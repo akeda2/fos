@@ -4,14 +4,18 @@ use crate::console;
 use crate::cpu;
 use crate::disk;
 use crate::fosfs;
+use crate::interrupts;
+use crate::keyboard;
 use crate::keyboard::Keyboard;
+use crate::pmem;
 use crate::{print, println};
 
 const LINE_CAPACITY: usize = 80;
 
 pub fn run(info: &BootInfo) -> ! {
-    let mut keyboard = Keyboard::initialize();
-    if keyboard.is_some() {
+    let keyboard_available = Keyboard::initialize().is_some();
+    interrupts::initialize();
+    if keyboard_available {
         println!("PS/2 keyboard initialized. Type 'help' for commands.");
     } else {
         println!("PS/2 keyboard unavailable; serial input remains available.");
@@ -23,11 +27,7 @@ pub fn run(info: &BootInfo) -> ! {
     prompt();
 
     loop {
-        let byte = console::read_serial_byte().or_else(|| {
-            keyboard
-                .as_mut()
-                .and_then(Keyboard::read_char)
-        });
+        let byte = console::read_serial_byte().or_else(keyboard::pop_char);
         let Some(byte) = byte else {
             continue;
         };
@@ -71,6 +71,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"help" => {
             if no_arguments(arguments) {
                 println!("System: help clear about bootinfo memmap memory cpuinfo hexdump halt");
+                println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Disk: diskinfo readsector format ls cat write rm");
             }
         }
@@ -81,6 +82,12 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"memory" if no_arguments(arguments) => print_memory_summary(info),
         b"cpuinfo" if no_arguments(arguments) => print_cpu_info(),
         b"diskinfo" if no_arguments(arguments) => print_disk_info(info),
+        b"ticks" if no_arguments(arguments) => print_ticks(),
+        b"uptime" if no_arguments(arguments) => print_uptime(),
+        b"irqstat" if no_arguments(arguments) => print_irq_stats(),
+        b"pmem" if no_arguments(arguments) => print_pmem_stats(),
+        b"palloc" if no_arguments(arguments) => palloc_command(),
+        b"pfree" => pfree_command(arguments),
         b"readsector" => read_sector_command(info, arguments),
         b"hexdump" => hexdump_command(info, arguments),
         b"format" if no_arguments(arguments) => filesystem_result(fosfs::format(info), "FOSFS formatted."),
@@ -95,12 +102,66 @@ fn execute(command: &[u8], info: &BootInfo) {
             println!("Halting CPU. Reset or power-cycle to restart.");
             halt_forever();
         }
-        b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"diskinfo" | b"format" | b"ls" => {
+        b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"diskinfo" | b"format" | b"ls"
+        | b"ticks" | b"uptime" | b"irqstat" | b"pmem" | b"palloc" => {
             println!("This command does not accept arguments.");
         }
 
         _ => println!("Unknown command. Type 'help' for commands."),
     }
+}
+
+fn print_ticks() {
+    println!("Timer ticks: {} (at {} Hz)", interrupts::ticks(), interrupts::tick_frequency_hz());
+}
+
+fn print_uptime() {
+    let ticks = interrupts::ticks();
+    let frequency = u64::from(interrupts::tick_frequency_hz());
+    println!(
+        "Uptime: {}.{:02} seconds ({} ticks)",
+        ticks / frequency,
+        (ticks % frequency) * 100 / frequency,
+        ticks
+    );
+}
+
+fn print_irq_stats() {
+    println!(
+        "IRQ0 (timer): {} fired; IRQ1 (keyboard): {} fired",
+        interrupts::timer_irq_count(),
+        interrupts::keyboard_irq_count()
+    );
+}
+
+fn print_pmem_stats() {
+    let (total, free) = pmem::stats();
+    let used = total - free;
+    println!(
+        "Physical frames: {total} total, {free} free, {used} used ({} KiB/frame)",
+        pmem::FRAME_SIZE / 1024
+    );
+}
+
+fn palloc_command() {
+    match pmem::allocate() {
+        Some(address) => println!("Allocated frame at 0x{address:08x}."),
+        None => println!("No free physical frames remain."),
+    }
+}
+
+fn pfree_command(arguments: &[u8]) {
+    let (value, remainder) = take_word(arguments);
+    let Some(address) = parse_number(value) else {
+        println!("Usage: pfree ADDRESS (as returned by palloc)");
+        return;
+    };
+    if !remainder.is_empty() {
+        println!("Usage: pfree ADDRESS");
+        return;
+    }
+    pmem::free(address);
+    println!("Frame at 0x{address:08x} released (if it was allocated and in range).");
 }
 
 fn print_cpu_info() {
@@ -161,8 +222,13 @@ fn write_command(info: &BootInfo, arguments: &[u8]) {
         return;
     }
     match fosfs::write(info, name, text) {
-        Ok(true) => println!("File written."),
-        Ok(false) => println!("Invalid name, content, or no space remains."),
+        Ok(fosfs::WriteOutcome::Written) => println!("File written."),
+        Ok(fosfs::WriteOutcome::InvalidName) => {
+            println!("Invalid name: use up to 16 uppercase letters, digits, '.', '_', or '-'.");
+        }
+        Ok(fosfs::WriteOutcome::ContentTooLarge) => println!("Content too large: FOSFS files are limited to one 512-byte sector."),
+        Ok(fosfs::WriteOutcome::DirectoryFull) => println!("Directory full: all 64 FOSFS entries are in use."),
+        Ok(fosfs::WriteOutcome::DataFull) => println!("Data region full: no free sector remains in the FOSFS partition."),
         Err(error) => println!("FOSFS disk error: {error:?}"),
     }
 }
@@ -276,12 +342,23 @@ fn print_boot_info(info: &BootInfo) {
 
 fn print_memory_map(info: &BootInfo) {
     let count = usize::from(read_u16(core::ptr::addr_of!(info.memory_region_count)));
-    println!("Firmware memory map ({count} entries):");
+    println!("Firmware memory map ({count} entries reported by BIOS INT 15h EAX=E820h):");
     for index in 0..count {
         let region = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index])) };
         print_region(index, region);
     }
 
+}
+
+fn e820_type_name(kind: u32) -> &'static str {
+    match kind {
+        1 => "usable RAM",
+        2 => "reserved (not usable)",
+        3 => "ACPI reclaimable",
+        4 => "ACPI NVS",
+        5 => "bad memory",
+        _ => "unknown type",
+    }
 }
 
 fn print_memory_summary(info: &BootInfo) {
@@ -297,14 +374,14 @@ fn print_memory_summary(info: &BootInfo) {
             reserved = reserved.saturating_add(length);
         }
     }
-    println!("E820 summary: {usable} usable bytes; {reserved} non-usable bytes.");
+    println!("E820 summary: {usable} usable bytes; {reserved} non-usable bytes (reserved/ACPI/bad).");
 }
 
 fn print_region(index: usize, region: MemoryRegion) {
     let base = read_u64(core::ptr::addr_of!(region.base));
     let length = read_u64(core::ptr::addr_of!(region.length));
     let kind = read_u32(core::ptr::addr_of!(region.kind));
-    println!("  {index:02}: 0x{base:016x} + 0x{length:016x} type {kind}");
+    println!("  {index:02}: 0x{base:016x} + 0x{length:016x} type {kind} ({})", e820_type_name(kind));
 }
 
 fn read_u16(pointer: *const u16) -> u16 {

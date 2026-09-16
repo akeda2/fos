@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Boot the image and validate the serial-visible educational milestones."""
+"""Boot the image and validate the serial-visible educational milestones.
+
+Drives a headless QEMU instance over its `-serial stdio` pipe, typing a
+scripted sequence of shell commands and asserting that every message in
+`EXPECTED` appears, in order, within a bounded timeout. This is the project's
+sole automated test path (`cargo test` cannot run this crate's `no_std`
+custom-target binary); see `make test` and the top-level AGENTS.md.
+"""
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -11,18 +18,32 @@ import time
 
 BOOT_MARKER = b"fos> "
 EXPECTED = (
+    # Stage one's messages go to the VGA text console only (see boot/stage1.S
+    # for why it doesn't also initialize the serial UART); they are not
+    # visible on this serial-only capture, so the first markers here are
+    # stage two's, which mirrors everything to both VGA and COM1.
     b"FOS stage 2: real mode active.",
+    b"Querying BIOS INT 15h EAX=E820h for the physical memory map...",
     b"Memory map collected.",
+    b"Enabling the A20 address line (needed to address memory above 1 MiB)...",
     b"A20 enabled.",
+    b"Loading the Rust kernel from disk to physical 0x10000...",
     b"Kernel loaded. BIOS services end now.",
+    b"Masking the legacy 8259 PIC and installing a flat 32-bit GDT...",
+    b"GDT loaded, CR0.PE set. Far-jumping into 32-bit protected mode",
     b"Kernel: protected-mode Rust entry reached.",
+    b"Physical memory: ",
+    b"Interrupts enabled: IDT loaded, PIC remapped to 0x20/0x28,",
     b"PS/2 keyboard initialized.",
     b"System: help clear about bootinfo memmap memory cpuinfo hexdump halt",
+    b"Interrupts: ticks uptime irqstat pmem palloc pfree",
     b"fos is a small educational 32-bit x86 operating system.",
     b"This command does not accept arguments.",
     b"Unknown command. Type 'help' for commands.",
     b"Boot drive: 0x80;",
     b"Firmware memory map (",
+    b"usable RAM)",
+    b"reserved (not usable))",
     b"Halting CPU.",
     b"FOSFS partition: LBA 4096 + 4096 sectors",
     b"FOSFS1",
@@ -32,10 +53,24 @@ EXPECTED = (
     b"File removed.",
     b"FOSFS formatted.",
     b"FOSFS is empty.",
+    b"Timer ticks: ",
+    b"Uptime: ",
+    b"IRQ0 (timer): ",
+    b"Physical frames: ",
+    b"Allocated frame at 0x",
+    b"released (if it was allocated and in range).",
+    b"Invalid name: use up to 16 uppercase letters, digits, '.', '_', or '-'.",
 )
 
 
 def wait_for(output: bytearray, selector: selectors.BaseSelector, marker: bytes, timeout: float) -> None:
+    """Blocks until `marker` has appeared anywhere in `output`.
+
+    Reads from the QEMU serial pipe (registered on `selector`) as it
+    arrives, appending to `output`, and raises `TimeoutError` if `marker`
+    still hasn't shown up after `timeout` seconds, or `RuntimeError` if the
+    stream closes first (e.g. the VM crashed or exited unexpectedly).
+    """
     deadline = time.monotonic() + timeout
     while marker not in output:
         remaining = deadline - time.monotonic()
@@ -70,7 +105,9 @@ def main() -> None:
         process.stdin.write(
             b"helx\x08p\rabout\rhelp extra\runknown\rclear\rdiskinfo\r"
             b"readsector 4096\rcpuinfo\rmemory\rls\rcat README.TXT\r"
-            b"write NOTE.TXT HELLO\rcat NOTE.TXT\rrm NOTE.TXT\rformat\rls\r"
+            b"write NOTE.TXT HELLO\rcat NOTE.TXT\rrm NOTE.TXT\r"
+            b"write AB@D.TXT hi\rformat\rls\r"
+            b"ticks\ruptime\rirqstat\rpmem\rpalloc\rpfree 0\r"
             b"bootinfo\rmemmap\rhalt\r"
         )
         process.stdin.flush()

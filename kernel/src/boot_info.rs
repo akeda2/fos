@@ -49,3 +49,7 @@ impl BootInfo {
 pub fn read_u32(pointer: *const u32) -> u32 {
     unsafe { core::ptr::read_unaligned(pointer) }
 }
+
+pub fn read_u64(pointer: *const u64) -> u64 {
+    unsafe { core::ptr::read_unaligned(pointer) }
+}

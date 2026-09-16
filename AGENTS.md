@@ -24,9 +24,30 @@ that obscure hardware behavior.
 - `kernel/src/disk.rs` invokes the stage-two BIOS EDD trampoline. It performs
   exactly one sector transfer and only after validating the LBA and buffer
   constraints. Do not call BIOS interrupts directly from protected mode.
+  Because the trampoline drops into real mode, and the kernel's own IDT/PIC
+  remap would otherwise break BIOS's real-mode interrupt handling, `transfer`
+  briefly restores the real-mode IVT (`IDTR` base 0) and the BIOS-conventional
+  PIC vector mapping around each individual BIOS call, then switches back.
+- `kernel/src/interrupts.rs` builds a 256-entry IDT (only IRQ0/IRQ1 gates
+  populated), remaps the 8259 PIC clear of the CPU exception range, arms the
+  PIT at 100 Hz, and services the timer/keyboard IRQs with minimal
+  `x86-interrupt` ABI handlers. Input is interrupt-driven, not polled.
+- `kernel/src/pmem.rs` is a small bitmap-based physical-frame allocator (4 KiB
+  frames) built from the E820 map; it reserves everything below the kernel's
+  own low-memory region. There is no paging.
 - `kernel/src/fosfs.rs` implements FOSFS, a deliberately small custom
   filesystem: one superblock, four directory sectors, 64 fixed entries, and
   contiguous one-sector files.
+
+## Educational verbosity
+
+This project exists to be read and explained, not just to run. Boot stages
+and kernel subsystems should narrate what they are doing and why in their
+status messages (e.g. which BIOS interrupt is being called, what a PIC remap
+or IDT load accomplishes), not just announce bare completion. When adding a
+boot step or kernel subsystem, prefer an explanatory message over a terse one,
+and keep `README.md`'s command table and "What happens at boot" walkthrough in
+sync with the actual command surface and boot sequence.
 
 ## Disk image and safety
 
@@ -66,6 +87,9 @@ and wait for the prompt before sending input.
 System commands: `help`, `clear`, `about`, `bootinfo`, `memmap`, `memory`,
 `cpuinfo`, `hexdump ADDRESS LENGTH`, and `halt`.
 
+Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
+`pfree ADDRESS`.
+
 Storage commands: `diskinfo`, `readsector LBA`, `format`, `ls`, `cat NAME`,
 `write NAME TEXT`, and `rm NAME`.
 
@@ -77,7 +101,8 @@ filesystem are intentional teaching constraints.
 ## Deliberately deferred work
 
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
-  native USB, hardware IRQ drivers, and robust fault recovery.
+  native USB, further hardware IRQ drivers beyond the timer/keyboard, and
+  robust fault recovery.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.

@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 core::arch::global_asm!(include_str!("entry.S"));
 
@@ -9,7 +10,9 @@ mod console;
 mod cpu;
 mod disk;
 mod fosfs;
+mod interrupts;
 mod keyboard;
+mod pmem;
 mod shell;
 
 use core::panic::PanicInfo;
@@ -28,6 +31,7 @@ pub extern "C" fn kmain(boot_info_address: u32) -> ! {
     console::initialize(boot_info.serial_available != 0);
     println!("\nKernel: protected-mode Rust entry reached.");
     println!("Kernel: validated loader boot information.");
+    pmem::initialize(boot_info);
     shell::run(boot_info)
 }
 

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Create a fixed-layout MBR disk image without touching host block devices."""
+"""Create a fixed-layout MBR disk image without touching host block devices.
+
+Produces `build/fos.img`: a 4 MiB raw disk with a classic MBR partition
+table describing two partitions -- a raw "boot payload" partition (stage
+two loader + kernel, active/bootable) and a separate FOSFS data partition,
+which this script also preformats with a tiny FOSFS filesystem containing
+one `README.TXT`. See the top-level README's "Disk image layout" section
+for the full physical layout diagram.
+"""
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -10,11 +18,21 @@ STAGE2_SECTORS = 32
 MIN_IMAGE_SECTORS = 8192
 DATA_START_LBA = 4096
 DATA_SECTORS = 4096
+# FOSFS reserves one superblock sector plus this many fixed directory
+# sectors (64 entries total, 32 bytes each) before file data begins.
 DIRECTORY_SECTORS = 4
 DATA_START = 1 + DIRECTORY_SECTORS
 
 
 def preformat_fosfs(image: bytearray) -> None:
+    """Writes a ready-to-use FOSFS filesystem into the data partition.
+
+    Lays down the superblock (magic, version, geometry), a single
+    directory entry for `README.TXT`, and that file's contents, so a fresh
+    image boots straight into a usable filesystem without requiring a
+    `format` first. See `kernel/src/fosfs.rs` for the on-disk layout this
+    mirrors.
+    """
     offset = DATA_START_LBA * SECTOR_SIZE
     superblock = bytearray(SECTOR_SIZE)
     superblock[:8] = b"FOSFS1\0\0"
@@ -41,6 +59,7 @@ def preformat_fosfs(image: bytearray) -> None:
 
 
 def pad(data: bytes, sectors: int) -> bytes:
+    """Right-pads `data` with zero bytes to fill exactly `sectors` sectors."""
     if len(data) > sectors * SECTOR_SIZE:
         raise ValueError(f"artifact exceeds its {sectors}-sector allocation")
     return data.ljust(sectors * SECTOR_SIZE, b"\0")
@@ -67,6 +86,14 @@ def main() -> None:
     image[:SECTOR_SIZE] = stage1
     partition_offset = 446
     payload_sectors = STAGE2_SECTORS + kernel_sectors
+    # Two classic 16-byte MBR partition table entries. Byte 0 is the boot
+    # flag (0x80 = active/bootable), byte 4 is the partition type (0x02,
+    # arbitrarily chosen to mean "fos raw payload"/"fos FOSFS data" -- no
+    # real OS needs to recognize these types), bytes 1-3 and 5-7 are
+    # legacy CHS start/end fields that BIOS EDD/LBA reads ignore, so they
+    # are filled with the conventional "ignore me" sentinel 0xda,0xff,0xff,
+    # followed by the LBA start and sector count that this loader actually
+    # uses.
     image[partition_offset:partition_offset + 16] = bytes([
         0x80, 0, 2, 0, 0xda, 0xff, 0xff, 0xff,
     ]) + PAYLOAD_START_LBA.to_bytes(4, "little") + payload_sectors.to_bytes(4, "little")
@@ -83,3 +110,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

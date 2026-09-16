@@ -237,15 +237,15 @@ boot_drive:
 serial_available:
     .byte 0
 banner:
-    .asciz "FOS stage 2: real mode active.\r\nCollecting BIOS E820 memory map...\r\n"
+    .asciz "FOS stage 2: real mode active. Now running from 0x8000.\r\nQuerying BIOS INT 15h EAX=E820h for the physical memory map...\r\n"
 memory_map_done:
-    .asciz "Memory map collected.\r\nEnabling A20 address line...\r\n"
+    .asciz "Memory map collected.\r\nEnabling the A20 address line (needed to address memory above 1 MiB)...\r\n"
 a20_done:
-    .asciz "A20 enabled.\r\nLoading Rust kernel...\r\n"
+    .asciz "A20 enabled.\r\nLoading the Rust kernel from disk to physical 0x10000...\r\n"
 kernel_done:
-    .asciz "Kernel loaded. BIOS services end now.\r\nEntering 32-bit protected mode...\r\n"
+    .asciz "Kernel loaded. BIOS services end now.\r\nMasking the legacy 8259 PIC and installing a flat 32-bit GDT...\r\n"
 transition_message:
-    .asciz "Transferring control to Rust kernel.\r\n"
+    .asciz "GDT loaded, CR0.PE set. Far-jumping into 32-bit protected mode and the Rust kernel.\r\n"
 memory_map_failed:
     .asciz "FOS ERROR: E820 memory map unavailable.\r\n"
 a20_failed:

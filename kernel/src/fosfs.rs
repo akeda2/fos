@@ -22,9 +22,27 @@ struct FileEntry {
     name_length: usize,
 }
 
+/// Distinguishes why a `write` did or did not succeed, so the shell can
+/// report a deterministic, specific reason instead of a generic failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteOutcome {
+    Written,
+    InvalidName,
+    ContentTooLarge,
+    /// All `DIRECTORY_SECTORS * ENTRIES_PER_SECTOR` directory slots are in use.
+    DirectoryFull,
+    /// The data region (`data_partition_sectors - DATA_START` sectors) is exhausted.
+    DataFull,
+}
+
 pub fn format(info: &BootInfo) -> Result<(), disk::Error> {
     let base = disk::data_partition_lba(info);
     let sectors = disk::data_partition_sectors(info);
+    if sectors <= DATA_START {
+        // Too small to hold the superblock, directory, and at least one
+        // data sector; refuse rather than underflow the free-space field.
+        return Err(disk::Error::OutOfRange);
+    }
     disk::write_sector(info, base, |sector| {
         sector.fill(0);
         sector[..8].copy_from_slice(MAGIC);
@@ -75,9 +93,12 @@ pub fn cat(info: &BootInfo, name: &[u8]) -> Result<bool, disk::Error> {
     Ok(true)
 }
 
-pub fn write(info: &BootInfo, name: &[u8], text: &[u8]) -> Result<bool, disk::Error> {
-    if !valid_name(name) || text.len() > SECTOR_SIZE {
-        return Ok(false);
+pub fn write(info: &BootInfo, name: &[u8], text: &[u8]) -> Result<WriteOutcome, disk::Error> {
+    if !valid_name(name) {
+        return Ok(WriteOutcome::InvalidName);
+    }
+    if text.len() > SECTOR_SIZE {
+        return Ok(WriteOutcome::ContentTooLarge);
     }
     validate(info)?;
     let base = disk::data_partition_lba(info);
@@ -86,12 +107,12 @@ pub fn write(info: &BootInfo, name: &[u8], text: &[u8]) -> Result<bool, disk::Er
         (entry.directory_lba, entry.index, entry.start_sector)
     } else {
         let Some((directory_lba, index)) = find_free_slot(info)? else {
-            return Ok(false);
+            return Ok(WriteOutcome::DirectoryFull);
         };
         (directory_lba, index, next_free_data_sector(info)?)
     };
     if start_sector >= disk::data_partition_sectors(info) {
-        return Ok(false);
+        return Ok(WriteOutcome::DataFull);
     }
     disk::write_sector(info, base + start_sector, |contents| {
         contents.fill(0);
@@ -107,7 +128,7 @@ pub fn write(info: &BootInfo, name: &[u8], text: &[u8]) -> Result<bool, disk::Er
     put_u32(&mut directory, offset + 12, 1);
     directory[offset + 16..offset + 16 + name.len()].copy_from_slice(name);
     disk::write_sector(info, directory_lba, |contents| *contents = directory)?;
-    Ok(true)
+    Ok(WriteOutcome::Written)
 }
 
 pub fn remove(info: &BootInfo, name: &[u8]) -> Result<bool, disk::Error> {

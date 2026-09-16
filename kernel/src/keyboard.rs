@@ -1,4 +1,5 @@
 use crate::arch::x86::{inb, outb};
+use crate::interrupts;
 
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
@@ -10,8 +11,19 @@ pub struct Keyboard {
     right_shift: bool,
 }
 
+/// Shift-key decoding state for scancodes drained from the IRQ1 queue.
+/// Single-threaded and only ever touched by `pop_char`, which callers use
+/// from the main shell loop (not from interrupt context).
+static mut DECODER: Keyboard = Keyboard {
+    left_shift: false,
+    right_shift: false,
+};
+
 impl Keyboard {
-    pub fn initialize() -> Option<Self> {
+    /// Enables scanning on the PS/2 keyboard. Must run before
+    /// `interrupts::initialize` unmasks IRQ1, since this handshake polls the
+    /// controller directly rather than going through the interrupt queue.
+    pub fn initialize() -> Option<()> {
         if !wait_for_input_empty() {
             return None;
         }
@@ -22,18 +34,7 @@ impl Keyboard {
         if unsafe { inb(DATA_PORT) } != 0xfa {
             return None;
         }
-        Some(Self {
-            left_shift: false,
-            right_shift: false,
-        })
-    }
-
-    pub fn read_char(&mut self) -> Option<u8> {
-        if unsafe { inb(STATUS_PORT) } & STATUS_OUTPUT_FULL == 0 {
-            return None;
-        }
-        let scancode = unsafe { inb(DATA_PORT) };
-        self.decode_scancode(scancode)
+        Some(())
     }
 
     fn decode_scancode(&mut self, scancode: u8) -> Option<u8> {
@@ -48,6 +49,27 @@ impl Keyboard {
             _ => return keycode_to_ascii(code, self.left_shift || self.right_shift),
         }
         None
+    }
+}
+
+/// Reads one raw scancode directly from the controller. Called only from the
+/// IRQ1 handler, which already knows a byte is waiting.
+pub fn read_pending_scancode() -> Option<u8> {
+    if unsafe { inb(STATUS_PORT) } & STATUS_OUTPUT_FULL == 0 {
+        return None;
+    }
+    Some(unsafe { inb(DATA_PORT) })
+}
+
+/// Drains one interrupt-queued scancode and decodes it to ASCII, tracking
+/// shift state across calls. Safe to call repeatedly from the shell's main
+/// loop; briefly disables interrupts internally (via `interrupts::pop_scancode`)
+/// to avoid racing the IRQ1 handler.
+pub fn pop_char() -> Option<u8> {
+    let scancode = interrupts::pop_scancode()?;
+    #[allow(static_mut_refs)]
+    unsafe {
+        DECODER.decode_scancode(scancode)
     }
 }
 

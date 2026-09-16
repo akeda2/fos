@@ -1,4 +1,5 @@
 use crate::boot_info::{read_u32, BootInfo};
+use crate::interrupts;
 
 const SECTOR_SIZE: usize = 512;
 
@@ -49,7 +50,33 @@ fn transfer(info: &BootInfo, lba: u32, direction: u32) -> Result<(), Error> {
     let routine: unsafe extern "C" fn(u32, u32, u32) -> u32 =
         unsafe { core::mem::transmute(address as usize) };
     let buffer = core::ptr::addr_of!(SECTOR) as u32;
-    if unsafe { routine(direction, lba, buffer) } == 0 {
+    // The trampoline drops into real mode to run genuine BIOS code. BIOS
+    // expects both the traditional real-mode IVT at address 0 (our own IDT
+    // holds 8-byte protected-mode gate descriptors at a different address,
+    // which would be misread as garbage 4-byte real-mode entries) and the
+    // PIC's BIOS-conventional vector mapping (IRQ0 -> INT 08h, whose
+    // real-mode handler advances the BDA tick counter that BIOS
+    // disk-timeout logic polls). Restore both for the duration of the call,
+    // with interrupts disabled around each switch so nothing can be
+    // misdelivered mid-reprogramming.
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+    interrupts::use_real_mode_idt();
+    interrupts::use_bios_pic_mapping();
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
+    let result = unsafe { routine(direction, lba, buffer) };
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+    interrupts::use_kernel_idt();
+    interrupts::use_kernel_pic_mapping();
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
+    if result == 0 {
         Ok(())
     } else {
         Err(Error::FirmwareFailure)

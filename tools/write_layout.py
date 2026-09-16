@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
-"""Generate the assembly constants shared by the image builder and loaders."""
+"""Generate the assembly constants shared by the image builder and loaders.
+
+This is the single place that turns "how big is the kernel binary right
+now" into the disk-layout constants (`layout.inc`) that both `boot/stage1.S`
+and `boot/stage2.S` `.include`. Keeping this generated, rather than hand
+edited in the assembly sources, means the loader's LBA/sector-count
+constants can never silently drift out of sync with the actual kernel size
+or `tools/build_image.py`'s partition layout.
+"""
 
 from argparse import ArgumentParser
 from pathlib import Path
 
 SECTOR_SIZE = 512
+# LBA of the raw payload partition (stage two + kernel); see build_image.py.
 PAYLOAD_START_LBA = 2048
+# Stage two is always allocated this many 512-byte sectors, regardless of
+# its actual assembled size, leaving headroom to grow without relayout.
 STAGE2_SECTORS = 32
+# Physical address stage two loads the kernel to, and the end of the
+# reserved low-memory region the kernel itself must fit inside (see
+# `kernel/linker.ld`).
 KERNEL_LOAD_ADDRESS = 0x10000
 KERNEL_RESERVED_END = 0x20000
 IMAGE_SECTORS = 8192
+# LBA and size of the dedicated FOSFS data partition, kept separate from the
+# boot payload partition so formatting FOSFS can never touch loader code.
 DATA_START_LBA = 4096
 DATA_SECTORS = 4096
 
 
 def sector_count(path: Path) -> int:
+    """Rounds a file's byte size up to whole 512-byte sectors."""
     size = path.stat().st_size
     return (size + SECTOR_SIZE - 1) // SECTOR_SIZE
 
@@ -31,6 +48,8 @@ def main() -> None:
     kernel_end = KERNEL_LOAD_ADDRESS + kernel_sectors * SECTOR_SIZE
     if kernel_end > KERNEL_RESERVED_END:
         raise SystemExit("kernel exceeds the reserved low-memory load region")
+    # Emitted as GNU `as` `.set` directives so boot/stage1.S and
+    # boot/stage2.S can `.include` this file directly as assembly source.
     content = (
         f".set STAGE2_LBA, {PAYLOAD_START_LBA}\n"
         f".set STAGE2_SECTORS, {STAGE2_SECTORS}\n"
@@ -47,3 +66,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
