@@ -72,7 +72,11 @@ the 0xb8000 text framebuffer does not move the blinking hardware cursor by
 itself -- that is separate CRTC state (ports `0x3d4`/`0x3d5`) driven
 explicitly after every VGA write so the caret always tracks the next write
 position, matching what real hardware (verified on a Pentium 4 machine
-booted from USB) requires.
+booted from USB) requires. The screen is never cleared at boot, so that
+VGA-only viewers keep seeing the full real-mode narration; the kernel
+instead reads the cursor position the real-mode loader's own BIOS-teletype
+printing already left behind and continues writing from there, rather than
+resetting to row 0 and overwriting the top of that narration.
 
 | Command | Description |
 | --- | --- |

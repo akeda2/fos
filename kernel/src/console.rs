@@ -8,13 +8,14 @@ const VGA_HEIGHT: usize = 25;
 const VGA_COLOR: u8 = 0x07;
 const COM1: u16 = 0x3f8;
 
-/// VGA CRTC index/data ports used to move the hardware text-mode cursor.
-/// Writing characters into the 0xb8000 framebuffer only changes what is
-/// drawn; it never moves the blinking caret, which is a separate piece of
-/// CRTC state left wherever the firmware/BIOS put it at boot. Real
-/// hardware makes this obvious (the caret sits still, e.g. mid-screen,
-/// while text appears elsewhere); some emulators are more forgiving about
-/// it, but this must be driven explicitly to behave correctly everywhere.
+/// VGA CRTC index/data ports used to read and move the hardware
+/// text-mode cursor. Writing characters into the 0xb8000 framebuffer only
+/// changes what is drawn; it never moves the blinking caret, which is
+/// separate CRTC state. This must be driven explicitly to behave
+/// correctly on real hardware (an emulator may be more forgiving about
+/// leaving it stale). At boot, the kernel reads this position back
+/// (rather than resetting it) so its own messages continue right after
+/// whatever the real-mode loader already printed via BIOS teletype.
 const CRTC_INDEX_PORT: u16 = 0x3d4;
 const CRTC_DATA_PORT: u16 = 0x3d5;
 const CRTC_CURSOR_LOCATION_HIGH: u8 = 0x0e;
@@ -28,11 +29,31 @@ pub fn initialize(serial_available: bool) {
     unsafe {
         SERIAL_READY = serial_available && initialize_serial();
     }
-    // Move the hardware caret to (0, 0) immediately: firmware/BIOS may
-    // have left it anywhere on screen (real hardware has been observed
-    // leaving it mid-screen), and it otherwise would not move until the
-    // first character is printed.
-    update_cursor();
+    // Pick up exactly where real-mode's own BIOS-teletype printing left
+    // the hardware cursor, rather than resetting to (0, 0): the screen is
+    // never cleared at boot (stage1/stage2 messages stay visible for
+    // VGA-only viewers), so continuing from the real cursor position
+    // means the kernel's own messages append after them instead of
+    // overwriting the top of the screen and leaving stale text below.
+    unsafe {
+        let (row, column) = read_cursor_position();
+        ROW = row;
+        COLUMN = column;
+    }
+}
+
+/// Reads the hardware text-mode cursor position back from the CRTC, in
+/// (row, column) form. Used once at boot so kernel output continues
+/// exactly where the real-mode loader's BIOS-teletype printing left off.
+unsafe fn read_cursor_position() -> (usize, usize) {
+    unsafe {
+        outb(CRTC_INDEX_PORT, CRTC_CURSOR_LOCATION_HIGH);
+        let high = inb(CRTC_DATA_PORT);
+        outb(CRTC_INDEX_PORT, CRTC_CURSOR_LOCATION_LOW);
+        let low = inb(CRTC_DATA_PORT);
+        let position = (usize::from(high) << 8 | usize::from(low)).min(VGA_WIDTH * VGA_HEIGHT - 1);
+        (position / VGA_WIDTH, position % VGA_WIDTH)
+    }
 }
 
 unsafe fn initialize_serial() -> bool {
