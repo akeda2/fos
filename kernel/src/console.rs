@@ -144,6 +144,17 @@ pub fn write_bytes(bytes: &[u8]) {
     write_serial(bytes);
 }
 
+/// Writes bytes to the VGA text console only, without echoing them back out
+/// over COM1. `term`'s raw pass-through loop uses this for bytes arriving
+/// from the remote end: COM1 is the link to that remote machine while
+/// `term` is active, so mirroring its own incoming bytes back onto itself
+/// would corrupt the conversation.
+pub fn write_vga_only(bytes: &[u8]) {
+    for &byte in bytes {
+        write_byte(byte);
+    }
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => ($crate::console::print(core::format_args!($($arg)*)));

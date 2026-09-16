@@ -92,6 +92,7 @@ polled, alongside a free-running PIT timer on IRQ0.
 | `cat NAME` | Displays a FOSFS text file. |
 | `write NAME TEXT` | Creates or replaces a one-sector FOSFS text file. Names use up to 16 uppercase letters, digits, `.`, `_`, or `-`; oversized content, a full directory, or a full data region are each reported distinctly. |
 | `rm NAME` | Removes a FOSFS file entry. |
+| `term` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte over COM1 to a remote machine, and displays incoming COM1 bytes locally (VGA only, not re-echoed to serial). Press F12 to return to the shell. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -130,6 +131,20 @@ one-sector files. It does not reuse file data after deletion; `format` resets
 the directory and allocation frontier. The generated image starts preformatted
 with `README.TXT`. Raw `readsector` is read-only. Only FOSFS commands issue
 writes, and their LBAs are constrained to the data partition.
+
+`term` repurposes the single COM1 UART as a raw link to a remote machine,
+matching real hardware where most physical machines expose only one serial
+port. While `term` is active, COM1 stops being an optional local console
+mirror and becomes the remote wire exclusively: outgoing PS/2 keystrokes are
+sent byte-for-byte with no local echo, and incoming bytes are shown via VGA
+only (never re-echoed back out over COM1, which would corrupt the link).
+Exit is bound to F12 rather than a Ctrl or Shift/AltGr combination, since F12
+occupies the same physical key and produces the same scancode regardless of
+keyboard layout (e.g. Nordic vs. US) -- unlike letter/punctuation keys, whose
+legends and shifted symbols vary by layout. A caveat: if serial is your only
+connection to fos (no VGA in use), entering `term` gives up your control
+channel until the remote end sends something recognizable, or you regain
+local VGA access -- an explicit, documented trade-off rather than a bug.
 
 
 ## Supported platform

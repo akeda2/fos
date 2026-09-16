@@ -6,6 +6,23 @@ const STATUS_PORT: u16 = 0x64;
 const STATUS_OUTPUT_FULL: u8 = 1;
 const STATUS_INPUT_FULL: u8 = 2;
 
+/// Scan Code Set 1 make code for F12. Function keys sit at the same
+/// physical position and produce the same scancode on every keyboard
+/// layout this project targets (US, UK, Nordic, ...): unlike letter/symbol
+/// keys, they are never reached through Shift or AltGr. That makes F12 a
+/// good, layout-independent "leave raw terminal mode" key for `term` (see
+/// `shell::term_command`), which must intercept it before it would
+/// otherwise be forwarded byte-for-byte over the serial link.
+const ESCAPE_SCANCODE: u8 = 0x58;
+
+/// One decoded keyboard event as seen by `term`'s raw pass-through loop.
+pub enum KeyEvent {
+    /// An ordinary key was pressed; forward this byte to the remote end.
+    Char(u8),
+    /// F12 was pressed: stop forwarding and return to the fos shell.
+    Escape,
+}
+
 pub struct Keyboard {
     left_shift: bool,
     right_shift: bool,
@@ -71,6 +88,22 @@ pub fn pop_char() -> Option<u8> {
     unsafe {
         DECODER.decode_scancode(scancode)
     }
+}
+
+/// Drains one interrupt-queued scancode for `term`'s raw pass-through loop.
+/// Recognizes the F12 "leave raw mode" make code (see `ESCAPE_SCANCODE`)
+/// before decoding, so it is never forwarded as a character; every other
+/// key goes through the same shift-aware decoder as `pop_char`, so typed
+/// text still reaches the remote end as ordinary ASCII.
+pub fn poll_term_event() -> Option<KeyEvent> {
+    let scancode = interrupts::pop_scancode()?;
+    let released = scancode & 0x80 != 0;
+    if scancode & 0x7f == ESCAPE_SCANCODE {
+        return if released { None } else { Some(KeyEvent::Escape) };
+    }
+    #[allow(static_mut_refs)]
+    let decoded = unsafe { DECODER.decode_scancode(scancode) };
+    decoded.map(KeyEvent::Char)
 }
 
 fn wait_for_input_empty() -> bool {

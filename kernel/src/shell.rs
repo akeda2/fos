@@ -73,6 +73,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("System: help clear about bootinfo memmap memory cpuinfo hexdump halt");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Disk: diskinfo readsector format ls cat write rm");
+                println!("Serial: term (raw terminal to another machine over COM1; F12 to exit)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -95,6 +96,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"cat" => cat_command(info, arguments),
         b"write" => write_command(info, arguments),
         b"rm" => remove_command(info, arguments),
+        b"term" => term_command(arguments),
         b"halt" => {
             if !no_arguments(arguments) {
                 return;
@@ -170,6 +172,42 @@ fn print_cpu_info() {
     console::write_bytes(&vendor);
     let (edx, ecx) = cpu::features();
     println!("\nCPUID feature bits: EDX=0x{edx:08x} ECX=0x{ecx:08x}");
+}
+
+/// A minimal raw serial terminal emulator: once entered, COM1 stops being
+/// this shell's own (optional) input/output mirror and instead becomes a
+/// dedicated link to whatever is on the other end of the wire, byte for
+/// byte, with no local line editing or echo -- the remote side is expected
+/// to echo your keystrokes itself, exactly as a real terminal program
+/// would. This reuses the single COM1 port most real machines actually
+/// have, rather than requiring a second serial port.
+///
+/// Because this repurposes COM1, a serial-only session controlling fos
+/// through that same port would lose its ability to type further commands
+/// once `term` starts; local VGA + PS/2 keyboard input is unaffected and
+/// remains the way to invoke `term` and to leave it again with F12 (chosen
+/// specifically because function keys sit outside the Shift/AltGr layers
+/// that a Nordic keyboard puts most punctuation behind).
+fn term_command(arguments: &[u8]) {
+    if !no_arguments(arguments) {
+        return;
+    }
+    println!("Entering raw terminal mode on COM1: your keystrokes are sent byte-for-byte,");
+    println!("with no local echo or line editing -- the far end echoes them back. Press F12");
+    println!("to return to the fos shell. If you are controlling fos over this same serial");
+    println!("link, note that link is about to become the remote connection instead: use");
+    println!("the VGA console to get back in that case.");
+    loop {
+        match keyboard::poll_term_event() {
+            Some(keyboard::KeyEvent::Escape) => break,
+            Some(keyboard::KeyEvent::Char(byte)) => console::write_serial(&[byte]),
+            None => {}
+        }
+        if let Some(byte) = console::read_serial_byte() {
+            console::write_vga_only(&[byte]);
+        }
+    }
+    println!("\nLeft terminal mode; back at the fos shell.");
 }
 
 fn no_arguments(arguments: &[u8]) -> bool {

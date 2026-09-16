@@ -93,10 +93,23 @@ Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
 Storage commands: `diskinfo`, `readsector LBA`, `format`, `ls`, `cat NAME`,
 `write NAME TEXT`, and `rm NAME`.
 
+Serial commands: `term` (raw terminal pass-through over COM1; F12 exits).
+
 `readsector` is read-only. `hexdump` is limited to the reserved kernel range
 and at most 128 bytes. FOSFS names are limited to 16 uppercase alphanumeric or
 `.`, `_`, and `-` characters. The fixed command buffer and single-sector
 filesystem are intentional teaching constraints.
+
+`term` reuses the single COM1 port rather than adding a second UART, since
+most physical machines expose only one serial port. While active, COM1 is
+exclusively the remote link: PS/2 keystrokes go out over COM1 with no local
+echo, and incoming COM1 bytes are shown via VGA only (`console::write_vga_only`,
+which intentionally skips serial mirroring to avoid retransmitting incoming
+bytes back over the same wire). The escape key is F12 (scan code `0x58`) --
+not a Shift/AltGr/Ctrl combination -- because function keys are
+layout-independent, satisfying keyboards (e.g. Nordic) where such combinations
+are ambiguous or reserved. A serial-only fos session loses its control channel
+upon entering `term`; this is a documented, intentional trade-off.
 
 ## Deliberately deferred work
 
