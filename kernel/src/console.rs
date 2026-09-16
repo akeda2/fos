@@ -57,15 +57,107 @@ unsafe fn read_cursor_position() -> (usize, usize) {
 }
 
 unsafe fn initialize_serial() -> bool {
+    configure_uart(COM1, UART_CLOCK)
+}
+
+/// The UART's fixed input clock, already divided down to the maximum
+/// standard baud rate: programming a divisor of `UART_CLOCK / baud`
+/// selects any other standard rate exactly, with no rounding error, as
+/// long as `baud` evenly divides `UART_CLOCK`.
+pub const UART_CLOCK: u32 = 115_200;
+
+fn uart_divisor(baud: u32) -> Option<u16> {
+    if baud == 0 || UART_CLOCK % baud != 0 {
+        return None;
+    }
+    u16::try_from(UART_CLOCK / baud).ok()
+}
+
+/// Programs one UART for 8 data bits, no parity, one stop bit ("8N1") at
+/// `baud`, enables its FIFOs, and asserts DTR/RTS so a real null-modem
+/// cable reports the link as up. Returns whether the UART responded
+/// (mirrors the loopback-style probe the loader already performs for the
+/// primary COM1 console link).
+fn configure_uart(base: u16, baud: u32) -> bool {
+    let Some(divisor) = uart_divisor(baud) else {
+        return false;
+    };
     unsafe {
-        outb(COM1 + 1, 0);
-        outb(COM1 + 3, 0x80);
-        outb(COM1, 1);
-        outb(COM1 + 1, 0);
-        outb(COM1 + 3, 0x03);
-        outb(COM1 + 2, 0xc7);
-        outb(COM1 + 4, 0x0b);
-        inb(COM1 + 5) != 0xff
+        outb(base + 1, 0);
+        outb(base + 3, 0x80);
+        outb(base, (divisor & 0xff) as u8);
+        outb(base + 1, (divisor >> 8) as u8);
+        outb(base + 3, 0x03);
+        outb(base + 2, 0xc7);
+        outb(base + 4, 0x0b);
+        inb(base + 5) != 0xff
+    }
+}
+
+/// BIOS Data Area addresses of each legacy COM port's base I/O address,
+/// in index order COM1..COM4. The BIOS fills these in at POST (0 if a
+/// port was not found) -- the same lookup DOS and other real-mode
+/// software have always used instead of probing I/O space directly.
+/// Reading physical address 0x400 is safe here because the kernel runs
+/// with a flat, unpaged 32-bit address space, so that physical address is
+/// simply mapped at the same virtual address.
+const BDA_COM_PORTS: *const u16 = 0x400 as *const u16;
+
+/// Detects which of COM1..COM4 the BIOS found at boot, returning each
+/// one's base I/O port address (or `None` if absent).
+pub fn detect_ports() -> [Option<u16>; 4] {
+    let mut ports = [None; 4];
+    for (index, port) in ports.iter_mut().enumerate() {
+        let base = unsafe { BDA_COM_PORTS.add(index).read_volatile() };
+        if base != 0 {
+            *port = Some(base);
+        }
+    }
+    ports
+}
+
+/// A single UART, independent of the shared COM1 console link above.
+/// `term` uses this for COM2/COM3/COM4: unlike COM1 (which doubles as
+/// this shell's own optional serial input/output and so must stay at a
+/// fixed, predictable baud rate), those ports are never used by the
+/// interactive shell, so a `term` session may freely pick any standard
+/// baud rate for them.
+pub struct Uart {
+    base: u16,
+}
+
+impl Uart {
+    pub const fn new(base: u16) -> Self {
+        Uart { base }
+    }
+
+    /// Programs this UART for 8N1 at `baud`. Returns `false` if `baud`
+    /// does not evenly divide the UART's clock (see `UART_CLOCK`) or if
+    /// the UART did not respond to initialization.
+    pub fn configure(&self, baud: u32) -> bool {
+        configure_uart(self.base, baud)
+    }
+
+    pub fn read_byte(&self) -> Option<u8> {
+        unsafe {
+            if inb(self.base + 5) & 1 != 0 {
+                Some(inb(self.base))
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn write_byte(&self, byte: u8) {
+        unsafe {
+            let mut attempts = 100_000;
+            while inb(self.base + 5) & 0x20 == 0 && attempts != 0 {
+                attempts -= 1;
+            }
+            if attempts != 0 {
+                outb(self.base, byte);
+            }
+        }
     }
 }
 
@@ -137,6 +229,12 @@ pub fn write_serial(bytes: &[u8]) {
             outb(COM1, byte);
         }
     }
+}
+
+/// Single-byte wrapper around `write_serial`, matching the `Fn(u8)` shape
+/// `shell::term_loop` uses uniformly across every port it can drive.
+pub fn write_serial_byte(byte: u8) {
+    write_serial(&[byte]);
 }
 
 fn newline() {

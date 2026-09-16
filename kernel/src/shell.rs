@@ -73,7 +73,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("System: help clear about bootinfo memmap memory cpuinfo hexdump halt");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Disk: diskinfo readsector format ls cat write rm");
-                println!("Serial: term (raw terminal to another machine over COM1; F12 to exit)");
+                println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 to exit)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -97,6 +97,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"write" => write_command(info, arguments),
         b"rm" => remove_command(info, arguments),
         b"term" => term_command(arguments),
+        b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"halt" => {
             if !no_arguments(arguments) {
                 return;
@@ -105,7 +106,7 @@ fn execute(command: &[u8], info: &BootInfo) {
             halt_forever();
         }
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"diskinfo" | b"format" | b"ls"
-        | b"ticks" | b"uptime" | b"irqstat" | b"pmem" | b"palloc" => {
+        | b"ticks" | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" => {
             println!("This command does not accept arguments.");
         }
 
@@ -174,40 +175,131 @@ fn print_cpu_info() {
     println!("\nCPUID feature bits: EDX=0x{edx:08x} ECX=0x{ecx:08x}");
 }
 
-/// A minimal raw serial terminal emulator: once entered, COM1 stops being
-/// this shell's own (optional) input/output mirror and instead becomes a
+/// Display names for the four legacy COM ports, in BIOS Data Area index
+/// order; shared by `serial` (listing) and `term` (port selection).
+const SERIAL_PORT_NAMES: [&[u8]; 4] = [b"COM1", b"COM2", b"COM3", b"COM4"];
+
+fn print_serial_ports() {
+    let ports = console::detect_ports();
+    for (index, name) in SERIAL_PORT_NAMES.iter().enumerate() {
+        let name = core::str::from_utf8(name).unwrap_or("?");
+        match ports[index] {
+            Some(base) if index == 0 => {
+                println!("{name}: 0x{base:04x} (local shell console, fixed at 115200 8N1)");
+            }
+            Some(base) => println!("{name}: 0x{base:04x} (free for 'term'; baud chosen when entering it)"),
+            None => println!("{name}: not detected"),
+        }
+    }
+}
+
+/// A minimal raw serial terminal emulator: once entered, the chosen port
+/// stops being available for anything else and instead becomes a
 /// dedicated link to whatever is on the other end of the wire, byte for
 /// byte, with no local line editing or echo -- the remote side is expected
 /// to echo your keystrokes itself, exactly as a real terminal program
-/// would. This reuses the single COM1 port most real machines actually
-/// have, rather than requiring a second serial port.
+/// would.
 ///
-/// Because this repurposes COM1, a serial-only session controlling fos
-/// through that same port would lose its ability to type further commands
-/// once `term` starts; local VGA + PS/2 keyboard input is unaffected and
-/// remains the way to invoke `term` and to leave it again with F12 (chosen
-/// specifically because function keys sit outside the Shift/AltGr layers
-/// that a Nordic keyboard puts most punctuation behind).
+/// With no arguments, `term` reuses the single COM1 port most real
+/// machines actually have, at its fixed 115200 baud (see below). Because
+/// this repurposes COM1, a serial-only session controlling fos through
+/// that same port would lose its ability to type further commands once
+/// `term` starts; local VGA + PS/2 keyboard input is unaffected and
+/// remains the way to invoke `term` and to leave it again with F12
+/// (chosen specifically because function keys sit outside the
+/// Shift/AltGr layers that a Nordic keyboard puts most punctuation
+/// behind).
+///
+/// `term COM2`/`COM3`/`COM4` [BAUD] uses an additional port instead, if
+/// the BIOS detected one (see `serial`). Those ports are never used by
+/// the interactive shell, so -- unlike COM1, whose rate must stay fixed
+/// so it keeps matching whatever terminal program is already attached to
+/// it -- their baud rate can be freely chosen; it must evenly divide
+/// 115200 (the UART's fixed clock) so the requested rate is reproduced
+/// exactly, e.g. 115200, 57600, 38400, 19200, 9600, 4800, 2400, 1200.
 fn term_command(arguments: &[u8]) {
-    if !no_arguments(arguments) {
+    let (port_word, remainder) = take_word(arguments);
+    let (baud_word, remainder) = take_word(remainder);
+    if !remainder.is_empty() {
+        println!("Usage: term [COM1|COM2|COM3|COM4] [BAUD]");
         return;
     }
-    println!("Entering raw terminal mode on COM1: your keystrokes are sent byte-for-byte,");
-    println!("with no local echo or line editing -- the far end echoes them back. Press F12");
-    println!("to return to the fos shell. If you are controlling fos over this same serial");
-    println!("link, note that link is about to become the remote connection instead: use");
-    println!("the VGA console to get back in that case.");
+
+    let port_index = if port_word.is_empty() {
+        0
+    } else {
+        let Some(index) = SERIAL_PORT_NAMES.iter().position(|name| name.eq_ignore_ascii_case(port_word)) else {
+            println!("Usage: term [COM1|COM2|COM3|COM4] [BAUD]");
+            return;
+        };
+        index
+    };
+
+    let baud = if baud_word.is_empty() {
+        None
+    } else {
+        match parse_number(baud_word) {
+            Some(baud) => Some(baud),
+            None => {
+                println!("Invalid baud rate.");
+                return;
+            }
+        }
+    };
+
+    if port_index == 0 {
+        if baud.is_some() {
+            println!("COM1's baud rate is fixed at 115200 (it is shared with the local shell");
+            println!("console, so changing it mid-session would desync anyone attached to it).");
+            println!("Use COM2, COM3, or COM4 for a custom baud rate.");
+            return;
+        }
+        println!("Entering raw terminal mode on COM1 at 115200 baud: your keystrokes are sent");
+        println!("byte-for-byte, with no local echo or line editing -- the far end echoes them");
+        println!("back. Press F12 to return to the fos shell. If you are controlling fos over");
+        println!("this same serial link, note that link is about to become the remote");
+        println!("connection instead: use the VGA console to get back in that case.");
+        term_loop(console::write_serial_byte, console::read_serial_byte);
+        println!("\nLeft terminal mode; back at the fos shell.");
+        return;
+    }
+
+    let ports = console::detect_ports();
+    let Some(base) = ports[port_index] else {
+        let name = core::str::from_utf8(SERIAL_PORT_NAMES[port_index]).unwrap_or("?");
+        println!("{name} was not detected by the BIOS at boot; see 'serial'.");
+        return;
+    };
+    let baud = baud.unwrap_or(console::UART_CLOCK);
+    let uart = console::Uart::new(base);
+    if !uart.configure(baud) {
+        let name = core::str::from_utf8(SERIAL_PORT_NAMES[port_index]).unwrap_or("?");
+        println!("Could not initialize {name} at {baud} baud (rate must evenly divide 115200,");
+        println!("e.g. 115200, 57600, 38400, 19200, 9600, 4800, 2400, 1200).");
+        return;
+    }
+    let name = core::str::from_utf8(SERIAL_PORT_NAMES[port_index]).unwrap_or("?");
+    println!("Entering raw terminal mode on {name} at {baud} baud: your keystrokes are sent");
+    println!("byte-for-byte, with no local echo or line editing -- the far end echoes them");
+    println!("back. Press F12 to return to the fos shell.");
+    term_loop(|byte| uart.write_byte(byte), || uart.read_byte());
+    println!("\nLeft terminal mode; back at the fos shell.");
+}
+
+/// Shared by every `term` port: forwards keystrokes via `write` until F12
+/// is pressed, and shows bytes arriving via `read` locally (VGA only, so
+/// they are never re-echoed back over the same wire they arrived on).
+fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
     loop {
         match keyboard::poll_term_event() {
             Some(keyboard::KeyEvent::Escape) => break,
-            Some(keyboard::KeyEvent::Char(byte)) => console::write_serial(&[byte]),
+            Some(keyboard::KeyEvent::Char(byte)) => write(byte),
             None => {}
         }
-        if let Some(byte) = console::read_serial_byte() {
+        if let Some(byte) = read() {
             console::write_vga_only(&[byte]);
         }
     }
-    println!("\nLeft terminal mode; back at the fos shell.");
 }
 
 fn no_arguments(arguments: &[u8]) -> bool {

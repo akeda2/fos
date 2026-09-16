@@ -101,7 +101,8 @@ resetting to row 0 and overwriting the top of that narration.
 | `cat NAME` | Displays a FOSFS text file. |
 | `write NAME TEXT` | Creates or replaces a one-sector FOSFS text file. Names use up to 16 uppercase letters, digits, `.`, `_`, or `-`; oversized content, a full directory, or a full data region are each reported distinctly. |
 | `rm NAME` | Removes a FOSFS file entry. |
-| `term` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte over COM1 to a remote machine, and displays incoming COM1 bytes locally (VGA only, not re-echoed to serial). Press F12 to return to the shell. |
+| `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), noting which is the local console. |
+| `term [COM1\|COM2\|COM3\|COM4] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 accept an optional custom `BAUD` that must evenly divide 115200. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -141,19 +142,31 @@ the directory and allocation frontier. The generated image starts preformatted
 with `README.TXT`. Raw `readsector` is read-only. Only FOSFS commands issue
 writes, and their LBAs are constrained to the data partition.
 
-`term` repurposes the single COM1 UART as a raw link to a remote machine,
-matching real hardware where most physical machines expose only one serial
-port. While `term` is active, COM1 stops being an optional local console
-mirror and becomes the remote wire exclusively: outgoing PS/2 keystrokes are
-sent byte-for-byte with no local echo, and incoming bytes are shown via VGA
-only (never re-echoed back out over COM1, which would corrupt the link).
-Exit is bound to F12 rather than a Ctrl or Shift/AltGr combination, since F12
-occupies the same physical key and produces the same scancode regardless of
-keyboard layout (e.g. Nordic vs. US) -- unlike letter/punctuation keys, whose
-legends and shifted symbols vary by layout. A caveat: if serial is your only
-connection to fos (no VGA in use), entering `term` gives up your control
-channel until the remote end sends something recognizable, or you regain
-local VGA access -- an explicit, documented trade-off rather than a bug.
+`term` repurposes COM1 as a raw link to a remote machine by default, matching
+real hardware where most physical machines expose only one serial port.
+While `term` is active on a given port, that port stops being available for
+anything else and becomes the remote wire exclusively: outgoing PS/2
+keystrokes are sent byte-for-byte with no local echo, and incoming bytes are
+shown via VGA only (never re-echoed back out over the same port, which would
+corrupt the link). Exit is bound to F12 rather than a Ctrl or Shift/AltGr
+combination, since F12 occupies the same physical key and produces the same
+scancode regardless of keyboard layout (e.g. Nordic vs. US) -- unlike
+letter/punctuation keys, whose legends and shifted symbols vary by layout. A
+caveat: if serial is your only connection to fos over COM1 (no VGA in use),
+entering `term` on COM1 gives up your control channel until the remote end
+sends something recognizable, or you regain local VGA access -- an explicit,
+documented trade-off rather than a bug.
+
+`term` can also drive COM2, COM3, or COM4 if the BIOS detected one (`serial`
+lists what was found, reading the same BIOS Data Area at physical `0x400`
+that DOS and other real-mode software have always used, rather than probing
+I/O space directly). Those ports are never shared with the interactive
+shell, so unlike COM1 -- whose 115200 baud rate must stay fixed to keep
+matching whatever terminal program is already attached to the local console
+-- their baud rate is a free choice per `term` session, e.g. `term COM2
+9600`. A requested rate must evenly divide 115200 (the UART's fixed clock)
+so it is reproduced exactly rather than rounded; invalid combinations are
+rejected with an explanation instead of silently misconfiguring the link.
 
 
 ## Supported platform
