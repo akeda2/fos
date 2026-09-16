@@ -12,6 +12,7 @@ mod disk;
 mod fosfs;
 mod interrupts;
 mod keyboard;
+mod pci;
 mod pmem;
 mod shell;
 

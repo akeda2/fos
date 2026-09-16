@@ -93,8 +93,9 @@ Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
 Storage commands: `diskinfo`, `readsector LBA`, `format`, `ls`, `cat NAME`,
 `write NAME TEXT`, and `rm NAME`.
 
-Serial commands: `serial` (lists COM1..COM4 as detected via the BIOS Data
-Area) and `term [COM1|COM2|COM3|COM4] [BAUD]` (raw terminal pass-through;
+Serial commands: `serial` (lists COM1..COM4 via the BIOS Data Area, plus any
+PCI-discovered serial controllers as `PCI0`, `PCI1`, ...) and
+`term [COM1|COM2|COM3|COM4|PCI0|PCI1|...] [BAUD]` (raw terminal pass-through;
 F12 exits).
 
 `readsector` is read-only. `hexdump` is limited to the reserved kernel range
@@ -119,10 +120,30 @@ reading the BIOS Data Area at physical `0x400`) accept an optional custom
 `BAUD` argument, since those ports are never shared with the interactive
 shell. COM1's baud rate is deliberately kept fixed at 115200 -- it is the
 same port the shell itself may already be driven over, so changing its rate
+`term COM2`/`COM3`/`COM4` (`console::Uart`, detected via `console::detect_ports`
+reading the BIOS Data Area at physical `0x400`) accept an optional custom
+`BAUD` argument, since those ports are never shared with the interactive
+shell. COM1's baud rate is deliberately kept fixed at 115200 -- it is the
+same port the shell itself may already be driven over, so changing its rate
 mid-session would desync any attached terminal program. A requested `BAUD`
 must evenly divide `console::UART_CLOCK` (115200) so the exact rate is
 programmed rather than rounded; `term` reports and rejects invalid rates or
 undetected ports rather than silently misconfiguring the link.
+
+`term PCI0`/`PCI1`/... work the same way as COM2-4, but their I/O address
+comes from `console::detect_pci_ports` (`kernel/src/pci.rs`) walking PCI
+configuration space (Mechanism #1, ports `0xcf8`/`0xcfc`) for class `0x07`
+subclass `0x00` ("simple communication controller" / "serial") devices and
+reading each one's BAR0. This is not registered in the BIOS Data Area, so it
+needs its own lookup, separate from `detect_ports`. Legacy ISA serial cards
+need no such lookup: jumpered to a standard COM address, BIOS POST
+enumerates them exactly like an onboard port, so they already appear via
+`detect_ports`. `pci.rs` only implements enough PCI to serve this one
+purpose (no bridges, no memory-mapped BARs, no other device classes) and
+treats each matching PCI function as exactly one port, so multi-port cards
+that multiplex several UARTs behind one BAR at internal offsets are not
+specially decoded. Native USB (and thus USB-to-serial adapters) remains out
+of scope; see "Deliberately deferred work" below.
 
 ## Deliberately deferred work
 

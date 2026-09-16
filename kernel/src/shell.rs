@@ -179,6 +179,10 @@ fn print_cpu_info() {
 /// order; shared by `serial` (listing) and `term` (port selection).
 const SERIAL_PORT_NAMES: [&[u8]; 4] = [b"COM1", b"COM2", b"COM3", b"COM4"];
 
+/// Display names for PCI-discovered serial ports (see `console::detect_pci_ports`
+/// / `pci::find_serial_ports`), in discovery order.
+const PCI_PORT_NAMES: [&[u8]; console::MAX_PCI_SERIAL_PORTS] = [b"PCI0", b"PCI1", b"PCI2", b"PCI3"];
+
 fn print_serial_ports() {
     let ports = console::detect_ports();
     for (index, name) in SERIAL_PORT_NAMES.iter().enumerate() {
@@ -189,6 +193,16 @@ fn print_serial_ports() {
             }
             Some(base) => println!("{name}: 0x{base:04x} (free for 'term'; baud chosen when entering it)"),
             None => println!("{name}: not detected"),
+        }
+    }
+    let (pci_ports, pci_count) = console::detect_pci_ports();
+    if pci_count == 0 {
+        println!("PCI: no additional serial controllers found on the PCI bus.");
+    } else {
+        for index in 0..pci_count {
+            let name = core::str::from_utf8(PCI_PORT_NAMES[index]).unwrap_or("?");
+            let base = pci_ports[index];
+            println!("{name}: 0x{base:04x} (found via PCI enumeration; free for 'term'; baud chosen when entering it)");
         }
     }
 }
@@ -210,30 +224,24 @@ fn print_serial_ports() {
 /// Shift/AltGr layers that a Nordic keyboard puts most punctuation
 /// behind).
 ///
-/// `term COM2`/`COM3`/`COM4` [BAUD] uses an additional port instead, if
-/// the BIOS detected one (see `serial`). Those ports are never used by
-/// the interactive shell, so -- unlike COM1, whose rate must stay fixed
-/// so it keeps matching whatever terminal program is already attached to
-/// it -- their baud rate can be freely chosen; it must evenly divide
-/// 115200 (the UART's fixed clock) so the requested rate is reproduced
-/// exactly, e.g. 115200, 57600, 38400, 19200, 9600, 4800, 2400, 1200.
+/// `term COM2`/`COM3`/`COM4`/`PCI0`/`PCI1`/... [BAUD] uses an additional
+/// port instead, if one was detected (see `serial`): COM2-4 via the BIOS
+/// Data Area, PCI ports via PCI configuration-space enumeration
+/// (`console::detect_pci_ports`). None of those are ever used by the
+/// interactive shell, so -- unlike COM1, whose rate must stay fixed so it
+/// keeps matching whatever terminal program is already attached to it --
+/// their baud rate can be freely chosen; it must evenly divide 115200
+/// (the UART's fixed clock) so the requested rate is reproduced exactly,
+/// e.g. 115200, 57600, 38400, 19200, 9600, 4800, 2400, 1200.
 fn term_command(arguments: &[u8]) {
+    const USAGE: &str = "Usage: term [COM1|COM2|COM3|COM4|PCI0|PCI1|...] [BAUD]";
+
     let (port_word, remainder) = take_word(arguments);
     let (baud_word, remainder) = take_word(remainder);
     if !remainder.is_empty() {
-        println!("Usage: term [COM1|COM2|COM3|COM4] [BAUD]");
+        println!("{USAGE}");
         return;
     }
-
-    let port_index = if port_word.is_empty() {
-        0
-    } else {
-        let Some(index) = SERIAL_PORT_NAMES.iter().position(|name| name.eq_ignore_ascii_case(port_word)) else {
-            println!("Usage: term [COM1|COM2|COM3|COM4] [BAUD]");
-            return;
-        };
-        index
-    };
 
     let baud = if baud_word.is_empty() {
         None
@@ -247,11 +255,11 @@ fn term_command(arguments: &[u8]) {
         }
     };
 
-    if port_index == 0 {
+    if port_word.is_empty() || SERIAL_PORT_NAMES[0].eq_ignore_ascii_case(port_word) {
         if baud.is_some() {
             println!("COM1's baud rate is fixed at 115200 (it is shared with the local shell");
             println!("console, so changing it mid-session would desync anyone attached to it).");
-            println!("Use COM2, COM3, or COM4 for a custom baud rate.");
+            println!("Use COM2, COM3, COM4, or a PCI port for a custom baud rate.");
             return;
         }
         println!("Entering raw terminal mode on COM1 at 115200 baud: your keystrokes are sent");
@@ -264,21 +272,43 @@ fn term_command(arguments: &[u8]) {
         return;
     }
 
-    let ports = console::detect_ports();
-    let Some(base) = ports[port_index] else {
-        let name = core::str::from_utf8(SERIAL_PORT_NAMES[port_index]).unwrap_or("?");
-        println!("{name} was not detected by the BIOS at boot; see 'serial'.");
+    if let Some(index) = SERIAL_PORT_NAMES.iter().position(|name| name.eq_ignore_ascii_case(port_word)) {
+        let ports = console::detect_ports();
+        let Some(base) = ports[index] else {
+            let name = core::str::from_utf8(SERIAL_PORT_NAMES[index]).unwrap_or("?");
+            println!("{name} was not detected by the BIOS at boot; see 'serial'.");
+            return;
+        };
+        run_uart_term(SERIAL_PORT_NAMES[index], base, baud);
         return;
-    };
+    }
+
+    if let Some(index) = PCI_PORT_NAMES.iter().position(|name| name.eq_ignore_ascii_case(port_word)) {
+        let (pci_ports, pci_count) = console::detect_pci_ports();
+        if index >= pci_count {
+            let name = core::str::from_utf8(PCI_PORT_NAMES[index]).unwrap_or("?");
+            println!("{name} was not detected via PCI enumeration; see 'serial'.");
+            return;
+        }
+        run_uart_term(PCI_PORT_NAMES[index], pci_ports[index], baud);
+        return;
+    }
+
+    println!("{USAGE}");
+}
+
+/// Shared by every non-COM1 port (COM2-4 and PCI-discovered ports): each
+/// gets its own freshly configured `console::Uart` rather than the shared
+/// console link, so it may use any baud rate the caller asks for.
+fn run_uart_term(name_bytes: &[u8], base: u16, baud: Option<u32>) {
+    let name = core::str::from_utf8(name_bytes).unwrap_or("?");
     let baud = baud.unwrap_or(console::UART_CLOCK);
     let uart = console::Uart::new(base);
     if !uart.configure(baud) {
-        let name = core::str::from_utf8(SERIAL_PORT_NAMES[port_index]).unwrap_or("?");
         println!("Could not initialize {name} at {baud} baud (rate must evenly divide 115200,");
         println!("e.g. 115200, 57600, 38400, 19200, 9600, 4800, 2400, 1200).");
         return;
     }
-    let name = core::str::from_utf8(SERIAL_PORT_NAMES[port_index]).unwrap_or("?");
     println!("Entering raw terminal mode on {name} at {baud} baud: your keystrokes are sent");
     println!("byte-for-byte, with no local echo or line editing -- the far end echoes them");
     println!("back. Press F12 to return to the fos shell.");
@@ -301,6 +331,7 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
         }
     }
 }
+
 
 fn no_arguments(arguments: &[u8]) -> bool {
     if arguments.is_empty() {

@@ -101,8 +101,8 @@ resetting to row 0 and overwriting the top of that narration.
 | `cat NAME` | Displays a FOSFS text file. |
 | `write NAME TEXT` | Creates or replaces a one-sector FOSFS text file. Names use up to 16 uppercase letters, digits, `.`, `_`, or `-`; oversized content, a full directory, or a full data region are each reported distinctly. |
 | `rm NAME` | Removes a FOSFS file entry. |
-| `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), noting which is the local console. |
-| `term [COM1\|COM2\|COM3\|COM4] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 accept an optional custom `BAUD` that must evenly divide 115200. |
+| `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
+| `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -167,6 +167,25 @@ matching whatever terminal program is already attached to the local console
 9600`. A requested rate must evenly divide 115200 (the UART's fixed clock)
 so it is reproduced exactly rather than rounded; invalid combinations are
 rejected with an explanation instead of silently misconfiguring the link.
+
+Add-on serial cards are also usable, listed as `PCI0`, `PCI1`, ... in
+discovery order. Legacy ISA cards jumpered to a standard COM address need no
+extra support at all: BIOS POST enumerates ports by address, not by
+onboard-vs-add-in, so they land in the same BIOS Data Area lookup as COM1-4.
+PCI/PCIe serial cards are found separately, by walking PCI configuration
+space (`kernel/src/pci.rs`) for "simple communication controller / serial"
+devices (class `0x07`, subclass `0x00`) and reading each one's first I/O-space
+Base Address Register -- the same technique that finds any PCI device, using
+Configuration Mechanism #1 (`0xcf8`/`0xcfc`), which even PCIe chipsets still
+answer for backward compatibility. The underlying UART register interface on
+essentially all such cards is 16550-compatible, so no new register-level
+code is needed once a card's I/O address is known; a `PCI` port behaves
+exactly like a `COM2`/`COM3`/`COM4` one, including a freely chosen baud
+rate. Cards that pack more than one port behind a single BAR at internal
+byte offsets are not specially decoded (only cards exposing one PCI function
+per port are recognized as multiple ports); genuine USB-to-serial adapters
+are out of scope entirely, since they need a full USB host-controller and
+device stack rather than simple port I/O (see "Current boundaries").
 
 
 ## Supported platform

@@ -116,6 +116,21 @@ pub fn detect_ports() -> [Option<u16>; 4] {
     ports
 }
 
+/// Maximum number of PCI-discovered serial ports `detect_pci_ports` will
+/// report; matched by `shell::PCI_PORT_NAMES`.
+pub const MAX_PCI_SERIAL_PORTS: usize = 4;
+
+/// Finds serial ("16550-compatible UART") controllers on PCI/PCIe add-on
+/// cards, via PCI configuration-space enumeration (see the `pci` module),
+/// returning their I/O base addresses and how many were found. Unlike
+/// `detect_ports`, these are never registered in the BIOS Data Area, so
+/// they need this separate, explicit lookup.
+pub fn detect_pci_ports() -> ([u16; MAX_PCI_SERIAL_PORTS], usize) {
+    let mut ports = [0u16; MAX_PCI_SERIAL_PORTS];
+    let count = crate::pci::find_serial_ports(&mut ports);
+    (ports, count)
+}
+
 /// A single UART, independent of the shared COM1 console link above.
 /// `term` uses this for COM2/COM3/COM4: unlike COM1 (which doubles as
 /// this shell's own optional serial input/output and so must stay at a
