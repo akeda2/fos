@@ -11,12 +11,14 @@
 //! broadly compatible, matching the rest of this project's approach to
 //! hardware access.
 //!
-//! Only enough of PCI is implemented to serve this one purpose: walking
-//! every bus/device/function, reading each function's class code, and --
-//! for serial controllers -- reading its first Base Address Register
-//! (BAR0) to recover the I/O port address the card's UART lives at. There
-//! is no support for memory-mapped BARs, PCI bridges, or any other device
-//! class; this is a teaching-scoped lookup, not a general PCI driver.
+//! Only enough of PCI is implemented to serve this project's two uses:
+//! walking every bus/device/function to find serial controllers by class
+//! code (reading BAR0 for the UART's I/O port), and finding one specific
+//! Ethernet card by vendor/device ID for the RTL8139 driver (`rtl8139.rs`,
+//! reading its BAR0 the same way, plus writing the PCI command register to
+//! enable I/O space and bus mastering, which DMA needs). There is no
+//! support for memory-mapped BARs, PCI bridges, or any other device class;
+//! this is a teaching-scoped lookup, not a general PCI driver.
 
 use crate::arch::x86::{inl, outl};
 
@@ -60,6 +62,79 @@ fn read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
     let value = read_u32(bus, device, function, offset);
     let shift = u32::from(offset & 3) * 8;
     ((value >> shift) & 0xff) as u8
+}
+
+fn write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    unsafe {
+        outl(CONFIG_ADDRESS, config_address(bus, device, function, offset));
+        outl(CONFIG_DATA, value);
+    }
+}
+
+/// The address of one PCI function, as found by `find_device`. Enough to
+/// re-read its BARs or reconfigure its command register without walking
+/// the bus again.
+#[derive(Clone, Copy)]
+pub struct PciAddress {
+    bus: u8,
+    device: u8,
+    function: u8,
+}
+
+impl PciAddress {
+    /// Reads BAR0, returning its I/O base address if it is I/O-mapped
+    /// (`None` for memory-mapped BARs, which this project's port-I/O code
+    /// cannot use).
+    pub fn io_bar0(&self) -> Option<u16> {
+        let bar0 = read_u32(self.bus, self.device, self.function, BAR0_OFFSET);
+        if bar0 & BAR_IS_IO_SPACE == 0 {
+            return None;
+        }
+        Some((bar0 & 0xffff_fffc) as u16)
+    }
+
+    /// Sets the I/O Space Enable (bit 0) and Bus Master Enable (bit 2)
+    /// bits in the PCI command register (offset `0x04`), leaving every
+    /// other bit as the firmware left it. Bus mastering is required for
+    /// any device -- such as an Ethernet card -- that writes to memory on
+    /// its own (DMA) instead of only being read from/written to via port
+    /// I/O, as this project's UARTs are.
+    pub fn enable_io_and_bus_master(&self) {
+        const COMMAND_OFFSET: u8 = 0x04;
+        const IO_SPACE_ENABLE: u32 = 1 << 0;
+        const BUS_MASTER_ENABLE: u32 = 1 << 2;
+        let command = read_u32(self.bus, self.device, self.function, COMMAND_OFFSET);
+        write_u32(self.bus, self.device, self.function, COMMAND_OFFSET, command | IO_SPACE_ENABLE | BUS_MASTER_ENABLE);
+    }
+}
+
+/// Finds the first PCI function matching the given vendor/device ID pair,
+/// used by `rtl8139.rs` to locate that one specific Ethernet card. Unlike
+/// `find_serial_ports`, this does not filter by class code, since some
+/// chips (like the RTL8139) can be identified more precisely by ID than
+/// by class alone.
+pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciAddress> {
+    for bus in 0..=255u8 {
+        for device in 0..32u8 {
+            let vendor = read_u16(bus, device, 0, 0x00);
+            if vendor == 0xffff {
+                continue;
+            }
+            let header_type = read_u8(bus, device, 0, 0x0e);
+            let function_count = if header_type & HEADER_TYPE_MULTIFUNCTION != 0 { 8 } else { 1 };
+            for function in 0..function_count {
+                let function_vendor = if function == 0 { vendor } else { read_u16(bus, device, function, 0x00) };
+                if function_vendor != vendor_id {
+                    continue;
+                }
+                let function_device = read_u16(bus, device, function, 0x02);
+                if function_device == device_id {
+                    return Some(PciAddress { bus, device, function });
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Walks every PCI bus/device/function looking for serial controllers,

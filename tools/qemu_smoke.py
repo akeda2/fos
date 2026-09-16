@@ -37,6 +37,7 @@ EXPECTED = (
     b"PS/2 keyboard initialized.",
     b"System: help clear about bootinfo memmap memory cpuinfo hexdump halt",
     b"Interrupts: ticks uptime irqstat pmem palloc pfree",
+    b"Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame)",
     b"fos is a small educational 32-bit x86 operating system.",
     b"This command does not accept arguments.",
     b"Unknown command. Type 'help' for commands.",
@@ -60,6 +61,7 @@ EXPECTED = (
     b"Allocated frame at 0x",
     b"released (if it was allocated and in range).",
     b"Invalid name: use up to 16 uppercase letters, digits, '.', '_', or '-'.",
+    b"No RTL8139 Ethernet controller found on the PCI bus.",
 )
 
 
@@ -108,7 +110,7 @@ def main() -> None:
             b"write NOTE.TXT HELLO\rcat NOTE.TXT\rrm NOTE.TXT\r"
             b"write AB@D.TXT hi\rformat\rls\r"
             b"ticks\ruptime\rirqstat\rpmem\rpalloc\rpfree 0\r"
-            b"bootinfo\rmemmap\rhalt\r"
+            b"bootinfo\rmemmap\rnic\rhalt\r"
         )
         process.stdin.flush()
         for marker in EXPECTED:

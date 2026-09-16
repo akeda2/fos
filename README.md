@@ -103,6 +103,9 @@ resetting to row 0 and overwriting the top of that narration.
 | `rm NAME` | Removes a FOSFS file entry. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
+| `nic` | Reports whether an RTL8139 Ethernet controller was found on PCI (and, if so, its MAC address). |
+| `nic send` | Transmits one raw broadcast Ethernet test frame. |
+| `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -187,6 +190,40 @@ per port are recognized as multiple ports); genuine USB-to-serial adapters
 are out of scope entirely, since they need a full USB host-controller and
 device stack rather than simple port I/O (see "Current boundaries").
 
+### Ethernet (`nic`)
+
+`nic` exercises a single supported network card: the Realtek RTL8139 Fast
+Ethernet controller (`kernel/src/rtl8139.rs`), chosen because it is
+well-documented, was extremely common in real PCI-era hardware, and is what
+QEMU emulates by default. It is found via the same PCI configuration-space
+walk used for add-on serial cards (`kernel/src/pci.rs`, extended with a
+vendor/device ID lookup), except this time by exact vendor/device ID (Realtek
+`0x10ec:0x8139`) rather than by class code, since NICs -- unlike UARTs --
+don't share one common register interface across vendors.
+
+Unlike the UART, an Ethernet controller does not hand over bytes one at a
+time via port I/O: it moves whole frames itself, via DMA, into and out of
+buffers whose physical address the driver hands it ahead of time. This
+kernel has no paging, so physical and virtual addresses are identical and
+those buffers can be read and written directly through raw pointers, but
+they must still be real, physically contiguous memory the card can reach --
+so `nic`'s first use of the card allocates its receive ring (`pmem`'s first
+caller to need more than one contiguous frame at a time; see
+`pmem::allocate_contiguous`) and four single-frame transmit buffers, and
+never frees them.
+
+There is no interrupt handling here: this project's PIC setup leaves every
+IRQ but the timer and keyboard masked (see "Current boundaries"), so the
+driver's interrupt mask register is simply left at zero and everything is
+done by polling status registers, the same approach `term` already takes for
+serial I/O. `nic` (no arguments) reports whether a card was found and its
+MAC address; `nic send` transmits one broadcast test frame tagged with an
+IEEE-reserved "experimental" ethertype (`0x88b5`) so it is unmistakably fos's
+own test traffic; `nic recv` polls briefly for one incoming frame and
+hex-dumps it. There is deliberately no protocol above raw Ethernet yet -- no
+ARP, no IPv4, nothing resembling a socket -- this only proves the card itself
+works.
+
 
 ## Supported platform
 
@@ -231,8 +268,10 @@ automatically selects or writes a host block device.
 
 This milestone uses one CPU, no paging, heap allocation, userspace, or
 scheduler. It has FOSFS (a deliberately tiny file-per-sector filesystem, not a
-general-purpose one) and interrupt-driven IRQ0/IRQ1 handling for the timer and
-keyboard, but no other hardware IRQ drivers (no native disk, network, or USB
+general-purpose one), interrupt-driven IRQ0/IRQ1 handling for the timer and
+keyboard, and one polling-mode network card driver (RTL8139, raw Ethernet
+frames only -- no ARP/IPv4/TCP stack, and no NIC interrupt handling; see
+"Ethernet (`nic`)"), but no other hardware IRQ drivers (no native disk or USB
 interrupt handling). The architecture keeps x86/driver code separate from
 console and shell policy so later work can add those facilities without
 changing the BIOS-to-kernel contract.

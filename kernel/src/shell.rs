@@ -8,6 +8,7 @@ use crate::interrupts;
 use crate::keyboard;
 use crate::keyboard::Keyboard;
 use crate::pmem;
+use crate::rtl8139;
 use crate::{print, println};
 
 const LINE_CAPACITY: usize = 80;
@@ -74,6 +75,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Disk: diskinfo readsector format ls cat write rm");
                 println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 to exit)");
+                println!("Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -98,6 +100,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"rm" => remove_command(info, arguments),
         b"term" => term_command(arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
+        b"nic" => nic_command(arguments),
         b"halt" => {
             if !no_arguments(arguments) {
                 return;
@@ -328,6 +331,112 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
         }
         if let Some(byte) = read() {
             console::write_vga_only(&[byte]);
+        }
+    }
+}
+
+/// A test-only ethertype from the "experimental" range (`0x88b5`/`0x88b6`,
+/// reserved by IEEE 802 for exactly this purpose: local, non-routable
+/// protocol experiments that will never collide with a real assigned
+/// ethertype), used to mark `nic send`'s frames as fos's own test traffic
+/// rather than anything meaningful to a real network.
+const TEST_ETHERTYPE: [u8; 2] = [0x88, 0xb5];
+const TEST_PAYLOAD: &[u8] = b"fos raw ethernet test frame";
+
+/// `nic` (no arguments) reports whether an RTL8139 was found and brought
+/// up, along with its MAC address; `nic send` transmits one broadcast
+/// test frame (see `TEST_ETHERTYPE`); `nic recv` polls briefly for one
+/// incoming frame and hex-dumps it if one arrives. There is no protocol
+/// above raw Ethernet here (no ARP, no IPv4) -- this only exercises the
+/// card itself.
+fn nic_command(arguments: &[u8]) {
+    let (subcommand, remainder) = take_word(arguments);
+    if !remainder.is_empty() {
+        println!("Usage: nic [send|recv]");
+        return;
+    }
+    match subcommand {
+        b"" => nic_status(),
+        b"send" => nic_send(),
+        b"recv" => nic_recv(),
+        _ => println!("Usage: nic [send|recv]"),
+    }
+}
+
+fn nic_status() {
+    match rtl8139::get() {
+        Ok(nic) => {
+            let mac = nic.mac_address();
+            println!(
+                "RTL8139 found: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+        }
+        Err(rtl8139::Status::NotPresent) => println!("No RTL8139 Ethernet controller found on the PCI bus."),
+        Err(rtl8139::Status::InitFailed(error)) => println!("RTL8139 found but could not be initialized: {error:?}"),
+    }
+}
+
+fn nic_send() {
+    let nic = match rtl8139::get() {
+        Ok(nic) => nic,
+        Err(rtl8139::Status::NotPresent) => {
+            println!("No RTL8139 Ethernet controller found on the PCI bus.");
+            return;
+        }
+        Err(rtl8139::Status::InitFailed(error)) => {
+            println!("RTL8139 found but could not be initialized: {error:?}");
+            return;
+        }
+    };
+    let source = nic.mac_address();
+    let mut frame = [0u8; 14 + TEST_PAYLOAD.len()];
+    frame[0..6].fill(0xff); // Broadcast destination.
+    frame[6..12].copy_from_slice(&source);
+    frame[12..14].copy_from_slice(&TEST_ETHERTYPE);
+    frame[14..].copy_from_slice(TEST_PAYLOAD);
+
+    if nic.send(&frame) {
+        println!("Sent a {}-byte broadcast test frame (ethertype 0x{:02x}{:02x}).", frame.len(), TEST_ETHERTYPE[0], TEST_ETHERTYPE[1]);
+    } else {
+        println!("Transmit failed (card reported an error, or timed out).");
+    }
+}
+
+fn nic_recv() {
+    let nic = match rtl8139::get() {
+        Ok(nic) => nic,
+        Err(rtl8139::Status::NotPresent) => {
+            println!("No RTL8139 Ethernet controller found on the PCI bus.");
+            return;
+        }
+        Err(rtl8139::Status::InitFailed(error)) => {
+            println!("RTL8139 found but could not be initialized: {error:?}");
+            return;
+        }
+    };
+    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut attempts = 20_000_000u32;
+    loop {
+        if let Some(length) = nic.receive(&mut buffer) {
+            let frame = &buffer[..length];
+            if length >= 14 {
+                println!(
+                    "Received {length} bytes: dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype 0x{:02x}{:02x}",
+                    frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+                    frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+                    frame[12], frame[13]
+                );
+            } else {
+                println!("Received {length} bytes (too short to hold an Ethernet header).");
+            }
+            dump_bytes(0, frame);
+            return;
+        }
+        attempts -= 1;
+        if attempts == 0 {
+            println!("No frame received (timed out waiting).");
+            return;
         }
     }
 }

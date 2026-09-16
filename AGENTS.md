@@ -120,11 +120,6 @@ reading the BIOS Data Area at physical `0x400`) accept an optional custom
 `BAUD` argument, since those ports are never shared with the interactive
 shell. COM1's baud rate is deliberately kept fixed at 115200 -- it is the
 same port the shell itself may already be driven over, so changing its rate
-`term COM2`/`COM3`/`COM4` (`console::Uart`, detected via `console::detect_ports`
-reading the BIOS Data Area at physical `0x400`) accept an optional custom
-`BAUD` argument, since those ports are never shared with the interactive
-shell. COM1's baud rate is deliberately kept fixed at 115200 -- it is the
-same port the shell itself may already be driven over, so changing its rate
 mid-session would desync any attached terminal program. A requested `BAUD`
 must evenly divide `console::UART_CLOCK` (115200) so the exact rate is
 programmed rather than rounded; `term` reports and rejects invalid rates or
@@ -145,11 +140,40 @@ that multiplex several UARTs behind one BAR at internal offsets are not
 specially decoded. Native USB (and thus USB-to-serial adapters) remains out
 of scope; see "Deliberately deferred work" below.
 
+Ethernet commands: `nic` (status; probes and initializes the RTL8139 driver
+on first use), `nic send` (one raw broadcast test frame), and `nic recv`
+(polls briefly for one incoming frame and hex-dumps it).
+
+`nic` is backed by `kernel/src/rtl8139.rs`, a polling-mode driver for the
+Realtek RTL8139 -- chosen as the one supported NIC because it is
+well-documented, common in real PCI-era hardware, and QEMU's default
+emulated card. Unlike serial cards (found by class code, since UARTs share
+one register model across vendors), the RTL8139 is found by exact
+vendor/device ID (`pci::find_device`, Realtek `0x10ec:0x8139`), since NIC
+register layouts are vendor-specific. `pci.rs` gained a second capability
+for this: `PciAddress::enable_io_and_bus_master`, setting the PCI command
+register's I/O-space and bus-master bits (the latter required for any
+device that performs DMA, unlike the UARTs, which only ever use plain port
+I/O).
+
+The driver polls status registers rather than using the card's interrupt
+line -- consistent with `interrupts.rs` leaving every IRQ but the timer and
+keyboard masked at the PIC -- and asks `pmem` for real physical frames for
+its DMA buffers rather than using `static` kernel memory, since a receive
+ring large enough to be useful would not fit in the kernel's small reserved
+low-memory region (`linker.ld`). Its receive ring must be one physically
+contiguous block, which single-frame-at-a-time `pmem::allocate` cannot
+guarantee, hence `pmem::allocate_contiguous` (this project's first caller to
+need more than one contiguous frame). There is no protocol above raw
+Ethernet frames (no ARP, no IPv4, no sockets) and no support for any NIC
+besides the RTL8139; both are explicit scope boundaries, not oversights.
+
 ## Deliberately deferred work
 
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
-  native USB, further hardware IRQ drivers beyond the timer/keyboard, and
-  robust fault recovery.
+  native USB, further hardware IRQ drivers beyond the timer/keyboard, robust
+  fault recovery, any protocol above raw Ethernet frames (no ARP, no IPv4,
+  no sockets), and support for any NIC besides the one RTL8139 driver.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.

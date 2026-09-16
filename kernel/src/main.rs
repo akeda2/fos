@@ -14,6 +14,7 @@ mod interrupts;
 mod keyboard;
 mod pci;
 mod pmem;
+mod rtl8139;
 mod shell;
 
 use core::panic::PanicInfo;

@@ -109,6 +109,41 @@ pub fn allocate() -> Option<u32> {
     None
 }
 
+/// Allocates `count` *physically contiguous* frames, returning the base
+/// address of the first one, or `None` if no run of that length is free.
+/// Nothing before this needed contiguity (the disk code moves one sector
+/// at a time; each UART is a single fixed register set) -- but a NIC's
+/// receive ring is one buffer the hardware writes into with its own DMA
+/// engine, so it must be one unbroken block of physical memory.
+pub fn allocate_contiguous(count: usize) -> Option<u32> {
+    if count == 0 || count > MAX_FRAMES {
+        return None;
+    }
+    unsafe {
+        let mut run_start = 0usize;
+        let mut run_length = 0usize;
+        for index in 0..MAX_FRAMES {
+            if is_free(index) {
+                if run_length == 0 {
+                    run_start = index;
+                }
+                run_length += 1;
+                if run_length == count {
+                    for offset in 0..count {
+                        set_free(run_start + offset, false);
+                    }
+                    FREE_FRAMES -= count;
+                    NEXT_SEARCH = (run_start + count) % MAX_FRAMES;
+                    return Some(run_start as u32 * FRAME_SIZE);
+                }
+            } else {
+                run_length = 0;
+            }
+        }
+    }
+    None
+}
+
 /// Returns a previously allocated frame to the free pool. Frames outside the
 /// tracked/reserved range, or already free, are ignored rather than
 /// corrupting accounting.

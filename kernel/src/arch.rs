@@ -35,6 +35,27 @@ pub mod x86 {
         }
     }
 
+    /// 16-bit input, used for the RTL8139 NIC's 16-bit registers (`CAPR`,
+    /// `CBR`, `IMR`, `ISR`). Kept alongside `outw` for symmetry even
+    /// though this driver only currently writes those registers.
+    #[inline]
+    #[allow(dead_code)]
+    pub unsafe fn inw(port: u16) -> u16 {
+        let value: u16;
+        unsafe {
+            core::arch::asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack, preserves_flags));
+        }
+        value
+    }
+
+    /// 16-bit output; see `inw`.
+    #[inline]
+    pub unsafe fn outw(port: u16, value: u16) {
+        unsafe {
+            core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+        }
+    }
+
     pub fn halt_forever() -> ! {
         loop {
             unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
