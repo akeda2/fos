@@ -67,7 +67,12 @@ freestanding binary); `make test` is the sole automated validation path.
 The prompt accepts fixed-size, allocation-free command lines. Enter and
 Backspace work on both serial and the US-layout PS/2 keyboard subset. Both
 input sources are interrupt-driven (IRQ1 for the keyboard) rather than
-polled, alongside a free-running PIT timer on IRQ0.
+polled, alongside a free-running PIT timer on IRQ0. Writing characters into
+the 0xb8000 text framebuffer does not move the blinking hardware cursor by
+itself -- that is separate CRTC state (ports `0x3d4`/`0x3d5`) driven
+explicitly after every VGA write so the caret always tracks the next write
+position, matching what real hardware (verified on a Pentium 4 machine
+booted from USB) requires.
 
 | Command | Description |
 | --- | --- |

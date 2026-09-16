@@ -8,6 +8,18 @@ const VGA_HEIGHT: usize = 25;
 const VGA_COLOR: u8 = 0x07;
 const COM1: u16 = 0x3f8;
 
+/// VGA CRTC index/data ports used to move the hardware text-mode cursor.
+/// Writing characters into the 0xb8000 framebuffer only changes what is
+/// drawn; it never moves the blinking caret, which is a separate piece of
+/// CRTC state left wherever the firmware/BIOS put it at boot. Real
+/// hardware makes this obvious (the caret sits still, e.g. mid-screen,
+/// while text appears elsewhere); some emulators are more forgiving about
+/// it, but this must be driven explicitly to behave correctly everywhere.
+const CRTC_INDEX_PORT: u16 = 0x3d4;
+const CRTC_DATA_PORT: u16 = 0x3d5;
+const CRTC_CURSOR_LOCATION_HIGH: u8 = 0x0e;
+const CRTC_CURSOR_LOCATION_LOW: u8 = 0x0f;
+
 static mut ROW: usize = 0;
 static mut COLUMN: usize = 0;
 static mut SERIAL_READY: bool = false;
@@ -16,6 +28,11 @@ pub fn initialize(serial_available: bool) {
     unsafe {
         SERIAL_READY = serial_available && initialize_serial();
     }
+    // Move the hardware caret to (0, 0) immediately: firmware/BIOS may
+    // have left it anywhere on screen (real hardware has been observed
+    // leaving it mid-screen), and it otherwise would not move until the
+    // first character is printed.
+    update_cursor();
 }
 
 unsafe fn initialize_serial() -> bool {
@@ -31,6 +48,19 @@ unsafe fn initialize_serial() -> bool {
     }
 }
 
+/// Moves the hardware text-mode cursor to match `ROW`/`COLUMN`. Called
+/// after every operation that changes the current write position, so the
+/// blinking caret always tracks where the next character will be drawn.
+fn update_cursor() {
+    unsafe {
+        let position = (ROW * VGA_WIDTH + COLUMN) as u16;
+        outb(CRTC_INDEX_PORT, CRTC_CURSOR_LOCATION_LOW);
+        outb(CRTC_DATA_PORT, (position & 0xff) as u8);
+        outb(CRTC_INDEX_PORT, CRTC_CURSOR_LOCATION_HIGH);
+        outb(CRTC_DATA_PORT, (position >> 8) as u8);
+    }
+}
+
 pub fn clear() {
     unsafe {
         for i in 0..VGA_WIDTH * VGA_HEIGHT {
@@ -39,6 +69,7 @@ pub fn clear() {
         ROW = 0;
         COLUMN = 0;
     }
+    update_cursor();
     write_serial(b"\x1b[2J\x1b[H");
 }
 
@@ -54,6 +85,7 @@ pub fn erase_last_character() {
                 .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(b' '));
         }
     }
+    update_cursor();
     write_serial(b"\x08 \x08");
 }
 
@@ -120,6 +152,7 @@ fn write_byte(byte: u8) {
         },
         _ => {}
     }
+    update_cursor();
 }
 
 struct Console;
