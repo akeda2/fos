@@ -111,6 +111,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic` | Reports whether an RTL8139 Ethernet controller was found on PCI (and, if so, its MAC address). |
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
 | `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
+| `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 stops the capture, then turns promiscuous mode back off. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -228,6 +229,18 @@ own test traffic; `nic recv` polls briefly for one incoming frame and
 hex-dumps it. There is deliberately no protocol above raw Ethernet yet -- no
 ARP, no IPv4, nothing resembling a socket -- this only proves the card itself
 works.
+
+`nic sniff` is a small link-level packet sniffer: it sets the card's receive
+filter to promiscuous mode (the RTL8139's `RCR` "accept all packets" bit),
+so it is handed every frame it can see on the wire, not only ones addressed
+to it, then prints a one-line summary plus a hex dump of each frame as it
+arrives. Like `term`, it runs until F12 is pressed -- the same
+layout-independent choice, made for the same reason (see the `term`
+description above: F12 produces the same scancode regardless of keyboard
+layout, unlike a Shift/AltGr combination a Nordic keyboard would put it
+behind) -- and always restores the card to its normal, non-promiscuous
+filter before returning, so a later `nic send`/`nic recv` is not left seeing
+unrelated traffic.
 
 
 ## Booting from a NIC ROM

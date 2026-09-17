@@ -75,7 +75,8 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Disk: diskinfo readsector format ls cat write rm");
                 println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 to exit)");
-                println!("Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame)");
+                println!("Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame),");
+        println!("          nic sniff (promiscuous capture; F12 to stop)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -346,20 +347,22 @@ const TEST_PAYLOAD: &[u8] = b"fos raw ethernet test frame";
 /// `nic` (no arguments) reports whether an RTL8139 was found and brought
 /// up, along with its MAC address; `nic send` transmits one broadcast
 /// test frame (see `TEST_ETHERTYPE`); `nic recv` polls briefly for one
-/// incoming frame and hex-dumps it if one arrives. There is no protocol
-/// above raw Ethernet here (no ARP, no IPv4) -- this only exercises the
-/// card itself.
+/// incoming frame and hex-dumps it if one arrives; `nic sniff` runs a
+/// continuous promiscuous-mode capture, printing every frame seen until
+/// F12 stops it. There is no protocol above raw Ethernet here (no ARP,
+/// no IPv4) -- this only exercises the card itself.
 fn nic_command(arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
     if !remainder.is_empty() {
-        println!("Usage: nic [send|recv]");
+        println!("Usage: nic [send|recv|sniff]");
         return;
     }
     match subcommand {
         b"" => nic_status(),
         b"send" => nic_send(),
         b"recv" => nic_recv(),
-        _ => println!("Usage: nic [send|recv]"),
+        b"sniff" => nic_sniff(),
+        _ => println!("Usage: nic [send|recv|sniff]"),
     }
 }
 
@@ -378,17 +381,7 @@ fn nic_status() {
 }
 
 fn nic_send() {
-    let nic = match rtl8139::get() {
-        Ok(nic) => nic,
-        Err(rtl8139::Status::NotPresent) => {
-            println!("No RTL8139 Ethernet controller found on the PCI bus.");
-            return;
-        }
-        Err(rtl8139::Status::InitFailed(error)) => {
-            println!("RTL8139 found but could not be initialized: {error:?}");
-            return;
-        }
-    };
+    let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
     let mut frame = [0u8; 14 + TEST_PAYLOAD.len()];
     frame[0..6].fill(0xff); // Broadcast destination.
@@ -403,18 +396,25 @@ fn nic_send() {
     }
 }
 
-fn nic_recv() {
-    let nic = match rtl8139::get() {
-        Ok(nic) => nic,
+/// Shared by every `nic` subcommand that needs the card itself (`send`,
+/// `recv`, `sniff`): reports either failure case the same way `nic`
+/// (status) does, and returns `None` so callers can just early-return.
+fn nic_or_report() -> Option<&'static rtl8139::Rtl8139> {
+    match rtl8139::get() {
+        Ok(nic) => Some(nic),
         Err(rtl8139::Status::NotPresent) => {
             println!("No RTL8139 Ethernet controller found on the PCI bus.");
-            return;
+            None
         }
         Err(rtl8139::Status::InitFailed(error)) => {
             println!("RTL8139 found but could not be initialized: {error:?}");
-            return;
+            None
         }
-    };
+    }
+}
+
+fn nic_recv() {
+    let Some(nic) = nic_or_report() else { return };
     let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
     let mut attempts = 20_000_000u32;
     loop {
@@ -439,6 +439,48 @@ fn nic_recv() {
             return;
         }
     }
+}
+
+/// Puts the card into promiscuous mode (`Rtl8139::set_promiscuous`) and
+/// prints every frame it captures -- addressed to this card or not --
+/// until F12 stops the capture, the same escape key `term` uses and for
+/// the same reason (layout-independent, unlike a Shift/AltGr combination
+/// on a Nordic keyboard). Promiscuous mode is always turned back off
+/// before returning, whether the capture ran to completion or not, so a
+/// later `nic send`/`nic recv` is not left seeing unrelated traffic.
+fn nic_sniff() {
+    let Some(nic) = nic_or_report() else { return };
+
+    println!("Enabling promiscuous mode: the card will now hand over every frame it sees");
+    println!("on the wire, not just frames addressed to it (unicast/multicast/broadcast).");
+    println!("Press F12 to stop capturing and return to the fos shell.");
+    nic.set_promiscuous(true);
+
+    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut captured = 0u32;
+    loop {
+        if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+            break;
+        }
+        if let Some(length) = nic.receive(&mut buffer) {
+            captured += 1;
+            let frame = &buffer[..length];
+            if length >= 14 {
+                println!(
+                    "#{captured} {length} bytes: dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype 0x{:02x}{:02x}",
+                    frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+                    frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+                    frame[12], frame[13]
+                );
+            } else {
+                println!("#{captured} {length} bytes (too short to hold an Ethernet header).");
+            }
+            dump_bytes(0, frame);
+        }
+    }
+
+    nic.set_promiscuous(false);
+    println!("\nPromiscuous mode disabled; captured {captured} frame(s). Back at the fos shell.");
 }
 
 

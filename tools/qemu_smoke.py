@@ -37,7 +37,7 @@ EXPECTED = (
     b"PS/2 keyboard initialized.",
     b"System: help clear about bootinfo memmap memory cpuinfo hexdump halt",
     b"Interrupts: ticks uptime irqstat pmem palloc pfree",
-    b"Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame)",
+    b"Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame),",
     b"fos is a small educational 32-bit x86 operating system.",
     b"This command does not accept arguments.",
     b"Unknown command. Type 'help' for commands.",

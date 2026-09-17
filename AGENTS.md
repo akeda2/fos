@@ -179,8 +179,9 @@ specially decoded. Native USB (and thus USB-to-serial adapters) remains out
 of scope; see "Deliberately deferred work" below.
 
 Ethernet commands: `nic` (status; probes and initializes the RTL8139 driver
-on first use), `nic send` (one raw broadcast test frame), and `nic recv`
-(polls briefly for one incoming frame and hex-dumps it).
+on first use), `nic send` (one raw broadcast test frame), `nic recv`
+(polls briefly for one incoming frame and hex-dumps it), and `nic sniff`
+(promiscuous-mode capture of every frame seen, until F12 stops it).
 
 `nic` is backed by `kernel/src/rtl8139.rs`, a polling-mode driver for the
 Realtek RTL8139 -- chosen as the one supported NIC because it is
@@ -206,7 +207,16 @@ need more than one contiguous frame). There is no protocol above raw
 Ethernet frames (no ARP, no IPv4, no sockets) and no support for any NIC
 besides the RTL8139; both are explicit scope boundaries, not oversights.
 
-## Deliberately deferred work
+`Rtl8139::set_promiscuous` is a read-modify-write toggle of `RCR`'s `AAP`
+("accept all packets") bit, layered on top of the accept-filter bits `init`
+already sets in `RCR_CONFIG`, so it must not disturb them. `nic sniff`
+(`shell.rs`) enables it, polls `receive` in a loop printing every frame
+until `keyboard::poll_term_event()` reports the F12 escape -- the same
+mechanism and rationale `term_loop` uses -- and always disables it again on
+the way out, whether the loop ran to completion or was interrupted, so a
+later `nic send`/`nic recv` is not left seeing unrelated traffic.
+
+
 
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
   native USB, further hardware IRQ drivers beyond the timer/keyboard, robust

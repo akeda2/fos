@@ -54,6 +54,13 @@ const CR_RST: u8 = 1 << 4; // Software reset.
 /// of slack at the end (see `RX_BUF_LEN`'s doc comment).
 const RCR_CONFIG: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 7);
 
+/// Accept All Packets: with this bit set, the card hands over every frame
+/// it sees on the wire regardless of destination address, instead of only
+/// unicast/multicast/broadcast frames matched by `RCR_CONFIG`. Left off by
+/// `init` (real traffic is noisy and rarely useful to see in full); toggled
+/// on only for `set_promiscuous`, which backs the shell's `nic sniff`.
+const RCR_AAP: u32 = 1 << 0;
+
 const TSD_TOK: u32 = 1 << 15; // Transmit OK.
 const TSD_TUN: u32 = 1 << 14; // Transmit FIFO underrun.
 const TSD_TABT: u32 = 1 << 30; // Transmit abort.
@@ -168,6 +175,20 @@ impl Rtl8139 {
             *byte = read8(self.io_base, REG_IDR0 + index as u16);
         }
         mac
+    }
+
+    /// Enables or disables promiscuous mode (`RCR`'s `AAP` bit, see its
+    /// doc comment). Read-modify-write, since `RCR` also holds the
+    /// unrelated accept-filter bits `init` set up in `RCR_CONFIG` and
+    /// this must not disturb them.
+    pub fn set_promiscuous(&self, enabled: bool) {
+        let mut rcr = read32(self.io_base, REG_RCR);
+        if enabled {
+            rcr |= RCR_AAP;
+        } else {
+            rcr &= !RCR_AAP;
+        }
+        write32(self.io_base, REG_RCR, rcr);
     }
 
     /// Transmits one raw Ethernet frame (destination MAC + source MAC +
