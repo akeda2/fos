@@ -77,7 +77,8 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 to exit)");
                 println!("Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame),");
         println!("          nic sniff (promiscuous capture; F12 to stop)");
-        println!("          chat [PEER_MAC] (broadcast or unicast text chat; F12 or /quit to leave)");
+        println!("          nic discover (probe for other listening fos machines), nic peers (list them)");
+        println!("          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 or /quit to leave)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -351,12 +352,14 @@ const TEST_PAYLOAD: &[u8] = b"fos raw ethernet test frame";
 /// test frame (see `TEST_ETHERTYPE`); `nic recv` polls briefly for one
 /// incoming frame and hex-dumps it if one arrives; `nic sniff` runs a
 /// continuous promiscuous-mode capture, printing every frame seen until
-/// F12 stops it. There is no protocol above raw Ethernet here (no ARP,
-/// no IPv4) -- this only exercises the card itself.
+/// F12 stops it; `nic discover` broadcasts a `chat` discovery probe and
+/// lists whoever answers; `nic peers` shows the peer list discovered so
+/// far without sending anything. There is no protocol above raw Ethernet
+/// here (no ARP, no IPv4) -- this only exercises the card itself.
 fn nic_command(arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
     if !remainder.is_empty() {
-        println!("Usage: nic [send|recv|sniff]");
+        println!("Usage: nic [send|recv|sniff|discover|peers]");
         return;
     }
     match subcommand {
@@ -364,7 +367,9 @@ fn nic_command(arguments: &[u8]) {
         b"send" => nic_send(),
         b"recv" => nic_recv(),
         b"sniff" => nic_sniff(),
-        _ => println!("Usage: nic [send|recv|sniff]"),
+        b"discover" => nic_discover(),
+        b"peers" => print_peers(),
+        _ => println!("Usage: nic [send|recv|sniff|discover|peers]"),
     }
 }
 
@@ -485,49 +490,160 @@ fn nic_sniff() {
     println!("\nPromiscuous mode disabled; captured {captured} frame(s). Back at the fos shell.");
 }
 
-/// A dedicated ethertype for `chat`, distinct from `TEST_ETHERTYPE`, so a
-/// `nic sniff` capture (or a stray `nic recv`) never mistakes a chat line
-/// for test traffic or vice versa. `0x88b5`/`0x88b6` are the two ethertypes
-/// IEEE 802 reserves together for exactly this kind of local, non-routable
-/// protocol experiment.
+/// A dedicated ethertype for `chat` and its discovery probes, distinct from
+/// `TEST_ETHERTYPE`, so a `nic sniff` capture (or a stray `nic recv`) never
+/// mistakes fos's own chat traffic for `nic send`'s test frames or vice
+/// versa. `0x88b5`/`0x88b6` are the two ethertypes IEEE 802 reserves
+/// together for exactly this kind of local, non-routable protocol
+/// experiment.
 const CHAT_ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const CHAT_TEXT_CAPACITY: usize = 200;
 const BROADCAST_MAC: [u8; 6] = [0xff; 6];
 
+/// Every `CHAT_ETHERTYPE` frame carries a one-byte message tag right after
+/// the Ethernet header, ahead of any per-message data, so one ethertype can
+/// carry both ordinary chat lines and the small discovery exchange below
+/// without inventing a second ethertype fos has no IEEE reservation for.
+const CHAT_TAG_TEXT: u8 = 0x01;
+const CHAT_TAG_DISCOVER_REQUEST: u8 = 0x02;
+const CHAT_TAG_DISCOVER_REPLY: u8 = 0x03;
+
+const MAX_PEERS: usize = 16;
+
+/// Every MAC address any `nic discover` probe or `chat` auto-reply has ever
+/// seen on this wire, in first-seen order; the shell's only address book
+/// (see `remember_peer`/`peer_by_index`/`print_peers`). A plain array is
+/// enough here, matching this project's general preference for small fixed
+/// tables over dynamic collections (there is no heap in this kernel).
+static mut PEERS: [[u8; 6]; MAX_PEERS] = [[0; 6]; MAX_PEERS];
+static mut PEER_COUNT: usize = 0;
+
+/// Records `mac` in the peer table if it is not already there, silently
+/// dropping it once the table is full (`MAX_PEERS`) rather than growing --
+/// this is a teaching aid for a handful of QEMU/LAN peers, not an address
+/// book meant to scale. Returns whether `mac` was newly added.
+fn remember_peer(mac: [u8; 6]) -> bool {
+    let peers = &raw mut PEERS;
+    let count = &raw mut PEER_COUNT;
+    unsafe {
+        if (&*peers)[..*count].contains(&mac) {
+            return false;
+        }
+        if *count >= MAX_PEERS {
+            return false;
+        }
+        (*peers)[*count] = mac;
+        *count += 1;
+        true
+    }
+}
+
+/// Looks up a peer by its 1-based position in `nic peers`' printed list
+/// (matching how `chat` accepts a peer number as shorthand for a full MAC
+/// address).
+fn peer_by_index(index: usize) -> Option<[u8; 6]> {
+    let peers = &raw const PEERS;
+    let count = unsafe { PEER_COUNT };
+    if index == 0 || index > count {
+        return None;
+    }
+    Some(unsafe { (*peers)[index - 1] })
+}
+
+fn print_peers() {
+    let peers = &raw const PEERS;
+    let count = unsafe { PEER_COUNT };
+    if count == 0 {
+        println!("No peers known yet. Run 'nic discover' to broadcast a probe -- other fos");
+        println!("machines only answer it while their own 'chat' or 'nic discover' is running.");
+        return;
+    }
+    println!("Known peers (use the number with 'chat' instead of a full MAC):");
+    for index in 0..count {
+        println!("  {}: {}", index + 1, Mac(&unsafe { (*peers)[index] }));
+    }
+}
+
+/// Broadcasts one discovery probe (`CHAT_TAG_DISCOVER_REQUEST`) and listens
+/// briefly for replies, adding every distinct source MAC seen to the peer
+/// table. There is no interrupt-driven network service in this kernel (see
+/// "Current boundaries" in `AGENTS.md`), so a reply only ever comes from a
+/// fos machine whose own `chat` or `nic discover` happens to be running and
+/// polling its card at that moment -- this only finds who is listening
+/// *right now*, not who exists on the network.
+fn nic_discover() {
+    let Some(nic) = nic_or_report() else { return };
+    let source = nic.mac_address();
+    send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
+    println!("Broadcast a discovery probe; listening for replies for a couple of seconds...");
+
+    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut attempts = 60_000_000u32;
+    let mut discovered = 0u32;
+    while attempts > 0 {
+        attempts -= 1;
+        let Some(length) = nic.receive(&mut buffer) else { continue };
+        let frame = &buffer[..length];
+        if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE || frame[14] != CHAT_TAG_DISCOVER_REPLY {
+            continue;
+        }
+        let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+        if remember_peer(peer_mac) {
+            discovered += 1;
+        }
+    }
+
+    println!("Received {discovered} new reply/replies.");
+    print_peers();
+}
+
 /// `chat` (no arguments) is an open, broadcast text chat: every frame it
 /// sends goes to the broadcast address, and it displays any `CHAT_ETHERTYPE`
-/// frame it receives from anyone. `chat AA:BB:CC:DD:EE:FF` instead targets
-/// one peer directly (a real unicast Ethernet address, not a broadcast) and
-/// only displays frames whose *source* matches that address, for a private
-/// two-machine conversation -- both send and receive reuse the exact same
-/// `Rtl8139::send`/`receive` calls either way, since addressing is just a
-/// different destination MAC, not a different protocol.
+/// text frame it receives from anyone. `chat AA:BB:CC:DD:EE:FF` (or, once
+/// `nic discover` has found peers, the shorter `chat N`, a 1-based number
+/// from `nic peers`) instead targets one peer directly (a real unicast
+/// Ethernet address, not a broadcast) and only displays lines whose
+/// *source* matches that address, for a private two-machine conversation --
+/// every mode reuses the exact same `Rtl8139::send`/`receive` calls, since
+/// addressing here is just a different destination MAC, not a different
+/// protocol.
 ///
 /// Typed lines are sent on Enter, one line per frame, with the same
 /// backspace/echo/length-limit handling the main shell prompt itself uses;
 /// incoming lines are printed as they arrive, tagged with the sender's MAC.
 /// Because incoming lines can arrive while a local line is only half typed,
 /// they may interleave with it on screen -- a known, accepted simplification
-/// for a single-scrolling-console chat, not a bug. Leaves through F12 (only
-/// available from the local PS/2 keyboard, same as `term`/`nic sniff`) or by
-/// typing the line `/quit` (which also works from a serial-only session,
-/// since -- unlike `term` -- `chat` never takes over the serial console).
+/// for a single-scrolling-console chat, not a bug. While running, `chat`
+/// also silently answers any discovery probe it sees (see `nic discover`)
+/// with a one-line note, so simply leaving a chat session open is enough to
+/// make a machine discoverable. Leaves through F12 (only available from the
+/// local PS/2 keyboard, same as `term`/`nic sniff`) or by typing the line
+/// `/quit` (which also works from a serial-only session, since -- unlike
+/// `term` -- `chat` never takes over the serial console).
 fn chat_command(arguments: &[u8]) {
     let (peer_word, remainder) = take_word(arguments);
     if !remainder.is_empty() {
-        println!("Usage: chat [PEER_MAC]");
+        println!("Usage: chat [PEER_MAC|PEER_NUMBER]");
         return;
     }
     let peer = if peer_word.is_empty() {
         None
-    } else {
-        match parse_mac(peer_word) {
+    } else if let Some(mac) = parse_mac(peer_word) {
+        Some(mac)
+    } else if let Some(index) = parse_number(peer_word) {
+        match peer_by_index(index as usize) {
             Some(mac) => Some(mac),
             None => {
-                println!("'{}' is not a MAC address in aa:bb:cc:dd:ee:ff form.", core::str::from_utf8(peer_word).unwrap_or("?"));
+                println!("No peer #{index} known; run 'nic discover' first, or give a full MAC address.");
                 return;
             }
         }
+    } else {
+        println!(
+            "'{}' is neither a MAC address (aa:bb:cc:dd:ee:ff) nor a known peer number; see 'nic peers'.",
+            core::str::from_utf8(peer_word).unwrap_or("?")
+        );
+        return;
     };
 
     let Some(nic) = nic_or_report() else { return };
@@ -535,10 +651,7 @@ fn chat_command(arguments: &[u8]) {
     let source = nic.mac_address();
 
     match peer {
-        Some(mac) => println!(
-            "Chatting with {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} only. F12 or '/quit' to leave.",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        ),
+        Some(mac) => println!("Chatting with {} only. F12 or '/quit' to leave.", Mac(&mac)),
         None => println!("Broadcasting to everyone listening. F12 or '/quit' to leave."),
     }
 
@@ -589,7 +702,7 @@ fn chat_command(arguments: &[u8]) {
         }
 
         if let Some(received) = nic.receive(&mut recv_buffer) {
-            print_chat_frame(&recv_buffer[..received], peer.as_ref());
+            handle_incoming_chat_frame(nic, &recv_buffer[..received], &source, peer.as_ref());
         }
     }
 
@@ -597,39 +710,74 @@ fn chat_command(arguments: &[u8]) {
 }
 
 fn send_chat_line(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], text: &[u8]) {
-    let mut frame = [0u8; 14 + CHAT_TEXT_CAPACITY];
+    let mut frame = [0u8; 15 + CHAT_TEXT_CAPACITY];
     frame[0..6].copy_from_slice(destination);
     frame[6..12].copy_from_slice(source);
     frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
-    frame[14..14 + text.len()].copy_from_slice(text);
-    if !nic.send(&frame[..14 + text.len()]) {
+    frame[14] = CHAT_TAG_TEXT;
+    frame[15..15 + text.len()].copy_from_slice(text);
+    if !nic.send(&frame[..15 + text.len()]) {
         println!("(message not sent: card reported an error, or timed out)");
     }
 }
 
-/// Prints one received frame if it is a `chat` line meant for us: the right
-/// ethertype, and -- when in a unicast conversation (`peer` is `Some`) --
-/// from that exact peer (broadcast-mode `chat` shows lines from anyone).
-/// Trailing zero bytes are trimmed before decoding as text, since short
-/// lines are zero-padded up to Ethernet's 60-byte minimum frame length the
-/// same way `Rtl8139::send`/`tools/send_frame.py` both already do.
-fn print_chat_frame(frame: &[u8], peer: Option<&[u8; 6]>) {
-    if frame.len() < 14 || frame[12..14] != CHAT_ETHERTYPE {
+/// Sends a zero-length `CHAT_ETHERTYPE` control frame (a discovery request
+/// or reply): just the Ethernet header plus the one-byte tag, since neither
+/// message needs a body -- the requester learns a peer's address from the
+/// reply's own source MAC, not from anything inside it.
+fn send_chat_control(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], tag: u8) {
+    let mut frame = [0u8; 15];
+    frame[0..6].copy_from_slice(destination);
+    frame[6..12].copy_from_slice(source);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = tag;
+    nic.send(&frame);
+}
+
+/// Handles one received frame during `chat`: a `CHAT_TAG_TEXT` line is
+/// printed (filtered to `peer`'s source address in a unicast conversation;
+/// shown from anyone while broadcasting) after trimming the trailing zero
+/// padding `send_chat_line`/`Rtl8139::send`/`tools/send_frame.py` all add to
+/// reach Ethernet's 60-byte minimum frame length. A `CHAT_TAG_DISCOVER_REQUEST`
+/// is answered automatically with a reply addressed straight back to its
+/// sender (never broadcast, to keep replies from also broadcasting to every
+/// other listener) and remembered as a peer, exactly as if `nic discover`
+/// itself had seen it; anything else (including a stray discovery reply
+/// while just chatting) is ignored.
+fn handle_incoming_chat_frame(nic: &rtl8139::Rtl8139, frame: &[u8], own_mac: &[u8; 6], peer: Option<&[u8; 6]>) {
+    if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
         return;
     }
-    let source = &frame[6..12];
-    if let Some(peer) = peer {
-        if source != peer {
-            return;
+    let source: [u8; 6] = frame[6..12].try_into().unwrap();
+    match frame[14] {
+        CHAT_TAG_TEXT => {
+            if let Some(peer) = peer {
+                if &source != peer {
+                    return;
+                }
+            }
+            let payload = &frame[15..];
+            let text_end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
+            let text = core::str::from_utf8(&payload[..text_end]).unwrap_or("<non-UTF-8 chat data>");
+            println!("\n{}: {text}", Mac(&source));
         }
+        CHAT_TAG_DISCOVER_REQUEST => {
+            remember_peer(source);
+            send_chat_control(nic, &source, own_mac, CHAT_TAG_DISCOVER_REPLY);
+            println!("\n(replied to a discovery probe from {})", Mac(&source));
+        }
+        _ => {}
     }
-    let payload = &frame[14..];
-    let text_end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
-    let text = core::str::from_utf8(&payload[..text_end]).unwrap_or("<non-UTF-8 chat data>");
-    println!(
-        "\n{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}: {text}",
-        source[0], source[1], source[2], source[3], source[4], source[5]
-    );
+}
+
+/// Displays a MAC address as `aa:bb:cc:dd:ee:ff` wherever `println!`/`print!`
+/// need one, without repeating the six-field hex format at every call site.
+struct Mac<'a>(&'a [u8; 6]);
+
+impl core::fmt::Display for Mac<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5])
+    }
 }
 
 /// Parses `aa:bb:cc:dd:ee:ff`-style text into a MAC address, mirroring

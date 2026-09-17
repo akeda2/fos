@@ -112,7 +112,9 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
 | `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
 | `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 stops the capture, then turns promiscuous mode back off. |
-| `chat [PEER_MAC]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. Leave with F12 (local keyboard) or by typing `/quit` (works over serial too). |
+| `nic discover` | Broadcasts a `chat`-protocol discovery probe and listens briefly for replies, adding every distinct responder to a numbered peer list (only fos machines currently running `chat` or `nic discover` reply). |
+| `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
+| `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (local keyboard) or by typing `/quit` (works over serial too). |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -271,14 +273,19 @@ are easy to recognize, but `--ethertype` can send something else.
 `chat` is a small two-way text chat built out of the same two primitives
 `nic sniff` and `term` already demonstrate separately: `nic sniff`'s
 receive-and-print loop and `term`'s line-input-and-echo loop, merged into
-one full-duplex loop. Every typed line becomes one frame (ethertype
-`0x88b6`, IEEE's other "local experimental" value, paired with `0x88b5` and
-kept distinct from it so `nic sniff`/`nic recv` never mistake a chat line
-for test traffic or vice versa); every matching incoming frame is printed
-tagged with its sender's MAC. With no argument, `chat` broadcasts to and
-listens for everyone; `chat aa:bb:cc:dd:ee:ff` instead sends only to that
+one full-duplex loop. Every `CHAT_ETHERTYPE` frame (`0x88b6`, IEEE's other
+"local experimental" value, paired with `0x88b5` and kept distinct from it
+so `nic sniff`/`nic recv` never mistake chat traffic for test traffic or
+vice versa) starts with a one-byte message tag right after the Ethernet
+header, so the one ethertype can carry both ordinary text lines and the
+small discovery exchange below without inventing a third, unreserved
+ethertype. Every typed line becomes one tagged text frame; every matching
+incoming text frame is printed tagged with its sender's MAC. With no
+argument, `chat` broadcasts to and listens for everyone; `chat
+aa:bb:cc:dd:ee:ff` (or, once `nic discover`/`nic peers` has found some
+peers, the shorter `chat N` for peer number `N`) instead sends only to that
 one peer and only displays frames whose *source* matches it, for a private
-two-machine conversation -- both modes call the exact same
+two-machine conversation -- every mode calls the exact same
 `Rtl8139::send`/`receive`, since addressing here is just a different
 destination MAC, not a different protocol or a driver change. Short/long
 lines are zero-padded/truncated the same way `nic send` and
@@ -289,6 +296,25 @@ works from a serial-only session, since `chat` never takes over the serial
 console the way `term` does. A known, accepted simplification: an incoming
 line can interleave on screen with a local line that is only half-typed,
 since both share one scrolling console.
+
+`nic discover` and `nic peers` add a numbered address book on top of that
+same tagged-frame format, so a peer can be named `chat 1` instead of typing
+its full MAC every time. `nic discover` broadcasts a `CHAT_TAG_DISCOVER_REQUEST`
+frame and then polls the card for a bounded window, remembering the source
+MAC of every `CHAT_TAG_DISCOVER_REPLY` it sees; `nic peers` just prints the
+list built so far, without sending anything. There is no interrupt-driven
+network service in this kernel -- every receive is a polled `nic.receive()`
+call somewhere in a foreground loop -- so a probe is only ever answered by a
+fos machine whose own `chat` or `nic discover` happens to be running and
+polling its card at that exact moment; anyone not actively at a `chat`
+prompt or mid-`nic discover` is simply invisible, honestly reflecting that
+constraint rather than hiding it behind a fake "background service". Whoever
+receives a `CHAT_TAG_DISCOVER_REQUEST` (whether from `nic discover` or a
+running `chat` session) replies with one unicast `CHAT_TAG_DISCOVER_REPLY`
+frame straight back to the requester's source MAC (never broadcast, so
+replies don't also broadcast to every other listener) and remembers the
+requester as a peer too, so discovery is naturally symmetric after one
+round.
 
 
 ## Booting from a NIC ROM

@@ -181,8 +181,10 @@ of scope; see "Deliberately deferred work" below.
 Ethernet commands: `nic` (status; probes and initializes the RTL8139 driver
 on first use), `nic send` (one raw broadcast test frame), `nic recv`
 (polls briefly for one incoming frame and hex-dumps it), `nic sniff`
-(promiscuous-mode capture of every frame seen, until F12 stops it), and
-`chat [PEER_MAC]` (line-based broadcast or unicast text chat; see below).
+(promiscuous-mode capture of every frame seen, until F12 stops it),
+`nic discover`/`nic peers` (broadcast/list a numbered address book of other
+listening fos machines), and `chat [PEER_MAC|PEER_NUMBER]` (line-based
+broadcast or unicast text chat; see below).
 
 `nic` is backed by `kernel/src/rtl8139.rs`, a polling-mode driver for the
 Realtek RTL8139 -- chosen as the one supported NIC because it is
@@ -230,22 +232,49 @@ changes.
 `chat` (`shell.rs`) is built from the same two pieces `nic sniff` and
 `term` already demonstrate separately, merged into one full-duplex loop: a
 receive-and-print loop (`Rtl8139::receive` + `CHAT_ETHERTYPE` filtering, in
-`print_chat_frame`) and a line-input-and-echo loop (`keyboard::poll_term_event`
-for local keys, `console::read_serial_byte` as an equally valid input
-source so `/quit` also works over a serial-only session -- unlike `term`,
-`chat` never repurposes the serial console, so there is no reason to
-restrict it to the keyboard). `CHAT_ETHERTYPE` (`0x88b6`) is deliberately
-distinct from `TEST_ETHERTYPE` (`0x88b5`, `nic send`'s), even though IEEE
-reserves both together for exactly this kind of local experiment, so a
-`nic sniff`/`nic recv` capture can't confuse a chat line for test traffic.
-`chat AA:BB:CC:DD:EE:FF` (parsed by the local `parse_mac`, which mirrors
-`tools/send_frame.py`'s Python function of the same name) targets one peer
-directly instead of broadcasting; unicast needed no driver changes at all,
-since `Rtl8139::send`/`receive` already handle any destination address --
-only the shell layer's addressing and inbound source-MAC filtering needed
-to be added. Received payloads are trimmed of trailing zero padding (the
-same padding `Rtl8139::send` and `tools/send_frame.py` both add to reach
-Ethernet's 60-byte minimum frame length) before being decoded as UTF-8.
+`handle_incoming_chat_frame`) and a line-input-and-echo loop
+(`keyboard::poll_term_event` for local keys, `console::read_serial_byte` as
+an equally valid input source so `/quit` also works over a serial-only
+session -- unlike `term`, `chat` never repurposes the serial console, so
+there is no reason to restrict it to the keyboard). `CHAT_ETHERTYPE`
+(`0x88b6`) is deliberately distinct from `TEST_ETHERTYPE` (`0x88b5`, `nic
+send`'s), even though IEEE reserves both together for exactly this kind of
+local experiment, so a `nic sniff`/`nic recv` capture can't confuse chat
+traffic for test traffic. `chat AA:BB:CC:DD:EE:FF` (parsed by the local
+`parse_mac`, which mirrors `tools/send_frame.py`'s Python function of the
+same name) targets one peer directly instead of broadcasting; unicast
+needed no driver changes at all, since `Rtl8139::send`/`receive` already
+handle any destination address -- only the shell layer's addressing and
+inbound source-MAC filtering needed to be added.
+
+Every `CHAT_ETHERTYPE` frame carries a one-byte message tag right after the
+Ethernet header (`CHAT_TAG_TEXT`/`CHAT_TAG_DISCOVER_REQUEST`/
+`CHAT_TAG_DISCOVER_REPLY`), so the single ethertype can carry both chat
+lines and the small peer-discovery exchange below without needing a third,
+unreserved ethertype. A `CHAT_TAG_TEXT` payload is trimmed of trailing zero
+padding (the same padding `Rtl8139::send` and `tools/send_frame.py` both
+add to reach Ethernet's 60-byte minimum frame length) before being decoded
+as UTF-8.
+
+`nic discover`/`nic peers` add a small numbered peer table
+(`PEERS`/`PEER_COUNT` statics, capped at `MAX_PEERS` = 16, deliberately not
+dynamically sized since this kernel has no heap) so a peer can be named
+`chat 1` instead of a full MAC. `nic discover` broadcasts one
+`CHAT_TAG_DISCOVER_REQUEST` and busy-polls `receive` for a bounded window
+(unlike `nic_recv`'s single-frame timeout, this window keeps collecting
+after the first reply, since several peers might answer); `nic peers` just
+prints the table. Whoever receives a `CHAT_TAG_DISCOVER_REQUEST` -- whether
+via `nic discover` or a running `chat` session's own receive loop --
+answers with one unicast `CHAT_TAG_DISCOVER_REPLY` straight back to the
+requester's source MAC (never broadcast, so replying doesn't also
+broadcast to every other listener) and remembers the requester too, making
+discovery symmetric after one round. Because this kernel has no
+interrupt-driven network service (every receive is a polled call inside a
+foreground loop -- `nic_recv`, `nic sniff`, `chat`, or `nic discover`
+itself), a probe only ever gets a reply from a fos machine that happens to
+be inside `chat` or `nic discover` at that exact moment; this is a real,
+honestly-documented limit of the polling design, not a bug to eventually
+fix with a background listener.
 
 
 
