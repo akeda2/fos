@@ -38,6 +38,32 @@ that obscure hardware behavior.
 - `kernel/src/fosfs.rs` implements FOSFS, a deliberately small custom
   filesystem: one superblock, four directory sectors, 64 fixed entries, and
   contiguous one-sector files.
+- `boot/netrom.S` is an optional, parallel boot path: a PCI expansion ROM that
+  boots fos from a NIC's own boot ROM instead of disk/USB (`make netrom`,
+  producing `build/netboot.rom`; never part of `make image`/`run`/`test`).
+  It reuses `stage2.S`'s narration/E820/A20/GDT logic but must treat its own
+  ROM image as read-only at run time (a shadowed option ROM cannot be
+  written back to) -- see "Low-memory map" below for the scratch RAM this
+  forces it to use instead.
+
+## Low-memory map
+
+Real-mode code before the kernel's own memory management exists shares a
+handful of fixed low-memory addresses across `stage1.S`, `stage2.S`, and
+`netrom.S`. There is no single enforcing mechanism for this -- it is
+convention only -- so treat this table as authoritative before adding any new
+fixed address below `0x20000`, and update it in the same change that adds one:
+
+| Address | Used by | Purpose |
+| --- | --- | --- |
+| `0x500`-`0x510` | `stage2.S` (`verify_a20`) | Two probe bytes used to detect whether the A20 line is enabled. |
+| `0x600`-`0x613` | `netrom.S` | Scratch RAM for state a shadowed (read-only) option ROM cannot mutate in place: computed ROM segment/physical base, serial-availability flag, and the GDT/protected-entry descriptors used to enter protected mode. |
+| `0x5000` | `stage2.S`, `netrom.S`, `kernel/` | The packed `BootInfo` struct: the loader/kernel ABI. |
+| `0x7a00` | `stage2.S`, `netrom.S` | Real-mode stack pointer during boot. |
+| `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
+| `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
+| `0x9f000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer, just below the conventional End-of-Low-Memory / EBDA boundary. |
+| `0x10000`-`0x20000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
 
 ## Educational verbosity
 
@@ -81,6 +107,18 @@ make test     # Runs the serial-driven QEMU smoke test.
 Always run `make test` for boot, loader, kernel, shell, disk, or FOSFS changes.
 The smoke harness must use bounded waits, preserve serial output on failure,
 and wait for the prompt before sending input.
+
+When debugging 16-bit real-mode code (`stage1.S`, `stage2.S`, `netrom.S`),
+always disassemble with `objdump -d -M i8086 <object-file>`. Plain
+`objdump -d` on these ELF objects defaults to 32-bit operand/address
+decoding regardless of the source's `.code16` directives and silently
+produces wrong instruction lengths and operands -- confusing, not just
+unhelpful. `qemu-system-i386 -d int,cpu_reset -D <logfile>` (kept separate
+from any `-serial file:...` log) is the other key tool: it dumps full CPU
+register state, including segment/descriptor caches, at every exception or
+reset, and pairs with `nm`/`objdump` on the *freshly rebuilt* object (stale
+builds shift symbol offsets and will mislead you) to map a faulting address
+back to source.
 
 ## Current command surface
 
