@@ -169,9 +169,17 @@ impl Rtl8139 {
 
         write32(io_base, REG_RBSTART, rx_buffer);
         write16(io_base, REG_IMR, 0x0000); // No interrupt line use; see module docs.
+        // The transmitter/receiver enable bits must be set in CR *before*
+        // RCR/TCR are written, not after: those two registers also carry
+        // FIFO/DMA threshold fields, and on real silicon (unlike QEMU's
+        // more forgiving emulated card) writing them while Tx/Rx are still
+        // disabled leaves those threshold fields not properly latched --
+        // the card still reports a normal-looking TOK for every send, but
+        // nothing usable ever reaches the wire. Linux's 8139too.c driver
+        // documents this exact ordering requirement.
+        write8(io_base, REG_CR, CR_TE | CR_RE);
         write32(io_base, REG_RCR, RCR_CONFIG);
         write32(io_base, REG_TCR, TCR_STANDARD_IFG);
-        write8(io_base, REG_CR, CR_TE | CR_RE);
         write16(io_base, REG_ISR, 0xffff); // Clear any latched status from before reset.
 
         Ok(Rtl8139 { io_base, rx_buffer, rx_offset: Cell::new(0), tx_buffers, tx_next: Cell::new(0) })
