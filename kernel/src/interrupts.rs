@@ -1,15 +1,22 @@
-//! Minimal interrupt infrastructure: an IDT with just the two vectors this
-//! kernel actually drives (the PIT timer and the PS/2 keyboard), remapped
-//! away from the CPU exception range, plus tiny lock-free counters and a
-//! scancode queue that the shell drains between prompts.
+//! Minimal interrupt infrastructure: an IDT with all 32 reserved CPU
+//! exception vectors (each just reporting what fired and halting -- see
+//! `report_exception`) plus the two vectors this kernel actually drives
+//! (the PIT timer and the PS/2 keyboard), remapped away from the CPU
+//! exception range; plus tiny lock-free counters and a scancode queue that
+//! the shell drains between prompts.
 //!
-//! Everything else (page faults, double faults, other IRQs) is intentionally
-//! left unhandled: robust fault recovery is deliberately deferred, per the
-//! project's teaching scope.
+//! There is still no fault *recovery* here (an exception halts, it never
+//! resumes) -- that remains deliberately out of scope, per the project's
+//! teaching goals. But leaving exceptions completely unhandled meant any
+//! unexpected fault (page fault, GPF, ...) fell through to a double, then a
+//! triple fault -- an unconditional CPU reset with no diagnostic at all,
+//! which is exactly what real hardware looks like when something in this
+//! kernel goes wrong that QEMU never reproduces. A minimal, halting handler
+//! for every vector turns that silent reset loop into a legible message.
 
 use core::arch::asm;
 
-use crate::arch::x86::outb;
+use crate::arch::x86::{io_wait, outb};
 use crate::keyboard;
 
 const CODE_SELECTOR: u16 = 0x08;
@@ -69,7 +76,18 @@ impl IdtEntry {
     }
 
     fn gate(handler: extern "x86-interrupt" fn(InterruptStackFrame)) -> Self {
-        let address = handler as usize as u32;
+        Self::from_address(handler as usize as u32)
+    }
+
+    /// For the handful of CPU exception vectors where the processor itself
+    /// pushes a 32-bit error code below the return address (see
+    /// `install_exception_handlers`); the handler's signature must include
+    /// it, or it will read the return address as if it were one instead.
+    fn gate_with_error_code(handler: extern "x86-interrupt" fn(InterruptStackFrame, u32)) -> Self {
+        Self::from_address(handler as usize as u32)
+    }
+
+    fn from_address(address: u32) -> Self {
         Self {
             offset_low: address as u16,
             selector: CODE_SELECTOR,
@@ -96,6 +114,7 @@ static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
 /// loop starts consuming `pop_scancode`.
 pub fn initialize() {
     unsafe {
+        install_exception_handlers();
         IDT[usize::from(TIMER_VECTOR)] = IdtEntry::gate(timer_interrupt);
         IDT[usize::from(KEYBOARD_VECTOR)] = IdtEntry::gate(keyboard_interrupt);
     }
@@ -161,21 +180,42 @@ const BIOS_PIC1_OFFSET: u8 = 0x08;
 const BIOS_PIC2_OFFSET: u8 = 0x70;
 
 fn program_pic(master_offset: u8, slave_offset: u8, master_mask: u8, slave_mask: u8) {
+    // Real 8259 PICs (or their chipset-integrated equivalents) can be slow
+    // to latch a command byte; issuing the next one before that happens is
+    // silently ignored, leaving the PIC mis-programmed rather than causing
+    // any visible error. QEMU's emulated 8259 tolerates back-to-back writes
+    // fine, but this has been observed to matter on real hardware (see
+    // "Real hardware notes" in AGENTS.md) -- a mis-programmed PIC can leave
+    // an IRQ vectored into the CPU exception range instead of `IRQ_BASE`,
+    // and since this kernel installs no exception handlers, the very first
+    // such interrupt double- (then triple-) faults the machine, which looks
+    // exactly like a reset loop. `io_wait` after every `outb` here gives
+    // the chip time to catch up.
     unsafe {
         // ICW1: begin initialization, expect ICW4.
         outb(PIC1_COMMAND, 0x11);
+        io_wait();
         outb(PIC2_COMMAND, 0x11);
+        io_wait();
         // ICW2: vector offsets.
         outb(PIC1_DATA, master_offset);
+        io_wait();
         outb(PIC2_DATA, slave_offset);
+        io_wait();
         // ICW3: master has a slave on IRQ2 (bit 2); slave's cascade identity is 2.
         outb(PIC1_DATA, 0x04);
+        io_wait();
         outb(PIC2_DATA, 0x02);
+        io_wait();
         // ICW4: 8086 mode.
         outb(PIC1_DATA, 0x01);
+        io_wait();
         outb(PIC2_DATA, 0x01);
+        io_wait();
         outb(PIC1_DATA, master_mask);
+        io_wait();
         outb(PIC2_DATA, slave_mask);
+        io_wait();
     }
 }
 
@@ -197,8 +237,11 @@ fn program_pit() {
     let divisor = (PIT_INPUT_HZ / PIT_FREQUENCY_HZ) as u16;
     unsafe {
         outb(PIT_COMMAND, 0x36); // channel 0, low+high byte, mode 3, binary
+        io_wait();
         outb(PIT_CHANNEL0_DATA, divisor as u8);
+        io_wait();
         outb(PIT_CHANNEL0_DATA, (divisor >> 8) as u8);
+        io_wait();
     }
 }
 
@@ -220,6 +263,137 @@ struct InterruptStackFrame {
     flags: u32,
     stack_pointer: u32,
     stack_segment: u32,
+}
+
+/// Human-readable names for the 32 reserved CPU exception vectors (Intel
+/// SDM Vol. 3A, ch. 6; a few late entries are AMD-specific). Used only for
+/// `report_exception`'s printed diagnostic -- a bare vector number would
+/// work too, but a name is far more useful when trying to diagnose a fault
+/// that only reproduces on real hardware and never under QEMU.
+const EXCEPTION_NAMES: [&str; 32] = [
+    "Divide Error", "Debug", "NMI Interrupt", "Breakpoint", "Overflow", "BOUND Range Exceeded",
+    "Invalid Opcode", "Device Not Available", "Double Fault", "Coprocessor Segment Overrun",
+    "Invalid TSS", "Segment Not Present", "Stack-Segment Fault", "General Protection Fault",
+    "Page Fault", "Reserved", "x87 Floating-Point Error", "Alignment Check", "Machine Check",
+    "SIMD Floating-Point Exception", "Virtualization Exception", "Control Protection Exception",
+    "Reserved", "Reserved", "Reserved", "Reserved", "Reserved", "Reserved",
+    "Hypervisor Injection Exception", "VMM Communication Exception", "Security Exception", "Reserved",
+];
+
+/// Prints what CPU exception fired, its error code (if that vector has
+/// one), and where, then halts for good -- this kernel deliberately has no
+/// fault recovery (see the module doc comment), but printing this instead
+/// of silently double- (then triple-) faulting turns an otherwise
+/// indistinguishable reset loop into a legible diagnostic. This is the
+/// single most useful thing to look at first when a boot problem only
+/// reproduces on real hardware and never under QEMU.
+fn report_exception(vector: u8, error_code: Option<u32>, frame: &InterruptStackFrame) -> ! {
+    let name = EXCEPTION_NAMES[usize::from(vector)];
+    let instruction_pointer = frame.instruction_pointer;
+    let code_segment = frame.code_segment;
+    match error_code {
+        Some(code) => crate::println!(
+            "\nCPU EXCEPTION {vector} ({name}), error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
+        ),
+        None => crate::println!(
+            "\nCPU EXCEPTION {vector} ({name}) at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
+        ),
+    }
+    crate::arch::x86::halt_forever();
+}
+
+/// Generates one `extern "x86-interrupt"` handler function per exception
+/// vector (the ABI requires a distinct function per IDT gate; a vector
+/// number can't be passed as an ordinary argument), forwarding straight to
+/// `report_exception`. Two variants exist because the CPU only pushes an
+/// error code for a handful of vectors (`gate_with_error_code`'s doc
+/// comment); calling the wrong one desyncs the stack.
+macro_rules! exception_handler {
+    ($name:ident, $vector:expr) => {
+        extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+            report_exception($vector, None, &frame);
+        }
+    };
+}
+macro_rules! exception_handler_with_error_code {
+    ($name:ident, $vector:expr) => {
+        extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u32) {
+            report_exception($vector, Some(error_code), &frame);
+        }
+    };
+}
+
+exception_handler!(exception_00_divide_error, 0);
+exception_handler!(exception_01_debug, 1);
+exception_handler!(exception_02_nmi, 2);
+exception_handler!(exception_03_breakpoint, 3);
+exception_handler!(exception_04_overflow, 4);
+exception_handler!(exception_05_bound_range_exceeded, 5);
+exception_handler!(exception_06_invalid_opcode, 6);
+exception_handler!(exception_07_device_not_available, 7);
+exception_handler_with_error_code!(exception_08_double_fault, 8);
+exception_handler!(exception_09_coprocessor_segment_overrun, 9);
+exception_handler_with_error_code!(exception_10_invalid_tss, 10);
+exception_handler_with_error_code!(exception_11_segment_not_present, 11);
+exception_handler_with_error_code!(exception_12_stack_segment_fault, 12);
+exception_handler_with_error_code!(exception_13_general_protection_fault, 13);
+exception_handler_with_error_code!(exception_14_page_fault, 14);
+exception_handler!(exception_15_reserved, 15);
+exception_handler!(exception_16_x87_floating_point, 16);
+exception_handler_with_error_code!(exception_17_alignment_check, 17);
+exception_handler!(exception_18_machine_check, 18);
+exception_handler!(exception_19_simd_floating_point, 19);
+exception_handler!(exception_20_virtualization, 20);
+exception_handler_with_error_code!(exception_21_control_protection, 21);
+exception_handler!(exception_22_reserved, 22);
+exception_handler!(exception_23_reserved, 23);
+exception_handler!(exception_24_reserved, 24);
+exception_handler!(exception_25_reserved, 25);
+exception_handler!(exception_26_reserved, 26);
+exception_handler!(exception_27_reserved, 27);
+exception_handler!(exception_28_hypervisor_injection, 28);
+exception_handler_with_error_code!(exception_29_vmm_communication, 29);
+exception_handler_with_error_code!(exception_30_security_exception, 30);
+exception_handler!(exception_31_reserved, 31);
+
+/// Installs all 32 reserved-vector exception gates (see `report_exception`)
+/// into `IDT`, ahead of `initialize`'s own timer/keyboard gates at vectors
+/// 0x20/0x21 -- comfortably clear of this range, so there is no overlap.
+unsafe fn install_exception_handlers() {
+    unsafe {
+        IDT[0] = IdtEntry::gate(exception_00_divide_error);
+        IDT[1] = IdtEntry::gate(exception_01_debug);
+        IDT[2] = IdtEntry::gate(exception_02_nmi);
+        IDT[3] = IdtEntry::gate(exception_03_breakpoint);
+        IDT[4] = IdtEntry::gate(exception_04_overflow);
+        IDT[5] = IdtEntry::gate(exception_05_bound_range_exceeded);
+        IDT[6] = IdtEntry::gate(exception_06_invalid_opcode);
+        IDT[7] = IdtEntry::gate(exception_07_device_not_available);
+        IDT[8] = IdtEntry::gate_with_error_code(exception_08_double_fault);
+        IDT[9] = IdtEntry::gate(exception_09_coprocessor_segment_overrun);
+        IDT[10] = IdtEntry::gate_with_error_code(exception_10_invalid_tss);
+        IDT[11] = IdtEntry::gate_with_error_code(exception_11_segment_not_present);
+        IDT[12] = IdtEntry::gate_with_error_code(exception_12_stack_segment_fault);
+        IDT[13] = IdtEntry::gate_with_error_code(exception_13_general_protection_fault);
+        IDT[14] = IdtEntry::gate_with_error_code(exception_14_page_fault);
+        IDT[15] = IdtEntry::gate(exception_15_reserved);
+        IDT[16] = IdtEntry::gate(exception_16_x87_floating_point);
+        IDT[17] = IdtEntry::gate_with_error_code(exception_17_alignment_check);
+        IDT[18] = IdtEntry::gate(exception_18_machine_check);
+        IDT[19] = IdtEntry::gate(exception_19_simd_floating_point);
+        IDT[20] = IdtEntry::gate(exception_20_virtualization);
+        IDT[21] = IdtEntry::gate_with_error_code(exception_21_control_protection);
+        IDT[22] = IdtEntry::gate(exception_22_reserved);
+        IDT[23] = IdtEntry::gate(exception_23_reserved);
+        IDT[24] = IdtEntry::gate(exception_24_reserved);
+        IDT[25] = IdtEntry::gate(exception_25_reserved);
+        IDT[26] = IdtEntry::gate(exception_26_reserved);
+        IDT[27] = IdtEntry::gate(exception_27_reserved);
+        IDT[28] = IdtEntry::gate(exception_28_hypervisor_injection);
+        IDT[29] = IdtEntry::gate_with_error_code(exception_29_vmm_communication);
+        IDT[30] = IdtEntry::gate_with_error_code(exception_30_security_exception);
+        IDT[31] = IdtEntry::gate(exception_31_reserved);
+    }
 }
 
 extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {

@@ -136,15 +136,26 @@ Unknown commands and oversized input are reported rather than ignored.
 
 ## Interrupts and the physical-frame allocator
 
-The kernel builds a 256-entry IDT with only two populated gates (the PIT
-timer on IRQ0 and the PS/2 keyboard on IRQ1), remaps the 8259 PIC's vectors
-clear of the CPU's reserved exception range, and enables interrupts. Scancodes
-and timer ticks are captured by minimal ISRs and drained by the shell loop
-between prompts; see `kernel/src/interrupts.rs`. A small bitmap-based
-physical-frame allocator (`kernel/src/pmem.rs`) tracks which 4 KiB frames the
-E820 map reports as usable, reserving everything below the kernel's own
-low-memory region. There is no paging yet -- this only tracks free/used
-frames, exposed through `pmem`/`palloc`/`pfree`.
+The kernel builds a 256-entry IDT with all 32 CPU exception vectors (0-31)
+populated plus two hardware gates (the PIT timer on IRQ0 and the PS/2
+keyboard on IRQ1), remaps the 8259 PIC's vectors clear of that reserved
+exception range, and enables interrupts. Every PIC/PIT command byte is
+followed by a short `io_wait()` (a throwaway write to port `0x80`) rather
+than sent back-to-back -- some real chipsets are slower to latch a command
+than QEMU's emulated 8259, and a missed one leaves the PIC mis-programmed
+with no error of its own, which can misdirect an IRQ into the reserved
+exception range. Rather than silently faulting into a triple-fault reset,
+each exception handler prints the vector number, its name, the CPU-pushed
+error code (if any), and the faulting `CS:EIP`, then halts -- turning what
+used to look exactly like an unexplained reset loop right after boot into
+a legible diagnostic. There is still no fault *recovery*: every exception
+is treated as fatal. Scancodes and timer ticks are captured by minimal
+ISRs and drained by the shell loop between prompts; see
+`kernel/src/interrupts.rs`. A small bitmap-based physical-frame
+allocator (`kernel/src/pmem.rs`) tracks which 4 KiB frames the E820 map
+reports as usable, reserving everything below the kernel's own low-memory
+region. There is no paging yet -- this only tracks free/used frames,
+exposed through `pmem`/`palloc`/`pfree`.
 
 ## Disk access and FOSFS
 

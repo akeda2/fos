@@ -56,6 +56,21 @@ pub mod x86 {
         }
     }
 
+    /// A short, port-I/O-based delay: a throwaway write to port `0x80`,
+    /// conventionally unused (the original IBM PC used it for POST debug
+    /// codes) but still wired to the ISA/LPC bus on essentially all real
+    /// PC-compatible chipsets, so an `out` to it takes roughly the same
+    /// bus cycle time as any other I/O port access. Some real hardware --
+    /// unlike QEMU's emulated 8259, which accepts back-to-back writes with
+    /// no delay -- needs a short gap between successive command bytes sent
+    /// to slower legacy devices (the PIC being the classic example); this
+    /// gives them one without needing a calibrated timer this early in
+    /// boot, before the PIT has even been programmed.
+    #[inline]
+    pub unsafe fn io_wait() {
+        unsafe { outb(0x80, 0) }
+    }
+
     pub fn halt_forever() -> ! {
         loop {
             unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }

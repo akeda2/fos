@@ -297,13 +297,45 @@ future contributor doesn't have to rediscover them from scratch:
   USB (see `README.md`'s "Prompt" section).
 - **A20 enable order** -- `enable_a20` (`boot/stage2.S`, duplicated in
   `boot/netrom.S`) used to only write the "fast A20 gate" system control
-  port (`0x92`). That worked fine in QEMU but caused an immediate
-  reset-and-reboot loop on a real AMD Athlon 64 X2 machine -- some real
-  chipsets have side effects on writes to that port beyond toggling A20,
-  which a pure emulator won't reproduce. The fix tries the BIOS
-  (`INT 15h`, `AX=2401h`) and then the 8042 keyboard-controller gate first,
-  falling back to port `0x92` only if both fail and re-verifying A20 after
-  every attempt rather than trusting any method's own reported success.
+  port (`0x92`). That worked fine in QEMU, and this reordering is a real,
+  worthwhile robustness fix regardless, but it turned out *not* to be the
+  cause of the AMD Athlon 64 X2 reset loop below -- trying the BIOS
+  (`INT 15h`, `AX=2401h`) and the 8042 keyboard-controller gate before
+  falling back to port `0x92` (re-verifying A20 after every attempt rather
+  than trusting any method's own reported success) is still worth keeping,
+  since some real chipsets have side effects on writes to that port beyond
+  toggling A20 that a pure emulator won't reproduce -- it just wasn't
+  what was resetting *this particular* machine.
+- **PIC/PIT command timing** -- `program_pic`/`program_pit`
+  (`kernel/src/interrupts.rs`) used to send their ICW/OCW command bytes to
+  the 8259/PIT back-to-back. QEMU's emulated 8259 accepts that fine, but a
+  real chipset can be slower to latch one command byte before the next
+  arrives, silently leaving the PIC mis-programmed (there's no error
+  status to check). Back when this kernel installed no CPU exception
+  handlers, an IRQ that ended up misdirected into the reserved exception
+  range would double- (then triple-) fault on the very first timer tick
+  right after `sti`, which presents as an immediate reset loop moments
+  after boot -- this is the current leading suspect for the reset loop
+  reported on a real AMD Athlon 64 X2 (PCIe) machine that a Pentium 4
+  machine (older, no PCIe) does not exhibit; the fix inserts a short
+  `io_wait()` (a throwaway write to port `0x80`) after every PIC/PIT
+  command byte, the standard technique for this exact class of bug.
+  **Not yet confirmed against the real hardware that reported the bug.**
+- **CPU exception handlers as a diagnostic tool** -- added alongside the
+  PIC/PIT fix above, since that fix can't be confirmed without the
+  original hardware: all 32 CPU exception vectors (`kernel/src/interrupts.rs`,
+  `install_exception_handlers`) now have real IDT gates instead of being
+  left `missing()`. Each prints the vector number, its name, the
+  CPU-pushed error code if the vector has one, and the faulting `CS:EIP`,
+  then halts. This was verified in QEMU by deliberately executing `int3`
+  right after `interrupts::initialize()` and confirming the diagnostic
+  printed and the machine halted cleanly instead of resetting (then
+  reverting that temporary trigger). If the PIC/PIT fix above turns out
+  not to be the real cause and the AMD machine still resets, this is what
+  should surface the actual faulting vector next time -- ask whoever is
+  testing on real hardware whether a "CPU EXCEPTION ..." line appears
+  before any reset, since that alone would confirm or rule out this whole
+  class of bug and point at a specific vector to chase.
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
