@@ -284,12 +284,93 @@ memory_failed:
     stc
     ret
 
+# Tries progressively less gentle ways to enable the A20 address line,
+# stopping as soon as `verify_a20` reports success. Real hardware varies in
+# which of these a given chipset actually implements, and -- more
+# importantly -- some older boards react badly (occasionally even
+# resetting the CPU) to writes on the "fast A20 gate" system control port
+# (0x92) used below, so it is deliberately tried last, only once the two
+# safer options have already failed. Every step re-verifies rather than
+# trusting a method's own reported success, since a BIOS or chipset can
+# claim success without actually toggling the line. (Kept identical to
+# `stage2.S`'s copy of this same logic; this boot path can't call into
+# stage two's code, since it may run from read-only option ROM shadow
+# memory instead of stage two's own RAM location.)
 enable_a20:
+    call verify_a20
+    jnc enable_a20_done
+
+    # BIOS-assisted enable (INT 15h, AX=2401h): asks the platform to do it,
+    # touching no chipset ports directly.
+    movw $0x2401, %ax
+    int $0x15
+    call verify_a20
+    jnc enable_a20_done
+
+    # The traditional 8042 keyboard-controller gate, supported by every PC
+    # chipset since the original IBM AT and far less likely than port 0x92
+    # to have unwanted side effects on quirky real hardware.
+    call enable_a20_via_keyboard_controller
+    call verify_a20
+    jnc enable_a20_done
+
+    # Last resort: the "fast A20 gate". Bit 0 of this port can trigger an
+    # immediate CPU reset on some chipsets, so it is explicitly cleared
+    # here (never set) before the write.
     inb $0x92, %al
     orb $0x02, %al
     andb $0xfe, %al
     outb %al, $0x92
     call verify_a20
+enable_a20_done:
+    ret
+
+# Enables A20 via the keyboard controller's "write output port" command,
+# the same technique used by DOS-era bootloaders and, later, GRUB. Every
+# keyboard-controller access is bounded (see `kbc_wait_input_clear`/
+# `kbc_wait_output_full`) so a machine with no responding 8042 controller
+# still returns instead of hanging the boot forever.
+enable_a20_via_keyboard_controller:
+    call kbc_wait_input_clear
+    movb $0xad, %al
+    outb %al, $0x64
+    call kbc_wait_input_clear
+    movb $0xd0, %al
+    outb %al, $0x64
+    call kbc_wait_output_full
+    inb $0x60, %al
+    pushw %ax
+    call kbc_wait_input_clear
+    movb $0xd1, %al
+    outb %al, $0x64
+    call kbc_wait_input_clear
+    popw %ax
+    orb $0x02, %al
+    outb %al, $0x60
+    call kbc_wait_input_clear
+    movb $0xae, %al
+    outb %al, $0x64
+    call kbc_wait_input_clear
+    ret
+
+kbc_wait_input_clear:
+    movw $0xffff, %cx
+kbc_wait_input_clear_loop:
+    inb $0x64, %al
+    testb $0x02, %al
+    jz kbc_wait_input_clear_done
+    loop kbc_wait_input_clear_loop
+kbc_wait_input_clear_done:
+    ret
+
+kbc_wait_output_full:
+    movw $0xffff, %cx
+kbc_wait_output_full_loop:
+    inb $0x64, %al
+    testb $0x01, %al
+    jnz kbc_wait_output_full_done
+    loop kbc_wait_output_full_loop
+kbc_wait_output_full_done:
     ret
 
 verify_a20:

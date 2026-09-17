@@ -13,8 +13,11 @@ that obscure hardware behavior.
 - `boot/stage1.S` is the 512-byte MBR loader. It loads stage two from LBA 2048.
   It must retain the partition table area at bytes 446-509 and the `0x55aa`
   signature at bytes 510-511.
-- `boot/stage2.S` gathers E820 memory information, verifies A20, loads the
-  kernel at physical `0x10000`, and enters flat 32-bit protected mode.
+- `boot/stage2.S` gathers E820 memory information, enables and verifies A20
+  (trying, in order, the BIOS itself, the 8042 keyboard controller, and only
+  then the "fast A20 gate" port `0x92` -- see the "Real hardware notes"
+  section below for why), loads the kernel at physical `0x10000`, and enters
+  flat 32-bit protected mode.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
   low-memory kernel region through `0x20000`; do not place loader, boot-info,
   or disk-trampoline data there.
@@ -279,7 +282,35 @@ ever gets a reply from a fos machine that happens to be inside `chat` or
 limit of the polling design, not a bug to eventually
 fix with a background listener.
 
+## Real hardware notes
 
+QEMU is this project's primary validation environment, but a few behaviors
+have only ever surfaced on physical machines; both are recorded here so a
+future contributor doesn't have to rediscover them from scratch:
+
+- **VGA cursor and boot narration** -- writing to the `0xb8000` text
+  framebuffer does not move the blinking hardware cursor by itself; the
+  kernel drives the CRTC cursor-position ports (`0x3d4`/`0x3d5`) explicitly
+  after every write, and continues from wherever the real-mode loader's own
+  BIOS-teletype printing left the cursor rather than clearing the screen at
+  boot, both confirmed necessary on a real Pentium 4 machine booted from
+  USB (see `README.md`'s "Prompt" section).
+- **A20 enable order** -- `enable_a20` (`boot/stage2.S`, duplicated in
+  `boot/netrom.S`) used to only write the "fast A20 gate" system control
+  port (`0x92`). That worked fine in QEMU but caused an immediate
+  reset-and-reboot loop on a real AMD Athlon 64 X2 machine -- some real
+  chipsets have side effects on writes to that port beyond toggling A20,
+  which a pure emulator won't reproduce. The fix tries the BIOS
+  (`INT 15h`, `AX=2401h`) and then the 8042 keyboard-controller gate first,
+  falling back to port `0x92` only if both fail and re-verifying A20 after
+  every attempt rather than trusting any method's own reported success.
+
+If real hardware ever produces a boot loop, a screen that fails to update,
+or output that only appears over one of VGA/serial, suspect this class of
+gap first -- QEMU's emulated devices are close to real hardware but not a
+perfect model of the more idiosyncratic chipset-level behavior above.
+
+## Deliberately deferred work
 
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
   native USB, further hardware IRQ drivers beyond the timer/keyboard, robust

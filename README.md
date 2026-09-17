@@ -40,6 +40,20 @@ narrow exception is `kernel/src/disk.rs`'s trampoline, which briefly restores
 the real-mode IVT and BIOS-conventional PIC mapping around each individual
 disk sector transfer -- see "Disk access and FOSFS" below.
 
+Enabling A20 (`enable_a20` in `boot/stage2.S`, duplicated in `boot/netrom.S`
+for the same reason described under "Booting from a NIC ROM" below) tries
+three methods in order, stopping as soon as a probe write/read pair
+confirms A20 is actually on: first the BIOS itself (`INT 15h`, `AX=2401h`),
+then the traditional 8042 keyboard-controller gate, and only as a last
+resort the "fast A20 gate" system control port (`0x92`). That last method
+used to be the *only* one this loader tried, and worked fine in QEMU, but
+caused an immediate reset-and-reboot loop on a real AMD Athlon 64 X2
+machine -- writing to port `0x92` on some real chipsets has side effects
+beyond A20 that a pure emulator won't reproduce. Trying the gentler options
+first, and only reaching for `0x92` when they don't work, fixed it there
+without weakening A20 support on hardware (or emulators) that only
+implements the fast gate.
+
 ## Requirements
 
 - Linux or another Unix-like host with GNU Make, GNU binutils (`as` and
