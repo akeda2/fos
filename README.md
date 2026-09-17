@@ -129,6 +129,11 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic discover` | Broadcasts a `chat`-protocol discovery probe (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 stops it (only fos machines currently running `chat` or `nic discover` reply). |
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (local keyboard) or by typing `/quit` (works over serial too). |
+| `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
+| `tape load disk NAME` | Loads a FOSFS file straight into a fresh tape buffer (bounded by FOSFS's current 512-byte one-sector file limit). |
+| `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 to give up. |
+| `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
+| `tape run` | Executes the loaded tape: a bare call to its first byte, in ring 0, with no memory protection. If it ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -362,6 +367,53 @@ frame straight back to the requester's source MAC (never broadcast, so
 replies don't also broadcast to every other listener) and remembers the
 requester as a peer too, so discovery is naturally symmetric after one
 round.
+
+### Tape (`tape`)
+
+`tape` treats a chunk of memory as a paper tape: something you load, then
+separately choose to run. A tape is just a flat, position-independent-at-a-
+fixed-address raw binary -- the exact same convention the kernel itself is
+loaded and entered with (see `linker.ld`/`boot/stage2.S`) -- executed by a
+bare `call` to its first byte, in ring 0, on the kernel's own stack, with
+absolutely no memory protection: this kernel has no userspace or paging
+(see "Current boundaries" below), so a tape is trusted exactly as much as
+any other kernel code. Ending with a near `ret` returns control to the
+shell cleanly; anything else that faults is at least caught by the CPU
+exception handlers (see "Interrupts and the physical-frame allocator"
+above) rather than silently rebooting, but is never recoverable -- there is
+no way back into a hung or corrupted kernel except a reset.
+
+A tape can be loaded two ways. `tape load disk NAME` reads a FOSFS file
+straight into a freshly allocated buffer -- bounded, for now, by FOSFS's
+own 512-byte one-sector file limit, and by `write NAME TEXT` only ever
+being able to put printable ASCII bytes on disk in the first place, so a
+disk-loaded tape's practical use today is mostly for content that arrived
+some other way (e.g. copied there outside this kernel) rather than typed
+in live. `tape load net` instead waits for a tape sent over Ethernet: one
+`TAPE_TAG_START` frame (sharing `CHAT_ETHERTYPE` with `chat`/`nic
+discover`) declares the transfer's total length, then any number of
+`TAPE_TAG_DATA` frames each carry an explicit sequence number and up to
+1024 bytes, until one `TAPE_TAG_STOP` frame closes it. The receiver
+allocates exactly as many physical frames (via the same allocator `pmem`
+tracks) as the declared length needs -- there is no arbitrary size cap,
+only whatever contiguous RAM `pmem` can still offer -- and computes each
+chunk's exact byte count from its sequence number and the declared total
+length, never from the frame's own (possibly padded) received length, so a
+genuine binary tape's own trailing zero bytes are never mistaken for
+padding the way `chat`'s text frames get away with trimming. A skipped or
+reordered sequence number aborts that attempt and frees its frames rather
+than silently loading a corrupt tape, since this deliberately simple
+protocol has no retransmission.
+
+The other end of a network load can be another fos machine's `tape send
+NAME PEER_MAC|PEER_NUMBER` (reads a FOSFS file and streams it out, reusing
+the exact same `chat`-style peer addressing `chat`/`nic peers` already
+provide), or an ordinary Linux host running `tools/send_tape.py FILE`,
+which speaks the identical wire protocol over a raw `AF_PACKET` socket.
+Rather than requiring a MAC address up front, that tool broadcasts the
+same `CHAT_TAG_DISCOVER_REQUEST` probe `nic discover` sends and picks the
+destination automatically if exactly one fos machine replies (pass `--mac`
+to skip discovery and address one directly).
 
 
 ## Booting from a NIC ROM

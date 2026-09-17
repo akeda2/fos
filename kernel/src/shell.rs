@@ -79,6 +79,9 @@ fn execute(command: &[u8], info: &BootInfo) {
         println!("          nic sniff (promiscuous capture; F12 to stop)");
         println!("          nic discover (probe for other listening fos machines), nic peers (list them)");
         println!("          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 or /quit to leave)");
+        println!("Tape: tape status (what's loaded), tape run (execute it)");
+        println!("      tape load disk NAME (load a FOSFS file), tape load net (wait for one over Ethernet; F12 to give up)");
+        println!("      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -105,6 +108,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"nic" => nic_command(arguments),
         b"chat" => chat_command(arguments),
+        b"tape" => tape_command(info, arguments),
         b"halt" => {
             if !no_arguments(arguments) {
                 return;
@@ -509,6 +513,22 @@ const CHAT_TAG_TEXT: u8 = 0x01;
 const CHAT_TAG_DISCOVER_REQUEST: u8 = 0x02;
 const CHAT_TAG_DISCOVER_REPLY: u8 = 0x03;
 
+/// `tape load`/`tape send`'s wire protocol, sharing `CHAT_ETHERTYPE` rather
+/// than inventing a third reserved ethertype: a paper-tape-style transfer
+/// is `TAPE_TAG_START` (payload: the transfer's total length, 4 bytes
+/// little-endian) once, then any number of `TAPE_TAG_DATA` frames (payload:
+/// a 4-byte little-endian sequence number, then up to `TAPE_CHUNK_LEN` raw
+/// bytes), then one `TAPE_TAG_STOP` (no payload) to close it.
+const TAPE_TAG_START: u8 = 0x10;
+const TAPE_TAG_DATA: u8 = 0x11;
+const TAPE_TAG_STOP: u8 = 0x12;
+
+/// Data bytes carried in one `TAPE_TAG_DATA` frame: comfortably under
+/// `rtl8139::MAX_FRAME_LEN` once the Ethernet header (14 bytes), tag
+/// (1 byte), and sequence number (4 bytes) are accounted for, and a round
+/// enough number to reason about by hand.
+const TAPE_CHUNK_LEN: usize = 1024;
+
 const MAX_PEERS: usize = 16;
 
 /// Every MAC address any `nic discover` probe or `chat` auto-reply has ever
@@ -807,6 +827,343 @@ fn handle_incoming_chat_frame(nic: &rtl8139::Rtl8139, frame: &[u8], own_mac: &[u
         }
         _ => {}
     }
+}
+
+/// The one currently loaded "paper tape": a physical address from
+/// `pmem::allocate_contiguous` plus its exact byte length. `None` until
+/// `tape load disk`/`tape load net` succeeds; loading a new tape always
+/// frees any previous one first, so at most one tape's frames are ever
+/// held at a time. There is no paging in this kernel, so this physical
+/// address doubles as a directly usable pointer -- the same convention
+/// `rtl8139.rs`'s own DMA buffers rely on.
+static mut TAPE: Option<(u32, u32)> = None;
+
+/// Reads/writes `TAPE` through raw pointers (`&raw const`/`&raw mut`)
+/// rather than ever forming a `&`/`&mut` reference to the static, the same
+/// convention `PEERS`/`PEER_COUNT` use just above -- this is a
+/// single-threaded, non-reentrant shell, so the only real hazard is taking
+/// a live reference across something that could alias it.
+fn tape_get() -> Option<(u32, u32)> {
+    unsafe { *(&raw const TAPE) }
+}
+
+fn tape_set(value: Option<(u32, u32)>) {
+    unsafe { *(&raw mut TAPE) = value };
+}
+
+/// Reads and clears `TAPE` in one step, `Option::take`'s effect without
+/// ever holding a `&mut` to the static.
+fn tape_take() -> Option<(u32, u32)> {
+    let value = tape_get();
+    tape_set(None);
+    value
+}
+
+
+/// `tape [status|run|load ...|send ...]`. `status`/no arguments report what
+/// (if anything) is loaded; `run` executes it; `load`/`send` are documented
+/// on their own handlers below.
+fn tape_command(info: &BootInfo, arguments: &[u8]) {
+    let (subcommand, remainder) = take_word(arguments);
+    match subcommand {
+        b"" | b"status" if remainder.is_empty() => tape_status(),
+        b"run" if remainder.is_empty() => tape_run(),
+        b"load" => tape_load_command(info, remainder),
+        b"send" => tape_send_command(info, remainder),
+        _ => println!("Usage: tape [status|run|load disk NAME|load net|send NAME PEER_MAC|PEER_NUMBER]"),
+    }
+}
+
+fn tape_status() {
+    match tape_get() {
+        Some((address, length)) => println!("Tape loaded: {length} byte(s) at 0x{address:05x}. 'tape run' to execute it."),
+        None => println!("No tape loaded. 'tape load disk NAME' or 'tape load net' to load one."),
+    }
+}
+
+/// Frees a tape's frames back to `pmem`: `pmem::free` only releases one
+/// frame at a time, so a multi-frame tape needs one call per frame it was
+/// allocated with (`allocate_contiguous`'s own counterpart).
+fn free_tape_frames(address: u32, length: u32) {
+    let frame_count = (length as usize).div_ceil(pmem::FRAME_SIZE as usize);
+    for offset in 0..frame_count {
+        pmem::free(address + offset as u32 * pmem::FRAME_SIZE);
+    }
+}
+
+/// Replaces whatever tape is currently loaded (freeing its frames first, if
+/// any) with a freshly allocated `length`-byte buffer, or reports why that
+/// failed. Shared by both `tape load disk` and `tape load net`, since
+/// either source ends up needing the exact same buffer.
+fn allocate_tape_buffer(length: u32) -> Option<u32> {
+    if let Some((old_address, old_length)) = tape_take() {
+        free_tape_frames(old_address, old_length);
+    }
+    let frame_count = (length as usize).div_ceil(pmem::FRAME_SIZE as usize);
+    match pmem::allocate_contiguous(frame_count) {
+        Some(address) => Some(address),
+        None => {
+            let (_, free) = pmem::stats();
+            println!("Not enough contiguous free physical memory for a {length}-byte tape ({frame_count} frame(s) needed, {free} frame(s) free).");
+            None
+        }
+    }
+}
+
+/// Executes the loaded tape: a bare `call` to its first byte, in ring 0,
+/// on the kernel's own stack, with no memory protection whatsoever -- this
+/// kernel has no userspace or paging (see "Deliberately deferred work" in
+/// AGENTS.md), so a tape is trusted exactly as much as any other kernel
+/// code. A tape is a plain flat binary (the same convention the kernel
+/// itself is loaded and entered with, see `linker.ld`/`boot/stage2.S`): if
+/// it ends with a near `ret`, control returns cleanly to this shell;
+/// if it hangs, faults, or corrupts kernel state, there is no recovery --
+/// a reset or power-cycle is required, exactly as with any other
+/// unrecoverable fault this kernel reports.
+fn tape_run() {
+    let Some((address, length)) = tape_get() else {
+        println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
+        return;
+    };
+    println!("Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery.");
+    let entry: extern "C" fn() = unsafe { core::mem::transmute::<usize, extern "C" fn()>(address as usize) };
+    entry();
+    println!("Tape returned; back at the fos shell.");
+}
+
+fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
+    let (kind, remainder) = take_word(arguments);
+    match kind {
+        b"net" if remainder.is_empty() => tape_load_net(),
+        b"disk" => {
+            let (name, extra) = take_word(remainder);
+            if name.is_empty() || !extra.is_empty() {
+                println!("Usage: tape load disk NAME");
+                return;
+            }
+            tape_load_disk(info, name);
+        }
+        _ => println!("Usage: tape load [net|disk NAME]"),
+    }
+}
+
+/// Loads a FOSFS file straight into a fresh tape buffer. Bounded by FOSFS's
+/// current one-sector-per-file limit (see `fosfs::read`), so this is only
+/// good for tapes up to 512 bytes for now; `tape load net` has no such
+/// ceiling, since it allocates however many frames the sender declares.
+fn tape_load_disk(info: &BootInfo, name: &[u8]) {
+    let mut sector = [0u8; 512];
+    match fosfs::read(info, name, &mut sector) {
+        Ok(Some(length)) => {
+            if length == 0 {
+                println!("'{}' is empty; nothing to load.", core::str::from_utf8(name).unwrap_or("?"));
+                return;
+            }
+            let Some(address) = allocate_tape_buffer(length as u32) else { return };
+            let destination = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
+            destination.copy_from_slice(&sector[..length]);
+            tape_set(Some((address, length as u32)));
+            println!("Loaded {length} byte(s) from '{}' at 0x{address:05x}. 'tape run' to execute it.", core::str::from_utf8(name).unwrap_or("?"));
+        }
+        Ok(None) => println!("File not found."),
+        Err(error) => println!("FOSFS disk error: {error:?}"),
+    }
+}
+
+/// One tape transfer in progress during `tape load net`: which sender it's
+/// locked onto (so unrelated chat/discover/tape traffic from anyone else
+/// can't corrupt it mid-transfer), where its bytes are landing, how long
+/// it's declared to be, and how much of it (by sequence number and byte
+/// count) has arrived so far.
+struct TapeTransfer {
+    source: [u8; 6],
+    address: u32,
+    length: u32,
+    expected_seq: u32,
+    received: u32,
+}
+
+/// Waits for a tape to arrive over the network: a `TAPE_TAG_START` frame
+/// declares the total length, then `TAPE_TAG_DATA` frames each carry an
+/// explicit sequence number and up to `TAPE_CHUNK_LEN` bytes, until a
+/// `TAPE_TAG_STOP` frame closes the transfer -- see the `TAPE_TAG_*`
+/// constants. The offset and expected byte count for each chunk come from
+/// its sequence number and the transfer's declared total length, never
+/// from the received Ethernet frame's own (possibly hardware- or
+/// software-padded) length, so a genuine binary tape's own trailing zero
+/// bytes are never mistaken for padding -- unlike `chat`'s text frames,
+/// which can get away with trimming trailing zeros only because printable
+/// text never legitimately ends in one.
+///
+/// An out-of-order or skipped sequence number aborts that attempt
+/// (freeing any frames already allocated for it) rather than silently
+/// loading a corrupt tape, since this deliberately simple protocol has no
+/// retransmission; waiting for a fresh start after an abort, or after any
+/// unrelated sender's frame, costs nothing and needs no separate state.
+fn tape_load_net() {
+    let Some(nic) = nic_or_report() else { return };
+    let own_mac = nic.mac_address();
+    println!("Waiting for a tape over the network; press F12 to give up.");
+    println!("Have the sender target this card's MAC address ({}).", Mac(&own_mac));
+
+    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut transfer: Option<TapeTransfer> = None;
+
+    loop {
+        if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+            if let Some(transfer) = transfer {
+                free_tape_frames(transfer.address, transfer.length);
+            }
+            println!("\nGave up waiting; no tape loaded.");
+            return;
+        }
+        let Some(received) = nic.receive(&mut buffer) else { continue };
+        let frame = &buffer[..received];
+        if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+            continue;
+        }
+        let source: [u8; 6] = frame[6..12].try_into().unwrap();
+        let payload = &frame[15..];
+
+        match frame[14] {
+            TAPE_TAG_START if transfer.is_none() => {
+                let Some(length_bytes) = payload.get(0..4) else { continue };
+                let length = u32::from_le_bytes(length_bytes.try_into().unwrap());
+                if length == 0 {
+                    println!("\nIgnoring a zero-length tape start from {}.", Mac(&source));
+                    continue;
+                }
+                let Some(address) = allocate_tape_buffer(length) else { continue };
+                println!("\nReceiving a {length}-byte tape from {}...", Mac(&source));
+                transfer = Some(TapeTransfer { source, address, length, expected_seq: 0, received: 0 });
+            }
+            TAPE_TAG_DATA if transfer.as_ref().is_some_and(|transfer| transfer.source == source) => {
+                let active = transfer.as_mut().unwrap();
+                let Some(seq_bytes) = payload.get(0..4) else { continue };
+                let seq = u32::from_le_bytes(seq_bytes.try_into().unwrap());
+                if seq != active.expected_seq {
+                    println!("\nGap in tape data from {}: expected chunk #{}, got #{seq} -- aborting this load.", Mac(&source), active.expected_seq);
+                    free_tape_frames(active.address, active.length);
+                    transfer = None;
+                    continue;
+                }
+                let offset = seq as usize * TAPE_CHUNK_LEN;
+                let chunk_len = (active.length as usize - offset).min(TAPE_CHUNK_LEN);
+                let data = &payload[4..];
+                if data.len() < chunk_len {
+                    println!("\nShort tape data chunk #{seq} from {}: expected {chunk_len} byte(s), frame only carried {} -- aborting this load.", Mac(&source), data.len());
+                    free_tape_frames(active.address, active.length);
+                    transfer = None;
+                    continue;
+                }
+                let destination = unsafe { core::slice::from_raw_parts_mut((active.address as usize + offset) as *mut u8, chunk_len) };
+                destination.copy_from_slice(&data[..chunk_len]);
+                active.received += chunk_len as u32;
+                active.expected_seq += 1;
+            }
+            TAPE_TAG_STOP if transfer.as_ref().is_some_and(|transfer| transfer.source == source) => {
+                let active = transfer.take().unwrap();
+                if active.received == active.length {
+                    tape_set(Some((active.address, active.length)));
+                    println!("\nTape loaded: {} byte(s) at 0x{:05x} from {}. 'tape run' to execute it.", active.length, active.address, Mac(&source));
+                    return;
+                }
+                println!("\nTape from {} stopped early: only {} of {} declared byte(s) arrived -- aborting.", Mac(&source), active.received, active.length);
+                free_tape_frames(active.address, active.length);
+            }
+            _ => {} // A stray/unrelated tag, or traffic from a different sender mid-transfer: ignored.
+        }
+    }
+}
+
+fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
+    let (name, remainder) = take_word(arguments);
+    let (peer_word, extra) = take_word(remainder);
+    if name.is_empty() || peer_word.is_empty() || !extra.is_empty() {
+        println!("Usage: tape send NAME PEER_MAC|PEER_NUMBER");
+        return;
+    }
+    let destination = if let Some(mac) = parse_mac(peer_word) {
+        mac
+    } else if let Some(index) = parse_number(peer_word) {
+        match peer_by_index(index as usize) {
+            Some(mac) => mac,
+            None => {
+                println!("No peer #{index} known; run 'nic discover' first, or give a full MAC address.");
+                return;
+            }
+        }
+    } else {
+        println!(
+            "'{}' is neither a MAC address (aa:bb:cc:dd:ee:ff) nor a known peer number; see 'nic peers'.",
+            core::str::from_utf8(peer_word).unwrap_or("?")
+        );
+        return;
+    };
+
+    let mut sector = [0u8; 512];
+    let length = match fosfs::read(info, name, &mut sector) {
+        Ok(Some(length)) => length,
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    };
+    if length == 0 {
+        println!("'{}' is empty; nothing to send.", core::str::from_utf8(name).unwrap_or("?"));
+        return;
+    }
+
+    let Some(nic) = nic_or_report() else { return };
+    let source = nic.mac_address();
+    tape_send(nic, &destination, &source, &sector[..length]);
+}
+
+/// Sends one tape (`TAPE_TAG_START`, then `TAPE_TAG_DATA` chunks, then
+/// `TAPE_TAG_STOP`, see the `TAPE_TAG_*` constants) unicast to
+/// `destination`, mirroring `tools/send_tape.py`'s host-side sender so
+/// either end can talk to the other.
+fn tape_send(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], data: &[u8]) {
+    let mut start_frame = [0u8; 19];
+    start_frame[0..6].copy_from_slice(destination);
+    start_frame[6..12].copy_from_slice(source);
+    start_frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    start_frame[14] = TAPE_TAG_START;
+    start_frame[15..19].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    if !nic.send(&start_frame) {
+        println!("Transmit failed (card reported an error, or timed out); tape not sent.");
+        return;
+    }
+
+    let mut data_frame = [0u8; 15 + 4 + TAPE_CHUNK_LEN];
+    data_frame[0..6].copy_from_slice(destination);
+    data_frame[6..12].copy_from_slice(source);
+    data_frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    data_frame[14] = TAPE_TAG_DATA;
+    for (seq, chunk) in data.chunks(TAPE_CHUNK_LEN).enumerate() {
+        data_frame[15..19].copy_from_slice(&(seq as u32).to_le_bytes());
+        data_frame[19..19 + chunk.len()].copy_from_slice(chunk);
+        if !nic.send(&data_frame[..19 + chunk.len()]) {
+            println!("Transmit failed on chunk #{seq} (card reported an error, or timed out); tape not fully sent.");
+            return;
+        }
+    }
+
+    let mut stop_frame = [0u8; 15];
+    stop_frame[0..6].copy_from_slice(destination);
+    stop_frame[6..12].copy_from_slice(source);
+    stop_frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    stop_frame[14] = TAPE_TAG_STOP;
+    if !nic.send(&stop_frame) {
+        println!("Transmit failed sending the closing frame; the receiver may report an incomplete tape.");
+        return;
+    }
+
+    println!("Sent {} byte(s) to {}.", data.len(), Mac(destination));
 }
 
 /// Displays a MAC address as `aa:bb:cc:dd:ee:ff` wherever `println!`/`print!`

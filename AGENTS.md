@@ -19,7 +19,7 @@ that obscure hardware behavior.
   section below for why), loads the kernel at physical `0x10000`, and enters
   flat 32-bit protected mode.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
-  low-memory kernel region through `0x20000`; do not place loader, boot-info,
+  low-memory kernel region through `0x40000`; do not place loader, boot-info,
   or disk-trampoline data there.
 - The packed version-2 `BootInfo` at physical `0x5000` is the loader/kernel ABI.
   Validate its magic, version, size, and count before using it. Use unaligned
@@ -55,7 +55,7 @@ Real-mode code before the kernel's own memory management exists shares a
 handful of fixed low-memory addresses across `stage1.S`, `stage2.S`, and
 `netrom.S`. There is no single enforcing mechanism for this -- it is
 convention only -- so treat this table as authoritative before adding any new
-fixed address below `0x20000`, and update it in the same change that adds one:
+fixed address below `0x40000`, and update it in the same change that adds one:
 
 | Address | Used by | Purpose |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ fixed address below `0x20000`, and update it in the same change that adds one:
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
 | `0x9f000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer, just below the conventional End-of-Low-Memory / EBDA boundary. |
-| `0x10000`-`0x20000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
+| `0x10000`-`0x40000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
 
 ## Educational verbosity
 
@@ -186,8 +186,9 @@ on first use), `nic send` (one raw broadcast test frame), `nic recv`
 (polls briefly for one incoming frame and hex-dumps it), `nic sniff`
 (promiscuous-mode capture of every frame seen, until F12 stops it),
 `nic discover`/`nic peers` (broadcast/list a numbered address book of other
-listening fos machines), and `chat [PEER_MAC|PEER_NUMBER]` (line-based
-broadcast or unicast text chat; see below).
+listening fos machines), `chat [PEER_MAC|PEER_NUMBER]` (line-based
+broadcast or unicast text chat; see below), and `tape` (load and execute a
+raw binary from disk or over Ethernet; see below).
 
 `nic` is backed by `kernel/src/rtl8139.rs`, a polling-mode driver for the
 Realtek RTL8139 -- chosen as the one supported NIC because it is
@@ -281,6 +282,87 @@ ever gets a reply from a fos machine that happens to be inside `chat` or
 `nic discover` at that exact moment; this is a real, honestly-documented
 limit of the polling design, not a bug to eventually
 fix with a background listener.
+
+`tape` (`shell.rs`) is a "load, then run" pair built the same way as
+everything else here: no new abstraction layer, just a fixed-size physical
+buffer (`pmem::allocate_contiguous`, freed and replaced as a whole by each
+new load, tracked in one `static mut TAPE: Option<(address, length)>`
+accessed only through raw-pointer `tape_get`/`tape_set`/`tape_take` helpers,
+the same convention `PEERS`/`PEER_COUNT` already use) and a `call` straight
+to its first byte. There is no size ceiling baked in beyond whatever
+contiguous RAM `pmem` still has free -- a declared length that doesn't fit
+just fails the load cleanly (`Not enough contiguous free physical memory
+for a N-byte tape ...`) rather than being silently truncated or rejected by
+an arbitrary constant.
+
+`tape load net`/`tape send` share `CHAT_ETHERTYPE` with `chat`/`nic
+discover`, adding three tags (`TAPE_TAG_START`/`TAPE_TAG_DATA`/
+`TAPE_TAG_STOP`). Unlike `CHAT_TAG_TEXT`, which gets away with trimming
+trailing zero padding because printable text never legitimately ends in
+one, a genuine binary tape's own trailing zero bytes must never be
+confused with Ethernet's 60-byte minimum-frame padding -- so `TAPE_TAG_START`
+declares the transfer's exact total length up front, and every
+`TAPE_TAG_DATA` frame's expected byte count is derived purely from its
+sequence number and that declared length, never from the received frame's
+own (possibly padded) length. A skipped or reordered sequence number aborts
+that attempt and frees its frames immediately, since this protocol
+deliberately has no retransmission (consistent with `chat`/`nic discover`
+also being simple, best-effort, unacknowledged protocols); it does not
+retry or wait for a fresh start automatically, but `tape load net`'s own
+loop keeps listening afterward, so a resend from the sender just starts a
+fresh attempt. `tape load net` locks onto whichever sender's
+`TAPE_TAG_START` it accepts first and ignores any other sender's frames
+until that attempt finishes or aborts, the same reasoning `chat`'s unicast
+mode filters incoming text by source MAC.
+
+`tape send NAME PEER_MAC|PEER_NUMBER` reuses `chat`'s exact peer-addressing
+(`parse_mac`/`parse_number`/`peer_by_index`) so a peer found by `nic
+discover` needs no MAC typed out, and reuses `fosfs::read` (added
+alongside `tape`, mirroring `fosfs::cat` but copying bytes into a caller
+buffer instead of the console) to source its data. `tools/send_tape.py` is
+the host-side counterpart, deliberately building the identical wire frames
+by hand (rather than importing anything from the kernel side, which is not
+possible across the language/target boundary) so either end can talk to
+either implementation. Rather than requiring a `tools/mac`-style file up
+front like `tools/send_frame.py` does, it can perform its own discovery --
+broadcasting a `CHAT_TAG_DISCOVER_REQUEST` and listening briefly for
+`CHAT_TAG_DISCOVER_REPLY` frames -- since a script only used for a single,
+short transfer benefits less from a persistent MAC file than a script
+meant to be re-run against the same test machine over and over. `--mac`/
+`--mac-file` remain available to skip discovery entirely.
+
+`tape load disk NAME` reuses `fosfs::read` the same way, bounded by FOSFS's
+existing 512-byte one-sector file limit. Because `write NAME TEXT` (the
+only way to put a file on FOSFS from the interactive shell today) only
+ever accepts printable ASCII text, a disk-loaded tape's contents are, for
+now, whatever printable-ASCII-constrained bytes ended up in that file --
+genuinely useful machine code on disk would need to arrive some other way
+(most practically, `tape load net` followed by a future `tape save disk`,
+which does not exist yet). This is an honest, currently-real limitation,
+not a bug; see the FOSFS multi-sector-file extension noted as deferred
+future work below, which this limitation is also downstream of.
+
+`tape run` is a bare `unsafe extern "C" fn()` `call` (via
+`core::mem::transmute`) to the loaded buffer's physical address, which
+this kernel's flat, unpaged memory model lets it also treat directly as a
+usable pointer -- the same convention `rtl8139.rs`'s own DMA buffers rely
+on. A tape that ends with a near `ret` returns control to the shell
+cleanly (verified end-to-end with a real one-byte `0xc3` tape sent over a
+live QEMU multicast netdev from a host-side Python script and executed);
+anything else is trusted exactly as much as any other kernel code -- a bad
+opcode is at least caught by the CPU exception handlers added earlier this
+project (see "Real hardware notes" below) rather than corrupting silently,
+but there is still no way back into a hung or corrupted kernel except a
+reset, consistent with "Current boundaries" in README.md.
+
+The reserved low-memory kernel region (`linker.ld`/`pmem::RESERVED_BELOW`/
+`tools/write_layout.py`'s `KERNEL_RESERVED_END`) grew from `0x20000` to
+`0x40000` alongside `tape`, since the feature's own code pushed the kernel
+binary past the previous 64 KiB ceiling with essentially no headroom left
+beforehand (the prior build was already only dozens of bytes under it).
+All three constants must always match; see "Low-memory map" above for why
+growing this region is safe (nothing else lives between `0x20000` and the
+real-mode stack pointer's `0x9f000`).
 
 ## Real hardware notes
 

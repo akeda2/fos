@@ -25,5 +25,5 @@ SECTIONS
   }
 
   __kernel_end = .;
-  ASSERT(__kernel_end < 0x20000, "kernel exceeds the reserved low-memory load region")
+  ASSERT(__kernel_end < 0x40000, "kernel exceeds the reserved low-memory load region")
 }

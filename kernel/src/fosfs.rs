@@ -93,6 +93,26 @@ pub fn cat(info: &BootInfo, name: &[u8]) -> Result<bool, disk::Error> {
     Ok(true)
 }
 
+/// Reads a whole file's raw bytes into `buffer` (used by `tape load disk`
+/// to bring a saved tape back into memory), returning its exact byte
+/// length, or `None` if no such file exists. `buffer` must be at least
+/// `SECTOR_SIZE` long: every FOSFS file is at most one sector, the same
+/// limit `write` enforces, so there is never more than one sector to copy
+/// out. Unlike `cat`, this never touches the console -- the caller decides
+/// what the bytes mean.
+pub fn read(info: &BootInfo, name: &[u8], buffer: &mut [u8]) -> Result<Option<usize>, disk::Error> {
+    validate(info)?;
+    let Some(entry) = find_entry(info, name)? else {
+        return Ok(None);
+    };
+    let base = disk::data_partition_lba(info);
+    let length = (entry.length as usize).min(SECTOR_SIZE).min(buffer.len());
+    disk::read_sector(info, base + entry.start_sector, |contents| {
+        buffer[..length].copy_from_slice(&contents[..length]);
+    })?;
+    Ok(Some(length))
+}
+
 pub fn write(info: &BootInfo, name: &[u8], text: &[u8]) -> Result<WriteOutcome, disk::Error> {
     if !valid_name(name) {
         return Ok(WriteOutcome::InvalidName);

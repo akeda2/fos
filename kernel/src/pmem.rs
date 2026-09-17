@@ -2,7 +2,7 @@
 //!
 //! It builds a fixed-size bitmap (one bit per 4 KiB frame) from the E820
 //! memory map the loader collected, marks everything below the reserved
-//! low-memory kernel region (see `linker.ld`, `__kernel_end < 0x20000`) as
+//! low-memory kernel region (see `linker.ld`, `__kernel_end < 0x40000`) as
 //! permanently unavailable, and hands out/reclaims individual frames. There
 //! is no paging here yet -- this only tracks which physical frames are free.
 
@@ -20,7 +20,7 @@ const BITMAP_BYTES: usize = MAX_FRAMES.div_ceil(8);
 /// Frames below this physical address are never handed out: it covers the
 /// real-mode IVT/BDA, the BootInfo table, and the kernel's own reserved
 /// low-memory region.
-const RESERVED_BELOW: u32 = 0x20000;
+const RESERVED_BELOW: u32 = 0x40000;
 
 /// One bit per frame. `1` means "not available to the allocator" (either
 /// outside a usable E820 region, below `RESERVED_BELOW`, or already
