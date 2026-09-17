@@ -65,6 +65,17 @@ const TSD_TOK: u32 = 1 << 15; // Transmit OK.
 const TSD_TUN: u32 = 1 << 14; // Transmit FIFO underrun.
 const TSD_TABT: u32 = 1 << 30; // Transmit abort.
 
+/// `TCR`'s Interframe Gap Time field (bits 25:24), set to the standard
+/// IEEE 802.3 gap (`11b`). Leaving this at its all-zero reset value (the
+/// smallest gap the chip supports) still makes the card report a normal
+/// `TOK` for every frame -- that only reflects the chip's own FIFO/abort
+/// state, not whether anything downstream accepted the frame -- but real
+/// switches and NICs can and do silently drop frames sent with too short
+/// a gap between them, which QEMU's virtual NIC never enforces and so
+/// never surfaces there. Linux's own historic RTL8139 driver
+/// (`8139too.c`) forces this same value for the same reason.
+const TCR_STANDARD_IFG: u32 = 0b11 << 24;
+
 /// The receive ring is a plain, non-wrapping-mid-packet buffer: 8 KiB of
 /// actual ring, plus 16 bytes the card's documentation reserves, plus
 /// 1500 bytes of slack so the last packet before the wraparound point can
@@ -159,7 +170,7 @@ impl Rtl8139 {
         write32(io_base, REG_RBSTART, rx_buffer);
         write16(io_base, REG_IMR, 0x0000); // No interrupt line use; see module docs.
         write32(io_base, REG_RCR, RCR_CONFIG);
-        write32(io_base, REG_TCR, 0x0000_0000);
+        write32(io_base, REG_TCR, TCR_STANDARD_IFG);
         write8(io_base, REG_CR, CR_TE | CR_RE);
         write16(io_base, REG_ISR, 0xffff); // Clear any latched status from before reset.
 
