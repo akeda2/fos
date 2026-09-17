@@ -109,7 +109,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `hexdump ADDRESS LENGTH` | Dumps up to 128 bytes inside the reserved kernel range. Addresses accept decimal or `0x` hexadecimal notation. |
 | `ticks` | Shows the free-running PIT timer tick count and its configured frequency. |
 | `uptime` | Shows elapsed time since boot, derived from the timer tick count. |
-| `irqstat` | Shows how many times the timer (IRQ0) and keyboard (IRQ1) interrupts have fired. |
+| `irqstat` | Shows how many times the timer (IRQ0), keyboard (IRQ1), and spurious IRQ7/IRQ15 interrupts have fired. |
 | `pmem` | Summarizes the physical-frame allocator's total/free/used frame counts. |
 | `palloc` | Allocates one 4 KiB physical frame and prints its base address. |
 | `pfree ADDRESS` | Returns a previously allocated frame to the free pool. |
@@ -137,23 +137,34 @@ Unknown commands and oversized input are reported rather than ignored.
 ## Interrupts and the physical-frame allocator
 
 The kernel builds a 256-entry IDT with all 32 CPU exception vectors (0-31)
-populated plus two hardware gates (the PIT timer on IRQ0 and the PS/2
-keyboard on IRQ1), remaps the 8259 PIC's vectors clear of that reserved
-exception range, and enables interrupts. Every PIC/PIT command byte is
-followed by a short `io_wait()` (a throwaway write to port `0x80`) rather
-than sent back-to-back -- some real chipsets are slower to latch a command
-than QEMU's emulated 8259, and a missed one leaves the PIC mis-programmed
-with no error of its own, which can misdirect an IRQ into the reserved
-exception range. Rather than silently faulting into a triple-fault reset,
-each exception handler prints the vector number, its name, the CPU-pushed
-error code (if any), and the faulting `CS:EIP`, then halts -- turning what
-used to look exactly like an unexplained reset loop right after boot into
-a legible diagnostic. There is still no fault *recovery*: every exception
-is treated as fatal. Scancodes and timer ticks are captured by minimal
-ISRs and drained by the shell loop between prompts; see
-`kernel/src/interrupts.rs`. A small bitmap-based physical-frame
-allocator (`kernel/src/pmem.rs`) tracks which 4 KiB frames the E820 map
-reports as usable, reserving everything below the kernel's own low-memory
+populated plus four hardware gates (the PIT timer on IRQ0, the PS/2
+keyboard on IRQ1, and the master/slave PICs' own spurious-interrupt
+vectors on IRQ7/IRQ15), remaps the 8259 PIC's vectors clear of that
+reserved exception range, and enables interrupts. Every PIC/PIT command
+byte is followed by a short `io_wait()` (a throwaway write to port
+`0x80`) rather than sent back-to-back -- some real chipsets are slower to
+latch a command than QEMU's emulated 8259. Real hardware also
+occasionally raises IRQ7 (or IRQ15) on the 8259 for no genuine device
+reason at all -- an electrical glitch withdraws the interrupt request
+before the PIC can latch it, and the 8259 reports that as a "spurious"
+IRQ7/IRQ15 regardless of what's masked; QEMU's idealized PIC essentially
+never does this. The handlers for those two vectors read the PIC's
+in-service register before deciding whether to send an EOI at all, per
+the standard spurious-IRQ protocol, and `irqstat` reports how often it
+happens. Without a real gate there, either kind of misdirected IRQ would
+have hit an invalid IDT descriptor and produced a CPU exception instead;
+rather than silently faulting into a triple-fault reset, each exception
+handler prints the vector number, its name, the CPU-pushed error code (if
+any), and the faulting `CS:EIP`, then halts -- turning what used to look
+exactly like an unexplained reset loop right after boot into a legible
+diagnostic (this is exactly how the spurious-IRQ7 case above was
+diagnosed on real AMD hardware in the first place). There is still no
+fault *recovery*: every exception is treated as fatal. Scancodes and
+timer ticks are captured by minimal ISRs and drained by the shell loop
+between prompts; see `kernel/src/interrupts.rs`. A small bitmap-based
+physical-frame allocator (`kernel/src/pmem.rs`) tracks which 4 KiB frames
+the E820 map reports as usable, reserving everything below the kernel's
+own low-memory
 region. There is no paging yet -- this only tracks free/used frames,
 exposed through `pmem`/`palloc`/`pfree`.
 

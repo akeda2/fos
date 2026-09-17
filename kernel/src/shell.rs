@@ -138,9 +138,10 @@ fn print_uptime() {
 
 fn print_irq_stats() {
     println!(
-        "IRQ0 (timer): {} fired; IRQ1 (keyboard): {} fired",
+        "IRQ0 (timer): {} fired; IRQ1 (keyboard): {} fired; spurious IRQ7/IRQ15: {} fired",
         interrupts::timer_irq_count(),
-        interrupts::keyboard_irq_count()
+        interrupts::keyboard_irq_count(),
+        interrupts::spurious_irq_count()
     );
 }
 

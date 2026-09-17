@@ -1,9 +1,10 @@
 //! Minimal interrupt infrastructure: an IDT with all 32 reserved CPU
 //! exception vectors (each just reporting what fired and halting -- see
-//! `report_exception`) plus the two vectors this kernel actually drives
-//! (the PIT timer and the PS/2 keyboard), remapped away from the CPU
-//! exception range; plus tiny lock-free counters and a scancode queue that
-//! the shell drains between prompts.
+//! `report_exception`) plus the four vectors this kernel actually drives
+//! (the PIT timer, the PS/2 keyboard, and the master/slave PICs' own
+//! spurious-interrupt vectors -- see `spurious_master_interrupt`), remapped
+//! away from the CPU exception range; plus tiny lock-free counters and a
+//! scancode queue that the shell drains between prompts.
 //!
 //! There is still no fault *recovery* here (an exception halts, it never
 //! resumes) -- that remains deliberately out of scope, per the project's
@@ -16,7 +17,7 @@
 
 use core::arch::asm;
 
-use crate::arch::x86::{io_wait, outb};
+use crate::arch::x86::{inb, io_wait, outb};
 use crate::keyboard;
 
 const CODE_SELECTOR: u16 = 0x08;
@@ -35,6 +36,26 @@ const IRQ_BASE: u8 = 0x20;
 const TIMER_VECTOR: u8 = IRQ_BASE;
 const KEYBOARD_VECTOR: u8 = IRQ_BASE + 1;
 
+/// The master PIC's IRQ7 and the slave PIC's IRQ15 double as each PIC's
+/// "spurious interrupt" vector: real hardware occasionally raises INTR and
+/// then withdraws the request line before it can be latched (electrical
+/// noise, a device glitch, ...), and the 8259 reports that as if it were
+/// IRQ7/IRQ15 even though nothing genuine happened and no device is wired
+/// there. QEMU's idealized PIC essentially never does this, but real
+/// chipsets do -- these two vectors need real IDT gates (so a spurious
+/// firing doesn't fall through to the CPU's #GP-on-invalid-gate path, which
+/// is what actually produced the "CPU EXCEPTION 13 ... error code 0x13b"
+/// report on the AMD Athlon 64 X2 machine: 0x13b decodes to IDT index 39,
+/// i.e. vector 0x27, IRQ7) and that check the in-service register before
+/// deciding whether to send an EOI at all -- see `spurious_master_interrupt`
+/// and `spurious_slave_interrupt`.
+const SPURIOUS_MASTER_VECTOR: u8 = IRQ_BASE + 7;
+const SPURIOUS_SLAVE_VECTOR: u8 = IRQ_BASE + 15;
+
+/// OCW3 command selecting the in-service register for the next read of a
+/// PIC's command port.
+const PIC_READ_ISR: u8 = 0x0b;
+
 /// PIT channel 0, mode 3 (square wave), running at this tick rate.
 const PIT_FREQUENCY_HZ: u32 = 100;
 const PIT_INPUT_HZ: u32 = 1_193_182;
@@ -48,6 +69,7 @@ const PIT_COMMAND: u16 = 0x43;
 static mut TIMER_TICKS: u64 = 0;
 static mut TIMER_IRQ_COUNT: u64 = 0;
 static mut KEYBOARD_IRQ_COUNT: u64 = 0;
+static mut SPURIOUS_IRQ_COUNT: u64 = 0;
 
 const SCANCODE_QUEUE_CAPACITY: usize = 32;
 static mut SCANCODE_QUEUE: [u8; SCANCODE_QUEUE_CAPACITY] = [0; SCANCODE_QUEUE_CAPACITY];
@@ -117,6 +139,8 @@ pub fn initialize() {
         install_exception_handlers();
         IDT[usize::from(TIMER_VECTOR)] = IdtEntry::gate(timer_interrupt);
         IDT[usize::from(KEYBOARD_VECTOR)] = IdtEntry::gate(keyboard_interrupt);
+        IDT[usize::from(SPURIOUS_MASTER_VECTOR)] = IdtEntry::gate(spurious_master_interrupt);
+        IDT[usize::from(SPURIOUS_SLAVE_VECTOR)] = IdtEntry::gate(spurious_slave_interrupt);
     }
 
     load_kernel_idt();
@@ -414,6 +438,44 @@ extern "x86-interrupt" fn keyboard_interrupt(_frame: InterruptStackFrame) {
     send_eoi(KEYBOARD_VECTOR);
 }
 
+/// Reads a PIC's in-service register: bit N is set only while a genuine
+/// IRQ N is actually being serviced. Used to tell a real IRQ7/IRQ15 apart
+/// from a spurious one on the same vector (see `SPURIOUS_MASTER_VECTOR`).
+fn read_isr(command_port: u16) -> u8 {
+    unsafe {
+        outb(command_port, PIC_READ_ISR);
+        inb(command_port)
+    }
+}
+
+extern "x86-interrupt" fn spurious_master_interrupt(_frame: InterruptStackFrame) {
+    unsafe {
+        SPURIOUS_IRQ_COUNT += 1;
+    }
+    // Bit 7 of the master's ISR is only set for a genuine IRQ7; if it is
+    // clear, the PIC never actually latched a real interrupt and must not
+    // be told EOI (there is nothing in service to end).
+    if read_isr(PIC1_COMMAND) & 0x80 != 0 {
+        send_eoi(SPURIOUS_MASTER_VECTOR);
+    }
+}
+
+extern "x86-interrupt" fn spurious_slave_interrupt(_frame: InterruptStackFrame) {
+    unsafe {
+        SPURIOUS_IRQ_COUNT += 1;
+    }
+    // A spurious IRQ15 still came in on the cascade line the slave shares
+    // with the master's IRQ2, so the master needs an EOI regardless; only
+    // the slave's own EOI depends on whether it was genuine.
+    if read_isr(PIC2_COMMAND) & 0x80 != 0 {
+        send_eoi(SPURIOUS_SLAVE_VECTOR);
+    } else {
+        unsafe {
+            outb(PIC1_COMMAND, PIC_EOI);
+        }
+    }
+}
+
 fn push_scancode(byte: u8) {
     // Interrupts are already disabled for the duration of this handler (it
     // was entered through an interrupt gate), so plain reads/writes here
@@ -459,6 +521,10 @@ pub fn timer_irq_count() -> u64 {
 
 pub fn keyboard_irq_count() -> u64 {
     read_u64_atomically(core::ptr::addr_of!(KEYBOARD_IRQ_COUNT))
+}
+
+pub fn spurious_irq_count() -> u64 {
+    read_u64_atomically(core::ptr::addr_of!(SPURIOUS_IRQ_COUNT))
 }
 
 /// Reads a `u64` counter with interrupts disabled, so a concurrent IRQ

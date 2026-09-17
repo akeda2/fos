@@ -311,31 +311,48 @@ future contributor doesn't have to rediscover them from scratch:
   the 8259/PIT back-to-back. QEMU's emulated 8259 accepts that fine, but a
   real chipset can be slower to latch one command byte before the next
   arrives, silently leaving the PIC mis-programmed (there's no error
-  status to check). Back when this kernel installed no CPU exception
-  handlers, an IRQ that ended up misdirected into the reserved exception
-  range would double- (then triple-) fault on the very first timer tick
-  right after `sti`, which presents as an immediate reset loop moments
-  after boot -- this is the current leading suspect for the reset loop
-  reported on a real AMD Athlon 64 X2 (PCIe) machine that a Pentium 4
-  machine (older, no PCIe) does not exhibit; the fix inserts a short
-  `io_wait()` (a throwaway write to port `0x80`) after every PIC/PIT
-  command byte, the standard technique for this exact class of bug.
-  **Not yet confirmed against the real hardware that reported the bug.**
+  status to check). The fix inserts a short `io_wait()` (a throwaway write
+  to port `0x80`) after every PIC/PIT command byte, the standard technique
+  for this exact class of bug. This did not turn out to be the cause of
+  the AMD Athlon 64 X2 reset loop below (see the spurious-IRQ entry), but
+  is still worth keeping as a general robustness fix.
 - **CPU exception handlers as a diagnostic tool** -- added alongside the
-  PIC/PIT fix above, since that fix can't be confirmed without the
+  PIC/PIT fix above, since that fix couldn't be confirmed without the
   original hardware: all 32 CPU exception vectors (`kernel/src/interrupts.rs`,
   `install_exception_handlers`) now have real IDT gates instead of being
   left `missing()`. Each prints the vector number, its name, the
   CPU-pushed error code if the vector has one, and the faulting `CS:EIP`,
-  then halts. This was verified in QEMU by deliberately executing `int3`
-  right after `interrupts::initialize()` and confirming the diagnostic
-  printed and the machine halted cleanly instead of resetting (then
-  reverting that temporary trigger). If the PIC/PIT fix above turns out
-  not to be the real cause and the AMD machine still resets, this is what
-  should surface the actual faulting vector next time -- ask whoever is
-  testing on real hardware whether a "CPU EXCEPTION ..." line appears
-  before any reset, since that alone would confirm or rule out this whole
-  class of bug and point at a specific vector to chase.
+  then halts. Verified in QEMU by deliberately executing `int3` right
+  after `interrupts::initialize()` and confirming the diagnostic printed
+  and the machine halted cleanly instead of resetting (then reverting
+  that temporary trigger). This is exactly what let the AMD Athlon 64 X2
+  reset loop below get diagnosed instead of staying a silent reset.
+- **Spurious IRQ7/IRQ15 -- confirmed cause of the AMD Athlon 64 X2 reset
+  loop** -- with the exception handlers above in place, the real hardware
+  that had been resetting instead printed
+  `CPU EXCEPTION 13 (General Protection Fault), error code 0x0000013b, at
+  0008:0001218f` right after the "Physical memory:" line. The error code
+  decodes (bit0 EXT=1, bit1 IDT=1, bits3-15 index = `0x13b >> 3` = `0x27`)
+  to "IDT gate 0x27 is not a valid gate descriptor" -- vector `0x27` is
+  `IRQ_BASE + 7`, i.e. IRQ7 on the master 8259. This kernel only ever
+  unmasks IRQ0/IRQ1, and nothing is wired to IRQ7, but the 8259 hardware
+  itself uses IRQ7 (and IRQ15 on the slave) as its own "spurious
+  interrupt" signal: a device can assert then withdraw its interrupt
+  request before the PIC latches it (electrical noise, a glitchy
+  peripheral, ...), and the 8259 reports that as IRQ7/IRQ15 regardless of
+  masking. QEMU's idealized 8259 essentially never generates one, so this
+  never surfaced there. Because `IdtEntry::missing()` zeroes the
+  `type_attributes` byte -- an invalid gate type, not just "not present"
+  -- the CPU's own gate-type check (which runs before the present-bit
+  check) raised `#GP` rather than `#NP`, and with no `#GP` handler
+  previously installed, that cascaded into the double-/triple-fault reset
+  loop. The fix gives IRQ7 and IRQ15 real IDT gates
+  (`spurious_master_interrupt`/`spurious_slave_interrupt`) that read the
+  relevant PIC's in-service register before deciding whether to send an
+  EOI at all, per the standard spurious-IRQ protocol -- a genuine EOI-less
+  spurious IRQ7 is now a normal, silent, roughly-never-noticed event
+  instead of a fatal exception. `irqstat` reports how often it happens.
+  **Confirmed fix for the originally reported bug.**
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
