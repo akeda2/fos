@@ -602,13 +602,33 @@ fn nic_discover() {
         }
         let Some(length) = nic.receive(&mut buffer) else { continue };
         let frame = &buffer[..length];
-        if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE || frame[14] != CHAT_TAG_DISCOVER_REPLY {
+        if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
             continue;
         }
         let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
-        if remember_peer(peer_mac) {
-            discovered += 1;
-            println!("Found peer #{discovered}: {}", Mac(&peer_mac));
+        match frame[14] {
+            CHAT_TAG_DISCOVER_REPLY => {
+                if remember_peer(peer_mac) {
+                    discovered += 1;
+                    println!("Found peer #{discovered}: {}", Mac(&peer_mac));
+                }
+            }
+            // A peer's own probe reaching us proves it's listening too, so
+            // it belongs in our list exactly as if it had replied to ours
+            // -- and, symmetrically to `chat`'s own handling of this same
+            // tag (`handle_incoming_chat_frame`), we must answer it
+            // ourselves, or two machines that only ever run `nic discover`
+            // (neither one running `chat`) would broadcast requests at
+            // each other forever without either side ever sending the
+            // reply the other is waiting for.
+            CHAT_TAG_DISCOVER_REQUEST => {
+                if remember_peer(peer_mac) {
+                    discovered += 1;
+                    println!("Found peer #{discovered}: {}", Mac(&peer_mac));
+                }
+                send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY);
+            }
+            _ => continue,
         }
     }
 
