@@ -242,6 +242,31 @@ behind) -- and always restores the card to its normal, non-promiscuous
 filter before returning, so a later `nic send`/`nic recv` is not left seeing
 unrelated traffic.
 
+`tools/send_frame.py` is `nic sniff`'s host-side counterpart, for testing
+against a real fos machine over an actual Ethernet link rather than another
+fos instance: it builds one raw frame (destination MAC + this host's own
+source MAC + ethertype + payload) and transmits it on a chosen network
+interface via a Linux `AF_PACKET` raw socket -- the same "whole frame, no
+protocol above Ethernet" level fos's own driver speaks, so no IP address or
+ARP entry is needed on either end.
+
+```sh
+echo 52:54:00:12:34:56 > tools/mac   # the target fos machine's MAC; see its 'nic' command
+sudo python3 tools/send_frame.py "hello fos"
+```
+
+Sending raw frames needs `CAP_NET_RAW` (in practice, run it with `sudo`).
+The destination MAC is read from `tools/mac` (default path; overridable with
+`--mac-file`) rather than a required argument, since it is normally the same
+physical test machine throughout one session -- and, being specific to
+whoever's hardware is at hand, that file is deliberately `.gitignore`d, not
+checked in. The payload is either a literal argument, a file's raw bytes via
+`--file`, or -- with neither given -- a fixed default test string; the
+network interface to send from is auto-detected (first non-loopback
+interface, preferring one that is up) unless `--iface` overrides it; and the
+ethertype defaults to the same `0x88b5` `nic send` uses, so captured frames
+are easy to recognize, but `--ethertype` can send something else.
+
 
 ## Booting from a NIC ROM
 

@@ -216,6 +216,16 @@ mechanism and rationale `term_loop` uses -- and always disables it again on
 the way out, whether the loop ran to completion or was interrupted, so a
 later `nic send`/`nic recv` is not left seeing unrelated traffic.
 
+`tools/send_frame.py` is a standalone host-side script (not part of any
+`make` target) that sends one raw Ethernet frame from the host machine via
+an `AF_PACKET` raw socket, for testing `nic sniff` against real hardware.
+It reads the destination MAC from `tools/mac`, a small `.gitignore`d file
+(not checked in, since it names whichever physical test machine is at
+hand) rather than a required argument. Keep this script dependency-free
+(standard library only, matching the other `tools/` scripts) and keep its
+default ethertype in sync with `shell.rs`'s `TEST_ETHERTYPE` if that ever
+changes.
+
 
 
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
