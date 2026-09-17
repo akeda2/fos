@@ -22,9 +22,7 @@ pub fn run(info: &BootInfo) -> ! {
         println!("PS/2 keyboard unavailable; serial input remains available.");
         println!("Type 'help' for commands.");
     }
-    let mut line = [0u8; LINE_CAPACITY];
-    let mut length = 0;
-    let mut saw_carriage_return = false;
+    let mut editor = LineEditor::new();
     prompt();
 
     loop {
@@ -32,28 +30,56 @@ pub fn run(info: &BootInfo) -> ! {
         let Some(byte) = byte else {
             continue;
         };
+        editor.feed(byte, info);
+    }
+}
+
+/// One command line's editing state: the buffer of characters typed so
+/// far, how many of them are in use, and whether the previous byte was a
+/// bare `\r` (so a `\r\n` pair from a terminal that sends both is treated
+/// as a single Enter, not two). Factored out of `run`'s loop so
+/// `term_net` can feed it bytes arriving from a remote network peer
+/// through the exact same line-editing and command-dispatch logic the
+/// interactive local prompt uses, instead of reimplementing it.
+struct LineEditor {
+    buffer: [u8; LINE_CAPACITY],
+    length: usize,
+    saw_carriage_return: bool,
+}
+
+impl LineEditor {
+    fn new() -> Self {
+        LineEditor { buffer: [0u8; LINE_CAPACITY], length: 0, saw_carriage_return: false }
+    }
+
+    /// Feeds one input byte through the same line-editing rules the
+    /// interactive shell prompt uses -- echoing printable characters,
+    /// handling backspace/delete, and running `execute` once Enter is
+    /// seen -- regardless of whether `byte` came from the local keyboard,
+    /// COM1, or a remote network peer.
+    fn feed(&mut self, byte: u8, info: &BootInfo) {
         match byte {
-            b'\n' if saw_carriage_return => saw_carriage_return = false,
+            b'\n' if self.saw_carriage_return => self.saw_carriage_return = false,
             b'\r' | b'\n' => {
                 println!();
-                execute(&line[..length], info);
-                length = 0;
-                saw_carriage_return = byte == b'\r';
+                execute(&self.buffer[..self.length], info);
+                self.length = 0;
+                self.saw_carriage_return = byte == b'\r';
                 prompt();
             }
-            8 | 127 if length > 0 => {
-                saw_carriage_return = false;
-                length -= 1;
+            8 | 127 if self.length > 0 => {
+                self.saw_carriage_return = false;
+                self.length -= 1;
                 console::erase_last_character();
             }
-            0x20..=0x7e if length < LINE_CAPACITY => {
-                saw_carriage_return = false;
-                line[length] = byte;
-                length += 1;
+            0x20..=0x7e if self.length < LINE_CAPACITY => {
+                self.saw_carriage_return = false;
+                self.buffer[self.length] = byte;
+                self.length += 1;
                 print!("{}", byte as char);
             }
             0x20..=0x7e => {
-                saw_carriage_return = false;
+                self.saw_carriage_return = false;
                 println!("\nInput limit is {LINE_CAPACITY} characters.")
             }
             _ => {}
@@ -82,6 +108,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         println!("Tape: tape status (what's loaded), tape run (execute it)");
         println!("      tape load disk NAME (load a FOSFS file), tape load net (wait for one over Ethernet; F12 to give up)");
         println!("      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')");
+        println!("Remote: term net (wait for a remote terminal client over Ethernet; F12 to give up)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -104,7 +131,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"cat" => cat_command(info, arguments),
         b"write" => write_command(info, arguments),
         b"rm" => remove_command(info, arguments),
-        b"term" => term_command(arguments),
+        b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"nic" => nic_command(arguments),
         b"chat" => chat_command(arguments),
@@ -245,8 +272,14 @@ fn print_serial_ports() {
 /// their baud rate can be freely chosen; it must evenly divide 115200
 /// (the UART's fixed clock) so the requested rate is reproduced exactly,
 /// e.g. 115200, 57600, 38400, 19200, 9600, 4800, 2400, 1200.
-fn term_command(arguments: &[u8]) {
-    const USAGE: &str = "Usage: term [COM1|COM2|COM3|COM4|PCI0|PCI1|...] [BAUD]";
+///
+/// `term net` is unrelated to any serial port: it waits for a remote
+/// terminal client to say hello over Ethernet (see `term_net`), then
+/// hands local keyboard/VGA control over entirely so the connected peer
+/// drives this same live shell -- unlike `term COM1`/etc, which is a dumb
+/// byte pipe with no shell involvement at all.
+fn term_command(info: &BootInfo, arguments: &[u8]) {
+    const USAGE: &str = "Usage: term [COM1|COM2|COM3|COM4|PCI0|PCI1|...|net] [BAUD]";
 
     let (port_word, remainder) = take_word(arguments);
     let (baud_word, remainder) = take_word(remainder);
@@ -266,6 +299,15 @@ fn term_command(arguments: &[u8]) {
             }
         }
     };
+
+    if port_word.eq_ignore_ascii_case(b"net") {
+        if baud.is_some() {
+            println!("{USAGE}");
+            return;
+        }
+        term_net(info);
+        return;
+    }
 
     if port_word.is_empty() || SERIAL_PORT_NAMES[0].eq_ignore_ascii_case(port_word) {
         if baud.is_some() {
@@ -344,7 +386,140 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
     }
 }
 
-/// A test-only ethertype from the "experimental" range (`0x88b5`/`0x88b6`,
+/// A full remote shell over Ethernet: unlike `term`'s raw byte pipe, this
+/// hands the actual local shell -- prompt, line editing, and every
+/// existing command (`nic`, `chat`, `tape`, ...) -- over to whichever
+/// remote peer connects, so a client only needs to speak the small
+/// `TERM_TAG_*` framing below, not reimplement any command logic.
+///
+/// Waits (F12 to give up, same convention as `nic discover`/`chat`/`term`)
+/// for a `TERM_TAG_HELLO` from any peer, then locks onto that peer's MAC
+/// for the rest of the session -- a second `HELLO` from someone else while
+/// already connected is ignored, since only one remote client can drive
+/// this single-threaded shell at a time. Once connected:
+///
+/// - Everything the shell would normally print to VGA/COM1 (prompts,
+///   echoed keystrokes, command output) is instead captured by
+///   `console::enable_relay` and forwarded as `TERM_TAG_DATA` frames, so
+///   the remote peer sees exactly what a local operator would.
+/// - Incoming `TERM_TAG_DATA` payload bytes are fed one at a time into a
+///   fresh `LineEditor`, exactly as if they had been typed locally,
+///   including running `execute` on Enter.
+/// - Local VGA/PS/2 input is *not* read at all while connected (this
+///   session is exclusive, not mirrored): the only way to interrupt it
+///   locally is F12, which sends `TERM_TAG_BYE` to the peer before
+///   returning. The peer may also end the session first by sending its
+///   own `TERM_TAG_BYE`.
+///
+/// Like `tape_load_net`, this answers any `CHAT_TAG_DISCOVER_REQUEST` it
+/// sees the whole time it runs -- both before a client has connected and
+/// during an active session -- so simply leaving `term net` running is
+/// enough to make this host discoverable, exactly as `chat`/`tape load
+/// net` already do.
+fn term_net(info: &BootInfo) {
+    let Some(nic) = nic_or_report() else { return };
+    let source = nic.mac_address();
+    println!("Waiting for a remote terminal client to connect; press F12 to give up.");
+
+    let mut recv_buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let peer = loop {
+        if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
+            println!("Gave up waiting for a remote terminal client.");
+            return;
+        }
+        if let Some(received) = nic.receive(&mut recv_buffer) {
+            let frame = &recv_buffer[..received];
+            if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+                continue;
+            }
+            let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+            match frame[14] {
+                TERM_TAG_HELLO => break peer_mac,
+                CHAT_TAG_DISCOVER_REQUEST => {
+                    remember_peer(peer_mac);
+                    send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY);
+                    println!("\n(replied to a discovery probe from {})", Mac(&peer_mac));
+                }
+                _ => {}
+            }
+        }
+    };
+
+    println!("Remote terminal connected from {}. Local input is disabled; F12 disconnects it.", Mac(&peer));
+    console::enable_relay();
+    let mut editor = LineEditor::new();
+    let mut relay_chunk = [0u8; TERM_DATA_CAPACITY];
+    prompt();
+
+    'session: loop {
+        let drained = console::drain_relay(&mut relay_chunk);
+        if drained > 0 {
+            send_term_data(nic, &peer, &source, &relay_chunk[..drained]);
+        }
+
+        if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
+            send_term_control(nic, &peer, &source, TERM_TAG_BYE);
+            break 'session;
+        }
+
+        if let Some(received) = nic.receive(&mut recv_buffer) {
+            let frame = &recv_buffer[..received];
+            if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+                continue;
+            }
+            let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
+            if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
+                remember_peer(frame_source);
+                send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
+                continue;
+            }
+            if frame_source != peer {
+                continue;
+            }
+            match frame[14] {
+                TERM_TAG_BYE => break 'session,
+                TERM_TAG_DATA => {
+                    let payload = &frame[15..];
+                    let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
+                    for &byte in &payload[..end] {
+                        editor.feed(byte, info);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    console::disable_relay();
+    println!("\nRemote terminal disconnected; back at the local fos shell.");
+}
+
+/// Sends `data` as one `TERM_TAG_DATA` frame to `destination`, silently
+/// dropping it on a card error the same way `send_chat_line` does -- a lost
+/// screen update is recoverable (the next drain/print will eventually
+/// catch the console up), so nothing here retries or blocks.
+fn send_term_data(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], data: &[u8]) {
+    let mut frame = [0u8; 15 + TERM_DATA_CAPACITY];
+    frame[0..6].copy_from_slice(destination);
+    frame[6..12].copy_from_slice(source);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = TERM_TAG_DATA;
+    frame[15..15 + data.len()].copy_from_slice(data);
+    nic.send(&frame[..15 + data.len()]);
+}
+
+/// Sends a zero-length `CHAT_ETHERTYPE` control frame with a `TERM_TAG_*`
+/// tag (`HELLO` or `BYE`), mirroring `send_chat_control`.
+fn send_term_control(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], tag: u8) {
+    let mut frame = [0u8; 15];
+    frame[0..6].copy_from_slice(destination);
+    frame[6..12].copy_from_slice(source);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = tag;
+    nic.send(&frame);
+}
+
+
 /// reserved by IEEE 802 for exactly this purpose: local, non-routable
 /// protocol experiments that will never collide with a real assigned
 /// ethertype), used to mark `nic send`'s frames as fos's own test traffic
@@ -532,6 +707,24 @@ const TAPE_CHUNK_LEN: usize = 1024;
 /// How often (in PIT ticks, 100/second -- see `interrupts::ticks`)
 /// `tape_load_net` prints a progress line while a transfer is in flight.
 const TAPE_STATUS_TICKS: u64 = 200; // ~2 seconds.
+
+/// `term net`'s wire protocol, sharing `CHAT_ETHERTYPE` rather than
+/// inventing a fourth reserved ethertype: a client says hello with
+/// `TERM_TAG_HELLO` (no payload) to open a session, either side then sends
+/// any number of `TERM_TAG_DATA` frames (payload: raw bytes, unlike
+/// `tape`'s chunks there is no sequence number -- a dropped frame here is
+/// just like a dropped keystroke or a torn screen update, not corrupted
+/// data, so it is not worth the extra bookkeeping), and either side may
+/// close the session with `TERM_TAG_BYE` (no payload).
+const TERM_TAG_HELLO: u8 = 0x20;
+const TERM_TAG_DATA: u8 = 0x21;
+const TERM_TAG_BYE: u8 = 0x22;
+
+/// Data bytes carried in one `TERM_TAG_DATA` frame in either direction:
+/// generous for a burst of shell output (a whole `println!` line or two)
+/// while staying comfortably under `rtl8139::MAX_FRAME_LEN` once the
+/// Ethernet header (14 bytes) and tag (1 byte) are accounted for.
+const TERM_DATA_CAPACITY: usize = 512;
 
 const MAX_PEERS: usize = 16;
 

@@ -25,6 +25,80 @@ static mut ROW: usize = 0;
 static mut COLUMN: usize = 0;
 static mut SERIAL_READY: bool = false;
 
+/// Bounded queue of every byte this module writes out (VGA text plus
+/// whatever reaches `write_serial`, which `Console::write_str`,
+/// `write_bytes`, `clear`, and `erase_last_character` all funnel through)
+/// while a "network relay" session is active. `shell::term_net` is the
+/// only user: it calls `enable_relay` before entering its remote-terminal
+/// loop, then drains this queue every iteration and forwards whatever it
+/// finds to the connected peer over Ethernet, so the shell's ordinary
+/// `println!`/`print!` calls throughout this whole kernel do not need to
+/// know or care that a network client is watching -- the same
+/// producer/consumer queue shape `keyboard`'s interrupt-fed scancode
+/// queue already uses, just for output instead of input. Writing while
+/// inactive (the overwhelmingly common case) costs one branch.
+const RELAY_QUEUE_LEN: usize = 4096;
+static mut RELAY_QUEUE: [u8; RELAY_QUEUE_LEN] = [0; RELAY_QUEUE_LEN];
+static mut RELAY_HEAD: usize = 0;
+static mut RELAY_TAIL: usize = 0;
+static mut RELAY_ACTIVE: bool = false;
+
+/// Starts capturing console output into the relay queue, discarding
+/// anything left over from a previous session.
+pub fn enable_relay() {
+    unsafe {
+        RELAY_ACTIVE = true;
+        RELAY_HEAD = 0;
+        RELAY_TAIL = 0;
+    }
+}
+
+/// Stops capturing; bytes printed after this call are no longer queued
+/// (and, since `enable_relay` resets the queue, are not visible to a
+/// later session either).
+pub fn disable_relay() {
+    unsafe {
+        RELAY_ACTIVE = false;
+    }
+}
+
+/// Appends `bytes` to the relay queue if a session is active, silently
+/// dropping whatever does not fit rather than blocking or panicking --
+/// this is best-effort diagnostic/interactive output, not a guaranteed
+/// delivery channel, exactly like every other network feature in this
+/// kernel (see `tape_load_net`'s own doc comment on lost frames).
+fn relay_push(bytes: &[u8]) {
+    unsafe {
+        if !RELAY_ACTIVE {
+            return;
+        }
+        for &byte in bytes {
+            let next = (RELAY_TAIL + 1) % RELAY_QUEUE_LEN;
+            if next == RELAY_HEAD {
+                break;
+            }
+            RELAY_QUEUE[RELAY_TAIL] = byte;
+            RELAY_TAIL = next;
+        }
+    }
+}
+
+/// Drains up to `out.len()` queued relay bytes into `out`, returning how
+/// many were copied (zero if the queue is currently empty). `term_net`
+/// calls this every loop iteration to pick up whatever has been printed
+/// since the last drain.
+pub fn drain_relay(out: &mut [u8]) -> usize {
+    unsafe {
+        let mut count = 0;
+        while count < out.len() && RELAY_HEAD != RELAY_TAIL {
+            out[count] = RELAY_QUEUE[RELAY_HEAD];
+            RELAY_HEAD = (RELAY_HEAD + 1) % RELAY_QUEUE_LEN;
+            count += 1;
+        }
+        count
+    }
+}
+
 pub fn initialize(serial_available: bool) {
     unsafe {
         SERIAL_READY = serial_available && initialize_serial();
@@ -246,6 +320,7 @@ pub fn read_serial_byte() -> Option<u8> {
 }
 
 pub fn write_serial(bytes: &[u8]) {
+    relay_push(bytes);
     unsafe {
         if !SERIAL_READY {
             return;

@@ -187,8 +187,9 @@ on first use), `nic send` (one raw broadcast test frame), `nic recv`
 (promiscuous-mode capture of every frame seen, until F12 stops it),
 `nic discover`/`nic peers` (broadcast/list a numbered address book of other
 listening fos machines), `chat [PEER_MAC|PEER_NUMBER]` (line-based
-broadcast or unicast text chat; see below), and `tape` (load and execute a
-raw binary from disk or over Ethernet; see below).
+broadcast or unicast text chat; see below), `tape` (load and execute a
+raw binary from disk or over Ethernet; see below), and `term net` (a full
+remote shell over Ethernet; see below).
 
 `nic` is backed by `kernel/src/rtl8139.rs`, a polling-mode driver for the
 Realtek RTL8139 -- chosen as the one supported NIC because it is
@@ -407,6 +408,91 @@ just for this one tape. It also saves and restores `%ebx`/`%esi`/`%edi`/
 `%ebp` around its own body, since `tape_run` calls it as a plain
 `extern "C" fn()` (cdecl), which requires those callee-saved registers to
 come back exactly as they went in.
+
+## Remote terminal (`term net`)
+
+`term net` is deliberately a full remote *shell*, not a byte pipe like
+`term`: once a client connects, the real, live shell -- prompt, line
+editing, and every existing command -- is handed over to it entirely. This
+was made possible by two small refactors, not a parallel reimplementation
+of shell logic:
+
+- `run`'s local input loop was factored into a `LineEditor` struct
+  (`feed(byte, info)`, holding the line buffer/length/carriage-return
+  state that used to be loose locals in `run`). `run` itself now just
+  reads a byte and calls `editor.feed`; `term_net` creates its own
+  `LineEditor` and feeds it bytes arriving over the network instead,
+  so command dispatch (`execute`), line editing, and echo are identical
+  regardless of the byte's source -- no command needs to know it might be
+  driven remotely.
+- `console.rs` gained a small bounded relay queue
+  (`enable_relay`/`disable_relay`/`drain_relay`), fed by a single
+  `relay_push` call inserted at the top of `write_serial` -- already the
+  common choke-point `Console::write_str` (backing `print!`/`println!`),
+  `write_bytes`, `clear`, and `erase_last_character` all funnel through,
+  so every one of them is captured for forwarding without touching any
+  individual call site. `relay_push` runs unconditionally, before
+  `write_serial`'s own `SERIAL_READY` check, so relaying still works on
+  hardware with no COM1 detected. `write_vga_only` (used only by serial
+  `term`'s incoming-byte display) is deliberately *not* hooked in, but
+  since this is a single-threaded kernel where only one shell command runs
+  at a time, serial `term` and `term net` can never be active
+  simultaneously anyway -- this is a non-issue in practice, not a race
+  requiring a guard.
+
+`term_net` (`kernel/src/shell.rs`) waits for a `TERM_TAG_HELLO` frame
+(sharing `CHAT_ETHERTYPE` with `chat`/`tape`/discovery; new tags
+`TERM_TAG_HELLO`/`TERM_TAG_DATA`/`TERM_TAG_BYE` continuing the numbering
+after `TAPE_TAG_STOP`), locking onto that peer's MAC for the session --
+like `tape load net`'s `TAPE_TAG_START` locking, a second `HELLO` from
+someone else while already connected is ignored, since only one remote
+client can drive this single-threaded shell at a time. `TERM_TAG_DATA` (in
+either direction) deliberately carries no sequence number, unlike `tape`'s
+chunked transfer: term is a live, ongoing stream where an occasional
+dropped frame is like a dropped keystroke or a torn screen update, not
+corrupted data worth aborting over, so the extra bookkeeping tape's
+protocol needs was not worth adding here. Both `TERM_TAG_DATA` payloads
+trim trailing zero bytes on receipt, the same convention `CHAT_TAG_TEXT`
+already uses (see above) and safe for the same reason: this is printable
+shell traffic, which never legitimately ends in a genuine zero byte,
+unlike `tape`'s binary payloads.
+
+Once connected, `term_net`'s loop each iteration: drains the relay queue
+and forwards whatever it finds as `TERM_TAG_DATA`; feeds any incoming
+`TERM_TAG_DATA` payload bytes one at a time into its own `LineEditor` via
+`feed`; and checks for local F12 (sends `TERM_TAG_BYE` to the peer, then
+returns) or an incoming `TERM_TAG_BYE` (returns without sending one back). Local
+PS/2/VGA input is not read at all while connected -- this is an exclusive
+takeover, matching this project's existing "one active mode at a time"
+convention (`chat`/`tape load net`/serial `term` are all exclusive the
+same way), not a mirrored session where a local operator and the remote
+peer both drive the shell simultaneously. Like `tape_load_net`, it keeps
+answering `CHAT_TAG_DISCOVER_REQUEST` throughout -- both while waiting for
+a `HELLO` and during an active session -- so simply leaving `term net`
+running is enough to make a host discoverable.
+
+`tools/term_net.py` is the host-side client, reusing
+`tools/send_tape.py`'s discovery/MAC-resolution/raw-`AF_PACKET`-socket
+helpers rather than duplicating them (`import send_tape` and call its
+`parse_mac`/`format_mac`/`discover`/`pad`/`default_interface`/
+`interface_mac` directly). Its primary, expected-to-be-most-used mode is
+non-interactive request/response: given one or more command lines (as
+arguments or via `--stdin`), it sends each, waits for a quiet period on
+the wire (`--settle`, default 0.5s) before printing accumulated output and
+moving to the next command, then sends `TERM_TAG_BYE` and exits -- chosen
+specifically so this tool (and, in turn, this assistant, which drives fos
+primarily through the bash tool's call/response model rather than a live
+interactive TTY) can script a fos session without needing a real terminal
+attached to its own stdin/stdout. `--interactive` is a secondary,
+genuinely interactive raw pass-through mode (reads/writes this program's
+own stdin/stdout with no local echo, since the remote shell echoes
+keystrokes itself) for a human operator's own manual use.
+
+Verified end-to-end against a live QEMU multicast netdev (mirroring
+`tools/tapes/test_primes_e2e.py`'s approach; see
+`tools/test_term_net_e2e.py`): `term net` accepted a `TERM_TAG_HELLO`,
+relayed a couple of ordinary commands' full output (including their
+prompts) back over the wire, and cleanly disconnected on `TERM_TAG_BYE`.
 
 ## Real hardware notes
 

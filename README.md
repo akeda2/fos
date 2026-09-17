@@ -134,6 +134,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
 | `tape run` | Executes the loaded tape: a bare call to its first byte, in ring 0, with no memory protection. If it ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 disconnects it (or the peer can disconnect first). While waiting or connected, also auto-replies to `nic discover` probes, same as `chat`/`tape load net`. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -436,6 +437,44 @@ Build it with `make tape-primes` (produces `build/tapes/primes.bin`,
 entirely separate from `make image`/`run`/`test`), then send it to a
 running fos machine with `tools/send_tape.py build/tapes/primes.bin` and
 run `tape run` there once `tape load net` confirms it arrived.
+
+
+### Remote terminal (`term net`)
+
+`term net` is a full remote shell over raw Ethernet, not a byte pipe like
+`term`: once a client connects, the live shell itself -- prompt, line
+editing, and every existing command (`nic`, `chat`, `tape`, `ls`, ...) --
+is handed over to it, so nothing about any other command needs to know or
+care that it might be driven remotely. This is possible because of how the
+shell's local input loop was already factored: a small `LineEditor` turns
+one byte at a time into command lines and calls the same `execute()`
+dispatcher regardless of where that byte came from, and every bit of
+console output already funnels through one function (`write_serial`) that
+a bounded "relay queue" can tap into without touching any individual
+`println!` call site.
+
+`term net` waits for a `TERM_TAG_HELLO` frame (sharing `CHAT_ETHERTYPE`
+with `chat`/`tape`/discovery) from any peer -- press F12 to give up first
+-- then locks onto that peer's MAC for the session. Once connected: local
+PS/2 keyboard and VGA input stop being read entirely (this is an exclusive
+takeover, not a mirrored session); everything the shell prints is captured
+by the relay queue and forwarded as `TERM_TAG_DATA` frames; and incoming
+`TERM_TAG_DATA` payload bytes are fed byte-by-byte into the same
+`LineEditor` a local keyboard would drive. A `TERM_TAG_BYE` frame from
+either side ends the session and returns control to the local console.
+Like `tape load net`/`chat`, it keeps answering `CHAT_TAG_DISCOVER_REQUEST`
+probes the whole time it runs, before and during a connected session, so
+leaving `term net` open is enough to make a machine discoverable.
+
+The client side is `tools/term_net.py`, built on the same raw
+`AF_PACKET`-socket/MAC-discovery approach as `tools/send_tape.py`. Its
+primary mode is non-interactive and script-friendly: give it one or more
+command lines as arguments (or via `--stdin`), and it sends each in turn,
+waits for a quiet period on the wire, prints whatever came back, then
+sends `TERM_TAG_BYE` and exits -- e.g. `tools/term_net.py "about" "nic"
+"ls"`. `--interactive` instead opens a raw pass-through session reading
+from and writing to this program's own stdin/stdout, closer to a real
+remote login for a human at a keyboard.
 
 
 ## Booting from a NIC ROM
