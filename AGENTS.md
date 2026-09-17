@@ -546,7 +546,83 @@ future contributor doesn't have to rediscover them from scratch:
   was bad -- resynchronizing a *nonsensical* length field is still out of
   scope for this teaching driver (there is no sane byte count to advance
   past), but a bad-but-plausible header must never be left blocking the
-  ring forever.
+  ring forever. **This fix alone was not sufficient** -- see the next
+  entries for the actual root cause of the reported stall.
+- **`tape load net` never answered discovery probes** -- found alongside
+  the ring-wedge investigation above: a fos machine sitting in
+  `tape load net` never replied to `CHAT_TAG_DISCOVER_REQUEST`, unlike
+  `nic discover`/`chat`, because `tape_load_net`'s receive loop
+  (`kernel/src/shell.rs`) only matched the `TAPE_TAG_*` tags and silently
+  ignored everything else. This forced `tools/send_tape.py` to always be
+  given an explicit `--mac` while a receiver waited in `tape load net`.
+  Fixed by adding a `CHAT_TAG_DISCOVER_REQUEST` match arm mirroring
+  `handle_incoming_chat_frame`'s (`remember_peer` + a unicast
+  `CHAT_TAG_DISCOVER_REPLY`), so this host stays discoverable the whole
+  time it waits for a tape, not just before/after a transfer.
+- **RTL8139 Rx buffer/FIFO overflow -- the actual cause of the "stuck
+  after `Receiving a N-byte tape from...`" reports** -- confirmed by
+  reproducing against real hardware directly from a sandboxed dev
+  environment that turned out to share the same LAN (raw `AF_PACKET`
+  sockets need `CAP_NET_RAW`; granted via `setcap` on a dedicated
+  `python3` copy rather than system-wide, see `tools/send_tape.py`'s
+  usage). Sending `tools/tapes/primes.bin` (~1 MB, 978 chunks) with
+  `send_tape.py`'s default (no `--delay`) reliably reproduced the stall;
+  the same tape with `--delay 0.003` (3 ms between chunks) reliably
+  succeeded -- isolating the cause to the receive ring overflowing under
+  an unpaced burst, something a real NIC sending at its own wire speed
+  can do far more easily than QEMU's virtual NIC ever does (QEMU's own
+  end-to-end test for this same tape, `tools/tapes/test_primes_e2e.py`,
+  needed the identical 3 ms pacing to avoid "Gap in tape data" failures
+  even inside emulation). `Rtl8139::receive` never checked `ISR`'s
+  `RXOVW`/`FOVW` bits at all, so once the ring overflowed, its read/write
+  pointers were left desynchronized with nothing to resynchronize them.
+  Three things changed in `kernel/src/rtl8139.rs` to address this:
+  1. `RCR`'s Rx Buffer Length field (`RBLEN`, bits 12:11) was left at its
+     reset default, the smallest ring size (8 KiB). Grown to 32 KiB
+     (`RCR_RBLEN_32K`) -- **not** the largest option, 64 KiB: that was
+     tried first and confirmed, in QEMU testing, to actually corrupt
+     frame data, because at 64 KiB the ring already spans `CAPR`'s entire
+     16-bit addressable range, leaving `RCR_CONFIG`'s `WRAP` bit (which
+     works by letting a packet spill a little past the ring's nominal end
+     into reserved slack space) with no well-defined place left to spill
+     to. A bigger ring only reduces, and does not eliminate, how often an
+     unpaced sender can overflow it.
+  2. Added overflow detection and recovery (`recover_from_overflow`,
+     called at the top of every `receive`): the first attempt -- disable
+     `CR_RE`, reset `CAPR`/`rx_offset`, rewrite `RBSTART`/`RCR`, re-enable
+     `CR_RE` -- looked sufficient in QEMU but, on real hardware, left the
+     card completely unable to receive anything at all afterwards, in a
+     way that outlasted leaving and re-entering `tape load net` and
+     needed a full reboot to clear. Recovery was changed to a full
+     software reset (the same `CR_RST` sequence `init` uses, factored out
+     as `soft_reset`/`program_registers` so both share it) instead of a
+     lighter register-level fixup; confirmed on real hardware that a
+     paced (`--delay 0.003`) send now succeeds immediately after an
+     unpaced send has overflowed the ring, with no reboot in between.
+  3. `tape_load_net` now prints a periodic (~2s) progress line (bytes
+     received so far vs. the declared total, plus
+     `Rtl8139::overflow_count`) while a transfer is in flight, so a
+     transfer that is still making progress is visibly distinguishable
+     from one that has stalled, and a nonzero/growing overflow count
+     points straight at this class of problem instead of leaving it a
+     silent, undiagnosable hang.
+
+  **Confirmed on real hardware**: an unpaced `send_tape.py` run against
+  the fixed driver no longer hangs forever -- it now either completes, or
+  cleanly aborts with a reported "Gap in tape data" once frames are
+  actually lost to an overflow the bigger ring couldn't absorb, since
+  this protocol has no retransmission (see `tape_load_net`'s own doc
+  comment) -- and a paced (`--delay 0.003`, matching
+  `test_primes_e2e.py`'s own pacing) run reliably succeeds, including
+  immediately after a prior unpaced run has triggered the overflow path,
+  without needing a reboot in between. **A polling-only driver with no
+  interrupt and no hardware descriptor ring beyond one 32 KiB buffer
+  fundamentally cannot keep up with a full wire-speed, completely unpaced
+  burst from a real host NIC** -- this is an intentional teaching
+  boundary (see "Deliberately deferred work" below), not a bug still to
+  be chased further; pacing sends of any nontrivial tape remains expected
+  practice, exactly as `send_tape.py`'s own `--delay` flag already
+  documented before this investigation.
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of

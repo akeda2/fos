@@ -173,7 +173,15 @@ def main() -> None:
         "--delay",
         type=float,
         default=0.0,
-        help="Seconds to sleep between data frames, in case a receiver needs pacing (default: 0, none).",
+        help=(
+            "Seconds to sleep between data frames. fos's RTL8139 driver only polls "
+            "for frames (no interrupt, and one receive ring no bigger than 32 KiB); "
+            "on real hardware, sending a nontrivial tape with no delay at all can "
+            "outrun it and lose data (fos reports this as an overflow-recovery count "
+            "and/or a 'Gap in tape data' abort, never a silent hang). "
+            "0.003 (3ms) has been confirmed reliable against real hardware for a "
+            "~1 MB tape; QEMU needs the same pacing (default: 0, none)."
+        ),
     )
     args = parser.parse_args()
 

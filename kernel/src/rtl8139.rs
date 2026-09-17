@@ -23,7 +23,7 @@
 
 use core::cell::Cell;
 
-use crate::arch::x86::{inb, inl, outb, outl, outw};
+use crate::arch::x86::{inb, inl, inw, outb, outl, outw};
 use crate::pci;
 use crate::pmem;
 
@@ -51,8 +51,9 @@ const CR_RST: u8 = 1 << 4; // Software reset.
 /// Accept broadcast (AB), multicast (AM), and packets addressed to our
 /// own MAC (APM); WRAP lets a packet straddle the end of the ring buffer
 /// without wrapping mid-packet, at the cost of needing `RX_BUF_LEN` bytes
-/// of slack at the end (see `RX_BUF_LEN`'s doc comment).
-const RCR_CONFIG: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 7);
+/// of slack at the end (see `RX_BUF_LEN`'s doc comment); `RCR_RBLEN_32K`
+/// selects a larger-than-default ring size (see its own doc comment).
+const RCR_CONFIG: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 7) | RCR_RBLEN_32K;
 
 /// Accept All Packets: with this bit set, the card hands over every frame
 /// it sees on the wire regardless of destination address, instead of only
@@ -61,9 +62,48 @@ const RCR_CONFIG: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 7);
 /// on only for `set_promiscuous`, which backs the shell's `nic sniff`.
 const RCR_AAP: u32 = 1 << 0;
 
+/// `RCR`'s Rx Buffer Length field (bits 12:11): `10b` selects a 32 KiB
+/// ring, four times the reset default (`00b`, 8 KiB -- `RX_BUF_LEN`'s
+/// previous value). The largest option, `11b`/64 KiB, is deliberately
+/// avoided: at 64 KiB the ring already spans the entire 16-bit range
+/// `CAPR`/the ring offset can address, so `RCR_CONFIG`'s `WRAP` bit --
+/// which works by letting a packet spill a little past the ring's
+/// nominal end into reserved slack space -- has nowhere well-defined
+/// left to spill *to*, since "past the end" and "wrapped back to the
+/// start" become the same address; this was confirmed to actually
+/// corrupt frame data (silently splitting/misaligning a packet) rather
+/// than merely being untested, when tried against QEMU's emulated card.
+/// A polling-only driver like this one, with no interrupt to react to a
+/// frame the instant it lands, is far more exposed to a fast, unpaced
+/// sender than an interrupt-driven one would be (see `ISR_RXOVW`'s doc
+/// comment): giving the card four times the room to buffer frames while
+/// this driver's poll loop catches up measurably reduces -- though, since
+/// real bursts are only bounded by wire speed and this loop still has to
+/// actually run its own logic between polls, does not entirely eliminate
+/// -- how often `recover_from_overflow` has to trigger, and how much tape
+/// data is lost to it, under a real, unpaced `send_tape.py` run.
+const RCR_RBLEN_32K: u32 = 0b10 << 11;
+
 const TSD_TOK: u32 = 1 << 15; // Transmit OK.
 const TSD_TUN: u32 = 1 << 14; // Transmit FIFO underrun.
 const TSD_TABT: u32 = 1 << 30; // Transmit abort.
+
+/// `ISR`'s Rx Buffer Overflow bit: the ring filled up faster than
+/// software drained it (this driver only polls; it never services an
+/// interrupt) and the card had nowhere left to DMA an incoming frame.
+/// This is expected to happen under a fast, unpaced burst of frames --
+/// e.g. `tools/send_tape.py` run with no `--delay` against real hardware,
+/// which can offer frames back-to-back far faster than the emulated NIC
+/// QEMU presents ever does -- and, once it happens, the ring's read/write
+/// pointers are left desynchronized: without an explicit recovery step,
+/// every later `receive` call either sees a permanently non-empty buffer
+/// that never yields a sane frame again, or silently reads garbage.
+const ISR_RXOVW: u16 = 1 << 4;
+/// `ISR`'s Rx FIFO Overflow bit: the tiny on-chip FIFO in front of the
+/// ring itself could not be drained to the ring fast enough. Distinct
+/// from `ISR_RXOVW` but calls for the identical recovery, so both are
+/// treated the same way here.
+const ISR_FOVW: u16 = 1 << 6;
 
 /// `TCR`'s Interframe Gap Time field (bits 25:24), set to the standard
 /// IEEE 802.3 gap (`11b`). Leaving this at its all-zero reset value (the
@@ -76,12 +116,14 @@ const TSD_TABT: u32 = 1 << 30; // Transmit abort.
 /// (`8139too.c`) forces this same value for the same reason.
 const TCR_STANDARD_IFG: u32 = 0b11 << 24;
 
-/// The receive ring is a plain, non-wrapping-mid-packet buffer: 8 KiB of
-/// actual ring, plus 16 bytes the card's documentation reserves, plus
-/// 1500 bytes of slack so the last packet before the wraparound point can
-/// spill past the 8 KiB mark instead of being split. Rounded up to whole
-/// 4 KiB frames, since `pmem` only ever hands out whole frames.
-const RX_BUF_LEN: u32 = 8192;
+/// The receive ring is a plain, non-wrapping-mid-packet buffer: 32 KiB of
+/// actual ring (see `RCR_RBLEN_32K`'s doc comment for why not the
+/// largest, 64 KiB, option), plus 16 bytes the card's documentation
+/// reserves, plus 1500 bytes of slack so the last packet before the
+/// wraparound point can spill past the ring's end instead of being
+/// split. Rounded up to whole 4 KiB frames, since `pmem` only ever hands
+/// out whole frames.
+const RX_BUF_LEN: u32 = 32768;
 const RX_BUF_TOTAL: u32 = RX_BUF_LEN + 16 + 1500;
 const RX_BUF_FRAMES: usize = ((RX_BUF_TOTAL as usize) + 4095) / 4096;
 
@@ -97,6 +139,10 @@ fn read8(base: u16, register: u16) -> u8 {
 
 fn write8(base: u16, register: u16, value: u8) {
     unsafe { outb(base + register, value) }
+}
+
+fn read16(base: u16, register: u16) -> u16 {
+    unsafe { inw(base + register) }
 }
 
 fn write16(base: u16, register: u16, value: u16) {
@@ -117,6 +163,11 @@ pub struct Rtl8139 {
     rx_offset: Cell<u16>,
     tx_buffers: [u32; TX_DESCRIPTORS],
     tx_next: Cell<usize>,
+    /// Count of Rx buffer/FIFO overflow recoveries performed so far (see
+    /// `recover_from_overflow`). Exposed only for diagnostics (e.g. the
+    /// shell's `tape load net` can report it if a transfer stalls); it
+    /// does not affect driver behavior.
+    overflow_count: Cell<u32>,
 }
 
 /// What went wrong trying to bring a detected card up. Detection (finding
@@ -149,8 +200,30 @@ impl Rtl8139 {
     /// and never freed back to `pmem` -- this driver is not meant to be
     /// torn down and re-initialized repeatedly).
     pub fn init(io_base: u16) -> Result<Self, InitError> {
-        // Power on, then software-reset, waiting for the card to clear
-        // RST itself once the reset completes.
+        Self::soft_reset(io_base)?;
+
+        let rx_buffer = pmem::allocate_contiguous(RX_BUF_FRAMES).ok_or(InitError::OutOfMemory)?;
+        let mut tx_buffers = [0u32; TX_DESCRIPTORS];
+        for slot in tx_buffers.iter_mut() {
+            *slot = pmem::allocate_contiguous(TX_BUF_FRAMES).ok_or(InitError::OutOfMemory)?;
+        }
+
+        Self::program_registers(io_base, rx_buffer);
+
+        Ok(Rtl8139 {
+            io_base,
+            rx_buffer,
+            rx_offset: Cell::new(0),
+            tx_buffers,
+            tx_next: Cell::new(0),
+            overflow_count: Cell::new(0),
+        })
+    }
+
+    /// Power on, then software-reset, waiting for the card to clear
+    /// `CR_RST` itself once the reset completes. Shared by `init` and by
+    /// `recover_from_overflow`'s full-reset recovery path.
+    fn soft_reset(io_base: u16) -> Result<(), InitError> {
         write8(io_base, REG_CONFIG1, 0x00);
         write8(io_base, REG_CR, CR_RST);
         let mut attempts = 1_000_000u32;
@@ -160,13 +233,15 @@ impl Rtl8139 {
                 return Err(InitError::ResetTimedOut);
             }
         }
+        Ok(())
+    }
 
-        let rx_buffer = pmem::allocate_contiguous(RX_BUF_FRAMES).ok_or(InitError::OutOfMemory)?;
-        let mut tx_buffers = [0u32; TX_DESCRIPTORS];
-        for slot in tx_buffers.iter_mut() {
-            *slot = pmem::allocate_contiguous(TX_BUF_FRAMES).ok_or(InitError::OutOfMemory)?;
-        }
-
+    /// (Re-)programs every register a freshly reset card needs before it
+    /// will actually send/receive, pointing it at `rx_buffer` as its
+    /// receive ring. Shared by `init` (first bring-up) and
+    /// `recover_from_overflow` (recovering after a full reset, reusing
+    /// the same DMA buffer rather than allocating a new one).
+    fn program_registers(io_base: u16, rx_buffer: u32) {
         write32(io_base, REG_RBSTART, rx_buffer);
         write16(io_base, REG_IMR, 0x0000); // No interrupt line use; see module docs.
         // The transmitter/receiver enable bits must be set in CR *before*
@@ -181,8 +256,6 @@ impl Rtl8139 {
         write32(io_base, REG_RCR, RCR_CONFIG);
         write32(io_base, REG_TCR, TCR_STANDARD_IFG);
         write16(io_base, REG_ISR, 0xffff); // Clear any latched status from before reset.
-
-        Ok(Rtl8139 { io_base, rx_buffer, rx_offset: Cell::new(0), tx_buffers, tx_next: Cell::new(0) })
     }
 
     /// This card's burned-in MAC address, read from its `IDR0..IDR5`
@@ -253,12 +326,69 @@ impl Rtl8139 {
         }
     }
 
+    /// Detects an Rx buffer or FIFO overflow (`ISR_RXOVW`/`ISR_FOVW`) and,
+    /// if one occurred, recovers from it with a full software reset
+    /// (`soft_reset`) followed by reprogramming every register a fresh
+    /// card needs (`program_registers`, reusing the same DMA buffer
+    /// rather than allocating a new one) and resetting the ring's read
+    /// pointer (`CAPR`, `rx_offset`) to the very start of the buffer.
+    /// Testing this driver against real hardware showed that a lighter
+    /// recovery -- just toggling `CR_RE` off and on, even while also
+    /// rewriting `RBSTART`/`RCR` -- was not enough: the card was left
+    /// unable to receive anything at all afterwards, in a way that
+    /// outlasted leaving and re-entering `tape load net` and needed a
+    /// full reboot to clear. A full software reset is more disruptive
+    /// (transmit state is reset too, and this pauses receiving for
+    /// longer than the lighter approach would have), but is what actually
+    /// leaves the card working afterwards, matching the full
+    /// reset-and-reinitialize recovery real-world drivers (e.g. Linux's
+    /// historic `8139too.c`) document using for this exact condition.
+    /// Called at the top of every `receive`, so a burst that overflows
+    /// the ring (real hardware can be sent frames back-to-back far faster
+    /// than QEMU's emulated NIC ever presents them, e.g. `send_tape.py`
+    /// run with no `--delay`) recovers into a genuinely working card on
+    /// its own on the next poll, instead of the ring wedging forever.
+    /// Any frame(s) lost to the overflow are simply gone, exactly as on
+    /// any other Ethernet link that dropped them.
+    fn recover_from_overflow(&self) {
+        let isr = read16(self.io_base, REG_ISR);
+        if isr & (ISR_RXOVW | ISR_FOVW) == 0 {
+            return;
+        }
+
+        // A reset that fails to complete within `soft_reset`'s generous
+        // bounded wait leaves nothing sane to recover into; there is no
+        // sane fallback but to leave the card as-is and let the next
+        // `receive` call try again.
+        if Self::soft_reset(self.io_base).is_err() {
+            return;
+        }
+        Self::program_registers(self.io_base, self.rx_buffer);
+        self.rx_offset.set(0);
+        write16(self.io_base, REG_CAPR, 0u16.wrapping_sub(16));
+
+        self.overflow_count.set(self.overflow_count.get() + 1);
+    }
+
+    /// How many times `receive` has detected and recovered from an Rx
+    /// buffer/FIFO overflow so far. Diagnostic only (see
+    /// `recover_from_overflow`); a nonzero, growing count while a
+    /// transfer is in progress is a strong sign frames are being lost to
+    /// the sender running faster than this driver's polling loop can
+    /// drain the ring, which `tape load net` reports to help tell that
+    /// apart from other causes of a stalled transfer.
+    pub fn overflow_count(&self) -> u32 {
+        self.overflow_count.get()
+    }
+
     /// Copies out one received frame (if any is waiting) into `out`,
     /// returning its length -- clipped to `out.len()` if the frame is
     /// larger than the caller's buffer, though the ring is advanced by
     /// the *actual* frame length either way. Returns `None` if no frame
     /// is currently waiting; this does not block.
     pub fn receive(&self, out: &mut [u8]) -> Option<usize> {
+        self.recover_from_overflow();
+
         if read8(self.io_base, REG_CR) & CR_BUFE != 0 {
             return None; // Buffer empty register bit: nothing waiting.
         }

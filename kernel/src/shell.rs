@@ -529,6 +529,10 @@ const TAPE_TAG_STOP: u8 = 0x12;
 /// enough number to reason about by hand.
 const TAPE_CHUNK_LEN: usize = 1024;
 
+/// How often (in PIT ticks, 100/second -- see `interrupts::ticks`)
+/// `tape_load_net` prints a progress line while a transfer is in flight.
+const TAPE_STATUS_TICKS: u64 = 200; // ~2 seconds.
+
 const MAX_PEERS: usize = 16;
 
 /// Every MAC address any `nic discover` probe or `chat` auto-reply has ever
@@ -1014,6 +1018,15 @@ fn tape_load_net() {
 
     let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
     let mut transfer: Option<TapeTransfer> = None;
+    // Periodic (~2s) progress line while a transfer is in flight, so a
+    // stalled load is visibly distinguishable from one still making
+    // progress -- and, since `Rtl8139::overflow_count` only climbs when
+    // the receive ring genuinely overflowed (see `recover_from_overflow`
+    // in rtl8139.rs), a nonzero and growing count here is a strong sign
+    // the sender is outrunning this driver's polling loop, distinct from
+    // a sender that has simply stopped, gone quiet, or was never reached
+    // at all.
+    let mut next_status = interrupts::ticks() + TAPE_STATUS_TICKS;
 
     loop {
         if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
@@ -1022,6 +1035,17 @@ fn tape_load_net() {
             }
             println!("\nGave up waiting; no tape loaded.");
             return;
+        }
+        if transfer.is_some() && interrupts::ticks() >= next_status {
+            let active = transfer.as_ref().unwrap();
+            println!(
+                "\n... {} of {} byte(s) received so far ({} Rx overflow recover{}).",
+                active.received,
+                active.length,
+                nic.overflow_count(),
+                if nic.overflow_count() == 1 { "y" } else { "ies" }
+            );
+            next_status = interrupts::ticks() + TAPE_STATUS_TICKS;
         }
         let Some(received) = nic.receive(&mut buffer) else { continue };
         let frame = &buffer[..received];
@@ -1076,6 +1100,17 @@ fn tape_load_net() {
                 }
                 println!("\nTape from {} stopped early: only {} of {} declared byte(s) arrived -- aborting.", Mac(&source), active.received, active.length);
                 free_tape_frames(active.address, active.length);
+            }
+            CHAT_TAG_DISCOVER_REQUEST => {
+                // A `send_tape.py`/`nic discover`/`chat` peer probing for
+                // us: reply the same way `handle_incoming_chat_frame` and
+                // `nic_discover` do, regardless of whether a transfer is
+                // in progress, so this host stays discoverable the whole
+                // time it sits in `tape load net`, not only before/after
+                // a transfer.
+                remember_peer(source);
+                send_chat_control(nic, &source, &own_mac, CHAT_TAG_DISCOVER_REPLY);
+                println!("\n(replied to a discovery probe from {})", Mac(&source));
             }
             _ => {} // A stray/unrelated tag, or traffic from a different sender mid-transfer: ignored.
         }
