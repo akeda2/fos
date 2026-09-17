@@ -4,8 +4,10 @@ KERNEL_BIN := $(BUILD)/kernel.bin
 STAGE1_BIN := $(BUILD)/stage1.bin
 STAGE2_BIN := $(BUILD)/stage2.bin
 IMAGE := $(BUILD)/fos.img
+NETROM_RAW := $(BUILD)/netrom_raw.bin
+NETROM := $(BUILD)/netboot.rom
 
-.PHONY: all kernel image run test clean
+.PHONY: all kernel image run test netrom clean
 
 all: image
 
@@ -28,6 +30,17 @@ run: image
 
 test: image
 	python3 tools/qemu_smoke.py --image $(IMAGE)
+
+# Builds an alternative, optional boot artifact: a PCI expansion ("option")
+# ROM that boots fos directly from a network card's own boot ROM instead of
+# from disk/USB. Entirely additive -- `image`/`run`/`test` above are
+# untouched, and this never runs as part of `make` or `make all`. See
+# README.md's "Booting from a NIC ROM" section.
+netrom: kernel
+	python3 tools/write_netrom_layout.py --kernel $(KERNEL_BIN) --output $(BUILD)/netrom_layout.inc
+	as --32 -I$(BUILD) -Iboot -o $(BUILD)/netrom.o boot/netrom.S
+	objcopy -O binary $(BUILD)/netrom.o $(NETROM_RAW)
+	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 clean:
 	rm -rf $(BUILD) kernel/target

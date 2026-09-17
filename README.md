@@ -62,6 +62,11 @@ introspection, FOSFS formatting, file creation, reading, removal, and halt.
 `cargo test` does not work for this crate (a `no_std`, custom-target,
 freestanding binary); `make test` is the sole automated validation path.
 
+`make netrom` builds an alternative, optional boot artifact,
+`build/netboot.rom`, that boots fos from a NIC's own PCI option ROM instead
+of disk/USB; see "Booting from a NIC ROM" below. It does not run as part of
+`make`/`make all`, and does not affect `image`/`run`/`test`.
+
 ## Prompt
 
 The prompt accepts fixed-size, allocation-free command lines. Enter and
@@ -225,6 +230,76 @@ ARP, no IPv4, nothing resembling a socket -- this only proves the card itself
 works.
 
 
+## Booting from a NIC ROM
+
+`make netrom` builds `build/netboot.rom`: an alternative, optional boot
+artifact -- a **PCI expansion ("option") ROM** for the RTL8139 that boots fos
+directly from a network card's own boot ROM instead of from a disk or USB
+stick. This is purely additive: `make image`/`make run`/`make test` above are
+completely untouched, and USB/disk booting continues to work exactly as
+before. Nothing about this feature changes any existing boot path; it just
+adds a second, independent way to reach the same kernel.
+
+Legacy BIOS scans every PCI card at POST for exactly this kind of ROM: a
+small image starting with the same `0x55 0xaa` signature the MBR uses, plus a
+whole-image checksum and a `PCIR` data structure identifying the card
+(vendor/device ID, class code) the ROM belongs to. If found, BIOS "shadows"
+(copies) the ROM into memory somewhere in the `0xc0000`-`0xe0000` range and
+far-calls into it during POST -- this is the same mechanism real network
+(PXE) boot ROMs use, and it runs before BIOS ever attempts a disk boot.
+
+`boot/netrom.S` implements this in two phases, mirroring how real network
+boot ROMs behave:
+
+1. **`init_entry`**, far-called by BIOS very early in POST, is a "good
+   citizen": it prints a short banner, installs a hook on the real-mode
+   `INT 19h` vector ("bootstrap loader", fired later once BIOS is ready to
+   boot something), and returns normally so the rest of POST can continue
+   uninterrupted.
+2. **`boot_entry`**, reached once BIOS actually invokes `INT 19h`, never
+   returns. It narrates the same steps as `boot/stage2.S` -- E820 memory map,
+   A20 enable, GDT setup, the far jump into 32-bit protected mode -- except
+   instead of a BIOS disk read, it copies the Rust kernel from its own
+   already-shadowed ROM image straight to physical `0x10000` with a plain
+   memory copy, since the kernel is embedded directly in the ROM (via
+   `.incbin`) rather than read from a disk sector.
+
+Two details make this meaningfully different from `boot/stage2.S`, both
+driven by the fact that an option ROM's *own* memory is effectively read-only
+at run time, exactly like the real EPROM/flash chip it represents:
+
+- **The ROM's own load segment is unknown at build time** (it depends on how
+  many other cards' option ROMs come before it), so, unlike stage two's fixed
+  `0x8000` load address, this code reads its own running segment from `%cs`
+  at startup and computes everything else relative to that.
+- **Nothing inside the ROM image itself can be written at run time.** Any
+  state this code needs to mutate -- its own computed segment/physical base,
+  whether serial is present, and the two descriptors used to enter protected
+  mode -- lives in a small fixed scratch area in genuine low RAM (`0x600`-
+  `0x613`) instead, addressed the same way as the E820/BootInfo buffer
+  (`ES=0` with an explicit `%es:` override).
+
+This first version deliberately does not implement the BIOS-disk real-mode
+trampoline `boot/stage2.S` provides: `BootInfo.bios_disk_io` is left at zero,
+which `kernel/src/disk.rs` already treats as "disk unavailable" and reports
+gracefully (`diskinfo` shows zero sectors; FOSFS commands report the disk as
+absent) rather than attempting a read. `BootInfo.boot_drive` is likewise a
+best-effort `0x80` guess, since BIOS does not hand an `INT 19h`-hooked
+handler a meaningful drive number the way it does for a normal MBR boot.
+The embedded kernel must also fit in 65535 bytes (`tools/write_netrom_layout.py`
+enforces this at build time), since it is copied with a single 16-bit-counted
+`rep movsb` rather than sector-by-sector.
+
+**Physical hardware note:** writing `build/netboot.rom` onto an actual boot
+ROM chip is only possible if the card has a writable/socketed option ROM --
+most RTL8139-era cards either have no ROM socket at all, or only a small
+EEPROM meant for the card's MAC address rather than boot code -- and, where a
+socket does exist, programming it typically requires an external EPROM/flash
+programmer; this project only builds the image, it does not attempt to flash
+any hardware. Validate the image in QEMU first with
+`qemu-system-i386 -device rtl8139,romfile=build/netboot.rom` (no `-drive`
+needed at all to prove it boots standalone).
+
 ## Supported platform
 
 The supported target has all of the following:
@@ -272,6 +347,8 @@ general-purpose one), interrupt-driven IRQ0/IRQ1 handling for the timer and
 keyboard, and one polling-mode network card driver (RTL8139, raw Ethernet
 frames only -- no ARP/IPv4/TCP stack, and no NIC interrupt handling; see
 "Ethernet (`nic`)"), but no other hardware IRQ drivers (no native disk or USB
-interrupt handling). The architecture keeps x86/driver code separate from
+interrupt handling). The optional NIC-ROM boot path (see "Booting from a NIC
+ROM") does not implement the BIOS-disk trampoline, so disk/FOSFS access is
+unavailable when booted that way. The architecture keeps x86/driver code separate from
 console and shell policy so later work can add those facilities without
 changing the BIOS-to-kernel contract.
