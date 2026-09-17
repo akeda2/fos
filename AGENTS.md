@@ -371,7 +371,29 @@ future contributor doesn't have to rediscover them from scratch:
   hardware bisection across three physical machines after ruling out the
   PIC/IRQ fixes above as the cause (the pre-AMD-work baseline commit had
   the identical bug -- it just had never been tested host-to-host on real
-  NICs before).
+  NICs before). **Confirmed correct in principle (matches Linux's own
+  constant/comment) but did not, on its own, resolve the reported
+  symptom** -- see the next entry.
+- **RTL8139 CR/RCR/TCR write order** -- still investigating the same
+  "nothing a real fos host sends is ever received by anything" report
+  after the interframe-gap fix above. Comparing against Linux's reference
+  `rtl8139_hw_start` (`8139too.c`) turned up an explicit comment: "Must
+  enable Tx/Rx before setting transfer thresholds!" -- it writes `CR`
+  (`CmdRxEnb`/`CmdTxEnb`) *before* `RxConfig`/`TxConfig`, not after. This
+  driver's `init` did the opposite: it wrote `RCR`/`TCR` (which carry
+  FIFO/DMA threshold fields alongside their other bits) while Tx/Rx were
+  still disabled, then enabled them afterward. QEMU's emulated RTL8139
+  tolerates either order, which is why this was never caught by any
+  QEMU-based testing this session. Fixed by moving the `CR` write (enable
+  Tx/Rx) before the `RCR`/`TCR` writes. **Not yet confirmed against real
+  hardware** -- if the AMD/P4/dev-host trio still can't exchange frames
+  after this, the next thing to check is the exact hex bytes an external
+  `tcpdump`/Wireshark capture sees leaving a fos host during `nic send`
+  (a capture that's never actually been attempted yet in this
+  investigation), since that would show directly whether the frame
+  reaching the wire is well-formed, garbled, or simply never arrives at
+  all -- narrowing between "chip mis-programmed" and "frame data itself
+  is wrong" far more precisely than blind register-level guessing can.
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
