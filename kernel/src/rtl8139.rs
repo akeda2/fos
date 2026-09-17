@@ -268,24 +268,26 @@ impl Rtl8139 {
         let status = header & 0xffff;
         let frame_len = (header >> 16) as u16; // Includes the 4-byte FCS.
 
-        if status & 0x1 == 0 || frame_len < 4 {
-            // Not "receive OK", or a nonsensical length: resynchronizing
-            // the ring here is out of scope for this teaching driver, so
-            // just report nothing rather than risk reading garbage.
+        if frame_len < 4 || u32::from(frame_len) > RX_BUF_LEN {
+            // The length field itself is nonsensical, meaning the ring is
+            // desynchronized (or we are reading garbage): there is no sane
+            // byte count to advance past, so resynchronizing here is out
+            // of scope for this teaching driver. Just report nothing.
             return None;
         }
-
-        let payload_len = usize::from(frame_len) - 4; // Drop the FCS.
-        let copy_len = payload_len.min(out.len());
-        let payload_start = self.rx_buffer + u32::from(offset) + 4;
-        let payload = unsafe { core::slice::from_raw_parts(payload_start as *const u8, copy_len) };
-        out[..copy_len].copy_from_slice(payload);
 
         // Advance past this packet's 4-byte header plus its length,
         // rounded up to a 4-byte boundary, wrapping at RX_BUF_LEN; then
         // tell the card via CAPR, which -- per the card's documented
         // quirk -- must be the new offset minus 16, not the offset
-        // itself.
+        // itself. This must happen even for a frame the card marked as
+        // not "receive OK" (a real CRC/alignment/runt error, more likely
+        // under a fast back-to-back burst like `tape`'s than the
+        // occasional `chat`/`nic discover` frame): the length field is
+        // still meaningful for those, and every entry in the ring -- good
+        // or bad -- must be advanced past, or the whole ring wedges
+        // forever on the first bad frame, with every later, perfectly
+        // good frame behind it in the ring never becoming reachable.
         let mut next_offset = u32::from(offset) + 4 + u32::from(frame_len);
         next_offset = (next_offset + 3) & !3;
         if next_offset >= RX_BUF_LEN {
@@ -293,6 +295,16 @@ impl Rtl8139 {
         }
         self.rx_offset.set(next_offset as u16);
         write16(self.io_base, REG_CAPR, next_offset.wrapping_sub(16) as u16);
+
+        if status & 0x1 == 0 {
+            return None; // Not receive-OK: ring advanced, nothing to report.
+        }
+
+        let payload_len = usize::from(frame_len) - 4; // Drop the FCS.
+        let copy_len = payload_len.min(out.len());
+        let payload_start = self.rx_buffer + u32::from(offset) + 4;
+        let payload = unsafe { core::slice::from_raw_parts(payload_start as *const u8, copy_len) };
+        out[..copy_len].copy_from_slice(payload);
 
         Some(copy_len)
     }

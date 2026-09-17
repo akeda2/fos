@@ -520,6 +520,33 @@ future contributor doesn't have to rediscover them from scratch:
   reaching the wire is well-formed, garbled, or simply never arrives at
   all -- narrowing between "chip mis-programmed" and "frame data itself
   is wrong" far more precisely than blind register-level guessing can.
+- **RTL8139 receive ring could wedge permanently on one bad frame** --
+  found while diagnosing "`tape load net` prints its `Receiving a
+  N-byte tape from...` line and then never receives another frame again
+  (and `nic discover` stops finding anyone either, in the same session)"
+  on real hardware. `Rtl8139::receive` reads a 4-byte header out of the
+  ring for the frame at the current read offset; if the card's own
+  "receive OK" status bit was clear (a real CRC/alignment/runt error --
+  much more likely to actually occur under a fast, back-to-back burst of
+  frames like `tape`'s DATA chunks than the occasional single `chat`/
+  `nic discover` frame), the old code returned `None` *without* advancing
+  `rx_offset`/`CAPR` past that entry at all. Every later call then read
+  the exact same bad header again, forever -- silently, with no error
+  printed, since returning `None` is also the ordinary "nothing waiting
+  right now" result. Because the ring offset lives in the one persistent
+  `Rtl8139` instance rather than being reset per-command, one single bad
+  frame during *any* network command permanently wedges receiving for
+  the rest of the session, explaining why an unrelated command
+  (`nic discover`) also stopped working once this happened. QEMU's
+  virtual NIC essentially never reports a receive error, so this never
+  surfaced in any QEMU-based testing. Fixed by always advancing past the
+  ring entry using its header's length field whenever that length itself
+  looks sane, regardless of the "receive OK" bit, and only skipping the
+  copy-out (still returning `None` to the caller) when the frame itself
+  was bad -- resynchronizing a *nonsensical* length field is still out of
+  scope for this teaching driver (there is no sane byte count to advance
+  past), but a bad-but-plausible header must never be left blocking the
+  ring forever.
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
