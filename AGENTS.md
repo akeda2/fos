@@ -364,6 +364,50 @@ All three constants must always match; see "Low-memory map" above for why
 growing this region is safe (nothing else lives between `0x20000` and the
 real-mode stack pointer's `0x9f000`).
 
+Because a tape can write VGA memory and move the hardware cursor directly
+(see `tools/tapes/primes.S` below) with no way to tell `console.rs` it did
+so, `tape_run` calls the new `console::resync_cursor()` immediately after
+the tape returns -- it just re-reads the CRTC cursor position the same way
+`console::initialize()` already does once at boot, so the shell's next
+line of output continues from wherever the tape actually left the cursor
+instead of overwriting the tape's own output from a stale, pre-tape
+position.
+
+`tools/tapes/primes.S` is a worked, non-trivial test tape: a
+Sieve-of-Eratosthenes prime counter up to 1,000,000, assembled the same
+way as `boot/stage1.S`/`boot/stage2.S` (`as --32` then `objcopy -O
+binary`, via the new `make tape-primes` target -- entirely separate from
+`make image`/`run`/`test`) rather than compiled by `kernel/`'s own Cargo
+build. Unlike the throwaway one-byte `0xc3` tape used to validate `tape`
+itself, this one has real data (a 1,000,000-byte sieve array) and so must
+be genuine position-independent code: its very first instructions are the
+classic `call get_base` / `pop %ebx` idiom to capture its own runtime load
+address, since `pmem::allocate_contiguous` gives it no fixed one, and
+every later label reference is computed as `%ebx + (label - get_base)`,
+an assemble-time constant GNU `as` resolves within this single unlinked
+file exactly the way `boot/stage2.S` already resolves its own `label +
+STAGE2_BASE` expressions. The sieve array is embedded as literal
+zero-filled space (`.fill N, 1, 0`) directly in the file rather than
+assumed to be available in whatever memory happens to follow the tape's
+own buffer, since only the declared/transferred length is ever actually
+allocated for it (see the `tape` protocol notes above) -- this is also
+why the assembled binary is roughly a megabyte, sent over the network in
+~1000 chunks by `tools/send_tape.py`, since FOSFS's 512-byte file cap
+can't hold it. Because a tape can't call back into the kernel for timing
+or console output either, it measures elapsed time with a raw `rdtsc`
+(reported as uncalibrated CPU cycles, not wall-clock time) and
+reimplements VGA text output and CRTC cursor handling by hand, matching
+`console.rs`'s own conventions byte-for-byte, plus mirrors every printed
+character to COM1 (matching `console.rs`'s own dual VGA+serial habit) --
+which is what let this be checked end-to-end by a disposable
+serial-driven test harness (`tools/tapes/test_primes_e2e.py`, a QEMU
+multicast-netdev-based script in the same spirit as the one used to
+validate `tape` itself) instead of needing a screen-capture/OCR pipeline
+just for this one tape. It also saves and restores `%ebx`/`%esi`/`%edi`/
+`%ebp` around its own body, since `tape_run` calls it as a plain
+`extern "C" fn()` (cdecl), which requires those callee-saved registers to
+come back exactly as they went in.
+
 ## Real hardware notes
 
 QEMU is this project's primary validation environment, but a few behaviors

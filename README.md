@@ -415,6 +415,28 @@ same `CHAT_TAG_DISCOVER_REQUEST` probe `nic discover` sends and picks the
 destination automatically if exactly one fos machine replies (pass `--mac`
 to skip discovery and address one directly).
 
+#### Test tape: `tools/tapes/primes.S`
+
+A worked example of everything above: a hand-written, genuinely
+position-independent 32-bit assembly program that computes every prime up
+to 1,000,000 with a Sieve of Eratosthenes, then prints a short summary
+(count found, largest prime, elapsed CPU cycles) to both VGA and the
+serial console, and returns cleanly to the shell. Since a tape has no
+fixed load address, it captures its own runtime base with the classic
+`call`/`pop` idiom and addresses every label as an offset from that base
+-- unlike the tiny single-instruction tape used while developing `tape`
+itself, this one has real data (a 1,000,000-byte sieve array) that must be
+reachable no matter where it lands in memory. The sieve array is embedded
+directly in the file as literal zero-filled space, which is why the
+assembled binary is about a megabyte -- see the file's own header comment
+for the full reasoning, including why it re-implements VGA cursor
+handling and COM1 output by hand rather than calling back into the kernel.
+
+Build it with `make tape-primes` (produces `build/tapes/primes.bin`,
+entirely separate from `make image`/`run`/`test`), then send it to a
+running fos machine with `tools/send_tape.py build/tapes/primes.bin` and
+run `tape run` there once `tape load net` confirms it arrived.
+
 
 ## Booting from a NIC ROM
 

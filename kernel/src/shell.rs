@@ -928,6 +928,12 @@ fn tape_run() {
     println!("Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery.");
     let entry: extern "C" fn() = unsafe { core::mem::transmute::<usize, extern "C" fn()>(address as usize) };
     entry();
+    // A tape is free to write VGA memory and move the hardware cursor
+    // directly (see tools/tapes/primes.S for an example), with no way to
+    // tell the kernel's console code it did so. Re-sync the console's own
+    // cached cursor position now, or this println! would continue from a
+    // stale, pre-tape position and overwrite whatever the tape just printed.
+    console::resync_cursor();
     println!("Tape returned; back at the fos shell.");
 }
 

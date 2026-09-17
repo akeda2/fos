@@ -6,8 +6,9 @@ STAGE2_BIN := $(BUILD)/stage2.bin
 IMAGE := $(BUILD)/fos.img
 NETROM_RAW := $(BUILD)/netrom_raw.bin
 NETROM := $(BUILD)/netboot.rom
+TAPE_PRIMES_BIN := $(BUILD)/tapes/primes.bin
 
-.PHONY: all kernel image run test netrom clean
+.PHONY: all kernel image run test netrom tape-primes clean
 
 all: image
 
@@ -41,6 +42,17 @@ netrom: kernel
 	as --32 -I$(BUILD) -Iboot -o $(BUILD)/netrom.o boot/netrom.S
 	objcopy -O binary $(BUILD)/netrom.o $(NETROM_RAW)
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
+
+# Builds the "primes" test tape: a standalone, position-independent 32-bit
+# binary that is not part of the disk image at all. It is meant to be sent
+# to a running fos instance with tools/send_tape.py and executed with
+# `tape load net` / `tape run`. See tools/tapes/primes.S's header comment
+# and README.md's "Tape" section for details. Entirely additive -- untouched
+# by `make`/`make all`/`image`/`run`/`test`.
+tape-primes:
+	mkdir -p $(BUILD)/tapes
+	as --32 -o $(BUILD)/tapes/primes.o tools/tapes/primes.S
+	objcopy -O binary $(BUILD)/tapes/primes.o $(TAPE_PRIMES_BIN)
 
 clean:
 	rm -rf $(BUILD) kernel/target

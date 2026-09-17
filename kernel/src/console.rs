@@ -42,6 +42,24 @@ pub fn initialize(serial_available: bool) {
     }
 }
 
+/// Re-reads the hardware cursor position and updates the kernel's own
+/// cached ROW/COLUMN to match. `initialize()` only does this once at boot,
+/// because normally the kernel is the only thing moving the hardware
+/// cursor, so its own cache never goes stale on its own. A `tape` (see
+/// kernel/src/shell.rs and tools/tapes/*.S) breaks that assumption: it
+/// writes VGA memory and drives the CRTC cursor directly, with no way to
+/// tell the kernel's console code it did so. Call this right after a tape
+/// returns so the shell's next line of output continues from wherever the
+/// tape actually left the cursor, instead of overwriting the tape's own
+/// output from a stale, pre-tape position.
+pub fn resync_cursor() {
+    unsafe {
+        let (row, column) = read_cursor_position();
+        ROW = row;
+        COLUMN = column;
+    }
+}
+
 /// Reads the hardware text-mode cursor position back from the CRTC, in
 /// (row, column) form. Used once at boot so kernel output continues
 /// exactly where the real-mode loader's BIOS-teletype printing left off.
