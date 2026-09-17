@@ -260,20 +260,23 @@ as UTF-8.
 (`PEERS`/`PEER_COUNT` statics, capped at `MAX_PEERS` = 16, deliberately not
 dynamically sized since this kernel has no heap) so a peer can be named
 `chat 1` instead of a full MAC. `nic discover` broadcasts one
-`CHAT_TAG_DISCOVER_REQUEST` and busy-polls `receive` for a bounded window
-(unlike `nic_recv`'s single-frame timeout, this window keeps collecting
-after the first reply, since several peers might answer); `nic peers` just
-prints the table. Whoever receives a `CHAT_TAG_DISCOVER_REQUEST` -- whether
-via `nic discover` or a running `chat` session's own receive loop --
-answers with one unicast `CHAT_TAG_DISCOVER_REPLY` straight back to the
-requester's source MAC (never broadcast, so replying doesn't also
-broadcast to every other listener) and remembers the requester too, making
-discovery symmetric after one round. Because this kernel has no
-interrupt-driven network service (every receive is a polled call inside a
-foreground loop -- `nic_recv`, `nic sniff`, `chat`, or `nic discover`
-itself), a probe only ever gets a reply from a fos machine that happens to
-be inside `chat` or `nic discover` at that exact moment; this is a real,
-honestly-documented limit of the polling design, not a bug to eventually
+`CHAT_TAG_DISCOVER_REQUEST`, re-sending it every `DISCOVER_REBROADCAST_TICKS`
+(a plain `interrupts::ticks()` comparison, not a timer interrupt) so a peer
+that only starts `chat`/`nic discover` partway through is still found, and
+busy-polls `receive` -- printing each newly-seen peer as it arrives -- until
+`keyboard::poll_term_event()` reports F12, the same escape convention
+`nic sniff`/`term`/`chat` all use; `nic peers` just prints the table.
+Whoever receives a `CHAT_TAG_DISCOVER_REQUEST` -- whether via `nic discover`
+or a running `chat` session's own receive loop -- answers with one unicast
+`CHAT_TAG_DISCOVER_REPLY` straight back to the requester's source MAC
+(never broadcast, so replying doesn't also broadcast to every other
+listener) and remembers the requester too, making discovery symmetric
+after one round. Because this kernel has no interrupt-driven network
+service (every receive is a polled call inside a foreground loop --
+`nic_recv`, `nic sniff`, `chat`, or `nic discover` itself), a probe only
+ever gets a reply from a fos machine that happens to be inside `chat` or
+`nic discover` at that exact moment; this is a real, honestly-documented
+limit of the polling design, not a bug to eventually
 fix with a background listener.
 
 

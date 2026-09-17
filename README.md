@@ -112,7 +112,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
 | `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
 | `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 stops the capture, then turns promiscuous mode back off. |
-| `nic discover` | Broadcasts a `chat`-protocol discovery probe and listens briefly for replies, adding every distinct responder to a numbered peer list (only fos machines currently running `chat` or `nic discover` reply). |
+| `nic discover` | Broadcasts a `chat`-protocol discovery probe (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 stops it (only fos machines currently running `chat` or `nic discover` reply). |
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (local keyboard) or by typing `/quit` (works over serial too). |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
@@ -300,8 +300,10 @@ since both share one scrolling console.
 `nic discover` and `nic peers` add a numbered address book on top of that
 same tagged-frame format, so a peer can be named `chat 1` instead of typing
 its full MAC every time. `nic discover` broadcasts a `CHAT_TAG_DISCOVER_REQUEST`
-frame and then polls the card for a bounded window, remembering the source
-MAC of every `CHAT_TAG_DISCOVER_REPLY` it sees; `nic peers` just prints the
+frame, re-sending it every few seconds (so a machine that starts `chat`/`nic
+discover` a little late is still found), and keeps polling the card --
+printing each newly-seen peer as it replies -- until F12 stops it, the same
+convention `nic sniff`/`term`/`chat` all use; `nic peers` just prints the
 list built so far, without sending anything. There is no interrupt-driven
 network service in this kernel -- every receive is a polled `nic.receive()`
 call somewhere in a foreground loop -- so a probe is only ever answered by a

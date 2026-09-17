@@ -564,24 +564,41 @@ fn print_peers() {
     }
 }
 
-/// Broadcasts one discovery probe (`CHAT_TAG_DISCOVER_REQUEST`) and listens
-/// briefly for replies, adding every distinct source MAC seen to the peer
-/// table. There is no interrupt-driven network service in this kernel (see
-/// "Current boundaries" in `AGENTS.md`), so a reply only ever comes from a
-/// fos machine whose own `chat` or `nic discover` happens to be running and
-/// polling its card at that moment -- this only finds who is listening
-/// *right now*, not who exists on the network.
+/// The gap, in 100 Hz timer ticks, between re-broadcasts of the discovery
+/// probe (see `nic_discover`) -- frequent enough that a peer which starts
+/// `chat`/`nic discover` a few seconds late is still found before the
+/// operator gives up and presses F12, but not so frequent that the wire (or
+/// the printed peer list, which only grows on genuinely new replies) is
+/// spammed.
+const DISCOVER_REBROADCAST_TICKS: u64 = 300;
+
+/// Broadcasts a discovery probe (`CHAT_TAG_DISCOVER_REQUEST`), re-sending it
+/// every `DISCOVER_REBROADCAST_TICKS` so machines that only start `chat` or
+/// `nic discover` partway through are still found, and keeps listening --
+/// printing each newly-seen peer as it replies -- until F12 stops it, the
+/// same convention `nic sniff`/`term`/`chat` all use. There is no
+/// interrupt-driven network service in this kernel (see "Current
+/// boundaries" in `AGENTS.md`), so a reply only ever comes from a fos
+/// machine whose own `chat` or `nic discover` happens to be running and
+/// polling its card while this loop is open -- it only finds who is
+/// listening *right now*, not who exists on the network.
 fn nic_discover() {
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
+    println!("Broadcasting a discovery probe every few seconds; press F12 to stop and see the list.");
     send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
-    println!("Broadcast a discovery probe; listening for replies for a couple of seconds...");
+    let mut next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
 
     let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
-    let mut attempts = 60_000_000u32;
     let mut discovered = 0u32;
-    while attempts > 0 {
-        attempts -= 1;
+    loop {
+        if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+            break;
+        }
+        if interrupts::ticks() >= next_broadcast {
+            send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
+            next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
+        }
         let Some(length) = nic.receive(&mut buffer) else { continue };
         let frame = &buffer[..length];
         if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE || frame[14] != CHAT_TAG_DISCOVER_REPLY {
@@ -590,10 +607,11 @@ fn nic_discover() {
         let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
         if remember_peer(peer_mac) {
             discovered += 1;
+            println!("Found peer #{discovered}: {}", Mac(&peer_mac));
         }
     }
 
-    println!("Received {discovered} new reply/replies.");
+    println!("\nStopped discovery; found {discovered} new peer(s) this run.");
     print_peers();
 }
 
