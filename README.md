@@ -261,7 +261,16 @@ There is no interrupt handling here: this project's PIC setup leaves every
 IRQ but the timer and keyboard masked (see "Current boundaries"), so the
 driver's interrupt mask register is simply left at zero and everything is
 done by polling status registers, the same approach `term` already takes for
-serial I/O. `nic` (no arguments) reports whether a card was found and its
+serial I/O. `TCR` (Transmit Configuration Register) is programmed with a
+standard IEEE 802.3 interframe gap rather than left at its all-zero reset
+value -- the RTL8139's own "transmit OK" status bit only reflects the
+chip's own FIFO/abort state, not whether anything downstream actually
+accepted the frame, and a too-short gap between frames is a well-known
+real-hardware gotcha real switches and NICs can silently enforce by
+dropping the frame even while the card itself reports success (QEMU's
+virtual NIC never enforces this, which is why it went unnoticed until
+tested between two real machines -- see "Real hardware notes" in
+`AGENTS.md`). `nic` (no arguments) reports whether a card was found and its
 MAC address; `nic send` transmits one broadcast test frame tagged with an
 IEEE-reserved "experimental" ethertype (`0x88b5`) so it is unmistakably fos's
 own test traffic; `nic recv` polls briefly for one incoming frame and

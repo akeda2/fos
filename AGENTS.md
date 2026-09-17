@@ -353,6 +353,25 @@ future contributor doesn't have to rediscover them from scratch:
   spurious IRQ7 is now a normal, silent, roughly-never-noticed event
   instead of a fatal exception. `irqstat` reports how often it happens.
   **Confirmed fix for the originally reported bug.**
+- **RTL8139 transmit interframe gap** -- `Rtl8139::init` (`kernel/src/rtl8139.rs`)
+  used to program `TCR` (Transmit Configuration Register) as all zeros,
+  leaving the Interframe Gap Time field (bits 25:24) at its minimum. This
+  looked fine by every signal the driver itself checks (`nic send` always
+  reported success, since the card's `TOK` status bit only reflects its
+  own FIFO/abort state, not whether anything downstream accepted the
+  frame), and QEMU's virtual NIC/hub happily ignored the too-short gap
+  too -- but on real hardware, no other machine ever received anything a
+  real fos host sent, including another fos host's own `nic sniff`, even
+  though that same fos host's `nic sniff` correctly captured ordinary
+  external traffic (confirming the receive path, RCR config, and ring
+  buffer parsing were all fine). This is a well-known RTL8139 gotcha --
+  Linux's historic `8139too.c` driver forces the same field to the
+  standard IEEE 802.3 gap for the same reason. Fixed by writing
+  `TCR_STANDARD_IFG` (`0b11 << 24`) instead of `0`. Found via real
+  hardware bisection across three physical machines after ruling out the
+  PIC/IRQ fixes above as the cause (the pre-AMD-work baseline commit had
+  the identical bug -- it just had never been tested host-to-host on real
+  NICs before).
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
