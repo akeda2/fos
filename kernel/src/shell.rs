@@ -77,6 +77,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 to exit)");
                 println!("Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame),");
         println!("          nic sniff (promiscuous capture; F12 to stop)");
+        println!("          chat [PEER_MAC] (broadcast or unicast text chat; F12 or /quit to leave)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -102,6 +103,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"term" => term_command(arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"nic" => nic_command(arguments),
+        b"chat" => chat_command(arguments),
         b"halt" => {
             if !no_arguments(arguments) {
                 return;
@@ -481,6 +483,172 @@ fn nic_sniff() {
 
     nic.set_promiscuous(false);
     println!("\nPromiscuous mode disabled; captured {captured} frame(s). Back at the fos shell.");
+}
+
+/// A dedicated ethertype for `chat`, distinct from `TEST_ETHERTYPE`, so a
+/// `nic sniff` capture (or a stray `nic recv`) never mistakes a chat line
+/// for test traffic or vice versa. `0x88b5`/`0x88b6` are the two ethertypes
+/// IEEE 802 reserves together for exactly this kind of local, non-routable
+/// protocol experiment.
+const CHAT_ETHERTYPE: [u8; 2] = [0x88, 0xb6];
+const CHAT_TEXT_CAPACITY: usize = 200;
+const BROADCAST_MAC: [u8; 6] = [0xff; 6];
+
+/// `chat` (no arguments) is an open, broadcast text chat: every frame it
+/// sends goes to the broadcast address, and it displays any `CHAT_ETHERTYPE`
+/// frame it receives from anyone. `chat AA:BB:CC:DD:EE:FF` instead targets
+/// one peer directly (a real unicast Ethernet address, not a broadcast) and
+/// only displays frames whose *source* matches that address, for a private
+/// two-machine conversation -- both send and receive reuse the exact same
+/// `Rtl8139::send`/`receive` calls either way, since addressing is just a
+/// different destination MAC, not a different protocol.
+///
+/// Typed lines are sent on Enter, one line per frame, with the same
+/// backspace/echo/length-limit handling the main shell prompt itself uses;
+/// incoming lines are printed as they arrive, tagged with the sender's MAC.
+/// Because incoming lines can arrive while a local line is only half typed,
+/// they may interleave with it on screen -- a known, accepted simplification
+/// for a single-scrolling-console chat, not a bug. Leaves through F12 (only
+/// available from the local PS/2 keyboard, same as `term`/`nic sniff`) or by
+/// typing the line `/quit` (which also works from a serial-only session,
+/// since -- unlike `term` -- `chat` never takes over the serial console).
+fn chat_command(arguments: &[u8]) {
+    let (peer_word, remainder) = take_word(arguments);
+    if !remainder.is_empty() {
+        println!("Usage: chat [PEER_MAC]");
+        return;
+    }
+    let peer = if peer_word.is_empty() {
+        None
+    } else {
+        match parse_mac(peer_word) {
+            Some(mac) => Some(mac),
+            None => {
+                println!("'{}' is not a MAC address in aa:bb:cc:dd:ee:ff form.", core::str::from_utf8(peer_word).unwrap_or("?"));
+                return;
+            }
+        }
+    };
+
+    let Some(nic) = nic_or_report() else { return };
+    let destination = peer.unwrap_or(BROADCAST_MAC);
+    let source = nic.mac_address();
+
+    match peer {
+        Some(mac) => println!(
+            "Chatting with {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} only. F12 or '/quit' to leave.",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        ),
+        None => println!("Broadcasting to everyone listening. F12 or '/quit' to leave."),
+    }
+
+    let mut line = [0u8; CHAT_TEXT_CAPACITY];
+    let mut length = 0usize;
+    let mut saw_carriage_return = false;
+    let mut recv_buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+
+    'chat: loop {
+        // Serial bytes take the same path a plain keyboard character
+        // would (there is no serial equivalent of the F12 escape key);
+        // only fall back to polling the keyboard -- which can also report
+        // Escape -- once no serial byte is waiting.
+        let event = match console::read_serial_byte() {
+            Some(byte) => Some(keyboard::KeyEvent::Char(byte)),
+            None => keyboard::poll_term_event(),
+        };
+        match event {
+            Some(keyboard::KeyEvent::Escape) => break 'chat,
+            Some(keyboard::KeyEvent::Char(b'\n')) if saw_carriage_return => saw_carriage_return = false,
+            Some(keyboard::KeyEvent::Char(byte @ (b'\r' | b'\n'))) => {
+                saw_carriage_return = byte == b'\r';
+                println!();
+                if &line[..length] == b"/quit" {
+                    break 'chat;
+                }
+                if length > 0 {
+                    send_chat_line(nic, &destination, &source, &line[..length]);
+                }
+                length = 0;
+            }
+            Some(keyboard::KeyEvent::Char(8 | 127)) if length > 0 => {
+                saw_carriage_return = false;
+                length -= 1;
+                console::erase_last_character();
+            }
+            Some(keyboard::KeyEvent::Char(byte @ 0x20..=0x7e)) if length < CHAT_TEXT_CAPACITY => {
+                saw_carriage_return = false;
+                line[length] = byte;
+                length += 1;
+                print!("{}", byte as char);
+            }
+            Some(keyboard::KeyEvent::Char(0x20..=0x7e)) => {
+                saw_carriage_return = false;
+                println!("\nChat lines are limited to {CHAT_TEXT_CAPACITY} characters.");
+            }
+            _ => {}
+        }
+
+        if let Some(received) = nic.receive(&mut recv_buffer) {
+            print_chat_frame(&recv_buffer[..received], peer.as_ref());
+        }
+    }
+
+    println!("Left chat; back at the fos shell.");
+}
+
+fn send_chat_line(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], text: &[u8]) {
+    let mut frame = [0u8; 14 + CHAT_TEXT_CAPACITY];
+    frame[0..6].copy_from_slice(destination);
+    frame[6..12].copy_from_slice(source);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14..14 + text.len()].copy_from_slice(text);
+    if !nic.send(&frame[..14 + text.len()]) {
+        println!("(message not sent: card reported an error, or timed out)");
+    }
+}
+
+/// Prints one received frame if it is a `chat` line meant for us: the right
+/// ethertype, and -- when in a unicast conversation (`peer` is `Some`) --
+/// from that exact peer (broadcast-mode `chat` shows lines from anyone).
+/// Trailing zero bytes are trimmed before decoding as text, since short
+/// lines are zero-padded up to Ethernet's 60-byte minimum frame length the
+/// same way `Rtl8139::send`/`tools/send_frame.py` both already do.
+fn print_chat_frame(frame: &[u8], peer: Option<&[u8; 6]>) {
+    if frame.len() < 14 || frame[12..14] != CHAT_ETHERTYPE {
+        return;
+    }
+    let source = &frame[6..12];
+    if let Some(peer) = peer {
+        if source != peer {
+            return;
+        }
+    }
+    let payload = &frame[14..];
+    let text_end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
+    let text = core::str::from_utf8(&payload[..text_end]).unwrap_or("<non-UTF-8 chat data>");
+    println!(
+        "\n{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}: {text}",
+        source[0], source[1], source[2], source[3], source[4], source[5]
+    );
+}
+
+/// Parses `aa:bb:cc:dd:ee:ff`-style text into a MAC address, mirroring
+/// `tools/send_frame.py`'s `parse_mac` for consistency across the
+/// host/kernel halves of the chat/sniff tooling.
+fn parse_mac(text: &[u8]) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut fields = text.split(|&byte| byte == b':');
+    for slot in mac.iter_mut() {
+        let field = fields.next()?;
+        if field.len() != 2 {
+            return None;
+        }
+        *slot = u8::from_str_radix(core::str::from_utf8(field).ok()?, 16).ok()?;
+    }
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(mac)
 }
 
 

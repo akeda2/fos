@@ -180,8 +180,9 @@ of scope; see "Deliberately deferred work" below.
 
 Ethernet commands: `nic` (status; probes and initializes the RTL8139 driver
 on first use), `nic send` (one raw broadcast test frame), `nic recv`
-(polls briefly for one incoming frame and hex-dumps it), and `nic sniff`
-(promiscuous-mode capture of every frame seen, until F12 stops it).
+(polls briefly for one incoming frame and hex-dumps it), `nic sniff`
+(promiscuous-mode capture of every frame seen, until F12 stops it), and
+`chat [PEER_MAC]` (line-based broadcast or unicast text chat; see below).
 
 `nic` is backed by `kernel/src/rtl8139.rs`, a polling-mode driver for the
 Realtek RTL8139 -- chosen as the one supported NIC because it is
@@ -225,6 +226,26 @@ hand) rather than a required argument. Keep this script dependency-free
 (standard library only, matching the other `tools/` scripts) and keep its
 default ethertype in sync with `shell.rs`'s `TEST_ETHERTYPE` if that ever
 changes.
+
+`chat` (`shell.rs`) is built from the same two pieces `nic sniff` and
+`term` already demonstrate separately, merged into one full-duplex loop: a
+receive-and-print loop (`Rtl8139::receive` + `CHAT_ETHERTYPE` filtering, in
+`print_chat_frame`) and a line-input-and-echo loop (`keyboard::poll_term_event`
+for local keys, `console::read_serial_byte` as an equally valid input
+source so `/quit` also works over a serial-only session -- unlike `term`,
+`chat` never repurposes the serial console, so there is no reason to
+restrict it to the keyboard). `CHAT_ETHERTYPE` (`0x88b6`) is deliberately
+distinct from `TEST_ETHERTYPE` (`0x88b5`, `nic send`'s), even though IEEE
+reserves both together for exactly this kind of local experiment, so a
+`nic sniff`/`nic recv` capture can't confuse a chat line for test traffic.
+`chat AA:BB:CC:DD:EE:FF` (parsed by the local `parse_mac`, which mirrors
+`tools/send_frame.py`'s Python function of the same name) targets one peer
+directly instead of broadcasting; unicast needed no driver changes at all,
+since `Rtl8139::send`/`receive` already handle any destination address --
+only the shell layer's addressing and inbound source-MAC filtering needed
+to be added. Received payloads are trimmed of trailing zero padding (the
+same padding `Rtl8139::send` and `tools/send_frame.py` both add to reach
+Ethernet's 60-byte minimum frame length) before being decoded as UTF-8.
 
 
 
