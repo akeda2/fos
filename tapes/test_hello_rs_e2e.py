@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-off end-to-end test: send tools/tapes/hello-rs's built tape to a
+"""One-off end-to-end test: send tapes/hello-rs's built tape to a
 running fos QEMU instance over a real (emulated) Ethernet link, run it,
 and check that its printed summary matches the known-correct answer (168
 primes <= 1,000, largest one 997) -- the same idea as
@@ -35,13 +35,13 @@ import time
 import os
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import send_tape  # noqa: E402
 
 MCAST_GROUP = "230.42.42.49"
 MCAST_PORT = 4249
-IMAGE = Path(__file__).resolve().parent.parent.parent / "build" / "fos.img"
-TAPE = Path(__file__).resolve().parent.parent.parent / "build" / "tapes" / "hello-rs.bin"
+IMAGE = Path(__file__).resolve().parent.parent / "build" / "fos.img"
+TAPE = Path(__file__).resolve().parent.parent / "build" / "tapes" / "hello-rs.bin"
 TERM_CLIENT_MAC = bytes.fromhex("02deadbeef09")
 TAPE_SENDER_MAC = bytes.fromhex("02deadbeef0a")
 CHAT_ETHERTYPE = (0x88, 0xB6)

@@ -396,9 +396,9 @@ but is never recoverable -- there is no way back into a hung or corrupted
 kernel except a reset. Because every tape always loads at that same fixed
 address, its own compiled code can use ordinary absolute addressing --
 position-independent code is no longer required (though still harmless,
-as `tools/tapes/primes.S` shows), which is what makes writing a tape in a
+as `tapes/primes.S` shows), which is what makes writing a tape in a
 compiled language like Rust or C practical -- see "Test tape:
-`tools/tapes/hello-rs/`" below.
+`tapes/hello-rs/`" below.
 
 A tape can be loaded two ways. `tape load disk NAME` reads a FOSFS file
 straight into the fixed tape buffer -- bounded, for now, by FOSFS's
@@ -432,7 +432,7 @@ than one, pass `--mac` with either a full MAC address or a peer number
 from `tools/peers.py` (see "A numbered peer address book for the Python
 tools too" below) instead of typing one out.
 
-#### Test tape: `tools/tapes/primes.S`
+#### Test tape: `tapes/primes.S`
 
 A worked example of everything above: a hand-written, genuinely
 position-independent 32-bit assembly program that computes every prime up
@@ -457,7 +457,7 @@ entirely separate from `make image`/`run`/`test`, though included in
 `tools/send_tape.py build/tapes/primes.bin` and run `tape run` there
 once `tape load net` confirms it arrived.
 
-#### Test tape: `tools/tapes/hello-rs/`
+#### Test tape: `tapes/hello-rs/`
 
 A small Rust reference tape, proving a compiled language (not just
 hand-written PIC assembly like `primes.S`) works here now that every
@@ -470,11 +470,11 @@ fixes the kernel's own. It prints a greeting, sieves primes up to 1,000
 through the same one callback (`console::print_byte`) `primes.S` uses,
 and returns -- ordinary absolute addressing, no PIC trick needed. Build
 it with `make tape-hello-rs` (producing `build/tapes/hello-rs.bin`) and
-verify it with `tools/tapes/test_hello_rs_e2e.py`. Want to write your own
+verify it with `tapes/test_hello_rs_e2e.py`. Want to write your own
 Rust tape? See `docs/rust-tapes-for-dummies.md` for a from-scratch,
 beginner-friendly walkthrough.
 
-#### Test tape: `tools/tapes/vga-colors/`
+#### Test tape: `tapes/vga-colors/`
 
 A second Rust reference tape, this one looping instead of running once.
 It writes several rows of text straight to VGA text memory (physical
@@ -494,7 +494,7 @@ at the very start and one at the very end print through `putc`; the
 animation itself never touches serial or a `term net` relay at all,
 since it writes VGA memory directly -- the whole point of the example.
 Stopping the tape this way, local or remote, never disconnects a `term
-net` session driving it (see `tools/tapes/test_vga_colors_e2e.py` for a
+net` session driving it (see `tapes/test_vga_colors_e2e.py` for a
 test that actually exercises both ways, not just documents them). Build
 it with `make tape-vga-colors` (producing `build/tapes/vga-colors.bin`).
 
@@ -593,7 +593,7 @@ type `tape run`. Two things are worth knowing before relying on this:
   since there is nothing in that tape's own code to notice a stop
   request in the first place. A tape that instead declares the newer
   two-callback ABI and checks `should_abort` in its own loop (like
-  `tools/tapes/vga-colors/`, see "Test tape: `tools/tapes/vga-colors/`"
+  `tapes/vga-colors/`, see "Test tape: `tapes/vga-colors/`"
   above) *is* interruptible remotely, even though `term_net`'s own outer
   loop is paused the whole time: `shell::poll_remote_tape_abort` polls
   the network card directly, on that paused loop's behalf, recognizing
@@ -607,7 +607,7 @@ type `tape run`. Two things are worth knowing before relying on this:
 - Only the kernel's own printed messages around a tape -- "Tape loaded",
   "Running N-byte tape...", "Tape returned; back at the fos shell.", and
   so on -- plus the tape's own printed output (like the primes tape's
-  summary; see `tools/tapes/primes.S`) are ever relayed, all as one burst
+  summary; see `tapes/primes.S`) are ever relayed, all as one burst
   once the command returns (since nothing drains the relay queue while
   paused inside it). A tape prints by calling back into the kernel's own
   `console::print_byte` (passed to it as `tape_run`'s first argument)

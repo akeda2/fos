@@ -3,7 +3,7 @@
 //! to make an ordinary, non-position-independent compiled language work
 //! here, the same way it lets the kernel itself use plain addressing. See
 //! AGENTS.md's "Rust tapes" section for the full story and
-//! `tools/tapes/primes.S`'s header comment for how a hand-written
+//! `tapes/primes.S`'s header comment for how a hand-written
 //! position-independent assembly tape had to work before this.
 //!
 //! Deliberately much simpler than `primes.S`: it prints a greeting, then

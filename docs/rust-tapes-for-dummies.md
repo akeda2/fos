@@ -47,13 +47,13 @@ probably describing a kernel feature, not a tape.
 
 ## 2. Anatomy of a Rust tape directory
 
-Every existing Rust tape (`tools/tapes/hello-rs/`, `tools/tapes/vga-colors/`)
+Every existing Rust tape (`tapes/hello-rs/`, `tapes/vga-colors/`)
 follows the same five-file layout. Copy whichever one is closer to what
 you want to build and start editing -- `hello-rs` for a one-shot tape,
 `vga-colors` for a looping one.
 
 ```
-tools/tapes/your-tape/
+tapes/your-tape/
 ├── Cargo.toml           # crate metadata + release profile (panic = "abort", etc.)
 ├── .cargo/config.toml   # points cargo at the kernel's own i686-fos target
 ├── linker.ld            # fixes the load address at 0x100000
@@ -97,7 +97,7 @@ the linker script to `linker.ld` in the same directory.
 Also copy verbatim. It fixes the entry point's load address at
 `0x100000` (`pmem::TAPE_BASE`) -- the one fact that lets ordinary,
 non-position-independent Rust work here at all, instead of needing the
-hand-written relocation tricks `tools/tapes/primes.S` (the assembly
+hand-written relocation tricks `tapes/primes.S` (the assembly
 reference tape) has to use.
 
 ### `src/entry.S`
@@ -162,7 +162,7 @@ Rules to keep in mind while writing the body:
   runs on the kernel's own stack with no guard page, so keep stack usage
   modest -- see `hello-rs`'s sieve array for the pattern).
 - **No `core::fmt`/`println!`.** Printing numbers means writing your own
-  decimal-digit loop (see `print_u32` in `tools/tapes/hello-rs/src/main.rs`)
+  decimal-digit loop (see `print_u32` in `tapes/hello-rs/src/main.rs`)
   -- `core::fmt` pulls in more machinery than is worth it for a teaching
   example, and there's no `Display` target to write to anyway besides
   `putc`.
@@ -184,7 +184,7 @@ Rules to keep in mind while writing the body:
 
 If your tape needs to redraw the screen every frame, don't do it through
 `putc` -- write straight to the VGA text-mode framebuffer at physical
-`0xb8000` instead, the same way `tools/tapes/vga-colors/src/main.rs` does:
+`0xb8000` instead, the same way `tapes/vga-colors/src/main.rs` does:
 
 ```rust
 const VGA_BUFFER: *mut u16 = 0xb8000 as *mut u16;
@@ -213,11 +213,11 @@ Add a target to the `Makefile`, modeled on the existing `tape-hello-rs`/
 
 ```make
 tape-your-tape:
-	cd tools/tapes/your-tape && cargo +nightly-2026-09-13 build --release \
+	cd tapes/your-tape && cargo +nightly-2026-09-13 build --release \
 		-Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem \
 		-Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tools/tapes/your-tape/target/i686-fos/release/your-tape-bin-name \
+	objcopy -O binary tapes/your-tape/target/i686-fos/release/your-tape-bin-name \
 		$(BUILD)/tapes/your-tape.bin
 ```
 
@@ -264,12 +264,12 @@ request -- either way, control returns to the shell without ending the
 
 ## 6. Where to look next
 
-- `tools/tapes/hello-rs/src/main.rs` -- the simplest complete one-shot
+- `tapes/hello-rs/src/main.rs` -- the simplest complete one-shot
   Rust tape (a sieve of Eratosthenes over a small range).
-- `tools/tapes/vga-colors/src/main.rs` -- the simplest complete looping
+- `tapes/vga-colors/src/main.rs` -- the simplest complete looping
   Rust tape (a colored-text VGA animation, abortable both locally and
   remotely).
-- `tools/tapes/primes.S` -- the original hand-written, position-
+- `tapes/primes.S` -- the original hand-written, position-
   independent assembly tape, useful for understanding what Rust's fixed
   load address saves you from having to do by hand.
 - AGENTS.md's "Tape print callback ABI", "Tapes: fixed load address, and

@@ -88,27 +88,27 @@ tapes: tape-primes tape-hello-rs tape-vga-colors
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
 # to a running fos instance with tools/send_tape.py and executed with
-# `tape load net` / `tape run`. See tools/tapes/primes.S's header comment
+# `tape load net` / `tape run`. See tapes/primes.S's header comment
 # and README.md's "Tape" section for details. Entirely additive -- untouched
 # by plain `make`/`image`/`run`/`test`; built as part of `make all`/`make
 # tapes`.
 tape-primes:
 	mkdir -p $(BUILD)/tapes
-	as --32 -o $(BUILD)/tapes/primes.o tools/tapes/primes.S
+	as --32 -o $(BUILD)/tapes/primes.o tapes/primes.S
 	objcopy -O binary $(BUILD)/tapes/primes.o $(TAPE_PRIMES_BIN)
 
 # Builds the "hello-rs" test tape: the same idea as tape-primes above, but
 # written in ordinary (non-position-independent) Rust instead of hand-
 # written PIC assembly -- possible only because every tape now always
-# loads at the same fixed physical address (tools/tapes/hello-rs/linker.ld,
+# loads at the same fixed physical address (tapes/hello-rs/linker.ld,
 # see kernel/src/pmem.rs's TAPE_BASE/TAPE_LEN doc comment). See
-# tools/tapes/hello-rs/src/main.rs and README.md's "Tape" section for
+# tapes/hello-rs/src/main.rs and README.md's "Tape" section for
 # details. Entirely additive -- untouched by plain `make`/`image`/`run`/
 # `test`; built as part of `make all`/`make tapes`.
 tape-hello-rs:
-	cd tools/tapes/hello-rs && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	cd tapes/hello-rs && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tools/tapes/hello-rs/target/i686-fos/release/hello-tape $(TAPE_HELLO_RS_BIN)
+	objcopy -O binary tapes/hello-rs/target/i686-fos/release/hello-tape $(TAPE_HELLO_RS_BIN)
 
 # Builds the "vga-colors" test tape: same fixed-address Rust setup as
 # tape-hello-rs above, but demonstrating the tape ABI's second callback
@@ -116,14 +116,14 @@ tape-hello-rs:
 # `shell::tape_run`'s doc comment) -- it loops, drawing cycling colored
 # text directly to VGA memory (bypassing console::print_byte/serial/
 # term net relay entirely for that animation), until a local operator
-# presses one of the "give up" keys. See tools/tapes/vga-colors/src/
+# presses one of the "give up" keys. See tapes/vga-colors/src/
 # main.rs and AGENTS.md's "vga-colors tape" section for details.
 # Entirely additive -- untouched by plain `make`/`image`/`run`/`test`;
 # built as part of `make all`/`make tapes`.
 tape-vga-colors:
-	cd tools/tapes/vga-colors && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	cd tapes/vga-colors && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tools/tapes/vga-colors/target/i686-fos/release/vga-colors-tape $(TAPE_VGA_COLORS_BIN)
+	objcopy -O binary tapes/vga-colors/target/i686-fos/release/vga-colors-tape $(TAPE_VGA_COLORS_BIN)
 
 clean:
-	rm -rf $(BUILD) kernel/target tools/tapes/hello-rs/target tools/tapes/vga-colors/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target

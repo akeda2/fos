@@ -8,7 +8,7 @@ remote terminal.
 This exercises (and documents, by asserting on it) the exact behavior
 `term net`'s own doc comment predicts for a nested blocking command,
 combined with the tape print-callback ABI added in
-`tools/tapes/primes.S`/`kernel/src/console.rs::print_byte`:
+`tapes/primes.S`/`kernel/src/console.rs::print_byte`:
 
 - `tape load net`/`tape run` work completely normally while driven
   remotely -- the shell dispatches them exactly the same way a locally
@@ -32,7 +32,7 @@ combined with the tape print-callback ABI added in
   streaming mid-tape), but present, unlike before this callback existed.
 
 Not part of `make test` -- manual verification script, in the same spirit
-as test_term_net_e2e.py and tools/tapes/test_primes_e2e.py, both of which
+as test_term_net_e2e.py and tapes/test_primes_e2e.py, both of which
 this borrows its structure from.
 """
 
@@ -63,7 +63,7 @@ TERM_TAG_BYE = 0x22
 
 
 class McastSocket:
-    """Same wrapper as tools/tapes/test_primes_e2e.py's, reused here so
+    """Same wrapper as tapes/test_primes_e2e.py's, reused here so
     send_tape.send_tape can drive it directly for the independent
     "third-party sender" role."""
 

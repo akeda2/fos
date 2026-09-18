@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-off end-to-end test: send tools/tapes/vga-colors's built tape to a
+"""One-off end-to-end test: send tapes/vga-colors's built tape to a
 running fos QEMU instance, run it, and check two things a purely serial-
 stream test (like test_primes_e2e.py/test_hello_rs_e2e.py) cannot: that
 its colored text actually lands in VGA text memory (physical 0xb8000,
@@ -51,14 +51,14 @@ import time
 import os
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import send_tape  # noqa: E402
 from test_primes_e2e import McastSocket  # noqa: E402
 
 MCAST_GROUP = "230.42.42.51"
 MCAST_PORT = 4251
-IMAGE = Path(__file__).resolve().parent.parent.parent / "build" / "fos.img"
-TAPE = Path(__file__).resolve().parent.parent.parent / "build" / "tapes" / "vga-colors.bin"
+IMAGE = Path(__file__).resolve().parent.parent / "build" / "fos.img"
+TAPE = Path(__file__).resolve().parent.parent / "build" / "tapes" / "vga-colors.bin"
 TERM_CLIENT_MAC = bytes.fromhex("02deadbeef0e")
 TAPE_SENDER_MAC = bytes.fromhex("02deadbeef0f")
 MONITOR_SOCK = Path("/tmp/fos-test-vga-colors-monitor.sock")

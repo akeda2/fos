@@ -30,7 +30,7 @@ const RESERVED_BELOW: u32 = 0x40000;
 /// instead of needing to be position-independent and locate its own
 /// runtime base first, the same way the kernel itself gets away with plain
 /// addressing by always loading at the fixed `0x10000` `linker.ld` picks.
-/// 4 MiB is comfortably above `tools/tapes/primes.S`'s ~1 MiB binary (most
+/// 4 MiB is comfortably above `tapes/primes.S`'s ~1 MiB binary (most
 /// of which is its embedded sieve array) with headroom for future tapes.
 pub const TAPE_BASE: u32 = 0x100000;
 pub const TAPE_LEN: u32 = 4 * 1024 * 1024;

@@ -370,7 +370,7 @@ growing this region is safe (nothing else lives between `0x20000` and the
 real-mode stack pointer's `0x9f000`).
 
 Because a tape can write VGA memory and move the hardware cursor directly
-(see `tools/tapes/primes.S` below) with no way to tell `console.rs` it did
+(see `tapes/primes.S` below) with no way to tell `console.rs` it did
 so, `tape_run` originally called a `console::resync_cursor()` immediately
 after the tape returned -- it just re-read the CRTC cursor position the
 same way `console::initialize()` already does once at boot, so the
@@ -383,7 +383,7 @@ is the current design; the paragraphs immediately following this one
 describe the tape as it worked *before* that change, for historical
 context on the bugs that shaped `primes.S`'s scroll/cursor handling.
 
-`tools/tapes/primes.S` is a worked, non-trivial test tape: a
+`tapes/primes.S` is a worked, non-trivial test tape: a
 Sieve-of-Eratosthenes prime counter up to 1,000,000, assembled the same
 way as `boot/stage1.S`/`boot/stage2.S` (`as --32` then `objcopy -O
 binary`, via the new `make tape-primes` target -- entirely separate from
@@ -410,7 +410,7 @@ reimplements VGA text output and CRTC cursor handling by hand, matching
 `console.rs`'s own conventions byte-for-byte, plus mirrors every printed
 character to COM1 (matching `console.rs`'s own dual VGA+serial habit) --
 which is what let this be checked end-to-end by a disposable
-serial-driven test harness (`tools/tapes/test_primes_e2e.py`, a QEMU
+serial-driven test harness (`tapes/test_primes_e2e.py`, a QEMU
 multicast-netdev-based script in the same spirit as the one used to
 validate `tape` itself) instead of needing a screen-capture/OCR pipeline
 just for this one tape. It also saves and restores `%ebx`/`%esi`/`%edi`/
@@ -451,14 +451,14 @@ each digit was always correct regardless; only the on-screen VGA
 placement broke, landing wherever `cursor_pos - get_base + <bogus small
 counter value>` happened to point instead of the real cursor. This is
 exactly why a serial-only test could never have caught either bug:
-`tools/tapes/test_primes_e2e.py` only reads QEMU's `-serial stdio`
+`tapes/test_primes_e2e.py` only reads QEMU's `-serial stdio`
 stream, which both bugs left completely untouched. The fix was simply to
 have `print_decimal` use `%edi` (free at every call site, and already
 proven safe to hold across `print_char` -- `print_char_scroll` itself
 saves/restores it) as its digit counter instead of `%ebx`.
 
 Because both of these were VGA-only bugs invisible to the existing
-serial-based test, `tools/tapes/test_primes_vga_e2e.py` was added
+serial-based test, `tapes/test_primes_vga_e2e.py` was added
 alongside it: it runs the same tape-send/tape-run sequence but reads the
 tape's actual summary back out of the live VGA text framebuffer
 (physical `0xb8000`) via the QEMU monitor's `pmemsave`, exposed over a
@@ -496,7 +496,7 @@ full zero-extended 32-bit stack slot), rather than depending on how a
 particular Rust/LLVM version happens to pass a sub-word argument under
 cdecl.
 
-`tools/tapes/primes.S` was rewritten around this: its `_start` prologue
+`tapes/primes.S` was rewritten around this: its `_start` prologue
 now captures the callback pointer from `4(%esp)` (the tape's one cdecl
 argument) into a `putc_fn` data slot (replacing the old `cursor_pos`
 slot) right after computing its own PIC base, `print_char` now just
@@ -538,7 +538,7 @@ Before this, `allocate_tape_buffer` (`kernel/src/shell.rs`) called
 `pmem::allocate_contiguous`, the same general-purpose frame allocator
 everything else uses -- so a tape's load address varied depending on
 whatever contiguous run of free frames happened to be available that run.
-That's exactly why `tools/tapes/primes.S` had to be genuinely
+That's exactly why `tapes/primes.S` had to be genuinely
 position-independent: its `_start` prologue captures its own runtime base
 with the classic `call get_base` / `pop %ebx` idiom, and every label is
 addressed as an offset from that base, because the assembler/linker have
@@ -572,12 +572,12 @@ fixed region in place. `tape_take` (which existed solely to clear `TAPE`
 before freeing the old frames) became dead code and was removed along
 with it.
 
-This also means `tools/tapes/primes.S` no longer *needs* to be
+This also means `tapes/primes.S` no longer *needs* to be
 position-independent -- but it still works unchanged (a fixed address is
 still a valid address for PIC code, it's just no longer required), so it
 was left as-is, as the assembly reference example.
 
-`tools/tapes/hello-rs/` is the new Rust reference example, proving the
+`tapes/hello-rs/` is the new Rust reference example, proving the
 concept: a small `no_std`/`no_main` binary crate that reuses the kernel's
 own custom target spec (`targets/i686-fos.json`) and `-Z build-std`
 invocation verbatim (see its `.cargo/config.toml`), but with its own
@@ -593,7 +593,7 @@ the kernel's own boot path:
   `kernel/src/entry.S` provides for `kmain` -- an ordinary
   `extern "C" fn(putc: extern "C" fn(u32))` already matches `tape_run`'s
   call site exactly.
-- `tools/tapes/hello-rs/src/entry.S` is consequently tiny: it exists
+- `tapes/hello-rs/src/entry.S` is consequently tiny: it exists
   solely to zero `.bss` (the same reason `kernel/src/entry.S` does it --
   a flat binary's `.bss` bytes are only implicitly zero-filled by
   `objcopy -O binary`'s padding, never explicitly, so Rust statics can't
@@ -610,7 +610,7 @@ isn't worth the risk), and returns -- proving real, non-trivial compiled
 Rust code runs correctly at the fixed tape address, not just a string
 literal. It's built with `make tape-hello-rs` (producing
 `build/tapes/hello-rs.bin`) and verified end to end over the network with
-`tools/tapes/test_hello_rs_e2e.py`, mirroring `test_primes_e2e.py`.
+`tapes/test_hello_rs_e2e.py`, mirroring `test_primes_e2e.py`.
 
 The same fixed-address convention would work identically for a C tape
 (`gcc -m32 -ffreestanding -fno-pic` with a matching linker script) --
@@ -648,7 +648,7 @@ cdecl, the caller (`tape_run`) both pushes arguments onto the stack and
 cleans them up afterward, regardless of how many the callee actually
 reads. `primes.S`/`hello-rs` still declare (and use) only the first
 parameter, and neither needed a single line changed -- confirmed by
-rerunning `tools/tapes/test_primes_e2e.py`/`test_hello_rs_e2e.py`
+rerunning `tapes/test_primes_e2e.py`/`test_hello_rs_e2e.py`
 unmodified against the rebuilt kernel before writing anything new.
 
 The specific worry this raised -- "if a tape's own loop consumes a local
@@ -666,7 +666,7 @@ key's paired *release* scancode left in the queue after the tape stops
 polling, is harmless for the same reason `poll_term_event` already
 documents elsewhere: release events decode to `None`, never `Escape`.
 
-`tools/tapes/vga-colors/` is the reference tape exercising this: same
+`tapes/vga-colors/` is the reference tape exercising this: same
 Rust/`no_std`/fixed-address setup as `hello-rs`, but its main loop writes
 several rows of text straight to VGA text memory (physical `0xb8000`,
 the exact address `console.rs`'s own `VGA_BUFFER` uses) instead of
@@ -684,7 +684,7 @@ once the tape returns -- the colored rows simply stay on screen
 underneath whatever the shell prints next.
 
 Built with `make tape-vga-colors` (producing `build/tapes/vga-colors.bin`)
-and verified with `tools/tapes/test_vga_colors_e2e.py`, which goes beyond
+and verified with `tapes/test_vga_colors_e2e.py`, which goes beyond
 the usual serial-stream check (there is deliberately very little to see
 there): it reads the real VGA text framebuffer via the QEMU monitor's
 `pmemsave` (the same technique `test_primes_vga_e2e.py` uses) to confirm
@@ -747,7 +747,7 @@ raw mode) was chosen specifically because it leaves signal-generating
 characters alone, so Ctrl-C still ends the client program the same way
 it always did.
 
-`tools/tapes/test_vga_colors_e2e.py` was extended to prove this actually
+`tapes/test_vga_colors_e2e.py` was extended to prove this actually
 works, not just compiles: after the existing local-`sendkey f12` half of
 the test, it starts the tape a second time and sends a raw `0x1b` byte
 inside an ordinary `TERM_TAG_DATA` frame over the same session (standing
@@ -838,7 +838,7 @@ own stdin/stdout with no local echo, since the remote shell echoes
 keystrokes itself) for a human operator's own manual use.
 
 Verified end-to-end against a live QEMU multicast netdev (mirroring
-`tools/tapes/test_primes_e2e.py`'s approach; see
+`tapes/test_primes_e2e.py`'s approach; see
 `tools/test_term_net_e2e.py`): `term net` accepted a `TERM_TAG_HELLO`,
 relayed a couple of ordinary commands' full output (including their
 prompts) back over the wire, and cleanly disconnected on `TERM_TAG_BYE`.
@@ -915,8 +915,8 @@ prompt -- no longer works, since that disconnect now just re-arms the
 wait instead. A serial-only machine's only ways back to a local prompt
 are now driving it entirely over `term net` itself, or briefly attaching
 a local keyboard to press one of the "give up" keys once. The affected
-test scripts (`tools/tapes/test_primes_e2e.py`,
-`tools/tapes/test_hello_rs_e2e.py`, `tools/tapes/test_primes_vga_e2e.py`,
+test scripts (`tapes/test_primes_e2e.py`,
+`tapes/test_hello_rs_e2e.py`, `tapes/test_primes_vga_e2e.py`,
 `tools/test_term_net_tape_e2e.py`) were all updated to drive their
 commands over one continuous `term net` session (via `TERM_TAG_DATA`
 frames) instead of relying on that trick -- console output always mirrors
@@ -948,8 +948,8 @@ character of whatever a serial operator was about to type. A serial-only
 operator can no longer fall back on "have any peer connect and then
 disconnect" either, now that `term_net` re-arms itself instead of
 returning on a remote disconnect -- see the note above about this
-project's own e2e tests (`tools/tapes/test_primes_e2e.py`, `tools/
-tapes/test_primes_vga_e2e.py`, `tools/tapes/test_hello_rs_e2e.py`, and
+project's own e2e tests (`tapes/test_primes_e2e.py`, `tools/
+tapes/test_primes_vga_e2e.py`, `tapes/test_hello_rs_e2e.py`, and
 `tools/test_term_net_tape_e2e.py`) being updated to drive their commands
 over one continuous `term net` session instead of relying on that trick.
 
@@ -1129,13 +1129,13 @@ future contributor doesn't have to rediscover them from scratch:
   environment that turned out to share the same LAN (raw `AF_PACKET`
   sockets need `CAP_NET_RAW`; granted via `setcap` on a dedicated
   `python3` copy rather than system-wide, see `tools/send_tape.py`'s
-  usage). Sending `tools/tapes/primes.bin` (~1 MB, 978 chunks) with
+  usage). Sending `tapes/primes.bin` (~1 MB, 978 chunks) with
   `send_tape.py`'s default (no `--delay`) reliably reproduced the stall;
   the same tape with `--delay 0.003` (3 ms between chunks) reliably
   succeeded -- isolating the cause to the receive ring overflowing under
   an unpaced burst, something a real NIC sending at its own wire speed
   can do far more easily than QEMU's virtual NIC ever does (QEMU's own
-  end-to-end test for this same tape, `tools/tapes/test_primes_e2e.py`,
+  end-to-end test for this same tape, `tapes/test_primes_e2e.py`,
   needed the identical 3 ms pacing to avoid "Gap in tape data" failures
   even inside emulation). `Rtl8139::receive` never checked `ISR`'s
   `RXOVW`/`FOVW` bits at all, so once the ring overflowed, its read/write

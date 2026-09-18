@@ -398,7 +398,7 @@ pub fn write_bytes(bytes: &[u8]) {
 /// `extern "C" fn(u32)` callback a tape's entry point can call to print
 /// one byte through this exact combined VGA+serial(+relay-queue-if-active)
 /// path, instead of touching hardware directly (see
-/// `tools/tapes/primes.S`, whose header comment explains why this was
+/// `tapes/primes.S`, whose header comment explains why this was
 /// worth a narrow exception to "a tape cannot call back into the kernel").
 /// `shell::tape_run` passes this directly as the tape's one argument.
 /// Takes `u32`, not `u8`, so the calling convention at the assembly side

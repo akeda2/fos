@@ -3,7 +3,7 @@
  * loaded at -- the same convention kernel/linker.ld uses to fix the
  * kernel's own load address at 0x10000. Because this address never
  * changes from run to run, ordinary absolute addressing works and no
- * position-independent-code trick (like tools/tapes/primes.S's own
+ * position-independent-code trick (like tapes/primes.S's own
  * `call`/`pop` base capture) is needed.
  */
 ENTRY(_start)

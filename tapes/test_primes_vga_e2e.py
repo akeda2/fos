@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-off end-to-end test: send tools/tapes/primes.bin to a running fos
+"""One-off end-to-end test: send tapes/primes.bin to a running fos
 QEMU instance, run it, and check its summary by reading the *actual VGA
 text framebuffer* (physical 0xb8000) via the QEMU monitor's `pmemsave`,
 rather than QEMU's `-serial stdio` stream.
@@ -37,14 +37,14 @@ import time
 import os
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import send_tape  # noqa: E402
 from test_primes_e2e import McastSocket  # noqa: E402
 
 MCAST_GROUP = "230.42.42.46"
 MCAST_PORT = 4246
-IMAGE = Path(__file__).resolve().parent.parent.parent / "build" / "fos.img"
-TAPE = Path(__file__).resolve().parent.parent.parent / "build" / "tapes" / "primes.bin"
+IMAGE = Path(__file__).resolve().parent.parent / "build" / "fos.img"
+TAPE = Path(__file__).resolve().parent.parent / "build" / "tapes" / "primes.bin"
 TERM_CLIENT_MAC = bytes.fromhex("02deadbeef05")
 TAPE_SENDER_MAC = bytes.fromhex("02deadbeef0b")
 MONITOR_SOCK = Path("/tmp/fos-test-primes-vga-monitor.sock")
@@ -149,7 +149,7 @@ def main() -> None:
         # through to the local shell whenever a remote session ends, so
         # there is no "connect, then disconnect to reach the local
         # prompt" trick left to fall back on -- see
-        # tools/tapes/test_primes_e2e.py's own header comment for the
+        # tapes/test_primes_e2e.py's own header comment for the
         # full reasoning this borrows.
         read_until(b"Waiting for a remote terminal client to connect", 30)
         del output[:]

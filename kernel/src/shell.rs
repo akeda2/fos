@@ -1268,7 +1268,7 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// "C" fn() -> u32)` (cdecl, two arguments): `console::print_byte` is
 /// passed as the first, giving a tape a narrow, explicit way to call back
 /// into the kernel's own console code to print, instead of touching
-/// VGA/COM1 hardware directly (see `tools/tapes/primes.S`'s header
+/// VGA/COM1 hardware directly (see `tapes/primes.S`'s header
 /// comment for why this one callback was worth the exception). This is
 /// what makes a tape's own output show up over `term net` like any other
 /// command's, and is why `tape_run` no longer needs to re-sync the
@@ -1277,7 +1277,7 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// the kernel's own cached position is never stale to begin with.
 ///
 /// `combined_tape_should_abort` is passed as the second argument, giving
-/// a long-running or looping tape (like `tools/tapes/vga-colors`) a way
+/// a long-running or looping tape (like `tapes/vga-colors`) a way
 /// to notice a "give up" request without touching the keyboard
 /// controller or network card itself. It checks two independent sources,
 /// either one enough to stop the tape: a local "give up" keypress

@@ -60,7 +60,7 @@ const ROWS: [&[u8]; 15] = [
     b" VGA color demo -- row 11 -- see keyboard::tape_should_abort's own   ",
     b" VGA color demo -- row 12 -- doc comment for exactly why that holds  ",
     b" VGA color demo -- row 13 -- fos: a small educational 32-bit x86 OS  ",
-    b" VGA color demo -- row 14 -- tools/tapes/vga-colors/src/main.rs      ",
+    b" VGA color demo -- row 14 -- tapes/vga-colors/src/main.rs      ",
 ];
 
 fn print_bytes(putc: extern "C" fn(u32), bytes: &[u8]) {

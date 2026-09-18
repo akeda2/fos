@@ -7,7 +7,7 @@ every boot (see `shell::run`), this no longer needs to type `term net`
 itself -- it just waits for the "Waiting for a remote terminal client to
 connect" banner before sending its own `TERM_TAG_HELLO`.
 
-Not part of `make test` -- like `tools/tapes/test_primes_e2e.py`, this is a
+Not part of `make test` -- like `tapes/test_primes_e2e.py`, this is a
 manual verification script exercising a real Ethernet round-trip, kept
 outside the serial-only smoke harness. Requires no root: QEMU's
 `socket,mcast=` netdev is a plain UDP multicast socket carrying one raw

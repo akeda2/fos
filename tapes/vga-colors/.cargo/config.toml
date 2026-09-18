@@ -1,9 +1,9 @@
 [build]
 # Reuses the exact same custom target the kernel itself builds with (see
-# ../../../kernel/.cargo/config.toml) -- a tape and the kernel are both
+# ../../kernel/.cargo/config.toml) -- a tape and the kernel are both
 # freestanding, no_std, ring-0 flat binaries for the same 32-bit protected
 # mode, so there is no reason for a second target spec to exist.
-target = "../../../targets/i686-fos.json"
+target = "../../targets/i686-fos.json"
 
 [unstable]
 build-std = ["core", "compiler_builtins"]
