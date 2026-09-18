@@ -100,22 +100,36 @@ def run_noninteractive(raw: socket.socket, source: bytes, peer: bytes, commands:
     reacting to that command (true for every existing fos command, none
     of which streams output indefinitely without more input)."""
 
-    def drain_output(timeout_first: float) -> None:
+    def drain_output(timeout_first: float) -> bool:
+        """Returns whether any output was actually received."""
         timeout = timeout_first
+        received_any = False
         while True:
             payload = recv_data_frame(raw, source, peer, timeout)
             if payload is None:
-                return
+                return received_any
+            received_any = True
             sys.stdout.buffer.write(payload)
             sys.stdout.flush()
             timeout = settle
 
-    drain_output(initial_wait)
+    connected = drain_output(initial_wait)
     for command in commands:
         send_data(raw, peer, source, command.encode() + b"\n")
-        drain_output(settle)
+        if drain_output(settle):
+            connected = True
 
-    send_control(raw, peer, source, TERM_TAG_BYE)
+    # Only say goodbye to a session that was actually established: if
+    # nothing ever came back (no fos host was listening, or our own
+    # TERM_TAG_HELLO never reached one), sending TERM_TAG_BYE regardless
+    # would just leave a stray, unrelated control frame sitting unread in
+    # some other fos host's Rx ring until the next time it happens to
+    # poll for one -- exactly the kind of leftover frame that could
+    # confuse a *later*, unrelated `term net` session on that host.
+    if connected:
+        send_control(raw, peer, source, TERM_TAG_BYE)
+    else:
+        print("No response from the remote shell; not sending TERM_TAG_BYE (no session was established).", file=sys.stderr)
 
 
 def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait: float) -> None:
@@ -132,6 +146,7 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
     selector.register(raw, selectors.EVENT_READ)
 
     payload = recv_data_frame(raw, source, peer, initial_wait)
+    connected = payload is not None
     if payload is not None:
         sys.stdout.buffer.write(payload)
         sys.stdout.flush()
@@ -144,6 +159,7 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
                     if not chunk:
                         return
                     send_data(raw, peer, source, chunk)
+                    connected = True
                 else:
                     raw.settimeout(0)
                     try:
@@ -152,6 +168,7 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
                         continue
                     if len(packet) < 15 or packet[12:14] != CHAT_ETHERTYPE.to_bytes(2, "big") or packet[6:12] != peer:
                         continue
+                    connected = True
                     if packet[14] == TERM_TAG_BYE:
                         print("\nRemote fos shell closed the session.", file=sys.stderr)
                         return
@@ -165,7 +182,12 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
     except KeyboardInterrupt:
         pass
     finally:
-        send_control(raw, peer, source, TERM_TAG_BYE)
+        # See run_noninteractive's identical guard: only say goodbye to a
+        # session that was actually established, so a client that never
+        # got a response (nobody was listening) does not leave a stray
+        # TERM_TAG_BYE sitting unread in some host's Rx ring.
+        if connected:
+            send_control(raw, peer, source, TERM_TAG_BYE)
 
 
 def main() -> None:
