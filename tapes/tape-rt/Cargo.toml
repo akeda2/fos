@@ -1,0 +1,11 @@
+[package]
+name = "tape-rt"
+version = "0.1.0"
+edition = "2024"
+
+# No [profile.*] sections here on purpose -- this crate is only ever built
+# as a path dependency of a tape's own `bin` crate (see tapes/vga-colors/
+# Cargo.toml), never as a standalone top-level build, so it inherits
+# whichever profile (panic = "abort", opt-level, etc.) the dependent tape
+# already sets. See src/lib.rs's header comment for why this crate exists
+# and which tapes use it.

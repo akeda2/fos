@@ -16,3 +16,10 @@ codegen-units = 1
 lto = true
 opt-level = "z"
 strip = "symbols"
+
+# ../tape-rt provides the `_start` stub, panic handler, and `putc` print
+# helpers this tape would otherwise have to duplicate -- see
+# tape-rt/src/lib.rs's header comment for why this tape uses it and why
+# tapes/hello-rs / tapes/bigsieve deliberately still don't.
+[dependencies]
+tape-rt = { path = "../tape-rt" }

@@ -695,6 +695,48 @@ that the exact same `term_net` session driving it remotely is still
 alive afterward -- the concrete proof of the guarantee `tape_should_abort`
 documents, not just a read of its doc comment.
 
+#### `tapes/tape-rt/`: a shared runtime, so far only used by `vga-colors`
+
+`tapes/hello-rs`, `tapes/vga-colors`, and `tapes/bigsieve` each used to
+carry byte-identical copies of three things that have nothing to do with
+any one tape's own purpose: `src/entry.S` (the tiny `_start` stub that
+zeroes `.bss` and tail-calls into `tape_main`), a `#[panic_handler]` that
+just spins forever, and a `print_bytes` helper wrapping the `putc`
+callback (`hello-rs`/`bigsieve` also duplicated a `print_u32` decimal
+formatter). `tapes/vga-colors` now instead depends on `tapes/tape-rt/`, a
+small shared `no_std` library crate providing all of these once, added
+as an ordinary Cargo path dependency (`tape-rt = { path = "../tape-rt" }`
+in `vga-colors/Cargo.toml`) -- no new build-system machinery was needed:
+`cargo`, `-Z build-std`, and the existing `targets/i686-fos.json`/
+`linker.ld` setup all already handle a path dependency exactly like any
+other crate in the dependency graph.
+
+This mirrors, for ordinary 32-bit tapes, the exact same "shared plumbing
+in one reusable place, swappable per-tape logic supplied externally"
+split that `tapes/longmode64_shim.S` uses for 64-bit-excursion tapes (see
+"A tape that visits 64-bit long mode and comes back" above): there, the
+shim owns the CPU-mode-switch mechanics in assembly and calls out to an
+external `tape64_body`; here, `tape-rt` owns the startup/panic/print
+mechanics in Rust and a tape's own `src/main.rs` supplies `tape_main`.
+
+`hello-rs` and `bigsieve` were deliberately *not* migrated to depend on
+`tape-rt` too, even though both would benefit from the same deduplication
+`vga-colors` got. This project's Rust tapes exist first as a teaching
+ladder (see `docs/rust-tapes-for-dummies.md`), and a beginner working
+through it is meant to read `hello-rs/src/main.rs` -- the very first Rust
+tape -- top to bottom and see the *entire* thing that runs, with nothing
+imported from an unfamiliar sibling crate. Introducing a shared dependency
+into either of those two would trade that self-containedness for a small
+amount of saved duplication -- a bad trade for a from-scratch walkthrough's
+first two examples specifically. `vga-colors` was chosen instead to
+demonstrate the *other* valid pattern -- extracting shared plumbing into
+one place once duplicating it a third time starts to feel real -- so a
+reader curious about that tradeoff has a working example to study,
+without disturbing the two simpler ones. Any genuinely new future tape
+(not a teaching-ladder example) should prefer depending on `tape-rt` the
+way `vga-colors` does, rather than copying `entry.S`/the panic handler/
+the print helpers a fourth time.
+
 #### A local keypress isn't enough: remote abort via `poll_remote_tape_abort`
 
 The above covers *local* escape stopping a tape started remotely, but

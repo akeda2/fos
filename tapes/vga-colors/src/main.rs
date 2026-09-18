@@ -16,12 +16,20 @@
 //! `putc`, so a remote operator at least sees that the tape started and
 //! stopped, without every single frame of the animation flooding their
 //! session.
+//!
+//! Unlike `hello-rs`/`bigsieve`, this tape doesn't keep its own local
+//! `entry.S`/panic handler/`print_bytes` -- it depends on `../tape-rt`
+//! for all three instead. See `tape-rt/src/lib.rs`'s header comment for
+//! the full reasoning: this repository's Rust tapes exist mainly as a
+//! teaching ladder (`docs/rust-tapes-for-dummies.md`), and `hello-rs`/
+//! `bigsieve` deliberately stay fully self-contained for that reason --
+//! this tape was chosen instead to demonstrate the *other* valid pattern,
+//! extracting shared plumbing into one place once duplicating it a third
+//! time would otherwise start to feel real.
 #![no_std]
 #![no_main]
 
-core::arch::global_asm!(include_str!("entry.S"));
-
-use core::panic::PanicInfo;
+use tape_rt::print_bytes;
 
 /// Physical address of the standard 80x25 VGA text-mode framebuffer --
 /// the exact same address `kernel/src/console.rs`'s own `VGA_BUFFER`
@@ -62,12 +70,6 @@ const ROWS: [&[u8]; 15] = [
     b" VGA color demo -- row 13 -- fos: a small educational 32-bit x86 OS  ",
     b" VGA color demo -- row 14 -- tapes/vga-colors/src/main.rs      ",
 ];
-
-fn print_bytes(putc: extern "C" fn(u32), bytes: &[u8]) {
-    for &byte in bytes {
-        putc(u32::from(byte));
-    }
-}
 
 /// Writes one character cell directly to VGA text memory at (`row`,
 /// `col`), bypassing `console.rs` entirely -- no serial mirroring, no
@@ -136,14 +138,4 @@ watch the screen, not this terminal.\n",
     }
 
     print_bytes(putc, b"VGA color demo stopped.\n");
-}
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    // A tape has nowhere to unwind to and no OS underneath it -- see
-    // `panic = "abort"` in Cargo.toml -- so this can only spin forever,
-    // exactly like the kernel's own panic handler in kernel/src/main.rs
-    // (a tape faulting or hanging is documented as unrecoverable; see
-    // `tape_run`'s doc comment).
-    loop {}
 }

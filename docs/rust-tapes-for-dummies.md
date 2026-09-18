@@ -92,6 +92,23 @@ You will only ever need to edit `src/main.rs` and `Cargo.toml`'s crate
 identical) across every tape -- copy them from an existing tape rather
 than writing them from scratch.
 
+For this walkthrough, copy from `tapes/hello-rs/` specifically, not
+`tapes/vga-colors/`: `vga-colors` no longer keeps its own `src/entry.S`,
+panic handler, or `print_bytes` -- it depends on `tapes/tape-rt/`, a
+small shared crate providing all three, instead (see
+`tapes/tape-rt/src/lib.rs`'s header comment, and AGENTS.md's
+"`tapes/tape-rt/`: a shared runtime, so far only used by `vga-colors`"
+section, for the full story). `hello-rs` and `bigsieve` were left fully
+self-contained on purpose, specifically so a walkthrough like this one
+can show every line that actually runs, with nothing imported from an
+unfamiliar sibling crate -- so keep following that pattern for your own
+first tape too. Once you're comfortable with the whole layout, depending
+on `tape-rt` (`tape-rt = { path = "../tape-rt" }` in your `Cargo.toml`,
+then `use tape_rt::print_bytes;` instead of defining your own, and
+deleting your own `src/entry.S`/panic handler) is a perfectly good way to
+avoid a fourth copy of the same boilerplate -- see `vga-colors/Cargo.toml`
+and `vga-colors/src/main.rs` for exactly what changes.
+
 ### `Cargo.toml`
 
 ```toml
@@ -128,11 +145,13 @@ reference tape) has to use.
 
 ### `src/entry.S`
 
-Also copy verbatim. It's a fixed 10-line stub whose only job is to zero
-`.bss` (so Rust `static`/`static mut` variables actually start at zero --
-a flat binary's `.bss` is not automatically zeroed the way an ELF loader
-would do it) and then `jmp` into your Rust `tape_main`. You will not need
-to touch this file even for a fairly involved tape.
+Copy this one verbatim from `hello-rs` or `bigsieve` (not `vga-colors`,
+which gets it from `tape-rt` instead -- see above). It's a fixed 10-line
+stub whose only job is to zero `.bss` (so Rust `static`/`static mut`
+variables actually start at zero -- a flat binary's `.bss` is not
+automatically zeroed the way an ELF loader would do it) and then `jmp`
+into your Rust `tape_main`. You will not need to touch this file even for
+a fairly involved tape.
 
 ## 3. Writing `src/main.rs`
 

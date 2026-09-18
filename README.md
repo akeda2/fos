@@ -499,6 +499,16 @@ net` session driving it (see `tapes/test_vga_colors_e2e.py` for a
 test that actually exercises both ways, not just documents them). Build
 it with `make tape-vga-colors` (producing `build/tapes/vga-colors.bin`).
 
+Unlike `hello-rs`/`bigsieve`, this tape doesn't keep its own copy of
+`entry.S`, the panic handler, or `print_bytes` -- it depends on
+`tapes/tape-rt/`, a small shared crate providing all three, instead (see
+`tapes/tape-rt/src/lib.rs`'s header comment for why this crate exists,
+and why only this tape uses it -- `hello-rs`/`bigsieve` stay fully
+self-contained on purpose, as beginner-facing teaching examples). Any
+new future Rust tape (not a from-scratch teaching-ladder example) should
+generally depend on `tape-rt` too, rather than copying that boilerplate
+a fourth time.
+
 #### Test tape: `tapes/bigsieve/`
 
 A third Rust reference tape, proving a tape's working set isn't actually
