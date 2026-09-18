@@ -3,15 +3,17 @@
 A "tape" is the smallest possible fos program: a tiny freestanding binary
 that gets loaded into a fixed 4 MiB region of physical memory
 (`pmem::TAPE_BASE`, `0x100000`) and run with a single `call` from the
-shell's `tape run` command. No filesystem, no process table, no heap, no
-paging -- just your code, a stack it borrows from the kernel, and one or
-two function pointers the kernel hands you to talk to the outside world.
+shell's `tape run` command. No filesystem, no process table, no
+built-in heap, no paging -- just your code, a stack it borrows from the
+kernel, and a handful of function pointers the kernel hands you to talk
+to the outside world (including, if you need it, a way to borrow memory
+far bigger than that fixed 4 MiB region -- see section 7).
 
 This guide walks through writing, building, loading, and running a Rust
 tape from nothing, assuming no prior fos or embedded-Rust experience. For
 the deeper "why", see AGENTS.md's "Tapes: fixed load address, and writing
-one in Rust" and "Tape ABI grows a second callback" sections -- this
-document only covers the "how".
+one in Rust", "Tape ABI grows a second callback", and "Tape ABI grows
+alloc/free" sections -- this document only covers the "how".
 
 ## 1. What a tape actually is
 
@@ -22,7 +24,7 @@ That's why building one means compiling normally, then stripping away
 everything but the raw bytes with `objcopy -O binary`.
 
 Every tape must export exactly one C-callable entry point named
-`tape_main`, matching one of two signatures:
+`tape_main`, matching one of three signatures:
 
 ```rust
 // One-shot tapes: print something, maybe compute something, then return.
@@ -30,6 +32,14 @@ extern "C" fn tape_main(putc: extern "C" fn(u32));
 
 // Looping tapes: keep running until told to stop.
 extern "C" fn tape_main(putc: extern "C" fn(u32), should_abort: extern "C" fn() -> u32);
+
+// Tapes that need more than their own fixed 4 MiB region of memory.
+extern "C" fn tape_main(
+    putc: extern "C" fn(u32),
+    should_abort: extern "C" fn() -> u32,
+    alloc: extern "C" fn(u32) -> u32,
+    free: extern "C" fn(u32, u32),
+);
 ```
 
 - `putc(byte)` is the *only* way to print. It goes through the kernel's
@@ -40,17 +50,33 @@ extern "C" fn tape_main(putc: extern "C" fn(u32), should_abort: extern "C" fn() 
   has requested an abort. A one-shot tape doesn't get this callback at
   all -- it's expected to just finish. A looping tape must check it once
   per iteration and return when it's non-zero, or it can never be stopped.
+- `alloc(bytes)`/`free(address, bytes)` hand out and return memory from a
+  much larger pool than your own fixed 4 MiB region -- see section 7 if
+  your tape needs a buffer bigger than that.
 
-That's the entire ABI. No file I/O, no memory allocation calls, no
-threads, no interrupts of your own -- if you need something more, you're
-probably describing a kernel feature, not a tape.
+**Important:** these four parameters are always in this order, and a
+tape may only leave off a *trailing* run of them it doesn't use -- never
+one in the middle. Only wanting `alloc`/`free` but not `should_abort`?
+You must still declare `should_abort` in your signature (even if you
+never call it, e.g. name it `_should_abort`) so `alloc`/`free` land in
+the right stack positions. This works at all because of how `cdecl`
+(the calling convention every tape is called with) works: the caller
+always pushes every argument and always cleans them all up afterward, so
+a shorter signature just means your code never reads some of the bytes
+already sitting on the stack -- but it can only safely ignore them from
+the end, not skip over one in the middle.
+
+That's the entire ABI. No file I/O, no threads, no interrupts of your
+own -- if you need something more than these four callbacks provide,
+you're probably describing a kernel feature, not a tape.
 
 ## 2. Anatomy of a Rust tape directory
 
-Every existing Rust tape (`tapes/hello-rs/`, `tapes/vga-colors/`)
-follows the same five-file layout. Copy whichever one is closer to what
-you want to build and start editing -- `hello-rs` for a one-shot tape,
-`vga-colors` for a looping one.
+Every existing Rust tape (`tapes/hello-rs/`, `tapes/vga-colors/`,
+`tapes/bigsieve/`) follows the same five-file layout. Copy whichever one
+is closer to what you want to build and start editing -- `hello-rs` for
+a one-shot tape, `vga-colors` for a looping one, `bigsieve` for a
+one-shot tape that needs a buffer bigger than 4 MiB.
 
 ```
 tapes/your-tape/
@@ -262,19 +288,75 @@ is pressed locally, or the remote `term net` peer sends its own abort
 request -- either way, control returns to the shell without ending the
 `term net` session itself.
 
-## 6. Where to look next
+## 6. When 4 MiB isn't enough: `alloc`/`free`
+
+Every tape's own compiled code, `static` data, and stack live inside its
+fixed 4 MiB region (`pmem::TAPE_BASE`/`TAPE_LEN`) -- but that region isn't
+a hard ceiling on how much memory your *running* tape can use. Declare
+the four-parameter `tape_main` signature from section 1 and you get two
+more callbacks:
+
+```rust
+let bytes: u32 = 64 * 1024 * 1024; // 64 MiB
+let address = alloc(bytes);
+if address == 0 {
+    // Not enough contiguous memory was free -- always check this.
+} else {
+    let buffer: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(address as *mut u8, bytes as usize) };
+    // `alloc` does NOT zero the memory for you -- do it yourself if you
+    // need a clean buffer, the same way `bigsieve` does.
+    for byte in buffer.iter_mut() {
+        *byte = 0;
+    }
+    // ... use `buffer` ...
+    free(address, bytes); // give it back before returning
+}
+```
+
+A few things worth knowing before you reach for this:
+
+- **Always check for a zero return from `alloc`.** It means there wasn't
+  a big enough contiguous free block left -- this machine's RAM, the
+  amount already handed out to other tapes/`palloc` calls, and how
+  fragmented what's left is are all things a tape can't control.
+- **`alloc`/`free` round up to whole 1 MiB chunks** (`pmem::
+  BIG_CHUNK_SIZE`), a coarser granularity than the general kernel frame
+  pool's 4 KiB. Fine for the large, single buffers this is meant for;
+  wasteful if you call it many times for small allocations.
+- **There is no auto-free.** If your tape returns (or panics) without
+  calling `free`, that memory is gone for the rest of this boot -- the
+  same unforgiving, trust-the-caller contract the kernel shell's own
+  `palloc`/`pfree` commands already have.
+- **Memory above the 128 MiB mark only exists if the machine actually
+  has more than 128 MiB of RAM.** Under QEMU without an explicit `-m`
+  flag, that's often not true -- `tapes/test_bigsieve_e2e.py` passes
+  `-m 256` for exactly this reason. On real hardware with a gigabyte or
+  more, this is rarely a concern.
+
+See AGENTS.md's "Tape ABI grows alloc/free: using the rest of the
+machine's RAM" for the full story of why this callback pair exists (and
+the kernel-side memory pool it's backed by), and `tapes/bigsieve/src/
+main.rs` for a complete worked example: a 64 MiB dynamically-allocated
+sieve of Eratosthenes, including why its counting loop can't just reuse
+`hello-rs`'s algorithm unchanged at this larger scale (an integer
+overflow trap worth understanding even outside this project).
+
+## 7. Where to look next
 
 - `tapes/hello-rs/src/main.rs` -- the simplest complete one-shot
   Rust tape (a sieve of Eratosthenes over a small range).
 - `tapes/vga-colors/src/main.rs` -- the simplest complete looping
   Rust tape (a colored-text VGA animation, abortable both locally and
   remotely).
+- `tapes/bigsieve/src/main.rs` -- a one-shot tape using `alloc`/`free`
+  to work with a 64 MiB buffer far bigger than its own 4 MiB region.
 - `tapes/primes.S` -- the original hand-written, position-
   independent assembly tape, useful for understanding what Rust's fixed
   load address saves you from having to do by hand.
 - AGENTS.md's "Tape print callback ABI", "Tapes: fixed load address, and
-  writing one in Rust", and "Tape ABI grows a second callback" sections --
-  the full historical and technical reasoning behind every constraint
-  described above.
+  writing one in Rust", "Tape ABI grows a second callback", and "Tape
+  ABI grows alloc/free" sections -- the full historical and technical
+  reasoning behind every constraint described above.
 - `kernel/src/shell.rs`'s `tape_run` doc comment -- the authoritative,
-  in-code description of the ABI both callbacks must satisfy.
+  in-code description of the ABI all four callbacks must satisfy.

@@ -9,8 +9,9 @@ NETROM := $(BUILD)/netboot.rom
 TAPE_PRIMES_BIN := $(BUILD)/tapes/primes.bin
 TAPE_HELLO_RS_BIN := $(BUILD)/tapes/hello-rs.bin
 TAPE_VGA_COLORS_BIN := $(BUILD)/tapes/vga-colors.bin
+TAPE_BIGSIEVE_BIN := $(BUILD)/tapes/bigsieve.bin
 
-.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors clean
+.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -35,10 +36,11 @@ help:
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
 	@echo "  make test       - build the image, then run the serial-driven QEMU smoke test"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
+	@echo "  make tape-bigsieve   - build build/tapes/bigsieve.bin (Rust tape, uses alloc/free for a 64 MiB buffer)"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -83,7 +85,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -125,5 +127,21 @@ tape-vga-colors:
 	mkdir -p $(BUILD)/tapes
 	objcopy -O binary tapes/vga-colors/target/i686-fos/release/vga-colors-tape $(TAPE_VGA_COLORS_BIN)
 
+# Builds the "bigsieve" test tape: same fixed-address Rust setup as
+# tape-hello-rs above, but demonstrating the tape ABI's third and fourth
+# callbacks (`alloc`/`free`, see kernel/src/shell.rs's `tape_alloc`/
+# `tape_free` and `shell::tape_run`'s doc comment) -- it requests a fresh
+# 64 MiB buffer from the general frame pool at run time (far beyond its
+# own fixed 4 MiB tape region) to sieve primes up to a much larger bound
+# than tape-hello-rs can, then frees that buffer again before returning.
+# See tapes/bigsieve/src/main.rs and AGENTS.md's "Tape ABI grows
+# alloc/free" section for details. Entirely additive -- untouched by
+# plain `make`/`image`/`run`/`test`; built as part of `make all`/`make
+# tapes`.
+tape-bigsieve:
+	cd tapes/bigsieve && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tapes/bigsieve/target/i686-fos/release/bigsieve-tape $(TAPE_BIGSIEVE_BIN)
+
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target

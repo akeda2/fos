@@ -12,7 +12,18 @@ pub const FRAME_SIZE: u32 = 4096;
 
 /// Frames are tracked up to this physical address; anything beyond it is
 /// simply never marked free. 128 MiB is comfortably above what QEMU's
-/// default E820 map and this kernel's teaching scope need.
+/// default E820 map and this kernel's own small allocations (disk/NIC
+/// buffers, `palloc`/`pfree`) need at this fine 4 KiB granularity. Memory
+/// beyond this is still reachable -- see `BIG_POOL_BASE`/`allocate_big`
+/// below -- just not tracked bit-per-4-KiB-frame, since every byte of
+/// `BITMAP` below is baked directly into the shipped `kernel.bin` (a flat
+/// binary's `.bss` is zero-padded into the file by `objcopy -O binary`,
+/// not merely reserved at load time), and `boot/stage2.S` loads the whole
+/// kernel with a single INT13h extended read capped at 127 sectors /
+/// 65024 bytes (see `tools/write_layout.py`) to stay within one real-mode
+/// segment. A bitmap fine enough to track a full 1 GiB machine at this
+/// same 4 KiB granularity (32 KiB) would blow well past that ceiling by
+/// itself.
 const TRACKED_BYTES: u32 = 128 * 1024 * 1024;
 const MAX_FRAMES: usize = (TRACKED_BYTES / FRAME_SIZE) as usize;
 const BITMAP_BYTES: usize = MAX_FRAMES.div_ceil(8);
@@ -44,6 +55,54 @@ static mut TOTAL_FRAMES: usize = 0;
 static mut FREE_FRAMES: usize = 0;
 static mut NEXT_SEARCH: usize = 0;
 
+/// A second, much coarser pool, used only by a tape's `alloc`/`free`
+/// callbacks (`shell::tape_alloc`/`tape_free`) -- entirely separate from
+/// `BITMAP` above, which stays exactly the size the fine 4 KiB frame
+/// allocator has always needed (see `TRACKED_BYTES`'s doc comment for why
+/// that matters). A tape wanting far more than its own fixed 4 MiB
+/// region (a big sieve, a large buffer, ...) only ever wants one large
+/// contiguous block at a time, so tracking this pool in whole 1 MiB
+/// chunks instead of 4 KiB frames costs 256x less bitmap space for the
+/// same amount of RAM -- reaching a full 1 GiB machine costs a little
+/// over 100 bytes here, not the 32 KiB the fine bitmap would need, which
+/// would not fit in `boot/stage2.S`'s 127-sector kernel-load ceiling (see
+/// `TRACKED_BYTES`'s doc comment).
+pub const BIG_CHUNK_SIZE: u32 = 1024 * 1024;
+/// Starts exactly where the fine-grained pool's own tracked window ends,
+/// so the two pools can never both claim the same physical memory.
+pub const BIG_POOL_BASE: u32 = TRACKED_BYTES;
+/// Total physical address space this pool tracks, `BIG_POOL_BASE`
+/// through this address -- 1 GiB, matching the target physical machine
+/// this kernel is validated against (see AGENTS.md). A machine with less
+/// RAM than this simply never has the extra chunks marked free in the
+/// first place (see `initialize`); raising this constant costs only a
+/// little more bitmap space, never memory that has to actually exist.
+pub const BIG_POOL_END: u32 = 1024 * 1024 * 1024;
+const BIG_POOL_CHUNKS: usize = ((BIG_POOL_END - BIG_POOL_BASE) / BIG_CHUNK_SIZE) as usize;
+const BIG_BITMAP_BYTES: usize = BIG_POOL_CHUNKS.div_ceil(8);
+
+static mut BIG_BITMAP: [u8; BIG_BITMAP_BYTES] = [0xff; BIG_BITMAP_BYTES];
+static mut BIG_TOTAL_CHUNKS: usize = 0;
+static mut BIG_FREE_CHUNKS: usize = 0;
+
+fn big_chunk_index(address: u32) -> usize {
+    ((address - BIG_POOL_BASE) / BIG_CHUNK_SIZE) as usize
+}
+
+fn big_is_free(index: usize) -> bool {
+    unsafe { BIG_BITMAP[index / 8] & (1 << (index % 8)) == 0 }
+}
+
+fn big_set_free(index: usize, free: bool) {
+    unsafe {
+        if free {
+            BIG_BITMAP[index / 8] &= !(1 << (index % 8));
+        } else {
+            BIG_BITMAP[index / 8] |= 1 << (index % 8);
+        }
+    }
+}
+
 fn frame_index(address: u32) -> usize {
     (address / FRAME_SIZE) as usize
 }
@@ -71,7 +130,10 @@ pub fn initialize(info: &BootInfo) {
         if read_u32(core::ptr::addr_of!(region.kind)) != 1 {
             continue; // only "usable" (type 1) regions are ever free.
         }
-        mark_region_free(read_u64(core::ptr::addr_of!(region.base)), read_u64(core::ptr::addr_of!(region.length)));
+        let base = read_u64(core::ptr::addr_of!(region.base));
+        let length = read_u64(core::ptr::addr_of!(region.length));
+        mark_region_free(base, length);
+        mark_big_region_free(base, length);
     }
     // Carve the fixed tape region back out of the general pool, the same
     // way frames below RESERVED_BELOW never entered it: this must happen
@@ -81,10 +143,14 @@ pub fn initialize(info: &BootInfo) {
     // frames to anything else.
     reserve_range(TAPE_BASE, TAPE_LEN);
     let (total, _) = stats();
+    let (big_total, _) = big_stats();
     crate::println!(
         "Physical memory: {total} frames ({} KiB) tracked above 0x{RESERVED_BELOW:05x}, excluding 0x{TAPE_BASE:05x}-0x{:05x} reserved for tapes; use 'pmem'/'palloc'/'pfree' to inspect.",
         u64::from(total as u32) * u64::from(FRAME_SIZE) / 1024,
         TAPE_BASE + TAPE_LEN
+    );
+    crate::println!(
+        "Additionally tracked in 1 MiB chunks from 0x{BIG_POOL_BASE:08x}-0x{BIG_POOL_END:08x} for a tape's own 'alloc'/'free' callbacks: {big_total} MiB usable so far this boot."
     );
 }
 
@@ -128,6 +194,32 @@ fn mark_region_free(base: u64, length: u64) {
             }
         }
         address += u64::from(FRAME_SIZE);
+    }
+}
+
+/// `mark_region_free`'s exact counterpart for the coarse "big pool" above
+/// -- only whole 1 MiB chunks fully inside the region, and inside
+/// `[BIG_POOL_BASE, BIG_POOL_END)`, are marked free; partial edge chunks
+/// are conservatively left reserved, same reasoning as `mark_region_free`.
+fn mark_big_region_free(base: u64, length: u64) {
+    let start = base.div_ceil(u64::from(BIG_CHUNK_SIZE)) * u64::from(BIG_CHUNK_SIZE);
+    let end = (base + length) / u64::from(BIG_CHUNK_SIZE) * u64::from(BIG_CHUNK_SIZE);
+    if end <= start {
+        return;
+    }
+    let start = start.max(u64::from(BIG_POOL_BASE));
+    let end = end.min(u64::from(BIG_POOL_END));
+    let mut address = start;
+    while address < end {
+        let index = big_chunk_index(address as u32);
+        if !big_is_free(index) {
+            big_set_free(index, true);
+            unsafe {
+                BIG_TOTAL_CHUNKS += 1;
+                BIG_FREE_CHUNKS += 1;
+            }
+        }
+        address += u64::from(BIG_CHUNK_SIZE);
     }
 }
 
@@ -203,6 +295,69 @@ pub fn free(address: u32) {
 /// Returns `(total tracked frames, free frames)`.
 pub fn stats() -> (usize, usize) {
     unsafe { (TOTAL_FRAMES, FREE_FRAMES) }
+}
+
+/// Allocates `count` *physically contiguous* 1 MiB chunks from the coarse
+/// "big pool" (see its own doc comment above), returning the base address
+/// of the first one, or `None` if no run of that length is free. Used
+/// only by `shell::tape_alloc`, for a tape needing far more RAM than its
+/// own fixed 4 MiB region -- entirely separate storage from
+/// `allocate_contiguous` above, so the two pools never contend with each
+/// other or with each other's callers.
+pub fn allocate_big_contiguous(count: usize) -> Option<u32> {
+    if count == 0 || count > BIG_POOL_CHUNKS {
+        return None;
+    }
+    unsafe {
+        let mut run_start = 0usize;
+        let mut run_length = 0usize;
+        for index in 0..BIG_POOL_CHUNKS {
+            if big_is_free(index) {
+                if run_length == 0 {
+                    run_start = index;
+                }
+                run_length += 1;
+                if run_length == count {
+                    for offset in 0..count {
+                        big_set_free(run_start + offset, false);
+                    }
+                    BIG_FREE_CHUNKS -= count;
+                    return Some(BIG_POOL_BASE + run_start as u32 * BIG_CHUNK_SIZE);
+                }
+            } else {
+                run_length = 0;
+            }
+        }
+    }
+    None
+}
+
+/// Returns `count` previously allocated 1 MiB chunks (starting at
+/// `address`) to the big pool's free list. Chunks outside the tracked
+/// range, or already free, are ignored rather than corrupting accounting
+/// -- the same lenient contract `free` above already has for the fine
+/// frame pool.
+pub fn free_big(address: u32, count: usize) {
+    if address < BIG_POOL_BASE || (address - BIG_POOL_BASE) % BIG_CHUNK_SIZE != 0 {
+        return;
+    }
+    let start = big_chunk_index(address);
+    for offset in 0..count {
+        let index = start + offset;
+        if index >= BIG_POOL_CHUNKS || big_is_free(index) {
+            continue;
+        }
+        big_set_free(index, true);
+        unsafe {
+            BIG_FREE_CHUNKS += 1;
+        }
+    }
+}
+
+/// Returns `(total tracked big-pool chunks, free chunks)` -- each chunk
+/// is exactly 1 MiB (`BIG_CHUNK_SIZE`), so these numbers double as MiB.
+pub fn big_stats() -> (usize, usize) {
+    unsafe { (BIG_TOTAL_CHUNKS, BIG_FREE_CHUNKS) }
 }
 
 fn read_u16(pointer: *const u16) -> u16 {

@@ -483,7 +483,8 @@ foreground color once per frame, forever, until told to stop -- checked
 once per frame through a second callback, `should_abort`
 (`shell::combined_tape_should_abort`), that `tape_run` now passes
 alongside the usual `putc` callback (see "tape print callback ABI" in
-AGENTS.md for the full two-callback ABI). That check recognizes two
+AGENTS.md for the full tape ABI, now grown to four callbacks -- see
+"Tape ABI grows alloc/free" further below). That check recognizes two
 independent "give up" signals, either one enough: a local keypress
 (F12/F4/F6/F7/F8/F10, via `keyboard::tape_should_abort`) and, if this
 tape was started from an active `term net` session, a remote one too
@@ -497,6 +498,26 @@ Stopping the tape this way, local or remote, never disconnects a `term
 net` session driving it (see `tapes/test_vga_colors_e2e.py` for a
 test that actually exercises both ways, not just documents them). Build
 it with `make tape-vga-colors` (producing `build/tapes/vga-colors.bin`).
+
+#### Test tape: `tapes/bigsieve/`
+
+A third Rust reference tape, proving a tape's working set isn't actually
+capped at its own fixed 4 MiB region -- only its compiled code/data/
+`.bss` is. It requests a 64 MiB buffer at run time through two more
+callbacks, `alloc`/`free` (`shell::tape_alloc`/`shell::tape_free`, the
+tape ABI's third and fourth arguments -- see "Tape ABI grows alloc/free:
+using the rest of the machine's RAM" in AGENTS.md for the full four-
+callback ABI and the two-pool memory design behind it), zeroes it
+manually (memory from `alloc` isn't pre-zeroed), sieves primes up to
+67,108,864 into it, prints the summary through the usual `putc`
+callback, and frees the buffer before returning. Built with
+`make tape-bigsieve` (producing `build/tapes/bigsieve.bin`) and verified
+end to end with `tapes/test_bigsieve_e2e.py`, which runs QEMU with
+`-m 256` since the buffer comes from a pool that only starts at the
+128 MiB mark. Want to write your own Rust tape? See
+`docs/rust-tapes-for-dummies.md` for a from-scratch, beginner-friendly
+walkthrough, including a section on `alloc`/`free` for tapes that need
+more memory than their fixed 4 MiB region.
 
 
 ### Remote terminal (`term net`)

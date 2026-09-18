@@ -1265,41 +1265,99 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// unrecoverable fault this kernel reports.
 ///
 /// Called as `extern "C" fn(putc: extern "C" fn(u32), should_abort: extern
-/// "C" fn() -> u32)` (cdecl, two arguments): `console::print_byte` is
-/// passed as the first, giving a tape a narrow, explicit way to call back
-/// into the kernel's own console code to print, instead of touching
-/// VGA/COM1 hardware directly (see `tapes/primes.S`'s header
-/// comment for why this one callback was worth the exception). This is
-/// what makes a tape's own output show up over `term net` like any other
-/// command's, and is why `tape_run` no longer needs to re-sync the
-/// console's cursor state afterward: a tape that only ever prints
-/// through this callback never touches the hardware cursor itself, so
-/// the kernel's own cached position is never stale to begin with.
+/// "C" fn() -> u32, alloc: extern "C" fn(u32) -> u32, free: extern "C"
+/// fn(u32, u32))` (cdecl, four arguments), in that fixed order -- a tape
+/// is free to declare only a leading prefix of these parameters (as
+/// `primes.S`/`hello-rs` declare only `putc`, and `vga-colors` declares
+/// only `putc`/`should_abort`) and ignore the rest; under cdecl this
+/// remains binary-compatible, since the caller (this function) both
+/// pushes and cleans up every argument regardless of how many the callee
+/// actually reads. A tape needing a *later* argument (like `alloc`/`free`
+/// below) must still declare every parameter before it, purely to keep
+/// each argument's stack position lined up correctly -- see
+/// `docs/rust-tapes-for-dummies.md` for a worked example.
 ///
-/// `combined_tape_should_abort` is passed as the second argument, giving
-/// a long-running or looping tape (like `tapes/vga-colors`) a way
-/// to notice a "give up" request without touching the keyboard
-/// controller or network card itself. It checks two independent sources,
-/// either one enough to stop the tape: a local "give up" keypress
-/// (F12/F4/F6/F7/F8/F10, via `keyboard::tape_should_abort` -- see that
-/// function's own doc comment for why this is safe even when a tape was
-/// started remotely over an active `term_net` session), and, if a
-/// `term_net` session is what started this tape, a remote one too (via
-/// `poll_remote_tape_abort`, since that session's own loop -- and so its
-/// own `nic.receive` -- is paused for as long as this tape runs and
-/// cannot notice incoming frames on its own). A tape that runs once and
-/// returns (like `primes.S`/`hello-rs`) is free to ignore this argument
-/// entirely; under cdecl this remains binary-compatible with a tape
-/// declaring only the first parameter, since the caller (this function)
-/// both pushes and cleans up the extra stack slot regardless of whether
-/// the callee ever reads it.
+/// - `console::print_byte` is passed as the first argument, giving a tape
+///   a narrow, explicit way to call back into the kernel's own console
+///   code to print, instead of touching VGA/COM1 hardware directly (see
+///   `tapes/primes.S`'s header comment for why this one callback was
+///   worth the exception). This is what makes a tape's own output show
+///   up over `term net` like any other command's, and is why `tape_run`
+///   no longer needs to re-sync the console's cursor state afterward: a
+///   tape that only ever prints through this callback never touches the
+///   hardware cursor itself, so the kernel's own cached position is
+///   never stale to begin with.
+/// - `combined_tape_should_abort` is passed as the second argument, giving
+///   a long-running or looping tape (like `tapes/vga-colors`) a way
+///   to notice a "give up" request without touching the keyboard
+///   controller or network card itself. It checks two independent
+///   sources, either one enough to stop the tape: a local "give up"
+///   keypress (F12/F4/F6/F7/F8/F10, via `keyboard::tape_should_abort` --
+///   see that function's own doc comment for why this is safe even when
+///   a tape was started remotely over an active `term_net` session), and,
+///   if a `term_net` session is what started this tape, a remote one too
+///   (via `poll_remote_tape_abort`, since that session's own loop -- and
+///   so its own `nic.receive` -- is paused for as long as this tape runs
+///   and cannot notice incoming frames on its own).
+/// - `tape_alloc`/`tape_free` are passed as the third and fourth
+///   arguments, letting a tape reach far beyond its own fixed 4 MiB
+///   static region (`pmem::TAPE_BASE`/`TAPE_LEN`) for a large working set
+///   (a big sieve, a large buffer, ...) -- up to almost all of this
+///   machine's RAM (see `pmem::TRACKED_BYTES`), by borrowing physically
+///   contiguous frames straight from the same general pool `palloc`/
+///   `pfree` operate on. See `tape_alloc`'s own doc comment for the full
+///   contract (no auto-zeroing, no auto-free on return).
 ///
-/// (A tape is still ring-0 code and technically free to ignore both
-/// callbacks and touch hardware directly anyway -- nothing enforces this
-/// convention -- so this remains just that: a convention, not a
-/// sandboxed boundary.)
+/// (A tape is still ring-0 code and technically free to ignore any of
+/// these callbacks and touch hardware -- or `pmem` -- directly anyway --
+/// nothing enforces this convention -- so this remains just that: a
+/// convention, not a sandboxed boundary.)
 extern "C" fn combined_tape_should_abort() -> u32 {
     (keyboard::tape_should_abort() != 0 || poll_remote_tape_abort()) as u32
+}
+
+/// Hands a tape a fresh, physically contiguous block of at least `bytes`
+/// bytes (rounded up to whole 1 MiB chunks), from `pmem`'s separate,
+/// coarse-grained "big pool" (`pmem::allocate_big_contiguous`/`free_big`)
+/// -- everything from `pmem::BIG_POOL_BASE` up to `pmem::BIG_POOL_END`
+/// (1 GiB by default), entirely apart from the fine 4 KiB frame pool
+/// `palloc`/`pfree`/the fixed 4 MiB tape region draw from. Passed as the
+/// tape ABI's third argument (see `tape_run`'s doc comment). See
+/// `pmem::TRACKED_BYTES`'s doc comment for why this second, coarser pool
+/// exists at all instead of simply growing the fine bitmap: doing that
+/// would have grown `kernel.bin` itself (a flat binary's `.bss` is baked
+/// into the file) past `boot/stage2.S`'s 127-sector kernel-load ceiling.
+///
+/// Returns physical address `0` on failure (not enough contiguous free
+/// memory) -- never a valid chunk address, since nothing below
+/// `pmem::BIG_POOL_BASE` is ever handed out by this callback. Unlike a
+/// `static mut` array (whose bytes a flat binary's own loading always
+/// zeroes, see `entry.S`'s `.bss` zeroing stub in every Rust tape), these
+/// chunks are **not** zeroed -- they may hold whatever a previous
+/// allocation left behind -- so a tape relying on its buffer starting at
+/// zero must zero it itself (see `tapes/bigsieve/src/main.rs`).
+///
+/// A tape that calls this must later call `tape_free` with the exact same
+/// `bytes` value (or leak those chunks forever) -- there is no automatic
+/// cleanup on return, the same "trusted exactly as much as any other
+/// kernel code" reasoning `tape_run`'s own doc comment already gives for
+/// tapes in general, and the same manual-only contract `palloc`/`pfree`
+/// already have from the shell.
+extern "C" fn tape_alloc(bytes: u32) -> u32 {
+    let chunks = bytes.div_ceil(pmem::BIG_CHUNK_SIZE) as usize;
+    pmem::allocate_big_contiguous(chunks).unwrap_or(0)
+}
+
+/// `tape_alloc`'s exact opposite: releases the same `bytes` (rounded up
+/// to whole chunks the same way `tape_alloc` rounded when allocating)
+/// back to the big pool, starting at `address`. Passed as the tape ABI's
+/// fourth argument (see `tape_run`'s doc comment). `pmem::free_big`
+/// already silently ignores an out-of-range or already-free chunk rather
+/// than corrupting accounting, so a slightly-wrong `bytes` value here is
+/// safe, if still a bug worth fixing in the tape itself.
+extern "C" fn tape_free(address: u32, bytes: u32) {
+    let chunks = bytes.div_ceil(pmem::BIG_CHUNK_SIZE) as usize;
+    pmem::free_big(address, chunks);
 }
 
 fn tape_run() {
@@ -1308,9 +1366,14 @@ fn tape_run() {
         return;
     };
     println!("Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery.");
-    type TapeEntry = extern "C" fn(putc: extern "C" fn(u32), should_abort: extern "C" fn() -> u32);
+    type TapeEntry = extern "C" fn(
+        putc: extern "C" fn(u32),
+        should_abort: extern "C" fn() -> u32,
+        alloc: extern "C" fn(u32) -> u32,
+        free: extern "C" fn(u32, u32),
+    );
     let entry: TapeEntry = unsafe { core::mem::transmute::<usize, TapeEntry>(address as usize) };
-    entry(console::print_byte, combined_tape_should_abort);
+    entry(console::print_byte, combined_tape_should_abort, tape_alloc, tape_free);
     println!("Tape returned; back at the fos shell.");
 }
 

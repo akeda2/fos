@@ -878,6 +878,88 @@ single-threaded, nested-nothing design, combined with whatever a nested
 command's own output actually goes through -- but are exactly the kind of
 thing worth a regression test given how easy they'd be to silently break.
 
+### Tape ABI grows alloc/free: using the rest of the machine's RAM
+
+Every tape up to this point was limited to its own fixed 4 MiB region
+(`pmem::TAPE_BASE`/`TAPE_LEN`) for both code and data -- fine for a
+`static mut` sieve up to a million or so, but no way to work with, say,
+a genuinely large in-memory buffer on a machine with a real gigabyte of
+RAM behind it. `shell::tape_run`'s ABI grows two more callbacks to fix
+that: `TapeEntry` is now `extern "C" fn(putc: extern "C" fn(u32),
+should_abort: extern "C" fn() -> u32, alloc: extern "C" fn(u32) -> u32,
+free: extern "C" fn(u32, u32))`, with new `shell::tape_alloc`/
+`shell::tape_free` functions as the third and fourth arguments. Exactly
+like the `should_abort` callback before it, cdecl's caller-pushes/
+caller-cleans convention means older tapes (`primes.S`/`hello-rs`,
+one callback; `vga-colors`, two) still work unmodified even though
+`tape_run` now always pushes four arguments -- the extra pushed bytes are
+just stack space an older tape's shorter signature never reads, and
+`tape_run` cleans up all four regardless of how many the tape declared.
+The one hard rule (see `bigsieve`'s own doc comments): a tape may only
+omit a *trailing* run of parameters it doesn't use, never one in the
+middle -- a tape that wants `free` (fourth) but not `should_abort`
+(second) must still declare `should_abort` in its signature (even if
+unused, e.g. `_should_abort`) to keep every later parameter's stack
+position aligned.
+
+`alloc`/`free` are backed by a brand new, deliberately separate memory
+pool in `kernel/src/pmem.rs`, not the existing frame allocator
+`palloc`/`pfree`/disk/NIC code already use. That existing pool (`BITMAP`,
+`TRACKED_BYTES` = 128 MiB, 4 KiB-per-frame granularity) was left
+completely alone; a first attempt at this feature just grew its bitmap
+to cover a full 1 GiB and hit a hard, easy-to-forget architectural wall
+instead: `objcopy -O binary` bakes a `.bss` array's *entire* size into
+the shipped flat binary as zero bytes (there's no "reserved but unbacked"
+concept once a `no_std` freestanding binary is flattened), so a 1 GiB
+bitmap (32 KiB, up from the original 4 KiB) directly inflated
+`kernel.bin` by ~28 KB -- enough to blow past `boot/stage2.S`'s hard
+127-sector (65,024-byte) kernel load ceiling (`tools/write_layout.py`
+rejects anything bigger with `"kernel must occupy between 1 and 127
+sectors"`). That ceiling exists because stage two loads the entire
+kernel with a *single* INT13h extended-read BIOS call into one real-mode
+64 KiB segment; 127 sectors is deliberately the largest count that stays
+just under that 65,536-byte boundary.
+
+The fix: a second allocator, the "big pool" (`BIG_BITMAP`,
+`BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 1 GiB,
+`BIG_CHUNK_SIZE` = 1 MiB granularity instead of 4 KiB), tracked by its
+own tiny ~112-byte bitmap (896 MiB / 1 MiB / 8) -- negligible compared to
+the fine-grained pool's bitmap, so `kernel.bin` barely grows at all. The
+coarser 1 MiB granularity costs nothing in practice: a tape asking for
+`alloc` almost certainly wants one big contiguous block (a buffer, not
+many small ones), and `alloc`/`free` round a request up to whole
+`BIG_CHUNK_SIZE` chunks, same as `palloc`'s existing frame-granularity
+rounding just at a coarser step. `pmem::initialize()` calls a new
+`mark_big_region_free` for each usable E820 region (alongside the
+existing `mark_region_free`) and its boot `println` reports the big
+pool's tracked/usable MiB alongside the existing frame-pool line. Like
+`palloc`/`pfree`, there is no auto-free-on-return: a tape that calls
+`alloc` and never calls `free` leaks those chunks for the rest of that
+boot, exactly as trusted and exactly as unforgiving as any other
+kernel-level allocation in this project.
+
+`tapes/bigsieve/` is the reference tape exercising this: it requests a
+64 MiB buffer via `alloc` (sixteen times `pmem::TAPE_LEN`, so it could
+never fit in the tape's own fixed region no matter how it was compiled),
+zeroes it manually (unlike a `static mut` array, memory handed back by
+`alloc` isn't pre-zeroed for you), sieves primes up to 67,108,864, prints
+the results, and calls `free` before returning. Its sieve intentionally
+does **not** reuse `hello-rs`'s algorithm unchanged: `hello-rs`'s bound
+(1,000) is small enough that squaring every candidate all the way up to
+the limit never overflows `u32`, but at 64 MiB `candidate * candidate`
+would silently wrap around (Rust's `release` profile has overflow checks
+off) for any candidate past 65,536, corrupting the sieve with bogus
+composite markings far from where they belonged -- caught by this
+tape's own e2e test asserting an exact, independently-computed prime
+count. The fix is the standard sieve refinement: only compute
+`candidate * candidate` while marking composites up to
+`sqrt(SIEVE_LIMIT)`, then a separate linear pass counts unmarked bytes
+across the full range. Built with `make tape-bigsieve` (producing
+`build/tapes/bigsieve.bin`) and verified end to end over the network
+with `tapes/test_bigsieve_e2e.py` (run with QEMU given `-m 256`, since
+its 64 MiB request only succeeds once the machine actually has more than
+128 MiB of RAM for the big pool to serve it from).
+
 ### `term net` stays resident after a remote disconnect
 
 Originally, *any* session-ending event -- local F12, a remote

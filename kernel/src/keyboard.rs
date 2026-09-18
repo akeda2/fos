@@ -127,7 +127,7 @@ pub fn poll_term_event() -> Option<KeyEvent> {
 /// `chat`, `tape load net`, ...) already uses to recognize "give up".
 /// `shell::tape_run` passes this as a tape's second argument, alongside
 /// `console::print_byte` as the first (see that function's doc comment
-/// for the full two-callback ABI).
+/// for the full tape ABI).
 ///
 /// Safe to use even when a tape was started by a *remote* `tape run`
 /// (dispatched through an active `term_net` session): `interrupts::
