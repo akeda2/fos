@@ -483,8 +483,9 @@ foreground color once per frame, forever, until told to stop -- checked
 once per frame through a second callback, `should_abort`
 (`shell::combined_tape_should_abort`), that `tape_run` now passes
 alongside the usual `putc` callback (see "tape print callback ABI" in
-AGENTS.md for the full tape ABI, now grown to four callbacks -- see
-"Tape ABI grows alloc/free" further below). That check recognizes two
+AGENTS.md for the full tape ABI, since grown further still -- see
+"Tape ABI grows alloc/free" and "Tape ABI grows again: `read_key` and
+startup arguments" further below). That check recognizes two
 independent "give up" signals, either one enough: a local keypress
 (F12/F4/F6/F7/F8/F10, via `keyboard::tape_should_abort`) and, if this
 tape was started from an active `term net` session, a remote one too

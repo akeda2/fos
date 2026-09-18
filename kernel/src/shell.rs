@@ -116,7 +116,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         println!("          nic sniff (promiscuous capture; F12 (or F4/F6/F7/F8/F10) to stop)");
         println!("          nic discover (probe for other listening fos machines), nic peers (list them)");
         println!("          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 (or F4/F6/F7/F8/F10) or /quit to leave)");
-        println!("Tape: tape status (what's loaded), tape run (execute it)");
+        println!("Tape: tape status (what's loaded), tape run [ARGS...] (execute it, optionally passing arguments)");
         println!("      tape load disk NAME (load a FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)");
         println!("      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')");
         println!("Remote: term net (wait for a remote terminal client over Ethernet, same as the automatic wait at every boot; F12 (or F4/F6/F7/F8/F10) to give up)");
@@ -1216,17 +1216,21 @@ fn tape_set(value: Option<(u32, u32)>) {
 }
 
 
-/// `tape [status|run|load ...|send ...]`. `status`/no arguments report what
-/// (if anything) is loaded; `run` executes it; `load`/`send` are documented
-/// on their own handlers below.
+/// `tape [status|run [ARGS...]|load ...|send ...]`. `status`/no arguments
+/// report what (if anything) is loaded; `run` executes it, optionally
+/// passing everything after `run` to the tape verbatim as its own
+/// `args_ptr`/`args_len` (see `tape_run`'s doc comment) -- a tape that
+/// ignores those two arguments (every existing tape in this repository
+/// does) is unaffected either way; `load`/`send` are documented on their
+/// own handlers below.
 fn tape_command(info: &BootInfo, arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
     match subcommand {
         b"" | b"status" if remainder.is_empty() => tape_status(),
-        b"run" if remainder.is_empty() => tape_run(),
+        b"run" => tape_run(remainder),
         b"load" => tape_load_command(info, remainder),
         b"send" => tape_send_command(info, remainder),
-        _ => println!("Usage: tape [status|run|load disk NAME|load net|send NAME PEER_MAC|PEER_NUMBER]"),
+        _ => println!("Usage: tape [status|run [ARGS...]|load disk NAME|load net|send NAME PEER_MAC|PEER_NUMBER]"),
     }
 }
 
@@ -1266,8 +1270,9 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 ///
 /// Called as `extern "C" fn(putc: extern "C" fn(u32), should_abort: extern
 /// "C" fn() -> u32, alloc: extern "C" fn(u32) -> u32, free: extern "C"
-/// fn(u32, u32))` (cdecl, four arguments), in that fixed order -- a tape
-/// is free to declare only a leading prefix of these parameters (as
+/// fn(u32, u32), read_key: extern "C" fn() -> u32, args_ptr: u32, args_len:
+/// u32)` (cdecl, seven arguments), in that fixed order -- a tape is free
+/// to declare only a leading prefix of these parameters (as
 /// `primes.S`/`hello-rs` declare only `putc`, and `vga-colors` declares
 /// only `putc`/`should_abort`) and ignore the rest; under cdecl this
 /// remains binary-compatible, since the caller (this function) both
@@ -1307,6 +1312,25 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 ///   contiguous frames straight from the same general pool `palloc`/
 ///   `pfree` operate on. See `tape_alloc`'s own doc comment for the full
 ///   contract (no auto-zeroing, no auto-free on return).
+/// - `combined_tape_read_key` is passed as the fifth argument, giving a
+///   tape a way to read actual input -- not just detect "give up" --
+///   from whichever source started it, local keyboard or an active
+///   `term_net` session, without knowing or caring which. See its own
+///   doc comment for the full return-value encoding and, importantly,
+///   why a tape should use *either* this *or* `should_abort`, never both
+///   in the same loop.
+/// - `args_ptr`/`args_len` are passed as the sixth and seventh arguments:
+///   the address and length of whatever trailing text followed `tape run`
+///   on the command line (e.g. `tape run 2 + 2` gives a tape `"2 + 2"`,
+///   0 if none was given), letting a tape take simple, one-shot startup
+///   parameters the way a Unix program reads `argv` -- as opposed to
+///   `read_key`'s repeated, interactive input during a tape's own run.
+///   This slice points directly into the command line this shell already
+///   parsed (see `execute`/`LineEditor::feed`), which remains valid for
+///   as long as this synchronous call lasts, so no copy is made. A tape
+///   ignoring these two (every existing tape in this repository does)
+///   simply never reads them, exactly like any other trailing argument
+///   under cdecl.
 ///
 /// (A tape is still ring-0 code and technically free to ignore any of
 /// these callbacks and touch hardware -- or `pmem` -- directly anyway --
@@ -1314,6 +1338,187 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// convention, not a sandboxed boundary.)
 extern "C" fn combined_tape_should_abort() -> u32 {
     (keyboard::tape_should_abort() != 0 || poll_remote_tape_abort()) as u32
+}
+
+/// A small FIFO of pending remote tape-input bytes, exactly analogous to
+/// `console`'s own `RELAY_QUEUE` (output) or `interrupts`'s scancode queue
+/// (input): a single `TERM_TAG_DATA` frame can carry many bytes at once
+/// (a whole pasted or fast-typed line), but `combined_tape_read_key`
+/// hands a tape back only one decoded event per call, so any bytes beyond
+/// the first one a frame yields are queued here instead of discarded --
+/// unlike the older `poll_remote_tape_abort`, which only ever needed to
+/// detect one specific byte and could safely ignore everything else in a
+/// frame's payload.
+const TAPE_INPUT_QUEUE_LEN: usize = 256;
+static mut TAPE_INPUT_QUEUE: [u8; TAPE_INPUT_QUEUE_LEN] = [0; TAPE_INPUT_QUEUE_LEN];
+static mut TAPE_INPUT_HEAD: usize = 0;
+static mut TAPE_INPUT_TAIL: usize = 0;
+
+/// Queues `bytes` for later `tape_input_pop` calls, silently dropping
+/// whatever doesn't fit -- the same "never corrupt accounting, just stop
+/// accepting more" choice `pmem::free_big` and this file's own
+/// `remember_peer` already make elsewhere, on the theory that a tape
+/// falling behind this far during interactive use has bigger problems
+/// than one dropped keystroke.
+fn tape_input_push(bytes: &[u8]) {
+    unsafe {
+        for &byte in bytes {
+            let next = (TAPE_INPUT_TAIL + 1) % TAPE_INPUT_QUEUE_LEN;
+            if next == TAPE_INPUT_HEAD {
+                break;
+            }
+            TAPE_INPUT_QUEUE[TAPE_INPUT_TAIL] = byte;
+            TAPE_INPUT_TAIL = next;
+        }
+    }
+}
+
+fn tape_input_pop() -> Option<u8> {
+    unsafe {
+        if TAPE_INPUT_HEAD == TAPE_INPUT_TAIL {
+            return None;
+        }
+        let byte = TAPE_INPUT_QUEUE[TAPE_INPUT_HEAD];
+        TAPE_INPUT_HEAD = (TAPE_INPUT_HEAD + 1) % TAPE_INPUT_QUEUE_LEN;
+        Some(byte)
+    }
+}
+
+/// The one non-zero "nothing to report" event `combined_tape_read_key`
+/// never returns -- reserved so `0` unambiguously means "no input right
+/// now", matching `should_abort`'s own "0 means keep going" convention.
+const TAPE_EVENT_NONE: u32 = 0;
+/// Returned by `combined_tape_read_key` for a "give up" signal -- a local
+/// escape keypress or a remote `term_net` peer's abort byte/disconnect --
+/// exactly the same trigger `combined_tape_should_abort` already reports
+/// as `true`, just encoded as a distinct value here so one event can mean
+/// either "stop" or "here is a character" without a tape needing a second
+/// callback to tell them apart.
+const TAPE_EVENT_ABORT: u32 = 1;
+/// Everything from `TAPE_EVENT_CHAR_BASE` up encodes an ordinary input
+/// byte: subtract this base back off to recover it. Starts above `0`/`1`
+/// so every valid encoded byte (`0..=255`) stays distinguishable from
+/// both reserved values without needing a second return channel.
+const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
+
+/// Polls the network card once, on behalf of `combined_tape_read_key`,
+/// for a byte typed by the `term_net` peer that started this tape --
+/// mirrors `poll_remote_tape_abort`'s framing/discovery-probe handling
+/// closely (see that function's doc comment for why polling here is safe
+/// even mid-tape), but where that function only ever needed to notice one
+/// specific byte and could discard the rest of a payload, this one keeps
+/// every byte: the first is returned immediately, any more are queued in
+/// `TAPE_INPUT_QUEUE` for the next call. A payload containing the abort
+/// byte (`REMOTE_ABORT_BYTE`) anywhere is still treated exactly like
+/// `poll_remote_tape_abort` treats it -- the whole frame is dropped as a
+/// "give up" signal, never fed to a tape as ordinary characters, so a
+/// peer's escape keypress can never accidentally end up echoed into a
+/// tape's own input.
+fn poll_remote_tape_input() -> Option<u32> {
+    if let Some(byte) = tape_input_pop() {
+        return Some(TAPE_EVENT_CHAR_BASE | u32::from(byte));
+    }
+    if !console::relay_enabled() {
+        return None;
+    }
+    let (Some(peer), Some(source)) = (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE }) else {
+        return None;
+    };
+    let Ok(nic) = rtl8139::get() else { return None };
+    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let Some(received) = nic.receive(&mut buffer) else { return None };
+    let frame = &buffer[..received];
+    if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+        return None;
+    }
+    let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
+    if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
+        remember_peer(frame_source);
+        send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
+        return None;
+    }
+    if frame_source != peer {
+        return None;
+    }
+    match frame[14] {
+        TERM_TAG_BYE => {
+            unsafe { PENDING_REMOTE_BYE = true };
+            Some(TAPE_EVENT_ABORT)
+        }
+        TERM_TAG_DATA => {
+            let payload = &frame[15..];
+            let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
+            let data = &payload[..end];
+            if data.contains(&REMOTE_ABORT_BYTE) {
+                return Some(TAPE_EVENT_ABORT);
+            }
+            let (&first, rest) = data.split_first()?;
+            tape_input_push(rest);
+            Some(TAPE_EVENT_CHAR_BASE | u32::from(first))
+        }
+        _ => None,
+    }
+}
+
+/// `extern "C" fn() -> u32` callback giving a tape actual interactive
+/// input, not just "give up" detection -- passed as the tape ABI's fifth
+/// argument (see `tape_run`'s doc comment). Non-blocking: called once per
+/// polling iteration by a tape's own loop, exactly like `should_abort`,
+/// returning immediately either way.
+///
+/// Return value, checked in this order:
+/// - `0` (`TAPE_EVENT_NONE`): nothing waiting right now; keep polling.
+/// - `1` (`TAPE_EVENT_ABORT`): the same "give up" signal
+///   `combined_tape_should_abort` reports as `true` -- a local escape
+///   keypress, or (if a `term_net` session started this tape) the remote
+///   peer's abort byte or a disconnect.
+/// - `0x100` (`TAPE_EVENT_CHAR_BASE`) or above: an ordinary input byte,
+///   recovered with `value - 0x100` (or `value & 0xff`, equivalently) --
+///   from whichever source produced it, local keyboard or an active
+///   `term_net` session's `TERM_TAG_DATA` payload, with no way for a tape
+///   to tell which after the fact (nor any reason to want to: both are
+///   just "the user typed this").
+///
+/// A decoded backspace (ASCII `8`) also triggers `console::
+/// erase_last_character()` here, before returning the event -- the one
+/// piece of this a tape cannot safely do itself even with the `putc`
+/// callback, since plain `console::write_byte` does not special-case
+/// `0x08` the way `erase_last_character` does (rewinding the VGA cursor
+/// and emitting the `\x08 \x08` sequence a real serial terminal expects).
+/// Doing it here, unconditionally, keeps a tape's own backspace handling
+/// as simple as "decrement my buffer length" regardless of whether the
+/// keystroke was typed locally or arrived over the network -- exactly
+/// mirroring how `LineEditor::feed` already handles backspace for the
+/// ordinary shell prompt.
+///
+/// Shares its two input sources with `should_abort`
+/// (`keyboard::poll_term_event`'s scancode queue, and a `term_net`
+/// session's own network frames) but is a genuinely separate consumer of
+/// each: calling both callbacks from the same tape in the same loop will
+/// race them for input and intermittently lose keystrokes to whichever
+/// one happens to poll first. A tape wanting real input should call only
+/// this one -- checking for `TAPE_EVENT_ABORT` covers everything
+/// `should_abort` would have told it anyway -- not both.
+extern "C" fn combined_tape_read_key() -> u32 {
+    if let Some(event) = keyboard::poll_term_event() {
+        let code = match event {
+            keyboard::KeyEvent::Escape => TAPE_EVENT_ABORT,
+            keyboard::KeyEvent::Char(byte) => TAPE_EVENT_CHAR_BASE | u32::from(byte),
+        };
+        if code == TAPE_EVENT_CHAR_BASE | 8 {
+            console::erase_last_character();
+        }
+        return code;
+    }
+    match poll_remote_tape_input() {
+        Some(code) => {
+            if code == TAPE_EVENT_CHAR_BASE | 8 {
+                console::erase_last_character();
+            }
+            code
+        }
+        None => TAPE_EVENT_NONE,
+    }
 }
 
 /// Hands a tape a fresh, physically contiguous block of at least `bytes`
@@ -1360,7 +1565,7 @@ extern "C" fn tape_free(address: u32, bytes: u32) {
     pmem::free_big(address, chunks);
 }
 
-fn tape_run() {
+fn tape_run(arguments: &[u8]) {
     let Some((address, length)) = tape_get() else {
         println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
         return;
@@ -1371,11 +1576,23 @@ fn tape_run() {
         should_abort: extern "C" fn() -> u32,
         alloc: extern "C" fn(u32) -> u32,
         free: extern "C" fn(u32, u32),
+        read_key: extern "C" fn() -> u32,
+        args_ptr: u32,
+        args_len: u32,
     );
     let entry: TapeEntry = unsafe { core::mem::transmute::<usize, TapeEntry>(address as usize) };
-    entry(console::print_byte, combined_tape_should_abort, tape_alloc, tape_free);
+    entry(
+        console::print_byte,
+        combined_tape_should_abort,
+        tape_alloc,
+        tape_free,
+        combined_tape_read_key,
+        arguments.as_ptr() as u32,
+        arguments.len() as u32,
+    );
     println!("Tape returned; back at the fos shell.");
 }
+
 
 fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
     let (kind, remainder) = take_word(arguments);

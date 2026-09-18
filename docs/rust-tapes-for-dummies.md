@@ -7,13 +7,15 @@ shell's `tape run` command. No filesystem, no process table, no
 built-in heap, no paging -- just your code, a stack it borrows from the
 kernel, and a handful of function pointers the kernel hands you to talk
 to the outside world (including, if you need it, a way to borrow memory
-far bigger than that fixed 4 MiB region -- see section 7).
+far bigger than that fixed 4 MiB region -- see section 6 -- and a
+way to read input -- see section 7).
 
 This guide walks through writing, building, loading, and running a Rust
 tape from nothing, assuming no prior fos or embedded-Rust experience. For
 the deeper "why", see AGENTS.md's "Tapes: fixed load address, and writing
-one in Rust", "Tape ABI grows a second callback", and "Tape ABI grows
-alloc/free" sections -- this document only covers the "how".
+one in Rust", "Tape ABI grows a second callback", "Tape ABI grows
+alloc/free", and "Tape ABI grows again: `read_key` and startup
+arguments" sections -- this document only covers the "how".
 
 ## 1. What a tape actually is
 
@@ -24,7 +26,7 @@ That's why building one means compiling normally, then stripping away
 everything but the raw bytes with `objcopy -O binary`.
 
 Every tape must export exactly one C-callable entry point named
-`tape_main`, matching one of three signatures:
+`tape_main`, matching one of these signatures:
 
 ```rust
 // One-shot tapes: print something, maybe compute something, then return.
@@ -40,6 +42,17 @@ extern "C" fn tape_main(
     alloc: extern "C" fn(u32) -> u32,
     free: extern "C" fn(u32, u32),
 );
+
+// Tapes that want interactive input and/or a startup argument string.
+extern "C" fn tape_main(
+    putc: extern "C" fn(u32),
+    should_abort: extern "C" fn() -> u32,
+    alloc: extern "C" fn(u32) -> u32,
+    free: extern "C" fn(u32, u32),
+    read_key: extern "C" fn() -> u32,
+    args_ptr: u32,
+    args_len: u32,
+);
 ```
 
 - `putc(byte)` is the *only* way to print. It goes through the kernel's
@@ -51,10 +64,19 @@ extern "C" fn tape_main(
   all -- it's expected to just finish. A looping tape must check it once
   per iteration and return when it's non-zero, or it can never be stopped.
 - `alloc(bytes)`/`free(address, bytes)` hand out and return memory from a
-  much larger pool than your own fixed 4 MiB region -- see section 7 if
+  much larger pool than your own fixed 4 MiB region -- see section 6 if
   your tape needs a buffer bigger than that.
+- `read_key()` is a non-blocking "read one input event" callback -- see
+  section 7 for the full encoding and how to build a line reader on top
+  of it. Only needed by a tape that wants actual keystrokes, not just
+  "give up" detection.
+- `args_ptr`/`args_len` are the address and length of whatever text
+  followed `tape run` on the command line (`tape run 2 + 2` gives you
+  `"2 + 2"`, or a zero-length slice if nothing followed) -- a simple,
+  one-shot way to pass your tape a startup parameter, the way a Unix
+  program reads `argv`. See section 7.
 
-**Important:** these four parameters are always in this order, and a
+**Important:** these seven parameters are always in this order, and a
 tape may only leave off a *trailing* run of them it doesn't use -- never
 one in the middle. Only wanting `alloc`/`free` but not `should_abort`?
 You must still declare `should_abort` in your signature (even if you
@@ -67,7 +89,7 @@ already sitting on the stack -- but it can only safely ignore them from
 the end, not skip over one in the middle.
 
 That's the entire ABI. No file I/O, no threads, no interrupts of your
-own -- if you need something more than these four callbacks provide,
+own -- if you need something more than these seven parameters provide,
 you're probably describing a kernel feature, not a tape.
 
 ## 2. Anatomy of a Rust tape directory
@@ -361,7 +383,91 @@ sieve of Eratosthenes, including why its counting loop can't just reuse
 `hello-rs`'s algorithm unchanged at this larger scale (an integer
 overflow trap worth understanding even outside this project).
 
-## 7. Where to look next
+## 7. Reading input and startup arguments
+
+Every example so far only ever *prints*. Declare the full seven-parameter
+`tape_main` signature from section 1 and a tape can also receive a
+startup parameter and read live keystrokes -- whether typed locally or
+sent over an active `term net` session; a tape has no way to tell which,
+by design, and doesn't need to.
+
+**Startup arguments** are whatever text followed `tape run` on the
+command line:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn tape_main(
+    putc: extern "C" fn(u32),
+    should_abort: extern "C" fn() -> u32,
+    _alloc: extern "C" fn(u32) -> u32,
+    _free: extern "C" fn(u32, u32),
+    read_key: extern "C" fn() -> u32,
+    args_ptr: u32,
+    args_len: u32,
+) {
+    let args: &[u8] =
+        unsafe { core::slice::from_raw_parts(args_ptr as *const u8, args_len as usize) };
+    if args.is_empty() {
+        print_bytes(putc, b"No arguments given -- try `tape run` with some text.\n");
+    } else {
+        print_bytes(putc, b"You passed: ");
+        print_bytes(putc, args);
+        print_bytes(putc, b"\n");
+    }
+    // ...
+}
+```
+
+`tape run 2 + 2` gives `args` as `b"2 + 2"`; plain `tape run` gives an
+empty slice. There's no parsing convention imposed here at all -- your
+tape decides what the bytes mean (a whole expression, one flag character,
+whatever fits your program).
+
+**Interactive input** works by polling `read_key()` once per loop
+iteration, exactly like `should_abort()` (in fact, don't call both --
+see the warning below):
+
+```rust
+const TAPE_EVENT_NONE: u32 = 0;
+const TAPE_EVENT_ABORT: u32 = 1;
+const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
+
+loop {
+    match read_key() {
+        TAPE_EVENT_NONE => {
+            // nothing waiting yet this iteration -- keep polling
+        }
+        TAPE_EVENT_ABORT => break,
+        event => {
+            let byte = (event - TAPE_EVENT_CHAR_BASE) as u8;
+            // ... handle `byte`, e.g. echo it, append it to a line buffer ...
+        }
+    }
+}
+```
+
+A backspace byte (`8`) is special-cased for you: the kernel erases it
+from the screen (locally and over `term net`, cursor and all) before
+`read_key` ever returns it, so your own line-editing code only needs to
+shrink its own buffer length by one -- it should not also try to print
+anything for a backspace itself.
+
+**Important: use `should_abort` *or* `read_key`, never both in the same
+tape.** They both end up draining the exact same underlying input
+sources (the local keyboard's scancode queue, and an active `term net`
+session's incoming network frames) -- polling both from the same loop
+races them for the same bytes and will intermittently lose keystrokes to
+whichever one happens to poll first. `read_key`'s own `TAPE_EVENT_ABORT`
+already reports everything `should_abort` would have told you, so a
+tape reading input never needs `should_abort` at all.
+
+See AGENTS.md's "Tape ABI grows again: `read_key` and startup arguments"
+for the full story of why this shape was chosen -- including why
+line-based input (reading a whole line, not one keystroke) is
+deliberately left as something you build yourself out of `read_key`
+in ordinary Rust, rather than a second kernel callback.
+
+## 8. Where to look next
 
 - `tapes/hello-rs/src/main.rs` -- the simplest complete one-shot
   Rust tape (a sieve of Eratosthenes over a small range).
@@ -379,8 +485,9 @@ overflow trap worth understanding even outside this project).
   assembly tape that jumps into 64-bit long mode and back, entirely
   inside one `tape run` call.
 - AGENTS.md's "Tape print callback ABI", "Tapes: fixed load address, and
-  writing one in Rust", "Tape ABI grows a second callback", and "Tape
-  ABI grows alloc/free" sections -- the full historical and technical
-  reasoning behind every constraint described above.
+  writing one in Rust", "Tape ABI grows a second callback", "Tape ABI
+  grows alloc/free", and "Tape ABI grows again: `read_key` and startup
+  arguments" sections -- the full historical and technical reasoning
+  behind every constraint described above.
 - `kernel/src/shell.rs`'s `tape_run` doc comment -- the authoritative,
-  in-code description of the ABI all four callbacks must satisfy.
+  in-code description of the ABI all seven parameters must satisfy.

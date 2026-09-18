@@ -1036,6 +1036,94 @@ with `tapes/test_bigsieve_e2e.py` (run with QEMU given `-m 256`, since
 its 64 MiB request only succeeds once the machine actually has more than
 128 MiB of RAM for the big pool to serve it from).
 
+### Tape ABI grows again: `read_key` and startup arguments
+
+Every tape so far was a pure "run once, print a summary, maybe loop
+until told to give up" program -- none could take input, whether a
+one-shot parameter (like an expression for a calculator) or ongoing
+interactive keystrokes (like a calculator's own REPL). This surfaced
+while sketching a genuinely new tape (a simple calculator) as a test of
+the whole Rust-tape workflow itself: the very first design question --
+"how does it get an expression to evaluate?" -- had no answer anywhere
+in the existing ABI. `should_abort` could detect "give up" but nothing
+else; there was no way to pass `tape run` any text, and no way for a
+running tape to read a keystroke. Building the calculator was deferred
+until this gap was closed, on the theory that the gap itself was the
+more valuable finding: exactly the kind of blind alley a less-capable
+model (or a person new to this codebase) would otherwise burn a lot of
+effort discovering the hard way, mid-tape, with no clean way out.
+
+Two additions close it, both purely additive to the existing four-
+argument ABI (see "Tape ABI grows alloc/free" above):
+
+- **Startup arguments.** `tape run` no longer requires an empty
+  remainder -- `tape run 2 + 2` now runs the loaded tape exactly as
+  before, but passes `"2 + 2"` through as two new trailing arguments,
+  `args_ptr: u32`/`args_len: u32` (the address and length of that
+  slice). This is deliberately the same one-shot, non-interactive
+  parameter passing a Unix program's `argv` provides -- no parsing
+  convention (words, quoting, ...) is imposed here at all; a tape
+  receiving `args_ptr`/`args_len` gets the raw trailing bytes exactly as
+  typed and decides for itself what they mean. The slice points directly
+  into the command line `execute`/`LineEditor::feed` already parsed, and
+  remains valid for as long as `tape_run`'s synchronous call lasts, so no
+  copy is made. Every existing tape ignores both new arguments and is
+  completely unaffected, the same cdecl "extra trailing arguments cost
+  the callee nothing" guarantee `alloc`/`free`'s own addition relied on.
+- **Interactive input.** A new fifth argument, `read_key: extern "C" fn()
+  -> u32`, gives a tape actual keystrokes -- not just abort detection --
+  from whichever source started it, local keyboard or an active
+  `term_net` session, without needing to know or care which. Non-
+  blocking, called once per polling iteration exactly like
+  `should_abort`: `0` means nothing is waiting yet, `1`
+  (`TAPE_EVENT_ABORT`, the exact same "give up" trigger `should_abort`
+  reports as `true`) means stop, and `0x100` or above encodes an
+  ordinary input byte (`value - 0x100` recovers it). A tape using
+  `read_key` should not *also* call `should_abort`: both ultimately
+  drain the same two underlying sources (`keyboard::poll_term_event`'s
+  scancode queue, and a `term_net` session's own network frames), so
+  calling both from the same loop races them for input and
+  intermittently drops keystrokes to whichever polls first -- checking
+  for `TAPE_EVENT_ABORT` already covers everything `should_abort` would
+  have reported anyway.
+
+  Implementing this surfaced one asymmetry between local and remote
+  input worth calling out: a single `TERM_TAG_DATA` frame can carry many
+  bytes at once (a whole pasted or fast-typed line), but `read_key`
+  hands back only one decoded byte per call. `poll_remote_tape_abort`
+  (the existing `should_abort`-only helper) never had to care, since it
+  only ever looked for one specific byte and safely ignored the rest of
+  a frame's payload -- but a general input callback can't discard bytes
+  it hasn't been asked to. The new `poll_remote_tape_input` fixes this by
+  queuing everything past the first byte of a frame into a small FIFO
+  (`TAPE_INPUT_QUEUE`, 256 bytes), drained by later `read_key` calls
+  before it ever polls the network again -- the same producer/consumer
+  queue shape `console`'s own output-side `RELAY_QUEUE` already uses,
+  just for input.
+
+  Backspace (ASCII `8`) gets one more piece of special handling: `read_key`
+  calls `console::erase_last_character()` itself before returning that
+  event, regardless of whether the keystroke was typed locally or
+  arrived over the network. This is the one thing a tape genuinely
+  cannot do itself even with the `putc` callback -- plain
+  `console::write_byte` does not special-case `0x08` the way
+  `erase_last_character` does (rewinding the VGA cursor and emitting the
+  `\x08 \x08` sequence a real serial terminal expects) -- so doing it
+  here keeps a tape's own line-editing logic as simple as "decrement my
+  buffer length," exactly mirroring how the ordinary shell prompt's own
+  `LineEditor::feed` already handles backspace.
+
+No tape in this repository uses either addition yet (none existed with
+a reason to before this gap was found) -- this section exists to
+document the ABI ahead of the calculator tape that motivated it, and any
+future tape needing input. `docs/rust-tapes-for-dummies.md`'s tape ABI
+section and `tapes/tape-rt/` (see "`tapes/tape-rt/`: a shared runtime,
+so far only used by `vga-colors`" above) are the natural places a
+`read_key`-based line-reading helper belongs once a tape actually needs
+one, built the same way the shell's own `LineEditor` is: ordinary Rust
+layered over one narrow, non-blocking primitive, not a second kernel
+callback.
+
 ### `term net` stays resident after a remote disconnect
 
 Originally, *any* session-ending event -- local F12, a remote
