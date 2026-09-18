@@ -8,8 +8,9 @@ NETROM_RAW := $(BUILD)/netrom_raw.bin
 NETROM := $(BUILD)/netboot.rom
 TAPE_PRIMES_BIN := $(BUILD)/tapes/primes.bin
 TAPE_HELLO_RS_BIN := $(BUILD)/tapes/hello-rs.bin
+TAPE_VGA_COLORS_BIN := $(BUILD)/tapes/vga-colors.bin
 
-.PHONY: all kernel image run test netrom tape-primes tape-hello-rs clean
+.PHONY: all kernel image run test netrom tape-primes tape-hello-rs tape-vga-colors clean
 
 all: image
 
@@ -68,5 +69,19 @@ tape-hello-rs:
 	mkdir -p $(BUILD)/tapes
 	objcopy -O binary tools/tapes/hello-rs/target/i686-fos/release/hello-tape $(TAPE_HELLO_RS_BIN)
 
+# Builds the "vga-colors" test tape: same fixed-address Rust setup as
+# tape-hello-rs above, but demonstrating the tape ABI's second callback
+# (`should_abort`, see kernel/src/keyboard.rs's `tape_should_abort` and
+# `shell::tape_run`'s doc comment) -- it loops, drawing cycling colored
+# text directly to VGA memory (bypassing console::print_byte/serial/
+# term net relay entirely for that animation), until a local operator
+# presses one of the "give up" keys. See tools/tapes/vga-colors/src/
+# main.rs and AGENTS.md's "vga-colors tape" section for details.
+# Entirely additive -- untouched by `make`/`make all`/`image`/`run`/`test`.
+tape-vga-colors:
+	cd tools/tapes/vga-colors && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tools/tapes/vga-colors/target/i686-fos/release/vga-colors-tape $(TAPE_VGA_COLORS_BIN)
+
 clean:
-	rm -rf $(BUILD) kernel/target tools/tapes/hello-rs/target
+	rm -rf $(BUILD) kernel/target tools/tapes/hello-rs/target tools/tapes/vga-colors/target

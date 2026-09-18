@@ -120,6 +120,32 @@ pub fn poll_term_event() -> Option<KeyEvent> {
     decoded.map(KeyEvent::Char)
 }
 
+/// `extern "C" fn() -> u32` callback a tape's entry point can call once
+/// per loop iteration to check whether a local operator wants it to stop
+/// -- backed by the exact same `poll_term_event`/`ESCAPE_SCANCODES` check
+/// every other blocking shell loop (`term`, `term net`, `nic sniff`,
+/// `chat`, `tape load net`, ...) already uses to recognize "give up".
+/// `shell::tape_run` passes this as a tape's second argument, alongside
+/// `console::print_byte` as the first (see that function's doc comment
+/// for the full two-callback ABI).
+///
+/// Safe to use even when a tape was started by a *remote* `tape run`
+/// (dispatched through an active `term_net` session): `interrupts::
+/// pop_scancode`'s queue is a single, consuming FIFO shared by every
+/// caller in this single-threaded kernel, and `term_net`'s own session
+/// loop is paused for the entire time a nested command like a tape is
+/// running. So a local escape keypress a tape's own loop consumes here to
+/// stop *itself* is gone from the queue by the time control returns to
+/// `term_net` -- it can never also be seen there afterward as "disconnect
+/// the remote session". The one extra wrinkle, a physical key press's
+/// paired release scancode, is harmless for the same reason
+/// `poll_term_event` already documents: `released` events decode to
+/// `None`, so `term_net`'s later poll of that leftover byte never reads
+/// as an escape either.
+pub extern "C" fn tape_should_abort() -> u32 {
+    matches!(poll_term_event(), Some(KeyEvent::Escape)) as u32
+}
+
 fn wait_for_input_empty() -> bool {
     for _ in 0..100_000 {
         if unsafe { inb(STATUS_PORT) } & STATUS_INPUT_FULL == 0 {

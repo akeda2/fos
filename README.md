@@ -446,6 +446,41 @@ entirely separate from `make image`/`run`/`test`), then send it to a
 running fos machine with `tools/send_tape.py build/tapes/primes.bin` and
 run `tape run` there once `tape load net` confirms it arrived.
 
+#### Test tape: `tools/tapes/hello-rs/`
+
+A small Rust reference tape, proving a compiled language (not just
+hand-written PIC assembly like `primes.S`) works here now that every
+tape always loads at the same fixed physical address (`0x100000`): a
+`no_std`/`no_main` binary crate, reusing the kernel's own custom target
+spec and `-Z build-std` setup (see its `.cargo/config.toml`), with its
+own `linker.ld` fixing the load address the same way `kernel/linker.ld`
+fixes the kernel's own. It prints a greeting, sieves primes up to 1,000
+(168 primes, largest 997) into a `static mut` array, prints the summary
+through the same one callback (`console::print_byte`) `primes.S` uses,
+and returns -- ordinary absolute addressing, no PIC trick needed. Build
+it with `make tape-hello-rs` (producing `build/tapes/hello-rs.bin`) and
+verify it with `tools/tapes/test_hello_rs_e2e.py`.
+
+#### Test tape: `tools/tapes/vga-colors/`
+
+A second Rust reference tape, this one looping instead of running once.
+It writes several rows of text straight to VGA text memory (physical
+`0xb8000`) instead of through `console::print_byte`, cycling their
+foreground color once per frame, forever, until a local operator presses
+one of the "give up" keys (F12/F4/F6/F7/F8/F10) -- checked once per
+frame through a second callback, `should_abort` (backed by
+`keyboard::tape_should_abort`), that `tape_run` now passes alongside the
+usual `putc` callback (see "tape print callback ABI" in AGENTS.md for
+the full two-callback ABI). Only one line at the very start and one at
+the very end print through `putc`; the animation itself never touches
+serial or a `term net` relay at all, since it writes VGA memory directly
+-- the whole point of the example. Pressing "give up" while this tape's
+loop is running stops only the tape, never a `term net` session driving
+it remotely (see `keyboard::tape_should_abort`'s doc comment for exactly
+why that's guaranteed, and `tools/tapes/test_vga_colors_e2e.py` for a
+test that actually exercises it, not just documents it). Build it with
+`make tape-vga-colors` (producing `build/tapes/vga-colors.bin`).
+
 
 ### Remote terminal (`term net`)
 

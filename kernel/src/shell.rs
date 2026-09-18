@@ -1156,29 +1156,43 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// a reset or power-cycle is required, exactly as with any other
 /// unrecoverable fault this kernel reports.
 ///
-/// Called as `extern "C" fn(putc: extern "C" fn(u32))` (cdecl, one
-/// argument): `console::print_byte` is passed as that argument, giving a
-/// tape a narrow, explicit way to call back into the kernel's own console
-/// code to print, instead of touching VGA/COM1 hardware directly (see
-/// `tools/tapes/primes.S`'s header comment for why this one callback was
-/// worth the exception). This is what makes a tape's own output show up
-/// over `term net` like any other command's, and is why `tape_run` no
-/// longer needs to re-sync the console's cursor state afterward: a tape
-/// that only ever prints through this callback never touches the
-/// hardware cursor itself, so the kernel's own cached position is never
-/// stale to begin with. (A tape is still ring-0 code and technically free
-/// to ignore the callback and touch hardware directly anyway -- nothing
-/// enforces this convention -- so this remains just that: a convention,
-/// not a sandboxed boundary.)
+/// Called as `extern "C" fn(putc: extern "C" fn(u32), should_abort: extern
+/// "C" fn() -> u32)` (cdecl, two arguments): `console::print_byte` is
+/// passed as the first, giving a tape a narrow, explicit way to call back
+/// into the kernel's own console code to print, instead of touching
+/// VGA/COM1 hardware directly (see `tools/tapes/primes.S`'s header
+/// comment for why this one callback was worth the exception). This is
+/// what makes a tape's own output show up over `term net` like any other
+/// command's, and is why `tape_run` no longer needs to re-sync the
+/// console's cursor state afterward: a tape that only ever prints
+/// through this callback never touches the hardware cursor itself, so
+/// the kernel's own cached position is never stale to begin with.
+///
+/// `keyboard::tape_should_abort` is passed as the second argument, giving
+/// a long-running or looping tape (like `tools/tapes/vga-colors`) a way
+/// to notice a local "give up" keypress (F12/F4/F6/F7/F8/F10) without
+/// touching the keyboard controller itself -- see that function's own
+/// doc comment for why this is safe even when a tape was started
+/// remotely over an active `term_net` session. A tape that runs once and
+/// returns (like `primes.S`/`hello-rs`) is free to ignore this argument
+/// entirely; under cdecl this remains binary-compatible with a tape
+/// declaring only the first parameter, since the caller (this function)
+/// both pushes and cleans up the extra stack slot regardless of whether
+/// the callee ever reads it.
+///
+/// (A tape is still ring-0 code and technically free to ignore both
+/// callbacks and touch hardware directly anyway -- nothing enforces this
+/// convention -- so this remains just that: a convention, not a
+/// sandboxed boundary.)
 fn tape_run() {
     let Some((address, length)) = tape_get() else {
         println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
         return;
     };
     println!("Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery.");
-    type TapeEntry = extern "C" fn(putc: extern "C" fn(u32));
+    type TapeEntry = extern "C" fn(putc: extern "C" fn(u32), should_abort: extern "C" fn() -> u32);
     let entry: TapeEntry = unsafe { core::mem::transmute::<usize, TapeEntry>(address as usize) };
-    entry(console::print_byte);
+    entry(console::print_byte, keyboard::tape_should_abort);
     println!("Tape returned; back at the fos shell.");
 }
 

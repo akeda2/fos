@@ -614,6 +614,78 @@ The same fixed-address convention would work identically for a C tape
 Rust was chosen here only because it reuses the kernel's own toolchain
 and build-std setup with far less new scaffolding.
 
+### Tape ABI grows a second callback: `should_abort`, and `vga-colors`
+
+Every tape up to this point ran once and returned: `primes.S`/`hello-rs`
+compute something, print a summary through the one callback `tape_run`
+passed in (`console::print_byte`, "the tape print callback ABI" above),
+and `ret`. That's not enough for a tape meant to *loop* -- an animation,
+a benchmark with a visible running total, anything a local operator
+should be able to stop without rebooting -- since nothing in the
+original one-callback ABI let a tape notice a keypress at all.
+
+`shell::tape_run` now calls a tape as `extern "C" fn(putc: extern "C"
+fn(u32), should_abort: extern "C" fn() -> u32)`, passing `keyboard::
+tape_should_abort` as the second argument alongside `console::print_byte`
+as the first. `tape_should_abort` (`kernel/src/keyboard.rs`) is a thin
+wrapper around the exact same `poll_term_event`/`ESCAPE_SCANCODES` check
+every other blocking shell loop (`term`, `term net`, `nic sniff`, `chat`,
+`tape load net`) already uses to recognize "give up" (F12/F4/F6/F7/F8/
+F10) -- a looping tape is just one more thing in that same family, not a
+special case.
+
+This is backward-compatible by construction, not by accident: under
+cdecl, the caller (`tape_run`) both pushes arguments onto the stack and
+cleans them up afterward, regardless of how many the callee actually
+reads. `primes.S`/`hello-rs` still declare (and use) only the first
+parameter, and neither needed a single line changed -- confirmed by
+rerunning `tools/tapes/test_primes_e2e.py`/`test_hello_rs_e2e.py`
+unmodified against the rebuilt kernel before writing anything new.
+
+The specific worry this raised -- "if a tape's own loop consumes a local
+escape keypress to stop itself, could `term_net`'s own session loop
+somehow also see that same keypress and disconnect the remote session
+driving the tape?" -- turns out not to be a real risk, and
+`tape_should_abort`'s own doc comment spells out exactly why: `interrupts
+::pop_scancode`'s queue is a single, consuming FIFO shared by every
+caller in this single-threaded kernel, and `term_net`'s own session loop
+is paused for the entire time a nested command (like a tape) is running.
+So a keypress a tape's loop consumes to stop itself is simply gone from
+the queue by the time control returns to `term_net` -- it can never also
+be read there afterward as "disconnect". The one loose end, a physical
+key's paired *release* scancode left in the queue after the tape stops
+polling, is harmless for the same reason `poll_term_event` already
+documents elsewhere: release events decode to `None`, never `Escape`.
+
+`tools/tapes/vga-colors/` is the reference tape exercising this: same
+Rust/`no_std`/fixed-address setup as `hello-rs`, but its main loop writes
+several rows of text straight to VGA text memory (physical `0xb8000`,
+the exact address `console.rs`'s own `VGA_BUFFER` uses) instead of
+through `console::print_byte`, cycling their foreground color once per
+frame, forever, until `should_abort` returns nonzero. Only one line at
+the very start and one at the very end go through `putc` -- the
+animation itself deliberately never touches serial or a `term net` relay
+at all, which is the whole reason this tape bypasses the console
+abstraction rather than reusing `print_byte` in a loop: a remote operator
+watching a `term net` session would otherwise be flooded with a repaint
+every frame, for output that only ever made sense on the local screen to
+begin with. It also never touches the CRTC cursor ports, so the kernel's
+own cached cursor position is exactly where it was before `tape run`
+once the tape returns -- the colored rows simply stay on screen
+underneath whatever the shell prints next.
+
+Built with `make tape-vga-colors` (producing `build/tapes/vga-colors.bin`)
+and verified with `tools/tapes/test_vga_colors_e2e.py`, which goes beyond
+the usual serial-stream check (there is deliberately very little to see
+there): it reads the real VGA text framebuffer via the QEMU monitor's
+`pmemsave` (the same technique `test_primes_vga_e2e.py` uses) to confirm
+several distinct colors actually landed there, then uses the monitor's
+`sendkey f12` to simulate a *local* physical keypress and confirms both
+that the tape's loop stops (and control returns to the fos shell) and
+that the exact same `term_net` session driving it remotely is still
+alive afterward -- the concrete proof of the guarantee `tape_should_abort`
+documents, not just a read of its doc comment.
+
 
 
 `term net` is deliberately a full remote *shell*, not a byte pipe like
