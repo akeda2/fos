@@ -605,14 +605,41 @@ static mut PENDING_REMOTE_BYE: bool = false;
 /// local echo or interpretation of its own.
 const REMOTE_ABORT_BYTE: u8 = 0x1b;
 
+/// Drains whatever console output has queued up in `console`'s relay
+/// buffer since the last drain and forwards it to `peer` as one
+/// `TERM_TAG_DATA` frame -- the same "drain, then send" step
+/// `term_net`'s own session loop performs every iteration, factored out
+/// so `poll_remote_tape_abort`/`poll_remote_tape_input` can perform it
+/// too. Without this, a nested blocking command's own `putc` output
+/// (which still reaches `console::write_bytes`/`relay_push` exactly like
+/// any other console output) would only ever reach the relay queue, not
+/// the wire, until `term_net`'s own outer loop resumed -- fine for a
+/// one-shot tape whose whole output arrives in one burst once it returns
+/// (see AGENTS.md's `tools/test_term_net_tape_e2e.py` notes), but wrong
+/// for a tape that loops for a long time printing incrementally (an
+/// interactive REPL like `tapes/calc`, or a future long-running
+/// `should_abort` tape that prints progress) -- a remote operator would
+/// otherwise see nothing at all until the whole thing finally exits.
+/// Calling this from both polling helpers below means any `read_key`- or
+/// `should_abort`-based tape gets live output relaying for free, with no
+/// ABI change and no per-tape opt-in required.
+fn relay_pending_tape_output(nic: &rtl8139::Rtl8139, peer: &[u8; 6], source: &[u8; 6]) {
+    let mut chunk = [0u8; TERM_DATA_CAPACITY];
+    let drained = console::drain_relay(&mut chunk);
+    if drained > 0 {
+        send_term_data(nic, peer, source, &chunk[..drained]);
+    }
+}
+
 /// Polls the network card once for a frame from the currently connected
 /// `term_net` peer, if any, on behalf of a nested blocking command (see
 /// `tape_run`) whose own loop has `term_net`'s *own* session loop --
 /// including its `nic.receive` -- paused for as long as it runs. Mirrors
 /// that loop's own frame handling closely enough to stay a reasonable
 /// network citizen even mid-tape (still answering discovery probes from
-/// someone else, still noticing this peer hanging up) without ever
-/// touching anything not addressed to this specific peer.
+/// someone else, still noticing this peer hanging up, still relaying
+/// this tape's own printed output live via `relay_pending_tape_output`)
+/// without ever touching anything not addressed to this specific peer.
 ///
 /// Returns whether the caller's blocking command should stop: either the
 /// peer explicitly asked to (a `TERM_TAG_DATA` frame containing
@@ -635,6 +662,7 @@ fn poll_remote_tape_abort() -> bool {
         return false;
     };
     let Ok(nic) = rtl8139::get() else { return false };
+    relay_pending_tape_output(nic, &peer, &source);
     let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
     let Some(received) = nic.receive(&mut buffer) else { return false };
     let frame = &buffer[..received];
@@ -1403,18 +1431,33 @@ const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 
 /// Polls the network card once, on behalf of `combined_tape_read_key`,
 /// for a byte typed by the `term_net` peer that started this tape --
-/// mirrors `poll_remote_tape_abort`'s framing/discovery-probe handling
-/// closely (see that function's doc comment for why polling here is safe
-/// even mid-tape), but where that function only ever needed to notice one
-/// specific byte and could discard the rest of a payload, this one keeps
-/// every byte: the first is returned immediately, any more are queued in
-/// `TAPE_INPUT_QUEUE` for the next call. A payload containing the abort
-/// byte (`REMOTE_ABORT_BYTE`) anywhere is still treated exactly like
-/// `poll_remote_tape_abort` treats it -- the whole frame is dropped as a
-/// "give up" signal, never fed to a tape as ordinary characters, so a
-/// peer's escape keypress can never accidentally end up echoed into a
-/// tape's own input.
+/// mirrors `poll_remote_tape_abort`'s framing/discovery-probe/output-
+/// relaying handling closely (see that function's doc comment for why
+/// polling here is safe even mid-tape), but where that function only
+/// ever needed to notice one specific byte and could discard the rest of
+/// a payload, this one keeps every byte: the first is returned
+/// immediately, any more are queued in `TAPE_INPUT_QUEUE` for the next
+/// call. A payload containing the abort byte (`REMOTE_ABORT_BYTE`)
+/// anywhere is still treated exactly like `poll_remote_tape_abort`
+/// treats it -- the whole frame is dropped as a "give up" signal, never
+/// fed to a tape as ordinary characters, so a peer's escape keypress can
+/// never accidentally end up echoed into a tape's own input.
+///
+/// Output relaying happens first, unconditionally, even when a queued
+/// `TAPE_INPUT_QUEUE` byte lets this call return immediately afterward --
+/// otherwise a fast-typing peer could keep this function returning from
+/// the queue for several calls in a row without ever reaching the
+/// network-polling code below, leaving whatever the tape had already
+/// printed (e.g. a prompt) stuck in the relay queue for longer than
+/// necessary.
 fn poll_remote_tape_input() -> Option<u32> {
+    if console::relay_enabled() {
+        if let (Some(peer), Some(source)) = (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE }) {
+            if let Ok(nic) = rtl8139::get() {
+                relay_pending_tape_output(nic, &peer, &source);
+            }
+        }
+    }
     if let Some(byte) = tape_input_pop() {
         return Some(TAPE_EVENT_CHAR_BASE | u32::from(byte));
     }

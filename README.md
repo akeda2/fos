@@ -695,15 +695,26 @@ type `tape run`. Two things are worth knowing before relying on this:
 - Only the kernel's own printed messages around a tape -- "Tape loaded",
   "Running N-byte tape...", "Tape returned; back at the fos shell.", and
   so on -- plus the tape's own printed output (like the primes tape's
-  summary; see `tapes/primes.S`) are ever relayed, all as one burst
-  once the command returns (since nothing drains the relay queue while
-  paused inside it). A tape prints by calling back into the kernel's own
-  `console::print_byte` (passed to it as `tape_run`'s first argument)
-  rather than touching VGA/COM1 hardware directly, so its output goes
-  through the exact same combined VGA+serial+relay path as any other
-  command's -- it reaches a remote `term net` client too, just delayed
-  until the tape returns rather than streamed live.
-  `tools/test_term_net_tape_e2e.py` verifies exactly this.
+  summary; see `tapes/primes.S`) are ever relayed. A tape prints by
+  calling back into the kernel's own `console::print_byte` (passed to it
+  as `tape_run`'s first argument) rather than touching VGA/COM1 hardware
+  directly, so its output goes through the exact same combined
+  VGA+serial+relay path as any other command's. For a tape like
+  `tapes/primes.S` that never calls `should_abort`/`read_key` (it takes
+  no input and always runs to completion on its own), this all still
+  arrives as one burst once the tape returns, since nothing drains the
+  relay queue while `term_net`'s own loop is paused waiting for it --
+  `tools/test_term_net_tape_e2e.py` verifies exactly this. But a tape
+  that *does* poll `should_abort`/`read_key` (like `tapes/calc`'s
+  interactive REPL) gets its output relayed live, as it's printed, not
+  just in one final burst: `poll_remote_tape_abort`/
+  `poll_remote_tape_input` (`kernel/src/shell.rs`) also drain and forward
+  the relay queue on every poll, on `term_net`'s behalf, exactly the way
+  they already polled the network card for input/abort bytes -- see
+  AGENTS.md's "Live output relaying for `read_key`/`should_abort`-based
+  tapes over `term net`" section. `tapes/test_calc_e2e.py` verifies this
+  by listening on the wire and confirming the calculator's banner and
+  prompt arrive before any input is even sent.
 
 ### A numbered peer address book for the Python tools too
 

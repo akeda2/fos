@@ -1183,6 +1183,80 @@ proves for a `should_abort`-based tape) all pass, and the same
 immediately afterward. Built with `make tape-calc` (producing
 `build/tapes/calc.bin`).
 
+### Live output relaying for `read_key`/`should_abort`-based tapes over `term net`
+
+Building `tapes/calc` (the first genuinely interactive, potentially
+long-running tape) surfaced a real usability bug the batching design
+described just above never had to face: a remote `term_net` client
+driving the calculator's interactive REPL saw *no* output at all --
+no banner, no prompt, no echoed input, no evaluated result -- until the
+tape finally exited, even though keystrokes typed in the meantime were
+clearly reaching the tape (the REPL visibly responded to them on the
+*local* screen). This is a stronger version of the batching behavior
+documented above for `primes.S`/`tape_load_net`: those are one-shot,
+bounded operations where "everything arrives in one burst once the
+nested command returns" is a minor, acceptable delay; an interactive
+REPL that may run for as long as an operator keeps typing has no
+natural "returns soon" to wait for, so batching there meant a remote
+session looked completely frozen, not merely a little behind.
+
+The root cause was a real asymmetry between this feature's input and
+output sides. `poll_remote_tape_abort`/`poll_remote_tape_input`
+(`kernel/src/shell.rs`) already poll the network card directly, on
+`term_net`'s behalf, so a nested blocking command's `should_abort`/
+`read_key` calls keep working correctly even while `term_net`'s own
+outer loop -- the *only* place that used to drain
+`console`'s relay queue and forward it via `send_term_data` -- is
+completely paused. Nothing equivalent existed for output: a tape's
+`putc` calls still reached `console::relay_push` exactly as before, but
+that queued data just sat there, undrained, for as long as the nested
+command kept running.
+
+The fix is a small, shared helper, `relay_pending_tape_output` (`kernel
+/src/shell.rs`), doing exactly what `term_net`'s own loop already does
+each iteration -- `console::drain_relay` into a `TERM_DATA_CAPACITY`
+buffer, then `send_term_data` if anything came out -- called from both
+`poll_remote_tape_abort` and `poll_remote_tape_input` before either
+does its own network-card polling. `poll_remote_tape_input` in
+particular drains relay output *unconditionally*, even on the fast path
+where a byte is already sitting in `TAPE_INPUT_QUEUE` and would
+otherwise let the function return immediately without ever reaching the
+network-polling code below -- otherwise a quickly-typing remote peer
+could keep this function short-circuiting on queued input for several
+calls in a row, needlessly delaying whatever the tape had already
+printed (e.g. its next prompt). This required no tape ABI change and no
+per-tape opt-in: any `read_key`- or `should_abort`-polling tape gets
+live output relaying automatically, purely because both polling
+functions now happen to also drain output as a side effect.
+
+`tapes/test_calc_e2e.py` was extended with `drain_term_data_for`, which
+actually listens on the simulated wire for `TERM_TAG_DATA` frames
+addressed to the remote test client (something no earlier `term_net`
+e2e test did -- they only ever checked the *local* fos-side QEMU serial
+log, which always looked correct regardless of this bug, since local
+VGA/serial output was never affected). It asserts the interactive mode's
+banner and first prompt reach the wire *before any input is even sent*
+(proving they could only have arrived via live relaying, not as a
+side effect of the tape returning, since nothing sent yet could have
+made it return) and that an evaluated result reaches the wire live too.
+Confirmed both ways: reverting the fix and rerunning this test
+reproduces exactly the reported bug (the assertion fails, with the
+banner/prompt only appearing in a captured buffer after the escape byte
+that ends the tape -- i.e. only once `term_net`'s own loop resumes), and
+with the fix restored the same test passes.
+
+This does **not** change the batching behavior documented above for
+non-polling commands: `tapes/primes.S`'s summary and `tape_load_net`'s
+own wrapper messages still arrive in one burst on return, confirmed
+unchanged by rerunning `tools/test_term_net_tape_e2e.py` unmodified --
+`primes.S` never calls `should_abort`/`read_key` at all (it has no
+input, and always runs to completion), so neither polling function
+above ever executes during its run, and there is nothing new to drain
+on its behalf. The "relay queue only gets drained by `term_net`'s own
+outer loop" claim above is now only accurate for a nested command that
+never calls `should_abort`/`read_key`; any tape that does gets the
+benefit of this fix for free.
+
 ### `term net` stays resident after a remote disconnect
 
 Originally, *any* session-ending event -- local F12, a remote

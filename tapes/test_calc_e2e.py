@@ -19,7 +19,12 @@ itself twice, over that same session:
   `read_key` treats `\\r`/`\\n` as "evaluate now"), then a lone `0x1b`
   Escape byte to leave the REPL the same way
   `tools/test_vga_colors_e2e.py` proves a remote Escape byte stops a
-  `read_key`-based loop.
+  `read_key`-based loop. Also verifies the interactive mode's banner,
+  prompt, and evaluated results actually reach the remote wire *while
+  the tape is still running* (not just after it returns) via
+  `drain_term_data_for`, proving `kernel/src/shell.rs`'s
+  `relay_pending_tape_output` fix for the "no output visible on a
+  remote `term_net` client during a long-running tape" bug.
 
 Not part of `make test` -- this is a manual verification script, kept
 outside kernel/tools proper, matching every other tapes/test_*_e2e.py
@@ -76,6 +81,32 @@ class McastSocket:
 
     def recv(self, size: int) -> bytes:
         return self.sock.recv(size)
+
+
+def drain_term_data_for(mcast: "McastSocket", deadline: float) -> bytes:
+    """Collects every TERM_TAG_DATA payload addressed to TERM_CLIENT_MAC
+    that arrives before `deadline` (a time.monotonic() value), ignoring
+    anything else on the wire (other MACs' chat/discovery traffic, frames
+    for a different destination, ...). Used to prove the relay-draining
+    fix actually reaches the remote wire live, not just that the fos-side
+    QEMU serial log looks right -- the two are not the same thing, since
+    the fix in question is specifically about what gets sent over the
+    network while a tape's own loop is still running."""
+    collected = bytearray()
+    mcast.settimeout(0.05)
+    while time.monotonic() < deadline:
+        try:
+            frame = mcast.recv(2048)
+        except socketlib.timeout:
+            continue
+        if len(frame) < 15:
+            continue
+        destination = frame[0:6]
+        ethertype = tuple(frame[12:14])
+        tag = frame[14]
+        if destination == TERM_CLIENT_MAC and ethertype == CHAT_ETHERTYPE and tag == TERM_TAG_DATA:
+            collected.extend(frame[15:].rstrip(b"\0"))
+    return bytes(collected)
 
 
 def main() -> None:
@@ -166,7 +197,24 @@ def main() -> None:
         del output[:]
 
         # --- Interactive mode: read_key-based REPL ---
+        # This is the specific proof that the term_net relay-draining fix
+        # (poll_remote_tape_abort/poll_remote_tape_input calling
+        # relay_pending_tape_output, see kernel/src/shell.rs) actually
+        # works: the banner/"Press F12"/first "> " prompt are all printed
+        # *before* the tape's read_key loop ever polls for input, so they
+        # can only have reached this wire capture if output relaying
+        # happens while the tape is still blocked in that loop -- nothing
+        # sent to fos yet could possibly have triggered a return. Before
+        # the fix, none of this would appear on the wire until the tape
+        # actually returned (i.e. only after the escape byte below).
+        capture_deadline = time.monotonic() + 3.0
         mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"tape run\n"))
+        wire_data = drain_term_data_for(mcast, capture_deadline)
+        assert b"Press F12" in wire_data, (
+            "the interactive banner/prompt never reached the remote wire while "
+            f"the tape was still running (live relay is broken); captured: {wire_data!r}"
+        )
+        print("PASS: interactive mode's banner/prompt reached the remote client live, before any input was sent.", file=sys.stderr)
         read_until(b"Press F12", 15)
         del output[:]
 
@@ -174,9 +222,14 @@ def main() -> None:
         # zero), and a backspace mid-line (typing "2 2 -", backspacing
         # the second "2", typing "3" instead -- exercising read_key's
         # own backspace handling -- to get "2 3 -" = -1).
+        capture_deadline = time.monotonic() + 3.0
         mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"6 7 *\r"))
+        wire_data = drain_term_data_for(mcast, capture_deadline)
+        assert b"= 42" in wire_data, (
+            f"the evaluated result never reached the remote wire live; captured: {wire_data!r}"
+        )
         read_until(b"= 42", 10)
-        print("PASS: interactive mode evaluated '6 7 *' to 42.", file=sys.stderr)
+        print("PASS: interactive mode evaluated '6 7 *' to 42 (confirmed live on the wire).", file=sys.stderr)
         del output[:]
 
         mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"5 0 /\r"))
