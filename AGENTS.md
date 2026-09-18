@@ -1056,6 +1056,59 @@ or output that only appears over one of VGA/serial, suspect this class of
 gap first -- QEMU's emulated devices are close to real hardware but not a
 perfect model of the more idiosyncratic chipset-level behavior above.
 
+### Talking to a real fos machine from a sandboxed dev environment
+
+`tools/send_tape.py`, `tools/term_net.py`, and `tools/send_frame.py` all
+need raw `AF_PACKET` sockets, which normally require `CAP_NET_RAW` --
+in practice, running as root. A sandboxed environment (such as this
+assistant's own bash tool) is unlikely to have interactive/passwordless
+`sudo`, and running an agent as root for an entire session is not
+something to reach for just to send one Ethernet frame. The workaround
+used throughout this project's real-hardware verification instead grants
+the capability to one dedicated binary, not system-wide:
+
+```sh
+cp "$(command -v python3)" ~/.local/bin/python3-netraw
+sudo setcap cap_net_raw+eip ~/.local/bin/python3-netraw
+```
+
+The `setcap` command itself needs a real, interactive `sudo` prompt, so a
+human has to run it (or at least approve it) once -- an agent should
+never attempt this silently on the user's behalf. After that one-time
+setup, verify it stuck with `getcap ~/.local/bin/python3-netraw`, then
+invoke any of the scripts above through that binary instead of the
+system `python3`:
+
+```sh
+~/.local/bin/python3-netraw tools/send_tape.py --iface wlp2s0 \
+    --discover-timeout 5 build/tapes/hello-rs.bin
+~/.local/bin/python3-netraw tools/term_net.py --iface wlp2s0 \
+    --mac 00:20:18:89:4a:d6 "tape status" "tape run"
+```
+
+Nothing about the copied binary's capability leaks into the ordinary
+`python3` on `PATH` or into any other process -- `cap_net_raw+eip` is
+scoped to that one file's inode, not the user, so this cannot be used to
+raw-socket from any other script or shell command without going through
+`python3-netraw` explicitly.
+
+Two things specific to this kind of environment tripped this up in
+practice, worth checking first if a raw-socket script mysteriously can't
+find the target machine:
+
+- **Interface selection.** `send_tape.py`'s `default_interface()` picks
+  the first "up" interface in alphabetical order; a sandboxed dev box can
+  easily have an unrelated VPN-style interface (alphabetically ordered
+  before the real LAN NIC) that a real fos machine is obviously never
+  reachable through. Always pass `--iface <name>` explicitly (e.g.
+  `--iface wlp2s0`) rather than relying on the default when more than one
+  interface is up.
+- **`send_tape.py`'s `--delay` default.** As covered above, real hardware
+  needs pacing between chunks (`--delay 0.003` is the current default);
+  without it, a real fos machine's polling-only RTL8139 driver can
+  silently overflow its receive ring on a large tape sent from a fast,
+  unpaced sender.
+
 ## Deliberately deferred work
 
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
