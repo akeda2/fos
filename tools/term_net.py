@@ -18,11 +18,14 @@ direction) carries keystrokes one way and shell output the other, and
 
 This tool's primary mode is non-interactive: give it one or more command
 lines on the argument list (or on stdin, one per line, with --stdin), and
-it sends each, waits for a quiet period on the wire (no new output for
---settle seconds) before printing what came back and moving to the next
-one, then sends TERM_TAG_BYE and exits -- well suited to being driven by a
-script rather than a human at a keyboard. Pass --interactive for a raw
-terminal instead, reading from and echoing to this program's own stdin/
+it sends each, waits up to --command-timeout seconds for the first reply
+(generous, since a blocking command like `tape run` produces nothing on
+the wire until it returns), then for a quiet period on the wire (no new
+output for --settle seconds) before printing what came back and moving to
+the next one, then sends TERM_TAG_BYE and exits -- well suited to being
+driven by a script rather than a human at a keyboard. Pass --interactive
+for a raw terminal instead, reading from and echoing to this program's own
+stdin/
 stdout, closer to a real remote login session: this program puts its own
 terminal into cbreak mode (see `run_interactive`) so every keystroke is
 forwarded the instant it is typed, with no waiting for Enter and no local
@@ -105,13 +108,27 @@ def recv_data_frame(raw: socket.socket, source: bytes, peer: bytes, timeout: flo
     return payload[:end]
 
 
-def run_noninteractive(raw: socket.socket, source: bytes, peer: bytes, commands: list[str], settle: float, initial_wait: float) -> None:
+def run_noninteractive(
+    raw: socket.socket, source: bytes, peer: bytes, commands: list[str], settle: float, initial_wait: float, command_timeout: float
+) -> None:
     """Sends each of `commands` as one line, printing whatever text comes
     back before moving to the next: after sending, keeps reading
     TERM_TAG_DATA frames until `settle` seconds pass with none arriving,
     on the assumption that a quiet wire means the shell has finished
     reacting to that command (true for every existing fos command, none
-    of which streams output indefinitely without more input)."""
+    of which streams output indefinitely without more input).
+
+    The *first* wait after sending a command uses the more generous
+    `command_timeout`, not `settle`: a blocking command like `tape run`
+    produces nothing at all on the wire until it returns (see AGENTS.md's
+    "term net stays resident..." section and "the whole burst, never
+    live" note -- term_net's own outer loop, the only thing that ever
+    relays queued output, is paused for the entire nested command), so a
+    short first wait would give up and move on to the next command before
+    a slow one has even started answering, silently dropping its output
+    rather than actually waiting for it. Once at least one frame has
+    arrived, subsequent waits fall back to the short `settle` period,
+    since a quiet wire genuinely means "done" from that point on."""
 
     def drain_output(timeout_first: float) -> bool:
         """Returns whether any output was actually received."""
@@ -129,7 +146,7 @@ def run_noninteractive(raw: socket.socket, source: bytes, peer: bytes, commands:
     connected = drain_output(initial_wait)
     for command in commands:
         send_data(raw, peer, source, command.encode() + b"\n")
-        if drain_output(settle):
+        if drain_output(command_timeout):
             connected = True
 
     # Only say goodbye to a session that was actually established: if
@@ -184,15 +201,50 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
         old_settings = termios.tcgetattr(sys.stdin.fileno())
         tty.setcbreak(sys.stdin.fileno())
 
+    # A blocking remote command like `tape run` (or `tape load net`
+    # waiting on a transfer) produces nothing at all on the wire until it
+    # returns -- see AGENTS.md's "term net stays resident..." section --
+    # so once Enter is sent there is nothing to distinguish "the remote
+    # shell is quietly working" from "the connection died" just by
+    # watching this program's own output. `submitted_at`/`warned_stall`
+    # track that: whenever a chunk containing a carriage return or
+    # newline is forwarded (Enter, in cbreak mode), a timer starts, and
+    # if `STALL_WARNING_SECONDS` pass with no reply at all, a one-time
+    # notice prints to stderr -- deliberately stderr, not stdout, so it
+    # never gets mixed into the remote shell's own terminal content. The
+    # timer resets (and the notice can fire again) the next time a line
+    # is submitted.
+    STALL_WARNING_SECONDS = 1.5
+    submitted_at: float | None = None
+    warned_stall = False
+
     try:
         while True:
-            for key, _ in selector.select():
+            events = selector.select(timeout=0.2)
+            if not events:
+                if (
+                    submitted_at is not None
+                    and not warned_stall
+                    and time.monotonic() - submitted_at > STALL_WARNING_SECONDS
+                ):
+                    print(
+                        "\n(still waiting for the remote shell -- this session has not frozen; a "
+                        "slow command like 'tape run' produces no output at all until it finishes. "
+                        "Press Escape to abort a running tape without ending this session.)",
+                        file=sys.stderr,
+                    )
+                    warned_stall = True
+                continue
+            for key, _ in events:
                 if key.fileobj is sys.stdin:
                     chunk = sys.stdin.buffer.read1(4096)
                     if not chunk:
                         return
                     send_data(raw, peer, source, chunk)
                     connected = True
+                    if b"\r" in chunk or b"\n" in chunk:
+                        submitted_at = time.monotonic()
+                        warned_stall = False
                 else:
                     raw.settimeout(0)
                     try:
@@ -212,6 +264,8 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
                             end -= 1
                         sys.stdout.buffer.write(body[:end])
                         sys.stdout.flush()
+                        submitted_at = None
+                        warned_stall = False
     except KeyboardInterrupt:
         pass
     finally:
@@ -239,6 +293,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--settle", type=float, default=0.5, help="Quiet period (seconds) that ends output collection per command (default: 0.5)."
+    )
+    parser.add_argument(
+        "--command-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for a command's *first* reply before giving up on it (default: 30.0); "
+        "needs to be generous for a slow blocking command like 'tape run', which produces nothing "
+        "on the wire at all until it returns.",
     )
     parser.add_argument(
         "--initial-wait", type=float, default=2.0, help="Seconds to wait for the session banner/first prompt (default: 2.0)."
@@ -295,7 +357,7 @@ def main() -> None:
         if args.interactive:
             run_interactive(raw, source, destination, args.initial_wait)
         else:
-            run_noninteractive(raw, source, destination, commands, args.settle, args.initial_wait)
+            run_noninteractive(raw, source, destination, commands, args.settle, args.initial_wait, args.command_timeout)
 
 
 if __name__ == "__main__":

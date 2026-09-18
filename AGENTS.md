@@ -878,6 +878,38 @@ single-threaded, nested-nothing design, combined with whatever a nested
 command's own output actually goes through -- but are exactly the kind of
 thing worth a regression test given how easy they'd be to silently break.
 
+The one-burst-after-return behavior above has a real client-side
+consequence worth calling out on its own: a long silence on the wire
+while a slow blocking command runs is completely indistinguishable, from
+`term_net.py`'s point of view, from the session having quietly died --
+and both of its modes had (in `--interactive`'s case, still cosmetically
+has, on purpose) to account for that so a working session doesn't *look*
+frozen to an operator watching it.
+- `run_noninteractive` originally used the same short `--settle` period
+  (default 0.5s) as its *first* wait after sending every command, not
+  just for detecting when a burst of output has finished. That's fine
+  for quick commands, but a genuinely slow one like `tape run` produces
+  nothing at all for as long as it runs -- so the first wait would
+  time out, `drain_output` would report nothing received, and the
+  client would move on to the next command (or send `TERM_TAG_BYE` and
+  exit) having silently missed that command's entire output once it
+  finally did arrive. Fixed by giving the *first* wait after each sent
+  command its own, far more generous `--command-timeout` (default 30s),
+  while `--settle` keeps its original, short-and-tight job of ending
+  collection once output has actually started arriving and then goes
+  quiet.
+- `--interactive` has no analogous correctness bug -- it just keeps
+  reading forever, so a slow command was always eventually going to
+  produce its output -- but from a human's perspective, several seconds
+  of a seemingly stuck cursor right after pressing Enter (for `tape load
+  net`/`tape run` in particular) reads exactly like a crash. It now
+  tracks the last time a line was submitted (a forwarded chunk
+  containing `\r`/`\n`) and, if `STALL_WARNING_SECONDS` (1.5s) pass with
+  no reply at all, prints a one-time reassurance to stderr -- stderr
+  specifically, so it can never get mixed into the remote shell's own
+  terminal content on stdout, and one-time per submitted line so it
+  doesn't nag once a slow command is already known to be running.
+
 ### Tape ABI grows alloc/free: using the rest of the machine's RAM
 
 Every tape up to this point was limited to its own fixed 4 MiB region
