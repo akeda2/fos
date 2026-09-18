@@ -476,6 +476,34 @@ sends `TERM_TAG_BYE` and exits -- e.g. `tools/term_net.py "about" "nic"
 from and writing to this program's own stdin/stdout, closer to a real
 remote login for a human at a keyboard.
 
+Because `tape load net`/`tape run` are ordinary commands dispatched
+through the same `execute()`, they work over `term net` too, with no
+special-case integration: a remote client can type `tape load net`, have
+some other machine (or another fos host) send a tape at the usual
+`send_tape.py` targeting the fos machine's own MAC address (that sender
+does not need to know or care a `term net` session is even open), then
+type `tape run`. Two things are worth knowing before relying on this:
+
+- Neither command is interruptible remotely while it runs: like any
+  command that blocks in its own local polling loop, `tape load net`
+  (waiting for tape frames) and `tape run` (running the tape) pause
+  `term_net`'s own outer loop -- including the relay-queue drain and the
+  `TERM_TAG_BYE`/keystroke handling that loop does -- until they return.
+  A remote client's keystrokes or even a `TERM_TAG_BYE` sent while one is
+  in flight are silently dropped, not queued; only local F12 can interrupt
+  `tape load net` early, and `tape run` cannot be interrupted at all once
+  started (same as running it locally).
+- Only the kernel's own printed messages around a tape -- "Tape loaded",
+  "Running N-byte tape...", "Tape returned; back at the fos shell.", and
+  so on -- are ever relayed, and only as one burst once the command
+  returns (since nothing drains the relay queue while paused inside it).
+  A tape's *own* printed output (like the primes tape's summary; see
+  `tools/tapes/primes.S`) writes directly to VGA/COM1 hardware, bypassing
+  the relay queue entirely -- it is only ever visible to whoever is
+  physically at that machine's own screen, never to a remote `term net`
+  client. `tools/test_term_net_tape_e2e.py` verifies both of these exactly
+  this way.
+
 
 ## Booting from a NIC ROM
 

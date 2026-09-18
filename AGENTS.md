@@ -544,6 +544,35 @@ Verified end-to-end against a live QEMU multicast netdev (mirroring
 relayed a couple of ordinary commands' full output (including their
 prompts) back over the wire, and cleanly disconnected on `TERM_TAG_BYE`.
 
+A follow-up worth noting for anyone extending `term net` further: since
+`tape load net`/`tape run` are dispatched through the exact same
+`execute()` as every other command, they already work unmodified from
+inside a `term_net` session -- confirmed by `tools/test_term_net_tape_e2e.py`,
+which connects over `term net`, remotely runs `tape load net`, has a
+*third*, unrelated MAC send the tape (exactly as an independent
+`send_tape.py` run elsewhere on the LAN would, with no awareness the
+`term_net` session even exists), then remotely runs `tape run`. Both
+commands' own blocking loops (`tape_load_net`'s frame-wait loop,
+`tape_run`'s call into the tape) nest directly inside `term_net`'s outer
+loop, which is what predicts -- and the test asserts -- two consequences
+rather than surprises:
+- The relay queue only gets drained by `term_net`'s own outer loop, which
+  is paused for the entire time a nested command blocks. So every kernel-
+  printed line around a tape (`Tape loaded: ...`, `Running N-byte tape...`,
+  `Tape returned; back at the fos shell.`) reaches the remote client only
+  as one burst once the nested command returns, never live.
+- `primes.S`'s own summary output writes VGA/COM1 directly (see the tape
+  section above), entirely bypassing `console::write_serial` and thus the
+  relay queue -- so it appears on QEMU's raw serial stream (or, on real
+  hardware, the physical screen) exactly as it always did, but never in a
+  single `TERM_TAG_DATA` frame sent to the remote client. A remote
+  operator can load and run a tape, but only a local operator ever sees
+  what it actually prints.
+Neither of these needed any code change to work correctly -- they follow
+directly from `term_net`'s existing single-threaded, nested-nothing design
+-- but are exactly the kind of thing worth a regression test given how
+easy they'd be to silently break.
+
 ## Real hardware notes
 
 QEMU is this project's primary validation environment, but a few behaviors
