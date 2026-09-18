@@ -173,14 +173,20 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
 
     Puts this program's own stdin into cbreak mode (see the `tty` module)
     when it is a real terminal: canonical line buffering and local echo
-    are both off, but Ctrl-C/Ctrl-D still raise the usual
-    KeyboardInterrupt/EOF this function already handles, since cbreak
-    mode -- unlike full raw mode -- leaves signal-generating characters
-    alone. Without this, every keystroke (including a lone Escape) would
-    sit unsent in this program's own input buffer until Enter was
-    pressed, which defeats `kernel/src/shell.rs`'s `REMOTE_ABORT_BYTE`
-    check entirely: that check needs to see a single 0x1b byte arrive on
-    its own, not batched together with whatever is typed next."""
+    are both off. Ctrl-C still raises the usual KeyboardInterrupt this
+    function already handles, since cbreak mode -- unlike full raw mode --
+    leaves signal-generating characters alone. Ctrl-D is different: EOF-
+    on-Ctrl-D is purely a canonical-mode feature of the tty driver, so
+    with ICANON off it has no special meaning to the terminal at all and
+    would otherwise just arrive as an ordinary 0x04 byte -- the read loop
+    below watches for that explicitly instead, to keep Ctrl-D ending the
+    session the way a human typing it here would expect. Cbreak mode
+    (rather than canonical mode, or full raw mode) matters here because
+    every keystroke (including a lone Escape) needs to reach the remote
+    shell the instant it's typed, not batched together with whatever is
+    typed next: canonical mode would hold everything until Enter, which
+    defeats `kernel/src/shell.rs`'s `REMOTE_ABORT_BYTE` check entirely,
+    since that check needs to see a single 0x1b byte arrive on its own."""
     print(
         "Interactive session; Escape aborts a running remote command (like `tape run`) "
         "without ending this session; Ctrl-C or Ctrl-D ends the session itself (sends TERM_TAG_BYE).",
@@ -235,6 +241,24 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
                 if key.fileobj is sys.stdin:
                     chunk = sys.stdin.buffer.read1(4096)
                     if not chunk:
+                        return
+                    # In cbreak mode (unlike the line-buffered/canonical
+                    # mode a plain terminal starts in) ICANON is off, and
+                    # EOF-on-Ctrl-D is purely a canonical-mode feature of
+                    # the tty driver -- with it off, Ctrl-D has no special
+                    # meaning to the terminal at all, and just arrives
+                    # here as an ordinary 0x04 byte alongside whatever
+                    # else was typed, rather than as an empty `read1`
+                    # the way it would in canonical mode. Recognize it
+                    # explicitly so Ctrl-D still ends the session locally
+                    # (matching this function's own banner text above),
+                    # instead of forwarding a stray 0x04 byte to a remote
+                    # shell that has no use for it.
+                    if b"\x04" in chunk:
+                        before = chunk[: chunk.index(b"\x04")]
+                        if before:
+                            send_data(raw, peer, source, before)
+                            connected = True
                         return
                     send_data(raw, peer, source, chunk)
                     connected = True

@@ -587,10 +587,13 @@ sends `TERM_TAG_BYE` and exits -- e.g. `tools/term_net.py "about" "nic"
 "ls"`. `--interactive` instead opens a raw pass-through session reading
 from and writing to this program's own stdin/stdout, closer to a real
 remote login for a human at a keyboard; it puts its own stdin into
-cbreak mode (no line buffering, no local echo, but Ctrl-C/Ctrl-D still
-work as they always did) so every keystroke -- including a lone Escape,
-used to abort a currently running remote command like `tape run` without
-ending the session, see "A local keypress isn't enough: remote abort via
+cbreak mode (no line buffering, no local echo; Ctrl-C still raises
+KeyboardInterrupt as usual, and Ctrl-D is recognized explicitly by the
+read loop itself to still end the session, since cbreak mode's ICANON-
+off means the tty driver no longer treats it as EOF the way canonical
+mode would) so every keystroke -- including a lone Escape, used to abort
+a currently running remote command like `tape run` without ending the
+session, see "A local keypress isn't enough: remote abort via
 `poll_remote_tape_abort`" in AGENTS.md -- reaches the fos kernel the
 instant it's typed, not batched together with whatever comes next.
 
