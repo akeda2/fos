@@ -77,7 +77,11 @@ status messages (e.g. which BIOS interrupt is being called, what a PIC remap
 or IDT load accomplishes), not just announce bare completion. When adding a
 boot step or kernel subsystem, prefer an explanatory message over a terse one,
 and keep `README.md`'s command table and "What happens at boot" walkthrough in
-sync with the actual command surface and boot sequence.
+sync with the actual command surface and boot sequence. Inline documentation
+is mandatory for new hardware-facing code and new educational examples:
+explain the relevant ABI, register/port behavior, timing assumptions, and
+why the implementation follows the project's constraints rather than leaving
+those details implicit.
 
 ## Disk image and safety
 
@@ -114,6 +118,14 @@ make help     # Lists every target with a one-line description.
 Always run `make test` for boot, loader, kernel, shell, disk, or FOSFS changes.
 The smoke harness must use bounded waits, preserve serial output on failure,
 and wait for the prompt before sending input.
+
+Every new tape must include a focused test alongside its implementation, as
+`tapes/test_beep_e2e.py` does for `tapes/beep/`. Tape tests should exercise
+the tape through its documented load/run path and verify observable behavior
+end to end; when hardware output cannot be captured directly, assert a
+documented diagnostic or callback-visible result and verify control returns to
+the shell. A successful build alone is not sufficient validation for a new
+tape.
 
 When debugging 16-bit real-mode code (`stage1.S`, `stage2.S`, `netrom.S`),
 always disassemble with `objdump -d -M i8086 <object-file>`. Plain

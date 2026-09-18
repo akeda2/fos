@@ -83,9 +83,9 @@ plain `make` (still just `make image`) and does not affect `image`/`run`/
 `test`, but is included in `make all` (see below).
 
 `make all` builds everything this repository knows how to produce in one
-go: the image, `make netrom`, and every test tape (`make tapes`, i.e.
-`tape-primes`/`tape-hello-rs`/`tape-vga-colors` -- see "Tape (`tape`)"
-below). Not needed for ordinary kernel/boot work, for which plain `make`
+go: the image, `make netrom`, and every test tape (`make tapes`, including
+`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-beep` -- see "Tape
+(`tape`)" below). Not needed for ordinary kernel/boot work, for which plain `make`
 (equivalent to `make image`) is enough. `make help` lists every target
 with a one-line description.
 
@@ -551,6 +551,20 @@ both modes: startup-argument evaluation, an interactive session
 including a backspace correction and a division-by-zero error, and a
 remote Escape byte cleanly ending the REPL without disconnecting the
 `term_net` session driving it.
+
+#### Test tape: `tapes/beep/`
+
+A small 32-bit Rust tape using the newest seven-argument ABI and the
+`read_key` callback. It waits for the lowercase or shifted `b` key from
+either the local keyboard or an active `term net` session, programs PIT
+channel 2 to drive the PC speaker at 440 Hz for approximately 100 ms, then
+silences it. Each accepted key also prints `Beep.` so the behavior is
+observable in serial/remote-terminal tests. Press F12 (or F4/F6/F7/F8/F10)
+to return to the shell. Build it with `make tape-beep` (producing
+`build/tapes/beep.bin`), send it with `tools/send_tape.py`, run `tape load
+net`, then execute `tape run`. The manual QEMU regression test is
+`tapes/test_beep_e2e.py`; it exercises both remote and local `b` input and
+checks that the remote shell remains usable afterward.
 
 #### Test tape: `tapes/longmode.S` / `tapes/longmode-rs/`
 
