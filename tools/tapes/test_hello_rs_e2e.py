@@ -3,14 +3,26 @@
 running fos QEMU instance over a real (emulated) Ethernet link, run it,
 and check that its printed summary matches the known-correct answer (168
 primes <= 1,000, largest one 997) -- the same idea as
-test_primes_e2e.py, just proving the *Rust* tape (not the hand-written
-assembly one) works end to end once loaded at the fixed tape address.
+test_primes_e2e.py, just proving the *Rust* tape works end to end.
+
+Drives everything through one continuous `term net` session established
+right after boot (see `shell::run`'s automatic wait): since `term_net`
+(kernel/src/shell.rs) now loops back to waiting for a new client instead
+of falling through to the local shell whenever a remote session ends (see
+AGENTS.md's "Remote terminal (`term net`)" section), there is no longer a
+"connect, then disconnect to reach the local prompt" trick to fall back
+on -- so `nic`/`tape load net`/`tape run` are all typed into that one
+session instead of QEMU's own stdin. The tape's bytes themselves still
+come from a second, independent MAC (mirroring an ordinary `send_tape.py`
+run from another machine, unrelated to the term_net session), exactly the
+way `tools/test_term_net_tape_e2e.py` already does it.
 
 Not part of `make test` -- this is a manual verification script, kept
-outside kernel/tools proper. Requires no root: QEMU's `socket,mcast=`
-netdev is a plain UDP multicast socket carrying one raw Ethernet frame
-per datagram, so a normal unprivileged UDP socket can inject/observe
-frames without CAP_NET_RAW.
+outside kernel/tools proper, mirroring the throwaway harness used earlier
+in this project's history to validate `tape load net` itself. Requires no
+root: QEMU's `socket,mcast=` netdev is a plain UDP multicast socket
+carrying one raw Ethernet frame per datagram, so a normal unprivileged UDP
+socket can inject/observe frames without CAP_NET_RAW.
 """
 
 import re
@@ -26,13 +38,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import send_tape  # noqa: E402
 
-MCAST_GROUP = "230.42.42.42"
-MCAST_PORT = 4242
+MCAST_GROUP = "230.42.42.49"
+MCAST_PORT = 4249
 IMAGE = Path(__file__).resolve().parent.parent.parent / "build" / "fos.img"
 TAPE = Path(__file__).resolve().parent.parent.parent / "build" / "tapes" / "hello-rs.bin"
-HOST_MAC = bytes.fromhex("02deadbeef01")
+TERM_CLIENT_MAC = bytes.fromhex("02deadbeef09")
+TAPE_SENDER_MAC = bytes.fromhex("02deadbeef0a")
 CHAT_ETHERTYPE = (0x88, 0xB6)
 TERM_TAG_HELLO = 0x20
+TERM_TAG_DATA = 0x21
 TERM_TAG_BYE = 0x22
 
 
@@ -99,10 +113,6 @@ def main() -> None:
                 output.extend(chunk)
         return bytes(output)
 
-    def send_line(line: str) -> None:
-        qemu.stdin.write((line + "\n").encode())
-        qemu.stdin.flush()
-
     def term_frame(destination: bytes, source: bytes, tag: int, payload: bytes = b"") -> bytes:
         frame = bytearray(destination + source + bytes(CHAT_ETHERTYPE) + bytes([tag]) + payload)
         if len(frame) < 60:
@@ -112,25 +122,19 @@ def main() -> None:
     try:
         # fos now runs `term net` automatically at boot (see shell::run/
         # AGENTS.md), waiting for a remote terminal client before it ever
-        # shows the "fos> " prompt. This test doesn't want a term net
-        # session at all, just the ordinary local prompt to type
-        # `tape load net` into -- so it connects and immediately
-        # disconnects one, the same skip-past trick
-        # tools/test_term_net_tape_e2e.py already relies on.
+        # shows the local "fos> " prompt. Connect once and stay connected
+        # for the rest of this test -- see this file's own header comment
+        # for why disconnecting no longer reaches a local prompt to fall
+        # back on.
         read_until(b"Waiting for a remote terminal client to connect", 30)
         del output[:]
         mcast = McastSocket(MCAST_GROUP, MCAST_PORT)
-        mcast.send(term_frame(b"\xff" * 6, HOST_MAC, TERM_TAG_HELLO))
+        mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_HELLO))
         read_until(b"Remote terminal connected", 10)
-        read_until(b"fos> ", 5)  # the initial in-session prompt
-        del output[:]  # clear it so it can't be mistaken for the post-disconnect prompt below
-        mcast.send(term_frame(b"\xff" * 6, HOST_MAC, TERM_TAG_BYE))
-        read_until(b"Remote terminal disconnected", 10)
-        read_until(b"fos> ", 10)
-        del output[:]
+        read_until(b"fos> ", 5)
         del output[:]
 
-        send_line("nic")
+        mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"nic\n"))
         read_until(b"fos> ", 10)
         match = re.search(rb"RTL8139 found: MAC ([0-9a-fA-F:]{17})", bytes(output))
         if not match:
@@ -139,12 +143,12 @@ def main() -> None:
         print(f"fos MAC: {send_tape.format_mac(fos_mac)}", file=sys.stderr)
         del output[:]
 
-        send_line("tape load net")
+        mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"tape load net\n"))
         time.sleep(0.5)  # give the shell a moment to enter its receive-wait loop
 
         data = TAPE.read_bytes()
-        print(f"sending {len(data)}-byte tape...", file=sys.stderr)
-        send_tape.send_tape(mcast, fos_mac, HOST_MAC, data, delay=0.003)
+        print(f"sending {len(data)}-byte tape from an independent sender...", file=sys.stderr)
+        send_tape.send_tape(mcast, fos_mac, TAPE_SENDER_MAC, data, delay=0.003)
 
         read_until(b"fos> ", 30)
         if b"Tape loaded" not in output:
@@ -152,7 +156,7 @@ def main() -> None:
         print("tape loaded OK", file=sys.stderr)
         del output[:]
 
-        send_line("tape run")
+        mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"tape run\n"))
         read_until(b"Tape returned; back at the fos shell.", 30)
         text = output.decode("utf-8", "replace")
         print(text)
@@ -160,6 +164,8 @@ def main() -> None:
         assert "primes found:  168" in text, "prime count mismatch"
         assert "largest prime: 997" in text, "largest prime mismatch"
         print("PASS: hello-rs tape produced the correct summary.", file=sys.stderr)
+
+        mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_BYE))
     finally:
         qemu.terminate()
         try:

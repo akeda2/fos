@@ -469,24 +469,32 @@ read entirely (this is an exclusive takeover, not a mirrored session);
 everything the shell prints is captured by the relay queue and forwarded
 as `TERM_TAG_DATA` frames; and incoming `TERM_TAG_DATA` payload bytes are
 fed byte-by-byte into the same `LineEditor` a local keyboard would drive.
-A `TERM_TAG_BYE` frame from either side ends the session and returns
-control to the local console. Like `tape load net`/`chat`, it keeps
-answering `CHAT_TAG_DISCOVER_REQUEST` probes the whole time it runs,
-before and during a connected session, so leaving `term net` open is
-enough to make a machine discoverable.
+A `TERM_TAG_BYE` frame from the *remote* peer (or the remote end simply
+going away) ends only that one session -- `term net` then loops back to
+waiting for a fresh `TERM_TAG_HELLO` instead of falling through to the
+local console, so the machine stays reachable over the network with no
+manual step required to re-arm it. Only a *local* "give up" key press
+(F12/F4/F6/F7/F8/F10) ends the wait for good and hands control to the
+local console. Like `tape load net`/`chat`, it keeps answering
+`CHAT_TAG_DISCOVER_REQUEST` probes the whole time it runs, whether
+waiting or connected, so leaving `term net` open is enough to make a
+machine discoverable.
 
 fos now starts a `term net` wait automatically at every boot, before the
 ordinary interactive prompt ever appears -- so every fos machine is
 reachable over the network by default, with no manual step, which
 matters most for a machine with no attached screen/keyboard at all. A
 local operator watching a real screen presses one of the "give up" keys
-below to skip straight to the interactive prompt instead; if a remote
-client connects first, disconnecting (from either end) falls through to
-that same local prompt afterward, exactly as a manually typed `term net`
-session always has. There is no serial equivalent of "give up" for this
-wait (same limitation `chat`/`term` already have): a serial-only operator
-reaches the local prompt the same way this project's own tests do -- have
-any peer connect and then disconnect.
+below to skip straight to the interactive prompt instead; a remote peer
+connecting and then disconnecting does *not* reach that local prompt --
+it only resets the wait for the next remote peer, exactly as a manually
+typed `term net` session now behaves too. There is no serial equivalent
+of "give up" for this wait (same limitation `chat`/`term` already have),
+and unlike before, a serial-only operator can no longer reach the local
+prompt by having any peer connect and disconnect either -- the intended
+path for a serial-only machine is to drive it entirely over `term net`
+itself (or a wired local keyboard, even briefly, to press one of the
+"give up" keys once).
 
 "Give up" recognizes six function keys, not just F12: F12, F4, F6, F7,
 F8, and F10 (see `keyboard::ESCAPE_SCANCODES`). F12 was always chosen for

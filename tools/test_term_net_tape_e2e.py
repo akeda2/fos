@@ -133,10 +133,6 @@ def main() -> None:
                     raise SystemExit(f"QEMU serial stream ended early:\n{output.decode('utf-8', 'replace')}")
                 output.extend(chunk)
 
-    def send_line(line: str) -> None:
-        qemu.stdin.write((line + "\n").encode())
-        qemu.stdin.flush()
-
     mcast = McastSocket(MCAST_GROUP, MCAST_PORT)
     mcast.settimeout(0.2)
     relayed = bytearray()
@@ -162,39 +158,34 @@ def main() -> None:
     try:
         # fos now runs `term net` automatically at boot (see shell::run/
         # AGENTS.md), waiting for a remote terminal client before it ever
-        # shows the "fos> " prompt. Connect and immediately disconnect one
-        # to skip past that automatic wait and reach the ordinary local
-        # prompt below, same trick tools/tapes/test_primes_e2e.py uses --
-        # this test's own, later, deliberately-typed "term net" session is
-        # unrelated to this automatic one.
+        # shows the local "fos> " prompt. Connect once here and stay
+        # connected for the entire test: term_net (kernel/src/shell.rs)
+        # now loops back to waiting for a new client instead of falling
+        # through to the local shell whenever a remote session ends, so
+        # there is no "connect, then disconnect to reach the local
+        # prompt" trick left to fall back on, and no need for a second,
+        # separately-typed "term net" session either -- one continuous
+        # session covers both the MAC lookup and the nested tape commands
+        # below.
         read_until(b"Waiting for a remote terminal client to connect", 30)
         del output[:]
         mcast.send(term_frame(BROADCAST_MAC, TERM_CLIENT_MAC, TERM_TAG_HELLO))
         read_until(b"Remote terminal connected", 10)
         read_until(b"fos> ", 5)  # the initial in-session prompt
-        del output[:]  # clear it so it can't be mistaken for the post-disconnect prompt below
-        mcast.send(term_frame(BROADCAST_MAC, TERM_CLIENT_MAC, TERM_TAG_BYE))
-        read_until(b"Remote terminal disconnected", 10)
-        read_until(b"fos> ", 10)
+        print("term net session established", file=sys.stderr)
         del output[:]
+        drain_relay_frames(time.monotonic() + 0.3)
+        del relayed[:]
 
-        # Learn fos's own MAC address locally first (term_net's HELLO-wait
-        # loop doesn't read local keyboard commands once entered).
-        send_line("nic")
+        # Learn fos's own MAC address remotely too (there's no local
+        # prompt to fall back on anymore).
+        mcast.send(term_frame(BROADCAST_MAC, TERM_CLIENT_MAC, TERM_TAG_DATA, b"nic\n"))
         read_until(b"fos> ", 10)
         match = re.search(rb"RTL8139 found: MAC ([0-9a-fA-F:]{17})", bytes(output))
         if not match:
             raise SystemExit(f"couldn't find fos's MAC address in:\n{output.decode('utf-8', 'replace')}")
         fos_mac = send_tape.parse_mac(match.group(1).decode())
         print(f"fos MAC: {send_tape.format_mac(fos_mac)}", file=sys.stderr)
-        del output[:]
-
-        send_line("term net")
-        time.sleep(0.5)
-
-        mcast.send(term_frame(BROADCAST_MAC, TERM_CLIENT_MAC, TERM_TAG_HELLO))
-        read_until(b"Remote terminal connected", 10)
-        print("term net session established", file=sys.stderr)
         del output[:]
         drain_relay_frames(time.monotonic() + 0.3)
         del relayed[:]

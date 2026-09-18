@@ -425,9 +425,13 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
 ///   including running `execute` on Enter.
 /// - Local VGA/PS/2 input is *not* read at all while connected (this
 ///   session is exclusive, not mirrored): the only way to interrupt it
-///   locally is F12 (or F4/F6/F7/F8/F10), which sends `TERM_TAG_BYE` to the peer before
-///   returning. The peer may also end the session first by sending its
-///   own `TERM_TAG_BYE`.
+///   locally is F12 (or F4/F6/F7/F8/F10), which sends `TERM_TAG_BYE` to the peer and
+///   returns control to the local shell for good. If the *peer* ends the
+///   session first (its own `TERM_TAG_BYE`, or it simply vanishes and a
+///   later `HELLO` from someone else arrives), this does not return either
+///   -- it goes back to waiting for a new client instead, so the only way
+///   to actually leave `term net` and reach the local shell is the local
+///   escape key, never a remote disconnect.
 ///
 /// Like `tape_load_net`, this answers any `CHAT_TAG_DISCOVER_REQUEST` it
 /// sees the whole time it runs -- both before a client has connected and
@@ -438,93 +442,116 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
 /// `shell::run` calls this once automatically at every boot, before the
 /// ordinary interactive prompt, so every fos machine is reachable over
 /// `term net` by default with no manual step -- this matters most for a
-/// machine with no attached screen/keyboard. A local operator watching a
-/// real screen presses F12 (or F4/F6/F7/F8/F10) to skip the wait and get
-/// the interactive prompt immediately; there is deliberately no serial
-/// equivalent (same limitation `chat` already documents), since reading
-/// one byte here to mean "give up" would silently eat the first
-/// character of whatever a serial operator was about to type. A
-/// serial-only operator can still reach the local prompt by having any
-/// peer connect and then disconnect (`TERM_TAG_HELLO` then
-/// `TERM_TAG_BYE`), which is exactly the trick this project's own net
-/// e2e tests use to skip past this automatic wait.
+/// machine with no attached screen/keyboard. Because a finished remote
+/// session loops back to waiting rather than returning, this call
+/// effectively keeps the machine remotely reachable indefinitely: the
+/// local interactive prompt below it in `run` is only ever reached by a
+/// local operator's own escape key, at any point -- while waiting or
+/// while a session is active -- never by a remote peer disconnecting on
+/// its own. A local operator watching a real screen presses F12 (or
+/// F4/F6/F7/F8/F10) to skip the wait and get the interactive prompt
+/// immediately; there is deliberately no serial equivalent (same
+/// limitation `chat` already documents), since reading one byte here to
+/// mean "give up" would silently eat the first character of whatever a
+/// serial operator was about to type. Unlike before, a serial-only
+/// operator can no longer fall back on "have any peer connect and then
+/// disconnect" to reach the local prompt either, now that a remote
+/// disconnect re-arms the wait instead of returning -- a serial-only
+/// machine is meant to be driven entirely over `term net` itself, or
+/// have a local keyboard attached briefly just to press one of the
+/// "give up" keys once.
 fn term_net(info: &BootInfo) {
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
     println!("Waiting for a remote terminal client to connect; press F12 (or F4/F6/F7/F8/F10) to give up.");
 
     let mut recv_buffer = [0u8; rtl8139::MAX_FRAME_LEN];
-    let peer = loop {
-        if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
-            println!("Gave up waiting for a remote terminal client.");
+    loop {
+        let peer = loop {
+            if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
+                println!("Gave up waiting for a remote terminal client.");
+                return;
+            }
+            if let Some(received) = nic.receive(&mut recv_buffer) {
+                let frame = &recv_buffer[..received];
+                if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+                    continue;
+                }
+                let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+                match frame[14] {
+                    TERM_TAG_HELLO => break peer_mac,
+                    CHAT_TAG_DISCOVER_REQUEST => {
+                        remember_peer(peer_mac);
+                        send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY);
+                        println!("\n(replied to a discovery probe from {})", Mac(&peer_mac));
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        println!("Remote terminal connected from {}. Local input is disabled; F12 (or F4/F6/F7/F8/F10) disconnects it.", Mac(&peer));
+        console::enable_relay();
+        let mut editor = LineEditor::new();
+        let mut relay_chunk = [0u8; TERM_DATA_CAPACITY];
+        prompt();
+
+        // Tracks *why* the session below ended: only a local escape key
+        // press should ever fall through to the local shell (see this
+        // function's own doc comment) -- a remote `TERM_TAG_BYE` instead
+        // loops back to waiting for a new client.
+        let mut local_escape = false;
+        'session: loop {
+            let drained = console::drain_relay(&mut relay_chunk);
+            if drained > 0 {
+                send_term_data(nic, &peer, &source, &relay_chunk[..drained]);
+            }
+
+            if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
+                send_term_control(nic, &peer, &source, TERM_TAG_BYE);
+                local_escape = true;
+                break 'session;
+            }
+
+            if let Some(received) = nic.receive(&mut recv_buffer) {
+                let frame = &recv_buffer[..received];
+                if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+                    continue;
+                }
+                let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
+                if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
+                    remember_peer(frame_source);
+                    send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
+                    continue;
+                }
+                if frame_source != peer {
+                    continue;
+                }
+                match frame[14] {
+                    TERM_TAG_BYE => break 'session,
+                    TERM_TAG_DATA => {
+                        let payload = &frame[15..];
+                        let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
+                        for &byte in &payload[..end] {
+                            editor.feed(byte, info);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        console::disable_relay();
+        if local_escape {
+            println!("\nRemote terminal disconnected; back at the local fos shell.");
             return;
         }
-        if let Some(received) = nic.receive(&mut recv_buffer) {
-            let frame = &recv_buffer[..received];
-            if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
-                continue;
-            }
-            let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
-            match frame[14] {
-                TERM_TAG_HELLO => break peer_mac,
-                CHAT_TAG_DISCOVER_REQUEST => {
-                    remember_peer(peer_mac);
-                    send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY);
-                    println!("\n(replied to a discovery probe from {})", Mac(&peer_mac));
-                }
-                _ => {}
-            }
-        }
-    };
-
-    println!("Remote terminal connected from {}. Local input is disabled; F12 (or F4/F6/F7/F8/F10) disconnects it.", Mac(&peer));
-    console::enable_relay();
-    let mut editor = LineEditor::new();
-    let mut relay_chunk = [0u8; TERM_DATA_CAPACITY];
-    prompt();
-
-    'session: loop {
-        let drained = console::drain_relay(&mut relay_chunk);
-        if drained > 0 {
-            send_term_data(nic, &peer, &source, &relay_chunk[..drained]);
-        }
-
-        if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
-            send_term_control(nic, &peer, &source, TERM_TAG_BYE);
-            break 'session;
-        }
-
-        if let Some(received) = nic.receive(&mut recv_buffer) {
-            let frame = &recv_buffer[..received];
-            if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
-                continue;
-            }
-            let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
-            if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
-                remember_peer(frame_source);
-                send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
-                continue;
-            }
-            if frame_source != peer {
-                continue;
-            }
-            match frame[14] {
-                TERM_TAG_BYE => break 'session,
-                TERM_TAG_DATA => {
-                    let payload = &frame[15..];
-                    let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
-                    for &byte in &payload[..end] {
-                        editor.feed(byte, info);
-                    }
-                }
-                _ => {}
-            }
-        }
+        println!(
+            "\nRemote terminal disconnected; waiting for a new one to connect (F12 (or F4/F6/F7/F8/F10) to stop and use the local shell)."
+        );
     }
-
-    console::disable_relay();
-    println!("\nRemote terminal disconnected; back at the local fos shell.");
 }
+
 
 /// Sends `data` as one `TERM_TAG_DATA` frame to `destination`, silently
 /// dropping it on a card error the same way `send_chat_line` does -- a lost
