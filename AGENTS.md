@@ -905,10 +905,12 @@ frozen to an operator watching it.
   net`/`tape run` in particular) reads exactly like a crash. It now
   tracks the last time a line was submitted (a forwarded chunk
   containing `\r`/`\n`) and, if `STALL_WARNING_SECONDS` (1.5s) pass with
-  no reply at all, prints a one-time reassurance to stderr -- stderr
+  no reply at all, prints a brief `...` heartbeat to stderr -- stderr
   specifically, so it can never get mixed into the remote shell's own
-  terminal content on stdout, and one-time per submitted line so it
-  doesn't nag once a slow command is already known to be running.
+  terminal content on stdout, kept to three dots rather than a sentence
+  so it reads as "still alive", not an alarming wall of text, and fires
+  once per submitted line so it doesn't nag once a slow command is
+  already known to be running.
 
 ### Tape ABI grows alloc/free: using the rest of the machine's RAM
 

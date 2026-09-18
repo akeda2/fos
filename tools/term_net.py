@@ -209,11 +209,12 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
     # watching this program's own output. `submitted_at`/`warned_stall`
     # track that: whenever a chunk containing a carriage return or
     # newline is forwarded (Enter, in cbreak mode), a timer starts, and
-    # if `STALL_WARNING_SECONDS` pass with no reply at all, a one-time
-    # notice prints to stderr -- deliberately stderr, not stdout, so it
-    # never gets mixed into the remote shell's own terminal content. The
-    # timer resets (and the notice can fire again) the next time a line
-    # is submitted.
+    # if `STALL_WARNING_SECONDS` pass with no reply at all, a short "..."
+    # prints to stderr -- deliberately stderr, not stdout, so it never
+    # gets mixed into the remote shell's own terminal content, and
+    # deliberately brief so it reads as a heartbeat rather than an alarm.
+    # The timer resets (and the notice can fire again) the next time a
+    # line is submitted.
     STALL_WARNING_SECONDS = 1.5
     submitted_at: float | None = None
     warned_stall = False
@@ -227,12 +228,7 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
                     and not warned_stall
                     and time.monotonic() - submitted_at > STALL_WARNING_SECONDS
                 ):
-                    print(
-                        "\n(still waiting for the remote shell -- this session has not frozen; a "
-                        "slow command like 'tape run' produces no output at all until it finishes. "
-                        "Press Escape to abort a running tape without ending this session.)",
-                        file=sys.stderr,
-                    )
+                    print("...", file=sys.stderr)
                     warned_stall = True
                 continue
             for key, _ in events:
