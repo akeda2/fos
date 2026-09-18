@@ -79,7 +79,15 @@ freestanding binary); `make test` is the sole automated validation path.
 `make netrom` builds an alternative, optional boot artifact,
 `build/netboot.rom`, that boots fos from a NIC's own PCI option ROM instead
 of disk/USB; see "Booting from a NIC ROM" below. It does not run as part of
-`make`/`make all`, and does not affect `image`/`run`/`test`.
+plain `make` (still just `make image`) and does not affect `image`/`run`/
+`test`, but is included in `make all` (see below).
+
+`make all` builds everything this repository knows how to produce in one
+go: the image, `make netrom`, and every test tape (`make tapes`, i.e.
+`tape-primes`/`tape-hello-rs`/`tape-vga-colors` -- see "Tape (`tape`)"
+below). Not needed for ordinary kernel/boot work, for which plain `make`
+(equivalent to `make image`) is enough. `make help` lists every target
+with a one-line description.
 
 ## Prompt
 
@@ -444,9 +452,10 @@ hardware itself -- see the file's own header comment for the full
 reasoning.
 
 Build it with `make tape-primes` (produces `build/tapes/primes.bin`,
-entirely separate from `make image`/`run`/`test`), then send it to a
-running fos machine with `tools/send_tape.py build/tapes/primes.bin` and
-run `tape run` there once `tape load net` confirms it arrived.
+entirely separate from `make image`/`run`/`test`, though included in
+`make all`/`make tapes`), then send it to a running fos machine with
+`tools/send_tape.py build/tapes/primes.bin` and run `tape run` there
+once `tape load net` confirms it arrived.
 
 #### Test tape: `tools/tapes/hello-rs/`
 

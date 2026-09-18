@@ -103,9 +103,12 @@ The pinned toolchain is `nightly-2026-09-13`, with `rust-src`. Required host
 tools are GNU Make, GNU `as`/`objcopy`, Python 3, and `qemu-system-i386`.
 
 ```sh
-make image    # Produces build/fos.img only.
+make image    # Produces build/fos.img only. Plain `make` is equivalent.
 make run      # Boots it interactively in QEMU.
 make test     # Runs the serial-driven QEMU smoke test.
+make all      # Builds everything: image, netrom, and every test tape.
+make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
+make help     # Lists every target with a one-line description.
 ```
 
 Always run `make test` for boot, loader, kernel, shell, disk, or FOSFS changes.
