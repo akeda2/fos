@@ -67,10 +67,14 @@
  * comments on why writing the framebuffer alone does not move the real,
  * blinking hardware cursor). It starts from whatever cursor position the
  * shell already left behind, so its first line continues naturally after
- * the shell's own last output, and it prints only four short lines (well
- * under 80 columns and 25 rows) so it deliberately does not implement the
- * kernel's line-wrap/scroll logic -- there's simply never enough output
- * here to need it. Because the tape moves the hardware cursor but has no
+ * the shell's own last output. If printing would run past the last VGA
+ * row, it scrolls the screen up by one row first, the same as
+ * kernel/src/console.rs's own newline() does -- this was not implemented
+ * in an earlier version of this file (reasoned, incorrectly, that four
+ * short lines could never need it), which on real hardware silently wrote
+ * this tape's entire summary off-screen whenever the cursor was already
+ * further down the screen than a fresh QEMU boot typically leaves it.
+ * Because the tape moves the hardware cursor but has no
  * way to update the kernel's own cached cursor position, kernel/src/shell.rs
  * re-syncs it via console::resync_cursor() immediately after this tape
  * returns, so the shell's next line of output continues from the right
@@ -108,6 +112,7 @@
 .equ VGA_BASE,             0xb8000
 .equ VGA_ATTR,             0x07
 .equ VGA_WIDTH,            80
+.equ VGA_HEIGHT,           25
 .equ CRTC_INDEX_PORT,      0x3d4
 .equ CRTC_DATA_PORT,       0x3d5
 .equ CRTC_CURSOR_HIGH,     0x0e
@@ -273,27 +278,35 @@ print_string_done:
 # print_decimal: prints the unsigned 32-bit value in %eax as decimal digits,
 # most significant digit first, with no leading zeroes (0 itself prints as
 # a single "0"). Uses the stack to reverse the digit order from the
-# repeated-division-by-10 algorithm. Clobbers %eax, %ecx, %edx.
+# repeated-division-by-10 algorithm. Clobbers %eax, %ecx, %edx. Tracks its
+# pushed-digit count in %edi rather than %ebx: %ebx is this whole file's
+# PIC load-base register, live across every call to print_char (which
+# dereferences `cursor_pos - get_base` off of it), so repurposing it here
+# -- an earlier version of this routine did exactly that -- silently broke
+# every digit's on-screen position while this loop ran, without ever
+# affecting the parallel COM1 mirror byte serial_putc also writes; that
+# mismatch is exactly why this bug was invisible to a serial-only e2e
+# test and only showed up watching the real VGA screen.
 #
 print_decimal:
-    pushl %ebx                  # repurposed here as a pushed-digit counter
-    xorl %ebx, %ebx
+    pushl %edi                  # repurposed here as a pushed-digit counter
+    xorl %edi, %edi
     movl $10, %ecx
 print_decimal_split:
     xorl %edx, %edx
     divl %ecx                   # eax = eax / 10, edx = eax % 10
     addl $'0', %edx
     pushl %edx
-    incl %ebx
+    incl %edi
     testl %eax, %eax
     jnz print_decimal_split
 print_decimal_emit:
     popl %edx
     movb %dl, %al
     call print_char
-    decl %ebx
+    decl %edi
     jnz print_decimal_emit
-    popl %ebx
+    popl %edi
     ret
 
 #
@@ -301,11 +314,15 @@ print_decimal_emit:
 # then re-programs the CRTC hardware cursor to match, and mirrors the same
 # byte to COM1 (matching kernel/src/console.rs's own dual VGA+serial
 # habit). '\n' moves to the start of the next text row without touching
-# VGA memory. There is no scroll/wrap handling here -- this tape only ever
-# prints a handful of short lines, well within one screen, so it
-# deliberately keeps this simple rather than reimplementing
-# kernel/src/console.rs's full logic. Clobbers nothing visible to the
-# caller.
+# VGA memory. If that would advance past the last row (VGA_HEIGHT), the
+# whole screen is scrolled up by one row first -- mirroring
+# kernel/src/console.rs's own newline()/scroll logic -- since real
+# hardware, unlike a fresh QEMU boot, can easily have already scrolled the
+# cursor well down the screen by the time a tape runs (a longer BIOS/boot
+# narration, more commands typed first, etc.); without this, this tape's
+# own summary lines silently wrote past the visible 80x25 window and were
+# never seen at all, a real bug found by running this tape on physical
+# hardware. Clobbers nothing visible to the caller.
 #
 print_char:
     pushl %eax
@@ -321,6 +338,8 @@ print_char:
     movw %dx, VGA_BASE(, %ecx, 2)
     incl %ecx
     movl %ecx, (cursor_pos - get_base)(%ebx)
+    cmpl $(VGA_WIDTH * VGA_HEIGHT), %ecx
+    jae print_char_scroll
     jmp print_char_move_cursor
 
 print_char_newline:
@@ -330,6 +349,34 @@ print_char_newline:
     divl %ecx                   # eax = pos / 80, edx = pos % 80 (unused)
     incl %eax
     imull %ecx, %eax             # eax = (pos / 80 + 1) * 80
+    movl %eax, (cursor_pos - get_base)(%ebx)
+    cmpl $(VGA_WIDTH * VGA_HEIGHT), %eax
+    jae print_char_scroll
+    jmp print_char_move_cursor
+
+#
+# print_char_scroll: copies text rows 1..VGA_HEIGHT-1 up by one row, blanks
+# the new last row, and resets cursor_pos to the start of that last row --
+# the same outcome as kernel/src/console.rs's own newline()/scroll, just
+# using `rep movsw`/`rep stosw` (hence the explicit %esi/%edi save/restore,
+# since both are live caller state -- e.g. print_string's own %esi loop
+# pointer -- that must come back unchanged, unlike %eax/%ecx/%edx, which
+# print_char already saves/restores around its entire body).
+#
+print_char_scroll:
+    pushl %esi
+    pushl %edi
+    movl $(VGA_BASE + VGA_WIDTH * 2), %esi
+    movl $VGA_BASE, %edi
+    movl $(VGA_WIDTH * (VGA_HEIGHT - 1)), %ecx
+    rep movsw
+    movl $(VGA_BASE + VGA_WIDTH * (VGA_HEIGHT - 1) * 2), %edi
+    movw $((VGA_ATTR << 8) | ' '), %ax
+    movl $VGA_WIDTH, %ecx
+    rep stosw
+    popl %edi
+    popl %esi
+    movl $(VGA_WIDTH * (VGA_HEIGHT - 1)), %eax
     movl %eax, (cursor_pos - get_base)(%ebx)
 
 print_char_move_cursor:

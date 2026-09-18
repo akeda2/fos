@@ -409,6 +409,56 @@ just for this one tape. It also saves and restores `%ebx`/`%esi`/`%edi`/
 `extern "C" fn()` (cdecl), which requires those callee-saved registers to
 come back exactly as they went in.
 
+An earlier version of this tape's hand-rolled `print_char` tracked
+`cursor_pos` as a flat `row*80 + col` offset but never checked it against
+the 80x25 (2000-cell) screen, unlike `console.rs`'s own `newline()`. A
+fresh QEMU boot happens to leave the cursor well within the visible
+screen before `tape run`, so `test_primes_e2e.py` never caught this, but
+real hardware's longer/different boot narration (or simply more commands
+typed first) can easily leave the cursor already near the bottom row --
+and on real hardware this tape's whole three-line summary silently
+scrolled off into unaddressed-but-still-writable VGA memory and was never
+seen at all, with the very next kernel-printed line afterward
+(`Tape returned; back at the fos shell.`) then landing corrupted too,
+since `tape_run`'s `console::resync_cursor()` inherited the tape's
+now-out-of-range hardware cursor position. The fix mirrors
+`console.rs`'s scroll logic in assembly: once a `'\n'` or an implicit
+column-80 wrap would push `cursor_pos` to `VGA_WIDTH * VGA_HEIGHT`, a new
+`print_char_scroll` routine `rep movsw`s every row but the first up by
+one, `rep stosw`s the newly-exposed last row blank, and resets
+`cursor_pos` to the start of that last row before the existing
+CRTC-cursor-update code runs.
+
+A second, unrelated bug surfaced immediately after fixing the first one:
+with scrolling fixed, real hardware showed the three summary *labels*
+("primes found:", "largest prime:", "elapsed:") but every digit was
+missing. `print_decimal` was briefly repurposing `%ebx` -- this whole
+file's PIC load-base register, on which every `print_char` call depends
+to find `cursor_pos` (`(cursor_pos - get_base)(%ebx)`) -- as its own
+pushed-digit counter across the very `call print_char` it makes per
+digit. `serial_putc` is called unconditionally at the very top of
+`print_char`, before any VGA/cursor work, so the COM1 mirror byte for
+each digit was always correct regardless; only the on-screen VGA
+placement broke, landing wherever `cursor_pos - get_base + <bogus small
+counter value>` happened to point instead of the real cursor. This is
+exactly why a serial-only test could never have caught either bug:
+`tools/tapes/test_primes_e2e.py` only reads QEMU's `-serial stdio`
+stream, which both bugs left completely untouched. The fix was simply to
+have `print_decimal` use `%edi` (free at every call site, and already
+proven safe to hold across `print_char` -- `print_char_scroll` itself
+saves/restores it) as its digit counter instead of `%ebx`.
+
+Because both of these were VGA-only bugs invisible to the existing
+serial-based test, `tools/tapes/test_primes_vga_e2e.py` was added
+alongside it: it runs the same tape-send/tape-run sequence but reads the
+tape's actual summary back out of the live VGA text framebuffer
+(physical `0xb8000`) via the QEMU monitor's `pmemsave`, exposed over a
+throwaway local Unix socket (`-monitor unix:...`, since `-serial stdio`
+already owns stdio). Anyone touching `print_char`/`print_decimal`/cursor
+handling in `primes.S` should run this test, not just the serial-based
+one, since only it actually checks what the tape's real screen would
+show.
+
 ## Remote terminal (`term net`)
 
 `term net` is deliberately a full remote *shell*, not a byte pipe like
