@@ -1403,6 +1403,24 @@ be a different machine, or offline, today) -- hence `--forget`, so a
 person notices and resets it deliberately rather than either tool
 trying to guess when an entry has gone stale on its own.
 
+### `tapes/longmode.S` verified on real hardware
+
+Confirmed working on two real machines, not just QEMU: a Pentium 4 (no
+x86-64 support at all) correctly took the graceful CPUID early-return
+path and printed "CPUID reports no long-mode support on this CPU;
+nothing to do" without touching CR0/CR3/CR4/EFER/GDTR/EFLAGS, and an AMD
+Athlon 64 X2 (the same machine behind the A20/PIC/PIT/spurious-IRQ
+entries above) completed the full round trip -- reaching 64-bit mode,
+writing its proof value to VGA, and returning cleanly to a still-
+responsive shell. Real hardware is exactly where this tape's "restore
+everything, `cli` for the whole excursion" discipline matters most: a
+real CPU, unlike QEMU, offers no forgiving default behavior for a
+half-restored GDT or a stray interrupt firing against an invalid IDT
+mid-transition, so this is a meaningfully stronger confirmation than the
+QEMU-only (`qemu-system-x86_64` vs `qemu-system-i386`) testing described
+in AGENTS.md's "A tape that visits 64-bit long mode and comes back"
+section above.
+
 ## Deliberately deferred work
 
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
