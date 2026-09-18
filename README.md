@@ -519,6 +519,26 @@ end to end with `tapes/test_bigsieve_e2e.py`, which runs QEMU with
 walkthrough, including a section on `alloc`/`free` for tapes that need
 more memory than their fixed 4 MiB region.
 
+#### Test tape: `tapes/longmode.S`
+
+A hand-written assembly tape (not Rust -- see AGENTS.md's "A tape that
+visits 64-bit long mode and comes back" for why) that jumps the running
+32-bit kernel into 64-bit long mode and back, entirely inside one
+`tape run` call: it builds its own tiny identity-mapped page tables and
+its own private GDT, proves it reached 64-bit mode by writing a
+64-bit-only value directly to VGA text memory, then restores every
+piece of CPU state it touched (CR0/CR3/CR4/EFER/GDTR/EFLAGS) before
+returning, leaving the kernel's own GDT/paging/IDT completely untouched.
+Interrupts stay off for the whole excursion (the kernel's live PIT/
+keyboard IDT is invalid to service against mid-transition). Built with
+`make tape-longmode` (producing `build/tapes/longmode.bin`); unlike
+every other tape here, its build needs a real `ld` link step (x86-64 ELF
+relocations can't survive a linker-free `objcopy`, unlike x86-32's).
+Verified end to end with `tapes/test_longmode_e2e.py`, the one e2e test
+in this repository that launches `qemu-system-x86_64` instead of
+`qemu-system-i386`, since `qemu-system-i386`'s TCG backend cannot
+emulate the CPUID long-mode feature bit at all.
+
 
 ### Remote terminal (`term net`)
 

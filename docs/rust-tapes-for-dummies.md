@@ -354,6 +354,11 @@ overflow trap worth understanding even outside this project).
 - `tapes/primes.S` -- the original hand-written, position-
   independent assembly tape, useful for understanding what Rust's fixed
   load address saves you from having to do by hand.
+- `tapes/longmode.S` -- not Rust (this guide is Rust-specific, see its
+  own header comment and AGENTS.md's "A tape that visits 64-bit long
+  mode and comes back" instead), but worth knowing about: a hand-written
+  assembly tape that jumps into 64-bit long mode and back, entirely
+  inside one `tape run` call.
 - AGENTS.md's "Tape print callback ABI", "Tapes: fixed load address, and
   writing one in Rust", "Tape ABI grows a second callback", and "Tape
   ABI grows alloc/free" sections -- the full historical and technical

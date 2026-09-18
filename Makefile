@@ -10,8 +10,9 @@ TAPE_PRIMES_BIN := $(BUILD)/tapes/primes.bin
 TAPE_HELLO_RS_BIN := $(BUILD)/tapes/hello-rs.bin
 TAPE_VGA_COLORS_BIN := $(BUILD)/tapes/vga-colors.bin
 TAPE_BIGSIEVE_BIN := $(BUILD)/tapes/bigsieve.bin
+TAPE_LONGMODE_BIN := $(BUILD)/tapes/longmode.bin
 
-.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve clean
+.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -36,11 +37,12 @@ help:
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
 	@echo "  make test       - build the image, then run the serial-driven QEMU smoke test"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
 	@echo "  make tape-bigsieve   - build build/tapes/bigsieve.bin (Rust tape, uses alloc/free for a 64 MiB buffer)"
+	@echo "  make tape-longmode   - build build/tapes/longmode.bin (hand-written assembly tape, visits 64-bit long mode and returns)"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -85,7 +87,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -142,6 +144,28 @@ tape-bigsieve:
 	cd tapes/bigsieve && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
 	objcopy -O binary tapes/bigsieve/target/i686-fos/release/bigsieve-tape $(TAPE_BIGSIEVE_BIN)
+
+# Builds the "longmode" test tape: a hand-written assembly tape that jumps
+# from the kernel's ordinary 32-bit protected mode into 64-bit long mode
+# and back, proving the trip with a direct VGA write, then restores every
+# piece of CPU state it touched (CR0/CR3/CR4/EFER/GDTR/EFLAGS) before
+# returning -- see tapes/longmode.S's header comment for the full design
+# rationale, and AGENTS.md's "A tape that visits 64-bit long mode and
+# comes back" section. Unlike tape-primes, this needs a real `ld` link
+# step (not just `as`+`objcopy`): x86-64 ELF relocations are RELA-style,
+# so a linker-free objcopy would leave zeroed addresses everywhere this
+# file references a label (see the header comment for the full
+# explanation). `-Ttext=0x100000` matches kernel/src/pmem.rs's TAPE_BASE,
+# the fixed address every tape is loaded at. Entirely additive --
+# untouched by plain `make`/`image`/`run`/`test`; built as part of
+# `make all`/`make tapes`. Note that actually *running* this tape's real
+# 64-bit excursion needs `qemu-system-x86_64`, not the `qemu-system-i386`
+# every other target in this repo uses -- see tools/test_longmode_tape_e2e.py.
+tape-longmode:
+	mkdir -p $(BUILD)/tapes
+	as --64 -o $(BUILD)/tapes/longmode.o tapes/longmode.S
+	ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main -o $(BUILD)/tapes/longmode.elf $(BUILD)/tapes/longmode.o
+	objcopy -O binary $(BUILD)/tapes/longmode.elf $(TAPE_LONGMODE_BIN)
 
 clean:
 	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target

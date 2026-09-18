@@ -1416,6 +1416,89 @@ trying to guess when an entry has gone stale on its own.
   BIOS EDD/LBA, E820, VGA text, COM1, and PS/2-compatible input. QEMU is the
   primary validation environment.
 
+### A tape that visits 64-bit long mode and comes back
+
+`tapes/longmode.S` is a hand-written assembly tape that jumps the running
+32-bit kernel into 64-bit long mode, proves it got there, and jumps back
+-- entirely inside one `tape run` call, leaving nothing about the
+kernel's own GDT, page tables (fos never otherwise enables paging), or
+IDT touched or replaced once it returns. This is deliberately not the
+same thing as "Deferred optional x86-64 path" below: that section is
+about a permanent, parallel 64-bit boot *target* built from the ground
+up; this tape is a small, one-shot, fully reversible demonstration that
+the mode switch itself works, run from inside the existing 32-bit
+kernel, using CPU features stage2's own GDT/paging setup never touches.
+
+It builds its own tiny identity-mapped page tables (three static 2 MiB
+pages covering physical 0..6 MiB -- the kernel's own code/stack,
+0x10000..0x40000; VGA text memory, 0xb8000; and the tape's own 4 MiB
+image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-descriptor private
+GDT (a 64-bit code descriptor at selector 0x08, and a flat 32-bit code
+descriptor at selector 0x10 used only as the landing pad immediately
+after leaving 64-bit mode), then: `cli`s, saves CR0/CR3/CR4/EFER/
+GDTR/EFLAGS, sets CR4.PAE, loads its own page tables into CR3, sets
+EFER.LME, sets CR0.PG (entering IA-32e compatibility submode), swaps in
+its private GDT, and far-jumps into 64-bit code. Once there, it loads a
+64-bit-only immediate (`0xdeadbeefcafebabe` -- a value no 32-bit `mov`
+could load in one instruction) and hex-dumps it directly to VGA text
+memory, exactly like `tapes/vga-colors` writes VGA, as proof that
+64-bit-encoded instructions genuinely ran (this can't go through the
+`putc` callback: calling 32-bit code from 64-bit mode would need a whole
+second nested mode transition for one debug print, so it isn't done). A
+`push`+`push`+`lretq` (the standard, SDM-documented way to leave 64-bit
+mode for a fixed target, since a plain far jump with an immediate target
+isn't encodable there) returns to the compatibility-mode landing pad,
+which restores every saved register in reverse order -- CR0 (clearing
+PG and everything else back to its original value in one move), CR4
+(clearing PAE), CR3, EFER via `wrmsr` (clearing LME), the original GDTR,
+a far jump back onto the kernel's own code selector to reload CS
+against it, and finally EFLAGS (re-enabling interrupts last of all) --
+before printing a wrap-up message through the ordinary `putc` callback
+and returning to the shell exactly like any other tape.
+
+Two things make this materially different from every other tape in this
+repository:
+
+- **Interrupts stay off for the whole excursion, not just as a nicety.**
+  `kernel/src/interrupts.rs` keeps the PIT (100 Hz, IRQ0) and PS/2
+  keyboard (IRQ1) firing live the entire time the shell runs, including
+  during a tape. That IDT is a 32-bit-format IDT, invalid to service an
+  interrupt against while CR0/CR3/CR4/EFER/GDTR are mid-transition or
+  while this tape's own private GDT is loaded -- so the `cli` above is a
+  hard correctness requirement, and EFLAGS is restored (re-enabling
+  interrupts) only after every other piece of state is back to normal.
+- **The build needs a real `ld` link step, unlike `tapes/primes.S`.**
+  x86-32 ELF relocations are REL-style: GAS bakes the resolved address
+  directly into the instruction bytes at assemble time, so `primes.S`'s
+  bare `as --32` + `objcopy -O binary` pipeline (no linker at all) works
+  correctly. x86-64 ELF relocations are RELA-style instead: the resolved
+  address lives only in a separate `.rela` section that a linker-free
+  `objcopy -O binary` throws away entirely, leaving zeroed placeholders
+  everywhere this file's `.code64` region references a `.code32` label
+  or vice versa. `make tape-longmode` therefore assembles with `as --64`
+  (needed for the file's 64-bit-context relocations, even though most of
+  its instructions are still ordinary 32-bit-encoded `.code32` code),
+  links with `ld -Ttext=0x100000 --oformat=elf64-x86-64` (matching
+  `pmem::TAPE_BASE`, so every label resolves to its real, final runtime
+  address), and only then runs `objcopy -O binary`.
+
+If CPUID (leaf 0x80000001, EDX bit 29) reports no long-mode support, the
+tape prints a short message and returns immediately, touching none of
+CR0/CR3/CR4/EFER/GDTR/EFLAGS at all. This matters for testing:
+`qemu-system-i386`'s TCG backend cannot emulate the long-mode CPUID bit
+at all (confirmed: it prints `warning: TCG doesn't support requested
+feature: CPUID[eax=80000001h].EDX.lm [bit 29]` and reports the feature
+absent), so this tape's real 64-bit excursion can only be exercised
+under `qemu-system-x86_64` -- confirmed to boot this same 32-bit
+`fos.img` identically otherwise. `tapes/test_longmode_e2e.py` is the one
+e2e test in this repository that launches `qemu-system-x86_64` instead
+of `qemu-system-i386`; it asserts on the tape's own serial-visible
+messages and that the shell keeps responding to ordinary commands
+afterward (the "64-BIT MODE REACHED" VGA text itself is only visible on
+the real screen -- `make run` with this tape loaded -- since it bypasses
+the serial-mirrored `putc` callback entirely). Built with
+`make tape-longmode`, producing `build/tapes/longmode.bin`.
+
 ## Deferred optional x86-64 path
 
 Do not treat x86-64 as a compiler-target switch. BIOS begins in real mode; the
@@ -1434,3 +1517,29 @@ The 32-bit BIOS trampoline cannot be called unchanged by a long-mode kernel.
 For an initial x86-64 milestone, make post-boot FOSFS access read-only or defer
 it; prefer a native disk driver before attempting a 64-bit-to-real-mode
 transition that preserves full 64-bit state.
+
+Could this eventual path be prototyped as a tape first, the way
+`tapes/longmode.S` above proves the mode switch itself? For early,
+incremental work, plausibly yes, and it may be the better place to
+start: a tape needs no boot loader, disk image, or partition layout
+changes at all to iterate on, and most of what a real 64-bit path needs
+early on -- VGA, serial, and PS/2 drivers re-hosted as native 64-bit
+code, a 64-bit interrupt/exception setup, more generous page tables --
+is just port I/O and MMIO with no real-mode dependency, exactly the kind
+of thing that translates cleanly into a long, ambitious tape built on
+`tapes/longmode.S`'s pattern. Two real limits stop that pattern from
+covering the *whole* eventual path, though. First, disk I/O fundamentally
+needs BIOS EDD calls, which need real mode: a tape wanting real FOSFS
+access from 64-bit code would need its own, more elaborate 64-bit ->
+32-bit -> 16-bit -> BIOS -> back-up trampoline (a taller version of the
+one `kernel/src/disk.rs` already has for 32-to-16), or a native
+AHCI/ATA driver -- already listed above as deferred work either way.
+Second, and more fundamentally: a tape that *never returns* -- that
+becomes the environment for the rest of the boot, instead of a bounded
+excursion back to the 32-bit shell -- stops being "just a tape" in any
+meaningful sense and starts being exactly this section's "parallel,
+optional boot path", just entered via `tape run` instead of the boot
+loader's partition layout. That may still be a genuinely useful way to
+begin (no disk image to touch while the shape of things is still
+changing), with promotion to a real, dedicated boot entry point coming
+later, once/if this path becomes serious enough to be more than a demo.
