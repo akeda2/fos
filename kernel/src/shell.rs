@@ -1,4 +1,4 @@
-use crate::arch::x86::halt_forever;
+use crate::arch::x86::{halt_forever, reset};
 use crate::boot_info::{BootInfo, MemoryRegion};
 use crate::console;
 use crate::cpu;
@@ -108,7 +108,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"" => {}
         b"help" => {
             if no_arguments(arguments) {
-                println!("System: help clear about bootinfo memmap memory cpuinfo hexdump halt");
+                println!("System: help clear about bootinfo memmap memory cpuinfo hexdump halt reset");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Disk: diskinfo readsector format ls cat write rm");
                 println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 (or F4/F6/F7/F8/F10) to exit)");
@@ -153,6 +153,13 @@ fn execute(command: &[u8], info: &BootInfo) {
             }
             println!("Halting CPU. Reset or power-cycle to restart.");
             halt_forever();
+        }
+        b"reset" => {
+            if !no_arguments(arguments) {
+                return;
+            }
+            println!("Resetting the machine now (8042 keyboard-controller pulse reset)...");
+            reset();
         }
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"diskinfo" | b"format" | b"ls"
         | b"ticks" | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" => {
@@ -1051,13 +1058,13 @@ fn handle_incoming_chat_frame(nic: &rtl8139::Rtl8139, frame: &[u8], own_mac: &[u
     }
 }
 
-/// The one currently loaded "paper tape": a physical address from
-/// `pmem::allocate_contiguous` plus its exact byte length. `None` until
-/// `tape load disk`/`tape load net` succeeds; loading a new tape always
-/// frees any previous one first, so at most one tape's frames are ever
-/// held at a time. There is no paging in this kernel, so this physical
-/// address doubles as a directly usable pointer -- the same convention
-/// `rtl8139.rs`'s own DMA buffers rely on.
+/// The one currently loaded "paper tape": always `pmem::TAPE_BASE` (see its
+/// doc comment) plus the tape's exact byte length. `None` until `tape load
+/// disk`/`tape load net` succeeds; loading a new tape simply overwrites the
+/// fixed region in place, so there's no per-tape frame bookkeeping to free.
+/// There is no paging in this kernel, so this physical address doubles as
+/// a directly usable pointer -- the same convention `rtl8139.rs`'s own DMA
+/// buffers rely on.
 static mut TAPE: Option<(u32, u32)> = None;
 
 /// Reads/writes `TAPE` through raw pointers (`&raw const`/`&raw mut`)
@@ -1071,14 +1078,6 @@ fn tape_get() -> Option<(u32, u32)> {
 
 fn tape_set(value: Option<(u32, u32)>) {
     unsafe { *(&raw mut TAPE) = value };
-}
-
-/// Reads and clears `TAPE` in one step, `Option::take`'s effect without
-/// ever holding a `&mut` to the static.
-fn tape_take() -> Option<(u32, u32)> {
-    let value = tape_get();
-    tape_set(None);
-    value
 }
 
 
@@ -1103,33 +1102,20 @@ fn tape_status() {
     }
 }
 
-/// Frees a tape's frames back to `pmem`: `pmem::free` only releases one
-/// frame at a time, so a multi-frame tape needs one call per frame it was
-/// allocated with (`allocate_contiguous`'s own counterpart).
-fn free_tape_frames(address: u32, length: u32) {
-    let frame_count = (length as usize).div_ceil(pmem::FRAME_SIZE as usize);
-    for offset in 0..frame_count {
-        pmem::free(address + offset as u32 * pmem::FRAME_SIZE);
-    }
-}
-
-/// Replaces whatever tape is currently loaded (freeing its frames first, if
-/// any) with a freshly allocated `length`-byte buffer, or reports why that
-/// failed. Shared by both `tape load disk` and `tape load net`, since
-/// either source ends up needing the exact same buffer.
+/// Validates `length` fits the fixed tape region and reports the fixed
+/// address, or explains why it doesn't. Every tape -- whatever loads it --
+/// always lands at the same `pmem::TAPE_BASE` address (see its doc
+/// comment): unlike a general allocation, this is deliberate, so a tape's
+/// own compiled code (assembly, C, or Rust) can address itself directly
+/// instead of needing to be position-independent and locate its own
+/// runtime base first. Shared by both `tape load disk` and `tape load
+/// net`, since either source ends up needing the exact same buffer.
 fn allocate_tape_buffer(length: u32) -> Option<u32> {
-    if let Some((old_address, old_length)) = tape_take() {
-        free_tape_frames(old_address, old_length);
+    if length > pmem::TAPE_LEN {
+        println!("Tape too large: {length} byte(s) exceeds the {}-byte fixed tape region at 0x{:05x}.", pmem::TAPE_LEN, pmem::TAPE_BASE);
+        return None;
     }
-    let frame_count = (length as usize).div_ceil(pmem::FRAME_SIZE as usize);
-    match pmem::allocate_contiguous(frame_count) {
-        Some(address) => Some(address),
-        None => {
-            let (_, free) = pmem::stats();
-            println!("Not enough contiguous free physical memory for a {length}-byte tape ({frame_count} frame(s) needed, {free} frame(s) free).");
-            None
-        }
-    }
+    Some(pmem::TAPE_BASE)
 }
 
 /// Executes the loaded tape: a bare `call` to its first byte, in ring 0,
@@ -1258,9 +1244,6 @@ fn tape_load_net() {
 
     loop {
         if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
-            if let Some(transfer) = transfer {
-                free_tape_frames(transfer.address, transfer.length);
-            }
             println!("\nGave up waiting; no tape loaded.");
             return;
         }
@@ -1301,7 +1284,6 @@ fn tape_load_net() {
                 let seq = u32::from_le_bytes(seq_bytes.try_into().unwrap());
                 if seq != active.expected_seq {
                     println!("\nGap in tape data from {}: expected chunk #{}, got #{seq} -- aborting this load.", Mac(&source), active.expected_seq);
-                    free_tape_frames(active.address, active.length);
                     transfer = None;
                     continue;
                 }
@@ -1310,7 +1292,6 @@ fn tape_load_net() {
                 let data = &payload[4..];
                 if data.len() < chunk_len {
                     println!("\nShort tape data chunk #{seq} from {}: expected {chunk_len} byte(s), frame only carried {} -- aborting this load.", Mac(&source), data.len());
-                    free_tape_frames(active.address, active.length);
                     transfer = None;
                     continue;
                 }
@@ -1327,7 +1308,6 @@ fn tape_load_net() {
                     return;
                 }
                 println!("\nTape from {} stopped early: only {} of {} declared byte(s) arrived -- aborting.", Mac(&source), active.received, active.length);
-                free_tape_frames(active.address, active.length);
             }
             CHAT_TAG_DISCOVER_REQUEST => {
                 // A `send_tape.py`/`nic discover`/`chat` peer probing for

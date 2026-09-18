@@ -1,0 +1,18 @@
+[package]
+name = "hello-tape"
+version = "0.1.0"
+edition = "2024"
+
+# A tape has no OS underneath it to hand control back to on panic (see
+# src/main.rs's panic handler), so unwinding would have nothing useful to
+# do anyway -- the same reasoning kernel/Cargo.toml gives for its own
+# `panic = "abort"`.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = "symbols"

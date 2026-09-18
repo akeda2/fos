@@ -136,6 +136,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing the kernel's own `console::print_byte` as its one argument so its printed output goes through the same VGA/serial/relay path as any other command's. If it ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, also auto-replies to `nic discover` probes, same as `chat`/`tape load net`. This same wait now also runs automatically once at every boot, before the interactive prompt appears. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
+| `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
 Unknown commands and oversized input are reported rather than ignored.
@@ -372,20 +373,27 @@ round.
 ### Tape (`tape`)
 
 `tape` treats a chunk of memory as a paper tape: something you load, then
-separately choose to run. A tape is just a flat, position-independent-at-a-
-fixed-address raw binary -- the exact same convention the kernel itself is
-loaded and entered with (see `linker.ld`/`boot/stage2.S`) -- executed by a
-bare `call` to its first byte, in ring 0, on the kernel's own stack, with
-absolutely no memory protection: this kernel has no userspace or paging
-(see "Current boundaries" below), so a tape is trusted exactly as much as
-any other kernel code. Ending with a near `ret` returns control to the
-shell cleanly; anything else that faults is at least caught by the CPU
-exception handlers (see "Interrupts and the physical-frame allocator"
-above) rather than silently rebooting, but is never recoverable -- there is
-no way back into a hung or corrupted kernel except a reset.
+separately choose to run. A tape is a flat binary always loaded at one
+fixed physical address (`0x100000`, 4 MiB reserved -- see `pmem::TAPE_BASE`/
+`TAPE_LEN` in `kernel/src/pmem.rs`), the exact same convention the kernel
+itself is loaded and entered with (see `linker.ld`/`boot/stage2.S`, fixed
+at `0x10000`) -- executed by a bare `call` to its first byte, in ring 0,
+on the kernel's own stack, with absolutely no memory protection: this
+kernel has no userspace or paging (see "Current boundaries" below), so a
+tape is trusted exactly as much as any other kernel code. Ending with a
+near `ret` returns control to the shell cleanly; anything else that
+faults is at least caught by the CPU exception handlers (see "Interrupts
+and the physical-frame allocator" above) rather than silently rebooting,
+but is never recoverable -- there is no way back into a hung or corrupted
+kernel except a reset. Because every tape always loads at that same fixed
+address, its own compiled code can use ordinary absolute addressing --
+position-independent code is no longer required (though still harmless,
+as `tools/tapes/primes.S` shows), which is what makes writing a tape in a
+compiled language like Rust or C practical -- see "Test tape:
+`tools/tapes/hello-rs/`" below.
 
 A tape can be loaded two ways. `tape load disk NAME` reads a FOSFS file
-straight into a freshly allocated buffer -- bounded, for now, by FOSFS's
+straight into the fixed tape buffer -- bounded, for now, by FOSFS's
 own 512-byte one-sector file limit, and by `write NAME TEXT` only ever
 being able to put printable ASCII bytes on disk in the first place, so a
 disk-loaded tape's practical use today is mostly for content that arrived
@@ -395,16 +403,14 @@ in live. `tape load net` instead waits for a tape sent over Ethernet: one
 discover`) declares the transfer's total length, then any number of
 `TAPE_TAG_DATA` frames each carry an explicit sequence number and up to
 1024 bytes, until one `TAPE_TAG_STOP` frame closes it. The receiver
-allocates exactly as many physical frames (via the same allocator `pmem`
-tracks) as the declared length needs -- there is no arbitrary size cap,
-only whatever contiguous RAM `pmem` can still offer -- and computes each
-chunk's exact byte count from its sequence number and the declared total
-length, never from the frame's own (possibly padded) received length, so a
-genuine binary tape's own trailing zero bytes are never mistaken for
-padding the way `chat`'s text frames get away with trimming. A skipped or
-reordered sequence number aborts that attempt and frees its frames rather
-than silently loading a corrupt tape, since this deliberately simple
-protocol has no retransmission.
+checks the declared length fits the fixed 4 MiB tape region and computes
+each chunk's exact byte count from its sequence number and the declared
+total length, never from the frame's own (possibly padded) received
+length, so a genuine binary tape's own trailing zero bytes are never
+mistaken for padding the way `chat`'s text frames get away with
+trimming. A skipped or reordered sequence number aborts that attempt
+rather than silently loading a corrupt tape, since this deliberately
+simple protocol has no retransmission.
 
 The other end of a network load can be another fos machine's `tape send
 NAME PEER_MAC|PEER_NUMBER` (reads a FOSFS file and streams it out, reusing

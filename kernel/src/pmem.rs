@@ -22,6 +22,19 @@ const BITMAP_BYTES: usize = MAX_FRAMES.div_ceil(8);
 /// low-memory region.
 const RESERVED_BELOW: u32 = 0x40000;
 
+/// Fixed physical address every "tape" (see `shell.rs`'s `tape_run`) is
+/// always loaded at, and the size of the region set aside for it. Unlike
+/// every other allocation this module hands out, a tape's address must
+/// never vary from run to run: that's what lets a tape's own compiled code
+/// (assembly, C, or Rust) address itself with ordinary absolute addresses
+/// instead of needing to be position-independent and locate its own
+/// runtime base first, the same way the kernel itself gets away with plain
+/// addressing by always loading at the fixed `0x10000` `linker.ld` picks.
+/// 4 MiB is comfortably above `tools/tapes/primes.S`'s ~1 MiB binary (most
+/// of which is its embedded sieve array) with headroom for future tapes.
+pub const TAPE_BASE: u32 = 0x100000;
+pub const TAPE_LEN: u32 = 4 * 1024 * 1024;
+
 /// One bit per frame. `1` means "not available to the allocator" (either
 /// outside a usable E820 region, below `RESERVED_BELOW`, or already
 /// allocated). Starts fully reserved; `initialize` clears bits for usable
@@ -60,11 +73,37 @@ pub fn initialize(info: &BootInfo) {
         }
         mark_region_free(read_u64(core::ptr::addr_of!(region.base)), read_u64(core::ptr::addr_of!(region.length)));
     }
+    // Carve the fixed tape region back out of the general pool, the same
+    // way frames below RESERVED_BELOW never entered it: this must happen
+    // after the E820-driven marking above (which would otherwise mark
+    // these frames free again) and before any allocation, so
+    // `allocate`/`allocate_contiguous`/`palloc` can never hand these
+    // frames to anything else.
+    reserve_range(TAPE_BASE, TAPE_LEN);
     let (total, _) = stats();
     crate::println!(
-        "Physical memory: {total} frames ({} KiB) tracked above 0x{RESERVED_BELOW:05x}; use 'pmem'/'palloc'/'pfree' to inspect.",
-        u64::from(total as u32) * u64::from(FRAME_SIZE) / 1024
+        "Physical memory: {total} frames ({} KiB) tracked above 0x{RESERVED_BELOW:05x}, excluding 0x{TAPE_BASE:05x}-0x{:05x} reserved for tapes; use 'pmem'/'palloc'/'pfree' to inspect.",
+        u64::from(total as u32) * u64::from(FRAME_SIZE) / 1024,
+        TAPE_BASE + TAPE_LEN
     );
+}
+
+/// Removes `[base, base + length)` from the free pool (and from the total
+/// tracked count) without ever having offered it to `allocate`/
+/// `allocate_contiguous` -- `mark_region_free`'s opposite, used once at
+/// boot for the fixed tape region.
+fn reserve_range(base: u32, length: u32) {
+    let start = frame_index(base);
+    let end = frame_index(base + length);
+    for index in start..end.min(MAX_FRAMES) {
+        if is_free(index) {
+            set_free(index, false);
+            unsafe {
+                TOTAL_FRAMES -= 1;
+                FREE_FRAMES -= 1;
+            }
+        }
+    }
 }
 
 fn mark_region_free(base: u64, length: u64) {

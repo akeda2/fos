@@ -67,6 +67,7 @@ fixed address below `0x40000`, and update it in the same change that adds one:
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
 | `0x9f000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer, just below the conventional End-of-Low-Memory / EBDA boundary. |
 | `0x10000`-`0x40000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
+| `0x100000`-`0x500000` | `kernel/src/pmem.rs` (`TAPE_BASE`/`TAPE_LEN`), any tape's own linker script | The fixed 4 MiB region every tape (`tape load disk`/`tape load net`) is always loaded into, carved out of `pmem`'s general frame pool at boot so `allocate`/`allocate_contiguous`/`palloc` can never hand these frames to anything else. See "Tapes: fixed load address, and writing one in Rust" below. |
 
 ## Educational verbosity
 
@@ -126,7 +127,7 @@ back to source.
 ## Current command surface
 
 System commands: `help`, `clear`, `about`, `bootinfo`, `memmap`, `memory`,
-`cpuinfo`, `hexdump ADDRESS LENGTH`, and `halt`.
+`cpuinfo`, `hexdump ADDRESS LENGTH`, `halt`, and `reset`.
 
 Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
 `pfree ADDRESS`.
@@ -528,7 +529,92 @@ the burst of `TERM_TAG_DATA` frames relayed to a remote `term net` client
 after `tape run` returns, proving the callback actually reaches the relay
 queue end-to-end over the network, not just in the local VGA/serial view.
 
-## Remote terminal (`term net`)
+### Tapes: fixed load address, and writing one in Rust
+
+Before this, `allocate_tape_buffer` (`kernel/src/shell.rs`) called
+`pmem::allocate_contiguous`, the same general-purpose frame allocator
+everything else uses -- so a tape's load address varied depending on
+whatever contiguous run of free frames happened to be available that run.
+That's exactly why `tools/tapes/primes.S` had to be genuinely
+position-independent: its `_start` prologue captures its own runtime base
+with the classic `call get_base` / `pop %ebx` idiom, and every label is
+addressed as an offset from that base, because the assembler/linker have
+no way to know the load address ahead of time. That PIC requirement is
+easy enough to hand-write in assembly, but neither Rust nor C has an easy
+no-dynamic-linker PIC story on a freestanding `i686` target -- their
+usual position-independent code relies on a dynamic linker computing
+relocations at load time, which this kernel doesn't have and has no
+reason to grow just for tapes.
+
+The fix follows the exact same convention the kernel itself already
+uses for its own load address: `kernel/src/pmem.rs` now reserves a fixed
+physical region, `TAPE_BASE` (`0x100000`) through `TAPE_BASE + TAPE_LEN`
+(4 MiB, comfortably above `primes.bin`'s ~1 MiB with headroom for future
+tapes), carved out of the general frame pool once at boot via a new
+`reserve_range` helper -- `mark_region_free`'s exact opposite, unmarking
+those frames as free (and out of the tracked total) the same way frames
+below `RESERVED_BELOW` never entered the pool to begin with. Because
+this happens before `shell::run` (and therefore any command) can
+allocate anything, `allocate`/`allocate_contiguous`/`palloc` can never
+hand a tape's own memory to something else, and a tape never needs to
+compete with other allocations for it.
+
+With the address now always the same, `allocate_tape_buffer` shrank to a
+bounds check (`length <= pmem::TAPE_LEN`) returning `pmem::TAPE_BASE`
+unconditionally -- no more per-load frame accounting, and no more
+`free_tape_frames`/`pmem::free` calls scattered through `tape_load_disk`/
+`tape_load_net`'s abort paths, since there are no longer any dynamically
+held frames to release: loading a new tape simply overwrites the same
+fixed region in place. `tape_take` (which existed solely to clear `TAPE`
+before freeing the old frames) became dead code and was removed along
+with it.
+
+This also means `tools/tapes/primes.S` no longer *needs* to be
+position-independent -- but it still works unchanged (a fixed address is
+still a valid address for PIC code, it's just no longer required), so it
+was left as-is, as the assembly reference example.
+
+`tools/tapes/hello-rs/` is the new Rust reference example, proving the
+concept: a small `no_std`/`no_main` binary crate that reuses the kernel's
+own custom target spec (`targets/i686-fos.json`) and `-Z build-std`
+invocation verbatim (see its `.cargo/config.toml`), but with its own
+`linker.ld` fixing the load address at `0x100000` (`pmem::TAPE_BASE`)
+instead of the kernel's own `0x10000`. Two things make this simpler than
+the kernel's own boot path:
+
+- `tape_run` calls a tape with an ordinary cdecl `call` (the CPU is
+  already fully set up -- protected mode, a working stack), unlike
+  `boot/stage2.S`'s raw `jmp` into the kernel, which hands off the
+  `BootInfo` address in a register rather than on the stack. So a tape
+  written in Rust needs no register-to-stack bridging assembly like
+  `kernel/src/entry.S` provides for `kmain` -- an ordinary
+  `extern "C" fn(putc: extern "C" fn(u32))` already matches `tape_run`'s
+  call site exactly.
+- `tools/tapes/hello-rs/src/entry.S` is consequently tiny: it exists
+  solely to zero `.bss` (the same reason `kernel/src/entry.S` does it --
+  a flat binary's `.bss` bytes are only implicitly zero-filled by
+  `objcopy -O binary`'s padding, never explicitly, so Rust statics can't
+  be trusted to start zeroed without this) before tail-`jmp`-ing into the
+  real Rust entry point, `tape_main`, so `tape_main`'s own `ret` returns
+  straight to `tape_run`.
+
+`hello-rs`'s `tape_main` mirrors `primes.S` in miniature -- prints a
+greeting, sieves primes up to a much smaller 1,000 (168 primes, largest
+997) using a `static mut` array rather than a stack buffer (same
+reasoning as `primes.S`'s `.bss`-resident sieve: SIEVE_LIMIT bytes of
+stack in a tape running on the kernel's own stack, with no guard page,
+isn't worth the risk), and returns -- proving real, non-trivial compiled
+Rust code runs correctly at the fixed tape address, not just a string
+literal. It's built with `make tape-hello-rs` (producing
+`build/tapes/hello-rs.bin`) and verified end to end over the network with
+`tools/tapes/test_hello_rs_e2e.py`, mirroring `test_primes_e2e.py`.
+
+The same fixed-address convention would work identically for a C tape
+(`gcc -m32 -ffreestanding -fno-pic` with a matching linker script) --
+Rust was chosen here only because it reuses the kernel's own toolchain
+and build-std setup with far less new scaffolding.
+
+
 
 `term net` is deliberately a full remote *shell*, not a byte pipe like
 `term`: once a client connects, the real, live shell -- prompt, line

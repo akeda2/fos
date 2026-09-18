@@ -76,5 +76,31 @@ pub mod x86 {
             unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
         }
     }
+
+    /// Asks the 8042 keyboard controller to pulse the CPU's own RESET
+    /// line -- the classic real-mode/protected-mode-era way to reboot a
+    /// PC-compatible without BIOS or ACPI help, still honored by QEMU's
+    /// emulated 8042 and by essentially every real chipset for backward
+    /// compatibility. `0x64` is the controller's status/command port
+    /// (see `STATUS_PORT` in `keyboard.rs`); bit 1 of a status read means
+    /// its input buffer still holds a byte the controller hasn't consumed
+    /// yet, so this polls that clear first (the same convention
+    /// `keyboard.rs`'s own status-port polling uses) before sending
+    /// `0xfe` ("pulse output port bit 0", which is wired to RESET) to
+    /// that same port as a command.
+    pub fn reset() -> ! {
+        loop {
+            let status = unsafe { inb(0x64) };
+            if status & 0x02 == 0 {
+                break;
+            }
+        }
+        unsafe { outb(0x64, 0xfe) };
+        // A real reset never returns control here; this is only reached
+        // if the controller somehow didn't respond (never observed in
+        // QEMU), so fail safe by halting rather than falling through to
+        // whatever undefined state the caller didn't expect.
+        halt_forever()
+    }
 }
 

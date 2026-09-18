@@ -7,8 +7,9 @@ IMAGE := $(BUILD)/fos.img
 NETROM_RAW := $(BUILD)/netrom_raw.bin
 NETROM := $(BUILD)/netboot.rom
 TAPE_PRIMES_BIN := $(BUILD)/tapes/primes.bin
+TAPE_HELLO_RS_BIN := $(BUILD)/tapes/hello-rs.bin
 
-.PHONY: all kernel image run test netrom tape-primes clean
+.PHONY: all kernel image run test netrom tape-primes tape-hello-rs clean
 
 all: image
 
@@ -54,5 +55,18 @@ tape-primes:
 	as --32 -o $(BUILD)/tapes/primes.o tools/tapes/primes.S
 	objcopy -O binary $(BUILD)/tapes/primes.o $(TAPE_PRIMES_BIN)
 
+# Builds the "hello-rs" test tape: the same idea as tape-primes above, but
+# written in ordinary (non-position-independent) Rust instead of hand-
+# written PIC assembly -- possible only because every tape now always
+# loads at the same fixed physical address (tools/tapes/hello-rs/linker.ld,
+# see kernel/src/pmem.rs's TAPE_BASE/TAPE_LEN doc comment). See
+# tools/tapes/hello-rs/src/main.rs and README.md's "Tape" section for
+# details. Entirely additive -- untouched by `make`/`make all`/`image`/
+# `run`/`test`.
+tape-hello-rs:
+	cd tools/tapes/hello-rs && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tools/tapes/hello-rs/target/i686-fos/release/hello-tape $(TAPE_HELLO_RS_BIN)
+
 clean:
-	rm -rf $(BUILD) kernel/target
+	rm -rf $(BUILD) kernel/target tools/tapes/hello-rs/target
