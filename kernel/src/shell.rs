@@ -22,6 +22,17 @@ pub fn run(info: &BootInfo) -> ! {
         println!("PS/2 keyboard unavailable; serial input remains available.");
         println!("Type 'help' for commands.");
     }
+    // Automatically wait for a remote `term net` client at every boot,
+    // exactly as if a local operator had just typed `term net`: this
+    // makes every fos machine remotely reachable by default with no
+    // manual step, which matters most for a machine with no attached
+    // screen/keyboard at all. A local operator who wants the ordinary
+    // interactive shell right away, without waiting, can press F12 (or
+    // F4/F6/F7/F8/F10) immediately to give up waiting, exactly as they
+    // would to leave a manually started `term net` session; if a remote
+    // client does connect first, disconnecting (locally or remotely)
+    // falls through to the same local shell below, same as ever.
+    term_net(info);
     let mut editor = LineEditor::new();
     prompt();
 
@@ -100,15 +111,15 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("System: help clear about bootinfo memmap memory cpuinfo hexdump halt");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Disk: diskinfo readsector format ls cat write rm");
-                println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 to exit)");
+                println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 (or F4/F6/F7/F8/F10) to exit)");
                 println!("Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame),");
-        println!("          nic sniff (promiscuous capture; F12 to stop)");
+        println!("          nic sniff (promiscuous capture; F12 (or F4/F6/F7/F8/F10) to stop)");
         println!("          nic discover (probe for other listening fos machines), nic peers (list them)");
-        println!("          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 or /quit to leave)");
+        println!("          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 (or F4/F6/F7/F8/F10) or /quit to leave)");
         println!("Tape: tape status (what's loaded), tape run (execute it)");
-        println!("      tape load disk NAME (load a FOSFS file), tape load net (wait for one over Ethernet; F12 to give up)");
+        println!("      tape load disk NAME (load a FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)");
         println!("      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')");
-        println!("Remote: term net (wait for a remote terminal client over Ethernet; F12 to give up)");
+        println!("Remote: term net (wait for a remote terminal client over Ethernet, same as the automatic wait at every boot; F12 (or F4/F6/F7/F8/F10) to give up)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -258,7 +269,7 @@ fn print_serial_ports() {
 /// this repurposes COM1, a serial-only session controlling fos through
 /// that same port would lose its ability to type further commands once
 /// `term` starts; local VGA + PS/2 keyboard input is unaffected and
-/// remains the way to invoke `term` and to leave it again with F12
+/// remains the way to invoke `term` and to leave it again with F12 (or F4/F6/F7/F8/F10)
 /// (chosen specifically because function keys sit outside the
 /// Shift/AltGr layers that a Nordic keyboard puts most punctuation
 /// behind).
@@ -318,7 +329,7 @@ fn term_command(info: &BootInfo, arguments: &[u8]) {
         }
         println!("Entering raw terminal mode on COM1 at 115200 baud: your keystrokes are sent");
         println!("byte-for-byte, with no local echo or line editing -- the far end echoes them");
-        println!("back. Press F12 to return to the fos shell. If you are controlling fos over");
+        println!("back. Press F12 (or F4/F6/F7/F8/F10) to return to the fos shell. If you are controlling fos over");
         println!("this same serial link, note that link is about to become the remote");
         println!("connection instead: use the VGA console to get back in that case.");
         term_loop(console::write_serial_byte, console::read_serial_byte);
@@ -365,12 +376,12 @@ fn run_uart_term(name_bytes: &[u8], base: u16, baud: Option<u32>) {
     }
     println!("Entering raw terminal mode on {name} at {baud} baud: your keystrokes are sent");
     println!("byte-for-byte, with no local echo or line editing -- the far end echoes them");
-    println!("back. Press F12 to return to the fos shell.");
+    println!("back. Press F12 (or F4/F6/F7/F8/F10) to return to the fos shell.");
     term_loop(|byte| uart.write_byte(byte), || uart.read_byte());
     println!("\nLeft terminal mode; back at the fos shell.");
 }
 
-/// Shared by every `term` port: forwards keystrokes via `write` until F12
+/// Shared by every `term` port: forwards keystrokes via `write` until F12 (or F4/F6/F7/F8/F10)
 /// is pressed, and shows bytes arriving via `read` locally (VGA only, so
 /// they are never re-echoed back over the same wire they arrived on).
 fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
@@ -392,7 +403,7 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
 /// remote peer connects, so a client only needs to speak the small
 /// `TERM_TAG_*` framing below, not reimplement any command logic.
 ///
-/// Waits (F12 to give up, same convention as `nic discover`/`chat`/`term`)
+/// Waits (F12 (or F4/F6/F7/F8/F10) to give up, same convention as `nic discover`/`chat`/`term`)
 /// for a `TERM_TAG_HELLO` from any peer, then locks onto that peer's MAC
 /// for the rest of the session -- a second `HELLO` from someone else while
 /// already connected is ignored, since only one remote client can drive
@@ -407,7 +418,7 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
 ///   including running `execute` on Enter.
 /// - Local VGA/PS/2 input is *not* read at all while connected (this
 ///   session is exclusive, not mirrored): the only way to interrupt it
-///   locally is F12, which sends `TERM_TAG_BYE` to the peer before
+///   locally is F12 (or F4/F6/F7/F8/F10), which sends `TERM_TAG_BYE` to the peer before
 ///   returning. The peer may also end the session first by sending its
 ///   own `TERM_TAG_BYE`.
 ///
@@ -416,10 +427,24 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
 /// during an active session -- so simply leaving `term net` running is
 /// enough to make this host discoverable, exactly as `chat`/`tape load
 /// net` already do.
+///
+/// `shell::run` calls this once automatically at every boot, before the
+/// ordinary interactive prompt, so every fos machine is reachable over
+/// `term net` by default with no manual step -- this matters most for a
+/// machine with no attached screen/keyboard. A local operator watching a
+/// real screen presses F12 (or F4/F6/F7/F8/F10) to skip the wait and get
+/// the interactive prompt immediately; there is deliberately no serial
+/// equivalent (same limitation `chat` already documents), since reading
+/// one byte here to mean "give up" would silently eat the first
+/// character of whatever a serial operator was about to type. A
+/// serial-only operator can still reach the local prompt by having any
+/// peer connect and then disconnect (`TERM_TAG_HELLO` then
+/// `TERM_TAG_BYE`), which is exactly the trick this project's own net
+/// e2e tests use to skip past this automatic wait.
 fn term_net(info: &BootInfo) {
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
-    println!("Waiting for a remote terminal client to connect; press F12 to give up.");
+    println!("Waiting for a remote terminal client to connect; press F12 (or F4/F6/F7/F8/F10) to give up.");
 
     let mut recv_buffer = [0u8; rtl8139::MAX_FRAME_LEN];
     let peer = loop {
@@ -445,7 +470,7 @@ fn term_net(info: &BootInfo) {
         }
     };
 
-    println!("Remote terminal connected from {}. Local input is disabled; F12 disconnects it.", Mac(&peer));
+    println!("Remote terminal connected from {}. Local input is disabled; F12 (or F4/F6/F7/F8/F10) disconnects it.", Mac(&peer));
     console::enable_relay();
     let mut editor = LineEditor::new();
     let mut relay_chunk = [0u8; TERM_DATA_CAPACITY];
@@ -532,7 +557,7 @@ const TEST_PAYLOAD: &[u8] = b"fos raw ethernet test frame";
 /// test frame (see `TEST_ETHERTYPE`); `nic recv` polls briefly for one
 /// incoming frame and hex-dumps it if one arrives; `nic sniff` runs a
 /// continuous promiscuous-mode capture, printing every frame seen until
-/// F12 stops it; `nic discover` broadcasts a `chat` discovery probe and
+/// F12 (or F4/F6/F7/F8/F10) stops it; `nic discover` broadcasts a `chat` discovery probe and
 /// lists whoever answers; `nic peers` shows the peer list discovered so
 /// far without sending anything. There is no protocol above raw Ethernet
 /// here (no ARP, no IPv4) -- this only exercises the card itself.
@@ -630,7 +655,7 @@ fn nic_recv() {
 
 /// Puts the card into promiscuous mode (`Rtl8139::set_promiscuous`) and
 /// prints every frame it captures -- addressed to this card or not --
-/// until F12 stops the capture, the same escape key `term` uses and for
+/// until F12 (or F4/F6/F7/F8/F10) stops the capture, the same escape key `term` uses and for
 /// the same reason (layout-independent, unlike a Shift/AltGr combination
 /// on a Nordic keyboard). Promiscuous mode is always turned back off
 /// before returning, whether the capture ran to completion or not, so a
@@ -640,7 +665,7 @@ fn nic_sniff() {
 
     println!("Enabling promiscuous mode: the card will now hand over every frame it sees");
     println!("on the wire, not just frames addressed to it (unicast/multicast/broadcast).");
-    println!("Press F12 to stop capturing and return to the fos shell.");
+    println!("Press F12 (or F4/F6/F7/F8/F10) to stop capturing and return to the fos shell.");
     nic.set_promiscuous(true);
 
     let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
@@ -785,7 +810,7 @@ fn print_peers() {
 /// The gap, in 100 Hz timer ticks, between re-broadcasts of the discovery
 /// probe (see `nic_discover`) -- frequent enough that a peer which starts
 /// `chat`/`nic discover` a few seconds late is still found before the
-/// operator gives up and presses F12, but not so frequent that the wire (or
+/// operator gives up and presses F12 (or F4/F6/F7/F8/F10), but not so frequent that the wire (or
 /// the printed peer list, which only grows on genuinely new replies) is
 /// spammed.
 const DISCOVER_REBROADCAST_TICKS: u64 = 300;
@@ -793,7 +818,7 @@ const DISCOVER_REBROADCAST_TICKS: u64 = 300;
 /// Broadcasts a discovery probe (`CHAT_TAG_DISCOVER_REQUEST`), re-sending it
 /// every `DISCOVER_REBROADCAST_TICKS` so machines that only start `chat` or
 /// `nic discover` partway through are still found, and keeps listening --
-/// printing each newly-seen peer as it replies -- until F12 stops it, the
+/// printing each newly-seen peer as it replies -- until F12 (or F4/F6/F7/F8/F10) stops it, the
 /// same convention `nic sniff`/`term`/`chat` all use. There is no
 /// interrupt-driven network service in this kernel (see "Current
 /// boundaries" in `AGENTS.md`), so a reply only ever comes from a fos
@@ -803,7 +828,7 @@ const DISCOVER_REBROADCAST_TICKS: u64 = 300;
 fn nic_discover() {
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
-    println!("Broadcasting a discovery probe every few seconds; press F12 to stop and see the list.");
+    println!("Broadcasting a discovery probe every few seconds; press F12 (or F4/F6/F7/F8/F10) to stop and see the list.");
     send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
     let mut next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
 
@@ -872,7 +897,7 @@ fn nic_discover() {
 /// for a single-scrolling-console chat, not a bug. While running, `chat`
 /// also silently answers any discovery probe it sees (see `nic discover`)
 /// with a one-line note, so simply leaving a chat session open is enough to
-/// make a machine discoverable. Leaves through F12 (only available from the
+/// make a machine discoverable. Leaves through F12 (or F4/F6/F7/F8/F10) (only available from the
 /// local PS/2 keyboard, same as `term`/`nic sniff`) or by typing the line
 /// `/quit` (which also works from a serial-only session, since -- unlike
 /// `term` -- `chat` never takes over the serial console).
@@ -907,8 +932,8 @@ fn chat_command(arguments: &[u8]) {
     let source = nic.mac_address();
 
     match peer {
-        Some(mac) => println!("Chatting with {} only. F12 or '/quit' to leave.", Mac(&mac)),
-        None => println!("Broadcasting to everyone listening. F12 or '/quit' to leave."),
+        Some(mac) => println!("Chatting with {} only. F12 (or F4/F6/F7/F8/F10) or '/quit' to leave.", Mac(&mac)),
+        None => println!("Broadcasting to everyone listening. F12 (or F4/F6/F7/F8/F10) or '/quit' to leave."),
     }
 
     let mut line = [0u8; CHAT_TEXT_CAPACITY];
@@ -918,7 +943,7 @@ fn chat_command(arguments: &[u8]) {
 
     'chat: loop {
         // Serial bytes take the same path a plain keyboard character
-        // would (there is no serial equivalent of the F12 escape key);
+        // would (there is no serial equivalent of the F12 (or F4/F6/F7/F8/F10) escape key);
         // only fall back to polling the keyboard -- which can also report
         // Escape -- once no serial byte is waiting.
         let event = match console::read_serial_byte() {
@@ -1216,7 +1241,7 @@ struct TapeTransfer {
 fn tape_load_net() {
     let Some(nic) = nic_or_report() else { return };
     let own_mac = nic.mac_address();
-    println!("Waiting for a tape over the network; press F12 to give up.");
+    println!("Waiting for a tape over the network; press F12 (or F4/F6/F7/F8/F10) to give up.");
     println!("Have the sender target this card's MAC address ({}).", Mac(&own_mac));
 
     let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];

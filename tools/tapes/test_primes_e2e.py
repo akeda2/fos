@@ -30,6 +30,9 @@ MCAST_PORT = 4242
 IMAGE = Path(__file__).resolve().parent.parent.parent / "build" / "fos.img"
 TAPE = Path(__file__).resolve().parent.parent.parent / "build" / "tapes" / "primes.bin"
 HOST_MAC = bytes.fromhex("02deadbeef01")
+CHAT_ETHERTYPE = (0x88, 0xB6)
+TERM_TAG_HELLO = 0x20
+TERM_TAG_BYE = 0x22
 
 
 class McastSocket:
@@ -99,8 +102,31 @@ def main() -> None:
         qemu.stdin.write((line + "\n").encode())
         qemu.stdin.flush()
 
+    def term_frame(destination: bytes, source: bytes, tag: int, payload: bytes = b"") -> bytes:
+        frame = bytearray(destination + source + bytes(CHAT_ETHERTYPE) + bytes([tag]) + payload)
+        if len(frame) < 60:
+            frame.extend(b"\0" * (60 - len(frame)))
+        return bytes(frame)
+
     try:
-        read_until(b"fos> ", 30)
+        # fos now runs `term net` automatically at boot (see shell::run/
+        # AGENTS.md), waiting for a remote terminal client before it ever
+        # shows the "fos> " prompt. This test doesn't want a term net
+        # session at all, just the ordinary local prompt to type
+        # `tape load net` into -- so it connects and immediately
+        # disconnects one, the same skip-past trick
+        # tools/test_term_net_tape_e2e.py already relies on.
+        read_until(b"Waiting for a remote terminal client to connect", 30)
+        del output[:]
+        mcast = McastSocket(MCAST_GROUP, MCAST_PORT)
+        mcast.send(term_frame(b"\xff" * 6, HOST_MAC, TERM_TAG_HELLO))
+        read_until(b"Remote terminal connected", 10)
+        read_until(b"fos> ", 5)  # the initial in-session prompt
+        del output[:]  # clear it so it can't be mistaken for the post-disconnect prompt below
+        mcast.send(term_frame(b"\xff" * 6, HOST_MAC, TERM_TAG_BYE))
+        read_until(b"Remote terminal disconnected", 10)
+        read_until(b"fos> ", 10)
+        del output[:]
         del output[:]
 
         send_line("nic")
@@ -115,7 +141,6 @@ def main() -> None:
         send_line("tape load net")
         time.sleep(0.5)  # give the shell a moment to enter its receive-wait loop
 
-        mcast = McastSocket(MCAST_GROUP, MCAST_PORT)
         data = TAPE.read_bytes()
         print(f"sending {len(data)}-byte tape...", file=sys.stderr)
         send_tape.send_tape(mcast, fos_mac, HOST_MAC, data, delay=0.003)

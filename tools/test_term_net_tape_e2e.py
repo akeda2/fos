@@ -160,7 +160,22 @@ def main() -> None:
             relayed.extend(payload[:end])
 
     try:
-        read_until(b"fos> ", 30)
+        # fos now runs `term net` automatically at boot (see shell::run/
+        # AGENTS.md), waiting for a remote terminal client before it ever
+        # shows the "fos> " prompt. Connect and immediately disconnect one
+        # to skip past that automatic wait and reach the ordinary local
+        # prompt below, same trick tools/tapes/test_primes_e2e.py uses --
+        # this test's own, later, deliberately-typed "term net" session is
+        # unrelated to this automatic one.
+        read_until(b"Waiting for a remote terminal client to connect", 30)
+        del output[:]
+        mcast.send(term_frame(BROADCAST_MAC, TERM_CLIENT_MAC, TERM_TAG_HELLO))
+        read_until(b"Remote terminal connected", 10)
+        read_until(b"fos> ", 5)  # the initial in-session prompt
+        del output[:]  # clear it so it can't be mistaken for the post-disconnect prompt below
+        mcast.send(term_frame(BROADCAST_MAC, TERM_CLIENT_MAC, TERM_TAG_BYE))
+        read_until(b"Remote terminal disconnected", 10)
+        read_until(b"fos> ", 10)
         del output[:]
 
         # Learn fos's own MAC address locally first (term_net's HELLO-wait

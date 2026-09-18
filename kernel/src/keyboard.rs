@@ -6,20 +6,34 @@ const STATUS_PORT: u16 = 0x64;
 const STATUS_OUTPUT_FULL: u8 = 1;
 const STATUS_INPUT_FULL: u8 = 2;
 
-/// Scan Code Set 1 make code for F12. Function keys sit at the same
-/// physical position and produce the same scancode on every keyboard
-/// layout this project targets (US, UK, Nordic, ...): unlike letter/symbol
-/// keys, they are never reached through Shift or AltGr. That makes F12 a
-/// good, layout-independent "leave raw terminal mode" key for `term` (see
-/// `shell::term_command`), which must intercept it before it would
-/// otherwise be forwarded byte-for-byte over the serial link.
-const ESCAPE_SCANCODE: u8 = 0x58;
+/// Scan Code Set 1 make codes for the function keys recognized as "leave
+/// this mode" keys throughout `shell.rs` (`term`, `term net`, `nic sniff`,
+/// `chat`, `tape load net`, ...). Function keys sit at the same physical
+/// position and produce the same scancode on every keyboard layout this
+/// project targets (US, UK, Nordic, ...): unlike letter/symbol keys, they
+/// are never reached through Shift or AltGr. F12 was the original choice
+/// for exactly that reason, but some terminal emulators and KVMs
+/// intercept F12 themselves (for their own menus/binds) before it ever
+/// reaches a guest, so several other function keys are recognized too --
+/// whichever one actually reaches the guest works, with no need to
+/// remember which; F1/F2/F3/F5/F9/F11 are left free since some terminals
+/// use those for other emulator-level bindings, and F12 stays first in
+/// this list since it remains the documented, most-mentioned choice.
+const ESCAPE_SCANCODES: [u8; 6] = [
+    0x58, // F12
+    0x3e, // F4
+    0x40, // F6
+    0x41, // F7
+    0x42, // F8
+    0x44, // F10
+];
 
 /// One decoded keyboard event as seen by `term`'s raw pass-through loop.
 pub enum KeyEvent {
     /// An ordinary key was pressed; forward this byte to the remote end.
     Char(u8),
-    /// F12 was pressed: stop forwarding and return to the fos shell.
+    /// One of `ESCAPE_SCANCODES` was pressed: stop forwarding and return
+    /// to the fos shell.
     Escape,
 }
 
@@ -91,14 +105,14 @@ pub fn pop_char() -> Option<u8> {
 }
 
 /// Drains one interrupt-queued scancode for `term`'s raw pass-through loop.
-/// Recognizes the F12 "leave raw mode" make code (see `ESCAPE_SCANCODE`)
-/// before decoding, so it is never forwarded as a character; every other
-/// key goes through the same shift-aware decoder as `pop_char`, so typed
-/// text still reaches the remote end as ordinary ASCII.
+/// Recognizes any of `ESCAPE_SCANCODES` ("leave raw mode" make codes)
+/// before decoding, so they are never forwarded as characters; every
+/// other key goes through the same shift-aware decoder as `pop_char`, so
+/// typed text still reaches the remote end as ordinary ASCII.
 pub fn poll_term_event() -> Option<KeyEvent> {
     let scancode = interrupts::pop_scancode()?;
     let released = scancode & 0x80 != 0;
-    if scancode & 0x7f == ESCAPE_SCANCODE {
+    if ESCAPE_SCANCODES.contains(&(scancode & 0x7f)) {
         return if released { None } else { Some(KeyEvent::Escape) };
     }
     #[allow(static_mut_refs)]

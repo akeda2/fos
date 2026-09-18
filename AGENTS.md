@@ -648,6 +648,51 @@ single-threaded, nested-nothing design, combined with whatever a nested
 command's own output actually goes through -- but are exactly the kind of
 thing worth a regression test given how easy they'd be to silently break.
 
+### `term net` at boot, and more "give up" function keys
+
+`shell::run` now calls `term_net` once, automatically, before it ever
+enters the ordinary interactive prompt loop -- so every fos machine waits
+for a remote terminal client by default at every boot, with no manual
+step required. This matters most for a machine with no attached
+screen/keyboard: it is reachable over the network the moment it finishes
+booting. `term_net` already tolerated "no NIC" gracefully (it just prints
+a message and returns via `nic_or_report`), so this needed no change to
+`term_net` itself, only one new call site in `run`. A local operator
+watching a real screen who wants the ordinary prompt immediately, without
+waiting, presses one of the "give up" keys below; if a remote client
+connects first instead, disconnecting (locally or from the remote end)
+falls through to the exact same local shell afterward, same as a manually
+invoked `term net` session always has.
+
+There is deliberately no serial equivalent of "give up" for this
+automatic wait (mirrored from `term_net`'s own pre-existing convention):
+reading one byte here to mean "give up" would silently eat the first
+character of whatever a serial operator was about to type, and a
+serial-only operator can still reach the local prompt the same way this
+project's own net e2e tests do -- have any peer connect and then
+disconnect (`TERM_TAG_HELLO` then `TERM_TAG_BYE`), which `tools/
+tapes/test_primes_e2e.py`, `tools/tapes/test_primes_vga_e2e.py`, and
+`tools/test_term_net_tape_e2e.py` were all updated to do at the very
+start of each run, now that this automatic wait exists.
+
+Separately, `keyboard::ESCAPE_SCANCODES` (`kernel/src/keyboard.rs`) grew
+from a single F12 scancode to six: F12, F4, F6, F7, F8, and F10. F12 was
+always a deliberate choice for being a function key (same physical
+position/scancode on every keyboard layout this project targets,
+unreachable through Shift/AltGr, so nothing about the current locale
+matters) rather than an ordinary printable character that would need
+distinguishing from real typed text. The problem in practice: some
+terminal emulators, KVMs, and remote-desktop clients intercept F12
+themselves before it ever reaches a guest OS, so a fos operator using one
+of those had no working "give up" key at all. Recognizing several
+function keys instead -- whichever one actually reaches the guest works,
+with nothing to remember or configure -- fixes this without weakening the
+original rationale for using a function key in the first place. F1/F2/F3/
+F5/F9/F11 were deliberately left out since some terminals bind those to
+their own emulator-level features (new tab, fullscreen, etc.); F12 stays
+first in the list and in every user-facing message since it remains the
+most commonly documented, most muscle-memory choice.
+
 
 ## Real hardware notes
 

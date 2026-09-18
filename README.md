@@ -121,20 +121,20 @@ resetting to row 0 and overwriting the top of that narration.
 | `write NAME TEXT` | Creates or replaces a one-sector FOSFS text file. Names use up to 16 uppercase letters, digits, `.`, `_`, or `-`; oversized content, a full directory, or a full data region are each reported distinctly. |
 | `rm NAME` | Removes a FOSFS file entry. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
-| `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
+| `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
 | `nic` | Reports whether an RTL8139 Ethernet controller was found on PCI (and, if so, its MAC address). |
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
 | `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
-| `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 stops the capture, then turns promiscuous mode back off. |
-| `nic discover` | Broadcasts a `chat`-protocol discovery probe (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 stops it (only fos machines currently running `chat` or `nic discover` reply). |
+| `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 (or F4/F6/F7/F8/F10) stops the capture, then turns promiscuous mode back off. |
+| `nic discover` | Broadcasts a `chat`-protocol discovery probe (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 (or F4/F6/F7/F8/F10) stops it (only fos machines currently running `chat` or `nic discover` reply). |
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
-| `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (local keyboard) or by typing `/quit` (works over serial too). |
+| `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (or F4/F6/F7/F8/F10) (local keyboard) or by typing `/quit` (works over serial too). |
 | `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
 | `tape load disk NAME` | Loads a FOSFS file straight into a fresh tape buffer (bounded by FOSFS's current 512-byte one-sector file limit). |
-| `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 to give up. |
+| `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
 | `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing the kernel's own `console::print_byte` as its one argument so its printed output goes through the same VGA/serial/relay path as any other command's. If it ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
-| `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 disconnects it (or the peer can disconnect first). While waiting or connected, also auto-replies to `nic discover` probes, same as `chat`/`tape load net`. |
+| `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, also auto-replies to `nic discover` probes, same as `chat`/`tape load net`. This same wait now also runs automatically once at every boot, before the interactive prompt appears. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
@@ -456,17 +456,40 @@ a bounded "relay queue" can tap into without touching any individual
 `println!` call site.
 
 `term net` waits for a `TERM_TAG_HELLO` frame (sharing `CHAT_ETHERTYPE`
-with `chat`/`tape`/discovery) from any peer -- press F12 to give up first
--- then locks onto that peer's MAC for the session. Once connected: local
-PS/2 keyboard and VGA input stop being read entirely (this is an exclusive
-takeover, not a mirrored session); everything the shell prints is captured
-by the relay queue and forwarded as `TERM_TAG_DATA` frames; and incoming
-`TERM_TAG_DATA` payload bytes are fed byte-by-byte into the same
-`LineEditor` a local keyboard would drive. A `TERM_TAG_BYE` frame from
-either side ends the session and returns control to the local console.
-Like `tape load net`/`chat`, it keeps answering `CHAT_TAG_DISCOVER_REQUEST`
-probes the whole time it runs, before and during a connected session, so
-leaving `term net` open is enough to make a machine discoverable.
+with `chat`/`tape`/discovery) from any peer -- press F12 (or F4/F6/F7/F8/
+F10 -- see below) to give up first -- then locks onto that peer's MAC for
+the session. Once connected: local PS/2 keyboard and VGA input stop being
+read entirely (this is an exclusive takeover, not a mirrored session);
+everything the shell prints is captured by the relay queue and forwarded
+as `TERM_TAG_DATA` frames; and incoming `TERM_TAG_DATA` payload bytes are
+fed byte-by-byte into the same `LineEditor` a local keyboard would drive.
+A `TERM_TAG_BYE` frame from either side ends the session and returns
+control to the local console. Like `tape load net`/`chat`, it keeps
+answering `CHAT_TAG_DISCOVER_REQUEST` probes the whole time it runs,
+before and during a connected session, so leaving `term net` open is
+enough to make a machine discoverable.
+
+fos now starts a `term net` wait automatically at every boot, before the
+ordinary interactive prompt ever appears -- so every fos machine is
+reachable over the network by default, with no manual step, which
+matters most for a machine with no attached screen/keyboard at all. A
+local operator watching a real screen presses one of the "give up" keys
+below to skip straight to the interactive prompt instead; if a remote
+client connects first, disconnecting (from either end) falls through to
+that same local prompt afterward, exactly as a manually typed `term net`
+session always has. There is no serial equivalent of "give up" for this
+wait (same limitation `chat`/`term` already have): a serial-only operator
+reaches the local prompt the same way this project's own tests do -- have
+any peer connect and then disconnect.
+
+"Give up" recognizes six function keys, not just F12: F12, F4, F6, F7,
+F8, and F10 (see `keyboard::ESCAPE_SCANCODES`). F12 was always chosen for
+being a function key -- same scancode on every keyboard layout this
+project targets, never reachable through Shift/AltGr -- but some terminal
+emulators and KVMs intercept F12 themselves before it reaches a guest OS,
+leaving no working "give up" key at all on those setups. Any of the six
+now works, with nothing to configure; F1/F2/F3/F5/F9/F11 are deliberately
+left alone since some terminals bind those to their own features.
 
 The client side is `tools/term_net.py`, built on the same raw
 `AF_PACKET`-socket/MAC-discovery approach as `tools/send_tape.py`. Its
@@ -492,7 +515,7 @@ type `tape run`. Two things are worth knowing before relying on this:
   `term_net`'s own outer loop -- including the relay-queue drain and the
   `TERM_TAG_BYE`/keystroke handling that loop does -- until they return.
   A remote client's keystrokes or even a `TERM_TAG_BYE` sent while one is
-  in flight are silently dropped, not queued; only local F12 can interrupt
+  in flight are silently dropped, not queued; only local F12 (or F4/F6/F7/F8/F10) can interrupt
   `tape load net` early, and `tape run` cannot be interrupted at all once
   started (same as running it locally).
 - Only the kernel's own printed messages around a tape -- "Tape loaded",

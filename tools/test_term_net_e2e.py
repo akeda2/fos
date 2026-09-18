@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""One-off end-to-end test: connect to a running fos QEMU instance with
-`term net`, run a couple of ordinary shell commands remotely, and check
-that their output actually made it back over the (emulated) wire.
+"""One-off end-to-end test: connect to a running fos QEMU instance's
+automatic-at-boot `term net` session, run a couple of ordinary shell
+commands remotely, and check that their output actually made it back
+over the (emulated) wire. Since fos now starts `term net` on its own at
+every boot (see `shell::run`), this no longer needs to type `term net`
+itself -- it just waits for the "Waiting for a remote terminal client to
+connect" banner before sending its own `TERM_TAG_HELLO`.
 
 Not part of `make test` -- like `tools/tapes/test_primes_e2e.py`, this is a
 manual verification script exercising a real Ethernet round-trip, kept
@@ -94,16 +98,13 @@ def main() -> None:
                     raise SystemExit(f"QEMU serial stream ended early:\n{output.decode('utf-8', 'replace')}")
                 output.extend(chunk)
 
-    def send_line(line: str) -> None:
-        qemu.stdin.write((line + "\n").encode())
-        qemu.stdin.flush()
-
     try:
-        read_until(b"fos> ", 30)
+        read_until(b"Waiting for a remote terminal client to connect", 30)
         del output[:]
-
-        send_line("term net")
-        time.sleep(0.5)  # give the shell a moment to enter its HELLO-wait loop
+        # fos now runs `term net` automatically at boot (see
+        # shell::run/AGENTS.md), so there is no need to type it -- the
+        # HELLO-wait loop is already active by the time the marker above
+        # appears.
 
         mcast = McastSocket(MCAST_GROUP, MCAST_PORT)
         mcast.send(frame(BROADCAST_MAC, HOST_MAC, TERM_TAG_HELLO))
