@@ -166,21 +166,28 @@ def main() -> None:
     parser.add_argument(
         "--discover-timeout",
         type=float,
-        default=1.0,
-        help="Seconds to wait for discovery replies before giving up (default: 1.0).",
+        default=2.0,
+        help=(
+            "Seconds to wait for discovery replies before giving up (default: 2.0). "
+            "A backlogged fos receiver (e.g. still draining frames left over from a "
+            "prior aborted transfer) can take noticeably longer than one second to "
+            "reach and answer a fresh discovery probe, even though its own console "
+            "shows the reply going out promptly -- give it more room here rather than "
+            "assuming a quiet return means fos never replied."
+        ),
     )
     parser.add_argument(
         "--delay",
         type=float,
-        default=0.0,
+        default=0.003,
         help=(
-            "Seconds to sleep between data frames. fos's RTL8139 driver only polls "
-            "for frames (no interrupt, and one receive ring no bigger than 32 KiB); "
-            "on real hardware, sending a nontrivial tape with no delay at all can "
-            "outrun it and lose data (fos reports this as an overflow-recovery count "
-            "and/or a 'Gap in tape data' abort, never a silent hang). "
-            "0.003 (3ms) has been confirmed reliable against real hardware for a "
-            "~1 MB tape; QEMU needs the same pacing (default: 0, none)."
+            "Seconds to sleep between data frames (default: 0.003, i.e. 3ms). fos's "
+            "RTL8139 driver only polls for frames (no interrupt, and one receive ring "
+            "no bigger than 32 KiB); on real hardware, sending a nontrivial tape with "
+            "little or no delay can outrun it and lose data (fos reports this as an "
+            "overflow-recovery count and/or a 'Gap in tape data' abort, never a silent "
+            "hang). 0.003 has been confirmed reliable against real hardware for a "
+            "~1 MB tape; QEMU needs the same pacing. Pass --delay 0 to disable."
         ),
     )
     args = parser.parse_args()

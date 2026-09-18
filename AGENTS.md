@@ -758,7 +758,11 @@ future contributor doesn't have to rediscover them from scratch:
   boundary (see "Deliberately deferred work" below), not a bug still to
   be chased further; pacing sends of any nontrivial tape remains expected
   practice, exactly as `send_tape.py`'s own `--delay` flag already
-  documented before this investigation.
+  documented before this investigation. `send_tape.py`'s `--delay`
+  default was later changed from 0 to 0.003 (matching every value
+  confirmed reliable above), since real hardware needs it essentially
+  always, not just for unusually large tapes -- passing `--delay 0`
+  explicitly still opts back into the old unpaced behavior.
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
