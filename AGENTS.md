@@ -367,12 +367,17 @@ real-mode stack pointer's `0x9f000`).
 
 Because a tape can write VGA memory and move the hardware cursor directly
 (see `tools/tapes/primes.S` below) with no way to tell `console.rs` it did
-so, `tape_run` calls the new `console::resync_cursor()` immediately after
-the tape returns -- it just re-reads the CRTC cursor position the same way
-`console::initialize()` already does once at boot, so the shell's next
-line of output continues from wherever the tape actually left the cursor
-instead of overwriting the tape's own output from a stale, pre-tape
-position.
+so, `tape_run` originally called a `console::resync_cursor()` immediately
+after the tape returned -- it just re-read the CRTC cursor position the
+same way `console::initialize()` already does once at boot, so the
+shell's next line of output would continue from wherever the tape
+actually left the cursor instead of overwriting the tape's own output
+from a stale, pre-tape position. This whole mechanism (and the function
+itself) was later removed once tapes stopped touching the CRTC directly
+at all -- see the "tape print callback ABI" section further below, which
+is the current design; the paragraphs immediately following this one
+describe the tape as it worked *before* that change, for historical
+context on the bugs that shaped `primes.S`'s scroll/cursor handling.
 
 `tools/tapes/primes.S` is a worked, non-trivial test tape: a
 Sieve-of-Eratosthenes prime counter up to 1,000,000, assembled the same
@@ -458,6 +463,70 @@ already owns stdio). Anyone touching `print_char`/`print_decimal`/cursor
 handling in `primes.S` should run this test, not just the serial-based
 one, since only it actually checks what the tape's real screen would
 show.
+
+### Tape print callback ABI
+
+The hand-rolled VGA/CRTC/COM1 output described above worked, but it had a
+deeper cost than just being a source of subtle bugs: it wrote to
+hardware directly, entirely bypassing `console::write_serial` -- the one
+function `term_net`'s relay queue (`console::enable_relay`/`relay_push`)
+taps into -- so a tape's own printed output could never reach a remote
+`term net` client, only whatever wrapper messages `shell.rs` itself
+printed around it (see "Remote terminal (`term net`)" below for the
+`term_net`/tape interaction in general). Duplicating scroll and cursor
+logic in assembly was also just inherently more bug-prone than reusing
+the kernel's own, already-correct implementation, as the two bugs above
+demonstrate.
+
+The fix: `tape_run`'s entry type changed from a zero-argument
+`extern "C" fn()` to `extern "C" fn(putc: extern "C" fn(u32))` (still
+cdecl), and it now calls `entry(console::print_byte)` instead of
+`entry()`. `console::print_byte` is a new, narrow `extern "C" fn(u32)`
+wrapper around the existing `console::write_bytes(&[byte as u8])` -- the
+same single function every other command's `println!` ultimately goes
+through, so it already correctly handles VGA placement, scrolling, the
+hardware cursor, the COM1 mirror, and relaying to `term_net` if active,
+all in one place. The argument is widened from `u8` to `u32` specifically
+so the calling convention at the assembly call site is unambiguous (a
+full zero-extended 32-bit stack slot), rather than depending on how a
+particular Rust/LLVM version happens to pass a sub-word argument under
+cdecl.
+
+`tools/tapes/primes.S` was rewritten around this: its `_start` prologue
+now captures the callback pointer from `4(%esp)` (the tape's one cdecl
+argument) into a `putc_fn` data slot (replacing the old `cursor_pos`
+slot) right after computing its own PIC base, `print_char` now just
+zero-extends its byte into `%eax`, pushes it, and `call`s through
+`putc_fn`, and the old hand-rolled `print_char_newline`/
+`print_char_scroll`/`print_char_move_cursor`/`serial_putc` routines (and
+the `VGA_*`/`CRTC_*`/`COM1_*` constants they used) are gone entirely --
+none of it is needed anymore. `print_decimal`'s earlier `%ebx`-vs-`%edi`
+fix (described above) remains necessary and correct under this design
+too: `%ebx` is still this file's PIC load-base register, needed by every
+`print_char` call to locate `putc_fn` itself (`(putc_fn - get_base)(%ebx)`),
+so `print_decimal` still must not repurpose it as a digit counter.
+
+Because `console::print_byte` is a plain Rust `extern "C" fn`, the tape
+no longer needs to save/restore any of `%ebx`/`%esi`/`%edi`/`%ebp` around
+the *callback* call specifically (Rust-generated code preserves its own
+callee-saved registers automatically); it still saves/restores them
+around its own body as a whole, since `tape_run` itself still calls the
+tape's `_start` as a plain cdecl function.
+
+This also made `tape_run`'s `console::resync_cursor()` call unnecessary:
+a tape that only ever prints through the callback never touches the CRTC
+directly, so the kernel's own cached `ROW`/`COLUMN` state is never stale
+to begin with. That function and its call site were removed rather than
+kept as dead weight -- nothing currently needs a "the tape misbehaved and
+touched hardware anyway" recovery path, and one can be re-added if a
+future tape ever needs it.
+
+`tools/test_term_net_tape_e2e.py` (see "Remote terminal (`term net`)"
+below) was updated to assert the opposite of what it asserted before this
+change: the primes tape's own `78498`/`999983` digits now DO appear in
+the burst of `TERM_TAG_DATA` frames relayed to a remote `term net` client
+after `tape run` returns, proving the callback actually reaches the relay
+queue end-to-end over the network, not just in the local VGA/serial view.
 
 ## Remote terminal (`term net`)
 
@@ -561,17 +630,24 @@ rather than surprises:
   printed line around a tape (`Tape loaded: ...`, `Running N-byte tape...`,
   `Tape returned; back at the fos shell.`) reaches the remote client only
   as one burst once the nested command returns, never live.
-- `primes.S`'s own summary output writes VGA/COM1 directly (see the tape
-  section above), entirely bypassing `console::write_serial` and thus the
-  relay queue -- so it appears on QEMU's raw serial stream (or, on real
-  hardware, the physical screen) exactly as it always did, but never in a
-  single `TERM_TAG_DATA` frame sent to the remote client. A remote
-  operator can load and run a tape, but only a local operator ever sees
-  what it actually prints.
-Neither of these needed any code change to work correctly -- they follow
-directly from `term_net`'s existing single-threaded, nested-nothing design
--- but are exactly the kind of thing worth a regression test given how
-easy they'd be to silently break.
+- Since the "tape print callback ABI" change described above,
+  `primes.S`'s own summary digits print through `console::print_byte`,
+  the same combined VGA+serial+relay path every other command's output
+  goes through -- so they now DO appear in that same relayed burst
+  alongside the wrapper messages, not just on QEMU's raw serial stream
+  (or a real machine's physical screen). A remote operator driving
+  `tape load net`/`tape run` over `term net` now sees the tape's actual
+  output too, just delayed until the nested command returns rather than
+  streamed live. (This is a change from this feature's first version,
+  when tapes still wrote VGA/COM1 directly and their output truly was
+  local-only; `tools/test_term_net_tape_e2e.py` was updated accordingly
+  once the callback ABI landed.)
+Neither of these needed any code change to `term_net` itself to work
+correctly -- they follow directly from `term_net`'s existing
+single-threaded, nested-nothing design, combined with whatever a nested
+command's own output actually goes through -- but are exactly the kind of
+thing worth a regression test given how easy they'd be to silently break.
+
 
 ## Real hardware notes
 

@@ -48,56 +48,57 @@
  *
  * Registers and calling convention
  * ----------------------------------
- * The shell calls this tape as a plain `extern "C" fn()` (see
- * kernel/src/shell.rs's `tape_run`), i.e. the cdecl convention: %eax, %ecx,
- * %edx are ours to clobber freely, but %ebx, %esi, %edi, %ebp (and %esp)
- * must come back exactly as they went in, or the shell code that resumes
- * after `tape run` could behave unpredictably. This file saves those four
- * registers on entry and restores them immediately before the final `ret`,
- * even though %ebx is then immediately repurposed as this file's own load
- * base for the rest of its run.
+ * The shell calls this tape as `extern "C" fn(putc: extern "C" fn(u32))`
+ * (see kernel/src/shell.rs's `tape_run`), i.e. plain cdecl with one
+ * argument: a function pointer this file must call to print one byte,
+ * passed on the stack (at `4(%esp)` on entry, before any of this file's
+ * own pushes) exactly the way any C caller would pass it. %eax, %ecx,
+ * %edx are ours to clobber freely (and calling through the passed
+ * pointer clobbers them too, same as any other cdecl call); %ebx, %esi,
+ * %edi, %ebp (and %esp) must come back exactly as they went in, or the
+ * shell code that resumes after `tape run` could behave unpredictably.
+ * This file saves those four registers on entry and restores them
+ * immediately before the final `ret`, even though %ebx is then
+ * immediately repurposed as this file's own load base for the rest of
+ * its run, and the passed callback pointer is saved (relative to that
+ * base) into `putc_fn` before %eax is clobbered by anything else.
  *
- * VGA and serial output
- * ----------------------
- * There is no ABI to call back into the kernel's own console code, so this
- * writes VGA text memory (0xb8000, one word per cell: attribute byte 0x07
- * in the high byte, ASCII in the low byte) and drives the CRTC cursor
- * ports (0x3d4 index / 0x3d5 data, registers 0x0e/0x0f) directly, matching
- * kernel/src/console.rs's own conventions exactly (see that file's
- * comments on why writing the framebuffer alone does not move the real,
- * blinking hardware cursor). It starts from whatever cursor position the
- * shell already left behind, so its first line continues naturally after
- * the shell's own last output. If printing would run past the last VGA
- * row, it scrolls the screen up by one row first, the same as
- * kernel/src/console.rs's own newline() does -- this was not implemented
- * in an earlier version of this file (reasoned, incorrectly, that four
- * short lines could never need it), which on real hardware silently wrote
- * this tape's entire summary off-screen whenever the cursor was already
- * further down the screen than a fresh QEMU boot typically leaves it.
- * Because the tape moves the hardware cursor but has no
- * way to update the kernel's own cached cursor position, kernel/src/shell.rs
- * re-syncs it via console::resync_cursor() immediately after this tape
- * returns, so the shell's next line of output continues from the right
- * place instead of overwriting this summary.
+ * VGA, serial, and cursor output
+ * --------------------------------
+ * All output goes through the one passed-in `putc_fn` callback, which
+ * `tape_run` sets to `console::print_byte` -- a thin wrapper around the
+ * same `console::write_bytes` every other kernel message uses. That means
+ * this file no longer touches VGA memory, the CRTC cursor ports, or COM1
+ * directly at all: the kernel's own console code already handles VGA
+ * placement, scrolling, the hardware cursor, the COM1 mirror, and (when a
+ * `term net` session is active) forwarding to a remote client, all in one
+ * place, uniformly for every caller. `print_char` below is now just a
+ * one-byte-at-a-time wrapper around calling that pointer.
  *
- * Every character is also mirrored to the COM1 UART (0x3f8, same port the
- * kernel's own console uses), matching kernel/src/console.rs's own
- * dual-output habit. Besides being consistent with the rest of fos, this
- * is what makes the tape's result checkable by the same serial-driven
- * automated smoke test the rest of the project uses (see
- * tools/qemu_smoke.py) instead of needing a screen-capture/OCR pipeline
- * just for this one test tape.
+ * This is a deliberate, narrow exception to "a tape cannot call back into
+ * the kernel" (see below): earlier versions of this file reimplemented
+ * VGA/cursor/serial output by hand instead, which needed its own
+ * from-scratch scroll-bounds logic (a real bug here once let output
+ * silently scroll off an already-mostly-full real-hardware screen) and
+ * kept its own `cursor_pos`, disconnected from the kernel's own -- both
+ * problems this callback design eliminates entirely, since there is now
+ * only ever one piece of code (the kernel's own) that ever touches VGA
+ * state. It also means this tape's output is no longer local-only: it
+ * now reaches a remote `term net` client exactly like any other command's
+ * output does (see AGENTS.md's "Remote terminal" section), which was the
+ * entire reason this callback was added.
  *
  * Timing
  * -------
- * There is likewise no stable way to call into the kernel's timer code, so
- * elapsed time is measured with the RDTSC instruction (always available in
- * ring 0) around the sieve, reported as raw CPU cycles rather than
- * calibrated seconds -- it is a relative, uncalibrated measurement, not a
- * wall-clock time, and is printed as such. The 64-bit TSC delta's high
- * 32 bits are assumed to be zero: at any realistic CPU clock speed, sieving
- * a million numbers finishes in far under the ~4 billion cycles the low
- * 32 bits alone can hold, so only the low half is printed.
+ * There is still no callback for timing (RDTSC is a plain CPU instruction
+ * available in ring 0 regardless, so one was never needed), so elapsed
+ * time is measured with RDTSC around the sieve and reported as raw CPU
+ * cycles rather than calibrated seconds -- it is a relative, uncalibrated
+ * measurement, not a wall-clock time, and is printed as such. The 64-bit
+ * TSC delta's high 32 bits are assumed to be zero: at any realistic CPU
+ * clock speed, sieving a million numbers finishes in far under the ~4
+ * billion cycles the low 32 bits alone can hold, so only the low half is
+ * printed.
  *
  * Build: `make tape-primes` assembles this with the same `as --32` +
  * `objcopy -O binary` recipe used for boot/stage1.S and boot/stage2.S,
@@ -109,20 +110,15 @@
 .global _start
 
 .equ N,                   1000000
-.equ VGA_BASE,             0xb8000
-.equ VGA_ATTR,             0x07
-.equ VGA_WIDTH,            80
-.equ VGA_HEIGHT,           25
-.equ CRTC_INDEX_PORT,      0x3d4
-.equ CRTC_DATA_PORT,       0x3d5
-.equ CRTC_CURSOR_HIGH,     0x0e
-.equ CRTC_CURSOR_LOW,      0x0f
-.equ COM1_PORT,            0x3f8
-.equ COM1_LINE_STATUS,     0x3fd
-.equ COM1_TX_EMPTY,        0x20
-.equ COM1_WAIT_ATTEMPTS,   100000
 
 _start:
+    # cdecl argument #1 (the kernel's print-byte callback) sits at
+    # 4(%esp) right now -- 0(%esp) is the return address `call _start`
+    # pushed, and nothing else has touched %esp yet. Grab it into %eax
+    # before the pushes below shift everything, so it can be saved
+    # (relative to our PIC base) once that base is known.
+    movl 4(%esp), %eax
+
     # Preserve the caller's callee-saved registers (cdecl): we are about to
     # repurpose %ebx as our own position-independent load base, and %esi /
     # %edi as loop and pointer scratch, for the whole run.
@@ -135,29 +131,12 @@ _start:
     call get_base
 get_base:
     pop %ebx                       # %ebx = our own runtime load address
+    movl %eax, (putc_fn - get_base)(%ebx)
 
     # Record the starting TSC so we can report elapsed cycles later.
     rdtsc
     movl %eax, (tsc_start_lo - get_base)(%ebx)
     movl %edx, (tsc_start_hi - get_base)(%ebx)
-
-    # Read the current hardware cursor position so our first printed
-    # character continues right after whatever the shell already printed,
-    # instead of starting at row/col 0.
-    movb $CRTC_CURSOR_HIGH, %al
-    movw $CRTC_INDEX_PORT, %dx
-    outb %al, %dx
-    movw $CRTC_DATA_PORT, %dx
-    inb %dx, %al
-    movb %al, %ch
-    movb $CRTC_CURSOR_LOW, %al
-    movw $CRTC_INDEX_PORT, %dx
-    outb %al, %dx
-    movw $CRTC_DATA_PORT, %dx
-    inb %dx, %al
-    movb %al, %cl
-    movzwl %cx, %ecx
-    movl %ecx, (cursor_pos - get_base)(%ebx)
 
     # Zero the sieve array explicitly. The tape's own bytes already arrive
     # as zero (it is a literal .fill in this file), but pmem-allocated
@@ -281,12 +260,13 @@ print_string_done:
 # repeated-division-by-10 algorithm. Clobbers %eax, %ecx, %edx. Tracks its
 # pushed-digit count in %edi rather than %ebx: %ebx is this whole file's
 # PIC load-base register, live across every call to print_char (which
-# dereferences `cursor_pos - get_base` off of it), so repurposing it here
-# -- an earlier version of this routine did exactly that -- silently broke
-# every digit's on-screen position while this loop ran, without ever
-# affecting the parallel COM1 mirror byte serial_putc also writes; that
-# mismatch is exactly why this bug was invisible to a serial-only e2e
-# test and only showed up watching the real VGA screen.
+# dereferences `putc_fn - get_base` off of it to find the kernel's print
+# callback), so repurposing it here -- an earlier version of this routine
+# did exactly that -- silently broke every digit's on-screen position
+# while this loop ran, without affecting the COM1 mirror the kernel's own
+# callback also produced; that mismatch is exactly why this bug was
+# invisible to a serial-only e2e test and only showed up watching the
+# real VGA screen.
 #
 print_decimal:
     pushl %edi                  # repurposed here as a pushed-digit counter
@@ -310,130 +290,32 @@ print_decimal_emit:
     ret
 
 #
-# print_char: prints the character in %al at the tracked cursor position,
-# then re-programs the CRTC hardware cursor to match, and mirrors the same
-# byte to COM1 (matching kernel/src/console.rs's own dual VGA+serial
-# habit). '\n' moves to the start of the next text row without touching
-# VGA memory. If that would advance past the last row (VGA_HEIGHT), the
-# whole screen is scrolled up by one row first -- mirroring
-# kernel/src/console.rs's own newline()/scroll logic -- since real
-# hardware, unlike a fresh QEMU boot, can easily have already scrolled the
-# cursor well down the screen by the time a tape runs (a longer BIOS/boot
-# narration, more commands typed first, etc.); without this, this tape's
-# own summary lines silently wrote past the visible 80x25 window and were
-# never seen at all, a real bug found by running this tape on physical
-# hardware. Clobbers nothing visible to the caller.
+# print_char: prints the byte in %al by calling back into the kernel's own
+# console code (see the file header comment) via the saved `putc_fn`
+# pointer, zero-extended to 32 bits to match its `extern "C" fn(u32)`
+# signature and pushed as its one cdecl argument. The callback (usually
+# `console::print_byte`) handles VGA placement, scrolling, the hardware
+# cursor, the COM1 mirror, and term_net relaying all by itself -- this
+# routine no longer needs to know or care about any of that. Clobbers
+# nothing visible to the caller.
 #
 print_char:
     pushl %eax
     pushl %ecx
     pushl %edx
-    call serial_putc
-    cmpb $'\n', %al
-    je print_char_newline
-
-    movl (cursor_pos - get_base)(%ebx), %ecx
-    movb %al, %dl
-    movb $VGA_ATTR, %dh
-    movw %dx, VGA_BASE(, %ecx, 2)
-    incl %ecx
-    movl %ecx, (cursor_pos - get_base)(%ebx)
-    cmpl $(VGA_WIDTH * VGA_HEIGHT), %ecx
-    jae print_char_scroll
-    jmp print_char_move_cursor
-
-print_char_newline:
-    movl (cursor_pos - get_base)(%ebx), %eax
-    xorl %edx, %edx
-    movl $VGA_WIDTH, %ecx
-    divl %ecx                   # eax = pos / 80, edx = pos % 80 (unused)
-    incl %eax
-    imull %ecx, %eax             # eax = (pos / 80 + 1) * 80
-    movl %eax, (cursor_pos - get_base)(%ebx)
-    cmpl $(VGA_WIDTH * VGA_HEIGHT), %eax
-    jae print_char_scroll
-    jmp print_char_move_cursor
-
-#
-# print_char_scroll: copies text rows 1..VGA_HEIGHT-1 up by one row, blanks
-# the new last row, and resets cursor_pos to the start of that last row --
-# the same outcome as kernel/src/console.rs's own newline()/scroll, just
-# using `rep movsw`/`rep stosw` (hence the explicit %esi/%edi save/restore,
-# since both are live caller state -- e.g. print_string's own %esi loop
-# pointer -- that must come back unchanged, unlike %eax/%ecx/%edx, which
-# print_char already saves/restores around its entire body).
-#
-print_char_scroll:
-    pushl %esi
-    pushl %edi
-    movl $(VGA_BASE + VGA_WIDTH * 2), %esi
-    movl $VGA_BASE, %edi
-    movl $(VGA_WIDTH * (VGA_HEIGHT - 1)), %ecx
-    rep movsw
-    movl $(VGA_BASE + VGA_WIDTH * (VGA_HEIGHT - 1) * 2), %edi
-    movw $((VGA_ATTR << 8) | ' '), %ax
-    movl $VGA_WIDTH, %ecx
-    rep stosw
-    popl %edi
-    popl %esi
-    movl $(VGA_WIDTH * (VGA_HEIGHT - 1)), %eax
-    movl %eax, (cursor_pos - get_base)(%ebx)
-
-print_char_move_cursor:
-    movl (cursor_pos - get_base)(%ebx), %ecx
-    movb $CRTC_CURSOR_LOW, %al
-    movw $CRTC_INDEX_PORT, %dx
-    outb %al, %dx
-    movb %cl, %al
-    movw $CRTC_DATA_PORT, %dx
-    outb %al, %dx
-    movb $CRTC_CURSOR_HIGH, %al
-    movw $CRTC_INDEX_PORT, %dx
-    outb %al, %dx
-    movb %ch, %al
-    movw $CRTC_DATA_PORT, %dx
-    outb %al, %dx
-
-    popl %edx
-    popl %ecx
-    popl %eax
-    ret
-
-#
-# serial_putc: writes the character in %al to COM1, waiting (with a
-# bounded retry count, matching kernel/src/console.rs's own
-# write_serial()) for the UART's transmit-holding-register-empty bit.
-# Gives up silently if COM1 never becomes ready, exactly like the kernel
-# does, rather than hanging forever. Preserves %al for the caller.
-#
-serial_putc:
+    movzbl %al, %eax
     pushl %eax
-    pushl %ecx
-    pushl %edx
-    movb %al, %ah
-    movl $COM1_WAIT_ATTEMPTS, %ecx
-serial_putc_wait:
-    movw $COM1_LINE_STATUS, %dx
-    inb %dx, %al
-    testb $COM1_TX_EMPTY, %al
-    jnz serial_putc_ready
-    decl %ecx
-    jnz serial_putc_wait
-    jmp serial_putc_done
-serial_putc_ready:
-    movb %ah, %al
-    movw $COM1_PORT, %dx
-    outb %al, %dx
-serial_putc_done:
+    call *(putc_fn - get_base)(%ebx)
+    addl $4, %esp
     popl %edx
     popl %ecx
     popl %eax
     ret
 
     .align 4
+putc_fn:              .long 0
 tsc_start_lo:        .long 0
 tsc_start_hi:         .long 0
-cursor_pos:            .long 0
 saved_count:            .long 0
 saved_last_prime:        .long 0
 saved_elapsed:            .long 0

@@ -1117,20 +1117,30 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// if it hangs, faults, or corrupts kernel state, there is no recovery --
 /// a reset or power-cycle is required, exactly as with any other
 /// unrecoverable fault this kernel reports.
+///
+/// Called as `extern "C" fn(putc: extern "C" fn(u32))` (cdecl, one
+/// argument): `console::print_byte` is passed as that argument, giving a
+/// tape a narrow, explicit way to call back into the kernel's own console
+/// code to print, instead of touching VGA/COM1 hardware directly (see
+/// `tools/tapes/primes.S`'s header comment for why this one callback was
+/// worth the exception). This is what makes a tape's own output show up
+/// over `term net` like any other command's, and is why `tape_run` no
+/// longer needs to re-sync the console's cursor state afterward: a tape
+/// that only ever prints through this callback never touches the
+/// hardware cursor itself, so the kernel's own cached position is never
+/// stale to begin with. (A tape is still ring-0 code and technically free
+/// to ignore the callback and touch hardware directly anyway -- nothing
+/// enforces this convention -- so this remains just that: a convention,
+/// not a sandboxed boundary.)
 fn tape_run() {
     let Some((address, length)) = tape_get() else {
         println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
         return;
     };
     println!("Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery.");
-    let entry: extern "C" fn() = unsafe { core::mem::transmute::<usize, extern "C" fn()>(address as usize) };
-    entry();
-    // A tape is free to write VGA memory and move the hardware cursor
-    // directly (see tools/tapes/primes.S for an example), with no way to
-    // tell the kernel's console code it did so. Re-sync the console's own
-    // cached cursor position now, or this println! would continue from a
-    // stale, pre-tape position and overwrite whatever the tape just printed.
-    console::resync_cursor();
+    type TapeEntry = extern "C" fn(putc: extern "C" fn(u32));
+    let entry: TapeEntry = unsafe { core::mem::transmute::<usize, TapeEntry>(address as usize) };
+    entry(console::print_byte);
     println!("Tape returned; back at the fos shell.");
 }
 

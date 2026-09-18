@@ -133,7 +133,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load disk NAME` | Loads a FOSFS file straight into a fresh tape buffer (bounded by FOSFS's current 512-byte one-sector file limit). |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape run` | Executes the loaded tape: a bare call to its first byte, in ring 0, with no memory protection. If it ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing the kernel's own `console::print_byte` as its one argument so its printed output goes through the same VGA/serial/relay path as any other command's. If it ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 disconnects it (or the peer can disconnect first). While waiting or connected, also auto-replies to `nic discover` probes, same as `chat`/`tape load net`. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 
@@ -421,17 +421,19 @@ to skip discovery and address one directly).
 A worked example of everything above: a hand-written, genuinely
 position-independent 32-bit assembly program that computes every prime up
 to 1,000,000 with a Sieve of Eratosthenes, then prints a short summary
-(count found, largest prime, elapsed CPU cycles) to both VGA and the
-serial console, and returns cleanly to the shell. Since a tape has no
-fixed load address, it captures its own runtime base with the classic
-`call`/`pop` idiom and addresses every label as an offset from that base
--- unlike the tiny single-instruction tape used while developing `tape`
-itself, this one has real data (a 1,000,000-byte sieve array) that must be
-reachable no matter where it lands in memory. The sieve array is embedded
-directly in the file as literal zero-filled space, which is why the
-assembled binary is about a megabyte -- see the file's own header comment
-for the full reasoning, including why it re-implements VGA cursor
-handling and COM1 output by hand rather than calling back into the kernel.
+(count found, largest prime, elapsed CPU cycles) and returns cleanly to
+the shell. Since a tape has no fixed load address, it captures its own
+runtime base with the classic `call`/`pop` idiom and addresses every
+label as an offset from that base -- unlike the tiny single-instruction
+tape used while developing `tape` itself, this one has real data (a
+1,000,000-byte sieve array) that must be reachable no matter where it
+lands in memory. The sieve array is embedded directly in the file as
+literal zero-filled space, which is why the assembled binary is about a
+megabyte. It prints by calling back into the kernel's own console code
+through a function pointer the kernel passes it as its one argument (see
+"tape print callback ABI" in AGENTS.md), rather than touching VGA/COM1
+hardware itself -- see the file's own header comment for the full
+reasoning.
 
 Build it with `make tape-primes` (produces `build/tapes/primes.bin`,
 entirely separate from `make image`/`run`/`test`), then send it to a
@@ -495,14 +497,16 @@ type `tape run`. Two things are worth knowing before relying on this:
   started (same as running it locally).
 - Only the kernel's own printed messages around a tape -- "Tape loaded",
   "Running N-byte tape...", "Tape returned; back at the fos shell.", and
-  so on -- are ever relayed, and only as one burst once the command
-  returns (since nothing drains the relay queue while paused inside it).
-  A tape's *own* printed output (like the primes tape's summary; see
-  `tools/tapes/primes.S`) writes directly to VGA/COM1 hardware, bypassing
-  the relay queue entirely -- it is only ever visible to whoever is
-  physically at that machine's own screen, never to a remote `term net`
-  client. `tools/test_term_net_tape_e2e.py` verifies both of these exactly
-  this way.
+  so on -- plus the tape's own printed output (like the primes tape's
+  summary; see `tools/tapes/primes.S`) are ever relayed, all as one burst
+  once the command returns (since nothing drains the relay queue while
+  paused inside it). A tape prints by calling back into the kernel's own
+  `console::print_byte` (passed to it as `tape_run`'s one argument)
+  rather than touching VGA/COM1 hardware directly, so its output goes
+  through the exact same combined VGA+serial+relay path as any other
+  command's -- it reaches a remote `term net` client too, just delayed
+  until the tape returns rather than streamed live.
+  `tools/test_term_net_tape_e2e.py` verifies exactly this.
 
 
 ## Booting from a NIC ROM

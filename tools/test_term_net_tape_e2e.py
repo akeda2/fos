@@ -6,29 +6,30 @@ if it were an ordinary `send_tape.py` invocation running alongside the
 remote terminal.
 
 This exercises (and documents, by asserting on it) the exact behavior
-`term net`'s own doc comment predicts for a nested blocking command:
+`term net`'s own doc comment predicts for a nested blocking command,
+combined with the tape print-callback ABI added in
+`tools/tapes/primes.S`/`kernel/src/console.rs::print_byte`:
 
 - `tape load net`/`tape run` work completely normally while driven
   remotely -- the shell dispatches them exactly the same way a locally
   typed command would, and the NIC frame filtering in both already
   ignores unrelated tags/ethertypes, so `TERM_TAG_*` and `TAPE_TAG_*`
   traffic never interfere with each other.
-- But neither command's *output* reaches the remote client live: since
+- Neither command's *output* reaches the remote client live: since
   `console::enable_relay`'s queue is only drained by `term_net`'s own
   outer loop, and that loop is paused for the whole time a nested command
   blocks in its own loop, every kernel-printed line (progress messages,
-  "Tape loaded", "Tape returned; back at the fos shell.") arrives in one
-  burst only once the nested command returns and control comes back to
-  `term_net`.
-- The primes tape's own summary digits (printed by primes.S's hand-rolled
-  VGA/serial routines, entirely bypassing console::write_serial and thus
-  `enable_relay`'s queue -- see AGENTS.md's discussion of this) reach
-  QEMU's raw serial stream (as they always did) but are *never* present
-  in the TERM_TAG_DATA frames relayed to the remote client: only the
-  kernel's own wrapper messages before/after the tape runs are relayed.
-  A remote operator can drive tape loading and running, but only a local
-  operator watching the real screen/serial ever sees a tape's actual
-  output.
+  "Tape loaded", the tape's own digits, "Tape returned; back at the fos
+  shell.") arrives in one burst only once the nested command returns and
+  control comes back to `term_net`.
+- The primes tape's own summary digits, though, DO now show up in that
+  burst: the tape calls back into `console::print_byte` (passed to it as
+  `tape_run`'s one argument) for every byte it prints, and that callback
+  is the exact same `console::write_bytes` path every other command's
+  `println!` goes through, relay queue included. So a remote operator
+  driving `tape load net`/`tape run` over `term net` now sees the tape's
+  actual output too -- delayed until the nested command returns (no live
+  streaming mid-tape), but present, unlike before this callback existed.
 
 Not part of `make test` -- manual verification script, in the same spirit
 as test_term_net_e2e.py and tools/tapes/test_primes_e2e.py, both of which
@@ -226,7 +227,8 @@ def main() -> None:
         print("-------------------------------------------------------------------", file=sys.stderr)
         assert "Running" in relayed_text_after_run, "'Running N-byte tape...' wrapper message missing from the relayed burst"
         assert "Tape returned; back at the fos shell." in relayed_text_after_run, "'Tape returned' wrapper message missing from the relayed burst"
-        assert "78498" not in relayed_text_after_run, "primes tape's own output unexpectedly reached the remote client"
+        assert "78498" in relayed_text_after_run, "primes tape's own output (via the console::print_byte callback) missing from the relayed burst"
+        assert "999983" in relayed_text_after_run, "primes tape's own output (via the console::print_byte callback) missing from the relayed burst"
         del relayed[:]
 
         mcast.send(term_frame(BROADCAST_MAC, TERM_CLIENT_MAC, TERM_TAG_BYE))
@@ -234,8 +236,9 @@ def main() -> None:
 
         print(
             "PASS: 'tape load net'/'tape run' work correctly from inside a term_net "
-            "session -- wrapper messages relay (in a burst, after each command "
-            "returns), while the tape's own direct-hardware output stays local-only.",
+            "session -- both the wrapper messages and the tape's own output (via the "
+            "console::print_byte callback) relay to the remote client, in one burst "
+            "after each command returns.",
             file=sys.stderr,
         )
     finally:

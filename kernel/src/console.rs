@@ -116,24 +116,6 @@ pub fn initialize(serial_available: bool) {
     }
 }
 
-/// Re-reads the hardware cursor position and updates the kernel's own
-/// cached ROW/COLUMN to match. `initialize()` only does this once at boot,
-/// because normally the kernel is the only thing moving the hardware
-/// cursor, so its own cache never goes stale on its own. A `tape` (see
-/// kernel/src/shell.rs and tools/tapes/*.S) breaks that assumption: it
-/// writes VGA memory and drives the CRTC cursor directly, with no way to
-/// tell the kernel's console code it did so. Call this right after a tape
-/// returns so the shell's next line of output continues from wherever the
-/// tape actually left the cursor, instead of overwriting the tape's own
-/// output from a stale, pre-tape position.
-pub fn resync_cursor() {
-    unsafe {
-        let (row, column) = read_cursor_position();
-        ROW = row;
-        COLUMN = column;
-    }
-}
-
 /// Reads the hardware text-mode cursor position back from the CRTC, in
 /// (row, column) form. Used once at boot so kernel output continues
 /// exactly where the real-mode loader's BIOS-teletype printing left off.
@@ -402,6 +384,20 @@ pub fn write_bytes(bytes: &[u8]) {
         write_byte(byte);
     }
     write_serial(bytes);
+}
+
+/// `extern "C" fn(u32)` callback a tape's entry point can call to print
+/// one byte through this exact combined VGA+serial(+relay-queue-if-active)
+/// path, instead of touching hardware directly (see
+/// `tools/tapes/primes.S`, whose header comment explains why this was
+/// worth a narrow exception to "a tape cannot call back into the kernel").
+/// `shell::tape_run` passes this directly as the tape's one argument.
+/// Takes `u32`, not `u8`, so the calling convention at the assembly side
+/// is unambiguous (a promoted, zero-extended 32-bit stack slot) rather
+/// than relying on how a given Rust/LLVM version happens to pass a `u8`
+/// under cdecl.
+pub extern "C" fn print_byte(byte: u32) {
+    write_bytes(&[byte as u8]);
 }
 
 /// Writes bytes to the VGA text console only, without echoing them back out
