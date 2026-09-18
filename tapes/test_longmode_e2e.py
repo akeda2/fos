@@ -5,7 +5,7 @@ the tape's own serial-visible messages ("CPUID reports long-mode support",
 "back in ordinary 32-bit protected mode, all state restored") appear, and
 that the shell is still alive and responsive afterward.
 
-This is the one and only e2e test in this repository that must launch
+This is one of the two e2e tests in this repository that must launch
 `qemu-system-x86_64` instead of `qemu-system-i386`: QEMU's i386 TCG
 backend cannot emulate the CPUID long-mode feature bit at all (confirmed:
 `qemu-system-i386 -cpu qemu64 ...` prints `warning: TCG doesn't support

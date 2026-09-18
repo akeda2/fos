@@ -11,8 +11,9 @@ TAPE_HELLO_RS_BIN := $(BUILD)/tapes/hello-rs.bin
 TAPE_VGA_COLORS_BIN := $(BUILD)/tapes/vga-colors.bin
 TAPE_BIGSIEVE_BIN := $(BUILD)/tapes/bigsieve.bin
 TAPE_LONGMODE_BIN := $(BUILD)/tapes/longmode.bin
+TAPE_LONGMODE_RS_BIN := $(BUILD)/tapes/longmode-rs.bin
 
-.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode clean
+.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -37,12 +38,13 @@ help:
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
 	@echo "  make test       - build the image, then run the serial-driven QEMU smoke test"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
 	@echo "  make tape-bigsieve   - build build/tapes/bigsieve.bin (Rust tape, uses alloc/free for a 64 MiB buffer)"
-	@echo "  make tape-longmode   - build build/tapes/longmode.bin (hand-written assembly tape, visits 64-bit long mode and returns)"
+	@echo "  make tape-longmode   - build build/tapes/longmode.bin (asm shim + asm body, visits 64-bit long mode and returns)"
+	@echo "  make tape-longmode-rs - build build/tapes/longmode-rs.bin (same asm shim, but the 64-bit body is Rust)"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -87,7 +89,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -145,27 +147,58 @@ tape-bigsieve:
 	mkdir -p $(BUILD)/tapes
 	objcopy -O binary tapes/bigsieve/target/i686-fos/release/bigsieve-tape $(TAPE_BIGSIEVE_BIN)
 
-# Builds the "longmode" test tape: a hand-written assembly tape that jumps
-# from the kernel's ordinary 32-bit protected mode into 64-bit long mode
-# and back, proving the trip with a direct VGA write, then restores every
-# piece of CPU state it touched (CR0/CR3/CR4/EFER/GDTR/EFLAGS) before
-# returning -- see tapes/longmode.S's header comment for the full design
-# rationale, and AGENTS.md's "A tape that visits 64-bit long mode and
-# comes back" section. Unlike tape-primes, this needs a real `ld` link
-# step (not just `as`+`objcopy`): x86-64 ELF relocations are RELA-style,
-# so a linker-free objcopy would leave zeroed addresses everywhere this
-# file references a label (see the header comment for the full
-# explanation). `-Ttext=0x100000` matches kernel/src/pmem.rs's TAPE_BASE,
-# the fixed address every tape is loaded at. Entirely additive --
+# Builds the "longmode" test tape: fos's own hand-written assembly
+# `tape64_body` (tapes/longmode.S) linked against the reusable mode-
+# switch plumbing shared by every "visits 64-bit long mode" tape
+# (tapes/longmode64_shim.S -- CPUID check, page tables, private GDT,
+# state save/restore, the actual mode transition in both directions).
+# See tapes/longmode64_shim.S's header comment for the reusable
+# `tape64_body` contract, tapes/longmode.S's header comment for what
+# this particular body does, and AGENTS.md's "A tape that visits 64-bit
+# long mode and comes back" section for the full design rationale.
+# Unlike tape-primes, this needs a real `ld` link step (not just
+# `as`+`objcopy`): x86-64 ELF relocations are RELA-style, so a
+# linker-free objcopy would leave zeroed addresses everywhere either
+# file references a label in the other (see the header comment for the
+# full explanation). `-Ttext=0x100000` matches kernel/src/pmem.rs's
+# TAPE_BASE, the fixed address every tape is loaded at; `-e tape_main`
+# picks the shim's entry point, not the body's. Entirely additive --
 # untouched by plain `make`/`image`/`run`/`test`; built as part of
 # `make all`/`make tapes`. Note that actually *running* this tape's real
 # 64-bit excursion needs `qemu-system-x86_64`, not the `qemu-system-i386`
-# every other target in this repo uses -- see tools/test_longmode_tape_e2e.py.
+# every other target in this repo uses -- see tapes/test_longmode_e2e.py.
 tape-longmode:
 	mkdir -p $(BUILD)/tapes
+	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
 	as --64 -o $(BUILD)/tapes/longmode.o tapes/longmode.S
-	ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main -o $(BUILD)/tapes/longmode.elf $(BUILD)/tapes/longmode.o
+	ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main -o $(BUILD)/tapes/longmode.elf $(BUILD)/tapes/longmode64_shim.o $(BUILD)/tapes/longmode.o
 	objcopy -O binary $(BUILD)/tapes/longmode.elf $(TAPE_LONGMODE_BIN)
 
+# Builds the "longmode-rs" test tape: the exact same reusable
+# tapes/longmode64_shim.S plumbing as tape-longmode above, but its
+# `tape64_body` is instead compiled from ordinary `#![no_std]` Rust
+# (tapes/longmode-rs/src/lib.rs), targeting a new custom target spec,
+# targets/x86_64-fos-tape.json -- a genuinely 64-bit target, unlike
+# targets/i686-fos.json every other Rust tape in this repo uses, with
+# SSE/MMX disabled and soft-float enabled (fos's CR4 setup never sets
+# OSFXSR, so any SSE-encoded instruction would fault). Unlike every
+# other Rust tape here, this crate is a `staticlib` (see its Cargo.toml),
+# not a `bin`: it has no `_start`/linker script/entry point of its own,
+# just the one `tape64_body` function, linked directly against the
+# shim's object file with the same `ld -Ttext=0x100000 -e tape_main`
+# recipe as tape-longmode above -- the linker pulls the one needed
+# object out of the archive automatically, resolving tape-longmode64_
+# shim.S's `.extern tape64_body` reference. See AGENTS.md's "A tape that
+# visits 64-bit long mode and comes back" section for the full design
+# rationale and a line-by-line comparison against tape-longmode's
+# hand-written body. Entirely additive -- untouched by plain
+# `make`/`image`/`run`/`test`; built as part of `make all`/`make tapes`.
+tape-longmode-rs:
+	mkdir -p $(BUILD)/tapes
+	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
+	cd tapes/longmode-rs && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main -o $(BUILD)/tapes/longmode-rs.elf $(BUILD)/tapes/longmode64_shim.o tapes/longmode-rs/target/x86_64-fos-tape/release/liblongmode_tape_body.a
+	objcopy -O binary $(BUILD)/tapes/longmode-rs.elf $(TAPE_LONGMODE_RS_BIN)
+
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target

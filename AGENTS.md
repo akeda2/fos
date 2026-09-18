@@ -1436,43 +1436,77 @@ section above.
 
 ### A tape that visits 64-bit long mode and comes back
 
-`tapes/longmode.S` is a hand-written assembly tape that jumps the running
-32-bit kernel into 64-bit long mode, proves it got there, and jumps back
--- entirely inside one `tape run` call, leaving nothing about the
-kernel's own GDT, page tables (fos never otherwise enables paging), or
-IDT touched or replaced once it returns. This is deliberately not the
-same thing as "Deferred optional x86-64 path" below: that section is
-about a permanent, parallel 64-bit boot *target* built from the ground
-up; this tape is a small, one-shot, fully reversible demonstration that
-the mode switch itself works, run from inside the existing 32-bit
-kernel, using CPU features stage2's own GDT/paging setup never touches.
+`tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written
+tape that jumps the running 32-bit kernel into 64-bit long mode, proves
+it got there, and jumps back -- entirely inside one `tape run` call,
+leaving nothing about the kernel's own GDT, page tables (fos never
+otherwise enables paging), or IDT touched or replaced once it returns.
+This is deliberately not the same thing as "Deferred optional x86-64
+path" below: that section is about a permanent, parallel 64-bit boot
+*target* built from the ground up; this tape is a small, one-shot, fully
+reversible demonstration that the mode switch itself works, run from
+inside the existing 32-bit kernel, using CPU features stage2's own
+GDT/paging setup never touches.
 
-It builds its own tiny identity-mapped page tables (three static 2 MiB
-pages covering physical 0..6 MiB -- the kernel's own code/stack,
-0x10000..0x40000; VGA text memory, 0xb8000; and the tape's own 4 MiB
-image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-descriptor private
-GDT (a 64-bit code descriptor at selector 0x08, and a flat 32-bit code
-descriptor at selector 0x10 used only as the landing pad immediately
-after leaving 64-bit mode), then: `cli`s, saves CR0/CR3/CR4/EFER/
-GDTR/EFLAGS, sets CR4.PAE, loads its own page tables into CR3, sets
-EFER.LME, sets CR0.PG (entering IA-32e compatibility submode), swaps in
-its private GDT, and far-jumps into 64-bit code. Once there, it loads a
-64-bit-only immediate (`0xdeadbeefcafebabe` -- a value no 32-bit `mov`
-could load in one instruction) and hex-dumps it directly to VGA text
-memory, exactly like `tapes/vga-colors` writes VGA, as proof that
-64-bit-encoded instructions genuinely ran (this can't go through the
-`putc` callback: calling 32-bit code from 64-bit mode would need a whole
-second nested mode transition for one debug print, so it isn't done). A
-`push`+`push`+`lretq` (the standard, SDM-documented way to leave 64-bit
-mode for a fixed target, since a plain far jump with an immediate target
-isn't encodable there) returns to the compatibility-mode landing pad,
-which restores every saved register in reverse order -- CR0 (clearing
-PG and everything else back to its original value in one move), CR4
-(clearing PAE), CR3, EFER via `wrmsr` (clearing LME), the original GDTR,
-a far jump back onto the kernel's own code selector to reload CS
-against it, and finally EFLAGS (re-enabling interrupts last of all) --
-before printing a wrap-up message through the ordinary `putc` callback
-and returning to the shell exactly like any other tape.
+The design is deliberately split into two files with a narrow, documented
+contract between them, so the privileged mode-switch mechanics can be
+reused by any future "visits 64-bit mode" tape without rewriting them:
+
+- **`tapes/longmode64_shim.S`** owns everything privileged and reusable:
+  the `tape_main` entry point the kernel calls, the CPUID long-mode
+  check (with its own early-return path -- see below), the identity-
+  mapped page tables, the private GDT, the full CR0/CR3/CR4/EFER/GDTR/
+  EFLAGS save-and-restore, and both directions of the actual mode
+  transition. Its only job besides that plumbing is calling one external
+  symbol, `tape64_body`, once it has safely landed in 64-bit mode with
+  interrupts off -- and restoring everything the instant that call
+  returns.
+- **`tapes/longmode.S`** (now much shorter than before this split) is
+  just one *implementation* of `tape64_body`, written in hand-assembled
+  `.code64`: it loads a 64-bit-only immediate (`0xdeadbeefcafebabe` -- a
+  value no 32-bit `mov` could load in one instruction) and hex-dumps it
+  directly to VGA text memory, exactly like `tapes/vga-colors` writes
+  VGA, as proof that 64-bit-encoded instructions genuinely ran (this
+  can't go through the `putc` callback: calling 32-bit code from 64-bit
+  mode would need a whole second nested mode transition for one debug
+  print, so it isn't done).
+
+The `tape64_body` contract is intentionally minimal: an ordinary SysV64
+`extern "C" fn()` -- no arguments, no return value -- called only after
+the shim has already entered 64-bit mode (paging on, CR4.PAE/EFER.LME/
+CS.L set, the shim's private GDT loaded, interrupts masked), free to do
+whatever it wants, and expected to return via a plain `ret`. Because
+SysV64 requires `%rsp` 16-byte-aligned at the point of `call` (unlike the
+cdecl the shim's own 32-bit code otherwise follows), the shim saves its
+pre-alignment `%rsp` in `%r15` (callee-saved, and otherwise unused)
+immediately before the `call` and restores it immediately after --
+critical, since leaving `%rsp` misaligned by even a few bytes would
+corrupt the later 32-bit register-restore epilogue and the tape's final
+`ret` back to the kernel. Any body -- hand-written assembly or, as below,
+compiled from Rust -- just needs to define one global `tape64_body`
+symbol matching this contract and link against `longmode64_shim.o`.
+
+Mechanically, the shim builds its own tiny identity-mapped page tables
+(three static 2 MiB pages covering physical 0..6 MiB -- the kernel's own
+code/stack, 0x10000..0x40000; VGA text memory, 0xb8000; and the tape's
+own 4 MiB image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-
+descriptor private GDT (a 64-bit code descriptor at selector 0x08, and a
+flat 32-bit code descriptor at selector 0x10 used only as the landing pad
+immediately after leaving 64-bit mode), then: `cli`s, saves CR0/CR3/
+CR4/EFER/GDTR/EFLAGS, sets CR4.PAE, loads its own page tables into CR3,
+sets EFER.LME, sets CR0.PG (entering IA-32e compatibility submode), swaps
+in its private GDT, and far-jumps into 64-bit code, where it calls
+`tape64_body` as described above. A `push`+`push`+`lretq` (the standard,
+SDM-documented way to leave 64-bit mode for a fixed target, since a
+plain far jump with an immediate target isn't encodable there) returns
+to the compatibility-mode landing pad, which restores every saved
+register in reverse order -- CR0 (clearing PG and everything else back
+to its original value in one move), CR4 (clearing PAE), CR3, EFER via
+`wrmsr` (clearing LME), the original GDTR, a far jump back onto the
+kernel's own code selector to reload CS against it, and finally EFLAGS
+(re-enabling interrupts last of all) -- before printing a wrap-up
+message through the ordinary `putc` callback and returning to the shell
+exactly like any other tape.
 
 Two things make this materially different from every other tape in this
 repository:
@@ -1493,29 +1527,84 @@ repository:
   address lives only in a separate `.rela` section that a linker-free
   `objcopy -O binary` throws away entirely, leaving zeroed placeholders
   everywhere this file's `.code64` region references a `.code32` label
-  or vice versa. `make tape-longmode` therefore assembles with `as --64`
-  (needed for the file's 64-bit-context relocations, even though most of
-  its instructions are still ordinary 32-bit-encoded `.code32` code),
-  links with `ld -Ttext=0x100000 --oformat=elf64-x86-64` (matching
-  `pmem::TAPE_BASE`, so every label resolves to its real, final runtime
-  address), and only then runs `objcopy -O binary`.
+  or vice versa. `make tape-longmode` therefore assembles both
+  `tapes/longmode64_shim.S` and `tapes/longmode.S` with `as --64`
+  (needed for their 64-bit-context relocations, even though most of the
+  shim's instructions are still ordinary 32-bit-encoded `.code32` code),
+  links both objects together with `ld -Ttext=0x100000
+  --oformat=elf64-x86-64 -e tape_main` (matching `pmem::TAPE_BASE`, so
+  every label resolves to its real, final runtime address, and picking
+  the shim's `tape_main` -- not the body's `tape64_body` -- as the entry
+  point), and only then runs `objcopy -O binary`.
 
 If CPUID (leaf 0x80000001, EDX bit 29) reports no long-mode support, the
-tape prints a short message and returns immediately, touching none of
-CR0/CR3/CR4/EFER/GDTR/EFLAGS at all. This matters for testing:
-`qemu-system-i386`'s TCG backend cannot emulate the long-mode CPUID bit
-at all (confirmed: it prints `warning: TCG doesn't support requested
-feature: CPUID[eax=80000001h].EDX.lm [bit 29]` and reports the feature
-absent), so this tape's real 64-bit excursion can only be exercised
-under `qemu-system-x86_64` -- confirmed to boot this same 32-bit
-`fos.img` identically otherwise. `tapes/test_longmode_e2e.py` is the one
-e2e test in this repository that launches `qemu-system-x86_64` instead
-of `qemu-system-i386`; it asserts on the tape's own serial-visible
-messages and that the shell keeps responding to ordinary commands
-afterward (the "64-BIT MODE REACHED" VGA text itself is only visible on
-the real screen -- `make run` with this tape loaded -- since it bypasses
-the serial-mirrored `putc` callback entirely). Built with
-`make tape-longmode`, producing `build/tapes/longmode.bin`.
+shim prints a short message and returns immediately, without ever
+calling `tape64_body` or touching CR0/CR3/CR4/EFER/GDTR/EFLAGS at all.
+This matters for testing: `qemu-system-i386`'s TCG backend cannot emulate
+the long-mode CPUID bit at all (confirmed: it prints `warning: TCG
+doesn't support requested feature: CPUID[eax=80000001h].EDX.lm [bit
+29]` and reports the feature absent), so this tape's real 64-bit
+excursion can only be exercised under `qemu-system-x86_64` -- confirmed
+to boot this same 32-bit `fos.img` identically otherwise.
+`tapes/test_longmode_e2e.py` is one of the two e2e tests in this
+repository that launch `qemu-system-x86_64` instead of
+`qemu-system-i386`; it asserts on the shim's own serial-visible messages
+and that the shell keeps responding to ordinary commands afterward (the
+"64-BIT MODE REACHED" VGA text itself is only visible on the real screen
+-- `make run` with this tape loaded -- since it bypasses the serial-
+mirrored `putc` callback entirely). Built with `make tape-longmode`,
+producing `build/tapes/longmode.bin`.
+
+#### A second `tape64_body`, written in Rust: `tapes/longmode-rs/`
+
+`tapes/longmode-rs/` is a second implementation of exactly the same
+`tape64_body` contract described above, written in ordinary `#![no_std]`
+Rust (`src/lib.rs`) instead of hand-assembled `.code64` -- proof the
+shim/body split above is a real, reusable boundary, not just a
+refactor for its own sake. It performs the identical VGA hex-dump proof
+as `tapes/longmode.S`'s body, just via safe(-ish) `write_volatile` calls
+to `0xb8000` instead of raw `mov`s, and is linked against the *exact same*
+`tapes/longmode64_shim.S` object file -- no shim changes needed at all to
+support a compiled-language body.
+
+Unlike every other Rust tape in this repository (`tapes/hello-rs`,
+`tapes/vga-colors`, `tapes/bigsieve` -- each a whole self-contained flat
+binary compiled as a `bin` crate with its own linker script), `longmode-
+rs` is a `staticlib` crate (see its `Cargo.toml`): it has no `_start`, no
+entry point, and no linker script of its own, since it exists only to
+provide one function that gets linked into a larger image alongside the
+shim. `make tape-longmode-rs` builds it with `cargo`, then links
+`build/tapes/longmode64_shim.o` against the resulting `.a` archive with
+the same `ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main` recipe
+`tape-longmode` uses -- the linker pulls only the one object it actually
+needs (the one defining `tape64_body`) out of the archive automatically.
+
+It also needs its own new custom Rust target, `targets/x86_64-fos-tape.json`
+-- the first genuinely 64-bit target in this repository, unlike
+`targets/i686-fos.json` every other Rust tape uses. Modeled on that file
+but for `x86_64`, it additionally disables SSE/MMX/AVX and sets
+`"rustc-abi": "softfloat"`: fos's kernel never sets CR4.OSFXSR/OSXMMEXCPT
+(bits 9/10), since it never uses floating point, so any SSE-encoded
+instruction -- including ones LLVM might silently emit for something as
+mundane as a struct copy, not just explicit float math -- would fault
+with `#UD` the instant it executed. (Confirmed necessary: an earlier
+attempt without `"rustc-abi": "softfloat"` failed to build at all, with
+`error: target feature sse2 is required by the ABI but gets disabled in
+target spec`.) It deliberately uses `"code-model": "small"`, not the
+`"kernel"` code model rustc's own builtin `x86_64-unknown-none` target
+defaults to: `"kernel"` assumes high, negative-canonical addresses like
+`0xffffffff80000000`, which is wrong for this tape's low, positive
+`0x100000` load address (`pmem::TAPE_BASE`).
+
+`tapes/test_longmode_rs_e2e.py` is the second (and, along with
+`tapes/test_longmode_e2e.py`, only other) e2e test in this repository
+that launches `qemu-system-x86_64`; it is a near-duplicate of that
+script -- same shim-emitted serial messages, same shell-still-alive
+check, a distinct multicast group/port so both can run concurrently --
+proving the shim's mode-switch mechanics behave identically no matter
+which language implemented the body that runs while briefly parked in
+64-bit mode. Built with `make tape-longmode-rs`, producing
+`build/tapes/longmode-rs.bin`.
 
 ## Deferred optional x86-64 path
 
