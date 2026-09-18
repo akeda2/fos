@@ -23,8 +23,19 @@ it sends each, waits for a quiet period on the wire (no new output for
 one, then sends TERM_TAG_BYE and exits -- well suited to being driven by a
 script rather than a human at a keyboard. Pass --interactive for a raw
 terminal instead, reading from and echoing to this program's own stdin/
-stdout, closer to a real remote login session (F12 has no equivalent
-here; press Ctrl-C or send fos's own `halt`/reboot to end it, or use
+stdout, closer to a real remote login session: this program puts its own
+terminal into cbreak mode (see `run_interactive`) so every keystroke is
+forwarded the instant it is typed, with no waiting for Enter and no local
+echo (the remote shell echoes typed characters itself, exactly as it
+would for a local keyboard) -- this is what lets a plain Escape keypress
+here reach the fos kernel as a single 0x1b byte, the same one
+`kernel/src/shell.rs`'s `REMOTE_ABORT_BYTE` looks for to stop a
+currently running blocking command like `tape run` (see that constant's
+own doc comment) without ending this session -- F12 (and friends) has no
+*session-ending* equivalent here by design, since a remote peer hanging
+up is never supposed to look like a local escape key press to the fos
+side (see `term_net`'s own doc comment in `kernel/src/shell.rs`); press
+Ctrl-C or send fos's own `halt`/reboot to end the session itself, or use
 --interactive's dedicated EOF-on-stdin handling).
 
 Sending raw frames requires CAP_NET_RAW (in practice: run this as root,
@@ -35,7 +46,9 @@ directly, e.g. via `setcap cap_net_raw+ep`).
 import selectors
 import socket
 import sys
+import termios
 import time
+import tty
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -139,8 +152,23 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
     (the remote shell echoes typed characters itself, exactly as it would
     for a local keyboard) -- closer to a real terminal program than the
     request/response mode above, at the cost of needing a real interactive
-    terminal to drive it from."""
-    print("Interactive session; Ctrl-C or Ctrl-D to end it (sends TERM_TAG_BYE).", file=sys.stderr)
+    terminal to drive it from.
+
+    Puts this program's own stdin into cbreak mode (see the `tty` module)
+    when it is a real terminal: canonical line buffering and local echo
+    are both off, but Ctrl-C/Ctrl-D still raise the usual
+    KeyboardInterrupt/EOF this function already handles, since cbreak
+    mode -- unlike full raw mode -- leaves signal-generating characters
+    alone. Without this, every keystroke (including a lone Escape) would
+    sit unsent in this program's own input buffer until Enter was
+    pressed, which defeats `kernel/src/shell.rs`'s `REMOTE_ABORT_BYTE`
+    check entirely: that check needs to see a single 0x1b byte arrive on
+    its own, not batched together with whatever is typed next."""
+    print(
+        "Interactive session; Escape aborts a running remote command (like `tape run`) "
+        "without ending this session; Ctrl-C or Ctrl-D ends the session itself (sends TERM_TAG_BYE).",
+        file=sys.stderr,
+    )
     selector = selectors.DefaultSelector()
     selector.register(sys.stdin, selectors.EVENT_READ)
     selector.register(raw, selectors.EVENT_READ)
@@ -150,6 +178,11 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
     if payload is not None:
         sys.stdout.buffer.write(payload)
         sys.stdout.flush()
+
+    old_settings = None
+    if sys.stdin.isatty():
+        old_settings = termios.tcgetattr(sys.stdin.fileno())
+        tty.setcbreak(sys.stdin.fileno())
 
     try:
         while True:
@@ -182,6 +215,8 @@ def run_interactive(raw: socket.socket, source: bytes, peer: bytes, initial_wait
     except KeyboardInterrupt:
         pass
     finally:
+        if old_settings is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
         # See run_noninteractive's identical guard: only say goodbye to a
         # session that was actually established, so a client that never
         # got a response (nobody was listening) does not leave a stray

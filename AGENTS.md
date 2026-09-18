@@ -686,6 +686,66 @@ that the exact same `term_net` session driving it remotely is still
 alive afterward -- the concrete proof of the guarantee `tape_should_abort`
 documents, not just a read of its doc comment.
 
+#### A local keypress isn't enough: remote abort via `poll_remote_tape_abort`
+
+The above covers *local* escape stopping a tape started remotely, but
+not the other direction: a remote `term net` peer had no way at all to
+stop a looping tape like `vga-colors`, since `term_net`'s own session
+loop -- the only thing that ever calls `nic.receive` -- is completely
+paused for as long as a nested blocking command (a tape's own loop) is
+running. `keyboard::tape_should_abort` only ever checks the *local*
+PS/2 scancode queue, so a remote client sending anything at all over the
+wire while a tape ran just sat unread in the network card's own Rx ring
+until the tape eventually returned on its own.
+
+`shell::tape_run` now passes a new `combined_tape_should_abort` as the
+`should_abort` callback instead of `keyboard::tape_should_abort` directly:
+it checks both, returning nonzero if *either* the local keypress check or
+a new `shell::poll_remote_tape_abort` says stop. `poll_remote_tape_abort`
+does nothing (a single `console::relay_enabled()` branch) unless a
+`term_net` session actually started this tape; when one did, it polls
+the network card itself, on `term_net`'s behalf, exactly the way that
+loop's own `nic.receive` normally would -- recognizing the connected
+peer's `TERM_TAG_DATA` frames (stopping the tape if `REMOTE_ABORT_BYTE`
+(`0x1b`, plain ASCII Escape) appears anywhere in the payload, the whole
+frame otherwise simply dropped rather than fed to the line editor, the
+same "consumed, not typed" convention a local escape keypress already
+gets) and `TERM_TAG_BYE` (stopping the tape *and* recording
+`PENDING_REMOTE_BYE`, a new static `term_net`'s own `'session` loop
+checks the moment it resumes, since the one `TERM_TAG_BYE` frame the peer
+sent can only ever be received once -- by whichever loop happens to be
+polling the network card at that instant). It still answers a discovery
+probe from some unrelated third MAC along the way, the same courtesy
+`term_net`'s own loop already extends, so a long-running tape doesn't
+make the host briefly stop looking like a good network citizen.
+
+Two new statics in `shell.rs`, `ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE`,
+carry the connected peer's identity across this call boundary:
+`poll_remote_tape_abort` runs many stack frames below `term_net`'s own
+loop (inside `entry()`, the tape itself, calling back into
+`combined_tape_should_abort`), with no argument of its own to thread the
+peer through, so `term_net` sets these two right before entering its
+session loop and clears them right after leaving it.
+
+`tools/term_net.py --interactive` now puts its own stdin into cbreak
+mode (see the `tty`/`termios` standard library modules) rather than
+leaving it in the terminal's default line-buffered ("canonical") mode:
+without this, a lone Escape keypress would sit in the *client's own*
+input buffer until Enter was also pressed, arriving batched with
+whatever was typed next instead of as a single `0x1b` byte on its own --
+defeating `REMOTE_ABORT_BYTE`'s whole point. Cbreak (as opposed to full
+raw mode) was chosen specifically because it leaves signal-generating
+characters alone, so Ctrl-C still ends the client program the same way
+it always did.
+
+`tools/tapes/test_vga_colors_e2e.py` was extended to prove this actually
+works, not just compiles: after the existing local-`sendkey f12` half of
+the test, it starts the tape a second time and sends a raw `0x1b` byte
+inside an ordinary `TERM_TAG_DATA` frame over the same session (standing
+in for a real `term_net.py --interactive` client's Escape keypress),
+confirms the tape's loop stops the same way, and confirms -- again -- one
+more command over that same session still gets a reply afterward.
+
 
 
 `term net` is deliberately a full remote *shell*, not a byte pipe like

@@ -466,20 +466,24 @@ verify it with `tools/tapes/test_hello_rs_e2e.py`.
 A second Rust reference tape, this one looping instead of running once.
 It writes several rows of text straight to VGA text memory (physical
 `0xb8000`) instead of through `console::print_byte`, cycling their
-foreground color once per frame, forever, until a local operator presses
-one of the "give up" keys (F12/F4/F6/F7/F8/F10) -- checked once per
-frame through a second callback, `should_abort` (backed by
-`keyboard::tape_should_abort`), that `tape_run` now passes alongside the
-usual `putc` callback (see "tape print callback ABI" in AGENTS.md for
-the full two-callback ABI). Only one line at the very start and one at
-the very end print through `putc`; the animation itself never touches
-serial or a `term net` relay at all, since it writes VGA memory directly
--- the whole point of the example. Pressing "give up" while this tape's
-loop is running stops only the tape, never a `term net` session driving
-it remotely (see `keyboard::tape_should_abort`'s doc comment for exactly
-why that's guaranteed, and `tools/tapes/test_vga_colors_e2e.py` for a
-test that actually exercises it, not just documents it). Build it with
-`make tape-vga-colors` (producing `build/tapes/vga-colors.bin`).
+foreground color once per frame, forever, until told to stop -- checked
+once per frame through a second callback, `should_abort`
+(`shell::combined_tape_should_abort`), that `tape_run` now passes
+alongside the usual `putc` callback (see "tape print callback ABI" in
+AGENTS.md for the full two-callback ABI). That check recognizes two
+independent "give up" signals, either one enough: a local keypress
+(F12/F4/F6/F7/F8/F10, via `keyboard::tape_should_abort`) and, if this
+tape was started from an active `term net` session, a remote one too
+(a raw `0x1b` Escape byte sent inside a `TERM_TAG_DATA` frame, via
+`shell::poll_remote_tape_abort` -- see "A local keypress isn't enough:
+remote abort via `poll_remote_tape_abort`" in AGENTS.md). Only one line
+at the very start and one at the very end print through `putc`; the
+animation itself never touches serial or a `term net` relay at all,
+since it writes VGA memory directly -- the whole point of the example.
+Stopping the tape this way, local or remote, never disconnects a `term
+net` session driving it (see `tools/tapes/test_vga_colors_e2e.py` for a
+test that actually exercises both ways, not just documents them). Build
+it with `make tape-vga-colors` (producing `build/tapes/vga-colors.bin`).
 
 
 ### Remote terminal (`term net`)
@@ -548,7 +552,13 @@ waits for a quiet period on the wire, prints whatever came back, then
 sends `TERM_TAG_BYE` and exits -- e.g. `tools/term_net.py "about" "nic"
 "ls"`. `--interactive` instead opens a raw pass-through session reading
 from and writing to this program's own stdin/stdout, closer to a real
-remote login for a human at a keyboard.
+remote login for a human at a keyboard; it puts its own stdin into
+cbreak mode (no line buffering, no local echo, but Ctrl-C/Ctrl-D still
+work as they always did) so every keystroke -- including a lone Escape,
+used to abort a currently running remote command like `tape run` without
+ending the session, see "A local keypress isn't enough: remote abort via
+`poll_remote_tape_abort`" in AGENTS.md -- reaches the fos kernel the
+instant it's typed, not batched together with whatever comes next.
 
 Because `tape load net`/`tape run` are ordinary commands dispatched
 through the same `execute()`, they work over `term net` too, with no
@@ -558,22 +568,36 @@ some other machine (or another fos host) send a tape at the usual
 does not need to know or care a `term net` session is even open), then
 type `tape run`. Two things are worth knowing before relying on this:
 
-- Neither command is interruptible remotely while it runs: like any
-  command that blocks in its own local polling loop, `tape load net`
-  (waiting for tape frames) and `tape run` (running the tape) pause
-  `term_net`'s own outer loop -- including the relay-queue drain and the
-  `TERM_TAG_BYE`/keystroke handling that loop does -- until they return.
-  A remote client's keystrokes or even a `TERM_TAG_BYE` sent while one is
-  in flight are silently dropped, not queued; only local F12 (or F4/F6/F7/F8/F10) can interrupt
-  `tape load net` early, and `tape run` cannot be interrupted at all once
-  started (same as running it locally).
+- Neither command's *own* network traffic overlaps with `term_net`'s
+  outer loop while it runs: like any command that blocks in its own
+  local polling loop, `tape load net` (waiting for tape frames) and
+  `tape run` (running the tape) pause `term_net`'s own outer loop --
+  including the relay-queue drain and its usual keystroke/`TERM_TAG_BYE`
+  handling -- until they return. Only local F12 (or F4/F6/F7/F8/F10) can
+  interrupt `tape load net` early. `tape run` cannot be interrupted at
+  all for a tape that only ever declares the original one-argument
+  `putc` callback (`primes.S`/`hello-rs`) -- same as running it locally,
+  since there is nothing in that tape's own code to notice a stop
+  request in the first place. A tape that instead declares the newer
+  two-callback ABI and checks `should_abort` in its own loop (like
+  `tools/tapes/vga-colors/`, see "Test tape: `tools/tapes/vga-colors/`"
+  above) *is* interruptible remotely, even though `term_net`'s own outer
+  loop is paused the whole time: `shell::poll_remote_tape_abort` polls
+  the network card directly, on that paused loop's behalf, recognizing
+  `REMOTE_ABORT_BYTE` (`0x1b`, plain ASCII Escape) inside an ordinary
+  `TERM_TAG_DATA` frame from the connected peer -- exactly what
+  `tools/term_net.py --interactive` now forwards for a real Escape
+  keypress once its own stdin is in cbreak mode. Stopping a tape this
+  way never disconnects the session driving it, the same guarantee a
+  local F12 keypress already gets (see "A local keypress isn't enough:
+  remote abort via `poll_remote_tape_abort`" in AGENTS.md).
 - Only the kernel's own printed messages around a tape -- "Tape loaded",
   "Running N-byte tape...", "Tape returned; back at the fos shell.", and
   so on -- plus the tape's own printed output (like the primes tape's
   summary; see `tools/tapes/primes.S`) are ever relayed, all as one burst
   once the command returns (since nothing drains the relay queue while
   paused inside it). A tape prints by calling back into the kernel's own
-  `console::print_byte` (passed to it as `tape_run`'s one argument)
+  `console::print_byte` (passed to it as `tape_run`'s first argument)
   rather than touching VGA/COM1 hardware directly, so its output goes
   through the exact same combined VGA+serial+relay path as any other
   command's -- it reaches a remote `term net` client too, just delayed

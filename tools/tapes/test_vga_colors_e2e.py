@@ -24,7 +24,15 @@ This test also confirms the specific guarantee this tape exists to
 demonstrate: pressing "give up" while this tape's loop is running stops
 only the tape, never the `term net` session driving it -- checked here by
 issuing one more command over the very same session afterward and
-confirming it still gets a reply, instead of reconnecting.
+confirming it still gets a reply, instead of reconnecting. It checks this
+twice: once via a simulated *local* keypress (QEMU monitor `sendkey
+f12`), and once via a simulated *remote* one (a raw 0x1b byte sent inside
+an ordinary `TERM_TAG_DATA` frame, exactly what `tools/term_net.py
+--interactive` now forwards for a real Escape keypress once its own
+stdin is in cbreak mode) -- proving `shell::poll_remote_tape_abort`
+really does let a remote peer stop a currently running tape even though
+`term_net`'s own session loop (and so its own `nic.receive`) is paused
+for as long as that tape runs.
 
 Not part of `make test` -- manual verification script, in the same spirit
 as test_primes_vga_e2e.py (which this borrows its monitor/pmemsave
@@ -232,6 +240,37 @@ def main() -> None:
             "PASS: vga-colors tape painted VGA text memory directly in several "
             "colors, and a local 'give up' keypress stopped the tape's own loop "
             "without disconnecting the term_net session driving it.",
+            file=sys.stderr,
+        )
+        del output[:]
+
+        # Second half: the *remote* equivalent. term_net's own session
+        # loop (and so its own nic.receive) is paused for as long as
+        # tape_run blocks, so a genuine remote client has no way to poll
+        # for this -- shell::poll_remote_tape_abort exists precisely to
+        # let a nested command like this notice a REMOTE_ABORT_BYTE
+        # (0x1b) arriving inside an ordinary TERM_TAG_DATA frame anyway.
+        # tools/term_net.py's own --interactive mode sends exactly this
+        # byte for a plain Escape keypress once its stdin is in cbreak
+        # mode; this test sends the same byte directly over the raw
+        # socket instead, since it has no real terminal to type at.
+        mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"tape run\n"))
+        read_until(b"watch the screen", 10)
+        print("tape running again; sending a simulated remote Escape byte (0x1b)...", file=sys.stderr)
+        time.sleep(1.0)
+        mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, bytes([0x1B])))
+        read_until(b"VGA color demo stopped.", 10)
+        read_until(b"Tape returned; back at the fos shell.", 10)
+        print("tape stopped cleanly after the simulated remote escape byte", file=sys.stderr)
+        del output[:]
+
+        # And the same survival check again: a remote-triggered abort
+        # must not have ended the session either.
+        mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"about\n"))
+        read_until(b"fos is a small educational 32-bit x86 operating system.", 10)
+        print(
+            "PASS: a simulated remote Escape byte stopped the tape's own loop "
+            "too, again without disconnecting the term_net session driving it.",
             file=sys.stderr,
         )
 

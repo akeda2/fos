@@ -492,6 +492,16 @@ fn term_net(info: &BootInfo) {
 
         println!("Remote terminal connected from {}. Local input is disabled; F12 (or F4/F6/F7/F8/F10) disconnects it.", Mac(&peer));
         console::enable_relay();
+        // Lets `poll_remote_tape_abort` recognize this peer's own frames
+        // while a nested blocking command (like `tape_run`) has this
+        // loop's own `nic.receive` paused -- cleared again below once
+        // this session ends, so a tape started from the local shell (no
+        // active peer) never mistakes leftover state for one.
+        unsafe {
+            ACTIVE_TERM_PEER = Some(peer);
+            ACTIVE_TERM_SOURCE = Some(source);
+            PENDING_REMOTE_BYE = false;
+        }
         let mut editor = LineEditor::new();
         let mut relay_chunk = [0u8; TERM_DATA_CAPACITY];
         prompt();
@@ -502,6 +512,16 @@ fn term_net(info: &BootInfo) {
         // loops back to waiting for a new client.
         let mut local_escape = false;
         'session: loop {
+            // Set by `poll_remote_tape_abort` if a nested tape's own
+            // network poll already consumed this peer's `TERM_TAG_BYE`
+            // while this loop's own `nic.receive` below was paused: the
+            // real disconnect already happened, so there is no second
+            // `TERM_TAG_BYE` left to receive here -- this is exactly as
+            // if the `TERM_TAG_BYE` arm just below had matched.
+            if unsafe { PENDING_REMOTE_BYE } {
+                break 'session;
+            }
+
             let drained = console::drain_relay(&mut relay_chunk);
             if drained > 0 {
                 send_term_data(nic, &peer, &source, &relay_chunk[..drained]);
@@ -542,6 +562,10 @@ fn term_net(info: &BootInfo) {
         }
 
         console::disable_relay();
+        unsafe {
+            ACTIVE_TERM_PEER = None;
+            ACTIVE_TERM_SOURCE = None;
+        }
         if local_escape {
             println!("\nRemote terminal disconnected; back at the local fos shell.");
             return;
@@ -549,6 +573,90 @@ fn term_net(info: &BootInfo) {
         println!(
             "\nRemote terminal disconnected; waiting for a new one to connect (F12 (or F4/F6/F7/F8/F10) to stop and use the local shell)."
         );
+    }
+}
+
+/// The peer and source MAC of the `term_net` session currently driving
+/// this shell, if any -- `None` whenever no remote terminal is connected
+/// (including the entire time this function is running from a local
+/// keyboard). Set and cleared by `term_net` itself around its per-peer
+/// session loop; read by `poll_remote_tape_abort` so a nested blocking
+/// command like `tape_run`, called deep inside that loop's own
+/// `editor.feed`/`execute` call chain with no arguments of its own to
+/// thread this through, can still find out who to listen for.
+static mut ACTIVE_TERM_PEER: Option<[u8; 6]> = None;
+static mut ACTIVE_TERM_SOURCE: Option<[u8; 6]> = None;
+
+/// Set by `poll_remote_tape_abort` when it consumes the connected peer's
+/// own `TERM_TAG_BYE` while `term_net`'s own session loop was paused
+/// inside a nested blocking command; checked (and reset by starting a
+/// new session) at the top of that loop so a disconnect noticed this way
+/// is not lost, since the frame carrying it can only ever be received
+/// once.
+static mut PENDING_REMOTE_BYE: bool = false;
+
+/// The byte a remote `term net` peer can send inside a `TERM_TAG_DATA`
+/// frame to ask a currently running blocking command (right now, only
+/// `tape_run`'s loop) to stop -- the network equivalent of the local
+/// "give up" keys (F12/F4/F6/F7/F8/F10) `keyboard::ESCAPE_SCANCODES`
+/// recognizes. Plain ASCII Escape was picked because it needs no
+/// translation on the client side: `tools/term_net.py --interactive`
+/// already forwards a raw Escape keypress as exactly this byte, with no
+/// local echo or interpretation of its own.
+const REMOTE_ABORT_BYTE: u8 = 0x1b;
+
+/// Polls the network card once for a frame from the currently connected
+/// `term_net` peer, if any, on behalf of a nested blocking command (see
+/// `tape_run`) whose own loop has `term_net`'s *own* session loop --
+/// including its `nic.receive` -- paused for as long as it runs. Mirrors
+/// that loop's own frame handling closely enough to stay a reasonable
+/// network citizen even mid-tape (still answering discovery probes from
+/// someone else, still noticing this peer hanging up) without ever
+/// touching anything not addressed to this specific peer.
+///
+/// Returns whether the caller's blocking command should stop: either the
+/// peer explicitly asked to (a `TERM_TAG_DATA` frame containing
+/// `REMOTE_ABORT_BYTE` anywhere in its payload -- the whole frame is
+/// simply dropped rather than fed to the line editor, the same way a
+/// local escape key press is consumed rather than typed as a literal
+/// character) or the peer hung up entirely (`TERM_TAG_BYE`, which also
+/// records `PENDING_REMOTE_BYE` since this call is the only place that
+/// frame will ever be received).
+///
+/// Does nothing but check one flag (and so costs a single branch) unless
+/// a `term_net` relay session is actually active: a tape started from
+/// the local shell has `console::relay_enabled()` false the entire time,
+/// so it never touches the network card at all.
+fn poll_remote_tape_abort() -> bool {
+    if !console::relay_enabled() {
+        return false;
+    }
+    let (Some(peer), Some(source)) = (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE }) else {
+        return false;
+    };
+    let Ok(nic) = rtl8139::get() else { return false };
+    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let Some(received) = nic.receive(&mut buffer) else { return false };
+    let frame = &buffer[..received];
+    if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+        return false;
+    }
+    let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
+    if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
+        remember_peer(frame_source);
+        send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
+        return false;
+    }
+    if frame_source != peer {
+        return false;
+    }
+    match frame[14] {
+        TERM_TAG_BYE => {
+            unsafe { PENDING_REMOTE_BYE = true };
+            true
+        }
+        TERM_TAG_DATA => frame[15..].contains(&REMOTE_ABORT_BYTE),
+        _ => false,
     }
 }
 
@@ -1168,12 +1276,18 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// through this callback never touches the hardware cursor itself, so
 /// the kernel's own cached position is never stale to begin with.
 ///
-/// `keyboard::tape_should_abort` is passed as the second argument, giving
+/// `combined_tape_should_abort` is passed as the second argument, giving
 /// a long-running or looping tape (like `tools/tapes/vga-colors`) a way
-/// to notice a local "give up" keypress (F12/F4/F6/F7/F8/F10) without
-/// touching the keyboard controller itself -- see that function's own
-/// doc comment for why this is safe even when a tape was started
-/// remotely over an active `term_net` session. A tape that runs once and
+/// to notice a "give up" request without touching the keyboard
+/// controller or network card itself. It checks two independent sources,
+/// either one enough to stop the tape: a local "give up" keypress
+/// (F12/F4/F6/F7/F8/F10, via `keyboard::tape_should_abort` -- see that
+/// function's own doc comment for why this is safe even when a tape was
+/// started remotely over an active `term_net` session), and, if a
+/// `term_net` session is what started this tape, a remote one too (via
+/// `poll_remote_tape_abort`, since that session's own loop -- and so its
+/// own `nic.receive` -- is paused for as long as this tape runs and
+/// cannot notice incoming frames on its own). A tape that runs once and
 /// returns (like `primes.S`/`hello-rs`) is free to ignore this argument
 /// entirely; under cdecl this remains binary-compatible with a tape
 /// declaring only the first parameter, since the caller (this function)
@@ -1184,6 +1298,10 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// callbacks and touch hardware directly anyway -- nothing enforces this
 /// convention -- so this remains just that: a convention, not a
 /// sandboxed boundary.)
+extern "C" fn combined_tape_should_abort() -> u32 {
+    (keyboard::tape_should_abort() != 0 || poll_remote_tape_abort()) as u32
+}
+
 fn tape_run() {
     let Some((address, length)) = tape_get() else {
         println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
@@ -1192,7 +1310,7 @@ fn tape_run() {
     println!("Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery.");
     type TapeEntry = extern "C" fn(putc: extern "C" fn(u32), should_abort: extern "C" fn() -> u32);
     let entry: TapeEntry = unsafe { core::mem::transmute::<usize, TapeEntry>(address as usize) };
-    entry(console::print_byte, keyboard::tape_should_abort);
+    entry(console::print_byte, combined_tape_should_abort);
     println!("Tape returned; back at the fos shell.");
 }
 

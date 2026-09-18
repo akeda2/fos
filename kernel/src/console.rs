@@ -62,6 +62,15 @@ pub fn disable_relay() {
     }
 }
 
+/// Whether a `term_net` relay session is currently active. `shell`'s
+/// `poll_remote_tape_abort` checks this before touching the network card
+/// at all, so a tape started from the local shell (no relay, this is
+/// `false`) never pays for polling for a remote "give up" signal that
+/// cannot possibly arrive.
+pub fn relay_enabled() -> bool {
+    unsafe { RELAY_ACTIVE }
+}
+
 /// Appends `bytes` to the relay queue if a session is active, silently
 /// dropping whatever does not fit rather than blocking or panicking --
 /// this is best-effort diagnostic/interactive output, not a guaranteed
