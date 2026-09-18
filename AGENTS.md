@@ -617,6 +617,12 @@ The same fixed-address convention would work identically for a C tape
 Rust was chosen here only because it reuses the kernel's own toolchain
 and build-std setup with far less new scaffolding.
 
+See `docs/rust-tapes-for-dummies.md` for a beginner-oriented, step-by-step
+guide to writing, building, and running a new Rust tape from scratch --
+this section explains the underlying design; that document is the
+practical "how do I make one" walkthrough, and is what README.md's Rust
+tape sections point readers at too.
+
 ### Tape ABI grows a second callback: `should_abort`, and `vga-colors`
 
 Every tape up to this point ran once and returned: `primes.S`/`hello-rs`

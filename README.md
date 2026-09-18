@@ -470,7 +470,9 @@ fixes the kernel's own. It prints a greeting, sieves primes up to 1,000
 through the same one callback (`console::print_byte`) `primes.S` uses,
 and returns -- ordinary absolute addressing, no PIC trick needed. Build
 it with `make tape-hello-rs` (producing `build/tapes/hello-rs.bin`) and
-verify it with `tools/tapes/test_hello_rs_e2e.py`.
+verify it with `tools/tapes/test_hello_rs_e2e.py`. Want to write your own
+Rust tape? See `docs/rust-tapes-for-dummies.md` for a from-scratch,
+beginner-friendly walkthrough.
 
 #### Test tape: `tools/tapes/vga-colors/`
 
