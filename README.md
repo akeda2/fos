@@ -419,8 +419,10 @@ provide), or an ordinary Linux host running `tools/send_tape.py FILE`,
 which speaks the identical wire protocol over a raw `AF_PACKET` socket.
 Rather than requiring a MAC address up front, that tool broadcasts the
 same `CHAT_TAG_DISCOVER_REQUEST` probe `nic discover` sends and picks the
-destination automatically if exactly one fos machine replies (pass `--mac`
-to skip discovery and address one directly).
+destination automatically if exactly one fos machine replies; with more
+than one, pass `--mac` with either a full MAC address or a peer number
+from `tools/peers.py` (see "A numbered peer address book for the Python
+tools too" below) instead of typing one out.
 
 #### Test tape: `tools/tapes/primes.S`
 
@@ -603,6 +605,39 @@ type `tape run`. Two things are worth knowing before relying on this:
   command's -- it reaches a remote `term net` client too, just delayed
   until the tape returns rather than streamed live.
   `tools/test_term_net_tape_e2e.py` verifies exactly this.
+
+### A numbered peer address book for the Python tools too
+
+fos's own `chat`/`tape send`/`tape load net` accept `PEER_NUMBER` as
+shorthand for a full MAC address, backed by the kernel's own `PEERS`
+table (`kernel/src/shell.rs`'s `remember_peer`/`peer_by_index`/
+`print_peers`, printed with `nic peers`): every MAC any discovery probe
+or `chat` reply has ever seen, in first-seen order, for as long as that
+one boot stays up. `tools/send_tape.py`/`tools/term_net.py` had no
+equivalent -- with more than one fos machine replying to a discovery
+probe, both used to just print the full MAC list and ask for `--mac`
+spelled out in full, every single run, since neither tool has anywhere
+to remember a peer between one short-lived Python process and the next.
+
+They now share a small on-disk address book instead (a JSON file, by
+default `~/.cache/fos_peers.json`, overridable with the `FOS_PEERS_FILE`
+environment variable -- mainly so tests don't pollute a real user's
+cache with throwaway QEMU-session MACs): every discovery either tool
+performs merges newly seen peers into it, in first-seen order, the same
+way the kernel's own `remember_peer` does; `--mac` on either tool now
+accepts a peer number from this list exactly as `chat`/`tape send`
+accept one from `nic peers`, in addition to a full MAC address.
+
+`tools/peers.py` manages this address book directly, mirroring `nic
+peers`/`nic discover`: with no arguments it just prints the numbered
+list, no network traffic at all; `--discover` broadcasts one probe,
+merges any replies in, and prints the (possibly grown) list; `--forget`
+empties it. Unlike the kernel's own table, this one survives between
+runs (and reboots) rather than starting empty every time, so it can also
+go stale (a MAC that answered yesterday might be a different machine, or
+offline, today) -- `--forget` exists so a person can notice and reset it
+deliberately, rather than the tools trying to guess when an entry has
+gone stale on their own.
 
 
 ## Booting from a NIC ROM

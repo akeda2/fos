@@ -17,12 +17,24 @@ Rather than requiring the destination fos machine's MAC address up front
 (the way `send_frame.py` reads one from a small `--mac-file`), this tool can
 find it itself: it broadcasts the same discovery probe fos's own
 `nic discover` sends (`CHAT_TAG_DISCOVER_REQUEST`) and listens briefly for
-replies. Exactly one reply picks the destination automatically; zero or
-several require `--mac` to say which machine you mean. Pass `--mac` (or the
-legacy `--mac-file`, kept for parity with `send_frame.py`) to skip discovery
-entirely.
+replies. Exactly one reply picks the destination automatically; zero
+requires `--mac` (or `--mac-file`) to say which machine you mean, since
+none replied. Several replies no longer requires spelling out a full MAC
+either: like fos's own `chat`/`tape send`, which accept a small
+PEER_NUMBER shortcut into the kernel's own `PEERS` table
+(`kernel/src/shell.rs`) instead of a full MAC address, this tool and
+`term_net.py`/`tools/peers.py` share a small on-disk address book (see
+`PEERS_CACHE_FILE`) that every discovery (live or from either tool)
+merges newly seen peers into, in first-seen order -- so `--mac 2` means
+"whichever machine was the second one ever discovered", persisted across
+separate runs of either tool the same way fos's own `PEERS` table
+persists across one kernel's whole boot (just longer, since there is no
+kernel here to reboot and reset it -- see `tools/peers.py --forget` to
+reset it deliberately instead).
 """
 
+import json
+import os
 import re
 import socket
 import sys
@@ -134,6 +146,85 @@ def discover(raw: socket.socket, iface: str, source: bytes, timeout: float) -> l
     return found
 
 
+# A small on-disk address book, shared by every invocation of send_tape.py,
+# term_net.py, and tools/peers.py, mirroring fos's own kernel-side `PEERS`
+# table (kernel/src/shell.rs) -- just persisted across separate short-lived
+# processes rather than kept only in one long-running kernel's own RAM.
+# Overridable with an environment variable mainly so tests don't pollute a
+# real user's cache with throwaway QEMU-session MACs.
+PEERS_CACHE_FILE = Path(os.environ.get("FOS_PEERS_FILE", str(Path.home() / ".cache" / "fos_peers.json")))
+
+
+def load_known_peers() -> list[bytes]:
+    """Loads the address book in first-seen order, the same order
+    `remember_known_peer` preserves and `kernel/src/shell.rs`'s own
+    `PEERS`/`peer_by_index` rely on. A missing or corrupt cache file is
+    silently treated as empty -- this is a convenience cache, not a
+    guaranteed record, matching the "best effort" spirit every other part
+    of fos's own networking already has."""
+    try:
+        entries = json.loads(PEERS_CACHE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    peers = []
+    for entry in entries:
+        try:
+            peers.append(parse_mac(entry))
+        except SystemExit:
+            continue  # A hand-edited or corrupted entry; skip rather than fail the whole load.
+    return peers
+
+
+def save_known_peers(peers: list[bytes]) -> None:
+    """Overwrites the address book with exactly `peers`, in the order
+    given -- callers are responsible for preserving first-seen order
+    themselves (see `remember_known_peer`)."""
+    PEERS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PEERS_CACHE_FILE.write_text(json.dumps([format_mac(mac) for mac in peers]))
+
+
+def remember_known_peer(peers: list[bytes], mac: bytes) -> bool:
+    """Appends `mac` to `peers` if not already present, mirroring
+    `kernel/src/shell.rs`'s own `remember_peer`: first-seen order, no
+    reordering, no de-duplication beyond "already known". Returns whether
+    `mac` was newly added -- callers use this to decide whether the
+    on-disk cache actually needs rewriting. Does not persist anything
+    itself; call `save_known_peers` afterward if this returns `True`."""
+    if mac in peers:
+        return False
+    peers.append(mac)
+    return True
+
+
+def resolve_peer(text: str, peers: list[bytes]) -> bytes:
+    """Accepts either a full MAC address or a 1-based index into `peers`
+    -- exactly how fos's own `chat`/`tape send` accept
+    `PEER_MAC|PEER_NUMBER` (see `kernel/src/shell.rs`'s `peer_by_index`)
+    -- and returns the resolved MAC address, or exits with a clear error
+    for an out-of-range number."""
+    if text.isdigit():
+        index = int(text)
+        if index < 1 or index > len(peers):
+            raise SystemExit(
+                f"peer number {index} is out of range ({len(peers)} known peer(s)); "
+                "run 'tools/peers.py' to see the numbered list, or pass a full MAC address instead."
+            )
+        return peers[index - 1]
+    return parse_mac(text)
+
+
+def print_known_peers(peers: list[bytes]) -> None:
+    """Prints the address book the same way fos's own `nic peers` prints
+    its `PEERS` table -- a 1-based numbered list, so `--mac N` (this
+    tool, `term_net.py`) has something concrete to reference."""
+    if not peers:
+        print("No peers known yet. Run 'tools/peers.py --discover' (or send_tape.py/term_net.py once) first.")
+        return
+    print("Known peers (use the number with --mac instead of a full MAC address):")
+    for index, mac in enumerate(peers, start=1):
+        print(f"  {index}: {format_mac(mac)}")
+
+
 def send_tape(raw: socket.socket, destination: bytes, source: bytes, data: bytes, delay: float) -> None:
     start = bytearray(destination + source + CHAT_ETHERTYPE.to_bytes(2, "big") + bytes([TAPE_TAG_START]) + len(data).to_bytes(4, "little"))
     raw.send(pad(start))
@@ -157,7 +248,7 @@ def main() -> None:
     parser = ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("file", type=Path, help="File to send as the tape's contents.")
     parser.add_argument("--iface", help="Network interface to send from (default: auto-detected).")
-    parser.add_argument("--mac", help="Destination MAC address; skips discovery.")
+    parser.add_argument("--mac", help="Destination MAC address, or a peer number from tools/peers.py; skips discovery.")
     parser.add_argument(
         "--mac-file",
         type=Path,
@@ -211,24 +302,31 @@ def main() -> None:
                 "CAP_NET_RAW -- try running this again with sudo."
             )
 
+        known_peers = load_known_peers()
+
         if args.mac:
-            destination = parse_mac(args.mac)
+            destination = resolve_peer(args.mac, known_peers)
         elif args.mac_file:
             destination = read_mac_file(args.mac_file)
         else:
             print(f"Discovering a fos host on {iface} ({args.discover_timeout}s)...", file=sys.stderr)
-            peers = discover(raw, iface, source, args.discover_timeout)
-            if len(peers) == 1:
-                destination = peers[0]
+            live_peers = discover(raw, iface, source, args.discover_timeout)
+            if any(remember_known_peer(known_peers, mac) for mac in live_peers):
+                save_known_peers(known_peers)
+            if len(live_peers) == 1:
+                destination = live_peers[0]
                 print(f"Found one peer: {format_mac(destination)}", file=sys.stderr)
-            elif not peers:
+            elif not live_peers:
                 raise SystemExit(
                     "no fos host replied to the discovery probe. Make sure one is running "
-                    "'tape load net' or 'nic discover'/'chat', or pass --mac AA:BB:CC:DD:EE:FF explicitly."
+                    "'tape load net' or 'nic discover'/'chat', or pass --mac AA:BB:CC:DD:EE:FF (or a peer number) explicitly."
                 )
             else:
-                listed = ", ".join(format_mac(mac) for mac in peers)
-                raise SystemExit(f"found {len(peers)} peers ({listed}); pass --mac to pick one.")
+                print_known_peers(known_peers)
+                raise SystemExit(
+                    f"found {len(live_peers)} peers this probe; pass --mac with a full MAC address "
+                    "or one of the numbers listed above to pick one."
+                )
 
         print(f"Sending {len(data)} byte(s) from {args.file} to {format_mac(destination)} on {iface}...", file=sys.stderr)
         send_tape(raw, destination, source, data, args.delay)

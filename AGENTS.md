@@ -1241,6 +1241,43 @@ find the target machine:
   silently overflow its receive ring on a large tape sent from a fast,
   unpaced sender.
 
+### A numbered peer address book for `send_tape.py`/`term_net.py`
+
+Both tools already broadcast the same `CHAT_TAG_DISCOVER_REQUEST` probe
+`nic discover` sends and pick the destination automatically when exactly
+one fos machine replies. With more than one on the wire, though, each
+was previously a dead end: print every MAC found and ask for `--mac`
+spelled out in full -- every single run, since a short-lived Python
+process has nowhere of its own to remember "peer 2 was that RTL8139 at
+`52:54:00:...`" the way the fos kernel's own `PEERS` table
+(`kernel/src/shell.rs`) does for a whole boot session, letting `chat`/
+`tape send` accept a small `PEER_NUMBER` instead.
+
+`send_tape.py` now keeps a small on-disk address book mirroring that
+table -- `load_known_peers`/`save_known_peers`/`remember_known_peer`/
+`resolve_peer`/`print_known_peers`, all reused by `term_net.py` (which
+already imports `send_tape` for its wire-format helpers) and the new
+`tools/peers.py`. It's a JSON file, by default `~/.cache/fos_peers.json`
+(`PEERS_CACHE_FILE`, overridable via the `FOS_PEERS_FILE` environment
+variable so tests can point it somewhere disposable instead of a real
+user's cache): every discovery either tool performs merges newly seen
+peers into it in first-seen order, exactly like `remember_peer`, and
+`--mac` on either tool now accepts either a full MAC address or a
+1-based index into this list, exactly like `chat`/`tape send` accept
+`PEER_MAC|PEER_NUMBER`.
+
+`tools/peers.py` is the standalone equivalent of `nic peers`/
+`nic discover`: no arguments just prints the cached list (no network
+traffic); `--discover` broadcasts one probe, merges replies in, and
+prints the resulting list; `--forget` empties it. The one real
+difference from the kernel's own table is persistence itself: the
+kernel's starts empty every reboot, so a stale entry there is
+self-limiting, while this one survives indefinitely across separate
+tool invocations and can go stale (a MAC that answered yesterday might
+be a different machine, or offline, today) -- hence `--forget`, so a
+person notices and resets it deliberately rather than either tool
+trying to guess when an entry has gone stale on its own.
+
 ## Deliberately deferred work
 
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,

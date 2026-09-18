@@ -233,7 +233,7 @@ def main() -> None:
     parser.add_argument("--stdin", action="store_true", help="Read additional command lines from stdin, one per line.")
     parser.add_argument("--interactive", action="store_true", help="Raw interactive session instead of request/response.")
     parser.add_argument("--iface", help="Network interface to send from (default: auto-detected).")
-    parser.add_argument("--mac", help="Destination MAC address; skips discovery.")
+    parser.add_argument("--mac", help="Destination MAC address, or a peer number from tools/peers.py; skips discovery.")
     parser.add_argument(
         "--discover-timeout", type=float, default=1.0, help="Seconds to wait for discovery replies (default: 1.0)."
     )
@@ -263,23 +263,31 @@ def main() -> None:
                 "CAP_NET_RAW -- try running this again with sudo."
             )
 
+        known_peers = send_tape.load_known_peers()
+
         if args.mac:
-            destination = send_tape.parse_mac(args.mac)
+            destination = send_tape.resolve_peer(args.mac, known_peers)
         else:
             print(f"Discovering a fos host on {iface} ({args.discover_timeout}s)...", file=sys.stderr)
-            peers = send_tape.discover(raw, iface, source, args.discover_timeout)
-            if len(peers) == 1:
-                destination = peers[0]
+            live_peers = send_tape.discover(raw, iface, source, args.discover_timeout)
+            if any(send_tape.remember_known_peer(known_peers, mac) for mac in live_peers):
+                send_tape.save_known_peers(known_peers)
+            if len(live_peers) == 1:
+                destination = live_peers[0]
                 print(f"Found one peer: {send_tape.format_mac(destination)}", file=sys.stderr)
-            elif not peers:
+            elif not live_peers:
                 raise SystemExit(
                     "no fos host replied to the discovery probe. Make sure one is running "
                     "'chat'/'nic discover'/'tape load net' (or already 'term net', which also "
-                    "answers discovery until a client connects), or pass --mac AA:BB:CC:DD:EE:FF explicitly."
+                    "answers discovery until a client connects), or pass --mac AA:BB:CC:DD:EE:FF "
+                    "(or a peer number) explicitly."
                 )
             else:
-                listed = ", ".join(send_tape.format_mac(mac) for mac in peers)
-                raise SystemExit(f"found {len(peers)} peers ({listed}); pass --mac to pick one.")
+                send_tape.print_known_peers(known_peers)
+                raise SystemExit(
+                    f"found {len(live_peers)} peers this probe; pass --mac with a full MAC address "
+                    "or one of the numbers listed above to pick one."
+                )
 
         print(f"Connecting to {send_tape.format_mac(destination)} on {iface}...", file=sys.stderr)
         send_control(raw, destination, source, TERM_TAG_HELLO)
