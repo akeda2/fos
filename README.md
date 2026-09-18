@@ -141,7 +141,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load disk NAME` | Loads a FOSFS file straight into a fresh tape buffer (bounded by FOSFS's current 512-byte one-sector file limit). |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing the kernel's own `console::print_byte` as its one argument so its printed output goes through the same VGA/serial/relay path as any other command's. If it ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing `putc`/`should_abort`/`alloc`/`free`/`read_key` callbacks and any trailing command-line text (as `args_ptr`/`args_len`) as its arguments -- see "Tape ABI grows again" in AGENTS.md for the full seven-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run` alone leaves it empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, also auto-replies to `nic discover` probes, same as `chat`/`tape load net`. This same wait now also runs automatically once at every boot, before the interactive prompt appears. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
@@ -529,6 +529,28 @@ end to end with `tapes/test_bigsieve_e2e.py`, which runs QEMU with
 `docs/rust-tapes-for-dummies.md` for a from-scratch, beginner-friendly
 walkthrough, including a section on `alloc`/`free` for tapes that need
 more memory than their fixed 4 MiB region.
+
+#### Test tape: `tapes/calc/`
+
+A reverse-Polish-notation (RPN) integer calculator, and the tape that
+motivated the ABI's `read_key`/`args_ptr`/`args_len` additions (see
+"Tape ABI grows again" in AGENTS.md) -- an earlier attempt at exactly
+this tape discovered there was no way for any tape to receive a
+parameter or read a keystroke at all. Like `vga-colors`, it depends on
+`../tape-rt` rather than duplicating that boilerplate again. Two ways to
+use it: `tape run 3 4 +` evaluates `"3 4 +"` once via the new startup-
+argument parameters and returns immediately; plain `tape run` instead
+starts a small interactive REPL built on the new `read_key` callback,
+reading one line at a time -- from local keyboard or an active
+`term net` session, indistinguishably -- until a "give up" key (or a
+remote Escape byte) ends it. Supports `+ - * / %` with checked overflow/
+division-by-zero detection, reporting friendly errors rather than
+crashing. Built with `make tape-calc` (producing `build/tapes/calc.bin`)
+and verified end to end with `tapes/test_calc_e2e.py`, which exercises
+both modes: startup-argument evaluation, an interactive session
+including a backspace correction and a division-by-zero error, and a
+remote Escape byte cleanly ending the REPL without disconnecting the
+`term_net` session driving it.
 
 #### Test tape: `tapes/longmode.S` / `tapes/longmode-rs/`
 

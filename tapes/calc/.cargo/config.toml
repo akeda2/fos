@@ -1,0 +1,19 @@
+[build]
+# Reuses the exact same custom target the kernel and every other 32-bit
+# Rust tape build with (see ../../kernel/.cargo/config.toml) -- a tape
+# and the kernel are both freestanding, no_std, ring-0 flat binaries for
+# the same 32-bit protected mode, so there is no reason for a second
+# target spec to exist.
+target = "../../targets/i686-fos.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
+
+[target.i686-fos]
+# Unlike the kernel's own linker.ld (fixed at 0x10000, see kernel/linker.ld),
+# this fixes the load address at pmem::TAPE_BASE (0x100000) -- the address
+# every tape, regardless of source language, is always loaded at (see
+# kernel/src/pmem.rs's TAPE_BASE/TAPE_LEN doc comment).
+rustflags = ["-C", "link-arg=-Tlinker.ld"]

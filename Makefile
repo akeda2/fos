@@ -12,8 +12,9 @@ TAPE_VGA_COLORS_BIN := $(BUILD)/tapes/vga-colors.bin
 TAPE_BIGSIEVE_BIN := $(BUILD)/tapes/bigsieve.bin
 TAPE_LONGMODE_BIN := $(BUILD)/tapes/longmode.bin
 TAPE_LONGMODE_RS_BIN := $(BUILD)/tapes/longmode-rs.bin
+TAPE_CALC_BIN := $(BUILD)/tapes/calc.bin
 
-.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs clean
+.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -38,13 +39,14 @@ help:
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
 	@echo "  make test       - build the image, then run the serial-driven QEMU smoke test"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
 	@echo "  make tape-bigsieve   - build build/tapes/bigsieve.bin (Rust tape, uses alloc/free for a 64 MiB buffer)"
 	@echo "  make tape-longmode   - build build/tapes/longmode.bin (asm shim + asm body, visits 64-bit long mode and returns)"
 	@echo "  make tape-longmode-rs - build build/tapes/longmode-rs.bin (same asm shim, but the 64-bit body is Rust)"
+	@echo "  make tape-calc       - build build/tapes/calc.bin (Rust RPN calculator tape; uses read_key/args_ptr/args_len)"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -89,7 +91,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -200,5 +202,22 @@ tape-longmode-rs:
 	ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main -o $(BUILD)/tapes/longmode-rs.elf $(BUILD)/tapes/longmode64_shim.o tapes/longmode-rs/target/x86_64-fos-tape/release/liblongmode_tape_body.a
 	objcopy -O binary $(BUILD)/tapes/longmode-rs.elf $(TAPE_LONGMODE_RS_BIN)
 
+# Builds the "calc" test tape: same fixed-address Rust setup as
+# tape-vga-colors above (depends on ../tape-rt for _start/panic handler/
+# print helpers), but demonstrating the tape ABI's newest additions --
+# `read_key` and `args_ptr`/`args_len` (see kernel/src/shell.rs's
+# `combined_tape_read_key` and `shell::tape_run`'s doc comment, and
+# AGENTS.md's "Tape ABI grows again: `read_key` and startup arguments"
+# section). A reverse-Polish-notation integer calculator: `tape run 3 4 +`
+# evaluates once and returns; plain `tape run` starts an interactive REPL
+# reading one line at a time from local keyboard or an active `term net`
+# session. See tapes/calc/src/main.rs for the full design. Entirely
+# additive -- untouched by plain `make`/`image`/`run`/`test`; built as
+# part of `make all`/`make tapes`.
+tape-calc:
+	cd tapes/calc && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tapes/calc/target/i686-fos/release/calc-tape $(TAPE_CALC_BIN)
+
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target

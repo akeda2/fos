@@ -476,6 +476,10 @@ in ordinary Rust, rather than a second kernel callback.
   remotely).
 - `tapes/bigsieve/src/main.rs` -- a one-shot tape using `alloc`/`free`
   to work with a 64 MiB buffer far bigger than its own 4 MiB region.
+- `tapes/calc/src/main.rs` -- a reverse-Polish-notation calculator
+  demonstrating both `read_key` (an interactive REPL) and startup
+  arguments (`tape run 3 4 +`), the section 7 additions above, in a
+  complete real tape.
 - `tapes/primes.S` -- the original hand-written, position-
   independent assembly tape, useful for understanding what Rust's fixed
   load address saves you from having to do by hand.

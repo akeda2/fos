@@ -1124,6 +1124,65 @@ one, built the same way the shell's own `LineEditor` is: ordinary Rust
 layered over one narrow, non-blocking primitive, not a second kernel
 callback.
 
+### `tapes/calc/`: the reverse-Polish-notation calculator this all was for
+
+The calculator deferred while `read_key`/`args_ptr`/`args_len` above were
+being designed now exists: `tapes/calc/`, a genuinely new tape (not a
+`docs/rust-tapes-for-dummies.md` teaching-ladder example), depending on
+`../tape-rt` the same way `vga-colors` does rather than duplicating
+`entry.S`/the panic handler/print helpers a third time.
+
+Reverse Polish notation (RPN) was chosen deliberately, not just as an
+arbitrary demo choice: evaluating it needs only a stack and one
+left-to-right pass over whitespace-separated tokens (a number pushes, an
+operator pops two operands and pushes one result) -- no operator-
+precedence table, no parentheses, no lookahead. That simplicity keeps
+this tape's own logic (`eval_line`, `next_token`, `parse_i32` in
+`tapes/calc/src/main.rs`) squarely focused on demonstrating the new ABI
+additions, not on parser design.
+
+It exercises both new additions, independently, exactly as each was
+designed to be used:
+
+- **`tape run 3 4 +`** (startup arguments): evaluates `"3 4 +"` once via
+  `args_ptr`/`args_len`, prints `= 7`, and returns immediately -- no
+  interaction at all.
+- **Plain `tape run`** (interactive `read_key`): starts a small REPL,
+  reading one line at a time from whichever source started the tape
+  (local keyboard or an active `term_net` session, indistinguishably, as
+  designed) until told to give up. This is also the first tape to
+  demonstrate a *line-based* input pattern built entirely out of the
+  kernel's one non-blocking `read_key` primitive, exactly as this
+  section above predicted a future tape would: a fixed-size line buffer
+  that grows on ordinary printable bytes, shrinks by one on a backspace
+  event (the on-screen erase already happened inside `read_key` itself,
+  so the tape only tracks its own length), and evaluates and resets on
+  `\r`/`\n`. `TAPE_EVENT_ABORT` ends the REPL the same way it would for
+  any other `read_key`-based tape.
+
+`tapes/calc/src/main.rs` intentionally never calls `should_abort` --
+consistent with this section's own warning, doing so alongside
+`read_key` would race both against the same underlying input sources.
+Its `EvalError` enum (stack underflow, division/remainder by zero,
+`i32` overflow via `checked_add`/`checked_sub`/`checked_mul`/
+`checked_div`/`checked_rem`, an unrecognized token, a full stack, or
+leftover operands once input is exhausted) reports a friendly message
+through `putc` for every failure mode rather than panicking or silently
+producing a wrong answer -- deliberately, since a calculator that
+crashes on `5 0 /` would defeat the point of a teaching example.
+
+Verified end to end over the network with `tapes/test_calc_e2e.py`
+(mirroring `tapes/test_hello_rs_e2e.py`'s one-continuous-`term-net`-
+session structure): both startup-argument evaluation (`3 4 +` = `7`) and
+an interactive session (`6 7 *` = `42`; `5 0 /` reports division by
+zero; `2 2` with a backspace then `3 -` correctly becomes `2 3 -` = `-1`,
+proving `read_key`'s backspace handling; a remote Escape byte stops the
+REPL cleanly, the same mechanism `tapes/test_vga_colors_e2e.py` already
+proves for a `should_abort`-based tape) all pass, and the same
+`term_net` session remains responsive to an ordinary command
+immediately afterward. Built with `make tape-calc` (producing
+`build/tapes/calc.bin`).
+
 ### `term net` stays resident after a remote disconnect
 
 Originally, *any* session-ending event -- local F12, a remote
