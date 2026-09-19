@@ -15,8 +15,12 @@ TAPE_LONGMODE_RS_BIN := $(BUILD)/tapes/longmode-rs.bin
 TAPE_CALC_BIN := $(BUILD)/tapes/calc.bin
 TAPE_BEEP_BIN := $(BUILD)/tapes/beep.bin
 TAPE_MORSE_BIN := $(BUILD)/tapes/morse.bin
+TAPE_NET_CHAT_BIN := $(BUILD)/tapes/net-chat.bin
+TAPE_IP_CHAT_BIN := $(BUILD)/tapes/ip-chat.bin
+TAPE_TELNET_BIN := $(BUILD)/tapes/telnet.bin
+TAPE_BRIDGE_BIN := $(BUILD)/tapes/bridge.bin
 
-.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse clean
+.PHONY: all help kernel image run test test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -39,9 +43,13 @@ help:
 	@echo "  make kernel     - build only the Rust kernel binary (build/kernel.bin)"
 	@echo "  make image      - build build/fos.img (stage1 + stage2 + kernel), via 'make kernel'"
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
-	@echo "  make test       - build the image, then run the serial-driven QEMU smoke test"
+	@echo "  make test       - build the image, then run default-NIC, e1000, dual-e1000, and VGA mode tests"
+	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
+	@echo "  make test-dual-e1000 - build the image, then verify two e1000 interfaces and selection"
+	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
+	@echo "  make test-vga-modes - verify 80x25, 80x50, and experimental 132x25 under QEMU"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-beep + tape-morse)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
@@ -51,6 +59,14 @@ help:
 	@echo "  make tape-calc       - build build/tapes/calc.bin (Rust RPN calculator tape; uses read_key/args_ptr/args_len)"
 	@echo "  make tape-beep       - build build/tapes/beep.bin (Rust PC speaker tape; beeps on b via read_key)"
 	@echo "  make tape-morse      - build build/tapes/morse.bin (Rust Morse trainer; plays A-Z/0-9 via read_key)"
+	@echo "  make tape-net-chat   - build build/tapes/net-chat.bin (Rust shell-compatible Ethernet chat tape)"
+	@echo "  make tape-ip-chat   - build build/tapes/ip-chat.bin (Rust IPv4/UDP chat tape; static or DHCP)"
+	@echo "  make tape-telnet   - build build/tapes/telnet.bin (Rust TCP/Telnet terminal tape; static IPv4 or DHCP)"
+	@echo "  make tape-bridge   - build build/tapes/bridge.bin (Rust layer-2 learning bridge/switch tape)"
+	@echo "  make test-tape-net   - run host-side unit tests for tapes/tape-net"
+	@echo "  make test-tape-ip-chat - run host-side unit tests for tapes/ip-chat"
+	@echo "  make test-tape-telnet - run host-side unit tests for tapes/telnet"
+	@echo "  make test-tape-bridge - build the image/tape and run the three-guest layer-2 bridge test"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -81,6 +97,21 @@ run: image
 
 test: image
 	python3 tools/qemu_smoke.py --image $(IMAGE)
+	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000
+	python3 tools/qemu_smoke.py --image $(IMAGE) --nic dual-e1000
+	python3 tools/test_vga_modes.py --image $(IMAGE)
+
+test-e1000: image
+	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000
+
+test-dual-e1000: image
+	python3 tools/qemu_smoke.py --image $(IMAGE) --nic dual-e1000
+
+test-e1000-net: tape-net-chat image
+	python3 tapes/test_net_chat_e2e.py --nic e1000
+
+test-vga-modes: image
+	python3 tools/test_vga_modes.py --image $(IMAGE)
 
 # Builds an alternative, optional boot artifact: a PCI expansion ("option")
 # ROM that boots fos directly from a network card's own boot ROM instead of
@@ -95,7 +126,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -224,7 +255,7 @@ tape-calc:
 	objcopy -O binary tapes/calc/target/i686-fos/release/calc-tape $(TAPE_CALC_BIN)
 
 # Builds the "beep" test tape: a 32-bit Rust tape using the newest
-# seven-argument ABI and `read_key` to drive the PC speaker directly.
+# twelve-argument ABI and `read_key` to drive the PC speaker directly.
 # Each lowercase or shifted `b` press starts a 440 Hz, approximately
 # 100 ms beep; F12/F4/F6/F7/F8/F10 returns to the shell. It supports both
 # local keyboard input and bytes arriving through `term net`.
@@ -233,7 +264,7 @@ tape-beep:
 	mkdir -p $(BUILD)/tapes
 	objcopy -O binary tapes/beep/target/i686-fos/release/beep-tape $(TAPE_BEEP_BIN)
 
-# Builds the "morse" test tape: a 32-bit Rust tape using the seven-argument
+# Builds the "morse" test tape: a 32-bit Rust tape using the twelve-argument
 # ABI and `read_key` to turn each A-Z/0-9 input character into a printed
 # Morse representation and a timed PC-speaker sequence.
 tape-morse:
@@ -241,5 +272,50 @@ tape-morse:
 	mkdir -p $(BUILD)/tapes
 	objcopy -O binary tapes/morse/target/i686-fos/release/morse-tape $(TAPE_MORSE_BIN)
 
+# Builds the "net-chat" test tape: a 32-bit Rust implementation of fos's
+# shell-compatible raw Ethernet chat protocol using the kernel-managed NIC
+# callbacks and read_key for local or remote line input.
+tape-net-chat:
+	cd tapes/net-chat && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tapes/net-chat/target/i686-fos/release/net-chat-tape $(TAPE_NET_CHAT_BIN)
+
+# Builds the "ip-chat" protocol tape: a 32-bit Rust UDP-over-IPv4 chat
+# application using tape-net for ARP/IPv4/UDP and DHCP. Static mode is the
+# deterministic integration-test path; `tape run dhcp` is for a network with
+# an actual DHCP server.
+tape-ip-chat:
+	cd tapes/ip-chat && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tapes/ip-chat/target/i686-fos/release/ip-chat-tape $(TAPE_IP_CHAT_BIN)
+
+test-tape-net:
+	cargo +nightly-2026-09-13 test --manifest-path tapes/tape-net/Cargo.toml
+
+test-tape-ip-chat:
+	cargo +nightly-2026-09-13 test --manifest-path tapes/ip-chat/Cargo.toml --lib
+
+# Builds the "telnet" protocol tape: a 32-bit Rust TCP terminal client.
+# It uses static IPv4 configuration, the shared one-connection TCP state
+# machine, and a minimal Telnet option parser while preserving UTF-8 bytes.
+tape-telnet:
+	cd tapes/telnet && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tapes/telnet/target/i686-fos/release/telnet-tape $(TAPE_TELNET_BIN)
+
+test-tape-telnet:
+	cargo +nightly-2026-09-13 test --manifest-path tapes/telnet/Cargo.toml --lib
+
+# Builds the "bridge" tape: a 32-bit Rust layer-2 learning bridge. It
+# exercises the per-interface NIC callbacks added to the append-only tape ABI
+# and forwards raw Ethernet frames without implementing any IP protocol.
+tape-bridge:
+	cd tapes/bridge && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tapes/bridge/target/i686-fos/release/bridge-tape $(TAPE_BRIDGE_BIN)
+
+test-tape-bridge: image tape-bridge
+	python3 tapes/test_bridge_e2e.py
+
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target tapes/net-chat/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target

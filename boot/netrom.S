@@ -411,8 +411,10 @@ copy_kernel:
     movw %ax, %es
     movw $kernel_data, %si
     xorw %di, %di
-    movw $NETROM_KERNEL_SIZE, %cx
-    rep movsb
+    movl $NETROM_KERNEL_SIZE, %ecx
+    movl $kernel_data, %esi
+    xorl %edi, %edi
+    addr32 rep movsb
     popw %es
     ret
 

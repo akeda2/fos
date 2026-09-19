@@ -183,22 +183,33 @@ pub enum InitError {
 }
 
 impl Rtl8139 {
-    /// Looks for exactly one Realtek RTL8139 on the PCI bus and, if
-    /// found, enables its I/O space and bus-mastering (DMA) bits,
-    /// returning its I/O base address (BAR0). Returns `None` if no such
-    /// card is present, or if it is found but its BAR0 is not I/O-mapped.
-    /// Use `init` on the result to actually bring the card up.
-    pub fn probe() -> Option<u16> {
-        let address = pci::find_device(VENDOR_REALTEK, DEVICE_RTL8139)?;
-        address.enable_io_and_bus_master();
-        address.io_bar0()
+    /// Finds every Realtek RTL8139 function with a usable I/O BAR and
+    /// enables I/O space and bus mastering for each one.
+    pub fn probe_all(out: &mut [u16]) -> usize {
+        let mut addresses = [None; pci::MAX_DEVICE_MATCHES];
+        let found = pci::find_devices(
+            VENDOR_REALTEK,
+            &[DEVICE_RTL8139],
+            &mut addresses,
+        );
+        let mut count = 0;
+        for address in addresses[..found.min(addresses.len())].iter().flatten() {
+            address.enable_io_and_bus_master();
+            if let Some(io_base) = address.io_bar0() {
+                if count == out.len() {
+                    break;
+                }
+                out[count] = io_base;
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Resets the card, allocates its DMA buffers, and enables receiving
-    /// and transmitting. Only one `Rtl8139` should exist per physical
-    /// card at a time (each owns its own DMA buffers, allocated once here
-    /// and never freed back to `pmem` -- this driver is not meant to be
-    /// torn down and re-initialized repeatedly).
+    /// and transmitting. Each instance owns its own DMA buffers, allocated
+    /// once here and never freed back to `pmem`; the driver is not meant to
+    /// be torn down and re-initialized repeatedly.
     pub fn init(io_base: u16) -> Result<Self, InitError> {
         Self::soft_reset(io_base)?;
 
@@ -300,7 +311,8 @@ impl Rtl8139 {
         // Physical memory is identity-mapped, so the DMA buffer's
         // physical address doubles as a plain pointer we can write
         // through directly.
-        let destination = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, MAX_FRAME_LEN) };
+        let destination =
+            unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, MAX_FRAME_LEN) };
         destination[..frame.len()].copy_from_slice(frame);
         let padded_len = frame.len().max(MIN_FRAME_LEN);
         if padded_len > frame.len() {
@@ -308,7 +320,11 @@ impl Rtl8139 {
         }
 
         write32(self.io_base, REG_TSAD0 + descriptor as u16 * 4, buffer);
-        write32(self.io_base, REG_TSD0 + descriptor as u16 * 4, padded_len as u32);
+        write32(
+            self.io_base,
+            REG_TSD0 + descriptor as u16 * 4,
+            padded_len as u32,
+        );
 
         let mut attempts = 1_000_000u32;
         loop {
@@ -394,7 +410,9 @@ impl Rtl8139 {
         }
 
         let offset = self.rx_offset.get();
-        let header = unsafe { core::ptr::read_unaligned((self.rx_buffer + u32::from(offset)) as *const u32) };
+        let header = unsafe {
+            core::ptr::read_unaligned((self.rx_buffer + u32::from(offset)) as *const u32)
+        };
         let status = header & 0xffff;
         let frame_len = (header >> 16) as u16; // Includes the 4-byte FCS.
 
@@ -440,12 +458,10 @@ impl Rtl8139 {
     }
 }
 
-/// The one `Rtl8139` this kernel ever brings up, created lazily on first
-/// use by `get`. A single instance is all this driver supports (its DMA
-/// buffers are allocated once and never freed); this matches the
-/// project's general approach of building exactly as much as one worked
-/// example needs, not a general multi-device driver model.
-static mut NIC: Option<Rtl8139> = None;
+const MAX_INSTANCES: usize = pci::MAX_DEVICE_MATCHES;
+static mut NICS: [Option<Rtl8139>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
+static mut NIC_COUNT: usize = 0;
+static mut INITIALIZED: bool = false;
 
 /// Why `get` could not make a card available. `NotPresent` means no
 /// RTL8139 was found at all (the caller should say so and stop);
@@ -453,20 +469,45 @@ static mut NIC: Option<Rtl8139> = None;
 #[derive(Debug)]
 pub enum Status {
     NotPresent,
-    InitFailed(InitError),
+    InitFailed,
 }
 
-/// Returns the singleton driver instance, probing and initializing the
-/// card the first time this is called and simply reusing it on every
-/// later call (repeated calls do not re-probe or re-reset the card).
-pub fn get() -> Result<&'static Rtl8139, Status> {
-    let nic = &raw mut NIC;
+/// Probes and initializes every usable RTL8139, retaining each instance's
+/// DMA buffers for the remainder of the boot.
+pub fn initialize_all() -> Result<usize, Status> {
     unsafe {
-        if (*nic).is_none() {
-            let io_base = Rtl8139::probe().ok_or(Status::NotPresent)?;
-            let initialized = Rtl8139::init(io_base).map_err(Status::InitFailed)?;
-            *nic = Some(initialized);
+        if !INITIALIZED {
+            INITIALIZED = true;
+            let mut io_bases = [0u16; MAX_INSTANCES];
+            let found = Rtl8139::probe_all(&mut io_bases);
+            let mut first_error = None;
+            for &io_base in &io_bases[..found] {
+                match Rtl8139::init(io_base) {
+                    Ok(initialized) => {
+                        NICS[NIC_COUNT] = Some(initialized);
+                        NIC_COUNT += 1;
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+            }
+            if NIC_COUNT == 0 {
+                return                 if first_error.is_some() {
+                    Err(Status::InitFailed)
+                } else {
+                    Err(Status::NotPresent)
+                };
+            }
         }
-        Ok((*nic).as_ref().unwrap())
+        Ok(NIC_COUNT)
+    }
+}
+
+pub fn get(index: usize) -> Option<&'static Rtl8139> {
+    unsafe {
+        if index >= NIC_COUNT {
+            return None;
+        }
+        NICS[index].as_ref()
     }
 }

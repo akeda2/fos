@@ -70,11 +70,19 @@ make run
 ```
 
 `make test` builds the image and performs a bounded serial-driven QEMU smoke
-test. It checks boot milestones (including interrupt/allocator setup), line
-editing, shell error handling, system inspection, interrupt/memory
-introspection, FOSFS formatting, file creation, reading, removal, and halt.
+test plus a VGA-mode test. It checks boot milestones (including
+interrupt/allocator setup), line editing, shell error handling, system
+inspection, interrupt/memory introspection, FOSFS formatting, file creation,
+reading, removal, halt, and the 80x25/80x50/experimental 132x25 local VGA
+mode switches. `make test-vga-modes` runs only the VGA mode test.
 `cargo test` does not work for this crate (a `no_std`, custom-target,
 freestanding binary); `make test` is the sole automated validation path.
+
+`make test-tape-net` runs the host-side unit suite for the no-heap shared
+networking library in `tapes/tape-net/`. Its synthetic-frame tests cover the
+protocol code without requiring a NIC or QEMU. `make test-tape-ip-chat` runs
+the host-side tests for the IPv4/UDP chat tape's argument and packet helpers;
+`make test-tape-telnet` does the same for the Telnet tape.
 
 `make netrom` builds an alternative, optional boot artifact,
 `build/netboot.rom`, that boots fos from a NIC's own PCI option ROM instead
@@ -84,10 +92,15 @@ plain `make` (still just `make image`) and does not affect `image`/`run`/
 
 `make all` builds everything this repository knows how to produce in one
 go: the image, `make netrom`, and every test tape (`make tapes`, including
-`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-beep`/`tape-morse` -- see "Tape
+`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-beep`/`tape-morse`/`tape-net-chat`/`tape-ip-chat`/`tape-telnet`/`tape-bridge` -- see "Tape
 (`tape`)" below). Not needed for ordinary kernel/boot work, for which plain `make`
 (equivalent to `make image`) is enough. `make help` lists every target
 with a one-line description.
+
+The kernel/tape networking boundary and the shared protocol library are
+documented separately in [`NETWORKING.md`](NETWORKING.md). That document
+covers the raw NIC callbacks, timer/queue semantics, and the staged
+Ethernet/ARP/IPv4/ICMP/UDP/TCP implementation in `tapes/tape-net/`.
 
 ## Prompt
 
@@ -109,6 +122,7 @@ resetting to row 0 and overwriting the top of that narration.
 | --- | --- |
 | `help` | Lists available commands. |
 | `clear` | Clears VGA text and sends an ANSI clear request to serial terminals. |
+| `vga [d\|80x25\|80x50\|132x25]` | Shows the current mode and available modes, or changes the local VGA text mode. `d` returns to the 80x25 default; 80x50 uses the VGA 8x8-font mode; 132x25 uses experimental extended horizontal timing and may not work on every adapter or monitor. |
 | `about` | Describes this educational OS. |
 | `bootinfo` | Shows boot drive, serial status, and the reserved kernel memory range. |
 | `memmap` | Prints the BIOS E820 memory-map entries, decoded (usable RAM, reserved, ACPI, bad memory). |
@@ -130,7 +144,9 @@ resetting to row 0 and overwriting the top of that narration.
 | `rm NAME` | Removes a FOSFS file entry. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
-| `nic` | Reports whether an RTL8139 Ethernet controller was found on PCI (and, if so, its MAC address). |
+| `nic` | Reports the active supported PCI Ethernet controller and its MAC address; the first initialized interface is selected by default. |
+| `nic list` | Lists every initialized Ethernet interface, its driver, MAC address, and active marker. |
+| `nic use N` | Selects interface N from `nic list` for the shell and legacy single-interface tape callbacks. |
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
 | `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
 | `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 (or F4/F6/F7/F8/F10) stops the capture, then turns promiscuous mode back off. |
@@ -141,13 +157,25 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load disk NAME` | Loads a FOSFS file straight into a fresh tape buffer (bounded by FOSFS's current 512-byte one-sector file limit). |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing `putc`/`should_abort`/`alloc`/`free`/`read_key` callbacks and any trailing command-line text (as `args_ptr`/`args_len`) as its arguments -- see "Tape ABI grows again" in AGENTS.md for the full seven-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run` alone leaves it empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, and timer callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full seventeen-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run` alone leaves it empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, also auto-replies to `nic discover` probes, same as `chat`/`tape load net`. This same wait now also runs automatically once at every boot, before the interactive prompt appears. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
 
 Argument-taking commands show a usage message for missing or extra arguments.
 Unknown commands and oversized input are reported rather than ignored.
+
+### Local VGA modes
+
+The kernel owns the local VGA mode and clears the text framebuffer whenever
+`vga` changes it. `80x25` is the BIOS-compatible default. `80x50` keeps the
+normal 80-column timing but selects a copied 8x8 font map, giving twice as
+many rows. `132x25` selects an 8-pixel character clock and experimental
+extended horizontal timing; QEMU supports the resulting 1056x400 surface, but
+plain VGA adapters and attached monitors are not required to accept it.
+Switching back to `vga 80x25` restores the register values captured during
+kernel initialization. Tapes and the tape library do not need mode-specific
+changes because normal tape output goes through the kernel's `putc` callback.
 
 ## Interrupts and the physical-frame allocator
 
@@ -252,14 +280,18 @@ device stack rather than simple port I/O (see "Current boundaries").
 
 ### Ethernet (`nic`)
 
-`nic` exercises a single supported network card: the Realtek RTL8139 Fast
-Ethernet controller (`kernel/src/rtl8139.rs`), chosen because it is
-well-documented, was extremely common in real PCI-era hardware, and is what
-QEMU emulates by default. It is found via the same PCI configuration-space
-walk used for add-on serial cards (`kernel/src/pci.rs`, extended with a
-vendor/device ID lookup), except this time by exact vendor/device ID (Realtek
-`0x10ec:0x8139`) rather than by class code, since NICs -- unlike UARTs --
-don't share one common register interface across vendors.
+`nic` initializes every supported PCI network card it can bring up:
+the Realtek RTL8139, selected 3Com 3C905/B/C variants, or Intel e1000
+(82540EM). The first initialized interface is active by default; `nic list`
+shows all interfaces and `nic use N` selects one for shell commands and the
+legacy single-interface tape callbacks. New tapes can enumerate and use
+several interfaces concurrently through the appended per-interface callbacks.
+The RTL8139 is what QEMU emulates by default; QEMU also provides an 82540EM
+model through `-device e1000`. The 3C905 backend is included for
+physical-machine testing, but the installed QEMU build has no 3C905 model.
+Each backend is found by exact vendor/device IDs through the PCI
+configuration-space walk in `kernel/src/pci.rs`, rather than by class code,
+because NIC register layouts are vendor-specific.
 
 Unlike the UART, an Ethernet controller does not hand over bytes one at a
 time via port I/O: it moves whole frames itself, via DMA, into and out of
@@ -267,34 +299,27 @@ buffers whose physical address the driver hands it ahead of time. This
 kernel has no paging, so physical and virtual addresses are identical and
 those buffers can be read and written directly through raw pointers, but
 they must still be real, physically contiguous memory the card can reach --
-so `nic`'s first use of the card allocates its receive ring (`pmem`'s first
-caller to need more than one contiguous frame at a time; see
-`pmem::allocate_contiguous`) and four single-frame transmit buffers, and
-never frees them.
+so the first use of `nic` allocates the physically contiguous DMA state required
+by every initialized backend through `pmem::allocate_contiguous` and never
+frees it. The RTL8139 uses a receive ring and transmit buffers; the
+3C905 uses receive/transmit descriptor lists; and e1000 uses legacy
+receive/transmit descriptor rings.
 
-There is no interrupt handling here: this project's PIC setup leaves every
-IRQ but the timer and keyboard masked (see "Current boundaries"), so the
-driver's interrupt mask register is simply left at zero and everything is
-done by polling status registers, the same approach `term` already takes for
-serial I/O. `TCR` (Transmit Configuration Register) is programmed with a
-standard IEEE 802.3 interframe gap rather than left at its all-zero reset
-value -- the RTL8139's own "transmit OK" status bit only reflects the
-chip's own FIFO/abort state, not whether anything downstream actually
-accepted the frame, and a too-short gap between frames is a well-known
-real-hardware gotcha real switches and NICs can silently enforce by
-dropping the frame even while the card itself reports success (QEMU's
-virtual NIC never enforces this, which is why it went unnoticed until
-tested between two real machines -- see "Real hardware notes" in
-`AGENTS.md`). `nic` (no arguments) reports whether a card was found and its
-MAC address; `nic send` transmits one broadcast test frame tagged with an
-IEEE-reserved "experimental" ethertype (`0x88b5`) so it is unmistakably fos's
-own test traffic; `nic recv` polls briefly for one incoming frame and
-hex-dumps it. There is deliberately no protocol above raw Ethernet yet -- no
-ARP, no IPv4, nothing resembling a socket -- this only proves the card itself
-works.
+There is no NIC interrupt handling here yet: this project's PIC setup leaves
+every IRQ but the timer and keyboard masked (see "Current boundaries"), so
+all three backends poll their device state. The e1000 driver uses MMIO and
+keeps device interrupts masked; it is deliberately the first Intel model
+because its legacy descriptor format is also available in QEMU for repeatable
+testing. `nic` (no arguments) reports the selected backend and MAC address;
+`nic send` transmits one broadcast frame tagged with an IEEE-reserved
+experimental ethertype (`0x88b5`); and `nic recv` polls briefly for one
+incoming frame and hex-dumps it. The shell commands remain deliberately
+raw-Ethernet demonstrations. Higher protocols are implemented by networking
+tapes through the shared `tapes/tape-net/` library rather than being hidden
+inside the kernel.
 
-`nic sniff` is a small link-level packet sniffer: it sets the card's receive
-filter to promiscuous mode (the RTL8139's `RCR` "accept all packets" bit),
+`nic sniff` is a small link-level packet sniffer: it asks the selected
+backend to enable promiscuous reception,
 so it is handed every frame it can see on the wire, not only ones addressed
 to it, then prints a one-line summary plus a hex dump of each frame as it
 arrives. Like `term`, it runs until F12 is pressed -- the same
@@ -304,6 +329,11 @@ layout, unlike a Shift/AltGr combination a Nordic keyboard would put it
 behind) -- and always restores the card to its normal, non-promiscuous
 filter before returning, so a later `nic send`/`nic recv` is not left seeing
 unrelated traffic.
+
+The per-interface tape callback `nic_set_promiscuous_at` exposes the same
+receive-all switch to multi-port tapes. It is needed by a layer-2 bridge:
+without promiscuous mode, a NIC normally discards frames addressed to hosts
+behind another bridge port before the tape can forward them.
 
 `tools/send_frame.py` is `nic sniff`'s host-side counterpart, for testing
 against a real fos machine over an actual Ethernet link rather than another
@@ -554,7 +584,7 @@ remote Escape byte cleanly ending the REPL without disconnecting the
 
 #### Test tape: `tapes/beep/`
 
-A small 32-bit Rust tape using the newest seven-argument ABI and the
+A small 32-bit Rust tape using the current seventeen-argument ABI and the
 `read_key` callback. It waits for the lowercase or shifted `b` key from
 either the local keyboard or an active `term net` session, programs PIT
 channel 2 to drive the PC speaker at 440 Hz for approximately 100 ms, then
@@ -579,6 +609,92 @@ the speaker carrier without disturbing the kernel timer. Both modes exit
 cleanly, while interactive mode also exits on F12 (or F4/F6/F7/F8/F10). Build
 it with `make tape-morse` (producing `build/tapes/morse.bin`) and verify both
 modes with `tapes/test_morse_e2e.py`.
+
+#### Test tape: `tapes/net-chat/`
+
+A Rust implementation of the shell's raw-Ethernet chat protocol, proving a
+tape can use the kernel-managed NIC callbacks without owning PCI, DMA,
+or receive-ring recovery itself. Plain `tape run` broadcasts; `tape run
+AA:BB:CC:DD:EE:FF` selects a unicast peer. While running, `/discover`
+broadcasts the same discovery probe as `nic discover`, `/peers` lists the
+tape's local peer table, `/to MAC` changes the unicast target, `/broadcast`
+returns to broadcast, and `/quit` exits. Its wire format is intentionally
+identical to the shell's `chat`, so either end can chat with the other. Build
+it with `make tape-net-chat` (producing `build/tapes/net-chat.bin`) and run
+`tapes/test_net_chat_e2e.py` to verify both directions against a second fos
+machine running the ordinary shell command. Use
+`python3 tapes/test_net_chat_e2e.py --nic e1000` (or
+`make test-e1000-net`) to run the same two-guest integration test through
+QEMU's Intel 82540EM backend.
+
+#### Test tape: `tapes/bridge/`
+
+An intentionally small layer-2 learning bridge/switch. It uses the
+per-interface tape callbacks rather than the active-interface compatibility
+callbacks, learns source MAC addresses in a bounded table, forwards known
+unicast destinations to one egress port, and floods unknown, broadcast, and
+multicast frames to every other selected port. Frames stay as raw Ethernet
+bytes; the tape does not implement ARP, IPv4, routing, TTL changes, or loop
+prevention.
+
+Use one-based interface numbers matching `nic list`, for example
+`tape run 1 2`, or omit the arguments to bridge every initialized interface.
+The tape enables promiscuous reception on its selected ports because a bridge
+must receive frames addressed to hosts behind another port. Do not connect
+its ports in a physical loop: STP/VLANs and loop prevention are deliberately
+out of scope. Build it with `make tape-bridge` and run
+`make test-tape-bridge` for the three-guest QEMU test, which uses two
+isolated e1000 segments and verifies forwarding in both directions.
+
+#### Test tape: `tapes/ip-chat/`
+
+An IPv4/UDP line-chat application built on the shared `tapes/tape-net/`
+library. It resolves peers with ARP, routes off-subnet traffic through the
+configured gateway, and keeps application policy in the tape rather than the
+kernel. Start it with `tape run static LOCAL_IP NETMASK GATEWAY [PEER_IP]`
+for deterministic configuration, or `tape run dhcp [PEER_IP]` when a DHCP
+server is available. While running, `/to A.B.C.D` selects a unicast peer,
+`/broadcast` returns to IPv4 broadcast, `/peers` lists configured/heard
+peers, and `/quit` returns to the shell. Lines are bounded to 240 bytes and
+UDP provides no delivery acknowledgement or retransmission. Build it with
+`make tape-ip-chat` (producing `build/tapes/ip-chat.bin`) and run
+`tapes/test_ip_chat_e2e.py` to verify static-IP chat in both directions and
+shell recovery afterward.
+
+#### Test tape: `tapes/telnet/`
+
+A fixed-buffer TCP terminal client for generic Unix-like Telnet servers. It
+uses the shared `tapes/tape-net/` ARP/TCP/DHCP implementation. Choose static
+configuration for deterministic setups:
+
+```text
+tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT
+```
+
+Or use DHCP for the local address, netmask, and gateway while still naming the
+Telnet server explicitly:
+
+```text
+tape run dhcp SERVER_IP SERVER_PORT
+```
+
+The tape negotiates the basic Telnet `WILL/WONT/DO/DONT` options, escapes
+literal `0xff` bytes as required by the protocol, skips subnegotiation, and
+forwards terminal data byte-for-byte. UTF-8 is intentionally preserved as
+raw bytes rather than decoded inside the tape, so an attached terminal can
+render the server's Unicode output without adding a character library or
+terminal-width policy. The client does not yet implement DNS,
+terminal-type/window-size negotiation, or authentication policy; a server's
+login prompt and credentials are simply terminal bytes. Common ANSI/VT100
+control sequences are preserved for serial and `term net` clients while being
+consumed for the local VGA view, which cannot interpret terminal escape
+sequences.
+
+Build it with `make tape-telnet` (producing `build/tapes/telnet.bin`) and run
+`tapes/test_telnet_e2e.py` for the focused raw-Ethernet interoperability test.
+That test uses the same unprivileged multicast QEMU fixture as the other
+networking tapes and a small host-side DHCP/ARP/IPv4/TCP/Telnet peer instead
+of requiring a TAP bridge or host network configuration.
 
 #### Test tape: `tapes/longmode.S` / `tapes/longmode-rs/`
 
@@ -834,9 +950,11 @@ gracefully (`diskinfo` shows zero sectors; FOSFS commands report the disk as
 absent) rather than attempting a read. `BootInfo.boot_drive` is likewise a
 best-effort `0x80` guess, since BIOS does not hand an `INT 19h`-hooked
 handler a meaningful drive number the way it does for a normal MBR boot.
-The embedded kernel must also fit in 65535 bytes (`tools/write_netrom_layout.py`
-enforces this at build time), since it is copied with a single 16-bit-counted
-`rep movsb` rather than sector-by-sector.
+The embedded kernel must still fit in the reserved `0x10000..0x40000`
+destination window (`tools/write_netrom_layout.py` enforces this at build
+time). The ROM path copies it with a 32-bit-address-size `rep movsb`; the
+final ROM image remains subject to the PCI option-ROM size limit enforced by
+`tools/build_netrom.py`.
 
 **Physical hardware note:** writing `build/netboot.rom` onto an actual boot
 ROM chip is only possible if the card has a writable/socketed option ROM --
@@ -874,8 +992,9 @@ UEFI-only machines and CHS-only BIOS disk services are unsupported.
 - LBA 4096: a separate 4096-sector FOSFS data partition.
 
 `tools/write_layout.py` generates the loader constants from the actual kernel
-size. The image builder rejects invalid stage-one signatures, oversized stage
-two payloads, and kernels exceeding the current BIOS disk-read limit. It
+size. Stage two loads the kernel with multiple bounded BIOS EDD transfers so
+no transfer crosses a 64 KiB real-mode boundary; the image builder rejects
+kernels that exceed the reserved `0x10000..0x40000` load region. It
 preformats only the image's own FOSFS data partition; it does not touch host
 storage.
 
@@ -892,11 +1011,13 @@ automatically selects or writes a host block device.
 This milestone uses one CPU, no paging, heap allocation, userspace, or
 scheduler. It has FOSFS (a deliberately tiny file-per-sector filesystem, not a
 general-purpose one), interrupt-driven IRQ0/IRQ1 handling for the timer and
-keyboard, and one polling-mode network card driver (RTL8139, raw Ethernet
-frames only -- no ARP/IPv4/TCP stack, and no NIC interrupt handling; see
-"Ethernet (`nic`)"), but no other hardware IRQ drivers (no native disk or USB
-interrupt handling). The optional NIC-ROM boot path (see "Booting from a NIC
-ROM") does not implement the BIOS-disk trampoline, so disk/FOSFS access is
-unavailable when booted that way. The architecture keeps x86/driver code separate from
-console and shell policy so later work can add those facilities without
-changing the BIOS-to-kernel contract.
+keyboard, and three polling-mode PCI network card drivers (RTL8139,
+selected 3C905 variants, and Intel e1000, with raw frame access in the kernel and
+ARP/IPv4/ICMP/UDP/TCP/DHCP protocol code in `tapes/tape-net/`; no NIC
+interrupt handling), but no other hardware IRQ
+drivers (no native disk or USB interrupt handling). The optional NIC-ROM boot
+path (see "Booting from a NIC ROM") does not implement the BIOS-disk
+trampoline, so disk/FOSFS access is unavailable when booted that way. The
+architecture keeps x86/driver code separate from console, shell, and tape
+protocol policy so these layers can grow without changing the BIOS-to-kernel
+contract.

@@ -6,7 +6,7 @@
 //! permanently unavailable, and hands out/reclaims individual frames. There
 //! is no paging here yet -- this only tracks which physical frames are free.
 
-use crate::boot_info::{read_u32, read_u64, BootInfo, MemoryRegion};
+use crate::boot_info::{BootInfo, MemoryRegion, read_u32, read_u64};
 
 pub const FRAME_SIZE: u32 = 4096;
 
@@ -65,7 +65,7 @@ static mut NEXT_SEARCH: usize = 0;
 /// chunks instead of 4 KiB frames costs 256x less bitmap space for the
 /// same amount of RAM -- reaching a full 1 GiB machine costs a little
 /// over 100 bytes here, not the 32 KiB the fine bitmap would need, which
-/// would not fit in `boot/stage2.S`'s 127-sector kernel-load ceiling (see
+/// would have exceeded the old single-transfer kernel-load ceiling (see
 /// `TRACKED_BYTES`'s doc comment).
 pub const BIG_CHUNK_SIZE: u32 = 1024 * 1024;
 /// Starts exactly where the fine-grained pool's own tracked window ends,
@@ -126,7 +126,8 @@ fn set_free(index: usize, free: bool) {
 pub fn initialize(info: &BootInfo) {
     let count = usize::from(read_u16(core::ptr::addr_of!(info.memory_region_count)));
     for index in 0..count {
-        let region: MemoryRegion = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index])) };
+        let region: MemoryRegion =
+            unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index])) };
         if read_u32(core::ptr::addr_of!(region.kind)) != 1 {
             continue; // only "usable" (type 1) regions are ever free.
         }

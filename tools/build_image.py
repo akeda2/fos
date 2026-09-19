@@ -18,6 +18,8 @@ STAGE2_SECTORS = 32
 MIN_IMAGE_SECTORS = 8192
 DATA_START_LBA = 4096
 DATA_SECTORS = 4096
+KERNEL_LOAD_ADDRESS = 0x10000
+KERNEL_RESERVED_END = 0x40000
 # FOSFS reserves one superblock sector plus this many fixed directory
 # sectors (64 entries total, 32 bytes each) before file data begins.
 DIRECTORY_SECTORS = 4
@@ -79,8 +81,9 @@ def main() -> None:
     stage2 = pad(args.stage2.read_bytes(), STAGE2_SECTORS)
     kernel = args.kernel.read_bytes()
     kernel_sectors = (len(kernel) + SECTOR_SIZE - 1) // SECTOR_SIZE
-    if not 0 < kernel_sectors <= 127:
-        raise SystemExit("kernel must occupy between 1 and 127 sectors")
+    max_kernel_sectors = (KERNEL_RESERVED_END - KERNEL_LOAD_ADDRESS) // SECTOR_SIZE
+    if not 0 < kernel_sectors <= max_kernel_sectors:
+        raise SystemExit(f"kernel must occupy between 1 and {max_kernel_sectors} sectors")
 
     image = bytearray(MIN_IMAGE_SECTORS * SECTOR_SIZE)
     image[:SECTOR_SIZE] = stage1
@@ -110,4 +113,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

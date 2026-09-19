@@ -22,9 +22,10 @@ SIGNATURE_OFFSET = 0
 SIZE_BYTE_OFFSET = 2
 PCI_STRUCT_POINTER_OFFSET = 0x18
 PCIR_IMAGE_LENGTH_OFFSET = 0x10
-# A real option ROM chip is a fixed, discrete size (2 KiB, 4 KiB, ... up to
-# 64 KiB); this cap keeps the image within the largest size BIOS's 512-byte
-# block-count byte can even describe (255 * 512 bytes).
+# The ROM header's one-byte size field counts 512-byte blocks, so the largest
+# image this format can describe is 255 * 512 bytes. Real option ROM chips
+# are discrete sizes and are often smaller; a BIOS or card may reject a
+# larger image even though the format can describe it.
 MAX_ROM_BYTES = 255 * SECTOR_SIZE
 
 

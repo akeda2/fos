@@ -176,13 +176,22 @@ fn validate(info: &BootInfo) -> Result<(), disk::Error> {
         }
         true
     })
-    .and_then(|valid| if valid { Ok(()) } else { Err(disk::Error::FirmwareFailure) })
+    .and_then(|valid| {
+        if valid {
+            Ok(())
+        } else {
+            Err(disk::Error::FirmwareFailure)
+        }
+    })
 }
 
 fn find_entry(info: &BootInfo, name: &[u8]) -> Result<Option<FileEntry>, disk::Error> {
     let mut result = None;
     for_each_entry(info, |entry| {
-        if result.is_none() && entry.name_length == name.len() && entry.name[..entry.name_length] == name[..] {
+        if result.is_none()
+            && entry.name_length == name.len()
+            && entry.name[..entry.name_length] == name[..]
+        {
             result = Some(entry);
         }
     })?;
@@ -211,7 +220,10 @@ fn next_free_data_sector(info: &BootInfo) -> Result<u32, disk::Error> {
     Ok(next)
 }
 
-fn for_each_entry(info: &BootInfo, mut operation: impl FnMut(FileEntry)) -> Result<(), disk::Error> {
+fn for_each_entry(
+    info: &BootInfo,
+    mut operation: impl FnMut(FileEntry),
+) -> Result<(), disk::Error> {
     let base = disk::data_partition_lba(info);
     for sector_offset in 0..DIRECTORY_SECTORS {
         let lba = base + 1 + sector_offset;
@@ -248,9 +260,9 @@ fn read_sector_copy(info: &BootInfo, lba: u32) -> Result<[u8; SECTOR_SIZE], disk
 fn valid_name(name: &[u8]) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_LENGTH
-        && name.iter().all(|byte| {
-            matches!(*byte, b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-')
-        })
+        && name
+            .iter()
+            .all(|byte| matches!(*byte, b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
 }
 
 fn print_name(name: &[u8]) {

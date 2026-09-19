@@ -43,8 +43,9 @@ def main() -> None:
     args = parser.parse_args()
 
     kernel_sectors = sector_count(args.kernel)
-    if not 0 < kernel_sectors <= 127:
-        raise SystemExit("kernel must occupy between 1 and 127 sectors")
+    max_kernel_sectors = (KERNEL_RESERVED_END - KERNEL_LOAD_ADDRESS) // SECTOR_SIZE
+    if not 0 < kernel_sectors <= max_kernel_sectors:
+        raise SystemExit(f"kernel must occupy between 1 and {max_kernel_sectors} sectors")
     kernel_end = KERNEL_LOAD_ADDRESS + kernel_sectors * SECTOR_SIZE
     if kernel_end > KERNEL_RESERVED_END:
         raise SystemExit("kernel exceeds the reserved low-memory load region")
@@ -66,4 +67,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

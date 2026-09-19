@@ -16,11 +16,18 @@ that obscure hardware behavior.
 - `boot/stage2.S` gathers E820 memory information, enables and verifies A20
   (trying, in order, the BIOS itself, the 8042 keyboard controller, and only
   then the "fast A20 gate" port `0x92` -- see the "Real hardware notes"
-  section below for why), loads the kernel at physical `0x10000`, and enters
-  flat 32-bit protected mode.
+  section below for why), loads the kernel at physical `0x10000` using bounded
+  multi-transfer BIOS EDD reads that never cross a 64 KiB transfer boundary,
+  and enters flat 32-bit protected mode. The reserved
+  `0x10000..0x40000` region, not the old single-transfer 127-sector
+  convention, is the current kernel-size limit.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
   low-memory kernel region through `0x40000`; do not place loader, boot-info,
   or disk-trampoline data there.
+- `kernel/src/entry.S` reserves a 32 KiB kernel stack. Tapes run nested inside
+  shell calls on that stack, so fixed packet/state buffers must leave headroom
+  for the surrounding `term net` call chain; do not grow tape-local arrays
+  casually without checking the stack budget.
 - The packed version-2 `BootInfo` at physical `0x5000` is the loader/kernel ABI.
   Validate its magic, version, size, and count before using it. Use unaligned
   reads for packed multi-byte fields.
@@ -48,6 +55,13 @@ that obscure hardware behavior.
   ROM image as read-only at run time (a shadowed option ROM cannot be
   written back to) -- see "Low-memory map" below for the scratch RAM this
   forces it to use instead.
+- `tapes/tape-net/` is the shared no-heap protocol library for networking
+  tapes. It builds on the kernel's raw NIC callbacks and implements the
+  educational Ethernet/ARP/IPv4/ICMP/UDP/TCP layers described in
+  `NETWORKING.md`; it is not part of the kernel image.
+- `tapes/bridge/` is a raw layer-2 learning bridge tape. It uses the
+  per-interface tape callbacks, enables promiscuous mode on selected ports,
+  and forwards Ethernet frames without implementing IP routing.
 
 ## Low-memory map
 
@@ -109,7 +123,7 @@ tools are GNU Make, GNU `as`/`objcopy`, Python 3, and `qemu-system-i386`.
 ```sh
 make image    # Produces build/fos.img only. Plain `make` is equivalent.
 make run      # Boots it interactively in QEMU.
-make test     # Runs the serial-driven QEMU smoke test.
+make test     # Runs the serial-driven QEMU smoke test and VGA mode test.
 make all      # Builds everything: image, netrom, and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
 make help     # Lists every target with a one-line description.
@@ -141,8 +155,17 @@ back to source.
 
 ## Current command surface
 
-System commands: `help`, `clear`, `about`, `bootinfo`, `memmap`, `memory`,
-`cpuinfo`, `hexdump ADDRESS LENGTH`, `halt`, and `reset`.
+System commands: `help`, `clear`, `vga [d|80x25|80x50|132x25]`, `about`,
+`bootinfo`, `memmap`, `memory`, `cpuinfo`, `hexdump ADDRESS LENGTH`, `halt`,
+and `reset`.
+
+`vga` shows the current and available local modes, and changes the mode when
+an argument is supplied; it clears the framebuffer after a change. `d` and
+`80x25` select the default mode. `80x25` is
+the BIOS-compatible default, `80x50` uses the VGA 8x8-font mode, and `132x25`
+uses experimental extended horizontal timing that is not guaranteed on every
+VGA adapter or monitor. Serial and `term net` output are unchanged; existing
+tapes continue to print through the kernel console callback.
 
 Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
 `pfree ADDRESS`.
@@ -197,8 +220,9 @@ that multiplex several UARTs behind one BAR at internal offsets are not
 specially decoded. Native USB (and thus USB-to-serial adapters) remains out
 of scope; see "Deliberately deferred work" below.
 
-Ethernet commands: `nic` (status; probes and initializes the RTL8139 driver
-on first use), `nic send` (one raw broadcast test frame), `nic recv`
+Ethernet commands: `nic` (active status; initializes every supported backend
+on first use, currently RTL8139, 3C905, or Intel e1000), `nic list`,
+`nic use N`, `nic send` (one raw broadcast test frame), `nic recv`
 (polls briefly for one incoming frame and hex-dumps it), `nic sniff`
 (promiscuous-mode capture of every frame seen, until F12 stops it),
 `nic discover`/`nic peers` (broadcast/list a numbered address book of other
@@ -207,17 +231,19 @@ broadcast or unicast text chat; see below), `tape` (load and execute a
 raw binary from disk or over Ethernet; see below), and `term net` (a full
 remote shell over Ethernet; see below).
 
-`nic` is backed by `kernel/src/rtl8139.rs`, a polling-mode driver for the
-Realtek RTL8139 -- chosen as the one supported NIC because it is
-well-documented, common in real PCI-era hardware, and QEMU's default
-emulated card. Unlike serial cards (found by class code, since UARTs share
-one register model across vendors), the RTL8139 is found by exact
-vendor/device ID (`pci::find_device`, Realtek `0x10ec:0x8139`), since NIC
-register layouts are vendor-specific. `pci.rs` gained a second capability
-for this: `PciAddress::enable_io_and_bus_master`, setting the PCI command
-register's I/O-space and bus-master bits (the latter required for any
-device that performs DMA, unlike the UARTs, which only ever use plain port
-I/O).
+`nic` is backed by the common `kernel/src/nic.rs` facade, which initializes
+every polling backend instance that succeeds: `rtl8139.rs` for the
+QEMU-default Realtek RTL8139, `threecom.rs` for selected PCI 3C905/B/C
+variants, or `e1000.rs` for Intel's QEMU 82540EM model. The first
+initialized interface remains active by default; `nic list` and `nic use N`
+select the shell's active interface. Each card is found by exact vendor/device
+ID through `pci::find_devices` because NIC register layouts are
+vendor-specific. The 3C905 path uses the card's windowed command interface
+and bus-master descriptor lists; it is not emulated by the installed QEMU
+build and needs physical validation. The e1000 path uses a 32-bit memory BAR
+and legacy descriptor rings; QEMU coverage makes it the first Intel backend
+suitable for automated testing. PCI helpers enable the address-space type
+required by each backend and bus mastering.
 
 The driver polls status registers rather than using the card's interrupt
 line -- consistent with `interrupts.rs` leaving every IRQ but the timer and
@@ -228,8 +254,9 @@ low-memory region (`linker.ld`). Its receive ring must be one physically
 contiguous block, which single-frame-at-a-time `pmem::allocate` cannot
 guarantee, hence `pmem::allocate_contiguous` (this project's first caller to
 need more than one contiguous frame). There is no protocol above raw
-Ethernet frames (no ARP, no IPv4, no sockets) and no support for any NIC
-besides the RTL8139; both are explicit scope boundaries, not oversights.
+Ethernet frames (no ARP, no IPv4, no sockets) and no support for additional
+NIC families beyond the RTL8139, selected 3C905 PCI backends, and Intel
+e1000; 3C509 ISA and e1000e/82574 support are separate future drivers.
 
 `Rtl8139::set_promiscuous` is a read-modify-write toggle of `RCR`'s `AAP`
 ("accept all packets") bit, layered on top of the accept-filter bits `init`
@@ -1000,13 +1027,11 @@ instead: `objcopy -O binary` bakes a `.bss` array's *entire* size into
 the shipped flat binary as zero bytes (there's no "reserved but unbacked"
 concept once a `no_std` freestanding binary is flattened), so a 1 GiB
 bitmap (32 KiB, up from the original 4 KiB) directly inflated
-`kernel.bin` by ~28 KB -- enough to blow past `boot/stage2.S`'s hard
-127-sector (65,024-byte) kernel load ceiling (`tools/write_layout.py`
-rejects anything bigger with `"kernel must occupy between 1 and 127
-sectors"`). That ceiling exists because stage two loads the entire
-kernel with a *single* INT13h extended-read BIOS call into one real-mode
-64 KiB segment; 127 sectors is deliberately the largest count that stays
-just under that 65,536-byte boundary.
+`kernel.bin` by ~28 KB. Stage two now avoids the former single-transfer
+127-sector ceiling by splitting kernel loading into bounded INT 13h
+extended-read calls that respect each BIOS 64 KiB boundary. The remaining
+limit is the reserved `0x10000..0x40000` low-memory region, currently
+384 sectors, and `tools/write_layout.py` emits that limit.
 
 The fix: a second allocator, the "big pool" (`BIG_BITMAP`,
 `BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 1 GiB,
@@ -1194,6 +1219,85 @@ proves for a `should_abort`-based tape) all pass, and the same
 `term_net` session remains responsive to an ordinary command
 immediately afterward. Built with `make tape-calc` (producing
 `build/tapes/calc.bin`).
+
+### Tape ABI grows kernel-managed networking: `net-chat`
+
+The tape ABI now has three trailing callbacks after `args_ptr`/`args_len`:
+`nic_mac: extern "C" fn(u32) -> u32`, `nic_send: extern "C" fn(u32, u32)
+-> u32`, and `nic_receive: extern "C" fn(u32, u32) -> u32`. They preserve
+the same append-only cdecl rule as every earlier ABI extension: existing
+tapes ignore the trailing stack slots unchanged, while a networked tape must
+declare every earlier parameter to keep these three positions aligned.
+
+The kernel retains ownership of every initialized NIC, including PCI
+discovery, bus-master/DMA allocation, receive-ring accounting, and overflow
+recovery. The original callbacks operate on the active interface;
+`nic_mac` copies its six-byte address to a tape-owned buffer and returns one
+on success; `nic_send` sends a complete tape-owned Ethernet frame;
+`nic_receive` copies one complete frame into a tape-owned buffer and returns
+its length, or zero when no frame is waiting or the operation cannot proceed.
+A tape must call `nic_mac` first and report a zero return rather
+than mistaking it for an idle network.
+
+`tapes/net-chat/` is the reference consumer: it uses exactly the shell
+`chat` ethertype/tags, supports broadcast and unicast chat plus discovery,
+and combines the callbacks with `read_key` so local PS/2 and active
+`term net` input both work. Because raw reception and remote `term net`
+input share one NIC ring, the kernel preserves non-terminal frames for the
+tape and queues terminal frames back for `read_key`; neither side silently
+steals the other's traffic. `tapes/test_net_chat_e2e.py` proves the tape
+exchanges messages with a second fos instance running the ordinary shell
+`chat` command.
+
+The ABI now appends two more callbacks after those raw Ethernet operations:
+`nic_max_frame_len: extern "C" fn() -> u32` and
+`ticks: extern "C" fn() -> u64`. The first reports the kernel's actual
+maximum frame size so a tape library does not duplicate backend constants.
+The second exposes the kernel's monotonic PIT tick count for retransmission
+and connection deadlines; tapes must not reprogram the timer merely to obtain
+protocol time.
+
+Raw frames deferred while the `read_key`/networking callbacks share the
+selected NIC receive path now lives behind a four-frame FIFO rather than one slot. A
+frame is also retained when a tape polls with a too-small output buffer,
+allowing it to retry using `nic_max_frame_len()` instead of silently losing
+the packet. The kernel still does not parse ARP, IPv4, UDP, or TCP: those
+protocols belong in the fixed-buffer `tapes/tape-net/` library, documented in
+`NETWORKING.md`.
+
+DHCPv4 is also protocol-library code, not a kernel service. Its client starts
+with the required zero/broadcast IPv4 bootstrap addresses, uses the tape
+`ticks` callback for bounded retries and lease renewal/rebind deadlines, and
+returns explicit lease configuration to the application. A consuming tape
+should expose `tape run dhcp` and a structured fallback such as
+`tape run static IP NETMASK GATEWAY`; argument parsing and post-configuration
+policy belong to that tape, not to `tape-net`.
+
+The ABI now appends five multi-interface callbacks after `ticks`:
+`nic_count`, `nic_mac_at`, `nic_send_at`, `nic_receive_at`, and
+`nic_set_promiscuous_at`. Their indices are zero-based, unlike the shell's
+one-based `nic list`/`nic use N` commands. The final callback toggles
+receive-all filtering for one interface; it is required by
+`tapes/bridge/`, which must receive frames addressed to hosts behind a
+different port. A bridge tape should enable it only for its selected ports
+and restore normal filtering before returning.
+
+`tapes/ip-chat/` is the reference application for this split. It uses
+ARP/IPv4/UDP from `tape-net` to implement a fixed-buffer line chat, accepts
+`static LOCAL_IP NETMASK GATEWAY [PEER_IP]` or `dhcp [PEER_IP]` startup
+arguments, and keeps `/to`, `/broadcast`, `/peers`, and `/quit` policy in the
+tape. Its focused `tapes/test_ip_chat_e2e.py` test uses two static-IP QEMU
+guests; the multicast fixture has no DHCP server, so DHCP is covered by the
+library/application unit tests rather than that integration test.
+
+`tapes/telnet/` is the first TCP application on top of that boundary. It is a
+single-connection, static-IP Telnet client using `tape-net` for ARP and TCP.
+Its incremental parser negotiates the basic Telnet verbs, skips
+subnegotiation, doubles literal `IAC` bytes, and forwards UTF-8 as bytes
+without decoding it in the tape. Keep authentication, terminal-type/NAWS
+negotiation, DHCP, DNS, and multi-connection support out of this first
+example; the focused `tapes/test_telnet_e2e.py` test uses an unprivileged
+multicast QEMU fixture plus a small host-side protocol peer.
 
 ### Live output relaying for `read_key`/`should_abort`-based tapes over `term net`
 
@@ -1701,7 +1805,8 @@ section above.
 - Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
   native USB, further hardware IRQ drivers beyond the timer/keyboard, robust
   fault recovery, any protocol above raw Ethernet frames (no ARP, no IPv4,
-  no sockets), and support for any NIC besides the one RTL8139 driver.
+  no sockets), and support for NIC families beyond the current RTL8139,
+  selected 3C905, and Intel e1000 backends.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.

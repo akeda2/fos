@@ -7,8 +7,8 @@ use crate::fosfs;
 use crate::interrupts;
 use crate::keyboard;
 use crate::keyboard::Keyboard;
+use crate::nic;
 use crate::pmem;
-use crate::rtl8139;
 use crate::{print, println};
 
 const LINE_CAPACITY: usize = 80;
@@ -60,7 +60,11 @@ struct LineEditor {
 
 impl LineEditor {
     fn new() -> Self {
-        LineEditor { buffer: [0u8; LINE_CAPACITY], length: 0, saw_carriage_return: false }
+        LineEditor {
+            buffer: [0u8; LINE_CAPACITY],
+            length: 0,
+            saw_carriage_return: false,
+        }
     }
 
     /// Feeds one input byte through the same line-editing rules the
@@ -102,28 +106,93 @@ fn prompt() {
     print!("fos> ");
 }
 
+fn vga_command(arguments: &[u8]) {
+    let (mode_word, remainder) = take_word(arguments);
+    if mode_word.is_empty() {
+        let mode = console::current_vga_mode();
+        println!(
+            "VGA mode: {} ({} columns x {} rows).",
+            mode.name(),
+            mode.width(),
+            mode.height()
+        );
+        println!("Available modes: 80x25 (default), 80x50, 132x25 (experimental).");
+        println!("Use 'vga d' to return to the default 80x25 mode.");
+        return;
+    }
+    if !remainder.is_empty() {
+        println!("Usage: vga [d|80x25|80x50|132x25]");
+        return;
+    }
+
+    let mode = match mode_word {
+        b"d" | b"80x25" => console::VgaMode::Text80x25,
+        b"80x50" => console::VgaMode::Text80x50,
+        b"132x25" => console::VgaMode::Experimental132x25,
+        _ => {
+            println!("Usage: vga [d|80x25|80x50|132x25]");
+            return;
+        }
+    };
+    console::set_vga_mode(mode);
+    println!(
+        "VGA mode changed to {} ({} columns x {} rows).",
+        mode.name(),
+        mode.width(),
+        mode.height()
+    );
+    if mode == console::VgaMode::Experimental132x25 {
+        println!(
+            "Warning: 132-column timing is experimental and may not work on every VGA adapter or monitor."
+        );
+    }
+}
+
 fn execute(command: &[u8], info: &BootInfo) {
     let (name, arguments) = take_word(command);
     match name {
         b"" => {}
         b"help" => {
             if no_arguments(arguments) {
-                println!("System: help clear about bootinfo memmap memory cpuinfo hexdump halt reset");
+                println!(
+                    "System: help clear vga about bootinfo memmap memory cpuinfo hexdump halt reset"
+                );
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Disk: diskinfo readsector format ls cat write rm");
-                println!("Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 (or F4/F6/F7/F8/F10) to exit)");
-                println!("Ethernet: nic (status), nic send (broadcast test frame), nic recv (poll for one frame),");
-        println!("          nic sniff (promiscuous capture; F12 (or F4/F6/F7/F8/F10) to stop)");
-        println!("          nic discover (probe for other listening fos machines), nic peers (list them)");
-        println!("          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 (or F4/F6/F7/F8/F10) or /quit to leave)");
-        println!("Tape: tape status (what's loaded), tape run [ARGS...] (execute it, optionally passing arguments)");
-        println!("      tape load disk NAME (load a FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)");
-        println!("      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')");
-        println!("Remote: term net (wait for a remote terminal client over Ethernet, same as the automatic wait at every boot; F12 (or F4/F6/F7/F8/F10) to give up)");
+                println!(
+                    "Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 (or F4/F6/F7/F8/F10) to exit)"
+                );
+                println!(
+                    "Ethernet: nic (active status), nic list, nic use N, nic send (broadcast test frame),"
+                );
+                println!(
+                    "          nic sniff (promiscuous capture; F12 (or F4/F6/F7/F8/F10) to stop)"
+                );
+                println!(
+                    "          nic discover (probe for other listening fos machines), nic peers (list them)"
+                );
+                println!(
+                    "          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 (or F4/F6/F7/F8/F10) or /quit to leave)"
+                );
+                println!(
+                    "Tape: tape status (what's loaded), tape run [ARGS...] (execute it, optionally passing arguments)"
+                );
+                println!(
+                    "      tape load disk NAME (load a FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
+                );
+                println!(
+                    "      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')"
+                );
+                println!(
+                    "Remote: term net (wait for a remote terminal client over Ethernet, same as the automatic wait at every boot; F12 (or F4/F6/F7/F8/F10) to give up)"
+                );
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
-        b"about" if no_arguments(arguments) => println!("fos is a small educational 32-bit x86 operating system."),
+        b"vga" => vga_command(arguments),
+        b"about" if no_arguments(arguments) => {
+            println!("fos is a small educational 32-bit x86 operating system.")
+        }
         b"bootinfo" if no_arguments(arguments) => print_boot_info(info),
         b"memmap" if no_arguments(arguments) => print_memory_map(info),
         b"memory" if no_arguments(arguments) => print_memory_summary(info),
@@ -137,7 +206,9 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"pfree" => pfree_command(arguments),
         b"readsector" => read_sector_command(info, arguments),
         b"hexdump" => hexdump_command(info, arguments),
-        b"format" if no_arguments(arguments) => filesystem_result(fosfs::format(info), "FOSFS formatted."),
+        b"format" if no_arguments(arguments) => {
+            filesystem_result(fosfs::format(info), "FOSFS formatted.")
+        }
         b"ls" if no_arguments(arguments) => filesystem_result(fosfs::list(info), ""),
         b"cat" => cat_command(info, arguments),
         b"write" => write_command(info, arguments),
@@ -161,8 +232,9 @@ fn execute(command: &[u8], info: &BootInfo) {
             println!("Resetting the machine now (8042 keyboard-controller pulse reset)...");
             reset();
         }
-        b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"diskinfo" | b"format" | b"ls"
-        | b"ticks" | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" => {
+        b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"diskinfo"
+        | b"format" | b"ls" | b"ticks" | b"uptime" | b"irqstat" | b"pmem" | b"palloc"
+        | b"serial" => {
             println!("This command does not accept arguments.");
         }
 
@@ -171,7 +243,11 @@ fn execute(command: &[u8], info: &BootInfo) {
 }
 
 fn print_ticks() {
-    println!("Timer ticks: {} (at {} Hz)", interrupts::ticks(), interrupts::tick_frequency_hz());
+    println!(
+        "Timer ticks: {} (at {} Hz)",
+        interrupts::ticks(),
+        interrupts::tick_frequency_hz()
+    );
 }
 
 fn print_uptime() {
@@ -248,7 +324,9 @@ fn print_serial_ports() {
             Some(base) if index == 0 => {
                 println!("{name}: 0x{base:04x} (local shell console, fixed at 115200 8N1)");
             }
-            Some(base) => println!("{name}: 0x{base:04x} (free for 'term'; baud chosen when entering it)"),
+            Some(base) => {
+                println!("{name}: 0x{base:04x} (free for 'term'; baud chosen when entering it)")
+            }
             None => println!("{name}: not detected"),
         }
     }
@@ -259,7 +337,9 @@ fn print_serial_ports() {
         for index in 0..pci_count {
             let name = core::str::from_utf8(PCI_PORT_NAMES[index]).unwrap_or("?");
             let base = pci_ports[index];
-            println!("{name}: 0x{base:04x} (found via PCI enumeration; free for 'term'; baud chosen when entering it)");
+            println!(
+                "{name}: 0x{base:04x} (found via PCI enumeration; free for 'term'; baud chosen when entering it)"
+            );
         }
     }
 }
@@ -336,7 +416,9 @@ fn term_command(info: &BootInfo, arguments: &[u8]) {
         }
         println!("Entering raw terminal mode on COM1 at 115200 baud: your keystrokes are sent");
         println!("byte-for-byte, with no local echo or line editing -- the far end echoes them");
-        println!("back. Press F12 (or F4/F6/F7/F8/F10) to return to the fos shell. If you are controlling fos over");
+        println!(
+            "back. Press F12 (or F4/F6/F7/F8/F10) to return to the fos shell. If you are controlling fos over"
+        );
         println!("this same serial link, note that link is about to become the remote");
         println!("connection instead: use the VGA console to get back in that case.");
         term_loop(console::write_serial_byte, console::read_serial_byte);
@@ -344,7 +426,10 @@ fn term_command(info: &BootInfo, arguments: &[u8]) {
         return;
     }
 
-    if let Some(index) = SERIAL_PORT_NAMES.iter().position(|name| name.eq_ignore_ascii_case(port_word)) {
+    if let Some(index) = SERIAL_PORT_NAMES
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(port_word))
+    {
         let ports = console::detect_ports();
         let Some(base) = ports[index] else {
             let name = core::str::from_utf8(SERIAL_PORT_NAMES[index]).unwrap_or("?");
@@ -355,7 +440,10 @@ fn term_command(info: &BootInfo, arguments: &[u8]) {
         return;
     }
 
-    if let Some(index) = PCI_PORT_NAMES.iter().position(|name| name.eq_ignore_ascii_case(port_word)) {
+    if let Some(index) = PCI_PORT_NAMES
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(port_word))
+    {
         let (pci_ports, pci_count) = console::detect_pci_ports();
         if index >= pci_count {
             let name = core::str::from_utf8(PCI_PORT_NAMES[index]).unwrap_or("?");
@@ -463,9 +551,11 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
 fn term_net(info: &BootInfo) {
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
-    println!("Waiting for a remote terminal client to connect; press F12 (or F4/F6/F7/F8/F10) to give up.");
+    println!(
+        "Waiting for a remote terminal client to connect; press F12 (or F4/F6/F7/F8/F10) to give up."
+    );
 
-    let mut recv_buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut recv_buffer = [0u8; nic::MAX_FRAME_LEN];
     loop {
         let peer = loop {
             if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
@@ -490,7 +580,10 @@ fn term_net(info: &BootInfo) {
             }
         };
 
-        println!("Remote terminal connected from {}. Local input is disabled; F12 (or F4/F6/F7/F8/F10) disconnects it.", Mac(&peer));
+        println!(
+            "Remote terminal connected from {}. Local input is disabled; F12 (or F4/F6/F7/F8/F10) disconnects it.",
+            Mac(&peer)
+        );
         console::enable_relay();
         // Lets `poll_remote_tape_abort` recognize this peer's own frames
         // while a nested blocking command (like `tape_run`) has this
@@ -551,7 +644,10 @@ fn term_net(info: &BootInfo) {
                     TERM_TAG_BYE => break 'session,
                     TERM_TAG_DATA => {
                         let payload = &frame[15..];
-                        let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
+                        let end = payload
+                            .iter()
+                            .rposition(|&byte| byte != 0)
+                            .map_or(0, |index| index + 1);
                         for &byte in &payload[..end] {
                             editor.feed(byte, info);
                         }
@@ -623,7 +719,7 @@ const REMOTE_ABORT_BYTE: u8 = 0x1b;
 /// Calling this from both polling helpers below means any `read_key`- or
 /// `should_abort`-based tape gets live output relaying for free, with no
 /// ABI change and no per-tape opt-in required.
-fn relay_pending_tape_output(nic: &rtl8139::Rtl8139, peer: &[u8; 6], source: &[u8; 6]) {
+fn relay_pending_tape_output(nic: &nic::Nic, peer: &[u8; 6], source: &[u8; 6]) {
     let mut chunk = [0u8; TERM_DATA_CAPACITY];
     let drained = console::drain_relay(&mut chunk);
     if drained > 0 {
@@ -658,13 +754,16 @@ fn poll_remote_tape_abort() -> bool {
     if !console::relay_enabled() {
         return false;
     }
-    let (Some(peer), Some(source)) = (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE }) else {
+    let (Some(peer), Some(source)) = (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE })
+    else {
         return false;
     };
-    let Ok(nic) = rtl8139::get() else { return false };
+    let Ok(nic) = nic::get() else { return false };
     relay_pending_tape_output(nic, &peer, &source);
-    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
-    let Some(received) = nic.receive(&mut buffer) else { return false };
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
+    let Some(received) = nic.receive(&mut buffer) else {
+        return false;
+    };
     let frame = &buffer[..received];
     if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
         return false;
@@ -688,12 +787,11 @@ fn poll_remote_tape_abort() -> bool {
     }
 }
 
-
 /// Sends `data` as one `TERM_TAG_DATA` frame to `destination`, silently
 /// dropping it on a card error the same way `send_chat_line` does -- a lost
 /// screen update is recoverable (the next drain/print will eventually
 /// catch the console up), so nothing here retries or blocks.
-fn send_term_data(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], data: &[u8]) {
+fn send_term_data(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8]) {
     let mut frame = [0u8; 15 + TERM_DATA_CAPACITY];
     frame[0..6].copy_from_slice(destination);
     frame[6..12].copy_from_slice(source);
@@ -705,7 +803,7 @@ fn send_term_data(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6
 
 /// Sends a zero-length `CHAT_ETHERTYPE` control frame with a `TERM_TAG_*`
 /// tag (`HELLO` or `BYE`), mirroring `send_chat_control`.
-fn send_term_control(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], tag: u8) {
+fn send_term_control(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], tag: u8) {
     let mut frame = [0u8; 15];
     frame[0..6].copy_from_slice(destination);
     frame[6..12].copy_from_slice(source);
@@ -714,7 +812,6 @@ fn send_term_control(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8
     nic.send(&frame);
 }
 
-
 /// reserved by IEEE 802 for exactly this purpose: local, non-routable
 /// protocol experiments that will never collide with a real assigned
 /// ethertype), used to mark `nic send`'s frames as fos's own test traffic
@@ -722,44 +819,106 @@ fn send_term_control(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8
 const TEST_ETHERTYPE: [u8; 2] = [0x88, 0xb5];
 const TEST_PAYLOAD: &[u8] = b"fos raw ethernet test frame";
 
-/// `nic` (no arguments) reports whether an RTL8139 was found and brought
-/// up, along with its MAC address; `nic send` transmits one broadcast
-/// test frame (see `TEST_ETHERTYPE`); `nic recv` polls briefly for one
-/// incoming frame and hex-dumps it if one arrives; `nic sniff` runs a
-/// continuous promiscuous-mode capture, printing every frame seen until
-/// F12 (or F4/F6/F7/F8/F10) stops it; `nic discover` broadcasts a `chat` discovery probe and
-/// lists whoever answers; `nic peers` shows the peer list discovered so
-/// far without sending anything. There is no protocol above raw Ethernet
-/// here (no ARP, no IPv4) -- this only exercises the card itself.
+/// `nic` (no arguments) reports the active interface; `nic list` shows every
+/// initialized interface; and `nic use N` selects one by its 1-based list
+/// number. `nic send` transmits one broadcast test frame (see
+/// `TEST_ETHERTYPE`); `nic recv` polls briefly for one incoming frame and
+/// hex-dumps it if one arrives; `nic sniff` runs a continuous
+/// promiscuous-mode capture, printing every frame seen until F12 (or
+/// F4/F6/F7/F8/F10) stops it; `nic discover` broadcasts a `chat` discovery
+/// probe and lists whoever answers; `nic peers` shows the peer list
+/// discovered so far without sending anything. These shell subcommands
+/// intentionally stay at the raw-Ethernet layer; ARP/IPv4/UDP/TCP/DHCP live
+/// in networking tapes and the shared `tapes/tape-net` library instead.
 fn nic_command(arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
-    if !remainder.is_empty() {
-        println!("Usage: nic [send|recv|sniff|discover|peers]");
-        return;
-    }
     match subcommand {
-        b"" => nic_status(),
-        b"send" => nic_send(),
-        b"recv" => nic_recv(),
-        b"sniff" => nic_sniff(),
-        b"discover" => nic_discover(),
-        b"peers" => print_peers(),
-        _ => println!("Usage: nic [send|recv|sniff|discover|peers]"),
+        b"" if remainder.is_empty() => nic_status(),
+        b"list" if remainder.is_empty() => nic_list(),
+        b"use" => nic_use(remainder),
+        b"send" if remainder.is_empty() => nic_send(),
+        b"recv" if remainder.is_empty() => nic_recv(),
+        b"sniff" if remainder.is_empty() => nic_sniff(),
+        b"discover" if remainder.is_empty() => nic_discover(),
+        b"peers" if remainder.is_empty() => print_peers(),
+        _ => println!("Usage: nic [list|use N|send|recv|sniff|discover|peers]"),
     }
 }
 
 fn nic_status() {
-    match rtl8139::get() {
+    match nic::get() {
         Ok(nic) => {
             let mac = nic.mac_address();
             println!(
-                "RTL8139 found: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                "{} found: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                nic.driver_name(),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
             );
+            let count = nic::count();
+            if count > 1 {
+                println!(
+                    "Active interface: {} of {}. Use 'nic list' or 'nic use N' to select another.",
+                    nic::active_index() + 1,
+                    count
+                );
+            }
         }
-        Err(rtl8139::Status::NotPresent) => println!("No RTL8139 Ethernet controller found on the PCI bus."),
-        Err(rtl8139::Status::InitFailed(error)) => println!("RTL8139 found but could not be initialized: {error:?}"),
+        Err(nic::Status::NotPresent) => {
+            println!("No supported Ethernet controller found on the PCI bus.")
+        }
+        Err(nic::Status::InitFailed(error)) => println!(
+            "A supported Ethernet controller was found but could not be initialized: {error}"
+        ),
     }
+}
+
+fn nic_list() {
+    let count = nic::count();
+    if count == 0 {
+        nic_status();
+        return;
+    }
+    for index in 0..count {
+        let Some(nic) = nic::get_at(index) else {
+            continue;
+        };
+        let mac = nic.mac_address();
+        println!(
+            "{}NIC {}: {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            if index == nic::active_index() { '*' } else { ' ' },
+            index + 1,
+            nic.driver_name(),
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
+        );
+    }
+}
+
+fn nic_use(arguments: &[u8]) {
+    let (value, remainder) = take_word(arguments);
+    let Some(index) = parse_number(value) else {
+        println!("Usage: nic use N (see 'nic list'; numbering starts at 1)");
+        return;
+    };
+    if !remainder.is_empty() || index == 0 || !nic::set_active(index as usize - 1) {
+        println!("No such NIC. Use 'nic list' to see available interfaces.");
+        return;
+    }
+    let nic = nic::get().unwrap();
+    println!(
+        "Active interface is now {} {}.",
+        nic::active_index() + 1,
+        nic.driver_name()
+    );
 }
 
 fn nic_send() {
@@ -772,7 +931,12 @@ fn nic_send() {
     frame[14..].copy_from_slice(TEST_PAYLOAD);
 
     if nic.send(&frame) {
-        println!("Sent a {}-byte broadcast test frame (ethertype 0x{:02x}{:02x}).", frame.len(), TEST_ETHERTYPE[0], TEST_ETHERTYPE[1]);
+        println!(
+            "Sent a {}-byte broadcast test frame (ethertype 0x{:02x}{:02x}).",
+            frame.len(),
+            TEST_ETHERTYPE[0],
+            TEST_ETHERTYPE[1]
+        );
     } else {
         println!("Transmit failed (card reported an error, or timed out).");
     }
@@ -781,15 +945,17 @@ fn nic_send() {
 /// Shared by every `nic` subcommand that needs the card itself (`send`,
 /// `recv`, `sniff`): reports either failure case the same way `nic`
 /// (status) does, and returns `None` so callers can just early-return.
-fn nic_or_report() -> Option<&'static rtl8139::Rtl8139> {
-    match rtl8139::get() {
+fn nic_or_report() -> Option<&'static nic::Nic> {
+    match nic::get() {
         Ok(nic) => Some(nic),
-        Err(rtl8139::Status::NotPresent) => {
-            println!("No RTL8139 Ethernet controller found on the PCI bus.");
+        Err(nic::Status::NotPresent) => {
+            println!("No supported Ethernet controller found on the PCI bus.");
             None
         }
-        Err(rtl8139::Status::InitFailed(error)) => {
-            println!("RTL8139 found but could not be initialized: {error:?}");
+        Err(nic::Status::InitFailed(error)) => {
+            println!(
+                "A supported Ethernet controller was found but could not be initialized: {error}"
+            );
             None
         }
     }
@@ -797,7 +963,7 @@ fn nic_or_report() -> Option<&'static rtl8139::Rtl8139> {
 
 fn nic_recv() {
     let Some(nic) = nic_or_report() else { return };
-    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let mut attempts = 20_000_000u32;
     loop {
         if let Some(length) = nic.receive(&mut buffer) {
@@ -805,9 +971,20 @@ fn nic_recv() {
             if length >= 14 {
                 println!(
                     "Received {length} bytes: dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype 0x{:02x}{:02x}",
-                    frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
-                    frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
-                    frame[12], frame[13]
+                    frame[0],
+                    frame[1],
+                    frame[2],
+                    frame[3],
+                    frame[4],
+                    frame[5],
+                    frame[6],
+                    frame[7],
+                    frame[8],
+                    frame[9],
+                    frame[10],
+                    frame[11],
+                    frame[12],
+                    frame[13]
                 );
             } else {
                 println!("Received {length} bytes (too short to hold an Ethernet header).");
@@ -838,10 +1015,13 @@ fn nic_sniff() {
     println!("Press F12 (or F4/F6/F7/F8/F10) to stop capturing and return to the fos shell.");
     nic.set_promiscuous(true);
 
-    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let mut captured = 0u32;
     loop {
-        if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+        if matches!(
+            keyboard::poll_term_event(),
+            Some(keyboard::KeyEvent::Escape)
+        ) {
             break;
         }
         if let Some(length) = nic.receive(&mut buffer) {
@@ -850,9 +1030,20 @@ fn nic_sniff() {
             if length >= 14 {
                 println!(
                     "#{captured} {length} bytes: dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype 0x{:02x}{:02x}",
-                    frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
-                    frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
-                    frame[12], frame[13]
+                    frame[0],
+                    frame[1],
+                    frame[2],
+                    frame[3],
+                    frame[4],
+                    frame[5],
+                    frame[6],
+                    frame[7],
+                    frame[8],
+                    frame[9],
+                    frame[10],
+                    frame[11],
+                    frame[12],
+                    frame[13]
                 );
             } else {
                 println!("#{captured} {length} bytes (too short to hold an Ethernet header).");
@@ -894,7 +1085,7 @@ const TAPE_TAG_DATA: u8 = 0x11;
 const TAPE_TAG_STOP: u8 = 0x12;
 
 /// Data bytes carried in one `TAPE_TAG_DATA` frame: comfortably under
-/// `rtl8139::MAX_FRAME_LEN` once the Ethernet header (14 bytes), tag
+/// `nic::MAX_FRAME_LEN` once the Ethernet header (14 bytes), tag
 /// (1 byte), and sequence number (4 bytes) are accounted for, and a round
 /// enough number to reason about by hand.
 const TAPE_CHUNK_LEN: usize = 1024;
@@ -917,7 +1108,7 @@ const TERM_TAG_BYE: u8 = 0x22;
 
 /// Data bytes carried in one `TERM_TAG_DATA` frame in either direction:
 /// generous for a burst of shell output (a whole `println!` line or two)
-/// while staying comfortably under `rtl8139::MAX_FRAME_LEN` once the
+/// while staying comfortably under `nic::MAX_FRAME_LEN` once the
 /// Ethernet header (14 bytes) and tag (1 byte) are accounted for.
 const TERM_DATA_CAPACITY: usize = 512;
 
@@ -998,21 +1189,28 @@ const DISCOVER_REBROADCAST_TICKS: u64 = 300;
 fn nic_discover() {
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
-    println!("Broadcasting a discovery probe every few seconds; press F12 (or F4/F6/F7/F8/F10) to stop and see the list.");
+    println!(
+        "Broadcasting a discovery probe every few seconds; press F12 (or F4/F6/F7/F8/F10) to stop and see the list."
+    );
     send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
     let mut next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
 
-    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let mut discovered = 0u32;
     loop {
-        if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+        if matches!(
+            keyboard::poll_term_event(),
+            Some(keyboard::KeyEvent::Escape)
+        ) {
             break;
         }
         if interrupts::ticks() >= next_broadcast {
             send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
             next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
         }
-        let Some(length) = nic.receive(&mut buffer) else { continue };
+        let Some(length) = nic.receive(&mut buffer) else {
+            continue;
+        };
         let frame = &buffer[..length];
         if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
             continue;
@@ -1085,7 +1283,9 @@ fn chat_command(arguments: &[u8]) {
         match peer_by_index(index as usize) {
             Some(mac) => Some(mac),
             None => {
-                println!("No peer #{index} known; run 'nic discover' first, or give a full MAC address.");
+                println!(
+                    "No peer #{index} known; run 'nic discover' first, or give a full MAC address."
+                );
                 return;
             }
         }
@@ -1102,14 +1302,19 @@ fn chat_command(arguments: &[u8]) {
     let source = nic.mac_address();
 
     match peer {
-        Some(mac) => println!("Chatting with {} only. F12 (or F4/F6/F7/F8/F10) or '/quit' to leave.", Mac(&mac)),
-        None => println!("Broadcasting to everyone listening. F12 (or F4/F6/F7/F8/F10) or '/quit' to leave."),
+        Some(mac) => println!(
+            "Chatting with {} only. F12 (or F4/F6/F7/F8/F10) or '/quit' to leave.",
+            Mac(&mac)
+        ),
+        None => println!(
+            "Broadcasting to everyone listening. F12 (or F4/F6/F7/F8/F10) or '/quit' to leave."
+        ),
     }
 
     let mut line = [0u8; CHAT_TEXT_CAPACITY];
     let mut length = 0usize;
     let mut saw_carriage_return = false;
-    let mut recv_buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut recv_buffer = [0u8; nic::MAX_FRAME_LEN];
 
     'chat: loop {
         // Serial bytes take the same path a plain keyboard character
@@ -1122,7 +1327,9 @@ fn chat_command(arguments: &[u8]) {
         };
         match event {
             Some(keyboard::KeyEvent::Escape) => break 'chat,
-            Some(keyboard::KeyEvent::Char(b'\n')) if saw_carriage_return => saw_carriage_return = false,
+            Some(keyboard::KeyEvent::Char(b'\n')) if saw_carriage_return => {
+                saw_carriage_return = false
+            }
             Some(keyboard::KeyEvent::Char(byte @ (b'\r' | b'\n'))) => {
                 saw_carriage_return = byte == b'\r';
                 println!();
@@ -1160,7 +1367,7 @@ fn chat_command(arguments: &[u8]) {
     println!("Left chat; back at the fos shell.");
 }
 
-fn send_chat_line(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], text: &[u8]) {
+fn send_chat_line(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], text: &[u8]) {
     let mut frame = [0u8; 15 + CHAT_TEXT_CAPACITY];
     frame[0..6].copy_from_slice(destination);
     frame[6..12].copy_from_slice(source);
@@ -1176,7 +1383,7 @@ fn send_chat_line(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6
 /// or reply): just the Ethernet header plus the one-byte tag, since neither
 /// message needs a body -- the requester learns a peer's address from the
 /// reply's own source MAC, not from anything inside it.
-fn send_chat_control(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], tag: u8) {
+fn send_chat_control(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], tag: u8) {
     let mut frame = [0u8; 15];
     frame[0..6].copy_from_slice(destination);
     frame[6..12].copy_from_slice(source);
@@ -1195,7 +1402,12 @@ fn send_chat_control(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8
 /// other listener) and remembered as a peer, exactly as if `nic discover`
 /// itself had seen it; anything else (including a stray discovery reply
 /// while just chatting) is ignored.
-fn handle_incoming_chat_frame(nic: &rtl8139::Rtl8139, frame: &[u8], own_mac: &[u8; 6], peer: Option<&[u8; 6]>) {
+fn handle_incoming_chat_frame(
+    nic: &nic::Nic,
+    frame: &[u8],
+    own_mac: &[u8; 6],
+    peer: Option<&[u8; 6]>,
+) {
     if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
         return;
     }
@@ -1208,8 +1420,12 @@ fn handle_incoming_chat_frame(nic: &rtl8139::Rtl8139, frame: &[u8], own_mac: &[u
                 }
             }
             let payload = &frame[15..];
-            let text_end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
-            let text = core::str::from_utf8(&payload[..text_end]).unwrap_or("<non-UTF-8 chat data>");
+            let text_end = payload
+                .iter()
+                .rposition(|&byte| byte != 0)
+                .map_or(0, |index| index + 1);
+            let text =
+                core::str::from_utf8(&payload[..text_end]).unwrap_or("<non-UTF-8 chat data>");
             println!("\n{}: {text}", Mac(&source));
         }
         CHAT_TAG_DISCOVER_REQUEST => {
@@ -1243,7 +1459,6 @@ fn tape_set(value: Option<(u32, u32)>) {
     unsafe { *(&raw mut TAPE) = value };
 }
 
-
 /// `tape [status|run [ARGS...]|load ...|send ...]`. `status`/no arguments
 /// report what (if anything) is loaded; `run` executes it, optionally
 /// passing everything after `run` to the tape verbatim as its own
@@ -1258,13 +1473,17 @@ fn tape_command(info: &BootInfo, arguments: &[u8]) {
         b"run" => tape_run(remainder),
         b"load" => tape_load_command(info, remainder),
         b"send" => tape_send_command(info, remainder),
-        _ => println!("Usage: tape [status|run [ARGS...]|load disk NAME|load net|send NAME PEER_MAC|PEER_NUMBER]"),
+        _ => println!(
+            "Usage: tape [status|run [ARGS...]|load disk NAME|load net|send NAME PEER_MAC|PEER_NUMBER]"
+        ),
     }
 }
 
 fn tape_status() {
     match tape_get() {
-        Some((address, length)) => println!("Tape loaded: {length} byte(s) at 0x{address:05x}. 'tape run' to execute it."),
+        Some((address, length)) => {
+            println!("Tape loaded: {length} byte(s) at 0x{address:05x}. 'tape run' to execute it.")
+        }
         None => println!("No tape loaded. 'tape load disk NAME' or 'tape load net' to load one."),
     }
 }
@@ -1279,7 +1498,11 @@ fn tape_status() {
 /// net`, since either source ends up needing the exact same buffer.
 fn allocate_tape_buffer(length: u32) -> Option<u32> {
     if length > pmem::TAPE_LEN {
-        println!("Tape too large: {length} byte(s) exceeds the {}-byte fixed tape region at 0x{:05x}.", pmem::TAPE_LEN, pmem::TAPE_BASE);
+        println!(
+            "Tape too large: {length} byte(s) exceeds the {}-byte fixed tape region at 0x{:05x}.",
+            pmem::TAPE_LEN,
+            pmem::TAPE_BASE
+        );
         return None;
     }
     Some(pmem::TAPE_BASE)
@@ -1299,7 +1522,14 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 /// Called as `extern "C" fn(putc: extern "C" fn(u32), should_abort: extern
 /// "C" fn() -> u32, alloc: extern "C" fn(u32) -> u32, free: extern "C"
 /// fn(u32, u32), read_key: extern "C" fn() -> u32, args_ptr: u32, args_len:
-/// u32)` (cdecl, seven arguments), in that fixed order -- a tape is free
+/// u32, nic_mac: extern "C" fn(u32) -> u32, nic_send: extern "C" fn(u32,
+/// u32) -> u32, nic_receive: extern "C" fn(u32, u32) -> u32,
+/// nic_max_frame_len: extern "C" fn() -> u32, ticks: extern "C" fn() -> u64,
+/// nic_count: extern "C" fn() -> u32, nic_mac_at: extern "C" fn(u32, u32)
+/// -> u32, nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
+/// nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
+/// nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32)` (cdecl,
+/// seventeen arguments), in that fixed order -- a tape is free
 /// to declare only a leading prefix of these parameters (as
 /// `primes.S`/`hello-rs` declare only `putc`, and `vga-colors` declares
 /// only `putc`/`should_abort`) and ignore the rest; under cdecl this
@@ -1359,6 +1589,31 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
 ///   ignoring these two (every existing tape in this repository does)
 ///   simply never reads them, exactly like any other trailing argument
 ///   under cdecl.
+/// - `tape_nic_mac`/`tape_nic_send`/`tape_nic_receive` are the first three
+///   callbacks. They expose the active kernel-owned NIC as raw Ethernet
+///   frames, so a tape can experiment with network protocols without
+///   duplicating PCI discovery, DMA allocation, ring management, or
+///   overflow recovery. `nic_mac` copies this machine's six-byte MAC to
+///   its caller-provided buffer; `nic_send` transmits a caller-provided
+///   complete frame; `nic_receive` copies one complete received frame to
+///   its caller-provided buffer and returns its length, or zero when no
+///   frame is waiting. Each returns zero on failure. A tape should call
+///   `nic_mac` once at startup and report its failure explicitly before
+///   entering a receive loop; the callbacks then reuse the same active
+///   interface as the shell's `nic` and `chat` commands.
+/// - `tape_nic_max_frame_len` and `tape_ticks` are the next two callbacks.
+///   The first reports the largest frame `nic_receive` can return. The
+///   second returns the monotonic PIT tick count used for protocol deadlines.
+///   They are deliberately separate from packet operations so a shared
+///   library can remain deterministic and testable with fake callbacks.
+/// - `tape_nic_count`, `tape_nic_mac_at`, `tape_nic_send_at`, and
+///   `tape_nic_receive_at` are appended after `ticks`. They let a newer tape
+///   enumerate interfaces and keep independent raw-frame state per index.
+/// - `tape_nic_set_promiscuous_at` is the final callback. It enables or
+///   disables receive-all mode on one selected interface, returning zero if
+///   that index is invalid. A layer-2 bridge needs this because frames
+///   addressed to another host are not normally delivered to a NIC's
+///   receive ring.
 ///
 /// (A tape is still ring-0 code and technically free to ignore any of
 /// these callbacks and touch hardware -- or `pmem` -- directly anyway --
@@ -1382,6 +1637,23 @@ static mut TAPE_INPUT_QUEUE: [u8; TAPE_INPUT_QUEUE_LEN] = [0; TAPE_INPUT_QUEUE_L
 static mut TAPE_INPUT_HEAD: usize = 0;
 static mut TAPE_INPUT_TAIL: usize = 0;
 
+/// A `read_key` call and a tape's raw `nic_receive` call both ultimately
+/// poll the same RTL8139 ring. When `read_key` happens to collect a chat
+/// frame before the tape asks for it, retain it here instead of silently
+/// discarding it. A four-frame FIFO handles short bursts and lets a protocol
+/// stack drain packets in order without requiring the kernel to parse IP or
+/// TCP itself.
+const TAPE_NETWORK_QUEUE_LEN: usize = 4;
+static mut TAPE_NETWORK_FRAMES: [[u8; nic::MAX_FRAME_LEN]; TAPE_NETWORK_QUEUE_LEN] =
+    [[0; nic::MAX_FRAME_LEN]; TAPE_NETWORK_QUEUE_LEN];
+static mut TAPE_NETWORK_FRAME_LENS: [usize; TAPE_NETWORK_QUEUE_LEN] = [0; TAPE_NETWORK_QUEUE_LEN];
+static mut TAPE_NETWORK_HEAD: usize = 0;
+static mut TAPE_NETWORK_TAIL: usize = 0;
+static mut TAPE_NETWORK_COUNT: usize = 0;
+/// A terminal abort can be discovered by `nic_receive` before `read_key`
+/// runs. Preserve it until `read_key` returns the standard abort event.
+static mut TAPE_REMOTE_ABORT_PENDING: bool = false;
+
 /// Queues `bytes` for later `tape_input_pop` calls, silently dropping
 /// whatever doesn't fit -- the same "never corrupt accounting, just stop
 /// accepting more" choice `pmem::free_big` and this file's own
@@ -1401,6 +1673,19 @@ fn tape_input_push(bytes: &[u8]) {
     }
 }
 
+/// Prepends the first byte of a terminal frame after `classify_remote_tape_frame`
+/// has already queued its remainder. This preserves the wire's original
+/// order when `nic_receive`, rather than `read_key`, consumed that frame.
+fn tape_input_push_front(byte: u8) {
+    unsafe {
+        let previous = (TAPE_INPUT_HEAD + TAPE_INPUT_QUEUE_LEN - 1) % TAPE_INPUT_QUEUE_LEN;
+        if previous != TAPE_INPUT_TAIL {
+            TAPE_INPUT_HEAD = previous;
+            TAPE_INPUT_QUEUE[TAPE_INPUT_HEAD] = byte;
+        }
+    }
+}
+
 fn tape_input_pop() -> Option<u8> {
     unsafe {
         if TAPE_INPUT_HEAD == TAPE_INPUT_TAIL {
@@ -1409,6 +1694,92 @@ fn tape_input_pop() -> Option<u8> {
         let byte = TAPE_INPUT_QUEUE[TAPE_INPUT_HEAD];
         TAPE_INPUT_HEAD = (TAPE_INPUT_HEAD + 1) % TAPE_INPUT_QUEUE_LEN;
         Some(byte)
+    }
+}
+
+fn tape_network_frame_push(frame: &[u8]) {
+    unsafe {
+        if frame.len() <= nic::MAX_FRAME_LEN && TAPE_NETWORK_COUNT < TAPE_NETWORK_QUEUE_LEN {
+            core::ptr::copy_nonoverlapping(
+                frame.as_ptr(),
+                (&raw mut TAPE_NETWORK_FRAMES[TAPE_NETWORK_TAIL]).cast::<u8>(),
+                frame.len(),
+            );
+            TAPE_NETWORK_FRAME_LENS[TAPE_NETWORK_TAIL] = frame.len();
+            TAPE_NETWORK_TAIL = (TAPE_NETWORK_TAIL + 1) % TAPE_NETWORK_QUEUE_LEN;
+            TAPE_NETWORK_COUNT += 1;
+        }
+    }
+}
+
+fn tape_network_frame_pop(out: &mut [u8]) -> Option<usize> {
+    unsafe {
+        if TAPE_NETWORK_COUNT == 0 {
+            return None;
+        }
+        let length = TAPE_NETWORK_FRAME_LENS[TAPE_NETWORK_HEAD];
+        if out.len() < length {
+            return None;
+        }
+        core::ptr::copy_nonoverlapping(
+            (&raw const TAPE_NETWORK_FRAMES[TAPE_NETWORK_HEAD]).cast::<u8>(),
+            out.as_mut_ptr(),
+            length,
+        );
+        TAPE_NETWORK_FRAME_LENS[TAPE_NETWORK_HEAD] = 0;
+        TAPE_NETWORK_HEAD = (TAPE_NETWORK_HEAD + 1) % TAPE_NETWORK_QUEUE_LEN;
+        TAPE_NETWORK_COUNT -= 1;
+        Some(length)
+    }
+}
+
+enum RemoteTapeFrame {
+    Input(u32),
+    Consumed,
+    PassThrough,
+}
+
+/// Separates a `term net` control/input frame from an ordinary raw Ethernet
+/// frame while a tape is running. `read_key` turns `Input` into an event;
+/// `nic_receive` queues it for that later `read_key` call. Everything else
+/// remains available to a networking tape through `PassThrough`.
+fn classify_remote_tape_frame(peer: &[u8; 6], frame: &[u8]) -> RemoteTapeFrame {
+    if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+        return RemoteTapeFrame::PassThrough;
+    }
+    let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
+    // A networking tape owns chat/discovery framing itself. Leave discovery
+    // probes in its raw receive stream so it can update its own peer table
+    // and send exactly one protocol reply, rather than having this remote-
+    // input bridge consume the frame before the tape ever sees it.
+    if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
+        return RemoteTapeFrame::PassThrough;
+    }
+    if &frame_source != peer {
+        return RemoteTapeFrame::PassThrough;
+    }
+    match frame[14] {
+        TERM_TAG_BYE => {
+            unsafe { PENDING_REMOTE_BYE = true };
+            RemoteTapeFrame::Input(TAPE_EVENT_ABORT)
+        }
+        TERM_TAG_DATA => {
+            let payload = &frame[15..];
+            let end = payload
+                .iter()
+                .rposition(|&byte| byte != 0)
+                .map_or(0, |index| index + 1);
+            let data = &payload[..end];
+            if data.contains(&REMOTE_ABORT_BYTE) {
+                return RemoteTapeFrame::Input(TAPE_EVENT_ABORT);
+            }
+            let Some((&first, rest)) = data.split_first() else {
+                return RemoteTapeFrame::Consumed;
+            };
+            tape_input_push(rest);
+            RemoteTapeFrame::Input(TAPE_EVENT_CHAR_BASE | u32::from(first))
+        }
+        _ => RemoteTapeFrame::PassThrough,
     }
 }
 
@@ -1451,9 +1822,15 @@ const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 /// printed (e.g. a prompt) stuck in the relay queue for longer than
 /// necessary.
 fn poll_remote_tape_input() -> Option<u32> {
+    if unsafe { TAPE_REMOTE_ABORT_PENDING } {
+        unsafe { TAPE_REMOTE_ABORT_PENDING = false };
+        return Some(TAPE_EVENT_ABORT);
+    }
     if console::relay_enabled() {
-        if let (Some(peer), Some(source)) = (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE }) {
-            if let Ok(nic) = rtl8139::get() {
+        if let (Some(peer), Some(source)) =
+            (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE })
+        {
+            if let Ok(nic) = nic::get() {
                 relay_pending_tape_output(nic, &peer, &source);
             }
         }
@@ -1464,43 +1841,179 @@ fn poll_remote_tape_input() -> Option<u32> {
     if !console::relay_enabled() {
         return None;
     }
-    let (Some(peer), Some(source)) = (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE }) else {
+    let Some(peer) = (unsafe { ACTIVE_TERM_PEER }) else {
         return None;
     };
-    let Ok(nic) = rtl8139::get() else { return None };
-    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
-    let Some(received) = nic.receive(&mut buffer) else { return None };
+    let Ok(nic) = nic::get() else { return None };
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
+    let Some(received) = nic.receive(&mut buffer) else {
+        return None;
+    };
     let frame = &buffer[..received];
-    if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
-        return None;
-    }
-    let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
-    if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
-        remember_peer(frame_source);
-        send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
-        return None;
-    }
-    if frame_source != peer {
-        return None;
-    }
-    match frame[14] {
-        TERM_TAG_BYE => {
-            unsafe { PENDING_REMOTE_BYE = true };
-            Some(TAPE_EVENT_ABORT)
+    match classify_remote_tape_frame(&peer, frame) {
+        RemoteTapeFrame::Input(event) => Some(event),
+        RemoteTapeFrame::Consumed => None,
+        RemoteTapeFrame::PassThrough => {
+            tape_network_frame_push(frame);
+            None
         }
-        TERM_TAG_DATA => {
-            let payload = &frame[15..];
-            let end = payload.iter().rposition(|&byte| byte != 0).map_or(0, |index| index + 1);
-            let data = &payload[..end];
-            if data.contains(&REMOTE_ABORT_BYTE) {
-                return Some(TAPE_EVENT_ABORT);
+    }
+}
+
+/// Copies the active NIC's MAC into a six-byte tape buffer. A tape calls this
+/// once before networking so a missing or failed controller has one explicit,
+/// checkable error path instead of appearing as an endless empty receive loop.
+extern "C" fn tape_nic_mac(out: u32) -> u32 {
+    if out == 0 {
+        return 0;
+    }
+    let Ok(nic) = nic::get() else { return 0 };
+    unsafe {
+        core::slice::from_raw_parts_mut(out as *mut u8, 6).copy_from_slice(&nic.mac_address());
+    }
+    1
+}
+
+/// Copies the selected NIC's MAC into a six-byte tape buffer.
+extern "C" fn tape_nic_mac_at(index: u32, out: u32) -> u32 {
+    if out == 0 {
+        return 0;
+    }
+    let Some(nic) = nic::get_at(index as usize) else {
+        return 0;
+    };
+    unsafe {
+        core::slice::from_raw_parts_mut(out as *mut u8, 6).copy_from_slice(&nic.mac_address());
+    }
+    1
+}
+
+/// Sends one complete raw Ethernet frame through the active NIC.
+/// Invalid lengths and controller/transmit failures are reported as zero;
+/// callers own their input buffer and should print a useful error themselves.
+extern "C" fn tape_nic_send(frame: u32, length: u32) -> u32 {
+    if frame == 0 || !(14..=nic::MAX_FRAME_LEN as u32).contains(&length) {
+        return 0;
+    }
+    let Ok(nic) = nic::get() else { return 0 };
+    let frame = unsafe { core::slice::from_raw_parts(frame as *const u8, length as usize) };
+    nic.send(frame) as u32
+}
+
+/// Sends one complete raw Ethernet frame through a selected NIC.
+extern "C" fn tape_nic_send_at(index: u32, frame: u32, length: u32) -> u32 {
+    if frame == 0 || !(14..=nic::MAX_FRAME_LEN as u32).contains(&length) {
+        return 0;
+    }
+    let Some(nic) = nic::get_at(index as usize) else {
+        return 0;
+    };
+    let frame = unsafe { core::slice::from_raw_parts(frame as *const u8, length as usize) };
+    nic.send(frame) as u32
+}
+
+/// Returns the number of initialized Ethernet interfaces.
+extern "C" fn tape_nic_count() -> u32 {
+    nic::count() as u32
+}
+
+/// Reports the maximum Ethernet frame length accepted by the kernel-owned
+/// driver. A shared tape networking library uses this instead of duplicating
+/// the RTL8139 limit, so its receive buffers stay synchronized with the
+/// kernel's hardware boundary.
+extern "C" fn tape_nic_max_frame_len() -> u32 {
+    nic::MAX_FRAME_LEN as u32
+}
+
+/// Returns the monotonic PIT tick counter used by the kernel. Protocol
+/// retransmission and connection deadlines should use this callback rather
+/// than programming a timer or reading PIT hardware from a tape.
+extern "C" fn tape_ticks() -> u64 {
+    interrupts::ticks()
+}
+
+/// Copies one raw Ethernet frame into `out`, returning its full length or
+/// zero when none is waiting, the caller buffer is too small, or the NIC
+/// cannot be used. A terminal frame consumed here is queued for `read_key`
+/// rather than exposed as chat traffic, preserving remote input while a
+/// networking tape runs inside `term net`. A too-small-buffer poll leaves
+/// the frame in the deferred FIFO for a later retry.
+extern "C" fn tape_nic_receive(out: u32, capacity: u32) -> u32 {
+    if out == 0 || capacity as usize > nic::MAX_FRAME_LEN {
+        return 0;
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(out as *mut u8, capacity as usize) };
+    if let Some(length) = tape_network_frame_pop(out) {
+        return length as u32;
+    }
+    let Ok(nic) = nic::get() else { return 0 };
+    let mut frame = [0u8; nic::MAX_FRAME_LEN];
+    let Some(length) = nic.receive(&mut frame) else {
+        return 0;
+    };
+
+    if console::relay_enabled() {
+        if let Some(peer) = unsafe { ACTIVE_TERM_PEER } {
+            match classify_remote_tape_frame(&peer, &frame[..length]) {
+                RemoteTapeFrame::Input(TAPE_EVENT_ABORT) => {
+                    unsafe { TAPE_REMOTE_ABORT_PENDING = true };
+                    return 0;
+                }
+                RemoteTapeFrame::Input(event) => {
+                    tape_input_push_front((event & 0xff) as u8);
+                    return 0;
+                }
+                RemoteTapeFrame::Consumed => return 0,
+                RemoteTapeFrame::PassThrough => {}
             }
-            let (&first, rest) = data.split_first()?;
-            tape_input_push(rest);
-            Some(TAPE_EVENT_CHAR_BASE | u32::from(first))
         }
-        _ => None,
     }
+    if out.len() < length {
+        // Keep the frame available for a retry with the advertised maximum
+        // size instead of consuming it because this poll used a small
+        // caller-provided buffer.
+        tape_network_frame_push(&frame[..length]);
+        return 0;
+    }
+    out[..length].copy_from_slice(&frame[..length]);
+    length as u32
+}
+
+/// Receives one frame from a selected NIC. The active interface uses the
+/// existing terminal-aware path; other interfaces are exposed directly to
+/// the tape without being mistaken for the active `term net` input channel.
+extern "C" fn tape_nic_receive_at(index: u32, out: u32, capacity: u32) -> u32 {
+    if out == 0 || capacity as usize > nic::MAX_FRAME_LEN {
+        return 0;
+    }
+    let Some(nic) = nic::get_at(index as usize) else {
+        return 0;
+    };
+    if index as usize == nic::active_index() {
+        return tape_nic_receive(out, capacity);
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(out as *mut u8, capacity as usize) };
+    let mut frame = [0u8; nic::MAX_FRAME_LEN];
+    let Some(length) = nic.receive(&mut frame) else {
+        return 0;
+    };
+    if out.len() < length {
+        return 0;
+    }
+    out[..length].copy_from_slice(&frame[..length]);
+    length as u32
+}
+
+/// Enables or disables receive-all mode for one selected NIC. This is
+/// intentionally per-interface: a multi-port layer-2 tape must see frames
+/// addressed to hosts behind its other ports, while ordinary protocol tapes
+/// should keep the backend's normal address filtering.
+extern "C" fn tape_nic_set_promiscuous_at(index: u32, enabled: u32) -> u32 {
+    let Some(nic) = nic::get_at(index as usize) else {
+        return 0;
+    };
+    nic.set_promiscuous(enabled != 0);
+    1
 }
 
 /// `extern "C" fn() -> u32` callback giving a tape actual interactive
@@ -1574,7 +2087,7 @@ extern "C" fn combined_tape_read_key() -> u32 {
 /// `pmem::TRACKED_BYTES`'s doc comment for why this second, coarser pool
 /// exists at all instead of simply growing the fine bitmap: doing that
 /// would have grown `kernel.bin` itself (a flat binary's `.bss` is baked
-/// into the file) past `boot/stage2.S`'s 127-sector kernel-load ceiling.
+/// into the file) beyond the old single-transfer kernel-load ceiling.
 ///
 /// Returns physical address `0` on failure (not enough contiguous free
 /// memory) -- never a valid chunk address, since nothing below
@@ -1613,7 +2126,20 @@ fn tape_run(arguments: &[u8]) {
         println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
         return;
     };
-    println!("Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery.");
+    println!(
+        "Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery."
+    );
+    // No tape's pending remote keystrokes, abort, or raw frame belongs to
+    // the next one. Clear this cross-callback state before every entry,
+    // including tapes launched locally after a prior `term net` session.
+    unsafe {
+        TAPE_INPUT_HEAD = 0;
+        TAPE_INPUT_TAIL = 0;
+        TAPE_NETWORK_HEAD = 0;
+        TAPE_NETWORK_TAIL = 0;
+        TAPE_NETWORK_COUNT = 0;
+        TAPE_REMOTE_ABORT_PENDING = false;
+    }
     type TapeEntry = extern "C" fn(
         putc: extern "C" fn(u32),
         should_abort: extern "C" fn() -> u32,
@@ -1622,6 +2148,16 @@ fn tape_run(arguments: &[u8]) {
         read_key: extern "C" fn() -> u32,
         args_ptr: u32,
         args_len: u32,
+        nic_mac: extern "C" fn(u32) -> u32,
+        nic_send: extern "C" fn(u32, u32) -> u32,
+        nic_receive: extern "C" fn(u32, u32) -> u32,
+        nic_max_frame_len: extern "C" fn() -> u32,
+        ticks: extern "C" fn() -> u64,
+        nic_count: extern "C" fn() -> u32,
+        nic_mac_at: extern "C" fn(u32, u32) -> u32,
+        nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
+        nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
+        nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
     );
     let entry: TapeEntry = unsafe { core::mem::transmute::<usize, TapeEntry>(address as usize) };
     entry(
@@ -1632,10 +2168,20 @@ fn tape_run(arguments: &[u8]) {
         combined_tape_read_key,
         arguments.as_ptr() as u32,
         arguments.len() as u32,
+        tape_nic_mac,
+        tape_nic_send,
+        tape_nic_receive,
+        tape_nic_max_frame_len,
+        tape_ticks,
+        tape_nic_count,
+        tape_nic_mac_at,
+        tape_nic_send_at,
+        tape_nic_receive_at,
+        tape_nic_set_promiscuous_at,
     );
+    console::reset_terminal_output();
     println!("Tape returned; back at the fos shell.");
 }
-
 
 fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
     let (kind, remainder) = take_word(arguments);
@@ -1662,14 +2208,23 @@ fn tape_load_disk(info: &BootInfo, name: &[u8]) {
     match fosfs::read(info, name, &mut sector) {
         Ok(Some(length)) => {
             if length == 0 {
-                println!("'{}' is empty; nothing to load.", core::str::from_utf8(name).unwrap_or("?"));
+                println!(
+                    "'{}' is empty; nothing to load.",
+                    core::str::from_utf8(name).unwrap_or("?")
+                );
                 return;
             }
-            let Some(address) = allocate_tape_buffer(length as u32) else { return };
-            let destination = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
+            let Some(address) = allocate_tape_buffer(length as u32) else {
+                return;
+            };
+            let destination =
+                unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
             destination.copy_from_slice(&sector[..length]);
             tape_set(Some((address, length as u32)));
-            println!("Loaded {length} byte(s) from '{}' at 0x{address:05x}. 'tape run' to execute it.", core::str::from_utf8(name).unwrap_or("?"));
+            println!(
+                "Loaded {length} byte(s) from '{}' at 0x{address:05x}. 'tape run' to execute it.",
+                core::str::from_utf8(name).unwrap_or("?")
+            );
         }
         Ok(None) => println!("File not found."),
         Err(error) => println!("FOSFS disk error: {error:?}"),
@@ -1710,9 +2265,12 @@ fn tape_load_net() {
     let Some(nic) = nic_or_report() else { return };
     let own_mac = nic.mac_address();
     println!("Waiting for a tape over the network; press F12 (or F4/F6/F7/F8/F10) to give up.");
-    println!("Have the sender target this card's MAC address ({}).", Mac(&own_mac));
+    println!(
+        "Have the sender target this card's MAC address ({}).",
+        Mac(&own_mac)
+    );
 
-    let mut buffer = [0u8; rtl8139::MAX_FRAME_LEN];
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let mut transfer: Option<TapeTransfer> = None;
     // Periodic (~2s) progress line while a transfer is in flight, so a
     // stalled load is visibly distinguishable from one still making
@@ -1725,7 +2283,10 @@ fn tape_load_net() {
     let mut next_status = interrupts::ticks() + TAPE_STATUS_TICKS;
 
     loop {
-        if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+        if matches!(
+            keyboard::poll_term_event(),
+            Some(keyboard::KeyEvent::Escape)
+        ) {
             println!("\nGave up waiting; no tape loaded.");
             return;
         }
@@ -1736,11 +2297,17 @@ fn tape_load_net() {
                 active.received,
                 active.length,
                 nic.overflow_count(),
-                if nic.overflow_count() == 1 { "y" } else { "ies" }
+                if nic.overflow_count() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
             );
             next_status = interrupts::ticks() + TAPE_STATUS_TICKS;
         }
-        let Some(received) = nic.receive(&mut buffer) else { continue };
+        let Some(received) = nic.receive(&mut buffer) else {
+            continue;
+        };
         let frame = &buffer[..received];
         if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
             continue;
@@ -1750,22 +2317,42 @@ fn tape_load_net() {
 
         match frame[14] {
             TAPE_TAG_START if transfer.is_none() => {
-                let Some(length_bytes) = payload.get(0..4) else { continue };
+                let Some(length_bytes) = payload.get(0..4) else {
+                    continue;
+                };
                 let length = u32::from_le_bytes(length_bytes.try_into().unwrap());
                 if length == 0 {
                     println!("\nIgnoring a zero-length tape start from {}.", Mac(&source));
                     continue;
                 }
-                let Some(address) = allocate_tape_buffer(length) else { continue };
+                let Some(address) = allocate_tape_buffer(length) else {
+                    continue;
+                };
                 println!("\nReceiving a {length}-byte tape from {}...", Mac(&source));
-                transfer = Some(TapeTransfer { source, address, length, expected_seq: 0, received: 0 });
+                transfer = Some(TapeTransfer {
+                    source,
+                    address,
+                    length,
+                    expected_seq: 0,
+                    received: 0,
+                });
             }
-            TAPE_TAG_DATA if transfer.as_ref().is_some_and(|transfer| transfer.source == source) => {
+            TAPE_TAG_DATA
+                if transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.source == source) =>
+            {
                 let active = transfer.as_mut().unwrap();
-                let Some(seq_bytes) = payload.get(0..4) else { continue };
+                let Some(seq_bytes) = payload.get(0..4) else {
+                    continue;
+                };
                 let seq = u32::from_le_bytes(seq_bytes.try_into().unwrap());
                 if seq != active.expected_seq {
-                    println!("\nGap in tape data from {}: expected chunk #{}, got #{seq} -- aborting this load.", Mac(&source), active.expected_seq);
+                    println!(
+                        "\nGap in tape data from {}: expected chunk #{}, got #{seq} -- aborting this load.",
+                        Mac(&source),
+                        active.expected_seq
+                    );
                     transfer = None;
                     continue;
                 }
@@ -1773,23 +2360,46 @@ fn tape_load_net() {
                 let chunk_len = (active.length as usize - offset).min(TAPE_CHUNK_LEN);
                 let data = &payload[4..];
                 if data.len() < chunk_len {
-                    println!("\nShort tape data chunk #{seq} from {}: expected {chunk_len} byte(s), frame only carried {} -- aborting this load.", Mac(&source), data.len());
+                    println!(
+                        "\nShort tape data chunk #{seq} from {}: expected {chunk_len} byte(s), frame only carried {} -- aborting this load.",
+                        Mac(&source),
+                        data.len()
+                    );
                     transfer = None;
                     continue;
                 }
-                let destination = unsafe { core::slice::from_raw_parts_mut((active.address as usize + offset) as *mut u8, chunk_len) };
+                let destination = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (active.address as usize + offset) as *mut u8,
+                        chunk_len,
+                    )
+                };
                 destination.copy_from_slice(&data[..chunk_len]);
                 active.received += chunk_len as u32;
                 active.expected_seq += 1;
             }
-            TAPE_TAG_STOP if transfer.as_ref().is_some_and(|transfer| transfer.source == source) => {
+            TAPE_TAG_STOP
+                if transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.source == source) =>
+            {
                 let active = transfer.take().unwrap();
                 if active.received == active.length {
                     tape_set(Some((active.address, active.length)));
-                    println!("\nTape loaded: {} byte(s) at 0x{:05x} from {}. 'tape run' to execute it.", active.length, active.address, Mac(&source));
+                    println!(
+                        "\nTape loaded: {} byte(s) at 0x{:05x} from {}. 'tape run' to execute it.",
+                        active.length,
+                        active.address,
+                        Mac(&source)
+                    );
                     return;
                 }
-                println!("\nTape from {} stopped early: only {} of {} declared byte(s) arrived -- aborting.", Mac(&source), active.received, active.length);
+                println!(
+                    "\nTape from {} stopped early: only {} of {} declared byte(s) arrived -- aborting.",
+                    Mac(&source),
+                    active.received,
+                    active.length
+                );
             }
             CHAT_TAG_DISCOVER_REQUEST => {
                 // A `send_tape.py`/`nic discover`/`chat` peer probing for
@@ -1820,7 +2430,9 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         match peer_by_index(index as usize) {
             Some(mac) => mac,
             None => {
-                println!("No peer #{index} known; run 'nic discover' first, or give a full MAC address.");
+                println!(
+                    "No peer #{index} known; run 'nic discover' first, or give a full MAC address."
+                );
                 return;
             }
         }
@@ -1845,7 +2457,10 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         }
     };
     if length == 0 {
-        println!("'{}' is empty; nothing to send.", core::str::from_utf8(name).unwrap_or("?"));
+        println!(
+            "'{}' is empty; nothing to send.",
+            core::str::from_utf8(name).unwrap_or("?")
+        );
         return;
     }
 
@@ -1858,7 +2473,7 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
 /// `TAPE_TAG_STOP`, see the `TAPE_TAG_*` constants) unicast to
 /// `destination`, mirroring `tools/send_tape.py`'s host-side sender so
 /// either end can talk to the other.
-fn tape_send(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], data: &[u8]) {
+fn tape_send(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8]) {
     let mut start_frame = [0u8; 19];
     start_frame[0..6].copy_from_slice(destination);
     start_frame[6..12].copy_from_slice(source);
@@ -1879,7 +2494,9 @@ fn tape_send(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], da
         data_frame[15..19].copy_from_slice(&(seq as u32).to_le_bytes());
         data_frame[19..19 + chunk.len()].copy_from_slice(chunk);
         if !nic.send(&data_frame[..19 + chunk.len()]) {
-            println!("Transmit failed on chunk #{seq} (card reported an error, or timed out); tape not fully sent.");
+            println!(
+                "Transmit failed on chunk #{seq} (card reported an error, or timed out); tape not fully sent."
+            );
             return;
         }
     }
@@ -1890,7 +2507,9 @@ fn tape_send(nic: &rtl8139::Rtl8139, destination: &[u8; 6], source: &[u8; 6], da
     stop_frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
     stop_frame[14] = TAPE_TAG_STOP;
     if !nic.send(&stop_frame) {
-        println!("Transmit failed sending the closing frame; the receiver may report an incomplete tape.");
+        println!(
+            "Transmit failed sending the closing frame; the receiver may report an incomplete tape."
+        );
         return;
     }
 
@@ -1903,7 +2522,11 @@ struct Mac<'a>(&'a [u8; 6]);
 
 impl core::fmt::Display for Mac<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5])
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        )
     }
 }
 
@@ -1926,7 +2549,6 @@ fn parse_mac(text: &[u8]) -> Option<[u8; 6]> {
     Some(mac)
 }
 
-
 fn no_arguments(arguments: &[u8]) -> bool {
     if arguments.is_empty() {
         true
@@ -1938,7 +2560,10 @@ fn no_arguments(arguments: &[u8]) -> bool {
 
 fn take_word(input: &[u8]) -> (&[u8], &[u8]) {
     let input = trim_start(input);
-    let end = input.iter().position(|byte| *byte == b' ').unwrap_or(input.len());
+    let end = input
+        .iter()
+        .position(|byte| *byte == b' ')
+        .unwrap_or(input.len());
     (&input[..end], trim_start(&input[end..]))
 }
 
@@ -1981,9 +2606,15 @@ fn write_command(info: &BootInfo, arguments: &[u8]) {
         Ok(fosfs::WriteOutcome::InvalidName) => {
             println!("Invalid name: use up to 16 uppercase letters, digits, '.', '_', or '-'.");
         }
-        Ok(fosfs::WriteOutcome::ContentTooLarge) => println!("Content too large: FOSFS files are limited to one 512-byte sector."),
-        Ok(fosfs::WriteOutcome::DirectoryFull) => println!("Directory full: all 64 FOSFS entries are in use."),
-        Ok(fosfs::WriteOutcome::DataFull) => println!("Data region full: no free sector remains in the FOSFS partition."),
+        Ok(fosfs::WriteOutcome::ContentTooLarge) => {
+            println!("Content too large: FOSFS files are limited to one 512-byte sector.")
+        }
+        Ok(fosfs::WriteOutcome::DirectoryFull) => {
+            println!("Directory full: all 64 FOSFS entries are in use.")
+        }
+        Ok(fosfs::WriteOutcome::DataFull) => {
+            println!("Data region full: no free sector remains in the FOSFS partition.")
+        }
         Err(error) => println!("FOSFS disk error: {error:?}"),
     }
 }
@@ -2036,7 +2667,14 @@ fn hexdump_command(info: &BootInfo, arguments: &[u8]) {
     };
     let kernel_start = read_u32(core::ptr::addr_of!(info.kernel_start));
     let kernel_end = read_u32(core::ptr::addr_of!(info.kernel_end));
-    if !extra.is_empty() || length == 0 || length > 128 || address < kernel_start || address.checked_add(length).is_none_or(|end| end > kernel_end) {
+    if !extra.is_empty()
+        || length == 0
+        || length > 128
+        || address < kernel_start
+        || address
+            .checked_add(length)
+            .is_none_or(|end| end > kernel_end)
+    {
         println!("Address must be within the reserved kernel range; maximum is 128 bytes.");
         return;
     }
@@ -2055,7 +2693,14 @@ fn dump_bytes(base: u32, bytes: &[u8]) {
         }
         print!("|");
         for byte in chunk {
-            print!("{}", if (0x20..=0x7e).contains(byte) { *byte as char } else { '.' });
+            print!(
+                "{}",
+                if (0x20..=0x7e).contains(byte) {
+                    *byte as char
+                } else {
+                    '.'
+                }
+            );
         }
         println!("|");
     }
@@ -2091,7 +2736,11 @@ fn print_boot_info(info: &BootInfo) {
     let serial_available = info.serial_available != 0;
     println!(
         "Boot drive: 0x{boot_drive:02x}; serial: {}; kernel: 0x{kernel_start:08x}-0x{kernel_end:08x}",
-        if serial_available { "available" } else { "unavailable" }
+        if serial_available {
+            "available"
+        } else {
+            "unavailable"
+        }
     );
 }
 
@@ -2099,10 +2748,10 @@ fn print_memory_map(info: &BootInfo) {
     let count = usize::from(read_u16(core::ptr::addr_of!(info.memory_region_count)));
     println!("Firmware memory map ({count} entries reported by BIOS INT 15h EAX=E820h):");
     for index in 0..count {
-        let region = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index])) };
+        let region =
+            unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index])) };
         print_region(index, region);
     }
-
 }
 
 fn e820_type_name(kind: u32) -> &'static str {
@@ -2121,7 +2770,8 @@ fn print_memory_summary(info: &BootInfo) {
     let mut usable = 0u64;
     let mut reserved = 0u64;
     for index in 0..count {
-        let region = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index])) };
+        let region =
+            unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index])) };
         let length = read_u64(core::ptr::addr_of!(region.length));
         if read_u32(core::ptr::addr_of!(region.kind)) == 1 {
             usable = usable.saturating_add(length);
@@ -2129,14 +2779,19 @@ fn print_memory_summary(info: &BootInfo) {
             reserved = reserved.saturating_add(length);
         }
     }
-    println!("E820 summary: {usable} usable bytes; {reserved} non-usable bytes (reserved/ACPI/bad).");
+    println!(
+        "E820 summary: {usable} usable bytes; {reserved} non-usable bytes (reserved/ACPI/bad)."
+    );
 }
 
 fn print_region(index: usize, region: MemoryRegion) {
     let base = read_u64(core::ptr::addr_of!(region.base));
     let length = read_u64(core::ptr::addr_of!(region.length));
     let kind = read_u32(core::ptr::addr_of!(region.kind));
-    println!("  {index:02}: 0x{base:016x} + 0x{length:016x} type {kind} ({})", e820_type_name(kind));
+    println!(
+        "  {index:02}: 0x{base:016x} + 0x{length:016x} type {kind} ({})",
+        e820_type_name(kind)
+    );
 }
 
 fn read_u16(pointer: *const u16) -> u16 {

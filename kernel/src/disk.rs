@@ -1,4 +1,4 @@
-use crate::boot_info::{read_u32, BootInfo};
+use crate::boot_info::{BootInfo, read_u32};
 use crate::interrupts;
 
 const SECTOR_SIZE: usize = 512;
@@ -27,13 +27,21 @@ pub fn data_partition_sectors(info: &BootInfo) -> u32 {
     read_u32(core::ptr::addr_of!(info.data_partition_sectors))
 }
 
-pub fn read_sector<T>(info: &BootInfo, lba: u32, operation: impl FnOnce(&[u8; SECTOR_SIZE]) -> T) -> Result<T, Error> {
+pub fn read_sector<T>(
+    info: &BootInfo,
+    lba: u32,
+    operation: impl FnOnce(&[u8; SECTOR_SIZE]) -> T,
+) -> Result<T, Error> {
     transfer(info, lba, 0)?;
     let sector = unsafe { &*core::ptr::addr_of!(SECTOR.0) };
     Ok(operation(sector))
 }
 
-pub fn write_sector(info: &BootInfo, lba: u32, operation: impl FnOnce(&mut [u8; SECTOR_SIZE])) -> Result<(), Error> {
+pub fn write_sector(
+    info: &BootInfo,
+    lba: u32,
+    operation: impl FnOnce(&mut [u8; SECTOR_SIZE]),
+) -> Result<(), Error> {
     let sector = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR.0) };
     operation(sector);
     transfer(info, lba, 1)

@@ -113,7 +113,11 @@ pub fn poll_term_event() -> Option<KeyEvent> {
     let scancode = interrupts::pop_scancode()?;
     let released = scancode & 0x80 != 0;
     if ESCAPE_SCANCODES.contains(&(scancode & 0x7f)) {
-        return if released { None } else { Some(KeyEvent::Escape) };
+        return if released {
+            None
+        } else {
+            Some(KeyEvent::Escape)
+        };
     }
     #[allow(static_mut_refs)]
     let decoded = unsafe { DECODER.decode_scancode(scancode) };

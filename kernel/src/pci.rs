@@ -13,12 +13,13 @@
 //!
 //! Only enough of PCI is implemented to serve this project's two uses:
 //! walking every bus/device/function to find serial controllers by class
-//! code (reading BAR0 for the UART's I/O port), and finding one specific
-//! Ethernet card by vendor/device ID for the RTL8139 driver (`rtl8139.rs`,
-//! reading its BAR0 the same way, plus writing the PCI command register to
-//! enable I/O space and bus mastering, which DMA needs). There is no
-//! support for memory-mapped BARs, PCI bridges, or any other device class;
-//! this is a teaching-scoped lookup, not a general PCI driver.
+//! code (reading BAR0 for the UART's I/O port), and finding Ethernet cards by
+//! vendor/device ID for the RTL8139, 3C905, and Intel e1000 drivers
+//! (`rtl8139.rs`, `threecom.rs`, and `e1000.rs`). The first two read I/O BARs;
+//! e1000 reads a 32-bit memory BAR. All DMA-capable backends enable bus
+//! mastering through the PCI command register.
+//! There is no support for 64-bit memory BARs, PCI bridges, or any other
+//! device class; this is a teaching-scoped lookup, not a general PCI driver.
 
 use crate::arch::x86::{inl, outl};
 
@@ -47,7 +48,10 @@ fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 
 fn read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     unsafe {
-        outl(CONFIG_ADDRESS, config_address(bus, device, function, offset));
+        outl(
+            CONFIG_ADDRESS,
+            config_address(bus, device, function, offset),
+        );
         inl(CONFIG_DATA)
     }
 }
@@ -66,12 +70,15 @@ fn read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
 
 fn write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     unsafe {
-        outl(CONFIG_ADDRESS, config_address(bus, device, function, offset));
+        outl(
+            CONFIG_ADDRESS,
+            config_address(bus, device, function, offset),
+        );
         outl(CONFIG_DATA, value);
     }
 }
 
-/// The address of one PCI function, as found by `find_device`. Enough to
+/// The address of one PCI function, as found by `find_devices`. Enough to
 /// re-read its BARs or reconfigure its command register without walking
 /// the bus again.
 #[derive(Clone, Copy)]
@@ -81,60 +88,134 @@ pub struct PciAddress {
     function: u8,
 }
 
+pub const MAX_DEVICE_MATCHES: usize = 8;
+
 impl PciAddress {
-    /// Reads BAR0, returning its I/O base address if it is I/O-mapped
+    /// Reads an I/O BAR, returning its base address if it is I/O-mapped
     /// (`None` for memory-mapped BARs, which this project's port-I/O code
     /// cannot use).
-    pub fn io_bar0(&self) -> Option<u16> {
-        let bar0 = read_u32(self.bus, self.device, self.function, BAR0_OFFSET);
-        if bar0 & BAR_IS_IO_SPACE == 0 {
+    pub fn io_bar(&self, index: u8) -> Option<u16> {
+        if index >= 6 {
             return None;
         }
-        Some((bar0 & 0xffff_fffc) as u16)
+        let offset = BAR0_OFFSET + index * 4;
+        let bar = read_u32(self.bus, self.device, self.function, offset);
+        if bar & BAR_IS_IO_SPACE == 0 {
+            return None;
+        }
+        Some((bar & 0xffff_fffc) as u16)
+    }
+
+    /// Reads BAR0, returning its I/O base address if it is I/O-mapped.
+    pub fn io_bar0(&self) -> Option<u16> {
+        self.io_bar(0)
+    }
+
+    /// Reads a 32-bit memory BAR, returning its physical base address.
+    /// 64-bit memory BARs are deliberately not handled yet because the
+    /// kernel and its DMA allocator currently use 32-bit physical addresses.
+    pub fn memory_bar(&self, index: u8) -> Option<u32> {
+        if index >= 6 {
+            return None;
+        }
+        let offset = BAR0_OFFSET + index * 4;
+        let bar = read_u32(self.bus, self.device, self.function, offset);
+        if bar & BAR_IS_IO_SPACE != 0 {
+            return None;
+        }
+        let memory_type = (bar >> 1) & 0b11;
+        if memory_type == 0b10 {
+            return None;
+        }
+        let base = bar & 0xffff_fff0;
+        (base != 0).then_some(base)
     }
 
     /// Sets the I/O Space Enable (bit 0) and Bus Master Enable (bit 2)
     /// bits in the PCI command register (offset `0x04`), leaving every
-    /// other bit as the firmware left it. Bus mastering is required for
-    /// any device -- such as an Ethernet card -- that writes to memory on
-    /// its own (DMA) instead of only being read from/written to via port
-    /// I/O, as this project's UARTs are.
+    /// other bit as the firmware left it.
     pub fn enable_io_and_bus_master(&self) {
         const COMMAND_OFFSET: u8 = 0x04;
         const IO_SPACE_ENABLE: u32 = 1 << 0;
         const BUS_MASTER_ENABLE: u32 = 1 << 2;
         let command = read_u32(self.bus, self.device, self.function, COMMAND_OFFSET);
-        write_u32(self.bus, self.device, self.function, COMMAND_OFFSET, command | IO_SPACE_ENABLE | BUS_MASTER_ENABLE);
+        write_u32(
+            self.bus,
+            self.device,
+            self.function,
+            COMMAND_OFFSET,
+            command | IO_SPACE_ENABLE | BUS_MASTER_ENABLE,
+        );
+    }
+
+    /// Sets Memory Space Enable (bit 1) and Bus Master Enable (bit 2).
+    /// Intel e1000 exposes its device registers through a memory BAR, while
+    /// its receive/transmit rings are still accessed by PCI bus mastering.
+    pub fn enable_memory_and_bus_master(&self) {
+        const COMMAND_OFFSET: u8 = 0x04;
+        const MEMORY_SPACE_ENABLE: u32 = 1 << 1;
+        const BUS_MASTER_ENABLE: u32 = 1 << 2;
+        let command = read_u32(self.bus, self.device, self.function, COMMAND_OFFSET);
+        write_u32(
+            self.bus,
+            self.device,
+            self.function,
+            COMMAND_OFFSET,
+            command | MEMORY_SPACE_ENABLE | BUS_MASTER_ENABLE,
+        );
     }
 }
 
-/// Finds the first PCI function matching the given vendor/device ID pair,
-/// used by `rtl8139.rs` to locate that one specific Ethernet card. Unlike
-/// `find_serial_ports`, this does not filter by class code, since some
-/// chips (like the RTL8139) can be identified more precisely by ID than
-/// by class alone.
-pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciAddress> {
+/// Finds all PCI functions matching a vendor ID and one of its device IDs,
+/// storing up to `out.len()` addresses in bus/device/function enumeration
+/// order. This is intentionally bounded: the kernel has no heap, and the
+/// supported NIC set is small enough for a fixed caller-owned array.
+pub fn find_devices(
+    vendor_id: u16,
+    device_ids: &[u16],
+    out: &mut [Option<PciAddress>],
+) -> usize {
+    let mut found = 0;
     for bus in 0..=255u8 {
         for device in 0..32u8 {
             let vendor = read_u16(bus, device, 0, 0x00);
             if vendor == 0xffff {
                 continue;
             }
+
             let header_type = read_u8(bus, device, 0, 0x0e);
-            let function_count = if header_type & HEADER_TYPE_MULTIFUNCTION != 0 { 8 } else { 1 };
+            let function_count = if header_type & HEADER_TYPE_MULTIFUNCTION != 0 {
+                8
+            } else {
+                1
+            };
             for function in 0..function_count {
-                let function_vendor = if function == 0 { vendor } else { read_u16(bus, device, function, 0x00) };
+                let function_vendor = if function == 0 {
+                    vendor
+                } else {
+                    read_u16(bus, device, function, 0x00)
+                };
                 if function_vendor != vendor_id {
                     continue;
                 }
                 let function_device = read_u16(bus, device, function, 0x02);
-                if function_device == device_id {
-                    return Some(PciAddress { bus, device, function });
+                if device_ids.contains(&function_device) {
+                    if found < out.len() {
+                        out[found] = Some(PciAddress {
+                            bus,
+                            device,
+                            function,
+                        });
+                    }
+                    found += 1;
+                    if found == out.len() {
+                        return found;
+                    }
                 }
             }
         }
     }
-    None
+    found
 }
 
 /// Walks every PCI bus/device/function looking for serial controllers,
@@ -156,9 +237,17 @@ pub fn find_serial_ports(out: &mut [u16]) -> usize {
                 continue;
             }
             let header_type = read_u8(bus, device, 0, 0x0e);
-            let function_count = if header_type & HEADER_TYPE_MULTIFUNCTION != 0 { 8 } else { 1 };
+            let function_count = if header_type & HEADER_TYPE_MULTIFUNCTION != 0 {
+                8
+            } else {
+                1
+            };
             for function in 0..function_count {
-                let function_vendor = if function == 0 { vendor } else { read_u16(bus, device, function, 0x00) };
+                let function_vendor = if function == 0 {
+                    vendor
+                } else {
+                    read_u16(bus, device, function, 0x00)
+                };
                 if function_vendor == 0xffff {
                     continue;
                 }

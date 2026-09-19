@@ -3,10 +3,20 @@ use core::fmt::{self, Write};
 use crate::arch::x86::{inb, outb};
 
 const VGA_BUFFER: *mut u16 = 0xb8000 as *mut u16;
-const VGA_WIDTH: usize = 80;
-const VGA_HEIGHT: usize = 25;
 const VGA_COLOR: u8 = 0x07;
 const COM1: u16 = 0x3f8;
+
+const SEQUENCER_INDEX_PORT: u16 = 0x3c4;
+const SEQUENCER_DATA_PORT: u16 = 0x3c5;
+const GRAPHICS_INDEX_PORT: u16 = 0x3ce;
+const GRAPHICS_DATA_PORT: u16 = 0x3cf;
+const FONT_MEMORY: *mut u8 = 0xa0000 as *mut u8;
+const FONT_MAP_SIZE: usize = 0x2000;
+const FONT_GLYPH_STRIDE: usize = 32;
+const FONT_8X8_MAP: usize = FONT_MAP_SIZE;
+// Character-map selectors are not linear addresses: selector 4 selects the
+// 0x2000-0x3fff region in plane 2. Select that map for both attribute halves.
+const FONT_8X8_CHARACTER_MAP: u8 = 0x24;
 
 /// VGA CRTC index/data ports used to read and move the hardware
 /// text-mode cursor. Writing characters into the 0xb8000 framebuffer only
@@ -21,9 +31,61 @@ const CRTC_DATA_PORT: u16 = 0x3d5;
 const CRTC_CURSOR_LOCATION_HIGH: u8 = 0x0e;
 const CRTC_CURSOR_LOCATION_LOW: u8 = 0x0f;
 
+/// VGA text modes supported by the kernel console. `Experimental132x25`
+/// uses non-standard horizontal timing and is intended primarily for QEMU
+/// and VGA-compatible hardware that accepts extended text timings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VgaMode {
+    Text80x25,
+    Text80x50,
+    Experimental132x25,
+}
+
+impl VgaMode {
+    pub const fn width(self) -> usize {
+        match self {
+            Self::Text80x25 | Self::Text80x50 => 80,
+            Self::Experimental132x25 => 132,
+        }
+    }
+
+    pub const fn height(self) -> usize {
+        match self {
+            Self::Text80x25 | Self::Experimental132x25 => 25,
+            Self::Text80x50 => 50,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Text80x25 => "80x25",
+            Self::Text80x50 => "80x50",
+            Self::Experimental132x25 => "132x25 (experimental)",
+        }
+    }
+}
+
 static mut ROW: usize = 0;
 static mut COLUMN: usize = 0;
 static mut SERIAL_READY: bool = false;
+static mut CURRENT_VGA_MODE: VgaMode = VgaMode::Text80x25;
+static mut BASELINE_CRTC: [u8; 8] = [0; 8];
+static mut BASELINE_CLOCKING_MODE: u8 = 0;
+static mut BASELINE_CHARACTER_MAP: u8 = 0;
+static mut BASELINE_CRTC_PROTECT: u8 = 0;
+static mut FONT_8X8_READY: bool = false;
+
+#[derive(Clone, Copy)]
+enum TerminalVgaState {
+    Normal,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    Osc,
+    OscEscape,
+}
+
+static mut TERMINAL_VGA_STATE: TerminalVgaState = TerminalVgaState::Normal;
 
 /// Bounded queue of every byte this module writes out (VGA text plus
 /// whatever reaches `write_serial`, which `Console::write_str`,
@@ -111,6 +173,7 @@ pub fn drain_relay(out: &mut [u8]) -> usize {
 pub fn initialize(serial_available: bool) {
     unsafe {
         SERIAL_READY = serial_available && initialize_serial();
+        capture_vga_baseline();
     }
     // Pick up exactly where real-mode's own BIOS-teletype printing left
     // the hardware cursor, rather than resetting to (0, 0): the screen is
@@ -134,9 +197,199 @@ unsafe fn read_cursor_position() -> (usize, usize) {
         let high = inb(CRTC_DATA_PORT);
         outb(CRTC_INDEX_PORT, CRTC_CURSOR_LOCATION_LOW);
         let low = inb(CRTC_DATA_PORT);
-        let position = (usize::from(high) << 8 | usize::from(low)).min(VGA_WIDTH * VGA_HEIGHT - 1);
-        (position / VGA_WIDTH, position % VGA_WIDTH)
+        let mode = CURRENT_VGA_MODE;
+        let position =
+            (usize::from(high) << 8 | usize::from(low)).min(mode.width() * mode.height() - 1);
+        (position / mode.width(), position % mode.width())
     }
+}
+
+unsafe fn read_indexed(index_port: u16, data_port: u16, index: u8) -> u8 {
+    unsafe {
+        outb(index_port, index);
+        inb(data_port)
+    }
+}
+
+unsafe fn write_indexed(index_port: u16, data_port: u16, index: u8, value: u8) {
+    unsafe {
+        outb(index_port, index);
+        outb(data_port, value);
+    }
+}
+
+unsafe fn read_crtc(index: u8) -> u8 {
+    unsafe { read_indexed(CRTC_INDEX_PORT, CRTC_DATA_PORT, index) }
+}
+
+unsafe fn write_crtc(index: u8, value: u8) {
+    unsafe {
+        write_indexed(CRTC_INDEX_PORT, CRTC_DATA_PORT, index, value);
+    }
+}
+
+unsafe fn capture_vga_baseline() {
+    unsafe {
+        BASELINE_CRTC = [
+            read_crtc(0x00),
+            read_crtc(0x01),
+            read_crtc(0x02),
+            read_crtc(0x03),
+            read_crtc(0x04),
+            read_crtc(0x05),
+            read_crtc(0x09),
+            read_crtc(0x13),
+        ];
+        BASELINE_CLOCKING_MODE = read_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x01);
+        BASELINE_CHARACTER_MAP = read_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x03);
+        BASELINE_CRTC_PROTECT = read_crtc(0x11);
+    }
+}
+
+/// Copies the BIOS-provided 8x16 font into a second VGA font map, retaining
+/// its first eight scan lines for 8x8 modes. Keeping the original map intact
+/// lets the console switch back to 80x25 without needing a baked-in font
+/// table, which matters because the flat kernel image has a deliberately
+/// small BIOS loader size budget.
+unsafe fn prepare_8x8_font() {
+    unsafe {
+        if FONT_8X8_READY {
+            return;
+        }
+
+        let saved_seq2 = read_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x02);
+        let saved_seq4 = read_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x04);
+        let saved_gfx4 = read_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x04);
+        let saved_gfx5 = read_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x05);
+        let saved_gfx6 = read_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x06);
+
+        write_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x02, 0x04);
+        write_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x04, 0x07);
+        write_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x04, 0x02);
+        write_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x05, 0x00);
+        write_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x06, 0x04);
+
+        for character in 0..256 {
+            let source = FONT_MEMORY.add(character * FONT_GLYPH_STRIDE);
+            let destination = FONT_MEMORY.add(FONT_8X8_MAP + character * FONT_GLYPH_STRIDE);
+            for row in 0..8 {
+                destination
+                    .add(row)
+                    .write_volatile(source.add(row).read_volatile());
+            }
+            for row in 8..FONT_GLYPH_STRIDE {
+                destination.add(row).write_volatile(0);
+            }
+        }
+
+        write_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x02, saved_seq2);
+        write_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x04, saved_seq4);
+        write_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x04, saved_gfx4);
+        write_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x05, saved_gfx5);
+        write_indexed(GRAPHICS_INDEX_PORT, GRAPHICS_DATA_PORT, 0x06, saved_gfx6);
+        FONT_8X8_READY = true;
+    }
+}
+
+unsafe fn restore_80x25_hardware() {
+    unsafe {
+        write_indexed(
+            SEQUENCER_INDEX_PORT,
+            SEQUENCER_DATA_PORT,
+            0x01,
+            BASELINE_CLOCKING_MODE,
+        );
+        write_indexed(
+            SEQUENCER_INDEX_PORT,
+            SEQUENCER_DATA_PORT,
+            0x03,
+            BASELINE_CHARACTER_MAP,
+        );
+        let protect = BASELINE_CRTC_PROTECT;
+        write_crtc(0x11, protect & 0x7f);
+        for (index, value) in [
+            (0x00, BASELINE_CRTC[0]),
+            (0x01, BASELINE_CRTC[1]),
+            (0x02, BASELINE_CRTC[2]),
+            (0x03, BASELINE_CRTC[3]),
+            (0x04, BASELINE_CRTC[4]),
+            (0x05, BASELINE_CRTC[5]),
+            (0x09, BASELINE_CRTC[6]),
+            (0x13, BASELINE_CRTC[7]),
+        ] {
+            write_crtc(index, value);
+        }
+        write_crtc(0x11, protect);
+    }
+}
+
+unsafe fn program_8x8_mode(width: usize) {
+    unsafe {
+        prepare_8x8_font();
+        let clocking_mode = if width == 132 {
+            BASELINE_CLOCKING_MODE | 0x01
+        } else {
+            BASELINE_CLOCKING_MODE
+        };
+        write_indexed(
+            SEQUENCER_INDEX_PORT,
+            SEQUENCER_DATA_PORT,
+            0x01,
+            clocking_mode,
+        );
+        // Select the copied font map for both attribute-selected font halves.
+        write_indexed(
+            SEQUENCER_INDEX_PORT,
+            SEQUENCER_DATA_PORT,
+            0x03,
+            FONT_8X8_CHARACTER_MAP,
+        );
+
+        let protect = BASELINE_CRTC_PROTECT;
+        write_crtc(0x11, protect & 0x7f);
+        if width == 132 {
+            // This deliberately non-standard timing is useful on QEMU and
+            // some SVGA-compatible adapters, but is not guaranteed by
+            // baseline VGA hardware or every attached monitor.
+            for (index, value) in [
+                (0x00, 0x9b), // 160 character clocks per scan line
+                (0x01, 0x83), // 132 visible character clocks
+                (0x02, 0x84), // horizontal blanking begins after display
+                (0x03, 0x92), // extended horizontal blanking interval
+                (0x04, 0x8c), // horizontal retrace begins in blanking
+                (0x05, 0x96), // horizontal retrace ends
+                (0x09, 0x07), // eight scan lines per character
+                (0x13, 0x42), // 132 cells * 2 bytes / 4
+            ] {
+                write_crtc(index, value);
+            }
+        } else {
+            write_crtc(0x09, 0x07);
+        }
+        write_crtc(0x11, protect);
+    }
+}
+
+pub fn current_vga_mode() -> VgaMode {
+    unsafe { CURRENT_VGA_MODE }
+}
+
+/// Changes the local VGA text mode, clears its framebuffer, and resets the
+/// kernel's cursor state. Serial output remains independent and continues to
+/// use the same raw byte stream as before.
+pub fn set_vga_mode(mode: VgaMode) {
+    unsafe {
+        match mode {
+            VgaMode::Text80x25 => restore_80x25_hardware(),
+            VgaMode::Text80x50 => program_8x8_mode(80),
+            VgaMode::Experimental132x25 => program_8x8_mode(132),
+        }
+        CURRENT_VGA_MODE = mode;
+        ROW = 0;
+        COLUMN = 0;
+        TERMINAL_VGA_STATE = TerminalVgaState::Normal;
+    }
+    clear();
 }
 
 unsafe fn initialize_serial() -> bool {
@@ -264,7 +517,8 @@ impl Uart {
 /// blinking caret always tracks where the next character will be drawn.
 fn update_cursor() {
     unsafe {
-        let position = (ROW * VGA_WIDTH + COLUMN) as u16;
+        let mode = CURRENT_VGA_MODE;
+        let position = (ROW * mode.width() + COLUMN) as u16;
         outb(CRTC_INDEX_PORT, CRTC_CURSOR_LOCATION_LOW);
         outb(CRTC_DATA_PORT, (position & 0xff) as u8);
         outb(CRTC_INDEX_PORT, CRTC_CURSOR_LOCATION_HIGH);
@@ -274,8 +528,11 @@ fn update_cursor() {
 
 pub fn clear() {
     unsafe {
-        for i in 0..VGA_WIDTH * VGA_HEIGHT {
-            VGA_BUFFER.add(i).write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(b' '));
+        let mode = CURRENT_VGA_MODE;
+        for i in 0..mode.width() * mode.height() {
+            VGA_BUFFER
+                .add(i)
+                .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(b' '));
         }
         ROW = 0;
         COLUMN = 0;
@@ -286,13 +543,15 @@ pub fn clear() {
 
 pub fn erase_last_character() {
     unsafe {
+        let mode = CURRENT_VGA_MODE;
         if COLUMN == 0 && ROW > 0 {
             ROW -= 1;
-            COLUMN = VGA_WIDTH;
+            COLUMN = mode.width();
         }
         if COLUMN > 0 {
             COLUMN -= 1;
-            VGA_BUFFER.add(ROW * VGA_WIDTH + COLUMN)
+            VGA_BUFFER
+                .add(ROW * mode.width() + COLUMN)
                 .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(b' '));
         }
     }
@@ -338,20 +597,24 @@ pub fn write_serial_byte(byte: u8) {
 
 fn newline() {
     unsafe {
+        let mode = CURRENT_VGA_MODE;
         COLUMN = 0;
         ROW += 1;
-        if ROW == VGA_HEIGHT {
-            for row in 1..VGA_HEIGHT {
-                for column in 0..VGA_WIDTH {
-                    let source = VGA_BUFFER.add(row * VGA_WIDTH + column).read_volatile();
-                    VGA_BUFFER.add((row - 1) * VGA_WIDTH + column).write_volatile(source);
+        if ROW == mode.height() {
+            for row in 1..mode.height() {
+                for column in 0..mode.width() {
+                    let source = VGA_BUFFER.add(row * mode.width() + column).read_volatile();
+                    VGA_BUFFER
+                        .add((row - 1) * mode.width() + column)
+                        .write_volatile(source);
                 }
             }
-            for column in 0..VGA_WIDTH {
-                VGA_BUFFER.add((VGA_HEIGHT - 1) * VGA_WIDTH + column)
+            for column in 0..mode.width() {
+                VGA_BUFFER
+                    .add((mode.height() - 1) * mode.width() + column)
                     .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(b' '));
             }
-            ROW = VGA_HEIGHT - 1;
+            ROW = mode.height() - 1;
         }
     }
 }
@@ -361,16 +624,70 @@ fn write_byte(byte: u8) {
         b'\n' => newline(),
         b'\r' => unsafe { COLUMN = 0 },
         0x20..=0x7e => unsafe {
-            VGA_BUFFER.add(ROW * VGA_WIDTH + COLUMN)
+            let mode = CURRENT_VGA_MODE;
+            VGA_BUFFER
+                .add(ROW * mode.width() + COLUMN)
                 .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(byte));
             COLUMN += 1;
-            if COLUMN == VGA_WIDTH {
+            if COLUMN == mode.width() {
                 newline();
             }
         },
         _ => {}
     }
     update_cursor();
+}
+
+/// Consume common ANSI/VT100 escape sequences for the local VGA view while
+/// leaving the byte stream itself untouched for serial and `term net`.
+fn write_terminal_vga_byte(byte: u8) {
+    unsafe {
+        match TERMINAL_VGA_STATE {
+            TerminalVgaState::Normal => {
+                if byte == 0x1b {
+                    TERMINAL_VGA_STATE = TerminalVgaState::Escape;
+                } else {
+                    write_byte(byte);
+                }
+            }
+            TerminalVgaState::Escape => match byte {
+                b'[' => TERMINAL_VGA_STATE = TerminalVgaState::Csi,
+                b']' => TERMINAL_VGA_STATE = TerminalVgaState::Osc,
+                0x20..=0x2f => TERMINAL_VGA_STATE = TerminalVgaState::EscapeIntermediate,
+                0x30..=0x7e => TERMINAL_VGA_STATE = TerminalVgaState::Normal,
+                _ => TERMINAL_VGA_STATE = TerminalVgaState::Normal,
+            },
+            TerminalVgaState::EscapeIntermediate => {
+                if (0x30..=0x7e).contains(&byte) {
+                    TERMINAL_VGA_STATE = TerminalVgaState::Normal;
+                }
+            }
+            TerminalVgaState::Csi => {
+                if (0x40..=0x7e).contains(&byte) {
+                    TERMINAL_VGA_STATE = TerminalVgaState::Normal;
+                } else if byte == 0x1b {
+                    TERMINAL_VGA_STATE = TerminalVgaState::Escape;
+                }
+            }
+            TerminalVgaState::Osc => match byte {
+                0x07 => TERMINAL_VGA_STATE = TerminalVgaState::Normal,
+                0x1b => TERMINAL_VGA_STATE = TerminalVgaState::OscEscape,
+                _ => {}
+            },
+            TerminalVgaState::OscEscape => match byte {
+                b'\\' => TERMINAL_VGA_STATE = TerminalVgaState::Normal,
+                0x1b => {}
+                _ => TERMINAL_VGA_STATE = TerminalVgaState::Osc,
+            },
+        }
+    }
+}
+
+/// Reset an incomplete terminal-control sequence before the shell resumes.
+pub fn reset_terminal_output() {
+    unsafe {
+        TERMINAL_VGA_STATE = TerminalVgaState::Normal;
+    }
 }
 
 struct Console;
@@ -406,7 +723,9 @@ pub fn write_bytes(bytes: &[u8]) {
 /// than relying on how a given Rust/LLVM version happens to pass a `u8`
 /// under cdecl.
 pub extern "C" fn print_byte(byte: u32) {
-    write_bytes(&[byte as u8]);
+    let byte = byte as u8;
+    write_terminal_vga_byte(byte);
+    write_serial(&[byte]);
 }
 
 /// Writes bytes to the VGA text console only, without echoing them back out

@@ -165,7 +165,10 @@ fn load_idt(limit: u16, base: u32) {
 }
 
 fn load_kernel_idt() {
-    load_idt((core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16, core::ptr::addr_of!(IDT) as u32);
+    load_idt(
+        (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
+        core::ptr::addr_of!(IDT) as u32,
+    );
 }
 
 /// Restores `IDTR` to the traditional real-mode IVT (256 4-byte far
@@ -185,7 +188,6 @@ pub fn use_real_mode_idt() {
 pub fn use_kernel_idt() {
     load_kernel_idt();
 }
-
 
 fn remap_pic() {
     program_pic(IRQ_BASE, IRQ_BASE + 8, NORMAL_PIC1_MASK, 0xff);
@@ -295,13 +297,38 @@ struct InterruptStackFrame {
 /// work too, but a name is far more useful when trying to diagnose a fault
 /// that only reproduces on real hardware and never under QEMU.
 const EXCEPTION_NAMES: [&str; 32] = [
-    "Divide Error", "Debug", "NMI Interrupt", "Breakpoint", "Overflow", "BOUND Range Exceeded",
-    "Invalid Opcode", "Device Not Available", "Double Fault", "Coprocessor Segment Overrun",
-    "Invalid TSS", "Segment Not Present", "Stack-Segment Fault", "General Protection Fault",
-    "Page Fault", "Reserved", "x87 Floating-Point Error", "Alignment Check", "Machine Check",
-    "SIMD Floating-Point Exception", "Virtualization Exception", "Control Protection Exception",
-    "Reserved", "Reserved", "Reserved", "Reserved", "Reserved", "Reserved",
-    "Hypervisor Injection Exception", "VMM Communication Exception", "Security Exception", "Reserved",
+    "Divide Error",
+    "Debug",
+    "NMI Interrupt",
+    "Breakpoint",
+    "Overflow",
+    "BOUND Range Exceeded",
+    "Invalid Opcode",
+    "Device Not Available",
+    "Double Fault",
+    "Coprocessor Segment Overrun",
+    "Invalid TSS",
+    "Segment Not Present",
+    "Stack-Segment Fault",
+    "General Protection Fault",
+    "Page Fault",
+    "Reserved",
+    "x87 Floating-Point Error",
+    "Alignment Check",
+    "Machine Check",
+    "SIMD Floating-Point Exception",
+    "Virtualization Exception",
+    "Control Protection Exception",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Hypervisor Injection Exception",
+    "VMM Communication Exception",
+    "Security Exception",
+    "Reserved",
 ];
 
 /// Prints what CPU exception fired, its error code (if that vector has

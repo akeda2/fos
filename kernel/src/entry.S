@@ -26,5 +26,8 @@ _start:
 .section .bss
 .align 16
 kernel_stack:
-    .skip 16384
+    # Networking tapes can run nested inside `term net` and borrow this
+    # stack for their fixed packet buffers and TCP state.  Keep enough
+    # headroom for that call chain without introducing a tape-specific ABI.
+    .skip 32768
 kernel_stack_top:

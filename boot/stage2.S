@@ -222,6 +222,50 @@ a20_still_disabled:
 
 load_kernel:
     movb boot_drive + STAGE2_BASE, %dl
+    movw $KERNEL_SECTORS, kernel_remaining + STAGE2_BASE
+    movl $KERNEL_LBA, kernel_packet + STAGE2_BASE + 8
+    movw $0x1000, kernel_packet + STAGE2_BASE + 6
+load_kernel_chunk:
+    movw kernel_remaining + STAGE2_BASE, %cx
+    cmpw $126, %cx
+    jbe load_kernel_final
+
+    # An EDD transfer may not cross a 64 KiB boundary.  Transfer 126
+    # sectors (0xfc00 bytes), then finish the current 64 KiB window with
+    # one or two sectors before moving the segment base to the next
+    # boundary.  The old loader used one 127-sector transfer, which is why
+    # the image builder historically rejected larger kernels.
+    movw $126, kernel_packet + STAGE2_BASE + 2
+    call load_kernel_packet
+    jc load_kernel_done
+    subw $126, kernel_remaining + STAGE2_BASE
+    addl $126, kernel_packet + STAGE2_BASE + 8
+    addw $0xfc0, kernel_packet + STAGE2_BASE + 6
+
+    movw kernel_remaining + STAGE2_BASE, %cx
+    cmpw $2, %cx
+    jae load_kernel_boundary_pair
+    movw %cx, kernel_packet + STAGE2_BASE + 2
+    call load_kernel_packet
+    jmp load_kernel_done
+
+load_kernel_boundary_pair:
+    movw $2, kernel_packet + STAGE2_BASE + 2
+    call load_kernel_packet
+    jc load_kernel_done
+    subw $2, kernel_remaining + STAGE2_BASE
+    addl $2, kernel_packet + STAGE2_BASE + 8
+    addw $0x40, kernel_packet + STAGE2_BASE + 6
+    jmp load_kernel_chunk
+
+load_kernel_final:
+    movw %cx, kernel_packet + STAGE2_BASE + 2
+    call load_kernel_packet
+
+load_kernel_done:
+    ret
+
+load_kernel_packet:
     movw $(kernel_packet + STAGE2_BASE), %si
     movb $0x42, %ah
     int $0x13
@@ -337,6 +381,8 @@ kernel_packet:
     .word KERNEL_SECTORS
     .word 0, 0x1000
     .quad KERNEL_LBA
+kernel_remaining:
+    .word 0
 
 .align 8
 gdt:

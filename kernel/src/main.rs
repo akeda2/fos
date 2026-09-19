@@ -9,13 +9,16 @@ mod boot_info;
 mod console;
 mod cpu;
 mod disk;
+mod e1000;
 mod fosfs;
 mod interrupts;
 mod keyboard;
+mod nic;
 mod pci;
 mod pmem;
 mod rtl8139;
 mod shell;
+mod threecom;
 
 use core::panic::PanicInfo;
 

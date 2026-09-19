@@ -14,8 +14,10 @@ This guide walks through writing, building, loading, and running a Rust
 tape from nothing, assuming no prior fos or embedded-Rust experience. For
 the deeper "why", see AGENTS.md's "Tapes: fixed load address, and writing
 one in Rust", "Tape ABI grows a second callback", "Tape ABI grows
-alloc/free", and "Tape ABI grows again: `read_key` and startup
-arguments" sections -- this document only covers the "how".
+alloc/free", "Tape ABI grows again: `read_key` and startup arguments",
+and "Tape ABI grows kernel-managed networking" sections, plus
+[`NETWORKING.md`](../NETWORKING.md) for the protocol-layer design -- this
+document only covers the "how".
 
 ## 1. What a tape actually is
 
@@ -24,6 +26,9 @@ or sections a loader has to parse -- just raw machine code and data bytes,
 copied verbatim into memory starting at `0x100000` and then jumped into.
 That's why building one means compiling normally, then stripping away
 everything but the raw bytes with `objcopy -O binary`.
+The call uses the kernel's 32 KiB stack, not a private tape stack; keep
+fixed local buffers bounded, especially when a tape is launched from a
+nested `term net` command.
 
 Every tape must export exactly one C-callable entry point named
 `tape_main`, matching one of these signatures:
@@ -43,7 +48,7 @@ extern "C" fn tape_main(
     free: extern "C" fn(u32, u32),
 );
 
-// Tapes that want interactive input and/or a startup argument string.
+// Tapes that want interactive input, startup arguments, and raw Ethernet.
 extern "C" fn tape_main(
     putc: extern "C" fn(u32),
     should_abort: extern "C" fn() -> u32,
@@ -52,6 +57,16 @@ extern "C" fn tape_main(
     read_key: extern "C" fn() -> u32,
     args_ptr: u32,
     args_len: u32,
+    nic_mac: extern "C" fn(u32) -> u32,
+    nic_send: extern "C" fn(u32, u32) -> u32,
+    nic_receive: extern "C" fn(u32, u32) -> u32,
+    nic_max_frame_len: extern "C" fn() -> u32,
+    ticks: extern "C" fn() -> u64,
+    nic_count: extern "C" fn() -> u32,
+    nic_mac_at: extern "C" fn(u32, u32) -> u32,
+    nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
+    nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
+    nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
 );
 ```
 
@@ -75,8 +90,26 @@ extern "C" fn tape_main(
   `"2 + 2"`, or a zero-length slice if nothing followed) -- a simple,
   one-shot way to pass your tape a startup parameter, the way a Unix
   program reads `argv`. See section 7.
+- `nic_mac(out_ptr)` copies the active kernel-managed NIC's six-byte MAC to
+  `out_ptr` and returns non-zero on success. `nic_send(frame_ptr, length)`
+  sends one complete raw Ethernet frame, while `nic_receive(out_ptr,
+  capacity)` copies one received raw frame and returns its length (or zero
+  if none is ready). These callbacks let a tape use Ethernet without
+  owning PCI discovery, DMA buffers, or receive-ring recovery. Call
+  `nic_mac` once first and report failure before entering a receive loop;
+  see `tapes/net-chat/src/main.rs` for a complete shell-compatible example.
+- `nic_max_frame_len()` reports the largest frame the kernel can return.
+  Use it when sizing a receive buffer instead of duplicating the RTL8139
+  constant. `ticks()` returns the kernel's monotonic timer count; protocol
+  timers should compare this value rather than programming PIT hardware from
+  the tape.
+- `nic_count()` reports all initialized interfaces. The `*_at` callbacks use
+  zero-based interface indices for concurrent multi-NIC tapes. The final
+  `nic_set_promiscuous_at(index, enabled)` callback enables or disables
+  receive-all filtering on one interface; a layer-2 bridge needs this so it
+  can receive frames addressed to hosts behind another port.
 
-**Important:** these seven parameters are always in this order, and a
+**Important:** these seventeen parameters are always in this order, and a
 tape may only leave off a *trailing* run of them it doesn't use -- never
 one in the middle. Only wanting `alloc`/`free` but not `should_abort`?
 You must still declare `should_abort` in your signature (even if you
@@ -89,7 +122,7 @@ already sitting on the stack -- but it can only safely ignore them from
 the end, not skip over one in the middle.
 
 That's the entire ABI. No file I/O, no threads, no interrupts of your
-own -- if you need something more than these seven parameters provide,
+own -- if you need something more than these seventeen parameters provide,
 you're probably describing a kernel feature, not a tape.
 
 ## 2. Anatomy of a Rust tape directory
@@ -467,7 +500,49 @@ line-based input (reading a whole line, not one keystroke) is
 deliberately left as something you build yourself out of `read_key`
 in ordinary Rust, rather than a second kernel callback.
 
-## 8. Where to look next
+## 8. Building a networking tape
+
+For protocol applications, keep the same boundary as `tapes/ip-chat/`:
+the kernel owns the RTL8139 and exposes only raw-frame callbacks, while
+`tapes/tape-net/` owns Ethernet, ARP, IPv4, UDP, TCP, and DHCP packet/state
+logic. The tape owns configuration policy, fixed buffers, input, output, and
+the polling loop. Do not duplicate PCI discovery, DMA setup, receive-ring
+management, or NIC reset logic in the tape.
+
+The recommended startup forms are:
+
+```text
+tape run static LOCAL_IP NETMASK GATEWAY [PEER_IP]
+tape run dhcp [PEER_IP]
+```
+
+Static mode is the deterministic choice for QEMU tests. DHCP mode requires a
+real DHCP server on the attached network; the multicast network used by the
+repository's two-guest integration tests does not provide one. A UDP tape
+must resolve the next-hop MAC with ARP, use `ticks()` for bounded polling
+deadlines, and treat datagrams as best-effort: UDP provides no delivery
+acknowledgement or retransmission. `tapes/ip-chat/src/main.rs` is the complete
+reference, and `tapes/test_ip_chat_e2e.py` demonstrates two static peers.
+
+For a stream-oriented application, `tapes/telnet/` is the next example. It
+uses the same static configuration shape with an explicit server endpoint:
+
+```text
+tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT
+```
+
+The tape drives one `tape-net::TcpConnection`, then parses Telnet control
+bytes incrementally as they arrive in TCP segments. Its parser handles
+`IAC`, basic option negotiation, and subnegotiation boundaries while passing
+ordinary application bytes to `putc`. It deliberately treats Unicode as
+UTF-8 bytes rather than decoding code points: this keeps the tape fixed-buffer
+and `no_std` while preserving exactly what a UTF-8 terminal needs to render.
+The host-side `tapes/test_telnet_e2e.py` fixture is a useful pattern for
+testing a TCP tape without root privileges: it speaks ARP, IPv4, TCP, and the
+application protocol over the same multicast Ethernet setup as the other
+tape tests.
+
+## 9. Where to look next
 
 - `tapes/hello-rs/src/main.rs` -- the simplest complete one-shot
   Rust tape (a sieve of Eratosthenes over a small range).
@@ -480,6 +555,19 @@ in ordinary Rust, rather than a second kernel callback.
   demonstrating both `read_key` (an interactive REPL) and startup
   arguments (`tape run 3 4 +`), the section 7 additions above, in a
   complete real tape.
+- `tapes/tape-net/src/lib.rs` -- the shared fixed-buffer networking library,
+  including Ethernet, ARP, IPv4, ICMP, UDP, DHCPv4, and bounded TCP. See
+  `NETWORKING.md` for how an application tape should select `dhcp` or
+  `static IP NETMASK GATEWAY` mode and drive the library with the kernel
+  callbacks.
+- `tapes/ip-chat/src/main.rs` -- a complete UDP-over-IPv4 application tape
+  using static or DHCP configuration, ARP next-hop resolution, line input,
+  and the `/to`/`/broadcast`/`/peers`/`/quit` command policy described above.
+- `tapes/telnet/src/main.rs` -- a complete fixed-buffer TCP/Telnet terminal
+  client, including static endpoint parsing, incremental option negotiation,
+  UTF-8 byte preservation, and terminal input forwarding.
+- `tapes/test_telnet_e2e.py` -- an unprivileged ARP/IPv4/TCP/Telnet fixture
+  that validates the tape's wire behavior and shell recovery.
 - `tapes/primes.S` -- the original hand-written, position-
   independent assembly tape, useful for understanding what Rust's fixed
   load address saves you from having to do by hand.
@@ -490,8 +578,9 @@ in ordinary Rust, rather than a second kernel callback.
   inside one `tape run` call.
 - AGENTS.md's "Tape print callback ABI", "Tapes: fixed load address, and
   writing one in Rust", "Tape ABI grows a second callback", "Tape ABI
-  grows alloc/free", and "Tape ABI grows again: `read_key` and startup
-  arguments" sections -- the full historical and technical reasoning
-  behind every constraint described above.
+  grows alloc/free", "Tape ABI grows again: `read_key` and startup
+  arguments", and "Tape ABI grows kernel-managed networking" sections --
+  the full historical and technical reasoning behind every constraint
+  described above.
 - `kernel/src/shell.rs`'s `tape_run` doc comment -- the authoritative,
-  in-code description of the ABI all seven parameters must satisfy.
+  in-code description of the ABI all seventeen parameters must satisfy.

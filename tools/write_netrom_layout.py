@@ -12,11 +12,10 @@ drift out of sync with the actual kernel size.
 from argparse import ArgumentParser
 from pathlib import Path
 
-# `boot/netrom.S` copies the whole embedded kernel with a single real-mode
-# `rep movsb`, whose count register (CX) is 16 bits -- so, unlike the
-# disk-boot path's 127-sector (~65 KiB) cap enforced across whole sectors,
-# this is a hard per-byte ceiling.
-MAX_KERNEL_BYTES = 65535
+# `boot/netrom.S` copies the embedded kernel with a 32-bit-address-size
+# `rep movsb`. The destination still shares the disk boot path's reserved
+# low-memory window, so do not allow a kernel beyond 0x10000..0x40000.
+MAX_KERNEL_BYTES = 0x40000 - 0x10000
 
 
 def main() -> None:
@@ -27,12 +26,7 @@ def main() -> None:
 
     kernel_size = args.kernel.stat().st_size
     if not 0 < kernel_size <= MAX_KERNEL_BYTES:
-        raise SystemExit(
-            f"kernel must be between 1 and {MAX_KERNEL_BYTES} bytes to be "
-            "embedded in a NIC option ROM (it is copied with a single "
-            "16-bit-counted `rep movsb`); use `make image` instead if it "
-            "has grown past this"
-        )
+        raise SystemExit("kernel must fit in the reserved 0x10000..0x40000 load region")
     content = f".set NETROM_KERNEL_SIZE, {kernel_size}\n"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(content, encoding="ascii")

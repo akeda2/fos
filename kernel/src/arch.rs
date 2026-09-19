@@ -73,7 +73,9 @@ pub mod x86 {
 
     pub fn halt_forever() -> ! {
         loop {
-            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack));
+            }
         }
     }
 
@@ -103,4 +105,3 @@ pub mod x86 {
         halt_forever()
     }
 }
-
