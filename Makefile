@@ -14,8 +14,9 @@ TAPE_LONGMODE_BIN := $(BUILD)/tapes/longmode.bin
 TAPE_LONGMODE_RS_BIN := $(BUILD)/tapes/longmode-rs.bin
 TAPE_CALC_BIN := $(BUILD)/tapes/calc.bin
 TAPE_BEEP_BIN := $(BUILD)/tapes/beep.bin
+TAPE_MORSE_BIN := $(BUILD)/tapes/morse.bin
 
-.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep clean
+.PHONY: all help kernel image run test netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -40,7 +41,7 @@ help:
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
 	@echo "  make test       - build the image, then run the serial-driven QEMU smoke test"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-beep)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-beep + tape-morse)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
@@ -49,6 +50,7 @@ help:
 	@echo "  make tape-longmode-rs - build build/tapes/longmode-rs.bin (same asm shim, but the 64-bit body is Rust)"
 	@echo "  make tape-calc       - build build/tapes/calc.bin (Rust RPN calculator tape; uses read_key/args_ptr/args_len)"
 	@echo "  make tape-beep       - build build/tapes/beep.bin (Rust PC speaker tape; beeps on b via read_key)"
+	@echo "  make tape-morse      - build build/tapes/morse.bin (Rust Morse trainer; plays A-Z/0-9 via read_key)"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -93,7 +95,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -230,6 +232,14 @@ tape-beep:
 	cd tapes/beep && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
 	objcopy -O binary tapes/beep/target/i686-fos/release/beep-tape $(TAPE_BEEP_BIN)
+
+# Builds the "morse" test tape: a 32-bit Rust tape using the seven-argument
+# ABI and `read_key` to turn each A-Z/0-9 input character into a printed
+# Morse representation and a timed PC-speaker sequence.
+tape-morse:
+	cd tapes/morse && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tapes/morse/target/i686-fos/release/morse-tape $(TAPE_MORSE_BIN)
 
 clean:
 	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target

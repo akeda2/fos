@@ -84,7 +84,7 @@ plain `make` (still just `make image`) and does not affect `image`/`run`/
 
 `make all` builds everything this repository knows how to produce in one
 go: the image, `make netrom`, and every test tape (`make tapes`, including
-`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-beep` -- see "Tape
+`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-beep`/`tape-morse` -- see "Tape
 (`tape`)" below). Not needed for ordinary kernel/boot work, for which plain `make`
 (equivalent to `make image`) is enough. `make help` lists every target
 with a one-line description.
@@ -565,6 +565,20 @@ to return to the shell. Build it with `make tape-beep` (producing
 net`, then execute `tape run`. The manual QEMU regression test is
 `tapes/test_beep_e2e.py`; it exercises both remote and local `b` input and
 checks that the remote shell remains usable afterward.
+
+#### Test tape: `tapes/morse/`
+
+A Rust tape that turns each typed letter or digit into Morse code: the
+representation is printed through the normal console callback and played
+through the PC speaker using 440 Hz dots and dashes. `tape run ARGUMENTS`
+processes its raw trailing argument string once and returns; plain `tape run`
+keeps the interactive mode, accepting characters from the local keyboard or
+an active `term net` session. One Morse timing unit is approximately 100 ms,
+based on the kernel's existing 100 Hz PIT channel 0; PIT channel 2 supplies
+the speaker carrier without disturbing the kernel timer. Both modes exit
+cleanly, while interactive mode also exits on F12 (or F4/F6/F7/F8/F10). Build
+it with `make tape-morse` (producing `build/tapes/morse.bin`) and verify both
+modes with `tapes/test_morse_e2e.py`.
 
 #### Test tape: `tapes/longmode.S` / `tapes/longmode-rs/`
 
