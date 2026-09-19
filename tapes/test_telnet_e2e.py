@@ -41,6 +41,16 @@ SERVER_PORT = 2323
 MONITOR_SOCK = Path("/tmp/fos-test-telnet-monitor.sock")
 VGA_DUMP = Path("/tmp/fos-test-telnet-vga.bin")
 ANSI_METADATA = b"\x1b[?2004h"
+ANSI_DEMO = (
+    b"\x1b[2J\x1b[H"
+    b"\x1b[31mRED\x1b[0m"
+    b"\x1b[2;5HXY"
+    b"\x1b[?1049hALT SCREEN\x1b[?1049l"
+)
+ANSI_CPR_QUERY = b"\x1b[6n\x1b[5n"
+ANSI_CPR_RESPONSE = b"\x1b[4;1R\x1b[0n"
+ANSI_DIRTY_STATE = b"\x1b[8m\x1b[?25l\x1b[6 q"
+ANSI_RESET = b"\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?7h\x1b[0 q"
 
 CHAT_ETHERTYPE = bytes((0x88, 0xB6))
 TERM_TAG_HELLO = 0x20
@@ -272,7 +282,11 @@ class RawTelnetServer:
         self.banner_sent = False
         self.echo_sent = False
         self.received = bytearray()
+        self.telnet_pending = bytearray()
+        self.application_received = bytearray()
         self.negotiation_seen = False
+        self.ttype_requested = False
+        self.ttype_reply_seen = False
         self.dhcp_requests = 0
 
     def send(self, frame: bytes) -> None:
@@ -314,7 +328,11 @@ class RawTelnetServer:
             self.server_next = 0x12345679
             self.banner_sent = False
             self.echo_sent = False
+            self.ttype_requested = False
+            self.ttype_reply_seen = False
             self.received.clear()
+            self.telnet_pending.clear()
+            self.application_received.clear()
             response = tcp_frame(
                 self.client_mac,
                 GUEST_IP,
@@ -338,15 +356,45 @@ class RawTelnetServer:
                 return
             self.client_next += len(payload)
             self.received.extend(payload)
+            self.telnet_pending.extend(payload)
+            self.consume_telnet_application()
             if b"\xff" in payload:
                 self.negotiation_seen = True
             self.send_ack()
-            if not self.echo_sent and b"hello \xc3\xa9\r\n" in self.received:
+            if b"\xff\xfb\x18" in self.received and not self.ttype_requested:
+                self.ttype_requested = True
+                self.send_text(b"\xff\xfa\x18\x01\xff\xf0")
+            if b"\xff\xfa\x18\x00xterm\xff\xf0" in self.received:
+                self.ttype_reply_seen = True
+            if not self.echo_sent and b"hello \xc3\xa9\r\n" in self.application_received:
                 self.echo_sent = True
                 self.send_text(b"echo: \xcf\x80 from unix telnetd\r\n")
         if flags & TCP_FIN:
             self.client_next += 1
             self.send_ack()
+
+    def consume_telnet_application(self) -> None:
+        while self.telnet_pending:
+            if self.telnet_pending[0] != 0xFF:
+                self.application_received.append(self.telnet_pending.pop(0))
+                continue
+            if len(self.telnet_pending) < 2:
+                return
+            command = self.telnet_pending[1]
+            if command == 0xFF:
+                self.application_received.append(0xFF)
+                del self.telnet_pending[:2]
+            elif command in (251, 252, 253, 254):
+                if len(self.telnet_pending) < 3:
+                    return
+                del self.telnet_pending[:3]
+            elif command == 250:
+                end = self.telnet_pending.find(b"\xff\xf0", 2)
+                if end < 0:
+                    return
+                del self.telnet_pending[: end + 2]
+            else:
+                del self.telnet_pending[:2]
 
     def send_ack(self) -> None:
         assert self.client_mac is not None
@@ -366,8 +414,11 @@ class RawTelnetServer:
         self.banner_sent = True
         self.send_text(
             b"\xff\xfb\x01\xff\xfd\x03"
+            + b"\xff\xfd\x18"
             + ANSI_METADATA
-            + b"\x1b[2J\x1b[HUnix telnetd \xcf\x80 ready\r\n"
+            + ANSI_DEMO
+            + b"\x1b[3;1HUnix telnetd \xcf\x80 ready\r\n"
+            + ANSI_DIRTY_STATE
         )
 
     def send_text(self, payload: bytes) -> None:
@@ -413,6 +464,14 @@ def read_vga_text() -> str:
     chars = bytes(raw[offset] for offset in range(0, len(raw), 2))
     rows = [chars[row : row + 80].decode("ascii", "replace") for row in range(0, 2000, 80)]
     return "\n".join(row.rstrip() for row in rows)
+
+
+def read_vga_cells() -> list[tuple[str, int]]:
+    if VGA_DUMP.exists():
+        VGA_DUMP.unlink()
+    monitor_command(f'pmemsave 0xb8000 4000 "{VGA_DUMP}"')
+    raw = VGA_DUMP.read_bytes()
+    return [(chr(raw[offset]), raw[offset + 1]) for offset in range(0, 4000, 2)]
 
 
 def main() -> None:
@@ -513,29 +572,54 @@ def main() -> None:
             )
         if "Unix telnetd" not in vga_text:
             raise SystemExit("Telnet server text did not reach the local VGA console")
+        cells = read_vga_cells()
+        if "".join(cells[index][0] for index in range(3)) != "RED":
+            raise SystemExit("ANSI cursor/home or printable output did not render on VGA")
+        if any(cells[index][1] & 0x0f != 4 for index in range(3)):
+            raise SystemExit("ANSI SGR red foreground did not reach VGA attributes")
+        if "".join(cells[80 + index][0] for index in range(4, 6)) != "XY":
+            raise SystemExit("ANSI cursor positioning did not reach VGA")
+        if "ALT SCREEN" in vga_text:
+            raise SystemExit("alternate-screen contents were not restored on VGA")
         if "π".encode() not in output[start:]:
             raise SystemExit(
                 "server UTF-8 banner did not reach the tape output: "
                 + repr(bytes(output[start:]))
             )
+        server.send_text(ANSI_CPR_QUERY)
         print("PASS: Telnet tape completed TCP handshake and preserved UTF-8 server bytes.")
 
         start = len(output)
         send_term(TERM_TAG_DATA, b"hello \xc3\xa9\r\n")
         read_until(b"echo: ", 10, start)
         read_until("π".encode(), 10, start)
-        if b"hello \xc3\xa9\r\n" not in server.received:
+        if ANSI_CPR_RESPONSE not in server.application_received:
             raise SystemExit(
-                f"Telnet server did not receive the UTF-8 terminal input: {server.received!r}"
+                "Telnet tape did not answer CPR/status queries: "
+                f"{server.application_received!r}"
+            )
+        if b"hello \xc3\xa9\r\n" not in server.application_received:
+            raise SystemExit(
+                "Telnet server did not receive the UTF-8 terminal input: "
+                f"{server.application_received!r}"
             )
         if not server.negotiation_seen:
             raise SystemExit("Telnet tape did not answer the server's IAC negotiation")
+        if b"\xff\xfb\x18" not in server.received or b"\xff\xfb\x1f" not in server.received:
+            raise SystemExit("Telnet tape did not advertise terminal type and window size")
+        if not server.ttype_reply_seen:
+            raise SystemExit("Telnet tape did not answer TTYPE SEND with xterm")
         print("PASS: Telnet tape forwarded UTF-8 input and answered Telnet negotiation.")
 
         start = len(output)
         send_term(TERM_TAG_DATA, b"\x1b")
         read_until(b"TELNET ABORTED", 10, start)
         read_until(b"Tape returned; back at the fos shell.", 10, start)
+        if ANSI_RESET not in output[start:]:
+            raise SystemExit(
+                "Telnet tape did not reset the external terminal state after abort: "
+                + repr(bytes(output[start:]))
+            )
         start = len(output)
         send_term(TERM_TAG_DATA, b"tape run dhcp 192.0.2.20 2323\n")
         read_until(b"DHCP lease acquired for 192.0.2.10.", 15, start)

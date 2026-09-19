@@ -34,7 +34,8 @@ TAPE_IMAGE_ARGS := \
 	--file IP-CHAT.BIN $(TAPE_IP_CHAT_BIN) \
 	--file TELNET.BIN $(TAPE_TELNET_BIN) \
 	--file BRIDGE.BIN $(TAPE_BRIDGE_BIN) \
-	--file ROUTER.BIN $(TAPE_ROUTER_BIN)
+	--file ROUTER.BIN $(TAPE_ROUTER_BIN) \
+	--file ROUTER.CFG tapes/router/ROUTER.CFG
 
 .PHONY: all help kernel image run test test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router clean
 

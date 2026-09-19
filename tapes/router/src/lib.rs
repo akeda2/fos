@@ -5,7 +5,7 @@
 //! prefix matching testable without a target-specific build or a NIC.
 #![no_std]
 
-use tape_net::Ipv4Address;
+use tape_net::{DHCP_MAX_DNS_SERVERS, Ipv4Address};
 
 pub const MAX_INTERFACES: usize = 4;
 
@@ -27,6 +27,9 @@ pub struct RouterConfig {
     pub interfaces: [Option<InterfaceConfig>; MAX_INTERFACES],
     pub interface_count: usize,
     pub dhcp: bool,
+    pub dhcp_server: bool,
+    pub dns_servers: [Option<Ipv4Address>; DHCP_MAX_DNS_SERVERS],
+    pub dns_server_count: usize,
     pub default_route: Option<DefaultRoute>,
 }
 
@@ -43,6 +46,9 @@ pub enum ConfigError {
     BadDefaultNic,
     BadGateway,
     DefaultNicNotConfigured,
+    MissingDnsValue,
+    BadDnsServer,
+    TooManyDnsServers,
 }
 
 pub fn parse_ipv4(text: &[u8]) -> Option<Ipv4Address> {
@@ -73,6 +79,33 @@ pub fn parse_ipv4(text: &[u8]) -> Option<Ipv4Address> {
     (component == 4).then_some(Ipv4Address::new(octets))
 }
 
+fn parse_prefix_mask(text: &[u8]) -> Option<Ipv4Address> {
+    let prefix = parse_number(text)?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Some(Ipv4Address::new(mask.to_be_bytes()))
+}
+
+fn parse_cidr(text: &[u8]) -> core::result::Result<(Ipv4Address, Ipv4Address), ConfigError> {
+    let Some(slash) = text.iter().position(|&byte| byte == b'/') else {
+        return Err(ConfigError::BadAddress);
+    };
+    let address = parse_ipv4(&text[..slash]).ok_or(ConfigError::BadAddress)?;
+    let mask = parse_prefix_mask(&text[slash + 1..]).ok_or(ConfigError::BadNetmask)?;
+    Ok((address, mask))
+}
+
+fn parse_netmask(text: &[u8]) -> Option<Ipv4Address> {
+    text.strip_prefix(b"/")
+        .map_or_else(|| parse_ipv4(text), parse_prefix_mask)
+}
+
 fn parse_number(text: &[u8]) -> Option<u32> {
     if text.is_empty() {
         return None;
@@ -91,11 +124,20 @@ fn split_words<'a>(input: &'a [u8], words: &mut [Option<&'a [u8]>]) -> usize {
         while position < input.len() && input[position].is_ascii_whitespace() {
             position += 1;
         }
+        if position < input.len() && input[position] == b'#' {
+            while position < input.len() && input[position] != b'\n' {
+                position += 1;
+            }
+            continue;
+        }
         if position == input.len() {
             break;
         }
         let start = position;
-        while position < input.len() && !input[position].is_ascii_whitespace() {
+        while position < input.len()
+            && !input[position].is_ascii_whitespace()
+            && input[position] != b'#'
+        {
             position += 1;
         }
         if count == words.len() {
@@ -103,28 +145,44 @@ fn split_words<'a>(input: &'a [u8], words: &mut [Option<&'a [u8]>]) -> usize {
         }
         words[count] = Some(&input[start..position]);
         count += 1;
+        if position < input.len() && input[position] == b'#' {
+            while position < input.len() && input[position] != b'\n' {
+                position += 1;
+            }
+        }
     }
     count
 }
 
 fn valid_netmask(mask: Ipv4Address) -> bool {
     let value = u32::from_be_bytes(mask.0);
-    if value == 0 {
-        return false;
-    }
     let inverted = !value;
     inverted & inverted.wrapping_add(1) == 0
 }
 
-/// Parses `[dhcp] NIC IP NETMASK [NIC IP NETMASK ...] [default NIC GATEWAY]`.
+/// Parses `[dhcp] [dhcp-server] [dns SERVER [SERVER]] NIC IP NETMASK
+/// [NIC IP NETMASK ...] [default NIC GATEWAY]`.
 ///
 /// NIC numbers are one-based in the command line, matching `nic list`.
 /// The optional leading `router` word is accepted so both
 /// `tape run 1 ...` and `tape run router 1 ...` are readable.
+/// Interfaces may use either the legacy `NIC IP NETMASK` form, the compact
+/// `NIC IP/PREFIX` form, or `NIC IP /PREFIX`. For example, all of these
+/// describe the same interface: `1 10.0.1.1 255.255.255.0`,
+/// `1 10.0.1.1/24`, and `1 10.0.1.1 /24`.
 ///
 /// `dhcp` reserves NIC 1 (callback index zero) for a DHCP lease.  Static
 /// triples then configure the remaining interfaces.  The optional `default`
 /// suffix selects the one-based egress NIC and its next-hop gateway.
+///
+/// `dhcp-server` enables the built-in DHCP server on every configured
+/// interface except NIC 1. Its pool is derived from each interface subnet.
+///
+/// `dns SERVER [SERVER]` overrides DNS servers learned from upstream DHCP.
+/// Up to two IPv4 DNS server addresses may be supplied.
+///
+/// Whitespace may include newlines, and `#` starts a comment through the end
+/// of its line, so the same grammar can be kept as a readable FOSFS file.
 pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigError> {
     let mut words = [None; 20];
     let count = split_words(input, &mut words);
@@ -138,9 +196,53 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
     if first == count {
         return Err(ConfigError::MissingInterface);
     }
-    let dhcp = words[first] == Some(&b"dhcp"[..]);
-    if dhcp {
-        first += 1;
+    let mut dhcp = false;
+    let mut dhcp_server = false;
+    let mut dns_servers = [None; DHCP_MAX_DNS_SERVERS];
+    let mut dns_server_count = 0usize;
+    loop {
+        match words[first] {
+            Some(b"dhcp") => {
+                dhcp = true;
+                first += 1;
+            }
+            Some(b"dhcp-server") => {
+                dhcp_server = true;
+                first += 1;
+            }
+            Some(b"dns") => {
+                first += 1;
+                let dns = words
+                    .get(first)
+                    .and_then(|word| *word)
+                    .ok_or(ConfigError::MissingDnsValue)?;
+                let address = parse_ipv4(dns)
+                    .filter(|address| *address != Ipv4Address::UNSPECIFIED)
+                    .ok_or(ConfigError::BadDnsServer)?;
+                if dns_server_count == DHCP_MAX_DNS_SERVERS {
+                    return Err(ConfigError::TooManyDnsServers);
+                }
+                dns_servers[dns_server_count] = Some(address);
+                dns_server_count += 1;
+                first += 1;
+                if let Some(next) = words.get(first).and_then(|word| *word) {
+                    if let Some(address) = parse_ipv4(next)
+                        .filter(|address| *address != Ipv4Address::UNSPECIFIED)
+                    {
+                        if dns_server_count == DHCP_MAX_DNS_SERVERS {
+                            return Err(ConfigError::TooManyDnsServers);
+                        }
+                        dns_servers[dns_server_count] = Some(address);
+                        dns_server_count += 1;
+                        first += 1;
+                    }
+                }
+            }
+            _ => break,
+        }
+        if first == count {
+            return Err(ConfigError::MissingInterface);
+        }
     }
 
     let mut static_end = count;
@@ -164,25 +266,37 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         return Err(ConfigError::MissingDefaultRouteValue);
     }
 
-    let static_words = static_end.saturating_sub(first);
-    if static_words % 3 != 0 {
-        return Err(ConfigError::WrongArgumentCount);
-    }
-    let interface_count = static_words / 3;
-    let total_interfaces = interface_count + usize::from(dhcp);
-    if total_interfaces < 2 {
-        return Err(ConfigError::MissingInterface);
-    }
-    if interface_count > MAX_INTERFACES || total_interfaces > MAX_INTERFACES {
-        return Err(ConfigError::TooManyInterfaces);
-    }
     let mut configs: [Option<InterfaceConfig>; MAX_INTERFACES] = [None; MAX_INTERFACES];
-    for index in 0..interface_count {
-        let nic = parse_number(words[first + index * 3].unwrap())
+    let mut interface_count = 0usize;
+    let mut position = first;
+    while position < static_end {
+        if interface_count == MAX_INTERFACES {
+            return Err(ConfigError::TooManyInterfaces);
+        }
+        let nic = parse_number(words[position].ok_or(ConfigError::WrongArgumentCount)?)
             .filter(|number| *number != 0)
             .ok_or(ConfigError::BadNicNumber)?
             - 1;
-        if configs[..index]
+        let address_word = words
+            .get(position + 1)
+            .and_then(|word| *word)
+            .ok_or(ConfigError::WrongArgumentCount)?;
+        let (address, netmask, consumed) = if address_word.contains(&b'/') {
+            let (address, netmask) = parse_cidr(address_word)?;
+            (address, netmask, 2)
+        } else {
+            let address = parse_ipv4(address_word).ok_or(ConfigError::BadAddress)?;
+            let netmask_word = words
+                .get(position + 2)
+                .and_then(|word| *word)
+                .ok_or(ConfigError::WrongArgumentCount)?;
+            let netmask = parse_netmask(netmask_word).ok_or(ConfigError::BadNetmask)?;
+            (address, netmask, 3)
+        };
+        if !valid_netmask(netmask) {
+            return Err(ConfigError::BadNetmask);
+        }
+        if configs[..interface_count]
             .iter()
             .flatten()
             .any(|config| config.nic == nic)
@@ -192,18 +306,20 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         if dhcp && nic == 0 {
             return Err(ConfigError::DuplicateNic);
         }
-        let address =
-            parse_ipv4(words[first + index * 3 + 1].unwrap()).ok_or(ConfigError::BadAddress)?;
-        let netmask =
-            parse_ipv4(words[first + index * 3 + 2].unwrap()).ok_or(ConfigError::BadNetmask)?;
-        if !valid_netmask(netmask) {
-            return Err(ConfigError::BadNetmask);
-        }
-        configs[index] = Some(InterfaceConfig {
+        configs[interface_count] = Some(InterfaceConfig {
             nic,
             address,
             netmask,
         });
+        interface_count += 1;
+        position += consumed;
+    }
+    let total_interfaces = interface_count + usize::from(dhcp);
+    if total_interfaces < 2 {
+        return Err(ConfigError::MissingInterface);
+    }
+    if total_interfaces > MAX_INTERFACES {
+        return Err(ConfigError::TooManyInterfaces);
     }
     if let Some(route) = default_route {
         let configured = (dhcp && route.nic == 0)
@@ -228,6 +344,9 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         interfaces: configs,
         interface_count,
         dhcp,
+        dhcp_server,
+        dns_servers,
+        dns_server_count,
         default_route,
     })
 }
@@ -331,6 +450,34 @@ mod tests {
     }
 
     #[test]
+    fn accepts_cidr_and_prefix_only_netmask_syntax() {
+        let compact = parse_config(b"router 1 10.0.1.1/24 2 10.0.2.1/24").expect("compact CIDR");
+        let separate =
+            parse_config(b"router 1 10.0.1.1 /24 2 10.0.2.1 /24").expect("separate prefix");
+        let dotted = parse_config(b"router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0")
+            .expect("dotted netmask");
+        assert_eq!(compact, dotted);
+        assert_eq!(separate, dotted);
+        assert_eq!(
+            compact.interfaces[0].unwrap().netmask,
+            Ipv4Address::new([255, 255, 255, 0])
+        );
+    }
+
+    #[test]
+    fn accepts_zero_prefix_and_rejects_invalid_cidr() {
+        assert!(parse_config(b"1 10.0.1.1/0 2 10.0.2.1/24").is_ok());
+        assert_eq!(
+            parse_config(b"1 10.0.1.1/33 2 10.0.2.1/24"),
+            Err(ConfigError::BadNetmask)
+        );
+        assert_eq!(
+            parse_config(b"1 10.0.1.1/x 2 10.0.2.1/24"),
+            Err(ConfigError::BadNetmask)
+        );
+    }
+
+    #[test]
     fn parses_dhcp_and_explicit_default_route() {
         let config =
             parse_config(b"router dhcp 2 10.0.2.1 255.255.255.0 default 1 10.0.0.1").unwrap();
@@ -366,6 +513,56 @@ mod tests {
                 config.default_route
             ),
             Some((0, Ipv4Address::new([10, 0, 2, 9])))
+        );
+    }
+
+    #[test]
+    fn parses_dhcp_server_mode_without_reserving_nic_one() {
+        let config = parse_config(b"router dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24").unwrap();
+        assert!(!config.dhcp);
+        assert!(config.dhcp_server);
+        assert_eq!(config.interface_count, 2);
+    }
+
+    #[test]
+    fn parses_dns_override_for_upstream_dhcp() {
+        let config =
+            parse_config(b"router dhcp dhcp-server dns 10.0.1.53 1.1.1.1 2 10.0.2.1/24")
+                .unwrap();
+        assert!(config.dhcp);
+        assert!(config.dhcp_server);
+        assert_eq!(config.dns_server_count, 2);
+        assert_eq!(
+            config.dns_servers,
+            [
+                Some(Ipv4Address::new([10, 0, 1, 53])),
+                Some(Ipv4Address::new([1, 1, 1, 1])),
+            ]
+        );
+        assert_eq!(
+            parse_config(b"router dhcp dns 0.0.0.0 2 10.0.2.1/24"),
+            Err(ConfigError::BadDnsServer)
+        );
+    }
+
+    #[test]
+    fn parses_multiline_configuration_with_comments() {
+        let config = parse_config(
+            b"# Serve the downstream LANs\n\
+              dhcp-server\n\
+              1 10.0.1.1/24 # primary, never serves DHCP\n\
+              2 10.0.2.1/24\n\
+              default 1 10.0.1.254\n",
+        )
+        .unwrap();
+        assert!(config.dhcp_server);
+        assert_eq!(config.interface_count, 2);
+        assert_eq!(
+            config.default_route,
+            Some(DefaultRoute {
+                nic: 0,
+                gateway: Ipv4Address::new([10, 0, 1, 254]),
+            })
         );
     }
 

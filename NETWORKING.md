@@ -118,7 +118,11 @@ tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0
 ```
 
 The interface number is one-based, matching `nic list`; the optional leading
-`router` word is accepted for readability. The tape answers ARP requests for
+`router` word is accepted for readability. Compact CIDR notation is also
+accepted, so the equivalent shorter form is
+`tape run router 1 10.0.1.1/24 2 10.0.2.1/24`; the separate
+`1 10.0.1.1 /24` form is accepted too. Dotted netmasks remain supported.
+The tape answers ARP requests for
 each configured address, learns sender mappings in one bounded ARP cache per
 interface, chooses a directly connected egress with longest-prefix matching,
 decrements IPv4 TTL, recomputes the IPv4 header checksum, and emits the
@@ -154,6 +158,58 @@ unreachable/time-exceeded errors, fragmentation/reassembly, IPv6, and a kernel
 socket layer remain out of scope. `make test-tape-router` runs the
 three-party QEMU/multicast test that verifies ARP, forwarding in both
 directions, and TTL/checksum changes.
+
+The router can also provide a small DHCP server with the optional
+`dhcp-server` word:
+
+```text
+tape run router dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24
+```
+
+Every configured interface except NIC 1 serves clients. Each pool is derived
+from that interface's subnet and excludes the network address, broadcast
+address, and router address. The router allocates one in-memory lease slot for
+every usable address in the subnet, using the tape allocator rather than a
+small fixed lease limit. A configuration can therefore use the complete
+address range of an ordinary subnet; extremely large subnets can still be
+refused if the machine cannot provide the required lease-table memory.
+Leases last seven days, with renewal at 3.5 days and rebinding at 6.125 days,
+and the server handles the normal DISCOVER/OFFER and REQUEST/ACK exchange
+plus DECLINE and RELEASE. Replies include subnet mask, router, broadcast
+address, server identifier, lease time, and renewal timers.
+
+If NIC 1 is configured with `dhcp`, DNS server addresses from the upstream
+lease are copied into downstream DHCP option 6. A `dns SERVER [SERVER]`
+directive can override those values when the upstream interface is static or
+when a specific external resolver should be advertised:
+
+```text
+dhcp
+dhcp-server
+dns 192.168.1.53 1.1.1.1
+2 10.0.2.1/24
+```
+
+The router does not run DNS and does not persist leases. A /31 or /32
+interface has no usable pool and is skipped. This is deliberately a DHCP
+service for the router's directly connected LANs, not a general DHCP relay or
+network-management daemon.
+
+For repeatable setups, router arguments may be stored in an uppercase FOSFS
+file and supplied with `@FILE`:
+
+```text
+# ROUTER.CFG
+dhcp-server
+1 10.0.1.1/24
+2 10.0.2.1/24
+```
+
+Run it with `tape run router @ROUTER.CFG`. The shell reads the file through
+the kernel's FOSFS/BIOS disk path and passes its bytes through the existing
+tape startup-argument ABI; the router tape does not access the disk itself.
+Router configuration accepts newlines and `#` comments, and the file is
+limited to 4096 bytes by the shell's fixed configuration buffer.
 
 ## Kernel Ethernet backends
 
@@ -362,8 +418,11 @@ single-connection terminal client for generic Unix-like Telnet servers. Static
 configuration uses:
 
 ```text
-tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT
+tape run static LOCAL_IP/PREFIX GATEWAY SERVER_IP SERVER_PORT
 ```
+
+Dotted netmasks remain accepted for compatibility, as does the separate
+`LOCAL_IP /PREFIX` form.
 
 DHCP can supply the local IPv4 configuration while the server remains
 explicit:
@@ -377,26 +436,36 @@ TCP connection state machine, and polls the kernel-managed NIC callbacks until
 the session ends. In DHCP mode it drives the bounded
 DISCOVER/OFFER/REQUEST/ACK exchange from `tape-net` before resolving the
 Telnet server. Its application buffer is fixed and caller-owned; there is no
-heap, DNS, multiple connection support, or terminal emulator state.
+heap, DNS, or multiple connection support. It advertises an 80x25 `xterm`
+terminal and sends NAWS window-size information.
 The server port is explicit so the same tape can connect to the conventional
 port 23 or to a non-privileged test service.
 
 The Telnet parser is incremental because TCP can split any Telnet command
-across segments. It handles `IAC IAC` literal bytes, `WILL/WONT/DO/DONT`
-negotiation, and `IAC SB ... IAC SE` subnegotiation. BINARY, ECHO, and
-SUPPRESS-GO-AHEAD are accepted in their appropriate directions; unknown
-options are refused. Application bytes containing `0xff` are doubled before
-transmission, as required by Telnet framing.
+across segments. It handles `IAC IAC` literal bytes,
+`WILL/WONT/DO/DONT` negotiation, terminal-type (`xterm`) and NAWS
+subnegotiation, and `IAC SB ... IAC SE` across TCP boundaries. BINARY, ECHO,
+SUPPRESS-GO-AHEAD, TERMINAL-TYPE, and NAWS are accepted in their appropriate
+directions; unknown options are refused. Application bytes containing `0xff`
+are doubled before transmission, as required by Telnet framing.
 
 Unicode is deliberately not decoded in the tape. UTF-8 is a byte encoding,
 so forwarding the exact bytes preserves server output and local input for an
 attached UTF-8 terminal without adding a character decoder, normalization
 policy, or terminal-width calculation. A generic Telnet server's login
 prompts, credentials, and line endings remain ordinary terminal bytes; this
-client does not implement authentication policy, terminal-type negotiation, or
-NAWS/window-size negotiation. Common ANSI/VT100 control sequences are kept
-intact for serial and `term net` clients but consumed for the local VGA view,
-which cannot interpret terminal escape sequences.
+client does not implement authentication policy or DNS. Common ANSI/VT100 control
+sequences are kept intact for serial and `term net` clients. The local VGA
+callback now interprets a bounded VT100 subset: cursor movement and
+positioning, erase display/line, SGR 16-color attributes plus common
+256-color indexes including hidden text, cursor-shape requests, save/restore
+cursor, scroll regions, cursor visibility, and the alternate screen buffer.
+It answers `CSI 5n` (OK) and `CSI 6n` (1-based cursor position) from the
+kernel-owned cursor state. When a Telnet tape returns, the kernel resets both
+its VGA parser/hardware state and the attached terminal's common modes, so
+programs cannot leave the next `fos>` prompt with stale colors, visibility,
+cursor shape, alternate-screen, bracketed-paste, or wrapping state. Local VGA
+remains fixed-buffer and reports 80x25 to the server.
 
 The focused `tapes/test_telnet_e2e.py` test uses the existing unprivileged
 QEMU `socket,mcast=` Ethernet fixture and a small host-side

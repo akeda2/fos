@@ -6,6 +6,8 @@
 //! Startup syntax:
 //!
 //! ```text
+//! tape run static LOCAL_IP/PREFIX GATEWAY SERVER_IP SERVER_PORT
+//! tape run static LOCAL_IP /PREFIX GATEWAY SERVER_IP SERVER_PORT
 //! tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT
 //! tape run dhcp SERVER_IP SERVER_PORT
 //! ```
@@ -13,22 +15,23 @@
 //! Example for a Telnet server at 192.0.2.20:23:
 //!
 //! ```text
-//! tape run static 192.0.2.10 255.255.255.0 0.0.0.0 192.0.2.20 23
+//! tape run static 192.0.2.10/24 0.0.0.0 192.0.2.20 23
 //! tape run dhcp 192.0.2.20 23
 //! ```
 //!
-//! The tape uses the twelve-argument tape ABI.  The kernel still owns PCI,
-//! DMA, and the active NIC; this tape owns only packet assembly, ARP policy,
-//! DHCP startup, TCP connection state, Telnet byte parsing, and the terminal
-//! loop.
+//! The tape uses the append-only tape ABI. The kernel still owns PCI, DMA,
+//! VGA state, and the active NIC; this tape owns only packet assembly, ARP
+//! policy, DHCP startup, TCP connection state, Telnet parsing, CPR responses,
+//! and the terminal loop.
 //! `tape-net` supplies the fixed-buffer Ethernet/IPv4/TCP codecs and the
 //! bounded single-connection TCP state machine.
 //!
-//! Terminal input is deliberately byte-oriented.  Every byte returned by
+//! Terminal input is deliberately byte-oriented. Every byte returned by
 //! `read_key` is forwarded (including bytes >= 0x80 and UTF-8 continuation
-//! bytes) without decoding it as text.  A literal Telnet IAC (0xff) is
-//! doubled on the wire.  Server data is passed to `putc` byte by byte, so a
-//! UTF-8 sequence remains a sequence of original bytes.
+//! bytes) without decoding it as text; the kernel maps navigation keys to
+//! ordinary ANSI escape sequences before this callback sees them. A literal
+//! Telnet IAC (0xff) is doubled on the wire. Server data is passed to `putc`
+//! byte by byte, so a UTF-8 sequence remains a sequence of original bytes.
 
 use core::cmp::min;
 
@@ -41,8 +44,11 @@ use tape_net::{
 use tape_rt::print_bytes;
 use telnet_tape::{
     MARKER_ABORTED, MARKER_CONNECTED, MARKER_CONNECTING, MARKER_DISCONNECTED, MAX_FRAME_LEN,
-    StartupError, StartupMode, TCP_SEGMENT_CAPACITY, TELNET_IAC, TelnetConfig, TelnetEvent,
-    TelnetParser, build_tcp_frame, encode_application, parse_startup, same_subnet,
+    StartupError, StartupMode, TCP_SEGMENT_CAPACITY, TELNET_BINARY, TELNET_DO, TELNET_IAC,
+    TELNET_NAWS, TELNET_SB, TELNET_SE, TELNET_SUPPRESS_GO_AHEAD, TELNET_TERMINAL_NAME,
+    TELNET_TERMINAL_TYPE, TELNET_TTYPE_IS, TELNET_TTYPE_SEND, TELNET_WILL, TELNET_WINDOW_HEIGHT,
+    TELNET_WINDOW_WIDTH, TelnetConfig, TelnetEvent, TelnetParser, build_tcp_frame,
+    encode_application, parse_startup, same_subnet,
 };
 
 const MAX_INPUT_QUEUE: usize = 2048;
@@ -65,6 +71,7 @@ type NicMac = extern "C" fn(u32) -> u32;
 type NicSend = extern "C" fn(u32, u32) -> u32;
 type NicReceive = extern "C" fn(u32, u32) -> u32;
 type Ticks = extern "C" fn() -> u64;
+type TerminalPosition = extern "C" fn() -> u32;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ConnectResult {
@@ -94,7 +101,170 @@ impl<const N: usize> ByteQueue<N> {
             len: 0,
         }
     }
+}
 
+#[derive(Clone, Copy)]
+enum TerminalOutputState {
+    Normal,
+    Escape,
+    Csi {
+        private: bool,
+        params: [u16; 4],
+        count: usize,
+        value: u16,
+        has_value: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum TerminalQuery {
+    CursorPosition,
+    Status,
+}
+
+struct TerminalOutputParser {
+    state: TerminalOutputState,
+}
+
+impl TerminalOutputParser {
+    const fn new() -> Self {
+        Self {
+            state: TerminalOutputState::Normal,
+        }
+    }
+
+    fn feed(&mut self, byte: u8) -> Option<TerminalQuery> {
+        let state = core::mem::replace(&mut self.state, TerminalOutputState::Normal);
+        match state {
+            TerminalOutputState::Normal => {
+                if byte == 0x1b {
+                    self.state = TerminalOutputState::Escape;
+                }
+            }
+            TerminalOutputState::Escape => {
+                if byte == b'[' {
+                    self.state = TerminalOutputState::Csi {
+                        private: false,
+                        params: [0; 4],
+                        count: 0,
+                        value: 0,
+                        has_value: false,
+                    };
+                } else if byte == 0x1b {
+                    self.state = TerminalOutputState::Escape;
+                }
+            }
+            TerminalOutputState::Csi {
+                private,
+                mut params,
+                mut count,
+                mut value,
+                mut has_value,
+            } => {
+                if byte == b'?' && count == 0 && !has_value {
+                    self.state = TerminalOutputState::Csi {
+                        private: true,
+                        params,
+                        count,
+                        value,
+                        has_value,
+                    };
+                } else if byte.is_ascii_digit() {
+                    has_value = true;
+                    value = value
+                        .saturating_mul(10)
+                        .saturating_add(u16::from(byte - b'0'));
+                    self.state = TerminalOutputState::Csi {
+                        private,
+                        params,
+                        count,
+                        value,
+                        has_value,
+                    };
+                } else if byte == b';' {
+                    if count < params.len() {
+                        params[count] = if has_value { value } else { 0 };
+                        count += 1;
+                    }
+                    self.state = TerminalOutputState::Csi {
+                        private,
+                        params,
+                        count,
+                        value: 0,
+                        has_value: false,
+                    };
+                } else if (0x40..=0x7e).contains(&byte) {
+                    if has_value || count != 0 {
+                        if count < params.len() {
+                            params[count] = if has_value { value } else { 0 };
+                            count += 1;
+                        }
+                    }
+                    let query = if !private && byte == b'n' && count == 1 {
+                        match params[0] {
+                            5 => Some(TerminalQuery::Status),
+                            6 => Some(TerminalQuery::CursorPosition),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    self.state = TerminalOutputState::Normal;
+                    return query;
+                } else if byte == 0x1b {
+                    self.state = TerminalOutputState::Escape;
+                } else {
+                    self.state = TerminalOutputState::Normal;
+                }
+            }
+        }
+        None
+    }
+}
+
+fn push_decimal(queue: &mut ByteQueue<MAX_INPUT_QUEUE>, mut value: u32) -> bool {
+    let mut digits = [0u8; 10];
+    let mut length = 0;
+    if value == 0 {
+        return queue.push(b'0');
+    }
+    while value != 0 {
+        digits[length] = b'0' + (value % 10) as u8;
+        length += 1;
+        value /= 10;
+    }
+    while length != 0 {
+        length -= 1;
+        if !queue.push(digits[length]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn queue_terminal_query_response(
+    queue: &mut ByteQueue<MAX_INPUT_QUEUE>,
+    query: TerminalQuery,
+    terminal_position: TerminalPosition,
+) -> bool {
+    if !queue.push_slice(b"\x1b[") {
+        return false;
+    }
+    match query {
+        TerminalQuery::Status => queue.push_slice(b"0n"),
+        TerminalQuery::CursorPosition => {
+            let packed = terminal_position();
+            let row = packed >> 16;
+            let column = packed & 0xffff;
+            if !push_decimal(queue, row) || !queue.push(b';') || !push_decimal(queue, column) {
+                return false;
+            }
+            queue.push(b'R')
+        }
+    }
+}
+
+impl<const N: usize> ByteQueue<N> {
     fn push(&mut self, byte: u8) -> bool {
         if self.len == N {
             return false;
@@ -161,13 +331,16 @@ fn print_startup_error(putc: Putc, error: StartupError) {
         StartupError::UnknownMode => b"mode must be static or dhcp",
         StartupError::WrongArgumentCount => b"wrong number of startup words",
         StartupError::BadAddress => b"invalid dotted IPv4 address",
+        StartupError::BadNetmask => b"invalid IPv4 prefix or netmask",
         StartupError::BadPort => b"invalid TCP server port",
     };
     print_bytes(putc, b"TELNET ERROR: ");
     print_bytes(putc, detail);
     print_bytes(
         putc,
-        b". Usage: tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT | \
+        b". Usage: tape run static LOCAL_IP/PREFIX GATEWAY SERVER_IP SERVER_PORT | \
+tape run static LOCAL_IP /PREFIX GATEWAY SERVER_IP SERVER_PORT | \
+tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT | \
 tape run dhcp SERVER_IP SERVER_PORT\n",
     );
 }
@@ -443,7 +616,10 @@ fn configure_dhcp(
         }
         let now = (ticks() / 100) as u32;
         if now.wrapping_sub(started) > DHCP_TIMEOUT_SECONDS {
-            print_bytes(putc, b"DHCP failed: no server responded before the timeout.\n");
+            print_bytes(
+                putc,
+                b"DHCP failed: no server responded before the timeout.\n",
+            );
             return DhcpResult::Failed;
         }
         match client.poll(now, &mut payload) {
@@ -480,7 +656,10 @@ fn configure_dhcp(
             });
         }
         if client.state() == DhcpClientState::Failed {
-            print_bytes(putc, b"DHCP failed: no usable offer/acknowledgement arrived.\n");
+            print_bytes(
+                putc,
+                b"DHCP failed: no usable offer/acknowledgement arrived.\n",
+            );
             return DhcpResult::Failed;
         }
 
@@ -560,18 +739,75 @@ fn queue_negotiation(queue: &mut ByteQueue<MAX_INPUT_QUEUE>, event: TelnetEvent)
     let TelnetEvent::Reply { verb, option } = event else {
         return true;
     };
-    queue.push_slice(&[TELNET_IAC, verb, option])
+    if !queue.push_slice(&[TELNET_IAC, verb, option]) {
+        return false;
+    }
+    if verb == TELNET_WILL && option == TELNET_NAWS {
+        queue_naws(queue)
+    } else {
+        true
+    }
+}
+
+fn queue_subnegotiation(queue: &mut ByteQueue<MAX_INPUT_QUEUE>, option: u8, data: &[u8]) -> bool {
+    if !queue.push_slice(&[TELNET_IAC, TELNET_SB, option]) {
+        return false;
+    }
+    for &byte in data {
+        if !queue.push(byte) {
+            return false;
+        }
+        if byte == TELNET_IAC && !queue.push(byte) {
+            return false;
+        }
+    }
+    queue.push_slice(&[TELNET_IAC, TELNET_SE])
+}
+
+fn queue_naws(queue: &mut ByteQueue<MAX_INPUT_QUEUE>) -> bool {
+    queue_subnegotiation(
+        queue,
+        TELNET_NAWS,
+        &[
+            (TELNET_WINDOW_WIDTH >> 8) as u8,
+            TELNET_WINDOW_WIDTH as u8,
+            (TELNET_WINDOW_HEIGHT >> 8) as u8,
+            TELNET_WINDOW_HEIGHT as u8,
+        ],
+    )
+}
+
+fn queue_initial_negotiation(queue: &mut ByteQueue<MAX_INPUT_QUEUE>) -> bool {
+    queue.push_slice(&[
+        TELNET_IAC,
+        TELNET_WILL,
+        TELNET_TERMINAL_TYPE,
+        TELNET_IAC,
+        TELNET_WILL,
+        TELNET_NAWS,
+        TELNET_IAC,
+        TELNET_WILL,
+        TELNET_BINARY,
+        TELNET_IAC,
+        TELNET_DO,
+        TELNET_BINARY,
+        TELNET_IAC,
+        TELNET_DO,
+        TELNET_SUPPRESS_GO_AHEAD,
+    ])
 }
 
 #[allow(clippy::too_many_arguments)]
 fn process_tcp_frame(
     putc: Putc,
+    terminal_position: TerminalPosition,
     nic_send: NicSend,
     config: TelnetConfig,
     own_mac: MacAddress,
     server_mac: MacAddress,
     connection: &mut TcpConnection<TCP_RX_CAPACITY>,
     parser: &mut TelnetParser,
+    terminal_output: &mut TerminalOutputParser,
     queue: &mut ByteQueue<MAX_INPUT_QUEUE>,
     segment_output: &mut [u8; TCP_SEGMENT_CAPACITY],
     app_output: &mut [u8; TCP_RX_CAPACITY],
@@ -606,14 +842,36 @@ fn process_tcp_frame(
     let count = connection.take_received(app_output);
     for &byte in &app_output[..count] {
         match parser.feed(byte) {
-            TelnetEvent::Data(byte) => putc(u32::from(byte)),
+            TelnetEvent::Data(byte) => {
+                let query = terminal_output.feed(byte);
+                putc(u32::from(byte));
+                if let Some(query) = query
+                    && !queue_terminal_query_response(queue, query, terminal_position)
+                {
+                    print_bytes(putc, b"TELNET ERROR: terminal response queue is full\n");
+                    return Some(true);
+                }
+            }
             TelnetEvent::Reply { verb, option } => {
                 if !queue_negotiation(queue, TelnetEvent::Reply { verb, option }) {
                     print_bytes(putc, b"TELNET ERROR: negotiation queue is full\n");
                     return Some(true);
                 }
             }
-            TelnetEvent::None => {}
+            TelnetEvent::Subnegotiation {
+                option,
+                data,
+                length,
+            } if option == TELNET_TERMINAL_TYPE && length == 1 && data[0] == TELNET_TTYPE_SEND => {
+                let mut terminal_type = [0u8; 1 + TELNET_TERMINAL_NAME.len()];
+                terminal_type[0] = TELNET_TTYPE_IS;
+                terminal_type[1..].copy_from_slice(TELNET_TERMINAL_NAME);
+                if !queue_subnegotiation(queue, TELNET_TERMINAL_TYPE, &terminal_type) {
+                    print_bytes(putc, b"TELNET ERROR: negotiation queue is full\n");
+                    return Some(true);
+                }
+            }
+            TelnetEvent::Subnegotiation { .. } | TelnetEvent::None => {}
         }
     }
 
@@ -661,6 +919,7 @@ fn close_connection(
 #[allow(clippy::too_many_arguments)]
 fn run_session(
     putc: Putc,
+    terminal_position: TerminalPosition,
     read_key: ReadKey,
     nic_receive: NicReceive,
     nic_send: NicSend,
@@ -686,6 +945,7 @@ fn run_session(
     let mut segment_output = [0u8; TCP_SEGMENT_CAPACITY];
     let mut app_output = [0u8; TCP_RX_CAPACITY];
     let mut parser = TelnetParser::new();
+    let mut terminal_output = TerminalOutputParser::new();
     let mut tx = [0u8; TCP_SEGMENT_CAPACITY];
 
     let Ok(syn_length) = connection.start_connect(ticks() as u32, &mut segment_output) else {
@@ -737,12 +997,14 @@ fn run_session(
                 } else {
                     let _ = process_tcp_frame(
                         putc,
+                        terminal_position,
                         nic_send,
                         config,
                         own_mac,
                         server_mac,
                         &mut connection,
                         &mut parser,
+                        &mut terminal_output,
                         queue,
                         &mut segment_output,
                         &mut app_output,
@@ -769,6 +1031,19 @@ fn run_session(
         return;
     }
     print_bytes(putc, MARKER_CONNECTED);
+    if !queue_initial_negotiation(queue) {
+        print_bytes(putc, b"TELNET ERROR: negotiation queue is full\n");
+        close_connection(
+            nic_send,
+            config,
+            own_mac,
+            server_mac,
+            &mut connection,
+            &mut segment_output,
+            max_frame_len,
+        );
+        return;
+    }
 
     loop {
         match queue_input(read_key, queue) {
@@ -817,12 +1092,14 @@ fn run_session(
                     );
                 } else if let Some(closed) = process_tcp_frame(
                     putc,
+                    terminal_position,
                     nic_send,
                     config,
                     own_mac,
                     server_mac,
                     &mut connection,
                     &mut parser,
+                    &mut terminal_output,
                     queue,
                     &mut segment_output,
                     &mut app_output,
@@ -874,9 +1151,9 @@ fn run_session(
     }
 }
 
-/// Full twelve-argument ABI entry.  The omitted callbacks are intentionally
-/// named to document that Telnet needs raw NIC access, time, and byte input,
-/// but not heap allocation or the separate `should_abort` callback.
+/// Tape ABI entry. The networking callbacks after `ticks` are declared even
+/// though this single-NIC client does not use them, because the cursor-position
+/// callback is append-only after the multi-NIC ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(
     putc: Putc,
@@ -891,6 +1168,12 @@ pub extern "C" fn tape_main(
     nic_receive: NicReceive,
     nic_max_frame_len: extern "C" fn() -> u32,
     ticks: Ticks,
+    _nic_count: extern "C" fn() -> u32,
+    _nic_mac_at: extern "C" fn(u32, u32) -> u32,
+    _nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
+    _nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
+    _nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
+    terminal_position: TerminalPosition,
 ) {
     let arguments = if args_len == 0 {
         &[][..]
@@ -985,6 +1268,7 @@ pub extern "C" fn tape_main(
 
     run_session(
         putc,
+        terminal_position,
         read_key,
         nic_receive,
         nic_send,

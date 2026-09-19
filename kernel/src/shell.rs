@@ -11,7 +11,8 @@ use crate::nic;
 use crate::pmem;
 use crate::{print, println};
 
-const LINE_CAPACITY: usize = 80;
+const LINE_CAPACITY: usize = 256;
+const TAPE_ARGUMENT_FILE_CAPACITY: usize = 4096;
 const TERM_NET_IDLE_TICKS: u64 = 60 * 100;
 
 pub fn run(info: &BootInfo) -> ! {
@@ -191,7 +192,10 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 (or F4/F6/F7/F8/F10) or /quit to leave)"
                 );
                 println!(
-                    "Tape: tape status (what's loaded), tape run [ARGS...] (execute it, optionally passing arguments)"
+                    "Tape: tape status (what's loaded), tape run [ARGS...] or tape run @FILE (execute it)"
+                );
+                println!(
+                    "      tape run router @CONFIG_FILE (read router arguments from an uppercase FOSFS file)"
                 );
                 println!(
                     "      tape load disk NAME (load a flat multi-sector FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
@@ -864,10 +868,11 @@ const TEST_PAYLOAD: &[u8] = b"fos raw ethernet test frame";
 /// hex-dumps it if one arrives; `nic sniff` runs a continuous
 /// promiscuous-mode capture, printing every frame seen until F12 (or
 /// F4/F6/F7/F8/F10) stops it; `nic discover` broadcasts a `chat` discovery
-/// probe and lists whoever answers; `nic peers` shows the peer list
-/// discovered so far without sending anything. These shell subcommands
-/// intentionally stay at the raw-Ethernet layer; ARP/IPv4/UDP/TCP/DHCP live
-/// in networking tapes and the shared `tapes/tape-net` library instead.
+/// probe through every initialized interface and lists whoever answers;
+/// `nic peers` shows the peer list discovered so far without sending
+/// anything. These shell subcommands intentionally stay at the raw-Ethernet
+/// layer; ARP/IPv4/UDP/TCP/DHCP live in networking tapes and the shared
+/// `tapes/tape-net` library instead.
 fn nic_command(arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
     match subcommand {
@@ -934,7 +939,11 @@ fn nic_list() {
         let mac = nic.mac_address();
         println!(
             "{}NIC {}: {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            if index == nic::active_index() { '*' } else { ' ' },
+            if index == nic::active_index() {
+                '*'
+            } else {
+                ' '
+            },
             index + 1,
             nic.driver_name(),
             mac[0],
@@ -1138,6 +1147,14 @@ const TAPE_CHUNK_LEN: usize = 1024;
 /// `tape_load_net` prints a progress line while a transfer is in flight.
 const TAPE_STATUS_TICKS: u64 = 200; // ~2 seconds.
 
+/// Spacing used by the in-kernel `tape send` producer. The receiver is a
+/// polling-only NIC driver with a finite ring, so waiting one PIT tick
+/// between frames keeps a real RTL8139 from overrunning that ring in the
+/// same way `tools/send_tape.py --delay 0.003` does. This is deliberately
+/// conservative because the PIT is only 100 Hz; a future acknowledged
+/// transfer protocol could use a tighter, receiver-driven window instead.
+const TAPE_SEND_PACE_TICKS: u64 = 1; // ~10 ms.
+
 /// `term net`'s wire protocol, sharing `CHAT_ETHERTYPE` rather than
 /// inventing a fourth reserved ethertype: a client says hello with
 /// `TERM_TAG_HELLO` (no payload) to open a session, either side then sends
@@ -1220,23 +1237,35 @@ fn print_peers() {
 /// spammed.
 const DISCOVER_REBROADCAST_TICKS: u64 = 300;
 
-/// Broadcasts a discovery probe (`CHAT_TAG_DISCOVER_REQUEST`), re-sending it
-/// every `DISCOVER_REBROADCAST_TICKS` so machines that only start `chat` or
-/// `nic discover` partway through are still found, and keeps listening --
-/// printing each newly-seen peer as it replies -- until F12 (or F4/F6/F7/F8/F10) stops it, the
-/// same convention `nic sniff`/`term`/`chat` all use. There is no
-/// interrupt-driven network service in this kernel (see "Current
-/// boundaries" in `AGENTS.md`), so a reply only ever comes from a fos
-/// machine whose own `chat` or `nic discover` happens to be running and
-/// polling its card while this loop is open -- it only finds who is
-/// listening *right now*, not who exists on the network.
+/// Broadcasts a discovery probe (`CHAT_TAG_DISCOVER_REQUEST`) through every
+/// initialized interface, re-sending it every `DISCOVER_REBROADCAST_TICKS` so
+/// machines that only start `chat` or `nic discover` partway through are still
+/// found, and keeps listening on every interface -- printing each newly-seen
+/// peer as it replies -- until F12 (or F4/F6/F7/F8/F10) stops it, the same
+/// convention `nic sniff`/`term`/`chat` all use. Replies to incoming probes
+/// go back through the interface where the probe arrived. There is no
+/// interrupt-driven network service in this kernel (see "Current boundaries"
+/// in `AGENTS.md`), so a reply only ever comes from a fos machine whose own
+/// `chat` or `nic discover` happens to be running and polling its card while
+/// this loop is open -- it only finds who is listening *right now*, not who
+/// exists on the network.
 fn nic_discover() {
-    let Some(nic) = nic_or_report() else { return };
-    let source = nic.mac_address();
+    let count = nic::count();
+    if count == 0 {
+        nic_status();
+        return;
+    }
     println!(
-        "Broadcasting a discovery probe every few seconds; press F12 (or F4/F6/F7/F8/F10) to stop and see the list."
+        "Broadcasting a discovery probe on {} interface(s) every few seconds; press F12 (or F4/F6/F7/F8/F10) to stop and see the list.",
+        count
     );
-    send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
+    for index in 0..count {
+        let Some(nic) = nic::get_at(index) else {
+            continue;
+        };
+        let source = nic.mac_address();
+        send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
+    }
     let mut next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
 
     let mut buffer = [0u8; nic::MAX_FRAME_LEN];
@@ -1249,40 +1278,48 @@ fn nic_discover() {
             break;
         }
         if interrupts::ticks() >= next_broadcast {
-            send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
+            for index in 0..count {
+                let Some(nic) = nic::get_at(index) else {
+                    continue;
+                };
+                let source = nic.mac_address();
+                send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
+            }
             next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
         }
-        let Some(length) = nic.receive(&mut buffer) else {
-            continue;
-        };
-        let frame = &buffer[..length];
-        if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
-            continue;
-        }
-        let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
-        match frame[14] {
-            CHAT_TAG_DISCOVER_REPLY => {
-                if remember_peer(peer_mac) {
-                    discovered += 1;
-                    println!("Found peer #{discovered}: {}", Mac(&peer_mac));
-                }
+        for index in 0..count {
+            let Some(nic) = nic::get_at(index) else {
+                continue;
+            };
+            let source = nic.mac_address();
+            let Some(length) = nic.receive(&mut buffer) else {
+                continue;
+            };
+            let frame = &buffer[..length];
+            if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+                continue;
             }
-            // A peer's own probe reaching us proves it's listening too, so
-            // it belongs in our list exactly as if it had replied to ours
-            // -- and, symmetrically to `chat`'s own handling of this same
-            // tag (`handle_incoming_chat_frame`), we must answer it
-            // ourselves, or two machines that only ever run `nic discover`
-            // (neither one running `chat`) would broadcast requests at
-            // each other forever without either side ever sending the
-            // reply the other is waiting for.
-            CHAT_TAG_DISCOVER_REQUEST => {
-                if remember_peer(peer_mac) {
-                    discovered += 1;
-                    println!("Found peer #{discovered}: {}", Mac(&peer_mac));
+            let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+            match frame[14] {
+                CHAT_TAG_DISCOVER_REPLY => {
+                    if remember_peer(peer_mac) {
+                        discovered += 1;
+                        println!("Found peer #{discovered}: {}", Mac(&peer_mac));
+                    }
                 }
-                send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY);
+                // A peer's own probe reaching us proves it's listening too,
+                // so it belongs in our list exactly as if it had replied to
+                // ours. Reply on the same interface so discovery works across
+                // isolated networks attached to different local NICs.
+                CHAT_TAG_DISCOVER_REQUEST => {
+                    if remember_peer(peer_mac) {
+                        discovered += 1;
+                        println!("Found peer #{discovered}: {}", Mac(&peer_mac));
+                    }
+                    send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY);
+                }
+                _ => continue,
             }
-            _ => continue,
         }
     }
 
@@ -1538,7 +1575,7 @@ fn tape_command(info: &BootInfo, arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
     match subcommand {
         b"" | b"status" if remainder.is_empty() => tape_status(),
-        b"run" => tape_run(remainder),
+        b"run" => tape_run(info, remainder),
         b"load" => tape_load_command(info, remainder),
         b"send" => tape_send_command(info, remainder),
         _ => println!(
@@ -1651,7 +1688,10 @@ fn load_elf32_image(address: u32, length: u32) -> Result<Option<u32>, &'static s
         let virtual_address = elf_u32(image, header + 8)?;
         let file_size = elf_u32(image, header + 16)?;
         let memory_size = elf_u32(image, header + 20)?;
-        if file_offset.checked_add(file_size).ok_or("ELF32 segment overflows")? > length
+        if file_offset
+            .checked_add(file_size)
+            .ok_or("ELF32 segment overflows")?
+            > length
             || file_size > memory_size
             || virtual_address < pmem::TAPE_BASE
             || virtual_address
@@ -1735,7 +1775,8 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 /// -> u32, nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
 /// nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
 /// nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32)` (cdecl,
-/// seventeen arguments), in that fixed order -- a tape is free
+/// eighteen arguments), followed by append-only callbacks -- in that fixed
+/// order. A tape is free
 /// to declare only a leading prefix of these parameters (as
 /// `primes.S`/`hello-rs` declare only `putc`, and `vga-colors` declares
 /// only `putc`/`should_abort`) and ignore the rest; under cdecl this
@@ -1745,6 +1786,10 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 /// below) must still declare every parameter before it, purely to keep
 /// each argument's stack position lined up correctly -- see
 /// `docs/rust-tapes-for-dummies.md` for a worked example.
+/// - `console::terminal_position` is the next append-only callback. It returns
+///   the current 1-based ANSI cursor row and column packed into one `u32`, so
+///   a terminal tape can answer `CSI 6n` cursor-position requests while the
+///   kernel remains the owner of VGA state.
 ///
 /// - `console::print_byte` is passed as the first argument, giving a tape
 ///   a narrow, explicit way to call back into the kernel's own console
@@ -2327,10 +2372,77 @@ extern "C" fn tape_free(address: u32, bytes: u32) {
     pmem::free_big(address, chunks);
 }
 
-fn tape_run(arguments: &[u8]) {
+enum TapeArgumentSource<'a> {
+    Direct(&'a [u8]),
+    File(&'a [u8]),
+    Invalid,
+}
+
+fn tape_argument_source(arguments: &[u8]) -> TapeArgumentSource<'_> {
+    let (first, remainder) = take_word(arguments);
+    let (candidate, trailing) = if first == b"router" {
+        take_word(remainder)
+    } else {
+        (first, remainder)
+    };
+    if !candidate.starts_with(b"@") {
+        return TapeArgumentSource::Direct(arguments);
+    }
+    if candidate.len() == 1 || !trailing.is_empty() {
+        return TapeArgumentSource::Invalid;
+    }
+    TapeArgumentSource::File(&candidate[1..])
+}
+
+fn tape_run(info: &BootInfo, arguments: &[u8]) {
     let Some((address, length)) = tape_get() else {
         println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
         return;
+    };
+    let mut file_buffer = [0u8; TAPE_ARGUMENT_FILE_CAPACITY];
+    let arguments = match tape_argument_source(arguments) {
+        TapeArgumentSource::Direct(arguments) => arguments,
+        TapeArgumentSource::Invalid => {
+            println!("Usage: tape run [ARGS...] or tape run router @CONFIG_FILE");
+            return;
+        }
+        TapeArgumentSource::File(name) => {
+            let length = match fosfs::file_length(info, name) {
+                Ok(Some(length)) => length,
+                Ok(None) => {
+                    println!(
+                        "Router configuration file '{}' was not found.",
+                        core::str::from_utf8(name).unwrap_or("?")
+                    );
+                    return;
+                }
+                Err(error) => {
+                    println!("FOSFS disk error while reading router configuration: {error:?}");
+                    return;
+                }
+            };
+            if length > TAPE_ARGUMENT_FILE_CAPACITY as u64 {
+                println!(
+                    "Router configuration file is too large: {length} bytes (maximum {TAPE_ARGUMENT_FILE_CAPACITY})."
+                );
+                return;
+            }
+            let length = length as usize;
+            match fosfs::read(info, name, &mut file_buffer[..length]) {
+                Ok(Some(_)) => &file_buffer[..length],
+                Ok(None) => {
+                    println!(
+                        "Router configuration file '{}' was not found.",
+                        core::str::from_utf8(name).unwrap_or("?")
+                    );
+                    return;
+                }
+                Err(error) => {
+                    println!("FOSFS disk error while reading router configuration: {error:?}");
+                    return;
+                }
+            }
+        }
     };
     println!(
         "Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery."
@@ -2364,6 +2476,7 @@ fn tape_run(arguments: &[u8]) {
         nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
         nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
         nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
+        terminal_position: extern "C" fn() -> u32,
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -2385,6 +2498,7 @@ fn tape_run(arguments: &[u8]) {
         tape_nic_send_at,
         tape_nic_receive_at,
         tape_nic_set_promiscuous_at,
+        console::terminal_position,
     );
     console::reset_terminal_output();
     println!("Tape returned; back at the fos shell.");
@@ -2723,6 +2837,7 @@ fn tape_send(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8
         println!("Transmit failed (card reported an error, or timed out); tape not sent.");
         return;
     }
+    pace_tape_send();
 
     let mut data_frame = [0u8; 15 + 4 + TAPE_CHUNK_LEN];
     data_frame[0..6].copy_from_slice(destination);
@@ -2738,6 +2853,7 @@ fn tape_send(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8
             );
             return;
         }
+        pace_tape_send();
     }
 
     let mut stop_frame = [0u8; 15];
@@ -2753,6 +2869,13 @@ fn tape_send(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8
     }
 
     println!("Sent {} byte(s) to {}.", data.len(), Mac(destination));
+}
+
+fn pace_tape_send() {
+    let start = interrupts::ticks();
+    while interrupts::ticks().wrapping_sub(start) < TAPE_SEND_PACE_TICKS {
+        core::hint::spin_loop();
+    }
 }
 
 /// Displays a MAC address as `aa:bb:cc:dd:ee:ff` wherever `println!`/`print!`

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""End-to-end test for the static IPv4 router tape.
+"""End-to-end test for the IPv4 router tape.
 
 One fos guest has two Intel e1000 interfaces attached to two isolated
 multicast Ethernet segments.  Host-injected ARP requests teach the router
 both neighboring MAC addresses; IPv4 frames then have to cross the guest with
-the egress Ethernet address changed and the IPv4 TTL decremented.
+the egress Ethernet address changed and the IPv4 TTL decremented. The test
+also supplies an upstream DHCP lease, verifies DNS propagation, and confirms
+that more than the old small fixed lease count can be allocated downstream.
 """
 
 import os
@@ -31,14 +33,17 @@ TERM_TAG_DATA = 0x21
 TERM_TAG_BYE = 0x22
 ROUTER_MAC_A = bytes.fromhex("525400cafe01")
 ROUTER_MAC_B = bytes.fromhex("525400cafe02")
+UPSTREAM_MAC = bytes.fromhex("525400cafe06")
 LEFT_MAC = bytes.fromhex("525400cafe03")
 RIGHT_MAC = bytes.fromhex("525400cafe04")
 TERM_CLIENT_MAC = bytes.fromhex("02deadbeef41")
 TAPE_SENDER_MAC = bytes.fromhex("02deadbeef42")
 LEFT_IP = bytes((10, 0, 1, 2))
 ROUTER_IP_A = bytes((10, 0, 1, 1))
-RIGHT_IP = bytes((10, 0, 2, 2))
-ROUTER_IP_B = bytes((10, 0, 2, 1))
+RIGHT_IP = bytes((10, 0, 15, 2))
+ROUTER_IP_B = bytes((10, 0, 15, 1))
+DHCP_CLIENT_MAC = bytes.fromhex("525400cafe05")
+DHCP_XID = 0x12345678
 
 
 class McastSocket:
@@ -101,6 +106,184 @@ def arp_request(source_mac: bytes, source_ip: bytes, target_ip: bytes) -> bytes:
         target_ip,
     )
     return ethernet_frame(b"\xff" * 6, source_mac, 0x0806, payload)
+
+
+def udp_datagram(source_port: int, destination_port: int, payload: bytes) -> bytes:
+    return struct.pack("!HHHH", source_port, destination_port, 8 + len(payload), 0) + payload
+
+
+def dhcp_packet(
+    message_type: int,
+    client_mac: bytes,
+    requested_ip: bytes | None = None,
+    server_identifier: bytes | None = None,
+) -> bytes:
+    header = struct.pack(
+        "!BBBBIHH4s4s4s4s16s64s128s",
+        1,
+        1,
+        6,
+        0,
+        DHCP_XID,
+        0,
+        0x8000,
+        b"\0" * 4,
+        b"\0" * 4,
+        b"\0" * 4,
+        b"\0" * 4,
+        client_mac + b"\0" * 10,
+        b"\0" * 64,
+        b"\0" * 128,
+    )
+    options = bytearray((99, 130, 83, 99, 53, 1, message_type))
+    if requested_ip is not None:
+        options.extend((50, 4))
+        options.extend(requested_ip)
+    if server_identifier is not None:
+        options.extend((54, 4))
+        options.extend(server_identifier)
+    options.append(255)
+    return header + bytes(options)
+
+
+def dhcp_frame(
+    message_type: int,
+    client_mac: bytes,
+    requested_ip: bytes | None = None,
+    server_identifier: bytes | None = None,
+) -> bytes:
+    payload = udp_datagram(
+        68,
+        67,
+        dhcp_packet(message_type, client_mac, requested_ip, server_identifier),
+    )
+    return ipv4_frame(
+        b"\xff" * 6,
+        client_mac,
+        b"\0" * 4,
+        b"\xff" * 4,
+        payload,
+    )
+
+
+def dhcp_server_frame(
+    message_type: int,
+    client_mac: bytes,
+    transaction_id: int,
+    offered_ip: bytes,
+    server_ip: bytes,
+    router_ip: bytes,
+    dns_ip: bytes,
+) -> bytes:
+    header = struct.pack(
+        "!BBBBIHH4s4s4s4s16s64s128s",
+        2,
+        1,
+        6,
+        0,
+        transaction_id,
+        0,
+        0x8000,
+        b"\0" * 4,
+        offered_ip,
+        server_ip,
+        b"\0" * 4,
+        client_mac + b"\0" * 10,
+        b"\0" * 64,
+        b"\0" * 128,
+    )
+    options = bytearray((99, 130, 83, 99))
+
+    def option(code: int, value: bytes) -> None:
+        options.extend((code, len(value)))
+        options.extend(value)
+
+    option(53, bytes((message_type,)))
+    option(54, server_ip)
+    option(1, bytes((255, 255, 255, 0)))
+    option(3, router_ip)
+    option(6, dns_ip)
+    option(28, bytes((10, 0, 1, 255)))
+    option(51, struct.pack("!I", 3600))
+    option(58, struct.pack("!I", 1800))
+    option(59, struct.pack("!I", 3150))
+    options.append(255)
+    payload = header + bytes(options)
+    return ipv4_frame(
+        b"\xff" * 6,
+        UPSTREAM_MAC,
+        server_ip,
+        b"\xff" * 4,
+        udp_datagram(67, 68, payload),
+    )
+
+
+def dhcp_message_type(frame: bytes) -> bytes | None:
+    ip_header_length = (frame[14] & 0x0F) * 4
+    payload = frame[14 + ip_header_length + 8 :]
+    if len(payload) < 240 or payload[236:240] != b"\x63\x82\x53\x63":
+        return None
+    offset = 240
+    while offset < len(payload):
+        code = payload[offset]
+        offset += 1
+        if code == 255:
+            return None
+        if code == 0:
+            continue
+        if offset >= len(payload):
+            return None
+        length = payload[offset]
+        offset += 1
+        if offset + length > len(payload):
+            return None
+        if code == 53:
+            return payload[offset : offset + length]
+        offset += length
+    return None
+
+
+def dhcp_client_mac(frame: bytes) -> bytes:
+    ip_header_length = (frame[14] & 0x0F) * 4
+    payload = frame[14 + ip_header_length + 8 :]
+    return payload[28:34]
+
+
+def dhcp_transaction_id(frame: bytes) -> int:
+    ip_header_length = (frame[14] & 0x0F) * 4
+    payload = frame[14 + ip_header_length + 8 :]
+    return int.from_bytes(payload[4:8], "big")
+
+
+def is_upstream_discover(frame: bytes) -> bool:
+    return (
+        frame[6:12] == ROUTER_MAC_A
+        and dhcp_message_type(frame) == b"\x01"
+        and dhcp_client_mac(frame) == ROUTER_MAC_A
+    )
+
+
+def parse_dhcp(frame: bytes) -> tuple[bytes, dict[int, bytes]]:
+    assert frame[12:14] == b"\x08\x00", frame.hex()
+    ip_header_length = (frame[14] & 0x0F) * 4
+    udp_start = 14 + ip_header_length
+    assert frame[udp_start : udp_start + 4] == struct.pack("!HH", 67, 68)
+    payload = frame[udp_start + 8 :]
+    assert payload[236:240] == b"\x63\x82\x53\x63"
+    options = {}
+    offset = 240
+    while offset < len(payload):
+        code = payload[offset]
+        offset += 1
+        if code == 255:
+            break
+        if code == 0:
+            continue
+        length = payload[offset]
+        offset += 1
+        options[code] = payload[offset : offset + length]
+        offset += length
+    return payload[16:20], options
 
 
 def ipv4_frame(
@@ -225,12 +408,102 @@ def main() -> None:
         read_until(b"Tape loaded", 30, load_start)
         read_until(b"fos> ", 5, load_start)
 
-        run_start = send_command(
-            b"tape run router 1 10.0.1.1 255.255.255.0 "
-            b"2 10.0.2.1 255.255.255.0"
+        run_start = send_command(b"tape run router @ROUTER.CFG")
+        upstream_discover = wait_for_frame(
+            links["a"],
+            is_upstream_discover,
+            10,
+            "an upstream DHCP discover from NIC 1",
+        )
+        assert upstream_discover[0:6] == b"\xff" * 6
+        transaction_id = dhcp_transaction_id(upstream_discover)
+        links["a"].send(
+            dhcp_server_frame(
+                2,
+                ROUTER_MAC_A,
+                transaction_id,
+                ROUTER_IP_A,
+                bytes((10, 0, 1, 254)),
+                bytes((10, 0, 1, 254)),
+                bytes((10, 0, 1, 53)),
+            )
+        )
+        wait_for_frame(
+            links["a"],
+            lambda frame: frame[6:12] == ROUTER_MAC_A
+            and dhcp_message_type(frame) == b"\x03"
+            and dhcp_client_mac(frame) == ROUTER_MAC_A,
+            10,
+            "an upstream DHCP request from NIC 1",
+        )
+        links["a"].send(
+            dhcp_server_frame(
+                5,
+                ROUTER_MAC_A,
+                transaction_id,
+                ROUTER_IP_A,
+                bytes((10, 0, 1, 254)),
+                bytes((10, 0, 1, 254)),
+                bytes((10, 0, 1, 53)),
+            )
         )
         read_until(b"fos router: 2 interface(s)", 10, run_start)
-        print("PASS: router tape started with two configured e1000 interfaces.")
+        read_until(b"DHCP server on NIC 2", 10, run_start)
+        print("PASS: router tape started with DHCP service on the secondary NIC.")
+
+        links["b"].send(dhcp_frame(1, DHCP_CLIENT_MAC))
+        offer = wait_for_frame(
+            links["b"],
+            lambda frame: frame[0:6] == b"\xff" * 6
+            and frame[6:12] == ROUTER_MAC_B
+            and frame[12:14] == b"\x08\x00"
+            and parse_dhcp(frame)[1].get(53) == b"\x02",
+            10,
+            "a DHCP offer on segment B",
+        )
+        offered_ip, offer_options = parse_dhcp(offer)
+        assert offered_ip == bytes((10, 0, 15, 2)), offered_ip
+        assert offer_options[1] == bytes((255, 255, 255, 0))
+        assert offer_options[3] == ROUTER_IP_B
+        assert offer_options[28] == bytes((10, 0, 15, 255))
+        assert offer_options[6] == bytes((10, 0, 1, 53))
+
+        links["b"].send(dhcp_frame(3, DHCP_CLIENT_MAC, offered_ip, ROUTER_IP_B))
+        ack = wait_for_frame(
+            links["b"],
+            lambda frame: frame[0:6] == b"\xff" * 6
+            and frame[6:12] == ROUTER_MAC_B
+            and frame[12:14] == b"\x08\x00"
+            and parse_dhcp(frame)[1].get(53) == b"\x05",
+            10,
+            "a DHCP acknowledgement on segment B",
+        )
+        acknowledged_ip, _ = parse_dhcp(ack)
+        assert acknowledged_ip == offered_ip
+        print("PASS: DHCP server completed DISCOVER/OFFER/REQUEST/ACK.")
+
+        for index in range(17):
+            client_mac = bytes((0x52, 0x54, 0x00, 0xca, 0xfe, 0x20 + index))
+            links["b"].send(dhcp_frame(1, client_mac))
+            extra_offer = wait_for_frame(
+                links["b"],
+                lambda frame, client_mac=client_mac: frame[6:12] == ROUTER_MAC_B
+                and dhcp_message_type(frame) == b"\x02"
+                and dhcp_client_mac(frame) == client_mac,
+                10,
+                f"DHCP offer {index + 1} beyond the old lease limit",
+            )
+            extra_ip, _ = parse_dhcp(extra_offer)
+            links["b"].send(dhcp_frame(3, client_mac, extra_ip, ROUTER_IP_B))
+            wait_for_frame(
+                links["b"],
+                lambda frame, client_mac=client_mac: frame[6:12] == ROUTER_MAC_B
+                and dhcp_message_type(frame) == b"\x05"
+                and dhcp_client_mac(frame) == client_mac,
+                10,
+                f"DHCP acknowledgement {index + 1} beyond the old lease limit",
+            )
+        print("PASS: DHCP server allocated more than 16 simultaneous leases.")
 
         links["a"].send(arp_request(LEFT_MAC, LEFT_IP, ROUTER_IP_A))
         wait_for_frame(

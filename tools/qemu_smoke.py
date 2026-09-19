@@ -58,6 +58,7 @@ EXPECTED_COMMON = (
     b"FOSFS partition: LBA 4096 + 28639 sectors",
     b"FOSFS3",
     b"README.TXT  63 bytes, 1 sector(s)",
+    b"ROUTER.CFG",
     b"PRIMES.BIN",
     b"HELLO-RS.BIN",
     b"VGA-COLORS.BIN",

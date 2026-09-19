@@ -3,6 +3,8 @@
 //! The tape accepts either an explicit static IPv4 configuration or DHCP:
 //!
 //! ```text
+//! tape run static LOCAL_IP/PREFIX GATEWAY SERVER_IP SERVER_PORT
+//! tape run static LOCAL_IP /PREFIX GATEWAY SERVER_IP SERVER_PORT
 //! tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT
 //! tape run dhcp SERVER_IP SERVER_PORT
 //! ```
@@ -10,8 +12,8 @@
 //! `SERVER_PORT` is decimal and must be 1..=65535.  Use `0.0.0.0` for
 //! `GATEWAY` when the server is on the local subnet.  DHCP supplies the local
 //! address, netmask, and gateway, while the server address and port are
-//! always supplied by the caller.  There is no DNS, terminal-type
-//! negotiation, or heap allocation in this small teaching client.
+//! always supplied by the caller.  The client advertises an 80x25 `xterm`
+//! terminal and has no DNS or heap allocation.
 //!
 //! Telnet's byte-oriented protocol is kept separate from TCP.  `TelnetParser`
 //! consumes server bytes one at a time, emits application bytes unchanged,
@@ -37,6 +39,14 @@ pub const TELNET_SE: u8 = 240;
 pub const TELNET_BINARY: u8 = 0;
 pub const TELNET_ECHO: u8 = 1;
 pub const TELNET_SUPPRESS_GO_AHEAD: u8 = 3;
+pub const TELNET_TERMINAL_TYPE: u8 = 24;
+pub const TELNET_NAWS: u8 = 31;
+pub const TELNET_TTYPE_IS: u8 = 0;
+pub const TELNET_TTYPE_SEND: u8 = 1;
+pub const TELNET_WINDOW_WIDTH: u16 = 80;
+pub const TELNET_WINDOW_HEIGHT: u16 = 25;
+pub const TELNET_TERMINAL_NAME: &[u8] = b"xterm";
+const MAX_SUBNEGOTIATION: usize = 32;
 pub const MARKER_CONNECTING: &[u8] = b"TELNET CONNECTING\n";
 pub const MARKER_CONNECTED: &[u8] = b"TELNET CONNECTED\n";
 pub const MARKER_DISCONNECTED: &[u8] = b"TELNET DISCONNECTED\n";
@@ -66,6 +76,7 @@ pub enum StartupError {
     UnknownMode,
     WrongArgumentCount,
     BadAddress,
+    BadNetmask,
     BadPort,
 }
 
@@ -138,6 +149,42 @@ fn parse_port(text: &[u8]) -> Option<u16> {
     (value != 0).then_some(value as u16)
 }
 
+fn parse_prefix_mask(text: &[u8]) -> Option<Ipv4Address> {
+    let prefix = text.strip_prefix(b"/").and_then(|value| {
+        if value.is_empty() {
+            return None;
+        }
+        let mut number = 0u32;
+        for &byte in value {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            number = number
+                .checked_mul(10)?
+                .checked_add(u32::from(byte - b'0'))?;
+        }
+        Some(number)
+    })?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Some(Ipv4Address::new(mask.to_be_bytes()))
+}
+
+fn parse_cidr(text: &[u8]) -> core::result::Result<(Ipv4Address, Ipv4Address), StartupError> {
+    let Some(slash) = text.iter().position(|&byte| byte == b'/') else {
+        return Err(StartupError::BadAddress);
+    };
+    let address = parse_ipv4(&text[..slash]).ok_or(StartupError::BadAddress)?;
+    let netmask = parse_prefix_mask(&text[slash..]).ok_or(StartupError::BadNetmask)?;
+    Ok((address, netmask))
+}
+
 /// Parse the documented static or DHCP startup syntax.
 pub fn parse_startup(input: &[u8]) -> core::result::Result<StartupMode, StartupError> {
     let mut words = [None; 6];
@@ -147,15 +194,34 @@ pub fn parse_startup(input: &[u8]) -> core::result::Result<StartupMode, StartupE
     }
     match words[0] {
         Some(b"static") => {
-            if count != 6 {
+            if !(5..=6).contains(&count) {
+                return Err(StartupError::WrongArgumentCount);
+            }
+            let (local_ip, netmask, next) = if words[1].unwrap().contains(&b'/') {
+                let (address, mask) = parse_cidr(words[1].unwrap())?;
+                (address, mask, 2)
+            } else if count == 6 && words[2].unwrap().starts_with(b"/") {
+                (
+                    parse_ipv4(words[1].unwrap()).ok_or(StartupError::BadAddress)?,
+                    parse_prefix_mask(words[2].unwrap()).ok_or(StartupError::BadNetmask)?,
+                    3,
+                )
+            } else {
+                (
+                    parse_ipv4(words[1].unwrap()).ok_or(StartupError::BadAddress)?,
+                    parse_ipv4(words[2].unwrap()).ok_or(StartupError::BadNetmask)?,
+                    3,
+                )
+            };
+            if count != next + 3 {
                 return Err(StartupError::WrongArgumentCount);
             }
             Ok(StartupMode::Static(TelnetConfig {
-                local_ip: parse_ipv4(words[1].unwrap()).ok_or(StartupError::BadAddress)?,
-                netmask: parse_ipv4(words[2].unwrap()).ok_or(StartupError::BadAddress)?,
-                gateway: parse_ipv4(words[3].unwrap()).ok_or(StartupError::BadAddress)?,
-                server_ip: parse_ipv4(words[4].unwrap()).ok_or(StartupError::BadAddress)?,
-                server_port: parse_port(words[5].unwrap()).ok_or(StartupError::BadPort)?,
+                local_ip,
+                netmask,
+                gateway: parse_ipv4(words[next].unwrap()).ok_or(StartupError::BadAddress)?,
+                server_ip: parse_ipv4(words[next + 1].unwrap()).ok_or(StartupError::BadAddress)?,
+                server_port: parse_port(words[next + 2].unwrap()).ok_or(StartupError::BadPort)?,
             }))
         }
         Some(b"dhcp") => {
@@ -203,7 +269,15 @@ pub fn build_tcp_frame(
 pub enum TelnetEvent {
     None,
     Data(u8),
-    Reply { verb: u8, option: u8 },
+    Reply {
+        verb: u8,
+        option: u8,
+    },
+    Subnegotiation {
+        option: u8,
+        data: [u8; MAX_SUBNEGOTIATION],
+        length: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,25 +285,30 @@ enum ParserState {
     Data,
     Iac,
     Option(u8),
-    Subnegotiation,
-    SubnegotiationIac,
+    SubnegotiationOption,
+    Subnegotiation(u8),
+    SubnegotiationIac(u8),
 }
 
 /// Incremental Telnet parser.
 ///
-/// This policy accepts only the byte-preserving options needed for a useful
-/// terminal stream: BINARY and SUPPRESS-GO-AHEAD in either direction, and
-/// server ECHO.  All other WILL/DO requests are refused.  Subnegotiation is
-/// skipped until IAC SE, including across TCP segment boundaries.
+/// This policy accepts the byte-preserving options needed for a useful
+/// terminal stream plus TERMINAL-TYPE and NAWS. All other WILL/DO requests
+/// are refused. Subnegotiation is retained in a bounded buffer until IAC SE,
+/// including when TCP splits the sequence across segments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TelnetParser {
     state: ParserState,
+    subnegotiation: [u8; MAX_SUBNEGOTIATION],
+    subnegotiation_length: usize,
 }
 
 impl TelnetParser {
     pub const fn new() -> Self {
         Self {
             state: ParserState::Data,
+            subnegotiation: [0; MAX_SUBNEGOTIATION],
+            subnegotiation_length: 0,
         }
     }
 
@@ -253,7 +332,8 @@ impl TelnetParser {
                     TelnetEvent::None
                 }
                 TELNET_SB => {
-                    self.state = ParserState::Subnegotiation;
+                    self.subnegotiation_length = 0;
+                    self.state = ParserState::SubnegotiationOption;
                     TelnetEvent::None
                 }
                 _ => {
@@ -291,23 +371,43 @@ impl TelnetParser {
                     _ => TelnetEvent::None,
                 }
             }
-            ParserState::Subnegotiation => {
+            ParserState::SubnegotiationOption => {
+                self.state = ParserState::Subnegotiation(byte);
+                TelnetEvent::None
+            }
+            ParserState::Subnegotiation(option) => {
                 if byte == TELNET_IAC {
-                    self.state = ParserState::SubnegotiationIac;
+                    self.state = ParserState::SubnegotiationIac(option);
+                } else {
+                    if self.subnegotiation_length < MAX_SUBNEGOTIATION {
+                        self.subnegotiation[self.subnegotiation_length] = byte;
+                        self.subnegotiation_length += 1;
+                    }
                 }
                 TelnetEvent::None
             }
-            ParserState::SubnegotiationIac => match byte {
+            ParserState::SubnegotiationIac(option) => match byte {
                 TELNET_SE => {
                     self.state = ParserState::Data;
-                    TelnetEvent::None
+                    let mut data = [0; MAX_SUBNEGOTIATION];
+                    data[..self.subnegotiation_length]
+                        .copy_from_slice(&self.subnegotiation[..self.subnegotiation_length]);
+                    TelnetEvent::Subnegotiation {
+                        option,
+                        data,
+                        length: self.subnegotiation_length as u8,
+                    }
                 }
                 TELNET_IAC => {
-                    self.state = ParserState::Subnegotiation;
+                    if self.subnegotiation_length < MAX_SUBNEGOTIATION {
+                        self.subnegotiation[self.subnegotiation_length] = TELNET_IAC;
+                        self.subnegotiation_length += 1;
+                    }
+                    self.state = ParserState::Subnegotiation(option);
                     TelnetEvent::None
                 }
                 _ => {
-                    self.state = ParserState::Subnegotiation;
+                    self.state = ParserState::Subnegotiation(option);
                     TelnetEvent::None
                 }
             },
@@ -329,7 +429,10 @@ fn supports_server_option(option: u8) -> bool {
 }
 
 fn supports_client_option(option: u8) -> bool {
-    matches!(option, TELNET_BINARY | TELNET_SUPPRESS_GO_AHEAD)
+    matches!(
+        option,
+        TELNET_BINARY | TELNET_SUPPRESS_GO_AHEAD | TELNET_TERMINAL_TYPE | TELNET_NAWS
+    )
 }
 
 /// Encode application bytes for a Telnet stream.  IAC is doubled so a literal
@@ -369,12 +472,21 @@ mod tests {
             }))
         );
         let StartupMode::Static(config) =
-            parse_startup(b"static 192.0.2.10 255.255.255.0 192.0.2.1 192.0.2.20 65535")
-                .unwrap()
+            parse_startup(b"static 192.0.2.10 255.255.255.0 192.0.2.1 192.0.2.20 65535").unwrap()
         else {
             panic!("expected static startup mode");
         };
         assert_eq!(config.server_port, 65535);
+        for syntax in [
+            b"static 192.0.2.10/24 192.0.2.1 192.0.2.20 23".as_slice(),
+            b"static 192.0.2.10 /24 192.0.2.1 192.0.2.20 23".as_slice(),
+        ] {
+            let StartupMode::Static(config) = parse_startup(syntax).unwrap() else {
+                panic!("expected static startup mode");
+            };
+            assert_eq!(config.local_ip, Ipv4Address::new([192, 0, 2, 10]));
+            assert_eq!(config.netmask, Ipv4Address::new([255, 255, 255, 0]));
+        }
         assert_eq!(
             parse_startup(b"dhcp 192.0.2.20 23"),
             Ok(StartupMode::Dhcp {
@@ -403,6 +515,10 @@ mod tests {
             parse_startup(b"static 192.0.2.10 255.255.255.0 0.0.0.0 192.0.2.20 0"),
             Err(StartupError::BadPort)
         );
+        assert_eq!(
+            parse_startup(b"static 192.0.2.10/33 0.0.0.0 192.0.2.20 23"),
+            Err(StartupError::BadNetmask)
+        );
     }
 
     #[test]
@@ -420,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn telnet_negotiates_supported_options_and_skips_subnegotiation() {
+    fn telnet_negotiates_supported_options_and_parses_subnegotiation() {
         let mut parser = TelnetParser::new();
         assert_eq!(parser.feed(TELNET_IAC), TelnetEvent::None);
         assert_eq!(parser.feed(TELNET_WILL), TelnetEvent::None);
@@ -434,7 +550,18 @@ mod tests {
         for byte in [TELNET_IAC, TELNET_SB, 24, b'x', TELNET_IAC] {
             assert_eq!(parser.feed(byte), TelnetEvent::None);
         }
-        assert_eq!(parser.feed(TELNET_SE), TelnetEvent::None);
+        assert_eq!(
+            parser.feed(TELNET_SE),
+            TelnetEvent::Subnegotiation {
+                option: TELNET_TERMINAL_TYPE,
+                data: {
+                    let mut data = [0; MAX_SUBNEGOTIATION];
+                    data[0] = b'x';
+                    data
+                },
+                length: 1,
+            }
+        );
         assert_eq!(parser.feed(b'Z'), TelnetEvent::Data(b'Z'));
     }
 

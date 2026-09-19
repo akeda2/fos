@@ -663,6 +663,7 @@ pub const DHCP_OPTION_RENEWAL_TIME: u8 = 58;
 pub const DHCP_OPTION_REBINDING_TIME: u8 = 59;
 pub const DHCP_OPTION_MAX_MESSAGE_SIZE: u8 = 57;
 pub const DHCP_OPTION_END: u8 = 255;
+pub const DHCP_MAX_DNS_SERVERS: usize = 2;
 
 /// BOOTP request/reply direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1071,6 +1072,8 @@ pub struct DhcpLease {
     pub address: Ipv4Address,
     pub subnet_mask: Ipv4Address,
     pub router: Ipv4Address,
+    pub dns_servers: [Ipv4Address; DHCP_MAX_DNS_SERVERS],
+    pub dns_server_count: usize,
     pub server: Ipv4Address,
     pub lease_seconds: u32,
     pub renewal_seconds: u32,
@@ -1414,6 +1417,19 @@ impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
         if address == Ipv4Address::UNSPECIFIED {
             return Err(Error::Invalid);
         }
+        let mut dns_servers = [Ipv4Address::UNSPECIFIED; DHCP_MAX_DNS_SERVERS];
+        let dns_server_count = match options.find(DHCP_OPTION_DNS)? {
+            Some(bytes) if !bytes.is_empty() && bytes.len() % 4 == 0 => {
+                let count = core::cmp::min(bytes.len() / 4, DHCP_MAX_DNS_SERVERS);
+                for (index, server) in dns_servers.iter_mut().enumerate().take(count) {
+                    let start = index * 4;
+                    *server = Ipv4Address(bytes[start..start + 4].try_into().unwrap());
+                }
+                count
+            }
+            Some(_) => return Err(Error::Invalid),
+            None => 0,
+        };
         let lease = DhcpLease {
             address,
             subnet_mask: options
@@ -1422,6 +1438,8 @@ impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
             router: options
                 .ipv4(DHCP_OPTION_ROUTER)?
                 .unwrap_or(Ipv4Address::UNSPECIFIED),
+            dns_servers,
+            dns_server_count,
             server,
             lease_seconds,
             renewal_seconds,
@@ -2050,6 +2068,9 @@ mod tests {
                     .push_ipv4(DHCP_OPTION_ROUTER, Ipv4Address([192, 0, 2, 1]))
                     .unwrap();
                 writer
+                    .push(DHCP_OPTION_DNS, &[192, 0, 2, 53, 198, 51, 100, 53])
+                    .unwrap();
+                writer
                     .push_u32(DHCP_OPTION_LEASE_TIME, lease_seconds)
                     .unwrap();
                 writer
@@ -2114,7 +2135,16 @@ mod tests {
         let ack = DhcpPacket::parse(&ack_bytes[..ack_length]).unwrap();
         client.receive(2, &ack).unwrap();
         assert_eq!(client.state(), DhcpClientState::Bound);
-        assert_eq!(client.lease().unwrap().address, address);
+        let lease = client.lease().unwrap();
+        assert_eq!(lease.address, address);
+        assert_eq!(lease.dns_server_count, 2);
+        assert_eq!(
+            lease.dns_servers,
+            [
+                Ipv4Address([192, 0, 2, 53]),
+                Ipv4Address([198, 51, 100, 53]),
+            ]
+        );
 
         let udp = UdpDatagram::new(
             DHCP_CLIENT_PORT,

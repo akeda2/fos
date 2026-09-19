@@ -3,7 +3,7 @@ use core::fmt::{self, Write};
 use crate::arch::x86::{inb, outb};
 
 const VGA_BUFFER: *mut u16 = 0xb8000 as *mut u16;
-const VGA_COLOR: u8 = 0x07;
+const DEFAULT_VGA_COLOR: u8 = 0x07;
 const COM1: u16 = 0x3f8;
 
 const SEQUENCER_INDEX_PORT: u16 = 0x3c4;
@@ -67,9 +67,22 @@ impl VgaMode {
 
 static mut ROW: usize = 0;
 static mut COLUMN: usize = 0;
+static mut TERMINAL_COLOR: u8 = DEFAULT_VGA_COLOR;
+static mut TERMINAL_HIDDEN: bool = false;
+static mut TERMINAL_SAVED_ROW: usize = 0;
+static mut TERMINAL_SAVED_COLUMN: usize = 0;
+static mut TERMINAL_CURSOR_VISIBLE: bool = true;
+static mut TERMINAL_CURSOR_START: u8 = 0;
+static mut TERMINAL_CURSOR_END: u8 = 15;
+static mut TERMINAL_SCROLL_TOP: usize = 0;
+static mut TERMINAL_SCROLL_BOTTOM: usize = 24;
+static mut TERMINAL_ALT_ACTIVE: bool = false;
+static mut TERMINAL_ALT_BUFFER: [u16; 80 * 50] = [0; 80 * 50];
 static mut SERIAL_READY: bool = false;
 static mut CURRENT_VGA_MODE: VgaMode = VgaMode::Text80x25;
 static mut BASELINE_CRTC: [u8; 8] = [0; 8];
+static mut BASELINE_CURSOR_START: u8 = 0;
+static mut BASELINE_CURSOR_END: u8 = 15;
 static mut BASELINE_CLOCKING_MODE: u8 = 0;
 static mut BASELINE_CHARACTER_MAP: u8 = 0;
 static mut BASELINE_CRTC_PROTECT: u8 = 0;
@@ -86,6 +99,13 @@ enum TerminalVgaState {
 }
 
 static mut TERMINAL_VGA_STATE: TerminalVgaState = TerminalVgaState::Normal;
+static mut TERMINAL_CSI_PRIVATE: bool = false;
+const TERMINAL_CSI_PARAM_CAPACITY: usize = 8;
+static mut TERMINAL_CSI_PARAMS: [u16; TERMINAL_CSI_PARAM_CAPACITY] =
+    [0; TERMINAL_CSI_PARAM_CAPACITY];
+static mut TERMINAL_CSI_COUNT: usize = 0;
+static mut TERMINAL_CSI_VALUE: u16 = 0;
+static mut TERMINAL_CSI_HAS_VALUE: bool = false;
 
 /// Bounded queue of every byte this module writes out (VGA text plus
 /// whatever reaches `write_serial`, which `Console::write_str`,
@@ -240,6 +260,11 @@ unsafe fn capture_vga_baseline() {
             read_crtc(0x09),
             read_crtc(0x13),
         ];
+        BASELINE_CURSOR_START = read_crtc(0x0a);
+        BASELINE_CURSOR_END = read_crtc(0x0b);
+        TERMINAL_CURSOR_START = BASELINE_CURSOR_START & 0x1f;
+        TERMINAL_CURSOR_END = BASELINE_CURSOR_END & 0x1f;
+        TERMINAL_CURSOR_VISIBLE = BASELINE_CURSOR_START & 0x20 == 0;
         BASELINE_CLOCKING_MODE = read_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x01);
         BASELINE_CHARACTER_MAP = read_indexed(SEQUENCER_INDEX_PORT, SEQUENCER_DATA_PORT, 0x03);
         BASELINE_CRTC_PROTECT = read_crtc(0x11);
@@ -388,8 +413,22 @@ pub fn set_vga_mode(mode: VgaMode) {
         ROW = 0;
         COLUMN = 0;
         TERMINAL_VGA_STATE = TerminalVgaState::Normal;
+        TERMINAL_COLOR = DEFAULT_VGA_COLOR;
+        TERMINAL_HIDDEN = false;
+        TERMINAL_SCROLL_TOP = 0;
+        TERMINAL_SCROLL_BOTTOM = mode.height() - 1;
+        TERMINAL_CURSOR_VISIBLE = true;
+        if mode == VgaMode::Text80x25 {
+            TERMINAL_CURSOR_START = BASELINE_CURSOR_START & 0x1f;
+            TERMINAL_CURSOR_END = BASELINE_CURSOR_END & 0x1f;
+        } else {
+            TERMINAL_CURSOR_START = 0;
+            TERMINAL_CURSOR_END = 7;
+        }
+        TERMINAL_ALT_ACTIVE = false;
     }
     clear();
+    terminal_set_cursor_visible(true);
 }
 
 unsafe fn initialize_serial() -> bool {
@@ -532,10 +571,13 @@ pub fn clear() {
         for i in 0..mode.width() * mode.height() {
             VGA_BUFFER
                 .add(i)
-                .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(b' '));
+                .write_volatile(u16::from(DEFAULT_VGA_COLOR) << 8 | u16::from(b' '));
         }
         ROW = 0;
         COLUMN = 0;
+        TERMINAL_COLOR = DEFAULT_VGA_COLOR;
+        TERMINAL_SCROLL_TOP = 0;
+        TERMINAL_SCROLL_BOTTOM = mode.height() - 1;
     }
     update_cursor();
     write_serial(b"\x1b[2J\x1b[H");
@@ -552,7 +594,7 @@ pub fn erase_last_character() {
             COLUMN -= 1;
             VGA_BUFFER
                 .add(ROW * mode.width() + COLUMN)
-                .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(b' '));
+                .write_volatile(u16::from(DEFAULT_VGA_COLOR) << 8 | u16::from(b' '));
         }
     }
     update_cursor();
@@ -612,7 +654,7 @@ fn newline() {
             for column in 0..mode.width() {
                 VGA_BUFFER
                     .add((mode.height() - 1) * mode.width() + column)
-                    .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(b' '));
+                    .write_volatile(u16::from(DEFAULT_VGA_COLOR) << 8 | u16::from(b' '));
             }
             ROW = mode.height() - 1;
         }
@@ -627,7 +669,7 @@ fn write_byte(byte: u8) {
             let mode = CURRENT_VGA_MODE;
             VGA_BUFFER
                 .add(ROW * mode.width() + COLUMN)
-                .write_volatile(u16::from(VGA_COLOR) << 8 | u16::from(byte));
+                .write_volatile(u16::from(DEFAULT_VGA_COLOR) << 8 | u16::from(byte));
             COLUMN += 1;
             if COLUMN == mode.width() {
                 newline();
@@ -636,6 +678,392 @@ fn write_byte(byte: u8) {
         _ => {}
     }
     update_cursor();
+}
+
+fn terminal_parameter(index: usize, default: u16) -> u16 {
+    unsafe {
+        if index < TERMINAL_CSI_COUNT {
+            TERMINAL_CSI_PARAMS[index]
+        } else {
+            default
+        }
+    }
+}
+
+fn terminal_set_cursor(row: usize, column: usize) {
+    unsafe {
+        let mode = CURRENT_VGA_MODE;
+        ROW = row.min(mode.height().saturating_sub(1));
+        COLUMN = column.min(mode.width().saturating_sub(1));
+    }
+}
+
+fn terminal_scroll() {
+    unsafe {
+        let mode = CURRENT_VGA_MODE;
+        if TERMINAL_SCROLL_TOP >= mode.height() || TERMINAL_SCROLL_BOTTOM >= mode.height() {
+            TERMINAL_SCROLL_TOP = 0;
+            TERMINAL_SCROLL_BOTTOM = mode.height() - 1;
+        }
+        if TERMINAL_SCROLL_TOP >= TERMINAL_SCROLL_BOTTOM {
+            ROW = TERMINAL_SCROLL_TOP;
+            COLUMN = 0;
+            return;
+        }
+        for row in TERMINAL_SCROLL_TOP + 1..=TERMINAL_SCROLL_BOTTOM {
+            for column in 0..mode.width() {
+                let source = VGA_BUFFER.add(row * mode.width() + column).read_volatile();
+                VGA_BUFFER
+                    .add((row - 1) * mode.width() + column)
+                    .write_volatile(source);
+            }
+        }
+        for column in 0..mode.width() {
+            VGA_BUFFER
+                .add(TERMINAL_SCROLL_BOTTOM * mode.width() + column)
+                .write_volatile(u16::from(TERMINAL_COLOR) << 8 | u16::from(b' '));
+        }
+        ROW = TERMINAL_SCROLL_BOTTOM;
+        COLUMN = 0;
+    }
+}
+
+fn terminal_newline() {
+    unsafe {
+        COLUMN = 0;
+        if ROW >= TERMINAL_SCROLL_BOTTOM {
+            terminal_scroll();
+        } else {
+            ROW += 1;
+        }
+    }
+}
+
+fn terminal_write_byte(byte: u8) {
+    match byte {
+        b'\n' => terminal_newline(),
+        b'\r' => unsafe { COLUMN = 0 },
+        8 => unsafe {
+            if COLUMN > 0 {
+                COLUMN -= 1;
+            }
+        },
+        0x20..=0x7e => unsafe {
+            let mode = CURRENT_VGA_MODE;
+            VGA_BUFFER
+                .add(ROW * mode.width() + COLUMN)
+                .write_volatile(u16::from(terminal_current_color()) << 8 | u16::from(byte));
+            COLUMN += 1;
+            if COLUMN == mode.width() {
+                terminal_newline();
+            }
+        },
+        _ => {}
+    }
+}
+
+fn terminal_current_color() -> u8 {
+    unsafe {
+        if TERMINAL_HIDDEN {
+            (TERMINAL_COLOR & 0xf0) | ((TERMINAL_COLOR >> 4) & 0x0f)
+        } else {
+            TERMINAL_COLOR
+        }
+    }
+}
+
+fn terminal_ansi_color(value: u16) -> u8 {
+    match value {
+        0 => 0,
+        1 => 4,
+        2 => 2,
+        3 => 6,
+        4 => 1,
+        5 => 5,
+        6 => 3,
+        7 => 7,
+        8..=15 => (value - 8) as u8,
+        16..=231 => {
+            let index = (value - 16) as u8;
+            let red = index / 36;
+            let green = (index / 6) % 6;
+            let blue = index % 6;
+            let mut result = 0;
+            if red >= 3 {
+                result |= 4;
+            }
+            if green >= 3 {
+                result |= 2;
+            }
+            if blue >= 3 {
+                result |= 1;
+            }
+            if red == 5 || green == 5 || blue == 5 {
+                result |= 8;
+            }
+            result
+        }
+        _ => {
+            if value < 244 {
+                7
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn terminal_sgr() {
+    unsafe {
+        let mut index = 0;
+        if TERMINAL_CSI_COUNT == 0 {
+            TERMINAL_COLOR = DEFAULT_VGA_COLOR;
+            TERMINAL_HIDDEN = false;
+            return;
+        }
+        while index < TERMINAL_CSI_COUNT {
+            let value = TERMINAL_CSI_PARAMS[index];
+            match value {
+                0 => {
+                    TERMINAL_COLOR = DEFAULT_VGA_COLOR;
+                    TERMINAL_HIDDEN = false;
+                }
+                1 => TERMINAL_COLOR |= 0x08,
+                7 => TERMINAL_COLOR = TERMINAL_COLOR.rotate_left(4),
+                22 => TERMINAL_COLOR &= 0xf7,
+                8 => TERMINAL_HIDDEN = true,
+                28 => TERMINAL_HIDDEN = false,
+                27 => TERMINAL_COLOR = TERMINAL_COLOR.rotate_left(4),
+                30..=37 => {
+                    TERMINAL_COLOR = (TERMINAL_COLOR & 0xf0) | terminal_ansi_color(value - 30)
+                }
+                39 => TERMINAL_COLOR = (TERMINAL_COLOR & 0xf0) | (DEFAULT_VGA_COLOR & 0x0f),
+                40..=47 => {
+                    TERMINAL_COLOR =
+                        (TERMINAL_COLOR & 0x0f) | (terminal_ansi_color(value - 40) << 4)
+                }
+                49 => TERMINAL_COLOR = (TERMINAL_COLOR & 0x0f) | (DEFAULT_VGA_COLOR & 0xf0),
+                90..=97 => {
+                    TERMINAL_COLOR = (TERMINAL_COLOR & 0xf0) | terminal_ansi_color(value - 90 + 8)
+                }
+                100..=107 => {
+                    TERMINAL_COLOR =
+                        (TERMINAL_COLOR & 0x0f) | (terminal_ansi_color(value - 100 + 8) << 4)
+                }
+                38 | 48
+                    if index + 2 < TERMINAL_CSI_COUNT && TERMINAL_CSI_PARAMS[index + 1] == 5 =>
+                {
+                    let color = terminal_ansi_color(TERMINAL_CSI_PARAMS[index + 2]);
+                    if value == 38 {
+                        TERMINAL_COLOR = (TERMINAL_COLOR & 0xf0) | color;
+                    } else {
+                        TERMINAL_COLOR = (TERMINAL_COLOR & 0x0f) | (color << 4);
+                    }
+                    index += 2;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+}
+
+fn terminal_erase_line(mode: u16) {
+    unsafe {
+        let current_mode = CURRENT_VGA_MODE;
+        let start = match mode {
+            1 => 0,
+            2 => 0,
+            _ => COLUMN,
+        };
+        let end = match mode {
+            1 => COLUMN + 1,
+            2 => current_mode.width(),
+            _ => current_mode.width(),
+        };
+        for column in start..end {
+            VGA_BUFFER
+                .add(ROW * current_mode.width() + column)
+                .write_volatile(u16::from(TERMINAL_COLOR) << 8 | u16::from(b' '));
+        }
+    }
+}
+
+fn terminal_erase_display(mode: u16) {
+    unsafe {
+        let current_mode = CURRENT_VGA_MODE;
+        match mode {
+            2 | 3 => {
+                for row in 0..current_mode.height() {
+                    for column in 0..current_mode.width() {
+                        VGA_BUFFER
+                            .add(row * current_mode.width() + column)
+                            .write_volatile(u16::from(TERMINAL_COLOR) << 8 | u16::from(b' '));
+                    }
+                }
+            }
+            1 => {
+                for row in 0..=ROW {
+                    let end = if row == ROW {
+                        COLUMN + 1
+                    } else {
+                        current_mode.width()
+                    };
+                    for column in 0..end {
+                        VGA_BUFFER
+                            .add(row * current_mode.width() + column)
+                            .write_volatile(u16::from(TERMINAL_COLOR) << 8 | u16::from(b' '));
+                    }
+                }
+            }
+            _ => {
+                for row in ROW..current_mode.height() {
+                    let start = if row == ROW { COLUMN } else { 0 };
+                    for column in start..current_mode.width() {
+                        VGA_BUFFER
+                            .add(row * current_mode.width() + column)
+                            .write_volatile(u16::from(TERMINAL_COLOR) << 8 | u16::from(b' '));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn terminal_enter_alt_screen() {
+    unsafe {
+        if TERMINAL_ALT_ACTIVE {
+            return;
+        }
+        let mode = CURRENT_VGA_MODE;
+        if mode.width() > 80 || mode.height() > 50 {
+            return;
+        }
+        for row in 0..mode.height() {
+            for column in 0..mode.width() {
+                TERMINAL_ALT_BUFFER[row * mode.width() + column] =
+                    VGA_BUFFER.add(row * mode.width() + column).read_volatile();
+            }
+        }
+        TERMINAL_SAVED_ROW = ROW;
+        TERMINAL_SAVED_COLUMN = COLUMN;
+        TERMINAL_ALT_ACTIVE = true;
+        for row in 0..mode.height() {
+            for column in 0..mode.width() {
+                VGA_BUFFER
+                    .add(row * mode.width() + column)
+                    .write_volatile(u16::from(TERMINAL_COLOR) << 8 | u16::from(b' '));
+            }
+        }
+        ROW = 0;
+        COLUMN = 0;
+    }
+}
+
+fn terminal_leave_alt_screen() {
+    unsafe {
+        if !TERMINAL_ALT_ACTIVE {
+            return;
+        }
+        let mode = CURRENT_VGA_MODE;
+        if mode.width() > 80 || mode.height() > 50 {
+            TERMINAL_ALT_ACTIVE = false;
+            return;
+        }
+        for row in 0..mode.height() {
+            for column in 0..mode.width() {
+                VGA_BUFFER
+                    .add(row * mode.width() + column)
+                    .write_volatile(TERMINAL_ALT_BUFFER[row * mode.width() + column]);
+            }
+        }
+        ROW = TERMINAL_SAVED_ROW.min(mode.height().saturating_sub(1));
+        COLUMN = TERMINAL_SAVED_COLUMN.min(mode.width().saturating_sub(1));
+        TERMINAL_ALT_ACTIVE = false;
+    }
+}
+
+fn terminal_set_cursor_visible(visible: bool) {
+    unsafe {
+        TERMINAL_CURSOR_VISIBLE = visible;
+        outb(CRTC_INDEX_PORT, 0x0a);
+        outb(
+            CRTC_DATA_PORT,
+            if visible {
+                TERMINAL_CURSOR_START & 0x1f
+            } else {
+                TERMINAL_CURSOR_START | 0x20
+            },
+        );
+        outb(CRTC_INDEX_PORT, 0x0b);
+        outb(CRTC_DATA_PORT, TERMINAL_CURSOR_END & 0x1f);
+    }
+}
+
+fn terminal_handle_csi(final_byte: u8) {
+    unsafe {
+        let first = terminal_parameter(0, 0);
+        match final_byte {
+            b'A' => terminal_set_cursor(ROW.saturating_sub(first.max(1) as usize), COLUMN),
+            b'B' => terminal_set_cursor(ROW + first.max(1) as usize, COLUMN),
+            b'C' => terminal_set_cursor(ROW, COLUMN + first.max(1) as usize),
+            b'D' => terminal_set_cursor(ROW, COLUMN.saturating_sub(first.max(1) as usize)),
+            b'E' => terminal_set_cursor(ROW + first.max(1) as usize, 0),
+            b'F' => terminal_set_cursor(ROW.saturating_sub(first.max(1) as usize), 0),
+            b'G' | b'`' => terminal_set_cursor(ROW, first.max(1) as usize - 1),
+            b'd' => terminal_set_cursor(first.max(1) as usize - 1, COLUMN),
+            b'H' | b'f' => terminal_set_cursor(
+                terminal_parameter(0, 1).max(1) as usize - 1,
+                terminal_parameter(1, 1).max(1) as usize - 1,
+            ),
+            b'J' => terminal_erase_display(first),
+            b'K' => terminal_erase_line(first),
+            b'm' => terminal_sgr(),
+            b's' => {
+                TERMINAL_SAVED_ROW = ROW;
+                TERMINAL_SAVED_COLUMN = COLUMN;
+            }
+            b'u' => terminal_set_cursor(TERMINAL_SAVED_ROW, TERMINAL_SAVED_COLUMN),
+            b'q' => terminal_set_cursor_shape(first),
+            b'r' => {
+                let mode = CURRENT_VGA_MODE;
+                TERMINAL_SCROLL_TOP = terminal_parameter(0, 1).max(1) as usize - 1;
+                TERMINAL_SCROLL_BOTTOM =
+                    terminal_parameter(1, mode.height() as u16).max(1) as usize - 1;
+                TERMINAL_SCROLL_TOP = TERMINAL_SCROLL_TOP.min(mode.height() - 1);
+                TERMINAL_SCROLL_BOTTOM = TERMINAL_SCROLL_BOTTOM.min(mode.height() - 1);
+                ROW = TERMINAL_SCROLL_TOP;
+                COLUMN = 0;
+            }
+            b'h' if TERMINAL_CSI_PRIVATE && first == 25 => terminal_set_cursor_visible(true),
+            b'l' if TERMINAL_CSI_PRIVATE && first == 25 => terminal_set_cursor_visible(false),
+            b'h' if TERMINAL_CSI_PRIVATE && (first == 47 || first == 1047 || first == 1049) => {
+                terminal_enter_alt_screen()
+            }
+            b'l' if TERMINAL_CSI_PRIVATE && (first == 47 || first == 1047 || first == 1049) => {
+                terminal_leave_alt_screen()
+            }
+            _ => {}
+        }
+    }
+}
+
+fn terminal_set_cursor_shape(style: u16) {
+    unsafe {
+        let end = if CURRENT_VGA_MODE == VgaMode::Text80x25 {
+            BASELINE_CURSOR_END & 0x1f
+        } else {
+            7
+        };
+        let (start, end) = match style {
+            3..=6 => (end.saturating_sub(1), end),
+            7..=9 => (0, 0),
+            _ => (0, end),
+        };
+        TERMINAL_CURSOR_START = start;
+        TERMINAL_CURSOR_END = end;
+        terminal_set_cursor_visible(TERMINAL_CURSOR_VISIBLE);
+    }
 }
 
 /// Consume common ANSI/VT100 escape sequences for the local VGA view while
@@ -647,11 +1075,17 @@ fn write_terminal_vga_byte(byte: u8) {
                 if byte == 0x1b {
                     TERMINAL_VGA_STATE = TerminalVgaState::Escape;
                 } else {
-                    write_byte(byte);
+                    terminal_write_byte(byte);
                 }
             }
             TerminalVgaState::Escape => match byte {
-                b'[' => TERMINAL_VGA_STATE = TerminalVgaState::Csi,
+                b'[' => {
+                    TERMINAL_CSI_PRIVATE = false;
+                    TERMINAL_CSI_COUNT = 0;
+                    TERMINAL_CSI_VALUE = 0;
+                    TERMINAL_CSI_HAS_VALUE = false;
+                    TERMINAL_VGA_STATE = TerminalVgaState::Csi;
+                }
                 b']' => TERMINAL_VGA_STATE = TerminalVgaState::Osc,
                 0x20..=0x2f => TERMINAL_VGA_STATE = TerminalVgaState::EscapeIntermediate,
                 0x30..=0x7e => TERMINAL_VGA_STATE = TerminalVgaState::Normal,
@@ -663,7 +1097,36 @@ fn write_terminal_vga_byte(byte: u8) {
                 }
             }
             TerminalVgaState::Csi => {
-                if (0x40..=0x7e).contains(&byte) {
+                if byte == b'?' && TERMINAL_CSI_COUNT == 0 && !TERMINAL_CSI_HAS_VALUE {
+                    TERMINAL_CSI_PRIVATE = true;
+                } else if byte.is_ascii_digit() {
+                    TERMINAL_CSI_HAS_VALUE = true;
+                    TERMINAL_CSI_VALUE = TERMINAL_CSI_VALUE
+                        .saturating_mul(10)
+                        .saturating_add(u16::from(byte - b'0'));
+                } else if byte == b';' {
+                    if TERMINAL_CSI_COUNT < TERMINAL_CSI_PARAM_CAPACITY {
+                        TERMINAL_CSI_PARAMS[TERMINAL_CSI_COUNT] = if TERMINAL_CSI_HAS_VALUE {
+                            TERMINAL_CSI_VALUE
+                        } else {
+                            0
+                        };
+                        TERMINAL_CSI_COUNT += 1;
+                    }
+                    TERMINAL_CSI_VALUE = 0;
+                    TERMINAL_CSI_HAS_VALUE = false;
+                } else if (0x40..=0x7e).contains(&byte) {
+                    if TERMINAL_CSI_HAS_VALUE || TERMINAL_CSI_COUNT != 0 {
+                        if TERMINAL_CSI_COUNT < TERMINAL_CSI_PARAM_CAPACITY {
+                            TERMINAL_CSI_PARAMS[TERMINAL_CSI_COUNT] = if TERMINAL_CSI_HAS_VALUE {
+                                TERMINAL_CSI_VALUE
+                            } else {
+                                0
+                            };
+                            TERMINAL_CSI_COUNT += 1;
+                        }
+                    }
+                    terminal_handle_csi(byte);
                     TERMINAL_VGA_STATE = TerminalVgaState::Normal;
                 } else if byte == 0x1b {
                     TERMINAL_VGA_STATE = TerminalVgaState::Escape;
@@ -681,13 +1144,33 @@ fn write_terminal_vga_byte(byte: u8) {
             },
         }
     }
+    update_cursor();
 }
 
-/// Reset an incomplete terminal-control sequence before the shell resumes.
+/// Reset terminal parser and presentation state before the shell resumes.
 pub fn reset_terminal_output() {
     unsafe {
+        terminal_leave_alt_screen();
         TERMINAL_VGA_STATE = TerminalVgaState::Normal;
+        TERMINAL_CSI_PRIVATE = false;
+        TERMINAL_CSI_COUNT = 0;
+        TERMINAL_CSI_VALUE = 0;
+        TERMINAL_CSI_HAS_VALUE = false;
+        TERMINAL_COLOR = DEFAULT_VGA_COLOR;
+        TERMINAL_HIDDEN = false;
+        TERMINAL_SCROLL_TOP = 0;
+        TERMINAL_SCROLL_BOTTOM = CURRENT_VGA_MODE.height() - 1;
+        if CURRENT_VGA_MODE == VgaMode::Text80x25 {
+            TERMINAL_CURSOR_START = BASELINE_CURSOR_START & 0x1f;
+            TERMINAL_CURSOR_END = BASELINE_CURSOR_END & 0x1f;
+        } else {
+            TERMINAL_CURSOR_START = 0;
+            TERMINAL_CURSOR_END = 7;
+        }
+        terminal_set_cursor_visible(true);
     }
+    update_cursor();
+    write_serial(b"\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?7h\x1b[0 q");
 }
 
 struct Console;
@@ -726,6 +1209,14 @@ pub extern "C" fn print_byte(byte: u32) {
     let byte = byte as u8;
     write_terminal_vga_byte(byte);
     write_serial(&[byte]);
+}
+
+/// Returns the ANSI cursor position as a packed 1-based `(row, column)`.
+/// The high 16 bits contain the row and the low 16 bits contain the column.
+/// This is an append-only tape ABI callback used to answer terminal CPR
+/// requests without exposing the VGA framebuffer or CRTC implementation.
+pub extern "C" fn terminal_position() -> u32 {
+    unsafe { (((ROW + 1) as u32) << 16) | (COLUMN + 1) as u32 }
 }
 
 /// Writes bytes to the VGA text console only, without echoing them back out

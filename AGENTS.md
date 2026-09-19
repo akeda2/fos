@@ -68,11 +68,20 @@ that obscure hardware behavior.
 - `tapes/router/` is a fixed-buffer layer-3 tape. It reuses the bridge's
   polling shape, answers ARP per configured interface, and forwards IPv4
   packets between directly connected subnets while updating TTL and header
-  checksum. Its syntax is `tape run router [dhcp] NIC IP NETMASK ... [default
-  NIC GATEWAY]`; NIC numbers are one-based, `dhcp` configures NIC 1 (callback
-  index zero), and an explicit or DHCP-supplied gateway handles unmatched
-  destinations. It deliberately has no NAT, dynamic routing, ICMP errors,
-  fragmentation, or IPv6.
+  checksum. Its syntax is `tape run router [dhcp] [dhcp-server] NIC IP/PREFIX ... [default
+  NIC GATEWAY]` (legacy dotted `NIC IP NETMASK` and separate `NIC IP /PREFIX`
+  forms remain accepted); NIC numbers are one-based, `dhcp` configures NIC 1
+  (callback index zero), and an explicit or DHCP-supplied gateway handles
+  unmatched destinations. `dhcp-server` serves every configured interface
+  except NIC 1 using an automatically derived subnet pool with one in-memory
+  lease slot per usable address, and seven-day leases. Upstream DHCP DNS
+  values are propagated to downstream clients; a `dns SERVER [SERVER]`
+  directive overrides them. The server has no DNS implementation or
+  persistence. It also accepts `tape run router @ROUTER.CFG`: the shell reads the uppercase
+  FOSFS file and passes its contents through the existing startup-argument
+  ABI; `#` comments and newlines are accepted, with a 4096-byte fixed limit.
+  The tape does not perform disk I/O. It deliberately has no NAT, dynamic
+  routing, ICMP errors, fragmentation, or IPv6.
 
 ## Low-memory map
 
@@ -330,12 +339,15 @@ as UTF-8.
 (`PEERS`/`PEER_COUNT` statics, capped at `MAX_PEERS` = 16, deliberately not
 dynamically sized since this kernel has no heap) so a peer can be named
 `chat 1` instead of a full MAC. `nic discover` broadcasts one
-`CHAT_TAG_DISCOVER_REQUEST`, re-sending it every `DISCOVER_REBROADCAST_TICKS`
-(a plain `interrupts::ticks()` comparison, not a timer interrupt) so a peer
-that only starts `chat`/`nic discover` partway through is still found, and
-busy-polls `receive` -- printing each newly-seen peer as it arrives -- until
-`keyboard::poll_term_event()` reports F12, the same escape convention
-`nic sniff`/`term`/`chat` all use; `nic peers` just prints the table.
+`CHAT_TAG_DISCOVER_REQUEST` through every initialized NIC, re-sending it every
+`DISCOVER_REBROADCAST_TICKS` (a plain `interrupts::ticks()` comparison, not a
+timer interrupt) so a peer that only starts `chat`/`nic discover` partway
+through is still found, and busy-polls every NIC's `receive` -- printing each
+newly-seen peer as it arrives -- until `keyboard::poll_term_event()` reports
+F12, the same escape convention `nic sniff`/`term`/`chat` all use; `nic peers`
+just prints the table. A reply to an incoming probe is sent back through the
+same local NIC on which that probe arrived, so discovery works across
+different attached Ethernet segments rather than only on the primary NIC.
 Whoever receives a `CHAT_TAG_DISCOVER_REQUEST` -- whether via `nic discover`
 or a running `chat` session's own receive loop -- answers with one unicast
 `CHAT_TAG_DISCOVER_REPLY` straight back to the requester's source MAC
@@ -396,6 +408,14 @@ broadcasting a `CHAT_TAG_DISCOVER_REQUEST` and listening briefly for
 short transfer benefits less from a persistent MAC file than a script
 meant to be re-run against the same test machine over and over. `--mac`/
 `--mac-file` remain available to skip discovery entirely.
+
+Both senders pace their frames because `tape load net` polls a finite RTL8139
+receive ring rather than receiving through an interrupt-driven queue. The
+kernel's `tape send` waits one 100-Hz PIT tick (about 10 ms) between frames;
+`tools/send_tape.py` defaults to a 3 ms delay, which is the faster interval
+verified reliable on the documented real-hardware setup. An unpaced burst can
+overflow the receiver, causing the deliberately strict sequence check to
+report a missing or unexpected chunk rather than load corrupt data.
 
 `tape load disk NAME` reuses `fosfs::read` and now reads the complete
 multi-sector file into the tape image buffer. New Rust tape files are ELF32
@@ -1292,7 +1312,8 @@ with the required zero/broadcast IPv4 bootstrap addresses, uses the tape
 `ticks` callback for bounded retries and lease renewal/rebind deadlines, and
 returns explicit lease configuration to the application. A consuming tape
 should expose `tape run dhcp` and a structured fallback such as
-`tape run static IP NETMASK GATEWAY`; argument parsing and post-configuration
+`tape run static IP/PREFIX GATEWAY`; dotted netmasks and a separate
+`IP /PREFIX` remain accepted; argument parsing and post-configuration
 policy belong to that tape, not to `tape-net`.
 
 The ABI now appends five multi-interface callbacks after `ticks`:
@@ -1312,14 +1333,17 @@ tape. Its focused `tapes/test_ip_chat_e2e.py` test uses two static-IP QEMU
 guests; the multicast fixture has no DHCP server, so DHCP is covered by the
 library/application unit tests rather than that integration test.
 
-`tapes/telnet/` is the first TCP application on top of that boundary. It is a
-single-connection, static-IP Telnet client using `tape-net` for ARP and TCP.
-Its incremental parser negotiates the basic Telnet verbs, skips
-subnegotiation, doubles literal `IAC` bytes, and forwards UTF-8 as bytes
-without decoding it in the tape. Keep authentication, terminal-type/NAWS
-negotiation, DHCP, DNS, and multi-connection support out of this first
-example; the focused `tapes/test_telnet_e2e.py` test uses an unprivileged
-multicast QEMU fixture plus a small host-side protocol peer.
+`tapes/telnet/` is a single-connection Telnet client using `tape-net` for
+ARP, DHCP, and TCP. Its incremental parser negotiates the basic Telnet verbs
+plus an 80x25 `xterm` terminal type and NAWS window size, handles
+subnegotiation across TCP boundaries, doubles literal `IAC` bytes, and
+forwards UTF-8 as bytes without decoding it in the tape. The kernel's local
+VGA callback interprets a bounded VT100 subset and answers `CSI 5n`/`CSI 6n`
+using its 1-based software cursor position, while serial and `term net`
+retain raw control sequences. Keep authentication, DNS, and
+multi-connection support out of scope; the focused
+`tapes/test_telnet_e2e.py` test uses an unprivileged multicast QEMU fixture
+plus a small host-side protocol peer.
 
 ### Live output relaying for `read_key`/`should_abort`-based tapes over `term net`
 

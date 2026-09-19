@@ -1,10 +1,14 @@
 use crate::arch::x86::{inb, outb};
 use crate::interrupts;
+use core::arch::asm;
 
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
 const STATUS_OUTPUT_FULL: u8 = 1;
 const STATUS_INPUT_FULL: u8 = 2;
+const KEYBOARD_ACK: u8 = 0xfa;
+const KEYBOARD_SET_LEDS: u8 = 0xed;
+const CAPS_LOCK_LED: u8 = 0x04;
 
 /// Scan Code Set 1 make codes for the function keys recognized as "leave
 /// this mode" keys throughout `shell.rs` (`term`, `term net`, `nic sniff`,
@@ -40,6 +44,7 @@ pub enum KeyEvent {
 pub struct Keyboard {
     left_shift: bool,
     right_shift: bool,
+    caps_lock: bool,
 }
 
 /// Shift-key decoding state for scancodes drained from the IRQ1 queue.
@@ -48,7 +53,13 @@ pub struct Keyboard {
 static mut DECODER: Keyboard = Keyboard {
     left_shift: false,
     right_shift: false,
+    caps_lock: false,
 };
+const PENDING_KEY_BYTES_LEN: usize = 8;
+static mut PENDING_KEY_BYTES: [u8; PENDING_KEY_BYTES_LEN] = [0; PENDING_KEY_BYTES_LEN];
+static mut PENDING_KEY_HEAD: usize = 0;
+static mut PENDING_KEY_LEN: usize = 0;
+static mut EXTENDED_SCANCODE: bool = false;
 
 impl Keyboard {
     /// Enables scanning on the PS/2 keyboard. Must run before
@@ -74,10 +85,16 @@ impl Keyboard {
         match code {
             0x2a => self.left_shift = !released,
             0x36 => self.right_shift = !released,
+            0x3a if !released => {
+                self.caps_lock = !self.caps_lock;
+                set_caps_lock_led(self.caps_lock);
+            }
             _ if released => {}
             0x1c => return Some(b'\n'),
             0x0e => return Some(8),
-            _ => return keycode_to_ascii(code, self.left_shift || self.right_shift),
+            _ => {
+                return keycode_to_ascii(code, self.left_shift || self.right_shift, self.caps_lock);
+            }
         }
         None
     }
@@ -110,8 +127,22 @@ pub fn pop_char() -> Option<u8> {
 /// other key goes through the same shift-aware decoder as `pop_char`, so
 /// typed text still reaches the remote end as ordinary ASCII.
 pub fn poll_term_event() -> Option<KeyEvent> {
+    unsafe {
+        if PENDING_KEY_LEN != 0 {
+            let byte = PENDING_KEY_BYTES[PENDING_KEY_HEAD];
+            PENDING_KEY_HEAD = (PENDING_KEY_HEAD + 1) % PENDING_KEY_BYTES_LEN;
+            PENDING_KEY_LEN -= 1;
+            return Some(KeyEvent::Char(byte));
+        }
+    }
     let scancode = interrupts::pop_scancode()?;
     let released = scancode & 0x80 != 0;
+    if scancode == 0xe0 {
+        unsafe {
+            EXTENDED_SCANCODE = true;
+        }
+        return None;
+    }
     if ESCAPE_SCANCODES.contains(&(scancode & 0x7f)) {
         return if released {
             None
@@ -119,9 +150,74 @@ pub fn poll_term_event() -> Option<KeyEvent> {
             Some(KeyEvent::Escape)
         };
     }
+    let extended = unsafe {
+        let extended = EXTENDED_SCANCODE;
+        EXTENDED_SCANCODE = false;
+        extended
+    };
+    if extended {
+        if !released {
+            if let Some(sequence) = extended_key_sequence(scancode & 0x7f) {
+                unsafe {
+                    for &byte in sequence {
+                        if PENDING_KEY_LEN == PENDING_KEY_BYTES_LEN {
+                            break;
+                        }
+                        let tail = (PENDING_KEY_HEAD + PENDING_KEY_LEN) % PENDING_KEY_BYTES_LEN;
+                        PENDING_KEY_BYTES[tail] = byte;
+                        PENDING_KEY_LEN += 1;
+                    }
+                }
+            }
+        }
+        return poll_term_event();
+    }
+    if !released {
+        if let Some(sequence) = function_key_sequence(scancode & 0x7f) {
+            unsafe {
+                for &byte in sequence {
+                    if PENDING_KEY_LEN == PENDING_KEY_BYTES_LEN {
+                        break;
+                    }
+                    let tail = (PENDING_KEY_HEAD + PENDING_KEY_LEN) % PENDING_KEY_BYTES_LEN;
+                    PENDING_KEY_BYTES[tail] = byte;
+                    PENDING_KEY_LEN += 1;
+                }
+            }
+            return poll_term_event();
+        }
+    }
     #[allow(static_mut_refs)]
     let decoded = unsafe { DECODER.decode_scancode(scancode) };
     decoded.map(KeyEvent::Char)
+}
+
+fn extended_key_sequence(code: u8) -> Option<&'static [u8]> {
+    match code {
+        0x48 => Some(b"\x1b[A"),
+        0x50 => Some(b"\x1b[B"),
+        0x4d => Some(b"\x1b[C"),
+        0x4b => Some(b"\x1b[D"),
+        0x47 => Some(b"\x1b[H"),
+        0x4f => Some(b"\x1b[F"),
+        0x52 => Some(b"\x1b[2~"),
+        0x53 => Some(b"\x1b[3~"),
+        0x49 => Some(b"\x1b[5~"),
+        0x51 => Some(b"\x1b[6~"),
+        _ => None,
+    }
+}
+
+fn function_key_sequence(code: u8) -> Option<&'static [u8]> {
+    match code {
+        0x3b => Some(b"\x1bOP"),
+        0x3c => Some(b"\x1bOQ"),
+        0x3d => Some(b"\x1bOR"),
+        0x3f => Some(b"\x1bOS"),
+        0x43 => Some(b"\x1b[20~"),
+        0x57 => Some(b"\x1b[23~"),
+        _ => None,
+    }
 }
 
 /// `extern "C" fn() -> u32` callback a tape's entry point can call once
@@ -168,7 +264,7 @@ fn wait_for_output() -> bool {
     false
 }
 
-fn keycode_to_ascii(code: u8, shifted: bool) -> Option<u8> {
+fn keycode_to_ascii(code: u8, shifted: bool, caps_lock: bool) -> Option<u8> {
     let normal = match code {
         0x02..=0x0b => b"1234567890"[(code - 0x02) as usize],
         0x10..=0x19 => b"qwertyuiop"[(code - 0x10) as usize],
@@ -188,11 +284,16 @@ fn keycode_to_ascii(code: u8, shifted: bool) -> Option<u8> {
         0x35 => b'/',
         _ => return None,
     };
+    if normal.is_ascii_lowercase() {
+        if shifted ^ caps_lock {
+            return Some(normal - b'a' + b'A');
+        }
+        return Some(normal);
+    }
     if !shifted {
         return Some(normal);
     }
     Some(match normal {
-        b'a'..=b'z' => normal - b'a' + b'A',
         b'1' => b'!',
         b'2' => b'@',
         b'3' => b'#',
@@ -218,14 +319,39 @@ fn keycode_to_ascii(code: u8, shifted: bool) -> Option<u8> {
     })
 }
 
+fn set_caps_lock_led(enabled: bool) {
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+        if wait_for_input_empty() {
+            outb(DATA_PORT, KEYBOARD_SET_LEDS);
+            if wait_for_output() && inb(DATA_PORT) == KEYBOARD_ACK {
+                outb(DATA_PORT, if enabled { CAPS_LOCK_LED } else { 0 });
+                let _ = wait_for_output().then(|| inb(DATA_PORT));
+            }
+        }
+        asm!("sti", options(nomem, nostack));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::keycode_to_ascii;
+    use super::{extended_key_sequence, function_key_sequence, keycode_to_ascii};
 
     #[test]
     fn translates_us_keyboard_letters_and_shifted_symbols() {
-        assert_eq!(keycode_to_ascii(0x23, false), Some(b'h'));
-        assert_eq!(keycode_to_ascii(0x23, true), Some(b'H'));
-        assert_eq!(keycode_to_ascii(0x02, true), Some(b'!'));
+        assert_eq!(keycode_to_ascii(0x23, false, false), Some(b'h'));
+        assert_eq!(keycode_to_ascii(0x23, true, false), Some(b'H'));
+        assert_eq!(keycode_to_ascii(0x23, false, true), Some(b'H'));
+        assert_eq!(keycode_to_ascii(0x23, true, true), Some(b'h'));
+        assert_eq!(keycode_to_ascii(0x02, true, false), Some(b'!'));
+        assert_eq!(keycode_to_ascii(0x02, false, true), Some(b'1'));
+    }
+
+    #[test]
+    fn maps_navigation_keys_to_terminal_sequences() {
+        assert_eq!(extended_key_sequence(0x48), Some(&b"\x1b[A"[..]));
+        assert_eq!(extended_key_sequence(0x53), Some(&b"\x1b[3~"[..]));
+        assert_eq!(function_key_sequence(0x3b), Some(&b"\x1bOP"[..]));
+        assert_eq!(function_key_sequence(0x3e), None);
     }
 }

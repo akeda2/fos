@@ -104,7 +104,8 @@ Ethernet/ARP/IPv4/ICMP/UDP/TCP implementation in `tapes/tape-net/`.
 
 ## Prompt
 
-The prompt accepts fixed-size, allocation-free command lines. Enter and
+The prompt accepts fixed-size, allocation-free command lines of up to 256
+characters. Enter and
 Backspace work on both serial and the US-layout PS/2 keyboard subset. Both
 input sources are interrupt-driven (IRQ1 for the keyboard) rather than
 polled, alongside a free-running PIT timer on IRQ0. Writing characters into
@@ -150,14 +151,14 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
 | `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
 | `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 (or F4/F6/F7/F8/F10) stops the capture, then turns promiscuous mode back off. |
-| `nic discover` | Broadcasts a `chat`-protocol discovery probe (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 (or F4/F6/F7/F8/F10) stops it (only fos machines currently running `chat` or `nic discover` reply). |
+| `nic discover` | Broadcasts a `chat`-protocol discovery probe through every initialized NIC (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 (or F4/F6/F7/F8/F10) stops it (only fos machines currently running `chat` or `nic discover` reply). |
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (or F4/F6/F7/F8/F10) (local keyboard) or by typing `/quit` (works over serial too). |
 | `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
 | `tape load disk NAME` | Loads a complete flat, multi-sector FOSFS file straight into the fixed tape buffer. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, and timer callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full seventeen-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run` alone leaves it empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, and timer callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full seventeen-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run router @ROUTER.CFG` reads router startup arguments from the uppercase FOSFS file `ROUTER.CFG`; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
@@ -395,24 +396,26 @@ since both share one scrolling console.
 
 `nic discover` and `nic peers` add a numbered address book on top of that
 same tagged-frame format, so a peer can be named `chat 1` instead of typing
-its full MAC every time. `nic discover` broadcasts a `CHAT_TAG_DISCOVER_REQUEST`
-frame, re-sending it every few seconds (so a machine that starts `chat`/`nic
-discover` a little late is still found), and keeps polling the card --
-printing each newly-seen peer as it replies -- until F12 stops it, the same
-convention `nic sniff`/`term`/`chat` all use; `nic peers` just prints the
-list built so far, without sending anything. There is no interrupt-driven
-network service in this kernel -- every receive is a polled `nic.receive()`
-call somewhere in a foreground loop -- so a probe is only ever answered by a
-fos machine whose own `chat` or `nic discover` happens to be running and
-polling its card at that exact moment; anyone not actively at a `chat`
-prompt or mid-`nic discover` is simply invisible, honestly reflecting that
-constraint rather than hiding it behind a fake "background service". Whoever
-receives a `CHAT_TAG_DISCOVER_REQUEST` (whether from `nic discover` or a
-running `chat` session) replies with one unicast `CHAT_TAG_DISCOVER_REPLY`
-frame straight back to the requester's source MAC (never broadcast, so
-replies don't also broadcast to every other listener) and remembers the
-requester as a peer too, so discovery is naturally symmetric after one
-round.
+its full MAC every time. `nic discover` broadcasts a `CHAT_TAG_DISCOVER_REQUEST` frame through every
+initialized NIC, re-sending it every few seconds (so a machine that starts
+`chat`/`nic discover` a little late is still found), and keeps polling every
+NIC -- printing each newly-seen peer as it replies -- until F12 stops it, the
+same convention `nic sniff`/`term`/`chat` all use; `nic peers` just prints the
+list built so far, without sending anything. A reply to an incoming probe is
+sent through the same local NIC on which that probe arrived, allowing one
+machine to discover peers across multiple attached Ethernet segments. There
+is no interrupt-driven network service in this kernel -- every receive is a
+polled `nic.receive()` call somewhere in a foreground loop -- so a probe is
+only ever answered by a fos machine whose own `chat` or `nic discover` happens
+to be running and polling its card at that exact moment; anyone not actively
+at a `chat` prompt or mid-`nic discover` is simply invisible, honestly
+reflecting that constraint rather than hiding it behind a fake "background
+service". Whoever receives a `CHAT_TAG_DISCOVER_REQUEST` (whether from
+`nic discover` or a running `chat` session) replies with one unicast
+`CHAT_TAG_DISCOVER_REPLY` frame straight back to the requester's source MAC
+(never broadcast, so replies don't also broadcast to every other listener)
+and remembers the requester as a peer too, so discovery is naturally
+symmetric after one round.
 
 ### Tape (`tape`)
 
@@ -480,6 +483,10 @@ destination automatically if exactly one fos machine replies; with more
 than one, pass `--mac` with either a full MAC address or a peer number
 from `tools/peers.py` (see "A numbered peer address book for the Python
 tools too" below) instead of typing one out.
+Both senders pace frames because `tape load net` uses a polling-only NIC
+receiver with a finite receive ring: the kernel sender waits about 10 ms
+between frames, while `tools/send_tape.py` defaults to its empirically
+reliable 3 ms delay (`--delay 0` explicitly disables that protection).
 
 #### Test tape: `tapes/primes.S`
 
@@ -682,9 +689,11 @@ tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0
 ```
 
 The leading `router` word is optional and NIC numbers are one-based, matching
-`nic list`. The static triples may be followed by `default NIC GATEWAY` to
-route otherwise-unmatched destinations through an explicitly selected
-interface:
+`nic list`. Interfaces may use compact CIDR notation such as
+`1 10.0.1.1/24`, or the separate `1 10.0.1.1 /24` form; dotted netmasks
+remain accepted. The static interfaces may be followed by
+`default NIC GATEWAY` to route otherwise-unmatched destinations through an
+explicitly selected interface:
 
 ```text
 tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0 default 1 10.0.1.254
@@ -705,6 +714,58 @@ and a default gateway must be on its selected interface's subnet. The router
 still has no NAT, dynamic routing, ICMP errors, fragmentation, or IPv6.
 Build it with `make tape-router` and run `make test-tape-router` for the
 two-segment QEMU forwarding test.
+
+The optional `dhcp-server` word enables a DHCP server on every configured
+interface except NIC 1. Its pool is derived automatically from each
+interface's subnet: network, broadcast, and router addresses are excluded,
+and the router allocates one in-memory lease slot for every usable address in
+the subnet rather than imposing a small fixed lease count. Leases last seven
+days, with renewal at 3.5 days and rebinding at 6.125 days. The required
+lease-table memory comes from the tape allocator, so an unusually large subnet
+can still be refused if the machine cannot provide enough RAM. Offers and
+acknowledgements include the subnet mask, router, broadcast address, server
+identifier, and renewal timers:
+
+```text
+tape run router dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24
+```
+
+DNS option 6 is also advertised when available. With `dhcp` on NIC 1, DNS
+addresses received from the upstream DHCP server are propagated to downstream
+clients. A `dns SERVER [SERVER]` directive in the router configuration
+overrides those learned values, which is useful when the upstream interface is
+static or when a specific resolver should be given to clients:
+
+```text
+dhcp
+dhcp-server
+dns 192.168.1.53 1.1.1.1
+2 10.0.2.1/24
+```
+
+The DHCP service remains non-persistent and does not implement DNS itself; it
+only tells clients which external resolver addresses to use. It is a small
+LAN DHCP service for directly attached segments, not a replacement for a full
+network-management daemon.
+
+For a readable, reusable setup, the router can read this configuration from
+an uppercase FOSFS file. `#` starts a comment through the end of its line:
+
+```text
+# ROUTER.CFG
+dhcp-server
+1 10.0.1.1/24
+2 10.0.2.1/24
+```
+
+After storing that text as `ROUTER.CFG`, run the loaded router tape with:
+
+```text
+tape run router @ROUTER.CFG
+```
+
+The shell reads the file through the kernel's FOSFS/BIOS disk path and passes
+the contents to the router; the router tape itself never performs disk I/O.
 
 #### Test tape: `tapes/ip-chat/`
 
@@ -728,8 +789,11 @@ uses the shared `tapes/tape-net/` ARP/TCP/DHCP implementation. Choose static
 configuration for deterministic setups:
 
 ```text
-tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT
+tape run static LOCAL_IP/PREFIX GATEWAY SERVER_IP SERVER_PORT
 ```
+
+Dotted netmasks remain accepted, as does the separate `LOCAL_IP /PREFIX`
+form.
 
 Or use DHCP for the local address, netmask, and gateway while still naming the
 Telnet server explicitly:
@@ -738,17 +802,25 @@ Telnet server explicitly:
 tape run dhcp SERVER_IP SERVER_PORT
 ```
 
-The tape negotiates the basic Telnet `WILL/WONT/DO/DONT` options, escapes
-literal `0xff` bytes as required by the protocol, skips subnegotiation, and
-forwards terminal data byte-for-byte. UTF-8 is intentionally preserved as
-raw bytes rather than decoded inside the tape, so an attached terminal can
-render the server's Unicode output without adding a character library or
-terminal-width policy. The client does not yet implement DNS,
-terminal-type/window-size negotiation, or authentication policy; a server's
-login prompt and credentials are simply terminal bytes. Common ANSI/VT100
-control sequences are preserved for serial and `term net` clients while being
-consumed for the local VGA view, which cannot interpret terminal escape
-sequences.
+The tape negotiates the basic Telnet `WILL/WONT/DO/DONT` options, advertises
+an 80x25 `xterm` terminal with NAWS window-size information, escapes literal
+`0xff` bytes as required by the protocol, and forwards terminal data
+byte-for-byte. UTF-8 is intentionally preserved as raw bytes rather than
+decoded inside the tape, so an attached terminal can render the server's
+Unicode output without adding a character library. The client does not
+implement DNS or authentication policy; a server's login prompt and
+credentials are simply terminal bytes. Common ANSI/VT100 control sequences
+are preserved for serial and `term net` clients. The local VGA path now
+interprets a bounded VT100 subset including cursor movement, erase commands,
+SGR colors and hidden text, cursor-shape requests, scroll regions, cursor
+visibility, save/restore, and the alternate screen buffer. It answers
+terminal status and cursor-position requests (`CSI 5n`/`CSI 6n`) from the
+kernel's 1-based 80x25 cursor state. When the tape returns, the kernel
+restores local VGA state and emits a terminal reset (SGR, cursor
+visibility/shape, alternate-screen, bracketed-paste, and wrapping modes) so a
+program cannot leave the following `fos>` prompt invisible, recolored, or
+with a changed cursor. Local keyboard arrows, navigation keys, and non-abort
+function keys are encoded as standard terminal escape sequences.
 
 Build it with `make tape-telnet` (producing `build/tapes/telnet.bin`) and run
 `tapes/test_telnet_e2e.py` for the focused raw-Ethernet interoperability test.
