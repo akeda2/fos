@@ -272,8 +272,11 @@ pub extern "C" fn tape_main(
     let mut forwarded = 0u32;
     let mut dropped = 0u32;
 
-    loop {
+    'bridge: loop {
         for ingress in 0..port_count {
+            if should_abort() != 0 {
+                break 'bridge;
+            }
             let received = nic_receive_at(
                 ports[ingress],
                 frame.as_mut_ptr() as u32,

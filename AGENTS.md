@@ -62,6 +62,14 @@ that obscure hardware behavior.
 - `tapes/bridge/` is a raw layer-2 learning bridge tape. It uses the
   per-interface tape callbacks, enables promiscuous mode on selected ports,
   and forwards Ethernet frames without implementing IP routing.
+- `tapes/router/` is a fixed-buffer layer-3 tape. It reuses the bridge's
+  polling shape, answers ARP per configured interface, and forwards IPv4
+  packets between directly connected subnets while updating TTL and header
+  checksum. Its syntax is `tape run router [dhcp] NIC IP NETMASK ... [default
+  NIC GATEWAY]`; NIC numbers are one-based, `dhcp` configures NIC 1 (callback
+  index zero), and an explicit or DHCP-supplied gateway handles unmatched
+  destinations. It deliberately has no NAT, dynamic routing, ICMP errors,
+  fragmentation, or IPv6.
 
 ## Low-memory map
 
@@ -244,6 +252,12 @@ build and needs physical validation. The e1000 path uses a 32-bit memory BAR
 and legacy descriptor rings; QEMU coverage makes it the first Intel backend
 suitable for automated testing. PCI helpers enable the address-space type
 required by each backend and bus mastering.
+
+The 3C905 transmit descriptor's first word is revision-sensitive: original
+905 cards use the packet length, while 905B/C cards require the transmit
+indication and roundup-defeat flags. `threecom.rs` identifies that revision
+from the PCI device ID and keeps transmit polling bounded, so a missing link
+must not strand a polling bridge in a long wait.
 
 The driver polls status registers rather than using the card's interrupt
 line -- consistent with `interrupts.rs` leaving every IRQ but the timer and

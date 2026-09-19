@@ -19,8 +19,9 @@ TAPE_NET_CHAT_BIN := $(BUILD)/tapes/net-chat.bin
 TAPE_IP_CHAT_BIN := $(BUILD)/tapes/ip-chat.bin
 TAPE_TELNET_BIN := $(BUILD)/tapes/telnet.bin
 TAPE_BRIDGE_BIN := $(BUILD)/tapes/bridge.bin
+TAPE_ROUTER_BIN := $(BUILD)/tapes/router.bin
 
-.PHONY: all help kernel image run test test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge clean
+.PHONY: all help kernel image run test test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -49,7 +50,7 @@ help:
 	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
 	@echo "  make test-vga-modes - verify 80x25, 80x50, and experimental 132x25 under QEMU"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
@@ -63,10 +64,12 @@ help:
 	@echo "  make tape-ip-chat   - build build/tapes/ip-chat.bin (Rust IPv4/UDP chat tape; static or DHCP)"
 	@echo "  make tape-telnet   - build build/tapes/telnet.bin (Rust TCP/Telnet terminal tape; static IPv4 or DHCP)"
 	@echo "  make tape-bridge   - build build/tapes/bridge.bin (Rust layer-2 learning bridge/switch tape)"
+	@echo "  make tape-router   - build build/tapes/router.bin (Rust static IPv4 router tape)"
 	@echo "  make test-tape-net   - run host-side unit tests for tapes/tape-net"
 	@echo "  make test-tape-ip-chat - run host-side unit tests for tapes/ip-chat"
 	@echo "  make test-tape-telnet - run host-side unit tests for tapes/telnet"
 	@echo "  make test-tape-bridge - build the image/tape and run the three-guest layer-2 bridge test"
+	@echo "  make test-tape-router - build the image/tape and run the three-guest IPv4 router test"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -126,7 +129,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -317,5 +320,13 @@ tape-bridge:
 test-tape-bridge: image tape-bridge
 	python3 tapes/test_bridge_e2e.py
 
+tape-router:
+	cd tapes/router && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	objcopy -O binary tapes/router/target/i686-fos/release/router-tape $(TAPE_ROUTER_BIN)
+
+test-tape-router: image tape-router
+	python3 tapes/test_router_e2e.py
+
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target tapes/net-chat/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target tapes/net-chat/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target

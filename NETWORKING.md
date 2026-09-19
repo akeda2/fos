@@ -107,6 +107,54 @@ TTL/checksum handling, VLAN support, STP, or loop prevention. Do not connect
 the selected ports in a physical Ethernet loop. `make test-tape-bridge`
 exercises both directions across two isolated QEMU e1000 segments.
 
+## IPv4 router tape
+
+`tapes/router/` is a fixed-buffer layer-3 consumer of the per-interface
+callbacks. It reuses the bridge's selected-port polling shape, but each
+configured port is assigned an IPv4 address and netmask:
+
+```text
+tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0
+```
+
+The interface number is one-based, matching `nic list`; the optional leading
+`router` word is accepted for readability. The tape answers ARP requests for
+each configured address, learns sender mappings in one bounded ARP cache per
+interface, chooses a directly connected egress with longest-prefix matching,
+decrements IPv4 TTL, recomputes the IPv4 header checksum, and emits the
+packet with the egress interface's MAC address. ARP resolution polls all
+configured interfaces with a bounded timeout so the router can keep answering
+requests on either side while resolving a next hop.
+
+The optional `default NIC GATEWAY` suffix selects a one-based egress NIC and
+the next-hop IPv4 address for destinations that do not match a directly
+connected subnet:
+
+```text
+tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0 default 1 10.0.1.254
+```
+
+The optional `dhcp` word reserves NIC 1 (callback index zero) for the
+`tape-net` DHCP client. Static triples then configure the other interfaces:
+
+```text
+tape run router dhcp 2 10.0.2.1 255.255.255.0
+```
+
+DHCP requires the same bounded polling discipline as the router: it uses only
+the indexed NIC callbacks, checks `should_abort`, retries for a finite timeout,
+and reports whether the lease supplied an address, netmask, and router. If no
+explicit default suffix is supplied, a DHCP router option becomes NIC 1's
+default. At least two interfaces are required, NIC selections must be unique
+and exist, and an explicit gateway must be on the selected interface's
+subnet. Packets addressed to the router itself, IPv4 broadcast/multicast,
+unknown networks without a default, TTL 1, and malformed/checksum-invalid
+IPv4 packets are dropped. NAT, dynamic routing, ICMP
+unreachable/time-exceeded errors, fragmentation/reassembly, IPv6, and a kernel
+socket layer remain out of scope. `make test-tape-router` runs the
+three-party QEMU/multicast test that verifies ARP, forwarding in both
+directions, and TTL/checksum changes.
+
 ## Kernel Ethernet backends
 
 `kernel/src/nic.rs` is the common facade used by the shell and all tape
@@ -128,6 +176,22 @@ Physical validation should begin with `nic`, then `nic send`/`nic recv` or
 `term net`, and finally a protocol tape such as `tapes/ip-chat` or
 `tapes/telnet`. A failed 3C905 initialization is reported separately from
 the absence of any supported controller.
+
+The 3C905 transmit descriptor format differs between the original 905
+Boomerang cards and the 905B/C Cyclone/Tornado revisions. The driver selects
+the appropriate frame-start header from the PCI device ID; B/C cards require
+the transmit-indication and roundup-defeat flags, with the payload length
+stored only in the final-fragment field. A single transmit descriptor is used
+by this polling driver, so a busy or non-completing card drops a frame rather
+than blocking a bridge indefinitely.
+
+Initialization also selects the card's EEPROM/connector media mode in window
+3, normally choosing 10/100BASE-T autonegotiation on 905B/C TXM cards, and
+uses the network-only global reset so the PHY is not unnecessarily reset out
+from under autonegotiation. `nic` reports the 3Com media link-beat bit as a
+basic physical-link diagnostic; a down result means discovery cannot work yet
+and should be debugged as a cable, switch/peer, PHY, or media-selection issue
+before investigating DMA descriptors.
 
 3Com 3C509 cards are not covered by `threecom.rs`. They are ISA devices with
 a different EtherLink III FIFO/windowed protocol and need a separate

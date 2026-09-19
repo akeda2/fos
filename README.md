@@ -92,7 +92,7 @@ plain `make` (still just `make image`) and does not affect `image`/`run`/
 
 `make all` builds everything this repository knows how to produce in one
 go: the image, `make netrom`, and every test tape (`make tapes`, including
-`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-beep`/`tape-morse`/`tape-net-chat`/`tape-ip-chat`/`tape-telnet`/`tape-bridge` -- see "Tape
+`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-beep`/`tape-morse`/`tape-net-chat`/`tape-ip-chat`/`tape-telnet`/`tape-bridge`/`tape-router` -- see "Tape
 (`tape`)" below). Not needed for ordinary kernel/boot work, for which plain `make`
 (equivalent to `make image`) is enough. `make help` lists every target
 with a one-line description.
@@ -158,7 +158,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
 | `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, and timer callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full seventeen-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run` alone leaves it empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
-| `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, also auto-replies to `nic discover` probes, same as `chat`/`tape load net`. This same wait now also runs automatically once at every boot, before the interactive prompt appears. |
+| `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
 
@@ -646,6 +646,47 @@ out of scope. Build it with `make tape-bridge` and run
 `make test-tape-bridge` for the three-guest QEMU test, which uses two
 isolated e1000 segments and verifies forwarding in both directions.
 
+#### Test tape: `tapes/router/`
+
+A small fixed-buffer IPv4 router that reuses the bridge tape's
+selected-interface polling loop but terminates Ethernet on each port and
+forwards valid IPv4 packets between directly connected subnets. Each
+configured interface gets an IPv4 address and netmask, answers ARP for that
+address, learns neighboring MAC addresses, and uses longest-prefix matching to
+select an egress. Forwarded packets have their TTL decremented and IPv4 header
+checksum recomputed.
+
+Run it with one-based NIC numbers from `nic list`, for example:
+
+```text
+tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0
+```
+
+The leading `router` word is optional and NIC numbers are one-based, matching
+`nic list`. The static triples may be followed by `default NIC GATEWAY` to
+route otherwise-unmatched destinations through an explicitly selected
+interface:
+
+```text
+tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0 default 1 10.0.1.254
+```
+
+`dhcp` configures NIC 1 (the zero-based callback index 0), so a mixed
+configuration can obtain the upstream address and router from DHCP while
+statically configuring another port:
+
+```text
+tape run router dhcp 2 10.0.2.1 255.255.255.0
+```
+
+If DHCP supplies a router option and no explicit `default` suffix is present,
+that router becomes NIC 1's default route. At least two interfaces (the DHCP
+interface counts as one) are required; static NICs must be unique and present,
+and a default gateway must be on its selected interface's subnet. The router
+still has no NAT, dynamic routing, ICMP errors, fragmentation, or IPv6.
+Build it with `make tape-router` and run `make test-tape-router` for the
+two-segment QEMU forwarding test.
+
 #### Test tape: `tapes/ip-chat/`
 
 An IPv4/UDP line-chat application built on the shared `tapes/tape-net/`
@@ -775,7 +816,10 @@ and unlike before, a serial-only operator can no longer reach the local
 prompt by having any peer connect and disconnect either -- the intended
 path for a serial-only machine is to drive it entirely over `term net`
 itself (or a wired local keyboard, even briefly, to press one of the
-"give up" keys once).
+"give up" keys once). Boot also prints every initialized NIC, its driver,
+number, and MAC address before entering the wait. If the local operator
+does give up, the shell re-enters the automatic wait after 60 seconds
+without local keyboard or serial input.
 
 "Give up" recognizes six function keys, not just F12: F12, F4, F6, F7,
 F8, and F10 (see `keyboard::ESCAPE_SCANCODES`). F12 was always chosen for

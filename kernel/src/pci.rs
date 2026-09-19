@@ -91,6 +91,11 @@ pub struct PciAddress {
 pub const MAX_DEVICE_MATCHES: usize = 8;
 
 impl PciAddress {
+    /// Reads the PCI device identifier for this function.
+    pub fn device_id(&self) -> u16 {
+        read_u16(self.bus, self.device, self.function, 0x00)
+    }
+
     /// Reads an I/O BAR, returning its base address if it is I/O-mapped
     /// (`None` for memory-mapped BARs, which this project's port-I/O code
     /// cannot use).

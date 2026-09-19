@@ -12,6 +12,7 @@ use crate::pmem;
 use crate::{print, println};
 
 const LINE_CAPACITY: usize = 80;
+const TERM_NET_IDLE_TICKS: u64 = 60 * 100;
 
 pub fn run(info: &BootInfo) -> ! {
     let keyboard_available = Keyboard::initialize().is_some();
@@ -22,6 +23,10 @@ pub fn run(info: &BootInfo) -> ! {
         println!("PS/2 keyboard unavailable; serial input remains available.");
         println!("Type 'help' for commands.");
     }
+    if nic::count() > 0 {
+        println!("Detected Ethernet interfaces:");
+        nic_list();
+    }
     // Automatically wait for a remote `term net` client at every boot,
     // exactly as if a local operator had just typed `term net`: this
     // makes every fos machine remotely reachable by default with no
@@ -30,18 +35,28 @@ pub fn run(info: &BootInfo) -> ! {
     // interactive shell right away, without waiting, can press F12 (or
     // F4/F6/F7/F8/F10) immediately to give up waiting, exactly as they
     // would to leave a manually started `term net` session; if a remote
-    // client does connect first, disconnecting (locally or remotely)
-    // falls through to the same local shell below, same as ever.
+    // client does connect first, a remote disconnect returns to waiting and
+    // a local escape returns to the local shell below.
     term_net(info);
     let mut editor = LineEditor::new();
     prompt();
+    let mut last_activity = interrupts::ticks();
 
     loop {
         let byte = console::read_serial_byte().or_else(keyboard::pop_char);
         let Some(byte) = byte else {
+            if interrupts::ticks().wrapping_sub(last_activity) >= TERM_NET_IDLE_TICKS {
+                println!(
+                    "\nNo local shell activity for 60 seconds; waiting for a remote terminal client again."
+                );
+                term_net(info);
+                last_activity = interrupts::ticks();
+                prompt();
+            }
             continue;
         };
         editor.feed(byte, info);
+        last_activity = interrupts::ticks();
     }
 }
 
@@ -525,32 +540,24 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
 /// sees the whole time it runs -- both before a client has connected and
 /// during an active session -- so simply leaving `term net` running is
 /// enough to make this host discoverable, exactly as `chat`/`tape load
-/// net` already do.
+/// net` already do. While waiting, probes are answered on every
+/// initialized NIC, not only the active terminal NIC.
 ///
 /// `shell::run` calls this once automatically at every boot, before the
 /// ordinary interactive prompt, so every fos machine is reachable over
 /// `term net` by default with no manual step -- this matters most for a
-/// machine with no attached screen/keyboard. Because a finished remote
-/// session loops back to waiting rather than returning, this call
-/// effectively keeps the machine remotely reachable indefinitely: the
-/// local interactive prompt below it in `run` is only ever reached by a
-/// local operator's own escape key, at any point -- while waiting or
-/// while a session is active -- never by a remote peer disconnecting on
-/// its own. A local operator watching a real screen presses F12 (or
-/// F4/F6/F7/F8/F10) to skip the wait and get the interactive prompt
-/// immediately; there is deliberately no serial equivalent (same
-/// limitation `chat` already documents), since reading one byte here to
-/// mean "give up" would silently eat the first character of whatever a
-/// serial operator was about to type. Unlike before, a serial-only
-/// operator can no longer fall back on "have any peer connect and then
-/// disconnect" to reach the local prompt either, now that a remote
-/// disconnect re-arms the wait instead of returning -- a serial-only
-/// machine is meant to be driven entirely over `term net` itself, or
-/// have a local keyboard attached briefly just to press one of the
-/// "give up" keys once.
+/// machine with no attached screen/keyboard. A local operator watching a
+/// real screen presses F12 (or F4/F6/F7/F8/F10) to skip the wait and get
+/// the interactive prompt immediately; after that local escape, one minute
+/// without local keyboard or serial activity re-enters the wait. There is
+/// deliberately no serial equivalent for the escape key, since reading one
+/// byte here to mean "give up" would silently eat the first character of
+/// whatever a serial operator was about to type.
 fn term_net(info: &BootInfo) {
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
+    let active_index = nic::active_index();
+    let interface_count = nic::count();
     println!(
         "Waiting for a remote terminal client to connect; press F12 (or F4/F6/F7/F8/F10) to give up."
     );
@@ -562,21 +569,44 @@ fn term_net(info: &BootInfo) {
                 println!("Gave up waiting for a remote terminal client.");
                 return;
             }
-            if let Some(received) = nic.receive(&mut recv_buffer) {
+            let mut connected_peer = None;
+            for index in 0..interface_count {
+                let Some(interface) = nic::get_at(index) else {
+                    continue;
+                };
+                let Some(received) = interface.receive(&mut recv_buffer) else {
+                    continue;
+                };
                 let frame = &recv_buffer[..received];
                 if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
                     continue;
                 }
                 let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
                 match frame[14] {
-                    TERM_TAG_HELLO => break peer_mac,
+                    TERM_TAG_HELLO if index == active_index => {
+                        connected_peer = Some(peer_mac);
+                        break;
+                    }
                     CHAT_TAG_DISCOVER_REQUEST => {
+                        let interface_mac = interface.mac_address();
                         remember_peer(peer_mac);
-                        send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY);
-                        println!("\n(replied to a discovery probe from {})", Mac(&peer_mac));
+                        send_chat_control(
+                            interface,
+                            &peer_mac,
+                            &interface_mac,
+                            CHAT_TAG_DISCOVER_REPLY,
+                        );
+                        println!(
+                            "\n(replied to a discovery probe from {} on NIC {})",
+                            Mac(&peer_mac),
+                            index + 1
+                        );
                     }
                     _ => {}
                 }
+            }
+            if let Some(peer) = connected_peer {
+                break peer;
             }
         };
 
@@ -734,8 +764,9 @@ fn relay_pending_tape_output(nic: &nic::Nic, peer: &[u8; 6], source: &[u8; 6]) {
 /// that loop's own frame handling closely enough to stay a reasonable
 /// network citizen even mid-tape (still answering discovery probes from
 /// someone else, still noticing this peer hanging up, still relaying
-/// this tape's own printed output live via `relay_pending_tape_output`)
-/// without ever touching anything not addressed to this specific peer.
+/// this tape's own printed output live via `relay_pending_tape_output`).
+/// Frames that belong to the tape rather than the terminal session are
+/// preserved in the deferred raw-frame queue instead of being lost here.
 ///
 /// Returns whether the caller's blocking command should stop: either the
 /// peer explicitly asked to (a `TERM_TAG_DATA` frame containing
@@ -766,15 +797,18 @@ fn poll_remote_tape_abort() -> bool {
     };
     let frame = &buffer[..received];
     if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+        tape_network_frame_push(frame);
         return false;
     }
     let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
     if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
         remember_peer(frame_source);
         send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
+        tape_network_frame_push(frame);
         return false;
     }
     if frame_source != peer {
+        tape_network_frame_push(frame);
         return false;
     }
     match frame[14] {
@@ -783,7 +817,10 @@ fn poll_remote_tape_abort() -> bool {
             true
         }
         TERM_TAG_DATA => frame[15..].contains(&REMOTE_ABORT_BYTE),
-        _ => false,
+        _ => {
+            tape_network_frame_push(frame);
+            false
+        }
     }
 }
 
@@ -859,6 +896,12 @@ fn nic_status() {
                 mac[4],
                 mac[5]
             );
+            if let Some(link_up) = nic.link_up() {
+                println!(
+                    "3Com media link: {} (raw link-beat status; check cable/switch if down).",
+                    if link_up { "up" } else { "down" }
+                );
+            }
             let count = nic::count();
             if count > 1 {
                 println!(

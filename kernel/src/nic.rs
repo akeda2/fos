@@ -33,6 +33,13 @@ impl Nic {
         }
     }
 
+    pub fn link_up(&self) -> Option<bool> {
+        match self {
+            Nic::Rtl8139(_) | Nic::E1000(_) => None,
+            Nic::ThreeCom(nic) => Some(nic.link_up()),
+        }
+    }
+
     pub fn send(&self, frame: &[u8]) -> bool {
         match self {
             Nic::Rtl8139(nic) => nic.send(frame),
