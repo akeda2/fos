@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Create a fixed-layout MBR disk image without touching host block devices.
+"""Create a fixed-layout GPT disk image without touching host block devices.
 
-Produces `build/fos.img`: a 16 MiB raw disk with a classic MBR partition
-table describing two partitions -- a raw "boot payload" partition (stage
-two loader + kernel, active/bootable) and a separate FOSFS data partition,
-which this script also preformats with `README.TXT` and every compiled tape
-passed through `--file NAME PATH`. See the top-level README's "Disk image
-layout" section for the full physical layout diagram.
+Produces `build/fos.img`: a 16 MiB raw disk with a protective MBR, primary
+and backup GPT, a raw boot payload partition (stage two loader + kernel), and
+a separate FOSFS data partition. The data partition is preformatted with
+`README.TXT` and every compiled tape passed through `--file NAME PATH`. See
+the top-level README's "Disk image layout" section for the full diagram.
 """
 
 from argparse import ArgumentParser
 from pathlib import Path
+import struct
+import zlib
 
 from write_layout import DATA_SECTORS, DATA_START_LBA, IMAGE_SECTORS
 
@@ -21,9 +22,16 @@ MIN_IMAGE_SECTORS = IMAGE_SECTORS
 KERNEL_LOAD_ADDRESS = 0x10000
 KERNEL_RESERVED_END = 0x40000
 # FOSFS reserves one superblock sector plus this many fixed directory
-# sectors (64 entries total, 32 bytes each) before file data begins.
-DIRECTORY_SECTORS = 4
+# sectors (64 entries total, 64 bytes each) before file data begins.
+DIRECTORY_SECTORS = 8
+ENTRY_SIZE = 64
 DATA_START = 1 + DIRECTORY_SECTORS
+GPT_ENTRY_COUNT = 128
+GPT_ENTRY_SIZE = 128
+GPT_PRIMARY_HEADER_LBA = 1
+GPT_PRIMARY_ENTRIES_LBA = 2
+GPT_BACKUP_HEADER_LBA = IMAGE_SECTORS - 1
+GPT_BACKUP_ENTRIES_LBA = IMAGE_SECTORS - 33
 
 
 def valid_name(name: bytes) -> bool:
@@ -43,33 +51,33 @@ def preformat_fosfs(image: bytearray, files: list[tuple[str, bytes]]) -> None:
     """
     offset = DATA_START_LBA * SECTOR_SIZE
     superblock = bytearray(SECTOR_SIZE)
-    superblock[:8] = b"FOSFS2\0\0"
-    superblock[8:10] = (2).to_bytes(2, "little")
-    superblock[10:12] = (32).to_bytes(2, "little")
+    superblock[:8] = b"FOSFS3\0\0"
+    superblock[8:10] = (3).to_bytes(2, "little")
+    superblock[10:12] = ENTRY_SIZE.to_bytes(2, "little")
     superblock[12:16] = (1).to_bytes(4, "little")
     superblock[16:20] = DIRECTORY_SECTORS.to_bytes(4, "little")
-    superblock[20:24] = DATA_START.to_bytes(4, "little")
-    superblock[24:28] = (DATA_SECTORS - DATA_START).to_bytes(4, "little")
+    superblock[20:28] = DATA_START.to_bytes(8, "little")
+    superblock[28:36] = (DATA_SECTORS - DATA_START).to_bytes(8, "little")
     image[offset:offset + SECTOR_SIZE] = superblock
     next_sector = DATA_START
     for index, (name, contents) in enumerate(files):
         name_bytes = name.encode("ascii")
         if not valid_name(name_bytes):
             raise ValueError(f"invalid FOSFS name: {name!r}")
-        if index >= DIRECTORY_SECTORS * (SECTOR_SIZE // 32):
+        if index >= DIRECTORY_SECTORS * (SECTOR_SIZE // ENTRY_SIZE):
             raise ValueError("FOSFS directory cannot contain all requested files")
         sector_count = (len(contents) + SECTOR_SIZE - 1) // SECTOR_SIZE
         if next_sector + sector_count > DATA_SECTORS:
             raise ValueError(f"FOSFS data partition is too small for {name!r}")
-        entry = bytearray(32)
+        entry = bytearray(ENTRY_SIZE)
         entry[0] = 1
         entry[1] = len(name_bytes)
-        entry[4:8] = next_sector.to_bytes(4, "little")
-        entry[8:12] = len(contents).to_bytes(4, "little")
-        entry[12:16] = sector_count.to_bytes(4, "little")
-        entry[16:16 + len(name_bytes)] = name_bytes
-        directory_offset = offset + SECTOR_SIZE + index * 32
-        image[directory_offset:directory_offset + 32] = entry
+        entry[4:12] = next_sector.to_bytes(8, "little")
+        entry[12:20] = len(contents).to_bytes(8, "little")
+        entry[20:28] = sector_count.to_bytes(8, "little")
+        entry[28:28 + len(name_bytes)] = name_bytes
+        directory_offset = offset + SECTOR_SIZE + index * ENTRY_SIZE
+        image[directory_offset:directory_offset + ENTRY_SIZE] = entry
         file_offset = offset + next_sector * SECTOR_SIZE
         image[file_offset:file_offset + len(contents)] = contents
         next_sector += sector_count
@@ -80,6 +88,73 @@ def pad(data: bytes, sectors: int) -> bytes:
     if len(data) > sectors * SECTOR_SIZE:
         raise ValueError(f"artifact exceeds its {sectors}-sector allocation")
     return data.ljust(sectors * SECTOR_SIZE, b"\0")
+
+
+def guid_bytes(text: str) -> bytes:
+    """Encode a deterministic GPT GUID in the on-disk mixed-endian form."""
+    words = text.split("-")
+    if len(words) != 5:
+        raise ValueError(f"invalid GUID {text!r}")
+    first = int(words[0], 16).to_bytes(4, "little")
+    second = int(words[1], 16).to_bytes(2, "little")
+    third = int(words[2], 16).to_bytes(2, "little")
+    return first + second + third + bytes.fromhex(words[3] + words[4])
+
+
+def write_gpt(image: bytearray, payload_sectors: int) -> None:
+    """Write a protective MBR and primary/backup GPT metadata."""
+    image[446:462] = bytes([0, 0, 2, 0, 0xEE, 0xFF, 0xFF, 0xFF]) + (
+        1
+    ).to_bytes(4, "little") + min(IMAGE_SECTORS - 1, 0xFFFFFFFF).to_bytes(4, "little")
+    image[462:510] = b"\0" * 48
+
+    entries = bytearray(GPT_ENTRY_COUNT * GPT_ENTRY_SIZE)
+    fosfs_type = guid_bytes("0f6f7362-0000-4f53-8000-000000000004")
+    payload_type = guid_bytes("0f6f7362-0000-4f53-8000-000000000001")
+    payload_guid = guid_bytes("0f6f7362-0000-4f53-8000-000000000002")
+    data_guid = guid_bytes("0f6f7362-0000-4f53-8000-000000000003")
+    entries[0:16] = payload_type
+    entries[16:32] = payload_guid
+    struct.pack_into("<QQ", entries, 32, PAYLOAD_START_LBA, PAYLOAD_START_LBA + payload_sectors - 1)
+    entries[56:56 + len("FOS payload".encode("utf-16le"))] = "FOS payload".encode("utf-16le")
+    entries[128:144] = fosfs_type
+    entries[144:160] = data_guid
+    struct.pack_into(
+        "<QQ",
+        entries,
+        160,
+        DATA_START_LBA,
+        DATA_START_LBA + DATA_SECTORS - 1,
+    )
+    entries[184:184 + len("FOSFS data".encode("utf-16le"))] = "FOSFS data".encode("utf-16le")
+
+    def header(current: int, backup: int, entries_lba: int) -> bytes:
+        raw = bytearray(SECTOR_SIZE)
+        raw[:8] = b"EFI PART"
+        struct.pack_into("<I", raw, 8, 0x00010000)
+        struct.pack_into("<I", raw, 12, 92)
+        struct.pack_into("<Q", raw, 24, current)
+        struct.pack_into("<Q", raw, 32, backup)
+        struct.pack_into("<QQ", raw, 40, 34, IMAGE_SECTORS - 34)
+        raw[56:72] = guid_bytes("0f6f7362-0000-4f53-8000-000000000010")
+        struct.pack_into("<Q", raw, 72, entries_lba)
+        struct.pack_into("<I", raw, 80, GPT_ENTRY_COUNT)
+        struct.pack_into("<I", raw, 84, GPT_ENTRY_SIZE)
+        struct.pack_into("<I", raw, 88, zlib.crc32(entries) & 0xFFFFFFFF)
+        crc = zlib.crc32(raw[:92]) & 0xFFFFFFFF
+        struct.pack_into("<I", raw, 16, crc)
+        return bytes(raw)
+
+    primary_entries = GPT_PRIMARY_ENTRIES_LBA * SECTOR_SIZE
+    backup_entries = GPT_BACKUP_ENTRIES_LBA * SECTOR_SIZE
+    image[primary_entries:primary_entries + len(entries)] = entries
+    image[backup_entries:backup_entries + len(entries)] = entries
+    image[GPT_PRIMARY_HEADER_LBA * SECTOR_SIZE:(GPT_PRIMARY_HEADER_LBA + 1) * SECTOR_SIZE] = header(
+        GPT_PRIMARY_HEADER_LBA, GPT_BACKUP_HEADER_LBA, GPT_PRIMARY_ENTRIES_LBA
+    )
+    image[GPT_BACKUP_HEADER_LBA * SECTOR_SIZE:(GPT_BACKUP_HEADER_LBA + 1) * SECTOR_SIZE] = header(
+        GPT_BACKUP_HEADER_LBA, GPT_PRIMARY_HEADER_LBA, GPT_BACKUP_ENTRIES_LBA
+    )
 
 
 def main() -> None:
@@ -110,22 +185,8 @@ def main() -> None:
 
     image = bytearray(MIN_IMAGE_SECTORS * SECTOR_SIZE)
     image[:SECTOR_SIZE] = stage1
-    partition_offset = 446
     payload_sectors = STAGE2_SECTORS + kernel_sectors
-    # Two classic 16-byte MBR partition table entries. Byte 0 is the boot
-    # flag (0x80 = active/bootable), byte 4 is the partition type (0x02,
-    # arbitrarily chosen to mean "fos raw payload"/"fos FOSFS data" -- no
-    # real OS needs to recognize these types), bytes 1-3 and 5-7 are
-    # legacy CHS start/end fields that BIOS EDD/LBA reads ignore, so they
-    # are filled with the conventional "ignore me" sentinel 0xda,0xff,0xff,
-    # followed by the LBA start and sector count that this loader actually
-    # uses.
-    image[partition_offset:partition_offset + 16] = bytes([
-        0x80, 0, 2, 0, 0xda, 0xff, 0xff, 0xff,
-    ]) + PAYLOAD_START_LBA.to_bytes(4, "little") + payload_sectors.to_bytes(4, "little")
-    image[partition_offset + 16:partition_offset + 32] = bytes([
-        0, 0, 2, 0, 0xda, 0xff, 0xff, 0xff,
-    ]) + DATA_START_LBA.to_bytes(4, "little") + DATA_SECTORS.to_bytes(4, "little")
+    write_gpt(image, payload_sectors)
     image[PAYLOAD_START_LBA * SECTOR_SIZE:(PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE] = stage2
     kernel_start = (PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE
     image[kernel_start:kernel_start + len(kernel)] = kernel

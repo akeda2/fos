@@ -114,6 +114,8 @@ run: image
 	qemu-system-i386 -drive format=raw,file=$(IMAGE) -serial stdio -monitor none -no-reboot -no-shutdown
 
 test: image
+	python3 tools/test_gpt.py
+	python3 tools/test_tape_elf.py
 	python3 tools/qemu_smoke.py --image $(IMAGE)
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic dual-e1000
@@ -169,7 +171,7 @@ tape-primes:
 tape-hello-rs:
 	cd tapes/hello-rs && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/hello-rs/target/i686-fos/release/hello-tape $(TAPE_HELLO_RS_BIN)
+	cp tapes/hello-rs/target/i686-fos/release/hello-tape $(TAPE_HELLO_RS_BIN)
 
 # Builds the "vga-colors" test tape: same fixed-address Rust setup as
 # tape-hello-rs above, but demonstrating the tape ABI's second callback
@@ -184,7 +186,7 @@ tape-hello-rs:
 tape-vga-colors:
 	cd tapes/vga-colors && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/vga-colors/target/i686-fos/release/vga-colors-tape $(TAPE_VGA_COLORS_BIN)
+	cp tapes/vga-colors/target/i686-fos/release/vga-colors-tape $(TAPE_VGA_COLORS_BIN)
 
 # Builds the "bigsieve" test tape: same fixed-address Rust setup as
 # tape-hello-rs above, but demonstrating the tape ABI's third and fourth
@@ -200,7 +202,7 @@ tape-vga-colors:
 tape-bigsieve:
 	cd tapes/bigsieve && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/bigsieve/target/i686-fos/release/bigsieve-tape $(TAPE_BIGSIEVE_BIN)
+	cp tapes/bigsieve/target/i686-fos/release/bigsieve-tape $(TAPE_BIGSIEVE_BIN)
 
 # Builds the "longmode" test tape: fos's own hand-written assembly
 # `tape64_body` (tapes/longmode.S) linked against the reusable mode-
@@ -270,7 +272,7 @@ tape-longmode-rs:
 tape-calc:
 	cd tapes/calc && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/calc/target/i686-fos/release/calc-tape $(TAPE_CALC_BIN)
+	cp tapes/calc/target/i686-fos/release/calc-tape $(TAPE_CALC_BIN)
 
 # Builds the "beep" test tape: a 32-bit Rust tape using the newest
 # twelve-argument ABI and `read_key` to drive the PC speaker directly.
@@ -280,7 +282,7 @@ tape-calc:
 tape-beep:
 	cd tapes/beep && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/beep/target/i686-fos/release/beep-tape $(TAPE_BEEP_BIN)
+	cp tapes/beep/target/i686-fos/release/beep-tape $(TAPE_BEEP_BIN)
 
 # Builds the "morse" test tape: a 32-bit Rust tape using the twelve-argument
 # ABI and `read_key` to turn each A-Z/0-9 input character into a printed
@@ -288,7 +290,7 @@ tape-beep:
 tape-morse:
 	cd tapes/morse && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/morse/target/i686-fos/release/morse-tape $(TAPE_MORSE_BIN)
+	cp tapes/morse/target/i686-fos/release/morse-tape $(TAPE_MORSE_BIN)
 
 # Builds the "net-chat" test tape: a 32-bit Rust implementation of fos's
 # shell-compatible raw Ethernet chat protocol using the kernel-managed NIC
@@ -296,7 +298,7 @@ tape-morse:
 tape-net-chat:
 	cd tapes/net-chat && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/net-chat/target/i686-fos/release/net-chat-tape $(TAPE_NET_CHAT_BIN)
+	cp tapes/net-chat/target/i686-fos/release/net-chat-tape $(TAPE_NET_CHAT_BIN)
 
 # Builds the "ip-chat" protocol tape: a 32-bit Rust UDP-over-IPv4 chat
 # application using tape-net for ARP/IPv4/UDP and DHCP. Static mode is the
@@ -305,7 +307,7 @@ tape-net-chat:
 tape-ip-chat:
 	cd tapes/ip-chat && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/ip-chat/target/i686-fos/release/ip-chat-tape $(TAPE_IP_CHAT_BIN)
+	cp tapes/ip-chat/target/i686-fos/release/ip-chat-tape $(TAPE_IP_CHAT_BIN)
 
 test-tape-net:
 	cargo +nightly-2026-09-13 test --manifest-path tapes/tape-net/Cargo.toml
@@ -319,7 +321,7 @@ test-tape-ip-chat:
 tape-telnet:
 	cd tapes/telnet && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/telnet/target/i686-fos/release/telnet-tape $(TAPE_TELNET_BIN)
+	cp tapes/telnet/target/i686-fos/release/telnet-tape $(TAPE_TELNET_BIN)
 
 test-tape-telnet:
 	cargo +nightly-2026-09-13 test --manifest-path tapes/telnet/Cargo.toml --lib
@@ -330,7 +332,7 @@ test-tape-telnet:
 tape-bridge:
 	cd tapes/bridge && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/bridge/target/i686-fos/release/bridge-tape $(TAPE_BRIDGE_BIN)
+	cp tapes/bridge/target/i686-fos/release/bridge-tape $(TAPE_BRIDGE_BIN)
 
 test-tape-bridge: image tape-bridge
 	python3 tapes/test_bridge_e2e.py
@@ -338,7 +340,7 @@ test-tape-bridge: image tape-bridge
 tape-router:
 	cd tapes/router && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/router/target/i686-fos/release/router-tape $(TAPE_ROUTER_BIN)
+	cp tapes/router/target/i686-fos/release/router-tape $(TAPE_ROUTER_BIN)
 
 test-tape-router: image tape-router
 	python3 tapes/test_router_e2e.py

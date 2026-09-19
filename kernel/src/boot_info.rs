@@ -1,5 +1,5 @@
 pub const BOOT_INFO_MAGIC: u32 = 0x464F_5342;
-pub const BOOT_INFO_VERSION: u16 = 2;
+pub const BOOT_INFO_VERSION: u16 = 3;
 pub const MAX_MEMORY_REGIONS: usize = 32;
 
 #[repr(C, packed)]
@@ -22,9 +22,9 @@ pub struct BootInfo {
     pub kernel_start: u32,
     pub kernel_end: u32,
     pub bios_disk_io: u32,
-    pub disk_sector_count: u32,
-    pub data_partition_lba: u32,
-    pub data_partition_sectors: u32,
+    pub disk_sector_count: u64,
+    pub data_partition_lba: u64,
+    pub data_partition_sectors: u64,
     pub memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS],
 }
 

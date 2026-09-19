@@ -1,10 +1,12 @@
 # Rust tape programming for dummies
 
-A "tape" is the smallest possible fos program: a tiny freestanding binary
-that gets loaded into a fixed 4 MiB region of physical memory
-(`pmem::TAPE_BASE`, `0x100000`) and run with a single `call` from the
-shell's `tape run` command. No filesystem, no process table, no
-built-in heap, no paging -- just your code, a stack it borrows from the
+A "tape" is the smallest possible fos program: a tiny freestanding ELF32
+`ET_EXEC` image whose `PT_LOAD` segments are validated and materialized by
+the shell's loader. The initial migration image region is the historical
+fixed 4 MiB physical area (`pmem::TAPE_BASE`, `0x100000`), and legacy raw
+flat binaries remain accepted while older tapes are modernized. No
+filesystem, no process table, no built-in heap, no paging -- just your
+code, a stack it borrows from the
 kernel, and a handful of function pointers the kernel hands you to talk
 to the outside world (including, if you need it, a way to borrow memory
 far bigger than that fixed 4 MiB region -- see section 6 -- and a
@@ -21,11 +23,11 @@ document only covers the "how".
 
 ## 1. What a tape actually is
 
-A tape is a flat binary blob: not an ELF file, not anything with headers
-or sections a loader has to parse -- just raw machine code and data bytes,
-copied verbatim into memory starting at `0x100000` and then jumped into.
-That's why building one means compiling normally, then stripping away
-everything but the raw bytes with `objcopy -O binary`.
+A new Rust tape is an ELF32 file. The loader ignores section headers and
+uses only validated `PT_LOAD` program headers, so the file retains its
+entry point, segment sizes, and BSS metadata. A raw flat image is still a
+deliberate compatibility fallback, but new tapes should keep the linker
+output intact rather than stripping it with `objcopy -O binary`.
 The call uses the kernel's 32 KiB stack, not a private tape stack; keep
 fixed local buffers bounded, especially when a tape is launched from a
 nested `term net` command.
@@ -317,7 +319,7 @@ tape-your-tape:
 		-Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem \
 		-Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	objcopy -O binary tapes/your-tape/target/i686-fos/release/your-tape-bin-name \
+	cp tapes/your-tape/target/i686-fos/release/your-tape-bin-name \
 		$(BUILD)/tapes/your-tape.bin
 ```
 
@@ -332,9 +334,10 @@ make tape-your-tape
 
 This runs `cargo build` against the kernel's own custom `i686-fos` target
 (the same `-Z build-std` unstable-cargo dance the kernel itself needs,
-since there's no prebuilt `std`/`core` for this target), then strips the
-resulting ELF down to a raw flat binary with `objcopy -O binary` -- the
-same two-step process for every tape, Rust or assembly.
+since there's no prebuilt `std`/`core` for this target), then copies the
+ELF32 output unchanged. The fixed-address linker script keeps the first
+migration images compatible with the loader; future position-independent
+`ET_DYN` images can use the same workflow once relocation support is added.
 
 ## 5. Loading and running it
 

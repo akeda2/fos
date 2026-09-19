@@ -28,7 +28,9 @@ that obscure hardware behavior.
   shell calls on that stack, so fixed packet/state buffers must leave headroom
   for the surrounding `term net` call chain; do not grow tape-local arrays
   casually without checking the stack budget.
-- The packed version-2 `BootInfo` at physical `0x5000` is the loader/kernel ABI.
+- The packed version-3 `BootInfo` at physical `0x5000` is the loader/kernel ABI;
+  its disk geometry fields are 64-bit so GPT-discovered LBAs can survive the
+  boot handoff.
   Validate its magic, version, size, and count before using it. Use unaligned
   reads for packed multi-byte fields.
 - `kernel/src/disk.rs` invokes the stage-two BIOS EDD trampoline. It performs
@@ -45,9 +47,10 @@ that obscure hardware behavior.
 - `kernel/src/pmem.rs` is a small bitmap-based physical-frame allocator (4 KiB
   frames) built from the E820 map; it reserves everything below the kernel's
   own low-memory region. There is no paging.
-- `kernel/src/fosfs.rs` implements FOSFS version 2, a deliberately small
-  flat custom filesystem: one superblock, four directory sectors, 64 fixed
-  entries, and contiguous multi-sector files with bounded first-fit reuse.
+- `kernel/src/fosfs.rs` implements FOSFS version 3, a deliberately small
+  flat custom filesystem: one superblock, eight directory sectors, 64 fixed
+  64-byte entries, 64-bit contiguous multi-sector extents, and bounded
+  first-fit reuse. Multi-extent files remain a future extension.
 - `boot/netrom.S` is an optional, parallel boot path: a PCI expansion ROM that
   boots fos from a NIC's own boot ROM instead of disk/USB (`make netrom`,
   producing `build/netboot.rom`; never part of `make image`/`run`/`test`).
@@ -107,21 +110,26 @@ those details implicit.
 
 ## Disk image and safety
 
-`tools/build_image.py` creates `build/fos.img`, a 16 MiB raw image:
+`tools/build_image.py` creates `build/fos.img`, a 16 MiB raw image with a
+protective MBR and primary/backup GPT metadata:
 
 | Location | Contents |
 | --- | --- |
 | LBA 0 | MBR / stage-one loader |
-| LBA 2048 | Active raw boot payload partition |
+| LBA 2048 | GPT boot payload partition |
 | First 32 payload sectors | Stage-two loader |
 | Following payload sectors | Flat 32-bit Rust kernel |
-| LBA 4096 | Dedicated 28672-sector FOSFS data partition containing README and all compiled tapes |
+| LBA 4096 | Dedicated 28639-sector GPT-discovered FOSFS data partition containing README and all compiled tapes |
+| Final 33 sectors | Backup GPT entry array and header |
 
-The image builder is the single source of truth for partition placement.
-`tools/write_layout.py` emits matching stage-loader constants from the actual
-kernel size. Never add host block-device writes, automatic device selection,
-or commands that let FOSFS write outside its own partition. Copying an image
-to a device is destructive and must remain an explicit user action.
+The image builder is the single source of truth for partition placement and
+writes both GPT copies. The kernel validates the primary GPT and discovers the
+FOSFS partition by its type GUID, with loader-provided geometry retained as a
+compatibility fallback for older images. `tools/write_layout.py` emits
+matching stage-loader constants from the actual kernel size. Never add host
+block-device writes, automatic device selection, or commands that let FOSFS
+write outside its own partition. Copying an image to a device is destructive
+and must remain an explicit user action.
 
 ## Build and validation
 
@@ -390,13 +398,18 @@ meant to be re-run against the same test machine over and over. `--mac`/
 `--mac-file` remain available to skip discovery entirely.
 
 `tape load disk NAME` reuses `fosfs::read` and now reads the complete
-contiguous multi-sector file into the fixed tape buffer. The generated image
-preloads every compiled tape, so a fresh boot can run them without a network
-transfer. `write NAME TEXT` remains the interactive printable-ASCII path;
-binary files are installed by the host-side image builder.
+multi-sector file into the tape image buffer. New Rust tape files are ELF32
+`ET_EXEC` images: the loader validates the i386 header and program-header
+table, materializes only `PT_LOAD` segments, clears BSS tails, and records the
+validated entry point. Legacy raw flat files remain accepted during migration.
+The generated image preloads every compiled tape, so a fresh boot can run them
+without a network transfer. `write NAME TEXT` remains the interactive
+printable-ASCII path; binary files are installed by the host-side image
+builder.
 
 `tape run` is a bare `unsafe extern "C" fn()` `call` (via
-`core::mem::transmute`) to the loaded buffer's physical address, which
+`core::mem::transmute`) to the validated ELF entry point (or the loaded
+buffer's address for a legacy flat file), which
 this kernel's flat, unpaged memory model lets it also treat directly as a
 usable pointer -- the same convention `rtl8139.rs`'s own DMA buffers rely
 on. A tape that ends with a near `ret` returns control to the shell

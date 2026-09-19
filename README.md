@@ -413,11 +413,19 @@ round.
 ### Tape (`tape`)
 
 `tape` treats a chunk of memory as a paper tape: something you load, then
-separately choose to run. A tape is a flat binary always loaded at one
-fixed physical address (`0x100000`, 4 MiB reserved -- see `pmem::TAPE_BASE`/
-`TAPE_LEN` in `kernel/src/pmem.rs`), the exact same convention the kernel
-itself is loaded and entered with (see `linker.ld`/`boot/stage2.S`, fixed
-at `0x10000`) -- executed by a bare `call` to its first byte, in ring 0,
+separately choose to run. New Rust tapes are stored as ELF32 `ET_EXEC`
+images. The loader validates the i386 ELF header, loads only `PT_LOAD`
+segments, clears each segment's BSS tail, validates the entry point, and
+then calls it in ring 0. During migration, legacy raw flat binaries remain
+accepted and are executed from the historical fixed physical address
+(`0x100000`, 4 MiB reserved -- see `pmem::TAPE_BASE`/`TAPE_LEN` in
+`kernel/src/pmem.rs`).
+Both formats run on the kernel's own stack with absolutely no memory
+protection: this kernel has no userspace or paging (see "Current
+boundaries" below), so a tape is trusted exactly as much as any other kernel
+code. The ELF32 migration currently supports fixed-address `ET_EXEC`; a
+future `ET_DYN`/relocation loader can reuse the same program-header and tape
+metadata path without changing the tape callback ABI.
 on the kernel's own stack, with absolutely no memory protection: this
 kernel has no userspace or paging (see "Current boundaries" below), so a
 tape is trusted exactly as much as any other kernel code. Ending with a
@@ -432,8 +440,8 @@ as `tapes/primes.S` shows), which is what makes writing a tape in a
 compiled language like Rust or C practical -- see "Test tape:
 `tapes/hello-rs/`" below.
 
-A tape can be loaded two ways. `tape load disk NAME` reads a complete flat,
-multi-sector FOSFS file straight into the fixed tape buffer. The generated
+A tape can be loaded two ways. `tape load disk NAME` reads a complete
+multi-sector FOSFS file straight into the tape image buffer. The generated
 image contains every compiled tape under a short uppercase `.BIN` name, so
 they can be loaded locally without a network sender; `write NAME TEXT` remains
 the small interactive text-file path rather than a binary import mechanism.
@@ -442,7 +450,7 @@ the small interactive text-file path rather than a binary import mechanism.
 discover`) declares the transfer's total length, then any number of
 `TAPE_TAG_DATA` frames each carry an explicit sequence number and up to
 1024 bytes, until one `TAPE_TAG_STOP` frame closes it. The receiver
-checks the declared length fits the fixed 4 MiB tape region and computes
+checks the declared length fits the current tape image region and computes
 each chunk's exact byte count from its sequence number and the declared
 total length, never from the frame's own (possibly padded) received
 length, so a genuine binary tape's own trailing zero bytes are never
@@ -450,6 +458,12 @@ mistaken for padding the way `chat`'s text frames get away with
 trimming. A skipped or reordered sequence number aborts that attempt
 rather than silently loading a corrupt tape, since this deliberately
 simple protocol has no retransmission.
+
+Each successful load receives a monotonically increasing tape handle shown by
+`tape status`. The shell still exposes one active image today, but keeping the
+handle, format, entry point, and image length as explicit metadata avoids
+another ABI change when resident images and `tape select`/tape-to-tape loading
+are added.
 
 The other end of a network load can be another fos machine's `tape send
 NAME PEER_MAC|PEER_NUMBER` (reads a FOSFS file and streams it out, reusing
@@ -1028,21 +1042,23 @@ UEFI-only machines and CHS-only BIOS disk services are unsupported.
 
 ## Disk image layout
 
-`build/fos.img` is a 16 MiB raw disk image:
+`build/fos.img` is a 16 MiB raw disk image with protective MBR and primary/
+backup GPT metadata:
 
 - Sector 0: MBR and stage-one loader.
-- LBA 2048: active raw payload partition.
+- LBA 1: primary GPT header; LBAs 2-33: GPT partition entries.
+- LBA 2048: GPT payload partition.
 - First 32 payload sectors: stage-two loader.
 - Remaining payload sectors: flat kernel image at physical `0x10000`.
-- LBA 4096: a separate 28672-sector FOSFS data partition containing
+- LBA 4096: a separate 28639-sector FOSFS data partition containing
   `README.TXT` and every compiled tape.
+- Final 33 sectors: backup GPT entries and header.
 
 `tools/write_layout.py` generates the loader constants from the actual kernel
-size. Stage two loads the kernel with multiple bounded BIOS EDD transfers so
-no transfer crosses a 64 KiB real-mode boundary; the image builder rejects
-kernels that exceed the reserved `0x10000..0x40000` load region. It
-preformats only the image's own FOSFS data partition; it does not touch host
-storage.
+size. The kernel validates the GPT and discovers the FOSFS partition by its
+GPT type GUID, falling back to the loader-provided geometry for older images.
+The image builder preformats only the image's own FOSFS data partition; it
+does not touch host storage.
 
 ## Physical media warning
 

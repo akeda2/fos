@@ -27,7 +27,8 @@ IMAGE_SECTORS = 32768
 # LBA and size of the dedicated FOSFS data partition, kept separate from the
 # boot payload partition so formatting FOSFS can never touch loader code.
 DATA_START_LBA = 4096
-DATA_SECTORS = 28672
+# Leave the final 33 sectors for the backup GPT header and entry array.
+DATA_SECTORS = IMAGE_SECTORS - DATA_START_LBA - 33
 
 
 def sector_count(path: Path) -> int:
@@ -57,9 +58,12 @@ def main() -> None:
         f".set KERNEL_LBA, {PAYLOAD_START_LBA + STAGE2_SECTORS}\n"
         f".set KERNEL_SECTORS, {kernel_sectors}\n"
         f".set KERNEL_END, {KERNEL_RESERVED_END}\n"
-        f".set IMAGE_SECTORS, {IMAGE_SECTORS}\n"
-        f".set DATA_START_LBA, {DATA_START_LBA}\n"
-        f".set DATA_SECTORS, {DATA_SECTORS}\n"
+        f".set IMAGE_SECTORS_LO, {IMAGE_SECTORS & 0xffffffff}\n"
+        f".set IMAGE_SECTORS_HI, {IMAGE_SECTORS >> 32}\n"
+        f".set DATA_START_LBA_LO, {DATA_START_LBA & 0xffffffff}\n"
+        f".set DATA_START_LBA_HI, {DATA_START_LBA >> 32}\n"
+        f".set DATA_SECTORS_LO, {DATA_SECTORS & 0xffffffff}\n"
+        f".set DATA_SECTORS_HI, {DATA_SECTORS >> 32}\n"
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(content, encoding="ascii")

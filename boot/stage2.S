@@ -4,10 +4,14 @@
 
 .set STAGE2_BASE, 0x8000
 .set BOOT_INFO, 0x5000
-.set MEMORY_MAP, BOOT_INFO + 36
+.set MEMORY_MAP, BOOT_INFO + 48
 .set MAX_MEMORY_REGIONS, 32
 .set COM1, 0x3f8
 .set DISK_REQUEST, 0x5400
+# DISK_REQUEST holds the protected-mode call arguments and a 16-byte EDD
+# packet. Its fields are: direction byte at +0, status byte at +1, BIOS
+# drive at +2, LBA low/high dwords at +4/+8, buffer physical address at +12,
+# and the DAP at +16.
 .set DISK_SAVED_ESP, 0x5440
 
 .global _start
@@ -58,12 +62,12 @@ halt:
 initialize_boot_info:
     movw $BOOT_INFO, %di
     xorw %ax, %ax
-    movw $(36 + MAX_MEMORY_REGIONS * 24) / 2, %cx
+    movw $(48 + MAX_MEMORY_REGIONS * 24) / 2, %cx
     rep stosw
     movw $0x5342, BOOT_INFO
     movw $0x464f, BOOT_INFO + 2
-    movw $2, BOOT_INFO + 4
-    movw $(36 + MAX_MEMORY_REGIONS * 24), BOOT_INFO + 6
+    movw $3, BOOT_INFO + 4
+    movw $(48 + MAX_MEMORY_REGIONS * 24), BOOT_INFO + 6
     movb boot_drive + STAGE2_BASE, %al
     movb %al, BOOT_INFO + 8
     movb serial_available + STAGE2_BASE, %al
@@ -71,9 +75,12 @@ initialize_boot_info:
     movl $0x10000, BOOT_INFO + 12
     movl $KERNEL_END, BOOT_INFO + 16
     movl $(bios_disk_io + STAGE2_BASE), BOOT_INFO + 20
-    movl $IMAGE_SECTORS, BOOT_INFO + 24
-    movl $DATA_START_LBA, BOOT_INFO + 28
-    movl $DATA_SECTORS, BOOT_INFO + 32
+    movl $IMAGE_SECTORS_LO, BOOT_INFO + 24
+    movl $IMAGE_SECTORS_HI, BOOT_INFO + 28
+    movl $DATA_START_LBA_LO, BOOT_INFO + 32
+    movl $DATA_START_LBA_HI, BOOT_INFO + 36
+    movl $DATA_SECTORS_LO, BOOT_INFO + 40
+    movl $DATA_SECTORS_HI, BOOT_INFO + 44
     ret
 
 collect_memory_map:
@@ -426,11 +433,13 @@ bios_disk_io:
     movl 12(%ebp), %eax
     movl %eax, DISK_REQUEST + 4
     movl 16(%ebp), %eax
+    movl %eax, DISK_REQUEST + 8
+    movl 20(%ebp), %eax
     testl $0x0f, %eax
     jnz bios_disk_invalid
     cmpl $0x100000, %eax
     jae bios_disk_invalid
-    movl %eax, DISK_REQUEST + 8
+    movl %eax, DISK_REQUEST + 12
     movb BOOT_INFO + 8, %al
     movb %al, DISK_REQUEST + 2
     ljmp $0x18, $(bios_disk_protected16 + STAGE2_BASE)
@@ -460,17 +469,18 @@ bios_disk_real:
     movw %ax, %es
     movw %ax, %ss
     movw $0x7a00, %sp
-    movw $0x0010, DISK_REQUEST + 12
-    movw $1, DISK_REQUEST + 14
+    movw $0x0010, DISK_REQUEST + 16
+    movw $1, DISK_REQUEST + 18
     movl DISK_REQUEST + 4, %eax
-    movl %eax, DISK_REQUEST + 20
-    movl $0, DISK_REQUEST + 24
+    movl %eax, DISK_REQUEST + 24
     movl DISK_REQUEST + 8, %eax
+    movl %eax, DISK_REQUEST + 28
+    movl DISK_REQUEST + 12, %eax
     shrl $4, %eax
-    movw %ax, DISK_REQUEST + 18
-    movw $0, DISK_REQUEST + 16
+    movw %ax, DISK_REQUEST + 22
+    movw $0, DISK_REQUEST + 20
     movb DISK_REQUEST + 2, %dl
-    movw $DISK_REQUEST + 12, %si
+    movw $DISK_REQUEST + 16, %si
     cmpb $0, DISK_REQUEST
     jne bios_disk_write
     movb $0x42, %ah

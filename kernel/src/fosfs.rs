@@ -3,44 +3,40 @@ use crate::console;
 use crate::disk;
 use crate::{print, println};
 
-const MAGIC: &[u8; 8] = b"FOSFS2\0\0";
-const VERSION: u16 = 2;
+const MAGIC: &[u8; 8] = b"FOSFS3\0\0";
+const VERSION: u16 = 3;
 const SECTOR_SIZE: usize = 512;
-const DIRECTORY_SECTORS: u32 = 4;
-const DATA_START: u32 = 5;
-const ENTRY_SIZE: usize = 32;
+const DIRECTORY_SECTORS: u64 = 8;
+const DATA_START: u64 = 9;
+const ENTRY_SIZE: usize = 64;
 const ENTRIES_PER_SECTOR: usize = SECTOR_SIZE / ENTRY_SIZE;
 const MAX_ENTRIES: usize = DIRECTORY_SECTORS as usize * ENTRIES_PER_SECTOR;
 const MAX_NAME_LENGTH: usize = 16;
 
 #[derive(Clone, Copy)]
 struct FileEntry {
-    directory_lba: u32,
+    directory_lba: u64,
     index: usize,
-    start_sector: u32,
-    length: u32,
-    sector_count: u32,
+    start_sector: u64,
+    length: u64,
+    sector_count: u64,
     name: [u8; MAX_NAME_LENGTH],
     name_length: usize,
 }
 
 #[derive(Clone, Copy)]
 struct Extent {
-    start_sector: u32,
-    sector_count: u32,
-    directory_lba: u32,
+    start_sector: u64,
+    sector_count: u64,
+    directory_lba: u64,
     index: usize,
 }
 
-/// Distinguishes why a `write` did or did not succeed, so the shell can
-/// report a deterministic, specific reason instead of a generic failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteOutcome {
     Written,
     InvalidName,
-    /// All `DIRECTORY_SECTORS * ENTRIES_PER_SECTOR` directory slots are in use.
     DirectoryFull,
-    /// The data region has no contiguous extent large enough for the file.
     DataFull,
 }
 
@@ -56,9 +52,9 @@ pub fn format(info: &BootInfo) -> Result<(), disk::Error> {
         put_u16(sector, 8, VERSION);
         put_u16(sector, 10, ENTRY_SIZE as u16);
         put_u32(sector, 12, 1);
-        put_u32(sector, 16, DIRECTORY_SECTORS);
-        put_u32(sector, 20, DATA_START);
-        put_u32(sector, 24, sectors - DATA_START);
+        put_u32(sector, 16, DIRECTORY_SECTORS as u32);
+        put_u64(sector, 20, DATA_START);
+        put_u64(sector, 28, sectors - DATA_START);
     })?;
     for sector in 0..DIRECTORY_SECTORS {
         disk::write_sector(info, base + 1 + sector, |contents| contents.fill(0))?;
@@ -86,12 +82,12 @@ pub fn cat(info: &BootInfo, name: &[u8]) -> Result<bool, disk::Error> {
         return Ok(false);
     };
     let base = disk::data_partition_lba(info);
-    let mut remaining = entry.length as usize;
+    let mut remaining = entry.length;
     for sector in 0..entry.sector_count {
         disk::read_sector(info, base + entry.start_sector + sector, |contents| {
-            let length = remaining.min(SECTOR_SIZE);
+            let length = remaining.min(SECTOR_SIZE as u64) as usize;
             console::write_bytes(&contents[..length]);
-            remaining -= length;
+            remaining -= length as u64;
         })?;
     }
     if entry.length != 0 {
@@ -101,36 +97,39 @@ pub fn cat(info: &BootInfo, name: &[u8]) -> Result<bool, disk::Error> {
 }
 
 /// Returns a file's exact byte length, or `None` if the flat name is absent.
-pub fn file_length(info: &BootInfo, name: &[u8]) -> Result<Option<usize>, disk::Error> {
+pub fn file_length(info: &BootInfo, name: &[u8]) -> Result<Option<u64>, disk::Error> {
     validate(info)?;
-    Ok(find_entry(info, name)?.map(|entry| entry.length as usize))
+    Ok(find_entry(info, name)?.map(|entry| entry.length))
 }
 
 /// Reads a whole file's raw bytes into `buffer`, returning its exact length,
 /// or `None` if no such file exists. The caller must provide enough space for
-/// the complete file; silently truncating a tape would turn valid machine
-/// code into an unrecoverable execution fault.
-pub fn read(info: &BootInfo, name: &[u8], buffer: &mut [u8]) -> Result<Option<usize>, disk::Error> {
+/// the complete file; silently truncating a tape would corrupt its image.
+pub fn read(
+    info: &BootInfo,
+    name: &[u8],
+    buffer: &mut [u8],
+) -> Result<Option<u64>, disk::Error> {
     validate(info)?;
     let Some(entry) = find_entry(info, name)? else {
         return Ok(None);
     };
-    if entry.length as usize > buffer.len() {
+    if entry.length > buffer.len() as u64 {
         return Err(disk::Error::OutOfRange);
     }
     let base = disk::data_partition_lba(info);
-    let mut remaining = entry.length as usize;
+    let mut remaining = entry.length;
     let mut destination_offset = 0;
     for sector in 0..entry.sector_count {
         disk::read_sector(info, base + entry.start_sector + sector, |contents| {
-            let length = remaining.min(SECTOR_SIZE);
+            let length = remaining.min(SECTOR_SIZE as u64) as usize;
             buffer[destination_offset..destination_offset + length]
                 .copy_from_slice(&contents[..length]);
             destination_offset += length;
-            remaining -= length;
+            remaining -= length as u64;
         })?;
     }
-    Ok(Some(entry.length as usize))
+    Ok(Some(entry.length))
 }
 
 pub fn write(info: &BootInfo, name: &[u8], text: &[u8]) -> Result<WriteOutcome, disk::Error> {
@@ -172,7 +171,7 @@ pub fn write(info: &BootInfo, name: &[u8], text: &[u8]) -> Result<WriteOutcome, 
             directory_lba,
             index,
             start_sector,
-            text.len(),
+            text.len() as u64,
             required_sectors,
             name,
         )?;
@@ -186,7 +185,7 @@ pub fn write(info: &BootInfo, name: &[u8], text: &[u8]) -> Result<WriteOutcome, 
         entry.directory_lba,
         entry.index,
         start_sector,
-        text.len(),
+        text.len() as u64,
         required_sectors,
         name,
     )?;
@@ -211,9 +210,9 @@ fn validate(info: &BootInfo) -> Result<(), disk::Error> {
             && get_u16(sector, 8) == VERSION
             && get_u16(sector, 10) == ENTRY_SIZE as u16
             && get_u32(sector, 12) == 1
-            && get_u32(sector, 16) == DIRECTORY_SECTORS
-            && get_u32(sector, 20) == DATA_START
-            && get_u32(sector, 24) == disk::data_partition_sectors(info) - DATA_START
+            && get_u32(sector, 16) == DIRECTORY_SECTORS as u32
+            && get_u64(sector, 20) == DATA_START
+            && get_u64(sector, 28) == disk::data_partition_sectors(info) - DATA_START
     })
     .and_then(|valid| {
         if valid {
@@ -237,7 +236,7 @@ fn find_entry(info: &BootInfo, name: &[u8]) -> Result<Option<FileEntry>, disk::E
     Ok(result)
 }
 
-fn find_free_slot(info: &BootInfo) -> Result<Option<(u32, usize)>, disk::Error> {
+fn find_free_slot(info: &BootInfo) -> Result<Option<(u64, usize)>, disk::Error> {
     let base = disk::data_partition_lba(info);
     for sector_offset in 0..DIRECTORY_SECTORS {
         let lba = base + 1 + sector_offset;
@@ -253,9 +252,9 @@ fn find_free_slot(info: &BootInfo) -> Result<Option<(u32, usize)>, disk::Error> 
 
 fn find_free_extent(
     info: &BootInfo,
-    sector_count: u32,
+    sector_count: u64,
     ignored: Option<Extent>,
-) -> Result<Option<u32>, disk::Error> {
+) -> Result<Option<u64>, disk::Error> {
     if sector_count == 0 {
         return Ok(Some(DATA_START));
     }
@@ -303,12 +302,12 @@ fn find_free_extent(
     Ok(None)
 }
 
-fn write_file_data(info: &BootInfo, start_sector: u32, data: &[u8]) -> Result<(), disk::Error> {
+fn write_file_data(info: &BootInfo, start_sector: u64, data: &[u8]) -> Result<(), disk::Error> {
     let base = disk::data_partition_lba(info);
     for (sector_index, chunk) in data.chunks(SECTOR_SIZE).enumerate() {
         disk::write_sector(
             info,
-            base + start_sector + sector_index as u32,
+            base + start_sector + sector_index as u64,
             |contents| {
                 contents.fill(0);
                 contents[..chunk.len()].copy_from_slice(chunk);
@@ -320,11 +319,11 @@ fn write_file_data(info: &BootInfo, start_sector: u32, data: &[u8]) -> Result<()
 
 fn write_directory_entry(
     info: &BootInfo,
-    directory_lba: u32,
+    directory_lba: u64,
     index: usize,
-    start_sector: u32,
-    length: usize,
-    sector_count: u32,
+    start_sector: u64,
+    length: u64,
+    sector_count: u64,
     name: &[u8],
 ) -> Result<(), disk::Error> {
     let mut directory = read_sector_copy(info, directory_lba)?;
@@ -332,10 +331,10 @@ fn write_directory_entry(
     directory[offset..offset + ENTRY_SIZE].fill(0);
     directory[offset] = 1;
     directory[offset + 1] = name.len() as u8;
-    put_u32(&mut directory, offset + 4, start_sector);
-    put_u32(&mut directory, offset + 8, length as u32);
-    put_u32(&mut directory, offset + 12, sector_count);
-    directory[offset + 16..offset + 16 + name.len()].copy_from_slice(name);
+    put_u64(&mut directory, offset + 4, start_sector);
+    put_u64(&mut directory, offset + 12, length);
+    put_u64(&mut directory, offset + 20, sector_count);
+    directory[offset + 28..offset + 28 + name.len()].copy_from_slice(name);
     disk::write_sector(info, directory_lba, |contents| *contents = directory)
 }
 
@@ -354,20 +353,20 @@ fn for_each_entry(
                 continue;
             }
             let name_length = usize::from(contents[offset + 1]);
-            let start_sector = get_u32(&contents, offset + 4);
-            let length = get_u32(&contents, offset + 8);
-            let sector_count = get_u32(&contents, offset + 12);
+            let start_sector = get_u64(&contents, offset + 4);
+            let length = get_u64(&contents, offset + 12);
+            let sector_count = get_u64(&contents, offset + 20);
             let end_sector = start_sector.saturating_add(sector_count);
             if name_length == 0
                 || name_length > MAX_NAME_LENGTH
                 || start_sector < DATA_START
                 || end_sector > data_end
-                || length > sector_count.saturating_mul(SECTOR_SIZE as u32)
+                || length > sector_count.saturating_mul(SECTOR_SIZE as u64)
             {
                 continue;
             }
             let mut name = [0; MAX_NAME_LENGTH];
-            name.copy_from_slice(&contents[offset + 16..offset + 32]);
+            name.copy_from_slice(&contents[offset + 28..offset + 44]);
             operation(FileEntry {
                 directory_lba: lba,
                 index,
@@ -382,12 +381,12 @@ fn for_each_entry(
     Ok(())
 }
 
-fn read_sector_copy(info: &BootInfo, lba: u32) -> Result<[u8; SECTOR_SIZE], disk::Error> {
+fn read_sector_copy(info: &BootInfo, lba: u64) -> Result<[u8; SECTOR_SIZE], disk::Error> {
     disk::read_sector(info, lba, |contents| *contents)
 }
 
-fn sectors_for_length(length: usize) -> u32 {
-    ((length + SECTOR_SIZE - 1) / SECTOR_SIZE) as u32
+fn sectors_for_length(length: usize) -> u64 {
+    ((length + SECTOR_SIZE - 1) / SECTOR_SIZE) as u64
 }
 
 fn valid_name(name: &[u8]) -> bool {
@@ -417,10 +416,27 @@ fn get_u32(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
+fn get_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
 fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }

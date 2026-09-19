@@ -17,6 +17,7 @@ const TERM_NET_IDLE_TICKS: u64 = 60 * 100;
 pub fn run(info: &BootInfo) -> ! {
     let keyboard_available = Keyboard::initialize().is_some();
     interrupts::initialize();
+    disk::initialize(info);
     if keyboard_available {
         println!("PS/2 keyboard initialized. Type 'help' for commands.");
     } else {
@@ -1488,6 +1489,10 @@ fn handle_incoming_chat_frame(
 /// a directly usable pointer -- the same convention `rtl8139.rs`'s own DMA
 /// buffers rely on.
 static mut TAPE: Option<(u32, u32)> = None;
+static mut TAPE_ENTRY: u32 = 0;
+static mut TAPE_ELF: bool = false;
+static mut TAPE_HANDLE: u32 = 0;
+static mut NEXT_TAPE_HANDLE: u32 = 1;
 
 /// Reads/writes `TAPE` through raw pointers (`&raw const`/`&raw mut`)
 /// rather than ever forming a `&`/`&mut` reference to the static, the same
@@ -1498,8 +1503,28 @@ fn tape_get() -> Option<(u32, u32)> {
     unsafe { *(&raw const TAPE) }
 }
 
-fn tape_set(value: Option<(u32, u32)>) {
-    unsafe { *(&raw mut TAPE) = value };
+fn tape_entry() -> u32 {
+    unsafe { *(&raw const TAPE_ENTRY) }
+}
+
+fn install_tape(address: u32, length: u32) -> bool {
+    let (entry, elf) = match load_elf32_image(address, length) {
+        Ok(Some(entry)) => (entry, true),
+        Ok(None) => (address, false),
+        Err(message) => {
+            println!("Tape rejected: {message}");
+            return false;
+        }
+    };
+    let handle = unsafe { *(&raw const NEXT_TAPE_HANDLE) };
+    unsafe {
+        *(&raw mut TAPE) = Some((address, length));
+        *(&raw mut TAPE_ENTRY) = entry;
+        *(&raw mut TAPE_ELF) = elf;
+        *(&raw mut TAPE_HANDLE) = handle;
+        *(&raw mut NEXT_TAPE_HANDLE) = handle.wrapping_add(1).max(1);
+    }
+    true
 }
 
 /// `tape [status|run [ARGS...]|load ...|send ...]`. `status`/no arguments
@@ -1524,8 +1549,17 @@ fn tape_command(info: &BootInfo, arguments: &[u8]) {
 
 fn tape_status() {
     match tape_get() {
-        Some((address, length)) => {
-            println!("Tape loaded: {length} byte(s) at 0x{address:05x}. 'tape run' to execute it.")
+        Some((_address, length)) => {
+            let format = if unsafe { *(&raw const TAPE_ELF) } {
+                "ELF32"
+            } else {
+                "legacy flat"
+            };
+            println!(
+                "Tape loaded: #{}; {length} byte(s), {format}, entry 0x{:08x}. 'tape run' to execute it.",
+                unsafe { *(&raw const TAPE_HANDLE) },
+                tape_entry()
+            )
         }
         None => println!("No tape loaded. 'tape load disk NAME' or 'tape load net' to load one."),
     }
@@ -1549,6 +1583,135 @@ fn allocate_tape_buffer(length: u32) -> Option<u32> {
         return None;
     }
     Some(pmem::TAPE_BASE)
+}
+
+#[derive(Clone, Copy)]
+struct Elf32Load {
+    offset: u32,
+    virtual_address: u32,
+    file_size: u32,
+    memory_size: u32,
+}
+
+/// Validates and materializes one ELF32 tape in its linked load region.
+///
+/// The first migration step intentionally accepts `ET_EXEC` images linked at
+/// the historical `pmem::TAPE_BASE` and retains a raw-flat fallback. The
+/// program-header-only loader keeps section metadata out of the runtime ABI;
+/// `ET_DYN`/relocation support can be added later without changing callers.
+fn load_elf32_image(address: u32, length: u32) -> Result<Option<u32>, &'static str> {
+    if length < 52 {
+        return Ok(None);
+    }
+    let image = unsafe { core::slice::from_raw_parts(address as *const u8, length as usize) };
+    if &image[..4] != b"\x7fELF" {
+        return Ok(None);
+    }
+    if image[4] != 1 || image[5] != 1 || image[6] != 1 {
+        return Err("expected little-endian ELF32");
+    }
+    let e_type = elf_u16(image, 16)?;
+    if e_type != 2 {
+        return Err("only fixed-address ELF32 ET_EXEC tapes are supported");
+    }
+    if elf_u16(image, 18)? != 3 {
+        return Err("ELF image is not for i386");
+    }
+    let entry = elf_u32(image, 24)?;
+    let program_offset = elf_u32(image, 28)?;
+    let entry_size = elf_u16(image, 42)? as u32;
+    let program_count = elf_u16(image, 44)? as u32;
+    if entry_size < 32 || program_count == 0 || program_count > 32 {
+        return Err("invalid ELF32 program-header table");
+    }
+    let table_end = program_offset
+        .checked_add(entry_size.saturating_mul(program_count))
+        .ok_or("ELF32 program-header table overflows")?;
+    if table_end > length {
+        return Err("ELF32 program-header table is outside the file");
+    }
+
+    let mut loads = [Elf32Load {
+        offset: 0,
+        virtual_address: 0,
+        file_size: 0,
+        memory_size: 0,
+    }; 32];
+    let mut load_count = 0usize;
+    let tape_end = pmem::TAPE_BASE
+        .checked_add(pmem::TAPE_LEN)
+        .ok_or("tape address range overflows")?;
+    for index in 0..program_count as usize {
+        let header = program_offset as usize + index * entry_size as usize;
+        let kind = elf_u32(image, header)?;
+        if kind != 1 {
+            continue;
+        }
+        let file_offset = elf_u32(image, header + 4)?;
+        let virtual_address = elf_u32(image, header + 8)?;
+        let file_size = elf_u32(image, header + 16)?;
+        let memory_size = elf_u32(image, header + 20)?;
+        if file_offset.checked_add(file_size).ok_or("ELF32 segment overflows")? > length
+            || file_size > memory_size
+            || virtual_address < pmem::TAPE_BASE
+            || virtual_address
+                .checked_add(memory_size)
+                .ok_or("ELF32 segment address overflows")?
+                > tape_end
+        {
+            return Err("ELF32 load segment is outside the tape region");
+        }
+        if load_count == loads.len() {
+            return Err("too many ELF32 load segments");
+        }
+        loads[load_count] = Elf32Load {
+            offset: file_offset,
+            virtual_address,
+            file_size,
+            memory_size,
+        };
+        load_count += 1;
+    }
+    if load_count == 0
+        || entry < pmem::TAPE_BASE
+        || entry >= tape_end
+        || !loads[..load_count].iter().any(|segment| {
+            entry >= segment.virtual_address
+                && entry < segment.virtual_address + segment.memory_size
+        })
+    {
+        return Err("ELF32 entry point is not inside a loadable segment");
+    }
+
+    for segment in &loads[..load_count] {
+        unsafe {
+            core::ptr::copy(
+                (address + segment.offset) as *const u8,
+                segment.virtual_address as *mut u8,
+                segment.file_size as usize,
+            );
+            core::ptr::write_bytes(
+                (segment.virtual_address + segment.file_size) as *mut u8,
+                0,
+                (segment.memory_size - segment.file_size) as usize,
+            );
+        }
+    }
+    Ok(Some(entry))
+}
+
+fn elf_u16(image: &[u8], offset: usize) -> Result<u16, &'static str> {
+    let bytes = image
+        .get(offset..offset + 2)
+        .ok_or("truncated ELF32 header")?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
+    let bytes = image
+        .get(offset..offset + 4)
+        .ok_or("truncated ELF32 header")?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 /// Executes the loaded tape: a bare `call` to its first byte, in ring 0,
@@ -2202,7 +2365,8 @@ fn tape_run(arguments: &[u8]) {
         nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
         nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
     );
-    let entry: TapeEntry = unsafe { core::mem::transmute::<usize, TapeEntry>(address as usize) };
+    let entry: TapeEntry =
+        unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
     entry(
         console::print_byte,
         combined_tape_should_abort,
@@ -2253,7 +2417,11 @@ fn tape_load_disk(info: &BootInfo, name: &[u8]) {
                 core::str::from_utf8(name).unwrap_or("?")
             );
         }
+        Ok(Some(length)) if length > u32::MAX as u64 => {
+            println!("Tape is too large for this 32-bit tape loader.");
+        }
         Ok(Some(length)) => {
+            let length = length as usize;
             let Some(address) = allocate_tape_buffer(length as u32) else {
                 return;
             };
@@ -2261,7 +2429,9 @@ fn tape_load_disk(info: &BootInfo, name: &[u8]) {
                 unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
             match fosfs::read(info, name, destination) {
                 Ok(Some(_)) => {
-                    tape_set(Some((address, length as u32)));
+                    if !install_tape(address, length as u32) {
+                        return;
+                    }
                     println!(
                         "Loaded {length} byte(s) from '{}' at 0x{address:05x}. 'tape run' to execute it.",
                         core::str::from_utf8(name).unwrap_or("?")
@@ -2430,7 +2600,9 @@ fn tape_load_net() {
             {
                 let active = transfer.take().unwrap();
                 if active.received == active.length {
-                    tape_set(Some((active.address, active.length)));
+                    if !install_tape(active.address, active.length) {
+                        return;
+                    }
                     println!(
                         "\nTape loaded: {} byte(s) at 0x{:05x} from {}. 'tape run' to execute it.",
                         active.length,
@@ -2507,7 +2679,12 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         );
         return;
     }
+    if length > u32::MAX as u64 {
+        println!("File is too large for this 32-bit tape transfer.");
+        return;
+    }
 
+    let length = length as usize;
     let Some(address) = allocate_tape_buffer(length as u32) else {
         return;
     };
@@ -2523,7 +2700,9 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
             return;
         }
     }
-    tape_set(Some((address, length as u32)));
+    if !install_tape(address, length as u32) {
+        return;
+    }
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
     tape_send(nic, &destination, &source, data);
@@ -2709,7 +2888,7 @@ fn read_sector_command(info: &BootInfo, arguments: &[u8]) {
         println!("Usage: readsector LBA");
         return;
     }
-    match disk::read_sector(info, lba, |sector| dump_bytes(lba * 512, sector)) {
+    match disk::read_sector(info, lba as u64, |sector| dump_bytes(lba * 512, sector)) {
         Ok(()) => {}
         Err(error) => println!("Disk read failed: {error:?}"),
     }
