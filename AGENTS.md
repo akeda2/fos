@@ -45,9 +45,9 @@ that obscure hardware behavior.
 - `kernel/src/pmem.rs` is a small bitmap-based physical-frame allocator (4 KiB
   frames) built from the E820 map; it reserves everything below the kernel's
   own low-memory region. There is no paging.
-- `kernel/src/fosfs.rs` implements FOSFS, a deliberately small custom
-  filesystem: one superblock, four directory sectors, 64 fixed entries, and
-  contiguous one-sector files.
+- `kernel/src/fosfs.rs` implements FOSFS version 2, a deliberately small
+  flat custom filesystem: one superblock, four directory sectors, 64 fixed
+  entries, and contiguous multi-sector files with bounded first-fit reuse.
 - `boot/netrom.S` is an optional, parallel boot path: a PCI expansion ROM that
   boots fos from a NIC's own boot ROM instead of disk/USB (`make netrom`,
   producing `build/netboot.rom`; never part of `make image`/`run`/`test`).
@@ -107,7 +107,7 @@ those details implicit.
 
 ## Disk image and safety
 
-`tools/build_image.py` creates `build/fos.img`, a 4 MiB raw image:
+`tools/build_image.py` creates `build/fos.img`, a 16 MiB raw image:
 
 | Location | Contents |
 | --- | --- |
@@ -115,7 +115,7 @@ those details implicit.
 | LBA 2048 | Active raw boot payload partition |
 | First 32 payload sectors | Stage-two loader |
 | Following payload sectors | Flat 32-bit Rust kernel |
-| LBA 4096 | Dedicated 4096-sector FOSFS data partition |
+| LBA 4096 | Dedicated 28672-sector FOSFS data partition containing README and all compiled tapes |
 
 The image builder is the single source of truth for partition placement.
 `tools/write_layout.py` emits matching stage-loader constants from the actual
@@ -129,7 +129,7 @@ The pinned toolchain is `nightly-2026-09-13`, with `rust-src`. Required host
 tools are GNU Make, GNU `as`/`objcopy`, Python 3, and `qemu-system-i386`.
 
 ```sh
-make image    # Produces build/fos.img only. Plain `make` is equivalent.
+make image    # Produces build/fos.img with all compiled tapes. Plain `make` is equivalent.
 make run      # Boots it interactively in QEMU.
 make test     # Runs the serial-driven QEMU smoke test and VGA mode test.
 make all      # Builds everything: image, netrom, and every test tape.
@@ -179,7 +179,7 @@ Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
 `pfree ADDRESS`.
 
 Storage commands: `diskinfo`, `readsector LBA`, `format`, `ls`, `cat NAME`,
-`write NAME TEXT`, and `rm NAME`.
+`write NAME TEXT`, and `rm NAME`; FOSFS is flat and supports contiguous multi-sector files.
 
 Serial commands: `serial` (lists COM1..COM4 via the BIOS Data Area, plus any
 PCI-discovered serial controllers as `PCI0`, `PCI1`, ...) and
@@ -389,16 +389,11 @@ short transfer benefits less from a persistent MAC file than a script
 meant to be re-run against the same test machine over and over. `--mac`/
 `--mac-file` remain available to skip discovery entirely.
 
-`tape load disk NAME` reuses `fosfs::read` the same way, bounded by FOSFS's
-existing 512-byte one-sector file limit. Because `write NAME TEXT` (the
-only way to put a file on FOSFS from the interactive shell today) only
-ever accepts printable ASCII text, a disk-loaded tape's contents are, for
-now, whatever printable-ASCII-constrained bytes ended up in that file --
-genuinely useful machine code on disk would need to arrive some other way
-(most practically, `tape load net` followed by a future `tape save disk`,
-which does not exist yet). This is an honest, currently-real limitation,
-not a bug; see the FOSFS multi-sector-file extension noted as deferred
-future work below, which this limitation is also downstream of.
+`tape load disk NAME` reuses `fosfs::read` and now reads the complete
+contiguous multi-sector file into the fixed tape buffer. The generated image
+preloads every compiled tape, so a fresh boot can run them without a network
+transfer. `write NAME TEXT` remains the interactive printable-ASCII path;
+binary files are installed by the host-side image builder.
 
 `tape run` is a bare `unsafe extern "C" fn()` `call` (via
 `core::mem::transmute`) to the loaded buffer's physical address, which

@@ -140,7 +140,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `format` | Initializes the dedicated FOSFS partition, permanently removing its files. |
 | `ls` | Lists FOSFS files. |
 | `cat NAME` | Displays a FOSFS text file. |
-| `write NAME TEXT` | Creates or replaces a one-sector FOSFS text file. Names use up to 16 uppercase letters, digits, `.`, `_`, or `-`; oversized content, a full directory, or a full data region are each reported distinctly. |
+| `write NAME TEXT` | Creates or replaces a flat FOSFS file. Names use up to 16 uppercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
 | `rm NAME` | Removes a FOSFS file entry. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
@@ -154,7 +154,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (or F4/F6/F7/F8/F10) (local keyboard) or by typing `/quit` (works over serial too). |
 | `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
-| `tape load disk NAME` | Loads a FOSFS file straight into a fresh tape buffer (bounded by FOSFS's current 512-byte one-sector file limit). |
+| `tape load disk NAME` | Loads a complete flat, multi-sector FOSFS file straight into the fixed tape buffer. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
 | `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, and timer callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full seventeen-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run` alone leaves it empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
@@ -226,12 +226,14 @@ mapping around each individual BIOS call, then switches back immediately
 after. The kernel rejects raw LBAs beyond the image size. This is
 intentionally a teaching bridge, not a general disk driver.
 
-FOSFS is a small custom filesystem in the dedicated data partition. It has a
-single superblock, four fixed directory sectors (64 entries), and contiguous
-one-sector files. It does not reuse file data after deletion; `format` resets
-the directory and allocation frontier. The generated image starts preformatted
-with `README.TXT`. Raw `readsector` is read-only. Only FOSFS commands issue
-writes, and their LBAs are constrained to the data partition.
+FOSFS is a small custom filesystem in the dedicated data partition. Version 2
+has a single superblock, four fixed directory sectors (64 flat entries), and
+contiguous multi-sector files. File creation and replacement use a bounded
+first-fit extent scan, so deleting a file makes its sectors reusable without a
+bitmap or heap. The generated image starts preformatted with `README.TXT` and
+all compiled tape binaries; `format` removes them and resets the directory.
+Raw `readsector` is read-only. Only FOSFS commands issue writes, and their
+LBAs are constrained to the data partition.
 
 `term` repurposes COM1 as a raw link to a remote machine by default, matching
 real hardware where most physical machines expose only one serial port.
@@ -430,13 +432,12 @@ as `tapes/primes.S` shows), which is what makes writing a tape in a
 compiled language like Rust or C practical -- see "Test tape:
 `tapes/hello-rs/`" below.
 
-A tape can be loaded two ways. `tape load disk NAME` reads a FOSFS file
-straight into the fixed tape buffer -- bounded, for now, by FOSFS's
-own 512-byte one-sector file limit, and by `write NAME TEXT` only ever
-being able to put printable ASCII bytes on disk in the first place, so a
-disk-loaded tape's practical use today is mostly for content that arrived
-some other way (e.g. copied there outside this kernel) rather than typed
-in live. `tape load net` instead waits for a tape sent over Ethernet: one
+A tape can be loaded two ways. `tape load disk NAME` reads a complete flat,
+multi-sector FOSFS file straight into the fixed tape buffer. The generated
+image contains every compiled tape under a short uppercase `.BIN` name, so
+they can be loaded locally without a network sender; `write NAME TEXT` remains
+the small interactive text-file path rather than a binary import mechanism.
+`tape load net` instead waits for a tape sent over Ethernet: one
 `TAPE_TAG_START` frame (sharing `CHAT_ETHERTYPE` with `chat`/`nic
 discover`) declares the transfer's total length, then any number of
 `TAPE_TAG_DATA` frames each carry an explicit sequence number and up to
@@ -1027,13 +1028,14 @@ UEFI-only machines and CHS-only BIOS disk services are unsupported.
 
 ## Disk image layout
 
-`build/fos.img` is a 4 MiB raw disk image:
+`build/fos.img` is a 16 MiB raw disk image:
 
 - Sector 0: MBR and stage-one loader.
 - LBA 2048: active raw payload partition.
 - First 32 payload sectors: stage-two loader.
 - Remaining payload sectors: flat kernel image at physical `0x10000`.
-- LBA 4096: a separate 4096-sector FOSFS data partition.
+- LBA 4096: a separate 28672-sector FOSFS data partition containing
+  `README.TXT` and every compiled tape.
 
 `tools/write_layout.py` generates the loader constants from the actual kernel
 size. Stage two loads the kernel with multiple bounded BIOS EDD transfers so
@@ -1053,7 +1055,7 @@ automatically selects or writes a host block device.
 ## Current boundaries
 
 This milestone uses one CPU, no paging, heap allocation, userspace, or
-scheduler. It has FOSFS (a deliberately tiny file-per-sector filesystem, not a
+scheduler. It has FOSFS (a deliberately tiny flat multi-sector filesystem, not a
 general-purpose one), interrupt-driven IRQ0/IRQ1 handling for the timer and
 keyboard, and three polling-mode PCI network card drivers (RTL8139,
 selected 3C905 variants, and Intel e1000, with raw frame access in the kernel and

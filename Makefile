@@ -20,6 +20,21 @@ TAPE_IP_CHAT_BIN := $(BUILD)/tapes/ip-chat.bin
 TAPE_TELNET_BIN := $(BUILD)/tapes/telnet.bin
 TAPE_BRIDGE_BIN := $(BUILD)/tapes/bridge.bin
 TAPE_ROUTER_BIN := $(BUILD)/tapes/router.bin
+TAPE_IMAGE_ARGS := \
+	--file PRIMES.BIN $(TAPE_PRIMES_BIN) \
+	--file HELLO-RS.BIN $(TAPE_HELLO_RS_BIN) \
+	--file VGA-COLORS.BIN $(TAPE_VGA_COLORS_BIN) \
+	--file BIGSIEVE.BIN $(TAPE_BIGSIEVE_BIN) \
+	--file LONGMODE.BIN $(TAPE_LONGMODE_BIN) \
+	--file LONG-RS.BIN $(TAPE_LONGMODE_RS_BIN) \
+	--file CALC.BIN $(TAPE_CALC_BIN) \
+	--file BEEP.BIN $(TAPE_BEEP_BIN) \
+	--file MORSE.BIN $(TAPE_MORSE_BIN) \
+	--file NET-CHAT.BIN $(TAPE_NET_CHAT_BIN) \
+	--file IP-CHAT.BIN $(TAPE_IP_CHAT_BIN) \
+	--file TELNET.BIN $(TAPE_TELNET_BIN) \
+	--file BRIDGE.BIN $(TAPE_BRIDGE_BIN) \
+	--file ROUTER.BIN $(TAPE_ROUTER_BIN)
 
 .PHONY: all help kernel image run test test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router clean
 
@@ -42,7 +57,7 @@ help:
 	@echo "  make            - same as 'make image' (the default goal)"
 	@echo "  make all        - build everything below: image, netrom, and every tape"
 	@echo "  make kernel     - build only the Rust kernel binary (build/kernel.bin)"
-	@echo "  make image      - build build/fos.img (stage1 + stage2 + kernel), via 'make kernel'"
+	@echo "  make image      - build build/fos.img (boot + kernel + every compiled tape)"
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
 	@echo "  make test       - build the image, then run default-NIC, e1000, dual-e1000, and VGA mode tests"
 	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
@@ -87,13 +102,13 @@ kernel:
 	cp kernel/target/i686-fos/release/fos-kernel $(KERNEL_ELF)
 	objcopy -O binary $(KERNEL_ELF) $(KERNEL_BIN)
 
-image: kernel
+image: kernel tapes
 	python3 tools/write_layout.py --kernel $(KERNEL_BIN) --output $(BUILD)/layout.inc
 	as --32 -I$(BUILD) -o $(BUILD)/stage1.o boot/stage1.S
 	objcopy -O binary $(BUILD)/stage1.o $(STAGE1_BIN)
 	as --32 -I$(BUILD) -o $(BUILD)/stage2.o boot/stage2.S
 	objcopy -O binary $(BUILD)/stage2.o $(STAGE2_BIN)
-	python3 tools/build_image.py --stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) --kernel $(KERNEL_BIN) --output $(IMAGE)
+	python3 tools/build_image.py --stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) --kernel $(KERNEL_BIN) --output $(IMAGE) $(TAPE_IMAGE_ARGS)
 
 run: image
 	qemu-system-i386 -drive format=raw,file=$(IMAGE) -serial stdio -monitor none -no-reboot -no-shutdown

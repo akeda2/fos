@@ -23,11 +23,11 @@ STAGE2_SECTORS = 32
 # `kernel/linker.ld`).
 KERNEL_LOAD_ADDRESS = 0x10000
 KERNEL_RESERVED_END = 0x40000
-IMAGE_SECTORS = 8192
+IMAGE_SECTORS = 32768
 # LBA and size of the dedicated FOSFS data partition, kept separate from the
 # boot payload partition so formatting FOSFS can never touch loader code.
 DATA_START_LBA = 4096
-DATA_SECTORS = 4096
+DATA_SECTORS = 28672
 
 
 def sector_count(path: Path) -> int:

@@ -193,7 +193,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "Tape: tape status (what's loaded), tape run [ARGS...] (execute it, optionally passing arguments)"
                 );
                 println!(
-                    "      tape load disk NAME (load a FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
+                    "      tape load disk NAME (load a flat multi-sector FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
                 );
                 println!(
                     "      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')"
@@ -2242,32 +2242,34 @@ fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
     }
 }
 
-/// Loads a FOSFS file straight into a fresh tape buffer. Bounded by FOSFS's
-/// current one-sector-per-file limit (see `fosfs::read`), so this is only
-/// good for tapes up to 512 bytes for now; `tape load net` has no such
-/// ceiling, since it allocates however many frames the sender declares.
+/// Loads a complete flat FOSFS file straight into the fixed tape buffer.
+/// Multi-sector files are read one BIOS sector at a time, and the file must
+/// fit the same fixed region used by `tape load net`.
 fn tape_load_disk(info: &BootInfo, name: &[u8]) {
-    let mut sector = [0u8; 512];
-    match fosfs::read(info, name, &mut sector) {
+    match fosfs::file_length(info, name) {
+        Ok(Some(length)) if length == 0 => {
+            println!(
+                "'{}' is empty; nothing to load.",
+                core::str::from_utf8(name).unwrap_or("?")
+            );
+        }
         Ok(Some(length)) => {
-            if length == 0 {
-                println!(
-                    "'{}' is empty; nothing to load.",
-                    core::str::from_utf8(name).unwrap_or("?")
-                );
-                return;
-            }
             let Some(address) = allocate_tape_buffer(length as u32) else {
                 return;
             };
             let destination =
                 unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
-            destination.copy_from_slice(&sector[..length]);
-            tape_set(Some((address, length as u32)));
-            println!(
-                "Loaded {length} byte(s) from '{}' at 0x{address:05x}. 'tape run' to execute it.",
-                core::str::from_utf8(name).unwrap_or("?")
-            );
+            match fosfs::read(info, name, destination) {
+                Ok(Some(_)) => {
+                    tape_set(Some((address, length as u32)));
+                    println!(
+                        "Loaded {length} byte(s) from '{}' at 0x{address:05x}. 'tape run' to execute it.",
+                        core::str::from_utf8(name).unwrap_or("?")
+                    );
+                }
+                Ok(None) => println!("File not found."),
+                Err(error) => println!("FOSFS disk error: {error:?}"),
+            }
         }
         Ok(None) => println!("File not found."),
         Err(error) => println!("FOSFS disk error: {error:?}"),
@@ -2487,8 +2489,7 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         return;
     };
 
-    let mut sector = [0u8; 512];
-    let length = match fosfs::read(info, name, &mut sector) {
+    let length = match fosfs::file_length(info, name) {
         Ok(Some(length)) => length,
         Ok(None) => {
             println!("File not found.");
@@ -2507,9 +2508,25 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         return;
     }
 
+    let Some(address) = allocate_tape_buffer(length as u32) else {
+        return;
+    };
+    let data = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
+    match fosfs::read(info, name, data) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    }
+    tape_set(Some((address, length as u32)));
     let Some(nic) = nic_or_report() else { return };
     let source = nic.mac_address();
-    tape_send(nic, &destination, &source, &sector[..length]);
+    tape_send(nic, &destination, &source, data);
 }
 
 /// Sends one tape (`TAPE_TAG_START`, then `TAPE_TAG_DATA` chunks, then
@@ -2648,9 +2665,6 @@ fn write_command(info: &BootInfo, arguments: &[u8]) {
         Ok(fosfs::WriteOutcome::Written) => println!("File written."),
         Ok(fosfs::WriteOutcome::InvalidName) => {
             println!("Invalid name: use up to 16 uppercase letters, digits, '.', '_', or '-'.");
-        }
-        Ok(fosfs::WriteOutcome::ContentTooLarge) => {
-            println!("Content too large: FOSFS files are limited to one 512-byte sector.")
         }
         Ok(fosfs::WriteOutcome::DirectoryFull) => {
             println!("Directory full: all 64 FOSFS entries are in use.")

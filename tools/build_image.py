@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """Create a fixed-layout MBR disk image without touching host block devices.
 
-Produces `build/fos.img`: a 4 MiB raw disk with a classic MBR partition
+Produces `build/fos.img`: a 16 MiB raw disk with a classic MBR partition
 table describing two partitions -- a raw "boot payload" partition (stage
 two loader + kernel, active/bootable) and a separate FOSFS data partition,
-which this script also preformats with a tiny FOSFS filesystem containing
-one `README.TXT`. See the top-level README's "Disk image layout" section
-for the full physical layout diagram.
+which this script also preformats with `README.TXT` and every compiled tape
+passed through `--file NAME PATH`. See the top-level README's "Disk image
+layout" section for the full physical layout diagram.
 """
 
 from argparse import ArgumentParser
 from pathlib import Path
 
+from write_layout import DATA_SECTORS, DATA_START_LBA, IMAGE_SECTORS
+
 SECTOR_SIZE = 512
 PAYLOAD_START_LBA = 2048
 STAGE2_SECTORS = 32
-MIN_IMAGE_SECTORS = 8192
-DATA_START_LBA = 4096
-DATA_SECTORS = 4096
+MIN_IMAGE_SECTORS = IMAGE_SECTORS
 KERNEL_LOAD_ADDRESS = 0x10000
 KERNEL_RESERVED_END = 0x40000
 # FOSFS reserves one superblock sector plus this many fixed directory
@@ -26,38 +26,53 @@ DIRECTORY_SECTORS = 4
 DATA_START = 1 + DIRECTORY_SECTORS
 
 
-def preformat_fosfs(image: bytearray) -> None:
+def valid_name(name: bytes) -> bool:
+    return (
+        0 < len(name) <= 16
+        and all(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for byte in name)
+    )
+
+
+def preformat_fosfs(image: bytearray, files: list[tuple[str, bytes]]) -> None:
     """Writes a ready-to-use FOSFS filesystem into the data partition.
 
-    Lays down the superblock (magic, version, geometry), a single
-    directory entry for `README.TXT`, and that file's contents, so a fresh
-    image boots straight into a usable filesystem without requiring a
-    `format` first. See `kernel/src/fosfs.rs` for the on-disk layout this
-    mirrors.
+    Lays down the superblock (magic, version, geometry), a flat directory,
+    and contiguous file extents, so a fresh image boots straight into a
+    usable filesystem without requiring a `format` first. See
+    `kernel/src/fosfs.rs` for the on-disk layout this mirrors.
     """
     offset = DATA_START_LBA * SECTOR_SIZE
     superblock = bytearray(SECTOR_SIZE)
-    superblock[:8] = b"FOSFS1\0\0"
-    superblock[8:10] = (1).to_bytes(2, "little")
+    superblock[:8] = b"FOSFS2\0\0"
+    superblock[8:10] = (2).to_bytes(2, "little")
     superblock[10:12] = (32).to_bytes(2, "little")
     superblock[12:16] = (1).to_bytes(4, "little")
     superblock[16:20] = DIRECTORY_SECTORS.to_bytes(4, "little")
     superblock[20:24] = DATA_START.to_bytes(4, "little")
     superblock[24:28] = (DATA_SECTORS - DATA_START).to_bytes(4, "little")
     image[offset:offset + SECTOR_SIZE] = superblock
-
-    readme = b"Welcome to FOSFS.\nUse ls, cat README.TXT, and write NAME TEXT.\n"
-    entry = bytearray(32)
-    entry[0] = 1
-    entry[1] = len(b"README.TXT")
-    entry[4:8] = DATA_START.to_bytes(4, "little")
-    entry[8:12] = len(readme).to_bytes(4, "little")
-    entry[12:16] = (1).to_bytes(4, "little")
-    entry[16:16 + len(b"README.TXT")] = b"README.TXT"
-    directory_offset = offset + SECTOR_SIZE
-    image[directory_offset:directory_offset + 32] = entry
-    file_offset = offset + DATA_START * SECTOR_SIZE
-    image[file_offset:file_offset + len(readme)] = readme
+    next_sector = DATA_START
+    for index, (name, contents) in enumerate(files):
+        name_bytes = name.encode("ascii")
+        if not valid_name(name_bytes):
+            raise ValueError(f"invalid FOSFS name: {name!r}")
+        if index >= DIRECTORY_SECTORS * (SECTOR_SIZE // 32):
+            raise ValueError("FOSFS directory cannot contain all requested files")
+        sector_count = (len(contents) + SECTOR_SIZE - 1) // SECTOR_SIZE
+        if next_sector + sector_count > DATA_SECTORS:
+            raise ValueError(f"FOSFS data partition is too small for {name!r}")
+        entry = bytearray(32)
+        entry[0] = 1
+        entry[1] = len(name_bytes)
+        entry[4:8] = next_sector.to_bytes(4, "little")
+        entry[8:12] = len(contents).to_bytes(4, "little")
+        entry[12:16] = sector_count.to_bytes(4, "little")
+        entry[16:16 + len(name_bytes)] = name_bytes
+        directory_offset = offset + SECTOR_SIZE + index * 32
+        image[directory_offset:directory_offset + 32] = entry
+        file_offset = offset + next_sector * SECTOR_SIZE
+        image[file_offset:file_offset + len(contents)] = contents
+        next_sector += sector_count
 
 
 def pad(data: bytes, sectors: int) -> bytes:
@@ -73,6 +88,14 @@ def main() -> None:
     parser.add_argument("--stage2", type=Path, required=True)
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--file",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("NAME", "PATH"),
+        help="preload one flat FOSFS file from PATH",
+    )
     args = parser.parse_args()
 
     stage1 = args.stage1.read_bytes()
@@ -106,7 +129,15 @@ def main() -> None:
     image[PAYLOAD_START_LBA * SECTOR_SIZE:(PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE] = stage2
     kernel_start = (PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE
     image[kernel_start:kernel_start + len(kernel)] = kernel
-    preformat_fosfs(image)
+    readme = b"Welcome to FOSFS.\nUse ls, cat README.TXT, and write NAME TEXT.\n"
+    files = [("README.TXT", readme)]
+    files.extend((name, Path(path).read_bytes()) for name, path in args.file)
+    if len({name for name, _ in files}) != len(files):
+        raise SystemExit("FOSFS file names must be unique")
+    try:
+        preformat_fosfs(image, files)
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(image)
 
