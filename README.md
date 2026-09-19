@@ -223,10 +223,14 @@ would otherwise break genuine BIOS real-mode interrupt handling (the BDA tick
 counter BIOS's disk-timeout logic depends on stops advancing), the kernel
 briefly restores the traditional real-mode IVT and BIOS-conventional PIC
 mapping around each individual BIOS call, then switches back immediately
-after. The kernel rejects raw LBAs beyond the image size. This is
+after. Interrupts remain disabled while the CPU is still in protected mode
+with the real-mode IVT loaded; the trampoline enables them only after it has
+entered real mode, avoiding an IRQ being decoded through 4-byte IVT entries
+as if they were protected-mode IDT gates. The kernel rejects raw LBAs beyond
+the image size. This is
 intentionally a teaching bridge, not a general disk driver.
 
-FOSFS is a small custom filesystem in the dedicated data partition. Version 2
+FOSFS is a small custom filesystem in the dedicated data partition. Version 3
 has a single superblock, four fixed directory sectors (64 flat entries), and
 contiguous multi-sector files. File creation and replacement use a bounded
 first-fit extent scan, so deleting a file makes its sectors reusable without a

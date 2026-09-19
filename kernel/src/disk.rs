@@ -145,15 +145,17 @@ fn transfer(info: &BootInfo, lba: u64, direction: u32) -> Result<(), Error> {
     // real-mode handler advances the BDA tick counter that BIOS
     // disk-timeout logic polls). Restore both for the duration of the call,
     // with interrupts disabled around each switch so nothing can be
-    // misdelivered mid-reprogramming.
+    // misdelivered mid-reprogramming. Keep interrupts disabled until the
+    // trampoline has actually switched to real mode; while the CPU is still
+    // in protected mode, IDTR=0 points at 4-byte real-mode IVT entries, not
+    // valid 8-byte protected-mode gates, so an IRQ in that small window
+    // would triple-fault the machine. The trampoline enables interrupts only
+    // after entering real mode and disables them again before returning.
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack));
     }
     interrupts::use_real_mode_idt();
     interrupts::use_bios_pic_mapping();
-    unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
-    }
     let result = unsafe {
         routine(
             direction,

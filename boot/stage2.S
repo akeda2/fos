@@ -481,6 +481,11 @@ bios_disk_real:
     movw $0, DISK_REQUEST + 20
     movb DISK_REQUEST + 2, %dl
     movw $DISK_REQUEST + 16, %si
+    # `disk::transfer` deliberately keeps IF=0 while the CPU is still in
+    # protected mode with IDTR=0 (the real-mode IVT is not a valid
+    # protected-mode IDT). The PIC/IVT are now ready and we are genuinely in
+    # real mode, so BIOS disk timeout/tick handling can safely run IRQ0.
+    sti
     cmpb $0, DISK_REQUEST
     jne bios_disk_write
     movb $0x42, %ah

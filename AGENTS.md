@@ -1523,6 +1523,18 @@ future contributor doesn't have to rediscover them from scratch:
   for this exact class of bug. This did not turn out to be the cause of
   the AMD Athlon 64 X2 reset loop below (see the spurious-IRQ entry), but
   is still worth keeping as a general robustness fix.
+- **Protected-mode IRQ window during BIOS disk calls** -- `disk::transfer`
+  (`kernel/src/disk.rs`) must keep interrupts disabled after loading the
+  real-mode IVT and BIOS PIC mapping, until `boot/stage2.S`'s
+  `bios_disk_real` has actually switched the CPU to real mode. An earlier
+  version executed `sti` while the processor was still in protected mode
+  with `IDTR=0`; any timer or keyboard IRQ in that window interpreted the
+  IVT's 4-byte far pointers as protected-mode IDT gates and triple-faulted
+  back to reset. This was especially reproducible on the AMD machine during
+  boot and during the many-sector disk load of `PRIMES.BIN`. The trampoline
+  now enables interrupts only after entering real mode, where BIOS's timer
+  tick and disk-timeout logic can run safely, and executes `cli` before
+  returning to protected mode.
 - **CPU exception handlers as a diagnostic tool** -- added alongside the
   PIC/PIT fix above, since that fix couldn't be confirmed without the
   original hardware: all 32 CPU exception vectors (`kernel/src/interrupts.rs`,
