@@ -13,6 +13,8 @@ use crate::{print, println};
 
 const LINE_CAPACITY: usize = 256;
 const TAPE_ARGUMENT_FILE_CAPACITY: usize = 4096;
+const START_FILE_NAME: &[u8] = b"START";
+const START_FILE_CAPACITY: usize = 4096;
 const TERM_NET_IDLE_TICKS: u64 = 60 * 100;
 
 pub fn run(info: &BootInfo) -> ! {
@@ -29,6 +31,7 @@ pub fn run(info: &BootInfo) -> ! {
         println!("Detected Ethernet interfaces:");
         nic_list();
     }
+    run_start_file(info);
     // Automatically wait for a remote `term net` client at every boot,
     // exactly as if a local operator had just typed `term net`: this
     // makes every fos machine remotely reachable by default with no
@@ -59,6 +62,58 @@ pub fn run(info: &BootInfo) -> ! {
         };
         editor.feed(byte, info);
         last_activity = interrupts::ticks();
+    }
+}
+
+/// Runs the optional FOSFS `START` script before the automatic remote-terminal
+/// wait. Lines use the ordinary shell dispatcher, so a deployment script has
+/// exactly the same command syntax and error reporting as an interactive one.
+fn run_start_file(info: &BootInfo) {
+    let length = match fosfs::file_length(info, START_FILE_NAME) {
+        Ok(Some(length)) => length,
+        Ok(None) => return,
+        Err(error) => {
+            println!("START: could not inspect the file: {error:?}");
+            return;
+        }
+    };
+    if length > START_FILE_CAPACITY as u64 {
+        println!(
+            "START: {length}-byte file is too large; the boot script limit is {START_FILE_CAPACITY} bytes."
+        );
+        return;
+    }
+
+    let mut contents = [0u8; START_FILE_CAPACITY];
+    let length = match fosfs::read(info, START_FILE_NAME, &mut contents[..length as usize]) {
+        Ok(Some(length)) => length as usize,
+        Ok(None) => return,
+        Err(error) => {
+            println!("START: could not read the file: {error:?}");
+            return;
+        }
+    };
+    println!("START: running {length}-byte boot script.");
+
+    let mut line_start = 0;
+    let mut line_number = 1;
+    for index in 0..=length {
+        if index != length && contents[index] != b'\n' {
+            continue;
+        }
+        let mut line = &contents[line_start..index];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        let line = trim_start(line);
+        if !line.is_empty() && line[0] != b'#' {
+            print!("START line {line_number}: ");
+            console::write_bytes(line);
+            println!();
+            execute(line, info);
+        }
+        line_start = index + 1;
+        line_number += 1;
     }
 }
 
@@ -288,6 +343,14 @@ fn print_irq_stats() {
         interrupts::keyboard_irq_count(),
         interrupts::spurious_irq_count()
     );
+    for irq in 3..16 {
+        if interrupts::pci_irq_registered(irq) {
+            println!(
+                "PCI IRQ{irq}: {} dispatch(es) (device handlers only acknowledge and defer receive work).",
+                interrupts::pci_irq_count(irq)
+            );
+        }
+    }
 }
 
 fn print_pmem_stats() {
@@ -629,6 +692,10 @@ fn term_net(info: &BootInfo) {
             ACTIVE_TERM_PEER = Some(peer);
             ACTIVE_TERM_SOURCE = Some(source);
             PENDING_REMOTE_BYE = false;
+            TERM_DEFERRED_INPUT_HEAD = 0;
+            TERM_DEFERRED_INPUT_TAIL = 0;
+            TERM_DEFERRED_INPUT_COUNT = 0;
+            TERM_DEFERRED_INPUT_OVERFLOWED = false;
         }
         let mut editor = LineEditor::new();
         let mut relay_chunk = [0u8; TERM_DATA_CAPACITY];
@@ -649,6 +716,8 @@ fn term_net(info: &BootInfo) {
             if unsafe { PENDING_REMOTE_BYE } {
                 break 'session;
             }
+
+            drain_deferred_term_input(&mut editor, info);
 
             let drained = console::drain_relay(&mut relay_chunk);
             if drained > 0 {
@@ -725,6 +794,92 @@ static mut ACTIVE_TERM_SOURCE: Option<[u8; 6]> = None;
 /// is not lost, since the frame carrying it can only ever be received
 /// once.
 static mut PENDING_REMOTE_BYE: bool = false;
+
+/// `term net`'s editor is suspended while a nested command owns NIC polling.
+/// Retain complete data frames from its active peer here so commands sent
+/// during (for example) `tape load net` run after that command returns.
+/// Four protocol-sized frames cover the expected short command burst without
+/// adding a heap or letting a stalled client consume unbounded kernel memory.
+const TERM_DEFERRED_INPUT_FRAME_COUNT: usize = 4;
+static mut TERM_DEFERRED_INPUT_FRAMES: [[u8; TERM_DATA_CAPACITY];
+    TERM_DEFERRED_INPUT_FRAME_COUNT] = [[0; TERM_DATA_CAPACITY];
+    TERM_DEFERRED_INPUT_FRAME_COUNT];
+static mut TERM_DEFERRED_INPUT_LENS: [usize; TERM_DEFERRED_INPUT_FRAME_COUNT] =
+    [0; TERM_DEFERRED_INPUT_FRAME_COUNT];
+static mut TERM_DEFERRED_INPUT_HEAD: usize = 0;
+static mut TERM_DEFERRED_INPUT_TAIL: usize = 0;
+static mut TERM_DEFERRED_INPUT_COUNT: usize = 0;
+static mut TERM_DEFERRED_INPUT_OVERFLOWED: bool = false;
+
+/// Saves one active-peer terminal frame for the suspended `LineEditor`.
+/// Oversized frames or a full queue drop the whole newest frame (never a
+/// partial command) and arrange one explicit diagnostic once the editor
+/// resumes. `TERM_TAG_BYE` remains a session event, never editor input.
+fn defer_active_term_input(frame: &[u8]) -> bool {
+    if !console::relay_enabled()
+        || frame.len() < 15
+        || frame[12..14] != CHAT_ETHERTYPE
+        || frame[6..12] != unsafe { ACTIVE_TERM_PEER }.unwrap_or([0; 6])
+    {
+        return false;
+    }
+    match frame[14] {
+        TERM_TAG_BYE => {
+            unsafe { PENDING_REMOTE_BYE = true };
+            true
+        }
+        TERM_TAG_DATA => {
+            let payload = &frame[15..];
+            let length = payload
+                .iter()
+                .rposition(|&byte| byte != 0)
+                .map_or(0, |index| index + 1);
+            unsafe {
+                if length > TERM_DATA_CAPACITY
+                    || TERM_DEFERRED_INPUT_COUNT == TERM_DEFERRED_INPUT_FRAME_COUNT
+                {
+                    TERM_DEFERRED_INPUT_OVERFLOWED = true;
+                } else {
+                    TERM_DEFERRED_INPUT_FRAMES[TERM_DEFERRED_INPUT_TAIL][..length]
+                        .copy_from_slice(&payload[..length]);
+                    TERM_DEFERRED_INPUT_LENS[TERM_DEFERRED_INPUT_TAIL] = length;
+                    TERM_DEFERRED_INPUT_TAIL =
+                        (TERM_DEFERRED_INPUT_TAIL + 1) % TERM_DEFERRED_INPUT_FRAME_COUNT;
+                    TERM_DEFERRED_INPUT_COUNT += 1;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Replays deferred complete terminal frames only after the blocking command
+/// that consumed them has returned to `term_net`.
+fn drain_deferred_term_input(editor: &mut LineEditor, info: &BootInfo) {
+    if unsafe { TERM_DEFERRED_INPUT_OVERFLOWED } {
+        unsafe { TERM_DEFERRED_INPUT_OVERFLOWED = false };
+        println!("\nRemote terminal input overflowed while a blocking command owned the NIC; dropped newest frame(s).");
+    }
+    loop {
+        let mut frame = [0u8; TERM_DATA_CAPACITY];
+        let length = unsafe {
+            if TERM_DEFERRED_INPUT_COUNT == 0 {
+                return;
+            }
+            let head = TERM_DEFERRED_INPUT_HEAD;
+            let length = TERM_DEFERRED_INPUT_LENS[head];
+            frame[..length].copy_from_slice(&TERM_DEFERRED_INPUT_FRAMES[head][..length]);
+            TERM_DEFERRED_INPUT_LENS[head] = 0;
+            TERM_DEFERRED_INPUT_HEAD = (head + 1) % TERM_DEFERRED_INPUT_FRAME_COUNT;
+            TERM_DEFERRED_INPUT_COUNT -= 1;
+            length
+        };
+        for &byte in &frame[..length] {
+            editor.feed(byte, info);
+        }
+    }
+}
 
 /// The byte a remote `term net` peer can send inside a `TERM_TAG_DATA`
 /// frame to ask a currently running blocking command (right now, only
@@ -821,7 +976,14 @@ fn poll_remote_tape_abort() -> bool {
             unsafe { PENDING_REMOTE_BYE = true };
             true
         }
-        TERM_TAG_DATA => frame[15..].contains(&REMOTE_ABORT_BYTE),
+        TERM_TAG_DATA => {
+            if frame[15..].contains(&REMOTE_ABORT_BYTE) {
+                true
+            } else {
+                defer_active_term_input(frame);
+                false
+            }
+        }
         _ => {
             tape_network_frame_push(frame);
             false
@@ -884,13 +1046,15 @@ fn nic_command(arguments: &[u8]) {
         b"sniff" if remainder.is_empty() => nic_sniff(),
         b"discover" if remainder.is_empty() => nic_discover(),
         b"peers" if remainder.is_empty() => print_peers(),
-        _ => println!("Usage: nic [list|use N|send|recv|sniff|discover|peers]"),
+        b"watchdog" if remainder.is_empty() => nic_watchdog(),
+        _ => println!("Usage: nic [list|use N|send|recv|sniff|discover|peers|watchdog]"),
     }
 }
 
 fn nic_status() {
     match nic::get() {
         Ok(nic) => {
+            report_nic_watchdog(nic.watchdog());
             let mac = nic.mac_address();
             println!(
                 "{} found: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -908,6 +1072,8 @@ fn nic_status() {
                     if link_up { "up" } else { "down" }
                 );
             }
+            print_nic_interrupt_status(nic);
+            print_nic_health(nic);
             let count = nic::count();
             if count > 1 {
                 println!(
@@ -953,6 +1119,66 @@ fn nic_list() {
             mac[4],
             mac[5]
         );
+        report_nic_watchdog(nic.watchdog());
+        print_nic_interrupt_status(nic);
+        print_nic_health(nic);
+    }
+}
+
+fn nic_watchdog() {
+    match nic::watchdog() {
+        Ok(result) => report_nic_watchdog(result),
+        Err(nic::Status::NotPresent) => {
+            println!("No supported Ethernet controller found on the PCI bus.")
+        }
+
+        Err(nic::Status::InitFailed(error)) => println!(
+            "A supported Ethernet controller was found but could not be initialized: {error}"
+        ),
+    }
+}
+
+fn report_nic_watchdog(result: nic::WatchdogResult) {
+    match result {
+        nic::WatchdogResult::Healthy => {}
+        nic::WatchdogResult::Recovered => println!(
+            "NIC watchdog: recovered a documented adapter fault in foreground; polling remains available."
+        ),
+        nic::WatchdogResult::Failed => println!(
+            "NIC watchdog: bounded adapter reset/rebuild failed; polling remains available, but this card may need a reset."
+        ),
+    }
+}
+
+fn print_nic_health(nic: &nic::Nic) {
+    let health = nic.health();
+    println!(
+        "NIC health: Rx {} frame(s), Tx {} frame(s), {} recovery/recoveries, {} failed; {}.",
+        health.rx_progress,
+        health.tx_progress,
+        health.recoveries,
+        health.recovery_failures,
+        if health.recovery_pending {
+            "foreground recovery pending"
+        } else {
+            "no recovery pending"
+        }
+    );
+}
+
+fn print_nic_interrupt_status(nic: &nic::Nic) {
+    let stats = nic.interrupt_stats();
+    match stats.irq {
+        Some(irq) if interrupts::pci_irq_registered(irq) => println!(
+            "NIC IRQ{irq}: {} notification(s), {} device error notification(s), foreground work {}.",
+            stats.count,
+            stats.errors,
+            if stats.pending { "pending" } else { "not pending" }
+        ),
+        Some(irq) => println!(
+            "NIC IRQ{irq}: legacy line is unavailable or reserved; polling remains active."
+        ),
+        None => println!("NIC has no firmware-assigned legacy IRQ; polling remains active."),
     }
 }
 
@@ -1000,7 +1226,10 @@ fn nic_send() {
 /// (status) does, and returns `None` so callers can just early-return.
 fn nic_or_report() -> Option<&'static nic::Nic> {
     match nic::get() {
-        Ok(nic) => Some(nic),
+        Ok(nic) => {
+            report_nic_watchdog(nic.watchdog());
+            Some(nic)
+        }
         Err(nic::Status::NotPresent) => {
             println!("No supported Ethernet controller found on the PCI bus.");
             None
@@ -1908,6 +2137,10 @@ static mut TAPE_NETWORK_COUNT: usize = 0;
 /// A terminal abort can be discovered by `nic_receive` before `read_key`
 /// runs. Preserve it until `read_key` returns the standard abort event.
 static mut TAPE_REMOTE_ABORT_PENDING: bool = false;
+/// Set by a tape that has actually asked for keyboard input. Until then,
+/// ordinary terminal data seen by its raw NIC callback belongs to the
+/// suspended shell editor, not to a callback the tape never consumes.
+static mut TAPE_READ_KEY_USED: bool = false;
 
 /// Queues `bytes` for later `tape_input_pop` calls, silently dropping
 /// whatever doesn't fit -- the same "never corrupt accounting, just stop
@@ -2209,6 +2442,16 @@ extern "C" fn tape_nic_receive(out: u32, capacity: u32) -> u32 {
 
     if console::relay_enabled() {
         if let Some(peer) = unsafe { ACTIVE_TERM_PEER } {
+            if !unsafe { TAPE_READ_KEY_USED }
+                && frame[..length].len() >= 15
+                && frame[12..14] == CHAT_ETHERTYPE
+                && frame[6..12] == peer
+                && frame[14] == TERM_TAG_DATA
+                && !frame[15..length].contains(&REMOTE_ABORT_BYTE)
+            {
+                defer_active_term_input(&frame[..length]);
+                return 0;
+            }
             match classify_remote_tape_frame(&peer, &frame[..length]) {
                 RemoteTapeFrame::Input(TAPE_EVENT_ABORT) => {
                     unsafe { TAPE_REMOTE_ABORT_PENDING = true };
@@ -2311,6 +2554,7 @@ extern "C" fn tape_nic_set_promiscuous_at(index: u32, enabled: u32) -> u32 {
 /// this one -- checking for `TAPE_EVENT_ABORT` covers everything
 /// `should_abort` would have told it anyway -- not both.
 extern "C" fn combined_tape_read_key() -> u32 {
+    unsafe { TAPE_READ_KEY_USED = true };
     if let Some(event) = keyboard::poll_term_event() {
         let code = match event {
             keyboard::KeyEvent::Escape => TAPE_EVENT_ABORT,
@@ -2588,6 +2832,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         TAPE_NETWORK_TAIL = 0;
         TAPE_NETWORK_COUNT = 0;
         TAPE_REMOTE_ABORT_PENDING = false;
+        TAPE_READ_KEY_USED = false;
     }
     type TapeEntry = extern "C" fn(
         putc: extern "C" fn(u32),
@@ -2749,7 +2994,7 @@ fn tape_load_net() {
     // Periodic (~2s) progress line while a transfer is in flight, so a
     // stalled load is visibly distinguishable from one still making
     // progress -- and, since `Rtl8139::overflow_count` only climbs when
-    // the receive ring genuinely overflowed (see `recover_from_overflow`
+    // the receive ring genuinely overflowed (see `Rtl8139::recover`
     // in rtl8139.rs), a nonzero and growing count here is a strong sign
     // the sender is outrunning this driver's polling loop, distinct from
     // a sender that has simply stopped, gone quiet, or was never reached
@@ -2783,6 +3028,17 @@ fn tape_load_net() {
             continue;
         };
         let frame = &buffer[..received];
+        // While this nested loop owns NIC polling, do not let a command
+        // from the suspended remote terminal editor vanish into the tape
+        // protocol's catch-all arm. A remote hangup still ends the session
+        // once `term_net` resumes; normal data is replayed by that editor.
+        if defer_active_term_input(frame) {
+            if unsafe { PENDING_REMOTE_BYE } {
+                println!("\nRemote terminal disconnected; no tape loaded.");
+                return;
+            }
+            continue;
+        }
         if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
             continue;
         }

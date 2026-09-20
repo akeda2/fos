@@ -5,16 +5,23 @@ SECTIONS
   . = 0x10000;
   __kernel_start = .;
 
-  .text : ALIGN(16) {
+  . = ALIGN(4096);
+  __text_start = .;
+  .text : {
     KEEP(*(.text.entry))
     *(.text .text.*)
   }
+  __text_end = .;
 
-  .rodata : ALIGN(16) {
+  . = ALIGN(4096);
+  __rodata_start = .;
+  .rodata : {
     *(.rodata .rodata.*)
   }
+  __rodata_end = .;
 
-  .data : ALIGN(16) {
+  . = ALIGN(4096);
+  .data : {
     *(.data .data.*)
   }
 
@@ -25,5 +32,5 @@ SECTIONS
   }
 
   __kernel_end = .;
-  ASSERT(__kernel_end < 0x40000, "kernel exceeds the reserved low-memory load region")
+  ASSERT(__kernel_end < 0x50000, "kernel exceeds the reserved low-memory load region")
 }

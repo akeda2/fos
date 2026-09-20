@@ -4,13 +4,16 @@
 //! transmit descriptors live in physical memory, while the device is
 //! controlled through a windowed command register at BAR0/BAR1. This driver
 //! intentionally implements only the raw Ethernet operations the kernel
-//! already exposes to tapes. It does not add interrupts, link management,
-//! checksum offload, or a general descriptor allocator.
+//! already exposes to tapes. Legacy IRQs only acknowledge and defer work to
+//! foreground polling; it does not add link management, checksum offload, or
+//! a general descriptor allocator.
 
 use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::arch::x86::{inl, inw, outb, outl, outw};
+use crate::nic::{Health, WatchdogResult};
 use crate::pci;
 use crate::pmem;
 
@@ -63,6 +66,8 @@ const DOWNLOAD_COMPLETE: u32 = 1 << 16;
 const TX_ROUNDUP_DEFEAT: u32 = 1 << 28;
 const EEPROM_READ: u16 = 0x80;
 const EEPROM_BUSY: u16 = 0x8000;
+const INTERRUPT_MASK: u16 = 0x07ff;
+const STATUS_HOST_ERROR: u16 = 1 << 1;
 
 const RX_DESC_COUNT: usize = 4;
 const RX_BUFFER_SIZE: usize = 1536;
@@ -121,16 +126,28 @@ fn descriptor_ptr<T>(base: u32, index: usize) -> *mut T {
 pub struct ThreeCom {
     io_base: u16,
     b_revision: bool,
-    mac: [u8; 6],
+    mac: Cell<[u8; 6]>,
     descriptors: u32,
     rx_buffers: [u32; RX_DESC_COUNT],
     tx_buffer: u32,
     rx_next: Cell<usize>,
     overflow_count: Cell<u32>,
+    rx_progress: Cell<u32>,
+    tx_progress: Cell<u32>,
+    recovery_count: Cell<u32>,
+    recovery_failures: Cell<u32>,
+    recovery_pending: AtomicBool,
+    promiscuous: Cell<bool>,
+    interrupts_enabled: Cell<bool>,
+    irq: Option<u8>,
+    interrupt_count: AtomicU32,
+    interrupt_errors: AtomicU32,
+    work_pending: AtomicBool,
 }
 
 struct ProbeInfo {
     io_base: u16,
+    irq: Option<u8>,
     b_revision: bool,
 }
 
@@ -159,6 +176,7 @@ impl ThreeCom {
                 }
                 out[count] = ProbeInfo {
                     io_base,
+                    irq: address.interrupt_line(),
                     b_revision: matches!(
                         address.device_id(),
                         0x9054 | 0x9055 | 0x9058 | 0x905a | 0x9200
@@ -170,7 +188,7 @@ impl ThreeCom {
         count
     }
 
-    fn init(io_base: u16, b_revision: bool) -> Result<Self, InitError> {
+    fn init(io_base: u16, b_revision: bool, irq: Option<u8>) -> Result<Self, InitError> {
         Self::reset(io_base)?;
         let descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let mut rx_buffers = [0u32; RX_DESC_COUNT];
@@ -178,15 +196,26 @@ impl ThreeCom {
             *buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         }
         let tx_buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        let mut nic = Self {
+        let nic = Self {
             io_base,
             b_revision,
-            mac: [0; 6],
+            mac: Cell::new([0; 6]),
             descriptors,
             rx_buffers,
             tx_buffer,
             rx_next: Cell::new(0),
             overflow_count: Cell::new(0),
+            rx_progress: Cell::new(0),
+            tx_progress: Cell::new(0),
+            recovery_count: Cell::new(0),
+            recovery_failures: Cell::new(0),
+            recovery_pending: AtomicBool::new(false),
+            promiscuous: Cell::new(false),
+            interrupts_enabled: Cell::new(false),
+            irq,
+            interrupt_count: AtomicU32::new(0),
+            interrupt_errors: AtomicU32::new(0),
+            work_pending: AtomicBool::new(false),
         };
         nic.configure()?;
         Ok(nic)
@@ -247,7 +276,7 @@ impl ThreeCom {
         Ok(())
     }
 
-    fn configure(&mut self) -> Result<(), InitError> {
+    fn configure(&self) -> Result<(), InitError> {
         self.select_window(0);
         let mut mac = [0u8; 6];
         for (index, byte) in mac.chunks_exact_mut(2).enumerate() {
@@ -257,7 +286,7 @@ impl ThreeCom {
         if mac.iter().all(|&byte| byte == 0) || mac == [0xff; 6] {
             return Err(InitError::InvalidMac);
         }
-        self.mac = mac;
+        self.mac.set(mac);
 
         self.select_window(2);
         for (index, byte) in mac.iter().enumerate() {
@@ -311,9 +340,11 @@ impl ThreeCom {
         self.select_window(3);
         write16(self.io_base, MAX_PACKET_SIZE, RX_BUFFER_SIZE as u16);
         self.command(SET_STATUS_ENABLE)?;
-        self.command(SET_INTERRUPT_ENABLE)?;
         self.command(SET_RX_THRESHOLD | (RX_BUFFER_SIZE as u16 / 4))?;
-        self.command(SET_RX_FILTER | RX_STATION | RX_BROADCAST)?;
+        self.command(
+            SET_RX_FILTER | RX_STATION | RX_BROADCAST
+                | if self.promiscuous.get() { RX_PROMISCUOUS } else { 0 },
+        )?;
         self.command(RX_ENABLE)?;
         self.command(TX_ENABLE)?;
         self.command(ACK_INTERRUPT | 0x07ff)?;
@@ -334,7 +365,7 @@ impl ThreeCom {
     }
 
     pub fn mac_address(&self) -> [u8; 6] {
-        self.mac
+        self.mac.get()
     }
 
     /// Reads the 3Com media-status link-beat bit. This is intentionally a
@@ -348,10 +379,72 @@ impl ThreeCom {
         self.select_window(1);
         let filter = RX_STATION | RX_BROADCAST | if enabled { RX_PROMISCUOUS } else { 0 };
         let _ = self.command(SET_RX_FILTER | filter);
+        self.promiscuous.set(enabled);
     }
 
     pub fn overflow_count(&self) -> u32 {
         self.overflow_count.get()
+    }
+
+    pub fn health(&self) -> Health {
+        Health {
+            rx_progress: self.rx_progress.get(),
+            tx_progress: self.tx_progress.get(),
+            recoveries: self.recovery_count.get(),
+            recovery_failures: self.recovery_failures.get(),
+            recovery_pending: self.recovery_pending.load(Ordering::Acquire),
+        }
+    }
+
+    /// The 3C905 Host Error interrupt and a bounded download timeout are
+    /// documented adapter failures. Reset and rebuild the existing list
+    /// in place; this never allocates, frees, or moves DMA memory.
+    pub fn watchdog(&self) -> WatchdogResult {
+        if !self.recovery_pending.swap(false, Ordering::AcqRel) {
+            return WatchdogResult::Healthy;
+        }
+
+        if Self::reset(self.io_base).is_err() || self.configure().is_err() {
+            self.recovery_failures.set(self.recovery_failures.get().wrapping_add(1));
+            return WatchdogResult::Failed;
+        }
+        self.rx_next.set(0);
+        if self.interrupts_enabled.get() {
+            self.enable_interrupts();
+        }
+        self.recovery_count.set(self.recovery_count.get().wrapping_add(1));
+        WatchdogResult::Recovered
+    }
+
+    pub fn enable_interrupts(&self) {
+        let _ = self.command(ACK_INTERRUPT | INTERRUPT_MASK);
+        let _ = self.command(SET_INTERRUPT_ENABLE | INTERRUPT_MASK);
+        self.interrupts_enabled.set(true);
+    }
+
+    pub fn handle_interrupt(&self) {
+        let status = read16(self.io_base, CMD_STATUS) & INTERRUPT_MASK;
+        if status == 0 {
+            return;
+        }
+        // Command completion can wait, but an ISR must only acknowledge and
+        // return; the card's command-in-progress bit is therefore not polled.
+        write16(self.io_base, CMD_STATUS, ACK_INTERRUPT | status);
+        self.interrupt_count.fetch_add(1, Ordering::Relaxed);
+        if status & STATUS_HOST_ERROR != 0 {
+            self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
+            self.recovery_pending.store(true, Ordering::Release);
+        }
+        self.work_pending.store(true, Ordering::Release);
+    }
+
+    pub fn interrupt_stats(&self) -> (Option<u8>, u32, u32, bool) {
+        (
+            self.irq,
+            self.interrupt_count.load(Ordering::Relaxed),
+            self.interrupt_errors.load(Ordering::Relaxed),
+            self.work_pending.load(Ordering::Acquire),
+        )
     }
 
     pub fn send(&self, frame: &[u8]) -> bool {
@@ -396,14 +489,17 @@ impl ThreeCom {
             if attempts == 0 {
                 write16(self.io_base, CMD_STATUS, TX_RESET);
                 write16(self.io_base, CMD_STATUS, TX_ENABLE);
+                self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }
         }
         unsafe { write_volatile(&mut (*descriptor).status, 0) };
+        self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
         true
     }
 
     pub fn receive(&self, out: &mut [u8]) -> Option<usize> {
+        self.work_pending.store(false, Ordering::Release);
         let index = self.rx_next.get();
         let descriptor = descriptor_ptr::<RxDescriptor>(self.descriptors, index);
         let status = unsafe { read_volatile(&(*descriptor).status) };
@@ -423,6 +519,7 @@ impl ThreeCom {
             let source = core::slice::from_raw_parts(self.rx_buffers[index] as *const u8, copy_len);
             out[..copy_len].copy_from_slice(source);
         }
+        self.rx_progress.set(self.rx_progress.get().wrapping_add(1));
         Some(copy_len)
     }
 }
@@ -445,13 +542,14 @@ pub fn initialize_all() -> Result<usize, Status> {
             let mut probe_info = [const {
                 ProbeInfo {
                     io_base: 0,
+                    irq: None,
                     b_revision: false,
                 }
             }; MAX_INSTANCES];
             let found = ThreeCom::probe_all(&mut probe_info);
             let mut first_error = None;
             for info in &probe_info[..found] {
-                match ThreeCom::init(info.io_base, info.b_revision) {
+                match ThreeCom::init(info.io_base, info.b_revision, info.irq) {
                     Ok(initialized) => {
                         NICS[NIC_COUNT] = Some(initialized);
                         NIC_COUNT += 1;

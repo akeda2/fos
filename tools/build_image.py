@@ -20,7 +20,7 @@ PAYLOAD_START_LBA = 2048
 STAGE2_SECTORS = 32
 MIN_IMAGE_SECTORS = IMAGE_SECTORS
 KERNEL_LOAD_ADDRESS = 0x10000
-KERNEL_RESERVED_END = 0x40000
+KERNEL_RESERVED_END = 0x50000
 # FOSFS reserves one superblock sector plus this many fixed directory
 # sectors (64 entries total, 64 bytes each) before file data begins.
 DIRECTORY_SECTORS = 8

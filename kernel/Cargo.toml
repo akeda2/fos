@@ -5,7 +5,9 @@ edition = "2024"
 
 [features]
 legacy-unsafe-memory = []
+page-protection-test = []
 stack-guard-test = []
+nic-watchdog-test = []
 
 [profile.dev]
 panic = "abort"

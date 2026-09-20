@@ -96,6 +96,14 @@ impl PciAddress {
         read_u16(self.bus, self.device, self.function, 0x00)
     }
 
+    /// Returns the legacy PCI interrupt line assigned by firmware, if this
+    /// function has one. `0xff` means no usable legacy PIC line (for example,
+    /// an MSI-only route), so callers must retain their polling fallback.
+    pub fn interrupt_line(&self) -> Option<u8> {
+        let line = read_u8(self.bus, self.device, self.function, 0x3c);
+        (line != 0xff).then_some(line)
+    }
+
     /// Reads an I/O BAR, returning its base address if it is I/O-mapped
     /// (`None` for memory-mapped BARs, which this project's port-I/O code
     /// cannot use).

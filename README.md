@@ -29,8 +29,9 @@ and explained, not just to run.
    the Rust entry point, passing a versioned boot-information record at
    physical address `0x5000`.
 5. The Rust kernel clears BSS, validates that record, initializes its VGA/COM1
-   console, enables a supervisor-only identity map for the low physical range
-   and PCI MMIO, then
+   console, enables a supervisor-only identity map for the low physical range,
+   makes kernel text/read-only data write-protected, and registers PCI MMIO
+   only when a driver claims its BAR, then
    builds its physical-frame bitmap from the E820 map. The shell sets up its
    own IDT and remaps the PIC (arming the PIT timer on IRQ0 and the PS/2
    keyboard on IRQ1), then runs the prompt. Each of these steps prints what
@@ -81,6 +82,9 @@ mode switches. `make test-vga-modes` runs only the VGA mode test.
 `make test-stack-guard` builds a test-only image that deliberately reaches the
 kernel stack's absent guard page and verifies that the emergency double-fault
 task prints its diagnostic instead of resetting.
+`make test-page-protection` similarly builds a temporary image that attempts a
+supervisor write to kernel text and verifies the read-only page-fault
+diagnostic before restoring the ordinary image.
 For a deliberate comparison with the pre-paging teaching model,
 `make image-unsafe-memory` writes `build/fos-unsafe-memory.img` with paging
 disabled, then restores the normal paged `build/fos.img`; `make
@@ -160,6 +164,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `cat NAME` | Displays a FOSFS text file. |
 | `write NAME TEXT` | Creates or replaces a flat FOSFS file. Names use up to 16 uppercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
 | `rm NAME` | Removes a FOSFS file entry. |
+| `START` file | Optional boot-time command script. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
 | `nic` | Reports the active supported PCI Ethernet controller and its MAC address; the first initialized interface is selected by default. |
@@ -230,11 +235,13 @@ unmapped 4 KiB guard page. If overflow reaches that absent page, the CPU cannot
 place a page-fault frame on the exhausted stack, so IDT vector 8 task-switches
 to a dedicated TSS and emergency stack that emits a diagnostic halt instead of
 triple-faulting. `kernel/src/paging.rs` uses 4 MiB pages to identity-map the
-low 2 GiB physical range and the conventional high PCI-MMIO window as
-supervisor-only writable pages, except for the low 4 MiB page table containing
-that stack guard; the unmapped middle range turns many stray high pointers into
-diagnosable page faults. This is paging infrastructure, not userspace
-protection: all current code and tapes still execute in ring 0.
+low 2 GiB physical range as supervisor-only writable pages, except for the
+low 4 MiB page table containing that stack guard. It makes page-aligned kernel
+text and read-only data non-writable under `CR0.WP`, and maps high PCI MMIO
+only after a driver registers the precise BAR range it needs; other high
+ranges turn stray pointers into diagnosable page faults. This is paging
+infrastructure, not userspace protection: all current code and tapes still
+execute in ring 0.
 
 ## Disk access and FOSFS
 
@@ -338,12 +345,25 @@ frees it. The RTL8139 uses a receive ring and transmit buffers; the
 3C905 uses receive/transmit descriptor lists; and e1000 uses legacy
 receive/transmit descriptor rings.
 
-There is no NIC interrupt handling here yet: this project's PIC setup leaves
-every IRQ but the timer and keyboard masked (see "Current boundaries"), so
-all three backends poll their device state. The e1000 driver uses MMIO and
-keeps device interrupts masked; it is deliberately the first Intel model
-because its legacy descriptor format is also available in QEMU for repeatable
-testing. `nic` (no arguments) reports the selected backend and MAC address;
+Each backend uses a legacy PCI IRQ when firmware assigns a safe PIC line:
+the tiny handler acknowledges the device, counts the notification, and marks
+foreground work pending. It never parses a descriptor, copies a frame, or
+runs a protocol; the existing foreground `receive` calls drain the rings and
+remain the fallback for cards without a usable line. PIC lines are unmasked
+only after their IDT gate and device acknowledgement path are ready. `nic`
+and `nic list` show per-device IRQ notifications/errors/pending state, while
+`irqstat` shows registered PCI-line dispatch counts. The e1000 driver uses
+MMIO; it is deliberately the first Intel model because its legacy descriptor
+format is also available in QEMU for repeatable testing. `nic` (no arguments)
+reports the selected backend and MAC address; it also runs the bounded
+foreground health watchdog and reports completed Rx/Tx frames plus
+recovery/failure counters. `nic watchdog` performs the same check explicitly.
+The watchdog never treats an idle link as failure: it resets and rebuilds
+existing DMA/ring state only after a driver observed a documented adapter
+fault (RTL8139 overflow or transmit timeout, e1000 receive overrun or
+transmit timeout, or 3C905 Host Error/download timeout). It restores the
+prior interrupt mask and promiscuous setting without allocating or freeing
+DMA memory, while ordinary polling remains the fallback if recovery fails.
 `nic send` transmits one broadcast frame tagged with an IEEE-reserved
 experimental ethertype (`0x88b5`); and `nic recv` polls briefly for one
 incoming frame and hex-dumps it. The shell commands remain deliberately
@@ -380,6 +400,29 @@ ARP entry is needed on either end.
 echo 52:54:00:12:34:56 > tools/mac   # the target fos machine's MAC; see its 'nic' command
 sudo python3 tools/send_frame.py "hello fos"
 ```
+
+### Boot-time `START` script
+
+An optional uppercase FOSFS file named `START` turns a prepared image into a
+small appliance: fos reads up to 4096 bytes after disk and NIC initialization,
+then dispatches every non-empty line that does not begin with `#` through the
+ordinary shell command handler. Commands therefore have the same syntax,
+output, and errors as commands entered at `fos> `. The script continues after
+an individual command error; a missing `START` file changes nothing.
+
+For a router image, load `ED.BIN` as usual, run `tape run ed START`, and save:
+
+```text
+# Start the configured router at boot.
+tape load disk ROUTER.BIN
+tape run router @ROUTER.CFG
+```
+
+The automatic `term net` wait runs only after the script finishes. A
+long-running command such as `tape run router @ROUTER.CFG` intentionally owns
+the boot session until it returns; put `term net` in `START` only when waiting
+for a remote shell is the desired startup action. `make test-start` verifies
+comment/blank-line handling and normal shell dispatch with an isolated image.
 
 Sending raw frames needs `CAP_NET_RAW` (in practice, run it with `sudo`).
 The destination MAC is read from `tools/mac` (default path; overridable with
@@ -756,18 +799,35 @@ explicitly selected interface:
 tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0 default 1 10.0.1.254
 ```
 
-`dhcp` configures NIC 1 (the zero-based callback index 0), so a mixed
-configuration can obtain the upstream address and router from DHCP while
-statically configuring another port:
+`dhcp` remains the backward-compatible spelling for DHCP on NIC 1 (the
+zero-based callback index 0). `dhcp N` adds one-based NIC `N` as the next
+priority DHCP uplink, while static triples configure downstream ports:
 
 ```text
 tape run router dhcp 2 10.0.2.1 255.255.255.0
 ```
 
+`health A.B.C.D` enables bounded periodic health checks for DHCP uplinks. An
+uplink must answer a fresh gateway ARP request and an ICMP echo request to the
+target; three missed cycles select the next healthy uplink, and recovery
+automatically fails back to the highest-priority healthy lease. NAT and
+static forwards use only the active uplink, so existing flows may break during
+a change.
+
 NAT is enabled by default. Add `no-nat` when the upstream network has an
 explicit route back to the downstream subnets and should receive the original
 source addresses; `nat` may be written explicitly to document or re-enable
 masquerading.
+
+For permanent inbound services, configure a static rule before interface
+entries: `forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]`. NIC 1
+is the public side; matching inbound TCP/UDP traffic is DNATed to the
+configured host, and matching replies are source-translated back to NIC 1's
+address and external port. Omitting the internal port keeps the same port.
+The fixed no-heap list holds 16 rules, prints each at startup, rejects
+duplicate external ports or ambiguous internal endpoints per protocol, and
+only permits targets on configured non-primary subnets. Unrelated unsolicited
+traffic is still dropped.
 
 If DHCP supplies a router option and no explicit `default` suffix is present,
 that router becomes NIC 1's default route. At least two interfaces (the DHCP
@@ -838,6 +898,7 @@ an uppercase FOSFS file. `#` starts a comment through the end of its line:
 ```text
 # ROUTER.CFG
 dhcp-server
+forward tcp 8080 10.0.15.2 80
 1 10.0.1.1/24
 2 10.0.2.1/24
 ```
@@ -1041,7 +1102,12 @@ type `tape run`. Two things are worth knowing before relying on this:
   local polling loop, `tape load net` (waiting for tape frames) and
   `tape run` (running the tape) pause `term_net`'s own outer loop --
   including the relay-queue drain and its usual keystroke/`TERM_TAG_BYE`
-  handling -- until they return. Only local F12 (or F4/F6/F7/F8/F10) can
+  handling -- until they return. `tape load net` retains a bounded four-frame
+  queue of ordinary `TERM_TAG_DATA` input from its connected peer and replays
+  it through the suspended shell editor when it returns, so a following
+  command (such as `tape run router @ROUTER.CFG`) sent during the transfer is
+  not lost; if that queue fills, whole newest frames are dropped and fos
+  reports the overflow. Only local F12 (or F4/F6/F7/F8/F10) can
   interrupt `tape load net` early. `tape run` cannot be interrupted at
   all for a tape that only ever declares the original one-argument
   `putc` callback (`primes.S`/`hello-rs`) -- same as running it locally,
@@ -1173,7 +1239,7 @@ gracefully (`diskinfo` shows zero sectors; FOSFS commands report the disk as
 absent) rather than attempting a read. `BootInfo.boot_drive` is likewise a
 best-effort `0x80` guess, since BIOS does not hand an `INT 19h`-hooked
 handler a meaningful drive number the way it does for a normal MBR boot.
-The embedded kernel must still fit in the reserved `0x10000..0x40000`
+The embedded kernel must still fit in the reserved `0x10000..0x50000`
 destination window (`tools/write_netrom_layout.py` enforces this at build
 time). The ROM path copies it with a 32-bit-address-size `rep movsb`; the
 final ROM image remains subject to the PCI option-ROM size limit enforced by

@@ -19,10 +19,10 @@ that obscure hardware behavior.
   section below for why), loads the kernel at physical `0x10000` using bounded
   multi-transfer BIOS EDD reads that never cross a 64 KiB transfer boundary,
   and enters flat 32-bit protected mode. The reserved
-  `0x10000..0x40000` region, not the old single-transfer 127-sector
+  `0x10000..0x50000` region, not the old single-transfer 127-sector
   convention, is the current kernel-size limit.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
-  low-memory kernel region through `0x40000`; do not place loader, boot-info,
+  low-memory kernel region through `0x50000`; do not place loader, boot-info,
   or disk-trampoline data there.
 - `kernel/src/entry.S` reserves a 32 KiB kernel stack with a low-end canary
   above an unmapped 4 KiB guard page. `kernel/src/gdt.rs` installs a
@@ -46,19 +46,25 @@ that obscure hardware behavior.
   paging for that real-mode transition, then switches back. The trampoline
   reloads stage two's GDT, so `disk.rs` restores the permanent kernel GDT
   (including the double-fault TSS descriptors) before interrupts resume.
-- `kernel/src/interrupts.rs` builds a 256-entry IDT (only IRQ0/IRQ1 gates
-  plus vector 8's double-fault task gate populated), remaps the 8259 PIC
-  clear of the CPU exception range, arms the PIT at 100 Hz, and services the
-  timer/keyboard IRQs with minimal `x86-interrupt` ABI handlers. Input is
-  interrupt-driven, not polled.
+- `kernel/src/interrupts.rs` builds a 256-entry IDT (timer, keyboard,
+  spurious-PIC, safe legacy-PCI IRQ gates, and vector 8's double-fault task
+  gate), remaps the 8259 PIC clear of the CPU exception range, and arms the
+  PIT at 100 Hz. NIC handlers only acknowledge/count/mark pending work;
+  descriptor and protocol parsing remains foreground polling.
+- `nic` status and ordinary foreground NIC traffic run a bounded watchdog,
+  never an ISR or timer task. It only resets a backend after that driver
+  latched a documented DMA/Tx fault, reuses its DMA allocations, restores
+  interrupt/promiscuous state, and exposes progress/recovery counters.
 - `kernel/src/pmem.rs` is a small bitmap-based physical-frame allocator (4 KiB
   frames) built from the E820 map; it reserves everything below the kernel's
   own low-memory region.
 - `kernel/src/paging.rs` enables supervisor-only identity mappings for the
-  first 2 GiB and the high PCI MMIO window. The low 4 MiB uses 4 KiB PTEs
-  solely to leave the kernel-stack guard page absent; the remaining low
-  range uses 4 MiB PSE mappings. This retains physical-pointer compatibility
-  for DMA and the BIOS trampoline while leaving an unmapped middle range for
+  first 2 GiB. The low 4 MiB uses 4 KiB PTEs to leave the kernel-stack guard
+  page absent and make page-aligned kernel text/read-only data non-writable;
+  the remaining low range uses 4 MiB PSE mappings. High PCI MMIO is absent
+  until `map_mmio` registers a driver's exact BAR range, using at most three
+  dynamic page tables. This retains physical-pointer compatibility for DMA
+  and the BIOS trampoline while leaving unrelated high ranges unmapped for
   useful page-fault diagnostics; it is not userspace isolation.
   `make image-unsafe-memory` is the explicit teaching comparison: it builds
   a separate unpaged artifact, so it has neither those absent ranges nor the
@@ -67,6 +73,11 @@ that obscure hardware behavior.
   flat custom filesystem: one superblock, eight directory sectors, 64 fixed
   64-byte entries, 64-bit contiguous multi-sector extents, and bounded
   first-fit reuse. Multi-extent files remain a future extension.
+- `kernel/src/shell.rs` runs an optional FOSFS `START` file after disk/NIC
+  initialization and before the automatic `term net` wait. It accepts up to
+  4096 bytes; non-empty lines not beginning with `#` use the ordinary command
+  dispatcher. Keep a long-running router `tape run` last, because later
+  script lines cannot run until it returns.
 - `boot/netrom.S` is an optional, parallel boot path: a PCI expansion ROM that
   boots fos from a NIC's own boot ROM instead of disk/USB (`make netrom`,
   producing `build/netboot.rom`; never part of `make image`/`run`/`test`).
@@ -84,19 +95,23 @@ that obscure hardware behavior.
 - `tapes/router/` is a fixed-buffer layer-3 tape. It reuses the bridge's
   polling shape, answers ARP per configured interface, and forwards IPv4
   packets between directly connected subnets while updating TTL and header
-  checksum. Its syntax is `tape run router [dhcp] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] NIC IP/PREFIX ... [default
+  checksum. Its syntax is `tape run router [dhcp [NIC]]... [health A.B.C.D] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]] NIC IP/PREFIX ... [default
   NIC GATEWAY]` (legacy dotted `NIC IP NETMASK` and separate `NIC IP /PREFIX`
   forms remain accepted); NIC numbers are one-based, `dhcp` configures NIC 1
-  (callback index zero), and an explicit or DHCP-supplied gateway handles
-  unmatched destinations. NAT is enabled by default; `no-nat` disables it for
+  (callback index zero), while `dhcp N` adds an ordered DHCP uplink. `health`
+  requires both fresh gateway ARP and ICMP echo success, fails over after
+  three missed bounded polls, and fails back on recovery. NAT and static
+  forwards are limited to the active uplink, so existing flows may break on a
+  change. An explicit or active DHCP-supplied gateway handles unmatched
+  destinations. NAT is enabled by default; `no-nat` disables it for
   deployments where upstream routing reaches the downstream subnets, while
   `nat` explicitly enables it. When enabled, TCP/UDP traffic leaving
-  non-primary NICs through NIC 1 is source-NATed through a 4 MiB
+  non-primary NICs through the active uplink is source-NATed through a 4 MiB
   physical-memory-backed table and reverse-translated for replies, with a
   32-slot fallback if allocation is unavailable, so upstream hosts do not
   need a route back to the downstream subnet. `dhcp-server` serves every
   configured interface
-  except NIC 1 using an automatically derived subnet pool with one in-memory
+  except DHCP uplinks using an automatically derived subnet pool with one in-memory
   lease slot per usable address, and seven-day leases. Upstream DHCP DNS
   values are propagated to downstream clients; a `dns SERVER [SERVER]`
   directive overrides them. The server has no DNS implementation or
@@ -114,7 +129,7 @@ Real-mode code before the kernel's own memory management exists shares a
 handful of fixed low-memory addresses across `stage1.S`, `stage2.S`, and
 `netrom.S`. There is no single enforcing mechanism for this -- it is
 convention only -- so treat this table as authoritative before adding any new
-fixed address below `0x40000`, and update it in the same change that adds one:
+fixed address below `0x50000`, and update it in the same change that adds one:
 
 | Address | Used by | Purpose |
 | --- | --- | --- |
@@ -126,7 +141,7 @@ fixed address below `0x40000`, and update it in the same change that adds one:
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
 | `0x9f000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer, just below the conventional End-of-Low-Memory / EBDA boundary. |
-| `0x10000`-`0x40000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
+| `0x10000`-`0x50000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
 | `0x100000`-`0x500000` | `kernel/src/pmem.rs` (`TAPE_BASE`/`TAPE_LEN`), any tape's own linker script | The fixed 4 MiB region every tape (`tape load disk`/`tape load net`) is always loaded into, carved out of `pmem`'s general frame pool at boot so `allocate`/`allocate_contiguous`/`palloc` can never hand these frames to anything else. See "Tapes: fixed load address, and writing one in Rust" below. |
 
 ## Educational verbosity
@@ -179,6 +194,9 @@ make run-unsafe-memory # Boots the optional unpaged teaching image.
 make test     # Runs the serial-driven QEMU smoke test and VGA mode test.
 make test-unsafe-memory # Smoke-tests the optional unpaged teaching image.
 make test-stack-guard # Builds a fault-injection image and verifies its emergency #DF task.
+make test-page-protection # Verifies CR0.WP and read-only kernel-text PTEs.
+make test-nic-watchdog # Verifies foreground recovery from a latched NIC fault.
+make test-start # Verifies an optional FOSFS START boot-command script.
 make all      # Builds everything: image, netrom, and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
 make help     # Lists every target with a one-line description.
@@ -187,6 +205,10 @@ make help     # Lists every target with a one-line description.
 Always run `make test` for boot, loader, kernel, shell, disk, or FOSFS changes.
 Also run `make test-stack-guard` when changing paging, GDT/IDT handling,
 exception paths, or kernel-stack layout.
+Run `make test-page-protection` when changing page permissions, linker section
+layout, or page-fault diagnostics.
+Run `make test-start` when changing shell startup order, FOSFS startup-file
+handling, or command dispatch.
 Run `make test-unsafe-memory` when changing the legacy-memory feature or its
 separate image target.
 The smoke harness must use bounded waits, preserve serial output on failure,
@@ -482,7 +504,8 @@ reset, consistent with "Current boundaries" in README.md.
 
 The reserved low-memory kernel region (`linker.ld`/`pmem::RESERVED_BELOW`/
 `tools/write_layout.py`'s `KERNEL_RESERVED_END`) grew from `0x20000` to
-`0x40000` alongside `tape`, since the feature's own code pushed the kernel
+`0x40000` alongside `tape`, then to `0x50000` when paging, NIC reliability,
+and boot-script code consumed the remaining headroom. The feature's own code pushed the kernel
 binary past the previous 64 KiB ceiling with essentially no headroom left
 beforehand (the prior build was already only dozens of bytes under it).
 All three constants must always match; see "Low-memory map" above for why
@@ -1102,8 +1125,8 @@ bitmap (32 KiB, up from the original 4 KiB) directly inflated
 `kernel.bin` by ~28 KB. Stage two now avoids the former single-transfer
 127-sector ceiling by splitting kernel loading into bounded INT 13h
 extended-read calls that respect each BIOS 64 KiB boundary. The remaining
-limit is the reserved `0x10000..0x40000` low-memory region, currently
-384 sectors, and `tools/write_layout.py` emits that limit.
+limit is the reserved `0x10000..0x50000` low-memory region, currently
+512 sectors, and `tools/write_layout.py` emits that limit.
 
 The fix: a second allocator, the "big pool" (`BIG_BITMAP`,
 `BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 2 GiB,
@@ -1957,7 +1980,7 @@ symbol matching this contract and link against `longmode64_shim.o`.
 
 Mechanically, the shim builds its own tiny identity-mapped page tables
 (three static 2 MiB pages covering physical 0..6 MiB -- the kernel's own
-code/stack, 0x10000..0x40000; VGA text memory, 0xb8000; and the tape's
+code/stack, 0x10000..0x50000; VGA text memory, 0xb8000; and the tape's
 own 4 MiB image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-
 descriptor private GDT (a 64-bit code descriptor at selector 0x08, and a
 flat 32-bit code descriptor at selector 0x10 used only as the landing pad

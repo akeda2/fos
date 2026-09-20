@@ -15,15 +15,16 @@
 //! buffers.
 //!
 //! This driver only implements what is needed to send and receive raw
-//! Ethernet frames by polling; it does not touch the card's interrupt
-//! line (this project's PIC setup leaves it masked regardless -- see
-//! `interrupts.rs`), and it does not implement any protocol above
+//! Ethernet frames by polling; legacy interrupts only acknowledge the card
+//! and mark foreground receive work pending, and it does not implement any protocol above
 //! Ethernet itself (no ARP, no IPv4). Multicast filtering, wake-on-LAN,
 //! and the card's various statistics counters are all left untouched.
 
 use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::x86::{inb, inl, inw, outb, outl, outw};
+use crate::nic::{Health, WatchdogResult};
 use crate::pci;
 use crate::pmem;
 
@@ -37,7 +38,7 @@ const REG_TSAD0: u16 = 0x20; // Transmit start address (physical), descriptors 0
 const REG_RBSTART: u16 = 0x30; // Receive buffer start address (physical).
 const REG_CR: u16 = 0x37; // Command register.
 const REG_CAPR: u16 = 0x38; // Current address of packet read.
-const REG_IMR: u16 = 0x3c; // Interrupt mask (left at 0: see module docs).
+const REG_IMR: u16 = 0x3c; // Interrupt mask.
 const REG_ISR: u16 = 0x3e; // Interrupt status (latches regardless of IMR).
 const REG_TCR: u16 = 0x40; // Transmit configuration.
 const REG_RCR: u16 = 0x44; // Receive configuration.
@@ -80,7 +81,7 @@ const RCR_AAP: u32 = 1 << 0;
 /// this driver's poll loop catches up measurably reduces -- though, since
 /// real bursts are only bounded by wire speed and this loop still has to
 /// actually run its own logic between polls, does not entirely eliminate
-/// -- how often `recover_from_overflow` has to trigger, and how much tape
+/// -- how often `recover` has to trigger, and how much tape
 /// data is lost to it, under a real, unpaced `send_tape.py` run.
 const RCR_RBLEN_32K: u32 = 0b10 << 11;
 
@@ -104,6 +105,9 @@ const ISR_RXOVW: u16 = 1 << 4;
 /// from `ISR_RXOVW` but calls for the identical recovery, so both are
 /// treated the same way here.
 const ISR_FOVW: u16 = 1 << 6;
+const ISR_ROK: u16 = 1 << 0;
+const ISR_RER: u16 = 1 << 1;
+const RTL_INTERRUPT_MASK: u16 = ISR_ROK | ISR_RER | ISR_RXOVW | ISR_FOVW;
 
 /// `TCR`'s Interframe Gap Time field (bits 25:24), set to the standard
 /// IEEE 802.3 gap (`11b`). Leaving this at its all-zero reset value (the
@@ -137,6 +141,12 @@ fn read8(base: u16, register: u16) -> u8 {
     unsafe { inb(base + register) }
 }
 
+#[derive(Clone, Copy)]
+pub struct ProbeInfo {
+    io_base: u16,
+    irq: Option<u8>,
+}
+
 fn write8(base: u16, register: u16, value: u8) {
     unsafe { outb(base + register, value) }
 }
@@ -164,10 +174,22 @@ pub struct Rtl8139 {
     tx_buffers: [u32; TX_DESCRIPTORS],
     tx_next: Cell<usize>,
     /// Count of Rx buffer/FIFO overflow recoveries performed so far (see
-    /// `recover_from_overflow`). Exposed only for diagnostics (e.g. the
+    /// `recover`). Exposed only for diagnostics (e.g. the
     /// shell's `tape load net` can report it if a transfer stalls); it
     /// does not affect driver behavior.
     overflow_count: Cell<u32>,
+    recovery_count: Cell<u32>,
+    rx_progress: Cell<u32>,
+    tx_progress: Cell<u32>,
+    recovery_failures: Cell<u32>,
+    recovery_pending: AtomicBool,
+    promiscuous: Cell<bool>,
+    irq: Option<u8>,
+    interrupt_count: AtomicU32,
+    interrupt_errors: AtomicU32,
+    work_pending: AtomicBool,
+    overflow_pending: AtomicBool,
+    interrupts_enabled: Cell<bool>,
 }
 
 /// What went wrong trying to bring a detected card up. Detection (finding
@@ -185,7 +207,7 @@ pub enum InitError {
 impl Rtl8139 {
     /// Finds every Realtek RTL8139 function with a usable I/O BAR and
     /// enables I/O space and bus mastering for each one.
-    pub fn probe_all(out: &mut [u16]) -> usize {
+    pub fn probe_all(out: &mut [ProbeInfo]) -> usize {
         let mut addresses = [None; pci::MAX_DEVICE_MATCHES];
         let found = pci::find_devices(
             VENDOR_REALTEK,
@@ -199,7 +221,10 @@ impl Rtl8139 {
                 if count == out.len() {
                     break;
                 }
-                out[count] = io_base;
+                out[count] = ProbeInfo {
+                    io_base,
+                    irq: address.interrupt_line(),
+                };
                 count += 1;
             }
         }
@@ -210,7 +235,7 @@ impl Rtl8139 {
     /// and transmitting. Each instance owns its own DMA buffers, allocated
     /// once here and never freed back to `pmem`; the driver is not meant to
     /// be torn down and re-initialized repeatedly.
-    pub fn init(io_base: u16) -> Result<Self, InitError> {
+    pub fn init(io_base: u16, irq: Option<u8>) -> Result<Self, InitError> {
         Self::soft_reset(io_base)?;
 
         let rx_buffer = pmem::allocate_contiguous(RX_BUF_FRAMES).ok_or(InitError::OutOfMemory)?;
@@ -228,12 +253,24 @@ impl Rtl8139 {
             tx_buffers,
             tx_next: Cell::new(0),
             overflow_count: Cell::new(0),
+            recovery_count: Cell::new(0),
+            rx_progress: Cell::new(0),
+            tx_progress: Cell::new(0),
+            recovery_failures: Cell::new(0),
+            recovery_pending: AtomicBool::new(cfg!(feature = "nic-watchdog-test")),
+            promiscuous: Cell::new(false),
+            irq,
+            interrupt_count: AtomicU32::new(0),
+            interrupt_errors: AtomicU32::new(0),
+            work_pending: AtomicBool::new(false),
+            overflow_pending: AtomicBool::new(false),
+            interrupts_enabled: Cell::new(false),
         })
     }
 
     /// Power on, then software-reset, waiting for the card to clear
     /// `CR_RST` itself once the reset completes. Shared by `init` and by
-    /// `recover_from_overflow`'s full-reset recovery path.
+    /// `recover`'s full-reset recovery path.
     fn soft_reset(io_base: u16) -> Result<(), InitError> {
         write8(io_base, REG_CONFIG1, 0x00);
         write8(io_base, REG_CR, CR_RST);
@@ -250,11 +287,11 @@ impl Rtl8139 {
     /// (Re-)programs every register a freshly reset card needs before it
     /// will actually send/receive, pointing it at `rx_buffer` as its
     /// receive ring. Shared by `init` (first bring-up) and
-    /// `recover_from_overflow` (recovering after a full reset, reusing
+    /// `recover` (recovering after a full reset, reusing
     /// the same DMA buffer rather than allocating a new one).
     fn program_registers(io_base: u16, rx_buffer: u32) {
         write32(io_base, REG_RBSTART, rx_buffer);
-        write16(io_base, REG_IMR, 0x0000); // No interrupt line use; see module docs.
+        write16(io_base, REG_IMR, 0x0000);
         // The transmitter/receiver enable bits must be set in CR *before*
         // RCR/TCR are written, not after: those two registers also carry
         // FIFO/DMA threshold fields, and on real silicon (unlike QEMU's
@@ -292,6 +329,7 @@ impl Rtl8139 {
             rcr &= !RCR_AAP;
         }
         write32(self.io_base, REG_RCR, rcr);
+        self.promiscuous.set(enabled);
     }
 
     /// Transmits one raw Ethernet frame (destination MAC + source MAC +
@@ -330,20 +368,23 @@ impl Rtl8139 {
         loop {
             let status = read32(self.io_base, REG_TSD0 + descriptor as u16 * 4);
             if status & (TSD_TABT | TSD_TUN) != 0 {
+                self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }
             if status & TSD_TOK != 0 {
+                self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
                 return true;
             }
             attempts -= 1;
             if attempts == 0 {
+                self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }
         }
     }
 
-    /// Detects an Rx buffer or FIFO overflow (`ISR_RXOVW`/`ISR_FOVW`) and,
-    /// if one occurred, recovers from it with a full software reset
+    /// Recovers a latched Rx buffer/FIFO overflow (`ISR_RXOVW`/`ISR_FOVW`)
+    /// or bounded transmit failure with a full software reset
     /// (`soft_reset`) followed by reprogramming every register a fresh
     /// card needs (`program_registers`, reusing the same DMA buffer
     /// rather than allocating a new one) and resetting the ring's read
@@ -359,17 +400,22 @@ impl Rtl8139 {
     /// leaves the card working afterwards, matching the full
     /// reset-and-reinitialize recovery real-world drivers (e.g. Linux's
     /// historic `8139too.c`) document using for this exact condition.
-    /// Called at the top of every `receive`, so a burst that overflows
+    /// Called by foreground receive polling and the facade watchdog, so a burst that overflows
     /// the ring (real hardware can be sent frames back-to-back far faster
     /// than QEMU's emulated NIC ever presents them, e.g. `send_tape.py`
     /// run with no `--delay`) recovers into a genuinely working card on
     /// its own on the next poll, instead of the ring wedging forever.
     /// Any frame(s) lost to the overflow are simply gone, exactly as on
     /// any other Ethernet link that dropped them.
-    fn recover_from_overflow(&self) {
+    fn recover(&self) -> bool {
         let isr = read16(self.io_base, REG_ISR);
-        if isr & (ISR_RXOVW | ISR_FOVW) == 0 {
-            return;
+        let had_overflow = self.overflow_pending.swap(false, Ordering::AcqRel)
+            || isr & (ISR_RXOVW | ISR_FOVW) != 0;
+        if !had_overflow
+            && !self.recovery_pending.swap(false, Ordering::AcqRel)
+            && isr & (ISR_RXOVW | ISR_FOVW) == 0
+        {
+            return false;
         }
 
         // A reset that fails to complete within `soft_reset`'s generous
@@ -377,18 +423,29 @@ impl Rtl8139 {
         // sane fallback but to leave the card as-is and let the next
         // `receive` call try again.
         if Self::soft_reset(self.io_base).is_err() {
-            return;
+            self.recovery_failures.set(self.recovery_failures.get().wrapping_add(1));
+            return false;
         }
         Self::program_registers(self.io_base, self.rx_buffer);
+        if self.promiscuous.get() {
+            self.set_promiscuous(true);
+        }
+        if self.interrupts_enabled.get() {
+            self.enable_interrupts();
+        }
         self.rx_offset.set(0);
         write16(self.io_base, REG_CAPR, 0u16.wrapping_sub(16));
 
-        self.overflow_count.set(self.overflow_count.get() + 1);
+        if had_overflow {
+            self.overflow_count.set(self.overflow_count.get().wrapping_add(1));
+        }
+        self.recovery_count.set(self.recovery_count.get().wrapping_add(1));
+        true
     }
 
     /// How many times `receive` has detected and recovered from an Rx
     /// buffer/FIFO overflow so far. Diagnostic only (see
-    /// `recover_from_overflow`); a nonzero, growing count while a
+    /// `recover`); a nonzero, growing count while a
     /// transfer is in progress is a strong sign frames are being lost to
     /// the sender running faster than this driver's polling loop can
     /// drain the ring, which `tape load net` reports to help tell that
@@ -397,13 +454,70 @@ impl Rtl8139 {
         self.overflow_count.get()
     }
 
+    pub fn health(&self) -> Health {
+        Health {
+            rx_progress: self.rx_progress.get(),
+            tx_progress: self.tx_progress.get(),
+            recoveries: self.recovery_count.get(),
+            recovery_failures: self.recovery_failures.get(),
+            recovery_pending: self.overflow_pending.load(Ordering::Acquire)
+                || self.recovery_pending.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn watchdog(&self) -> WatchdogResult {
+        if !self.health().recovery_pending
+            && read16(self.io_base, REG_ISR) & (ISR_RXOVW | ISR_FOVW) == 0
+        {
+            return WatchdogResult::Healthy;
+        }
+
+        if self.recover() {
+            WatchdogResult::Recovered
+        } else {
+            WatchdogResult::Failed
+        }
+    }
+
+    pub fn enable_interrupts(&self) {
+        write16(self.io_base, REG_ISR, 0xffff);
+        write16(self.io_base, REG_IMR, RTL_INTERRUPT_MASK);
+        self.interrupts_enabled.set(true);
+    }
+
+    pub fn handle_interrupt(&self) {
+        let status = read16(self.io_base, REG_ISR) & RTL_INTERRUPT_MASK;
+        if status == 0 {
+            return;
+        }
+        write16(self.io_base, REG_ISR, status);
+        self.interrupt_count.fetch_add(1, Ordering::Relaxed);
+        if status & (ISR_RER | ISR_RXOVW | ISR_FOVW) != 0 {
+            self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if status & (ISR_RXOVW | ISR_FOVW) != 0 {
+            self.overflow_pending.store(true, Ordering::Release);
+        }
+        self.work_pending.store(true, Ordering::Release);
+    }
+
+    pub fn interrupt_stats(&self) -> (Option<u8>, u32, u32, bool) {
+        (
+            self.irq,
+            self.interrupt_count.load(Ordering::Relaxed),
+            self.interrupt_errors.load(Ordering::Relaxed),
+            self.work_pending.load(Ordering::Acquire),
+        )
+    }
+
     /// Copies out one received frame (if any is waiting) into `out`,
     /// returning its length -- clipped to `out.len()` if the frame is
     /// larger than the caller's buffer, though the ring is advanced by
     /// the *actual* frame length either way. Returns `None` if no frame
     /// is currently waiting; this does not block.
     pub fn receive(&self, out: &mut [u8]) -> Option<usize> {
-        self.recover_from_overflow();
+        self.work_pending.store(false, Ordering::Release);
+        self.recover();
 
         if read8(self.io_base, REG_CR) & CR_BUFE != 0 {
             return None; // Buffer empty register bit: nothing waiting.
@@ -454,6 +568,7 @@ impl Rtl8139 {
         let payload = unsafe { core::slice::from_raw_parts(payload_start as *const u8, copy_len) };
         out[..copy_len].copy_from_slice(payload);
 
+        self.rx_progress.set(self.rx_progress.get().wrapping_add(1));
         Some(copy_len)
     }
 }
@@ -478,11 +593,16 @@ pub fn initialize_all() -> Result<usize, Status> {
     unsafe {
         if !INITIALIZED {
             INITIALIZED = true;
-            let mut io_bases = [0u16; MAX_INSTANCES];
-            let found = Rtl8139::probe_all(&mut io_bases);
+            let mut probe_info = [const {
+                ProbeInfo {
+                    io_base: 0,
+                    irq: None,
+                }
+            }; MAX_INSTANCES];
+            let found = Rtl8139::probe_all(&mut probe_info);
             let mut first_error = None;
-            for &io_base in &io_bases[..found] {
-                match Rtl8139::init(io_base) {
+            for info in &probe_info[..found] {
+                match Rtl8139::init(info.io_base, info.irq) {
                     Ok(initialized) => {
                         NICS[NIC_COUNT] = Some(initialized);
                         NIC_COUNT += 1;

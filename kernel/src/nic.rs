@@ -4,8 +4,10 @@
 //! facade initializes every supported PCI backend instance, keeps the first
 //! initialized card active by default, and lets shell commands and newer
 //! tapes select a specific interface without exposing PCI or DMA details.
+//! Device IRQs only acknowledge a cause and make a foreground poll prompt;
+//! all descriptor and protocol parsing remains in foreground code.
 
-use crate::{e1000, pci, rtl8139, threecom};
+use crate::{e1000, interrupts, pci, rtl8139, threecom};
 
 pub const MAX_FRAME_LEN: usize = 1514;
 const MAX_NICS: usize = pci::MAX_DEVICE_MATCHES * 3;
@@ -14,6 +16,33 @@ pub enum Nic {
     Rtl8139(&'static rtl8139::Rtl8139),
     ThreeCom(&'static threecom::ThreeCom),
     E1000(&'static e1000::E1000),
+}
+
+#[derive(Clone, Copy)]
+pub struct InterruptStats {
+    pub irq: Option<u8>,
+    pub count: u32,
+    pub errors: u32,
+    pub pending: bool,
+}
+
+/// Foreground-only driver health counters. `rx_progress` and `tx_progress`
+/// count completed frames, not IRQs: polling remains the authority for ring
+/// ownership even when a legacy line is available.
+#[derive(Clone, Copy)]
+pub struct Health {
+    pub rx_progress: u32,
+    pub tx_progress: u32,
+    pub recoveries: u32,
+    pub recovery_failures: u32,
+    pub recovery_pending: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogResult {
+    Healthy,
+    Recovered,
+    Failed,
 }
 
 impl Nic {
@@ -71,6 +100,67 @@ impl Nic {
             Nic::E1000(nic) => nic.overflow_count(),
         }
     }
+
+    pub fn interrupt_stats(&self) -> InterruptStats {
+        let (irq, count, errors, pending) = match self {
+            Nic::Rtl8139(nic) => nic.interrupt_stats(),
+            Nic::ThreeCom(nic) => nic.interrupt_stats(),
+            Nic::E1000(nic) => nic.interrupt_stats(),
+        };
+        InterruptStats {
+            irq,
+            count,
+            errors,
+            pending,
+        }
+    }
+
+    pub fn health(&self) -> Health {
+        match self {
+            Nic::Rtl8139(nic) => nic.health(),
+            Nic::ThreeCom(nic) => nic.health(),
+            Nic::E1000(nic) => nic.health(),
+        }
+    }
+
+    /// Runs a bounded, device-specific reset only after the driver has
+    /// observed a documented fatal condition (such as a DMA overrun or a
+    /// transmit completion timeout). It never infers a failure merely from
+    /// an idle link: silence is normal for a raw Ethernet interface.
+    pub fn watchdog(&self) -> WatchdogResult {
+        match self {
+            Nic::Rtl8139(nic) => nic.watchdog(),
+            Nic::ThreeCom(nic) => nic.watchdog(),
+            Nic::E1000(nic) => nic.watchdog(),
+        }
+    }
+
+    fn enable_interrupts(&self) {
+        match self {
+            Nic::Rtl8139(nic) => nic.enable_interrupts(),
+            Nic::ThreeCom(nic) => nic.enable_interrupts(),
+            Nic::E1000(nic) => nic.enable_interrupts(),
+        }
+    }
+
+    fn handles_irq(&self, irq: u8) -> bool {
+        self.interrupt_stats().irq == Some(irq)
+    }
+
+    fn handle_interrupt(&self) {
+        match self {
+            Nic::Rtl8139(nic) => nic.handle_interrupt(),
+            Nic::ThreeCom(nic) => nic.handle_interrupt(),
+            Nic::E1000(nic) => nic.handle_interrupt(),
+        }
+    }
+}
+
+/// Polls the selected card's health state. Callers naturally reach this from
+/// shell status and normal send/receive traffic; it is deliberately never an
+/// IRQ handler or timer task.
+pub fn watchdog() -> Result<WatchdogResult, Status> {
+    Ok(get()?.watchdog())
 }
 
 static mut NICS: [Option<Nic>; MAX_NICS] = [const { None }; MAX_NICS];
@@ -153,7 +243,30 @@ pub fn initialize() -> Result<usize, Status> {
                 Err(Status::NotPresent)
             }
         } else {
+            for index in 0..NIC_COUNT {
+                let nic = NICS[index].as_ref().unwrap();
+                if let Some(irq) = nic.interrupt_stats().irq {
+                    if interrupts::register_pci_irq(irq, handle_pci_irq) {
+                        nic.enable_interrupts();
+                    }
+                }
+            }
             Ok(NIC_COUNT)
+        }
+    }
+}
+
+/// Shared legacy IRQs are normal. Each matching backend only reads and
+/// acknowledges its own device status, leaving all frame parsing for callers'
+/// ordinary polling receive loops.
+fn handle_pci_irq(irq: u8) {
+    unsafe {
+        for index in 0..NIC_COUNT {
+            if let Some(nic) = NICS[index].as_ref() {
+                if nic.handles_irq(irq) {
+                    nic.handle_interrupt();
+                }
+            }
         }
     }
 }

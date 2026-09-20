@@ -8,6 +8,30 @@
 use tape_net::{DHCP_MAX_DNS_SERVERS, Ipv4Address};
 
 pub const MAX_INTERFACES: usize = 4;
+pub const MAX_FORWARDS: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardProtocol {
+    Tcp,
+    Udp,
+}
+
+impl ForwardProtocol {
+    pub const fn ip_protocol(self) -> u8 {
+        match self {
+            Self::Tcp => 6,
+            Self::Udp => 17,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortForward {
+    pub protocol: ForwardProtocol,
+    pub external_port: u16,
+    pub internal_address: Ipv4Address,
+    pub internal_port: u16,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InterfaceConfig {
@@ -39,9 +63,16 @@ pub struct RouterConfig {
     pub interfaces: [Option<InterfaceConfig>; MAX_INTERFACES],
     pub interface_count: usize,
     pub dhcp: bool,
+    /// Ordered zero-based NICs that acquire their addresses through DHCP.
+    /// The first healthy lease is the preferred forward-facing uplink.
+    pub dhcp_uplinks: [Option<u32>; MAX_INTERFACES],
+    pub dhcp_uplink_count: usize,
+    pub health_target: Option<Ipv4Address>,
     pub dhcp_server: bool,
     pub dhcp_lease_file: Option<FileName>,
     pub nat: bool,
+    pub forwards: [Option<PortForward>; MAX_FORWARDS],
+    pub forward_count: usize,
     pub dns_servers: [Option<Ipv4Address>; DHCP_MAX_DNS_SERVERS],
     pub dns_server_count: usize,
     pub default_route: Option<DefaultRoute>,
@@ -67,6 +98,17 @@ pub enum ConfigError {
     MissingLeaseFileName,
     BadLeaseFileName,
     LeaseFileRequiresDhcpServer,
+    MissingForwardValue,
+    BadForwardProtocol,
+    BadForwardPort,
+    BadForwardAddress,
+    TooManyForwards,
+    DuplicateForward,
+    ForwardTargetNotInternal,
+    TooManyDhcpUplinks,
+    DuplicateDhcpUplink,
+    MissingHealthTarget,
+    BadHealthTarget,
 }
 
 pub fn parse_ipv4(text: &[u8]) -> Option<Ipv4Address> {
@@ -178,7 +220,8 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
     inverted & inverted.wrapping_add(1) == 0
 }
 
-/// Parses `[dhcp] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat]
+/// Parses `[dhcp [NIC]]... [health ADDRESS] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat]
+/// [forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]]
 /// [dns SERVER [SERVER]] NIC IP NETMASK
 /// [NIC IP NETMASK ...] [default NIC GATEWAY]`.
 ///
@@ -190,9 +233,10 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
 /// describe the same interface: `1 10.0.1.1 255.255.255.0`,
 /// `1 10.0.1.1/24`, and `1 10.0.1.1 /24`.
 ///
-/// `dhcp` reserves NIC 1 (callback index zero) for a DHCP lease.  Static
-/// triples then configure the remaining interfaces.  The optional `default`
-/// suffix selects the one-based egress NIC and its next-hop gateway.
+/// `dhcp` reserves NIC 1 (callback index zero) for a DHCP lease; `dhcp N`
+/// adds one-based NIC `N` as the next-priority DHCP uplink. Static triples
+/// then configure downstream interfaces. `health A.B.C.D` selects the ICMP
+/// echo target used to verify each DHCP uplink after its gateway answers ARP.
 ///
 /// `dhcp-server` enables the built-in DHCP server on every configured
 /// interface except NIC 1. Its pool is derived from each interface subnet.
@@ -208,10 +252,15 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
 /// `dns SERVER [SERVER]` overrides DNS servers learned from upstream DHCP.
 /// Up to two IPv4 DNS server addresses may be supplied.
 ///
+/// `forward` statically exposes a TCP or UDP port on NIC 1. Its internal
+/// address must be on a configured non-primary subnet; omitting
+/// `INTERNAL_PORT` preserves `EXTERNAL_PORT`. The bounded rule list rejects
+/// duplicate external ports and ambiguous duplicate internal endpoints.
+///
 /// Whitespace may include newlines, and `#` starts a comment through the end
 /// of its line, so the same grammar can be kept as a readable FOSFS file.
 pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigError> {
-    let mut words = [None; 20];
+    let mut words = [None; 128];
     let count = split_words(input, &mut words);
     if count == 0 || count > words.len() {
         return Err(ConfigError::WrongArgumentCount);
@@ -224,17 +273,65 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         return Err(ConfigError::MissingInterface);
     }
     let mut dhcp = false;
+    let mut dhcp_uplinks = [None; MAX_INTERFACES];
+    let mut dhcp_uplink_count = 0usize;
+    let mut health_target = None;
     let mut dhcp_server = false;
     let mut dhcp_lease_file = None;
     let mut nat = true;
     let mut nat_mode: Option<bool> = None;
+    let mut forwards: [Option<PortForward>; MAX_FORWARDS] = [None; MAX_FORWARDS];
+    let mut forward_count = 0usize;
     let mut dns_servers = [None; DHCP_MAX_DNS_SERVERS];
     let mut dns_server_count = 0usize;
     loop {
         match words[first] {
             Some(b"dhcp") => {
                 dhcp = true;
+                // Preserve the old `dhcp 2 ADDRESS/MASK` spelling: there the
+                // number starts the first static triple. An explicit uplink
+                // number is followed by another directive (normally `dhcp`)
+                // rather than an IPv4 address.
+                let nic = match (
+                    words.get(first + 1).and_then(|word| *word),
+                    words.get(first + 2).and_then(|word| *word),
+                ) {
+                    (Some(word), next)
+                        if parse_number(word).is_some()
+                            && !next.is_some_and(|next| {
+                                parse_ipv4(next).is_some() || next.contains(&b'/')
+                            }) =>
+                    {
+                        first += 1;
+                        parse_number(word).filter(|number| *number != 0).ok_or(ConfigError::BadNicNumber)? - 1
+                    }
+                    _ => 0,
+                };
+                if dhcp_uplinks[..dhcp_uplink_count]
+                    .iter()
+                    .flatten()
+                    .any(|existing| *existing == nic)
+                {
+                    return Err(ConfigError::DuplicateDhcpUplink);
+                }
+                if dhcp_uplink_count == MAX_INTERFACES {
+                    return Err(ConfigError::TooManyDhcpUplinks);
+                }
+                dhcp_uplinks[dhcp_uplink_count] = Some(nic);
+                dhcp_uplink_count += 1;
                 first += 1;
+            }
+            Some(b"health") => {
+                let target = words
+                    .get(first + 1)
+                    .and_then(|word| *word)
+                    .ok_or(ConfigError::MissingHealthTarget)?;
+                health_target = Some(
+                    parse_ipv4(target)
+                        .filter(|address| *address != Ipv4Address::UNSPECIFIED && address.0[0] < 224)
+                        .ok_or(ConfigError::BadHealthTarget)?,
+                );
+                first += 2;
             }
             Some(b"dhcp-server") => {
                 dhcp_server = true;
@@ -277,6 +374,64 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
                 nat_mode = Some(false);
                 nat = false;
                 first += 1;
+            }
+            Some(b"forward") => {
+                let protocol = match words.get(first + 1).and_then(|word| *word) {
+                    Some(b"tcp") => ForwardProtocol::Tcp,
+                    Some(b"udp") => ForwardProtocol::Udp,
+                    Some(_) => return Err(ConfigError::BadForwardProtocol),
+                    None => return Err(ConfigError::MissingForwardValue),
+                };
+                let external_port = parse_number(
+                    words
+                        .get(first + 2)
+                        .and_then(|word| *word)
+                        .ok_or(ConfigError::MissingForwardValue)?,
+                )
+                .filter(|port| (1..=u32::from(u16::MAX)).contains(port))
+                .ok_or(ConfigError::BadForwardPort)? as u16;
+                let internal_address = parse_ipv4(
+                    words
+                        .get(first + 3)
+                        .and_then(|word| *word)
+                        .ok_or(ConfigError::MissingForwardValue)?,
+                )
+                .filter(|address| *address != Ipv4Address::UNSPECIFIED && address.0[0] < 224)
+                .ok_or(ConfigError::BadForwardAddress)?;
+                let mut consumed = 4;
+                let mut internal_port = external_port;
+                if let Some(port_word) = words.get(first + consumed).and_then(|word| *word) {
+                    let next_is_interface = words
+                        .get(first + consumed + 1)
+                        .and_then(|word| *word)
+                        .is_some_and(|word| parse_ipv4(word).is_some() || word.contains(&b'/'));
+                    if !next_is_interface && parse_number(port_word).is_some() {
+                        internal_port = parse_number(port_word)
+                            .filter(|port| (1..=u32::from(u16::MAX)).contains(port))
+                            .ok_or(ConfigError::BadForwardPort)? as u16;
+                        consumed += 1;
+                    }
+                }
+                if forward_count == MAX_FORWARDS {
+                    return Err(ConfigError::TooManyForwards);
+                }
+                let forward = PortForward {
+                    protocol,
+                    external_port,
+                    internal_address,
+                    internal_port,
+                };
+                if forwards[..forward_count].iter().flatten().any(|existing| {
+                    (existing.protocol == protocol && existing.external_port == external_port)
+                        || (existing.protocol == protocol
+                            && existing.internal_address == internal_address
+                            && existing.internal_port == internal_port)
+                }) {
+                    return Err(ConfigError::DuplicateForward);
+                }
+                forwards[forward_count] = Some(forward);
+                forward_count += 1;
+                first += consumed;
             }
             Some(b"dns") => {
                 first += 1;
@@ -371,7 +526,11 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         {
             return Err(ConfigError::DuplicateNic);
         }
-        if dhcp && nic == 0 {
+        if dhcp_uplinks[..dhcp_uplink_count]
+            .iter()
+            .flatten()
+            .any(|uplink| *uplink == nic)
+        {
             return Err(ConfigError::DuplicateNic);
         }
         configs[interface_count] = Some(InterfaceConfig {
@@ -382,7 +541,7 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         interface_count += 1;
         position += consumed;
     }
-    let total_interfaces = interface_count + usize::from(dhcp);
+    let total_interfaces = interface_count + dhcp_uplink_count;
     if total_interfaces < 2 {
         return Err(ConfigError::MissingInterface);
     }
@@ -393,7 +552,10 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         return Err(ConfigError::LeaseFileRequiresDhcpServer);
     }
     if let Some(route) = default_route {
-        let configured = (dhcp && route.nic == 0)
+        let configured = dhcp_uplinks[..dhcp_uplink_count]
+            .iter()
+            .flatten()
+            .any(|uplink| *uplink == route.nic)
             || configs[..interface_count]
                 .iter()
                 .flatten()
@@ -411,13 +573,29 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
             }
         }
     }
+    for forward in forwards[..forward_count].iter().flatten() {
+        if !configs[..interface_count].iter().flatten().any(|config| {
+            !dhcp_uplinks[..dhcp_uplink_count]
+                .iter()
+                .flatten()
+                .any(|uplink| *uplink == config.nic)
+                && same_subnet(config.address, config.netmask, forward.internal_address)
+        }) {
+            return Err(ConfigError::ForwardTargetNotInternal);
+        }
+    }
     Ok(RouterConfig {
         interfaces: configs,
         interface_count,
         dhcp,
+        dhcp_uplinks,
+        dhcp_uplink_count,
+        health_target,
         dhcp_server,
         dhcp_lease_file,
         nat,
+        forwards,
+        forward_count,
         dns_servers,
         dns_server_count,
         default_route,
@@ -470,6 +648,12 @@ pub fn route_next_hop(
 ) -> Option<(usize, Ipv4Address)> {
     if let Some(index) = longest_match(configs, count, destination) {
         return Some((index, destination));
+    }
+
+    /// Returns the first healthy DHCP uplink index, preserving declaration order.
+    #[allow(dead_code)]
+    pub fn select_healthy_uplink(healthy: &[bool; MAX_INTERFACES], count: usize) -> Option<usize> {
+        healthy[..count].iter().position(|healthy| *healthy)
     }
     let route = default_route?;
     let index = configs[..count]
@@ -591,6 +775,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_ordered_dhcp_uplinks_and_health_target() {
+        let config = parse_config(
+            b"router dhcp dhcp 2 health 203.0.113.9 3 10.0.3.1/24",
+        )
+        .unwrap();
+        assert_eq!(config.dhcp_uplink_count, 2);
+        assert_eq!(config.dhcp_uplinks[..2], [Some(0), Some(1)]);
+        assert_eq!(config.health_target, Some(Ipv4Address::new([203, 0, 113, 9])));
+        assert_eq!(config.interfaces[0].unwrap().nic, 2);
+        assert_eq!(select_healthy_uplink(&[true, true, false, false], 2), Some(0));
+        assert_eq!(select_healthy_uplink(&[false, true, false, false], 2), Some(1));
+        assert_eq!(select_healthy_uplink(&[true, true, false, false], 2), Some(0));
+    }
+
+    #[test]
+    fn preserves_legacy_dhcp_then_static_nic_syntax() {
+        let config = parse_config(b"dhcp 2 10.0.2.1/24").unwrap();
+        assert_eq!(config.dhcp_uplinks[..1], [Some(0)]);
+        assert_eq!(config.interfaces[0].unwrap().nic, 1);
+        assert_eq!(
+            parse_config(b"dhcp dhcp 1 2 10.0.2.1/24"),
+            Err(ConfigError::DuplicateDhcpUplink)
+        );
+    }
+
+    #[test]
     fn parses_dhcp_server_mode_without_reserving_nic_one() {
         let config = parse_config(b"router dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24").unwrap();
         assert!(!config.dhcp);
@@ -647,6 +857,45 @@ mod tests {
         assert_eq!(
             parse_config(b"router no-nat nat 1 10.0.1.1/24 2 10.0.2.1/24"),
             Err(ConfigError::ConflictingNatMode)
+        );
+    }
+
+    #[test]
+    fn parses_static_port_forwards_and_rejects_ambiguous_rules() {
+        let config = parse_config(
+            b"router forward tcp 8080 10.0.2.2 80 forward udp 5353 10.0.2.3 \
+              1 10.0.1.1/24 2 10.0.2.1/24",
+        )
+        .unwrap();
+        assert_eq!(config.forward_count, 2);
+        assert_eq!(
+            config.forwards[0],
+            Some(PortForward {
+                protocol: ForwardProtocol::Tcp,
+                external_port: 8080,
+                internal_address: Ipv4Address::new([10, 0, 2, 2]),
+                internal_port: 80,
+            })
+        );
+        assert_eq!(
+            config.forwards[1],
+            Some(PortForward {
+                protocol: ForwardProtocol::Udp,
+                external_port: 5353,
+                internal_address: Ipv4Address::new([10, 0, 2, 3]),
+                internal_port: 5353,
+            })
+        );
+        assert_eq!(
+            parse_config(
+                b"forward tcp 80 10.0.2.2 forward tcp 80 10.0.2.3 \
+                  1 10.0.1.1/24 2 10.0.2.1/24"
+            ),
+            Err(ConfigError::DuplicateForward)
+        );
+        assert_eq!(
+            parse_config(b"forward udp 53 10.0.1.2 1 10.0.1.1/24 2 10.0.2.1/24"),
+            Err(ConfigError::ForwardTargetNotInternal)
         );
     }
 

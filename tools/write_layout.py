@@ -22,7 +22,7 @@ STAGE2_SECTORS = 32
 # reserved low-memory region the kernel itself must fit inside (see
 # `kernel/linker.ld`).
 KERNEL_LOAD_ADDRESS = 0x10000
-KERNEL_RESERVED_END = 0x40000
+KERNEL_RESERVED_END = 0x50000
 IMAGE_SECTORS = 32768
 # LBA and size of the dedicated FOSFS data partition, kept separate from the
 # boot payload partition so formatting FOSFS can never touch loader code.

@@ -150,6 +150,16 @@ def main() -> None:
         default="none",
         help="attach the selected QEMU NIC model (default: none)",
     )
+    parser.add_argument(
+        "--start-script-test",
+        action="store_true",
+        help="expect the test-only FOSFS START script to run before the prompt",
+    )
+    parser.add_argument(
+        "--nic-watchdog-test",
+        action="store_true",
+        help="exercise the test-only foreground NIC reset latch (requires matching kernel feature)",
+    )
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="fos-qemu-monitor-") as monitor_dir:
@@ -199,6 +209,15 @@ def main() -> None:
                 wait_for(output, selector, b"Waiting for a remote terminal client to connect;", 10)
                 send_monitor_command(monitor_path, "sendkey f12")
             wait_for(output, selector, BOOT_MARKER, 10)
+            if args.start_script_test:
+                if b"START: running " not in output:
+                    raise RuntimeError(
+                        f"START script did not run before the prompt:\n{output.decode(errors='replace')}"
+                    )
+                if b"START line 3: about" not in output:
+                    raise RuntimeError(
+                        f"START command was not dispatched:\n{output.decode(errors='replace')}"
+                    )
             commands = [
                 b"helx\x08p\r",
                 b"about\r",
@@ -262,8 +281,20 @@ def main() -> None:
                 else b"Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO;"
             )
             expected.insert(expected.index(b"Physical memory: "), memory_marker)
+            if not args.legacy_unsafe_memory:
+                expected.insert(
+                    expected.index(b"Physical memory: "),
+                    b"Paging protection: kernel text/read-only data reject writes; PCI MMIO maps only when a driver registers its BAR.",
+                )
             if args.nic == "e1000":
-                expected.extend((b"Intel e1000 found:", b"Sent a 41-byte broadcast test frame"))
+                expected.extend(
+                    (
+                        b"Intel e1000 found:",
+                        b"NIC IRQ11:",
+                        b"PCI IRQ11:",
+                        b"Sent a 41-byte broadcast test frame",
+                    )
+                )
             elif args.nic == "dual-e1000":
                 expected.extend(
                     (
@@ -271,6 +302,13 @@ def main() -> None:
                         b"NIC 2: Intel e1000 MAC 52:54:00:12:34:57",
                         b"Active interface is now 2 Intel e1000.",
                         b"Sent a 41-byte broadcast test frame",
+                    )
+                )
+            elif args.nic_watchdog_test:
+                expected.extend(
+                    (
+                        b"NIC watchdog: recovered a documented adapter fault in foreground",
+                        b"NIC health: Rx 0 frame(s), Tx 0 frame(s), 1 recovery/recoveries, 0 failed",
                     )
                 )
             else:

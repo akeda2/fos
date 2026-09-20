@@ -111,6 +111,12 @@ not a private address space, and can still touch hardware directly. The
 optional `make image-unsafe-memory` teaching image disables that map entirely;
 its networking callback ABI is unchanged, but it has even less accidental
 pointer-fault coverage.
+
+In the default image, the e1000 driver's memory BAR is not permanently
+reachable merely because it occupies a conventional PCI address. The driver
+registers the small register range it actually uses through
+`paging::map_mmio` before its first volatile access; unsupported or excess
+high BAR ranges fail NIC initialization instead of becoming silently mapped.
 The convention keeps ordinary networking examples focused on protocol logic
 instead of duplicating either NIC driver.
 
@@ -162,17 +168,45 @@ connected subnet:
 tape run router 1 10.0.1.1 255.255.255.0 2 10.0.2.1 255.255.255.0 default 1 10.0.1.254
 ```
 
-The optional `dhcp` word reserves NIC 1 (callback index zero) for the
-`tape-net` DHCP client. Static triples then configure the other interfaces:
+The optional `dhcp` word remains the backward-compatible spelling that
+reserves NIC 1 (callback index zero) for the `tape-net` DHCP client. `dhcp N`
+adds one-based NIC `N` as another DHCP uplink, in priority order; static
+triples configure the remaining downstream interfaces:
 
 ```text
 tape run router dhcp 2 10.0.2.1 255.255.255.0
 ```
 
+An optional `health A.B.C.D` supplies one ICMP echo target shared by DHCP
+uplinks. A usable uplink must answer both a fresh gateway ARP probe and that
+echo request. Probes are bounded and periodic; after three missed cycles the
+router chooses the next healthy declared uplink, and automatically fails back
+when a higher-priority uplink recovers. NAT and static inbound forwards use
+only that active uplink. Existing NAT and forwarded flows can break when it
+changes; there is deliberately no state migration.
+
 NAT is enabled by default. Add `no-nat` when the upstream network has an
 explicit route back to the downstream subnets and should receive the original
 source addresses; `nat` may be written explicitly to document or re-enable
 masquerading.
+
+Permanent inbound services use a bounded static port-forward list. Put each
+rule before the interface entries, using:
+
+```text
+forward tcp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]
+forward udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]
+```
+
+NIC 1 is always the external side. A rule DNATs packets addressed to its
+public address and named TCP/UDP port to the configured host, and rewrites
+that host's matching replies back to the NIC 1 address and external port.
+Omitting `INTERNAL_PORT` preserves the external port. The router accepts at
+most 16 rules, rejects duplicate protocol/external-port pairs and ambiguous
+duplicate internal endpoints, and requires each target to be a unicast
+address on a configured non-primary subnet. Rules are printed at startup.
+Unsolicited traffic that matches neither a static rule nor an existing
+outbound-NAT flow remains dropped.
 
 DHCP requires the same bounded polling discipline as the router: it uses only
 the indexed NIC callbacks, checks `should_abort`, retries for a finite timeout,
@@ -243,6 +277,7 @@ file and supplied with `@FILE`:
 # ROUTER.CFG
 dhcp-server
 dhcp-lease-file DHCP.LEASES
+forward tcp 8080 10.0.15.2 80
 1 10.0.1.1/24
 2 10.0.2.1/24
 ```
@@ -267,7 +302,33 @@ uses one-based numbering; tape callbacks use zero-based indices):
 - `kernel/src/threecom.rs` supports selected PCI 3C905/B/C identifiers using
   the card's windowed command interface and bus-master descriptor lists.
 - `kernel/src/e1000.rs` supports QEMU's Intel 82540EM model through a
-  memory BAR and legacy polling descriptor rings.
+  memory BAR and legacy descriptor rings.
+
+All three backends retain foreground polling for frame parsing. When firmware
+assigns a usable legacy PCI IRQ, the kernel first installs its IDT gate and
+unmasks that PIC line, then enables only the backend's acknowledgement path.
+The ISR acknowledges/counts its hardware cause and marks work pending; a
+normal `nic_receive` poll still reads descriptors and copies frames. This
+keeps router/bridge protocol code in foreground context, preserves operation
+on cards without a legacy line, and makes `nic`/`irqstat` diagnostics useful
+without introducing a background network service.
+
+### Foreground NIC watchdog
+
+`nic` status, `nic watchdog`, and normal shell NIC traffic run a bounded
+foreground health check; no timer or device ISR performs recovery. Drivers
+record foreground Rx/Tx completions, pending recovery, successful recoveries,
+and failed recoveries. Silence is never considered a stall. Recovery is only
+armed by a documented hardware condition: RTL8139 Rx/FIFO overflow or
+transmit timeout, e1000 Rx overrun or transmit timeout, and 3C905 Host Error
+or download timeout. Each backend resets and rebuilds its already allocated
+DMA/ring state, restores its interrupt mask and promiscuous setting, and
+reports the result through `nic`; it neither allocates nor frees DMA frames.
+If that bounded reset fails, polling remains available and the failure counter
+is visible rather than claiming that a link or cable was repaired.
+`make test-nic-watchdog` builds a test-only RTL8139 image that starts with
+this recovery latch set, then verifies in QEMU that foreground status performs
+the in-place reset and reports one successful recovery.
 
 The 3C905 path is intentionally preliminary and has not been validated by
 the repository's QEMU tests: the installed QEMU build has no 3C905 model.

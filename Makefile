@@ -39,8 +39,9 @@ TAPE_IMAGE_ARGS := \
 	--file BRIDGE.BIN $(TAPE_BRIDGE_BIN) \
 	--file ROUTER.BIN $(TAPE_ROUTER_BIN) \
 	--file ROUTER.CFG tapes/router/ROUTER.CFG
+EXTRA_FOSFS_FILES ?=
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -68,6 +69,9 @@ help:
 	@echo "  make test       - build the image, then run default-NIC, e1000, dual-e1000, and VGA mode tests"
 	@echo "  make test-unsafe-memory - boot the optional unpaged teaching image through the smoke test"
 	@echo "  make test-stack-guard - build a test-only guard-fault image and verify its emergency double-fault stack"
+	@echo "  make test-page-protection - verify kernel text rejects a supervisor write under CR0.WP"
+	@echo "  make test-nic-watchdog - inject a test-only NIC fault latch and verify foreground DMA-state recovery"
+	@echo "  make test-start - verify an optional FOSFS START boot-command script"
 	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
 	@echo "  make test-dual-e1000 - build the image, then verify two e1000 interfaces and selection"
 	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
@@ -120,7 +124,7 @@ image: kernel tapes
 	objcopy -O binary $(BUILD)/stage1.o $(STAGE1_BIN)
 	as --32 -I$(BUILD) -o $(BUILD)/stage2.o boot/stage2.S
 	objcopy -O binary $(BUILD)/stage2.o $(STAGE2_BIN)
-	python3 tools/build_image.py --stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) --kernel $(KERNEL_BIN) --output $(IMAGE) $(TAPE_IMAGE_ARGS)
+	python3 tools/build_image.py --stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) --kernel $(KERNEL_BIN) --output $(IMAGE) $(TAPE_IMAGE_ARGS) $(EXTRA_FOSFS_FILES)
 
 image-unsafe-memory:
 	$(MAKE) KERNEL_CARGO_FEATURES="--features legacy-unsafe-memory" image
@@ -147,6 +151,18 @@ test-unsafe-memory: image-unsafe-memory
 test-stack-guard:
 	$(MAKE) KERNEL_CARGO_FEATURES="--features stack-guard-test" image
 	@python3 tools/test_stack_guard.py --image $(IMAGE); status=$$?; $(MAKE) image; exit $$status
+
+test-page-protection:
+	$(MAKE) KERNEL_CARGO_FEATURES="--features page-protection-test" image
+	@python3 tools/test_page_protection.py --image $(IMAGE); status=$$?; $(MAKE) image; exit $$status
+
+test-nic-watchdog:
+	$(MAKE) KERNEL_CARGO_FEATURES="--features nic-watchdog-test" image
+	@python3 tools/qemu_smoke.py --image $(IMAGE) --nic rtl8139 --nic-watchdog-test; status=$$?; $(MAKE) image; exit $$status
+
+test-start:
+	$(MAKE) EXTRA_FOSFS_FILES="--file START tools/start-test.txt" image
+	@python3 tools/qemu_smoke.py --image $(IMAGE) --start-script-test; status=$$?; $(MAKE) image; exit $$status
 
 test-e1000: image
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000

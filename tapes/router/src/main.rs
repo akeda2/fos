@@ -16,13 +16,16 @@
 //! ```text
 //! tape run router 1 10.0.1.1/24 2 10.0.2.1/24
 //! tape run router dhcp 2 10.0.2.1/24
+//! tape run router dhcp dhcp 2 health 1.1.1.1 3 10.0.3.1/24
 //! tape run router dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24
 //! tape run router 1 10.0.1.1/24 2 10.0.2.1/24 default 1 10.0.1.254
 //! ```
 //!
-//! `dhcp` configures NIC 1 (callback index zero), and a trailing `default NIC
-//! GATEWAY` selects the egress NIC and next hop for unmatched destinations.
-//! Without an explicit default, a DHCP router option becomes NIC 1's default.
+//! `dhcp` configures NIC 1 (callback index zero); `dhcp N` adds an ordered
+//! DHCP uplink. `health TARGET` verifies every DHCP uplink with fresh gateway
+//! ARP plus ICMP echo, failing over after three missed cycles and failing back
+//! to the highest-priority recovered lease. A trailing `default NIC GATEWAY`
+//! selects a static egress when no DHCP uplink is used.
 //! `dhcp-server` serves every configured interface except NIC 1, deriving a
 //! pool from each subnet and allocating one in-memory lease slot per usable
 //! address for this run.
@@ -31,7 +34,7 @@
 //! while `nat` explicitly enables it. Supplying both modes is invalid.
 //! Static interfaces also accept the legacy `NIC IP NETMASK` form and the
 //! separate `NIC IP /PREFIX` form.
-//! Downstream TCP/UDP traffic leaving through NIC 1 is source-NATed with a
+//! Downstream TCP/UDP traffic leaving through the active DHCP uplink is source-NATed with a
 //! physical-memory-backed connection table, so hosts on the upstream LAN can
 //! reply without needing a route back to the downstream subnet. There is no
 //! dynamic routing protocol, ICMP error generation, fragmentation, or IPv6.
@@ -39,7 +42,8 @@
 use core::cmp::min;
 
 use router_tape::{
-    ConfigError, FileName, InterfaceConfig, MAX_INTERFACES, RouterConfig, parse_config,
+    ConfigError, FileName, ForwardProtocol, InterfaceConfig, MAX_FORWARDS, PortForward,
+    RouterConfig, MAX_INTERFACES, parse_config,
     route_next_hop,
 };
 use tape_net::{
@@ -64,6 +68,9 @@ const DHCP_LEASE_SECONDS: u32 = 7 * 24 * 60 * 60;
 const DHCP_OFFER_SECONDS: u32 = 30;
 const DHCP_RENEWAL_SECONDS: u32 = DHCP_LEASE_SECONDS / 2;
 const DHCP_REBINDING_SECONDS: u32 = DHCP_LEASE_SECONDS * 7 / 8;
+const HEALTH_POLL_TICKS: u64 = 5 * 100;
+const HEALTH_PROBE_TICKS: u64 = 50;
+const HEALTH_MISSED_CYCLES: u8 = 3;
 const NAT_FALLBACK_ENTRIES: usize = 32;
 const NAT_DYNAMIC_BYTES: u32 = 4 * 1024 * 1024;
 const NAT_TIMEOUT_TICKS: u64 = 60 * 100;
@@ -99,6 +106,15 @@ struct RouterInterface {
     netmask: Ipv4Address,
     mac: MacAddress,
     arp: ArpCache<ARP_CACHE_SIZE>,
+}
+
+#[derive(Clone, Copy)]
+struct UplinkHealth {
+    interface: usize,
+    gateway: Ipv4Address,
+    misses: u8,
+    healthy: bool,
+    sequence: u16,
 }
 
 #[repr(u8)]
@@ -751,12 +767,29 @@ fn print_config_error(putc: Putc, error: ConfigError) {
         ConfigError::LeaseFileRequiresDhcpServer => {
             &b"dhcp-lease-file requires dhcp-server"[..]
         },
+        ConfigError::MissingForwardValue => {
+            &b"forward must name protocol, external port, and internal IPv4 address"[..]
+        }
+        ConfigError::BadForwardProtocol => &b"forward protocol must be tcp or udp"[..],
+        ConfigError::BadForwardPort => &b"forward ports must be decimal values from 1 through 65535"[..],
+        ConfigError::BadForwardAddress => &b"forward internal address must be a unicast IPv4 address"[..],
+        ConfigError::TooManyForwards => &b"at most 16 port-forward rules may be configured"[..],
+        ConfigError::DuplicateForward => {
+            &b"forward external ports and internal endpoints must be unique per protocol"[..]
+        }
+        ConfigError::ForwardTargetNotInternal => {
+            &b"forward internal address is not on a configured non-primary subnet"[..]
+        }
+        ConfigError::TooManyDhcpUplinks => &b"at most four DHCP uplinks may be configured"[..],
+        ConfigError::DuplicateDhcpUplink => &b"the same DHCP uplink was selected more than once"[..],
+        ConfigError::MissingHealthTarget => &b"health must be followed by an IPv4 address"[..],
+        ConfigError::BadHealthTarget => &b"health target must be a unicast IPv4 address"[..],
     };
     print_bytes(putc, b"Router configuration error: ");
     print_bytes(putc, message);
     print_bytes(
         putc,
-        b". Usage: tape run router [dhcp] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [dns SERVER [SERVER]] \
+        b". Usage: tape run router [dhcp [NIC]]... [health ADDRESS] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [dns SERVER [SERVER]] [forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]] \
 NIC IP NETMASK ... [default NIC GATEWAY] (or NIC IP/PREFIX)\n",
     );
 }
@@ -766,6 +799,8 @@ fn print_startup(
     interfaces: &[RouterInterface; MAX_INTERFACES],
     count: usize,
     default_route: Option<(u32, Ipv4Address)>,
+    forwards: &[Option<PortForward>; MAX_FORWARDS],
+    forward_count: usize,
 ) {
     print_bytes(putc, b"fos router: ");
     print_u32(putc, count as u32);
@@ -792,6 +827,22 @@ fn print_startup(
             putc,
             b"  default route: none (unknown networks are dropped)\n",
         );
+    }
+    for forward in forwards[..forward_count].iter().flatten() {
+        print_bytes(putc, b"  forward ");
+        print_bytes(
+            putc,
+            match forward.protocol {
+                ForwardProtocol::Tcp => b"tcp "[..].as_ref(),
+                ForwardProtocol::Udp => b"udp "[..].as_ref(),
+            },
+        );
+        print_u32(putc, u32::from(forward.external_port));
+        print_bytes(putc, b" -> ");
+        print_ip(putc, forward.internal_address);
+        print_bytes(putc, b":");
+        print_u32(putc, u32::from(forward.internal_port));
+        print_bytes(putc, b" (NIC 1 external)\n");
     }
     print_bytes(
         putc,
@@ -1121,12 +1172,13 @@ fn configure_dhcp(
     nic_receive_at: NicReceiveAt,
     ticks: Ticks,
     own_mac: MacAddress,
+    nic: u32,
     receive_buffer: &mut [u8; MAX_FRAME_LEN],
     max_frame_len: usize,
 ) -> Option<DhcpLease> {
     print_bytes(
         putc,
-        b"DHCP: configuring NIC 1; broadcasting DISCOVER and waiting for a lease...\n",
+        b"DHCP: broadcasting DISCOVER and waiting for a lease...\n",
     );
     let transaction_id = (ticks() as u32)
         ^ u32::from_be_bytes([own_mac.0[0], own_mac.0[1], own_mac.0[2], own_mac.0[3]])
@@ -1161,7 +1213,7 @@ fn configure_dhcp(
                 let transmit = client.transmit();
                 if !send_dhcp_payload(
                     nic_send_at,
-                    0,
+                    nic,
                     own_mac,
                     &payload[..length],
                     MacAddress::BROADCAST,
@@ -1171,7 +1223,7 @@ fn configure_dhcp(
                     DHCP_SERVER_PORT,
                     max_frame_len,
                 ) {
-                    print_bytes(putc, b"DHCP failed: NIC 1 rejected the request frame.\n");
+                    print_bytes(putc, b"DHCP failed: selected NIC rejected the request frame.\n");
                     return None;
                 }
             }
@@ -1190,7 +1242,7 @@ fn configure_dhcp(
                 print_bytes(putc, b"DHCP failed: server supplied no subnet mask.\n");
                 return None;
             }
-            print_bytes(putc, b"DHCP lease acquired on NIC 1: ");
+            print_bytes(putc,             b"DHCP lease acquired: ");
             print_ip(putc, lease.address);
             print_bytes(putc, b"/");
             print_ip(putc, lease.subnet_mask);
@@ -1212,7 +1264,7 @@ fn configure_dhcp(
         }
 
         let length =
-            nic_receive_at(0, receive_buffer.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+            nic_receive_at(nic, receive_buffer.as_mut_ptr() as u32, max_frame_len as u32) as usize;
         if length != 0 {
             receive_dhcp(
                 &receive_buffer[..min(length, MAX_FRAME_LEN)],
@@ -1223,6 +1275,161 @@ fn configure_dhcp(
     }
 }
 
+fn internet_checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        let mut chunks = bytes.chunks_exact(2);
+        for word in &mut chunks {
+            sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+        }
+        if let Some(&byte) = chunks.remainder().first() {
+            sum += u32::from(byte) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+fn send_icmp_echo(
+        interface: &RouterInterface,
+        target: Ipv4Address,
+        target_mac: MacAddress,
+        sequence: u16,
+        nic_send_at: NicSendAt,
+        max_frame_len: usize,
+    ) -> bool {
+        let mut icmp = [0u8; 8];
+        icmp[0] = 8;
+        icmp[4..6].copy_from_slice(&(interface.nic as u16 + 1).to_be_bytes());
+        icmp[6..8].copy_from_slice(&sequence.to_be_bytes());
+        let checksum = internet_checksum(&icmp);
+        icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+        let packet = Ipv4Packet {
+            header: Ipv4Header::new(interface.address, target, 1, icmp.len()),
+            payload: &icmp,
+        };
+        let mut ip = [0u8; MAX_FRAME_LEN];
+        let Ok(ip_len) = packet.encode(&mut ip) else {
+            return false;
+        };
+        let ethernet = EthernetFrame::new(target_mac, interface.mac, ETHERTYPE_IPV4, &ip[..ip_len]);
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let Ok(length) = ethernet.encode(&mut frame) else {
+            return false;
+        };
+        length <= max_frame_len
+            && nic_send_at(interface.nic, frame.as_ptr() as u32, length as u32) != 0
+    }
+
+fn is_icmp_echo_reply(
+        frame: &[u8],
+        interface: &RouterInterface,
+        target: Ipv4Address,
+        sequence: u16,
+    ) -> bool {
+        let Ok(ethernet) = EthernetFrame::parse(frame) else {
+            return false;
+        };
+        if ethernet.ethertype != ETHERTYPE_IPV4 {
+            return false;
+        }
+        let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else {
+            return false;
+        };
+        packet.header.protocol == 1
+            && packet.header.source == target
+            && packet.header.destination == interface.address
+            && packet.payload.len() >= 8
+            && packet.payload[0] == 0
+            && packet.payload[1] == 0
+            && internet_checksum(packet.payload) == 0
+            && packet.payload[4..6] == (interface.nic as u16 + 1).to_be_bytes()
+            && packet.payload[6..8] == sequence.to_be_bytes()
+    }
+
+#[allow(clippy::too_many_arguments)]
+fn poll_uplink_health(
+        health: &mut UplinkHealth,
+        target: Ipv4Address,
+        interfaces: &mut [RouterInterface; MAX_INTERFACES],
+        count: usize,
+        receive_buffer: &mut [u8; MAX_FRAME_LEN],
+        nic_send_at: NicSendAt,
+        nic_receive_at: NicReceiveAt,
+        should_abort: ShouldAbort,
+        ticks: Ticks,
+        max_frame_len: usize,
+    ) -> bool {
+        let interface = health.interface;
+        // Each probe requires a fresh gateway answer, not merely a still-valid
+        // cache entry from a previous cycle.
+        interfaces[interface].arp.clear();
+        let _ = send_arp_request(&interfaces[interface], health.gateway, nic_send_at, max_frame_len);
+        let deadline = ticks().wrapping_add(HEALTH_PROBE_TICKS);
+        let mut gateway_mac = None;
+        while ticks().wrapping_sub(deadline) >= (1u64 << 63) {
+            if should_abort() == TAPE_EVENT_ABORT {
+                return false;
+            }
+            for index in 0..count {
+                let length = nic_receive_at(
+                    interfaces[index].nic,
+                    receive_buffer.as_mut_ptr() as u32,
+                    max_frame_len as u32,
+                ) as usize;
+                if length == 0 {
+                    continue;
+                }
+                process_arp(
+                    &mut interfaces[index],
+                    &receive_buffer[..min(length, MAX_FRAME_LEN)],
+                    ticks(),
+                    nic_send_at,
+                    max_frame_len,
+                );
+            }
+            gateway_mac = interfaces[interface]
+                .arp
+                .lookup(health.gateway, ticks() as u32);
+            if gateway_mac.is_some() {
+                break;
+            }
+        }
+        let Some(gateway_mac) = gateway_mac else {
+            return false;
+        };
+        health.sequence = health.sequence.wrapping_add(1);
+        if !send_icmp_echo(
+            &interfaces[interface],
+            target,
+            gateway_mac,
+            health.sequence,
+            nic_send_at,
+            max_frame_len,
+        ) {
+            return false;
+        }
+        let deadline = ticks().wrapping_add(HEALTH_PROBE_TICKS);
+        while ticks().wrapping_sub(deadline) >= (1u64 << 63) {
+            if should_abort() == TAPE_EVENT_ABORT {
+                return false;
+            }
+            let length = nic_receive_at(
+                interfaces[interface].nic,
+                receive_buffer.as_mut_ptr() as u32,
+                max_frame_len as u32,
+            ) as usize;
+            if length == 0 {
+                continue;
+            }
+            let frame = &receive_buffer[..min(length, MAX_FRAME_LEN)];
+            process_arp(&mut interfaces[interface], frame, ticks(), nic_send_at, max_frame_len);
+            if is_icmp_echo_reply(frame, &interfaces[interface], target, health.sequence) {
+                return true;
+            }
+        }
+        false
+    }
 fn process_arp(
     interface: &mut RouterInterface,
     frame: &[u8],
@@ -1236,6 +1443,7 @@ fn process_arp(
     if ethernet.ethertype != ETHERTYPE_ARP {
         return;
     }
+
     let Ok(packet) = ArpPacket::parse(ethernet.payload) else {
         return;
     };
@@ -1381,9 +1589,55 @@ fn rewrite_transport(
             u16::from_be_bytes([new_address.0[2], new_address.0[3]]),
         );
         updated = checksum_replace(updated, old_port, new_port);
+        let updated = if protocol == 17 && updated == 0 {
+            0xffff
+        } else {
+            updated
+        };
         payload[checksum_offset..checksum_offset + 2].copy_from_slice(&updated.to_be_bytes());
     }
     true
+}
+
+fn forward_protocol(protocol: u8) -> Option<ForwardProtocol> {
+    match protocol {
+        6 => Some(ForwardProtocol::Tcp),
+        17 => Some(ForwardProtocol::Udp),
+        _ => None,
+    }
+}
+
+fn inbound_forward(
+    forwards: &[Option<PortForward>; MAX_FORWARDS],
+    count: usize,
+    protocol: u8,
+    external_port: u16,
+) -> Option<PortForward> {
+    let protocol = forward_protocol(protocol)?;
+    forwards[..count]
+        .iter()
+        .flatten()
+        .copied()
+        .find(|forward| forward.protocol == protocol && forward.external_port == external_port)
+}
+
+fn reply_forward(
+    forwards: &[Option<PortForward>; MAX_FORWARDS],
+    count: usize,
+    protocol: u8,
+    internal_address: Ipv4Address,
+    internal_port: u16,
+) -> Option<PortForward> {
+    let protocol = forward_protocol(protocol)?;
+    forwards[..count]
+        .iter()
+        .flatten()
+        .copied()
+        .find(|forward| {
+            forward.protocol == protocol
+                && forward.internal_address == internal_address
+                && forward.internal_port == internal_port
+        })
 }
 
 fn forward_ipv4(
@@ -1393,12 +1647,15 @@ fn forward_ipv4(
     configs: &[Option<InterfaceConfig>; MAX_INTERFACES],
     count: usize,
     default_route: Option<router_tape::DefaultRoute>,
+    active_uplink: u32,
     nic_send_at: NicSendAt,
     nic_receive_at: NicReceiveAt,
     should_abort: ShouldAbort,
     ticks: Ticks,
     nat: &mut NatTable,
     nat_enabled: bool,
+    forwards: &[Option<PortForward>; MAX_FORWARDS],
+    forward_count: usize,
     receive_buffer: &mut [u8; MAX_FRAME_LEN],
     transport_buffer: &mut [u8; MAX_FRAME_LEN],
     ip_buffer: &mut [u8; MAX_FRAME_LEN],
@@ -1418,8 +1675,7 @@ fn forward_ipv4(
     let mut header = packet.header;
     let payload_len = packet.payload.len();
     let mut payload_in_transport_buffer = false;
-    if nat_enabled
-        && interfaces[ingress].nic == 0
+    if interfaces[ingress].nic == active_uplink
         && packet.header.destination == interfaces[ingress].address
     {
         let Some((source_port, destination_port)) =
@@ -1427,13 +1683,22 @@ fn forward_ipv4(
         else {
             return ForwardResult::Dropped;
         };
-        let Some((inside_address, inside_port)) = nat.inbound(
-            packet.header.protocol,
-            destination_port,
-            packet.header.source,
-            source_port,
-            now,
-        ) else {
+        let translation = if let Some(forward) =
+            inbound_forward(forwards, forward_count, packet.header.protocol, destination_port)
+        {
+            Some((forward.internal_address, forward.internal_port))
+        } else if nat_enabled {
+            nat.inbound(
+                packet.header.protocol,
+                destination_port,
+                packet.header.source,
+                source_port,
+                now,
+            )
+        } else {
+            None
+        };
+        let Some((inside_address, inside_port)) = translation else {
             return ForwardResult::Dropped;
         };
         transport_buffer[..payload_len].copy_from_slice(packet.payload);
@@ -1468,34 +1733,47 @@ fn forward_ipv4(
         return ForwardResult::Dropped;
     }
     let mut payload_rewritten = payload_in_transport_buffer;
-    if nat_enabled && interfaces[ingress].nic != 0 && interfaces[egress].nic == 0 {
+    if interfaces[ingress].nic != active_uplink && interfaces[egress].nic == active_uplink {
         if let Some((source_port, destination_port)) =
             transport_ports(packet.payload, header.protocol)
         {
-            let Some(external_port) = nat.outbound(
-                header.protocol,
-                header.source,
-                source_port,
-                header.destination,
-                destination_port,
-                now,
-            ) else {
-                return ForwardResult::Dropped;
+            let static_forward =
+                reply_forward(forwards, forward_count, header.protocol, header.source, source_port);
+            let external_port = if let Some(forward) = static_forward {
+                forward.external_port
+            } else if nat_enabled {
+                let Some(port) = nat.outbound(
+                    header.protocol,
+                    header.source,
+                    source_port,
+                    header.destination,
+                    destination_port,
+                    now,
+                ) else {
+                    return ForwardResult::Dropped;
+                };
+                port
+            } else {
+                0
             };
-            transport_buffer[..payload_len].copy_from_slice(packet.payload);
-            if !rewrite_transport(
-                &mut transport_buffer[..payload_len],
-                header.protocol,
-                header.source,
-                interfaces[egress].address,
-                source_port,
-                external_port,
-                true,
-            ) {
-                return ForwardResult::Dropped;
+            if static_forward.is_some() || nat_enabled {
+                if !payload_rewritten {
+                    transport_buffer[..payload_len].copy_from_slice(packet.payload);
+                }
+                if !rewrite_transport(
+                    &mut transport_buffer[..payload_len],
+                    header.protocol,
+                    header.source,
+                    interfaces[egress].address,
+                    source_port,
+                    external_port,
+                    true,
+                ) {
+                    return ForwardResult::Dropped;
+                }
+                payload_rewritten = true;
+                header.source = interfaces[egress].address;
             }
-            payload_rewritten = true;
-            header.source = interfaces[egress].address;
         }
     }
     let Some(destination_mac) = resolve_mac(
@@ -1602,19 +1880,13 @@ pub extern "C" fn tape_main(
         );
         return;
     }
-    if parsed.dhcp && nic_total == 0 {
-        print_bytes(
-            putc,
-            b"Router configuration error: DHCP NIC 1 is not present.\n",
-        );
+    if parsed.dhcp_uplinks[..parsed.dhcp_uplink_count].iter().flatten().any(|nic| *nic as usize >= nic_total) {
+        print_bytes(putc, b"Router configuration error: a DHCP NIC is not present.\n");
         return;
     }
     let max_frame_len = min(nic_max_frame_len() as usize, MAX_FRAME_LEN);
     if max_frame_len < 60 {
-        print_bytes(
-            putc,
-            b"Router cannot start: NIC frame limit is too small.\n",
-        );
+        print_bytes(putc, b"Router cannot start: NIC frame limit is too small.\n");
         return;
     }
 
@@ -1623,8 +1895,8 @@ pub extern "C" fn tape_main(
         core::array::from_fn(|_| None);
     let mut dhcp_allocations = [None; MAX_INTERFACES];
     let mut configs: [Option<InterfaceConfig>; MAX_INTERFACES] = [None; MAX_INTERFACES];
+    let mut uplinks: [Option<UplinkHealth>; MAX_INTERFACES] = [None; MAX_INTERFACES];
     let mut interface_count = 0;
-    let mut default_route = parsed.default_route;
     let mut dns_servers = [Ipv4Address::UNSPECIFIED; DHCP_MAX_DNS_SERVERS];
     let mut dns_server_count = parsed.dns_server_count;
     for (index, server) in parsed.dns_servers.iter().flatten().enumerate() {
@@ -1632,66 +1904,28 @@ pub extern "C" fn tape_main(
     }
     let mut receive_buffer = [0u8; MAX_FRAME_LEN];
 
-    if parsed.dhcp {
+    for (priority, nic) in parsed.dhcp_uplinks[..parsed.dhcp_uplink_count].iter().flatten().enumerate() {
         let mut mac = [0u8; 6];
-        if nic_mac_at(0, mac.as_mut_ptr() as u32) == 0 {
-            print_bytes(
-                putc,
-                b"Router cannot start: failed to read DHCP NIC 1 MAC.\n",
-            );
+        if nic_mac_at(*nic, mac.as_mut_ptr() as u32) == 0 {
+            print_bytes(putc, b"Router cannot start: failed to read a DHCP NIC MAC.\n");
             return;
         }
         let own_mac = MacAddress::new(mac);
-        let Some(lease) = configure_dhcp(
-            putc,
-            should_abort,
-            nic_send_at,
-            nic_receive_at,
-            ticks,
-            own_mac,
-            &mut receive_buffer,
-            max_frame_len,
-        ) else {
+        let Some(lease) = configure_dhcp(putc, should_abort, nic_send_at, nic_receive_at, ticks, own_mac, *nic, &mut receive_buffer, max_frame_len) else {
+            print_bytes(putc, b"Router cannot start: DHCP uplink did not acquire a lease.\n");
             return;
         };
-        let dhcp_config = InterfaceConfig {
-            nic: 0,
-            address: lease.address,
-            netmask: lease.subnet_mask,
-        };
-        interfaces[interface_count] = RouterInterface {
-            nic: 0,
-            address: lease.address,
-            netmask: lease.subnet_mask,
-            mac: own_mac,
-            arp: ArpCache::new(),
-        };
-        configs[interface_count] = Some(dhcp_config);
+        if lease.router == Ipv4Address::UNSPECIFIED {
+            print_bytes(putc, b"Router cannot start: DHCP uplink supplied no gateway.\n");
+            return;
+        }
+        interfaces[interface_count] = RouterInterface { nic: *nic, address: lease.address, netmask: lease.subnet_mask, mac: own_mac, arp: ArpCache::new() };
+        configs[interface_count] = Some(InterfaceConfig { nic: *nic, address: lease.address, netmask: lease.subnet_mask });
+        uplinks[priority] = Some(UplinkHealth { interface: interface_count, gateway: lease.router, misses: 0, healthy: true, sequence: 0 });
         interface_count += 1;
-        if default_route.is_none() && lease.router != Ipv4Address::UNSPECIFIED {
-            default_route = Some(router_tape::DefaultRoute {
-                nic: 0,
-                gateway: lease.router,
-            });
-            print_bytes(putc, b"DHCP supplied the default router for NIC 1.\n");
-        }
-        if let Some(route) = default_route {
-            if route.nic == 0
-                && !router_tape::same_subnet(lease.address, lease.subnet_mask, route.gateway)
-            {
-                print_bytes(
-                    putc,
-                    b"Router configuration error: default gateway is outside the DHCP subnet.\n",
-                );
-                return;
-            }
-        }
-        if dns_server_count == 0 {
+        if dns_server_count == 0 && priority == 0 {
             dns_server_count = lease.dns_server_count;
             dns_servers[..dns_server_count].copy_from_slice(&lease.dns_servers[..dns_server_count]);
-            if dns_server_count != 0 {
-                print_bytes(putc, b"DHCP supplied DNS server(s) for downstream clients.\n");
-            }
         }
     }
 
@@ -1718,7 +1952,8 @@ pub extern "C" fn tape_main(
         let mut enabled = 0;
         let mut static_lease_offset = 0usize;
         for (index, interface) in interfaces.iter().take(interface_count).enumerate() {
-            if interface.nic == 0 {
+            if parsed.dhcp_uplinks[..parsed.dhcp_uplink_count]
+                .iter().flatten().any(|uplink| *uplink == interface.nic) {
                 continue;
             }
             if let Some((start, end)) = dhcp_pool(interface) {
@@ -1919,6 +2154,10 @@ pub extern "C" fn tape_main(
         );
     }
     let lease_file = parsed.dhcp_lease_file;
+    let mut active_uplink = uplinks[0].map(|uplink| uplink.interface);
+    // Run the first health sweep before accepting ordinary forwarding, rather
+    // than assuming the first configured lease is reachable for one interval.
+    let mut last_health_poll = ticks().wrapping_sub(HEALTH_POLL_TICKS);
     if lease_file_needs_flush {
         if let Some(name) = lease_file {
             let _ = persist_leases(
@@ -1938,12 +2177,16 @@ pub extern "C" fn tape_main(
         putc,
         &interfaces,
         interface_count,
-        default_route.map(|route| (route.nic, route.gateway)),
+        active_uplink
+            .map(|index| (interfaces[index].nic, uplinks.iter().flatten().find(|uplink| uplink.interface == index).unwrap().gateway))
+            .or(parsed.default_route.map(|route| (route.nic, route.gateway))),
+        &parsed.forwards,
+        parsed.forward_count,
     );
     if parsed.nat {
         print_bytes(
             putc,
-            b"NAT: TCP/UDP masquerading enabled from non-primary NICs to NIC 1.\n",
+            b"NAT: TCP/UDP masquerading enabled through the active DHCP uplink.\n",
         );
     } else {
         print_bytes(
@@ -1981,6 +2224,67 @@ pub extern "C" fn tape_main(
     let mut dropped = 0u32;
 
     'router: loop {
+        if parsed.health_target.is_some()
+            && parsed.dhcp_uplink_count != 0
+            && ticks().wrapping_sub(last_health_poll) >= HEALTH_POLL_TICKS
+        {
+            last_health_poll = ticks();
+            let previous = active_uplink;
+            for uplink in uplinks[..parsed.dhcp_uplink_count].iter_mut().flatten() {
+                let target = parsed.health_target.unwrap();
+                if poll_uplink_health(
+                    uplink,
+                    target,
+                    &mut interfaces,
+                    interface_count,
+                    &mut arp_receive_buffer,
+                    nic_send_at,
+                    nic_receive_at,
+                    should_abort,
+                    ticks,
+                    max_frame_len,
+                ) {
+                    uplink.misses = 0;
+                    uplink.healthy = true;
+                } else {
+                    uplink.misses = uplink.misses.saturating_add(1);
+                    if uplink.misses >= HEALTH_MISSED_CYCLES {
+                        uplink.healthy = false;
+                    }
+                }
+            }
+            active_uplink = uplinks[..parsed.dhcp_uplink_count]
+                .iter()
+                .flatten()
+                .find(|uplink| uplink.healthy)
+                .map(|uplink| uplink.interface);
+            if active_uplink != previous {
+                match active_uplink {
+                    Some(index) => {
+                        print_bytes(putc, b"Uplink failover: active NIC ");
+                        print_u32(putc, interfaces[index].nic + 1);
+                        print_bytes(putc, b". Existing NAT flows may break.\n");
+                    }
+                    None => print_bytes(putc, b"Uplink failover: no healthy DHCP lease. Existing NAT flows may break.\n"),
+                }
+            }
+        }
+        let current_default = active_uplink.and_then(|index| {
+            uplinks[..parsed.dhcp_uplink_count]
+                .iter()
+                .flatten()
+                .find(|uplink| uplink.interface == index)
+                .map(|uplink| router_tape::DefaultRoute {
+                    nic: interfaces[index].nic,
+                    gateway: uplink.gateway,
+                })
+        }).or(parsed.default_route);
+        let active_index = active_uplink
+            .or_else(|| current_default.and_then(|route| {
+                interfaces[..interface_count].iter().position(|interface| interface.nic == route.nic)
+            }))
+            .unwrap_or(0);
+        let active_nic = interfaces[active_index].nic;
         for ingress in 0..interface_count {
             if should_abort() == TAPE_EVENT_ABORT {
                 break 'router;
@@ -1994,7 +2298,8 @@ pub extern "C" fn tape_main(
                 continue;
             }
             let length = min(length, MAX_FRAME_LEN);
-            if parsed.dhcp_server && interfaces[ingress].nic != 0 {
+            if parsed.dhcp_server && !parsed.dhcp_uplinks[..parsed.dhcp_uplink_count]
+                .iter().flatten().any(|uplink| *uplink == interfaces[ingress].nic) {
                 let mut lease_changed = false;
                 if let Some(server) = dhcp_servers[ingress].as_mut() {
                     let _ = dhcp_reply(
@@ -2037,13 +2342,16 @@ pub extern "C" fn tape_main(
                 &mut interfaces,
                 &configs,
                 interface_count,
-                default_route,
+                current_default,
+                active_nic,
                 nic_send_at,
                 nic_receive_at,
                 should_abort,
                 ticks,
                 &mut nat,
                 parsed.nat,
+                &parsed.forwards,
+                parsed.forward_count,
                 &mut arp_receive_buffer,
                 &mut transport_buffer,
                 &mut ip_buffer,

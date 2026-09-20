@@ -87,6 +87,74 @@ struct IdtEntry {
     offset_high: u16,
 }
 
+/// Connects one legacy PCI IRQ line to a tiny device-acknowledgement callback.
+/// IDT gates are installed before any PCI line is unmasked; handlers only
+/// acknowledge/count/mark work and leave descriptor parsing to foreground
+/// polling code. IRQ0/1 remain owned by the PIT/keyboard and IRQ2 is the PIC
+/// cascade, so none may be claimed by PCI.
+pub fn register_pci_irq(irq: u8, handler: IrqHandler) -> bool {
+    if irq < 3 || irq > 15 || irq == 7 || irq == 15 {
+        return false;
+    }
+    unsafe {
+        let flags: u32;
+        asm!(
+            "pushfd",
+            "pop {flags:e}",
+            flags = out(reg) flags,
+            options(nomem, preserves_flags)
+        );
+        asm!("cli", options(nomem, nostack));
+        let registered = {
+            let slot = &mut PCI_IRQ_HANDLERS[usize::from(irq)];
+            if let Some(existing) = *slot {
+                core::ptr::fn_addr_eq(existing, handler)
+            } else {
+                *slot = Some(handler);
+                true
+            }
+        };
+        if registered {
+            if irq < 8 {
+                PIC1_MASK &= !(1 << irq);
+                outb(PIC1_DATA, PIC1_MASK);
+                io_wait();
+            } else {
+                PIC1_MASK &= !(1 << 2);
+                PIC2_MASK &= !(1 << (irq - 8));
+                outb(PIC1_DATA, PIC1_MASK);
+                io_wait();
+                outb(PIC2_DATA, PIC2_MASK);
+                io_wait();
+            }
+        }
+        if flags & (1 << 9) != 0 {
+            asm!("sti", options(nomem, nostack));
+        }
+        registered
+    }
+}
+
+pub fn pci_irq_registered(irq: u8) -> bool {
+    irq < 16 && unsafe { PCI_IRQ_HANDLERS[usize::from(irq)].is_some() }
+}
+
+pub fn pci_irq_count(irq: u8) -> u64 {
+    if irq >= 16 {
+        return 0;
+    }
+    read_u64_atomically(unsafe { core::ptr::addr_of!(PCI_IRQ_COUNTS[usize::from(irq)]) })
+}
+
+fn dispatch_pci_irq(irq: u8) {
+    unsafe {
+        PCI_IRQ_COUNTS[usize::from(irq)] += 1;
+        if let Some(handler) = PCI_IRQ_HANDLERS[usize::from(irq)] {
+            handler(irq);
+        }
+    }
+}
+
 impl IdtEntry {
     const fn missing() -> Self {
         Self {
@@ -153,6 +221,17 @@ pub fn initialize() {
         install_exception_handlers();
         IDT[usize::from(TIMER_VECTOR)] = IdtEntry::gate(timer_interrupt);
         IDT[usize::from(KEYBOARD_VECTOR)] = IdtEntry::gate(keyboard_interrupt);
+        IDT[usize::from(IRQ_BASE + 3)] = IdtEntry::gate(pci_irq3_interrupt);
+        IDT[usize::from(IRQ_BASE + 4)] = IdtEntry::gate(pci_irq4_interrupt);
+        IDT[usize::from(IRQ_BASE + 5)] = IdtEntry::gate(pci_irq5_interrupt);
+        IDT[usize::from(IRQ_BASE + 6)] = IdtEntry::gate(pci_irq6_interrupt);
+        IDT[usize::from(IRQ_BASE + 8)] = IdtEntry::gate(pci_irq8_interrupt);
+        IDT[usize::from(IRQ_BASE + 9)] = IdtEntry::gate(pci_irq9_interrupt);
+        IDT[usize::from(IRQ_BASE + 10)] = IdtEntry::gate(pci_irq10_interrupt);
+        IDT[usize::from(IRQ_BASE + 11)] = IdtEntry::gate(pci_irq11_interrupt);
+        IDT[usize::from(IRQ_BASE + 12)] = IdtEntry::gate(pci_irq12_interrupt);
+        IDT[usize::from(IRQ_BASE + 13)] = IdtEntry::gate(pci_irq13_interrupt);
+        IDT[usize::from(IRQ_BASE + 14)] = IdtEntry::gate(pci_irq14_interrupt);
         IDT[usize::from(SPURIOUS_MASTER_VECTOR)] = IdtEntry::gate(spurious_master_interrupt);
         IDT[usize::from(SPURIOUS_SLAVE_VECTOR)] = IdtEntry::gate(spurious_slave_interrupt);
     }
@@ -160,6 +239,8 @@ pub fn initialize() {
     load_kernel_idt();
     remap_pic();
     program_pit();
+    #[cfg(feature = "page-protection-test")]
+    crate::paging::trigger_text_write_for_test();
 
     unsafe {
         asm!("sti", options(nomem, nostack));
@@ -207,6 +288,10 @@ pub fn use_kernel_idt() {
 
 fn remap_pic() {
     program_pic(IRQ_BASE, IRQ_BASE + 8, NORMAL_PIC1_MASK, 0xff);
+    unsafe {
+        PIC1_MASK = NORMAL_PIC1_MASK;
+        PIC2_MASK = 0xff;
+    }
 }
 
 /// The BIOS-conventional PIC vector offsets (IRQ0-7 -> INT 08h-0Fh, IRQ8-15
@@ -263,11 +348,19 @@ fn program_pic(master_offset: u8, slave_offset: u8, master_mask: u8, slave_mask:
 
 /// Mask reflecting IRQ0/IRQ1 unmasked and everything else off.
 const NORMAL_PIC1_MASK: u8 = 0b1111_1100;
+static mut PIC1_MASK: u8 = NORMAL_PIC1_MASK;
+static mut PIC2_MASK: u8 = 0xff;
 
-/// Switches the PIC back to the BIOS-conventional mapping with everything
-/// unmasked. Call immediately before any BIOS real-mode round trip.
+type IrqHandler = fn(u8);
+static mut PCI_IRQ_HANDLERS: [Option<IrqHandler>; 16] = [None; 16];
+static mut PCI_IRQ_COUNTS: [u64; 16] = [0; 16];
+
+/// Switches the PIC back to the BIOS-conventional mapping for a BIOS call.
+/// Keep every device IRQ masked except IRQ0: BIOS disk timeouts need the
+/// timer tick, but a kernel-owned PCI device interrupt would otherwise jump
+/// through an unrelated real-mode IVT entry while the kernel IDT is absent.
 pub fn use_bios_pic_mapping() {
-    program_pic(BIOS_PIC1_OFFSET, BIOS_PIC2_OFFSET, 0x00, 0x00);
+    program_pic(BIOS_PIC1_OFFSET, BIOS_PIC2_OFFSET, 0xfe, 0xff);
 }
 
 /// Restores this kernel's own PIC mapping after a BIOS round trip.
@@ -378,8 +471,9 @@ fn report_exception(vector: u8, error_code: Option<u32>, frame: &InterruptStackF
         } else {
             "user"
         };
+        let region = crate::paging::describe_address(address);
         crate::println!(
-            "\nPAGE FAULT at virtual address 0x{address:08x}: {cause} on {privilege} {access}, error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
+            "\nPAGE FAULT at virtual address 0x{address:08x} ({region}): {cause} on {privilege} {access}, error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
         );
         crate::arch::x86::halt_forever();
     }
@@ -512,6 +606,27 @@ extern "x86-interrupt" fn keyboard_interrupt(_frame: InterruptStackFrame) {
     send_eoi(KEYBOARD_VECTOR);
 }
 
+macro_rules! pci_irq_handler {
+    ($name:ident, $irq:expr) => {
+        extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            dispatch_pci_irq($irq);
+            send_eoi(IRQ_BASE + $irq);
+        }
+    };
+}
+
+pci_irq_handler!(pci_irq3_interrupt, 3);
+pci_irq_handler!(pci_irq4_interrupt, 4);
+pci_irq_handler!(pci_irq5_interrupt, 5);
+pci_irq_handler!(pci_irq6_interrupt, 6);
+pci_irq_handler!(pci_irq8_interrupt, 8);
+pci_irq_handler!(pci_irq9_interrupt, 9);
+pci_irq_handler!(pci_irq10_interrupt, 10);
+pci_irq_handler!(pci_irq11_interrupt, 11);
+pci_irq_handler!(pci_irq12_interrupt, 12);
+pci_irq_handler!(pci_irq13_interrupt, 13);
+pci_irq_handler!(pci_irq14_interrupt, 14);
+
 /// Reads a PIC's in-service register: bit N is set only while a genuine
 /// IRQ N is actually being serviced. Used to tell a real IRQ7/IRQ15 apart
 /// from a spurious one on the same vector (see `SPURIOUS_MASTER_VECTOR`).
@@ -523,27 +638,30 @@ fn read_isr(command_port: u16) -> u8 {
 }
 
 extern "x86-interrupt" fn spurious_master_interrupt(_frame: InterruptStackFrame) {
-    unsafe {
-        SPURIOUS_IRQ_COUNT += 1;
-    }
     // Bit 7 of the master's ISR is only set for a genuine IRQ7; if it is
     // clear, the PIC never actually latched a real interrupt and must not
     // be told EOI (there is nothing in service to end).
     if read_isr(PIC1_COMMAND) & 0x80 != 0 {
+        dispatch_pci_irq(7);
         send_eoi(SPURIOUS_MASTER_VECTOR);
+    } else {
+        unsafe {
+            SPURIOUS_IRQ_COUNT += 1;
+        }
     }
 }
 
 extern "x86-interrupt" fn spurious_slave_interrupt(_frame: InterruptStackFrame) {
-    unsafe {
-        SPURIOUS_IRQ_COUNT += 1;
-    }
     // A spurious IRQ15 still came in on the cascade line the slave shares
     // with the master's IRQ2, so the master needs an EOI regardless; only
     // the slave's own EOI depends on whether it was genuine.
     if read_isr(PIC2_COMMAND) & 0x80 != 0 {
+        dispatch_pci_irq(15);
         send_eoi(SPURIOUS_SLAVE_VECTOR);
     } else {
+        unsafe {
+            SPURIOUS_IRQ_COUNT += 1;
+        }
         unsafe {
             outb(PIC1_COMMAND, PIC_EOI);
         }

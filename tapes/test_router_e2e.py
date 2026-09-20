@@ -38,6 +38,7 @@ LEFT_MAC = bytes.fromhex("525400cafe03")
 RIGHT_MAC = bytes.fromhex("525400cafe04")
 TERM_CLIENT_MAC = bytes.fromhex("02deadbeef41")
 TAPE_SENDER_MAC = bytes.fromhex("02deadbeef42")
+output = bytearray()
 LEFT_IP = bytes((10, 0, 1, 2))
 ROUTER_IP_A = bytes((10, 0, 1, 1))
 RIGHT_IP = bytes((10, 0, 15, 2))
@@ -110,6 +111,15 @@ def arp_request(source_mac: bytes, source_ip: bytes, target_ip: bytes) -> bytes:
 
 def udp_datagram(source_port: int, destination_port: int, payload: bytes) -> bytes:
     return struct.pack("!HHHH", source_port, destination_port, 8 + len(payload), 0) + payload
+
+
+def udp_datagram_with_checksum(
+    source_ip: bytes, destination_ip: bytes, source_port: int, destination_port: int, payload: bytes
+) -> bytes:
+    datagram = udp_datagram(source_port, destination_port, payload)
+    pseudo = struct.pack("!4s4sBBH", source_ip, destination_ip, 0, 17, len(datagram))
+    checksum_value = checksum(pseudo + datagram) or 0xFFFF
+    return datagram[:6] + checksum_value.to_bytes(2, "big") + datagram[8:]
 
 
 def tcp_segment(
@@ -349,10 +359,14 @@ def wait_for_frame(
         frame = link.receive(min(0.2, deadline - time.monotonic()))
         if frame is not None and predicate(frame):
             return frame
-    raise SystemExit(f"timed out waiting for {description}")
+    raise SystemExit(
+        f"timed out waiting for {description}; router serial output:\n"
+        f"{output.decode('utf-8', 'replace')}"
+    )
 
 
 def main() -> None:
+    global output
     if not IMAGE.exists():
         raise SystemExit(f"{IMAGE} does not exist; run `make image` first.")
     if not TAPE.exists():
@@ -426,7 +440,7 @@ def main() -> None:
         read_until(b"fos> ", 10)
 
         load_start = send_command(b"tape load net")
-        time.sleep(0.5)
+        read_until(b"Have the sender target this card's MAC address", 10, load_start)
         send_tape.send_tape(
             links["a"],
             ROUTER_MAC_A,
@@ -436,8 +450,40 @@ def main() -> None:
         )
         read_until(b"Tape loaded", 30, load_start)
         read_until(b"fos> ", 5, load_start)
-
-        run_start = send_command(b"tape run router @ROUTER.CFG")
+        run_start = len(output)
+        router_started = False
+        for _ in range(20):
+            links["a"].send(
+                term_frame(
+                    ROUTER_MAC_A,
+                    TERM_CLIENT_MAC,
+                    TERM_TAG_DATA,
+                    b"tape run router dhcp nat forward tcp 8080 10.0.15.2 80 "
+                    b"forward udp 5353 10.0.15.2 dhcp-server 2 10.0.15.1/24\n",
+                )
+            )
+            deadline = time.monotonic() + 0.25
+            while time.monotonic() < deadline:
+                if b"DHCP: broadcasting DISCOVER" in output[run_start:]:
+                    router_started = True
+                    break
+                for key, _ in selector.select(deadline - time.monotonic()):
+                    chunk = os.read(key.fd, 4096)
+                    if not chunk:
+                        raise SystemExit(
+                            "router serial stream ended early:\n"
+                            + output.decode("utf-8", "replace")
+                        )
+                    output.extend(chunk)
+            if router_started:
+                break
+        if not router_started:
+            raise SystemExit(
+                "timed out waiting for the router tape to start after "
+                "retransmitting its best-effort remote-terminal command; "
+                "router serial output:\n"
+                + output.decode("utf-8", "replace")
+            )
         upstream_discover = wait_for_frame(
             links["a"],
             is_upstream_discover,
@@ -476,8 +522,9 @@ def main() -> None:
                 bytes((10, 0, 1, 53)),
             )
         )
-        read_until(b"fos router: 2 interface(s)", 10, run_start)
         read_until(b"DHCP server on NIC 2", 10, run_start)
+        read_until(b"forward tcp 8080 -> 10.0.15.2:80", 10, run_start)
+        read_until(b"forward udp 5353 -> 10.0.15.2:5353", 10, run_start)
         read_until(b"NAT: allocated", 10, run_start)
         print("PASS: router tape started with DHCP service on the secondary NIC.")
 
@@ -675,6 +722,101 @@ def main() -> None:
         )
         assert checksum(translated_pseudo + translated_tcp) == 0
         print("PASS: router reverse-translated the upstream TCP reply.")
+
+        forwarded_syn = tcp_segment(
+            LEFT_IP, ROUTER_IP_A, 41000, 8080, 300, 0, 0x002
+        )
+        links["a"].send(
+            ipv4_frame(
+                ROUTER_MAC_A, LEFT_MAC, LEFT_IP, ROUTER_IP_A, forwarded_syn, protocol=6
+            )
+        )
+        dnat_syn = wait_for_frame(
+            links["b"],
+            lambda frame: frame[0:6] == RIGHT_MAC
+            and frame[6:12] == ROUTER_MAC_B
+            and frame[12:14] == b"\x08\x00",
+            10,
+            "a statically forwarded TCP SYN on segment B",
+        )
+        assert dnat_syn[14 + 12 : 14 + 16] == LEFT_IP
+        assert dnat_syn[14 + 16 : 14 + 20] == RIGHT_IP
+        assert int.from_bytes(dnat_syn[36:38], "big") == 80
+        tcp_length = int.from_bytes(dnat_syn[16:18], "big") - 20
+        assert checksum(
+            struct.pack("!4s4sBBH", LEFT_IP, RIGHT_IP, 0, 6, tcp_length)
+            + dnat_syn[34 : 34 + tcp_length]
+        ) == 0
+
+        forwarded_syn_ack = tcp_segment(
+            RIGHT_IP, LEFT_IP, 80, 41000, 400, 301, 0x012
+        )
+        links["b"].send(
+            ipv4_frame(
+                ROUTER_MAC_B, RIGHT_MAC, RIGHT_IP, LEFT_IP, forwarded_syn_ack, protocol=6
+            )
+        )
+        snat_syn_ack = wait_for_frame(
+            links["a"],
+            lambda frame: frame[0:6] == LEFT_MAC
+            and frame[6:12] == ROUTER_MAC_A
+            and frame[12:14] == b"\x08\x00",
+            10,
+            "a static-forward TCP reply on segment A",
+        )
+        assert snat_syn_ack[26:30] == ROUTER_IP_A
+        assert int.from_bytes(snat_syn_ack[34:36], "big") == 8080
+        tcp_length = int.from_bytes(snat_syn_ack[16:18], "big") - 20
+        assert checksum(
+            struct.pack("!4s4sBBH", ROUTER_IP_A, LEFT_IP, 0, 6, tcp_length)
+            + snat_syn_ack[34 : 34 + tcp_length]
+        ) == 0
+        print("PASS: router statically DNATed TCP and translated its reply.")
+
+        incoming_udp = udp_datagram_with_checksum(LEFT_IP, ROUTER_IP_A, 42000, 5353, b"udp in")
+        links["a"].send(
+            ipv4_frame(
+                ROUTER_MAC_A, LEFT_MAC, LEFT_IP, ROUTER_IP_A, incoming_udp, protocol=17
+            )
+        )
+        dnat_udp = wait_for_frame(
+            links["b"],
+            lambda frame: frame[0:6] == RIGHT_MAC
+            and frame[6:12] == ROUTER_MAC_B
+            and frame[12:14] == b"\x08\x00",
+            10,
+            "a statically forwarded UDP datagram on segment B",
+        )
+        assert dnat_udp[30:34] == RIGHT_IP
+        assert int.from_bytes(dnat_udp[36:38], "big") == 5353
+        udp_length = int.from_bytes(dnat_udp[38:40], "big")
+        assert checksum(
+            struct.pack("!4s4sBBH", LEFT_IP, RIGHT_IP, 0, 17, udp_length)
+            + dnat_udp[34 : 34 + udp_length]
+        ) == 0
+
+        reply_udp = udp_datagram_with_checksum(RIGHT_IP, LEFT_IP, 5353, 42000, b"udp out")
+        links["b"].send(
+            ipv4_frame(
+                ROUTER_MAC_B, RIGHT_MAC, RIGHT_IP, LEFT_IP, reply_udp, protocol=17
+            )
+        )
+        snat_udp = wait_for_frame(
+            links["a"],
+            lambda frame: frame[0:6] == LEFT_MAC
+            and frame[6:12] == ROUTER_MAC_A
+            and frame[12:14] == b"\x08\x00",
+            10,
+            "a static-forward UDP reply on segment A",
+        )
+        assert snat_udp[26:30] == ROUTER_IP_A
+        assert int.from_bytes(snat_udp[34:36], "big") == 5353
+        udp_length = int.from_bytes(snat_udp[38:40], "big")
+        assert checksum(
+            struct.pack("!4s4sBBH", ROUTER_IP_A, LEFT_IP, 0, 17, udp_length)
+            + snat_udp[34 : 34 + udp_length]
+        ) == 0
+        print("PASS: router statically DNATed UDP and translated its reply.")
 
         stop_start = len(output)
         for _ in range(5):

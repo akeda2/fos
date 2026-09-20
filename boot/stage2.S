@@ -496,6 +496,10 @@ bios_disk_real:
     movb $0x42, %ah
     jmp bios_disk_invoke
 bios_disk_write:
+    # INT 13h extensions use AL as the write-control flags for AH=43h.
+    # The DAP segment calculation above leaves an unrelated value in AL;
+    # request an ordinary write with no verify/reserved flags.
+    xorb %al, %al
     movb $0x43, %ah
 bios_disk_invoke:
     int $0x13

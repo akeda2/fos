@@ -19,6 +19,11 @@ exists to compare that with the older unpaged model; it does not change a
 tape's ABI, but it intentionally removes the normal image's page-fault and
 stack-guard coverage.
 
+Neither image gives a tape a private address space: the default additionally
+protects the kernel's own text/read-only pages and maps PCI memory BARs only
+for the owning driver, but a tape still runs in ring 0 and can misuse every
+address the kernel maps.
+
 This guide walks through writing, building, loading, and running a Rust
 tape from nothing, assuming no prior fos or embedded-Rust experience. For
 the deeper "why", see AGENTS.md's "Tapes: fixed load address, and writing

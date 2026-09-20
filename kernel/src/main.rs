@@ -2,6 +2,9 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+#[cfg(all(feature = "legacy-unsafe-memory", feature = "page-protection-test"))]
+compile_error!("page-protection-test requires the default paged memory mode");
+
 core::arch::global_asm!(include_str!("entry.S"));
 
 mod arch;
@@ -48,6 +51,9 @@ pub extern "C" fn kmain(boot_info_address: u32) -> ! {
         }
         println!(
             "Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO; unmapped holes will fault."
+        );
+        println!(
+            "Paging protection: kernel text/read-only data reject writes; PCI MMIO maps only when a driver registers its BAR."
         );
     }
     #[cfg(feature = "legacy-unsafe-memory")]

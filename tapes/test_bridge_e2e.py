@@ -12,6 +12,7 @@ uses multicast socket netdevs to model two isolated Ethernet segments.
 """
 
 import os
+import re
 import selectors
 import socket
 import struct
@@ -264,6 +265,17 @@ def main() -> None:
             time.sleep(0.05)
         read_until("bridge", b"Bridge stopped;", 10, stop_start)
         read_until("bridge", b"Tape returned; back at the fos shell.", 10, stop_start)
+        read_until("bridge", b"fos> ", 10, stop_start)
+        irq_status = run_command("a", BRIDGE_MAC_A, BRIDGE_CLIENT_MAC, "bridge", b"nic")
+        notification_counts = [
+            int(count) for count in re.findall(rb"NIC IRQ\d+: (\d+) notification", irq_status)
+        ]
+        if not notification_counts or not any(notification_counts):
+            raise SystemExit(
+                "bridge received live e1000 traffic but reported no NIC interrupt notifications:\n"
+                f"{irq_status.decode('utf-8', 'replace')}"
+            )
+        print("PASS: bridge e1000 IRQ handler acknowledged live network traffic.")
         run_command("a", BRIDGE_MAC_A, BRIDGE_CLIENT_MAC, "bridge", b"about")
         print("PASS: bridge stopped cleanly and the remote shell remained usable.")
     finally:
