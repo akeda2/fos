@@ -28,6 +28,7 @@ const FS_DATA_FULL: u32 = 6;
 const EDITOR_MIN_CAPACITY: u32 = 1024 * 1024;
 const EDITOR_MAX_CAPACITY: u32 = 4 * 1024 * 1024;
 const INPUT_CAPACITY: usize = 256;
+const PAGE_LINES: usize = 20;
 
 // Small files must work on the default `make run` QEMU configuration, whose
 // RAM ends at the big allocator's 128 MiB starting address. Keeping the
@@ -241,11 +242,16 @@ fn dispatch(
         b"h" | b"help" => {
             print_bytes(
                 putc,
-                b"p print | a append | iN insert | dN delete | sN/TEXT substitute\n\
-                  eN edit | w write | x write+exit | q quit\n",
+                b"p print | m more-style print | a append | iN insert | dN delete\n\
+                  sN/TEXT substitute | eN edit | w write | x write+exit | q quit\n",
             );
         }
         b"p" => print_buffer(putc, text),
+        b"m" => {
+            if print_buffer_more(putc, read_key, text) {
+                return CommandResult::Quit;
+            }
+        }
         b"a" => {
             if append_lines(putc, read_key, text, text.line_count() + 1) {
                 return CommandResult::Quit;
@@ -422,6 +428,59 @@ fn print_buffer(putc: Putc, text: &TextBuffer<'_>) {
             print_bytes(putc, content);
         }
         putc(u32::from(b'\n'));
+    }
+}
+
+fn print_buffer_more(putc: Putc, read_key: ReadKey, text: &TextBuffer<'_>) -> bool {
+    let line_count = text.line_count();
+    let mut printed = 0;
+    for line in 1..=line_count {
+        print_u32(putc, line as u32);
+        print_bytes(putc, b": ");
+        if let Some(content) = text.line_content(line) {
+            print_bytes(putc, content);
+        }
+        putc(u32::from(b'\n'));
+        printed += 1;
+        if printed == PAGE_LINES && line < line_count {
+            match wait_for_more(putc, read_key) {
+                MoreAction::NextPage => printed = 0,
+                MoreAction::Stop => return false,
+                MoreAction::Abort => return true,
+            }
+        }
+    }
+    false
+}
+
+enum MoreAction {
+    NextPage,
+    Stop,
+    Abort,
+}
+
+fn wait_for_more(putc: Putc, read_key: ReadKey) -> MoreAction {
+    print_bytes(putc, b"-- more -- (space: next page, q: stop) ");
+    loop {
+        let event = read_key();
+        if event == TAPE_EVENT_ABORT {
+            putc(u32::from(b'\n'));
+            return MoreAction::Abort;
+        }
+        if event < TAPE_EVENT_BYTE_BASE {
+            continue;
+        }
+        match (event - TAPE_EVENT_BYTE_BASE) as u8 {
+            b'q' | b'Q' => {
+                putc(u32::from(b'\n'));
+                return MoreAction::Stop;
+            }
+            b' ' | b'\r' | b'\n' => {
+                putc(u32::from(b'\n'));
+                return MoreAction::NextPage;
+            }
+            _ => {}
+        }
     }
 }
 

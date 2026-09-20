@@ -624,7 +624,8 @@ through an active `term net` session.
 The core commands are:
 
 ```text
-p              print the buffer with line numbers
+p              print the entire buffer with line numbers
+m              print one screen-sized page at a time
 a              append lines at the end
 aLINE          append lines after LINE
 iLINE          insert lines before LINE
@@ -638,7 +639,9 @@ q              exit without saving
 ```
 
 `a` and `iLINE` accept lines until a line containing only `.` is entered.
-F12/F4/F6/F7/F8/F10 exits the editor without saving. Build it with
+`m` pauses after each 20 lines; press Space or Enter for the next page, or
+`q` to stop paging and return to the editor prompt. F12/F4/F6/F7/F8/F10
+exits the editor without saving. Build it with
 `make tape-ed`; `make image` preloads the resulting `ED.BIN`, and
 `make test-tape-ed` verifies loading, editing, saving, and reading the
 changed file back from FOSFS.

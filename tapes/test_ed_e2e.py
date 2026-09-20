@@ -18,7 +18,12 @@ from pathlib import Path
 
 MCAST_GROUP = "230.42.42.54"
 MCAST_PORT = 4254
-IMAGE = Path(__file__).resolve().parent.parent / "build" / "fos.img"
+IMAGE = Path(
+    os.environ.get(
+        "FOS_TEST_IMAGE",
+        str(Path(__file__).resolve().parent.parent / "build" / "fos.img"),
+    )
+)
 TERM_CLIENT_MAC = bytes.fromhex("02deadbeef31")
 CHAT_ETHERTYPE = bytes((0x88, 0xB6))
 TERM_TAG_HELLO = 0x20
@@ -147,6 +152,16 @@ def main():
         text = output.decode("utf-8", "replace")
         if "replaced\nlast\n" not in text:
             raise SystemExit(f"saved file has unexpected contents:\n{text}")
+
+        command("tape run ed ROUTER.CFG", marker=b"ed> ")
+        del output[:]
+        mcast.send(frame(TERM_TAG_DATA, b"m\n"))
+        read_until(b"-- more --", 10)
+        if b"1: # fos router configuration example" not in output:
+            raise SystemExit(f"paged print did not show the first page:\n{output.decode('utf-8', 'replace')}")
+        mcast.send(frame(TERM_TAG_DATA, b"q"))
+        read_until(b"ed> ", 10)
+        command("q\n")
         print("PASS: editor loaded, edited, saved, and persisted TEST.TXT.")
     finally:
         mcast.close()
