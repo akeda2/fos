@@ -1644,12 +1644,25 @@ fn poll_uplink_health(
                     continue;
                 }
                 if index == interface {
+                    // The interface being health-checked is also, in the
+                    // common failover setup, the active uplink itself: it
+                    // keeps carrying ordinary traffic the whole time its own
+                    // health probe is in flight. Only the probe's own echo
+                    // reply is consumed here; anything else on this same
+                    // interface must still be forwarded via drain_and_forward
+                    // below, exactly like every other interface -- an earlier
+                    // version of this branch `continue`d without forwarding,
+                    // silently dropping real replies arriving on the active
+                    // uplink during this ~HEALTH_PROBE_TICKS window every
+                    // health cycle. process_arp runs twice for this frame
+                    // (once here, once inside drain_and_forward) when it
+                    // falls through; that second call is a harmless,
+                    // idempotent re-insert into the same ARP cache entry.
                     let frame = &receive_buffer[..min(length, MAX_FRAME_LEN)];
                     process_arp(&mut interfaces[interface], frame, ticks(), nic_send_at, max_frame_len);
                     if is_icmp_echo_reply(frame, &interfaces[interface], target, health.sequence) {
                         return true;
                     }
-                    continue;
                 }
                 drain_and_forward(
                     index,
