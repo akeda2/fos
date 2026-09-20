@@ -613,8 +613,11 @@ remote Escape byte cleanly ending the REPL without disconnecting the
 A small line-oriented Rust text editor for complete FOSFS files. Start it
 with `tape run ed NAME`; `NAME` must be an uppercase FOSFS name. The editor
 loads the whole file through the tape filesystem callbacks, normalizes input
-line endings to LF, and keeps up to 4 MiB in an allocator-backed buffer.
-Missing files start empty. It is intentionally not a full-screen editor:
+line endings to LF, and uses a 1 MiB buffer in the tape's own fixed image
+region for new and small files. Larger existing files use the optional tape
+allocator in 1 MiB chunks, up to 4 MiB; they therefore need RAM above the
+allocator's 128 MiB starting address. Missing files start empty. It is
+intentionally not a full-screen editor:
 input is ordinary `read_key` text, so it works from the local keyboard or
 through an active `term net` session.
 

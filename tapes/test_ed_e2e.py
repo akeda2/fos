@@ -3,8 +3,9 @@
 
 The test drives the tape through one remote ``term net`` session, edits a
 file that was created through the normal shell, saves it through the tape's
-FOSFS callbacks, and reads it back through ``cat``. QEMU gets enough RAM for
-the editor's allocator-backed 4 MiB text buffer.
+FOSFS callbacks, and reads it back through ``cat``. It deliberately uses the
+default-sized 128 MiB QEMU configuration, proving small files work without
+the optional allocator-backed memory above 128 MiB.
 """
 
 import selectors
@@ -52,7 +53,7 @@ def main():
         [
             "qemu-system-i386",
             "-m",
-            "256",
+            "128",
             "-drive",
             f"format=raw,file={IMAGE}",
             "-serial",

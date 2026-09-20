@@ -4,8 +4,9 @@
 //! A deliberately small, line-oriented text editor tape.
 //!
 //! `tape run ed NAME` loads one complete FOSFS file through the high-level
-//! filesystem callbacks, edits it in an allocator-backed buffer, and writes
-//! it back only when the user chooses `w` or `x`. It uses the same
+//! filesystem callbacks, edits it in a 1 MiB-granular allocator-backed
+//! buffer (up to 4 MiB), and writes it back only when the user chooses `w` or
+//! `x`. It uses the same
 //! non-blocking `read_key` input path as the calculator tape, so local
 //! keyboard input and remote `term net` input need no separate code paths.
 //! Full-screen editing is intentionally out of scope: this tape demonstrates
@@ -24,8 +25,16 @@ const FS_NOT_FOUND: u32 = 1;
 const FS_BUFFER_TOO_SMALL: u32 = 3;
 const FS_DIRECTORY_FULL: u32 = 5;
 const FS_DATA_FULL: u32 = 6;
-const EDITOR_CAPACITY: u32 = 4 * 1024 * 1024;
+const EDITOR_MIN_CAPACITY: u32 = 1024 * 1024;
+const EDITOR_MAX_CAPACITY: u32 = 4 * 1024 * 1024;
 const INPUT_CAPACITY: usize = 256;
+
+// Small files must work on the default `make run` QEMU configuration, whose
+// RAM ends at the big allocator's 128 MiB starting address. Keeping the
+// common 1 MiB case in the tape's own fixed 4 MiB image region avoids making
+// basic editing depend on extra machine RAM.
+static mut EDITOR_BUFFER: [u8; EDITOR_MIN_CAPACITY as usize] =
+    [0; EDITOR_MIN_CAPACITY as usize];
 
 type Putc = extern "C" fn(u32);
 type ReadKey = extern "C" fn() -> u32;
@@ -73,19 +82,30 @@ pub extern "C" fn tape_main(
         print_bytes(putc, b")\n");
         return;
     }
-    if file_length > EDITOR_CAPACITY as u64 {
+    if file_length > EDITOR_MAX_CAPACITY as u64 {
         print_bytes(putc, b"ed: file exceeds the 4 MiB editor buffer\n");
         return;
     }
 
-    let address = alloc(EDITOR_CAPACITY);
+    let capacity = file_length
+        .max(u64::from(EDITOR_MIN_CAPACITY))
+        .div_ceil(u64::from(EDITOR_MIN_CAPACITY))
+        .saturating_mul(u64::from(EDITOR_MIN_CAPACITY)) as u32;
+    let uses_static_buffer = capacity == EDITOR_MIN_CAPACITY;
+    let address = if uses_static_buffer {
+        core::ptr::addr_of_mut!(EDITOR_BUFFER) as *mut u8 as u32
+    } else {
+        alloc(capacity)
+    };
     if address == 0 {
-        print_bytes(putc, b"ed: unable to allocate the 4 MiB editor buffer\n");
+        print_bytes(putc, b"ed: unable to allocate the ");
+        print_u32(putc, capacity / (1024 * 1024));
+        print_bytes(putc, b" MiB editor buffer\n");
         return;
     }
 
     let result = unsafe {
-        let storage = slice::from_raw_parts_mut(address as *mut u8, EDITOR_CAPACITY as usize);
+        let storage = slice::from_raw_parts_mut(address as *mut u8, capacity as usize);
         let mut text = TextBuffer::new(storage);
         if length_status == FS_OK {
             let mut read_length = 0u32;
@@ -93,14 +113,16 @@ pub extern "C" fn tape_main(
                 name.as_ptr() as u32,
                 name.len() as u32,
                 address,
-                EDITOR_CAPACITY,
+                capacity,
                 &mut read_length as *mut u32 as u32,
             );
             if status != FS_OK {
                 print_bytes(putc, b"ed: cannot read file (status ");
                 print_u32(putc, status);
                 print_bytes(putc, b")\n");
-                free(address, EDITOR_CAPACITY);
+                if !uses_static_buffer {
+                    free(address, capacity);
+                }
                 return;
             }
             if text
@@ -108,7 +130,9 @@ pub extern "C" fn tape_main(
                 .is_err()
             {
                 print_bytes(putc, b"ed: file does not fit after line-ending normalization\n");
-                free(address, EDITOR_CAPACITY);
+                if !uses_static_buffer {
+                    free(address, capacity);
+                }
                 return;
             }
         }
@@ -120,7 +144,9 @@ pub extern "C" fn tape_main(
             fs_write,
         )
     };
-    free(address, EDITOR_CAPACITY);
+    if !uses_static_buffer {
+        free(address, capacity);
+    }
     if result {
         print_bytes(putc, b"ed: saved and exited\n");
     } else {
