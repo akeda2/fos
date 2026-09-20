@@ -189,6 +189,13 @@ one participates in directly connected routing for that subnet. This prevents
 the original, unhealthy uplink from winning a longest-prefix route lookup
 after failover; static downstream routes remain directly connected.
 
+The router prints event-only diagnostics by default: upstream leases, new
+downstream DHCP offers/bindings/releases, and new TCP/UDP NAT mappings. It
+does not print ordinary forwarded packets or retransmissions. Add `quiet` to
+the router startup arguments to suppress the routine DHCP/NAT lifecycle
+messages on an unattended deployment; configuration errors and critical
+failover/no-uplink warnings remain visible.
+
 NAT is enabled by default. Add `no-nat` when the upstream network has an
 explicit route back to the downstream subnets and should receive the original
 source addresses; `nat` may be written explicitly to document or re-enable
@@ -226,7 +233,10 @@ through NIC 1, and reverses that mapping for replies. This provides tens of
 thousands of flow slots and lets downstream DHCP clients reach hosts on the
 upstream LAN without requiring those hosts to learn a route back to the
 downstream subnet. If allocation is unavailable, it falls back to 32 slots.
-Entries expire after ten minutes; new flows are rejected when the table is
+New mappings use a run-varying IANA dynamic source port rather than preserving
+the inside source port, so a fixed-port client reconnecting after a router
+restart does not immediately collide with a remote server's still-live TCP
+tuple. Entries expire after ten minutes; new flows are rejected when the table is
 full rather than evicting existing mappings. Non-TCP/UDP traffic is forwarded
 without translation. Dynamic routing, ICMP
 unreachable/time-exceeded errors, fragmentation/reassembly, IPv6, and a kernel

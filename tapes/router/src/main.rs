@@ -73,6 +73,8 @@ const HEALTH_MISSED_CYCLES: u8 = 3;
 const NAT_FALLBACK_ENTRIES: usize = 32;
 const NAT_DYNAMIC_BYTES: u32 = 4 * 1024 * 1024;
 const NAT_TIMEOUT_TICKS: u64 = 60 * 100;
+const NAT_PORT_FIRST: u16 = 49_152;
+const NAT_PORT_COUNT: u16 = u16::MAX - NAT_PORT_FIRST + 1;
 const LEASE_FILE_MAGIC: &[u8; 8] = b"FOSDHCP1";
 const LEASE_FILE_VERSION: u16 = 1;
 const LEASE_FILE_HEADER_SIZE: usize = 20;
@@ -161,13 +163,18 @@ struct NatTable<'a> {
 }
 
 impl<'a> NatTable<'a> {
-    fn new(entries: &'a mut [NatEntry]) -> Self {
+    fn new(entries: &'a mut [NatEntry], port_seed: u64) -> Self {
         for entry in entries.iter_mut() {
             *entry = NatEntry::empty();
         }
         Self {
             entries,
-            next_port: 49152,
+            // Keep the source port in the IANA dynamic range, and vary the
+            // starting point for every router run. A fixed-source-port
+            // client reconnecting after a router restart otherwise recreates
+            // the exact external TCP tuple while a remote server may still
+            // retain its old connection state.
+            next_port: NAT_PORT_FIRST + (port_seed as u16 % NAT_PORT_COUNT),
         }
     }
 
@@ -260,12 +267,12 @@ impl<'a> NatTable<'a> {
     }
 
     fn next_external_port(&mut self) -> u16 {
-        let port = if self.next_port < 49152 {
-            49152
+        let port = self.next_port;
+        self.next_port = if port == u16::MAX {
+            NAT_PORT_FIRST
         } else {
-            self.next_port
+            port + 1
         };
-        self.next_port = self.next_port.wrapping_add(1);
         port
     }
 
@@ -277,14 +284,14 @@ impl<'a> NatTable<'a> {
         remote_address: Ipv4Address,
         remote_port: u16,
         now: u64,
-    ) -> Option<u16> {
+    ) -> Option<(u16, bool)> {
         self.expire(now);
         if let Some(index) = self
             .find_inbound(protocol, inside_port, remote_address, remote_port)
             .filter(|index| self.entries[*index].inside_address == inside_address)
         {
             self.entries[index].last_used = now;
-            return Some(self.entries[index].external_port);
+            return Some((self.entries[index].external_port, false));
         }
         if let Some(index) = self.entries.iter().position(|entry| {
             entry.state == NatState::Occupied
@@ -294,10 +301,10 @@ impl<'a> NatTable<'a> {
                 && entry.remote_port == remote_port
         }) {
             self.entries[index].last_used = now;
-            return Some(self.entries[index].external_port);
+            return Some((self.entries[index].external_port, false));
         }
 
-        let mut external_port = inside_port;
+        let mut external_port = self.next_external_port();
         for attempt in 0..=u16::MAX {
             if self
                 .find_inbound(protocol, external_port, remote_address, remote_port)
@@ -321,7 +328,7 @@ impl<'a> NatTable<'a> {
             remote_port,
             last_used: now,
         };
-        Some(external_port)
+        Some((external_port, true))
     }
 
     fn inbound(
@@ -353,6 +360,27 @@ struct DhcpLeaseSlot {
     state: LeaseState,
     mac: MacAddress,
     expires_at: u32,
+}
+
+#[derive(Clone, Copy)]
+enum DhcpLeaseEvent {
+    Offered {
+        mac: MacAddress,
+        address: Ipv4Address,
+    },
+    Bound {
+        mac: MacAddress,
+        address: Ipv4Address,
+    },
+    Released {
+        mac: MacAddress,
+        address: Ipv4Address,
+        declined: bool,
+    },
+    Nak {
+        mac: MacAddress,
+    },
+    SendFailed,
 }
 
 impl DhcpLeaseSlot {
@@ -430,10 +458,10 @@ impl<'a> DhcpServer<'a> {
         (self.leases[index].state != LeaseState::Empty).then_some(index)
     }
 
-    fn allocate(&mut self, mac: MacAddress, now: u32) -> Option<usize> {
+    fn allocate(&mut self, mac: MacAddress, now: u32) -> Option<(usize, bool)> {
         self.expire(now);
         if let Some(index) = self.find_mac(mac) {
-            return Some(index);
+            return Some((index, false));
         }
         let slot = self
             .leases
@@ -445,7 +473,7 @@ impl<'a> DhcpServer<'a> {
             expires_at: now.wrapping_add(DHCP_OFFER_SECONDS),
         };
         self.dirty = true;
-        Some(slot)
+        Some((slot, true))
     }
 
     fn requested(
@@ -456,7 +484,7 @@ impl<'a> DhcpServer<'a> {
         start: u32,
         end: u32,
         now: u32,
-    ) -> Option<usize> {
+    ) -> Option<(usize, bool)> {
         self.expire(now);
         let existing = self.find_mac(mac);
         let desired = requested
@@ -487,19 +515,23 @@ impl<'a> DhcpServer<'a> {
             self.dirty = true;
             Some(slot)
         })?;
+        let newly_bound = self.leases[index].state != LeaseState::Bound;
         self.leases[index].state = LeaseState::Bound;
         self.leases[index].expires_at = now.wrapping_add(DHCP_LEASE_SECONDS);
         self.dirty = true;
-        Some(index)
+        Some((index, newly_bound))
     }
 
-    fn release(&mut self, mac: MacAddress, address: Ipv4Address) {
+    fn release(&mut self, mac: MacAddress, address: Ipv4Address) -> Option<Ipv4Address> {
         if let Some(index) = self.find_mac(mac) {
             if address == Ipv4Address::UNSPECIFIED || self.address(index) == address {
+                let released = self.address(index);
                 self.leases[index] = DhcpLeaseSlot::empty();
                 self.dirty = true;
+                return Some(released);
             }
         }
+        None
     }
 
     fn restore(&mut self, mac: MacAddress, address: Ipv4Address, now: u32) -> bool {
@@ -788,7 +820,7 @@ fn print_config_error(putc: Putc, error: ConfigError) {
     print_bytes(putc, message);
     print_bytes(
         putc,
-        b". Usage: tape run router [dhcp [NIC]]... [health ADDRESS] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [dns SERVER [SERVER]] [forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]] \
+        b". Usage: tape run router [dhcp [NIC]]... [health ADDRESS] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [quiet] [dns SERVER [SERVER]] [forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]] \
 NIC IP NETMASK ... [default NIC GATEWAY] (or NIC IP/PREFIX)\n",
     );
 }
@@ -990,18 +1022,18 @@ fn dhcp_reply(
     now: u32,
     nic_send_at: NicSendAt,
     max_frame_len: usize,
-) -> bool {
+) -> Option<DhcpLeaseEvent> {
     let Ok(ethernet) = EthernetFrame::parse(frame) else {
-        return false;
+        return None;
     };
     if ethernet.ethertype != ETHERTYPE_IPV4 {
-        return false;
+        return None;
     }
     let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else {
-        return false;
+        return None;
     };
     if packet.header.protocol != 17 {
-        return false;
+        return None;
     }
     let Ok(datagram) = UdpDatagram::parse(
         packet.payload,
@@ -1009,55 +1041,72 @@ fn dhcp_reply(
         packet.header.source,
         packet.header.destination,
     ) else {
-        return false;
+        return None;
     };
     if datagram.source_port != DHCP_CLIENT_PORT || datagram.destination_port != DHCP_SERVER_PORT {
-        return false;
+        return None;
     }
     let Ok(request) = DhcpPacket::parse(datagram.payload) else {
-        return false;
+        return None;
     };
     if request.header.op != DhcpOp::Request
         || request.header.hardware_type != 1
         || request.header.hardware_length != 6
     {
-        return true;
+        return None;
     }
     let Ok(message_type) = request.message_type() else {
-        return true;
+        return None;
     };
     let client_mac = request.header.client_mac();
     let Some((pool_start, pool_end)) = dhcp_pool(interface) else {
-        return true;
+        return None;
     };
     let options = DhcpOptions::new(request.options);
     let requested = options.ipv4(DHCP_OPTION_REQUESTED_IP).ok().flatten();
     let server_identifier = options.ipv4(DHCP_OPTION_SERVER_IDENTIFIER).ok().flatten();
 
     if message_type == DhcpMessageType::Release {
-        server.release(client_mac, request.header.client_address);
-        return true;
+        return server
+            .release(client_mac, request.header.client_address)
+            .map(|address| DhcpLeaseEvent::Released {
+                mac: client_mac,
+                address,
+                declined: false,
+            });
     }
     if message_type == DhcpMessageType::Decline {
-        server.release(
-            client_mac,
-            requested.unwrap_or(request.header.client_address),
-        );
-        return true;
+        return server
+            .release(
+                client_mac,
+                requested.unwrap_or(request.header.client_address),
+            )
+            .map(|address| DhcpLeaseEvent::Released {
+                mac: client_mac,
+                address,
+                declined: true,
+            });
     }
     if server_identifier.is_some_and(|value| value != interface.address) {
-        return true;
+        return None;
     }
 
-    let (reply_type, address) = match message_type {
+    let (reply_type, address, event) = match message_type {
         DhcpMessageType::Discover => {
-            let Some(index) = server.allocate(client_mac, now) else {
-                return true;
+            let Some((index, new_offer)) = server.allocate(client_mac, now) else {
+                return None;
             };
-            (DhcpMessageType::Offer, server.address(index))
+            let address = server.address(index);
+            (
+                DhcpMessageType::Offer,
+                address,
+                new_offer.then_some(DhcpLeaseEvent::Offered {
+                    mac: client_mac,
+                    address,
+                }),
+            )
         }
-        DhcpMessageType::Request => {
-            match server.requested(
+        DhcpMessageType::Request => match server.requested(
                 client_mac,
                 requested,
                 request.header.client_address,
@@ -1065,11 +1114,24 @@ fn dhcp_reply(
                 pool_end,
                 now,
             ) {
-                Some(index) => (DhcpMessageType::Ack, server.address(index)),
-                None => (DhcpMessageType::Nak, Ipv4Address::UNSPECIFIED),
-            }
-        }
-        _ => return true,
+                Some((index, newly_bound)) => {
+                    let address = server.address(index);
+                    (
+                        DhcpMessageType::Ack,
+                        address,
+                        newly_bound.then_some(DhcpLeaseEvent::Bound {
+                            mac: client_mac,
+                            address,
+                        }),
+                    )
+                }
+                None => (
+                    DhcpMessageType::Nak,
+                    Ipv4Address::UNSPECIFIED,
+                    Some(DhcpLeaseEvent::Nak { mac: client_mac }),
+                ),
+            },
+        _ => return None,
     };
 
     let mut header = request.header;
@@ -1104,7 +1166,7 @@ fn dhcp_reply(
             .push_ipv4(DHCP_OPTION_SERVER_IDENTIFIER, interface.address)
             .is_err()
     {
-        return true;
+        return None;
     }
     if reply_type != DhcpMessageType::Nak
         && (writer
@@ -1126,7 +1188,7 @@ fn dhcp_reply(
                 .push_u32(DHCP_OPTION_REBINDING_TIME, DHCP_REBINDING_SECONDS)
                 .is_err())
     {
-        return true;
+        return None;
     }
     if reply_type != DhcpMessageType::Nak && dns_server_count != 0 {
         let mut dns_bytes = [0u8; DHCP_MAX_DNS_SERVERS * 4];
@@ -1137,18 +1199,18 @@ fn dhcp_reply(
             .push(DHCP_OPTION_DNS, &dns_bytes[..dns_server_count * 4])
             .is_err()
         {
-            return true;
+            return None;
         }
     }
     let Ok(option_length) = writer.finish() else {
-        return true;
+        return None;
     };
     let dhcp = DhcpPacket::new(header, &option_bytes[..option_length]);
     let mut payload = [0u8; 600];
     let Ok(payload_length) = dhcp.encode(&mut payload) else {
-        return true;
+        return None;
     };
-    let _ = send_dhcp_payload(
+    if !send_dhcp_payload(
         nic_send_at,
         interface.nic,
         interface.mac,
@@ -1159,8 +1221,63 @@ fn dhcp_reply(
         DHCP_SERVER_PORT,
         DHCP_CLIENT_PORT,
         max_frame_len,
-    );
-    true
+    ) {
+        return Some(DhcpLeaseEvent::SendFailed);
+    }
+    event
+}
+
+fn print_dhcp_lease_event(putc: Putc, nic: u32, event: DhcpLeaseEvent) {
+    match event {
+        DhcpLeaseEvent::Offered { mac, address } => {
+            print_bytes(putc, b"DHCP: NIC ");
+            print_u32(putc, nic + 1);
+            print_bytes(putc, b" offered ");
+            print_ip(putc, address);
+            print_bytes(putc, b" to ");
+            print_mac(putc, mac);
+            print_bytes(putc, b".\n");
+        }
+        DhcpLeaseEvent::Bound { mac, address } => {
+            print_bytes(putc, b"DHCP: NIC ");
+            print_u32(putc, nic + 1);
+            print_bytes(putc, b" leased ");
+            print_ip(putc, address);
+            print_bytes(putc, b" to ");
+            print_mac(putc, mac);
+            print_bytes(putc, b".\n");
+        }
+        DhcpLeaseEvent::Released {
+            mac,
+            address,
+            declined,
+        } => {
+            print_bytes(putc, b"DHCP: NIC ");
+            print_u32(putc, nic + 1);
+            print_bytes(
+                putc,
+                if declined {
+                    b" declined "
+                } else {
+                    b" released "
+                },
+            );
+            print_ip(putc, address);
+            print_bytes(putc, b" from ");
+            print_mac(putc, mac);
+            print_bytes(putc, b".\n");
+        }
+        DhcpLeaseEvent::Nak { mac } => {
+            print_bytes(putc, b"DHCP: NIC ");
+            print_u32(putc, nic + 1);
+            print_bytes(putc, b" rejected a request from ");
+            print_mac(putc, mac);
+            print_bytes(putc, b".\n");
+        }
+        DhcpLeaseEvent::SendFailed => {
+            print_bytes(putc, b"DHCP: reply transmission failed.\n");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1640,6 +1757,8 @@ fn reply_forward(
 }
 
 fn forward_ipv4(
+    putc: Putc,
+    quiet: bool,
     ingress: usize,
     frame: &[u8],
     interfaces: &mut [RouterInterface; MAX_INTERFACES],
@@ -1741,7 +1860,7 @@ fn forward_ipv4(
             let external_port = if let Some(forward) = static_forward {
                 forward.external_port
             } else if nat_enabled {
-                let Some(port) = nat.outbound(
+                let Some((port, new_mapping)) = nat.outbound(
                     header.protocol,
                     header.source,
                     source_port,
@@ -1751,6 +1870,32 @@ fn forward_ipv4(
                 ) else {
                     return ForwardResult::Dropped;
                 };
+                if new_mapping && !quiet {
+                    print_bytes(putc, b"NAT: new ");
+                    print_bytes(
+                        putc,
+                        match forward_protocol(header.protocol) {
+                            Some(ForwardProtocol::Tcp) => b"TCP",
+                            Some(ForwardProtocol::Udp) => b"UDP",
+                            None => b"IP",
+                        },
+                    );
+                    print_bytes(putc, b" flow ");
+                    print_ip(putc, header.source);
+                    print_bytes(putc, b":");
+                    print_u32(putc, u32::from(source_port));
+                    print_bytes(putc, b" -> ");
+                    print_ip(putc, header.destination);
+                    print_bytes(putc, b":");
+                    print_u32(putc, u32::from(destination_port));
+                    print_bytes(putc, b" via NIC ");
+                    print_u32(putc, interfaces[egress].nic + 1);
+                    print_bytes(putc, b" as ");
+                    print_ip(putc, interfaces[egress].address);
+                    print_bytes(putc, b":");
+                    print_u32(putc, u32::from(port));
+                    print_bytes(putc, b".\n");
+                }
                 port
             } else {
                 0
@@ -2193,6 +2338,17 @@ pub extern "C" fn tape_main(
             b"NAT: disabled; upstream routing must reach downstream networks.\n",
         );
     }
+    if parsed.quiet {
+        print_bytes(
+            putc,
+            b"Router event diagnostics: quiet mode suppresses routine DHCP/NAT messages.\n",
+        );
+    } else {
+        print_bytes(
+            putc,
+            b"Router event diagnostics: DHCP lease and new NAT-flow messages enabled.\n",
+        );
+    }
     let mut arp_receive_buffer = [0u8; MAX_FRAME_LEN];
     let mut fallback_nat_entries = [NatEntry::empty(); NAT_FALLBACK_ENTRIES];
     let nat_allocation = if parsed.nat {
@@ -2208,13 +2364,13 @@ pub extern "C" fn tape_main(
         print_bytes(putc, b"NAT: allocated ");
         print_u32(putc, entry_count as u32);
         print_bytes(putc, b" flow slots from physical memory.\n");
-        NatTable::new(entries)
+        NatTable::new(entries, ticks())
     } else {
         print_bytes(
             putc,
             b"NAT: physical-memory allocation unavailable; using 32 flow slots.\n",
         );
-        NatTable::new(&mut fallback_nat_entries)
+        NatTable::new(&mut fallback_nat_entries, ticks())
     };
     let mut ip_buffer = [0u8; MAX_FRAME_LEN];
     let mut transport_buffer = [0u8; MAX_FRAME_LEN];
@@ -2311,7 +2467,7 @@ pub extern "C" fn tape_main(
                 .iter().flatten().any(|uplink| *uplink == interfaces[ingress].nic) {
                 let mut lease_changed = false;
                 if let Some(server) = dhcp_servers[ingress].as_mut() {
-                    let _ = dhcp_reply(
+                    if let Some(event) = dhcp_reply(
                         &interfaces[ingress],
                         server,
                         &dns_servers,
@@ -2320,7 +2476,11 @@ pub extern "C" fn tape_main(
                         (ticks() / 100) as u32,
                         nic_send_at,
                         max_frame_len,
-                    );
+                    ) {
+                        if !parsed.quiet {
+                            print_dhcp_lease_event(putc, interfaces[ingress].nic, event);
+                        }
+                    }
                     lease_changed = server.is_dirty();
                 }
                 if lease_changed || lease_file_needs_flush {
@@ -2346,6 +2506,8 @@ pub extern "C" fn tape_main(
                 max_frame_len,
             );
             match forward_ipv4(
+                putc,
+                parsed.quiet,
                 ingress,
                 &receive_buffer[..length],
                 &mut interfaces,

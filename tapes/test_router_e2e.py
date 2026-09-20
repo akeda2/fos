@@ -545,6 +545,7 @@ def main() -> None:
         read_until(b"forward tcp 8080 -> 10.0.15.2:80", 10, run_start)
         read_until(b"forward udp 5353 -> 10.0.15.2:5353", 10, run_start)
         read_until(b"NAT: allocated", 10, run_start)
+        read_until(b"Router event diagnostics: DHCP lease and new NAT-flow messages enabled.", 10, run_start)
         print("PASS: router tape started with DHCP service on the secondary NIC.")
 
         links["b"].send(dhcp_frame(1, DHCP_CLIENT_MAC))
@@ -576,6 +577,8 @@ def main() -> None:
         )
         acknowledged_ip, _ = parse_dhcp(ack)
         assert acknowledged_ip == offered_ip
+        read_until(b"DHCP: NIC 2 offered 10.0.15.2 to 52:54:00:ca:fe:05.", 10)
+        read_until(b"DHCP: NIC 2 leased 10.0.15.2 to 52:54:00:ca:fe:05.", 10)
         print("PASS: DHCP server completed DISCOVER/OFFER/REQUEST/ACK.")
 
         for index in range(17):
@@ -696,20 +699,23 @@ def main() -> None:
         )
         assert translated_syn[14 + 12 : 14 + 16] == ROUTER_IP_A
         assert translated_syn[14 + 16 : 14 + 20] == LEFT_IP
-        assert int.from_bytes(translated_syn[14 + 20 : 14 + 22], "big") == client_port
+        external_port = int.from_bytes(translated_syn[14 + 20 : 14 + 22], "big")
+        assert 49152 <= external_port <= 65535
+        assert external_port != client_port
         ip_length = int.from_bytes(translated_syn[14 + 2 : 14 + 4], "big")
         translated_tcp = translated_syn[14 + 20 : 14 + ip_length]
         translated_pseudo = struct.pack(
             "!4s4sBBH", ROUTER_IP_A, LEFT_IP, 0, 6, len(translated_tcp)
         )
         assert checksum(translated_pseudo + translated_tcp) == 0
+        read_until(b"NAT: new TCP flow 10.0.15.2:40000 -> 10.0.1.2:23 via NIC 1 as 10.0.1.1:", 10)
         print("PASS: router source-NATed a downstream TCP connection.")
 
         syn_ack = tcp_segment(
             LEFT_IP,
             ROUTER_IP_A,
             server_port,
-            client_port,
+            external_port,
             200,
             101,
             0x012,

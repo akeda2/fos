@@ -830,6 +830,11 @@ a change. If DHCP uplinks share an upstream subnet, that subnet is also routed
 only through the active uplink; an inactive standby cannot win a
 directly-connected route lookup.
 
+By default, the router narrates DHCP lease lifecycle changes and newly created
+TCP/UDP NAT mappings without printing ordinary packet forwarding. Add `quiet`
+to suppress those routine messages on an unattended router; errors and
+critical uplink failover warnings still print.
+
 NAT is enabled by default. Add `no-nat` when the upstream network has an
 explicit route back to the downstream subnets and should receive the original
 source addresses; `nat` may be written explicitly to document or re-enable

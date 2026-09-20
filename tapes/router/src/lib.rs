@@ -71,6 +71,8 @@ pub struct RouterConfig {
     pub dhcp_server: bool,
     pub dhcp_lease_file: Option<FileName>,
     pub nat: bool,
+    /// Suppresses routine DHCP and NAT lifecycle messages for unattended use.
+    pub quiet: bool,
     pub forwards: [Option<PortForward>; MAX_FORWARDS],
     pub forward_count: usize,
     pub dns_servers: [Option<Ipv4Address>; DHCP_MAX_DNS_SERVERS],
@@ -220,7 +222,7 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
     inverted & inverted.wrapping_add(1) == 0
 }
 
-/// Parses `[dhcp [NIC]]... [health ADDRESS] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat]
+/// Parses `[dhcp [NIC]]... [health ADDRESS] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [quiet]
 /// [forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]]
 /// [dns SERVER [SERVER]] NIC IP NETMASK
 /// [NIC IP NETMASK ...] [default NIC GATEWAY]`.
@@ -248,6 +250,8 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
 /// NAT is enabled by default. `no-nat` disables TCP/UDP source translation for
 /// deployments where upstream routers already have routes back to downstream
 /// networks; `nat` explicitly re-enables it. Supplying both modes is rejected.
+/// `quiet` suppresses routine DHCP/NAT lifecycle narration but never startup
+/// configuration errors or failover/no-uplink warnings.
 ///
 /// `dns SERVER [SERVER]` overrides DNS servers learned from upstream DHCP.
 /// Up to two IPv4 DNS server addresses may be supplied.
@@ -280,6 +284,7 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
     let mut dhcp_lease_file = None;
     let mut nat = true;
     let mut nat_mode: Option<bool> = None;
+    let mut quiet = false;
     let mut forwards: [Option<PortForward>; MAX_FORWARDS] = [None; MAX_FORWARDS];
     let mut forward_count = 0usize;
     let mut dns_servers = [None; DHCP_MAX_DNS_SERVERS];
@@ -373,6 +378,10 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
                 }
                 nat_mode = Some(false);
                 nat = false;
+                first += 1;
+            }
+            Some(b"quiet") => {
+                quiet = true;
                 first += 1;
             }
             Some(b"forward") => {
@@ -594,6 +603,7 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         dhcp_server,
         dhcp_lease_file,
         nat,
+        quiet,
         forwards,
         forward_count,
         dns_servers,
@@ -815,6 +825,15 @@ mod tests {
         assert_eq!(select_healthy_uplink(&[true, true, false, false], 2), Some(0));
         assert_eq!(select_healthy_uplink(&[false, true, false, false], 2), Some(1));
         assert_eq!(select_healthy_uplink(&[true, true, false, false], 2), Some(0));
+    }
+
+    #[test]
+    fn parses_quiet_event_diagnostics_mode() {
+        assert!(
+            parse_config(b"router quiet dhcp 2 10.0.2.1/24")
+                .unwrap()
+                .quiet
+        );
     }
 
     #[test]
