@@ -190,7 +190,7 @@ the original, unhealthy uplink from winning a longest-prefix route lookup
 after failover; static downstream routes remain directly connected.
 
 The router prints event-only diagnostics by default: upstream leases, new
-downstream DHCP offers/bindings/releases, and new TCP/UDP NAT mappings. It
+downstream DHCP offers/bindings/releases, and new TCP/UDP/ICMP-echo NAT mappings. It
 does not print ordinary forwarded packets or retransmissions. Add `quiet` to
 the router startup arguments to suppress the routine DHCP/NAT lifecycle
 messages on an unattended deployment; configuration errors and critical
@@ -227,7 +227,8 @@ default. At least two interfaces are required, NIC selections must be unique
 and exist, and an explicit gateway must be on the selected interface's
 subnet. Packets addressed to the router itself, IPv4 broadcast/multicast,
 unknown networks without a default, TTL 1, and malformed/checksum-invalid
-IPv4 packets are dropped. When enabled, the router performs TCP/UDP source NAT using a
+IPv4 packets are dropped. When enabled, the router performs TCP/UDP source NAT and ICMP echo identifier
+translation using a
 4 MiB physical-memory-backed table when traffic leaves a non-primary NIC
 through NIC 1, and reverses that mapping for replies. This provides tens of
 thousands of flow slots and lets downstream DHCP clients reach hosts on the
@@ -237,8 +238,8 @@ New mappings use a run-varying IANA dynamic source port rather than preserving
 the inside source port, so a fixed-port client reconnecting after a router
 restart does not immediately collide with a remote server's still-live TCP
 tuple. Entries expire after ten minutes; new flows are rejected when the table is
-full rather than evicting existing mappings. Non-TCP/UDP traffic is forwarded
-without translation. Dynamic routing, ICMP
+full rather than evicting existing mappings. Other ICMP messages and non-TCP/UDP
+traffic are forwarded without translation. Dynamic routing, ICMP
 unreachable/time-exceeded errors, fragmentation/reassembly, IPv6, and a kernel
 socket layer remain out of scope. `make test-tape-router` runs the
 three-party QEMU/multicast test that verifies ARP, forwarding in both
@@ -356,8 +357,14 @@ When diagnosing DHCP on a physical multi-NIC machine, run
 router or DHCP implementation. The tape tries every initialized interface
 independently, reports transmit/receive/parser/DHCP counters, and does not
 advance until that NIC binds or the operator presses an escape function key.
+Each successful lease also reports the DNS server addresses carried in DHCP
+option 6, or explicitly reports that no DNS server was advertised. This is a
+diagnostic only: the tape does not perform DNS queries or install a resolver.
 After all interfaces bind, it remains in a periodic status display until the
 operator presses an escape function key.
+Pass `tape run HOST [INTERVAL_SECONDS]` to add ICMP echo checks after binding;
+the tape ARPs the host directly when it is on the leased subnet and uses the
+DHCP gateway otherwise. With no startup arguments, it performs no ping checks.
 If a replacement NIC acquires a lease immediately on the same cable and
 network segment while the original one remains silent, that isolates a flaky
 NIC or its physical path; do not treat it as evidence that DHCP parsing,

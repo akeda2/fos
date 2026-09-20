@@ -65,6 +65,23 @@ def main() -> None:
                     )
                 output.extend(chunk)
 
+    def read_until_count(marker: bytes, count: int, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while output.count(marker) < count:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SystemExit(
+                    f"timed out waiting for {count} occurrences of {marker!r}:\n"
+                    f"{output.decode('utf-8', 'replace')}"
+                )
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 4096)
+                if not chunk:
+                    raise SystemExit(
+                        f"QEMU exited early:\n{output.decode('utf-8', 'replace')}"
+                    )
+                output.extend(chunk)
+
     def monitor(command: str) -> None:
         deadline = time.monotonic() + 5
         while True:
@@ -111,24 +128,55 @@ def main() -> None:
             qemu.stdin.write(bytes([byte]))
             qemu.stdin.flush()
             time.sleep(0.002)
-        read_until(b"Network DHCP test: every NIC acquired an IP; monitoring", 40)
+        read_until(
+            b"Network DHCP test: every NIC acquired an IP; monitoring until manual exit.",
+            40,
+        )
         text = output[command_start:].decode("utf-8", "replace")
         for marker in (
             "NIC 1 acquired ",
+            "NIC 1 DHCP DNS: ",
             "NIC 1 beep complete.",
             "NIC 2 acquired ",
+            "NIC 2 DHCP DNS: ",
             "NIC 2 beep complete.",
             "monitoring until manual exit.",
         ):
             if marker not in text:
                 raise SystemExit(f"missing {marker!r}:\n{text}")
+        dns_lines = [
+            line for line in text.splitlines() if " DHCP DNS: " in line
+        ]
+        if len(dns_lines) != 2 or any(not line.endswith(".") for line in dns_lines):
+            raise SystemExit(f"expected one DHCP DNS result per NIC:\n{text}")
+        if " ping " in text:
+            raise SystemExit(f"unexpected ping activity without arguments:\n{text}")
         # The tape must remain active after DHCP success.  Only a local escape
         # key should return the shell prompt.
         monitor("sendkey f12")
         read_until(b"Network DHCP test stopped.", 10)
         read_until(b"Tape returned; back at the fos shell.", 10)
         read_until(b"fos> ", 5)
-        print("PASS: DHCP connectivity tape monitored both leases until manual exit.")
+        print("PASS: DHCP connectivity tape monitored both leases without pinging.")
+
+        command_start = len(output)
+        for byte in b"tape run 10.0.2.2 1\r":
+            qemu.stdin.write(bytes([byte]))
+            qemu.stdin.flush()
+            time.sleep(0.002)
+        read_until(
+            b"Network DHCP test: every NIC acquired an IP; monitoring until manual exit.",
+            40,
+        )
+        read_until_count(b"ping 10.0.2.2: reply received.", 2, 10)
+        text = output[command_start:].decode("utf-8", "replace")
+        if text.count("ping 10.0.2.2: reply received.") < 2:
+            raise SystemExit(f"expected ping replies from both NICs:\n{text}")
+        monitor("sendkey f12")
+        read_until(b"Network DHCP test stopped.", 10)
+        read_until(b"Tape returned; back at the fos shell.", 10)
+        read_until(b"fos> ", 5)
+        print("PASS: DHCP connectivity tape pinged the host through both leases.")
     finally:
         qemu.terminate()
         try:

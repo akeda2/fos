@@ -732,9 +732,14 @@ approximately 100 ms PC-speaker beep before the tape advances to the next
 NIC. It uses the kernel's PIT channel 2 for the tone and leaves channel 0's
 100 Hz timer untouched. After all leases are acquired, it continues printing
 the per-NIC status and counters until manually stopped. Load it with
-`tape load disk NET-DHCP.BIN` and run `tape run`; F12/F4/F6/F7/F8/F10 remains
+`tape load disk NET-DHCP.BIN` and run `tape run`; optionally use
+`tape run HOST [INTERVAL_SECONDS]` to send ICMP echo requests through every
+leased NIC. Without arguments it does not ping. F12/F4/F6/F7/F8/F10 remains
 the explicit escape if a segment has no DHCP server. Build it with
 `make tape-net-dhcp`; the focused QEMU test is `make test-tape-net-dhcp`.
+Each lease report also shows the DNS server addresses from DHCP option 6, or
+`none` when the server advertised no DNS resolver. The tape reports this
+information but does not configure or query DNS itself.
 
 #### Test tape: `tapes/morse/`
 
@@ -831,7 +836,7 @@ only through the active uplink; an inactive standby cannot win a
 directly-connected route lookup.
 
 By default, the router narrates DHCP lease lifecycle changes and newly created
-TCP/UDP NAT mappings without printing ordinary packet forwarding. Add `quiet`
+TCP/UDP/ICMP-echo NAT mappings without printing ordinary packet forwarding. Add `quiet`
 to suppress those routine messages on an unattended router; errors and
 critical uplink failover warnings still print.
 

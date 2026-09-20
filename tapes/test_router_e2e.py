@@ -140,6 +140,11 @@ def udp_datagram_with_checksum(
     return datagram[:6] + checksum_value.to_bytes(2, "big") + datagram[8:]
 
 
+def icmp_echo(message_type: int, identifier: int, sequence: int, payload: bytes = b"") -> bytes:
+    message = struct.pack("!BBHHH", message_type, 0, 0, identifier, sequence) + payload
+    return message[:2] + checksum(message).to_bytes(2, "big") + message[4:]
+
+
 def tcp_segment(
     source_ip: bytes,
     destination_ip: bytes,
@@ -753,6 +758,63 @@ def main() -> None:
         )
         assert checksum(translated_pseudo + translated_tcp) == 0
         print("PASS: router reverse-translated the upstream TCP reply.")
+
+        echo_identifier = 0x1234
+        echo_request = icmp_echo(8, echo_identifier, 1, b"router ping")
+        links["b"].send(
+            ipv4_frame(
+                ROUTER_MAC_B,
+                RIGHT_MAC,
+                RIGHT_IP,
+                LEFT_IP,
+                echo_request,
+                protocol=1,
+            )
+        )
+        translated_echo_request = wait_for_frame(
+            links["a"],
+            lambda frame: frame[0:6] == LEFT_MAC
+            and frame[6:12] == ROUTER_MAC_A
+            and frame[12:14] == b"\x08\x00"
+            and frame[23] == 1,
+            10,
+            "a NAT-translated ICMP echo request on segment A",
+        )
+        assert translated_echo_request[26:30] == ROUTER_IP_A
+        external_identifier = int.from_bytes(translated_echo_request[38:40], "big")
+        assert 49152 <= external_identifier <= 65535
+        assert external_identifier != echo_identifier
+        assert checksum(translated_echo_request[34:]) == 0
+
+        echo_reply = icmp_echo(0, external_identifier, 1, b"router ping")
+        links["a"].send(
+            ipv4_frame(
+                ROUTER_MAC_A,
+                LEFT_MAC,
+                LEFT_IP,
+                ROUTER_IP_A,
+                echo_reply,
+                protocol=1,
+            )
+        )
+        translated_echo_reply = wait_for_frame(
+            links["b"],
+            lambda frame: frame[0:6] == RIGHT_MAC
+            and frame[6:12] == ROUTER_MAC_B
+            and frame[12:14] == b"\x08\x00"
+            and frame[23] == 1,
+            10,
+            "a reverse-NATed ICMP echo reply on segment B",
+        )
+        assert translated_echo_reply[26:30] == LEFT_IP
+        assert translated_echo_reply[30:34] == RIGHT_IP
+        assert int.from_bytes(translated_echo_reply[38:40], "big") == echo_identifier
+        assert checksum(translated_echo_reply[34:]) == 0
+        read_until(
+            b"NAT: new ICMP flow 10.0.15.2:4660 -> 10.0.1.2:4660 via NIC 1 as 10.0.1.1:",
+            10,
+        )
+        print("PASS: router source-NATed an ICMP echo request and reply.")
 
         forwarded_syn = tcp_segment(
             LEFT_IP, ROUTER_IP_A, 41000, 8080, 300, 0, 0x002

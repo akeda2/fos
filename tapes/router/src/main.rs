@@ -1475,7 +1475,91 @@ fn poll_uplink_health(
         should_abort: ShouldAbort,
         ticks: Ticks,
         max_frame_len: usize,
+        putc: Putc,
+        quiet: bool,
+        routing_configs: &[Option<InterfaceConfig>; MAX_INTERFACES],
+        default_route: Option<router_tape::DefaultRoute>,
+        active_nic: u32,
+        nat: &mut NatTable,
+        nat_enabled: bool,
+        forwards: &[Option<PortForward>; MAX_FORWARDS],
+        forward_count: usize,
+        arp_scratch_buffer: &mut [u8; MAX_FRAME_LEN],
+        transport_buffer: &mut [u8; MAX_FRAME_LEN],
+        ip_buffer: &mut [u8; MAX_FRAME_LEN],
+        output_buffer: &mut [u8; MAX_FRAME_LEN],
+        forwarded: &mut u32,
+        dropped: &mut u32,
     ) -> bool {
+        // Every frame this function drains from a NIC ring while waiting on a
+        // probe reply must still be forwarded like the main loop would,
+        // rather than silently discarded: a health check that only recognizes
+        // ARP/ICMP traffic of its own and drops everything else would starve
+        // ordinary client traffic on every interface for up to
+        // `HEALTH_PROBE_TICKS` twice per configured uplink, every health
+        // cycle. This was a real, reproducible source of packet loss whenever
+        // more than one DHCP uplink (and therefore health polling) was
+        // configured, even though the same NIC showed no loss at all when
+        // used alone with no health target to poll.
+        #[allow(clippy::too_many_arguments)]
+        fn drain_and_forward(
+            index: usize,
+            length: usize,
+            interfaces: &mut [RouterInterface; MAX_INTERFACES],
+            count: usize,
+            receive_buffer: &[u8; MAX_FRAME_LEN],
+            putc: Putc,
+            quiet: bool,
+            routing_configs: &[Option<InterfaceConfig>; MAX_INTERFACES],
+            default_route: Option<router_tape::DefaultRoute>,
+            active_nic: u32,
+            nic_send_at: NicSendAt,
+            nic_receive_at: NicReceiveAt,
+            should_abort: ShouldAbort,
+            ticks: Ticks,
+            nat: &mut NatTable,
+            nat_enabled: bool,
+            forwards: &[Option<PortForward>; MAX_FORWARDS],
+            forward_count: usize,
+            arp_scratch_buffer: &mut [u8; MAX_FRAME_LEN],
+            transport_buffer: &mut [u8; MAX_FRAME_LEN],
+            ip_buffer: &mut [u8; MAX_FRAME_LEN],
+            output_buffer: &mut [u8; MAX_FRAME_LEN],
+            forwarded: &mut u32,
+            dropped: &mut u32,
+            max_frame_len: usize,
+        ) {
+            let frame = &receive_buffer[..min(length, MAX_FRAME_LEN)];
+            process_arp(&mut interfaces[index], frame, ticks(), nic_send_at, max_frame_len);
+            match forward_ipv4(
+                putc,
+                quiet,
+                index,
+                frame,
+                interfaces,
+                routing_configs,
+                count,
+                default_route,
+                active_nic,
+                nic_send_at,
+                nic_receive_at,
+                should_abort,
+                ticks,
+                nat,
+                nat_enabled,
+                forwards,
+                forward_count,
+                arp_scratch_buffer,
+                transport_buffer,
+                ip_buffer,
+                output_buffer,
+                max_frame_len,
+            ) {
+                ForwardResult::Forwarded => *forwarded += 1,
+                ForwardResult::Dropped => *dropped += 1,
+            }
+        }
+
         let interface = health.interface;
         // Each probe requires a fresh gateway answer, not merely a still-valid
         // cache entry from a previous cycle.
@@ -1496,11 +1580,31 @@ fn poll_uplink_health(
                 if length == 0 {
                     continue;
                 }
-                process_arp(
-                    &mut interfaces[index],
-                    &receive_buffer[..min(length, MAX_FRAME_LEN)],
-                    ticks(),
+                drain_and_forward(
+                    index,
+                    length,
+                    interfaces,
+                    count,
+                    receive_buffer,
+                    putc,
+                    quiet,
+                    routing_configs,
+                    default_route,
+                    active_nic,
                     nic_send_at,
+                    nic_receive_at,
+                    should_abort,
+                    ticks,
+                    nat,
+                    nat_enabled,
+                    forwards,
+                    forward_count,
+                    arp_scratch_buffer,
+                    transport_buffer,
+                    ip_buffer,
+                    output_buffer,
+                    forwarded,
+                    dropped,
                     max_frame_len,
                 );
             }
@@ -1530,22 +1634,111 @@ fn poll_uplink_health(
             if should_abort() == TAPE_EVENT_ABORT {
                 return false;
             }
-            let length = nic_receive_at(
-                interfaces[interface].nic,
-                receive_buffer.as_mut_ptr() as u32,
-                max_frame_len as u32,
-            ) as usize;
-            if length == 0 {
-                continue;
-            }
-            let frame = &receive_buffer[..min(length, MAX_FRAME_LEN)];
-            process_arp(&mut interfaces[interface], frame, ticks(), nic_send_at, max_frame_len);
-            if is_icmp_echo_reply(frame, &interfaces[interface], target, health.sequence) {
-                return true;
+            for index in 0..count {
+                let length = nic_receive_at(
+                    interfaces[index].nic,
+                    receive_buffer.as_mut_ptr() as u32,
+                    max_frame_len as u32,
+                ) as usize;
+                if length == 0 {
+                    continue;
+                }
+                if index == interface {
+                    let frame = &receive_buffer[..min(length, MAX_FRAME_LEN)];
+                    process_arp(&mut interfaces[interface], frame, ticks(), nic_send_at, max_frame_len);
+                    if is_icmp_echo_reply(frame, &interfaces[interface], target, health.sequence) {
+                        return true;
+                    }
+                    continue;
+                }
+                drain_and_forward(
+                    index,
+                    length,
+                    interfaces,
+                    count,
+                    receive_buffer,
+                    putc,
+                    quiet,
+                    routing_configs,
+                    default_route,
+                    active_nic,
+                    nic_send_at,
+                    nic_receive_at,
+                    should_abort,
+                    ticks,
+                    nat,
+                    nat_enabled,
+                    forwards,
+                    forward_count,
+                    arp_scratch_buffer,
+                    transport_buffer,
+                    ip_buffer,
+                    output_buffer,
+                    forwarded,
+                    dropped,
+                    max_frame_len,
+                );
             }
         }
         false
     }
+
+/// Derives the active default route, active NIC, and DHCP-uplink-filtered
+/// routing table from the current failover state. Shared by the health-poll
+/// block (which needs this *before* forwarding traffic seen during a probe)
+/// and the ordinary per-frame forwarding loop (which needs it *after* a
+/// failover may have just changed `active_uplink`), so the two call sites
+/// can never drift out of sync with each other.
+#[allow(clippy::too_many_arguments)]
+fn compute_forwarding_context(
+    uplinks: &[Option<UplinkHealth>; MAX_INTERFACES],
+    dhcp_uplink_count: usize,
+    active_uplink: Option<usize>,
+    default_route: Option<router_tape::DefaultRoute>,
+    interfaces: &[RouterInterface; MAX_INTERFACES],
+    interface_count: usize,
+    configs: &[Option<InterfaceConfig>; MAX_INTERFACES],
+    dhcp_uplinks_config: &[Option<u32>; MAX_INTERFACES],
+) -> (
+    Option<router_tape::DefaultRoute>,
+    u32,
+    [Option<InterfaceConfig>; MAX_INTERFACES],
+) {
+    let current_default = active_uplink
+        .and_then(|index| {
+            uplinks[..dhcp_uplink_count]
+                .iter()
+                .flatten()
+                .find(|uplink| uplink.interface == index)
+                .map(|uplink| router_tape::DefaultRoute {
+                    nic: interfaces[index].nic,
+                    gateway: uplink.gateway,
+                })
+        })
+        .or(default_route);
+    let active_index = active_uplink
+        .or_else(|| {
+            current_default.and_then(|route| {
+                interfaces[..interface_count]
+                    .iter()
+                    .position(|interface| interface.nic == route.nic)
+            })
+        })
+        .unwrap_or(0);
+    let active_nic = interfaces[active_index].nic;
+    // Standby DHCP uplinks may share the active uplink's subnet. Exclude
+    // them from direct-route matching so that subnet never bypasses the
+    // health-selected active default route after a failover.
+    let routing_configs = routing_configs_for_active_uplink(
+        configs,
+        interface_count,
+        dhcp_uplinks_config,
+        dhcp_uplink_count,
+        active_uplink.map(|index| interfaces[index].nic),
+    );
+    (current_default, active_nic, routing_configs)
+}
+
 fn process_arp(
     interface: &mut RouterInterface,
     frame: &[u8],
@@ -1584,7 +1777,6 @@ fn resolve_mac(
     egress: usize,
     target: Ipv4Address,
     interfaces: &mut [RouterInterface; MAX_INTERFACES],
-    count: usize,
     nic_send_at: NicSendAt,
     nic_receive_at: NicReceiveAt,
     should_abort: ShouldAbort,
@@ -1604,18 +1796,24 @@ fn resolve_mac(
         if should_abort() == TAPE_EVENT_ABORT {
             return None;
         }
-        for index in 0..count {
-            let length = nic_receive_at(
-                interfaces[index].nic,
-                receive_buffer.as_mut_ptr() as u32,
-                max_frame_len as u32,
-            ) as usize;
-            if length == 0 {
-                continue;
-            }
+        // Only drain the egress interface's own ring here: the ARP reply we
+        // are waiting for can only arrive on it. Polling every interface (as
+        // an earlier version of this loop did) silently discarded ordinary
+        // IP traffic arriving on unrelated interfaces for up to
+        // ARP_TIMEOUT_TICKS on every cache-miss resolution -- e.g. a
+        // downstream client's own request frames, while the router blocked
+        // here resolving a WAN-side target's MAC. Leaving other interfaces'
+        // rings untouched lets the caller's own polling loop pick that
+        // traffic up normally once this call returns.
+        let length = nic_receive_at(
+            interfaces[egress].nic,
+            receive_buffer.as_mut_ptr() as u32,
+            max_frame_len as u32,
+        ) as usize;
+        if length != 0 {
             let length = min(length, MAX_FRAME_LEN);
             process_arp(
-                &mut interfaces[index],
+                &mut interfaces[egress],
                 &receive_buffer[..length],
                 ticks(),
                 nic_send_at,
@@ -1645,19 +1843,40 @@ fn is_local(
         .any(|interface| interface.address == address)
 }
 
-fn transport_ports(payload: &[u8], protocol: u8) -> Option<(u16, u16)> {
-    let header_len = match protocol {
-        6 => 20,
-        17 => 8,
-        _ => return None,
-    };
-    if payload.len() < header_len {
-        return None;
+fn nat_endpoints(payload: &[u8], protocol: u8) -> Option<(u16, u16)> {
+    match protocol {
+        6 if payload.len() >= 20 => Some((
+            u16::from_be_bytes([payload[0], payload[1]]),
+            u16::from_be_bytes([payload[2], payload[3]]),
+        )),
+        17 if payload.len() >= 8 => Some((
+            u16::from_be_bytes([payload[0], payload[1]]),
+            u16::from_be_bytes([payload[2], payload[3]]),
+        )),
+        // ICMP echo uses its identifier as the flow key. NAT only translates
+        // requests and matching replies; ICMP error payloads remain forwarded
+        // unchanged because they quote another packet's IP and transport data.
+        1 if payload.len() >= 8
+            && (payload[0] == 8 || payload[0] == 0)
+            && payload[1] == 0 =>
+        {
+            let identifier = u16::from_be_bytes([payload[4], payload[5]]);
+            Some((identifier, identifier))
+        }
+        _ => None,
     }
-    Some((
-        u16::from_be_bytes([payload[0], payload[1]]),
-        u16::from_be_bytes([payload[2], payload[3]]),
-    ))
+}
+
+// An echo reply preserves the router-assigned external identifier, so it no
+// longer contains the inside request's identifier. The remote address plus
+// external identifier uniquely selects its mapping; reserve the remote-port
+// slot as zero for both directions of an ICMP echo flow.
+fn nat_remote_endpoint(protocol: u8, endpoint: u16) -> u16 {
+    if protocol == 1 {
+        0
+    } else {
+        endpoint
+    }
 }
 
 fn checksum_replace(checksum: u16, old: u16, new: u16) -> u16 {
@@ -1668,9 +1887,9 @@ fn checksum_replace(checksum: u16, old: u16, new: u16) -> u16 {
     !(sum as u16)
 }
 
-// TCP and UDP checksums include the IPv4 pseudo-header. Recalculate only the
-// changed address and port words so transport options and payload bytes stay
-// untouched while NAT rewrites the packet.
+// TCP and UDP checksums include the IPv4 pseudo-header, while ICMP checksums
+// cover only the ICMP payload. Update just the changed words so options and
+// payload bytes stay untouched while NAT rewrites the packet.
 fn rewrite_transport(
     payload: &mut [u8],
     protocol: u8,
@@ -1680,6 +1899,23 @@ fn rewrite_transport(
     new_port: u16,
     source: bool,
 ) -> bool {
+    if protocol == 1 {
+        if payload.len() < 8
+            || (payload[0] != 8 && payload[0] != 0)
+            || payload[1] != 0
+        {
+            return false;
+        }
+        let identifier = u16::from_be_bytes([payload[4], payload[5]]);
+        if identifier != old_port {
+            return false;
+        }
+        let checksum = u16::from_be_bytes([payload[2], payload[3]]);
+        payload[4..6].copy_from_slice(&new_port.to_be_bytes());
+        let updated = checksum_replace(checksum, old_port, new_port);
+        payload[2..4].copy_from_slice(&updated.to_be_bytes());
+        return true;
+    }
     let (checksum_offset, port_offset) = match protocol {
         6 if payload.len() >= 20 => (16, if source { 0 } else { 2 }),
         17 if payload.len() >= 8 => (6, if source { 0 } else { 2 }),
@@ -1797,7 +2033,7 @@ fn forward_ipv4(
         && packet.header.destination == interfaces[ingress].address
     {
         let Some((source_port, destination_port)) =
-            transport_ports(packet.payload, packet.header.protocol)
+            nat_endpoints(packet.payload, packet.header.protocol)
         else {
             return ForwardResult::Dropped;
         };
@@ -1810,7 +2046,7 @@ fn forward_ipv4(
                 packet.header.protocol,
                 destination_port,
                 packet.header.source,
-                source_port,
+                nat_remote_endpoint(packet.header.protocol, source_port),
                 now,
             )
         } else {
@@ -1853,7 +2089,7 @@ fn forward_ipv4(
     let mut payload_rewritten = payload_in_transport_buffer;
     if interfaces[ingress].nic != active_uplink && interfaces[egress].nic == active_uplink {
         if let Some((source_port, destination_port)) =
-            transport_ports(packet.payload, header.protocol)
+            nat_endpoints(packet.payload, header.protocol)
         {
             let static_forward =
                 reply_forward(forwards, forward_count, header.protocol, header.source, source_port);
@@ -1865,7 +2101,7 @@ fn forward_ipv4(
                     header.source,
                     source_port,
                     header.destination,
-                    destination_port,
+                    nat_remote_endpoint(header.protocol, destination_port),
                     now,
                 ) else {
                     return ForwardResult::Dropped;
@@ -1874,10 +2110,14 @@ fn forward_ipv4(
                     print_bytes(putc, b"NAT: new ");
                     print_bytes(
                         putc,
-                        match forward_protocol(header.protocol) {
-                            Some(ForwardProtocol::Tcp) => b"TCP",
-                            Some(ForwardProtocol::Udp) => b"UDP",
-                            None => b"IP",
+                        if header.protocol == 1 {
+                            b"ICMP"
+                        } else {
+                            match forward_protocol(header.protocol) {
+                                Some(ForwardProtocol::Tcp) => b"TCP",
+                                Some(ForwardProtocol::Udp) => b"UDP",
+                                None => b"IP",
+                            }
                         },
                     );
                     print_bytes(putc, b" flow ");
@@ -1924,7 +2164,6 @@ fn forward_ipv4(
         egress,
         next_hop,
         interfaces,
-        count,
         nic_send_at,
         nic_receive_at,
         should_abort,
@@ -2385,6 +2624,20 @@ pub extern "C" fn tape_main(
         {
             last_health_poll = ticks();
             let previous = active_uplink;
+            // Computed from the pre-poll active uplink so any ordinary
+            // traffic seen while probing is forwarded exactly as the main
+            // loop below would forward it, instead of being silently
+            // dropped for the whole probe window.
+            let (pre_default, pre_active_nic, pre_routing_configs) = compute_forwarding_context(
+                &uplinks,
+                parsed.dhcp_uplink_count,
+                active_uplink,
+                parsed.default_route,
+                &interfaces,
+                interface_count,
+                &configs,
+                &parsed.dhcp_uplinks,
+            );
             for uplink in uplinks[..parsed.dhcp_uplink_count].iter_mut().flatten() {
                 let target = parsed.health_target.unwrap();
                 if poll_uplink_health(
@@ -2392,12 +2645,32 @@ pub extern "C" fn tape_main(
                     target,
                     &mut interfaces,
                     interface_count,
-                    &mut arp_receive_buffer,
+                    // The per-ingress `receive_buffer` below is unused until
+                    // the ordinary forwarding loop further down runs later
+                    // this same iteration, so it is safely reused here rather
+                    // than adding a whole extra MAX_FRAME_LEN array to this
+                    // already large, stack-budget-constrained tape function.
+                    &mut receive_buffer,
                     nic_send_at,
                     nic_receive_at,
                     should_abort,
                     ticks,
                     max_frame_len,
+                    putc,
+                    parsed.quiet,
+                    &pre_routing_configs,
+                    pre_default,
+                    pre_active_nic,
+                    &mut nat,
+                    parsed.nat,
+                    &parsed.forwards,
+                    parsed.forward_count,
+                    &mut arp_receive_buffer,
+                    &mut transport_buffer,
+                    &mut ip_buffer,
+                    &mut output_buffer,
+                    &mut forwarded,
+                    &mut dropped,
                 ) {
                     uplink.misses = 0;
                     uplink.healthy = true;
@@ -2424,31 +2697,15 @@ pub extern "C" fn tape_main(
                 }
             }
         }
-        let current_default = active_uplink.and_then(|index| {
-            uplinks[..parsed.dhcp_uplink_count]
-                .iter()
-                .flatten()
-                .find(|uplink| uplink.interface == index)
-                .map(|uplink| router_tape::DefaultRoute {
-                    nic: interfaces[index].nic,
-                    gateway: uplink.gateway,
-                })
-        }).or(parsed.default_route);
-        let active_index = active_uplink
-            .or_else(|| current_default.and_then(|route| {
-                interfaces[..interface_count].iter().position(|interface| interface.nic == route.nic)
-            }))
-            .unwrap_or(0);
-        let active_nic = interfaces[active_index].nic;
-        // Standby DHCP uplinks may share the active uplink's subnet. Exclude
-        // them from direct-route matching so that subnet never bypasses the
-        // health-selected active default route after a failover.
-        let routing_configs = routing_configs_for_active_uplink(
-            &configs,
-            interface_count,
-            &parsed.dhcp_uplinks,
+        let (current_default, active_nic, routing_configs) = compute_forwarding_context(
+            &uplinks,
             parsed.dhcp_uplink_count,
-            active_uplink.map(|index| interfaces[index].nic),
+            active_uplink,
+            parsed.default_route,
+            &interfaces,
+            interface_count,
+            &configs,
+            &parsed.dhcp_uplinks,
         );
         for ingress in 0..interface_count {
             if should_abort() == TAPE_EVENT_ABORT {
