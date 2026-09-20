@@ -116,6 +116,20 @@ struct UplinkHealth {
     misses: u8,
     healthy: bool,
     sequence: u16,
+    phase: HealthPhase,
+    deadline: u64,
+}
+
+/// Non-blocking health-probe state for one uplink. `Idle` means no probe is
+/// currently in flight (either none has started this cycle yet, or the
+/// previous one finished/timed out); `AwaitingArp`/`AwaitingIcmp` track which
+/// reply `advance_uplink_health` is still waiting to see, with `deadline`
+/// giving `expire_health_timeouts` a point at which to give up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HealthPhase {
+    Idle,
+    AwaitingArp,
+    AwaitingIcmp,
 }
 
 #[repr(u8)]
@@ -1464,245 +1478,125 @@ fn is_icmp_echo_reply(
     }
 
 #[allow(clippy::too_many_arguments)]
-fn poll_uplink_health(
-        health: &mut UplinkHealth,
-        target: Ipv4Address,
-        interfaces: &mut [RouterInterface; MAX_INTERFACES],
-        count: usize,
-        receive_buffer: &mut [u8; MAX_FRAME_LEN],
-        nic_send_at: NicSendAt,
-        nic_receive_at: NicReceiveAt,
-        should_abort: ShouldAbort,
-        ticks: Ticks,
-        max_frame_len: usize,
-        putc: Putc,
-        quiet: bool,
-        routing_configs: &[Option<InterfaceConfig>; MAX_INTERFACES],
-        default_route: Option<router_tape::DefaultRoute>,
-        active_nic: u32,
-        nat: &mut NatTable,
-        nat_enabled: bool,
-        forwards: &[Option<PortForward>; MAX_FORWARDS],
-        forward_count: usize,
-        arp_scratch_buffer: &mut [u8; MAX_FRAME_LEN],
-        transport_buffer: &mut [u8; MAX_FRAME_LEN],
-        ip_buffer: &mut [u8; MAX_FRAME_LEN],
-        output_buffer: &mut [u8; MAX_FRAME_LEN],
-        forwarded: &mut u32,
-        dropped: &mut u32,
-    ) -> bool {
-        // Every frame this function drains from a NIC ring while waiting on a
-        // probe reply must still be forwarded like the main loop would,
-        // rather than silently discarded: a health check that only recognizes
-        // ARP/ICMP traffic of its own and drops everything else would starve
-        // ordinary client traffic on every interface for up to
-        // `HEALTH_PROBE_TICKS` twice per configured uplink, every health
-        // cycle. This was a real, reproducible source of packet loss whenever
-        // more than one DHCP uplink (and therefore health polling) was
-        // configured, even though the same NIC showed no loss at all when
-        // used alone with no health target to poll.
-        #[allow(clippy::too_many_arguments)]
-        fn drain_and_forward(
-            index: usize,
-            length: usize,
-            interfaces: &mut [RouterInterface; MAX_INTERFACES],
-            count: usize,
-            receive_buffer: &[u8; MAX_FRAME_LEN],
-            putc: Putc,
-            quiet: bool,
-            routing_configs: &[Option<InterfaceConfig>; MAX_INTERFACES],
-            default_route: Option<router_tape::DefaultRoute>,
-            active_nic: u32,
-            nic_send_at: NicSendAt,
-            nic_receive_at: NicReceiveAt,
-            should_abort: ShouldAbort,
-            ticks: Ticks,
-            nat: &mut NatTable,
-            nat_enabled: bool,
-            forwards: &[Option<PortForward>; MAX_FORWARDS],
-            forward_count: usize,
-            arp_scratch_buffer: &mut [u8; MAX_FRAME_LEN],
-            transport_buffer: &mut [u8; MAX_FRAME_LEN],
-            ip_buffer: &mut [u8; MAX_FRAME_LEN],
-            output_buffer: &mut [u8; MAX_FRAME_LEN],
-            forwarded: &mut u32,
-            dropped: &mut u32,
-            max_frame_len: usize,
-        ) {
-            let frame = &receive_buffer[..min(length, MAX_FRAME_LEN)];
-            process_arp(&mut interfaces[index], frame, ticks(), nic_send_at, max_frame_len);
-            match forward_ipv4(
-                putc,
-                quiet,
-                index,
-                frame,
-                interfaces,
-                routing_configs,
-                count,
-                default_route,
-                active_nic,
-                nic_send_at,
-                nic_receive_at,
-                should_abort,
-                ticks,
-                nat,
-                nat_enabled,
-                forwards,
-                forward_count,
-                arp_scratch_buffer,
-                transport_buffer,
-                ip_buffer,
-                output_buffer,
-                max_frame_len,
-            ) {
-                ForwardResult::Forwarded => *forwarded += 1,
-                ForwardResult::Dropped => *dropped += 1,
-            }
-        }
+/// Starts one non-blocking health-probe round for every configured uplink:
+/// invalidates the previous cycle's gateway ARP entry (so a genuinely fresh
+/// answer is required, without disturbing any other cached entry on that
+/// interface -- see ArpCache::invalidate) and sends the ARP request, then
+/// arms a per-uplink deadline. It never waits for a reply itself; replies
+/// are recognized later, opportunistically, by advance_uplink_health as the
+/// ordinary per-ingress loop reads frames it would read anyway.
+fn start_health_round(
+    uplinks: &mut [Option<UplinkHealth>; MAX_INTERFACES],
+    dhcp_uplink_count: usize,
+    interfaces: &mut [RouterInterface; MAX_INTERFACES],
+    nic_send_at: NicSendAt,
+    ticks: Ticks,
+    max_frame_len: usize,
+) {
+    for uplink in uplinks[..dhcp_uplink_count].iter_mut().flatten() {
+        let interface = uplink.interface;
+        interfaces[interface].arp.invalidate(uplink.gateway);
+        let _ = send_arp_request(&interfaces[interface], uplink.gateway, nic_send_at, max_frame_len);
+        uplink.phase = HealthPhase::AwaitingArp;
+        uplink.deadline = ticks().wrapping_add(HEALTH_PROBE_TICKS);
+    }
+}
 
-        let interface = health.interface;
-        // Each probe requires a fresh gateway answer, not merely a still-valid
-        // cache entry from a previous cycle. Invalidate only the gateway's
-        // own entry, not the whole cache: this interface's ArpCache is also
-        // the one ordinary forwarding traffic through it consults, so
-        // wholesale clearing it here forced every other already-resolved
-        // destination on this interface to redo a full ARP resolution right
-        // after every health cycle -- and since resolve_mac only polls its
-        // own egress interface while blocked, that repeated re-resolution
-        // let other interfaces' rings back up, producing exactly the
-        // multi-second latency spikes this was found from.
-        interfaces[interface].arp.invalidate(health.gateway);
-        let _ = send_arp_request(&interfaces[interface], health.gateway, nic_send_at, max_frame_len);
-        let deadline = ticks().wrapping_add(HEALTH_PROBE_TICKS);
-        let mut gateway_mac = None;
-        while ticks().wrapping_sub(deadline) >= (1u64 << 63) {
-            if should_abort() == TAPE_EVENT_ABORT {
-                return false;
-            }
-            for index in 0..count {
-                let length = nic_receive_at(
-                    interfaces[index].nic,
-                    receive_buffer.as_mut_ptr() as u32,
-                    max_frame_len as u32,
-                ) as usize;
-                if length == 0 {
-                    continue;
-                }
-                drain_and_forward(
-                    index,
-                    length,
-                    interfaces,
-                    count,
-                    receive_buffer,
-                    putc,
-                    quiet,
-                    routing_configs,
-                    default_route,
-                    active_nic,
-                    nic_send_at,
-                    nic_receive_at,
-                    should_abort,
-                    ticks,
-                    nat,
-                    nat_enabled,
-                    forwards,
-                    forward_count,
-                    arp_scratch_buffer,
-                    transport_buffer,
-                    ip_buffer,
-                    output_buffer,
-                    forwarded,
-                    dropped,
-                    max_frame_len,
-                );
-            }
-            gateway_mac = interfaces[interface]
-                .arp
-                .lookup(health.gateway, ticks() as u32);
-            if gateway_mac.is_some() {
-                break;
-            }
+/// Fails any uplink whose current probe phase has run past its deadline
+/// with no reply. Called once per `'router` loop iteration, independent of
+/// whether any frame arrived, since an uplink that never answers at all
+/// would otherwise never time out. Returns whether any uplink's `healthy`
+/// flag changed, so the caller knows whether `active_uplink` needs
+/// recomputing.
+fn expire_health_timeouts(
+    uplinks: &mut [Option<UplinkHealth>; MAX_INTERFACES],
+    dhcp_uplink_count: usize,
+    ticks: Ticks,
+) -> bool {
+    let mut changed = false;
+    let now = ticks();
+    for uplink in uplinks[..dhcp_uplink_count].iter_mut().flatten() {
+        if uplink.phase == HealthPhase::Idle {
+            continue;
         }
-        let Some(gateway_mac) = gateway_mac else {
-            return false;
-        };
-        health.sequence = health.sequence.wrapping_add(1);
-        if !send_icmp_echo(
-            &interfaces[interface],
-            target,
-            gateway_mac,
-            health.sequence,
-            nic_send_at,
-            max_frame_len,
-        ) {
-            return false;
+        if now.wrapping_sub(uplink.deadline) < (1u64 << 63) {
+            continue;
         }
-        let deadline = ticks().wrapping_add(HEALTH_PROBE_TICKS);
-        while ticks().wrapping_sub(deadline) >= (1u64 << 63) {
-            if should_abort() == TAPE_EVENT_ABORT {
-                return false;
-            }
-            for index in 0..count {
-                let length = nic_receive_at(
-                    interfaces[index].nic,
-                    receive_buffer.as_mut_ptr() as u32,
-                    max_frame_len as u32,
-                ) as usize;
-                if length == 0 {
-                    continue;
-                }
-                if index == interface {
-                    // The interface being health-checked is also, in the
-                    // common failover setup, the active uplink itself: it
-                    // keeps carrying ordinary traffic the whole time its own
-                    // health probe is in flight. Only the probe's own echo
-                    // reply is consumed here; anything else on this same
-                    // interface must still be forwarded via drain_and_forward
-                    // below, exactly like every other interface -- an earlier
-                    // version of this branch `continue`d without forwarding,
-                    // silently dropping real replies arriving on the active
-                    // uplink during this ~HEALTH_PROBE_TICKS window every
-                    // health cycle. process_arp runs twice for this frame
-                    // (once here, once inside drain_and_forward) when it
-                    // falls through; that second call is a harmless,
-                    // idempotent re-insert into the same ARP cache entry.
-                    let frame = &receive_buffer[..min(length, MAX_FRAME_LEN)];
-                    process_arp(&mut interfaces[interface], frame, ticks(), nic_send_at, max_frame_len);
-                    if is_icmp_echo_reply(frame, &interfaces[interface], target, health.sequence) {
-                        return true;
+        uplink.phase = HealthPhase::Idle;
+        uplink.misses = uplink.misses.saturating_add(1);
+        if uplink.misses >= HEALTH_MISSED_CYCLES && uplink.healthy {
+            uplink.healthy = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Gives every uplink currently waiting on a probe reply a look at the
+/// frame the ordinary per-ingress loop just read for `ingress` -- the same
+/// frame `process_arp`/`forward_ipv4` are about to process anyway, so this
+/// adds no extra NIC reads and never blocks. An uplink in `AwaitingArp`
+/// only needs `interfaces[ingress].arp` to have been populated by the
+/// `process_arp` call the main loop already makes on every frame; an
+/// uplink in `AwaitingIcmp` inspects this frame directly for its expected
+/// echo reply. Returns whether any uplink's `healthy` flag changed.
+#[allow(clippy::too_many_arguments)]
+fn advance_uplink_health(
+    uplinks: &mut [Option<UplinkHealth>; MAX_INTERFACES],
+    dhcp_uplink_count: usize,
+    ingress: usize,
+    frame: &[u8],
+    interfaces: &mut [RouterInterface; MAX_INTERFACES],
+    target: Ipv4Address,
+    nic_send_at: NicSendAt,
+    ticks: Ticks,
+    max_frame_len: usize,
+) -> bool {
+    let mut changed = false;
+    for uplink in uplinks[..dhcp_uplink_count].iter_mut().flatten() {
+        if uplink.interface != ingress {
+            continue;
+        }
+        match uplink.phase {
+            HealthPhase::Idle => {}
+            HealthPhase::AwaitingArp => {
+                if let Some(gateway_mac) = interfaces[ingress].arp.lookup(uplink.gateway, ticks() as u32) {
+                    uplink.sequence = uplink.sequence.wrapping_add(1);
+                    if send_icmp_echo(
+                        &interfaces[ingress],
+                        target,
+                        gateway_mac,
+                        uplink.sequence,
+                        nic_send_at,
+                        max_frame_len,
+                    ) {
+                        uplink.phase = HealthPhase::AwaitingIcmp;
+                        uplink.deadline = ticks().wrapping_add(HEALTH_PROBE_TICKS);
+                    } else {
+                        uplink.phase = HealthPhase::Idle;
+                        uplink.misses = uplink.misses.saturating_add(1);
+                        if uplink.misses >= HEALTH_MISSED_CYCLES && uplink.healthy {
+                            uplink.healthy = false;
+                            changed = true;
+                        }
                     }
                 }
-                drain_and_forward(
-                    index,
-                    length,
-                    interfaces,
-                    count,
-                    receive_buffer,
-                    putc,
-                    quiet,
-                    routing_configs,
-                    default_route,
-                    active_nic,
-                    nic_send_at,
-                    nic_receive_at,
-                    should_abort,
-                    ticks,
-                    nat,
-                    nat_enabled,
-                    forwards,
-                    forward_count,
-                    arp_scratch_buffer,
-                    transport_buffer,
-                    ip_buffer,
-                    output_buffer,
-                    forwarded,
-                    dropped,
-                    max_frame_len,
-                );
+            }
+            HealthPhase::AwaitingIcmp => {
+                if is_icmp_echo_reply(frame, &interfaces[ingress], target, uplink.sequence) {
+                    uplink.phase = HealthPhase::Idle;
+                    uplink.misses = 0;
+                    if !uplink.healthy {
+                        uplink.healthy = true;
+                        changed = true;
+                    }
+                }
             }
         }
-        false
     }
+    changed
+}
+
 
 /// Derives the active default route, active NIC, and DHCP-uplink-filtered
 /// routing table from the current failover state. Shared by the health-poll
@@ -2325,7 +2219,7 @@ pub extern "C" fn tape_main(
         }
         interfaces[interface_count] = RouterInterface { nic: *nic, address: lease.address, netmask: lease.subnet_mask, mac: own_mac, arp: ArpCache::new() };
         configs[interface_count] = Some(InterfaceConfig { nic: *nic, address: lease.address, netmask: lease.subnet_mask });
-        uplinks[priority] = Some(UplinkHealth { interface: interface_count, gateway: lease.router, misses: 0, healthy: true, sequence: 0 });
+        uplinks[priority] = Some(UplinkHealth { interface: interface_count, gateway: lease.router, misses: 0, healthy: true, sequence: 0, phase: HealthPhase::Idle, deadline: 0 });
         interface_count += 1;
         if dns_server_count == 0 && priority == 0 {
             dns_server_count = lease.dns_server_count;
@@ -2644,79 +2538,18 @@ pub extern "C" fn tape_main(
             && ticks().wrapping_sub(last_health_poll) >= HEALTH_POLL_TICKS
         {
             last_health_poll = ticks();
-            let previous = active_uplink;
-            // Computed from the pre-poll active uplink so any ordinary
-            // traffic seen while probing is forwarded exactly as the main
-            // loop below would forward it, instead of being silently
-            // dropped for the whole probe window.
-            let (pre_default, pre_active_nic, pre_routing_configs) = compute_forwarding_context(
-                &uplinks,
+            start_health_round(
+                &mut uplinks,
                 parsed.dhcp_uplink_count,
-                active_uplink,
-                parsed.default_route,
-                &interfaces,
-                interface_count,
-                &configs,
-                &parsed.dhcp_uplinks,
+                &mut interfaces,
+                nic_send_at,
+                ticks,
+                max_frame_len,
             );
-            for uplink in uplinks[..parsed.dhcp_uplink_count].iter_mut().flatten() {
-                let target = parsed.health_target.unwrap();
-                if poll_uplink_health(
-                    uplink,
-                    target,
-                    &mut interfaces,
-                    interface_count,
-                    // The per-ingress `receive_buffer` below is unused until
-                    // the ordinary forwarding loop further down runs later
-                    // this same iteration, so it is safely reused here rather
-                    // than adding a whole extra MAX_FRAME_LEN array to this
-                    // already large, stack-budget-constrained tape function.
-                    &mut receive_buffer,
-                    nic_send_at,
-                    nic_receive_at,
-                    should_abort,
-                    ticks,
-                    max_frame_len,
-                    putc,
-                    parsed.quiet,
-                    &pre_routing_configs,
-                    pre_default,
-                    pre_active_nic,
-                    &mut nat,
-                    parsed.nat,
-                    &parsed.forwards,
-                    parsed.forward_count,
-                    &mut arp_receive_buffer,
-                    &mut transport_buffer,
-                    &mut ip_buffer,
-                    &mut output_buffer,
-                    &mut forwarded,
-                    &mut dropped,
-                ) {
-                    uplink.misses = 0;
-                    uplink.healthy = true;
-                } else {
-                    uplink.misses = uplink.misses.saturating_add(1);
-                    if uplink.misses >= HEALTH_MISSED_CYCLES {
-                        uplink.healthy = false;
-                    }
-                }
-            }
-            active_uplink = uplinks[..parsed.dhcp_uplink_count]
-                .iter()
-                .flatten()
-                .find(|uplink| uplink.healthy)
-                .map(|uplink| uplink.interface);
-            if active_uplink != previous {
-                match active_uplink {
-                    Some(index) => {
-                        print_bytes(putc, b"Uplink failover: active NIC ");
-                        print_u32(putc, interfaces[index].nic + 1);
-                        print_bytes(putc, b". Existing NAT flows may break.\n");
-                    }
-                    None => print_bytes(putc, b"Uplink failover: no healthy DHCP lease. Existing NAT flows may break.\n"),
-                }
-            }
+        }
+        let mut health_changed = false;
+        if parsed.health_target.is_some() {
+            health_changed |= expire_health_timeouts(&mut uplinks, parsed.dhcp_uplink_count, ticks);
         }
         let (current_default, active_nic, routing_configs) = compute_forwarding_context(
             &uplinks,
@@ -2783,6 +2616,19 @@ pub extern "C" fn tape_main(
                 nic_send_at,
                 max_frame_len,
             );
+            if let Some(target) = parsed.health_target {
+                health_changed |= advance_uplink_health(
+                    &mut uplinks,
+                    parsed.dhcp_uplink_count,
+                    ingress,
+                    &receive_buffer[..length],
+                    &mut interfaces,
+                    target,
+                    nic_send_at,
+                    ticks,
+                    max_frame_len,
+                );
+            }
             match forward_ipv4(
                 putc,
                 parsed.quiet,
@@ -2809,6 +2655,24 @@ pub extern "C" fn tape_main(
             ) {
                 ForwardResult::Forwarded => forwarded += 1,
                 ForwardResult::Dropped => dropped += 1,
+            }
+        }
+        if health_changed {
+            let previous = active_uplink;
+            active_uplink = uplinks[..parsed.dhcp_uplink_count]
+                .iter()
+                .flatten()
+                .find(|uplink| uplink.healthy)
+                .map(|uplink| uplink.interface);
+            if active_uplink != previous {
+                match active_uplink {
+                    Some(index) => {
+                        print_bytes(putc, b"Uplink failover: active NIC ");
+                        print_u32(putc, interfaces[index].nic + 1);
+                        print_bytes(putc, b". Existing NAT flows may break.\n");
+                    }
+                    None => print_bytes(putc, b"Uplink failover: no healthy DHCP lease. Existing NAT flows may break.\n"),
+                }
             }
         }
     }
