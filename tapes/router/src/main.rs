@@ -107,6 +107,19 @@ struct RouterInterface {
     netmask: Ipv4Address,
     mac: MacAddress,
     arp: ArpCache<ARP_CACHE_SIZE>,
+    // The active uplink health round's own confirmed (ip, mac) pair for this
+    // interface's default gateway, held outside the general ArpCache. That
+    // shared cache has only ARP_CACHE_SIZE entries and inserts one for every
+    // ARP frame this interface merely observes -- on a busy real-world LAN
+    // segment (unrelated neighbors' broadcasts, gratuitous ARPs, ...) that
+    // was enough to evict the gateway's own entry via ordinary LRU pressure
+    // between health rounds, forcing forward_ipv4's very next off-subnet
+    // packet into a fresh, blocking resolve_mac call -- reintroducing the
+    // same multi-second stalls health's non-blocking redesign was meant to
+    // eliminate, confirmed on real hardware. Pinning the gateway's own MAC
+    // here, refreshed every health round by advance_uplink_health, keeps it
+    // immune to that unrelated cache churn.
+    gateway_pin: Option<(Ipv4Address, MacAddress)>,
 }
 
 #[derive(Clone, Copy)]
@@ -758,6 +771,7 @@ impl RouterInterface {
             netmask: Ipv4Address::UNSPECIFIED,
             mac: MacAddress::ZERO,
             arp: ArpCache::new(),
+            gateway_pin: None,
         }
     }
 }
@@ -1597,6 +1611,7 @@ fn advance_uplink_health(
             HealthPhase::Idle => {}
             HealthPhase::AwaitingArp => {
                 if let Some(gateway_mac) = is_arp_reply_for(frame, uplink.gateway) {
+                    interfaces[ingress].gateway_pin = Some((uplink.gateway, gateway_mac));
                     uplink.sequence = uplink.sequence.wrapping_add(1);
                     if send_icmp_echo(
                         &interfaces[ingress],
@@ -1735,6 +1750,16 @@ fn resolve_mac(
     receive_buffer: &mut [u8; MAX_FRAME_LEN],
     max_frame_len: usize,
 ) -> Option<MacAddress> {
+    // Check the pinned gateway MAC (see RouterInterface::gateway_pin) before
+    // the general ArpCache: it is refreshed every health round and immune
+    // to that cache's own LRU eviction from unrelated ARP traffic, so this
+    // is the common, fast, non-blocking path for the default route's next
+    // hop on every ordinary forwarded packet.
+    if let Some((pinned_ip, pinned_mac)) = interfaces[egress].gateway_pin {
+        if pinned_ip == target {
+            return Some(pinned_mac);
+        }
+    }
     let now = ticks();
     if let Some(mac) = interfaces[egress].arp.lookup(target, now as u32) {
         return Some(mac);
@@ -2253,7 +2278,7 @@ pub extern "C" fn tape_main(
             print_bytes(putc, b"Router cannot start: DHCP uplink supplied no gateway.\n");
             return;
         }
-        interfaces[interface_count] = RouterInterface { nic: *nic, address: lease.address, netmask: lease.subnet_mask, mac: own_mac, arp: ArpCache::new() };
+        interfaces[interface_count] = RouterInterface { nic: *nic, address: lease.address, netmask: lease.subnet_mask, mac: own_mac, arp: ArpCache::new(), gateway_pin: None };
         configs[interface_count] = Some(InterfaceConfig { nic: *nic, address: lease.address, netmask: lease.subnet_mask });
         uplinks[priority] = Some(UplinkHealth { interface: interface_count, gateway: lease.router, misses: 0, healthy: true, sequence: 0, phase: HealthPhase::Idle, deadline: 0 });
         interface_count += 1;
@@ -2278,6 +2303,7 @@ pub extern "C" fn tape_main(
             netmask: config.netmask,
             mac: MacAddress::new(mac),
             arp: ArpCache::new(),
+            gateway_pin: None,
         };
         configs[interface_count] = Some(*config);
         interface_count += 1;
