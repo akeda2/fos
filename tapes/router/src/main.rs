@@ -1451,6 +1451,25 @@ fn send_icmp_echo(
             && nic_send_at(interface.nic, frame.as_ptr() as u32, length as u32) != 0
     }
 
+/// Recognizes a genuinely fresh ARP reply from `target`, without touching
+/// any interface's ArpCache. `advance_uplink_health`'s `AwaitingArp` phase
+/// uses this instead of a cache lookup so a health round's freshness check
+/// never has to invalidate the same cache entry ordinary forwarding relies
+/// on for that same gateway -- see `start_health_round`'s doc comment for
+/// why invalidating it was a real bug.
+fn is_arp_reply_for(frame: &[u8], target: Ipv4Address) -> Option<MacAddress> {
+    let ethernet = EthernetFrame::parse(frame).ok()?;
+    if ethernet.ethertype != ETHERTYPE_ARP {
+        return None;
+    }
+    let packet = ArpPacket::parse(ethernet.payload).ok()?;
+    if packet.operation == ArpOperation::Reply && packet.sender_protocol == target {
+        Some(packet.sender_hardware)
+    } else {
+        None
+    }
+}
+
 fn is_icmp_echo_reply(
         frame: &[u8],
         interface: &RouterInterface,
@@ -1479,12 +1498,26 @@ fn is_icmp_echo_reply(
 
 #[allow(clippy::too_many_arguments)]
 /// Starts one non-blocking health-probe round for every configured uplink:
-/// invalidates the previous cycle's gateway ARP entry (so a genuinely fresh
-/// answer is required, without disturbing any other cached entry on that
-/// interface -- see ArpCache::invalidate) and sends the ARP request, then
-/// arms a per-uplink deadline. It never waits for a reply itself; replies
-/// are recognized later, opportunistically, by advance_uplink_health as the
-/// ordinary per-ingress loop reads frames it would read anyway.
+/// sends a fresh ARP request for the gateway, then arms a per-uplink
+/// deadline. It never waits for a reply itself; replies are recognized
+/// later, opportunistically, by advance_uplink_health as the ordinary
+/// per-ingress loop reads frames it would read anyway.
+///
+/// This deliberately does *not* invalidate the interface's ArpCache entry
+/// for the gateway first, even though doing so once seemed like the right
+/// way to force a "genuinely fresh" answer (see ArpCache::invalidate). The
+/// gateway is also the default-route next hop ordinary forwarded traffic
+/// resolves through resolve_mac -- invalidating its one shared cache entry
+/// every health-poll cycle created a race: if a real packet needed that
+/// same MAC before this round's own reply repopulated the cache,
+/// resolve_mac would block the whole router for up to ARP_TIMEOUT_TICKS
+/// waiting for a fresh reply, reintroducing exactly the multi-second
+/// stalls the non-blocking redesign was meant to eliminate (confirmed on
+/// real hardware as periodic ~2.5s ping spikes aligned with the health
+/// cycle). advance_uplink_health now verifies freshness by recognizing
+/// this round's own ARP reply frame directly (`is_arp_reply_for`) instead
+/// of relying on a cache lookup, so it needs no shared cache entry evicted
+/// at all.
 fn start_health_round(
     uplinks: &mut [Option<UplinkHealth>; MAX_INTERFACES],
     dhcp_uplink_count: usize,
@@ -1495,7 +1528,6 @@ fn start_health_round(
 ) {
     for uplink in uplinks[..dhcp_uplink_count].iter_mut().flatten() {
         let interface = uplink.interface;
-        interfaces[interface].arp.invalidate(uplink.gateway);
         let _ = send_arp_request(&interfaces[interface], uplink.gateway, nic_send_at, max_frame_len);
         uplink.phase = HealthPhase::AwaitingArp;
         uplink.deadline = ticks().wrapping_add(HEALTH_PROBE_TICKS);
@@ -1538,10 +1570,12 @@ fn expire_health_timeouts(
 /// frame the ordinary per-ingress loop just read for `ingress` -- the same
 /// frame `process_arp`/`forward_ipv4` are about to process anyway, so this
 /// adds no extra NIC reads and never blocks. An uplink in `AwaitingArp`
-/// only needs `interfaces[ingress].arp` to have been populated by the
-/// `process_arp` call the main loop already makes on every frame; an
-/// uplink in `AwaitingIcmp` inspects this frame directly for its expected
-/// echo reply. Returns whether any uplink's `healthy` flag changed.
+/// recognizes this round's own reply directly via `is_arp_reply_for`,
+/// deliberately not via `interfaces[ingress].arp`'s cache (see
+/// `start_health_round`'s doc comment for why sharing that cache entry with
+/// ordinary forwarding caused real stalls); an uplink in `AwaitingIcmp`
+/// inspects this frame directly for its expected echo reply. Returns
+/// whether any uplink's `healthy` flag changed.
 #[allow(clippy::too_many_arguments)]
 fn advance_uplink_health(
     uplinks: &mut [Option<UplinkHealth>; MAX_INTERFACES],
@@ -1562,7 +1596,7 @@ fn advance_uplink_health(
         match uplink.phase {
             HealthPhase::Idle => {}
             HealthPhase::AwaitingArp => {
-                if let Some(gateway_mac) = interfaces[ingress].arp.lookup(uplink.gateway, ticks() as u32) {
+                if let Some(gateway_mac) = is_arp_reply_for(frame, uplink.gateway) {
                     uplink.sequence = uplink.sequence.wrapping_add(1);
                     if send_icmp_echo(
                         &interfaces[ingress],
