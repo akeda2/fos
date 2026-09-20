@@ -34,6 +34,7 @@ EXPECTED_COMMON = (
     b"Masking the legacy 8259 PIC and installing a flat 32-bit GDT...",
     b"GDT loaded, CR0.PE set. Far-jumping into 32-bit protected mode",
     b"Kernel: protected-mode Rust entry reached.",
+    b"Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO;",
     b"Physical memory: ",
     b"Interrupts enabled: IDT loaded, PIC remapped to 0x20/0x28,",
     b"PS/2 keyboard initialized.",

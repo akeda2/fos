@@ -106,7 +106,8 @@ at 100 Hz. A protocol library receives the callback explicitly so unit tests
 can replace it with a deterministic fake clock.
 
 The callbacks are a convention, not a protection boundary. Tapes run in ring
-0 with no paging or memory isolation and can still touch hardware directly.
+0 with only the kernel's supervisor identity map, not a private address space,
+and can still touch hardware directly.
 The convention keeps ordinary networking examples focused on protocol logic
 instead of duplicating either NIC driver.
 

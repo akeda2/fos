@@ -8,7 +8,7 @@ It is not a general-purpose OS and is intentionally incomplete. The current
 milestone demonstrates a custom BIOS loader, memory-map discovery, a
 Rust/assembly handoff, VGA and serial consoles, an interrupt-driven PS/2
 keyboard and PIT timer, a tiny physical-frame allocator, a small FOSFS
-filesystem, and a small command prompt -- all deliberately narrated with
+filesystem, supervisor-only identity paging, and a small command prompt -- all deliberately narrated with
 verbose status output at every step, since this project exists to be read
 and explained, not just to run.
 
@@ -29,7 +29,9 @@ and explained, not just to run.
    the Rust entry point, passing a versioned boot-information record at
    physical address `0x5000`.
 5. The Rust kernel clears BSS, validates that record, initializes its VGA/COM1
-   console, builds its physical-frame bitmap from the E820 map, sets up its
+   console, enables a supervisor-only identity map for the low physical range
+   and PCI MMIO, then
+   builds its physical-frame bitmap from the E820 map. The shell sets up its
    own IDT and remaps the PIC (arming the PIT timer on IRQ0 and the PS/2
    keyboard on IRQ1), then runs the prompt. Each of these steps prints what
    it just configured and why.
@@ -37,8 +39,9 @@ and explained, not just to run.
 The message `BIOS services end now` marks the important transition: code after
 that point must not call BIOS interrupts directly from protected mode. The one
 narrow exception is `kernel/src/disk.rs`'s trampoline, which briefly restores
-the real-mode IVT and BIOS-conventional PIC mapping around each individual
-disk sector transfer -- see "Disk access and FOSFS" below.
+the real-mode IVT and BIOS-conventional PIC mapping, and temporarily disables
+paging, around each individual disk sector transfer -- see "Disk access and
+FOSFS" below.
 
 Enabling A20 (`enable_a20` in `boot/stage2.S`, duplicated in `boot/netrom.S`
 for the same reason described under "Booting from a NIC ROM" below) tries
@@ -213,18 +216,23 @@ timer ticks are captured by minimal ISRs and drained by the shell loop
 between prompts; see `kernel/src/interrupts.rs`. A small bitmap-based
 physical-frame allocator (`kernel/src/pmem.rs`) tracks which 4 KiB frames
 the E820 map reports as usable, reserving everything below the kernel's
-own low-memory
-region. There is no paging yet -- this only tracks free/used frames,
-exposed through `pmem`/`palloc`/`pfree`.
+own low-memory region. The kernel stack has a low-end canary checked from IRQ0,
+so an observed overflow halts with a diagnostic rather than continuing with
+known-corrupted state. `kernel/src/paging.rs` uses 4 MiB pages to identity-map
+the low 2 GiB physical range and the conventional high PCI-MMIO window as
+supervisor-only writable pages; the unmapped middle range turns many stray
+high pointers into diagnosable page faults. This is paging infrastructure, not
+userspace protection: all current code and tapes still execute in ring 0.
 
 ## Disk access and FOSFS
 
 The kernel has no direct access to BIOS interrupts while in protected mode. For
 each validated disk operation, it calls the stage-two real-mode trampoline. The
-trampoline saves the protected-mode stack, transitions through a 16-bit
-protected-mode GDT descriptor into real mode, invokes BIOS EDD (`INT 13h`,
-extended read/write) for **exactly one sector**, then restores protected mode
-and returns an explicit status. Because the kernel's own IDT and PIC remap
+trampoline saves the protected-mode stack, transitions through a 16-bit protected-mode GDT descriptor into real mode,
+temporarily clearing `CR0.PG` as well as `CR0.PE`, invokes BIOS EDD (`INT
+13h`, extended read/write) for **exactly one sector**, then restores the
+caller's original protected-mode/paging state and returns an explicit status.
+Because the kernel's own IDT and PIC remap
 would otherwise break genuine BIOS real-mode interrupt handling (the BDA tick
 counter BIOS's disk-timeout logic depends on stops advancing), the kernel
 briefly restores the traditional real-mode IVT and BIOS-conventional PIC
@@ -307,10 +315,10 @@ because NIC register layouts are vendor-specific.
 
 Unlike the UART, an Ethernet controller does not hand over bytes one at a
 time via port I/O: it moves whole frames itself, via DMA, into and out of
-buffers whose physical address the driver hands it ahead of time. This
-kernel has no paging, so physical and virtual addresses are identical and
-those buffers can be read and written directly through raw pointers, but
-they must still be real, physically contiguous memory the card can reach --
+buffers whose physical address the driver hands it ahead of time. The
+kernel's supervisor identity map keeps physical and virtual addresses equal
+for those buffers, so they can be read and written directly through raw
+pointers, but they must still be real, physically contiguous memory the card can reach --
 so the first use of `nic` allocates the physically contiguous DMA state required
 by every initialized backend through `pmem::allocate_contiguous` and never
 frees it. The RTL8139 uses a receive ring and transmit buffers; the
@@ -1213,8 +1221,9 @@ automatically selects or writes a host block device.
 
 ## Current boundaries
 
-This milestone uses one CPU, no paging, heap allocation, userspace, or
-scheduler. It has FOSFS (a deliberately tiny flat multi-sector filesystem, not a
+This milestone uses one CPU, no heap allocation, userspace, or scheduler. It
+has supervisor-only identity paging, but no per-process address spaces or
+memory isolation. It has FOSFS (a deliberately tiny flat multi-sector filesystem, not a
 general-purpose one), interrupt-driven IRQ0/IRQ1 handling for the timer and
 keyboard, and three polling-mode PCI network card drivers (RTL8139,
 selected 3C905 variants, and Intel e1000, with raw frame access in the kernel and

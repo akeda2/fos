@@ -5,7 +5,8 @@ A "tape" is the smallest possible fos program: a tiny freestanding ELF32
 the shell's loader. The current image region is the fixed 4 MiB physical area
 (`pmem::TAPE_BASE`, `0x100000`); legacy raw-flat binaries remain accepted
 while older tapes are modernized. No
-filesystem, no process table, no built-in heap, no paging -- just your
+filesystem, no process table, no built-in heap, and no per-tape memory
+isolation -- just your
 code, a stack it borrows from the
 kernel, and a handful of function pointers the kernel hands you to talk
 to the outside world (including, if you need it, a way to borrow memory

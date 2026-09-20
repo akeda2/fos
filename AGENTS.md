@@ -24,10 +24,12 @@ that obscure hardware behavior.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
   low-memory kernel region through `0x40000`; do not place loader, boot-info,
   or disk-trampoline data there.
-- `kernel/src/entry.S` reserves a 32 KiB kernel stack. Tapes run nested inside
-  shell calls on that stack, so fixed packet/state buffers must leave headroom
-  for the surrounding `term net` call chain; do not grow tape-local arrays
-  casually without checking the stack budget.
+- `kernel/src/entry.S` reserves a 32 KiB kernel stack with a low-end canary.
+  `kernel/src/stack.rs` arms it after BSS initialization and IRQ0 checks it,
+  halting on an observed overflow before known-corrupted state continues.
+  Tapes run nested inside shell calls on that stack, so fixed packet/state
+  buffers must leave headroom for the surrounding `term net` call chain; do
+  not grow tape-local arrays casually without checking the stack budget.
 - The packed version-3 `BootInfo` at physical `0x5000` is the loader/kernel ABI;
   its disk geometry fields are 64-bit so GPT-discovered LBAs can survive the
   boot handoff.
@@ -39,14 +41,20 @@ that obscure hardware behavior.
   Because the trampoline drops into real mode, and the kernel's own IDT/PIC
   remap would otherwise break BIOS's real-mode interrupt handling, `transfer`
   briefly restores the real-mode IVT (`IDTR` base 0) and the BIOS-conventional
-  PIC vector mapping around each individual BIOS call, then switches back.
+  PIC vector mapping around each individual BIOS call, temporarily disables
+  paging for that real-mode transition, then switches back.
 - `kernel/src/interrupts.rs` builds a 256-entry IDT (only IRQ0/IRQ1 gates
   populated), remaps the 8259 PIC clear of the CPU exception range, arms the
   PIT at 100 Hz, and services the timer/keyboard IRQs with minimal
   `x86-interrupt` ABI handlers. Input is interrupt-driven, not polled.
 - `kernel/src/pmem.rs` is a small bitmap-based physical-frame allocator (4 KiB
   frames) built from the E820 map; it reserves everything below the kernel's
-  own low-memory region. There is no paging.
+  own low-memory region.
+- `kernel/src/paging.rs` enables 4 MiB, supervisor-only identity mappings for
+  the first 2 GiB and the high PCI MMIO window. This retains physical-pointer
+  compatibility for DMA and the BIOS trampoline while leaving an unmapped
+  middle range for useful page-fault diagnostics; it is not userspace
+  isolation.
 - `kernel/src/fosfs.rs` implements FOSFS version 3, a deliberately small
   flat custom filesystem: one superblock, eight directory sectors, 64 fixed
   64-byte entries, 64-bit contiguous multi-sector extents, and bounded
@@ -105,6 +113,7 @@ fixed address below `0x40000`, and update it in the same change that adds one:
 | `0x500`-`0x510` | `stage2.S` (`verify_a20`) | Two probe bytes used to detect whether the A20 line is enabled. |
 | `0x600`-`0x613` | `netrom.S` | Scratch RAM for state a shadowed (read-only) option ROM cannot mutate in place: computed ROM segment/physical base, serial-availability flag, and the GDT/protected-entry descriptors used to enter protected mode. |
 | `0x5000` | `stage2.S`, `netrom.S`, `kernel/` | The packed `BootInfo` struct: the loader/kernel ABI. |
+| `0x5400`-`0x5447` | `stage2.S` BIOS disk trampoline | One EDD request/DAP plus saved protected-mode stack pointer and CR0, used while temporarily entering real mode. |
 | `0x7a00` | `stage2.S`, `netrom.S` | Real-mode stack pointer during boot. |
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
@@ -1865,7 +1874,8 @@ section above.
 
 ## Deliberately deferred work
 
-- Paging, heap allocation, filesystems beyond FOSFS, userspace, scheduling,
+- Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
+  userspace, scheduling,
   native USB, further hardware IRQ drivers beyond the timer/keyboard, robust
   fault recovery, any protocol above raw Ethernet frames (no ARP, no IPv4,
   no sockets), and support for NIC families beyond the current RTL8139,

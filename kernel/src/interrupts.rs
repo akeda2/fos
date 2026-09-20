@@ -342,6 +342,31 @@ fn report_exception(vector: u8, error_code: Option<u32>, frame: &InterruptStackF
     let name = EXCEPTION_NAMES[usize::from(vector)];
     let instruction_pointer = frame.instruction_pointer;
     let code_segment = frame.code_segment;
+    if vector == 14 {
+        // The CPU always supplies an error code for #PF; retain a harmless
+        // fallback so this diagnostic path can never panic recursively.
+        let code = error_code.unwrap_or(0);
+        let address = crate::paging::fault_address();
+        let cause = if code & 1 == 0 {
+            "non-present mapping"
+        } else {
+            "protection violation"
+        };
+        let access = if code & (1 << 1) == 0 {
+            "read"
+        } else {
+            "write"
+        };
+        let privilege = if code & (1 << 2) == 0 {
+            "supervisor"
+        } else {
+            "user"
+        };
+        crate::println!(
+            "\nPAGE FAULT at virtual address 0x{address:08x}: {cause} on {privilege} {access}, error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
+        );
+        crate::arch::x86::halt_forever();
+    }
     match error_code {
         Some(code) => crate::println!(
             "\nCPU EXCEPTION {vector} ({name}), error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
@@ -451,6 +476,12 @@ extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
     unsafe {
         TIMER_TICKS += 1;
         TIMER_IRQ_COUNT += 1;
+    }
+    if !crate::stack::is_intact() {
+        crate::println!(
+            "\nKERNEL STACK OVERFLOW: the low-end canary was overwritten.\nHalting before corrupted kernel state can continue."
+        );
+        crate::arch::x86::halt_forever();
     }
     send_eoi(TIMER_VECTOR);
 }

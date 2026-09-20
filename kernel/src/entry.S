@@ -25,6 +25,12 @@ _start:
 
 .section .bss
 .align 16
+.global kernel_stack_canary
+kernel_stack_canary:
+    # `stack.rs` arms and IRQ0 checks this tripwire. Keep it immediately
+    # below the downward-growing kernel stack so an overflow damages it first.
+    .skip 16
+.global kernel_stack
 kernel_stack:
     # Networking tapes can run nested inside `term net` and borrow this
     # stack for their fixed packet buffers and TCP state.  Keep enough

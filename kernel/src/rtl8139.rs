@@ -8,11 +8,11 @@
 //! Unlike the UART, an Ethernet controller does not hand bytes over one
 //! at a time via port I/O: it moves whole frames itself, via DMA, into
 //! and out of buffers whose *physical* address the driver hands it ahead
-//! of time. There is no paging in this kernel, so physical and virtual
-//! addresses are identical and those buffers can be read/written directly
-//! through raw pointers -- but they must be actual memory the card can
-//! reach, which is why this driver asks `pmem` for real physical frames
-//! rather than using `static` kernel buffers.
+//! of time. The kernel's first paging configuration identity-maps DMA memory,
+//! so these physical addresses remain usable as raw-pointer addresses. They
+//! must still be actual memory the card can reach, which is why this driver
+//! asks `pmem` for real physical frames rather than using `static` kernel
+//! buffers.
 //!
 //! This driver only implements what is needed to send and receive raw
 //! Ethernet frames by polling; it does not touch the card's interrupt

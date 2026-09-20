@@ -3,8 +3,10 @@
 //! It builds a fixed-size bitmap (one bit per 4 KiB frame) from the E820
 //! memory map the loader collected, marks everything below the reserved
 //! low-memory kernel region (see `linker.ld`, `__kernel_end < 0x40000`) as
-//! permanently unavailable, and hands out/reclaims individual frames. There
-//! is no paging here yet -- this only tracks which physical frames are free.
+//! permanently unavailable, and hands out/reclaims individual frames.
+//! `paging.rs` maps those physical frames into the current identity-mapped
+//! supervisor address space; this module deliberately remains concerned only
+//! with ownership, not virtual-address translation.
 
 use crate::boot_info::{BootInfo, MemoryRegion, read_u32, read_u64};
 

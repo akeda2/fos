@@ -1522,9 +1522,9 @@ fn handle_incoming_chat_frame(
 /// doc comment) plus the tape's exact byte length. `None` until `tape load
 /// disk`/`tape load net` succeeds; loading a new tape simply overwrites the
 /// fixed region in place, so there's no per-tape frame bookkeeping to free.
-/// There is no paging in this kernel, so this physical address doubles as
-/// a directly usable pointer -- the same convention `rtl8139.rs`'s own DMA
-/// buffers rely on.
+/// The current supervisor identity map keeps this physical address directly
+/// usable as a pointer -- the same convention `rtl8139.rs`'s own DMA buffers
+/// rely on.
 static mut TAPE: Option<(u32, u32)> = None;
 static mut TAPE_ENTRY: u32 = 0;
 static mut TAPE_ELF: bool = false;
@@ -1763,16 +1763,13 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-/// Executes the loaded tape: a bare `call` to its first byte, in ring 0,
-/// on the kernel's own stack, with no memory protection whatsoever -- this
-/// kernel has no userspace or paging (see "Deliberately deferred work" in
-/// AGENTS.md), so a tape is trusted exactly as much as any other kernel
-/// code. A tape is a plain flat binary (the same convention the kernel
-/// itself is loaded and entered with, see `linker.ld`/`boot/stage2.S`): if
-/// it ends with a near `ret`, control returns cleanly to this shell;
-/// if it hangs, faults, or corrupts kernel state, there is no recovery --
-/// a reset or power-cycle is required, exactly as with any other
-/// unrecoverable fault this kernel reports.
+/// Executes a loaded tape's validated ELF entry point (or the image base for
+/// the legacy raw-flat fallback) in ring 0 on the kernel's own stack. The
+/// current paging setup is supervisor-only identity mapping, not isolation,
+/// so a tape remains trusted exactly as much as any other kernel code. If it
+/// ends with a near `ret`, control returns cleanly to this shell; if it hangs,
+/// faults, or corrupts kernel state, there is no recovery -- a reset or
+/// power-cycle is required, exactly as with any other unrecoverable fault.
 ///
 /// Called as `extern "C" fn(putc: extern "C" fn(u32), should_abort: extern
 /// "C" fn() -> u32, alloc: extern "C" fn(u32) -> u32, free: extern "C"
@@ -1783,9 +1780,12 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 /// nic_count: extern "C" fn() -> u32, nic_mac_at: extern "C" fn(u32, u32)
 /// -> u32, nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
 /// nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
-/// nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32)` (cdecl,
-/// eighteen arguments), followed by append-only callbacks -- in that fixed
-/// order. A tape is free
+/// nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
+/// terminal_position: extern "C" fn() -> u32, fs_file_length: extern "C"
+/// fn(u32, u32, u32) -> u32, fs_read: extern "C" fn(u32, u32, u32, u32, u32)
+/// -> u32, fs_write: extern "C" fn(u32, u32, u32, u32) -> u32, fs_remove:
+/// extern "C" fn(u32, u32) -> u32)` (cdecl, twenty-two arguments), in that
+/// fixed order. A tape is free
 /// to declare only a leading prefix of these parameters (as
 /// `primes.S`/`hello-rs` declare only `putc`, and `vga-colors` declares
 /// only `putc`/`should_abort`) and ignore the rest; under cdecl this
@@ -1795,11 +1795,6 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 /// below) must still declare every parameter before it, purely to keep
 /// each argument's stack position lined up correctly -- see
 /// `docs/rust-tapes-for-dummies.md` for a worked example.
-/// - `console::terminal_position` is the next append-only callback. It returns
-///   the current 1-based ANSI cursor row and column packed into one `u32`, so
-///   a terminal tape can answer `CSI 6n` cursor-position requests while the
-///   kernel remains the owner of VGA state.
-///
 /// - `console::print_byte` is passed as the first argument, giving a tape
 ///   a narrow, explicit way to call back into the kernel's own console
 ///   code to print, instead of touching VGA/COM1 hardware directly (see

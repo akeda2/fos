@@ -13,6 +13,7 @@
 # drive at +2, LBA low/high dwords at +4/+8, buffer physical address at +12,
 # and the DAP at +16.
 .set DISK_SAVED_ESP, 0x5440
+.set DISK_SAVED_CR0, 0x5444
 
 .global _start
 _start:
@@ -459,7 +460,11 @@ bios_disk_protected16:
     movw %ax, %es
     movw %ax, %ss
     movl %cr0, %eax
-    andl $0xfffffffe, %eax
+    movl %eax, DISK_SAVED_CR0
+    # A paged kernel must clear both PG and PE before the real-mode far
+    # transfer. Real mode has no page-table translation, so leaving PG set
+    # would make BIOS code execute with an invalid architectural state.
+    andl $0x7ffffffe, %eax
     movl %eax, %cr0
     ljmp $0, $(bios_disk_real + STAGE2_BASE)
 
@@ -516,6 +521,12 @@ bios_disk_pm_return:
     movw %ax, %gs
     movw %ax, %ss
     movl DISK_SAVED_ESP, %esp
+    # Restore the caller's complete CR0 only after protected-mode segments
+    # and the original stack are usable again. The paging foundation keeps
+    # this path identity-mapped, so the following instructions and return
+    # address retain the same numeric addresses across the transition.
+    movl DISK_SAVED_CR0, %eax
+    movl %eax, %cr0
     movzbl DISK_REQUEST + 1, %eax
     popl %edi
     popl %esi
