@@ -1,14 +1,21 @@
 use crate::arch::x86::{inb, outb};
 use crate::interrupts;
 use core::arch::asm;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
 const STATUS_OUTPUT_FULL: u8 = 1;
 const STATUS_INPUT_FULL: u8 = 2;
 const KEYBOARD_ACK: u8 = 0xfa;
+const KEYBOARD_ENABLE_SCANNING: u8 = 0xf4;
 const KEYBOARD_SET_LEDS: u8 = 0xed;
 const CAPS_LOCK_LED: u8 = 0x04;
+const CONTROLLER_READ_COMMAND_BYTE: u8 = 0x20;
+const CONTROLLER_WRITE_COMMAND_BYTE: u8 = 0x60;
+const CONTROLLER_KEYBOARD_IRQ: u8 = 1 << 0;
+const CONTROLLER_TRANSLATE_SET_2: u8 = 1 << 6;
+static BIOS_RESTORE_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 /// Scan Code Set 1 make codes for the function keys recognized as "leave
 /// this mode" keys throughout `shell.rs` (`term`, `term net`, `nic sniff`,
@@ -66,17 +73,7 @@ impl Keyboard {
     /// `interrupts::initialize` unmasks IRQ1, since this handshake polls the
     /// controller directly rather than going through the interrupt queue.
     pub fn initialize() -> Option<()> {
-        if !wait_for_input_empty() {
-            return None;
-        }
-        unsafe { outb(DATA_PORT, 0xf4) };
-        if !wait_for_output() {
-            return None;
-        }
-        if unsafe { inb(DATA_PORT) } != 0xfa {
-            return None;
-        }
-        Some(())
+        send_keyboard_byte(KEYBOARD_ENABLE_SCANNING).then_some(())
     }
 
     fn decode_scancode(&mut self, scancode: u8) -> Option<u8> {
@@ -89,6 +86,7 @@ impl Keyboard {
                 self.caps_lock = !self.caps_lock;
                 set_caps_lock_led(self.caps_lock);
             }
+
             _ if released => {}
             0x1c => return Some(b'\n'),
             0x0e => return Some(8),
@@ -99,6 +97,71 @@ impl Keyboard {
         }
         None
     }
+}
+
+/// Reasserts the shell's Scan Code Set 1 *output* contract after a BIOS disk
+/// call.
+///
+/// Physical PS/2 keyboards normally emit Set 2, while the 8042 translates it
+/// to the Set 1 bytes the decoder below expects. USB keyboards using firmware
+/// legacy emulation can have that controller translation (or its keyboard IRQ
+/// enable bit) changed by BIOS code while it services `INT 13h`. Restore those
+/// controller bits rather than changing the keyboard's own scan set: doing so
+/// preserves the standard Set 2 -> Set 1 path on both physical 8042s and
+/// QEMU. `disk` calls this with interrupts disabled after the protected-mode
+/// IDT/PIC are back; controller replies are polled and cannot be mistaken for
+/// queued input.
+pub fn restore_after_bios_disk_call() {
+    if !restore_controller_translation() {
+        BIOS_RESTORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Returns failed post-BIOS keyboard restoration attempts for `irqstat`.
+pub fn bios_restore_failures() -> u32 {
+    BIOS_RESTORE_FAILURES.load(Ordering::Relaxed)
+}
+
+fn restore_controller_translation() -> bool {
+    // A BIOS handler can leave a controller reply or a stale make/break byte
+    // pending. Drop it before waiting for the acknowledgements below, since
+    // treating it as an ACK would desynchronize the command exchange.
+    while unsafe { inb(STATUS_PORT) } & STATUS_OUTPUT_FULL != 0 {
+        let _ = unsafe { inb(DATA_PORT) };
+    }
+    let Some(command_byte) = read_controller_command_byte() else {
+        return false;
+    };
+    write_controller_command_byte(command_byte | CONTROLLER_KEYBOARD_IRQ | CONTROLLER_TRANSLATE_SET_2)
+        && send_keyboard_byte(KEYBOARD_ENABLE_SCANNING)
+}
+
+fn read_controller_command_byte() -> Option<u8> {
+    if !wait_for_input_empty() {
+        return None;
+    }
+    unsafe { outb(STATUS_PORT, CONTROLLER_READ_COMMAND_BYTE) };
+    wait_for_output().then(|| unsafe { inb(DATA_PORT) })
+}
+
+fn write_controller_command_byte(byte: u8) -> bool {
+    if !wait_for_input_empty() {
+        return false;
+    }
+    unsafe { outb(STATUS_PORT, CONTROLLER_WRITE_COMMAND_BYTE) };
+    if !wait_for_input_empty() {
+        return false;
+    }
+    unsafe { outb(DATA_PORT, byte) };
+    true
+}
+
+fn send_keyboard_byte(byte: u8) -> bool {
+    if !wait_for_input_empty() {
+        return false;
+    }
+    unsafe { outb(DATA_PORT, byte) };
+    wait_for_output() && unsafe { inb(DATA_PORT) } == KEYBOARD_ACK
 }
 
 /// Reads one raw scancode directly from the controller. Called only from the

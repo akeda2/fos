@@ -76,6 +76,7 @@ const SCANCODE_QUEUE_CAPACITY: usize = 32;
 static mut SCANCODE_QUEUE: [u8; SCANCODE_QUEUE_CAPACITY] = [0; SCANCODE_QUEUE_CAPACITY];
 static mut QUEUE_HEAD: usize = 0;
 static mut QUEUE_TAIL: usize = 0;
+static mut SCANCODE_DROPS: u32 = 0;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -679,7 +680,25 @@ fn push_scancode(byte: u8) {
         if next != QUEUE_HEAD {
             SCANCODE_QUEUE[QUEUE_TAIL] = byte;
             QUEUE_TAIL = next;
+        } else {
+            SCANCODE_DROPS = SCANCODE_DROPS.wrapping_add(1);
         }
+    }
+}
+
+/// Returns scancodes waiting for foreground decoding and bytes that could not
+/// be queued because IRQ1 arrived faster than the shell consumed input.
+pub fn scancode_queue_stats() -> (usize, u32) {
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+        let pending = if QUEUE_TAIL >= QUEUE_HEAD {
+            QUEUE_TAIL - QUEUE_HEAD
+        } else {
+            SCANCODE_QUEUE_CAPACITY - QUEUE_HEAD + QUEUE_TAIL
+        };
+        let drops = SCANCODE_DROPS;
+        asm!("sti", options(nomem, nostack));
+        (pending, drops)
     }
 }
 

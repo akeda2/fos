@@ -170,6 +170,10 @@ fn transfer(info: &BootInfo, lba: u64, direction: u32) -> Result<(), Error> {
     crate::gdt::restore_after_bios();
     interrupts::use_kernel_idt();
     interrupts::use_kernel_pic_mapping();
+    // Some USB legacy-emulation BIOSes alter the keyboard scan-set/8042
+    // translation state while handling INT 13h. Restore the Set 1 contract
+    // before IRQ1 can resume delivering bytes to the shell decoder.
+    crate::keyboard::restore_after_bios_disk_call();
     unsafe {
         core::arch::asm!("sti", options(nomem, nostack));
     }

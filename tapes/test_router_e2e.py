@@ -14,6 +14,7 @@ import selectors
 import socket
 import struct
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -70,6 +71,22 @@ class McastSocket:
 
     def close(self) -> None:
         self.sock.close()
+
+
+def send_monitor_command(path: Path, command: str, timeout: float = 5) -> None:
+    """Sends one human-monitor command after QEMU creates its Unix socket."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as monitor:
+                monitor.settimeout(1)
+                monitor.connect(str(path))
+                monitor.sendall((command + "\n").encode())
+                return
+        except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"could not connect to QEMU monitor at {path}")
+            time.sleep(0.05)
 
 
 def pad(frame: bytes) -> bytes:
@@ -376,6 +393,8 @@ def main() -> None:
     selector = selectors.DefaultSelector()
     process = None
     output = bytearray()
+    monitor_dir = tempfile.TemporaryDirectory(prefix="fos-router-monitor-")
+    monitor_path = Path(monitor_dir.name) / "monitor.sock"
 
     def read_until(marker: bytes, timeout: float, start: int = 0) -> bytes:
         deadline = time.monotonic() + timeout
@@ -414,7 +433,7 @@ def main() -> None:
             "-serial",
             "stdio",
             "-monitor",
-            "none",
+            f"unix:{monitor_path},server=on,wait=off",
             "-no-reboot",
             "-no-shutdown",
             "-display",
@@ -819,14 +838,15 @@ def main() -> None:
         print("PASS: router statically DNATed UDP and translated its reply.")
 
         stop_start = len(output)
-        for _ in range(5):
-            links["a"].send(term_frame(ROUTER_MAC_A, TERM_CLIENT_MAC, TERM_TAG_DATA, b"\x1b"))
-            time.sleep(0.05)
+        # The router polls the tape abort callback while forwarding. Verify a
+        # local function-key escape still stops it after its disk-loaded image
+        # performed BIOS EDD reads and the remote terminal session stays live.
+        send_monitor_command(monitor_path, "sendkey f12")
         read_until(b"Router stopped;", 10, stop_start)
         read_until(b"Tape returned; back at the fos shell.", 10, stop_start)
         send_command(b"about")
         read_until(b"fos> ", 10)
-        print("PASS: router stopped cleanly and the remote shell remained usable.")
+        print("PASS: local F12 stopped the router and the remote shell remained usable.")
     finally:
         for link in links.values():
             link.close()
@@ -837,6 +857,7 @@ def main() -> None:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+        monitor_dir.cleanup()
 
 
 if __name__ == "__main__":

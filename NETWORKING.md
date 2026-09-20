@@ -184,6 +184,10 @@ router chooses the next healthy declared uplink, and automatically fails back
 when a higher-priority uplink recovers. NAT and static inbound forwards use
 only that active uplink. Existing NAT and forwarded flows can break when it
 changes; there is deliberately no state migration.
+When DHCP uplinks receive leases on the same upstream subnet, only the active
+one participates in directly connected routing for that subnet. This prevents
+the original, unhealthy uplink from winning a longest-prefix route lookup
+after failover; static downstream routes remain directly connected.
 
 NAT is enabled by default. Add `no-nat` when the upstream network has an
 explicit route back to the downstream subnets and should receive the original
@@ -336,6 +340,18 @@ Physical validation should begin with `nic`, then `nic send`/`nic recv` or
 `term net`, and finally a protocol tape such as `tapes/ip-chat` or
 `tapes/telnet`. A failed 3C905 initialization is reported separately from
 the absence of any supported controller.
+
+When diagnosing DHCP on a physical multi-NIC machine, run
+`tape load disk NET-DHCP.BIN` followed by `tape run` before changing the
+router or DHCP implementation. The tape tries every initialized interface
+independently, reports transmit/receive/parser/DHCP counters, and does not
+advance until that NIC binds or the operator presses an escape function key.
+After all interfaces bind, it remains in a periodic status display until the
+operator presses an escape function key.
+If a replacement NIC acquires a lease immediately on the same cable and
+network segment while the original one remains silent, that isolates a flaky
+NIC or its physical path; do not treat it as evidence that DHCP parsing,
+router policy, or the other interface drivers need changing.
 
 The 3C905 transmit descriptor format differs between the original 905
 Boomerang cards and the 905B/C Cyclone/Tornado revisions. The driver selects

@@ -174,19 +174,32 @@ fn relay_push(bytes: &[u8]) {
     }
 }
 
-/// Drains up to `out.len()` queued relay bytes into `out`, returning how
-/// many were copied (zero if the queue is currently empty). `term_net`
-/// calls this every loop iteration to pick up whatever has been printed
-/// since the last drain.
-pub fn drain_relay(out: &mut [u8]) -> usize {
+/// Copies up to `out.len()` queued relay bytes into `out` without removing
+/// them. The terminal relay must retain a chunk until its NIC accepts the
+/// matching Ethernet frame: a temporarily busy transmitter must not turn
+/// ordinary shell output or its prompt into permanently lost bytes.
+pub fn peek_relay(out: &mut [u8]) -> usize {
     unsafe {
         let mut count = 0;
-        while count < out.len() && RELAY_HEAD != RELAY_TAIL {
-            out[count] = RELAY_QUEUE[RELAY_HEAD];
-            RELAY_HEAD = (RELAY_HEAD + 1) % RELAY_QUEUE_LEN;
+        let mut index = RELAY_HEAD;
+        while count < out.len() && index != RELAY_TAIL {
+            out[count] = RELAY_QUEUE[index];
+            index = (index + 1) % RELAY_QUEUE_LEN;
             count += 1;
         }
         count
+    }
+}
+
+/// Removes up to `count` bytes previously observed with `peek_relay`.
+/// Callers discard only after their transport reports successful delivery.
+pub fn discard_relay(count: usize) {
+    unsafe {
+        let mut remaining = count;
+        while remaining != 0 && RELAY_HEAD != RELAY_TAIL {
+            RELAY_HEAD = (RELAY_HEAD + 1) % RELAY_QUEUE_LEN;
+            remaining -= 1;
+        }
     }
 }
 

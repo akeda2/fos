@@ -510,6 +510,10 @@ bios_disk_failed:
     movb $1, DISK_REQUEST + 1
 bios_disk_return_to_pm:
     cli
+    # BIOS interrupt handlers do not provide a kernel ABI guarantee for DF.
+    # Rust/string operations require forward direction, so normalize it before
+    # any protected-mode code or copied FOSFS/tape data runs after INT 13h.
+    cld
     lgdt gdt_descriptor + STAGE2_BASE
     movl %cr0, %eax
     orl $1, %eax

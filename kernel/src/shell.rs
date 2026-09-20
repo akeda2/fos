@@ -337,12 +337,21 @@ fn print_uptime() {
 }
 
 fn print_irq_stats() {
+    let (queued_scancodes, dropped_scancodes) = interrupts::scancode_queue_stats();
     println!(
-        "IRQ0 (timer): {} fired; IRQ1 (keyboard): {} fired; spurious IRQ7/IRQ15: {} fired",
+        "IRQ0 (timer): {} fired; IRQ1 (keyboard): {} fired ({} queued, {} dropped); spurious IRQ7/IRQ15: {} fired",
         interrupts::timer_irq_count(),
         interrupts::keyboard_irq_count(),
+        queued_scancodes,
+        dropped_scancodes,
         interrupts::spurious_irq_count()
     );
+    let keyboard_restore_failures = keyboard::bios_restore_failures();
+    if keyboard_restore_failures != 0 {
+        println!(
+            "PS/2 Scan Code Set 1 restoration after BIOS disk calls failed {keyboard_restore_failures} time(s)."
+        );
+    }
     for irq in 3..16 {
         if interrupts::pci_irq_registered(irq) {
             println!(
@@ -719,9 +728,9 @@ fn term_net(info: &BootInfo) {
 
             drain_deferred_term_input(&mut editor, info);
 
-            let drained = console::drain_relay(&mut relay_chunk);
-            if drained > 0 {
-                send_term_data(nic, &peer, &source, &relay_chunk[..drained]);
+            let queued = console::peek_relay(&mut relay_chunk);
+            if queued > 0 && send_term_data(nic, &peer, &source, &relay_chunk[..queued]) {
+                console::discard_relay(queued);
             }
 
             if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
@@ -891,9 +900,9 @@ fn drain_deferred_term_input(editor: &mut LineEditor, info: &BootInfo) {
 /// local echo or interpretation of its own.
 const REMOTE_ABORT_BYTE: u8 = 0x1b;
 
-/// Drains whatever console output has queued up in `console`'s relay
-/// buffer since the last drain and forwards it to `peer` as one
-/// `TERM_TAG_DATA` frame -- the same "drain, then send" step
+/// Copies whatever console output is queued in `console`'s relay buffer
+/// and forwards it to `peer` as one `TERM_TAG_DATA` frame -- the same
+/// "send, then discard" step
 /// `term_net`'s own session loop performs every iteration, factored out
 /// so `poll_remote_tape_abort`/`poll_remote_tape_input` can perform it
 /// too. Without this, a nested blocking command's own `putc` output
@@ -911,9 +920,9 @@ const REMOTE_ABORT_BYTE: u8 = 0x1b;
 /// ABI change and no per-tape opt-in required.
 fn relay_pending_tape_output(nic: &nic::Nic, peer: &[u8; 6], source: &[u8; 6]) {
     let mut chunk = [0u8; TERM_DATA_CAPACITY];
-    let drained = console::drain_relay(&mut chunk);
-    if drained > 0 {
-        send_term_data(nic, peer, source, &chunk[..drained]);
+    let queued = console::peek_relay(&mut chunk);
+    if queued > 0 && send_term_data(nic, peer, source, &chunk[..queued]) {
+        console::discard_relay(queued);
     }
 }
 
@@ -991,18 +1000,23 @@ fn poll_remote_tape_abort() -> bool {
     }
 }
 
-/// Sends `data` as one `TERM_TAG_DATA` frame to `destination`, silently
-/// dropping it on a card error the same way `send_chat_line` does -- a lost
-/// screen update is recoverable (the next drain/print will eventually
-/// catch the console up), so nothing here retries or blocks.
-fn send_term_data(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8]) {
+/// Sends `data` as one `TERM_TAG_DATA` frame to `destination`.
+///
+/// The caller retains the corresponding relay bytes when this returns
+/// `false`, allowing a later foreground iteration to retry them in order.
+fn send_term_data(
+    nic: &nic::Nic,
+    destination: &[u8; 6],
+    source: &[u8; 6],
+    data: &[u8],
+) -> bool {
     let mut frame = [0u8; 15 + TERM_DATA_CAPACITY];
     frame[0..6].copy_from_slice(destination);
     frame[6..12].copy_from_slice(source);
     frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
     frame[14] = TERM_TAG_DATA;
     frame[15..15 + data.len()].copy_from_slice(data);
-    nic.send(&frame[..15 + data.len()]);
+    nic.send(&frame[..15 + data.len()])
 }
 
 /// Sends a zero-length `CHAT_ETHERTYPE` control frame with a `TERM_TAG_*`

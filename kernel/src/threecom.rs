@@ -346,6 +346,12 @@ impl ThreeCom {
                 | if self.promiscuous.get() { RX_PROMISCUOUS } else { 0 },
         )?;
         self.command(RX_ENABLE)?;
+        // RX_ENABLE accepts frames at the MAC, but the Cyclone/Tornado DMA
+        // upload engine can remain stalled after RX_RESET. The upload list is
+        // already posted above; explicitly resume it so the first broadcast
+        // (such as a DHCP DISCOVER) reaches its descriptor instead of waiting
+        // for a receive completion that can never occur.
+        self.command(UP_UNSTALL)?;
         self.command(TX_ENABLE)?;
         self.command(ACK_INTERRUPT | 0x07ff)?;
         Ok(())
@@ -507,17 +513,24 @@ impl ThreeCom {
             return None;
         }
         let length = (status & 0x1fff) as usize;
+        let valid = status & RX_ERROR == 0 && length <= RX_BUFFER_SIZE;
+        let copy_len = length.min(out.len()).min(MAX_FRAME_LEN);
+        // Returning a completed descriptor makes its DMA buffer available to
+        // the adapter immediately. Copy before clearing its status so a new
+        // wire packet cannot overwrite the frame the foreground protocol is
+        // about to parse (especially visible for a short DHCP exchange).
+        if valid {
+            unsafe {
+                let source = core::slice::from_raw_parts(self.rx_buffers[index] as *const u8, copy_len);
+                out[..copy_len].copy_from_slice(source);
+            }
+        }
         unsafe { write_volatile(&mut (*descriptor).status, 0) };
         write16(self.io_base, CMD_STATUS, UP_UNSTALL);
         self.rx_next.set((index + 1) % RX_DESC_COUNT);
-        if status & RX_ERROR != 0 || length > RX_BUFFER_SIZE {
+        if !valid {
             self.overflow_count.set(self.overflow_count.get() + 1);
             return None;
-        }
-        let copy_len = length.min(out.len()).min(MAX_FRAME_LEN);
-        unsafe {
-            let source = core::slice::from_raw_parts(self.rx_buffers[index] as *const u8, copy_len);
-            out[..copy_len].copy_from_slice(source);
         }
         self.rx_progress.set(self.rx_progress.get().wrapping_add(1));
         Some(copy_len)

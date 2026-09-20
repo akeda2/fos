@@ -42,9 +42,8 @@
 use core::cmp::min;
 
 use router_tape::{
-    ConfigError, FileName, ForwardProtocol, InterfaceConfig, MAX_FORWARDS, PortForward,
-    RouterConfig, MAX_INTERFACES, parse_config,
-    route_next_hop,
+    ConfigError, FileName, ForwardProtocol, InterfaceConfig, MAX_FORWARDS, MAX_INTERFACES,
+    PortForward, RouterConfig, parse_config, route_next_hop, routing_configs_for_active_uplink,
 };
 use tape_net::{
     ArpCache, ArpOperation, ArpPacket, DHCP_CLIENT_PORT, DHCP_MAX_DNS_SERVERS,
@@ -2285,6 +2284,16 @@ pub extern "C" fn tape_main(
             }))
             .unwrap_or(0);
         let active_nic = interfaces[active_index].nic;
+        // Standby DHCP uplinks may share the active uplink's subnet. Exclude
+        // them from direct-route matching so that subnet never bypasses the
+        // health-selected active default route after a failover.
+        let routing_configs = routing_configs_for_active_uplink(
+            &configs,
+            interface_count,
+            &parsed.dhcp_uplinks,
+            parsed.dhcp_uplink_count,
+            active_uplink.map(|index| interfaces[index].nic),
+        );
         for ingress in 0..interface_count {
             if should_abort() == TAPE_EVENT_ABORT {
                 break 'router;
@@ -2340,7 +2349,7 @@ pub extern "C" fn tape_main(
                 ingress,
                 &receive_buffer[..length],
                 &mut interfaces,
-                &configs,
+                &routing_configs,
                 interface_count,
                 current_default,
                 active_nic,

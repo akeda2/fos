@@ -54,6 +54,13 @@ class McastSocket:
     def send(self, frame: bytes) -> None:
         self.sock.sendto(frame, (self.group, self.port))
 
+    def receive(self, timeout: float) -> bytes | None:
+        self.sock.settimeout(timeout)
+        try:
+            return self.sock.recv(2048)
+        except TimeoutError:
+            return None
+
 
 def pad(frame: bytes) -> bytes:
     frame = bytearray(frame)
@@ -110,20 +117,45 @@ def main() -> None:
         mcast.send(frame(BROADCAST_MAC, HOST_MAC, TERM_TAG_HELLO))
         read_until(b"Remote terminal connected", 10)
         print("session established", file=sys.stderr)
-        del output[:]
 
-        mcast.send(frame(BROADCAST_MAC, HOST_MAC, TERM_TAG_DATA, b"about\n"))
-        time.sleep(1.0)
-        mcast.send(frame(BROADCAST_MAC, HOST_MAC, TERM_TAG_DATA, b"cpuinfo\n"))
-        time.sleep(1.0)
+        def receive_term_until(marker: bytes, timeout: float) -> bytes:
+            deadline = time.monotonic() + timeout
+            received = bytearray()
+            while marker not in received:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SystemExit(
+                        f"timed out waiting for {marker!r} in terminal frames; "
+                        f"received:\n{received.decode('utf-8', 'replace')}"
+                    )
+                packet = mcast.receive(min(remaining, 0.2))
+                if (
+                    packet is None
+                    or len(packet) < 15
+                    or packet[:6] != HOST_MAC
+                    or packet[6:12] == HOST_MAC
+                    or packet[12:14] != bytes(CHAT_ETHERTYPE)
+                    or packet[14] != TERM_TAG_DATA
+                ):
+                    continue
+                payload = packet[15:]
+                received.extend(payload[: len(payload.rstrip(b"\0"))])
+            return bytes(received)
+
+        # The help text deliberately exceeds one terminal frame. Assert on
+        # its final section and the following prompt from actual Ethernet
+        # TERM_TAG_DATA packets, rather than QEMU's independent serial log.
+        receive_term_until(b"fos> ", 10)
+        mcast.send(frame(BROADCAST_MAC, HOST_MAC, TERM_TAG_DATA, b"help\n"))
+        relayed = receive_term_until(b"fos> ", 10)
+        assert b"Remote: term net" in relayed, "tail of multi-frame help output was not relayed"
+        assert relayed.endswith(b"fos> "), "prompt missing after multi-frame terminal output"
+
         mcast.send(frame(BROADCAST_MAC, HOST_MAC, TERM_TAG_BYE))
 
         read_until(b"Remote terminal disconnected", 10)
-        text = output.decode("utf-8", "replace")
-        print(text)
-        assert "small educational" in text, "'about' output missing from the relayed session"
-        assert "CPUID vendor" in text, "'cpuinfo' output missing from the relayed session"
-        print("PASS: term net relayed remote commands and their output correctly.", file=sys.stderr)
+        print(relayed.decode("utf-8", "replace"))
+        print("PASS: term net relayed complete multi-frame output and its prompt.", file=sys.stderr)
     finally:
         qemu.terminate()
         try:

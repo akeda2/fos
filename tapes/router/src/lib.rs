@@ -662,6 +662,34 @@ pub fn route_next_hop(
     Some((index, route.gateway))
 }
 
+/// Removes standby DHCP uplinks from directly connected route selection.
+///
+/// Two DHCP uplinks can legitimately receive leases on the same upstream
+/// subnet. In that case a normal longest-prefix lookup would otherwise select
+/// the first configured uplink even after health checking promoted another
+/// one. Static interfaces remain available as directly connected routes.
+pub fn routing_configs_for_active_uplink(
+    configs: &[Option<InterfaceConfig>; MAX_INTERFACES],
+    count: usize,
+    dhcp_uplinks: &[Option<u32>; MAX_INTERFACES],
+    dhcp_uplink_count: usize,
+    active_uplink: Option<u32>,
+) -> [Option<InterfaceConfig>; MAX_INTERFACES] {
+    let mut routes = *configs;
+    for config in routes[..count].iter_mut() {
+        if config.is_some_and(|config| {
+            dhcp_uplinks[..dhcp_uplink_count]
+                .iter()
+                .flatten()
+                .any(|uplink| *uplink == config.nic)
+                && Some(config.nic) != active_uplink
+        }) {
+            *config = None;
+        }
+    }
+    routes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +815,60 @@ mod tests {
         assert_eq!(select_healthy_uplink(&[true, true, false, false], 2), Some(0));
         assert_eq!(select_healthy_uplink(&[false, true, false, false], 2), Some(1));
         assert_eq!(select_healthy_uplink(&[true, true, false, false], 2), Some(0));
+    }
+
+    #[test]
+    fn active_uplink_owns_shared_dhcp_subnet_routes() {
+        let configs = [
+            Some(InterfaceConfig {
+                nic: 0,
+                address: Ipv4Address::new([192, 0, 2, 10]),
+                netmask: Ipv4Address::new([255, 255, 255, 0]),
+            }),
+            Some(InterfaceConfig {
+                nic: 1,
+                address: Ipv4Address::new([192, 0, 2, 11]),
+                netmask: Ipv4Address::new([255, 255, 255, 0]),
+            }),
+            Some(InterfaceConfig {
+                nic: 2,
+                address: Ipv4Address::new([10, 0, 15, 1]),
+                netmask: Ipv4Address::new([255, 255, 255, 0]),
+            }),
+            None,
+        ];
+        let routes = routing_configs_for_active_uplink(
+            &configs,
+            3,
+            &[Some(0), Some(1), None, None],
+            2,
+            Some(1),
+        );
+
+        assert_eq!(
+            route_next_hop(
+                &routes,
+                3,
+                Ipv4Address::new([192, 0, 2, 99]),
+                Some(DefaultRoute {
+                    nic: 1,
+                    gateway: Ipv4Address::new([192, 0, 2, 1]),
+                }),
+            ),
+            Some((1, Ipv4Address::new([192, 0, 2, 99])))
+        );
+        assert_eq!(
+            route_next_hop(
+                &routes,
+                3,
+                Ipv4Address::new([10, 0, 15, 99]),
+                Some(DefaultRoute {
+                    nic: 1,
+                    gateway: Ipv4Address::new([192, 0, 2, 1]),
+                }),
+            ),
+            Some((2, Ipv4Address::new([10, 0, 15, 99])))
+        );
     }
 
     #[test]

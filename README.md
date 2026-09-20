@@ -722,6 +722,20 @@ net`, then execute `tape run`. The manual QEMU regression test is
 `tapes/test_beep_e2e.py`; it exercises both remote and local `b` input and
 checks that the remote shell remains usable afterward.
 
+#### Diagnostic tape: `tapes/net-dhcp-test/`
+
+`NET-DHCP.BIN` is a 32-bit Rust hardware diagnostic that visits every
+initialized NIC and runs DHCP independently on each one. It keeps retrying
+until that interface receives an IP, printing transmit, receive, parse, and
+DHCP-error counters along the way; each successful lease triggers one
+approximately 100 ms PC-speaker beep before the tape advances to the next
+NIC. It uses the kernel's PIT channel 2 for the tone and leaves channel 0's
+100 Hz timer untouched. After all leases are acquired, it continues printing
+the per-NIC status and counters until manually stopped. Load it with
+`tape load disk NET-DHCP.BIN` and run `tape run`; F12/F4/F6/F7/F8/F10 remains
+the explicit escape if a segment has no DHCP server. Build it with
+`make tape-net-dhcp`; the focused QEMU test is `make test-tape-net-dhcp`.
+
 #### Test tape: `tapes/morse/`
 
 A Rust tape that turns each typed letter or digit into Morse code: the
@@ -812,7 +826,9 @@ uplink must answer a fresh gateway ARP request and an ICMP echo request to the
 target; three missed cycles select the next healthy uplink, and recovery
 automatically fails back to the highest-priority healthy lease. NAT and
 static forwards use only the active uplink, so existing flows may break during
-a change.
+a change. If DHCP uplinks share an upstream subnet, that subnet is also routed
+only through the active uplink; an inactive standby cannot win a
+directly-connected route lookup.
 
 NAT is enabled by default. Add `no-nat` when the upstream network has an
 explicit route back to the downstream subnets and should receive the original

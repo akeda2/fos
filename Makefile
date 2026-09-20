@@ -22,6 +22,7 @@ TAPE_IP_CHAT_BIN := $(BUILD)/tapes/ip-chat.bin
 TAPE_TELNET_BIN := $(BUILD)/tapes/telnet.bin
 TAPE_BRIDGE_BIN := $(BUILD)/tapes/bridge.bin
 TAPE_ROUTER_BIN := $(BUILD)/tapes/router.bin
+TAPE_NET_DHCP_BIN := $(BUILD)/tapes/net-dhcp.bin
 TAPE_IMAGE_ARGS := \
 	--file PRIMES.BIN $(TAPE_PRIMES_BIN) \
 	--file HELLO-RS.BIN $(TAPE_HELLO_RS_BIN) \
@@ -38,10 +39,11 @@ TAPE_IMAGE_ARGS := \
 	--file TELNET.BIN $(TAPE_TELNET_BIN) \
 	--file BRIDGE.BIN $(TAPE_BRIDGE_BIN) \
 	--file ROUTER.BIN $(TAPE_ROUTER_BIN) \
+	--file NET-DHCP.BIN $(TAPE_NET_DHCP_BIN) \
 	--file ROUTER.CFG tapes/router/ROUTER.CFG
 EXTRA_FOSFS_FILES ?=
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -77,7 +79,7 @@ help:
 	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
 	@echo "  make test-vga-modes - verify 80x25, 80x50, and experimental 132x25 under QEMU"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-ed + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-ed + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router + tape-net-dhcp)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
@@ -93,6 +95,7 @@ help:
 	@echo "  make tape-telnet   - build build/tapes/telnet.bin (Rust TCP/Telnet terminal tape; static IPv4 or DHCP)"
 	@echo "  make tape-bridge   - build build/tapes/bridge.bin (Rust layer-2 learning bridge/switch tape)"
 	@echo "  make tape-router   - build build/tapes/router.bin (Rust static IPv4 router tape)"
+	@echo "  make tape-net-dhcp  - build build/tapes/net-dhcp.bin (Rust all-NIC persistent DHCP connectivity test)"
 	@echo "  make test-tape-net   - run host-side unit tests for tapes/tape-net"
 	@echo "  make test-tape-ip-chat - run host-side unit tests for tapes/ip-chat"
 	@echo "  make test-tape-telnet - run host-side unit tests for tapes/telnet"
@@ -189,7 +192,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -393,8 +396,16 @@ tape-router:
 	mkdir -p $(BUILD)/tapes
 	cp tapes/router/target/i686-fos/release/router-tape $(TAPE_ROUTER_BIN)
 
+tape-net-dhcp:
+	cd tapes/net-dhcp-test && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	cp tapes/net-dhcp-test/target/i686-fos/release/net-dhcp-test-tape $(TAPE_NET_DHCP_BIN)
+
 test-tape-router: image tape-router
 	python3 tapes/test_router_e2e.py
+
+test-tape-net-dhcp: image tape-net-dhcp
+	python3 tapes/test_net_dhcp_e2e.py
 
 test-tape-ed: image tape-ed
 	python3 tapes/test_ed_e2e.py

@@ -73,6 +73,7 @@ EXPECTED_COMMON = (
     b"TELNET.BIN",
     b"BRIDGE.BIN",
     b"ROUTER.BIN",
+    b"NET-DHCP.BIN",
     b"Loaded ",
     b"fos test tape: Sieve of Eratosthenes up to 1,000,000",
     b"primes found:   78498",
@@ -233,6 +234,7 @@ def main() -> None:
                 b"cpuinfo\r",
                 b"memory\r",
                 b"ls\r",
+                b"tape load disk ROUTER.BIN\r",
                 b"tape load disk IP-CHAT.BIN\r",
                 b"tape load disk PRIMES.BIN\r",
                 b"tape run\r",
@@ -270,6 +272,16 @@ def main() -> None:
                 process.stdin.write(command)
                 process.stdin.flush()
                 wait_for(output, selector, BOOT_MARKER, 10, start)
+                if command == b"tape load disk ROUTER.BIN\r":
+                    # BIOS EDD reads temporarily enter real mode. Verify a
+                    # real PS/2 key still reaches IRQ1 after loading this
+                    # multi-sector tape, rather than merely proving serial
+                    # shell input still works.
+                    local_start = len(output)
+                    send_monitor_command(monitor_path, "sendkey a")
+                    send_monitor_command(monitor_path, "sendkey ret")
+                    wait_for(output, selector, b"Unknown command.", 10, local_start)
+                    wait_for(output, selector, BOOT_MARKER, 10, local_start)
             start = len(output)
             process.stdin.write(b"halt\r")
             process.stdin.flush()
