@@ -115,6 +115,13 @@ tape_main:
     movl %eax, saved_efer_lo
     movl %edx, saved_efer_hi
 
+    # The kernel's paging foundation uses non-PAE 4 MiB pages. PAE must not
+    # change while those page tables are active, so first leave paging; the
+    # kernel, stack, and this fixed-address tape remain directly reachable.
+    movl %cr0, %eax
+    andl $0x7fffffff, %eax
+    movl %eax, %cr0
+
     # ---- CR4.PAE, then point CR3 at our own identity-map page tables ----
     movl %cr4, %eax
     orl $0x20, %eax
@@ -160,10 +167,12 @@ long_entry:
 
 .code32
 back32:
-    # ---- undo everything above, in reverse, before touching interrupts
-    # again ----
-    movl saved_cr0, %eax
-    movl %eax, %cr0                  # clears PG (and restores every other bit)
+    # ---- leave IA-32e before restoring the kernel's non-PAE paging
+    # state. CR4.PAE must change only while paging is disabled. ----
+    movl %cr0, %eax
+    andl $0x7fffffff, %eax
+    movl %eax, %cr0
+
     movl saved_cr4, %eax
     movl %eax, %cr4                  # clears PAE
     movl saved_cr3, %eax
@@ -178,6 +187,10 @@ back32:
     ljmp $0x08, $after_gdt_restore
 
 after_gdt_restore:
+    # Re-enable the caller's original (non-PAE) paging only after its CR3,
+    # CR4, GDT, and code segment have all been restored.
+    movl saved_cr0, %eax
+    movl %eax, %cr0
     pushl saved_eflags
     popfl                            # restores the original interrupt flag last
 

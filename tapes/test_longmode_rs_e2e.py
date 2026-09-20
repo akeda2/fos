@@ -62,7 +62,7 @@ import send_tape  # noqa: E402
 MCAST_GROUP = "230.42.42.56"
 MCAST_PORT = 4256
 IMAGE = Path(__file__).resolve().parent.parent / "build" / "fos.img"
-TAPE = Path(__file__).resolve().parent.parent / "build" / "tapes" / "longmode.bin"
+TAPE = Path(__file__).resolve().parent.parent / "build" / "tapes" / "longmode-rs.bin"
 TERM_CLIENT_MAC = bytes.fromhex("02deadbeef09")
 TAPE_SENDER_MAC = bytes.fromhex("02deadbeef0a")
 CHAT_ETHERTYPE = (0x88, 0xB6)

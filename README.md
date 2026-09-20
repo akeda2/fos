@@ -439,10 +439,10 @@ segments, clears each segment's BSS tail, validates the entry point, and
 then calls it in ring 0. During migration, legacy raw flat binaries remain
 accepted and are executed from the historical fixed physical address
 (`0x100000`, 4 MiB reserved -- see `pmem::TAPE_BASE`/`TAPE_LEN` in
-`kernel/src/pmem.rs`). Both formats run on the kernel's own stack with
-absolutely no memory protection: this kernel has no userspace or paging (see
-"Current boundaries" below), so a
-tape is trusted exactly as much as any other kernel code. Ending with a
+`kernel/src/pmem.rs`). Both formats run on the kernel's own stack with absolutely no per-tape memory
+protection: this kernel has no userspace or private tape address spaces (see
+"Current boundaries" below), so a tape is trusted exactly as much as any
+other kernel code. Ending with a
 near `ret` returns control to the shell cleanly; anything else that
 faults is at least caught by the CPU exception handlers (see "Interrupts
 and the physical-frame allocator" above) rather than silently rebooting,

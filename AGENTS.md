@@ -1946,20 +1946,21 @@ own 4 MiB image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-
 descriptor private GDT (a 64-bit code descriptor at selector 0x08, and a
 flat 32-bit code descriptor at selector 0x10 used only as the landing pad
 immediately after leaving 64-bit mode), then: `cli`s, saves CR0/CR3/
-CR4/EFER/GDTR/EFLAGS, sets CR4.PAE, loads its own page tables into CR3,
-sets EFER.LME, sets CR0.PG (entering IA-32e compatibility submode), swaps
-in its private GDT, and far-jumps into 64-bit code, where it calls
+CR4/EFER/GDTR/EFLAGS, clears CR0.PG before changing the kernel's non-PAE
+page-table mode, sets CR4.PAE, loads its own page tables into CR3, sets
+EFER.LME, sets CR0.PG (entering IA-32e compatibility submode), swaps in its
+private GDT, and far-jumps into 64-bit code, where it calls
 `tape64_body` as described above. A `push`+`push`+`lretq` (the standard,
 SDM-documented way to leave 64-bit mode for a fixed target, since a
 plain far jump with an immediate target isn't encodable there) returns
 to the compatibility-mode landing pad, which restores every saved
-register in reverse order -- CR0 (clearing PG and everything else back
-to its original value in one move), CR4 (clearing PAE), CR3, EFER via
-`wrmsr` (clearing LME), the original GDTR, a far jump back onto the
-kernel's own code selector to reload CS against it, and finally EFLAGS
-(re-enabling interrupts last of all) -- before printing a wrap-up
-message through the ordinary `putc` callback and returning to the shell
-exactly like any other tape.
+register in reverse order -- it first clears CR0.PG, restores CR4
+(clearing PAE), CR3, EFER via `wrmsr` (clearing LME), the original GDTR,
+and a far jump back onto the kernel's own code selector to reload CS;
+only then does it restore CR0 (re-enabling the kernel's original
+non-PAE paging) and EFLAGS (re-enabling interrupts last of all) -- before
+printing a wrap-up message through the ordinary `putc` callback and
+returning to the shell exactly like any other tape.
 
 Two things make this materially different from every other tape in this
 repository:
