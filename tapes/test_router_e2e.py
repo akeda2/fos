@@ -26,6 +26,7 @@ import send_tape  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "build" / "fos.img"
 TAPE = ROOT / "build" / "tapes" / "router.bin"
+CONFIG = ROOT / "tapes" / "router" / "ROUTER.CFG"
 SEGMENT_A = ("230.42.42.80", 4280)
 SEGMENT_B = ("230.42.42.81", 4281)
 CHAT_ETHERTYPE = bytes((0x88, 0xB6))
@@ -384,6 +385,11 @@ def wait_for_frame(
 
 def main() -> None:
     global output
+    config_size = CONFIG.stat().st_size
+    if config_size > 4096:
+        raise SystemExit(
+            f"{CONFIG} is {config_size} bytes; router @CONFIG input is limited to 4096 bytes"
+        )
     if not IMAGE.exists():
         raise SystemExit(f"{IMAGE} does not exist; run `make image` first.")
     if not TAPE.exists():
