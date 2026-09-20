@@ -275,6 +275,22 @@ impl<const N: usize> ArpCache<N> {
         self.entries = [ArpCacheEntry::EMPTY; N];
     }
 
+    /// Invalidates one cached entry, leaving every other entry untouched.
+    /// Used by a health check that wants to force a fresh answer from one
+    /// specific address (its gateway) without discarding unrelated entries
+    /// this interface has already legitimately learned -- clearing the
+    /// whole cache instead would force every other destination reachable
+    /// through this interface to redo a full ARP resolution on the very
+    /// next packet, needlessly.
+    pub fn invalidate(&mut self, ip: Ipv4Address) {
+        for entry in &mut self.entries {
+            if entry.valid && entry.ip == ip {
+                entry.valid = false;
+                return;
+            }
+        }
+    }
+
     pub fn lookup(&mut self, ip: Ipv4Address, tick: u32) -> Option<MacAddress> {
         for entry in &mut self.entries {
             if entry.valid && entry.ip == ip {

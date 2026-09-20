@@ -1562,8 +1562,16 @@ fn poll_uplink_health(
 
         let interface = health.interface;
         // Each probe requires a fresh gateway answer, not merely a still-valid
-        // cache entry from a previous cycle.
-        interfaces[interface].arp.clear();
+        // cache entry from a previous cycle. Invalidate only the gateway's
+        // own entry, not the whole cache: this interface's ArpCache is also
+        // the one ordinary forwarding traffic through it consults, so
+        // wholesale clearing it here forced every other already-resolved
+        // destination on this interface to redo a full ARP resolution right
+        // after every health cycle -- and since resolve_mac only polls its
+        // own egress interface while blocked, that repeated re-resolution
+        // let other interfaces' rings back up, producing exactly the
+        // multi-second latency spikes this was found from.
+        interfaces[interface].arp.invalidate(health.gateway);
         let _ = send_arp_request(&interfaces[interface], health.gateway, nic_send_at, max_frame_len);
         let deadline = ticks().wrapping_add(HEALTH_PROBE_TICKS);
         let mut gateway_mac = None;
