@@ -1519,7 +1519,9 @@ fn expire_health_timeouts(
         if uplink.phase == HealthPhase::Idle {
             continue;
         }
-        if now.wrapping_sub(uplink.deadline) < (1u64 << 63) {
+        if now.wrapping_sub(uplink.deadline) >= (1u64 << 63) {
+            // Deadline not yet reached (the wrapping difference is still
+            // "negative" in two's-complement terms) -- keep waiting.
             continue;
         }
         uplink.phase = HealthPhase::Idle;
