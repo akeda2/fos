@@ -330,15 +330,27 @@ impl<'a> NatTable<'a> {
         now: u64,
     ) -> Option<(u16, bool)> {
         self.expire(now);
-        if let Some(index) = self
-            .find_inbound(protocol, inside_port, remote_address, remote_port)
-            .filter(|index| self.entries[*index].inside_address == inside_address)
-        {
-            self.entries[index].last_used = now;
-            return Some((self.entries[index].external_port, false));
-        }
+        // Look for an existing mapping for this exact internal connection
+        // (inside_address/inside_port/remote_address/remote_port), so a
+        // flow reuses its already-assigned external_port instead of getting
+        // a second, redundant one. This used to have a hash-indexed "fast
+        // path" ahead of this linear scan that called
+        // find_inbound(protocol, inside_port, remote_address, remote_port)
+        // -- but find_inbound's second parameter is external_port, not
+        // inside_port, so that call actually searched for an entry whose
+        // *external* port happened to equal this connection's *internal*
+        // port. Two unrelated downstream hosts opening connections to the
+        // same remote address/port could then alias onto each other's NAT
+        // mapping whenever one's inside_port coincided with the other's
+        // already-assigned external_port -- a real, if narrow, correctness
+        // bug, not just a missed optimization. The correct check is this
+        // linear scan (already present as a second, working fallback); the
+        // buggy fast path added nothing but the aliasing risk and was
+        // removed rather than fixed, since a linear scan over this small,
+        // bounded NAT table is already cheap.
         if let Some(index) = self.entries.iter().position(|entry| {
             entry.state == NatState::Occupied
+                && entry.protocol == protocol
                 && entry.inside_address == inside_address
                 && entry.inside_port == inside_port
                 && entry.remote_address == remote_address
