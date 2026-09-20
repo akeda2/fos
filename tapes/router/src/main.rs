@@ -57,7 +57,13 @@ use tape_net::{
 use tape_rt::{print_bytes, print_u32};
 
 const MAX_FRAME_LEN: usize = 1514;
-const ARP_TIMEOUT_TICKS: u64 = 300;
+// How long resolve_mac waits before resending an ARP request for the same
+// still-unresolved (egress, target) pair. 100 ticks (~1s at this kernel's
+// 100 Hz PIT) is a deliberately short retry, not a giving-up deadline --
+// resolve_mac never blocks or gives up itself; a destination that never
+// answers just keeps missing the cache and dropping packets, the same as
+// an ordinary IP stack's incomplete ARP entry would.
+const ARP_RETRY_TICKS: u64 = 100;
 const ARP_CACHE_SIZE: usize = 8;
 const BROADCAST_IP: Ipv4Address = Ipv4Address([255, 255, 255, 255]);
 const DHCP_TIMEOUT_SECONDS: u32 = 8;
@@ -120,6 +126,17 @@ struct RouterInterface {
     // here, refreshed every health round by advance_uplink_health, keeps it
     // immune to that unrelated cache churn.
     gateway_pin: Option<(Ipv4Address, MacAddress)>,
+    // A cache-miss target resolve_mac is currently waiting on a reply for,
+    // and the tick before which it will not resend the ARP request for that
+    // same target. resolve_mac never blocks: on a miss it fires at most one
+    // request per ARP_RETRY_TICKS window and drops the packet that
+    // triggered it, exactly like an ordinary IP stack drops (rather than
+    // waits on) a packet that misses its ARP cache. The reply -- like any
+    // other frame -- is picked up by the main loop's own unconditional
+    // process_arp call on its next read, populating `arp` in time for later
+    // packets to the same destination.
+    pending_arp: Option<Ipv4Address>,
+    pending_arp_retry: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -772,6 +789,8 @@ impl RouterInterface {
             mac: MacAddress::ZERO,
             arp: ArpCache::new(),
             gateway_pin: None,
+            pending_arp: None,
+            pending_arp_retry: 0,
         }
     }
 }
@@ -1744,10 +1763,7 @@ fn resolve_mac(
     target: Ipv4Address,
     interfaces: &mut [RouterInterface; MAX_INTERFACES],
     nic_send_at: NicSendAt,
-    nic_receive_at: NicReceiveAt,
-    should_abort: ShouldAbort,
     ticks: Ticks,
-    receive_buffer: &mut [u8; MAX_FRAME_LEN],
     max_frame_len: usize,
 ) -> Option<MacAddress> {
     // Check the pinned gateway MAC (see RouterInterface::gateway_pin) before
@@ -1764,45 +1780,29 @@ fn resolve_mac(
     if let Some(mac) = interfaces[egress].arp.lookup(target, now as u32) {
         return Some(mac);
     }
-    if !send_arp_request(&interfaces[egress], target, nic_send_at, max_frame_len) {
-        return None;
+    // Never block waiting for a reply here -- this used to nest its own
+    // nested-loop wait of up to ARP_TIMEOUT_TICKS, freezing every other
+    // interface's forwarding for the whole wait on any cache miss to any
+    // destination (not just a health-monitored gateway), the exact same
+    // class of stall the uplink-health redesign eliminated for gateway
+    // probing. Instead, a miss fires at most one ARP request per
+    // ARP_RETRY_TICKS window for this (egress, target) pair and drops the
+    // packet that triggered it -- exactly like an ordinary IP stack drops
+    // (rather than blocks) a packet on an ARP cache miss, relying on the
+    // caller's own retransmission (TCP) or next send (UDP/ICMP) to succeed
+    // once a reply arrives. That reply needs no special handling here: the
+    // main per-ingress loop already calls process_arp on every frame it
+    // reads regardless of content, so it populates `arp` in time for a
+    // later packet to the same destination to hit the cache lookup above.
+    let interface = &mut interfaces[egress];
+    let retry_on_cooldown = interface.pending_arp == Some(target)
+        && now.wrapping_sub(interface.pending_arp_retry) >= (1u64 << 63);
+    if !retry_on_cooldown {
+        let _ = send_arp_request(interface, target, nic_send_at, max_frame_len);
+        interface.pending_arp = Some(target);
+        interface.pending_arp_retry = now.wrapping_add(ARP_RETRY_TICKS);
     }
-    let deadline = now.wrapping_add(ARP_TIMEOUT_TICKS);
-    loop {
-        if should_abort() == TAPE_EVENT_ABORT {
-            return None;
-        }
-        // Only drain the egress interface's own ring here: the ARP reply we
-        // are waiting for can only arrive on it. Polling every interface (as
-        // an earlier version of this loop did) silently discarded ordinary
-        // IP traffic arriving on unrelated interfaces for up to
-        // ARP_TIMEOUT_TICKS on every cache-miss resolution -- e.g. a
-        // downstream client's own request frames, while the router blocked
-        // here resolving a WAN-side target's MAC. Leaving other interfaces'
-        // rings untouched lets the caller's own polling loop pick that
-        // traffic up normally once this call returns.
-        let length = nic_receive_at(
-            interfaces[egress].nic,
-            receive_buffer.as_mut_ptr() as u32,
-            max_frame_len as u32,
-        ) as usize;
-        if length != 0 {
-            let length = min(length, MAX_FRAME_LEN);
-            process_arp(
-                &mut interfaces[egress],
-                &receive_buffer[..length],
-                ticks(),
-                nic_send_at,
-                max_frame_len,
-            );
-        }
-        if let Some(mac) = interfaces[egress].arp.lookup(target, ticks() as u32) {
-            return Some(mac);
-        }
-        if ticks().wrapping_sub(deadline) < (1u64 << 63) {
-            return None;
-        }
-    }
+    None
 }
 
 fn is_broadcast_or_multicast(address: Ipv4Address) -> bool {
@@ -1979,14 +1979,11 @@ fn forward_ipv4(
     default_route: Option<router_tape::DefaultRoute>,
     active_uplink: u32,
     nic_send_at: NicSendAt,
-    nic_receive_at: NicReceiveAt,
-    should_abort: ShouldAbort,
     ticks: Ticks,
     nat: &mut NatTable,
     nat_enabled: bool,
     forwards: &[Option<PortForward>; MAX_FORWARDS],
     forward_count: usize,
-    receive_buffer: &mut [u8; MAX_FRAME_LEN],
     transport_buffer: &mut [u8; MAX_FRAME_LEN],
     ip_buffer: &mut [u8; MAX_FRAME_LEN],
     output_buffer: &mut [u8; MAX_FRAME_LEN],
@@ -2141,10 +2138,7 @@ fn forward_ipv4(
         next_hop,
         interfaces,
         nic_send_at,
-        nic_receive_at,
-        should_abort,
         ticks,
-        receive_buffer,
         max_frame_len,
     ) else {
         return ForwardResult::Dropped;
@@ -2278,7 +2272,7 @@ pub extern "C" fn tape_main(
             print_bytes(putc, b"Router cannot start: DHCP uplink supplied no gateway.\n");
             return;
         }
-        interfaces[interface_count] = RouterInterface { nic: *nic, address: lease.address, netmask: lease.subnet_mask, mac: own_mac, arp: ArpCache::new(), gateway_pin: None };
+        interfaces[interface_count] = RouterInterface { nic: *nic, address: lease.address, netmask: lease.subnet_mask, mac: own_mac, arp: ArpCache::new(), gateway_pin: None, pending_arp: None, pending_arp_retry: 0 };
         configs[interface_count] = Some(InterfaceConfig { nic: *nic, address: lease.address, netmask: lease.subnet_mask });
         uplinks[priority] = Some(UplinkHealth { interface: interface_count, gateway: lease.router, misses: 0, healthy: true, sequence: 0, phase: HealthPhase::Idle, deadline: 0 });
         interface_count += 1;
@@ -2304,6 +2298,8 @@ pub extern "C" fn tape_main(
             mac: MacAddress::new(mac),
             arp: ArpCache::new(),
             gateway_pin: None,
+            pending_arp: None,
+            pending_arp_retry: 0,
         };
         configs[interface_count] = Some(*config);
         interface_count += 1;
@@ -2565,7 +2561,6 @@ pub extern "C" fn tape_main(
             b"Router event diagnostics: DHCP lease and new NAT-flow messages enabled.\n",
         );
     }
-    let mut arp_receive_buffer = [0u8; MAX_FRAME_LEN];
     let mut fallback_nat_entries = [NatEntry::empty(); NAT_FALLBACK_ENTRIES];
     let nat_allocation = if parsed.nat {
         alloc(NAT_DYNAMIC_BYTES)
@@ -2702,14 +2697,11 @@ pub extern "C" fn tape_main(
                 current_default,
                 active_nic,
                 nic_send_at,
-                nic_receive_at,
-                should_abort,
                 ticks,
                 &mut nat,
                 parsed.nat,
                 &parsed.forwards,
                 parsed.forward_count,
-                &mut arp_receive_buffer,
                 &mut transport_buffer,
                 &mut ip_buffer,
                 &mut output_buffer,
