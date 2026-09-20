@@ -105,9 +105,12 @@ It is a tick count, not wall-clock time; the current kernel programs the PIT
 at 100 Hz. A protocol library receives the callback explicitly so unit tests
 can replace it with a deterministic fake clock.
 
-The callbacks are a convention, not a protection boundary. Tapes run in ring
-0 with only the kernel's supervisor identity map, not a private address space,
-and can still touch hardware directly.
+The callbacks are a convention, not a protection boundary. In the default
+image, tapes run in ring 0 with only the kernel's supervisor identity map,
+not a private address space, and can still touch hardware directly. The
+optional `make image-unsafe-memory` teaching image disables that map entirely;
+its networking callback ABI is unchanged, but it has even less accidental
+pointer-fault coverage.
 The convention keeps ordinary networking examples focused on protocol logic
 instead of duplicating either NIC driver.
 

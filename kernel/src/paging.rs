@@ -17,32 +17,45 @@
 
 use core::arch::asm;
 
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 use crate::cpu;
 
-const PAGE_DIRECTORY_ENTRIES: usize = 1024;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const LARGE_PAGE_SIZE: u32 = 4 * 1024 * 1024;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const IDENTITY_LOW_END: u32 = 2 * 1024 * 1024 * 1024;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const PCI_MMIO_BASE: u32 = 0xe000_0000;
 
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const PAGE_PRESENT: u32 = 1 << 0;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const PAGE_WRITABLE: u32 = 1 << 1;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const PAGE_LARGE: u32 = 1 << 7;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const CR0_WRITE_PROTECT: u32 = 1 << 16;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const CR0_PAGING: u32 = 1 << 31;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const CR4_PAGE_SIZE_EXTENSIONS: u32 = 1 << 4;
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 const CPUID_PAGE_SIZE_EXTENSIONS: u32 = 1 << 3;
 
 /// A page directory must begin on a 4 KiB boundary because CR3 stores its
 /// physical address with the low 12 bits reserved for flags.
 #[repr(C, align(4096))]
-struct PageDirectory([u32; PAGE_DIRECTORY_ENTRIES]);
+struct PageDirectory([u32; 1024]);
 
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 #[repr(C, align(4096))]
-struct PageTable([u32; PAGE_DIRECTORY_ENTRIES]);
+struct PageTable([u32; 1024]);
 
-static mut PAGE_DIRECTORY: PageDirectory = PageDirectory([0; PAGE_DIRECTORY_ENTRIES]);
-static mut LOW_PAGE_TABLE: PageTable = PageTable([0; PAGE_DIRECTORY_ENTRIES]);
+static mut PAGE_DIRECTORY: PageDirectory = PageDirectory([0; 1024]);
+#[cfg(not(feature = "legacy-unsafe-memory"))]
+static mut LOW_PAGE_TABLE: PageTable = PageTable([0; 1024]);
 
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     MissingPageSizeExtensions,
@@ -56,6 +69,7 @@ pub enum Error {
 /// high PCI MMIO window covers memory BARs such as QEMU's e1000. Leaving the
 /// intervening region absent gives the page-fault handler a useful signal
 /// without breaking those established address ranges.
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 pub fn initialize() -> Result<(), Error> {
     let (feature_edx, _) = cpu::features();
     if feature_edx & CPUID_PAGE_SIZE_EXTENSIONS == 0 {
@@ -67,7 +81,7 @@ pub fn initialize() -> Result<(), Error> {
     let directory = unsafe { core::ptr::addr_of_mut!(PAGE_DIRECTORY.0).cast::<u32>() };
     let low_page_table = unsafe { core::ptr::addr_of_mut!(LOW_PAGE_TABLE.0).cast::<u32>() };
     let stack_guard = crate::stack::guard_page_address();
-    for index in 0..PAGE_DIRECTORY_ENTRIES {
+    for index in 0..1024 {
         let address = (index as u32) * 4096;
         unsafe {
             low_page_table.add(index).write(if address == stack_guard {
@@ -78,7 +92,7 @@ pub fn initialize() -> Result<(), Error> {
         }
     }
 
-    for index in 0..PAGE_DIRECTORY_ENTRIES {
+    for index in 0..1024 {
         let address = (index as u32) * LARGE_PAGE_SIZE;
         let mapped = address < IDENTITY_LOW_END || address >= PCI_MMIO_BASE;
         unsafe {

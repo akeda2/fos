@@ -40,12 +40,19 @@ pub extern "C" fn kmain(boot_info_address: u32) -> ! {
     console::initialize(boot_info.serial_available != 0);
     println!("\nKernel: protected-mode Rust entry reached.");
     println!("Kernel: validated loader boot information.");
-    if paging::initialize().is_err() {
-        println!("KERNEL ERROR: CPU lacks 4 MiB page support required for the paging foundation.");
-        halt_forever();
+    #[cfg(not(feature = "legacy-unsafe-memory"))]
+    {
+        if paging::initialize().is_err() {
+            println!("KERNEL ERROR: CPU lacks 4 MiB page support required for the paging foundation.");
+            halt_forever();
+        }
+        println!(
+            "Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO; unmapped holes will fault."
+        );
     }
+    #[cfg(feature = "legacy-unsafe-memory")]
     println!(
-        "Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO; unmapped holes will fault."
+        "Paging intentionally disabled: legacy unsafe physical-address mode; stack guard pages are unavailable."
     );
     pmem::initialize(boot_info);
     shell::run(boot_info)

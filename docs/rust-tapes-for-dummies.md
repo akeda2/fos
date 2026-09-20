@@ -13,6 +13,12 @@ to the outside world (including, if you need it, a way to borrow memory
 far bigger than that fixed 4 MiB region -- see section 6 -- and a
 way to read input -- see section 7).
 
+The normal image uses a supervisor-only identity map, so those physical
+addresses remain directly usable as pointers. `make image-unsafe-memory`
+exists to compare that with the older unpaged model; it does not change a
+tape's ABI, but it intentionally removes the normal image's page-fault and
+stack-guard coverage.
+
 This guide walks through writing, building, loading, and running a Rust
 tape from nothing, assuming no prior fos or embedded-Rust experience. For
 the deeper "why", see AGENTS.md's "Tapes: fixed load address, and writing

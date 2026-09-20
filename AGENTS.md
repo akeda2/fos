@@ -60,6 +60,9 @@ that obscure hardware behavior.
   range uses 4 MiB PSE mappings. This retains physical-pointer compatibility
   for DMA and the BIOS trampoline while leaving an unmapped middle range for
   useful page-fault diagnostics; it is not userspace isolation.
+  `make image-unsafe-memory` is the explicit teaching comparison: it builds
+  a separate unpaged artifact, so it has neither those absent ranges nor the
+  guard page and must not replace the default deployment image.
 - `kernel/src/fosfs.rs` implements FOSFS version 3, a deliberately small
   flat custom filesystem: one superblock, eight directory sectors, 64 fixed
   64-byte entries, 64-bit contiguous multi-sector extents, and bounded
@@ -170,8 +173,11 @@ tools are GNU Make, GNU `as`/`objcopy`, Python 3, and `qemu-system-i386`.
 
 ```sh
 make image    # Produces build/fos.img with all compiled tapes. Plain `make` is equivalent.
+make image-unsafe-memory # Produces build/fos-unsafe-memory.img without paging, then restores build/fos.img.
 make run      # Boots it interactively in QEMU.
+make run-unsafe-memory # Boots the optional unpaged teaching image.
 make test     # Runs the serial-driven QEMU smoke test and VGA mode test.
+make test-unsafe-memory # Smoke-tests the optional unpaged teaching image.
 make test-stack-guard # Builds a fault-injection image and verifies its emergency #DF task.
 make all      # Builds everything: image, netrom, and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
@@ -181,6 +187,8 @@ make help     # Lists every target with a one-line description.
 Always run `make test` for boot, loader, kernel, shell, disk, or FOSFS changes.
 Also run `make test-stack-guard` when changing paging, GDT/IDT handling,
 exception paths, or kernel-stack layout.
+Run `make test-unsafe-memory` when changing the legacy-memory feature or its
+separate image target.
 The smoke harness must use bounded waits, preserve serial output on failure,
 and wait for the prompt before sending input.
 

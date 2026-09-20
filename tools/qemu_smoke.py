@@ -34,7 +34,6 @@ EXPECTED_COMMON = (
     b"Masking the legacy 8259 PIC and installing a flat 32-bit GDT...",
     b"GDT loaded, CR0.PE set. Far-jumping into 32-bit protected mode",
     b"Kernel: protected-mode Rust entry reached.",
-    b"Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO;",
     b"Physical memory: ",
     b"Interrupts enabled: IDT loaded, PIC remapped to 0x20/0x28,",
     b"PS/2 keyboard initialized.",
@@ -140,6 +139,11 @@ def main() -> None:
     parser = ArgumentParser()
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-i386")
+    parser.add_argument(
+        "--legacy-unsafe-memory",
+        action="store_true",
+        help="expect the opt-in unpaged teaching image instead of the default paging foundation",
+    )
     parser.add_argument(
         "--nic",
         choices=("none", "e1000", "dual-e1000", "rtl8139"),
@@ -252,6 +256,12 @@ def main() -> None:
             process.stdin.flush()
             wait_for(output, selector, b"Halting CPU.", 10, start)
             expected = list(EXPECTED_COMMON)
+            memory_marker = (
+                b"Paging intentionally disabled: legacy unsafe physical-address mode;"
+                if args.legacy_unsafe_memory
+                else b"Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO;"
+            )
+            expected.insert(expected.index(b"Physical memory: "), memory_marker)
             if args.nic == "e1000":
                 expected.extend((b"Intel e1000 found:", b"Sent a 41-byte broadcast test frame"))
             elif args.nic == "dual-e1000":

@@ -81,6 +81,12 @@ mode switches. `make test-vga-modes` runs only the VGA mode test.
 `make test-stack-guard` builds a test-only image that deliberately reaches the
 kernel stack's absent guard page and verifies that the emergency double-fault
 task prints its diagnostic instead of resetting.
+For a deliberate comparison with the pre-paging teaching model,
+`make image-unsafe-memory` writes `build/fos-unsafe-memory.img` with paging
+disabled, then restores the normal paged `build/fos.img`; `make
+test-unsafe-memory` boots that separate artifact through the smoke test. The
+legacy image has no unmapped middle range or stack guard page, so it is a
+demonstration artifact rather than a deployment choice.
 `cargo test` does not work for this crate (a `no_std`, custom-target,
 freestanding binary); `make test` is the primary automated kernel/boot
 validation path, while the focused tape tests below cover host-side protocol

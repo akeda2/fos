@@ -13,11 +13,13 @@ use core::arch::asm;
 const CANARY: [u32; 4] = [0x4b53_544b, 0x43a5_19d7, 0x6f72_6465, 0x7f3c_91b2];
 
 unsafe extern "C" {
+    #[cfg(not(feature = "legacy-unsafe-memory"))]
     static kernel_stack_guard: u8;
     static mut kernel_stack_canary: [u32; 4];
 }
 
 /// Returns the page-aligned address paging must leave absent.
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 pub fn guard_page_address() -> u32 {
     core::ptr::addr_of!(kernel_stack_guard) as u32
 }

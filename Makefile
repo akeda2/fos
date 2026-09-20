@@ -4,6 +4,7 @@ KERNEL_BIN := $(BUILD)/kernel.bin
 STAGE1_BIN := $(BUILD)/stage1.bin
 STAGE2_BIN := $(BUILD)/stage2.bin
 IMAGE := $(BUILD)/fos.img
+UNSAFE_MEMORY_IMAGE := $(BUILD)/fos-unsafe-memory.img
 NETROM_RAW := $(BUILD)/netrom_raw.bin
 NETROM := $(BUILD)/netboot.rom
 TAPE_PRIMES_BIN := $(BUILD)/tapes/primes.bin
@@ -39,7 +40,7 @@ TAPE_IMAGE_ARGS := \
 	--file ROUTER.BIN $(TAPE_ROUTER_BIN) \
 	--file ROUTER.CFG tapes/router/ROUTER.CFG
 
-.PHONY: all help kernel image run test test-stack-guard test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -61,8 +62,11 @@ help:
 	@echo "  make all        - build everything below: image, netrom, and every tape"
 	@echo "  make kernel     - build only the Rust kernel binary (build/kernel.bin)"
 	@echo "  make image      - build build/fos.img (boot + kernel + every compiled tape)"
+	@echo "  make image-unsafe-memory - build build/fos-unsafe-memory.img without paging, then restore the default image"
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
+	@echo "  make run-unsafe-memory - boot the optional unpaged teaching image interactively"
 	@echo "  make test       - build the image, then run default-NIC, e1000, dual-e1000, and VGA mode tests"
+	@echo "  make test-unsafe-memory - boot the optional unpaged teaching image through the smoke test"
 	@echo "  make test-stack-guard - build a test-only guard-fault image and verify its emergency double-fault stack"
 	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
 	@echo "  make test-dual-e1000 - build the image, then verify two e1000 interfaces and selection"
@@ -118,8 +122,16 @@ image: kernel tapes
 	objcopy -O binary $(BUILD)/stage2.o $(STAGE2_BIN)
 	python3 tools/build_image.py --stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) --kernel $(KERNEL_BIN) --output $(IMAGE) $(TAPE_IMAGE_ARGS)
 
+image-unsafe-memory:
+	$(MAKE) KERNEL_CARGO_FEATURES="--features legacy-unsafe-memory" image
+	cp $(IMAGE) $(UNSAFE_MEMORY_IMAGE)
+	$(MAKE) image
+
 run: image
 	qemu-system-i386 -drive format=raw,file=$(IMAGE) -serial stdio -monitor none -no-reboot -no-shutdown
+
+run-unsafe-memory: image-unsafe-memory
+	qemu-system-i386 -drive format=raw,file=$(UNSAFE_MEMORY_IMAGE) -serial stdio -monitor none -no-reboot -no-shutdown
 
 test: image
 	python3 tools/test_gpt.py
@@ -128,6 +140,9 @@ test: image
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic dual-e1000
 	python3 tools/test_vga_modes.py --image $(IMAGE)
+
+test-unsafe-memory: image-unsafe-memory
+	python3 tools/qemu_smoke.py --image $(UNSAFE_MEMORY_IMAGE) --legacy-unsafe-memory
 
 test-stack-guard:
 	$(MAKE) KERNEL_CARGO_FEATURES="--features stack-guard-test" image
