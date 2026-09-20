@@ -12,6 +12,8 @@
 //! wild high pointers into a legible page fault instead of an arbitrary bus
 //! access. The usual PCI MMIO window above 3.5 GiB remains mapped so an e1000
 //! BAR can retain its physical address as its volatile-pointer address.
+//! The low 4 MiB is split into ordinary 4 KiB pages solely so the page
+//! immediately below the kernel stack can remain absent as an overflow guard.
 
 use core::arch::asm;
 
@@ -35,7 +37,11 @@ const CPUID_PAGE_SIZE_EXTENSIONS: u32 = 1 << 3;
 #[repr(C, align(4096))]
 struct PageDirectory([u32; PAGE_DIRECTORY_ENTRIES]);
 
+#[repr(C, align(4096))]
+struct PageTable([u32; PAGE_DIRECTORY_ENTRIES]);
+
 static mut PAGE_DIRECTORY: PageDirectory = PageDirectory([0; PAGE_DIRECTORY_ENTRIES]);
+static mut LOW_PAGE_TABLE: PageTable = PageTable([0; PAGE_DIRECTORY_ENTRIES]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -59,13 +65,31 @@ pub fn initialize() -> Result<(), Error> {
     // Paging is still disabled and interrupts are not initialized, so this
     // one early-boot writer has exclusive access to the static directory.
     let directory = unsafe { core::ptr::addr_of_mut!(PAGE_DIRECTORY.0).cast::<u32>() };
+    let low_page_table = unsafe { core::ptr::addr_of_mut!(LOW_PAGE_TABLE.0).cast::<u32>() };
+    let stack_guard = crate::stack::guard_page_address();
+    for index in 0..PAGE_DIRECTORY_ENTRIES {
+        let address = (index as u32) * 4096;
+        unsafe {
+            low_page_table.add(index).write(if address == stack_guard {
+                0
+            } else {
+                address | PAGE_PRESENT | PAGE_WRITABLE
+            });
+        }
+    }
+
     for index in 0..PAGE_DIRECTORY_ENTRIES {
         let address = (index as u32) * LARGE_PAGE_SIZE;
         let mapped = address < IDENTITY_LOW_END || address >= PCI_MMIO_BASE;
         unsafe {
-            directory
-                .add(index)
-                .write(if mapped { address | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE } else { 0 });
+            let entry = if index == 0 {
+                low_page_table as u32 | PAGE_PRESENT | PAGE_WRITABLE
+            } else if mapped {
+                address | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE
+            } else {
+                0
+            };
+            directory.add(index).write(entry);
         }
     }
 
@@ -88,6 +112,11 @@ pub fn initialize() -> Result<(), Error> {
         asm!("mov cr0, {cr0:e}", cr0 = in(reg) cr0, options(nostack, preserves_flags));
     }
     Ok(())
+}
+
+/// Returns the physical address in CR3 for task-state restoration.
+pub fn directory_address() -> u32 {
+    core::ptr::addr_of!(PAGE_DIRECTORY) as u32
 }
 
 /// Returns CR2, the linear address that caused the most recent page fault.

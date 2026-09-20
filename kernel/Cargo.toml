@@ -3,6 +3,9 @@ name = "fos-kernel"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+stack-guard-test = []
+
 [profile.dev]
 panic = "abort"
 
@@ -12,4 +15,3 @@ codegen-units = 1
 lto = true
 opt-level = "z"
 strip = "symbols"
-

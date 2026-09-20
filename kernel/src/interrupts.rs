@@ -1,10 +1,11 @@
 //! Minimal interrupt infrastructure: an IDT with all 32 reserved CPU
-//! exception vectors (each just reporting what fired and halting -- see
-//! `report_exception`) plus the four vectors this kernel actually drives
-//! (the PIT timer, the PS/2 keyboard, and the master/slave PICs' own
-//! spurious-interrupt vectors -- see `spurious_master_interrupt`), remapped
-//! away from the CPU exception range; plus tiny lock-free counters and a
-//! scancode queue that the shell drains between prompts.
+//! exception vectors (each reporting what fired and halting -- see
+//! `report_exception`, except #DF, which uses an emergency task stack) plus
+//! the four vectors this kernel actually drives (the PIT timer, the PS/2
+//! keyboard, and the master/slave PICs' own spurious-interrupt vectors -- see
+//! `spurious_master_interrupt`), remapped away from the CPU exception range;
+//! plus tiny lock-free counters and a scancode queue that the shell drains
+//! between prompts.
 //!
 //! There is still no fault *recovery* here (an exception halts, it never
 //! resumes) -- that remains deliberately out of scope, per the project's
@@ -109,6 +110,18 @@ impl IdtEntry {
         Self::from_address(handler as usize as u32)
     }
 
+    /// A task gate lets #DF abandon an unusable current stack and begin in a
+    /// fully specified TSS with its own emergency stack.
+    const fn task_gate(tss_selector: u16) -> Self {
+        Self {
+            offset_low: 0,
+            selector: tss_selector,
+            zero: 0,
+            type_attributes: 0x85,
+            offset_high: 0,
+        }
+    }
+
     fn from_address(address: u32) -> Self {
         Self {
             offset_low: address as u16,
@@ -135,6 +148,7 @@ static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
 /// interrupts. Must run after `keyboard::initialize` and before the shell
 /// loop starts consuming `pop_scancode`.
 pub fn initialize() {
+    crate::gdt::initialize();
     unsafe {
         install_exception_handlers();
         IDT[usize::from(TIMER_VECTOR)] = IdtEntry::gate(timer_interrupt);
@@ -155,6 +169,8 @@ pub fn initialize() {
         "Interrupts enabled: IDT loaded, PIC remapped to 0x{IRQ_BASE:02x}/0x{:02x}, PIT at {PIT_FREQUENCY_HZ} Hz drives IRQ0 (timer), IRQ1 drives the keyboard.",
         IRQ_BASE + 8
     );
+    #[cfg(feature = "stack-guard-test")]
+    crate::stack::trigger_guard_page_for_test();
 }
 
 fn load_idt(limit: u16, base: u32) {
@@ -407,7 +423,6 @@ exception_handler!(exception_04_overflow, 4);
 exception_handler!(exception_05_bound_range_exceeded, 5);
 exception_handler!(exception_06_invalid_opcode, 6);
 exception_handler!(exception_07_device_not_available, 7);
-exception_handler_with_error_code!(exception_08_double_fault, 8);
 exception_handler!(exception_09_coprocessor_segment_overrun, 9);
 exception_handler_with_error_code!(exception_10_invalid_tss, 10);
 exception_handler_with_error_code!(exception_11_segment_not_present, 11);
@@ -432,9 +447,10 @@ exception_handler_with_error_code!(exception_29_vmm_communication, 29);
 exception_handler_with_error_code!(exception_30_security_exception, 30);
 exception_handler!(exception_31_reserved, 31);
 
-/// Installs all 32 reserved-vector exception gates (see `report_exception`)
+/// Installs all 32 reserved-vector exception entries (see `report_exception`)
 /// into `IDT`, ahead of `initialize`'s own timer/keyboard gates at vectors
-/// 0x20/0x21 -- comfortably clear of this range, so there is no overlap.
+/// 0x20/0x21. Vector 8 is a task gate; the other entries are ordinary
+/// interrupt gates, comfortably clear of this range.
 unsafe fn install_exception_handlers() {
     unsafe {
         IDT[0] = IdtEntry::gate(exception_00_divide_error);
@@ -445,7 +461,7 @@ unsafe fn install_exception_handlers() {
         IDT[5] = IdtEntry::gate(exception_05_bound_range_exceeded);
         IDT[6] = IdtEntry::gate(exception_06_invalid_opcode);
         IDT[7] = IdtEntry::gate(exception_07_device_not_available);
-        IDT[8] = IdtEntry::gate_with_error_code(exception_08_double_fault);
+        IDT[8] = IdtEntry::task_gate(crate::gdt::DOUBLE_FAULT_TSS_SELECTOR);
         IDT[9] = IdtEntry::gate(exception_09_coprocessor_segment_overrun);
         IDT[10] = IdtEntry::gate_with_error_code(exception_10_invalid_tss);
         IDT[11] = IdtEntry::gate_with_error_code(exception_11_segment_not_present);

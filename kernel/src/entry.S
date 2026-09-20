@@ -4,6 +4,12 @@
 .extern __bss_start
 .extern __bss_end
 
+# These helpers install the kernel-owned GDT after boot and after a BIOS disk
+# transfer. The latter returns with stage two's smaller GDT loaded, which has
+# no TSS descriptors for the double-fault task gate.
+.global load_kernel_gdt
+.global load_kernel_gdt_and_task_register
+
 _start:
     cli
     mov esp, offset kernel_stack_top
@@ -23,8 +29,39 @@ _start:
     hlt
     jmp .halt
 
+load_kernel_gdt:
+    mov eax, [esp + 4]
+    lgdt [eax]
+    push 0x08
+    mov eax, offset load_kernel_gdt_after
+    push eax
+    retf
+load_kernel_gdt_after:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    ret
+
+load_kernel_gdt_and_task_register:
+    mov eax, [esp + 4]
+    push eax
+    call load_kernel_gdt
+    add esp, 4
+    mov ax, 0x28
+    ltr ax
+    ret
+
 .section .bss
-.align 16
+.align 4096
+.global kernel_stack_guard
+kernel_stack_guard:
+    # `paging.rs` deliberately leaves this page unmapped after early boot.
+    # A downward stack overflow faults here instead of corrupting adjacent
+    # state; the double-fault task uses a separate emergency stack.
+    .skip 4096
 .global kernel_stack_canary
 kernel_stack_canary:
     # `stack.rs` arms and IRQ0 checks this tripwire. Keep it immediately

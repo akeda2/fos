@@ -11,6 +11,7 @@ mod cpu;
 mod disk;
 mod e1000;
 mod fosfs;
+mod gdt;
 mod interrupts;
 mod keyboard;
 mod nic;

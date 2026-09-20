@@ -167,6 +167,7 @@ fn transfer(info: &BootInfo, lba: u64, direction: u32) -> Result<(), Error> {
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack));
     }
+    crate::gdt::restore_after_bios();
     interrupts::use_kernel_idt();
     interrupts::use_kernel_pic_mapping();
     unsafe {

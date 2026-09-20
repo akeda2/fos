@@ -78,6 +78,9 @@ interrupt/allocator setup), line editing, shell error handling, system
 inspection, interrupt/memory introspection, FOSFS formatting, file creation,
 reading, removal, halt, and the 80x25/80x50/experimental 132x25 local VGA
 mode switches. `make test-vga-modes` runs only the VGA mode test.
+`make test-stack-guard` builds a test-only image that deliberately reaches the
+kernel stack's absent guard page and verifies that the emergency double-fault
+task prints its diagnostic instead of resetting.
 `cargo test` does not work for this crate (a `no_std`, custom-target,
 freestanding binary); `make test` is the primary automated kernel/boot
 validation path, while the focused tape tests below cover host-side protocol
@@ -216,13 +219,16 @@ timer ticks are captured by minimal ISRs and drained by the shell loop
 between prompts; see `kernel/src/interrupts.rs`. A small bitmap-based
 physical-frame allocator (`kernel/src/pmem.rs`) tracks which 4 KiB frames
 the E820 map reports as usable, reserving everything below the kernel's
-own low-memory region. The kernel stack has a low-end canary checked from IRQ0,
-so an observed overflow halts with a diagnostic rather than continuing with
-known-corrupted state. `kernel/src/paging.rs` uses 4 MiB pages to identity-map
-the low 2 GiB physical range and the conventional high PCI-MMIO window as
-supervisor-only writable pages; the unmapped middle range turns many stray
-high pointers into diagnosable page faults. This is paging infrastructure, not
-userspace protection: all current code and tapes still execute in ring 0.
+own low-memory region. The kernel stack has both a low-end canary and an
+unmapped 4 KiB guard page. If overflow reaches that absent page, the CPU cannot
+place a page-fault frame on the exhausted stack, so IDT vector 8 task-switches
+to a dedicated TSS and emergency stack that emits a diagnostic halt instead of
+triple-faulting. `kernel/src/paging.rs` uses 4 MiB pages to identity-map the
+low 2 GiB physical range and the conventional high PCI-MMIO window as
+supervisor-only writable pages, except for the low 4 MiB page table containing
+that stack guard; the unmapped middle range turns many stray high pointers into
+diagnosable page faults. This is paging infrastructure, not userspace
+protection: all current code and tapes still execute in ring 0.
 
 ## Disk access and FOSFS
 
@@ -231,7 +237,8 @@ each validated disk operation, it calls the stage-two real-mode trampoline. The
 trampoline saves the protected-mode stack, transitions through a 16-bit protected-mode GDT descriptor into real mode,
 temporarily clearing `CR0.PG` as well as `CR0.PE`, invokes BIOS EDD (`INT
 13h`, extended read/write) for **exactly one sector**, then restores the
-caller's original protected-mode/paging state and returns an explicit status.
+caller's original protected-mode/paging state, including the kernel GDT that
+contains its TSS descriptors, and returns an explicit status.
 Because the kernel's own IDT and PIC remap
 would otherwise break genuine BIOS real-mode interrupt handling (the BDA tick
 counter BIOS's disk-timeout logic depends on stops advancing), the kernel

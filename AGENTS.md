@@ -24,12 +24,13 @@ that obscure hardware behavior.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
   low-memory kernel region through `0x40000`; do not place loader, boot-info,
   or disk-trampoline data there.
-- `kernel/src/entry.S` reserves a 32 KiB kernel stack with a low-end canary.
-  `kernel/src/stack.rs` arms it after BSS initialization and IRQ0 checks it,
-  halting on an observed overflow before known-corrupted state continues.
-  Tapes run nested inside shell calls on that stack, so fixed packet/state
-  buffers must leave headroom for the surrounding `term net` call chain; do
-  not grow tape-local arrays casually without checking the stack budget.
+- `kernel/src/entry.S` reserves a 32 KiB kernel stack with a low-end canary
+  above an unmapped 4 KiB guard page. `kernel/src/gdt.rs` installs a
+  double-fault task gate and emergency stack so an overflowed normal stack
+  produces a diagnostic halt instead of a triple fault. Tapes run nested
+  inside shell calls on that stack, so fixed packet/state buffers must leave
+  headroom for the surrounding `term net` call chain; do not grow tape-local
+  arrays casually without checking the stack budget.
 - The packed version-3 `BootInfo` at physical `0x5000` is the loader/kernel ABI;
   its disk geometry fields are 64-bit so GPT-discovered LBAs can survive the
   boot handoff.
@@ -42,19 +43,23 @@ that obscure hardware behavior.
   remap would otherwise break BIOS's real-mode interrupt handling, `transfer`
   briefly restores the real-mode IVT (`IDTR` base 0) and the BIOS-conventional
   PIC vector mapping around each individual BIOS call, temporarily disables
-  paging for that real-mode transition, then switches back.
+  paging for that real-mode transition, then switches back. The trampoline
+  reloads stage two's GDT, so `disk.rs` restores the permanent kernel GDT
+  (including the double-fault TSS descriptors) before interrupts resume.
 - `kernel/src/interrupts.rs` builds a 256-entry IDT (only IRQ0/IRQ1 gates
-  populated), remaps the 8259 PIC clear of the CPU exception range, arms the
-  PIT at 100 Hz, and services the timer/keyboard IRQs with minimal
-  `x86-interrupt` ABI handlers. Input is interrupt-driven, not polled.
+  plus vector 8's double-fault task gate populated), remaps the 8259 PIC
+  clear of the CPU exception range, arms the PIT at 100 Hz, and services the
+  timer/keyboard IRQs with minimal `x86-interrupt` ABI handlers. Input is
+  interrupt-driven, not polled.
 - `kernel/src/pmem.rs` is a small bitmap-based physical-frame allocator (4 KiB
   frames) built from the E820 map; it reserves everything below the kernel's
   own low-memory region.
-- `kernel/src/paging.rs` enables 4 MiB, supervisor-only identity mappings for
-  the first 2 GiB and the high PCI MMIO window. This retains physical-pointer
-  compatibility for DMA and the BIOS trampoline while leaving an unmapped
-  middle range for useful page-fault diagnostics; it is not userspace
-  isolation.
+- `kernel/src/paging.rs` enables supervisor-only identity mappings for the
+  first 2 GiB and the high PCI MMIO window. The low 4 MiB uses 4 KiB PTEs
+  solely to leave the kernel-stack guard page absent; the remaining low
+  range uses 4 MiB PSE mappings. This retains physical-pointer compatibility
+  for DMA and the BIOS trampoline while leaving an unmapped middle range for
+  useful page-fault diagnostics; it is not userspace isolation.
 - `kernel/src/fosfs.rs` implements FOSFS version 3, a deliberately small
   flat custom filesystem: one superblock, eight directory sectors, 64 fixed
   64-byte entries, 64-bit contiguous multi-sector extents, and bounded
@@ -167,12 +172,15 @@ tools are GNU Make, GNU `as`/`objcopy`, Python 3, and `qemu-system-i386`.
 make image    # Produces build/fos.img with all compiled tapes. Plain `make` is equivalent.
 make run      # Boots it interactively in QEMU.
 make test     # Runs the serial-driven QEMU smoke test and VGA mode test.
+make test-stack-guard # Builds a fault-injection image and verifies its emergency #DF task.
 make all      # Builds everything: image, netrom, and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
 make help     # Lists every target with a one-line description.
 ```
 
 Always run `make test` for boot, loader, kernel, shell, disk, or FOSFS changes.
+Also run `make test-stack-guard` when changing paging, GDT/IDT handling,
+exception paths, or kernel-stack layout.
 The smoke harness must use bounded waits, preserve serial output on failure,
 and wait for the prompt before sending input.
 

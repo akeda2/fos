@@ -39,7 +39,7 @@ TAPE_IMAGE_ARGS := \
 	--file ROUTER.BIN $(TAPE_ROUTER_BIN) \
 	--file ROUTER.CFG tapes/router/ROUTER.CFG
 
-.PHONY: all help kernel image run test test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed clean
+.PHONY: all help kernel image run test test-stack-guard test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -63,6 +63,7 @@ help:
 	@echo "  make image      - build build/fos.img (boot + kernel + every compiled tape)"
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
 	@echo "  make test       - build the image, then run default-NIC, e1000, dual-e1000, and VGA mode tests"
+	@echo "  make test-stack-guard - build a test-only guard-fault image and verify its emergency double-fault stack"
 	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
 	@echo "  make test-dual-e1000 - build the image, then verify two e1000 interfaces and selection"
 	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
@@ -101,8 +102,10 @@ help:
 # that leaves nothing unbuilt.
 all: image netrom tapes
 
+KERNEL_CARGO_FEATURES ?=
+
 kernel:
-	cd kernel && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	cd kernel && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec $(KERNEL_CARGO_FEATURES)
 	mkdir -p $(BUILD)
 	cp kernel/target/i686-fos/release/fos-kernel $(KERNEL_ELF)
 	objcopy -O binary $(KERNEL_ELF) $(KERNEL_BIN)
@@ -125,6 +128,10 @@ test: image
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic dual-e1000
 	python3 tools/test_vga_modes.py --image $(IMAGE)
+
+test-stack-guard:
+	$(MAKE) KERNEL_CARGO_FEATURES="--features stack-guard-test" image
+	@python3 tools/test_stack_guard.py --image $(IMAGE); status=$$?; $(MAKE) image; exit $$status
 
 test-e1000: image
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000
