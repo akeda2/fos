@@ -26,15 +26,21 @@
 //! `dhcp-server` serves every configured interface except NIC 1, deriving a
 //! pool from each subnet and allocating one in-memory lease slot per usable
 //! address for this run.
+//! NAT is enabled by default; `no-nat` disables source translation for
+//! deployments where upstream routing already reaches downstream networks,
+//! while `nat` explicitly enables it. Supplying both modes is invalid.
 //! Static interfaces also accept the legacy `NIC IP NETMASK` form and the
 //! separate `NIC IP /PREFIX` form.
-//! The router remains a fixed-buffer teaching example: there is no NAT,
+//! Downstream TCP/UDP traffic leaving through NIC 1 is source-NATed with a
+//! physical-memory-backed connection table, so hosts on the upstream LAN can
+//! reply without needing a route back to the downstream subnet. There is no
 //! dynamic routing protocol, ICMP error generation, fragmentation, or IPv6.
 
 use core::cmp::min;
 
 use router_tape::{
-    ConfigError, InterfaceConfig, MAX_INTERFACES, RouterConfig, parse_config, route_next_hop,
+    ConfigError, FileName, InterfaceConfig, MAX_INTERFACES, RouterConfig, parse_config,
+    route_next_hop,
 };
 use tape_net::{
     ArpCache, ArpOperation, ArpPacket, DHCP_CLIENT_PORT, DHCP_MAX_DNS_SERVERS,
@@ -58,6 +64,16 @@ const DHCP_LEASE_SECONDS: u32 = 7 * 24 * 60 * 60;
 const DHCP_OFFER_SECONDS: u32 = 30;
 const DHCP_RENEWAL_SECONDS: u32 = DHCP_LEASE_SECONDS / 2;
 const DHCP_REBINDING_SECONDS: u32 = DHCP_LEASE_SECONDS * 7 / 8;
+const NAT_FALLBACK_ENTRIES: usize = 32;
+const NAT_DYNAMIC_BYTES: u32 = 4 * 1024 * 1024;
+const NAT_TIMEOUT_TICKS: u64 = 60 * 100;
+const LEASE_FILE_MAGIC: &[u8; 8] = b"FOSDHCP1";
+const LEASE_FILE_VERSION: u16 = 1;
+const LEASE_FILE_HEADER_SIZE: usize = 20;
+const LEASE_FILE_RECORD_SIZE: usize = 16;
+const LEASE_FILE_STATUS_OK: u32 = 0;
+const LEASE_FILE_STATUS_NOT_FOUND: u32 = 1;
+const LEASE_FILE_STATUS_BUFFER_TOO_SMALL: u32 = 3;
 
 const TAPE_EVENT_ABORT: u32 = 1;
 
@@ -70,6 +86,11 @@ type NicMacAt = extern "C" fn(u32, u32) -> u32;
 type NicSendAt = extern "C" fn(u32, u32, u32) -> u32;
 type NicReceiveAt = extern "C" fn(u32, u32, u32) -> u32;
 type NicSetPromiscuousAt = extern "C" fn(u32, u32) -> u32;
+type TerminalPosition = extern "C" fn() -> u32;
+type FsFileLength = extern "C" fn(u32, u32, u32) -> u32;
+type FsRead = extern "C" fn(u32, u32, u32, u32, u32) -> u32;
+type FsWrite = extern "C" fn(u32, u32, u32, u32) -> u32;
+type FsRemove = extern "C" fn(u32, u32) -> u32;
 type Ticks = extern "C" fn() -> u64;
 
 struct RouterInterface {
@@ -78,6 +99,229 @@ struct RouterInterface {
     netmask: Ipv4Address,
     mac: MacAddress,
     arp: ArpCache<ARP_CACHE_SIZE>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NatState {
+    Empty,
+    Occupied,
+    Deleted,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NatEntry {
+    state: NatState,
+    protocol: u8,
+    inside_address: Ipv4Address,
+    inside_port: u16,
+    external_port: u16,
+    remote_address: Ipv4Address,
+    remote_port: u16,
+    last_used: u64,
+}
+
+impl NatEntry {
+    const fn empty() -> Self {
+        Self {
+            state: NatState::Empty,
+            protocol: 0,
+            inside_address: Ipv4Address::UNSPECIFIED,
+            inside_port: 0,
+            external_port: 0,
+            remote_address: Ipv4Address::UNSPECIFIED,
+            remote_port: 0,
+            last_used: 0,
+        }
+    }
+}
+
+// The table is normally allocated from the tape's physical-memory pool. The
+// fallback remains small so the router can still run on a machine whose E820
+// map has no memory in the coarse big pool.
+struct NatTable<'a> {
+    entries: &'a mut [NatEntry],
+    next_port: u16,
+}
+
+impl<'a> NatTable<'a> {
+    fn new(entries: &'a mut [NatEntry]) -> Self {
+        for entry in entries.iter_mut() {
+            *entry = NatEntry::empty();
+        }
+        Self {
+            entries,
+            next_port: 49152,
+        }
+    }
+
+    fn expire(&mut self, now: u64) {
+        for entry in self.entries.iter_mut() {
+            if entry.state == NatState::Occupied
+                && now.wrapping_sub(entry.last_used) >= NAT_TIMEOUT_TICKS
+            {
+                entry.state = NatState::Deleted;
+            }
+        }
+    }
+
+    fn hash_connection(
+        &self,
+        protocol: u8,
+        external_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+    ) -> usize {
+        let mut hash = u32::from(protocol);
+        hash = hash
+            .wrapping_mul(33)
+            .wrapping_add(u32::from(external_port));
+        hash = hash
+            .wrapping_mul(33)
+            .wrapping_add(address_to_u32(remote_address));
+        hash = hash
+            .wrapping_mul(33)
+            .wrapping_add(u32::from(remote_port));
+        hash as usize % self.entries.len()
+    }
+
+    fn find_inbound(
+        &self,
+        protocol: u8,
+        external_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+    ) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let start = self.hash_connection(protocol, external_port, remote_address, remote_port);
+        for offset in 0..self.entries.len() {
+            let index = (start + offset) % self.entries.len();
+            let entry = &self.entries[index];
+            match entry.state {
+                NatState::Empty => return None,
+                NatState::Deleted => {}
+                NatState::Occupied
+                    if entry.protocol == protocol
+                        && entry.external_port == external_port
+                        && entry.remote_address == remote_address
+                        && entry.remote_port == remote_port =>
+                {
+                    return Some(index);
+                }
+                NatState::Occupied => {}
+            }
+        }
+        None
+    }
+
+    fn find_slot(
+        &self,
+        protocol: u8,
+        external_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+    ) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let start = self.hash_connection(protocol, external_port, remote_address, remote_port);
+        let mut deleted = None;
+        for offset in 0..self.entries.len() {
+            let index = (start + offset) % self.entries.len();
+            match self.entries[index].state {
+                NatState::Empty => return Some(deleted.unwrap_or(index)),
+                NatState::Deleted => {
+                    if deleted.is_none() {
+                        deleted = Some(index);
+                    }
+                }
+                NatState::Occupied => {}
+            }
+        }
+        deleted
+    }
+
+    fn next_external_port(&mut self) -> u16 {
+        let port = if self.next_port < 49152 {
+            49152
+        } else {
+            self.next_port
+        };
+        self.next_port = self.next_port.wrapping_add(1);
+        port
+    }
+
+    fn outbound(
+        &mut self,
+        protocol: u8,
+        inside_address: Ipv4Address,
+        inside_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now: u64,
+    ) -> Option<u16> {
+        self.expire(now);
+        if let Some(index) = self
+            .find_inbound(protocol, inside_port, remote_address, remote_port)
+            .filter(|index| self.entries[*index].inside_address == inside_address)
+        {
+            self.entries[index].last_used = now;
+            return Some(self.entries[index].external_port);
+        }
+        if let Some(index) = self.entries.iter().position(|entry| {
+            entry.state == NatState::Occupied
+                && entry.inside_address == inside_address
+                && entry.inside_port == inside_port
+                && entry.remote_address == remote_address
+                && entry.remote_port == remote_port
+        }) {
+            self.entries[index].last_used = now;
+            return Some(self.entries[index].external_port);
+        }
+
+        let mut external_port = inside_port;
+        for attempt in 0..=u16::MAX {
+            if self
+                .find_inbound(protocol, external_port, remote_address, remote_port)
+                .is_none()
+            {
+                break;
+            }
+            if attempt == u16::MAX {
+                return None;
+            }
+            external_port = self.next_external_port();
+        }
+        let slot = self.find_slot(protocol, external_port, remote_address, remote_port)?;
+        self.entries[slot] = NatEntry {
+            state: NatState::Occupied,
+            protocol,
+            inside_address,
+            inside_port,
+            external_port,
+            remote_address,
+            remote_port,
+            last_used: now,
+        };
+        Some(external_port)
+    }
+
+    fn inbound(
+        &mut self,
+        protocol: u8,
+        external_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now: u64,
+    ) -> Option<(Ipv4Address, u16)> {
+        let index = self.find_inbound(protocol, external_port, remote_address, remote_port)?;
+        let entry = &mut self.entries[index];
+        entry.last_used = now;
+        Some((entry.inside_address, entry.inside_port))
+    }
 }
 
 #[repr(u8)]
@@ -114,6 +358,7 @@ struct DhcpServer<'a> {
     leases: &'a mut [DhcpLeaseSlot],
     pool_start: u32,
     pool_end: u32,
+    dirty: bool,
 }
 
 impl<'a> DhcpServer<'a> {
@@ -125,6 +370,7 @@ impl<'a> DhcpServer<'a> {
             leases,
             pool_start,
             pool_end,
+            dirty: false,
         }
     }
 
@@ -137,8 +383,17 @@ impl<'a> DhcpServer<'a> {
             if lease.state != LeaseState::Empty && now.wrapping_sub(lease.expires_at) < 0x8000_0000
             {
                 *lease = DhcpLeaseSlot::empty();
+                self.dirty = true;
             }
         }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn clear_dirty(&mut self) {
+        self.dirty = false;
     }
 
     fn find_mac(&self, mac: MacAddress) -> Option<usize> {
@@ -174,6 +429,7 @@ impl<'a> DhcpServer<'a> {
             mac,
             expires_at: now.wrapping_add(DHCP_OFFER_SECONDS),
         };
+        self.dirty = true;
         Some(slot)
     }
 
@@ -213,10 +469,12 @@ impl<'a> DhcpServer<'a> {
                 mac,
                 expires_at: now.wrapping_add(DHCP_OFFER_SECONDS),
             };
+            self.dirty = true;
             Some(slot)
         })?;
         self.leases[index].state = LeaseState::Bound;
         self.leases[index].expires_at = now.wrapping_add(DHCP_LEASE_SECONDS);
+        self.dirty = true;
         Some(index)
     }
 
@@ -224,8 +482,191 @@ impl<'a> DhcpServer<'a> {
         if let Some(index) = self.find_mac(mac) {
             if address == Ipv4Address::UNSPECIFIED || self.address(index) == address {
                 self.leases[index] = DhcpLeaseSlot::empty();
+                self.dirty = true;
             }
         }
+    }
+
+    fn restore(&mut self, mac: MacAddress, address: Ipv4Address, now: u32) -> bool {
+        let Some(index) = self.address_index(address) else {
+            return false;
+        };
+        if self.leases[index].state != LeaseState::Empty || self.find_mac(mac).is_some() {
+            return false;
+        }
+        self.leases[index] = DhcpLeaseSlot {
+            state: LeaseState::Bound,
+            mac,
+            expires_at: now.wrapping_add(DHCP_LEASE_SECONDS),
+        };
+        self.dirty = true;
+        true
+    }
+}
+
+fn lease_file_capacity<'a>(
+    servers: &[Option<DhcpServer<'a>>; MAX_INTERFACES],
+) -> Option<usize> {
+    servers
+        .iter()
+        .flatten()
+        .try_fold(LEASE_FILE_HEADER_SIZE, |capacity, server| {
+            capacity.checked_add(server.leases.len().checked_mul(LEASE_FILE_RECORD_SIZE)?)
+        })
+}
+
+fn lease_checksum(bytes: &[u8]) -> u32 {
+    let mut value = 2_166_136_261u32;
+    for &byte in bytes {
+        value = (value ^ u32::from(byte)).wrapping_mul(16_777_619);
+    }
+    value
+}
+
+fn lease_get_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn lease_get_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn lease_put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn lease_put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn restore_lease_file<'a>(
+    bytes: &[u8],
+    interfaces: &[RouterInterface; MAX_INTERFACES],
+    servers: &mut [Option<DhcpServer<'a>>; MAX_INTERFACES],
+    now: u32,
+) -> Result<usize, ()> {
+    if bytes.len() < LEASE_FILE_HEADER_SIZE
+        || &bytes[..8] != LEASE_FILE_MAGIC
+        || lease_get_u16(bytes, 8) != LEASE_FILE_VERSION
+        || lease_get_u16(bytes, 10) != LEASE_FILE_RECORD_SIZE as u16
+    {
+        return Err(());
+    }
+    let record_count = usize::try_from(lease_get_u32(bytes, 12)).map_err(|_| ())?;
+    let expected_length = LEASE_FILE_HEADER_SIZE
+        .checked_add(record_count.checked_mul(LEASE_FILE_RECORD_SIZE).ok_or(())?)
+        .ok_or(())?;
+    if expected_length != bytes.len() || lease_get_u32(bytes, 16) != lease_checksum(&bytes[20..]) {
+        return Err(());
+    }
+
+    let mut restored = 0;
+    for record in bytes[LEASE_FILE_HEADER_SIZE..].chunks_exact(LEASE_FILE_RECORD_SIZE) {
+        let nic = lease_get_u32(record, 0);
+        let address = address_from_u32(lease_get_u32(record, 4));
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&record[8..14]);
+        for (index, interface) in interfaces.iter().enumerate() {
+            if interface.nic == nic {
+                if let Some(server) = servers[index].as_mut() {
+                    if server.restore(MacAddress::new(mac), address, now) {
+                        restored += 1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    for server in servers.iter_mut().flatten() {
+        server.clear_dirty();
+    }
+    Ok(restored)
+}
+
+fn flush_lease_file<'a>(
+    name: FileName,
+    buffer_address: u32,
+    capacity: usize,
+    interfaces: &[RouterInterface; MAX_INTERFACES],
+    servers: &mut [Option<DhcpServer<'a>>; MAX_INTERFACES],
+    fs_write: FsWrite,
+) -> u32 {
+    if capacity > u32::MAX as usize {
+        return LEASE_FILE_STATUS_BUFFER_TOO_SMALL;
+    }
+    let buffer = unsafe {
+        core::slice::from_raw_parts_mut(buffer_address as *mut u8, capacity)
+    };
+    buffer.fill(0);
+    buffer[..8].copy_from_slice(LEASE_FILE_MAGIC);
+    lease_put_u16(buffer, 8, LEASE_FILE_VERSION);
+    lease_put_u16(buffer, 10, LEASE_FILE_RECORD_SIZE as u16);
+    let mut record_count = 0u32;
+    let mut offset = LEASE_FILE_HEADER_SIZE;
+    for (index, server) in servers.iter().enumerate() {
+        let Some(server) = server.as_ref() else {
+            continue;
+        };
+        for (lease_index, lease) in server.leases.iter().enumerate() {
+            if lease.state != LeaseState::Bound {
+                continue;
+            }
+            if offset + LEASE_FILE_RECORD_SIZE > capacity {
+                return LEASE_FILE_STATUS_BUFFER_TOO_SMALL;
+            }
+            lease_put_u32(buffer, offset, interfaces[index].nic);
+            lease_put_u32(buffer, offset + 4, address_to_u32(server.address(lease_index)));
+            buffer[offset + 8..offset + 14].copy_from_slice(&lease.mac.0);
+            offset += LEASE_FILE_RECORD_SIZE;
+            record_count = record_count.saturating_add(1);
+        }
+    }
+    lease_put_u32(buffer, 12, record_count);
+    lease_put_u32(buffer, 16, lease_checksum(&buffer[LEASE_FILE_HEADER_SIZE..offset]));
+    fs_write(
+        name.as_bytes().as_ptr() as u32,
+        name.len as u32,
+        buffer_address,
+        offset as u32,
+    )
+}
+
+fn lease_servers_dirty<'a>(servers: &[Option<DhcpServer<'a>>; MAX_INTERFACES]) -> bool {
+    servers.iter().flatten().any(DhcpServer::is_dirty)
+}
+
+fn persist_leases<'a>(
+    putc: Putc,
+    name: FileName,
+    storage: &mut Option<(u32, usize)>,
+    needs_flush: &mut bool,
+    interfaces: &[RouterInterface; MAX_INTERFACES],
+    servers: &mut [Option<DhcpServer<'a>>; MAX_INTERFACES],
+    fs_write: FsWrite,
+    free: Free,
+) -> bool {
+    let Some((address, capacity)) = *storage else {
+        return false;
+    };
+    let status = flush_lease_file(name, address, capacity, interfaces, servers, fs_write);
+    if status == LEASE_FILE_STATUS_OK {
+        for server in servers.iter_mut().flatten() {
+            server.clear_dirty();
+        }
+        *needs_flush = false;
+        true
+    } else {
+        print_bytes(putc, b"DHCP lease persistence disabled after write error (status ");
+        print_u32(putc, status);
+        print_bytes(putc, b").\n");
+        free(address, capacity as u32);
+        *storage = None;
+        false
     }
 }
 
@@ -302,12 +743,20 @@ fn print_config_error(putc: Putc, error: ConfigError) {
         ConfigError::MissingDnsValue => &b"dns must be followed by at least one IPv4 address"[..],
         ConfigError::BadDnsServer => &b"invalid DNS server IPv4 address"[..],
         ConfigError::TooManyDnsServers => &b"at most two DNS servers may be configured"[..],
+        ConfigError::ConflictingNatMode => &b"nat and no-nat cannot both be configured"[..],
+        ConfigError::MissingLeaseFileName => {
+            &b"dhcp-lease-file must be followed by a FOSFS file name"[..]
+        },
+        ConfigError::BadLeaseFileName => &b"invalid DHCP lease file name"[..],
+        ConfigError::LeaseFileRequiresDhcpServer => {
+            &b"dhcp-lease-file requires dhcp-server"[..]
+        },
     };
     print_bytes(putc, b"Router configuration error: ");
     print_bytes(putc, message);
     print_bytes(
         putc,
-        b". Usage: tape run router [dhcp] [dhcp-server] [dns SERVER [SERVER]] \
+        b". Usage: tape run router [dhcp] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [dns SERVER [SERVER]] \
 NIC IP NETMASK ... [default NIC GATEWAY] (or NIC IP/PREFIX)\n",
     );
 }
@@ -872,6 +1321,71 @@ fn is_local(
         .any(|interface| interface.address == address)
 }
 
+fn transport_ports(payload: &[u8], protocol: u8) -> Option<(u16, u16)> {
+    let header_len = match protocol {
+        6 => 20,
+        17 => 8,
+        _ => return None,
+    };
+    if payload.len() < header_len {
+        return None;
+    }
+    Some((
+        u16::from_be_bytes([payload[0], payload[1]]),
+        u16::from_be_bytes([payload[2], payload[3]]),
+    ))
+}
+
+fn checksum_replace(checksum: u16, old: u16, new: u16) -> u16 {
+    let mut sum = u32::from(!checksum) + u32::from(!old) + u32::from(new);
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+// TCP and UDP checksums include the IPv4 pseudo-header. Recalculate only the
+// changed address and port words so transport options and payload bytes stay
+// untouched while NAT rewrites the packet.
+fn rewrite_transport(
+    payload: &mut [u8],
+    protocol: u8,
+    old_address: Ipv4Address,
+    new_address: Ipv4Address,
+    old_port: u16,
+    new_port: u16,
+    source: bool,
+) -> bool {
+    let (checksum_offset, port_offset) = match protocol {
+        6 if payload.len() >= 20 => (16, if source { 0 } else { 2 }),
+        17 if payload.len() >= 8 => (6, if source { 0 } else { 2 }),
+        _ => return false,
+    };
+    let checksum =
+        u16::from_be_bytes([payload[checksum_offset], payload[checksum_offset + 1]]);
+    let port = u16::from_be_bytes([payload[port_offset], payload[port_offset + 1]]);
+    if port != old_port {
+        return false;
+    }
+    payload[port_offset..port_offset + 2].copy_from_slice(&new_port.to_be_bytes());
+    if checksum != 0 {
+        let mut updated = checksum;
+        updated = checksum_replace(
+            updated,
+            u16::from_be_bytes([old_address.0[0], old_address.0[1]]),
+            u16::from_be_bytes([new_address.0[0], new_address.0[1]]),
+        );
+        updated = checksum_replace(
+            updated,
+            u16::from_be_bytes([old_address.0[2], old_address.0[3]]),
+            u16::from_be_bytes([new_address.0[2], new_address.0[3]]),
+        );
+        updated = checksum_replace(updated, old_port, new_port);
+        payload[checksum_offset..checksum_offset + 2].copy_from_slice(&updated.to_be_bytes());
+    }
+    true
+}
+
 fn forward_ipv4(
     ingress: usize,
     frame: &[u8],
@@ -883,7 +1397,10 @@ fn forward_ipv4(
     nic_receive_at: NicReceiveAt,
     should_abort: ShouldAbort,
     ticks: Ticks,
+    nat: &mut NatTable,
+    nat_enabled: bool,
     receive_buffer: &mut [u8; MAX_FRAME_LEN],
+    transport_buffer: &mut [u8; MAX_FRAME_LEN],
     ip_buffer: &mut [u8; MAX_FRAME_LEN],
     output_buffer: &mut [u8; MAX_FRAME_LEN],
     max_frame_len: usize,
@@ -897,21 +1414,89 @@ fn forward_ipv4(
     let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else {
         return ForwardResult::Dropped;
     };
+    let now = ticks();
+    let mut header = packet.header;
+    let payload_len = packet.payload.len();
+    let mut payload_in_transport_buffer = false;
+    if nat_enabled
+        && interfaces[ingress].nic == 0
+        && packet.header.destination == interfaces[ingress].address
+    {
+        let Some((source_port, destination_port)) =
+            transport_ports(packet.payload, packet.header.protocol)
+        else {
+            return ForwardResult::Dropped;
+        };
+        let Some((inside_address, inside_port)) = nat.inbound(
+            packet.header.protocol,
+            destination_port,
+            packet.header.source,
+            source_port,
+            now,
+        ) else {
+            return ForwardResult::Dropped;
+        };
+        transport_buffer[..payload_len].copy_from_slice(packet.payload);
+        if !rewrite_transport(
+            &mut transport_buffer[..payload_len],
+            packet.header.protocol,
+            packet.header.destination,
+            inside_address,
+            destination_port,
+            inside_port,
+            false,
+        ) {
+            return ForwardResult::Dropped;
+        }
+        header.destination = inside_address;
+        payload_in_transport_buffer = true;
+    }
     interfaces[ingress]
         .arp
-        .insert(packet.header.source, ethernet.source, ticks() as u32);
-    if is_local(interfaces, count, packet.header.destination)
-        || is_broadcast_or_multicast(packet.header.destination)
+        .insert(header.source, ethernet.source, now as u32);
+    if is_local(interfaces, count, header.destination)
+        || is_broadcast_or_multicast(header.destination)
     {
         return ForwardResult::Dropped;
     }
     let Some((egress, next_hop)) =
-        route_next_hop(configs, count, packet.header.destination, default_route)
+        route_next_hop(configs, count, header.destination, default_route)
     else {
         return ForwardResult::Dropped;
     };
-    if egress == ingress || packet.header.ttl <= 1 {
+    if egress == ingress || header.ttl <= 1 {
         return ForwardResult::Dropped;
+    }
+    let mut payload_rewritten = payload_in_transport_buffer;
+    if nat_enabled && interfaces[ingress].nic != 0 && interfaces[egress].nic == 0 {
+        if let Some((source_port, destination_port)) =
+            transport_ports(packet.payload, header.protocol)
+        {
+            let Some(external_port) = nat.outbound(
+                header.protocol,
+                header.source,
+                source_port,
+                header.destination,
+                destination_port,
+                now,
+            ) else {
+                return ForwardResult::Dropped;
+            };
+            transport_buffer[..payload_len].copy_from_slice(packet.payload);
+            if !rewrite_transport(
+                &mut transport_buffer[..payload_len],
+                header.protocol,
+                header.source,
+                interfaces[egress].address,
+                source_port,
+                external_port,
+                true,
+            ) {
+                return ForwardResult::Dropped;
+            }
+            payload_rewritten = true;
+            header.source = interfaces[egress].address;
+        }
     }
     let Some(destination_mac) = resolve_mac(
         egress,
@@ -927,11 +1512,14 @@ fn forward_ipv4(
     ) else {
         return ForwardResult::Dropped;
     };
-    let mut header = packet.header;
     header.ttl -= 1;
     let forwarded = Ipv4Packet {
         header,
-        payload: packet.payload,
+        payload: if payload_rewritten {
+            &transport_buffer[..payload_len]
+        } else {
+            packet.payload
+        },
     };
     let Ok(ip_length) = forwarded.encode(ip_buffer) else {
         return ForwardResult::Dropped;
@@ -984,6 +1572,11 @@ pub extern "C" fn tape_main(
     nic_send_at: NicSendAt,
     nic_receive_at: NicReceiveAt,
     nic_set_promiscuous_at: NicSetPromiscuousAt,
+    _terminal_position: TerminalPosition,
+    fs_file_length: FsFileLength,
+    fs_read: FsRead,
+    fs_write: FsWrite,
+    _fs_remove: FsRemove,
 ) {
     let nic_total = nic_count() as usize;
     let arguments = if args_len == 0 {
@@ -1212,6 +1805,134 @@ pub extern "C" fn tape_main(
             return;
         }
     }
+    let mut lease_file_storage: Option<(u32, usize)> = None;
+    let mut lease_file_needs_flush = false;
+    if let Some(lease_file) = parsed.dhcp_lease_file {
+        match lease_file_capacity(&dhcp_servers) {
+            Some(capacity) => match u32::try_from(capacity) {
+                Ok(capacity_u32) => {
+                    let buffer_address = alloc(capacity_u32);
+                    if buffer_address == 0 {
+                        print_bytes(
+                            putc,
+                            b"DHCP lease persistence disabled: insufficient memory for the lease file.\n",
+                        );
+                    } else {
+                        lease_file_storage = Some((buffer_address, capacity));
+                        let mut file_length = 0u64;
+                        match fs_file_length(
+                            lease_file.as_bytes().as_ptr() as u32,
+                            lease_file.len as u32,
+                            (&mut file_length as *mut u64) as u32,
+                        ) {
+                            LEASE_FILE_STATUS_NOT_FOUND => {
+                                print_bytes(
+                                    putc,
+                                    b"DHCP lease persistence enabled; no existing lease file.\n",
+                                );
+                            }
+                            LEASE_FILE_STATUS_OK
+                                if file_length <= u64::from(capacity_u32) =>
+                            {
+                                let mut read_length = 0u32;
+                                let status = fs_read(
+                                    lease_file.as_bytes().as_ptr() as u32,
+                                    lease_file.len as u32,
+                                    buffer_address,
+                                    capacity_u32,
+                                    (&mut read_length as *mut u32) as u32,
+                                );
+                                if status == LEASE_FILE_STATUS_OK {
+                                    let bytes = unsafe {
+                                        core::slice::from_raw_parts(
+                                            buffer_address as *const u8,
+                                            read_length as usize,
+                                        )
+                                    };
+                                    match restore_lease_file(
+                                        bytes,
+                                        &interfaces,
+                                        &mut dhcp_servers,
+                                        (ticks() / 100) as u32,
+                                    ) {
+                                        Ok(restored) => {
+                                            print_bytes(
+                                                putc,
+                                                b"DHCP lease persistence restored ",
+                                            );
+                                            print_u32(putc, restored as u32);
+                                            print_bytes(putc, b" lease(s).\n");
+                                        }
+                                        Err(()) => {
+                                            print_bytes(
+                                                putc,
+                                                b"DHCP lease file was invalid; starting with empty tables.\n",
+                                            );
+                                            lease_file_needs_flush = true;
+                                        }
+                                    }
+                                } else {
+                                    print_bytes(
+                                        putc,
+                                        b"DHCP lease persistence disabled: could not read the lease file.\n",
+                                    );
+                                    free(buffer_address, capacity_u32);
+                                    lease_file_storage = None;
+                                }
+                            }
+                            LEASE_FILE_STATUS_OK => {
+                                print_bytes(
+                                    putc,
+                                    b"DHCP lease file is too large; starting with empty tables.\n",
+                                );
+                                lease_file_needs_flush = true;
+                            }
+                            _ => {
+                                print_bytes(
+                                    putc,
+                                    b"DHCP lease persistence disabled: disk is unavailable.\n",
+                                );
+                                free(buffer_address, capacity_u32);
+                                lease_file_storage = None;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    print_bytes(
+                        putc,
+                        b"DHCP lease persistence disabled: lease buffer is too large.\n",
+                    );
+                }
+            },
+            None => {
+                print_bytes(
+                    putc,
+                    b"DHCP lease persistence disabled: lease buffer size overflowed.\n",
+                );
+            }
+        }
+    } else if parsed.dhcp_server {
+        print_bytes(
+            putc,
+            b"DHCP lease persistence disabled; leases are memory-only.\n",
+        );
+    }
+    let lease_file = parsed.dhcp_lease_file;
+    if lease_file_needs_flush {
+        if let Some(name) = lease_file {
+            let _ = persist_leases(
+                putc,
+                name,
+                &mut lease_file_storage,
+                &mut lease_file_needs_flush,
+                &interfaces,
+                &mut dhcp_servers,
+                fs_write,
+                free,
+            );
+        }
+    }
     let _ = nic_set_promiscuous_at;
     print_startup(
         putc,
@@ -1219,8 +1940,42 @@ pub extern "C" fn tape_main(
         interface_count,
         default_route.map(|route| (route.nic, route.gateway)),
     );
+    if parsed.nat {
+        print_bytes(
+            putc,
+            b"NAT: TCP/UDP masquerading enabled from non-primary NICs to NIC 1.\n",
+        );
+    } else {
+        print_bytes(
+            putc,
+            b"NAT: disabled; upstream routing must reach downstream networks.\n",
+        );
+    }
     let mut arp_receive_buffer = [0u8; MAX_FRAME_LEN];
+    let mut fallback_nat_entries = [NatEntry::empty(); NAT_FALLBACK_ENTRIES];
+    let nat_allocation = if parsed.nat {
+        alloc(NAT_DYNAMIC_BYTES)
+    } else {
+        0
+    };
+    let mut nat = if nat_allocation != 0 {
+        let entry_count = NAT_DYNAMIC_BYTES as usize / core::mem::size_of::<NatEntry>();
+        let entries = unsafe {
+            core::slice::from_raw_parts_mut(nat_allocation as *mut NatEntry, entry_count)
+        };
+        print_bytes(putc, b"NAT: allocated ");
+        print_u32(putc, entry_count as u32);
+        print_bytes(putc, b" flow slots from physical memory.\n");
+        NatTable::new(entries)
+    } else {
+        print_bytes(
+            putc,
+            b"NAT: physical-memory allocation unavailable; using 32 flow slots.\n",
+        );
+        NatTable::new(&mut fallback_nat_entries)
+    };
     let mut ip_buffer = [0u8; MAX_FRAME_LEN];
+    let mut transport_buffer = [0u8; MAX_FRAME_LEN];
     let mut output_buffer = [0u8; MAX_FRAME_LEN];
     let mut forwarded = 0u32;
     let mut dropped = 0u32;
@@ -1240,6 +1995,7 @@ pub extern "C" fn tape_main(
             }
             let length = min(length, MAX_FRAME_LEN);
             if parsed.dhcp_server && interfaces[ingress].nic != 0 {
+                let mut lease_changed = false;
                 if let Some(server) = dhcp_servers[ingress].as_mut() {
                     let _ = dhcp_reply(
                         &interfaces[ingress],
@@ -1251,6 +2007,21 @@ pub extern "C" fn tape_main(
                         nic_send_at,
                         max_frame_len,
                     );
+                    lease_changed = server.is_dirty();
+                }
+                if lease_changed || lease_file_needs_flush {
+                    if let Some(name) = lease_file {
+                        let _ = persist_leases(
+                            putc,
+                            name,
+                            &mut lease_file_storage,
+                            &mut lease_file_needs_flush,
+                            &interfaces,
+                            &mut dhcp_servers,
+                            fs_write,
+                            free,
+                        );
+                    }
                 }
             }
             process_arp(
@@ -1271,7 +2042,10 @@ pub extern "C" fn tape_main(
                 nic_receive_at,
                 should_abort,
                 ticks,
+                &mut nat,
+                parsed.nat,
                 &mut arp_receive_buffer,
+                &mut transport_buffer,
                 &mut ip_buffer,
                 &mut output_buffer,
                 max_frame_len,
@@ -1282,10 +2056,32 @@ pub extern "C" fn tape_main(
         }
     }
 
+    if lease_file_storage.is_some() && (lease_file_needs_flush || lease_servers_dirty(&dhcp_servers))
+    {
+        if let Some(name) = lease_file {
+            let _ = persist_leases(
+                putc,
+                name,
+                &mut lease_file_storage,
+                &mut lease_file_needs_flush,
+                &interfaces,
+                &mut dhcp_servers,
+                fs_write,
+                free,
+            );
+        }
+    }
     for server in &mut dhcp_servers {
         *server = None;
     }
+    if let Some((address, capacity)) = lease_file_storage {
+        free(address, capacity as u32);
+    }
     free_dhcp_allocations(&mut dhcp_allocations, free);
+    drop(nat);
+    if nat_allocation != 0 {
+        free(nat_allocation, NAT_DYNAMIC_BYTES);
+    }
     print_bytes(putc, b"Router stopped; forwarded ");
     print_u32(putc, forwarded);
     print_bytes(putc, b" IPv4 frame(s), dropped ");

@@ -68,11 +68,18 @@ that obscure hardware behavior.
 - `tapes/router/` is a fixed-buffer layer-3 tape. It reuses the bridge's
   polling shape, answers ARP per configured interface, and forwards IPv4
   packets between directly connected subnets while updating TTL and header
-  checksum. Its syntax is `tape run router [dhcp] [dhcp-server] NIC IP/PREFIX ... [default
+  checksum. Its syntax is `tape run router [dhcp] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] NIC IP/PREFIX ... [default
   NIC GATEWAY]` (legacy dotted `NIC IP NETMASK` and separate `NIC IP /PREFIX`
   forms remain accepted); NIC numbers are one-based, `dhcp` configures NIC 1
   (callback index zero), and an explicit or DHCP-supplied gateway handles
-  unmatched destinations. `dhcp-server` serves every configured interface
+  unmatched destinations. NAT is enabled by default; `no-nat` disables it for
+  deployments where upstream routing reaches the downstream subnets, while
+  `nat` explicitly enables it. When enabled, TCP/UDP traffic leaving
+  non-primary NICs through NIC 1 is source-NATed through a 4 MiB
+  physical-memory-backed table and reverse-translated for replies, with a
+  32-slot fallback if allocation is unavailable, so upstream hosts do not
+  need a route back to the downstream subnet. `dhcp-server` serves every
+  configured interface
   except NIC 1 using an automatically derived subnet pool with one in-memory
   lease slot per usable address, and seven-day leases. Upstream DHCP DNS
   values are propagated to downstream clients; a `dns SERVER [SERVER]`
@@ -80,8 +87,10 @@ that obscure hardware behavior.
   persistence. It also accepts `tape run router @ROUTER.CFG`: the shell reads the uppercase
   FOSFS file and passes its contents through the existing startup-argument
   ABI; `#` comments and newlines are accepted, with a 4096-byte fixed limit.
-  The tape does not perform disk I/O. It deliberately has no NAT, dynamic
-  routing, ICMP errors, fragmentation, or IPv6.
+  `dhcp-lease-file NAME` optionally persists bound DHCP assignments through
+  the tape filesystem callbacks; omitting it keeps the router diskless. The
+  tape deliberately has no dynamic routing,
+  ICMP errors, fragmentation, or IPv6.
 
 ## Low-memory map
 
@@ -1076,9 +1085,9 @@ limit is the reserved `0x10000..0x40000` low-memory region, currently
 384 sectors, and `tools/write_layout.py` emits that limit.
 
 The fix: a second allocator, the "big pool" (`BIG_BITMAP`,
-`BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 1 GiB,
+`BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 2 GiB,
 `BIG_CHUNK_SIZE` = 1 MiB granularity instead of 4 KiB), tracked by its
-own tiny ~112-byte bitmap (896 MiB / 1 MiB / 8) -- negligible compared to
+own tiny ~240-byte bitmap (1920 MiB / 1 MiB / 8) -- negligible compared to
 the fine-grained pool's bitmap, so `kernel.bin` barely grows at all. The
 coarser 1 MiB granularity costs nothing in practice: a tape asking for
 `alloc` almost certainly wants one big contiguous block (a buffer, not

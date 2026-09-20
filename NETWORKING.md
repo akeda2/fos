@@ -145,6 +145,11 @@ The optional `dhcp` word reserves NIC 1 (callback index zero) for the
 tape run router dhcp 2 10.0.2.1 255.255.255.0
 ```
 
+NAT is enabled by default. Add `no-nat` when the upstream network has an
+explicit route back to the downstream subnets and should receive the original
+source addresses; `nat` may be written explicitly to document or re-enable
+masquerading.
+
 DHCP requires the same bounded polling discipline as the router: it uses only
 the indexed NIC callbacks, checks `should_abort`, retries for a finite timeout,
 and reports whether the lease supplied an address, netmask, and router. If no
@@ -153,7 +158,15 @@ default. At least two interfaces are required, NIC selections must be unique
 and exist, and an explicit gateway must be on the selected interface's
 subnet. Packets addressed to the router itself, IPv4 broadcast/multicast,
 unknown networks without a default, TTL 1, and malformed/checksum-invalid
-IPv4 packets are dropped. NAT, dynamic routing, ICMP
+IPv4 packets are dropped. When enabled, the router performs TCP/UDP source NAT using a
+4 MiB physical-memory-backed table when traffic leaves a non-primary NIC
+through NIC 1, and reverses that mapping for replies. This provides tens of
+thousands of flow slots and lets downstream DHCP clients reach hosts on the
+upstream LAN without requiring those hosts to learn a route back to the
+downstream subnet. If allocation is unavailable, it falls back to 32 slots.
+Entries expire after ten minutes; new flows are rejected when the table is
+full rather than evicting existing mappings. Non-TCP/UDP traffic is forwarded
+without translation. Dynamic routing, ICMP
 unreachable/time-exceeded errors, fragmentation/reassembly, IPv6, and a kernel
 socket layer remain out of scope. `make test-tape-router` runs the
 three-party QEMU/multicast test that verifies ARP, forwarding in both
@@ -190,10 +203,14 @@ dns 192.168.1.53 1.1.1.1
 2 10.0.2.1/24
 ```
 
-The router does not run DNS and does not persist leases. A /31 or /32
-interface has no usable pool and is skipped. This is deliberately a DHCP
-service for the router's directly connected LANs, not a general DHCP relay or
-network-management daemon.
+The router does not run DNS. Lease persistence is optional: add
+`dhcp-lease-file NAME` alongside `dhcp-server` to save bound MAC-to-address
+assignments in FOSFS. Omitting it keeps the router diskless; an unavailable
+disk also falls back to memory-only operation. Persisted assignments restart
+their seven-day lease timer at the next boot because tapes have no
+battery-backed wall-clock callback. A /31 or /32 interface has no usable pool
+and is skipped. This is deliberately a DHCP service for the router's directly
+connected LANs, not a general DHCP relay or network-management daemon.
 
 For repeatable setups, router arguments may be stored in an uppercase FOSFS
 file and supplied with `@FILE`:
@@ -201,13 +218,15 @@ file and supplied with `@FILE`:
 ```text
 # ROUTER.CFG
 dhcp-server
+dhcp-lease-file DHCP.LEASES
 1 10.0.1.1/24
 2 10.0.2.1/24
 ```
 
 Run it with `tape run router @ROUTER.CFG`. The shell reads the file through
 the kernel's FOSFS/BIOS disk path and passes its bytes through the existing
-tape startup-argument ABI; the router tape does not access the disk itself.
+tape startup-argument ABI. The router's optional lease persistence uses the
+high-level FOSFS tape callbacks rather than accessing raw sectors or BIOS.
 Router configuration accepts newlines and `#` comments, and the file is
 limited to 4096 bytes by the shell's fixed configuration buffer.
 

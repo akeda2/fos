@@ -13,6 +13,7 @@ TAPE_BIGSIEVE_BIN := $(BUILD)/tapes/bigsieve.bin
 TAPE_LONGMODE_BIN := $(BUILD)/tapes/longmode.bin
 TAPE_LONGMODE_RS_BIN := $(BUILD)/tapes/longmode-rs.bin
 TAPE_CALC_BIN := $(BUILD)/tapes/calc.bin
+TAPE_ED_BIN := $(BUILD)/tapes/ed.bin
 TAPE_BEEP_BIN := $(BUILD)/tapes/beep.bin
 TAPE_MORSE_BIN := $(BUILD)/tapes/morse.bin
 TAPE_NET_CHAT_BIN := $(BUILD)/tapes/net-chat.bin
@@ -28,6 +29,7 @@ TAPE_IMAGE_ARGS := \
 	--file LONGMODE.BIN $(TAPE_LONGMODE_BIN) \
 	--file LONG-RS.BIN $(TAPE_LONGMODE_RS_BIN) \
 	--file CALC.BIN $(TAPE_CALC_BIN) \
+	--file ED.BIN $(TAPE_ED_BIN) \
 	--file BEEP.BIN $(TAPE_BEEP_BIN) \
 	--file MORSE.BIN $(TAPE_MORSE_BIN) \
 	--file NET-CHAT.BIN $(TAPE_NET_CHAT_BIN) \
@@ -37,7 +39,7 @@ TAPE_IMAGE_ARGS := \
 	--file ROUTER.BIN $(TAPE_ROUTER_BIN) \
 	--file ROUTER.CFG tapes/router/ROUTER.CFG
 
-.PHONY: all help kernel image run test test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router clean
+.PHONY: all help kernel image run test test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -66,7 +68,7 @@ help:
 	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
 	@echo "  make test-vga-modes - verify 80x25, 80x50, and experimental 132x25 under QEMU"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-ed + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
@@ -74,6 +76,7 @@ help:
 	@echo "  make tape-longmode   - build build/tapes/longmode.bin (asm shim + asm body, visits 64-bit long mode and returns)"
 	@echo "  make tape-longmode-rs - build build/tapes/longmode-rs.bin (same asm shim, but the 64-bit body is Rust)"
 	@echo "  make tape-calc       - build build/tapes/calc.bin (Rust RPN calculator tape; uses read_key/args_ptr/args_len)"
+	@echo "  make tape-ed         - build build/tapes/ed.bin (Rust line editor tape; uses FOSFS callbacks)"
 	@echo "  make tape-beep       - build build/tapes/beep.bin (Rust PC speaker tape; beeps on b via read_key)"
 	@echo "  make tape-morse      - build build/tapes/morse.bin (Rust Morse trainer; plays A-Z/0-9 via read_key)"
 	@echo "  make tape-net-chat   - build build/tapes/net-chat.bin (Rust shell-compatible Ethernet chat tape)"
@@ -86,6 +89,7 @@ help:
 	@echo "  make test-tape-telnet - run host-side unit tests for tapes/telnet"
 	@echo "  make test-tape-bridge - build the image/tape and run the three-guest layer-2 bridge test"
 	@echo "  make test-tape-router - build the image/tape and run the three-guest IPv4 router test"
+	@echo "  make test-tape-ed     - build the image/tape and verify editor FOSFS persistence"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -147,7 +151,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -275,6 +279,14 @@ tape-calc:
 	mkdir -p $(BUILD)/tapes
 	cp tapes/calc/target/i686-fos/release/calc-tape $(TAPE_CALC_BIN)
 
+# Builds the core line-oriented Rust editor. It uses the complete-file FOSFS
+# callbacks, a bounded allocated text buffer, and read_key for local or
+# remote `term net` input. See tapes/ed/src/main.rs for its command model.
+tape-ed:
+	cd tapes/ed && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	cp tapes/ed/target/i686-fos/release/ed-tape $(TAPE_ED_BIN)
+
 # Builds the "beep" test tape: a 32-bit Rust tape using the newest
 # twelve-argument ABI and `read_key` to drive the PC speaker directly.
 # Each lowercase or shifted `b` press starts a 440 Hz, approximately
@@ -346,5 +358,8 @@ tape-router:
 test-tape-router: image tape-router
 	python3 tapes/test_router_e2e.py
 
+test-tape-ed: image tape-ed
+	python3 tapes/test_ed_e2e.py
+
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target tapes/net-chat/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target tapes/ed/target tapes/net-chat/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target

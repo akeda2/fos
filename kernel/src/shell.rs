@@ -1530,6 +1530,15 @@ static mut TAPE_ENTRY: u32 = 0;
 static mut TAPE_ELF: bool = false;
 static mut TAPE_HANDLE: u32 = 0;
 static mut NEXT_TAPE_HANDLE: u32 = 1;
+static mut TAPE_BOOT_INFO: *const BootInfo = core::ptr::null();
+
+const TAPE_FS_OK: u32 = 0;
+const TAPE_FS_NOT_FOUND: u32 = 1;
+const TAPE_FS_INVALID_ARGUMENT: u32 = 2;
+const TAPE_FS_BUFFER_TOO_SMALL: u32 = 3;
+const TAPE_FS_DISK_ERROR: u32 = 4;
+const TAPE_FS_DIRECTORY_FULL: u32 = 5;
+const TAPE_FS_DATA_FULL: u32 = 6;
 
 /// Reads/writes `TAPE` through raw pointers (`&raw const`/`&raw mut`)
 /// rather than ever forming a `&`/`&mut` reference to the static, the same
@@ -2332,7 +2341,7 @@ extern "C" fn combined_tape_read_key() -> u32 {
 /// bytes (rounded up to whole 1 MiB chunks), from `pmem`'s separate,
 /// coarse-grained "big pool" (`pmem::allocate_big_contiguous`/`free_big`)
 /// -- everything from `pmem::BIG_POOL_BASE` up to `pmem::BIG_POOL_END`
-/// (1 GiB by default), entirely apart from the fine 4 KiB frame pool
+/// (2 GiB by default), entirely apart from the fine 4 KiB frame pool
 /// `palloc`/`pfree`/the fixed 4 MiB tape region draw from. Passed as the
 /// tape ABI's third argument (see `tape_run`'s doc comment). See
 /// `pmem::TRACKED_BYTES`'s doc comment for why this second, coarser pool
@@ -2370,6 +2379,133 @@ extern "C" fn tape_alloc(bytes: u32) -> u32 {
 extern "C" fn tape_free(address: u32, bytes: u32) {
     let chunks = bytes.div_ceil(pmem::BIG_CHUNK_SIZE) as usize;
     pmem::free_big(address, chunks);
+}
+
+fn tape_boot_info() -> Option<&'static BootInfo> {
+    let pointer = unsafe { TAPE_BOOT_INFO };
+    (!pointer.is_null()).then(|| unsafe { &*pointer })
+}
+
+fn tape_fs_name(pointer: u32, length: u32) -> Option<&'static [u8]> {
+    let length = usize::try_from(length).ok()?;
+    if pointer == 0
+        || length == 0
+        || length > 16
+        || !unsafe { core::slice::from_raw_parts(pointer as *const u8, length) }
+            .iter()
+            .all(|byte| matches!(*byte, b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(pointer as *const u8, length) })
+}
+
+fn tape_fs_buffer(pointer: u32, length: u32) -> Option<&'static mut [u8]> {
+    let length = usize::try_from(length).ok()?;
+    if length == 0 {
+        return Some(&mut []);
+    }
+    (pointer != 0).then(|| unsafe {
+        core::slice::from_raw_parts_mut(pointer as *mut u8, length)
+    })
+}
+
+/// Returns a FOSFS file's exact byte length through the append-only tape ABI.
+/// The output length is written unaligned because tape buffers are not
+/// required to have a particular alignment.
+extern "C" fn tape_fs_file_length(name: u32, name_length: u32, out_length: u32) -> u32 {
+    let Some(name) = tape_fs_name(name, name_length) else {
+        return TAPE_FS_INVALID_ARGUMENT;
+    };
+    if out_length == 0 {
+        return TAPE_FS_INVALID_ARGUMENT;
+    }
+    let Some(info) = tape_boot_info() else {
+        return TAPE_FS_DISK_ERROR;
+    };
+    match fosfs::file_length(info, name) {
+        Ok(Some(length)) => {
+            unsafe { core::ptr::write_unaligned(out_length as *mut u64, length) };
+            TAPE_FS_OK
+        }
+        Ok(None) => TAPE_FS_NOT_FOUND,
+        Err(_) => TAPE_FS_DISK_ERROR,
+    }
+}
+
+/// Reads a complete FOSFS file into a tape buffer. The output length is
+/// written only on success; callers should query `tape_fs_file_length` first
+/// when they need to allocate a precisely sized buffer.
+extern "C" fn tape_fs_read(
+    name: u32,
+    name_length: u32,
+    buffer: u32,
+    capacity: u32,
+    out_length: u32,
+) -> u32 {
+    let Some(name) = tape_fs_name(name, name_length) else {
+        return TAPE_FS_INVALID_ARGUMENT;
+    };
+    if out_length == 0 {
+        return TAPE_FS_INVALID_ARGUMENT;
+    }
+    let Some(info) = tape_boot_info() else {
+        return TAPE_FS_DISK_ERROR;
+    };
+    let length = match fosfs::file_length(info, name) {
+        Ok(Some(length)) => length,
+        Ok(None) => return TAPE_FS_NOT_FOUND,
+        Err(_) => return TAPE_FS_DISK_ERROR,
+    };
+    if length > u64::from(capacity) {
+        return TAPE_FS_BUFFER_TOO_SMALL;
+    }
+    let Some(buffer) = tape_fs_buffer(buffer, capacity) else {
+        return TAPE_FS_INVALID_ARGUMENT;
+    };
+    match fosfs::read(info, name, buffer) {
+        Ok(Some(read_length)) => {
+            unsafe { core::ptr::write_unaligned(out_length as *mut u32, read_length as u32) };
+            TAPE_FS_OK
+        }
+        Ok(None) => TAPE_FS_NOT_FOUND,
+        Err(_) => TAPE_FS_DISK_ERROR,
+    }
+}
+
+/// Replaces or creates one complete FOSFS file from a tape buffer.
+extern "C" fn tape_fs_write(name: u32, name_length: u32, buffer: u32, length: u32) -> u32 {
+    let Some(name) = tape_fs_name(name, name_length) else {
+        return TAPE_FS_INVALID_ARGUMENT;
+    };
+    let Some(buffer) = tape_fs_buffer(buffer, length) else {
+        return TAPE_FS_INVALID_ARGUMENT;
+    };
+    let Some(info) = tape_boot_info() else {
+        return TAPE_FS_DISK_ERROR;
+    };
+    match fosfs::write(info, name, buffer) {
+        Ok(fosfs::WriteOutcome::Written) => TAPE_FS_OK,
+        Ok(fosfs::WriteOutcome::InvalidName) => TAPE_FS_INVALID_ARGUMENT,
+        Ok(fosfs::WriteOutcome::DirectoryFull) => TAPE_FS_DIRECTORY_FULL,
+        Ok(fosfs::WriteOutcome::DataFull) => TAPE_FS_DATA_FULL,
+        Err(_) => TAPE_FS_DISK_ERROR,
+    }
+}
+
+/// Removes one FOSFS file, returning `TAPE_FS_NOT_FOUND` when absent.
+extern "C" fn tape_fs_remove(name: u32, name_length: u32) -> u32 {
+    let Some(name) = tape_fs_name(name, name_length) else {
+        return TAPE_FS_INVALID_ARGUMENT;
+    };
+    let Some(info) = tape_boot_info() else {
+        return TAPE_FS_DISK_ERROR;
+    };
+    match fosfs::remove(info, name) {
+        Ok(true) => TAPE_FS_OK,
+        Ok(false) => TAPE_FS_NOT_FOUND,
+        Err(_) => TAPE_FS_DISK_ERROR,
+    }
 }
 
 enum TapeArgumentSource<'a> {
@@ -2477,9 +2613,16 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
         nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
         terminal_position: extern "C" fn() -> u32,
+        fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
+        fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
+        fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
+        fs_remove: extern "C" fn(u32, u32) -> u32,
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
+    unsafe {
+        TAPE_BOOT_INFO = info as *const BootInfo;
+    }
     entry(
         console::print_byte,
         combined_tape_should_abort,
@@ -2499,7 +2642,14 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_nic_receive_at,
         tape_nic_set_promiscuous_at,
         console::terminal_position,
+        tape_fs_file_length,
+        tape_fs_read,
+        tape_fs_write,
+        tape_fs_remove,
     );
+    unsafe {
+        TAPE_BOOT_INFO = core::ptr::null();
+    }
     console::reset_terminal_output();
     println!("Tape returned; back at the fos shell.");
 }

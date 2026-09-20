@@ -13,7 +13,7 @@
 //! requesting a fresh 64 MiB buffer from the "big pool" at run time
 //! instead: proof that a tape's working set is not actually capped at
 //! 4 MiB, only its own compiled code/data/`.bss` is -- everything else
-//! this machine reports as usable RAM (up to `pmem::BIG_POOL_END`, 1 GiB)
+//! this machine reports as usable RAM (up to `pmem::BIG_POOL_END`, 2 GiB)
 //! is reachable too. Unlike `hello-rs`'s sieve, this one only computes
 //! `candidate * candidate` up to `sqrt(SIEVE_LIMIT)` (see the marking
 //! loop below) -- `hello-rs`'s bound is small enough that squaring every

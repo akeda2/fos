@@ -21,8 +21,8 @@ pub const FRAME_SIZE: u32 = 4096;
 /// not merely reserved at load time), and `boot/stage2.S` loads the whole
 /// kernel with a single INT13h extended read capped at 127 sectors /
 /// 65024 bytes (see `tools/write_layout.py`) to stay within one real-mode
-/// segment. A bitmap fine enough to track a full 1 GiB machine at this
-/// same 4 KiB granularity (32 KiB) would blow well past that ceiling by
+/// segment. A bitmap fine enough to track a full 2 GiB machine at this
+/// same 4 KiB granularity (64 KiB) would blow well past that ceiling by
 /// itself.
 const TRACKED_BYTES: u32 = 128 * 1024 * 1024;
 const MAX_FRAMES: usize = (TRACKED_BYTES / FRAME_SIZE) as usize;
@@ -63,8 +63,8 @@ static mut NEXT_SEARCH: usize = 0;
 /// region (a big sieve, a large buffer, ...) only ever wants one large
 /// contiguous block at a time, so tracking this pool in whole 1 MiB
 /// chunks instead of 4 KiB frames costs 256x less bitmap space for the
-/// same amount of RAM -- reaching a full 1 GiB machine costs a little
-/// over 100 bytes here, not the 32 KiB the fine bitmap would need, which
+/// same amount of RAM -- reaching a full 2 GiB machine costs only a few
+/// hundred bytes here, not the 64 KiB the fine bitmap would need, which
 /// would have exceeded the old single-transfer kernel-load ceiling (see
 /// `TRACKED_BYTES`'s doc comment).
 pub const BIG_CHUNK_SIZE: u32 = 1024 * 1024;
@@ -72,12 +72,12 @@ pub const BIG_CHUNK_SIZE: u32 = 1024 * 1024;
 /// so the two pools can never both claim the same physical memory.
 pub const BIG_POOL_BASE: u32 = TRACKED_BYTES;
 /// Total physical address space this pool tracks, `BIG_POOL_BASE`
-/// through this address -- 1 GiB, matching the target physical machine
-/// this kernel is validated against (see AGENTS.md). A machine with less
+/// through this address -- 2 GiB, matching the largest current 32-bit
+/// physical-memory target (see AGENTS.md). A machine with less
 /// RAM than this simply never has the extra chunks marked free in the
 /// first place (see `initialize`); raising this constant costs only a
 /// little more bitmap space, never memory that has to actually exist.
-pub const BIG_POOL_END: u32 = 1024 * 1024 * 1024;
+pub const BIG_POOL_END: u32 = 2 * 1024 * 1024 * 1024;
 const BIG_POOL_CHUNKS: usize = ((BIG_POOL_END - BIG_POOL_BASE) / BIG_CHUNK_SIZE) as usize;
 const BIG_BITMAP_BYTES: usize = BIG_POOL_CHUNKS.div_ceil(8);
 

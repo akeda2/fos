@@ -158,7 +158,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load disk NAME` | Loads a complete flat, multi-sector FOSFS file straight into the fixed tape buffer. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, and timer callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full seventeen-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run router @ROUTER.CFG` reads router startup arguments from the uppercase FOSFS file `ROUTER.CFG`; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run router @ROUTER.CFG` reads router startup arguments from the uppercase FOSFS file `ROUTER.CFG`; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
@@ -608,9 +608,41 @@ including a backspace correction and a division-by-zero error, and a
 remote Escape byte cleanly ending the REPL without disconnecting the
 `term_net` session driving it.
 
+#### Test tape: `tapes/ed/`
+
+A small line-oriented Rust text editor for complete FOSFS files. Start it
+with `tape run ed NAME`; `NAME` must be an uppercase FOSFS name. The editor
+loads the whole file through the tape filesystem callbacks, normalizes input
+line endings to LF, and keeps up to 4 MiB in an allocator-backed buffer.
+Missing files start empty. It is intentionally not a full-screen editor:
+input is ordinary `read_key` text, so it works from the local keyboard or
+through an active `term net` session.
+
+The core commands are:
+
+```text
+p              print the buffer with line numbers
+a              append lines at the end
+aLINE          append lines after LINE
+iLINE          insert lines before LINE
+dLINE          delete LINE
+sLINE/TEXT     replace LINE with TEXT
+sLINE          prompt for replacement text
+eLINE          prompt for replacement text and show the old line
+w              write the file and continue editing
+x              write the file and exit
+q              exit without saving
+```
+
+`a` and `iLINE` accept lines until a line containing only `.` is entered.
+F12/F4/F6/F7/F8/F10 exits the editor without saving. Build it with
+`make tape-ed`; `make image` preloads the resulting `ED.BIN`, and
+`make test-tape-ed` verifies loading, editing, saving, and reading the
+changed file back from FOSFS.
+
 #### Test tape: `tapes/beep/`
 
-A small 32-bit Rust tape using the current seventeen-argument ABI and the
+A small 32-bit Rust tape using the current twenty-two-argument ABI and the
 `read_key` callback. It waits for the lowercase or shifted `b` key from
 either the local keyboard or an active `term net` session, programs PIT
 channel 2 to drive the PC speaker at 440 Hz for approximately 100 ms, then
@@ -707,11 +739,22 @@ statically configuring another port:
 tape run router dhcp 2 10.0.2.1 255.255.255.0
 ```
 
+NAT is enabled by default. Add `no-nat` when the upstream network has an
+explicit route back to the downstream subnets and should receive the original
+source addresses; `nat` may be written explicitly to document or re-enable
+masquerading.
+
 If DHCP supplies a router option and no explicit `default` suffix is present,
 that router becomes NIC 1's default route. At least two interfaces (the DHCP
 interface counts as one) are required; static NICs must be unique and present,
-and a default gateway must be on its selected interface's subnet. The router
-still has no NAT, dynamic routing, ICMP errors, fragmentation, or IPv6.
+and a default gateway must be on its selected interface's subnet. When NAT is
+enabled, TCP/UDP traffic leaving a non-primary NIC through NIC 1 is source-NATed using a
+4 MiB physical-memory-backed table, then reverse-translated for replies; this
+provides tens of thousands of flow slots and means upstream hosts do not need
+an explicit route back to the downstream DHCP subnet. If that allocation is
+unavailable, the router falls back to 32 slots. Idle NAT entries expire after
+ten minutes. Other traffic is forwarded without NAT, and dynamic routing,
+ICMP errors, fragmentation, and IPv6 remain out of scope.
 Build it with `make tape-router` and run `make test-tape-router` for the
 two-segment QEMU forwarding test.
 
@@ -748,6 +791,22 @@ only tells clients which external resolver addresses to use. It is a small
 LAN DHCP service for directly attached segments, not a replacement for a full
 network-management daemon.
 
+Lease persistence is optional. Add `dhcp-lease-file NAME` alongside
+`dhcp-server` to save bound MAC-to-address assignments in FOSFS and restore
+them on the next run:
+
+```text
+dhcp-server
+dhcp-lease-file DHCP.LEASES
+1 10.0.1.1/24
+2 10.0.2.1/24
+```
+
+If the directive is omitted, or the disk is unavailable, the router remains
+diskless and keeps leases only in memory. Persisted leases restore the address
+assignment but restart the seven-day lease timer from the new boot; fos does
+not currently expose a battery-backed wall clock to tapes.
+
 For a readable, reusable setup, the router can read this configuration from
 an uppercase FOSFS file. `#` starts a comment through the end of its line:
 
@@ -765,7 +824,9 @@ tape run router @ROUTER.CFG
 ```
 
 The shell reads the file through the kernel's FOSFS/BIOS disk path and passes
-the contents to the router; the router tape itself never performs disk I/O.
+the contents to the router. The router tape's optional lease persistence uses
+the same high-level FOSFS callback ABI and never accesses raw sectors or BIOS
+directly.
 
 #### Test tape: `tapes/ip-chat/`
 

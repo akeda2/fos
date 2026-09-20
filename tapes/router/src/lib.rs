@@ -23,11 +23,25 @@ pub struct DefaultRoute {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileName {
+    pub bytes: [u8; 16],
+    pub len: usize,
+}
+
+impl FileName {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouterConfig {
     pub interfaces: [Option<InterfaceConfig>; MAX_INTERFACES],
     pub interface_count: usize,
     pub dhcp: bool,
     pub dhcp_server: bool,
+    pub dhcp_lease_file: Option<FileName>,
+    pub nat: bool,
     pub dns_servers: [Option<Ipv4Address>; DHCP_MAX_DNS_SERVERS],
     pub dns_server_count: usize,
     pub default_route: Option<DefaultRoute>,
@@ -49,6 +63,10 @@ pub enum ConfigError {
     MissingDnsValue,
     BadDnsServer,
     TooManyDnsServers,
+    ConflictingNatMode,
+    MissingLeaseFileName,
+    BadLeaseFileName,
+    LeaseFileRequiresDhcpServer,
 }
 
 pub fn parse_ipv4(text: &[u8]) -> Option<Ipv4Address> {
@@ -160,7 +178,8 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
     inverted & inverted.wrapping_add(1) == 0
 }
 
-/// Parses `[dhcp] [dhcp-server] [dns SERVER [SERVER]] NIC IP NETMASK
+/// Parses `[dhcp] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat]
+/// [dns SERVER [SERVER]] NIC IP NETMASK
 /// [NIC IP NETMASK ...] [default NIC GATEWAY]`.
 ///
 /// NIC numbers are one-based in the command line, matching `nic list`.
@@ -177,6 +196,14 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
 ///
 /// `dhcp-server` enables the built-in DHCP server on every configured
 /// interface except NIC 1. Its pool is derived from each interface subnet.
+///
+/// `dhcp-lease-file NAME` enables optional persistence for the DHCP server's
+/// bound MAC-to-address assignments through the tape filesystem callbacks.
+/// The file is only used when `dhcp-server` is also present.
+///
+/// NAT is enabled by default. `no-nat` disables TCP/UDP source translation for
+/// deployments where upstream routers already have routes back to downstream
+/// networks; `nat` explicitly re-enables it. Supplying both modes is rejected.
 ///
 /// `dns SERVER [SERVER]` overrides DNS servers learned from upstream DHCP.
 /// Up to two IPv4 DNS server addresses may be supplied.
@@ -198,6 +225,9 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
     }
     let mut dhcp = false;
     let mut dhcp_server = false;
+    let mut dhcp_lease_file = None;
+    let mut nat = true;
+    let mut nat_mode: Option<bool> = None;
     let mut dns_servers = [None; DHCP_MAX_DNS_SERVERS];
     let mut dns_server_count = 0usize;
     loop {
@@ -208,6 +238,44 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
             }
             Some(b"dhcp-server") => {
                 dhcp_server = true;
+                first += 1;
+            }
+            Some(b"dhcp-lease-file") => {
+                first += 1;
+                let name = words
+                    .get(first)
+                    .and_then(|word| *word)
+                    .ok_or(ConfigError::MissingLeaseFileName)?;
+                if name.is_empty()
+                    || name.len() > 16
+                    || !name
+                        .iter()
+                        .all(|byte| matches!(*byte, b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+                {
+                    return Err(ConfigError::BadLeaseFileName);
+                }
+                let mut bytes = [0u8; 16];
+                bytes[..name.len()].copy_from_slice(name);
+                dhcp_lease_file = Some(FileName {
+                    bytes,
+                    len: name.len(),
+                });
+                first += 1;
+            }
+            Some(b"nat") => {
+                if nat_mode == Some(false) {
+                    return Err(ConfigError::ConflictingNatMode);
+                }
+                nat_mode = Some(true);
+                nat = true;
+                first += 1;
+            }
+            Some(b"no-nat") => {
+                if nat_mode == Some(true) {
+                    return Err(ConfigError::ConflictingNatMode);
+                }
+                nat_mode = Some(false);
+                nat = false;
                 first += 1;
             }
             Some(b"dns") => {
@@ -321,6 +389,9 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
     if total_interfaces > MAX_INTERFACES {
         return Err(ConfigError::TooManyInterfaces);
     }
+    if dhcp_lease_file.is_some() && !dhcp_server {
+        return Err(ConfigError::LeaseFileRequiresDhcpServer);
+    }
     if let Some(route) = default_route {
         let configured = (dhcp && route.nic == 0)
             || configs[..interface_count]
@@ -345,6 +416,8 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         interface_count,
         dhcp,
         dhcp_server,
+        dhcp_lease_file,
+        nat,
         dns_servers,
         dns_server_count,
         default_route,
@@ -482,6 +555,7 @@ mod tests {
         let config =
             parse_config(b"router dhcp 2 10.0.2.1 255.255.255.0 default 1 10.0.0.1").unwrap();
         assert!(config.dhcp);
+        assert!(config.nat);
         assert_eq!(config.interface_count, 1);
         assert_eq!(
             config.default_route,
@@ -521,7 +595,27 @@ mod tests {
         let config = parse_config(b"router dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24").unwrap();
         assert!(!config.dhcp);
         assert!(config.dhcp_server);
+        assert!(config.dhcp_lease_file.is_none());
         assert_eq!(config.interface_count, 2);
+    }
+
+    #[test]
+    fn parses_optional_dhcp_lease_file() {
+        let config =
+            parse_config(b"router dhcp-server dhcp-lease-file DHCP.LEASES 1 10.0.1.1/24 2 10.0.2.1/24")
+                .unwrap();
+        assert_eq!(
+            config.dhcp_lease_file.unwrap().as_bytes(),
+            b"DHCP.LEASES"
+        );
+        assert_eq!(
+            parse_config(b"router dhcp-lease-file DHCP.LEASES 1 10.0.1.1/24 2 10.0.2.1/24"),
+            Err(ConfigError::LeaseFileRequiresDhcpServer)
+        );
+        assert_eq!(
+            parse_config(b"router dhcp-server dhcp-lease-file bad/name 1 10.0.1.1/24 2 10.0.2.1/24"),
+            Err(ConfigError::BadLeaseFileName)
+        );
     }
 
     #[test]
@@ -542,6 +636,17 @@ mod tests {
         assert_eq!(
             parse_config(b"router dhcp dns 0.0.0.0 2 10.0.2.1/24"),
             Err(ConfigError::BadDnsServer)
+        );
+    }
+
+    #[test]
+    fn parses_nat_toggle() {
+        assert!(!parse_config(b"router no-nat 1 10.0.1.1/24 2 10.0.2.1/24")
+            .unwrap()
+            .nat);
+        assert_eq!(
+            parse_config(b"router no-nat nat 1 10.0.1.1/24 2 10.0.2.1/24"),
+            Err(ConfigError::ConflictingNatMode)
         );
     }
 

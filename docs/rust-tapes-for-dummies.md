@@ -69,6 +69,11 @@ extern "C" fn tape_main(
     nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
     nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
     nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
+    terminal_position: extern "C" fn() -> u32,
+    fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
+    fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
+    fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
+    fs_remove: extern "C" fn(u32, u32) -> u32,
 );
 ```
 
@@ -110,8 +115,25 @@ extern "C" fn tape_main(
   `nic_set_promiscuous_at(index, enabled)` callback enables or disables
   receive-all filtering on one interface; a layer-2 bridge needs this so it
   can receive frames addressed to hosts behind another port.
+- `terminal_position()` returns the kernel's current packed VGA cursor
+  position. The filesystem callbacks operate on complete FOSFS files rather
+  than raw sectors: `fs_file_length(name_ptr, name_len, out_len_ptr)` writes
+  an unaligned `u64` length and returns a status; `fs_read(name_ptr, name_len,
+  buffer_ptr, capacity, out_len_ptr)` copies one whole file into a
+  caller-provided buffer; `fs_write` replaces or creates one whole file; and
+  `fs_remove` deletes it. A zero return is success, while nonzero values
+  report invalid arguments, missing files, insufficient read buffers,
+  unavailable disk firmware, or FOSFS capacity errors. These callbacks are
+  useful for optional tape state such as DHCP leases without exposing BIOS,
+  GPT, or sector-layout details.
 
-**Important:** these seventeen parameters are always in this order, and a
+The `tapes/ed/` tape is a complete example of this pattern: it validates a
+FOSFS name, queries the length, reads the whole file into an `alloc`-backed
+buffer, edits newline-delimited bytes, and replaces the file with `fs_write`.
+It deliberately uses a bounded buffer and line-oriented commands rather than
+trying to expose raw disk operations or build a full-screen terminal editor.
+
+**Important:** these twenty-two parameters are always in this order, and a
 tape may only leave off a *trailing* run of them it doesn't use -- never
 one in the middle. Only wanting `alloc`/`free` but not `should_abort`?
 You must still declare `should_abort` in your signature (even if you
@@ -123,9 +145,10 @@ a shorter signature just means your code never reads some of the bytes
 already sitting on the stack -- but it can only safely ignore them from
 the end, not skip over one in the middle.
 
-That's the entire ABI. No file I/O, no threads, no interrupts of your
-own -- if you need something more than these seventeen parameters provide,
-you're probably describing a kernel feature, not a tape.
+That's the entire ABI. Tapes still have no threads or interrupts of their
+own, but they may use the high-level FOSFS callbacks when persistent state is
+appropriate. Raw sectors, BIOS calls, GPT layout, and partition geometry
+remain kernel-only.
 
 ## 2. Anatomy of a Rust tape directory
 
@@ -586,4 +609,4 @@ tape tests.
   the full historical and technical reasoning behind every constraint
   described above.
 - `kernel/src/shell.rs`'s `tape_run` doc comment -- the authoritative,
-  in-code description of the ABI all seventeen parameters must satisfy.
+  in-code description of the ABI all twenty-two parameters must satisfy.

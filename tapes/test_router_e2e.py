@@ -112,6 +112,32 @@ def udp_datagram(source_port: int, destination_port: int, payload: bytes) -> byt
     return struct.pack("!HHHH", source_port, destination_port, 8 + len(payload), 0) + payload
 
 
+def tcp_segment(
+    source_ip: bytes,
+    destination_ip: bytes,
+    source_port: int,
+    destination_port: int,
+    sequence: int,
+    acknowledgment: int,
+    flags: int,
+) -> bytes:
+    segment = struct.pack(
+        "!HHIIHHHHH",
+        source_port,
+        destination_port,
+        sequence,
+        acknowledgment,
+        5 << 12,
+        flags,
+        65535,
+        0,
+        0,
+    )
+    pseudo = struct.pack("!4s4sBBH", source_ip, destination_ip, 0, 6, len(segment))
+    checksum_value = checksum(pseudo + segment)
+    return segment[:16] + checksum_value.to_bytes(2, "big") + segment[18:]
+
+
 def dhcp_packet(
     message_type: int,
     client_mac: bytes,
@@ -293,6 +319,7 @@ def ipv4_frame(
     destination_ip: bytes,
     payload: bytes,
     ttl: int = 64,
+    protocol: int = 17,
 ) -> bytes:
     header = struct.pack(
         "!BBHHHBBH4s4s",
@@ -302,7 +329,7 @@ def ipv4_frame(
         0x1234,
         0,
         ttl,
-        17,
+        protocol,
         0,
         source_ip,
         destination_ip,
@@ -365,6 +392,8 @@ def main() -> None:
     try:
         command = [
             "qemu-system-i386",
+            "-m",
+            "256",
             "-drive",
             f"format=raw,file={IMAGE}",
             "-snapshot",
@@ -449,6 +478,7 @@ def main() -> None:
         )
         read_until(b"fos router: 2 interface(s)", 10, run_start)
         read_until(b"DHCP server on NIC 2", 10, run_start)
+        read_until(b"NAT: allocated", 10, run_start)
         print("PASS: router tape started with DHCP service on the secondary NIC.")
 
         links["b"].send(dhcp_frame(1, DHCP_CLIENT_MAC))
@@ -568,6 +598,83 @@ def main() -> None:
         assert forwarded[14 + 8] == 63, forwarded.hex()
         assert checksum(forwarded[14 : 14 + 20]) == 0
         print("PASS: router forwarded B to A with TTL and checksum updated.")
+
+        client_port = 40000
+        server_port = 23
+        syn = tcp_segment(
+            RIGHT_IP,
+            LEFT_IP,
+            client_port,
+            server_port,
+            100,
+            0,
+            0x002,
+        )
+        links["b"].send(
+            ipv4_frame(
+                ROUTER_MAC_B,
+                RIGHT_MAC,
+                RIGHT_IP,
+                LEFT_IP,
+                syn,
+                protocol=6,
+            )
+        )
+        translated_syn = wait_for_frame(
+            links["a"],
+            lambda frame: frame[0:6] == LEFT_MAC
+            and frame[6:12] == ROUTER_MAC_A
+            and frame[12:14] == b"\x08\x00",
+            10,
+            "a NAT-translated TCP SYN on segment A",
+        )
+        assert translated_syn[14 + 12 : 14 + 16] == ROUTER_IP_A
+        assert translated_syn[14 + 16 : 14 + 20] == LEFT_IP
+        assert int.from_bytes(translated_syn[14 + 20 : 14 + 22], "big") == client_port
+        ip_length = int.from_bytes(translated_syn[14 + 2 : 14 + 4], "big")
+        translated_tcp = translated_syn[14 + 20 : 14 + ip_length]
+        translated_pseudo = struct.pack(
+            "!4s4sBBH", ROUTER_IP_A, LEFT_IP, 0, 6, len(translated_tcp)
+        )
+        assert checksum(translated_pseudo + translated_tcp) == 0
+        print("PASS: router source-NATed a downstream TCP connection.")
+
+        syn_ack = tcp_segment(
+            LEFT_IP,
+            ROUTER_IP_A,
+            server_port,
+            client_port,
+            200,
+            101,
+            0x012,
+        )
+        links["a"].send(
+            ipv4_frame(
+                ROUTER_MAC_A,
+                LEFT_MAC,
+                LEFT_IP,
+                ROUTER_IP_A,
+                syn_ack,
+                protocol=6,
+            )
+        )
+        translated_syn_ack = wait_for_frame(
+            links["b"],
+            lambda frame: frame[0:6] == RIGHT_MAC
+            and frame[6:12] == ROUTER_MAC_B
+            and frame[12:14] == b"\x08\x00",
+            10,
+            "a reverse-NATed TCP SYN/ACK on segment B",
+        )
+        assert translated_syn_ack[14 + 12 : 14 + 16] == LEFT_IP
+        assert translated_syn_ack[14 + 16 : 14 + 20] == RIGHT_IP
+        ip_length = int.from_bytes(translated_syn_ack[14 + 2 : 14 + 4], "big")
+        translated_tcp = translated_syn_ack[14 + 20 : 14 + ip_length]
+        translated_pseudo = struct.pack(
+            "!4s4sBBH", LEFT_IP, RIGHT_IP, 0, 6, len(translated_tcp)
+        )
+        assert checksum(translated_pseudo + translated_tcp) == 0
+        print("PASS: router reverse-translated the upstream TCP reply.")
 
         stop_start = len(output)
         for _ in range(5):
