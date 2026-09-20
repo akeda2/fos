@@ -28,7 +28,7 @@ from test_primes_e2e import McastSocket  # noqa: E402
 MCAST_GROUP = "230.42.42.61"
 MCAST_PORT = 4261
 ROOT = Path(__file__).resolve().parent.parent
-IMAGE = ROOT / "build" / "fos.img"
+IMAGE = Path(os.environ.get("FOS_TEST_IMAGE", ROOT / "build" / "fos.img"))
 TAPE = ROOT / "build" / "tapes" / "telnet.bin"
 
 GUEST_MAC = bytes.fromhex("525400123471")
@@ -590,6 +590,7 @@ def main() -> None:
         print("PASS: Telnet tape completed TCP handshake and preserved UTF-8 server bytes.")
 
         start = len(output)
+        send_term(TERM_TAG_DATA, b"\t")
         send_term(TERM_TAG_DATA, b"hello \xc3\xa9\r\n")
         read_until(b"echo: ", 10, start)
         read_until("π".encode(), 10, start)
@@ -601,6 +602,11 @@ def main() -> None:
         if b"hello \xc3\xa9\r\n" not in server.application_received:
             raise SystemExit(
                 "Telnet server did not receive the UTF-8 terminal input: "
+                f"{server.application_received!r}"
+            )
+        if b"\t" not in server.application_received:
+            raise SystemExit(
+                "Telnet server did not receive the Tab input byte: "
                 f"{server.application_received!r}"
             )
         if not server.negotiation_seen:

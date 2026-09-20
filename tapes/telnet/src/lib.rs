@@ -589,6 +589,13 @@ mod tests {
     }
 
     #[test]
+    fn telnet_preserves_tab_application_bytes() {
+        let mut output = [0u8; 1];
+        assert_eq!(encode_application(b"\t", &mut output), Some(1));
+        assert_eq!(output, [b'\t']);
+    }
+
+    #[test]
     fn builds_a_checksummed_tcp_frame() {
         let segment = TcpSegment::new(40000, 23, 10, 20, tape_net::TCP_ACK, 512, b"hi");
         let mut frame = [0u8; MAX_FRAME_LEN];

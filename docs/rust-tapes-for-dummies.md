@@ -2,9 +2,9 @@
 
 A "tape" is the smallest possible fos program: a tiny freestanding ELF32
 `ET_EXEC` image whose `PT_LOAD` segments are validated and materialized by
-the shell's loader. The initial migration image region is the historical
-fixed 4 MiB physical area (`pmem::TAPE_BASE`, `0x100000`), and legacy raw
-flat binaries remain accepted while older tapes are modernized. No
+the shell's loader. The current image region is the fixed 4 MiB physical area
+(`pmem::TAPE_BASE`, `0x100000`); legacy raw-flat binaries remain accepted
+while older tapes are modernized. No
 filesystem, no process table, no built-in heap, no paging -- just your
 code, a stack it borrows from the
 kernel, and a handful of function pointers the kernel hands you to talk
@@ -32,8 +32,9 @@ The call uses the kernel's 32 KiB stack, not a private tape stack; keep
 fixed local buffers bounded, especially when a tape is launched from a
 nested `term net` command.
 
-Every tape must export exactly one C-callable entry point named
-`tape_main`, matching one of these signatures:
+Every Rust tape must ultimately export exactly one C-callable entry point
+named `tape_main`, matching one of these signatures. A small `_start` stub
+clears `.bss` and tail-jumps to it:
 
 ```rust
 // One-shot tapes: print something, maybe compute something, then return.
@@ -77,9 +78,11 @@ extern "C" fn tape_main(
 );
 ```
 
-- `putc(byte)` is the *only* way to print. It goes through the kernel's
-  own `console::print_byte`, so anything you print also mirrors to serial
-  and to a connected `term net` peer, exactly like ordinary shell output.
+- `putc(byte)` is the normal way to print. It goes through the kernel's own
+  `console::print_byte`, so anything you print also mirrors to serial and to
+  a connected `term net` peer, exactly like ordinary shell output. A tape
+  deliberately drawing a local-only animation can instead write VGA memory
+  directly; section 3 explains that exception.
 - `should_abort()` returns non-zero once a local operator has pressed one
   of the "give up" keys (F12/F4/F6/F7/F8/F10) or a remote `term net` peer
   has requested an abort. A one-shot tape doesn't get this callback at
@@ -115,10 +118,12 @@ extern "C" fn tape_main(
   `nic_set_promiscuous_at(index, enabled)` callback enables or disables
   receive-all filtering on one interface; a layer-2 bridge needs this so it
   can receive frames addressed to hosts behind another port.
-- `terminal_position()` returns the kernel's current packed VGA cursor
-  position. The filesystem callbacks operate on complete FOSFS files rather
-  than raw sectors: `fs_file_length(name_ptr, name_len, out_len_ptr)` writes
-  an unaligned `u64` length and returns a status; `fs_read(name_ptr, name_len,
+- `terminal_position()` returns the kernel's packed, 1-based ANSI cursor
+  position: row in the high 16 bits and column in the low 16 bits. It is
+  useful for terminal protocols that must answer a cursor-position request.
+  The filesystem callbacks operate on complete FOSFS files rather than raw
+  sectors: `fs_file_length(name_ptr, name_len, out_len_ptr)` writes an
+  unaligned `u64` length and returns a status; `fs_read(name_ptr, name_len,
   buffer_ptr, capacity, out_len_ptr)` copies one whole file into a
   caller-provided buffer; `fs_write` replaces or creates one whole file; and
   `fs_remove` deletes it. A zero return is success, while nonzero values
@@ -152,8 +157,9 @@ remain kernel-only.
 
 ## 2. Anatomy of a Rust tape directory
 
-Every existing Rust tape (`tapes/hello-rs/`, `tapes/vga-colors/`,
-`tapes/bigsieve/`) follows the same five-file layout. Copy whichever one
+The simplest self-contained Rust tapes (`tapes/hello-rs/`,
+`tapes/vga-colors/`, `tapes/bigsieve/`) follow the same five-file layout.
+Copy whichever one
 is closer to what you want to build and start editing -- `hello-rs` for
 a one-shot tape, `vga-colors` for a looping one, `bigsieve` for a
 one-shot tape that needs a buffer bigger than 4 MiB.
@@ -167,10 +173,11 @@ tapes/your-tape/
 └── src/main.rs           # your actual tape, written in ordinary #![no_std] Rust
 ```
 
-You will only ever need to edit `src/main.rs` and `Cargo.toml`'s crate
-`name`. The other three files are boilerplate that's identical (or nearly
-identical) across every tape -- copy them from an existing tape rather
-than writing them from scratch.
+Within this directory, you normally edit only `src/main.rs` and
+`Cargo.toml`'s crate `name`. The other three files are boilerplate that's
+identical (or nearly identical) across every tape -- copy them from an
+existing tape rather than writing them from scratch. You still add a
+corresponding build target to the repository `Makefile` in section 4.
 
 For this walkthrough, copy from `tapes/hello-rs/` specifically, not
 `tapes/vga-colors/`: `vga-colors` no longer keeps its own `src/entry.S`,
@@ -204,7 +211,7 @@ panic = "abort"           # a tape has nowhere to unwind to -- see main.rs's pan
 panic = "abort"
 codegen-units = 1
 lto = true
-opt-level = "z"           # optimize for size: a tape has no filesystem quota, but small is simple
+opt-level = "z"           # optimize for size: the tape image has a fixed 4 MiB limit
 strip = "symbols"
 ```
 
@@ -228,8 +235,8 @@ reference tape) has to use.
 Copy this one verbatim from `hello-rs` or `bigsieve` (not `vga-colors`,
 which gets it from `tape-rt` instead -- see above). It's a fixed 10-line
 stub whose only job is to zero `.bss` (so Rust `static`/`static mut`
-variables actually start at zero -- a flat binary's `.bss` is not
-automatically zeroed the way an ELF loader would do it) and then `jmp`
+variables start at zero in both the ELF and legacy-flat workflows; the ELF
+loader also clears each loadable segment's BSS tail) and then `jmp`
 into your Rust `tape_main`. You will not need to touch this file even for
 a fairly involved tape.
 
@@ -348,8 +355,16 @@ tape-your-tape:
 
 Then add `tape-your-tape` to both the `tapes:` aggregate target and the
 `.PHONY` list, and a one-line description to the `help` target, so
-`make all`/`make tapes`/`make help` all pick it up automatically. Build
-it on its own with:
+`make all`/`make tapes`/`make help` all pick it up automatically. To load
+the tape from FOSFS on a fresh image, also add an uppercase, at-most-16-byte
+file name to `TAPE_IMAGE_ARGS`, for example:
+
+```make
+	--file YOUR.BIN $(BUILD)/tapes/your-tape.bin \
+```
+
+The image target then preloads that ELF file and you can use `tape load disk
+YOUR.BIN`. Build the tape on its own with:
 
 ```sh
 make tape-your-tape
@@ -364,8 +379,18 @@ migration images compatible with the loader; future position-independent
 
 ## 5. Loading and running it
 
-Boot fos (`make run`, or a physical machine set up per AGENTS.md's `term
-net` section), then from another terminal on the same network:
+The simplest local loop is to run `make image` after adding the
+`TAPE_IMAGE_ARGS` line above, boot it with `make run`, then type:
+
+```text
+tape load disk YOUR.BIN
+tape run
+```
+
+For an already-running fos machine, or to avoid rebuilding its disk image,
+send the built ELF over Ethernet instead. Boot fos (`make run`, or a physical
+machine set up per AGENTS.md's `term net` section), then from another terminal
+on the same network:
 
 ```sh
 python3 tools/send_tape.py build/tapes/your-tape.bin
@@ -382,11 +407,11 @@ tape run
 ```
 
 `tape load net` confirms the transfer arrived; `tape run` executes it. A
-one-shot tape prints its output and returns you straight to the shell
-prompt. A looping tape keeps running until F12 (or F4/F6/F7/F8/F10)
-is pressed locally, or the remote `term net` peer sends its own abort
-request -- either way, control returns to the shell without ending the
-`term net` session itself.
+one-shot tape prints its output and returns you straight to the shell prompt.
+A looping tape keeps running until F12 (or F4/F6/F7/F8/F10) is pressed
+locally, or the remote `term net` peer sends its own abort request -- either
+way, control returns to the shell without ending the `term net` session
+itself.
 
 ## 6. When 4 MiB isn't enough: `alloc`/`free`
 
@@ -418,8 +443,9 @@ A few things worth knowing before you reach for this:
 
 - **Always check for a zero return from `alloc`.** It means there wasn't
   a big enough contiguous free block left -- this machine's RAM, the
-  amount already handed out to other tapes/`palloc` calls, and how
-  fragmented what's left is are all things a tape can't control.
+  amount already handed out to other tape allocations, and the degree of
+  fragmentation in the remaining 1 MiB chunks are all things a tape can't
+  control.
 - **`alloc`/`free` round up to whole 1 MiB chunks** (`pmem::
   BIG_CHUNK_SIZE`), a coarser granularity than the general kernel frame
   pool's 4 KiB. Fine for the large, single buffers this is meant for;
@@ -428,8 +454,8 @@ A few things worth knowing before you reach for this:
   calling `free`, that memory is gone for the rest of this boot -- the
   same unforgiving, trust-the-caller contract the kernel shell's own
   `palloc`/`pfree` commands already have.
-- **Memory above the 128 MiB mark only exists if the machine actually
-  has more than 128 MiB of RAM.** Under QEMU without an explicit `-m`
+- **The big pool spans 128 MiB through 2 GiB, but only RAM actually
+  reported by E820 is usable.** Under QEMU without an explicit `-m`
   flag, that's often not true -- `tapes/test_bigsieve_e2e.py` passes
   `-m 256` for exactly this reason. On real hardware with a gigabyte or
   more, this is rarely a concern.

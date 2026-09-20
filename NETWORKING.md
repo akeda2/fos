@@ -27,6 +27,11 @@ nic_mac_at(index: u32, out_ptr: u32) -> u32
 nic_send_at(index: u32, frame_ptr: u32, length: u32) -> u32
 nic_receive_at(index: u32, out_ptr: u32, capacity: u32) -> u32
 nic_set_promiscuous_at(index: u32, enabled: u32) -> u32
+terminal_position() -> u32
+fs_file_length(name_ptr: u32, name_len: u32, out_len_ptr: u32) -> u32
+fs_read(name_ptr: u32, name_len: u32, out_ptr: u32, capacity: u32, out_len_ptr: u32) -> u32
+fs_write(name_ptr: u32, name_len: u32, data_ptr: u32, length: u32) -> u32
+fs_remove(name_ptr: u32, name_len: u32) -> u32
 ```
 
 These are trailing additions to the existing cdecl tape ABI. The complete
@@ -49,10 +54,16 @@ current order is:
 15. `nic_send_at`
 16. `nic_receive_at`
 17. `nic_set_promiscuous_at`
+18. `terminal_position`
+19. `fs_file_length`
+20. `fs_read`
+21. `fs_write`
+22. `fs_remove`
 
 The append-only rule is important. Existing tapes that declare only a leading
-prefix remain binary-compatible. A tape that wants slot 16 must still declare
-slots 1 through 15, even if it does not use them.
+prefix remain binary-compatible. A tape that wants slot 22 must still declare
+slots 1 through 21, even if it does not use them; parameters cannot be skipped
+in the middle because that would shift later cdecl stack positions.
 
 `nic_mac`/`nic_send`/`nic_receive` operate on the currently selected
 interface. `nic_count` reports how many interfaces initialized successfully;
@@ -63,6 +74,15 @@ several links can enumerate them and keep separate protocol state per index.
 `nic_set_promiscuous_at` enables or disables receive-all filtering on one
 interface, which is required by a layer-2 bridge that must receive frames
 addressed to hosts behind another port.
+
+`terminal_position` returns the kernel's packed, 1-based ANSI cursor position
+(row in the high 16 bits and column in the low 16 bits). It lets a tape answer
+terminal cursor-position requests without reaching into the console's private
+state. The four filesystem callbacks operate on complete uppercase FOSFS names
+and contiguous multi-sector files: `fs_file_length` reports a file's byte length,
+`fs_read` copies file bytes into a caller-owned buffer, `fs_write` replaces or
+creates a file, and `fs_remove` deletes it. They are used by tapes such as
+`tapes/ed/` and by the router's optional DHCP lease persistence.
 
 `nic_mac` copies the six-byte hardware address into tape-owned memory.
 `nic_send` accepts one complete Ethernet II frame, including the 14-byte
@@ -466,7 +486,9 @@ across segments. It handles `IAC IAC` literal bytes,
 subnegotiation, and `IAC SB ... IAC SE` across TCP boundaries. BINARY, ECHO,
 SUPPRESS-GO-AHEAD, TERMINAL-TYPE, and NAWS are accepted in their appropriate
 directions; unknown options are refused. Application bytes containing `0xff`
-are doubled before transmission, as required by Telnet framing.
+are doubled before transmission, as required by Telnet framing. All other
+input bytes are preserved, including Tab (`0x09`), so shell tab-completion
+remains usable through the Telnet tape.
 
 Unicode is deliberately not decoded in the tape. UTF-8 is a byte encoding,
 so forwarding the exact bytes preserves server output and local input for an
@@ -489,8 +511,9 @@ remains fixed-buffer and reports 80x25 to the server.
 The focused `tapes/test_telnet_e2e.py` test uses the existing unprivileged
 QEMU `socket,mcast=` Ethernet fixture and a small host-side
 DHCP/ARP/IPv4/TCP peer. The peer serves a lease, sends Telnet negotiation plus
-a UTF-8 banner, checks the tape's negotiation replies and UTF-8 input, then
-exercises abort and remote-shell recovery. This validates the protocol
+a UTF-8 banner, checks the tape's negotiation replies, UTF-8 input, and Tab
+forwarding, then exercises abort and remote-shell recovery. This validates
+the protocol
 boundary without requiring a TAP bridge or modifying the host's network
 configuration; interoperability with a real Unix `telnetd` remains a separate
 manual test.

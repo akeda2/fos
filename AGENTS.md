@@ -207,6 +207,12 @@ Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
 Storage commands: `diskinfo`, `readsector LBA`, `format`, `ls`, `cat NAME`,
 `write NAME TEXT`, and `rm NAME`; FOSFS is flat and supports contiguous multi-sector files.
 
+Tape commands: `tape status`, `tape load disk NAME`, `tape load net`,
+`tape send NAME PEER_MAC|PEER_NUMBER`, and `tape run [ARGS...]`. Tapes are
+validated ELF32 `ET_EXEC` images or legacy raw-flat binaries loaded into the
+fixed 4 MiB image region; `tape run` supplies the append-only kernel callback
+ABI described below.
+
 Serial commands: `serial` (lists COM1..COM4 via the BIOS Data Area, plus any
 PCI-discovered serial controllers as `PCI0`, `PCI1`, ...) and
 `term [COM1|COM2|COM3|COM4|PCI0|PCI1|...] [BAUD]` (raw terminal pass-through;
@@ -214,8 +220,9 @@ F12 exits).
 
 `readsector` is read-only. `hexdump` is limited to the reserved kernel range
 and at most 128 bytes. FOSFS names are limited to 16 uppercase alphanumeric or
-`.`, `_`, and `-` characters. The fixed command buffer and single-sector
-filesystem are intentional teaching constraints.
+`.`, `_`, and `-` characters. The fixed command buffer and contiguous
+multi-sector file layout are intentional teaching constraints; the shell's
+interactive command line is capped at 256 characters.
 
 `term` defaults to COM1, reusing the same port most physical machines
 already have rather than requiring a second UART. While active on a given
@@ -261,9 +268,8 @@ on first use, currently RTL8139, 3C905, or Intel e1000), `nic list`,
 (promiscuous-mode capture of every frame seen, until F12 stops it),
 `nic discover`/`nic peers` (broadcast/list a numbered address book of other
 listening fos machines), `chat [PEER_MAC|PEER_NUMBER]` (line-based
-broadcast or unicast text chat; see below), `tape` (load and execute a
-raw binary from disk or over Ethernet; see below), and `term net` (a full
-remote shell over Ethernet; see below).
+broadcast or unicast text chat; see below), and `term net` (a full remote
+shell over Ethernet; see below).
 
 `nic` is backed by the common `kernel/src/nic.rs` facade, which initializes
 every polling backend instance that succeeds: `rtl8139.rs` for the
@@ -370,17 +376,14 @@ ever gets a reply from a fos machine that happens to be inside `chat` or
 limit of the polling design, not a bug to eventually
 fix with a background listener.
 
-`tape` (`shell.rs`) is a "load, then run" pair built the same way as
-everything else here: no new abstraction layer, just a fixed-size physical
-buffer (`pmem::allocate_contiguous`, freed and replaced as a whole by each
-new load, tracked in one `static mut TAPE: Option<(address, length)>`
-accessed only through raw-pointer `tape_get`/`tape_set`/`tape_take` helpers,
-the same convention `PEERS`/`PEER_COUNT` already use) and a `call` straight
-to its first byte. There is no size ceiling baked in beyond whatever
-contiguous RAM `pmem` still has free -- a declared length that doesn't fit
-just fails the load cleanly (`Not enough contiguous free physical memory
-for a N-byte tape ...`) rather than being silently truncated or rejected by
-an arbitrary constant.
+`tape` (`shell.rs`) is a "load, then run" pair: one fixed-size physical
+image buffer at `pmem::TAPE_BASE` through `pmem::TAPE_BASE + TAPE_LEN`
+(4 MiB), plus explicit metadata for the loaded length, format, entry point,
+and monotonically increasing handle. Loading a new tape overwrites that
+reserved image region; it does not allocate or free a variable-sized tape
+buffer from the general frame pool. The loader accepts validated fixed-address
+ELF32 `ET_EXEC` images and legacy raw flat images, and rejects any image that
+does not fit the reserved region.
 
 `tape load net`/`tape send` share `CHAT_ETHERTYPE` with `chat`/`nic
 discover`, adding three tags (`TAPE_TAG_START`/`TAPE_TAG_DATA`/
@@ -392,7 +395,7 @@ declares the transfer's exact total length up front, and every
 `TAPE_TAG_DATA` frame's expected byte count is derived purely from its
 sequence number and that declared length, never from the received frame's
 own (possibly padded) length. A skipped or reordered sequence number aborts
-that attempt and frees its frames immediately, since this protocol
+that attempt and discards the partial image immediately, since this protocol
 deliberately has no retransmission (consistent with `chat`/`nic discover`
 also being simple, best-effort, unacknowledged protocols); it does not
 retry or wait for a fresh start automatically, but `tape load net`'s own
@@ -436,12 +439,14 @@ without a network transfer. `write NAME TEXT` remains the interactive
 printable-ASCII path; binary files are installed by the host-side image
 builder.
 
-`tape run` is a bare `unsafe extern "C" fn()` `call` (via
-`core::mem::transmute`) to the validated ELF entry point (or the loaded
-buffer's address for a legacy flat file), which
-this kernel's flat, unpaged memory model lets it also treat directly as a
-usable pointer -- the same convention `rtl8139.rs`'s own DMA buffers rely
-on. A tape that ends with a near `ret` returns control to the shell
+`tape run` uses a cdecl `call` (via `core::mem::transmute`) to the validated
+ELF entry point (or the loaded buffer's address for a legacy flat file), then
+passes the append-only tape callback ABI: console output, abort/input,
+allocation, startup arguments, indexed NIC access, terminal position, and
+FOSFS file operations. This kernel's flat, unpaged memory model lets the
+tape image treat its physical address directly as a usable pointer -- the
+same convention `rtl8139.rs`'s own DMA buffers rely on. A tape that ends with
+a near `ret` returns control to the shell
 cleanly (verified end-to-end with a real one-byte `0xc3` tape sent over a
 live QEMU multicast netdev from a host-side Python script and executed);
 anything else is trusted exactly as much as any other kernel code -- a bad
@@ -479,27 +484,19 @@ way as `boot/stage1.S`/`boot/stage2.S` (`as --32` then `objcopy -O
 binary`, via the new `make tape-primes` target -- entirely separate from
 `make image`/`run`/`test`) rather than compiled by `kernel/`'s own Cargo
 build. Unlike the throwaway one-byte `0xc3` tape used to validate `tape`
-itself, this one has real data (a 1,000,000-byte sieve array) and so must
-be genuine position-independent code: its very first instructions are the
-classic `call get_base` / `pop %ebx` idiom to capture its own runtime load
-address, since `pmem::allocate_contiguous` gives it no fixed one, and
-every later label reference is computed as `%ebx + (label - get_base)`,
-an assemble-time constant GNU `as` resolves within this single unlinked
-file exactly the way `boot/stage2.S` already resolves its own `label +
-STAGE2_BASE` expressions. The sieve array is embedded as literal
-zero-filled space (`.fill N, 1, 0`) directly in the file rather than
-assumed to be available in whatever memory happens to follow the tape's
-own buffer, since only the declared/transferred length is ever actually
-allocated for it (see the `tape` protocol notes above) -- this is also
-why the assembled binary is roughly a megabyte, sent over the network in
-~1000 chunks by `tools/send_tape.py`, since FOSFS's 512-byte file cap
-can't hold it. Because a tape can't call back into the kernel for timing
-or console output either, it measures elapsed time with a raw `rdtsc`
-(reported as uncalibrated CPU cycles, not wall-clock time) and
-reimplements VGA text output and CRTC cursor handling by hand, matching
-`console.rs`'s own conventions byte-for-byte, plus mirrors every printed
-character to COM1 (matching `console.rs`'s own dual VGA+serial habit) --
-which is what let this be checked end-to-end by a disposable
+itself, this one has real data (a 1,000,000-byte sieve array). It remains
+genuinely position-independent as a teaching example, using the classic
+`call get_base` / `pop %ebx` idiom and base-relative labels, although the
+fixed tape address means that PIC is no longer required. The sieve array is
+embedded as literal zero-filled space (`.fill N, 1, 0`) directly in the file,
+which is why the assembled binary is roughly a megabyte. It prints through
+the kernel's `putc` callback, so the normal VGA, serial, and `term net`
+relay paths handle output; it measures elapsed time with a raw `rdtsc`
+(reported as uncalibrated CPU cycles, not wall-clock time). The large image
+is sent over the network in ~1000 chunks by `tools/send_tape.py`; FOSFS3
+supports contiguous multi-sector files, so its preloaded copy is not limited
+to one 512-byte sector. That is what lets this be checked end-to-end by a
+disposable
 serial-driven test harness (`tapes/test_primes_e2e.py`, a QEMU
 multicast-netdev-based script in the same spirit as the one used to
 validate `tape` itself) instead of needing a screen-capture/OCR pipeline
@@ -684,12 +681,11 @@ the kernel's own boot path:
   `extern "C" fn(putc: extern "C" fn(u32))` already matches `tape_run`'s
   call site exactly.
 - `tapes/hello-rs/src/entry.S` is consequently tiny: it exists
-  solely to zero `.bss` (the same reason `kernel/src/entry.S` does it --
-  a flat binary's `.bss` bytes are only implicitly zero-filled by
-  `objcopy -O binary`'s padding, never explicitly, so Rust statics can't
-  be trusted to start zeroed without this) before tail-`jmp`-ing into the
-  real Rust entry point, `tape_main`, so `tape_main`'s own `ret` returns
-  straight to `tape_run`.
+  solely to zero `.bss` before tail-`jmp`-ing into the real Rust entry
+  point, `tape_main`, so `tape_main`'s own `ret` returns straight to
+  `tape_run`. The ELF loader also clears each loadable segment's BSS tail;
+  retaining the stub keeps the tape startup convention explicit and
+  compatible with legacy flat images.
 
 `hello-rs`'s `tape_main` mirrors `primes.S` in miniature -- prints a
 greeting, sieves primes up to a much smaller 1,000 (168 primes, largest
@@ -2014,10 +2010,10 @@ to `0xb8000` instead of raw `mov`s, and is linked against the *exact same*
 `tapes/longmode64_shim.S` object file -- no shim changes needed at all to
 support a compiled-language body.
 
-Unlike every other Rust tape in this repository (`tapes/hello-rs`,
-`tapes/vga-colors`, `tapes/bigsieve` -- each a whole self-contained flat
-binary compiled as a `bin` crate with its own linker script), `longmode-
-rs` is a `staticlib` crate (see its `Cargo.toml`): it has no `_start`, no
+Unlike the ordinary Rust tapes in this repository (`tapes/hello-rs`,
+`tapes/vga-colors`, `tapes/bigsieve` -- each a whole self-contained ELF32
+binary compiled as a `bin` crate with its own linker script), `longmode-rs`
+is a `staticlib` crate (see its `Cargo.toml`): it has no `_start`, no
 entry point, and no linker script of its own, since it exists only to
 provide one function that gets linked into a larger image alongside the
 shim. `make tape-longmode-rs` builds it with `cargo`, then links

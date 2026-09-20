@@ -92,6 +92,7 @@ impl Keyboard {
             _ if released => {}
             0x1c => return Some(b'\n'),
             0x0e => return Some(8),
+            0x0f => return Some(b'\t'),
             _ => {
                 return keycode_to_ascii(code, self.left_shift || self.right_shift, self.caps_lock);
             }
@@ -345,6 +346,16 @@ mod tests {
         assert_eq!(keycode_to_ascii(0x23, true, true), Some(b'h'));
         assert_eq!(keycode_to_ascii(0x02, true, false), Some(b'!'));
         assert_eq!(keycode_to_ascii(0x02, false, true), Some(b'1'));
+    }
+
+    #[test]
+    fn decodes_tab_make_code_as_tab() {
+        let mut keyboard = super::Keyboard {
+            left_shift: false,
+            right_shift: false,
+            caps_lock: false,
+        };
+        assert_eq!(keyboard.decode_scancode(0x0f), Some(b'\t'));
     }
 
     #[test]

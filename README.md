@@ -76,7 +76,9 @@ inspection, interrupt/memory introspection, FOSFS formatting, file creation,
 reading, removal, halt, and the 80x25/80x50/experimental 132x25 local VGA
 mode switches. `make test-vga-modes` runs only the VGA mode test.
 `cargo test` does not work for this crate (a `no_std`, custom-target,
-freestanding binary); `make test` is the sole automated validation path.
+freestanding binary); `make test` is the primary automated kernel/boot
+validation path, while the focused tape tests below cover host-side protocol
+helpers and selected multi-guest scenarios.
 
 `make test-tape-net` runs the host-side unit suite for the no-heap shared
 networking library in `tapes/tape-net/`. Its synthetic-frame tests cover the
@@ -92,8 +94,11 @@ plain `make` (still just `make image`) and does not affect `image`/`run`/
 
 `make all` builds everything this repository knows how to produce in one
 go: the image, `make netrom`, and every test tape (`make tapes`, including
-`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-beep`/`tape-morse`/`tape-net-chat`/`tape-ip-chat`/`tape-telnet`/`tape-bridge`/`tape-router` -- see "Tape
-(`tape`)" below). Not needed for ordinary kernel/boot work, for which plain `make`
+`tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-bigsieve`/
+`tape-longmode`/`tape-longmode-rs`/`tape-calc`/`tape-ed`/`tape-beep`/
+`tape-morse`/`tape-net-chat`/`tape-ip-chat`/`tape-telnet`/`tape-bridge`/
+`tape-router` -- see "Tape (`tape`)" below). Not needed for ordinary
+kernel/boot work, for which plain `make`
 (equivalent to `make image`) is enough. `make help` lists every target
 with a one-line description.
 
@@ -155,10 +160,10 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (or F4/F6/F7/F8/F10) (local keyboard) or by typing `/quit` (works over serial too). |
 | `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
-| `tape load disk NAME` | Loads a complete flat, multi-sector FOSFS file straight into the fixed tape buffer. |
-| `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): allocates however many frames the sender declares, checks each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
+| `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer. |
+| `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): checks that the declared image fits the fixed 4 MiB tape region, validates each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape run` | Executes the loaded tape: a call to its first byte, in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run router @ROUTER.CFG` reads router startup arguments from the uppercase FOSFS file `ROUTER.CFG`; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run router @ROUTER.CFG` reads router startup arguments from the uppercase FOSFS file `ROUTER.CFG`; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
@@ -232,7 +237,7 @@ the image size. This is
 intentionally a teaching bridge, not a general disk driver.
 
 FOSFS is a small custom filesystem in the dedicated data partition. Version 3
-has a single superblock, four fixed directory sectors (64 flat entries), and
+has a single superblock, eight fixed directory sectors (64 flat entries), and
 contiguous multi-sector files. File creation and replacement use a bounded
 first-fit extent scan, so deleting a file makes its sectors reusable without a
 bitmap or heap. The generated image starts preformatted with `README.TXT` and
@@ -426,15 +431,9 @@ segments, clears each segment's BSS tail, validates the entry point, and
 then calls it in ring 0. During migration, legacy raw flat binaries remain
 accepted and are executed from the historical fixed physical address
 (`0x100000`, 4 MiB reserved -- see `pmem::TAPE_BASE`/`TAPE_LEN` in
-`kernel/src/pmem.rs`).
-Both formats run on the kernel's own stack with absolutely no memory
-protection: this kernel has no userspace or paging (see "Current
-boundaries" below), so a tape is trusted exactly as much as any other kernel
-code. The ELF32 migration currently supports fixed-address `ET_EXEC`; a
-future `ET_DYN`/relocation loader can reuse the same program-header and tape
-metadata path without changing the tape callback ABI.
-on the kernel's own stack, with absolutely no memory protection: this
-kernel has no userspace or paging (see "Current boundaries" below), so a
+`kernel/src/pmem.rs`). Both formats run on the kernel's own stack with
+absolutely no memory protection: this kernel has no userspace or paging (see
+"Current boundaries" below), so a
 tape is trusted exactly as much as any other kernel code. Ending with a
 near `ret` returns control to the shell cleanly; anything else that
 faults is at least caught by the CPU exception handlers (see "Interrupts
@@ -494,13 +493,12 @@ A worked example of everything above: a hand-written, genuinely
 position-independent 32-bit assembly program that computes every prime up
 to 1,000,000 with a Sieve of Eratosthenes, then prints a short summary
 (count found, largest prime, elapsed CPU cycles) and returns cleanly to
-the shell. Since a tape has no fixed load address, it captures its own
-runtime base with the classic `call`/`pop` idiom and addresses every
-label as an offset from that base -- unlike the tiny single-instruction
-tape used while developing `tape` itself, this one has real data (a
-1,000,000-byte sieve array) that must be reachable no matter where it
-lands in memory. The sieve array is embedded directly in the file as
-literal zero-filled space, which is why the assembled binary is about a
+the shell. It still uses the classic `call`/`pop` idiom and base-relative
+labels as a compact position-independent assembly example, even though the
+loader now places every tape at the fixed address `0x100000`. Unlike the
+tiny single-instruction tape used while developing `tape` itself, this one
+has real data (a 1,000,000-byte sieve array) embedded directly in the file
+as literal zero-filled space, which is why the assembled image is about a
 megabyte. It prints by calling back into the kernel's own console code
 through a function pointer the kernel passes it as its one argument (see
 "tape print callback ABI" in AGENTS.md), rather than touching VGA/COM1
@@ -516,8 +514,8 @@ once `tape load net` confirms it arrived.
 #### Test tape: `tapes/hello-rs/`
 
 A small Rust reference tape, proving a compiled language (not just
-hand-written PIC assembly like `primes.S`) works here now that every
-tape always loads at the same fixed physical address (`0x100000`): a
+hand-written PIC assembly like `primes.S`) works with the fixed physical
+load address (`0x100000`): a
 `no_std`/`no_main` binary crate, reusing the kernel's own custom target
 spec and `-Z build-std` setup (see its `.cargo/config.toml`), with its
 own `linker.ld` fixing the load address the same way `kernel/linker.ld`
@@ -887,7 +885,9 @@ restores local VGA state and emits a terminal reset (SGR, cursor
 visibility/shape, alternate-screen, bracketed-paste, and wrapping modes) so a
 program cannot leave the following `fos>` prompt invisible, recolored, or
 with a changed cursor. Local keyboard arrows, navigation keys, and non-abort
-function keys are encoded as standard terminal escape sequences.
+function keys are encoded as standard terminal escape sequences; Tab is
+forwarded as the ordinary `0x09` application byte so remote shell
+tab-completion works.
 
 Build it with `make tape-telnet` (producing `build/tapes/telnet.bin`) and run
 `tapes/test_telnet_e2e.py` for the focused raw-Ethernet interoperability test.
