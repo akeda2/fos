@@ -50,7 +50,7 @@ use tape_net::{
     DHCP_OPTION_BROADCAST_ADDRESS, DHCP_OPTION_DNS, DHCP_OPTION_LEASE_TIME,
     DHCP_OPTION_MESSAGE_TYPE, DHCP_OPTION_REBINDING_TIME, DHCP_OPTION_RENEWAL_TIME,
     DHCP_OPTION_REQUESTED_IP, DHCP_OPTION_ROUTER, DHCP_OPTION_SERVER_IDENTIFIER,
-    DHCP_OPTION_SUBNET_MASK, DHCP_SERVER_PORT, DhcpClient, DhcpClientState, DhcpLease,
+    DHCP_OPTION_SUBNET_MASK, DHCP_SERVER_PORT, DhcpClient, DhcpClientState,
     DhcpMessageType, DhcpOp, DhcpOptionWriter, DhcpOptions, DhcpPacket, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, EthernetFrame, Ipv4Address, Ipv4Header, Ipv4Packet, MacAddress, UdpDatagram,
 };
@@ -1338,7 +1338,7 @@ fn configure_dhcp(
     nic: u32,
     receive_buffer: &mut [u8; MAX_FRAME_LEN],
     max_frame_len: usize,
-) -> Option<DhcpLease> {
+) -> Option<DhcpClient<128>> {
     print_bytes(
         putc,
         b"DHCP: broadcasting DISCOVER and waiting for a lease...\n",
@@ -1416,7 +1416,7 @@ fn configure_dhcp(
                 print_bytes(putc, b", no router option");
             }
             print_bytes(putc, b".\n");
-            return Some(lease);
+            return Some(client);
         }
         if client.state() == DhcpClientState::Failed {
             print_bytes(
@@ -1436,6 +1436,127 @@ fn configure_dhcp(
             );
         }
     }
+}
+
+/// Drives every DHCP-uplink interface's retained DhcpClient once per main
+/// forwarding-loop iteration: fires whatever request the library's own
+/// Bound/Renewing/Rebinding state machine says is due (an ordinary renewal
+/// unicast to the current server, a Rebinding broadcast, or nothing at all
+/// most iterations), and reacts if a lease was just renewed or the client
+/// gave up and expired. This never blocks -- `DhcpClient::poll` only ever
+/// returns a packet to send or `None`, exactly like `resolve_mac`'s and the
+/// uplink-health redesign's own non-blocking designs elsewhere in this file.
+///
+/// Before this existed, `configure_dhcp` was the *only* thing that ever
+/// drove a DHCP client: once it returned a lease at startup, the client
+/// itself was discarded entirely, so nothing ever renewed, rebound, or even
+/// noticed a lease quietly expiring. A long-running router just kept
+/// forwarding traffic under a private address the upstream server had
+/// already reclaimed once that lease's `expires_at` passed.
+///
+/// Returns true if anything this loop depends on (an interface's address or
+/// an uplink's health-checked gateway) actually changed, so the caller
+/// knows any state it derived from the old value may now be stale.
+#[allow(clippy::too_many_arguments)]
+fn poll_dhcp_renewals(
+    putc: Putc,
+    quiet: bool,
+    dhcp_clients: &mut [Option<DhcpClient<128>>; MAX_INTERFACES],
+    interfaces: &mut [RouterInterface; MAX_INTERFACES],
+    configs: &mut [Option<InterfaceConfig>; MAX_INTERFACES],
+    interface_count: usize,
+    uplinks: &mut [Option<UplinkHealth>; MAX_INTERFACES],
+    dhcp_uplink_count: usize,
+    nic_send_at: NicSendAt,
+    ticks: Ticks,
+    max_frame_len: usize,
+) -> bool {
+    let mut changed = false;
+    let now = (ticks() / 100) as u32;
+    let mut payload = [0u8; 600];
+    for index in 0..interface_count {
+        let own_mac = interfaces[index].mac;
+        let nic = interfaces[index].nic;
+        let Some(client) = dhcp_clients[index].as_mut() else {
+            continue;
+        };
+        let previous_state = client.state();
+        if let Ok(Some(length)) = client.poll(now, &mut payload) {
+            let transmit = client.transmit();
+            let _ = send_dhcp_payload(
+                nic_send_at,
+                nic,
+                own_mac,
+                &payload[..length],
+                MacAddress::BROADCAST,
+                transmit.source,
+                transmit.destination,
+                DHCP_CLIENT_PORT,
+                DHCP_SERVER_PORT,
+                max_frame_len,
+            );
+        }
+        let new_state = client.state();
+        let lease = client.lease();
+        // `client`'s mutable borrow ends here (its last use); everything
+        // below only touches `dhcp_clients[index]` again, `interfaces`,
+        // `configs`, and `uplinks`.
+        if new_state == DhcpClientState::Expired && previous_state != DhcpClientState::Expired {
+            if !quiet {
+                print_bytes(putc, b"DHCP lease expired on NIC ");
+                print_u32(putc, nic);
+                print_bytes(putc, b"; restarting acquisition.\n");
+            }
+            let transaction_id = (ticks() as u32)
+                ^ u32::from_be_bytes([own_mac.0[0], own_mac.0[1], own_mac.0[2], own_mac.0[3]])
+                ^ u32::from_be_bytes([own_mac.0[2], own_mac.0[3], own_mac.0[4], own_mac.0[5]]);
+            dhcp_clients[index] = Some(DhcpClient::<128>::new(
+                own_mac,
+                transaction_id,
+                DHCP_RETRY_SECONDS,
+                DHCP_MAX_RETRIES,
+            ));
+            changed = true;
+            continue;
+        }
+        if new_state != DhcpClientState::Bound {
+            continue;
+        }
+        let Some(lease) = lease else {
+            continue;
+        };
+        if lease.address != interfaces[index].address || lease.subnet_mask != interfaces[index].netmask
+        {
+            if !quiet {
+                print_bytes(putc, b"DHCP lease renewed on NIC ");
+                print_u32(putc, nic);
+                print_bytes(putc, b": ");
+                print_ip(putc, lease.address);
+                print_bytes(putc, b"/");
+                print_ip(putc, lease.subnet_mask);
+                print_bytes(putc, b".\n");
+            }
+            interfaces[index].address = lease.address;
+            interfaces[index].netmask = lease.subnet_mask;
+            configs[index] = Some(InterfaceConfig {
+                nic,
+                address: lease.address,
+                netmask: lease.subnet_mask,
+            });
+            changed = true;
+        }
+        if lease.router != Ipv4Address::UNSPECIFIED
+            && let Some(uplink) = uplinks[..dhcp_uplink_count]
+                .iter_mut()
+                .flatten()
+                .find(|uplink| uplink.interface == index)
+            && uplink.gateway != lease.router
+        {
+            uplink.gateway = lease.router;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -2256,6 +2377,18 @@ pub extern "C" fn tape_main(
         dns_servers[index] = *server;
     }
     let mut receive_buffer = [0u8; MAX_FRAME_LEN];
+    // The DHCP client for each DHCP-configured uplink interface, kept alive
+    // (indexed by that interface's position in `interfaces`) for as long as
+    // the router runs, not discarded once the initial lease is acquired.
+    // configure_dhcp used to hand back only the resulting DhcpLease and drop
+    // the DhcpClient entirely, so nothing ever renewed a lease before its
+    // server-assigned expiry -- the router simply kept forwarding traffic
+    // under a private address the upstream DHCP server had already reclaimed
+    // for someone else. The main loop below polls/feeds each retained client
+    // every iteration, exactly mirroring how the client library's own
+    // Bound/Renewing/Rebinding states are driven during initial acquisition.
+    let mut dhcp_clients: [Option<DhcpClient<128>>; MAX_INTERFACES] =
+        core::array::from_fn(|_| None);
 
     for (priority, nic) in parsed.dhcp_uplinks[..parsed.dhcp_uplink_count].iter().flatten().enumerate() {
         let mut mac = [0u8; 6];
@@ -2264,7 +2397,11 @@ pub extern "C" fn tape_main(
             return;
         }
         let own_mac = MacAddress::new(mac);
-        let Some(lease) = configure_dhcp(putc, should_abort, nic_send_at, nic_receive_at, ticks, own_mac, *nic, &mut receive_buffer, max_frame_len) else {
+        let Some(client) = configure_dhcp(putc, should_abort, nic_send_at, nic_receive_at, ticks, own_mac, *nic, &mut receive_buffer, max_frame_len) else {
+            print_bytes(putc, b"Router cannot start: DHCP uplink did not acquire a lease.\n");
+            return;
+        };
+        let Some(lease) = client.lease() else {
             print_bytes(putc, b"Router cannot start: DHCP uplink did not acquire a lease.\n");
             return;
         };
@@ -2275,6 +2412,7 @@ pub extern "C" fn tape_main(
         interfaces[interface_count] = RouterInterface { nic: *nic, address: lease.address, netmask: lease.subnet_mask, mac: own_mac, arp: ArpCache::new(), gateway_pin: None, pending_arp: None, pending_arp_retry: 0 };
         configs[interface_count] = Some(InterfaceConfig { nic: *nic, address: lease.address, netmask: lease.subnet_mask });
         uplinks[priority] = Some(UplinkHealth { interface: interface_count, gateway: lease.router, misses: 0, healthy: true, sequence: 0, phase: HealthPhase::Idle, deadline: 0 });
+        dhcp_clients[interface_count] = Some(client);
         interface_count += 1;
         if dns_server_count == 0 && priority == 0 {
             dns_server_count = lease.dns_server_count;
@@ -2608,6 +2746,21 @@ pub extern "C" fn tape_main(
         if parsed.health_target.is_some() {
             health_changed |= expire_health_timeouts(&mut uplinks, parsed.dhcp_uplink_count, ticks);
         }
+        if parsed.dhcp_uplink_count != 0 {
+            health_changed |= poll_dhcp_renewals(
+                putc,
+                parsed.quiet,
+                &mut dhcp_clients,
+                &mut interfaces,
+                &mut configs,
+                interface_count,
+                &mut uplinks,
+                parsed.dhcp_uplink_count,
+                nic_send_at,
+                ticks,
+                max_frame_len,
+            );
+        }
         let (current_default, active_nic, routing_configs) = compute_forwarding_context(
             &uplinks,
             parsed.dhcp_uplink_count,
@@ -2665,6 +2818,9 @@ pub extern "C" fn tape_main(
                         );
                     }
                 }
+            }
+            if let Some(client) = dhcp_clients[ingress].as_mut() {
+                receive_dhcp(&receive_buffer[..length], client, (ticks() / 100) as u32);
             }
             process_arp(
                 &mut interfaces[ingress],
