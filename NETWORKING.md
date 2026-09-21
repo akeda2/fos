@@ -241,7 +241,10 @@ tuple. Entries expire after ten minutes; new flows are rejected when the table i
 full rather than evicting existing mappings. Other ICMP messages and non-TCP/UDP
 traffic are forwarded without translation; a TCP/UDP-labeled segment too short
 to contain its own port pair is not this passthrough and is dropped instead of
-leaking the downstream host's private source address unNATed. Dynamic routing, ICMP
+leaking the downstream host's private source address unNATed. Any packet whose
+more-fragments flag or fragment offset is nonzero is dropped rather than
+misread as a complete transport header, since fragment reassembly remains out
+of scope. Dynamic routing, ICMP
 unreachable/time-exceeded errors, fragmentation/reassembly, IPv6, and a kernel
 socket layer remain out of scope. `make test-tape-router` runs the
 three-party QEMU/multicast test that verifies ARP, forwarding in both

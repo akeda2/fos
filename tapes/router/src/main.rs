@@ -65,6 +65,12 @@ const MAX_FRAME_LEN: usize = 1514;
 // an ordinary IP stack's incomplete ARP entry would.
 const ARP_RETRY_TICKS: u64 = 100;
 const ARP_CACHE_SIZE: usize = 8;
+// Ipv4Header::flags_fragment layout (RFC 791): bit 13 (0x2000) is the
+// more-fragments flag, and the low 13 bits are the fragment offset in
+// 8-byte units. Either one being nonzero means this packet is not a
+// complete, unfragmented datagram.
+const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
+const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const BROADCAST_IP: Ipv4Address = Ipv4Address([255, 255, 255, 255]);
 const DHCP_TIMEOUT_SECONDS: u32 = 8;
 const DHCP_RETRY_SECONDS: u32 = 1;
@@ -2131,6 +2137,21 @@ fn forward_ipv4(
     let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else {
         return ForwardResult::Dropped;
     };
+    // This router (like the rest of tape-net, see NETWORKING.md's stated
+    // scope) has no fragment-reassembly support: nat_endpoints/
+    // rewrite_transport assume packet.payload starts with a complete
+    // TCP/UDP/ICMP header. A fragment offset of zero with the
+    // more-fragments flag set is a first fragment whose payload happens to
+    // still start with a real transport header (which could slip through
+    // undetected and get NATed as if it were the whole datagram, corrupting
+    // a rewrite that a never-arriving reassembly would need to complete
+    // consistently), and any fragment with a nonzero offset carries no
+    // transport header at all (raw payload continuation bytes are not port
+    // numbers). Both cases are rejected before any NAT/transport rewrite
+    // touches the payload.
+    if packet.header.flags_fragment & (IPV4_FLAG_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 {
+        return ForwardResult::Dropped;
+    }
     let now = ticks();
     let mut header = packet.header;
     let payload_len = packet.payload.len();
