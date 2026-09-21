@@ -1807,6 +1807,41 @@ future contributor doesn't have to rediscover them from scratch:
   confirmed reliable above), since real hardware needs it essentially
   always, not just for unusually large tapes -- passing `--delay 0`
   explicitly still opts back into the old unpaced behavior.
+- **RTL8139 receive ring could also wedge permanently on a nonsensical
+  length field, with no recovery trigger at all -- suspected cause of a
+  router NIC never rejoining fail-over after a cable reconnect** -- found
+  while diagnosing a real-hardware report against `tapes/router`: after
+  pulling and reconnecting one uplink's cable, the router's health check
+  correctly failed over to the other uplink, but the reconnected NIC
+  never recovered even after being physically reconnected for well over
+  a minute -- no ARP reply from it was ever recognized again, so it never
+  rejoined the fail-over rotation, and it also then failed a fresh DHCP
+  attempt outright once it became the router's only uplink (after the
+  other cable was pulled to test the reverse direction). The router's own
+  health-check logic (`start_health_round`/`expire_health_timeouts`/
+  `advance_uplink_health`, `tapes/router/src/main.rs`) was reviewed and
+  confirmed to probe every uplink every cycle regardless of its current
+  active/healthy status, using consistent tick units throughout -- so
+  this is not a router-logic bug. `Rtl8139::receive` reads a 4-byte
+  header out of the ring at the current read offset; the entry
+  immediately above this one already fixed the case where the "receive
+  OK" status bit is clear, but a *separate* branch -- reached when the
+  header's own length field is nonsensical (`frame_len < 4` or greater
+  than the ring size) -- still just returned `None` with nothing
+  advanced and no fault flagged, exactly the same silent-forever-stuck
+  shape the "receive OK" bug had. A link down/up cycle plausibly deposits
+  link-training noise into the ring at its current offset, landing
+  exactly there. Fixed the same way the two entries above already fixed
+  their own trigger conditions: this branch now sets `recovery_pending`
+  before returning `None`, so the very next `receive()` call's
+  unconditional `recover()` performs the existing, already real-hardware-
+  proven full soft-reset (not a lighter register fixup, per the overflow
+  entry above) instead of leaving the ring wedged. **Not yet confirmed on
+  real hardware** -- pending the user repeating the exact cable-pull/
+  reconnect fail-over/fail-back sequence against the rebuilt image; if
+  reconnecting still does not recover the affected NIC, the RTL8139 PHY's
+  own link-status register may need an explicit check/reset on top of
+  this fix.
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
