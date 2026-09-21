@@ -43,6 +43,13 @@ const REG_ISR: u16 = 0x3e; // Interrupt status (latches regardless of IMR).
 const REG_TCR: u16 = 0x40; // Transmit configuration.
 const REG_RCR: u16 = 0x44; // Receive configuration.
 const REG_CONFIG1: u16 = 0x52;
+const REG_MSR: u16 = 0x58; // Media Status Register.
+
+/// `MSR`'s "Linkage Bad" bit: `1` while the physical link is down, `0`
+/// once it is established. Polled by `check_link_recovery` to detect a
+/// down-to-up transition; see that function's doc comment for why this
+/// driver needs to react to one at all.
+const MSR_LINKB: u8 = 1 << 2;
 
 const CR_BUFE: u8 = 1 << 0; // Receive buffer empty.
 const CR_TE: u8 = 1 << 2; // Transmitter enable.
@@ -183,6 +190,10 @@ pub struct Rtl8139 {
     tx_progress: Cell<u32>,
     recovery_failures: Cell<u32>,
     recovery_pending: AtomicBool,
+    /// Last-observed link state (`MSR_LINKB`, inverted), used by
+    /// `check_link_recovery` to detect a down-to-up transition. Seeded
+    /// from the card's actual state in `init`/`recover`, not assumed.
+    link_up: Cell<bool>,
     promiscuous: Cell<bool>,
     irq: Option<u8>,
     interrupt_count: AtomicU32,
@@ -258,6 +269,7 @@ impl Rtl8139 {
             tx_progress: Cell::new(0),
             recovery_failures: Cell::new(0),
             recovery_pending: AtomicBool::new(cfg!(feature = "nic-watchdog-test")),
+            link_up: Cell::new(read8(io_base, REG_MSR) & MSR_LINKB == 0),
             promiscuous: Cell::new(false),
             irq,
             interrupt_count: AtomicU32::new(0),
@@ -410,6 +422,32 @@ impl Rtl8139 {
     /// its own on the next poll, instead of the ring wedging forever.
     /// Any frame(s) lost to the overflow are simply gone, exactly as on
     /// any other Ethernet link that dropped them.
+    ///
+    /// Detects a physical link recovery via `MSR`'s `LinkB` bit and, if
+    /// one just happened, flags a full reset the same way an overflow or
+    /// bounded transmit failure already does. This is a *separate* real-
+    /// hardware finding from the ring-wedge fix in `receive` above: that
+    /// fix only helps once garbled bytes actually land in the ring, but
+    /// real testing showed a cable pull/replug on an RTL8139-backed
+    /// uplink left it completely unable to receive anything ever again --
+    /// with the link itself cleanly back up (this bit confirms that) and
+    /// nothing ever landing in the ring to trigger the other fix, this
+    /// card's receiver logic simply never resumed on its own. Linux's
+    /// historic `8139too.c` documents the identical requirement: it polls
+    /// this same link-status bit and performs a full re-init
+    /// (`rtl8139_hw_start`) on a down-to-up transition rather than
+    /// trusting the card to resume Rx by itself. A router uplink that
+    /// never rejoined fail-over after its cable was reconnected, while an
+    /// otherwise-identical setup using only 3C905 cards recovered fine,
+    /// is exactly what this quirk predicts.
+    fn check_link_recovery(&self) {
+        let link_now = read8(self.io_base, REG_MSR) & MSR_LINKB == 0;
+        let was_up = self.link_up.replace(link_now);
+        if link_now && !was_up {
+            self.recovery_pending.store(true, Ordering::Release);
+        }
+    }
+
     fn recover(&self) -> bool {
         let isr = read16(self.io_base, REG_ISR);
         let had_overflow = self.overflow_pending.swap(false, Ordering::AcqRel)
@@ -469,6 +507,7 @@ impl Rtl8139 {
     }
 
     pub fn watchdog(&self) -> WatchdogResult {
+        self.check_link_recovery();
         if !self.health().recovery_pending
             && read16(self.io_base, REG_ISR) & (ISR_RXOVW | ISR_FOVW) == 0
         {
@@ -520,6 +559,7 @@ impl Rtl8139 {
     /// is currently waiting; this does not block.
     pub fn receive(&self, out: &mut [u8]) -> Option<usize> {
         self.work_pending.store(false, Ordering::Release);
+        self.check_link_recovery();
         self.recover();
 
         if read8(self.io_base, REG_CR) & CR_BUFE != 0 {
