@@ -245,6 +245,7 @@ fn prompt() {
     print!("fos> ");
 }
 
+#[inline(never)]
 fn vga_command(arguments: &[u8]) {
     let (mode_word, remainder) = take_word(arguments);
     if mode_word.is_empty() {
@@ -287,6 +288,39 @@ fn vga_command(arguments: &[u8]) {
     }
 }
 
+/// `execute` recurses (indirectly, via the `start`/boot-script path below)
+/// when a script line itself dispatches another command: `start_command` ->
+/// `execute_start_file` -> `execute` again for each line. Every command
+/// handler this function's match arms call is therefore marked
+/// `#[inline(never)]`. Without that, this release profile's aggressive
+/// whole-program size optimization (`opt-level = "z"`, `lto = true`,
+/// `codegen-units = 1`) happily inlines every handler -- `tape_run`'s own
+/// frame, `nic_command`'s frame, `term_command`'s frame, and so on --
+/// directly into `execute`'s own stack frame, even though only one match
+/// arm ever runs per call. That makes one call to `execute` cost the *sum*
+/// of every possible command's stack usage, not just the one actually
+/// invoked. A single top-level call absorbs that fine, but two of them
+/// stacked (typing `start` interactively, which is itself dispatched
+/// through `execute`, and which then calls `execute` again for each script
+/// line) doubles that inflated frame on the kernel's fixed 32 KiB stack --
+/// confirmed, before this fix, to double-fault running a script that
+/// merely `tape run`s a large tape (e.g. `router`) via the interactive
+/// `start` command specifically, while the exact same commands typed
+/// manually, or run automatically at boot (where `execute` is only ever
+/// one level deep), worked every time. `#[inline(never)]` keeps `execute`
+/// itself a small dispatcher and lets each handler's own frame exist only
+/// when that handler is actually on the call stack, exactly as a plain
+/// `match` over function calls should behave.
+///
+/// This alone was not sufficient, though: even with `execute` shrunk to a
+/// thin dispatcher, the second, nested `execute` -> `tape_command` ->
+/// `tape_run` chain the interactive `start` path adds is a genuine,
+/// unavoidable extra layer of stack depth on top of whatever the running
+/// tape itself uses -- and a heavy tape like `router` (multiple NICs,
+/// DHCP, health checks, NAT) still exhausted the kernel's original 32 KiB
+/// stack at that combined depth. `kernel/src/entry.S`'s `kernel_stack` was
+/// doubled to 64 KiB to give this path real headroom; see its comment for
+/// why that budget is safe against `linker.ld`'s low-memory-region limit.
 fn execute(command: &[u8], info: &BootInfo) {
     let (name, arguments) = take_word(command);
     match name {
@@ -561,6 +595,7 @@ fn print_serial_ports() {
 /// hands local keyboard/VGA control over entirely so the connected peer
 /// drives this same live shell -- unlike `term COM1`/etc, which is a dumb
 /// byte pipe with no shell involvement at all.
+#[inline(never)]
 fn term_command(info: &BootInfo, arguments: &[u8]) {
     const USAGE: &str = "Usage: term [COM1|COM2|COM3|COM4|PCI0|PCI1|...|net] [BAUD]";
 
@@ -1142,6 +1177,7 @@ const TEST_PAYLOAD: &[u8] = b"fos raw ethernet test frame";
 /// anything. These shell subcommands intentionally stay at the raw-Ethernet
 /// layer; ARP/IPv4/UDP/TCP/DHCP live in networking tapes and the shared
 /// `tapes/tape-net` library instead.
+#[inline(never)]
 fn nic_command(arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
     match subcommand {
@@ -1686,6 +1722,7 @@ fn nic_discover() {
 /// local PS/2 keyboard, same as `term`/`nic sniff`) or by typing the line
 /// `/quit` (which also works from a serial-only session, since -- unlike
 /// `term` -- `chat` never takes over the serial console).
+#[inline(never)]
 fn chat_command(arguments: &[u8]) {
     let (peer_word, remainder) = take_word(arguments);
     if !remainder.is_empty() {
@@ -1916,6 +1953,7 @@ fn install_tape(address: u32, length: u32) -> bool {
 /// ignores those two arguments (every existing tape in this repository
 /// does) is unaffected either way; `load`/`send` are documented on their
 /// own handlers below.
+#[inline(never)]
 fn tape_command(info: &BootInfo, arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
     match subcommand {
@@ -2926,6 +2964,7 @@ fn tape_argument_source(arguments: &[u8]) -> TapeArgumentSource<'_> {
     TapeArgumentSource::File(device, name)
 }
 
+#[inline(never)]
 fn tape_run(info: &BootInfo, arguments: &[u8]) {
     let Some((address, length)) = tape_get() else {
         println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
@@ -3055,6 +3094,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
     println!("Tape returned; back at the fos shell.");
 }
 
+#[inline(never)]
 fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
     let (kind, remainder) = take_word(arguments);
     match kind {
@@ -3086,6 +3126,7 @@ fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
 /// Loads a complete flat FOSFS file straight into the fixed tape buffer.
 /// Multi-sector files are read one BIOS sector at a time, and the file must
 /// fit the same fixed region used by `tape load net`.
+#[inline(never)]
 fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
     match fosfs::file_length(info, device, name) {
         Ok(Some(length)) if length == 0 => {
@@ -3153,6 +3194,7 @@ struct TapeTransfer {
 /// loading a corrupt tape, since this deliberately simple protocol has no
 /// retransmission; waiting for a fresh start after an abort, or after any
 /// unrelated sender's frame, costs nothing and needs no separate state.
+#[inline(never)]
 fn tape_load_net() {
     let Some(nic) = nic_or_report() else { return };
     let own_mac = nic.mac_address();
@@ -3598,6 +3640,7 @@ fn filesystem_result(result: Result<(), disk::Error>, success: &str) {
     }
 }
 
+#[inline(never)]
 fn cat_command(info: &BootInfo, arguments: &[u8]) {
     let (device, arguments) = parse_disk_and_one_argument(arguments);
     let (name, remainder) = take_word(arguments);
@@ -3612,6 +3655,7 @@ fn cat_command(info: &BootInfo, arguments: &[u8]) {
     }
 }
 
+#[inline(never)]
 fn write_command(info: &BootInfo, arguments: &[u8]) {
     let (device, arguments) = parse_disk_and_two_arguments(arguments);
     let (name, text) = take_word(arguments);
@@ -3634,6 +3678,7 @@ fn write_command(info: &BootInfo, arguments: &[u8]) {
     }
 }
 
+#[inline(never)]
 fn remove_command(info: &BootInfo, arguments: &[u8]) {
     let (device, arguments) = parse_disk_and_one_argument(arguments);
     let (name, remainder) = take_word(arguments);
@@ -3656,6 +3701,7 @@ fn remove_command(info: &BootInfo, arguments: &[u8]) {
 /// `tape load disk` already uses for "read a whole file into memory, then
 /// do something with it," rather than adding a second large static buffer;
 /// see `copy_file`'s doc comment for why that is safe.
+#[inline(never)]
 fn copy_command(info: &BootInfo, arguments: &[u8]) {
     let (source_word, remainder) = take_word(arguments);
     let (name, remainder) = take_word(remainder);
@@ -3782,6 +3828,7 @@ fn print_disk_info(info: &BootInfo, device: disk::Device) {
     }
 }
 
+#[inline(never)]
 fn read_sector_command(info: &BootInfo, arguments: &[u8]) {
     let (device, arguments) = parse_disk_and_one_argument(arguments);
     let (value, remainder) = take_word(arguments);
@@ -3801,6 +3848,7 @@ fn read_sector_command(info: &BootInfo, arguments: &[u8]) {
     }
 }
 
+#[inline(never)]
 fn hexdump_command(info: &BootInfo, arguments: &[u8]) {
     let (address, remainder) = take_word(arguments);
     let (length, extra) = take_word(remainder);
@@ -3887,6 +3935,7 @@ fn print_boot_info(info: &BootInfo) {
     );
 }
 
+#[inline(never)]
 fn print_memory_map(info: &BootInfo) {
     let count = usize::from(read_u16(core::ptr::addr_of!(info.memory_region_count)));
     println!("Firmware memory map ({count} entries reported by BIOS INT 15h EAX=E820h):");

@@ -72,5 +72,17 @@ kernel_stack:
     # Networking tapes can run nested inside `term net` and borrow this
     # stack for their fixed packet buffers and TCP state.  Keep enough
     # headroom for that call chain without introducing a tape-specific ABI.
-    .skip 32768
+    #
+    # Grown from 32 KiB to 64 KiB after a real double fault: the interactive
+    # `start` shell command re-enters `execute()` one level deeper than the
+    # boot-time start-script path (`execute("start")` -> `start_command()`
+    # -> `execute_start_file()` -> `execute(script line)`), and a heavy
+    # script line such as `tape run router @router.cfg` (multiple NICs,
+    # DHCP, health checks, NAT) pushes the combined depth of that extra
+    # `execute()`/`tape_command`/`tape_run` chain past 32 KiB even after
+    # `execute()`'s own frame was shrunk (see the `#[inline(never)]` note
+    # on `execute()` in `shell.rs`). `__kernel_end` sits far enough below
+    # the reserved region's `0x50000` ceiling (`linker.ld`'s `ASSERT`) that
+    # doubling this reservation still leaves headroom.
+    .skip 65536
 kernel_stack_top:

@@ -2489,6 +2489,58 @@ preload a `start` file) to confirm the "not found" message, including
 `--second-disk`'s still-unformatted secondary disk correctly falling
 through to `Missing` rather than an error.
 
+**Follow-up: a real double fault from `start`, traced to inlining and a
+too-small stack, not a logic bug.** Running the boot script's exact
+commands manually always worked, but retyping them via the interactive
+`start` command reliably produced "DOUBLE FAULT: switched to the
+emergency task stack" whenever the script's `tape run` line was something
+heavy, e.g. `tape run router @router.cfg` with several NICs, DHCP, health
+checks, and NAT -- reproduced with a QEMU-monitor-driven script that
+confirmed the exact same real `router.cfg` crashed a pre-fix kernel every
+time and no longer did after the fix below, both via the real interactive
+path, not just an approximation of it.
+
+The root cause is two compounding effects, both invisible from the
+source code alone:
+- `kernel/Cargo.toml`'s release profile (`opt-level = "z"`, `lto = true`,
+  `codegen-units = 1`) is aggressive enough that every command handler
+  `execute()`'s `match` calls (`tape_run`, `nic_command`, `term_command`,
+  ...) was being inlined directly into `execute` itself, even though only
+  one handler's code path is ever live per call. That collapsed
+  `execute`'s own stack frame to the *sum* of every command's stack
+  needs (confirmed via `nm`/`objdump` on a debug build override,
+  `--config profile.release.strip=false`, since the shipped profile
+  strips symbols: `execute`'s frame was 5288 bytes before the fix, most
+  of it dead weight for any one call). `#[inline(never)]` was added to
+  every large handler function `execute` calls, shrinking `execute`
+  itself to a thin ~1.7 KB dispatcher and letting each handler pay for
+  its own frame only when it is genuinely on the call stack.
+- That alone was not enough. The interactive `start` command
+  unavoidably nests one real level of `execute` deeper than the boot-time
+  path (`execute("start")` -> `start_command` -> `execute_start_file` ->
+  `execute(script line)`, versus boot's `run` -> `run_start_file` ->
+  `execute(script line)`, which never re-enters `execute` at the top
+  level at all) -- and a heavy tape running at the bottom of that extra
+  layer is a real, unavoidable added stack cost, not an artifact of
+  inlining. Confirmed by re-running the same real-`router.cfg` repro
+  against the kernel with the `#[inline(never)]` fix alone: it still
+  double-faulted. `kernel/src/entry.S`'s `kernel_stack` was doubled from
+  32 KiB to 64 KiB to give this path real headroom; `__kernel_end` sits
+  tens of KiB below `linker.ld`'s `0x50000` ceiling even after this
+  change, so the extra reservation is safe. Re-running the identical
+  repro against the doubled-stack kernel completed the router script a
+  second time via `start` with no fault.
+
+Both changes were necessary together: the inlining fix alone measurably
+shrunk `execute`'s frame but the two genuinely nested `execute` ->
+`tape_command` -> `tape_run` chains (each now a real, separate call
+sequence rather than one inlined blob) still summed to more than the
+inlining fix alone saved; only adding the larger stack on top actually
+closed the gap for the heaviest real-world case. `make test-stack-guard`
+(unaffected -- it targets the separate emergency double-fault task stack,
+not this ordinary kernel stack) and every other `make test*` target were
+re-run after this fix with no regressions.
+
 **Follow-up: `diskN/NAME` for the tape filesystem callback ABI (`ed`,
 `router`).** `tapes/ed` and `tapes/router` are the only two tapes using
 the kernel's `tape_fs_file_length`/`tape_fs_read`/`tape_fs_write`/
