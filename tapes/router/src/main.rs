@@ -2264,6 +2264,20 @@ fn forward_ipv4(
                 payload_rewritten = true;
                 header.source = interfaces[egress].address;
             }
+        } else if nat_enabled && matches!(header.protocol, 6 | 17) {
+            // nat_endpoints returned None here because the payload is too
+            // short to contain a TCP/UDP source/destination port pair, not
+            // because this is genuinely different (non-TCP/UDP/ICMP-echo)
+            // traffic -- NETWORKING.md's "other ICMP messages and
+            // non-TCP/UDP traffic are forwarded without translation" is a
+            // deliberate passthrough for that latter case and is left
+            // alone below. A malformed TCP/UDP segment has no way to be
+            // NATed, so forwarding it unchanged while NAT is enabled would
+            // leak the downstream host's private source address onto the
+            // uplink -- the same leak the inbound-NAT path already avoids
+            // by dropping unmatched/unparseable traffic instead of passing
+            // it through.
+            return ForwardResult::Dropped;
         }
     }
     let Some(destination_mac) = resolve_mac(

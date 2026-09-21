@@ -239,7 +239,9 @@ the inside source port, so a fixed-port client reconnecting after a router
 restart does not immediately collide with a remote server's still-live TCP
 tuple. Entries expire after ten minutes; new flows are rejected when the table is
 full rather than evicting existing mappings. Other ICMP messages and non-TCP/UDP
-traffic are forwarded without translation. Dynamic routing, ICMP
+traffic are forwarded without translation; a TCP/UDP-labeled segment too short
+to contain its own port pair is not this passthrough and is dropped instead of
+leaking the downstream host's private source address unNATed. Dynamic routing, ICMP
 unreachable/time-exceeded errors, fragmentation/reassembly, IPv6, and a kernel
 socket layer remain out of scope. `make test-tape-router` runs the
 three-party QEMU/multicast test that verifies ARP, forwarding in both
