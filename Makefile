@@ -43,7 +43,7 @@ TAPE_IMAGE_ARGS := \
 	--file router.cfg tapes/router/router.cfg
 EXTRA_FOSFS_FILES ?=
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -74,6 +74,7 @@ help:
 	@echo "  make test-page-protection - verify kernel text rejects a supervisor write under CR0.WP"
 	@echo "  make test-nic-watchdog - inject a test-only NIC fault latch and verify foreground DMA-state recovery"
 	@echo "  make test-start - verify an optional FOSFS start boot-command script"
+	@echo "  make test-second-disk - verify the diskN selector on a second, non-boot disk"
 	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
 	@echo "  make test-dual-e1000 - build the image, then verify two e1000 interfaces and selection"
 	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
@@ -148,6 +149,7 @@ test: image
 	python3 tools/qemu_smoke.py --image $(IMAGE)
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic dual-e1000
+	python3 tools/qemu_smoke.py --image $(IMAGE) --second-disk
 	python3 tools/test_vga_modes.py --image $(IMAGE)
 
 test-unsafe-memory: image-unsafe-memory
@@ -168,6 +170,9 @@ test-nic-watchdog:
 test-start:
 	$(MAKE) EXTRA_FOSFS_FILES="--file start tools/start-test.txt" image
 	@python3 tools/qemu_smoke.py --image $(IMAGE) --start-script-test; status=$$?; $(MAKE) image; exit $$status
+
+test-second-disk: image
+	python3 tools/qemu_smoke.py --image $(IMAGE) --second-disk
 
 test-e1000: image
 	python3 tools/qemu_smoke.py --image $(IMAGE) --nic e1000

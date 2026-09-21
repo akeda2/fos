@@ -21,6 +21,7 @@ pub fn run(info: &BootInfo) -> ! {
     let keyboard_available = Keyboard::initialize().is_some();
     interrupts::initialize();
     disk::initialize(info);
+    disk::discover_secondary_disks(info);
     if keyboard_available {
         println!("PS/2 keyboard initialized. Type 'help' for commands.");
     } else {
@@ -69,7 +70,7 @@ pub fn run(info: &BootInfo) -> ! {
 /// wait. Lines use the ordinary shell dispatcher, so a deployment script has
 /// exactly the same command syntax and error reporting as an interactive one.
 fn run_start_file(info: &BootInfo) {
-    let length = match fosfs::file_length(info, START_FILE_NAME) {
+    let length = match fosfs::file_length(info, disk::Device::Boot, START_FILE_NAME) {
         Ok(Some(length)) => length,
         Ok(None) => return,
         Err(error) => {
@@ -85,7 +86,7 @@ fn run_start_file(info: &BootInfo) {
     }
 
     let mut contents = [0u8; START_FILE_CAPACITY];
-    let length = match fosfs::read(info, START_FILE_NAME, &mut contents[..length as usize]) {
+    let length = match fosfs::read(info, disk::Device::Boot, START_FILE_NAME, &mut contents[..length as usize]) {
         Ok(Some(length)) => length as usize,
         Ok(None) => return,
         Err(error) => {
@@ -230,7 +231,13 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "System: help clear vga about bootinfo memmap memory cpuinfo hexdump halt reset"
                 );
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
-                println!("Disk: diskinfo readsector format ls cat write rm");
+                println!(
+                    "Disk: diskinfo [diskN], readsector [diskN] LBA, format [diskN], ls [diskN],"
+                );
+                println!("      cat [diskN] NAME, write [diskN] NAME TEXT, rm [diskN] NAME");
+                println!(
+                    "      (disk1 is the boot disk and can be omitted; disk2, disk3, ... name additional attached disks)"
+                );
                 println!(
                     "Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 (or F4/F6/F7/F8/F10) to exit)"
                 );
@@ -272,7 +279,12 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"memmap" if no_arguments(arguments) => print_memory_map(info),
         b"memory" if no_arguments(arguments) => print_memory_summary(info),
         b"cpuinfo" if no_arguments(arguments) => print_cpu_info(),
-        b"diskinfo" if no_arguments(arguments) => print_disk_info(info),
+        b"diskinfo" => {
+            let (device, remainder) = parse_disk_only(arguments);
+            if no_arguments(remainder) {
+                print_disk_info(info, device);
+            }
+        }
         b"ticks" if no_arguments(arguments) => print_ticks(),
         b"uptime" if no_arguments(arguments) => print_uptime(),
         b"irqstat" if no_arguments(arguments) => print_irq_stats(),
@@ -281,10 +293,18 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"pfree" => pfree_command(arguments),
         b"readsector" => read_sector_command(info, arguments),
         b"hexdump" => hexdump_command(info, arguments),
-        b"format" if no_arguments(arguments) => {
-            filesystem_result(fosfs::format(info), "FOSFS formatted.")
+        b"format" => {
+            let (device, remainder) = parse_disk_only(arguments);
+            if no_arguments(remainder) {
+                filesystem_result(fosfs::format(info, device), "FOSFS formatted.")
+            }
         }
-        b"ls" if no_arguments(arguments) => filesystem_result(fosfs::list(info), ""),
+        b"ls" => {
+            let (device, remainder) = parse_disk_only(arguments);
+            if no_arguments(remainder) {
+                filesystem_result(fosfs::list(info, device), "")
+            }
+        }
         b"cat" => cat_command(info, arguments),
         b"write" => write_command(info, arguments),
         b"rm" => remove_command(info, arguments),
@@ -307,9 +327,8 @@ fn execute(command: &[u8], info: &BootInfo) {
             println!("Resetting the machine now (8042 keyboard-controller pulse reset)...");
             reset();
         }
-        b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"diskinfo"
-        | b"format" | b"ls" | b"ticks" | b"uptime" | b"irqstat" | b"pmem" | b"palloc"
-        | b"serial" => {
+        b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
+        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" => {
             println!("This command does not accept arguments.");
         }
 
@@ -2676,7 +2695,7 @@ extern "C" fn tape_fs_file_length(name: u32, name_length: u32, out_length: u32) 
     let Some(info) = tape_boot_info() else {
         return TAPE_FS_DISK_ERROR;
     };
-    match fosfs::file_length(info, name) {
+    match fosfs::file_length(info, disk::Device::Boot, name) {
         Ok(Some(length)) => {
             unsafe { core::ptr::write_unaligned(out_length as *mut u64, length) };
             TAPE_FS_OK
@@ -2705,7 +2724,7 @@ extern "C" fn tape_fs_read(
     let Some(info) = tape_boot_info() else {
         return TAPE_FS_DISK_ERROR;
     };
-    let length = match fosfs::file_length(info, name) {
+    let length = match fosfs::file_length(info, disk::Device::Boot, name) {
         Ok(Some(length)) => length,
         Ok(None) => return TAPE_FS_NOT_FOUND,
         Err(_) => return TAPE_FS_DISK_ERROR,
@@ -2716,7 +2735,7 @@ extern "C" fn tape_fs_read(
     let Some(buffer) = tape_fs_buffer(buffer, capacity) else {
         return TAPE_FS_INVALID_ARGUMENT;
     };
-    match fosfs::read(info, name, buffer) {
+    match fosfs::read(info, disk::Device::Boot, name, buffer) {
         Ok(Some(read_length)) => {
             unsafe { core::ptr::write_unaligned(out_length as *mut u32, read_length as u32) };
             TAPE_FS_OK
@@ -2737,7 +2756,7 @@ extern "C" fn tape_fs_write(name: u32, name_length: u32, buffer: u32, length: u3
     let Some(info) = tape_boot_info() else {
         return TAPE_FS_DISK_ERROR;
     };
-    match fosfs::write(info, name, buffer) {
+    match fosfs::write(info, disk::Device::Boot, name, buffer) {
         Ok(fosfs::WriteOutcome::Written) => TAPE_FS_OK,
         Ok(fosfs::WriteOutcome::InvalidName) => TAPE_FS_INVALID_ARGUMENT,
         Ok(fosfs::WriteOutcome::DirectoryFull) => TAPE_FS_DIRECTORY_FULL,
@@ -2754,7 +2773,7 @@ extern "C" fn tape_fs_remove(name: u32, name_length: u32) -> u32 {
     let Some(info) = tape_boot_info() else {
         return TAPE_FS_DISK_ERROR;
     };
-    match fosfs::remove(info, name) {
+    match fosfs::remove(info, disk::Device::Boot, name) {
         Ok(true) => TAPE_FS_OK,
         Ok(false) => TAPE_FS_NOT_FOUND,
         Err(_) => TAPE_FS_DISK_ERROR,
@@ -2796,7 +2815,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
             return;
         }
         TapeArgumentSource::File(name) => {
-            let length = match fosfs::file_length(info, name) {
+            let length = match fosfs::file_length(info, disk::Device::Boot, name) {
                 Ok(Some(length)) => length,
                 Ok(None) => {
                     println!(
@@ -2817,7 +2836,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
                 return;
             }
             let length = length as usize;
-            match fosfs::read(info, name, &mut file_buffer[..length]) {
+            match fosfs::read(info, disk::Device::Boot, name, &mut file_buffer[..length]) {
                 Ok(Some(_)) => &file_buffer[..length],
                 Ok(None) => {
                     println!(
@@ -2928,7 +2947,7 @@ fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
 /// Multi-sector files are read one BIOS sector at a time, and the file must
 /// fit the same fixed region used by `tape load net`.
 fn tape_load_disk(info: &BootInfo, name: &[u8]) {
-    match fosfs::file_length(info, name) {
+    match fosfs::file_length(info, disk::Device::Boot, name) {
         Ok(Some(length)) if length == 0 => {
             println!(
                 "'{}' is empty; nothing to load.",
@@ -2945,7 +2964,7 @@ fn tape_load_disk(info: &BootInfo, name: &[u8]) {
             };
             let destination =
                 unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
-            match fosfs::read(info, name, destination) {
+            match fosfs::read(info, disk::Device::Boot, name, destination) {
                 Ok(Some(_)) => {
                     if !install_tape(address, length as u32) {
                         return;
@@ -3190,7 +3209,7 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         return;
     };
 
-    let length = match fosfs::file_length(info, name) {
+    let length = match fosfs::file_length(info, disk::Device::Boot, name) {
         Ok(Some(length)) => length,
         Ok(None) => {
             println!("File not found.");
@@ -3218,7 +3237,7 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         return;
     };
     let data = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
-    match fosfs::read(info, name, data) {
+    match fosfs::read(info, disk::Device::Boot, name, data) {
         Ok(Some(_)) => {}
         Ok(None) => {
             println!("File not found.");
@@ -3335,6 +3354,86 @@ fn no_arguments(arguments: &[u8]) -> bool {
     }
 }
 
+/// Parses a strict `diskN` token (`disk` followed by one or more decimal
+/// digits) into a [`disk::Device`], but only when `N` names a disk that is
+/// actually attached right now: `disk1` is always the boot disk; `disk2`,
+/// `disk3`, ... map to [`disk::discover_secondary_disks`]'s results in
+/// discovery order. Never guesses -- an out-of-range or malformed token
+/// simply isn't recognized as a selector at all, so a FOSFS file literally
+/// named e.g. `disk2` stays reachable unless a second disk really is
+/// attached (see AGENTS.md's "A second (non-boot) disk" section).
+fn strip_disk_selector(word: &[u8]) -> Option<disk::Device> {
+    let suffix = word.strip_prefix(b"disk")?;
+    if suffix.is_empty() || !suffix.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let number: u32 = core::str::from_utf8(suffix).ok()?.parse().ok()?;
+    match number {
+        0 => None,
+        1 => Some(disk::Device::Boot),
+        n => {
+            let index = (n - 2) as usize;
+            (index < disk::secondary_count()).then_some(disk::Device::Secondary(index))
+        }
+    }
+}
+
+/// Parses an optional `diskN` selector for a command that itself takes no
+/// further arguments (`ls`, `format`, `diskinfo`): a lone leading `diskN`
+/// word is unambiguous here, since none of these commands mean anything
+/// else by their argument.
+fn parse_disk_only(arguments: &[u8]) -> (disk::Device, &[u8]) {
+    let (first, remainder) = take_word(arguments);
+    match strip_disk_selector(first) {
+        Some(device) => (device, remainder),
+        None => (disk::Device::Boot, arguments),
+    }
+}
+
+/// Parses an optional `diskN` selector for a command that takes exactly one
+/// further argument (`cat NAME`, `rm NAME`, `readsector LBA`). A `diskN`-
+/// shaped first word is only treated as a selector when something follows
+/// it; with nothing left over, it must be the command's own single
+/// argument instead -- e.g. `cat disk2` still reads a file literally named
+/// `disk2` when there is nothing else on the line to read.
+fn parse_disk_and_one_argument(arguments: &[u8]) -> (disk::Device, &[u8]) {
+    let (first, remainder) = take_word(arguments);
+    if remainder.is_empty() {
+        return (disk::Device::Boot, arguments);
+    }
+    match strip_disk_selector(first) {
+        Some(device) => (device, remainder),
+        None => (disk::Device::Boot, arguments),
+    }
+}
+
+/// Parses an optional `diskN` selector for `write NAME TEXT`, which takes
+/// two further arguments. The same disambiguation rule applies one level
+/// deeper: `diskN` is only a selector when a non-empty NAME *and* non-empty
+/// TEXT both remain after it, so `write disk2 hello` still means "write a
+/// file named disk2 containing 'hello'" rather than an invalid selector
+/// with a missing TEXT.
+fn parse_disk_and_two_arguments(arguments: &[u8]) -> (disk::Device, &[u8]) {
+    let (first, remainder) = take_word(arguments);
+    let (name, text) = take_word(remainder);
+    if name.is_empty() || text.is_empty() {
+        return (disk::Device::Boot, arguments);
+    }
+    match strip_disk_selector(first) {
+        Some(device) => (device, remainder),
+        None => (disk::Device::Boot, arguments),
+    }
+}
+
+/// The human-facing `diskN` number for a [`disk::Device`], for status
+/// messages (`disk1` is always the boot disk).
+fn device_number(device: disk::Device) -> u32 {
+    match device {
+        disk::Device::Boot => 1,
+        disk::Device::Secondary(index) => index as u32 + 2,
+    }
+}
+
 fn take_word(input: &[u8]) -> (&[u8], &[u8]) {
     let input = trim_start(input);
     let end = input
@@ -3360,12 +3459,13 @@ fn filesystem_result(result: Result<(), disk::Error>, success: &str) {
 }
 
 fn cat_command(info: &BootInfo, arguments: &[u8]) {
+    let (device, arguments) = parse_disk_and_one_argument(arguments);
     let (name, remainder) = take_word(arguments);
     if name.is_empty() || !remainder.is_empty() {
-        println!("Usage: cat NAME");
+        println!("Usage: cat [diskN] NAME");
         return;
     }
-    match fosfs::cat(info, name) {
+    match fosfs::cat(info, device, name) {
         Ok(true) => {}
         Ok(false) => println!("File not found."),
         Err(error) => println!("FOSFS disk error: {error:?}"),
@@ -3373,12 +3473,13 @@ fn cat_command(info: &BootInfo, arguments: &[u8]) {
 }
 
 fn write_command(info: &BootInfo, arguments: &[u8]) {
+    let (device, arguments) = parse_disk_and_two_arguments(arguments);
     let (name, text) = take_word(arguments);
     if name.is_empty() || text.is_empty() {
-        println!("Usage: write NAME TEXT");
+        println!("Usage: write [diskN] NAME TEXT");
         return;
     }
-    match fosfs::write(info, name, text) {
+    match fosfs::write(info, device, name, text) {
         Ok(fosfs::WriteOutcome::Written) => println!("File written."),
         Ok(fosfs::WriteOutcome::InvalidName) => {
             println!("Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'.");
@@ -3394,39 +3495,51 @@ fn write_command(info: &BootInfo, arguments: &[u8]) {
 }
 
 fn remove_command(info: &BootInfo, arguments: &[u8]) {
+    let (device, arguments) = parse_disk_and_one_argument(arguments);
     let (name, remainder) = take_word(arguments);
     if name.is_empty() || !remainder.is_empty() {
-        println!("Usage: rm NAME");
+        println!("Usage: rm [diskN] NAME");
         return;
     }
-    match fosfs::remove(info, name) {
+    match fosfs::remove(info, device, name) {
         Ok(true) => println!("File removed."),
         Ok(false) => println!("File not found."),
         Err(error) => println!("FOSFS disk error: {error:?}"),
     }
 }
 
-fn print_disk_info(info: &BootInfo) {
+fn print_disk_info(info: &BootInfo, device: disk::Device) {
     println!(
-        "Disk: {} sectors; FOSFS partition: LBA {} + {} sectors",
-        disk::sector_count(info),
-        disk::data_partition_lba(info),
-        disk::data_partition_sectors(info)
+        "disk{}: {} sectors; FOSFS partition: LBA {} + {} sectors",
+        device_number(device),
+        disk::device_sector_count(info, device),
+        disk::device_data_partition_lba(info, device),
+        disk::device_data_partition_sectors(info, device)
     );
     println!("Only FOSFS commands may write; raw sector inspection is read-only.");
+    let secondary = disk::secondary_count();
+    if device == disk::Device::Boot && secondary > 0 {
+        println!(
+            "{secondary} additional disk(s) attached: disk2..disk{}. Give diskinfo diskN for details.",
+            secondary + 1
+        );
+    }
 }
 
 fn read_sector_command(info: &BootInfo, arguments: &[u8]) {
+    let (device, arguments) = parse_disk_and_one_argument(arguments);
     let (value, remainder) = take_word(arguments);
     let Some(lba) = parse_number(value) else {
-        println!("Usage: readsector LBA (decimal or 0x hexadecimal)");
+        println!("Usage: readsector [diskN] LBA (decimal or 0x hexadecimal)");
         return;
     };
     if !remainder.is_empty() {
-        println!("Usage: readsector LBA");
+        println!("Usage: readsector [diskN] LBA");
         return;
     }
-    match disk::read_sector(info, lba as u64, |sector| dump_bytes(lba * 512, sector)) {
+    match disk::device_read_sector(info, device, lba as u64, |sector| {
+        dump_bytes(lba * 512, sector)
+    }) {
         Ok(()) => {}
         Err(error) => println!("Disk read failed: {error:?}"),
     }

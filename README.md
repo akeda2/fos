@@ -77,8 +77,11 @@ make run
 test plus a VGA-mode test. It checks boot milestones (including
 interrupt/allocator setup), line editing, shell error handling, system
 inspection, interrupt/memory introspection, FOSFS formatting, file creation,
-reading, removal, halt, and the 80x25/80x50/experimental 132x25 local VGA
-mode switches. `make test-vga-modes` runs only the VGA mode test.
+reading, removal, halt, the 80x25/80x50/experimental 132x25 local VGA
+mode switches, and (via a dedicated `--second-disk` smoke run) the `diskN`
+selector against a second, blank attached disk. `make test-vga-modes` runs
+only the VGA mode test, and `make test-second-disk` runs only the
+second-disk scenario.
 `make test-stack-guard` builds a test-only image that deliberately reaches the
 kernel stack's absent guard page and verifies that the emergency double-fault
 task prints its diagnostic instead of resetting.
@@ -157,13 +160,13 @@ resetting to row 0 and overwriting the top of that narration.
 | `pmem` | Summarizes the physical-frame allocator's total/free/used frame counts. |
 | `palloc` | Allocates one 4 KiB physical frame and prints its base address. |
 | `pfree ADDRESS` | Returns a previously allocated frame to the free pool. |
-| `diskinfo` | Shows the total image size and FOSFS partition bounds. |
-| `readsector LBA` | Read-only hexadecimal/ASCII dump of one 512-byte image sector. |
-| `format` | Initializes the dedicated FOSFS partition, permanently removing its files. |
-| `ls` | Lists FOSFS files. |
-| `cat NAME` | Displays a FOSFS text file. |
-| `write NAME TEXT` | Creates or replaces a flat FOSFS file. Names use up to 16 lowercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
-| `rm NAME` | Removes a FOSFS file entry. |
+| `diskinfo [diskN]` | Shows the total image size and FOSFS partition bounds for the boot disk (`disk1`, the default) or an attached secondary disk. |
+| `readsector [diskN] LBA` | Read-only hexadecimal/ASCII dump of one 512-byte sector on the boot disk (`disk1`, default) or an attached secondary disk. |
+| `format [diskN]` | Initializes the FOSFS partition/volume on the boot disk (`disk1`, default) or an attached secondary disk, permanently removing its files. |
+| `ls [diskN]` | Lists FOSFS files on the boot disk (`disk1`, default) or an attached secondary disk. |
+| `cat [diskN] NAME` | Displays a FOSFS text file from the boot disk (`disk1`, default) or an attached secondary disk. |
+| `write [diskN] NAME TEXT` | Creates or replaces a flat FOSFS file on the boot disk (`disk1`, default) or an attached secondary disk. Names use up to 16 lowercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
+| `rm [diskN] NAME` | Removes a FOSFS file entry from the boot disk (`disk1`, default) or an attached secondary disk. |
 | `start` file | Optional boot-time command script. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
@@ -272,6 +275,22 @@ bitmap or heap. The generated image starts preformatted with `readme.txt` and
 all compiled tape binaries; `format` removes them and resets the directory.
 Raw `readsector` is read-only. Only FOSFS commands issue writes, and their
 LBAs are constrained to the data partition.
+
+### A second (non-boot) disk
+
+At boot, the kernel probes up to three additional BIOS hard-disk-range drives
+(`0x81`-`0x83`) with `INT 13h AH=41h`/`AH=48h` and reports each one it finds
+as `diskN` (`disk2`, `disk3`, ...); `disk1` always means the boot disk.
+Unlike the boot disk, a secondary disk has no GPT and no reserved low
+region -- it is one flat FOSFS volume starting at LBA 0, covering the whole
+probed drive, formatted directly with `format diskN`. `diskinfo`,
+`readsector`, `format`, `ls`, `cat`, `write`, and `rm` all accept an optional
+leading `diskN` selector (`disk1` may always be omitted, as shown in the
+command table above); an absent or malformed selector is treated as an
+ordinary argument rather than guessed at. This is meant for a lab machine's
+own config/log storage (e.g. a second USB thumb drive) kept separate from
+the tapes/data disk the build produces, not for booting -- a secondary disk
+is never GPT-formatted, partitioned, or written to by `tools/build_image.py`.
 
 `term` repurposes COM1 as a raw link to a remote machine by default, matching
 real hardware where most physical machines expose only one serial port.

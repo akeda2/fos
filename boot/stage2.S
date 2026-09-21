@@ -9,9 +9,15 @@
 .set COM1, 0x3f8
 .set DISK_REQUEST, 0x5400
 # DISK_REQUEST holds the protected-mode call arguments and a 16-byte EDD
-# packet. Its fields are: direction byte at +0, status byte at +1, BIOS
-# drive at +2, LBA low/high dwords at +4/+8, buffer physical address at +12,
-# and the DAP at +16.
+# packet. Its fields are: direction byte at +0 (0=read, 1=write, 2=probe),
+# status byte at +1, BIOS drive at +2, LBA low/high dwords at +4/+8, buffer
+# physical address at +12, and the DAP (direction 0/1) or the AH=48h "get
+# extended drive parameters" result buffer (direction 2) at +16, both of
+# which fit within the 64 bytes reserved before DISK_SAVED_ESP. +42/+44 hold
+# a second copy of the caller buffer's offset/segment, used only by the
+# probe path: its result buffer at +16 overlaps the DAP's own offset/segment
+# fields at +20/+22, so probe must rebuild ES:DI from this untouched copy
+# instead of reading back through fields AH=48h just overwrote.
 .set DISK_SAVED_ESP, 0x5440
 .set DISK_SAVED_CR0, 0x5444
 
@@ -428,7 +434,7 @@ bios_disk_io:
     pushl %edi
     movl %esp, DISK_SAVED_ESP
     movl 8(%ebp), %eax
-    cmpl $1, %eax
+    cmpl $2, %eax
     ja bios_disk_invalid
     movl %eax, DISK_REQUEST
     movl 12(%ebp), %eax
@@ -441,7 +447,19 @@ bios_disk_io:
     cmpl $0x100000, %eax
     jae bios_disk_invalid
     movl %eax, DISK_REQUEST + 12
-    movb BOOT_INFO + 8, %al
+    # The caller (kernel/src/disk.rs) now always supplies the target BIOS
+    # drive number explicitly as a 5th cdecl argument, instead of this
+    # trampoline hardcoding the one boot drive read from BOOT_INFO + 8 --
+    # that is what lets a second, non-boot disk (BIOS drive 0x81, 0x82, ...)
+    # be addressed through this same routine. Reject anything outside the
+    # BIOS hard-disk drive-number range (0x80-0xff): a floppy or an
+    # out-of-range value here would indicate a caller bug, not a disk that
+    # merely happens to be absent.
+    movl 24(%ebp), %eax
+    testl $0xffffff00, %eax
+    jnz bios_disk_invalid
+    cmpl $0x80, %eax
+    jb bios_disk_invalid
     movb %al, DISK_REQUEST + 2
     ljmp $0x18, $(bios_disk_protected16 + STAGE2_BASE)
 
@@ -484,6 +502,14 @@ bios_disk_real:
     shrl $4, %eax
     movw %ax, DISK_REQUEST + 22
     movw $0, DISK_REQUEST + 20
+    # bios_disk_probe reuses the DISK_REQUEST+16..+41 area as the AH=48h
+    # result buffer, which overlaps the ES:DI destination segment/offset
+    # word just stored at +20/+22 (the AH=48h "number of cylinders" field
+    # lands on the exact same bytes). Stash a second copy outside that
+    # range so the probe path can rebuild ES:DI afterward without reading
+    # back BIOS-overwritten data.
+    movw %ax, DISK_REQUEST + 44
+    movw $0, DISK_REQUEST + 42
     movb DISK_REQUEST + 2, %dl
     movw $DISK_REQUEST + 16, %si
     # `disk::transfer` deliberately keeps IF=0 while the CPU is still in
@@ -491,6 +517,8 @@ bios_disk_real:
     # protected-mode IDT). The PIC/IVT are now ready and we are genuinely in
     # real mode, so BIOS disk timeout/tick handling can safely run IRQ0.
     sti
+    cmpb $2, DISK_REQUEST
+    je bios_disk_probe
     cmpb $0, DISK_REQUEST
     jne bios_disk_write
     movb $0x42, %ah
@@ -504,6 +532,46 @@ bios_disk_write:
 bios_disk_invoke:
     int $0x13
     jc bios_disk_failed
+    movb $0, DISK_REQUEST + 1
+    jmp bios_disk_return_to_pm
+bios_disk_probe:
+    # A second, non-boot disk arrives with no drive number handed to us at
+    # boot the way the boot drive does (in DL), so the kernel must probe for
+    # it: AH=41h ("check extensions present") confirms the drive exists and
+    # supports the same AH=42h/43h calls the read/write path above already
+    # relies on, then AH=48h ("get extended drive parameters") reports its
+    # total sector count so the kernel can bounds-check reads/writes against
+    # it exactly as it already does for the boot disk.
+    movw $0x55aa, %bx
+    movb $0x41, %ah
+    int $0x13
+    jc bios_disk_failed
+    cmpw $0xaa55, %bx
+    jne bios_disk_failed
+    # AH=48h requires the caller to fill in the buffer's own size (in bytes)
+    # before the call; it overwrites this same DS:SI buffer the DAP above
+    # would otherwise occupy, which is safe since direction 2 never reaches
+    # the read/write path that needs the DAP layout.
+    movw $26, DISK_REQUEST + 16
+    movb $0x48, %ah
+    int $0x13
+    jc bios_disk_failed
+    cmpw $26, DISK_REQUEST + 16
+    jb bios_disk_failed
+    # Copy the 8-byte total-sector-count field (offset 16 within the AH=48h
+    # result buffer, i.e. DISK_REQUEST + 16 + 16) to the caller-supplied
+    # buffer at ES:DI. Its segment:offset was computed above from the
+    # caller's physical buffer address, but must be read back from the +42/
+    # +44 safe stash rather than +20/+22: the AH=48h call above just
+    # overwrote +20/+22 with its own "number of cylinders" result field,
+    # since that field happens to occupy the exact same two bytes.
+    movw DISK_REQUEST + 44, %ax
+    movw %ax, %es
+    movw DISK_REQUEST + 42, %di
+    movw $(DISK_REQUEST + 32), %si
+    movw $8, %cx
+    cld
+    rep movsb
     movb $0, DISK_REQUEST + 1
     jmp bios_disk_return_to_pm
 bios_disk_failed:

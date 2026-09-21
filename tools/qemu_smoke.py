@@ -161,6 +161,11 @@ def main() -> None:
         action="store_true",
         help="exercise the test-only foreground NIC reset latch (requires matching kernel feature)",
     )
+    parser.add_argument(
+        "--second-disk",
+        action="store_true",
+        help="attach a second, blank raw disk and exercise the diskN selector on the FOSFS commands",
+    )
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="fos-qemu-monitor-") as monitor_dir:
@@ -175,6 +180,18 @@ def main() -> None:
             "-no-reboot",
             "-no-shutdown",
         ]
+        second_disk_path = None
+        if args.second_disk:
+            # A brand-new blank image has no partition table at all -- exactly
+            # the state `format diskN` is meant to handle, since a secondary
+            # disk is a flat FOSFS volume with no GPT (see AGENTS.md's "A
+            # second (non-boot) disk" section). 4 MiB is comfortably above
+            # FOSFS3's fixed 8-sector directory area with room for a few test
+            # files.
+            second_disk_path = os.path.join(monitor_dir, "disk2.img")
+            with open(second_disk_path, "wb") as second_disk_file:
+                second_disk_file.truncate(4 * 1024 * 1024)
+            qemu_command.extend(["-drive", f"format=raw,file={second_disk_path}"])
         if args.nic == "none":
             qemu_command.extend(["-nic", "none"])
         elif args.nic == "dual-e1000":
@@ -258,6 +275,26 @@ def main() -> None:
                 b"bootinfo\r",
                 b"memmap\r",
             ]
+            if args.second_disk:
+                commands.extend(
+                    (
+                        b"diskinfo\r",
+                        b"diskinfo disk2\r",
+                        b"format disk2\r",
+                        b"ls disk2\r",
+                        b"write disk2 config.txt hello-from-disk2\r",
+                        b"ls disk2\r",
+                        b"cat disk2 config.txt\r",
+                        b"rm disk2 config.txt\r",
+                        b"ls disk2\r",
+                        # The bare `format`/`ls` earlier in this same script
+                        # already emptied disk1; re-checking it here proves
+                        # disk2's own format/write/rm above left disk1
+                        # completely untouched rather than merely unchecked.
+                        b"ls\r",
+                        b"cat readme.txt\r",
+                    )
+                )
             if args.nic in ("e1000", "dual-e1000", "ne2000"):
                 commands.extend((b"nic\r", b"nic send\r"))
             else:
@@ -336,6 +373,16 @@ def main() -> None:
                 )
             else:
                 expected.append(b"No supported Ethernet controller found on the PCI bus.")
+            if args.second_disk:
+                expected.extend(
+                    (
+                        b"disk2: found (BIOS drive 0x81, 8192 sectors).",
+                        b"1 additional disk(s) attached: disk2..disk2.",
+                        b"disk2: 8192 sectors; FOSFS partition: LBA 0 + 8192 sectors",
+                        b"config.txt  16 bytes, 1 sector(s)",
+                        b"hello-from-disk2",
+                    )
+                )
             for marker in expected:
                 wait_for(output, selector, marker, 10)
         finally:

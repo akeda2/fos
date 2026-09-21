@@ -216,6 +216,7 @@ make test-stack-guard # Builds a fault-injection image and verifies its emergenc
 make test-page-protection # Verifies CR0.WP and read-only kernel-text PTEs.
 make test-nic-watchdog # Verifies foreground recovery from a latched NIC fault.
 make test-start # Verifies an optional FOSFS start boot-command script.
+make test-second-disk # Verifies the diskN selector against a second, attached disk.
 make all      # Builds everything: image, netrom, and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
 make help     # Lists every target with a one-line description.
@@ -228,6 +229,9 @@ Run `make test-page-protection` when changing page permissions, linker section
 layout, or page-fault diagnostics.
 Run `make test-start` when changing shell startup order, FOSFS startup-file
 handling, or command dispatch.
+Run `make test-second-disk` when changing secondary-disk discovery, the
+`diskN` selector, or `disk.rs`'s device-aware trampoline calls (`make test`
+already includes it, but it is faster to run alone while iterating).
 Run `make test-unsafe-memory` when changing the legacy-memory feature or its
 separate image target.
 The smoke harness must use bounded waits, preserve serial output on failure,
@@ -270,8 +274,13 @@ tapes continue to print through the kernel console callback.
 Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
 `pfree ADDRESS`.
 
-Storage commands: `diskinfo`, `readsector LBA`, `format`, `ls`, `cat NAME`,
-`write NAME TEXT`, and `rm NAME`; FOSFS is flat and supports contiguous multi-sector files.
+Storage commands: `diskinfo [diskN]`, `readsector [diskN] LBA`,
+`format [diskN]`, `ls [diskN]`, `cat [diskN] NAME`, `write [diskN] NAME
+TEXT`, and `rm [diskN] NAME`; FOSFS is flat and supports contiguous
+multi-sector files. `disk1` (the boot disk) is always the default and may
+be omitted; `disk2`, `disk3`, ... address up to three additional BIOS
+hard-disk-range drives discovered at boot (see "A second (non-boot) disk
+for config/log storage" below), each a flat, unpartitioned FOSFS volume.
 
 Tape commands: `tape status`, `tape load disk NAME`, `tape load net`,
 `tape send NAME PEER_MAC|PEER_NUMBER`, and `tape run [ARGS...]`. Tapes are
@@ -2238,7 +2247,7 @@ partition holding every compiled tape) does not come close to fitting in a
 boot layout in the spirit of `boot/netrom.S`'s own parallel/optional path,
 not a change to the existing `image`/`run`/`test` layout.
 
-### A second (non-boot) disk for config/log storage: investigated, accepted design not yet built
+### A second (non-boot) disk for config/log storage
 
 Raised by the lab team: their test machines boot from an ordinary USB
 thumb drive, and the actual motivation here is to stop needing to bake
@@ -2274,7 +2283,7 @@ What is new, specific to a second disk:
   below) and left alone across every later `make image` rebuild of the
   boot medium, which is the entire point.
 
-**Accepted design: option 2 -- a device argument on the existing FOSFS
+**Implemented design: option 2 -- a device argument on the existing FOSFS
 commands, not a parallel command namespace.** `ls`/`cat`/`write`/`rm`/
 `format`/`diskinfo`/`readsector` all gain an optional leading `diskN`
 argument (`disk1` is the boot disk -- what these commands already mean
@@ -2322,6 +2331,47 @@ probe above (start LBA 0, whole-disk sector count) instead of from
 `BootInfo`'s boot-disk-specific GPT-discovered fields. No in-memory
 directory cache or other per-device state exists to duplicate -- FOSFS
 reads its superblock/directory fresh from disk on every operation already.
+
+**As built.** `boot/stage2.S`'s `bios_disk_io` trampoline call gained a 5th
+cdecl argument (the BIOS drive number, validated to the `0x80`-`0xff`
+hard-disk range) and a third direction value (`2` = probe), which runs
+`AH=41h` then `AH=48h` and copies back an 8-byte sector count. One real bug
+surfaced and was fixed here: the probe path's AH=48h result buffer (at
+`DISK_REQUEST+16`) overlaps the read/write DAP's own offset/segment fields
+at `DISK_REQUEST+20`/`+22` (used to build the caller's ES:DI copy
+destination) -- `AH=48h`'s "number of cylinders" output field lands on
+those exact same two bytes, silently corrupting the destination pointer
+right before it was used, which surfaced as `disk2: found (..., <huge
+garbage number> sectors)` instead of the real sector count. The fix
+stashes a second copy of that offset/segment at `DISK_REQUEST+42`/`+44`
+(untouched by the probe's own buffer) immediately after computing it, and
+the probe path reads back from there instead.
+
+`kernel/src/disk.rs` gained a `Device` enum (`Boot`/`Secondary(usize)`), a
+4-entry secondary-disk table populated by `discover_secondary_disks`
+(probing `0x81`-`0x83` at boot, right after `disk::initialize`), and
+device-aware `device_read_sector`/`device_write_sector`/
+`device_data_partition_lba`/`device_data_partition_sectors`/
+`device_sector_count` functions; `read_sector`/`write_sector` remain as
+thin `Device::Boot`-only wrappers so every pre-existing call site outside
+the seven commands above (tape ABI file callbacks, the `start` file,
+`tape run router @router.cfg`, `tape load disk`, `tape send`) needed no
+change and stays boot-disk-only by design. Every `fosfs.rs` function
+threads a `disk::Device` parameter exactly as scoped above. `shell.rs`
+gained `strip_disk_selector`/three arity-specific `parse_disk_*` helpers
+implementing the disambiguation rule described above, wired into
+`cat`/`write`/`rm`/`readsector`/`diskinfo`/`format`/`ls`.
+
+Verified end to end (`make test-second-disk`, folded into `make test`):
+booting with a second, blank 4 MiB QEMU drive attached is discovered as
+`disk2` (8192 sectors), `format disk2`/`write disk2 NAME TEXT`/`ls
+disk2`/`cat disk2 NAME`/`rm disk2 NAME` all work, and disk1's own files are
+completely unaffected by any of it (this project's real hardware is
+`0x80`+ USB thumb drives, which BIOS enumerates the same as this test's
+attached drive). A secondary disk's practical size ceiling is BIOS/
+firmware LBA support, not FOSFS -- the flat format itself has no meaningful
+capacity limit; the fixed 64-entry directory limits file *count*, not
+capacity, on any FOSFS volume regardless of size.
 
 ### A tape that visits 64-bit long mode and comes back
 
