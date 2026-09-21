@@ -2229,6 +2229,91 @@ partition holding every compiled tape) does not come close to fitting in a
 boot layout in the spirit of `boot/netrom.S`'s own parallel/optional path,
 not a change to the existing `image`/`run`/`test` layout.
 
+### A second (non-boot) disk for config/log storage: investigated, accepted design not yet built
+
+Raised by the lab team: their test machines boot from an ordinary USB
+thumb drive, and the actual motivation here is to stop needing to bake
+config into the build (today, e.g., `tapes/router/ROUTER.CFG` only
+reaches a running router via `tools/build_image.py --file ROUTER.CFG` at
+build time, or the 4096-byte `tape run router @ROUTER.CFG` startup-
+argument path) -- a second, persistent, live-editable disk sitting in the
+machine would let config and logs be read/written directly without
+touching the build pipeline or the boot medium at all.
+
+**This is genuinely easier than the floppy work above, and shares most of
+its plumbing.** A second hard disk (BIOS drive `0x81`, `0x82`, ...) needs
+no CHS/geometry translation at all -- real BIOS EDD extensions (`AH=42h`/
+`43h`) work identically for any hard-disk-range drive number, not just the
+boot one. So the one change floppy support already requires --
+parameterizing `disk::transfer`'s trampoline call with an explicit drive
+number, instead of the hardcoded single value read once from `BOOT_INFO+8`
+-- is *all* the register-level work a second disk needs; no new BIOS call
+variant, no per-drive geometry cache.
+
+What is new, specific to a second disk:
+
+- **Discovery.** The boot drive arrives for free via `DL` at boot; nothing
+  else does. A second disk needs to be probed for at kernel init -- try
+  `AH=41h` ("check extensions present") against `0x81`, `0x82`, ... and
+  treat a success response as "this disk exists," then `AH=48h` ("extended
+  read drive parameters") for its sector count.
+- **No GPT/MBR needed on the second disk.** The boot disk's whole MBR +
+  primary/backup-GPT dance (`tools/build_image.py`) exists purely so it can
+  also be a legitimate, standards-compliant *bootable* image. A disk that
+  is never booted from has no such requirement -- it can be a single flat
+  FOSFS volume starting at LBA 0, formatted once (by `format disk2`, see
+  below) and left alone across every later `make image` rebuild of the
+  boot medium, which is the entire point.
+
+**Accepted design: option 2 -- a device argument on the existing FOSFS
+commands, not a parallel command namespace.** `ls`/`cat`/`write`/`rm`/
+`format`/`diskinfo`/`readsector` all gain an optional leading `diskN`
+argument (`disk1` is the boot disk -- what these commands already mean
+today -- `disk2` the first additional disk, `disk3` a third if one is ever
+attached, and so on):
+
+```
+ls [diskN]
+cat [diskN] NAME
+write [diskN] NAME TEXT
+rm [diskN] NAME
+format [diskN]
+diskinfo [diskN]
+readsector [diskN] LBA
+```
+
+Omitting `diskN` keeps meaning exactly what it means today (the boot
+disk) -- every existing script, `START` file, and test stays byte-for-byte
+valid with zero migration cost. This also means `disk1` is never mandatory
+to type; it exists purely so the numbering is uniform and a config/log
+file can unambiguously say "disk2" without also needing a special word for
+"the first one."
+
+Parsing follows the same two rules already established for `floppy`/
+`tape load floppy`: a leading `diskN` token is recognized as a device
+selector only when it matches that strict pattern *and* names a disk that
+is actually attached (never guessed); and for commands that take exactly
+one further argument (`cat NAME`, `rm NAME`, `readsector LBA`), remaining-
+word count disambiguates `NAME`-only from `diskN NAME` the same way `tape
+load floppy NAME`/`tape load floppy A NAME` already do. The same class of
+accepted edge case applies too: a FOSFS file literally named `DISK2` (a
+syntactically legal name) would collide with the selector once a second
+disk is actually attached -- another one-line documented limitation, not
+worth solving with cleverness, consistent with the floppy `A`/`B` case.
+
+**Scope of the `fosfs.rs` refactor.** `fosfs.rs` today holds no global
+state of its own -- every function (`format`/`list`/`cat`/`write`/`remove`/
+...) already takes `&BootInfo` purely to reach `disk::read_sector`/
+`write_sector` and `disk::data_partition_lba`/`data_partition_sectors`.
+Threading a device parameter through it is a mechanical, if broad, change:
+every one of those function signatures gains a device argument that flows
+down into `disk.rs`'s own (already-planned, for floppy) device-parameter
+support, and a disk2-style device supplies its geometry from the `AH=48h`
+probe above (start LBA 0, whole-disk sector count) instead of from
+`BootInfo`'s boot-disk-specific GPT-discovered fields. No in-memory
+directory cache or other per-device state exists to duplicate -- FOSFS
+reads its superblock/directory fresh from disk on every operation already.
+
 ### A tape that visits 64-bit long mode and comes back
 
 `tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written
