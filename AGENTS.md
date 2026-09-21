@@ -2409,6 +2409,27 @@ content on each destination, and confirming a tape loaded earlier in that
 same run reports "No tape loaded" (with the reused-buffer note printed)
 immediately after a copy.
 
+**Follow-up: `@diskN/NAME` for `tape run`'s file-argument syntax.** Once a
+file like `router.cfg` could live on a secondary disk (via `copy` above),
+`tape run router @router.cfg` -- previously hardcoded to `disk::Device::
+Boot` in both `tape_argument_source` and `tape_run` -- had no way to reach
+it there. `TapeArgumentSource::File` now also carries a `disk::Device`,
+resolved by checking for a `/` inside the `@`-prefixed reference: a
+`diskN` prefix before the `/` selects that disk (reusing the existing
+`strip_disk_selector`, so an unattached or malformed `diskN` cleanly falls
+through to the same `Invalid`/usage-message path as any other malformed
+`@` reference, rather than silently defaulting); no `/` at all keeps
+meaning the boot disk, exactly as before. A literal `/` is a safe,
+unambiguous separator for this precise reason: FOSFS names may only
+contain letters, digits, `.`, `_`, and `-`, so a real file name can never
+collide with it. This works for *any* tape's `@FILE` argument, not just
+`router`'s, since the `@`-detection logic already applied uniformly before
+this change. Verified by extending `make test-second-disk`: `tape run
+@disk2/expr.txt` (reading `"3 4 +"` written to disk2) runs the already-
+loaded tape without a "not found"/usage error, while `tape run
+@disk9/expr.txt` (no such disk attached) cleanly prints the usage message
+instead of crashing or guessing.
+
 ### A tape that visits 64-bit long mode and comes back
 
 `tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written

@@ -285,13 +285,25 @@ def main() -> None:
                         b"write disk2 config.txt hello-from-disk2\r",
                         b"ls disk2\r",
                         b"cat disk2 config.txt\r",
+                        # `tape run @diskN/NAME` reads a tape's startup
+                        # arguments from an attached secondary disk instead
+                        # of only ever the boot disk. Exercised here while
+                        # the primes tape the base command list already
+                        # loaded (via its own earlier "tape run") is still
+                        # resident, since disk1's own preloaded tapes were
+                        # already wiped by that same base list's "format".
+                        # primes.S ignores any startup arguments, so this
+                        # only proves the file itself was read without
+                        # error (no "not found"/usage message), not that
+                        # its bytes changed behavior.
+                        b"write disk2 expr.txt 3 4 +\r",
+                        b"tape run @disk2/expr.txt\r",
+                        b"tape run @disk9/expr.txt\r",
+                        b"rm disk2 expr.txt\r",
                         # copy: exercise both directions, an explicit rename,
                         # and confirm a loaded tape's state is invalidated
                         # since copy_file reuses the same shared scratch
-                        # buffer as `tape load disk`/`tape load net`. The
-                        # base command list above already left the primes
-                        # tape loaded (via its own "tape run"), so no fresh
-                        # "tape load" is needed here just to prove this.
+                        # buffer as `tape load disk`/`tape load net`.
                         b"tape status\r",
                         b"copy disk2 config.txt disk1\r",
                         b"tape status\r",
@@ -402,6 +414,7 @@ def main() -> None:
                         b"Note: this reused the shared tape buffer, so the previously loaded tape is gone; 'tape load' again before 'tape run'.",
                         b"Copied 16 byte(s) from disk1 'note2.txt' to disk2 'note2-copy.txt'.",
                         b"hello-from-disk1",
+                        b"Usage: tape run [ARGS...] or tape run router @CONFIG_FILE (or @diskN/CONFIG_FILE)",
                     )
                 )
             for marker in expected:

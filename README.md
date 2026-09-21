@@ -184,7 +184,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): checks that the declared image fits the fixed 4 MiB tape region, validates each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run router @router.cfg` reads router startup arguments from the lowercase FOSFS file `router.cfg`; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run @NAME` (or `tape run router @NAME`) reads startup arguments from the FOSFS file `NAME` on the boot disk instead, and `@diskN/NAME` reads it from an attached secondary disk (e.g. `tape run router @disk2/router.cfg`); `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
@@ -304,6 +304,15 @@ needs its own dedicated buffer and inflates `kernel.bin` by nothing; the
 tradeoff is that any tape already loaded there is left overwritten, which
 `copy` reports so `tape run` doesn't later mistake copied file bytes for
 tape code.
+
+A tape's own startup arguments can likewise come from a secondary disk:
+`tape run @NAME` (or `tape run router @NAME`) already read a FOSFS file's
+raw bytes as startup arguments instead of requiring them typed on the
+command line; `tape run @diskN/NAME` extends that to name an attached
+secondary disk explicitly (`tape run router @disk2/router.cfg`), while a
+bare `@NAME` still means the boot disk, matching every command's existing
+default. A literal `/` is unambiguous as the disk/name separator here,
+since FOSFS names can never legally contain one.
 
 `term` repurposes COM1 as a raw link to a remote machine by default, matching
 real hardware where most physical machines expose only one serial port.

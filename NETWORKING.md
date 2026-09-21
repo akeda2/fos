@@ -307,7 +307,10 @@ the kernel's FOSFS/BIOS disk path and passes its bytes through the existing
 tape startup-argument ABI. The router's optional lease persistence uses the
 high-level FOSFS tape callbacks rather than accessing raw sectors or BIOS.
 Router configuration accepts newlines and `#` comments, and the file is
-limited to 4096 bytes by the shell's fixed configuration buffer.
+limited to 4096 bytes by the shell's fixed configuration buffer. If
+`ROUTER.CFG` lives on an attached secondary disk instead of the boot disk,
+name it explicitly: `tape run router @disk2/router.cfg`; a bare `@NAME`
+always means the boot disk.
 
 ## Kernel Ethernet backends
 

@@ -260,7 +260,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "Tape: tape status (what's loaded), tape run [ARGS...] or tape run @FILE (execute it)"
                 );
                 println!(
-                    "      tape run router @CONFIG_FILE (read router arguments from a lowercase FOSFS file)"
+                    "      tape run router @CONFIG_FILE (read router arguments from a lowercase FOSFS file; @diskN/CONFIG_FILE reads from an attached secondary disk)"
                 );
                 println!(
                     "      tape load disk NAME (load a flat multi-sector FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
@@ -2786,10 +2786,15 @@ extern "C" fn tape_fs_remove(name: u32, name_length: u32) -> u32 {
 
 enum TapeArgumentSource<'a> {
     Direct(&'a [u8]),
-    File(&'a [u8]),
+    File(disk::Device, &'a [u8]),
     Invalid,
 }
 
+/// `@NAME` reads the config file from the boot disk, matching the historical
+/// syntax; `@diskN/NAME` reads it from an attached secondary disk instead.
+/// A literal `/` is unambiguous as the disk/name separator here -- FOSFS
+/// names may only contain letters, digits, `.`, `_`, and `-`, so `/` can
+/// never appear in a real file name to collide with this.
 fn tape_argument_source(arguments: &[u8]) -> TapeArgumentSource<'_> {
     let (first, remainder) = take_word(arguments);
     let (candidate, trailing) = if first == b"router" {
@@ -2803,7 +2808,20 @@ fn tape_argument_source(arguments: &[u8]) -> TapeArgumentSource<'_> {
     if candidate.len() == 1 || !trailing.is_empty() {
         return TapeArgumentSource::Invalid;
     }
-    TapeArgumentSource::File(&candidate[1..])
+    let reference = &candidate[1..];
+    let (device, name) = match reference.iter().position(|&byte| byte == b'/') {
+        Some(slash) => {
+            let Some(device) = strip_disk_selector(&reference[..slash]) else {
+                return TapeArgumentSource::Invalid;
+            };
+            (device, &reference[slash + 1..])
+        }
+        None => (disk::Device::Boot, reference),
+    };
+    if name.is_empty() {
+        return TapeArgumentSource::Invalid;
+    }
+    TapeArgumentSource::File(device, name)
 }
 
 fn tape_run(info: &BootInfo, arguments: &[u8]) {
@@ -2815,16 +2833,19 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
     let arguments = match tape_argument_source(arguments) {
         TapeArgumentSource::Direct(arguments) => arguments,
         TapeArgumentSource::Invalid => {
-            println!("Usage: tape run [ARGS...] or tape run router @CONFIG_FILE");
+            println!(
+                "Usage: tape run [ARGS...] or tape run router @CONFIG_FILE (or @diskN/CONFIG_FILE)"
+            );
             return;
         }
-        TapeArgumentSource::File(name) => {
-            let length = match fosfs::file_length(info, disk::Device::Boot, name) {
+        TapeArgumentSource::File(device, name) => {
+            let length = match fosfs::file_length(info, device, name) {
                 Ok(Some(length)) => length,
                 Ok(None) => {
                     println!(
-                        "Router configuration file '{}' was not found.",
-                        core::str::from_utf8(name).unwrap_or("?")
+                        "Router configuration file '{}' was not found on disk{}.",
+                        core::str::from_utf8(name).unwrap_or("?"),
+                        device_number(device)
                     );
                     return;
                 }
@@ -2840,12 +2861,13 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
                 return;
             }
             let length = length as usize;
-            match fosfs::read(info, disk::Device::Boot, name, &mut file_buffer[..length]) {
+            match fosfs::read(info, device, name, &mut file_buffer[..length]) {
                 Ok(Some(_)) => &file_buffer[..length],
                 Ok(None) => {
                     println!(
-                        "Router configuration file '{}' was not found.",
-                        core::str::from_utf8(name).unwrap_or("?")
+                        "Router configuration file '{}' was not found on disk{}.",
+                        core::str::from_utf8(name).unwrap_or("?"),
+                        device_number(device)
                     );
                     return;
                 }
