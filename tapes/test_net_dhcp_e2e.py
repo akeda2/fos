@@ -177,6 +177,43 @@ def main() -> None:
         read_until(b"Tape returned; back at the fos shell.", 10)
         read_until(b"fos> ", 5)
         print("PASS: DHCP connectivity tape pinged the host through both leases.")
+
+        # Ping a target that never replies (an address with no host behind
+        # it) so both NICs' ARP-resolves-fine-but-ICMP-never-answers wait
+        # loops actually run their full PING_TIMEOUT_SECONDS. Before
+        # resolve_mac/ping_once checked should_abort internally, an escape
+        # keypress sent while a ping was in flight could sit unnoticed for
+        # up to PING_TIMEOUT_SECONDS per NIC (worse with more NICs down),
+        # since should_abort was previously polled only once per outer
+        # monitoring-loop iteration. This asserts the abort is now noticed
+        # quickly regardless of how many NICs are still waiting on a reply.
+        command_start = len(output)
+        for byte in b"tape run 10.0.2.99 5\r":
+            qemu.stdin.write(bytes([byte]))
+            qemu.stdin.flush()
+            time.sleep(0.002)
+        read_until(
+            b"Network DHCP test: every NIC acquired an IP; monitoring until manual exit.",
+            40,
+        )
+        # Give both NICs' pings time to actually be in flight (waiting on a
+        # reply that will never come) before requesting the abort.
+        time.sleep(1.0)
+        abort_sent_at = time.monotonic()
+        monitor("sendkey f12")
+        read_until(b"Network DHCP test stopped.", 3)
+        abort_latency = time.monotonic() - abort_sent_at
+        if abort_latency > 2.5:
+            raise SystemExit(
+                "abort took too long while pings were unanswered: "
+                f"{abort_latency:.2f}s"
+            )
+        read_until(b"Tape returned; back at the fos shell.", 10)
+        read_until(b"fos> ", 5)
+        print(
+            "PASS: local escape aborts promptly even while pings to an "
+            f"unreachable target are in flight ({abort_latency:.2f}s)."
+        )
     finally:
         qemu.terminate()
         try:

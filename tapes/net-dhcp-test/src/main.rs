@@ -277,6 +277,7 @@ fn send_arp_request(
 }
 
 fn resolve_mac(
+    should_abort: ShouldAbort,
     nic: usize,
     mac: MacAddress,
     address: Ipv4Address,
@@ -291,8 +292,22 @@ fn resolve_mac(
     if !send_arp_request(mac, address, target, nic_send_at, nic, frame, arp) {
         return None;
     }
-    let deadline = (ticks() / 100).saturating_add(PING_TIMEOUT_SECONDS as u64 * 100);
+    // ticks() / 100 is already in whole seconds (the PIT runs at 100 Hz), so
+    // the timeout budget must be added in seconds too, not re-multiplied by
+    // 100 -- an earlier version of this deadline did exactly that, making a
+    // "5 second" ARP wait actually last PING_TIMEOUT_SECONDS * 100 seconds
+    // (over 8 minutes) instead. A down link (no ARP reply ever arriving)
+    // is exactly the case that hit this every time, making the tape look
+    // like it had hung completely instead of merely timing out slowly.
+    let deadline = (ticks() / 100).saturating_add(PING_TIMEOUT_SECONDS as u64);
     while (ticks() / 100) < deadline {
+        // A down link means no ARP reply ever arrives, so this loop would
+        // otherwise spin for the full PING_TIMEOUT_SECONDS with no way for
+        // an operator to abort -- check should_abort every iteration so a
+        // down NIC never delays F12 from being noticed.
+        if should_abort() == TAPE_EVENT_ABORT {
+            return None;
+        }
         let length =
             nic_receive_at(nic as u32, frame.as_mut_ptr() as u32, max_frame_len as u32) as usize;
         if length == 0 {
@@ -320,6 +335,7 @@ fn resolve_mac(
 
 fn ping_once(
     putc: Putc,
+    should_abort: ShouldAbort,
     nic: usize,
     mac: MacAddress,
     status: &AcquiredNic,
@@ -340,6 +356,7 @@ fn ping_once(
         status.gateway
     };
     let Some(destination_mac) = resolve_mac(
+        should_abort,
         nic,
         mac,
         status.address,
@@ -382,8 +399,13 @@ fn ping_once(
         print_bytes(putc, b": transmit error.\n");
         return false;
     }
-    let deadline = (ticks() / 100).saturating_add(PING_TIMEOUT_SECONDS as u64 * 100);
+    let deadline = (ticks() / 100).saturating_add(PING_TIMEOUT_SECONDS as u64);
     while (ticks() / 100) < deadline {
+        // Same rationale as resolve_mac's wait loop above: a down link
+        // never produces an echo reply, so this must stay abortable.
+        if should_abort() == TAPE_EVENT_ABORT {
+            break;
+        }
         let length =
             nic_receive_at(nic as u32, frame.as_mut_ptr() as u32, max_frame_len as u32) as usize;
         if length == 0 {
@@ -777,6 +799,7 @@ F12 (or F4/F6/F7/F8/F10) aborts.\n"
             status.ping_sent = 1;
             if ping_once(
                 putc,
+                should_abort,
                 nic,
                 status.mac,
                 &status,
@@ -819,10 +842,19 @@ F12 (or F4/F6/F7/F8/F10) aborts.\n"
         if let Some((target, interval)) = ping_options {
             if now >= next_ping {
                 for nic in 0..status_count {
+                    // Check between NICs, not just once per outer iteration:
+                    // several down links back-to-back could otherwise each
+                    // consume a full PING_TIMEOUT_SECONDS before F12 is
+                    // noticed again.
+                    if should_abort() == TAPE_EVENT_ABORT {
+                        print_bytes(putc, b"Network DHCP test stopped.\n");
+                        return;
+                    }
                     let status = statuses[nic];
                     statuses[nic].ping_sent += 1;
                     if ping_once(
                         putc,
+                        should_abort,
                         nic,
                         status.mac,
                         &status,
