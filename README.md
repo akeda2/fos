@@ -167,6 +167,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `cat [diskN] NAME` | Displays a FOSFS text file from the boot disk (`disk1`, default) or an attached secondary disk. |
 | `write [diskN] NAME TEXT` | Creates or replaces a flat FOSFS file on the boot disk (`disk1`, default) or an attached secondary disk. Names use up to 16 lowercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
 | `rm [diskN] NAME` | Removes a FOSFS file entry from the boot disk (`disk1`, default) or an attached secondary disk. |
+| `copy SRC_DISK NAME DST_DISK [NEW_NAME]` | Copies one FOSFS file's raw bytes from `SRC_DISK` to `DST_DISK` (both must be spelled out explicitly, e.g. `disk1`/`disk2` — unlike every other disk command, neither side defaults), optionally renaming it to `NEW_NAME`. Uses the same shared tape staging buffer as `tape load disk`/`tape load net`, so any previously loaded tape is invalidated by a copy; the shell reports this when it happens. |
 | `start` file | Optional boot-time command script. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
@@ -291,6 +292,18 @@ ordinary argument rather than guessed at. This is meant for a lab machine's
 own config/log storage (e.g. a second USB thumb drive) kept separate from
 the tapes/data disk the build produces, not for booting -- a secondary disk
 is never GPT-formatted, partitioned, or written to by `tools/build_image.py`.
+
+`copy SRC_DISK NAME DST_DISK [NEW_NAME]` moves one file's bytes directly
+between two disks (e.g. `copy disk1 router.cfg disk2`) without a host round
+trip. Unlike every other disk command above, both sides must be spelled out
+explicitly -- with two disks genuinely in play, letting either one default
+would be ambiguous about which disk it actually meant. It stages the whole
+file through the same shared 4 MiB buffer `tape load disk`/`tape load net`
+already use (see "Tapes: fixed load address..." in AGENTS.md), so it never
+needs its own dedicated buffer and inflates `kernel.bin` by nothing; the
+tradeoff is that any tape already loaded there is left overwritten, which
+`copy` reports so `tape run` doesn't later mistake copied file bytes for
+tape code.
 
 `term` repurposes COM1 as a raw link to a remote machine by default, matching
 real hardware where most physical machines expose only one serial port.

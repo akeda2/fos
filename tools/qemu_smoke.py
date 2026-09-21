@@ -285,6 +285,23 @@ def main() -> None:
                         b"write disk2 config.txt hello-from-disk2\r",
                         b"ls disk2\r",
                         b"cat disk2 config.txt\r",
+                        # copy: exercise both directions, an explicit rename,
+                        # and confirm a loaded tape's state is invalidated
+                        # since copy_file reuses the same shared scratch
+                        # buffer as `tape load disk`/`tape load net`. The
+                        # base command list above already left the primes
+                        # tape loaded (via its own "tape run"), so no fresh
+                        # "tape load" is needed here just to prove this.
+                        b"tape status\r",
+                        b"copy disk2 config.txt disk1\r",
+                        b"tape status\r",
+                        b"cat disk1 config.txt\r",
+                        b"write note2.txt hello-from-disk1\r",
+                        b"copy disk1 note2.txt disk2 note2-copy.txt\r",
+                        b"cat disk2 note2-copy.txt\r",
+                        b"rm disk2 note2-copy.txt\r",
+                        b"rm note2.txt\r",
+                        b"rm disk1 config.txt\r",
                         b"rm disk2 config.txt\r",
                         b"ls disk2\r",
                         # The bare `format`/`ls` earlier in this same script
@@ -381,6 +398,10 @@ def main() -> None:
                         b"disk2: 8192 sectors; FOSFS partition: LBA 0 + 8192 sectors",
                         b"config.txt  16 bytes, 1 sector(s)",
                         b"hello-from-disk2",
+                        b"Copied 16 byte(s) from disk2 'config.txt' to disk1 'config.txt'.",
+                        b"Note: this reused the shared tape buffer, so the previously loaded tape is gone; 'tape load' again before 'tape run'.",
+                        b"Copied 16 byte(s) from disk1 'note2.txt' to disk2 'note2-copy.txt'.",
+                        b"hello-from-disk1",
                     )
                 )
             for marker in expected:

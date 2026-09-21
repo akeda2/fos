@@ -276,11 +276,19 @@ Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
 
 Storage commands: `diskinfo [diskN]`, `readsector [diskN] LBA`,
 `format [diskN]`, `ls [diskN]`, `cat [diskN] NAME`, `write [diskN] NAME
-TEXT`, and `rm [diskN] NAME`; FOSFS is flat and supports contiguous
-multi-sector files. `disk1` (the boot disk) is always the default and may
-be omitted; `disk2`, `disk3`, ... address up to three additional BIOS
-hard-disk-range drives discovered at boot (see "A second (non-boot) disk
-for config/log storage" below), each a flat, unpartitioned FOSFS volume.
+TEXT`, `rm [diskN] NAME`, and `copy SRC_DISK NAME DST_DISK [NEW_NAME]`;
+FOSFS is flat and supports contiguous multi-sector files. `disk1` (the boot
+disk) is always the default and may be omitted; `disk2`, `disk3`, ... address
+up to three additional BIOS hard-disk-range drives discovered at boot (see
+"A second (non-boot) disk for config/log storage" below), each a flat,
+unpartitioned FOSFS volume. `copy` is the one exception to `disk1`'s default:
+since it moves a file between two disks, both `SRC_DISK` and `DST_DISK` must
+be spelled out explicitly, never assumed. It stages the whole file through
+the same shared `pmem::TAPE_BASE`/`TAPE_LEN` buffer `tape load disk`/`tape
+load net` already use (see "Tapes: fixed load address..." below) rather than
+adding a second large static buffer, and invalidates (and reports) any
+previously loaded tape's now-stale bookkeeping afterward, since that buffer
+no longer holds that tape's bytes.
 
 Tape commands: `tape status`, `tape load disk NAME`, `tape load net`,
 `tape send NAME PEER_MAC|PEER_NUMBER`, and `tape run [ARGS...]`. Tapes are
@@ -2372,6 +2380,34 @@ attached drive). A secondary disk's practical size ceiling is BIOS/
 firmware LBA support, not FOSFS -- the flat format itself has no meaningful
 capacity limit; the fixed 64-entry directory limits file *count*, not
 capacity, on any FOSFS volume regardless of size.
+
+**Follow-up: `copy SRC_DISK NAME DST_DISK [NEW_NAME]`.** Copying a file
+directly between two disks (e.g. `disk1` -> `disk2`) needed no host round
+trip and no new on-disk mechanism, since `fosfs::read`/`fosfs::write` were
+already binary-safe, device-parameterized functions operating on plain
+`&[u8]` buffers -- `write`'s "TEXT" naming is historical, not a real
+restriction. Unlike the seven commands above, `copy_command` requires
+*both* disk selectors to be spelled out explicitly; letting either one
+default to `disk1` would be genuinely ambiguous about which side it meant
+once two disks are actually in play. `copy_file` stages the whole file
+through the shared `pmem::TAPE_BASE`/`TAPE_LEN` buffer that `tape load
+disk`/`tape load net` already use as scratch space (`allocate_tape_buffer`,
+already bounds-checking and error-reporting), rather than adding a second
+large `.bss` array that would inflate `kernel.bin` for no benefit -- this
+also means a copy is bounded by the same 4 MiB the tape subsystem already
+budgets for. Because that buffer is shared, `copy_file` never calls
+`install_tape` (the copied bytes are an arbitrary file, not necessarily a
+valid tape) but does explicitly clear the `TAPE` static and print a note
+once the copy succeeds, if and only if a tape had actually been loaded
+there before -- otherwise a later `tape run`/`tape status` would silently
+misreport or attempt to execute whatever file was just copied through,
+exactly the same hazard `tape load disk`/`tape load net` avoid by always
+calling `install_tape` for themselves. Verified end to end by extending
+`make test-second-disk`'s own scenario: `copy disk2 config.txt disk1`,
+`copy disk1 note2.txt disk2 note2-copy.txt`, confirming byte-for-byte
+content on each destination, and confirming a tape loaded earlier in that
+same run reports "No tape loaded" (with the reused-buffer note printed)
+immediately after a copy.
 
 ### A tape that visits 64-bit long mode and comes back
 

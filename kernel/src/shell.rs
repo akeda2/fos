@@ -236,6 +236,9 @@ fn execute(command: &[u8], info: &BootInfo) {
                 );
                 println!("      cat [diskN] NAME, write [diskN] NAME TEXT, rm [diskN] NAME");
                 println!(
+                    "      copy SRC_DISK NAME DST_DISK [NEW_NAME] (copy a file between disks, e.g. copy disk1 router.cfg disk2)"
+                );
+                println!(
                     "      (disk1 is the boot disk and can be omitted; disk2, disk3, ... name additional attached disks)"
                 );
                 println!(
@@ -308,6 +311,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"cat" => cat_command(info, arguments),
         b"write" => write_command(info, arguments),
         b"rm" => remove_command(info, arguments),
+        b"copy" => copy_command(info, arguments),
         b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"nic" => nic_command(arguments),
@@ -3505,6 +3509,122 @@ fn remove_command(info: &BootInfo, arguments: &[u8]) {
         Ok(true) => println!("File removed."),
         Ok(false) => println!("File not found."),
         Err(error) => println!("FOSFS disk error: {error:?}"),
+    }
+}
+
+/// `copy SRC_DISK NAME DST_DISK [NEW_NAME]`. Unlike every other FOSFS
+/// command, both disks here must be spelled out explicitly (even `disk1`)
+/// rather than one side defaulting to the boot disk: with two disks
+/// genuinely in play, a silent default would be ambiguous about which side
+/// it applies to. Reuses the shared `pmem::TAPE_BASE` staging buffer that
+/// `tape load disk` already uses for "read a whole file into memory, then
+/// do something with it," rather than adding a second large static buffer;
+/// see `copy_file`'s doc comment for why that is safe.
+fn copy_command(info: &BootInfo, arguments: &[u8]) {
+    let (source_word, remainder) = take_word(arguments);
+    let (name, remainder) = take_word(remainder);
+    let (destination_word, remainder) = take_word(remainder);
+    let (new_name, remainder) = take_word(remainder);
+    if name.is_empty() || destination_word.is_empty() || !remainder.is_empty() {
+        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]");
+        return;
+    }
+    let Some(source) = strip_disk_selector(source_word) else {
+        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; SRC_DISK must name an attached disk (e.g. disk1).");
+        return;
+    };
+    let Some(destination) = strip_disk_selector(destination_word) else {
+        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; DST_DISK must name an attached disk (e.g. disk2).");
+        return;
+    };
+    let destination_name = if new_name.is_empty() { name } else { new_name };
+    copy_file(info, source, name, destination, destination_name);
+}
+
+/// Reads a whole file from `source` into the shared tape staging buffer
+/// (`pmem::TAPE_BASE`/`TAPE_LEN`, the same one `tape load disk`/`tape load
+/// net` use) and writes it back out to `destination` under
+/// `destination_name`. This is safe to share with the tape subsystem
+/// because nothing here calls `install_tape`: a copy never becomes a
+/// loaded tape, and any tape that *was* loaded there is invalidated
+/// afterward (its bytes are now whatever file was just copied through),
+/// exactly like loading a genuinely new tape already overwrites the
+/// previous one in place.
+fn copy_file(
+    info: &BootInfo,
+    source: disk::Device,
+    name: &[u8],
+    destination: disk::Device,
+    destination_name: &[u8],
+) {
+    let length = match fosfs::file_length(info, source, name) {
+        Ok(Some(length)) => length,
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    };
+    if length > u32::MAX as u64 {
+        println!("File is too large to copy through the shared tape-buffer scratch area.");
+        return;
+    }
+    let length = length as usize;
+    let Some(address) = allocate_tape_buffer(length as u32) else {
+        return;
+    };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
+    match fosfs::read(info, source, name, buffer) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    }
+    let outcome = fosfs::write(info, destination, destination_name, buffer);
+    invalidate_tape_after_scratch_use();
+    match outcome {
+        Ok(fosfs::WriteOutcome::Written) => println!(
+            "Copied {length} byte(s) from disk{} '{}' to disk{} '{}'.",
+            device_number(source),
+            core::str::from_utf8(name).unwrap_or("?"),
+            device_number(destination),
+            core::str::from_utf8(destination_name).unwrap_or("?")
+        ),
+        Ok(fosfs::WriteOutcome::InvalidName) => {
+            println!("Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'.");
+        }
+        Ok(fosfs::WriteOutcome::DirectoryFull) => {
+            println!("Directory full: all 64 FOSFS entries are in use.")
+        }
+        Ok(fosfs::WriteOutcome::DataFull) => {
+            println!("Data region full: no free sector remains in the FOSFS partition.")
+        }
+        Err(error) => println!("FOSFS disk error: {error:?}"),
+    }
+}
+
+/// Clears any previously loaded tape's bookkeeping after `copy_file` reuses
+/// the tape staging buffer as scratch space, and says so -- silently
+/// leaving stale `TAPE`/`TAPE_ENTRY` state around would let a later `tape
+/// run` misinterpret the just-copied file's bytes as tape code instead of
+/// honestly reporting "nothing is loaded."
+fn invalidate_tape_after_scratch_use() {
+    let had_tape = tape_get().is_some();
+    unsafe {
+        *(&raw mut TAPE) = None;
+    }
+    if had_tape {
+        println!(
+            "Note: this reused the shared tape buffer, so the previously loaded tape is gone; 'tape load' again before 'tape run'."
+        );
     }
 }
 
