@@ -2068,6 +2068,15 @@ of this investigation, so nothing was implemented; a future attempt should
 decide up front which discovery path to take, since that choice (not the
 Ethernet register work) is what actually determines the size of the task.
 
+QEMU's `-device help` lists `ne2k_isa` (a fixed-port, non-PnP ISA NE2000)
+but no 3C509 model at all, unlike every PCI backend this project has built
+so far. A 3C509 driver would therefore have no automated `make test`
+coverage ever -- every iteration, on both the discovery code and the
+register-level driver, would need real hardware, permanently, not just at
+the end. This is a standing cost the PCI backends never had, and is worth
+weighing at least as heavily as the discovery-protocol choice above when
+deciding whether/when to build this driver.
+
 ### A tape that visits 64-bit long mode and comes back
 
 `tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written
