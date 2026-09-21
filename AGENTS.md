@@ -2077,6 +2077,55 @@ the end. This is a standing cost the PCI backends never had, and is worth
 weighing at least as heavily as the discovery-protocol choice above when
 deciding whether/when to build this driver.
 
+### Floppy drive support: investigated, not yet built
+
+Raised by the lab team as a possible next storage target. This project's
+entire disk stack -- `boot/stage2.S`'s loader reads and `kernel/src/
+disk.rs`'s BIOS trampoline alike -- is built exclusively around INT 13h's
+*extended* (`AH=42h`) LBA read/write service, and around one fixed drive
+(`boot_drive`, captured from `DL` at boot, always `0x80`+ for a hard disk).
+Real floppy drives are a real complication here, on two independent axes:
+
+- **The BIOS call convention itself differs.** Real BIOS floppy support is
+  legacy CHS (`AH=02h`/`03h` read/write, `AH=08h` get drive
+  parameters/geometry) -- the extended `AH=41h`/`42h` LBA service this
+  project already relies on is a hard-disk-era addition that most real
+  BIOSes do not implement for the floppy drive number (`0x00`/`0x01`) at
+  all. None of `disk.rs`'s existing LBA-based transfer logic could be
+  reused unmodified; a floppy path needs its own CHS conversion and its
+  own bounded-transfer logic (the same "never cross a 64 KiB boundary"
+  discipline `stage2.S`'s multi-transfer kernel load already follows, just
+  derived from CHS geometry instead of LBA math). The real-mode-trampoline
+  *mechanism* itself (`disk::transfer`'s protected-to-real-mode drop, IVT/
+  PIC save-restore, GDT reload) is fully reusable as-is, though -- only the
+  BIOS call semantics change, not the surrounding plumbing.
+- **There is no second-device concept anywhere above the trampoline.**
+  `fosfs.rs` and every disk-facing shell command assume the one boot
+  drive/GPT-discovered partition; adding a floppy would need either a
+  separate, filesystem-agnostic raw command surface (mirroring
+  `readsector`/`hexdump`'s existing pattern, e.g. a new `floppy` namespace)
+  or an actual multi-device parameter threaded through `fosfs.rs` -- the
+  latter is a real, if not huge, refactor of code that has never needed to
+  address more than one device.
+
+Unlike the 3C509 investigation above, QEMU emulates this well
+(`-device help` lists `floppy`/`isa-fdc`, and `-fda` is a standard, widely
+documented QEMU option) -- so, refreshingly, this is one legacy-hardware
+feature that keeps full `make test`-style automated coverage, not a
+permanent real-hardware-only cost.
+
+A native FDC/8237-DMA driver bypassing BIOS entirely (à la the deferred
+native ATA/AHCI work) was also considered and set aside for the same
+reason ATA/AHCI is deferred: the floppy controller's own timing/DMA/motor
+quirks are a well-known source of fragile, fiddly driver code, and the
+BIOS trampoline this project already leans on for the boot disk sidesteps
+all of it for comparable effort. Booting fos *from* a floppy is a separate,
+larger question again: the current 16 MiB GPT image (with its FOSFS
+partition holding every compiled tape) does not come close to fitting in a
+1.44 MB floppy's 2880 sectors, so that would mean a distinct, trimmed-down
+boot layout in the spirit of `boot/netrom.S`'s own parallel/optional path,
+not a change to the existing `image`/`run`/`test` layout.
+
 ### A tape that visits 64-bit long mode and comes back
 
 `tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written
