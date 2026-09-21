@@ -2114,6 +2114,69 @@ documented QEMU option) -- so, refreshingly, this is one legacy-hardware
 feature that keeps full `make test`-style automated coverage, not a
 permanent real-hardware-only cost.
 
+**Follow-up scoped to secondary storage only (no floppy boot path), and to
+the lab's actual two physical drives -- a 3.5" 1.44 MB and a 5.25" 360 KB
+unit:**
+
+- **The "two floppy types" concern turns out to be mostly a non-issue.**
+  `AH=08h` (get drive parameters) reports the real, current drive's own
+  geometry (heads/sectors-per-track/cylinders) -- for a 1.44 MB 3.5" drive
+  that is 2 heads x 18 sectors/track x 80 cylinders; for a 360 KB 5.25"
+  drive it is 2 heads x 9 sectors/track x 40 cylinders. A single generic
+  CHS driver that queries this once per drive and caches it, then does
+  ordinary LBA<->CHS math against whatever came back, handles both
+  transparently -- there is no need for two separate code paths, just one
+  path plus a per-drive-number geometry cache. The one real caveat: real
+  BIOS resolves each floppy *drive number* (`0x00`=A:, `0x01`=B:) to a type
+  via CMOS Setup, not by inspecting whatever medium happens to be in the
+  drive at boot -- so this only works cleanly if CMOS is actually
+  configured with drive A as the 1.44 MB type and drive B as the 360 KB
+  type (or vice versa), a one-time BIOS Setup step on that physical
+  machine, not something software here can query and set for itself.
+- **The trampoline needs a drive-number parameter it does not have today.**
+  `disk::transfer`'s Rust-side call into the loader's trampoline only ever
+  passes direction/LBA/buffer; the actual BIOS drive number is baked in on
+  the assembly side, read once from `BOOT_INFO+8` (the boot drive DL
+  captured at boot) and never varied. Adding a second device means
+  extending that call ABI with an explicit drive-number argument (and a
+  CHS-vs-extended mode flag, since the boot disk keeps using `AH=42h`/
+  `43h` while a floppy uses `AH=02h`/`03h`/`08h`), not just adding a new
+  Rust-side wrapper around the existing call.
+- **`disk.rs` itself only needs a modest generalization, not a rewrite.**
+  Today every function (`read_sector`/`write_sector`/`transfer`) implicitly
+  means "the boot disk," using `BootInfo` for both the trampoline address
+  and the sector-count bound. A floppy is a genuinely separate device with
+  its own drive number, its own queried geometry, and its own bound (2880
+  or 720 sectors) that has nothing to do with `BootInfo`'s disk-geometry
+  fields -- so the natural shape is a small, explicit device
+  parameter/enum threaded through these functions (boot disk vs. floppy
+  unit 0/1), not a multi-device abstraction layered underneath every
+  existing call. Because this kernel is single-threaded with no
+  concurrent disk access, the existing single static sector buffer can
+  still be shared sequentially across devices with no locking concerns.
+- **`fosfs.rs` does not need to change at all for this scope.** Since this
+  is secondary storage for raw sector access/education, not a second
+  bootable filesystem, the floppy path can mirror the existing
+  `readsector`/`hexdump` raw-access commands instead of extending FOSFS to
+  understand more than one device. Putting an actual second FOSFS instance
+  on a floppy is a real, separable follow-up (FOSFS's superblock/directory
+  logic would need a device parameter threaded through it too), not part
+  of this scope.
+- **Naming: keep the existing boot-disk commands exactly as they are.**
+  `diskinfo`/`readsector`/`format`/`ls`/`cat`/`write`/`rm` are unprefixed
+  today because there has only ever been one disk; renaming all of them
+  under an explicit `disk` prefix to mirror a new `floppy` namespace would
+  be a disruptive, unforced command-surface break (every existing test
+  script, `START` file, and README passage that already types
+  `readsector`/`ls`/`cat` unprefixed would need updating for no functional
+  gain). The lower-disruption shape mirrors this project's own `nic`/
+  `tape` convention instead: add `floppy` as a wholly new namespace
+  (`floppy status`, `floppy readsector UNIT LBA`, `floppy write UNIT LBA
+  ...`, one/zero-based unit selecting drive A/B) alongside the untouched
+  existing boot-disk commands. A bare `disk` alias that simply forwards to
+  today's existing commands could still be added purely for naming
+  symmetry if wanted, but it is cosmetic, not a functional requirement.
+
 A native FDC/8237-DMA driver bypassing BIOS entirely (à la the deferred
 native ATA/AHCI work) was also considered and set aside for the same
 reason ATA/AHCI is deferred: the floppy controller's own timing/DMA/motor
