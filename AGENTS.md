@@ -2541,6 +2541,22 @@ closed the gap for the heaviest real-world case. `make test-stack-guard`
 not this ordinary kernel stack) and every other `make test*` target were
 re-run after this fix with no regressions.
 
+**Follow-up: `help` output was wrapping and scrolling itself out of
+view.** Several `help` lines were longer than 80 columns, so VGA text
+mode wrapped them onto an extra row each; combined with the original
+line count, the full listing took over 30 rows once wrapped -- more
+than an 80x25 screen holds, so its own earlier lines scrolled out of
+view before the listing finished printing. Rewritten to 11 lines, each
+kept to at most 79 columns, not 80: a `println!` whose text lands
+exactly on column 80 wraps *and* leaves a spurious blank row for its
+own trailing `'\n'`, so 79 is the true safe maximum. All the same
+commands remain listed, just more tersely phrased (full syntax stays
+in this document and README.md). `tools/qemu_smoke.py`'s matching
+assertion string was updated to match; verified with a QEMU boot
+printing `help` (each line lands as exactly one row, confirmed against
+the real serial output) and by rerunning `make test` and
+`tools/test_term_net_e2e.py`.
+
 **Follow-up: `diskN/NAME` for the tape filesystem callback ABI (`ed`,
 `router`).** `tapes/ed` and `tapes/router` are the only two tapes using
 the kernel's `tape_fs_file_length`/`tape_fs_read`/`tape_fs_write`/
