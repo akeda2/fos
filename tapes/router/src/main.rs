@@ -65,6 +65,17 @@ const MAX_FRAME_LEN: usize = 1514;
 // an ordinary IP stack's incomplete ARP entry would.
 const ARP_RETRY_TICKS: u64 = 100;
 const ARP_CACHE_SIZE: usize = 8;
+// Minimum spacing between synchronous DHCP lease-file writes triggered from
+// inside the per-ingress forwarding loop. persist_leases performs a
+// blocking FOSFS fs_write, stalling every interface's forwarding for the
+// write's duration; without this, a burst of simultaneous lease requests
+// (e.g. many clients booting at once) could trigger one such write per
+// DHCP transaction. 100 ticks (~1s at 100 Hz) batches that burst into
+// occasional writes instead, while the loop's own dirty-flag bookkeeping
+// (server.is_dirty()/lease_file_needs_flush) still guarantees a pending
+// change is eventually flushed -- both from a later loop iteration once
+// the interval has passed, and unconditionally once the router exits.
+const LEASE_FLUSH_MIN_TICKS: u64 = 100;
 // Ipv4Header::flags_fragment layout (RFC 791): bit 13 (0x2000) is the
 // more-fragments flag, and the low 13 bits are the fragment offset in
 // 8-byte units. Either one being nonzero means this packet is not a
@@ -2699,6 +2710,7 @@ pub extern "C" fn tape_main(
     // Run the first health sweep before accepting ordinary forwarding, rather
     // than assuming the first configured lease is reachable for one interval.
     let mut last_health_poll = ticks().wrapping_sub(HEALTH_POLL_TICKS);
+    let mut last_lease_flush = ticks();
     if lease_file_needs_flush {
         if let Some(name) = lease_file {
             let _ = persist_leases(
@@ -2808,6 +2820,25 @@ pub extern "C" fn tape_main(
                 max_frame_len,
             );
         }
+        if lease_file_storage.is_some()
+            && (lease_file_needs_flush || lease_servers_dirty(&dhcp_servers))
+            && ticks().wrapping_sub(last_lease_flush) >= LEASE_FLUSH_MIN_TICKS
+        {
+            if let Some(name) = lease_file {
+                if persist_leases(
+                    putc,
+                    name,
+                    &mut lease_file_storage,
+                    &mut lease_file_needs_flush,
+                    &interfaces,
+                    &mut dhcp_servers,
+                    fs_write,
+                    free,
+                ) {
+                    last_lease_flush = ticks();
+                }
+            }
+        }
         let (current_default, active_nic, routing_configs) = compute_forwarding_context(
             &uplinks,
             parsed.dhcp_uplink_count,
@@ -2833,7 +2864,6 @@ pub extern "C" fn tape_main(
             let length = min(length, MAX_FRAME_LEN);
             if parsed.dhcp_server && !parsed.dhcp_uplinks[..parsed.dhcp_uplink_count]
                 .iter().flatten().any(|uplink| *uplink == interfaces[ingress].nic) {
-                let mut lease_changed = false;
                 if let Some(server) = dhcp_servers[ingress].as_mut() {
                     if let Some(event) = dhcp_reply(
                         &interfaces[ingress],
@@ -2849,22 +2879,18 @@ pub extern "C" fn tape_main(
                             print_dhcp_lease_event(putc, interfaces[ingress].nic, event);
                         }
                     }
-                    lease_changed = server.is_dirty();
                 }
-                if lease_changed || lease_file_needs_flush {
-                    if let Some(name) = lease_file {
-                        let _ = persist_leases(
-                            putc,
-                            name,
-                            &mut lease_file_storage,
-                            &mut lease_file_needs_flush,
-                            &interfaces,
-                            &mut dhcp_servers,
-                            fs_write,
-                            free,
-                        );
-                    }
-                }
+                // Persisting is handled once per outer-loop iteration, rate
+                // limited by LEASE_FLUSH_MIN_TICKS below -- not here, right
+                // after every single DHCP transaction. A blocking FOSFS
+                // fs_write stalls every interface's forwarding for its
+                // duration; flushing after each individual lease event (as
+                // this used to do) meant a burst of simultaneous lease
+                // requests -- many clients booting at once -- triggered one
+                // such stall per transaction. The dirty bit this event may
+                // have just set (server.is_dirty()) is picked up by that
+                // periodic check instead, and unconditionally by the final
+                // flush once the router exits.
             }
             if let Some(client) = dhcp_clients[ingress].as_mut() {
                 receive_dhcp(&receive_buffer[..length], client, (ticks() / 100) as u32);
