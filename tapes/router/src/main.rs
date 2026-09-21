@@ -83,7 +83,15 @@ const LEASE_FLUSH_MIN_TICKS: u64 = 100;
 const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
 const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const BROADCAST_IP: Ipv4Address = Ipv4Address([255, 255, 255, 255]);
-const DHCP_TIMEOUT_SECONDS: u32 = 8;
+// One bounded DhcpClient retry cycle (DHCP_RETRY_SECONDS between attempts,
+// DHCP_MAX_RETRIES attempts) exhausts itself and reports `Failed` in well
+// under DHCP_RETRY_SECONDS * DHCP_MAX_RETRIES seconds -- there is no
+// exponential backoff, just a fixed interval. The overall timeout must be
+// large enough for configure_dhcp to restart several fresh cycles (see
+// below), not just survive one: a switch still settling STP/link state, or
+// a first DISCOVER burst simply getting lost, is a transient condition a
+// second attempt usually clears, not a reason to abandon startup.
+const DHCP_TIMEOUT_SECONDS: u32 = 30;
 const DHCP_RETRY_SECONDS: u32 = 1;
 const DHCP_MAX_RETRIES: u8 = 5;
 const DHCP_LEASE_SECONDS: u32 = 7 * 24 * 60 * 60;
@@ -1356,6 +1364,39 @@ fn print_dhcp_lease_event(putc: Putc, nic: u32, event: DhcpLeaseEvent) {
     }
 }
 
+/// Derives a fresh, essentially-random DHCP transaction ID from this NIC's
+/// MAC address and the current tick count, so a restarted `DhcpClient` (one
+/// whose previous cycle went `Expired` or `Failed`) doesn't reuse the exact
+/// transaction ID an upstream server might still associate with the old,
+/// abandoned exchange. Shared by every restart site in this file
+/// (`configure_dhcp`'s own retry loop, and `poll_dhcp_renewals`'s
+/// Expired/Failed restarts) so they can't drift out of sync with each other.
+fn fresh_dhcp_client(own_mac: MacAddress, ticks: Ticks) -> DhcpClient<128> {
+    let transaction_id = (ticks() as u32)
+        ^ u32::from_be_bytes([own_mac.0[0], own_mac.0[1], own_mac.0[2], own_mac.0[3]])
+        ^ u32::from_be_bytes([own_mac.0[2], own_mac.0[3], own_mac.0[4], own_mac.0[5]]);
+    DhcpClient::<128>::new(own_mac, transaction_id, DHCP_RETRY_SECONDS, DHCP_MAX_RETRIES)
+}
+
+/// Outcome of one bounded DHCP-uplink acquisition attempt at boot.
+/// `TimedOut` deliberately keeps the (still-cycling) client instead of
+/// discarding it: this uplink NIC simply didn't hear back from a server
+/// within this boot attempt's own budget, which is not distinguishable from
+/// "genuinely offline" at this point -- a router built for fail-over must
+/// not refuse to start just because one of several configured uplinks
+/// happens to be the one still waiting, so the caller keeps that client
+/// running in the background via `poll_dhcp_renewals` instead of treating
+/// it as fatal. `Aborted` and `Error` remain fatal to the whole tape: the
+/// former is an explicit operator request to stop, and the latter indicates
+/// a NIC/callback problem that isn't specific to one DHCP server being slow
+/// or absent.
+enum DhcpAcquireOutcome {
+    Bound(DhcpClient<128>),
+    TimedOut(DhcpClient<128>),
+    Aborted,
+    Error,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn configure_dhcp(
     putc: Putc,
@@ -1367,20 +1408,12 @@ fn configure_dhcp(
     nic: u32,
     receive_buffer: &mut [u8; MAX_FRAME_LEN],
     max_frame_len: usize,
-) -> Option<DhcpClient<128>> {
+) -> DhcpAcquireOutcome {
     print_bytes(
         putc,
         b"DHCP: broadcasting DISCOVER and waiting for a lease...\n",
     );
-    let transaction_id = (ticks() as u32)
-        ^ u32::from_be_bytes([own_mac.0[0], own_mac.0[1], own_mac.0[2], own_mac.0[3]])
-        ^ u32::from_be_bytes([own_mac.0[2], own_mac.0[3], own_mac.0[4], own_mac.0[5]]);
-    let mut client = DhcpClient::<128>::new(
-        own_mac,
-        transaction_id,
-        DHCP_RETRY_SECONDS,
-        DHCP_MAX_RETRIES,
-    );
+    let mut client = fresh_dhcp_client(own_mac, ticks);
     let started = (ticks() / 100) as u32;
     let mut payload = [0u8; 600];
 
@@ -1390,15 +1423,15 @@ fn configure_dhcp(
                 putc,
                 b"DHCP stopped by operator before a lease was acquired.\n",
             );
-            return None;
+            return DhcpAcquireOutcome::Aborted;
         }
         let now = (ticks() / 100) as u32;
         if now.wrapping_sub(started) > DHCP_TIMEOUT_SECONDS {
             print_bytes(
                 putc,
-                b"DHCP failed: no server responded before the timeout.\n",
+                b"DHCP: no server responded before the boot timeout; will keep retrying in the background.\n",
             );
-            return None;
+            return DhcpAcquireOutcome::TimedOut(client);
         }
         match client.poll(now, &mut payload) {
             Ok(Some(length)) => {
@@ -1416,23 +1449,23 @@ fn configure_dhcp(
                     max_frame_len,
                 ) {
                     print_bytes(putc, b"DHCP failed: selected NIC rejected the request frame.\n");
-                    return None;
+                    return DhcpAcquireOutcome::Error;
                 }
             }
             Ok(None) => {}
             Err(_) => {
                 print_bytes(putc, b"DHCP failed: packet construction error.\n");
-                return None;
+                return DhcpAcquireOutcome::Error;
             }
         }
         if client.state() == DhcpClientState::Bound {
             let Some(lease) = client.lease() else {
                 print_bytes(putc, b"DHCP failed: client reported a missing lease.\n");
-                return None;
+                return DhcpAcquireOutcome::Error;
             };
             if lease.subnet_mask == Ipv4Address::UNSPECIFIED {
                 print_bytes(putc, b"DHCP failed: server supplied no subnet mask.\n");
-                return None;
+                return DhcpAcquireOutcome::Error;
             }
             print_bytes(putc,             b"DHCP lease acquired: ");
             print_ip(putc, lease.address);
@@ -1445,14 +1478,23 @@ fn configure_dhcp(
                 print_bytes(putc, b", no router option");
             }
             print_bytes(putc, b".\n");
-            return Some(client);
+            return DhcpAcquireOutcome::Bound(client);
         }
         if client.state() == DhcpClientState::Failed {
+            // A bounded retry cycle exhausting itself (see DHCP_TIMEOUT_SECONDS's
+            // doc comment) is not necessarily a real failure -- restart a fresh
+            // client with a new transaction ID and keep trying within the
+            // overall budget, exactly as poll_dhcp_renewals already does after
+            // boot for an Expired lease, and exactly as tapes/net-dhcp-test
+            // does for its own initial acquisition. Only running out of the
+            // overall DHCP_TIMEOUT_SECONDS budget (checked at the top of this
+            // loop) is treated as a real, reportable failure.
             print_bytes(
                 putc,
-                b"DHCP failed: no usable offer/acknowledgement arrived.\n",
+                b"DHCP: no usable offer/acknowledgement arrived; retrying...\n",
             );
-            return None;
+            client = fresh_dhcp_client(own_mac, ticks);
+            continue;
         }
 
         let length =
@@ -1530,21 +1572,32 @@ fn poll_dhcp_renewals(
         // `client`'s mutable borrow ends here (its last use); everything
         // below only touches `dhcp_clients[index]` again, `interfaces`,
         // `configs`, and `uplinks`.
-        if new_state == DhcpClientState::Expired && previous_state != DhcpClientState::Expired {
+        //
+        // Expired (a previously bound lease's server-assigned lifetime ran
+        // out) and Failed (a bounded acquisition/renewal cycle exhausted its
+        // own retries with no usable reply -- the same outcome
+        // `configure_dhcp`'s own retry loop treats as transient, see its doc
+        // comment) both mean this client's cycle is over but the uplink
+        // itself may still recover, so both restart a fresh client rather
+        // than leaving `dhcp_clients[index]` stuck returning `Ok(None)`
+        // forever. This is what lets an uplink NIC that had no server reply
+        // at all during initial boot acquisition (see the boot loop below,
+        // which starts such a NIC's client already in this same situation)
+        // keep trying indefinitely in the background instead of never
+        // getting another chance.
+        if (new_state == DhcpClientState::Expired || new_state == DhcpClientState::Failed)
+            && previous_state != new_state
+        {
             if !quiet {
-                print_bytes(putc, b"DHCP lease expired on NIC ");
+                if new_state == DhcpClientState::Expired {
+                    print_bytes(putc, b"DHCP lease expired on NIC ");
+                } else {
+                    print_bytes(putc, b"DHCP acquisition failed on NIC ");
+                }
                 print_u32(putc, nic);
                 print_bytes(putc, b"; restarting acquisition.\n");
             }
-            let transaction_id = (ticks() as u32)
-                ^ u32::from_be_bytes([own_mac.0[0], own_mac.0[1], own_mac.0[2], own_mac.0[3]])
-                ^ u32::from_be_bytes([own_mac.0[2], own_mac.0[3], own_mac.0[4], own_mac.0[5]]);
-            dhcp_clients[index] = Some(DhcpClient::<128>::new(
-                own_mac,
-                transaction_id,
-                DHCP_RETRY_SECONDS,
-                DHCP_MAX_RETRIES,
-            ));
+            dhcp_clients[index] = Some(fresh_dhcp_client(own_mac, ticks));
             changed = true;
             continue;
         }
@@ -1710,6 +1763,16 @@ fn start_health_round(
     max_frame_len: usize,
 ) {
     for uplink in uplinks[..dhcp_uplink_count].iter_mut().flatten() {
+        // An uplink that hasn't yet acquired a gateway at all (a boot-time
+        // DHCP timeout, or a lease with no router option -- see the
+        // uplink-acquisition loop in tape_main) has nothing to ARP for yet;
+        // leave it Idle and unhealthy until poll_dhcp_renewals gives it a
+        // real gateway; this also keeps active_uplink's own
+        // `.find(|uplink| uplink.healthy)` from ever picking it in the
+        // meantime.
+        if uplink.gateway == Ipv4Address::UNSPECIFIED {
+            continue;
+        }
         let interface = uplink.interface;
         let _ = send_arp_request(&interfaces[interface], uplink.gateway, nic_send_at, max_frame_len);
         uplink.phase = HealthPhase::AwaitingArp;
@@ -2448,6 +2511,7 @@ pub extern "C" fn tape_main(
     let mut dhcp_clients: [Option<DhcpClient<128>>; MAX_INTERFACES] =
         core::array::from_fn(|_| None);
 
+    let mut dns_from_uplink = false;
     for (priority, nic) in parsed.dhcp_uplinks[..parsed.dhcp_uplink_count].iter().flatten().enumerate() {
         let mut mac = [0u8; 6];
         if nic_mac_at(*nic, mac.as_mut_ptr() as u32) == 0 {
@@ -2455,26 +2519,54 @@ pub extern "C" fn tape_main(
             return;
         }
         let own_mac = MacAddress::new(mac);
-        let Some(client) = configure_dhcp(putc, should_abort, nic_send_at, nic_receive_at, ticks, own_mac, *nic, &mut receive_buffer, max_frame_len) else {
-            print_bytes(putc, b"Router cannot start: DHCP uplink did not acquire a lease.\n");
-            return;
+        // A router built for fail-over must not refuse to start just
+        // because one configured uplink NIC didn't hear back from a DHCP
+        // server in time (or was offered a lease with no gateway) -- the
+        // whole point of configuring more than one uplink is that another
+        // one may still work. Every non-fatal case below still adds this
+        // NIC's interface entry and keeps its DhcpClient retained in
+        // `dhcp_clients`, unhealthy/unconfigured for now, so
+        // poll_dhcp_renewals keeps driving it in the background and the
+        // ordinary failover machinery adopts it automatically the moment it
+        // does acquire a usable lease. Only an explicit operator abort or a
+        // NIC/callback-level error (DhcpAcquireOutcome::Error) still halts
+        // the whole router: those aren't specific to this one uplink being
+        // slow or absent.
+        let outcome = configure_dhcp(putc, should_abort, nic_send_at, nic_receive_at, ticks, own_mac, *nic, &mut receive_buffer, max_frame_len);
+        let (client, lease) = match outcome {
+            DhcpAcquireOutcome::Aborted => return,
+            DhcpAcquireOutcome::Error => {
+                print_bytes(putc, b"Router cannot start: DHCP uplink failed.\n");
+                return;
+            }
+            DhcpAcquireOutcome::TimedOut(client) => (client, None),
+            DhcpAcquireOutcome::Bound(client) => {
+                let Some(lease) = client.lease() else {
+                    print_bytes(putc, b"Router cannot start: DHCP uplink did not acquire a lease.\n");
+                    return;
+                };
+                (client, Some(lease))
+            }
         };
-        let Some(lease) = client.lease() else {
-            print_bytes(putc, b"Router cannot start: DHCP uplink did not acquire a lease.\n");
-            return;
-        };
-        if lease.router == Ipv4Address::UNSPECIFIED {
-            print_bytes(putc, b"Router cannot start: DHCP uplink supplied no gateway.\n");
-            return;
+        let (address, netmask) = lease
+            .map(|lease| (lease.address, lease.subnet_mask))
+            .unwrap_or((Ipv4Address::UNSPECIFIED, Ipv4Address::UNSPECIFIED));
+        let gateway = lease.map(|lease| lease.router).unwrap_or(Ipv4Address::UNSPECIFIED);
+        if lease.is_some() && gateway == Ipv4Address::UNSPECIFIED {
+            print_bytes(putc, b"DHCP uplink supplied no gateway; leaving it unhealthy until a renewal supplies one.\n");
         }
-        interfaces[interface_count] = RouterInterface { nic: *nic, address: lease.address, netmask: lease.subnet_mask, mac: own_mac, arp: ArpCache::new(), gateway_pin: None, pending_arp: None, pending_arp_retry: 0 };
-        configs[interface_count] = Some(InterfaceConfig { nic: *nic, address: lease.address, netmask: lease.subnet_mask });
-        uplinks[priority] = Some(UplinkHealth { interface: interface_count, gateway: lease.router, misses: 0, healthy: true, sequence: 0, phase: HealthPhase::Idle, deadline: 0 });
+        interfaces[interface_count] = RouterInterface { nic: *nic, address, netmask, mac: own_mac, arp: ArpCache::new(), gateway_pin: None, pending_arp: None, pending_arp_retry: 0 };
+        configs[interface_count] = lease.map(|_| InterfaceConfig { nic: *nic, address, netmask });
+        uplinks[priority] = Some(UplinkHealth { interface: interface_count, gateway, misses: 0, healthy: gateway != Ipv4Address::UNSPECIFIED, sequence: 0, phase: HealthPhase::Idle, deadline: 0 });
         dhcp_clients[interface_count] = Some(client);
         interface_count += 1;
-        if dns_server_count == 0 && priority == 0 {
+        if let Some(lease) = lease
+            && dns_server_count == 0
+            && !dns_from_uplink
+        {
             dns_server_count = lease.dns_server_count;
             dns_servers[..dns_server_count].copy_from_slice(&lease.dns_servers[..dns_server_count]);
+            dns_from_uplink = true;
         }
     }
 
@@ -2706,7 +2798,18 @@ pub extern "C" fn tape_main(
         );
     }
     let lease_file = parsed.dhcp_lease_file;
-    let mut active_uplink = uplinks[0].map(|uplink| uplink.interface);
+    // Prefer an uplink that is already marked healthy (has both a lease and
+    // a gateway) over uplinks[0] unconditionally: a boot-time DHCP timeout or
+    // a missing gateway option now leaves that first-priority slot present
+    // but unhealthy (see the uplink-acquisition loop above), and routing
+    // through it before the first health sweep corrects `active_uplink`
+    // would otherwise send traffic out through a NIC with no real gateway.
+    let mut active_uplink = uplinks[..parsed.dhcp_uplink_count]
+        .iter()
+        .flatten()
+        .find(|uplink| uplink.healthy)
+        .or(uplinks[0].as_ref())
+        .map(|uplink| uplink.interface);
     // Run the first health sweep before accepting ordinary forwarding, rather
     // than assuming the first configured lease is reachable for one interval.
     let mut last_health_poll = ticks().wrapping_sub(HEALTH_POLL_TICKS);

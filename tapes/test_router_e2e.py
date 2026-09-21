@@ -934,5 +934,115 @@ def main() -> None:
         monitor_dir.cleanup()
 
 
+def test_uplink_boot_timeout_is_not_fatal() -> None:
+    """A router with two configured DHCP uplinks must still start using
+    whichever uplink actually acquires a lease, even if the other one never
+    hears back from any DHCP server at all during boot.
+
+    configure_dhcp used to treat a bounded acquisition attempt exhausting its
+    own retries as immediately fatal to the whole router, so on real
+    hardware a single flaky uplink NIC (or one plugged into a segment with
+    no DHCP server yet, e.g. right after a cable/NIC swap) prevented the
+    router from starting at all -- defeating the entire point of
+    configuring more than one uplink for fail-over. This is a separate,
+    self-contained QEMU instance (rather than a phase of the main scenario
+    above) because it needs its own three-NIC topology: one uplink attached
+    to an isolated segment with nothing on the other end (modeling "no DHCP
+    server ever responds"), one uplink on QEMU's own user-mode network
+    (which serves a real DHCP lease, standing in for the uplink that does
+    work), and a downstream interface to satisfy the router's requirement
+    for at least one non-uplink interface.
+    """
+    if not IMAGE.exists():
+        raise SystemExit(f"{IMAGE} does not exist; run `make image` first.")
+
+    monitor_dir = tempfile.TemporaryDirectory(prefix="fos-router-failover-monitor-")
+    monitor_path = Path(monitor_dir.name) / "monitor.sock"
+    output = bytearray()
+    selector = selectors.DefaultSelector()
+    process = None
+    try:
+        process = subprocess.Popen(
+            [
+                "qemu-system-i386",
+                "-drive", f"format=raw,file={IMAGE}",
+                "-snapshot",
+                "-serial", "stdio",
+                "-monitor", f"unix:{monitor_path},server=on,wait=off",
+                "-no-reboot", "-no-shutdown", "-display", "none",
+                # NIC 1: an isolated multicast segment with nothing on the
+                # other end -- no DHCP server will ever answer here.
+                "-netdev", "socket,id=net0,mcast=230.55.55.90:4590",
+                "-device", "e1000,netdev=net0",
+                # NIC 2: QEMU's own user-mode network -- a real DHCP server
+                # answers here, the same trick tapes/test_net_dhcp_e2e.py
+                # already relies on for a hermetic, dependency-free lease.
+                "-netdev", "user,id=net1",
+                "-device", "e1000,netdev=net1",
+                # NIC 3: another isolated segment, used only as the
+                # required downstream (non-uplink) interface.
+                "-netdev", "socket,id=net2,mcast=230.55.55.91:4591",
+                "-device", "e1000,netdev=net2",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        selector.register(process.stdout, selectors.EVENT_READ)
+
+        def read_until(marker: bytes, timeout: float, start: int = 0) -> None:
+            deadline = time.monotonic() + timeout
+            while marker not in output[start:]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SystemExit(
+                        f"timed out waiting for {marker!r}; output since checkpoint:\n"
+                        f"{output[start:].decode('utf-8', 'replace')}"
+                    )
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fd, 4096)
+                    if not chunk:
+                        raise SystemExit(
+                            "router serial stream ended early:\n"
+                            + output.decode("utf-8", "replace")
+                        )
+                    output.extend(chunk)
+
+        def type_line(line: bytes) -> None:
+            for byte in line:
+                process.stdin.write(bytes([byte]))
+                process.stdin.flush()
+                time.sleep(0.002)
+
+        read_until(b"Waiting for a remote terminal client to connect", 30)
+        send_monitor_command(monitor_path, "sendkey f12")
+        read_until(b"fos> ", 10)
+        type_line(b"tape load disk ROUTER.BIN\r")
+        read_until(b"'tape run' to execute it.", 10)
+        start = len(output)
+        type_line(b"tape run dhcp 1 dhcp 2 3 10.0.20.1/24\r")
+        read_until(b"Forwarding IPv4 frames", 60, start)
+        text = bytes(output[start:]).decode("utf-8", "replace")
+        assert "Router cannot start" not in text
+        assert "no server responded before the boot timeout" in text
+        assert "fos router: 3 interface(s)" in text
+        print("PASS: router started using the working uplink; the dead uplink kept retrying in the background instead of aborting startup.")
+
+        stop_start = len(output)
+        send_monitor_command(monitor_path, "sendkey f12")
+        read_until(b"fos> ", 10, stop_start)
+        print("PASS: local F12 stopped the router and the local shell remained usable.")
+    finally:
+        selector.close()
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        monitor_dir.cleanup()
+
+
 if __name__ == "__main__":
     main()
+    test_uplink_boot_timeout_is_not_fatal()

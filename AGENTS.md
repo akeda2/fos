@@ -102,7 +102,17 @@ that obscure hardware behavior.
   requires both fresh gateway ARP and ICMP echo success, fails over after
   three missed bounded polls, and fails back on recovery. NAT and static
   forwards are limited to the active uplink, so existing flows may break on a
-  change. An explicit or active DHCP-supplied gateway handles unmatched
+  change. Boot-time acquisition for a configured DHCP uplink is bounded but
+  non-fatal to the whole router: an uplink that gets no usable offer within
+  its own boot budget is left unconfigured and unhealthy rather than
+  aborting startup, and its `DhcpClient` keeps retrying in the background
+  (the same restart-on-`Expired`/`Failed` machinery that already drives
+  ordinary lease renewal) until it does acquire a lease, at which point the
+  ordinary failover machinery adopts it automatically. A router is only
+  refused startup for an explicit operator abort or a NIC/callback-level
+  error, never for one uplink alone failing to hear back from a DHCP
+  server -- the entire point of configuring more than one uplink is that
+  another one may still work. An explicit or active DHCP-supplied gateway handles unmatched
   destinations. NAT is enabled by default; `no-nat` disables it for
   deployments where upstream routing reaches the downstream subnets, while
   `nat` explicitly enables it. When enabled, TCP/UDP traffic leaving
