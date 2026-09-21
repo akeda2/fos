@@ -2177,6 +2177,46 @@ unit:**
   today's existing commands could still be added purely for naming
   symmetry if wanted, but it is cosmetic, not a functional requirement.
 
+**Accepted UX design** (for this lab's actual two-drive setup; nothing
+below is implemented yet):
+
+```
+floppy                          Show both drives: detected type/geometry, or "not responding"/"no disk"
+floppy readsector [A|B] LBA     Raw sector read + hexdump (unit-scoped readsector clone)
+floppy write [A|B] LBA TEXT     Raw sector write, printable ASCII, zero-padded to 512 bytes
+tape load floppy [A|B] NAME     A third `tape load` source alongside `disk`/`net`
+```
+
+The `[A|B]` unit letter is optional whenever exactly one floppy is
+attached (mirroring `nic`'s own "single interface stays active by default,
+`nic use N` only needed once there is more than one" convention), and
+mandatory -- with a clear, narrated error rather than a silent guess --
+whenever both are. Parsing rule: the first token after the subcommand is
+a unit selector if and only if it case-insensitively equals `A` or `B`;
+otherwise it is the real argument (`LBA`/`NAME`), and the drive is
+inferred, which only succeeds with exactly one floppy present. This works
+because a bare `A`/`B` letter can never also parse as a valid LBA number.
+`tape load floppy NAME` and `tape load floppy A NAME` are unambiguous by
+the same reasoning `readsector`/`write` are: `tape load floppy` never
+takes more than one argument besides an optional unit, so one remaining
+word is always `NAME` and two are always `unit NAME`.
+
+One accepted, undoctored edge case: a FOSFS tape file literally named `A`
+or `B` (single-letter names are technically legal) would collide with the
+unit-letter shorthand on a single-drive machine (`tape load floppy A`
+reads as "drive A, missing NAME"). This is a one-line documented
+limitation -- don't name a floppy tape file a bare `A`/`B` -- not something
+worth solving with extra parsing cleverness, consistent with this
+project's existing preference for small, explained trade-offs (e.g.
+`term`'s COM1 lock-out) over cleverness.
+
+Errors throughout are narrated, matching this project's existing
+"explain the hardware state" convention (`nic`, GDT/PIC messages) rather
+than surfacing a bare BIOS status byte: "no disk in drive," "write-
+protected," "drive not responding," and (for the two-drives-present,
+no-letter-given case) "ambiguous: both drive A: and drive B: are
+attached; specify which one."
+
 A native FDC/8237-DMA driver bypassing BIOS entirely (à la the deferred
 native ATA/AHCI work) was also considered and set aside for the same
 reason ATA/AHCI is deferred: the floppy controller's own timing/DMA/motor
