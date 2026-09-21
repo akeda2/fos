@@ -66,18 +66,84 @@ pub fn run(info: &BootInfo) -> ! {
     }
 }
 
+/// Where a `start` script was found (or why it wasn't run), returned by
+/// [`locate_start_file`] so both the silent boot-time call and the
+/// interactive `start` command can share one lookup while still reporting
+/// their own outcomes appropriately.
+enum StartFileLookup {
+    Found(disk::Device, u64),
+    Missing,
+    Error(disk::Error),
+}
+
+/// Looks for the optional `start` script on the boot disk first, falling
+/// back to the first secondary disk (`disk2`, the same disk the "second
+/// (non-boot) disk" config/log convention already targets) only if the
+/// boot disk has none at all -- letting a deployment keep its boot script
+/// alongside other disk2-resident config/log files instead of duplicating
+/// it onto disk1 too. Only the boot disk's own result can produce
+/// `StartFileLookup::Error`: it always carries a valid FOSFS volume, so a
+/// read error there is a real problem worth reporting. disk2, in
+/// contrast, is very often attached blank and unformatted (the normal
+/// state before a deployment's first `format disk2`) -- `fosfs::validate`
+/// fails on any such disk, and treating that the same as a genuine error
+/// would print a scary, misleading message on every single boot of a
+/// perfectly ordinary machine with an unused secondary disk. So *any*
+/// outcome on disk2 other than actually finding the file (including every
+/// error) is simply treated as "no start script there", exactly like
+/// disk1's own `Ok(None)`.
+fn locate_start_file(info: &BootInfo) -> StartFileLookup {
+    match fosfs::file_length(info, disk::Device::Boot, START_FILE_NAME) {
+        Ok(Some(length)) => return StartFileLookup::Found(disk::Device::Boot, length),
+        Ok(None) => {}
+        Err(error) => return StartFileLookup::Error(error),
+    }
+    if disk::secondary_count() == 0 {
+        return StartFileLookup::Missing;
+    }
+    let device = disk::Device::Secondary(0);
+    match fosfs::file_length(info, device, START_FILE_NAME) {
+        Ok(Some(length)) => StartFileLookup::Found(device, length),
+        _ => StartFileLookup::Missing,
+    }
+}
+
 /// Runs the optional FOSFS `start` script before the automatic remote-terminal
 /// wait. Lines use the ordinary shell dispatcher, so a deployment script has
 /// exactly the same command syntax and error reporting as an interactive one.
+/// Silent when no start file exists on either disk -- a machine with no
+/// start script should boot normally with no scary message.
 fn run_start_file(info: &BootInfo) {
-    let length = match fosfs::file_length(info, disk::Device::Boot, START_FILE_NAME) {
-        Ok(Some(length)) => length,
-        Ok(None) => return,
-        Err(error) => {
+    match locate_start_file(info) {
+        StartFileLookup::Found(device, length) => execute_start_file(info, device, length),
+        StartFileLookup::Missing => {}
+        StartFileLookup::Error(error) => {
             println!("start: could not inspect the file: {error:?}");
-            return;
         }
-    };
+    }
+}
+
+/// Interactive `start` command: reruns the exact same optional boot script
+/// `run_start_file` runs automatically at boot, letting an operator restart
+/// a `tape run`-driven script from the top -- e.g. after pressing F12 to
+/// leave a long-running tape it started -- without a full machine reset.
+/// Unlike the silent boot-time call, it reports plainly when no start file
+/// exists at all, since an operator explicitly asking for one deserves to
+/// know why nothing happened.
+fn start_command(info: &BootInfo) {
+    match locate_start_file(info) {
+        StartFileLookup::Found(device, length) => execute_start_file(info, device, length),
+        StartFileLookup::Missing => {
+            println!("start: no start file found on disk1 or disk2.");
+        }
+        StartFileLookup::Error(error) => {
+            println!("start: could not inspect the file: {error:?}");
+        }
+    }
+}
+
+/// Reads and runs one already-located `start` script from `device`.
+fn execute_start_file(info: &BootInfo, device: disk::Device, length: u64) {
     if length > START_FILE_CAPACITY as u64 {
         println!(
             "start: {length}-byte file is too large; the boot script limit is {START_FILE_CAPACITY} bytes."
@@ -86,7 +152,7 @@ fn run_start_file(info: &BootInfo) {
     }
 
     let mut contents = [0u8; START_FILE_CAPACITY];
-    let length = match fosfs::read(info, disk::Device::Boot, START_FILE_NAME, &mut contents[..length as usize]) {
+    let length = match fosfs::read(info, device, START_FILE_NAME, &mut contents[..length as usize]) {
         Ok(Some(length)) => length as usize,
         Ok(None) => return,
         Err(error) => {
@@ -242,6 +308,9 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "      (disk1 is the boot disk and can be omitted; disk2, disk3, ... name additional attached disks)"
                 );
                 println!(
+                    "      start (rerun the optional boot-time 'start' script now, e.g. after F12-ing out of a tape it launched)"
+                );
+                println!(
                     "Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 (or F4/F6/F7/F8/F10) to exit)"
                 );
                 println!(
@@ -312,6 +381,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"write" => write_command(info, arguments),
         b"rm" => remove_command(info, arguments),
         b"copy" => copy_command(info, arguments),
+        b"start" if no_arguments(arguments) => start_command(info),
         b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"nic" => nic_command(arguments),
@@ -332,7 +402,7 @@ fn execute(command: &[u8], info: &BootInfo) {
             reset();
         }
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
-        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" => {
+        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"start" => {
             println!("This command does not accept arguments.");
         }
 
@@ -2662,18 +2732,42 @@ fn tape_boot_info() -> Option<&'static BootInfo> {
     (!pointer.is_null()).then(|| unsafe { &*pointer })
 }
 
-fn tape_fs_name(pointer: u32, length: u32) -> Option<&'static [u8]> {
+/// A FOSFS name is at most 16 bytes; a `diskN/` selector prefix (matching
+/// `tape run`'s `@diskN/NAME` and the shell's `diskN` command selectors)
+/// adds a handful more, so this is a generous round bound, not a precise
+/// one -- the real length/charset checks happen on the two halves
+/// separately once split, in [`tape_fs_reference`].
+const TAPE_FS_REFERENCE_CAPACITY: usize = 32;
+
+/// Resolves a tape-supplied file reference into a disk device and a plain
+/// FOSFS name, exactly mirroring `tape run`'s `@diskN/NAME` convention: a
+/// bare name (no `/`) always means the boot disk, matching every existing
+/// tape's behavior before this existed; a `diskN/NAME` reference selects an
+/// attached secondary disk instead. A literal `/` is unambiguous as the
+/// separator since FOSFS names may only contain letters, digits, `.`, `_`,
+/// and `-`, so a real file name can never collide with it.
+fn tape_fs_reference(pointer: u32, length: u32) -> Option<(disk::Device, &'static [u8])> {
     let length = usize::try_from(length).ok()?;
-    if pointer == 0
-        || length == 0
-        || length > 16
-        || !unsafe { core::slice::from_raw_parts(pointer as *const u8, length) }
+    if pointer == 0 || length == 0 || length > TAPE_FS_REFERENCE_CAPACITY {
+        return None;
+    }
+    let reference = unsafe { core::slice::from_raw_parts(pointer as *const u8, length) };
+    let (device, name) = match reference.iter().position(|&byte| byte == b'/') {
+        Some(slash) => {
+            let device = strip_disk_selector(&reference[..slash])?;
+            (device, &reference[slash + 1..])
+        }
+        None => (disk::Device::Boot, reference),
+    };
+    if name.is_empty()
+        || name.len() > 16
+        || !name
             .iter()
             .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
     {
         return None;
     }
-    Some(unsafe { core::slice::from_raw_parts(pointer as *const u8, length) })
+    Some((device, name))
 }
 
 fn tape_fs_buffer(pointer: u32, length: u32) -> Option<&'static mut [u8]> {
@@ -2688,9 +2782,11 @@ fn tape_fs_buffer(pointer: u32, length: u32) -> Option<&'static mut [u8]> {
 
 /// Returns a FOSFS file's exact byte length through the append-only tape ABI.
 /// The output length is written unaligned because tape buffers are not
-/// required to have a particular alignment.
+/// required to have a particular alignment. `name` may be a bare FOSFS name
+/// (boot disk) or a `diskN/NAME` reference (an attached secondary disk); see
+/// [`tape_fs_reference`].
 extern "C" fn tape_fs_file_length(name: u32, name_length: u32, out_length: u32) -> u32 {
-    let Some(name) = tape_fs_name(name, name_length) else {
+    let Some((device, name)) = tape_fs_reference(name, name_length) else {
         return TAPE_FS_INVALID_ARGUMENT;
     };
     if out_length == 0 {
@@ -2699,7 +2795,7 @@ extern "C" fn tape_fs_file_length(name: u32, name_length: u32, out_length: u32) 
     let Some(info) = tape_boot_info() else {
         return TAPE_FS_DISK_ERROR;
     };
-    match fosfs::file_length(info, disk::Device::Boot, name) {
+    match fosfs::file_length(info, device, name) {
         Ok(Some(length)) => {
             unsafe { core::ptr::write_unaligned(out_length as *mut u64, length) };
             TAPE_FS_OK
@@ -2711,7 +2807,9 @@ extern "C" fn tape_fs_file_length(name: u32, name_length: u32, out_length: u32) 
 
 /// Reads a complete FOSFS file into a tape buffer. The output length is
 /// written only on success; callers should query `tape_fs_file_length` first
-/// when they need to allocate a precisely sized buffer.
+/// when they need to allocate a precisely sized buffer. `name` may be a bare
+/// FOSFS name (boot disk) or a `diskN/NAME` reference (an attached secondary
+/// disk); see [`tape_fs_reference`].
 extern "C" fn tape_fs_read(
     name: u32,
     name_length: u32,
@@ -2719,7 +2817,7 @@ extern "C" fn tape_fs_read(
     capacity: u32,
     out_length: u32,
 ) -> u32 {
-    let Some(name) = tape_fs_name(name, name_length) else {
+    let Some((device, name)) = tape_fs_reference(name, name_length) else {
         return TAPE_FS_INVALID_ARGUMENT;
     };
     if out_length == 0 {
@@ -2728,7 +2826,7 @@ extern "C" fn tape_fs_read(
     let Some(info) = tape_boot_info() else {
         return TAPE_FS_DISK_ERROR;
     };
-    let length = match fosfs::file_length(info, disk::Device::Boot, name) {
+    let length = match fosfs::file_length(info, device, name) {
         Ok(Some(length)) => length,
         Ok(None) => return TAPE_FS_NOT_FOUND,
         Err(_) => return TAPE_FS_DISK_ERROR,
@@ -2739,7 +2837,7 @@ extern "C" fn tape_fs_read(
     let Some(buffer) = tape_fs_buffer(buffer, capacity) else {
         return TAPE_FS_INVALID_ARGUMENT;
     };
-    match fosfs::read(info, disk::Device::Boot, name, buffer) {
+    match fosfs::read(info, device, name, buffer) {
         Ok(Some(read_length)) => {
             unsafe { core::ptr::write_unaligned(out_length as *mut u32, read_length as u32) };
             TAPE_FS_OK
@@ -2749,9 +2847,11 @@ extern "C" fn tape_fs_read(
     }
 }
 
-/// Replaces or creates one complete FOSFS file from a tape buffer.
+/// Replaces or creates one complete FOSFS file from a tape buffer. `name` may
+/// be a bare FOSFS name (boot disk) or a `diskN/NAME` reference (an attached
+/// secondary disk); see [`tape_fs_reference`].
 extern "C" fn tape_fs_write(name: u32, name_length: u32, buffer: u32, length: u32) -> u32 {
-    let Some(name) = tape_fs_name(name, name_length) else {
+    let Some((device, name)) = tape_fs_reference(name, name_length) else {
         return TAPE_FS_INVALID_ARGUMENT;
     };
     let Some(buffer) = tape_fs_buffer(buffer, length) else {
@@ -2760,7 +2860,7 @@ extern "C" fn tape_fs_write(name: u32, name_length: u32, buffer: u32, length: u3
     let Some(info) = tape_boot_info() else {
         return TAPE_FS_DISK_ERROR;
     };
-    match fosfs::write(info, disk::Device::Boot, name, buffer) {
+    match fosfs::write(info, device, name, buffer) {
         Ok(fosfs::WriteOutcome::Written) => TAPE_FS_OK,
         Ok(fosfs::WriteOutcome::InvalidName) => TAPE_FS_INVALID_ARGUMENT,
         Ok(fosfs::WriteOutcome::DirectoryFull) => TAPE_FS_DIRECTORY_FULL,
@@ -2769,15 +2869,17 @@ extern "C" fn tape_fs_write(name: u32, name_length: u32, buffer: u32, length: u3
     }
 }
 
-/// Removes one FOSFS file, returning `TAPE_FS_NOT_FOUND` when absent.
+/// Removes one FOSFS file, returning `TAPE_FS_NOT_FOUND` when absent. `name`
+/// may be a bare FOSFS name (boot disk) or a `diskN/NAME` reference (an
+/// attached secondary disk); see [`tape_fs_reference`].
 extern "C" fn tape_fs_remove(name: u32, name_length: u32) -> u32 {
-    let Some(name) = tape_fs_name(name, name_length) else {
+    let Some((device, name)) = tape_fs_reference(name, name_length) else {
         return TAPE_FS_INVALID_ARGUMENT;
     };
     let Some(info) = tape_boot_info() else {
         return TAPE_FS_DISK_ERROR;
     };
-    match fosfs::remove(info, disk::Device::Boot, name) {
+    match fosfs::remove(info, device, name) {
         Ok(true) => TAPE_FS_OK,
         Ok(false) => TAPE_FS_NOT_FOUND,
         Err(_) => TAPE_FS_DISK_ERROR,

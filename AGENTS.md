@@ -2453,6 +2453,76 @@ not real code -- only proving the disk2 read path itself works), and
 `tape load disk9 config.txt` (no such disk) prints the usage message and
 leaves the previously loaded tape's state untouched.
 
+**Follow-up: disk2 fallback for the boot-time `start` script, plus an
+interactive `start` command.** The `start` file (see "Boot-time `start`
+script" in README.md) previously had to live on `disk1`, forcing any
+change to it through a rebuild of the boot medium -- exactly the
+inconvenience the second disk exists to avoid. `shell.rs` gained a small
+`StartFileLookup` enum (`Found(disk::Device, u64)` / `Missing` /
+`Error(disk::Error)`) and a `locate_start_file` helper: check `disk1`
+first, and only if it has no `start` file, check `disk2`
+(`disk::Device::Secondary(0)`). The two checks are deliberately not
+symmetric in how they treat an error: `disk1` always has a valid FOSFS
+volume (it is the boot disk), so a real read failure there is reported;
+`disk2` is commonly blank/unformatted (the default state for a machine
+not yet using a config disk), and `fosfs::validate` on an unformatted
+volume always returns `Err(disk::Error::FirmwareFailure)` -- indistinguishable
+at this level from a genuine I/O fault -- so *any* error checking `disk2`
+is folded into `Missing` rather than surfaced, avoiding a scary, spurious
+error message on every ordinary boot with an unused second disk attached.
+
+The former single `run_start_file` function was split into three: the
+silent, boot-time `run_start_file` (unchanged behavior when no script
+exists anywhere), a new interactive `start_command` (explicitly reports
+`"start: no start file found on disk1 or disk2."` when absent, since a
+human typing `start` deserves to know why nothing happened), and a shared
+`execute_start_file(info, device, length)` doing the actual line-by-line
+dispatch, parameterized by whichever device `locate_start_file` resolved.
+`start` (no arguments) was added to `execute()`'s dispatch and to the
+"no arguments accepted" error group. The main use case: after F12-ing out
+of a long-running tape the script launched (e.g. `router`), `start` puts
+the machine back into the same state a fresh boot would, without an
+actual reset. Verified by extending `make test-start`'s existing scenario
+with an interactive rerun (confirming the script executes a second time)
+and by extending every other `qemu_smoke.py` scenario (which never
+preload a `start` file) to confirm the "not found" message, including
+`--second-disk`'s still-unformatted secondary disk correctly falling
+through to `Missing` rather than an error.
+
+**Follow-up: `diskN/NAME` for the tape filesystem callback ABI (`ed`,
+`router`).** `tapes/ed` and `tapes/router` are the only two tapes using
+the kernel's `tape_fs_file_length`/`tape_fs_read`/`tape_fs_write`/
+`tape_fs_remove` callbacks, and all four were hardcoded to
+`disk::Device::Boot` -- so neither tape could read or write a file on
+`disk2`, even though the shell's own `cat`/`write`/`rm`/`copy` commands
+already could. Adding a `device` parameter to these callbacks was
+possible under the append-only cdecl ABI rule, but would have required
+updating every tape using this ABI (`ed` and `router`) to pass it, for a
+change that is really only about what the existing `name` argument can
+*mean*. Instead, `tape_fs_name` was replaced with `tape_fs_reference
+(pointer, length) -> Option<(disk::Device, &'static [u8])>`, which parses
+an optional leading `diskN/` prefix out of the name string via the
+already-shared `strip_disk_selector` -- exactly the same trick `tape
+run`'s `@diskN/NAME` argument uses (see above), just applied to this
+callback's string instead. No `name` with no `/` still means the boot
+disk, so no existing caller changes behavior. This means `tapes/router`'s
+lease-file argument (`dhcp-lease-file NAME`, previously unrestricted)
+transparently gained disk2 support for free, with zero code changes on
+the tape side, though this has not yet been separately tested or
+documented for `router` specifically.
+
+`ed` itself needed one small change to avoid rejecting a legitimate
+`diskN/` prefix before it ever reaches the kernel: its own `valid_name`
+check (which rejects `/`, among other things) is now only applied to the
+part *after* an optional `diskN/` prefix, via new `valid_reference`/
+`is_disk_selector` helpers. `ed` never resolves the disk itself -- it just
+validates the reference's shape and passes the whole string through to
+the kernel callbacks unchanged, which is why its `save`/`written ...`
+message reports the full reference (e.g. `written disk2/config.txt`), not
+just the bare file name. Verified by extending `tapes/test_ed_e2e.py`
+with a second, blank QEMU drive and a full `format disk2` / `write` /
+`tape run ed disk2/NAME` / edit / save / `cat disk2 NAME` cycle.
+
 ### A tape that visits 64-bit long mode and comes back
 
 `tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written

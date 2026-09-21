@@ -71,7 +71,7 @@ pub extern "C" fn tape_main(
     _fs_remove: extern "C" fn(u32, u32) -> u32,
 ) {
     let Some(name) = parse_filename(args_ptr, args_len) else {
-        print_bytes(putc, b"Usage: tape run ed NAME\n");
+        print_bytes(putc, b"Usage: tape run ed NAME (or diskN/NAME for a secondary disk)\n");
         return;
     };
 
@@ -163,10 +163,37 @@ fn parse_filename<'a>(args_ptr: u32, args_len: u32) -> Option<&'a [u8]> {
     let mut words = args.split(|byte| *byte == b' ');
     let command = trim_ascii(words.next()?);
     let name = trim_ascii(words.next()?);
-    if command != b"ed" || name.is_empty() || words.next().is_some() || !valid_name(name) {
+    if command != b"ed" || name.is_empty() || words.next().is_some() || !valid_reference(name) {
         return None;
     }
     Some(name)
+}
+
+/// A bare FOSFS name means the boot disk, exactly as before; a `diskN/NAME`
+/// reference selects an attached secondary disk instead, matching the
+/// kernel's own `tape_fs_*` callback convention (see
+/// `kernel/src/shell.rs`'s `tape_fs_reference`) and `tape run`'s own
+/// `@diskN/NAME` syntax. `ed` itself never needs to know which disk a
+/// reference resolves to -- it just validates the shape locally (so a
+/// malformed reference is rejected with a usage message instead of an
+/// opaque filesystem error) and passes the whole string through to
+/// `fs_file_length`/`fs_read`/`fs_write` unchanged, letting the kernel do
+/// the actual disk selection.
+fn valid_reference(reference: &[u8]) -> bool {
+    match reference.iter().position(|&byte| byte == b'/') {
+        Some(slash) => is_disk_selector(&reference[..slash]) && valid_name(&reference[slash + 1..]),
+        None => valid_name(reference),
+    }
+}
+
+/// A loose, tape-side shape check only -- `diskN` for any digit string,
+/// without knowing which disks are actually attached (the kernel rejects an
+/// unattached or malformed selector once the reference reaches it).
+fn is_disk_selector(word: &[u8]) -> bool {
+    match word.strip_prefix(b"disk") {
+        Some(suffix) => !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit),
+        None => false,
+    }
 }
 
 fn valid_name(name: &[u8]) -> bool {

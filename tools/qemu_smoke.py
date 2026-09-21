@@ -240,6 +240,36 @@ def main() -> None:
                     raise RuntimeError(
                         f"start command was not dispatched:\n{output.decode(errors='replace')}"
                     )
+                # The interactive `start` command reruns the exact same
+                # script on demand -- useful after F12-ing out of a
+                # long-running tape it launched -- without a full machine
+                # reset. Checked before the base command list's own bare
+                # `format` below wipes disk1 (which would remove the start
+                # file this same interactive rerun depends on).
+                local_start = len(output)
+                process.stdin.write(b"start\r")
+                process.stdin.flush()
+                wait_for(output, selector, BOOT_MARKER, 10, local_start)
+                if b"start: running " not in output[local_start:]:
+                    raise RuntimeError(
+                        f"interactive 'start' did not rerun the script:\n{output.decode(errors='replace')}"
+                    )
+                if b"start line 3: about" not in output[local_start:]:
+                    raise RuntimeError(
+                        f"interactive 'start' did not dispatch the script's commands:\n{output.decode(errors='replace')}"
+                    )
+            else:
+                # No start file exists anywhere in this scenario; the
+                # interactive command should say so plainly rather than
+                # silently doing nothing.
+                local_start = len(output)
+                process.stdin.write(b"start\r")
+                process.stdin.flush()
+                wait_for(output, selector, BOOT_MARKER, 10, local_start)
+                if b"start: no start file found on disk1 or disk2." not in output[local_start:]:
+                    raise RuntimeError(
+                        f"interactive 'start' did not report a missing start file:\n{output.decode(errors='replace')}"
+                    )
             commands = [
                 b"helx\x08p\r",
                 b"about\r",

@@ -168,7 +168,8 @@ resetting to row 0 and overwriting the top of that narration.
 | `write [diskN] NAME TEXT` | Creates or replaces a flat FOSFS file on the boot disk (`disk1`, default) or an attached secondary disk. Names use up to 16 lowercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
 | `rm [diskN] NAME` | Removes a FOSFS file entry from the boot disk (`disk1`, default) or an attached secondary disk. |
 | `copy SRC_DISK NAME DST_DISK [NEW_NAME]` | Copies one FOSFS file's raw bytes from `SRC_DISK` to `DST_DISK` (both must be spelled out explicitly, e.g. `disk1`/`disk2` — unlike every other disk command, neither side defaults), optionally renaming it to `NEW_NAME`. Uses the same shared tape staging buffer as `tape load disk`/`tape load net`, so any previously loaded tape is invalidated by a copy; the shell reports this when it happens. |
-| `start` file | Optional boot-time command script. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
+| `start` file | Optional boot-time command script, read from `disk1` or, if absent there, `disk2`. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
+| `start` | Reruns the boot-time `start` script on demand (same disk1-then-disk2 lookup), e.g. after F12-ing out of a tape it launched, without needing a reset. Reports plainly if no `start` file is found on either disk. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
 | `nic` | Reports the active supported PCI Ethernet controller and its MAC address; the first initialized interface is selected by default. |
@@ -466,6 +467,22 @@ ordinary shell command handler. Commands therefore have the same syntax,
 output, and errors as commands entered at `fos> `. The script continues after
 an individual command error; a missing `start` file changes nothing.
 
+fos looks for `start` on `disk1` first and, only if it is not found there,
+on `disk2` -- useful for a config/log disk (see "A second disk for
+configuration and logs" below) that carries its own startup script without
+needing to touch the boot disk's own copy. An error reading `disk1` itself
+(rather than simply not having the file) is still reported; an unformatted
+or missing `disk2` is silently treated the same as "no script there" and
+never produces a spurious error, since a blank secondary disk is the normal
+state for a deployment that isn't using one yet.
+
+The interactive `start` command reruns this exact same script on demand --
+handy after pressing F12 to escape a tape the script launched (e.g. a
+long-running `router`), to bring the machine back to the same state as a
+fresh boot without an actual reset. Unlike the silent boot-time run, `start`
+explicitly reports `"start: no start file found on disk1 or disk2."` if
+neither disk has one.
+
 For a router image, load `ed.bin` as usual, run `tape run ed start`, and save:
 
 ```text
@@ -729,7 +746,9 @@ remote Escape byte cleanly ending the REPL without disconnecting the
 #### Test tape: `tapes/ed/`
 
 A small line-oriented Rust text editor for complete FOSFS files. Start it
-with `tape run ed NAME`; `NAME` must be a lowercase FOSFS name. The editor
+with `tape run ed NAME`; `NAME` must be a lowercase FOSFS name, optionally
+prefixed with `diskN/` (e.g. `tape run ed disk2/config.txt`) to read from and
+save to an attached secondary disk instead of the boot disk. The editor
 loads the whole file through the tape filesystem callbacks, normalizes input
 line endings to LF, and uses a 1 MiB buffer in the tape's own fixed image
 region for new and small files. Larger existing files use the optional tape

@@ -12,6 +12,7 @@ import selectors
 import socket as socketlib
 import struct
 import subprocess
+import tempfile
 import time
 import os
 from pathlib import Path
@@ -54,6 +55,15 @@ def main():
     if not IMAGE.exists():
         raise SystemExit(f"{IMAGE} does not exist; run `make image` first.")
 
+    disk2_dir = tempfile.TemporaryDirectory(prefix="fos-ed-disk2-")
+    # A blank 4 MiB secondary disk, matching tools/qemu_smoke.py's own
+    # --second-disk setup: `format disk2` handles the no-partition-table
+    # starting state, and 4 MiB comfortably fits FOSFS3's fixed directory
+    # area plus a couple of small test files.
+    disk2_path = os.path.join(disk2_dir.name, "disk2.img")
+    with open(disk2_path, "wb") as disk2_file:
+        disk2_file.truncate(4 * 1024 * 1024)
+
     qemu = subprocess.Popen(
         [
             "qemu-system-i386",
@@ -61,6 +71,8 @@ def main():
             "128",
             "-drive",
             f"format=raw,file={IMAGE}",
+            "-drive",
+            f"format=raw,file={disk2_path}",
             "-serial",
             "stdio",
             "-monitor",
@@ -162,7 +174,43 @@ def main():
         mcast.send(frame(TERM_TAG_DATA, b"q"))
         read_until(b"ed> ", 10)
         command("q\n")
-        print("PASS: editor loaded, edited, saved, and persisted test.txt.")
+
+        # `tape run ed diskN/NAME` reads/writes a file on an attached
+        # secondary disk instead of only ever the boot disk, exactly like
+        # `tape run @diskN/NAME` and `tape load diskN NAME` (see
+        # kernel/src/shell.rs's `tape_fs_reference`). disk2 starts as a
+        # blank image with no FOSFS structure at all, so it must be
+        # formatted first, the same as `tools/qemu_smoke.py`'s own
+        # --second-disk scenario.
+        command("format disk2\n")
+        if b"FOSFS formatted." not in output:
+            raise SystemExit(f"failed to format disk2:\n{output.decode('utf-8', 'replace')}")
+
+        command("write disk2 test2.txt one two\n")
+        if b"File written." not in output:
+            raise SystemExit(f"failed to seed disk2 test2.txt:\n{output.decode('utf-8', 'replace')}")
+
+        del output[:]
+        mcast.send(frame(TERM_TAG_DATA, b"tape run ed disk2/test2.txt\n"))
+        read_until(b"ed> ", 15)
+
+        command("p\n", marker=b"ed> ")
+        if b"1: one two" not in output:
+            raise SystemExit(f"editor did not print disk2's seed file:\n{output.decode('utf-8', 'replace')}")
+
+        command("a\n", marker=b". ")
+        command("added\n", marker=b". ")
+        command(".\n", marker=b"ed> ")
+        command("x\n", marker=b"fos> ")
+        if b"written disk2/test2.txt" not in output:
+            raise SystemExit(f"editor did not report a successful disk2 save:\n{output.decode('utf-8', 'replace')}")
+
+        command("cat disk2 test2.txt\n")
+        text = output.decode("utf-8", "replace")
+        if "one two\nadded\n" not in text:
+            raise SystemExit(f"disk2 saved file has unexpected contents:\n{text}")
+
+        print("PASS: editor loaded, edited, saved, and persisted test.txt (disk1 and disk2).")
     finally:
         mcast.close()
         qemu.terminate()
@@ -171,6 +219,7 @@ def main():
         except subprocess.TimeoutExpired:
             qemu.kill()
             qemu.wait()
+        disk2_dir.cleanup()
 
 
 if __name__ == "__main__":
