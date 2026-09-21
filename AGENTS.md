@@ -1992,6 +1992,39 @@ section above.
   BIOS EDD/LBA, E820, VGA text, COM1, and PS/2-compatible input. QEMU is the
   primary validation environment.
 
+### ISA bus support and the 3C509: investigated, not yet built
+
+Every NIC backend today (`rtl8139.rs`, `threecom.rs`, `e1000.rs`) is found
+through `pci.rs`'s PCI configuration-space walk (Mechanism #1, ports
+`0xcf8`/`0xcfc`); this project has no ISA bus code at all. A 3Com 3C509 was
+considered as a next NIC target and investigated, but deliberately not
+started, because it splits into two pieces of very different size:
+
+- **Card discovery is the genuinely new, harder half.** A 3C509 in its
+  default ISA Plug-and-Play state has no PCI-style enumerable configuration
+  space to walk; it must instead be woken from sleep with an LFSR-derived
+  32-byte key sequence written to an ID port, then walked through a serial-
+  identification/CSN-assignment protocol to have software assign it an I/O
+  base and IRQ. That is a real, standalone subsystem (`isa.rs`, unrelated to
+  `pci.rs`'s mechanism) this project has never needed before. The
+  alternative -- jumperless-configuring a card once via the old DOS
+  `3c5x9cfg.exe` utility (or its EEPROM default) to always answer at one
+  fixed, known I/O port -- sidesteps ISA PnP entirely and shrinks discovery
+  to "probe one known address, read the card's ID," at the cost of a one-
+  time manual setup step per physical card that this project's existing
+  drivers never require.
+- **The register-level driver itself would actually be simpler** than the
+  PCI backends already built: the 3C509 has no bus-mastering or descriptor
+  rings at all -- it is plain programmed I/O through a window-based FIFO
+  (well documented; Linux's original `3c509.c` is short), comparable to
+  `threecom.rs`'s own window-register conventions but without any of its
+  DMA-buffer bookkeeping.
+
+No ISA machine was available to validate discovery either way at the time
+of this investigation, so nothing was implemented; a future attempt should
+decide up front which discovery path to take, since that choice (not the
+Ethernet register work) is what actually determines the size of the task.
+
 ### A tape that visits 64-bit long mode and comes back
 
 `tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written
