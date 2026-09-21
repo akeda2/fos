@@ -173,7 +173,7 @@ fn valid_name(name: &[u8]) -> bool {
     !name.is_empty()
         && name.len() <= 16
         && name.iter().all(|byte| {
-            matches!(*byte, b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-')
+            matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-')
         })
 }
 

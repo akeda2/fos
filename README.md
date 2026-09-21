@@ -162,9 +162,9 @@ resetting to row 0 and overwriting the top of that narration.
 | `format` | Initializes the dedicated FOSFS partition, permanently removing its files. |
 | `ls` | Lists FOSFS files. |
 | `cat NAME` | Displays a FOSFS text file. |
-| `write NAME TEXT` | Creates or replaces a flat FOSFS file. Names use up to 16 uppercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
+| `write NAME TEXT` | Creates or replaces a flat FOSFS file. Names use up to 16 lowercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
 | `rm NAME` | Removes a FOSFS file entry. |
-| `START` file | Optional boot-time command script. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
+| `start` file | Optional boot-time command script. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
 | `nic` | Reports the active supported PCI Ethernet controller and its MAC address; the first initialized interface is selected by default. |
@@ -180,7 +180,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): checks that the declared image fits the fixed 4 MiB tape region, validates each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run router @ROUTER.CFG` reads router startup arguments from the uppercase FOSFS file `ROUTER.CFG`; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run router @router.cfg` reads router startup arguments from the lowercase FOSFS file `router.cfg`; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
@@ -268,7 +268,7 @@ FOSFS is a small custom filesystem in the dedicated data partition. Version 3
 has a single superblock, eight fixed directory sectors (64 flat entries), and
 contiguous multi-sector files. File creation and replacement use a bounded
 first-fit extent scan, so deleting a file makes its sectors reusable without a
-bitmap or heap. The generated image starts preformatted with `README.TXT` and
+bitmap or heap. The generated image starts preformatted with `readme.txt` and
 all compiled tape binaries; `format` removes them and resets the directory.
 Raw `readsector` is read-only. Only FOSFS commands issue writes, and their
 LBAs are constrained to the data partition.
@@ -410,26 +410,26 @@ echo 52:54:00:12:34:56 > tools/mac   # the target fos machine's MAC; see its 'ni
 sudo python3 tools/send_frame.py "hello fos"
 ```
 
-### Boot-time `START` script
+### Boot-time `start` script
 
-An optional uppercase FOSFS file named `START` turns a prepared image into a
+An optional lowercase FOSFS file named `start` turns a prepared image into a
 small appliance: fos reads up to 4096 bytes after disk and NIC initialization,
 then dispatches every non-empty line that does not begin with `#` through the
 ordinary shell command handler. Commands therefore have the same syntax,
 output, and errors as commands entered at `fos> `. The script continues after
-an individual command error; a missing `START` file changes nothing.
+an individual command error; a missing `start` file changes nothing.
 
-For a router image, load `ED.BIN` as usual, run `tape run ed START`, and save:
+For a router image, load `ed.bin` as usual, run `tape run ed start`, and save:
 
 ```text
 # Start the configured router at boot.
-tape load disk ROUTER.BIN
-tape run router @ROUTER.CFG
+tape load disk router.bin
+tape run router @router.cfg
 ```
 
 The automatic `term net` wait runs only after the script finishes. A
-long-running command such as `tape run router @ROUTER.CFG` intentionally owns
-the boot session until it returns; put `term net` in `START` only when waiting
+long-running command such as `tape run router @router.cfg` intentionally owns
+the boot session until it returns; put `term net` in `start` only when waiting
 for a remote shell is the desired startup action. `make test-start` verifies
 comment/blank-line handling and normal shell dispatch with an isolated image.
 
@@ -521,7 +521,7 @@ compiled language like Rust or C practical -- see "Test tape:
 
 A tape can be loaded two ways. `tape load disk NAME` reads a complete
 multi-sector FOSFS file straight into the tape image buffer. The generated
-image contains every compiled tape under a short uppercase `.BIN` name, so
+image contains every compiled tape under a short lowercase `.bin` name, so
 they can be loaded locally without a network sender; `write NAME TEXT` remains
 the small interactive text-file path rather than a binary import mechanism.
 `tape load net` instead waits for a tape sent over Ethernet: one
@@ -682,7 +682,7 @@ remote Escape byte cleanly ending the REPL without disconnecting the
 #### Test tape: `tapes/ed/`
 
 A small line-oriented Rust text editor for complete FOSFS files. Start it
-with `tape run ed NAME`; `NAME` must be an uppercase FOSFS name. The editor
+with `tape run ed NAME`; `NAME` must be a lowercase FOSFS name. The editor
 loads the whole file through the tape filesystem callbacks, normalizes input
 line endings to LF, and uses a 1 MiB buffer in the tape's own fixed image
 region for new and small files. Larger existing files use the optional tape
@@ -713,7 +713,7 @@ q              exit without saving
 `m` pauses after each 20 lines; press Space or Enter for the next page, or
 `q` to stop paging and return to the editor prompt. F12/F4/F6/F7/F8/F10
 exits the editor without saving. Build it with
-`make tape-ed`; `make image` preloads the resulting `ED.BIN`, and
+`make tape-ed`; `make image` preloads the resulting `ed.bin`, and
 `make test-tape-ed` verifies loading, editing, saving, and reading the
 changed file back from FOSFS.
 
@@ -733,7 +733,7 @@ checks that the remote shell remains usable afterward.
 
 #### Diagnostic tape: `tapes/net-dhcp-test/`
 
-`NET-DHCP.BIN` is a 32-bit Rust hardware diagnostic that visits every
+`net-dhcp.bin` is a 32-bit Rust hardware diagnostic that visits every
 initialized NIC and runs DHCP independently on each one. It keeps retrying
 until that interface receives an IP, printing transmit, receive, parse, and
 DHCP-error counters along the way; each successful lease triggers one
@@ -741,7 +741,7 @@ approximately 100 ms PC-speaker beep before the tape advances to the next
 NIC. It uses the kernel's PIT channel 2 for the tone and leaves channel 0's
 100 Hz timer untouched. After all leases are acquired, it continues printing
 the per-NIC status and counters until manually stopped. Load it with
-`tape load disk NET-DHCP.BIN` and run `tape run`; optionally use
+`tape load disk net-dhcp.bin` and run `tape run`; optionally use
 `tape run HOST [INTERVAL_SECONDS]` to send ICMP echo requests through every
 leased NIC. Without arguments it does not ping. F12/F4/F6/F7/F8/F10 remains
 the explicit escape if a segment has no DHCP server. Build it with
@@ -929,20 +929,20 @@ assignment but restart the seven-day lease timer from the new boot; fos does
 not currently expose a battery-backed wall clock to tapes.
 
 For a readable, reusable setup, the router can read this configuration from
-an uppercase FOSFS file. `#` starts a comment through the end of its line:
+a lowercase FOSFS file. `#` starts a comment through the end of its line:
 
 ```text
-# ROUTER.CFG
+# router.cfg
 dhcp-server
 forward tcp 8080 10.0.15.2 80
 1 10.0.1.1/24
 2 10.0.2.1/24
 ```
 
-After storing that text as `ROUTER.CFG`, run the loaded router tape with:
+After storing that text as `router.cfg`, run the loaded router tape with:
 
 ```text
-tape run router @ROUTER.CFG
+tape run router @router.cfg
 ```
 
 The shell reads the file through the kernel's FOSFS/BIOS disk path and passes
@@ -1141,7 +1141,7 @@ type `tape run`. Two things are worth knowing before relying on this:
   handling -- until they return. `tape load net` retains a bounded four-frame
   queue of ordinary `TERM_TAG_DATA` input from its connected peer and replays
   it through the suspended shell editor when it returns, so a following
-  command (such as `tape run router @ROUTER.CFG`) sent during the transfer is
+  command (such as `tape run router @router.cfg`) sent during the transfer is
   not lost; if that queue fills, whole newest frames are dropped and fos
   reports the overflow. Only local F12 (or F4/F6/F7/F8/F10) can
   interrupt `tape load net` early. `tape run` cannot be interrupted at
@@ -1317,7 +1317,7 @@ backup GPT metadata:
 - First 32 payload sectors: stage-two loader.
 - Remaining payload sectors: flat kernel image at physical `0x10000`.
 - LBA 4096: a separate 28639-sector FOSFS data partition containing
-  `README.TXT` and every compiled tape.
+  `readme.txt` and every compiled tape.
 - Final 33 sectors: backup GPT entries and header.
 
 `tools/write_layout.py` generates the loader constants from the actual kernel

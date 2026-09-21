@@ -14,7 +14,7 @@
 //! Run it with:
 //!
 //! ```text
-//! tape load disk NET-DHCP.BIN
+//! tape load disk net-dhcp.bin
 //! tape run
 //! tape run 192.168.0.1 5
 //! ```

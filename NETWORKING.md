@@ -78,7 +78,7 @@ addressed to hosts behind another port.
 `terminal_position` returns the kernel's packed, 1-based ANSI cursor position
 (row in the high 16 bits and column in the low 16 bits). It lets a tape answer
 terminal cursor-position requests without reaching into the console's private
-state. The four filesystem callbacks operate on complete uppercase FOSFS names
+state. The four filesystem callbacks operate on complete lowercase FOSFS names
 and contiguous multi-sector files: `fs_file_length` reports a file's byte length,
 `fs_read` copies file bytes into a caller-owned buffer, `fs_write` replaces or
 creates a file, and `fs_remove` deletes it. They are used by tapes such as
@@ -290,11 +290,11 @@ battery-backed wall-clock callback. A /31 or /32 interface has no usable pool
 and is skipped. This is deliberately a DHCP service for the router's directly
 connected LANs, not a general DHCP relay or network-management daemon.
 
-For repeatable setups, router arguments may be stored in an uppercase FOSFS
+For repeatable setups, router arguments may be stored in a lowercase FOSFS
 file and supplied with `@FILE`:
 
 ```text
-# ROUTER.CFG
+# router.cfg
 dhcp-server
 dhcp-lease-file DHCP.LEASES
 forward tcp 8080 10.0.15.2 80
@@ -302,7 +302,7 @@ forward tcp 8080 10.0.15.2 80
 2 10.0.2.1/24
 ```
 
-Run it with `tape run router @ROUTER.CFG`. The shell reads the file through
+Run it with `tape run router @router.cfg`. The shell reads the file through
 the kernel's FOSFS/BIOS disk path and passes its bytes through the existing
 tape startup-argument ABI. The router's optional lease persistence uses the
 high-level FOSFS tape callbacks rather than accessing raw sectors or BIOS.
@@ -358,7 +358,7 @@ Physical validation should begin with `nic`, then `nic send`/`nic recv` or
 the absence of any supported controller.
 
 When diagnosing DHCP on a physical multi-NIC machine, run
-`tape load disk NET-DHCP.BIN` followed by `tape run` before changing the
+`tape load disk net-dhcp.bin` followed by `tape run` before changing the
 router or DHCP implementation. The tape tries every initialized interface
 independently, reports transmit/receive/parser/DHCP counters, and does not
 advance until that NIC binds or the operator presses an escape function key.

@@ -121,7 +121,7 @@ def main() -> None:
         read_until(b"Waiting for a remote terminal client to connect", 30)
         monitor("sendkey f12")
         read_until(b"fos> ", 10)
-        command(b"tape load disk NET-DHCP.BIN\r")
+        command(b"tape load disk net-dhcp.bin\r")
         del output[:]
         command_start = len(output)
         for byte in b"tape run\r":

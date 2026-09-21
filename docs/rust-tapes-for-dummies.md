@@ -368,15 +368,15 @@ tape-your-tape:
 Then add `tape-your-tape` to both the `tapes:` aggregate target and the
 `.PHONY` list, and a one-line description to the `help` target, so
 `make all`/`make tapes`/`make help` all pick it up automatically. To load
-the tape from FOSFS on a fresh image, also add an uppercase, at-most-16-byte
+the tape from FOSFS on a fresh image, also add a lowercase, at-most-16-byte
 file name to `TAPE_IMAGE_ARGS`, for example:
 
 ```make
-	--file YOUR.BIN $(BUILD)/tapes/your-tape.bin \
+	--file your.bin $(BUILD)/tapes/your-tape.bin \
 ```
 
 The image target then preloads that ELF file and you can use `tape load disk
-YOUR.BIN`. Build the tape on its own with:
+your.bin`. Build the tape on its own with:
 
 ```sh
 make tape-your-tape
@@ -395,7 +395,7 @@ The simplest local loop is to run `make image` after adding the
 `TAPE_IMAGE_ARGS` line above, boot it with `make run`, then type:
 
 ```text
-tape load disk YOUR.BIN
+tape load disk your.bin
 tape run
 ```
 

@@ -57,23 +57,23 @@ EXPECTED_COMMON = (
     b"Halting CPU.",
     b"FOSFS partition: LBA 4096 + 28639 sectors",
     b"FOSFS3",
-    b"README.TXT  63 bytes, 1 sector(s)",
-    b"ROUTER.CFG",
-    b"PRIMES.BIN",
-    b"HELLO-RS.BIN",
-    b"VGA-COLORS.BIN",
-    b"BIGSIEVE.BIN",
-    b"LONGMODE.BIN",
-    b"LONG-RS.BIN",
-    b"CALC.BIN",
-    b"BEEP.BIN",
-    b"MORSE.BIN",
-    b"NET-CHAT.BIN",
-    b"IP-CHAT.BIN",
-    b"TELNET.BIN",
-    b"BRIDGE.BIN",
-    b"ROUTER.BIN",
-    b"NET-DHCP.BIN",
+    b"readme.txt  63 bytes, 1 sector(s)",
+    b"router.cfg",
+    b"primes.bin",
+    b"hello-rs.bin",
+    b"vga-colors.bin",
+    b"bigsieve.bin",
+    b"longmode.bin",
+    b"long-rs.bin",
+    b"calc.bin",
+    b"beep.bin",
+    b"morse.bin",
+    b"net-chat.bin",
+    b"ip-chat.bin",
+    b"telnet.bin",
+    b"bridge.bin",
+    b"router.bin",
+    b"net-dhcp.bin",
     b"Loaded ",
     b"fos test tape: Sieve of Eratosthenes up to 1,000,000",
     b"primes found:   78498",
@@ -90,7 +90,7 @@ EXPECTED_COMMON = (
     b"Physical frames: ",
     b"Allocated frame at 0x",
     b"released (if it was allocated and in range).",
-    b"Invalid name: use up to 16 uppercase letters, digits, '.', '_', or '-'.",
+    b"Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'.",
 )
 
 
@@ -154,7 +154,7 @@ def main() -> None:
     parser.add_argument(
         "--start-script-test",
         action="store_true",
-        help="expect the test-only FOSFS START script to run before the prompt",
+        help="expect the test-only FOSFS start script to run before the prompt",
     )
     parser.add_argument(
         "--nic-watchdog-test",
@@ -215,13 +215,13 @@ def main() -> None:
                 send_monitor_command(monitor_path, "sendkey f12")
             wait_for(output, selector, BOOT_MARKER, 10)
             if args.start_script_test:
-                if b"START: running " not in output:
+                if b"start: running " not in output:
                     raise RuntimeError(
-                        f"START script did not run before the prompt:\n{output.decode(errors='replace')}"
+                        f"start script did not run before the prompt:\n{output.decode(errors='replace')}"
                     )
-                if b"START line 3: about" not in output:
+                if b"start line 3: about" not in output:
                     raise RuntimeError(
-                        f"START command was not dispatched:\n{output.decode(errors='replace')}"
+                        f"start command was not dispatched:\n{output.decode(errors='replace')}"
                     )
             commands = [
                 b"helx\x08p\r",
@@ -238,15 +238,15 @@ def main() -> None:
                 b"cpuinfo\r",
                 b"memory\r",
                 b"ls\r",
-                b"tape load disk ROUTER.BIN\r",
-                b"tape load disk IP-CHAT.BIN\r",
-                b"tape load disk PRIMES.BIN\r",
+                b"tape load disk router.bin\r",
+                b"tape load disk ip-chat.bin\r",
+                b"tape load disk primes.bin\r",
                 b"tape run\r",
-                b"cat README.TXT\r",
-                b"write NOTE.TXT HELLO\r",
-                b"cat NOTE.TXT\r",
-                b"rm NOTE.TXT\r",
-                b"write AB@D.TXT hi\r",
+                b"cat readme.txt\r",
+                b"write note.txt HELLO\r",
+                b"cat note.txt\r",
+                b"rm note.txt\r",
+                b"write ab@d.txt hi\r",
                 b"format\r",
                 b"ls\r",
                 b"ticks\r",
@@ -276,7 +276,7 @@ def main() -> None:
                 process.stdin.write(command)
                 process.stdin.flush()
                 wait_for(output, selector, BOOT_MARKER, 10, start)
-                if command == b"tape load disk ROUTER.BIN\r":
+                if command == b"tape load disk router.bin\r":
                     # BIOS EDD reads temporarily enter real mode. Verify a
                     # real PS/2 key still reaches IRQ1 after loading this
                     # multi-sector tape, rather than merely proving serial

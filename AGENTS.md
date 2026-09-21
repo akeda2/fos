@@ -72,8 +72,17 @@ that obscure hardware behavior.
 - `kernel/src/fosfs.rs` implements FOSFS version 3, a deliberately small
   flat custom filesystem: one superblock, eight directory sectors, 64 fixed
   64-byte entries, 64-bit contiguous multi-sector extents, and bounded
-  first-fit reuse. Multi-extent files remain a future extension.
-- `kernel/src/shell.rs` runs an optional FOSFS `START` file after disk/NIC
+  first-fit reuse. Multi-extent files remain a future extension. File names
+  use up to 16 lowercase letters, digits, `.`, `_`, or `-` (this project's
+  own file-naming convention now uses lower case throughout, not just for
+  FOSFS entries) -- enforced independently in three places that must be kept
+  in sync: `fosfs::valid_name` (writes through the shell), `tape_fs_name`
+  in `kernel/src/shell.rs` (every tape's own `fs_write`/`fs_read` ABI
+  callback), and `tools/build_image.py`'s `valid_name` (preformatted image
+  files). Individual tapes taking a file name argument (e.g. `tapes/ed`,
+  `tapes/router`'s `dhcp-lease-file`) have historically duplicated this same
+  check client-side and must be updated together with it.
+- `kernel/src/shell.rs` runs an optional FOSFS `start` file after disk/NIC
   initialization and before the automatic `term net` wait. It accepts up to
   4096 bytes; non-empty lines not beginning with `#` use the ordinary command
   dispatcher. Keep a long-running router `tape run` last, because later
@@ -125,7 +134,7 @@ that obscure hardware behavior.
   lease slot per usable address, and seven-day leases. Upstream DHCP DNS
   values are propagated to downstream clients; a `dns SERVER [SERVER]`
   directive overrides them. The server has no DNS implementation or
-  persistence. It also accepts `tape run router @ROUTER.CFG`: the shell reads the uppercase
+  persistence. It also accepts `tape run router @router.cfg`: the shell reads the lowercase
   FOSFS file and passes its contents through the existing startup-argument
   ABI; `#` comments and newlines are accepted, with a 4096-byte fixed limit.
   `dhcp-lease-file NAME` optionally persists bound DHCP assignments through
@@ -206,7 +215,7 @@ make test-unsafe-memory # Smoke-tests the optional unpaged teaching image.
 make test-stack-guard # Builds a fault-injection image and verifies its emergency #DF task.
 make test-page-protection # Verifies CR0.WP and read-only kernel-text PTEs.
 make test-nic-watchdog # Verifies foreground recovery from a latched NIC fault.
-make test-start # Verifies an optional FOSFS START boot-command script.
+make test-start # Verifies an optional FOSFS start boot-command script.
 make all      # Builds everything: image, netrom, and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
 make help     # Lists every target with a one-line description.
@@ -276,7 +285,7 @@ PCI-discovered serial controllers as `PCI0`, `PCI1`, ...) and
 F12 exits).
 
 `readsector` is read-only. `hexdump` is limited to the reserved kernel range
-and at most 128 bytes. FOSFS names are limited to 16 uppercase alphanumeric or
+and at most 128 bytes. FOSFS names are limited to 16 lowercase alphanumeric or
 `.`, `_`, and `-` characters. The fixed command buffer and contiguous
 multi-sector file layout are intentional teaching constraints; the shell's
 interactive command line is capped at 256 characters.
@@ -1661,7 +1670,7 @@ future contributor doesn't have to rediscover them from scratch:
   with `IDTR=0`; any timer or keyboard IRQ in that window interpreted the
   IVT's 4-byte far pointers as protected-mode IDT gates and triple-faulted
   back to reset. This was especially reproducible on the AMD machine during
-  boot and during the many-sector disk load of `PRIMES.BIN`. The trampoline
+  boot and during the many-sector disk load of `primes.bin`. The trampoline
   now enables interrupts only after entering real mode, where BIOS's timer
   tick and disk-timeout logic can run safely, and executes `cli` before
   returning to protected mode.
@@ -2167,7 +2176,7 @@ unit:**
   today because there has only ever been one disk; renaming all of them
   under an explicit `disk` prefix to mirror a new `floppy` namespace would
   be a disruptive, unforced command-surface break (every existing test
-  script, `START` file, and README passage that already types
+  script, `start` file, and README passage that already types
   `readsector`/`ls`/`cat` unprefixed would need updating for no functional
   gain). The lower-disruption shape mirrors this project's own `nic`/
   `tape` convention instead: add `floppy` as a wholly new namespace
@@ -2233,9 +2242,9 @@ not a change to the existing `image`/`run`/`test` layout.
 
 Raised by the lab team: their test machines boot from an ordinary USB
 thumb drive, and the actual motivation here is to stop needing to bake
-config into the build (today, e.g., `tapes/router/ROUTER.CFG` only
-reaches a running router via `tools/build_image.py --file ROUTER.CFG` at
-build time, or the 4096-byte `tape run router @ROUTER.CFG` startup-
+config into the build (today, e.g., `tapes/router/router.cfg` only
+reaches a running router via `tools/build_image.py --file router.cfg` at
+build time, or the 4096-byte `tape run router @router.cfg` startup-
 argument path) -- a second, persistent, live-editable disk sitting in the
 machine would let config and logs be read/written directly without
 touching the build pipeline or the boot medium at all.
@@ -2283,7 +2292,7 @@ readsector [diskN] LBA
 ```
 
 Omitting `diskN` keeps meaning exactly what it means today (the boot
-disk) -- every existing script, `START` file, and test stays byte-for-byte
+disk) -- every existing script, `start` file, and test stays byte-for-byte
 valid with zero migration cost. This also means `disk1` is never mandatory
 to type; it exists purely so the numbering is uniform and a config/log
 file can unambiguously say "disk2" without also needing a special word for

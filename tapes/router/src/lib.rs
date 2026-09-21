@@ -352,7 +352,7 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
                     || name.len() > 16
                     || !name
                         .iter()
-                        .all(|byte| matches!(*byte, b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+                        .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
                 {
                     return Err(ConfigError::BadLeaseFileName);
                 }

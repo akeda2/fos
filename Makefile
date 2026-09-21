@@ -24,23 +24,23 @@ TAPE_BRIDGE_BIN := $(BUILD)/tapes/bridge.bin
 TAPE_ROUTER_BIN := $(BUILD)/tapes/router.bin
 TAPE_NET_DHCP_BIN := $(BUILD)/tapes/net-dhcp.bin
 TAPE_IMAGE_ARGS := \
-	--file PRIMES.BIN $(TAPE_PRIMES_BIN) \
-	--file HELLO-RS.BIN $(TAPE_HELLO_RS_BIN) \
-	--file VGA-COLORS.BIN $(TAPE_VGA_COLORS_BIN) \
-	--file BIGSIEVE.BIN $(TAPE_BIGSIEVE_BIN) \
-	--file LONGMODE.BIN $(TAPE_LONGMODE_BIN) \
-	--file LONG-RS.BIN $(TAPE_LONGMODE_RS_BIN) \
-	--file CALC.BIN $(TAPE_CALC_BIN) \
-	--file ED.BIN $(TAPE_ED_BIN) \
-	--file BEEP.BIN $(TAPE_BEEP_BIN) \
-	--file MORSE.BIN $(TAPE_MORSE_BIN) \
-	--file NET-CHAT.BIN $(TAPE_NET_CHAT_BIN) \
-	--file IP-CHAT.BIN $(TAPE_IP_CHAT_BIN) \
-	--file TELNET.BIN $(TAPE_TELNET_BIN) \
-	--file BRIDGE.BIN $(TAPE_BRIDGE_BIN) \
-	--file ROUTER.BIN $(TAPE_ROUTER_BIN) \
-	--file NET-DHCP.BIN $(TAPE_NET_DHCP_BIN) \
-	--file ROUTER.CFG tapes/router/ROUTER.CFG
+	--file primes.bin $(TAPE_PRIMES_BIN) \
+	--file hello-rs.bin $(TAPE_HELLO_RS_BIN) \
+	--file vga-colors.bin $(TAPE_VGA_COLORS_BIN) \
+	--file bigsieve.bin $(TAPE_BIGSIEVE_BIN) \
+	--file longmode.bin $(TAPE_LONGMODE_BIN) \
+	--file long-rs.bin $(TAPE_LONGMODE_RS_BIN) \
+	--file calc.bin $(TAPE_CALC_BIN) \
+	--file ed.bin $(TAPE_ED_BIN) \
+	--file beep.bin $(TAPE_BEEP_BIN) \
+	--file morse.bin $(TAPE_MORSE_BIN) \
+	--file net-chat.bin $(TAPE_NET_CHAT_BIN) \
+	--file ip-chat.bin $(TAPE_IP_CHAT_BIN) \
+	--file telnet.bin $(TAPE_TELNET_BIN) \
+	--file bridge.bin $(TAPE_BRIDGE_BIN) \
+	--file router.bin $(TAPE_ROUTER_BIN) \
+	--file net-dhcp.bin $(TAPE_NET_DHCP_BIN) \
+	--file router.cfg tapes/router/router.cfg
 EXTRA_FOSFS_FILES ?=
 
 .PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp clean
@@ -73,7 +73,7 @@ help:
 	@echo "  make test-stack-guard - build a test-only guard-fault image and verify its emergency double-fault stack"
 	@echo "  make test-page-protection - verify kernel text rejects a supervisor write under CR0.WP"
 	@echo "  make test-nic-watchdog - inject a test-only NIC fault latch and verify foreground DMA-state recovery"
-	@echo "  make test-start - verify an optional FOSFS START boot-command script"
+	@echo "  make test-start - verify an optional FOSFS start boot-command script"
 	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
 	@echo "  make test-dual-e1000 - build the image, then verify two e1000 interfaces and selection"
 	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
@@ -166,7 +166,7 @@ test-nic-watchdog:
 	@python3 tools/qemu_smoke.py --image $(IMAGE) --nic rtl8139 --nic-watchdog-test; status=$$?; $(MAKE) image; exit $$status
 
 test-start:
-	$(MAKE) EXTRA_FOSFS_FILES="--file START tools/start-test.txt" image
+	$(MAKE) EXTRA_FOSFS_FILES="--file start tools/start-test.txt" image
 	@python3 tools/qemu_smoke.py --image $(IMAGE) --start-script-test; status=$$?; $(MAKE) image; exit $$status
 
 test-e1000: image

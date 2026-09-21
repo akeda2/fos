@@ -394,7 +394,7 @@ fn valid_name(name: &[u8]) -> bool {
         && name.len() <= MAX_NAME_LENGTH
         && name
             .iter()
-            .all(|byte| matches!(*byte, b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+            .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
 }
 
 fn print_name(name: &[u8]) {

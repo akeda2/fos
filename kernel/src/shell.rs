@@ -13,7 +13,7 @@ use crate::{print, println};
 
 const LINE_CAPACITY: usize = 256;
 const TAPE_ARGUMENT_FILE_CAPACITY: usize = 4096;
-const START_FILE_NAME: &[u8] = b"START";
+const START_FILE_NAME: &[u8] = b"start";
 const START_FILE_CAPACITY: usize = 4096;
 const TERM_NET_IDLE_TICKS: u64 = 60 * 100;
 
@@ -65,7 +65,7 @@ pub fn run(info: &BootInfo) -> ! {
     }
 }
 
-/// Runs the optional FOSFS `START` script before the automatic remote-terminal
+/// Runs the optional FOSFS `start` script before the automatic remote-terminal
 /// wait. Lines use the ordinary shell dispatcher, so a deployment script has
 /// exactly the same command syntax and error reporting as an interactive one.
 fn run_start_file(info: &BootInfo) {
@@ -73,13 +73,13 @@ fn run_start_file(info: &BootInfo) {
         Ok(Some(length)) => length,
         Ok(None) => return,
         Err(error) => {
-            println!("START: could not inspect the file: {error:?}");
+            println!("start: could not inspect the file: {error:?}");
             return;
         }
     };
     if length > START_FILE_CAPACITY as u64 {
         println!(
-            "START: {length}-byte file is too large; the boot script limit is {START_FILE_CAPACITY} bytes."
+            "start: {length}-byte file is too large; the boot script limit is {START_FILE_CAPACITY} bytes."
         );
         return;
     }
@@ -89,11 +89,11 @@ fn run_start_file(info: &BootInfo) {
         Ok(Some(length)) => length as usize,
         Ok(None) => return,
         Err(error) => {
-            println!("START: could not read the file: {error:?}");
+            println!("start: could not read the file: {error:?}");
             return;
         }
     };
-    println!("START: running {length}-byte boot script.");
+    println!("start: running {length}-byte boot script.");
 
     let mut line_start = 0;
     let mut line_number = 1;
@@ -107,7 +107,7 @@ fn run_start_file(info: &BootInfo) {
         }
         let line = trim_start(line);
         if !line.is_empty() && line[0] != b'#' {
-            print!("START line {line_number}: ");
+            print!("start line {line_number}: ");
             console::write_bytes(line);
             println!();
             execute(line, info);
@@ -250,7 +250,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "Tape: tape status (what's loaded), tape run [ARGS...] or tape run @FILE (execute it)"
                 );
                 println!(
-                    "      tape run router @CONFIG_FILE (read router arguments from an uppercase FOSFS file)"
+                    "      tape run router @CONFIG_FILE (read router arguments from a lowercase FOSFS file)"
                 );
                 println!(
                     "      tape load disk NAME (load a flat multi-sector FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
@@ -2646,7 +2646,7 @@ fn tape_fs_name(pointer: u32, length: u32) -> Option<&'static [u8]> {
         || length > 16
         || !unsafe { core::slice::from_raw_parts(pointer as *const u8, length) }
             .iter()
-            .all(|byte| matches!(*byte, b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+            .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
     {
         return None;
     }
@@ -3381,7 +3381,7 @@ fn write_command(info: &BootInfo, arguments: &[u8]) {
     match fosfs::write(info, name, text) {
         Ok(fosfs::WriteOutcome::Written) => println!("File written."),
         Ok(fosfs::WriteOutcome::InvalidName) => {
-            println!("Invalid name: use up to 16 uppercase letters, digits, '.', '_', or '-'.");
+            println!("Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'.");
         }
         Ok(fosfs::WriteOutcome::DirectoryFull) => {
             println!("Directory full: all 64 FOSFS entries are in use.")

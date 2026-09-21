@@ -26,7 +26,7 @@ import send_tape  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "build" / "fos.img"
 TAPE = ROOT / "build" / "tapes" / "router.bin"
-CONFIG = ROOT / "tapes" / "router" / "ROUTER.CFG"
+CONFIG = ROOT / "tapes" / "router" / "router.cfg"
 SEGMENT_A = ("230.42.42.80", 4280)
 SEGMENT_B = ("230.42.42.81", 4281)
 CHAT_ETHERTYPE = bytes((0x88, 0xB6))
@@ -1017,7 +1017,7 @@ def test_uplink_boot_timeout_is_not_fatal() -> None:
         read_until(b"Waiting for a remote terminal client to connect", 30)
         send_monitor_command(monitor_path, "sendkey f12")
         read_until(b"fos> ", 10)
-        type_line(b"tape load disk ROUTER.BIN\r")
+        type_line(b"tape load disk router.bin\r")
         read_until(b"'tape run' to execute it.", 10)
         start = len(output)
         type_line(b"tape run dhcp 1 dhcp 2 3 10.0.20.1/24\r")

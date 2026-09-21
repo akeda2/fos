@@ -4,7 +4,7 @@
 Produces `build/fos.img`: a 16 MiB raw disk with a protective MBR, primary
 and backup GPT, a raw boot payload partition (stage two loader + kernel), and
 a separate FOSFS data partition. The data partition is preformatted with
-`README.TXT` and every compiled tape passed through `--file NAME PATH`. See
+`readme.txt` and every compiled tape passed through `--file NAME PATH`. See
 the top-level README's "Disk image layout" section for the full diagram.
 """
 
@@ -37,7 +37,7 @@ GPT_BACKUP_ENTRIES_LBA = IMAGE_SECTORS - 33
 def valid_name(name: bytes) -> bool:
     return (
         0 < len(name) <= 16
-        and all(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for byte in name)
+        and all(byte in b"abcdefghijklmnopqrstuvwxyz0123456789._-" for byte in name)
     )
 
 
@@ -190,8 +190,8 @@ def main() -> None:
     image[PAYLOAD_START_LBA * SECTOR_SIZE:(PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE] = stage2
     kernel_start = (PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE
     image[kernel_start:kernel_start + len(kernel)] = kernel
-    readme = b"Welcome to FOSFS.\nUse ls, cat README.TXT, and write NAME TEXT.\n"
-    files = [("README.TXT", readme)]
+    readme = b"Welcome to FOSFS.\nUse ls, cat readme.txt, and write NAME TEXT.\n"
+    files = [("readme.txt", readme)]
     files.extend((name, Path(path).read_bytes()) for name, path in args.file)
     if len({name for name, _ in files}) != len(files):
         raise SystemExit("FOSFS file names must be unique")

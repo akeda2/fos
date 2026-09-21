@@ -120,16 +120,16 @@ def main():
         read_until(b"Remote terminal connected", 10)
         read_until(b"fos> ", 5)
 
-        command("write TEST.TXT alpha beta\n")
+        command("write test.txt alpha beta\n")
         if b"File written." not in output:
-            raise SystemExit(f"failed to seed TEST.TXT:\n{output.decode('utf-8', 'replace')}")
+            raise SystemExit(f"failed to seed test.txt:\n{output.decode('utf-8', 'replace')}")
 
-        command("tape load disk ED.BIN")
-        if b"Loaded " not in output or b" byte(s) from 'ED.BIN'" not in output:
-            raise SystemExit(f"failed to load ED.BIN:\n{output.decode('utf-8', 'replace')}")
+        command("tape load disk ed.bin")
+        if b"Loaded " not in output or b" byte(s) from 'ed.bin'" not in output:
+            raise SystemExit(f"failed to load ed.bin:\n{output.decode('utf-8', 'replace')}")
 
         del output[:]
-        mcast.send(frame(TERM_TAG_DATA, b"tape run ed TEST.TXT\n"))
+        mcast.send(frame(TERM_TAG_DATA, b"tape run ed test.txt\n"))
         read_until(b"ed> ", 15)
 
         command("p\n", marker=b"ed> ")
@@ -145,15 +145,15 @@ def main():
         command(".\n", marker=b"ed> ")
         command("d1\n", marker=b"ed> ")
         command("x\n", marker=b"fos> ")
-        if b"written TEST.TXT" not in output:
+        if b"written test.txt" not in output:
             raise SystemExit(f"editor did not report a successful save:\n{output.decode('utf-8', 'replace')}")
 
-        command("cat TEST.TXT\n")
+        command("cat test.txt\n")
         text = output.decode("utf-8", "replace")
         if "replaced\nlast\n" not in text:
             raise SystemExit(f"saved file has unexpected contents:\n{text}")
 
-        command("tape run ed ROUTER.CFG", marker=b"ed> ")
+        command("tape run ed router.cfg", marker=b"ed> ")
         del output[:]
         mcast.send(frame(TERM_TAG_DATA, b"m\n"))
         read_until(b"-- more --", 10)
@@ -162,7 +162,7 @@ def main():
         mcast.send(frame(TERM_TAG_DATA, b"q"))
         read_until(b"ed> ", 10)
         command("q\n")
-        print("PASS: editor loaded, edited, saved, and persisted TEST.TXT.")
+        print("PASS: editor loaded, edited, saved, and persisted test.txt.")
     finally:
         mcast.close()
         qemu.terminate()
