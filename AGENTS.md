@@ -2430,6 +2430,29 @@ loaded tape without a "not found"/usage error, while `tape run
 @disk9/expr.txt` (no such disk attached) cleanly prints the usage message
 instead of crashing or guessing.
 
+**Follow-up: `tape load diskN NAME`.** The tape itself -- not just its
+config/startup-argument file -- can now come from a secondary disk too.
+`tape_load_command`'s `kind` word (`net`/`disk`) already only ever meant
+"where does the tape come from"; `disk` was really always `disk1` spelled
+the historical way. Rather than inventing a `diskN/NAME`-style prefix
+(the `/` convention above exists specifically because `tape run`'s file
+reference is embedded inside one `@`-prefixed token; `tape load`'s `kind`
+and `NAME` are already separate words, so no such trick is needed here),
+any other `diskN` word is now recognized as a `kind` in its own right via
+the existing `strip_disk_selector`, dispatching to the same
+`tape_load_disk`, now itself taking a `disk::Device` parameter instead of
+hardcoding `disk::Device::Boot`. `disk` alone is kept as a permanent
+alias for `disk1`, not deprecated, since it predates secondary disks
+entirely and every existing script/test already uses it. An unattached or
+malformed `diskN` (or any other unrecognized `kind` word) falls through to
+a `"Usage: tape load [net|disk NAME|diskN NAME]"` message rather than
+being misread as a file name. Verified by extending `make
+test-second-disk`: `tape load disk2 config.txt` loads a plain-text file
+from disk2 as a "legacy flat" tape (never `tape run` on it, since it is
+not real code -- only proving the disk2 read path itself works), and
+`tape load disk9 config.txt` (no such disk) prints the usage message and
+leaves the previously loaded tape's state untouched.
+
 ### A tape that visits 64-bit long mode and comes back
 
 `tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written

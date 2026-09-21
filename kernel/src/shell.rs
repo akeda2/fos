@@ -263,7 +263,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "      tape run router @CONFIG_FILE (read router arguments from a lowercase FOSFS file; @diskN/CONFIG_FILE reads from an attached secondary disk)"
                 );
                 println!(
-                    "      tape load disk NAME (load a flat multi-sector FOSFS file), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
+                    "      tape load disk NAME (load a flat multi-sector FOSFS file; diskN NAME loads from an attached secondary disk), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
                 );
                 println!(
                     "      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')"
@@ -2963,17 +2963,29 @@ fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
                 println!("Usage: tape load disk NAME");
                 return;
             }
-            tape_load_disk(info, name);
+            tape_load_disk(info, disk::Device::Boot, name);
         }
-        _ => println!("Usage: tape load [net|disk NAME]"),
+        // `disk` above is really just `disk1` spelled the historical way;
+        // any other `diskN` word (`disk2`, `disk3`, ...) names an attached
+        // secondary disk exactly like every other disk command's selector.
+        _ if strip_disk_selector(kind).is_some() => {
+            let device = strip_disk_selector(kind).unwrap();
+            let (name, extra) = take_word(remainder);
+            if name.is_empty() || !extra.is_empty() {
+                println!("Usage: tape load diskN NAME");
+                return;
+            }
+            tape_load_disk(info, device, name);
+        }
+        _ => println!("Usage: tape load [net|disk NAME|diskN NAME]"),
     }
 }
 
 /// Loads a complete flat FOSFS file straight into the fixed tape buffer.
 /// Multi-sector files are read one BIOS sector at a time, and the file must
 /// fit the same fixed region used by `tape load net`.
-fn tape_load_disk(info: &BootInfo, name: &[u8]) {
-    match fosfs::file_length(info, disk::Device::Boot, name) {
+fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
+    match fosfs::file_length(info, device, name) {
         Ok(Some(length)) if length == 0 => {
             println!(
                 "'{}' is empty; nothing to load.",
@@ -2990,7 +3002,7 @@ fn tape_load_disk(info: &BootInfo, name: &[u8]) {
             };
             let destination =
                 unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
-            match fosfs::read(info, disk::Device::Boot, name, destination) {
+            match fosfs::read(info, device, name, destination) {
                 Ok(Some(_)) => {
                     if !install_tape(address, length as u32) {
                         return;

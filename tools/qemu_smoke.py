@@ -300,6 +300,15 @@ def main() -> None:
                         b"tape run @disk2/expr.txt\r",
                         b"tape run @disk9/expr.txt\r",
                         b"rm disk2 expr.txt\r",
+                        # `tape load diskN NAME` loads straight from an
+                        # attached secondary disk too, joining the existing
+                        # `disk`/`net` kinds; `disk` alone still always
+                        # means disk1. config.txt is plain text, not a real
+                        # tape, so this only loads it (proving the disk2
+                        # read path works) and never `tape run`s it.
+                        b"tape load disk2 config.txt\r",
+                        b"tape status\r",
+                        b"tape load disk9 config.txt\r",
                         # copy: exercise both directions, an explicit rename,
                         # and confirm a loaded tape's state is invalidated
                         # since copy_file reuses the same shared scratch
@@ -415,6 +424,8 @@ def main() -> None:
                         b"Copied 16 byte(s) from disk1 'note2.txt' to disk2 'note2-copy.txt'.",
                         b"hello-from-disk1",
                         b"Usage: tape run [ARGS...] or tape run router @CONFIG_FILE (or @diskN/CONFIG_FILE)",
+                        b"Loaded 16 byte(s) from 'config.txt' at 0x100000. 'tape run' to execute it.",
+                        b"Usage: tape load [net|disk NAME|diskN NAME]",
                     )
                 )
             for marker in expected:

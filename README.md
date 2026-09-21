@@ -181,7 +181,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (or F4/F6/F7/F8/F10) (local keyboard) or by typing `/quit` (works over serial too). |
 | `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
-| `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer. |
+| `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer, from the boot disk; `tape load diskN NAME` loads from an attached secondary disk instead. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): checks that the declared image fits the fixed 4 MiB tape region, validates each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
 | `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run @NAME` (or `tape run router @NAME`) reads startup arguments from the FOSFS file `NAME` on the boot disk instead, and `@diskN/NAME` reads it from an attached secondary disk (e.g. `tape run router @disk2/router.cfg`); `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
@@ -313,6 +313,12 @@ secondary disk explicitly (`tape run router @disk2/router.cfg`), while a
 bare `@NAME` still means the boot disk, matching every command's existing
 default. A literal `/` is unambiguous as the disk/name separator here,
 since FOSFS names can never legally contain one.
+
+The tape itself can be loaded from a secondary disk too: `tape load diskN
+NAME` (e.g. `tape load disk2 router.bin`) joins `tape load disk`/`tape load
+net` as a third `kind` word rather than needing a separate syntax --
+`disk` alone is really just `disk1` spelled the historical way, so any
+other `diskN` selector reads that same way.
 
 `term` repurposes COM1 as a raw link to a remote machine by default, matching
 real hardware where most physical machines expose only one serial port.
