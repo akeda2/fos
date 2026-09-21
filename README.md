@@ -321,13 +321,17 @@ device stack rather than simple port I/O (see "Current boundaries").
 ### Ethernet (`nic`)
 
 `nic` initializes every supported PCI network card it can bring up:
-the Realtek RTL8139, selected 3Com 3C905/B/C variants, or Intel e1000
-(82540EM). The first initialized interface is active by default; `nic list`
-shows all interfaces and `nic use N` selects one for shell commands and the
-legacy single-interface tape callbacks. New tapes can enumerate and use
-several interfaces concurrently through the appended per-interface callbacks.
+the Realtek RTL8139, selected 3Com 3C905/B/C variants, Intel e1000
+(82540EM), or an NE2000-compatible clone (`kernel/src/ne2000.rs`, vendor/
+device `0x10ec`/`0x8029`, the Realtek RTL8029AS -- the chip almost every
+plain "NetWare"-branded PCI NE2000 clone actually uses). The first
+initialized interface is active by default; `nic list` shows all
+interfaces and `nic use N` selects one for shell commands and the legacy
+single-interface tape callbacks. New tapes can enumerate and use several
+interfaces concurrently through the appended per-interface callbacks.
 The RTL8139 is what QEMU emulates by default; QEMU also provides an 82540EM
-model through `-device e1000`. The 3C905 backend is included for
+model through `-device e1000` and an NE2000-compatible model through
+`-device ne2k_pci`. The 3C905 backend is included for
 physical-machine testing, but the installed QEMU build has no 3C905 model.
 Each backend is found by exact vendor/device IDs through the PCI
 configuration-space walk in `kernel/src/pci.rs`, rather than by class code,
@@ -342,8 +346,12 @@ pointers, but they must still be real, physically contiguous memory the card can
 so the first use of `nic` allocates the physically contiguous DMA state required
 by every initialized backend through `pmem::allocate_contiguous` and never
 frees it. The RTL8139 uses a receive ring and transmit buffers; the
-3C905 uses receive/transmit descriptor lists; and e1000 uses legacy
-receive/transmit descriptor rings.
+3C905 uses receive/transmit descriptor lists; e1000 uses legacy
+receive/transmit descriptor rings; and the NE2000-compatible driver uses
+the card's own remote-DMA port-I/O interface (no descriptor rings or
+BAR-mapped buffers at all) to move frames into and out of its 16 KiB
+onboard packet memory, addressed as an 8-entry, 256-byte-per-page ring
+buffer.
 
 Each backend uses a legacy PCI IRQ when firmware assigns a safe PIC line:
 the tiny handler acknowledges the device, counts the notification, and marks
@@ -361,7 +369,8 @@ recovery/failure counters. `nic watchdog` performs the same check explicitly.
 The watchdog never treats an idle link as failure: it resets and rebuilds
 existing DMA/ring state only after a driver observed a documented adapter
 fault (RTL8139 overflow or transmit timeout, e1000 receive overrun or
-transmit timeout, or 3C905 Host Error/download timeout). It restores the
+transmit timeout, 3C905 Host Error/download timeout, or an NE2000-
+compatible ring overflow/desync or transmit timeout). It restores the
 prior interrupt mask and promiscuous setting without allocating or freeing
 DMA memory, while ordinary polling remains the fallback if recovery fails.
 `nic send` transmits one broadcast frame tagged with an IEEE-reserved
@@ -770,7 +779,8 @@ it with `make tape-net-chat` (producing `build/tapes/net-chat.bin`) and run
 machine running the ordinary shell command. Use
 `python3 tapes/test_net_chat_e2e.py --nic e1000` (or
 `make test-e1000-net`) to run the same two-guest integration test through
-QEMU's Intel 82540EM backend.
+QEMU's Intel 82540EM backend, or `--nic ne2000` (or `make test-ne2000-net`)
+for QEMU's `ne2k_pci` NE2000-compatible model.
 
 #### Test tape: `tapes/bridge/`
 
@@ -1330,8 +1340,9 @@ This milestone uses one CPU, no heap allocation, userspace, or scheduler. It
 has supervisor-only identity paging, but no per-process address spaces or
 memory isolation. It has FOSFS (a deliberately tiny flat multi-sector filesystem, not a
 general-purpose one), interrupt-driven IRQ0/IRQ1 handling for the timer and
-keyboard, and three polling-mode PCI network card drivers (RTL8139,
-selected 3C905 variants, and Intel e1000, with raw frame access in the kernel and
+keyboard, and four polling-mode PCI network card drivers (RTL8139,
+selected 3C905 variants, Intel e1000, and an NE2000-compatible clone, with
+raw frame access in the kernel and
 ARP/IPv4/ICMP/UDP/TCP/DHCP protocol code in `tapes/tape-net/`; no NIC
 interrupt handling), but no other hardware IRQ
 drivers (no native disk or USB interrupt handling). The optional NIC-ROM boot

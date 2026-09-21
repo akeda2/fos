@@ -60,6 +60,10 @@ def main(nic_model: str) -> None:
     if not TAPE.exists():
         raise SystemExit(f"{TAPE} does not exist; run `make tape-net-chat` first.")
 
+    # QEMU calls its NE2000-compatible PCI model `ne2k_pci`, not `ne2000`;
+    # every other `--nic` choice already matches QEMU's own `-device` name.
+    qemu_device = "ne2k_pci" if nic_model == "ne2000" else nic_model
+
     selector = selectors.DefaultSelector()
     guests: dict[str, subprocess.Popen[bytes]] = {}
     output: dict[str, bytearray] = {}
@@ -87,7 +91,7 @@ def main(nic_model: str) -> None:
                 "-netdev",
                 f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}",
                 "-device",
-                f"{nic_model},netdev=net0,mac={GUEST_MACS[name]}",
+                f"{qemu_device},netdev=net0,mac={GUEST_MACS[name]}",
                 "-display",
                 "none",
             ],
@@ -163,7 +167,7 @@ def main(nic_model: str) -> None:
         read_until("shell", b"Remote terminal connected", 10)
         read_until("shell", b"fos> ", 5)
         shell_nic = run_command(b"\xff" * 6, CHAT_CLIENT_MAC, b"nic", "shell")
-        nic_name = b"Intel e1000" if nic_model == "e1000" else b"RTL8139"
+        nic_name = b"Intel e1000" if nic_model == "e1000" else b"NE2000-compatible" if nic_model == "ne2000" else b"RTL8139"
         shell_match = re.search(
             rb"(" + re.escape(nic_name) + rb") found: MAC ([0-9a-fA-F:]{17})",
             shell_nic,
@@ -269,5 +273,5 @@ def main(nic_model: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--nic", choices=("rtl8139", "e1000"), default="rtl8139")
+    parser.add_argument("--nic", choices=("rtl8139", "e1000", "ne2000"), default="rtl8139")
     main(parser.parse_args().nic)

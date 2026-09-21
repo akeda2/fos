@@ -147,7 +147,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--nic",
-        choices=("none", "e1000", "dual-e1000", "rtl8139"),
+        choices=("none", "e1000", "dual-e1000", "rtl8139", "ne2000"),
         default="none",
         help="attach the selected QEMU NIC model (default: none)",
     )
@@ -191,7 +191,11 @@ def main() -> None:
                 ]
             )
         else:
-            qemu_command.extend(["-netdev", "user,id=net0", "-device", f"{args.nic},netdev=net0"])
+            # Most `--nic` choices match QEMU's own `-device` name exactly;
+            # "ne2000" is the one exception, since QEMU calls its NE2000-
+            # compatible PCI model `ne2k_pci` rather than `ne2000`.
+            qemu_device = "ne2k_pci" if args.nic == "ne2000" else args.nic
+            qemu_command.extend(["-netdev", "user,id=net0", "-device", f"{qemu_device},netdev=net0"])
 
         process = subprocess.Popen(
             qemu_command,
@@ -254,7 +258,7 @@ def main() -> None:
                 b"bootinfo\r",
                 b"memmap\r",
             ]
-            if args.nic in ("e1000", "dual-e1000"):
+            if args.nic in ("e1000", "dual-e1000", "ne2000"):
                 commands.extend((b"nic\r", b"nic send\r"))
             else:
                 commands.append(b"nic\r")
@@ -313,6 +317,13 @@ def main() -> None:
                         b"NIC 1: Intel e1000 MAC 52:54:00:12:34:56",
                         b"NIC 2: Intel e1000 MAC 52:54:00:12:34:57",
                         b"Active interface is now 2 Intel e1000.",
+                        b"Sent a 41-byte broadcast test frame",
+                    )
+                )
+            elif args.nic == "ne2000":
+                expected.extend(
+                    (
+                        b"NE2000-compatible found:",
                         b"Sent a 41-byte broadcast test frame",
                     )
                 )

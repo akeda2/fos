@@ -43,7 +43,7 @@ TAPE_IMAGE_ARGS := \
 	--file ROUTER.CFG tapes/router/ROUTER.CFG
 EXTRA_FOSFS_FILES ?=
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-e1000 test-dual-e1000 test-e1000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -77,6 +77,8 @@ help:
 	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
 	@echo "  make test-dual-e1000 - build the image, then verify two e1000 interfaces and selection"
 	@echo "  make test-e1000-net - build net-chat, then run its two-guest e1000 network test"
+	@echo "  make test-ne2000 - build the image, then run the QEMU NE2000-compatible (ne2k_pci) smoke test"
+	@echo "  make test-ne2000-net - build net-chat, then run its two-guest NE2000-compatible network test"
 	@echo "  make test-vga-modes - verify 80x25, 80x50, and experimental 132x25 under QEMU"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
 	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-ed + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router + tape-net-dhcp)"
@@ -175,6 +177,12 @@ test-dual-e1000: image
 
 test-e1000-net: tape-net-chat image
 	python3 tapes/test_net_chat_e2e.py --nic e1000
+
+test-ne2000: image
+	python3 tools/qemu_smoke.py --image $(IMAGE) --nic ne2000
+
+test-ne2000-net: tape-net-chat image
+	python3 tapes/test_net_chat_e2e.py --nic ne2000
 
 test-vga-modes: image
 	python3 tools/test_vga_modes.py --image $(IMAGE)

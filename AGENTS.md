@@ -358,8 +358,51 @@ contiguous block, which single-frame-at-a-time `pmem::allocate` cannot
 guarantee, hence `pmem::allocate_contiguous` (this project's first caller to
 need more than one contiguous frame). There is no protocol above raw
 Ethernet frames (no ARP, no IPv4, no sockets) and no support for additional
-NIC families beyond the RTL8139, selected 3C905 PCI backends, and Intel
-e1000; 3C509 ISA and e1000e/82574 support are separate future drivers.
+NIC families beyond the RTL8139, selected 3C905 PCI backends, Intel e1000,
+and NE2000-compatible clones (see "NE2000-compatible PCI clones" below);
+3C509 ISA and e1000e/82574 support are separate future drivers.
+
+### NE2000-compatible PCI clones
+
+`kernel/src/ne2000.rs` is a fourth NIC backend, found by exact vendor/
+device ID (`0x10ec`/`0x8029`, the Realtek RTL8029AS) the same way every
+other backend is -- this is the chip almost every generic, unbranded PCI
+card marked only "NetWare" (no vendor name at all) actually contains, since
+NE2000 compatibility became a decades-long de facto standard for the
+cheapest possible Ethernet silicon. Unlike every other driver here, it uses
+no host-RAM DMA at all: the card has its own 16 KiB of onboard packet
+memory, addressed through a remote-DMA port-I/O interface (`REG_RSAR0/1`
+set a start address, `REG_RBCR0/1` set a byte count, then the data itself
+is streamed through one port, `REG_DATA`) rather than a descriptor ring or
+BAR-mapped buffer the driver reads/writes directly. `pmem::
+allocate_contiguous` is therefore never called by this driver, unlike
+every other one here.
+
+The receive side is organized as an 8-entry ring of 256-byte pages
+(`RX_START_PAGE`..`RX_STOP_PAGE`) inside that onboard memory, each entry
+prefixed by a 4-byte header the card itself writes: byte 0 is the receive
+status (matching `RSR`), byte 1 is the next entry's page number, and bytes
+2-3 are a little-endian byte count. Getting that byte order backwards --
+which this driver's first working version did -- silently drops every real
+frame in a way that looks identical to "the card never received anything
+at all": the swapped bytes make the ring's own sanity check compare a
+receive-status value (typically `0x01`) against a page-number range
+(`0x46..0x80`), which always fails, and this driver's next poll then
+observes `recovery_pending` and performs a full software reset that erases
+the very evidence needed to diagnose it (`CURR`/`BNRY`/`ISR` all revert to
+their pristine post-reset values). This was only conclusively diagnosed by
+using GDB against QEMU's own `hw/net/ne2000.c` (breakpoints on symbol-
+relative offsets like `*ne2000_receive+0x331`, since raw absolute
+addresses do not get PIE/ASLR-relocated by GDB, and since `ne2000_
+ioport_read`/`ne2000_buffer_full` are `static` functions with no exported
+symbol to break on at all) to prove QEMU's device model does fully write
+and advance the ring before the fos driver ever sees it -- conclusively
+isolating the bug to this driver's own header-field order, not QEMU, the
+network layer, or the ring's page-range constants. `-object filter-
+dump,id=ID,netdev=NETDEV_ID,file=PATH.pcap` (a QEMU netdev capture filter)
+is a lower-effort complementary tool worth reaching for first in any
+future "does the frame even arrive" investigation, since it proves or
+disproves network-layer delivery without needing a debugger at all.
 
 `Rtl8139::set_promiscuous` is a read-modify-write toggle of `RCR`'s `AAP`
 ("accept all packets") bit, layered on top of the accept-filter bits `init`
@@ -1984,7 +2027,7 @@ section above.
   native USB, further hardware IRQ drivers beyond the timer/keyboard, robust
   fault recovery, any protocol above raw Ethernet frames (no ARP, no IPv4,
   no sockets), and support for NIC families beyond the current RTL8139,
-  selected 3C905, and Intel e1000 backends.
+  selected 3C905, Intel e1000, and NE2000-compatible backends.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.

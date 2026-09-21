@@ -17,6 +17,7 @@ mod fosfs;
 mod gdt;
 mod interrupts;
 mod keyboard;
+mod ne2000;
 mod nic;
 mod paging;
 mod pci;
