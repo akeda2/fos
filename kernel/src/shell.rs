@@ -326,53 +326,44 @@ fn execute(command: &[u8], info: &BootInfo) {
     match name {
         b"" => {}
         b"help" => {
+            // Every line here is kept to at most 79 columns (VGA text mode
+            // wraps a line at exactly 80, and a println! whose text lands
+            // precisely on column 80 wraps *and* leaves a spurious blank
+            // row for its own trailing '\n' -- so 79 is the true safe
+            // maximum, not 80) and the whole listing to 11 lines, so it
+            // always fits a standard 80x25 screen without wrapping or
+            // scrolling any of itself out of view. Prefer trimming detail
+            // (full syntax remains in README.md/AGENTS.md) over adding a
+            // line or letting one run long if this command ever grows.
             if no_arguments(arguments) {
                 println!(
                     "System: help clear vga about bootinfo memmap memory cpuinfo hexdump halt reset"
                 );
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!(
-                    "Disk: diskinfo [diskN], readsector [diskN] LBA, format [diskN], ls [diskN],"
-                );
-                println!("      cat [diskN] NAME, write [diskN] NAME TEXT, rm [diskN] NAME");
-                println!(
-                    "      copy SRC_DISK NAME DST_DISK [NEW_NAME] (copy a file between disks, e.g. copy disk1 router.cfg disk2)"
+                    "Disk: diskinfo/readsector/format/ls/cat/write/rm [diskN], copy SRC NAME DST"
                 );
                 println!(
-                    "      (disk1 is the boot disk and can be omitted; disk2, disk3, ... name additional attached disks)"
+                    "      (disk1 is the boot disk, N may be omitted; disk2, disk3... are extras)"
                 );
                 println!(
-                    "      start (rerun the optional boot-time 'start' script now, e.g. after F12-ing out of a tape it launched)"
+                    "      start (rerun the boot 'start' script, e.g. after F12 from a tape)"
                 );
                 println!(
-                    "Serial: serial (list ports), term [PORT [BAUD]] (raw terminal; F12 (or F4/F6/F7/F8/F10) to exit)"
+                    "Serial: serial (list ports), term [PORT [BAUD]] (raw terminal, F12 to exit)"
                 );
                 println!(
-                    "Ethernet: nic (active status), nic list, nic use N, nic send (broadcast test frame),"
+                    "Ethernet: nic [list|use N|send|sniff|discover|peers], chat [PEER_MAC|N]"
+                );
+                println!("Tape: tape status | tape run [ARGS...|@FILE|@diskN/FILE]");
+                println!(
+                    "      tape load disk[N] NAME | tape load net | tape send NAME PEER"
                 );
                 println!(
-                    "          nic sniff (promiscuous capture; F12 (or F4/F6/F7/F8/F10) to stop)"
+                    "Remote: term net (wait for a remote shell over Ethernet; same as at boot)"
                 );
                 println!(
-                    "          nic discover (probe for other listening fos machines), nic peers (list them)"
-                );
-                println!(
-                    "          chat [PEER_MAC|PEER_NUMBER] (broadcast or unicast text chat; F12 (or F4/F6/F7/F8/F10) or /quit to leave)"
-                );
-                println!(
-                    "Tape: tape status (what's loaded), tape run [ARGS...] or tape run @FILE (execute it)"
-                );
-                println!(
-                    "      tape run router @CONFIG_FILE (read router arguments from a lowercase FOSFS file; @diskN/CONFIG_FILE reads from an attached secondary disk)"
-                );
-                println!(
-                    "      tape load disk NAME (load a flat multi-sector FOSFS file; diskN NAME loads from an attached secondary disk), tape load net (wait for one over Ethernet; F12 (or F4/F6/F7/F8/F10) to give up)"
-                );
-                println!(
-                    "      tape send NAME PEER_MAC|PEER_NUMBER (transmit a FOSFS file to a peer's 'tape load net')"
-                );
-                println!(
-                    "Remote: term net (wait for a remote terminal client over Ethernet, same as the automatic wait at every boot; F12 (or F4/F6/F7/F8/F10) to give up)"
+                    "Note: F12 (or F4/F6/F7/F8/F10) gives up on any blocking wait (sniff/term/chat)."
                 );
             }
         }

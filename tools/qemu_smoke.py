@@ -39,7 +39,7 @@ EXPECTED_COMMON = (
     b"PS/2 keyboard initialized.",
     b"System: help clear vga about bootinfo memmap memory cpuinfo hexdump halt reset",
     b"Interrupts: ticks uptime irqstat pmem palloc pfree",
-    b"Ethernet: nic (active status), nic list, nic use N, nic send (broadcast test frame),",
+    b"Ethernet: nic [list|use N|send|sniff|discover|peers], chat [PEER_MAC|N]",
     b"fos is a small educational 32-bit x86 operating system.",
     b"This command does not accept arguments.",
     b"Unknown command. Type 'help' for commands.",
