@@ -383,8 +383,11 @@ impl Rtl8139 {
         }
     }
 
-    /// Recovers a latched Rx buffer/FIFO overflow (`ISR_RXOVW`/`ISR_FOVW`)
-    /// or bounded transmit failure with a full software reset
+    /// Recovers a latched Rx buffer/FIFO overflow (`ISR_RXOVW`/`ISR_FOVW`),
+    /// a bounded transmit failure, or a ring entry whose length field is
+    /// itself nonsensical (see `receive`'s own doc comment: confirmed on
+    /// real hardware after a physical link down/up cycle) with a full
+    /// software reset
     /// (`soft_reset`) followed by reprogramming every register a fresh
     /// card needs (`program_registers`, reusing the same DMA buffer
     /// rather than allocating a new one) and resetting the ring's read
@@ -533,8 +536,25 @@ impl Rtl8139 {
         if frame_len < 4 || u32::from(frame_len) > RX_BUF_LEN {
             // The length field itself is nonsensical, meaning the ring is
             // desynchronized (or we are reading garbage): there is no sane
-            // byte count to advance past, so resynchronizing here is out
-            // of scope for this teaching driver. Just report nothing.
+            // byte count to advance past, so resynchronizing in place is
+            // out of scope for this teaching driver. Left alone, this was
+            // a real, confirmed wedge: real hardware showed a physical
+            // cable unplug/replug cycle can leave stray bytes at the
+            // current read offset (link-training noise landing in the DMA
+            // buffer), and with nothing here ever advancing rx_offset/CAPR
+            // or flagging a fault, this exact same bogus header was read
+            // again on every later poll forever -- the NIC looked
+            // permanently dead (no more frames ever received) until a full
+            // reboot, exactly as an RTL8139-backed uplink failing to
+            // rejoin a router's fail-over rotation after its link came
+            // back. Flagging this for the existing full-reset recovery
+            // path (already proven correct for overflow/TX-failure, see
+            // `recover`'s own doc comment) is the same fix in spirit as
+            // that overflow work: the ring's read pointer cannot be
+            // trusted to resynchronize itself, so the whole card is reset
+            // and reprogrammed from scratch instead, which is disruptive
+            // but the only state this driver knows for certain is sane.
+            self.recovery_pending.store(true, Ordering::Release);
             return None;
         }
 
