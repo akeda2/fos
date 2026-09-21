@@ -1836,12 +1836,33 @@ future contributor doesn't have to rediscover them from scratch:
   before returning `None`, so the very next `receive()` call's
   unconditional `recover()` performs the existing, already real-hardware-
   proven full soft-reset (not a lighter register fixup, per the overflow
-  entry above) instead of leaving the ring wedged. **Not yet confirmed on
-  real hardware** -- pending the user repeating the exact cable-pull/
-  reconnect fail-over/fail-back sequence against the rebuilt image; if
-  reconnecting still does not recover the affected NIC, the RTL8139 PHY's
-  own link-status register may need an explicit check/reset on top of
-  this fix.
+  entry above) instead of leaving the ring wedged. **This fix alone did
+  not resolve the reported symptom** -- see the next entry for the
+  confirmed root cause.
+- **RTL8139 never resumes receiving after a link recovery on its own --
+  confirmed root cause of the router fail-back bug** -- real-hardware
+  testing isolated the entry above's fix as insufficient by process of
+  elimination: an all-3C905 router setup fails over *and back* correctly
+  on a cable pull/replug, but swapping NIC 1 for an RTL8139 reproduces
+  the original symptom exactly (fails over fine, never rejoins after the
+  cable is reconnected, needs a reboot). The ring-wedge fix above only
+  helps once garbled bytes actually land in the ring; with the link
+  genuinely down, nothing lands there at all, so that fix's trigger
+  condition never fires during a real cable pull. This driver never read
+  the card's Media Status Register (`MSR`, offset `0x58`) at all, so it
+  had no way to even notice a link recovery happened, let alone react to
+  one. Linux's historic `8139too.c` documents the identical requirement:
+  it polls this exact same `LinkB` bit and performs a full re-init
+  (`rtl8139_hw_start`) on a down-to-up transition, rather than trusting
+  the card to resume Rx by itself -- this chip does not. Fixed by adding
+  `check_link_recovery`, called from both `receive` (the router/tape
+  polling path) and `watchdog` (the shell's own path): it reads `MSR`
+  each call, and on a down-to-up transition flags `recovery_pending` the
+  same way the ring-wedge and overflow/TX-failure conditions already do,
+  so the very next call performs the existing, already real-hardware-
+  proven full soft-reset. **Pending final real-hardware confirmation**
+  from the user repeating the cable-pull/reconnect sequence against the
+  rebuilt image with an RTL8139 as the affected uplink.
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
