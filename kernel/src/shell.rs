@@ -850,6 +850,10 @@ fn print_run(command: &[u8], info: &BootInfo) {
     );
     if owns_relay {
         console::enable_print_relay();
+        unsafe {
+            ACTIVE_PRINT_BASE = Some(base);
+            ACTIVE_PRINT_FAULT = None;
+        }
     }
     let was_active = unsafe { PRINTER_SESSION_ACTIVE };
     unsafe {
@@ -863,9 +867,12 @@ fn print_run(command: &[u8], info: &BootInfo) {
         return;
     }
     let printer = parallel::Printer::new(base);
-    let mut last_fault = None;
-    let finished = drain_print_relay(&printer, &mut last_fault);
+    let finished = drain_print_relay(&printer, active_print_fault_mut());
     console::disable_print_relay();
+    unsafe {
+        ACTIVE_PRINT_BASE = None;
+        ACTIVE_PRINT_FAULT = None;
+    }
     if finished {
         println!("Done.");
     } else {
@@ -1273,6 +1280,71 @@ static mut ACTIVE_TERM_SOURCE: Option<[u8; 6]> = None;
 /// Never set by `print_command`'s one-shot `print run CMD`, which is the
 /// intended way to print `help` deliberately, once.
 static mut PRINTER_SESSION_ACTIVE: bool = false;
+
+/// The active printer's base I/O port and its ongoing fault state, for
+/// as long as a print job that might run a nested tape (`print_run`'s
+/// own-relay path, or `term_printer`'s Enter-committed `execute` call)
+/// is in progress -- mirroring `ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE`'s
+/// exact reasoning: `relay_pending_print_output`, called deep inside a
+/// nested tape's own `should_abort`/`read_key` polling with no argument
+/// of its own to thread a printer through, needs some way to find one.
+/// `ACTIVE_PRINT_FAULT` doubles as the single, continuous "last reported
+/// fault" for the whole session (shared with any direct
+/// `write_to_printer_with_retry`/`drain_print_relay` calls the owning
+/// caller makes itself), so a fault surfaced live during a running tape
+/// is not re-announced the moment that tape returns and normal draining
+/// resumes.
+static mut ACTIVE_PRINT_BASE: Option<u16> = None;
+static mut ACTIVE_PRINT_FAULT: Option<parallel::PrinterFault> = None;
+
+/// Drains whatever the print-relay queue currently holds to the printer
+/// named by `ACTIVE_PRINT_BASE`, without blocking on a fault -- called
+/// from inside a nested tape's own non-blocking `should_abort`/`read_key`
+/// polling (see `combined_tape_should_abort`/`poll_remote_tape_input`) so
+/// a long-running interactive tape's printed output (e.g. `tapes/calc`'s
+/// REPL) reaches paper as it is produced, instead of arriving in one
+/// burst only once the tape returns -- mirroring
+/// `relay_pending_tape_output`'s equivalent fix for `term_net`. Unlike
+/// `drain_print_relay` (used once a command finishes, where blocking
+/// retry-until-clear is exactly the desired "pause, don't abort"
+/// behavior), a fault here just stops this poll's draining early --
+/// blocking here would freeze the *tape* itself, not just its printer
+/// output -- leaving the remainder queued for the next poll.
+fn relay_pending_print_output() {
+    if !console::print_relay_active() {
+        return;
+    }
+    let Some(base) = (unsafe { ACTIVE_PRINT_BASE }) else {
+        return;
+    };
+    let printer = parallel::Printer::new(base);
+    let mut chunk = [0u8; 64];
+    let queued = console::peek_print_relay(&mut chunk);
+    if queued == 0 {
+        return;
+    }
+    let mut written = 0;
+    while written < queued {
+        match printer.write_byte(chunk[written]) {
+            Ok(()) => {
+                let had_fault = matches!(unsafe { ACTIVE_PRINT_FAULT }, Some(_));
+                if had_fault {
+                    unsafe { ACTIVE_PRINT_FAULT = None };
+                    println!("Printer recovered; resuming.");
+                }
+                written += 1;
+            }
+            Err(fault) => {
+                if unsafe { ACTIVE_PRINT_FAULT != Some(fault) } {
+                    println!("{}", printer_fault_message(fault));
+                    unsafe { ACTIVE_PRINT_FAULT = Some(fault) };
+                }
+                break;
+            }
+        }
+    }
+    console::discard_print_relay(written);
+}
 
 /// Set by `poll_remote_tape_abort` when it consumes the connected peer's
 /// own `TERM_TAG_BYE` while `term_net`'s own session loop was paused
@@ -1742,6 +1814,18 @@ fn print_bytes_live(
     true
 }
 
+/// A fresh, transient `&mut` into `ACTIVE_PRINT_FAULT`, obtained via a raw
+/// pointer rather than held across a call: `term_printer` fetches one
+/// immediately before each individual `print_bytes_live`/
+/// `drain_print_relay` call rather than caching one long-lived reference
+/// across its whole session, specifically so a nested tape's own
+/// `relay_pending_print_output` (touching the same static through its own
+/// short-lived unsafe reads/writes while `execute()` is running) is never
+/// aliased against a reference `term_printer` itself is still holding.
+fn active_print_fault_mut() -> &'static mut Option<parallel::PrinterFault> {
+    unsafe { &mut *core::ptr::addr_of_mut!(ACTIVE_PRINT_FAULT) }
+}
+
 /// `term printer`/`term LPTn`: an exclusive terminal mode that runs the
 /// live shell against a physical printer instead of a screen or a network
 /// peer, echoing true teletype-style: every typed character (including
@@ -1781,13 +1865,20 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
     println!("F4/F6/F7/F8/F10) to leave.");
 
     let printer = parallel::Printer::new(base);
-    let mut last_fault: Option<parallel::PrinterFault> = None;
+    unsafe {
+        ACTIVE_PRINT_BASE = Some(base);
+        ACTIVE_PRINT_FAULT = None;
+    }
     let mut buffer = [0u8; LINE_CAPACITY];
     let mut length = 0usize;
     prompt();
-    if !print_bytes_live(&printer, b"fos> ", &mut last_fault) {
+    if !print_bytes_live(&printer, b"fos> ", active_print_fault_mut()) {
         println!();
         println!("Leaving printer terminal mode; back at the fos shell.");
+        unsafe {
+            ACTIVE_PRINT_BASE = None;
+            ACTIVE_PRINT_FAULT = None;
+        }
         return;
     }
     loop {
@@ -1795,6 +1886,10 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
             Some(keyboard::KeyEvent::Escape) => {
                 println!();
                 println!("Leaving printer terminal mode; back at the fos shell.");
+                unsafe {
+                    ACTIVE_PRINT_BASE = None;
+                    ACTIVE_PRINT_FAULT = None;
+                }
                 return;
             }
             Some(keyboard::KeyEvent::KillLine) => {
@@ -1802,16 +1897,24 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
                     length -= 1;
                     console::erase_last_character();
                 }
-                if !print_bytes_live(&printer, b"\r\nfos> ", &mut last_fault) {
+                if !print_bytes_live(&printer, b"\r\nfos> ", active_print_fault_mut()) {
                     println!();
                     println!("Leaving printer terminal mode; back at the fos shell.");
+                    unsafe {
+                        ACTIVE_PRINT_BASE = None;
+                        ACTIVE_PRINT_FAULT = None;
+                    }
                     return;
                 }
             }
             Some(keyboard::KeyEvent::Char(b'\r' | b'\n')) => {
                 println!();
-                if !print_bytes_live(&printer, b"\r\n", &mut last_fault) {
+                if !print_bytes_live(&printer, b"\r\n", active_print_fault_mut()) {
                     println!("Leaving printer terminal mode; back at the fos shell.");
+                    unsafe {
+                        ACTIVE_PRINT_BASE = None;
+                        ACTIVE_PRINT_FAULT = None;
+                    }
                     return;
                 }
                 unsafe {
@@ -1819,7 +1922,7 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
                 }
                 console::enable_print_relay();
                 execute(&buffer[..length], info);
-                let finished = drain_print_relay(&printer, &mut last_fault);
+                let finished = drain_print_relay(&printer, active_print_fault_mut());
                 console::disable_print_relay();
                 unsafe {
                     PRINTER_SESSION_ACTIVE = false;
@@ -1827,12 +1930,20 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
                 length = 0;
                 if !finished {
                     println!("Leaving printer terminal mode; back at the fos shell.");
+                    unsafe {
+                        ACTIVE_PRINT_BASE = None;
+                        ACTIVE_PRINT_FAULT = None;
+                    }
                     return;
                 }
                 prompt();
-                if !print_bytes_live(&printer, b"fos> ", &mut last_fault) {
+                if !print_bytes_live(&printer, b"fos> ", active_print_fault_mut()) {
                     println!();
                     println!("Leaving printer terminal mode; back at the fos shell.");
+                    unsafe {
+                        ACTIVE_PRINT_BASE = None;
+                        ACTIVE_PRINT_FAULT = None;
+                    }
                     return;
                 }
             }
@@ -1844,9 +1955,13 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
                 buffer[length] = byte;
                 length += 1;
                 print!("{}", byte as char);
-                if !print_bytes_live(&printer, &[byte], &mut last_fault) {
+                if !print_bytes_live(&printer, &[byte], active_print_fault_mut()) {
                     println!();
                     println!("Leaving printer terminal mode; back at the fos shell.");
+                    unsafe {
+                        ACTIVE_PRINT_BASE = None;
+                        ACTIVE_PRINT_FAULT = None;
+                    }
                     return;
                 }
             }
@@ -2744,6 +2859,7 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 /// nothing enforces this convention -- so this remains just that: a
 /// convention, not a sandboxed boundary.)
 extern "C" fn combined_tape_should_abort() -> u32 {
+    relay_pending_print_output();
     (keyboard::tape_should_abort() != 0 || poll_remote_tape_abort()) as u32
 }
 
@@ -2950,6 +3066,7 @@ const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 /// printed (e.g. a prompt) stuck in the relay queue for longer than
 /// necessary.
 fn poll_remote_tape_input() -> Option<u32> {
+    relay_pending_print_output();
     if unsafe { TAPE_REMOTE_ABORT_PENDING } {
         unsafe { TAPE_REMOTE_ABORT_PENDING = false };
         return Some(TAPE_EVENT_ABORT);

@@ -1726,27 +1726,33 @@ printer is the intended real-hardware validation target; until that
 happens, treat the fault classification (which bit means what) as
 unconfirmed.
 
-**Real-hardware follow-up: a false "Printer out of paper" report.** The
-user's KX-P1083 reported "out of paper" with paper loaded, the printer
-online, and its own out-of-paper indicator light off. A first theory --
-that the printer's DIP-switch-selected emulation mode (IBM Proprinter vs.
-Standard/Epson-compatible) changes how the Paper-Out *status line* is
-driven -- turned out to be the wrong lead on reflection: emulation mode
-governs how a printer's firmware interprets incoming escape codes for
-text formatting, not how its hardware drives the Centronics status
-signals back to the host, which come directly from a physical paper
-sensor. Switching emulation mode was therefore unlikely to have ever
-fixed this, and the report persisted after ruling it out.
+**Real-hardware follow-up: a false "Printer out of paper" report, resolved
+by a BIOS parallel-port fix.** The user's KX-P1083 reported "out of
+paper" with paper loaded, the printer online, and its own out-of-paper
+indicator light off. A first theory -- that the printer's DIP-switch-
+selected emulation mode (IBM Proprinter vs. Standard/Epson-compatible)
+changes how the Paper-Out *status line* is driven -- turned out to be the
+wrong lead on reflection and has been retracted: emulation mode governs
+how a printer's firmware interprets incoming escape codes for text
+formatting, not how its hardware drives the Centronics status signals
+back to the host, which come directly from a physical paper sensor.
 
 Rather than guess again, `printer` was extended to print each detected
 port's raw status byte plus a per-bit decode
 (`status=0xNN: busy=B paper_out=P select=S error=E`), so the exact
-real-hardware register value can be read directly instead of inferred.
-This is the concrete next diagnostic step: with paper loaded and the
-printer online, a `paper_out=1` reading with the light off would mean
-this driver's `STATUS_PAPER_OUT` bit (or its polarity) is simply wrong for
-this hardware/chipset and should be corrected directly from that
-evidence, rather than continuing to guess at indirect explanations.
+real-hardware register value could be read directly instead of inferred.
+Real hardware showed `status=0xff` -- literally every bit set, including
+ones that should reflect a genuine "ready, selected, no error" printer.
+That is the signature of a status register not backed by real hardware at
+all, not a single mis-wired polarity bit in this driver. The actual cause
+was a dead CMOS battery that had disabled/reset the BIOS parallel port
+configuration entirely; setting it back to base `0x378` + Normal (SPP)
+mode (not ECP, which repurposes the register layout this driver assumes,
+and not Bi-Directional, which is unneeded since this driver never reads
+the Data port back) resolved it -- confirmed by the printer working
+correctly afterward. This driver's status-bit polarity constants remain
+otherwise unconfirmed against real hardware, since this particular bug
+turned out to be a hardware/BIOS configuration issue, not a software one.
 
 `shell.rs` adds `term printer`/`term LPT1`..`LPT4` (an exclusive terminal
 mode, mirroring `term COM1`/`term_net`'s existing "one active mode at a
@@ -1857,6 +1863,69 @@ against the user's Panasonic KX-P1083 is the outstanding confirmation
 step before this feature's fault/polarity assumptions can be considered
 settled, consistent with this project's established pattern for
 hardware-facing features (see "Real hardware notes" below).
+
+**Real-hardware follow-up: dot-matrix printers cannot show true
+character-by-character teletype output.** With the port fixed, live
+per-character echo (above) was confirmed to genuinely reach the printer
+one byte at a time -- but a moving-print-head dot-matrix printer (the
+user's KX-P1083) buffers a full line internally and only physically inks
+it once flushed by CR/LF/FF or an internal buffer limit, so typed
+characters visibly appear only once the line commits, not as each key is
+struck. This is inherent to the printer's own mechanism, not something
+any universal SPP/Centronics command can change; true live
+character-at-a-time inking needs a genuine teletype/TTY or a
+daisy-wheel/typewriter-style printer instead. No code change was made or
+is possible here.
+
+**Real-hardware follow-up: an interactive tape's own output was batched
+until it exited.** `print run tape run` against an interactive,
+`read_key`/`should_abort`-polling tape (e.g. `tapes/calc`'s REPL) showed
+no printed output at all until the tape returned, even though its
+banner/prompts/results were clearly being produced (and echoed to VGA)
+throughout. This is the exact same class of bug already fixed for
+`term_net` (see "Live output relaying for `read_key`/`should_abort`-based
+tapes over `term net`" above): the print-relay queue was only ever
+drained by the outer `print_run`/`term_printer` code, which is paused for
+as long as a nested tape's own blocking call is running -- there was no
+equivalent of `relay_pending_tape_output` for the *print* relay queue.
+
+The fix follows that fix's pattern exactly. Two new statics,
+`ACTIVE_PRINT_BASE`/`ACTIVE_PRINT_FAULT` (`shell.rs`), carry the active
+printer's port and ongoing fault state across the call-stack boundary
+into a nested tape's own polling callbacks, the same reason
+`ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE` exist for `term_net`. A new
+`relay_pending_print_output()` drains whatever the print-relay queue
+currently holds to that printer -- but, unlike `drain_print_relay` (used
+once a command finishes, where blocking retry-until-clear is the correct
+"pause, don't abort" behavior), it never blocks on a fault: it writes
+what it can, stops the instant a fault is hit (reporting it once via
+`ACTIVE_PRINT_FAULT`, exactly like every other fault-reporting path in
+this feature), and leaves the remainder queued for the next poll --
+blocking here would freeze the *tape* itself, not just its printer
+output. It is called from both `combined_tape_should_abort` and
+`poll_remote_tape_input`, so any `read_key`- or `should_abort`-polling
+tape gets live print-relaying automatically, with no per-tape opt-in,
+mirroring exactly how the `term_net` equivalent fix works.
+
+`term_printer` and `print_run` (when `owns_relay` is true, i.e. not
+itself nested inside an already-active `term_printer` session) now set
+`ACTIVE_PRINT_BASE`/reset `ACTIVE_PRINT_FAULT` before running a command
+and clear both afterward, and use a fresh, transient `&mut` into
+`ACTIVE_PRINT_FAULT` (via a new `active_print_fault_mut()` helper using
+`core::ptr::addr_of_mut!`, never a reference held across the nested
+`execute()` call itself) for their own direct
+`print_bytes_live`/`drain_print_relay` calls, rather than each keeping a
+separate local `last_fault` variable -- so a fault surfaced live during a
+running tape is not redundantly re-announced the moment the tape returns
+and ordinary post-`execute()` draining resumes. `print_file` (which never
+calls `execute()`, so no nested tape can run during its own work) keeps
+its own local `last_fault` unchanged, since no cross-call-stack sharing
+is needed there. Verified with a QEMU-monitor-driven manual test
+(`-parallel file:PATH`, `sendkey`-based, in the same spirit as the
+nesting-aware fix's own manual test above): `print run tape run` against
+`tapes/calc` showed its `= 42` result already present in the captured
+print file before F12 ended the tape, confirming the fix (reverting it
+reproduces the batched-until-exit symptom exactly).
 
 
 ## Real hardware notes
