@@ -357,8 +357,9 @@ fn execute(command: &[u8], info: &BootInfo) {
                 );
                 println!("Tape: tape status | tape run [ARGS...|@FILE|@diskN/FILE]");
                 println!(
-                    "      tape load disk[N] NAME | tape load net | tape send NAME PEER"
+                    "      tape load disk[N] NAME | tape load net | tape save [diskN] NAME"
                 );
+                println!("      tape send NAME PEER");
                 println!(
                     "Remote: term net (wait for a remote shell over Ethernet; same as at boot)"
                 );
@@ -1937,13 +1938,13 @@ fn install_tape(address: u32, length: u32) -> bool {
     true
 }
 
-/// `tape [status|run [ARGS...]|load ...|send ...]`. `status`/no arguments
-/// report what (if anything) is loaded; `run` executes it, optionally
-/// passing everything after `run` to the tape verbatim as its own
-/// `args_ptr`/`args_len` (see `tape_run`'s doc comment) -- a tape that
+/// `tape [status|run [ARGS...]|load ...|save ...|send ...]`. `status`/no
+/// arguments report what (if anything) is loaded; `run` executes it,
+/// optionally passing everything after `run` to the tape verbatim as its
+/// own `args_ptr`/`args_len` (see `tape_run`'s doc comment) -- a tape that
 /// ignores those two arguments (every existing tape in this repository
-/// does) is unaffected either way; `load`/`send` are documented on their
-/// own handlers below.
+/// does) is unaffected either way; `load`/`save`/`send` are documented on
+/// their own handlers below.
 #[inline(never)]
 fn tape_command(info: &BootInfo, arguments: &[u8]) {
     let (subcommand, remainder) = take_word(arguments);
@@ -1951,9 +1952,10 @@ fn tape_command(info: &BootInfo, arguments: &[u8]) {
         b"" | b"status" if remainder.is_empty() => tape_status(),
         b"run" => tape_run(info, remainder),
         b"load" => tape_load_command(info, remainder),
+        b"save" => tape_save_command(info, remainder),
         b"send" => tape_send_command(info, remainder),
         _ => println!(
-            "Usage: tape [status|run [ARGS...]|load disk NAME|load net|send NAME PEER_MAC|PEER_NUMBER]"
+            "Usage: tape [status|run [ARGS...]|load disk NAME|load net|save [diskN] NAME|send NAME PEER_MAC|PEER_NUMBER]"
         ),
     }
 }
@@ -3151,6 +3153,52 @@ fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
             }
         }
         Ok(None) => println!("File not found."),
+        Err(error) => println!("FOSFS disk error: {error:?}"),
+    }
+}
+
+/// Writes the currently loaded tape's exact bytes out to FOSFS, the
+/// missing counterpart to `tape load disk`/`tape load net`: a tape
+/// received over the network (`tape load net`) previously had no way to
+/// persist it, so a fresh `tape load net` transfer -- with its real,
+/// per-run pacing/reliability cost -- was the only way to run it again
+/// after a reboot. Works identically regardless of how the tape got into
+/// the fixed buffer in the first place (disk load, network load, or even
+/// right after an earlier `tape save`), since it just re-reads whatever
+/// `tape_get()` currently reports, exactly the same "whatever's resident"
+/// contract `tape run` itself already relies on. Unlike `copy_file`, this
+/// never reuses the buffer as scratch space for something else, so the
+/// loaded tape's own bookkeeping (`TAPE`/`TAPE_ENTRY`/`TAPE_HANDLE`) is
+/// left completely untouched -- `tape run` still works immediately
+/// afterward with no need to `tape load` it back first.
+#[inline(never)]
+fn tape_save_command(info: &BootInfo, arguments: &[u8]) {
+    let (device, arguments) = parse_disk_and_one_argument(arguments);
+    let (name, remainder) = take_word(arguments);
+    if name.is_empty() || !remainder.is_empty() {
+        println!("Usage: tape save [diskN] NAME");
+        return;
+    }
+    let Some((address, length)) = tape_get() else {
+        println!("No tape loaded; use 'tape load disk NAME' or 'tape load net' first.");
+        return;
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, length as usize) };
+    match fosfs::write(info, device, name, bytes) {
+        Ok(fosfs::WriteOutcome::Written) => println!(
+            "Saved {length} byte(s) of the loaded tape to disk{} '{}'.",
+            device_number(device),
+            core::str::from_utf8(name).unwrap_or("?")
+        ),
+        Ok(fosfs::WriteOutcome::InvalidName) => {
+            println!("Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'.");
+        }
+        Ok(fosfs::WriteOutcome::DirectoryFull) => {
+            println!("Directory full: all 64 FOSFS entries are in use.")
+        }
+        Ok(fosfs::WriteOutcome::DataFull) => {
+            println!("Data region full: no free sector remains in the FOSFS partition.")
+        }
         Err(error) => println!("FOSFS disk error: {error:?}"),
     }
 }

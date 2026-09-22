@@ -304,10 +304,20 @@ previously loaded tape's now-stale bookkeeping afterward, since that buffer
 no longer holds that tape's bytes.
 
 Tape commands: `tape status`, `tape load disk NAME`, `tape load net`,
-`tape send NAME PEER_MAC|PEER_NUMBER`, and `tape run [ARGS...]`. Tapes are
-validated ELF32 `ET_EXEC` images or legacy raw-flat binaries loaded into the
-fixed 4 MiB image region; `tape run` supplies the append-only kernel callback
-ABI described below.
+`tape save [diskN] NAME`, `tape send NAME PEER_MAC|PEER_NUMBER`, and
+`tape run [ARGS...]`. Tapes are validated ELF32 `ET_EXEC` images or legacy
+raw-flat binaries loaded into the fixed 4 MiB image region; `tape run`
+supplies the append-only kernel callback ABI described below. `tape save`
+writes whatever tape is currently resident (loaded via `disk`, `net`, or
+even a prior `save`) back out to FOSFS unchanged -- the missing
+counterpart to `tape load net`, which previously had no way to persist a
+tape received over the network; a fresh transfer was the only way to run
+it again after a reboot. It reads directly out of the loaded tape's own
+buffer (`tape_get()`) via an ordinary `fosfs::write`, so -- unlike
+`copy`, which stages through the same buffer as scratch space and always
+invalidates whatever was loaded there -- the currently loaded tape's own
+bookkeeping is left untouched and `tape run` keeps working immediately
+afterward.
 
 Serial commands: `serial` (lists COM1..COM4 via the BIOS Data Area, plus any
 PCI-discovered serial controllers as `PCI0`, `PCI1`, ...) and

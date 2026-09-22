@@ -185,6 +185,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer, from the boot disk; `tape load diskN NAME` loads from an attached secondary disk instead. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): checks that the declared image fits the fixed 4 MiB tape region, validates each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
+| `tape save [diskN] NAME` | Writes the currently loaded tape's exact bytes out to FOSFS under `NAME` (boot disk by default, or an attached secondary disk with `diskN`) -- the missing counterpart to `tape load net`: a tape received over the network previously had no way to persist it, so a fresh network transfer (with its per-run pacing/reliability cost) was the only way to run it again after a reboot. Works on whatever tape is currently resident regardless of how it was loaded, and leaves that loaded tape's own state untouched, so `tape run` still works immediately afterward. |
 | `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run @NAME` (or `tape run router @NAME`) reads startup arguments from the FOSFS file `NAME` on the boot disk instead, and `@diskN/NAME` reads it from an attached secondary disk (e.g. `tape run router @disk2/router.cfg`); `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
@@ -607,6 +608,16 @@ Each successful load receives a monotonically increasing tape handle shown by
 handle, format, entry point, and image length as explicit metadata avoids
 another ABI change when resident images and `tape select`/tape-to-tape loading
 are added.
+
+`tape save [diskN] NAME` closes the gap this left: a tape loaded via
+`tape load net` previously had no way to persist it, so re-running it after
+a reboot meant repeating the entire network transfer. `tape save` writes
+whatever is currently resident -- however it got there, network or disk --
+back out to FOSFS via an ordinary `fosfs::write`, so `tape load disk NAME`
+can reload it directly next time. It reuses the loaded tape's own buffer in
+place rather than the shared `copy`/`tape load` scratch region, so unlike
+`copy`, it never invalidates the currently loaded tape's own state --
+`tape run` still works immediately afterward with nothing to reload.
 
 The other end of a network load can be another fos machine's `tape send
 NAME PEER_MAC|PEER_NUMBER` (reads a FOSFS file and streams it out, reusing

@@ -79,6 +79,19 @@ EXPECTED_COMMON = (
     b"primes found:   78498",
     b"largest prime:  999983",
     b"Tape returned; back at the fos shell.",
+    # `tape save`'s round trip (see its command block's own comment): the
+    # small hello-rs tape's baseline run, its save to a new name, and its
+    # second run from the reloaded, saved-and-renamed copy, proving the
+    # saved bytes are byte-for-byte identical to the original tape.
+    b"fos Rust test tape: Sieve of Eratosthenes up to 1000",
+    b"primes found:  168",
+    b"largest prime: 997",
+    b"Saved 5052 byte(s) of the loaded tape to disk1 'hello-copy.bin'.",
+    b"File removed.",
+    b"Loaded 5052 byte(s) from 'hello-copy.bin' at 0x100000. 'tape run' to execute it.",
+    b"fos Rust test tape: Sieve of Eratosthenes up to 1000",
+    b"primes found:  168",
+    b"largest prime: 997",
     b"Welcome to FOSFS.",
     b"File written.",
     b"File removed.",
@@ -289,6 +302,26 @@ def main() -> None:
                 b"tape load disk ip-chat.bin\r",
                 b"tape load disk primes.bin\r",
                 b"tape run\r",
+                # `tape save` is the missing counterpart to `tape load
+                # disk`/`tape load net`: previously, a tape received over
+                # the network had no way to persist it, so a fresh network
+                # transfer was the only way to run it again. It works on
+                # whatever tape is currently resident regardless of how it
+                # got loaded, so this exercises the whole round trip with
+                # the small hello-rs tape (disk-loaded here, but the save
+                # path itself is source-agnostic) instead of the much
+                # larger primes tape: load, run (baseline output), save
+                # under a new name, remove the original entirely, reload
+                # from the saved copy, and run again, confirming identical
+                # output proves the saved bytes are byte-for-byte the same
+                # tape.
+                b"tape load disk hello-rs.bin\r",
+                b"tape run\r",
+                b"tape save hello-copy.bin\r",
+                b"rm hello-rs.bin\r",
+                b"tape load disk hello-copy.bin\r",
+                b"tape run\r",
+                b"rm hello-copy.bin\r",
                 *(
                     [
                         # disk2 must be formatted before it can hold
