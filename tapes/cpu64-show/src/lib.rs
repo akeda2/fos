@@ -32,6 +32,13 @@ const TEST_RENDERED: u32 = 1 << 10;
 const VGA_BUFFER: *mut u16 = 0xb8000 as *mut u16;
 const WIDTH: usize = 80;
 const HEIGHT: usize = 25;
+
+/// Capacity of the shim's `report_summary` buffer (see
+/// `tapes/longmode64_shim.S`'s file header comment); must match that
+/// buffer's reserved size exactly, since this struct is overlaid directly
+/// on the shim's own report memory.
+const SUMMARY_CAPACITY: usize = 128;
+
 #[repr(C)]
 struct Report {
     magic: u32,
@@ -39,6 +46,7 @@ struct Report {
     mode: u32,
     support: u32,
     tests: u32,
+    summary: [u8; SUMMARY_CAPACITY],
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -107,9 +115,9 @@ fn parse_args(args: &[u8]) -> (Mode, u32) {
     } else {
         Mode::Auto
     };
-    let (frames_word, _) = take_word(rest);
-    let frames = parse_u32_ascii(frames_word).unwrap_or(240).clamp(1, 1500);
-    (mode, frames)
+    let (seconds_word, _) = take_word(rest);
+    let seconds = parse_u32_ascii(seconds_word).unwrap_or(10).clamp(1, 120);
+    (mode, seconds)
 }
 
 fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
@@ -146,6 +154,69 @@ fn read_cr4() -> u64 {
         asm!("mov {}, cr4", lateout(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
+}
+
+/// Reads the timestamp counter. Used only to enforce a real minimum
+/// wall-clock runtime for the demo loop below: the shim cannot safely call
+/// back into 32-bit `ticks`/`should_abort` callbacks once inside this
+/// 64-bit excursion (see `tapes/longmode64_shim.S`'s file header comment),
+/// so `rdtsc`, calibrated against a `cycles_per_second` figure the shim
+/// measured just before the mode switch, is this body's only clock.
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        asm!("rdtsc", lateout("eax") lo, lateout("edx") hi, options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
+/// A tiny fixed-capacity ASCII text builder, used to assemble the
+/// human-readable capability/usage summary line written into the shim's
+/// `report_summary` buffer. No heap exists on this target, so this is a
+/// plain `[u8; N]` buffer plus a length, exactly the same shape the
+/// kernel's own line editor and this project's other no-alloc text
+/// helpers already use.
+struct TextBuf<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> TextBuf<N> {
+    fn new() -> Self {
+        TextBuf { bytes: [0; N], len: 0 }
+    }
+
+    fn push_bytes(&mut self, extra: &[u8]) {
+        for &byte in extra {
+            // Leave the final byte permanently zero, so this buffer is
+            // always NUL-terminated for the shim's `print_string` even if
+            // truncated here.
+            if self.len + 1 >= N {
+                return;
+            }
+            self.bytes[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    fn push_decimal(&mut self, mut value: u32) {
+        let mut scratch = [0u8; 10];
+        let mut length = 0usize;
+        if value == 0 {
+            scratch[0] = b'0';
+            length = 1;
+        } else {
+            while value != 0 {
+                scratch[length] = b'0' + (value % 10) as u8;
+                value /= 10;
+                length += 1;
+            }
+        }
+        for index in (0..length).rev() {
+            self.push_bytes(&[scratch[index]]);
+        }
+    }
 }
 
 fn detect_support(arena_len: usize) -> u32 {
@@ -382,7 +453,56 @@ fn seed_words(words: &mut [u32]) {
     }
 }
 
-fn run_demo(words: &mut [u32], requested_mode: Mode, frames: u32, support: u32) -> u32 {
+/// A generous backstop against a broken/implausible calibration (see
+/// `tape64_body`'s sanity check on `cycles_per_second`) -- normal runs stop
+/// long before this via the elapsed-cycles check instead.
+const MAX_FRAMES: u32 = 2_000_000;
+
+fn run_demo(words: &mut [u32], requested_mode: Mode, target_cycles: u64, support: u32) -> (u32, u32) {
+    let can_use_sse2 = (support & SUPPORT_SSE2_USABLE) != 0;
+    let use_sse2 = matches!(requested_mode, Mode::Sse2) || (requested_mode == Mode::Auto && can_use_sse2);
+    let work_words = core::cmp::min(words.len(), 262_144);
+    seed_words(words);
+    let mut tests = TEST_RAN;
+    if use_sse2 && can_use_sse2 {
+        tests |= TEST_USED_SSE2;
+    }
+    let start_tsc = rdtsc();
+    let mut frame = 0_u32;
+    loop {
+        let start = ((frame as usize) * work_words) % words.len();
+        let end = core::cmp::min(start + work_words, words.len());
+        if use_sse2 && can_use_sse2 {
+            unsafe { update_sse2(&mut words[start..end], frame) };
+            if end - start < work_words {
+                let rest = work_words - (end - start);
+                unsafe { update_sse2(&mut words[..rest], frame.wrapping_add(1)) };
+            }
+        } else {
+            update_scalar(&mut words[start..end], frame);
+            if end - start < work_words {
+                let rest = work_words - (end - start);
+                update_scalar(&mut words[..rest], frame.wrapping_add(1));
+            }
+        }
+        render_frame(&words[start..end], frame, requested_mode, words.len() * 4, use_sse2 && can_use_sse2);
+        frame += 1;
+        if frame >= MAX_FRAMES {
+            break;
+        }
+        if rdtsc().wrapping_sub(start_tsc) >= target_cycles {
+            break;
+        }
+    }
+    (tests | TEST_RENDERED, frame)
+}
+
+/// Same rendering/update logic as `run_demo`, but bounded purely by frame
+/// count rather than elapsed `rdtsc` cycles -- used only when
+/// `cycles_per_second` calibration looks untrustworthy (see
+/// `tape64_body`'s `MIN_TRUSTED_CYCLES_PER_SECOND` check), so the demo
+/// still terminates promptly instead of trusting a bogus time target.
+fn run_demo_fixed_frames(words: &mut [u32], requested_mode: Mode, frames: u32, support: u32) -> (u32, u32) {
     let can_use_sse2 = (support & SUPPORT_SSE2_USABLE) != 0;
     let use_sse2 = matches!(requested_mode, Mode::Sse2) || (requested_mode == Mode::Auto && can_use_sse2);
     let work_words = core::cmp::min(words.len(), 262_144);
@@ -409,8 +529,18 @@ fn run_demo(words: &mut [u32], requested_mode: Mode, frames: u32, support: u32) 
         }
         render_frame(&words[start..end], frame, requested_mode, words.len() * 4, use_sse2 && can_use_sse2);
     }
-    tests | TEST_RENDERED
+    (tests | TEST_RENDERED, frames)
 }
+
+/// Below this, a `cycles_per_second` figure is treated as an unreliable
+/// calibration (no real x86-64 CPU runs this slow) rather than trusted --
+/// see the file header comment in `tapes/longmode64_shim.S`.
+const MIN_TRUSTED_CYCLES_PER_SECOND: u64 = 100_000_000;
+
+/// A safe fallback frame count used only when `cycles_per_second`
+/// calibration looks untrustworthy (see above): a fixed-length run instead
+/// of a real time-based one, so the demo still terminates promptly.
+const FALLBACK_FRAMES: u32 = 240;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tape64_body(
@@ -419,6 +549,7 @@ pub extern "C" fn tape64_body(
     report_ptr: u64,
     arena_ptr: u64,
     arena_len: u64,
+    cycles_per_second: u64,
 ) {
     if report_ptr == 0 {
         return;
@@ -429,14 +560,24 @@ pub extern "C" fn tape64_body(
         let length = core::cmp::min(args_len as usize, 256);
         unsafe { core::slice::from_raw_parts(args_ptr as *const u8, length) }
     };
-    let (requested_mode, frames) = parse_args(args);
+    let (requested_mode, seconds) = parse_args(args);
     let support = detect_support(arena_len as usize);
-    let tests = if arena_ptr != 0 && arena_len >= 4096 {
+    let calibration_trusted = cycles_per_second >= MIN_TRUSTED_CYCLES_PER_SECOND;
+    let target_cycles = cycles_per_second.saturating_mul(u64::from(seconds));
+    let (tests, frame_count) = if arena_ptr != 0 && arena_len >= 4096 {
         let words = unsafe { core::slice::from_raw_parts_mut(arena_ptr as *mut u32, (arena_len as usize) / 4) };
-        run_demo(words, requested_mode, frames, support)
+        if calibration_trusted {
+            run_demo(words, requested_mode, target_cycles, support)
+        } else {
+            run_demo_fixed_frames(words, requested_mode, FALLBACK_FRAMES, support)
+        }
     } else {
         let mut fallback = [0u32; 1024];
-        run_demo(&mut fallback, requested_mode, frames, support)
+        if calibration_trusted {
+            run_demo(&mut fallback, requested_mode, target_cycles, support)
+        } else {
+            run_demo_fixed_frames(&mut fallback, requested_mode, FALLBACK_FRAMES, support)
+        }
     };
 
     let report = unsafe { &mut *(report_ptr as *mut Report) };
@@ -445,6 +586,39 @@ pub extern "C" fn tape64_body(
     report.mode = requested_mode.code();
     report.support = support;
     report.tests = tests;
+
+    let mut summary: TextBuf<SUMMARY_CAPACITY> = TextBuf::new();
+    summary.push_bytes(b"cpu64-show: cpu supports");
+    if (support & SUPPORT_X87) != 0 {
+        summary.push_bytes(b" x87");
+    }
+    if (support & SUPPORT_MMX) != 0 {
+        summary.push_bytes(b" mmx");
+    }
+    if (support & SUPPORT_SSE) != 0 {
+        summary.push_bytes(b" sse");
+    }
+    if (support & SUPPORT_SSE2) != 0 {
+        summary.push_bytes(b" sse2");
+    }
+    summary.push_bytes(b"; used");
+    if (tests & TEST_USED_SSE2) != 0 {
+        summary.push_bytes(b" sse2");
+    } else {
+        summary.push_bytes(b" scalar");
+    }
+    summary.push_bytes(b" across ");
+    summary.push_decimal(frame_count);
+    summary.push_bytes(b" frames");
+    if calibration_trusted {
+        summary.push_bytes(b" in ~");
+        summary.push_decimal(seconds);
+        summary.push_bytes(b"s");
+    } else {
+        summary.push_bytes(b" (uncalibrated timing; fixed frame count used)");
+    }
+    summary.push_bytes(b"\n");
+    report.summary[..summary.len].copy_from_slice(&summary.bytes[..summary.len]);
 }
 
 #[panic_handler]

@@ -22,18 +22,34 @@
  * `tape64_body`, an ordinary SysV64-ABI function linked from elsewhere.
  * This shim calls it as:
  *
- *   extern "C" fn(args_ptr: u64, args_len: u64, report_ptr: u64)
+ *   extern "C" fn(args_ptr: u64, args_len: u64, report_ptr: u64,
+ *                 arena_ptr: u64, arena_len: u64, cycles_per_second: u64)
  *
  * where:
  * - `args_ptr`/`args_len` mirror `shell::tape_run`'s ordinary startup-
  *   argument slice (same bytes as `tape run ...` passed after `run`).
  * - `report_ptr` points to this shim's writable report buffer
  *   (`report_magic`, `report_version`, `report_mode`, `report_support`,
- *   `report_tests`) for optional structured status handoff back to the
- *   32-bit side after the round trip.
+ *   `report_tests`, then a 128-byte NUL-terminated `report_summary`
+ *   text buffer) for optional structured/human-readable status handoff
+ *   back to the 32-bit side after the round trip. A body that leaves
+ *   `report_summary`'s first byte zero (the default -- this shim clears
+ *   the whole report before every run) gets no extra line printed; one
+ *   that fills in a friendly NUL-terminated message gets it echoed
+ *   through `putc` right after the usual hex-coded report line.
  * - `arena_ptr`/`arena_len` are an optional large temporary buffer
  *   allocated through tape ABI `alloc` before entering long mode and
  *   released via `free` after returning (0/0 when unavailable).
+ * - `cycles_per_second` is this shim's own short TSC-vs-PIT calibration
+ *   (see `.Lcalibrate_wait` below), so a body that wants to run for a
+ *   real minimum wall-clock duration (rather than a fixed instruction or
+ *   frame count) can do so using only `rdtsc` -- it cannot safely call
+ *   back into 32-bit code (`ticks`/`should_abort`/...) once the mode
+ *   switch below has happened, since those cdecl functions assume a
+ *   32-bit stack/operand-size world this shim has already left behind.
+ *   Zero means calibration could not run (should not happen in
+ *   practice, but a body should treat it as "unknown" rather than
+ *   trusting a suspiciously small nonzero value blindly).
  *
  * Under SysV64, a body declaring fewer arguments remains valid (unused
  * trailing register arguments are ignored), so existing zero-argument
@@ -50,6 +66,20 @@
  * see AGENTS.md's note on disk I/O's real-mode dependency) only needs to
  * provide its own `tape64_body`, in whichever language, and link against
  * this same shim.
+ *
+ * CR4.OSFXSR/OSXMMEXCPT (bits 9/10) are also temporarily set for the
+ * duration of the excursion, alongside CR4.PAE, and restored to their
+ * original (always-clear) value on the way back like every other saved
+ * register. The 32-bit kernel deliberately never sets these -- it never
+ * uses floating point/SSE at all -- which meant `cpu64-lab`'s and
+ * `cpu64-show`'s own CR4-gated "is SSE actually usable" checks always
+ * read false and their SSE/SSE2 code paths never actually ran on any real
+ * boot, even on hardware whose CPUID reports full SSE2 support. Since
+ * this excursion is fully self-contained and every other piece of CR4 is
+ * restored exactly as saved, enabling these two bits only while inside
+ * this shim's own isolated 64-bit world is safe: the kernel's own
+ * "never enables float" policy is completely undisturbed the instant
+ * control returns to 32-bit code.
  *
  * `tape64_body` runs with the stack pointer 16-byte aligned (SysV64's
  * calling-convention requirement, unlike cdecl, which this shim's own
@@ -92,6 +122,8 @@ tape_main:
     movl %ecx, alloc_fn
     movl 16(%esp), %ecx            # tape_run's free callback
     movl %ecx, free_fn
+    movl 48(%esp), %ecx            # tape_run's ticks callback (12th cdecl arg)
+    movl %ecx, ticks_fn
 
     # Preserve the caller's callee-saved registers (cdecl).
     pushl %ebp
@@ -142,6 +174,44 @@ tape_main:
     movl $0, report_mode
     movl $0, report_support
     movl $0, report_tests
+    leal report_summary, %edi
+    movl $REPORT_SUMMARY_CAPACITY, %ecx
+    xorl %eax, %eax
+    rep stosb
+
+    # ---- calibrate a TSC-based "cycles per second" figure ----
+    # A body cannot safely call back into 32-bit code (`ticks`,
+    # `should_abort`, ...) once interrupts are masked and the mode switch
+    # below has happened, so a body wanting a real minimum wall-clock
+    # runtime needs its own time source purely from `rdtsc`. This has to
+    # happen here, before `cli`, while the PIT-driven `ticks_fn` can still
+    # actually increment.
+    call *ticks_fn
+    movl %eax, calib_tick0_lo
+    movl %edx, calib_tick0_hi
+    rdtsc
+    movl %eax, calib_tsc0_lo
+    movl %edx, calib_tsc0_hi
+.Lcalibrate_wait:
+    call *ticks_fn
+    subl calib_tick0_lo, %eax
+    sbbl calib_tick0_hi, %edx
+    cmpl $0, %edx
+    jg .Lcalibrate_done          # high word positive: far more than enough ticks passed
+    jl .Lcalibrate_wait          # high word negative: not enough yet (should not happen)
+    cmpl $CALIBRATE_TICKS, %eax
+    jb .Lcalibrate_wait
+.Lcalibrate_done:
+    rdtsc
+    subl calib_tsc0_lo, %eax
+    sbbl calib_tsc0_hi, %edx
+    # cycles_per_second = delta_tsc * (100 / CALIBRATE_TICKS); with
+    # CALIBRATE_TICKS = 25 that multiplier is exactly 4 (a left shift by
+    # 2 across the 64-bit edx:eax pair), since the PIT runs at 100 Hz.
+    shldl $2, %eax, %edx
+    shll $2, %eax
+    movl %eax, cycles_per_second_lo
+    movl %edx, cycles_per_second_hi
 
     # ---- save every piece of CPU state we are about to change ----
     # From here until the matching restore below, interrupts stay off:
@@ -170,9 +240,13 @@ tape_main:
     andl $0x7fffffff, %eax
     movl %eax, %cr0
 
-    # ---- CR4.PAE, then point CR3 at our own identity-map page tables ----
+    # ---- CR4.PAE, then point CR3 at our own identity-map page tables.
+    # Also set OSFXSR/OSXMMEXCPT (bits 9/10) for the duration of this
+    # excursion only -- see the file header comment on why this is safe:
+    # `saved_cr4` above was captured before this OR, so the kernel's own
+    # (always-clear) CR4 is restored exactly on the way back. ----
     movl %cr4, %eax
-    orl $0x20, %eax
+    orl $0x620, %eax
     movl %eax, %cr4
 
     movl $pml4, %eax
@@ -207,6 +281,12 @@ long_entry:
     leaq report_magic(%rip), %rdx
     movl saved_arena_ptr, %ecx
     movl saved_arena_len, %r8d
+    # Build the 6th argument (cycles_per_second, a single 64-bit value)
+    # from the two 32-bit halves the calibration above computed.
+    movl cycles_per_second_lo, %r9d
+    movl cycles_per_second_hi, %eax
+    shlq $32, %rax
+    orq %rax, %r9
     call tape64_body
     movq %r15, %rsp
 
@@ -264,6 +344,10 @@ after_gdt_restore:
     movl report_tests, %eax
     call print_hex32
     leal msg_report_suffix, %esi
+    call print_string
+    cmpb $0, report_summary
+    je .Lfree_arena
+    leal report_summary, %esi
     call print_string
 .Lfree_arena:
     movl saved_arena_ptr, %eax
@@ -351,6 +435,7 @@ print_hex32_loop:
 putc_fn:            .long 0
 alloc_fn:           .long 0
 free_fn:            .long 0
+ticks_fn:            .long 0
 saved_args_ptr:      .long 0
 saved_args_len:      .long 0
 saved_arena_ptr:     .long 0
@@ -361,11 +446,22 @@ saved_cr3:           .long 0
 saved_cr4:           .long 0
 saved_efer_lo:       .long 0
 saved_efer_hi:       .long 0
+calib_tick0_lo:      .long 0
+calib_tick0_hi:      .long 0
+calib_tsc0_lo:       .long 0
+calib_tsc0_hi:       .long 0
+cycles_per_second_lo: .long 0
+cycles_per_second_hi: .long 0
 report_magic:        .long 0
 report_version:      .long 0
 report_mode:         .long 0
 report_support:      .long 0
 report_tests:        .long 0
+.equ REPORT_SUMMARY_CAPACITY, 128
+report_summary:
+    .fill REPORT_SUMMARY_CAPACITY, 1, 0
+
+.equ CALIBRATE_TICKS, 25             # 250 ms at the PIT's 100 Hz rate
 
     .align 8
 saved_gdtr:

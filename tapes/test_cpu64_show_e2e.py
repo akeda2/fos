@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Smoke test for the 64-bit cpu64-show visual demo tape.
 
-Runs `tape run auto 2` to keep runtime bounded for CI-style checks while still
-exercising the longmode shim handoff, optional large-arena pass-through, and
-structured report output.
+Runs `tape run auto 2` (2 seconds -- the demo's SECONDS argument, clamped to
+1..120) to keep runtime bounded for CI-style checks while still exercising
+the longmode shim handoff, the real large-arena pass-through (`-m 256`
+below), and structured report output plus the human-readable summary line.
 """
 
 import os
@@ -74,6 +75,13 @@ def main() -> None:
             "rtl8139,netdev=net0",
             "-display",
             "none",
+            # This tape's 8 MiB arena comes from pmem's "big pool", which only
+            # has usable capacity once total machine RAM exceeds its 128 MiB
+            # tracked-frame-pool ceiling (mirroring tapes/test_bigsieve_e2e.py's
+            # own -m 256). Without this, alloc() always returns 0 here and the
+            # arena/SUPPORT_ARENA code path is never actually exercised.
+            "-m",
+            "256",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -127,6 +135,8 @@ def main() -> None:
         text = output.decode("utf-8", "replace")
         if "longmode: 64-bit body report mode=0x" not in text:
             raise SystemExit(f"missing structured report output:\n{text}")
+        if "cpu64-show: cpu supports" not in text:
+            raise SystemExit(f"missing human-readable summary line:\n{text}")
 
         del output[:]
         mcast.send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_DATA, b"about\n"))

@@ -1149,17 +1149,36 @@ structured report line as `cpu64-lab`.
 Run it as:
 
 ```text
-tape run [auto|scalar|sse2] [FRAMES]
+tape run [auto|scalar|sse2] [SECONDS]
 ```
 
-`auto` picks SSE2 when currently usable, otherwise scalar. `FRAMES` defaults
-to 240. The status line at the bottom shows selected mode, frame progress,
-and arena size in KiB. The report bitfields include whether SSE2 was used and
-whether a large arena was available.
+`auto` picks SSE2 when currently usable, otherwise scalar. `SECONDS`
+(default 10, clamped to 1..120) is a real minimum wall-clock runtime, not a
+frame count: the shim calibrates a `cycles_per_second` figure from the
+kernel's PIT-driven `ticks` callback just before entering long mode (since
+64-bit code cannot safely call back into that 32-bit callback once the mode
+switch happens), and the demo loop keeps rendering frames until that many
+`rdtsc` cycles have actually elapsed, falling back to a fixed frame count
+only if that calibration looks implausible. The status line at the bottom
+shows selected mode, frame progress, and arena size in KiB. On exit, the
+shim also prints a human-readable summary line built by the 64-bit body,
+naming which of x87/MMX/SSE/SSE2 the CPU supports, which one was actually
+used, and how many frames ran over roughly how many seconds -- in addition
+to the existing hex-coded structured report line.
+
+The shim temporarily sets `CR4.OSFXSR`/`CR4.OSXMMEXCPT` (bits 9/10) only for
+the duration of the 64-bit excursion, restoring the kernel's own (always
+clear) `CR4` exactly on return -- the 32-bit kernel deliberately never uses
+floating point and never sets these bits itself, so without this, SSE/SSE2
+were never actually usable inside either `cpu64-lab` or `cpu64-show` despite
+CPUID reporting full support.
 
 Build it with `make tape-cpu64-show` (producing `build/tapes/cpu64-show.bin`)
 and run `tapes/test_cpu64_show_e2e.py` for a focused smoke test (`tape run
-auto 2`) on `qemu-system-x86_64`.
+auto 2`, i.e. a bounded 2-second run) on `qemu-system-x86_64`. That test
+also passes QEMU `-m 256`, since the tape's 8 MiB arena request only
+succeeds once the machine has more than 128 MiB of total RAM for `pmem`'s
+big pool to serve it from (mirroring `tapes/test_bigsieve_e2e.py`).
 
 
 ### Remote terminal (`term net`)
