@@ -10,7 +10,8 @@
 .set DISK_REQUEST, 0x5400
 # DISK_REQUEST holds the protected-mode call arguments and a 16-byte EDD
 # packet. Its fields are: direction byte at +0 (0=read, 1=write, 2=probe),
-# status byte at +1, BIOS drive at +2, LBA low/high dwords at +4/+8, buffer
+# status byte at +1, BIOS drive at +2, sector count byte at +3 (1..=126,
+# ignored by the probe direction), LBA low/high dwords at +4/+8, buffer
 # physical address at +12, and the DAP (direction 0/1) or the AH=48h "get
 # extended drive parameters" result buffer (direction 2) at +16, both of
 # which fit within the 64 bytes reserved before DISK_SAVED_ESP. +42/+44 hold
@@ -18,6 +19,12 @@
 # probe path: its result buffer at +16 overlaps the DAP's own offset/segment
 # fields at +20/+22, so probe must rebuild ES:DI from this untouched copy
 # instead of reading back through fields AH=48h just overwrote.
+#
+# The sector-count byte at +3 lets one BIOS call transfer up to 126
+# contiguous sectors instead of always exactly one; a single byte suffices
+# since 126 fits comfortably. It is written only after the initial
+# direction dword-store below (which zeroes bytes +1..+3), the same pattern
+# already used for the drive-number byte at +2.
 .set DISK_SAVED_ESP, 0x5440
 .set DISK_SAVED_CR0, 0x5444
 
@@ -461,6 +468,20 @@ bios_disk_io:
     cmpl $0x80, %eax
     jb bios_disk_invalid
     movb %al, DISK_REQUEST + 2
+    # A 6th cdecl argument lets the caller (kernel/src/disk.rs) request up
+    # to 126 contiguous sectors in one BIOS call instead of always exactly
+    # one; 126 matches the kernel loader's own already-proven safe transfer
+    # size (0xfc00 bytes, comfortably clear of a real-mode segment's 64 KiB
+    # boundary given this trampoline's 16-byte-aligned buffer requirement).
+    # Reject 0 or anything above that bound as a caller bug.
+    movl 28(%ebp), %eax
+    testl $0xffffff00, %eax
+    jnz bios_disk_invalid
+    cmpl $0, %eax
+    je bios_disk_invalid
+    cmpl $126, %eax
+    ja bios_disk_invalid
+    movb %al, DISK_REQUEST + 3
     ljmp $0x18, $(bios_disk_protected16 + STAGE2_BASE)
 
 bios_disk_invalid:
@@ -493,7 +514,8 @@ bios_disk_real:
     movw %ax, %ss
     movw $0x7a00, %sp
     movw $0x0010, DISK_REQUEST + 16
-    movw $1, DISK_REQUEST + 18
+    movzbw DISK_REQUEST + 3, %ax
+    movw %ax, DISK_REQUEST + 18
     movl DISK_REQUEST + 4, %eax
     movl %eax, DISK_REQUEST + 24
     movl DISK_REQUEST + 8, %eax

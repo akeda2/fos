@@ -85,12 +85,22 @@ pub fn cat(info: &BootInfo, device: disk::Device, name: &[u8]) -> Result<bool, d
     };
     let base = disk::device_data_partition_lba(info, device);
     let mut remaining = entry.length;
-    for sector in 0..entry.sector_count {
-        disk::device_read_sector(info, device, base + entry.start_sector + sector, |contents| {
-            let length = remaining.min(SECTOR_SIZE as u64) as usize;
-            console::write_bytes(&contents[..length]);
-            remaining -= length as u64;
-        })?;
+    let mut sector = 0u64;
+    while sector < entry.sector_count {
+        let chunk_sectors =
+            (entry.sector_count - sector).min(disk::MAX_TRANSFER_SECTORS as u64) as usize;
+        disk::device_read_sectors(
+            info,
+            device,
+            base + entry.start_sector + sector,
+            chunk_sectors,
+            |contents| {
+                let length = remaining.min((chunk_sectors * SECTOR_SIZE) as u64) as usize;
+                console::write_bytes(&contents[..length]);
+                remaining -= length as u64;
+            },
+        )?;
+        sector += chunk_sectors as u64;
     }
     if entry.length != 0 {
         println!();
@@ -127,14 +137,24 @@ pub fn read(
     let base = disk::device_data_partition_lba(info, device);
     let mut remaining = entry.length;
     let mut destination_offset = 0;
-    for sector in 0..entry.sector_count {
-        disk::device_read_sector(info, device, base + entry.start_sector + sector, |contents| {
-            let length = remaining.min(SECTOR_SIZE as u64) as usize;
-            buffer[destination_offset..destination_offset + length]
-                .copy_from_slice(&contents[..length]);
-            destination_offset += length;
-            remaining -= length as u64;
-        })?;
+    let mut sector = 0u64;
+    while sector < entry.sector_count {
+        let chunk_sectors =
+            (entry.sector_count - sector).min(disk::MAX_TRANSFER_SECTORS as u64) as usize;
+        disk::device_read_sectors(
+            info,
+            device,
+            base + entry.start_sector + sector,
+            chunk_sectors,
+            |contents| {
+                let length = remaining.min((chunk_sectors * SECTOR_SIZE) as u64) as usize;
+                buffer[destination_offset..destination_offset + length]
+                    .copy_from_slice(&contents[..length]);
+                destination_offset += length;
+                remaining -= length as u64;
+            },
+        )?;
+        sector += chunk_sectors as u64;
     }
     Ok(Some(entry.length))
 }
@@ -334,16 +354,25 @@ fn write_file_data(
     data: &[u8],
 ) -> Result<(), disk::Error> {
     let base = disk::device_data_partition_lba(info, device);
-    for (sector_index, chunk) in data.chunks(SECTOR_SIZE).enumerate() {
-        disk::device_write_sector(
+    let total_sectors = sectors_for_length(data.len());
+    let mut offset = 0usize;
+    let mut sector = 0u64;
+    while sector < total_sectors {
+        let chunk_sectors =
+            (total_sectors - sector).min(disk::MAX_TRANSFER_SECTORS as u64) as usize;
+        let chunk_bytes = (chunk_sectors * SECTOR_SIZE).min(data.len() - offset);
+        let source = &data[offset..offset + chunk_bytes];
+        disk::device_write_sectors(
             info,
             device,
-            base + start_sector + sector_index as u64,
+            base + start_sector + sector,
+            chunk_sectors,
             |contents| {
-                contents.fill(0);
-                contents[..chunk.len()].copy_from_slice(chunk);
+                contents[..source.len()].copy_from_slice(source);
             },
         )?;
+        offset += chunk_bytes;
+        sector += chunk_sectors as u64;
     }
     Ok(())
 }

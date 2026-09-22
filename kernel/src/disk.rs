@@ -12,10 +12,52 @@ const FIRST_SECONDARY_DRIVE: u8 = 0x81;
 /// have BIOS drive letters for, and cheap to raise later if that changes.
 const MAX_SECONDARY_DISKS: usize = 4;
 
+/// The largest sector count `bios_disk_io` (`boot/stage2.S`) will accept in
+/// one BIOS call, matching the kernel loader's own already-proven safe
+/// per-transfer size (`0xfc00` bytes): comfortably inside a real-mode
+/// segment's 64 KiB range given the trampoline's requirement that the
+/// buffer be 16-byte aligned (so the real-mode offset within that segment
+/// is always exactly 0). This is the assembly side's hard ceiling, not
+/// necessarily what the kernel actually requests per call -- see
+/// [`MAX_TRANSFER_SECTORS`] below for why the kernel deliberately asks for
+/// less.
+const TRAMPOLINE_MAX_SECTORS: usize = 126;
+
+/// The largest sector count [`device_read_sectors`]/[`device_write_sectors`]
+/// actually transfer in one BIOS call. This is deliberately smaller than
+/// [`TRAMPOLINE_MAX_SECTORS`]: a `[u8; TRAMPOLINE_MAX_SECTORS * SECTOR_SIZE]`
+/// scratch buffer (63 KiB) would not fit in the small headroom left in the
+/// kernel's own reserved low-memory `.bss` region (`linker.ld`'s
+/// `__kernel_end < 0x50000` check covers the whole address range .bss
+/// occupies, not just what `objcopy -O binary` ships in `kernel.bin`, since
+/// physical memory for `.bss` still needs to exist even though the flat
+/// image itself carries no bytes for it). 16 sectors (8 KiB) already cuts
+/// the number of BIOS round trips for a large file by 16x -- each round
+/// trip's own fixed real-mode-transition cost (see `call_trampoline`'s doc
+/// comment) is what this batching actually amortizes -- while leaving a
+/// healthy few KiB of headroom in the reserved region for future growth,
+/// rather than the handful of bytes a larger buffer would leave.
+pub const MAX_TRANSFER_SECTORS: usize = 16;
+
+const _: () = assert!(MAX_TRANSFER_SECTORS <= TRAMPOLINE_MAX_SECTORS);
+const _: () = assert!(MAX_TRANSFER_SECTORS > 0);
+
 #[repr(align(16))]
 struct AlignedSector([u8; SECTOR_SIZE]);
 
+#[repr(align(16))]
+struct AlignedChunk([u8; MAX_TRANSFER_SECTORS * SECTOR_SIZE]);
+
 static mut SECTOR: AlignedSector = AlignedSector([0; SECTOR_SIZE]);
+/// Scratch buffer for [`device_read_sectors`]/[`device_write_sectors`],
+/// separate from the single-sector [`SECTOR`] buffer used everywhere else
+/// (directory/superblock reads, which are rare and see no benefit from a
+/// bigger buffer). `objcopy -O binary` bakes a `.bss` array's whole size
+/// into the shipped `kernel.bin` as zero bytes (see AGENTS.md's "Tape ABI
+/// grows alloc/free" section), so this deliberately stays at the smallest
+/// size that lets one BIOS call reach the trampoline's own bound rather
+/// than being rounded up further.
+static mut CHUNK: AlignedChunk = AlignedChunk([0; MAX_TRANSFER_SECTORS * SECTOR_SIZE]);
 static mut GPT_DATA_LBA: u64 = 0;
 static mut GPT_DATA_SECTORS: u64 = 0;
 static mut GPT_VALID: bool = false;
@@ -165,7 +207,15 @@ pub fn discover_secondary_disks(info: &BootInfo) {
 }
 
 fn probe_drive(info: &BootInfo, drive_number: u8) -> Option<u64> {
-    call_trampoline(info, 2, 0, drive_number).ok()?;
+    call_trampoline(
+        info,
+        2,
+        0,
+        drive_number,
+        core::ptr::addr_of!(SECTOR) as u32,
+        1,
+    )
+    .ok()?;
     let sector = unsafe { &*core::ptr::addr_of!(SECTOR.0) };
     Some(get_u64(sector, 0))
 }
@@ -268,6 +318,47 @@ pub fn device_write_sector(
     transfer(info, device, lba, 1)
 }
 
+/// Reads `count` (1..=[`MAX_TRANSFER_SECTORS`]) contiguous sectors starting
+/// at `lba` in one BIOS call, exposing them as one `count * SECTOR_SIZE`
+/// byte slice -- the multi-sector counterpart to [`device_read_sector`]. A
+/// caller needing more sectors than [`MAX_TRANSFER_SECTORS`] must call this
+/// repeatedly with successive `lba`s (see `fosfs.rs`'s chunked loops), since
+/// a single BIOS call cannot itself cross the trampoline's per-transfer
+/// bound.
+pub fn device_read_sectors<T>(
+    info: &BootInfo,
+    device: Device,
+    lba: u64,
+    count: usize,
+    operation: impl FnOnce(&[u8]) -> T,
+) -> Result<T, Error> {
+    transfer_chunk(info, device, lba, count, 0)?;
+    let chunk = unsafe { &*core::ptr::addr_of!(CHUNK.0) };
+    Ok(operation(&chunk[..count * SECTOR_SIZE]))
+}
+
+/// Same as [`device_read_sectors`], but for writes: `operation` fills up to
+/// `count * SECTOR_SIZE` bytes of scratch space (already zeroed, matching
+/// [`device_write_sector`]'s single-sector contract of receiving a
+/// zero-initialized buffer to fill) before it is written out in one BIOS
+/// call.
+pub fn device_write_sectors(
+    info: &BootInfo,
+    device: Device,
+    lba: u64,
+    count: usize,
+    operation: impl FnOnce(&mut [u8]),
+) -> Result<(), Error> {
+    if count == 0 || count > MAX_TRANSFER_SECTORS {
+        return Err(Error::OutOfRange);
+    }
+    let chunk = unsafe { &mut *core::ptr::addr_of_mut!(CHUNK.0) };
+    let region = &mut chunk[..count * SECTOR_SIZE];
+    region.fill(0);
+    operation(region);
+    transfer_chunk(info, device, lba, count, 1)
+}
+
 fn transfer(info: &BootInfo, device: Device, lba: u64, direction: u32) -> Result<(), Error> {
     if lba >= device_sector_count(info, device) {
         return Err(Error::OutOfRange);
@@ -275,27 +366,65 @@ fn transfer(info: &BootInfo, device: Device, lba: u64, direction: u32) -> Result
     let Some(drive_number) = drive_number(info, device) else {
         return Err(Error::Unavailable);
     };
-    call_trampoline(info, direction, lba, drive_number)
+    call_trampoline(
+        info,
+        direction,
+        lba,
+        drive_number,
+        core::ptr::addr_of!(SECTOR) as u32,
+        1,
+    )
+}
+
+/// Same as [`transfer`], but for a multi-sector operation against the
+/// shared [`CHUNK`] buffer.
+fn transfer_chunk(
+    info: &BootInfo,
+    device: Device,
+    lba: u64,
+    count: usize,
+    direction: u32,
+) -> Result<(), Error> {
+    if count == 0 || count > MAX_TRANSFER_SECTORS {
+        return Err(Error::OutOfRange);
+    }
+    if lba + count as u64 > device_sector_count(info, device) {
+        return Err(Error::OutOfRange);
+    }
+    let Some(drive_number) = drive_number(info, device) else {
+        return Err(Error::Unavailable);
+    };
+    call_trampoline(
+        info,
+        direction,
+        lba,
+        drive_number,
+        core::ptr::addr_of!(CHUNK) as u32,
+        count as u32,
+    )
 }
 
 /// Invokes the `bios_disk_io` trampoline (`boot/stage2.S`) for one
-/// operation against `drive_number`, using the shared [`SECTOR`] buffer as
-/// its source/destination. `lba` is ignored by the probe operation
-/// (`direction == 2`), which instead fills [`SECTOR`] with an 8-byte total
-/// sector count on success.
+/// operation against `drive_number`, transferring `sector_count`
+/// (1..=[`MAX_TRANSFER_SECTORS`]) contiguous sectors starting at `lba`
+/// to/from `buffer` (either [`SECTOR`]'s or [`CHUNK`]'s address). `lba` and
+/// `sector_count` are both ignored by the probe operation (`direction ==
+/// 2`), which instead fills the buffer with an 8-byte total sector count on
+/// success.
 fn call_trampoline(
     info: &BootInfo,
     direction: u32,
     lba: u64,
     drive_number: u8,
+    buffer: u32,
+    sector_count: u32,
 ) -> Result<(), Error> {
     let address = read_u32(core::ptr::addr_of!(info.bios_disk_io));
     if address == 0 {
         return Err(Error::Unavailable);
     }
-    let routine: unsafe extern "C" fn(u32, u32, u32, u32, u32) -> u32 =
+    let routine: unsafe extern "C" fn(u32, u32, u32, u32, u32, u32) -> u32 =
         unsafe { core::mem::transmute(address as usize) };
-    let buffer = core::ptr::addr_of!(SECTOR) as u32;
     // The trampoline drops into real mode to run genuine BIOS code. BIOS
     // expects both the traditional real-mode IVT at address 0 (our own IDT
     // holds 8-byte protected-mode gate descriptors at a different address,
@@ -322,6 +451,7 @@ fn call_trampoline(
             (lba >> 32) as u32,
             buffer,
             drive_number as u32,
+            sector_count,
         )
     };
     unsafe {

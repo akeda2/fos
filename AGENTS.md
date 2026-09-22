@@ -36,9 +36,22 @@ that obscure hardware behavior.
   boot handoff.
   Validate its magic, version, size, and count before using it. Use unaligned
   reads for packed multi-byte fields.
-- `kernel/src/disk.rs` invokes the stage-two BIOS EDD trampoline. It performs
-  exactly one sector transfer and only after validating the LBA and buffer
-  constraints. Do not call BIOS interrupts directly from protected mode.
+- `kernel/src/disk.rs` invokes the stage-two BIOS EDD trampoline. The
+  trampoline itself can batch up to 126 sectors per real-mode call
+  (`TRAMPOLINE_MAX_SECTORS`, matching the loader's own already-proven
+  bounded-transfer size), but `disk.rs` only ever requests up to
+  `MAX_TRANSFER_SECTORS` (16, an 8 KiB `CHUNK` buffer) at a time -- the
+  smaller value exists purely to fit the kernel's `.bss` budget below the
+  `0x50000` reserved-region ceiling, not any BIOS/hardware limit. FOSFS
+  file reads/writes (`fosfs::cat`/`read`/`write_file_data`) loop over
+  `MAX_TRANSFER_SECTORS`-sized chunks via `device_read_sectors`/
+  `device_write_sectors` instead of one BIOS round trip per sector, which
+  matters most for large tapes: legacy USB/BIOS INT13h per-call latency
+  otherwise dominates a multi-hundred-sector transfer's total time far
+  more than the underlying disk's real transfer speed. Every transfer,
+  whether one sector or a full chunk, is issued only after validating the
+  LBA and buffer constraints. Do not call BIOS interrupts directly from
+  protected mode.
   Because the trampoline drops into real mode, and the kernel's own IDT/PIC
   remap would otherwise break BIOS's real-mode interrupt handling, `transfer`
   briefly restores the real-mode IVT (`IDTR` base 0) and the BIOS-conventional

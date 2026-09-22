@@ -289,6 +289,31 @@ def main() -> None:
                 b"tape load disk ip-chat.bin\r",
                 b"tape load disk primes.bin\r",
                 b"tape run\r",
+                *(
+                    [
+                        # disk2 must be formatted before it can hold
+                        # anything; do that now (rather than in the
+                        # second-disk-only block further below) so the
+                        # stash below can happen before "format" wipes
+                        # disk1's primes.bin. The second-disk-only block's
+                        # own "format disk2" was removed to avoid wiping
+                        # this stash again before its round trip.
+                        b"format disk2\r",
+                        # Stash a copy of primes.bin (~1954 sectors) on
+                        # disk2 before the "format" below wipes disk1 --
+                        # disk2's own multi-sector round trip further below
+                        # needs a copy that survives disk1 being reformatted.
+                        # This first leg (disk1 -> disk2) already exercises
+                        # the new multi-sector BIOS batching in
+                        # kernel/src/disk.rs (device_read_sectors/
+                        # device_write_sectors, via fosfs::read/write): its
+                        # sector count spans well over a hundred
+                        # MAX_TRANSFER_SECTORS-sized chunks.
+                        b"copy disk1 primes.bin disk2 primes-bak.bin\r",
+                    ]
+                    if args.second_disk
+                    else []
+                ),
                 b"cat readme.txt\r",
                 b"write note.txt HELLO\r",
                 b"cat note.txt\r",
@@ -310,22 +335,26 @@ def main() -> None:
                     (
                         b"diskinfo\r",
                         b"diskinfo disk2\r",
-                        b"format disk2\r",
                         b"ls disk2\r",
                         b"write disk2 config.txt hello-from-disk2\r",
                         b"ls disk2\r",
                         b"cat disk2 config.txt\r",
                         # `tape run @diskN/NAME` reads a tape's startup
                         # arguments from an attached secondary disk instead
-                        # of only ever the boot disk. Exercised here while
-                        # the primes tape the base command list already
-                        # loaded (via its own earlier "tape run") is still
-                        # resident, since disk1's own preloaded tapes were
-                        # already wiped by that same base list's "format".
-                        # primes.S ignores any startup arguments, so this
-                        # only proves the file itself was read without
-                        # error (no "not found"/usage message), not that
-                        # its bytes changed behavior.
+                        # of only ever the boot disk. This used to rely on
+                        # the base command list's own earlier "tape run"
+                        # leaving the primes tape resident, but the
+                        # multi-sector round-trip test above now copies
+                        # disk1's primes.bin to disk2 first, invalidating
+                        # that loaded tape (see "reused the shared tape
+                        # buffer" above) -- so reload the same primes tape
+                        # from its disk2 backup here instead of a plain
+                        # text file, since @disk2/expr.txt's file reference
+                        # resolves successfully and actually runs whatever
+                        # tape is currently loaded with these startup
+                        # arguments (primes.S ignores them, so this only
+                        # proves the file itself was read without error).
+                        b"tape load disk2 primes-bak.bin\r",
                         b"write disk2 expr.txt 3 4 +\r",
                         b"tape run @disk2/expr.txt\r",
                         b"tape run @disk9/expr.txt\r",
@@ -352,6 +381,23 @@ def main() -> None:
                         b"cat disk2 note2-copy.txt\r",
                         b"rm disk2 note2-copy.txt\r",
                         b"rm note2.txt\r",
+                        # Round-trip the much larger primes.bin (backed up
+                        # to disk2 earlier, before disk1's "format" above
+                        # wiped it) back to disk1 under a new name. This
+                        # second leg (disk2 -> disk1) exercises the
+                        # multi-sector read/write batching in the other
+                        # direction. Re-running the primes tape from the
+                        # round-tripped copy and getting the exact same
+                        # prime count and largest prime (already in
+                        # EXPECTED_COMMON, and matched again here since
+                        # wait_for only ever scans forward) proves no byte
+                        # was corrupted at a chunk boundary either way,
+                        # without needing a dedicated checksum command.
+                        b"copy disk2 primes-bak.bin disk1 primes-rt.bin\r",
+                        b"rm disk2 primes-bak.bin\r",
+                        b"tape load disk primes-rt.bin\r",
+                        b"tape run\r",
+                        b"rm primes-rt.bin\r",
                         b"rm disk1 config.txt\r",
                         b"rm disk2 config.txt\r",
                         b"ls disk2\r",
@@ -407,6 +453,17 @@ def main() -> None:
                     expected.index(b"Physical memory: "),
                     b"Paging protection: kernel text/read-only data reject writes; PCI MMIO maps only when a driver registers its BAR.",
                 )
+            if args.second_disk:
+                # Matches the conditional "copy disk1 primes.bin disk2
+                # primes-bak.bin" command inserted right after the base
+                # command list's own primes tape run, before "format" wipes
+                # disk1 -- see that command's own comment. Inserted right
+                # after the primes tape's own output markers (already in
+                # EXPECTED_COMMON) since wait_for only ever scans forward.
+                expected.insert(
+                    expected.index(b"largest prime:  999983") + 1,
+                    b"Copied 1000516 byte(s) from disk1 'primes.bin' to disk2 'primes-bak.bin'.",
+                )
             if args.nic == "e1000":
                 expected.extend(
                     (
@@ -449,6 +506,7 @@ def main() -> None:
                         b"disk2: 8192 sectors; FOSFS partition: LBA 0 + 8192 sectors",
                         b"config.txt  16 bytes, 1 sector(s)",
                         b"hello-from-disk2",
+                        b"Loaded 1000516 byte(s) from 'primes-bak.bin' at 0x100000. 'tape run' to execute it.",
                         b"Copied 16 byte(s) from disk2 'config.txt' to disk1 'config.txt'.",
                         b"Note: this reused the shared tape buffer, so the previously loaded tape is gone; 'tape load' again before 'tape run'.",
                         b"Copied 16 byte(s) from disk1 'note2.txt' to disk2 'note2-copy.txt'.",
@@ -456,6 +514,10 @@ def main() -> None:
                         b"Usage: tape run [ARGS...] or tape run router @CONFIG_FILE (or @diskN/CONFIG_FILE)",
                         b"Loaded 16 byte(s) from 'config.txt' at 0x100000. 'tape run' to execute it.",
                         b"Usage: tape load [net|disk NAME|diskN NAME]",
+                        b"Copied 1000516 byte(s) from disk2 'primes-bak.bin' to disk1 'primes-rt.bin'.",
+                        b"Loaded 1000516 byte(s) from 'primes-rt.bin' at 0x100000. 'tape run' to execute it.",
+                        b"primes found:   78498",
+                        b"largest prime:  999983",
                     )
                 )
             for marker in expected:
