@@ -593,7 +593,17 @@ fn print_printer_ports() {
     for (index, name) in PRINTER_PORT_NAMES.iter().enumerate() {
         let name = core::str::from_utf8(name).unwrap_or("?");
         match ports[index] {
-            Some(base) => println!("{name}: 0x{base:04x} (free for 'term printer'/'term {name}')"),
+            Some(base) => {
+                println!("{name}: 0x{base:04x} (free for 'term printer'/'term {name}')");
+                let status = parallel::Printer::new(base).status();
+                println!(
+                    "  status=0x{status:02x}: busy={} paper_out={} select={} error={}",
+                    (status & 0x80 != 0) as u8,
+                    (status & 0x20 != 0) as u8,
+                    (status & 0x10 != 0) as u8,
+                    (status & 0x08 == 0) as u8,
+                );
+            }
             None => println!("{name}: not detected"),
         }
     }

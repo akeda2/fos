@@ -1718,35 +1718,35 @@ hardware notes" below): several Centronics signals (`nBusy`, `nAck`,
 `nError`) are active-low on the physical cable, and different references
 disagree on exactly how an ISA bus buffer presents them back to software.
 The polarities implemented follow the most commonly cited convention
-(matching Linux's historic `parport_pc`/`lp` driver headers and the
-signaling IBM Proprinter emulation follows) but have only been checked
-against QEMU's `-parallel` emulation, not a real Centronics cable --
-`kernel/src/parallel.rs`'s own module doc comment flags this prominently.
-The user's physical Panasonic KX-P1083 dot-matrix printer is the intended
-real-hardware validation target; until that happens, treat the fault
-classification (which bit means what) as unconfirmed.
+(matching Linux's historic `parport_pc`/`lp` driver headers) but have
+only been checked against QEMU's `-parallel` emulation, not a real
+Centronics cable -- `kernel/src/parallel.rs`'s own module doc comment
+flags this prominently. The user's physical Panasonic KX-P1083 dot-matrix
+printer is the intended real-hardware validation target; until that
+happens, treat the fault classification (which bit means what) as
+unconfirmed.
 
-**Real-hardware follow-up: a false "Printer out of paper" report, traced
-to the printer's own emulation-mode DIP switch, not (necessarily) a
-polarity bug in this driver.** The user's KX-P1083 reported "out of
-paper" with paper loaded and the printer online. This driver's status-bit
-polarities were re-checked against the standard SPP status register
-layout and found to already match the documented convention exactly, so
-no obviously wrong constant was found by inspection alone. The likely
-explanation instead: the KX-P1083 (like the related KX-P1080/1081) has a
-DIP-switch-selected emulation mode, IBM Proprinter or Standard (Epson-
-compatible) -- this driver's status-bit assumptions are modeled on IBM
-Proprinter-style signaling, but Standard/Epson mode is documented to
-present the Paper-Out status line differently (sometimes inactive,
-sometimes following Epson's own protocol instead), which would read as a
-spurious paper-out condition to software expecting IBM-style signaling
-regardless of any polarity constant in this file. The user confirmed
-their printer is currently set to Standard mode, not IBM Proprinter mode.
-The recommended fix is hardware-side (set the printer's DIP switches to
-IBM Proprinter emulation, matching this driver's assumptions) rather than
-guessing at a software-side bit inversion for Epson-mode semantics this
-driver has never been written against; this remains unconfirmed pending
-the user re-testing with the mode switched.
+**Real-hardware follow-up: a false "Printer out of paper" report.** The
+user's KX-P1083 reported "out of paper" with paper loaded, the printer
+online, and its own out-of-paper indicator light off. A first theory --
+that the printer's DIP-switch-selected emulation mode (IBM Proprinter vs.
+Standard/Epson-compatible) changes how the Paper-Out *status line* is
+driven -- turned out to be the wrong lead on reflection: emulation mode
+governs how a printer's firmware interprets incoming escape codes for
+text formatting, not how its hardware drives the Centronics status
+signals back to the host, which come directly from a physical paper
+sensor. Switching emulation mode was therefore unlikely to have ever
+fixed this, and the report persisted after ruling it out.
+
+Rather than guess again, `printer` was extended to print each detected
+port's raw status byte plus a per-bit decode
+(`status=0xNN: busy=B paper_out=P select=S error=E`), so the exact
+real-hardware register value can be read directly instead of inferred.
+This is the concrete next diagnostic step: with paper loaded and the
+printer online, a `paper_out=1` reading with the light off would mean
+this driver's `STATUS_PAPER_OUT` bit (or its polarity) is simply wrong for
+this hardware/chipset and should be corrected directly from that
+evidence, rather than continuing to guess at indirect explanations.
 
 `shell.rs` adds `term printer`/`term LPT1`..`LPT4` (an exclusive terminal
 mode, mirroring `term COM1`/`term_net`'s existing "one active mode at a

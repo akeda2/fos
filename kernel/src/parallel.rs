@@ -29,15 +29,18 @@
 //! KX-P1083 is the intended validation target; see AGENTS.md).
 //!
 //! A real-hardware report of a false "out of paper" status against that
-//! printer was traced, most likely, to the printer's own DIP-switch-
-//! selected emulation mode rather than a polarity bug here: the KX-P1083
-//! supports both IBM Proprinter and Standard (Epson-compatible) emulation,
-//! and Standard mode is documented to present the Paper-Out status line
-//! differently than IBM Proprinter mode does. This driver's polarities
-//! assume IBM Proprinter-style signaling; a printer left in Standard mode
-//! should be switched to IBM Proprinter mode rather than this file's
-//! constants being reworked to guess at Epson-mode semantics. This remains
-//! unconfirmed pending the user re-testing with the mode switched.
+//! printer (with paper loaded, printer online, its own paper-out light
+//! off) remains unexplained. An earlier theory -- that the printer's
+//! DIP-switch emulation mode (IBM Proprinter vs. Standard/Epson) changes
+//! how the Paper-Out *status line* is driven -- does not hold up: emulation
+//! mode governs escape-code interpretation for text formatting, not how
+//! hardware drives Centronics status signals from a physical paper
+//! sensor. `Printer::status()` (exposed via the `printer` shell command's
+//! raw status/bit decode) exists specifically so the real register value
+//! can be read directly from the affected hardware instead of continuing
+//! to guess; if that shows `paper_out=1` with real paper loaded, the
+//! `STATUS_PAPER_OUT` bit or its polarity should be corrected from that
+//! evidence directly.
 use crate::arch::x86::{inb, outb};
 
 /// BIOS Data Area addresses of each legacy LPT port's base I/O address, in
