@@ -9,6 +9,7 @@ use crate::keyboard;
 use crate::keyboard::Keyboard;
 use crate::nic;
 use crate::parallel;
+use crate::pci;
 use crate::pmem;
 use crate::{print, println};
 
@@ -330,7 +331,7 @@ fn execute(command: &[u8], info: &BootInfo) {
             // wraps a line at exactly 80, and a println! whose text lands
             // precisely on column 80 wraps *and* leaves a spurious blank
             // row for its own trailing '\n' -- so 79 is the true safe
-            // maximum, not 80) and the whole listing to 13 lines, so it
+            // maximum, not 80) and the whole listing to 15 lines, so it
             // always fits a standard 80x25 screen without wrapping or
             // scrolling any of itself out of view. Prefer trimming detail
             // (full syntax remains in README.md/AGENTS.md) over adding a
@@ -352,8 +353,9 @@ fn execute(command: &[u8], info: &BootInfo) {
             }
             if no_arguments(arguments) {
                 println!(
-                    "System: help clear vga about bootinfo memmap memory cpuinfo hexdump halt reset"
+                    "System: help clear vga about bootinfo memmap memory cpuinfo pci"
                 );
+                println!("      hexdump halt reset");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!(
                     "Disk: diskinfo/readsector/format/ls/cat/write/rm [diskN], copy SRC NAME DST"
@@ -431,6 +433,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"start" if no_arguments(arguments) => start_command(info),
         b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
+        b"pci" if no_arguments(arguments) => print_pci_devices(),
         b"printer" if no_arguments(arguments) => print_printer_ports(),
         b"print" => print_command(info, arguments),
         b"nic" => nic_command(arguments),
@@ -451,7 +454,8 @@ fn execute(command: &[u8], info: &BootInfo) {
             reset();
         }
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
-        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"printer" | b"start" => {
+        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci" | b"printer"
+        | b"start" => {
             println!("This command does not accept arguments.");
         }
 
@@ -585,6 +589,51 @@ fn print_serial_ports() {
             );
             println!("baud chosen when entering it)");
         }
+    }
+}
+
+/// Dumps every PCI function found on the bus: location, vendor/device ID,
+/// class/subclass/prog-if, header type, and BAR0's raw value. This exists
+/// so an unmarked or newly acquired card's real vendor/device ID (needed to
+/// add it to a driver's `pci::find_devices` match list, e.g. `rtl8139.rs`/
+/// `e1000.rs`) can be read directly from fos itself, without needing a
+/// second machine or `lspci`. Unlike most commands, this one's output is
+/// allowed to scroll past one screen -- like `ls`/`memmap`, the number of
+/// devices on a real bus is inherently unbounded, not a fixed-size listing
+/// that could easily have been trimmed to fit.
+fn print_pci_devices() {
+    let mut devices = [pci::PciDeviceInfo {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        class: 0,
+        subclass: 0,
+        prog_if: 0,
+        header_type: 0,
+        bar0: 0,
+    }; pci::MAX_PCI_DEVICES];
+    let found = pci::scan_devices(&mut devices);
+    let shown = found.min(devices.len());
+    if shown == 0 {
+        println!("No PCI devices found.");
+        return;
+    }
+    println!("Found {found} PCI function(s):");
+    for info in &devices[..shown] {
+        println!(
+            "{:02x}:{:02x}.{} {:04x}:{:04x} class={:02x}/{:02x} prog_if={:02x}",
+            info.bus, info.device, info.function, info.vendor_id, info.device_id, info.class,
+            info.subclass, info.prog_if,
+        );
+        println!(
+            "  header={:02x} bar0=0x{:08x}",
+            info.header_type, info.bar0
+        );
+    }
+    if found > shown {
+        println!("({} more found but not shown; MAX_PCI_DEVICES exceeded)", found - shown);
     }
 }
 
@@ -1125,6 +1174,12 @@ fn term_net(info: &BootInfo) {
                 println!("Gave up waiting for a remote terminal client.");
                 return;
             }
+            // Lets the active NIC's watchdog recover a latched fault even
+            // while sitting idle waiting for a client -- previously this
+            // wait had no watchdog check at all, so a fault occurring
+            // right at boot (before any session ever connects) sat
+            // unrecovered indefinitely.
+            poll_background_work(nic::get().ok());
             let mut connected_peer = None;
             for index in 0..interface_count {
                 let Some(interface) = nic::get_at(index) else {
@@ -1184,7 +1239,6 @@ fn term_net(info: &BootInfo) {
             TERM_DEFERRED_INPUT_OVERFLOWED = false;
         }
         let mut editor = LineEditor::new();
-        let mut relay_chunk = [0u8; TERM_DATA_CAPACITY];
         prompt();
 
         // Tracks *why* the session below ended: only a local escape key
@@ -1205,10 +1259,12 @@ fn term_net(info: &BootInfo) {
 
             drain_deferred_term_input(&mut editor, info);
 
-            let queued = console::peek_relay(&mut relay_chunk);
-            if queued > 0 && send_term_data(nic, &peer, &source, &relay_chunk[..queued]) {
-                console::discard_relay(queued);
-            }
+            // Also drains the print-relay queue and lets the NIC
+            // watchdog notice/recover a latched fault -- previously only
+            // checked when a human ran `nic`/`nic list`/`nic watchdog`
+            // afterward, so a fault occurring mid-session sat
+            // unrecovered until this loop happened to return.
+            poll_background_work(Some(nic));
 
             if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
                 send_term_control(nic, &peer, &source, TERM_TAG_BYE);
@@ -1477,6 +1533,46 @@ fn relay_pending_tape_output(nic: &nic::Nic, peer: &[u8; 6], source: &[u8; 6]) {
     }
 }
 
+/// The one shared "background poll" hook: everything a long-running
+/// foreground loop wants done once per iteration, regardless of which
+/// command that loop belongs to, gathered in one place instead of each
+/// loop separately remembering (or, as several did until this was added,
+/// forgetting) its own subset. It:
+///
+/// - relays any queued printer output (`relay_pending_print_output`);
+/// - relays any queued `term_net` output to the connected peer, if this
+///   loop is running nested inside an active `term_net` session
+///   (`ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE`), exactly the way
+///   `poll_remote_tape_abort`/`poll_remote_tape_input` already do for a
+///   nested tape -- so a long `nic sniff`/`nic discover`/`chat` typed
+///   *as a command* over a remote `term net` session now streams its own
+///   output live too, instead of arriving in one burst only once it
+///   returns;
+/// - and lets the active NIC's watchdog notice and recover from a
+///   latched, documented adapter fault (see `nic.rs`'s module doc
+///   comment) -- previously only ever checked when a human happened to
+///   run `nic`/`nic list`/`nic watchdog` afterward, so a fault occurring
+///   mid-capture, mid-chat, or mid-`term-net`-session sat unrecovered
+///   until that loop returned and someone thought to check.
+///
+/// Cheap when idle: `watchdog()` is a handful of register/atomic reads
+/// unless a fault is actually latched (see `rtl8139::Rtl8139::watchdog`),
+/// and both relay checks are a single peek against an otherwise-empty
+/// queue. Takes `Option<&nic::Nic>` rather than requiring one, since a
+/// few callers (the tape polling callbacks) may run with no NIC at all.
+fn poll_background_work(nic: Option<&nic::Nic>) {
+    relay_pending_print_output();
+    let Some(nic) = nic else { return };
+    if console::relay_enabled() {
+        if let (Some(peer), Some(source)) =
+            (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE })
+        {
+            relay_pending_tape_output(nic, &peer, &source);
+        }
+    }
+    report_nic_watchdog(nic.watchdog());
+}
+
 /// Polls the network card once for a frame from the currently connected
 /// `term_net` peer, if any, on behalf of a nested blocking command (see
 /// `tape_run`) whose own loop has `term_net`'s *own* session loop --
@@ -1497,11 +1593,19 @@ fn relay_pending_tape_output(nic: &nic::Nic, peer: &[u8; 6], source: &[u8; 6]) {
 /// records `PENDING_REMOTE_BYE` since this call is the only place that
 /// frame will ever be received).
 ///
-/// Does nothing but check one flag (and so costs a single branch) unless
-/// a `term_net` relay session is actually active: a tape started from
-/// the local shell has `console::relay_enabled()` false the entire time,
-/// so it never touches the network card at all.
+/// Also runs `poll_background_work` unconditionally first, so any
+/// running tape -- not just one nested inside a `term_net` session --
+/// gets live printer-output relaying and NIC watchdog recovery for the
+/// duration of its own polling loop, not only once it returns.
+///
+/// Beyond that, this does nothing but check one flag (and so costs a
+/// single extra branch) unless a `term_net` relay session is actually
+/// active: a tape started from the local shell has
+/// `console::relay_enabled()` false the entire time, so it never
+/// touches the network card at all beyond the watchdog check above.
 fn poll_remote_tape_abort() -> bool {
+    let nic_ref = nic::get().ok();
+    poll_background_work(nic_ref);
     if !console::relay_enabled() {
         return false;
     }
@@ -1509,8 +1613,7 @@ fn poll_remote_tape_abort() -> bool {
     else {
         return false;
     };
-    let Ok(nic) = nic::get() else { return false };
-    relay_pending_tape_output(nic, &peer, &source);
+    let Some(nic) = nic_ref else { return false };
     let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let Some(received) = nic.receive(&mut buffer) else {
         return false;
@@ -2054,6 +2157,12 @@ fn nic_sniff() {
         ) {
             break;
         }
+        // Relays live output to a connected `term_net` peer (if `nic
+        // sniff` was itself typed as a remote command) and lets the NIC
+        // watchdog recover a latched fault -- previously this capture
+        // loop did neither, so a remote session saw nothing until the
+        // capture stopped, and a mid-capture fault went unrecovered.
+        poll_background_work(Some(nic));
         if let Some(length) = nic.receive(&mut buffer) {
             captured += 1;
             let frame = &buffer[..length];
@@ -2255,6 +2364,11 @@ fn nic_discover() {
         ) {
             break;
         }
+        // Relays live output to a connected `term_net` peer (if `nic
+        // discover` was itself typed as a remote command) and lets the
+        // active NIC's watchdog recover a latched fault -- previously
+        // this loop did neither.
+        poll_background_work(nic::get().ok());
         if interrupts::ticks() >= next_broadcast {
             for index in 0..count {
                 let Some(nic) = nic::get_at(index) else {
@@ -2379,6 +2493,11 @@ fn chat_command(arguments: &[u8]) {
     let mut recv_buffer = [0u8; nic::MAX_FRAME_LEN];
 
     'chat: loop {
+        // Relays live output to a connected `term_net` peer (if `chat`
+        // was itself typed as a remote command) and lets the NIC
+        // watchdog recover a latched fault -- previously this loop did
+        // neither.
+        poll_background_work(Some(nic));
         // Serial bytes take the same path a plain keyboard character
         // would (there is no serial equivalent of the F12 (or F4/F6/F7/F8/F10) escape key);
         // only fall back to polling the keyboard -- which can also report
@@ -3058,27 +3177,21 @@ const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 /// fed to a tape as ordinary characters, so a peer's escape keypress can
 /// never accidentally end up echoed into a tape's own input.
 ///
-/// Output relaying happens first, unconditionally, even when a queued
-/// `TAPE_INPUT_QUEUE` byte lets this call return immediately afterward --
-/// otherwise a fast-typing peer could keep this function returning from
-/// the queue for several calls in a row without ever reaching the
-/// network-polling code below, leaving whatever the tape had already
-/// printed (e.g. a prompt) stuck in the relay queue for longer than
-/// necessary.
+/// `poll_background_work` (print-relay draining, term-net output
+/// relaying, and NIC watchdog recovery) runs first, unconditionally,
+/// even when a queued `TAPE_INPUT_QUEUE` byte lets this call return
+/// immediately afterward -- otherwise a fast-typing peer could keep this
+/// function returning from the queue for several calls in a row without
+/// ever reaching the network-polling code below, leaving whatever the
+/// tape had already printed (e.g. a prompt) stuck in the relay queue for
+/// longer than necessary, and a latched NIC fault unrecovered for as
+/// long as the tape kept the peer's attention.
 fn poll_remote_tape_input() -> Option<u32> {
-    relay_pending_print_output();
+    let nic_ref = nic::get().ok();
+    poll_background_work(nic_ref);
     if unsafe { TAPE_REMOTE_ABORT_PENDING } {
         unsafe { TAPE_REMOTE_ABORT_PENDING = false };
         return Some(TAPE_EVENT_ABORT);
-    }
-    if console::relay_enabled() {
-        if let (Some(peer), Some(source)) =
-            (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE })
-        {
-            if let Ok(nic) = nic::get() {
-                relay_pending_tape_output(nic, &peer, &source);
-            }
-        }
     }
     if let Some(byte) = tape_input_pop() {
         return Some(TAPE_EVENT_CHAR_BASE | u32::from(byte));
@@ -3089,7 +3202,7 @@ fn poll_remote_tape_input() -> Option<u32> {
     let Some(peer) = (unsafe { ACTIVE_TERM_PEER }) else {
         return None;
     };
-    let Ok(nic) = nic::get() else { return None };
+    let Some(nic) = nic_ref else { return None };
     let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let Some(received) = nic.receive(&mut buffer) else {
         return None;

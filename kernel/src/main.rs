@@ -15,6 +15,7 @@ mod disk;
 mod e1000;
 mod fosfs;
 mod gdt;
+mod i350;
 mod interrupts;
 mod keyboard;
 mod ne2000;

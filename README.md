@@ -153,6 +153,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `memmap` | Prints the BIOS E820 memory-map entries, decoded (usable RAM, reserved, ACPI, bad memory). |
 | `memory` | Summarizes E820 usable and non-usable memory. |
 | `cpuinfo` | Shows the CPUID vendor and raw feature bitfields. |
+| `pci` | Dumps every PCI function found on the bus: location, vendor/device ID, class/subclass/prog-if, header type, and BAR0's raw value. Used to identify unmarked or unknown hardware (e.g. reading a NIC's real vendor/device ID) before adding driver support for it. |
 | `hexdump ADDRESS LENGTH` | Dumps up to 128 bytes inside the reserved kernel range. Addresses accept decimal or `0x` hexadecimal notation. |
 | `ticks` | Shows the free-running PIT timer tick count and its configured frequency. |
 | `uptime` | Shows elapsed time since boot, derived from the timer tick count. |
@@ -389,6 +390,15 @@ physical-machine testing, but the installed QEMU build has no 3C905 model.
 Each backend is found by exact vendor/device IDs through the PCI
 configuration-space walk in `kernel/src/pci.rs`, rather than by class code,
 because NIC register layouts are vendor-specific.
+
+`kernel/src/i350.rs` is a fifth backend module, fully wired into `nic.rs`'s
+facade but currently inert: its `CANDIDATE_DEVICE_IDS` list is deliberately
+empty pending real-hardware confirmation of an Intel I350 card's exact PCI
+device ID, so `nic`/`nic list` never report it and its code has no runtime
+effect today. See `AGENTS.md`'s "Intel I350 support" section for the
+register-layout differences from the e1000 (82540EM) backend it mirrors,
+and the `pci` command below for identifying an unknown card's exact IDs
+ahead of enabling a new backend.
 
 Unlike the UART, an Ethernet controller does not hand over bytes one at a
 time via port I/O: it moves whole frames itself, via DMA, into and out of
@@ -1426,7 +1436,7 @@ gracefully (`diskinfo` shows zero sectors; FOSFS commands report the disk as
 absent) rather than attempting a read. `BootInfo.boot_drive` is likewise a
 best-effort `0x80` guess, since BIOS does not hand an `INT 19h`-hooked
 handler a meaningful drive number the way it does for a normal MBR boot.
-The embedded kernel must still fit in the reserved `0x10000..0x50000`
+The embedded kernel must still fit in the reserved `0x10000..0x60000`
 destination window (`tools/write_netrom_layout.py` enforces this at build
 time). The ROM path copies it with a 32-bit-address-size `rep movsb`; the
 final ROM image remains subject to the PCI option-ROM size limit enforced by

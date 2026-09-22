@@ -19,10 +19,10 @@ that obscure hardware behavior.
   section below for why), loads the kernel at physical `0x10000` using bounded
   multi-transfer BIOS EDD reads that never cross a 64 KiB transfer boundary,
   and enters flat 32-bit protected mode. The reserved
-  `0x10000..0x50000` region, not the old single-transfer 127-sector
+  `0x10000..0x60000` region, not the old single-transfer 127-sector
   convention, is the current kernel-size limit.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
-  low-memory kernel region through `0x50000`; do not place loader, boot-info,
+  low-memory kernel region through `0x60000`; do not place loader, boot-info,
   or disk-trampoline data there.
 - `kernel/src/entry.S` reserves a 32 KiB kernel stack with a low-end canary
   above an unmapped 4 KiB guard page. `kernel/src/gdt.rs` installs a
@@ -42,7 +42,7 @@ that obscure hardware behavior.
   bounded-transfer size), but `disk.rs` only ever requests up to
   `MAX_TRANSFER_SECTORS` (16, an 8 KiB `CHUNK` buffer) at a time -- the
   smaller value exists purely to fit the kernel's `.bss` budget below the
-  `0x50000` reserved-region ceiling, not any BIOS/hardware limit. FOSFS
+  `0x60000` reserved-region ceiling, not any BIOS/hardware limit. FOSFS
   file reads/writes (`fosfs::cat`/`read`/`write_file_data`) loop over
   `MAX_TRANSFER_SECTORS`-sized chunks via `device_read_sectors`/
   `device_write_sectors` instead of one BIOS round trip per sector, which
@@ -161,7 +161,7 @@ Real-mode code before the kernel's own memory management exists shares a
 handful of fixed low-memory addresses across `stage1.S`, `stage2.S`, and
 `netrom.S`. There is no single enforcing mechanism for this -- it is
 convention only -- so treat this table as authoritative before adding any new
-fixed address below `0x50000`, and update it in the same change that adds one:
+fixed address below `0x60000`, and update it in the same change that adds one:
 
 | Address | Used by | Purpose |
 | --- | --- | --- |
@@ -173,7 +173,7 @@ fixed address below `0x50000`, and update it in the same change that adds one:
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
 | `0x9f000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer, just below the conventional End-of-Low-Memory / EBDA boundary. |
-| `0x10000`-`0x50000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
+| `0x10000`-`0x60000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
 | `0x100000`-`0x500000` | `kernel/src/pmem.rs` (`TAPE_BASE`/`TAPE_LEN`), any tape's own linker script | The fixed 4 MiB region every tape (`tape load disk`/`tape load net`) is always loaded into, carved out of `pmem`'s general frame pool at boot so `allocate`/`allocate_contiguous`/`palloc` can never hand these frames to anything else. See "Tapes: fixed load address, and writing one in Rust" below. |
 
 ## Educational verbosity
@@ -631,8 +631,13 @@ The reserved low-memory kernel region (`linker.ld`/`pmem::RESERVED_BELOW`/
 `0x40000` alongside `tape`, then to `0x50000` when paging, NIC reliability,
 and boot-script code consumed the remaining headroom. The feature's own code pushed the kernel
 binary past the previous 64 KiB ceiling with essentially no headroom left
-beforehand (the prior build was already only dozens of bytes under it).
-All three constants must always match; see "Low-memory map" above for why
+beforehand (the prior build was already only dozens of bytes under it), then
+to `0x60000` when scaffolding the inert `kernel/src/i350.rs` driver module
+(see "Intel I350 support" below) pushed `__kernel_end` to `0x51fb4` -- past
+the old `0x50000` ceiling even with `i350::CANDIDATE_DEVICE_IDS` left empty,
+since the module's per-instance static storage (`i350::NICS`) and its code
+are linked in regardless of whether any real device ID ever matches at
+runtime. All three constants must always match; see "Low-memory map" above for why
 growing this region is safe (nothing else lives between `0x20000` and the
 real-mode stack pointer's `0x9f000`).
 
@@ -649,6 +654,95 @@ at all -- see the "tape print callback ABI" section further below, which
 is the current design; the paragraphs immediately following this one
 describe the tape as it worked *before* that change, for historical
 context on the bugs that shaped `primes.S`'s scroll/cursor handling.
+
+### A permanent `pci` device-dump command
+
+`pci` (`shell.rs`) lists every discovered PCI function -- bus:device.func,
+vendor:device ID, class/subclass/prog-if, header type, and BAR0 -- using a
+new `pci::scan_devices()` that mirrors `find_serial_ports`'s own
+multi-function-aware scanning (checking `HEADER_TYPE_MULTIFUNCTION` and
+iterating functions 0..8 for a multifunction device, same as
+`find_devices` already does for NIC discovery), capped at `MAX_PCI_DEVICES`
+(64, comfortably above any real machine's populated slot count). Unlike
+`ls`/`memmap`, it is allowed to scroll past one screen, since the number of
+PCI functions on a real machine is inherently unbounded and not worth
+truncating. This exists specifically so an unknown card's exact vendor/
+device ID can be read directly from hardware -- the same information this
+project would otherwise have to guess at from a chip's silkscreen marking
+alone -- before deciding whether to add a new NIC (or other) backend for
+it; see "Intel I350 support" immediately below for the motivating case.
+
+### Intel I350 support: scaffolded, not yet enabled
+
+`kernel/src/i350.rs` is a fifth NIC backend, structurally mirroring
+`e1000.rs`'s driver shape (the same descriptor structs and
+reset/configure/send/receive/watchdog pattern) but for Intel's I350
+("Powerville") PCIe Gigabit Ethernet controller family -- a genuinely
+different, newer chip generation than the `82540EM` QEMU emulates as
+`e1000` (in Linux driver terms, I350 belongs to the `igb` family, not
+`e1000`/`e1000e`). It was added in preparation for a physical dual-port
+card (chip-marked `NHI350AM4 S621J51C 1621`, identified by its markings as
+an I350 board with only 2 of the chip's 4 ports wired out) whose exact PCI
+device ID had not yet been confirmed at the time this module was written
+-- the owner's second card was offsite and its ID needed reading from a
+different machine.
+
+Three real register-layout differences from `e1000.rs`, documented in
+`i350.rs`'s own doc comments as "unverified against real hardware,
+best-effort transcription from the public 82576/82580/I350 register map,
+same as Linux's `igb` driver" (mirroring this project's usual "flag it as
+speculative until physical hardware proves or disproves it" convention --
+see "Real hardware notes" below):
+
+- Interrupt registers (`ICR`/`IMS`/`IMC`) moved from `0x00c0`/`0x00d0`/
+  `0x00d8` to `0x1500`/`0x1508`/`0x150c`.
+- Ring registers became per-queue arrays; queue 0 lives at `0xc000` (Rx) /
+  `0xe000` (Tx) instead of the fixed `0x2800`/`0x3800` 82540EM uses, and
+  needs an explicit `RXDCTL0`/`TXDCTL0` (`0xc028`/`0xe028`) "queue enable"
+  bit (`1<<25`) set before the ring is considered live -- a step 82540EM
+  never required.
+- A `SWSM` (`0x5b50`)/`SW_FW_SYNC` (`0x5b5c`) software/firmware semaphore
+  handshake (`acquire_swfw_sync`/`release_swfw_sync`) is needed before
+  touching the PHY, to arbitrate with resident management firmware
+  (AMT/ME) that I350 boards often carry -- again, not needed on 82540EM.
+
+`i350::CANDIDATE_DEVICE_IDS` is deliberately an empty `&[u16]`: the module
+is fully wired into `nic.rs`'s facade (`Nic::I350`, every match arm, and
+`initialize()`'s backend loop) and compiles as ordinary, complete code, but
+with no device IDs to match it can never actually claim a PCI device, so
+`nic`/`nic list`/`pci` behave identically to before this module existed.
+This is deliberate, not an oversight: `0x1520` is the I350 **Virtual
+Function** (SR-IOV) device ID, with a completely different, mailbox-based
+register interface that has no direct PHY/link access at all -- silently
+matching it alongside a real physical-function ID would hang or corrupt
+state, so no ID is enabled at all until the real card's own ID is read
+back (e.g. via the new `pci` command above, or `lspci -nn` on a machine
+that already has a working driver for it) and confirmed to be a physical
+function, not this one. Enabling support for every plausible I350 sibling
+ID at once was considered and rejected for the same reason: fiber/
+backplane variants skip copper-PHY autonegotiation entirely, and treating
+them identically to a copper port's link-bring-up sequence could hang
+indefinitely waiting on a link state that variant will never report the
+same way. The intended path is to add only the one confirmed, physically
+tested ID first, then broaden deliberately to sibling copper IDs only once
+each has actually been tested against real hardware -- never as a
+speculative batch.
+
+Like the 3C509 investigation and I350's own complete absence from QEMU
+(`-device help` lists no I350 model at all, unlike RTL8139/82540EM/
+NE2000), this is a standing, permanent real-hardware-only testing cost for
+every future iteration on this driver, not a one-time bring-up expense --
+see "ISA bus support and the 3C509" under "Deliberately deferred work"
+below for the same tradeoff discussed at length for a different card.
+
+Scaffolding this module alone (with no device IDs enabled, and therefore
+no runtime behavior change at all) pushed `__kernel_end` past the
+previous `0x50000` reserved-region ceiling, to `0x51fb4` -- the module's
+own static per-instance storage (`i350::NICS`, sized like `e1000::NICS`)
+and its driver code are linked into `kernel.bin` unconditionally,
+regardless of whether `CANDIDATE_DEVICE_IDS` ever matches anything at
+runtime. This required growing the reserved region again, to `0x60000`;
+see the paragraph on that growth history further below.
 
 `tapes/primes.S` is a worked, non-trivial test tape: a
 Sieve-of-Eratosthenes prime counter up to 1,000,000, assembled the same
@@ -1249,8 +1343,8 @@ bitmap (32 KiB, up from the original 4 KiB) directly inflated
 `kernel.bin` by ~28 KB. Stage two now avoids the former single-transfer
 127-sector ceiling by splitting kernel loading into bounded INT 13h
 extended-read calls that respect each BIOS 64 KiB boundary. The remaining
-limit is the reserved `0x10000..0x50000` low-memory region, currently
-512 sectors, and `tools/write_layout.py` emits that limit.
+limit is the reserved `0x10000..0x60000` low-memory region, currently
+640 sectors, and `tools/write_layout.py` emits that limit.
 
 The fix: a second allocator, the "big pool" (`BIG_BITMAP`,
 `BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 2 GiB,
@@ -1595,6 +1689,78 @@ on its behalf. The "relay queue only gets drained by `term_net`'s own
 outer loop" claim above is now only accurate for a nested command that
 never calls `should_abort`/`read_key`; any tape that does gets the
 benefit of this fix for free.
+
+### `poll_background_work`: one shared hook instead of four duplicated ones ("Tier 0" of the scheduler discussion)
+
+Investigating what a real preemptive/cooperative scheduler would cost
+this project (per-task stacks, a context-switch primitive, and -- the
+expensive part -- auditing every "this kernel is single-threaded"
+assumption, most critically `disk.rs`'s BIOS real-mode trampoline, which
+cannot tolerate any concurrent execution during its brief real-mode
+window) surfaced a much cheaper, already-half-built alternative: this
+kernel's several long-running blocking loops (`term_net`'s own session
+loop, `nic sniff`, `nic discover`, `chat_command`, and the tape-callback
+polling functions `poll_remote_tape_abort`/`poll_remote_tape_input`
+described just above) already each poll hardware/keyboard state once per
+iteration -- so "background work" here doesn't need real concurrency at
+all, just a handful of small, cheap, non-blocking checks called from
+every one of those loops instead of only some of them. This is
+explicitly scoped to kernel-native recurring work only, not to
+backgrounding a *tape*: a tape is structured as one big imperative
+blocking loop with its state on the stack, and making one of those
+(e.g. `tapes/router`) genuinely resumable without a real per-task stack
+would mean hand-rewriting it into an explicit coroutine/step function --
+harder, not easier, than just giving it a real stack and one `yield()`
+call once a full scheduler exists. No tape or tape ABI changed for this
+work.
+
+Auditing the four independent places this ad hoc pattern had grown
+(`relay_pending_tape_output`/`poll_remote_tape_abort` for `term_net`'s
+own relay+network polling, `poll_remote_tape_input`'s near-identical
+copy of the same for `read_key`, and `term_net`'s own session loop
+inlining the identical relay-drain a third time) also surfaced a real,
+previously invisible functional gap: `nic.watchdog()` -- the mechanism
+that notices and recovers a latched, documented adapter fault (see
+"`nic` status and ordinary foreground NIC traffic run a bounded
+watchdog" above) -- was, before this change, only ever invoked from
+`nic`/`nic list`/`nic watchdog`'s own command handlers, never from
+inside any of these long-running loops. A fault occurring mid-capture,
+mid-chat, mid-discovery, or mid-`term_net`-session (including while
+still idle waiting for a client to connect) simply sat unrecovered until
+that loop happened to return and a human thought to run `nic status`
+afterward.
+
+`poll_background_work(nic: Option<&nic::Nic>)` (`shell.rs`) is the one
+shared hook consolidating all of this: it drains the print-relay queue
+(`relay_pending_print_output`, a no-op unless a printer session is
+actually active), relays queued `term_net` output to the connected peer
+if this call is running nested inside an active session
+(`console::relay_enabled()` plus `ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE`,
+exactly the gating `poll_remote_tape_abort`/`poll_remote_tape_input`
+already used), and calls `nic.watchdog()`. It is cheap enough to call
+unconditionally on every iteration of every loop it was added to:
+`watchdog()` is a handful of register/atomic reads unless a fault is
+actually latched (see `Rtl8139::watchdog`), and each relay check is a
+single peek against an otherwise-empty queue.
+
+It is now called from: `term_net`'s outer "waiting for a `HELLO`" loop
+and its inner `'session` loop (replacing that loop's own inlined
+relay-drain duplicate); `nic_sniff`'s capture loop; `nic_discover`'s
+probe/listen loop; `chat_command`'s input/receive loop; and
+`poll_remote_tape_abort`/`poll_remote_tape_input` (replacing their own
+bespoke relay-plus-network-poll logic with one call to this same hook,
+called unconditionally before either function's own
+`console::relay_enabled()`-gated logic runs -- so a tape's watchdog
+recovery and print-relaying now also work when the tape was started
+*without* an active `term_net` session, which the old, `term_net`-only
+gated logic in those two functions never covered). No externally
+observable behavior of the tape ABI (`should_abort`/`read_key`
+semantics, or any tape's own output) changed; the tape e2e suite
+(`tapes/test_calc_e2e.py`, `tools/test_term_net_tape_e2e.py`,
+`tapes/test_net_chat_e2e.py`, `tools/test_term_net_e2e.py`) and `make
+test` all pass unmodified after this refactor, confirming the
+consolidation is behavior-preserving apart from the intended new
+watchdog coverage.
 
 ### `term net` stays resident after a remote disconnect
 
@@ -2344,6 +2510,119 @@ section above.
   BIOS EDD/LBA, E820, VGA text, COM1, and PS/2-compatible input. QEMU is the
   primary validation environment.
 
+### MSI/MSI-X and the local APIC: investigated, not yet built
+
+Raised while scoping PCIe/I350 support: fos's entire interrupt story today
+is the legacy 8259 PIC (`interrupts.rs`) fed by INTx lines -- `pci::
+PciDevice::interrupt_line()` reads the config-space interrupt-line byte,
+and `register_pci_irq` just unmasks that IRQ on the 8259. There is no local
+APIC, no I/O-APIC, and `pci.rs` does not walk the PCI capability list at
+all, so MSI (capability ID `0x05`) and MSI-X (`0x11`) support does not
+exist in any form.
+
+MSI replaces a physical interrupt wire with an ordinary-looking memory
+write: the device writes a small "message data" value to a "message
+address" (architecturally `0xfeennnnn`, intercepted by the CPU's local
+APIC rather than landing in RAM) whenever it wants to interrupt. Adding
+real support would need, at minimum: a local APIC driver (CPUID detection,
+mapping its MMIO window, programming the spurious-vector and
+task-priority registers -- a genuinely new subsystem running alongside,
+not replacing, the existing PIC code, since BIOS/legacy devices may still
+want PIC-routed IRQs); a PCI capability-list walk in `pci.rs` to find the
+MSI/MSI-X capability and program the device's message address/data
+registers; and a new IDT vector range for MSI-delivered interrupts,
+separate from the PIC's remapped `IRQ_BASE` range. MSI itself needs no
+I/O-APIC, since it bypasses I/O-APIC redirection entirely -- that could be
+scoped independently of full I/O-APIC-based INTx routing.
+
+This is *not* expected to be a performance win for fos as currently built,
+and should not be undertaken as one. MSI's usual real-world benefits --
+avoiding shared-IRQ-line contention, skipping a status-register read to
+de-assert a level-triggered line, and (the largest one) giving each queue
+its own vector routed to its own CPU core for per-core affinity/RSS --
+mostly do not apply here: fos is single-core with no per-core IRQ affinity
+concept at all; every backend's `handle_interrupt()` already does nothing
+but ack-count-and-flag before returning to a foreground polling loop
+(`nic.rs`'s documented design), so there is no expensive status-register
+read in the hot path for MSI to remove; and nothing in fos blocks or
+sleeps waiting to be woken by an interrupt -- `nic recv`/`tape load
+net`/`chat` etc. are busy-polling loops regardless of whether an
+interrupt ever fires, so lower interrupt latency has nothing downstream
+to speed up. The one real fos-relevant benefit worth keeping in mind: some
+PCIe devices legitimately leave the legacy `interrupt_line`/
+`interrupt_pin` config-space bytes meaningless (implementing only MSI/
+MSI-X), so a card encountered in the future that never asserts INTx at all
+is a plausible, not just theoretical, real-hardware scenario -- but
+fos's polling-first design already tolerates an interrupt line that never
+fires without any correctness impact, exactly as it tolerates today's
+already-documented PCIe INTx-routing quirks.
+
+Worth revisiting if fos ever grows either genuine multi-core scheduling
+(where per-queue MSI-X vector affinity would become a real win) or a
+polling loop redesigned to actually `hlt`-and-wake on interrupt instead of
+spinning (where MSI's lower, non-shared delivery latency would then
+matter) -- neither depends on the other, and either alone would be enough
+to justify this work. Until one of those lands, treat it the same as the
+deferred x86-64 path below: a worthwhile future architectural exercise,
+not a prerequisite for any NIC backend (including I350) working
+correctly.
+
+### Cooperative/preemptive scheduling: investigated, not yet built
+
+Raised as "what would a real scheduler cost, and what would it buy us?"
+while designing `poll_background_work` above (which is deliberately the
+much cheaper alternative, scoped to kernel-native recurring work only --
+see that section). A genuine scheduler, cooperative or preemptive, would
+need several pieces this kernel has none of today:
+
+- **Per-task stacks and a small, fixed-size task-control-block table.**
+  No heap exists (see "Deliberately deferred work" below), so this would
+  be a fixed array of TCBs, each owning a statically-sized stack --
+  mirroring how `kernel::entry.S`'s single kernel stack and guard page
+  already work, just multiplied per task, not a dynamically sized pool.
+- **A context-switch primitive** (save/restore the full register set plus
+  stack pointer, the same category of state `gdt.rs`'s double-fault task
+  gate and `tapes/longmode64_shim.S`'s mode-switch save/restore already
+  demonstrate this project handling carefully elsewhere) and a scheduling
+  policy on top of it -- even a trivial round-robin needs somewhere to
+  decide "whose turn is it," which does not exist at all right now.
+- **Cooperative vs. preemptive** is the first real fork: cooperative (a
+  task runs until it explicitly `yield()`s) needs no timer-interrupt
+  integration and is far simpler to reason about, but only helps once
+  something in the kernel actually calls `yield()` at a useful point --
+  preemptive (forcibly switching tasks on the existing 100 Hz PIT tick)
+  would need every switch point audited for what state is safe to
+  interrupt, a much larger and riskier change.
+- **By far the most expensive part, though, is auditing every place this
+  kernel currently assumes single-threaded execution**, not building the
+  mechanism itself. `disk.rs`'s BIOS real-mode trampoline is the sharpest
+  example: it briefly disables paging and restores the real-mode IVT/PIC
+  mapping to make one BIOS call, a window during which absolutely nothing
+  else -- no interrupt handler, no other task -- can safely run without
+  corrupting CPU/segment state (see "Protected-mode IRQ window during
+  BIOS disk calls" above for what happens when even an ordinary IRQ fires
+  during that window). A scheduler would need this (and every other
+  similarly single-threaded assumption throughout `shell.rs`/`nic.rs`) to
+  either run with scheduling explicitly disabled/pinned, or be redesigned
+  entirely -- a large, project-wide review, not a contained addition.
+
+**Benefits weighed against that cost, for this project specifically:**
+genuine concurrency would let a long-running foreground task (e.g. a
+`router` tape) share CPU time with an interactive shell instead of
+occupying it exclusively, and would let a future blocking primitive
+("wait for a frame" instead of "poll for a frame") avoid busy-spinning.
+Neither is a pressing need today: `poll_background_work` above already
+gets the low-cost share of that benefit (recurring kernel-native
+housekeeping alongside any blocking loop) with none of the single-
+threading-audit cost, and no tape currently needs to run "in the
+background" while the shell keeps working -- `tape run` already fully
+occupies the CPU by design, and F12/remote-abort already let an operator
+reclaim it. **Conclusion: revisit a real scheduler only if a future tape
+or workload genuinely needs concurrent execution (not just recurring
+background polling, which `poll_background_work` already covers); until
+then this remains a deliberately deferred, larger architectural project,**
+not a prerequisite for anything currently planned.
+
 ### ISA bus support and the 3C509: investigated, not yet built
 
 Every NIC backend today (`rtl8139.rs`, `threecom.rs`, `e1000.rs`) is found
@@ -2928,7 +3207,7 @@ symbol matching this contract and link against `longmode64_shim.o`.
 
 Mechanically, the shim builds its own tiny identity-mapped page tables
 (three static 2 MiB pages covering physical 0..6 MiB -- the kernel's own
-code/stack, 0x10000..0x50000; VGA text memory, 0xb8000; and the tape's
+code/stack, 0x10000..0x60000; VGA text memory, 0xb8000; and the tape's
 own 4 MiB image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-
 descriptor private GDT (a 64-bit code descriptor at selector 0x08, and a
 flat 32-bit code descriptor at selector 0x10 used only as the landing pad

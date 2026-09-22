@@ -37,7 +37,7 @@ EXPECTED_COMMON = (
     b"Physical memory: ",
     b"Interrupts enabled: IDT loaded, PIC remapped to 0x20/0x28,",
     b"PS/2 keyboard initialized.",
-    b"System: help clear vga about bootinfo memmap memory cpuinfo hexdump halt reset",
+    b"System: help clear vga about bootinfo memmap memory cpuinfo pci",
     b"Interrupts: ticks uptime irqstat pmem palloc pfree",
     b"Ethernet: nic [list|use N|send|sniff|discover|peers], chat [PEER_MAC|N]",
     b"fos is a small educational 32-bit x86 operating system.",

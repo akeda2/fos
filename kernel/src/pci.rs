@@ -11,13 +11,17 @@
 //! broadly compatible, matching the rest of this project's approach to
 //! hardware access.
 //!
-//! Only enough of PCI is implemented to serve this project's two uses:
+//! Only enough of PCI is implemented to serve this project's three uses:
 //! walking every bus/device/function to find serial controllers by class
-//! code (reading BAR0 for the UART's I/O port), and finding Ethernet cards by
+//! code (reading BAR0 for the UART's I/O port), finding Ethernet cards by
 //! vendor/device ID for the RTL8139, 3C905, and Intel e1000 drivers
-//! (`rtl8139.rs`, `threecom.rs`, and `e1000.rs`). The first two read I/O BARs;
-//! e1000 reads a 32-bit memory BAR. All DMA-capable backends enable bus
-//! mastering through the PCI command register.
+//! (`rtl8139.rs`, `threecom.rs`, and `e1000.rs`), and a general device dump
+//! (`scan_devices`, backing the shell's `pci` command) used to identify
+//! hardware -- most concretely, an unmarked or newly acquired NIC's real
+//! vendor/device ID -- before writing or extending a driver for it. The
+//! first two read I/O BARs; e1000 reads a 32-bit memory BAR. All
+//! DMA-capable backends enable bus mastering through the PCI command
+//! register.
 //! There is no support for 64-bit memory BARs, PCI bridges, or any other
 //! device class; this is a teaching-scoped lookup, not a general PCI driver.
 
@@ -224,6 +228,92 @@ pub fn find_devices(
                     if found == out.len() {
                         return found;
                     }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// One PCI function's identifying configuration-space fields, as reported
+/// by `scan_devices`. This is deliberately read-only/informational (unlike
+/// `PciAddress`, which callers use to re-read BARs or flip command-register
+/// bits) -- its only purpose is the `pci` shell command's device dump, used
+/// to identify unknown hardware (e.g. reading off a device ID) before
+/// writing a driver for it.
+#[derive(Clone, Copy)]
+pub struct PciDeviceInfo {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub prog_if: u8,
+    pub header_type: u8,
+    /// The raw BAR0 register value, undecoded: bit 0 distinguishes I/O-
+    /// mapped (base in bits 31:2) from memory-mapped (base in bits 31:4,
+    /// with bits 2:1 giving the memory type) space. Shown as a raw hex
+    /// value rather than decoded, since a dump command's job is exposing
+    /// what is actually on the bus, not guessing which BAR meaning a
+    /// not-yet-identified device intends.
+    pub bar0: u32,
+}
+
+/// Bounded to the largest device count this project has ever needed to
+/// enumerate at once (a handful of onboard devices plus a multi-port add-on
+/// card); like every other fixed-size PCI table here, this trades an
+/// unlikely truncation on an exotic system with many devices for having no
+/// heap at all.
+pub const MAX_PCI_DEVICES: usize = 64;
+
+/// Walks every PCI bus/device/function, recording each present function's
+/// identifying fields into `out` in enumeration order. Stops once `out` is
+/// full; returns the total number of functions found (which may exceed
+/// `out.len()` if it was too small to hold them all, mirroring
+/// `find_devices`/`find_serial_ports`'s own truncation behavior).
+pub fn scan_devices(out: &mut [PciDeviceInfo]) -> usize {
+    let mut found = 0;
+    for bus in 0..=255u8 {
+        for device in 0..32u8 {
+            let vendor = read_u16(bus, device, 0, 0x00);
+            if vendor == 0xffff {
+                continue;
+            }
+            let header_type = read_u8(bus, device, 0, 0x0e);
+            let function_count = if header_type & HEADER_TYPE_MULTIFUNCTION != 0 {
+                8
+            } else {
+                1
+            };
+            for function in 0..function_count {
+                let function_vendor = if function == 0 {
+                    vendor
+                } else {
+                    read_u16(bus, device, function, 0x00)
+                };
+                if function_vendor == 0xffff {
+                    continue;
+                }
+                let info = PciDeviceInfo {
+                    bus,
+                    device,
+                    function,
+                    vendor_id: function_vendor,
+                    device_id: read_u16(bus, device, function, 0x02),
+                    class: read_u8(bus, device, function, 0x0b),
+                    subclass: read_u8(bus, device, function, 0x0a),
+                    prog_if: read_u8(bus, device, function, 0x09),
+                    header_type: read_u8(bus, device, function, 0x0e),
+                    bar0: read_u32(bus, device, function, BAR0_OFFSET),
+                };
+                if let Some(slot) = out.get_mut(found) {
+                    *slot = info;
+                }
+                found += 1;
+                if found == out.len() {
+                    return found;
                 }
             }
         }

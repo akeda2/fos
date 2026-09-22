@@ -2,7 +2,7 @@
 //!
 //! It builds a fixed-size bitmap (one bit per 4 KiB frame) from the E820
 //! memory map the loader collected, marks everything below the reserved
-//! low-memory kernel region (see `linker.ld`, `__kernel_end < 0x50000`) as
+//! low-memory kernel region (see `linker.ld`, `__kernel_end < 0x60000`) as
 //! permanently unavailable, and hands out/reclaims individual frames.
 //! `paging.rs` maps those physical frames into the current identity-mapped
 //! supervisor address space; this module deliberately remains concerned only
@@ -33,7 +33,7 @@ const BITMAP_BYTES: usize = MAX_FRAMES.div_ceil(8);
 /// Frames below this physical address are never handed out: it covers the
 /// real-mode IVT/BDA, the BootInfo table, and the kernel's own reserved
 /// low-memory region.
-const RESERVED_BELOW: u32 = 0x50000;
+const RESERVED_BELOW: u32 = 0x60000;
 
 /// Fixed physical address every "tape" (see `shell.rs`'s `tape_run`) is
 /// always loaded at, and the size of the region set aside for it. Unlike
