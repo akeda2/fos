@@ -625,22 +625,55 @@ fn printer_fault_message(fault: parallel::PrinterFault) -> &'static str {
     }
 }
 
+/// Writes one byte to `printer`, retrying with the *same* byte on a fault
+/// (paper out, offline, a latched error, or an unexpectedly long busy
+/// spell) until it clears or the operator gives up with F12 -- "pause,
+/// don't abort" (see `term_printer`'s doc comment). `last_fault` is
+/// threaded through by the caller across every byte in a session (not
+/// reset per call) so the same ongoing fault is reported only once, not
+/// re-announced for every subsequent byte or keystroke, and a recovery is
+/// announced exactly once too. Returns `false` if the operator gave up.
+fn write_to_printer_with_retry(
+    printer: &parallel::Printer,
+    byte: u8,
+    last_fault: &mut Option<parallel::PrinterFault>,
+) -> bool {
+    loop {
+        match printer.write_byte(byte) {
+            Ok(()) => {
+                if last_fault.take().is_some() {
+                    println!("Printer recovered; resuming.");
+                }
+                return true;
+            }
+            Err(fault) => {
+                if *last_fault != Some(fault) {
+                    println!("{}", printer_fault_message(fault));
+                    *last_fault = Some(fault);
+                }
+                if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 /// Drains the entire print-relay queue to `printer`, one byte at a time,
-/// via [`parallel::Printer::write_byte`]. A fault (paper out, offline, a
-/// latched error, or an unexpectedly long busy spell) is reported once and
-/// then retried with the *same* byte -- never skipped or dropped -- until
-/// it clears or the local operator presses F12 to give up, satisfying
-/// "pause, don't abort" (see `term_printer`'s doc comment) without any
-/// single call blocking forever: each retry is its own bounded
-/// `write_byte` attempt, and F12 is rechecked between every one.
+/// via `write_to_printer_with_retry` -- used for a command's own captured
+/// output (queued by `console::relay_push` while the print relay is
+/// active), never for `term_printer`'s live keystroke echo, which writes
+/// directly instead (see `term_printer`'s own doc comment for why).
 ///
 /// Returns `false` if the operator gave up mid-fault, leaving whatever was
 /// still queued undelivered (silently dropped, exactly like every other
 /// best-effort output queue in this kernel -- see `console::relay_push`'s
 /// own doc comment).
-fn drain_print_relay(printer: &parallel::Printer) -> bool {
+fn drain_print_relay(
+    printer: &parallel::Printer,
+    last_fault: &mut Option<parallel::PrinterFault>,
+) -> bool {
     let mut chunk = [0u8; 256];
-    let mut last_fault: Option<parallel::PrinterFault> = None;
     loop {
         let queued = console::peek_print_relay(&mut chunk);
         if queued == 0 {
@@ -648,24 +681,11 @@ fn drain_print_relay(printer: &parallel::Printer) -> bool {
         }
         let mut written = 0;
         while written < queued {
-            match printer.write_byte(chunk[written]) {
-                Ok(()) => {
-                    if last_fault.take().is_some() {
-                        println!("Printer recovered; resuming.");
-                    }
-                    written += 1;
-                }
-                Err(fault) => {
-                    if last_fault != Some(fault) {
-                        println!("{}", printer_fault_message(fault));
-                        last_fault = Some(fault);
-                    }
-                    if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
-                        console::discard_print_relay(written);
-                        return false;
-                    }
-                }
+            if !write_to_printer_with_retry(printer, chunk[written], last_fault) {
+                console::discard_print_relay(written);
+                return false;
             }
+            written += 1;
         }
         console::discard_print_relay(written);
     }
@@ -772,7 +792,8 @@ fn print_file(info: &BootInfo, device: disk::Device, name: &[u8]) {
         return;
     }
     let printer = parallel::Printer::new(base);
-    let finished = drain_print_relay(&printer);
+    let mut last_fault = None;
+    let finished = drain_print_relay(&printer, &mut last_fault);
     console::disable_print_relay();
     if finished {
         println!("Done.");
@@ -832,7 +853,8 @@ fn print_run(command: &[u8], info: &BootInfo) {
         return;
     }
     let printer = parallel::Printer::new(base);
-    let finished = drain_print_relay(&printer);
+    let mut last_fault = None;
+    let finished = drain_print_relay(&printer, &mut last_fault);
     console::disable_print_relay();
     if finished {
         println!("Done.");
@@ -1692,23 +1714,47 @@ fn nic_send() {
     }
 }
 
+/// Writes `bytes` to `printer` live, one at a time, via
+/// `write_to_printer_with_retry`. Returns `false` the moment the operator
+/// gives up mid-fault (F12), leaving the remainder of `bytes` unsent --
+/// the same "pause, don't abort, but stop entirely on a deliberate give
+/// up" contract every other printer-writing path in this module follows.
+fn print_bytes_live(
+    printer: &parallel::Printer,
+    bytes: &[u8],
+    last_fault: &mut Option<parallel::PrinterFault>,
+) -> bool {
+    for &byte in bytes {
+        if !write_to_printer_with_retry(printer, byte, last_fault) {
+            return false;
+        }
+    }
+    true
+}
+
 /// `term printer`/`term LPTn`: an exclusive terminal mode that runs the
 /// live shell against a physical printer instead of a screen or a network
-/// peer. Unlike `term_net`'s `LineEditor` (which echoes and executes each
-/// byte as it arrives), a line here is buffered locally and edited purely
-/// on screen until Enter commits it -- nothing reaches the printer for a
-/// line discarded with F2 (`KeyEvent::KillLine`), since ink cannot be
-/// erased the way a screen or a network peer's own line editor can.
+/// peer, echoing true teletype-style: every typed character (including
+/// the prompt and the line's own trailing newline) is written to the
+/// physical printer the instant it is typed, exactly like a real
+/// teletype/telex terminal, not buffered until Enter. This means F2
+/// (`KeyEvent::KillLine`) can no longer act as a genuine undo -- ink
+/// already on the paper cannot be erased -- so it instead just abandons
+/// the local input buffer (as if the operator had never typed it) and
+/// prints a fresh `"\r\n" + "fos> "` break, the same way a real teletype
+/// operator would simply start a fresh line after a visible mistake
+/// rather than pretend it never happened. Backspace remains screen/
+/// buffer-only and is never itself sent to the printer, so backspacing
+/// over an already-printed character leaves it visible on the physical
+/// paper -- an intentional, documented limitation of live echo, not a
+/// bug.
 ///
-/// Once a line commits: the typed command (echoed as `"fos> " + line`,
-/// exactly matching the local prompt) and then that command's own output
-/// are both queued via the print-relay mechanism (`console::
-/// enable_print_relay`/`print_relay_push_raw`, tapped automatically by
-/// every `println!`/`print!` call through `console::relay_push` -- see
-/// its own doc comment) and drained to the printer by `drain_print_relay`,
-/// which pauses and retries indefinitely on a fault (paper out, offline,
-/// a latched error, or an unexpectedly long busy spell) rather than
-/// dropping bytes, until it clears or the operator gives up with F12.
+/// `last_fault` is one variable held for the entire session, threaded
+/// through both the live-typed-character path and `drain_print_relay`
+/// (used for each command's own captured output) below, so an ongoing
+/// fault is reported once across the whole session, not re-announced the
+/// moment output-draining begins right after a fault was already being
+/// reported during typing.
 ///
 /// `help` refuses to run while `PRINTER_SESSION_ACTIVE` is set (see its
 /// arm in `execute`), to avoid burning a whole sheet of paper by habit;
@@ -1716,17 +1762,24 @@ fn nic_send() {
 #[inline(never)]
 fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
     let name = core::str::from_utf8(name).unwrap_or("?");
-    println!("Entering printer terminal mode on {name}. A typed line is only shown on");
-    println!("screen and sent to the printer once you press Enter; F2 discards it first.");
-    println!("Backspace edits the line normally and is never itself sent to the printer.");
+    println!("Entering printer terminal mode on {name}. Every keystroke is echoed to the");
+    println!("printer live as you type, teletype style; F2 abandons the current line (it");
+    println!("cannot un-print already-inked characters) and starts a fresh one. Backspace");
+    println!("edits the line on screen only and is never itself sent to the printer.");
     println!("Commands run here print their own output too; 'help' is disabled here --");
     println!("run 'print run help' once for a paper copy instead. Press F12 (or");
     println!("F4/F6/F7/F8/F10) to leave.");
 
     let printer = parallel::Printer::new(base);
+    let mut last_fault: Option<parallel::PrinterFault> = None;
     let mut buffer = [0u8; LINE_CAPACITY];
     let mut length = 0usize;
     prompt();
+    if !print_bytes_live(&printer, b"fos> ", &mut last_fault) {
+        println!();
+        println!("Leaving printer terminal mode; back at the fos shell.");
+        return;
+    }
     loop {
         match keyboard::poll_term_event() {
             Some(keyboard::KeyEvent::Escape) => {
@@ -1739,18 +1792,24 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
                     length -= 1;
                     console::erase_last_character();
                 }
+                if !print_bytes_live(&printer, b"\r\nfos> ", &mut last_fault) {
+                    println!();
+                    println!("Leaving printer terminal mode; back at the fos shell.");
+                    return;
+                }
             }
             Some(keyboard::KeyEvent::Char(b'\r' | b'\n')) => {
                 println!();
+                if !print_bytes_live(&printer, b"\r\n", &mut last_fault) {
+                    println!("Leaving printer terminal mode; back at the fos shell.");
+                    return;
+                }
                 unsafe {
                     PRINTER_SESSION_ACTIVE = true;
                 }
                 console::enable_print_relay();
-                console::print_relay_push_raw(b"fos> ");
-                console::print_relay_push_raw(&buffer[..length]);
-                console::print_relay_push_raw(b"\r\n");
                 execute(&buffer[..length], info);
-                let finished = drain_print_relay(&printer);
+                let finished = drain_print_relay(&printer, &mut last_fault);
                 console::disable_print_relay();
                 unsafe {
                     PRINTER_SESSION_ACTIVE = false;
@@ -1761,6 +1820,11 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
                     return;
                 }
                 prompt();
+                if !print_bytes_live(&printer, b"fos> ", &mut last_fault) {
+                    println!();
+                    println!("Leaving printer terminal mode; back at the fos shell.");
+                    return;
+                }
             }
             Some(keyboard::KeyEvent::Char(8 | 127)) if length > 0 => {
                 length -= 1;
@@ -1770,6 +1834,11 @@ fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
                 buffer[length] = byte;
                 length += 1;
                 print!("{}", byte as char);
+                if !print_bytes_live(&printer, &[byte], &mut last_fault) {
+                    println!();
+                    println!("Leaving printer terminal mode; back at the fos shell.");
+                    return;
+                }
             }
             Some(keyboard::KeyEvent::Char(_)) | None => {}
         }

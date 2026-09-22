@@ -340,8 +340,9 @@ PCI-discovered serial controllers as `PCI0`, `PCI1`, ...) and
 F12 exits).
 
 Printer commands: `printer` (lists LPT1..LPT4 via the BIOS Data Area),
-`term printer|LPT1|...|LPT4` (buffered-line printer terminal; F12 exits,
-F2 discards the line being typed), and `print [diskN] NAME`/`print run
+`term printer|LPT1|...|LPT4` (teletype-style live printer terminal; F12
+exits, F2 abandons the line being typed and starts a fresh one), and
+`print [diskN] NAME`/`print run
 CMD...` (print a file, or a command's own output, to the first detected
 LPT port).
 
@@ -1689,8 +1690,8 @@ first in the list and in every user-facing message since it remains the
 most commonly documented, most muscle-memory choice. F2 was later given
 its own distinct meaning -- see "A physical printer port" below -- rather
 than being added to this "give up" list, since it needs to mean something
-narrower ("discard the line I'm typing," only inside `term_printer`) than
-every other key here.
+narrower ("abandon the line I'm typing without executing it," only inside
+`term_printer`) than every other key here.
 
 
 ### A physical printer port
@@ -1717,13 +1718,35 @@ hardware notes" below): several Centronics signals (`nBusy`, `nAck`,
 `nError`) are active-low on the physical cable, and different references
 disagree on exactly how an ISA bus buffer presents them back to software.
 The polarities implemented follow the most commonly cited convention
-(matching Linux's historic `parport_pc`/`lp` driver headers) but have
-only been checked against QEMU's `-parallel` emulation, not a real
-Centronics cable -- `kernel/src/parallel.rs`'s own module doc comment
-flags this prominently. The user's physical Panasonic KX-P1083 dot-matrix
-printer is the intended real-hardware validation target; until that
-happens, treat the fault classification (which bit means what) as
-unconfirmed.
+(matching Linux's historic `parport_pc`/`lp` driver headers and the
+signaling IBM Proprinter emulation follows) but have only been checked
+against QEMU's `-parallel` emulation, not a real Centronics cable --
+`kernel/src/parallel.rs`'s own module doc comment flags this prominently.
+The user's physical Panasonic KX-P1083 dot-matrix printer is the intended
+real-hardware validation target; until that happens, treat the fault
+classification (which bit means what) as unconfirmed.
+
+**Real-hardware follow-up: a false "Printer out of paper" report, traced
+to the printer's own emulation-mode DIP switch, not (necessarily) a
+polarity bug in this driver.** The user's KX-P1083 reported "out of
+paper" with paper loaded and the printer online. This driver's status-bit
+polarities were re-checked against the standard SPP status register
+layout and found to already match the documented convention exactly, so
+no obviously wrong constant was found by inspection alone. The likely
+explanation instead: the KX-P1083 (like the related KX-P1080/1081) has a
+DIP-switch-selected emulation mode, IBM Proprinter or Standard (Epson-
+compatible) -- this driver's status-bit assumptions are modeled on IBM
+Proprinter-style signaling, but Standard/Epson mode is documented to
+present the Paper-Out status line differently (sometimes inactive,
+sometimes following Epson's own protocol instead), which would read as a
+spurious paper-out condition to software expecting IBM-style signaling
+regardless of any polarity constant in this file. The user confirmed
+their printer is currently set to Standard mode, not IBM Proprinter mode.
+The recommended fix is hardware-side (set the printer's DIP switches to
+IBM Proprinter emulation, matching this driver's assumptions) rather than
+guessing at a software-side bit inversion for Epson-mode semantics this
+driver has never been written against; this remains unconfirmed pending
+the user re-testing with the mode switched.
 
 `shell.rs` adds `term printer`/`term LPT1`..`LPT4` (an exclusive terminal
 mode, mirroring `term COM1`/`term_net`'s existing "one active mode at a
@@ -1751,28 +1774,42 @@ time" convention) and a `print` command pair (`print [diskN] NAME`,
   `relay_push` (called from `write_serial`) -- generalized to feed both
   queues unconditionally, so any command's ordinary `println!`/`print!`
   output is captured for the printer automatically, with no per-call-site
-  instrumentation needed. A separate, gate-bypassing
-  `print_relay_push_raw` exists specifically for `term_printer` to inject
-  the just-committed input line's transcript (`"fos> " + line + "\r\n"`)
-  without duplicating it on VGA the way an ordinary `println!` would.
+  instrumentation needed. `print_relay_push_raw` bypasses this tap
+  entirely (queuing raw bytes with no VGA echo of its own); it remains in
+  use only by `print_file`, which queues a whole file's raw contents this
+  way rather than routing them through `println!`.
 
-**Typed input is buffered, not sent live.** Unlike `term_net`'s
-`LineEditor` (which echoes and executes each byte as it arrives),
-`term_printer` keeps its own local line buffer and echoes each keystroke
-to VGA only (`console::write_vga_only`, bypassing both relay queues
-entirely) while the line is being edited. Nothing reaches the print-relay
-queue -- and therefore the physical printer -- until Enter commits the
-line; F2 discards the buffered line and its on-screen echo with nothing
-ever queued for it. This is a deliberate design choice, not an oversight:
-ink cannot be erased the way a screen or a network peer's own line editor
-can, so buffering is what makes F2's "cancel a mistyped line" meaningful,
-and avoids wasting paper on a typo. Once Enter commits a line: the
-transcript, then that line's own command output (captured automatically
-via the shared `relay_push` tap above), are drained together to the
-printer by `shell::drain_print_relay`, which reports a fault once and
-retries the *same* byte indefinitely -- pausing, not aborting -- until it
-clears or the operator gives up with F12, exactly matching this feature's
-`fault_behavior=pause` design decision.
+**Typed input is echoed live, teletype style, not buffered until
+Enter.** Unlike the original design (buffer locally, echo to VGA only,
+and queue nothing for the printer until Enter commits the line),
+`term_printer` now writes every typed character to the physical printer
+the instant it is typed -- via a new `shell::write_to_printer_with_retry`/
+`print_bytes_live` pair, not the print-relay queue -- exactly mirroring
+`term_net`'s own live, byte-at-a-time echo, just to a printer instead of a
+network peer. This was a deliberate reversal of the earlier design once
+real-hardware testing showed the buffered approach didn't read as a
+teletype at all: a real teletype/telex terminal always inks a character
+the instant a key is struck, with no "not yet committed" state. F2
+(`KeyEvent::KillLine`) can therefore no longer act as a genuine undo --
+already-inked characters cannot be un-printed -- so it instead just
+abandons the local input buffer (clearing the on-screen echo the same way
+as before) and prints a fresh `"\r\n" + "fos> "` break to the paper,
+mirroring how a real teletype operator would simply start a fresh line
+after a visible mistake rather than pretend it never happened. Backspace
+remains screen/buffer-only and is still never itself sent to the printer,
+so backspacing over an already-printed character leaves that character
+visible on the physical paper -- an intentional, documented limitation of
+live echo, not a bug. Enter still triggers the same enable-queue-execute-
+drain-disable cycle as before for a committed command's own *output*
+(unchanged, since that output is only known once the command actually
+runs) -- only the typed input side changed. One `last_fault:
+Option<PrinterFault>` variable is now held for an entire `term_printer`
+session and threaded through both the live per-character writes and
+`drain_print_relay` (whose signature grew a matching `&mut
+Option<PrinterFault>` parameter), so an ongoing fault is reported once
+across the whole session rather than being re-announced the moment
+output-draining begins right after a fault was already being reported
+during typing.
 
 **`help` refuses to run while `PRINTER_SESSION_ACTIVE`** (a small flag
 set only for the duration of a `term_printer` session's own `execute`

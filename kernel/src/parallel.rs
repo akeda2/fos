@@ -27,6 +27,17 @@
 //! QEMU's `-parallel` emulation, not a real Centronics cable -- they are
 //! **not yet confirmed against a real printer** (the user's Panasonic
 //! KX-P1083 is the intended validation target; see AGENTS.md).
+//!
+//! A real-hardware report of a false "out of paper" status against that
+//! printer was traced, most likely, to the printer's own DIP-switch-
+//! selected emulation mode rather than a polarity bug here: the KX-P1083
+//! supports both IBM Proprinter and Standard (Epson-compatible) emulation,
+//! and Standard mode is documented to present the Paper-Out status line
+//! differently than IBM Proprinter mode does. This driver's polarities
+//! assume IBM Proprinter-style signaling; a printer left in Standard mode
+//! should be switched to IBM Proprinter mode rather than this file's
+//! constants being reworked to guess at Epson-mode semantics. This remains
+//! unconfirmed pending the user re-testing with the mode switched.
 use crate::arch::x86::{inb, outb};
 
 /// BIOS Data Area addresses of each legacy LPT port's base I/O address, in
