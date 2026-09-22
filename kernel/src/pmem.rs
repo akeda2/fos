@@ -148,13 +148,21 @@ pub fn initialize(info: &BootInfo) {
     let (total, _) = stats();
     let (big_total, _) = big_stats();
     crate::println!(
-        "Physical memory: {total} frames ({} KiB) tracked above 0x{RESERVED_BELOW:05x}, excluding 0x{TAPE_BASE:05x}-0x{:05x} reserved for tapes; use 'pmem'/'palloc'/'pfree' to inspect.",
+        "Physical memory: {total} frames ({} KiB) tracked above 0x{RESERVED_BELOW:05x},",
         u64::from(total as u32) * u64::from(FRAME_SIZE) / 1024,
-        TAPE_BASE + TAPE_LEN
     );
     crate::println!(
-        "Additionally tracked in 1 MiB chunks from 0x{BIG_POOL_BASE:08x}-0x{BIG_POOL_END:08x} for a tape's own 'alloc'/'free' callbacks: {big_total} MiB usable so far this boot."
+        "excluding 0x{TAPE_BASE:05x}-0x{:05x} reserved for tapes; use 'pmem'/",
+        TAPE_BASE + TAPE_LEN
     );
+    crate::println!("'palloc'/'pfree' to inspect.");
+    crate::println!(
+        "Additionally tracked in 1 MiB chunks from 0x{BIG_POOL_BASE:08x}-",
+    );
+    crate::println!(
+        "0x{BIG_POOL_END:08x} for a tape's own 'alloc'/'free' callbacks: {big_total} MiB",
+    );
+    crate::println!("usable so far this boot.");
 }
 
 /// Removes `[base, base + length)` from the free pool (and from the total

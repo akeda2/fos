@@ -190,6 +190,21 @@ explain the relevant ABI, register/port behavior, timing assumptions, and
 why the implementation follows the project's constraints rather than leaving
 those details implicit.
 
+Every shell command's output should fit an 80x25 VGA screen without wrapping
+or, where at all avoidable, scrolling: keep each `println!`/`print!` line to
+at most 79 columns (not 80 -- a line landing exactly on column 80 wraps *and*
+leaves a spurious blank row for its own trailing `'\n'`, as the `help`
+rewrite below found the hard way), splitting a long message across two or
+more `println!` calls rather than one long line. A command whose output is
+inherently unbounded or can legitimately exceed 25 rows for its own good
+reason (e.g. `ls` listing up to FOSFS's 64 directory entries, `nic sniff`'s
+captured-frame dump, or a long `memmap`/E820 listing) may still scroll --
+the console's own scroll logic (see `tapes/primes.S`'s scroll/cursor
+handling above) already handles that correctly -- but scrolling should never
+be the *incidental* result of an oversized fixed message that could easily
+have been split to fit, and a command's normal/expected case should stay on
+one screen whenever practical.
+
 ## Disk image and safety
 
 `tools/build_image.py` creates `build/fos.img`, a 16 MiB raw image with a

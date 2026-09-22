@@ -88,7 +88,8 @@ EXPECTED_COMMON = (
     b"largest prime: 997",
     b"Saved 5052 byte(s) of the loaded tape to disk1 'hello-copy.bin'.",
     b"File removed.",
-    b"Loaded 5052 byte(s) from 'hello-copy.bin' at 0x100000. 'tape run' to execute it.",
+    b"Loaded 5052 byte(s) from 'hello-copy.bin' at 0x100000.",
+    b"'tape run' to execute it.",
     b"fos Rust test tape: Sieve of Eratosthenes up to 1000",
     b"primes found:  168",
     b"largest prime: 997",
@@ -475,16 +476,29 @@ def main() -> None:
             process.stdin.flush()
             wait_for(output, selector, b"Halting CPU.", 10, start)
             expected = list(EXPECTED_COMMON)
-            memory_marker = (
-                b"Paging intentionally disabled: legacy unsafe physical-address mode;"
+            memory_markers = (
+                [
+                    b"Paging intentionally disabled: legacy unsafe physical-address",
+                    b"mode; stack guard pages are unavailable.",
+                ]
                 if args.legacy_unsafe_memory
-                else b"Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO;"
+                else [
+                    b"Paging enabled: supervisor-only identity map for the low",
+                    b"physical range and PCI MMIO; unmapped holes will fault.",
+                ]
             )
-            expected.insert(expected.index(b"Physical memory: "), memory_marker)
+            physical_memory_index = expected.index(b"Physical memory: ")
+            for offset, marker in enumerate(memory_markers):
+                expected.insert(physical_memory_index + offset, marker)
             if not args.legacy_unsafe_memory:
+                protection_index = expected.index(b"Physical memory: ")
                 expected.insert(
-                    expected.index(b"Physical memory: "),
-                    b"Paging protection: kernel text/read-only data reject writes; PCI MMIO maps only when a driver registers its BAR.",
+                    protection_index,
+                    b"Paging protection: kernel text/read-only data reject writes;",
+                )
+                expected.insert(
+                    protection_index + 1,
+                    b"PCI MMIO maps only when a driver registers its BAR.",
                 )
             if args.second_disk:
                 # Matches the conditional "copy disk1 primes.bin disk2
@@ -525,8 +539,10 @@ def main() -> None:
             elif args.nic_watchdog_test:
                 expected.extend(
                     (
-                        b"NIC watchdog: recovered a documented adapter fault in foreground",
-                        b"NIC health: Rx 0 frame(s), Tx 0 frame(s), 1 recovery/recoveries, 0 failed",
+                        b"NIC watchdog: recovered a documented adapter fault in",
+                        b"foreground; polling remains available.",
+                        b"NIC health: Rx 0 frame(s), Tx 0 frame(s), 1 recovery/recoveries,",
+                        b"0 failed;",
                     )
                 )
             else:
@@ -539,16 +555,21 @@ def main() -> None:
                         b"disk2: 8192 sectors; FOSFS partition: LBA 0 + 8192 sectors",
                         b"config.txt  16 bytes, 1 sector(s)",
                         b"hello-from-disk2",
-                        b"Loaded 1000516 byte(s) from 'primes-bak.bin' at 0x100000. 'tape run' to execute it.",
+                        b"Loaded 1000516 byte(s) from 'primes-bak.bin' at 0x100000.",
+                        b"'tape run' to execute it.",
                         b"Copied 16 byte(s) from disk2 'config.txt' to disk1 'config.txt'.",
-                        b"Note: this reused the shared tape buffer, so the previously loaded tape is gone; 'tape load' again before 'tape run'.",
+                        b"Note: this reused the shared tape buffer, so the previously",
+                        b"loaded tape is gone; 'tape load' again before 'tape run'.",
                         b"Copied 16 byte(s) from disk1 'note2.txt' to disk2 'note2-copy.txt'.",
                         b"hello-from-disk1",
-                        b"Usage: tape run [ARGS...] or tape run router @CONFIG_FILE (or @diskN/CONFIG_FILE)",
-                        b"Loaded 16 byte(s) from 'config.txt' at 0x100000. 'tape run' to execute it.",
+                        b"Usage: tape run [ARGS...] or tape run router @CONFIG_FILE",
+                        b"(or @diskN/CONFIG_FILE)",
+                        b"Loaded 16 byte(s) from 'config.txt' at 0x100000.",
+                        b"'tape run' to execute it.",
                         b"Usage: tape load [net|disk NAME|diskN NAME]",
                         b"Copied 1000516 byte(s) from disk2 'primes-bak.bin' to disk1 'primes-rt.bin'.",
-                        b"Loaded 1000516 byte(s) from 'primes-rt.bin' at 0x100000. 'tape run' to execute it.",
+                        b"Loaded 1000516 byte(s) from 'primes-rt.bin' at 0x100000.",
+                        b"'tape run' to execute it.",
                         b"primes found:   78498",
                         b"largest prime:  999983",
                     )

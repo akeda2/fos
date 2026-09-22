@@ -282,9 +282,8 @@ fn vga_command(arguments: &[u8]) {
         mode.height()
     );
     if mode == console::VgaMode::Experimental132x25 {
-        println!(
-            "Warning: 132-column timing is experimental and may not work on every VGA adapter or monitor."
-        );
+        println!("Warning: 132-column timing is experimental and may not work");
+        println!("on every VGA adapter or monitor.");
     }
 }
 
@@ -458,25 +457,28 @@ fn print_uptime() {
 fn print_irq_stats() {
     let (queued_scancodes, dropped_scancodes) = interrupts::scancode_queue_stats();
     println!(
-        "IRQ0 (timer): {} fired; IRQ1 (keyboard): {} fired ({} queued, {} dropped); spurious IRQ7/IRQ15: {} fired",
+        "IRQ0 (timer): {} fired; IRQ1 (keyboard): {} fired ({} queued,",
         interrupts::timer_irq_count(),
         interrupts::keyboard_irq_count(),
         queued_scancodes,
+    );
+    println!(
+        "{} dropped); spurious IRQ7/IRQ15: {} fired",
         dropped_scancodes,
         interrupts::spurious_irq_count()
     );
     let keyboard_restore_failures = keyboard::bios_restore_failures();
     if keyboard_restore_failures != 0 {
-        println!(
-            "PS/2 Scan Code Set 1 restoration after BIOS disk calls failed {keyboard_restore_failures} time(s)."
-        );
+        println!("PS/2 Scan Code Set 1 restoration after BIOS disk calls failed");
+        println!("{keyboard_restore_failures} time(s).");
     }
     for irq in 3..16 {
         if interrupts::pci_irq_registered(irq) {
             println!(
-                "PCI IRQ{irq}: {} dispatch(es) (device handlers only acknowledge and defer receive work).",
+                "PCI IRQ{irq}: {} dispatch(es) (device handlers only acknowledge",
                 interrupts::pci_irq_count(irq)
             );
+            println!("and defer receive work).");
         }
     }
 }
@@ -549,8 +551,9 @@ fn print_serial_ports() {
             let name = core::str::from_utf8(PCI_PORT_NAMES[index]).unwrap_or("?");
             let base = pci_ports[index];
             println!(
-                "{name}: 0x{base:04x} (found via PCI enumeration; free for 'term'; baud chosen when entering it)"
+                "{name}: 0x{base:04x} (found via PCI enumeration; free for 'term';"
             );
+            println!("baud chosen when entering it)");
         }
     }
 }
@@ -628,11 +631,10 @@ fn term_command(info: &BootInfo, arguments: &[u8]) {
         }
         println!("Entering raw terminal mode on COM1 at 115200 baud: your keystrokes are sent");
         println!("byte-for-byte, with no local echo or line editing -- the far end echoes them");
-        println!(
-            "back. Press F12 (or F4/F6/F7/F8/F10) to return to the fos shell. If you are controlling fos over"
-        );
-        println!("this same serial link, note that link is about to become the remote");
-        println!("connection instead: use the VGA console to get back in that case.");
+        println!("back. Press F12 (or F4/F6/F7/F8/F10) to return to the fos shell.");
+        println!("If you are controlling fos over this same serial link, note that link");
+        println!("is about to become the remote connection instead: use the VGA console");
+        println!("to get back in that case.");
         term_loop(console::write_serial_byte, console::read_serial_byte);
         println!("\nLeft terminal mode; back at the fos shell.");
         return;
@@ -755,9 +757,8 @@ fn term_net(info: &BootInfo) {
     let source = nic.mac_address();
     let active_index = nic::active_index();
     let interface_count = nic::count();
-    println!(
-        "Waiting for a remote terminal client to connect; press F12 (or F4/F6/F7/F8/F10) to give up."
-    );
+    println!("Waiting for a remote terminal client to connect; press F12");
+    println!("(or F4/F6/F7/F8/F10) to give up.");
 
     let mut recv_buffer = [0u8; nic::MAX_FRAME_LEN];
     loop {
@@ -807,10 +808,8 @@ fn term_net(info: &BootInfo) {
             }
         };
 
-        println!(
-            "Remote terminal connected from {}. Local input is disabled; F12 (or F4/F6/F7/F8/F10) disconnects it.",
-            Mac(&peer)
-        );
+        println!("Remote terminal connected from {}. Local input is disabled;", Mac(&peer));
+        println!("F12 (or F4/F6/F7/F8/F10) disconnects it.");
         console::enable_relay();
         // Lets `poll_remote_tape_abort` recognize this peer's own frames
         // while a nested blocking command (like `tape_run`) has this
@@ -988,7 +987,8 @@ fn defer_active_term_input(frame: &[u8]) -> bool {
 fn drain_deferred_term_input(editor: &mut LineEditor, info: &BootInfo) {
     if unsafe { TERM_DEFERRED_INPUT_OVERFLOWED } {
         unsafe { TERM_DEFERRED_INPUT_OVERFLOWED = false };
-        println!("\nRemote terminal input overflowed while a blocking command owned the NIC; dropped newest frame(s).");
+        println!("\nRemote terminal input overflowed while a blocking command");
+        println!("owned the NIC; dropped newest frame(s).");
     }
     loop {
         let mut frame = [0u8; TERM_DATA_CAPACITY];
@@ -1221,9 +1221,10 @@ fn nic_status() {
         Err(nic::Status::NotPresent) => {
             println!("No supported Ethernet controller found on the PCI bus.")
         }
-        Err(nic::Status::InitFailed(error)) => println!(
-            "A supported Ethernet controller was found but could not be initialized: {error}"
-        ),
+        Err(nic::Status::InitFailed(error)) => {
+            println!("A supported Ethernet controller was found but could not");
+            println!("be initialized: {error}");
+        }
     }
 }
 
@@ -1267,31 +1268,35 @@ fn nic_watchdog() {
             println!("No supported Ethernet controller found on the PCI bus.")
         }
 
-        Err(nic::Status::InitFailed(error)) => println!(
-            "A supported Ethernet controller was found but could not be initialized: {error}"
-        ),
+        Err(nic::Status::InitFailed(error)) => {
+            println!("A supported Ethernet controller was found but could not");
+            println!("be initialized: {error}");
+        }
     }
 }
 
 fn report_nic_watchdog(result: nic::WatchdogResult) {
     match result {
         nic::WatchdogResult::Healthy => {}
-        nic::WatchdogResult::Recovered => println!(
-            "NIC watchdog: recovered a documented adapter fault in foreground; polling remains available."
-        ),
-        nic::WatchdogResult::Failed => println!(
-            "NIC watchdog: bounded adapter reset/rebuild failed; polling remains available, but this card may need a reset."
-        ),
+        nic::WatchdogResult::Recovered => {
+            println!("NIC watchdog: recovered a documented adapter fault in");
+            println!("foreground; polling remains available.");
+        }
+        nic::WatchdogResult::Failed => {
+            println!("NIC watchdog: bounded adapter reset/rebuild failed; polling");
+            println!("remains available, but this card may need a reset.");
+        }
     }
 }
 
 fn print_nic_health(nic: &nic::Nic) {
     let health = nic.health();
     println!(
-        "NIC health: Rx {} frame(s), Tx {} frame(s), {} recovery/recoveries, {} failed; {}.",
-        health.rx_progress,
-        health.tx_progress,
-        health.recoveries,
+        "NIC health: Rx {} frame(s), Tx {} frame(s), {} recovery/recoveries,",
+        health.rx_progress, health.tx_progress, health.recoveries,
+    );
+    println!(
+        "{} failed; {}.",
         health.recovery_failures,
         if health.recovery_pending {
             "foreground recovery pending"
@@ -1304,12 +1309,16 @@ fn print_nic_health(nic: &nic::Nic) {
 fn print_nic_interrupt_status(nic: &nic::Nic) {
     let stats = nic.interrupt_stats();
     match stats.irq {
-        Some(irq) if interrupts::pci_irq_registered(irq) => println!(
-            "NIC IRQ{irq}: {} notification(s), {} device error notification(s), foreground work {}.",
-            stats.count,
-            stats.errors,
-            if stats.pending { "pending" } else { "not pending" }
-        ),
+        Some(irq) if interrupts::pci_irq_registered(irq) => {
+            println!(
+                "NIC IRQ{irq}: {} notification(s), {} device error notification(s),",
+                stats.count, stats.errors,
+            );
+            println!(
+                "foreground work {}.",
+                if stats.pending { "pending" } else { "not pending" }
+            );
+        }
         Some(irq) => println!(
             "NIC IRQ{irq}: legacy line is unavailable or reserved; polling remains active."
         ),
@@ -1370,9 +1379,8 @@ fn nic_or_report() -> Option<&'static nic::Nic> {
             None
         }
         Err(nic::Status::InitFailed(error)) => {
-            println!(
-                "A supported Ethernet controller was found but could not be initialized: {error}"
-            );
+            println!("A supported Ethernet controller was found but could not");
+            println!("be initialized: {error}");
             None
         }
     }
@@ -1620,9 +1628,10 @@ fn nic_discover() {
         return;
     }
     println!(
-        "Broadcasting a discovery probe on {} interface(s) every few seconds; press F12 (or F4/F6/F7/F8/F10) to stop and see the list.",
+        "Broadcasting a discovery probe on {} interface(s) every few seconds;",
         count
     );
+    println!("press F12 (or F4/F6/F7/F8/F10) to stop and see the list.");
     for index in 0..count {
         let Some(nic) = nic::get_at(index) else {
             continue;
@@ -1737,9 +1746,10 @@ fn chat_command(arguments: &[u8]) {
         }
     } else {
         println!(
-            "'{}' is neither a MAC address (aa:bb:cc:dd:ee:ff) nor a known peer number; see 'nic peers'.",
+            "'{}' is neither a MAC address (aa:bb:cc:dd:ee:ff) nor a known peer",
             core::str::from_utf8(peer_word).unwrap_or("?")
         );
+        println!("number; see 'nic peers'.");
         return;
     };
 
@@ -1748,13 +1758,14 @@ fn chat_command(arguments: &[u8]) {
     let source = nic.mac_address();
 
     match peer {
-        Some(mac) => println!(
-            "Chatting with {} only. F12 (or F4/F6/F7/F8/F10) or '/quit' to leave.",
-            Mac(&mac)
-        ),
-        None => println!(
-            "Broadcasting to everyone listening. F12 (or F4/F6/F7/F8/F10) or '/quit' to leave."
-        ),
+        Some(mac) => {
+            println!("Chatting with {} only. F12 (or F4/F6/F7/F8/F10) or", Mac(&mac));
+            println!("'/quit' to leave.");
+        }
+        None => {
+            println!("Broadcasting to everyone listening. F12 (or F4/F6/F7/F8/F10)");
+            println!("or '/quit' to leave.");
+        }
     }
 
     let mut line = [0u8; CHAT_TEXT_CAPACITY];
@@ -1954,9 +1965,10 @@ fn tape_command(info: &BootInfo, arguments: &[u8]) {
         b"load" => tape_load_command(info, remainder),
         b"save" => tape_save_command(info, remainder),
         b"send" => tape_send_command(info, remainder),
-        _ => println!(
-            "Usage: tape [status|run [ARGS...]|load disk NAME|load net|save [diskN] NAME|send NAME PEER_MAC|PEER_NUMBER]"
-        ),
+        _ => {
+            println!("Usage: tape [status|run [ARGS...]|load disk NAME|load net|");
+            println!("save [diskN] NAME|send NAME PEER_MAC|PEER_NUMBER]");
+        }
     }
 }
 
@@ -1969,10 +1981,10 @@ fn tape_status() {
                 "legacy flat"
             };
             println!(
-                "Tape loaded: #{}; {length} byte(s), {format}, entry 0x{:08x}. 'tape run' to execute it.",
+                "Tape loaded: #{}; {length} byte(s), {format},",
                 unsafe { *(&raw const TAPE_HANDLE) },
-                tape_entry()
-            )
+            );
+            println!("entry 0x{:08x}. 'tape run' to execute it.", tape_entry())
         }
         None => println!("No tape loaded. 'tape load disk NAME' or 'tape load net' to load one."),
     }
@@ -1989,10 +2001,10 @@ fn tape_status() {
 fn allocate_tape_buffer(length: u32) -> Option<u32> {
     if length > pmem::TAPE_LEN {
         println!(
-            "Tape too large: {length} byte(s) exceeds the {}-byte fixed tape region at 0x{:05x}.",
+            "Tape too large: {length} byte(s) exceeds the {}-byte fixed tape",
             pmem::TAPE_LEN,
-            pmem::TAPE_BASE
         );
+        println!("region at 0x{:05x}.", pmem::TAPE_BASE);
         return None;
     }
     Some(pmem::TAPE_BASE)
@@ -2967,9 +2979,8 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
     let arguments = match tape_argument_source(arguments) {
         TapeArgumentSource::Direct(arguments) => arguments,
         TapeArgumentSource::Invalid => {
-            println!(
-                "Usage: tape run [ARGS...] or tape run router @CONFIG_FILE (or @diskN/CONFIG_FILE)"
-            );
+            println!("Usage: tape run [ARGS...] or tape run router @CONFIG_FILE");
+            println!("(or @diskN/CONFIG_FILE)");
             return;
         }
         TapeArgumentSource::File(device, name) => {
@@ -3012,9 +3023,8 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
             }
         }
     };
-    println!(
-        "Running {length}-byte tape at 0x{address:05x} in ring 0, no memory protection or fault recovery."
-    );
+    println!("Running {length}-byte tape at 0x{address:05x} in ring 0, no");
+    println!("memory protection or fault recovery.");
     // No tape's pending remote keystrokes, abort, or raw frame belongs to
     // the next one. Clear this cross-callback state before every entry,
     // including tapes launched locally after a prior `term net` session.
@@ -3144,9 +3154,10 @@ fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
                         return;
                     }
                     println!(
-                        "Loaded {length} byte(s) from '{}' at 0x{address:05x}. 'tape run' to execute it.",
+                        "Loaded {length} byte(s) from '{}' at 0x{address:05x}.",
                         core::str::from_utf8(name).unwrap_or("?")
                     );
+                    println!("'tape run' to execute it.");
                 }
                 Ok(None) => println!("File not found."),
                 Err(error) => println!("FOSFS disk error: {error:?}"),
@@ -3424,9 +3435,10 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         }
     } else {
         println!(
-            "'{}' is neither a MAC address (aa:bb:cc:dd:ee:ff) nor a known peer number; see 'nic peers'.",
+            "'{}' is neither a MAC address (aa:bb:cc:dd:ee:ff) nor a known peer",
             core::str::from_utf8(peer_word).unwrap_or("?")
         );
+        println!("number; see 'nic peers'.");
         return;
     };
 
@@ -3489,7 +3501,8 @@ fn tape_send(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8
     start_frame[14] = TAPE_TAG_START;
     start_frame[15..19].copy_from_slice(&(data.len() as u32).to_le_bytes());
     if !nic.send(&start_frame) {
-        println!("Transmit failed (card reported an error, or timed out); tape not sent.");
+        println!("Transmit failed (card reported an error, or timed out);");
+        println!("tape not sent.");
         return;
     }
     pace_tape_send();
@@ -3504,8 +3517,9 @@ fn tape_send(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8
         data_frame[19..19 + chunk.len()].copy_from_slice(chunk);
         if !nic.send(&data_frame[..19 + chunk.len()]) {
             println!(
-                "Transmit failed on chunk #{seq} (card reported an error, or timed out); tape not fully sent."
+                "Transmit failed on chunk #{seq} (card reported an error, or"
             );
+            println!("timed out); tape not fully sent.");
             return;
         }
         pace_tape_send();
@@ -3517,9 +3531,8 @@ fn tape_send(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], data: &[u8
     stop_frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
     stop_frame[14] = TAPE_TAG_STOP;
     if !nic.send(&stop_frame) {
-        println!(
-            "Transmit failed sending the closing frame; the receiver may report an incomplete tape."
-        );
+        println!("Transmit failed sending the closing frame; the receiver may");
+        println!("report an incomplete tape.");
         return;
     }
 
@@ -3751,11 +3764,13 @@ fn copy_command(info: &BootInfo, arguments: &[u8]) {
         return;
     }
     let Some(source) = strip_disk_selector(source_word) else {
-        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; SRC_DISK must name an attached disk (e.g. disk1).");
+        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; SRC_DISK must name");
+        println!("an attached disk (e.g. disk1).");
         return;
     };
     let Some(destination) = strip_disk_selector(destination_word) else {
-        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; DST_DISK must name an attached disk (e.g. disk2).");
+        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; DST_DISK must name");
+        println!("an attached disk (e.g. disk2).");
         return;
     };
     let destination_name = if new_name.is_empty() { name } else { new_name };
@@ -3843,9 +3858,8 @@ fn invalidate_tape_after_scratch_use() {
         *(&raw mut TAPE) = None;
     }
     if had_tape {
-        println!(
-            "Note: this reused the shared tape buffer, so the previously loaded tape is gone; 'tape load' again before 'tape run'."
-        );
+        println!("Note: this reused the shared tape buffer, so the previously");
+        println!("loaded tape is gone; 'tape load' again before 'tape run'.");
     }
 }
 
@@ -4010,9 +4024,8 @@ fn print_memory_summary(info: &BootInfo) {
             reserved = reserved.saturating_add(length);
         }
     }
-    println!(
-        "E820 summary: {usable} usable bytes; {reserved} non-usable bytes (reserved/ACPI/bad)."
-    );
+    println!("E820 summary: {usable} usable bytes; {reserved} non-usable bytes");
+    println!("(reserved/ACPI/bad).");
 }
 
 fn print_region(index: usize, region: MemoryRegion) {

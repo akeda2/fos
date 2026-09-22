@@ -248,8 +248,11 @@ pub fn initialize() {
     }
 
     crate::println!(
-        "Interrupts enabled: IDT loaded, PIC remapped to 0x{IRQ_BASE:02x}/0x{:02x}, PIT at {PIT_FREQUENCY_HZ} Hz drives IRQ0 (timer), IRQ1 drives the keyboard.",
+        "Interrupts enabled: IDT loaded, PIC remapped to 0x{IRQ_BASE:02x}/0x{:02x},",
         IRQ_BASE + 8
+    );
+    crate::println!(
+        "PIT at {PIT_FREQUENCY_HZ} Hz drives IRQ0 (timer), IRQ1 drives the keyboard."
     );
     #[cfg(feature = "stack-guard-test")]
     crate::stack::trigger_guard_page_for_test();

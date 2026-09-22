@@ -47,20 +47,20 @@ pub extern "C" fn kmain(boot_info_address: u32) -> ! {
     #[cfg(not(feature = "legacy-unsafe-memory"))]
     {
         if paging::initialize().is_err() {
-            println!("KERNEL ERROR: CPU lacks 4 MiB page support required for the paging foundation.");
+            println!("KERNEL ERROR: CPU lacks 4 MiB page support required for");
+            println!("the paging foundation.");
             halt_forever();
         }
-        println!(
-            "Paging enabled: supervisor-only identity map for the low physical range and PCI MMIO; unmapped holes will fault."
-        );
-        println!(
-            "Paging protection: kernel text/read-only data reject writes; PCI MMIO maps only when a driver registers its BAR."
-        );
+        println!("Paging enabled: supervisor-only identity map for the low");
+        println!("physical range and PCI MMIO; unmapped holes will fault.");
+        println!("Paging protection: kernel text/read-only data reject writes;");
+        println!("PCI MMIO maps only when a driver registers its BAR.");
     }
     #[cfg(feature = "legacy-unsafe-memory")]
-    println!(
-        "Paging intentionally disabled: legacy unsafe physical-address mode; stack guard pages are unavailable."
-    );
+    {
+        println!("Paging intentionally disabled: legacy unsafe physical-address");
+        println!("mode; stack guard pages are unavailable.");
+    }
     pmem::initialize(boot_info);
     shell::run(boot_info)
 }
