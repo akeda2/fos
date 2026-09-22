@@ -13,9 +13,10 @@ edition = "2024"
 # ../longmode.S for the equivalent function written in hand-written
 # assembly instead. There is no `_start`, no linker script, and no entry
 # point in this crate at all: `make tape-longmode-rs` links the compiled
-# `.a` this produces directly against the shim's object file with a
-# plain `ld -Ttext=0x100000 -e tape_main`, letting the shim supply the
-# one and only entry point the kernel ever calls.
+# `.a` this produces directly against the shim's object file with
+# `ld -T ../../tapes/longmode64.ld`, letting that shared linker script
+# keep the shim first at 0x100000 and supply the one entry point the
+# kernel ever calls (`tape_main`).
 [lib]
 crate-type = ["staticlib"]
 

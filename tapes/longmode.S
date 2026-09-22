@@ -28,9 +28,10 @@
  * mode" part differs).
  *
  * `tape64_body` is called with an ordinary SysV64 `call` (stack aligned
- * by the shim beforehand) and returns with a plain `ret` -- no
- * arguments, no return value, matching the `extern "C" fn()` contract
- * `tapes/longmode-rs/src/lib.rs`'s Rust version also implements.
+ * by the shim beforehand) and returns with a plain `ret`. The shim now
+ * passes trailing optional arguments (`args_ptr`, `args_len`,
+ * `report_ptr`) for newer bodies, but this one intentionally ignores
+ * them and remains a zero-argument body by design.
  *
  * Build: `make tape-longmode` assembles this and `longmode64_shim.S`
  * both with `as --64`, links them together with a fixed

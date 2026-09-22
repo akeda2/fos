@@ -1,9 +1,12 @@
 //! `tape64_body` written in ordinary `#![no_std]` Rust instead of hand-
 //! written assembly -- the counterpart to `../longmode.S`, both linked
 //! against the same reusable `tapes/longmode64_shim.S` (see that file's
-//! header comment for the full `tape64_body` contract: an `extern "C"
-//! fn()` taking no arguments and returning nothing, called once the
-//! shim has already entered 64-bit mode with its private GDT loaded and
+//! header comment for the full `tape64_body` contract: the shim now
+//! passes `args_ptr`, `args_len`, and `report_ptr` for newer bodies, but
+//! a body declaring no parameters remains valid under SysV64 and simply
+//! ignores them. This crate intentionally does that -- its `tape64_body`
+//! takes no arguments and returns nothing, called once the shim has
+//! already entered 64-bit mode with its private GDT loaded and
 //! interrupts masked, and expected to return normally with a plain
 //! `ret`). See AGENTS.md's "A tape that visits 64-bit long mode and
 //! comes back" section for the full design rationale behind the

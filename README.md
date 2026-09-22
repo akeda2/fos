@@ -114,7 +114,7 @@ plain `make` (still just `make image`) and does not affect `image`/`run`/
 `make all` builds everything this repository knows how to produce in one
 go: the image, `make netrom`, and every test tape (`make tapes`, including
 `tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-bigsieve`/
-`tape-longmode`/`tape-longmode-rs`/`tape-calc`/`tape-ed`/`tape-beep`/
+`tape-longmode`/`tape-longmode-rs`/`tape-cpu64-lab`/`tape-cpu64-show`/`tape-calc`/`tape-ed`/`tape-beep`/
 `tape-morse`/`tape-net-chat`/`tape-ip-chat`/`tape-telnet`/`tape-bridge`/
 `tape-router` -- see "Tape (`tape`)" below). Not needed for ordinary
 kernel/boot work, for which plain `make`
@@ -1109,6 +1109,57 @@ only two e2e tests in this repository that launch
 `qemu-system-x86_64` instead of `qemu-system-i386`, since
 `qemu-system-i386`'s TCG backend cannot emulate the CPUID long-mode
 feature bit at all.
+
+#### Test tape: `tapes/cpu64-lab/`
+
+A modular 64-bit CPU-feature lab body linked against the same reusable
+`tapes/longmode64_shim.S` used by `longmode`/`longmode-rs`. Run it as:
+
+```text
+tape run [probe|x87|mmx|sse|all]
+```
+
+`probe` performs CPUID/XGETBV capability reporting only; the others run
+their named instruction test when supported; `all` runs every gated test.
+The 64-bit body writes a compact structured report into the shim's shared
+buffer, and the 32-bit side prints it after full state restore:
+
+```text
+longmode: 64-bit body report mode=0x..., support=0x..., tests=0x...
+```
+
+Support bits (in `support`) are:
+`bit0=x87`, `bit1=MMX`, `bit2=SSE`, `bit3=SSE2`,
+`bit4=XSAVE`, `bit5=AVX`, `bit6=XCR0.XMM`, `bit7=XCR0.YMM`,
+`bit8=x87 usable now`, `bit9=MMX usable now`, `bit10=SSE usable now`.
+Test bits (in `tests`) are:
+`bit0/1=x87 ran/pass`, `bit2/3=MMX ran/pass`, `bit4/5=SSE ran/pass`.
+
+Build it with `make tape-cpu64-lab` (producing `build/tapes/cpu64-lab.bin`)
+and run `tapes/test_cpu64_lab_e2e.py` for a focused `qemu-system-x86_64`
+integration check.
+
+#### Test tape: `tapes/cpu64-show/`
+
+A 64-bit visual demo that uses a large arena (when available), updates that
+memory each frame with scalar or SSE2 vector math, and renders animated VGA
+text-mode plasma/particle-style output. It reuses the same longmode shim and
+structured report line as `cpu64-lab`.
+
+Run it as:
+
+```text
+tape run [auto|scalar|sse2] [FRAMES]
+```
+
+`auto` picks SSE2 when currently usable, otherwise scalar. `FRAMES` defaults
+to 240. The status line at the bottom shows selected mode, frame progress,
+and arena size in KiB. The report bitfields include whether SSE2 was used and
+whether a large arena was available.
+
+Build it with `make tape-cpu64-show` (producing `build/tapes/cpu64-show.bin`)
+and run `tapes/test_cpu64_show_e2e.py` for a focused smoke test (`tape run
+auto 2`) on `qemu-system-x86_64`.
 
 
 ### Remote terminal (`term net`)

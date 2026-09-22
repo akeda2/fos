@@ -13,6 +13,8 @@ TAPE_VGA_COLORS_BIN := $(BUILD)/tapes/vga-colors.bin
 TAPE_BIGSIEVE_BIN := $(BUILD)/tapes/bigsieve.bin
 TAPE_LONGMODE_BIN := $(BUILD)/tapes/longmode.bin
 TAPE_LONGMODE_RS_BIN := $(BUILD)/tapes/longmode-rs.bin
+TAPE_CPU64_LAB_BIN := $(BUILD)/tapes/cpu64-lab.bin
+TAPE_CPU64_SHOW_BIN := $(BUILD)/tapes/cpu64-show.bin
 TAPE_CALC_BIN := $(BUILD)/tapes/calc.bin
 TAPE_ED_BIN := $(BUILD)/tapes/ed.bin
 TAPE_BEEP_BIN := $(BUILD)/tapes/beep.bin
@@ -30,6 +32,8 @@ TAPE_IMAGE_ARGS := \
 	--file bigsieve.bin $(TAPE_BIGSIEVE_BIN) \
 	--file longmode.bin $(TAPE_LONGMODE_BIN) \
 	--file long-rs.bin $(TAPE_LONGMODE_RS_BIN) \
+	--file cpu64-lab.bin $(TAPE_CPU64_LAB_BIN) \
+	--file cpu64-show.bin $(TAPE_CPU64_SHOW_BIN) \
 	--file calc.bin $(TAPE_CALC_BIN) \
 	--file ed.bin $(TAPE_ED_BIN) \
 	--file beep.bin $(TAPE_BEEP_BIN) \
@@ -43,7 +47,7 @@ TAPE_IMAGE_ARGS := \
 	--file router.cfg tapes/router/router.cfg
 EXTRA_FOSFS_FILES ?=
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -82,13 +86,15 @@ help:
 	@echo "  make test-ne2000-net - build net-chat, then run its two-guest NE2000-compatible network test"
 	@echo "  make test-vga-modes - verify 80x25, 80x50, and experimental 132x25 under QEMU"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-calc + tape-ed + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router + tape-net-dhcp)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-cpu64-lab + tape-cpu64-show + tape-calc + tape-ed + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router + tape-net-dhcp)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
 	@echo "  make tape-bigsieve   - build build/tapes/bigsieve.bin (Rust tape, uses alloc/free for a 64 MiB buffer)"
 	@echo "  make tape-longmode   - build build/tapes/longmode.bin (asm shim + asm body, visits 64-bit long mode and returns)"
 	@echo "  make tape-longmode-rs - build build/tapes/longmode-rs.bin (same asm shim, but the 64-bit body is Rust)"
+	@echo "  make tape-cpu64-lab  - build build/tapes/cpu64-lab.bin (asm shim + Rust 64-bit CPU feature lab body)"
+	@echo "  make tape-cpu64-show - build build/tapes/cpu64-show.bin (64-bit SIMD/memory visual demo)"
 	@echo "  make tape-calc       - build build/tapes/calc.bin (Rust RPN calculator tape; uses read_key/args_ptr/args_len)"
 	@echo "  make tape-ed         - build build/tapes/ed.bin (Rust line editor tape; uses FOSFS callbacks)"
 	@echo "  make tape-beep       - build build/tapes/beep.bin (Rust PC speaker tape; beeps on b via read_key)"
@@ -105,6 +111,8 @@ help:
 	@echo "  make test-tape-bridge - build the image/tape and run the three-guest layer-2 bridge test"
 	@echo "  make test-tape-router - build the image/tape and run the three-guest IPv4 router test"
 	@echo "  make test-tape-ed     - build the image/tape and verify editor FOSFS persistence"
+	@echo "  make test-cpu64-lab   - build image/tape and run the 64-bit CPU feature lab e2e test"
+	@echo "  make test-cpu64-show  - build image/tape and run the 64-bit visual demo e2e smoke test"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -205,7 +213,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -276,9 +284,9 @@ tape-bigsieve:
 # `as`+`objcopy`): x86-64 ELF relocations are RELA-style, so a
 # linker-free objcopy would leave zeroed addresses everywhere either
 # file references a label in the other (see the header comment for the
-# full explanation). `-Ttext=0x100000` matches kernel/src/pmem.rs's
-# TAPE_BASE, the fixed address every tape is loaded at; `-e tape_main`
-# picks the shim's entry point, not the body's. Entirely additive --
+# full explanation). tapes/longmode64.ld fixes the load address at
+# 0x100000 (kernel/src/pmem.rs's TAPE_BASE) and sets `tape_main` as the
+# entry point. Entirely additive --
 # untouched by plain `make`/`image`/`run`/`test`; built as part of
 # `make all`/`make tapes`. Note that actually *running* this tape's real
 # 64-bit excursion needs `qemu-system-x86_64`, not the `qemu-system-i386`
@@ -287,7 +295,7 @@ tape-longmode:
 	mkdir -p $(BUILD)/tapes
 	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
 	as --64 -o $(BUILD)/tapes/longmode.o tapes/longmode.S
-	ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main -o $(BUILD)/tapes/longmode.elf $(BUILD)/tapes/longmode64_shim.o $(BUILD)/tapes/longmode.o
+	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/longmode.elf $(BUILD)/tapes/longmode64_shim.o $(BUILD)/tapes/longmode.o
 	objcopy -O binary $(BUILD)/tapes/longmode.elf $(TAPE_LONGMODE_BIN)
 
 # Builds the "longmode-rs" test tape: the exact same reusable
@@ -301,7 +309,7 @@ tape-longmode:
 # other Rust tape here, this crate is a `staticlib` (see its Cargo.toml),
 # not a `bin`: it has no `_start`/linker script/entry point of its own,
 # just the one `tape64_body` function, linked directly against the
-# shim's object file with the same `ld -Ttext=0x100000 -e tape_main`
+# shim's object file with the same `ld -T tapes/longmode64.ld`
 # recipe as tape-longmode above -- the linker pulls the one needed
 # object out of the archive automatically, resolving tape-longmode64_
 # shim.S's `.extern tape64_body` reference. See AGENTS.md's "A tape that
@@ -313,8 +321,27 @@ tape-longmode-rs:
 	mkdir -p $(BUILD)/tapes
 	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
 	cd tapes/longmode-rs && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
-	ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main -o $(BUILD)/tapes/longmode-rs.elf $(BUILD)/tapes/longmode64_shim.o tapes/longmode-rs/target/x86_64-fos-tape/release/liblongmode_tape_body.a
+	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/longmode-rs.elf $(BUILD)/tapes/longmode64_shim.o tapes/longmode-rs/target/x86_64-fos-tape/release/liblongmode_tape_body.a
 	objcopy -O binary $(BUILD)/tapes/longmode-rs.elf $(TAPE_LONGMODE_RS_BIN)
+
+# Builds the "cpu64-lab" test tape: the same reusable longmode shim as
+# tape-longmode/tape-longmode-rs, but with a Rust body that probes CPUID and
+# (optionally, by startup argument) runs tiny x87/MMX/SSE instruction tests.
+# The body writes a compact bitfield report back through the shim's shared
+# report buffer, which the 32-bit side prints on serial after state restore.
+tape-cpu64-lab:
+	mkdir -p $(BUILD)/tapes
+	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
+	cd tapes/cpu64-lab && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/cpu64-lab.elf $(BUILD)/tapes/longmode64_shim.o tapes/cpu64-lab/target/x86_64-fos-tape/release/libcpu64_lab_tape_body.a
+	objcopy -O binary $(BUILD)/tapes/cpu64-lab.elf $(TAPE_CPU64_LAB_BIN)
+
+tape-cpu64-show:
+	mkdir -p $(BUILD)/tapes
+	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
+	cd tapes/cpu64-show && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/cpu64-show.elf $(BUILD)/tapes/longmode64_shim.o tapes/cpu64-show/target/x86_64-fos-tape/release/libcpu64_show_tape_body.a
+	objcopy -O binary $(BUILD)/tapes/cpu64-show.elf $(TAPE_CPU64_SHOW_BIN)
 
 # Builds the "calc" test tape: same fixed-address Rust setup as
 # tape-vga-colors above (depends on ../tape-rt for _start/panic handler/
@@ -423,5 +450,11 @@ test-tape-net-dhcp: image tape-net-dhcp
 test-tape-ed: image tape-ed
 	python3 tapes/test_ed_e2e.py
 
+test-cpu64-lab: image tape-cpu64-lab
+	python3 tapes/test_cpu64_lab_e2e.py
+
+test-cpu64-show: image tape-cpu64-show
+	python3 tapes/test_cpu64_show_e2e.py
+
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/calc/target tapes/ed/target tapes/net-chat/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/net-chat/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target

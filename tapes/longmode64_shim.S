@@ -19,22 +19,37 @@
  * -- none of that is repeated here.
  *
  * The reusable contract: this file expects exactly one external symbol,
- * `tape64_body`, an ordinary SysV64-ABI function (`extern "C" fn()` in
- * Rust terms) taking no arguments and returning nothing, to be linked in
- * from elsewhere. Between entering 64-bit mode and leaving it again, this
- * file does nothing but `call tape64_body` -- so whatever that body does
- * runs with paging on, CR4.PAE/EFER.LME/CS.L all set, this file's own
- * private GDT loaded, and interrupts masked, exactly like the inline demo
- * `tapes/longmode.S` (asm-only, this shim's original all-in-one form)
- * used to run directly. `tapes/longmode.S` now provides `tape64_body` in
- * hand-written assembly; `tapes/longmode-rs/` provides an equivalent
- * `tape64_body` compiled from ordinary `#![no_std]` Rust instead -- see
- * that crate's `src/lib.rs` for how little is actually different between
- * the two. A future tape wanting to run something else in 64-bit mode
- * (a bigger computation, more VGA output, anything not needing disk/BIOS
- * access -- see AGENTS.md's note on disk I/O's real-mode dependency)
- * only needs to provide its own `tape64_body`, in whichever language, and
- * link against this same shim.
+ * `tape64_body`, an ordinary SysV64-ABI function linked from elsewhere.
+ * This shim calls it as:
+ *
+ *   extern "C" fn(args_ptr: u64, args_len: u64, report_ptr: u64)
+ *
+ * where:
+ * - `args_ptr`/`args_len` mirror `shell::tape_run`'s ordinary startup-
+ *   argument slice (same bytes as `tape run ...` passed after `run`).
+ * - `report_ptr` points to this shim's writable report buffer
+ *   (`report_magic`, `report_version`, `report_mode`, `report_support`,
+ *   `report_tests`) for optional structured status handoff back to the
+ *   32-bit side after the round trip.
+ * - `arena_ptr`/`arena_len` are an optional large temporary buffer
+ *   allocated through tape ABI `alloc` before entering long mode and
+ *   released via `free` after returning (0/0 when unavailable).
+ *
+ * Under SysV64, a body declaring fewer arguments remains valid (unused
+ * trailing register arguments are ignored), so existing zero-argument
+ * longmode demos still link/run unchanged. Between entering 64-bit mode
+ * and leaving it again, this file does nothing but call that body -- so
+ * whatever it does runs with paging on, CR4.PAE/EFER.LME/CS.L all set,
+ * this file's own private GDT loaded, and interrupts masked, exactly like
+ * the inline demo `tapes/longmode.S` (asm-only, this shim's original
+ * all-in-one form) used to run directly. `tapes/longmode.S` now provides
+ * `tape64_body` in hand-written assembly; `tapes/longmode-rs/` provides
+ * an equivalent body compiled from ordinary `#![no_std]` Rust instead.
+ * A future tape wanting to run something else in 64-bit mode (a bigger
+ * computation, more VGA output, anything not needing disk/BIOS access --
+ * see AGENTS.md's note on disk I/O's real-mode dependency) only needs to
+ * provide its own `tape64_body`, in whichever language, and link against
+ * this same shim.
  *
  * `tape64_body` runs with the stack pointer 16-byte aligned (SysV64's
  * calling-convention requirement, unlike cdecl, which this shim's own
@@ -51,12 +66,14 @@
  * Build: never built directly (`.PHONY` in the Makefile has no
  * `tape-longmode64-shim` target) -- always assembled with `as --64` and
  * linked together with whatever object/archive provides `tape64_body`,
- * via `ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main`. See
- * `make tape-longmode`/`make tape-longmode-rs` in the Makefile.
+ * via `ld -T tapes/longmode64.ld --oformat=elf64-x86-64` (that linker
+ * script fixes the load address at 0x100000 and sets `tape_main` as the
+ * entry point). See `make tape-longmode`/`make tape-longmode-rs` in the
+ * Makefile.
  */
 
 .code32
-.text
+.section .longmode_shim, "ax"
 .global tape_main
 .extern tape64_body
 
@@ -67,6 +84,14 @@ tape_main:
     # cdecl argument #1 (the kernel's print-byte callback) sits at
     # 4(%esp) right now -- nothing has touched %esp yet.
     movl 4(%esp), %eax
+    movl 24(%esp), %ecx            # tape_run's args_ptr
+    movl %ecx, saved_args_ptr
+    movl 28(%esp), %ecx            # tape_run's args_len
+    movl %ecx, saved_args_len
+    movl 12(%esp), %ecx            # tape_run's alloc callback
+    movl %ecx, alloc_fn
+    movl 16(%esp), %ecx            # tape_run's free callback
+    movl %ecx, free_fn
 
     # Preserve the caller's callee-saved registers (cdecl).
     pushl %ebp
@@ -94,6 +119,29 @@ tape_main:
 
     leal msg_supported, %esi
     call print_string
+
+    # Ask the kernel for a large temporary arena. Some demos only need a
+    # few KiB; others deliberately stress wide vector loops over many MiB.
+    # A zero pointer is a normal, explicit "not available" case.
+    movl $ARENA_BYTES, %eax
+    pushl %eax
+    call *alloc_fn
+    addl $4, %esp
+    movl %eax, saved_arena_ptr
+    movl $0, saved_arena_len
+    testl %eax, %eax
+    jz .Lno_arena
+    movl $ARENA_BYTES, saved_arena_len
+.Lno_arena:
+
+    # A 64-bit body may optionally fill this report buffer. Keep it zeroed
+    # before every run so old bodies (that do not know about it) cannot
+    # accidentally leave stale status from a previous invocation.
+    movl $0, report_magic
+    movl $0, report_version
+    movl $0, report_mode
+    movl $0, report_support
+    movl $0, report_tests
 
     # ---- save every piece of CPU state we are about to change ----
     # From here until the matching restore below, interrupts stay off:
@@ -154,6 +202,11 @@ long_entry:
     # comment on why) and restore it right after `tape64_body` returns.
     movq %rsp, %r15
     andq $-16, %rsp
+    movl saved_args_ptr, %edi
+    movl saved_args_len, %esi
+    leaq report_magic(%rip), %rdx
+    movl saved_arena_ptr, %ecx
+    movl saved_arena_len, %r8d
     call tape64_body
     movq %r15, %rsp
 
@@ -196,7 +249,31 @@ after_gdt_restore:
 
     leal msg_done, %esi
     call print_string
-    jmp .Lreturn
+    cmpl $0x43503634, report_magic
+    jne .Lfree_arena
+    leal msg_report_prefix, %esi
+    call print_string
+    movl report_mode, %eax
+    call print_hex32
+    leal msg_report_support, %esi
+    call print_string
+    movl report_support, %eax
+    call print_hex32
+    leal msg_report_tests, %esi
+    call print_string
+    movl report_tests, %eax
+    call print_hex32
+    leal msg_report_suffix, %esi
+    call print_string
+.Lfree_arena:
+    movl saved_arena_ptr, %eax
+    testl %eax, %eax
+    jz .Lreturn
+    pushl saved_arena_len
+    pushl %eax
+    call *free_fn
+    addl $8, %esp
+    jmp .Lfree_arena
 
 .Lno_long_mode:
     leal msg_unsupported, %esi
@@ -245,14 +322,49 @@ print_char:
     popl %eax
     ret
 
+#
+# print_hex32: prints %eax as eight lowercase hexadecimal digits.
+#
+print_hex32:
+    pushl %eax
+    pushl %ebx
+    pushl %ecx
+    pushl %edx
+    movl %eax, %edx
+    movl $8, %ecx
+print_hex32_loop:
+    movl %edx, %ebx
+    shrl $28, %ebx
+    movb hex_digits(%ebx), %al
+    call print_char
+    shll $4, %edx
+    decl %ecx
+    jnz print_hex32_loop
+    popl %edx
+    popl %ecx
+    popl %ebx
+    popl %eax
+    ret
+
     .align 4
 putc_fn:            .long 0
+alloc_fn:           .long 0
+free_fn:            .long 0
+saved_args_ptr:      .long 0
+saved_args_len:      .long 0
+saved_arena_ptr:     .long 0
+saved_arena_len:     .long 0
 saved_eflags:        .long 0
 saved_cr0:           .long 0
 saved_cr3:           .long 0
 saved_cr4:           .long 0
 saved_efer_lo:       .long 0
 saved_efer_hi:       .long 0
+report_magic:        .long 0
+report_version:      .long 0
+report_mode:         .long 0
+report_support:      .long 0
+report_tests:        .long 0
 
     .align 8
 saved_gdtr:
@@ -266,6 +378,18 @@ msg_unsupported:
     .asciz "longmode: CPUID reports no long-mode support on this CPU; nothing to do\n"
 msg_done:
     .asciz "longmode: back in ordinary 32-bit protected mode, all state restored\n"
+msg_report_prefix:
+    .asciz "longmode: 64-bit body report mode=0x"
+msg_report_support:
+    .asciz ", support=0x"
+msg_report_tests:
+    .asciz ", tests=0x"
+msg_report_suffix:
+    .asciz "\n"
+hex_digits:
+    .asciz "0123456789abcdef"
+
+.equ ARENA_BYTES, 8388608
 
 # ---- identity-mapped page tables: physical 0..6 MiB via three 2 MiB
 # pages, covering the kernel (0x10000..0x40000), VGA text memory
