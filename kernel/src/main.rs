@@ -20,6 +20,7 @@ mod keyboard;
 mod ne2000;
 mod nic;
 mod paging;
+mod parallel;
 mod pci;
 mod pmem;
 mod rtl8139;

@@ -39,13 +39,27 @@ const ESCAPE_SCANCODES: [u8; 6] = [
     0x44, // F10
 ];
 
-/// One decoded keyboard event as seen by `term`'s raw pass-through loop.
+/// Scan Code Set 1 make code for F2, used only by `shell::term_printer`'s
+/// line-buffered typing loop to discard the not-yet-printed current line
+/// (see that function's doc comment for why this needs its own key,
+/// distinct from ordinary backspace). F2 is one of the function keys this
+/// project deliberately leaves free of any other meaning (see the comment
+/// on `ESCAPE_SCANCODES` above), and is layout-independent for the same
+/// reason F12 is.
+const KILL_LINE_SCANCODE: u8 = 0x3c;
+
+/// One decoded keyboard event as seen by `term`'s raw pass-through loop
+/// (and `term_printer`'s own typing loop, which additionally recognizes
+/// `KillLine`).
 pub enum KeyEvent {
     /// An ordinary key was pressed; forward this byte to the remote end.
     Char(u8),
     /// One of `ESCAPE_SCANCODES` was pressed: stop forwarding and return
     /// to the fos shell.
     Escape,
+    /// F2 was pressed: `term_printer` discards its current, not-yet-sent
+    /// input line. Ignored by every other `poll_term_event` caller.
+    KillLine,
 }
 
 pub struct Keyboard {
@@ -212,6 +226,13 @@ pub fn poll_term_event() -> Option<KeyEvent> {
             None
         } else {
             Some(KeyEvent::Escape)
+        };
+    }
+    if scancode & 0x7f == KILL_LINE_SCANCODE {
+        return if released {
+            None
+        } else {
+            Some(KeyEvent::KillLine)
         };
     }
     let extended = unsafe {

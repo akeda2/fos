@@ -339,6 +339,12 @@ PCI-discovered serial controllers as `PCI0`, `PCI1`, ...) and
 `term [COM1|COM2|COM3|COM4|PCI0|PCI1|...] [BAUD]` (raw terminal pass-through;
 F12 exits).
 
+Printer commands: `printer` (lists LPT1..LPT4 via the BIOS Data Area),
+`term printer|LPT1|...|LPT4` (buffered-line printer terminal; F12 exits,
+F2 discards the line being typed), and `print [diskN] NAME`/`print run
+CMD...` (print a file, or a command's own output, to the first detected
+LPT port).
+
 `readsector` is read-only. `hexdump` is limited to the reserved kernel range
 and at most 128 bytes. FOSFS names are limited to 16 lowercase alphanumeric or
 `.`, `_`, and `-` characters. The fixed command buffer and contiguous
@@ -1676,11 +1682,144 @@ themselves before it ever reaches a guest OS, so a fos operator using one
 of those had no working "give up" key at all. Recognizing several
 function keys instead -- whichever one actually reaches the guest works,
 with nothing to remember or configure -- fixes this without weakening the
-original rationale for using a function key in the first place. F1/F2/F3/
+original rationale for using a function key in the first place. F1/F3/
 F5/F9/F11 were deliberately left out since some terminals bind those to
 their own emulator-level features (new tab, fullscreen, etc.); F12 stays
 first in the list and in every user-facing message since it remains the
-most commonly documented, most muscle-memory choice.
+most commonly documented, most muscle-memory choice. F2 was later given
+its own distinct meaning -- see "A physical printer port" below -- rather
+than being added to this "give up" list, since it needs to mean something
+narrower ("discard the line I'm typing," only inside `term_printer`) than
+every other key here.
+
+
+### A physical printer port
+
+`kernel/src/parallel.rs` is a new, deliberately narrow legacy-ISA
+parallel/Centronics port driver, discovered via the BIOS Data Area
+(`0x408`-`0x40E`, LPT1..LPT4) the same way `console::detect_ports` finds
+COM1..COM4 -- there is no PCI parallel-card discovery to mirror
+`console::detect_pci_ports`, matching this project's existing "ISA only,
+PCI parallel cards out of scope" convention already established for the
+3C509 investigation. It implements only the original IBM PC "SPP"
+(Standard Parallel Port) register set -- Data/Status/Control at
+`base+0`/`+1`/`+2` -- with no bidirectional/EPP/ECP modes. `Printer::
+write_byte` writes a byte, pulses Strobe, and polls the Busy status bit
+for up to `BUSY_POLL_ATTEMPTS` (200,000) reads before giving up and
+reporting a `PrinterFault` (`NotSelected`/`PaperOut`/`ErrorLine`/`Busy`)
+rather than blocking forever -- the same bounded-poll-then-caller-retries
+shape every other polling loop in this kernel already follows.
+
+**Status/control bit polarity is an explicit, documented real-hardware
+caveat**, exactly the same class of risk as the RTL8139's TCR
+interframe-gap field and CR/RCR/TCR write-order surprises (see "Real
+hardware notes" below): several Centronics signals (`nBusy`, `nAck`,
+`nError`) are active-low on the physical cable, and different references
+disagree on exactly how an ISA bus buffer presents them back to software.
+The polarities implemented follow the most commonly cited convention
+(matching Linux's historic `parport_pc`/`lp` driver headers) but have
+only been checked against QEMU's `-parallel` emulation, not a real
+Centronics cable -- `kernel/src/parallel.rs`'s own module doc comment
+flags this prominently. The user's physical Panasonic KX-P1083 dot-matrix
+printer is the intended real-hardware validation target; until that
+happens, treat the fault classification (which bit means what) as
+unconfirmed.
+
+`shell.rs` adds `term printer`/`term LPT1`..`LPT4` (an exclusive terminal
+mode, mirroring `term COM1`/`term_net`'s existing "one active mode at a
+time" convention) and a `print` command pair (`print [diskN] NAME`,
+`print run CMD...`), on top of two new pieces of shared plumbing:
+
+- **`keyboard.rs` gained a sixth recognized key, F2 (`KILL_LINE_SCANCODE`
+  = `0x3c`, `KeyEvent::KillLine`)**, chosen for the same reason F12 was
+  originally chosen (a function key is layout-independent, unlike a
+  Shift/AltGr-modified character a Nordic keyboard might put somewhere
+  unexpected) -- this avoided adding Ctrl-modifier tracking to the
+  keyboard driver, which does not exist at all today. It means "discard
+  the line I'm typing" only inside `term_printer`'s own typing loop;
+  every other blocking loop in this kernel (`term_loop`,
+  `combined_tape_read_key`, `nic sniff`, `nic discover`, `tape_load_net`,
+  `chat_command`) either already has a catch-all match arm or was given
+  one, so adding this variant needed no behavior change anywhere else.
+- **`console.rs` gained a second, fully independent relay queue**
+  (`PRINT_RELAY_QUEUE`/`enable_print_relay`/`disable_print_relay`/
+  `print_relay_active`/`peek_print_relay`/`discard_print_relay`),
+  structurally identical to the existing network relay queue
+  (peek/discard rather than drain, so a fault mid-print never silently
+  loses a byte that was already "read" from the queue but not yet
+  accepted by the printer) and fed from the exact same single tap point,
+  `relay_push` (called from `write_serial`) -- generalized to feed both
+  queues unconditionally, so any command's ordinary `println!`/`print!`
+  output is captured for the printer automatically, with no per-call-site
+  instrumentation needed. A separate, gate-bypassing
+  `print_relay_push_raw` exists specifically for `term_printer` to inject
+  the just-committed input line's transcript (`"fos> " + line + "\r\n"`)
+  without duplicating it on VGA the way an ordinary `println!` would.
+
+**Typed input is buffered, not sent live.** Unlike `term_net`'s
+`LineEditor` (which echoes and executes each byte as it arrives),
+`term_printer` keeps its own local line buffer and echoes each keystroke
+to VGA only (`console::write_vga_only`, bypassing both relay queues
+entirely) while the line is being edited. Nothing reaches the print-relay
+queue -- and therefore the physical printer -- until Enter commits the
+line; F2 discards the buffered line and its on-screen echo with nothing
+ever queued for it. This is a deliberate design choice, not an oversight:
+ink cannot be erased the way a screen or a network peer's own line editor
+can, so buffering is what makes F2's "cancel a mistyped line" meaningful,
+and avoids wasting paper on a typo. Once Enter commits a line: the
+transcript, then that line's own command output (captured automatically
+via the shared `relay_push` tap above), are drained together to the
+printer by `shell::drain_print_relay`, which reports a fault once and
+retries the *same* byte indefinitely -- pausing, not aborting -- until it
+clears or the operator gives up with F12, exactly matching this feature's
+`fault_behavior=pause` design decision.
+
+**`help` refuses to run while `PRINTER_SESSION_ACTIVE`** (a small flag
+set only for the duration of a `term_printer` session's own `execute`
+call), to avoid a full-screen listing burning a whole sheet of paper by
+habit -- the user should consult the manual instead for routine reference.
+`print run help` is a deliberate, always-available exception: `print_run`
+temporarily clears `PRINTER_SESSION_ACTIVE` around its own nested
+`execute` call and restores it afterward, so a genuine one-off paper copy
+of `help` works even when typed from inside an already-active
+`term_printer` session, not only from the ordinary local prompt.
+
+**`print run CMD...`/`print [diskN] NAME` are nesting-aware.** Both were
+originally written assuming they always own the full
+enable-queue-drain-disable cycle themselves, which is correct when either
+is typed at the ordinary local prompt -- but when typed as a command
+*from inside* an already-active `term_printer` session, that session's
+own committed-line flow has already called `enable_print_relay` and
+queued that line's own transcript before `execute` ever reaches
+`print_command`. Naively calling `enable_print_relay` again there resets
+the queue (discarding the transcript still waiting to be drained), and
+draining/disabling independently ends the outer session's print job
+early -- splitting what should be one physical print job (the transcript,
+plus this command's own "Running ...""/output/"Done." messages) into two.
+`console::print_relay_active()` is checked first specifically to detect
+this nesting: when already active, `print_file`/`print_run` only queue
+their own bytes (the file's raw contents, or the command's captured
+output) and leave every bit of enabling, draining, and disabling to the
+outer `term_printer` loop, so it all lands on one continuous piece of
+paper as one job. This was caught by an interactive QEMU-monitor-driven
+manual test (`sendkey`-based, mirroring `tapes/test_vga_colors_e2e.py`'s
+technique) exercising `term printer` -> `print run diskinfo` end to end
+against QEMU's `-parallel file:PATH` emulation, which showed the bug
+directly: only `diskinfo`'s own two output lines reached the captured
+file, with the surrounding transcript and wrapper messages silently
+missing, before this fix.
+
+No automated `make test`-style coverage exists yet for this feature (the
+QEMU `-parallel file:PATH` interactive check above was ad hoc, not a
+committed test script) -- a `make test-printer`-style smoke test using
+that same QEMU flag remains a reasonable follow-up, with the same
+limitation every such test would have: it can prove the happy-path byte
+sequence but not the real Busy/Select/Error handshake or fault recovery,
+which only a real Centronics cable can exercise. Real-hardware validation
+against the user's Panasonic KX-P1083 is the outstanding confirmation
+step before this feature's fault/polarity assumptions can be considered
+settled, consistent with this project's established pattern for
+hardware-facing features (see "Real hardware notes" below).
 
 
 ## Real hardware notes

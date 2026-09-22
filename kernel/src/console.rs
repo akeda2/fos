@@ -157,21 +157,25 @@ pub fn relay_enabled() -> bool {
 /// dropping whatever does not fit rather than blocking or panicking --
 /// this is best-effort diagnostic/interactive output, not a guaranteed
 /// delivery channel, exactly like every other network feature in this
-/// kernel (see `tape_load_net`'s own doc comment on lost frames).
+/// kernel (see `tape_load_net`'s own doc comment on lost frames). Also
+/// feeds the independent print-relay queue below when *it* is active, so
+/// one tap point serves both consumers -- `term_net` and `term_printer`
+/// are mutually exclusive in practice (this is a single-threaded shell),
+/// but nothing here assumes that.
 fn relay_push(bytes: &[u8]) {
     unsafe {
-        if !RELAY_ACTIVE {
-            return;
-        }
-        for &byte in bytes {
-            let next = (RELAY_TAIL + 1) % RELAY_QUEUE_LEN;
-            if next == RELAY_HEAD {
-                break;
+        if RELAY_ACTIVE {
+            for &byte in bytes {
+                let next = (RELAY_TAIL + 1) % RELAY_QUEUE_LEN;
+                if next == RELAY_HEAD {
+                    break;
+                }
+                RELAY_QUEUE[RELAY_TAIL] = byte;
+                RELAY_TAIL = next;
             }
-            RELAY_QUEUE[RELAY_TAIL] = byte;
-            RELAY_TAIL = next;
         }
     }
+    print_relay_push(bytes);
 }
 
 /// Copies up to `out.len()` queued relay bytes into `out` without removing
@@ -198,6 +202,128 @@ pub fn discard_relay(count: usize) {
         let mut remaining = count;
         while remaining != 0 && RELAY_HEAD != RELAY_TAIL {
             RELAY_HEAD = (RELAY_HEAD + 1) % RELAY_QUEUE_LEN;
+            remaining -= 1;
+        }
+    }
+}
+
+/// A second, independent bounded queue, structurally identical to
+/// `RELAY_QUEUE` above but serving `shell::term_printer`/`shell::
+/// print_command` instead of `term_net`: while active, everything this
+/// module writes (prompts, echoed keystrokes from an ordinary `LineEditor`,
+/// and command output) is also captured here, to be drained onto a
+/// parallel-port printer instead of forwarded over Ethernet. Kept separate
+/// from `RELAY_QUEUE` rather than reusing it because the two consumers
+/// decode their queue differently (raw bytes to a printer vs. Ethernet
+/// framing) and, more importantly, so `print_relay_push` (below) can inject
+/// bytes that were deliberately *not* mirrored to this module's own VGA/
+/// serial output -- `term_printer` needs that to record its own committed
+/// input lines on paper without the live, char-by-char echo those lines
+/// already got on screen.
+const PRINT_RELAY_QUEUE_LEN: usize = 4096;
+static mut PRINT_RELAY_QUEUE: [u8; PRINT_RELAY_QUEUE_LEN] = [0; PRINT_RELAY_QUEUE_LEN];
+static mut PRINT_RELAY_HEAD: usize = 0;
+static mut PRINT_RELAY_TAIL: usize = 0;
+static mut PRINT_RELAY_ACTIVE: bool = false;
+
+/// Starts capturing console output into the print-relay queue, discarding
+/// anything left over from a previous session.
+pub fn enable_print_relay() {
+    unsafe {
+        PRINT_RELAY_ACTIVE = true;
+        PRINT_RELAY_HEAD = 0;
+        PRINT_RELAY_TAIL = 0;
+    }
+}
+
+/// Stops capturing via the ordinary `relay_push` tap point. Does not
+/// discard whatever is still queued -- `term_printer`/`print_command`
+/// call this only after they have already drained the queue onto the
+/// printer, exactly like `disable_relay`'s network counterpart.
+pub fn disable_print_relay() {
+    unsafe {
+        PRINT_RELAY_ACTIVE = false;
+    }
+}
+
+/// Reports whether a print-relay session is already capturing output.
+/// `shell::print_command`'s `print_file`/`print_run` check this *before*
+/// touching `enable_print_relay`/`disable_print_relay` themselves: a
+/// `print run CMD`/`print NAME` typed from inside an already-active
+/// `term_printer` session must not call `enable_print_relay` again (it
+/// would discard that session's own not-yet-drained queue contents, e.g.
+/// the just-committed command-line transcript) nor drain/disable on the
+/// outer session's behalf -- see those functions' doc comments.
+pub fn print_relay_active() -> bool {
+    unsafe { PRINT_RELAY_ACTIVE }
+}
+
+/// Appends `bytes` to the print-relay queue if a session is active,
+/// silently dropping whatever does not fit (best-effort, exactly like
+/// `relay_push`). Called from `relay_push` itself, so ordinary `println!`/
+/// `print!` output is captured automatically without any call site
+/// needing to know a printer might be listening.
+fn print_relay_push(bytes: &[u8]) {
+    unsafe {
+        if !PRINT_RELAY_ACTIVE {
+            return;
+        }
+        for &byte in bytes {
+            let next = (PRINT_RELAY_TAIL + 1) % PRINT_RELAY_QUEUE_LEN;
+            if next == PRINT_RELAY_HEAD {
+                break;
+            }
+            PRINT_RELAY_QUEUE[PRINT_RELAY_TAIL] = byte;
+            PRINT_RELAY_TAIL = next;
+        }
+    }
+}
+
+/// Injects `bytes` directly into the print-relay queue, bypassing the
+/// `PRINT_RELAY_ACTIVE` gate above and touching no other output path (no
+/// VGA, no serial, no network relay). `term_printer` uses this to record
+/// its own committed input line on paper: that line was already echoed to
+/// VGA character-by-character as it was typed (see that function's doc
+/// comment on why printing happens only once a line is committed, not
+/// live), so replaying it through the ordinary `println!`/`print!` path
+/// here would duplicate it on screen. This is safe to call regardless of
+/// whether a print-relay session is currently enabled.
+pub fn print_relay_push_raw(bytes: &[u8]) {
+    unsafe {
+        for &byte in bytes {
+            let next = (PRINT_RELAY_TAIL + 1) % PRINT_RELAY_QUEUE_LEN;
+            if next == PRINT_RELAY_HEAD {
+                break;
+            }
+            PRINT_RELAY_QUEUE[PRINT_RELAY_TAIL] = byte;
+            PRINT_RELAY_TAIL = next;
+        }
+    }
+}
+
+/// Copies up to `out.len()` queued print-relay bytes into `out` without
+/// removing them, mirroring `peek_relay`: a byte must stay queued until
+/// the printer has actually accepted it (see `Printer::write_byte`'s
+/// fault handling), not merely been attempted once.
+pub fn peek_print_relay(out: &mut [u8]) -> usize {
+    unsafe {
+        let mut count = 0;
+        let mut index = PRINT_RELAY_HEAD;
+        while count < out.len() && index != PRINT_RELAY_TAIL {
+            out[count] = PRINT_RELAY_QUEUE[index];
+            index = (index + 1) % PRINT_RELAY_QUEUE_LEN;
+            count += 1;
+        }
+        count
+    }
+}
+
+/// Removes up to `count` bytes previously observed with `peek_print_relay`.
+pub fn discard_print_relay(count: usize) {
+    unsafe {
+        let mut remaining = count;
+        while remaining != 0 && PRINT_RELAY_HEAD != PRINT_RELAY_TAIL {
+            PRINT_RELAY_HEAD = (PRINT_RELAY_HEAD + 1) % PRINT_RELAY_QUEUE_LEN;
             remaining -= 1;
         }
     }

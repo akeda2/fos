@@ -8,6 +8,7 @@ use crate::interrupts;
 use crate::keyboard;
 use crate::keyboard::Keyboard;
 use crate::nic;
+use crate::parallel;
 use crate::pmem;
 use crate::{print, println};
 
@@ -329,11 +330,26 @@ fn execute(command: &[u8], info: &BootInfo) {
             // wraps a line at exactly 80, and a println! whose text lands
             // precisely on column 80 wraps *and* leaves a spurious blank
             // row for its own trailing '\n' -- so 79 is the true safe
-            // maximum, not 80) and the whole listing to 11 lines, so it
+            // maximum, not 80) and the whole listing to 13 lines, so it
             // always fits a standard 80x25 screen without wrapping or
             // scrolling any of itself out of view. Prefer trimming detail
             // (full syntax remains in README.md/AGENTS.md) over adding a
             // line or letting one run long if this command ever grows.
+            //
+            // Disabled while connected via `term_printer`: its own output
+            // would otherwise be captured and printed like any other
+            // command's, and this listing is long enough that running it
+            // by habit would waste real paper every time. `print run
+            // help` is a deliberate, always-available exception (it
+            // temporarily clears this flag around its own nested
+            // `execute` call -- see `print_run`) for getting exactly one
+            // paper copy, including from inside an active session.
+            if unsafe { PRINTER_SESSION_ACTIVE } {
+                println!("help is disabled while connected to a printer terminal (it would");
+                println!("print this whole listing). Run 'print run help' once instead, or");
+                println!("check the manual.");
+                return;
+            }
             if no_arguments(arguments) {
                 println!(
                     "System: help clear vga about bootinfo memmap memory cpuinfo hexdump halt reset"
@@ -361,6 +377,12 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("      tape send NAME PEER");
                 println!(
                     "Remote: term net (wait for a remote shell over Ethernet; same as at boot)"
+                );
+                println!(
+                    "Printer: printer (list LPTs), term printer|LPTn (raw, F12 exits, F2 kills"
+                );
+                println!(
+                    "      the current line), print [diskN] NAME | print run CMD..."
                 );
                 println!(
                     "Note: F12 (or F4/F6/F7/F8/F10) gives up on any blocking wait (sniff/term/chat)."
@@ -409,6 +431,8 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"start" if no_arguments(arguments) => start_command(info),
         b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
+        b"printer" if no_arguments(arguments) => print_printer_ports(),
+        b"print" => print_command(info, arguments),
         b"nic" => nic_command(arguments),
         b"chat" => chat_command(arguments),
         b"tape" => tape_command(info, arguments),
@@ -427,7 +451,7 @@ fn execute(command: &[u8], info: &BootInfo) {
             reset();
         }
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
-        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"start" => {
+        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"printer" | b"start" => {
             println!("This command does not accept arguments.");
         }
 
@@ -529,6 +553,12 @@ const SERIAL_PORT_NAMES: [&[u8]; 4] = [b"COM1", b"COM2", b"COM3", b"COM4"];
 /// / `pci::find_serial_ports`), in discovery order.
 const PCI_PORT_NAMES: [&[u8]; console::MAX_PCI_SERIAL_PORTS] = [b"PCI0", b"PCI1", b"PCI2", b"PCI3"];
 
+/// Display names for the four legacy LPT ports, in BIOS Data Area index
+/// order; shared by `printer` (listing) and `term` (port selection). ISA
+/// only -- see `parallel`'s module doc comment for why there is no PCI
+/// parallel-card discovery to mirror `PCI_PORT_NAMES` above.
+const PRINTER_PORT_NAMES: [&[u8]; 4] = [b"LPT1", b"LPT2", b"LPT3", b"LPT4"];
+
 fn print_serial_ports() {
     let ports = console::detect_ports();
     for (index, name) in SERIAL_PORT_NAMES.iter().enumerate() {
@@ -557,6 +587,260 @@ fn print_serial_ports() {
         }
     }
 }
+
+fn print_printer_ports() {
+    let ports = parallel::detect_ports();
+    for (index, name) in PRINTER_PORT_NAMES.iter().enumerate() {
+        let name = core::str::from_utf8(name).unwrap_or("?");
+        match ports[index] {
+            Some(base) => println!("{name}: 0x{base:04x} (free for 'term printer'/'term {name}')"),
+            None => println!("{name}: not detected"),
+        }
+    }
+}
+
+/// The first detected LPT port, for `term printer`/`print`'s "no port
+/// named explicitly" default -- mirrors how bare `term` defaults to COM1.
+fn default_printer_port() -> Option<(&'static [u8], u16)> {
+    let ports = parallel::detect_ports();
+    let index = ports.iter().position(Option::is_some)?;
+    Some((PRINTER_PORT_NAMES[index], ports[index].unwrap()))
+}
+
+/// One human-readable line per [`parallel::PrinterFault`], shown once when
+/// a fault first appears (not on every retry -- see `drain_print_relay`)
+/// and reused by both `term_printer` and `print_command`.
+fn printer_fault_message(fault: parallel::PrinterFault) -> &'static str {
+    match fault {
+        parallel::PrinterFault::NotSelected => {
+            "Printer offline (not selected); waiting... (F12 to give up)"
+        }
+        parallel::PrinterFault::PaperOut => "Printer out of paper; waiting... (F12 to give up)",
+        parallel::PrinterFault::ErrorLine => {
+            "Printer reports an error condition; waiting... (F12 to give up)"
+        }
+        parallel::PrinterFault::Busy => {
+            "Printer busy longer than expected; still waiting... (F12 to give up)"
+        }
+    }
+}
+
+/// Drains the entire print-relay queue to `printer`, one byte at a time,
+/// via [`parallel::Printer::write_byte`]. A fault (paper out, offline, a
+/// latched error, or an unexpectedly long busy spell) is reported once and
+/// then retried with the *same* byte -- never skipped or dropped -- until
+/// it clears or the local operator presses F12 to give up, satisfying
+/// "pause, don't abort" (see `term_printer`'s doc comment) without any
+/// single call blocking forever: each retry is its own bounded
+/// `write_byte` attempt, and F12 is rechecked between every one.
+///
+/// Returns `false` if the operator gave up mid-fault, leaving whatever was
+/// still queued undelivered (silently dropped, exactly like every other
+/// best-effort output queue in this kernel -- see `console::relay_push`'s
+/// own doc comment).
+fn drain_print_relay(printer: &parallel::Printer) -> bool {
+    let mut chunk = [0u8; 256];
+    let mut last_fault: Option<parallel::PrinterFault> = None;
+    loop {
+        let queued = console::peek_print_relay(&mut chunk);
+        if queued == 0 {
+            return true;
+        }
+        let mut written = 0;
+        while written < queued {
+            match printer.write_byte(chunk[written]) {
+                Ok(()) => {
+                    if last_fault.take().is_some() {
+                        println!("Printer recovered; resuming.");
+                    }
+                    written += 1;
+                }
+                Err(fault) => {
+                    if last_fault != Some(fault) {
+                        println!("{}", printer_fault_message(fault));
+                        last_fault = Some(fault);
+                    }
+                    if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+                        console::discard_print_relay(written);
+                        return false;
+                    }
+                }
+            }
+        }
+        console::discard_print_relay(written);
+    }
+}
+
+/// `print [diskN] NAME` prints one FOSFS file's raw contents; `print run
+/// CMD...` runs an ordinary command and prints only its output (never the
+/// echoed command line itself, unlike `term_printer`'s own transcript) --
+/// the intended way to get a one-off paper copy of something like `help`
+/// without leaving it permanently disabled-by-habit inside a printer
+/// session (see `execute`'s `help` arm). Usable at any time, independent
+/// of whether a `term_printer` session is currently open.
+#[inline(never)]
+fn print_command(info: &BootInfo, arguments: &[u8]) {
+    const USAGE: &str = "Usage: print [diskN] NAME | print run CMD...";
+
+    let (first, remainder) = take_word(arguments);
+    if first.eq_ignore_ascii_case(b"run") {
+        if remainder.is_empty() {
+            println!("{USAGE}");
+            return;
+        }
+        print_run(remainder, info);
+        return;
+    }
+
+    let (device, arguments) = parse_disk_and_one_argument(arguments);
+    let (name, trailing) = take_word(arguments);
+    if name.is_empty() || !trailing.is_empty() {
+        println!("{USAGE}");
+        return;
+    }
+    print_file(info, device, name);
+}
+
+/// Reads a whole file through the shared tape staging buffer
+/// (`pmem::TAPE_BASE`/`TAPE_LEN`, exactly like `copy_file` -- see that
+/// function's doc comment for why sharing it with the tape subsystem is
+/// safe) and queues its raw bytes onto the print relay via `console::
+/// print_relay_push_raw`, bypassing VGA/serial entirely: a file being
+/// printed is not also a transcript of anything typed, so there is
+/// nothing to echo.
+///
+/// Nesting-aware, exactly like `print_run` (see its doc comment for why):
+/// if a `term_printer` session's own relay is already active (this was
+/// typed as a command from inside one), this only queues the file's bytes
+/// and leaves enabling/draining/disabling to that outer session, so the
+/// file's content lands on the same paper as everything else the session
+/// prints instead of splitting into its own separate, premature print job.
+/// Otherwise (typed at the ordinary local prompt via `print [diskN]
+/// NAME`), it owns the whole enable-queue-drain-disable cycle itself.
+fn print_file(info: &BootInfo, device: disk::Device, name: &[u8]) {
+    let Some((printer_name, base)) = default_printer_port() else {
+        println!("No LPT port was detected by the BIOS at boot; see 'printer'.");
+        return;
+    };
+    let length = match fosfs::file_length(info, device, name) {
+        Ok(Some(length)) => length,
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    };
+    if length > u32::MAX as u64 {
+        println!("File is too large to print through the shared tape-buffer scratch area.");
+        return;
+    }
+    let length = length as usize;
+    let Some(address) = allocate_tape_buffer(length as u32) else {
+        return;
+    };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
+    match fosfs::read(info, device, name, buffer) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    }
+    invalidate_tape_after_scratch_use();
+
+    let owns_relay = !console::print_relay_active();
+    let printer_name = core::str::from_utf8(printer_name).unwrap_or("?");
+    println!(
+        "Printing {length} byte(s) from disk{} '{}' to {printer_name}...",
+        device_number(device),
+        core::str::from_utf8(name).unwrap_or("?")
+    );
+    if owns_relay {
+        console::enable_print_relay();
+    }
+    console::print_relay_push_raw(buffer);
+    if !owns_relay {
+        // The outer `term_printer` session owns draining/disabling this
+        // queue; just leave the bytes queued for it.
+        return;
+    }
+    let printer = parallel::Printer::new(base);
+    let finished = drain_print_relay(&printer);
+    console::disable_print_relay();
+    if finished {
+        println!("Done.");
+    } else {
+        println!("Gave up printing '{}'.", core::str::from_utf8(name).unwrap_or("?"));
+    }
+}
+
+/// `print run CMD...` runs `command` with the print-relay queue enabled
+/// (so its ordinary console output is captured, exactly as
+/// `term_printer`'s own committed commands are) and then drains that
+/// queue to the printer -- but, unlike `term_printer`, never injects the
+/// command line itself into the queue: this is meant purely as "print
+/// what this command would have shown," not a transcript entry.
+///
+/// Temporarily clears `PRINTER_SESSION_ACTIVE` around the nested
+/// `execute` call so `print run help` (the documented, deliberate
+/// exception to `help`'s printer-session refusal -- see that arm's doc
+/// comment) works even when typed *from inside* an active `term_printer`
+/// session, not only from the ordinary local prompt; the previous value
+/// is restored afterward regardless of which one that was.
+///
+/// Nesting-aware: `console::print_relay_active()` is checked *before* any
+/// of the above, since a `term_printer` session's own committed-line flow
+/// already enables the print relay and queues that line's transcript
+/// before calling `execute` (which is what reaches this function for
+/// `print run ...` typed inside a session). Calling `enable_print_relay`
+/// again here would discard that not-yet-drained transcript (it resets
+/// the queue), and draining/disabling here would end the outer session's
+/// print job early, splitting one line's worth of output across two
+/// separate physical print jobs instead of one. When nested, this instead
+/// just runs `command` and leaves every bit of enabling, draining, and
+/// disabling to the outer `term_printer` loop.
+fn print_run(command: &[u8], info: &BootInfo) {
+    let Some((printer_name, base)) = default_printer_port() else {
+        println!("No LPT port was detected by the BIOS at boot; see 'printer'.");
+        return;
+    };
+    let owns_relay = !console::print_relay_active();
+    let printer_name = core::str::from_utf8(printer_name).unwrap_or("?");
+    println!(
+        "Running '{}' and printing its output to {printer_name}...",
+        core::str::from_utf8(command).unwrap_or("?")
+    );
+    if owns_relay {
+        console::enable_print_relay();
+    }
+    let was_active = unsafe { PRINTER_SESSION_ACTIVE };
+    unsafe {
+        PRINTER_SESSION_ACTIVE = false;
+    }
+    execute(command, info);
+    unsafe {
+        PRINTER_SESSION_ACTIVE = was_active;
+    }
+    if !owns_relay {
+        return;
+    }
+    let printer = parallel::Printer::new(base);
+    let finished = drain_print_relay(&printer);
+    console::disable_print_relay();
+    if finished {
+        println!("Done.");
+    } else {
+        println!("Gave up printing the command's output.");
+    }
+}
+
 
 /// A minimal raw serial terminal emulator: once entered, the chosen port
 /// stops being available for anything else and instead becomes a
@@ -592,7 +876,8 @@ fn print_serial_ports() {
 /// byte pipe with no shell involvement at all.
 #[inline(never)]
 fn term_command(info: &BootInfo, arguments: &[u8]) {
-    const USAGE: &str = "Usage: term [COM1|COM2|COM3|COM4|PCI0|PCI1|...|net] [BAUD]";
+    const USAGE: &str =
+        "Usage: term [COM1|COM2|COM3|COM4|PCI0|PCI1|...|printer|LPT1|...|net] [BAUD]";
 
     let (port_word, remainder) = take_word(arguments);
     let (baud_word, remainder) = take_word(remainder);
@@ -619,6 +904,38 @@ fn term_command(info: &BootInfo, arguments: &[u8]) {
             return;
         }
         term_net(info);
+        return;
+    }
+
+    if port_word.eq_ignore_ascii_case(b"printer") {
+        if baud.is_some() {
+            println!("{USAGE}");
+            return;
+        }
+        let ports = parallel::detect_ports();
+        let Some(index) = ports.iter().position(Option::is_some) else {
+            println!("No LPT port was detected by the BIOS at boot; see 'printer'.");
+            return;
+        };
+        term_printer(info, PRINTER_PORT_NAMES[index], ports[index].unwrap());
+        return;
+    }
+
+    if let Some(index) = PRINTER_PORT_NAMES
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(port_word))
+    {
+        if baud.is_some() {
+            println!("{USAGE}");
+            return;
+        }
+        let ports = parallel::detect_ports();
+        let Some(base) = ports[index] else {
+            let name = core::str::from_utf8(PRINTER_PORT_NAMES[index]).unwrap_or("?");
+            println!("{name} was not detected by the BIOS at boot; see 'printer'.");
+            return;
+        };
+        term_printer(info, PRINTER_PORT_NAMES[index], base);
         return;
     }
 
@@ -698,7 +1015,9 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
         match keyboard::poll_term_event() {
             Some(keyboard::KeyEvent::Escape) => break,
             Some(keyboard::KeyEvent::Char(byte)) => write(byte),
-            None => {}
+            // This raw byte pipe has no line concept for F2 to discard;
+            // only `term_printer`'s own typing loop gives it meaning.
+            Some(keyboard::KeyEvent::KillLine) | None => {}
         }
         if let Some(byte) = read() {
             console::write_vga_only(&[byte]);
@@ -914,6 +1233,14 @@ fn term_net(info: &BootInfo) {
 /// thread this through, can still find out who to listen for.
 static mut ACTIVE_TERM_PEER: Option<[u8; 6]> = None;
 static mut ACTIVE_TERM_SOURCE: Option<[u8; 6]> = None;
+
+/// Set for as long as `term_printer`'s interactive session (or a
+/// deliberately nested `execute` call it makes for a committed line) is
+/// running, so `execute`'s own `help` arm can refuse to run (see its doc
+/// comment) rather than flooding the connected printer with its listing.
+/// Never set by `print_command`'s one-shot `print run CMD`, which is the
+/// intended way to print `help` deliberately, once.
+static mut PRINTER_SESSION_ACTIVE: bool = false;
 
 /// Set by `poll_remote_tape_abort` when it consumes the connected peer's
 /// own `TERM_TAG_BYE` while `term_net`'s own session loop was paused
@@ -1362,6 +1689,90 @@ fn nic_send() {
         );
     } else {
         println!("Transmit failed (card reported an error, or timed out).");
+    }
+}
+
+/// `term printer`/`term LPTn`: an exclusive terminal mode that runs the
+/// live shell against a physical printer instead of a screen or a network
+/// peer. Unlike `term_net`'s `LineEditor` (which echoes and executes each
+/// byte as it arrives), a line here is buffered locally and edited purely
+/// on screen until Enter commits it -- nothing reaches the printer for a
+/// line discarded with F2 (`KeyEvent::KillLine`), since ink cannot be
+/// erased the way a screen or a network peer's own line editor can.
+///
+/// Once a line commits: the typed command (echoed as `"fos> " + line`,
+/// exactly matching the local prompt) and then that command's own output
+/// are both queued via the print-relay mechanism (`console::
+/// enable_print_relay`/`print_relay_push_raw`, tapped automatically by
+/// every `println!`/`print!` call through `console::relay_push` -- see
+/// its own doc comment) and drained to the printer by `drain_print_relay`,
+/// which pauses and retries indefinitely on a fault (paper out, offline,
+/// a latched error, or an unexpectedly long busy spell) rather than
+/// dropping bytes, until it clears or the operator gives up with F12.
+///
+/// `help` refuses to run while `PRINTER_SESSION_ACTIVE` is set (see its
+/// arm in `execute`), to avoid burning a whole sheet of paper by habit;
+/// `print run help` still works, as a deliberate one-shot exception.
+#[inline(never)]
+fn term_printer(info: &BootInfo, name: &[u8], base: u16) {
+    let name = core::str::from_utf8(name).unwrap_or("?");
+    println!("Entering printer terminal mode on {name}. A typed line is only shown on");
+    println!("screen and sent to the printer once you press Enter; F2 discards it first.");
+    println!("Backspace edits the line normally and is never itself sent to the printer.");
+    println!("Commands run here print their own output too; 'help' is disabled here --");
+    println!("run 'print run help' once for a paper copy instead. Press F12 (or");
+    println!("F4/F6/F7/F8/F10) to leave.");
+
+    let printer = parallel::Printer::new(base);
+    let mut buffer = [0u8; LINE_CAPACITY];
+    let mut length = 0usize;
+    prompt();
+    loop {
+        match keyboard::poll_term_event() {
+            Some(keyboard::KeyEvent::Escape) => {
+                println!();
+                println!("Leaving printer terminal mode; back at the fos shell.");
+                return;
+            }
+            Some(keyboard::KeyEvent::KillLine) => {
+                while length > 0 {
+                    length -= 1;
+                    console::erase_last_character();
+                }
+            }
+            Some(keyboard::KeyEvent::Char(b'\r' | b'\n')) => {
+                println!();
+                unsafe {
+                    PRINTER_SESSION_ACTIVE = true;
+                }
+                console::enable_print_relay();
+                console::print_relay_push_raw(b"fos> ");
+                console::print_relay_push_raw(&buffer[..length]);
+                console::print_relay_push_raw(b"\r\n");
+                execute(&buffer[..length], info);
+                let finished = drain_print_relay(&printer);
+                console::disable_print_relay();
+                unsafe {
+                    PRINTER_SESSION_ACTIVE = false;
+                }
+                length = 0;
+                if !finished {
+                    println!("Leaving printer terminal mode; back at the fos shell.");
+                    return;
+                }
+                prompt();
+            }
+            Some(keyboard::KeyEvent::Char(8 | 127)) if length > 0 => {
+                length -= 1;
+                console::erase_last_character();
+            }
+            Some(keyboard::KeyEvent::Char(byte @ 0x20..=0x7e)) if length < LINE_CAPACITY => {
+                buffer[length] = byte;
+                length += 1;
+                print!("{}", byte as char);
+            }
+            Some(keyboard::KeyEvent::Char(_)) | None => {}
+        }
     }
 }
 
@@ -2709,6 +3120,9 @@ extern "C" fn combined_tape_read_key() -> u32 {
         let code = match event {
             keyboard::KeyEvent::Escape => TAPE_EVENT_ABORT,
             keyboard::KeyEvent::Char(byte) => TAPE_EVENT_CHAR_BASE | u32::from(byte),
+            // Meaningless outside `term_printer`'s own typing loop; no
+            // tape ABI event corresponds to it, so just poll again.
+            keyboard::KeyEvent::KillLine => return combined_tape_read_key(),
         };
         if code == TAPE_EVENT_CHAR_BASE | 8 {
             console::erase_last_character();
