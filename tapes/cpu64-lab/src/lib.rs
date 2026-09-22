@@ -170,7 +170,7 @@ fn detect_support() -> u32 {
     if (bits & SUPPORT_SSE) != 0 && x87_usable && (cr4 & (1 << 9)) != 0 {
         bits |= SUPPORT_SSE_USABLE;
     }
-    if (bits & SUPPORT_XSAVE) != 0 {
+    if (bits & SUPPORT_XSAVE) != 0 && (cr4 & (1 << 18)) != 0 {
         let xcr0 = xgetbv0();
         if (xcr0 & (1 << 1)) != 0 {
             bits |= SUPPORT_XCR0_XMM;

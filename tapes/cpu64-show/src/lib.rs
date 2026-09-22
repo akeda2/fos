@@ -184,7 +184,7 @@ fn detect_support(arena_len: usize) -> u32 {
     if (bits & SUPPORT_SSE2) != 0 && (bits & SUPPORT_SSE_USABLE) != 0 {
         bits |= SUPPORT_SSE2_USABLE;
     }
-    if (bits & SUPPORT_XSAVE) != 0 {
+    if (bits & SUPPORT_XSAVE) != 0 && (cr4 & (1 << 18)) != 0 {
         let xcr0 = xgetbv0();
         if (xcr0 & (1 << 1)) != 0 {
             bits |= SUPPORT_XCR0_XMM;
@@ -280,18 +280,81 @@ fn write_u32_decimal(row: usize, mut column: usize, mut value: u32, attribute: u
     column
 }
 
-fn render_frame(words: &[u32], frame: u32, mode: Mode, arena_len: usize, use_sse2: bool) {
+/// Bhaskara I's ~7th-century integer approximation of sin(degrees), scaled
+/// by 1000 (so the true range [-1, 1] becomes roughly [-1000, 1000]). This
+/// keeps the plasma field's math entirely in integer arithmetic, which is
+/// both simpler and faster than pulling in a soft-float sine on this
+/// SSE-disabled, softfloat-ABI target (see targets/x86_64-fos-tape.json).
+fn sin1000(degrees: i32) -> i32 {
+    let mut normalized = degrees % 360;
+    if normalized < 0 {
+        normalized += 360;
+    }
+    let (sign, x) = if normalized < 180 {
+        (1_i64, normalized as i64)
+    } else {
+        (-1_i64, (normalized - 180) as i64)
+    };
+    let numerator = 4 * x * (180 - x) * 1000;
+    let denominator = 40500 - x * (180 - x);
+    if denominator == 0 {
+        return 0;
+    }
+    (sign * (numerator / denominator)) as i32
+}
+
+/// Plain integer square root (Newton's method), used to turn a screen cell's
+/// (dx, dy) offset from center into a radius for the ripple term below.
+fn isqrt(value: u32) -> u32 {
+    if value == 0 {
+        return 0;
+    }
+    let mut x = value;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + value / x) / 2;
+    }
+    x
+}
+
+/// Renders one frame of a classic four-wave plasma field (horizontal ripple,
+/// vertical ripple, diagonal ripple, and a radial ripple from screen center),
+/// each an integer sine of position and time. `sample_words` is the slice of
+/// the arena the vector update just touched this frame; a handful of bright
+/// "particle" sparkles are placed using its live values so the on-screen
+/// picture visibly reflects the ongoing scalar/SSE2 vector workload rather
+/// than only being background computation.
+fn render_frame(sample_words: &[u32], frame: u32, mode: Mode, arena_len: usize, use_sse2: bool) {
     const PALETTE: &[u8; 10] = b" .:-=+*#%@";
+    let phase = (frame as i32).wrapping_mul(6);
+    let center_x = (WIDTH / 2) as i32;
+    let center_y = (HEIGHT / 2) as i32;
     for row in 0..(HEIGHT - 1) {
         for column in 0..WIDTH {
             let cell = row * WIDTH + column;
-            let word_index = ((cell * 97) + (frame as usize * 131)) % words.len();
-            let value = words[word_index];
-            let shade = PALETTE[((value >> 28) as usize) % PALETTE.len()];
-            let color = ((value >> 8) & 0x0f) as u8;
-            let attribute = if color == 0 { 0x0f } else { color };
-            write_cell(cell, shade, attribute);
+            let dx = column as i32 - center_x;
+            // VGA text cells are about twice as tall as wide, so scale the
+            // vertical offset to keep the radial ripple visually circular.
+            let dy = (row as i32 - center_y) * 2;
+            let radius = isqrt((dx * dx + dy * dy) as u32) as i32;
+            let horizontal = sin1000(column as i32 * 9 + phase * 2);
+            let vertical = sin1000(row as i32 * 16 - phase);
+            let radial = sin1000(radius * 7 - phase * 3);
+            let diagonal = sin1000((column as i32 + row as i32) * 5 + phase / 2);
+            let sum = horizontal + vertical + radial + diagonal; // roughly -4000..4000
+            let level = ((sum + 4000).clamp(0, 7999) as u32 * (PALETTE.len() as u32 - 1)) / 8000;
+            let shade = PALETTE[level as usize];
+            let color = (((sum + 4000) / 500) as u8 & 0x07) + 8;
+            write_cell(cell, shade, color);
         }
+    }
+
+    let particle_count = core::cmp::min(16, sample_words.len());
+    for sample in sample_words.iter().take(particle_count) {
+        let px = (*sample as usize) % WIDTH;
+        let py = ((*sample >> 16) as usize) % (HEIGHT - 1);
+        write_cell(py * WIDTH + px, b'*', 0x0f);
     }
 
     for column in 0..WIDTH {
@@ -344,7 +407,7 @@ fn run_demo(words: &mut [u32], requested_mode: Mode, frames: u32, support: u32) 
                 update_scalar(&mut words[..rest], frame.wrapping_add(1));
             }
         }
-        render_frame(words, frame, requested_mode, words.len() * 4, use_sse2 && can_use_sse2);
+        render_frame(&words[start..end], frame, requested_mode, words.len() * 4, use_sse2 && can_use_sse2);
     }
     tests | TEST_RENDERED
 }

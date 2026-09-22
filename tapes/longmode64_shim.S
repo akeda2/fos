@@ -273,7 +273,8 @@ after_gdt_restore:
     pushl %eax
     call *free_fn
     addl $8, %esp
-    jmp .Lfree_arena
+    movl $0, saved_arena_ptr
+    jmp .Lreturn
 
 .Lno_long_mode:
     leal msg_unsupported, %esi
@@ -391,12 +392,12 @@ hex_digits:
 
 .equ ARENA_BYTES, 8388608
 
-# ---- identity-mapped page tables: physical 0..6 MiB via three 2 MiB
-# pages, covering the kernel (0x10000..0x40000), VGA text memory
-# (0xb8000), and this tape's own 4 MiB image (TAPE_BASE..TAPE_BASE+
-# TAPE_LEN, i.e. 0x100000..0x500000). Nothing else is ever touched while
-# in 64-bit mode, so nothing else needs to be mapped. Present + writable
-# is 0x3; present + writable + page-size(2 MiB) is 0x83. ----
+# ---- identity-mapped page tables: first 1 GiB via 2 MiB pages. This
+# still covers the original low-memory requirements (kernel low region,
+# VGA text memory, and the tape image itself) and additionally covers the
+# big-pool arena passed to newer 64-bit demos (`cpu64-show`) which can
+# live well above 6 MiB. Present + writable is 0x3; present + writable +
+# page-size(2 MiB) is 0x83. ----
     .align 4096
 pml4:
     .quad pdpt + 0x3
@@ -409,10 +410,11 @@ pdpt:
 
     .align 4096
 pd:
-    .quad 0x0000000000000083         # 0x000000..0x1fffff
-    .quad 0x0000000000200083         # 0x200000..0x3fffff
-    .quad 0x0000000000400083         # 0x400000..0x5fffff
-    .fill 4096 - 24, 1, 0
+    .set pd_phys, 0
+    .rept 512
+        .quad pd_phys + 0x83
+        .set pd_phys, pd_phys + 0x200000
+    .endr
 
 # ---- this tape's own private GDT, used only for the excursion above and
 # never referenced again once the kernel's original GDTR is restored.
