@@ -93,6 +93,23 @@ struct IdtEntry {
 /// acknowledge/count/mark work and leave descriptor parsing to foreground
 /// polling code. IRQ0/1 remain owned by the PIT/keyboard and IRQ2 is the PIC
 /// cascade, so none may be claimed by PCI.
+///
+/// A legacy INTx line is routinely shared between two or more PCI functions
+/// -- QEMU's own i440fx/PIIX3 IRQ router hands out exactly this on an
+/// ordinary machine (confirmed real-hardware-plausible, not just an
+/// emulator quirk: seen assigning an RTL8139 NIC and an ES1370 audio card
+/// to the same IRQ 11 with no other configuration involved), and a real
+/// motherboard's fixed PCI slot wiring can do the same. Each backend's own
+/// `handle_interrupt()` already checks its device's own status register
+/// before doing anything (`nic.rs`'s documented "ack/count/flag, nothing
+/// else" design), so calling every handler registered on a shared line is
+/// safe: a handler that isn't the actual interrupt source simply finds its
+/// own status bit clear and no-ops. `PCI_IRQ_HANDLERS` therefore holds up
+/// to `MAX_SHARED_HANDLERS` handlers per line rather than one -- the same
+/// bounded-fixed-array convention this kernel already uses everywhere else
+/// -- instead of the previous single-slot design, which silently failed to
+/// register (and therefore left that whole device uninitialized) the
+/// instant it happened to share a line with an already-registered device.
 pub fn register_pci_irq(irq: u8, handler: IrqHandler) -> bool {
     if irq < 3 || irq > 15 || irq == 7 || irq == 15 {
         return false;
@@ -107,12 +124,18 @@ pub fn register_pci_irq(irq: u8, handler: IrqHandler) -> bool {
         );
         asm!("cli", options(nomem, nostack));
         let registered = {
-            let slot = &mut PCI_IRQ_HANDLERS[usize::from(irq)];
-            if let Some(existing) = *slot {
-                core::ptr::fn_addr_eq(existing, handler)
-            } else {
-                *slot = Some(handler);
+            let slots = &mut PCI_IRQ_HANDLERS[usize::from(irq)];
+            if slots
+                .iter()
+                .filter_map(|slot| *slot)
+                .any(|existing| core::ptr::fn_addr_eq(existing, handler))
+            {
                 true
+            } else if let Some(empty) = slots.iter_mut().find(|slot| slot.is_none()) {
+                *empty = Some(handler);
+                true
+            } else {
+                false
             }
         };
         if registered {
@@ -137,7 +160,8 @@ pub fn register_pci_irq(irq: u8, handler: IrqHandler) -> bool {
 }
 
 pub fn pci_irq_registered(irq: u8) -> bool {
-    irq < 16 && unsafe { PCI_IRQ_HANDLERS[usize::from(irq)].is_some() }
+    irq < 16
+        && unsafe { PCI_IRQ_HANDLERS[usize::from(irq)].iter().any(Option::is_some) }
 }
 
 pub fn pci_irq_count(irq: u8) -> u64 {
@@ -150,7 +174,7 @@ pub fn pci_irq_count(irq: u8) -> u64 {
 fn dispatch_pci_irq(irq: u8) {
     unsafe {
         PCI_IRQ_COUNTS[usize::from(irq)] += 1;
-        if let Some(handler) = PCI_IRQ_HANDLERS[usize::from(irq)] {
+        for handler in PCI_IRQ_HANDLERS[usize::from(irq)].into_iter().flatten() {
             handler(irq);
         }
     }
@@ -356,7 +380,14 @@ static mut PIC1_MASK: u8 = NORMAL_PIC1_MASK;
 static mut PIC2_MASK: u8 = 0xff;
 
 type IrqHandler = fn(u8);
-static mut PCI_IRQ_HANDLERS: [Option<IrqHandler>; 16] = [None; 16];
+/// How many distinct device handlers one shared legacy PCI IRQ line can
+/// hold. 4 comfortably covers any realistic sharing scenario this project's
+/// small number of PCI backends (NIC, ES1370, ...) can produce -- QEMU's
+/// own i440fx machine has at most a handful of PCI slots, each contributing
+/// at most one interrupt-registering backend.
+const MAX_SHARED_HANDLERS: usize = 4;
+static mut PCI_IRQ_HANDLERS: [[Option<IrqHandler>; MAX_SHARED_HANDLERS]; 16] =
+    [[None; MAX_SHARED_HANDLERS]; 16];
 static mut PCI_IRQ_COUNTS: [u64; 16] = [0; 16];
 
 /// Switches the PIC back to the BIOS-conventional mapping for a BIOS call.

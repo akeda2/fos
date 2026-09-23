@@ -22,7 +22,7 @@ STAGE2_SECTORS = 32
 # reserved low-memory region the kernel itself must fit inside (see
 # `kernel/linker.ld`).
 KERNEL_LOAD_ADDRESS = 0x10000
-KERNEL_RESERVED_END = 0x60000
+KERNEL_RESERVED_END = 0x70000
 # One fixed-size slot per kernel copy, sized to the whole reserved
 # low-memory region regardless of any one build's actual kernel size, so a
 # later network kernel update (see "A/B kernel slots" below) can never grow

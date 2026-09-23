@@ -20,6 +20,7 @@ TAPE_ED_BIN := $(BUILD)/tapes/ed.bin
 TAPE_BEEP_BIN := $(BUILD)/tapes/beep.bin
 TAPE_MORSE_BIN := $(BUILD)/tapes/morse.bin
 TAPE_NET_CHAT_BIN := $(BUILD)/tapes/net-chat.bin
+TAPE_AUDIO_NET_BIN := $(BUILD)/tapes/audio-net.bin
 TAPE_IP_CHAT_BIN := $(BUILD)/tapes/ip-chat.bin
 TAPE_TELNET_BIN := $(BUILD)/tapes/telnet.bin
 TAPE_BRIDGE_BIN := $(BUILD)/tapes/bridge.bin
@@ -39,6 +40,7 @@ TAPE_IMAGE_ARGS := \
 	--file beep.bin $(TAPE_BEEP_BIN) \
 	--file morse.bin $(TAPE_MORSE_BIN) \
 	--file net-chat.bin $(TAPE_NET_CHAT_BIN) \
+	--file audio-net.bin $(TAPE_AUDIO_NET_BIN) \
 	--file ip-chat.bin $(TAPE_IP_CHAT_BIN) \
 	--file telnet.bin $(TAPE_TELNET_BIN) \
 	--file bridge.bin $(TAPE_BRIDGE_BIN) \
@@ -47,7 +49,7 @@ TAPE_IMAGE_ARGS := \
 	--file router.cfg tapes/router/router.cfg
 EXTRA_FOSFS_FILES ?=
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -87,7 +89,7 @@ help:
 	@echo "  make test-ne2000-net - build net-chat, then run its two-guest NE2000-compatible network test"
 	@echo "  make test-vga-modes - verify 80x25, 80x50, and experimental 132x25 under QEMU"
 	@echo "  make netrom     - build build/netboot.rom, the optional NIC-ROM boot path"
-	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-cpu64-lab + tape-cpu64-show + tape-calc + tape-ed + tape-beep + tape-morse + tape-net-chat + tape-ip-chat + tape-telnet + tape-bridge + tape-router + tape-net-dhcp)"
+	@echo "  make tapes      - build every test tape (same as tape-primes + tape-hello-rs + tape-vga-colors + tape-bigsieve + tape-longmode + tape-longmode-rs + tape-cpu64-lab + tape-cpu64-show + tape-calc + tape-ed + tape-beep + tape-morse + tape-net-chat + tape-audio-net + tape-ip-chat + tape-telnet + tape-bridge + tape-router + tape-net-dhcp)"
 	@echo "  make tape-primes     - build build/tapes/primes.bin (hand-written PIC assembly tape)"
 	@echo "  make tape-hello-rs   - build build/tapes/hello-rs.bin (Rust tape, one-shot)"
 	@echo "  make tape-vga-colors - build build/tapes/vga-colors.bin (Rust tape, loops until 'give up')"
@@ -101,6 +103,7 @@ help:
 	@echo "  make tape-beep       - build build/tapes/beep.bin (Rust PC speaker tape; beeps on b via read_key)"
 	@echo "  make tape-morse      - build build/tapes/morse.bin (Rust Morse trainer; plays A-Z/0-9 via read_key)"
 	@echo "  make tape-net-chat   - build build/tapes/net-chat.bin (Rust shell-compatible Ethernet chat tape)"
+	@echo "  make tape-audio-net  - build build/tapes/audio-net.bin (raw-Ethernet PCM audio streaming tape)"
 	@echo "  make tape-ip-chat   - build build/tapes/ip-chat.bin (Rust IPv4/UDP chat tape; static or DHCP)"
 	@echo "  make tape-telnet   - build build/tapes/telnet.bin (Rust TCP/Telnet terminal tape; static IPv4 or DHCP)"
 	@echo "  make tape-bridge   - build build/tapes/bridge.bin (Rust layer-2 learning bridge/switch tape)"
@@ -114,6 +117,8 @@ help:
 	@echo "  make test-tape-ed     - build the image/tape and verify editor FOSFS persistence"
 	@echo "  make test-cpu64-lab   - build image/tape and run the 64-bit CPU feature lab e2e test"
 	@echo "  make test-cpu64-show  - build image/tape and run the 64-bit visual demo e2e smoke test"
+	@echo "  make test-audio-capture - build image, verify ES1370 ADC/capture via QEMU's none audiodev"
+	@echo "  make test-audio-net   - build image/tape and run the network-fed audio-net playback e2e test"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -217,7 +222,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -398,6 +403,16 @@ tape-net-chat:
 	mkdir -p $(BUILD)/tapes
 	cp tapes/net-chat/target/i686-fos/release/net-chat-tape $(TAPE_NET_CHAT_BIN)
 
+# Builds the "audio-net" test tape: a raw-Ethernet PCM audio streaming tape
+# for kernel/src/audio.rs's ES1370 playback facade. Listen mode (`tape run`)
+# waits for a matching-format stream and forwards it into audio_submit; send
+# mode (`tape run send NAME [MAC]`) replays a raw PCM file already on FOSFS,
+# since the ES1370 driver has no ADC/capture support yet.
+tape-audio-net:
+	cd tapes/audio-net && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	cp tapes/audio-net/target/i686-fos/release/audio-net-tape $(TAPE_AUDIO_NET_BIN)
+
 # Builds the "ip-chat" protocol tape: a 32-bit Rust UDP-over-IPv4 chat
 # application using tape-net for ARP/IPv4/UDP and DHCP. Static mode is the
 # deterministic integration-test path; `tape run dhcp` is for a network with
@@ -460,5 +475,15 @@ test-cpu64-lab: image tape-cpu64-lab
 test-cpu64-show: image tape-cpu64-show
 	python3 tapes/test_cpu64_show_e2e.py
 
+# Uses QEMU's `none` audiodev backend (available everywhere, unlike the
+# `wav`/`pipewire` backends the manual real-microphone demo below needs),
+# so this is safe to run in any environment/CI, including this project's
+# usual sandboxed dev environment with no physical audio hardware at all.
+test-audio-capture: image
+	python3 tapes/test_audio_capture_e2e.py
+
+test-audio-net: image tape-audio-net
+	python3 tapes/test_audio_net_e2e.py
+
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/net-chat/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/net-chat/target tapes/audio-net/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target

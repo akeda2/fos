@@ -1566,11 +1566,22 @@ pool in `kernel/src/pmem.rs`, not the existing frame allocator
 `TRACKED_BYTES` = 128 MiB, 4 KiB-per-frame granularity) was left
 completely alone; a first attempt at this feature just grew its bitmap
 to cover a full 1 GiB and hit a hard, easy-to-forget architectural wall
-instead: `objcopy -O binary` bakes a `.bss` array's *entire* size into
-the shipped flat binary as zero bytes (there's no "reserved but unbacked"
-concept once a `no_std` freestanding binary is flattened), so a 1 GiB
-bitmap (32 KiB, up from the original 4 KiB) directly inflated
-`kernel.bin` by ~28 KB. Stage two now avoids the former single-transfer
+instead: at the time, `objcopy -O binary` baked a `.bss` array's *entire*
+size into the shipped flat binary as zero bytes (there's no "reserved but
+unbacked" concept once a `no_std` freestanding binary is flattened), so a
+1 GiB bitmap (32 KiB, up from the original 4 KiB) directly inflated
+`kernel.bin` by ~28 KB. **This specific mechanism no longer applies to the
+current linker layout** -- see "`audio.rs`: a format-agnostic facade, and
+network-fed playback" below, where a much later investigation found that
+`.bss` (now `linker.ld`'s last section, with nothing loadable after it)
+is *not* baked into `kernel.bin`'s raw file size at all; `entry.S`'s own
+explicit zero-fill loop is what actually makes a large `.bss` static safe
+at runtime today, and the real enforced limit is `linker.ld`'s
+`ASSERT(__kernel_end < 0x60000, ...)`, not the flat file's byte count.
+Whatever caused the ~28 KB growth described here was evidently something
+other than pure `.bss`-truncation behavior at that point in this
+project's history; take the mechanism explained below as the current,
+verified one. Stage two now avoids the former single-transfer
 127-sector ceiling by splitting kernel loading into bounded INT 13h
 extended-read calls that respect each BIOS 64 KiB boundary. The remaining
 limit is the reserved `0x10000..0x60000` low-memory region, currently
@@ -2985,6 +2996,762 @@ remote PUT (`copy disk1 NAME HOST:disk2`), `tape load HOST NAME`, `tape
 run @HOST:diskN/NAME` (evaluating `3 4 +` through the `calc` tape to
 prove a fetched startup-argument file reaches a real tape), and a clean
 `NOT_FOUND` error for a nonexistent remote file all pass.
+
+## Real-time audio streaming: the ES1370 driver
+
+Raised by a real request: could fos support realtime audio streaming
+between two dedicated machines, each with its own audio interface card,
+talking over plain layer-2 Ethernet? The answer settled on after
+discussion is "yes, as a genuine teaching-grade real-time exercise,"
+provided two project-shaping decisions are kept: **audio and `router`
+never run on the same machine** (this project's "do one thing at a time
+and do it well" philosophy, applied literally -- each dedicated machine
+gets its own single-purpose image), and this kernel's single-threaded,
+polling-only architecture is *not* replaced with a general preemptive
+scheduler just for this. A real scheduler was investigated and rejected
+for exactly the reasons "Cooperative/preemptive scheduling" above already
+gives: the single most disruptive cost (auditing/rewriting every place
+that assumes single-threaded execution, especially `disk.rs`'s BIOS
+real-mode trampoline) buys nothing once audio and router are guaranteed
+never to compete for one CPU. What audio *does* need, and does not yet
+have anywhere else in this kernel, is a real ISR that does non-trivial,
+time-critical work instead of this project's usual "ack, count, flag,
+defer to a foreground poll" convention -- see `kernel/src/es1370.rs`'s own
+module doc comment for why that departure is deliberate and scoped
+narrowly to this one driver.
+
+**ES1370 was chosen as the first target the same way RTL8139 was chosen
+as the first NIC:** it is QEMU's own emulated sound device
+(`-device ES1370,audiodev=snd0`), so this driver is testable in CI right
+now, without needing physical hardware for every iteration. It is also
+directly relevant to real hardware this project expects to run on:
+Creative's early "Sound Blaster PCI" cards (SB PCI64/128) are commonly a
+rebranded Ensoniq ES1370 or its near-identical successor ES1371 -- a
+Sound Blaster Live!/Audigy card is a *different*, unrelated chip
+(Creative's own EMU10K1/EMU10K2), not part of this family, so a physical
+card's exact identity should always be confirmed with `pci` first, the
+same caution this project already applies to every other NIC/serial/
+printer card.
+
+Every register offset, bit, and DMA semantic in `kernel/src/es1370.rs`
+was cross-checked directly against QEMU's own `hw/audio/es1370.c`
+emulation (itself transcribed, with attribution, from Linux's historic
+`drivers/sound/es1370.c`), the same rigor this project applies to every
+other register-level driver after the RTL8139 lessons above. DAC1 (one
+stereo 16-bit playback channel) and ADC (one stereo 16-bit recording
+channel) are both implemented -- see "ES1370 ADC/capture support" below
+for the ADC half; DAC2, the MIDI UART, and the joystick port are all
+left untouched, and this driver does not program the external
+AK4531-style mixer chip real hardware also carries (reachable through
+the indirect `CODEC` register) -- QEMU's emulated backend has no such
+gating, so this gap does not block testing here, but a physical card
+may need its master/DAC (and, once a real microphone is attached, its
+mic/ADC) volume unmuted through a separate path before audio is actually
+audible or captured. All of this is, as of this writing, **unverified
+against real hardware** -- expect real-hardware fixups the same way every
+other PCI driver here needed them (see "Real hardware notes" above).
+
+The driver programs a small double-buffered DMA ring (two periods of
+1024 stereo 16-bit frames each, roughly 23 ms/period at 44.1 kHz) and
+lets the hardware loop through both halves continuously once started;
+`Es1370::handle_interrupt` -- installed as this device's legacy PCI IRQ
+handler via the existing `interrupts::register_pci_irq` facade every
+other PCI backend already uses -- refills whichever half just finished
+playing each time `STATUS`'s `STAT_DAC1` bit is raised. A bare
+`Cell<u32>`/`AtomicU32` pair (`tone_phase`, `interrupt_count`/
+`periods_serviced`) is all the state this needs, precisely because the
+work done per interrupt is small and bounded by construction (exactly
+`PERIOD_FRAMES` samples, never a variable amount), unlike NIC frame
+parsing.
+
+### A genuine interrupt storm, not a missing interrupt -- confirmed via QEMU's own `-d int` trace
+
+The first working version of `handle_interrupt` served the very first
+period correctly (proven by a `-audiodev wav` capture containing real,
+continuous, correctly-shaped test-tone audio) but reported **zero**
+interrupts ever having fired, on every subsequent check, via a raw
+counter (`interrupts::pci_irq_count`) incremented unconditionally in
+this kernel's shared PCI-IRQ dispatch path before any device-specific
+handler runs at all. Those two observations flatly contradict each
+other under the assumption "no interrupt fired" -- and turned out to
+both be true simultaneously, for a much stranger reason.
+
+`STAT_DAC1` is a **level**, not an edge, and -- unlike RTL8139's `ISR`,
+which a driver acknowledges by writing back the status bits it just
+handled -- `STATUS` on this chip is entirely read-only. QEMU's own
+`es1370_write` has no case for it at all. The *only* documented way to
+lower an already-set `STAT_DAC1` is the specific transition ES1370's
+datasheet (and QEMU's `es1370_maybe_lower_irq`) requires:
+`SERIAL_CONTROL`'s `P1INTEN` bit going from 1 to 0. The original driver
+never did this, so the first period's genuine, correct interrupt raised
+the level and then left it stuck asserted forever. The instant that
+handler's `iret` restored `EFLAGS.IF`, the still-asserted legacy PCI
+`INTx#` line refired *immediately* -- before any other instruction,
+including one that could print a counter or read a keystroke, ever ran
+again. This was confirmed directly, not inferred: `qemu-system-i386 -d
+int -D logfile` showed the identical faulting `EIP` re-entered over
+188,000 times within a couple of seconds -- a genuine interrupt storm
+that consumed effectively all CPU time from the moment DAC1 first
+activated, starving the very shell command that would have reported a
+nonzero count. QEMU's own `-trace enable=es1370_*` output corroborated
+this from the device side: a real `irq=1` transfer trace event on
+(roughly) every period, immediately followed by a repeating
+`es1370_lost_interrupt` trace event -- QEMU's own internal detection
+that the device wanted to re-assert an already-asserted level.
+
+The fix, `Es1370::acknowledge_dac1`, toggles `P1INTEN` off then
+immediately back on (rather than leaving it permanently disabled) right
+after each period's refill -- clearing the level for that period while
+keeping the next period's interrupt enabled, exactly mirroring the real
+driver convention this chip's own datasheet documents. Confirmed fixed
+three ways: the `-d int` storm disappeared entirely (the shell/keyboard/
+timer stayed fully responsive throughout a multi-second test), the raw
+and per-device interrupt counters agreed and incremented steadily (one
+period roughly every 23 ms, matching `PERIOD_FRAMES`/44.1 kHz), and a
+fresh WAV capture came back 100% non-zero with no discontinuities,
+confirming glitch-free, continuously-refilled playback end to end.
+
+This is a genuinely new failure class for this project's driver work,
+worth naming plainly for future debugging: **a level-triggered interrupt
+source that the driver never acknowledges does not look like "no
+interrupt" from a symptom-only view -- it can look exactly like one**,
+because the resulting storm can starve the very code path that would
+otherwise reveal it. Every other PCI backend here (`rtl8139.rs`,
+`threecom.rs`, `e1000.rs`) already acknowledges its own status register
+on every interrupt as a matter of course, so this exact trap could not
+recur there; ES1370 is simply the first device in this kernel whose
+"how do I clear this" is a register *transition* instead of a
+write-back, and that shape is worth checking explicitly for the next
+driver that has anything resembling a persistent, level-style status
+bit.
+
+### Auditing every `cli`-disabled section in the kernel for audio-safe duration
+
+Once ISR-driven refill was confirmed correct, the next real risk to
+glitch-free playback is anything else in this kernel that disables
+interrupts (`cli`) for long enough to make the CPU miss a whole DAC1
+period (~23 ms at the current `PERIOD_FRAMES`) -- if that happens, the
+hardware loops back and replays a stale half of the ring rather than
+waiting, audibly. Every runtime `cli` site in `kernel/src/*.rs` (boot-time
+`cli`s in `boot/*.S` and `kernel/src/entry.S` all execute before
+interrupts are ever enabled, so they cannot affect a running audio
+stream and are out of scope here) was reviewed for its worst-case
+duration:
+
+- **`disk::call_trampoline` (`kernel/src/disk.rs`) is the one real risk,
+  by a wide margin.** Its `cli`-disabled span covers the *entire* BIOS
+  `INT 13h` round trip through `boot/stage2.S`'s real-mode trampoline --
+  fundamentally unbounded from this kernel's point of view, since it is
+  however long real BIOS/firmware takes to complete one genuine disk
+  transfer (easily tens of milliseconds on real spinning or USB media,
+  dwarfing one 23 ms audio period many times over). Worse, this window's
+  IDT is temporarily the *real-mode* IVT with the PIC remapped to
+  BIOS-conventional vectors (see `call_trampoline`'s own doc comment) --
+  even if `EFLAGS.IF` is set for part of this window, this kernel's own
+  ES1370 interrupt gate is not reachable at all while it lasts, so any
+  DAC1 interrupt that fires during a BIOS disk call is simply not
+  serviced by this driver until the call returns, no matter how the real
+  BIOS's own default interrupt stub handles it. A native ATA/AHCI driver
+  would remove this entirely but is explicitly deferred elsewhere in this
+  document, for unrelated reasons of its own scope. **The actionable
+  mitigation is architectural, not a code change**: the dedicated audio
+  machine must never perform disk I/O while a stream is active. This is
+  exactly what "do one thing at a time and do it well" already implies in
+  practice -- the eventual audio-streaming tape (see the project's own
+  todo list) must load any configuration it needs *before* entering its
+  streaming loop, and never touch FOSFS/disk again once streaming starts.
+- **`interrupts::register_pci_irq`'s own `cli`/`sti` pair, `scancode_queue_stats`/`pop_scancode`'s
+  (`interrupts.rs`), and `read_u64_atomically`'s** are all a handful of
+  register/array reads or one PIC port write apiece -- sub-microsecond,
+  negligible next to a 23 ms budget regardless of how many times any of
+  them run.
+- **`keyboard::set_caps_lock_led` (`kernel/src/keyboard.rs`) is the one
+  other real, if much smaller, finding.** It holds `cli` across up to two
+  bounded 8042-controller polling loops (`wait_for_input_empty`/
+  `wait_for_output`, `100_000` iterations each, the same
+  bounded-poll-then-give-up shape `parallel.rs`'s `BUSY_POLL_ATTEMPTS`
+  already uses elsewhere) -- normally a handful of microseconds in the
+  overwhelmingly common case where the 8042 responds immediately, but
+  theoretically up to on the order of 100 ms in the pathological case
+  where the controller never responds at all. This is deliberately left
+  as a documented, accepted, rare edge case rather than a code change:
+  it only triggers on an actual Caps Lock keypress, and this project's
+  own single-purpose-machine philosophy already implies a dedicated
+  audio-streaming machine is not expected to have an operator typing on
+  it interactively while a stream is live.
+
+No code changes were needed for the second and third bullets; the first
+is recorded here as a hard design constraint on the eventual
+audio-streaming tape rather than a kernel change, consistent with this
+project's preference for a small, explained trade-off over speculative
+complexity elsewhere in this document (e.g. the floppy `A`/`B` naming
+collision, the `DISK2`-named-file collision).
+
+### The `audio` shell command
+
+`audio` (bare, no arguments, mirroring `pci`'s own shape) reports
+whether an ES1370 (or compatible) controller was found and its I/O base,
+lazily performing PCI discovery/DMA-buffer allocation/IRQ registration
+and starting DAC1 playback (currently a fixed ~441 Hz test tone -- see
+`Es1370::fill_period`'s own doc comment -- standing in for a real network
+audio source until the streaming transport below is wired in) on its
+first call. It also prints the raw and DAC1-recognized interrupt counts
+(`interrupts::pci_irq_count`/`Es1370::interrupt_stats`), the count of
+periods refilled so far, and the raw `STATUS` register value -- the same
+diagnostic depth `pci`/`irqstat` already provide, and exactly what made
+the interrupt-storm bug above possible to root-cause from a serial-only
+test harness with no audio hardware of its own to listen to.
+
+### `audio.rs`: a format-agnostic facade, and network-fed playback
+
+`kernel/src/audio.rs` mirrors `nic.rs`'s own shape deliberately: a small
+enum (`Audio`) wrapping every supported backend (currently one,
+`Audio::Es1370`), a lazy `initialize()`/`get()` pair, and a stable,
+format-agnostic contract both the tape ABI and the `audio` shell command
+build on -- so a second codec driver (an AC97 or HD-Audio card, neither
+implemented yet) can slot in the same way a second NIC backend already
+does, without either caller changing. This split exists specifically
+because ES1370 is a genuine *silicon* ceiling, not a driver choice: its
+DAC1 rate generator only offers four hardwired rates (5512/11025/22050/
+44100 Hz) and its sample-format field only encodes 8- or 16-bit PCM (see
+`es1370.rs`'s own register doc comments) -- this project's real Sound
+Blaster PCI hardware target shares that ceiling. A future 24-bit/48 kHz
+card should not need `audio.rs`, the ring buffer, or the tape ABI's
+`audio_submit` callback to change at all; a tape must always ask the
+active device its real format (`AudioFormat`, via the ABI's
+`audio_sample_rate`/`audio_channels_and_bits` callbacks) and produce
+exactly that format -- this kernel does no sample-rate conversion or
+bit-depth requantization of its own, the same "small kernel API,
+protocol/format logic stays in tape code" split this project already
+applies to NIC frame parsing.
+
+The tape ABI grew three more trailing callbacks (append-only, cdecl,
+after the existing `nic_*`/`ticks` set): `audio_sample_rate() -> u32` (0
+if no device), `audio_channels_and_bits() -> u32` (channels in the low
+byte, bits-per-sample in the next byte, 0 if no device -- packed into one
+u32 deliberately, to avoid a fourth trailing parameter for what is really
+one small format fact), and `audio_submit(data: u32, length: u32) -> u32`
+(pushes raw PCM bytes into the network-fed ring, returning how many bytes
+were actually accepted -- a short count means "ring full, retry the
+remainder shortly," mirroring `nic_send`'s own short-write convention).
+Calling `audio_submit` at all permanently switches the card from its
+default built-in test tone into network-fed mode (`Es1370`'s
+`network_mode` flag) -- there is no way back to the test tone without a
+reboot, the same one-way switch `tape_load_net`'s "first sender locks the
+attempt" convention uses elsewhere in this project.
+
+**The network-fed ring buffer, and a real sizing pitfall worth
+remembering.** `PcmRing` (`audio.rs`) is a fixed-capacity, lock-free,
+single-producer/single-consumer byte ring -- exactly the same shape and
+safety argument as `console`'s own `RELAY_QUEUE`/`interrupts`'s scancode
+queue: monotonically increasing `write_pos`/`read_pos` counters, a
+`Release` store of `write_pos` only after every byte is written, and an
+`Acquire` load of it before the consumer (the DAC1 ISR's own period
+refill, `Es1370::fill_period`) touches any byte it implies is valid.
+
+A first attempt sized `RING_CAPACITY_BYTES` generously against the
+*worst* format this project expects to ever support (24-bit stereo at
+48 kHz, 384,000 bytes/sec) at 64 KiB -- and that measurably does not fit.
+Investigating why turned up two separate, easy-to-conflate effects,
+worth spelling out precisely since a future contributor sizing another
+large `.bss` array here could otherwise draw the wrong lesson from either
+one alone:
+
+- **`objcopy -O binary` does not bake `.bss` into `kernel.bin` at all,
+  contrary to an earlier (now corrected) claim in this document's own
+  size-budget history above.** `.bss` is `linker.ld`'s last section, with
+  nothing loadable after it; `objcopy`'s raw-binary output simply
+  truncates right after `.data` and never extends out to `.bss`'s full
+  virtual size, regardless of how large any `.bss` static declares itself
+  to be. This is *why* `kernel.bin`'s own file size stayed byte-identical
+  across many different `RING_CAPACITY_BYTES` values during bisection --
+  a red herring that has nothing to do with the array being "dead" or
+  "live." `kernel/src/entry.S` is what actually makes a large `.bss`
+  array safe at runtime: it zero-fills the whole `__bss_start`..
+  `__bss_end` range with an explicit loop before any Rust code runs, the
+  same way any freestanding kernel's startup stub must, precisely because
+  the loaded image itself never contains those bytes.
+- **The real, enforced budget is the link-time `ASSERT(__kernel_end <
+  0x60000, ...)` in `linker.ld`**, which *does* depend on `.bss`'s true
+  linked size (the address arithmetic that computes `__kernel_end`, not
+  the raw file's byte count) and *does* depend on whether `--gc-sections`
+  actually keeps a large unreferenced static's section at all. Bisecting
+  through the real `make kernel` recipe (not a bare `cargo build
+  --release`, which uses different `-Z build-std` flags and gives
+  misleading numbers here) found a genuine, reproducible LLVM/linker
+  cliff for a `[0u8; N]` initializer this large: `N = 32768` links,
+  `N = 40960` does not -- confirmed identical whether `submit`/
+  `audio_submit`/`audio_status` are genuinely reachable, live code paths
+  or not, so (unlike a first, since-retracted theory) this is not
+  actually a dead-code-elimination artifact at all; it is a real codegen
+  threshold for how large a zero-initializer LLVM will still fold away
+  cheaply before it has to be emitted as a real, full-sized `.bss`
+  region. `RING_CAPACITY_BYTES` was set to 16 KiB -- comfortably inside
+  that threshold, covering ~93 ms of jitter tolerance at ES1370's current
+  44.1 kHz/16-bit/stereo format (176,400 bytes/sec), and ~43 ms at the
+  hypothetical 24-bit/48 kHz future ceiling. A future codec driver
+  needing more headroom at that higher rate should re-measure this same
+  real link budget rather than assuming today's 32 KiB/40 KiB cliff still
+  holds once other kernel code has grown or shrunk around it.
+
+`audio_status()` (the `audio` shell command's handler) was rewritten to
+go through this facade (`audio::get()`) instead of calling `es1370::get()`
+directly, so it keeps working unchanged once a second backend exists, and
+now also reports the network-fed ring's current backlog
+(`Audio::ring_backlog()`/`Es1370::ring_backlog()`, in bytes out of
+`audio::RING_CAPACITY_BYTES`) and underrun count
+(`Audio::underrun_count()`) -- useful for telling a healthy, steadily-fed
+stream apart from one about to glitch, without waiting for an actual
+underrun to happen first.
+
+No dedicated audio-streaming tape exists yet to actually drive
+`audio_submit` end to end over the network (see "Deliberately deferred
+work" -- this is the next planned increment); this section documents the
+kernel-side facade, ABI, and sizing investigation only.
+
+### `tapes/audio-net/`: network-fed playback, and a file-replay stand-in for live capture
+
+`tapes/audio-net/` is the dedicated tape driving `audio_submit` end to
+end over the network -- the increment the previous section's closing
+note flagged as not yet built. It shares `CHAT_ETHERTYPE` (`0x88b6`) with
+`chat`/`nic discover`/`tape`/`term net`/NETFS/KUP, adding three new tags
+continuing that numbering: `AUDIO_TAG_START` (`0x40`, declares the
+stream's sample rate/channel count/bits-per-sample so a format mismatch
+against the local device can be rejected up front rather than played as
+noise), `AUDIO_TAG_DATA` (`0x41`, one PCM chunk), and `AUDIO_TAG_STOP`
+(`0x42`, ends the stream cleanly). Unlike `CHAT_TAG_TEXT`/`TERM_TAG_DATA`,
+which trim trailing zero padding on receipt, `AUDIO_TAG_DATA` carries an
+explicit 16-bit length prefix instead: legitimate 16-bit signed PCM
+silence is genuinely all-zero bytes, and must never be confused with
+Ethernet's own 60-byte minimum-frame padding the way printable text safely
+can be. Like `TERM_TAG_DATA` (and unlike `TAPE_TAG_DATA`'s strict,
+abort-on-gap sequence numbering), there is deliberately no sequence number
+at all: this is a live, ongoing best-effort stream where an occasional
+dropped frame should read as a brief audio glitch, not a fatal transfer
+error worth aborting over.
+
+The tape has two modes. `tape run` (no arguments) is **listen mode**: it
+queries the local device's actual format via `audio_sample_rate()`/
+`audio_channels_and_bits()`, prints it,
+then waits for an `AUDIO_TAG_START` from any peer -- locking onto the
+first sender whose declared format matches (a mismatched stream is
+rejected with a clear message, but the tape *keeps waiting* rather than
+exiting, so a misconfigured first sender doesn't force a reboot/rerun
+just to try a corrected one) -- and forwards every `AUDIO_TAG_DATA`
+payload into `audio_submit`. Because `audio_submit` has short-write
+semantics (mirroring `tape_nic_send`'s own convention: it returns bytes
+actually accepted, which may be less than requested if the ring is
+momentarily full), `listen_mode` retries the remainder in a bounded
+64-spin loop and only counts genuinely undelivered bytes as dropped once
+that bound is exceeded, rather than blocking indefinitely. `tape run send
+NAME [PEER_MAC|PEER_NUMBER]` remains a stand-in for live capture: even
+though `kernel/src/es1370.rs` now implements real ADC/recording support
+(see "ES1370 ADC/capture support" below) and exposes it through the tape
+ABI's `tape_audio_capture` callback, this tape has not yet been given a
+mode that reads it -- `send` still replays a
+pre-recorded, headerless raw PCM file already on FOSFS (read whole via
+`fs_file_length`/`fs_read` into an `alloc()`-backed buffer, capped at 16
+MiB, since the FOSFS tape callback ABI has no partial/offset read) at a
+fixed 44100 Hz/2ch/16-bit format -- this project's real ES1370 ceiling,
+not an arbitrary choice -- pacing `AUDIO_TAG_DATA` chunks (1024 bytes
+each) against `ticks()`'s 100 Hz PIT count using a computed absolute
+target-tick schedule (`start_ticks + offset * PIT_HZ / bytes_per_sec`)
+rather than a fixed per-chunk sleep, to avoid cumulative drift over a
+long transfer. A genuine live-capture send mode (reading
+`tape_audio_capture` in a loop instead of a file) is the natural next
+step toward the user's "ADC to DAC, and eventually full-duplex" goal,
+but remains unbuilt as of this writing.
+
+Verified end to end with `tapes/test_audio_net_e2e.py` (not part of
+`make test`, mirroring every other tape's own `test_*_e2e.py` harness):
+a single QEMU guest carries both an RTL8139 (the ordinary multicast
+Ethernet segment) and a QEMU-emulated ES1370 captured to a host-side WAV
+file via `-audiodev wav,id=snd0,path=...`. The test script itself acts as
+the sending peer -- constructing and sending the exact
+`AUDIO_TAG_START`/`DATA`/`STOP` wire frames directly, the same protocol a
+real `tools/send_audio.py` or the tape's own `send` mode would use --
+streams a short synthetic 440 Hz tone into the tape's listen mode, and
+confirms both the tape's own byte-count summary (received == sent,
+dropped == 0) and, the stronger proof, that the captured WAV file
+actually contains real, non-silent audio matching the sent tone (a peak
+amplitude comfortably above a silence-noise floor), not just that the
+tape's own counters looked right.
+
+### A real bug this test found: shared legacy PCI IRQ lines silently broke a second device's `init()`
+
+Building the test above surfaced a genuine kernel bug, not a test
+artifact: the ES1370 device consistently failed to initialize
+(`audio_status()` reporting "An audio controller was found but could not
+be initialized") the moment an RTL8139 NIC was also attached to the same
+QEMU guest. `info pci` at the QEMU monitor showed why: QEMU's i440fx/
+PIIX3 IRQ router assigned *both* devices to the same legacy line, IRQ 11
+-- normal, expected PCI behavior (a real motherboard's fixed slot wiring
+can do the same), not an emulator quirk. `interrupts::register_pci_irq`
+(`kernel/src/interrupts.rs`) only ever supported one handler per IRQ
+line: a second, different device registering on an already-claimed line
+was rejected outright, `es1370::initialize()` treated that rejection as
+a fatal `Status::InitFailed`, and the whole device came up unusable --
+silently, with nothing about the failure pointing at the real cause.
+
+This was a real, previously-undiscovered gap, not specific to ES1370:
+*any* two PCI backends this project has (two NICs, a NIC plus ES1370, a
+future I350 alongside anything else) could hit the identical failure the
+moment QEMU's (or a real motherboard's) IRQ router happened to assign
+them the same line -- which audio-plus-networking, the two device
+classes this project's whole current priority is built around, makes a
+routine combination to hit, not a rare edge case.
+
+The fix: `PCI_IRQ_HANDLERS` grew from one `Option<IrqHandler>` slot per
+line to a small fixed-size array (`MAX_SHARED_HANDLERS` = 4 -- the same
+bounded-fixed-array convention this kernel already uses everywhere else,
+comfortably covering any realistic sharing scenario this project's small
+number of PCI backends can produce). `register_pci_irq` now searches for
+an existing matching handler (idempotent re-registration, unchanged),
+then an empty slot, and only fails if the line's handler capacity is
+genuinely exhausted; `dispatch_pci_irq` now calls every handler
+registered on that line instead of at most one. This is safe by
+construction, not just by observation: every backend's own
+`handle_interrupt()` already checks its own device's status register
+before doing anything (`nic.rs`'s documented "ack/count/flag, nothing
+else" design, and ES1370's own `handle_interrupt` checks `STAT_DAC1`
+the same way), so a handler that isn't the actual interrupt source
+simply finds its own status bit clear and no-ops -- calling every
+handler on a shared line costs nothing beyond that one harmless check.
+`pci_irq_registered` (used by `nic`/`audio`'s own diagnostics to decide
+whether to report raw IRQ fire counts) was updated to mean "at least one
+handler is registered on this line," preserving its existing meaning for
+every caller. Confirmed fixed by rerunning the same reproduction (`info
+pci` showing IRQ 11 shared between the RTL8139 and ES1370, `audio`
+reporting successful discovery afterward) and by rerunning `make test`,
+`make test-nic-watchdog`, `make test-stack-guard`, and
+`make test-page-protection` -- all pass unmodified, confirming this is a
+targeted fix with no regression to the existing single-handler-per-line
+cases those tests already exercise.
+
+### ES1370 ADC/capture support: implemented
+
+The user's stated project goal, once `tapes/audio-net/` above proved the
+network-fed playback path works end to end: real microphone input (ADC
+-> network -> speaker output, DAC), and eventually full-duplex
+(simultaneous capture and playback) as a stretch goal. `kernel/src/
+es1370.rs` now implements DAC1 (playback) and ADC (recording) as two
+independent, simultaneously running DMA channels sharing one chip; DAC2,
+the MIDI UART, and the joystick port remain untouched. Every ADC register
+offset, bit, and DMA/interrupt semantic was re-derived from QEMU's own
+`hw/audio/es1370.c`, the same source and rigor used for DAC1: ADC's
+`FRAMEADR`/`FRAMECNT` registers alias DAC1's own `0x30`/`0x34` offsets,
+distinguished only by which page (`PAGE_ADC` = 0x0d vs. `PAGE_DAC` =
+0x0c) is selected in `MEM_PAGE` before writing them; `CTRL_ADC_EN =
+1<<4`; `CTRL_PCLKDIV` (bits 28:16) is a clock divider shared between ADC
+and DAC2, precomputed here as a fixed `CTRL_PCLKDIV_44100` constant for
+the driver's one supported rate (`divider = ((1411200 + rate/2)/rate) -
+2`); `SCTRL_R1INTEN = 1<<10`/`SCTRL_R1FMT_STEREO16 = 0b11<<4`; and
+`STAT_ADC = 1<<0` is an independent, level-triggered status bit distinct
+from `STAT_DAC1 = 1<<2` -- both can be set simultaneously on one
+interrupt, so `handle_interrupt` checks each unconditionally rather than
+treating them as an if/else.
+
+**The one real bug this surfaced, caught before it ever reached real
+hardware:** `CONTROL` and `SERIAL_CONTROL` are genuinely *shared*
+registers -- `CONTROL`'s `CTRL_PCLKDIV` field and DAC-vs-ADC enable bits,
+and `SERIAL_CONTROL`'s per-channel format/interrupt-enable bits, all live
+in the same 32-bit register regardless of which channel a given bit
+belongs to. The DAC1-only version of `start_dac1`/`acknowledge_dac1`
+wrote a fixed, hardcoded bit pattern to each register -- harmless with
+only one channel ever touching them, but it would have silently
+clobbered whichever channel's bits it didn't intend to set the moment a
+second channel existed. Every one of these functions
+(`start_dac1`/`start_adc`/`acknowledge_dac1`/`acknowledge_adc`) was
+rewritten to read-modify-write instead: read the current value, flip
+only the bits that function owns, write it back. Confirmed correct by
+booting with both channels enabled and observing DAC1's own period count
+keep advancing at its expected rate the entire time ADC is also running
+(and vice versa) -- if either write path had clobbered the other
+channel's enable/format bits, one channel would have silently stalled.
+
+`audio.rs`'s facade gained a read-direction counterpart to
+`audio_submit`: `Audio::capture`/`capture_overrun_count`/
+`capture_backlog`/`capture_periods`, backed by a second, independent
+`PcmRing` (`CAPTURE_RING`) and a new `PcmRing::pop_upto` (a variable-
+length "however much is ready" pop, unlike `pop_into`'s all-or-nothing
+shape, mirroring `tape_nic_receive`'s own convention). The tape ABI grew
+a matching `tape_audio_capture(out, capacity) -> u32` callback (the
+final, append-only `TapeEntry` cdecl argument), and `audio_status()` now
+reports the ADC's own period-captured/overrun counts and capture-ring
+backlog alongside DAC1's existing diagnostics.
+
+**Design choice: ADC runs unconditionally, exactly like DAC1.** `Es1370::
+initialize()` calls `start_adc()` right after `start_dac1()`,
+unconditionally -- there is no "only start recording once a tape asks
+for it" gate. This mirrors DAC1's own always-on design (silence plays
+continuously even with nothing feeding `audio_submit`) for the same
+reason: a second, always-running DMA channel costs nothing observable
+when unused, and it means `audio_status()`'s ADC diagnostics are always
+meaningful immediately after boot, not only after some tape has opted
+in. Captured bytes nobody ever reads via `tape_audio_capture` simply
+overflow `CAPTURE_RING` and increment its overrun counter once full --
+the same harmless "recording into a room nobody is listening to"
+behavior a real always-on ADC would have, not a fault condition.
+
+**Reserved low-memory region grew again, to `0x70000`.** ADC's second
+DMA capture buffer and its associated code pushed the kernel past the
+previous `0x60000` ceiling (see "Low-memory map" for why all four
+constants -- `kernel/linker.ld`, `kernel/src/pmem.rs`'s
+`RESERVED_BELOW`, `tools/write_layout.py`'s `KERNEL_RESERVED_END`, and
+`tools/write_netrom_layout.py`'s `MAX_KERNEL_BYTES` -- must always move
+together). One non-obvious wrinkle surfaced while sizing this: a naive
+`size`-command `text+data+bss` sum undercounts the real footprint,
+because `linker.ld` 4096-byte-aligns the `.text`/`.rodata`/`.data`
+section boundaries, adding padding that sum doesn't reflect -- `readelf
+-S`'s real final `.bss` end address is the number that actually matters
+against the `ASSERT` ceiling. `tools/write_layout.py`'s `SLOT_SECTORS`
+(and therefore `tools/build_image.py`'s A/B kernel slot sizing) is
+derived automatically from `KERNEL_RESERVED_END`, so growing that one
+constant alone was sufficient -- no separate disk-layout constant needed
+updating.
+
+**Verified with `tapes/test_audio_capture_e2e.py`** (not part of `make
+test`, mirroring every other tape's own harness): using QEMU's `none`
+audiodev backend (bidirectional -- it opens both an out and an in voice
+-- but silence-only), the test confirms DAC1 and ADC periods both
+advance simultaneously and independently (proving the shared-register
+read-modify-write fix above actually works, not just compiles), and that
+`CAPTURE_RING` -- deliberately never drained in this test, since no tape
+calls `tape_audio_capture` -- correctly fills to capacity and then
+reports a steadily incrementing overrun count rather than wedging or
+corrupting state. **This cannot verify real, non-silent captured audio
+content**, unlike the DAC1/`tapes/test_audio_net_e2e.py` test, which can:
+QEMU's own `audio/wavaudio.c` (confirmed by reading its source directly)
+implements only `HWVoiceOut` in this project's installed QEMU version
+(10.2.1) -- there is no `in.path`/file-sourced fake-microphone input
+option at all, despite that combination appearing in some online
+examples written against other QEMU versions or forks. Verifying actual
+captured sample values therefore needs either a host environment with a
+real, usable audio input backend (ALSA/PulseAudio/PipeWire, generally
+unavailable in a sandboxed dev/CI container) or real hardware, the same
+honestly-documented gap this project already accepts for other
+QEMU-model-limited features (e.g. the 3C509/I350 real-hardware-only
+testing cost documented above).
+
+Full-duplex (a tape both feeding `audio_submit` and reading
+`tape_audio_capture` in the same loop) is now mechanically unblocked --
+both channels run independently and simultaneously. `tapes/audio-net/`
+now has three modes dispatched from its startup argument: bare
+`tape run` (listen mode, unchanged), `tape run send NAME [MAC]` (the
+pre-recorded-file replay stand-in described above), and
+`tape run capture [MAC]` -- the genuine live-capture send mode this
+section's closing note originally called for, described next.
+
+### `tape run capture`: genuine live-microphone streaming
+
+`capture_mode` (`tapes/audio-net/src/main.rs`) is the ADC counterpart to
+`listen_mode`: it reads the local device's real format via the same
+`audio_sample_rate`/`audio_channels_and_bits` callbacks `listen_mode`
+already used, sends one `AUDIO_TAG_START` declaring it, then loops
+pulling bytes out of `tape_audio_capture` (non-blocking, "however much
+is ready" semantics -- see "ES1370 ADC/capture support" above) and
+forwarding them as `AUDIO_TAG_DATA` frames via `nic_send`, exactly
+mirroring `send_mode`'s own pacing/chunking but sourced from the live
+capture ring instead of a FOSFS file. `should_abort()` is checked
+unconditionally at the top of every loop iteration, before the
+non-blocking capture call, so a remote or local abort is expected to be
+noticed within one iteration regardless of whether any audio happens to
+be flowing that moment.
+
+Verified correct end to end using QEMU's `none` audiodev backend (no
+real audio device at all -- `audio_capture` simply returns 0 bytes most
+iterations): streaming starts, `nic_send`s real (silent) PCM frames at
+the expected 44.1 kHz/stereo rate, and a remote abort byte sent partway
+through is detected and handled in the same call, printing
+`"audio-net: capture stopped locally after N byte(s) sent."` and
+returning cleanly to the shell prompt -- proving the ABI wiring,
+argument parsing, and abort-polling logic here are all correct. See
+the next section for what happened -- and did not happen -- when this
+same mode was pointed at a genuine, physical microphone on a real host
+machine, and why that gap was not chased further.
+
+### Real-microphone testing on a dev machine: QEMU audiodev backend pitfalls (host-environment, not a fos bug)
+
+Answering "can a real microphone on this dev machine feed `tape run
+capture`?" surfaced two host-side QEMU audiodev quirks, neither of which
+is a fos kernel or tape bug -- both are recorded here since they cost
+real time to isolate and would otherwise be rediscovered the hard way by
+the next person trying the same thing on a similarly PipeWire-based
+Linux dev machine.
+
+**`-audiodev alsa,...` deadlocks completely against a PipeWire-provided
+ALSA compatibility layer.** On this machine (PipeWire providing the
+system's ALSA plugin, as is now the Linux desktop default), pointing
+QEMU's `alsa` audiodev backend at the "default" device -- for either
+direction (`in.dev`/`out.dev`) independently -- hung the entire guest
+indefinitely: not just the audio subsystem, the whole VM stopped
+responding to anything, including plain keypresses, for 120+ seconds
+with zero progress. Plain host-side `aplay`/`arecord` against that same
+"default" device in the same shell session completed instantly,
+confirming the underlying audio pipeline was healthy and the hang was
+specific to QEMU's own `alsa` backend implementation, not this machine's
+audio configuration. This is a known category of bug: QEMU's `alsa`
+backend's own polling/threading assumptions don't fully match the
+semantics PipeWire's ALSA-compatibility shim presents, unlike a
+genuine, unmediated ALSA driver talking directly to hardware. **Fix**:
+use QEMU's native `-audiodev pipewire,id=snd0` backend instead --
+property names differ (`in|out.name=<sink/source>`, not `in.dev`/
+`out.dev`, which are `alsa`-backend-specific); omitting them entirely
+uses PipeWire's own default routing. With `pipewire`, the `audio` shell
+command returned instantly and reported correct ES1370 register state.
+
+**The originally reported "`tape run capture` hangs on real audio +
+remote abort" was not a real bug at all -- it was two bugs in the ad hoc
+test harness's own output-parsing logic.** A first pass genuinely
+reproduced what looked like a 40+ second hang and, lacking `strace`/`gdb`
+access (see below for why that belief was itself wrong), that was
+tentatively attributed to a QEMU/PipeWire lock-ordering deadlock. Once
+`strace`/`gdb` were confirmed usable after all (see below), re-running
+the exact same scenario -- both a single guest launched directly under
+`strace -f`, and the full two-guest demo, several times each -- never
+reproduced any hang at all: every remote-abort round trip completed in
+under a second. Instead, the demo script itself had two bugs, both
+instances of a general class worth watching for in any `term_net`
+byte-at-a-time-relayed test harness:
+1. A checkpoint-ordering race: one guest's output-buffer length was
+   captured as a search starting point *after* a slow round trip on the
+   *other* guest, whose output kept streaming into that same buffer the
+   whole time in the background -- so the checkpoint ended up placed
+   *after* the very text it was meant to search for, and the subsequent
+   bounded `read_until` call simply timed out looking in the wrong
+   place.
+2. A marker-prefix race: a `read_until` marker
+   (`b"capture stopped locally"`) that is itself a strict prefix of the
+   full line (`"capture stopped locally after N byte(s) sent.\n"`,
+   assembled from three separate `print_bytes`/`print_u32`/`print_bytes`
+   calls, each relayed one byte at a time over `term_net`) can match
+   before the rest of the line has actually arrived, so a later regex
+   against the still-partial buffer fails. This is the exact same bug
+   class already documented above for the `"audio"` command's own marker
+   (fixed there by using `b"Raw STATUS register"` instead of `b"ADC:"`).
+   **The general lesson: a `read_until` marker must always be the true
+   tail of the line a subsequent regex will parse, never merely an
+   early-appearing prefix or substring of it**, or the exact same class
+   of intermittent, timing-dependent failure can recur in any future
+   `term_net`-driven test.
+
+Both bugs are now fixed in
+`tapes/test_audio_net_real_mic_e2e.py`, committed but deliberately kept
+outside `make test` -- a manual, environment-dependent demo, since its
+"real microphone" half only works with a physical audio input device
+actually present and reachable on the host; see below.
+
+**A second, more interesting false positive surfaced once the harness
+bugs above were fixed: the demo could report "PASS: real, non-silent
+audio flowed" even when the ADC channel had captured zero real bytes.**
+`kernel/src/audio.rs`'s DAC1 channel runs its own default idle test tone
+continuously and unconditionally regardless of network activity (see
+"The `audio` shell command" above) -- so a captured WAV file being
+non-silent proves nothing about whether real network-relayed audio ever
+reached it; the demo's own before/after `audio` status check (`ADC: 0
+periods captured; overruns (ring full): 0` before *and* after an 8-second
+capture attempt, while `DAC1` periods kept advancing) revealed that on
+this specific sandboxed dev machine, the ADC channel was capturing
+*literally nothing at all*, not even digital silence (silence would
+still count as nonzero captured bytes, since the ADC produces a steady
+sample stream regardless of amplitude). `wpctl status` confirmed the
+root cause directly: PipeWire on this host has **no audio Source node
+registered at all** -- only a dummy/virtual sink for output -- because
+the system is configured to expect a specific USB audio CODEC input
+device that is not actually connected in this sandboxed environment.
+QEMU's `pipewire` audiodev backend degrades silently in this situation
+(no error, just an ADC channel that never produces a single sample),
+which is exactly what made the false positive possible. `tapes/test_audio_net_real_mic_e2e.py`
+was fixed to assert `bytes_sent > 0` and `bytes_received > 0` from the
+tapes' own reported network byte counts before ever trusting the WAV
+file's amplitude -- a captured WAV's non-silence is only meaningful
+*after* confirming real bytes actually flowed over the network, not on
+its own.
+
+**Root cause of the missing PipeWire Source, precisely identified: this
+sandbox's SSH session is not the seat0 session.** This dev machine is a
+physical laptop, normally accessed by SSH rather than its own screen/
+keyboard; after a host power outage, its physical desktop session had
+not been logged back into again. `loginctl list-sessions`/
+`seat-status seat0` showed `seat0`'s only active session was still
+`gdm-greeter` (the login screen itself, class `greeter`, on `tty1`) --
+every `akeda` session (including this one) showed `SEAT -`, i.e. not
+seat-assigned at all, because an SSH login is never attached to a
+physical seat the way a graphical desktop login is. This matters
+because the laptop's real built-in microphone device node
+(`/dev/snd/pcmC0D0c`, "HDA Intel PCH Headphone Mic") is udev-tagged
+`uaccess` -- systemd-logind grants read/write ACL on `uaccess`-tagged
+device nodes only to whichever session is the *active* one on a given
+seat, confirmed directly: `getfacl /dev/snd/pcmC0D0c` showed an ACL
+entry for `gdm-greeter` and none at all for `akeda`. So this SSH
+session's own PipeWire user instance (`akeda`'s systemd `--user`
+manager) never receives access to the real hardware capture device at
+all, regardless of how QEMU's `pipewire` audiodev backend is
+configured -- it correctly shows only a dummy/virtual sink and no
+Sources, because from logind's point of view `akeda` genuinely has no
+seat-granted device access right now. `wpctl status`'s "Default
+Configured Devices" entry naming a USB audio CODEC input is just
+WirePlumber's cached last-known configuration from whenever someone
+last logged into the desktop with that device attached -- it does not
+mean the device is currently reachable, and is not itself proof of a
+missing microphone (check the live `Audio -> Sources` list instead, as
+this section's earlier `wpctl status` output demonstrates).
+
+**Fix**: once someone physically logs into (or is auto-logged into) the
+laptop's own desktop session -- making an `akeda` session the *active*
+one on `seat0` instead of `gdm-greeter` -- logind will grant that
+session's PipeWire instance the same `uaccess` ACL on the real hardware,
+and the whole `tapes/test_audio_net_real_mic_e2e.py` pipeline should be re-run at that
+point to get the final, genuine non-silent-signal confirmation this
+section has been building toward. This is a same-machine, purely local
+prerequisite (nothing to do with SSH access, network config, or fos
+itself) -- re-run `wpctl status` after logging in and confirm a real
+device (not just the dummy sink) appears under `Audio -> Sources`
+before re-attempting the demo.
+
+**Practical takeaway**: the tape/kernel-side capture ABI and logic
+(`capture_mode`'s `should_abort`/`audio_capture`/`nic_send` loop,
+`Es1370`'s ADC DMA channel, remote-abort handling) are all proven
+correct -- confirmed with QEMU's `none` backend (silent digital data,
+correct byte rate, instant remote-abort response) and now also with
+`pipewire` (correct instant remote-abort response; zero hang ever
+reproduced across many runs). What remains unverified is a **genuine
+non-silent captured signal**, blocked purely by the seat0/logind
+device-ACL issue just diagnosed above, not by any fos or QEMU bug --
+tracked as the `audio-real-mic-verify` follow-up until someone logs
+into the laptop's desktop session in person.
+
+**Corrected: `strace`/`ptrace` access in this sandbox.** An earlier
+version of this section claimed this sandbox lacks `CAP_SYS_PTRACE`
+entirely and so cannot use `strace`/`gdb` at all -- that claim was
+tested directly and found wrong. The real, verified picture: `strace`
+uses the `ptrace` system call to intercept and log every syscall a
+process makes (e.g. showing a `futex(...)` call it's blocked in, or a
+`poll`/`read` waiting on a file descriptor); `gdb` also uses `ptrace`,
+to pause a process and inspect its actual call stack/thread state.
+**Launching a target process directly under either tool
+(`strace -f -o log <command>`, `gdb --args <command>`) works today with
+zero privilege changes** -- this is ordinary parent-traces-child
+`ptrace`, which Linux's Yama LSM always permits regardless of scope
+setting, confirmed by directly running `strace -f -o log
+qemu-system-i386 ...` in this environment with no error. Only
+*attaching* to an already-running, unrelated process
+(`strace -p <pid>` / `gdb -p <pid>`) is blocked here, confirmed via a
+live test (`ptrace(PTRACE_SEIZE, ...): Operation not permitted`),
+because `/proc/sys/kernel/yama/ptrace_scope` is `1` ("restricted":
+ptrace only between a direct parent/child, or if the target opts in via
+`PR_SET_PTRACER`) -- a normal, unprivileged-process posture
+(`CapEff` empty, `CapBnd` nearly full), not a container-specific
+restriction. To also enable attach-mode tracing, in descending order of
+convenience: prefer direct-launch tracing when the target process can be
+started that way at all (covers the overwhelming majority of cases, as
+it did here); `sudo sh -c 'echo 0 >
+/proc/sys/kernel/yama/ptrace_scope'` to relax to classic same-uid
+ptrace rules (needs interactive `sudo`, resets on reboot); or
+`sudo setcap cap_sys_ptrace+eip <binary>` to grant the capability to one
+specific tool binary, mirroring this project's existing
+`python3-netraw` convention (see "Talking to a real fos machine from a
+sandboxed dev environment" above).
 
 ## Deliberately deferred work
 

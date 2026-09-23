@@ -1,4 +1,5 @@
 use crate::arch::x86::{halt_forever, reset};
+use crate::audio;
 use crate::boot_info::{BootInfo, MemoryRegion};
 use crate::console;
 use crate::cpu;
@@ -529,6 +530,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"printer" if no_arguments(arguments) => print_printer_ports(),
         b"print" => print_command(info, arguments),
         b"nic" => nic_command(arguments),
+        b"audio" if no_arguments(arguments) => audio_status(),
         b"chat" => chat_command(arguments),
         b"tape" => tape_command(info, arguments),
         b"halt" => {
@@ -548,7 +550,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"debug" => debug_command(info, arguments),
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
         | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci" | b"printer"
-        | b"start" => {
+        | b"start" | b"audio" => {
             println!("This command does not accept arguments.");
         }
 
@@ -791,6 +793,69 @@ fn print_pci_devices() {
     }
     if found > shown {
         println!("({} more found but not shown; MAX_PCI_DEVICES exceeded)", found - shown);
+    }
+}
+
+/// `audio` reports the active audio device's status through the
+/// format-agnostic `audio.rs` facade (not `es1370::get()` directly, so this
+/// command keeps working unchanged once a second codec backend joins
+/// `audio::Audio`): whether a device was found, its driver name and format,
+/// I/O base, how many playback interrupts/periods it has serviced -- the
+/// ISR-driven equivalent of `nic`'s own interrupt counters, useful for
+/// confirming the driver is actually being interrupted and refilling its
+/// DMA ring, not just silently idle -- and, once a tape has started
+/// streaming into it (`tape_audio_submit`), the network-fed ring's current
+/// backlog and underrun count.
+fn audio_status() {
+    match audio::get() {
+        Ok(device) => {
+            let format = device.format();
+            println!(
+                "{} found: I/O base 0x{:04x}, format {} Hz / {}ch / {}-bit.",
+                device.driver_name(),
+                device.io_base(),
+                format.sample_rate,
+                format.channels,
+                format.bits_per_sample
+            );
+            let (irq, interrupts, periods) = device.interrupt_stats();
+            match irq {
+                Some(irq) => {
+                    let raw = crate::interrupts::pci_irq_count(irq);
+                    println!(
+                        "IRQ {irq}: {raw} raw fire(s), {interrupts} recognized as DAC1."
+                    );
+                }
+                None => println!("No legacy PCI IRQ line assigned; audio is silent."),
+            }
+            println!("DAC1: {periods} periods refilled since boot.");
+            println!(
+                "Underruns (ring empty on refill): {}",
+                device.underrun_count()
+            );
+            println!(
+                "Network-fed ring backlog: {} of {} byte(s) queued.",
+                device.ring_backlog(),
+                audio::RING_CAPACITY_BYTES
+            );
+            println!(
+                "ADC: {} periods captured; overruns (ring full): {}.",
+                device.capture_periods(),
+                device.capture_overrun_count()
+            );
+            println!(
+                "Capture ring backlog: {} of {} byte(s) queued.",
+                device.capture_backlog(),
+                audio::RING_CAPACITY_BYTES
+            );
+            println!("Raw STATUS register: 0x{:08x}", device.raw_status());
+        }
+        Err(audio::Status::NotPresent) => {
+            println!("No Ensoniq ES1370 (or compatible) audio controller found.");
+        }
+        Err(audio::Status::InitFailed) => {
+            println!("An audio controller was found but could not be initialized.");
+        }
     }
 }
 
@@ -3507,7 +3572,9 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 /// terminal_position: extern "C" fn() -> u32, fs_file_length: extern "C"
 /// fn(u32, u32, u32) -> u32, fs_read: extern "C" fn(u32, u32, u32, u32, u32)
 /// -> u32, fs_write: extern "C" fn(u32, u32, u32, u32) -> u32, fs_remove:
-/// extern "C" fn(u32, u32) -> u32)` (cdecl, twenty-two arguments), in that
+/// extern "C" fn(u32, u32) -> u32, audio_sample_rate: extern "C" fn() ->
+/// u32, audio_channels_and_bits: extern "C" fn() -> u32, audio_submit:
+/// extern "C" fn(u32, u32) -> u32)` (cdecl, twenty-five arguments), in that
 /// fixed order. A tape is free
 /// to declare only a leading prefix of these parameters (as
 /// `primes.S`/`hello-rs` declare only `putc`, and `vga-colors` declares
@@ -3587,11 +3654,34 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 /// - `tape_nic_count`, `tape_nic_mac_at`, `tape_nic_send_at`, and
 ///   `tape_nic_receive_at` are appended after `ticks`. They let a newer tape
 ///   enumerate interfaces and keep independent raw-frame state per index.
-/// - `tape_nic_set_promiscuous_at` is the final callback. It enables or
-///   disables receive-all mode on one selected interface, returning zero if
-///   that index is invalid. A layer-2 bridge needs this because frames
-///   addressed to another host are not normally delivered to a NIC's
-///   receive ring.
+/// - `tape_nic_set_promiscuous_at` enables or disables receive-all mode on
+///   one selected interface, returning zero if that index is invalid. A
+///   layer-2 bridge needs this because frames addressed to another host are
+///   not normally delivered to a NIC's receive ring. `terminal_position`
+///   and the `fs_*` file callbacks (documented individually near their own
+///   definitions, e.g. [`tape_fs_remove`]) follow it.
+/// - `tape_audio_sample_rate`/`tape_audio_channels_and_bits`/
+///   `tape_audio_submit`/`tape_audio_capture` are the final four
+///   callbacks, giving a tape
+///   access to the kernel-owned audio playback facade (`audio.rs`) the
+///   same way the NIC callbacks above expose the kernel-owned network
+///   card: `audio_sample_rate` and `audio_channels_and_bits` report the
+///   active device's fixed format (zero if no device is present -- a
+///   streaming tape must query both before its first `audio_submit` and
+///   produce exactly that format, since this kernel does no resampling or
+///   requantization of its own), `audio_submit` pushes raw PCM bytes
+///   into that device's ISR-drained playback ring buffer, returning how
+///   many bytes were actually accepted (a short count, including zero,
+///   means the ring is temporarily full and the caller should retry the
+///   remainder on a later poll, mirroring `tape_nic_send`'s own
+///   short-write convention), and `audio_capture` copies out ISR-filled
+///   recorded PCM bytes from the device's own capture ring, returning how
+///   many bytes were actually copied (fewer than requested, including
+///   zero, simply means fewer samples have been captured so far --
+///   mirroring `tape_nic_receive`'s "however much is ready" convention
+///   rather than `audio_submit`'s "however much fits" one). Every
+///   existing tape in this repository ignores all four, exactly like any
+///   other trailing argument under cdecl.
 ///
 /// (A tape is still ring-0 code and technically free to ignore any of
 /// these callbacks and touch hardware -- or `pmem` -- directly anyway --
@@ -3908,6 +3998,69 @@ extern "C" fn tape_nic_max_frame_len() -> u32 {
 /// than programming a timer or reading PIT hardware from a tape.
 extern "C" fn tape_ticks() -> u64 {
     interrupts::ticks()
+}
+
+/// Reports the active audio device's fixed sample rate in Hz, or zero if no
+/// device is present. A streaming tape must call this (and
+/// `tape_audio_channels_and_bits`) before `tape_audio_submit`, and must
+/// produce exactly this format -- the kernel does no resampling or
+/// requantization of its own (see `audio.rs`'s own module doc comment).
+extern "C" fn tape_audio_sample_rate() -> u32 {
+    match audio::get() {
+        Ok(device) => device.format().sample_rate,
+        Err(_) => 0,
+    }
+}
+
+/// Packs the active audio device's channel count and bit depth into one
+/// `u32` (channels in the low byte, bits-per-sample in the next byte),
+/// avoiding a sixth trailing ABI parameter for what is otherwise always
+/// consulted alongside `tape_audio_sample_rate`. Returns zero if no device
+/// is present, which never collides with a real format (every real device
+/// has at least one channel and a nonzero bit depth).
+extern "C" fn tape_audio_channels_and_bits() -> u32 {
+    match audio::get() {
+        Ok(device) => {
+            let format = device.format();
+            format.channels as u32 | ((format.bits_per_sample as u32) << 8)
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Submits raw PCM samples, in the active device's own format, for
+/// playback. Returns how many bytes were actually accepted; a short count
+/// (including zero) means the device's ring buffer is temporarily full and
+/// the caller should retry the remainder on a later poll, the same
+/// short-write convention `tape_nic_send`'s own ABI already uses elsewhere.
+extern "C" fn tape_audio_submit(data: u32, length: u32) -> u32 {
+    if data == 0 || length == 0 {
+        return 0;
+    }
+    let Ok(device) = audio::get() else {
+        return 0;
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(data as *const u8, length as usize) };
+    device.submit(bytes) as u32
+}
+
+/// Copies out captured (recorded) PCM samples, in the active device's own
+/// format, up to `capacity` bytes into `out` -- the ADC counterpart to
+/// `tape_audio_submit`, mirroring `tape_nic_receive`'s own "copy however
+/// much is ready" shape rather than `tape_audio_submit`'s "accept however
+/// much fits" one. Returns how many bytes were actually copied; fewer than
+/// `capacity` (including zero) simply means fewer samples have been
+/// captured so far, not an error -- the caller should keep polling.
+extern "C" fn tape_audio_capture(out: u32, capacity: u32) -> u32 {
+    if out == 0 || capacity == 0 {
+        return 0;
+    }
+    let Ok(device) = audio::get() else {
+        return 0;
+    };
+    let buffer =
+        unsafe { core::slice::from_raw_parts_mut(out as *mut u8, capacity as usize) };
+    device.capture(buffer) as u32
 }
 
 /// Copies one raw Ethernet frame into `out`, returning its full length or
@@ -4430,6 +4583,10 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
         fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
         fs_remove: extern "C" fn(u32, u32) -> u32,
+        audio_sample_rate: extern "C" fn() -> u32,
+        audio_channels_and_bits: extern "C" fn() -> u32,
+        audio_submit: extern "C" fn(u32, u32) -> u32,
+        audio_capture: extern "C" fn(u32, u32) -> u32,
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -4459,6 +4616,10 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_fs_read,
         tape_fs_write,
         tape_fs_remove,
+        tape_audio_sample_rate,
+        tape_audio_channels_and_bits,
+        tape_audio_submit,
+        tape_audio_capture,
     );
     unsafe {
         TAPE_BOOT_INFO = core::ptr::null();

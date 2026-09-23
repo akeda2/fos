@@ -115,7 +115,7 @@ plain `make` (still just `make image`) and does not affect `image`/`run`/
 go: the image, `make netrom`, and every test tape (`make tapes`, including
 `tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-bigsieve`/
 `tape-longmode`/`tape-longmode-rs`/`tape-cpu64-lab`/`tape-cpu64-show`/`tape-calc`/`tape-ed`/`tape-beep`/
-`tape-morse`/`tape-net-chat`/`tape-ip-chat`/`tape-telnet`/`tape-bridge`/
+`tape-morse`/`tape-net-chat`/`tape-audio-net`/`tape-ip-chat`/`tape-telnet`/`tape-bridge`/
 `tape-router` -- see "Tape (`tape`)" below). Not needed for ordinary
 kernel/boot work, for which plain `make`
 (equivalent to `make image`) is enough. `make help` lists every target
@@ -154,6 +154,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `memory` | Summarizes E820 usable and non-usable memory. |
 | `cpuinfo` | Shows the CPUID vendor and raw feature bitfields. |
 | `pci` | Dumps every PCI function found on the bus: location, vendor/device ID, class/subclass/prog-if, header type, and BAR0's raw value. Used to identify unmarked or unknown hardware (e.g. reading a NIC's real vendor/device ID) before adding driver support for it. |
+| `audio` | Finds an ES1370-compatible sound card (QEMU's emulated Ensoniq AudioPCI, or a real Sound Blaster PCI card using the same chip family), starts ISR-driven DAC1 playback and ADC capture on first use, and reports both channels' interrupt/period/overrun counts, ring backlog, and the raw hardware status register. |
 | `hexdump ADDRESS LENGTH` | Dumps up to 128 bytes inside the reserved kernel range. Addresses accept decimal or `0x` hexadecimal notation. |
 | `ticks` | Shows the free-running PIT timer tick count and its configured frequency. |
 | `uptime` | Shows elapsed time since boot, derived from the timer tick count. |
@@ -936,6 +937,34 @@ machine running the ordinary shell command. Use
 `make test-e1000-net`) to run the same two-guest integration test through
 QEMU's Intel 82540EM backend, or `--nic ne2000` (or `make test-ne2000-net`)
 for QEMU's `ne2k_pci` NE2000-compatible model.
+
+#### Test tape: `tapes/audio-net/`
+
+A raw-Ethernet PCM audio streaming tape driving `kernel/src/audio.rs`'s
+ES1370 playback facade end to end over the network. It shares the same
+`CHAT_ETHERTYPE` as `chat`/`nic discover`/`tape`/`term net`, adding three
+tags: `AUDIO_TAG_START` (declares the stream's sample rate/channels/bits,
+so a format mismatch is rejected rather than played as noise),
+`AUDIO_TAG_DATA` (one length-prefixed PCM chunk -- a length prefix, not
+trailing-zero trimming, since 16-bit PCM silence is legitimately all
+zero bytes), and `AUDIO_TAG_STOP`. Plain `tape run` is **listen mode**:
+it prints the local device's real format, waits for a matching stream
+from any peer, and forwards every chunk into `audio_submit`, retrying a
+short write in a bounded loop rather than blocking forever. `tape run
+send NAME [PEER_MAC|PEER_NUMBER]` remains a stand-in for live capture --
+it paces a pre-recorded, raw headerless 44100 Hz/2ch/16-bit PCM file
+already on FOSFS out over the wire in real time, using the kernel's own
+PIT tick count so a long transfer does not drift -- rather than using the
+kernel's own ADC support (`kernel/src/shell.rs`'s `tape_audio_capture`
+callback, backed by `kernel/src/es1370.rs`'s ADC/capture pipeline). Live
+microphone-to-network capture is a natural next step for this tape but has
+not yet been built; see `tapes/test_audio_capture_e2e.py` for the kernel-
+side ADC pipeline's own regression coverage in the meantime. Build the
+tape with `make tape-audio-net` (producing `build/tapes/audio-net.bin`)
+and verify it with `tapes/test_audio_net_e2e.py`, which streams a
+synthetic tone into a QEMU guest's listen-mode tape and confirms the
+guest's `-audiodev wav` capture actually contains real, non-silent audio
+matching what was sent.
 
 #### Test tape: `tapes/bridge/`
 

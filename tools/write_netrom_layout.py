@@ -15,7 +15,7 @@ from pathlib import Path
 # `boot/netrom.S` copies the embedded kernel with a 32-bit-address-size
 # `rep movsb`. The destination still shares the disk boot path's reserved
 # low-memory window, so do not allow a kernel beyond 0x10000..0x60000.
-MAX_KERNEL_BYTES = 0x60000 - 0x10000
+MAX_KERNEL_BYTES = 0x70000 - 0x10000
 
 
 def main() -> None:

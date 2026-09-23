@@ -33,7 +33,7 @@ const BITMAP_BYTES: usize = MAX_FRAMES.div_ceil(8);
 /// Frames below this physical address are never handed out: it covers the
 /// real-mode IVT/BDA, the BootInfo table, and the kernel's own reserved
 /// low-memory region.
-const RESERVED_BELOW: u32 = 0x60000;
+const RESERVED_BELOW: u32 = 0x70000;
 
 /// Fixed physical address every "tape" (see `shell.rs`'s `tape_run`) is
 /// always loaded at, and the size of the region set aside for it. Unlike
