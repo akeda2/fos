@@ -11,6 +11,7 @@ mod arch;
 mod boot_info;
 mod console;
 mod cpu;
+mod debug;
 mod disk;
 mod e1000;
 mod fosfs;

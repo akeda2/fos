@@ -13,14 +13,25 @@ from pathlib import Path
 import struct
 import zlib
 
-from write_layout import DATA_SECTORS, DATA_START_LBA, IMAGE_SECTORS
+from write_layout import (
+    DATA_SECTORS,
+    DATA_START_LBA,
+    IMAGE_SECTORS,
+    METADATA_LBA,
+    SLOT0_LBA,
+    SLOT1_LBA,
+    SLOT_SECTORS,
+)
 
 SECTOR_SIZE = 512
 PAYLOAD_START_LBA = 2048
 STAGE2_SECTORS = 32
 MIN_IMAGE_SECTORS = IMAGE_SECTORS
-KERNEL_LOAD_ADDRESS = 0x10000
-KERNEL_RESERVED_END = 0x50000
+# A fresh image's boot metadata sector: version 1, slot 0 active, no
+# pending update, both slots recorded as holding the freshly built kernel
+# (both copies are identical at build time; see `write_boot_metadata`
+# below and boot/stage2.S's `select_kernel_slot`).
+METADATA_MAGIC = b"FOSM"
 # FOSFS reserves one superblock sector plus this many fixed directory
 # sectors (64 entries total, 64 bytes each) before file data begins.
 DIRECTORY_SECTORS = 8
@@ -88,6 +99,30 @@ def pad(data: bytes, sectors: int) -> bytes:
     if len(data) > sectors * SECTOR_SIZE:
         raise ValueError(f"artifact exceeds its {sectors}-sector allocation")
     return data.ljust(sectors * SECTOR_SIZE, b"\0")
+
+
+def write_boot_metadata(image: bytearray, kernel_sectors: int) -> None:
+    """Writes the one-sector A/B kernel-slot metadata boot/stage2.S reads.
+
+    A fresh image always boots from slot 0 with no pending update; both
+    slots hold an identical copy of the freshly built kernel (see
+    `main`), so a stage2 fallback to slot 1 (e.g. after a corrupted
+    metadata sector defaults elsewhere, or once a real update has been
+    tried and reverted) still finds a bootable kernel. Byte layout must
+    exactly match `select_kernel_slot` in boot/stage2.S and
+    `kernel/src/debug.rs`'s `SlotMetadata`.
+    """
+    metadata = bytearray(SECTOR_SIZE)
+    metadata[0:4] = METADATA_MAGIC
+    metadata[4] = 1  # version
+    metadata[5] = 0  # active_slot
+    metadata[6] = 0xFF  # pending_slot (none)
+    metadata[7] = 0  # attempted
+    metadata[8] = 0  # confirmed
+    metadata[10:12] = kernel_sectors.to_bytes(2, "little")  # slot0_sectors
+    metadata[12:14] = kernel_sectors.to_bytes(2, "little")  # slot1_sectors
+    offset = METADATA_LBA * SECTOR_SIZE
+    image[offset:offset + SECTOR_SIZE] = metadata
 
 
 def guid_bytes(text: str) -> bytes:
@@ -179,17 +214,23 @@ def main() -> None:
     stage2 = pad(args.stage2.read_bytes(), STAGE2_SECTORS)
     kernel = args.kernel.read_bytes()
     kernel_sectors = (len(kernel) + SECTOR_SIZE - 1) // SECTOR_SIZE
-    max_kernel_sectors = (KERNEL_RESERVED_END - KERNEL_LOAD_ADDRESS) // SECTOR_SIZE
-    if not 0 < kernel_sectors <= max_kernel_sectors:
-        raise SystemExit(f"kernel must occupy between 1 and {max_kernel_sectors} sectors")
+    if not 0 < kernel_sectors <= SLOT_SECTORS:
+        raise SystemExit(f"kernel must occupy between 1 and {SLOT_SECTORS} sectors")
 
     image = bytearray(MIN_IMAGE_SECTORS * SECTOR_SIZE)
     image[:SECTOR_SIZE] = stage1
-    payload_sectors = STAGE2_SECTORS + kernel_sectors
+    # The payload partition always reserves the full metadata-sector +
+    # two-slot region, regardless of this build's actual kernel size, so a
+    # later network kernel update (which may be a different size) never
+    # needs to grow the partition itself -- only the metadata sector's
+    # per-slot sector counts change.
+    payload_sectors = STAGE2_SECTORS + 1 + 2 * SLOT_SECTORS
     write_gpt(image, payload_sectors)
     image[PAYLOAD_START_LBA * SECTOR_SIZE:(PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE] = stage2
-    kernel_start = (PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE
-    image[kernel_start:kernel_start + len(kernel)] = kernel
+    write_boot_metadata(image, kernel_sectors)
+    for slot_lba in (SLOT0_LBA, SLOT1_LBA):
+        slot_start = slot_lba * SECTOR_SIZE
+        image[slot_start:slot_start + len(kernel)] = kernel
     readme = b"Welcome to FOSFS.\nUse ls, cat readme.txt, and write NAME TEXT.\n"
     files = [("readme.txt", readme)]
     files.extend((name, Path(path).read_bytes()) for name, path in args.file)

@@ -1,6 +1,12 @@
 pub const BOOT_INFO_MAGIC: u32 = 0x464F_5342;
-pub const BOOT_INFO_VERSION: u16 = 3;
+pub const BOOT_INFO_VERSION: u16 = 4;
 pub const MAX_MEMORY_REGIONS: usize = 32;
+/// Fixed physical address `boot/stage2.S` writes `BootInfo` at (its own
+/// `BOOT_INFO` constant) and `entry.S` passes to `kmain` in a register.
+/// Exposed here so a fault handler (which has no `&BootInfo` of its own to
+/// thread through) can re-fetch it on demand -- see
+/// `kernel/src/debug.rs`'s crash-record path.
+pub const BOOT_INFO_ADDRESS: u32 = 0x5000;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -26,6 +32,14 @@ pub struct BootInfo {
     pub data_partition_lba: u64,
     pub data_partition_sectors: u64,
     pub memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS],
+    /// Which fixed-size kernel slot (0 or 1) `boot/stage2.S`'s
+    /// `select_kernel_slot` actually loaded this boot from -- see
+    /// `kernel/src/debug.rs`'s A/B slot metadata for the full state
+    /// machine this feeds into (milestone-confirming a pending update, or
+    /// noticing a boot into a slot that never got confirmed).
+    pub booted_slot: u8,
+    /// Reserved padding, kept zero, so `size` stays even.
+    pub _reserved: u8,
 }
 
 impl BootInfo {

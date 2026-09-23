@@ -1443,6 +1443,47 @@ offline, today) -- `--forget` exists so a person can notice and reset it
 deliberately, rather than the tools trying to guess when an entry has
 gone stale on their own.
 
+## Debug mode: unattended, remote-friendly development on real hardware
+
+An optional `debug` file (looked up the same way `hostname`/`start` are:
+`disk1` first, then every secondary disk) turns on a handful of features
+meant to make iterating against real, network-attached hardware -- with
+nobody watching the screen or standing next to the reset button --
+almost as cheap as iterating against QEMU. It is off by default; with no
+`debug` file, a crash still halts and the network kernel-update service
+below never even acknowledges its own protocol.
+
+- `reboot-on-crash` -- a fatal CPU exception (including a double fault)
+  resets the machine instead of halting forever, after printing the
+  crash details and waiting `reboot-delay` seconds (default 3). The
+  previous crash's details (faulting vector, `CS:EIP`, `EFLAGS`, and,
+  for a double fault, the saved general-purpose registers) are written
+  to a fixed physical address and reported once, automatically, on the
+  *next* boot, so an operator checking in later can see exactly what
+  went wrong without having watched it happen.
+- A built-in loop guard halts (rather than rebooting again) after five
+  consecutive crashes that each happened before the shell reached its
+  usual working prompt -- protecting an unattended machine from
+  spinning forever on a kernel that crashes immediately after every
+  reboot, something `reboot-on-crash` alone can't fix. Reaching a real,
+  working prompt at least once resets this counter.
+- `kernel-update` enables **KUP**, a small network protocol for pushing a
+  freshly built kernel to a running machine and trying it automatically:
+  `tools/send_kernel_update.py build/kernel.bin` (reusing the same
+  discovery/peer-address-book helpers as `tools/send_tape.py`) writes
+  the new image into whichever of the machine's two kernel slots isn't
+  currently active, then the machine reboots to try it. If it doesn't
+  reach a working prompt on that first try, the boot loader automatically
+  falls back to the previous, known-good kernel -- no physical access
+  needed to recover from a bad push. KUP is only ever served while a
+  machine is idle at its own local prompt, same as NETFS above.
+- `debug status`/`debug crash`/`debug slots` are three small, hidden
+  (not listed in `help`) diagnostic commands for checking the current
+  config, deliberately triggering a test crash, and inspecting the A/B
+  kernel-slot state, respectively.
+
+See `AGENTS.md`'s own "Debug mode" section for the full wire protocol,
+on-disk layout, and state-machine details.
 
 ## Booting from a NIC ROM
 
@@ -1540,7 +1581,10 @@ backup GPT metadata:
 - LBA 1: primary GPT header; LBAs 2-33: GPT partition entries.
 - LBA 2048: GPT payload partition.
 - First 32 payload sectors: stage-two loader.
-- Remaining payload sectors: flat kernel image at physical `0x10000`.
+- LBA 2080: one-sector A/B kernel-slot metadata block (see "Debug mode"
+  below).
+- LBA 2081-2720 and LBA 2721-3360: two 640-sector kernel slots; only one
+  is the boot loader's active choice at a time.
 - LBA 4096: a separate 28639-sector FOSFS data partition containing
   `readme.txt` and every compiled tape.
 - Final 33 sectors: backup GPT entries and header.

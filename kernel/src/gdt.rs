@@ -162,9 +162,92 @@ fn tss_descriptor(base: u32) -> u64 {
         | (u64::from(base >> 24) << 56)
 }
 
+unsafe fn read_tss_u32(tss: *const TaskStateSegment, offset: usize) -> u32 {
+    unsafe { (tss.cast::<u8>().add(offset).cast::<u32>()).read_unaligned() }
+}
+
+const TSS_EAX: usize = 40;
+const TSS_ECX: usize = 44;
+const TSS_EDX: usize = 48;
+const TSS_EBX: usize = 52;
+const TSS_EBP: usize = 60;
+const TSS_ESI: usize = 64;
+const TSS_EDI: usize = 68;
+
+/// The interrupted task's full register snapshot, as the CPU's own
+/// hardware task switch saved it into the normal TSS (referenced by TR at
+/// the moment vector 8's task gate fired) before loading the emergency
+/// double-fault TSS -- the one case in this kernel where a fatal
+/// exception's general-purpose registers are actually recoverable, since
+/// `extern "x86-interrupt"` handlers never expose them for an ordinary
+/// exception. See `kernel/src/debug.rs`'s `CrashRecord`, the only caller.
+pub struct DoubleFaultState {
+    pub code_segment: u32,
+    pub instruction_pointer: u32,
+    pub eflags: u32,
+    pub stack_segment: u32,
+    pub stack_pointer: u32,
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
+}
+
+pub fn double_fault_state() -> DoubleFaultState {
+    unsafe {
+        let tss = core::ptr::addr_of!(NORMAL_TSS);
+        DoubleFaultState {
+            code_segment: read_tss_u32(tss, TSS_CS) & 0xffff,
+            instruction_pointer: read_tss_u32(tss, TSS_EIP),
+            eflags: read_tss_u32(tss, TSS_EFLAGS),
+            stack_segment: read_tss_u32(tss, TSS_SS) & 0xffff,
+            stack_pointer: read_tss_u32(tss, TSS_ESP),
+            eax: read_tss_u32(tss, TSS_EAX),
+            ebx: read_tss_u32(tss, TSS_EBX),
+            ecx: read_tss_u32(tss, TSS_ECX),
+            edx: read_tss_u32(tss, TSS_EDX),
+            esi: read_tss_u32(tss, TSS_ESI),
+            edi: read_tss_u32(tss, TSS_EDI),
+            ebp: read_tss_u32(tss, TSS_EBP),
+        }
+    }
+}
+
 extern "C" fn double_fault_task() -> ! {
     crate::println!(
         "\nDOUBLE FAULT: switched to the emergency task stack.\nHalting before corrupted kernel state can continue."
     );
+    let state = double_fault_state();
+    let booted_slot = unsafe {
+        crate::boot_info::BootInfo::from_address(crate::boot_info::BOOT_INFO_ADDRESS)
+    }
+    .map_or(0, |info| info.booted_slot);
+    crate::debug::record_crash(
+        8,
+        None,
+        state.code_segment,
+        state.instruction_pointer,
+        state.eflags,
+        state.stack_segment,
+        state.stack_pointer,
+        Some(crate::debug::SavedRegisters {
+            eax: state.eax,
+            ebx: state.ebx,
+            ecx: state.ecx,
+            edx: state.edx,
+            esi: state.esi,
+            edi: state.edi,
+            ebp: state.ebp,
+        }),
+        booted_slot,
+    );
+    if crate::debug::reboot_on_crash() {
+        let info =
+            unsafe { crate::boot_info::BootInfo::from_address(crate::boot_info::BOOT_INFO_ADDRESS) };
+        crate::debug::handle_crash(info);
+    }
     crate::arch::x86::halt_forever();
 }

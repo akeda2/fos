@@ -39,9 +39,13 @@ static mut HOSTNAME_LEN: usize = 0;
 pub fn run(info: &BootInfo) -> ! {
     let keyboard_available = Keyboard::initialize().is_some();
     interrupts::initialize();
+    crate::debug::report_and_clear_previous_crash();
     disk::initialize(info);
     disk::discover_secondary_disks(info);
     load_hostname(info);
+    crate::debug::load_config(info);
+    crate::debug::maybe_crash_on_boot();
+    crate::debug::confirm_boot(info);
     if keyboard_available {
         println!("PS/2 keyboard initialized. Type 'help' for commands.");
     } else {
@@ -541,6 +545,7 @@ fn execute(command: &[u8], info: &BootInfo) {
             println!("Resetting the machine now (8042 keyboard-controller pulse reset)...");
             reset();
         }
+        b"debug" => debug_command(info, arguments),
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
         | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci" | b"printer"
         | b"start" => {
@@ -549,6 +554,70 @@ fn execute(command: &[u8], info: &BootInfo) {
 
         _ => println!("Unknown command. Type 'help' for commands."),
     }
+}
+
+/// `debug status` prints the currently loaded [`crate::debug::DebugConfig`]
+/// and A/B slot metadata; `debug crash` deliberately raises a real CPU
+/// exception (`int3`, vector 3, no error code) so an operator can verify
+/// `reboot-on-crash` actually reboots (or correctly halts, if disabled)
+/// *before* trusting it unattended on real hardware -- exactly the kind of
+/// thing that's much cheaper to check on purpose than to wait for a real
+/// crash to happen. Undocumented in `help`'s own listing (it is a
+/// diagnostic tool for this feature specifically, not routine command
+/// surface), but always available, matching the `debug` file's own
+/// "off unless configured" default -- `debug crash` still raises a real
+/// exception even with no `debug` file present, it just then halts instead
+/// of rebooting, exactly as any other unconfigured crash would.
+fn debug_command(info: &BootInfo, arguments: &[u8]) {
+    let (subcommand, rest) = take_word(arguments);
+    match subcommand {
+        b"status" if no_arguments(rest) => {
+            println!(
+                "debug: reboot-on-crash={}, reboot-delay={}s, kernel-update={}.",
+                crate::debug::reboot_on_crash(),
+                crate::debug::reboot_delay_ticks() / 100,
+                crate::debug::kernel_update_enabled()
+            );
+        }
+        b"crash" if no_arguments(rest) => {
+            println!("debug: deliberately raising a test exception (int3) now...");
+            unsafe {
+                core::arch::asm!("int3", options(nomem, nostack));
+            }
+        }
+        b"slots" if no_arguments(rest) => {
+            print_slot_metadata(info);
+        }
+        _ => println!("Usage: debug status | debug crash | debug slots"),
+    }
+}
+
+/// Prints the current A/B kernel-slot metadata ([`crate::debug::SlotMetadata`])
+/// -- the currently booted slot, the active/pending slots, the fallback
+/// state machine's own `attempted`/`confirmed` flags, and the on-disk
+/// crash-loop counter. Undocumented in `help`, same as the rest of `debug`;
+/// useful for verifying a network kernel update (or the fallback path)
+/// actually did what it claimed, both by a real operator and by this
+/// feature's own end-to-end test.
+fn print_slot_metadata(info: &BootInfo) {
+    let Some(metadata) = crate::debug::SlotMetadata::read(info) else {
+        println!("debug: no A/B slot metadata found on disk1.");
+        return;
+    };
+    match metadata.pending_slot {
+        Some(pending) => println!(
+            "debug: booted slot {}; active={}, pending={}, attempted={},",
+            info.booted_slot, metadata.active_slot, pending, metadata.attempted,
+        ),
+        None => println!(
+            "debug: booted slot {}; active={}, pending=none, attempted={},",
+            info.booted_slot, metadata.active_slot, metadata.attempted,
+        ),
+    }
+    println!(
+        "confirmed={}, crash_count={}, slot0_sectors={}, slot1_sectors={}.",
+        metadata.confirmed, metadata.crash_count, metadata.slot_sectors[0], metadata.slot_sectors[1]
+    );
 }
 
 fn print_ticks() {
@@ -2414,6 +2483,43 @@ const NETFS_ERROR_DISK_ERROR: u8 = 7;
 const NETFS_ERROR_CHECKSUM_MISMATCH: u8 = 8;
 const NETFS_ERROR_BUSY: u8 = 9;
 
+/// KUP ("kernel update"): a debug-mode-only sibling of NETFS's PUT, sharing
+/// `CHAT_ETHERTYPE` and the exact same "`_REQUEST` carrying the length and
+/// checksum up front, then sequence-numbered `_DATA` chunks, then `_STOP`,
+/// answered with `_ACK` or `_ERROR`" shape (see `NETFS_TAG_PUT_*` above),
+/// but installing the received bytes as a whole new kernel image into
+/// whichever A/B slot (`debug::SlotMetadata`) is not currently
+/// `active_slot`, instead of writing an ordinary FOSFS file. A successful
+/// `_ACK` is followed by this host resetting itself a short delay later, so
+/// the very next boot is `select_kernel_slot`'s (`boot/stage2.S`) own
+/// "first attempt at a fresh pending slot" case -- if the new kernel
+/// crashes before ever reaching `debug::confirm_boot`'s milestone, the boot
+/// *after that* automatically falls back to the still-known-good slot this
+/// update never touched, entirely without physical intervention.
+///
+/// Deliberately gated behind `debug::kernel_update_enabled()` (the `debug`
+/// file's `kernel-update` option) at the one call site that dispatches
+/// these tags (`ambient_discovery_poll`): unlike NETFS, which is always
+/// available, letting an arbitrary LAN peer overwrite this machine's own
+/// boot media is powerful enough that it must be an explicit, per-machine
+/// opt-in, not an ambient default. A host with the option off does not even
+/// acknowledge these frames -- indistinguishable, from a client's own
+/// timeout, from "not present on this LAN segment at all".
+const KUP_TAG_PUT_REQUEST: u8 = 0x3a;
+const KUP_TAG_PUT_DATA: u8 = 0x3b;
+const KUP_TAG_PUT_STOP: u8 = 0x3c;
+const KUP_TAG_PUT_ACK: u8 = 0x3d;
+const KUP_TAG_PUT_ERROR: u8 = 0x3e;
+
+/// One-byte error codes carried in a `KUP_TAG_PUT_ERROR` frame's payload;
+/// deliberately its own small enum rather than reusing `NETFS_ERROR_*`,
+/// since a kernel image is not a FOSFS file and several NETFS codes (bad
+/// name, directory full, ...) have no KUP equivalent.
+const KUP_ERROR_TOO_LARGE: u8 = 1;
+const KUP_ERROR_CHECKSUM_MISMATCH: u8 = 2;
+const KUP_ERROR_DISK_ERROR: u8 = 3;
+const KUP_ERROR_BUSY: u8 = 4;
+
 /// The FOSFS name-length limit (`fosfs::MAX_NAME_LENGTH`, not itself
 /// `pub`), duplicated here for the NETFS wire payload's own fixed-size
 /// frame buffers -- the same reasoning already used elsewhere in this file
@@ -2785,6 +2891,15 @@ fn ambient_discovery_poll(info: &BootInfo) {
             }
             NETFS_TAG_PUT_STOP => {
                 serve_netfs_put_stop(info, nic, peer_mac, own_mac);
+            }
+            KUP_TAG_PUT_REQUEST if crate::debug::kernel_update_enabled() => {
+                serve_kup_put_request(nic, peer_mac, own_mac, payload);
+            }
+            KUP_TAG_PUT_DATA if crate::debug::kernel_update_enabled() => {
+                serve_kup_put_data(peer_mac, payload);
+            }
+            KUP_TAG_PUT_STOP if crate::debug::kernel_update_enabled() => {
+                serve_kup_put_stop(info, nic, peer_mac, own_mac);
             }
             _ => {}
         }
@@ -5507,6 +5622,184 @@ fn serve_netfs_put_stop(info: &BootInfo, nic: &nic::Nic, source: [u8; 6], own_ma
             NETFS_ERROR_DISK_ERROR,
         ),
     }
+}
+
+/// One incoming KUP (network kernel update) PUT in progress -- structurally
+/// identical to [`NetfsPutTransfer`] above (see its own doc comment for the
+/// shared "sequence-numbered, no retransmission, spread across many idle-
+/// loop calls" design), but tracking a raw kernel image destined for an A/B
+/// slot instead of a named FOSFS file, so there is no `device`/`name` field
+/// here at all. Shares the same accepted shared-buffer risk
+/// `NetfsPutTransfer` documents (both stage incoming bytes in
+/// `pmem::TAPE_BASE`) -- more consequential here, since it could corrupt an
+/// in-progress kernel image, but still bounded by the same safety net:
+/// `select_kernel_slot` (`boot/stage2.S`) only ever trusts a pending slot
+/// once it is both `attempted` and `confirmed`, so even a corrupted image
+/// installed this way cannot brick the machine outright -- it simply fails
+/// to reach `debug::confirm_boot`'s milestone and is rolled back on the
+/// following boot exactly like any other bad kernel push.
+struct KernelUpdateTransfer {
+    source: [u8; 6],
+    length: u32,
+    checksum: u16,
+    expected_seq: u32,
+    received: u32,
+}
+
+static mut KERNEL_UPDATE_INCOMING: Option<KernelUpdateTransfer> = None;
+
+/// Begins serving one `KUP_TAG_PUT_REQUEST`, called from
+/// `ambient_discovery_poll` only when `debug::kernel_update_enabled()`.
+/// Payload: length (u32 LE) then checksum (u16 LE) -- no name, since there
+/// is only ever one kernel image per update, unlike NETFS's arbitrarily
+/// named files. `serve_kup_put_data`/`serve_kup_put_stop` (each called from
+/// later frames) do the rest, mirroring `serve_netfs_put_request`'s own
+/// split for the same reason: a PUT's data necessarily spans many later
+/// `ambient_discovery_poll` calls.
+fn serve_kup_put_request(nic: &nic::Nic, source: [u8; 6], own_mac: [u8; 6], payload: &[u8]) {
+    if unsafe { (*(&raw const KERNEL_UPDATE_INCOMING)).is_some() } {
+        send_netfs_error(nic, &source, &own_mac, KUP_TAG_PUT_ERROR, KUP_ERROR_BUSY);
+        return;
+    }
+    let Some(length_bytes) = payload.get(0..4) else {
+        return;
+    };
+    let Some(checksum_bytes) = payload.get(4..6) else {
+        return;
+    };
+    let length = u32::from_le_bytes(length_bytes.try_into().unwrap());
+    let checksum = u16::from_le_bytes(checksum_bytes.try_into().unwrap());
+    let max_len = (crate::debug::SLOT_SECTORS * 512) as u32;
+    if length == 0 || length > max_len || length > pmem::TAPE_LEN {
+        send_netfs_error(nic, &source, &own_mac, KUP_TAG_PUT_ERROR, KUP_ERROR_TOO_LARGE);
+        return;
+    }
+    println!(
+        "\nAccepting a {length}-byte network kernel update from {}...",
+        Mac(&source)
+    );
+    unsafe {
+        *(&raw mut KERNEL_UPDATE_INCOMING) = Some(KernelUpdateTransfer {
+            source,
+            length,
+            checksum,
+            expected_seq: 0,
+            received: 0,
+        });
+    }
+}
+
+fn serve_kup_put_data(source: [u8; 6], payload: &[u8]) {
+    let transfer_ptr = &raw mut KERNEL_UPDATE_INCOMING;
+    let Some(transfer) = (unsafe { &mut *transfer_ptr }).as_mut() else {
+        return;
+    };
+    if transfer.source != source {
+        return;
+    }
+    let Some(seq_bytes) = payload.get(0..4) else {
+        return;
+    };
+    let seq = u32::from_le_bytes(seq_bytes.try_into().unwrap());
+    if seq != transfer.expected_seq {
+        println!(
+            "\nGap in incoming network kernel update data from {}; aborting.",
+            Mac(&source)
+        );
+        unsafe {
+            *transfer_ptr = None;
+        }
+        return;
+    }
+    let offset = seq as usize * TAPE_CHUNK_LEN;
+    let chunk_len = (transfer.length as usize - offset).min(TAPE_CHUNK_LEN);
+    let data = &payload[4..];
+    if data.len() < chunk_len {
+        println!(
+            "\nShort incoming network kernel update data from {}; aborting.",
+            Mac(&source)
+        );
+        unsafe {
+            *transfer_ptr = None;
+        }
+        return;
+    }
+    let destination = unsafe {
+        core::slice::from_raw_parts_mut((pmem::TAPE_BASE as usize + offset) as *mut u8, chunk_len)
+    };
+    destination.copy_from_slice(&data[..chunk_len]);
+    transfer.received += chunk_len as u32;
+    transfer.expected_seq += 1;
+}
+
+/// Finishes one KUP transfer: verifies the checksum, writes the image into
+/// whichever slot is not `active_slot` ([`debug::inactive_slot`]), records
+/// it as a fresh `pending_slot` ([`debug::install_kernel_update`]), and --
+/// on success only -- acknowledges the peer and resets this machine a short
+/// delay later so `select_kernel_slot`'s existing fallback state machine
+/// gives the new kernel its first, bounded try. A failure at any step
+/// leaves the currently running kernel and its `active_slot` completely
+/// untouched; this machine keeps running unmodified and the operator can
+/// simply try again.
+fn serve_kup_put_stop(info: &BootInfo, nic: &nic::Nic, source: [u8; 6], own_mac: [u8; 6]) {
+    let transfer_ptr = &raw mut KERNEL_UPDATE_INCOMING;
+    let matches = unsafe { &*transfer_ptr }
+        .as_ref()
+        .is_some_and(|transfer| transfer.source == source);
+    if !matches {
+        return;
+    }
+    let transfer = unsafe { (&mut *transfer_ptr).take().unwrap() };
+    if transfer.received != transfer.length {
+        println!(
+            "\nIncoming network kernel update from {} stopped early ({} of {} byte(s)); aborting.",
+            Mac(&source),
+            transfer.received,
+            transfer.length
+        );
+        send_netfs_error(nic, &source, &own_mac, KUP_TAG_PUT_ERROR, KUP_ERROR_DISK_ERROR);
+        return;
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(pmem::TAPE_BASE as *const u8, transfer.length as usize)
+    };
+    if internet_checksum(bytes) != transfer.checksum {
+        println!(
+            "\nChecksum mismatch on incoming network kernel update from {}; discarding.",
+            Mac(&source)
+        );
+        send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            KUP_TAG_PUT_ERROR,
+            KUP_ERROR_CHECKSUM_MISMATCH,
+        );
+        return;
+    }
+    let Some(metadata) = crate::debug::SlotMetadata::read(info) else {
+        println!("\nCould not read A/B slot metadata; discarding network kernel update.");
+        send_netfs_error(nic, &source, &own_mac, KUP_TAG_PUT_ERROR, KUP_ERROR_DISK_ERROR);
+        return;
+    };
+    let slot = crate::debug::inactive_slot(&metadata);
+    if let Err(error) = crate::debug::install_kernel_update(info, slot, bytes) {
+        println!("\nFailed to write network kernel update to slot {slot}: {error:?}");
+        send_netfs_error(nic, &source, &own_mac, KUP_TAG_PUT_ERROR, KUP_ERROR_DISK_ERROR);
+        return;
+    }
+    invalidate_tape_after_scratch_use();
+    println!(
+        "\nInstalled a {}-byte kernel from {} into slot {slot}; rebooting to try it ...",
+        transfer.length,
+        Mac(&source)
+    );
+    send_netfs_control(nic, &source, &own_mac, KUP_TAG_PUT_ACK);
+    let deadline = interrupts::ticks().wrapping_add(100);
+    while interrupts::ticks() < deadline {
+        core::hint::spin_loop();
+    }
+    reset();
 }
 
 /// Displays a MAC address as `aa:bb:cc:dd:ee:ff` wherever `println!`/`print!`

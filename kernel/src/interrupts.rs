@@ -455,6 +455,11 @@ fn report_exception(vector: u8, error_code: Option<u32>, frame: &InterruptStackF
     let name = EXCEPTION_NAMES[usize::from(vector)];
     let instruction_pointer = frame.instruction_pointer;
     let code_segment = frame.code_segment;
+    let action = if crate::debug::reboot_on_crash() {
+        "Rebooting"
+    } else {
+        "Halting"
+    };
     if vector == 14 {
         // The CPU always supplies an error code for #PF; retain a harmless
         // fallback so this diagnostic path can never panic recursively.
@@ -477,17 +482,46 @@ fn report_exception(vector: u8, error_code: Option<u32>, frame: &InterruptStackF
         };
         let region = crate::paging::describe_address(address);
         crate::println!(
-            "\nPAGE FAULT at virtual address 0x{address:08x} ({region}): {cause} on {privilege} {access}, error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
+            "\nPAGE FAULT at virtual address 0x{address:08x} ({region}): {cause} on {privilege} {access}, error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\n{action}: this kernel has no fault recovery."
         );
-        crate::arch::x86::halt_forever();
+        finish_exception(vector, error_code, frame);
     }
     match error_code {
         Some(code) => crate::println!(
-            "\nCPU EXCEPTION {vector} ({name}), error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
+            "\nCPU EXCEPTION {vector} ({name}), error code 0x{code:08x}, at {code_segment:04x}:{instruction_pointer:08x}.\n{action}: this kernel has no fault recovery."
         ),
         None => crate::println!(
-            "\nCPU EXCEPTION {vector} ({name}) at {code_segment:04x}:{instruction_pointer:08x}.\nHalting: this kernel has no fault recovery."
+            "\nCPU EXCEPTION {vector} ({name}) at {code_segment:04x}:{instruction_pointer:08x}.\n{action}: this kernel has no fault recovery."
         ),
+    }
+    finish_exception(vector, error_code, frame);
+}
+
+/// Records a [`crate::debug::CrashRecord`] for the exception just reported,
+/// then either halts forever (the default) or, when `reboot-on-crash` is
+/// active in the `debug` file, waits a short configured delay and resets --
+/// letting an unattended real-hardware machine recover from a crash with no
+/// physical intervention. Ordinary exception handlers here (unlike the
+/// double-fault task gate in `gdt.rs`) use `extern "x86-interrupt"`, which
+/// never exposes the interrupted code's general-purpose registers, so the
+/// crash record's register fields stay zero for every vector but 8.
+fn finish_exception(vector: u8, error_code: Option<u32>, frame: &InterruptStackFrame) -> ! {
+    let info =
+        unsafe { crate::boot_info::BootInfo::from_address(crate::boot_info::BOOT_INFO_ADDRESS) };
+    let booted_slot = info.map_or(0, |info| info.booted_slot);
+    crate::debug::record_crash(
+        vector,
+        error_code,
+        frame.code_segment,
+        frame.instruction_pointer,
+        frame.flags,
+        frame.stack_segment,
+        frame.stack_pointer,
+        None,
+        booted_slot,
+    );
+    if crate::debug::reboot_on_crash() {
+        crate::debug::handle_crash(info);
     }
     crate::arch::x86::halt_forever();
 }

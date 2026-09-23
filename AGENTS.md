@@ -169,6 +169,7 @@ fixed address below `0x60000`, and update it in the same change that adds one:
 | `0x600`-`0x613` | `netrom.S` | Scratch RAM for state a shadowed (read-only) option ROM cannot mutate in place: computed ROM segment/physical base, serial-availability flag, and the GDT/protected-entry descriptors used to enter protected mode. |
 | `0x5000` | `stage2.S`, `netrom.S`, `kernel/` | The packed `BootInfo` struct: the loader/kernel ABI. |
 | `0x5400`-`0x5447` | `stage2.S` BIOS disk trampoline | One EDD request/DAP plus saved protected-mode stack pointer and CR0, used while temporarily entering real mode. |
+| `0x5500`-`0x5547` | `kernel/src/debug.rs` (`CRASH_RECORD_ADDR`) | A `CrashRecord` written by a fault handler and read back on the *next* boot, so a real-hardware operator can see what a previous fatal exception looked like without having watched it happen live. See "Debug mode" below. |
 | `0x7a00` | `stage2.S`, `netrom.S` | Real-mode stack pointer during boot. |
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
@@ -214,8 +215,10 @@ protective MBR and primary/backup GPT metadata:
 | --- | --- |
 | LBA 0 | MBR / stage-one loader |
 | LBA 2048 | GPT boot payload partition |
-| First 32 payload sectors | Stage-two loader |
-| Following payload sectors | Flat 32-bit Rust kernel |
+| First 32 payload sectors (LBA 2048-2079) | Stage-two loader |
+| LBA 2080 | One-sector A/B kernel-slot metadata block (see "Debug mode" below) |
+| LBA 2081-2720 (640 sectors, slot 0) | Kernel slot 0 |
+| LBA 2721-3360 (640 sectors, slot 1) | Kernel slot 1 |
 | LBA 4096 | Dedicated 28639-sector GPT-discovered FOSFS data partition containing README and all compiled tapes |
 | Final 33 sectors | Backup GPT entry array and header |
 
@@ -227,6 +230,197 @@ matching stage-loader constants from the actual kernel size. Never add host
 block-device writes, automatic device selection, or commands that let FOSFS
 write outside its own partition. Copying an image to a device is destructive
 and must remain an explicit user action.
+
+Only one of the two 640-sector kernel slots is ever the boot loader's actual
+first choice at a time (`active_slot`, in the metadata block); the other
+exists purely so a kernel update can be written into it without touching the
+one currently running. See "Debug mode" below for the full state machine and
+the network service that writes a fresh slot.
+
+## Debug mode: unattended, remote-friendly development on real hardware
+
+Real hardware has no debugger attached and no guarantee anyone is watching
+the screen when something goes wrong -- the exact opposite of QEMU, where a
+crash is easy to see and a bad build costs nothing to retry. Debug mode
+exists to make iterating against a real machine over the network almost as
+cheap as iterating against QEMU: instead of a fatal exception halting the
+CPU and needing a physical hand on the reset button, the machine can reboot
+itself and explain what happened; instead of a kernel update needing a
+freshly written USB stick, a new kernel can be pushed over Ethernet and
+tried automatically, with a built-in, automatic fallback if it turns out to
+be broken.
+
+Everything below is controlled by an optional `debug` file (the same kind
+of per-machine config file `hostname`/`start` already are -- see
+`kernel/src/debug.rs`'s `load_config`, checked on `disk1` first and then
+every secondary disk in order) so an ordinary deployment with no such file
+behaves exactly as it always has: a fatal exception halts the CPU, and the
+network kernel-update service does not even acknowledge its own protocol's
+frames. One line per option, `#` comments and blank lines ignored:
+
+| Option | Effect |
+| --- | --- |
+| `reboot-on-crash` | A fatal CPU exception resets the machine instead of halting forever. |
+| `reboot-delay N` | Seconds to print the crash details before actually resetting (default 3); gives a slow serial link time to flush. |
+| `kernel-update` | Enables KUP, the network kernel-update service (see below). Off by default -- this is a powerful, write-to-disk-and-reboot capability, not something to leave enabled on every machine. |
+| `crash-on-boot` | Test-only: crashes immediately at every boot, before the milestone that would otherwise reset the loop-guard counter (see below). Exists purely to exercise the loop guard itself in an automated test (`tools/test_debug_mode_e2e.py`) without needing a real hardware/driver bug; genuinely useful as a documented, supported option for anyone else who needs to test the same path, not something planned for removal. |
+
+### Crash records and reboot-on-crash
+
+`kernel/src/interrupts.rs`'s ordinary exception handlers and
+`kernel/src/gdt.rs`'s double-fault task gate both call
+`debug::handle_crash` (via `debug::record_crash`) instead of unconditionally
+halting. `record_crash` writes a `CrashRecord` (vector, error code,
+`CS:EIP`, `EFLAGS`, `SS:ESP`, and -- for a double fault only, since that's
+the one case where the CPU's own hardware task switch actually saves them
+-- the general-purpose registers) to a fixed physical address,
+`CRASH_RECORD_ADDR` (`0x5500`; see "Low-memory map" above), not to disk:
+writing it must be safe from inside a fault handler with no allocator and,
+for a double fault, an already-exhausted normal stack. The *next* boot's
+`shell::run` calls `debug::report_and_clear_previous_crash` early, which
+prints the record (if its magic/version match) and clears it, so an
+operator checking in later sees exactly what the last boot's fatal
+exception looked like without having had to be watching when it happened.
+This only survives a reset that happens to leave RAM intact -- true of
+every real chipset and QEMU tested against, but not a guarantee this module
+can make; a machine whose reset path clears RAM just shows no previous
+crash on the next boot, same as if none had happened.
+
+With `reboot-on-crash` enabled, `handle_crash` prints the crash details,
+waits `reboot-delay` seconds, then performs the same 8042
+keyboard-controller pulse reset the `reset` shell command uses, instead of
+halting. With it disabled (the default), a crash still writes the crash
+record (so `debug status`/the next boot's report both still work) but then
+halts exactly as it always did.
+
+A consecutive-crash loop guard (`MAX_CONSECUTIVE_CRASHES` = 5,
+`crash_count` persisted in metadata byte 9 of the on-disk slot-metadata
+sector, not in RAM, so it survives a RAM-clearing reset too) protects
+against a kernel that crashes immediately after every reboot -- a bug
+reboot-on-crash itself cannot fix -- from spinning forever, chewing power
+and wearing out real hardware unattended. `debug::confirm_boot` (called
+once `shell::run` reaches its own milestone, i.e. the point where a human
+or a remote client could actually use the machine) unconditionally resets
+`crash_count` to 0: reaching a real, working shell proves this boot is
+fine, regardless of what an operator does with it afterward. This means
+the guard can only ever be tripped by a crash that happens *before* that
+milestone on every one of five consecutive boots -- exactly the scenario a
+bad kernel update or a startup-time bug produces, not a manually typed
+`debug crash` from an already-reached prompt (which has already reset the
+counter for that boot). Once tripped, the machine halts with a clear
+message instead of rebooting again.
+
+Two hidden diagnostic commands (undocumented in `help`'s own listing, but
+always available): `debug status` prints the current config
+(`reboot-on-crash`/`reboot-delay`/`kernel-update`); `debug crash`
+deliberately raises a real `int3` exception so `reboot-on-crash` (or its
+absence) can be verified on purpose, cheaply, rather than waiting for a
+real crash to happen; `debug slots` prints the current A/B slot metadata
+(booted slot, active/pending slots, the fallback state machine's own
+`attempted`/`confirmed` flags, and `crash_count`) -- mainly useful for
+verifying a kernel update (or its fallback) actually did what it claimed.
+
+### A/B kernel slots and automatic fallback
+
+Two 640-sector kernel slots (see the disk layout table above) let a new
+kernel be written without ever overwriting the one currently running. A
+one-sector metadata block at LBA 2080 (`kernel/src/debug.rs`'s
+`SlotMetadata`, byte-identical to `tools/write_layout.py`'s constants and
+`boot/stage2.S`'s `select_kernel_slot`) records `active_slot` (0 or 1),
+an optional `pending_slot`, and two flags: `attempted` (has the pending
+slot been booted at least once) and `confirmed` (did that boot reach the
+kernel's own milestone).
+
+`select_kernel_slot` (`boot/stage2.S`), run before the kernel is loaded,
+implements the actual fallback logic:
+- No pending slot: boot `active_slot`, exactly as before this feature
+  existed.
+- A pending slot exists but hasn't been attempted yet: boot it, and mark
+  `attempted = true` (a **single** try; see below).
+- A pending slot was attempted and confirmed: promote it (`active_slot =
+  pending_slot`, clear `pending_slot`/`attempted`/`confirmed`) and boot
+  it -- covers the case where the kernel confirmed but reset before it
+  could clear its own pending state.
+- A pending slot was attempted but *not* confirmed (it crashed, hung, or
+  the machine was power-cycled before reaching the milestone): give up on
+  it, clear `pending_slot`/`attempted`/`confirmed`, and fall back to
+  booting the unchanged `active_slot` instead. A bad kernel update gets
+  exactly one try before this machine automatically reverts to the last
+  known-good kernel, with no physical intervention required.
+
+`debug::confirm_boot`, called once `shell::run` reaches its milestone, is
+the only place that ever sets `confirmed = true` (or promotes an
+already-confirmed pending slot immediately, for the reset-before-clearing
+case above) -- this is a deliberate, narrow point in the boot sequence,
+not "the kernel ran for a while without crashing."
+
+### KUP: the network kernel-update service
+
+KUP (`kernel/src/shell.rs`'s `serve_kup_put_*` functions,
+`kernel/src/debug.rs`'s `install_kernel_update`/`inactive_slot`, and the
+host-side `tools/send_kernel_update.py`) lets a new kernel image be pushed
+to a running machine over plain Ethernet and tried automatically, with the
+A/B fallback above as its safety net -- directly answering "would it be
+possible to overwrite the kernel on a running machine from the network for
+testing?". It only exists at all when the `debug` file's `kernel-update`
+option is set; otherwise the frames below are never even acknowledged,
+indistinguishable on the wire from "no such machine".
+
+It shares `CHAT_ETHERTYPE` with `chat`/`nic discover`/`tape`/`term
+net`/NETFS, and mirrors NETFS's own PUT flow almost exactly:
+
+| Tag | Meaning |
+| --- | --- |
+| `KUP_TAG_PUT_REQUEST` (`0x3a`) | Client -> server. Payload: length (u32 LE), RFC 1071 Internet checksum (u16 LE) of the whole image. |
+| `KUP_TAG_PUT_DATA` (`0x3b`) | Client -> server, one per chunk. Payload: sequence number (u32 LE) then up to 1024 bytes -- the same `TAPE_CHUNK_LEN`-shaped, sequence-numbered chunking `tape`'s own network transfer already uses, for the same reason (a binary image's own trailing zero bytes must never be confused with Ethernet's 60-byte minimum-frame padding). A gap or reorder aborts the transfer immediately; there is no retransmission. |
+| `KUP_TAG_PUT_STOP` (`0x3c`) | Client -> server. Ends the transfer; triggers verification. |
+| `KUP_TAG_PUT_ACK` (`0x3d`) | Server -> client. The image was verified and installed; the server will reset shortly to try it. |
+| `KUP_TAG_PUT_ERROR` (`0x3e`) | Server -> client. One-byte code: `1` `TOO_LARGE` (bigger than one 640-sector slot, or the shared staging buffer), `2` `CHECKSUM_MISMATCH`, `3` `DISK_ERROR` (writing the slot, or reading metadata, failed), `4` `BUSY` (another update is already in flight). |
+
+`ambient_discovery_poll` -- the same idle-prompt-loop hook that also serves
+NETFS and ordinary discovery -- dispatches all three request-carrying tags,
+gated behind `debug::kernel_update_enabled()`. **KUP is therefore only ever
+served while a machine is sitting idle at its own local prompt**, exactly
+like NETFS -- not inside `chat`, `nic discover`, `term net`, or a running
+tape's own polling loop.
+
+On `KUP_TAG_PUT_STOP`, the server verifies the reassembled image's checksum
+before writing anything; a mismatch (or any other failure) leaves the
+currently running kernel and `active_slot` completely untouched, replies
+with the matching error, and the operator can simply try again. On success,
+it writes the image into whichever slot is *not* `active_slot`
+(`debug::inactive_slot`), records it as a fresh, unattempted `pending_slot`
+(`debug::install_kernel_update` -- no `boot/stage2.S` changes were needed
+for this, since its fallback state machine above already handles "a fresh
+pending slot" as a first-class case), sends `KUP_TAG_PUT_ACK`, and resets
+the machine roughly a second later so `select_kernel_slot`'s existing logic
+gives the new kernel its one bounded try on the very next boot -- if it
+never reaches its own milestone, the automatic fallback above reverts to
+the previous kernel with no manual step at all.
+
+Like NETFS's own PUT, a KUP transfer reuses the shared
+`pmem::TAPE_BASE`/`TAPE_LEN` staging buffer -- the same accepted,
+documented risk (a local `copy`/`tape load` command run concurrently on the
+serving machine could corrupt an in-flight transfer) applies here too, but
+is bounded: even a corrupted install can't brick the machine, since
+`select_kernel_slot` never trusts an unconfirmed pending slot.
+
+`tools/send_kernel_update.py` is the host-side sender, reusing
+`tools/send_tape.py`'s discovery/peer-resolution/address-book helpers
+directly (`--mac`, a peer number, or automatic single-reply discovery) so
+it needs no separate addressing logic of its own; give it a `kernel.bin`
+path and it sends the request/data/stop sequence above (paced the same way
+`send_tape.py` paces a tape, to avoid outrunning a polling-only RTL8139
+receive path) and reports the ACK/ERROR reply.
+
+`tools/test_debug_mode_e2e.py` (`make test-debug-mode`) is the automated
+regression test for everything in this section: reboot-on-crash reboots
+and reports the previous crash; the same crash halts when reboot-on-crash
+is off; the consecutive-crash loop guard trips after five automatic
+pre-milestone crashes (using `crash-on-boot`); and KUP is silently ignored
+when disabled, rejects a bad checksum with slot metadata untouched, and
+installs, ACKs, actually reboots, and promotes the new slot to active on a
+good push of the real `build/kernel.bin`.
 
 ## Build and validation
 
@@ -245,6 +439,7 @@ make test-page-protection # Verifies CR0.WP and read-only kernel-text PTEs.
 make test-nic-watchdog # Verifies foreground recovery from a latched NIC fault.
 make test-start # Verifies an optional FOSFS start boot-command script.
 make test-second-disk # Verifies the diskN selector against a second, attached disk.
+make test-debug-mode # Verifies reboot-on-crash, the crash-loop guard, and KUP.
 make all      # Builds everything: image, netrom, and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
 make help     # Lists every target with a one-line description.
@@ -262,6 +457,11 @@ Run `make test-second-disk` when changing secondary-disk discovery, the
 already includes it, but it is faster to run alone while iterating).
 Run `make test-unsafe-memory` when changing the legacy-memory feature or its
 separate image target.
+Run `make test-debug-mode` when changing `kernel/src/debug.rs`, the A/B
+kernel-slot state machine in `boot/stage2.S`, `shell.rs`'s KUP handlers, or
+anything else under "Debug mode" below -- it is not part of `make test`
+since it performs several genuine QEMU guest resets (never `-no-reboot`)
+and takes noticeably longer.
 The smoke harness must use bounded waits, preserve serial output on failure,
 and wait for the prompt before sending input.
 

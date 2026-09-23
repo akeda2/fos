@@ -76,12 +76,12 @@ halt:
 initialize_boot_info:
     movw $BOOT_INFO, %di
     xorw %ax, %ax
-    movw $(48 + MAX_MEMORY_REGIONS * 24) / 2, %cx
+    movw $(48 + MAX_MEMORY_REGIONS * 24 + 2) / 2, %cx
     rep stosw
     movw $0x5342, BOOT_INFO
     movw $0x464f, BOOT_INFO + 2
-    movw $3, BOOT_INFO + 4
-    movw $(48 + MAX_MEMORY_REGIONS * 24), BOOT_INFO + 6
+    movw $4, BOOT_INFO + 4
+    movw $(48 + MAX_MEMORY_REGIONS * 24 + 2), BOOT_INFO + 6
     movb boot_drive + STAGE2_BASE, %al
     movb %al, BOOT_INFO + 8
     movb serial_available + STAGE2_BASE, %al
@@ -95,6 +95,11 @@ initialize_boot_info:
     movl $DATA_START_LBA_HI, BOOT_INFO + 36
     movl $DATA_SECTORS_LO, BOOT_INFO + 40
     movl $DATA_SECTORS_HI, BOOT_INFO + 44
+    # `BOOT_INFO + 816` (the new `booted_slot` byte, right after the fixed
+    # 32-entry memory map -- see kernel/src/boot_info.rs) is left at the
+    # zero `select_kernel_slot` will overwrite once it actually decides
+    # which kernel slot this boot is using; a byte at +817 is reserved
+    # padding, also left zero.
     ret
 
 collect_memory_map:
@@ -243,8 +248,7 @@ a20_still_disabled:
 
 load_kernel:
     movb boot_drive + STAGE2_BASE, %dl
-    movw $KERNEL_SECTORS, kernel_remaining + STAGE2_BASE
-    movl $KERNEL_LBA, kernel_packet + STAGE2_BASE + 8
+    call select_kernel_slot
     movw $0x1000, kernel_packet + STAGE2_BASE + 6
 load_kernel_chunk:
     movw kernel_remaining + STAGE2_BASE, %cx
@@ -289,6 +293,119 @@ load_kernel_done:
 load_kernel_packet:
     movw $(kernel_packet + STAGE2_BASE), %si
     movb $0x42, %ah
+    int $0x13
+    ret
+
+# Reads the one-sector boot metadata (LBA `METADATA_LBA`) and decides which
+# of the two fixed-size kernel slots to boot from, implementing the A/B
+# fallback/confirm state machine debug-mode remote kernel updates rely on
+# (see kernel/src/debug.rs's `SlotMetadata`, which mirrors this exact byte
+# layout and does the *writing* half of this same protocol -- this routine
+# only ever advances metadata forward through states a genuinely running
+# kernel already requested). Every reachable exit sets `kernel_packet`'s
+# LBA field, `kernel_remaining`, and `BOOT_INFO + 816` (`booted_slot`)
+# before returning, so `load_kernel_chunk`'s existing transfer loop and the
+# kernel's own milestone-confirm logic both see a consistent choice.
+#
+# Metadata sector byte layout (must stay in sync with
+# tools/build_image.py's `write_boot_metadata` and kernel/src/debug.rs):
+#   +0..4   magic "FOSM"
+#   +4      version (1)
+#   +5      active_slot (0 or 1)
+#   +6      pending_slot (0xff = none)
+#   +7      attempted (0/1): has `pending_slot` been booted at least once
+#   +8      confirmed (0/1): did that boot reach the kernel's milestone
+#   +10     slot0_sectors (u16)
+#   +12     slot1_sectors (u16)
+select_kernel_slot:
+    movb boot_drive + STAGE2_BASE, %dl
+    movw $(metadata_packet + STAGE2_BASE), %si
+    movb $0x42, %ah
+    int $0x13
+    jc select_kernel_slot_default
+
+    movl metadata_buffer + STAGE2_BASE, %eax
+    cmpl $0x4d534f46, %eax
+    jne select_kernel_slot_default
+    movb metadata_buffer + STAGE2_BASE + 4, %al
+    cmpb $1, %al
+    jne select_kernel_slot_default
+
+    movb metadata_buffer + STAGE2_BASE + 6, %al
+    cmpb $0xff, %al
+    je select_kernel_slot_use_active
+
+    # A pending slot exists; `attempted`/`confirmed` decide what to do
+    # with it, per the state machine documented in AGENTS.md's "A/B kernel
+    # slots" section.
+    movb metadata_buffer + STAGE2_BASE + 8, %ah
+    cmpb $1, %ah
+    je select_kernel_slot_promote
+    movb metadata_buffer + STAGE2_BASE + 7, %ah
+    cmpb $0, %ah
+    je select_kernel_slot_first_attempt
+
+    # attempted && !confirmed: the last boot into the pending slot never
+    # reached the kernel's milestone -- give up on it and fall back to the
+    # still-known-good active slot.
+    movb $0xff, metadata_buffer + STAGE2_BASE + 6
+    movb $0, metadata_buffer + STAGE2_BASE + 7
+    call select_kernel_slot_write_back
+    jmp select_kernel_slot_use_active
+
+select_kernel_slot_first_attempt:
+    movb $1, metadata_buffer + STAGE2_BASE + 7
+    call select_kernel_slot_write_back
+    movb metadata_buffer + STAGE2_BASE + 6, %al
+    jmp select_kernel_slot_apply
+
+select_kernel_slot_promote:
+    # The kernel confirmed but may have reset before it could clear
+    # `pending_slot` itself (see kernel/src/debug.rs); finish that
+    # promotion here so the next ordinary boot sees a clean, settled
+    # `active_slot`/no-pending state.
+    movb metadata_buffer + STAGE2_BASE + 6, %al
+    movb %al, metadata_buffer + STAGE2_BASE + 5
+    movb $0xff, metadata_buffer + STAGE2_BASE + 6
+    movb $0, metadata_buffer + STAGE2_BASE + 7
+    movb $0, metadata_buffer + STAGE2_BASE + 8
+    call select_kernel_slot_write_back
+    movb metadata_buffer + STAGE2_BASE + 5, %al
+    jmp select_kernel_slot_apply
+
+select_kernel_slot_use_active:
+    movb metadata_buffer + STAGE2_BASE + 5, %al
+
+select_kernel_slot_apply:
+    movb %al, BOOT_INFO + 816
+    cmpb $0, %al
+    je select_kernel_slot_zero
+    movw metadata_buffer + STAGE2_BASE + 12, %cx
+    movl $SLOT1_LBA, kernel_packet + STAGE2_BASE + 8
+    jmp select_kernel_slot_finish
+select_kernel_slot_zero:
+    movw metadata_buffer + STAGE2_BASE + 10, %cx
+    movl $SLOT0_LBA, kernel_packet + STAGE2_BASE + 8
+select_kernel_slot_finish:
+    movw %cx, kernel_remaining + STAGE2_BASE
+    ret
+
+# Reached when the metadata sector can't be read at all, or doesn't carry
+# this routine's expected magic/version -- a very old image predating this
+# feature, or a corrupted sector. Falls back to this build's own slot 0
+# kernel and its actual sector count (from `layout.inc`), the one case
+# where a compile-time default is the best available answer.
+select_kernel_slot_default:
+    movb $0, BOOT_INFO + 816
+    movw $KERNEL_SECTORS, kernel_remaining + STAGE2_BASE
+    movl $SLOT0_LBA, kernel_packet + STAGE2_BASE + 8
+    ret
+
+select_kernel_slot_write_back:
+    movb boot_drive + STAGE2_BASE, %dl
+    movw $(metadata_packet + STAGE2_BASE), %si
+    movb $0x43, %ah
+    xorb %al, %al
     int $0x13
     ret
 
@@ -401,9 +518,18 @@ kernel_packet:
     .byte 0x10, 0
     .word KERNEL_SECTORS
     .word 0, 0x1000
-    .quad KERNEL_LBA
+    .quad SLOT0_LBA
 kernel_remaining:
     .word 0
+
+.align 4
+metadata_packet:
+    .byte 0x10, 0
+    .word 1
+    .word (metadata_buffer + STAGE2_BASE), 0
+    .quad METADATA_LBA
+metadata_buffer:
+    .space 512
 
 .align 8
 gdt:
