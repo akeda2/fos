@@ -18,12 +18,30 @@ const TAPE_ARGUMENT_FILE_CAPACITY: usize = 4096;
 const START_FILE_NAME: &[u8] = b"start";
 const START_FILE_CAPACITY: usize = 4096;
 const TERM_NET_IDLE_TICKS: u64 = 60 * 100;
+const HOSTNAME_FILE_NAME: &[u8] = b"hostname";
+/// Generous for a short, hand-typed machine name; kept small since it is
+/// duplicated into every peer table entry (see `PEER_HOSTNAME_CAPACITY`).
+const HOSTNAME_CAPACITY: usize = 16;
+/// `HOSTNAME_CAPACITY` plus room for a 1-based interface number appended by
+/// `interface_hostname` -- two digits comfortably covers `nic::MAX_NICS`
+/// (currently 32).
+const INTERFACE_HOSTNAME_CAPACITY: usize = HOSTNAME_CAPACITY + 2;
+
+/// This machine's configured base hostname (before a per-interface number is
+/// appended -- see `interface_hostname`), loaded once at boot by
+/// `load_hostname`. Empty (`HOSTNAME_LEN == 0`) means no `hostname` file was
+/// found anywhere, in which case discovery frames carry no hostname payload
+/// and every peer is shown by bare MAC address alone, exactly as before this
+/// feature existed.
+static mut HOSTNAME: [u8; HOSTNAME_CAPACITY] = [0; HOSTNAME_CAPACITY];
+static mut HOSTNAME_LEN: usize = 0;
 
 pub fn run(info: &BootInfo) -> ! {
     let keyboard_available = Keyboard::initialize().is_some();
     interrupts::initialize();
     disk::initialize(info);
     disk::discover_secondary_disks(info);
+    load_hostname(info);
     if keyboard_available {
         println!("PS/2 keyboard initialized. Type 'help' for commands.");
     } else {
@@ -52,6 +70,7 @@ pub fn run(info: &BootInfo) -> ! {
 
     loop {
         let byte = console::read_serial_byte().or_else(keyboard::pop_char);
+        ambient_discovery_poll();
         let Some(byte) = byte else {
             if interrupts::ticks().wrapping_sub(last_activity) >= TERM_NET_IDLE_TICKS {
                 println!(
@@ -109,6 +128,75 @@ fn locate_start_file(info: &BootInfo) -> StartFileLookup {
         _ => StartFileLookup::Missing,
     }
 }
+
+/// Looks for an optional `hostname` file, checking the boot disk first and
+/// then *every* secondary disk in order (disk2, disk3, ...) -- unlike
+/// `locate_start_file`, which only ever falls back to the first secondary
+/// disk, since a `start` script is expected to sit right next to whatever
+/// disk holds other boot-time config, while a hostname is just as likely to
+/// be dropped onto whichever secondary disk happens to be handy on a given
+/// machine. Any error (including an unformatted/blank disk, the common
+/// state for a secondary disk with no config on it yet) is silently treated
+/// as "no hostname there", the same reasoning `locate_start_file` already
+/// applies to disk2. Called once at boot; the result is cached in
+/// `HOSTNAME`/`HOSTNAME_LEN` for `interface_hostname` to use for the rest of
+/// the session.
+fn load_hostname(info: &BootInfo) {
+    let devices = core::iter::once(disk::Device::Boot)
+        .chain((0..disk::secondary_count()).map(disk::Device::Secondary));
+    for device in devices {
+        let length = match fosfs::file_length(info, device, HOSTNAME_FILE_NAME) {
+            Ok(Some(length)) => length,
+            _ => continue,
+        };
+        if length > HOSTNAME_CAPACITY as u64 {
+            println!(
+                "hostname: ignoring a {length}-byte hostname file (limit is {HOSTNAME_CAPACITY} bytes)."
+            );
+            continue;
+        }
+        let mut contents = [0u8; HOSTNAME_CAPACITY];
+        let Ok(Some(read_length)) = fosfs::read(
+            info,
+            device,
+            HOSTNAME_FILE_NAME,
+            &mut contents[..length as usize],
+        ) else {
+            continue;
+        };
+        let name = trim_trailing_whitespace(&contents[..read_length as usize]);
+        if name.is_empty() {
+            continue;
+        }
+        unsafe {
+            HOSTNAME[..name.len()].copy_from_slice(name);
+            HOSTNAME_LEN = name.len();
+        }
+        let text = core::str::from_utf8(name).unwrap_or("<non-UTF-8 hostname>");
+        println!(
+            "hostname: configured as '{text}' (interfaces appear as '{text}1', '{text}2', ...)."
+        );
+        return;
+    }
+}
+
+/// Formats the configured hostname (see `load_hostname`) with a 1-based
+/// interface number appended (e.g. `myhost1`, `myhost2`), matching `nic
+/// list`'s own 1-based numbering -- this is what lets several NICs on one
+/// machine appear as distinct, individually addressable names on the wire.
+/// Returns 0 (nothing written) if no hostname is configured, so a machine
+/// with no `hostname` file behaves exactly as it always has.
+fn interface_hostname(index: usize, out: &mut [u8]) -> usize {
+    let name_len = unsafe { HOSTNAME_LEN };
+    if name_len == 0 {
+        return 0;
+    }
+    let hostname = &raw const HOSTNAME;
+    let name = unsafe { &(&*hostname)[..name_len] };
+    out[..name_len].copy_from_slice(name);
+    name_len + write_decimal(&mut out[name_len..], index + 1)
+}
+
 
 /// Runs the optional FOSFS `start` script before the automatic remote-terminal
 /// wait. Lines use the ordinary shell dispatcher, so a deployment script has
@@ -1200,12 +1288,13 @@ fn term_net(info: &BootInfo) {
                     }
                     CHAT_TAG_DISCOVER_REQUEST => {
                         let interface_mac = interface.mac_address();
-                        remember_peer(peer_mac);
+                        remember_peer(peer_mac, trim_trailing_zero(&frame[15..]));
                         send_chat_control(
                             interface,
                             &peer_mac,
                             &interface_mac,
                             CHAT_TAG_DISCOVER_REPLY,
+                            index,
                         );
                         println!(
                             "\n(replied to a discovery probe from {} on NIC {})",
@@ -1279,8 +1368,14 @@ fn term_net(info: &BootInfo) {
                 }
                 let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
                 if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
-                    remember_peer(frame_source);
-                    send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
+                    remember_peer(frame_source, trim_trailing_zero(&frame[15..]));
+                    send_chat_control(
+                        nic,
+                        &frame_source,
+                        &source,
+                        CHAT_TAG_DISCOVER_REPLY,
+                        nic::active_index(),
+                    );
                     continue;
                 }
                 if frame_source != peer {
@@ -1625,8 +1720,14 @@ fn poll_remote_tape_abort() -> bool {
     }
     let frame_source: [u8; 6] = frame[6..12].try_into().unwrap();
     if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
-        remember_peer(frame_source);
-        send_chat_control(nic, &frame_source, &source, CHAT_TAG_DISCOVER_REPLY);
+        remember_peer(frame_source, trim_trailing_zero(&frame[15..]));
+        send_chat_control(
+            nic,
+            &frame_source,
+            &source,
+            CHAT_TAG_DISCOVER_REPLY,
+            nic::active_index(),
+        );
         tape_network_frame_push(frame);
         return false;
     }
@@ -1789,6 +1890,13 @@ fn nic_list() {
             mac[4],
             mac[5]
         );
+        let mut hostname_buf = [0u8; INTERFACE_HOSTNAME_CAPACITY];
+        let hostname_len = interface_hostname(index, &mut hostname_buf);
+        if hostname_len > 0 {
+            let name = core::str::from_utf8(&hostname_buf[..hostname_len])
+                .unwrap_or("<non-UTF-8 hostname>");
+            println!("  hostname: {name}");
+        }
         report_nic_watchdog(nic.watchdog());
         print_nic_interrupt_status(nic);
         print_nic_health(nic);
@@ -2261,29 +2369,72 @@ const TERM_DATA_CAPACITY: usize = 512;
 
 const MAX_PEERS: usize = 16;
 
-/// Every MAC address any `nic discover` probe or `chat` auto-reply has ever
-/// seen on this wire, in first-seen order; the shell's only address book
-/// (see `remember_peer`/`peer_by_index`/`print_peers`). A plain array is
-/// enough here, matching this project's general preference for small fixed
-/// tables over dynamic collections (there is no heap in this kernel).
-static mut PEERS: [[u8; 6]; MAX_PEERS] = [[0; 6]; MAX_PEERS];
+/// A NIC's own hostname payload as carried in a discovery frame's tag byte
+/// plus interface number -- distinct from `HOSTNAME_CAPACITY`, which is the
+/// *base* name before that number is appended (see `interface_hostname`).
+const PEER_HOSTNAME_CAPACITY: usize = INTERFACE_HOSTNAME_CAPACITY;
+
+/// One entry in the peer address book: a MAC address, plus whatever
+/// hostname (if any) that peer's own discovery frame carried. `hostname_len
+/// == 0` means the peer answered with no hostname payload at all -- either
+/// it has no `hostname` file configured, or it predates this feature
+/// entirely (`tools/send_tape.py`'s discovery reply, for instance, has no
+/// hostname of its own to send).
+#[derive(Clone, Copy)]
+struct Peer {
+    mac: [u8; 6],
+    hostname: [u8; PEER_HOSTNAME_CAPACITY],
+    hostname_len: u8,
+}
+
+const EMPTY_PEER: Peer = Peer {
+    mac: [0; 6],
+    hostname: [0; PEER_HOSTNAME_CAPACITY],
+    hostname_len: 0,
+};
+
+/// Every peer any `nic discover` probe or `chat` auto-reply has ever seen on
+/// this wire, in first-seen order; the shell's only address book (see
+/// `remember_peer`/`peer_by_index`/`print_peers`). A plain array is enough
+/// here, matching this project's general preference for small fixed tables
+/// over dynamic collections (there is no heap in this kernel).
+static mut PEERS: [Peer; MAX_PEERS] = [EMPTY_PEER; MAX_PEERS];
 static mut PEER_COUNT: usize = 0;
 
-/// Records `mac` in the peer table if it is not already there, silently
-/// dropping it once the table is full (`MAX_PEERS`) rather than growing --
-/// this is a teaching aid for a handful of QEMU/LAN peers, not an address
-/// book meant to scale. Returns whether `mac` was newly added.
-fn remember_peer(mac: [u8; 6]) -> bool {
+/// Records `mac` (with an optional `hostname` payload, already trimmed of
+/// wire zero-padding by the caller) in the peer table if it is not already
+/// there, silently dropping it once the table is full (`MAX_PEERS`) rather
+/// than growing -- this is a teaching aid for a handful of QEMU/LAN peers,
+/// not an address book meant to scale. A peer already known without a
+/// hostname adopts one the first time a frame carrying one arrives (e.g. a
+/// `hostname` file added to that machine after it was first seen), but an
+/// already-known hostname is never overwritten by a later, different one --
+/// this table records the first name a peer answered with, not a live
+/// rename feed. Returns whether `mac` was newly added.
+fn remember_peer(mac: [u8; 6], hostname: &[u8]) -> bool {
     let peers = &raw mut PEERS;
     let count = &raw mut PEER_COUNT;
     unsafe {
-        if (&*peers)[..*count].contains(&mac) {
+        if let Some(existing) = (&mut *peers)[..*count]
+            .iter_mut()
+            .find(|peer| peer.mac == mac)
+        {
+            if existing.hostname_len == 0 && !hostname.is_empty() {
+                let length = hostname.len().min(PEER_HOSTNAME_CAPACITY);
+                existing.hostname[..length].copy_from_slice(&hostname[..length]);
+                existing.hostname_len = length as u8;
+            }
             return false;
         }
         if *count >= MAX_PEERS {
             return false;
         }
-        (*peers)[*count] = mac;
+        let mut peer = EMPTY_PEER;
+        peer.mac = mac;
+        let length = hostname.len().min(PEER_HOSTNAME_CAPACITY);
+        peer.hostname[..length].copy_from_slice(&hostname[..length]);
+        peer.hostname_len = length as u8;
+        (*peers)[*count] = peer;
         *count += 1;
         true
     }
@@ -2298,7 +2449,7 @@ fn peer_by_index(index: usize) -> Option<[u8; 6]> {
     if index == 0 || index > count {
         return None;
     }
-    Some(unsafe { (*peers)[index - 1] })
+    Some(unsafe { (*peers)[index - 1].mac })
 }
 
 fn print_peers() {
@@ -2311,7 +2462,15 @@ fn print_peers() {
     }
     println!("Known peers (use the number with 'chat' instead of a full MAC):");
     for index in 0..count {
-        println!("  {}: {}", index + 1, Mac(&unsafe { (*peers)[index] }));
+        let peer = unsafe { (*peers)[index] };
+        let hostname_len = peer.hostname_len as usize;
+        if hostname_len == 0 {
+            println!("  {}: {}", index + 1, Mac(&peer.mac));
+        } else {
+            let name = core::str::from_utf8(&peer.hostname[..hostname_len])
+                .unwrap_or("<non-UTF-8 hostname>");
+            println!("  {}: {} ({name})", index + 1, Mac(&peer.mac));
+        }
     }
 }
 
@@ -2322,6 +2481,106 @@ fn print_peers() {
 /// the printed peer list, which only grows on genuinely new replies) is
 /// spammed.
 const DISCOVER_REBROADCAST_TICKS: u64 = 300;
+
+/// How long after the idle prompt loop first starts (see
+/// `ambient_discovery_poll`) ambient self-announces use the fast
+/// `AMBIENT_BOOT_BROADCAST_TICKS` interval rather than the slow steady-state
+/// one -- long enough that two machines booting within this window of each
+/// other, but not perfectly in sync, still overlap at least one of each
+/// other's announces before either settles down.
+const AMBIENT_BOOT_BURST_TICKS: u64 = 30 * 100; // ~30 seconds.
+/// Ambient self-announce interval during the post-boot burst window above:
+/// the same cadence `nic_discover`'s own dedicated command already uses.
+const AMBIENT_BOOT_BROADCAST_TICKS: u64 = DISCOVER_REBROADCAST_TICKS; // ~3 seconds.
+/// Ambient self-announce interval once the post-boot burst window has
+/// elapsed -- infrequent enough to not be a constant, unbounded background
+/// chirp for a machine that just sits at its idle prompt for hours, while
+/// still refreshing every peer's shortlist often enough to notice a
+/// machine that joined the network later.
+const AMBIENT_STEADY_BROADCAST_TICKS: u64 = 60 * 100; // ~60 seconds.
+
+/// Tick (see `interrupts::ticks`) at which the idle prompt loop first called
+/// `ambient_discovery_poll`, used only to decide how long the post-boot
+/// burst window (`AMBIENT_BOOT_BURST_TICKS`) has left. `None` until that
+/// first call.
+static mut AMBIENT_DISCOVERY_STARTED_AT: Option<u64> = None;
+/// Tick at which `ambient_discovery_poll` should next self-announce;
+/// starts at 0 so the very first call always announces immediately.
+static mut NEXT_AMBIENT_BROADCAST: u64 = 0;
+
+/// The "always on" half of NIC discovery: called every iteration of the
+/// idle interactive prompt loop in `run` -- the one loop that, before this,
+/// never touched the network card at all, since every other long-running
+/// command (`chat`, `term net`, `nic discover`, a running tape, ...) already
+/// polls its own NIC and already replies to an incoming discovery probe
+/// unconditionally. It always answers a `CHAT_TAG_DISCOVER_REQUEST` and
+/// remembers a `CHAT_TAG_DISCOVER_REPLY` silently (no `println!` of its
+/// own -- unlike `nic_discover`'s dedicated command, this must never
+/// interrupt whatever the operator is typing at the ordinary prompt), and
+/// periodically re-announces itself so other machines' own shortlists stay
+/// current even when nobody is running `nic discover` at all. There is
+/// still no interrupt-driven network service in this kernel (see "Current
+/// boundaries" in `AGENTS.md`): this is only "always on" in the sense that
+/// the one loop that is always running (the idle prompt) now always
+/// participates, not that discovery runs independently of the CPU actually
+/// being here to poll for it.
+fn ambient_discovery_poll() {
+    let now = interrupts::ticks();
+    let started_at = unsafe {
+        let started = &raw mut AMBIENT_DISCOVERY_STARTED_AT;
+        match *started {
+            Some(value) => value,
+            None => {
+                *started = Some(now);
+                now
+            }
+        }
+    };
+
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
+    for index in 0..nic::count() {
+        let Some(nic) = nic::get_at(index) else {
+            continue;
+        };
+        let Some(length) = nic.receive(&mut buffer) else {
+            continue;
+        };
+        let frame = &buffer[..length];
+        if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+            continue;
+        }
+        let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+        let hostname = trim_trailing_zero(&frame[15..]);
+        match frame[14] {
+            CHAT_TAG_DISCOVER_REPLY => {
+                remember_peer(peer_mac, hostname);
+            }
+            CHAT_TAG_DISCOVER_REQUEST => {
+                remember_peer(peer_mac, hostname);
+                let source = nic.mac_address();
+                send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY, index);
+            }
+            _ => {}
+        }
+    }
+
+    if now < unsafe { NEXT_AMBIENT_BROADCAST } {
+        return;
+    }
+    for index in 0..nic::count() {
+        let Some(nic) = nic::get_at(index) else {
+            continue;
+        };
+        let source = nic.mac_address();
+        send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST, index);
+    }
+    let interval = if now.wrapping_sub(started_at) < AMBIENT_BOOT_BURST_TICKS {
+        AMBIENT_BOOT_BROADCAST_TICKS
+    } else {
+        AMBIENT_STEADY_BROADCAST_TICKS
+    };
+    unsafe { NEXT_AMBIENT_BROADCAST = now + interval };
+}
 
 /// Broadcasts a discovery probe (`CHAT_TAG_DISCOVER_REQUEST`) through every
 /// initialized interface, re-sending it every `DISCOVER_REBROADCAST_TICKS` so
@@ -2351,7 +2610,7 @@ fn nic_discover() {
             continue;
         };
         let source = nic.mac_address();
-        send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
+        send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST, index);
     }
     let mut next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
 
@@ -2375,7 +2634,13 @@ fn nic_discover() {
                     continue;
                 };
                 let source = nic.mac_address();
-                send_chat_control(nic, &BROADCAST_MAC, &source, CHAT_TAG_DISCOVER_REQUEST);
+                send_chat_control(
+                    nic,
+                    &BROADCAST_MAC,
+                    &source,
+                    CHAT_TAG_DISCOVER_REQUEST,
+                    index,
+                );
             }
             next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
         }
@@ -2392,9 +2657,10 @@ fn nic_discover() {
                 continue;
             }
             let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+            let hostname = trim_trailing_zero(&frame[15..]);
             match frame[14] {
                 CHAT_TAG_DISCOVER_REPLY => {
-                    if remember_peer(peer_mac) {
+                    if remember_peer(peer_mac, hostname) {
                         discovered += 1;
                         println!("Found peer #{discovered}: {}", Mac(&peer_mac));
                     }
@@ -2404,11 +2670,11 @@ fn nic_discover() {
                 // ours. Reply on the same interface so discovery works across
                 // isolated networks attached to different local NICs.
                 CHAT_TAG_DISCOVER_REQUEST => {
-                    if remember_peer(peer_mac) {
+                    if remember_peer(peer_mac, hostname) {
                         discovered += 1;
                         println!("Found peer #{discovered}: {}", Mac(&peer_mac));
                     }
-                    send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY);
+                    send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY, index);
                 }
                 _ => continue,
             }
@@ -2560,17 +2826,30 @@ fn send_chat_line(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], text:
     }
 }
 
-/// Sends a zero-length `CHAT_ETHERTYPE` control frame (a discovery request
-/// or reply): just the Ethernet header plus the one-byte tag, since neither
-/// message needs a body -- the requester learns a peer's address from the
-/// reply's own source MAC, not from anything inside it.
-fn send_chat_control(nic: &nic::Nic, destination: &[u8; 6], source: &[u8; 6], tag: u8) {
-    let mut frame = [0u8; 15];
+/// Sends a `CHAT_ETHERTYPE` control frame (a discovery request or reply):
+/// the Ethernet header, the one-byte tag, and -- if this machine has a
+/// configured hostname (see `load_hostname`) -- that interface's own
+/// formatted name (`interface_hostname`) as payload. `interface_index` is
+/// this NIC's 0-based position in `nic::get_at`, matching `nic list`'s own
+/// numbering once it is displayed 1-based. A machine with no `hostname`
+/// file sends exactly the same zero-payload frame this always sent before
+/// this feature existed, so an old peer/host tool sees no difference.
+fn send_chat_control(
+    nic: &nic::Nic,
+    destination: &[u8; 6],
+    source: &[u8; 6],
+    tag: u8,
+    interface_index: usize,
+) {
+    let mut hostname = [0u8; INTERFACE_HOSTNAME_CAPACITY];
+    let hostname_len = interface_hostname(interface_index, &mut hostname);
+    let mut frame = [0u8; 15 + INTERFACE_HOSTNAME_CAPACITY];
     frame[0..6].copy_from_slice(destination);
     frame[6..12].copy_from_slice(source);
     frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
     frame[14] = tag;
-    nic.send(&frame);
+    frame[15..15 + hostname_len].copy_from_slice(&hostname[..hostname_len]);
+    nic.send(&frame[..15 + hostname_len]);
 }
 
 /// Handles one received frame during `chat`: a `CHAT_TAG_TEXT` line is
@@ -2610,8 +2889,8 @@ fn handle_incoming_chat_frame(
             println!("\n{}: {text}", Mac(&source));
         }
         CHAT_TAG_DISCOVER_REQUEST => {
-            remember_peer(source);
-            send_chat_control(nic, &source, own_mac, CHAT_TAG_DISCOVER_REPLY);
+            remember_peer(source, trim_trailing_zero(&frame[15..]));
+            send_chat_control(nic, &source, own_mac, CHAT_TAG_DISCOVER_REPLY, nic::active_index());
             println!("\n(replied to a discovery probe from {})", Mac(&source));
         }
         _ => {}
@@ -4128,8 +4407,14 @@ fn tape_load_net() {
                 // in progress, so this host stays discoverable the whole
                 // time it sits in `tape load net`, not only before/after
                 // a transfer.
-                remember_peer(source);
-                send_chat_control(nic, &source, &own_mac, CHAT_TAG_DISCOVER_REPLY);
+                remember_peer(source, trim_trailing_zero(payload));
+                send_chat_control(
+                    nic,
+                    &source,
+                    &own_mac,
+                    CHAT_TAG_DISCOVER_REPLY,
+                    nic::active_index(),
+                );
                 println!("\n(replied to a discovery probe from {})", Mac(&source));
             }
             _ => {} // A stray/unrelated tag, or traffic from a different sender mid-transfer: ignored.
@@ -4405,6 +4690,56 @@ fn trim_start(mut input: &[u8]) -> &[u8] {
         input = &input[1..];
     }
     input
+}
+
+/// Trims trailing ASCII whitespace (space, tab, `\r`, `\n`) from `bytes`,
+/// used to clean up a hand-edited config file's own trailing newline (see
+/// `load_hostname`) -- distinct from `trim_trailing_zero` below, which
+/// trims the zero *padding* Ethernet's 60-byte minimum frame length adds to
+/// a short frame, not genuine whitespace a human typed.
+fn trim_trailing_whitespace(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |index| index + 1);
+    &bytes[..end]
+}
+
+/// Trims trailing zero bytes from a received frame's payload -- the padding
+/// `Rtl8139::send`/`tools/send_frame.py` add to reach Ethernet's 60-byte
+/// minimum frame length, safe to strip here because genuine text/hostname
+/// payloads never legitimately end in a real zero byte.
+fn trim_trailing_zero(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|&byte| byte != 0)
+        .map_or(0, |index| index + 1);
+    &bytes[..end]
+}
+
+/// Writes `value` as ASCII decimal digits into `out` (which must be large
+/// enough for the full representation), returning the number of bytes
+/// written. Used to append a 1-based interface number to a configured
+/// hostname (see `interface_hostname`) -- this kernel has no `core::fmt`
+/// integration for writing into a plain byte buffer, so this is a small,
+/// direct replacement for that one purpose.
+fn write_decimal(out: &mut [u8], value: usize) -> usize {
+    if value == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut digits = [0u8; 20]; // usize::MAX in decimal fits comfortably.
+    let mut count = 0;
+    let mut remaining = value;
+    while remaining > 0 {
+        digits[count] = b'0' + (remaining % 10) as u8;
+        remaining /= 10;
+        count += 1;
+    }
+    for index in 0..count {
+        out[index] = digits[count - 1 - index];
+    }
+    count
 }
 
 fn filesystem_result(result: Result<(), disk::Error>, success: &str) {

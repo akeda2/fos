@@ -183,7 +183,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
 | `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
 | `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 (or F4/F6/F7/F8/F10) stops the capture, then turns promiscuous mode back off. |
-| `nic discover` | Broadcasts a `chat`-protocol discovery probe through every initialized NIC (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 (or F4/F6/F7/F8/F10) stops it (only fos machines currently running `chat` or `nic discover` reply). |
+| `nic discover` | Broadcasts a `chat`-protocol discovery probe through every initialized NIC (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 (or F4/F6/F7/F8/F10) stops it (a fos machine currently running `chat`, `nic discover`, or sitting idle at `fos> ` replies; see "Hostname and NIC discovery" below). |
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (or F4/F6/F7/F8/F10) (local keyboard) or by typing `/quit` (works over serial too). |
 | `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
@@ -512,6 +512,30 @@ the boot session until it returns; put `term net` in `start` only when waiting
 for a remote shell is the desired startup action. `make test-start` verifies
 comment/blank-line handling and normal shell dispatch with an isolated image.
 
+### Hostname and NIC discovery
+
+An optional lowercase FOSFS file named `hostname` (at most 16 bytes,
+trailing whitespace trimmed) gives a machine a memorable name for `nic
+discover`/`nic peers`/`chat` -- otherwise every peer is only ever known by
+its MAC address. fos looks for `hostname` on `disk1` first, then every
+attached secondary disk in order, the same "config disk may hold it
+instead" reasoning `start` uses, but checking every secondary disk rather
+than stopping at the first. Since one machine can have several NICs, the
+configured name has a 1-based interface number appended for display and
+for the name actually sent in discovery frames (`myhost1`, `myhost2`, ...),
+shown under each interface's own line in `nic list` and next to a MAC in
+`nic peers`' output (e.g. `52:54:00:12:34:56 (myhost1)`). A machine with no
+`hostname` file behaves exactly as it always has.
+
+Discovery now also runs ambiently at the idle `fos> ` prompt, not only
+while `nic discover`/`chat`/a tape's own polling loop is active: fos
+answers any incoming discovery probe silently, and re-announces itself
+once immediately after reaching the idle prompt, several more times over
+the following ~30 seconds (to catch another machine booting around the
+same time but not quite in sync), then roughly once a minute afterward.
+`nic discover` itself is unaffected and keeps its own faster, dedicated
+rebroadcast cadence for an operator actively searching for peers.
+
 Sending raw frames needs `CAP_NET_RAW` (in practice, run it with `sudo`).
 The destination MAC is read from `tools/mac` (default path; overridable with
 `--mac-file`) rather than a required argument, since it is normally the same
@@ -563,11 +587,13 @@ sent through the same local NIC on which that probe arrived, allowing one
 machine to discover peers across multiple attached Ethernet segments. There
 is no interrupt-driven network service in this kernel -- every receive is a
 polled `nic.receive()` call somewhere in a foreground loop -- so a probe is
-only ever answered by a fos machine whose own `chat` or `nic discover` happens
-to be running and polling its card at that exact moment; anyone not actively
-at a `chat` prompt or mid-`nic discover` is simply invisible, honestly
-reflecting that constraint rather than hiding it behind a fake "background
-service". Whoever receives a `CHAT_TAG_DISCOVER_REQUEST` (whether from
+only ever answered by a fos machine whose own `chat`, `nic discover`, or
+idle `fos> ` prompt (see "Hostname and NIC discovery" above; the idle
+prompt loop now polls too) happens to be running and polling its card at
+that exact moment; a machine mid-`tape run` with no polling ABI callback
+in use is the one real remaining gap, honestly reflecting that constraint
+rather than hiding it behind a fake "background service". Whoever
+receives a `CHAT_TAG_DISCOVER_REQUEST` (whether from
 `nic discover` or a running `chat` session) replies with one unicast
 `CHAT_TAG_DISCOVER_REPLY` frame straight back to the requester's source MAC
 (never broadcast, so replies don't also broadcast to every other listener)

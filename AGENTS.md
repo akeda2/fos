@@ -2495,6 +2495,131 @@ QEMU-only (`qemu-system-x86_64` vs `qemu-system-i386`) testing described
 in AGENTS.md's "A tape that visits 64-bit long mode and comes back"
 section above.
 
+### Hostname-based NIC discovery, and an always-on ambient discovery loop
+
+Every peer this project's discovery mechanisms (`nic discover`/`nic
+peers`, `chat`'s own discovery, `tools/peers.py`'s address book) tracked
+was previously identified only by MAC address -- functional, but not
+memorable across a LAN with more than a couple of fos machines on it.
+`kernel/src/shell.rs` now loads an optional `hostname` file the same way
+`locate_start_file` looks for `start`, but checking *every* attached
+disk rather than stopping at the first one with a FOSFS volume:
+`load_hostname` tries `disk1` first, then every secondary disk in order
+(`0..disk::secondary_count()`), since a hostname is just as likely to
+live on a small config disk as a boot-time script is, and any error
+short of "found a valid, differently-sized file" is folded into "no
+hostname here," mirroring `locate_start_file`'s own `disk2`-is-commonly-
+blank reasoning. The file's contents are trimmed of trailing whitespace
+(`trim_trailing_whitespace`, distinct from the wire-payload
+`trim_trailing_zero` below) and capped at `HOSTNAME_CAPACITY` (16 bytes);
+an oversized file is reported and ignored rather than silently
+truncated. A machine with no `hostname` file anywhere behaves exactly as
+it always has -- this is purely additive.
+
+Because one machine can have several NICs, and a bare hostname could not
+tell two interfaces on the same host apart, `interface_hostname(index,
+out)` formats the configured base name with a 1-based interface number
+appended (`myhost1`, `myhost2`, ...) -- consistent with every other
+1-based NIC numbering already in this project's UI (`nic list`/`nic use
+N`). This formatted, per-interface name is what actually gets sent and
+displayed everywhere below; the bare on-disk `hostname` file content is
+only ever a template for it. `nic list` prints a machine's own
+`hostname: NAME` line under each configured interface once a hostname
+exists.
+
+**Carrying a hostname over the wire.** `send_chat_control` (the one
+function behind every `CHAT_TAG_DISCOVER_REQUEST`/`REPLY` frame this
+project sends -- confirmed to have no other caller) grew an
+`interface_index` parameter and now appends that interface's formatted
+hostname (or nothing, if unconfigured) as a payload right after the
+existing tag byte. This is safe on the wire for the same reason
+`CHAT_TAG_TEXT`/`TERM_TAG_DATA` payloads already are: neither
+`tools/send_tape.py`'s `discover()` nor `tapes/net-chat`'s frame handler
+validate an exact/maximum frame length, only the tag byte itself, so an
+older sender's shorter (no-payload) discovery frame and a newer
+receiver's longer one interoperate unchanged in both directions. The
+receiving side trims trailing zero padding (`trim_trailing_zero`,
+matching the identical convention already used for `CHAT_TAG_TEXT`) since
+Ethernet's 60-byte minimum-frame padding must never be mistaken for part
+of the name.
+
+**The peer table now remembers names, not just MACs.** The former
+`PEERS: [[u8; 6]; MAX_PEERS]` table became `[Peer; MAX_PEERS]`, `Peer`
+holding a MAC plus an optional fixed-size hostname buffer/length.
+`remember_peer(mac, hostname)` only *fills in* a hostname for an entry
+that does not have one yet -- it never overwrites an already-known
+hostname with a later, possibly different one from the same MAC. This
+was a deliberate simplicity choice (first-seen name wins for the rest of
+that boot), not a live-rename feature; a machine whose `hostname` file
+changes mid-session will not update an already-recorded peer's displayed
+name until that peer entry is naturally re-created (e.g. after a
+reboot). `print_peers`/`nic peers` show `MAC (name)` once a hostname is
+known, falling back to a bare MAC otherwise, exactly like before.
+
+**Always-on ambient discovery, not just the dedicated `nic discover`
+command.** The original ask was "can discovery just run all the time?",
+which this project's single-threaded, no-scheduler, busy-polling
+architecture (see "Scheduler" discussion elsewhere in this document)
+answers narrowly: there is no background execution at all, only
+"whichever loop happens to be running right now can also poll for this."
+Every existing long-running command loop (`chat`, `term net`, `nic
+discover`, a tape's own `should_abort`/`read_key` polling) already
+replied to an incoming discovery probe unconditionally -- those needed no
+change beyond the hostname-payload plumbing above. The one genuine gap
+was the *idle local prompt loop* in `run()`: it never touched the NIC at
+all between commands, so a fos machine sitting at its own prompt (the
+most common steady state) was invisible to discovery and could not
+receive one either, unless an operator happened to be running `nic
+discover`/`chat` at that exact moment.
+
+`poll_background_work()` -- the existing Tier-0 unification point shared
+by many short command loops -- was deliberately *not* extended to
+auto-broadcast a probe, since doing so would make every one of its many
+callers start transmitting extra frames, which was not the ask. Instead,
+a new `ambient_discovery_poll()` is called only from the idle prompt
+loop, once per iteration. Two independent behaviors, arrived at after
+explicit user steering across several iterations of this design:
+
+- **Reply and remember, always, silently.** Every iteration, it drains
+  and answers any incoming `CHAT_TAG_DISCOVER_REQUEST`/`REPLY` on every
+  interface exactly like `nic_discover`'s own loop does, but with no
+  `println!` output at all -- unlike the dedicated command, this runs
+  underneath an interactive prompt display and must never corrupt it.
+- **Self-announce on a schedule, not on every idle iteration.** The
+  first design considered ("broadcast a probe every idle iteration") was
+  rejected by the user as too noisy; the next ("only reply, never
+  broadcast") was rejected in turn since two machines that both only
+  reply and never initiate would never discover each other at all
+  without a human running `nic discover` on at least one side. The
+  design actually built: broadcast one immediate self-announce the
+  first time the idle loop starts (fast convergence right after boot),
+  then continue re-announcing every `AMBIENT_BOOT_BROADCAST_TICKS` (~3s,
+  the same cadence `nic_discover`'s own rebroadcast already uses) for
+  `AMBIENT_BOOT_BURST_TICKS` (~30s) after that first call -- explicitly
+  to cover two machines booting around the same time but not perfectly
+  in sync, so each one's boot-time burst window has a good chance of
+  overlapping the other's -- and settle to a much slower
+  `AMBIENT_STEADY_BROADCAST_TICKS` (~60s) afterward, since a machine that
+  has been up and idle for a while has little need to keep re-announcing
+  aggressively. `nic_discover`'s own command keeps its separate,
+  unmodified, faster fixed-interval rebroadcast loop -- the two are
+  intentionally not unified, since a human explicitly running `nic
+  discover` should still get its existing fast convergence regardless of
+  ambient discovery's own slower steady-state cadence.
+
+Verified end to end with a new, dedicated two-guest test,
+`tools/test_hostname_discovery_e2e.py` (not part of `make test`,
+mirroring `tapes/test_net_chat_e2e.py`'s structure): each guest is built
+from its own tiny image carrying a distinct `hostname` file (`alpha`/
+`beta`) via `build_image.py --file hostname ...`, both are driven to
+their local idle prompt (F12 out of the automatic boot-time `term net`
+wait, never running `term net`/`nic discover` themselves), and after a
+short wait for a couple of ambient-discovery rounds, `nic peers` on each
+side shows the other's formatted name (`(beta1)`/`(alpha1)`) -- proving
+the whole chain (hostname file -> wire payload -> peer table -> display)
+works purely through the idle loop's own ambient polling, with no
+dedicated discovery command ever invoked by either guest.
+
 ## Deliberately deferred work
 
 - Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
