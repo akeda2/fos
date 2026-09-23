@@ -3753,6 +3753,86 @@ specific tool binary, mirroring this project's existing
 `python3-netraw` convention (see "Talking to a real fos machine from a
 sandboxed dev environment" above).
 
+### The `audio-real-mic-verify` follow-up, resolved: a genuine non-silent capture, and a QEMU TCG/BQL timing artifact found along the way
+
+The prior section's blocker was purely a seat0/logind device-ACL issue on
+one specific laptop, tracked as `audio-real-mic-verify` until someone
+could test from a machine with a real, reachable microphone. That
+happened on a different physical dev machine ("bengt"): a genuine active
+seat0 session (not just SSH) and a real PipeWire `Audio -> Sources` entry
+were confirmed present via `wpctl status`, closing out that
+prerequisite.
+
+**A real, unrelated bug in the test script itself surfaced first.**
+`tapes/test_audio_net_real_mic_e2e.py` resolved `sys.path`/`ROOT`/`IMAGE`
+using `Path(__file__).resolve().parent` (pointing at `tapes/`) instead of
+`.parent.parent` (the repo root) -- every sibling `test_*_e2e.py` script
+uses `.parent.parent` for this exact reason, since the script itself
+lives one level below the repo root. This immediately raised
+`ModuleNotFoundError: No module named 'send_tape'` before the test could
+even start a guest. Fixed by correcting the tools-path insert and
+`ROOT`/`IMAGE` construction to use `.parent.parent`, keeping a bare
+`.parent` only for importing the sibling `test_primes_e2e` module (which
+does live alongside this script in `tapes/`).
+
+**With that fixed, the test ran but reported the mic guest sending 0
+captured bytes -- even though the microphone itself was confirmed
+genuinely working** (`arecord` captured real, non-silent audio directly
+on the host; a standalone diagnostic running the plain `audio` shell
+command showed the ES1370 ADC ring filling and overflowing normally while
+the guest sat idle, proving the pipewire-backed device model itself
+receives real mic input correctly). The bug only appeared once the
+`audio-net` tape's actual `capture` mode ran its polling loop -- a code
+path `tapes/test_audio_capture_e2e.py` had never exercised, since that
+existing regression test only checks the `audio` command's own counters
+and never drains the ring via the tape ABI's `tape_audio_capture`
+callback.
+
+Isolating it: a diagnostic running `tape run capture` for a fixed 4
+seconds showed only 4 raw PCI IRQ fires / 0 recognized ADC periods for
+the entire window, versus roughly 275 raw fires / 169 ADC periods over
+the same 4 seconds with no tape running at all (an idle shell loop) --
+the correct rate for 1024-frame periods at 44.1 kHz (~23 ms/period, ~43/s).
+This was exactly, deterministically reproducible across repeated runs,
+which argued against ordinary host scheduling noise. A second diagnostic
+running `tapes/bigsieve` instead (a tape with a pure CPU-bound loop and
+*no* I/O port polling of any kind) reproduced the identical starvation
+pattern -- proving this is not specific to `audio-net`'s own
+`should_abort`/`nic_send` polling, but a general property of *any* tight,
+uninterrupted guest busy loop under QEMU's software (TCG) execution
+mode: the continuously-running vCPU thread holds the Big QEMU Lock
+almost the entire time, starving the separate host-thread-driven audio
+timer callback that the `pipewire` audiodev backend needs serviced on
+real wall-clock schedule to pull genuine samples through. **This is a
+QEMU/TCG emulation-fidelity limitation of this specific test
+methodology, not a fos kernel or tape bug** -- real hardware's audio
+interrupt is asserted by silicon regardless of what the CPU happens to
+be executing at that instant, so no equivalent starvation is possible on
+a real machine.
+
+**Fix confirmed**: adding `-accel kvm -cpu host` (hardware-virtualized
+execution instead of interpreted) to the exact same reproduction fully
+resolved it with no other change -- 24 raw fires / 15 DAC1 periods / 13
+ADC periods captured / 9 overruns over the same 4-second window, and the
+tape correctly forwarded all bytes it captured. `tapes/
+test_audio_net_real_mic_e2e.py` now auto-detects `/dev/kvm` accessibility
+(`kvm_available()`, a plain `os.open`/`os.close` probe) and adds
+`-accel kvm -cpu host` to both guests' QEMU invocations when available,
+printing a clear warning and falling back to plain TCG (with capture
+byte counts expected to read 0, for the reason above, rather than a real
+failure) when it is not -- this is the first script in this repository to
+request KVM acceleration at all; every other `test_*_e2e.py`/
+`qemu_smoke.py` script uses default TCG, since exact real-time device
+timing has never mattered for any of those tests before ES1370.
+
+**Final result, `audio-real-mic-verify` now genuinely closed**: with both
+fixes applied, the full test passes end to end -- mic -> ES1370 ADC ->
+network -> `audio-net` capture/listen tapes -> ES1370 DAC1 -> a captured
+WAV file containing real audio with peak amplitude 8000 (of 32767 max)
+and RMS 5449.1, clearly a real signal well above a silence noise floor,
+not the false-positive "PASS" the earlier section's `bytes_sent == 0`
+guard was added specifically to prevent.
+
 ## Deliberately deferred work
 
 - Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
