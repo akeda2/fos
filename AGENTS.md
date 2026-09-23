@@ -470,7 +470,7 @@ make test-nic-watchdog # Verifies foreground recovery from a latched NIC fault.
 make test-start # Verifies an optional FOSFS start boot-command script.
 make test-second-disk # Verifies the diskN selector against a second, attached disk.
 make test-debug-mode # Verifies reboot-on-crash, the crash-loop guard, and KUP.
-make all      # Builds everything: image, netrom, and every test tape.
+make all      # Builds everything: image and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
 make help     # Lists every target with a one-line description.
 ```

@@ -68,7 +68,7 @@ EXTRA_FOSFS_FILES ?=
 help:
 	@echo "Targets:"
 	@echo "  make            - same as 'make image' (the default goal)"
-	@echo "  make all        - build everything below: image, netrom, and every tape"
+	@echo "  make all        - build everything below: image and every tape"
 	@echo "  make kernel     - build only the Rust kernel binary (build/kernel.bin)"
 	@echo "  make image      - build build/fos.img (boot + kernel + every compiled tape)"
 	@echo "  make image-unsafe-memory - build build/fos-unsafe-memory.img without paging, then restore the default image"
@@ -128,7 +128,7 @@ help:
 # alone (what `run`/`test`/plain `make` already depend on, see
 # `.DEFAULT_GOAL` above) is enough for that -- but this is the one target
 # that leaves nothing unbuilt.
-all: image netrom tapes
+all: image tapes
 
 KERNEL_CARGO_FEATURES ?=
 
@@ -213,7 +213,7 @@ test-vga-modes: image
 # ROM that boots fos directly from a network card's own boot ROM instead of
 # from disk/USB. Entirely additive -- `image`/`run`/`test` above are
 # untouched, and this never runs as part of plain `make` (which still just
-# means `make image`); it is only built as part of `make all`. See
+# means `make image`); build it explicitly with `make netrom`. See
 # README.md's "Booting from a NIC ROM" section.
 netrom: kernel
 	python3 tools/write_netrom_layout.py --kernel $(KERNEL_BIN) --output $(BUILD)/netrom_layout.inc

@@ -109,10 +109,10 @@ the host-side tests for the IPv4/UDP chat tape's argument and packet helpers;
 `build/netboot.rom`, that boots fos from a NIC's own PCI option ROM instead
 of disk/USB; see "Booting from a NIC ROM" below. It does not run as part of
 plain `make` (still just `make image`) and does not affect `image`/`run`/
-`test`, but is included in `make all` (see below).
+`test`; run it explicitly when needed.
 
 `make all` builds everything this repository knows how to produce in one
-go: the image, `make netrom`, and every test tape (`make tapes`, including
+go: the image and every test tape (`make tapes`, including
 `tape-primes`/`tape-hello-rs`/`tape-vga-colors`/`tape-bigsieve`/
 `tape-longmode`/`tape-longmode-rs`/`tape-cpu64-lab`/`tape-cpu64-show`/`tape-calc`/`tape-ed`/`tape-beep`/
 `tape-morse`/`tape-net-chat`/`tape-audio-net`/`tape-ip-chat`/`tape-telnet`/`tape-bridge`/
