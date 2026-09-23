@@ -422,6 +422,36 @@ when disabled, rejects a bad checksum with slot metadata untouched, and
 installs, ACKs, actually reboots, and promotes the new slot to active on a
 good push of the real `build/kernel.bin`.
 
+`tools/test_realnet_e2e.py` (not part of `make test`/`make test-debug-mode`,
+and depends on host machine state -- see its own docstring) is a second,
+complementary debug-mode test proving the *client tooling* itself works,
+not just the kernel/protocol side: unlike every other test script here, it
+drives the real `tools/term_net.py`/`tools/send_kernel_update.py` CLIs as
+subprocesses (through a `CAP_NET_RAW`-tagged `python3` copy, the same
+`setcap` convention "Talking to a real fos machine from a sandboxed dev
+environment" above already uses) over a genuine host tap interface bridged
+to the QEMU guest's primary NIC, rather than reimplementing the wire
+protocol inline over a raw UDP multicast socket the way
+`test_debug_mode_e2e.py`/`test_kernel_update_e2e.py` do. It also
+demonstrates the "exercise a new NIC driver as a second interface in QEMU
+before ever touching physical hardware" workflow this section's debug-mode
+design was originally motivated by: the guest's second NIC is a real,
+QEMU-emulated `ne2k_pci` (NE2000-compatible), and `nic list` over the real
+tap confirms both interfaces are correctly identified. (Intel's I350 has
+no QEMU model at all -- see "Intel I350 support" above -- so this pattern
+can't cover that specific driver, but it covers any NIC family QEMU does
+emulate.) One non-obvious timing detail this test has to account for:
+`term_net` runs automatically at every boot and needs no F12 escape at all
+to reach with `term_net.py` (a session HELLO can connect directly to that
+automatic wait); a local escape to the idle prompt is needed only
+immediately before a KUP push, since KUP is served solely from the idle
+loop's `ambient_discovery_poll`, never from inside an active `term_net`
+session -- escaping earlier than necessary is actively harmful here, since
+after a local escape the shell only restarts `term_net`'s own HELLO wait
+after `TERM_NET_IDLE_TICKS` (60s) of local idle time, so a command sent
+shortly after an unnecessary escape would see no listener at all until
+that window elapses.
+
 ## Build and validation
 
 The pinned toolchain is `nightly-2026-09-13`, with `rust-src`. Required host
