@@ -31,6 +31,30 @@ everywhere but only prove the mechanism, not real audio content.
 
 Run manually with: `python3 tapes/test_audio_net_real_mic_e2e.py`
 (builds nothing itself -- run `make image tape-audio-net` first).
+
+**Requires KVM acceleration (`/dev/kvm` accessible), unlike every other
+tapes/test_*_e2e.py script.** A first attempt under plain TCG
+(`qemu-system-i386` with no `-accel`) reproducibly reported 0 captured
+bytes ever sent, even though the exact same host microphone/PipeWire
+setup was independently confirmed working (`arecord`, and a standalone
+`audio` shell-command check showing the ADC ring filling and overflowing
+normally while the guest sits idle). Isolated with a second, unrelated
+CPU-bound tape (`bigsieve`, no I/O polling in its hot loop at all) showing
+the identical symptom: while *any* tight, uninterrupted guest busy loop
+runs under TCG, QEMU's own audio-timer callback (which needs the same
+Big QEMU Lock the vCPU thread holds almost continuously in that mode)
+gets starved for the loop's entire duration -- a handful of interrupts
+fire total, regardless of how long the loop runs, rather than the
+expected ~43/s DAC1 rate. This is a QEMU/TCG software-emulation timing
+artifact, not a fos kernel or tape bug: real hardware's audio interrupt
+is asserted by real silicon regardless of what the CPU happens to be
+executing, and switching this same reproduction to `-accel kvm` (real
+hardware-virtualized execution, not interpreted) immediately fixed it --
+confirmed the `capture` tape actually drained and forwarded real ADC
+bytes once KVM was enabled, with no other change. If `/dev/kvm` is not
+accessible in a given environment, this test will still start guests
+under plain TCG (with a printed warning) but should be expected to
+report 0 captured bytes for the reason above, not a real regression.
 """
 
 import os
@@ -43,15 +67,15 @@ import time
 import wave
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tapes"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import send_tape  # noqa: E402
 from test_primes_e2e import McastSocket  # noqa: E402
 
 MCAST_GROUP = "230.42.42.59"
 MCAST_PORT = 4259
-ROOT = Path(__file__).resolve()
-IMAGE = ROOT.parent / "build" / "fos.img"
+ROOT = Path(__file__).resolve().parent.parent
+IMAGE = ROOT / "build" / "fos.img"
 
 CHAT_ETHERTYPE = (0x88, 0xB6)
 TERM_TAG_HELLO = 0x20
@@ -72,9 +96,33 @@ def eth_frame(destination: bytes, source: bytes, tag: int, payload: bytes = b"")
     return bytes(frame)
 
 
+def kvm_available() -> bool:
+    """See this module's own doc comment: plain TCG software emulation lets
+    a guest's tight busy loop starve QEMU's audio-timer callback for the
+    loop's entire duration, making this test's central measurement (real
+    captured bytes actually flowing) meaningless. KVM avoids this since the
+    guest runs hardware-virtualized instead of interpreted."""
+    try:
+        fd = os.open("/dev/kvm", os.O_RDWR)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
 def main() -> None:
     if not IMAGE.exists():
         raise SystemExit(f"missing {IMAGE}; run `make image` first")
+
+    accel_args = ["-accel", "kvm", "-cpu", "host"] if kvm_available() else []
+    if not accel_args:
+        print(
+            "WARNING: /dev/kvm is not accessible; falling back to plain TCG. "
+            "This test's capture-mode byte counts are expected to read 0 "
+            "under TCG (see this script's own doc comment) -- that is a "
+            "QEMU emulation-timing artifact, not a real failure.",
+            file=sys.stderr,
+        )
 
     wav_capture = Path("/tmp/fos-real-mic-capture.wav")
     if wav_capture.exists():
@@ -91,6 +139,7 @@ def main() -> None:
                 "-drive",
                 f"format=raw,file={IMAGE}",
                 "-snapshot",
+                *accel_args,
                 "-serial",
                 "stdio",
                 "-monitor",
