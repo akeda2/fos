@@ -70,7 +70,7 @@ pub fn run(info: &BootInfo) -> ! {
 
     loop {
         let byte = console::read_serial_byte().or_else(keyboard::pop_char);
-        ambient_discovery_poll();
+        ambient_discovery_poll(info);
         let Some(byte) = byte else {
             if interrupts::ticks().wrapping_sub(last_activity) >= TERM_NET_IDLE_TICKS {
                 println!(
@@ -2367,6 +2367,132 @@ const TERM_TAG_BYE: u8 = 0x22;
 /// Ethernet header (14 bytes) and tag (1 byte) are accounted for.
 const TERM_DATA_CAPACITY: usize = 512;
 
+/// NETFS: a small network filesystem layered on top of hostname-based peer
+/// discovery, sharing `CHAT_ETHERTYPE` rather than inventing yet another
+/// reserved ethertype. Use case: `copy hostname1:disk2/file.name disk2`
+/// (or `tape load`/`tape save`/`tape run`'s `@HOST[:diskN]/NAME`) fetches or
+/// stores a file on a discovered peer's own FOSFS disk over raw Ethernet.
+/// GET (fetch) mirrors `TAPE_TAG_*`'s proven shape exactly -- a `_REQUEST`,
+/// then one `_START` declaring the total length and a checksum, then any
+/// number of sequence-numbered `_DATA` chunks, then one `_STOP` -- and PUT
+/// (store) is the same shape with the length/checksum carried up front in
+/// the `_REQUEST` itself (the sender already knows both before it starts),
+/// closing with either a `_ACK` or a `_ERROR` instead of a bare `_STOP`, so
+/// the client learns whether the remote FOSFS write actually succeeded.
+/// Exactly like `TAPE_TAG_*`, there is deliberately no retransmission: a
+/// gap or a checksum mismatch aborts the whole attempt rather than risking
+/// a silently corrupt file.
+///
+/// Deliberate scope limits, not yet lifted: a peer only serves NETFS
+/// requests while sitting idle at its own local prompt (`ambient_discovery_
+/// poll`, the one loop this shares with ambient discovery itself) -- not
+/// while it is itself running `chat`, `nic discover`, `term net`, or a
+/// tape, mirroring how those other loops already only reply to discovery
+/// probes, never NETFS ones. And a remote host reference (see
+/// `parse_remote_host_token`) only accepts a known hostname or `nic peers`
+/// number, never a raw MAC address, because a MAC's own colons would
+/// collide with the `HOST:diskN` separator.
+const NETFS_TAG_GET_REQUEST: u8 = 0x30;
+const NETFS_TAG_GET_START: u8 = 0x31;
+const NETFS_TAG_GET_DATA: u8 = 0x32;
+const NETFS_TAG_GET_STOP: u8 = 0x33;
+const NETFS_TAG_GET_ERROR: u8 = 0x34;
+const NETFS_TAG_PUT_REQUEST: u8 = 0x35;
+const NETFS_TAG_PUT_DATA: u8 = 0x36;
+const NETFS_TAG_PUT_STOP: u8 = 0x37;
+const NETFS_TAG_PUT_ACK: u8 = 0x38;
+const NETFS_TAG_PUT_ERROR: u8 = 0x39;
+
+/// One-byte error codes carried in a `NETFS_TAG_*_ERROR` frame's payload.
+const NETFS_ERROR_NOT_FOUND: u8 = 1;
+const NETFS_ERROR_DISK_UNAVAILABLE: u8 = 2;
+const NETFS_ERROR_TOO_LARGE: u8 = 3;
+const NETFS_ERROR_INVALID_NAME: u8 = 4;
+const NETFS_ERROR_DIRECTORY_FULL: u8 = 5;
+const NETFS_ERROR_DATA_FULL: u8 = 6;
+const NETFS_ERROR_DISK_ERROR: u8 = 7;
+const NETFS_ERROR_CHECKSUM_MISMATCH: u8 = 8;
+const NETFS_ERROR_BUSY: u8 = 9;
+
+/// The FOSFS name-length limit (`fosfs::MAX_NAME_LENGTH`, not itself
+/// `pub`), duplicated here for the NETFS wire payload's own fixed-size
+/// frame buffers -- the same reasoning already used elsewhere in this file
+/// for the same constant (see e.g. this module's own "16 lowercase
+/// letters..." messages).
+const NETFS_NAME_CAPACITY: usize = 16;
+
+/// How long (in PIT ticks) a NETFS client waits for its peer to respond at
+/// all, or to keep making progress, before giving up -- generous enough to
+/// tolerate a slow FOSFS write through the BIOS disk trampoline on the
+/// serving side, unlike `tape`'s own tighter, purely receive-side timeout.
+const NETFS_TIMEOUT_TICKS: u64 = 1000; // ~10 seconds.
+
+/// Computes the RFC 1071 16-bit Internet checksum over `data`, the same
+/// algorithm `tapes/tape-net` already uses for IPv4/TCP/UDP -- reused here
+/// (reimplemented, not shared code, since tapes and the kernel are separate
+/// crate boundaries) purely as a whole-file integrity check: NETFS has no
+/// retransmission, so a receiver that computes a different checksum over
+/// the reassembled bytes than the sender declared up front knows the
+/// transfer was corrupted somewhere and discards it, rather than risking a
+/// silently wrong file. This is not authentication or security of any
+/// kind -- NETFS has none, matching this project's existing "no auth at
+/// all" chat/discovery/tape-transfer protocols.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let [last] = *chunks.remainder() {
+        sum += (last as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Every way a client-side NETFS `netfs_get`/`netfs_put` call can fail.
+enum NetfsError {
+    /// The initial request frame itself could not be sent.
+    TransmitFailed,
+    /// No response (or no further progress) arrived within
+    /// `NETFS_TIMEOUT_TICKS`, or the local operator gave up (F12/etc).
+    NoReply,
+    /// An out-of-order or short data chunk arrived; this protocol has no
+    /// retransmission, so the whole attempt is abandoned instead.
+    Gap,
+    /// The remote file is larger than the caller's own destination buffer
+    /// (checked locally, before any data is transferred).
+    TooLargeLocally,
+    /// The reassembled bytes didn't match the checksum declared up front.
+    ChecksumMismatch,
+    /// The peer reported one of the `NETFS_ERROR_*` codes.
+    Remote(u8),
+}
+
+impl core::fmt::Display for NetfsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NetfsError::TransmitFailed => write!(f, "transmit failed (card reported an error, or timed out)"),
+            NetfsError::NoReply => write!(f, "no response from the peer; gave up"),
+            NetfsError::Gap => write!(f, "gap in the transfer; aborted (NETFS has no retransmission)"),
+            NetfsError::TooLargeLocally => write!(f, "remote file is too large for this destination"),
+            NetfsError::ChecksumMismatch => write!(f, "checksum mismatch; discarded"),
+            NetfsError::Remote(NETFS_ERROR_NOT_FOUND) => write!(f, "remote: file not found"),
+            NetfsError::Remote(NETFS_ERROR_DISK_UNAVAILABLE) => write!(f, "remote: no such disk attached there"),
+            NetfsError::Remote(NETFS_ERROR_TOO_LARGE) => write!(f, "remote: file too large for its own tape buffer"),
+            NetfsError::Remote(NETFS_ERROR_INVALID_NAME) => write!(f, "remote: invalid file name"),
+            NetfsError::Remote(NETFS_ERROR_DIRECTORY_FULL) => write!(f, "remote: its FOSFS directory is full"),
+            NetfsError::Remote(NETFS_ERROR_DATA_FULL) => write!(f, "remote: its FOSFS data region is full"),
+            NetfsError::Remote(NETFS_ERROR_DISK_ERROR) => write!(f, "remote: FOSFS disk error"),
+            NetfsError::Remote(NETFS_ERROR_CHECKSUM_MISMATCH) => write!(f, "remote: checksum mismatch; it discarded the write"),
+            NetfsError::Remote(NETFS_ERROR_BUSY) => write!(f, "remote: already serving another NETFS transfer"),
+            NetfsError::Remote(code) => write!(f, "remote: unknown error code {code}"),
+        }
+    }
+}
+
 const MAX_PEERS: usize = 16;
 
 /// A NIC's own hostname payload as carried in a discovery frame's tag byte
@@ -2452,6 +2578,84 @@ fn peer_by_index(index: usize) -> Option<[u8; 6]> {
     Some(unsafe { (*peers)[index - 1].mac })
 }
 
+/// Looks up a peer by the formatted hostname its own discovery frames
+/// carried (see `interface_hostname`/`remember_peer`): an exact,
+/// case-sensitive match against whatever that peer's own discovery reply
+/// contained -- not a fuzzy or prefix match, and not consulted at all for
+/// a peer that never sent a hostname (`hostname_len == 0`).
+fn peer_by_hostname(name: &[u8]) -> Option<[u8; 6]> {
+    let peers = &raw const PEERS;
+    let count = unsafe { PEER_COUNT };
+    for index in 0..count {
+        let peer = unsafe { (*peers)[index] };
+        let hostname_len = peer.hostname_len as usize;
+        if hostname_len != 0 && hostname_len == name.len() && &peer.hostname[..hostname_len] == name
+        {
+            return Some(peer.mac);
+        }
+    }
+    None
+}
+
+/// Resolves a peer reference the same way `chat`/`tape send` already
+/// resolve their own `PEER_MAC|PEER_NUMBER` argument, except a raw MAC
+/// address is deliberately not accepted here: used only by NETFS's
+/// `HOST[:diskN]` syntax (see `parse_remote_host_token`), where a MAC's
+/// own colons would collide with the `:diskN` separator. `HOST` must
+/// therefore be a known hostname or a `nic peers` number instead.
+fn resolve_peer(word: &[u8]) -> Option<[u8; 6]> {
+    if let Some(index) = parse_number(word) {
+        return peer_by_index(index as usize);
+    }
+    peer_by_hostname(word)
+}
+
+/// Parses `HOST` or `HOST:diskN` into a resolved peer MAC plus a raw
+/// 1-based disk number on that peer (defaulting to `1`, its own boot disk,
+/// when no `:diskN` suffix is given) -- the shared building block behind
+/// every NETFS-backed command (`copy`, `tape load`, `tape save`, and `tape
+/// run`'s `@HOST[:diskN]/NAME` argument source, see `parse_remote_token`).
+/// `HOST` must resolve via `resolve_peer`; an unknown host or malformed
+/// `:diskN` suffix is never guessed at, only rejected. The disk number
+/// itself is deliberately not checked against any locally-known list --
+/// this machine has no way to know what disks a remote peer has attached;
+/// the peer validates it and reports `NETFS_ERROR_DISK_UNAVAILABLE` if it
+/// doesn't exist there.
+fn parse_remote_host_token(word: &[u8]) -> Option<([u8; 6], u8)> {
+    let (host_word, remote_disk_number) = match word.iter().position(|&byte| byte == b':') {
+        Some(colon) => {
+            let suffix = word[colon + 1..].strip_prefix(b"disk")?;
+            if suffix.is_empty() || !suffix.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let number: u32 = core::str::from_utf8(suffix).ok()?.parse().ok()?;
+            if number == 0 || number > u8::MAX as u32 {
+                return None;
+            }
+            (&word[..colon], number as u8)
+        }
+        None => (word, 1u8),
+    };
+    let peer = resolve_peer(host_word)?;
+    Some((peer, remote_disk_number))
+}
+
+/// Parses `HOST[:diskN]/NAME`, all one token -- the form `copy`'s remote
+/// endpoints use (see `take_source_endpoint`/`take_destination_endpoint`),
+/// combining a peer reference with a file name the same way `tape run`'s
+/// existing `@diskN/NAME` argument source already combines a local disk
+/// selector with one. A literal `/` is unambiguous as the separator for
+/// the same reason it already is there: FOSFS names can never contain one.
+fn parse_remote_token(word: &[u8]) -> Option<([u8; 6], u8, &[u8])> {
+    let slash = word.iter().position(|&byte| byte == b'/')?;
+    let (head, name) = (&word[..slash], &word[slash + 1..]);
+    if name.is_empty() {
+        return None;
+    }
+    let (peer, remote_disk_number) = parse_remote_host_token(head)?;
+    Some((peer, remote_disk_number, name))
+}
+
 fn print_peers() {
     let peers = &raw const PEERS;
     let count = unsafe { PEER_COUNT };
@@ -2524,7 +2728,15 @@ static mut NEXT_AMBIENT_BROADCAST: u64 = 0;
 /// the one loop that is always running (the idle prompt) now always
 /// participates, not that discovery runs independently of the CPU actually
 /// being here to poll for it.
-fn ambient_discovery_poll() {
+///
+/// This is also, deliberately, the *only* loop that answers NETFS requests
+/// (`NETFS_TAG_GET_REQUEST`/`PUT_REQUEST`/`PUT_DATA`/`PUT_STOP`): a peer
+/// serves NETFS only while sitting idle at its own local prompt, not while
+/// it is itself running `chat`/`nic discover`/`term net`/a tape (see
+/// "NETFS" above). Unlike routine discovery traffic, NETFS activity is
+/// rare and consequential enough to be worth a `println!` here even though
+/// discovery replies deliberately stay silent.
+fn ambient_discovery_poll(info: &BootInfo) {
     let now = interrupts::ticks();
     let started_at = unsafe {
         let started = &raw mut AMBIENT_DISCOVERY_STARTED_AT;
@@ -2550,15 +2762,29 @@ fn ambient_discovery_poll() {
             continue;
         }
         let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
-        let hostname = trim_trailing_zero(&frame[15..]);
+        let payload = &frame[15..];
+        let own_mac = nic.mac_address();
         match frame[14] {
             CHAT_TAG_DISCOVER_REPLY => {
-                remember_peer(peer_mac, hostname);
+                remember_peer(peer_mac, trim_trailing_zero(payload));
             }
             CHAT_TAG_DISCOVER_REQUEST => {
-                remember_peer(peer_mac, hostname);
-                let source = nic.mac_address();
-                send_chat_control(nic, &peer_mac, &source, CHAT_TAG_DISCOVER_REPLY, index);
+                remember_peer(peer_mac, trim_trailing_zero(payload));
+                send_chat_control(nic, &peer_mac, &own_mac, CHAT_TAG_DISCOVER_REPLY, index);
+            }
+            NETFS_TAG_GET_REQUEST => {
+                let remote_disk_number = payload.first().copied().unwrap_or(0);
+                let name = payload.get(1..).unwrap_or(&[]);
+                serve_netfs_get_request(info, nic, peer_mac, own_mac, remote_disk_number, name);
+            }
+            NETFS_TAG_PUT_REQUEST => {
+                serve_netfs_put_request(nic, peer_mac, own_mac, payload);
+            }
+            NETFS_TAG_PUT_DATA => {
+                serve_netfs_put_data(peer_mac, payload);
+            }
+            NETFS_TAG_PUT_STOP => {
+                serve_netfs_put_stop(info, nic, peer_mac, own_mac);
             }
             _ => {}
         }
@@ -3934,14 +4160,17 @@ extern "C" fn tape_fs_remove(name: u32, name_length: u32) -> u32 {
 enum TapeArgumentSource<'a> {
     Direct(&'a [u8]),
     File(disk::Device, &'a [u8]),
+    RemoteFile([u8; 6], u8, &'a [u8]),
     Invalid,
 }
 
 /// `@NAME` reads the config file from the boot disk, matching the historical
-/// syntax; `@diskN/NAME` reads it from an attached secondary disk instead.
-/// A literal `/` is unambiguous as the disk/name separator here -- FOSFS
-/// names may only contain letters, digits, `.`, `_`, and `-`, so `/` can
-/// never appear in a real file name to collide with this.
+/// syntax; `@diskN/NAME` reads it from an attached secondary disk instead;
+/// `@HOST[:diskN]/NAME` fetches it over the network from a discovered
+/// peer's own disk instead (see `parse_remote_host_token`, NETFS). A
+/// literal `/` is unambiguous as the disk-or-host/name separator here --
+/// FOSFS names may only contain letters, digits, `.`, `_`, and `-`, so `/`
+/// can never appear in a real file name to collide with this.
 fn tape_argument_source(arguments: &[u8]) -> TapeArgumentSource<'_> {
     let (first, remainder) = take_word(arguments);
     let (candidate, trailing) = if first == b"router" {
@@ -3956,19 +4185,30 @@ fn tape_argument_source(arguments: &[u8]) -> TapeArgumentSource<'_> {
         return TapeArgumentSource::Invalid;
     }
     let reference = &candidate[1..];
-    let (device, name) = match reference.iter().position(|&byte| byte == b'/') {
+    match reference.iter().position(|&byte| byte == b'/') {
         Some(slash) => {
-            let Some(device) = strip_disk_selector(&reference[..slash]) else {
+            let head = &reference[..slash];
+            let name = &reference[slash + 1..];
+            if name.is_empty() {
                 return TapeArgumentSource::Invalid;
-            };
-            (device, &reference[slash + 1..])
+            }
+            if let Some(device) = strip_disk_selector(head) {
+                return TapeArgumentSource::File(device, name);
+            }
+            match parse_remote_host_token(head) {
+                Some((peer, remote_disk_number)) => {
+                    TapeArgumentSource::RemoteFile(peer, remote_disk_number, name)
+                }
+                None => TapeArgumentSource::Invalid,
+            }
         }
-        None => (disk::Device::Boot, reference),
-    };
-    if name.is_empty() {
-        return TapeArgumentSource::Invalid;
+        None => {
+            if reference.is_empty() {
+                return TapeArgumentSource::Invalid;
+            }
+            TapeArgumentSource::File(disk::Device::Boot, reference)
+        }
     }
-    TapeArgumentSource::File(device, name)
 }
 
 #[inline(never)]
@@ -3982,7 +4222,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         TapeArgumentSource::Direct(arguments) => arguments,
         TapeArgumentSource::Invalid => {
             println!("Usage: tape run [ARGS...] or tape run router @CONFIG_FILE");
-            println!("(or @diskN/CONFIG_FILE)");
+            println!("(or @diskN/CONFIG_FILE or @HOST[:diskN]/CONFIG_FILE)");
             return;
         }
         TapeArgumentSource::File(device, name) => {
@@ -4020,6 +4260,19 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
                 }
                 Err(error) => {
                     println!("FOSFS disk error while reading router configuration: {error:?}");
+                    return;
+                }
+            }
+        }
+        TapeArgumentSource::RemoteFile(peer, remote_disk_number, name) => {
+            let Some(nic) = nic_or_report() else {
+                return;
+            };
+            let own_mac = nic.mac_address();
+            match netfs_get(nic, peer, own_mac, remote_disk_number, name, &mut file_buffer) {
+                Ok(received) => &file_buffer[..received],
+                Err(error) => {
+                    println!("NETFS fetch of router configuration failed: {error}");
                     return;
                 }
             }
@@ -4124,7 +4377,57 @@ fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
             }
             tape_load_disk(info, device, name);
         }
-        _ => println!("Usage: tape load [net|disk NAME|diskN NAME]"),
+        // A bare hostname or `nic peers` number (optionally with `:diskN`)
+        // fetches the file over the network from that peer instead, via
+        // NETFS -- see `parse_remote_host_token`/`netfs_get`.
+        _ if parse_remote_host_token(kind).is_some() => {
+            let (peer, remote_disk_number) = parse_remote_host_token(kind).unwrap();
+            let (name, extra) = take_word(remainder);
+            if name.is_empty() || !extra.is_empty() {
+                println!("Usage: tape load HOST[:diskN] NAME");
+                return;
+            }
+            tape_load_remote(peer, remote_disk_number, name);
+        }
+        _ => println!("Usage: tape load [net|disk NAME|diskN NAME|HOST[:diskN] NAME]"),
+    }
+}
+
+/// Fetches a file from a discovered peer's own disk over NETFS and loads
+/// it into the fixed tape buffer, the remote counterpart to
+/// `tape_load_disk`. Reuses the same `pmem::TAPE_BASE`/`TAPE_LEN` region
+/// as every other tape-load path, so `netfs_get` can write directly into
+/// it rather than staging through a second buffer.
+#[inline(never)]
+fn tape_load_remote(peer: [u8; 6], remote_disk_number: u8, name: &[u8]) {
+    let Some(nic) = nic_or_report() else {
+        return;
+    };
+    let own_mac = nic.mac_address();
+    let Some(address) = allocate_tape_buffer(pmem::TAPE_LEN) else {
+        return;
+    };
+    let destination =
+        unsafe { core::slice::from_raw_parts_mut(address as *mut u8, pmem::TAPE_LEN as usize) };
+    match netfs_get(nic, peer, own_mac, remote_disk_number, name, destination) {
+        Ok(length) => {
+            if length == 0 {
+                println!(
+                    "'{}' is empty; nothing to load.",
+                    core::str::from_utf8(name).unwrap_or("?")
+                );
+                return;
+            }
+            if !install_tape(address, length as u32) {
+                return;
+            }
+            println!(
+                "Loaded {length} byte(s) from '{}' over NETFS at 0x{address:05x}.",
+                core::str::from_utf8(name).unwrap_or("?")
+            );
+            println!("'tape run' to execute it.");
+        }
+        Err(error) => println!("NETFS load failed: {error}"),
     }
 }
 
@@ -4186,10 +4489,16 @@ fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
 /// afterward with no need to `tape load` it back first.
 #[inline(never)]
 fn tape_save_command(info: &BootInfo, arguments: &[u8]) {
-    let (device, arguments) = parse_disk_and_one_argument(arguments);
     let (name, remainder) = take_word(arguments);
+    let (destination, name, remainder) = match parse_save_destination(name) {
+        Some(destination) => {
+            let (name, remainder) = take_word(remainder);
+            (destination, name, remainder)
+        }
+        None => (SaveDestination::Disk(disk::Device::Boot), name, remainder),
+    };
     if name.is_empty() || !remainder.is_empty() {
-        println!("Usage: tape save [diskN] NAME");
+        println!("Usage: tape save [diskN|HOST[:diskN]] NAME");
         return;
     }
     let Some((address, length)) = tape_get() else {
@@ -4197,23 +4506,58 @@ fn tape_save_command(info: &BootInfo, arguments: &[u8]) {
         return;
     };
     let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, length as usize) };
-    match fosfs::write(info, device, name, bytes) {
-        Ok(fosfs::WriteOutcome::Written) => println!(
-            "Saved {length} byte(s) of the loaded tape to disk{} '{}'.",
-            device_number(device),
-            core::str::from_utf8(name).unwrap_or("?")
-        ),
-        Ok(fosfs::WriteOutcome::InvalidName) => {
-            println!("Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'.");
+    match destination {
+        SaveDestination::Disk(device) => match fosfs::write(info, device, name, bytes) {
+            Ok(fosfs::WriteOutcome::Written) => println!(
+                "Saved {length} byte(s) of the loaded tape to disk{} '{}'.",
+                device_number(device),
+                core::str::from_utf8(name).unwrap_or("?")
+            ),
+            Ok(fosfs::WriteOutcome::InvalidName) => {
+                println!(
+                    "Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'."
+                );
+            }
+            Ok(fosfs::WriteOutcome::DirectoryFull) => {
+                println!("Directory full: all 64 FOSFS entries are in use.")
+            }
+            Ok(fosfs::WriteOutcome::DataFull) => {
+                println!("Data region full: no free sector remains in the FOSFS partition.")
+            }
+            Err(error) => println!("FOSFS disk error: {error:?}"),
+        },
+        SaveDestination::Remote(peer, remote_disk_number) => {
+            let Some(nic) = nic_or_report() else {
+                return;
+            };
+            let own_mac = nic.mac_address();
+            match netfs_put(nic, peer, own_mac, remote_disk_number, name, bytes) {
+                Ok(()) => println!(
+                    "Saved {length} byte(s) of the loaded tape over NETFS to '{}'.",
+                    core::str::from_utf8(name).unwrap_or("?")
+                ),
+                Err(error) => println!("NETFS save failed: {error}"),
+            }
         }
-        Ok(fosfs::WriteOutcome::DirectoryFull) => {
-            println!("Directory full: all 64 FOSFS entries are in use.")
-        }
-        Ok(fosfs::WriteOutcome::DataFull) => {
-            println!("Data region full: no free sector remains in the FOSFS partition.")
-        }
-        Err(error) => println!("FOSFS disk error: {error:?}"),
     }
+}
+
+enum SaveDestination {
+    Disk(disk::Device),
+    Remote([u8; 6], u8),
+}
+
+/// Recognizes an optional leading destination word for `tape save`: a
+/// `diskN` selector (an attached secondary disk), or a `HOST[:diskN]` peer
+/// reference (NETFS). Returns `None` when the word is neither, so the
+/// caller treats it as the file name instead (matching every other
+/// `[diskN] NAME`-style command's own "no selector present" fallback).
+fn parse_save_destination(word: &[u8]) -> Option<SaveDestination> {
+    if let Some(device) = strip_disk_selector(word) {
+        return Some(SaveDestination::Disk(device));
+    }
+    parse_remote_host_token(word)
+        .map(|(peer, remote_disk_number)| SaveDestination::Remote(peer, remote_disk_number))
 }
 
 /// One tape transfer in progress during `tape load net`: which sender it's
@@ -4554,6 +4898,617 @@ fn pace_tape_send() {
     }
 }
 
+/// One incoming NETFS PUT in progress, mirroring `TapeTransfer`'s "locked
+/// onto exactly one sender, sequence-numbered, no retransmission" shape,
+/// but living across many separate `ambient_discovery_poll` calls (one
+/// frame at a time) rather than one dedicated blocking loop, since serving
+/// is deliberately folded into the idle prompt loop instead of a loop of
+/// its own (see "NETFS" above `NETFS_TAG_GET_REQUEST`). Lives in the
+/// shared `pmem::TAPE_BASE` staging buffer -- the same one `copy`/`tape
+/// load disk`/`tape load net` already reuse for "receive an unknown-sized
+/// file, then act on it" -- so a locally typed `copy`/`tape load` command
+/// that also touches that buffer while a remote PUT is mid-flight (which,
+/// spread across many idle-loop iterations, can span real wall-clock
+/// seconds) would corrupt both. This is a known, accepted limitation of
+/// fos's single-threaded, no-locking design, not something this feature
+/// attempts to guard against.
+struct NetfsPutTransfer {
+    source: [u8; 6],
+    device: disk::Device,
+    remote_disk_number: u8,
+    name: [u8; NETFS_NAME_CAPACITY],
+    name_len: u8,
+    length: u32,
+    checksum: u16,
+    expected_seq: u32,
+    received: u32,
+}
+
+static mut NETFS_INCOMING_PUT: Option<NetfsPutTransfer> = None;
+
+fn send_netfs_get_request(
+    nic: &nic::Nic,
+    peer: &[u8; 6],
+    own_mac: &[u8; 6],
+    remote_disk_number: u8,
+    name: &[u8],
+) -> bool {
+    let mut frame = [0u8; 16 + NETFS_NAME_CAPACITY];
+    let total = 16 + name.len();
+    frame[0..6].copy_from_slice(peer);
+    frame[6..12].copy_from_slice(own_mac);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = NETFS_TAG_GET_REQUEST;
+    frame[15] = remote_disk_number;
+    frame[16..16 + name.len()].copy_from_slice(name);
+    nic.send(&frame[..total])
+}
+
+fn send_netfs_put_request(
+    nic: &nic::Nic,
+    peer: &[u8; 6],
+    own_mac: &[u8; 6],
+    remote_disk_number: u8,
+    length: u32,
+    checksum: u16,
+    name: &[u8],
+) -> bool {
+    let mut frame = [0u8; 22 + NETFS_NAME_CAPACITY];
+    let total = 22 + name.len();
+    frame[0..6].copy_from_slice(peer);
+    frame[6..12].copy_from_slice(own_mac);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = NETFS_TAG_PUT_REQUEST;
+    frame[15] = remote_disk_number;
+    frame[16..20].copy_from_slice(&length.to_le_bytes());
+    frame[20..22].copy_from_slice(&checksum.to_le_bytes());
+    frame[22..22 + name.len()].copy_from_slice(name);
+    nic.send(&frame[..total])
+}
+
+fn send_netfs_get_start(
+    nic: &nic::Nic,
+    peer: &[u8; 6],
+    own_mac: &[u8; 6],
+    length: u32,
+    checksum: u16,
+) -> bool {
+    let mut frame = [0u8; 21];
+    frame[0..6].copy_from_slice(peer);
+    frame[6..12].copy_from_slice(own_mac);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = NETFS_TAG_GET_START;
+    frame[15..19].copy_from_slice(&length.to_le_bytes());
+    frame[19..21].copy_from_slice(&checksum.to_le_bytes());
+    nic.send(&frame)
+}
+
+/// Sends `data` as a sequence-numbered burst of `tag`-tagged chunks (up to
+/// `TAPE_CHUNK_LEN` bytes each), the exact same shape and pacing
+/// `tape_send`'s own `TAPE_TAG_DATA` loop uses -- reused here rather than
+/// duplicated, since NETFS's GET/PUT data frames are byte-for-byte the
+/// same shape, just under different tags.
+fn send_netfs_data_frames(
+    nic: &nic::Nic,
+    peer: &[u8; 6],
+    own_mac: &[u8; 6],
+    tag: u8,
+    data: &[u8],
+) -> bool {
+    let mut frame = [0u8; 15 + 4 + TAPE_CHUNK_LEN];
+    frame[0..6].copy_from_slice(peer);
+    frame[6..12].copy_from_slice(own_mac);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = tag;
+    for (seq, chunk) in data.chunks(TAPE_CHUNK_LEN).enumerate() {
+        frame[15..19].copy_from_slice(&(seq as u32).to_le_bytes());
+        frame[19..19 + chunk.len()].copy_from_slice(chunk);
+        if !nic.send(&frame[..19 + chunk.len()]) {
+            return false;
+        }
+        pace_tape_send();
+    }
+    true
+}
+
+fn send_netfs_control(nic: &nic::Nic, peer: &[u8; 6], own_mac: &[u8; 6], tag: u8) -> bool {
+    let mut frame = [0u8; 15];
+    frame[0..6].copy_from_slice(peer);
+    frame[6..12].copy_from_slice(own_mac);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = tag;
+    nic.send(&frame)
+}
+
+fn send_netfs_error(nic: &nic::Nic, peer: &[u8; 6], own_mac: &[u8; 6], tag: u8, code: u8) {
+    let mut frame = [0u8; 16];
+    frame[0..6].copy_from_slice(peer);
+    frame[6..12].copy_from_slice(own_mac);
+    frame[12..14].copy_from_slice(&CHAT_ETHERTYPE);
+    frame[14] = tag;
+    frame[15] = code;
+    nic.send(&frame);
+}
+
+/// Fetches a file from `peer`'s disk `remote_disk_number` into
+/// `destination`, returning the number of bytes actually received. This is
+/// the shared client-side half of NETFS's GET, used identically by `copy`,
+/// `tape load HOST[:diskN] NAME`, and `tape run`'s `@HOST[:diskN]/NAME`
+/// argument source -- each just provides a different destination buffer
+/// (the shared `pmem::TAPE_BASE` scratch region for the first two, a small
+/// caller-owned stack buffer for the third, so a config-file fetch can
+/// never disturb an already-loaded tape sitting in that shared region).
+/// Gives up, returning `NetfsError::NoReply`, after `NETFS_TIMEOUT_TICKS`
+/// with no further progress, or on a local escape keypress -- the same
+/// "give up" convention `tape_load_net` already uses.
+fn netfs_get(
+    nic: &nic::Nic,
+    peer: [u8; 6],
+    own_mac: [u8; 6],
+    remote_disk_number: u8,
+    name: &[u8],
+    destination: &mut [u8],
+) -> Result<usize, NetfsError> {
+    if !send_netfs_get_request(nic, &peer, &own_mac, remote_disk_number, name) {
+        return Err(NetfsError::TransmitFailed);
+    }
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
+    let mut deadline = interrupts::ticks() + NETFS_TIMEOUT_TICKS;
+    let mut declared_length: Option<u32> = None;
+    let mut declared_checksum = 0u16;
+    let mut expected_seq = 0u32;
+    let mut received = 0u32;
+    loop {
+        if matches!(
+            keyboard::poll_term_event(),
+            Some(keyboard::KeyEvent::Escape)
+        ) {
+            return Err(NetfsError::NoReply);
+        }
+        if interrupts::ticks() >= deadline {
+            return Err(NetfsError::NoReply);
+        }
+        let Some(length) = nic.receive(&mut buffer) else {
+            continue;
+        };
+        let frame = &buffer[..length];
+        if defer_active_term_input(frame) {
+            if unsafe { PENDING_REMOTE_BYE } {
+                return Err(NetfsError::NoReply);
+            }
+            continue;
+        }
+        if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+            continue;
+        }
+        let source: [u8; 6] = frame[6..12].try_into().unwrap();
+        let payload = &frame[15..];
+        if source != peer {
+            if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
+                remember_peer(source, trim_trailing_zero(payload));
+                send_chat_control(
+                    nic,
+                    &source,
+                    &own_mac,
+                    CHAT_TAG_DISCOVER_REPLY,
+                    nic::active_index(),
+                );
+            }
+            continue;
+        }
+        match frame[14] {
+            NETFS_TAG_GET_START if declared_length.is_none() => {
+                let Some(length_bytes) = payload.get(0..4) else {
+                    continue;
+                };
+                let Some(checksum_bytes) = payload.get(4..6) else {
+                    continue;
+                };
+                let total = u32::from_le_bytes(length_bytes.try_into().unwrap());
+                if total as usize > destination.len() {
+                    return Err(NetfsError::TooLargeLocally);
+                }
+                declared_length = Some(total);
+                declared_checksum = u16::from_le_bytes(checksum_bytes.try_into().unwrap());
+                deadline = interrupts::ticks() + NETFS_TIMEOUT_TICKS;
+            }
+            NETFS_TAG_GET_DATA if declared_length.is_some() => {
+                let total = declared_length.unwrap();
+                let Some(seq_bytes) = payload.get(0..4) else {
+                    continue;
+                };
+                let seq = u32::from_le_bytes(seq_bytes.try_into().unwrap());
+                if seq != expected_seq {
+                    return Err(NetfsError::Gap);
+                }
+                let offset = seq as usize * TAPE_CHUNK_LEN;
+                let chunk_len = (total as usize - offset).min(TAPE_CHUNK_LEN);
+                let data = &payload[4..];
+                if data.len() < chunk_len {
+                    return Err(NetfsError::Gap);
+                }
+                destination[offset..offset + chunk_len].copy_from_slice(&data[..chunk_len]);
+                received += chunk_len as u32;
+                expected_seq += 1;
+                deadline = interrupts::ticks() + NETFS_TIMEOUT_TICKS;
+            }
+            NETFS_TAG_GET_STOP if declared_length.is_some() => {
+                let total = declared_length.unwrap();
+                if received != total {
+                    return Err(NetfsError::Gap);
+                }
+                let total = total as usize;
+                if internet_checksum(&destination[..total]) != declared_checksum {
+                    return Err(NetfsError::ChecksumMismatch);
+                }
+                return Ok(total);
+            }
+            NETFS_TAG_GET_ERROR => {
+                return Err(NetfsError::Remote(payload.first().copied().unwrap_or(0)));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Stores `data` under `name` on `peer`'s disk `remote_disk_number`, the
+/// shared client-side half of NETFS's PUT, used identically by `copy` and
+/// `tape save HOST[:diskN] NAME`. Unlike `netfs_get`, the length and
+/// checksum are already known up front (the caller already has the whole
+/// file in memory), so they travel in the initial request frame itself
+/// rather than a separate `_START`; the transfer still ends with an
+/// explicit `_ACK`/`_ERROR` so the caller learns whether the remote FOSFS
+/// write actually succeeded, not just whether every byte arrived.
+fn netfs_put(
+    nic: &nic::Nic,
+    peer: [u8; 6],
+    own_mac: [u8; 6],
+    remote_disk_number: u8,
+    name: &[u8],
+    data: &[u8],
+) -> Result<(), NetfsError> {
+    if data.len() > u32::MAX as usize {
+        return Err(NetfsError::TooLargeLocally);
+    }
+    let checksum = internet_checksum(data);
+    if !send_netfs_put_request(
+        nic,
+        &peer,
+        &own_mac,
+        remote_disk_number,
+        data.len() as u32,
+        checksum,
+        name,
+    ) {
+        return Err(NetfsError::TransmitFailed);
+    }
+    pace_tape_send();
+    if !send_netfs_data_frames(nic, &peer, &own_mac, NETFS_TAG_PUT_DATA, data) {
+        return Err(NetfsError::TransmitFailed);
+    }
+    if !send_netfs_control(nic, &peer, &own_mac, NETFS_TAG_PUT_STOP) {
+        return Err(NetfsError::TransmitFailed);
+    }
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
+    let deadline = interrupts::ticks() + NETFS_TIMEOUT_TICKS;
+    loop {
+        if matches!(
+            keyboard::poll_term_event(),
+            Some(keyboard::KeyEvent::Escape)
+        ) {
+            return Err(NetfsError::NoReply);
+        }
+        if interrupts::ticks() >= deadline {
+            return Err(NetfsError::NoReply);
+        }
+        let Some(length) = nic.receive(&mut buffer) else {
+            continue;
+        };
+        let frame = &buffer[..length];
+        if defer_active_term_input(frame) {
+            if unsafe { PENDING_REMOTE_BYE } {
+                return Err(NetfsError::NoReply);
+            }
+            continue;
+        }
+        if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
+            continue;
+        }
+        let source: [u8; 6] = frame[6..12].try_into().unwrap();
+        if source != peer {
+            if frame[14] == CHAT_TAG_DISCOVER_REQUEST {
+                remember_peer(source, trim_trailing_zero(&frame[15..]));
+                send_chat_control(
+                    nic,
+                    &source,
+                    &own_mac,
+                    CHAT_TAG_DISCOVER_REPLY,
+                    nic::active_index(),
+                );
+            }
+            continue;
+        }
+        match frame[14] {
+            NETFS_TAG_PUT_ACK => return Ok(()),
+            NETFS_TAG_PUT_ERROR => {
+                return Err(NetfsError::Remote(frame.get(15).copied().unwrap_or(0)));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Answers one `NETFS_TAG_GET_REQUEST`, called from `ambient_discovery_
+/// poll`. This is synchronous and blocking, exactly like `tape_send`'s
+/// existing paced transmit loop: it reads the whole file, computes its
+/// checksum, and sends the entire `_START`+`_DATA*`+`_STOP` burst before
+/// returning, pausing the idle prompt loop for the duration -- an accepted
+/// trade-off consistent with this kernel having no real concurrency at all.
+fn serve_netfs_get_request(
+    info: &BootInfo,
+    nic: &nic::Nic,
+    source: [u8; 6],
+    own_mac: [u8; 6],
+    remote_disk_number: u8,
+    name: &[u8],
+) {
+    let name = trim_trailing_zero(name);
+    if name.is_empty() {
+        send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_GET_ERROR,
+            NETFS_ERROR_INVALID_NAME,
+        );
+        return;
+    }
+    let Some(device) = device_from_number(remote_disk_number as u32) else {
+        send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_GET_ERROR,
+            NETFS_ERROR_DISK_UNAVAILABLE,
+        );
+        return;
+    };
+    let length = match fosfs::file_length(info, device, name) {
+        Ok(Some(length)) => length,
+        Ok(None) => {
+            send_netfs_error(nic, &source, &own_mac, NETFS_TAG_GET_ERROR, NETFS_ERROR_NOT_FOUND);
+            return;
+        }
+        Err(_) => {
+            send_netfs_error(nic, &source, &own_mac, NETFS_TAG_GET_ERROR, NETFS_ERROR_DISK_ERROR);
+            return;
+        }
+    };
+    if length == 0 || length > pmem::TAPE_LEN as u64 {
+        send_netfs_error(nic, &source, &own_mac, NETFS_TAG_GET_ERROR, NETFS_ERROR_TOO_LARGE);
+        return;
+    }
+    let length = length as usize;
+    let buffer = unsafe { core::slice::from_raw_parts_mut(pmem::TAPE_BASE as *mut u8, length) };
+    match fosfs::read(info, device, name, buffer) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            send_netfs_error(nic, &source, &own_mac, NETFS_TAG_GET_ERROR, NETFS_ERROR_NOT_FOUND);
+            return;
+        }
+        Err(_) => {
+            send_netfs_error(nic, &source, &own_mac, NETFS_TAG_GET_ERROR, NETFS_ERROR_DISK_ERROR);
+            return;
+        }
+    }
+    let checksum = internet_checksum(buffer);
+    println!(
+        "\nServing a {length}-byte network GET of disk{remote_disk_number} '{}' to {}...",
+        core::str::from_utf8(name).unwrap_or("?"),
+        Mac(&source)
+    );
+    if send_netfs_get_start(nic, &source, &own_mac, length as u32, checksum) {
+        pace_tape_send();
+        if send_netfs_data_frames(nic, &source, &own_mac, NETFS_TAG_GET_DATA, buffer) {
+            send_netfs_control(nic, &source, &own_mac, NETFS_TAG_GET_STOP);
+        }
+    }
+    invalidate_tape_after_scratch_use();
+}
+
+/// Begins serving one `NETFS_TAG_PUT_REQUEST`, called from
+/// `ambient_discovery_poll`. Unlike GET (answered synchronously in one
+/// call), a PUT's data necessarily spans many later `ambient_discovery_
+/// poll` calls, so this only validates the request and records
+/// `NetfsPutTransfer` state; `serve_netfs_put_data`/`serve_netfs_put_stop`
+/// (each called from later frames) do the rest.
+fn serve_netfs_put_request(nic: &nic::Nic, source: [u8; 6], own_mac: [u8; 6], payload: &[u8]) {
+    if unsafe { (*(&raw const NETFS_INCOMING_PUT)).is_some() } {
+        send_netfs_error(nic, &source, &own_mac, NETFS_TAG_PUT_ERROR, NETFS_ERROR_BUSY);
+        return;
+    }
+    let Some(&remote_disk_number) = payload.first() else {
+        return;
+    };
+    let Some(length_bytes) = payload.get(1..5) else {
+        return;
+    };
+    let Some(checksum_bytes) = payload.get(5..7) else {
+        return;
+    };
+    let name = trim_trailing_zero(payload.get(7..).unwrap_or(&[]));
+    let length = u32::from_le_bytes(length_bytes.try_into().unwrap());
+    let checksum = u16::from_le_bytes(checksum_bytes.try_into().unwrap());
+    if name.is_empty() || name.len() > NETFS_NAME_CAPACITY {
+        send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_PUT_ERROR,
+            NETFS_ERROR_INVALID_NAME,
+        );
+        return;
+    }
+    let Some(device) = device_from_number(remote_disk_number as u32) else {
+        send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_PUT_ERROR,
+            NETFS_ERROR_DISK_UNAVAILABLE,
+        );
+        return;
+    };
+    if length == 0 || length > pmem::TAPE_LEN {
+        send_netfs_error(nic, &source, &own_mac, NETFS_TAG_PUT_ERROR, NETFS_ERROR_TOO_LARGE);
+        return;
+    }
+    println!(
+        "\nAccepting a {length}-byte network PUT of '{}' onto disk{remote_disk_number} from {}...",
+        core::str::from_utf8(name).unwrap_or("?"),
+        Mac(&source)
+    );
+    let mut transfer = NetfsPutTransfer {
+        source,
+        device,
+        remote_disk_number,
+        name: [0; NETFS_NAME_CAPACITY],
+        name_len: name.len() as u8,
+        length,
+        checksum,
+        expected_seq: 0,
+        received: 0,
+    };
+    transfer.name[..name.len()].copy_from_slice(name);
+    unsafe {
+        *(&raw mut NETFS_INCOMING_PUT) = Some(transfer);
+    }
+}
+
+fn serve_netfs_put_data(source: [u8; 6], payload: &[u8]) {
+    let transfer_ptr = &raw mut NETFS_INCOMING_PUT;
+    let Some(transfer) = (unsafe { &mut *transfer_ptr }).as_mut() else {
+        return;
+    };
+    if transfer.source != source {
+        return;
+    }
+    let Some(seq_bytes) = payload.get(0..4) else {
+        return;
+    };
+    let seq = u32::from_le_bytes(seq_bytes.try_into().unwrap());
+    if seq != transfer.expected_seq {
+        println!(
+            "\nGap in incoming network PUT data from {}; aborting.",
+            Mac(&source)
+        );
+        unsafe {
+            *transfer_ptr = None;
+        }
+        return;
+    }
+    let offset = seq as usize * TAPE_CHUNK_LEN;
+    let chunk_len = (transfer.length as usize - offset).min(TAPE_CHUNK_LEN);
+    let data = &payload[4..];
+    if data.len() < chunk_len {
+        println!(
+            "\nShort incoming network PUT data from {}; aborting.",
+            Mac(&source)
+        );
+        unsafe {
+            *transfer_ptr = None;
+        }
+        return;
+    }
+    let destination = unsafe {
+        core::slice::from_raw_parts_mut((pmem::TAPE_BASE as usize + offset) as *mut u8, chunk_len)
+    };
+    destination.copy_from_slice(&data[..chunk_len]);
+    transfer.received += chunk_len as u32;
+    transfer.expected_seq += 1;
+}
+
+fn serve_netfs_put_stop(info: &BootInfo, nic: &nic::Nic, source: [u8; 6], own_mac: [u8; 6]) {
+    let transfer_ptr = &raw mut NETFS_INCOMING_PUT;
+    let matches = unsafe { &*transfer_ptr }
+        .as_ref()
+        .is_some_and(|transfer| transfer.source == source);
+    if !matches {
+        return;
+    }
+    let transfer = unsafe { (&mut *transfer_ptr).take().unwrap() };
+    if transfer.received != transfer.length {
+        println!(
+            "\nIncoming network PUT from {} stopped early ({} of {} byte(s)); aborting.",
+            Mac(&source),
+            transfer.received,
+            transfer.length
+        );
+        send_netfs_error(nic, &source, &own_mac, NETFS_TAG_PUT_ERROR, NETFS_ERROR_DISK_ERROR);
+        return;
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(pmem::TAPE_BASE as *const u8, transfer.length as usize)
+    };
+    if internet_checksum(bytes) != transfer.checksum {
+        println!(
+            "\nChecksum mismatch on incoming network PUT from {}; discarding.",
+            Mac(&source)
+        );
+        send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_PUT_ERROR,
+            NETFS_ERROR_CHECKSUM_MISMATCH,
+        );
+        return;
+    }
+    let name = &transfer.name[..transfer.name_len as usize];
+    let outcome = fosfs::write(info, transfer.device, name, bytes);
+    invalidate_tape_after_scratch_use();
+    match outcome {
+        Ok(fosfs::WriteOutcome::Written) => {
+            println!(
+                "\nWrote {} byte(s) from {} to disk{} '{}'.",
+                transfer.length,
+                Mac(&source),
+                transfer.remote_disk_number,
+                core::str::from_utf8(name).unwrap_or("?")
+            );
+            send_netfs_control(nic, &source, &own_mac, NETFS_TAG_PUT_ACK);
+        }
+        Ok(fosfs::WriteOutcome::InvalidName) => send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_PUT_ERROR,
+            NETFS_ERROR_INVALID_NAME,
+        ),
+        Ok(fosfs::WriteOutcome::DirectoryFull) => send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_PUT_ERROR,
+            NETFS_ERROR_DIRECTORY_FULL,
+        ),
+        Ok(fosfs::WriteOutcome::DataFull) => send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_PUT_ERROR,
+            NETFS_ERROR_DATA_FULL,
+        ),
+        Err(_) => send_netfs_error(
+            nic,
+            &source,
+            &own_mac,
+            NETFS_TAG_PUT_ERROR,
+            NETFS_ERROR_DISK_ERROR,
+        ),
+    }
+}
+
 /// Displays a MAC address as `aa:bb:cc:dd:ee:ff` wherever `println!`/`print!`
 /// need one, without repeating the six-field hex format at every call site.
 struct Mac<'a>(&'a [u8; 6]);
@@ -4596,6 +5551,23 @@ fn no_arguments(arguments: &[u8]) -> bool {
     }
 }
 
+/// Maps a 1-based disk number (`1` = boot disk, `2` = the first secondary
+/// disk, ...) to a [`disk::Device`], but only when it names a disk that is
+/// actually attached right now -- the numeric half of `strip_disk_selector`
+/// below, factored out for callers (like NETFS's wire protocol, which
+/// sends a disk number as a single byte rather than parsing `diskN` text)
+/// that already have the number itself.
+fn device_from_number(number: u32) -> Option<disk::Device> {
+    match number {
+        0 => None,
+        1 => Some(disk::Device::Boot),
+        n => {
+            let index = (n - 2) as usize;
+            (index < disk::secondary_count()).then_some(disk::Device::Secondary(index))
+        }
+    }
+}
+
 /// Parses a strict `diskN` token (`disk` followed by one or more decimal
 /// digits) into a [`disk::Device`], but only when `N` names a disk that is
 /// actually attached right now: `disk1` is always the boot disk; `disk2`,
@@ -4610,14 +5582,7 @@ fn strip_disk_selector(word: &[u8]) -> Option<disk::Device> {
         return None;
     }
     let number: u32 = core::str::from_utf8(suffix).ok()?.parse().ok()?;
-    match number {
-        0 => None,
-        1 => Some(disk::Device::Boot),
-        n => {
-            let index = (n - 2) as usize;
-            (index < disk::secondary_count()).then_some(disk::Device::Secondary(index))
-        }
-    }
+    device_from_number(number)
 }
 
 /// Parses an optional `diskN` selector for a command that itself takes no
@@ -4807,32 +5772,201 @@ fn remove_command(info: &BootInfo, arguments: &[u8]) {
 /// command, both disks here must be spelled out explicitly (even `disk1`)
 /// rather than one side defaulting to the boot disk: with two disks
 /// genuinely in play, a silent default would be ambiguous about which side
-/// it applies to. Reuses the shared `pmem::TAPE_BASE` staging buffer that
-/// `tape load disk` already uses for "read a whole file into memory, then
-/// do something with it," rather than adding a second large static buffer;
-/// see `copy_file`'s doc comment for why that is safe.
+/// it applies to. Either side may instead name a discovered NETFS peer:
+/// `copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]` (remote source) or
+/// `copy SRC_DISK NAME HOST[:diskN] [NEW_NAME]` (remote destination). A
+/// remote *source* is written as one `HOST[:diskN]/NAME` token (mirroring
+/// `tape run`'s `@HOST[:diskN]/NAME`), disambiguated from a local
+/// `SRC_DISK` token by the presence of `/` -- FOSFS names never contain
+/// one. A remote *destination* has no file name of its own to combine
+/// with, so it's just `HOST[:diskN]`, same shape as a local `DST_DISK`.
+/// Copying directly between two remote hosts is deliberately rejected;
+/// copy through a local disk in two steps instead. Reuses the shared
+/// `pmem::TAPE_BASE` staging buffer that `tape load disk` already uses for
+/// "read a whole file into memory, then do something with it," rather
+/// than adding a second large static buffer; see `copy_file`'s doc comment
+/// for why that is safe.
 #[inline(never)]
 fn copy_command(info: &BootInfo, arguments: &[u8]) {
-    let (source_word, remainder) = take_word(arguments);
+    let (first, remainder) = take_word(arguments);
+    if first.contains(&b'/') {
+        let Some((peer, remote_disk_number, name)) = parse_remote_token(first) else {
+            println!("Usage: copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]");
+            return;
+        };
+        let (destination_word, remainder) = take_word(remainder);
+        let (new_name, remainder) = take_word(remainder);
+        if destination_word.is_empty() || !remainder.is_empty() {
+            println!("Usage: copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]");
+            return;
+        }
+        let destination_name = if new_name.is_empty() { name } else { new_name };
+        match parse_copy_destination(destination_word) {
+            Some(CopyDestination::Local(destination)) => {
+                copy_from_remote(info, peer, remote_disk_number, name, destination, destination_name);
+            }
+            Some(CopyDestination::Remote(..)) => {
+                println!("copy can't move a file directly between two remote hosts;");
+                println!("copy through a local disk in two steps instead.");
+            }
+            None => {
+                println!("Usage: copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]; DST_DISK must");
+                println!("name an attached disk (e.g. disk2).");
+            }
+        }
+        return;
+    }
     let (name, remainder) = take_word(remainder);
     let (destination_word, remainder) = take_word(remainder);
     let (new_name, remainder) = take_word(remainder);
     if name.is_empty() || destination_word.is_empty() || !remainder.is_empty() {
         println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]");
+        println!("(SRC_DISK/DST_DISK may also be a discovered HOST[:diskN])");
         return;
     }
-    let Some(source) = strip_disk_selector(source_word) else {
+    let Some(source) = strip_disk_selector(first) else {
         println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; SRC_DISK must name");
         println!("an attached disk (e.g. disk1).");
         return;
     };
-    let Some(destination) = strip_disk_selector(destination_word) else {
-        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; DST_DISK must name");
-        println!("an attached disk (e.g. disk2).");
+    let destination_name = if new_name.is_empty() { name } else { new_name };
+    match parse_copy_destination(destination_word) {
+        Some(CopyDestination::Local(destination)) => {
+            copy_file(info, source, name, destination, destination_name);
+        }
+        Some(CopyDestination::Remote(peer, remote_disk_number)) => {
+            copy_to_remote(info, source, name, peer, remote_disk_number, destination_name);
+        }
+        None => {
+            println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; DST_DISK must name");
+            println!("an attached disk or a discovered HOST[:diskN].");
+        }
+    }
+}
+
+enum CopyDestination {
+    Local(disk::Device),
+    Remote([u8; 6], u8),
+}
+
+/// Parses `copy`'s destination word as either a local `diskN` selector or a
+/// discovered `HOST[:diskN]` NETFS peer reference. Returns `None` when the
+/// word is neither, so the caller can report a single combined usage
+/// message rather than guessing which one the operator meant.
+fn parse_copy_destination(word: &[u8]) -> Option<CopyDestination> {
+    if let Some(device) = strip_disk_selector(word) {
+        return Some(CopyDestination::Local(device));
+    }
+    parse_remote_host_token(word)
+        .map(|(peer, remote_disk_number)| CopyDestination::Remote(peer, remote_disk_number))
+}
+
+/// Fetches a file from a discovered peer's own disk over NETFS and writes
+/// it to a local disk, the remote-source counterpart to `copy_file`.
+/// Shares the same staging buffer and invalidation logic.
+fn copy_from_remote(
+    info: &BootInfo,
+    peer: [u8; 6],
+    remote_disk_number: u8,
+    name: &[u8],
+    destination: disk::Device,
+    destination_name: &[u8],
+) {
+    let Some(nic) = nic_or_report() else {
         return;
     };
-    let destination_name = if new_name.is_empty() { name } else { new_name };
-    copy_file(info, source, name, destination, destination_name);
+    let own_mac = nic.mac_address();
+    let Some(address) = allocate_tape_buffer(pmem::TAPE_LEN) else {
+        return;
+    };
+    let buffer =
+        unsafe { core::slice::from_raw_parts_mut(address as *mut u8, pmem::TAPE_LEN as usize) };
+    let length = match netfs_get(nic, peer, own_mac, remote_disk_number, name, buffer) {
+        Ok(length) => length,
+        Err(error) => {
+            println!("NETFS fetch failed: {error}");
+            return;
+        }
+    };
+    let outcome = fosfs::write(info, destination, destination_name, &buffer[..length]);
+    invalidate_tape_after_scratch_use();
+    match outcome {
+        Ok(fosfs::WriteOutcome::Written) => println!(
+            "Copied {length} byte(s) over NETFS to disk{} '{}'.",
+            device_number(destination),
+            core::str::from_utf8(destination_name).unwrap_or("?")
+        ),
+        Ok(fosfs::WriteOutcome::InvalidName) => {
+            println!("Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'.");
+        }
+        Ok(fosfs::WriteOutcome::DirectoryFull) => {
+            println!("Directory full: all 64 FOSFS entries are in use.")
+        }
+        Ok(fosfs::WriteOutcome::DataFull) => {
+            println!("Data region full: no free sector remains in the FOSFS partition.")
+        }
+        Err(error) => println!("FOSFS disk error: {error:?}"),
+    }
+}
+
+/// Reads a file from a local disk and sends it to a discovered peer's own
+/// disk over NETFS, the remote-destination counterpart to `copy_file`.
+/// Shares the same staging buffer and invalidation logic.
+fn copy_to_remote(
+    info: &BootInfo,
+    source: disk::Device,
+    name: &[u8],
+    peer: [u8; 6],
+    remote_disk_number: u8,
+    destination_name: &[u8],
+) {
+    let length = match fosfs::file_length(info, source, name) {
+        Ok(Some(length)) => length,
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    };
+    if length > u32::MAX as u64 {
+        println!("File is too large to copy through the shared tape-buffer scratch area.");
+        return;
+    }
+    let length = length as usize;
+    let Some(address) = allocate_tape_buffer(length as u32) else {
+        return;
+    };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
+    match fosfs::read(info, source, name, buffer) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    }
+    let Some(nic) = nic_or_report() else {
+        invalidate_tape_after_scratch_use();
+        return;
+    };
+    let own_mac = nic.mac_address();
+    let outcome = netfs_put(nic, peer, own_mac, remote_disk_number, destination_name, buffer);
+    invalidate_tape_after_scratch_use();
+    match outcome {
+        Ok(()) => println!(
+            "Copied {length} byte(s) from disk{} '{}' over NETFS to '{}'.",
+            device_number(source),
+            core::str::from_utf8(name).unwrap_or("?"),
+            core::str::from_utf8(destination_name).unwrap_or("?")
+        ),
+        Err(error) => println!("NETFS send failed: {error}"),
+    }
 }
 
 /// Reads a whole file from `source` into the shared tape staging buffer

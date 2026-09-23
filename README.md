@@ -168,7 +168,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `cat [diskN] NAME` | Displays a FOSFS text file from the boot disk (`disk1`, default) or an attached secondary disk. |
 | `write [diskN] NAME TEXT` | Creates or replaces a flat FOSFS file on the boot disk (`disk1`, default) or an attached secondary disk. Names use up to 16 lowercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
 | `rm [diskN] NAME` | Removes a FOSFS file entry from the boot disk (`disk1`, default) or an attached secondary disk. |
-| `copy SRC_DISK NAME DST_DISK [NEW_NAME]` | Copies one FOSFS file's raw bytes from `SRC_DISK` to `DST_DISK` (both must be spelled out explicitly, e.g. `disk1`/`disk2` — unlike every other disk command, neither side defaults), optionally renaming it to `NEW_NAME`. Uses the same shared tape staging buffer as `tape load disk`/`tape load net`, so any previously loaded tape is invalidated by a copy; the shell reports this when it happens. |
+| `copy SRC_DISK NAME DST_DISK [NEW_NAME]` | Copies one FOSFS file's raw bytes from `SRC_DISK` to `DST_DISK` (both must be spelled out explicitly, e.g. `disk1`/`disk2` — unlike every other disk command, neither side defaults), optionally renaming it to `NEW_NAME`. Either side may instead be a discovered NETFS peer: `copy HOST[:diskN]/NAME DST_DISK` (remote source) or `copy SRC_DISK NAME HOST[:diskN]` (remote destination) — see "NETFS: copying files to/from a discovered peer" below. Uses the same shared tape staging buffer as `tape load disk`/`tape load net`, so any previously loaded tape is invalidated by a copy; the shell reports this when it happens. |
 | `start` file | Optional boot-time command script, read from `disk1` or, if absent there, `disk2`. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
 | `start` | Reruns the boot-time `start` script on demand (same disk1-then-disk2 lookup), e.g. after F12-ing out of a tape it launched, without needing a reset. Reports plainly if no `start` file is found on either disk. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
@@ -187,11 +187,11 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (or F4/F6/F7/F8/F10) (local keyboard) or by typing `/quit` (works over serial too). |
 | `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
-| `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer, from the boot disk; `tape load diskN NAME` loads from an attached secondary disk instead. |
+| `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer, from the boot disk; `tape load diskN NAME` loads from an attached secondary disk instead. `tape load HOST[:diskN] NAME` fetches it over the network from a discovered NETFS peer instead. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): checks that the declared image fits the fixed 4 MiB tape region, validates each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
 | `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
-| `tape save [diskN] NAME` | Writes the currently loaded tape's exact bytes out to FOSFS under `NAME` (boot disk by default, or an attached secondary disk with `diskN`) -- the missing counterpart to `tape load net`: a tape received over the network previously had no way to persist it, so a fresh network transfer (with its per-run pacing/reliability cost) was the only way to run it again after a reboot. Works on whatever tape is currently resident regardless of how it was loaded, and leaves that loaded tape's own state untouched, so `tape run` still works immediately afterward. |
-| `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run @NAME` (or `tape run router @NAME`) reads startup arguments from the FOSFS file `NAME` on the boot disk instead, and `@diskN/NAME` reads it from an attached secondary disk (e.g. `tape run router @disk2/router.cfg`); `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
+| `tape save [diskN\|HOST[:diskN]] NAME` | Writes the currently loaded tape's exact bytes out to FOSFS under `NAME` (boot disk by default, an attached secondary disk with `diskN`, or a discovered NETFS peer's own disk with `HOST[:diskN]`) -- the missing counterpart to `tape load net`: a tape received over the network previously had no way to persist it, so a fresh network transfer (with its per-run pacing/reliability cost) was the only way to run it again after a reboot. Works on whatever tape is currently resident regardless of how it was loaded, and leaves that loaded tape's own state untouched, so `tape run` still works immediately afterward. |
+| `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run @NAME` (or `tape run router @NAME`) reads startup arguments from the FOSFS file `NAME` on the boot disk instead, `@diskN/NAME` reads it from an attached secondary disk (e.g. `tape run router @disk2/router.cfg`), and `@HOST[:diskN]/NAME` fetches it over the network from a discovered NETFS peer instead; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
 | `halt` | Stops the CPU. Reset or power-cycle to restart. |
 | `reset` | Reboots the machine immediately via an 8042 keyboard-controller pulse reset -- the same classic mechanism real DOS-era reboot utilities used, still honored by QEMU and virtually every real chipset. Control never returns; the machine re-enters `boot/stage1.S` from scratch. |
@@ -535,6 +535,44 @@ the following ~30 seconds (to catch another machine booting around the
 same time but not quite in sync), then roughly once a minute afterward.
 `nic discover` itself is unaffected and keeps its own faster, dedicated
 rebroadcast cadence for an operator actively searching for peers.
+
+### NETFS: copying files to/from a discovered peer
+
+Once a peer shows up by name in `nic peers`, `copy`/`tape load`/`tape
+save`/`tape run @...` can reference a file on that peer's own disk
+directly, without a shared disk or a manual network transfer first --
+NETFS, a small unauthenticated protocol built for exactly this:
+
+```
+copy alpha1:disk2/report.txt disk2      # fetch report.txt from peer "alpha1"'s disk2
+copy disk1 note.txt beta1:disk2         # send note.txt to peer "beta1"'s disk2
+tape load alpha1 router.bin             # load a tape straight from a peer's disk
+tape save beta1 router.bin              # save the loaded tape to a peer's disk
+tape run router @alpha1:disk2/router.cfg
+```
+
+A remote reference is always `HOST[:diskN]` (disk1 if omitted), where
+`HOST` is either an `nic peers` number or a discovered hostname -- never a
+raw MAC address, since a MAC's own colons would collide with `:diskN`.
+Every transfer is verified with a 16-bit Internet checksum (RFC 1071, the
+same algorithm `tapes/tape-net`'s IPv4/UDP/TCP layers use) computed over
+the whole file; a mismatch aborts before anything is written locally or
+remotely. Like every other protocol in this project, there is no
+retransmission and no authentication: anyone on the same Ethernet segment
+can request or send a file, and a dropped frame simply aborts the
+transfer rather than being retried. Copying directly between two remote
+peers (`copy hostA:.../NAME hostB:...`) is rejected; copy through a local
+disk in two steps instead.
+
+A peer only serves NETFS requests while sitting idle at its own local
+`fos> ` prompt (the same ambient loop that answers discovery probes) --
+not while running `chat`, `nic discover`, `term net`, or a tape. Because
+serving reuses the same shared tape staging buffer `copy`/`tape load`
+already use locally, a local operator typing a `copy`/`tape load` command
+on the *serving* machine while a remote transfer is in flight can corrupt
+both; this is an accepted limitation of fos's single-threaded design, not
+something NETFS guards against. See AGENTS.md's "NETFS" section for the
+full wire protocol and design rationale.
 
 Sending raw frames needs `CAP_NET_RAW` (in practice, run it with `sudo`).
 The destination MAC is read from `tools/mac` (default path; overridable with

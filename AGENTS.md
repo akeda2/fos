@@ -2620,6 +2620,142 @@ the whole chain (hostname file -> wire payload -> peer table -> display)
 works purely through the idle loop's own ambient polling, with no
 dedicated discovery command ever invoked by either guest.
 
+### NETFS: a simple network filesystem over discovered peers
+
+Once every machine on a LAN segment reliably shows up in `nic peers` by
+name, the natural next question was whether a file could be fetched
+straight from a peer's own disk without first bouncing it through a
+disk that both machines share -- motivated directly by the target use
+case `copy hostname1:disk2/file.name disk2`. NETFS is the small,
+deliberately unauthenticated protocol this project ended up with, reusing
+`CHAT_ETHERTYPE` (the same one `chat`/`nic discover`/`tape`/`term net`
+already share) and the same design philosophy as every other protocol in
+this codebase: no retransmission, no security, and an honestly documented
+accepted risk where corners were cut, rather than hidden complexity to
+paper over them.
+
+**Wire protocol.** Ten new tags continue the numbering after
+`TERM_TAG_BYE`: `NETFS_TAG_GET_REQUEST`/`GET_START`/`GET_DATA`/
+`GET_STOP`/`GET_ERROR` and `PUT_REQUEST`/`PUT_DATA`/`PUT_STOP`/`PUT_ACK`/
+`PUT_ERROR`. A GET request carries a one-byte remote disk number plus the
+file name; the server replies with a `_START` frame declaring the exact
+length and a 16-bit checksum, then a `TAPE_TAG_DATA`-shaped burst of
+`_DATA` frames (same sequence-number-and-declared-length discipline as
+`tape load net`'s own chunked transfer, for the same reason: a binary
+file's own trailing zero bytes must never be mistaken for Ethernet's
+60-byte minimum-frame padding), then `_STOP`. A PUT request instead
+carries the length and checksum up front (the client already has the
+whole file in memory before sending), followed by the same `_DATA`/
+`_STOP` shape, and the server replies with `_ACK` or a one-byte
+`_ERROR` code. Nine error codes cover not-found, disk-unavailable,
+too-large, invalid-name, directory-full, data-full, a checksum mismatch,
+a generic disk error, and `BUSY` -- the last one new to this feature: a
+peer already mid-PUT rejects a second concurrent `PUT_REQUEST` outright
+rather than letting two transfers corrupt the one shared staging buffer
+(see below).
+
+**The checksum.** Every transfer computes the standard RFC 1071 16-bit
+Internet checksum (`internet_checksum`, the same algorithm
+`tapes/tape-net`'s IPv4/UDP/TCP layers already use) over the *entire*
+file, verified only once the whole thing has been reassembled -- there is
+no partial-frame verification, matching this protocol's "no
+retransmission, abort cleanly on any detected problem" philosophy
+throughout. GET carries the checksum in `_START`, since the server only
+knows it once the file has actually been read from disk; PUT carries it
+in `_REQUEST`, since the client already holds the whole file in memory
+up front. A mismatch on either side aborts before any write happens (a
+GET never installs a corrupt tape or writes a corrupt file locally; a PUT
+server never calls `fosfs::write` with data that failed verification).
+
+**Peer references never accept a raw MAC address.** `resolve_peer` (used
+by NETFS's `parse_remote_host_token`/`parse_remote_token`) accepts only
+an `nic peers` index number or a known hostname -- deliberately not a
+colon-separated MAC address, unlike `chat`/`tape send`'s existing peer
+resolution, because a MAC's colons would be genuinely ambiguous against
+`HOST:diskN`'s own colon. This is a one-line, deliberate scope narrowing
+for NETFS specifically, not a change to `chat`/`tape send`'s own
+resolution.
+
+**Command syntax**, layered onto every existing command that already
+moves a whole file through the shared `pmem::TAPE_BASE`/`TAPE_LEN`
+staging buffer:
+
+```
+copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]     remote source (NETFS GET)
+copy SRC_DISK NAME HOST[:diskN] [NEW_NAME]     remote destination (NETFS PUT)
+tape load HOST[:diskN] NAME                    remote source, straight into the tape buffer
+tape save HOST[:diskN] NAME                    remote destination, from the loaded tape
+tape run @HOST[:diskN]/NAME                    remote source, as a startup-argument file
+```
+
+A remote *source* is always written as one `HOST[:diskN]/NAME` token
+(the same reasoning `tape run`'s pre-existing `@diskN/NAME` already
+established: FOSFS names never contain `/`, so it's an unambiguous
+separator), because it needs to carry a file name alongside the host. A
+remote *destination* has no file name of its own to combine with -- the
+name always comes from the source side (or an explicit `NEW_NAME`) -- so
+it's just `HOST[:diskN]`, the same shape as a local `DST_DISK`/`diskN`
+selector; `parse_copy_destination`/`parse_save_destination` each try a
+local `diskN` selector first, falling back to a peer reference.
+`tape run`'s existing `TapeArgumentSource` enum gained a `RemoteFile`
+variant fetched into the small stack-resident `file_buffer`
+(`TAPE_ARGUMENT_FILE_CAPACITY`, 4096 bytes) that argument already used
+-- deliberately *not* `pmem::TAPE_BASE`, since a tape is already resident
+there by the time `tape run` parses its arguments, and clobbering it
+mid-fetch would corrupt the very tape about to run. `copy`/`tape load`'s
+remote-GET call sites, which have no such conflict, pass the full
+`pmem::TAPE_BASE`/`TAPE_LEN` region as `netfs_get`'s destination buffer
+instead -- `netfs_get` takes that buffer as a caller-supplied slice
+specifically so both call sites can share one function with no
+special-casing; it learns the real length from the `_START` frame and
+errors out before writing anything if it would overflow the caller's
+buffer. Attempting `copy HOST1:.../NAME HOST2:...` (two remote endpoints
+at once) is explicitly rejected with a message to copy through a local
+disk in two steps instead -- NETFS moves a file to or from *this*
+machine's own disk, never directly between two other peers.
+
+**Serving is scoped to the idle prompt loop only**, mirroring ambient
+discovery's own scoping decision above and for the same reason: this is
+the one loop already proven safe to extend with extra, silent background
+polling without corrupting an interactive display. `ambient_discovery_poll`
+now also recognizes and dispatches the four request-carrying tags
+(`GET_REQUEST`/`PUT_REQUEST`/`PUT_DATA`/`PUT_STOP`) to
+`serve_netfs_get_request`/`serve_netfs_put_request`/`serve_netfs_put_data`/
+`serve_netfs_put_stop` -- unlike routine discovery traffic, NETFS activity
+*is* printed, since it is a much rarer, more consequential event than an
+ordinary discovery probe/reply. A GET is served synchronously within one
+`ambient_discovery_poll()` call (read the file, compute the checksum,
+send the whole paced burst) -- an accepted blocking cost, the same
+trade-off `tape send` already makes. A PUT is necessarily stateful across
+many idle-loop iterations instead (one frame arrives at a time), tracked
+in a small `NetfsPutTransfer` held in a `static mut` -- a second,
+concurrent `PUT_REQUEST` while one is already in flight is rejected with
+`BUSY` rather than silently clobbering it. **A fos machine must be
+sitting idle at its own local prompt to serve a NETFS request at all** --
+not inside `chat`, `nic discover`, `term net`, or a running tape's own
+polling loop, all of which keep working exactly as they did before this
+feature and simply do not answer NETFS traffic.
+
+**Accepted shared-buffer collision risk.** NETFS serving reuses the same
+`pmem::TAPE_BASE`/`TAPE_LEN` staging buffer that a locally typed
+`copy`/`tape load` command already uses. Because a PUT transfer can span
+several real seconds across many idle-loop iterations, a local operator
+typing a `copy`/`tape load` command on the *serving* machine at the same
+moment could corrupt both. This is an explicit, documented limitation of
+fos's single-threaded, no-locking design (see `NetfsPutTransfer`'s own
+doc comment in `kernel/src/shell.rs`) -- not something this feature
+guards against, consistent with how little else in this kernel guards
+against concurrent misuse of shared state.
+
+Verified end to end with `tools/test_netfs_e2e.py` (not part of `make
+test`, mirroring `test_hostname_discovery_e2e.py`'s two-guest structure,
+each guest additionally carrying its own blank second disk and the
+prebuilt `calc.bin` tape): a remote GET (`copy HOST:disk2/NAME disk2`), a
+remote PUT (`copy disk1 NAME HOST:disk2`), `tape load HOST NAME`, `tape
+run @HOST:diskN/NAME` (evaluating `3 4 +` through the `calc` tape to
+prove a fetched startup-argument file reaches a real tape), and a clean
+`NOT_FOUND` error for a nonexistent remote file all pass.
+
 ## Deliberately deferred work
 
 - Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
