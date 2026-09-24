@@ -31,6 +31,11 @@ Covers:
      of the current `build/kernel.bin` is installed, ACKed, and actually
      booted (confirmed via the hidden `debug slots` command) after a real
      reset.
+  5. `reboot soft`/`reboot hard`: a soft reboot re-enters the boot loader
+     without ever resetting the CPU and still reports real memory/finds
+     the NIC afterward (a direct regression check for the two soft-
+     reboot-only bugs fixed and documented in AGENTS.md); `reboot hard`
+     performs the same hardware reset `reset` does.
 """
 
 import os
@@ -256,6 +261,74 @@ def test_crash_loop_guard(tmp_dir: Path) -> None:
         guest.terminate()
 
 
+def test_reboot_soft(tmp_dir: Path) -> None:
+    """`reboot`/`reboot soft` (`kernel/src/reboot.rs`) warm-restarts by
+    jumping straight back into `boot/stage2.S`'s own `_start`, with no
+    hardware CPU reset at all. Confirmed here the same way
+    `tools/test_reset_e2e.py` confirms the hardware `reset` path: stage
+    two's own boot banner reappears a second time on this one continuous
+    serial stream, followed by a fresh, working shell prompt -- exactly
+    the scenario the two soft-reboot-only bugs documented in AGENTS.md
+    (stale KUP slot-LBA constants, and `collect_memory_map`'s partial
+    `%ebp` clear) were both found and fixed against."""
+    image_path = tmp_dir / "reboot-soft.img"
+    build_image(image_path, None)
+    guest = SerialGuest(image_path)
+    try:
+        guest.read_until(b"fos> ", 15)
+        if guest.output.count(b"FOS stage 2: real mode active.") != 1:
+            raise SystemExit(
+                f"expected exactly one boot banner before 'reboot soft':\n{guest.output.decode('utf-8', 'replace')}"
+            )
+        if b"Physical memory: 0 frames" in guest.output:
+            raise SystemExit("first boot already reported zero memory frames; test fixture is broken")
+        checkpoint = len(guest.output)
+        guest.process.stdin.write(b"reboot soft\r\n")
+        guest.process.stdin.flush()
+        guest.read_until(
+            b"Soft-rebooting: re-entering the boot loader without a hardware reset...", 5, checkpoint
+        )
+        guest.read_until(b"FOS stage 2: real mode active.", 15, checkpoint)
+        guest.read_until(b"Kernel: protected-mode Rust entry reached.", 15, checkpoint)
+        result = guest.read_until(b"fos> ", 10, checkpoint)
+        # Regression check for the E820 %ebp bug specifically: a soft
+        # reboot must still report real, nonzero tracked memory, not
+        # silently regress into the "0 frames" symptom that bug produced.
+        # (`SerialGuest` runs with `-nic none`, so there is deliberately no
+        # NIC-detection check here -- that half of the original bug's
+        # symptom is instead covered by `test_kup_good_update`'s NetGuest
+        # scenario, which already exercises a soft reboot with a real NIC
+        # attached and would fail its own later `debug slots` check if the
+        # NIC/pmem state came back corrupted.)
+        if b"Physical memory: 0 frames" in result:
+            raise SystemExit(f"soft reboot reported zero memory frames:\n{result.decode('utf-8', 'replace')}")
+        print("PASS: 'reboot soft' re-enters the boot loader (no hardware reset) and reaches a working prompt.")
+    finally:
+        guest.terminate()
+
+
+def test_reboot_hard(tmp_dir: Path) -> None:
+    """`reboot hard` is documented as an explicit alias for `reset`'s
+    8042 keyboard-controller pulse reset; confirm the two-word form
+    actually dispatches to that same hardware-reset path (not, say,
+    silently falling through to a no-op or the soft-reboot path)."""
+    image_path = tmp_dir / "reboot-hard.img"
+    build_image(image_path, None)
+    guest = SerialGuest(image_path)
+    try:
+        guest.read_until(b"fos> ", 15)
+        checkpoint = len(guest.output)
+        guest.process.stdin.write(b"reboot hard\r\n")
+        guest.process.stdin.flush()
+        guest.read_until(b"Resetting the machine now (8042 keyboard-controller pulse reset)...", 5, checkpoint)
+        guest.read_until(b"FOS stage 2: real mode active.", 15, checkpoint)
+        guest.read_until(b"Kernel: protected-mode Rust entry reached.", 15, checkpoint)
+        guest.read_until(b"fos> ", 10, checkpoint)
+        print("PASS: 'reboot hard' performs the same hardware reset as 'reset'.")
+    finally:
+        guest.terminate()
+
+
 class NetGuest:
     """A QEMU guest with a real NIC on the shared multicast netdev, for
     the KUP scenarios. Reaching KUP's own idle-loop-only service point
@@ -419,6 +492,8 @@ def main() -> None:
         test_crash_reboot(tmp_dir)
         test_crash_halts_by_default(tmp_dir)
         test_crash_loop_guard(tmp_dir)
+        test_reboot_soft(tmp_dir)
+        test_reboot_hard(tmp_dir)
         test_kup_disabled_by_default(tmp_dir)
         test_kup_bad_checksum(tmp_dir, kup_debug_text)
         test_kup_good_update(tmp_dir, kup_debug_text)
