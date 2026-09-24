@@ -1,0 +1,1521 @@
+# History: assorted development investigations and bug postmortems
+
+This file collects several detailed, chronological development notes moved
+out of `AGENTS.md` to keep that file within its size budget. Each section
+below is otherwise unedited from its original place in `AGENTS.md`.
+
+## Two soft-reboot bugs found and fixed during development
+
+#### Two soft-reboot bugs found and fixed during development, neither ever hit by a hardware reset
+
+Soft reboot is a fundamentally new code path: it is the first time
+`boot/stage2.S`'s real-mode boot sequence has ever run on a CPU that
+*wasn't* freshly reset by BIOS POST moments before. Both bugs below are
+exactly the class of surprise that predicts -- each one was invisible to
+every existing test and to a hardware reset, and surfaced only because a
+soft reboot leaves behind state (on disk, or in a CPU register) that a
+real reset always wipes clean.
+
+- **Stale slot-LBA/sector-count constants caused KUP to write a new
+  kernel to the wrong disk location.** `kernel/src/debug.rs`'s
+  `SLOT1_LBA`/`SLOT_SECTORS` constants are a copy of values
+  `tools/write_layout.py` also computes and are meant to move together
+  with it (see "Low-memory map"/A-B slot documentation for every other
+  constant already known to need this) -- but this fifth location was
+  missed when a past `KERNEL_RESERVED_END` growth (`0x60000` -> `0x70000`
+  for ES1370 ADC support) updated `linker.ld`/`pmem.rs`/
+  `write_layout.py`/`write_netrom_layout.py` together. The stale values
+  (`SLOT1_LBA=2721`, `SLOT_SECTORS=640`, versus the current, correct
+  `SLOT1_LBA=2849`, `SLOT_SECTORS=768`) meant `install_kernel_update`
+  wrote a freshly pushed kernel image to the wrong LBA, while
+  `select_kernel_slot` (using the current, correct constants baked into
+  `build/layout.inc`) read the *right* LBA on the next boot -- landing on
+  a stale, unrelated 128-sector region and executing whatever garbage
+  bytes were there as code, producing a wild `#UD` a few instructions in.
+  This was invisible to every pre-existing test because nothing before
+  soft reboot ever exercised the very first KUP-installed-kernel boot in
+  a way that also depended on `debug.rs`'s own copy of these constants
+  being correct -- a hardware-reset-only KUP flow happened to never
+  actually be run end-to-end with a genuinely mismatched value until this
+  feature's own test coverage did. Fixed by correcting both constants and
+  expanding `debug.rs`'s doc comment to explicitly document this as a
+  fifth location that must be kept in sync, with the exact recipe
+  (`python3 tools/write_layout.py --kernel build/kernel.bin --output
+  /dev/stdout`) for recomputing them.
+- **`collect_memory_map` cleared only the low 16 bits of `%ebp`, so a
+  soft reboot's leftover register garbage made the E820 loop believe it
+  was already done.** `boot/stage2.S`'s E820 collection loop used
+  `xorw %bp, %bp` to zero its region counter, but then compared and
+  stored using the full 32-bit `%ebp` (`cmpl $MAX_MEMORY_REGIONS, %ebp`,
+  `movw %bp, BOOT_INFO + 10`). On a genuine BIOS cold boot this worked by
+  incidental luck -- POST happens to leave `%ebp`'s upper 16 bits zero --
+  but a soft reboot never resets the CPU at all: it is the same running
+  processor jumping back into real mode from the still-executing 32-bit
+  Rust kernel, which leaves `%ebp` holding whatever 32-bit stack-frame-
+  pointer-sized value it was last using. The 32-bit comparison then saw a
+  garbage value already `>= MAX_MEMORY_REGIONS` (32) on the very first
+  loop iteration, exiting immediately and storing a region count of 0 (the
+  low 16 bits were still correctly zero) -- producing exactly the observed
+  `Physical memory: 0 frames (0 KiB) tracked above 0x70000` on every boot
+  following a soft reboot, and, once `pmem`'s allocator had nothing to
+  hand out, a cascading `No supported Ethernet controller found on the
+  PCI bus.` once NIC driver initialization's own DMA-buffer allocation
+  failed too -- one root cause producing two seemingly unrelated
+  symptoms. Fixed by changing `xorw %bp, %bp` to `xorl %ebp, %ebp` so the
+  full register is genuinely zeroed before the loop begins. Both bugs
+  were caught by `tools/test_debug_mode_e2e.py`'s KUP-then-soft-reboot
+  scenario, confirming the value of that test covering the exact
+  code path (a real KUP install followed by an in-process soft reboot,
+  not just a hardware-reset boot) most likely to expose this whole class
+  of "assumes cold-boot register/state cleanliness" bug.
+
+**A QEMU HMP debugging note from this investigation, worth keeping for
+future monitor-driven repro scripts**: QEMU 10.2.1's `pmemsave` HMP
+command requires the destination filename argument to be quoted if it
+contains a `/` (e.g. `pmemsave 0x100000 4096 "/tmp/some/path.bin"`) --
+an unquoted path with a slash is silently misparsed. Draining a QEMU
+monitor UNIX-socket connection also needs a loop, not a single `recv()`
+call, since a reply can arrive across more than one TCP/socket read.
+
+`vga` shows the current and available local modes, and changes the mode when
+an argument is supplied; it clears the framebuffer after a change. `d` and
+`80x25` select the default mode. `80x25` is
+the BIOS-compatible default, `80x50` uses the VGA 8x8-font mode, and `132x25`
+uses experimental extended horizontal timing that is not guaranteed on every
+VGA adapter or monitor. Serial and `term net` output are unchanged; existing
+tapes continue to print through the kernel console callback.
+
+Interrupt/memory commands: `ticks`, `uptime`, `irqstat`, `pmem`, `palloc`, and
+`pfree ADDRESS`.
+
+Storage commands: `diskinfo [diskN]`, `readsector [diskN] LBA`,
+`format [diskN]`, `ls [diskN]`, `cat [diskN] NAME`, `write [diskN] NAME
+TEXT`, `rm [diskN] NAME`, and `copy SRC_DISK NAME DST_DISK [NEW_NAME]`;
+FOSFS is flat and supports contiguous multi-sector files. `disk1` (the boot
+disk) is always the default and may be omitted; `disk2`, `disk3`, ... address
+up to three additional BIOS hard-disk-range drives discovered at boot (see
+"A second (non-boot) disk for config/log storage" below), each a flat,
+unpartitioned FOSFS volume. `copy` is the one exception to `disk1`'s default:
+since it moves a file between two disks, both `SRC_DISK` and `DST_DISK` must
+be spelled out explicitly, never assumed. It stages the whole file through
+the same shared `pmem::TAPE_BASE`/`TAPE_LEN` buffer `tape load disk`/`tape
+load net` already use (see "Tapes: fixed load address..." below) rather than
+adding a second large static buffer, and invalidates (and reports) any
+previously loaded tape's now-stale bookkeeping afterward, since that buffer
+no longer holds that tape's bytes.
+
+Tape commands: `tape status`, `tape load disk NAME`, `tape load net`,
+`tape save [diskN] NAME`, `tape send NAME PEER_MAC|PEER_NUMBER`, and
+`tape run [ARGS...]`. Tapes are validated ELF32 `ET_EXEC` images or legacy
+raw-flat binaries loaded into the fixed 4 MiB image region; `tape run`
+supplies the append-only kernel callback ABI described below. `tape save`
+writes whatever tape is currently resident (loaded via `disk`, `net`, or
+even a prior `save`) back out to FOSFS unchanged -- the missing
+counterpart to `tape load net`, which previously had no way to persist a
+tape received over the network; a fresh transfer was the only way to run
+it again after a reboot. It reads directly out of the loaded tape's own
+buffer (`tape_get()`) via an ordinary `fosfs::write`, so -- unlike
+`copy`, which stages through the same buffer as scratch space and always
+invalidates whatever was loaded there -- the currently loaded tape's own
+bookkeeping is left untouched and `tape run` keeps working immediately
+afterward.
+
+Serial commands: `serial` (lists COM1..COM4 via the BIOS Data Area, plus any
+PCI-discovered serial controllers as `PCI0`, `PCI1`, ...) and
+`term [COM1|COM2|COM3|COM4|PCI0|PCI1|...] [BAUD]` (raw terminal pass-through;
+F12 exits).
+
+Printer commands: `printer` (lists LPT1..LPT4 via the BIOS Data Area),
+`term printer|LPT1|...|LPT4` (teletype-style live printer terminal; F12
+exits, F2 abandons the line being typed and starts a fresh one), and
+`print [diskN] NAME`/`print run
+CMD...` (print a file, or a command's own output, to the first detected
+LPT port).
+
+`readsector` is read-only. `hexdump` is limited to the reserved kernel range
+and at most 128 bytes. FOSFS names are limited to 16 lowercase alphanumeric or
+`.`, `_`, and `-` characters. The fixed command buffer and contiguous
+multi-sector file layout are intentional teaching constraints; the shell's
+interactive command line is capped at 256 characters.
+
+`term` defaults to COM1, reusing the same port most physical machines
+already have rather than requiring a second UART. While active on a given
+port, that port is exclusively the remote link: PS/2 keystrokes go out with
+no local echo, and incoming bytes are shown via VGA only
+(`console::write_vga_only`, which intentionally skips serial mirroring to
+avoid retransmitting incoming bytes back over the same wire). The escape
+key is F12 (scan code `0x58`) -- not a Shift/AltGr/Ctrl combination --
+because function keys are layout-independent, satisfying keyboards (e.g.
+Nordic) where such combinations are ambiguous or reserved. A serial-only fos
+session loses its control channel upon entering `term` on COM1; this is a
+documented, intentional trade-off.
+
+`term COM2`/`COM3`/`COM4` (`console::Uart`, detected via `console::detect_ports`
+reading the BIOS Data Area at physical `0x400`) accept an optional custom
+`BAUD` argument, since those ports are never shared with the interactive
+shell. COM1's baud rate is deliberately kept fixed at 115200 -- it is the
+same port the shell itself may already be driven over, so changing its rate
+mid-session would desync any attached terminal program. A requested `BAUD`
+must evenly divide `console::UART_CLOCK` (115200) so the exact rate is
+programmed rather than rounded; `term` reports and rejects invalid rates or
+undetected ports rather than silently misconfiguring the link.
+
+`term PCI0`/`PCI1`/... work the same way as COM2-4, but their I/O address
+comes from `console::detect_pci_ports` (`kernel/src/pci.rs`) walking PCI
+configuration space (Mechanism #1, ports `0xcf8`/`0xcfc`) for class `0x07`
+subclass `0x00` ("simple communication controller" / "serial") devices and
+reading each one's BAR0. This is not registered in the BIOS Data Area, so it
+needs its own lookup, separate from `detect_ports`. Legacy ISA serial cards
+need no such lookup: jumpered to a standard COM address, BIOS POST
+enumerates them exactly like an onboard port, so they already appear via
+`detect_ports`. `pci.rs` only implements enough PCI to serve this one
+purpose (no bridges, no memory-mapped BARs, no other device classes) and
+treats each matching PCI function as exactly one port, so multi-port cards
+that multiplex several UARTs behind one BAR at internal offsets are not
+specially decoded. Native USB (and thus USB-to-serial adapters) remains out
+of scope; see "Deliberately deferred work" below.
+
+Ethernet commands: `nic` (active status; initializes every supported backend
+on first use, currently RTL8139, 3C905, or Intel e1000), `nic list`,
+`nic use N`, `nic send` (one raw broadcast test frame), `nic recv`
+(polls briefly for one incoming frame and hex-dumps it), `nic sniff`
+(promiscuous-mode capture of every frame seen, until F12 stops it),
+`nic discover`/`nic peers` (broadcast/list a numbered address book of other
+listening fos machines), `chat [PEER_MAC|PEER_NUMBER]` (line-based
+broadcast or unicast text chat; see below), and `term net` (a full remote
+shell over Ethernet; see below).
+
+`nic` is backed by the common `kernel/src/nic.rs` facade, which initializes
+every polling backend instance that succeeds: `rtl8139.rs` for the
+QEMU-default Realtek RTL8139, `threecom.rs` for selected PCI 3C905/B/C
+variants, or `e1000.rs` for Intel's QEMU 82540EM model. The first
+initialized interface remains active by default; `nic list` and `nic use N`
+select the shell's active interface. Each card is found by exact vendor/device
+ID through `pci::find_devices` because NIC register layouts are
+vendor-specific. The 3C905 path uses the card's windowed command interface
+and bus-master descriptor lists; it is not emulated by the installed QEMU
+build and needs physical validation. The e1000 path uses a 32-bit memory BAR
+and legacy descriptor rings; QEMU coverage makes it the first Intel backend
+suitable for automated testing. PCI helpers enable the address-space type
+required by each backend and bus mastering.
+
+The 3C905 transmit descriptor's first word is revision-sensitive: original
+905 cards use the packet length, while 905B/C cards require the transmit
+indication and roundup-defeat flags. `threecom.rs` identifies that revision
+from the PCI device ID and keeps transmit polling bounded, so a missing link
+must not strand a polling bridge in a long wait.
+
+The driver polls status registers rather than using the card's interrupt
+line -- consistent with `interrupts.rs` leaving every IRQ but the timer and
+keyboard masked at the PIC -- and asks `pmem` for real physical frames for
+its DMA buffers rather than using `static` kernel memory, since a receive
+ring large enough to be useful would not fit in the kernel's small reserved
+low-memory region (`linker.ld`). Its receive ring must be one physically
+contiguous block, which single-frame-at-a-time `pmem::allocate` cannot
+guarantee, hence `pmem::allocate_contiguous` (this project's first caller to
+need more than one contiguous frame). There is no protocol above raw
+Ethernet frames (no ARP, no IPv4, no sockets) and no support for additional
+NIC families beyond the RTL8139, selected 3C905 PCI backends, Intel e1000,
+and NE2000-compatible clones (see "NE2000-compatible PCI clones" below);
+3C509 ISA and e1000e/82574 support are separate future drivers.
+
+
+
+## Intel I350 support: scaffolded, not yet enabled (full detail)
+
+### Intel I350 support: scaffolded, not yet enabled
+
+`kernel/src/i350.rs` is a fifth NIC backend, structurally mirroring
+`e1000.rs`'s driver shape (the same descriptor structs and
+reset/configure/send/receive/watchdog pattern) but for Intel's I350
+("Powerville") PCIe Gigabit Ethernet controller family -- a genuinely
+different, newer chip generation than the `82540EM` QEMU emulates as
+`e1000` (in Linux driver terms, I350 belongs to the `igb` family, not
+`e1000`/`e1000e`). It was added in preparation for a physical dual-port
+card (chip-marked `NHI350AM4 S621J51C 1621`, identified by its markings as
+an I350 board with only 2 of the chip's 4 ports wired out) whose exact PCI
+device ID had not yet been confirmed at the time this module was written
+-- the owner's second card was offsite and its ID needed reading from a
+different machine.
+
+Three real register-layout differences from `e1000.rs`, documented in
+`i350.rs`'s own doc comments as "unverified against real hardware,
+best-effort transcription from the public 82576/82580/I350 register map,
+same as Linux's `igb` driver" (mirroring this project's usual "flag it as
+speculative until physical hardware proves or disproves it" convention --
+see "Real hardware notes" below):
+
+- Interrupt registers (`ICR`/`IMS`/`IMC`) moved from `0x00c0`/`0x00d0`/
+  `0x00d8` to `0x1500`/`0x1508`/`0x150c`.
+- Ring registers became per-queue arrays; queue 0 lives at `0xc000` (Rx) /
+  `0xe000` (Tx) instead of the fixed `0x2800`/`0x3800` 82540EM uses, and
+  needs an explicit `RXDCTL0`/`TXDCTL0` (`0xc028`/`0xe028`) "queue enable"
+  bit (`1<<25`) set before the ring is considered live -- a step 82540EM
+  never required.
+- A `SWSM` (`0x5b50`)/`SW_FW_SYNC` (`0x5b5c`) software/firmware semaphore
+  handshake (`acquire_swfw_sync`/`release_swfw_sync`) is needed before
+  touching the PHY, to arbitrate with resident management firmware
+  (AMT/ME) that I350 boards often carry -- again, not needed on 82540EM.
+
+`i350::CANDIDATE_DEVICE_IDS` is deliberately an empty `&[u16]`: the module
+is fully wired into `nic.rs`'s facade (`Nic::I350`, every match arm, and
+`initialize()`'s backend loop) and compiles as ordinary, complete code, but
+with no device IDs to match it can never actually claim a PCI device, so
+`nic`/`nic list`/`pci` behave identically to before this module existed.
+This is deliberate, not an oversight: `0x1520` is the I350 **Virtual
+Function** (SR-IOV) device ID, with a completely different, mailbox-based
+register interface that has no direct PHY/link access at all -- silently
+matching it alongside a real physical-function ID would hang or corrupt
+state, so no ID is enabled at all until the real card's own ID is read
+back (e.g. via the new `pci` command above, or `lspci -nn` on a machine
+that already has a working driver for it) and confirmed to be a physical
+function, not this one. Enabling support for every plausible I350 sibling
+ID at once was considered and rejected for the same reason: fiber/
+backplane variants skip copper-PHY autonegotiation entirely, and treating
+them identically to a copper port's link-bring-up sequence could hang
+indefinitely waiting on a link state that variant will never report the
+same way. The intended path is to add only the one confirmed, physically
+tested ID first, then broaden deliberately to sibling copper IDs only once
+each has actually been tested against real hardware -- never as a
+speculative batch.
+
+Like the 3C509 investigation and I350's own complete absence from QEMU
+(`-device help` lists no I350 model at all, unlike RTL8139/82540EM/
+NE2000), this is a standing, permanent real-hardware-only testing cost for
+every future iteration on this driver, not a one-time bring-up expense --
+see "ISA bus support and the 3C509" under "Deliberately deferred work"
+below for the same tradeoff discussed at length for a different card.
+
+Scaffolding this module alone (with no device IDs enabled, and therefore
+no runtime behavior change at all) pushed `__kernel_end` past the
+previous `0x50000` reserved-region ceiling, to `0x51fb4` -- the module's
+own static per-instance storage (`i350::NICS`, sized like `e1000::NICS`)
+and its driver code are linked into `kernel.bin` unconditionally,
+regardless of whether `CANDIDATE_DEVICE_IDS` ever matches anything at
+runtime. This required growing the reserved region again, to `0x60000`;
+see the paragraph on that growth history further below.
+
+`tapes/primes.S` is a worked, non-trivial test tape: a
+Sieve-of-Eratosthenes prime counter up to 1,000,000, assembled the same
+way as `boot/stage1.S`/`boot/stage2.S` (`as --32` then `objcopy -O
+binary`, via the new `make tape-primes` target -- entirely separate from
+`make image`/`run`/`test`) rather than compiled by `kernel/`'s own Cargo
+build. Unlike the throwaway one-byte `0xc3` tape used to validate `tape`
+itself, this one has real data (a 1,000,000-byte sieve array). It remains
+genuinely position-independent as a teaching example, using the classic
+`call get_base` / `pop %ebx` idiom and base-relative labels, although the
+fixed tape address means that PIC is no longer required. The sieve array is
+embedded as literal zero-filled space (`.fill N, 1, 0`) directly in the file,
+which is why the assembled binary is roughly a megabyte. It prints through
+the kernel's `putc` callback, so the normal VGA, serial, and `term net`
+relay paths handle output; it measures elapsed time with a raw `rdtsc`
+(reported as uncalibrated CPU cycles, not wall-clock time). The large image
+is sent over the network in ~1000 chunks by `tools/send_tape.py`; FOSFS3
+supports contiguous multi-sector files, so its preloaded copy is not limited
+to one 512-byte sector. That is what lets this be checked end-to-end by a
+disposable
+serial-driven test harness (`tapes/test_primes_e2e.py`, a QEMU
+multicast-netdev-based script in the same spirit as the one used to
+validate `tape` itself) instead of needing a screen-capture/OCR pipeline
+just for this one tape. It also saves and restores `%ebx`/`%esi`/`%edi`/
+`%ebp` around its own body, since `tape_run` calls it as a plain
+`extern "C" fn()` (cdecl), which requires those callee-saved registers to
+come back exactly as they went in.
+
+An earlier version of this tape's hand-rolled `print_char` tracked
+`cursor_pos` as a flat `row*80 + col` offset but never checked it against
+the 80x25 (2000-cell) screen, unlike `console.rs`'s own `newline()`. A
+fresh QEMU boot happens to leave the cursor well within the visible
+screen before `tape run`, so `test_primes_e2e.py` never caught this, but
+real hardware's longer/different boot narration (or simply more commands
+typed first) can easily leave the cursor already near the bottom row --
+and on real hardware this tape's whole three-line summary silently
+scrolled off into unaddressed-but-still-writable VGA memory and was never
+seen at all, with the very next kernel-printed line afterward
+(`Tape returned; back at the fos shell.`) then landing corrupted too,
+since `tape_run`'s `console::resync_cursor()` inherited the tape's
+now-out-of-range hardware cursor position. The fix mirrors
+`console.rs`'s scroll logic in assembly: once a `'\n'` or an implicit
+column-80 wrap would push `cursor_pos` to `VGA_WIDTH * VGA_HEIGHT`, a new
+`print_char_scroll` routine `rep movsw`s every row but the first up by
+one, `rep stosw`s the newly-exposed last row blank, and resets
+`cursor_pos` to the start of that last row before the existing
+CRTC-cursor-update code runs.
+
+A second, unrelated bug surfaced immediately after fixing the first one:
+with scrolling fixed, real hardware showed the three summary *labels*
+("primes found:", "largest prime:", "elapsed:") but every digit was
+missing. `print_decimal` was briefly repurposing `%ebx` -- this whole
+file's PIC load-base register, on which every `print_char` call depends
+to find `cursor_pos` (`(cursor_pos - get_base)(%ebx)`) -- as its own
+pushed-digit counter across the very `call print_char` it makes per
+digit. `serial_putc` is called unconditionally at the very top of
+`print_char`, before any VGA/cursor work, so the COM1 mirror byte for
+each digit was always correct regardless; only the on-screen VGA
+placement broke, landing wherever `cursor_pos - get_base + <bogus small
+counter value>` happened to point instead of the real cursor. This is
+exactly why a serial-only test could never have caught either bug:
+`tapes/test_primes_e2e.py` only reads QEMU's `-serial stdio`
+stream, which both bugs left completely untouched. The fix was simply to
+have `print_decimal` use `%edi` (free at every call site, and already
+proven safe to hold across `print_char` -- `print_char_scroll` itself
+saves/restores it) as its digit counter instead of `%ebx`.
+
+Because both of these were VGA-only bugs invisible to the existing
+serial-based test, `tapes/test_primes_vga_e2e.py` was added
+alongside it: it runs the same tape-send/tape-run sequence but reads the
+tape's actual summary back out of the live VGA text framebuffer
+(physical `0xb8000`) via the QEMU monitor's `pmemsave`, exposed over a
+throwaway local Unix socket (`-monitor unix:...`, since `-serial stdio`
+already owns stdio). Anyone touching `print_char`/`print_decimal`/cursor
+handling in `primes.S` should run this test, not just the serial-based
+one, since only it actually checks what the tape's real screen would
+show.
+
+
+
+## A physical printer port (full detail)
+
+### A physical printer port
+
+`kernel/src/parallel.rs` is a new, deliberately narrow legacy-ISA
+parallel/Centronics port driver, discovered via the BIOS Data Area
+(`0x408`-`0x40E`, LPT1..LPT4) the same way `console::detect_ports` finds
+COM1..COM4 -- there is no PCI parallel-card discovery to mirror
+`console::detect_pci_ports`, matching this project's existing "ISA only,
+PCI parallel cards out of scope" convention already established for the
+3C509 investigation. It implements only the original IBM PC "SPP"
+(Standard Parallel Port) register set -- Data/Status/Control at
+`base+0`/`+1`/`+2` -- with no bidirectional/EPP/ECP modes. `Printer::
+write_byte` writes a byte, pulses Strobe, and polls the Busy status bit
+for up to `BUSY_POLL_ATTEMPTS` (200,000) reads before giving up and
+reporting a `PrinterFault` (`NotSelected`/`PaperOut`/`ErrorLine`/`Busy`)
+rather than blocking forever -- the same bounded-poll-then-caller-retries
+shape every other polling loop in this kernel already follows.
+
+**Status/control bit polarity is an explicit, documented real-hardware
+caveat**, exactly the same class of risk as the RTL8139's TCR
+interframe-gap field and CR/RCR/TCR write-order surprises (see "Real
+hardware notes" below): several Centronics signals (`nBusy`, `nAck`,
+`nError`) are active-low on the physical cable, and different references
+disagree on exactly how an ISA bus buffer presents them back to software.
+The polarities implemented follow the most commonly cited convention
+(matching Linux's historic `parport_pc`/`lp` driver headers) but have
+only been checked against QEMU's `-parallel` emulation, not a real
+Centronics cable -- `kernel/src/parallel.rs`'s own module doc comment
+flags this prominently. The user's physical Panasonic KX-P1083 dot-matrix
+printer is the intended real-hardware validation target; until that
+happens, treat the fault classification (which bit means what) as
+unconfirmed.
+
+**Real-hardware follow-up: a false "Printer out of paper" report, resolved
+by a BIOS parallel-port fix.** The user's KX-P1083 reported "out of
+paper" with paper loaded, the printer online, and its own out-of-paper
+indicator light off. A first theory -- that the printer's DIP-switch-
+selected emulation mode (IBM Proprinter vs. Standard/Epson-compatible)
+changes how the Paper-Out *status line* is driven -- turned out to be the
+wrong lead on reflection and has been retracted: emulation mode governs
+how a printer's firmware interprets incoming escape codes for text
+formatting, not how its hardware drives the Centronics status signals
+back to the host, which come directly from a physical paper sensor.
+
+Rather than guess again, `printer` was extended to print each detected
+port's raw status byte plus a per-bit decode
+(`status=0xNN: busy=B paper_out=P select=S error=E`), so the exact
+real-hardware register value could be read directly instead of inferred.
+Real hardware showed `status=0xff` -- literally every bit set, including
+ones that should reflect a genuine "ready, selected, no error" printer.
+That is the signature of a status register not backed by real hardware at
+all, not a single mis-wired polarity bit in this driver. The actual cause
+was a dead CMOS battery that had disabled/reset the BIOS parallel port
+configuration entirely; setting it back to base `0x378` + Normal (SPP)
+mode (not ECP, which repurposes the register layout this driver assumes,
+and not Bi-Directional, which is unneeded since this driver never reads
+the Data port back) resolved it -- confirmed by the printer working
+correctly afterward. This driver's status-bit polarity constants remain
+otherwise unconfirmed against real hardware, since this particular bug
+turned out to be a hardware/BIOS configuration issue, not a software one.
+
+`shell.rs` adds `term printer`/`term LPT1`..`LPT4` (an exclusive terminal
+mode, mirroring `term COM1`/`term_net`'s existing "one active mode at a
+time" convention) and a `print` command pair (`print [diskN] NAME`,
+`print run CMD...`), on top of two new pieces of shared plumbing:
+
+- **`keyboard.rs` gained a sixth recognized key, F2 (`KILL_LINE_SCANCODE`
+  = `0x3c`, `KeyEvent::KillLine`)**, chosen for the same reason F12 was
+  originally chosen (a function key is layout-independent, unlike a
+  Shift/AltGr-modified character a Nordic keyboard might put somewhere
+  unexpected) -- this avoided adding Ctrl-modifier tracking to the
+  keyboard driver, which does not exist at all today. It means "discard
+  the line I'm typing" only inside `term_printer`'s own typing loop;
+  every other blocking loop in this kernel (`term_loop`,
+  `combined_tape_read_key`, `nic sniff`, `nic discover`, `tape_load_net`,
+  `chat_command`) either already has a catch-all match arm or was given
+  one, so adding this variant needed no behavior change anywhere else.
+- **`console.rs` gained a second, fully independent relay queue**
+  (`PRINT_RELAY_QUEUE`/`enable_print_relay`/`disable_print_relay`/
+  `print_relay_active`/`peek_print_relay`/`discard_print_relay`),
+  structurally identical to the existing network relay queue
+  (peek/discard rather than drain, so a fault mid-print never silently
+  loses a byte that was already "read" from the queue but not yet
+  accepted by the printer) and fed from the exact same single tap point,
+  `relay_push` (called from `write_serial`) -- generalized to feed both
+  queues unconditionally, so any command's ordinary `println!`/`print!`
+  output is captured for the printer automatically, with no per-call-site
+  instrumentation needed. `print_relay_push_raw` bypasses this tap
+  entirely (queuing raw bytes with no VGA echo of its own); it remains in
+  use only by `print_file`, which queues a whole file's raw contents this
+  way rather than routing them through `println!`.
+
+**Typed input is echoed live, teletype style, not buffered until
+Enter.** Unlike the original design (buffer locally, echo to VGA only,
+and queue nothing for the printer until Enter commits the line),
+`term_printer` now writes every typed character to the physical printer
+the instant it is typed -- via a new `shell::write_to_printer_with_retry`/
+`print_bytes_live` pair, not the print-relay queue -- exactly mirroring
+`term_net`'s own live, byte-at-a-time echo, just to a printer instead of a
+network peer. This was a deliberate reversal of the earlier design once
+real-hardware testing showed the buffered approach didn't read as a
+teletype at all: a real teletype/telex terminal always inks a character
+the instant a key is struck, with no "not yet committed" state. F2
+(`KeyEvent::KillLine`) can therefore no longer act as a genuine undo --
+already-inked characters cannot be un-printed -- so it instead just
+abandons the local input buffer (clearing the on-screen echo the same way
+as before) and prints a fresh `"\r\n" + "fos> "` break to the paper,
+mirroring how a real teletype operator would simply start a fresh line
+after a visible mistake rather than pretend it never happened. Backspace
+remains screen/buffer-only and is still never itself sent to the printer,
+so backspacing over an already-printed character leaves that character
+visible on the physical paper -- an intentional, documented limitation of
+live echo, not a bug. Enter still triggers the same enable-queue-execute-
+drain-disable cycle as before for a committed command's own *output*
+(unchanged, since that output is only known once the command actually
+runs) -- only the typed input side changed. One `last_fault:
+Option<PrinterFault>` variable is now held for an entire `term_printer`
+session and threaded through both the live per-character writes and
+`drain_print_relay` (whose signature grew a matching `&mut
+Option<PrinterFault>` parameter), so an ongoing fault is reported once
+across the whole session rather than being re-announced the moment
+output-draining begins right after a fault was already being reported
+during typing.
+
+**`help` refuses to run while `PRINTER_SESSION_ACTIVE`** (a small flag
+set only for the duration of a `term_printer` session's own `execute`
+call), to avoid a full-screen listing burning a whole sheet of paper by
+habit -- the user should consult the manual instead for routine reference.
+`print run help` is a deliberate, always-available exception: `print_run`
+temporarily clears `PRINTER_SESSION_ACTIVE` around its own nested
+`execute` call and restores it afterward, so a genuine one-off paper copy
+of `help` works even when typed from inside an already-active
+`term_printer` session, not only from the ordinary local prompt.
+
+**`print run CMD...`/`print [diskN] NAME` are nesting-aware.** Both were
+originally written assuming they always own the full
+enable-queue-drain-disable cycle themselves, which is correct when either
+is typed at the ordinary local prompt -- but when typed as a command
+*from inside* an already-active `term_printer` session, that session's
+own committed-line flow has already called `enable_print_relay` and
+queued that line's own transcript before `execute` ever reaches
+`print_command`. Naively calling `enable_print_relay` again there resets
+the queue (discarding the transcript still waiting to be drained), and
+draining/disabling independently ends the outer session's print job
+early -- splitting what should be one physical print job (the transcript,
+plus this command's own "Running ...""/output/"Done." messages) into two.
+`console::print_relay_active()` is checked first specifically to detect
+this nesting: when already active, `print_file`/`print_run` only queue
+their own bytes (the file's raw contents, or the command's captured
+output) and leave every bit of enabling, draining, and disabling to the
+outer `term_printer` loop, so it all lands on one continuous piece of
+paper as one job. This was caught by an interactive QEMU-monitor-driven
+manual test (`sendkey`-based, mirroring `tapes/test_vga_colors_e2e.py`'s
+technique) exercising `term printer` -> `print run diskinfo` end to end
+against QEMU's `-parallel file:PATH` emulation, which showed the bug
+directly: only `diskinfo`'s own two output lines reached the captured
+file, with the surrounding transcript and wrapper messages silently
+missing, before this fix.
+
+No automated `make test`-style coverage exists yet for this feature (the
+QEMU `-parallel file:PATH` interactive check above was ad hoc, not a
+committed test script) -- a `make test-printer`-style smoke test using
+that same QEMU flag remains a reasonable follow-up, with the same
+limitation every such test would have: it can prove the happy-path byte
+sequence but not the real Busy/Select/Error handshake or fault recovery,
+which only a real Centronics cable can exercise. Real-hardware validation
+against the user's Panasonic KX-P1083 is the outstanding confirmation
+step before this feature's fault/polarity assumptions can be considered
+settled, consistent with this project's established pattern for
+hardware-facing features (see "Real hardware notes" below).
+
+**Real-hardware follow-up: dot-matrix printers cannot show true
+character-by-character teletype output.** With the port fixed, live
+per-character echo (above) was confirmed to genuinely reach the printer
+one byte at a time -- but a moving-print-head dot-matrix printer (the
+user's KX-P1083) buffers a full line internally and only physically inks
+it once flushed by CR/LF/FF or an internal buffer limit, so typed
+characters visibly appear only once the line commits, not as each key is
+struck. This is inherent to the printer's own mechanism, not something
+any universal SPP/Centronics command can change; true live
+character-at-a-time inking needs a genuine teletype/TTY or a
+daisy-wheel/typewriter-style printer instead. No code change was made or
+is possible here.
+
+**Real-hardware follow-up: an interactive tape's own output was batched
+until it exited.** `print run tape run` against an interactive,
+`read_key`/`should_abort`-polling tape (e.g. `tapes/calc`'s REPL) showed
+no printed output at all until the tape returned, even though its
+banner/prompts/results were clearly being produced (and echoed to VGA)
+throughout. This is the exact same class of bug already fixed for
+`term_net` (see "Live output relaying for `read_key`/`should_abort`-based
+tapes over `term net`" above): the print-relay queue was only ever
+drained by the outer `print_run`/`term_printer` code, which is paused for
+as long as a nested tape's own blocking call is running -- there was no
+equivalent of `relay_pending_tape_output` for the *print* relay queue.
+
+The fix follows that fix's pattern exactly. Two new statics,
+`ACTIVE_PRINT_BASE`/`ACTIVE_PRINT_FAULT` (`shell.rs`), carry the active
+printer's port and ongoing fault state across the call-stack boundary
+into a nested tape's own polling callbacks, the same reason
+`ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE` exist for `term_net`. A new
+`relay_pending_print_output()` drains whatever the print-relay queue
+currently holds to that printer -- but, unlike `drain_print_relay` (used
+once a command finishes, where blocking retry-until-clear is the correct
+"pause, don't abort" behavior), it never blocks on a fault: it writes
+what it can, stops the instant a fault is hit (reporting it once via
+`ACTIVE_PRINT_FAULT`, exactly like every other fault-reporting path in
+this feature), and leaves the remainder queued for the next poll --
+blocking here would freeze the *tape* itself, not just its printer
+output. It is called from both `combined_tape_should_abort` and
+`poll_remote_tape_input`, so any `read_key`- or `should_abort`-polling
+tape gets live print-relaying automatically, with no per-tape opt-in,
+mirroring exactly how the `term_net` equivalent fix works.
+
+`term_printer` and `print_run` (when `owns_relay` is true, i.e. not
+itself nested inside an already-active `term_printer` session) now set
+`ACTIVE_PRINT_BASE`/reset `ACTIVE_PRINT_FAULT` before running a command
+and clear both afterward, and use a fresh, transient `&mut` into
+`ACTIVE_PRINT_FAULT` (via a new `active_print_fault_mut()` helper using
+`core::ptr::addr_of_mut!`, never a reference held across the nested
+`execute()` call itself) for their own direct
+`print_bytes_live`/`drain_print_relay` calls, rather than each keeping a
+separate local `last_fault` variable -- so a fault surfaced live during a
+running tape is not redundantly re-announced the moment the tape returns
+and ordinary post-`execute()` draining resumes. `print_file` (which never
+calls `execute()`, so no nested tape can run during its own work) keeps
+its own local `last_fault` unchanged, since no cross-call-stack sharing
+is needed there. Verified with a QEMU-monitor-driven manual test
+(`-parallel file:PATH`, `sendkey`-based, in the same spirit as the
+nesting-aware fix's own manual test above): `print run tape run` against
+`tapes/calc` showed its `= 42` result already present in the captured
+print file before F12 ended the tape, confirming the fix (reverting it
+reproduces the batched-until-exit symptom exactly).
+
+
+
+
+## Floppy drive support: investigated, not yet built (full detail)
+
+### Floppy drive support: investigated, not yet built
+
+Raised by the lab team as a possible next storage target. This project's
+entire disk stack -- `boot/stage2.S`'s loader reads and `kernel/src/
+disk.rs`'s BIOS trampoline alike -- is built exclusively around INT 13h's
+*extended* (`AH=42h`) LBA read/write service, and around one fixed drive
+(`boot_drive`, captured from `DL` at boot, always `0x80`+ for a hard disk).
+Real floppy drives are a real complication here, on two independent axes:
+
+- **The BIOS call convention itself differs.** Real BIOS floppy support is
+  legacy CHS (`AH=02h`/`03h` read/write, `AH=08h` get drive
+  parameters/geometry) -- the extended `AH=41h`/`42h` LBA service this
+  project already relies on is a hard-disk-era addition that most real
+  BIOSes do not implement for the floppy drive number (`0x00`/`0x01`) at
+  all. None of `disk.rs`'s existing LBA-based transfer logic could be
+  reused unmodified; a floppy path needs its own CHS conversion and its
+  own bounded-transfer logic (the same "never cross a 64 KiB boundary"
+  discipline `stage2.S`'s multi-transfer kernel load already follows, just
+  derived from CHS geometry instead of LBA math). The real-mode-trampoline
+  *mechanism* itself (`disk::transfer`'s protected-to-real-mode drop, IVT/
+  PIC save-restore, GDT reload) is fully reusable as-is, though -- only the
+  BIOS call semantics change, not the surrounding plumbing.
+- **There is no second-device concept anywhere above the trampoline.**
+  `fosfs.rs` and every disk-facing shell command assume the one boot
+  drive/GPT-discovered partition; adding a floppy would need either a
+  separate, filesystem-agnostic raw command surface (mirroring
+  `readsector`/`hexdump`'s existing pattern, e.g. a new `floppy` namespace)
+  or an actual multi-device parameter threaded through `fosfs.rs` -- the
+  latter is a real, if not huge, refactor of code that has never needed to
+  address more than one device.
+
+Unlike the 3C509 investigation above, QEMU emulates this well
+(`-device help` lists `floppy`/`isa-fdc`, and `-fda` is a standard, widely
+documented QEMU option) -- so, refreshingly, this is one legacy-hardware
+feature that keeps full `make test`-style automated coverage, not a
+permanent real-hardware-only cost.
+
+**Follow-up scoped to secondary storage only (no floppy boot path), and to
+the lab's actual two physical drives -- a 3.5" 1.44 MB and a 5.25" 360 KB
+unit:**
+
+- **The "two floppy types" concern turns out to be mostly a non-issue.**
+  `AH=08h` (get drive parameters) reports the real, current drive's own
+  geometry (heads/sectors-per-track/cylinders) -- for a 1.44 MB 3.5" drive
+  that is 2 heads x 18 sectors/track x 80 cylinders; for a 360 KB 5.25"
+  drive it is 2 heads x 9 sectors/track x 40 cylinders. A single generic
+  CHS driver that queries this once per drive and caches it, then does
+  ordinary LBA<->CHS math against whatever came back, handles both
+  transparently -- there is no need for two separate code paths, just one
+  path plus a per-drive-number geometry cache. The one real caveat: real
+  BIOS resolves each floppy *drive number* (`0x00`=A:, `0x01`=B:) to a type
+  via CMOS Setup, not by inspecting whatever medium happens to be in the
+  drive at boot -- so this only works cleanly if CMOS is actually
+  configured with drive A as the 1.44 MB type and drive B as the 360 KB
+  type (or vice versa), a one-time BIOS Setup step on that physical
+  machine, not something software here can query and set for itself.
+- **The trampoline needs a drive-number parameter it does not have today.**
+  `disk::transfer`'s Rust-side call into the loader's trampoline only ever
+  passes direction/LBA/buffer; the actual BIOS drive number is baked in on
+  the assembly side, read once from `BOOT_INFO+8` (the boot drive DL
+  captured at boot) and never varied. Adding a second device means
+  extending that call ABI with an explicit drive-number argument (and a
+  CHS-vs-extended mode flag, since the boot disk keeps using `AH=42h`/
+  `43h` while a floppy uses `AH=02h`/`03h`/`08h`), not just adding a new
+  Rust-side wrapper around the existing call.
+- **`disk.rs` itself only needs a modest generalization, not a rewrite.**
+  Today every function (`read_sector`/`write_sector`/`transfer`) implicitly
+  means "the boot disk," using `BootInfo` for both the trampoline address
+  and the sector-count bound. A floppy is a genuinely separate device with
+  its own drive number, its own queried geometry, and its own bound (2880
+  or 720 sectors) that has nothing to do with `BootInfo`'s disk-geometry
+  fields -- so the natural shape is a small, explicit device
+  parameter/enum threaded through these functions (boot disk vs. floppy
+  unit 0/1), not a multi-device abstraction layered underneath every
+  existing call. Because this kernel is single-threaded with no
+  concurrent disk access, the existing single static sector buffer can
+  still be shared sequentially across devices with no locking concerns.
+- **`fosfs.rs` does not need to change at all for this scope.** Since this
+  is secondary storage for raw sector access/education, not a second
+  bootable filesystem, the floppy path can mirror the existing
+  `readsector`/`hexdump` raw-access commands instead of extending FOSFS to
+  understand more than one device. Putting an actual second FOSFS instance
+  on a floppy is a real, separable follow-up (FOSFS's superblock/directory
+  logic would need a device parameter threaded through it too), not part
+  of this scope.
+- **Naming: keep the existing boot-disk commands exactly as they are.**
+  `diskinfo`/`readsector`/`format`/`ls`/`cat`/`write`/`rm` are unprefixed
+  today because there has only ever been one disk; renaming all of them
+  under an explicit `disk` prefix to mirror a new `floppy` namespace would
+  be a disruptive, unforced command-surface break (every existing test
+  script, `start` file, and README passage that already types
+  `readsector`/`ls`/`cat` unprefixed would need updating for no functional
+  gain). The lower-disruption shape mirrors this project's own `nic`/
+  `tape` convention instead: add `floppy` as a wholly new namespace
+  (`floppy status`, `floppy readsector UNIT LBA`, `floppy write UNIT LBA
+  ...`, one/zero-based unit selecting drive A/B) alongside the untouched
+  existing boot-disk commands. A bare `disk` alias that simply forwards to
+  today's existing commands could still be added purely for naming
+  symmetry if wanted, but it is cosmetic, not a functional requirement.
+
+**Accepted UX design** (for this lab's actual two-drive setup; nothing
+below is implemented yet):
+
+```
+floppy                          Show both drives: detected type/geometry, or "not responding"/"no disk"
+floppy readsector [A|B] LBA     Raw sector read + hexdump (unit-scoped readsector clone)
+floppy write [A|B] LBA TEXT     Raw sector write, printable ASCII, zero-padded to 512 bytes
+tape load floppy [A|B] NAME     A third `tape load` source alongside `disk`/`net`
+```
+
+The `[A|B]` unit letter is optional whenever exactly one floppy is
+attached (mirroring `nic`'s own "single interface stays active by default,
+`nic use N` only needed once there is more than one" convention), and
+mandatory -- with a clear, narrated error rather than a silent guess --
+whenever both are. Parsing rule: the first token after the subcommand is
+a unit selector if and only if it case-insensitively equals `A` or `B`;
+otherwise it is the real argument (`LBA`/`NAME`), and the drive is
+inferred, which only succeeds with exactly one floppy present. This works
+because a bare `A`/`B` letter can never also parse as a valid LBA number.
+`tape load floppy NAME` and `tape load floppy A NAME` are unambiguous by
+the same reasoning `readsector`/`write` are: `tape load floppy` never
+takes more than one argument besides an optional unit, so one remaining
+word is always `NAME` and two are always `unit NAME`.
+
+One accepted, undoctored edge case: a FOSFS tape file literally named `A`
+or `B` (single-letter names are technically legal) would collide with the
+unit-letter shorthand on a single-drive machine (`tape load floppy A`
+reads as "drive A, missing NAME"). This is a one-line documented
+limitation -- don't name a floppy tape file a bare `A`/`B` -- not something
+worth solving with extra parsing cleverness, consistent with this
+project's existing preference for small, explained trade-offs (e.g.
+`term`'s COM1 lock-out) over cleverness.
+
+Errors throughout are narrated, matching this project's existing
+"explain the hardware state" convention (`nic`, GDT/PIC messages) rather
+than surfacing a bare BIOS status byte: "no disk in drive," "write-
+protected," "drive not responding," and (for the two-drives-present,
+no-letter-given case) "ambiguous: both drive A: and drive B: are
+attached; specify which one."
+
+A native FDC/8237-DMA driver bypassing BIOS entirely (à la the deferred
+native ATA/AHCI work) was also considered and set aside for the same
+reason ATA/AHCI is deferred: the floppy controller's own timing/DMA/motor
+quirks are a well-known source of fragile, fiddly driver code, and the
+BIOS trampoline this project already leans on for the boot disk sidesteps
+all of it for comparable effort. Booting fos *from* a floppy is a separate,
+larger question again: the current 16 MiB GPT image (with its FOSFS
+partition holding every compiled tape) does not come close to fitting in a
+1.44 MB floppy's 2880 sectors, so that would mean a distinct, trimmed-down
+boot layout in the spirit of `boot/netrom.S`'s own parallel/optional path,
+not a change to the existing `image`/`run`/`test` layout.
+
+
+
+## A second (non-boot) disk for config/log storage (full detail)
+
+### A second (non-boot) disk for config/log storage
+
+Raised by the lab team: their test machines boot from an ordinary USB
+thumb drive, and the actual motivation here is to stop needing to bake
+config into the build (today, e.g., `tapes/router/router.cfg` only
+reaches a running router via `tools/build_image.py --file router.cfg` at
+build time, or the 4096-byte `tape run router @router.cfg` startup-
+argument path) -- a second, persistent, live-editable disk sitting in the
+machine would let config and logs be read/written directly without
+touching the build pipeline or the boot medium at all.
+
+**This is genuinely easier than the floppy work above, and shares most of
+its plumbing.** A second hard disk (BIOS drive `0x81`, `0x82`, ...) needs
+no CHS/geometry translation at all -- real BIOS EDD extensions (`AH=42h`/
+`43h`) work identically for any hard-disk-range drive number, not just the
+boot one. So the one change floppy support already requires --
+parameterizing `disk::transfer`'s trampoline call with an explicit drive
+number, instead of the hardcoded single value read once from `BOOT_INFO+8`
+-- is *all* the register-level work a second disk needs; no new BIOS call
+variant, no per-drive geometry cache.
+
+What is new, specific to a second disk:
+
+- **Discovery.** The boot drive arrives for free via `DL` at boot; nothing
+  else does. A second disk needs to be probed for at kernel init -- try
+  `AH=41h` ("check extensions present") against `0x81`, `0x82`, ... and
+  treat a success response as "this disk exists," then `AH=48h` ("extended
+  read drive parameters") for its sector count.
+- **No GPT/MBR needed on the second disk.** The boot disk's whole MBR +
+  primary/backup-GPT dance (`tools/build_image.py`) exists purely so it can
+  also be a legitimate, standards-compliant *bootable* image. A disk that
+  is never booted from has no such requirement -- it can be a single flat
+  FOSFS volume starting at LBA 0, formatted once (by `format disk2`, see
+  below) and left alone across every later `make image` rebuild of the
+  boot medium, which is the entire point.
+
+**Implemented design: option 2 -- a device argument on the existing FOSFS
+commands, not a parallel command namespace.** `ls`/`cat`/`write`/`rm`/
+`format`/`diskinfo`/`readsector` all gain an optional leading `diskN`
+argument (`disk1` is the boot disk -- what these commands already mean
+today -- `disk2` the first additional disk, `disk3` a third if one is ever
+attached, and so on):
+
+```
+ls [diskN]
+cat [diskN] NAME
+write [diskN] NAME TEXT
+rm [diskN] NAME
+format [diskN]
+diskinfo [diskN]
+readsector [diskN] LBA
+```
+
+Omitting `diskN` keeps meaning exactly what it means today (the boot
+disk) -- every existing script, `start` file, and test stays byte-for-byte
+valid with zero migration cost. This also means `disk1` is never mandatory
+to type; it exists purely so the numbering is uniform and a config/log
+file can unambiguously say "disk2" without also needing a special word for
+"the first one."
+
+Parsing follows the same two rules already established for `floppy`/
+`tape load floppy`: a leading `diskN` token is recognized as a device
+selector only when it matches that strict pattern *and* names a disk that
+is actually attached (never guessed); and for commands that take exactly
+one further argument (`cat NAME`, `rm NAME`, `readsector LBA`), remaining-
+word count disambiguates `NAME`-only from `diskN NAME` the same way `tape
+load floppy NAME`/`tape load floppy A NAME` already do. The same class of
+accepted edge case applies too: a FOSFS file literally named `DISK2` (a
+syntactically legal name) would collide with the selector once a second
+disk is actually attached -- another one-line documented limitation, not
+worth solving with cleverness, consistent with the floppy `A`/`B` case.
+
+**Scope of the `fosfs.rs` refactor.** `fosfs.rs` today holds no global
+state of its own -- every function (`format`/`list`/`cat`/`write`/`remove`/
+...) already takes `&BootInfo` purely to reach `disk::read_sector`/
+`write_sector` and `disk::data_partition_lba`/`data_partition_sectors`.
+Threading a device parameter through it is a mechanical, if broad, change:
+every one of those function signatures gains a device argument that flows
+down into `disk.rs`'s own (already-planned, for floppy) device-parameter
+support, and a disk2-style device supplies its geometry from the `AH=48h`
+probe above (start LBA 0, whole-disk sector count) instead of from
+`BootInfo`'s boot-disk-specific GPT-discovered fields. No in-memory
+directory cache or other per-device state exists to duplicate -- FOSFS
+reads its superblock/directory fresh from disk on every operation already.
+
+**As built.** `boot/stage2.S`'s `bios_disk_io` trampoline call gained a 5th
+cdecl argument (the BIOS drive number, validated to the `0x80`-`0xff`
+hard-disk range) and a third direction value (`2` = probe), which runs
+`AH=41h` then `AH=48h` and copies back an 8-byte sector count. One real bug
+surfaced and was fixed here: the probe path's AH=48h result buffer (at
+`DISK_REQUEST+16`) overlaps the read/write DAP's own offset/segment fields
+at `DISK_REQUEST+20`/`+22` (used to build the caller's ES:DI copy
+destination) -- `AH=48h`'s "number of cylinders" output field lands on
+those exact same two bytes, silently corrupting the destination pointer
+right before it was used, which surfaced as `disk2: found (..., <huge
+garbage number> sectors)` instead of the real sector count. The fix
+stashes a second copy of that offset/segment at `DISK_REQUEST+42`/`+44`
+(untouched by the probe's own buffer) immediately after computing it, and
+the probe path reads back from there instead.
+
+`kernel/src/disk.rs` gained a `Device` enum (`Boot`/`Secondary(usize)`), a
+4-entry secondary-disk table populated by `discover_secondary_disks`
+(probing `0x81`-`0x83` at boot, right after `disk::initialize`), and
+device-aware `device_read_sector`/`device_write_sector`/
+`device_data_partition_lba`/`device_data_partition_sectors`/
+`device_sector_count` functions; `read_sector`/`write_sector` remain as
+thin `Device::Boot`-only wrappers so every pre-existing call site outside
+the seven commands above (tape ABI file callbacks, the `start` file,
+`tape run router @router.cfg`, `tape load disk`, `tape send`) needed no
+change and stays boot-disk-only by design. Every `fosfs.rs` function
+threads a `disk::Device` parameter exactly as scoped above. `shell.rs`
+gained `strip_disk_selector`/three arity-specific `parse_disk_*` helpers
+implementing the disambiguation rule described above, wired into
+`cat`/`write`/`rm`/`readsector`/`diskinfo`/`format`/`ls`.
+
+Verified end to end (`make test-second-disk`, folded into `make test`):
+booting with a second, blank 4 MiB QEMU drive attached is discovered as
+`disk2` (8192 sectors), `format disk2`/`write disk2 NAME TEXT`/`ls
+disk2`/`cat disk2 NAME`/`rm disk2 NAME` all work, and disk1's own files are
+completely unaffected by any of it (this project's real hardware is
+`0x80`+ USB thumb drives, which BIOS enumerates the same as this test's
+attached drive). A secondary disk's practical size ceiling is BIOS/
+firmware LBA support, not FOSFS -- the flat format itself has no meaningful
+capacity limit; the fixed 64-entry directory limits file *count*, not
+capacity, on any FOSFS volume regardless of size.
+
+**Follow-up: `copy SRC_DISK NAME DST_DISK [NEW_NAME]`.** Copying a file
+directly between two disks (e.g. `disk1` -> `disk2`) needed no host round
+trip and no new on-disk mechanism, since `fosfs::read`/`fosfs::write` were
+already binary-safe, device-parameterized functions operating on plain
+`&[u8]` buffers -- `write`'s "TEXT" naming is historical, not a real
+restriction. Unlike the seven commands above, `copy_command` requires
+*both* disk selectors to be spelled out explicitly; letting either one
+default to `disk1` would be genuinely ambiguous about which side it meant
+once two disks are actually in play. `copy_file` stages the whole file
+through the shared `pmem::TAPE_BASE`/`TAPE_LEN` buffer that `tape load
+disk`/`tape load net` already use as scratch space (`allocate_tape_buffer`,
+already bounds-checking and error-reporting), rather than adding a second
+large `.bss` array that would inflate `kernel.bin` for no benefit -- this
+also means a copy is bounded by the same 4 MiB the tape subsystem already
+budgets for. Because that buffer is shared, `copy_file` never calls
+`install_tape` (the copied bytes are an arbitrary file, not necessarily a
+valid tape) but does explicitly clear the `TAPE` static and print a note
+once the copy succeeds, if and only if a tape had actually been loaded
+there before -- otherwise a later `tape run`/`tape status` would silently
+misreport or attempt to execute whatever file was just copied through,
+exactly the same hazard `tape load disk`/`tape load net` avoid by always
+calling `install_tape` for themselves. Verified end to end by extending
+`make test-second-disk`'s own scenario: `copy disk2 config.txt disk1`,
+`copy disk1 note2.txt disk2 note2-copy.txt`, confirming byte-for-byte
+content on each destination, and confirming a tape loaded earlier in that
+same run reports "No tape loaded" (with the reused-buffer note printed)
+immediately after a copy.
+
+**Follow-up: `@diskN/NAME` for `tape run`'s file-argument syntax.** Once a
+file like `router.cfg` could live on a secondary disk (via `copy` above),
+`tape run router @router.cfg` -- previously hardcoded to `disk::Device::
+Boot` in both `tape_argument_source` and `tape_run` -- had no way to reach
+it there. `TapeArgumentSource::File` now also carries a `disk::Device`,
+resolved by checking for a `/` inside the `@`-prefixed reference: a
+`diskN` prefix before the `/` selects that disk (reusing the existing
+`strip_disk_selector`, so an unattached or malformed `diskN` cleanly falls
+through to the same `Invalid`/usage-message path as any other malformed
+`@` reference, rather than silently defaulting); no `/` at all keeps
+meaning the boot disk, exactly as before. A literal `/` is a safe,
+unambiguous separator for this precise reason: FOSFS names may only
+contain letters, digits, `.`, `_`, and `-`, so a real file name can never
+collide with it. This works for *any* tape's `@FILE` argument, not just
+`router`'s, since the `@`-detection logic already applied uniformly before
+this change. Verified by extending `make test-second-disk`: `tape run
+@disk2/expr.txt` (reading `"3 4 +"` written to disk2) runs the already-
+loaded tape without a "not found"/usage error, while `tape run
+@disk9/expr.txt` (no such disk attached) cleanly prints the usage message
+instead of crashing or guessing.
+
+**Follow-up: `tape load diskN NAME`.** The tape itself -- not just its
+config/startup-argument file -- can now come from a secondary disk too.
+`tape_load_command`'s `kind` word (`net`/`disk`) already only ever meant
+"where does the tape come from"; `disk` was really always `disk1` spelled
+the historical way. Rather than inventing a `diskN/NAME`-style prefix
+(the `/` convention above exists specifically because `tape run`'s file
+reference is embedded inside one `@`-prefixed token; `tape load`'s `kind`
+and `NAME` are already separate words, so no such trick is needed here),
+any other `diskN` word is now recognized as a `kind` in its own right via
+the existing `strip_disk_selector`, dispatching to the same
+`tape_load_disk`, now itself taking a `disk::Device` parameter instead of
+hardcoding `disk::Device::Boot`. `disk` alone is kept as a permanent
+alias for `disk1`, not deprecated, since it predates secondary disks
+entirely and every existing script/test already uses it. An unattached or
+malformed `diskN` (or any other unrecognized `kind` word) falls through to
+a `"Usage: tape load [net|disk NAME|diskN NAME]"` message rather than
+being misread as a file name. Verified by extending `make
+test-second-disk`: `tape load disk2 config.txt` loads a plain-text file
+from disk2 as a "legacy flat" tape (never `tape run` on it, since it is
+not real code -- only proving the disk2 read path itself works), and
+`tape load disk9 config.txt` (no such disk) prints the usage message and
+leaves the previously loaded tape's state untouched.
+
+**Follow-up: disk2 fallback for the boot-time `start` script, plus an
+interactive `start` command.** The `start` file (see "Boot-time `start`
+script" in README.md) previously had to live on `disk1`, forcing any
+change to it through a rebuild of the boot medium -- exactly the
+inconvenience the second disk exists to avoid. `shell.rs` gained a small
+`StartFileLookup` enum (`Found(disk::Device, u64)` / `Missing` /
+`Error(disk::Error)`) and a `locate_start_file` helper: check `disk1`
+first, and only if it has no `start` file, check `disk2`
+(`disk::Device::Secondary(0)`). The two checks are deliberately not
+symmetric in how they treat an error: `disk1` always has a valid FOSFS
+volume (it is the boot disk), so a real read failure there is reported;
+`disk2` is commonly blank/unformatted (the default state for a machine
+not yet using a config disk), and `fosfs::validate` on an unformatted
+volume always returns `Err(disk::Error::FirmwareFailure)` -- indistinguishable
+at this level from a genuine I/O fault -- so *any* error checking `disk2`
+is folded into `Missing` rather than surfaced, avoiding a scary, spurious
+error message on every ordinary boot with an unused second disk attached.
+
+The former single `run_start_file` function was split into three: the
+silent, boot-time `run_start_file` (unchanged behavior when no script
+exists anywhere), a new interactive `start_command` (explicitly reports
+`"start: no start file found on disk1 or disk2."` when absent, since a
+human typing `start` deserves to know why nothing happened), and a shared
+`execute_start_file(info, device, length)` doing the actual line-by-line
+dispatch, parameterized by whichever device `locate_start_file` resolved.
+`start` (no arguments) was added to `execute()`'s dispatch and to the
+"no arguments accepted" error group. The main use case: after F12-ing out
+of a long-running tape the script launched (e.g. `router`), `start` puts
+the machine back into the same state a fresh boot would, without an
+actual reset. Verified by extending `make test-start`'s existing scenario
+with an interactive rerun (confirming the script executes a second time)
+and by extending every other `qemu_smoke.py` scenario (which never
+preload a `start` file) to confirm the "not found" message, including
+`--second-disk`'s still-unformatted secondary disk correctly falling
+through to `Missing` rather than an error.
+
+**Follow-up: a real double fault from `start`, traced to inlining and a
+too-small stack, not a logic bug.** Running the boot script's exact
+commands manually always worked, but retyping them via the interactive
+`start` command reliably produced "DOUBLE FAULT: switched to the
+emergency task stack" whenever the script's `tape run` line was something
+heavy, e.g. `tape run router @router.cfg` with several NICs, DHCP, health
+checks, and NAT -- reproduced with a QEMU-monitor-driven script that
+confirmed the exact same real `router.cfg` crashed a pre-fix kernel every
+time and no longer did after the fix below, both via the real interactive
+path, not just an approximation of it.
+
+The root cause is two compounding effects, both invisible from the
+source code alone:
+- `kernel/Cargo.toml`'s release profile (`opt-level = "z"`, `lto = true`,
+  `codegen-units = 1`) is aggressive enough that every command handler
+  `execute()`'s `match` calls (`tape_run`, `nic_command`, `term_command`,
+  ...) was being inlined directly into `execute` itself, even though only
+  one handler's code path is ever live per call. That collapsed
+  `execute`'s own stack frame to the *sum* of every command's stack
+  needs (confirmed via `nm`/`objdump` on a debug build override,
+  `--config profile.release.strip=false`, since the shipped profile
+  strips symbols: `execute`'s frame was 5288 bytes before the fix, most
+  of it dead weight for any one call). `#[inline(never)]` was added to
+  every large handler function `execute` calls, shrinking `execute`
+  itself to a thin ~1.7 KB dispatcher and letting each handler pay for
+  its own frame only when it is genuinely on the call stack.
+- That alone was not enough. The interactive `start` command
+  unavoidably nests one real level of `execute` deeper than the boot-time
+  path (`execute("start")` -> `start_command` -> `execute_start_file` ->
+  `execute(script line)`, versus boot's `run` -> `run_start_file` ->
+  `execute(script line)`, which never re-enters `execute` at the top
+  level at all) -- and a heavy tape running at the bottom of that extra
+  layer is a real, unavoidable added stack cost, not an artifact of
+  inlining. Confirmed by re-running the same real-`router.cfg` repro
+  against the kernel with the `#[inline(never)]` fix alone: it still
+  double-faulted. `kernel/src/entry.S`'s `kernel_stack` was doubled from
+  32 KiB to 64 KiB to give this path real headroom; `__kernel_end` sits
+  tens of KiB below `linker.ld`'s `0x50000` ceiling even after this
+  change, so the extra reservation is safe. Re-running the identical
+  repro against the doubled-stack kernel completed the router script a
+  second time via `start` with no fault.
+
+Both changes were necessary together: the inlining fix alone measurably
+shrunk `execute`'s frame but the two genuinely nested `execute` ->
+`tape_command` -> `tape_run` chains (each now a real, separate call
+sequence rather than one inlined blob) still summed to more than the
+inlining fix alone saved; only adding the larger stack on top actually
+closed the gap for the heaviest real-world case. `make test-stack-guard`
+(unaffected -- it targets the separate emergency double-fault task stack,
+not this ordinary kernel stack) and every other `make test*` target were
+re-run after this fix with no regressions.
+
+**Follow-up: `help` output was wrapping and scrolling itself out of
+view.** Several `help` lines were longer than 80 columns, so VGA text
+mode wrapped them onto an extra row each; combined with the original
+line count, the full listing took over 30 rows once wrapped -- more
+than an 80x25 screen holds, so its own earlier lines scrolled out of
+view before the listing finished printing. Rewritten to 11 lines, each
+kept to at most 79 columns, not 80: a `println!` whose text lands
+exactly on column 80 wraps *and* leaves a spurious blank row for its
+own trailing `'\n'`, so 79 is the true safe maximum. All the same
+commands remain listed, just more tersely phrased (full syntax stays
+in this document and README.md). `tools/qemu_smoke.py`'s matching
+assertion string was updated to match; verified with a QEMU boot
+printing `help` (each line lands as exactly one row, confirmed against
+the real serial output) and by rerunning `make test` and
+`tools/test_term_net_e2e.py`.
+
+**Follow-up: `diskN/NAME` for the tape filesystem callback ABI (`ed`,
+`router`).** `tapes/ed` and `tapes/router` are the only two tapes using
+the kernel's `tape_fs_file_length`/`tape_fs_read`/`tape_fs_write`/
+`tape_fs_remove` callbacks, and all four were hardcoded to
+`disk::Device::Boot` -- so neither tape could read or write a file on
+`disk2`, even though the shell's own `cat`/`write`/`rm`/`copy` commands
+already could. Adding a `device` parameter to these callbacks was
+possible under the append-only cdecl ABI rule, but would have required
+updating every tape using this ABI (`ed` and `router`) to pass it, for a
+change that is really only about what the existing `name` argument can
+*mean*. Instead, `tape_fs_name` was replaced with `tape_fs_reference
+(pointer, length) -> Option<(disk::Device, &'static [u8])>`, which parses
+an optional leading `diskN/` prefix out of the name string via the
+already-shared `strip_disk_selector` -- exactly the same trick `tape
+run`'s `@diskN/NAME` argument uses (see above), just applied to this
+callback's string instead. No `name` with no `/` still means the boot
+disk, so no existing caller changes behavior. This means `tapes/router`'s
+lease-file argument (`dhcp-lease-file NAME`, previously unrestricted)
+transparently gained disk2 support for free, with zero code changes on
+the tape side, though this has not yet been separately tested or
+documented for `router` specifically.
+
+`ed` itself needed one small change to avoid rejecting a legitimate
+`diskN/` prefix before it ever reaches the kernel: its own `valid_name`
+check (which rejects `/`, among other things) is now only applied to the
+part *after* an optional `diskN/` prefix, via new `valid_reference`/
+`is_disk_selector` helpers. `ed` never resolves the disk itself -- it just
+validates the reference's shape and passes the whole string through to
+the kernel callbacks unchanged, which is why its `save`/`written ...`
+message reports the full reference (e.g. `written disk2/config.txt`), not
+just the bare file name. Verified by extending `tapes/test_ed_e2e.py`
+with a second, blank QEMU drive and a full `format disk2` / `write` /
+`tape run ed disk2/NAME` / edit / save / `cat disk2 NAME` cycle.
+
+
+
+## Tape ABI grows a second callback (`should_abort`), `tapes/tape-rt/`, and remote abort (full detail)
+
+### Tape ABI grows a second callback: `should_abort`, and `vga-colors`
+
+Every tape up to this point ran once and returned: `primes.S`/`hello-rs`
+compute something, print a summary through the one callback `tape_run`
+passed in (`console::print_byte`, "the tape print callback ABI" above),
+and `ret`. That's not enough for a tape meant to *loop* -- an animation,
+a benchmark with a visible running total, anything a local operator
+should be able to stop without rebooting -- since nothing in the
+original one-callback ABI let a tape notice a keypress at all.
+
+`shell::tape_run` now calls a tape as `extern "C" fn(putc: extern "C"
+fn(u32), should_abort: extern "C" fn() -> u32)`, passing `keyboard::
+tape_should_abort` as the second argument alongside `console::print_byte`
+as the first. `tape_should_abort` (`kernel/src/keyboard.rs`) is a thin
+wrapper around the exact same `poll_term_event`/`ESCAPE_SCANCODES` check
+every other blocking shell loop (`term`, `term net`, `nic sniff`, `chat`,
+`tape load net`) already uses to recognize "give up" (F12/F4/F6/F7/F8/
+F10) -- a looping tape is just one more thing in that same family, not a
+special case.
+
+This is backward-compatible by construction, not by accident: under
+cdecl, the caller (`tape_run`) both pushes arguments onto the stack and
+cleans them up afterward, regardless of how many the callee actually
+reads. `primes.S`/`hello-rs` still declare (and use) only the first
+parameter, and neither needed a single line changed -- confirmed by
+rerunning `tapes/test_primes_e2e.py`/`test_hello_rs_e2e.py`
+unmodified against the rebuilt kernel before writing anything new.
+
+The specific worry this raised -- "if a tape's own loop consumes a local
+escape keypress to stop itself, could `term_net`'s own session loop
+somehow also see that same keypress and disconnect the remote session
+driving the tape?" -- turns out not to be a real risk, and
+`tape_should_abort`'s own doc comment spells out exactly why: `interrupts
+::pop_scancode`'s queue is a single, consuming FIFO shared by every
+caller in this single-threaded kernel, and `term_net`'s own session loop
+is paused for the entire time a nested command (like a tape) is running.
+So a keypress a tape's loop consumes to stop itself is simply gone from
+the queue by the time control returns to `term_net` -- it can never also
+be read there afterward as "disconnect". The one loose end, a physical
+key's paired *release* scancode left in the queue after the tape stops
+polling, is harmless for the same reason `poll_term_event` already
+documents elsewhere: release events decode to `None`, never `Escape`.
+
+`tapes/vga-colors/` is the reference tape exercising this: same
+Rust/`no_std`/fixed-address setup as `hello-rs`, but its main loop writes
+several rows of text straight to VGA text memory (physical `0xb8000`,
+the exact address `console.rs`'s own `VGA_BUFFER` uses) instead of
+through `console::print_byte`, cycling their foreground color once per
+frame, forever, until `should_abort` returns nonzero. Only one line at
+the very start and one at the very end go through `putc` -- the
+animation itself deliberately never touches serial or a `term net` relay
+at all, which is the whole reason this tape bypasses the console
+abstraction rather than reusing `print_byte` in a loop: a remote operator
+watching a `term net` session would otherwise be flooded with a repaint
+every frame, for output that only ever made sense on the local screen to
+begin with. It also never touches the CRTC cursor ports, so the kernel's
+own cached cursor position is exactly where it was before `tape run`
+once the tape returns -- the colored rows simply stay on screen
+underneath whatever the shell prints next.
+
+Built with `make tape-vga-colors` (producing `build/tapes/vga-colors.bin`)
+and verified with `tapes/test_vga_colors_e2e.py`, which goes beyond
+the usual serial-stream check (there is deliberately very little to see
+there): it reads the real VGA text framebuffer via the QEMU monitor's
+`pmemsave` (the same technique `test_primes_vga_e2e.py` uses) to confirm
+several distinct colors actually landed there, then uses the monitor's
+`sendkey f12` to simulate a *local* physical keypress and confirms both
+that the tape's loop stops (and control returns to the fos shell) and
+that the exact same `term_net` session driving it remotely is still
+alive afterward -- the concrete proof of the guarantee `tape_should_abort`
+documents, not just a read of its doc comment.
+
+#### `tapes/tape-rt/`: a shared runtime, so far only used by `vga-colors`
+
+`tapes/hello-rs`, `tapes/vga-colors`, and `tapes/bigsieve` each used to
+carry byte-identical copies of three things that have nothing to do with
+any one tape's own purpose: `src/entry.S` (the tiny `_start` stub that
+zeroes `.bss` and tail-calls into `tape_main`), a `#[panic_handler]` that
+just spins forever, and a `print_bytes` helper wrapping the `putc`
+callback (`hello-rs`/`bigsieve` also duplicated a `print_u32` decimal
+formatter). `tapes/vga-colors` now instead depends on `tapes/tape-rt/`, a
+small shared `no_std` library crate providing all of these once, added
+as an ordinary Cargo path dependency (`tape-rt = { path = "../tape-rt" }`
+in `vga-colors/Cargo.toml`) -- no new build-system machinery was needed:
+`cargo`, `-Z build-std`, and the existing `targets/i686-fos.json`/
+`linker.ld` setup all already handle a path dependency exactly like any
+other crate in the dependency graph.
+
+This mirrors, for ordinary 32-bit tapes, the exact same "shared plumbing
+in one reusable place, swappable per-tape logic supplied externally"
+split that `tapes/longmode64_shim.S` uses for 64-bit-excursion tapes (see
+"A tape that visits 64-bit long mode and comes back" above): there, the
+shim owns the CPU-mode-switch mechanics in assembly and calls out to an
+external `tape64_body`; here, `tape-rt` owns the startup/panic/print
+mechanics in Rust and a tape's own `src/main.rs` supplies `tape_main`.
+
+`hello-rs` and `bigsieve` were deliberately *not* migrated to depend on
+`tape-rt` too, even though both would benefit from the same deduplication
+`vga-colors` got. This project's Rust tapes exist first as a teaching
+ladder (see `docs/rust-tapes-for-dummies.md`), and a beginner working
+through it is meant to read `hello-rs/src/main.rs` -- the very first Rust
+tape -- top to bottom and see the *entire* thing that runs, with nothing
+imported from an unfamiliar sibling crate. Introducing a shared dependency
+into either of those two would trade that self-containedness for a small
+amount of saved duplication -- a bad trade for a from-scratch walkthrough's
+first two examples specifically. `vga-colors` was chosen instead to
+demonstrate the *other* valid pattern -- extracting shared plumbing into
+one place once duplicating it a third time starts to feel real -- so a
+reader curious about that tradeoff has a working example to study,
+without disturbing the two simpler ones. Any genuinely new future tape
+(not a teaching-ladder example) should prefer depending on `tape-rt` the
+way `vga-colors` does, rather than copying `entry.S`/the panic handler/
+the print helpers a fourth time.
+
+#### A local keypress isn't enough: remote abort via `poll_remote_tape_abort`
+
+The above covers *local* escape stopping a tape started remotely, but
+not the other direction: a remote `term net` peer had no way at all to
+stop a looping tape like `vga-colors`, since `term_net`'s own session
+loop -- the only thing that ever calls `nic.receive` -- is completely
+paused for as long as a nested blocking command (a tape's own loop) is
+running. `keyboard::tape_should_abort` only ever checks the *local*
+PS/2 scancode queue, so a remote client sending anything at all over the
+wire while a tape ran just sat unread in the network card's own Rx ring
+until the tape eventually returned on its own.
+
+`shell::tape_run` now passes a new `combined_tape_should_abort` as the
+`should_abort` callback instead of `keyboard::tape_should_abort` directly:
+it checks both, returning nonzero if *either* the local keypress check or
+a new `shell::poll_remote_tape_abort` says stop. `poll_remote_tape_abort`
+does nothing (a single `console::relay_enabled()` branch) unless a
+`term_net` session actually started this tape; when one did, it polls
+the network card itself, on `term_net`'s behalf, exactly the way that
+loop's own `nic.receive` normally would -- recognizing the connected
+peer's `TERM_TAG_DATA` frames (stopping the tape if `REMOTE_ABORT_BYTE`
+(`0x1b`, plain ASCII Escape) appears anywhere in the payload, the whole
+frame otherwise simply dropped rather than fed to the line editor, the
+same "consumed, not typed" convention a local escape keypress already
+gets) and `TERM_TAG_BYE` (stopping the tape *and* recording
+`PENDING_REMOTE_BYE`, a new static `term_net`'s own `'session` loop
+checks the moment it resumes, since the one `TERM_TAG_BYE` frame the peer
+sent can only ever be received once -- by whichever loop happens to be
+polling the network card at that instant). It still answers a discovery
+probe from some unrelated third MAC along the way, the same courtesy
+`term_net`'s own loop already extends, so a long-running tape doesn't
+make the host briefly stop looking like a good network citizen.
+
+Two new statics in `shell.rs`, `ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE`,
+carry the connected peer's identity across this call boundary:
+`poll_remote_tape_abort` runs many stack frames below `term_net`'s own
+loop (inside `entry()`, the tape itself, calling back into
+`combined_tape_should_abort`), with no argument of its own to thread the
+peer through, so `term_net` sets these two right before entering its
+session loop and clears them right after leaving it.
+
+`tools/term_net.py --interactive` now puts its own stdin into cbreak
+mode (see the `tty`/`termios` standard library modules) rather than
+leaving it in the terminal's default line-buffered ("canonical") mode:
+without this, a lone Escape keypress would sit in the *client's own*
+input buffer until Enter was also pressed, arriving batched with
+whatever was typed next instead of as a single `0x1b` byte on its own --
+defeating `REMOTE_ABORT_BYTE`'s whole point. Cbreak (as opposed to full
+raw mode) was chosen specifically because it leaves signal-generating
+characters alone, so Ctrl-C still ends the client program the same way
+it always did.
+
+`tapes/test_vga_colors_e2e.py` was extended to prove this actually
+works, not just compiles: after the existing local-`sendkey f12` half of
+the test, it starts the tape a second time and sends a raw `0x1b` byte
+inside an ordinary `TERM_TAG_DATA` frame over the same session (standing
+in for a real `term_net.py --interactive` client's Escape keypress),
+confirms the tape's loop stops the same way, and confirms -- again -- one
+more command over that same session still gets a reply afterward.
+
+
+
+`term net` is deliberately a full remote *shell*, not a byte pipe like
+`term`: once a client connects, the real, live shell -- prompt, line
+editing, and every existing command -- is handed over to it entirely. This
+was made possible by two small refactors, not a parallel reimplementation
+of shell logic:
+
+- `run`'s local input loop was factored into a `LineEditor` struct
+  (`feed(byte, info)`, holding the line buffer/length/carriage-return
+  state that used to be loose locals in `run`). `run` itself now just
+  reads a byte and calls `editor.feed`; `term_net` creates its own
+  `LineEditor` and feeds it bytes arriving over the network instead,
+  so command dispatch (`execute`), line editing, and echo are identical
+  regardless of the byte's source -- no command needs to know it might be
+  driven remotely.
+- `console.rs` gained a small bounded relay queue
+  (`enable_relay`/`disable_relay`/`drain_relay`), fed by a single
+  `relay_push` call inserted at the top of `write_serial` -- already the
+  common choke-point `Console::write_str` (backing `print!`/`println!`),
+  `write_bytes`, `clear`, and `erase_last_character` all funnel through,
+  so every one of them is captured for forwarding without touching any
+  individual call site. `relay_push` runs unconditionally, before
+  `write_serial`'s own `SERIAL_READY` check, so relaying still works on
+  hardware with no COM1 detected. `write_vga_only` (used only by serial
+  `term`'s incoming-byte display) is deliberately *not* hooked in, but
+  since this is a single-threaded kernel where only one shell command runs
+  at a time, serial `term` and `term net` can never be active
+  simultaneously anyway -- this is a non-issue in practice, not a race
+  requiring a guard.
+
+`term_net` (`kernel/src/shell.rs`) waits for a `TERM_TAG_HELLO` frame
+(sharing `CHAT_ETHERTYPE` with `chat`/`tape`/discovery; new tags
+`TERM_TAG_HELLO`/`TERM_TAG_DATA`/`TERM_TAG_BYE` continuing the numbering
+after `TAPE_TAG_STOP`), locking onto that peer's MAC for the session --
+like `tape load net`'s `TAPE_TAG_START` locking, a second `HELLO` from
+someone else while already connected is ignored, since only one remote
+client can drive this single-threaded shell at a time. `TERM_TAG_DATA` (in
+either direction) deliberately carries no sequence number, unlike `tape`'s
+chunked transfer: term is a live, ongoing stream where an occasional
+dropped frame is like a dropped keystroke or a torn screen update, not
+corrupted data worth aborting over, so the extra bookkeeping tape's
+protocol needs was not worth adding here. Both `TERM_TAG_DATA` payloads
+trim trailing zero bytes on receipt, the same convention `CHAT_TAG_TEXT`
+already uses (see above) and safe for the same reason: this is printable
+shell traffic, which never legitimately ends in a genuine zero byte,
+unlike `tape`'s binary payloads.
+
+Once connected, `term_net`'s loop each iteration: drains the relay queue
+and forwards whatever it finds as `TERM_TAG_DATA`; feeds any incoming
+`TERM_TAG_DATA` payload bytes one at a time into its own `LineEditor` via
+`feed`; and checks for local F12 (sends `TERM_TAG_BYE` to the peer, then
+returns all the way to the local shell) or an incoming `TERM_TAG_BYE` (the
+session ends without echoing one back, but `term_net` then loops back to
+waiting for a fresh `TERM_TAG_HELLO` instead of returning -- see "`term
+net` stays resident" below). Local PS/2/VGA input is not read at all while
+connected -- this is an exclusive takeover, matching this project's
+existing "one active mode at a time" convention (`chat`/`tape load
+net`/serial `term` are all exclusive the same way), not a mirrored
+session where a local operator and the remote peer both drive the shell
+simultaneously. Like `tape_load_net`, it keeps answering
+`CHAT_TAG_DISCOVER_REQUEST` throughout -- both while waiting for a `HELLO`
+and during an active session -- so simply leaving `term net` running is
+enough to make a host discoverable.
+
+`tools/term_net.py` is the host-side client, reusing
+`tools/send_tape.py`'s discovery/MAC-resolution/raw-`AF_PACKET`-socket
+helpers rather than duplicating them (`import send_tape` and call its
+`parse_mac`/`format_mac`/`discover`/`pad`/`default_interface`/
+`interface_mac` directly). Its primary, expected-to-be-most-used mode is
+non-interactive request/response: given one or more command lines (as
+arguments or via `--stdin`), it sends each, waits for a quiet period on
+the wire (`--settle`, default 0.5s) before printing accumulated output and
+moving to the next command, then sends `TERM_TAG_BYE` and exits -- chosen
+specifically so this tool (and, in turn, this assistant, which drives fos
+primarily through the bash tool's call/response model rather than a live
+interactive TTY) can script a fos session without needing a real terminal
+attached to its own stdin/stdout. `--interactive` is a secondary,
+genuinely interactive raw pass-through mode (reads/writes this program's
+own stdin/stdout with no local echo, since the remote shell echoes
+keystrokes itself) for a human operator's own manual use.
+
+Verified end-to-end against a live QEMU multicast netdev (mirroring
+`tapes/test_primes_e2e.py`'s approach; see
+`tools/test_term_net_e2e.py`): `term net` accepted a `TERM_TAG_HELLO`,
+relayed a couple of ordinary commands' full output (including their
+prompts) back over the wire, and cleanly disconnected on `TERM_TAG_BYE`.
+
+A follow-up worth noting for anyone extending `term net` further: since
+`tape load net`/`tape run` are dispatched through the exact same
+`execute()` as every other command, they already work unmodified from
+inside a `term_net` session -- confirmed by `tools/test_term_net_tape_e2e.py`,
+which connects over `term net`, remotely runs `tape load net`, has a
+*third*, unrelated MAC send the tape (exactly as an independent
+`send_tape.py` run elsewhere on the LAN would, with no awareness the
+`term_net` session even exists), then remotely runs `tape run`. Both
+commands' own blocking loops (`tape_load_net`'s frame-wait loop,
+`tape_run`'s call into the tape) nest directly inside `term_net`'s outer
+loop, which is what predicts -- and the test asserts -- two consequences
+rather than surprises:
+- The relay queue only gets drained by `term_net`'s own outer loop, which
+  is paused for the entire time a nested command blocks. So every kernel-
+  printed line around a tape (`Tape loaded: ...`, `Running N-byte tape...`,
+  `Tape returned; back at the fos shell.`) reaches the remote client only
+  as one burst once the nested command returns, never live.
+- Since the "tape print callback ABI" change described above,
+  `primes.S`'s own summary digits print through `console::print_byte`,
+  the same combined VGA+serial+relay path every other command's output
+  goes through -- so they now DO appear in that same relayed burst
+  alongside the wrapper messages, not just on QEMU's raw serial stream
+  (or a real machine's physical screen). A remote operator driving
+  `tape load net`/`tape run` over `term net` now sees the tape's actual
+  output too, just delayed until the nested command returns rather than
+  streamed live. (This is a change from this feature's first version,
+  when tapes still wrote VGA/COM1 directly and their output truly was
+  local-only; `tools/test_term_net_tape_e2e.py` was updated accordingly
+  once the callback ABI landed.)
+Neither of these needed any code change to `term_net` itself to work
+correctly -- they follow directly from `term_net`'s existing
+single-threaded, nested-nothing design, combined with whatever a nested
+command's own output actually goes through -- but are exactly the kind of
+thing worth a regression test given how easy they'd be to silently break.
+
+The one-burst-after-return behavior above has a real client-side
+consequence worth calling out on its own: a long silence on the wire
+while a slow blocking command runs is completely indistinguishable, from
+`term_net.py`'s point of view, from the session having quietly died --
+and both of its modes had (in `--interactive`'s case, still cosmetically
+has, on purpose) to account for that so a working session doesn't *look*
+frozen to an operator watching it.
+- `run_noninteractive` originally used the same short `--settle` period
+  (default 0.5s) as its *first* wait after sending every command, not
+  just for detecting when a burst of output has finished. That's fine
+  for quick commands, but a genuinely slow one like `tape run` produces
+  nothing at all for as long as it runs -- so the first wait would
+  time out, `drain_output` would report nothing received, and the
+  client would move on to the next command (or send `TERM_TAG_BYE` and
+  exit) having silently missed that command's entire output once it
+  finally did arrive. Fixed by giving the *first* wait after each sent
+  command its own, far more generous `--command-timeout` (default 30s),
+  while `--settle` keeps its original, short-and-tight job of ending
+  collection once output has actually started arriving and then goes
+  quiet.
+- `--interactive` has no analogous correctness bug -- it just keeps
+  reading forever, so a slow command was always eventually going to
+  produce its output -- but from a human's perspective, several seconds
+  of a seemingly stuck cursor right after pressing Enter (for `tape load
+  net`/`tape run` in particular) reads exactly like a crash. It now
+  tracks the last time a line was submitted (a forwarded chunk
+  containing `\r`/`\n`) and, if `STALL_WARNING_SECONDS` (1.5s) pass with
+  no reply at all, prints a brief `...` heartbeat to stderr -- stderr
+  specifically, so it can never get mixed into the remote shell's own
+  terminal content on stdout, kept to three dots rather than a sentence
+  so it reads as "still alive", not an alarming wall of text, and fires
+  once per submitted line so it doesn't nag once a slow command is
+  already known to be running.
+
+
+
+## Live output relaying for `read_key`/`should_abort`-based tapes over `term net` (full detail)
+
+### Live output relaying for `read_key`/`should_abort`-based tapes over `term net`
+
+Building `tapes/calc` (the first genuinely interactive, potentially
+long-running tape) surfaced a real usability bug the batching design
+described just above never had to face: a remote `term_net` client
+driving the calculator's interactive REPL saw *no* output at all --
+no banner, no prompt, no echoed input, no evaluated result -- until the
+tape finally exited, even though keystrokes typed in the meantime were
+clearly reaching the tape (the REPL visibly responded to them on the
+*local* screen). This is a stronger version of the batching behavior
+documented above for `primes.S`/`tape_load_net`: those are one-shot,
+bounded operations where "everything arrives in one burst once the
+nested command returns" is a minor, acceptable delay; an interactive
+REPL that may run for as long as an operator keeps typing has no
+natural "returns soon" to wait for, so batching there meant a remote
+session looked completely frozen, not merely a little behind.
+
+The root cause was a real asymmetry between this feature's input and
+output sides. `poll_remote_tape_abort`/`poll_remote_tape_input`
+(`kernel/src/shell.rs`) already poll the network card directly, on
+`term_net`'s behalf, so a nested blocking command's `should_abort`/
+`read_key` calls keep working correctly even while `term_net`'s own
+outer loop -- the *only* place that used to drain
+`console`'s relay queue and forward it via `send_term_data` -- is
+completely paused. Nothing equivalent existed for output: a tape's
+`putc` calls still reached `console::relay_push` exactly as before, but
+that queued data just sat there, undrained, for as long as the nested
+command kept running.
+
+The fix is a small, shared helper, `relay_pending_tape_output` (`kernel
+/src/shell.rs`), doing exactly what `term_net`'s own loop already does
+each iteration -- `console::drain_relay` into a `TERM_DATA_CAPACITY`
+buffer, then `send_term_data` if anything came out -- called from both
+`poll_remote_tape_abort` and `poll_remote_tape_input` before either
+does its own network-card polling. `poll_remote_tape_input` in
+particular drains relay output *unconditionally*, even on the fast path
+where a byte is already sitting in `TAPE_INPUT_QUEUE` and would
+otherwise let the function return immediately without ever reaching the
+network-polling code below -- otherwise a quickly-typing remote peer
+could keep this function short-circuiting on queued input for several
+calls in a row, needlessly delaying whatever the tape had already
+printed (e.g. its next prompt). This required no tape ABI change and no
+per-tape opt-in: any `read_key`- or `should_abort`-polling tape gets
+live output relaying automatically, purely because both polling
+functions now happen to also drain output as a side effect.
+
+`tapes/test_calc_e2e.py` was extended with `drain_term_data_for`, which
+actually listens on the simulated wire for `TERM_TAG_DATA` frames
+addressed to the remote test client (something no earlier `term_net`
+e2e test did -- they only ever checked the *local* fos-side QEMU serial
+log, which always looked correct regardless of this bug, since local
+VGA/serial output was never affected). It asserts the interactive mode's
+banner and first prompt reach the wire *before any input is even sent*
+(proving they could only have arrived via live relaying, not as a
+side effect of the tape returning, since nothing sent yet could have
+made it return) and that an evaluated result reaches the wire live too.
+Confirmed both ways: reverting the fix and rerunning this test
+reproduces exactly the reported bug (the assertion fails, with the
+banner/prompt only appearing in a captured buffer after the escape byte
+that ends the tape -- i.e. only once `term_net`'s own loop resumes), and
+with the fix restored the same test passes.
+
+This does **not** change the batching behavior documented above for
+non-polling commands: `tapes/primes.S`'s summary and `tape_load_net`'s
+own wrapper messages still arrive in one burst on return, confirmed
+unchanged by rerunning `tools/test_term_net_tape_e2e.py` unmodified --
+`primes.S` never calls `should_abort`/`read_key` at all (it has no
+input, and always runs to completion), so neither polling function
+above ever executes during its run, and there is nothing new to drain
+on its behalf. The "relay queue only gets drained by `term_net`'s own
+outer loop" claim above is now only accurate for a nested command that
+never calls `should_abort`/`read_key`; any tape that does gets the
+benefit of this fix for free.
+
