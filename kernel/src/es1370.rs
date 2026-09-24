@@ -169,7 +169,31 @@ pub enum Status {
     InitFailed,
 }
 
+/// How many independent ES1370 (or compatible) cards this driver will
+/// discover and drive simultaneously. Each card is a completely
+/// independent stereo pair -- this chip's DAC1 has no way to address more
+/// than 2 channels itself (see this module's own doc comment) -- so this
+/// is also this project's current ceiling on ES1370-backed channel count:
+/// `MAX_INSTANCES * 2` (8, at the current value of 4). Deliberately not
+/// `pci::MAX_DEVICE_MATCHES` (8): each instance owns two independent
+/// `audio::RING_CAPACITY_BYTES`-sized (16 KiB) jitter rings (playback and
+/// capture), so doubling this would double that `.bss` cost for a channel
+/// count (16) well past what a real, physically installed set of vintage
+/// Sound Blaster PCI cards is ever likely to need -- 4 was chosen as
+/// enough to reach the user's stated "4 or 8 channels" target while
+/// keeping the reserved low-memory region's growth modest (see
+/// AGENTS.md's "Low-memory map" growth history for why this constant is
+/// not chosen casually).
+pub const MAX_INSTANCES: usize = 4;
+
 pub struct Es1370 {
+    /// Which slot in `RINGS`/`CAPTURE_RINGS` (and, from the facade's own
+    /// point of view, `audio::DEVICES`) this instance owns. Needed
+    /// because those rings are top-level statics, not fields of this
+    /// struct -- see `RINGS`'s own doc comment for why -- so every method
+    /// that used to reference a single top-level `RING`/`CAPTURE_RING`
+    /// now indexes through this instead.
+    instance: usize,
     io_base: u16,
     irq: Option<u8>,
     buffer_addr: u32,
@@ -215,31 +239,38 @@ pub struct Es1370 {
     capture_overrun_count: AtomicU32,
 }
 
-static mut CARD: Option<Es1370> = None;
+static mut CARDS: [Option<Es1370>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
+static mut CARD_COUNT: usize = 0;
+static mut INITIALIZED: bool = false;
 
-/// The kernel-owned jitter buffer a tape's foreground code feeds via
-/// `Es1370::submit`/the ABI's `audio_submit` callback (see `audio.rs`'s
-/// own doc comment for the full producer/consumer contract). Deliberately
-/// a standalone top-level static, not a field of `Es1370` itself: at
-/// `audio::RING_CAPACITY_BYTES` (64 KiB), embedding it inside a value that
-/// is ever constructed as a local (as `initialize`'s own `let card =
-/// Es1370 { ... }` briefly does, before moving it into `CARD`) would risk
-/// a large, avoidable stack copy on this kernel's own bounded stack;
-/// a `static` with a `const fn` initializer is instead placed directly in
-/// `.bss` at link time, with no runtime copy at all. This mirrors exactly
-/// why `TAPE_INPUT_QUEUE`/`console::RELAY_QUEUE` are standalone statics
-/// rather than fields embedded in some larger struct.
-static RING: audio::PcmRing = audio::PcmRing::new();
+/// The kernel-owned jitter buffers each instance's foreground code feeds
+/// via `Es1370::submit`/the ABI's `audio_submit`/`audio_submit_at`
+/// callbacks (see `audio.rs`'s own doc comment for the full
+/// producer/consumer contract). One slot per possible card, indexed by
+/// `Es1370::instance` -- deliberately a fixed-size array of standalone
+/// top-level statics, not a field embedded in `Es1370` itself: at
+/// `audio::RING_CAPACITY_BYTES` (16 KiB) each, embedding one inside a
+/// value ever constructed as a local (as `initialize_all`'s own `let
+/// card = Es1370 { ... }` briefly does, before moving it into `CARDS`)
+/// would risk a large, avoidable stack copy on this kernel's own bounded
+/// stack; a `static` array with a `const` per-element initializer is
+/// instead placed directly in `.bss` at link time, with no runtime copy
+/// at all. This mirrors exactly why `TAPE_INPUT_QUEUE`/
+/// `console::RELAY_QUEUE` are standalone statics rather than fields
+/// embedded in some larger struct.
+static RINGS: [audio::PcmRing; MAX_INSTANCES] =
+    [const { audio::PcmRing::new() }; MAX_INSTANCES];
 
-/// The ADC's own jitter ring, symmetric to `RING` but flowing the
-/// opposite direction: the ISR (`drain_capture_period`) is the sole
-/// producer, and a tape's own foreground polling (via the ABI's
-/// `audio_capture` callback, `Es1370::capture`) is the sole consumer.
-/// Kept as a second, independent `PcmRing` rather than reusing `RING` in
-/// the other direction, so a tape that both submits playback and drains
-/// capture (a future full-duplex application) never has one direction's
-/// backlog interfere with the other's.
-static CAPTURE_RING: audio::PcmRing = audio::PcmRing::new();
+/// The ADC's own jitter rings, symmetric to `RINGS` but flowing the
+/// opposite direction: each instance's own ISR (`drain_capture_period`)
+/// is the sole producer, and a tape's own foreground polling (via the
+/// ABI's `audio_capture`/`audio_capture_at` callbacks, `Es1370::capture`)
+/// is the sole consumer. Kept as a second, independent array rather than
+/// reusing `RINGS` in the other direction, so a card that both plays back
+/// and captures (a future full-duplex application) never has one
+/// direction's backlog interfere with the other's.
+static CAPTURE_RINGS: [audio::PcmRing; MAX_INSTANCES] =
+    [const { audio::PcmRing::new() }; MAX_INSTANCES];
 
 impl Es1370 {
     fn reset(&self) {
@@ -277,7 +308,7 @@ impl Es1370 {
     pub fn submit(&self, data: &[u8]) -> usize {
         self.network_mode
             .store(true, core::sync::atomic::Ordering::Relaxed);
-        RING.push(data)
+        RINGS[self.instance].push(data)
     }
 
     pub fn underrun_count(&self) -> u32 {
@@ -289,7 +320,7 @@ impl Es1370 {
     /// for telling a healthy, steadily-fed stream apart from one about to
     /// underrun, without waiting for an actual underrun to happen first.
     pub fn ring_backlog(&self) -> usize {
-        RING.available()
+        RINGS[self.instance].available()
     }
 
     /// Copies up to `out.len()` freshly captured PCM bytes (in this
@@ -301,7 +332,7 @@ impl Es1370 {
     /// "however much is ready right now" convention: a capture consumer
     /// has no equivalent fixed-period alignment requirement to preserve.
     pub fn capture(&self, out: &mut [u8]) -> usize {
-        unsafe { CAPTURE_RING.pop_upto(out.as_mut_ptr(), out.len()) }
+        unsafe { CAPTURE_RINGS[self.instance].pop_upto(out.as_mut_ptr(), out.len()) }
     }
 
     pub fn capture_overrun_count(&self) -> u32 {
@@ -311,7 +342,7 @@ impl Es1370 {
     /// How many not-yet-collected captured bytes currently sit in
     /// `CAPTURE_RING`, the capture-side counterpart to `ring_backlog`.
     pub fn capture_backlog(&self) -> usize {
-        CAPTURE_RING.available()
+        CAPTURE_RINGS[self.instance].available()
     }
 
     /// Fills one period's worth of the DMA ring. Once `network_mode` is
@@ -329,7 +360,7 @@ impl Es1370 {
             .network_mode
             .load(core::sync::atomic::Ordering::Relaxed)
         {
-            let filled = unsafe { RING.pop_into(base, period_bytes) };
+            let filled = unsafe { RINGS[self.instance].pop_into(base, period_bytes) };
             if !filled {
                 self.underrun_count.fetch_add(1, Ordering::Relaxed);
                 for i in 0..period_bytes {
@@ -386,7 +417,7 @@ impl Es1370 {
         let base = (self.capture_buffer_addr + offset) as *const u8;
         let period_bytes = (PERIOD_FRAMES * BYTES_PER_FRAME) as usize;
         let captured = unsafe { core::slice::from_raw_parts(base, period_bytes) };
-        let accepted = CAPTURE_RING.push(captured);
+        let accepted = CAPTURE_RINGS[self.instance].push(captured);
         if accepted < period_bytes {
             self.capture_overrun_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -559,30 +590,79 @@ impl Es1370 {
     }
 }
 
+/// Shared legacy IRQs are normal (see `nic.rs`'s own doc comment on this
+/// same point, and AGENTS.md's "A real bug this test found: shared
+/// legacy PCI IRQ lines silently broke a second device's `init()`" for
+/// why this matters in practice -- two ES1370 cards, or an ES1370 next to
+/// a NIC, can easily land on the same INTx line). Each card only reads
+/// and acknowledges its own `STATUS` register, so calling every
+/// registered card's `handle_interrupt` on every fire is always safe,
+/// even for a card that was not the actual source this time.
 fn handle_pci_irq(irq: u8) {
-    if let Some(card) = unsafe { (*core::ptr::addr_of!(CARD)).as_ref() } {
-        if card.irq == Some(irq) {
-            card.handle_interrupt();
+    unsafe {
+        for index in 0..CARD_COUNT {
+            if let Some(card) = CARDS[index].as_ref() {
+                if card.irq == Some(irq) {
+                    card.handle_interrupt();
+                }
+            }
         }
     }
 }
 
-/// Discovers and starts the ES1370, if present. Idempotent: a second call
-/// after a successful first one returns `Ok(())` immediately without
-/// touching hardware again.
-fn initialize() -> Result<(), Status> {
-    if unsafe { (*core::ptr::addr_of!(CARD)).is_some() } {
-        return Ok(());
+/// Discovers and starts every usable ES1370 (up to `MAX_INSTANCES`),
+/// retaining each instance's own DMA buffers for the remainder of the
+/// boot. Idempotent, mirroring `rtl8139::initialize_all`: a second call
+/// after a successful first one returns the already-discovered count
+/// immediately without touching hardware again.
+pub fn initialize_all() -> Result<usize, Status> {
+    unsafe {
+        if INITIALIZED {
+            return if CARD_COUNT == 0 {
+                Err(Status::NotPresent)
+            } else {
+                Ok(CARD_COUNT)
+            };
+        }
+        INITIALIZED = true;
     }
 
-    let mut matches: [Option<pci::PciAddress>; 1] = [None];
+    let mut matches: [Option<pci::PciAddress>; MAX_INSTANCES] = [None; MAX_INSTANCES];
     let found = pci::find_devices(VENDOR_ENSONIQ, &[DEVICE_ES1370], &mut matches);
     if found == 0 {
         return Err(Status::NotPresent);
     }
-    let Some(address) = matches[0] else {
+
+    let mut init_failed = false;
+    for address in matches[..found.min(MAX_INSTANCES)].iter().flatten() {
+        if init_card(*address).is_err() {
+            init_failed = true;
+        }
+    }
+
+    unsafe {
+        if CARD_COUNT == 0 {
+            if init_failed {
+                Err(Status::InitFailed)
+            } else {
+                Err(Status::NotPresent)
+            }
+        } else {
+            Ok(CARD_COUNT)
+        }
+    }
+}
+
+/// Brings up one already-PCI-discovered card and, on success, appends it
+/// to `CARDS`. Split out of `initialize_all` purely so that function's
+/// own per-address loop reads as a plain list of attempts, one per
+/// discovered card, mirroring `rtl8139::initialize_all`'s own shape.
+fn init_card(address: pci::PciAddress) -> Result<(), Status> {
+    let instance = unsafe { CARD_COUNT };
+    if instance >= MAX_INSTANCES {
         return Err(Status::InitFailed);
-    };
+    }
+
     address.enable_io_and_bus_master();
     let Some(io_base) = address.io_bar0() else {
         return Err(Status::InitFailed);
@@ -601,6 +681,7 @@ fn initialize() -> Result<(), Status> {
     };
 
     let card = Es1370 {
+        instance,
         io_base,
         irq,
         buffer_addr,
@@ -630,19 +711,30 @@ fn initialize() -> Result<(), Status> {
     // a tape's first `capture` call. This keeps both channels' state
     // machines equally simple (no separate "has recording ever been
     // requested" flag to thread through `handle_interrupt`) at a
-    // negligible real cost: an unread `CAPTURE_RING` merely drops
+    // negligible real cost: an unread capture ring merely drops
     // captured periods once full (counted in `capture_overrun_count`),
     // exactly as harmless as a real sound card capturing from a room
     // nobody is listening to.
     card.start_adc();
 
     unsafe {
-        core::ptr::addr_of_mut!(CARD).write(Some(card));
+        CARDS[instance] = Some(card);
+        CARD_COUNT += 1;
     }
     Ok(())
 }
 
-pub fn get() -> Result<&'static Es1370, Status> {
-    initialize()?;
-    Ok(unsafe { (*core::ptr::addr_of!(CARD)).as_ref() }.expect("just initialized"))
+/// Returns one already-discovered instance by index (0-based, unlike the
+/// shell's own 1-based `nic use N` convention -- see `nic_mac_at`'s own
+/// doc comment for why the tape ABI already made this same choice).
+/// Assumes `initialize_all` has already run; callers reach this only
+/// through `audio.rs`'s own facade, which calls it exactly once during
+/// its own `initialize`.
+pub fn get(index: usize) -> Option<&'static Es1370> {
+    unsafe {
+        if index >= CARD_COUNT {
+            return None;
+        }
+        CARDS[index].as_ref()
+    }
 }

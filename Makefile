@@ -49,7 +49,7 @@ TAPE_IMAGE_ARGS := \
 	--file router.cfg tapes/router/router.cfg
 EXTRA_FOSFS_FILES ?=
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -119,6 +119,7 @@ help:
 	@echo "  make test-cpu64-show  - build image/tape and run the 64-bit visual demo e2e smoke test"
 	@echo "  make test-audio-capture - build image, verify ES1370 ADC/capture via QEMU's none audiodev"
 	@echo "  make test-audio-net   - build image/tape and run the network-fed audio-net playback e2e test"
+	@echo "  make test-audio-multi - build image and verify two independent ES1370 devices"
 	@echo "  make clean      - remove build/ and every cargo target/ directory"
 	@echo "See README.md/AGENTS.md for what each artifact actually does."
 
@@ -484,6 +485,13 @@ test-audio-capture: image
 
 test-audio-net: image tape-audio-net
 	python3 tapes/test_audio_net_e2e.py
+
+# Two QEMU-emulated ES1370 devices, each with its own `none` audiodev
+# backend, proving kernel/src/es1370.rs's/audio.rs's conversion to a
+# fixed-size multi-instance array actually discovers and drives more than
+# one physical card independently and simultaneously.
+test-audio-multi: image
+	python3 tapes/test_audio_multi_e2e.py
 
 clean:
 	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/net-chat/target tapes/audio-net/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target

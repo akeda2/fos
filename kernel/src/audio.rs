@@ -35,6 +35,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::es1370;
+use crate::hda;
 
 /// One playback device's fixed sample format. Never negotiated or
 /// converted by this kernel -- a producer (an audio-streaming tape) must
@@ -207,18 +208,21 @@ impl PcmRing {
 
 pub enum Audio {
     Es1370(&'static es1370::Es1370),
+    Hda(&'static hda::Hda),
 }
 
 impl Audio {
     pub fn driver_name(&self) -> &'static str {
         match self {
             Audio::Es1370(_) => "ES1370",
+            Audio::Hda(_) => "Intel HDA",
         }
     }
 
     pub fn format(&self) -> AudioFormat {
         match self {
             Audio::Es1370(card) => card.format(),
+            Audio::Hda(card) => card.format(),
         }
     }
 
@@ -230,12 +234,14 @@ impl Audio {
     pub fn submit(&self, data: &[u8]) -> usize {
         match self {
             Audio::Es1370(card) => card.submit(data),
+            Audio::Hda(card) => card.submit(data),
         }
     }
 
     pub fn underrun_count(&self) -> u32 {
         match self {
             Audio::Es1370(card) => card.underrun_count(),
+            Audio::Hda(card) => card.underrun_count(),
         }
     }
 
@@ -244,24 +250,32 @@ impl Audio {
     pub fn ring_backlog(&self) -> usize {
         match self {
             Audio::Es1370(card) => card.ring_backlog(),
+            Audio::Hda(card) => card.ring_backlog(),
         }
     }
 
     pub fn interrupt_stats(&self) -> (Option<u8>, u32, u32) {
         match self {
             Audio::Es1370(card) => card.interrupt_stats(),
+            Audio::Hda(card) => card.interrupt_stats(),
         }
     }
 
-    pub fn io_base(&self) -> u16 {
+    /// A device's base address for diagnostics: a legacy I/O port number
+    /// for ES1370, or an MMIO physical address for HDA -- widened to
+    /// `u32` so both fit, printed with enough hex digits for either
+    /// (`audio_status`'s own `0x{:08x}` format).
+    pub fn io_base(&self) -> u32 {
         match self {
-            Audio::Es1370(card) => card.io_base(),
+            Audio::Es1370(card) => card.io_base() as u32,
+            Audio::Hda(card) => card.io_base(),
         }
     }
 
     pub fn raw_status(&self) -> u32 {
         match self {
             Audio::Es1370(card) => card.raw_status(),
+            Audio::Hda(card) => card.raw_status(),
         }
     }
 
@@ -269,16 +283,21 @@ impl Audio {
     /// device's own `format()`, up to `out.len()` bytes -- the ADC
     /// counterpart to `submit`. Returns how many bytes were actually
     /// copied; fewer than `out.len()` (including zero) simply means
-    /// fewer samples have been captured so far, not an error.
+    /// fewer samples have been captured so far, not an error. HDA
+    /// playback-only in this driver's initial scope, so an HDA device
+    /// always reports zero captured bytes here, exactly like ES1370
+    /// before its own ADC support existed.
     pub fn capture(&self, out: &mut [u8]) -> usize {
         match self {
             Audio::Es1370(card) => card.capture(out),
+            Audio::Hda(_) => 0,
         }
     }
 
     pub fn capture_overrun_count(&self) -> u32 {
         match self {
             Audio::Es1370(card) => card.capture_overrun_count(),
+            Audio::Hda(_) => 0,
         }
     }
 
@@ -287,6 +306,7 @@ impl Audio {
     pub fn capture_backlog(&self) -> usize {
         match self {
             Audio::Es1370(card) => card.capture_backlog(),
+            Audio::Hda(_) => 0,
         }
     }
 
@@ -295,11 +315,19 @@ impl Audio {
     pub fn capture_periods(&self) -> u32 {
         match self {
             Audio::Es1370(card) => card.capture_periods(),
+            Audio::Hda(_) => 0,
         }
     }
 }
 
-static mut ACTIVE: Option<Audio> = None;
+/// Maximum simultaneously usable audio devices: `es1370::MAX_INSTANCES`
+/// plus `hda::MAX_INSTANCES`, since both backends now share one flat
+/// `DEVICES` array -- see `initialize`'s own doc comment for why there
+/// is no per-backend cap here, only this one combined ceiling.
+pub const MAX_DEVICES: usize = es1370::MAX_INSTANCES + hda::MAX_INSTANCES;
+
+static mut DEVICES: [Option<Audio>; MAX_DEVICES] = [const { None }; MAX_DEVICES];
+static mut DEVICE_COUNT: usize = 0;
 static mut INITIALIZED: bool = false;
 
 #[derive(Debug)]
@@ -308,35 +336,100 @@ pub enum Status {
     InitFailed,
 }
 
-/// Discovers and starts the first supported audio backend, if any.
-/// Idempotent, mirroring `nic::initialize`. Backend order is currently
-/// just ES1370; a future codec driver joins this match the same way a
-/// fifth NIC backend joined `nic::initialize` in its own turn.
-pub fn initialize() -> Result<(), Status> {
+/// Discovers and starts every supported audio backend instance found
+/// (ES1370 and any Intel HDA controller reporting a usable playback
+/// stream; a future codec driver's own instances would be appended the
+/// same way a fifth NIC backend joins `nic::initialize`'s own loop).
+/// Idempotent, mirroring `nic::initialize`.
+///
+/// Deliberately no "active device" selection concept here, unlike
+/// `nic::set_active`: the whole point of supporting more than one
+/// instance is to drive every discovered card *simultaneously* as
+/// independent stereo pairs for a combined multichannel stream, not to
+/// pick one at a time. `get()` keeps meaning "device 0" purely so
+/// existing, non-indexed tape ABI callbacks (`tape_audio_sample_rate`,
+/// `tape_audio_submit`, ...) keep working unchanged for a single-card
+/// setup; a tape wanting every device must use `get_at`/`count` instead.
+pub fn initialize() -> Result<usize, Status> {
     unsafe {
         if INITIALIZED {
-            return if (*core::ptr::addr_of!(ACTIVE)).is_some() {
-                Ok(())
-            } else {
+            return if DEVICE_COUNT == 0 {
                 Err(Status::NotPresent)
+            } else {
+                Ok(DEVICE_COUNT)
             };
         }
         INITIALIZED = true;
     }
 
-    match es1370::get() {
-        Ok(card) => {
-            unsafe {
-                core::ptr::addr_of_mut!(ACTIVE).write(Some(Audio::Es1370(card)));
+    let found = match es1370::initialize_all() {
+        Ok(count) => count,
+        Err(es1370::Status::NotPresent) => 0,
+        Err(es1370::Status::InitFailed) => 0,
+    };
+
+    unsafe {
+        for index in 0..found.min(MAX_DEVICES) {
+            if let Some(card) = es1370::get(index) {
+                DEVICES[DEVICE_COUNT] = Some(Audio::Es1370(card));
+                DEVICE_COUNT += 1;
             }
-            Ok(())
         }
-        Err(es1370::Status::NotPresent) => Err(Status::NotPresent),
-        Err(es1370::Status::InitFailed) => Err(Status::InitFailed),
+
+        // HDA controllers with no usable playback stream (`has_playback`
+        // false -- no responding codec, no usable DAC/pin pair, or no
+        // free output stream at all) are deliberately left out of this
+        // facade entirely: an `audio-net`-style tape driving every
+        // `audio_count()` device has no use for one it could never
+        // submit a single byte to, and `hda status`/the `hda` shell
+        // command remain the right place to inspect such a controller's
+        // node graph regardless of whether playback ever came up.
+        let hda_found = hda::initialize_all().unwrap_or(0);
+        for index in 0..hda_found {
+            if DEVICE_COUNT >= MAX_DEVICES {
+                break;
+            }
+            if let Some(controller) = hda::get(index) {
+                if controller.has_playback() {
+                    DEVICES[DEVICE_COUNT] = Some(Audio::Hda(controller));
+                    DEVICE_COUNT += 1;
+                }
+            }
+        }
+
+        if DEVICE_COUNT == 0 {
+            Err(Status::InitFailed)
+        } else {
+            Ok(DEVICE_COUNT)
+        }
     }
 }
 
+/// The first discovered device, kept for every existing, non-indexed
+/// caller (the tape ABI's plain `audio_sample_rate`/`audio_submit`/...
+/// callbacks, and the pre-multi-instance `audio` shell command reporting)
+/// -- see `initialize`'s own doc comment for why there is no separate
+/// "active device" concept to select instead.
 pub fn get() -> Result<&'static Audio, Status> {
     initialize()?;
-    Ok(unsafe { (*core::ptr::addr_of!(ACTIVE)).as_ref() }.expect("just initialized"))
+    get_at(0).ok_or(Status::NotPresent)
+}
+
+/// Returns one discovered device by index (0-based, matching every other
+/// `_at`-suffixed tape ABI convention in this project -- see
+/// `nic_mac_at`'s own doc comment). Returns `None` for an index beyond
+/// however many were actually found, never a partially initialized slot.
+pub fn get_at(index: usize) -> Option<&'static Audio> {
+    unsafe {
+        if index >= DEVICE_COUNT {
+            return None;
+        }
+        DEVICES[index].as_ref()
+    }
+}
+
+/// How many audio devices were discovered, 0 before `initialize`/`get`
+/// has ever been called successfully.
+pub fn count() -> usize {
+    unsafe { DEVICE_COUNT }
 }

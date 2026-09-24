@@ -673,7 +673,7 @@ protected_entry:
 
     # A soft reboot (kernel/src/reboot.rs) can land here after
     # `load_kernel` just re-read a fresh kernel image, via a BIOS-emulated
-    # disk transfer, into this same physical range (0x10000..0x70000) that
+    # disk transfer, into this same physical range (0x10000..0x80000) that
     # this VM instance was already executing as code moments earlier -- a
     # pattern no cold boot ever exercises. Empirically, jumping straight
     # into it from here is unreliable (see `kernel/src/entry.S`'s own
@@ -688,7 +688,7 @@ protected_entry:
     # did not reliably trigger for a translation block that had already
     # executed in this VM instance.
     movl $0x10000, %edi
-    movl $0x70000, %ecx
+    movl $0x80000, %ecx
     subl %edi, %ecx
     shrl $12, %ecx
 resync_kernel_pages:

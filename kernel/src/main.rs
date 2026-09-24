@@ -18,6 +18,7 @@ mod e1000;
 mod es1370;
 mod fosfs;
 mod gdt;
+mod hda;
 mod i350;
 mod interrupts;
 mod keyboard;

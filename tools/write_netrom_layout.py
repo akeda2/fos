@@ -14,8 +14,8 @@ from pathlib import Path
 
 # `boot/netrom.S` copies the embedded kernel with a 32-bit-address-size
 # `rep movsb`. The destination still shares the disk boot path's reserved
-# low-memory window, so do not allow a kernel beyond 0x10000..0x60000.
-MAX_KERNEL_BYTES = 0x70000 - 0x10000
+# low-memory window, so do not allow a kernel beyond 0x10000..0x90000.
+MAX_KERNEL_BYTES = 0x90000 - 0x10000
 
 
 def main() -> None:
@@ -26,7 +26,7 @@ def main() -> None:
 
     kernel_size = args.kernel.stat().st_size
     if not 0 < kernel_size <= MAX_KERNEL_BYTES:
-        raise SystemExit("kernel must fit in the reserved 0x10000..0x60000 load region")
+        raise SystemExit("kernel must fit in the reserved 0x10000..0x90000 load region")
     content = f".set NETROM_KERNEL_SIZE, {kernel_size}\n"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(content, encoding="ascii")

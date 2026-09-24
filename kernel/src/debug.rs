@@ -57,16 +57,23 @@ use crate::println;
 /// here too** (run `python3 tools/write_layout.py --kernel build/kernel.bin
 /// --output /dev/stdout` after a rebuild and copy `SLOT1_LBA`/
 /// `SLOT_SECTORS` from its output; `SLOT0_LBA`/`METADATA_LBA` never move on
-/// their own, only when `PAYLOAD_START_LBA`/`STAGE2_SECTORS` change).
+/// their own, only when `PAYLOAD_START_LBA`/`STAGE2_SECTORS` change). This
+/// is the once-per-`KERNEL_RESERVED_END`-change checklist this module's
+/// own history above demonstrates the real cost of skipping:
+/// `KERNEL_RESERVED_END` grew again, from `0x70000` to `0x80000`, for
+/// multi-instance ES1370 audio support (see AGENTS.md's "Multi-instance
+/// ES1370 audio driver" section) -- `SLOT1_LBA`/`SLOT_SECTORS` above were
+/// updated to `2977`/`896` in the very same change, to avoid repeating
+/// this exact bug a second time.
 pub const METADATA_LBA: u64 = 2080;
 /// LBA of kernel slot 0 (see `tools/write_layout.py`'s `SLOT0_LBA`).
 pub const SLOT0_LBA: u64 = 2081;
 /// LBA of kernel slot 1 (see `tools/write_layout.py`'s `SLOT1_LBA`).
-pub const SLOT1_LBA: u64 = 2849;
+pub const SLOT1_LBA: u64 = 2977;
 /// Sectors reserved for each kernel slot (see `tools/write_layout.py`'s
 /// `SLOT_SECTORS`); also the largest kernel image a network update may
 /// install.
-pub const SLOT_SECTORS: u64 = 768;
+pub const SLOT_SECTORS: u64 = 896;
 
 const METADATA_MAGIC: [u8; 4] = *b"FOSM";
 const METADATA_VERSION: u8 = 1;

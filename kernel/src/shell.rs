@@ -5,6 +5,7 @@ use crate::console;
 use crate::cpu;
 use crate::disk;
 use crate::fosfs;
+use crate::hda;
 use crate::interrupts;
 use crate::keyboard;
 use crate::keyboard::Keyboard;
@@ -531,6 +532,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"print" => print_command(info, arguments),
         b"nic" => nic_command(arguments),
         b"audio" if no_arguments(arguments) => audio_status(),
+        b"hda" if no_arguments(arguments) => hda_status(),
         b"chat" => chat_command(arguments),
         b"tape" => tape_command(info, arguments),
         b"halt" => {
@@ -551,7 +553,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"debug" => debug_command(info, arguments),
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
         | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci" | b"printer"
-        | b"start" | b"audio" => {
+        | b"start" | b"audio" | b"hda" => {
             println!("This command does not accept arguments.");
         }
 
@@ -823,65 +825,177 @@ fn print_pci_devices() {
     }
 }
 
-/// `audio` reports the active audio device's status through the
-/// format-agnostic `audio.rs` facade (not `es1370::get()` directly, so this
-/// command keeps working unchanged once a second codec backend joins
-/// `audio::Audio`): whether a device was found, its driver name and format,
-/// I/O base, how many playback interrupts/periods it has serviced -- the
-/// ISR-driven equivalent of `nic`'s own interrupt counters, useful for
-/// confirming the driver is actually being interrupted and refilling its
-/// DMA ring, not just silently idle -- and, once a tape has started
-/// streaming into it (`tape_audio_submit`), the network-fed ring's current
-/// backlog and underrun count.
+/// `audio` reports every discovered audio device's status through the
+/// format-agnostic `audio.rs` facade (not `es1370::get_at()` directly, so
+/// this command keeps working unchanged once a second codec backend joins
+/// `audio::Audio`): whether any device was found, and per device its
+/// index, driver name and format, I/O base, how many playback
+/// interrupts/periods it has serviced -- the ISR-driven equivalent of
+/// `nic`'s own interrupt counters, useful for confirming the driver is
+/// actually being interrupted and refilling its DMA ring, not just
+/// silently idle -- and, once a tape has started streaming into it
+/// (`tape_audio_submit`/`tape_audio_submit_at`), the network-fed ring's
+/// current backlog and underrun count. Unlike `nic`/`nic list` (one
+/// "active" interface plus a full list), there is no single "active"
+/// audio device to report first -- every discovered device is reported
+/// equally, since the whole point of more than one is to drive them all
+/// simultaneously as independent stereo pairs (see `audio.rs`'s own doc
+/// comment on why there is no `set_active` here). Like `pci`, this is
+/// allowed to scroll past one screen once several devices are attached,
+/// since the number of physical cards is inherently unbounded.
 fn audio_status() {
     match audio::get() {
-        Ok(device) => {
-            let format = device.format();
-            println!(
-                "{} found: I/O base 0x{:04x}, format {} Hz / {}ch / {}-bit.",
-                device.driver_name(),
-                device.io_base(),
-                format.sample_rate,
-                format.channels,
-                format.bits_per_sample
-            );
-            let (irq, interrupts, periods) = device.interrupt_stats();
-            match irq {
-                Some(irq) => {
-                    let raw = crate::interrupts::pci_irq_count(irq);
-                    println!(
-                        "IRQ {irq}: {raw} raw fire(s), {interrupts} recognized as DAC1."
-                    );
-                }
-                None => println!("No legacy PCI IRQ line assigned; audio is silent."),
-            }
-            println!("DAC1: {periods} periods refilled since boot.");
-            println!(
-                "Underruns (ring empty on refill): {}",
-                device.underrun_count()
-            );
-            println!(
-                "Network-fed ring backlog: {} of {} byte(s) queued.",
-                device.ring_backlog(),
-                audio::RING_CAPACITY_BYTES
-            );
-            println!(
-                "ADC: {} periods captured; overruns (ring full): {}.",
-                device.capture_periods(),
-                device.capture_overrun_count()
-            );
-            println!(
-                "Capture ring backlog: {} of {} byte(s) queued.",
-                device.capture_backlog(),
-                audio::RING_CAPACITY_BYTES
-            );
-            println!("Raw STATUS register: 0x{:08x}", device.raw_status());
-        }
         Err(audio::Status::NotPresent) => {
             println!("No Ensoniq ES1370 (or compatible) audio controller found.");
+            return;
         }
         Err(audio::Status::InitFailed) => {
             println!("An audio controller was found but could not be initialized.");
+            return;
+        }
+        Ok(_) => {}
+    }
+    let count = audio::count();
+    println!("{count} audio device(s) found:");
+    for index in 0..count {
+        let Some(device) = audio::get_at(index) else {
+            continue;
+        };
+        let format = device.format();
+        println!(
+            "[{index}] {} at base 0x{:08x}: {} Hz / {}ch / {}-bit.",
+            device.driver_name(),
+            device.io_base(),
+            format.sample_rate,
+            format.channels,
+            format.bits_per_sample
+        );
+        let (irq, interrupts, periods) = device.interrupt_stats();
+        match irq {
+            Some(irq) => {
+                let raw = crate::interrupts::pci_irq_count(irq);
+                println!(
+                    "  IRQ {irq}: {raw} raw fire(s), {interrupts} recognized as DAC1."
+                );
+            }
+            None => println!("  No legacy PCI IRQ line assigned; audio is silent."),
+        }
+        println!("  DAC1: {periods} periods refilled since boot.");
+        println!(
+            "  Underruns (ring empty on refill): {}",
+            device.underrun_count()
+        );
+        println!(
+            "  Network-fed ring backlog: {} of {} byte(s) queued.",
+            device.ring_backlog(),
+            audio::RING_CAPACITY_BYTES
+        );
+        println!(
+            "  ADC: {} periods captured; overruns (ring full): {}.",
+            device.capture_periods(),
+            device.capture_overrun_count()
+        );
+        println!(
+            "  Capture ring backlog: {} of {} byte(s) queued.",
+            device.capture_backlog(),
+            audio::RING_CAPACITY_BYTES
+        );
+        println!("  Raw STATUS register: 0x{:08x}", device.raw_status());
+    }
+}
+
+fn hda_status() {
+    match hda::initialize_all() {
+        Err(hda::Status::NotPresent) => {
+            println!("No Intel HD Audio controller found.");
+            return;
+        }
+        Err(hda::Status::InitFailed) => {
+            println!("An Intel HD Audio controller was found but could not be reset.");
+            return;
+        }
+        Ok(count) => {
+            println!("{count} Intel HD Audio controller(s) discovered:");
+        }
+    }
+    for index in 0..hda::count() {
+        let Some(controller) = hda::get(index) else {
+            continue;
+        };
+        hda_status_one(controller);
+    }
+}
+
+fn hda_status_one(controller: &hda::Hda) {
+    println!(
+        "Controller {}: MMIO base 0x{:08x}.",
+        controller.instance(),
+        controller.mmio_base()
+    );
+    match controller.irq() {
+        Some(irq) => println!("  Legacy PCI IRQ line: {irq}."),
+        None => println!("  No legacy PCI IRQ line assigned."),
+    }
+    println!(
+        "  CORB/RIRB command transport up: {} input, {} output stream(s).",
+        controller.input_stream_count(),
+        controller.output_stream_count()
+    );
+    if controller.has_playback() {
+        let format = controller.format();
+        let (irq, interrupts, periods) = controller.interrupt_stats();
+        println!(
+            "  Playback active: {} Hz / {}ch / {}-bit.",
+            format.sample_rate, format.channels, format.bits_per_sample
+        );
+        match irq {
+            Some(irq) => {
+                let raw = crate::interrupts::pci_irq_count(irq);
+                println!("  IRQ {irq}: {raw} raw fire(s), {interrupts} recognized.");
+            }
+            None => println!("  No legacy PCI IRQ line assigned; playback is silent."),
+        }
+        println!("  {periods} period(s) refilled since boot.");
+        println!(
+            "  Underruns (ring empty on refill): {}",
+            controller.underrun_count()
+        );
+        println!(
+            "  Network-fed ring backlog: {} of {} byte(s) queued.",
+            controller.ring_backlog(),
+            audio::RING_CAPACITY_BYTES
+        );
+    } else {
+        println!("  No usable playback stream (no codec/DAC/pin found, or no free output stream).");
+    }
+    let codecs = controller.codecs();
+    if codecs.iter().flatten().count() == 0 {
+        println!("  No codec responded on STATESTS after reset.");
+        return;
+    }
+    println!("  Codec(s) discovered:");
+    for codec in codecs.iter().flatten() {
+        println!(
+            "  [cad {}] vendor:device 0x{:04x}:0x{:04x}",
+            codec.address, codec.vendor_id, codec.device_id
+        );
+        match codec.afg_nid {
+            Some(afg_nid) => println!("    Audio Function Group: nid {afg_nid}"),
+            None => println!("    No Audio Function Group found."),
+        }
+        for widget in codec.widgets().iter().flatten() {
+            let stereo = if widget.stereo { "stereo" } else { "mono" };
+            print!("    nid {}: {} ({stereo})", widget.nid, widget.widget_type.name());
+            if widget.widget_type == hda::WidgetType::Pin {
+                print!(
+                    " out={} in={}",
+                    widget.pin_output_capable as u8, widget.pin_input_capable as u8
+                );
+            }
+            match widget.connection {
+                Some(source) => println!(", conn -> nid {source}"),
+                None => println!(),
+            }
         }
     }
 }
@@ -3601,7 +3715,12 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 /// -> u32, fs_write: extern "C" fn(u32, u32, u32, u32) -> u32, fs_remove:
 /// extern "C" fn(u32, u32) -> u32, audio_sample_rate: extern "C" fn() ->
 /// u32, audio_channels_and_bits: extern "C" fn() -> u32, audio_submit:
-/// extern "C" fn(u32, u32) -> u32)` (cdecl, twenty-five arguments), in that
+/// extern "C" fn(u32, u32) -> u32, audio_capture: extern "C" fn(u32, u32)
+/// -> u32, audio_count: extern "C" fn() -> u32, audio_sample_rate_at:
+/// extern "C" fn(u32) -> u32, audio_channels_and_bits_at: extern "C"
+/// fn(u32) -> u32, audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
+/// audio_capture_at: extern "C" fn(u32, u32, u32) -> u32)` (cdecl, thirty
+/// arguments), in that
 /// fixed order. A tape is free
 /// to declare only a leading prefix of these parameters (as
 /// `primes.S`/`hello-rs` declare only `putc`, and `vga-colors` declares
@@ -3688,12 +3807,11 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 ///   and the `fs_*` file callbacks (documented individually near their own
 ///   definitions, e.g. [`tape_fs_remove`]) follow it.
 /// - `tape_audio_sample_rate`/`tape_audio_channels_and_bits`/
-///   `tape_audio_submit`/`tape_audio_capture` are the final four
-///   callbacks, giving a tape
+///   `tape_audio_submit`/`tape_audio_capture` give a tape
 ///   access to the kernel-owned audio playback facade (`audio.rs`) the
 ///   same way the NIC callbacks above expose the kernel-owned network
-///   card: `audio_sample_rate` and `audio_channels_and_bits` report the
-///   active device's fixed format (zero if no device is present -- a
+///   card: `audio_sample_rate` and `audio_channels_and_bits` report
+///   device 0's fixed format (zero if no device is present -- a
 ///   streaming tape must query both before its first `audio_submit` and
 ///   produce exactly that format, since this kernel does no resampling or
 ///   requantization of its own), `audio_submit` pushes raw PCM bytes
@@ -3706,9 +3824,25 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 ///   many bytes were actually copied (fewer than requested, including
 ///   zero, simply means fewer samples have been captured so far --
 ///   mirroring `tape_nic_receive`'s "however much is ready" convention
-///   rather than `audio_submit`'s "however much fits" one). Every
-///   existing tape in this repository ignores all four, exactly like any
-///   other trailing argument under cdecl.
+///   rather than `audio_submit`'s "however much fits" one).
+/// - `tape_audio_count`, `tape_audio_sample_rate_at`,
+///   `tape_audio_channels_and_bits_at`, `tape_audio_submit_at`, and
+///   `tape_audio_capture_at` are the final five callbacks, added
+///   alongside `es1370.rs`'s conversion to a multi-instance driver
+///   (mirroring the NIC family's own `nic_count`/`nic_mac_at`/etc.
+///   addition above): `audio_count` reports how many independent audio
+///   devices (e.g. several physical Sound Blaster PCI cards) were
+///   discovered, and the four `_at`-suffixed callbacks are the
+///   index-based (0-based, matching `nic_mac_at`'s own convention)
+///   counterparts to the four non-indexed callbacks just above, letting
+///   a tape drive every discovered card as an independent stereo pair --
+///   e.g. to combine four 2-channel cards into one 8-channel logical
+///   stream -- instead of only ever the first one. The non-indexed
+///   callbacks keep meaning "device 0" unchanged, so a tape written
+///   before this addition (or one that only ever expects a single card)
+///   needs no change at all. Every
+///   existing tape in this repository ignores all nine of these audio
+///   callbacks, exactly like any other trailing argument under cdecl.
 ///
 /// (A tape is still ring-0 code and technically free to ignore any of
 /// these callbacks and touch hardware -- or `pmem` -- directly anyway --
@@ -4083,6 +4217,67 @@ extern "C" fn tape_audio_capture(out: u32, capacity: u32) -> u32 {
         return 0;
     }
     let Ok(device) = audio::get() else {
+        return 0;
+    };
+    let buffer =
+        unsafe { core::slice::from_raw_parts_mut(out as *mut u8, capacity as usize) };
+    device.capture(buffer) as u32
+}
+
+/// Returns the number of initialized audio devices -- the audio-side
+/// counterpart to `tape_nic_count`, added so a multichannel-streaming tape
+/// can drive every discovered Sound Blaster PCI (ES1370-family) card as an
+/// independent stereo pair, rather than only ever the first one
+/// (`tape_audio_sample_rate`/`tape_audio_submit`/... keep meaning "device
+/// 0" unchanged, for a tape that only ever expects one card).
+extern "C" fn tape_audio_count() -> u32 {
+    audio::count() as u32
+}
+
+/// The `_at`-suffixed counterpart to `tape_audio_sample_rate`, reporting
+/// one selected device's fixed sample rate instead of always device 0.
+/// Returns zero for an out-of-range index, exactly like `tape_nic_mac_at`
+/// treats one.
+extern "C" fn tape_audio_sample_rate_at(index: u32) -> u32 {
+    match audio::get_at(index as usize) {
+        Some(device) => device.format().sample_rate,
+        None => 0,
+    }
+}
+
+/// The `_at`-suffixed counterpart to `tape_audio_channels_and_bits`.
+extern "C" fn tape_audio_channels_and_bits_at(index: u32) -> u32 {
+    match audio::get_at(index as usize) {
+        Some(device) => {
+            let format = device.format();
+            format.channels as u32 | ((format.bits_per_sample as u32) << 8)
+        }
+        None => 0,
+    }
+}
+
+/// The `_at`-suffixed counterpart to `tape_audio_submit`, feeding one
+/// selected device's own network-fed ring instead of always device 0 --
+/// this is what actually lets a multichannel-streaming tape drive several
+/// cards' DAC1 channels simultaneously, each with its own independent
+/// jitter buffer and playback timing.
+extern "C" fn tape_audio_submit_at(index: u32, data: u32, length: u32) -> u32 {
+    if data == 0 || length == 0 {
+        return 0;
+    }
+    let Some(device) = audio::get_at(index as usize) else {
+        return 0;
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(data as *const u8, length as usize) };
+    device.submit(bytes) as u32
+}
+
+/// The `_at`-suffixed counterpart to `tape_audio_capture`.
+extern "C" fn tape_audio_capture_at(index: u32, out: u32, capacity: u32) -> u32 {
+    if out == 0 || capacity == 0 {
+        return 0;
+    }
+    let Some(device) = audio::get_at(index as usize) else {
         return 0;
     };
     let buffer =
@@ -4614,6 +4809,11 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         audio_channels_and_bits: extern "C" fn() -> u32,
         audio_submit: extern "C" fn(u32, u32) -> u32,
         audio_capture: extern "C" fn(u32, u32) -> u32,
+        audio_count: extern "C" fn() -> u32,
+        audio_sample_rate_at: extern "C" fn(u32) -> u32,
+        audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
+        audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
+        audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -4647,6 +4847,11 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_audio_channels_and_bits,
         tape_audio_submit,
         tape_audio_capture,
+        tape_audio_count,
+        tape_audio_sample_rate_at,
+        tape_audio_channels_and_bits_at,
+        tape_audio_submit_at,
+        tape_audio_capture_at,
     );
     unsafe {
         TAPE_BOOT_INFO = core::ptr::null();
