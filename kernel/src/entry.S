@@ -106,8 +106,12 @@ kernel_stack:
     # DHCP, health checks, NAT) pushes the combined depth of that extra
     # `execute()`/`tape_command`/`tape_run` chain past 32 KiB even after
     # `execute()`'s own frame was shrunk (see the `#[inline(never)]` note
-    # on `execute()` in `shell.rs`). `__kernel_end` sits far enough below
-    # the reserved region's `0x50000` ceiling (`linker.ld`'s `ASSERT`) that
-    # doubling this reservation still leaves headroom.
+    # on `execute()` in `shell.rs`). Unlike when this was first sized,
+    # `__kernel_end` no longer sits comfortably below the reserved region's
+    # ceiling (`linker.ld`'s `ASSERT`, now `0x98000`) -- confirmed by
+    # measurement (`size build/kernel.elf`), current `.bss` usage leaves
+    # only a few tens of KiB of headroom before it, not room to casually
+    # double this reservation again. Growing this further would likely
+    # need bumping that ceiling too (see AGENTS.md's "Low-memory map").
     .skip 65536
 kernel_stack_top:

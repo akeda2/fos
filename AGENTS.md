@@ -19,12 +19,12 @@ that obscure hardware behavior.
   section below for why), loads the kernel at physical `0x10000` using bounded
   multi-transfer BIOS EDD reads that never cross a 64 KiB transfer boundary,
   and enters flat 32-bit protected mode. The reserved
-  `0x10000..0x60000` region, not the old single-transfer 127-sector
+  `0x10000..0x98000` region, not the old single-transfer 127-sector
   convention, is the current kernel-size limit.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
-  low-memory kernel region through `0x60000`; do not place loader, boot-info,
+  low-memory kernel region through `0x98000`; do not place loader, boot-info,
   or disk-trampoline data there.
-- `kernel/src/entry.S` reserves a 32 KiB kernel stack with a low-end canary
+- `kernel/src/entry.S` reserves a 64 KiB kernel stack with a low-end canary
   above an unmapped 4 KiB guard page. `kernel/src/gdt.rs` installs a
   double-fault task gate and emergency stack so an overflowed normal stack
   produces a diagnostic halt instead of a triple fault. Tapes run nested
@@ -42,7 +42,7 @@ that obscure hardware behavior.
   bounded-transfer size), but `disk.rs` only ever requests up to
   `MAX_TRANSFER_SECTORS` (16, an 8 KiB `CHUNK` buffer) at a time -- the
   smaller value exists purely to fit the kernel's `.bss` budget below the
-  `0x60000` reserved-region ceiling, not any BIOS/hardware limit. FOSFS
+  `0x98000` reserved-region ceiling, not any BIOS/hardware limit. FOSFS
   file reads/writes (`fosfs::cat`/`read`/`write_file_data`) loop over
   `MAX_TRANSFER_SECTORS`-sized chunks via `device_read_sectors`/
   `device_write_sectors` instead of one BIOS round trip per sector, which
@@ -167,7 +167,7 @@ Real-mode code before the kernel's own memory management exists shares a
 handful of fixed low-memory addresses across `stage1.S`, `stage2.S`, and
 `netrom.S`. There is no single enforcing mechanism for this -- it is
 convention only -- so treat this table as authoritative before adding any new
-fixed address below `0x60000`, and update it in the same change that adds one:
+fixed address below `0x98000`, and update it in the same change that adds one:
 
 | Address | Used by | Purpose |
 | --- | --- | --- |
@@ -180,8 +180,21 @@ fixed address below `0x60000`, and update it in the same change that adds one:
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
 | `0x9f000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer, just below the conventional End-of-Low-Memory / EBDA boundary. |
-| `0x10000`-`0x90000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
+| `0x10000`-`0x98000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
 | `0x100000`-`0x500000` | `kernel/src/pmem.rs` (`TAPE_BASE`/`TAPE_LEN`), any tape's own linker script | The fixed 4 MiB region every tape (`tape load disk`/`tape load net`) is always loaded into, carved out of `pmem`'s general frame pool at boot so `allocate`/`allocate_contiguous`/`palloc` can never hand these frames to anything else. See "Tapes: fixed load address, and writing one in Rust" below. |
+
+This region's own hard outer limit is `0x9f000` (the protected-mode stack
+pointer just above it) -- `0x98000` leaves a deliberate `0x7000` (28 KiB)
+gap below that, not a number to erode casually. Measure real headroom with
+`size build/kernel.elf` (`.bss`'s end, not `kernel.bin`'s file size, is
+what actually matters -- see "`audio.rs`: a format-agnostic facade..."
+below for why) before assuming a small `.bss` addition is free: as of this
+writing there is roughly 32 KiB of slack before `0x98000` itself, all of
+it now the *first* thing to check, not the linker's own `ASSERT` failing
+after the fact. If this genuinely runs out again, the sustainable fix is
+revisiting the `0x9f000` boundary itself (e.g. relocating the transient
+boot-time protected-mode stack elsewhere), not repeatedly nudging this
+ceiling up against it.
 
 ## Educational verbosity
 
@@ -223,21 +236,28 @@ protective MBR and primary/backup GPT metadata:
 | LBA 2048 | GPT boot payload partition |
 | First 32 payload sectors (LBA 2048-2079) | Stage-two loader |
 | LBA 2080 | One-sector A/B kernel-slot metadata block (see "Debug mode" below) |
-| LBA 2081-2720 (640 sectors, slot 0) | Kernel slot 0 |
-| LBA 2721-3360 (640 sectors, slot 1) | Kernel slot 1 |
-| LBA 4096 | Dedicated 28639-sector GPT-discovered FOSFS data partition containing README and all compiled tapes |
+| LBA 2081 onward (`SLOT_SECTORS` each, slot 0 then slot 1) | The two fixed-size kernel slots -- currently 1088 sectors each, sized to the whole reserved low-memory region (`KERNEL_RESERVED_END`); see below |
+| Immediately after both slots (`DATA_START_LBA`) | Dedicated GPT-discovered FOSFS data partition containing README and all compiled tapes |
 | Final 33 sectors | Backup GPT entry array and header |
 
 The image builder is the single source of truth for partition placement and
 writes both GPT copies. The kernel validates the primary GPT and discovers the
 FOSFS partition by its type GUID, with loader-provided geometry retained as a
 compatibility fallback for older images. `tools/write_layout.py` emits
-matching stage-loader constants from the actual kernel size. Never add host
-block-device writes, automatic device selection, or commands that let FOSFS
-write outside its own partition. Copying an image to a device is destructive
-and must remain an explicit user action.
+matching stage-loader constants from the actual kernel size; `SLOT_SECTORS`,
+`SLOT1_LBA`, and `DATA_START_LBA` are all computed there, not hardcoded
+elsewhere -- `DATA_START_LBA` in particular is deliberately derived from
+where slot 1 actually ends (`SLOT1_LBA + SLOT_SECTORS`), not an independent
+literal: an earlier, independent hardcoded value (`4096`) silently ended up
+*inside* slot 1's range once `KERNEL_RESERVED_END` grew enough to push
+`SLOT_SECTORS` past it, a real (if dormant, since no kernel had yet grown
+large enough to actually write into the overlap) 32-sector overlap between
+the kernel slot and this partition's own superblock/directory sectors. Never
+add host block-device writes, automatic device selection, or commands that
+let FOSFS write outside its own partition. Copying an image to a device is
+destructive and must remain an explicit user action.
 
-Only one of the two 640-sector kernel slots is ever the boot loader's actual
+Only one of the two fixed-size kernel slots is ever the boot loader's actual
 first choice at a time (`active_slot`, in the metadata block); the other
 exists purely so a kernel update can be written into it without touching the
 one currently running. See "Debug mode" below for the full state machine and
@@ -328,7 +348,7 @@ verifying a kernel update (or its fallback) actually did what it claimed.
 
 ### A/B kernel slots and automatic fallback
 
-Two 640-sector kernel slots (see the disk layout table above) let a new
+Two fixed-size kernel slots (see the disk layout table above) let a new
 kernel be written without ever overwriting the one currently running. A
 one-sector metadata block at LBA 2080 (`kernel/src/debug.rs`'s
 `SlotMetadata`, byte-identical to `tools/write_layout.py`'s constants and
@@ -381,7 +401,7 @@ net`/NETFS, and mirrors NETFS's own PUT flow almost exactly:
 | `KUP_TAG_PUT_DATA` (`0x3b`) | Client -> server, one per chunk. Payload: sequence number (u32 LE) then up to 1024 bytes -- the same `TAPE_CHUNK_LEN`-shaped, sequence-numbered chunking `tape`'s own network transfer already uses, for the same reason (a binary image's own trailing zero bytes must never be confused with Ethernet's 60-byte minimum-frame padding). A gap or reorder aborts the transfer immediately; there is no retransmission. |
 | `KUP_TAG_PUT_STOP` (`0x3c`) | Client -> server. Ends the transfer; triggers verification. |
 | `KUP_TAG_PUT_ACK` (`0x3d`) | Server -> client. The image was verified and installed; the server will reset shortly to try it. |
-| `KUP_TAG_PUT_ERROR` (`0x3e`) | Server -> client. One-byte code: `1` `TOO_LARGE` (bigger than one 640-sector slot, or the shared staging buffer), `2` `CHECKSUM_MISMATCH`, `3` `DISK_ERROR` (writing the slot, or reading metadata, failed), `4` `BUSY` (another update is already in flight). |
+| `KUP_TAG_PUT_ERROR` (`0x3e`) | Server -> client. One-byte code: `1` `TOO_LARGE` (bigger than one kernel slot, or the shared staging buffer), `2` `CHECKSUM_MISMATCH`, `3` `DISK_ERROR` (writing the slot, or reading metadata, failed), `4` `BUSY` (another update is already in flight). |
 
 `ambient_discovery_poll` -- the same idle-prompt-loop hook that also serves
 NETFS and ordinary discovery -- dispatches all three request-carrying tags,
@@ -782,9 +802,37 @@ to `0x60000` when scaffolding the inert `kernel/src/i350.rs` driver module
 the old `0x50000` ceiling even with `i350::CANDIDATE_DEVICE_IDS` left empty,
 since the module's per-instance static storage (`i350::NICS`) and its code
 are linked in regardless of whether any real device ID ever matches at
-runtime. All three constants must always match; see "Low-memory map" above for why
-growing this region is safe (nothing else lives between `0x20000` and the
-real-mode stack pointer's `0x9f000`).
+runtime. It kept growing after that (`0x70000` for ES1370 ADC capture,
+`0x80000` for multi-instance ES1370, `0x90000` later still -- see
+`docs/history/audio-hda.md` for the exact measurements behind each step),
+each time for the same reason: some feature's own `.bss` growth left no
+headroom under the previous ceiling.
+
+Most recently, grown again to the current `0x98000` -- this time
+deliberately, not reactively, alongside a fix to a real bug this exact
+history had already caused twice: `kernel/src/debug.rs` used to keep its
+own hand-copied `SLOT1_LBA`/`SLOT_SECTORS` (see "A/B kernel slots and
+automatic fallback" below), and *both* of the `0x70000`/`0x80000` steps
+above required a manual, easy-to-forget update to that copy -- the first
+time this was missed, it caused a real, fully deterministic
+soft-reboot-after-KUP crash; the second time (the `0x80000` -> `0x90000`
+step, undocumented until this investigation found it) went unnoticed only
+because no kernel had yet grown large enough to actually write into the
+resulting mismatch. Both `kernel/src/debug.rs`'s slot constants and
+`tools/build_image.py`'s FOSFS partition start (`DATA_START_LBA`, which
+had *also* silently drifted to sit partly inside kernel slot 1 once
+`SLOT_SECTORS` grew enough) are now generated/derived from
+`tools/write_layout.py` instead of hand-copied, making both classes of
+drift structurally impossible rather than merely documented against a
+third occurrence -- see `tools/write_layout.py`'s own doc comment and the
+`kernel` `Makefile` target.
+
+All three constants (`linker.ld`'s `ASSERT`, `pmem::RESERVED_BELOW`,
+`tools/write_layout.py`'s `KERNEL_RESERVED_END`) must still always match
+by hand -- see "Low-memory map" above for why those three specifically
+can't be generated the same way, and for this region's own remaining
+headroom before its hard outer limit, the `0x9f000` real-mode stack
+pointer.
 
 Because a tape can write VGA memory and move the hardware cursor directly
 (see `tapes/primes.S` below) with no way to tell `console.rs` it did
@@ -1065,16 +1113,18 @@ network-fed playback" below, where a much later investigation found that
 `.bss` (now `linker.ld`'s last section, with nothing loadable after it)
 is *not* baked into `kernel.bin`'s raw file size at all; `entry.S`'s own
 explicit zero-fill loop is what actually makes a large `.bss` static safe
-at runtime today, and the real enforced limit is `linker.ld`'s
-`ASSERT(__kernel_end < 0x60000, ...)`, not the flat file's byte count.
-Whatever caused the ~28 KB growth described here was evidently something
-other than pure `.bss`-truncation behavior at that point in this
-project's history; take the mechanism explained below as the current,
-verified one. Stage two now avoids the former single-transfer
-127-sector ceiling by splitting kernel loading into bounded INT 13h
-extended-read calls that respect each BIOS 64 KiB boundary. The remaining
-limit is the reserved `0x10000..0x60000` low-memory region, currently
-640 sectors, and `tools/write_layout.py` emits that limit.
+at runtime today, and the real enforced limit is `linker.ld`'s `ASSERT
+(__kernel_end < 0x98000, ...)` (the exact ceiling has grown several times
+since; see "Low-memory map" above for the current value and its own
+remaining headroom), not the flat file's byte count. Whatever caused the
+~28 KB growth described here was evidently something other than pure
+`.bss`-truncation behavior at that point in this project's history; take
+the mechanism explained below as the current, verified one. Stage two now
+avoids the former single-transfer 127-sector ceiling by splitting kernel
+loading into bounded INT 13h extended-read calls that respect each BIOS
+64 KiB boundary. The remaining limit is the reserved `0x10000..0x98000`
+low-memory region, currently `SLOT_SECTORS` (1088) sectors, and
+`tools/write_layout.py` emits that limit.
 
 The fix: a second allocator, the "big pool" (`BIG_BITMAP`,
 `BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 2 GiB,
@@ -2388,7 +2438,7 @@ symbol matching this contract and link against `longmode64_shim.o`.
 
 Mechanically, the shim builds its own tiny identity-mapped page tables
 (three static 2 MiB pages covering physical 0..6 MiB -- the kernel's own
-code/stack, 0x10000..0x60000; VGA text memory, 0xb8000; and the tape's
+code/stack, 0x10000..0x98000; VGA text memory, 0xb8000; and the tape's
 own 4 MiB image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-
 descriptor private GDT (a 64-bit code descriptor at selector 0x08, and a
 flat 32-bit code descriptor at selector 0x10 used only as the landing pad

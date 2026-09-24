@@ -1614,15 +1614,24 @@ backup GPT metadata:
 - First 32 payload sectors: stage-two loader.
 - LBA 2080: one-sector A/B kernel-slot metadata block (see "Debug mode"
   below).
-- LBA 2081-2720 and LBA 2721-3360: two 640-sector kernel slots; only one
-  is the boot loader's active choice at a time.
-- LBA 4096: a separate 28639-sector FOSFS data partition containing
-  `readme.txt` and every compiled tape.
+- LBA 2081 onward: two fixed-size kernel slots (A/B), sized to the whole
+  reserved low-memory region (`tools/write_layout.py`'s `SLOT_SECTORS`,
+  currently 1088 sectors each); only one is the boot loader's active
+  choice at a time.
+- Immediately after both slots: a separate FOSFS data partition
+  (`tools/write_layout.py`'s `DATA_START_LBA`, derived from where slot 1
+  ends rather than a fixed literal, so the two can never overlap)
+  containing `readme.txt` and every compiled tape.
 - Final 33 sectors: backup GPT entries and header.
 
 `tools/write_layout.py` generates the loader constants from the actual kernel
-size. The kernel validates the GPT and discovers the FOSFS partition by its
-GPT type GUID, falling back to the loader-provided geometry for older images.
+size; every one of the LBA/sector-count values above is computed there, not
+hardcoded, and both `boot/stage1.S`/`boot/stage2.S` and (via a small
+generated Rust file `kernel/src/debug.rs` `include!()`s) the kernel itself
+consume the exact same generated values, so they cannot drift out of sync
+with each other. The kernel validates the GPT and discovers the FOSFS
+partition by its GPT type GUID, falling back to the loader-provided
+geometry for older images.
 The image builder preformats only the image's own FOSFS data partition; it
 does not touch host storage.
 

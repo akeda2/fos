@@ -18,6 +18,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from write_layout import DATA_SECTORS, DATA_START_LBA  # noqa: E402
+
 BOOT_MARKER = b"fos> "
 EXPECTED_COMMON = (
     # Stage one's messages go to the VGA text console only (see boot/stage1.S
@@ -55,7 +58,7 @@ EXPECTED_COMMON = (
     b"usable RAM)",
     b"reserved (not usable))",
     b"Halting CPU.",
-    b"FOSFS partition: LBA 4096 + 28639 sectors",
+    f"FOSFS partition: LBA {DATA_START_LBA} + {DATA_SECTORS} sectors".encode("ascii"),
     b"FOSFS3",
     b"readme.txt  63 bytes, 1 sector(s)",
     b"router.cfg",
@@ -295,7 +298,7 @@ def main() -> None:
                 b"vga d\r",
                 b"clear\r",
                 b"diskinfo\r",
-                b"readsector 4096\r",
+                f"readsector {DATA_START_LBA}\r".encode("ascii"),
                 b"cpuinfo\r",
                 b"memory\r",
                 b"ls\r",

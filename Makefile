@@ -134,6 +134,7 @@ all: image tapes
 KERNEL_CARGO_FEATURES ?=
 
 kernel:
+	python3 tools/write_layout.py --rust-slots kernel/src/generated_slots.rs
 	cd kernel && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec $(KERNEL_CARGO_FEATURES)
 	mkdir -p $(BUILD)
 	cp kernel/target/i686-fos/release/fos-kernel $(KERNEL_ELF)

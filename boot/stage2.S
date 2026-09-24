@@ -673,10 +673,10 @@ protected_entry:
 
     # A soft reboot (kernel/src/reboot.rs) can land here after
     # `load_kernel` just re-read a fresh kernel image, via a BIOS-emulated
-    # disk transfer, into this same physical range (0x10000..0x90000, the
-    # current reserved-region ceiling -- see AGENTS.md's "Low-memory map")
-    # that this VM instance was already executing as code moments earlier
-    # -- a pattern no cold boot ever exercises. Empirically, jumping
+    # disk transfer, into this same physical range (0x10000..KERNEL_END,
+    # the current reserved-region ceiling -- see AGENTS.md's "Low-memory
+    # map") that this VM instance was already executing as code moments
+    # earlier -- a pattern no cold boot ever exercises. Empirically, jumping
     # straight into it from here is unreliable (see `kernel/src/entry.S`'s
     # own `_start` comment for the fuller account of this investigation);
     # an ordinary CPU load-then-store touch of every page in that range,
@@ -688,8 +688,16 @@ protected_entry:
     # first few instructions, in a way the BIOS/DMA-style write path alone
     # did not reliably trigger for a translation block that had already
     # executed in this VM instance.
+    #
+    # KERNEL_END (from layout.inc, `.include`d above) is used here rather
+    # than a second hardcoded copy of the reserved-region ceiling -- this
+    # exact class of drift (a manually-copied ceiling value silently going
+    # stale after `tools/write_layout.py`'s `KERNEL_RESERVED_END` moves) is
+    # what caused a real crash in `kernel/src/debug.rs`'s own A/B slot
+    # constants; using the already-generated constant here instead makes
+    # it structurally impossible for this one to drift the same way.
     movl $0x10000, %edi
-    movl $0x90000, %ecx
+    movl $KERNEL_END, %ecx
     subl %edi, %ecx
     shrl $12, %ecx
 resync_kernel_pages:

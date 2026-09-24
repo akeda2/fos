@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Validate the GPT geometry emitted by tools/build_image.py."""
 
+import sys
 from pathlib import Path
 import struct
 import zlib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from write_layout import DATA_START_LBA  # noqa: E402
 
 SECTOR_SIZE = 512
 FOSFS_TYPE = bytes.fromhex("62736f0f0000534f8000000000000004")
@@ -33,7 +37,7 @@ def main() -> None:
     data_entry = entries[128:256]
     assert data_entry[:16] == FOSFS_TYPE
     first, last = struct.unpack_from("<QQ", data_entry, 32)
-    assert (first, last) == (4096, sectors - 34)
+    assert (first, last) == (DATA_START_LBA, sectors - 34)
     print("PASS: primary and backup GPT metadata are valid")
 
 

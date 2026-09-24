@@ -28,52 +28,38 @@ use crate::disk;
 use crate::fosfs;
 use crate::println;
 
-/// LBA of the one-sector A/B slot metadata block. Must stay byte-identical
-/// to `tools/write_layout.py`'s `METADATA_LBA` and `boot/stage2.S`'s
-/// `select_kernel_slot` -- there is no single source of truth shared across
-/// the Python/assembly/Rust boundary, the same accepted convention already
-/// used for `pmem::RESERVED_BELOW` (see AGENTS.md's "Low-memory map").
-///
-/// **These four constants (`METADATA_LBA`/`SLOT0_LBA`/`SLOT1_LBA`/
-/// `SLOT_SECTORS`) all derive from `tools/write_layout.py`'s
-/// `KERNEL_RESERVED_END`, exactly like `pmem::RESERVED_BELOW` and
-/// `linker.ld`'s `ASSERT` already do -- but unlike those two, nothing
-/// currently cross-checks these ones against the loader at boot, so a
-/// future `KERNEL_RESERVED_END` change that updates the other three call
-/// sites but misses this one fails silently, not loudly**: `boot/stage2.S`
-/// still uses its own freshly generated, correct `SLOT1_LBA`/`SLOT_SECTORS`
-/// (from `build/layout.inc`) to *read* a slot back at boot, while
-/// `install_kernel_update` below would keep *writing* a KUP-pushed kernel
-/// to whatever stale LBA is hardcoded here -- silently installing it into
-/// the wrong disk sectors. This exact drift (`SLOT_SECTORS` stuck at the
-/// pre-audio-ADC value of 640/`SLOT1_LBA` at 2721, after
-/// `KERNEL_RESERVED_END` grew from `0x60000` to `0x70000` for ES1370 ADC
-/// capture -- see AGENTS.md's "ES1370 ADC/capture support" section) is
-/// exactly what caused a real, fully deterministic soft-reboot-after-KUP
-/// crash: the loader read slot 1 starting 128 sectors into what KUP had
-/// actually written there, landing a `#UD`-inducing wrong instruction
-/// stream at the kernel's own entry point. **Whenever
-/// `KERNEL_RESERVED_END` changes, recompute and update these three values
-/// here too** (run `python3 tools/write_layout.py --kernel build/kernel.bin
-/// --output /dev/stdout` after a rebuild and copy `SLOT1_LBA`/
-/// `SLOT_SECTORS` from its output; `SLOT0_LBA`/`METADATA_LBA` never move on
-/// their own, only when `PAYLOAD_START_LBA`/`STAGE2_SECTORS` change). This
-/// is the once-per-`KERNEL_RESERVED_END`-change checklist this module's
-/// own history above demonstrates the real cost of skipping:
-/// `KERNEL_RESERVED_END` grew again, from `0x70000` to `0x80000`, for
-/// multi-instance ES1370 audio support (see AGENTS.md's "Multi-instance
-/// ES1370 audio driver" section) -- `SLOT1_LBA`/`SLOT_SECTORS` above were
-/// updated to `2977`/`896` in the very same change, to avoid repeating
-/// this exact bug a second time.
-pub const METADATA_LBA: u64 = 2080;
-/// LBA of kernel slot 0 (see `tools/write_layout.py`'s `SLOT0_LBA`).
-pub const SLOT0_LBA: u64 = 2081;
-/// LBA of kernel slot 1 (see `tools/write_layout.py`'s `SLOT1_LBA`).
-pub const SLOT1_LBA: u64 = 2977;
-/// Sectors reserved for each kernel slot (see `tools/write_layout.py`'s
-/// `SLOT_SECTORS`); also the largest kernel image a network update may
-/// install.
-pub const SLOT_SECTORS: u64 = 896;
+// `METADATA_LBA`/`SLOT0_LBA`/`SLOT1_LBA`/`SLOT_SECTORS`, `include!()`-ed
+// from a file `tools/write_layout.py --rust-slots` generates fresh before
+// every kernel build (see the `kernel` `Makefile` target) -- the exact
+// same values, computed by the exact same code, that `boot/stage1.S`/
+// `boot/stage2.S` get from that script's other output, `build/layout.inc`.
+//
+// This used to be four hand-copied constants instead, with a doc comment
+// (now folded into this one, for the historical record) warning that nothing
+// cross-checked them against the loader's own generated values, and that
+// a missed manual update after any `KERNEL_RESERVED_END` change would fail
+// *silently*, not loudly: `boot/stage2.S` would keep reading a slot back
+// from its own correct, freshly generated LBA, while `install_kernel_update`
+// below kept *writing* a KUP-pushed kernel to whatever stale LBA was
+// hardcoded here -- silently installing it into the wrong disk sectors.
+// That warning was not hypothetical: it happened twice. First, stuck at
+// the pre-audio-ADC value (`SLOT_SECTORS` 640/`SLOT1_LBA` 2721) after
+// `KERNEL_RESERVED_END` grew from `0x60000` to `0x70000` for ES1370 ADC
+// capture, causing a real, fully deterministic soft-reboot-after-KUP
+// crash (the loader read slot 1 starting 128 sectors into what KUP had
+// actually written there, landing a `#UD`-inducing wrong instruction
+// stream at the kernel's own entry point) -- fixed at the time by manually
+// updating `SLOT1_LBA`/`SLOT_SECTORS` to `2977`/`896`. Second, stuck at
+// exactly those `0x80000`-era values after a later, undocumented growth to
+// the current `0x98000` went unnoticed until this comment's own
+// investigation found it -- discovered before it caused a second crash,
+// but only by luck of the current kernel size never yet exceeding what the
+// stale, too-small `SLOT_SECTORS` would still have accepted as valid.
+// `include!()`-ing a generated file instead of hand-copying, exactly like
+// `boot/stage1.S`/`boot/stage2.S` already do, makes this specific class of
+// drift structurally impossible rather than merely documented against a
+// third time.
+include!("generated_slots.rs");
 
 const METADATA_MAGIC: [u8; 4] = *b"FOSM";
 const METADATA_VERSION: u8 = 1;

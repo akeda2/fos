@@ -28,7 +28,7 @@ const TRAMPOLINE_MAX_SECTORS: usize = 126;
 /// [`TRAMPOLINE_MAX_SECTORS`]: a `[u8; TRAMPOLINE_MAX_SECTORS * SECTOR_SIZE]`
 /// scratch buffer (63 KiB) would not fit in the small headroom left in the
 /// kernel's own reserved low-memory `.bss` region (`linker.ld`'s
-/// `__kernel_end < 0x50000` check covers the whole address range .bss
+/// `__kernel_end < 0x98000` check covers the whole address range .bss
 /// occupies, not just what `objcopy -O binary` ships in `kernel.bin`, since
 /// physical memory for `.bss` still needs to exist even though the flat
 /// image itself carries no bytes for it). 16 sectors (8 KiB) already cuts
