@@ -224,6 +224,18 @@ const AC_WCAP_TYPE_SHIFT: u32 = 20;
 const AC_WCAP_TYPE_MASK: u32 = 0xf;
 const AC_WCAP_STEREO: u32 = 1 << 0;
 const AC_WCAP_CONN_LIST: u32 = 1 << 8;
+/// `AUDIO_WIDGET_CAP`'s 3-bit channel-count-extension field (bits[15:13]),
+/// combined with `AC_WCAP_STEREO` per the HDA spec -- and Linux's own
+/// `get_wcaps_channels()` (`include/sound/hdaudio.h`, mirrored verbatim
+/// in `sound/hda/common/hda_local.h`): `max_channels = ((ext << 1) | 1) +
+/// 1` once a widget's stereo bit is set (Linux hardcodes the OR'd `1`
+/// here rather than re-reading the stereo bit, since the spec only
+/// defines this field as meaningful for an already-stereo-capable
+/// widget); a widget with the stereo bit clear is mono-only (`1`)
+/// regardless of whatever this field happens to contain. See
+/// `widget_max_channels`.
+const AC_WCAP_CHAN_CNT_EXT_SHIFT: u32 = 13;
+const AC_WCAP_CHAN_CNT_EXT_MASK: u32 = 0x7;
 
 const AC_PINCAP_OUT: u32 = 1 << 4;
 const AC_PINCAP_IN: u32 = 1 << 5;
@@ -294,6 +306,14 @@ pub struct WidgetInfo {
     pub nid: u8,
     pub widget_type: WidgetType,
     pub stereo: bool,
+    /// This widget's own maximum supported channel count, per
+    /// `widget_max_channels` -- `2` for an ordinary stereo widget, `1`
+    /// for a mono-only one, or higher for a widget whose
+    /// `AC_WCAP_CHAN_CNT_EXT` field reports surround-capable channel
+    /// support (never verified beyond `2` against any QEMU-emulated
+    /// codec available to this project -- see that function's own doc
+    /// comment).
+    pub max_channels: u8,
     pub pin_output_capable: bool,
     pub pin_input_capable: bool,
     /// The widget's first connection-list entry (which other widget's
@@ -377,15 +397,26 @@ fn verb16(cad: u8, nid: u8, verb_id: u32, payload: u32) -> u32 {
 /// `AC_VERB_SET_STREAM_FORMAT` (`verb16` category): programs a converter
 /// widget's stream format, using the same `AC_FMT_*` bit encoding as the
 /// controller's own per-stream `SD_FORMAT` register (see
-/// `PLAYBACK_FORMAT`'s own doc comment).
+/// `format_for_channels`'s own doc comment).
 const AC_VERB_SET_STREAM_FORMAT: u32 = 0x2;
 /// `AC_VERB_SET_AMP_GAIN_MUTE` (`verb16` category).
 const AC_VERB_SET_AMP_GAIN_MUTE: u32 = 0x3;
 /// `AC_VERB_SET_CHANNEL_STREAMID` (`verb` category): assigns a converter
-/// widget to a stream tag and starting channel.
+/// widget to a stream tag and starting channel -- distinct from, and
+/// always sent alongside, `AC_VERB_SET_CVT_CHAN_COUNT` below, which sets
+/// how many channels that stream actually carries.
 const AC_VERB_SET_CHANNEL_STREAMID: u32 = 0x706;
 /// `AC_VERB_SET_PIN_WIDGET_CONTROL` (`verb` category).
 const AC_VERB_SET_PIN_WIDGET_CONTROL: u32 = 0x707;
+/// `AC_VERB_SET_CVT_CHAN_COUNT` (`verb` category, confirmed against
+/// Linux's own `include/sound/hda_verbs.h`): a converter widget whose
+/// `AC_WCAP_CHAN_CNT_EXT` reports more than the base stereo pair needs
+/// this verb, payload `channels - 1`, to actually activate more than 2
+/// of its channels -- separate from `SET_CHANNEL_STREAMID` above (stream
+/// tag/starting channel only) and from `SET_STREAM_FORMAT` (which
+/// encodes the channel count too, but per the spec does not by itself
+/// activate extra converter channels beyond stereo).
+const AC_VERB_SET_CVT_CHAN_COUNT: u32 = 0x72d;
 
 const AC_AMP_SET_OUTPUT: u32 = 1 << 15;
 const AC_AMP_SET_LEFT: u32 = 1 << 13;
@@ -449,27 +480,51 @@ const BDL_FLAG_IOC: u32 = 1;
 
 /// Matches ES1370's own period sizing (`es1370.rs`'s `PERIOD_FRAMES`),
 /// for the same ~23 ms latency/jitter-tolerance tradeoff and so both
-/// backends' `audio.rs` diagnostics stay directly comparable.
+/// backends' `audio.rs` diagnostics stay directly comparable. Frame
+/// *count* stays fixed regardless of the negotiated channel count below
+/// -- only the per-frame byte size (and therefore each period's/the
+/// whole buffer's byte size) scales with channels.
 const PLAYBACK_PERIOD_FRAMES: u32 = 1024;
 const PLAYBACK_PERIOD_COUNT: u32 = 2;
-/// 16-bit stereo: 2 channels * 2 bytes/sample.
-const PLAYBACK_BYTES_PER_FRAME: u32 = 4;
 const PLAYBACK_TOTAL_FRAMES: u32 = PLAYBACK_PERIOD_FRAMES * PLAYBACK_PERIOD_COUNT;
-const PLAYBACK_PERIOD_BYTES: u32 = PLAYBACK_PERIOD_FRAMES * PLAYBACK_BYTES_PER_FRAME;
-const PLAYBACK_BUFFER_BYTES: u32 = PLAYBACK_TOTAL_FRAMES * PLAYBACK_BYTES_PER_FRAME;
 
-/// 44100 Hz / 2 channels / 16-bit PCM, `AC_FMT_*`-encoded: bit14 set
-/// selects the 44.1 kHz base rate (rather than 48 kHz), no
-/// divisor/multiplier (fields left at 0), bits[6:4] = `001` for 16-bit
-/// samples, bits[3:0] = channels-1 = 1. Matches ES1370's own fixed
-/// format: QEMU's synthetic HDA codec, like ES1370, only actually
-/// implements 16-bit PCM anyway (`QEMU_HDA_PCM_FORMATS` in
-/// `hda-codec-common.h`), so a single hardcoded format is the same
-/// deliberate, documented "don't build untestable generality" choice
-/// this project already made for ES1370 -- see AGENTS.md's own research
-/// notes on this driver's scope. A future step could widen this to
-/// whatever a real codec's own `SUPPCM`/`SUPFMT` parameters report.
-const PLAYBACK_FORMAT: u32 = 0x4011;
+/// This driver's own imposed ceiling on a negotiated channel count,
+/// independent of whatever a widget's `AC_WCAP_CHAN_CNT_EXT` field would
+/// otherwise allow (the stream format field itself could encode up to
+/// 16 channels -- see `format_for_channels`'s own comment). `8` matches
+/// the common real-world "7.1 surround" ceiling and keeps period/buffer
+/// byte math comfortably bounded. Every QEMU-emulated HDA codec
+/// available to this project (`hda-output`/`hda-duplex`/`hda-micro`)
+/// reports `chan_cnt_ext = 0` on every widget -- confirmed directly from
+/// `hw/audio/hda-codec-common.h` -- so negotiation always settles on `2`
+/// channels in every automated test here; this ceiling, and the
+/// above-`2` negotiation path in general, is implemented per the HDA
+/// spec and Linux's own reference driver but can only be exercised
+/// against real, genuinely surround-capable hardware.
+const MAX_NEGOTIATED_CHANNELS: u8 = 8;
+
+/// Every sample this driver ever programs is 16-bit PCM (see
+/// `format_for_channels`'s own comment on why a fixed bit depth remains
+/// a deliberate, documented scope choice); channel count is the only
+/// per-frame size that now varies.
+const BYTES_PER_SAMPLE: u32 = 2;
+
+/// 44100 Hz / 16-bit PCM, `AC_FMT_*`-encoded, with a computed channel
+/// field: bit14 set selects the 44.1 kHz base rate (rather than 48 kHz),
+/// no divisor/multiplier (fields left at 0), bits[6:4] = `001` for
+/// 16-bit samples, bits[3:0] = channels-1. QEMU's synthetic HDA codec,
+/// like ES1370, only actually implements 16-bit PCM anyway
+/// (`QEMU_HDA_PCM_FORMATS` in `hda-codec-common.h`), so a fixed bit
+/// depth is the same deliberate, documented "don't build untestable
+/// generality" choice this project already made for ES1370 -- see
+/// AGENTS.md's own research notes on this driver's scope. `channels`
+/// must already be clamped to `1..=MAX_NEGOTIATED_CHANNELS` by the
+/// caller (every call site below negotiates through `widget_max_channels`
+/// and this ceiling first), so the low nibble can never overflow past
+/// the format field's own 4-bit width.
+fn format_for_channels(channels: u8) -> u32 {
+    0x4010 | ((channels as u32).saturating_sub(1) & 0xf)
+}
 
 /// Fixed, arbitrary non-zero stream tag; only one playback stream is
 /// ever active per controller in this driver, so no allocation scheme is
@@ -499,12 +554,16 @@ const AC_AMP_SET_INPUT: u32 = 1 << 14;
 /// bit-position relationship in the pin's *capability* register.
 const AC_PINCTL_IN_EN: u32 = 1 << 5;
 
-/// This driver's fixed capture buffer/period sizing reuses the exact
-/// same numbers as playback (`PLAYBACK_PERIOD_BYTES`/
-/// `PLAYBACK_BUFFER_BYTES`/`PLAYBACK_PERIOD_COUNT`) -- mirroring
-/// `es1370.rs`'s own `PERIOD_FRAMES`/`BUFFER_BYTES`, which are likewise
-/// shared unchanged between its DAC1 and ADC paths, since both directions
-/// use the identical fixed 44.1 kHz/16-bit/stereo format on this driver.
+/// This driver's capture buffer/period sizing reuses the same fixed
+/// frame count as playback (`PLAYBACK_PERIOD_FRAMES`/
+/// `PLAYBACK_PERIOD_COUNT`) -- mirroring `es1370.rs`'s own
+/// `PERIOD_FRAMES`/`BUFFER_BYTES`, which are likewise shared unchanged
+/// between its DAC1 and ADC paths -- but, since HDA multichannel
+/// negotiation (see `widget_max_channels`) is independent per converter
+/// widget, playback and capture may each negotiate a different channel
+/// count and therefore a different per-frame/period/buffer byte size;
+/// `Hda::playback_channels`/`Hda::capture_channels` track this
+/// separately rather than assuming the two directions always agree.
 
 #[derive(Debug, Clone, Copy)]
 pub enum Status {
@@ -577,11 +636,19 @@ pub struct Hda {
     /// `init_controller` never adds such a controller to `audio::DEVICES`
     /// (see `Hda::has_playback`).
     stream_index: Option<u8>,
+    /// The negotiated playback channel count -- see `widget_max_channels`
+    /// and `setup_playback`'s own doc comment. Always `2` (this driver's
+    /// original fixed value) when `stream_index` is `None`, since nothing
+    /// ever negotiated a real value in that case; `format()` and every
+    /// buffer/period byte-size calculation read this field rather than a
+    /// fixed constant.
+    playback_channels: u8,
     /// Physically contiguous DMA region backing the playback ring (two
-    /// periods, `PLAYBACK_BUFFER_BYTES` total) -- the codec itself pulls
-    /// bytes from here via its own DMA, unlike ES1370's controller-side
-    /// FRAMEADR/FRAMECNT pair (see this module's doc comment on why HDA's
-    /// DMA model is codec-pulled, not controller-pushed).
+    /// periods, `playback_buffer_bytes()` total) -- the codec itself
+    /// pulls bytes from here via its own DMA, unlike ES1370's
+    /// controller-side FRAMEADR/FRAMECNT pair (see this module's doc
+    /// comment on why HDA's DMA model is codec-pulled, not
+    /// controller-pushed).
     buffer_addr: u32,
     interrupt_count: AtomicU32,
     /// Counts every serviced playback period since streaming started;
@@ -605,6 +672,16 @@ pub struct Hda {
     /// capture-facing method below is a no-op in that case, mirroring
     /// `stream_index`/`has_playback`'s own convention exactly.
     capture_stream_index: Option<u8>,
+    /// The capture-path counterpart to `playback_channels`: the
+    /// negotiated capture channel count, independent of whatever
+    /// playback negotiated (a codec's ADC and DAC widgets need not report
+    /// the same `AC_WCAP_CHAN_CNT_EXT`). `audio.rs`'s single, shared
+    /// `format()` method only ever reports `playback_channels` -- see
+    /// that method's own doc comment for why a tape reading captured
+    /// bytes via `audio_capture`/`_at` should not assume they necessarily
+    /// match `format()`'s reported channel count on a codec where the two
+    /// directions genuinely differ.
+    capture_channels: u8,
     /// The capture-path counterpart to `buffer_addr`: a separate,
     /// physically contiguous DMA region the codec's ADC converter writes
     /// captured samples into.
@@ -662,17 +739,46 @@ impl Hda {
         self.capture_stream_index.is_some()
     }
 
-    /// This device's fixed native playback format -- see
-    /// `PLAYBACK_FORMAT`'s own doc comment for why this is a genuine
-    /// ceiling of QEMU's synthetic codec (and this driver's own initial
-    /// scope), not a driver-chosen default that could simply be widened
-    /// later without further work.
+    /// This device's negotiated native playback format: a fixed
+    /// 44.1 kHz/16-bit ceiling (QEMU's synthetic codec, like ES1370,
+    /// only ever implements 16-bit PCM -- see `format_for_channels`'s own
+    /// doc comment) with `playback_channels` reflecting whatever
+    /// `setup_playback` actually negotiated against the real DAC/pin
+    /// widget pair (`2` if no playback stream is active at all, or if
+    /// negotiation ran against a codec -- like every one this project's
+    /// QEMU tests use -- reporting no `AC_WCAP_CHAN_CNT_EXT` capability).
+    /// This is the one format the tape ABI's `audio_channels_and_bits`/
+    /// `_at` callbacks report for *both* directions of this device; see
+    /// `capture_channels`'s own doc comment for the accepted limitation
+    /// this implies on a codec whose ADC and DAC negotiate differently.
     pub fn format(&self) -> audio::AudioFormat {
         audio::AudioFormat {
             sample_rate: 44_100,
-            channels: 2,
+            channels: self.playback_channels,
             bits_per_sample: 16,
         }
+    }
+
+    /// `playback_channels` * `BYTES_PER_SAMPLE`, the per-frame byte size
+    /// `fill_period` computes its period byte size from (`setup_playback`
+    /// computes this and the buffer/period byte sizes itself, once, at
+    /// negotiation time, since they're also needed there before
+    /// `playback_channels` is even set).
+    fn playback_bytes_per_frame(&self) -> u32 {
+        self.playback_channels as u32 * BYTES_PER_SAMPLE
+    }
+
+    fn playback_period_bytes(&self) -> u32 {
+        PLAYBACK_PERIOD_FRAMES * self.playback_bytes_per_frame()
+    }
+
+    /// The capture-path counterpart to `playback_bytes_per_frame`.
+    fn capture_bytes_per_frame(&self) -> u32 {
+        self.capture_channels as u32 * BYTES_PER_SAMPLE
+    }
+
+    fn capture_period_bytes(&self) -> u32 {
+        PLAYBACK_PERIOD_FRAMES * self.capture_bytes_per_frame()
     }
 
     /// Accepts decoded PCM bytes from a tape (via the ABI's
@@ -751,9 +857,9 @@ impl Hda {
     /// whether a tape has ever submitted anything -- silence is the
     /// correct, harmless idle state here).
     fn fill_period(&self, half: u32) {
-        let offset = half * PLAYBACK_PERIOD_BYTES;
+        let offset = half * self.playback_period_bytes();
         let base = (self.buffer_addr + offset) as *mut u8;
-        let period_bytes = PLAYBACK_PERIOD_BYTES as usize;
+        let period_bytes = self.playback_period_bytes() as usize;
 
         if self.network_mode.load(Ordering::Relaxed) {
             let filled = unsafe { RINGS[self.instance].pop_into(base, period_bytes) };
@@ -780,9 +886,9 @@ impl Hda {
     /// bytes are simply dropped, mirroring
     /// `Es1370::drain_capture_period` exactly.
     fn drain_capture_period(&self, half: u32) {
-        let offset = half * PLAYBACK_PERIOD_BYTES;
+        let offset = half * self.capture_period_bytes();
         let base = (self.capture_buffer_addr + offset) as *const u8;
-        let period_bytes = PLAYBACK_PERIOD_BYTES as usize;
+        let period_bytes = self.capture_period_bytes() as usize;
         let captured = unsafe { core::slice::from_raw_parts(base, period_bytes) };
         let accepted = CAPTURE_RINGS[self.instance].push(captured);
         if accepted < captured.len() {
@@ -1005,12 +1111,14 @@ fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Sta
         codecs: [None; MAX_CODECS],
         codec_count: 0,
         stream_index: None,
+        playback_channels: 2,
         buffer_addr: 0,
         interrupt_count: AtomicU32::new(0),
         periods_serviced: AtomicU32::new(0),
         network_mode: AtomicBool::new(false),
         underrun_count: AtomicU32::new(0),
         capture_stream_index: None,
+        capture_channels: 2,
         capture_buffer_addr: 0,
         capture_periods_serviced: AtomicU32::new(0),
         capture_overrun_count: AtomicU32::new(0),
@@ -1031,7 +1139,12 @@ fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Sta
 /// `hda-output`/`hda-duplex` codecs always report a real connection, so
 /// this fallback exists purely for a real codec this driver hasn't been
 /// tested against yet, not as the expected common case.
-fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8)> {
+///
+/// The returned 4th element is the negotiated channel ceiling for this
+/// pair -- `min(dac.max_channels, pin.max_channels)`, per
+/// `widget_max_channels`'s own doc comment -- so `setup_playback` never
+/// needs to re-look-up either widget just to read its capability.
+fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8, u8)> {
     for codec in hda.codecs().iter().flatten() {
         let widgets = codec.widgets();
         for pin in widgets.iter().flatten() {
@@ -1039,27 +1152,27 @@ fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8)> {
                 continue;
             }
             if let Some(source_nid) = pin.connection {
-                let is_dac = widgets.iter().flatten().any(|w| {
+                let dac = widgets.iter().flatten().find(|w| {
                     w.nid == source_nid && w.widget_type == WidgetType::AudioOutput
                 });
-                if is_dac {
-                    return Some((codec.address, source_nid, pin.nid));
+                if let Some(dac) = dac {
+                    let max_channels = dac.max_channels.min(pin.max_channels);
+                    return Some((codec.address, source_nid, pin.nid, max_channels));
                 }
             }
         }
 
-        let dac_nid = widgets
+        let dac = widgets
             .iter()
             .flatten()
-            .find(|w| w.widget_type == WidgetType::AudioOutput)
-            .map(|w| w.nid);
-        let pin_nid = widgets
+            .find(|w| w.widget_type == WidgetType::AudioOutput);
+        let pin_widget = widgets
             .iter()
             .flatten()
-            .find(|w| w.widget_type == WidgetType::Pin && w.pin_output_capable)
-            .map(|w| w.nid);
-        if let (Some(dac_nid), Some(pin_nid)) = (dac_nid, pin_nid) {
-            return Some((codec.address, dac_nid, pin_nid));
+            .find(|w| w.widget_type == WidgetType::Pin && w.pin_output_capable);
+        if let (Some(dac), Some(pin_widget)) = (dac, pin_widget) {
+            let max_channels = dac.max_channels.min(pin_widget.max_channels);
+            return Some((codec.address, dac.nid, pin_widget.nid, max_channels));
         }
     }
     None
@@ -1074,8 +1187,8 @@ fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8)> {
 /// pin that is input-capable and already connected to a confirmed
 /// `AudioInput` converter, falling back to simply pairing the first
 /// `AudioInput` widget with the first input-capable pin on the same
-/// codec.
-fn find_capture_target(hda: &Hda) -> Option<(u8, u8, u8)> {
+/// codec. The returned 4th element mirrors `find_playback_target`'s own.
+fn find_capture_target(hda: &Hda) -> Option<(u8, u8, u8, u8)> {
     for codec in hda.codecs().iter().flatten() {
         let widgets = codec.widgets();
         for pin in widgets.iter().flatten() {
@@ -1083,27 +1196,27 @@ fn find_capture_target(hda: &Hda) -> Option<(u8, u8, u8)> {
                 continue;
             }
             if let Some(source_nid) = pin.connection {
-                let is_adc = widgets.iter().flatten().any(|w| {
+                let adc = widgets.iter().flatten().find(|w| {
                     w.nid == source_nid && w.widget_type == WidgetType::AudioInput
                 });
-                if is_adc {
-                    return Some((codec.address, source_nid, pin.nid));
+                if let Some(adc) = adc {
+                    let max_channels = adc.max_channels.min(pin.max_channels);
+                    return Some((codec.address, source_nid, pin.nid, max_channels));
                 }
             }
         }
 
-        let adc_nid = widgets
+        let adc = widgets
             .iter()
             .flatten()
-            .find(|w| w.widget_type == WidgetType::AudioInput)
-            .map(|w| w.nid);
-        let pin_nid = widgets
+            .find(|w| w.widget_type == WidgetType::AudioInput);
+        let pin_widget = widgets
             .iter()
             .flatten()
-            .find(|w| w.widget_type == WidgetType::Pin && w.pin_input_capable)
-            .map(|w| w.nid);
-        if let (Some(adc_nid), Some(pin_nid)) = (adc_nid, pin_nid) {
-            return Some((codec.address, adc_nid, pin_nid));
+            .find(|w| w.widget_type == WidgetType::Pin && w.pin_input_capable);
+        if let (Some(adc), Some(pin_widget)) = (adc, pin_widget) {
+            let max_channels = adc.max_channels.min(pin_widget.max_channels);
+            return Some((codec.address, adc.nid, pin_widget.nid, max_channels));
         }
     }
     None
@@ -1134,11 +1247,21 @@ fn setup_playback(hda: &mut Hda) {
     if hda.output_stream_count == 0 {
         return;
     }
-    let Some((cad, dac_nid, pin_nid)) = find_playback_target(hda) else {
+    let Some((cad, dac_nid, pin_nid, negotiated_channels)) = find_playback_target(hda) else {
         return;
     };
+    // Clamp to this driver's own ceiling (`MAX_NEGOTIATED_CHANNELS`) and
+    // never below 1 -- `widget_max_channels` already returns a value
+    // >= 1, but a defensive `.max(1)` costs nothing and keeps this
+    // function correct even against a widget reporting something
+    // unexpected.
+    let channels = negotiated_channels.clamp(1, MAX_NEGOTIATED_CHANNELS);
+    let format = format_for_channels(channels);
+    let bytes_per_frame = channels as u32 * BYTES_PER_SAMPLE;
+    let period_bytes = PLAYBACK_PERIOD_FRAMES * bytes_per_frame;
+    let buffer_bytes = PLAYBACK_TOTAL_FRAMES * bytes_per_frame;
 
-    let buffer_frames = (PLAYBACK_BUFFER_BYTES as usize).div_ceil(pmem::FRAME_SIZE as usize);
+    let buffer_frames = (buffer_bytes as usize).div_ceil(pmem::FRAME_SIZE as usize);
     let Some(buffer_addr) = pmem::allocate_contiguous(buffer_frames) else {
         return;
     };
@@ -1146,17 +1269,18 @@ fn setup_playback(hda: &mut Hda) {
         return;
     };
     unsafe {
-        core::ptr::write_bytes(buffer_addr as *mut u8, 0, PLAYBACK_BUFFER_BYTES as usize);
+        core::ptr::write_bytes(buffer_addr as *mut u8, 0, buffer_bytes as usize);
     }
     for half in 0..PLAYBACK_PERIOD_COUNT {
-        let addr = (buffer_addr as u64) + (half * PLAYBACK_PERIOD_BYTES) as u64;
-        write_bdl_entry(bdl_addr, half, addr, PLAYBACK_PERIOD_BYTES, BDL_FLAG_IOC);
+        let addr = (buffer_addr as u64) + (half * period_bytes) as u64;
+        write_bdl_entry(bdl_addr, half, addr, period_bytes, BDL_FLAG_IOC);
     }
 
     // First output stream index -- input streams occupy the low indices
     // (see `STREAM_BASE`'s own doc comment).
     let stream_index = hda.input_stream_count;
     hda.stream_index = Some(stream_index);
+    hda.playback_channels = channels;
     hda.buffer_addr = buffer_addr;
 
     let stream_off = stream_offset(stream_index);
@@ -1174,9 +1298,9 @@ fn setup_playback(hda: &mut Hda) {
         return;
     }
 
-    write_u32(hda.mmio_base, stream_off + SD_CBL, PLAYBACK_BUFFER_BYTES);
+    write_u32(hda.mmio_base, stream_off + SD_CBL, buffer_bytes);
     write_u16(hda.mmio_base, stream_off + SD_LVI, (PLAYBACK_PERIOD_COUNT - 1) as u16);
-    write_u16(hda.mmio_base, stream_off + SD_FORMAT, PLAYBACK_FORMAT as u16);
+    write_u16(hda.mmio_base, stream_off + SD_FORMAT, format as u16);
     write_u32(hda.mmio_base, stream_off + SD_BDLPL, bdl_addr);
     write_u32(hda.mmio_base, stream_off + SD_BDLPU, 0);
 
@@ -1186,13 +1310,27 @@ fn setup_playback(hda: &mut Hda) {
     // the verb is simply ignored) is not treated as fatal -- the stream
     // is started regardless, exactly as generously as this driver
     // already treats an unanswered verb during discovery.
-    hda.send_corb_command(verb16(cad, dac_nid, AC_VERB_SET_STREAM_FORMAT, PLAYBACK_FORMAT));
+    hda.send_corb_command(verb16(cad, dac_nid, AC_VERB_SET_STREAM_FORMAT, format));
     hda.send_corb_command(verb(
         cad,
         dac_nid,
         AC_VERB_SET_CHANNEL_STREAMID,
         (PLAYBACK_STREAM_TAG << 4) & 0xf0,
     ));
+    // Only sent when negotiation actually found more than the base
+    // stereo pair -- a widget reporting `chan_cnt_ext = 0` (every QEMU
+    // synthetic codec this driver has been tested against) implies
+    // `channels <= 2`, where this verb is both unnecessary and not
+    // guaranteed to be understood; see `AC_VERB_SET_CVT_CHAN_COUNT`'s own
+    // doc comment.
+    if channels > 2 {
+        hda.send_corb_command(verb(
+            cad,
+            dac_nid,
+            AC_VERB_SET_CVT_CHAN_COUNT,
+            (channels - 1) as u32,
+        ));
+    }
     hda.send_corb_command(verb16(
         cad,
         dac_nid,
@@ -1240,11 +1378,16 @@ fn setup_capture(hda: &mut Hda) {
     if hda.input_stream_count == 0 {
         return;
     }
-    let Some((cad, adc_nid, pin_nid)) = find_capture_target(hda) else {
+    let Some((cad, adc_nid, pin_nid, negotiated_channels)) = find_capture_target(hda) else {
         return;
     };
+    let channels = negotiated_channels.clamp(1, MAX_NEGOTIATED_CHANNELS);
+    let format = format_for_channels(channels);
+    let bytes_per_frame = channels as u32 * BYTES_PER_SAMPLE;
+    let period_bytes = PLAYBACK_PERIOD_FRAMES * bytes_per_frame;
+    let buffer_bytes = PLAYBACK_TOTAL_FRAMES * bytes_per_frame;
 
-    let buffer_frames = (PLAYBACK_BUFFER_BYTES as usize).div_ceil(pmem::FRAME_SIZE as usize);
+    let buffer_frames = (buffer_bytes as usize).div_ceil(pmem::FRAME_SIZE as usize);
     let Some(buffer_addr) = pmem::allocate_contiguous(buffer_frames) else {
         return;
     };
@@ -1252,11 +1395,11 @@ fn setup_capture(hda: &mut Hda) {
         return;
     };
     unsafe {
-        core::ptr::write_bytes(buffer_addr as *mut u8, 0, PLAYBACK_BUFFER_BYTES as usize);
+        core::ptr::write_bytes(buffer_addr as *mut u8, 0, buffer_bytes as usize);
     }
     for half in 0..PLAYBACK_PERIOD_COUNT {
-        let addr = (buffer_addr as u64) + (half * PLAYBACK_PERIOD_BYTES) as u64;
-        write_bdl_entry(bdl_addr, half, addr, PLAYBACK_PERIOD_BYTES, BDL_FLAG_IOC);
+        let addr = (buffer_addr as u64) + (half * period_bytes) as u64;
+        write_bdl_entry(bdl_addr, half, addr, period_bytes, BDL_FLAG_IOC);
     }
 
     // First input stream index (see `STREAM_BASE`'s own doc comment on
@@ -1264,6 +1407,7 @@ fn setup_capture(hda: &mut Hda) {
     // `setup_playback`'s `input_stream_count`-offset output index).
     let stream_index: u8 = 0;
     hda.capture_stream_index = Some(stream_index);
+    hda.capture_channels = channels;
     hda.capture_buffer_addr = buffer_addr;
 
     let stream_off = stream_offset(stream_index);
@@ -1279,19 +1423,27 @@ fn setup_capture(hda: &mut Hda) {
         return;
     }
 
-    write_u32(hda.mmio_base, stream_off + SD_CBL, PLAYBACK_BUFFER_BYTES);
+    write_u32(hda.mmio_base, stream_off + SD_CBL, buffer_bytes);
     write_u16(hda.mmio_base, stream_off + SD_LVI, (PLAYBACK_PERIOD_COUNT - 1) as u16);
-    write_u16(hda.mmio_base, stream_off + SD_FORMAT, PLAYBACK_FORMAT as u16);
+    write_u16(hda.mmio_base, stream_off + SD_FORMAT, format as u16);
     write_u32(hda.mmio_base, stream_off + SD_BDLPL, bdl_addr);
     write_u32(hda.mmio_base, stream_off + SD_BDLPU, 0);
 
-    hda.send_corb_command(verb16(cad, adc_nid, AC_VERB_SET_STREAM_FORMAT, PLAYBACK_FORMAT));
+    hda.send_corb_command(verb16(cad, adc_nid, AC_VERB_SET_STREAM_FORMAT, format));
     hda.send_corb_command(verb(
         cad,
         adc_nid,
         AC_VERB_SET_CHANNEL_STREAMID,
         (CAPTURE_STREAM_TAG << 4) & 0xf0,
     ));
+    if channels > 2 {
+        hda.send_corb_command(verb(
+            cad,
+            adc_nid,
+            AC_VERB_SET_CVT_CHAN_COUNT,
+            (channels - 1) as u32,
+        ));
+    }
     hda.send_corb_command(verb16(
         cad,
         adc_nid,
@@ -1456,6 +1608,18 @@ fn discover_codecs(hda: &mut Hda) {
     }
 }
 
+/// Computes a widget's maximum supported channel count from its raw
+/// `AUDIO_WIDGET_CAP` value -- see `AC_WCAP_CHAN_CNT_EXT_SHIFT`'s own doc
+/// comment for the formula and its Linux-kernel citation.
+fn widget_max_channels(cap: u32) -> u8 {
+    if cap & AC_WCAP_STEREO == 0 {
+        1
+    } else {
+        let ext = (cap >> AC_WCAP_CHAN_CNT_EXT_SHIFT) & AC_WCAP_CHAN_CNT_EXT_MASK;
+        (((ext << 1) | 1) + 1) as u8
+    }
+}
+
 /// Reads the root node's `NODE_COUNT` to find its subordinate nodes,
 /// then reads each one's `FUNCTION_TYPE` looking for
 /// `AC_GRP_AUDIO_FUNCTION`. Real codecs may expose more than one
@@ -1515,6 +1679,7 @@ fn enumerate_afg_widgets(
         };
         let widget_type = WidgetType::from_raw(((cap >> AC_WCAP_TYPE_SHIFT) & AC_WCAP_TYPE_MASK) as u8);
         let stereo = cap & AC_WCAP_STEREO != 0;
+        let max_channels = widget_max_channels(cap);
 
         let mut pin_output_capable = false;
         let mut pin_input_capable = false;
@@ -1547,6 +1712,7 @@ fn enumerate_afg_widgets(
                 nid,
                 widget_type,
                 stereo,
+                max_channels,
                 pin_output_capable,
                 pin_input_capable,
                 connection,

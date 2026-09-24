@@ -4861,6 +4861,129 @@ against QEMU's own HDA emulation, the same rigor and the same open
 real-hardware caveat every other driver in this project carries until a
 physical card actually confirms it.
 
+### Intel HDA, step six: real per-codec multichannel negotiation
+
+Every playback/capture stream up to this point was fixed at 2 channels
+(stereo), the same ceiling ES1370 has for a genuine silicon reason (its
+`SERIAL_CONTROL` format field only ever encodes mono or stereo). HDA has
+no such ceiling in its own spec -- a converter widget's
+`AUDIO_WIDGET_CAP` parameter carries a real
+`AC_WCAP_CHAN_CNT_EXT` field (bits 13:15) reporting how many channels
+beyond the base stereo pair it actually supports, and the stream-format
+encoding both the controller's own `SD_FORMAT` register and
+`AC_VERB_SET_STREAM_FORMAT` share already has room for up to 16 channels
+in its low nibble -- so this was a real, unnecessary gap between what
+HDA-based real hardware (a 4/6/8-channel-capable Sound Blaster PCI or
+motherboard codec, exactly the "box of different sound cards" this
+multichannel effort was originally scoped around) can do and what this
+driver ever asked for.
+
+**The authoritative channel-count formula**, confirmed directly from
+Linux's own HDA driver source (`include/sound/hdaudio.h`'s
+`snd_hdac_get_wcaps_channels`, and `sound/hda/common/hda_local.h`'s
+identical `get_wcaps_channels`):
+
+```
+ext = (wcaps & AC_WCAP_CHAN_CNT_EXT) >> 13;
+channels = ((ext << 1) | 1) + 1;
+```
+
+This formula is only meaningful once `AC_WCAP_STEREO` (a separate bit,
+already read by this driver's existing `widget.stereo` field) is
+confirmed set -- Linux's own caller (`sound/hda/common/proc.c`) always
+gates on that bit before ever computing this formula, and this driver's
+new `widget_max_channels(cap: u32) -> u8` helper mirrors that exactly: a
+mono-only widget (stereo bit clear) reports `1` regardless of whatever
+its `chan_cnt_ext` field happens to contain, since that field's meaning
+is only defined relative to an existing stereo pair.
+
+**A second, genuinely separate verb is required to *activate* more than
+2 channels**, not just to encode the count in the stream format:
+`AC_VERB_SET_CVT_CHAN_COUNT` (`0x72d`, `verb()` category, confirmed
+against Linux's `include/sound/hda_verbs.h`), payload `channels - 1`.
+This is distinct from both `AC_VERB_SET_CHANNEL_STREAMID` (`0x706`,
+assigns a stream tag and *starting* channel only, already sent
+unconditionally by `setup_playback`/`setup_capture`) and
+`AC_VERB_SET_STREAM_FORMAT` (which encodes the channel count in the
+format word, but per spec does not by itself widen a converter beyond
+its default stereo activation). This driver sends
+`SET_CVT_CHAN_COUNT` only when negotiation settles on more than 2
+channels -- a widget reporting `chan_cnt_ext = 0` implies `channels <=
+2`, where the verb is both unnecessary and not guaranteed to be
+understood, consistent with this driver's existing "an unanswered verb
+is not fatal" convention for every other optional codec-side step.
+
+**Widget discovery** (`enumerate_afg_widgets`) now computes and stores
+`max_channels: u8` on every `WidgetInfo` via `widget_max_channels`, right
+alongside the existing `stereo` field it depends on. **Target
+resolution** (`find_playback_target`/`find_capture_target`) now returns
+a 4th tuple element, `min(converter.max_channels, pin.max_channels)` --
+the pin itself can independently cap the real channel count on a codec
+whose physical jack wiring supports fewer channels than its converter
+electronics could otherwise drive, so the negotiated ceiling must
+account for both widgets, not just the DAC/ADC. **`setup_playback`/
+`setup_capture`** each clamp that negotiated value to `1..=
+MAX_NEGOTIATED_CHANNELS` (a new driver-side ceiling, `8`, chosen as a
+practical stopping point comfortably covering 7.1 surround without
+unbounded growth) and compute their own local `format`/`bytes_per_frame`/
+`period_bytes`/`buffer_bytes` from it via the new
+`format_for_channels(channels) -> u32` helper (generalizing the old
+fixed `PLAYBACK_FORMAT` constant), rather than assuming a single fixed
+2-channel size everywhere. Playback and capture negotiate and store
+their own channel counts independently (`Hda::playback_channels`/
+`Hda::capture_channels`, both defaulting to `2` before either stream is
+brought up) precisely because a codec's ADC and DAC converters need not
+report the same `AC_WCAP_CHAN_CNT_EXT` capability -- `fill_period`/
+`drain_capture_period` each read their own direction's negotiated
+per-frame byte size via new `playback_bytes_per_frame`/
+`playback_period_bytes`/`capture_bytes_per_frame`/`capture_period_bytes`
+methods instead of a single shared constant.
+
+**One pre-existing, accepted ABI limitation this task does not
+resolve**: `audio.rs`'s tape-facing `Audio::format()` is one shared
+method per device, used by the tape ABI's `audio_channels_and_bits`/
+`_at` callbacks for *both* `audio_submit` (playback) and
+`audio_capture` (capture) directions. `Hda::format()` therefore reports
+`playback_channels` specifically (surround/speaker output being the
+primary motivation for this work), not a per-direction pair -- on a
+real codec whose ADC and DAC negotiate genuinely different channel
+counts, a tape reading captured bytes via `audio_capture`/`_at` should
+not assume they match `format()`'s reported channel count. This mirrors
+an identical, already-accepted asymmetry in `Es1370`'s own single shared
+`format()` method, and in practice is a non-issue against every existing
+QEMU test today, since QEMU's codecs negotiate both directions down to 2
+either way.
+
+**QEMU is a hard verification ceiling for this specific feature, not
+just the usual "not yet tested against real hardware" caveat.** Every
+one of QEMU's synthetic HDA codec models (`hda-output`/`hda-duplex`/
+`hda-micro`, confirmed directly by reading `hw/audio/hda-codec.c`)
+reports `chan_cnt_ext = 0` on every widget it exposes, and QEMU's own
+`hda_codec_parse_fmt()` performs no capability check against a
+converter's real channel count at all -- meaning every existing and
+future automated QEMU-based test can only ever exercise the "negotiate
+down to the base stereo pair" path through this new logic, never the
+>2-channel path itself, `SET_CVT_CHAN_COUNT` being sent, or
+`format_for_channels` producing anything but its 2-channel value. This
+is the same honestly-documented class of gap this project already
+accepts for I350 (no QEMU model exists at all) and real-microphone ADC
+content (QEMU's audiodev backends have no fake-microphone input) --
+here, a QEMU model exists and is exercised, but its codec's own reported
+capabilities cannot exercise this feature's actual new code path.
+Confirming genuine >2-channel negotiation, the `SET_CVT_CHAN_COUNT`
+verb's real effect, and audible surround output all remain open,
+physical-hardware-only verification steps against the user's own
+multichannel-capable Sound Blaster PCI cards.
+
+Verified with the full existing HDA/audio test suite
+(`tapes/test_hda_e2e.py`, `test_hda_playback_e2e.py`,
+`test_hda_multi_e2e.py`, `test_hda_capture_e2e.py`,
+`test_audio_capture_e2e.py`, `test_audio_multi_e2e.py`,
+`test_audio_net_e2e.py`, `test_audio_net_multi_e2e.py`, and `make
+test`), all passing unmodified -- expected, since every QEMU codec this
+project tests against negotiates to exactly 2 channels either way, so
+this change is provably additive and non-regressing for every currently
+automatable scenario.
 
 - Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
   userspace, scheduling,
