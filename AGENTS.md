@@ -174,7 +174,7 @@ fixed address below `0x60000`, and update it in the same change that adds one:
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
 | `0x9f000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer, just below the conventional End-of-Low-Memory / EBDA boundary. |
-| `0x10000`-`0x60000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
+| `0x10000`-`0x90000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
 | `0x100000`-`0x500000` | `kernel/src/pmem.rs` (`TAPE_BASE`/`TAPE_LEN`), any tape's own linker script | The fixed 4 MiB region every tape (`tape load disk`/`tape load net`) is always loaded into, carved out of `pmem`'s general frame pool at boot so `allocate`/`allocate_contiguous`/`palloc` can never hand these frames to anything else. See "Tapes: fixed load address, and writing one in Rust" below. |
 
 ## Educational verbosity
@@ -4015,7 +4015,758 @@ and RMS 5449.1, clearly a real signal well above a silence noise floor,
 not the false-positive "PASS" the earlier section's `bytes_sent == 0`
 guard was added specifically to prevent.
 
-## Deliberately deferred work
+### Multi-instance ES1370: more than 2 channels via several physical cards
+
+Raised directly by the user's stated goal: could fos support more than
+ES1370's hard 2-channel silicon ceiling (see "Real-time audio streaming:
+the ES1370 driver" above) -- 4 or 8 channels, say -- if bandwidth allows?
+ES1370's `SERIAL_CONTROL` format field only ever encodes mono/stereo
+8-/16-bit PCM (re-confirmed against QEMU's own `hw/audio/es1370.c`), so
+more channels from *one* card is not on the table; two options were
+weighed instead: combine several independent physical ES1370-family
+cards (the user's own box of assorted Sound Blaster PCI cards, each an
+independent stereo pair), or build a driver for a genuinely
+multi-channel codec family (Intel HDA). The user chose to build the
+multi-card path first, deferring HDA to a later session.
+
+**The driver/facade conversion mirrors `nic.rs`/`rtl8139.rs`'s existing
+multi-instance pattern exactly, not a new design.** `kernel/src/
+es1370.rs`'s singleton `static mut CARD: Option<Es1370>` became
+`CARDS: [Option<Es1370>; MAX_INSTANCES]` (`MAX_INSTANCES = 4`, chosen the
+same way `rtl8139.rs`'s/`nic.rs`'s own small fixed caps are -- comfortably
+above what any one real machine is likely to carry, without an unbounded
+or dynamically-sized array this kernel's no-heap design can't support
+anyway) plus a `CARD_COUNT`; `initialize()` became `initialize_all() ->
+Result<usize, Status>`, walking every PCI match `pci::find_devices`
+returns (up to `MAX_INSTANCES`) and calling a new `init_card(address)`
+helper (the same per-card bring-up `initialize()` used to do once,
+unchanged in substance) for each; `get()` became `get(index: usize) ->
+Option<&'static Es1370>`; and `handle_pci_irq` now iterates every card
+instead of checking one, exactly mirroring `nic.rs`'s own IRQ dispatch --
+safe for the identical reason the ES1370+RTL8139 shared-IRQ-line fix
+already established (every backend's own `handle_interrupt()` checks its
+own status register first and no-ops harmlessly if it isn't the actual
+source, so calling every card's handler on a shared line costs nothing
+beyond that one check). Each card's own DAC1/ADC ring buffers
+(`RINGS`/`CAPTURE_RINGS`) became `[audio::PcmRing; MAX_INSTANCES]`
+arrays too, indexed by a new `instance: usize` field stored on each
+`Es1370` -- so every ring-touching method (`submit`, `capture`,
+`ring_backlog`, `capture_backlog`, `fill_period`,
+`drain_capture_period`) now reaches its own card's own ring, never
+another card's.
+
+`kernel/src/audio.rs`'s facade mirrors this identically:
+`DEVICES: [Option<Audio>; MAX_DEVICES]`/`DEVICE_COUNT` replace the former
+`ACTIVE`, `initialize()` now calls `es1370::initialize_all()` and
+populates every discovered slot, and new `get_at(index)`/`count()`
+functions join the existing `get()` (kept meaning "device 0", purely for
+backward compatibility with the non-indexed tape ABI callbacks that
+predate this feature). **Deliberately, and unlike `nic.rs`, there is no
+"active device" selection concept at all** (no `set_active`/
+`ACTIVE_INDEX`) -- the entire point of driving several cards is to use
+all of them *simultaneously* as independent stereo pairs for one
+combined multichannel stream, not to pick one card at a time the way
+`nic use N` picks one NIC. A tape wanting genuine multichannel output is
+expected to address every device by index, not switch between them.
+
+**The tape ABI grew five more trailing callbacks**, following the exact
+same append-only-cdecl convention as every prior ABI growth in this
+document: `tape_audio_count() -> u32` (how many devices were found) and
+four index-based counterparts to the existing non-indexed audio
+callbacks -- `tape_audio_sample_rate_at`,
+`tape_audio_channels_and_bits_at`, `tape_audio_submit_at`, and
+`tape_audio_capture_at` (all taking a 0-based device index as their first
+argument, matching `nic_mac_at`'s own indexing convention). Every
+existing tape ignores all nine audio callbacks (five new, four
+pre-existing) exactly like any other trailing cdecl argument; the
+existing `tape_audio_sample_rate`/`tape_audio_channels_and_bits`/
+`tape_audio_submit`/`tape_audio_capture` callbacks keep meaning "device
+0" unchanged.
+
+**`audio` (the shell command) was rewritten to report every discovered
+device, not the single one it used to assume.** It now prints an overall
+`N audio device(s) found:` line, then one indexed block per device
+(`[0] ES1370 at I/O base 0x...`, followed by that device's own
+IRQ/DAC1/ADC/backlog/underrun/overrun diagnostics, each indented two
+spaces) -- deliberately allowed to scroll past one screen once several
+real cards are attached, the same `pci` precedent already established
+for an inherently unbounded hardware listing. This changed the exact
+text `audio` prints (the former single-device `"ES1370 found: I/O base
+0x...` line is gone), which broke two pre-existing tests' own marker
+strings (`test_audio_capture_e2e.py`'s `b"ES1370 found"` check and
+`test_audio_net_e2e.py`'s identical one) purely because they searched for
+that literal, now-removed substring -- both were updated to look for
+`b"[0] ES1370"` instead, confirmed passing again afterward. No other
+test needed a change; `test_audio_net_real_mic_e2e.py`'s own marker
+(`b"Raw STATUS register"`, chosen specifically to be a true line-tail
+rather than a prefix -- see that section's own note on this exact class
+of bug) still appears verbatim, just now indented two spaces under its
+device's own block.
+
+**Reserved low-memory region grew again, from `0x60000` to `0x80000`.**
+Growing `MAX_INSTANCES`-many copies of every per-card static (DMA
+buffers, ring arrays, `CARDS`) pushed `__kernel_end` well past the
+previous ceiling. Measuring the real overflow needed the same technique
+this document's own audio-ring-sizing investigation above used:
+temporarily raise the linker `ASSERT` to something absurd (`0x200000`),
+build, then read `.bss`'s real start/size back out of `readelf -S`
+directly, since the `ASSERT` failure itself reports no numeric detail --
+this measured `.bss` starting at `0x37000`, sized `0x41fb4`, giving
+`__kernel_end = 0x78fb4`. `0x80000` was chosen as the new ceiling
+(roughly 28.75 KB of headroom above that measurement) and, as this
+project's "Low-memory map" section requires, all four constants that
+must always move together were updated in the same change:
+`kernel/linker.ld`'s `ASSERT`, `kernel/src/pmem.rs`'s `RESERVED_BELOW`,
+`tools/write_layout.py`'s `KERNEL_RESERVED_END`, and `tools/
+write_netrom_layout.py`'s `MAX_KERNEL_BYTES` -- plus a sixth,
+undocumented-until-now spot this same grep sweep turned up:
+`boot/stage2.S`'s soft-reboot page-touch/resync loop had its own
+hardcoded `0x70000` bound that also needed updating to `0x80000`, since
+it is not derived from any of the four "official" constants at all.
+
+**A fifth dependency this project's own soft-reboot documentation
+already warned about, checked and confirmed necessary again**:
+`kernel/src/debug.rs`'s `SLOT1_LBA`/`SLOT_SECTORS` constants (used by the
+A/B kernel-slot machinery) are not automatically derived from
+`KERNEL_RESERVED_END` and had to be manually recomputed (`python3
+tools/write_layout.py --kernel build/kernel.bin --output /dev/stdout`)
+and copied in by hand -- `SLOT1_LBA` moved `2849 -> 2977`, `SLOT_SECTORS`
+moved `768 -> 896`. `debug.rs`'s own doc comment (which already
+documents an earlier real crash caused by exactly this drift) was
+extended with this session's growth as a second confirming data point.
+Re-running `tools/write_layout.py` after every later shell-only ABI
+change (which does not change kernel size at the sector-rounding
+granularity) confirmed these two values did not need to move again for
+those later, smaller edits -- only the ring-array-driven growth above
+actually crossed a sector boundary.
+
+**Verified with `tapes/test_audio_multi_e2e.py`** (not part of `make
+test`; run via the new `make test-audio-multi` target): two independent
+QEMU-emulated ES1370 devices, each with its own `none` audiodev backend
+(chosen for the same environment-portability reason
+`test_audio_capture_e2e.py` already gives), are confirmed discovered at
+two distinct I/O bases (not the same device reported twice), both
+report the expected 44100 Hz/2ch/16-bit format independently, and both
+devices' DAC1 period counts keep advancing independently and
+simultaneously over a 1.5-second window -- the concrete proof that the
+array-of-instances refactor genuinely drives two separate cards rather
+than aliasing one card's state onto the other. This test deliberately
+scopes itself to the driver/facade/shell-command plumbing only, not the
+new tape-ABI callbacks themselves (`tape_audio_count`/`..._at`); those
+remain to be exercised by a future update to `tapes/audio-net` (the
+actual multichannel streaming payoff), not yet built as of this writing.
+`make test` (the full existing regression suite) was re-run after this
+whole refactor and passed unmodified, confirming no regression to any
+existing NIC/audio/disk/boot behavior from either the driver conversion
+or the reserved-region growth.
+
+`tapes/audio-net`'s own move to genuine multichannel streaming --
+designing a wire format that declares a device/channel count and
+interleaves PCM across several independent stereo devices, and extending
+`AUDIO_TAG_START`/`AUDIO_TAG_DATA` to carry it -- is the next planned
+increment, not yet started as of this writing.
+
+### `tapes/audio-net`'s wire protocol grows a per-device tag, instead of interleaving
+
+The multichannel-streaming increment flagged above as "not yet started"
+raised a real design fork: should one combined multi-card stream be a
+single frame format interleaving every device's samples together (e.g.
+`[dev0-L, dev0-R, dev1-L, dev1-R, ...]` per frame), or should each
+device keep its own independently tagged sub-stream sharing one session?
+
+**Tagged per-device sub-streams were chosen, not interleaving**, for the
+same reason this project's other wire protocols already tolerate
+occasional loss as "a glitch, not an abort" (see `AUDIO_TAG_DATA`'s own
+original doc comment, and `TERM_TAG_DATA`'s identical reasoning above):
+an interleaved frame's channels are only meaningful relative to each
+other, so one dropped frame -- routine on this project's best-effort,
+no-retransmission protocol family -- would desynchronize *every*
+channel's byte alignment permanently, with no way to recover it later.
+A dropped frame in a tagged sub-stream, by contrast, only glitches that
+one device; every other device's own sub-stream is completely
+unaffected. Tagging is also the more natural fit for genuinely
+independent multi-card hardware (as opposed to one hypothetical
+multichannel codec): each physical Sound Blaster card's sub-stream can
+be sent, dropped, or resent independently, arrive over a different NIC,
+or have its sender join/leave the session at a different time --
+`listen_mode`'s "first `AUDIO_TAG_START` from any device index locks the
+peer" design (below) depends directly on this independence.
+
+**Wire format, extended, not replaced:**
+
+| Tag | Payload (was) | Payload (now) |
+| --- | --- | --- |
+| `AUDIO_TAG_START` | `sample_rate:u32 LE, channels:u8, bits:u8` (6 bytes) | adds a trailing `device_index:u8` (7 bytes) |
+| `AUDIO_TAG_DATA` | `length:u16 LE` + PCM | adds a leading `device_index:u8` before the existing `length:u16 LE` + PCM (`DATA_HEADER_LEN` grew 2 -> 3 bytes) |
+| `AUDIO_TAG_STOP` | no payload | unchanged -- still ends the *entire* session, not one device's sub-stream |
+
+This is a breaking wire-protocol change, not an additive one -- accepted
+deliberately, since (unlike, say, NETFS/KUP) nothing outside this
+project's own paired sender/receiver ever speaks this exact protocol, so
+there is no interoperability cost to changing the payload layout
+outright rather than growing it compatibly. `MAX_DEVICES = 4` is a new
+tape-side constant deliberately mirroring `kernel/src/es1370.rs`'s
+`MAX_INSTANCES`, duplicated rather than shared (no header mechanism
+crosses the kernel/tape boundary, the same situation every other
+tape-side mirrored constant in this project is already in).
+
+**`listen_mode` was rewritten for per-device demultiplexing.** It now
+queries `audio_count()` (clamped to `MAX_DEVICES`) and prints every
+locally attached device's own format up front, then tracks
+`local_formats`/`device_active` arrays across the session. The *first*
+`AUDIO_TAG_START` received from any peer, for any device index, locks
+that peer's MAC as the session's `source` (mirroring `tape_load_net`'s
+existing "first sender wins" convention) and resets every device's
+active/byte-counter state for the new session; any *later* `AUDIO_TAG_
+START` from that same locked peer, naming a different device index, is
+then accepted as an additional sub-stream within the same session
+(printed as `"device N sub-stream active"`) rather than being rejected
+or re-locking the source. Each sub-stream's declared format is validated
+against that specific local device's own real format independently --
+one device's stream can be rejected as a mismatch while another
+device's stream is accepted in the same session, since resampling is
+still out of scope exactly as it always was. `AUDIO_TAG_DATA` frames are
+demultiplexed by their leading `device_index` byte to the matching
+local device's `audio_submit_at(index, ...)`; an out-of-range or not-yet-
+activated device index is silently dropped, mirroring the existing
+"drop what can't be understood" tolerance this protocol family already
+has elsewhere. Byte counters (`bytes_received`/`bytes_played`/`bytes_
+dropped`) remain one running session-wide total across every device's
+sub-stream combined, not broken out per device -- this matches the
+existing single-device summary's own granularity and was not considered
+important enough to change.
+
+**`capture_mode` was rewritten to round-robin across local devices.**
+It queries `audio_count()`, prints every device's format, sends one
+tagged `AUDIO_TAG_START` per local device up front (each carrying that
+device's own real format and index), and its main loop now polls
+`audio_capture_at(index, ...)` for every attached device once per pass,
+sending a tagged `AUDIO_TAG_DATA` frame for whichever device(s)
+produced a non-empty result that pass -- so one slow or silent device's
+capture never blocks another device's sub-stream from being forwarded
+promptly. `send_mode` (the pre-recorded-file replay stand-in for live
+capture) is unaffected in spirit -- it still replays exactly one file at
+the fixed 44100 Hz/2ch/16-bit format -- but now tags every frame it
+sends with a new `SEND_DEVICE_INDEX = 0` constant, since the wire format
+requires a device index on every frame regardless of how many devices
+are actually involved.
+
+**Verified with a new, dedicated e2e test, `tapes/test_audio_net_multi_
+e2e.py`** (not part of `make test`, mirroring every other tape e2e
+harness): two QEMU-emulated ES1370 cards, each with its own `wav`
+audiodev backend, are driven through one `audio-net` listen-mode
+session carrying two independently tagged sub-streams at once -- device
+0 gets a real, non-silent 440 Hz tone, device 1 gets genuine PCM
+silence (all-zero samples), sent interleaved frame-by-frame over the
+same session. The test deliberately does not just check "some audio
+played somewhere": it asserts device 0's captured WAV contains the real
+tone (peak amplitude comfortably above a silence floor) *and* device 1's
+captured WAV settles to near-zero amplitude once its own sub-stream
+starts submitting silence -- if `device_index` demuxing were broken
+(e.g. both sub-streams aliased onto the same local device, or one
+silently swapped for the other), this is exactly the check that would
+catch it. One real measurement subtlety surfaced while writing this
+test and is worth remembering for any future audio-capture-verifying
+test: a device's own captured WAV file spans its *entire* guest
+lifetime, including the boot-time narration before any tape ever ran --
+during which every device still plays its default ~441 Hz idle test
+tone (see `network_mode`'s own doc comment in `kernel/src/es1370.rs`:
+"there is no way back to the test tone without a reboot" once a
+device's first `audio_submit`/`audio_submit_at` call flips it into
+network-fed mode) -- so a naive whole-file peak check on the
+"expected silent" device would spuriously fail on that earlier idle
+tone. The fix was to check only the *tail* of that device's capture
+(after a deliberate `time.sleep(1.0)` once the streaming session's byte
+counts are confirmed, giving the device time to settle into pure
+post-submission silence) rather than the whole file -- the device-with-
+a-real-tone's check does not need this same care, since its own
+sub-stream's tone dominates the peak regardless of when in the capture
+window it is measured.
+
+The pre-existing single-device test, `tapes/test_audio_net_e2e.py`, was
+updated (not replaced) to speak the new 7-byte `AUDIO_TAG_START`/tagged
+`AUDIO_TAG_DATA` payloads with a fixed `DEVICE_INDEX = 0`, and its
+`"Local audio device: ..."` marker was updated to match `listen_mode`'s
+new per-device-list printed format (`"Local audio device(s): N.\n  [0]
+..."`). `tapes/test_audio_net_real_mic_e2e.py` needed no changes at all,
+since it drives both peers through the real compiled tape end to end
+(never constructing raw wire frames itself) and its own markers
+(`"Streaming live ADC input"`, `"capture stopped locally"`) are
+unaffected text that only moved position within `capture_mode`'s
+rewritten body. `make test` (the full existing regression suite),
+`tapes/test_audio_capture_e2e.py`, and `tapes/test_audio_multi_e2e.py`
+were all re-run after this change and passed unmodified, confirming no
+regression to the underlying driver/facade work from the prior session.
+
+### Intel HD Audio ("HDA"): a discover-only first increment
+
+Genuine Intel HDA support -- the second hardware family the user's own
+box of sound cards includes, considered as a follow-up once ES1370
+multi-device streaming was working -- now has a first, deliberately
+narrow increment: `kernel/src/hda.rs` and the new `hda` shell command
+reset an Intel HDA controller and enumerate whatever codec(s) respond,
+reading back each one's root-node Vendor/Device ID. **There is no
+playback or capture yet** -- this step proves controller discovery and
+codec enumeration work, nothing more, the same incremental approach
+`i350.rs`'s empty `CANDIDATE_DEVICE_IDS` and the very first ES1370
+increment (test-tone-only DAC1, before ADC/network-fed streaming
+existed) both already established for this project.
+
+**HDA's controller/codec split is architecturally different from every
+prior audio/NIC backend here.** An "HDA controller" (the PCI device this
+driver discovers) is a generic DMA/verb-transport engine, not itself an
+audio device -- the actual codec(s) (DAC/ADC/mixer widgets) sit behind it
+on a private, controller-owned "CODEC" bus addressed by a small integer
+("codec address", `cad`, 0-14) and are discovered, not assumed, by
+reading a bitmask register after reset. This is a real architectural
+split ES1370 (one PCI function *is* the whole audio device) has no
+equivalent of.
+
+**The Immediate Command interface was used instead of the full CORB/RIRB
+DMA ring buffers**, specifically because it needs zero guest-memory setup
+at all -- the spec's mandatory command/response path otherwise requires
+allocating and programming two ring buffers (Command Output Ring Buffer,
+Response Input Ring Buffer) before a single verb can be sent. Confirmed
+this synchronous path is real, not a QEMU stub, by reading QEMU's own
+`intel_hda_set_ics`/`intel_hda_corb_run`/`intel_hda_response`
+(`hw/audio/intel-hda.c`, tag v10.2.1, this project's installed QEMU
+version): `IC` (offset `0x60`) holds the 32-bit verb to send; writing
+`IRS_BUSY` (bit 0 of `IRS`, offset `0x68`) submits it; polling `IRS_BUSY`
+back to clear and `IRS_VALID` (bit 1) set indicates a response is ready
+in `IR` (offset `0x64`); writing 1 to `IRS_VALID` clears it for the next
+command, per spec. Every register offset/bit here was cross-checked
+directly against QEMU's own `intel-hda-defs.h`, the same rigor this
+project applies to every other register-level driver after the RTL8139
+lessons (see "Real hardware notes" above) -- **all of it remains
+unverified against real hardware**, exactly like every other freshly
+scaffolded driver here before its first physical test.
+
+**The 32-bit verb encoding** (validated against QEMU's own
+`hda_audio_command` decode logic in `hw/audio/hda-codec.c`): a command
+word is `(cad << 28) | (nid << 20) | (verb << 8) | payload`, where `nid`
+is the target widget/node (`AC_NODE_ROOT = 0x00` for this step, since it
+only reads the root node's own Vendor/Device ID parameter) and `verb`
+here is `AC_VERB_PARAMETERS = 0xf00` (get-parameter) with payload
+`AC_PAR_VENDOR_ID = 0x00`. This single formula covers both the spec's
+12-bit "short" verbs and 4-bit "long" verbs uniformly, since their bit
+ranges never overlap -- no special-casing needed, confirmed against
+several different verb constants in QEMU's decode path.
+
+**`GCTL_CRST`'s reset polarity is the opposite of an intuitive "write 1
+to reset" convention** -- bit 0 of `GCTL` (offset `0x08`) reads 0 while
+the controller is held in hardware reset and reads/must be written 1 for
+normal operation; it is not a self-clearing pulse. `reset_controller`
+clears it, polls until it reads back 0, sets it again, and polls until
+it reads back 1 -- both transitions bounded (`IMMEDIATE_COMMAND_POLL_
+ATTEMPTS`-style spin ceilings, this project's usual "poll then give up
+cleanly" convention, not a real timeout value from the spec) -- then
+waits a short, fixed number of PIT ticks (`CODEC_ENUMERATION_WAIT_
+TICKS`) before reading `STATESTS`, since the spec allows codecs a brief
+settle period after reset before they assert their own presence bit.
+
+**Only QEMU-confirmed PCI IDs are registered for now** -- Intel
+`0x8086:0x2668` (`intel-hda`, ich6) and `0x8086:0x293e`
+(`ich9-intel-hda`) -- following the same "don't guess real-hardware IDs,
+confirm via `pci` first" convention `i350.rs`'s empty candidate list
+already established; the user's actual Sound Blaster PCI cards will need
+their real vendor/device IDs read via the existing `pci` command before
+being added here. **Single-instance for this step** (only the first
+matching controller found is driven), a deliberate scope-narrowing
+documented in `hda.rs`'s own module doc comment, not a hard ceiling --
+mirroring how `es1370.rs` itself started single-instance before growing
+`MAX_INSTANCES` once multi-card streaming became a real, motivated need.
+
+**QEMU's synthetic codec identity, confirmed empirically, not just from
+reading source**: `hda-output`/`hda-duplex`/`hda-micro` all report
+Vendor ID `0x1af4` (QEMU's own convention for synthetic devices, shared
+with virtio) -- a real `-device intel-hda -device hda-duplex,audiodev=...`
+QEMU boot reported Device ID `0x0022` for `hda-duplex` specifically,
+confirming the `0x1af4:0x00xx` family predicted from reading
+`hw/audio/hda-codec-common.h` alone.
+
+Verified end to end with `tapes/test_hda_e2e.py` (not part of `make
+test`, mirroring every other tape/driver e2e harness's `term_net`-driven
+structure): boots a guest with `-device intel-hda -device
+hda-duplex,audiodev=none`, drives the `hda` shell command over a live
+`term net` session, and asserts the reported vendor ID matches `0x1af4`
+and that a second, immediately following `hda` call reports the exact
+same codec without re-probing (the command is idempotent once
+`initialize()` has already succeeded, matching every other lazy-init
+backend's `Option<Backend>`-cached convention here).
+
+CORB/RIRB DMA-ring support, real node-graph widget enumeration (walking
+each codec's Audio Function Group and its DAC/ADC/pin-complex widgets),
+stream-descriptor/BDL-based playback and capture, and format negotiation
+are all deliberately deferred to a later phase -- this increment proves
+only that the controller and codec(s) can be found and talked to at all.
+
+### Intel HDA, step two: CORB/RIRB command transport and real node-graph enumeration
+
+The natural next increment after discover-only: `kernel/src/hda.rs`
+switched entirely from the optional Immediate Command interface to
+CORB/RIRB (Command Output Ring Buffer / Response Input Ring Buffer), the
+HDA spec's mandatory command transport, and added a real node-graph
+walk -- root node -> Audio Function Group -> that AFG's own child
+widgets (DAC/ADC/pin complexes) -- replacing the prior step's "only ever
+read the root node's Vendor/Device ID" scope. Still no playback or
+capture; this is a diagnostic/plumbing increment, mirroring how ES1370
+grew in stages (test tone, then ADC, then network-fed streaming) rather
+than attempting stream DMA in one step.
+
+**Why CORB/RIRB despite Immediate Command already working.** Immediate
+Command is genuinely optional per spec -- real hardware is not required
+to implement it -- while CORB/RIRB is the transport every real
+controller must support, and it is also the same DMA-ring shape (a
+host-memory ring, a hardware-maintained write pointer, a
+software-maintained read pointer) actual stream playback's Buffer
+Descriptor Lists will need later, so building it now doubles as
+practice for that shape rather than being throwaway plumbing.
+
+**Every offset, bit, and DMA read/write-pointer semantic here was
+cross-checked directly against QEMU's own `hw/audio/intel-hda.c` (tag
+v10.2.1) source, not just header constants** -- specifically
+`intel_hda_corb_run`/`intel_hda_response`/`intel_hda_set_corb_wp`/
+`intel_hda_set_rirb_wp`, and the `regtab[]` register-definition table's
+`reset`/`wmask` fields for `CORBSIZE`/`RIRBSIZE`/`CORBRP`/`RIRBWP`. One
+practical lesson from this cross-referencing worth recording for future
+large-source-file investigations: `web_fetch` silently truncated at
+least one of these files with no truncation notice, giving an
+incomplete (and briefly misleading) picture; downloading the full file
+with `curl` and then `grep`/`sed`-ing it directly is the reliable way to
+get complete, verifiable reference source.
+
+**The CORB/RIRB read/write-pointer convention is a real gotcha, not
+obvious from the register names alone.** Both `CORBWP` and `RIRBWP` hold
+the index of the *last* written entry, not "the next free slot" --
+confirmed directly from `intel_hda_corb_run`'s `d->corb_rp = (d->corb_rp
++ 1) & 0xff` (reading the verb at that *pre-incremented* index) and
+`intel_hda_response`'s identical pre-increment before writing a
+response. So posting a new verb means: compute `(current_CORBWP + 1) &
+0xff`, write the verb into *that* ring slot, then update `CORBWP` to
+match -- writing the verb at the *current* `CORBWP` index (the
+intuitive-but-wrong reading) would silently clobber whatever slot the
+hardware last consumed, or race a still-in-flight command. `RIRBWP`
+mirrors this exactly on the read side, with one further wrinkle:
+**software has no RIRB read-pointer register at all** -- there is no
+`RIRBRP`, only `RIRBWP` (hardware's own last-written index) -- so this
+driver tracks its own "last consumed" index in a `Cell<u16>` on `Hda`
+(interior mutability, since every `send_corb_command` call takes only
+`&Hda`) and polls `RIRBWP` for it to advance to `(tracked + 1) & 0xff`
+before reading that slot.
+
+**`CORBSIZE`/`RIRBSIZE` are read-only in practice, not negotiated.**
+QEMU's own `regtab[]` gives both registers no `wmask` at all, and both
+reset to `0x42` (bit 6 set, "256-entry size supported"; bits[1:0] = `10`,
+"256 already selected"). The HDA spec does allow smaller ring sizes (2
+or 16 entries) on some real controllers, selected by writing bits[1:0],
+but since 256 is both the maximum and QEMU's only supported size,
+`setup_corb_rirb` simply reads each register back after programming the
+base-address registers and treats anything other than the 256-entry
+selection as unsupported, rather than attempting to write a particular
+size -- the safer assumption for real hardware that might likewise
+silently ignore an unsupported write.
+
+**`CORBRP`'s reset is a two-phase handshake; `RIRBWP`'s is a
+self-clearing pulse -- these are genuinely different, not two
+descriptions of the same thing.** `CORBRP_RST` (bit 15) must be set,
+polled until the readback confirms it, cleared, and polled again until
+the readback confirms *that* -- mirroring Linux's own `azx_reset`.
+`RIRBWP_RST`, by contrast, self-clears instantly per
+`intel_hda_set_rirb_wp`'s handler (`if (d->rirb_wp & ICH6_RIRBWP_RST)
+d->rirb_wp = 0;`), needing no poll at all. Getting these confused (e.g.
+polling `RIRBWP` for a bit that already cleared itself) would either
+hang or silently skip the intended reset.
+
+**`RINTCNT` must be set to its maximum (`0xff`) at setup, not left at
+its reset default**, because `intel_hda_corb_run` stalls verb processing
+once `rirb_count == RINTCNT` until software clears `RIRBSTS` -- a
+signal this driver, which only ever polls `RIRBWP` and never touches
+`RIRBSTS` at all, would never satisfy. Missing this would manifest as
+"the first handful of verbs work, then the controller silently stops
+answering" -- a real, easy-to-hit trap for a polling-only driver like
+this one.
+
+**Node-graph walk.** `find_audio_function_group` reads the root node's
+own `NODE_COUNT` parameter (start nid + count, packed as bits[23:16]/
+bits[7:0]) and checks each subordinate node's `FUNCTION_TYPE` for
+`AC_GRP_AUDIO_FUNCTION`, rather than assuming the first subordinate node
+is always the AFG -- a real codec could expose more than one function
+group (e.g. audio plus modem). `enumerate_afg_widgets` then reads the
+AFG's own `NODE_COUNT` for its child-widget range and, per widget, reads
+`AUDIO_WIDGET_CAP` (widget type via bits[23:20], stereo via bit 0) plus,
+conditionally, `PIN_CAP` (for a `Pin` widget, giving output/input
+capability) and `CONNLIST_LEN`/`GET_CONNECT_LIST` (for any widget
+reporting `AC_WCAP_CONN_LIST`, giving its first upstream connection).
+Only the short-form (one byte per entry, up to four entries) connection
+encoding is read -- sufficient for QEMU's synthetic codecs, which only
+ever expose one connection per widget in short form; a real codec's
+long-form (16-bit) entries or more than four connections would need a
+fuller parser, out of scope for this step.
+
+**Confirmed against QEMU's actual `hda-duplex` layout, not just
+predicted from source**: root (nid 0) -> AFG (nid 1) -> DAC (nid 2,
+`audio output`, stereo) -> line-out pin (nid 3, `pin complex`,
+output-capable, connected to nid 2) -> ADC (nid 4, `audio input`,
+stereo, connected to nid 5) -> line-in pin (nid 5, `pin complex`,
+input-capable). Note the ADC's connection points *at* its pin (nid 4 ->
+nid 5), the reverse direction of the DAC/output-pin pair (nid 3 -> nid
+2) -- an input path's converter reads *from* its pin, while an output
+path's pin reads *from* its converter, exactly the direction each
+signal actually flows; `tapes/test_hda_e2e.py`'s own regex assertions
+initially got this backwards and had to be corrected once the real
+output made the actual topology obvious.
+
+Verified end to end with the extended `tapes/test_hda_e2e.py`: beyond
+the prior step's vendor/device-ID and idempotency checks, it now also
+asserts the AFG nid, the DAC/line-out-pin pair (nid 2 -> nid 3
+connection), and -- when the guest is configured with `hda-duplex`
+(as this test's fixture is) -- the ADC/line-in-pin pair (nid 4 -> nid 5
+connection) all appear correctly in the `hda` command's output. `make
+test` (unrelated to HDA) was re-run unmodified and continues to pass,
+confirming no regression from this rewrite.
+
+Stream-descriptor/BDL-based playback and capture (`SD_FORMAT`, a Buffer
+Descriptor List, `SET_STREAM_FORMAT`/`SET_CHANNEL_STREAMID` verbs,
+`AC_PINCTL_OUT_EN` to actually enable a pin's output, and starting DMA
+via `SD_CTL`) remain the next, larger phase -- not yet scoped in detail.
+
+### Intel HDA, step three: more than one controller
+
+`kernel/src/hda.rs`'s own doc comment on the (then-)single-instance
+`MAX_CODECS` constant had already flagged this exact limitation as
+deliberate-but-revisitable, explicitly citing `es1370.rs`'s own
+instance-count growth (see "Multi-instance ES1370 audio driver" below)
+as the precedent to follow "once a real need for it appears" -- it
+appeared directly, from the user owning a box of several different
+physical sound cards and asking whether more than one HDA controller
+could be handled at once (e.g. one onboard controller plus a discrete
+add-in card).
+
+The conversion mirrors `es1370.rs`'s established shape exactly:
+`initialize()` became `initialize_all() -> Result<usize, Status>`
+(idempotent, returns the discovered count on success/repeat calls,
+`Status::NotPresent`/`InitFailed` unchanged otherwise), the single
+`static mut CONTROLLER: Option<Hda>` became `static mut CONTROLLERS:
+[Option<Hda>; MAX_INSTANCES]` plus a `CONTROLLER_COUNT` counter, and the
+former index-less `get()` became `get(index: usize)` (0-based, matching
+`es1370::get`'s own convention, not the shell's 1-based `nic use N`). A
+new `count()` accessor lets a caller loop `0..hda::count()` without
+needing to know `MAX_INSTANCES` itself. The per-address bring-up logic
+(PCI enable, MMIO BAR map, controller reset, CORB/RIRB ring setup, codec
+discovery) was extracted into a new `init_controller(address, instance)`
+helper -- mirroring `es1370::init_card`'s own split -- so one
+controller's bring-up failure does not prevent an already-discovered
+earlier one from being usable; `initialize_all` simply skips a failed
+address and continues. `Hda` gained one new field, `instance: usize`
+(mirroring `Es1370`'s own field of the same name and purpose), purely so
+`hda_status`'s per-controller output can print "Controller N: ..." from
+the struct itself rather than needing to be threaded through separately.
+
+**No structural change was needed to `Hda` itself, `CodecInfo`,
+`WidgetInfo`, `discover_codecs`, `find_audio_function_group`,
+`enumerate_afg_widgets`, `reset_controller`, or any register/verb
+constant** -- every one of those already operated on one controller's
+own `mmio_base`/`corb_base`/`rirb_base`, so they needed nothing beyond
+being called once per discovered address instead of once total. This is
+exactly why the conversion was safe and small: `paging::map_mmio` is
+already keyed off each controller's own distinct PCI BAR, so two
+controllers' MMIO windows, CORB/RIRB rings, and register state can never
+collide with one another simply by construction, with no extra
+bookkeeping required to keep them apart.
+
+**`MAX_INSTANCES` was set to `2`, not `es1370.rs`'s `4`.** The two
+drivers' growth motivations are genuinely different: ES1370's `4` was
+chosen to reach a target *channel count* (each ES1370 card is a fixed
+one-DAC-per-card stereo pair, so more instances is the only way to add
+more channels once playback exists). HDA has no playback implemented
+yet, and when it does, a single HDA codec can already expose several
+independent DAC/pin pairs on its own node graph -- so this ceiling only
+needs to cover a plausible number of physically installed
+*controllers*, not multiply out to a channel-count target. `2` also
+already matched this driver's pre-existing `find_devices` match-array
+size (sized for "at most a couple of these on one machine" even before
+this change), so no companion constant needed to grow alongside it.
+
+`kernel/src/shell.rs`'s `hda_status()` was split into an outer loop
+(calling `initialize_all()`, printing a `"N Intel HD Audio
+controller(s) discovered:"` summary line, then iterating
+`0..hda::count()`) and a new `hda_status_one(&Hda)` printing one
+controller's own MMIO base/IRQ/stream-count/codec-node-graph block,
+prefixed `"Controller N: ..."` -- reusing exactly the same per-codec/
+per-widget printing logic the prior single-controller version already
+had, unchanged. This follows this driver's existing "no arguments
+needed, just show me everything" diagnostic style (matching `pci`'s own
+shape) rather than adding `nic use N`-style index-based selection
+syntax, since HDA has no persistent "active controller" concept to
+select yet (no playback/capture exists to direct at one card over
+another).
+
+Verified end to end with a new, dedicated `tapes/test_hda_multi_e2e.py`
+(not part of `make test`, mirroring `tapes/test_hda_e2e.py`'s own
+structure): a guest configured with *two* independent `intel-hda`
+controllers (`hda0` carrying an output-only `hda-output` codec, `hda1`
+carrying a full-duplex `hda-duplex` codec, each on its own `-audiodev
+none` backend) confirms both are discovered (`count == 2`), reset
+independently with genuinely distinct MMIO bases, and each one's own
+codec is enumerated correctly and independently -- controller 0's block
+has no ADC/line-in widgets at all (proving `hda-output`'s narrower
+topology wasn't accidentally inherited from the other controller),
+while controller 1's block has both a DAC/line-out and an ADC/line-in
+pair, exactly like the existing single-controller test's `hda-duplex`
+fixture -- and that a second `hda` call remains idempotent, still
+reporting both controllers with no re-probe. `tapes/test_hda_e2e.py`
+(the original single-controller test) was re-run unmodified and
+continues to pass unchanged, confirming this conversion is backward-
+compatible for the single-controller case. `make test` (unrelated to
+HDA) was also re-run and continues to pass.
+
+### Intel HDA, step four: real stream-DMA playback
+
+The prior two increments got as far as codec/node-graph *enumeration*;
+this one makes an Intel HDA controller actually produce sound, joining
+`audio.rs`'s facade (and, through it, `audio-net`) alongside ES1370 with
+no tape-side changes at all -- `tapes/audio-net/src/main.rs` already
+iterated every device generically via `audio_count()`/`audio_sample_rate
+_at()`/`audio_submit_at()`, so an `Audio::Hda` variant slots in exactly
+the same way a fifth NIC backend joins `nic::initialize`'s own loop.
+
+**Register/verb semantics were re-derived from QEMU's own emulation
+source** (`hw/audio/intel-hda.c`/`intel-hda-defs.h`/`hda-codec.c` at the
+pinned `v10.2.1` tag, fetched via `raw.githubusercontent.com` since this
+sandbox has no local QEMU source tree and `apt-get source` has no
+`deb-src` configured) -- the same rigor and reasoning this project
+already applied to ES1370's own register work. Two points were load-
+bearing:
+- **The verb-encoding formula has two shapes**, matched by QEMU's own
+  `hda_audio_command`: a 12-bit-verb/8-bit-payload form when
+  `(data & 0x70000) == 0x70000` (used by the pre-existing discovery
+  code's `verb()` helper), and a 4-bit-verb/16-bit-payload form
+  otherwise (a new `verb16()` helper), needed for
+  `SET_STREAM_FORMAT`/`SET_AMP_GAIN_MUTE`, whose payloads don't fit in
+  8 bits.
+- **`SD_CTL` (per-stream control) and `SD_STS` (per-stream status)
+  alias the same 32-bit register**: the low 24 bits are real control
+  bits, but the top byte *is* `SD_STS` -- so every `SD_CTL` write must
+  mask `& 0x00ff_ffff` or it silently acknowledges a completion status
+  the driver never meant to touch. `write_sd_ctl`/`read_sd_ctl` wrap
+  this masking once so every call site can't get it wrong.
+
+**DMA is codec/controller-pulled, not driver-pushed**, the same shape
+ES1370's own DAC1 ring already uses: `setup_playback` allocates a
+physically contiguous 2-period DMA buffer (`pmem::allocate_contiguous`)
+plus a one-page Buffer Descriptor List (`pmem::allocate`), writes two
+16-byte BDL entries (`addr:u64`/`len:u32`/`flags:u32`, only the
+interrupt-on-completion flag used), performs the documented
+stream-reset handshake, programs `SD_CBL`/`SD_LVI`/`SD_FORMAT`/
+`SD_BDLPL`/`SD_BDLPU`, sends the codec verbs that route a fixed stream
+tag to the discovered DAC/pin pair and unmute it
+(`SET_STREAM_FORMAT`/`SET_CHANNEL_STREAMID`/`SET_AMP_GAIN_MUTE`/
+`SET_PIN_WIDGET_CONTROL` -- sent defensively, non-fatal if a codec
+doesn't answer, matching the existing discovery step's tolerance),
+pre-fills both periods with silence, registers a legacy PCI IRQ handler
+(`handle_pci_irq`, mirroring ES1370's own shared-line-safe pattern:
+check this device's own `SD_STS_BCIS` bit before doing anything, so
+sharing an INTx line with an unrelated device costs nothing beyond one
+harmless register read), and finally sets `SD_CTL`'s stream tag/IOCE/RUN
+bits and unmasks the controller's global/controller/per-stream
+interrupt-enable bits in `INTCTL`. `find_playback_target` walks the
+already-enumerated node graph for a DAC (`AudioOutput` widget) and an
+output-capable `Pin`, preferring a pair the graph already reports as
+connected and falling back to the first plausible pair otherwise --
+exactly the same "prefer confirmed, fall back to first-plausible"
+tolerance this driver's discovery step already uses elsewhere. A
+controller whose graph has no usable DAC/pin pair, or no free output
+stream, is left with `has_playback() == false` and is not added to
+`audio.rs`'s device list at all -- `hda status` remains a separate,
+always-available way to inspect such a controller's node graph
+regardless, unchanged from the previous two increments.
+
+**Format is a fixed 44100 Hz / 2ch / 16-bit ceiling** (`PLAYBACK_FORMAT
+= 0x4011`), the same ceiling QEMU's synthetic codec's converter widgets
+appear to support and, not coincidentally, identical to ES1370's own
+hardwired ceiling -- true per-codec-negotiated multichannel/higher-bit-
+depth support is deferred, undocumented and untested against this
+project's installed QEMU version, the same "flag it as speculative
+until real hardware or a richer emulation proves otherwise" convention
+already applied to I350's empty `CANDIDATE_DEVICE_IDS`.
+
+**`audio.rs`'s facade grew an `Audio::Hda(&'static hda::Hda)` variant**
+alongside the existing `Audio::Es1370` one: every method gained a
+matching arm, `MAX_DEVICES` became `es1370::MAX_INSTANCES +
+hda::MAX_INSTANCES` (both backends share one flat `DEVICES` array,
+mirroring `nic.rs`'s own multi-backend facade), and `io_base()`'s return
+type widened from `u16` to `u32` since HDA's MMIO physical base doesn't
+fit in 16 bits (ES1370's own arm now just casts its I/O port number
+`as u32`) -- `shell.rs`'s `audio_status()` print format string was
+updated from `0x{:04x}` to `0x{:08x}` to match, and its header line's
+wording changed from "I/O base" to the backend-neutral "base" for the
+same reason. `initialize()` no longer early-returns the moment ES1370
+reports `NotPresent`/`InitFailed`; it now falls through with `found = 0`
+so HDA discovery still runs on a machine with no ES1370 at all, then
+adds each HDA controller that has `has_playback() == true` after the
+ES1370 loop. Capture-side methods (`capture`/`capture_overrun_count`/
+`capture_backlog`/`capture_periods`) all return `0`/no-op for
+`Audio::Hda`, since this driver's initial scope is playback-only --
+mirroring ES1370's own DAC1-before-ADC history, and a candidate for a
+future increment the same way ES1370's ADC was.
+
+`kernel/src/shell.rs`'s `hda_status_one` was updated to match: the
+stale "node graph, no playback yet" wording is gone, and a controller
+with `has_playback() == true` now prints its active format, IRQ/period/
+interrupt counts, underrun count, and network-fed ring backlog --
+exactly the same diagnostic depth `audio_status()` already provides for
+ES1370, just placed under the existing `hda`/`hda status` per-controller
+block instead of `audio`'s own per-device one (a controller can be
+inspected either way: `audio` for the format-agnostic facade view every
+backend shares, `hda` for the full node-graph-plus-playback view unique
+to this driver).
+
+**The reserved low-memory region grew again, from `0x80000` to
+`0x90000`**, across all four required constants (`kernel/linker.ld`'s
+`ASSERT`, `kernel/src/pmem.rs`'s `RESERVED_BELOW`, `tools/
+write_layout.py`'s `KERNEL_RESERVED_END`, `tools/write_netrom_layout.py`'s
+`MAX_KERNEL_BYTES`) -- diagnosed the same way this region's every prior
+growth was: temporarily raising the linker `ASSERT` far past any
+plausible real ceiling to get a linkable binary, then reading `.bss`'s
+real end address via `readelf -S -W` (`0x83fb4`, about 16 KiB over the
+prior `0x80000` ceiling) rather than trusting a naive `size`-command
+`text+data+bss` sum, which undercounts `linker.ld`'s own 4096-byte
+section-alignment padding.
+
+Verified end to end with a new `tapes/test_hda_playback_e2e.py` (not
+part of `make test`, mirroring `tapes/test_audio_net_e2e.py`'s own
+structure almost exactly, just with `-device intel-hda,msi=off -device
+hda-output,audiodev=snd0` in place of `-device ES1370,audiodev=snd0` --
+`msi=off` is required since `kernel/src/hda.rs` only ever registers a
+legacy PCI IRQ handler, and QEMU defaults a new-enough HDA controller to
+MSI unless told otherwise): `audio` reports the discovered controller
+with the expected fixed format, `hda` reports active playback with a
+matching format line, `audio-net`'s listen mode accepts a locally
+generated 440 Hz tone streamed over the wire exactly like the ES1370
+test does, and the captured WAV file contains real, non-silent audio
+(peak amplitude comfortably above a silence floor) -- proving the whole
+chain (codec/DAC/pin discovery, BDL programming, the stream-reset
+handshake, and IRQ-driven period refill) actually produces sound, not
+just that the tape's own byte counters look right. `tapes/
+test_hda_multi_e2e.py`, `tapes/test_audio_multi_e2e.py` (whose own
+regex needed the same "I/O base" -> "base" wording update above),
+`tapes/test_audio_net_e2e.py`, and `tapes/test_audio_capture_e2e.py`
+were all re-run afterward and continue to pass unmodified (beyond that
+one regex fix), confirming this is additive and does not regress
+ES1370's own playback/capture paths. `make test`,
+`make test-nic-watchdog`, `make test-stack-guard`, and
+`make test-page-protection` were also re-run and continue to pass,
+confirming the reserved-region growth and the shared-PCI-IRQ-line/
+paging code this driver touches remain correct.
+
+Real, per-codec multichannel negotiation (beyond this fixed 2-channel
+ceiling), HDA capture (ADC) support, and validation against a real
+physical HDA-compatible sound card all remain open, deferred follow-ups
+-- consistent with this project's existing "confirmed in QEMU, flagged
+as unverified against real hardware" convention for every other
+register-level driver here.
+
+
 
 - Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
   userspace, scheduling,

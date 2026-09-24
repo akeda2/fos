@@ -154,7 +154,8 @@ resetting to row 0 and overwriting the top of that narration.
 | `memory` | Summarizes E820 usable and non-usable memory. |
 | `cpuinfo` | Shows the CPUID vendor and raw feature bitfields. |
 | `pci` | Dumps every PCI function found on the bus: location, vendor/device ID, class/subclass/prog-if, header type, and BAR0's raw value. Used to identify unmarked or unknown hardware (e.g. reading a NIC's real vendor/device ID) before adding driver support for it. |
-| `audio` | Finds an ES1370-compatible sound card (QEMU's emulated Ensoniq AudioPCI, or a real Sound Blaster PCI card using the same chip family), starts ISR-driven DAC1 playback and ADC capture on first use, and reports both channels' interrupt/period/overrun counts, ring backlog, and the raw hardware status register. |
+| `audio` | Finds an ES1370-compatible sound card (QEMU's emulated Ensoniq AudioPCI, or a real Sound Blaster PCI card using the same chip family) or an Intel HDA controller with a usable playback stream, starts ISR-driven playback (and, for ES1370, ADC capture) on first use, and reports each device's interrupt/period/overrun counts, ring backlog, and (for ES1370) the raw hardware status register. |
+| `hda` | Finds every Intel HD Audio controller on the bus (up to 2; QEMU's emulated `intel-hda`/`ich9-intel-hda`), resets each independently, and reports which codec address(es) responded on it, each one's Vendor/Device ID and node graph, and -- once a usable DAC/pin pair is found -- its active playback stream (format, interrupt/period counts, underruns, ring backlog). Playback-only; capture is not implemented. |
 | `hexdump ADDRESS LENGTH` | Dumps up to 128 bytes inside the reserved kernel range. Addresses accept decimal or `0x` hexadecimal notation. |
 | `ticks` | Shows the free-running PIT timer tick count and its configured frequency. |
 | `uptime` | Shows elapsed time since boot, derived from the timer tick count. |
@@ -1571,7 +1572,7 @@ gracefully (`diskinfo` shows zero sectors; FOSFS commands report the disk as
 absent) rather than attempting a read. `BootInfo.boot_drive` is likewise a
 best-effort `0x80` guess, since BIOS does not hand an `INT 19h`-hooked
 handler a meaningful drive number the way it does for a normal MBR boot.
-The embedded kernel must still fit in the reserved `0x10000..0x60000`
+The embedded kernel must still fit in the reserved `0x10000..0x90000`
 destination window (`tools/write_netrom_layout.py` enforces this at build
 time). The ROM path copies it with a 32-bit-address-size `rep movsb`; the
 final ROM image remains subject to the PCI option-ROM size limit enforced by
