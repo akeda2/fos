@@ -501,6 +501,30 @@ ports, length, and checksum fields, but does not provide sockets or a
 background listener. A tape chooses when to poll, where to place payload
 bytes, and what to do when its fixed receive buffer is full.
 
+### RTP scope
+
+`RtpPacket` implements the fixed 12-byte RTP header (RFC 3550) as a UDP
+payload format, the same relationship `IcmpEcho` has to `Ipv4Packet` one
+layer up. `parse` is genuinely RFC 3550-tolerant: it correctly skips a
+CSRC list and an extension header, and trims trailing padding, rather
+than rejecting any packet that uses them. `encode` only ever emits the
+simple common case (no CSRC, no extension, no padding), since that is
+the only form any sender built on this crate needs to produce.
+
+There is no RTCP, no SDP, and no stateful session/jitter-buffer type in
+this crate: sequence-number gap/reorder accounting is deliberately left
+to the calling tape (see `sequence16_at_or_after`, the 16-bit-width
+counterpart to `tick_reached`/`seq_at_or_after`'s wraparound-safe
+comparison idiom), exactly like `ArpCache`/`DhcpClient`/`TcpConnection`
+own their state but a bare `UdpDatagram` owns none.
+
+Payload type selection is a small, documented, *unnegotiated* convention
+rather than SDP: RFC 3551 has exactly one static entry this project's
+fixed-format audio hardware can ever match (`L16`/44100 Hz/stereo, PT
+`10`); anything else (48 kHz, 24-bit) uses a dynamic-range PT (96+) this
+project documents itself, in `AGENTS.md`'s `audio-rtp` section, rather
+than negotiating it out of band.
+
 ### DHCP scope
 
 DHCPv4 belongs in `tape-net` because its wire format and state machine are
@@ -624,6 +648,113 @@ boundary without requiring a TAP bridge or modifying the host's network
 configuration; interoperability with a real Unix `telnetd` remains a separate
 manual test.
 
+## `tapes/audio-rtp`
+
+`tapes/audio-rtp/` streams real-time raw PCM audio over genuine RTP
+(RFC 3550) carried in UDP/IPv4 -- the standards-based counterpart to
+`tapes/audio-net/`'s bespoke raw-Ethernet protocol. Any real RTP tool
+(`ffmpeg`, `gstreamer`, ...) can send to or receive from this tape
+directly; nothing about the wire format is fos-specific except the
+payload-type convention described in "RTP scope" above. Codec support
+(Opus or otherwise) is explicitly out of scope and deferred indefinitely
+-- this tape moves raw PCM only, by design, and always will.
+
+Startup forms put network configuration first, mirroring `tapes/telnet`'s
+own convention rather than `audio-net`'s mode-first shape (which has no
+network-config step at all):
+
+```text
+tape run static LOCAL_IP/PREFIX GATEWAY [PORT]
+tape run static LOCAL_IP/PREFIX GATEWAY send NAME PEER_IP [PEER_PORT]
+tape run static LOCAL_IP/PREFIX GATEWAY capture PEER_IP [PEER_PORT]
+tape run dhcp [PORT]
+tape run dhcp send NAME PEER_IP [PEER_PORT]
+tape run dhcp capture PEER_IP [PEER_PORT]
+```
+
+`PORT`/`PEER_PORT` default to `5004`, a common (if not IANA-registered)
+convention several real-world RTP tools already use unprompted.
+
+**Format is adaptive, not fixed.** The tape queries the local device's
+actual format (`audio_sample_rate_at`/`audio_channels_and_bits_at`,
+device 0 only -- see the scope note below) and picks the matching RTP
+payload type from a small table:
+
+| Rate | Bits | Channels | Payload type |
+| --- | --- | --- | --- |
+| 44100 Hz | 16 | 2 | `10` (RFC 3551 static `L16`/44100/stereo) |
+| 48000 Hz | 16 | 2 | `96` (dynamic range; documented convention) |
+| 48000 Hz | 24 | 2 | `97` (dynamic range; `L24` per RFC 3190's naming) |
+
+Any other combination is rejected outright (a clear error, not a
+resampling/requantization attempt) -- the same "don't build untestable
+generality" scope choice this project makes everywhere else.
+
+**Listen mode** locks onto the first sender's SSRC ("first sender wins,"
+matching `audio-net`/`tape_load_net`'s own convention) and tracks its
+sequence number: a gap resyncs forward and counts as loss (no
+reorder/jitter buffer beyond the kernel's own `PcmRing` -- matching
+`audio-net`'s accepted best-effort philosophy), a late/duplicate packet
+is dropped and counted separately. Every accepted packet's payload is
+byte-swapped from RTP's big-endian wire format to the kernel ABI's own
+little-endian format before `audio_submit_at` -- the one real
+translation step in an otherwise raw-copy pipeline. For 24-bit audio
+specifically, the wire format (`L24`, RFC 3190) is 3 tightly-packed
+bytes per sample, while this project's own HDA driver uses a 4-byte
+container per sample (see `AGENTS.md`'s HDA notes) -- so 24-bit also
+needs a repacking step, not just a byte-swap, and that repacking's exact
+container convention is a documented assumption pending real-hardware
+confirmation, same as the driver-side choice it mirrors.
+
+**Send mode** replays a raw, headerless PCM file already on FOSFS
+(`fs_file_length`/`fs_read`, matching `audio-net`'s own file-format
+assumption), resolving the peer's MAC via ARP first. **Capture mode** is
+the live-ADC counterpart, streaming `audio_capture_at`'s output in real
+time with no extra pacing loop -- the real ADC period rate already paces
+it, exactly as `audio-net`'s own capture mode reasons. Both answer
+incoming ARP requests for their own configured address while running,
+copied in shape from `tapes/ip-chat`'s `process_frame`/`send_arp_reply`
+(also mirrored by `tapes/router`) -- without this, no external sender
+could ever resolve this tape's MAC well enough to deliver it a unicast
+packet at all.
+
+**Packetization is capped at 1440 bytes of PCM payload per packet**, not
+the 20 ms/~3.5 KB real-world convention audio-over-RTP tools often use:
+this project's IPv4 stack has no fragmentation anywhere (`kernel/src/
+nic.rs`'s `MAX_FRAME_LEN` is a hard, unfragmentable ceiling), so
+`1514 - 14 (eth) - 20 (ip) - 8 (udp) - 12 (rtp) = 1460` bytes is the real
+ceiling, ever, per packet -- 1440 is a clean divisor comfortably under
+it, not a style preference.
+
+**Scope: device 0 only, deliberately.** One RTP session models exactly
+one media stream (one SSRC, one UDP 5-tuple) -- there is no RTP
+equivalent to `audio-net`'s single-session, in-band-tagged multi-device
+multiplexing, and this shell's one-foreground-tape-at-a-time model rules
+out true simultaneous multi-device sessions regardless of protocol. A
+second device means invoking this tape again on a second port.
+
+`tapes/test_audio_rtp_e2e.py` hand-builds real, spec-compliant RTP/UDP/
+IPv4/Ethernet frames in Python (never importing anything from the
+kernel/tape side), proving genuine interop-shaped correctness rather
+than fos-talking-to-fos: a real ARP request/reply round trip in both
+directions, a deliberate sequence gap and a deliberate stale/duplicate
+packet (exercising the loss/reorder accounting), a captured WAV verified
+for the *correct pitch* (not just non-silence -- a byte-swap bug would
+still produce loud, wrong-pitch audio a peak-amplitude-only check would
+wrongly pass) windowed against ES1370's own built-in ~441 Hz test tone
+(which the capture also contains until the tape's first submit call
+engages network mode), and a send-mode round trip verified byte-for-byte
+against the original source file. Capture mode's own transport
+correctness is covered by the same code path `send_mode` already proves;
+QEMU's silent default ADC content gives it nothing further to verify.
+
+A manual, non-automated sanity check against a real tool (e.g.
+`ffmpeg -re -i tone.wav -ar 44100 -ac 2 -f rtp rtp://<fos-ip>:5004`
+against listen mode, or the reverse direction receiving from send/
+capture mode) is the natural next step once real hardware is available,
+mirroring this project's existing "documented but not automated"
+real-interop convention.
+
 ## Testing
 
 The library's unit tests use synthetic frames and a deterministic tick source.
@@ -653,11 +784,13 @@ Run the focused checks with:
 cargo test --manifest-path tapes/tape-net/Cargo.toml
 make test-tape-ip-chat
 make test-tape-telnet
+make test-tape-audio-rtp
 make kernel
 python3 tapes/test_net_chat_e2e.py
 python3 tapes/test_net_chat_e2e.py --nic e1000
 python3 tapes/test_ip_chat_e2e.py
 python3 tapes/test_telnet_e2e.py
+python3 tapes/test_audio_rtp_e2e.py
 ```
 
 The normal `make test` remains required for kernel or boot changes. Real
@@ -679,3 +812,14 @@ socket layer remain deliberately deferred.
 Moving those into the kernel would make the educational protocol code harder
 to inspect and would exceed the current project's intentionally small
 hardware boundary.
+
+RTCP, SDP-based negotiation, multi-SSRC session multiplexing, and any codec
+support (Opus included) for `tapes/audio-rtp/` are also deliberately
+deferred, indefinitely for the codec specifically: a real Opus decoder is a
+categorically larger undertaking (thousands of lines of fixed-point DSP --
+SILK, CELT, a range coder) than anything else in this project, and this
+tape's whole point is proving the *transport* works against real tools
+first. If it is ever attempted, the realistic path is vendoring libopus's
+own fixed-point reference decoder (designed for FPU-less embedded targets,
+matching this kernel's own no-FPU convention) rather than a from-scratch
+reimplementation.

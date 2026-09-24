@@ -26,6 +26,7 @@ TAPE_TELNET_BIN := $(BUILD)/tapes/telnet.bin
 TAPE_BRIDGE_BIN := $(BUILD)/tapes/bridge.bin
 TAPE_ROUTER_BIN := $(BUILD)/tapes/router.bin
 TAPE_NET_DHCP_BIN := $(BUILD)/tapes/net-dhcp.bin
+TAPE_AUDIO_RTP_BIN := $(BUILD)/tapes/audio-rtp.bin
 TAPE_IMAGE_ARGS := \
 	--file primes.bin $(TAPE_PRIMES_BIN) \
 	--file hello-rs.bin $(TAPE_HELLO_RS_BIN) \
@@ -46,6 +47,7 @@ TAPE_IMAGE_ARGS := \
 	--file bridge.bin $(TAPE_BRIDGE_BIN) \
 	--file router.bin $(TAPE_ROUTER_BIN) \
 	--file net-dhcp.bin $(TAPE_NET_DHCP_BIN) \
+	--file audio-rtp.bin $(TAPE_AUDIO_RTP_BIN) \
 	--file router.cfg tapes/router/router.cfg
 EXTRA_FOSFS_FILES ?=
 
@@ -224,7 +226,7 @@ netrom: kernel
 	python3 tools/build_netrom.py --rom $(NETROM_RAW) --output $(NETROM)
 
 # Builds every test tape at once (see the individual tape-* targets below).
-tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp
+tapes: tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp tape-audio-rtp
 
 # Builds the "primes" test tape: a standalone, position-independent 32-bit
 # binary that is not part of the disk image at all. It is meant to be sent
@@ -440,6 +442,21 @@ tape-telnet:
 
 test-tape-telnet:
 	cargo +nightly-2026-09-13 test --manifest-path tapes/telnet/Cargo.toml --lib
+
+# Builds the "audio-rtp" tape: real-time raw-PCM audio streaming over
+# standard RTP/UDP (RFC 3550), using tape-net's RtpPacket/UdpDatagram --
+# the standards-based counterpart to tape-audio-net's bespoke raw-Ethernet
+# protocol. See AGENTS.md and tapes/audio-rtp/src/main.rs's own doc comment.
+tape-audio-rtp:
+	cd tapes/audio-rtp && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+	mkdir -p $(BUILD)/tapes
+	cp tapes/audio-rtp/target/i686-fos/release/audio-rtp-tape $(TAPE_AUDIO_RTP_BIN)
+
+test-tape-audio-rtp:
+	cargo +nightly-2026-09-13 test --manifest-path tapes/audio-rtp/Cargo.toml --lib
+
+test-audio-rtp: image tape-audio-rtp
+	python3 tapes/test_audio_rtp_e2e.py
 
 # Builds the "bridge" tape: a 32-bit Rust layer-2 learning bridge. It
 # exercises the per-interface NIC callbacks added to the append-only tape ABI

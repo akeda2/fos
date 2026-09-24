@@ -209,8 +209,28 @@ const AC_PAR_VENDOR_ID: u32 = 0x00;
 const AC_PAR_NODE_COUNT: u32 = 0x04;
 const AC_PAR_FUNCTION_TYPE: u32 = 0x05;
 const AC_PAR_AUDIO_WIDGET_CAP: u32 = 0x09;
+/// "Supported PCM Size, Rates" -- a converter (DAC/ADC) widget's own
+/// capability parameter, queried only for `WidgetType::AudioOutput`/
+/// `AudioInput` widgets (see `enumerate_afg_widgets`). Response bit
+/// layout per the HDA spec: bits 0-10 are named rates (bit 5 = 44.1 kHz,
+/// bit 6 = 48 kHz -- see `PCM_RATE_48000`; other rate bits are unused by
+/// this driver), bits 16-20 are supported bit depths (bit 17 = 16-bit,
+/// bit 19 = 24-bit -- see `PCM_BITS_24`). Unlike `AC_WCAP_CHAN_CNT_EXT`
+/// (cross-checked against QEMU's own `hda-codec-common.h`, see that
+/// constant's doc comment), this specific bit layout has **not** been
+/// independently re-verified against QEMU source or a primary-source HDA
+/// spec copy for this project -- `negotiate_format`'s fallback to the
+/// historical 44.1 kHz/16-bit baseline whenever a bit this driver checks
+/// for isn't set is the safety net if this layout turns out to be wrong
+/// for some codec.
+const AC_PAR_PCM: u32 = 0x0a;
 const AC_PAR_PIN_CAP: u32 = 0x0c;
 const AC_PAR_CONNLIST_LEN: u32 = 0x0e;
+
+/// `AC_PAR_PCM` bit 6: this widget supports a 48 kHz-based rate.
+const PCM_RATE_48000: u32 = 1 << 6;
+/// `AC_PAR_PCM` bit 19: this widget supports 24-bit samples.
+const PCM_BITS_24: u32 = 1 << 19;
 
 const AC_NODE_ROOT: u32 = 0x00;
 /// `FUNCTION_TYPE`'s low byte identifies an Audio Function Group,
@@ -324,6 +344,13 @@ pub struct WidgetInfo {
     /// entries would need a fuller parser than this diagnostic step
     /// implements.
     pub connection: Option<u8>,
+    /// The raw `AC_PAR_PCM` response, queried only for
+    /// `WidgetType::AudioOutput`/`AudioInput` widgets (`0` for every
+    /// other widget type, and for a converter whose query went
+    /// unanswered) -- see `negotiate_format`, which treats `0` the same
+    /// as "nothing beyond the historical 44.1 kHz/16-bit baseline is
+    /// known to be supported."
+    pub pcm_formats: u32,
 }
 
 /// Bounded busy-poll ceiling used throughout this driver: waiting for
@@ -397,7 +424,7 @@ fn verb16(cad: u8, nid: u8, verb_id: u32, payload: u32) -> u32 {
 /// `AC_VERB_SET_STREAM_FORMAT` (`verb16` category): programs a converter
 /// widget's stream format, using the same `AC_FMT_*` bit encoding as the
 /// controller's own per-stream `SD_FORMAT` register (see
-/// `format_for_channels`'s own doc comment).
+/// `stream_format`'s own doc comment).
 const AC_VERB_SET_STREAM_FORMAT: u32 = 0x2;
 /// `AC_VERB_SET_AMP_GAIN_MUTE` (`verb16` category).
 const AC_VERB_SET_AMP_GAIN_MUTE: u32 = 0x3;
@@ -491,7 +518,7 @@ const PLAYBACK_TOTAL_FRAMES: u32 = PLAYBACK_PERIOD_FRAMES * PLAYBACK_PERIOD_COUN
 /// This driver's own imposed ceiling on a negotiated channel count,
 /// independent of whatever a widget's `AC_WCAP_CHAN_CNT_EXT` field would
 /// otherwise allow (the stream format field itself could encode up to
-/// 16 channels -- see `format_for_channels`'s own comment). `8` matches
+/// 16 channels -- see `stream_format`'s own comment). `8` matches
 /// the common real-world "7.1 surround" ceiling and keeps period/buffer
 /// byte math comfortably bounded. Every QEMU-emulated HDA codec
 /// available to this project (`hda-output`/`hda-duplex`/`hda-micro`)
@@ -503,27 +530,90 @@ const PLAYBACK_TOTAL_FRAMES: u32 = PLAYBACK_PERIOD_FRAMES * PLAYBACK_PERIOD_COUN
 /// against real, genuinely surround-capable hardware.
 const MAX_NEGOTIATED_CHANNELS: u8 = 8;
 
-/// Every sample this driver ever programs is 16-bit PCM (see
-/// `format_for_channels`'s own comment on why a fixed bit depth remains
-/// a deliberate, documented scope choice); channel count is the only
-/// per-frame size that now varies.
-const BYTES_PER_SAMPLE: u32 = 2;
+/// This driver's two supported sample bit depths. Real HDA silicon can
+/// encode up to 32-bit samples in the stream format field (see
+/// `format_bits_field`), but 16/24-bit is what this driver negotiates
+/// and no more -- the same "don't build untestable generality" scope
+/// choice this project already makes elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitDepth {
+    Bits16,
+    Bits24,
+}
 
-/// 44100 Hz / 16-bit PCM, `AC_FMT_*`-encoded, with a computed channel
-/// field: bit14 set selects the 44.1 kHz base rate (rather than 48 kHz),
-/// no divisor/multiplier (fields left at 0), bits[6:4] = `001` for
-/// 16-bit samples, bits[3:0] = channels-1. QEMU's synthetic HDA codec,
-/// like ES1370, only actually implements 16-bit PCM anyway
-/// (`QEMU_HDA_PCM_FORMATS` in `hda-codec-common.h`), so a fixed bit
-/// depth is the same deliberate, documented "don't build untestable
-/// generality" choice this project already made for ES1370 -- see
-/// AGENTS.md's own research notes on this driver's scope. `channels`
-/// must already be clamped to `1..=MAX_NEGOTIATED_CHANNELS` by the
-/// caller (every call site below negotiates through `widget_max_channels`
-/// and this ceiling first), so the low nibble can never overflow past
-/// the format field's own 4-bit width.
-fn format_for_channels(channels: u8) -> u32 {
-    0x4010 | ((channels as u32).saturating_sub(1) & 0xf)
+impl BitDepth {
+    /// Bytes occupied by one sample container in the DMA buffer.
+    /// 16-bit is unambiguous (2 tightly-packed bytes). 24-bit is **not**
+    /// tightly packed to 3 bytes -- this driver assumes the common
+    /// "24 significant bits left-justified in a 4-byte container"
+    /// convention (matching Linux ALSA's `S24_LE` format), the same way
+    /// most real-world 24-bit audio hardware/drivers do it, but this has
+    /// never been verified against a primary-source HDA spec copy or
+    /// real hardware: QEMU's synthetic HDA codec only ever implements
+    /// 16-bit PCM (`QEMU_HDA_PCM_FORMATS` in `hda-codec-common.h`), so
+    /// this path cannot be exercised at all under this project's only
+    /// automated test environment. Treat this as a documented
+    /// assumption needing real-hardware confirmation, not a proven fact
+    /// -- see AGENTS.md's HDA notes.
+    fn bytes_per_sample(self) -> u32 {
+        match self {
+            BitDepth::Bits16 => 2,
+            BitDepth::Bits24 => 4,
+        }
+    }
+
+    /// The stream format field's bits[6:4]: `001` for 16-bit, `011` for
+    /// 24-bit, per the HDA Converter Format encoding.
+    fn format_bits_field(self) -> u32 {
+        match self {
+            BitDepth::Bits16 => 0b001,
+            BitDepth::Bits24 => 0b011,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            BitDepth::Bits16 => 16,
+            BitDepth::Bits24 => 24,
+        }
+    }
+}
+
+/// Picks this driver's preferred rate/bit-depth from a converter
+/// widget's raw `AC_PAR_PCM` capability (see that constant's own doc
+/// comment on the bit layout and its unverified status). Prefers 48 kHz
+/// over 44.1 kHz and 24-bit over 16-bit, but only when the widget
+/// actually advertises support -- `pcm_formats == 0` (query failed, or
+/// never issued for a non-converter widget) falls back to this driver's
+/// original, proven-working 44.1 kHz/16-bit baseline, and so does any
+/// widget that simply doesn't set the bits this driver looks for. This
+/// fallback is what makes the (unverified) `AC_PAR_PCM` bit layout safe
+/// to guess at: worst case, a wrong guess just never selects 48 kHz/
+/// 24-bit, not a wrong/corrupt format.
+fn negotiate_format(pcm_formats: u32) -> (bool, BitDepth) {
+    let base_44100 = pcm_formats & PCM_RATE_48000 == 0;
+    let bits = if pcm_formats & PCM_BITS_24 != 0 {
+        BitDepth::Bits24
+    } else {
+        BitDepth::Bits16
+    };
+    (base_44100, bits)
+}
+
+/// `AC_FMT_*`-encoded stream format: bit14 selects the 44.1 kHz base
+/// rate (clear selects 48 kHz instead), bits[6:4] select the bit depth
+/// (see `BitDepth::format_bits_field`), bits[3:0] = channels-1. No
+/// divisor/multiplier (fields left at 0) -- this driver only ever
+/// requests a widget's two named base rates directly, never a derived
+/// multiple. `channels` must already be clamped to
+/// `1..=MAX_NEGOTIATED_CHANNELS` by the caller (every call site below
+/// negotiates through `widget_max_channels` and this ceiling first), so
+/// the low nibble can never overflow past the format field's own 4-bit
+/// width.
+fn stream_format(base_44100: bool, bits: BitDepth, channels: u8) -> u32 {
+    let rate_bit = if base_44100 { 0x4000 } else { 0 };
+    let bits_field = bits.format_bits_field() << 4;
+    rate_bit | bits_field | ((channels as u32).saturating_sub(1) & 0xf)
 }
 
 /// Fixed, arbitrary non-zero stream tag; only one playback stream is
@@ -651,6 +741,15 @@ pub struct Hda {
     /// buffer/period byte-size calculation read this field rather than a
     /// fixed constant.
     playback_channels: u8,
+    /// The negotiated sample rate/bit depth, shared by both directions
+    /// exactly like `format()` only ever reporting `playback_channels`
+    /// (see that method's own doc comment) -- set once by
+    /// `setup_playback` via `negotiate_format`, or left at this driver's
+    /// original, proven-working 44.1 kHz/16-bit baseline if no playback
+    /// stream is active (matching `negotiate_format(0)`'s own fallback,
+    /// since nothing ever negotiated a real value in that case).
+    sample_rate: u32,
+    bits_per_sample: BitDepth,
     /// Physically contiguous DMA region backing the playback ring (two
     /// periods, `playback_buffer_bytes()` total) -- the codec itself
     /// pulls bytes from here via its own DMA, unlike ES1370's
@@ -751,42 +850,49 @@ impl Hda {
         self.capture_stream_index.is_some()
     }
 
-    /// This device's negotiated native playback format: a fixed
-    /// 44.1 kHz/16-bit ceiling (QEMU's synthetic codec, like ES1370,
-    /// only ever implements 16-bit PCM -- see `format_for_channels`'s own
-    /// doc comment) with `playback_channels` reflecting whatever
-    /// `setup_playback` actually negotiated against the real DAC/pin
-    /// widget pair (`2` if no playback stream is active at all, or if
-    /// negotiation ran against a codec -- like every one this project's
-    /// QEMU tests use -- reporting no `AC_WCAP_CHAN_CNT_EXT` capability).
-    /// This is the one format the tape ABI's `audio_channels_and_bits`/
-    /// `_at` callbacks report for *both* directions of this device; see
+    /// This device's negotiated native playback format: `sample_rate`/
+    /// `bits_per_sample` reflect whatever `setup_playback` negotiated via
+    /// `negotiate_format` against the real DAC widget's `AC_PAR_PCM`
+    /// capability (44.1 kHz/16-bit if no playback stream is active at
+    /// all, or if the widget didn't advertise anything beyond that
+    /// baseline -- every codec this project's QEMU tests use, since
+    /// QEMU's synthetic HDA codec only ever implements 16-bit PCM), with
+    /// `playback_channels` reflecting whatever `setup_playback` actually
+    /// negotiated against the real DAC/pin widget pair (`2` if no
+    /// playback stream is active, or if negotiation ran against a codec
+    /// reporting no `AC_WCAP_CHAN_CNT_EXT` capability). This is the one
+    /// format the tape ABI's `audio_channels_and_bits`/`_at` callbacks
+    /// report for *both* directions of this device; see
     /// `capture_channels`'s own doc comment for the accepted limitation
     /// this implies on a codec whose ADC and DAC negotiate differently.
     pub fn format(&self) -> audio::AudioFormat {
         audio::AudioFormat {
-            sample_rate: 44_100,
+            sample_rate: self.sample_rate,
             channels: self.playback_channels,
-            bits_per_sample: 16,
+            bits_per_sample: self.bits_per_sample.as_u8(),
         }
     }
 
-    /// `playback_channels` * `BYTES_PER_SAMPLE`, the per-frame byte size
-    /// `fill_period` computes its period byte size from (`setup_playback`
-    /// computes this and the buffer/period byte sizes itself, once, at
-    /// negotiation time, since they're also needed there before
-    /// `playback_channels` is even set).
+    /// `playback_channels` * the negotiated bit depth's byte size, the
+    /// per-frame byte size `fill_period` computes its period byte size
+    /// from (`setup_playback` computes this and the buffer/period byte
+    /// sizes itself, once, at negotiation time, since they're also
+    /// needed there before `playback_channels`/`bits_per_sample` are even
+    /// set).
     fn playback_bytes_per_frame(&self) -> u32 {
-        self.playback_channels as u32 * BYTES_PER_SAMPLE
+        self.playback_channels as u32 * self.bits_per_sample.bytes_per_sample()
     }
 
     fn playback_period_bytes(&self) -> u32 {
         PLAYBACK_PERIOD_FRAMES * self.playback_bytes_per_frame()
     }
 
-    /// The capture-path counterpart to `playback_bytes_per_frame`.
+    /// The capture-path counterpart to `playback_bytes_per_frame`. Shares
+    /// `bits_per_sample` with the playback path (see that field's own
+    /// doc comment on why capture doesn't negotiate its own bit depth
+    /// independently).
     fn capture_bytes_per_frame(&self) -> u32 {
-        self.capture_channels as u32 * BYTES_PER_SAMPLE
+        self.capture_channels as u32 * self.bits_per_sample.bytes_per_sample()
     }
 
     fn capture_period_bytes(&self) -> u32 {
@@ -1143,6 +1249,8 @@ fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Sta
         codec_count: 0,
         stream_index: None,
         playback_channels: 2,
+        sample_rate: 44_100,
+        bits_per_sample: BitDepth::Bits16,
         buffer_addr: 0,
         interrupt_count: AtomicU32::new(0),
         periods_serviced: AtomicU32::new(0),
@@ -1174,8 +1282,11 @@ fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Sta
 /// The returned 4th element is the negotiated channel ceiling for this
 /// pair -- `min(dac.max_channels, pin.max_channels)`, per
 /// `widget_max_channels`'s own doc comment -- so `setup_playback` never
-/// needs to re-look-up either widget just to read its capability.
-fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8, u8)> {
+/// needs to re-look-up either widget just to read its capability. The
+/// 5th element is the DAC's own raw `AC_PAR_PCM` capability, passed
+/// through unexamined for `setup_playback`'s `negotiate_format` call --
+/// only the DAC's rate/bit-depth support matters here, not the pin's.
+fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8, u8, u32)> {
     for codec in hda.codecs().iter().flatten() {
         let widgets = codec.widgets();
         for pin in widgets.iter().flatten() {
@@ -1188,7 +1299,7 @@ fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8, u8)> {
                 });
                 if let Some(dac) = dac {
                     let max_channels = dac.max_channels.min(pin.max_channels);
-                    return Some((codec.address, source_nid, pin.nid, max_channels));
+                    return Some((codec.address, source_nid, pin.nid, max_channels, dac.pcm_formats));
                 }
             }
         }
@@ -1203,7 +1314,7 @@ fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8, u8)> {
             .find(|w| w.widget_type == WidgetType::Pin && w.pin_output_capable);
         if let (Some(dac), Some(pin_widget)) = (dac, pin_widget) {
             let max_channels = dac.max_channels.min(pin_widget.max_channels);
-            return Some((codec.address, dac.nid, pin_widget.nid, max_channels));
+            return Some((codec.address, dac.nid, pin_widget.nid, max_channels, dac.pcm_formats));
         }
     }
     None
@@ -1278,7 +1389,8 @@ fn setup_playback(hda: &mut Hda) {
     if hda.output_stream_count == 0 {
         return;
     }
-    let Some((cad, dac_nid, pin_nid, negotiated_channels)) = find_playback_target(hda) else {
+    let Some((cad, dac_nid, pin_nid, negotiated_channels, pcm_formats)) = find_playback_target(hda)
+    else {
         return;
     };
     // Clamp to this driver's own ceiling (`MAX_NEGOTIATED_CHANNELS`) and
@@ -1287,8 +1399,9 @@ fn setup_playback(hda: &mut Hda) {
     // function correct even against a widget reporting something
     // unexpected.
     let channels = negotiated_channels.clamp(1, MAX_NEGOTIATED_CHANNELS);
-    let format = format_for_channels(channels);
-    let bytes_per_frame = channels as u32 * BYTES_PER_SAMPLE;
+    let (base_44100, bits) = negotiate_format(pcm_formats);
+    let format = stream_format(base_44100, bits, channels);
+    let bytes_per_frame = channels as u32 * bits.bytes_per_sample();
     let period_bytes = PLAYBACK_PERIOD_FRAMES * bytes_per_frame;
     let buffer_bytes = PLAYBACK_TOTAL_FRAMES * bytes_per_frame;
 
@@ -1312,6 +1425,8 @@ fn setup_playback(hda: &mut Hda) {
     let stream_index = hda.input_stream_count;
     hda.stream_index = Some(stream_index);
     hda.playback_channels = channels;
+    hda.sample_rate = if base_44100 { 44_100 } else { 48_000 };
+    hda.bits_per_sample = bits;
     hda.buffer_addr = buffer_addr;
 
     let stream_off = stream_offset(stream_index);
@@ -1415,8 +1530,18 @@ fn setup_capture(hda: &mut Hda) {
         return;
     };
     let channels = negotiated_channels.clamp(1, MAX_NEGOTIATED_CHANNELS);
-    let format = format_for_channels(channels);
-    let bytes_per_frame = channels as u32 * BYTES_PER_SAMPLE;
+    // Reuses whatever `setup_playback` already negotiated (or the
+    // driver's 44.1 kHz/16-bit default, if it found no playback target)
+    // rather than negotiating independently against the ADC's own
+    // `AC_PAR_PCM` -- the same shared-format convention `format()`
+    // already documents for channel count, just extended to rate/bit
+    // depth now that those vary too. `setup_playback` always runs first
+    // (see `init_controller`), so `hda.sample_rate`/`bits_per_sample`
+    // are already final by the time this reads them.
+    let bits = hda.bits_per_sample;
+    let base_44100 = hda.sample_rate != 48_000;
+    let format = stream_format(base_44100, bits, channels);
+    let bytes_per_frame = channels as u32 * bits.bytes_per_sample();
     let period_bytes = PLAYBACK_PERIOD_FRAMES * bytes_per_frame;
     let buffer_bytes = PLAYBACK_TOTAL_FRAMES * bytes_per_frame;
 
@@ -1742,6 +1867,18 @@ fn enumerate_afg_widgets(
             }
         }
 
+        // Only a converter widget's own PCM capability matters for
+        // format negotiation (see `negotiate_format`); querying it for
+        // every other widget type would just waste CORB round trips.
+        let pcm_formats = if widget_type == WidgetType::AudioOutput
+            || widget_type == WidgetType::AudioInput
+        {
+            hda.send_corb_command(verb(cad, nid, AC_VERB_PARAMETERS, AC_PAR_PCM))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         if count < MAX_WIDGETS {
             widgets[count] = Some(WidgetInfo {
                 nid,
@@ -1750,6 +1887,7 @@ fn enumerate_afg_widgets(
                 max_channels,
                 pin_output_capable,
                 pin_input_capable,
+                pcm_formats,
                 connection,
             });
             count += 1;

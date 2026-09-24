@@ -22,7 +22,7 @@ independently of and simultaneously with playback:
 - QEMU's HDA model raises a capture-stream completion and this driver's
   `drain_capture_period` actually runs (periods captured increases over
   time, matching the playback stream's own period count almost exactly,
-  since both directions are programmed at the identical 44100 Hz rate).
+  since both directions are programmed at the identical 48000 Hz rate).
 - Once nothing drains `CAPTURE_RINGS` (no tape has called
   `tape_audio_capture` in this test), it fills to capacity and then reports
   a correctly incrementing overrun count instead of silently wedging or

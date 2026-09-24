@@ -660,6 +660,142 @@ impl<'a> UdpDatagram<'a> {
     }
 }
 
+/// A borrowed RTP packet (RFC 3550), carried as a UDP payload -- the same
+/// relationship `IcmpEcho` has to `Ipv4Packet` one layer up. `parse` is
+/// genuinely RFC 3550-tolerant (it correctly skips a CSRC list and an
+/// extension header, and trims trailing padding, rather than rejecting
+/// any packet using them), but `encode` only ever emits the simple common
+/// case -- no CSRC, no extension, no padding -- since that is the only
+/// form any sender built on this crate needs to produce. There is no
+/// stateful session/jitter-buffer type here: sequence-number gap/reorder
+/// accounting (see `sequence16_at_or_after`) is deliberately left to the
+/// calling tape, exactly like `ArpCache`/`DhcpClient`/`TcpConnection` own
+/// their state but a bare `UdpDatagram` owns none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RtpPacket<'a> {
+    pub marker: bool,
+    /// 7 bits (0-127). No static/dynamic distinction is enforced here --
+    /// picking a sensible value (RFC 3551's static `L16`/44100/stereo is
+    /// `10`; anything else this project uses is a documented,
+    /// unnegotiated convention in the 96-127 dynamic range) is entirely
+    /// the caller's responsibility.
+    pub payload_type: u8,
+    pub sequence_number: u16,
+    pub timestamp: u32,
+    pub ssrc: u32,
+    pub payload: &'a [u8],
+}
+
+impl<'a> RtpPacket<'a> {
+    pub const MIN_HEADER_LEN: usize = 12;
+    const VERSION: u8 = 2;
+
+    pub const fn new(
+        payload_type: u8,
+        marker: bool,
+        sequence_number: u16,
+        timestamp: u32,
+        ssrc: u32,
+        payload: &'a [u8],
+    ) -> Self {
+        Self {
+            marker,
+            payload_type,
+            sequence_number,
+            timestamp,
+            ssrc,
+            payload,
+        }
+    }
+
+    /// Parses a fixed RTP header plus whatever CSRC/extension/padding it
+    /// declares, returning `payload` as exactly the media bytes with all
+    /// three already stripped. Rejects anything but version 2 (`Invalid`)
+    /// and any declared CSRC/extension/padding length that would run
+    /// past the end of `bytes` (`Truncated`).
+    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
+        if bytes.len() < Self::MIN_HEADER_LEN {
+            return Err(Error::Truncated);
+        }
+        let version = bytes[0] >> 6;
+        if version != Self::VERSION {
+            return Err(Error::Invalid);
+        }
+        let has_padding = bytes[0] & 0x20 != 0;
+        let has_extension = bytes[0] & 0x10 != 0;
+        let csrc_count = (bytes[0] & 0x0f) as usize;
+        let marker = bytes[1] & 0x80 != 0;
+        let payload_type = bytes[1] & 0x7f;
+        let sequence_number = u16::from_be_bytes([bytes[2], bytes[3]]);
+        let timestamp = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let ssrc = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+
+        let mut offset = Self::MIN_HEADER_LEN + csrc_count * 4;
+        if offset > bytes.len() {
+            return Err(Error::Truncated);
+        }
+        if has_extension {
+            if offset + 4 > bytes.len() {
+                return Err(Error::Truncated);
+            }
+            let extension_words =
+                u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+            offset += 4 + extension_words * 4;
+            if offset > bytes.len() {
+                return Err(Error::Truncated);
+            }
+        }
+
+        let mut end = bytes.len();
+        if has_padding {
+            let Some(&pad_count) = bytes.last() else {
+                return Err(Error::Truncated);
+            };
+            let pad_count = pad_count as usize;
+            if pad_count == 0 || pad_count > end - offset {
+                return Err(Error::Invalid);
+            }
+            end -= pad_count;
+        }
+
+        Ok(Self {
+            marker,
+            payload_type,
+            sequence_number,
+            timestamp,
+            ssrc,
+            payload: &bytes[offset..end],
+        })
+    }
+
+    /// Encodes the simple common case: version 2, no padding, no
+    /// extension, no CSRC list.
+    pub fn encode(&self, output: &mut [u8]) -> Result<usize> {
+        let length = Self::MIN_HEADER_LEN + self.payload.len();
+        if output.len() < length {
+            return Err(Error::BufferTooSmall);
+        }
+        output[0] = 0x80; // version 2, P=0, X=0, CC=0
+        output[1] = (u8::from(self.marker) << 7) | (self.payload_type & 0x7f);
+        output[2..4].copy_from_slice(&self.sequence_number.to_be_bytes());
+        output[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
+        output[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
+        output[Self::MIN_HEADER_LEN..length].copy_from_slice(self.payload);
+        Ok(length)
+    }
+}
+
+/// The 16-bit-width counterpart to `seq_at_or_after` (TCP sequence
+/// numbers, below) / `tick_reached` (DHCP deadlines) -- the same
+/// wraparound-safe "is `current` at or after `reference`, treating the
+/// numeric space as circular" comparison, just at RTP sequence numbers'
+/// own bit width. Exposed `pub`, unlike those two: RTP gap/reorder
+/// accounting is the calling tape's own responsibility (see
+/// `RtpPacket`'s own doc comment), not a state machine this crate owns.
+pub fn sequence16_at_or_after(current: u16, reference: u16) -> bool {
+    current.wrapping_sub(reference) < 0x8000
+}
+
 pub const DHCP_CLIENT_PORT: u16 = 68;
 pub const DHCP_SERVER_PORT: u16 = 67;
 pub const DHCP_MAGIC_COOKIE: u32 = 0x6382_5363;
@@ -2025,6 +2161,73 @@ mod tests {
             .payload,
             b"data"
         );
+    }
+
+    #[test]
+    fn rtp_round_trip() {
+        let packet = RtpPacket::new(96, false, 1000, 20_000, 0xdead_beef, b"pcm-data");
+        let mut bytes = [0u8; 64];
+        let length = packet.encode(&mut bytes).unwrap();
+        assert_eq!(length, RtpPacket::MIN_HEADER_LEN + 8);
+        assert_eq!(bytes[0], 0x80); // version 2, P=0, X=0, CC=0
+        assert_eq!(RtpPacket::parse(&bytes[..length]).unwrap(), packet);
+
+        // Wrong version is rejected outright.
+        let mut wrong_version = bytes;
+        wrong_version[0] = 0x40; // version 1
+        assert_eq!(RtpPacket::parse(&wrong_version[..length]), Err(Error::Invalid));
+
+        // Truncated header/payload is rejected.
+        assert_eq!(
+            RtpPacket::parse(&bytes[..RtpPacket::MIN_HEADER_LEN - 1]),
+            Err(Error::Truncated)
+        );
+    }
+
+    #[test]
+    fn rtp_skips_csrc_and_extension_and_trims_padding() {
+        // Hand-built: version 2, P=1, X=1, CC=2; marker=1, PT=10;
+        // sequence=1, timestamp=2, ssrc=3; two 4-byte CSRC entries; a
+        // 4-byte extension header declaring 1 word of extension data (4
+        // bytes); 4 bytes of payload; 1 pad byte whose value (2) is the
+        // total pad count (the trailing byte itself plus one more).
+        let mut bytes = [0u8; 64];
+        bytes[0] = 0b1011_0010; // V=2,P=1,X=1,CC=2
+        bytes[1] = 0x80 | 10; // marker=1, PT=10
+        bytes[2..4].copy_from_slice(&1u16.to_be_bytes());
+        bytes[4..8].copy_from_slice(&2u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&3u32.to_be_bytes());
+        // CSRC list (2 * 4 bytes), left as zero -- values don't matter.
+        let extension_offset = 12 + 2 * 4;
+        bytes[extension_offset + 2..extension_offset + 4].copy_from_slice(&1u16.to_be_bytes());
+        let payload_offset = extension_offset + 4 + 1 * 4;
+        bytes[payload_offset..payload_offset + 4].copy_from_slice(b"pcm!");
+        // 2 total padding bytes: one arbitrary filler byte, then the
+        // count byte itself (per RFC 3550, "including itself") as the
+        // packet's very last byte.
+        let total_len = payload_offset + 4 + 2;
+        bytes[total_len - 1] = 2;
+
+        let parsed = RtpPacket::parse(&bytes[..total_len]).unwrap();
+        assert!(parsed.marker);
+        assert_eq!(parsed.payload_type, 10);
+        assert_eq!(parsed.sequence_number, 1);
+        assert_eq!(parsed.timestamp, 2);
+        assert_eq!(parsed.ssrc, 3);
+        assert_eq!(parsed.payload, b"pcm!");
+    }
+
+    #[test]
+    fn sequence16_wraparound() {
+        assert!(sequence16_at_or_after(1, 0));
+        assert!(!sequence16_at_or_after(0, 1));
+        // Wraps cleanly across the 16-bit boundary.
+        assert!(sequence16_at_or_after(0, 0xffff));
+        assert!(!sequence16_at_or_after(0xffff, 0));
+        // A reference and current value exactly half the space apart is
+        // the one genuinely ambiguous case; this matches `tick_reached`'s
+        // own documented "< 0x8000_0000" convention at this bit width.
+        assert!(!sequence16_at_or_after(0x8000, 0));
     }
 
     #[test]

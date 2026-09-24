@@ -63,7 +63,7 @@ AUDIO_TAG_START = 0x40
 AUDIO_TAG_DATA = 0x41
 AUDIO_TAG_STOP = 0x42
 
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 48000
 CHANNELS = 2
 BITS_PER_SAMPLE = 16
 DATA_CHUNK_CAPACITY = 1024
@@ -118,7 +118,7 @@ def main() -> None:
             "-device",
             f"rtl8139,netdev=net0,mac={GUEST_MAC}",
             "-audiodev",
-            f"wav,id=snd0,path={wav_capture}",
+            f"wav,id=snd0,path={wav_capture},out.frequency={SAMPLE_RATE}",
             "-device",
             "intel-hda",
             "-device",
@@ -169,14 +169,14 @@ def main() -> None:
         audio_output = run_command(b"audio")
         if b"[0] Intel HDA" not in audio_output:
             raise SystemExit(f"Intel HDA not found:\n{audio_output.decode('utf-8', 'replace')}")
-        if b"44100 Hz / 2ch / 16-bit" not in audio_output:
+        if b"48000 Hz / 2ch / 16-bit" not in audio_output:
             raise SystemExit(
                 f"unexpected local audio format:\n{audio_output.decode('utf-8', 'replace')}"
             )
         print("PASS: Intel HDA discovered with the expected fixed format.")
 
         hda_output = run_command(b"hda")
-        if b"Playback active: 44100 Hz / 2ch / 16-bit." not in hda_output:
+        if b"Playback active: 48000 Hz / 2ch / 16-bit." not in hda_output:
             raise SystemExit(
                 f"'hda status' did not report active playback:\n"
                 f"{hda_output.decode('utf-8', 'replace')}"
@@ -200,7 +200,7 @@ def main() -> None:
 
         run_start = len(output)
         mcast.send(eth_frame(guest_mac, TERM_CLIENT_MAC, TERM_TAG_DATA, b"tape run\n"))
-        read_until(b"[0] 44100 Hz / 2ch / 16-bit", 10, run_start)
+        read_until(b"[0] 48000 Hz / 2ch / 16-bit", 10, run_start)
         read_until(b"Waiting for a matching audio stream", 10, run_start)
         print("PASS: audio-net tape started listen mode with the correct local format.")
 

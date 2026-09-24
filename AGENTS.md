@@ -2108,6 +2108,26 @@ local playback), `tape run send NAME [MAC]` (replays a pre-recorded FOSFS
 file), and `tape run capture [MAC]` (genuine live-microphone streaming,
 round-robining every local device via `audio_capture_at`).
 
+HDA's own sample rate and bit depth are negotiated, not fixed: `hda.rs`
+queries a discovered DAC widget's `AC_PAR_PCM` capability and prefers
+48 kHz over 44.1 kHz and 24-bit over 16-bit whenever the widget actually
+advertises support, falling back to the historical 44.1 kHz/16-bit
+baseline otherwise (`negotiate_format`) -- unlike channel count, which
+was already negotiated this way via `AC_WCAP_CHAN_CNT_EXT`, this was
+previously just a hardcoded `0x4010` format value, chosen for parity with
+ES1370, not a hardware limit HDA silicon actually has. ES1370 itself is
+unaffected: it is genuinely silicon-limited to 44100 Hz/16-bit (only 4
+hardwired rates, format field only encodes 8/16-bit PCM). **24-bit
+specifically cannot be exercised under QEMU at all**: its synthetic HDA
+codec only ever implements 16-bit PCM (`QEMU_HDA_PCM_FORMATS` in
+`hda-codec-common.h`), so that path is real-hardware-only, exactly like
+this section's own already-documented "unverified against real
+hardware" status below -- and the 24-bit sample container size (a 4-byte
+container per sample, matching Linux ALSA's `S24_LE` convention, chosen
+over RFC 3190's tightly-packed 3-byte wire convention) is a documented
+assumption pending that same real-hardware confirmation, not a verified
+fact.
+
 Both drivers are, as of this writing, unverified against real hardware
 (every register offset/bit/DMA semantic was cross-checked directly against
 QEMU's own emulation source, the same rigor applied to every other driver
@@ -2128,6 +2148,70 @@ ES1370, the audio-net wire-protocol's per-device tagging design, and every
 HDA increment (discover-only, CORB/RIRB + node-graph enumeration,
 multi-controller, stream-DMA playback, capture, and multichannel
 negotiation) -- is in `docs/history/audio-hda.md`.
+
+## Real-time audio streaming over RTP/UDP: the `audio-rtp` tape
+
+`tapes/audio-rtp/` streams the same raw PCM audio `audio-net` does, but
+over genuine RTP (RFC 3550) carried in UDP/IPv4 instead of a bespoke
+raw-Ethernet tag protocol -- so a real tool (`ffmpeg`, `gstreamer`, any
+RTP client) can send to or receive from `fos` directly, not just another
+fos instance. `tapes/tape-net/src/lib.rs` gained a matching `RtpPacket`
+type (parse/encode over borrowed slices/caller-owned buffers, exactly
+like `UdpDatagram`/`IcmpEcho`) and a `sequence16_at_or_after` wraparound
+helper; see `NETWORKING.md`'s "RTP scope"/"`tapes/audio-rtp`" sections
+for the full design (payload-type table, packetization-size derivation,
+ARP-reply requirement, ES1370-test-tone-contamination test gotcha, and
+the byte-swap/24-bit-repacking translation step). This section covers
+only what's specific to *this* project's kernel/hardware side.
+
+**Format is adaptive.** Unlike `audio-net` (which just plays whatever
+`audio_sample_rate_at`/`audio_channels_and_bits_at` report, since its own
+wire protocol carries the format explicitly), `audio-rtp` must map the
+local device's actual format to one of a small set of RTP payload types
+it understands (RFC 3551's one real static entry, `L16`/44100/stereo =
+PT 10, for ES1370; two documented dynamic-range conventions for HDA's
+newly-negotiable 48 kHz/16-bit and 48 kHz/24-bit) -- and rejects anything
+else outright, rather than generalizing. This is what motivated HDA's
+own rate/bit-depth negotiation becoming real (see above): a fixed
+44.1 kHz-only target would have made this tape's whole "prefer real
+hardware's actual modern format" premise moot for the one backend
+(HDA) most real machines actually have.
+
+**Scope: device 0 only, one direction (listen, send, or capture) per
+invocation.** One RTP session models exactly one media stream; there is
+no protocol-level equivalent to `audio-net`'s single-session multi-device
+tagging, and this shell's one-foreground-tape-at-a-time model rules out
+true simultaneous multi-device sessions regardless of protocol design. A
+second device needs a second, separately invoked session on a second
+port -- a real, standards-clean answer, just a narrower single-invocation
+feature than `audio-net`'s.
+
+**Codec support (Opus included) is out of scope, deliberately and
+indefinitely** -- not "not yet," but a considered exclusion. This tape
+moves raw PCM only. A real Opus decoder (SILK + CELT + a range coder) is
+thousands of lines of genuinely tricky fixed-point DSP, categorically
+larger than anything else in this project combined; proving the
+*transport* works against real tools first is the actual point of this
+tape, and remains true whether or not a codec is ever added on top of
+it later. If it is: libopus's own fixed-point reference decoder (BSD-
+licensed, designed for FPU-less embedded targets -- matching, not
+conflicting with, this kernel's own no-FPU convention) is the realistic
+path, as a vendored port, not a from-scratch reimplementation -- and
+note that FPU use itself would need no kernel ABI change at all if ever
+needed for something else: a tape runs in ring 0 with no privilege
+separation, so it can toggle `CR0`/`CR4`'s FPU-related bits itself,
+bracketed exactly like `tapes/longmode64_shim.S` already saves/restores
+`CR0`/`CR3`/`CR4`/`EFER` around its own mode switch.
+
+Verified end to end by `tapes/test_audio_rtp_e2e.py` (`NETWORKING.md` has
+the full description) -- hand-built, genuinely spec-compliant RTP/UDP/
+IPv4/Ethernet frames in Python, a real ARP round trip in both directions,
+deliberate loss/duplicate injection, and a WAV capture checked for the
+*correct pitch* windowed against ES1370's own built-in ~441 Hz test tone
+contaminating the same capture. Real-hardware interop (a genuine `ffmpeg`
+session against real fos hardware, and the 24-bit path this tape's
+format table already accounts for) remains future, documented, non-
+blocking work, exactly like ES1370/HDA's own real-hardware status above.
 
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 
