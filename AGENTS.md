@@ -2736,6 +2736,74 @@ future contributor doesn't have to rediscover them from scratch:
   proven full soft-reset. **Pending final real-hardware confirmation**
   from the user repeating the cable-pull/reconnect sequence against the
   rebuilt image with an RTL8139 as the affected uplink.
+- **`reboot soft` (see "reboot: a soft-reboot path..." above): not yet
+  tested on real hardware, and several of its assumptions have never been
+  exercised on real silicon before** -- every prior BIOS/A20/PIC code path
+  in this project always ran exactly once per genuine power-on; a soft
+  reboot re-enters `boot/stage2.S`'s `_start` without ever asserting the
+  CPU's hardware RESET line, so this is the first time any of the
+  following gets asked to run a *second* time against the same,
+  never-power-cycled chipset state. None of this is confirmed broken --
+  it is a predicted risk list to check first if `reboot soft` behaves
+  differently on real hardware than in QEMU, the same way the historical
+  A20/PIC/spurious-IRQ entries above were themselves predictable in
+  hindsight from reading the code closely enough:
+  - **A20 enabled a second time, with no reset in between.** `enable_a20`
+    tries BIOS (`INT 15h`, `AX=2401h`), then the 8042 keyboard controller,
+    then port `0x92`, re-verifying after each. Every one of those three
+    mechanisms has now run once already, earlier in the very same power-on
+    session -- toggling port `0x92`'s A20 gate bit (or pulsing the 8042's
+    output port) a second time on real silicon it already succeeded on
+    once is a genuinely new scenario for this codebase, not merely a
+    repeat of a previously-tested path. If `reboot soft` fails specifically
+    at "Enabling the A20 line..." on real hardware, suspect a chipset that
+    tolerates this fine once per boot but not twice, and consider whether
+    the *first* mechanism to succeed should be remembered and retried
+    first on a soft reboot, rather than probing all three again from
+    scratch.
+  - **The kernel's own 100 Hz PIT is still running throughout the
+    trampoline, not restored to BIOS's conventional ~18.2 Hz rate.** This
+    is not new to soft reboot -- every ordinary post-boot BIOS disk call
+    (`disk::call_trampoline`) already runs with the same faster PIT rate
+    for the same reason -- but `load_kernel`'s BIOS EDD reads inside
+    `soft_reboot_real`'s re-entered `_start` are the first place this
+    project depends on BIOS's own disk-timeout logic (which polls the BDA
+    tick counter IRQ0 advances) working correctly *immediately at boot*,
+    on potentially slower or flakier real USB boot media, rather than
+    mid-session against an already-proven-working disk path. A real BIOS
+    whose timeout logic reads that counter as advancing ~5.5x faster than
+    it expects could time out a disk read prematurely in a way QEMU's own
+    BIOS emulation may not reproduce.
+  - **Sibling bugs of the `%bp`-vs-`%ebp` E820 bug, elsewhere in
+    `stage2.S`/`netrom.S`/`disk.rs`.** That bug existed for a long time
+    unnoticed because a cold BIOS POST happens to leave a register's upper
+    bits zero by luck; a soft reboot is the first code path that leaves
+    genuinely different (Rust-kernel-derived) garbage in registers a cold
+    boot never would. Any other "clear only the low 16 bits of a 32-bit
+    register, then later compare/store the full 32 bits" pattern in this
+    real-mode code is a plausible sibling, worth a deliberate audit pass
+    rather than waiting to be tripped over the same way this one was.
+  - **NIC/PCI device state is never power-cycled** (`reboot soft` never
+    asserts PCIRST#, unlike a real hardware reset). A device's own
+    re-`init()` should fully reprogram it regardless of prior state, but
+    an interrupt latched, or a DMA transfer in flight, at the exact
+    instant of the jump has never been exercised on real silicon this way
+    before; if a NIC ever comes up in a stuck or half-configured state
+    specifically after a soft reboot (but not after `reboot hard`), start
+    here.
+  - **Real BIOS/USB-boot-media tolerance of a second, POST-less round of
+    EDD disk calls.** Every BIOS disk call this project has ever made
+    before now happened exactly once per genuine power-on cycle (BIOS's
+    own POST always ran first). `reboot soft` is the first time BIOS's
+    disk services get invoked cold a second time without an intervening
+    reset -- plausible territory for a real BIOS/USB-controller
+    combination to hold some one-time-per-power-on internal state that
+    does not expect this, even though nothing in this project's own code
+    changes between the two calls.
+  - Minor/cosmetic, not expected to cause a real failure: a stray PS/2
+    scancode or a partially transmitted UART byte from the very keystroke
+    that submitted `reboot soft` is not drained before the jump, so it
+    could resurface oddly in the freshly-booted kernel's input queue.
 
 If real hardware ever produces a boot loop, a screen that fails to update,
 or output that only appears over one of VGA/serial, suspect this class of
