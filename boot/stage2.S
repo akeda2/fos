@@ -673,12 +673,13 @@ protected_entry:
 
     # A soft reboot (kernel/src/reboot.rs) can land here after
     # `load_kernel` just re-read a fresh kernel image, via a BIOS-emulated
-    # disk transfer, into this same physical range (0x10000..0x80000) that
-    # this VM instance was already executing as code moments earlier -- a
-    # pattern no cold boot ever exercises. Empirically, jumping straight
-    # into it from here is unreliable (see `kernel/src/entry.S`'s own
-    # `_start` comment for the fuller account of this investigation); an
-    # ordinary CPU load-then-store touch of every page in that range,
+    # disk transfer, into this same physical range (0x10000..0x90000, the
+    # current reserved-region ceiling -- see AGENTS.md's "Low-memory map")
+    # that this VM instance was already executing as code moments earlier
+    # -- a pattern no cold boot ever exercises. Empirically, jumping
+    # straight into it from here is unreliable (see `kernel/src/entry.S`'s
+    # own `_start` comment for the fuller account of this investigation);
+    # an ordinary CPU load-then-store touch of every page in that range,
     # right here in flat 32-bit protected mode, reliably avoids it, unlike
     # the same *quantity* of unrelated I/O-port writes tried at this exact
     # location. The leading theory is that this forces QEMU/TCG's
@@ -688,7 +689,7 @@ protected_entry:
     # did not reliably trigger for a translation block that had already
     # executed in this VM instance.
     movl $0x10000, %edi
-    movl $0x80000, %ecx
+    movl $0x90000, %ecx
     subl %edi, %ecx
     shrl $12, %ecx
 resync_kernel_pages:

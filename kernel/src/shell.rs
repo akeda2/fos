@@ -968,6 +968,28 @@ fn hda_status_one(controller: &hda::Hda) {
     } else {
         println!("  No usable playback stream (no codec/DAC/pin found, or no free output stream).");
     }
+    if controller.has_capture() {
+        let format = controller.format();
+        println!(
+            "  Capture active: {} Hz / {}ch / {}-bit.",
+            format.sample_rate, format.channels, format.bits_per_sample
+        );
+        println!(
+            "  {} period(s) captured since boot.",
+            controller.capture_periods()
+        );
+        println!(
+            "  Overruns (ring full on drain): {}",
+            controller.capture_overrun_count()
+        );
+        println!(
+            "  Capture ring backlog: {} of {} byte(s) queued.",
+            controller.capture_backlog(),
+            audio::RING_CAPACITY_BYTES
+        );
+    } else {
+        println!("  No usable capture stream (no codec/ADC/pin found, or no free input stream).");
+    }
     let codecs = controller.codecs();
     if codecs.iter().flatten().count() == 0 {
         println!("  No codec responded on STATESTS after reset.");

@@ -283,21 +283,18 @@ impl Audio {
     /// device's own `format()`, up to `out.len()` bytes -- the ADC
     /// counterpart to `submit`. Returns how many bytes were actually
     /// copied; fewer than `out.len()` (including zero) simply means
-    /// fewer samples have been captured so far, not an error. HDA
-    /// playback-only in this driver's initial scope, so an HDA device
-    /// always reports zero captured bytes here, exactly like ES1370
-    /// before its own ADC support existed.
+    /// fewer samples have been captured so far, not an error.
     pub fn capture(&self, out: &mut [u8]) -> usize {
         match self {
             Audio::Es1370(card) => card.capture(out),
-            Audio::Hda(_) => 0,
+            Audio::Hda(card) => card.capture(out),
         }
     }
 
     pub fn capture_overrun_count(&self) -> u32 {
         match self {
             Audio::Es1370(card) => card.capture_overrun_count(),
-            Audio::Hda(_) => 0,
+            Audio::Hda(card) => card.capture_overrun_count(),
         }
     }
 
@@ -306,7 +303,7 @@ impl Audio {
     pub fn capture_backlog(&self) -> usize {
         match self {
             Audio::Es1370(card) => card.capture_backlog(),
-            Audio::Hda(_) => 0,
+            Audio::Hda(card) => card.capture_backlog(),
         }
     }
 
@@ -315,7 +312,7 @@ impl Audio {
     pub fn capture_periods(&self) -> u32 {
         match self {
             Audio::Es1370(card) => card.capture_periods(),
-            Audio::Hda(_) => 0,
+            Audio::Hda(card) => card.capture_periods(),
         }
     }
 }

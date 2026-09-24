@@ -4760,12 +4760,106 @@ confirming the reserved-region growth and the shared-PCI-IRQ-line/
 paging code this driver touches remain correct.
 
 Real, per-codec multichannel negotiation (beyond this fixed 2-channel
-ceiling), HDA capture (ADC) support, and validation against a real
-physical HDA-compatible sound card all remain open, deferred follow-ups
--- consistent with this project's existing "confirmed in QEMU, flagged
-as unverified against real hardware" convention for every other
-register-level driver here.
+ceiling) and validation against a real physical HDA-compatible sound
+card both remain open, deferred follow-ups -- consistent with this
+project's existing "confirmed in QEMU, flagged as unverified against
+real hardware" convention for every other register-level driver here.
+HDA capture (ADC) support is implemented -- see the next section.
 
+### Intel HDA, step five: capture (ADC) support
+
+The one HDA/audio gap this document's own "Anything left on the todo
+list?" summary called out as still open -- HDA was playback-only, unlike
+ES1370's existing dual DAC1/ADC support -- is now closed.
+`kernel/src/hda.rs` gained a genuine second, independent capture stream
+alongside its existing playback stream, mirroring `es1370.rs`'s own
+DAC1/ADC pattern as closely as the two chips' register models allow:
+
+- **`find_capture_target`** is the input-path mirror of
+  `find_playback_target`: per this module's own doc comment on QEMU's
+  synthetic `hda-duplex` codec layout, a pin's `GET_CONNECT_LIST` entry
+  names its *source* converter regardless of direction -- an output
+  pin's connection names its DAC, an input pin's connection names its
+  ADC -- so this reuses the identical two-pass strategy (prefer a
+  confirmed-connected input-capable pin/`AudioInput` pair, falling back
+  to simply pairing the first `AudioInput` widget with the first
+  input-capable pin on the same codec).
+- **`setup_capture`** mirrors `setup_playback`, with three real
+  differences: it uses stream index `0` directly rather than
+  `input_stream_count`'s offset (per `STREAM_BASE`'s own doc comment,
+  input streams occupy the *low* indices, unlike output streams which
+  start immediately after them), it allocates its own separate DMA
+  buffer (`capture_buffer_addr`, distinct from `buffer_addr`) rather
+  than sharing playback's, and it programs the codec-side amp/pin verbs
+  with `AC_AMP_SET_INPUT`/`AC_PINCTL_IN_EN` instead of their output-path
+  counterparts (`AC_AMP_SET_OUTPUT`/`AC_PINCTL_OUT_EN`). A new
+  `CAPTURE_STREAM_TAG` deliberately reuses the same numeric value as
+  `PLAYBACK_STREAM_TAG` (stream tags are only ever matched against one
+  direction's own `SD_CTL` register per the HDA spec, so there is no
+  collision). Bails out cleanly (leaving `has_capture()` reporting
+  `false`) on `input_stream_count == 0`, no confirmed ADC/pin pair, or a
+  DMA allocation failure -- exactly as generously as `setup_playback`
+  already treats its own failure paths, and for the same reason: a
+  controller missing one direction is still perfectly usable for the
+  other.
+- **`write_sd_ctl`/`read_sd_ctl`** were generalized to take an explicit
+  stream-index parameter (previously hardcoded to `self.stream_index`),
+  so both directions' bring-up code can share these two helpers instead
+  of duplicating the write-1-to-clear-safe register access pattern.
+- **`handle_interrupt`** now checks `self.stream_index` and
+  `self.capture_stream_index`'s own `SD_STS` bits unconditionally, not
+  as an if/else -- mirroring `Es1370::handle_interrupt`'s own independent
+  `STAT_DAC1`/`STAT_ADC` checks -- since both streams can legitimately
+  complete a period on the same interrupt, and this controller's legacy
+  PCI IRQ line may already be shared with another device entirely (see
+  "A real bug this test found: shared legacy PCI IRQ lines..." above).
+- **`drain_capture_period`** is the capture-path counterpart to
+  `fill_period`: copies one just-completed period out of the ADC's own
+  DMA ring into a new `CAPTURE_RINGS` static (mirroring `es1370.rs`'s own
+  array of the same name exactly, including living as a standalone
+  top-level array indexed by controller instance), incrementing
+  `capture_overrun_count` on any bytes that don't fit -- there is no
+  fallback content to generate on this side, unlike `fill_period`'s
+  silence fallback, since captured samples either exist or they don't.
+- **`audio.rs`'s facade** (`capture`/`capture_overrun_count`/
+  `capture_backlog`/`capture_periods`) had its `Audio::Hda(_) => 0` stub
+  arms replaced with real calls into the methods above, so any tape
+  using the ABI's `audio_capture`/`audio_capture_at` callbacks now gets
+  real HDA-sourced audio automatically, with no tape-side change needed
+  -- the same reason `tapes/audio-net`'s existing `capture` mode (see
+  "`tape run capture`: genuine live-microphone streaming" above) works
+  against an HDA card without modification.
+- **The dedicated `hda` shell command's per-controller status
+  (`hda_status_one`)** gained a capture block mirroring its existing
+  playback block (active format, periods captured, overrun count,
+  capture ring backlog), reporting "No usable capture stream ..." for a
+  controller with none, exactly like its existing playback fallback
+  message.
+
+Verified with a new `tapes/test_hda_capture_e2e.py`, mirroring
+`tapes/test_audio_capture_e2e.py`'s structure closely (same `intel-hda`
++ `hda-duplex` codec combination `tapes/test_hda_e2e.py` already uses to
+prove ADC/line-in discovery, `-audiodev none` since QEMU's packaged
+audiodev backends have no genuine file-sourced fake-microphone input --
+see that ES1370 test's own doc comment for why): playback and capture
+periods both advance independently and simultaneously (proving
+`handle_interrupt`'s unconditional dual check actually works, not just
+compiles), and an undrained `CAPTURE_RINGS` slot correctly fills to
+capacity and reports a steadily incrementing overrun count instead of
+wedging. Every existing HDA/audio e2e test (`tapes/test_hda_e2e.py`,
+`tapes/test_hda_multi_e2e.py`, `tapes/test_hda_playback_e2e.py`,
+`tapes/test_audio_capture_e2e.py`) was re-run afterward and continues to
+pass unmodified, confirming this is additive. `make test` was also
+re-run and continues to pass; this segment also fixed an unrelated,
+previously-stale `boot/stage2.S` soft-reboot resync loop bound
+(`0x80000` -> `0x90000`, matching the reserved-region ceiling everywhere
+else already tracks it -- see "Low-memory map" above).
+
+Like `Es1370`'s own ADC support, this remains **unverified against real
+hardware** -- every register offset/bit/DMA semantic was cross-checked
+against QEMU's own HDA emulation, the same rigor and the same open
+real-hardware caveat every other driver in this project carries until a
+physical card actually confirms it.
 
 
 - Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,

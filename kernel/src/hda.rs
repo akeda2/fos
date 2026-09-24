@@ -477,6 +477,35 @@ const PLAYBACK_FORMAT: u32 = 0x4011;
 /// `SD_CTL` stream-tag field just need to agree with each other.
 const PLAYBACK_STREAM_TAG: u32 = 1;
 
+/// The capture (ADC/input) stream's own fixed stream tag. Deliberately
+/// the same numeric value as `PLAYBACK_STREAM_TAG`: stream tags are only
+/// ever compared against the `SD_CTL` register of *one particular*
+/// stream descriptor (a converter widget's `SET_CHANNEL_STREAMID` is
+/// matched against its own direction's stream, per the HDA spec), so an
+/// output tag and an input tag reusing the same small integer can never
+/// collide -- exactly like `AC_AMP_SET_OUTPUT`/`AC_AMP_SET_INPUT` below
+/// being independent despite sharing the rest of that verb's payload
+/// bits.
+const CAPTURE_STREAM_TAG: u32 = 1;
+
+/// `AC_VERB_SET_AMP_GAIN_MUTE`'s "Set Input Amp" flag -- the capture-path
+/// counterpart to `AC_AMP_SET_OUTPUT`, selecting the ADC converter's
+/// input amplifier stage instead of a DAC/pin's output stage.
+const AC_AMP_SET_INPUT: u32 = 1 << 14;
+
+/// `PIN_WIDGET_CONTROL`'s input-enable bit -- the capture-path
+/// counterpart to `AC_PINCTL_OUT_EN`, at the adjacent bit position (bit 5
+/// vs. bit 6), matching `AC_PINCAP_IN`/`AC_PINCAP_OUT`'s own analogous
+/// bit-position relationship in the pin's *capability* register.
+const AC_PINCTL_IN_EN: u32 = 1 << 5;
+
+/// This driver's fixed capture buffer/period sizing reuses the exact
+/// same numbers as playback (`PLAYBACK_PERIOD_BYTES`/
+/// `PLAYBACK_BUFFER_BYTES`/`PLAYBACK_PERIOD_COUNT`) -- mirroring
+/// `es1370.rs`'s own `PERIOD_FRAMES`/`BUFFER_BYTES`, which are likewise
+/// shared unchanged between its DAC1 and ADC paths, since both directions
+/// use the identical fixed 44.1 kHz/16-bit/stereo format on this driver.
+
 #[derive(Debug, Clone, Copy)]
 pub enum Status {
     NotPresent,
@@ -569,6 +598,24 @@ pub struct Hda {
     /// test tone.
     network_mode: AtomicBool,
     underrun_count: AtomicU32,
+    /// The capture-path counterpart to `stream_index`: which input
+    /// stream index is programmed for recording, if `find_capture_target`
+    /// located a usable ADC/pin pair and this controller has at least one
+    /// input stream at all. `None` means no active capture -- every
+    /// capture-facing method below is a no-op in that case, mirroring
+    /// `stream_index`/`has_playback`'s own convention exactly.
+    capture_stream_index: Option<u8>,
+    /// The capture-path counterpart to `buffer_addr`: a separate,
+    /// physically contiguous DMA region the codec's ADC converter writes
+    /// captured samples into.
+    capture_buffer_addr: u32,
+    /// The capture-path counterpart to `periods_serviced`.
+    capture_periods_serviced: AtomicU32,
+    /// Incremented whenever a just-drained capture period couldn't be
+    /// fully queued into `CAPTURE_RINGS` (ring already full) -- the
+    /// capture-path counterpart to `underrun_count`, mirroring
+    /// `es1370::Es1370::capture_overrun_count`.
+    capture_overrun_count: AtomicU32,
 }
 
 impl Hda {
@@ -602,6 +649,17 @@ impl Hda {
     /// device.
     pub fn has_playback(&self) -> bool {
         self.stream_index.is_some()
+    }
+
+    /// Whether this controller has a usable, already-programmed capture
+    /// (ADC) stream -- unlike `has_playback`, this never gates whether
+    /// the controller is added to `audio::DEVICES` at all (a controller
+    /// with playback but no capture, or vice versa, is still a perfectly
+    /// usable device for whichever direction it does support); it exists
+    /// purely so `audio.rs`'s facade methods below can no-op cleanly for
+    /// a controller that never found a usable ADC/pin pair.
+    pub fn has_capture(&self) -> bool {
+        self.capture_stream_index.is_some()
     }
 
     /// This device's fixed native playback format -- see
@@ -640,6 +698,33 @@ impl Hda {
             self.interrupt_count.load(Ordering::Relaxed),
             self.periods_serviced.load(Ordering::Relaxed),
         )
+    }
+
+    /// Pulls up to `out.len()` captured bytes (in this device's own
+    /// `format()`) out of `CAPTURE_RINGS`, returning how many bytes were
+    /// actually copied -- mirrors `Es1370::capture` exactly, including
+    /// its "however much is ready" (never blocking, never short of a
+    /// full period) semantics. Always `0` for a controller with no
+    /// usable capture stream (`has_capture()` false).
+    pub fn capture(&self, out: &mut [u8]) -> usize {
+        if !self.has_capture() {
+            return 0;
+        }
+        unsafe { CAPTURE_RINGS[self.instance].pop_upto(out.as_mut_ptr(), out.len()) }
+    }
+
+    pub fn capture_overrun_count(&self) -> u32 {
+        self.capture_overrun_count.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently queued in this instance's own `CAPTURE_RINGS`
+    /// slot, the capture-side counterpart to `ring_backlog`.
+    pub fn capture_backlog(&self) -> usize {
+        CAPTURE_RINGS[self.instance].available()
+    }
+
+    pub fn capture_periods(&self) -> u32 {
+        self.capture_periods_serviced.load(Ordering::Relaxed)
     }
 
     /// Raw read of this controller's global interrupt-status register,
@@ -684,44 +769,79 @@ impl Hda {
         }
     }
 
+    /// The capture-path counterpart to `fill_period`: copies one
+    /// just-completed period's worth of captured PCM bytes out of the
+    /// ADC's own DMA ring and pushes them into `CAPTURE_RINGS` for a tape
+    /// to later drain via `capture`/the ABI's `audio_capture_at`
+    /// callback. Unlike `fill_period`, there is no fallback content to
+    /// generate here -- captured samples either exist or they don't; a
+    /// full `CAPTURE_RINGS` slot (a tape not draining fast enough) is
+    /// reported via `capture_overrun_count` and the remaining, unqueued
+    /// bytes are simply dropped, mirroring
+    /// `Es1370::drain_capture_period` exactly.
+    fn drain_capture_period(&self, half: u32) {
+        let offset = half * PLAYBACK_PERIOD_BYTES;
+        let base = (self.capture_buffer_addr + offset) as *const u8;
+        let period_bytes = PLAYBACK_PERIOD_BYTES as usize;
+        let captured = unsafe { core::slice::from_raw_parts(base, period_bytes) };
+        let accepted = CAPTURE_RINGS[self.instance].push(captured);
+        if accepted < captured.len() {
+            self.capture_overrun_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// The 32-bit register at `SD_CTL`'s offset packs the actual control
     /// bits (low 24) and the write-1-to-clear `SD_STS` byte (top 8) into
     /// one dword -- see `SD_CTL`'s own doc comment for why every write
     /// through here zeroes that top byte, so a control-bit change never
     /// accidentally acknowledges a completion status it wasn't meant to
-    /// touch.
-    fn write_sd_ctl(&self, ctl_bits: u32) {
-        let offset = stream_offset(self.stream_index.unwrap()) + SD_CTL;
+    /// touch. Takes an explicit stream index (rather than assuming
+    /// `self.stream_index`) so both the playback and capture paths can
+    /// share this one helper.
+    fn write_sd_ctl(&self, stream_index: u8, ctl_bits: u32) {
+        let offset = stream_offset(stream_index) + SD_CTL;
         write_u32(self.mmio_base, offset, ctl_bits & 0x00ff_ffff);
     }
 
-    fn read_sd_ctl(&self) -> u32 {
-        let offset = stream_offset(self.stream_index.unwrap()) + SD_CTL;
+    fn read_sd_ctl(&self, stream_index: u8) -> u32 {
+        let offset = stream_offset(stream_index) + SD_CTL;
         read_u32(self.mmio_base, offset) & 0x00ff_ffff
     }
 
-    /// Interrupt handler for this controller's playback stream, called
-    /// from `handle_pci_irq` for every registered controller sharing the
-    /// firing IRQ line (see that function's own doc comment for why
-    /// checking this controller's own status bits first makes that
-    /// safe). Refills whichever ring half just finished and
-    /// acknowledges the completion the same write-1-to-clear way real
-    /// HDA hardware requires -- unlike ES1370's level-triggered
-    /// `SERIAL_CONTROL` toggle, this is a genuine per-bit clear, so no
-    /// read-modify-write dance is needed.
+    /// Interrupt handler for this controller's playback and capture
+    /// streams, called from `handle_pci_irq` for every registered
+    /// controller sharing the firing IRQ line (see that function's own
+    /// doc comment for why checking this controller's own status bits
+    /// first makes that safe). Checks each direction's `SD_STS`
+    /// unconditionally rather than as an if/else -- exactly like
+    /// `Es1370::handle_interrupt` checking `STAT_DAC1`/`STAT_ADC`
+    /// independently -- since both streams can legitimately complete a
+    /// period on the same interrupt. Refills/drains whichever ring half
+    /// just finished and acknowledges the completion the same
+    /// write-1-to-clear way real HDA hardware requires -- unlike
+    /// ES1370's level-triggered `SERIAL_CONTROL` toggle, this is a
+    /// genuine per-bit clear, so no read-modify-write dance is needed.
     pub fn handle_interrupt(&self) {
-        let Some(stream_index) = self.stream_index else {
-            return;
-        };
-        let sts_offset = stream_offset(stream_index) + SD_STS;
-        let status = read_u8(self.mmio_base, sts_offset);
-        if status & SD_STS_BCIS == 0 {
-            return;
+        if let Some(stream_index) = self.stream_index {
+            let sts_offset = stream_offset(stream_index) + SD_STS;
+            let status = read_u8(self.mmio_base, sts_offset);
+            if status & SD_STS_BCIS != 0 {
+                self.interrupt_count.fetch_add(1, Ordering::Relaxed);
+                let served = self.periods_serviced.fetch_add(1, Ordering::Relaxed);
+                self.fill_period(served % PLAYBACK_PERIOD_COUNT);
+                write_u8(self.mmio_base, sts_offset, SD_STS_BCIS);
+            }
         }
-        self.interrupt_count.fetch_add(1, Ordering::Relaxed);
-        let served = self.periods_serviced.fetch_add(1, Ordering::Relaxed);
-        self.fill_period(served % PLAYBACK_PERIOD_COUNT);
-        write_u8(self.mmio_base, sts_offset, SD_STS_BCIS);
+        if let Some(stream_index) = self.capture_stream_index {
+            let sts_offset = stream_offset(stream_index) + SD_STS;
+            let status = read_u8(self.mmio_base, sts_offset);
+            if status & SD_STS_BCIS != 0 {
+                self.interrupt_count.fetch_add(1, Ordering::Relaxed);
+                let captured = self.capture_periods_serviced.fetch_add(1, Ordering::Relaxed);
+                self.drain_capture_period(captured % PLAYBACK_PERIOD_COUNT);
+                write_u8(self.mmio_base, sts_offset, SD_STS_BCIS);
+            }
+        }
     }
 
     /// Sends one verb through the CORB/RIRB DMA transport and returns
@@ -764,6 +884,16 @@ static mut INITIALIZED: bool = false;
 /// stack copy while `init_controller`'s own `let mut hda = Hda { ... }`
 /// is still a local).
 static RINGS: [audio::PcmRing; MAX_INSTANCES] =
+    [const { audio::PcmRing::new() }; MAX_INSTANCES];
+
+/// The capture-path counterpart to `RINGS`: each controller's own ADC
+/// interrupt handler (`Hda::drain_capture_period`) pushes just-captured
+/// PCM bytes in here, and a tape drains them back out via the ABI's
+/// `audio_capture`/`audio_capture_at` callbacks (`Hda::capture`) --
+/// mirrors `es1370.rs`'s own `CAPTURE_RINGS` array exactly, including
+/// living as a standalone top-level array for the same reason `RINGS`
+/// does above.
+static CAPTURE_RINGS: [audio::PcmRing; MAX_INSTANCES] =
     [const { audio::PcmRing::new() }; MAX_INSTANCES];
 
 /// Shared legacy IRQs are normal (see `es1370.rs`'s own doc comment on
@@ -880,9 +1010,14 @@ fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Sta
         periods_serviced: AtomicU32::new(0),
         network_mode: AtomicBool::new(false),
         underrun_count: AtomicU32::new(0),
+        capture_stream_index: None,
+        capture_buffer_addr: 0,
+        capture_periods_serviced: AtomicU32::new(0),
+        capture_overrun_count: AtomicU32::new(0),
     };
     discover_codecs(&mut hda);
     setup_playback(&mut hda);
+    setup_capture(&mut hda);
     Ok(hda)
 }
 
@@ -925,6 +1060,50 @@ fn find_playback_target(hda: &Hda) -> Option<(u8, u8, u8)> {
             .map(|w| w.nid);
         if let (Some(dac_nid), Some(pin_nid)) = (dac_nid, pin_nid) {
             return Some((codec.address, dac_nid, pin_nid));
+        }
+    }
+    None
+}
+
+/// Locates a usable ADC (converter)/pin-complex pair to record from --
+/// the capture-path mirror of `find_playback_target`. Per this module's
+/// own doc comment on QEMU's synthetic `hda-duplex` codec layout, the
+/// *pin*'s own connection entry names the ADC feeding it (the same
+/// direction `find_playback_target` already reads for an output pin's
+/// DAC source), so this reuses the identical two-pass strategy: prefer a
+/// pin that is input-capable and already connected to a confirmed
+/// `AudioInput` converter, falling back to simply pairing the first
+/// `AudioInput` widget with the first input-capable pin on the same
+/// codec.
+fn find_capture_target(hda: &Hda) -> Option<(u8, u8, u8)> {
+    for codec in hda.codecs().iter().flatten() {
+        let widgets = codec.widgets();
+        for pin in widgets.iter().flatten() {
+            if pin.widget_type != WidgetType::Pin || !pin.pin_input_capable {
+                continue;
+            }
+            if let Some(source_nid) = pin.connection {
+                let is_adc = widgets.iter().flatten().any(|w| {
+                    w.nid == source_nid && w.widget_type == WidgetType::AudioInput
+                });
+                if is_adc {
+                    return Some((codec.address, source_nid, pin.nid));
+                }
+            }
+        }
+
+        let adc_nid = widgets
+            .iter()
+            .flatten()
+            .find(|w| w.widget_type == WidgetType::AudioInput)
+            .map(|w| w.nid);
+        let pin_nid = widgets
+            .iter()
+            .flatten()
+            .find(|w| w.widget_type == WidgetType::Pin && w.pin_input_capable)
+            .map(|w| w.nid);
+        if let (Some(adc_nid), Some(pin_nid)) = (adc_nid, pin_nid) {
+            return Some((codec.address, adc_nid, pin_nid));
         }
     }
     None
@@ -984,13 +1163,13 @@ fn setup_playback(hda: &mut Hda) {
 
     // Two-phase stream reset, the same bounded readback-polling
     // handshake `reset_controller` already uses for `GCTL_CRST`.
-    hda.write_sd_ctl(SD_CTL_STREAM_RESET);
-    if !poll_until(|| hda.read_sd_ctl() & SD_CTL_STREAM_RESET != 0) {
+    hda.write_sd_ctl(stream_index, SD_CTL_STREAM_RESET);
+    if !poll_until(|| hda.read_sd_ctl(stream_index) & SD_CTL_STREAM_RESET != 0) {
         hda.stream_index = None;
         return;
     }
-    hda.write_sd_ctl(0);
-    if !poll_until(|| hda.read_sd_ctl() & SD_CTL_STREAM_RESET == 0) {
+    hda.write_sd_ctl(stream_index, 0);
+    if !poll_until(|| hda.read_sd_ctl(stream_index) & SD_CTL_STREAM_RESET == 0) {
         hda.stream_index = None;
         return;
     }
@@ -1030,7 +1209,104 @@ fn setup_playback(hda: &mut Hda) {
     }
 
     hda.write_sd_ctl(
+        stream_index,
         (PLAYBACK_STREAM_TAG << SD_CTL_STREAM_TAG_SHIFT) | SD_CTL_IOCE | SD_CTL_RUN,
+    );
+
+    let intctl = read_u32(hda.mmio_base, REG_INTCTL);
+    write_u32(
+        hda.mmio_base,
+        REG_INTCTL,
+        intctl | INTCTL_GIE | INTCTL_CIE | (1 << stream_index),
+    );
+}
+
+/// Brings up one capture (ADC) stream -- the input-path mirror of
+/// `setup_playback`, differing only in: using the low input-stream
+/// indices directly (stream index `0`, the first input stream, rather
+/// than `output_stream_count`'s offset into the output range -- see
+/// `STREAM_BASE`'s own doc comment on why input streams occupy the low
+/// indices), a separate DMA buffer (`capture_buffer_addr`, never shared
+/// with `buffer_addr`), `AC_AMP_SET_INPUT`/`AC_PINCTL_IN_EN` instead of
+/// their output-path counterparts, and seeding the ring with nothing
+/// (there is no silence-equivalent to pre-fill on the capture side --
+/// the codec's own DMA simply hasn't written anything yet at this
+/// point, exactly like `Es1370::start_adc` needs no analogous
+/// `fill_period` priming call either). Leaves `hda.capture_stream_index`
+/// at `None` (this controller simply has no capture -- `has_capture`
+/// reports `false`) on any failure, exactly as generously as
+/// `setup_playback` treats its own failure paths.
+fn setup_capture(hda: &mut Hda) {
+    if hda.input_stream_count == 0 {
+        return;
+    }
+    let Some((cad, adc_nid, pin_nid)) = find_capture_target(hda) else {
+        return;
+    };
+
+    let buffer_frames = (PLAYBACK_BUFFER_BYTES as usize).div_ceil(pmem::FRAME_SIZE as usize);
+    let Some(buffer_addr) = pmem::allocate_contiguous(buffer_frames) else {
+        return;
+    };
+    let Some(bdl_addr) = pmem::allocate() else {
+        return;
+    };
+    unsafe {
+        core::ptr::write_bytes(buffer_addr as *mut u8, 0, PLAYBACK_BUFFER_BYTES as usize);
+    }
+    for half in 0..PLAYBACK_PERIOD_COUNT {
+        let addr = (buffer_addr as u64) + (half * PLAYBACK_PERIOD_BYTES) as u64;
+        write_bdl_entry(bdl_addr, half, addr, PLAYBACK_PERIOD_BYTES, BDL_FLAG_IOC);
+    }
+
+    // First input stream index (see `STREAM_BASE`'s own doc comment on
+    // why input streams occupy the low indices, starting at 0, unlike
+    // `setup_playback`'s `input_stream_count`-offset output index).
+    let stream_index: u8 = 0;
+    hda.capture_stream_index = Some(stream_index);
+    hda.capture_buffer_addr = buffer_addr;
+
+    let stream_off = stream_offset(stream_index);
+
+    hda.write_sd_ctl(stream_index, SD_CTL_STREAM_RESET);
+    if !poll_until(|| hda.read_sd_ctl(stream_index) & SD_CTL_STREAM_RESET != 0) {
+        hda.capture_stream_index = None;
+        return;
+    }
+    hda.write_sd_ctl(stream_index, 0);
+    if !poll_until(|| hda.read_sd_ctl(stream_index) & SD_CTL_STREAM_RESET == 0) {
+        hda.capture_stream_index = None;
+        return;
+    }
+
+    write_u32(hda.mmio_base, stream_off + SD_CBL, PLAYBACK_BUFFER_BYTES);
+    write_u16(hda.mmio_base, stream_off + SD_LVI, (PLAYBACK_PERIOD_COUNT - 1) as u16);
+    write_u16(hda.mmio_base, stream_off + SD_FORMAT, PLAYBACK_FORMAT as u16);
+    write_u32(hda.mmio_base, stream_off + SD_BDLPL, bdl_addr);
+    write_u32(hda.mmio_base, stream_off + SD_BDLPU, 0);
+
+    hda.send_corb_command(verb16(cad, adc_nid, AC_VERB_SET_STREAM_FORMAT, PLAYBACK_FORMAT));
+    hda.send_corb_command(verb(
+        cad,
+        adc_nid,
+        AC_VERB_SET_CHANNEL_STREAMID,
+        (CAPTURE_STREAM_TAG << 4) & 0xf0,
+    ));
+    hda.send_corb_command(verb16(
+        cad,
+        adc_nid,
+        AC_VERB_SET_AMP_GAIN_MUTE,
+        AC_AMP_SET_INPUT | AC_AMP_SET_LEFT | AC_AMP_SET_RIGHT | AC_AMP_GAIN_DEFAULT,
+    ));
+    hda.send_corb_command(verb(cad, pin_nid, AC_VERB_SET_PIN_WIDGET_CONTROL, AC_PINCTL_IN_EN));
+
+    if let Some(irq) = hda.irq {
+        interrupts::register_pci_irq(irq, handle_pci_irq);
+    }
+
+    hda.write_sd_ctl(
+        stream_index,
+        (CAPTURE_STREAM_TAG << SD_CTL_STREAM_TAG_SHIFT) | SD_CTL_IOCE | SD_CTL_RUN,
     );
 
     let intctl = read_u32(hda.mmio_base, REG_INTCTL);
