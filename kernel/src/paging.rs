@@ -30,26 +30,25 @@ const PAGE_SIZE: u32 = 4096;
 #[cfg(not(feature = "legacy-unsafe-memory"))]
 const PAGE_DIRECTORY_ENTRIES: usize = 1024;
 /// One dynamic table per distinct 4 MiB-aligned high region a `map_mmio`
-/// caller has ever registered. Kept at 3 rather than bumped for MSI
-/// support (`lapic.rs`), even though the local APIC's own fixed MMIO
-/// window (`0xFEE00000`) is one more `map_mmio` consumer alongside the
-/// existing e1000/i350/HDA BAR mappings: each additional slot is a whole
-/// extra static 4 KiB page table, and the reserved low-memory kernel
-/// region (`linker.ld`'s `__kernel_end < 0x90000` assertion) has no spare
-/// room for one right now -- confirmed by trying it, not assumed. If this
-/// pool is ever exhausted (all 3 slots already claimed by 3 *other*
-/// simultaneously-mapped high regions when the LAPIC tries to map its
-/// own), `map_mmio` simply returns `Err`, `lapic::initialize()` reports
-/// no local APIC available, and every MSI-capable driver transparently
-/// falls back to its legacy PIC IRQ path -- the same "cleanly
-/// unavailable, not a fault" convention `disk.rs` already uses for a zero
-/// `bios_disk_io` pointer. Growing this pool (and the reserved region
-/// alongside it, in the same synchronized way `AGENTS.md`'s low-memory
-/// growth history describes) is the right fix if a real scenario ever
-/// needs 4 simultaneous high MMIO mappings at once; nothing here needs it
-/// pre-emptively today.
+/// caller has ever registered. Originally kept at 3 (covering e1000/i350/
+/// HDA's own BAR mappings) rather than bumped to cover the local APIC's
+/// own fixed MMIO window (`0xFEE00000`, one more `map_mmio` consumer
+/// alongside those three -- see `lapic.rs`) when MSI support was added,
+/// since the reserved low-memory kernel region had no spare room for
+/// another static 4 KiB page table at the time -- confirmed by trying it,
+/// not assumed. Bumped to 4 once that region's own ceiling grew for an
+/// unrelated reason (see `AGENTS.md`'s "Low-memory map"), closing the gap
+/// deliberately rather than leaving it as a standing, if narrow, MSI
+/// availability risk. If this pool is ever exhausted anyway (all 4 slots
+/// already claimed by 4 *other* simultaneously-mapped high regions), the
+/// failure is still graceful: `map_mmio` simply returns `Err`, and
+/// whichever caller wanted the mapping falls back accordingly -- for the
+/// LAPIC specifically, `lapic::initialize()` reports no local APIC
+/// available and every MSI-capable driver transparently falls back to its
+/// legacy PIC IRQ path, the same "cleanly unavailable, not a fault"
+/// convention `disk.rs` already uses for a zero `bios_disk_io` pointer.
 #[cfg(not(feature = "legacy-unsafe-memory"))]
-const MAX_DYNAMIC_PAGE_TABLES: usize = 3;
+const MAX_DYNAMIC_PAGE_TABLES: usize = 4;
 
 #[cfg(not(feature = "legacy-unsafe-memory"))]
 const PAGE_PRESENT: u32 = 1 << 0;

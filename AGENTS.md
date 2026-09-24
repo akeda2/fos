@@ -76,14 +76,12 @@ that obscure hardware behavior.
   page absent and make page-aligned kernel text/read-only data non-writable;
   the remaining low range uses 4 MiB PSE mappings. High PCI MMIO is absent
   until `map_mmio` registers a driver's exact BAR range, using at most
-  three dynamic page tables -- kept at three rather than bumped for the
-  local APIC's own fixed MMIO window (a fourth `map_mmio` consumer, see
-  "MSI/MSI-X and the local APIC" below) because the reserved low-memory
-  kernel region has no spare room for another whole 4 KiB page table right
-  now; exhausting this pool just means MSI is unavailable that boot
-  (every driver falls back to its legacy PIC IRQ), not a fault. This
-  retains physical-pointer compatibility for DMA and the BIOS trampoline
-  while leaving unrelated high ranges unmapped for useful page-fault
+  four dynamic page tables -- covering e1000/i350/HDA's own BAR mappings
+  plus the local APIC's fixed MMIO window (see "MSI/MSI-X support" below);
+  exhausting this pool just means MSI is unavailable that boot (every
+  driver falls back to its legacy PIC IRQ), not a fault. This retains
+  physical-pointer compatibility for DMA and the BIOS trampoline while
+  leaving unrelated high ranges unmapped for useful page-fault
   diagnostics; it is not userspace isolation.
   `make image-unsafe-memory` is the explicit teaching comparison: it builds
   a separate unpaged artifact, so it has neither those absent ranges nor the
@@ -2220,20 +2218,20 @@ kernel actually enabled it for that device) -- read-only, at no writing
 cost, useful for confirming a card the same way `pci`'s vendor/device ID
 dump already helps identify unknown hardware.
 
-**Accepted low-memory constraint**: the local APIC's own `map_mmio` call
-is a fourth potential consumer of `paging.rs`'s dynamic-page-table pool
-(alongside e1000/i350/HDA), but that pool was deliberately *not* widened
-from 3 to 4 slots -- confirmed by trying it, not assumed: even one more
-static 4 KiB page table pushed `__kernel_end` past `linker.ld`'s
-`0x90000` ceiling, meaning this kernel's low-memory budget currently has
-essentially no spare room at all. If this pool is ever genuinely
-exhausted (3 *other* high regions already mapped when the LAPIC tries to
-map its own), the failure is graceful: no local APIC, no MSI that boot,
-every driver on its legacy path -- not a fault. Growing the pool (and the
-reserved region alongside it, in the same synchronized way this
-document's low-memory growth history already describes) is the right fix
-if a real scenario ever needs 4 simultaneous high MMIO mappings; nothing
-here needs it pre-emptively.
+**Low-memory constraint, now resolved**: the local APIC's own `map_mmio`
+call is a fourth potential consumer of `paging.rs`'s dynamic-page-table
+pool (alongside e1000/i350/HDA). At the time this feature was built, that
+pool was deliberately *not* widened from 3 to 4 slots to cover it --
+confirmed by trying it, not assumed: even one more static 4 KiB page
+table pushed `__kernel_end` past `linker.ld`'s ceiling (then `0x90000`),
+which had essentially no spare room at all. The pool is now 4 slots:
+once that ceiling grew to `0x98000` for an unrelated reason (see
+"Low-memory map" above), there was real headroom again, and the gap was
+closed deliberately rather than left as a standing, if narrow,
+MSI-availability risk. If this pool is ever exhausted anyway (4 *other*
+high regions already mapped when the LAPIC tries to map its own), the
+failure remains graceful: no local APIC, no MSI that boot, every driver
+on its legacy path -- not a fault.
 
 Verified end to end by dropping the `-device intel-hda,msi=off` workaround
 from `tapes/test_hda_playback_e2e.py`/`tapes/test_hda_capture_e2e.py`
