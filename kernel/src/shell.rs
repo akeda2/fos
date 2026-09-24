@@ -448,7 +448,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!(
                     "System: help clear vga about bootinfo memmap memory cpuinfo pci"
                 );
-                println!("      hexdump halt reset");
+                println!("      hexdump halt reset reboot [soft|hard]");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!(
                     "Disk: diskinfo/readsector/format/ls/cat/write/rm [diskN], copy SRC NAME DST"
@@ -547,6 +547,7 @@ fn execute(command: &[u8], info: &BootInfo) {
             println!("Resetting the machine now (8042 keyboard-controller pulse reset)...");
             reset();
         }
+        b"reboot" => reboot_command(info, arguments),
         b"debug" => debug_command(info, arguments),
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
         | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci" | b"printer"
@@ -555,6 +556,32 @@ fn execute(command: &[u8], info: &BootInfo) {
         }
 
         _ => println!("Unknown command. Type 'help' for commands."),
+    }
+}
+
+/// `reboot` (bare, or `reboot soft`) warm-restarts the machine through
+/// `crate::reboot::soft_reboot` -- the "reset the OS, not the machine"
+/// command this project's design discussion settled on: it re-runs
+/// `boot/stage2.S`'s whole boot sequence (E820, A20, `select_kernel_slot`'s
+/// A/B fallback, and a fresh kernel load) without a hardware reset, so it
+/// picks up a pending KUP update exactly like a real reboot would. `reboot
+/// hard` instead performs the existing, unconditional 8042-pulse hardware
+/// reset -- kept as an explicit, always-available fallback for the case a
+/// soft reboot itself needs to be ruled out (e.g. it hangs, or something
+/// about the running kernel's own state is suspect). `reset` remains a
+/// permanent alias for `reboot hard`, predating this command and already
+/// relied on by existing scripts/tests.
+fn reboot_command(info: &BootInfo, arguments: &[u8]) {
+    match arguments {
+        b"" | b"soft" => {
+            println!("Soft-rebooting: re-entering the boot loader without a hardware reset...");
+            crate::reboot::soft_reboot(info);
+        }
+        b"hard" => {
+            println!("Resetting the machine now (8042 keyboard-controller pulse reset)...");
+            reset();
+        }
+        _ => println!("Usage: reboot [soft|hard]"),
     }
 }
 
@@ -5960,7 +5987,13 @@ fn serve_kup_put_stop(info: &BootInfo, nic: &nic::Nic, source: [u8; 6], own_mac:
     while interrupts::ticks() < deadline {
         core::hint::spin_loop();
     }
-    reset();
+    // A soft reboot (see `crate::reboot`) picks up the freshly installed
+    // pending slot exactly like a hardware reset would, just without
+    // waiting through a full BIOS POST first -- KUP's whole point is fast
+    // network-driven iteration, so skipping POST here matters in exactly
+    // the way it doesn't for `reboot-on-crash` (see that module's own
+    // doc comment for why *that* path stays hardware-only).
+    crate::reboot::soft_reboot(info);
 }
 
 /// Displays a MAC address as `aa:bb:cc:dd:ee:ff` wherever `println!`/`print!`

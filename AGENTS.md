@@ -519,7 +519,121 @@ back to source.
 
 System commands: `help`, `clear`, `vga [d|80x25|80x50|132x25]`, `about`,
 `bootinfo`, `memmap`, `memory`, `cpuinfo`, `hexdump ADDRESS LENGTH`, `halt`,
-and `reset`.
+`reset`, and `reboot [soft|hard]`.
+
+### `reboot`: a soft-reboot path alongside the existing hardware reset
+
+`reset` (and `reboot hard`, its explicit alias) has always meant an
+unconditional 8042 keyboard-controller pulse reset -- a genuine hardware
+CPU reset, indistinguishable from power-cycling as far as this kernel's
+own state is concerned. `reboot`/`reboot soft` (`kernel/src/reboot.rs`,
+`shell.rs`'s `reboot_command`) instead warm-restarts the machine by
+jumping straight back into `boot/stage2.S`'s own `_start` (via a new
+`BootInfo::soft_reboot` callback pointer, `soft_reboot_entry` in
+`stage2.S`) without ever touching the CPU's hardware RESET line: BIOS
+POST is skipped entirely, but every other step of an ordinary boot still
+runs for real -- E820 memory-map collection, A20 verification,
+`select_kernel_slot`'s full A/B fallback/confirm state machine, and a
+fresh kernel load from whichever slot that state machine currently
+selects. This is why a pending KUP-installed kernel (see "KUP" below) is
+tried exactly the same way after a soft reboot as after a hardware one --
+`select_kernel_slot`'s logic has no idea, and needs no idea, which kind
+of reboot brought it here. `soft_reboot` mirrors `disk::call_trampoline`'s
+own real-mode-drop discipline (`cli`, restore the real-mode IVT and
+BIOS-conventional PIC mapping, *then* drop to real mode) for the same
+reason: stage two's own BIOS disk reads need working BIOS timer-tick
+delivery, and the currently running kernel's IDT/PIC state is otherwise
+still loaded. If a given `BootInfo` predates this callback (or the
+loader never populated it), `soft_reboot` falls back to a hardware reset
+instead of transmuting a null pointer -- the same "cleanly unavailable,
+not a fault" convention `disk.rs` already uses for a zero `bios_disk_io`
+pointer.
+
+**Deliberately not used by `reboot-on-crash`** (`debug::handle_crash`):
+that path's entire point is recovering unattended no matter how corrupted
+the running kernel's state is after a fatal exception, including the very
+low-memory stage-two code and `BootInfo` a soft reboot depends on staying
+intact. A hardware reset makes no assumptions about surviving state at
+all; a soft reboot makes several (stage two's code at `0x8000` is
+unmodified, `BootInfo` is still valid, the CPU can still safely drop to
+real mode) -- appropriate only for a deliberate, operator- or
+KUP-requested restart of an otherwise healthy kernel, never a crash
+handler's own recovery path. `reset` remains available as an explicit,
+always-usable fallback in case a soft reboot itself ever needs to be
+ruled out (e.g. it hangs, or something about the running kernel's state
+is suspect) -- exactly the situation the two debugging sessions below
+were built to rule in or out.
+
+#### Two soft-reboot bugs found and fixed during development, neither ever hit by a hardware reset
+
+Soft reboot is a fundamentally new code path: it is the first time
+`boot/stage2.S`'s real-mode boot sequence has ever run on a CPU that
+*wasn't* freshly reset by BIOS POST moments before. Both bugs below are
+exactly the class of surprise that predicts -- each one was invisible to
+every existing test and to a hardware reset, and surfaced only because a
+soft reboot leaves behind state (on disk, or in a CPU register) that a
+real reset always wipes clean.
+
+- **Stale slot-LBA/sector-count constants caused KUP to write a new
+  kernel to the wrong disk location.** `kernel/src/debug.rs`'s
+  `SLOT1_LBA`/`SLOT_SECTORS` constants are a copy of values
+  `tools/write_layout.py` also computes and are meant to move together
+  with it (see "Low-memory map"/A-B slot documentation for every other
+  constant already known to need this) -- but this fifth location was
+  missed when a past `KERNEL_RESERVED_END` growth (`0x60000` -> `0x70000`
+  for ES1370 ADC support) updated `linker.ld`/`pmem.rs`/
+  `write_layout.py`/`write_netrom_layout.py` together. The stale values
+  (`SLOT1_LBA=2721`, `SLOT_SECTORS=640`, versus the current, correct
+  `SLOT1_LBA=2849`, `SLOT_SECTORS=768`) meant `install_kernel_update`
+  wrote a freshly pushed kernel image to the wrong LBA, while
+  `select_kernel_slot` (using the current, correct constants baked into
+  `build/layout.inc`) read the *right* LBA on the next boot -- landing on
+  a stale, unrelated 128-sector region and executing whatever garbage
+  bytes were there as code, producing a wild `#UD` a few instructions in.
+  This was invisible to every pre-existing test because nothing before
+  soft reboot ever exercised the very first KUP-installed-kernel boot in
+  a way that also depended on `debug.rs`'s own copy of these constants
+  being correct -- a hardware-reset-only KUP flow happened to never
+  actually be run end-to-end with a genuinely mismatched value until this
+  feature's own test coverage did. Fixed by correcting both constants and
+  expanding `debug.rs`'s doc comment to explicitly document this as a
+  fifth location that must be kept in sync, with the exact recipe
+  (`python3 tools/write_layout.py --kernel build/kernel.bin --output
+  /dev/stdout`) for recomputing them.
+- **`collect_memory_map` cleared only the low 16 bits of `%ebp`, so a
+  soft reboot's leftover register garbage made the E820 loop believe it
+  was already done.** `boot/stage2.S`'s E820 collection loop used
+  `xorw %bp, %bp` to zero its region counter, but then compared and
+  stored using the full 32-bit `%ebp` (`cmpl $MAX_MEMORY_REGIONS, %ebp`,
+  `movw %bp, BOOT_INFO + 10`). On a genuine BIOS cold boot this worked by
+  incidental luck -- POST happens to leave `%ebp`'s upper 16 bits zero --
+  but a soft reboot never resets the CPU at all: it is the same running
+  processor jumping back into real mode from the still-executing 32-bit
+  Rust kernel, which leaves `%ebp` holding whatever 32-bit stack-frame-
+  pointer-sized value it was last using. The 32-bit comparison then saw a
+  garbage value already `>= MAX_MEMORY_REGIONS` (32) on the very first
+  loop iteration, exiting immediately and storing a region count of 0 (the
+  low 16 bits were still correctly zero) -- producing exactly the observed
+  `Physical memory: 0 frames (0 KiB) tracked above 0x70000` on every boot
+  following a soft reboot, and, once `pmem`'s allocator had nothing to
+  hand out, a cascading `No supported Ethernet controller found on the
+  PCI bus.` once NIC driver initialization's own DMA-buffer allocation
+  failed too -- one root cause producing two seemingly unrelated
+  symptoms. Fixed by changing `xorw %bp, %bp` to `xorl %ebp, %ebp` so the
+  full register is genuinely zeroed before the loop begins. Both bugs
+  were caught by `tools/test_debug_mode_e2e.py`'s KUP-then-soft-reboot
+  scenario, confirming the value of that test covering the exact
+  code path (a real KUP install followed by an in-process soft reboot,
+  not just a hardware-reset boot) most likely to expose this whole class
+  of "assumes cold-boot register/state cleanliness" bug.
+
+**A QEMU HMP debugging note from this investigation, worth keeping for
+future monitor-driven repro scripts**: QEMU 10.2.1's `pmemsave` HMP
+command requires the destination filename argument to be quoted if it
+contains a `/` (e.g. `pmemsave 0x100000 4096 "/tmp/some/path.bin"`) --
+an unquoted path with a slash is silently misparsed. Draining a QEMU
+monitor UNIX-socket connection also needs a loop, not a single `recv()`
+call, since a reply can arrive across more than one TCP/socket read.
 
 `vga` shows the current and available local modes, and changes the mode when
 an argument is supplied; it clears the framebuffer after a change. `d` and

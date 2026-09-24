@@ -1,5 +1,5 @@
 pub const BOOT_INFO_MAGIC: u32 = 0x464F_5342;
-pub const BOOT_INFO_VERSION: u16 = 4;
+pub const BOOT_INFO_VERSION: u16 = 5;
 pub const MAX_MEMORY_REGIONS: usize = 32;
 /// Fixed physical address `boot/stage2.S` writes `BootInfo` at (its own
 /// `BOOT_INFO` constant) and `entry.S` passes to `kmain` in a register.
@@ -40,6 +40,13 @@ pub struct BootInfo {
     pub booted_slot: u8,
     /// Reserved padding, kept zero, so `size` stays even.
     pub _reserved: u8,
+    /// Physical address of `boot/stage2.S`'s `soft_reboot_entry` -- a
+    /// callback that warm-restarts the machine by dropping back into
+    /// stage two's own `_start` instead of a hardware reset. Zero on a
+    /// `BootInfo` that predates this field (version < 5) or that never
+    /// populates it at all (e.g. `boot/netrom.S`'s disk-less variant);
+    /// see `kernel/src/reboot.rs`'s own zero-address fallback.
+    pub soft_reboot: u32,
 }
 
 impl BootInfo {

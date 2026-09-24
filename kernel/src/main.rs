@@ -27,6 +27,7 @@ mod paging;
 mod parallel;
 mod pci;
 mod pmem;
+mod reboot;
 mod rtl8139;
 mod shell;
 mod stack;

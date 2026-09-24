@@ -76,12 +76,12 @@ halt:
 initialize_boot_info:
     movw $BOOT_INFO, %di
     xorw %ax, %ax
-    movw $(48 + MAX_MEMORY_REGIONS * 24 + 2) / 2, %cx
+    movw $(48 + MAX_MEMORY_REGIONS * 24 + 2 + 4) / 2, %cx
     rep stosw
     movw $0x5342, BOOT_INFO
     movw $0x464f, BOOT_INFO + 2
-    movw $4, BOOT_INFO + 4
-    movw $(48 + MAX_MEMORY_REGIONS * 24 + 2), BOOT_INFO + 6
+    movw $5, BOOT_INFO + 4
+    movw $(48 + MAX_MEMORY_REGIONS * 24 + 2 + 4), BOOT_INFO + 6
     movb boot_drive + STAGE2_BASE, %al
     movb %al, BOOT_INFO + 8
     movb serial_available + STAGE2_BASE, %al
@@ -99,7 +99,11 @@ initialize_boot_info:
     # 32-entry memory map -- see kernel/src/boot_info.rs) is left at the
     # zero `select_kernel_slot` will overwrite once it actually decides
     # which kernel slot this boot is using; a byte at +817 is reserved
-    # padding, also left zero.
+    # padding, also left zero. `BOOT_INFO + 818` (`soft_reboot`, version 5)
+    # points at `soft_reboot_entry` below, the kernel's callback for
+    # warm-restarting through this same stage two instead of a hardware
+    # reset -- see that label's own comment for what it does.
+    movl $(soft_reboot_entry + STAGE2_BASE), BOOT_INFO + 818
     ret
 
 collect_memory_map:
@@ -107,7 +111,17 @@ collect_memory_map:
     movw %ax, %es
     movw $MEMORY_MAP, %di
     xorl %ebx, %ebx
-    xorw %bp, %bp
+    # Must clear the *full* 32-bit %ebp, not just %bp: on an ordinary BIOS
+    # cold boot the CPU happens to leave %ebp's upper 16 bits zero already,
+    # but a soft reboot re-enters this same code from the still-running
+    # 32-bit Rust kernel (`reboot::soft_reboot`), which leaves %ebp holding
+    # whatever 32-bit stack-frame-pointer value it was last using. The
+    # `cmpl $MAX_MEMORY_REGIONS, %ebp` check below reads the full register,
+    # so stale non-zero upper bits made it compare as already-past-the-limit
+    # on the very first iteration -- silently producing a zero-entry memory
+    # map (and, in turn, zero usable RAM) on every soft reboot instead of a
+    # real E820 query.
+    xorl %ebp, %ebp
 memory_next:
     cmpl $MAX_MEMORY_REGIONS, %ebp
     jae memory_done
@@ -412,9 +426,37 @@ select_kernel_slot_write_back:
 enter_protected_mode:
     cli
     lgdt gdt_descriptor + STAGE2_BASE
+    # Install a real, valid protected-mode-format IDT (temp_idt below)
+    # before ever setting CR0.PE, instead of leaving whatever small,
+    # real-mode-shaped IDTR use_real_mode_idt() installed (see
+    # kernel/src/interrupts.rs) in effect across the transition. That
+    # tiny table (base 0, limit 0x3ff) is only ever safe to service an
+    # interrupt against while genuinely in real mode -- real mode always
+    # reads a 4-byte-per-vector table at physical address 0 regardless of
+    # IDTR, so it works there even though it's the "wrong" table for
+    # protected mode. A hardware interrupt landing in protected mode
+    # while that table is still loaded misreads its bytes as 8-byte gate
+    # descriptors instead and jumps to garbage -- exactly the class of
+    # bug AGENTS.md's "Real hardware notes" documents for disk.rs's own
+    # analogous window, and confirmed here via QEMU CPU tracing as a
+    # real, reproducible triple fault: masking the 8259 (and even an
+    # explicit EOI) immediately before this transition does not reliably
+    # prevent an already-in-flight IRQ0 request from still being
+    # delivered a handful of instructions into protected_entry below.
+    # Rather than keep chasing that exact timing race, sidestep it
+    # entirely: `temp_idt`'s 256 gates all point at one harmless stub
+    # that just re-EOIs both PICs and returns, so any interrupt that
+    # still manages to land here is a silent no-op instead of a fatal
+    # exception, regardless of the exact mechanism that delivered it.
+    # This IDT stays loaded until the kernel's own interrupts::initialize()
+    # installs its real one.
+    lidt temp_idt_descriptor + STAGE2_BASE
     movb $0xff, %al
     outb %al, $0xa1
     outb %al, $0x21
+    movb $0x20, %al
+    outb %al, $0xa0
+    outb %al, $0x20
     movl %cr0, %eax
     orl $1, %eax
     movl %eax, %cr0
@@ -542,8 +584,83 @@ gdt_descriptor:
     .word gdt_descriptor - gdt - 1
     .long gdt + STAGE2_BASE
 
+# A minimal, valid protected-mode IDT (256 8-byte interrupt gates, all
+# pointing at the one harmless `spurious_stub` below) installed by
+# enter_protected_mode before CR0.PE is ever set, and left in place until
+# the kernel's own interrupts::initialize() replaces it with the real
+# one. See enter_protected_mode's own comment for why this exists: an
+# interrupt landing in protected mode is only safe if IDTR points at a
+# genuine 8-byte-gate-format table, unlike the tiny real-mode-shaped one
+# (kernel/src/interrupts.rs's use_real_mode_idt()) this trampoline relies
+# on elsewhere, which is only safe while genuinely in real mode.
+.align 8
+temp_idt:
+.rept 256
+    # Low 16 bits: `.word` truncates a 32-bit value naturally, so no
+    # explicit mask is needed (and GAS's bitwise operators refuse a
+    # still-section-relative symbol expression like this one anyway,
+    # since this file has no separate link step -- see enter_protected_mode's
+    # comment and the Makefile's plain `as --32` + `objcopy -O binary`
+    # pipeline). High 16 bits: stage2 is capped at 32 sectors (16 KiB) and
+    # STAGE2_BASE is 0x8000, so every address in this file is always well
+    # under 0x10000 and its high word is always 0 -- hardcoded rather than
+    # computed for the same GAS-limitation reason.
+    .word spurious_stub + STAGE2_BASE
+    .word 0x08
+    .byte 0
+    .byte 0x8e
+    .word 0
+.endr
+temp_idt_descriptor:
+    .word 256 * 8 - 1
+    .long temp_idt + STAGE2_BASE
+
 .code32
+# Entered only via an interrupt gate (see temp_idt above), never by
+# sequential execution -- any interrupt/exception taken while this
+# temporary IDT is loaded lands here, harmlessly. Re-EOIs both PICs
+# (harmless even if the interrupt wasn't a genuine, in-service one) and
+# returns; the interrupted code resumes exactly where it left off.
+spurious_stub:
+    pushal
+    movb $0x20, %al
+    outb %al, $0xa0
+    outb %al, $0x20
+    popal
+    iret
+
 protected_entry:
+    # Defensive re-close of the interrupt window as early as physically
+    # possible after landing here. A soft reboot's real-mode _start pass
+    # (kernel/src/reboot.rs -> use_bios_pic_mapping()) deliberately leaves
+    # IRQ0 unmasked on the master PIC so BIOS's own real-mode tick/timeout
+    # logic keeps working during the later BIOS disk reads that reload the
+    # kernel image; enter_protected_mode (this same _start pass, moments
+    # earlier) already re-masks both PICs to 0xff/0xff and does its own
+    # cli before this far jump. Tracing a real, reproducible triple fault
+    # here nonetheless showed IRQ0 still being serviced a handful of
+    # instructions into protected_entry, with IF measured clear at the
+    # time -- i.e. some part of that state did not reliably survive the
+    # real-mode-to-protected-mode transition. Rather than keep chasing the
+    # exact mechanism, re-do both unconditionally, immediately, before
+    # touching any segment register or memory: a `cli` this early can only
+    # ever narrow the window further, and masking both PICs again is
+    # idempotent and cheap. This closes the race regardless of its exact
+    # cause. use_real_mode_idt()'s small (base 0, limit 0x3ff) IDTR is
+    # still loaded at this point -- it is only safe once real mode is
+    # active, and this is exactly the class of hazard it protects against:
+    # a hardware interrupt in protected mode using that table's bytes as
+    # 8-byte gates instead of 4-byte real-mode vectors produces a garbage
+    # jump target (see AGENTS.md's "Real hardware notes" for the same bug
+    # class in disk.rs's own protected/real-mode IRQ window).
+    cli
+    movb $0xff, %al
+    outb %al, $0xa1
+    outb %al, $0x21
+    movb $0x20, %al
+    outb %al, $0xa0
+    outb %al, $0x20
+
     movw $0x10, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -552,6 +669,34 @@ protected_entry:
     movw %ax, %ss
     movl $0x9f000, %esp
     movl $BOOT_INFO, %ebx
+
+
+    # A soft reboot (kernel/src/reboot.rs) can land here after
+    # `load_kernel` just re-read a fresh kernel image, via a BIOS-emulated
+    # disk transfer, into this same physical range (0x10000..0x70000) that
+    # this VM instance was already executing as code moments earlier -- a
+    # pattern no cold boot ever exercises. Empirically, jumping straight
+    # into it from here is unreliable (see `kernel/src/entry.S`'s own
+    # `_start` comment for the fuller account of this investigation); an
+    # ordinary CPU load-then-store touch of every page in that range,
+    # right here in flat 32-bit protected mode, reliably avoids it, unlike
+    # the same *quantity* of unrelated I/O-port writes tried at this exact
+    # location. The leading theory is that this forces QEMU/TCG's
+    # self-modifying-code tracking to invalidate any translation cached
+    # for the *old* kernel's code across the whole image, not just its
+    # first few instructions, in a way the BIOS/DMA-style write path alone
+    # did not reliably trigger for a translation block that had already
+    # executed in this VM instance.
+    movl $0x10000, %edi
+    movl $0x70000, %ecx
+    subl %edi, %ecx
+    shrl $12, %ecx
+resync_kernel_pages:
+    movl (%edi), %edx
+    movl %edx, (%edi)
+    addl $0x1000, %edi
+    loop resync_kernel_pages
+
     movl $0x10000, %eax
     call *%eax
 protected_halt:
@@ -757,3 +902,51 @@ bios_disk_pm_return:
     popl %ebx
     popl %ebp
     ret
+
+# The "soft reboot" trampoline (`kernel/src/reboot.rs`'s `soft_reboot`
+# callback, `BootInfo + 818`, version 5): warm-restarts the machine by
+# dropping back into this very file's own `_start`, instead of asking the
+# 8042 controller to pulse the hardware RESET line. Unlike
+# `bios_disk_io` above, this never returns to the caller -- there is no
+# "caller" left to return to once `_start` has zeroed `BOOT_INFO` and
+# begun a fresh boot. The caller (kernel/src/reboot.rs) is responsible for
+# `cli` and restoring the real-mode IVT/BIOS PIC mapping first, exactly as
+# `disk::call_trampoline` already does before its own real-mode drop --
+# `load_kernel`'s BIOS disk reads below need working BIOS timer-tick
+# interrupt delivery exactly as much as an ordinary `bios_disk_io` call
+# does, and the running kernel's IDT/PIC state is otherwise still loaded.
+#
+# Reuses the exact same protected-to-real-mode mechanics as
+# `bios_disk_protected16`/`bios_disk_real` above -- selectors 0x18/0x20
+# (see `kernel/src/gdt.rs`'s own comment on why it keeps these two 16-bit
+# descriptors around), and the identical CR0.PE|PG-clearing mask -- since
+# stage two's own `_start` reinitializes `BOOT_INFO`, re-collects the E820
+# map, re-verifies A20, and re-runs `select_kernel_slot`'s full A/B
+# fallback logic before reloading the kernel fresh from disk: a genuine
+# repeat of an ordinary boot, just without BIOS POST.
+.code32
+soft_reboot_entry:
+    ljmp $0x18, $(soft_reboot_16 + STAGE2_BASE)
+
+.code16
+soft_reboot_16:
+    movw $0x20, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movl %cr0, %eax
+    andl $0x7ffffffe, %eax
+    movl %eax, %cr0
+    ljmp $0, $(soft_reboot_real + STAGE2_BASE)
+
+soft_reboot_real:
+    xorw %ax, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    # `_start` re-stores whatever is in %dl back into `boot_drive` as its
+    # very first act; reload the value it already holds from the original
+    # boot rather than leaving %dl as whatever garbage the last BIOS call
+    # left behind, which would otherwise silently corrupt this saved value.
+    movb boot_drive + STAGE2_BASE, %dl
+    jmp _start

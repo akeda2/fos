@@ -15,6 +15,31 @@ _start:
     mov esp, offset kernel_stack_top
     xor ebp, ebp
 
+    # Soft reboot (see kernel/src/reboot.rs) re-enters this exact entry point
+    # after stage two has just re-read a fresh kernel image from disk into
+    # this same physical memory (0x10000) that this VM instance was already
+    # executing as code moments earlier -- a pattern no other boot path in
+    # this project exercises (an ordinary cold boot never overwrites
+    # already-executing code). Empirically, without this loop, a soft reboot
+    # reliably jumps into the wild shortly after landing here, even when the
+    # freshly-read bytes are byte-for-byte identical to what was already
+    # resident (ruling out a stale/incomplete disk read as the cause). A
+    # bare CPU delay loop of the same length does not fix it; a loop that
+    # performs real port I/O does, every time. The leading theory is a
+    # QEMU/TCG quirk around invalidating a cached code translation for this
+    # physical range after a BIOS-emulated disk write lands underneath it --
+    # `out` forces TCG to exit the current translation block, which appears
+    # to force it to pick up the fresh bytes for what follows. This has not
+    # been proven against QEMU internals or real hardware; it is recorded
+    # here as the best available explanation for a fix confirmed reliable
+    # across many repeated runs. Port 0x80 is the same conventionally-unused
+    # POST-diagnostic port `interrupts.rs`'s `io_wait()` already uses for
+    # PIC/PIT command pacing, so this has no observable side effect.
+    mov ecx, 2000
+.soft_reboot_resync:
+    out 0x80, al
+    loop .soft_reboot_resync
+
     mov edi, offset __bss_start
     mov ecx, offset __bss_end
     sub ecx, edi

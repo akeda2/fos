@@ -33,15 +33,40 @@ use crate::println;
 /// `select_kernel_slot` -- there is no single source of truth shared across
 /// the Python/assembly/Rust boundary, the same accepted convention already
 /// used for `pmem::RESERVED_BELOW` (see AGENTS.md's "Low-memory map").
+///
+/// **These four constants (`METADATA_LBA`/`SLOT0_LBA`/`SLOT1_LBA`/
+/// `SLOT_SECTORS`) all derive from `tools/write_layout.py`'s
+/// `KERNEL_RESERVED_END`, exactly like `pmem::RESERVED_BELOW` and
+/// `linker.ld`'s `ASSERT` already do -- but unlike those two, nothing
+/// currently cross-checks these ones against the loader at boot, so a
+/// future `KERNEL_RESERVED_END` change that updates the other three call
+/// sites but misses this one fails silently, not loudly**: `boot/stage2.S`
+/// still uses its own freshly generated, correct `SLOT1_LBA`/`SLOT_SECTORS`
+/// (from `build/layout.inc`) to *read* a slot back at boot, while
+/// `install_kernel_update` below would keep *writing* a KUP-pushed kernel
+/// to whatever stale LBA is hardcoded here -- silently installing it into
+/// the wrong disk sectors. This exact drift (`SLOT_SECTORS` stuck at the
+/// pre-audio-ADC value of 640/`SLOT1_LBA` at 2721, after
+/// `KERNEL_RESERVED_END` grew from `0x60000` to `0x70000` for ES1370 ADC
+/// capture -- see AGENTS.md's "ES1370 ADC/capture support" section) is
+/// exactly what caused a real, fully deterministic soft-reboot-after-KUP
+/// crash: the loader read slot 1 starting 128 sectors into what KUP had
+/// actually written there, landing a `#UD`-inducing wrong instruction
+/// stream at the kernel's own entry point. **Whenever
+/// `KERNEL_RESERVED_END` changes, recompute and update these three values
+/// here too** (run `python3 tools/write_layout.py --kernel build/kernel.bin
+/// --output /dev/stdout` after a rebuild and copy `SLOT1_LBA`/
+/// `SLOT_SECTORS` from its output; `SLOT0_LBA`/`METADATA_LBA` never move on
+/// their own, only when `PAYLOAD_START_LBA`/`STAGE2_SECTORS` change).
 pub const METADATA_LBA: u64 = 2080;
 /// LBA of kernel slot 0 (see `tools/write_layout.py`'s `SLOT0_LBA`).
 pub const SLOT0_LBA: u64 = 2081;
 /// LBA of kernel slot 1 (see `tools/write_layout.py`'s `SLOT1_LBA`).
-pub const SLOT1_LBA: u64 = 2721;
+pub const SLOT1_LBA: u64 = 2849;
 /// Sectors reserved for each kernel slot (see `tools/write_layout.py`'s
 /// `SLOT_SECTORS`); also the largest kernel image a network update may
 /// install.
-pub const SLOT_SECTORS: u64 = 640;
+pub const SLOT_SECTORS: u64 = 768;
 
 const METADATA_MAGIC: [u8; 4] = *b"FOSM";
 const METADATA_VERSION: u8 = 1;
