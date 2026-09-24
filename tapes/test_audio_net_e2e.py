@@ -162,7 +162,7 @@ def main() -> None:
         import re
 
         audio_output = run_command(b"audio")
-        if b"ES1370 found" not in audio_output:
+        if b"[0] ES1370" not in audio_output:
             raise SystemExit(f"ES1370 not found:\n{audio_output.decode('utf-8', 'replace')}")
         if b"44100 Hz / 2ch / 16-bit" not in audio_output:
             raise SystemExit(
@@ -179,14 +179,16 @@ def main() -> None:
 
         run_start = len(output)
         mcast.send(eth_frame(guest_mac, TERM_CLIENT_MAC, TERM_TAG_DATA, b"tape run\n"))
-        read_until(b"Local audio device: 44100 Hz / 2ch / 16-bit.", 10, run_start)
+        read_until(b"[0] 44100 Hz / 2ch / 16-bit", 10, run_start)
         read_until(b"Waiting for a matching audio stream", 10, run_start)
         print("PASS: audio-net tape started listen mode with the correct local format.")
 
         # Act as the sending peer ourselves: this is exactly the wire
         # protocol `tools/send_audio.py`/the tape's own `send` mode use.
+        # DEVICE_INDEX (0) targets the guest's one local device.
+        DEVICE_INDEX = 0
         stream_start = len(output)
-        start_payload = struct.pack("<IBB", SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE)
+        start_payload = struct.pack("<IBBB", SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE, DEVICE_INDEX)
         mcast.send(eth_frame(guest_mac, AUDIO_SENDER_MAC, AUDIO_TAG_START, start_payload))
         read_until(b"stream started from", 10, stream_start)
         print("PASS: tape accepted the matching-format stream and locked onto the sender.")
@@ -195,7 +197,7 @@ def main() -> None:
         offset = 0
         while offset < len(pcm):
             chunk = pcm[offset : offset + DATA_CHUNK_CAPACITY]
-            payload = struct.pack("<H", len(chunk)) + chunk
+            payload = struct.pack("<BH", DEVICE_INDEX, len(chunk)) + chunk
             mcast.send(eth_frame(guest_mac, AUDIO_SENDER_MAC, AUDIO_TAG_DATA, payload))
             offset += len(chunk)
             time.sleep(len(chunk) / bytes_per_sec)

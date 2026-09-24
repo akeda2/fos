@@ -157,7 +157,7 @@ def main() -> None:
         read_until(b"fos> ", 5)
 
         first = run_command(b"audio")
-        if b"ES1370 found" not in first:
+        if b"[0] ES1370" not in first:
             raise SystemExit(f"ES1370 not found:\n{first.decode('utf-8', 'replace')}")
         periods_1, captured_1, overruns_1, backlog_1, capacity = parse_audio_status(first)
         print("PASS: ES1370 discovered; ADC and DAC1 diagnostics present.")

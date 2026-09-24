@@ -36,21 +36,42 @@
 //! The wire format reuses the existing shared `CHAT_ETHERTYPE` (0x88b6),
 //! the same ethertype `chat`/`nic discover`/`tape`/`term net`/NETFS/KUP all
 //! already share, with three new tag bytes continuing that numbering past
-//! KUP's own highest (`0x3e`): `AUDIO_TAG_START` (0x40, sample rate + channel
-//! count + bit depth), `AUDIO_TAG_DATA` (0x41, an explicit 16-bit length
-//! prefix followed by raw PCM bytes -- unlike `CHAT_TAG_TEXT`/`TERM_TAG_DATA`,
-//! trailing zero bytes can never be trimmed here, since 16-bit signed silence
-//! is a legitimate, common PCM value), and `AUDIO_TAG_STOP` (0x42, no
-//! payload). Like `TERM_TAG_DATA`, `AUDIO_TAG_DATA` carries no sequence
-//! number: an occasional dropped frame is meant to read as a brief audio
-//! glitch, not an aborted transfer, matching this protocol's real-time,
-//! best-effort delivery model rather than `tape`'s own strict transfer
-//! semantics.
+//! KUP's own highest (`0x3e`): `AUDIO_TAG_START` (0x40, sample rate +
+//! channel count + bit depth + a `device_index`), `AUDIO_TAG_DATA` (0x41, a
+//! `device_index` byte followed by an explicit 16-bit length prefix and raw
+//! PCM bytes -- unlike `CHAT_TAG_TEXT`/`TERM_TAG_DATA`, trailing zero bytes
+//! can never be trimmed here, since 16-bit signed silence is a legitimate,
+//! common PCM value), and `AUDIO_TAG_STOP` (0x42, no payload, ends the whole
+//! session regardless of how many devices were in use). Like
+//! `TERM_TAG_DATA`, `AUDIO_TAG_DATA` carries no sequence number: an
+//! occasional dropped frame is meant to read as a brief audio glitch, not
+//! an aborted transfer, matching this protocol's real-time, best-effort
+//! delivery model rather than `tape`'s own strict transfer semantics.
+//!
+//! **Multi-device (more than one stereo pair, e.g. 4ch/8ch across several
+//! physical ES1370-family cards -- see `kernel/src/es1370.rs`'s
+//! `MAX_INSTANCES`) is modeled as several independent, per-device
+//! sub-streams sharing one session, not one large interleaved PCM blob.**
+//! Each local audio device gets its own `AUDIO_TAG_START` (declaring that
+//! device's own format and its `device_index`) and its own tagged
+//! `AUDIO_TAG_DATA` frames; a receiver demultiplexes purely by
+//! `device_index` and routes each sub-stream to the matching local device
+//! via `audio_submit_at`/`audio_capture_at`. This was chosen over a single
+//! interleaved multi-channel frame format specifically because this
+//! protocol has no retransmission: losing one interleaved frame would
+//! desync every channel's byte alignment simultaneously and permanently,
+//! whereas a dropped tagged frame only glitches its own device -- the same
+//! bounded-loss-tolerance property `AUDIO_TAG_DATA` already had for a
+//! single stereo pair. Per-device tagging also means sub-streams for
+//! different devices can arrive in any order and even over different NICs
+//! with no extra coordination, and a device that enumerates slower than
+//! another never blocks the rest of the session.
 //!
 //! No resampling or format conversion happens anywhere in this tape: a
-//! stream whose declared format does not match the local device's actual
-//! format is rejected outright (with a clear message) rather than played
-//! back at the wrong pitch/speed.
+//! device sub-stream whose declared format does not match that local
+//! device's actual format is rejected outright (with a clear message)
+//! rather than played back at the wrong pitch/speed; other devices in the
+//! same session are unaffected.
 
 use core::slice;
 use tape_rt::{print_bytes, print_u32};
@@ -61,10 +82,15 @@ const AUDIO_TAG_START: u8 = 0x40;
 const AUDIO_TAG_DATA: u8 = 0x41;
 const AUDIO_TAG_STOP: u8 = 0x42;
 const HEADER_LEN: usize = 15; // 6 (dst) + 6 (src) + 2 (ethertype) + 1 (tag)
-const START_PAYLOAD_LEN: usize = 6; // sample_rate (u32 LE) + channels (u8) + bits (u8)
-const DATA_LENGTH_PREFIX: usize = 2; // u16 LE byte count, since PCM silence is zero
+// sample_rate (u32 LE) + channels (u8) + bits (u8) + device_index (u8)
+const START_PAYLOAD_LEN: usize = 7;
+// device_index (u8) + byte count (u16 LE, since PCM silence is legitimately zero)
+const DATA_HEADER_LEN: usize = 3;
 const DATA_CHUNK_CAPACITY: usize = 1024; // comfortably under the Ethernet MTU with headers
 const BROADCAST_MAC: [u8; 6] = [0xff; 6];
+// Matches `kernel/src/es1370.rs`'s `MAX_INSTANCES`: the most independent
+// stereo devices this kernel can ever report through the `_at` ABI.
+const MAX_DEVICES: usize = 4;
 
 // Send mode's declared format: fixed at ES1370's own playback ceiling (see
 // `kernel/src/audio.rs`), since this tape does not parse WAV headers or
@@ -73,6 +99,11 @@ const BROADCAST_MAC: [u8; 6] = [0xff; 6];
 const SEND_SAMPLE_RATE: u32 = 44100;
 const SEND_CHANNELS: u8 = 2;
 const SEND_BITS: u8 = 16;
+// `send` mode replays exactly one pre-recorded stereo file, so it always
+// targets the first local device (index 0); a future multi-file send mode
+// could take a device index per file the same way `capture_mode` iterates
+// every locally attached device below.
+const SEND_DEVICE_INDEX: u8 = 0;
 const SEND_BYTES_PER_SEC: u64 = SEND_SAMPLE_RATE as u64 * SEND_CHANNELS as u64 * (SEND_BITS as u64 / 8);
 const PIT_HZ: u64 = 100;
 
@@ -101,6 +132,11 @@ type AudioSampleRate = extern "C" fn() -> u32;
 type AudioChannelsAndBits = extern "C" fn() -> u32;
 type AudioSubmit = extern "C" fn(u32, u32) -> u32;
 type AudioCapture = extern "C" fn(u32, u32) -> u32;
+type AudioCount = extern "C" fn() -> u32;
+type AudioSampleRateAt = extern "C" fn(u32) -> u32;
+type AudioChannelsAndBitsAt = extern "C" fn(u32) -> u32;
+type AudioSubmitAt = extern "C" fn(u32, u32, u32) -> u32;
+type AudioCaptureAt = extern "C" fn(u32, u32, u32) -> u32;
 
 // One capture poll's worth of PCM bytes, matching send mode's own
 // per-frame chunk size so both directions produce comparably sized
@@ -154,7 +190,7 @@ fn print_format(putc: Putc, sample_rate: u32, channels: u8, bits: u8) {
 }
 
 fn send_frame(nic_send: NicSend, destination: &[u8; 6], source: &[u8; 6], tag: u8, payload: &[u8]) {
-    let mut frame = [0u8; HEADER_LEN + DATA_LENGTH_PREFIX + DATA_CHUNK_CAPACITY];
+    let mut frame = [0u8; HEADER_LEN + DATA_HEADER_LEN + DATA_CHUNK_CAPACITY];
     frame[0..6].copy_from_slice(destination);
     frame[6..12].copy_from_slice(source);
     frame[12..14].copy_from_slice(&AUDIO_ETHERTYPE);
@@ -193,10 +229,20 @@ pub extern "C" fn tape_main(
     fs_read: FsRead,
     _fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
     _fs_remove: extern "C" fn(u32, u32) -> u32,
-    audio_sample_rate: AudioSampleRate,
-    audio_channels_and_bits: AudioChannelsAndBits,
-    audio_submit: AudioSubmit,
-    audio_capture: AudioCapture,
+    // The original single-device callbacks remain declared (append-only
+    // cdecl requires every earlier parameter to be present) but are no
+    // longer read directly: every mode now goes through the `_at` variants
+    // below, even for a single device (index 0), so the same code path
+    // handles one card and several identically.
+    _audio_sample_rate: AudioSampleRate,
+    _audio_channels_and_bits: AudioChannelsAndBits,
+    _audio_submit: AudioSubmit,
+    _audio_capture: AudioCapture,
+    audio_count: AudioCount,
+    audio_sample_rate_at: AudioSampleRateAt,
+    audio_channels_and_bits_at: AudioChannelsAndBitsAt,
+    audio_submit_at: AudioSubmitAt,
+    audio_capture_at: AudioCaptureAt,
 ) {
     let mut own_mac = [0u8; 6];
     if nic_mac(own_mac.as_mut_ptr() as u32) == 0 {
@@ -207,7 +253,15 @@ pub extern "C" fn tape_main(
     let arguments = unsafe { slice::from_raw_parts(args_ptr as *const u8, args_len as usize) };
     let mut words = split_words(arguments);
     match words.next() {
-        None => listen_mode(putc, should_abort, nic_receive, audio_sample_rate, audio_channels_and_bits, audio_submit),
+        None => listen_mode(
+            putc,
+            should_abort,
+            nic_receive,
+            audio_count,
+            audio_sample_rate_at,
+            audio_channels_and_bits_at,
+            audio_submit_at,
+        ),
         Some(b"send") => {
             let Some(name) = words.next() else {
                 print_bytes(putc, b"Usage: tape run send NAME [AA:BB:CC:DD:EE:FF]\n");
@@ -247,9 +301,10 @@ pub extern "C" fn tape_main(
             capture_mode(
                 putc,
                 should_abort,
-                audio_sample_rate,
-                audio_channels_and_bits,
-                audio_capture,
+                audio_count,
+                audio_sample_rate_at,
+                audio_channels_and_bits_at,
+                audio_capture_at,
                 &own_mac,
                 &destination,
                 nic_send,
@@ -269,25 +324,36 @@ fn listen_mode(
     putc: Putc,
     should_abort: ShouldAbort,
     nic_receive: NicReceive,
-    audio_sample_rate: AudioSampleRate,
-    audio_channels_and_bits: AudioChannelsAndBits,
-    audio_submit: AudioSubmit,
+    audio_count: AudioCount,
+    audio_sample_rate_at: AudioSampleRateAt,
+    audio_channels_and_bits_at: AudioChannelsAndBitsAt,
+    audio_submit_at: AudioSubmitAt,
 ) {
-    let sample_rate = audio_sample_rate();
-    if sample_rate == 0 {
+    let device_count = (audio_count() as usize).min(MAX_DEVICES);
+    if device_count == 0 {
         print_bytes(
             putc,
             b"audio-net: no audio device found; is an ES1370 (or compatible) card attached?\n",
         );
         return;
     }
-    let packed = audio_channels_and_bits();
-    let channels = (packed & 0xff) as u8;
-    let bits = ((packed >> 8) & 0xff) as u8;
 
-    print_bytes(putc, b"Local audio device: ");
-    print_format(putc, sample_rate, channels, bits);
+    print_bytes(putc, b"Local audio device(s): ");
+    print_u32(putc, device_count as u32);
     print_bytes(putc, b".\n");
+    let mut local_formats = [(0u32, 0u8, 0u8); MAX_DEVICES];
+    for (index, slot) in local_formats.iter_mut().enumerate().take(device_count) {
+        let rate = audio_sample_rate_at(index as u32);
+        let packed = audio_channels_and_bits_at(index as u32);
+        let channels = (packed & 0xff) as u8;
+        let bits = ((packed >> 8) & 0xff) as u8;
+        *slot = (rate, channels, bits);
+        print_bytes(putc, b"  [");
+        print_u32(putc, index as u32);
+        print_bytes(putc, b"] ");
+        print_format(putc, rate, channels, bits);
+        print_bytes(putc, b"\n");
+    }
     print_bytes(
         putc,
         b"Waiting for a matching audio stream from any peer; F12 (or\n",
@@ -296,6 +362,9 @@ fn listen_mode(
 
     let mut frame = [0u8; MAX_FRAME_LEN];
     let mut source: Option<[u8; 6]> = None;
+    // Per local-device sub-stream state: has this device's own
+    // AUDIO_TAG_START been accepted yet for the current session?
+    let mut device_active = [false; MAX_DEVICES];
     let mut bytes_received = 0u64;
     let mut bytes_played = 0u64;
     let mut bytes_dropped = 0u64;
@@ -320,45 +389,72 @@ fn listen_mode(
         let payload = &frame[HEADER_LEN..received];
 
         match tag {
-            AUDIO_TAG_START if source.is_none() => {
+            AUDIO_TAG_START if source.is_none() || source == Some(frame_source) => {
                 if payload.len() < START_PAYLOAD_LEN {
                     continue;
                 }
                 let remote_rate = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let remote_channels = payload[4];
                 let remote_bits = payload[5];
-                if remote_rate != sample_rate || remote_channels != channels || remote_bits != bits {
-                    print_bytes(putc, b"audio-net: rejected a stream declaring ");
+                let device_index = payload[6] as usize;
+                if device_index >= device_count {
+                    print_bytes(putc, b"audio-net: rejected a stream for local device index ");
+                    print_u32(putc, device_index as u32);
+                    print_bytes(putc, b" (only ");
+                    print_u32(putc, device_count as u32);
+                    print_bytes(putc, b" attached).\n");
+                    continue;
+                }
+                let (local_rate, local_channels, local_bits) = local_formats[device_index];
+                if remote_rate != local_rate || remote_channels != local_channels || remote_bits != local_bits {
+                    print_bytes(putc, b"audio-net: rejected device ");
+                    print_u32(putc, device_index as u32);
+                    print_bytes(putc, b"'s stream declaring ");
                     print_format(putc, remote_rate, remote_channels, remote_bits);
                     print_bytes(putc, b"\n(local device is ");
-                    print_format(putc, sample_rate, channels, bits);
+                    print_format(putc, local_rate, local_channels, local_bits);
                     print_bytes(putc, b"); no resampling is supported. Still waiting.\n");
                     continue;
                 }
-                print_bytes(putc, b"audio-net: stream started from ");
-                print_mac(putc, &frame_source);
-                print_bytes(putc, b".\n");
-                source = Some(frame_source);
-                bytes_received = 0;
-                bytes_played = 0;
-                bytes_dropped = 0;
+                if source.is_none() {
+                    print_bytes(putc, b"audio-net: stream started from ");
+                    print_mac(putc, &frame_source);
+                    print_bytes(putc, b".\n");
+                    source = Some(frame_source);
+                    device_active = [false; MAX_DEVICES];
+                    bytes_received = 0;
+                    bytes_played = 0;
+                    bytes_dropped = 0;
+                }
+                if !device_active[device_index] {
+                    device_active[device_index] = true;
+                    print_bytes(putc, b"audio-net: device ");
+                    print_u32(putc, device_index as u32);
+                    print_bytes(putc, b" sub-stream active.\n");
+                }
             }
             AUDIO_TAG_DATA if source == Some(frame_source) => {
-                if payload.len() < DATA_LENGTH_PREFIX {
+                if payload.len() < DATA_HEADER_LEN {
                     continue;
                 }
-                let declared = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                let available = payload.len() - DATA_LENGTH_PREFIX;
+                let device_index = payload[0] as usize;
+                if device_index >= device_count || !device_active[device_index] {
+                    continue;
+                }
+                let declared = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+                let available = payload.len() - DATA_HEADER_LEN;
                 let length = declared.min(available);
-                let pcm = &payload[DATA_LENGTH_PREFIX..DATA_LENGTH_PREFIX + length];
+                let pcm = &payload[DATA_HEADER_LEN..DATA_HEADER_LEN + length];
                 bytes_received += length as u64;
 
                 let mut offset = 0usize;
                 let mut spins = 0u32;
                 while offset < pcm.len() && spins < 64 {
-                    let accepted =
-                        audio_submit(pcm[offset..].as_ptr() as u32, (pcm.len() - offset) as u32)
-                            as usize;
+                    let accepted = audio_submit_at(
+                        device_index as u32,
+                        pcm[offset..].as_ptr() as u32,
+                        (pcm.len() - offset) as u32,
+                    ) as usize;
                     if accepted == 0 {
                         spins += 1;
                         continue;
@@ -466,6 +562,7 @@ fn send_mode(
     start_payload[0..4].copy_from_slice(&SEND_SAMPLE_RATE.to_le_bytes());
     start_payload[4] = SEND_CHANNELS;
     start_payload[5] = SEND_BITS;
+    start_payload[6] = SEND_DEVICE_INDEX;
     send_frame(nic_send, destination, own_mac, AUDIO_TAG_START, &start_payload);
 
     let buffer = unsafe { slice::from_raw_parts(address as *const u8, read_length as usize) };
@@ -491,15 +588,16 @@ fn send_mode(
 
         let chunk_end = (offset + DATA_CHUNK_CAPACITY).min(buffer.len());
         let chunk = &buffer[offset..chunk_end];
-        let mut payload = [0u8; DATA_LENGTH_PREFIX + DATA_CHUNK_CAPACITY];
-        payload[0..2].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
-        payload[DATA_LENGTH_PREFIX..DATA_LENGTH_PREFIX + chunk.len()].copy_from_slice(chunk);
+        let mut payload = [0u8; DATA_HEADER_LEN + DATA_CHUNK_CAPACITY];
+        payload[0] = SEND_DEVICE_INDEX;
+        payload[1..3].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+        payload[DATA_HEADER_LEN..DATA_HEADER_LEN + chunk.len()].copy_from_slice(chunk);
         send_frame(
             nic_send,
             destination,
             own_mac,
             AUDIO_TAG_DATA,
-            &payload[..DATA_LENGTH_PREFIX + chunk.len()],
+            &payload[..DATA_HEADER_LEN + chunk.len()],
         );
         offset = chunk_end;
     }
@@ -519,51 +617,66 @@ fn send_mode(
 }
 
 /// Live microphone-to-network capture: the real ADC counterpart to
-/// `send_mode`'s file replay. Each iteration polls `audio_capture` for
-/// however much the kernel's ISR-driven ADC ring currently has ready
-/// (mirroring `listen_mode`'s own `nic_receive` polling shape -- "copy
-/// however much is ready," never an all-or-nothing read), and immediately
-/// forwards a non-empty result as one `AUDIO_TAG_DATA` frame. There is no
-/// pacing/target-tick schedule here unlike `send_mode`: `audio_capture`
-/// itself only ever returns bytes once the hardware ISR has actually
-/// produced them, so the real ADC period rate is the pacing, and an
-/// unconditional tight poll loop (bounded only by `should_abort`) is
-/// exactly right, the same reasoning `nic_receive`-based loops elsewhere
-/// in this project already rely on.
+/// `send_mode`'s file replay. Iterates every locally attached audio device
+/// (`audio_count`), sending one `AUDIO_TAG_START` per device up front, then
+/// polls each device's own `audio_capture_at` in round-robin order --
+/// mirroring `listen_mode`'s own `nic_receive` polling shape ("copy however
+/// much is ready," never an all-or-nothing read) -- and immediately
+/// forwards a non-empty result as one `device_index`-tagged
+/// `AUDIO_TAG_DATA` frame. There is no pacing/target-tick schedule here
+/// unlike `send_mode`: `audio_capture_at` itself only ever returns bytes
+/// once that device's hardware ISR has actually produced them, so the real
+/// ADC period rate is the pacing, and an unconditional tight poll loop
+/// (bounded only by `should_abort`) is exactly right, the same reasoning
+/// `nic_receive`-based loops elsewhere in this project already rely on.
+/// Devices are polled independently, so one card falling behind (or never
+/// producing anything, e.g. under QEMU's silent `none` audiodev) never
+/// blocks another's stream.
 #[allow(clippy::too_many_arguments)]
 fn capture_mode(
     putc: Putc,
     should_abort: ShouldAbort,
-    audio_sample_rate: AudioSampleRate,
-    audio_channels_and_bits: AudioChannelsAndBits,
-    audio_capture: AudioCapture,
+    audio_count: AudioCount,
+    audio_sample_rate_at: AudioSampleRateAt,
+    audio_channels_and_bits_at: AudioChannelsAndBitsAt,
+    audio_capture_at: AudioCaptureAt,
     own_mac: &[u8; 6],
     destination: &[u8; 6],
     nic_send: NicSend,
 ) {
-    let sample_rate = audio_sample_rate();
-    if sample_rate == 0 {
+    let device_count = (audio_count() as usize).min(MAX_DEVICES);
+    if device_count == 0 {
         print_bytes(
             putc,
             b"audio-net: no audio device found; is an ES1370 (or compatible) card attached?\n",
         );
         return;
     }
-    let packed = audio_channels_and_bits();
-    let channels = (packed & 0xff) as u8;
-    let bits = ((packed >> 8) & 0xff) as u8;
 
-    print_bytes(putc, b"Local audio device (capture): ");
-    print_format(putc, sample_rate, channels, bits);
-    print_bytes(putc, b".\nStreaming live ADC input to ");
+    print_bytes(putc, b"Local audio device(s) (capture): ");
+    print_u32(putc, device_count as u32);
+    print_bytes(putc, b".\n");
+    for index in 0..device_count {
+        let rate = audio_sample_rate_at(index as u32);
+        let packed = audio_channels_and_bits_at(index as u32);
+        let channels = (packed & 0xff) as u8;
+        let bits = ((packed >> 8) & 0xff) as u8;
+        print_bytes(putc, b"  [");
+        print_u32(putc, index as u32);
+        print_bytes(putc, b"] ");
+        print_format(putc, rate, channels, bits);
+        print_bytes(putc, b"\n");
+
+        let mut start_payload = [0u8; START_PAYLOAD_LEN];
+        start_payload[0..4].copy_from_slice(&rate.to_le_bytes());
+        start_payload[4] = channels;
+        start_payload[5] = bits;
+        start_payload[6] = index as u8;
+        send_frame(nic_send, destination, own_mac, AUDIO_TAG_START, &start_payload);
+    }
+    print_bytes(putc, b"Streaming live ADC input to ");
     print_mac(putc, destination);
     print_bytes(putc, b"; F12 (or F4/F6/F7/F8/F10) stops.\n");
-
-    let mut start_payload = [0u8; START_PAYLOAD_LEN];
-    start_payload[0..4].copy_from_slice(&sample_rate.to_le_bytes());
-    start_payload[4] = channels;
-    start_payload[5] = bits;
-    send_frame(nic_send, destination, own_mac, AUDIO_TAG_START, &start_payload);
 
     let mut chunk = [0u8; CAPTURE_CHUNK_CAPACITY];
     let mut bytes_sent = 0u64;
@@ -572,21 +685,26 @@ fn capture_mode(
         if should_abort() != 0 {
             break;
         }
-        let captured = audio_capture(chunk.as_mut_ptr() as u32, CAPTURE_CHUNK_CAPACITY as u32) as usize;
-        if captured == 0 {
-            continue;
+        for index in 0..device_count {
+            let captured =
+                audio_capture_at(index as u32, chunk.as_mut_ptr() as u32, CAPTURE_CHUNK_CAPACITY as u32)
+                    as usize;
+            if captured == 0 {
+                continue;
+            }
+            let mut payload = [0u8; DATA_HEADER_LEN + DATA_CHUNK_CAPACITY];
+            payload[0] = index as u8;
+            payload[1..3].copy_from_slice(&(captured as u16).to_le_bytes());
+            payload[DATA_HEADER_LEN..DATA_HEADER_LEN + captured].copy_from_slice(&chunk[..captured]);
+            send_frame(
+                nic_send,
+                destination,
+                own_mac,
+                AUDIO_TAG_DATA,
+                &payload[..DATA_HEADER_LEN + captured],
+            );
+            bytes_sent += captured as u64;
         }
-        let mut payload = [0u8; DATA_LENGTH_PREFIX + DATA_CHUNK_CAPACITY];
-        payload[0..2].copy_from_slice(&(captured as u16).to_le_bytes());
-        payload[DATA_LENGTH_PREFIX..DATA_LENGTH_PREFIX + captured].copy_from_slice(&chunk[..captured]);
-        send_frame(
-            nic_send,
-            destination,
-            own_mac,
-            AUDIO_TAG_DATA,
-            &payload[..DATA_LENGTH_PREFIX + captured],
-        );
-        bytes_sent += captured as u64;
     }
 
     send_frame(nic_send, destination, own_mac, AUDIO_TAG_STOP, &[]);
