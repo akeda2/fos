@@ -1,4 +1,4 @@
-use crate::arch::x86::{halt_forever, reset};
+use crate::arch::x86::{halt_forever, halt_until_interrupt, reset};
 use crate::audio;
 use crate::boot_info::{BootInfo, MemoryRegion};
 use crate::console;
@@ -20,6 +20,14 @@ const TAPE_ARGUMENT_FILE_CAPACITY: usize = 4096;
 const START_FILE_NAME: &[u8] = b"start";
 const START_FILE_CAPACITY: usize = 4096;
 const TERM_NET_IDLE_TICKS: u64 = 60 * 100;
+/// How long (in PIT ticks, ~10ms each) the idle prompt loop must see no NIC
+/// activity from `ambient_discovery_poll` before it starts halting the CPU
+/// between polls. Kept comfortably above the ~3ms chunk pacing NETFS/KUP
+/// senders use (`tools/send_kernel_update.py`'s default `--delay`) so a
+/// transfer in flight never sees this loop sleep through the next chunk --
+/// see `arch::x86::halt_until_interrupt`'s doc comment for why a halted
+/// iteration still wakes within one PIT tick regardless.
+const AMBIENT_IDLE_GRACE_TICKS: u64 = 2;
 const HOSTNAME_FILE_NAME: &[u8] = b"hostname";
 /// Generous for a short, hand-typed machine name; kept small since it is
 /// duplicated into every peer table entry (see `PEER_HOSTNAME_CAPACITY`).
@@ -73,10 +81,13 @@ pub fn run(info: &BootInfo) -> ! {
     let mut editor = LineEditor::new();
     prompt();
     let mut last_activity = interrupts::ticks();
+    let mut last_network_activity = interrupts::ticks();
 
     loop {
         let byte = console::read_serial_byte().or_else(keyboard::pop_char);
-        ambient_discovery_poll(info);
+        if ambient_discovery_poll(info) {
+            last_network_activity = interrupts::ticks();
+        }
         let Some(byte) = byte else {
             if interrupts::ticks().wrapping_sub(last_activity) >= TERM_NET_IDLE_TICKS {
                 println!(
@@ -84,7 +95,18 @@ pub fn run(info: &BootInfo) -> ! {
                 );
                 term_net(info);
                 last_activity = interrupts::ticks();
+                last_network_activity = interrupts::ticks();
                 prompt();
+            } else if interrupts::ticks().wrapping_sub(last_network_activity)
+                >= AMBIENT_IDLE_GRACE_TICKS
+            {
+                // Nothing typed locally, and no NIC activity recently enough
+                // to suspect a NETFS/KUP transfer might still be arriving in
+                // paced chunks -- safe to sleep until the next interrupt
+                // instead of spinning. See `AMBIENT_IDLE_GRACE_TICKS` and
+                // `arch::x86::halt_until_interrupt`'s doc comments for why
+                // this can't miss a wakeup for longer than one PIT tick.
+                halt_until_interrupt();
             }
             continue;
         };
@@ -801,6 +823,7 @@ fn print_pci_devices() {
         prog_if: 0,
         header_type: 0,
         bar0: 0,
+        has_msi: false,
     }; pci::MAX_PCI_DEVICES];
     let found = pci::scan_devices(&mut devices);
     let shown = found.min(devices.len());
@@ -816,8 +839,10 @@ fn print_pci_devices() {
             info.subclass, info.prog_if,
         );
         println!(
-            "  header={:02x} bar0=0x{:08x}",
-            info.header_type, info.bar0
+            "  header={:02x} bar0=0x{:08x} msi={}",
+            info.header_type,
+            info.bar0,
+            if info.has_msi { "yes" } else { "no" }
         );
     }
     if found > shown {
@@ -932,9 +957,15 @@ fn hda_status_one(controller: &hda::Hda) {
         controller.instance(),
         controller.mmio_base()
     );
-    match controller.irq() {
-        Some(irq) => println!("  Legacy PCI IRQ line: {irq}."),
-        None => println!("  No legacy PCI IRQ line assigned."),
+    match controller.msi_vector() {
+        Some(vector) => {
+            let count = crate::interrupts::msi_irq_count(vector);
+            println!("  MSI enabled, vector 0x{vector:02x}: {count} fire(s).");
+        }
+        None => match controller.irq() {
+            Some(irq) => println!("  Legacy PCI IRQ line: {irq}."),
+            None => println!("  No legacy PCI IRQ line assigned."),
+        },
     }
     println!(
         "  CORB/RIRB command transport up: {} input, {} output stream(s).",
@@ -948,12 +979,21 @@ fn hda_status_one(controller: &hda::Hda) {
             "  Playback active: {} Hz / {}ch / {}-bit.",
             format.sample_rate, format.channels, format.bits_per_sample
         );
-        match irq {
-            Some(irq) => {
-                let raw = crate::interrupts::pci_irq_count(irq);
-                println!("  IRQ {irq}: {raw} raw fire(s), {interrupts} recognized.");
+        // Delivery mechanism (MSI vs. legacy IRQ) was already reported
+        // above; a legacy `pci_irq_count(irq)` "raw fire(s)" figure would
+        // be misleadingly stuck at 0 here whenever MSI is what's actually
+        // delivering these interrupts, since that counter only tracks
+        // PIC-dispatched fires.
+        if controller.msi_vector().is_none() {
+            match irq {
+                Some(irq) => {
+                    let raw = crate::interrupts::pci_irq_count(irq);
+                    println!("  IRQ {irq}: {raw} raw fire(s), {interrupts} recognized.");
+                }
+                None => println!("  No legacy PCI IRQ line assigned; playback is silent."),
             }
-            None => println!("  No legacy PCI IRQ line assigned; playback is silent."),
+        } else {
+            println!("  {interrupts} interrupt(s) recognized as playback (via MSI above).");
         }
         println!("  {periods} period(s) refilled since boot.");
         println!(
@@ -3070,7 +3110,15 @@ static mut NEXT_AMBIENT_BROADCAST: u64 = 0;
 /// "NETFS" above). Unlike routine discovery traffic, NETFS activity is
 /// rare and consequential enough to be worth a `println!` here even though
 /// discovery replies deliberately stay silent.
-fn ambient_discovery_poll(info: &BootInfo) {
+///
+/// Returns `true` if any NIC actually received a frame this call (whether
+/// or not it matched a tag this function understands). `run`'s idle loop
+/// uses this to decide whether it is safe to `hlt` until the next
+/// interrupt: an in-flight NETFS/KUP transfer arrives in paced chunks only
+/// a few milliseconds apart, so as long as frames keep arriving the caller
+/// must keep polling at full speed rather than sleeping through the next
+/// chunk.
+fn ambient_discovery_poll(info: &BootInfo) -> bool {
     let now = interrupts::ticks();
     let started_at = unsafe {
         let started = &raw mut AMBIENT_DISCOVERY_STARTED_AT;
@@ -3083,6 +3131,7 @@ fn ambient_discovery_poll(info: &BootInfo) {
         }
     };
 
+    let mut received_frame = false;
     let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     for index in 0..nic::count() {
         let Some(nic) = nic::get_at(index) else {
@@ -3091,6 +3140,7 @@ fn ambient_discovery_poll(info: &BootInfo) {
         let Some(length) = nic.receive(&mut buffer) else {
             continue;
         };
+        received_frame = true;
         let frame = &buffer[..length];
         if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
             continue;
@@ -3134,7 +3184,7 @@ fn ambient_discovery_poll(info: &BootInfo) {
     }
 
     if now < unsafe { NEXT_AMBIENT_BROADCAST } {
-        return;
+        return received_frame;
     }
     for index in 0..nic::count() {
         let Some(nic) = nic::get_at(index) else {
@@ -3149,6 +3199,7 @@ fn ambient_discovery_poll(info: &BootInfo) {
         AMBIENT_STEADY_BROADCAST_TICKS
     };
     unsafe { NEXT_AMBIENT_BROADCAST = now + interval };
+    received_frame
 }
 
 /// Broadcasts a discovery probe (`CHAT_TAG_DISCOVER_REQUEST`) through every

@@ -22,6 +22,7 @@ mod hda;
 mod i350;
 mod interrupts;
 mod keyboard;
+mod lapic;
 mod ne2000;
 mod nic;
 mod paging;

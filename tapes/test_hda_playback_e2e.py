@@ -4,9 +4,15 @@
 Near-identical to `tapes/test_audio_net_e2e.py`, but the guest's audio device
 is a QEMU-emulated Intel HDA controller (`intel-hda` + an `hda-output` codec)
 instead of ES1370, captured to a host-side WAV file via `-audiodev wav`. MSI
-is explicitly disabled (`msi=off`): `kernel/src/hda.rs` only registers a
-legacy PCI IRQ handler, exactly like every other backend here, and QEMU
-defaults new-enough HDA controllers to MSI when the guest doesn't object.
+is left at QEMU's own default (enabled) rather than forced off: `kernel/src/
+hda.rs` now tries MSI first via the local APIC (`kernel/src/lapic.rs`,
+`pci::PciAddress::enable_msi`) and only falls back to a legacy PCI IRQ
+handler if that fails, so this is the primary regression proof that the
+whole MSI path -- capability-list walk, local APIC bring-up, vector
+allocation, and MSI-delivered interrupt dispatch -- actually works, not
+just that legacy IRQ delivery (still exercised by every other HDA backend
+in this codebase, e.g. ES1370, which predates MSI and has no capability to
+find) continues to.
 
 This proves `kernel/src/hda.rs`'s stream-DMA playback pipeline end to end
 through the exact same generic, device-agnostic `audio-net` tape and
@@ -114,7 +120,7 @@ def main() -> None:
             "-audiodev",
             f"wav,id=snd0,path={wav_capture}",
             "-device",
-            "intel-hda,msi=off",
+            "intel-hda",
             "-device",
             "hda-output,audiodev=snd0",
             "-display",
@@ -176,6 +182,14 @@ def main() -> None:
                 f"{hda_output.decode('utf-8', 'replace')}"
             )
         print("PASS: 'hda status' reports active playback in the expected format.")
+
+        if not re.search(rb"MSI enabled, vector 0x[0-9a-f]{2}: \d+ fire\(s\)\.", hda_output):
+            raise SystemExit(
+                "'hda status' did not report MSI delivery (expected the guest's "
+                "default-MSI intel-hda controller to use it, not fall back to a "
+                f"legacy IRQ):\n{hda_output.decode('utf-8', 'replace')}"
+            )
+        print("PASS: HDA controller is actually using MSI, not a legacy IRQ fallback.")
 
         load_start = len(output)
         mcast.send(eth_frame(guest_mac, TERM_CLIENT_MAC, TERM_TAG_DATA, b"tape load net\n"))

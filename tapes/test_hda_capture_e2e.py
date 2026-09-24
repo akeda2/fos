@@ -5,9 +5,11 @@
 Near-identical in spirit to `tapes/test_audio_capture_e2e.py` (the ES1370
 counterpart), but the guest's audio device is a QEMU-emulated Intel HDA
 controller with the `hda-duplex` codec (the same one `tapes/test_hda_e2e.py`
-uses to prove ADC/line-in widget discovery) instead of ES1370. MSI is
-explicitly disabled (`msi=off`): `kernel/src/hda.rs` only registers a legacy
-PCI IRQ handler, exactly like every other backend here.
+uses to prove ADC/line-in widget discovery) instead of ES1370. MSI is left
+at QEMU's own default (enabled) rather than forced off, so this also
+exercises MSI-delivered interrupts driving both the playback and capture
+stream simultaneously -- see `tapes/test_hda_playback_e2e.py`'s doc comment
+for the primary MSI regression proof.
 
 This does not (and, in this sandboxed environment, cannot) verify actual
 recorded *content* -- see `tapes/test_audio_capture_e2e.py`'s own doc comment
@@ -97,7 +99,7 @@ def main() -> None:
             "-audiodev",
             "none,id=snd0",
             "-device",
-            "intel-hda,msi=off",
+            "intel-hda",
             "-device",
             "hda-duplex,audiodev=snd0",
             "-display",
@@ -153,6 +155,14 @@ def main() -> None:
         if b"Capture active" not in first:
             raise SystemExit(f"HDA capture stream not active:\n{first.decode('utf-8', 'replace')}")
         print("PASS: Intel HDA discovered with an active capture stream.")
+
+        if not re.search(rb"MSI enabled, vector 0x[0-9a-f]{2}: \d+ fire\(s\)\.", first):
+            raise SystemExit(
+                "'hda status' did not report MSI delivery (expected the guest's "
+                "default-MSI intel-hda controller to use it, not fall back to a "
+                f"legacy IRQ):\n{first.decode('utf-8', 'replace')}"
+            )
+        print("PASS: HDA controller is actually using MSI, not a legacy IRQ fallback.")
 
         played_1, captured_1, overruns_1, backlog_1, capacity = parse_hda_status(first)
 

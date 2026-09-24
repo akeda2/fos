@@ -24,6 +24,12 @@
 //! register.
 //! There is no support for 64-bit memory BARs, PCI bridges, or any other
 //! device class; this is a teaching-scoped lookup, not a general PCI driver.
+//!
+//! One further, narrow addition: `find_capability`/`enable_msi` walk a
+//! function's PCI capability list to enable Message Signaled Interrupts,
+//! used by `hda.rs` (see `lapic.rs` and "MSI/MSI-X" in `AGENTS.md`).
+//! MSI-X (a different, table-based capability, ID `0x11`) is not
+//! implemented -- no current device needs it.
 
 use crate::arch::x86::{inl, outl};
 
@@ -41,6 +47,16 @@ const SUBCLASS_SERIAL: u8 = 0x00;
 const HEADER_TYPE_MULTIFUNCTION: u8 = 0x80;
 const BAR0_OFFSET: u8 = 0x10;
 const BAR_IS_IO_SPACE: u32 = 0b01;
+
+const STATUS_OFFSET: u8 = 0x06;
+const STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
+const CAPABILITIES_POINTER_OFFSET: u8 = 0x34;
+/// PCI capability ID for Message Signaled Interrupts (`enable_msi`).
+const CAPABILITY_ID_MSI: u8 = 0x05;
+/// Bounds `find_capability`'s linked-list walk against a malformed or
+/// looping list -- no real PCI function has ever needed anywhere near
+/// this many capabilities.
+const MAX_CAPABILITY_HOPS: u8 = 16;
 
 fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     0x8000_0000
@@ -80,6 +96,19 @@ fn write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
         );
         outl(CONFIG_DATA, value);
     }
+}
+
+/// Config space only accepts full 32-bit writes, so a 16-bit field
+/// (everything the MSI capability's own registers below need) is written
+/// as a read-modify-write of its containing dword, mirroring how
+/// `read_u16` already extracts a 16-bit field by reading the dword and
+/// shifting.
+fn write_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
+    let current = read_u32(bus, device, function, offset);
+    let shift = u32::from(offset & 2) * 8;
+    let mask = 0xffffu32 << shift;
+    let updated = (current & !mask) | (u32::from(value) << shift);
+    write_u32(bus, device, function, offset, updated);
 }
 
 /// The address of one PCI function, as found by `find_devices`. Enough to
@@ -181,6 +210,125 @@ impl PciAddress {
             command | MEMORY_SPACE_ENABLE | BUS_MASTER_ENABLE,
         );
     }
+
+    /// Walks this function's PCI capability list (Status register bit 4,
+    /// then the linked list starting at the Capabilities Pointer, offset
+    /// `0x34`: each node is `[capability_id: u8][next_pointer: u8]`) for a
+    /// capability matching `capability_id`. Returns the config-space
+    /// offset of that capability's own structure (so its ID byte is at
+    /// the returned offset, and its fields immediately follow), or `None`
+    /// if this function has no capability list at all, or none matching.
+    fn find_capability(&self, capability_id: u8) -> Option<u8> {
+        let status = read_u16(self.bus, self.device, self.function, STATUS_OFFSET);
+        if status & STATUS_CAPABILITIES_LIST == 0 {
+            return None;
+        }
+        let mut pointer =
+            read_u8(self.bus, self.device, self.function, CAPABILITIES_POINTER_OFFSET);
+        for _ in 0..MAX_CAPABILITY_HOPS {
+            if pointer == 0 {
+                return None;
+            }
+            let id = read_u8(self.bus, self.device, self.function, pointer);
+            if id == capability_id {
+                return Some(pointer);
+            }
+            pointer = read_u8(self.bus, self.device, self.function, pointer + 1);
+        }
+        None
+    }
+
+    /// Enables Message Signaled Interrupts for this function, targeting
+    /// `vector` on the local APIC identified by `destination_lapic_id`
+    /// (see `lapic::id()`). Returns `None` -- with no config-space writes
+    /// performed -- if this function has no MSI capability at all (an
+    /// older device like ES1370, or any card exposing only legacy INTx);
+    /// callers must keep their `interrupt_line()`/`register_pci_irq`
+    /// fallback for that case, exactly as before this existed.
+    ///
+    /// Only the simplest case this project currently needs is
+    /// implemented: one vector, a 32-bit message address. A 64-bit-
+    /// capable device (Message Control bit 7) still works correctly with
+    /// only the 32-bit address fields written -- every address this
+    /// kernel ever targets (`0xfee00000`-range) fits in 32 bits regardless
+    /// -- so its Message Upper Address register is simply zeroed rather
+    /// than left holding whatever firmware put there. A device that
+    /// *requires* (not just supports) the 64-bit fields isn't handled
+    /// here. Per-vector masking (Message Control bit 8) and multi-vector
+    /// allocation (bits 1-3) are left at their power-on defaults (masking
+    /// off, one vector) -- no current consumer needs more, and MSI-X
+    /// (capability ID `0x11`, a completely different, table-based
+    /// mechanism) isn't implemented at all.
+    pub fn enable_msi(&self, vector: u8, destination_lapic_id: u32) -> Option<()> {
+        const MESSAGE_CONTROL_OFFSET: u8 = 0x02;
+        const MESSAGE_ADDRESS_OFFSET: u8 = 0x04;
+        const MESSAGE_UPPER_ADDRESS_OFFSET: u8 = 0x08;
+        const MESSAGE_DATA_OFFSET_32BIT: u8 = 0x08;
+        const MESSAGE_DATA_OFFSET_64BIT: u8 = 0x0c;
+        const CONTROL_64BIT_CAPABLE: u16 = 1 << 7;
+        const CONTROL_MSI_ENABLE: u16 = 1 << 0;
+        // Largest offset any branch below writes to, relative to the
+        // capability's own start; reject a (spec-violating) capability
+        // sitting too close to the end of config space to safely address
+        // rather than silently reading/writing past a 32-bit dword's
+        // worth of unrelated bytes.
+        const MAX_STRUCTURE_END: u8 = MESSAGE_DATA_OFFSET_64BIT + 2;
+
+        let capability = self.find_capability(CAPABILITY_ID_MSI)?;
+        if capability > u8::MAX - MAX_STRUCTURE_END {
+            return None;
+        }
+
+        let control = read_u16(
+            self.bus,
+            self.device,
+            self.function,
+            capability + MESSAGE_CONTROL_OFFSET,
+        );
+        let data_offset = if control & CONTROL_64BIT_CAPABLE != 0 {
+            write_u32(
+                self.bus,
+                self.device,
+                self.function,
+                capability + MESSAGE_UPPER_ADDRESS_OFFSET,
+                0,
+            );
+            MESSAGE_DATA_OFFSET_64BIT
+        } else {
+            MESSAGE_DATA_OFFSET_32BIT
+        };
+
+        // Physical destination mode, no redirection hint: this single-core
+        // kernel only ever has the one local APIC as a destination.
+        let message_address = 0xfee0_0000u32 | (destination_lapic_id << 12);
+        write_u32(
+            self.bus,
+            self.device,
+            self.function,
+            capability + MESSAGE_ADDRESS_OFFSET,
+            message_address,
+        );
+
+        // Delivery mode 0 (fixed), vector in the low byte. MSI is always
+        // edge-triggered per the PCI spec, so unlike a legacy PIC IRQ gate
+        // there is no trigger-mode bit to set here at all.
+        write_u16(
+            self.bus,
+            self.device,
+            self.function,
+            capability + data_offset,
+            u16::from(vector),
+        );
+
+        write_u16(
+            self.bus,
+            self.device,
+            self.function,
+            capability + MESSAGE_CONTROL_OFFSET,
+            control | CONTROL_MSI_ENABLE,
+        );
+        Some(())
+    }
 }
 
 /// Finds all PCI functions matching a vendor ID and one of its device IDs,
@@ -259,6 +407,12 @@ pub struct PciDeviceInfo {
     /// what is actually on the bus, not guessing which BAR meaning a
     /// not-yet-identified device intends.
     pub bar0: u32,
+    /// Whether this function advertises an MSI capability (ID `0x05`) at
+    /// all -- not whether MSI is actually *enabled* for it right now (a
+    /// driver may still be using its legacy `interrupt_line` even when
+    /// this is `true`, e.g. because every MSI vector was already claimed
+    /// by the time it initialized). See "MSI/MSI-X" in `AGENTS.md`.
+    pub has_msi: bool,
 }
 
 /// Bounded to the largest device count this project has ever needed to
@@ -296,6 +450,11 @@ pub fn scan_devices(out: &mut [PciDeviceInfo]) -> usize {
                 if function_vendor == 0xffff {
                     continue;
                 }
+                let address = PciAddress {
+                    bus,
+                    device,
+                    function,
+                };
                 let info = PciDeviceInfo {
                     bus,
                     device,
@@ -307,6 +466,7 @@ pub fn scan_devices(out: &mut [PciDeviceInfo]) -> usize {
                     prog_if: read_u8(bus, device, function, 0x09),
                     header_type: read_u8(bus, device, function, 0x0e),
                     bar0: read_u32(bus, device, function, BAR0_OFFSET),
+                    has_msi: address.find_capability(CAPABILITY_ID_MSI).is_some(),
                 };
                 if let Some(slot) = out.get_mut(found) {
                     *slot = info;

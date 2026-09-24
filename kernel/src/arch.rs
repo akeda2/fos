@@ -71,11 +71,77 @@ pub mod x86 {
         unsafe { outb(0x80, 0) }
     }
 
+    /// Reads a Model-Specific Register. `rdmsr`'s result is split across
+    /// `edx:eax` (high:low 32 bits of the 64-bit value) by the instruction
+    /// itself, not by any convention this code chooses -- this is how the
+    /// local APIC's base address/enable bit (`IA32_APIC_BASE`, MSR `0x1b`)
+    /// is read, the MSR equivalent of `inl`/`outl`'s port-I/O access.
+    #[inline]
+    pub unsafe fn rdmsr(msr: u32) -> u64 {
+        let low: u32;
+        let high: u32;
+        unsafe {
+            core::arch::asm!(
+                "rdmsr",
+                in("ecx") msr,
+                out("eax") low,
+                out("edx") high,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        (u64::from(high) << 32) | u64::from(low)
+    }
+
+    /// Writes a Model-Specific Register; see `rdmsr`.
+    #[inline]
+    pub unsafe fn wrmsr(msr: u32, value: u64) {
+        let low = value as u32;
+        let high = (value >> 32) as u32;
+        unsafe {
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") msr,
+                in("eax") low,
+                in("edx") high,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+
     pub fn halt_forever() -> ! {
         loop {
             unsafe {
                 core::arch::asm!("cli; hlt", options(nomem, nostack));
             }
+        }
+    }
+
+    /// Halts the CPU for exactly one `hlt` and returns once any interrupt
+    /// wakes it -- unlike `halt_forever`, which `cli`s first and never
+    /// returns. Meant to be called once per otherwise-idle iteration of a
+    /// polling loop that has nothing to do right now, so the CPU can stop
+    /// burning cycles/power/heat spinning on nothing until the next timer,
+    /// keyboard, or other interrupt actually gives it something to check.
+    ///
+    /// A textbook idle loop pairs this with `sti` immediately beforehand
+    /// (`sti; hlt` as one atomic sequence) to close the race where a wakeup
+    /// becomes pending after the caller's last check but before `hlt`
+    /// executes, which would otherwise sleep through it indefinitely. That
+    /// full defense isn't needed here: every caller of this function reaches
+    /// it with interrupts already unconditionally enabled (`sti` runs once,
+    /// early, in `interrupts::initialize()`, and nothing on these paths ever
+    /// `cli`s without a matching `sti` before returning), and the PIT
+    /// (`interrupts::TIMER_VECTOR`, IRQ0) is never masked and fires at a
+    /// fixed 100 Hz regardless of anything else. So even in the
+    /// worst-case race -- a wakeup arrives and is "missed" right at this
+    /// call's boundary -- the next PIT tick resumes execution within
+    /// roughly 10 ms, not indefinitely. Callers should treat that ~10 ms as
+    /// the real, bounded latency cost of using this function, not assume
+    /// it wakes only for the specific event they were waiting on.
+    #[inline]
+    pub fn halt_until_interrupt() {
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
         }
     }
 

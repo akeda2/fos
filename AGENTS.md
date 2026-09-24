@@ -75,10 +75,16 @@ that obscure hardware behavior.
   first 2 GiB. The low 4 MiB uses 4 KiB PTEs to leave the kernel-stack guard
   page absent and make page-aligned kernel text/read-only data non-writable;
   the remaining low range uses 4 MiB PSE mappings. High PCI MMIO is absent
-  until `map_mmio` registers a driver's exact BAR range, using at most three
-  dynamic page tables. This retains physical-pointer compatibility for DMA
-  and the BIOS trampoline while leaving unrelated high ranges unmapped for
-  useful page-fault diagnostics; it is not userspace isolation.
+  until `map_mmio` registers a driver's exact BAR range, using at most
+  three dynamic page tables -- kept at three rather than bumped for the
+  local APIC's own fixed MMIO window (a fourth `map_mmio` consumer, see
+  "MSI/MSI-X and the local APIC" below) because the reserved low-memory
+  kernel region has no spare room for another whole 4 KiB page table right
+  now; exhausting this pool just means MSI is unavailable that boot
+  (every driver falls back to its legacy PIC IRQ), not a fault. This
+  retains physical-pointer compatibility for DMA and the BIOS trampoline
+  while leaving unrelated high ranges unmapped for useful page-fault
+  diagnostics; it is not userspace isolation.
   `make image-unsafe-memory` is the explicit teaching comparison: it builds
   a separate unpaged artifact, so it has neither those absent ranges nor the
   guard page and must not replace the default deployment image.
@@ -1957,6 +1963,69 @@ run @HOST:diskN/NAME` (evaluating `3 4 +` through the `calc` tape to
 prove a fetched startup-argument file reaches a real tape), and a clean
 `NOT_FOUND` error for a nonexistent remote file all pass.
 
+### HLT-on-idle: letting the CPU actually rest at the idle prompt
+
+Every polling loop in this kernel busy-spins by design -- there is no
+scheduler, so "poll hardware, then loop" is how anything gets noticed at
+all. But the one loop that is *always* running whenever nothing else is --
+`shell::run`'s own idle prompt loop -- was spinning the CPU at full speed
+even while genuinely idle (the common steady state, especially for a
+debug-mode "unattended, always up" machine sitting at its own prompt
+between remote sessions). `arch::x86::halt_until_interrupt` (distinct from
+the existing `halt_forever`, which `cli`s and never returns -- this
+executes exactly one `hlt` and returns once any interrupt wakes it) lets
+that loop stop burning cycles/power/heat between polls, called only when a
+whole iteration found nothing at all to do.
+
+The reasoning for *not* needing the textbook `sti; hlt` atomic idiom here
+(which exists to close the race where a wakeup becomes pending between the
+caller's last check and `hlt` itself executing): every caller reaches this
+function with interrupts already unconditionally enabled for the entire
+life of the loop, and the PIT (IRQ0) is never masked and fires at a fixed
+100 Hz regardless of anything else -- so even a "missed" wakeup right at
+the call boundary only costs one more PIT tick (~10ms), never an
+indefinite hang. This bounded worst case is a property of this specific
+loop's environment, not a general guarantee `halt_until_interrupt` makes
+on its own; a caller anywhere PIT ticks could ever be masked, or that
+might reach this function with interrupts off, would need the full
+`sti;hlt` idiom instead.
+
+This is deliberately scoped to *only* `shell::run`'s idle loop, not
+`term_net`'s session loop, `nic_sniff`, `nic_discover`, `chat_command`, or
+any tape network-transfer loop (`tape_load_net`, `netfs_get`/`put`,
+`nic_discover`'s own loop). Every one of those is actively polling NIC
+receive with no interrupt backing at all (every NIC backend's own ISR only
+acks/counts/flags a diagnostic `work_pending` nothing actually waits on --
+`receive()` always polls hardware directly regardless), so none of them
+are "idle" in the sense this feature targets, and halting there would add
+the same latency for zero benefit.
+
+The one loop this does apply to also happens to be the *only* one that
+serves NETFS GET/PUT and KUP traffic (`ambient_discovery_poll`, see
+"NETFS" above and "KUP" under "Debug mode" below), which arrives in paced
+chunks only a few milliseconds apart (`tools/send_kernel_update.py`'s
+default `--delay 0.003`). Halting the instant a single iteration finds
+nothing would halt right after draining one chunk while the next is still
+in flight, adding up to one PIT tick of latency *per chunk* instead of
+just once per idle stretch -- a real, roughly 3x slowdown of an
+already-working feature, not a rounding error. `ambient_discovery_poll`
+therefore returns whether it actually received a frame this call, and
+`run`'s loop only halts once `AMBIENT_IDLE_GRACE_TICKS` (2 ticks, ~20ms --
+comfortably above that ~3ms chunk pacing) have passed with no NIC activity
+*and* no local keyboard/serial byte. An active transfer keeps refreshing
+that deadline faster than it can elapse, so the loop never halts
+mid-transfer; only genuine idle time triggers it.
+
+One accepted, bounded caveat: COM1 (serial input) has no interrupt behind
+it at all (IRQ4 is never unmasked), so once the machine is truly idle and
+halting, a serial-typed byte can incur up to one PIT tick (~10ms) of added
+latency before it's noticed, versus effectively 0ms before this change.
+Verified with `make test` (its bounded waits are 10-second-scale, utterly
+unaffected) and `make test-debug-mode` (KUP is served from this exact
+loop), plus a manual re-run of `tools/test_netfs_e2e.py` and
+`tools/test_hostname_discovery_e2e.py` to confirm no throughput regression
+in the paced-transfer traffic this change is riskiest against.
+
 ## Real-time audio streaming: the ES1370 driver, and Intel HD Audio
 
 `kernel/src/es1370.rs` and `kernel/src/hda.rs` are two independent PCI
@@ -2012,6 +2081,125 @@ HDA increment (discover-only, CORB/RIRB + node-graph enumeration,
 multi-controller, stream-DMA playback, capture, and multichannel
 negotiation) -- is in `docs/history/audio-hda.md`.
 
+## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
+
+`kernel/src/lapic.rs` is a minimal local APIC driver, added specifically
+to receive Message Signaled Interrupts (MSI) -- fos's interrupt story was
+previously the legacy 8259 PIC alone (`interrupts.rs`), fed by INTx lines
+via `pci::PciAddress::interrupt_line()`/`register_pci_irq`. The PIC keeps
+running exactly as before for every existing backend (RTL8139, the
+selected 3C905 variants, Intel e1000, the NE2000-compatible clone, and
+ES1370, which predates MSI and has no such capability to find); the local
+APIC is purely additive, used only to receive MSI-delivered interrupts,
+never to relay legacy INTx lines (its LINT0/LINT1 Local Vector Table
+entries are deliberately left masked/as firmware set them), and there is
+still no I/O-APIC anywhere in this kernel, since MSI bypasses I/O-APIC
+redirection entirely and needs none.
+
+`lapic::initialize()` runs once, unconditionally, from
+`interrupts::initialize()` (right alongside the PIC/PIT setup already
+there): it checks CPUID.1:EDX bit 9 (reusing the existing `cpu::features()`
+wrapper), reads `IA32_APIC_BASE` (MSR `0x1b`, via new `arch::x86::rdmsr`/
+`wrmsr` helpers -- the first MSR access anywhere in this kernel) to find
+the LAPIC's physical MMIO base (architecturally `0xfee00000`), maps that
+one 4 KiB window with the existing `paging::map_mmio` (the same mechanism
+every BAR-mapped driver already uses), and programs the Spurious-Interrupt
+Vector Register with a dedicated vector (`lapic::SPURIOUS_VECTOR`, `0x60`)
+-- mirroring the PIC's own IRQ7/IRQ15 spurious-vector convention for
+continuity, though a genuine spurious *local APIC* interrupt needs no EOI
+at all, unlike the PIC's ISR-check dance. Every real chipset since the
+Pentium era, and every CPU model QEMU emulates (even single-core, even
+the default `i440fx` machine type), has always had a local APIC, so this
+is a defensive check rather than an expected failure path; if it ever
+does fail (no APIC, or `map_mmio` has no free dynamic page table slot --
+see below), `lapic::initialize()` returns `false`, the boot narration
+says so, and every MSI-capable driver transparently falls back to its
+legacy PIC IRQ path exactly as if the feature didn't exist.
+
+`pci.rs` gained a capability-list walk (`PciAddress::find_capability`,
+bounded to a small fixed hop count against a malformed list) -- Status
+register bit 4, then the linked list at the Capabilities Pointer, offset
+`0x34` -- and `PciAddress::enable_msi(vector, destination_lapic_id)`,
+which finds the MSI capability (ID `0x05`; MSI-X, a different, table-based
+capability with ID `0x11`, is not implemented -- no current device needs
+it), writes the Message Address (`0xfee00000 | (destination_lapic_id <<
+12)`, physical destination mode, no redirection hint -- this single-core
+kernel only ever has the one destination) and Message Data (delivery mode
+fixed, the vector in the low byte -- MSI is always edge-triggered per the
+PCI spec, so there is no trigger-mode bit to set, unlike a legacy PIC IRQ
+gate), then sets the Message Control register's MSI-enable bit. Only the
+simplest case is handled: one vector, a 32-bit message address; a
+64-bit-capable device still works correctly with just its Message Upper
+Address register zeroed, since every address this kernel ever targets
+fits in 32 bits regardless.
+
+`interrupts.rs` reserves a new vector range, `MSI_VECTOR_BASE` (`0x50`)
+through `0x5f` -- clear of the CPU exception range, the PIC's remapped
+`0x20`-`0x2f`, and the new LAPIC spurious vector `0x60` (`gdt::
+DOUBLE_FAULT_TSS_SELECTOR`, `0x30`, is a GDT *selector*, a different
+namespace entirely, not a conflict) -- with `allocate_msi_vector`/
+`register_msi_irq`/`dispatch_msi_irq`. Unlike `register_pci_irq`'s
+`PCI_IRQ_HANDLERS`, which deliberately holds up to `MAX_SHARED_HANDLERS`
+handlers per legacy line (see "A real bug this test found: shared legacy
+PCI IRQ lines..." in `docs/history/audio-hda.md`), `MSI_HANDLERS` holds
+exactly one handler per vector: MSI's entire point is exclusive, unshared
+ownership, unlike legacy INTx sharing, which is a motherboard-topology
+fact no driver controls. Each generated MSI IDT gate calls
+`lapic::send_eoi()` -- a genuinely different acknowledgment mechanism
+from the PIC's own `send_eoi` (an MMIO register write instead of an `outb`
+command sequence) -- and the two are never mixed for one interrupt.
+
+`hda.rs` is the first (and, for now, only) consumer: `init_controller`
+tries `lapic::is_available()` -> `interrupts::allocate_msi_vector()` ->
+`address.enable_msi(vector, lapic::id())` before falling back to its
+previous `address.interrupt_line()` + `register_pci_irq` path, storing
+whichever succeeded as `Hda::msi_vector`/`irq`. `handle_pci_irq` matches
+an incoming byte against either field (`irq` values 0-15 and MSI vectors
+`0x50`-`0x5f` never overlap, so this is unambiguous) -- the existing
+"every controller checks its own status register, so a non-matching call
+is a harmless no-op" reasoning from the shared-legacy-line fix applies
+unchanged. `hda status` reports `"MSI enabled, vector 0x.."` with a live
+fire count when MSI is active, or the previous legacy-IRQ wording
+otherwise; ES1370 is completely untouched, since `find_capability(0x05)`
+naturally returns `None` for a device that predates MSI, and takes the
+same legacy path it always has.
+
+`kernel/src/pci.rs`'s `pci` command output also gained an `msi=yes/no`
+flag per discovered function (capability *presence*, not whether this
+kernel actually enabled it for that device) -- read-only, at no writing
+cost, useful for confirming a card the same way `pci`'s vendor/device ID
+dump already helps identify unknown hardware.
+
+**Accepted low-memory constraint**: the local APIC's own `map_mmio` call
+is a fourth potential consumer of `paging.rs`'s dynamic-page-table pool
+(alongside e1000/i350/HDA), but that pool was deliberately *not* widened
+from 3 to 4 slots -- confirmed by trying it, not assumed: even one more
+static 4 KiB page table pushed `__kernel_end` past `linker.ld`'s
+`0x90000` ceiling, meaning this kernel's low-memory budget currently has
+essentially no spare room at all. If this pool is ever genuinely
+exhausted (3 *other* high regions already mapped when the LAPIC tries to
+map its own), the failure is graceful: no local APIC, no MSI that boot,
+every driver on its legacy path -- not a fault. Growing the pool (and the
+reserved region alongside it, in the same synchronized way this
+document's low-memory growth history already describes) is the right fix
+if a real scenario ever needs 4 simultaneous high MMIO mappings; nothing
+here needs it pre-emptively.
+
+Verified end to end by dropping the `-device intel-hda,msi=off` workaround
+from `tapes/test_hda_playback_e2e.py`/`tapes/test_hda_capture_e2e.py`
+(previously forced off specifically because this feature didn't exist yet
+-- see those files' own doc comments) and asserting the new `"MSI
+enabled, vector 0x.."` narration instead: both tests still produce real,
+non-silent captured audio exactly as before, now proven driven by
+MSI-delivered interrupts rather than a legacy IRQ. `tapes/test_hda_e2e.py`
+and `tapes/test_hda_multi_e2e.py` (which never forced `msi=off` even
+before this feature existed) continue to pass unmodified, as does
+`tapes/test_audio_multi_e2e.py` (an RTL8139 sharing legacy IRQ 11 with
+two ES1370 cards -- the exact historical shared-line scenario, still
+legacy-only since ES1370 has no MSI capability), plus `make test`,
+`make test-nic-watchdog`, `make test-stack-guard`, and
+`make test-page-protection`.
+
 ## Deliberately deferred work
 
 - Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
@@ -2027,58 +2215,28 @@ negotiation) -- is in `docs/history/audio-hda.md`.
   BIOS EDD/LBA, E820, VGA text, COM1, and PS/2-compatible input. QEMU is the
   primary validation environment.
 
-### MSI/MSI-X and the local APIC: investigated, not yet built
+### MSI-X: still deferred
 
-Raised while scoping PCIe/I350 support: fos's entire interrupt story today
-is the legacy 8259 PIC (`interrupts.rs`) fed by INTx lines -- `pci::
-PciDevice::interrupt_line()` reads the config-space interrupt-line byte,
-and `register_pci_irq` just unmasks that IRQ on the 8259. There is no local
-APIC, no I/O-APIC, and `pci.rs` does not walk the PCI capability list at
-all, so MSI (capability ID `0x05`) and MSI-X (`0x11`) support does not
-exist in any form.
+Plain MSI (one vector, capability ID `0x05`) is now built -- see "MSI/MSI-X
+support" above. MSI-X (capability ID `0x11`) is a different, table-based
+mechanism (a per-entry MMIO table rather than fixed config-space
+registers, and support for many more vectors per device) that no current
+consumer needs: `hda.rs`'s single vector is enough for one controller's
+interrupt stream, and every other backend either has no MSI capability at
+all (ES1370) or hasn't been converted (the NIC family). Worth building if
+a future device (a real, physically tested I350, most plausibly) turns
+out to need per-queue vector affinity -- not a prerequisite for anything
+working correctly today, including I350's still-empty
+`CANDIDATE_DEVICE_IDS`.
 
-MSI replaces a physical interrupt wire with an ordinary-looking memory
-write: the device writes a small "message data" value to a "message
-address" (architecturally `0xfeennnnn`, intercepted by the CPU's local
-APIC rather than landing in RAM) whenever it wants to interrupt. Adding
-real support would need, at minimum: a local APIC driver (CPUID detection,
-mapping its MMIO window, programming the spurious-vector and
-task-priority registers -- a genuinely new subsystem running alongside,
-not replacing, the existing PIC code, since BIOS/legacy devices may still
-want PIC-routed IRQs); a PCI capability-list walk in `pci.rs` to find the
-MSI/MSI-X capability and program the device's message address/data
-registers; and a new IDT vector range for MSI-delivered interrupts,
-separate from the PIC's remapped `IRQ_BASE` range. MSI itself needs no
-I/O-APIC, since it bypasses I/O-APIC redirection entirely -- that could be
-scoped independently of full I/O-APIC-based INTx routing.
-
-This is *not* expected to be a performance win for fos as currently built,
-and should not be undertaken as one. MSI's usual real-world benefits --
-avoiding shared-IRQ-line contention, skipping a status-register read to
-de-assert a level-triggered line, and (the largest one) giving each queue
-its own vector routed to its own CPU core for per-core affinity/RSS --
-mostly do not apply here: fos is single-core with no per-core IRQ affinity
-concept at all; every backend's `handle_interrupt()` already does nothing
-but ack-count-and-flag before returning to a foreground polling loop, so
-there is no expensive status-register read in the hot path for MSI to
-remove; and nothing in fos blocks or sleeps waiting to be woken by an
-interrupt -- every polling loop spins regardless of whether an interrupt
-ever fires, so lower interrupt latency has nothing downstream to speed
-up. The one real fos-relevant benefit worth keeping in mind: some PCIe
-devices legitimately leave the legacy `interrupt_line`/`interrupt_pin`
-config-space bytes meaningless (implementing only MSI/MSI-X), so a card
-encountered in the future that never asserts INTx at all is a plausible
-real-hardware scenario -- but fos's polling-first design already
-tolerates an interrupt line that never fires without any correctness
-impact.
-
-Worth revisiting if fos ever grows either genuine multi-core scheduling
-(where per-queue MSI-X vector affinity would become a real win) or a
-polling loop redesigned to actually `hlt`-and-wake on interrupt instead of
-spinning (where MSI's lower, non-shared delivery latency would then
-matter). Until one of those lands, treat it like the deferred x86-64 path
-below: a worthwhile future architectural exercise, not a prerequisite for
-any NIC backend (including I350) working correctly.
+Multi-core and a genuinely `hlt`-and-wake-redesigned polling loop (as
+opposed to the single idle-prompt-loop-scoped "HLT-on-idle" feature
+above, which only covers the one loop that's actually idle, not NIC-
+receive-dependent loops) remain the two things that would make MSI's
+lower, non-shared delivery latency start to matter beyond what it already
+does (removing the shared-legacy-line hazard). See "Cooperative/
+preemptive scheduling" below for why multi-core specifically remains
+deferred.
 
 ### Cooperative/preemptive scheduling: investigated, not yet built
 

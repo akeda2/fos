@@ -616,6 +616,14 @@ pub struct Hda {
     instance: usize,
     mmio_base: u32,
     irq: Option<u8>,
+    /// The MSI vector this controller is actually using for interrupt
+    /// delivery, if `init_controller` was able to enable MSI for it (see
+    /// "MSI/MSI-X" in AGENTS.md). `irq` above still reflects whatever
+    /// legacy line firmware assigned regardless -- kept purely for
+    /// diagnostics -- but `handle_pci_irq`'s dispatch match and the
+    /// registration call sites below only ever use one or the other, never
+    /// both, for a given controller.
+    msi_vector: Option<u8>,
     corb_base: u32,
     rirb_base: u32,
     /// Software's own tracked "last consumed RIRB entry" index -- see
@@ -706,6 +714,10 @@ impl Hda {
 
     pub fn irq(&self) -> Option<u8> {
         self.irq
+    }
+
+    pub fn msi_vector(&self) -> Option<u8> {
+        self.msi_vector
     }
 
     pub fn input_stream_count(&self) -> u8 {
@@ -1009,10 +1021,18 @@ static CAPTURE_RINGS: [audio::PcmRing; MAX_INSTANCES] =
 /// calling every registered controller's `handle_interrupt` on every
 /// fire is always safe, even for a controller that was not the actual
 /// source this time (or has no playback stream programmed at all).
-fn handle_pci_irq(irq: u8) {
+/// `irq_or_vector` is either a legacy IRQ number (0-15, via
+/// `register_pci_irq`) or an MSI vector (`interrupts::MSI_VECTOR_BASE`
+/// and up, via `register_msi_irq`) -- the two ranges never overlap, so
+/// matching against both `irq`/`msi_vector` fields below is unambiguous.
+/// A controller using MSI never shares its vector with anything else (see
+/// `msi_vector`'s own doc comment), but the shared-legacy-line case this
+/// function already handled before MSI existed is unchanged.
+fn handle_pci_irq(irq_or_vector: u8) {
     unsafe {
         for controller in (*core::ptr::addr_of!(CONTROLLERS)).iter().flatten() {
-            if controller.irq == Some(irq) {
+            if controller.irq == Some(irq_or_vector) || controller.msi_vector == Some(irq_or_vector)
+            {
                 controller.handle_interrupt();
             }
         }
@@ -1086,6 +1106,16 @@ fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Sta
         return Err(Status::InitFailed);
     }
     let irq = address.interrupt_line();
+    // Try MSI first; only fall back to the legacy `irq` line above if this
+    // controller has no MSI capability at all, or every MSI vector is
+    // already claimed. `enable_msi` performs no config-space writes at
+    // all if it returns `None`, so there's nothing to undo on that path.
+    let msi_vector = if crate::lapic::is_available() {
+        interrupts::allocate_msi_vector()
+            .filter(|&vector| address.enable_msi(vector, crate::lapic::id()).is_some())
+    } else {
+        None
+    };
 
     if reset_controller(mmio_base).is_err() {
         return Err(Status::InitFailed);
@@ -1103,6 +1133,7 @@ fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Sta
         instance,
         mmio_base,
         irq,
+        msi_vector,
         corb_base,
         rirb_base,
         rirb_rp: Cell::new(0),
@@ -1342,7 +1373,9 @@ fn setup_playback(hda: &mut Hda) {
     hda.fill_period(0);
     hda.fill_period(1);
 
-    if let Some(irq) = hda.irq {
+    if let Some(vector) = hda.msi_vector {
+        interrupts::register_msi_irq(vector, handle_pci_irq);
+    } else if let Some(irq) = hda.irq {
         interrupts::register_pci_irq(irq, handle_pci_irq);
     }
 
@@ -1452,7 +1485,9 @@ fn setup_capture(hda: &mut Hda) {
     ));
     hda.send_corb_command(verb(cad, pin_nid, AC_VERB_SET_PIN_WIDGET_CONTROL, AC_PINCTL_IN_EN));
 
-    if let Some(irq) = hda.irq {
+    if let Some(vector) = hda.msi_vector {
+        interrupts::register_msi_irq(vector, handle_pci_irq);
+    } else if let Some(irq) = hda.irq {
         interrupts::register_pci_irq(irq, handle_pci_irq);
     }
 

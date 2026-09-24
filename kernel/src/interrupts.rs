@@ -53,6 +53,19 @@ const KEYBOARD_VECTOR: u8 = IRQ_BASE + 1;
 const SPURIOUS_MASTER_VECTOR: u8 = IRQ_BASE + 7;
 const SPURIOUS_SLAVE_VECTOR: u8 = IRQ_BASE + 15;
 
+/// A separate vector range for Message Signaled Interrupts
+/// (`register_msi_irq`/`dispatch_msi_irq`), clear of the CPU exception
+/// range (`0x00-0x1f`), the PIC's remapped legacy range (`IRQ_BASE`
+/// through `IRQ_BASE + 15`, i.e. `0x20-0x2f`), and `lapic::SPURIOUS_VECTOR`
+/// (`0x60`, chosen to sit just past this range). `gdt::
+/// DOUBLE_FAULT_TSS_SELECTOR` (`0x30`) is a GDT *selector*, a completely
+/// different namespace from an IDT vector number, so it is not a
+/// conflict despite the overlapping numeral. 16 is a generous, arbitrary
+/// bound -- comfortably more than this project's small, fixed set of
+/// MSI-capable devices (currently just `hda.rs`) could ever need at once.
+const MSI_VECTOR_BASE: u8 = 0x50;
+const MSI_VECTOR_COUNT: usize = 16;
+
 /// OCW3 command selecting the in-service register for the next read of a
 /// PIC's command port.
 const PIC_READ_ISR: u8 = 0x0b;
@@ -180,6 +193,62 @@ fn dispatch_pci_irq(irq: u8) {
     }
 }
 
+/// One handler slot per MSI vector, deliberately unlike
+/// `PCI_IRQ_HANDLERS`'s `MAX_SHARED_HANDLERS`-wide sharing. MSI's entire
+/// point is exclusive, unshared ownership: each device gets its own
+/// address/data pair pointing at its own dedicated vector, unlike legacy
+/// INTx lines, whose sharing is a motherboard-topology fact no driver
+/// controls. Reusing the shared-slot design here would defend against a
+/// problem MSI cannot have.
+static mut MSI_HANDLERS: [Option<IrqHandler>; MSI_VECTOR_COUNT] = [None; MSI_VECTOR_COUNT];
+static mut MSI_IRQ_COUNTS: [u64; MSI_VECTOR_COUNT] = [0; MSI_VECTOR_COUNT];
+
+/// Claims the next free MSI vector for a caller about to program a
+/// device's MSI capability (`pci::PciAddress::enable_msi`). Returns
+/// `None` once every slot in `MSI_VECTOR_BASE..MSI_VECTOR_BASE +
+/// MSI_VECTOR_COUNT` is taken -- callers should fall back to legacy
+/// `register_pci_irq` in that case, exactly as they would if the device
+/// had no MSI capability at all.
+pub fn allocate_msi_vector() -> Option<u8> {
+    unsafe {
+        let index = (0..MSI_VECTOR_COUNT).find(|&i| MSI_HANDLERS[i].is_none())?;
+        Some(MSI_VECTOR_BASE + index as u8)
+    }
+}
+
+/// Registers `handler` for a vector previously returned by
+/// `allocate_msi_vector`. No PIC mask manipulation happens here at all --
+/// unlike `register_pci_irq`, MSI never routes through the 8259, so there
+/// is nothing to unmask.
+pub fn register_msi_irq(vector: u8, handler: IrqHandler) -> bool {
+    if vector < MSI_VECTOR_BASE || vector >= MSI_VECTOR_BASE + MSI_VECTOR_COUNT as u8 {
+        return false;
+    }
+    let index = usize::from(vector - MSI_VECTOR_BASE);
+    unsafe {
+        MSI_HANDLERS[index] = Some(handler);
+    }
+    true
+}
+
+pub fn msi_irq_count(vector: u8) -> u64 {
+    if vector < MSI_VECTOR_BASE || vector >= MSI_VECTOR_BASE + MSI_VECTOR_COUNT as u8 {
+        return 0;
+    }
+    let index = usize::from(vector - MSI_VECTOR_BASE);
+    read_u64_atomically(unsafe { core::ptr::addr_of!(MSI_IRQ_COUNTS[index]) })
+}
+
+fn dispatch_msi_irq(vector: u8) {
+    let index = usize::from(vector - MSI_VECTOR_BASE);
+    unsafe {
+        MSI_IRQ_COUNTS[index] += 1;
+        if let Some(handler) = MSI_HANDLERS[index] {
+            handler(vector);
+        }
+    }
+}
+
 impl IdtEntry {
     const fn missing() -> Self {
         Self {
@@ -259,6 +328,23 @@ pub fn initialize() {
         IDT[usize::from(IRQ_BASE + 14)] = IdtEntry::gate(pci_irq14_interrupt);
         IDT[usize::from(SPURIOUS_MASTER_VECTOR)] = IdtEntry::gate(spurious_master_interrupt);
         IDT[usize::from(SPURIOUS_SLAVE_VECTOR)] = IdtEntry::gate(spurious_slave_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE)] = IdtEntry::gate(msi_irq_50_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 1)] = IdtEntry::gate(msi_irq_51_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 2)] = IdtEntry::gate(msi_irq_52_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 3)] = IdtEntry::gate(msi_irq_53_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 4)] = IdtEntry::gate(msi_irq_54_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 5)] = IdtEntry::gate(msi_irq_55_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 6)] = IdtEntry::gate(msi_irq_56_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 7)] = IdtEntry::gate(msi_irq_57_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 8)] = IdtEntry::gate(msi_irq_58_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 9)] = IdtEntry::gate(msi_irq_59_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 10)] = IdtEntry::gate(msi_irq_5a_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 11)] = IdtEntry::gate(msi_irq_5b_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 12)] = IdtEntry::gate(msi_irq_5c_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 13)] = IdtEntry::gate(msi_irq_5d_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 14)] = IdtEntry::gate(msi_irq_5e_interrupt);
+        IDT[usize::from(MSI_VECTOR_BASE + 15)] = IdtEntry::gate(msi_irq_5f_interrupt);
+        IDT[usize::from(crate::lapic::SPURIOUS_VECTOR)] = IdtEntry::gate(lapic_spurious_interrupt);
     }
 
     load_kernel_idt();
@@ -278,6 +364,18 @@ pub fn initialize() {
     crate::println!(
         "PIT at {PIT_FREQUENCY_HZ} Hz drives IRQ0 (timer), IRQ1 drives the keyboard."
     );
+    // The local APIC is additive, alongside the PIC above, not a
+    // replacement -- see "MSI/MSI-X" in AGENTS.md. This only maps its
+    // MMIO window and arms its spurious-vector register; it does not
+    // touch the PIC's own INTx routing at all.
+    if crate::lapic::initialize() {
+        crate::println!(
+            "Local APIC found and enabled (ID {}): MSI available for capable devices.",
+            crate::lapic::id()
+        );
+    } else {
+        crate::println!("No local APIC found; MSI-capable devices will use legacy IRQs.");
+    }
     #[cfg(feature = "stack-guard-test")]
     crate::stack::trigger_guard_page_for_test();
 }
@@ -736,6 +834,39 @@ extern "x86-interrupt" fn spurious_slave_interrupt(_frame: InterruptStackFrame) 
         }
     }
 }
+
+macro_rules! msi_irq_handler {
+    ($name:ident, $vector:expr) => {
+        extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            dispatch_msi_irq($vector);
+            crate::lapic::send_eoi();
+        }
+    };
+}
+
+msi_irq_handler!(msi_irq_50_interrupt, 0x50);
+msi_irq_handler!(msi_irq_51_interrupt, 0x51);
+msi_irq_handler!(msi_irq_52_interrupt, 0x52);
+msi_irq_handler!(msi_irq_53_interrupt, 0x53);
+msi_irq_handler!(msi_irq_54_interrupt, 0x54);
+msi_irq_handler!(msi_irq_55_interrupt, 0x55);
+msi_irq_handler!(msi_irq_56_interrupt, 0x56);
+msi_irq_handler!(msi_irq_57_interrupt, 0x57);
+msi_irq_handler!(msi_irq_58_interrupt, 0x58);
+msi_irq_handler!(msi_irq_59_interrupt, 0x59);
+msi_irq_handler!(msi_irq_5a_interrupt, 0x5a);
+msi_irq_handler!(msi_irq_5b_interrupt, 0x5b);
+msi_irq_handler!(msi_irq_5c_interrupt, 0x5c);
+msi_irq_handler!(msi_irq_5d_interrupt, 0x5d);
+msi_irq_handler!(msi_irq_5e_interrupt, 0x5e);
+msi_irq_handler!(msi_irq_5f_interrupt, 0x5f);
+
+/// A genuine spurious local-APIC interrupt (the CPU vectors here only
+/// when an interrupt was withdrawn before it could be dispatched to a
+/// real handler) needs no EOI at all, unlike the PIC's IRQ7/IRQ15
+/// spurious handling above -- per the Intel SDM, there is nothing "in
+/// service" to end, since no real interrupt was ever accepted.
+extern "x86-interrupt" fn lapic_spurious_interrupt(_frame: InterruptStackFrame) {}
 
 fn push_scancode(byte: u8) {
     // Interrupts are already disabled for the duration of this handler (it
