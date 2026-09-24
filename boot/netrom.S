@@ -257,7 +257,14 @@ initialize_boot_info:
 
 collect_memory_map:
     xorl %ebx, %ebx
-    xorw %bp, %bp
+    # Full 32-bit clear, not just %bp -- see boot/stage2.S's own
+    # collect_memory_map for why: this loop later compares and stores the
+    # full %ebp, so leftover garbage in its upper 16 bits (never possible
+    # from a cold BIOS/PXE-ROM boot today, since netrom.S has no soft-reboot
+    # entry point of its own, but this routine is otherwise a duplicate of
+    # stage2.S's and is kept in lockstep with it) would end the E820 loop
+    # immediately and report zero memory regions.
+    xorl %ebp, %ebp
     movw $MEMORY_MAP, %di
 memory_next:
     cmpl $MAX_MEMORY_REGIONS, %ebp
