@@ -34,6 +34,7 @@ mod rtl8139;
 mod shell;
 mod stack;
 mod threecom;
+mod uhci;
 
 use core::panic::PanicInfo;
 

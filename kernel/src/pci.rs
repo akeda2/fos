@@ -11,17 +11,18 @@
 //! broadly compatible, matching the rest of this project's approach to
 //! hardware access.
 //!
-//! Only enough of PCI is implemented to serve this project's three uses:
+//! Only enough of PCI is implemented to serve this project's four uses:
 //! walking every bus/device/function to find serial controllers by class
-//! code (reading BAR0 for the UART's I/O port), finding Ethernet cards by
-//! vendor/device ID for the RTL8139, 3C905, and Intel e1000 drivers
-//! (`rtl8139.rs`, `threecom.rs`, and `e1000.rs`), and a general device dump
-//! (`scan_devices`, backing the shell's `pci` command) used to identify
-//! hardware -- most concretely, an unmarked or newly acquired NIC's real
-//! vendor/device ID -- before writing or extending a driver for it. The
-//! first two read I/O BARs; e1000 reads a 32-bit memory BAR. All
-//! DMA-capable backends enable bus mastering through the PCI command
-//! register.
+//! code (reading BAR0 for the UART's I/O port), finding UHCI (USB 1.1) host
+//! controllers the same class-code-matching way (`find_uhci_controllers`,
+//! backing `uhci.rs`), finding Ethernet cards by vendor/device ID for the
+//! RTL8139, 3C905, and Intel e1000 drivers (`rtl8139.rs`, `threecom.rs`, and
+//! `e1000.rs`), and a general device dump (`scan_devices`, backing the
+//! shell's `pci` command) used to identify hardware -- most concretely, an
+//! unmarked or newly acquired NIC's real vendor/device ID -- before writing
+//! or extending a driver for it. The serial/UHCI/NIC lookups read I/O BARs;
+//! e1000 reads a 32-bit memory BAR. All DMA-capable backends enable bus
+//! mastering through the PCI command register.
 //! There is no support for 64-bit memory BARs, PCI bridges, or any other
 //! device class; this is a teaching-scoped lookup, not a general PCI driver.
 //!
@@ -43,6 +44,18 @@ const CONFIG_DATA: u16 = 0xcfc;
 /// 16550 register layout that all of them accept).
 const CLASS_SIMPLE_COMMUNICATION: u8 = 0x07;
 const SUBCLASS_SERIAL: u8 = 0x00;
+
+/// PCI class code for "serial bus controllers", subclass 0x03 for "USB",
+/// prog-if 0x00 for the UHCI (USB 1.1) programming interface specifically
+/// -- distinct from OHCI (`0x10`), EHCI (`0x20`), and xHCI (`0x30`), which
+/// this project does not implement. Matching by class/subclass/prog-if
+/// (like `find_serial_ports` below, not by vendor:device ID like every
+/// NIC/audio backend) is correct here because UHCI is a standardized
+/// programming interface many different vendors implement identically,
+/// not one specific chip.
+const CLASS_SERIAL_BUS: u8 = 0x0c;
+const SUBCLASS_USB: u8 = 0x03;
+const PROG_IF_UHCI: u8 = 0x00;
 
 const HEADER_TYPE_MULTIFUNCTION: u8 = 0x80;
 const BAR0_OFFSET: u8 = 0x10;
@@ -527,6 +540,62 @@ pub fn find_serial_ports(out: &mut [u16]) -> usize {
                     return count;
                 };
                 *slot = (bar0 & 0xffff_fffc) as u16;
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Walks every PCI bus/device/function looking for UHCI (USB 1.1) host
+/// controllers, matching by class/subclass/prog-if (`CLASS_SERIAL_BUS`/
+/// `SUBCLASS_USB`/`PROG_IF_UHCI`) rather than vendor:device ID -- the
+/// second such case in this file, alongside `find_serial_ports` above, and
+/// for the identical reason: many different chipset vendors implement the
+/// same standardized programming interface. Returns full `PciAddress`
+/// values (unlike `find_serial_ports`'s bare I/O addresses), since a UHCI
+/// controller -- unlike this project's port-I/O-only UART code -- also
+/// needs `enable_io_and_bus_master()` (UHCI is DMA-capable, walking its
+/// Frame List/Queue Heads/Transfer Descriptors by bus mastering) and
+/// `interrupt_line()`.
+pub fn find_uhci_controllers(out: &mut [Option<PciAddress>]) -> usize {
+    let mut count = 0;
+    for bus in 0..=255u8 {
+        for device in 0..32u8 {
+            let vendor = read_u16(bus, device, 0, 0x00);
+            if vendor == 0xffff {
+                continue;
+            }
+            let header_type = read_u8(bus, device, 0, 0x0e);
+            let function_count = if header_type & HEADER_TYPE_MULTIFUNCTION != 0 {
+                8
+            } else {
+                1
+            };
+            for function in 0..function_count {
+                let function_vendor = if function == 0 {
+                    vendor
+                } else {
+                    read_u16(bus, device, function, 0x00)
+                };
+                if function_vendor == 0xffff {
+                    continue;
+                }
+                let class = read_u8(bus, device, function, 0x0b);
+                let subclass = read_u8(bus, device, function, 0x0a);
+                let prog_if = read_u8(bus, device, function, 0x09);
+                if class != CLASS_SERIAL_BUS || subclass != SUBCLASS_USB || prog_if != PROG_IF_UHCI
+                {
+                    continue;
+                }
+                let Some(slot) = out.get_mut(count) else {
+                    return count;
+                };
+                *slot = Some(PciAddress {
+                    bus,
+                    device,
+                    function,
+                });
                 count += 1;
             }
         }

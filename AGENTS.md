@@ -936,6 +936,169 @@ all. Full detail (the three register-layout differences from `e1000.rs`,
 scaffolding this module's effect on the reserved low-memory region) is in
 `docs/history/development-notes.md`.
 
+### UHCI: a USB host controller driver, and isochronous USB Audio playback
+
+`kernel/src/uhci.rs` is a minimal UHCI (USB 1.1, I/O-port-based) host
+controller driver, added because many class-compliant USB audio
+interfaces are full-speed (12 Mbps) even when marketed as "USB 2.0" --
+UHCI alone is enough bandwidth, and sidesteps EHCI's companion-controller
+port-handoff dance entirely. `pci::find_uhci_controllers` (`pci.rs`) is
+the second class-code PCI walk in this file (matching class 0x0C/subclass
+0x03/prog-if 0x00, alongside `find_serial_ports`'s UART walk), since
+`find_devices` only matches by vendor:device ID and every existing NIC/
+audio backend needs the full `PciAddress` (for `enable_io_and_bus_master`/
+`interrupt_line`), unlike `find_serial_ports`'s bare I/O addresses.
+
+Bring-up (`Uhci::reset_and_start`): Global Reset, then Host Controller
+Reset (self-clearing), then a single page-sized Frame List
+(`pmem::allocate`, 1024 32-bit link pointers -- one per 1 ms frame) whose
+every entry points at one fixed control Queue Head, then Run/Stop set.
+One small fixed pool (also `pmem::allocate`, sub-page) holds that QH plus
+up to `TD_POOL_CAPACITY` (34) Transfer Descriptors -- enough for one
+control-transfer pipeline; there is no general per-device
+bandwidth-reservation scheduler, since this driver only ever runs
+enumeration's control transfers, never periodic (isochronous/interrupt)
+traffic. No IRQ handler is registered: UHCI has no MSI capability (same
+bucket as ES1370), and enumeration's control transfers have no real-time
+deadline, so foreground polling of each TD's status is enough.
+
+A real, non-obvious UHCI-specific bug, found only by booting against a
+real, verified QEMU `piix3-usb-uhci` + `usb-audio` device rather than
+trusting the spec/header from memory: **UHCI never auto-enables a port
+after reset** (`Uhci::reset_port` must explicitly write the `EN` bit --
+the spec's own wording is "software sets this bit to 1 to enable the
+port"), and, separately, **`PORTSC`'s `EN`/`SUSPEND` bits are ordinary
+read/write storage, not sticky-on-zero**: a later write meant only to
+clear the write-1-to-clear `CSC`/`ENC` change bits must read-modify-write
+the whole register (or simply write back the exact value just read) --
+writing only the change-clear bits silently re-disables the port that was
+just enabled. Both were confirmed by reading QEMU's own
+`hw/usb/hcd-uhci.c`/`include/hw/usb/uhci-regs.h` directly after the first
+symptom (every control transfer failing with a CRC/timeout TD status)
+turned out to trace back to `uhci_find_device` skipping any port whose
+`UHCI_PORT_EN` bit isn't set -- the same "verify against QEMU source"
+discipline the NE2000 header-byte-order bug (above) already established
+for this project. `reset_port` also observes the USB 2.0 7.1.7.3 reset
+recovery time (`TRSTRCY`, >=10 ms) before the first request, which is
+correct per spec even though it turned out not to be this bug's root
+cause.
+
+`Uhci::control_transfer` builds one SETUP-TD -> zero-or-more data-stage
+TDs (toggling `DATA0`/`DATA1` per packet, at most `max_packet` bytes each)
+-> one zero-length STATUS-TD chain, patches each TD's own link field to
+the next TD with the Depth-First bit set (so the whole chain runs within
+one frame rather than one TD per frame), points the QH's element pointer
+at the first TD, and polls each TD's control word for `ACTIVE` clearing
+(done) or an error bit (`STALL`/`BABBLE`/CRC-`TIMEOUT`) with a 500 ms
+deadline. The STATUS stage's data toggle is always `DATA1` regardless of
+how many data packets preceded it (a USB spec correction rule, not a
+simple continuation of the alternating pattern). `get_descriptor`/
+`set_address`/`set_configuration` are thin wrappers building the matching
+standard SETUP packet.
+
+The `usb` shell command (`shell.rs`) lists every discovered controller
+(`io_base`, `irq`, whether `USBSTS.HCHALTED` is clear) and, per root port,
+drives the full standard enumeration sequence far enough to print a real
+device descriptor (vendor/product ID, class, `bMaxPacketSize0`) and
+configuration descriptor (hex-dumped, `dump_bytes`) before issuing
+`SET_CONFIGURATION` -- proving the whole chain end to end with no
+audio-specific code involved. It always resets the port and re-enumerates
+from scratch on every call rather than caching a previous result, since a
+real device can be unplugged/replugged between commands. Low-speed
+devices (realistically only HID keyboards/mice) are detected and reported
+but not enumerated further. Verified end to end by `tapes/test_uhci_e2e.py`
+against QEMU's real `piix3-usb-uhci` + `usb-audio` device (vendor:product
+`0x46f4:0x0002`, its configuration descriptor's real USB Audio Class 1.0
+`CS_INTERFACE` `HEADER` descriptor bytes, and idempotent re-enumeration
+across two independent `usb` calls in the same session).
+
+#### Isochronous OUT transfers, and `usb play`
+
+Enumeration alone cannot play audio: USB Audio Class streaming uses an
+*isochronous* endpoint, structurally unlike a control transfer -- no
+Queue Head is involved at all. `IsocOutStream` (`uhci.rs`) is a second,
+separate Transfer-Descriptor pool (`isoc_td_pool_addr`, one more
+`pmem::allocate` page, `ISOC_TD_COUNT` = 16 TDs) driven by a fundamentally
+different mechanic: because the Frame List has exactly 1024 entries and
+hardware walks through all of them once per ~1.024 real seconds,
+*continuous* streaming requires refreshing roughly one Frame List entry
+per real millisecond, sustained for the whole playback -- unlike a
+control/bulk queue, where the same Queue Head is simply revisited every
+frame. `IsocOutStream::service`, polled from a foreground loop (no IRQ or
+MSI involved -- `USBINTR` stays masked exactly as `reset_and_start`
+already leaves it), keeps a small window of entries primed ahead of
+hardware's own position, read via `USBFRNUM` (confirmed against QEMU's
+own `frame_addr = fl_base + ((frnum & 0x3ff) << 2)`: the register is
+11 bits, but only its low 10 select a Frame List entry). Each isochronous
+TD sets `TD_CTRL_IOS` ("Isochronous Select"), confirmed against QEMU's
+`uhci_complete_td` to mean exactly one try with no retry/error-counter
+semantics -- unlike every control-transfer TD here, which uses UHCI's
+ordinary 3-retry budget. Because the shared `pmem::TAPE_BASE`/`TAPE_LEN`
+staging buffer (the same one `copy`/`tape load`/NETFS already document
+reusing) is one contiguous physical block, each TD's buffer pointer
+references it directly at the right offset -- no separate packet-buffer
+pool or copy step needed.
+
+Two real bugs were found only by actually streaming audio into QEMU's
+`usb-audio` device and inspecting its recorded WAV output, not by code
+review: the TD token's endpoint field was first coded at bits 14:11
+(colliding with the *device address* field, bits 14:8) instead of the
+correct bits 18:15 -- confirmed against QEMU's own extraction,
+`uint8_t ep_id = (td->token >> 15) & 0xf;` (`hw/usb/hcd-uhci.c`) -- so
+every packet silently reached a nonexistent device address instead of
+the real one, and `IsocOutStream` reported "Playback complete" with
+correct timing throughout, because an isochronous TD's `Active` bit
+clears identically whether a packet succeeded or failed (see `IOS`
+above) and nothing was checking the error bits at all. The second fix is
+exactly that gap: `IsocOutStream::error_count` (incremented in
+`install_next`, when a soon-to-be-reused pool slot's previous occupant
+shows `TD_CTRL_ERROR_MASK`, and in a final sweep of the un-recycled tail
+batch once streaming ends) makes a genuinely failed packet visible
+instead of silently discarded -- the `usb play` command prints a warning
+whenever it's nonzero.
+
+Minimal USB Audio Class 1.0 descriptor parsing lives in `shell.rs`
+(`find_uac_playback_endpoint`), walking a configuration descriptor's raw
+bytes generically by each sub-descriptor's own `bLength`, looking for an
+AudioStreaming alternate setting (`bInterfaceClass` AUDIO/`bInterfaceSubClass`
+AUDIOSTREAMING, `bNumEndpoints == 1` -- alternate setting 0 always
+declares zero endpoints per UAC1's own "idle" convention, so it's skipped
+naturally) whose Format-Type descriptor is PCM/16-bit and whose
+isochronous OUT endpoint is Synchronous or Adaptive sync (not
+Asynchronous, which needs an unimplemented feedback endpoint). It
+requires the sample rate to be evenly divisible by 1000 and the
+endpoint's `wMaxPacketSize` to exactly match `(rate/1000) * channels *
+bytes_per_sample` -- the fixed-packet-size assumption `IsocOutStream`
+relies on -- rejecting (not attempting) any device that would need a
+per-frame varying packet size, such as a 44.1 kHz device. `Uhci::
+set_interface` (the missing standard `SET_INTERFACE` request UAC1's own
+alternate-setting convention needs) is a thin wrapper reusing
+`control_transfer`, exactly like `set_configuration`.
+
+`usb play [diskN] NAME` (`shell.rs`) mirrors `enumerate_usb_port`'s own
+"reset and redo everything from scratch" sequence -- so it never depends
+on a separate, prior `usb` call having already addressed the device --
+scanning every controller/port for the first device offering a usable
+endpoint, completing `SET_ADDRESS`/`SET_CONFIGURATION`/`set_interface`,
+then streaming the named file (raw PCM, already in the device's exact
+negotiated format -- no resampling, the same expectation every other
+audio backend here already has) through `IsocOutStream`, polling
+`keyboard::poll_term_event`/`poll_background_work` each iteration exactly
+like `nic sniff`'s exclusive loop so F12 stops playback early. On
+completion or abort, `IsocOutStream::stop` restores every Frame List
+entry the stream touched back to the control Queue Head, and
+`set_interface` quiesces the streaming interface back to alternate
+setting 0. Verified end to end by `tapes/test_uhci_play_e2e.py`: the
+command discovers the real 48 kHz/16-bit/stereo/192-byte-packet format,
+blocks for close to a seeded 1-second tone's real duration (proving
+genuine ~1 kHz-paced streaming, not an instant no-op), reports no failed
+packets, and the QEMU-captured WAV file's dominant frequency (a
+single-bin Goertzel DFT, the same dependency-free technique
+`tapes/test_audio_rtp_opus_e2e.py` already uses) matches the seeded tone
+-- real, audible, correct playback, not just a clean-looking status
+line. Isochronous *capture* (IN) and `audio.rs`/tape-ABI integration
+remain explicit follow-on work; see "Deliberately deferred work" below.
+
 ### Tape print callback ABI
 
 The hand-rolled VGA/CRTC/COM1 output described above worked, but it had a
@@ -1977,10 +2140,14 @@ MSI address/data encoding, and the full verification list) is in
 
 - Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
   userspace, scheduling,
-  native USB, further hardware IRQ drivers beyond the timer/keyboard, robust
+  further hardware IRQ drivers beyond the timer/keyboard, robust
   fault recovery, any protocol above raw Ethernet frames (no ARP, no IPv4,
   no sockets), and support for NIC families beyond the current RTL8139,
-  selected 3C905, Intel e1000, and NE2000-compatible backends.
+  selected 3C905, Intel e1000, and NE2000-compatible backends. USB itself
+  is no longer fully deferred -- see "UHCI: a USB host controller driver,
+  and isochronous USB Audio playback" above for what's built (enumeration
+  and isochronous OUT/playback); isochronous IN (capture), `audio.rs`/
+  tape-ABI integration, and EHCI/OHCI/xHCI remain deferred.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.

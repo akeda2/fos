@@ -13,6 +13,7 @@ use crate::nic;
 use crate::parallel;
 use crate::pci;
 use crate::pmem;
+use crate::uhci;
 use crate::{print, println};
 
 const LINE_CAPACITY: usize = 256;
@@ -469,7 +470,7 @@ fn execute(command: &[u8], info: &BootInfo) {
             }
             if no_arguments(arguments) {
                 println!(
-                    "System: help clear vga about bootinfo memmap memory cpuinfo pci"
+                    "System: help clear vga about bootinfo memmap memory cpuinfo pci usb"
                 );
                 println!("      hexdump halt reset reboot [soft|hard]");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
@@ -550,6 +551,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"pci" if no_arguments(arguments) => print_pci_devices(),
+        b"usb" => usb_command(info, arguments),
         b"printer" if no_arguments(arguments) => print_printer_ports(),
         b"print" => print_command(info, arguments),
         b"nic" => nic_command(arguments),
@@ -574,8 +576,8 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"reboot" => reboot_command(info, arguments),
         b"debug" => debug_command(info, arguments),
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
-        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci" | b"printer"
-        | b"start" | b"audio" | b"hda" => {
+        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci"
+        | b"printer" | b"start" | b"audio" | b"hda" => {
             println!("This command does not accept arguments.");
         }
 
@@ -847,6 +849,455 @@ fn print_pci_devices() {
     }
     if found > shown {
         println!("({} more found but not shown; MAX_PCI_DEVICES exceeded)", found - shown);
+    }
+}
+
+/// `usb` reports every discovered UHCI (USB 1.1) host controller and, for
+/// each of its two root ports, drives a fresh port reset and full
+/// enumeration (address assignment, device/configuration descriptor
+/// reads, `SET_CONFIGURATION`) every time this command runs -- the same
+/// "read directly from hardware, print it" ethos as `pci`, deliberately
+/// re-run from a known state each call rather than cached, since a real
+/// device can be unplugged/replugged between commands. Isochronous
+/// transfers and USB Audio Class descriptor parsing are not implemented
+/// yet (see `uhci.rs`'s own module doc comment and AGENTS.md's "USB"
+/// section) -- this command's whole job is proving enumeration itself
+/// works, with no audio-specific code involved at all.
+fn print_usb_devices() {
+    let count = uhci::count();
+    if count == 0 {
+        println!("No UHCI controllers found.");
+        return;
+    }
+    println!("Found {count} UHCI controller(s):");
+    for index in 0..count {
+        let Some(controller) = uhci::get(index) else {
+            continue;
+        };
+        print!("Controller {}: io_base=0x{:04x}", controller.instance(), controller.io_base());
+        match controller.irq() {
+            Some(irq) => print!(" irq={irq}"),
+            None => print!(" irq=none"),
+        }
+        println!(" running={}", if controller.is_running() { "yes" } else { "no" });
+        for port in 0..uhci::UHCI_PORTS {
+            enumerate_usb_port(port + 1, controller, port);
+        }
+    }
+}
+
+/// Resets one root port and, if a full-speed device answers, drives the
+/// standard enumeration sequence far enough to read its real device and
+/// configuration descriptors: `GET_DESCRIPTOR` (8 bytes, to learn
+/// `bMaxPacketSize0`) -> `SET_ADDRESS` -> `GET_DESCRIPTOR` (full device
+/// descriptor) -> `GET_DESCRIPTOR` (configuration, header then full) ->
+/// `SET_CONFIGURATION`. `port_number` is the 1-based number printed to the
+/// operator; `port` is the 0-based index `Uhci`'s own API uses.
+fn enumerate_usb_port(port_number: u8, controller: &uhci::Uhci, port: u8) {
+    let low_speed = match controller.reset_port(port) {
+        Ok(low_speed) => low_speed,
+        Err(uhci::Error::NotPresent) => {
+            println!("  port {port_number}: no device connected.");
+            return;
+        }
+        Err(error) => {
+            println!("  port {port_number}: reset failed ({error:?}).");
+            return;
+        }
+    };
+    println!(
+        "  port {port_number}: connected, {}.",
+        if low_speed { "low-speed" } else { "full-speed" }
+    );
+    if low_speed {
+        // Realistically only HID keyboards/mice; not this command's
+        // concern, and not worth the extra low-speed-specific handling
+        // UHCI's spec otherwise requires (a different max packet size
+        // ceiling, and low-speed devices must be enumerated more
+        // carefully around babble). See AGENTS.md.
+        println!("    low-speed devices are not enumerated further.");
+        return;
+    }
+
+    let mut first8 = [0u8; 8];
+    // The USB spec mandates assuming a max packet size of 8 for exactly
+    // this first request, before the device's real value (the 8th byte
+    // of its own device descriptor) is known.
+    if let Err(error) = controller.get_descriptor(0, 8, uhci::USB_DESCRIPTOR_DEVICE, &mut first8) {
+        println!("    initial descriptor read failed: {error:?}");
+        return;
+    }
+    let max_packet0 = first8[7];
+
+    // A fixed device address: this command only ever enumerates one
+    // device at a time (each call resets the port first), so there is
+    // never a second already-addressed device to collide with.
+    const DEVICE_ADDRESS: u8 = 1;
+    if let Err(error) = controller.set_address(DEVICE_ADDRESS) {
+        println!("    SET_ADDRESS failed: {error:?}");
+        return;
+    }
+
+    let mut device_descriptor = [0u8; 18];
+    if let Err(error) =
+        controller.get_descriptor(DEVICE_ADDRESS, max_packet0, uhci::USB_DESCRIPTOR_DEVICE, &mut device_descriptor)
+    {
+        println!("    device descriptor read failed: {error:?}");
+        return;
+    }
+    let vendor = u16::from_le_bytes([device_descriptor[8], device_descriptor[9]]);
+    let product = u16::from_le_bytes([device_descriptor[10], device_descriptor[11]]);
+    println!(
+        "    device: vendor=0x{vendor:04x} product=0x{product:04x} class=0x{:02x} max_packet0={max_packet0}",
+        device_descriptor[4]
+    );
+
+    let mut config_header = [0u8; 9];
+    if let Err(error) = controller.get_descriptor(
+        DEVICE_ADDRESS,
+        max_packet0,
+        uhci::USB_DESCRIPTOR_CONFIGURATION,
+        &mut config_header,
+    ) {
+        println!("    configuration descriptor header read failed: {error:?}");
+        return;
+    }
+    let total_length =
+        (u16::from_le_bytes([config_header[2], config_header[3]]) as usize).min(uhci::MAX_DESCRIPTOR_BYTES);
+
+    let mut config = [0u8; uhci::MAX_DESCRIPTOR_BYTES];
+    let read = match controller.get_descriptor(
+        DEVICE_ADDRESS,
+        max_packet0,
+        uhci::USB_DESCRIPTOR_CONFIGURATION,
+        &mut config[..total_length],
+    ) {
+        Ok(read) => read,
+        Err(error) => {
+            println!("    configuration descriptor read failed: {error:?}");
+            return;
+        }
+    };
+    println!("    configuration descriptor ({read} bytes):");
+    dump_bytes(0, &config[..read]);
+
+    // bConfigurationValue is the configuration descriptor's 6th byte.
+    let config_value = config.get(5).copied().unwrap_or(0);
+    match controller.set_configuration(DEVICE_ADDRESS, max_packet0, config_value) {
+        Ok(()) => println!("    configured (bConfigurationValue={config_value})."),
+        Err(error) => println!("    SET_CONFIGURATION failed: {error:?}"),
+    }
+}
+
+/// `usb` (no arguments) prints every controller/port, exactly as before;
+/// `usb play [diskN] NAME` streams a raw PCM file to whatever USB Audio
+/// Class playback device it can find, over a real isochronous OUT
+/// transfer -- see `uhci.rs`'s `IsocOutStream` and AGENTS.md's "USB"
+/// section for the design.
+fn usb_command(info: &BootInfo, arguments: &[u8]) {
+    const USAGE: &str = "Usage: usb | usb play [diskN] NAME";
+
+    if arguments.is_empty() {
+        print_usb_devices();
+        return;
+    }
+
+    let (first, remainder) = take_word(arguments);
+    if first.eq_ignore_ascii_case(b"play") {
+        let (device, remainder) = parse_disk_and_one_argument(remainder);
+        let (name, trailing) = take_word(remainder);
+        if name.is_empty() || !trailing.is_empty() {
+            println!("{USAGE}");
+            return;
+        }
+        usb_play_command(info, device, name);
+        return;
+    }
+
+    println!("{USAGE}");
+}
+
+/// A USB Audio Class 1.0 playback endpoint this driver can actually
+/// drive: PCM, 16-bit, a single fixed discrete sample rate divisible by
+/// 1000 (so every isochronous packet is the same fixed size for the
+/// whole stream -- a device like a 44100 Hz one, which would need a
+/// varying packet size frame-to-frame, is deliberately out of scope; see
+/// AGENTS.md's "USB" section), and a Synchronous or Adaptive (not
+/// Asynchronous, which would need an unimplemented feedback endpoint)
+/// isochronous OUT endpoint.
+struct UacPlaybackEndpoint {
+    interface_number: u8,
+    alternate_setting: u8,
+    endpoint_address: u8,
+    packet_bytes: u16,
+    sample_rate: u32,
+    channels: u8,
+    bits_per_sample: u8,
+}
+
+/// Walks a configuration descriptor's raw bytes generically, one
+/// sub-descriptor at a time (each one's own `bLength` at byte 0),
+/// looking for one AudioStreaming alternate setting with a working
+/// isochronous OUT endpoint. See `UacPlaybackEndpoint`'s own doc comment
+/// for exactly which UAC1 shapes qualify; anything else (a continuous
+/// sample-rate range, Asynchronous sync, non-16-bit, or a packet size
+/// that doesn't match `sample_rate`/1000 exactly) is skipped rather than
+/// guessed at.
+fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
+    const DESC_INTERFACE: u8 = 0x04;
+    const DESC_CS_INTERFACE: u8 = 0x24;
+    const DESC_ENDPOINT: u8 = 0x05;
+    const SUBTYPE_AS_GENERAL: u8 = 0x01;
+    const SUBTYPE_FORMAT_TYPE: u8 = 0x02;
+    const CLASS_AUDIO: u8 = 0x01;
+    const SUBCLASS_AUDIOSTREAMING: u8 = 0x02;
+
+    let mut offset = 0usize;
+    let mut interface_number = 0u8;
+    let mut alternate_setting = 0u8;
+    let mut in_playback_interface = false;
+    let mut format_ok = false;
+    let mut sample_rate = 0u32;
+    let mut channels = 0u8;
+    let mut bits_per_sample = 0u8;
+
+    while offset + 1 < config.len() {
+        let length = config[offset] as usize;
+        if length < 2 || offset + length > config.len() {
+            break;
+        }
+        let descriptor_type = config[offset + 1];
+        match descriptor_type {
+            DESC_INTERFACE if length >= 9 => {
+                interface_number = config[offset + 2];
+                alternate_setting = config[offset + 3];
+                let num_endpoints = config[offset + 4];
+                let class = config[offset + 5];
+                let subclass = config[offset + 6];
+                // UAC1's own convention: an AudioStreaming interface's
+                // alternate setting 0 always declares zero endpoints
+                // ("idle"/zero-bandwidth); this naturally skips it and
+                // only considers an alternate setting with a real
+                // streaming endpoint.
+                in_playback_interface =
+                    class == CLASS_AUDIO && subclass == SUBCLASS_AUDIOSTREAMING && num_endpoints == 1;
+                format_ok = false;
+            }
+            DESC_CS_INTERFACE if in_playback_interface && length >= 3 => {
+                let subtype = config[offset + 2];
+                if subtype == SUBTYPE_AS_GENERAL && length >= 7 {
+                    let format_tag = u16::from_le_bytes([config[offset + 5], config[offset + 6]]);
+                    format_ok = format_tag == 1; // PCM
+                } else if subtype == SUBTYPE_FORMAT_TYPE && format_ok && length >= 8 {
+                    let format_type = config[offset + 3];
+                    let nr_channels = config[offset + 4];
+                    let bit_resolution = config[offset + 6];
+                    let sam_freq_type = config[offset + 7];
+                    if format_type == 1 && bit_resolution == 16 && sam_freq_type >= 1 && length >= 11 {
+                        // tSamFreq[0]: the first (and, for this plan's
+                        // scope, only usable) discrete sample rate --
+                        // continuous-range devices (`bSamFreqType == 0`)
+                        // are rejected above.
+                        sample_rate = u32::from(config[offset + 8])
+                            | (u32::from(config[offset + 9]) << 8)
+                            | (u32::from(config[offset + 10]) << 16);
+                        channels = nr_channels;
+                        bits_per_sample = bit_resolution;
+                    } else {
+                        format_ok = false;
+                    }
+                }
+            }
+            DESC_ENDPOINT if in_playback_interface && format_ok && length >= 7 => {
+                let endpoint_address = config[offset + 2];
+                let attributes = config[offset + 3];
+                let max_packet_size = u16::from_le_bytes([config[offset + 4], config[offset + 5]]);
+                let transfer_type = attributes & 0x03;
+                let sync_type = (attributes >> 2) & 0x03;
+                let is_out = endpoint_address & 0x80 == 0;
+                let is_isochronous = transfer_type == 0x01;
+                let sync_supported = sync_type == 0x02 || sync_type == 0x03; // Adaptive|Synchronous
+                let fixed_packet_size = sample_rate % 1000 == 0
+                    && u32::from(max_packet_size)
+                        == (sample_rate / 1000) * u32::from(channels) * (u32::from(bits_per_sample) / 8);
+                if is_isochronous && is_out && sync_supported && fixed_packet_size {
+                    return Some(UacPlaybackEndpoint {
+                        interface_number,
+                        alternate_setting,
+                        endpoint_address,
+                        packet_bytes: max_packet_size,
+                        sample_rate,
+                        channels,
+                        bits_per_sample,
+                    });
+                }
+            }
+            _ => {}
+        }
+        offset += length;
+    }
+    None
+}
+
+/// Scans every discovered controller/port for a device offering a
+/// usable playback endpoint (`find_uac_playback_endpoint`), completing
+/// `SET_ADDRESS`/`SET_CONFIGURATION`/`set_interface` on the first match.
+/// Mirrors `enumerate_usb_port`'s own "reset and redo everything from
+/// scratch" sequence rather than depending on a separate, prior `usb`
+/// call having already addressed the device -- so `usb play` alone,
+/// with no `usb` run first, is always enough.
+fn find_playback_device() -> Option<(&'static uhci::Uhci, UacPlaybackEndpoint)> {
+    const DEVICE_ADDRESS: u8 = 1;
+
+    let count = uhci::count();
+    for index in 0..count {
+        let Some(controller) = uhci::get(index) else { continue };
+        for port in 0..uhci::UHCI_PORTS {
+            let Ok(low_speed) = controller.reset_port(port) else { continue };
+            if low_speed {
+                continue;
+            }
+            let mut first8 = [0u8; 8];
+            if controller.get_descriptor(0, 8, uhci::USB_DESCRIPTOR_DEVICE, &mut first8).is_err() {
+                continue;
+            }
+            let max_packet0 = first8[7];
+            if controller.set_address(DEVICE_ADDRESS).is_err() {
+                continue;
+            }
+            let mut config_header = [0u8; 9];
+            if controller
+                .get_descriptor(DEVICE_ADDRESS, max_packet0, uhci::USB_DESCRIPTOR_CONFIGURATION, &mut config_header)
+                .is_err()
+            {
+                continue;
+            }
+            let total_length = (u16::from_le_bytes([config_header[2], config_header[3]]) as usize)
+                .min(uhci::MAX_DESCRIPTOR_BYTES);
+            let mut config = [0u8; uhci::MAX_DESCRIPTOR_BYTES];
+            let Ok(read) = controller.get_descriptor(
+                DEVICE_ADDRESS,
+                max_packet0,
+                uhci::USB_DESCRIPTOR_CONFIGURATION,
+                &mut config[..total_length],
+            ) else {
+                continue;
+            };
+            let Some(endpoint) = find_uac_playback_endpoint(&config[..read]) else { continue };
+            // bConfigurationValue is the configuration descriptor's 6th byte.
+            let config_value = config.get(5).copied().unwrap_or(0);
+            if controller.set_configuration(DEVICE_ADDRESS, max_packet0, config_value).is_err() {
+                continue;
+            }
+            if controller
+                .set_interface(DEVICE_ADDRESS, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
+                .is_err()
+            {
+                continue;
+            }
+            return Some((controller, endpoint));
+        }
+    }
+    None
+}
+
+/// Streams a raw PCM file already matching a discovered playback
+/// device's exact negotiated format (no resampling or reformatting --
+/// the same expectation every other audio backend here already has) to
+/// its isochronous OUT endpoint. Reuses the shared `pmem::TAPE_BASE`/
+/// `TAPE_LEN` staging buffer `copy`/`tape load`/NETFS already document
+/// sharing: because that buffer is one contiguous physical block, the
+/// isochronous engine's TD buffer pointers reference it directly, with
+/// no separate packet-buffer pool or copy step needed.
+fn usb_play_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
+    const DEVICE_ADDRESS: u8 = 1; // matches find_playback_device's own fixed address
+
+    let Some((controller, endpoint)) = find_playback_device() else {
+        println!("No USB Audio Class playback device found (needs PCM,");
+        println!("16-bit, a fixed rate divisible by 1000, and a");
+        println!("Synchronous/Adaptive isochronous OUT endpoint).");
+        return;
+    };
+    println!(
+        "Found endpoint 0x{:02x}: {} Hz/{}-bit/{}ch, {} bytes/packet.",
+        endpoint.endpoint_address, endpoint.sample_rate, endpoint.bits_per_sample, endpoint.channels,
+        endpoint.packet_bytes
+    );
+
+    let frame_bytes = u32::from(endpoint.channels) * (u32::from(endpoint.bits_per_sample) / 8);
+    let length = match fosfs::file_length(info, device, name) {
+        Ok(Some(length)) if length == 0 => {
+            println!("'{}' is empty; nothing to play.", core::str::from_utf8(name).unwrap_or("?"));
+            return;
+        }
+        Ok(Some(length)) if length > pmem::TAPE_LEN as u64 => {
+            println!("File is too large for the shared staging buffer.");
+            return;
+        }
+        Ok(Some(length)) => length as usize,
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    };
+    if length as u32 % frame_bytes != 0 {
+        println!(
+            "'{}' length is not a whole number of {}-byte frames.",
+            core::str::from_utf8(name).unwrap_or("?"),
+            frame_bytes
+        );
+        return;
+    }
+
+    let Some(address) = allocate_tape_buffer(length as u32) else { return };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
+    match fosfs::read(info, device, name, buffer) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            println!("File not found.");
+            return;
+        }
+        Err(error) => {
+            println!("FOSFS disk error: {error:?}");
+            return;
+        }
+    }
+
+    let endpoint_number = endpoint.endpoint_address & 0x0f;
+    let mut stream = controller.start_isoc_out(DEVICE_ADDRESS, endpoint_number, endpoint.packet_bytes, address, length);
+
+    println!("Playing {length} byte(s); press F12 to stop early.");
+    let start_ticks = interrupts::ticks();
+    let mut aborted = false;
+    loop {
+        if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+            aborted = true;
+            break;
+        }
+        poll_background_work(None);
+        if stream.service(controller) == uhci::IsocStatus::Finished {
+            break;
+        }
+    }
+    stream.stop(controller);
+    // Courteous teardown: quiesce the streaming interface back to its
+    // zero-bandwidth alternate setting. A failure here isn't reported --
+    // the stream itself already finished or was aborted either way.
+    let _ = controller.set_interface(DEVICE_ADDRESS, 8, endpoint.interface_number, 0);
+
+    let elapsed_ms = interrupts::ticks().wrapping_sub(start_ticks) * 10; // 100 Hz PIT
+    if aborted {
+        println!("Playback stopped early after {elapsed_ms} ms.");
+    } else {
+        println!("Playback complete ({elapsed_ms} ms).");
+    }
+    let errors = stream.error_count();
+    if errors > 0 {
+        println!("Warning: {errors} isochronous packet(s) failed (lost audio).");
     }
 }
 
