@@ -69,7 +69,7 @@ EXTRA_FOSFS_FILES ?=
 # directory before invoking cargo.
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -471,12 +471,60 @@ tape-telnet:
 test-tape-telnet:
 	cargo +nightly-2026-09-13 test --manifest-path tapes/telnet/Cargo.toml --lib
 
+# Builds tapes/opus-codec's vendored libopus fixed-point decoder
+# (tapes/opus-codec/vendor/opus/) as a plain static archive -- this
+# project's first vendored C dependency, and the first build step that
+# invokes a C compiler directly rather than through Cargo. See
+# tapes/opus-codec/config.h and AGENTS.md's Opus section for the design
+# (why fixed-point, why decode-only, why no libm/malloc dependency).
+# Every vendored object compiles under -m32 -ffreestanding with the same
+# no-SSE/no-MMX/soft-float assumptions targets/i686-fos.json encodes, so
+# the resulting archive is ABI-compatible with the ordinary Rust tape
+# build and can be linked directly into a tape via RUSTFLAGS (see
+# tape-audio-rtp below) -- no build.rs, no #[link(...)], matching this
+# project's preference for every build step staying visible in this
+# Makefile rather than hidden in Cargo build-script magic.
+#
+# The vendored tree is already trimmed to exactly the celt/silk/opus
+# source files a decode-only build needs (no encoder, no ARM/x86 SIMD, no
+# custom-modes support), so a plain wildcard over its three source
+# directories is the whole file list -- nothing to keep in sync by hand.
+OPUS_CODEC_VENDOR := tapes/opus-codec/vendor/opus
+OPUS_CODEC_SOURCES := $(wildcard $(OPUS_CODEC_VENDOR)/celt/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/silk/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/src/*.c)
+OPUS_CODEC_OBJS := $(patsubst $(OPUS_CODEC_VENDOR)/%.c,$(BUILD)/tapes/opus-codec/%.o,$(OPUS_CODEC_SOURCES))
+OPUS_CODEC_LIB := $(BUILD)/tapes/opus-codec/libopus_fixed.a
+OPUS_CODEC_CFLAGS := -m32 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -msoft-float -ffunction-sections -fdata-sections -DHAVE_CONFIG_H -Itapes/opus-codec -I$(OPUS_CODEC_VENDOR)/include -I$(OPUS_CODEC_VENDOR)/celt -I$(OPUS_CODEC_VENDOR)/silk -I$(OPUS_CODEC_VENDOR)/silk/fixed
+
+$(BUILD)/tapes/opus-codec/%.o: $(OPUS_CODEC_VENDOR)/%.c
+	mkdir -p $(dir $@)
+	gcc $(OPUS_CODEC_CFLAGS) -c $< -o $@
+
+$(OPUS_CODEC_LIB): $(OPUS_CODEC_OBJS)
+	ar rcs $@ $(OPUS_CODEC_OBJS)
+
+opus-codec-lib: $(OPUS_CODEC_LIB)
+
+test-tape-opus-codec:
+	# --test-threads=1: the allocator-shim tests share mutable statics
+	# standing in for the tape ABI's single-threaded "current allocator"
+	# (see src/lib.rs's CURRENT_ALLOC/CURRENT_FREE doc comment) and are not
+	# safe to run concurrently under the default multi-threaded test runner.
+	cargo +nightly-2026-09-13 test --manifest-path tapes/opus-codec/Cargo.toml --lib -- --test-threads=1
+
 # Builds the "audio-rtp" tape: real-time raw-PCM audio streaming over
 # standard RTP/UDP (RFC 3550), using tape-net's RtpPacket/UdpDatagram --
 # the standards-based counterpart to tape-audio-net's bespoke raw-Ethernet
 # protocol. See AGENTS.md and tapes/audio-rtp/src/main.rs's own doc comment.
-tape-audio-rtp:
-	cd tapes/audio-rtp && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+# Depends on opus-codec-lib (above) for its Opus decode path; RUSTFLAGS
+# adds the vendored archive to the linker's search path and links it in,
+# resolving tapes/opus-codec's `extern "C"` declarations against the real
+# libopus objects with no build.rs/#[link(...)] involved. The env var
+# RUSTFLAGS *replaces* (does not add to) tapes/audio-rtp/.cargo/config.toml's
+# own `rustflags`, so `-C link-arg=-Tlinker.ld` -- otherwise silently
+# dropped, breaking the tape's own entry point/layout -- must be repeated
+# here too.
+tape-audio-rtp: $(OPUS_CODEC_LIB)
+	cd tapes/audio-rtp && RUSTFLAGS="-C link-arg=-Tlinker.ld -L $(CURDIR)/$(BUILD)/tapes/opus-codec -l static=opus_fixed" cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
 	cp $(CARGO_TARGET_DIR)/i686-fos/release/audio-rtp-tape $(TAPE_AUDIO_RTP_BIN)
 
@@ -545,4 +593,4 @@ test-audio-multi: image
 # directories from before that change; harmless to list even once they no
 # longer exist, since `rm -rf` on a missing path is a no-op.
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/beep/target tapes/morse/target tapes/net-chat/target tapes/audio-net/target tapes/ip-chat/target tapes/telnet/target tapes/audio-rtp/target tapes/bridge/target tapes/router/target tapes/net-dhcp-test/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/beep/target tapes/morse/target tapes/net-chat/target tapes/audio-net/target tapes/ip-chat/target tapes/telnet/target tapes/audio-rtp/target tapes/opus-codec/target tapes/bridge/target tapes/router/target tapes/net-dhcp-test/target

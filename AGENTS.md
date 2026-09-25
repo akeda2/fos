@@ -1826,32 +1826,68 @@ second device needs a second, separately invoked session on a second
 port -- a real, standards-clean answer, just a narrower single-invocation
 feature than `audio-net`'s.
 
-**Codec support (Opus included) is out of scope, deliberately and
-indefinitely** -- not "not yet," but a considered exclusion. This tape
-moves raw PCM only. A real Opus decoder (SILK + CELT + a range coder) is
-thousands of lines of genuinely tricky fixed-point DSP, categorically
-larger than anything else in this project combined; proving the
-*transport* works against real tools first is the actual point of this
-tape, and remains true whether or not a codec is ever added on top of
-it later. If it is: libopus's own fixed-point reference decoder (BSD-
-licensed, designed for FPU-less embedded targets -- matching, not
-conflicting with, this kernel's own no-FPU convention) is the realistic
-path, as a vendored port, not a from-scratch reimplementation -- and
-note that FPU use itself would need no kernel ABI change at all if ever
-needed for something else: a tape runs in ring 0 with no privilege
-separation, so it can toggle `CR0`/`CR4`'s FPU-related bits itself,
-bracketed exactly like `tapes/longmode64_shim.S` already saves/restores
-`CR0`/`CR3`/`CR4`/`EFER` around its own mode switch.
+**Opus decode** is now built, via `tapes/opus-codec/` -- this project's
+first vendored C dependency, and its first build step that invokes a C
+compiler directly rather than through Cargo (the root Makefile's
+`opus-codec-lib` recipe, compiling `tapes/opus-codec/vendor/opus/` --
+libopus 1.5.2, BSD-3-Clause -- under the same `-m32`/no-SSE/no-MMX/
+soft-float flags `targets/i686-fos.json` implies, then linking the
+resulting archive into `tape-audio-rtp`'s build via `RUSTFLAGS`, no
+`build.rs`/`#[link(...)]` involved). It is the **fixed-point** decoder
+specifically, not the floating-point one: a real, systematic check (`nm
+-u` across every compiled object) found not one libm symbol anywhere in
+the decode-only build, matching this kernel's own no-FPU convention with
+no CR0/CR4 toggling needed, and fixed-point stays testable against known
+packet/PCM pairs in a way a float build (not guaranteed bit-identical to
+any particular reference decode) is not. `tapes/opus-codec/vendor/opus/`
+is trimmed to exactly the decode-only source files needed -- no encoder,
+no ARM/x86 SIMD, no custom-modes support (the non-custom-modes path uses
+libopus's own precomputed static CELT mode tables instead of building
+one at runtime, which is what makes decode allocation-free below the
+top-level state buffer) -- documented in `tapes/opus-codec/config.h`'s
+own header comment alongside the exact upstream version/URL.
 
-Verified end to end by `tapes/test_audio_rtp_e2e.py` (`NETWORKING.md` has
-the full description) -- hand-built, genuinely spec-compliant RTP/UDP/
-IPv4/Ethernet frames in Python, a real ARP round trip in both directions,
-deliberate loss/duplicate injection, and a WAV capture checked for the
-*correct pitch* windowed against ES1370's own built-in ~441 Hz test tone
-contaminating the same capture. Real-hardware interop (a genuine `ffmpeg`
-session against real fos hardware, and the 24-bit path this tape's
-format table already accounts for) remains future, documented, non-
-blocking work, exactly like ES1370/HDA's own real-hardware status above.
+The decoder's state buffer is sized and owned through the tape ABI's own
+`alloc`/`free` callbacks (`opus_decoder_get_size` + `opus_decoder_init`,
+never libopus's own malloc-backed `opus_decoder_create`); a small
+`custom_support.h` override point redirects libopus's internal
+`opus_alloc`/`opus_free` through those same callbacks instead of a libc
+allocator this freestanding target does not have, and `tapes/opus-codec/
+src/lib.rs` also provides a bare `abs()` -- one more libc symbol this
+build's `-fno-builtin` flag (needed for the freestanding build generally)
+incidentally stops GCC from inlining away on its own.
+
+`tapes/audio-rtp/src/main.rs`'s `listen_mode` recognizes a fourth, fixed
+dynamic payload type, `PAYLOAD_TYPE_OPUS` (98), decoding through a
+persistent `opus_codec::Decoder` instead of the raw-PCM repack path
+whenever the local device's own native format is 16-bit (this vendored
+build has no float API, so `opus_decode` only ever produces 16-bit PCM)
+*and* its sample rate is one of the five libopus accepts (8/12/16/24/
+48 kHz) -- ES1370's fixed 44100 Hz satisfies neither constraint, so Opus
+decode is HDA-only today, lining up exactly with HDA's own 48 kHz/16-bit
+negotiated format described above. This is **decode-only**: `send`/
+`capture` still move raw PCM exclusively, and always will. Opus encode,
+FEC, DTX, and any SDP/RTCP negotiation remain explicitly out of scope.
+
+Verified end to end by `tapes/test_audio_rtp_e2e.py` (raw PCM;
+`NETWORKING.md` has the full description) -- hand-built, genuinely
+spec-compliant RTP/UDP/IPv4/Ethernet frames in Python, a real ARP round
+trip in both directions, deliberate loss/duplicate injection, and a WAV
+capture checked for the *correct pitch* windowed against ES1370's own
+built-in ~441 Hz test tone contaminating the same capture -- and by the
+new `tapes/test_audio_rtp_opus_e2e.py` (Opus decode specifically): real
+RTP/Opus packets from an actual `ffmpeg`+`libopus` encode (not hand-built
+this time), decoded inside a real Intel HDA QEMU guest. That test's pitch
+check uses a dependency-free single-bin Goertzel DFT rather than the
+raw-PCM test's zero-crossing estimator, which proved too easily confused
+by a real Opus/HDA-underrun-bearing signal to trust for this one, even
+though the underlying decoded audio (cross-checked against an
+independent FFT during development) was already correct. Real-hardware
+interop (a genuine `ffmpeg` session against real fos hardware, and the
+24-bit path this tape's format table already accounts for -- Opus decode
+included, since it needs a 16-bit local device) remains future,
+documented, non-blocking work, exactly like ES1370/HDA's own
+real-hardware status above.
 
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 

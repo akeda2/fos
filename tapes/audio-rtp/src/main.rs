@@ -23,10 +23,11 @@
 //!
 //! `tape run` (listen mode, no stream args) queries device 0's real
 //! format (`audio_sample_rate_at`/`audio_channels_and_bits_at`, never
-//! hardcoded), picks the matching RTP payload type from
+//! hardcoded), picks the matching raw-PCM RTP payload type from
 //! `payload_type_for`, and waits on the configured UDP port for RTP
-//! packets carrying that payload type -- locking onto the first sender's
-//! SSRC ("first sender wins," matching `audio-net`/`tape_load_net`'s own
+//! packets carrying either that payload type or the fixed Opus payload
+//! type (`PAYLOAD_TYPE_OPUS`) -- locking onto the first sender's SSRC
+//! ("first sender wins," matching `audio-net`/`tape_load_net`'s own
 //! convention), tracking its sequence number to detect loss/reorder (a
 //! gap just resyncs forward and counts as loss, matching `audio-net`'s
 //! accepted best-effort philosophy -- there is no reorder/jitter buffer
@@ -50,8 +51,12 @@
 //! shell's one-foreground-tape-at-a-time model rules out true
 //! simultaneous multi-device sessions regardless of protocol -- a second
 //! device means invoking this tape again on a second port. There is no
-//! RTCP, no SDP, and no codec support (Opus or otherwise): this tape
-//! moves raw PCM only, by design, and always will.
+//! RTCP or SDP. `listen_mode` additionally recognizes one Opus payload
+//! type (`audio_rtp_tape::PAYLOAD_TYPE_OPUS`), decoded through
+//! `tapes/opus-codec`'s vendored fixed-point libopus decoder instead of
+//! the raw-PCM repack path -- see AGENTS.md's Opus section. This is
+//! decode-only: `send`/`capture` still move raw PCM exclusively, and
+//! always will.
 //!
 //! The tape uses no heap beyond `alloc`/`free`'s one bounded file-replay
 //! buffer, and does not own the NIC. IPv4 options, fragmentation, and
@@ -62,10 +67,12 @@
 use core::slice;
 
 use audio_rtp_tape::{
-    AudioFormat, DEFAULT_PORT, MAX_FRAME_LEN, NetworkMode, RTP_PAYLOAD_BYTES, StartupError,
-    StreamMode, as_u32, build_rtp_udp_frame, derive_stream_seed, initial_sequence_from_seed,
-    initial_timestamp_from_seed, parse_startup, payload_type_for, same_subnet, ssrc_from_seed,
+    AudioFormat, DEFAULT_PORT, MAX_FRAME_LEN, NetworkMode, PAYLOAD_TYPE_OPUS, RTP_PAYLOAD_BYTES,
+    StartupError, StreamMode, as_u32, build_rtp_udp_frame, derive_stream_seed,
+    initial_sequence_from_seed, initial_timestamp_from_seed, parse_startup, payload_type_for,
+    same_subnet, ssrc_from_seed,
 };
+use opus_codec::Decoder as OpusDecoder;
 use tape_net::{
     ArpCache, ArpOperation, ArpPacket, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClient,
     DhcpClientState, DhcpPacket, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthernetFrame, Ipv4Address,
@@ -87,6 +94,12 @@ const RECEIVE_INACTIVITY_TICKS: u64 = 500;
 /// supports: 24-bit's 3-byte-wire/4-byte-kernel-container expansion is
 /// the largest ratio this tape ever needs to hold at once.
 const KERNEL_PCM_SCRATCH_BYTES: usize = 2048;
+/// libopus's own largest supported frame duration (120 ms) at the
+/// highest rate this tape's devices ever report (48 kHz) -- the upper
+/// bound `opus_decode` is ever asked to produce per packet.
+const OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL: usize = 5760;
+/// Stereo-wide sample capacity for the Opus decode scratch buffer.
+const OPUS_PCM_SCRATCH_SAMPLES: usize = OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL * 2;
 
 const FS_OK: u32 = 0;
 const FS_NOT_FOUND: u32 = 1;
@@ -509,13 +522,17 @@ fn print_startup_error(putc: Putc, error: StartupError) {
 }
 
 /// Listen mode: waits for RTP packets carrying the local device's own
-/// payload type, locking onto the first sender's SSRC and tracking its
-/// sequence number for loss/reorder accounting. See this file's own
-/// module doc comment for the full policy.
+/// raw-PCM payload type, or the fixed Opus payload type
+/// (`PAYLOAD_TYPE_OPUS`) when the local device's format allows it,
+/// locking onto the first sender's SSRC and tracking its sequence
+/// number for loss/reorder accounting. See this file's own module doc
+/// comment for the full policy.
 #[allow(clippy::too_many_arguments)]
 fn listen_mode(
     putc: Putc,
     should_abort: ShouldAbort,
+    alloc: Alloc,
+    free: Free,
     nic_send: NicSend,
     nic_receive: NicReceive,
     ticks: Ticks,
@@ -545,9 +562,32 @@ fn listen_mode(
     print_u32(putc, u32::from(port));
     print_bytes(putc, b"; F12 (or F4/F6/F7/F8/F10) stops.\n");
 
+    // Opus decode always produces 16-bit PCM (this build has no float API);
+    // only offer it when the local device's own native format is 16-bit,
+    // so decoded output never needs a bit-depth conversion this tape does
+    // not implement. A device negotiated to 24-bit (HDA) keeps working on
+    // its own raw-PCM payload type above; it just cannot also accept Opus.
+    let mut opus_decoder = if format.bits_per_sample == 16 {
+        match OpusDecoder::new(format.sample_rate as i32, i32::from(format.channels), alloc, free) {
+            Ok(decoder) => {
+                print_bytes(putc, b"Opus decode also accepted (RTP payload type ");
+                print_u32(putc, u32::from(PAYLOAD_TYPE_OPUS));
+                print_bytes(putc, b").\n");
+                Some(decoder)
+            }
+            Err(_) => {
+                print_bytes(putc, b"audio-rtp: could not start Opus decoder; Opus packets will be ignored.\n");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut arp = ArpCache::<8>::new();
     let mut frame = [0u8; MAX_FRAME_LEN];
     let mut kernel_pcm = [0u8; KERNEL_PCM_SCRATCH_BYTES];
+    let mut opus_pcm = [0i16; OPUS_PCM_SCRATCH_SAMPLES];
     let mut locked: Option<(u32, u32)> = None; // (ssrc, source_ip as u32)
     let mut expected_sequence: u16 = 0;
     let mut packets_accepted = 0u64;
@@ -597,7 +637,8 @@ fn listen_mode(
         let Ok(rtp) = RtpPacket::parse(datagram.payload) else {
             continue;
         };
-        if rtp.payload_type != payload_type {
+        let is_opus = rtp.payload_type == PAYLOAD_TYPE_OPUS;
+        if rtp.payload_type != payload_type && !(is_opus && opus_decoder.is_some()) {
             continue;
         }
 
@@ -626,14 +667,39 @@ fn listen_mode(
 
         last_activity = raw_ticks(ticks);
         packets_accepted += 1;
-        let kernel_len = wire_to_kernel_pcm(rtp.payload, format.bits_per_sample, &mut kernel_pcm);
+
+        let submit_len = if is_opus {
+            let Some(decoder) = opus_decoder.as_mut() else {
+                continue;
+            };
+            match decoder.decode(rtp.payload, &mut opus_pcm, OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL) {
+                Ok(samples_per_channel) => {
+                    samples_per_channel * usize::from(format.channels) * size_of::<i16>()
+                }
+                Err(_) => {
+                    // A bad Opus packet is dropped, same "keep going, count
+                    // it as loss" policy as a sequence gap above -- there
+                    // is no error signalling back to the sender in RTP.
+                    bytes_dropped += rtp.payload.len() as u64;
+                    continue;
+                }
+            }
+        } else {
+            wire_to_kernel_pcm(rtp.payload, format.bits_per_sample, &mut kernel_pcm)
+        };
+        let pcm_bytes: &[u8] = if is_opus {
+            unsafe { slice::from_raw_parts(opus_pcm.as_ptr().cast::<u8>(), submit_len) }
+        } else {
+            &kernel_pcm[..submit_len]
+        };
+
         let mut offset = 0usize;
         let mut spins = 0u32;
-        while offset < kernel_len && spins < 64 {
+        while offset < submit_len && spins < 64 {
             let accepted = audio_submit_at(
                 0,
-                kernel_pcm[offset..kernel_len].as_ptr() as u32,
-                (kernel_len - offset) as u32,
+                pcm_bytes[offset..submit_len].as_ptr() as u32,
+                (submit_len - offset) as u32,
             ) as usize;
             if accepted == 0 {
                 spins += 1;
@@ -642,7 +708,7 @@ fn listen_mode(
             offset += accepted;
             bytes_submitted += accepted as u64;
         }
-        bytes_dropped += (kernel_len - offset) as u64;
+        bytes_dropped += (submit_len - offset) as u64;
     }
 
     print_bytes(putc, b"audio-rtp: ");
@@ -1000,6 +1066,8 @@ pub extern "C" fn tape_main(
         StreamMode::Listen { port } => listen_mode(
             putc,
             should_abort,
+            alloc,
+            free,
             nic_send,
             nic_receive,
             ticks,

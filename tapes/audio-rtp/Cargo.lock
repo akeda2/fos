@@ -6,9 +6,14 @@ version = 4
 name = "audio-rtp-tape"
 version = "0.1.0"
 dependencies = [
+ "opus-codec",
  "tape-net",
  "tape-rt",
 ]
+
+[[package]]
+name = "opus-codec"
+version = "0.1.0"
 
 [[package]]
 name = "tape-net"

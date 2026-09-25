@@ -1,0 +1,20 @@
+[package]
+name = "opus-codec"
+version = "0.1.0"
+edition = "2024"
+description = "Rust FFI wrapper around a vendored, fixed-point-only libopus decoder for fos tapes"
+license = "BSD-3-Clause"
+
+[lib]
+test = true
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = "symbols"

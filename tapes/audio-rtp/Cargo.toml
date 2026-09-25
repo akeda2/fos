@@ -30,3 +30,4 @@ tape-net = { path = "../tape-net" }
 
 [target.'cfg(target_os = "none")'.dependencies]
 tape-rt = { path = "../tape-rt" }
+opus-codec = { path = "../opus-codec" }

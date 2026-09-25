@@ -52,6 +52,16 @@ pub const PAYLOAD_TYPE_L16_44100_STEREO: u8 = 10;
 pub const PAYLOAD_TYPE_L16_48000_STEREO: u8 = 96;
 pub const PAYLOAD_TYPE_L24_48000_STEREO: u8 = 97;
 
+/// A fourth documented, unnegotiated dynamic-range convention: Opus
+/// (RFC 6716), decoded through `tapes/opus-codec`'s vendored fixed-point
+/// decoder (see AGENTS.md's Opus section). Unlike the three PCM entries
+/// above, this is not looked up by `payload_type_for` -- it is not a
+/// format a *local device* natively produces, it is a wire encoding
+/// `listen_mode` (main.rs) recognizes and decodes to whatever PCM format
+/// the local device actually needs, independent of the sender's own
+/// format. Decode-only: this tape does not encode/send Opus.
+pub const PAYLOAD_TYPE_OPUS: u8 = 98;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AudioFormat {
     pub sample_rate: u32,

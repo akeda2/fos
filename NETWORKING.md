@@ -655,9 +655,13 @@ manual test.
 `tapes/audio-net/`'s bespoke raw-Ethernet protocol. Any real RTP tool
 (`ffmpeg`, `gstreamer`, ...) can send to or receive from this tape
 directly; nothing about the wire format is fos-specific except the
-payload-type convention described in "RTP scope" above. Codec support
-(Opus or otherwise) is explicitly out of scope and deferred indefinitely
--- this tape moves raw PCM only, by design, and always will.
+payload-type convention described in "RTP scope" above. `send`/`capture`
+move raw PCM only, by design, and always will -- codec support there
+remains explicitly out of scope. `listen` mode additionally accepts one
+fixed Opus payload type, decoded through `tapes/opus-codec`'s vendored
+fixed-point libopus decoder; see `AGENTS.md`'s "Real-time audio streaming
+over RTP/UDP" section for the full design (vendoring rationale, the
+allocator override, and why decode is HDA-only).
 
 Startup forms put network configuration first, mirroring `tapes/telnet`'s
 own convention rather than `audio-net`'s mode-first shape (which has no
@@ -688,7 +692,14 @@ payload type from a small table:
 
 Any other combination is rejected outright (a clear error, not a
 resampling/requantization attempt) -- the same "don't build untestable
-generality" scope choice this project makes everywhere else.
+generality" scope choice this project makes everywhere else. `listen`
+mode additionally recognizes a fourth, fixed payload type, `98`
+(`PAYLOAD_TYPE_OPUS`), independent of this table -- it is not a format a
+local device natively produces, it is a wire encoding decoded to
+whatever PCM format the local device actually needs. It is only offered
+when the local device is 16-bit at one of libopus's five accepted decode
+rates (8/12/16/24/48 kHz); see `AGENTS.md` for why that makes it
+HDA-only today.
 
 **Listen mode** locks onto the first sender's SSRC ("first sender wins,"
 matching `audio-net`/`tape_load_net`'s own convention) and tracks its
@@ -747,6 +758,10 @@ engages network mode), and a send-mode round trip verified byte-for-byte
 against the original source file. Capture mode's own transport
 correctness is covered by the same code path `send_mode` already proves;
 QEMU's silent default ADC content gives it nothing further to verify.
+`tapes/test_audio_rtp_opus_e2e.py` is this file's Opus-decode sibling: it
+sources its RTP packets from a real `ffmpeg`+`libopus` encode rather than
+hand-building them, and runs against an Intel HDA guest (48 kHz/16-bit,
+one of libopus's accepted decode rates) instead of ES1370.
 
 A manual, non-automated sanity check against a real tool (e.g.
 `ffmpeg -re -i tone.wav -ar 44100 -ac 2 -f rtp rtp://<fos-ip>:5004`
@@ -791,6 +806,7 @@ python3 tapes/test_net_chat_e2e.py --nic e1000
 python3 tapes/test_ip_chat_e2e.py
 python3 tapes/test_telnet_e2e.py
 python3 tapes/test_audio_rtp_e2e.py
+python3 tapes/test_audio_rtp_opus_e2e.py
 ```
 
 The normal `make test` remains required for kernel or boot changes. Real
@@ -813,13 +829,9 @@ Moving those into the kernel would make the educational protocol code harder
 to inspect and would exceed the current project's intentionally small
 hardware boundary.
 
-RTCP, SDP-based negotiation, multi-SSRC session multiplexing, and any codec
-support (Opus included) for `tapes/audio-rtp/` are also deliberately
-deferred, indefinitely for the codec specifically: a real Opus decoder is a
-categorically larger undertaking (thousands of lines of fixed-point DSP --
-SILK, CELT, a range coder) than anything else in this project, and this
-tape's whole point is proving the *transport* works against real tools
-first. If it is ever attempted, the realistic path is vendoring libopus's
-own fixed-point reference decoder (designed for FPU-less embedded targets,
-matching this kernel's own no-FPU convention) rather than a from-scratch
-reimplementation.
+RTCP, SDP-based negotiation, and multi-SSRC session multiplexing remain
+deliberately deferred for `tapes/audio-rtp/`. Opus decode is no longer
+deferred -- see `AGENTS.md`'s "Real-time audio streaming over RTP/UDP"
+section for `tapes/opus-codec`'s vendored fixed-point libopus decoder.
+Opus *encode* (and FEC/DTX) remain out of scope: this tape's `send`/
+`capture` directions move raw PCM only, by design, and always will.
