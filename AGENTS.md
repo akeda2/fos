@@ -1963,52 +1963,69 @@ Full root-cause detail for every one of these (including the QEMU `-d int`/
 `-trace`-based diagnosis techniques used) is in
 `docs/history/real-hardware-notes.md`.
 
-### USB Legacy Support and USB-booted machines: a confirmed `usb` command hazard
+### USB audio and USB-boot media do not reliably coexist on real hardware
 
-**Confirmed on a real, physically tested USB-booting Pentium 4 machine**:
-running `usb` (or anything else that calls `uhci::initialize_all()` --
-`usb play`/`usb capture`/`audio`) and then any ordinary disk command
-(`ls`, `cat`, ...) fails with `FOSFS disk error: FirmwareFailure`
-(`disk.rs`'s BIOS EDD trampoline reporting that the `INT13h` extended-read
-call itself failed). `reboot soft` does not recover this either -- it
-fails with `FOS ERROR: kernel disk read failed.`, `boot/stage2.S`'s own
-from-scratch real-mode disk read, proving the breakage is at the
-firmware/hardware level (BIOS's own "USB Legacy Support" `INT13h`
-emulation, or the physical controller/device's own protocol state), not
-specific to the kernel's own trampoline. **Only a genuine hardware reset
-(`reset`/`reboot hard`'s 8042 pulse, or a physical power cycle) recovers
-it** -- `reboot soft` never touches the CPU's hardware RESET line, so
-BIOS's own broken legacy-USB state is never re-initialized by POST.
+**Confirmed on two different real machines, for two different reasons --
+neither fixable in software with the approach tried so far.**
+
+**Pentium 4 (USB-booting, UHCI)**: running `usb` (or anything else that
+calls `uhci::initialize_all()` -- `usb play`/`usb capture`/`audio`) and
+then any ordinary disk command (`ls`, `cat`, ...) fails with `FOSFS disk
+error: FirmwareFailure` (`disk.rs`'s BIOS EDD trampoline reporting that
+the `INT13h` extended-read call itself failed). `reboot soft` does not
+recover this either -- it fails with `FOS ERROR: kernel disk read
+failed.`, `boot/stage2.S`'s own from-scratch real-mode disk read, proving
+the breakage is at the firmware/hardware level (BIOS's own "USB Legacy
+Support" `INT13h` emulation, or the physical controller/device's own
+protocol state), not specific to the kernel's own trampoline. **Only a
+genuine hardware reset (`reset`/`reboot hard`'s 8042 pulse, or a physical
+power cycle) recovers it** -- `reboot soft` never touches the CPU's
+hardware RESET line, so BIOS's own broken legacy-USB state is never
+re-initialized by POST.
 
 Root cause: `uhci::initialize_all()` resets *every* UHCI controller it
-finds on the PCI bus, not just the one about to be used, and (until the
-fix below) `Uhci::reset_and_start` issued UHCI's Global Reset first,
-which per spec pulses a bus reset out to every device on every port of
-that controller -- including the boot device, if it happens to share a
-controller with (or simply be discovered alongside) whatever the `usb`
-command was actually trying to talk to. Picking a different physical
-port does not avoid this: `initialize_all` still discovers and resets
-every controller regardless of which one owns the device you're
-targeting.
+finds on the PCI bus, not just the one about to be used -- so picking a
+different physical port never avoids this, since `initialize_all` still
+discovers and resets every controller regardless of which one owns the
+device being targeted. The first fix attempted was dropping `Uhci::
+reset_and_start`'s Global Reset (which per spec pulses a bus reset out to
+every device on every port of a controller, not just a register-level
+reinit), relying on Host Controller Reset alone. **This did not fix it**
+-- re-tested on the same P4 machine, same `FirmwareFailure` result. This
+falsifies the original hypothesis that Global Reset specifically was the
+trigger: on this BIOS, Host Controller Reset alone -- the *minimum*
+register-level touch this driver's own correctness needs at all -- is
+already enough to break its legacy `INT13h` emulation. There is no
+gentler reset to fall back to; any OS-level initialization of the UHCI
+hardware this BIOS's legacy emulation depends on appears to break it.
+(The Global Reset removal itself is still kept -- it does strictly less
+than before and all QEMU UHCI tests, including `tapes/test_uhci_e2e.py`'s
+idempotent-re-enumeration check and `tapes/test_uhci_play_e2e.py`'s
+playback, remain unaffected -- it just isn't sufficient on its own.)
 
-**Fix applied, real-hardware re-verification still pending**:
-`reset_and_start` no longer issues Global Reset at all, relying on Host
-Controller Reset alone (which resets the controller's own internal
-state/schedule but, per spec, does not itself force a bus-level reset
-pulse to attached devices) -- Global Reset was never needed for this
-driver's own correctness, only incidentally harmful here. Confirmed in
-QEMU that enumeration (`tapes/test_uhci_e2e.py`, including its own
-idempotent-re-enumeration check) and isochronous playback
-(`tapes/test_uhci_play_e2e.py`) are both unaffected by this change. Not
-yet re-confirmed against the same physical Pentium 4 machine that found
-the bug -- until that happens, treat "any UHCI command on a USB-booted
-fos machine requires a hardware reset afterward" as still the safe
-assumption for that class of machine.
+**AMD Athlon 64 X2 (USB-booting, the same machine behind the A20/PIC/
+PIT/spurious-IRQ/RTL8139 findings above)**: cannot find *any* boot device
+at all -- BIOS's own POST-time "no boot device" failure -- whenever the
+USB audio device is physically connected, confirmed to happen before fos
+ever loads. This is not a fos bug and cannot be one: fos has not run yet
+at the point this fails. It is a hardware/firmware limitation of that
+machine's own USB enumeration at boot (most plausibly a device-count or
+power-budget limit, or boot-priority confusion once more than one USB
+mass-storage-adjacent device is present), independent of anything this
+project's driver code does.
 
-The complete, durable fix would be a native USB mass-storage driver (see
-"Deliberately deferred work" below), removing fos's dependency on BIOS
-continuing to own the controller for its own `INT13h` emulation once fos
-has taken it over -- a large, separate project, not attempted here.
+**Practical conclusion**: with the mitigation attempted so far, treat
+"don't use USB audio and USB-boot media together" as the safe assumption
+on real hardware, not a per-machine quirk to work around case by case.
+The remaining software options are a `debug`-file-style UHCI controller
+denylist (only useful if a given machine has multiple UHCI controllers
+and the boot drive and audio device can be split across them -- doesn't
+help the AMD machine's POST-time failure at all, since that happens
+before any denylist could take effect) or a native USB mass-storage
+driver (see "Deliberately deferred work" below), removing fos's
+dependency on BIOS continuing to own the controller for its own `INT13h`
+emulation once fos has taken it over -- a large, separate project, not
+attempted here, and the only option that would also help the P4 case.
 
 ### Talking to a real fos machine from a sandboxed dev environment
 

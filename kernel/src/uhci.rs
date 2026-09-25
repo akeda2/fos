@@ -48,6 +48,8 @@ const CMD_HCRESET: u16 = 1 << 1;
 // be used) -- and, unlike a normal crash, this is not recoverable by
 // `reboot soft` at all, only a genuine hardware reset, since BIOS's own
 // broken legacy-USB state is never re-initialized without a real POST.
+// Removing Global Reset alone did NOT fix this on that same machine,
+// though -- Host Controller Reset alone is already enough to break it.
 // See AGENTS.md's "Real hardware notes" section for the full story.
 
 const STS_HCHALTED: u16 = 1 << 5;
@@ -368,10 +370,17 @@ impl Uhci {
     /// function touches back to a known state, so Global Reset was never
     /// needed for this driver's own correctness, only for the (confirmed
     /// harmful, on real "USB Legacy Support" firmware) bus-reset pulse it
-    /// also happens to send to every attached device. Whether dropping it
-    /// actually avoids that harm on the same real hardware that found it
-    /// is still pending re-verification -- see the "Real hardware notes"
-    /// section in AGENTS.md.
+    /// also happens to send to every attached device. Dropping it was
+    /// re-tested on the same real Pentium 4 machine that found the
+    /// original bug and did **not** fix it -- Host Controller Reset alone
+    /// is already enough to break that BIOS's legacy `INT13h` emulation,
+    /// so there is no gentler register-level reset available to fall back
+    /// to. Kept anyway (it does strictly less than before, with no
+    /// downside in every QEMU UHCI test), but the underlying "USB audio
+    /// and USB-boot media don't reliably coexist" limitation is not
+    /// solved by this -- see the "Real hardware notes" section in
+    /// AGENTS.md for the full story and the two real machines that
+    /// confirmed it.
     fn reset_and_start(&self) {
         self.write_reg16(REG_USBCMD, CMD_HCRESET);
         for _ in 0..1000 {
