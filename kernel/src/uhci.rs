@@ -36,7 +36,19 @@ const REG_PORTSC2: u16 = 0x12;
 
 const CMD_RS: u16 = 1 << 0;
 const CMD_HCRESET: u16 = 1 << 1;
-const CMD_GRESET: u16 = 1 << 2;
+// Deliberately no `CMD_GRESET` ("Global Reset") constant: an earlier
+// version of `reset_and_start` issued it first, but Global Reset pulses
+// a bus reset out to every device on every port of this controller (not
+// just a register-level reinit of the controller itself, which
+// `CMD_HCRESET` alone already covers). Confirmed on a real, physically
+// tested USB-booting Pentium 4 machine to break BIOS's own "USB Legacy
+// Support" `INT13h` emulation for the boot device once `usb`/`audio`/
+// `usb play`/`usb capture` resets *any* discovered UHCI controller
+// (`initialize_all` resets every one found, not just the one about to
+// be used) -- and, unlike a normal crash, this is not recoverable by
+// `reboot soft` at all, only a genuine hardware reset, since BIOS's own
+// broken legacy-USB state is never re-initialized without a real POST.
+// See AGENTS.md's "Real hardware notes" section for the full story.
 
 const STS_HCHALTED: u16 = 1 << 5;
 
@@ -348,14 +360,19 @@ impl Uhci {
         }
     }
 
-    /// Global Reset, then Host Controller Reset, then program the Frame
-    /// List and start the controller with every frame pointing at the one
-    /// control Queue Head (which starts out empty -- Terminate set).
+    /// Host Controller Reset, then program the Frame List and start the
+    /// controller with every frame pointing at the one control Queue Head
+    /// (which starts out empty -- Terminate set). Deliberately no Global
+    /// Reset here -- see `CMD_HCRESET`'s neighboring doc comment above for
+    /// why: Host Controller Reset alone already puts every register this
+    /// function touches back to a known state, so Global Reset was never
+    /// needed for this driver's own correctness, only for the (confirmed
+    /// harmful, on real "USB Legacy Support" firmware) bus-reset pulse it
+    /// also happens to send to every attached device. Whether dropping it
+    /// actually avoids that harm on the same real hardware that found it
+    /// is still pending re-verification -- see the "Real hardware notes"
+    /// section in AGENTS.md.
     fn reset_and_start(&self) {
-        self.write_reg16(REG_USBCMD, CMD_GRESET);
-        wait_ticks(2);
-        self.write_reg16(REG_USBCMD, 0);
-
         self.write_reg16(REG_USBCMD, CMD_HCRESET);
         for _ in 0..1000 {
             if self.read_reg16(REG_USBCMD) & CMD_HCRESET == 0 {

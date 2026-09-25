@@ -1963,6 +1963,53 @@ Full root-cause detail for every one of these (including the QEMU `-d int`/
 `-trace`-based diagnosis techniques used) is in
 `docs/history/real-hardware-notes.md`.
 
+### USB Legacy Support and USB-booted machines: a confirmed `usb` command hazard
+
+**Confirmed on a real, physically tested USB-booting Pentium 4 machine**:
+running `usb` (or anything else that calls `uhci::initialize_all()` --
+`usb play`/`usb capture`/`audio`) and then any ordinary disk command
+(`ls`, `cat`, ...) fails with `FOSFS disk error: FirmwareFailure`
+(`disk.rs`'s BIOS EDD trampoline reporting that the `INT13h` extended-read
+call itself failed). `reboot soft` does not recover this either -- it
+fails with `FOS ERROR: kernel disk read failed.`, `boot/stage2.S`'s own
+from-scratch real-mode disk read, proving the breakage is at the
+firmware/hardware level (BIOS's own "USB Legacy Support" `INT13h`
+emulation, or the physical controller/device's own protocol state), not
+specific to the kernel's own trampoline. **Only a genuine hardware reset
+(`reset`/`reboot hard`'s 8042 pulse, or a physical power cycle) recovers
+it** -- `reboot soft` never touches the CPU's hardware RESET line, so
+BIOS's own broken legacy-USB state is never re-initialized by POST.
+
+Root cause: `uhci::initialize_all()` resets *every* UHCI controller it
+finds on the PCI bus, not just the one about to be used, and (until the
+fix below) `Uhci::reset_and_start` issued UHCI's Global Reset first,
+which per spec pulses a bus reset out to every device on every port of
+that controller -- including the boot device, if it happens to share a
+controller with (or simply be discovered alongside) whatever the `usb`
+command was actually trying to talk to. Picking a different physical
+port does not avoid this: `initialize_all` still discovers and resets
+every controller regardless of which one owns the device you're
+targeting.
+
+**Fix applied, real-hardware re-verification still pending**:
+`reset_and_start` no longer issues Global Reset at all, relying on Host
+Controller Reset alone (which resets the controller's own internal
+state/schedule but, per spec, does not itself force a bus-level reset
+pulse to attached devices) -- Global Reset was never needed for this
+driver's own correctness, only incidentally harmful here. Confirmed in
+QEMU that enumeration (`tapes/test_uhci_e2e.py`, including its own
+idempotent-re-enumeration check) and isochronous playback
+(`tapes/test_uhci_play_e2e.py`) are both unaffected by this change. Not
+yet re-confirmed against the same physical Pentium 4 machine that found
+the bug -- until that happens, treat "any UHCI command on a USB-booted
+fos machine requires a hardware reset afterward" as still the safe
+assumption for that class of machine.
+
+The complete, durable fix would be a native USB mass-storage driver (see
+"Deliberately deferred work" below), removing fos's dependency on BIOS
+continuing to own the controller for its own `INT13h` emulation once fos
+has taken it over -- a large, separate project, not attempted here.
+
 ### Talking to a real fos machine from a sandboxed dev environment
 
 `tools/send_tape.py`, `tools/term_net.py`, and `tools/send_frame.py` all
