@@ -689,6 +689,39 @@ impl Uhci {
         }
         stream
     }
+
+    /// Begins capturing up to `capacity` bytes of isochronous IN data
+    /// from `endpoint` on `device_addr` into caller-owned physical
+    /// memory at `base` (e.g. the shared tape staging buffer -- must
+    /// stay valid and unused by anything else for the capture's whole
+    /// duration), zero-copy exactly like `start_isoc_out`'s own `Buffer`
+    /// source. The caller must have already completed
+    /// `SET_CONFIGURATION`/`set_interface` for the capture alternate
+    /// setting. Primes the first `ISOC_TD_COUNT` Frame List entries
+    /// immediately; `IsocInStream::service` keeps that window filled and
+    /// harvests completed receive TDs as real time advances.
+    pub fn start_isoc_in(&self, device_addr: u8, endpoint: u8, packet_bytes: u16, base: u32, capacity: usize) -> IsocInStream {
+        let start_index =
+            (self.read_frame_number() & FRAME_INDEX_MASK).wrapping_add(STARTUP_GUARD_FRAMES) & FRAME_INDEX_MASK;
+        let mut stream = IsocInStream {
+            device_addr,
+            endpoint,
+            packet_bytes,
+            base,
+            capacity,
+            next_index: start_index,
+            requested_bytes: 0,
+            received_bytes: 0,
+            last_pool_slot: 0,
+            started_index: start_index,
+            entries_written: 0,
+            error_count: 0,
+        };
+        for _ in 0..ISOC_TD_COUNT {
+            stream.install_next(self);
+        }
+        stream
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -933,6 +966,170 @@ impl IsocOutStream {
     }
 }
 
+/// A single active isochronous IN stream (USB Audio Class capture),
+/// returned by `Uhci::start_isoc_in`. The mirror image of
+/// `IsocOutStream`, reusing the identical Frame-List-window-priming
+/// machinery (and, deliberately, the *same* per-controller isoc TD
+/// pool -- this plan's scope never runs playback and capture
+/// simultaneously, so a second pool isn't needed yet; duplex would need
+/// to revisit this), but with the data flow reversed in a way that
+/// changes exactly one thing structurally: for OUT, the driver already
+/// knows each packet's exact content before installing its TD; for IN,
+/// hardware decides how many bytes it actually sends (`ActLen`, read
+/// back via `decode_actlen` once `Active` clears), so a completed TD's
+/// data must be *harvested* -- read out and accounted for -- before its
+/// pool slot is reused for a fresh receive TD.
+///
+/// Zero-copy, exactly like `IsocOutStream`'s own `Buffer` source: each
+/// receive TD's buffer pointer is `base + requested_bytes`, a
+/// pre-computed offset directly into the caller's destination (the
+/// shared tape staging buffer, for `usb capture`), so hardware writes
+/// received samples straight into their final position with no
+/// intermediate copy pool. A short packet (`ActLen < packet_bytes`,
+/// legitimate under Adaptive sync) simply leaves whatever was already at
+/// the unwritten tail of that slot -- an accepted imprecision for a raw
+/// diagnostic capture, not a byte-exact protocol.
+pub struct IsocInStream {
+    device_addr: u8,
+    endpoint: u8,
+    packet_bytes: u16,
+    base: u32,
+    capacity: usize,
+    next_index: u16,
+    /// Upper-bound bytes ever requested (each installed TD's `MaxLen`
+    /// summed) -- known immediately at install time, the "should I
+    /// request more" check, exactly like `IsocOutStream`'s
+    /// `installed_bytes` for its `Buffer` source.
+    requested_bytes: usize,
+    /// Bytes actually confirmed received so far (summed `ActLen` across
+    /// every harvested TD) -- only known after a full round trip, and
+    /// the real count `usb capture` reports at the end.
+    received_bytes: usize,
+    last_pool_slot: usize,
+    started_index: u16,
+    entries_written: u32,
+    error_count: u32,
+}
+
+impl IsocInStream {
+    fn request_exhausted(&self) -> bool {
+        self.requested_bytes >= self.capacity
+    }
+
+    /// Reads back one already-completed receive TD's actual length and
+    /// error status, folding it into `received_bytes`/`error_count`.
+    /// Called for pool slot `slot` exactly once per TD ever installed
+    /// there -- either just before `install_next` reuses that slot for a
+    /// fresh receive TD, or, for the final un-recycled batch, from
+    /// `service`'s own tail scan once capture stops (mirroring
+    /// `IsocOutStream::service`'s identical tail-scan reasoning for
+    /// errors: every pool slot holds exactly the last TD ever written to
+    /// it, and any slot reused earlier was already harvested at that
+    /// reuse point, so scanning every slot once at the end is correct
+    /// and never double-counts).
+    fn harvest(&mut self, uhci: &Uhci, slot: usize) {
+        let control = uhci.read_isoc_td_control(slot);
+        if control & TD_CTRL_ERROR_MASK != 0 {
+            self.error_count += 1;
+            return;
+        }
+        self.received_bytes += decode_actlen(control);
+    }
+
+    /// Harvests the previous occupant of the next pool slot (if any),
+    /// then writes a fresh receive TD there and points this stream's
+    /// next Frame List entry at it. A no-op once `requested_bytes` has
+    /// already reached `capacity`.
+    fn install_next(&mut self, uhci: &Uhci) {
+        if self.request_exhausted() {
+            return;
+        }
+        let pool_slot = (self.entries_written as usize) % ISOC_TD_COUNT;
+        if self.entries_written as usize >= ISOC_TD_COUNT {
+            self.harvest(uhci, pool_slot);
+        }
+        let chunk = (self.capacity - self.requested_bytes).min(self.packet_bytes as usize);
+        let buffer_addr = self.base + self.requested_bytes as u32;
+        uhci.write_isoc_td(
+            pool_slot,
+            TD_CTRL_ACTIVE | TD_CTRL_IOS,
+            PID_IN
+                | (u32::from(self.device_addr) << TD_TOKEN_DEVICE_SHIFT)
+                | (u32::from(self.endpoint) << TD_TOKEN_ENDPOINT_SHIFT)
+                | (encode_len(chunk) << TD_TOKEN_MAXLEN_SHIFT),
+            buffer_addr,
+        );
+        uhci.write_frame_list_entry(self.next_index, uhci.isoc_td_addr(pool_slot));
+        self.last_pool_slot = pool_slot;
+        self.requested_bytes += chunk;
+        self.next_index = self.next_index.wrapping_add(1) & FRAME_INDEX_MASK;
+        self.entries_written += 1;
+    }
+
+    /// Keeps this stream's look-ahead window filled, and reports whether
+    /// it's done -- see `IsocOutStream::service`'s own doc comment for
+    /// why the window-tracking math must use a signed gap (a caller that
+    /// goes a while between calls must resync a few frames ahead of
+    /// *now*, not silently stall forever). Call this repeatedly from a
+    /// foreground polling loop (`usb capture`) -- there is no interrupt
+    /// driving an `IsocInStream` on its own.
+    pub fn service(&mut self, uhci: &Uhci) -> IsocStatus {
+        let current = uhci.read_frame_number() & FRAME_INDEX_MASK;
+
+        let raw_gap = self.next_index.wrapping_sub(current) & FRAME_INDEX_MASK;
+        let half = (FRAME_LIST_ENTRIES / 2) as i32;
+        let mut ahead = raw_gap as i32;
+        if ahead > half {
+            ahead -= FRAME_LIST_ENTRIES as i32;
+        }
+        if ahead < 0 {
+            self.next_index = current.wrapping_add(STARTUP_GUARD_FRAMES) & FRAME_INDEX_MASK;
+        }
+
+        while !self.request_exhausted() {
+            let raw_gap = self.next_index.wrapping_sub(current) & FRAME_INDEX_MASK;
+            let ahead = if raw_gap as i32 > half { raw_gap as i32 - FRAME_LIST_ENTRIES as i32 } else { raw_gap as i32 };
+            if ahead >= ISOC_TD_COUNT as i32 {
+                break;
+            }
+            self.install_next(uhci);
+        }
+        if self.request_exhausted() && uhci.read_isoc_td_control(self.last_pool_slot) & TD_CTRL_ACTIVE == 0 {
+            // The final `ISOC_TD_COUNT` receive TDs are never recycled by
+            // `install_next` (capture stops before their pool slot would
+            // be reused), so this is the only chance to harvest them.
+            for slot in 0..ISOC_TD_COUNT.min(self.entries_written as usize) {
+                self.harvest(uhci, slot);
+            }
+            return IsocStatus::Finished;
+        }
+        IsocStatus::Streaming
+    }
+
+    pub fn error_count(&self) -> u32 {
+        self.error_count
+    }
+
+    /// How many bytes have actually been confirmed received (harvested)
+    /// so far -- the real count `usb capture` reports, since a short
+    /// final packet or an error means this can be less than `capacity`.
+    pub fn received_bytes(&self) -> usize {
+        self.received_bytes
+    }
+
+    /// Restores every Frame List entry this stream ever wrote into back
+    /// to the control Queue Head -- identical to
+    /// `IsocOutStream::stop`'s own reasoning.
+    pub fn stop(&self, uhci: &Uhci) {
+        let restore_count = self.entries_written.min(FRAME_LIST_ENTRIES as u32);
+        let qh_link = uhci.qh_addr() | LINK_QH_SELECT;
+        for i in 0..restore_count {
+            let index = self.started_index.wrapping_add(i as u16) & FRAME_INDEX_MASK;
+            uhci.write_frame_list_entry(index, qh_link);
+        }
+    }
+}
+
 fn wait_ticks(count: u64) {
     let start = interrupts::ticks();
     while interrupts::ticks().wrapping_sub(start) < count {}
@@ -1039,26 +1236,26 @@ pub fn get(index: usize) -> Option<&'static Uhci> {
     }
 }
 
-/// A USB Audio Class 1.0 playback endpoint this driver can actually
-/// drive: PCM, 16-bit, a single fixed discrete sample rate divisible by
-/// 1000 (so every isochronous packet is the same fixed size for the
+/// A USB Audio Class 1.0 endpoint this driver can actually drive, either
+/// direction: PCM, 16-bit, a single fixed discrete sample rate divisible
+/// by 1000 (so every isochronous packet is the same fixed size for the
 /// whole stream -- a device like a 44100 Hz one, which would need a
 /// varying packet size frame-to-frame, is deliberately out of scope; see
 /// AGENTS.md's "USB" section), and a Synchronous or Adaptive (not
 /// Asynchronous, which would need an unimplemented feedback endpoint)
-/// isochronous OUT endpoint whose declared `wMaxPacketSize` is at least
-/// this nominal per-frame byte count. `packet_bytes` is always that
-/// computed *nominal* count, never the endpoint's own declared maximum:
-/// a real Adaptive-sync device (confirmed against a genuine USB Audio
-/// Class 1.0 sound card, not just QEMU's Synchronous-only emulated one)
+/// isochronous endpoint whose declared `wMaxPacketSize` is at least this
+/// nominal per-frame byte count. `packet_bytes` is always that computed
+/// *nominal* count, never the endpoint's own declared maximum: a real
+/// Adaptive-sync device (confirmed against a genuine USB Audio Class 1.0
+/// sound card, not just QEMU's Synchronous-only emulated one)
 /// legitimately declares some slack above nominal to tolerate a sample
 /// or so of clock drift per frame against its own crystal, but this
-/// driver always sends exactly the nominal size regardless -- correct
-/// and sufficient for a short stream, where that drift is negligible;
-/// real feedback-based rate adaptation for a long-running Adaptive
-/// stream remains explicitly out of scope, the same limit already
-/// covering Asynchronous sync devices outright.
-pub struct UacPlaybackEndpoint {
+/// driver always sends/expects exactly the nominal size regardless --
+/// correct and sufficient for a short stream, where that drift is
+/// negligible; real feedback-based rate adaptation for a long-running
+/// Adaptive stream remains explicitly out of scope, the same limit
+/// already covering Asynchronous sync devices outright.
+pub struct UacEndpoint {
     pub interface_number: u8,
     pub alternate_setting: u8,
     pub endpoint_address: u8,
@@ -1068,15 +1265,28 @@ pub struct UacPlaybackEndpoint {
     pub bits_per_sample: u8,
 }
 
+/// Both directions a UAC1 device might offer, discovered together from
+/// one `find_uac_device` pass -- a real device's playback and capture
+/// interfaces (e.g. a stereo speaker output alongside a mono microphone
+/// input) can have completely different formats, so callers must ask
+/// for whichever direction they need rather than assuming one shared
+/// format the way `es1370`/`hda`'s own real hardware happens to have.
+pub struct UacDevice {
+    pub playback: Option<UacEndpoint>,
+    pub capture: Option<UacEndpoint>,
+}
+
 /// Walks a configuration descriptor's raw bytes generically, one
 /// sub-descriptor at a time (each one's own `bLength` at byte 0),
 /// looking for one AudioStreaming alternate setting with a working
-/// isochronous OUT endpoint. See `UacPlaybackEndpoint`'s own doc comment
-/// for exactly which UAC1 shapes qualify; anything else (a continuous
-/// sample-rate range, Asynchronous sync, non-16-bit, or a declared
-/// packet size too small for the computed nominal one) is skipped
-/// rather than guessed at.
-fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
+/// isochronous endpoint in the requested direction (`want_in`: `false`
+/// for an OUT/playback endpoint, `true` for an IN/capture one). See
+/// `UacEndpoint`'s own doc comment for exactly which UAC1 shapes
+/// qualify; anything else (a continuous sample-rate range, Asynchronous
+/// sync, non-16-bit, the wrong direction, or a declared packet size too
+/// small for the computed nominal one) is skipped rather than guessed
+/// at.
+fn find_uac_endpoint(config: &[u8], want_in: bool) -> Option<UacEndpoint> {
     const DESC_INTERFACE: u8 = 0x04;
     const DESC_CS_INTERFACE: u8 = 0x24;
     const DESC_ENDPOINT: u8 = 0x05;
@@ -1088,7 +1298,7 @@ fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
     let mut offset = 0usize;
     let mut interface_number = 0u8;
     let mut alternate_setting = 0u8;
-    let mut in_playback_interface = false;
+    let mut in_streaming_interface = false;
     let mut format_ok = false;
     let mut sample_rate = 0u32;
     let mut channels = 0u8;
@@ -1112,11 +1322,11 @@ fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
                 // ("idle"/zero-bandwidth); this naturally skips it and
                 // only considers an alternate setting with a real
                 // streaming endpoint.
-                in_playback_interface =
+                in_streaming_interface =
                     class == CLASS_AUDIO && subclass == SUBCLASS_AUDIOSTREAMING && num_endpoints == 1;
                 format_ok = false;
             }
-            DESC_CS_INTERFACE if in_playback_interface && length >= 3 => {
+            DESC_CS_INTERFACE if in_streaming_interface && length >= 3 => {
                 let subtype = config[offset + 2];
                 if subtype == SUBTYPE_AS_GENERAL && length >= 7 {
                     let format_tag = u16::from_le_bytes([config[offset + 5], config[offset + 6]]);
@@ -1141,13 +1351,13 @@ fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
                     }
                 }
             }
-            DESC_ENDPOINT if in_playback_interface && format_ok && length >= 7 => {
+            DESC_ENDPOINT if in_streaming_interface && format_ok && length >= 7 => {
                 let endpoint_address = config[offset + 2];
                 let attributes = config[offset + 3];
                 let max_packet_size = u16::from_le_bytes([config[offset + 4], config[offset + 5]]);
                 let transfer_type = attributes & 0x03;
                 let sync_type = (attributes >> 2) & 0x03;
-                let is_out = endpoint_address & 0x80 == 0;
+                let is_in = endpoint_address & 0x80 != 0;
                 let is_isochronous = transfer_type == 0x01;
                 let sync_supported = sync_type == 0x02 || sync_type == 0x03; // Adaptive|Synchronous
                 let nominal_bytes =
@@ -1157,8 +1367,8 @@ fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
                 // Synchronous device) and real slack above it (a real
                 // Adaptive device) both qualify; too little room does not.
                 let usable_packet_size = sample_rate % 1000 == 0 && u32::from(max_packet_size) >= nominal_bytes;
-                if is_isochronous && is_out && sync_supported && usable_packet_size {
-                    return Some(UacPlaybackEndpoint {
+                if is_isochronous && is_in == want_in && sync_supported && usable_packet_size {
+                    return Some(UacEndpoint {
                         interface_number,
                         alternate_setting,
                         endpoint_address,
@@ -1177,14 +1387,22 @@ fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
 }
 
 /// Scans every discovered controller/port for a device offering a
-/// usable playback endpoint (`find_uac_playback_endpoint`), completing
-/// `SET_ADDRESS`/`SET_CONFIGURATION`/`set_interface` on the first match.
-/// Mirrors `enumerate_usb_port`'s own "reset and redo everything from
-/// scratch" sequence rather than depending on a separate, prior `usb`
-/// call having already addressed the device -- so `usb play` alone,
-/// with no `usb` run first, is always enough. Shared by the `usb play`
-/// shell command and `audio.rs`'s USB playback discovery.
-pub fn find_playback_device() -> Option<(&'static Uhci, UacPlaybackEndpoint)> {
+/// usable playback and/or capture endpoint (`find_uac_endpoint`,
+/// each direction independent -- a device may have only one, or, like
+/// this project's real TerraTec test card, both), completing
+/// `SET_ADDRESS`/`SET_CONFIGURATION` and `set_interface` for whichever
+/// direction(s) were actually found, all from *one* port
+/// reset/configuration pass. Both directions are discovered together
+/// deliberately, not via two independent calls: this project found,
+/// empirically, that two full resets of the same real device back to
+/// back with no settle time between them can intermittently fail (see
+/// AGENTS.md's "USB" section) -- unifying discovery into one pass avoids
+/// ever risking that within a single boot. Mirrors
+/// `enumerate_usb_port`'s own "reset and redo everything from scratch"
+/// sequence rather than depending on a separate, prior `usb` call having
+/// already addressed the device. Shared by the `usb play`/`usb capture`
+/// shell commands and `audio.rs`'s USB playback discovery.
+pub fn find_uac_device() -> Option<(&'static Uhci, UacDevice)> {
     const DEVICE_ADDRESS: u8 = 1;
 
     for index in 0..count() {
@@ -1220,19 +1438,30 @@ pub fn find_playback_device() -> Option<(&'static Uhci, UacPlaybackEndpoint)> {
             ) else {
                 continue;
             };
-            let Some(endpoint) = find_uac_playback_endpoint(&config[..read]) else { continue };
+            let playback = find_uac_endpoint(&config[..read], false);
+            let capture = find_uac_endpoint(&config[..read], true);
+            if playback.is_none() && capture.is_none() {
+                continue;
+            }
             // bConfigurationValue is the configuration descriptor's 6th byte.
             let config_value = config.get(5).copied().unwrap_or(0);
             if controller.set_configuration(DEVICE_ADDRESS, max_packet0, config_value).is_err() {
                 continue;
             }
-            if controller
-                .set_interface(DEVICE_ADDRESS, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
-                .is_err()
-            {
+            let playback = playback.filter(|endpoint| {
+                controller
+                    .set_interface(DEVICE_ADDRESS, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
+                    .is_ok()
+            });
+            let capture = capture.filter(|endpoint| {
+                controller
+                    .set_interface(DEVICE_ADDRESS, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
+                    .is_ok()
+            });
+            if playback.is_none() && capture.is_none() {
                 continue;
             }
-            return Some((controller, endpoint));
+            return Some((controller, UacDevice { playback, capture }));
         }
     }
     None
@@ -1249,7 +1478,7 @@ pub fn find_playback_device() -> Option<(&'static Uhci, UacPlaybackEndpoint)> {
 /// one foreground command/tape drives this kernel at a time).
 pub struct UsbAudioDevice {
     controller: &'static Uhci,
-    endpoint: UacPlaybackEndpoint,
+    endpoint: UacEndpoint,
     ring: &'static audio::PcmRing,
     stream: UnsafeCell<IsocOutStream>,
 }
@@ -1360,8 +1589,9 @@ pub fn discover_playback_device() -> Option<&'static UsbAudioDevice> {
         USB_AUDIO_DISCOVERED = true;
     }
 
-    let (controller, endpoint) = find_playback_device()?;
-    const DEVICE_ADDRESS: u8 = 1; // matches find_playback_device's own fixed address
+    let (controller, device) = find_uac_device()?;
+    let endpoint = device.playback?;
+    const DEVICE_ADDRESS: u8 = 1; // matches find_uac_device's own fixed address
     let endpoint_number = endpoint.endpoint_address & 0x0f;
     let stream =
         controller.start_isoc_ring_out(DEVICE_ADDRESS, endpoint_number, endpoint.packet_bytes, &USB_AUDIO_RING)?;

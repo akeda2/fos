@@ -995,7 +995,7 @@ fn enumerate_usb_port(port_number: u8, controller: &uhci::Uhci, port: u8) {
 /// transfer -- see `uhci.rs`'s `IsocOutStream` and AGENTS.md's "USB"
 /// section for the design.
 fn usb_command(info: &BootInfo, arguments: &[u8]) {
-    const USAGE: &str = "Usage: usb | usb play [diskN] NAME";
+    const USAGE: &str = "Usage: usb | usb play [diskN] NAME | usb capture [diskN] NAME";
 
     if arguments.is_empty() {
         print_usb_devices();
@@ -1013,6 +1013,16 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
         usb_play_command(info, device, name);
         return;
     }
+    if first.eq_ignore_ascii_case(b"capture") {
+        let (device, remainder) = parse_disk_and_one_argument(remainder);
+        let (name, trailing) = take_word(remainder);
+        if name.is_empty() || !trailing.is_empty() {
+            println!("{USAGE}");
+            return;
+        }
+        usb_capture_command(info, device, name);
+        return;
+    }
 
     println!("{USAGE}");
 }
@@ -1026,9 +1036,10 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
 /// isochronous engine's TD buffer pointers reference it directly, with
 /// no separate packet-buffer pool or copy step needed.
 fn usb_play_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
-    const DEVICE_ADDRESS: u8 = 1; // matches uhci::find_playback_device's own fixed address
+    const DEVICE_ADDRESS: u8 = 1; // matches uhci::find_uac_device's own fixed address
 
-    let Some((controller, endpoint)) = uhci::find_playback_device() else {
+    let found = uhci::find_uac_device().and_then(|(controller, uac)| Some((controller, uac.playback?)));
+    let Some((controller, endpoint)) = found else {
         println!("No USB Audio Class playback device found (needs PCM,");
         println!("16-bit, a fixed rate divisible by 1000, and a");
         println!("Synchronous/Adaptive isochronous OUT endpoint).");
@@ -1114,6 +1125,91 @@ fn usb_play_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
     let errors = stream.error_count();
     if errors > 0 {
         println!("Warning: {errors} isochronous packet(s) failed (lost audio).");
+    }
+}
+
+/// Captures raw isochronous IN audio from a discovered USB Audio Class
+/// capture device into the shared `pmem::TAPE_BASE`/`TAPE_LEN` staging
+/// buffer (the same one `usb play` reuses for the opposite direction),
+/// until either that buffer's 4 MiB capacity is reached or the operator
+/// presses F12, then writes exactly however many bytes were actually
+/// received out to the named FOSFS file. Raw device format, no
+/// resampling/reformatting -- the same expectation every other audio
+/// backend here already has for playback.
+fn usb_capture_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
+    const DEVICE_ADDRESS: u8 = 1; // matches uhci::find_uac_device's own fixed address
+
+    let found = uhci::find_uac_device().and_then(|(controller, uac)| Some((controller, uac.capture?)));
+    let Some((controller, endpoint)) = found else {
+        println!("No USB Audio Class capture device found (needs PCM,");
+        println!("16-bit, a fixed rate divisible by 1000, and a");
+        println!("Synchronous/Adaptive isochronous IN endpoint).");
+        return;
+    };
+    println!(
+        "Found endpoint 0x{:02x}: {} Hz/{}-bit/{}ch, {} bytes/packet.",
+        endpoint.endpoint_address, endpoint.sample_rate, endpoint.bits_per_sample, endpoint.channels,
+        endpoint.packet_bytes
+    );
+
+    let frame_bytes = u32::from(endpoint.channels) * (u32::from(endpoint.bits_per_sample) / 8);
+    let capacity = (pmem::TAPE_LEN / frame_bytes) * frame_bytes;
+    let Some(address) = allocate_tape_buffer(capacity) else { return };
+
+    let endpoint_number = endpoint.endpoint_address & 0x0f;
+    let mut stream =
+        controller.start_isoc_in(DEVICE_ADDRESS, endpoint_number, endpoint.packet_bytes, address, capacity as usize);
+
+    println!("Capturing up to {capacity} byte(s); press F12 to stop early.");
+    let start_ticks = interrupts::ticks();
+    let mut aborted = false;
+    loop {
+        if matches!(keyboard::poll_term_event(), Some(keyboard::KeyEvent::Escape)) {
+            aborted = true;
+            break;
+        }
+        poll_background_work(None);
+        if stream.service(controller) == uhci::IsocStatus::Finished {
+            break;
+        }
+    }
+    stream.stop(controller);
+    // Courteous teardown: quiesce the streaming interface back to its
+    // zero-bandwidth alternate setting. A failure here isn't reported --
+    // the stream itself already finished or was aborted either way.
+    let _ = controller.set_interface(DEVICE_ADDRESS, 8, endpoint.interface_number, 0);
+
+    let elapsed_ms = interrupts::ticks().wrapping_sub(start_ticks) * 10; // 100 Hz PIT
+    let received = stream.received_bytes();
+    if aborted {
+        println!("Capture stopped early after {elapsed_ms} ms ({received} byte(s)).");
+    } else {
+        println!("Capture complete ({elapsed_ms} ms, {received} byte(s)).");
+    }
+    let errors = stream.error_count();
+    if errors > 0 {
+        println!("Warning: {errors} isochronous packet(s) failed (lost audio).");
+    }
+
+    if received == 0 {
+        println!("Nothing captured; not writing a file.");
+        return;
+    }
+    let captured = unsafe { core::slice::from_raw_parts(address as *const u8, received) };
+    match fosfs::write(info, device, name, captured) {
+        Ok(fosfs::WriteOutcome::Written) => {
+            println!("Wrote {received} byte(s) to '{}'.", core::str::from_utf8(name).unwrap_or("?"));
+        }
+        Ok(fosfs::WriteOutcome::InvalidName) => {
+            println!("Invalid name: use up to 16 lowercase letters, digits, '.', '_', or '-'.");
+        }
+        Ok(fosfs::WriteOutcome::DirectoryFull) => {
+            println!("Directory full: all 64 FOSFS entries are in use.")
+        }
+        Ok(fosfs::WriteOutcome::DataFull) => {
+            println!("Data region full: no free sector remains in the FOSFS partition.")
+        }
+        Err(error) => println!("FOSFS disk error: {error:?}"),
     }
 }
 
