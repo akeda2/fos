@@ -1865,29 +1865,76 @@ build has no float API, so `opus_decode` only ever produces 16-bit PCM)
 *and* its sample rate is one of the five libopus accepts (8/12/16/24/
 48 kHz) -- ES1370's fixed 44100 Hz satisfies neither constraint, so Opus
 decode is HDA-only today, lining up exactly with HDA's own 48 kHz/16-bit
-negotiated format described above. This is **decode-only**: `send`/
-`capture` still move raw PCM exclusively, and always will. Opus encode,
-FEC, DTX, and any SDP/RTCP negotiation remain explicitly out of scope.
+negotiated format described above.
+
+**Opus encode** followed the same vendoring discipline, added to
+`send`/`capture` via `send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]`/
+`capture [opus] PEER_IP [PEER_PORT] [BITRATE]` (`opus_codec::Encoder`,
+same tape-ABI-backed allocation pattern as `Decoder`, never libopus's
+malloc-backed `opus_encoder_create`). `BITRATE` defaults to
+`opus_codec::DEFAULT_BITRATE_BPS` (96 kbps, Opus's conventional
+"transparent for 48 kHz stereo" floor) when omitted; complexity is
+hardcoded at libopus's maximum (10) and the application at
+`OPUS_APPLICATION_AUDIO`, neither exposed as a choice -- this project's
+real-hardware floor is Pentium 4, and Opus's CPU cost even at max
+complexity is trivial for that era of hardware, so there is no target-
+hardware reason to ever want either lower. The same HDA-only-for-Opus
+asymmetry applies to this direction too, for the identical reason.
+
+Building this surfaced a real, previously-undiscovered stack-overflow
+bug, not a decode-side concern at all: `tapes/opus-codec/vendor/opus/`
+originally used libopus's `VAR_ARRAYS` scratch-allocation mode (plain C99
+variable-length arrays on the real call stack) for both directions, which
+decode alone never grows large enough to matter for -- but the *encoder*'s
+SILK pipeline (LPC/pitch/noise-shaping analysis, several KB of VLA-based
+scratch nested many calls deep) reliably hit fos's kernel stack guard
+page the moment a real tape build exercised it, exactly the "tapes run
+nested inside the shell's own call chain on the kernel's shared stack"
+hazard `entry.S`'s own doc comment already warns about. Two independent
+fixes were needed: moving `send_mode`/`capture_mode`'s own PCM/packet
+scratch buffers off the stack and through the tape ABI's `alloc`
+callback instead (mirroring `send_mode`'s pre-existing file-buffer
+pattern), and -- the deeper fix -- switching `config.h` from
+`VAR_ARRAYS` to libopus's `NONTHREADSAFE_PSEUDOSTACK` mode, which moves
+*all* of celt/silk's internal scratch allocation onto one lazily-
+allocated, heap-backed buffer (via the already-existing `opus_alloc`
+override, needing no new code) instead of the real machine stack --
+"nonthreadsafe" is a non-issue here, matching every other single-
+threaded, no-concurrency `static mut` this codebase already relies on.
+The first fix alone was not sufficient; only the second one actually
+resolved it, confirming the SILK encoder's own internal stack pressure
+was the dominant cause, not this tape's own new locals.
 
 Verified end to end by `tapes/test_audio_rtp_e2e.py` (raw PCM;
 `NETWORKING.md` has the full description) -- hand-built, genuinely
 spec-compliant RTP/UDP/IPv4/Ethernet frames in Python, a real ARP round
 trip in both directions, deliberate loss/duplicate injection, and a WAV
 capture checked for the *correct pitch* windowed against ES1370's own
-built-in ~441 Hz test tone contaminating the same capture -- and by the
-new `tapes/test_audio_rtp_opus_e2e.py` (Opus decode specifically): real
-RTP/Opus packets from an actual `ffmpeg`+`libopus` encode (not hand-built
-this time), decoded inside a real Intel HDA QEMU guest. That test's pitch
-check uses a dependency-free single-bin Goertzel DFT rather than the
-raw-PCM test's zero-crossing estimator, which proved too easily confused
-by a real Opus/HDA-underrun-bearing signal to trust for this one, even
-though the underlying decoded audio (cross-checked against an
-independent FFT during development) was already correct. Real-hardware
+built-in ~441 Hz test tone contaminating the same capture -- and by
+`tapes/test_audio_rtp_opus_e2e.py` (Opus decode): real RTP/Opus packets
+from an actual `ffmpeg`+`libopus` encode (not hand-built this time),
+decoded inside a real Intel HDA QEMU guest. That test's pitch check uses
+a dependency-free single-bin Goertzel DFT rather than the raw-PCM test's
+zero-crossing estimator, which proved too easily confused by a real
+Opus/HDA-underrun-bearing signal to trust for this one, even though the
+underlying decoded audio (cross-checked against an independent FFT
+during development) was already correct. `tapes/test_audio_rtp_opus_send_e2e.py`
+covers the reverse direction (Opus encode): a known tone seeded into
+FOSFS, encoded for real by the kernel's `send opus` path, and decoded
+back by a small *host-side* build of this same vendored decoder
+(compiled fresh from `tapes/opus-codec/vendor/opus/` at test time, rather
+than depending on a second implementation like `ffmpeg` to cross-check
+against) to verify pitch and duration. Both Opus e2e tests use `-accel
+kvm` when available (see `kvm_available()` in either test file) -- a
+QEMU/TCG software-emulation timing artifact (any tight, uninterrupted
+guest busy loop starves QEMU's own timer/interrupt delivery under plain
+TCG, the same root cause `tapes/test_audio_net_real_mic_e2e.py` already
+found and fixed this way), not a real target-hardware concern. Two-way
+duplex (simultaneous `listen`+`send` in one invocation) and real-hardware
 interop (a genuine `ffmpeg` session against real fos hardware, and the
-24-bit path this tape's format table already accounts for -- Opus decode
-included, since it needs a 16-bit local device) remains future,
-documented, non-blocking work, exactly like ES1370/HDA's own
-real-hardware status above.
+24-bit path this tape's format table already accounts for -- Opus
+included, since it needs a 16-bit local device) remain future work,
+the former planned as a follow-on now that encode itself is proven.
 
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 

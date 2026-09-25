@@ -67,12 +67,12 @@
 use core::slice;
 
 use audio_rtp_tape::{
-    AudioFormat, DEFAULT_PORT, MAX_FRAME_LEN, NetworkMode, PAYLOAD_TYPE_OPUS, RTP_PAYLOAD_BYTES,
-    StartupError, StreamMode, as_u32, build_rtp_udp_frame, derive_stream_seed,
+    AudioFormat, Codec, DEFAULT_PORT, MAX_FRAME_LEN, NetworkMode, PAYLOAD_TYPE_OPUS,
+    RTP_PAYLOAD_BYTES, StartupError, StreamMode, as_u32, build_rtp_udp_frame, derive_stream_seed,
     initial_sequence_from_seed, initial_timestamp_from_seed, parse_startup, payload_type_for,
     same_subnet, ssrc_from_seed,
 };
-use opus_codec::Decoder as OpusDecoder;
+use opus_codec::{Decoder as OpusDecoder, Encoder as OpusEncoder};
 use tape_net::{
     ArpCache, ArpOperation, ArpPacket, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClient,
     DhcpClientState, DhcpPacket, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthernetFrame, Ipv4Address,
@@ -100,6 +100,16 @@ const KERNEL_PCM_SCRATCH_BYTES: usize = 2048;
 const OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL: usize = 5760;
 /// Stereo-wide sample capacity for the Opus decode scratch buffer.
 const OPUS_PCM_SCRATCH_SAMPLES: usize = OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL * 2;
+/// Encode side: a fixed 20 ms frame duration (one of libopus's accepted
+/// frame lengths at every rate it supports), not exposed as a choice --
+/// matches this tape's existing "don't build untestable generality"
+/// convention.
+const OPUS_FRAMES_PER_SECOND: usize = 1000 / 20;
+/// Stereo-wide sample capacity for one 20 ms encode frame at the highest
+/// rate this tape's devices ever report (48 kHz) -- Opus `send`/
+/// `capture` are effectively HDA-only for the same reason decode is (see
+/// `listen_mode`'s own doc comment), so this is already the worst case.
+const OPUS_ENCODE_FRAME_CAPACITY_SAMPLES: usize = (48_000 / OPUS_FRAMES_PER_SECOND) * 2;
 
 const FS_OK: u32 = 0;
 const FS_NOT_FOUND: u32 = 1;
@@ -510,15 +520,19 @@ fn print_startup_error(putc: Putc, error: StartupError) {
         StartupError::BadAddress => b"invalid dotted IPv4 address",
         StartupError::BadNetmask => b"invalid netmask/prefix",
         StartupError::BadPort => b"invalid port number",
+        StartupError::BadBitrate => b"invalid bitrate (bits/sec)",
         StartupError::MissingName => b"missing file name",
     };
     print_bytes(putc, b"audio-rtp startup error: ");
     print_bytes(putc, detail);
-    print_bytes(
-        putc,
-        b".\nUsage: tape run static LOCAL_IP/PREFIX GATEWAY [PORT|send NAME PEER_IP [PORT]|capture PEER_IP [PORT]]\n\
-       or     tape run dhcp [PORT|send NAME PEER_IP [PORT]|capture PEER_IP [PORT]]\n",
-    );
+    // Split across several print_bytes calls (rather than one long line)
+    // to stay within AGENTS.md's 79-column-per-line convention -- this
+    // grew too long for one line once `opus`/`BITRATE` joined `PORT`.
+    print_bytes(putc, b".\nUsage: tape run static LOCAL_IP/PREFIX GATEWAY [MODE]\n");
+    print_bytes(putc, b"   or  tape run dhcp [MODE]\n");
+    print_bytes(putc, b"MODE: PORT\n");
+    print_bytes(putc, b"    | send [opus] NAME PEER_IP [PORT] [BITRATE]\n");
+    print_bytes(putc, b"    | capture [opus] PEER_IP [PORT] [BITRATE]\n");
 }
 
 /// Listen mode: waits for RTP packets carrying the local device's own
@@ -740,6 +754,7 @@ fn send_mode(
     name: &[u8],
     peer_ip: Ipv4Address,
     peer_port: u16,
+    codec: Codec,
     audio_count: AudioCount,
     audio_sample_rate_at: AudioSampleRateAt,
     audio_channels_and_bits_at: AudioChannelsAndBitsAt,
@@ -753,6 +768,14 @@ fn send_mode(
         print_format(putc, format);
         print_bytes(putc, b") has no documented RTP payload type; cannot stream.\n");
         return;
+    };
+    let opus_bitrate = match codec {
+        Codec::Opus { .. } if format.bits_per_sample != 16 => {
+            print_bytes(putc, b"audio-rtp: Opus send needs a 16-bit device format.\n");
+            return;
+        }
+        Codec::Opus { bitrate_bps } => Some(bitrate_bps.unwrap_or(opus_codec::DEFAULT_BITRATE_BPS)),
+        Codec::Raw => None,
     };
 
     let mut file_length = 0u64;
@@ -810,7 +833,7 @@ fn send_mode(
 
     print_bytes(putc, b"audio-rtp: sending ");
     print_u32(putc, read_length);
-    print_bytes(putc, b" byte(s) of raw PCM (");
+    print_bytes(putc, if opus_bitrate.is_some() { b" byte(s) of PCM, Opus-encoded (" } else { b" byte(s) of raw PCM (" });
     print_format(putc, format);
     print_bytes(putc, b") to ");
     print_ip(putc, peer_ip);
@@ -819,62 +842,145 @@ fn send_mode(
     print_bytes(putc, b"...\n");
 
     let buffer = unsafe { slice::from_raw_parts(address as *const u8, read_length as usize) };
-    let bytes_per_frame = u32::from(format.channels) * (u32::from(format.bits_per_sample) / 8);
-    let bytes_per_sec = u64::from(format.sample_rate) * u64::from(bytes_per_frame);
-    let wire_bytes_per_sample: usize = if format.bits_per_sample == 24 { 3 } else { 2 };
-    let kernel_bytes_per_sample: usize = if format.bits_per_sample == 24 { 4 } else { 2 };
-    let samples_per_packet = RTP_PAYLOAD_BYTES / wire_bytes_per_sample;
-    let kernel_chunk = samples_per_packet * kernel_bytes_per_sample;
-
     let seed = derive_stream_seed(own_mac, raw_ticks(ticks));
     let ssrc = ssrc_from_seed(seed);
     let mut sequence = initial_sequence_from_seed(seed);
     let mut timestamp = initial_timestamp_from_seed(seed);
-
     let start_ticks = raw_ticks(ticks);
-    let mut offset = 0usize;
     let mut aborted = false;
-    let mut wire_bytes = [0u8; RTP_PAYLOAD_BYTES];
     let mut frame = [0u8; MAX_FRAME_LEN];
 
-    while offset < buffer.len() {
-        if should_abort() != 0 {
-            aborted = true;
-            break;
+    let offset = if let Some(bitrate) = opus_bitrate {
+        let mut encoder = match OpusEncoder::new(format.sample_rate as i32, i32::from(format.channels), bitrate, alloc, free) {
+            Ok(encoder) => encoder,
+            Err(_) => {
+                print_bytes(putc, b"audio-rtp: could not start the Opus encoder for this device's rate.\n");
+                free(address, capacity);
+                return;
+            }
+        };
+        // The file's raw PCM is already this device's 16-bit kernel format
+        // (native little-endian), so its bytes double directly as `i16`
+        // samples -- no repacking step, unlike the raw wire path.
+        let pcm: &[i16] = unsafe { slice::from_raw_parts(buffer.as_ptr().cast::<i16>(), buffer.len() / 2) };
+        let frame_samples = format.sample_rate as usize / OPUS_FRAMES_PER_SECOND;
+        let channels = usize::from(format.channels);
+        // `pcm_frame`/`packet` go through the tape ABI's alloc callback
+        // rather than the stack: a tape runs nested inside the shell's
+        // own call chain on the kernel's shared stack (see AGENTS.md's
+        // entry.S/stack-guard notes), and several KB of new locals here
+        // was enough to hit the guard page in practice.
+        let scratch_bytes = OPUS_ENCODE_FRAME_CAPACITY_SAMPLES as u32 * 2 + RTP_PAYLOAD_BYTES as u32;
+        let scratch_addr = alloc(scratch_bytes);
+        if scratch_addr == 0 {
+            print_bytes(putc, b"audio-rtp: unable to allocate Opus encode scratch space.\n");
+            free(address, capacity);
+            return;
         }
-        let target_ticks = start_ticks + (offset as u64 * PIT_HZ) / bytes_per_sec.max(1);
-        while raw_ticks(ticks) < target_ticks {
+        let pcm_frame: &mut [i16] =
+            unsafe { slice::from_raw_parts_mut(scratch_addr as *mut i16, OPUS_ENCODE_FRAME_CAPACITY_SAMPLES) };
+        let packet: &mut [u8] = unsafe {
+            slice::from_raw_parts_mut(
+                (scratch_addr + OPUS_ENCODE_FRAME_CAPACITY_SAMPLES as u32 * 2) as *mut u8,
+                RTP_PAYLOAD_BYTES,
+            )
+        };
+        let mut samples_sent = 0usize; // per channel
+        let mut offset_samples = 0usize; // per channel
+
+        while offset_samples * channels < pcm.len() {
             if should_abort() != 0 {
                 aborted = true;
                 break;
             }
-        }
-        if aborted {
-            break;
-        }
+            let target_ticks = start_ticks + (samples_sent as u64 * PIT_HZ) / format.sample_rate.max(1) as u64;
+            while raw_ticks(ticks) < target_ticks {
+                if should_abort() != 0 {
+                    aborted = true;
+                    break;
+                }
+            }
+            if aborted {
+                break;
+            }
 
-        let chunk_end = (offset + kernel_chunk).min(buffer.len());
-        let chunk = &buffer[offset..chunk_end];
-        let wire_len = kernel_to_wire_pcm(chunk, format.bits_per_sample, &mut wire_bytes);
-        let frames_in_chunk = (wire_len / wire_bytes_per_sample) as u32;
+            let start = offset_samples * channels;
+            let end = (start + frame_samples * channels).min(pcm.len());
+            pcm_frame[..end - start].copy_from_slice(&pcm[start..end]);
+            pcm_frame[end - start..frame_samples * channels].fill(0); // zero-pad a short final frame
 
-        let rtp = RtpPacket::new(payload_type, false, sequence, timestamp, ssrc, &wire_bytes[..wire_len]);
-        if let Ok(length) = build_rtp_udp_frame(
-            &mut frame,
-            own_mac,
-            peer_mac,
-            local,
-            peer_ip,
-            DEFAULT_PORT,
-            peer_port,
-            &rtp,
-        ) {
-            send_frame(nic_send, &frame[..length], MAX_FRAME_LEN);
+            match encoder.encode(&pcm_frame[..frame_samples * channels], frame_samples, packet) {
+                Ok(packet_len) => {
+                    let rtp = RtpPacket::new(PAYLOAD_TYPE_OPUS, false, sequence, timestamp, ssrc, &packet[..packet_len]);
+                    if let Ok(length) =
+                        build_rtp_udp_frame(&mut frame, own_mac, peer_mac, local, peer_ip, DEFAULT_PORT, peer_port, &rtp)
+                    {
+                        send_frame(nic_send, &frame[..length], MAX_FRAME_LEN);
+                    }
+                    sequence = sequence.wrapping_add(1);
+                    timestamp = timestamp.wrapping_add(frame_samples as u32);
+                }
+                Err(_) => {
+                    // Keep going, same "count it as loss, no retransmission"
+                    // policy the raw path implicitly has via dropped bytes.
+                }
+            }
+            samples_sent += frame_samples;
+            offset_samples += frame_samples;
         }
-        sequence = sequence.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(frames_in_chunk);
-        offset = chunk_end;
-    }
+        free(scratch_addr, scratch_bytes);
+        (offset_samples * channels * 2).min(buffer.len())
+    } else {
+        let bytes_per_frame = u32::from(format.channels) * (u32::from(format.bits_per_sample) / 8);
+        let bytes_per_sec = u64::from(format.sample_rate) * u64::from(bytes_per_frame);
+        let wire_bytes_per_sample: usize = if format.bits_per_sample == 24 { 3 } else { 2 };
+        let kernel_bytes_per_sample: usize = if format.bits_per_sample == 24 { 4 } else { 2 };
+        let samples_per_packet = RTP_PAYLOAD_BYTES / wire_bytes_per_sample;
+        let kernel_chunk = samples_per_packet * kernel_bytes_per_sample;
+
+        let mut wire_bytes = [0u8; RTP_PAYLOAD_BYTES];
+        let mut offset = 0usize;
+
+        while offset < buffer.len() {
+            if should_abort() != 0 {
+                aborted = true;
+                break;
+            }
+            let target_ticks = start_ticks + (offset as u64 * PIT_HZ) / bytes_per_sec.max(1);
+            while raw_ticks(ticks) < target_ticks {
+                if should_abort() != 0 {
+                    aborted = true;
+                    break;
+                }
+            }
+            if aborted {
+                break;
+            }
+
+            let chunk_end = (offset + kernel_chunk).min(buffer.len());
+            let chunk = &buffer[offset..chunk_end];
+            let wire_len = kernel_to_wire_pcm(chunk, format.bits_per_sample, &mut wire_bytes);
+            let frames_in_chunk = (wire_len / wire_bytes_per_sample) as u32;
+
+            let rtp = RtpPacket::new(payload_type, false, sequence, timestamp, ssrc, &wire_bytes[..wire_len]);
+            if let Ok(length) = build_rtp_udp_frame(
+                &mut frame,
+                own_mac,
+                peer_mac,
+                local,
+                peer_ip,
+                DEFAULT_PORT,
+                peer_port,
+                &rtp,
+            ) {
+                send_frame(nic_send, &frame[..length], MAX_FRAME_LEN);
+            }
+            sequence = sequence.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(frames_in_chunk);
+            offset = chunk_end;
+        }
+        offset
+    };
 
     free(address, capacity);
     if aborted {
@@ -892,6 +998,8 @@ fn send_mode(
 fn capture_mode(
     putc: Putc,
     should_abort: ShouldAbort,
+    alloc: Alloc,
+    free: Free,
     nic_send: NicSend,
     nic_receive: NicReceive,
     ticks: Ticks,
@@ -899,6 +1007,7 @@ fn capture_mode(
     local: Ipv4Address,
     peer_ip: Ipv4Address,
     peer_port: u16,
+    codec: Codec,
     audio_count: AudioCount,
     audio_sample_rate_at: AudioSampleRateAt,
     audio_channels_and_bits_at: AudioChannelsAndBitsAt,
@@ -913,6 +1022,14 @@ fn capture_mode(
         print_format(putc, format);
         print_bytes(putc, b") has no documented RTP payload type; cannot stream.\n");
         return;
+    };
+    let opus_bitrate = match codec {
+        Codec::Opus { .. } if format.bits_per_sample != 16 => {
+            print_bytes(putc, b"audio-rtp: Opus capture needs a 16-bit device format.\n");
+            return;
+        }
+        Codec::Opus { bitrate_bps } => Some(bitrate_bps.unwrap_or(opus_codec::DEFAULT_BITRATE_BPS)),
+        Codec::Raw => None,
     };
 
     let mut arp = ArpCache::<8>::new();
@@ -937,40 +1054,117 @@ fn capture_mode(
     let ssrc = ssrc_from_seed(seed);
     let mut sequence = initial_sequence_from_seed(seed);
     let mut timestamp = initial_timestamp_from_seed(seed);
-    let wire_bytes_per_sample: usize = if format.bits_per_sample == 24 { 3 } else { 2 };
 
     let mut kernel_chunk = [0u8; KERNEL_PCM_SCRATCH_BYTES];
-    let mut wire_bytes = [0u8; RTP_PAYLOAD_BYTES];
     let mut frame = [0u8; MAX_FRAME_LEN];
     let mut poll_frame = [0u8; MAX_FRAME_LEN];
     let mut bytes_sent = 0u64;
 
-    loop {
-        if should_abort() != 0 {
-            break;
+    if let Some(bitrate) = opus_bitrate {
+        let mut encoder = match OpusEncoder::new(format.sample_rate as i32, i32::from(format.channels), bitrate, alloc, free) {
+            Ok(encoder) => encoder,
+            Err(_) => {
+                print_bytes(putc, b"audio-rtp: could not start the Opus encoder for this device's rate.\n");
+                return;
+            }
+        };
+        let channels = usize::from(format.channels);
+        let frame_samples = format.sample_rate as usize / OPUS_FRAMES_PER_SECOND;
+        let frame_len = frame_samples * channels;
+        // Accumulates captured PCM across loop iterations until a full
+        // Opus frame is available: unlike the raw path, `audio_capture_at`
+        // drains "whatever's ready" (not frame-aligned), but Opus can only
+        // encode exactly one fixed frame duration at a time. Sized for one
+        // incoming chunk plus up to one frame's worth of carry-over.
+        //
+        // Allocated through the tape ABI's alloc callback rather than the
+        // stack: a tape runs nested inside the shell's own call chain on
+        // the kernel's shared stack (see AGENTS.md's entry.S/stack-guard
+        // notes), and this buffer alone is close to 6 KB.
+        const ACCUM_CAPACITY: usize = OPUS_ENCODE_FRAME_CAPACITY_SAMPLES + KERNEL_PCM_SCRATCH_BYTES / 2;
+        let scratch_bytes = ACCUM_CAPACITY as u32 * 2 + RTP_PAYLOAD_BYTES as u32;
+        let scratch_addr = alloc(scratch_bytes);
+        if scratch_addr == 0 {
+            print_bytes(putc, b"audio-rtp: unable to allocate Opus encode scratch space.\n");
+            return;
         }
-        // Answer any incoming ARP while we stream, exactly like listen
-        // mode does -- a peer may only just now be trying to resolve us.
-        let received = nic_receive(poll_frame.as_mut_ptr() as u32, MAX_FRAME_LEN as u32) as usize;
-        if received != 0 {
-            let now32 = raw_ticks(ticks) as u32;
-            handle_arp_frame(nic_send, &poll_frame[..received.min(MAX_FRAME_LEN)], own_mac, local, &mut arp, now32);
-        }
+        let accum: &mut [i16] = unsafe { slice::from_raw_parts_mut(scratch_addr as *mut i16, ACCUM_CAPACITY) };
+        let packet: &mut [u8] = unsafe {
+            slice::from_raw_parts_mut((scratch_addr + ACCUM_CAPACITY as u32 * 2) as *mut u8, RTP_PAYLOAD_BYTES)
+        };
+        let mut accum_len = 0usize;
 
-        let captured = audio_capture_at(0, kernel_chunk.as_mut_ptr() as u32, KERNEL_PCM_SCRATCH_BYTES as u32) as usize;
-        if captured == 0 {
-            continue;
-        }
-        let wire_len = kernel_to_wire_pcm(&kernel_chunk[..captured], format.bits_per_sample, &mut wire_bytes);
-        let frames_in_chunk = (wire_len / wire_bytes_per_sample) as u32;
+        loop {
+            if should_abort() != 0 {
+                break;
+            }
+            let received = nic_receive(poll_frame.as_mut_ptr() as u32, MAX_FRAME_LEN as u32) as usize;
+            if received != 0 {
+                let now32 = raw_ticks(ticks) as u32;
+                handle_arp_frame(nic_send, &poll_frame[..received.min(MAX_FRAME_LEN)], own_mac, local, &mut arp, now32);
+            }
 
-        let rtp = RtpPacket::new(payload_type, false, sequence, timestamp, ssrc, &wire_bytes[..wire_len]);
-        if let Ok(length) = build_rtp_udp_frame(&mut frame, own_mac, peer_mac, local, peer_ip, DEFAULT_PORT, peer_port, &rtp) {
-            send_frame(nic_send, &frame[..length], MAX_FRAME_LEN);
+            let captured = audio_capture_at(0, kernel_chunk.as_mut_ptr() as u32, KERNEL_PCM_SCRATCH_BYTES as u32) as usize;
+            if captured == 0 {
+                continue;
+            }
+            let captured_samples = captured / 2;
+            let captured_i16: &[i16] = unsafe { slice::from_raw_parts(kernel_chunk.as_ptr().cast::<i16>(), captured_samples) };
+            let copy_len = captured_samples.min(accum.len() - accum_len);
+            accum[accum_len..accum_len + copy_len].copy_from_slice(&captured_i16[..copy_len]);
+            accum_len += copy_len;
+
+            while accum_len >= frame_len {
+                match encoder.encode(&accum[..frame_len], frame_samples, packet) {
+                    Ok(packet_len) => {
+                        let rtp = RtpPacket::new(PAYLOAD_TYPE_OPUS, false, sequence, timestamp, ssrc, &packet[..packet_len]);
+                        if let Ok(length) =
+                            build_rtp_udp_frame(&mut frame, own_mac, peer_mac, local, peer_ip, DEFAULT_PORT, peer_port, &rtp)
+                        {
+                            send_frame(nic_send, &frame[..length], MAX_FRAME_LEN);
+                        }
+                        sequence = sequence.wrapping_add(1);
+                        timestamp = timestamp.wrapping_add(frame_samples as u32);
+                        bytes_sent += packet_len as u64;
+                    }
+                    Err(_) => {}
+                }
+                accum.copy_within(frame_len..accum_len, 0);
+                accum_len -= frame_len;
+            }
         }
-        sequence = sequence.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(frames_in_chunk);
-        bytes_sent += wire_len as u64;
+        free(scratch_addr, scratch_bytes);
+    } else {
+        let wire_bytes_per_sample: usize = if format.bits_per_sample == 24 { 3 } else { 2 };
+        let mut wire_bytes = [0u8; RTP_PAYLOAD_BYTES];
+
+        loop {
+            if should_abort() != 0 {
+                break;
+            }
+            // Answer any incoming ARP while we stream, exactly like listen
+            // mode does -- a peer may only just now be trying to resolve us.
+            let received = nic_receive(poll_frame.as_mut_ptr() as u32, MAX_FRAME_LEN as u32) as usize;
+            if received != 0 {
+                let now32 = raw_ticks(ticks) as u32;
+                handle_arp_frame(nic_send, &poll_frame[..received.min(MAX_FRAME_LEN)], own_mac, local, &mut arp, now32);
+            }
+
+            let captured = audio_capture_at(0, kernel_chunk.as_mut_ptr() as u32, KERNEL_PCM_SCRATCH_BYTES as u32) as usize;
+            if captured == 0 {
+                continue;
+            }
+            let wire_len = kernel_to_wire_pcm(&kernel_chunk[..captured], format.bits_per_sample, &mut wire_bytes);
+            let frames_in_chunk = (wire_len / wire_bytes_per_sample) as u32;
+
+            let rtp = RtpPacket::new(payload_type, false, sequence, timestamp, ssrc, &wire_bytes[..wire_len]);
+            if let Ok(length) = build_rtp_udp_frame(&mut frame, own_mac, peer_mac, local, peer_ip, DEFAULT_PORT, peer_port, &rtp) {
+                send_frame(nic_send, &frame[..length], MAX_FRAME_LEN);
+            }
+            sequence = sequence.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(frames_in_chunk);
+            bytes_sent += wire_len as u64;
+        }
     }
 
     print_bytes(putc, b"audio-rtp: capture stopped locally after ");
@@ -1083,6 +1277,7 @@ pub extern "C" fn tape_main(
             name,
             peer_ip,
             peer_port,
+            codec,
         } => send_mode(
             putc,
             should_abort,
@@ -1098,13 +1293,16 @@ pub extern "C" fn tape_main(
             name,
             peer_ip,
             peer_port,
+            codec,
             audio_count,
             audio_sample_rate_at,
             audio_channels_and_bits_at,
         ),
-        StreamMode::Capture { peer_ip, peer_port } => capture_mode(
+        StreamMode::Capture { peer_ip, peer_port, codec } => capture_mode(
             putc,
             should_abort,
+            alloc,
+            free,
             nic_send,
             nic_receive,
             ticks,
@@ -1112,6 +1310,7 @@ pub extern "C" fn tape_main(
             network.local,
             peer_ip,
             peer_port,
+            codec,
             audio_count,
             audio_sample_rate_at,
             audio_channels_and_bits_at,

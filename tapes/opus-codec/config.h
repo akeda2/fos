@@ -24,11 +24,24 @@
  * and celt/kiss_fft.c lives inside "#ifdef CUSTOM_MODES" and is therefore
  * dead code here.
  *
- * VAR_ARRAYS: selects plain C99 variable-length arrays for libopus's
- * internal scratch/stack_alloc.h mechanism, rather than USE_ALLOCA (an
- * extra compiler-intrinsic dependency) or NONTHREADSAFE_PSEUDOSTACK (a
- * second, hidden allocator). VLAs need no support beyond what -ffreestanding
- * already provides.
+ * NONTHREADSAFE_PSEUDOSTACK, not VAR_ARRAYS: libopus's internal scratch/
+ * stack_alloc.h mechanism has three modes -- plain C99 VLAs (VAR_ARRAYS),
+ * alloca() (USE_ALLOCA), or one lazily-allocated global scratch buffer
+ * bump-allocated from (NONTHREADSAFE_PSEUDOSTACK). Decode alone works
+ * fine with VAR_ARRAYS (real stack frames), but the *encoder*'s SILK
+ * pipeline (LPC/pitch/noise-shaping analysis, several KB of VLA-based
+ * scratch nested many calls deep) reliably hit this kernel's stack guard
+ * page once linked into a real tape -- a tape runs nested inside the
+ * shell's own call chain on the kernel's shared stack (see AGENTS.md's
+ * entry.S notes), which has nowhere near a host's multi-MB default stack.
+ * NONTHREADSAFE_PSEUDOSTACK moves that entire scratch region onto one
+ * heap allocation instead of the real call stack -- "nonthreadsafe" is
+ * fine here since this kernel has no concurrency to begin with (same
+ * single-threaded convention every other `static mut` in this codebase
+ * already relies on). No `#define GLOBAL_STACK_SIZE` override is needed;
+ * `celt/arch.h`'s own default (120000 bytes for a fixed-point build) is
+ * used, allocated once on first use and reused (leaked, like every other
+ * un-freed tape allocation) for the tape's lifetime.
  *
  * CUSTOM_SUPPORT / OVERRIDE_OPUS_ALLOC / OVERRIDE_OPUS_FREE:
  * celt/os_support.h's default opus_alloc()/opus_free() call libc
@@ -39,10 +52,11 @@
  * suppress libopus's own static-inline malloc-backed definitions;
  * tapes/opus-codec's Rust wrapper (src/lib.rs) then provides the real
  * opus_alloc/opus_free symbols, backed by the tape ABI's own alloc/free
- * callbacks. Only these two are overridden -- opus_realloc/
- * opus_alloc_scratch are never referenced by the compiled decode-only
- * object set (confirmed via `nm -u`), so their libc-backed defaults are
- * simply never linked in.
+ * callbacks. `opus_realloc` is still never referenced (confirmed via
+ * `nm -u`), so its libc-backed default is simply never linked in --
+ * but `opus_alloc_scratch` now genuinely is (by the pseudostack
+ * mechanism above); its own default definition (in os_support.h) just
+ * calls `opus_alloc`, so it needs no separate override.
  *
  * One more libc symbol, plain `abs()`, is also provided by
  * tapes/opus-codec's Rust wrapper (a few vendored files, e.g. cwrs.c and
@@ -59,7 +73,7 @@
 #define OPUS_BUILD 1
 #define FIXED_POINT 1
 #define DISABLE_FLOAT_API 1
-#define VAR_ARRAYS 1
+#define NONTHREADSAFE_PSEUDOSTACK 1
 #define CUSTOM_SUPPORT 1
 
 #endif

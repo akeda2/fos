@@ -1,18 +1,20 @@
-//! Rust FFI wrapper around a vendored, fixed-point-only libopus decoder.
+//! Rust FFI wrapper around a vendored, fixed-point-only libopus codec.
 //!
 //! `vendor/opus/` is libopus 1.5.2 (BSD-3-Clause, see `vendor/opus/COPYING`),
-//! trimmed to exactly the files a decode-only, `FIXED_POINT`/
-//! `DISABLE_FLOAT_API`/`CUSTOM_MODES`-off build needs -- no encoder, no
-//! ARM/x86 SIMD, no libm, no libc `malloc`. See `../config.h` and
+//! trimmed to exactly the files this `FIXED_POINT`/`DISABLE_FLOAT_API`/
+//! `CUSTOM_MODES`-off build needs -- no ARM/x86 SIMD, no multistream/
+//! ambisonics, no libm, no libc `malloc`. See `../config.h` and
 //! `../custom_support.h` for the exact build configuration, and the root
 //! Makefile's `opus-codec-lib` recipe for how it is compiled and archived
 //! (`libopus_fixed.a`) and linked into a tape via `RUSTFLAGS`.
 //!
-//! This crate deliberately wraps only decode: `opus_decoder_get_size`,
-//! `opus_decoder_init`, and `opus_decode`. It never calls
-//! `opus_decoder_create` (which would use libopus's own libc-`malloc`-backed
-//! `opus_alloc`), instead sizing and owning the decoder-state buffer itself
-//! through the tape ABI's own `alloc`/`free` callbacks -- see [`Decoder::new`].
+//! [`Decoder`] wraps only `opus_decoder_get_size`/`opus_decoder_init`/
+//! `opus_decode`; [`Encoder`] wraps the matching `opus_encoder_*` triple
+//! plus `opus_encoder_ctl` (used only to fix complexity and bitrate, see
+//! [`Encoder::new`]). Neither ever calls the corresponding
+//! `opus_{decoder,encoder}_create` (which would use libopus's own
+//! libc-`malloc`-backed `opus_alloc`), instead sizing and owning their
+//! state buffer through the tape ABI's own `alloc`/`free` callbacks.
 #![no_std]
 
 use core::ffi::c_void;
@@ -28,7 +30,44 @@ unsafe extern "C" {
         frame_size: i32,
         decode_fec: i32,
     ) -> i32;
+
+    fn opus_encoder_get_size(channels: i32) -> i32;
+    fn opus_encoder_init(state: *mut c_void, sample_rate: i32, channels: i32, application: i32) -> i32;
+    fn opus_encode(
+        state: *mut c_void,
+        pcm: *const i16,
+        frame_size: i32,
+        data: *mut u8,
+        max_data_bytes: i32,
+    ) -> i32;
+    /// Variadic C function; ordinary Rust FFI supports *calling* one, and
+    /// every call site here passes exactly one trailing `i32`, matching
+    /// `include/opus_defines.h`'s `OPUS_SET_COMPLEXITY`/`OPUS_SET_BITRATE`
+    /// macros' own `__opus_check_int(x)` shape.
+    fn opus_encoder_ctl(state: *mut c_void, request: i32, value: i32) -> i32;
 }
+
+/// `include/opus_defines.h`'s `OPUS_APPLICATION_AUDIO` -- tuned for
+/// general music/audio rather than speech (`OPUS_APPLICATION_VOIP`) or
+/// minimal algorithmic delay (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`).
+/// Fixed, not exposed as a choice: this project has no reason to encode
+/// anything other than general audio.
+const OPUS_APPLICATION_AUDIO: i32 = 2049;
+/// `include/opus_defines.h`'s `OPUS_SET_COMPLEXITY_REQUEST`/
+/// `OPUS_SET_BITRATE_REQUEST`.
+const OPUS_SET_COMPLEXITY_REQUEST: i32 = 4010;
+const OPUS_SET_BITRATE_REQUEST: i32 = 4002;
+/// Maximum encoder complexity (0-10 scale), hardcoded rather than exposed
+/// as a tunable: this project's real-hardware floor is Pentium 4, and
+/// Opus's CPU cost even at max complexity is trivial for that era of
+/// hardware -- the only reason it would ever look expensive is QEMU/TCG
+/// software emulation, not a real target-hardware constraint (see
+/// `tapes/test_audio_rtp_opus_e2e.py`'s `kvm_available()`).
+const OPUS_MAX_COMPLEXITY: i32 = 10;
+/// Default target bitrate for 48 kHz stereo: within Opus's conventional
+/// 96-128 kbps "transparent" range. Overridable by the caller; this is
+/// only the fallback when no bitrate is given.
+pub const DEFAULT_BITRATE_BPS: i32 = 96_000;
 
 /// Errors libopus's `int` return codes map to (see `include/opus_defines.h`'s
 /// `OPUS_BAD_ARG`..`OPUS_UNIMPLEMENTED` in the vendored tree).
@@ -202,6 +241,105 @@ impl Decoder {
 }
 
 impl Drop for Decoder {
+    fn drop(&mut self) {
+        (self.free)(self.state as u32, self.state_len);
+    }
+}
+
+/// A single Opus encoder instance, owning its encoder-state buffer through
+/// the tape ABI's `alloc`/`free` callbacks rather than libopus's own
+/// libc-`malloc`-backed `opus_encoder_create`. Complexity is fixed at
+/// [`OPUS_MAX_COMPLEXITY`] and the application at
+/// [`OPUS_APPLICATION_AUDIO`] -- neither is a per-instance choice.
+pub struct Encoder {
+    state: *mut c_void,
+    state_len: u32,
+    free: extern "C" fn(u32, u32),
+    channels: i32,
+}
+
+impl Encoder {
+    /// `channels` is 1 or 2; `sample_rate` must be one of libopus's five
+    /// accepted rates (8/12/16/24/48 kHz). `alloc`/`free` are the tape
+    /// ABI's own callbacks, also installed as the vendored codec's global
+    /// allocator (see [`opus_alloc`]/[`opus_free`]) -- shared with any
+    /// [`Decoder`] the same tape also constructs, since a fos tape never
+    /// runs more than one codec direction pair concurrently.
+    pub fn new(
+        sample_rate: i32,
+        channels: i32,
+        bitrate_bps: i32,
+        alloc: extern "C" fn(u32) -> u32,
+        free: extern "C" fn(u32, u32),
+    ) -> Result<Self> {
+        unsafe {
+            CURRENT_ALLOC = Some(alloc);
+            CURRENT_FREE = Some(free);
+        }
+
+        let size = unsafe { opus_encoder_get_size(channels) };
+        if size <= 0 {
+            return Err(OpusError::BadArgument);
+        }
+        let state_len = size as u32;
+
+        let address = alloc(state_len);
+        if address == 0 {
+            return Err(OpusError::AllocFail);
+        }
+        let state = address as *mut c_void;
+
+        let ret = unsafe { opus_encoder_init(state, sample_rate, channels, OPUS_APPLICATION_AUDIO) };
+        if ret != 0 {
+            free(address, state_len);
+            return Err(OpusError::from_code(ret));
+        }
+
+        let complexity_ret = unsafe { opus_encoder_ctl(state, OPUS_SET_COMPLEXITY_REQUEST, OPUS_MAX_COMPLEXITY) };
+        let bitrate_ret = unsafe { opus_encoder_ctl(state, OPUS_SET_BITRATE_REQUEST, bitrate_bps) };
+        if complexity_ret != 0 || bitrate_ret != 0 {
+            free(address, state_len);
+            return Err(OpusError::from_code(complexity_ret.min(bitrate_ret)));
+        }
+
+        Ok(Self {
+            state,
+            state_len,
+            free,
+            channels,
+        })
+    }
+
+    /// Encodes exactly one frame (`frame_size` samples per channel, one of
+    /// libopus's accepted frame durations at this encoder's sample rate --
+    /// e.g. 960 for 20 ms @ 48 kHz) from `pcm` (interleaved `i16`,
+    /// `channels` wide) into `packet_out`. Returns the number of bytes
+    /// written.
+    pub fn encode(&mut self, pcm: &[i16], frame_size: usize, packet_out: &mut [u8]) -> Result<usize> {
+        let needed = frame_size
+            .checked_mul(self.channels as usize)
+            .ok_or(OpusError::OutputTooSmall)?;
+        if pcm.len() < needed {
+            return Err(OpusError::OutputTooSmall);
+        }
+        let n = unsafe {
+            opus_encode(
+                self.state,
+                pcm.as_ptr(),
+                frame_size as i32,
+                packet_out.as_mut_ptr(),
+                packet_out.len() as i32,
+            )
+        };
+        if n < 0 {
+            Err(OpusError::from_code(n))
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+impl Drop for Encoder {
     fn drop(&mut self) {
         (self.free)(self.state as u32, self.state_len);
     }

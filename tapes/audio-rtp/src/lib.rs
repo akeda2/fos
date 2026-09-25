@@ -11,16 +11,19 @@
 //!
 //! ```text
 //! tape run static LOCAL_IP/PREFIX GATEWAY [PORT]
-//! tape run static LOCAL_IP/PREFIX GATEWAY send NAME PEER_IP [PEER_PORT]
-//! tape run static LOCAL_IP/PREFIX GATEWAY capture PEER_IP [PEER_PORT]
+//! tape run static LOCAL_IP/PREFIX GATEWAY send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]
+//! tape run static LOCAL_IP/PREFIX GATEWAY capture [opus] PEER_IP [PEER_PORT] [BITRATE]
 //! tape run dhcp [PORT]
-//! tape run dhcp send NAME PEER_IP [PEER_PORT]
-//! tape run dhcp capture PEER_IP [PEER_PORT]
+//! tape run dhcp send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]
+//! tape run dhcp capture [opus] PEER_IP [PEER_PORT] [BITRATE]
 //! ```
 //!
-//! `PORT`/`PEER_PORT` default to `5004`. `static` also accepts the
-//! legacy dotted-netmask and separate-`/PREFIX` forms `telnet` already
-//! does.
+//! `opus` selects Opus encode (via `tapes/opus-codec`'s vendored
+//! fixed-point libopus) in place of raw PCM; `BITRATE` (bits/sec) is only
+//! meaningful with `opus` and defaults to `opus_codec::DEFAULT_BITRATE_BPS`
+//! when omitted. `PORT`/`PEER_PORT` default to `5004`. `static` also
+//! accepts the legacy dotted-netmask and separate-`/PREFIX` forms `telnet`
+//! already does.
 #![no_std]
 
 use tape_net::{
@@ -94,6 +97,18 @@ pub enum NetworkMode {
     Dhcp,
 }
 
+/// `send`/`capture`'s wire format. `Opus`'s `bitrate_bps` is `None` when
+/// the caller didn't override it -- resolved to `opus_codec::
+/// DEFAULT_BITRATE_BPS` by `main.rs` (the only place in this crate that
+/// depends on `opus-codec`, keeping this host-testable `lib.rs` free of
+/// it: this file's own test binary links natively, with no host
+/// implementation of the vendored codec's `extern "C"` symbols).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Codec {
+    Raw,
+    Opus { bitrate_bps: Option<i32> },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamMode<'a> {
     Listen {
@@ -103,10 +118,12 @@ pub enum StreamMode<'a> {
         name: &'a [u8],
         peer_ip: Ipv4Address,
         peer_port: u16,
+        codec: Codec,
     },
     Capture {
         peer_ip: Ipv4Address,
         peer_port: u16,
+        codec: Codec,
     },
 }
 
@@ -124,10 +141,11 @@ pub enum StartupError {
     BadAddress,
     BadNetmask,
     BadPort,
+    BadBitrate,
     MissingName,
 }
 
-fn split_words<'a>(input: &'a [u8], words: &mut [Option<&'a [u8]>; 8]) -> usize {
+fn split_words<'a>(input: &'a [u8], words: &mut [Option<&'a [u8]>; 10]) -> usize {
     let mut count = 0;
     let mut offset = 0;
     while offset < input.len() {
@@ -232,12 +250,60 @@ fn parse_cidr(text: &[u8]) -> core::result::Result<(Ipv4Address, Ipv4Address), S
     Ok((address, netmask))
 }
 
+/// Parses a trailing `[PEER_PORT] [BITRATE]` tail, given how many words
+/// remain after the fixed part of `send`/`capture`'s own arguments (0-2).
+/// `BITRATE` is only a valid trailing word at all when `allow_bitrate`
+/// (i.e. the caller already saw an `opus` keyword) -- the raw path
+/// rejects a second trailing word outright (`WrongArgumentCount`) rather
+/// than trying to parse it as a bitrate it has no use for.
+fn parse_port_and_bitrate<'a>(
+    words: &[Option<&'a [u8]>; 10],
+    start: usize,
+    remaining: usize,
+    allow_bitrate: bool,
+) -> core::result::Result<(u16, Option<i32>), StartupError> {
+    match remaining {
+        0 => Ok((DEFAULT_PORT, None)),
+        1 => {
+            let port = words.get(start).copied().flatten().and_then(parse_port).ok_or(StartupError::BadPort)?;
+            Ok((port, None))
+        }
+        2 if allow_bitrate => {
+            let port = words.get(start).copied().flatten().and_then(parse_port).ok_or(StartupError::BadPort)?;
+            let bitrate = words
+                .get(start + 1)
+                .copied()
+                .flatten()
+                .and_then(parse_bitrate)
+                .ok_or(StartupError::BadBitrate)?;
+            Ok((port, Some(bitrate)))
+        }
+        _ => Err(StartupError::WrongArgumentCount),
+    }
+}
+
+fn parse_bitrate(text: &[u8]) -> Option<i32> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut value: i32 = 0;
+    for &byte in text {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(i32::from(byte - b'0'))?;
+    }
+    (value > 0).then_some(value)
+}
+
 /// Parses the trailing stream-mode words (everything after the network
 /// config): nothing or a bare port number means listen mode; `send
-/// NAME PEER_IP [PEER_PORT]` or `capture PEER_IP [PEER_PORT]` mean the
-/// other two.
+/// [opus] NAME PEER_IP [PEER_PORT] [BITRATE]` or `capture [opus] PEER_IP
+/// [PEER_PORT] [BITRATE]` mean the other two -- `BITRATE` is only
+/// accepted alongside `opus`, and always defaults (when omitted) to
+/// `opus_codec::DEFAULT_BITRATE_BPS`, resolved by `main.rs`.
 fn parse_stream_mode<'a>(
-    words: &[Option<&'a [u8]>; 8],
+    words: &[Option<&'a [u8]>; 10],
     start: usize,
     count: usize,
 ) -> core::result::Result<StreamMode<'a>, StartupError> {
@@ -247,47 +313,48 @@ fn parse_stream_mode<'a>(
             port: DEFAULT_PORT,
         }),
         Some(b"send") => {
-            let name = words.get(start + 1).copied().flatten().ok_or(StartupError::MissingName)?;
+            let is_opus = words.get(start + 1).copied().flatten() == Some(b"opus");
+            let name_index = if is_opus { start + 2 } else { start + 1 };
+            let name = words.get(name_index).copied().flatten().ok_or(StartupError::MissingName)?;
             let peer_ip = words
-                .get(start + 2)
+                .get(name_index + 1)
                 .copied()
                 .flatten()
                 .and_then(parse_ipv4)
                 .ok_or(StartupError::BadAddress)?;
-            let peer_port = match remaining {
-                3 => DEFAULT_PORT,
-                4 => words
-                    .get(start + 3)
-                    .copied()
-                    .flatten()
-                    .and_then(parse_port)
-                    .ok_or(StartupError::BadPort)?,
-                _ => return Err(StartupError::WrongArgumentCount),
-            };
+            let fixed_words = name_index + 2 - start;
+            let (peer_port, bitrate_bps) = parse_port_and_bitrate(
+                words,
+                name_index + 2,
+                remaining.saturating_sub(fixed_words),
+                is_opus,
+            )?;
+            let codec = if is_opus { Codec::Opus { bitrate_bps } } else { Codec::Raw };
             Ok(StreamMode::Send {
                 name,
                 peer_ip,
                 peer_port,
+                codec,
             })
         }
         Some(b"capture") => {
+            let is_opus = words.get(start + 1).copied().flatten() == Some(b"opus");
+            let ip_index = if is_opus { start + 2 } else { start + 1 };
             let peer_ip = words
-                .get(start + 1)
+                .get(ip_index)
                 .copied()
                 .flatten()
                 .and_then(parse_ipv4)
                 .ok_or(StartupError::BadAddress)?;
-            let peer_port = match remaining {
-                2 => DEFAULT_PORT,
-                3 => words
-                    .get(start + 2)
-                    .copied()
-                    .flatten()
-                    .and_then(parse_port)
-                    .ok_or(StartupError::BadPort)?,
-                _ => return Err(StartupError::WrongArgumentCount),
-            };
-            Ok(StreamMode::Capture { peer_ip, peer_port })
+            let fixed_words = ip_index + 1 - start;
+            let (peer_port, bitrate_bps) = parse_port_and_bitrate(
+                words,
+                ip_index + 1,
+                remaining.saturating_sub(fixed_words),
+                is_opus,
+            )?;
+            let codec = if is_opus { Codec::Opus { bitrate_bps } } else { Codec::Raw };
+            Ok(StreamMode::Capture { peer_ip, peer_port, codec })
         }
         Some(word) => {
             if remaining != 1 {
@@ -301,7 +368,7 @@ fn parse_stream_mode<'a>(
 
 /// Parse the documented static/dhcp startup syntax.
 pub fn parse_startup(input: &[u8]) -> core::result::Result<StartupConfig<'_>, StartupError> {
-    let mut words = [None; 8];
+    let mut words = [None; 10];
     let count = split_words(input, &mut words);
     if count == 0 {
         return Err(StartupError::MissingMode);
@@ -512,6 +579,7 @@ mod tests {
                 name: b"tone.pcm",
                 peer_ip: Ipv4Address::new([192, 0, 2, 20]),
                 peer_port: DEFAULT_PORT,
+                codec: Codec::Raw,
             }
         );
 
@@ -523,6 +591,7 @@ mod tests {
                 name: b"tone.pcm",
                 peer_ip: Ipv4Address::new([192, 0, 2, 20]),
                 peer_port: 6001,
+                codec: Codec::Raw,
             }
         );
 
@@ -532,6 +601,7 @@ mod tests {
             StreamMode::Capture {
                 peer_ip: Ipv4Address::new([192, 0, 2, 20]),
                 peer_port: DEFAULT_PORT,
+                codec: Codec::Raw,
             }
         );
 
@@ -541,7 +611,62 @@ mod tests {
             StreamMode::Capture {
                 peer_ip: Ipv4Address::new([192, 0, 2, 20]),
                 peer_port: 6002,
+                codec: Codec::Raw,
             }
+        );
+    }
+
+    #[test]
+    fn parses_opus_send_and_capture_startup_syntax() {
+        let config =
+            parse_startup(b"static 192.0.2.10/24 192.0.2.1 send opus tone.pcm 192.0.2.20").unwrap();
+        assert_eq!(
+            config.stream,
+            StreamMode::Send {
+                name: b"tone.pcm",
+                peer_ip: Ipv4Address::new([192, 0, 2, 20]),
+                peer_port: DEFAULT_PORT,
+                codec: Codec::Opus { bitrate_bps: None },
+            }
+        );
+
+        let config = parse_startup(b"static 192.0.2.10/24 192.0.2.1 send opus tone.pcm 192.0.2.20 6001 64000")
+            .unwrap();
+        assert_eq!(
+            config.stream,
+            StreamMode::Send {
+                name: b"tone.pcm",
+                peer_ip: Ipv4Address::new([192, 0, 2, 20]),
+                peer_port: 6001,
+                codec: Codec::Opus { bitrate_bps: Some(64_000) },
+            }
+        );
+
+        let config = parse_startup(b"dhcp capture opus 192.0.2.20").unwrap();
+        assert_eq!(
+            config.stream,
+            StreamMode::Capture {
+                peer_ip: Ipv4Address::new([192, 0, 2, 20]),
+                peer_port: DEFAULT_PORT,
+                codec: Codec::Opus { bitrate_bps: None },
+            }
+        );
+
+        let config = parse_startup(b"dhcp capture opus 192.0.2.20 6002 128000").unwrap();
+        assert_eq!(
+            config.stream,
+            StreamMode::Capture {
+                peer_ip: Ipv4Address::new([192, 0, 2, 20]),
+                peer_port: 6002,
+                codec: Codec::Opus { bitrate_bps: Some(128_000) },
+            }
+        );
+
+        // A bitrate is only accepted alongside `opus` -- an extra numeric
+        // word on the raw path is rejected, not silently interpreted.
+        assert_eq!(
+            parse_startup(b"dhcp capture 192.0.2.20 6002 128000"),
+            Err(StartupError::WrongArgumentCount)
         );
     }
 

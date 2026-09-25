@@ -655,13 +655,16 @@ manual test.
 `tapes/audio-net/`'s bespoke raw-Ethernet protocol. Any real RTP tool
 (`ffmpeg`, `gstreamer`, ...) can send to or receive from this tape
 directly; nothing about the wire format is fos-specific except the
-payload-type convention described in "RTP scope" above. `send`/`capture`
-move raw PCM only, by design, and always will -- codec support there
-remains explicitly out of scope. `listen` mode additionally accepts one
-fixed Opus payload type, decoded through `tapes/opus-codec`'s vendored
-fixed-point libopus decoder; see `AGENTS.md`'s "Real-time audio streaming
-over RTP/UDP" section for the full design (vendoring rationale, the
-allocator override, and why decode is HDA-only).
+payload-type convention described in "RTP scope" above. `listen` mode
+accepts one fixed Opus payload type, decoded through `tapes/opus-codec`'s
+vendored fixed-point libopus decoder; `send`/`capture` can now *encode*
+Opus too (`send opus`/`capture opus`, see the startup forms below). Both
+directions rely on the same vendored decoder/encoder; see `AGENTS.md`'s
+"Real-time audio streaming over RTP/UDP" section for the full design
+(vendoring rationale, the allocator override, why both directions are
+HDA-only, and a real stack-overflow bug the encoder's own internal SILK
+scratch allocation caused and how it was fixed). Opus FEC/DTX and any
+SDP/RTCP negotiation remain explicitly out of scope.
 
 Startup forms put network configuration first, mirroring `tapes/telnet`'s
 own convention rather than `audio-net`'s mode-first shape (which has no
@@ -669,15 +672,20 @@ network-config step at all):
 
 ```text
 tape run static LOCAL_IP/PREFIX GATEWAY [PORT]
-tape run static LOCAL_IP/PREFIX GATEWAY send NAME PEER_IP [PEER_PORT]
-tape run static LOCAL_IP/PREFIX GATEWAY capture PEER_IP [PEER_PORT]
+tape run static LOCAL_IP/PREFIX GATEWAY send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]
+tape run static LOCAL_IP/PREFIX GATEWAY capture [opus] PEER_IP [PEER_PORT] [BITRATE]
 tape run dhcp [PORT]
-tape run dhcp send NAME PEER_IP [PEER_PORT]
-tape run dhcp capture PEER_IP [PEER_PORT]
+tape run dhcp send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]
+tape run dhcp capture [opus] PEER_IP [PEER_PORT] [BITRATE]
 ```
 
 `PORT`/`PEER_PORT` default to `5004`, a common (if not IANA-registered)
-convention several real-world RTP tools already use unprompted.
+convention several real-world RTP tools already use unprompted. `opus`
+selects Opus encode in place of raw PCM; `BITRATE` (bits/sec) is only
+meaningful alongside `opus` and defaults to `opus_codec::DEFAULT_BITRATE_BPS`
+(96 kbps) when omitted. Complexity is fixed at libopus's maximum and the
+application at `OPUS_APPLICATION_AUDIO`, neither exposed as a choice --
+see `AGENTS.md` for why.
 
 **Format is adaptive, not fixed.** The tape queries the local device's
 actual format (`audio_sample_rate_at`/`audio_channels_and_bits_at`,
@@ -696,10 +704,11 @@ generality" scope choice this project makes everywhere else. `listen`
 mode additionally recognizes a fourth, fixed payload type, `98`
 (`PAYLOAD_TYPE_OPUS`), independent of this table -- it is not a format a
 local device natively produces, it is a wire encoding decoded to
-whatever PCM format the local device actually needs. It is only offered
-when the local device is 16-bit at one of libopus's five accepted decode
-rates (8/12/16/24/48 kHz); see `AGENTS.md` for why that makes it
-HDA-only today.
+whatever PCM format the local device actually needs; `send opus`/
+`capture opus` send with this same payload type in the other direction.
+Opus is only available when the local device is 16-bit at one of
+libopus's five accepted rates (8/12/16/24/48 kHz), in either direction;
+see `AGENTS.md` for why that makes it HDA-only today.
 
 **Listen mode** locks onto the first sender's SSRC ("first sender wins,"
 matching `audio-net`/`tape_load_net`'s own convention) and tracks its
@@ -722,12 +731,18 @@ confirmation, same as the driver-side choice it mirrors.
 assumption), resolving the peer's MAC via ARP first. **Capture mode** is
 the live-ADC counterpart, streaming `audio_capture_at`'s output in real
 time with no extra pacing loop -- the real ADC period rate already paces
-it, exactly as `audio-net`'s own capture mode reasons. Both answer
-incoming ARP requests for their own configured address while running,
-copied in shape from `tapes/ip-chat`'s `process_frame`/`send_arp_reply`
-(also mirrored by `tapes/router`) -- without this, no external sender
-could ever resolve this tape's MAC well enough to deliver it a unicast
-packet at all.
+it, exactly as `audio-net`'s own capture mode reasons. With `opus`, both
+instead encode fixed 20 ms frames through a persistent `opus_codec::
+Encoder` before sending: `send`'s own tick-based pacing keys off samples
+encoded rather than bytes copied, and `capture` accumulates
+`audio_capture_at`'s "whatever's ready" chunks into a small buffer until
+a complete 20 ms frame is available (Opus frames are fixed-duration; the
+raw path has no such alignment requirement at all). Both answer incoming
+ARP requests for their own configured address while running, copied in
+shape from `tapes/ip-chat`'s `process_frame`/`send_arp_reply` (also
+mirrored by `tapes/router`) -- without this, no external sender could
+ever resolve this tape's MAC well enough to deliver it a unicast packet
+at all.
 
 **Packetization is capped at 1440 bytes of PCM payload per packet**, not
 the 20 ms/~3.5 KB real-world convention audio-over-RTP tools often use:
@@ -762,6 +777,14 @@ QEMU's silent default ADC content gives it nothing further to verify.
 sources its RTP packets from a real `ffmpeg`+`libopus` encode rather than
 hand-building them, and runs against an Intel HDA guest (48 kHz/16-bit,
 one of libopus's accepted decode rates) instead of ES1370.
+`tapes/test_audio_rtp_opus_send_e2e.py` covers the reverse direction
+(Opus encode): a known tone seeded into FOSFS, encoded for real by
+`send opus`, and decoded back by a small host-side build of this
+project's own vendored decoder (compiled fresh at test time) to verify
+pitch and duration -- reusing the exact decoder the other test already
+proved, rather than depending on a second implementation to cross-check
+against. Both Opus tests use `-accel kvm` when available; see
+`AGENTS.md` for why.
 
 A manual, non-automated sanity check against a real tool (e.g.
 `ffmpeg -re -i tone.wav -ar 44100 -ac 2 -f rtp rtp://<fos-ip>:5004`
@@ -807,6 +830,7 @@ python3 tapes/test_ip_chat_e2e.py
 python3 tapes/test_telnet_e2e.py
 python3 tapes/test_audio_rtp_e2e.py
 python3 tapes/test_audio_rtp_opus_e2e.py
+python3 tapes/test_audio_rtp_opus_send_e2e.py
 ```
 
 The normal `make test` remains required for kernel or boot changes. Real
@@ -829,9 +853,12 @@ Moving those into the kernel would make the educational protocol code harder
 to inspect and would exceed the current project's intentionally small
 hardware boundary.
 
-RTCP, SDP-based negotiation, and multi-SSRC session multiplexing remain
-deliberately deferred for `tapes/audio-rtp/`. Opus decode is no longer
-deferred -- see `AGENTS.md`'s "Real-time audio streaming over RTP/UDP"
-section for `tapes/opus-codec`'s vendored fixed-point libopus decoder.
-Opus *encode* (and FEC/DTX) remain out of scope: this tape's `send`/
-`capture` directions move raw PCM only, by design, and always will.
+RTCP and SDP-based negotiation remain deliberately deferred for
+`tapes/audio-rtp/`. Opus (both decode and encode, plain FEC/DTX aside)
+is no longer deferred -- see `AGENTS.md`'s "Real-time audio streaming
+over RTP/UDP" section for `tapes/opus-codec`'s vendored fixed-point
+libopus codec. Two-way duplex (simultaneous `listen`+`send` in one
+invocation, multiplexing one incoming and one outgoing RTP stream over
+one UDP 5-tuple) is the next planned step, building on the same combined
+polling-loop pattern `shell.rs`'s `chat` command already uses to merge
+receive-and-print with input-and-echo -- not yet built.

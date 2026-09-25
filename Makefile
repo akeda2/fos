@@ -486,16 +486,19 @@ test-tape-telnet:
 # Makefile rather than hidden in Cargo build-script magic.
 #
 # The vendored tree is already trimmed to exactly the celt/silk/opus
-# source files a decode-only build needs (no encoder, no ARM/x86 SIMD, no
-# custom-modes support), so a plain wildcard over its three source
-# directories is the whole file list -- nothing to keep in sync by hand.
+# source files this build needs (no ARM/x86 SIMD, no custom-modes
+# support, no multistream/ambisonics), so a plain wildcard over its four
+# source directories is the whole file list -- nothing to keep in sync
+# by hand. silk/fixed/*.c (added alongside encode) is the SILK fixed-
+# point analysis engine (LPC/pitch/noise-shaping); decode alone never
+# needed any file from that directory.
 OPUS_CODEC_VENDOR := tapes/opus-codec/vendor/opus
-OPUS_CODEC_SOURCES := $(wildcard $(OPUS_CODEC_VENDOR)/celt/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/silk/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/src/*.c)
+OPUS_CODEC_SOURCES := $(wildcard $(OPUS_CODEC_VENDOR)/celt/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/silk/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/silk/fixed/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/src/*.c)
 OPUS_CODEC_OBJS := $(patsubst $(OPUS_CODEC_VENDOR)/%.c,$(BUILD)/tapes/opus-codec/%.o,$(OPUS_CODEC_SOURCES))
 OPUS_CODEC_LIB := $(BUILD)/tapes/opus-codec/libopus_fixed.a
 OPUS_CODEC_CFLAGS := -m32 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -msoft-float -ffunction-sections -fdata-sections -DHAVE_CONFIG_H -Itapes/opus-codec -I$(OPUS_CODEC_VENDOR)/include -I$(OPUS_CODEC_VENDOR)/celt -I$(OPUS_CODEC_VENDOR)/silk -I$(OPUS_CODEC_VENDOR)/silk/fixed
 
-$(BUILD)/tapes/opus-codec/%.o: $(OPUS_CODEC_VENDOR)/%.c
+$(BUILD)/tapes/opus-codec/%.o: $(OPUS_CODEC_VENDOR)/%.c tapes/opus-codec/config.h tapes/opus-codec/custom_support.h
 	mkdir -p $(dir $@)
 	gcc $(OPUS_CODEC_CFLAGS) -c $< -o $@
 
