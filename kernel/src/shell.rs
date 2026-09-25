@@ -1017,205 +1017,6 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
     println!("{USAGE}");
 }
 
-/// A USB Audio Class 1.0 playback endpoint this driver can actually
-/// drive: PCM, 16-bit, a single fixed discrete sample rate divisible by
-/// 1000 (so every isochronous packet is the same fixed size for the
-/// whole stream -- a device like a 44100 Hz one, which would need a
-/// varying packet size frame-to-frame, is deliberately out of scope; see
-/// AGENTS.md's "USB" section), and a Synchronous or Adaptive (not
-/// Asynchronous, which would need an unimplemented feedback endpoint)
-/// isochronous OUT endpoint whose declared `wMaxPacketSize` is at least
-/// this nominal per-frame byte count. `packet_bytes` is always that
-/// computed *nominal* count, never the endpoint's own declared maximum:
-/// a real Adaptive-sync device (confirmed against a genuine USB Audio
-/// Class 1.0 sound card, not just QEMU's Synchronous-only emulated one)
-/// legitimately declares some slack above nominal to tolerate a sample
-/// or so of clock drift per frame against its own crystal, but this
-/// driver always sends exactly the nominal size regardless -- correct
-/// and sufficient for a short stream, where that drift is negligible;
-/// real feedback-based rate adaptation for a long-running Adaptive
-/// stream remains explicitly out of scope, the same limit already
-/// covering Asynchronous sync devices outright.
-struct UacPlaybackEndpoint {
-    interface_number: u8,
-    alternate_setting: u8,
-    endpoint_address: u8,
-    packet_bytes: u16,
-    sample_rate: u32,
-    channels: u8,
-    bits_per_sample: u8,
-}
-
-/// Walks a configuration descriptor's raw bytes generically, one
-/// sub-descriptor at a time (each one's own `bLength` at byte 0),
-/// looking for one AudioStreaming alternate setting with a working
-/// isochronous OUT endpoint. See `UacPlaybackEndpoint`'s own doc comment
-/// for exactly which UAC1 shapes qualify; anything else (a continuous
-/// sample-rate range, Asynchronous sync, non-16-bit, or a declared
-/// packet size too small for the computed nominal one) is skipped
-/// rather than guessed at.
-fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
-    const DESC_INTERFACE: u8 = 0x04;
-    const DESC_CS_INTERFACE: u8 = 0x24;
-    const DESC_ENDPOINT: u8 = 0x05;
-    const SUBTYPE_AS_GENERAL: u8 = 0x01;
-    const SUBTYPE_FORMAT_TYPE: u8 = 0x02;
-    const CLASS_AUDIO: u8 = 0x01;
-    const SUBCLASS_AUDIOSTREAMING: u8 = 0x02;
-
-    let mut offset = 0usize;
-    let mut interface_number = 0u8;
-    let mut alternate_setting = 0u8;
-    let mut in_playback_interface = false;
-    let mut format_ok = false;
-    let mut sample_rate = 0u32;
-    let mut channels = 0u8;
-    let mut bits_per_sample = 0u8;
-
-    while offset + 1 < config.len() {
-        let length = config[offset] as usize;
-        if length < 2 || offset + length > config.len() {
-            break;
-        }
-        let descriptor_type = config[offset + 1];
-        match descriptor_type {
-            DESC_INTERFACE if length >= 9 => {
-                interface_number = config[offset + 2];
-                alternate_setting = config[offset + 3];
-                let num_endpoints = config[offset + 4];
-                let class = config[offset + 5];
-                let subclass = config[offset + 6];
-                // UAC1's own convention: an AudioStreaming interface's
-                // alternate setting 0 always declares zero endpoints
-                // ("idle"/zero-bandwidth); this naturally skips it and
-                // only considers an alternate setting with a real
-                // streaming endpoint.
-                in_playback_interface =
-                    class == CLASS_AUDIO && subclass == SUBCLASS_AUDIOSTREAMING && num_endpoints == 1;
-                format_ok = false;
-            }
-            DESC_CS_INTERFACE if in_playback_interface && length >= 3 => {
-                let subtype = config[offset + 2];
-                if subtype == SUBTYPE_AS_GENERAL && length >= 7 {
-                    let format_tag = u16::from_le_bytes([config[offset + 5], config[offset + 6]]);
-                    format_ok = format_tag == 1; // PCM
-                } else if subtype == SUBTYPE_FORMAT_TYPE && format_ok && length >= 8 {
-                    let format_type = config[offset + 3];
-                    let nr_channels = config[offset + 4];
-                    let bit_resolution = config[offset + 6];
-                    let sam_freq_type = config[offset + 7];
-                    if format_type == 1 && bit_resolution == 16 && sam_freq_type >= 1 && length >= 11 {
-                        // tSamFreq[0]: the first (and, for this plan's
-                        // scope, only usable) discrete sample rate --
-                        // continuous-range devices (`bSamFreqType == 0`)
-                        // are rejected above.
-                        sample_rate = u32::from(config[offset + 8])
-                            | (u32::from(config[offset + 9]) << 8)
-                            | (u32::from(config[offset + 10]) << 16);
-                        channels = nr_channels;
-                        bits_per_sample = bit_resolution;
-                    } else {
-                        format_ok = false;
-                    }
-                }
-            }
-            DESC_ENDPOINT if in_playback_interface && format_ok && length >= 7 => {
-                let endpoint_address = config[offset + 2];
-                let attributes = config[offset + 3];
-                let max_packet_size = u16::from_le_bytes([config[offset + 4], config[offset + 5]]);
-                let transfer_type = attributes & 0x03;
-                let sync_type = (attributes >> 2) & 0x03;
-                let is_out = endpoint_address & 0x80 == 0;
-                let is_isochronous = transfer_type == 0x01;
-                let sync_supported = sync_type == 0x02 || sync_type == 0x03; // Adaptive|Synchronous
-                let nominal_bytes =
-                    (sample_rate / 1000) * u32::from(channels) * (u32::from(bits_per_sample) / 8);
-                // The endpoint must declare *at least* room for our
-                // fixed-cadence nominal packet -- exact equality (QEMU's
-                // Synchronous device) and real slack above it (a real
-                // Adaptive device) both qualify; too little room does not.
-                let usable_packet_size = sample_rate % 1000 == 0 && u32::from(max_packet_size) >= nominal_bytes;
-                if is_isochronous && is_out && sync_supported && usable_packet_size {
-                    return Some(UacPlaybackEndpoint {
-                        interface_number,
-                        alternate_setting,
-                        endpoint_address,
-                        packet_bytes: nominal_bytes as u16,
-                        sample_rate,
-                        channels,
-                        bits_per_sample,
-                    });
-                }
-            }
-            _ => {}
-        }
-        offset += length;
-    }
-    None
-}
-
-/// Scans every discovered controller/port for a device offering a
-/// usable playback endpoint (`find_uac_playback_endpoint`), completing
-/// `SET_ADDRESS`/`SET_CONFIGURATION`/`set_interface` on the first match.
-/// Mirrors `enumerate_usb_port`'s own "reset and redo everything from
-/// scratch" sequence rather than depending on a separate, prior `usb`
-/// call having already addressed the device -- so `usb play` alone,
-/// with no `usb` run first, is always enough.
-fn find_playback_device() -> Option<(&'static uhci::Uhci, UacPlaybackEndpoint)> {
-    const DEVICE_ADDRESS: u8 = 1;
-
-    let count = uhci::count();
-    for index in 0..count {
-        let Some(controller) = uhci::get(index) else { continue };
-        for port in 0..uhci::UHCI_PORTS {
-            let Ok(low_speed) = controller.reset_port(port) else { continue };
-            if low_speed {
-                continue;
-            }
-            let mut first8 = [0u8; 8];
-            if controller.get_descriptor(0, 8, uhci::USB_DESCRIPTOR_DEVICE, &mut first8).is_err() {
-                continue;
-            }
-            let max_packet0 = first8[7];
-            if controller.set_address(DEVICE_ADDRESS).is_err() {
-                continue;
-            }
-            let mut config_header = [0u8; 9];
-            if controller
-                .get_descriptor(DEVICE_ADDRESS, max_packet0, uhci::USB_DESCRIPTOR_CONFIGURATION, &mut config_header)
-                .is_err()
-            {
-                continue;
-            }
-            let total_length = (u16::from_le_bytes([config_header[2], config_header[3]]) as usize)
-                .min(uhci::MAX_DESCRIPTOR_BYTES);
-            let mut config = [0u8; uhci::MAX_DESCRIPTOR_BYTES];
-            let Ok(read) = controller.get_descriptor(
-                DEVICE_ADDRESS,
-                max_packet0,
-                uhci::USB_DESCRIPTOR_CONFIGURATION,
-                &mut config[..total_length],
-            ) else {
-                continue;
-            };
-            let Some(endpoint) = find_uac_playback_endpoint(&config[..read]) else { continue };
-            // bConfigurationValue is the configuration descriptor's 6th byte.
-            let config_value = config.get(5).copied().unwrap_or(0);
-            if controller.set_configuration(DEVICE_ADDRESS, max_packet0, config_value).is_err() {
-                continue;
-            }
-            if controller
-                .set_interface(DEVICE_ADDRESS, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
-                .is_err()
-            {
-                continue;
-            }
-            return Some((controller, endpoint));
-        }
-    }
-    None
-}
-
 /// Streams a raw PCM file already matching a discovered playback
 /// device's exact negotiated format (no resampling or reformatting --
 /// the same expectation every other audio backend here already has) to
@@ -1225,9 +1026,9 @@ fn find_playback_device() -> Option<(&'static uhci::Uhci, UacPlaybackEndpoint)> 
 /// isochronous engine's TD buffer pointers reference it directly, with
 /// no separate packet-buffer pool or copy step needed.
 fn usb_play_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
-    const DEVICE_ADDRESS: u8 = 1; // matches find_playback_device's own fixed address
+    const DEVICE_ADDRESS: u8 = 1; // matches uhci::find_playback_device's own fixed address
 
-    let Some((controller, endpoint)) = find_playback_device() else {
+    let Some((controller, endpoint)) = uhci::find_playback_device() else {
         println!("No USB Audio Class playback device found (needs PCM,");
         println!("16-bit, a fixed rate divisible by 1000, and a");
         println!("Synchronous/Adaptive isochronous OUT endpoint).");
@@ -1369,7 +1170,15 @@ fn audio_status() {
                     "  IRQ {irq}: {raw} raw fire(s), {interrupts} recognized as DAC1."
                 );
             }
-            None => println!("  No legacy PCI IRQ line assigned; audio is silent."),
+            // Was safe to assume "no IRQ line" meant "not actually
+            // playing" back when only ES1370/HDA existed here (IRQ
+            // registration is required for either to ever reach this
+            // facade at all) -- but it is the *normal*, expected state
+            // for a USB Audio device, which is never silent just
+            // because it has no IRQ (see `uhci::UsbAudioDevice::
+            // interrupt_stats`'s own doc comment: it is foreground-
+            // polled, not IRQ-driven, by design).
+            None => println!("  No legacy PCI IRQ line (foreground-polled, not IRQ-driven, for this backend)."),
         }
         println!("  DAC1: {periods} periods refilled since boot.");
         println!(
@@ -2460,6 +2269,12 @@ fn relay_pending_tape_output(nic: &nic::Nic, peer: &[u8; 6], source: &[u8; 6]) {
 /// few callers (the tape polling callbacks) may run with no NIC at all.
 fn poll_background_work(nic: Option<&nic::Nic>) {
     relay_pending_print_output();
+    // Unconditional (unlike everything below, which needs a NIC): keeps
+    // an active USB Audio playback stream's Frame List window filled,
+    // if `audio::initialize()` ever discovered one. There is no IRQ
+    // driving it on its own -- see `uhci::service_active_playback`'s own
+    // doc comment.
+    uhci::service_active_playback();
     let Some(nic) = nic else { return };
     if console::relay_enabled() {
         if let (Some(peer), Some(source)) =

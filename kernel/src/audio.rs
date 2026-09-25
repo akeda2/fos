@@ -36,6 +36,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::es1370;
 use crate::hda;
+use crate::uhci;
 
 /// One playback device's fixed sample format. Never negotiated or
 /// converted by this kernel -- a producer (an audio-streaming tape) must
@@ -209,6 +210,12 @@ impl PcmRing {
 pub enum Audio {
     Es1370(&'static es1370::Es1370),
     Hda(&'static hda::Hda),
+    /// A USB Audio Class playback device discovered over UHCI -- see
+    /// `uhci::UsbAudioDevice`'s own doc comment. Playback only: this
+    /// variant's `capture`-family methods always report zero, since
+    /// isochronous capture (IN) is not implemented (see `uhci.rs`'s
+    /// module doc comment and AGENTS.md's "USB" section).
+    Uhci(&'static uhci::UsbAudioDevice),
 }
 
 impl Audio {
@@ -216,6 +223,7 @@ impl Audio {
         match self {
             Audio::Es1370(_) => "ES1370",
             Audio::Hda(_) => "Intel HDA",
+            Audio::Uhci(device) => device.driver_name(),
         }
     }
 
@@ -223,6 +231,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.format(),
             Audio::Hda(card) => card.format(),
+            Audio::Uhci(device) => device.format(),
         }
     }
 
@@ -235,6 +244,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.submit(data),
             Audio::Hda(card) => card.submit(data),
+            Audio::Uhci(device) => device.submit(data),
         }
     }
 
@@ -242,6 +252,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.underrun_count(),
             Audio::Hda(card) => card.underrun_count(),
+            Audio::Uhci(device) => device.underrun_count(),
         }
     }
 
@@ -251,6 +262,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.ring_backlog(),
             Audio::Hda(card) => card.ring_backlog(),
+            Audio::Uhci(device) => device.ring_backlog(),
         }
     }
 
@@ -258,6 +270,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.interrupt_stats(),
             Audio::Hda(card) => card.interrupt_stats(),
+            Audio::Uhci(device) => device.interrupt_stats(),
         }
     }
 
@@ -269,6 +282,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.io_base() as u32,
             Audio::Hda(card) => card.io_base(),
+            Audio::Uhci(device) => device.io_base(),
         }
     }
 
@@ -276,6 +290,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.raw_status(),
             Audio::Hda(card) => card.raw_status(),
+            Audio::Uhci(device) => device.raw_status(),
         }
     }
 
@@ -288,6 +303,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.capture(out),
             Audio::Hda(card) => card.capture(out),
+            Audio::Uhci(device) => device.capture(out),
         }
     }
 
@@ -295,6 +311,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.capture_overrun_count(),
             Audio::Hda(card) => card.capture_overrun_count(),
+            Audio::Uhci(device) => device.capture_overrun_count(),
         }
     }
 
@@ -304,6 +321,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.capture_backlog(),
             Audio::Hda(card) => card.capture_backlog(),
+            Audio::Uhci(device) => device.capture_backlog(),
         }
     }
 
@@ -313,15 +331,20 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.capture_periods(),
             Audio::Hda(card) => card.capture_periods(),
+            Audio::Uhci(device) => device.capture_periods(),
         }
     }
 }
 
 /// Maximum simultaneously usable audio devices: `es1370::MAX_INSTANCES`
-/// plus `hda::MAX_INSTANCES`, since both backends now share one flat
-/// `DEVICES` array -- see `initialize`'s own doc comment for why there
-/// is no per-backend cap here, only this one combined ceiling.
-pub const MAX_DEVICES: usize = es1370::MAX_INSTANCES + hda::MAX_INSTANCES;
+/// plus `hda::MAX_INSTANCES`, plus exactly one USB Audio slot, since all
+/// three backends now share one flat `DEVICES` array -- see
+/// `initialize`'s own doc comment for why there is no per-backend cap
+/// here, only this one combined ceiling. There is no `uhci::MAX_INSTANCES`
+/// to add instead: `uhci::find_playback_device` only ever claims the
+/// first matching device across every controller/port, so at most one
+/// USB Audio device is ever possible here regardless.
+pub const MAX_DEVICES: usize = es1370::MAX_INSTANCES + hda::MAX_INSTANCES + 1;
 
 static mut DEVICES: [Option<Audio>; MAX_DEVICES] = [const { None }; MAX_DEVICES];
 static mut DEVICE_COUNT: usize = 0;
@@ -391,6 +414,16 @@ pub fn initialize() -> Result<usize, Status> {
                     DEVICES[DEVICE_COUNT] = Some(Audio::Hda(controller));
                     DEVICE_COUNT += 1;
                 }
+            }
+        }
+
+        // At most one USB Audio device is ever possible -- see
+        // `MAX_DEVICES`'s own doc comment -- so this is a plain `if`,
+        // not a loop like the two backends above.
+        if DEVICE_COUNT < MAX_DEVICES {
+            if let Some(device) = uhci::discover_playback_device() {
+                DEVICES[DEVICE_COUNT] = Some(Audio::Uhci(device));
+                DEVICE_COUNT += 1;
             }
         }
 

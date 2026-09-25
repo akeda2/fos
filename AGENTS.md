@@ -1096,8 +1096,9 @@ packets, and the QEMU-captured WAV file's dominant frequency (a
 single-bin Goertzel DFT, the same dependency-free technique
 `tapes/test_audio_rtp_opus_e2e.py` already uses) matches the seeded tone
 -- real, audible, correct playback, not just a clean-looking status
-line. Isochronous *capture* (IN) and `audio.rs`/tape-ABI integration
-remain explicit follow-on work; see "Deliberately deferred work" below.
+line. Isochronous *capture* (IN) remains explicit follow-on work; see
+"Deliberately deferred work" below. `audio.rs`/tape-ABI integration is
+covered next.
 
 #### Confirmed on real, non-emulated USB Audio Class hardware
 
@@ -1148,6 +1149,81 @@ for this (there's no way to attach real hardware to `make test`'s QEMU
 fixture) -- this was a manual, one-time verification session, the same
 category of confirmation `tapes/longmode.S`'s own real-hardware section
 above documents.
+
+#### `audio.rs` integration: a USB device tapes can actually target
+
+`usb play` proved the isochronous engine but only as a one-shot file
+player, invisible to the tape ABI -- a tape like `audio-net`/`audio-rtp`
+can only ever reach a device through `audio.rs`'s `Audio` enum and its
+`audio_submit_at`/... callbacks, the same way it already reaches
+ES1370/HDA. `uhci::UsbAudioDevice` (a thin wrapper: the owning
+controller, the discovered `UacPlaybackEndpoint`, and an `UnsafeCell`-
+guarded `IsocOutStream` -- the same single-threaded interior-mutability
+pattern `PcmRing` itself already relies on) is now a third `Audio`
+variant, `Audio::Uhci`. `audio::initialize()` gains a third discovery
+phase after ES1370/HDA's: `uhci::discover_playback_device()` calls the
+same `find_playback_device()` `usb play` uses (moved into `uhci.rs` so
+both callers share it, since `audio.rs` must not depend back on
+`shell.rs`), then immediately starts a dedicated `PcmRing`-fed
+`IsocOutStream` -- discovered once, like every other backend here;
+plugging a device in after that first call isn't noticed until reboot.
+
+The isochronous engine itself gained a second data source alongside
+`usb play`'s existing zero-copy fixed buffer: `IsocOutSource::Ring`,
+draining a `PcmRing` via `pop_into` (falling back to silence on
+underrun, mirroring `Es1370::fill_period` exactly) into a small
+dedicated packet-copy pool, and never reporting `Finished` -- unlike a
+file, a live network-fed stream has no natural end. Because there is no
+interrupt for this backend at all, `poll_background_work` (`shell.rs`)
+gained one more unconditional call, `uhci::service_active_playback`,
+keeping the active stream's look-ahead window filled whenever *any*
+foreground loop happens to be running (a tape's own receive loop, `nic
+sniff`, `term_net`, ...) -- sitting idle at the local prompt starves it,
+an honest tradeoff of having no isochronous IRQ path, unlike ES1370/
+HDA's unconditional ISR-driven playback.
+
+Two more real bugs surfaced building this, again only by actually
+streaming real audio rather than trusting the design on paper:
+
+- **A permanent-stall bug in `service`'s own window-tracking math.**
+  `next_index.wrapping_sub(current) & FRAME_INDEX_MASK` is *unsigned*
+  modulo 1024, so "3 frames behind schedule" (a value of 1021) is
+  indistinguishable from "1021 frames ahead" without a sign correction --
+  a caller that goes a while between calls (exactly `audio-net`'s own
+  receive loop, paced by how often network frames actually arrive, not a
+  fixed timer) looked *already caught up* by this miscalculation and
+  silently primed nothing at all from that point on, permanently
+  starving the ring. Fixed by computing a genuinely signed gap (treating
+  a raw value past half the Frame List's range as negative) and, when
+  behind, resyncing a few frames ahead of *now* rather than mechanically
+  replaying an unrecoverable backlog into slots that would otherwise
+  only play a full ~1 s lap later.
+- **`ISOC_TD_COUNT`'s look-ahead window needed real margin against host-
+  scheduling jitter, not just uniform per-call overhead.** The original
+  16 ms (sized for `usb play`'s own tight, gap-free polling loop) was
+  provably too thin for `poll_background_work`-driven servicing: an
+  otherwise-correct stream still intermittently dropped a small fraction
+  of a percent of submitted bytes under this project's own QEMU dev
+  environment, tightening to zero only once raised to 250 ms -- verified
+  by five consecutive clean (zero-drop) runs at that size, where 16 ms
+  and 64 ms each still occasionally dropped a few hundred bytes. 250 ms
+  of playback latency is imperceptible for this use case; the real fix
+  for a tighter bound would be an actual isochronous IRQ path, which
+  remains out of scope.
+
+Verified end to end by `tapes/test_uhci_audio_facade_e2e.py`: mirrors
+`tapes/test_audio_net_e2e.py`'s exact shape (the unmodified `audio-net`
+tape, loaded and run over `term net`, this script acting as the sending
+peer) but with only `piix3-usb-uhci`/`usb-audio` attached -- no ES1370/
+HDA -- so the USB device becomes `audio::get()`'s device 0 automatically
+and the tape's existing, non-indexed `audio_submit` path reaches it with
+zero tape-code changes. Confirms the discovered format, zero dropped
+bytes, and the QEMU-captured WAV file's Goertzel-DFT dominant frequency
+matching the sent tone. Also confirmed against the same real TerraTec
+card described above, via `usb-host` passthrough: the facade path
+(`audio` listing the device, `audio-net` streaming through it) works
+identically on genuine hardware, with the same "no automated coverage
+for real hardware" caveat as the rest of this section.
 
 ### Tape print callback ABI
 
@@ -2195,9 +2271,9 @@ MSI address/data encoding, and the full verification list) is in
   no sockets), and support for NIC families beyond the current RTL8139,
   selected 3C905, Intel e1000, and NE2000-compatible backends. USB itself
   is no longer fully deferred -- see "UHCI: a USB host controller driver,
-  and isochronous USB Audio playback" above for what's built (enumeration
-  and isochronous OUT/playback); isochronous IN (capture), `audio.rs`/
-  tape-ABI integration, and EHCI/OHCI/xHCI remain deferred.
+  and isochronous USB Audio playback" above for what's built (enumeration,
+  isochronous OUT/playback, and `audio.rs`/tape-ABI integration);
+  isochronous IN (capture) and EHCI/OHCI/xHCI remain deferred.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.
