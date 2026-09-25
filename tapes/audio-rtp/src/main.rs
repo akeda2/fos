@@ -140,6 +140,8 @@ type AudioSampleRateAt = extern "C" fn(u32) -> u32;
 type AudioChannelsAndBitsAt = extern "C" fn(u32) -> u32;
 type AudioSubmitAt = extern "C" fn(u32, u32, u32) -> u32;
 type AudioCaptureAt = extern "C" fn(u32, u32, u32) -> u32;
+type AudioCaptureSampleRate = extern "C" fn() -> u32;
+type AudioCaptureChannelsAndBits = extern "C" fn() -> u32;
 
 #[derive(Clone, Copy)]
 struct NetworkConfig {
@@ -176,6 +178,31 @@ fn local_format(
     }
     let sample_rate = audio_sample_rate_at(0);
     let packed = audio_channels_and_bits_at(0);
+    Some(AudioFormat {
+        sample_rate,
+        channels: (packed & 0xff) as u8,
+        bits_per_sample: ((packed >> 8) & 0xff) as u8,
+    })
+}
+
+/// The *capture*-direction counterpart to `local_format`. Not guaranteed
+/// to match `local_format`'s own (playback) result: a real device's
+/// capture interface can have a different channel count from its
+/// playback interface (confirmed against a real, physically tested USB
+/// Audio device -- stereo playback, mono capture). Any caller sourcing
+/// bytes from `audio_capture_at` must use this, not `local_format`, to
+/// correctly label and pack them (`capture_mode`'s own doc comment has
+/// the full story of the bug this fixed).
+fn capture_local_format(
+    audio_count: AudioCount,
+    audio_capture_sample_rate: AudioCaptureSampleRate,
+    audio_capture_channels_and_bits: AudioCaptureChannelsAndBits,
+) -> Option<AudioFormat> {
+    if audio_count() == 0 {
+        return None;
+    }
+    let sample_rate = audio_capture_sample_rate();
+    let packed = audio_capture_channels_and_bits();
     Some(AudioFormat {
         sample_rate,
         channels: (packed & 0xff) as u8,
@@ -1018,22 +1045,40 @@ fn capture_mode(
     peer_port: u16,
     codec: Codec,
     audio_count: AudioCount,
-    audio_sample_rate_at: AudioSampleRateAt,
-    audio_channels_and_bits_at: AudioChannelsAndBitsAt,
+    audio_capture_sample_rate: AudioCaptureSampleRate,
+    audio_capture_channels_and_bits: AudioCaptureChannelsAndBits,
     audio_capture_at: AudioCaptureAt,
 ) {
-    let Some(format) = local_format(audio_count, audio_sample_rate_at, audio_channels_and_bits_at) else {
+    // The *capture* direction's own format, not the playback format
+    // `send_mode` (replaying a file) uses -- a real device's capture
+    // interface is not guaranteed to share the playback interface's
+    // channel count (the real TerraTec Aureon Dual is stereo out, mono
+    // in), confirmed the hard way against physical hardware: an earlier
+    // version of this function queried the playback format here, which
+    // correctly captured real audio but mislabeled it with the playback
+    // channel count's RTP payload type.
+    let Some(capture_format) = capture_local_format(audio_count, audio_capture_sample_rate, audio_capture_channels_and_bits)
+    else {
         print_bytes(putc, b"audio-rtp: no audio device found.\n");
         return;
     };
-    let Some(payload_type) = payload_type_for(format) else {
-        print_bytes(putc, b"audio-rtp: local device format (");
-        print_format(putc, format);
-        print_bytes(putc, b") has no documented RTP payload type; cannot stream.\n");
+    // A raw-PCM payload type is only required for `Codec::Raw`: unlike
+    // the fixed raw-PCM table (`payload_type_for`, RFC 3551's one static
+    // stereo entry plus two documented stereo-only 48 kHz conventions),
+    // Opus encodes any channel count libopus itself accepts, so a device
+    // whose capture format has no raw-PCM table entry at all (a real
+    // mono-only USB microphone, confirmed against physical hardware) can
+    // still stream via `opus` even though its raw path cannot.
+    let payload_type = payload_type_for(capture_format);
+    if matches!(codec, Codec::Raw) && payload_type.is_none() {
+        print_bytes(putc, b"audio-rtp: local capture format (");
+        print_format(putc, capture_format);
+        print_bytes(putc, b") has no documented RTP payload type; cannot stream ");
+        print_bytes(putc, b"raw (try 'opus').\n");
         return;
-    };
+    }
     let opus_bitrate = match codec {
-        Codec::Opus { .. } if format.bits_per_sample != 16 => {
+        Codec::Opus { .. } if capture_format.bits_per_sample != 16 => {
             print_bytes(putc, b"audio-rtp: Opus capture needs a 16-bit device format.\n");
             return;
         }
@@ -1052,7 +1097,7 @@ fn capture_mode(
     };
 
     print_bytes(putc, b"audio-rtp: streaming live capture (");
-    print_format(putc, format);
+    print_format(putc, capture_format);
     print_bytes(putc, b") to ");
     print_ip(putc, peer_ip);
     print_bytes(putc, b":");
@@ -1070,15 +1115,15 @@ fn capture_mode(
     let mut bytes_sent = 0u64;
 
     if let Some(bitrate) = opus_bitrate {
-        let mut encoder = match OpusEncoder::new(format.sample_rate as i32, i32::from(format.channels), bitrate, alloc, free) {
+        let mut encoder = match OpusEncoder::new(capture_format.sample_rate as i32, i32::from(capture_format.channels), bitrate, alloc, free) {
             Ok(encoder) => encoder,
             Err(_) => {
                 print_bytes(putc, b"audio-rtp: could not start the Opus encoder for this device's rate.\n");
                 return;
             }
         };
-        let channels = usize::from(format.channels);
-        let frame_samples = format.sample_rate as usize / OPUS_FRAMES_PER_SECOND;
+        let channels = usize::from(capture_format.channels);
+        let frame_samples = capture_format.sample_rate as usize / OPUS_FRAMES_PER_SECOND;
         let frame_len = frame_samples * channels;
         // Accumulates captured PCM across loop iterations until a full
         // Opus frame is available: unlike the raw path, `audio_capture_at`
@@ -1144,7 +1189,11 @@ fn capture_mode(
         }
         free(scratch_addr, scratch_bytes);
     } else {
-        let wire_bytes_per_sample: usize = if format.bits_per_sample == 24 { 3 } else { 2 };
+        // Guaranteed `Some` here: `Codec::Raw` already required
+        // `payload_type_for(capture_format)` to succeed above, before
+        // resolving the peer's MAC or printing the startup banner.
+        let payload_type = payload_type.expect("checked above for Codec::Raw");
+        let wire_bytes_per_sample: usize = if capture_format.bits_per_sample == 24 { 3 } else { 2 };
         let mut wire_bytes = [0u8; RTP_PAYLOAD_BYTES];
 
         loop {
@@ -1163,7 +1212,7 @@ fn capture_mode(
             if captured == 0 {
                 continue;
             }
-            let wire_len = kernel_to_wire_pcm(&kernel_chunk[..captured], format.bits_per_sample, &mut wire_bytes);
+            let wire_len = kernel_to_wire_pcm(&kernel_chunk[..captured], capture_format.bits_per_sample, &mut wire_bytes);
             let frames_in_chunk = (wire_len / wire_bytes_per_sample) as u32;
 
             let rtp = RtpPacket::new(payload_type, false, sequence, timestamp, ssrc, &wire_bytes[..wire_len]);
@@ -1244,6 +1293,8 @@ fn duplex_mode(
     audio_count: AudioCount,
     audio_sample_rate_at: AudioSampleRateAt,
     audio_channels_and_bits_at: AudioChannelsAndBitsAt,
+    audio_capture_sample_rate: AudioCaptureSampleRate,
+    audio_capture_channels_and_bits: AudioCaptureChannelsAndBits,
     audio_submit_at: AudioSubmitAt,
     audio_capture_at: AudioCaptureAt,
 ) {
@@ -1257,9 +1308,31 @@ fn duplex_mode(
         print_bytes(putc, b") has no documented RTP payload type; cannot stream.\n");
         return;
     };
+    // The *capture*-direction format, used for the send side below --
+    // see `capture_local_format`'s own doc comment for why this must be
+    // independent of `format` (the playback direction, used for the
+    // receive side above): a real device's capture interface is not
+    // guaranteed to share the playback interface's channel count.
+    let Some(capture_format) =
+        capture_local_format(audio_count, audio_capture_sample_rate, audio_capture_channels_and_bits)
+    else {
+        print_bytes(putc, b"audio-rtp: no audio device found.\n");
+        return;
+    };
+    // A raw-PCM payload type is only required for `Codec::Raw` -- see
+    // `capture_mode`'s identical check for why: Opus encodes any channel
+    // count libopus itself accepts, unlike the fixed raw-PCM table.
+    let capture_payload_type = payload_type_for(capture_format);
+    if matches!(codec, Codec::Raw) && capture_payload_type.is_none() {
+        print_bytes(putc, b"audio-rtp: local capture format (");
+        print_format(putc, capture_format);
+        print_bytes(putc, b") has no documented RTP payload type; cannot stream ");
+        print_bytes(putc, b"raw (try 'opus').\n");
+        return;
+    }
     let opus_bitrate = match codec {
-        Codec::Opus { .. } if format.bits_per_sample != 16 => {
-            print_bytes(putc, b"audio-rtp: Opus duplex needs a 16-bit device format.\n");
+        Codec::Opus { .. } if capture_format.bits_per_sample != 16 => {
+            print_bytes(putc, b"audio-rtp: Opus duplex needs a 16-bit capture format.\n");
             return;
         }
         Codec::Opus { bitrate_bps } => Some(bitrate_bps.unwrap_or(opus_codec::DEFAULT_BITRATE_BPS)),
@@ -1268,11 +1341,21 @@ fn duplex_mode(
 
     let listen_port = DEFAULT_PORT;
 
-    print_bytes(putc, b"Local audio device: ");
+    print_bytes(putc, b"Local playback device: ");
     print_format(putc, format);
     print_bytes(putc, b" (RTP payload type ");
     print_u32(putc, u32::from(payload_type));
-    print_bytes(putc, b").\nDuplex: listening on UDP port ");
+    print_bytes(putc, b").\nLocal capture device: ");
+    print_format(putc, capture_format);
+    match capture_payload_type {
+        Some(pt) => {
+            print_bytes(putc, b" (RTP payload type ");
+            print_u32(putc, u32::from(pt));
+            print_bytes(putc, b").\n");
+        }
+        None => print_bytes(putc, b" (Opus-only; no raw RTP payload type documented).\n"),
+    }
+    print_bytes(putc, b"Duplex: listening on UDP port ");
     print_u32(putc, u32::from(listen_port));
     print_bytes(putc, b", streaming live capture to ");
     print_ip(putc, peer_ip);
@@ -1323,15 +1406,15 @@ fn duplex_mode(
     const ACCUM_CAPACITY: usize = OPUS_ENCODE_FRAME_CAPACITY_SAMPLES + KERNEL_PCM_SCRATCH_BYTES / 2;
     let mut send_encoder = match opus_bitrate {
         Some(bitrate) => {
-            let encoder = match OpusEncoder::new(format.sample_rate as i32, i32::from(format.channels), bitrate, alloc, free) {
+            let encoder = match OpusEncoder::new(capture_format.sample_rate as i32, i32::from(capture_format.channels), bitrate, alloc, free) {
                 Ok(encoder) => encoder,
                 Err(_) => {
                     print_bytes(putc, b"audio-rtp: could not start the Opus encoder for this device's rate.\n");
                     return;
                 }
             };
-            let channels = usize::from(format.channels);
-            let frame_samples = format.sample_rate as usize / OPUS_FRAMES_PER_SECOND;
+            let channels = usize::from(capture_format.channels);
+            let frame_samples = capture_format.sample_rate as usize / OPUS_FRAMES_PER_SECOND;
             let frame_len = frame_samples * channels;
             let accum_bytes = ACCUM_CAPACITY as u32 * 2;
             let accum_addr = alloc(accum_bytes);
@@ -1358,7 +1441,7 @@ fn duplex_mode(
             }
         }
         None => SendEncoder::Raw {
-            wire_bytes_per_sample: if format.bits_per_sample == 24 { 3 } else { 2 },
+            wire_bytes_per_sample: if capture_format.bits_per_sample == 24 { 3 } else { 2 },
         },
     };
 
@@ -1496,9 +1579,13 @@ fn duplex_mode(
         if captured != 0 {
             match &mut send_encoder {
                 SendEncoder::Raw { wire_bytes_per_sample } => {
-                    let wire_len = kernel_to_wire_pcm(&kernel_chunk[..captured], format.bits_per_sample, &mut wire_bytes);
+                    // Guaranteed `Some`: `SendEncoder::Raw` is only ever
+                    // constructed for `Codec::Raw`, which already
+                    // required this to succeed above.
+                    let capture_payload_type = capture_payload_type.expect("checked above for Codec::Raw");
+                    let wire_len = kernel_to_wire_pcm(&kernel_chunk[..captured], capture_format.bits_per_sample, &mut wire_bytes);
                     let frames_in_chunk = (wire_len / *wire_bytes_per_sample) as u32;
-                    let rtp = RtpPacket::new(payload_type, false, sequence, timestamp, ssrc, &wire_bytes[..wire_len]);
+                    let rtp = RtpPacket::new(capture_payload_type, false, sequence, timestamp, ssrc, &wire_bytes[..wire_len]);
                     if let Ok(length) =
                         build_rtp_udp_frame(&mut tx_frame, own_mac, peer_mac, local, peer_ip, DEFAULT_PORT, peer_port, &rtp)
                     {
@@ -1576,12 +1663,16 @@ fn duplex_mode(
     print_bytes(putc, b" byte(s) sent.\n");
 }
 
-/// Declares the complete current thirty-parameter tape ABI (see
-/// `kernel/src/shell.rs`'s `TapeEntry`). `read_key`/`terminal_position`/
-/// `fs_write`/`fs_remove`/the non-`_at` `nic_*`/`audio_*` slots are
-/// unused (this tape does no line editing, writes no files, and only
-/// ever targets device 0 through the `_at` callbacks) but must still be
-/// declared, in order, per the append-only cdecl convention.
+/// Declares a leading prefix of the current tape ABI (see
+/// `kernel/src/shell.rs`'s `TapeEntry`) through `audio_capture_channels_
+/// and_bits` -- the trailing `_at`-suffixed capture-format callbacks are
+/// a valid omission, per this ABI's own "may only omit a *trailing* run
+/// of parameters" rule, since this tape only ever targets device 0.
+/// `read_key`/`terminal_position`/`fs_write`/`fs_remove`/the non-`_at`
+/// `nic_*`/`audio_*` slots are unused (this tape does no line editing,
+/// writes no files, and only ever targets device 0 through the `_at`
+/// callbacks) but must still be declared, in order, per the append-only
+/// cdecl convention.
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(
     putc: Putc,
@@ -1615,6 +1706,8 @@ pub extern "C" fn tape_main(
     audio_channels_and_bits_at: AudioChannelsAndBitsAt,
     audio_submit_at: AudioSubmitAt,
     audio_capture_at: AudioCaptureAt,
+    audio_capture_sample_rate: AudioCaptureSampleRate,
+    audio_capture_channels_and_bits: AudioCaptureChannelsAndBits,
 ) {
     let mut own_mac_bytes = [0u8; 6];
     if nic_mac(own_mac_bytes.as_mut_ptr() as u32) == 0 {
@@ -1716,8 +1809,8 @@ pub extern "C" fn tape_main(
             peer_port,
             codec,
             audio_count,
-            audio_sample_rate_at,
-            audio_channels_and_bits_at,
+            audio_capture_sample_rate,
+            audio_capture_channels_and_bits,
             audio_capture_at,
         ),
         StreamMode::Duplex { peer_ip, peer_port, codec } => duplex_mode(
@@ -1736,6 +1829,8 @@ pub extern "C" fn tape_main(
             audio_count,
             audio_sample_rate_at,
             audio_channels_and_bits_at,
+            audio_capture_sample_rate,
+            audio_capture_channels_and_bits,
             audio_submit_at,
             audio_capture_at,
         ),

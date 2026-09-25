@@ -2400,10 +2400,44 @@ packet arrives *before* the host finishes sending its tone -- ruling out
 an accidental "receive fully, then send" serialization bug, not just
 proving the code compiles.
 
-Real-hardware interop (a genuine `ffmpeg` session against real fos
-hardware) and the 24-bit path this tape's format table already accounts
-for (Opus included, since it needs a 16-bit local device) remain future
-work.
+**Verified against the real TerraTec Aureon Dual USB** (the same
+physically tested class-compliant USB Audio device the UHCI section
+above uses), via QEMU `usb-host` passthrough: this surfaced a real bug,
+invisible on every QEMU-only test above because ES1370/HDA both happen
+to share one format between playback and capture. `capture_mode`/
+`duplex_mode` used to query only `local_format()` (the *playback*
+format) and reuse it for the send side too -- silently correct for
+ES1370/HDA, but wrong for the real TerraTec card (stereo playback, mono
+capture): the outgoing captured audio was genuinely mono but got
+RTP-labeled with the stereo payload type computed from the playback
+format, and Opus was constructed with the wrong channel count. Fixed by
+adding `capture_local_format()` (`main.rs`), a `local_format()` twin
+built on the tape ABI's dedicated capture-format callbacks
+(`audio_capture_sample_rate`/`audio_capture_channels_and_bits`, added to
+the ABI in the session that built `capture_format()` on the kernel side
+but never actually consumed by this tape until now) -- every byte
+sourced from `audio_capture_at` in either function now uses this, not
+`local_format()`. A second, related fix: requiring a raw-PCM payload
+type (`payload_type_for`, RFC 3551's one static entry plus two
+documented stereo-only 48 kHz conventions) unconditionally, even for
+Opus, meant a mono-only capture device -- which has no raw-PCM table
+entry at all, since every entry is stereo-only -- couldn't stream via
+`opus` either, even though Opus itself is channel-count-flexible and
+never needed that lookup. Both `capture_mode`/`duplex_mode` now only
+require it for `Codec::Raw`. With both fixes, `duplex opus` against the
+real card played a real tone through its line-out (400 periods, byte-
+exact match to what was sent) while simultaneously capturing real,
+non-silent microphone audio (peak 2785, stdev 57.5 after decode) and
+Opus-encoding/streaming it out, correctly labeled -- decoded back and
+verified via the same host-side vendored-decoder technique
+`tapes/test_audio_rtp_opus_send_e2e.py` already uses, confirming genuine
+concurrent real-hardware duplex, not just the QEMU-only structural proof
+above.
+
+Real-hardware interop with a genuine, unmodified `ffmpeg` session (as
+opposed to this project's own hand-built test/verification scripts) and
+the 24-bit path this tape's format table already accounts for (Opus
+included, since it needs a 16-bit local device) remain future work.
 
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 
