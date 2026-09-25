@@ -41,6 +41,7 @@ pub enum StartupError {
     UnknownMode,
     WrongArgumentCount,
     BadAddress,
+    BadNetmask,
 }
 
 /// Parse a dotted-decimal IPv4 address without allocation or formatting
@@ -72,6 +73,44 @@ pub fn parse_ipv4(text: &[u8]) -> Option<Ipv4Address> {
     }
 
     (component == 4).then_some(Ipv4Address::new(octets))
+}
+
+/// Parses a `/PREFIX` (0-32) CIDR suffix into its equivalent dotted
+/// netmask -- mirrors `tapes/audio-rtp`/`tapes/telnet`/`tapes/router`'s
+/// own identical, independently-duplicated helper of the same name (no
+/// shared `tape-net` parser exists for this; each tape keeps its own
+/// small copy, consistent with this project's "small, explainable, no
+/// premature shared abstraction" philosophy).
+fn parse_prefix_mask(text: &[u8]) -> Option<Ipv4Address> {
+    let prefix = text.strip_prefix(b"/").and_then(|value| {
+        if value.is_empty() {
+            return None;
+        }
+        let mut number = 0u32;
+        for &byte in value {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            number = number.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+        }
+        Some(number)
+    })?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    Some(Ipv4Address::new(mask.to_be_bytes()))
+}
+
+/// Parses a combined `IP/PREFIX` token (both halves in one word) --
+/// mirrors `tapes/audio-rtp`'s `parse_cidr` of the same name.
+fn parse_cidr(text: &[u8]) -> core::result::Result<(Ipv4Address, Ipv4Address), StartupError> {
+    let Some(slash) = text.iter().position(|&byte| byte == b'/') else {
+        return Err(StartupError::BadAddress);
+    };
+    let address = parse_ipv4(&text[..slash]).ok_or(StartupError::BadAddress)?;
+    let netmask = parse_prefix_mask(&text[slash..]).ok_or(StartupError::BadNetmask)?;
+    Ok((address, netmask))
 }
 
 fn split_words<'a>(input: &'a [u8], words: &mut [Option<&'a [u8]>; 5]) -> usize {
@@ -106,12 +145,40 @@ pub fn parse_startup(input: &[u8]) -> core::result::Result<StartupMode, StartupE
     }
 
     match words[0].unwrap() {
-        b"static" if count == 4 || count == 5 => {
-            let local = parse_ipv4(words[1].unwrap()).ok_or(StartupError::BadAddress)?;
-            let netmask = parse_ipv4(words[2].unwrap()).ok_or(StartupError::BadAddress)?;
-            let gateway = parse_ipv4(words[3].unwrap()).ok_or(StartupError::BadAddress)?;
-            let peer = if count == 5 {
-                Some(parse_ipv4(words[4].unwrap()).ok_or(StartupError::BadAddress)?)
+        // Accepts three forms, matching telnet/audio-rtp/router's own
+        // identical convention: a combined `LOCAL_IP/PREFIX GATEWAY
+        // [PEER_IP]` (one word for address+prefix), a separate
+        // `LOCAL_IP /PREFIX GATEWAY [PEER_IP]` (prefix as its own word),
+        // or the legacy dotted `LOCAL_IP NETMASK GATEWAY [PEER_IP]`.
+        b"static" => {
+            if count < 3 {
+                return Err(StartupError::WrongArgumentCount);
+            }
+            let (local, netmask, next) = if words[1].unwrap().contains(&b'/') {
+                let (address, mask) = parse_cidr(words[1].unwrap())?;
+                (address, mask, 2)
+            } else if words[2].unwrap().starts_with(b"/") {
+                (
+                    parse_ipv4(words[1].unwrap()).ok_or(StartupError::BadAddress)?,
+                    parse_prefix_mask(words[2].unwrap()).ok_or(StartupError::BadNetmask)?,
+                    3,
+                )
+            } else {
+                if count < 4 {
+                    return Err(StartupError::WrongArgumentCount);
+                }
+                (
+                    parse_ipv4(words[1].unwrap()).ok_or(StartupError::BadAddress)?,
+                    parse_ipv4(words[2].unwrap()).ok_or(StartupError::BadNetmask)?,
+                    3,
+                )
+            };
+            if count != next + 1 && count != next + 2 {
+                return Err(StartupError::WrongArgumentCount);
+            }
+            let gateway = parse_ipv4(words[next].unwrap()).ok_or(StartupError::BadAddress)?;
+            let peer = if count == next + 2 {
+                Some(parse_ipv4(words[next + 1].unwrap()).ok_or(StartupError::BadAddress)?)
             } else {
                 None
             };
@@ -129,7 +196,7 @@ pub fn parse_startup(input: &[u8]) -> core::result::Result<StartupMode, StartupE
                 None
             },
         }),
-        b"static" | b"dhcp" => Err(StartupError::WrongArgumentCount),
+        b"dhcp" => Err(StartupError::WrongArgumentCount),
         _ => Err(StartupError::UnknownMode),
     }
 }
@@ -200,6 +267,44 @@ mod tests {
         assert_eq!(
             parse_startup(b"static 192.0.2.7 255.255.255.0"),
             Err(StartupError::WrongArgumentCount)
+        );
+    }
+
+    #[test]
+    fn parses_cidr_startup_syntax() {
+        let expected_no_peer = StartupMode::Static {
+            local: Ipv4Address::new([192, 0, 2, 7]),
+            netmask: Ipv4Address::new([255, 255, 255, 0]),
+            gateway: Ipv4Address::new([192, 0, 2, 1]),
+            peer: None,
+        };
+        // Combined `IP/PREFIX` word.
+        assert_eq!(
+            parse_startup(b"static 192.0.2.7/24 192.0.2.1"),
+            Ok(expected_no_peer)
+        );
+        // Separate `/PREFIX` word.
+        assert_eq!(
+            parse_startup(b"static 192.0.2.7 /24 192.0.2.1"),
+            Ok(expected_no_peer)
+        );
+        // Either CIDR form still accepts a trailing peer.
+        assert_eq!(
+            parse_startup(b"static 192.0.2.7/24 192.0.2.1 192.0.2.9"),
+            Ok(StartupMode::Static {
+                local: Ipv4Address::new([192, 0, 2, 7]),
+                netmask: Ipv4Address::new([255, 255, 255, 0]),
+                gateway: Ipv4Address::new([192, 0, 2, 1]),
+                peer: Some(Ipv4Address::new([192, 0, 2, 9])),
+            })
+        );
+        assert_eq!(
+            parse_startup(b"static 192.0.2.7/33 192.0.2.1"),
+            Err(StartupError::BadNetmask)
+        );
+        assert_eq!(
+            parse_startup(b"static 192.0.2.7 /33 192.0.2.1"),
+            Err(StartupError::BadNetmask)
         );
     }
 

@@ -3979,7 +3979,7 @@ fn tape_command(info: &BootInfo, arguments: &[u8]) {
         b"send" => tape_send_command(info, remainder),
         _ => {
             println!("Usage: tape [status|run [ARGS...]|load disk NAME|load net|");
-            println!("save [diskN] NAME|send NAME PEER_MAC|PEER_NUMBER]");
+            println!("save [diskN] NAME|send [diskN] NAME PEER_MAC|PEER_NUMBER]");
         }
     }
 }
@@ -5807,10 +5807,22 @@ fn tape_load_net() {
 }
 
 fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
-    let (name, remainder) = take_word(arguments);
+    // An optional leading `diskN` selector, matching every other
+    // FOSFS-reading command (`tape load`/`tape save`/`cat`/`rm`/`write`/
+    // `copy`) -- this used to be the one command that always read from
+    // disk1/Boot regardless, a real inconsistency found while building
+    // AGENTS.md's cross-tape/command syntax reference.
+    let (first_word, remainder) = take_word(arguments);
+    let (device, name, remainder) = match strip_disk_selector(first_word) {
+        Some(device) => {
+            let (name, remainder) = take_word(remainder);
+            (device, name, remainder)
+        }
+        None => (disk::Device::Boot, first_word, remainder),
+    };
     let (peer_word, extra) = take_word(remainder);
     if name.is_empty() || peer_word.is_empty() || !extra.is_empty() {
-        println!("Usage: tape send NAME PEER_MAC|PEER_NUMBER");
+        println!("Usage: tape send [diskN] NAME PEER_MAC|PEER_NUMBER");
         return;
     }
     let destination = if let Some(mac) = parse_mac(peer_word) {
@@ -5834,7 +5846,7 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         return;
     };
 
-    let length = match fosfs::file_length(info, disk::Device::Boot, name) {
+    let length = match fosfs::file_length(info, device, name) {
         Ok(Some(length)) => length,
         Ok(None) => {
             println!("File not found.");
@@ -5862,7 +5874,7 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
         return;
     };
     let data = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
-    match fosfs::read(info, disk::Device::Boot, name, data) {
+    match fosfs::read(info, device, name, data) {
         Ok(Some(_)) => {}
         Ok(None) => {
             println!("File not found.");

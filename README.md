@@ -190,11 +190,12 @@ resetting to row 0 and overwriting the top of that narration.
 | `nic sniff` | Enables promiscuous mode and prints every frame the card sees (destination/source MAC, ethertype, hex dump) until F12 (or F4/F6/F7/F8/F10) stops the capture, then turns promiscuous mode back off. |
 | `nic discover` | Broadcasts a `chat`-protocol discovery probe through every initialized NIC (re-sent every few seconds) and lists every distinct responder as it replies, running until F12 (or F4/F6/F7/F8/F10) stops it (a fos machine currently running `chat`, `nic discover`, or sitting idle at `fos> ` replies; see "Hostname and NIC discovery" below). |
 | `nic peers` | Prints the peer list built so far by `nic discover` (and by any auto-replies `chat` has sent), without sending anything. |
+| `nic watchdog` | Runs the same bounded recovery check that already runs automatically on every foreground NIC poll, explicitly and on demand -- resets a backend only if it has actually latched a documented DMA/Tx fault. |
 | `chat [PEER_MAC\|PEER_NUMBER]` | Enters a line-based Ethernet chat: broadcast to everyone by default, or unicast (send and receive) to one `aa:bb:cc:dd:ee:ff` peer -- or a numbered peer from `nic peers`/`nic discover`. Type a line and press Enter to send it; incoming lines are shown tagged with the sender's MAC. While running, also auto-replies to `nic discover` probes from other machines. Leave with F12 (or F4/F6/F7/F8/F10) (local keyboard) or by typing `/quit` (works over serial too). |
 | `tape status` | Reports what (if anything) is currently loaded: its length and physical address, or that nothing is loaded. |
 | `tape load disk NAME` | Loads a complete ELF32 or legacy-flat, multi-sector FOSFS file straight into the fixed tape buffer, from the boot disk; `tape load diskN NAME` loads from an attached secondary disk instead. `tape load HOST[:diskN] NAME` fetches it over the network from a discovered NETFS peer instead. |
 | `tape load net` | Waits for a tape sent over Ethernet (see `tape send`/`tools/send_tape.py`): checks that the declared image fits the fixed 4 MiB tape region, validates each chunk's sequence number, and reports success or exactly where a transfer broke down. Press F12 (or F4/F6/F7/F8/F10) to give up. |
-| `tape send NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
+| `tape send [diskN] NAME PEER_MAC\|PEER_NUMBER` | Reads a FOSFS file (boot disk by default, or an attached secondary disk with `diskN`) and transmits it as a tape to one peer's `tape load net` (or `tools/send_tape.py`, listening the same way). |
 | `tape save [diskN\|HOST[:diskN]] NAME` | Writes the currently loaded tape's exact bytes out to FOSFS under `NAME` (boot disk by default, an attached secondary disk with `diskN`, or a discovered NETFS peer's own disk with `HOST[:diskN]`) -- the missing counterpart to `tape load net`: a tape received over the network previously had no way to persist it, so a fresh network transfer (with its per-run pacing/reliability cost) was the only way to run it again after a reboot. Works on whatever tape is currently resident regardless of how it was loaded, and leaves that loaded tape's own state untouched, so `tape run` still works immediately afterward. |
 | `tape run` | Executes the loaded tape's validated entry point in ring 0, with no memory protection, passing console, input, allocation, startup-argument, kernel-managed raw-Ethernet, multi-interface, promiscuous-mode, maximum-frame-size, timer, terminal-position, and high-level FOSFS file callbacks. See `docs/rust-tapes-for-dummies.md` and `NETWORKING.md` for the full twenty-two-argument ABI. `tape run 3 4 +` passes `"3 4 +"` as a startup argument; `tape run @NAME` (or `tape run router @NAME`) reads startup arguments from the FOSFS file `NAME` on the boot disk instead, `@diskN/NAME` reads it from an attached secondary disk (e.g. `tape run router @disk2/router.cfg`), and `@HOST[:diskN]/NAME` fetches it over the network from a discovered NETFS peer instead; `tape run` alone leaves arguments empty. If the tape ends with a near `ret`, control returns to the shell; anything else that faults is caught by the CPU exception handlers (see below) but is not recoverable. |
 | `term net` | Waits for a remote terminal client over Ethernet (see `tools/term_net.py`) and, once one says hello, hands the live shell over to it entirely -- every other command works identically for the connected peer. Local PS/2/VGA input is disabled meanwhile; F12 (or F4/F6/F7/F8/F10) disconnects it (or the peer can disconnect first). While waiting or connected, it also auto-replies to `nic discover` probes; the waiting phase checks every initialized NIC. This same wait runs automatically at boot, and after a local operator gives up to use the shell, one minute without local keyboard or serial activity re-enters the wait. |
@@ -704,9 +705,9 @@ place rather than the shared `copy`/`tape load` scratch region, so unlike
 `tape run` still works immediately afterward with nothing to reload.
 
 The other end of a network load can be another fos machine's `tape send
-NAME PEER_MAC|PEER_NUMBER` (reads a FOSFS file and streams it out, reusing
-the exact same `chat`-style peer addressing `chat`/`nic peers` already
-provide), or an ordinary Linux host running `tools/send_tape.py FILE`,
+[diskN] NAME PEER_MAC|PEER_NUMBER` (reads a FOSFS file and streams it out,
+reusing the exact same `chat`-style peer addressing `chat`/`nic peers`
+already provide), or an ordinary Linux host running `tools/send_tape.py FILE`,
 which speaks the identical wire protocol over a raw `AF_PACKET` socket.
 Rather than requiring a MAC address up front, that tool broadcasts the
 same `CHAT_TAG_DISCOVER_REQUEST` probe `nic discover` sends and picks the
@@ -718,6 +719,60 @@ Both senders pace frames because `tape load net` uses a polling-only NIC
 receiver with a finite receive ring: the kernel sender waits about 10 ms
 between frames, while `tools/send_tape.py` defaults to its empirically
 reliable 3 ms delay (`--delay 0` explicitly disables that protection).
+
+#### Tape command-line reference
+
+Every tape's own `tape run [ARGS]` syntax in one place -- `tape load`/
+`tape save`/`tape send`'s own `[diskN]`/`HOST[:diskN]` file-selector
+syntax is already in the Prompt table above, not repeated here. A few
+conventions apply across every tape below, found and fixed for
+consistency while building this table:
+
+- Any tape's arguments may instead be given as `@NAME` (a FOSFS file on
+  the boot disk), `@diskN/NAME` (an attached secondary disk), or
+  `@HOST[:diskN]/NAME` (a discovered NETFS peer) -- `tape run` reads the
+  named file's contents and uses them as the argument string instead of
+  what follows `@` on the command line. `tape run router @router.cfg` is
+  a documented two-word exception: a leading `router` word before the
+  `@...` token is skipped first, so the config file itself never needs
+  to repeat it.
+- `HOST[:diskN]` (used by `tape load`/`tape save`/`copy`) is always a
+  configured hostname or an `nic peers` number, never a raw MAC address
+  (its colon would collide with `:diskN`). `PEER_MAC|PEER_NUMBER` (used
+  by `chat`/`tape send`) is the reverse: a MAC address or a peer number,
+  never a hostname.
+- `IP/PREFIX` (a combined CIDR word), a separate `/PREFIX` word, and the
+  legacy dotted `NETMASK` are all accepted wherever a tape takes a
+  network prefix (`telnet`, `audio-rtp`, `router`, `ip-chat`) -- kept
+  consistent across all four rather than each tape choosing its own
+  subset.
+- A tape's own name as a leading, optional, ignored word (`router`,
+  `bridge`) is tolerated but never required -- a `tape run bridge 1 2`
+  used to be rejected despite `bridge`'s own doc comment and usage
+  string already documenting it; fixed to match `router`'s existing
+  convention rather than downgrading the documentation to match the bug.
+
+| Tape | `tape run` syntax |
+| --- | --- |
+| `audio-net` | (no args) listens and plays.<br>`send NAME [PEER_MAC]` replays a FOSFS file.<br>`capture [PEER_MAC]` streams the live ADC. |
+| `audio-rtp` | `static LOCAL_IP/PREFIX GATEWAY [PORT]` or `dhcp [PORT]` listens and plays (raw PCM and Opus both auto-detected on receive).<br>`static ... send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]` (or `dhcp send ...`) replays a FOSFS file.<br>`... capture [opus] PEER_IP [PEER_PORT] [BITRATE]` streams the live ADC.<br>`... duplex [opus] PEER_IP [PEER_PORT] [BITRATE]` listens and streams the live ADC simultaneously. `PORT`/`PEER_PORT` default to `5004`; `duplex`'s own listen port is always `5004`, not separately configurable. |
+| `beep` | (no args) |
+| `bigsieve` | (no args) |
+| `bridge` | (no args) bridges every initialized interface.<br>`[bridge] NIC [NIC ...]` selects specific one-based `nic list` numbers (at least two, all distinct). |
+| `calc` | (no args) starts an interactive reverse-Polish-notation REPL.<br>`EXPRESSION` evaluates one expression and returns, e.g. `3 4 +`. |
+| `cpu64-lab` | `[probe\|x87\|mmx\|sse\|all]`, default `all`. |
+| `cpu64-show` | `[scalar\|sse2] [SECONDS]`, default mode `auto`, `SECONDS` defaults to 10 (clamped 1-120). |
+| `ed` | `ed NAME` loads a FOSFS file, then runs interactive full-screen editing. |
+| `hello-rs` | (no args) |
+| `ip-chat` | `static LOCAL_IP/PREFIX GATEWAY [PEER_IP]` or `dhcp [PEER_IP]`, then interactive `/to A.B.C.D`, `/broadcast`, `/peers`, `/quit`. |
+| `longmode.S` / `longmode-rs` | (no args) |
+| `morse` | (no args) starts interactive one-key-at-a-time input.<br>`TEXT` plays one message and returns. |
+| `net-chat` | (no args) broadcasts.<br>`PEER_MAC` unicasts to one peer. Then interactive `/discover`, `/peers`, `/to MAC`, `/broadcast`, `/quit`. |
+| `net-dhcp-test` | (no args) reports DHCP client status only.<br>`HOST_IP INTERVAL_SECONDS` runs a repeating ARP+ICMP-echo probe loop. |
+| `primes.S` | (no args) |
+| `router` | `[router] [dhcp [NIC]]... [health ADDRESS] [dhcp-server] [dhcp-lease-file NAME] [nat\|no-nat] [quiet] [forward tcp\|udp EXT_PORT INT_IP [INT_PORT]]... [dns SERVER [SERVER]] NIC IP/PREFIX [NIC IP/PREFIX ...] [default NIC GATEWAY]` -- see "Test tape: `tapes/router/`" below for the full walkthrough and `router.cfg` example. |
+| `telnet` | `static LOCAL_IP/PREFIX GATEWAY SERVER_IP SERVER_PORT` or `dhcp SERVER_IP SERVER_PORT`. |
+| `vga-colors` | (no args) |
 
 #### Test tape: `tapes/primes.S`
 
@@ -982,7 +1037,9 @@ bytes; the tape does not implement ARP, IPv4, routing, TTL changes, or loop
 prevention.
 
 Use one-based interface numbers matching `nic list`, for example
-`tape run 1 2`, or omit the arguments to bridge every initialized interface.
+`tape run 1 2` (an optional leading `bridge` word is also accepted, e.g.
+`tape run bridge 1 2`), or omit the arguments to bridge every initialized
+interface.
 The tape enables promiscuous reception on its selected ports because a bridge
 must receive frames addressed to hosts behind another port. Do not connect
 its ports in a physical loop: STP/VLANs and loop prevention are deliberately
@@ -1144,7 +1201,9 @@ directly.
 An IPv4/UDP line-chat application built on the shared `tapes/tape-net/`
 library. It resolves peers with ARP, routes off-subnet traffic through the
 configured gateway, and keeps application policy in the tape rather than the
-kernel. Start it with `tape run static LOCAL_IP NETMASK GATEWAY [PEER_IP]`
+kernel. Start it with `tape run static LOCAL_IP/PREFIX GATEWAY [PEER_IP]`
+(a separate `/PREFIX` word, or the legacy dotted `NETMASK`, are also
+accepted -- matching `telnet`/`audio-rtp`/`router`'s identical convention)
 for deterministic configuration, or `tape run dhcp [PEER_IP]` when a DHCP
 server is available. While running, `/to A.B.C.D` selects a unicast peer,
 `/broadcast` returns to IPv4 broadcast, `/peers` lists configured/heard

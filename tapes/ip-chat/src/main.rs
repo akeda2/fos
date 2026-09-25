@@ -11,9 +11,16 @@
 //! Startup forms:
 //!
 //! ```text
+//! tape run static LOCAL_IP/PREFIX GATEWAY [PEER_IP]
+//! tape run static LOCAL_IP /PREFIX GATEWAY [PEER_IP]
 //! tape run static LOCAL_IP NETMASK GATEWAY [PEER_IP]
 //! tape run dhcp [PEER_IP]
 //! ```
+//!
+//! `static` accepts a combined `IP/PREFIX` CIDR word, a separate
+//! `/PREFIX` word, or the legacy dotted `NETMASK` -- matching
+//! `telnet`/`audio-rtp`/`router`'s identical convention (see
+//! `parse_cidr`/`parse_prefix_mask` in `lib.rs`).
 //!
 //! A static configuration is used exactly as supplied.  DHCP sends the
 //! standard DISCOVER/OFFER/REQUEST/ACK exchange and reports a bounded,
@@ -120,13 +127,14 @@ fn print_startup_error(putc: Putc, error: StartupError) {
         StartupError::UnknownMode => &b"mode must be static or dhcp"[..],
         StartupError::WrongArgumentCount => &b"wrong number of arguments"[..],
         StartupError::BadAddress => &b"invalid dotted IPv4 address"[..],
+        StartupError::BadNetmask => &b"invalid netmask or /PREFIX"[..],
     };
     print_bytes(putc, b"IPv4 chat startup error: ");
     print_bytes(putc, detail);
     print_bytes(
         putc,
-        b". Usage: tape run static LOCAL_IP NETMASK GATEWAY [PEER_IP] | \
-tape run dhcp [PEER_IP]\n",
+        b". Usage: tape run static LOCAL_IP[/PREFIX] [/PREFIX|NETMASK] \
+GATEWAY [PEER_IP] | tape run dhcp [PEER_IP]\n",
     );
 }
 

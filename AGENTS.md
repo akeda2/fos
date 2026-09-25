@@ -203,8 +203,12 @@ and kernel subsystems should narrate what they are doing and why in their
 status messages (e.g. which BIOS interrupt is being called, what a PIC remap
 or IDT load accomplishes), not just announce bare completion. When adding a
 boot step or kernel subsystem, prefer an explanatory message over a terse one,
-and keep `README.md`'s command table and "What happens at boot" walkthrough in
-sync with the actual command surface and boot sequence. Inline documentation
+and keep `README.md`'s command table, its "Tape command-line reference"
+table (every tape's own `tape run [ARGS]` syntax, kept in one place rather
+than scattered across each tape's own source), and "What happens at boot"
+walkthrough in sync with the actual command surface and boot sequence. A
+new tape's own doc comment remains the source of truth for its syntax;
+add or update its row in that table in the same change. Inline documentation
 is mandatory for new hardware-facing code and new educational examples:
 explain the relevant ABI, register/port behavior, timing assumptions, and
 why the implementation follows the project's constraints rather than leaving

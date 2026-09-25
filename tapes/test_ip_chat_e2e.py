@@ -157,6 +157,12 @@ def main() -> None:
         load_tape("a")
         load_tape("b")
 
+        # Exercises the CIDR `/PREFIX` form (matching telnet/audio-rtp/
+        # router's identical convention), not just the legacy dotted
+        # netmask -- a real gap found while building AGENTS.md's
+        # cross-tape command-syntax reference: ip-chat used to accept
+        # only a dotted NETMASK word, unlike every other tape that takes
+        # a network prefix.
         for name in ("a", "b"):
             config = GUESTS[name]
             start = len(output[name])
@@ -164,7 +170,7 @@ def main() -> None:
                 name,
                 b"tape run static "
                 + config["ip"]
-                + b" 255.255.255.0 0.0.0.0 "
+                + b"/24 0.0.0.0 "
                 + config["peer"]
                 + b"\n",
             )

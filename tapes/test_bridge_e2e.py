@@ -229,11 +229,18 @@ def main() -> None:
         )
         read_until("bridge", b"Tape loaded", 30, load_start)
         read_until("bridge", b"fos> ", 5, load_start)
+        # Exercises the documented `bridge` keyword form (`tape run
+        # bridge 1 2`), not just the bare `tape run 1 2` form -- a real
+        # doc/parser mismatch found while building AGENTS.md's cross-tape
+        # command-syntax reference: parse_ports used to reject this
+        # exact form its own module doc comment and usage string
+        # document, since it fed the argument bytes straight to
+        # parse_number with no leading-keyword handling at all.
         run_start = send_command(
-            "a", BRIDGE_MAC_A, BRIDGE_CLIENT_MAC, "bridge", b"tape run 1 2"
+            "a", BRIDGE_MAC_A, BRIDGE_CLIENT_MAC, "bridge", b"tape run bridge 1 2"
         )
         read_until("bridge", b"fos bridge: ports 1", 10, run_start)
-        print("PASS: bridge tape started with two selected e1000 interfaces.")
+        print("PASS: bridge tape started with two selected e1000 interfaces (via the documented 'bridge' keyword form).")
 
         expected = b"dst 52:54:00:be:ef:04 src 52:54:00:be:ef:03 ethertype 0x88b7"
         receive_expected_frame(

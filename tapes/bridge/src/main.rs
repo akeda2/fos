@@ -95,11 +95,29 @@ fn parse_number(input: &[u8], mut position: usize) -> Option<(u32, usize)> {
     }
 }
 
+/// Strips an optional leading `bridge` word (a whole word, not just a
+/// prefix -- `bridged`/`bridge2` must not match), matching this ABI's
+/// established "the tape's own name is an optional, ignored leading
+/// word" convention (`router`'s `tape_argument_source` does the same for
+/// `tape run router ...`). Without this, `tape run bridge 1 2` -- the
+/// exact form this file's own module doc comment and usage string both
+/// document -- would fail to parse at all (`parse_number` sees `'b'`
+/// first and returns `None`), a real doc/parser mismatch found while
+/// building AGENTS.md's cross-tape command-syntax reference.
+fn strip_leading_bridge_word(arguments: &[u8]) -> &[u8] {
+    match arguments.strip_prefix(b"bridge") {
+        Some(rest) if rest.is_empty() || rest[0] == b' ' => rest,
+        _ => arguments,
+    }
+}
+
 fn parse_ports(
     arguments: &[u8],
     nic_count: usize,
     ports: &mut [u32; MAX_PORTS],
 ) -> Option<usize> {
+    let arguments = strip_leading_bridge_word(arguments);
+    let arguments = &arguments[skip_spaces(arguments, 0)..];
     if arguments.is_empty() {
         if nic_count > MAX_PORTS {
             return None;
