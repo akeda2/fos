@@ -35,6 +35,7 @@ mod shell;
 mod stack;
 mod threecom;
 mod uhci;
+mod usb_storage;
 
 use core::panic::PanicInfo;
 

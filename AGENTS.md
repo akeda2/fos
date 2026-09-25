@@ -1370,6 +1370,105 @@ capture overruns or packet errors on either side, confirming the
 dedicated second TD pool actually prevents the slot-collision hazard
 described above rather than merely avoiding it by accident.
 
+#### USB Mass Storage (Bulk-Only Transport): a bulk-transfer primitive, and the standalone `usb storage` command
+
+Motivated by a real, physically confirmed problem: `uhci::initialize_all()`
+resetting any UHCI controller (triggered by `usb`/`usb play`/`usb
+capture`/`audio`) breaks a real Pentium 4's BIOS "USB Legacy Support"
+`INT13h` emulation for its USB-booted disk (see "USB audio and USB-boot
+media do not reliably coexist on real hardware" below). A native USB Mass
+Storage driver is the only real fix -- it lets fos stop depending on BIOS
+continuing to own the boot disk once running -- and this increment builds
+the first, self-contained layer of it: enumeration and read/write against
+a discovered device, verified standalone, with no `disk.rs`/FOSFS
+integration yet (a separate, later step, since making a USB Mass Storage
+device transparently *become* `disk::Device::Boot` needs its own
+heuristic and is out of scope here).
+
+`Uhci::bulk_transfer` (`uhci.rs`) is the foundational new primitive: a
+sequence of data-stage packets only, with no SETUP or STATUS stage,
+reusing `control_transfer`'s exact TD-chain-building/link-patching/
+completion-polling machinery for the data stage alone. The one genuinely
+new mechanic bulk transfers need that control transfers don't: a bulk
+endpoint's DATA0/DATA1 toggle is real, persistent *endpoint* state that
+must survive across separate calls (unlike a control transfer, always a
+fresh self-contained SETUP+DATA+STATUS unit that always starts its own
+data stage at toggle 1). The caller owns this state (`toggle: &mut bool`,
+read on entry, written back only on success) rather than `Uhci` itself
+tracking per-endpoint state it has no lifetime-bounded way to associate
+with a specific device -- the same division of ownership `IsocOutStream`/
+`IsocInStream` already established for their own per-stream state. On any
+transport error, `*toggle` is left completely unchanged: USB Mass
+Storage's own Bulk-Only Transport (BOT) error-recovery procedure resets
+the device's toggle back to DATA0 anyway, so this function does not need
+to guess how many packets actually completed before a mid-chain failure.
+`Uhci::bulk_only_mass_storage_reset` (the class-specific "Bulk-Only Mass
+Storage Reset" request) and `Uhci::clear_endpoint_halt`
+(`CLEAR_FEATURE(ENDPOINT_HALT)`, targeting one bulk endpoint) are BOT's
+own mandated pair of recovery requests, both thin `control_transfer`
+wrappers mirroring `set_address`/`set_configuration`/`set_interface`'s
+existing SETUP-byte-array construction convention exactly.
+
+`kernel/src/usb_storage.rs` is a new file (not folded into `uhci.rs`
+alongside `UsbAudioDevice`, unlike everything else UHCI-related so far):
+Bulk-Only Transport's own CBW/CSW framing and the SCSI command subset
+below are a real, separate protocol layer above raw bulk transfers, the
+same reasoning that already keeps `es1370.rs`/`hda.rs` separate from
+`pci.rs` despite depending on it. `find_msc_endpoints` walks a
+configuration descriptor generically by `bLength` (the identical shape
+`uhci::find_uac_endpoint` already uses), recognizing interface class
+`0x08` (Mass Storage) / subclass `0x06` (SCSI transparent -- the
+universal choice for real USB flash drives) / protocol `0x50`
+(Bulk-Only Transport) and its two bulk endpoints; unlike USB Audio
+Class's alternate-setting-0-is-idle convention, Mass Storage has no such
+special case, so the first matching interface's endpoints are used
+directly with no `set_interface` call needed at all. `find_msc_device`
+mirrors `find_uac_device`'s exact "reset and redo everything from
+scratch, one port reset per attempt" discovery shape.
+
+`MscDevice` owns one discovered, already-`SET_CONFIGURATION`'d device:
+its two bulk endpoints, their independently tracked DATA0/DATA1 toggles,
+and a monotonically increasing CBW tag. `MscDevice::command` drives one
+full CBW-out/data-stage/CSW-in exchange and is the only place that talks
+to `bulk_transfer` directly; every other method (`inquiry`,
+`wait_until_ready` -- a bounded-retry `TEST UNIT READY` loop, since real
+removable media can report "not ready" for a moment right after
+enumeration --, `request_sense`, `read_capacity_10`, `read_10`,
+`write_10`) is a thin SCSI CDB wrapper around it. Any transport-level
+failure or CSW phase error drives BOT's own two-request reset-recovery
+procedure (`recover`, calling `bulk_only_mass_storage_reset` then
+`clear_endpoint_halt` on both endpoints and resetting both tracked
+toggles to match) before the error is returned, so the *next* command
+starts from a clean, known device state rather than compounding a stuck
+one. `read_capacity_10` rejects (`Error::Unsupported`) any device whose
+native block size isn't exactly 512 bytes, matching this project's
+established "reject rather than emulate" convention (the same one
+`audio_rtp_tape::payload_type_for` already applies to unsupported audio
+formats) rather than attempting 4Kn-to-512-byte emulation in a first cut.
+
+The standalone `usb storage` shell command (`shell.rs`'s
+`usb_storage_command`) mirrors `usb play`/`usb capture`'s own "prove the
+driver against real/QEMU hardware with a dedicated command before any
+deeper integration" precedent: it discovers the first Bulk-Only Transport
+device found, prints its `INQUIRY` vendor/product strings and `READ
+CAPACITY` result, and hex-dumps its first sector -- deliberately
+read-only, since issuing a real `WRITE(10)` against whichever USB device
+happens to enumerate first, with no disk-selection safeguard, is not a
+safe default action for an always-available diagnostic command (`write_10`
+itself is real, tested code -- see below -- just not wired into this
+command). Verified end to end by `tapes/test_usb_storage_e2e.py` against
+QEMU's synthetic `usb-storage` device: discovery, `INQUIRY` reporting
+QEMU's own vendor/product strings, `READ CAPACITY` matching a backing
+image's real size, and `READ(10)` of the first sector matching a known
+seeded byte pattern exactly. `write_10` was manually verified end to end
+during development (write a pattern to block 1, read it back, confirm an
+exact match) via a temporary shell-command hook removed before committing
+the read-only command; a permanent write round-trip test is more useful
+once this driver is wired into `disk.rs` as an ordinary secondary disk,
+through the same `write`/`cat`-based tests every other disk backend
+already has -- explicit follow-on work, along with the actual
+`disk::Device::Boot`-switching fix for the motivating Pentium 4 problem.
+
 ### Tape print callback ABI
 
 The hand-rolled VGA/CRTC/COM1 output described above worked, but it had a
@@ -2022,10 +2121,15 @@ denylist (only useful if a given machine has multiple UHCI controllers
 and the boot drive and audio device can be split across them -- doesn't
 help the AMD machine's POST-time failure at all, since that happens
 before any denylist could take effect) or a native USB mass-storage
-driver (see "Deliberately deferred work" below), removing fos's
-dependency on BIOS continuing to own the controller for its own `INT13h`
-emulation once fos has taken it over -- a large, separate project, not
-attempted here, and the only option that would also help the P4 case.
+driver, removing fos's dependency on BIOS continuing to own the
+controller for its own `INT13h` emulation once fos has taken it over --
+the only option that would also help the P4 case. This driver now has a
+first, self-contained increment (enumeration, `INQUIRY`/`READ CAPACITY`/
+`READ(10)`/`WRITE(10)`, verified standalone via the `usb storage` shell
+command -- see "USB Mass Storage (Bulk-Only Transport)" above), but
+wiring it into `disk.rs` and actually switching `disk::Device::Boot` over
+to it (the part that would close the P4 gap for real) remain separate,
+not-yet-done steps -- see "Deliberately deferred work" below.
 
 ### Talking to a real fos machine from a sandboxed dev environment
 
@@ -2559,7 +2663,14 @@ MSI address/data encoding, and the full verification list) is in
   genuinely concurrently on real hardware); EHCI/OHCI/xHCI remain
   deferred, and no tape yet exercises simultaneous playback+capture
   through the tape ABI itself even though the underlying engine now
-  supports it.
+  supports it. USB Mass Storage (Bulk-Only Transport) also has a first,
+  self-contained increment -- see "USB Mass Storage (Bulk-Only
+  Transport): a bulk-transfer primitive, and the standalone `usb storage`
+  command" above -- but only enumeration/read/write against a discovered
+  device, verified standalone; wiring it into `disk.rs` as an ordinary
+  secondary disk, and the further, separate step of transparently
+  switching `disk::Device::Boot` itself to close the real-hardware
+  Pentium 4 gap that motivated this driver, both remain deferred.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.

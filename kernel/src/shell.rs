@@ -14,6 +14,7 @@ use crate::parallel;
 use crate::pci;
 use crate::pmem;
 use crate::uhci;
+use crate::usb_storage;
 use crate::{print, println};
 
 const LINE_CAPACITY: usize = 256;
@@ -994,7 +995,7 @@ fn enumerate_usb_port(port_number: u8, controller: &uhci::Uhci, port: u8) {
 /// transfer -- see `uhci.rs`'s `IsocOutStream` and AGENTS.md's "UHCI"
 /// section for the design.
 fn usb_command(info: &BootInfo, arguments: &[u8]) {
-    const USAGE: &str = "Usage: usb | usb play [diskN] NAME | usb capture [diskN] NAME";
+    const USAGE: &str = "Usage: usb | usb play [diskN] NAME | usb capture [diskN] NAME | usb storage";
 
     if arguments.is_empty() {
         print_usb_devices();
@@ -1022,8 +1023,72 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
         usb_capture_command(info, device, name);
         return;
     }
+    if first.eq_ignore_ascii_case(b"storage") {
+        if !remainder.is_empty() {
+            println!("{USAGE}");
+            return;
+        }
+        usb_storage_command();
+        return;
+    }
 
     println!("{USAGE}");
+}
+
+/// Standalone verification for `kernel/src/usb_storage.rs`, mirroring
+/// `usb play`/`usb capture`'s own "prove the driver against real/QEMU
+/// hardware with a dedicated command before any deeper integration"
+/// precedent: enumerates the first Bulk-Only Transport Mass Storage
+/// device found, prints its `INQUIRY` string and `READ CAPACITY` result,
+/// and hex-dumps its first 512-byte sector. Deliberately does not touch
+/// FOSFS or `disk.rs` -- that integration is separate, later work.
+fn usb_storage_command() {
+    let Some(mut device) = usb_storage::open() else {
+        println!("No USB Mass Storage (Bulk-Only Transport, SCSI");
+        println!("transparent) device found.");
+        return;
+    };
+
+    if !device.wait_until_ready(10) {
+        println!("Device did not report ready after 10 attempts.");
+        let mut sense = [0u8; 18];
+        if let Ok(len) = device.request_sense(&mut sense) {
+            println!("REQUEST SENSE:");
+            dump_bytes(0, &sense[..len]);
+        }
+        return;
+    }
+
+    let mut inquiry = [0u8; 36];
+    match device.inquiry(&mut inquiry) {
+        Ok(len) => {
+            let vendor = core::str::from_utf8(&inquiry[8..16.min(len)]).unwrap_or("?").trim();
+            let product = core::str::from_utf8(&inquiry[16..32.min(len)]).unwrap_or("?").trim();
+            println!("INQUIRY: vendor='{vendor}' product='{product}'");
+        }
+        Err(error) => {
+            println!("INQUIRY failed: {error:?}");
+            return;
+        }
+    }
+
+    let (block_count, block_size) = match device.read_capacity_10() {
+        Ok(capacity) => capacity,
+        Err(error) => {
+            println!("READ CAPACITY failed: {error:?}");
+            return;
+        }
+    };
+    println!("READ CAPACITY: {block_count} block(s) of {block_size} bytes");
+
+    let mut sector = [0u8; usb_storage::BLOCK_SIZE];
+    match device.read_10(0, &mut sector) {
+        Ok(()) => {
+            println!("First sector:");
+            dump_bytes(0, &sector);
+        }
+        Err(error) => println!("READ(10) failed: {error:?}"),
+    }
 }
 
 /// Streams a raw PCM file already matching a discovered playback

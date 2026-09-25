@@ -122,6 +122,16 @@ const USB_REQUEST_GET_DESCRIPTOR: u8 = 0x06;
 const USB_REQUEST_SET_ADDRESS: u8 = 0x05;
 const USB_REQUEST_SET_INTERFACE: u8 = 0x0b;
 const USB_REQUEST_SET_CONFIGURATION: u8 = 0x09;
+/// Standard `CLEAR_FEATURE`, used here against the `ENDPOINT_HALT`
+/// feature selector (`0x00`) to clear a stalled bulk endpoint and reset
+/// its DATA0/DATA1 toggle -- part of USB Mass Storage's Bulk-Only
+/// Transport reset-recovery procedure (`clear_endpoint_halt`, below).
+const USB_REQUEST_CLEAR_FEATURE: u8 = 0x01;
+/// USB Mass Storage Class, Bulk-Only Transport's own class-specific
+/// "Bulk-Only Mass Storage Reset" request (`bulk_only_mass_storage_reset`,
+/// below) -- not a standard USB request at all, hence no shared
+/// `USB_REQUEST_*` numbering with the ones above.
+const USB_MSC_REQUEST_BOT_RESET: u8 = 0xff;
 pub const USB_DESCRIPTOR_DEVICE: u8 = 0x01;
 pub const USB_DESCRIPTOR_CONFIGURATION: u8 = 0x02;
 
@@ -605,6 +615,201 @@ impl Uhci {
             total += decode_actlen(control);
         }
         Ok(total)
+    }
+
+    /// Runs one bulk transfer: a sequence of data-stage packets only, with
+    /// no SETUP or STATUS stage -- unlike `control_transfer`, which this
+    /// otherwise closely mirrors (same one-Queue-Head depth-first TD
+    /// chain, same per-`max_packet`-byte chunking, same completion
+    /// polling). `data` is the caller's buffer for an IN transfer, or the
+    /// bytes to send for an OUT transfer (`data_is_in` selects which); it
+    /// must not be empty, since this driver's own USB Mass Storage usage
+    /// never needs a zero-length bulk transfer.
+    ///
+    /// Unlike a control transfer -- always a fresh SETUP+DATA+STATUS unit,
+    /// so its data stage always starts at toggle 1 -- a bulk endpoint's
+    /// DATA0/DATA1 toggle is real, persistent *endpoint* state that must
+    /// survive across separate calls. The caller owns it (`toggle`, read
+    /// on entry and written back on success), the same way `IsocOutStream`/
+    /// `IsocInStream` keep their own per-stream state separate from these
+    /// otherwise-stateless `Uhci` methods, rather than `Uhci` itself
+    /// tracking per-endpoint state it has no lifetime-bounded way to
+    /// associate with a specific device/endpoint pair. On any error,
+    /// `*toggle` is left completely unchanged: USB Mass Storage's own
+    /// Bulk-Only Transport error-recovery procedure
+    /// (`bulk_only_mass_storage_reset` + `clear_endpoint_halt`, below)
+    /// resets the device's own toggle back to DATA0 after a failure
+    /// anyway, so this function does not need to guess how many packets
+    /// actually completed before a mid-chain error.
+    pub fn bulk_transfer(
+        &self,
+        device_addr: u8,
+        endpoint: u8,
+        max_packet: u8,
+        data: &mut [u8],
+        data_is_in: bool,
+        toggle: &mut bool,
+    ) -> Result<usize, Error> {
+        if data.is_empty() {
+            return Err(Error::InitFailed);
+        }
+        let max_packet = usize::from(max_packet).max(1);
+
+        let data_pid = if data_is_in { PID_IN } else { PID_OUT };
+        let mut running_toggle = if *toggle { TD_TOKEN_DATA_TOGGLE } else { 0 };
+        let mut slot = 0usize;
+        let mut offset = 0usize;
+        while offset < data.len() {
+            // Unlike `control_transfer` (which reserves a trailing STATUS
+            // slot and so checks this bound *after* incrementing `slot`),
+            // a bulk chain has no such reserved slot -- `TD_POOL_CAPACITY`
+            // itself is already the first out-of-range index, so this
+            // must be checked before writing, not after.
+            if slot >= TD_POOL_CAPACITY {
+                return Err(Error::InitFailed);
+            }
+            let chunk = (data.len() - offset).min(max_packet);
+            let buffer_addr = unsafe { data.as_mut_ptr().add(offset) } as u32;
+            self.write_td(
+                slot,
+                0, // patched below once the chain length is known
+                TD_CTRL_ACTIVE | TD_CTRL_ERROR_COUNTER_MAX,
+                data_pid
+                    | (u32::from(device_addr) << TD_TOKEN_DEVICE_SHIFT)
+                    | (u32::from(endpoint) << TD_TOKEN_ENDPOINT_SHIFT)
+                    | running_toggle
+                    | (encode_len(chunk) << TD_TOKEN_MAXLEN_SHIFT),
+                buffer_addr,
+            );
+            running_toggle ^= TD_TOKEN_DATA_TOGGLE;
+            offset += chunk;
+            slot += 1;
+        }
+        let last = slot - 1;
+
+        // Patch each TD's link to the next, depth-first (same reasoning
+        // as `control_transfer`'s identical loop), then explicitly
+        // terminate the chain at the last TD -- there is no STATUS TD
+        // here for the chain to fall through to.
+        for i in 0..last {
+            let ptr = self.td_addr(i) as *mut RawTd;
+            unsafe {
+                core::ptr::write_volatile(&raw mut (*ptr).link, self.td_addr(i + 1) | LINK_DEPTH_FIRST);
+            }
+        }
+        let last_ptr = self.td_addr(last) as *mut RawTd;
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*last_ptr).link, LINK_TERMINATE);
+        }
+
+        self.write_qh(LINK_TERMINATE, self.td_addr(0));
+
+        let deadline_ticks = 50; // 500 ms at 100 Hz, matching `control_transfer`
+        let start = interrupts::ticks();
+        loop {
+            let mut all_done = true;
+            let mut error = false;
+            for i in 0..=last {
+                let control = self.read_td_control(i);
+                if control & TD_CTRL_ACTIVE != 0 {
+                    all_done = false;
+                    break;
+                }
+                if control & TD_CTRL_ERROR_MASK != 0 {
+                    error = true;
+                    break;
+                }
+            }
+            if error {
+                self.write_qh(LINK_TERMINATE, LINK_TERMINATE);
+                return Err(Error::TransferFailed);
+            }
+            if all_done {
+                break;
+            }
+            if interrupts::ticks().wrapping_sub(start) > deadline_ticks {
+                self.write_qh(LINK_TERMINATE, LINK_TERMINATE);
+                return Err(Error::Timeout);
+            }
+        }
+        self.write_qh(LINK_TERMINATE, LINK_TERMINATE);
+
+        // Only committed on success -- see this function's own doc
+        // comment for why an error path must leave `*toggle` untouched.
+        *toggle = running_toggle == TD_TOKEN_DATA_TOGGLE;
+
+        if !data_is_in {
+            return Ok(data.len());
+        }
+        // Unlike `control_transfer`'s equivalent sum, every TD here is a
+        // data-stage TD (no SETUP/STATUS TDs to exclude), so this sums
+        // across the whole chain.
+        let mut total = 0usize;
+        for i in 0..=last {
+            let control = self.read_td_control(i);
+            total += decode_actlen(control);
+        }
+        Ok(total)
+    }
+
+    /// USB Mass Storage Bulk-Only Transport's own mandated recovery
+    /// request: a class-specific "Bulk-Only Mass Storage Reset", telling
+    /// the device to abort whatever command it's mid-processing and
+    /// prepare to accept a fresh CBW, without a full bus/port reset. This
+    /// alone does *not* reset either bulk endpoint's own stalled/toggle
+    /// state on the device side -- BOT's spec requires `clear_endpoint_halt`
+    /// (below) on both bulk endpoints immediately afterward to actually do
+    /// that.
+    pub fn bulk_only_mass_storage_reset(
+        &self,
+        device_addr: u8,
+        max_packet: u8,
+        interface_number: u8,
+    ) -> Result<(), Error> {
+        let setup = [
+            0x21, // bmRequestType: host-to-device, class, interface recipient
+            USB_MSC_REQUEST_BOT_RESET,
+            0x00,
+            0x00,
+            interface_number,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        self.control_transfer(device_addr, max_packet, &setup, &mut [], false)?;
+        Ok(())
+    }
+
+    /// Standard `CLEAR_FEATURE(ENDPOINT_HALT)`, targeting one bulk
+    /// endpoint (`endpoint`'s low 7 bits are the endpoint number, bit 7
+    /// its direction -- the same address form `find_uac_endpoint`'s own
+    /// isochronous-endpoint descriptor already reports). Clears that
+    /// endpoint's halted/stalled state and resets its DATA0/DATA1 toggle
+    /// back to DATA0 on the *device* side; the caller must also reset its
+    /// own `toggle` state (the `&mut bool` `bulk_transfer` threads
+    /// through) to `false` at the same time, since this request only
+    /// affects the device's side of that shared, logical toggle. USB Mass
+    /// Storage's Bulk-Only Transport spec requires this on *both* bulk
+    /// endpoints as part of its own reset-recovery procedure, alongside
+    /// `bulk_only_mass_storage_reset` above.
+    pub fn clear_endpoint_halt(
+        &self,
+        device_addr: u8,
+        max_packet: u8,
+        endpoint: u8,
+    ) -> Result<(), Error> {
+        let setup = [
+            0x02, // bmRequestType: host-to-device, standard, endpoint recipient
+            USB_REQUEST_CLEAR_FEATURE,
+            0x00, // wValue: ENDPOINT_HALT feature selector
+            0x00,
+            endpoint, // wIndex low byte: the target endpoint's address
+            0x00,
+            0x00,
+            0x00,
+        ];
+        self.control_transfer(device_addr, max_packet, &setup, &mut [], false)?;
+        Ok(())
     }
 
     /// Reads `len` bytes of a standard descriptor (`GET_DESCRIPTOR`) into
