@@ -1024,7 +1024,18 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
 /// varying packet size frame-to-frame, is deliberately out of scope; see
 /// AGENTS.md's "USB" section), and a Synchronous or Adaptive (not
 /// Asynchronous, which would need an unimplemented feedback endpoint)
-/// isochronous OUT endpoint.
+/// isochronous OUT endpoint whose declared `wMaxPacketSize` is at least
+/// this nominal per-frame byte count. `packet_bytes` is always that
+/// computed *nominal* count, never the endpoint's own declared maximum:
+/// a real Adaptive-sync device (confirmed against a genuine USB Audio
+/// Class 1.0 sound card, not just QEMU's Synchronous-only emulated one)
+/// legitimately declares some slack above nominal to tolerate a sample
+/// or so of clock drift per frame against its own crystal, but this
+/// driver always sends exactly the nominal size regardless -- correct
+/// and sufficient for a short stream, where that drift is negligible;
+/// real feedback-based rate adaptation for a long-running Adaptive
+/// stream remains explicitly out of scope, the same limit already
+/// covering Asynchronous sync devices outright.
 struct UacPlaybackEndpoint {
     interface_number: u8,
     alternate_setting: u8,
@@ -1040,9 +1051,9 @@ struct UacPlaybackEndpoint {
 /// looking for one AudioStreaming alternate setting with a working
 /// isochronous OUT endpoint. See `UacPlaybackEndpoint`'s own doc comment
 /// for exactly which UAC1 shapes qualify; anything else (a continuous
-/// sample-rate range, Asynchronous sync, non-16-bit, or a packet size
-/// that doesn't match `sample_rate`/1000 exactly) is skipped rather than
-/// guessed at.
+/// sample-rate range, Asynchronous sync, non-16-bit, or a declared
+/// packet size too small for the computed nominal one) is skipped
+/// rather than guessed at.
 fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
     const DESC_INTERFACE: u8 = 0x04;
     const DESC_CS_INTERFACE: u8 = 0x24;
@@ -1117,15 +1128,19 @@ fn find_uac_playback_endpoint(config: &[u8]) -> Option<UacPlaybackEndpoint> {
                 let is_out = endpoint_address & 0x80 == 0;
                 let is_isochronous = transfer_type == 0x01;
                 let sync_supported = sync_type == 0x02 || sync_type == 0x03; // Adaptive|Synchronous
-                let fixed_packet_size = sample_rate % 1000 == 0
-                    && u32::from(max_packet_size)
-                        == (sample_rate / 1000) * u32::from(channels) * (u32::from(bits_per_sample) / 8);
-                if is_isochronous && is_out && sync_supported && fixed_packet_size {
+                let nominal_bytes =
+                    (sample_rate / 1000) * u32::from(channels) * (u32::from(bits_per_sample) / 8);
+                // The endpoint must declare *at least* room for our
+                // fixed-cadence nominal packet -- exact equality (QEMU's
+                // Synchronous device) and real slack above it (a real
+                // Adaptive device) both qualify; too little room does not.
+                let usable_packet_size = sample_rate % 1000 == 0 && u32::from(max_packet_size) >= nominal_bytes;
+                if is_isochronous && is_out && sync_supported && usable_packet_size {
                     return Some(UacPlaybackEndpoint {
                         interface_number,
                         alternate_setting,
                         endpoint_address,
-                        packet_bytes: max_packet_size,
+                        packet_bytes: nominal_bytes as u16,
                         sample_rate,
                         channels,
                         bits_per_sample,

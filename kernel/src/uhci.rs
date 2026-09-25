@@ -441,7 +441,17 @@ impl Uhci {
             toggle ^= TD_TOKEN_DATA_TOGGLE;
             offset += chunk;
             slot += 1;
-            if slot >= TD_POOL_CAPACITY - 1 {
+            // `slot` now holds the *next* TD's index -- either another
+            // data TD, or (once the loop exits) STATUS. `TD_POOL_CAPACITY`
+            // itself (not minus one) is the first genuinely out-of-range
+            // index, since valid slots are `0..TD_POOL_CAPACITY`; the
+            // previous, off-by-one-stricter bound rejected the last
+            // legal STATUS slot outright. Only found by a real device
+            // with `bMaxPacketSize0` at the smallest legal full-speed
+            // value (8) reading a large configuration descriptor --
+            // QEMU's own synthetic device (`max_packet0` 64) never came
+            // close to this boundary.
+            if slot >= TD_POOL_CAPACITY {
                 return Err(Error::InitFailed);
             }
         }

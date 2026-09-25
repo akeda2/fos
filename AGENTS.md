@@ -1099,6 +1099,56 @@ single-bin Goertzel DFT, the same dependency-free technique
 line. Isochronous *capture* (IN) and `audio.rs`/tape-ABI integration
 remain explicit follow-on work; see "Deliberately deferred work" below.
 
+#### Confirmed on real, non-emulated USB Audio Class hardware
+
+Unlike ES1370/HDA (still "unverified against real hardware" as of this
+writing), this driver has been confirmed against a genuine, physically
+attached class-compliant sound card -- a TerraTec Aureon Dual USB
+(C-Media chipset, `0ccd:0077`) -- via QEMU's `usb-host` PCI passthrough
+(`-device usb-host,vendorid=...,productid=...` in place of the synthetic
+`usb-audio` device), not just emulation. Real enumeration (device and
+full 253-byte configuration descriptor), `find_uac_playback_endpoint`,
+and `usb play` all worked unchanged against real silicon, and surfaced
+two things QEMU's own model never could:
+
+- **A real off-by-one in `control_transfer`'s data-stage bounds check**,
+  found only because this real device's `bMaxPacketSize0` is 8 -- the
+  smallest legal full-speed value, and far smaller than QEMU's
+  synthetic device's 64. Reading the full 253-byte configuration
+  descriptor at 8 bytes/packet needs exactly 32 data TDs (SETUP + 32
+  DATA + STATUS = all 34 of `TD_POOL_CAPACITY`'s slots, with zero to
+  spare), but the old check (`slot >= TD_POOL_CAPACITY - 1`) rejected
+  the transfer one slot too early -- it fired the instant `slot` reached
+  the last *valid* index (33, correctly reserved for STATUS), not only
+  once a write would actually go out of bounds. Fixed to
+  `slot >= TD_POOL_CAPACITY` (the first genuinely invalid index, since
+  slot 34 is where the Queue Head itself lives, immediately after the
+  TD pool). QEMU's own device, with a much larger `max_packet0`, never
+  came anywhere near this boundary, so no amount of emulated testing
+  could have found it.
+- **The Adaptive-sync `wMaxPacketSize` fix above was directly confirmed
+  necessary**, not just theoretically justified from reading the
+  descriptor: this real device's isochronous OUT endpoint declares
+  `wMaxPacketSize=200` (Adaptive sync, some slack above the 192-byte
+  nominal for 48 kHz/16-bit/stereo), which the old exact-equality check
+  would have rejected outright. With the `>=`-nominal check,
+  `find_uac_playback_endpoint` correctly computes and uses the 192-byte
+  nominal size regardless of the endpoint's own larger ceiling, and a
+  real 2-second tone streamed to physical hardware in almost exactly
+  2000 ms with zero reported packet errors.
+
+This required a one-time, explicit `sudo setfacl -m u:USER:rw
+/dev/bus/usb/BUS/DEV` grant on the specific device node (mirroring the
+project's existing `CAP_NET_RAW` precedent for raw sockets -- an agent
+never runs this silently); real hardware access is otherwise blocked by
+the host's own `snd-usb-audio`/`usbhid` kernel drivers already claiming
+every interface, which QEMU's `usb-host` backend detaches automatically
+once it has write access to the device node. No automated test exists
+for this (there's no way to attach real hardware to `make test`'s QEMU
+fixture) -- this was a manual, one-time verification session, the same
+category of confirmation `tapes/longmode.S`'s own real-hardware section
+above documents.
+
 ### Tape print callback ABI
 
 The hand-rolled VGA/CRTC/COM1 output described above worked, but it had a
