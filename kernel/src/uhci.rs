@@ -192,14 +192,18 @@ fn decode_actlen(control: u32) -> usize {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum Error {
     NotPresent,
     InitFailed,
     /// A control transfer's TD chain halted on a real error (not a NAK,
     /// which the hardware already retries on its own) -- STALL, buffer
     /// error, babble, or a CRC/timeout that exhausted its retry budget.
-    TransferFailed,
+    /// Carries the failing TD's raw control word (see the `TD_CTRL_*`
+    /// constants above) so a caller can report exactly which error bit(s)
+    /// fired -- added specifically to diagnose a real-hardware-only bulk
+    /// transfer failure invisible to QEMU's more forgiving UHCI emulation.
+    TransferFailed(u32),
     /// The transfer did not complete within this driver's bounded poll --
     /// either the device never responded, or (more likely while this is
     /// new code) the TD chain was built incorrectly.
@@ -575,7 +579,7 @@ impl Uhci {
         let start = interrupts::ticks();
         loop {
             let mut all_done = true;
-            let mut error = false;
+            let mut error = None;
             for i in 0..=last {
                 let control = self.read_td_control(i);
                 if control & TD_CTRL_ACTIVE != 0 {
@@ -583,19 +587,29 @@ impl Uhci {
                     break;
                 }
                 if control & TD_CTRL_ERROR_MASK != 0 {
-                    error = true;
+                    error = Some(control);
                     break;
                 }
             }
-            if error {
+            if let Some(control) = error {
                 self.write_qh(LINK_TERMINATE, LINK_TERMINATE);
-                return Err(Error::TransferFailed);
+                return Err(Error::TransferFailed(control));
             }
             if all_done {
                 break;
             }
             if interrupts::ticks().wrapping_sub(start) > deadline_ticks {
                 self.write_qh(LINK_TERMINATE, LINK_TERMINATE);
+                // A TD that never cleared Active may mean the controller
+                // was still mid-transaction on the wire at the exact
+                // moment this gave up -- clearing the QH's element
+                // pointer stops it from being *rescheduled*, but does not
+                // necessarily abort hardware that is already mid-fetch of
+                // this TD's own memory. A short settle delay here, before
+                // any caller (e.g. a control-transfer-based BOT recovery
+                // request) reuses this same TD pool, gives that in-flight
+                // activity a chance to genuinely finish first.
+                wait_ticks(2);
                 return Err(Error::Timeout);
             }
         }
@@ -708,7 +722,7 @@ impl Uhci {
         let start = interrupts::ticks();
         loop {
             let mut all_done = true;
-            let mut error = false;
+            let mut error = None;
             for i in 0..=last {
                 let control = self.read_td_control(i);
                 if control & TD_CTRL_ACTIVE != 0 {
@@ -716,19 +730,22 @@ impl Uhci {
                     break;
                 }
                 if control & TD_CTRL_ERROR_MASK != 0 {
-                    error = true;
+                    error = Some(control);
                     break;
                 }
             }
-            if error {
+            if let Some(control) = error {
                 self.write_qh(LINK_TERMINATE, LINK_TERMINATE);
-                return Err(Error::TransferFailed);
+                return Err(Error::TransferFailed(control));
             }
             if all_done {
                 break;
             }
             if interrupts::ticks().wrapping_sub(start) > deadline_ticks {
                 self.write_qh(LINK_TERMINATE, LINK_TERMINATE);
+                // See `control_transfer`'s identical timeout path for why:
+                // a settle delay before this TD pool memory is reused.
+                wait_ticks(2);
                 return Err(Error::Timeout);
             }
         }

@@ -390,15 +390,23 @@ pub fn boot_is_usb() -> bool {
 /// itself break BIOS's access to this exact disk, per the confirmed
 /// mechanism `attach_usb_disk` documents -- so this baseline read is a
 /// one-shot opportunity, taken before that risk exists). Only if the
-/// discovered USB device's own capacity *and* its own LBA 0 bytes match
-/// that baseline exactly is `Device::Boot` switched over; otherwise it is
+/// discovered USB device's own LBA 0 bytes match that baseline exactly,
+/// and its own reported capacity is *at least* as large as BIOS's own
+/// figure for `disk1`, is `Device::Boot` switched over; otherwise it is
 /// almost certainly a different physical disk, and `Device::Boot` is left
-/// completely untouched (`BootPromoteError::NotSameDisk`). This is a very
-/// strong check (two independent physical disks sharing both an exact
-/// capacity and a byte-identical MBR is not realistically possible by
-/// accident), though not an absolute proof -- deliberately documented as
-/// "confirmed, not just assumed," matching this project's own "heuristic,
-/// not certainty" framing for this whole follow-on.
+/// completely untouched (`BootPromoteError::NotSameDisk`). Capacity is
+/// deliberately a floor, not an exact match: confirmed on real hardware
+/// that a USB-boot BIOS's own legacy emulation can report a *smaller*
+/// capacity for `disk1` than the physical device truly has -- it reports
+/// the geometry baked into the boot image's own GPT (the original
+/// image's size, e.g. 16 MiB) rather than querying the real flash
+/// media's true capacity, so an exact-match requirement would wrongly
+/// refuse the device's own real boot media. The MBR content match is the
+/// real identity check (two independent physical disks sharing a
+/// byte-identical MBR is not realistically possible by accident), though
+/// not an absolute proof -- deliberately documented as "confirmed, not
+/// just assumed," matching this project's own "heuristic, not
+/// certainty" framing for this whole follow-on.
 ///
 /// Deliberately still does **not** fix `reboot soft`: that path re-enters
 /// `boot/stage2.S` from scratch and always depends on BIOS to reload the
@@ -424,7 +432,18 @@ pub fn promote_boot_to_usb(info: &BootInfo) -> Result<(), BootPromoteError> {
     if device.read_10(0, &mut candidate).is_err() {
         return Err(BootPromoteError::NotSameDisk);
     }
-    if u64::from(block_count) != boot_sectors || candidate != baseline {
+    // A real USB-boot BIOS commonly reports a *smaller* capacity for
+    // `disk1` than the physical device actually has -- confirmed on real
+    // hardware: USB Legacy emulation reports the drive geometry baked
+    // into the boot image's own GPT (the original image's size, e.g.
+    // 16 MiB) rather than querying the real flash media's true capacity.
+    // So the discovered device's capacity only needs to be *at least* as
+    // large as BIOS's own figure (it must have had room to hold whatever
+    // was imaged onto it in the first place), not exactly equal -- the
+    // real identity check is the MBR content match just below: a
+    // byte-for-byte 512-byte match is what actually makes this
+    // "confirmed, not just assumed."
+    if u64::from(block_count) < boot_sectors || candidate != baseline {
         return Err(BootPromoteError::NotSameDisk);
     }
 

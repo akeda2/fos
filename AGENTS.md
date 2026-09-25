@@ -445,11 +445,21 @@ net`/NETFS, and mirrors NETFS's own PUT flow almost exactly:
 | `KUP_TAG_PUT_ERROR` (`0x3e`) | Server -> client. One-byte code: `1` `TOO_LARGE` (bigger than one kernel slot, or the shared staging buffer), `2` `CHECKSUM_MISMATCH`, `3` `DISK_ERROR` (writing the slot, or reading metadata, failed), `4` `BUSY` (another update is already in flight). |
 
 `ambient_discovery_poll` -- the same idle-prompt-loop hook that also serves
-NETFS and ordinary discovery -- dispatches all three request-carrying tags,
-gated behind `debug::kernel_update_enabled()`. **KUP is therefore only ever
-served while a machine is sitting idle at its own local prompt**, exactly
-like NETFS -- not inside `chat`, `nic discover`, `term net`, or a running
-tape's own polling loop.
+NETFS and ordinary discovery -- dispatches all three request-carrying tags
+via a shared `dispatch_kup_frame` helper, gated behind
+`debug::kernel_update_enabled()`. Unlike NETFS (still idle-prompt-only --
+see that section above), KUP is **also** dispatched from both of
+`term_net`'s own receive loops (waiting for a `HELLO`, and an active
+session's own loop) through that same helper, so a kernel update can be
+pushed while `term_net` is running instead of requiring a local escape to
+the idle prompt first -- added specifically because real-hardware
+debugging sessions kept needing to interrupt an active `term_net`
+connection just to push one fix. KUP's own transfer state
+(`serve_kup_put_*`) is independent of whatever `term_net` itself is doing
+with the NIC, so this is safe; the shared-staging-buffer caveat below
+still applies regardless of which loop happens to be polling for it. KUP
+remains unavailable inside `chat`, `nic discover`, or a running tape's own
+polling loop, none of which call `dispatch_kup_frame`.
 
 On `KUP_TAG_PUT_STOP`, the server verifies the reassembled image's checksum
 before writing anything; a mismatch (or any other failure) leaves the
@@ -1467,6 +1477,60 @@ the read-only command; `write_10` itself is now wired into `disk.rs` --
 see the next section -- so this manual verification is superseded by that
 integration's own real, permanent test.
 
+#### A real bug found only on genuine UHCI hardware: bulk transfers need settle time between stages
+
+QEMU's synthetic `usb-storage` device never exposed this, but a real
+Kingston USB flash drive against real UHCI silicon reliably failed its
+very first `INQUIRY` with `TransportFailed(Timeout)` -- confirmed, via a
+temporary raw register/TD/QH dump added directly to `bulk_transfer`'s own
+timeout path, that the controller itself never cleared a TD's `Active`
+bit at all (no error bit ever set), and that the *specific* failing
+transfer varied between attempts (sometimes the data stage, sometimes the
+CSW). Root cause: unlike `control_transfer`, which keeps one Queue Head
+continuously armed across its entire SETUP+DATA+STATUS chain without
+ever stopping it mid-exchange, each stage of a bulk transfer
+(CBW/data/CSW) is a *separate* `bulk_transfer` call that stops the queue
+on its own completion and the next call restarts it completely fresh --
+with zero settle time between the stop and the next restart. Real UHCI
+hardware needs a brief turnaround gap there that this driver's design
+never provided. A 10ms (`wait_ticks(1)`) delay was added after *every*
+stage transition -- CBW-to-data, data-to-CSW, CBW-to-CSW (when there is
+no data stage), and after a command's own final CSW read completes
+(needed separately: FOSFS's own multi-sector directory reads issue
+several independent `read_10` calls back to back with no pacing of their
+own, unlike the standalone `usb storage` command's single open()-to-
+return sequence) -- fully resolving the issue. `MscDevice::command` also
+gained a bounded retry wrapper (`command_once` renamed from the original
+`command`, retried up to 3 times on a transport-level or phase error,
+never on an ordinary `CommandFailed` SCSI response) as a defense-in-depth
+measure against any remaining marginal timing on other real devices,
+though the settle delays alone were what actually fixed this specific
+drive.
+
+**A real crash was also found and fixed during this investigation**:
+before the settle delays existed, aggressively raising the retry count
+alone (without the delays) made a genuine CPU fault *more* likely, not
+less -- more attempts meant more exposure to a real hardware race: when
+a bulk transfer times out, the controller may still be mid-transaction
+on the wire at the exact moment software gives up, and immediately
+reusing that same Transfer-Descriptor-pool memory for BOT's own
+reset-recovery request (`recover`) can hit real hardware while it is
+still touching that memory. A short settle delay (`wait_ticks(2)`) was
+added to both `bulk_transfer`'s and `control_transfer`'s own timeout
+paths, after the queue is stopped but before that memory can be reused by
+any subsequent call -- eliminating the crash entirely in further testing.
+The lesson generalized here: retrying more aggressively is not a
+substitute for fixing a real timing bug, and can actively make a marginal
+hardware race more likely to manifest as a hard failure instead of a
+soft one.
+
+All of this was found and fixed through live iteration against the exact
+real Pentium 4 machine this whole feature was built for, using KUP (see
+"Debug mode" above) to push each fix over the network without ever
+needing to physically re-flash the boot USB stick -- confirming the
+debug-mode design's own stated purpose (fast, unattended-feeling
+iteration against real hardware) in practice, not just in the abstract.
+
 #### Wiring USB Mass Storage into `disk.rs` as an ordinary secondary disk
 
 `disk::Device` used to be a closed two-variant enum (`Boot`/
@@ -1558,18 +1622,26 @@ also records `disk1`'s own BIOS-reported sector count. This baseline
 read is a one-shot opportunity: discovering the USB device immediately
 afterward may itself break BIOS's access to this exact disk (the
 confirmed mechanism the previous section documents), so it must happen
-strictly first. Only if the discovered USB device's own capacity *and*
-its own LBA 0 bytes match that baseline exactly does `Device::Boot`
-switch over (a new `BOOT_USB_DEVICE` static, deliberately independent of
+strictly first. Only if the discovered USB device's own LBA 0 bytes
+match that baseline exactly, *and* its own reported capacity is at least
+as large as BIOS's own figure for `disk1`, does `Device::Boot` switch
+over (a new `BOOT_USB_DEVICE` static, deliberately independent of
 `USB_DISK` above -- promoting the boot disk and attaching an ordinary
 secondary USB disk are mutually exclusive uses of whatever single device
 is discovered); otherwise `promote_boot_to_usb` returns
 `BootPromoteError::NotSameDisk` and `Device::Boot` is left completely
-untouched. Two independent physical disks sharing both an exact capacity
-and a byte-identical MBR is not realistically possible by accident, so
-this is a strong, evidence-based check, not a bare guess -- though still
-documented as "confirmed, not proven," matching this whole follow-on's
-own honest framing. `is_usb_backed`/`usb_transfer` (the same dispatch
+untouched. Capacity is deliberately a floor, not an exact match --
+**confirmed necessary on real hardware, not just a defensive choice**: a
+real, physically tested Pentium 4 machine's own USB-boot BIOS legacy
+emulation reported `disk1`'s capacity as exactly 16 MiB (32768 sectors),
+matching the *original boot image's own baked-in GPT size*, not the
+physical USB stick's real ~14.4 GB capacity -- an exact-match requirement
+would have wrongly refused to promote the machine's own genuine boot
+media every time. The MBR content match is the real identity check (two
+independent physical disks sharing a byte-identical MBR is not
+realistically possible by accident), documented as "confirmed, not just
+assumed," matching this whole follow-on's own honest framing.
+`is_usb_backed`/`usb_transfer` (the same dispatch
 `transfer`/`transfer_chunk` already use for a `SecondaryBackend::Usb`
 disk) were extended to also recognize a promoted `Device::Boot` and
 route it to `BOOT_USB_DEVICE` instead of `USB_DISK` -- no other function
@@ -1599,6 +1671,19 @@ file (`test_refuses_mismatched_device`) confirms the cross-validation
 actually rejects a clearly different USB device (a distinctly-sized,
 all-zero backing image) rather than ever guessing, leaving `disk1`
 completely untouched and still BIOS-backed.
+
+**Confirmed on the real, physical Pentium 4 machine this whole feature
+was built for** -- not just the QEMU repro above. Live-iterated against
+it over the network via KUP (see "Debug mode" above and the bulk-transfer
+timing-bug section above, both found and fixed during this same session):
+`usb storage promote` correctly identified the machine's own genuine USB
+boot stick (a Kingston DataTraveler 3.0) despite BIOS reporting a wildly
+different, smaller capacity for it (see above), switched `disk1` over,
+and `ls`/`cat`/`write`/`rm` all continued working correctly through the
+native driver afterward -- the exact real-hardware scenario
+(`FOSFS disk error: FirmwareFailure` after any UHCI-touching command)
+that originally motivated this entire driver is now closed on the actual
+machine that exhibited it.
 
 **Still deliberately out of scope**: `reboot soft` re-enters
 `boot/stage2.S` from scratch and always depends on BIOS to reload the

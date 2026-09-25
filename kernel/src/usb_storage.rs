@@ -48,8 +48,11 @@ pub enum Error {
     /// A bulk transfer itself failed (STALL/CRC/timeout/babble) or timed
     /// out; BOT's own reset-recovery procedure has already been driven
     /// before this is returned, so the device should be ready for a
-    /// fresh command on the next call.
-    TransportFailed,
+    /// fresh command on the next call. Carries the underlying
+    /// `uhci::Error` (added to diagnose a real-hardware-only failure
+    /// QEMU's UHCI emulation never reproduced) so a caller can report
+    /// exactly which stage/error fired instead of just "it failed."
+    TransportFailed(crate::uhci::Error),
     /// The CSW's signature or tag didn't match this command, or its
     /// status byte was the reserved "Phase Error" value -- BOT's own
     /// reset-recovery procedure has already been driven before this is
@@ -291,31 +294,69 @@ impl MscDevice {
         self.out_toggle = false;
     }
 
-    /// Runs one full Bulk-Only Transport exchange: CBW out, an optional
-    /// data stage (`buffer`, direction per `data_in`), CSW in. Returns
-    /// the number of data-stage bytes actually transferred (only
-    /// meaningful for `data_in`, mirroring `Uhci::control_transfer`'s
-    /// identical convention). On any transport-level or phase error,
-    /// drives `recover` before returning, so the *next* call starts from
-    /// a clean, known device state rather than compounding a stuck one.
+    /// Runs [`command_once`](Self::command_once) up to `MAX_COMMAND_ATTEMPTS`
+    /// times, retrying (after `recover`'s reset-recovery, already run
+    /// internally by `command_once`) on a transport-level or phase error --
+    /// confirmed necessary on real hardware: a genuine Kingston flash
+    /// drive occasionally times out a single bulk transfer within an
+    /// otherwise-correct exchange (at an unpredictable stage -- sometimes
+    /// the data stage, sometimes the CSW), something QEMU's synthetic
+    /// usb-storage device never reproduces. A `CommandFailed` (an
+    /// ordinary SCSI-level "not this time" answer, e.g. a transient
+    /// not-ready condition) is a real, meaningful response, not a
+    /// transport glitch, so it is returned immediately rather than
+    /// retried here -- `wait_until_ready`'s own bounded retry loop
+    /// already handles that case at a higher level.
     fn command(&mut self, lun: u8, cdb: &[u8], buffer: &mut [u8], data_in: bool) -> Result<usize, Error> {
+        const MAX_COMMAND_ATTEMPTS: u32 = 3;
+        let mut last_error = Error::TransportFailed(crate::uhci::Error::Timeout);
+        for attempt in 0..MAX_COMMAND_ATTEMPTS {
+            match self.command_once(lun, cdb, buffer, data_in) {
+                Ok(len) => return Ok(len),
+                Err(Error::CommandFailed) => return Err(Error::CommandFailed),
+                Err(error) => {
+                    last_error = error;
+                    if attempt + 1 < MAX_COMMAND_ATTEMPTS {
+                        wait_ticks(1);
+                    }
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    /// One single attempt at a full Bulk-Only Transport exchange: CBW
+    /// out, an optional data stage (`buffer`, direction per `data_in`),
+    /// CSW in. Returns the number of data-stage bytes actually
+    /// transferred (only meaningful for `data_in`, mirroring
+    /// `Uhci::control_transfer`'s identical convention). On any
+    /// transport-level or phase error, drives `recover` before
+    /// returning, so a following attempt (whether `command`'s own retry
+    /// above, or an entirely separate command) starts from a clean,
+    /// known device state rather than compounding a stuck one.
+    fn command_once(&mut self, lun: u8, cdb: &[u8], buffer: &mut [u8], data_in: bool) -> Result<usize, Error> {
         let tag = self.next_tag();
         let mut cbw = build_cbw(tag, buffer.len() as u32, data_in, lun, cdb);
-        if self
-            .controller
-            .bulk_transfer(
-                self.device_address,
-                self.endpoints.out_endpoint & 0x0f,
-                self.endpoints.out_max_packet,
-                &mut cbw,
-                false,
-                &mut self.out_toggle,
-            )
-            .is_err()
-        {
+        if let Err(error) = self.controller.bulk_transfer(
+            self.device_address,
+            self.endpoints.out_endpoint & 0x0f,
+            self.endpoints.out_max_packet,
+            &mut cbw,
+            false,
+            &mut self.out_toggle,
+        ) {
             self.recover();
-            return Err(Error::TransportFailed);
+            return Err(Error::TransportFailed(error));
         }
+        // Every bulk_transfer call stops the queue on its own completion
+        // and the *next* one restarts it fresh from scratch -- unlike
+        // `control_transfer`, which keeps one QH continuously armed across
+        // its entire SETUP+DATA+STATUS chain without ever stopping it
+        // mid-exchange. A brief settle delay here, before the very next
+        // stage restarts that queue, is the same real-hardware-only
+        // turnaround-time accommodation already confirmed necessary
+        // between the data stage and the CSW below.
+        wait_ticks(1);
 
         let mut transferred = 0usize;
         if !buffer.is_empty() {
@@ -331,29 +372,42 @@ impl MscDevice {
                 toggle,
             ) {
                 Ok(len) => transferred = len,
-                Err(_) => {
+                Err(error) => {
                     self.recover();
-                    return Err(Error::TransportFailed);
+                    return Err(Error::TransportFailed(error));
                 }
             }
+            // A real device needs a brief moment after finishing its own
+            // data stage before it's ready to send the CSW -- confirmed
+            // necessary on real hardware (not reproduced by QEMU's
+            // synthetic usb-storage device at all): without this, the
+            // CSW-in bulk transfer immediately below reliably times out
+            // (Active never clears) on a genuine Kingston flash drive,
+            // even though the exact same IN endpoint just successfully
+            // completed the data stage moments earlier.
+            wait_ticks(1);
         }
 
         let mut csw = [0u8; CSW_LEN];
-        if self
-            .controller
-            .bulk_transfer(
-                self.device_address,
-                self.endpoints.in_endpoint & 0x0f,
-                self.endpoints.in_max_packet,
-                &mut csw,
-                true,
-                &mut self.in_toggle,
-            )
-            .is_err()
-        {
+        if let Err(error) = self.controller.bulk_transfer(
+            self.device_address,
+            self.endpoints.in_endpoint & 0x0f,
+            self.endpoints.in_max_packet,
+            &mut csw,
+            true,
+            &mut self.in_toggle,
+        ) {
             self.recover();
-            return Err(Error::TransportFailed);
+            return Err(Error::TransportFailed(error));
         }
+        // Settle time after this command's own final stage too, not just
+        // between this command's internal stages -- confirmed necessary
+        // for back-to-back *separate* commands on the same device (e.g.
+        // FOSFS's own multi-sector directory read, several independent
+        // `read_10` calls in a tight loop with no caller-side pacing of
+        // its own), the same real-hardware-only turnaround-time
+        // requirement as the intra-command delays above.
+        wait_ticks(1);
 
         let signature = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
         let csw_tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);

@@ -2168,6 +2168,14 @@ fn term_net(info: &BootInfo) {
                             index + 1
                         );
                     }
+                    tag if dispatch_kup_frame(
+                        info,
+                        interface,
+                        peer_mac,
+                        interface.mac_address(),
+                        tag,
+                        &frame[15..],
+                    ) => {}
                     _ => {}
                 }
             }
@@ -2242,6 +2250,9 @@ fn term_net(info: &BootInfo) {
                         CHAT_TAG_DISCOVER_REPLY,
                         nic::active_index(),
                     );
+                    continue;
+                }
+                if dispatch_kup_frame(info, nic, frame_source, source, frame[14], &frame[15..]) {
                     continue;
                 }
                 if frame_source != peer {
@@ -3301,8 +3312,9 @@ const NETFS_ERROR_BUSY: u8 = 9;
 /// update never touched, entirely without physical intervention.
 ///
 /// Deliberately gated behind `debug::kernel_update_enabled()` (the `debug`
-/// file's `kernel-update` option) at the one call site that dispatches
-/// these tags (`ambient_discovery_poll`): unlike NETFS, which is always
+/// file's `kernel-update` option) at every call site that dispatches these
+/// tags (`ambient_discovery_poll`, and both of `term_net`'s own receive
+/// loops via `dispatch_kup_frame`): unlike NETFS, which is always
 /// available, letting an arbitrary LAN peer overwrite this machine's own
 /// boot media is powerful enough that it must be an explicit, per-machine
 /// opt-in, not an ambient default. A host with the option off does not even
@@ -3653,6 +3665,39 @@ static mut NEXT_AMBIENT_BROADCAST: u64 = 0;
 /// a few milliseconds apart, so as long as frames keep arriving the caller
 /// must keep polling at full speed rather than sleeping through the next
 /// chunk.
+/// Dispatches one incoming frame's tag if (and only if) it is a KUP tag
+/// and `debug::kernel_update_enabled()`, returning whether it was
+/// handled -- shared by `ambient_discovery_poll` and both of `term_net`'s
+/// own receive loops (the "waiting for a `HELLO`" wait and an active
+/// session's own loop), so a kernel update can be pushed while `term_net`
+/// is running instead of requiring a local escape to the idle prompt
+/// first. Unlike NETFS (still idle-prompt-only, see `ambient_discovery_
+/// poll`'s own doc comment for why), KUP's own transfer state
+/// (`serve_kup_put_*`) is independent of whatever `term_net` itself is
+/// doing with the NIC, and a KUP push is a deliberate, operator-initiated
+/// action either way -- the same "shared staging buffer, don't run a
+/// local `copy`/`tape load` at the same time" caveat already documented
+/// for KUP applies regardless of which loop happens to be polling for it.
+fn dispatch_kup_frame(
+    info: &BootInfo,
+    nic: &nic::Nic,
+    peer_mac: [u8; 6],
+    own_mac: [u8; 6],
+    tag: u8,
+    payload: &[u8],
+) -> bool {
+    if !crate::debug::kernel_update_enabled() {
+        return false;
+    }
+    match tag {
+        KUP_TAG_PUT_REQUEST => serve_kup_put_request(nic, peer_mac, own_mac, payload),
+        KUP_TAG_PUT_DATA => serve_kup_put_data(peer_mac, payload),
+        KUP_TAG_PUT_STOP => serve_kup_put_stop(info, nic, peer_mac, own_mac),
+        _ => return false,
+    }
+    true
+}
+
 fn ambient_discovery_poll(info: &BootInfo) -> bool {
     let now = interrupts::ticks();
     let started_at = unsafe {
@@ -3705,15 +3750,7 @@ fn ambient_discovery_poll(info: &BootInfo) -> bool {
             NETFS_TAG_PUT_STOP => {
                 serve_netfs_put_stop(info, nic, peer_mac, own_mac);
             }
-            KUP_TAG_PUT_REQUEST if crate::debug::kernel_update_enabled() => {
-                serve_kup_put_request(nic, peer_mac, own_mac, payload);
-            }
-            KUP_TAG_PUT_DATA if crate::debug::kernel_update_enabled() => {
-                serve_kup_put_data(peer_mac, payload);
-            }
-            KUP_TAG_PUT_STOP if crate::debug::kernel_update_enabled() => {
-                serve_kup_put_stop(info, nic, peer_mac, own_mac);
-            }
+            tag if dispatch_kup_frame(info, nic, peer_mac, own_mac, tag, payload) => {}
             _ => {}
         }
     }
