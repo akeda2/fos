@@ -29,10 +29,16 @@ against QEMU's synthetic codec -- mirroring `tapes/test_hda_playback_e2e.py`'s
 device flags exactly, just with `audio-rtp.bin` in place of `audio-net.bin`.
 
 Not part of `make test`; run it after `make tape-audio-rtp` and `make
-image`. Requires a real `ffmpeg` built with `libopus` on the host.
+image`. Requires a real `ffmpeg` built with `libopus` on the host. Uses
+`-accel kvm` when `/dev/kvm` is accessible (see `kvm_available()`'s doc
+comment), falling back to plain TCG with a printed warning otherwise --
+mirroring `tapes/test_audio_net_real_mic_e2e.py`'s own precedent for the
+same underlying QEMU/TCG timing artifact.
 """
 
 import math
+import os
+import selectors
 import socket as socketlib
 import struct
 import subprocess
@@ -211,9 +217,41 @@ def monitor_command(command: str, wait: float = 0.5) -> None:
     sock.close()
 
 
+def kvm_available() -> bool:
+    """See tapes/test_audio_net_real_mic_e2e.py's own doc comment for the
+    full story: under plain TCG software emulation, a guest's tight,
+    uninterrupted busy loop starves QEMU's own timer/interrupt delivery
+    for the loop's entire duration (TCG holds one Big QEMU Lock almost
+    continuously in that mode) -- confirmed there down to an unrelated
+    CPU-bound tape showing the identical symptom, and fixed immediately
+    by switching to `-accel kvm` (real hardware-virtualized execution),
+    no other change. SILK's fixed-point encoder/decoder analysis is
+    exactly this kind of sustained CPU-bound loop, so this test uses the
+    same acceleration when available, with the same graceful TCG
+    fallback otherwise -- this is purely a QEMU dev-loop timing fidelity
+    concern, not a real-hardware one: this project targets Pentium 4 and
+    later, and Opus decode is comfortably real-time on hardware far
+    slower than that."""
+    try:
+        fd = os.open("/dev/kvm", os.O_RDWR)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
 def run_guest(image: Path, wav_capture: Path):
     if MONITOR_SOCK.exists():
         MONITOR_SOCK.unlink()
+    accel_args = ["-accel", "kvm", "-cpu", "host"] if kvm_available() else []
+    if not accel_args:
+        print(
+            "WARNING: /dev/kvm is not accessible; falling back to plain TCG "
+            "(see kvm_available()'s doc comment -- a QEMU timing artifact, "
+            "not a real regression, but underrun-driven gaps become more "
+            "likely).",
+            file=sys.stderr,
+        )
     return subprocess.Popen(
         [
             "qemu-system-i386",
@@ -223,6 +261,7 @@ def run_guest(image: Path, wav_capture: Path):
             # test_audio_rtp_e2e.py's send-mode `-m 256`.
             "-m",
             "256",
+            *accel_args,
             "-drive",
             f"format=raw,file={image}",
             "-snapshot",
@@ -251,9 +290,6 @@ def run_guest(image: Path, wav_capture: Path):
 
 
 def main() -> None:
-    import os
-    import selectors
-
     if not TAPE.exists():
         raise SystemExit(f"{TAPE} does not exist; run `make tape-audio-rtp` first")
     if not IMAGE.exists():
@@ -344,19 +380,17 @@ def main() -> None:
         stream_start = len(output)
         for packet in opus_packets:
             mcast.send(rtp_frame(GUEST_MAC, HOST_MAC, HOST_IP, GUEST_IP, RTP_PORT, RTP_PORT, packet))
-            # Real 20 ms Opus-frame pacing (matching ffmpeg's own send
-            # rate) starves QEMU's TCG-emulated guest CPU: fixed-point
-            # Opus decode is measurably heavier per packet than anything
-            # else this kernel does synchronously on packet arrival, and
-            # a software-emulated CPU decoding it is nowhere near as fast
-            # as real silicon (which decodes Opus far faster than
-            # real-time even on modest hardware) -- so strict real-time
-            # pacing here starved HDA's DMA between periods, producing
-            # audible underrun silence gaps instead of a genuine decode
-            # bug. Extra slack gives the emulated guest CPU headroom to
-            # keep the playback ring topped up well ahead of each
-            # period's drain deadline.
-            time.sleep(0.16)
+            # Real 20 ms Opus-frame pacing, matching ffmpeg's own send
+            # rate: each packet only carries ~20 ms of audio, so pacing
+            # any slower than that (an earlier version of this test used
+            # 160 ms, based on a mistaken TCG-starvation theory) just
+            # inserts real silence gaps of its own between packets --
+            # not a decode/DMA bug, just this test sending slower than
+            # the stream it claims to be. `run_guest`'s `-accel kvm` (see
+            # `kvm_available()`) is the actual fix for genuine QEMU/TCG
+            # timing starvation; it does not need help from artificial
+            # pacing on top of it.
+            time.sleep(0.02)
 
         read_until(b"stream started from", 15, stream_start)
         print("PASS: tape locked onto the real ffmpeg-sourced Opus RTP stream.")
