@@ -51,6 +51,24 @@ TAPE_IMAGE_ARGS := \
 	--file router.cfg tapes/router/router.cfg
 EXTRA_FOSFS_FILES ?=
 
+# Every cargo invocation below (the kernel plus every Rust tape) shares this
+# one target directory instead of each crate's own local `target/`. None of
+# these are a Cargo workspace (each tape is its own independent crate with
+# its own Cargo.toml), so without this every i686-fos crate independently
+# reran `-Z build-std=core,compiler_builtins` from scratch against the
+# identical target spec/profile -- the same work, repeated once per crate,
+# and again for the handful of x86_64-fos-tape crates. Cargo namespaces
+# this directory by target triple on its own (`$(CARGO_TARGET_DIR)/i686-fos/...`
+# vs `.../x86_64-fos-tape/...`), so one shared directory is enough for both.
+# Cargo's own target-dir locking makes concurrent `cargo build` invocations
+# against one shared directory safe under `make -j`: a shared unit (like
+# `core`, or the local `tape-rt` path dependency several tapes use) only
+# actually compiles once, and every other crate needing it waits briefly
+# and reuses the result instead of rebuilding it. `$(CURDIR)` (not a bare
+# relative path) is required since these recipes `cd` into each crate's own
+# directory before invoking cargo.
+export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
+
 .PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
@@ -139,7 +157,7 @@ kernel:
 	python3 tools/write_layout.py --rust-slots kernel/src/generated_slots.rs
 	cd kernel && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec $(KERNEL_CARGO_FEATURES)
 	mkdir -p $(BUILD)
-	cp kernel/target/i686-fos/release/fos-kernel $(KERNEL_ELF)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/fos-kernel $(KERNEL_ELF)
 	objcopy -O binary $(KERNEL_ELF) $(KERNEL_BIN)
 
 image: kernel tapes
@@ -251,7 +269,7 @@ tape-primes:
 tape-hello-rs:
 	cd tapes/hello-rs && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/hello-rs/target/i686-fos/release/hello-tape $(TAPE_HELLO_RS_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/hello-tape $(TAPE_HELLO_RS_BIN)
 
 # Builds the "vga-colors" test tape: same fixed-address Rust setup as
 # tape-hello-rs above, but demonstrating the tape ABI's second callback
@@ -266,7 +284,7 @@ tape-hello-rs:
 tape-vga-colors:
 	cd tapes/vga-colors && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/vga-colors/target/i686-fos/release/vga-colors-tape $(TAPE_VGA_COLORS_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/vga-colors-tape $(TAPE_VGA_COLORS_BIN)
 
 # Builds the "bigsieve" test tape: same fixed-address Rust setup as
 # tape-hello-rs above, but demonstrating the tape ABI's third and fourth
@@ -282,7 +300,7 @@ tape-vga-colors:
 tape-bigsieve:
 	cd tapes/bigsieve && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/bigsieve/target/i686-fos/release/bigsieve-tape $(TAPE_BIGSIEVE_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/bigsieve-tape $(TAPE_BIGSIEVE_BIN)
 
 # Builds the "longmode" test tape: fos's own hand-written assembly
 # `tape64_body` (tapes/longmode.S) linked against the reusable mode-
@@ -304,9 +322,22 @@ tape-bigsieve:
 # `make all`/`make tapes`. Note that actually *running* this tape's real
 # 64-bit excursion needs `qemu-system-x86_64`, not the `qemu-system-i386`
 # every other target in this repo uses -- see tapes/test_longmode_e2e.py.
-tape-longmode:
+# The reusable mode-switch shim is a real, file-tracked prerequisite (not
+# reassembled inline by each of the four targets below) specifically so
+# `make -j` is safe: tape-longmode, tape-longmode-rs, tape-cpu64-lab, and
+# tape-cpu64-show all link against this same object file, and four phony
+# recipes independently `as`-ing to the same output path is a real race
+# under parallel builds -- one target's `ld` could read this file while
+# another target's `as` still has it open for writing. Make's own
+# file-based dependency tracking now guarantees it is assembled exactly
+# once (and only when tapes/longmode64_shim.S itself changes) before any
+# of the four dependents run.
+$(BUILD)/tapes/longmode64_shim.o: tapes/longmode64_shim.S
 	mkdir -p $(BUILD)/tapes
-	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
+	as --64 -o $@ $<
+
+tape-longmode: $(BUILD)/tapes/longmode64_shim.o
+	mkdir -p $(BUILD)/tapes
 	as --64 -o $(BUILD)/tapes/longmode.o tapes/longmode.S
 	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/longmode.elf $(BUILD)/tapes/longmode64_shim.o $(BUILD)/tapes/longmode.o
 	objcopy -O binary $(BUILD)/tapes/longmode.elf $(TAPE_LONGMODE_BIN)
@@ -330,11 +361,10 @@ tape-longmode:
 # rationale and a line-by-line comparison against tape-longmode's
 # hand-written body. Entirely additive -- untouched by plain
 # `make`/`image`/`run`/`test`; built as part of `make all`/`make tapes`.
-tape-longmode-rs:
+tape-longmode-rs: $(BUILD)/tapes/longmode64_shim.o
 	mkdir -p $(BUILD)/tapes
-	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
 	cd tapes/longmode-rs && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
-	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/longmode-rs.elf $(BUILD)/tapes/longmode64_shim.o tapes/longmode-rs/target/x86_64-fos-tape/release/liblongmode_tape_body.a
+	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/longmode-rs.elf $(BUILD)/tapes/longmode64_shim.o $(CARGO_TARGET_DIR)/x86_64-fos-tape/release/liblongmode_tape_body.a
 	objcopy -O binary $(BUILD)/tapes/longmode-rs.elf $(TAPE_LONGMODE_RS_BIN)
 
 # Builds the "cpu64-lab" test tape: the same reusable longmode shim as
@@ -342,18 +372,16 @@ tape-longmode-rs:
 # (optionally, by startup argument) runs tiny x87/MMX/SSE instruction tests.
 # The body writes a compact bitfield report back through the shim's shared
 # report buffer, which the 32-bit side prints on serial after state restore.
-tape-cpu64-lab:
+tape-cpu64-lab: $(BUILD)/tapes/longmode64_shim.o
 	mkdir -p $(BUILD)/tapes
-	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
 	cd tapes/cpu64-lab && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
-	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/cpu64-lab.elf $(BUILD)/tapes/longmode64_shim.o tapes/cpu64-lab/target/x86_64-fos-tape/release/libcpu64_lab_tape_body.a
+	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/cpu64-lab.elf $(BUILD)/tapes/longmode64_shim.o $(CARGO_TARGET_DIR)/x86_64-fos-tape/release/libcpu64_lab_tape_body.a
 	objcopy -O binary $(BUILD)/tapes/cpu64-lab.elf $(TAPE_CPU64_LAB_BIN)
 
-tape-cpu64-show:
+tape-cpu64-show: $(BUILD)/tapes/longmode64_shim.o
 	mkdir -p $(BUILD)/tapes
-	as --64 -o $(BUILD)/tapes/longmode64_shim.o tapes/longmode64_shim.S
 	cd tapes/cpu64-show && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
-	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/cpu64-show.elf $(BUILD)/tapes/longmode64_shim.o tapes/cpu64-show/target/x86_64-fos-tape/release/libcpu64_show_tape_body.a
+	ld -T tapes/longmode64.ld --oformat=elf64-x86-64 -o $(BUILD)/tapes/cpu64-show.elf $(BUILD)/tapes/longmode64_shim.o $(CARGO_TARGET_DIR)/x86_64-fos-tape/release/libcpu64_show_tape_body.a
 	objcopy -O binary $(BUILD)/tapes/cpu64-show.elf $(TAPE_CPU64_SHOW_BIN)
 
 # Builds the "calc" test tape: same fixed-address Rust setup as
@@ -371,7 +399,7 @@ tape-cpu64-show:
 tape-calc:
 	cd tapes/calc && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/calc/target/i686-fos/release/calc-tape $(TAPE_CALC_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/calc-tape $(TAPE_CALC_BIN)
 
 # Builds the core line-oriented Rust editor. It uses the complete-file FOSFS
 # callbacks, a bounded allocated text buffer, and read_key for local or
@@ -379,7 +407,7 @@ tape-calc:
 tape-ed:
 	cd tapes/ed && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/ed/target/i686-fos/release/ed-tape $(TAPE_ED_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/ed-tape $(TAPE_ED_BIN)
 
 # Builds the "beep" test tape: a 32-bit Rust tape using the newest
 # twelve-argument ABI and `read_key` to drive the PC speaker directly.
@@ -389,7 +417,7 @@ tape-ed:
 tape-beep:
 	cd tapes/beep && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/beep/target/i686-fos/release/beep-tape $(TAPE_BEEP_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/beep-tape $(TAPE_BEEP_BIN)
 
 # Builds the "morse" test tape: a 32-bit Rust tape using the twelve-argument
 # ABI and `read_key` to turn each A-Z/0-9 input character into a printed
@@ -397,7 +425,7 @@ tape-beep:
 tape-morse:
 	cd tapes/morse && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/morse/target/i686-fos/release/morse-tape $(TAPE_MORSE_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/morse-tape $(TAPE_MORSE_BIN)
 
 # Builds the "net-chat" test tape: a 32-bit Rust implementation of fos's
 # shell-compatible raw Ethernet chat protocol using the kernel-managed NIC
@@ -405,7 +433,7 @@ tape-morse:
 tape-net-chat:
 	cd tapes/net-chat && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/net-chat/target/i686-fos/release/net-chat-tape $(TAPE_NET_CHAT_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/net-chat-tape $(TAPE_NET_CHAT_BIN)
 
 # Builds the "audio-net" test tape: a raw-Ethernet PCM audio streaming tape
 # for kernel/src/audio.rs's ES1370 playback facade. Listen mode (`tape run`)
@@ -415,7 +443,7 @@ tape-net-chat:
 tape-audio-net:
 	cd tapes/audio-net && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/audio-net/target/i686-fos/release/audio-net-tape $(TAPE_AUDIO_NET_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/audio-net-tape $(TAPE_AUDIO_NET_BIN)
 
 # Builds the "ip-chat" protocol tape: a 32-bit Rust UDP-over-IPv4 chat
 # application using tape-net for ARP/IPv4/UDP and DHCP. Static mode is the
@@ -424,7 +452,7 @@ tape-audio-net:
 tape-ip-chat:
 	cd tapes/ip-chat && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/ip-chat/target/i686-fos/release/ip-chat-tape $(TAPE_IP_CHAT_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/ip-chat-tape $(TAPE_IP_CHAT_BIN)
 
 test-tape-net:
 	cargo +nightly-2026-09-13 test --manifest-path tapes/tape-net/Cargo.toml
@@ -438,7 +466,7 @@ test-tape-ip-chat:
 tape-telnet:
 	cd tapes/telnet && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/telnet/target/i686-fos/release/telnet-tape $(TAPE_TELNET_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/telnet-tape $(TAPE_TELNET_BIN)
 
 test-tape-telnet:
 	cargo +nightly-2026-09-13 test --manifest-path tapes/telnet/Cargo.toml --lib
@@ -450,7 +478,7 @@ test-tape-telnet:
 tape-audio-rtp:
 	cd tapes/audio-rtp && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/audio-rtp/target/i686-fos/release/audio-rtp-tape $(TAPE_AUDIO_RTP_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/audio-rtp-tape $(TAPE_AUDIO_RTP_BIN)
 
 test-tape-audio-rtp:
 	cargo +nightly-2026-09-13 test --manifest-path tapes/audio-rtp/Cargo.toml --lib
@@ -464,7 +492,7 @@ test-audio-rtp: image tape-audio-rtp
 tape-bridge:
 	cd tapes/bridge && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/bridge/target/i686-fos/release/bridge-tape $(TAPE_BRIDGE_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/bridge-tape $(TAPE_BRIDGE_BIN)
 
 test-tape-bridge: image tape-bridge
 	python3 tapes/test_bridge_e2e.py
@@ -472,12 +500,12 @@ test-tape-bridge: image tape-bridge
 tape-router:
 	cd tapes/router && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/router/target/i686-fos/release/router-tape $(TAPE_ROUTER_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/router-tape $(TAPE_ROUTER_BIN)
 
 tape-net-dhcp:
 	cd tapes/net-dhcp-test && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
-	cp tapes/net-dhcp-test/target/i686-fos/release/net-dhcp-test-tape $(TAPE_NET_DHCP_BIN)
+	cp $(CARGO_TARGET_DIR)/i686-fos/release/net-dhcp-test-tape $(TAPE_NET_DHCP_BIN)
 
 test-tape-router: image tape-router
 	python3 tapes/test_router_e2e.py
@@ -511,5 +539,10 @@ test-audio-net: image tape-audio-net
 test-audio-multi: image
 	python3 tapes/test_audio_multi_e2e.py
 
+# Every crate now shares $(CARGO_TARGET_DIR) (build/cargo-target, see above),
+# so `rm -rf $(BUILD)` alone removes it along with everything else this repo
+# builds. The extra paths below are pre-existing per-crate `target/`
+# directories from before that change; harmless to list even once they no
+# longer exist, since `rm -rf` on a missing path is a no-op.
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/net-chat/target tapes/audio-net/target tapes/ip-chat/target tapes/telnet/target tapes/bridge/target tapes/router/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/beep/target tapes/morse/target tapes/net-chat/target tapes/audio-net/target tapes/ip-chat/target tapes/telnet/target tapes/audio-rtp/target tapes/bridge/target tapes/router/target tapes/net-dhcp-test/target

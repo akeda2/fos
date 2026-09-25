@@ -518,6 +518,22 @@ that window elapses.
 The pinned toolchain is `nightly-2026-09-13`, with `rust-src`. Required host
 tools are GNU Make, GNU `as`/`objcopy`, Python 3, and `qemu-system-i386`.
 
+Every `cargo build` invocation in the Makefile (the kernel plus every Rust
+tape -- none of these are a Cargo workspace) shares one `CARGO_TARGET_DIR`
+(`build/cargo-target`), so `-Z build-std`'s `core`/`compiler_builtins` and
+any shared local path dependency (e.g. `tape-rt`) compile once and are
+reused across crates instead of once per crate; Cargo's own target-dir
+locking keeps this safe under `make -j`. The four tapes that visit 64-bit
+long mode (`tape-longmode`, `tape-longmode-rs`, `tape-cpu64-lab`,
+`tape-cpu64-show`) link against one shared, file-tracked
+`build/tapes/longmode64_shim.o` prerequisite rather than each
+independently re-assembling it -- also required for `-j` safety, since
+four phony recipes each writing that same path with an inline `as`
+command would race. `make all -j$(nproc)` builds the image and every tape
+in well under a minute on a clean checkout on typical multi-core hardware;
+prefer `-j$(nproc)` over a bare `-j` so job count doesn't run away as more
+tapes get added.
+
 ```sh
 make image    # Produces build/fos.img with all compiled tapes. Plain `make` is equivalent.
 make image-unsafe-memory # Produces build/fos-unsafe-memory.img without paging, then restores build/fos.img.
