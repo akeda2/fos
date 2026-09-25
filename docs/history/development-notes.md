@@ -1519,3 +1519,431 @@ outer loop" claim above is now only accurate for a nested command that
 never calls `should_abort`/`read_key`; any tape that does gets the
 benefit of this fix for free.
 
+
+
+## `tapes/calc/`: the reverse-Polish-notation calculator this all was for (full detail)
+
+### `tapes/calc/`: the reverse-Polish-notation calculator this all was for
+
+The calculator deferred while `read_key`/`args_ptr`/`args_len` above were
+being designed now exists: `tapes/calc/`, a genuinely new tape (not a
+`docs/rust-tapes-for-dummies.md` teaching-ladder example), depending on
+`../tape-rt` the same way `vga-colors` does rather than duplicating
+`entry.S`/the panic handler/print helpers a third time.
+
+Reverse Polish notation (RPN) was chosen deliberately, not just as an
+arbitrary demo choice: evaluating it needs only a stack and one
+left-to-right pass over whitespace-separated tokens (a number pushes, an
+operator pops two operands and pushes one result) -- no operator-
+precedence table, no parentheses, no lookahead. That simplicity keeps
+this tape's own logic (`eval_line`, `next_token`, `parse_i32` in
+`tapes/calc/src/main.rs`) squarely focused on demonstrating the new ABI
+additions, not on parser design.
+
+It exercises both new additions, independently, exactly as each was
+designed to be used:
+
+- **`tape run 3 4 +`** (startup arguments): evaluates `"3 4 +"` once via
+  `args_ptr`/`args_len`, prints `= 7`, and returns immediately -- no
+  interaction at all.
+- **Plain `tape run`** (interactive `read_key`): starts a small REPL,
+  reading one line at a time from whichever source started the tape
+  (local keyboard or an active `term_net` session, indistinguishably, as
+  designed) until told to give up. This is also the first tape to
+  demonstrate a *line-based* input pattern built entirely out of the
+  kernel's one non-blocking `read_key` primitive, exactly as this
+  section above predicted a future tape would: a fixed-size line buffer
+  that grows on ordinary printable bytes, shrinks by one on a backspace
+  event (the on-screen erase already happened inside `read_key` itself,
+  so the tape only tracks its own length), and evaluates and resets on
+  `\r`/`\n`. `TAPE_EVENT_ABORT` ends the REPL the same way it would for
+  any other `read_key`-based tape.
+
+`tapes/calc/src/main.rs` intentionally never calls `should_abort` --
+consistent with this section's own warning, doing so alongside
+`read_key` would race both against the same underlying input sources.
+Its `EvalError` enum (stack underflow, division/remainder by zero,
+`i32` overflow via `checked_add`/`checked_sub`/`checked_mul`/
+`checked_div`/`checked_rem`, an unrecognized token, a full stack, or
+leftover operands once input is exhausted) reports a friendly message
+through `putc` for every failure mode rather than panicking or silently
+producing a wrong answer -- deliberately, since a calculator that
+crashes on `5 0 /` would defeat the point of a teaching example.
+
+Verified end to end over the network with `tapes/test_calc_e2e.py`
+(mirroring `tapes/test_hello_rs_e2e.py`'s one-continuous-`term-net`-
+session structure): both startup-argument evaluation (`3 4 +` = `7`) and
+an interactive session (`6 7 *` = `42`; `5 0 /` reports division by
+zero; `2 2` with a backspace then `3 -` correctly becomes `2 3 -` = `-1`,
+proving `read_key`'s backspace handling; a remote Escape byte stops the
+REPL cleanly, the same mechanism `tapes/test_vga_colors_e2e.py` already
+proves for a `should_abort`-based tape) all pass, and the same
+`term_net` session remains responsive to an ordinary command
+immediately afterward. Built with `make tape-calc` (producing
+`build/tapes/calc.bin`).
+
+
+
+## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer (full detail)
+
+## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
+
+`kernel/src/lapic.rs` is a minimal local APIC driver, added specifically
+to receive Message Signaled Interrupts (MSI) -- fos's interrupt story was
+previously the legacy 8259 PIC alone (`interrupts.rs`), fed by INTx lines
+via `pci::PciAddress::interrupt_line()`/`register_pci_irq`. The PIC keeps
+running exactly as before for every existing backend (RTL8139, the
+selected 3C905 variants, Intel e1000, the NE2000-compatible clone, and
+ES1370, which predates MSI and has no such capability to find); the local
+APIC is purely additive, used only to receive MSI-delivered interrupts,
+never to relay legacy INTx lines (its LINT0/LINT1 Local Vector Table
+entries are deliberately left masked/as firmware set them), and there is
+still no I/O-APIC anywhere in this kernel, since MSI bypasses I/O-APIC
+redirection entirely and needs none.
+
+`lapic::initialize()` runs once, unconditionally, from
+`interrupts::initialize()` (right alongside the PIC/PIT setup already
+there): it checks CPUID.1:EDX bit 9 (reusing the existing `cpu::features()`
+wrapper), reads `IA32_APIC_BASE` (MSR `0x1b`, via new `arch::x86::rdmsr`/
+`wrmsr` helpers -- the first MSR access anywhere in this kernel) to find
+the LAPIC's physical MMIO base (architecturally `0xfee00000`), maps that
+one 4 KiB window with the existing `paging::map_mmio` (the same mechanism
+every BAR-mapped driver already uses), and programs the Spurious-Interrupt
+Vector Register with a dedicated vector (`lapic::SPURIOUS_VECTOR`, `0x60`)
+-- mirroring the PIC's own IRQ7/IRQ15 spurious-vector convention for
+continuity, though a genuine spurious *local APIC* interrupt needs no EOI
+at all, unlike the PIC's ISR-check dance. Every real chipset since the
+Pentium era, and every CPU model QEMU emulates (even single-core, even
+the default `i440fx` machine type), has always had a local APIC, so this
+is a defensive check rather than an expected failure path; if it ever
+does fail (no APIC, or `map_mmio` has no free dynamic page table slot --
+see below), `lapic::initialize()` returns `false`, the boot narration
+says so, and every MSI-capable driver transparently falls back to its
+legacy PIC IRQ path exactly as if the feature didn't exist.
+
+`pci.rs` gained a capability-list walk (`PciAddress::find_capability`,
+bounded to a small fixed hop count against a malformed list) -- Status
+register bit 4, then the linked list at the Capabilities Pointer, offset
+`0x34` -- and `PciAddress::enable_msi(vector, destination_lapic_id)`,
+which finds the MSI capability (ID `0x05`; MSI-X, a different, table-based
+capability with ID `0x11`, is not implemented -- no current device needs
+it), writes the Message Address (`0xfee00000 | (destination_lapic_id <<
+12)`, physical destination mode, no redirection hint -- this single-core
+kernel only ever has the one destination) and Message Data (delivery mode
+fixed, the vector in the low byte -- MSI is always edge-triggered per the
+PCI spec, so there is no trigger-mode bit to set, unlike a legacy PIC IRQ
+gate), then sets the Message Control register's MSI-enable bit. Only the
+simplest case is handled: one vector, a 32-bit message address; a
+64-bit-capable device still works correctly with just its Message Upper
+Address register zeroed, since every address this kernel ever targets
+fits in 32 bits regardless.
+
+`interrupts.rs` reserves a new vector range, `MSI_VECTOR_BASE` (`0x50`)
+through `0x5f` -- clear of the CPU exception range, the PIC's remapped
+`0x20`-`0x2f`, and the new LAPIC spurious vector `0x60` (`gdt::
+DOUBLE_FAULT_TSS_SELECTOR`, `0x30`, is a GDT *selector*, a different
+namespace entirely, not a conflict) -- with `allocate_msi_vector`/
+`register_msi_irq`/`dispatch_msi_irq`. Unlike `register_pci_irq`'s
+`PCI_IRQ_HANDLERS`, which deliberately holds up to `MAX_SHARED_HANDLERS`
+handlers per legacy line (see "A real bug this test found: shared legacy
+PCI IRQ lines..." in `docs/history/audio-hda.md`), `MSI_HANDLERS` holds
+exactly one handler per vector: MSI's entire point is exclusive, unshared
+ownership, unlike legacy INTx sharing, which is a motherboard-topology
+fact no driver controls. Each generated MSI IDT gate calls
+`lapic::send_eoi()` -- a genuinely different acknowledgment mechanism
+from the PIC's own `send_eoi` (an MMIO register write instead of an `outb`
+command sequence) -- and the two are never mixed for one interrupt.
+
+`hda.rs` is the first (and, for now, only) consumer: `init_controller`
+tries `lapic::is_available()` -> `interrupts::allocate_msi_vector()` ->
+`address.enable_msi(vector, lapic::id())` before falling back to its
+previous `address.interrupt_line()` + `register_pci_irq` path, storing
+whichever succeeded as `Hda::msi_vector`/`irq`. `handle_pci_irq` matches
+an incoming byte against either field (`irq` values 0-15 and MSI vectors
+`0x50`-`0x5f` never overlap, so this is unambiguous) -- the existing
+"every controller checks its own status register, so a non-matching call
+is a harmless no-op" reasoning from the shared-legacy-line fix applies
+unchanged. `hda status` reports `"MSI enabled, vector 0x.."` with a live
+fire count when MSI is active, or the previous legacy-IRQ wording
+otherwise; ES1370 is completely untouched, since `find_capability(0x05)`
+naturally returns `None` for a device that predates MSI, and takes the
+same legacy path it always has.
+
+`kernel/src/pci.rs`'s `pci` command output also gained an `msi=yes/no`
+flag per discovered function (capability *presence*, not whether this
+kernel actually enabled it for that device) -- read-only, at no writing
+cost, useful for confirming a card the same way `pci`'s vendor/device ID
+dump already helps identify unknown hardware.
+
+**Low-memory constraint, now resolved**: the local APIC's own `map_mmio`
+call is a fourth potential consumer of `paging.rs`'s dynamic-page-table
+pool (alongside e1000/i350/HDA). At the time this feature was built, that
+pool was deliberately *not* widened from 3 to 4 slots to cover it --
+confirmed by trying it, not assumed: even one more static 4 KiB page
+table pushed `__kernel_end` past `linker.ld`'s ceiling (then `0x90000`),
+which had essentially no spare room at all. The pool is now 4 slots:
+once that ceiling grew to `0x98000` for an unrelated reason (see
+"Low-memory map" above), there was real headroom again, and the gap was
+closed deliberately rather than left as a standing, if narrow,
+MSI-availability risk. If this pool is ever exhausted anyway (4 *other*
+high regions already mapped when the LAPIC tries to map its own), the
+failure remains graceful: no local APIC, no MSI that boot, every driver
+on its legacy path -- not a fault.
+
+Verified end to end by dropping the `-device intel-hda,msi=off` workaround
+from `tapes/test_hda_playback_e2e.py`/`tapes/test_hda_capture_e2e.py`
+(previously forced off specifically because this feature didn't exist yet
+-- see those files' own doc comments) and asserting the new `"MSI
+enabled, vector 0x.."` narration instead: both tests still produce real,
+non-silent captured audio exactly as before, now proven driven by
+MSI-delivered interrupts rather than a legacy IRQ. `tapes/test_hda_e2e.py`
+and `tapes/test_hda_multi_e2e.py` (which never forced `msi=off` even
+before this feature existed) continue to pass unmodified, as does
+`tapes/test_audio_multi_e2e.py` (an RTL8139 sharing legacy IRQ 11 with
+two ES1370 cards -- the exact historical shared-line scenario, still
+legacy-only since ES1370 has no MSI capability), plus `make test`,
+`make test-nic-watchdog`, `make test-stack-guard`, and
+`make test-page-protection`.
+
+
+
+## Cooperative/preemptive scheduling: investigated, not yet built (full detail)
+
+### Cooperative/preemptive scheduling: investigated, not yet built
+
+Raised as "what would a real scheduler cost, and what would it buy us?"
+while designing `poll_background_work` above (which is deliberately the
+much cheaper alternative, scoped to kernel-native recurring work only --
+see that section). A genuine scheduler, cooperative or preemptive, would
+need several pieces this kernel has none of today: per-task stacks and a
+small, fixed-size task-control-block table (no heap exists, so this would
+be a fixed array of TCBs, each with a statically-sized stack, mirroring
+`entry.S`'s single kernel stack/guard page just multiplied per task); a
+context-switch primitive (save/restore the full register set plus stack
+pointer) and a scheduling policy on top of it; and a cooperative-vs-
+preemptive choice (cooperative needs no timer-interrupt integration but
+only helps once something actually calls `yield()`; preemptive needs
+every switch point audited for what state is safe to interrupt). By far
+the most expensive part, though, is auditing every place this kernel
+currently assumes single-threaded execution, not building the mechanism
+itself: `disk.rs`'s BIOS real-mode trampoline is the sharpest example --
+it briefly disables paging and restores the real-mode IVT/PIC mapping to
+make one BIOS call, a window during which nothing else can safely run
+without corrupting CPU/segment state (see "Protected-mode IRQ window
+during BIOS disk calls" above) -- a scheduler would need this, and every
+similar assumption throughout `shell.rs`/`nic.rs`, either pinned off or
+redesigned entirely.
+
+Genuine concurrency would let a long-running foreground task (e.g. a
+`router` tape) share CPU time with an interactive shell instead of
+occupying it exclusively, and would let a future blocking primitive avoid
+busy-spinning -- but neither is a pressing need today: `poll_background_work`
+already gets the low-cost share of that benefit with none of the single-
+threading-audit cost, and no tape currently needs to run in the background
+while the shell keeps working. **Conclusion: revisit a real scheduler only
+if a future tape or workload genuinely needs concurrent execution; until
+then this remains a deliberately deferred, larger architectural project.**
+
+
+
+## ISA bus support and the 3C509: investigated, not yet built (full detail)
+
+### ISA bus support and the 3C509: investigated, not yet built
+
+Every NIC backend today (`rtl8139.rs`, `threecom.rs`, `e1000.rs`) is found
+through `pci.rs`'s PCI configuration-space walk (Mechanism #1, ports
+`0xcf8`/`0xcfc`); this project has no ISA bus code at all. A 3Com 3C509 was
+considered as a next NIC target and investigated, but deliberately not
+started: card discovery is the genuinely new, harder half (a 3C509 in its
+default ISA Plug-and-Play state needs an LFSR-derived wake-up key sequence
+and a serial-identification/CSN-assignment protocol to be assigned an I/O
+base and IRQ in software -- a real, standalone `isa.rs` subsystem this
+project has never needed; jumperless-configuring a card once via the old
+DOS `3c5x9cfg.exe` utility to always answer at one fixed, known I/O port
+sidesteps this at the cost of a one-time manual setup step), while the
+register-level driver itself would actually be simpler than the PCI
+backends already built (plain programmed I/O through a window-based FIFO,
+no bus-mastering or descriptor rings at all). No ISA machine was available
+to validate discovery either way, so nothing was implemented. QEMU's
+`-device help` lists no 3C509 model at all, unlike every PCI backend built
+so far, so this driver would have no automated `make test` coverage ever --
+every iteration on both discovery and the register-level driver would need
+real hardware permanently, a standing cost worth weighing alongside the
+discovery-protocol choice when deciding whether/when to build this driver.
+
+
+## A tape that visits 64-bit long mode and comes back (full detail)
+
+## A tape that visits 64-bit long mode and comes back
+
+`tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written
+tape that jumps the running 32-bit kernel into 64-bit long mode, proves
+it got there, and jumps back -- entirely inside one `tape run` call,
+leaving nothing about the kernel's own GDT, page tables (fos never
+otherwise enables paging), or IDT touched or replaced once it returns.
+This is deliberately not the same thing as "Deferred optional x86-64
+path" below: that section is about a permanent, parallel 64-bit boot
+*target* built from the ground up; this tape is a small, one-shot, fully
+reversible demonstration that the mode switch itself works, run from
+inside the existing 32-bit kernel, using CPU features stage2's own
+GDT/paging setup never touches.
+
+The design is deliberately split into two files with a narrow, documented
+contract between them, so the privileged mode-switch mechanics can be
+reused by any future "visits 64-bit mode" tape without rewriting them:
+
+- **`tapes/longmode64_shim.S`** owns everything privileged and reusable:
+  the `tape_main` entry point the kernel calls, the CPUID long-mode
+  check (with its own early-return path -- see below), the identity-
+  mapped page tables, the private GDT, the full CR0/CR3/CR4/EFER/GDTR/
+  EFLAGS save-and-restore, and both directions of the actual mode
+  transition. Its only job besides that plumbing is calling one external
+  symbol, `tape64_body`, once it has safely landed in 64-bit mode with
+  interrupts off -- and restoring everything the instant that call
+  returns.
+- **`tapes/longmode.S`** (now much shorter than before this split) is
+  just one *implementation* of `tape64_body`, written in hand-assembled
+  `.code64`: it loads a 64-bit-only immediate (`0xdeadbeefcafebabe` -- a
+  value no 32-bit `mov` could load in one instruction) and hex-dumps it
+  directly to VGA text memory, exactly like `tapes/vga-colors` writes
+  VGA, as proof that 64-bit-encoded instructions genuinely ran (this
+  can't go through the `putc` callback: calling 32-bit code from 64-bit
+  mode would need a whole second nested mode transition for one debug
+  print, so it isn't done).
+
+The `tape64_body` contract is intentionally minimal: an ordinary SysV64
+`extern "C" fn()` -- no arguments, no return value -- called only after
+the shim has already entered 64-bit mode (paging on, CR4.PAE/EFER.LME/
+CS.L set, the shim's private GDT loaded, interrupts masked), free to do
+whatever it wants, and expected to return via a plain `ret`. Because
+SysV64 requires `%rsp` 16-byte-aligned at the point of `call` (unlike the
+cdecl the shim's own 32-bit code otherwise follows), the shim saves its
+pre-alignment `%rsp` in `%r15` (callee-saved, and otherwise unused)
+immediately before the `call` and restores it immediately after --
+critical, since leaving `%rsp` misaligned by even a few bytes would
+corrupt the later 32-bit register-restore epilogue and the tape's final
+`ret` back to the kernel. Any body -- hand-written assembly or, as below,
+compiled from Rust -- just needs to define one global `tape64_body`
+symbol matching this contract and link against `longmode64_shim.o`.
+
+Mechanically, the shim builds its own tiny identity-mapped page tables
+(three static 2 MiB pages covering physical 0..6 MiB -- the kernel's own
+code/stack, 0x10000..0x98000; VGA text memory, 0xb8000; and the tape's
+own 4 MiB image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-
+descriptor private GDT (a 64-bit code descriptor at selector 0x08, and a
+flat 32-bit code descriptor at selector 0x10 used only as the landing pad
+immediately after leaving 64-bit mode), then: `cli`s, saves CR0/CR3/
+CR4/EFER/GDTR/EFLAGS, clears CR0.PG before changing the kernel's non-PAE
+page-table mode, sets CR4.PAE, loads its own page tables into CR3, sets
+EFER.LME, sets CR0.PG (entering IA-32e compatibility submode), swaps in its
+private GDT, and far-jumps into 64-bit code, where it calls
+`tape64_body` as described above. A `push`+`push`+`lretq` (the standard,
+SDM-documented way to leave 64-bit mode for a fixed target, since a
+plain far jump with an immediate target isn't encodable there) returns
+to the compatibility-mode landing pad, which restores every saved
+register in reverse order -- it first clears CR0.PG, restores CR4
+(clearing PAE), CR3, EFER via `wrmsr` (clearing LME), the original GDTR,
+and a far jump back onto the kernel's own code selector to reload CS;
+only then does it restore CR0 (re-enabling the kernel's original
+non-PAE paging) and EFLAGS (re-enabling interrupts last of all) -- before
+printing a wrap-up message through the ordinary `putc` callback and
+returning to the shell exactly like any other tape.
+
+Two things make this materially different from every other tape in this
+repository:
+
+- **Interrupts stay off for the whole excursion, not just as a nicety.**
+  `kernel/src/interrupts.rs` keeps the PIT (100 Hz, IRQ0) and PS/2
+  keyboard (IRQ1) firing live the entire time the shell runs, including
+  during a tape. That IDT is a 32-bit-format IDT, invalid to service an
+  interrupt against while CR0/CR3/CR4/EFER/GDTR are mid-transition or
+  while this tape's own private GDT is loaded -- so the `cli` above is a
+  hard correctness requirement, and EFLAGS is restored (re-enabling
+  interrupts) only after every other piece of state is back to normal.
+- **The build needs a real `ld` link step, unlike `tapes/primes.S`.**
+  x86-32 ELF relocations are REL-style: GAS bakes the resolved address
+  directly into the instruction bytes at assemble time, so `primes.S`'s
+  bare `as --32` + `objcopy -O binary` pipeline (no linker at all) works
+  correctly. x86-64 ELF relocations are RELA-style instead: the resolved
+  address lives only in a separate `.rela` section that a linker-free
+  `objcopy -O binary` throws away entirely, leaving zeroed placeholders
+  everywhere this file's `.code64` region references a `.code32` label
+  or vice versa. `make tape-longmode` therefore assembles both
+  `tapes/longmode64_shim.S` and `tapes/longmode.S` with `as --64`
+  (needed for their 64-bit-context relocations, even though most of the
+  shim's instructions are still ordinary 32-bit-encoded `.code32` code),
+  links both objects together with `ld -Ttext=0x100000
+  --oformat=elf64-x86-64 -e tape_main` (matching `pmem::TAPE_BASE`, so
+  every label resolves to its real, final runtime address, and picking
+  the shim's `tape_main` -- not the body's `tape64_body` -- as the entry
+  point), and only then runs `objcopy -O binary`.
+
+If CPUID (leaf 0x80000001, EDX bit 29) reports no long-mode support, the
+shim prints a short message and returns immediately, without ever
+calling `tape64_body` or touching CR0/CR3/CR4/EFER/GDTR/EFLAGS at all.
+This matters for testing: `qemu-system-i386`'s TCG backend cannot emulate
+the long-mode CPUID bit at all (confirmed: it prints `warning: TCG
+doesn't support requested feature: CPUID[eax=80000001h].EDX.lm [bit
+29]` and reports the feature absent), so this tape's real 64-bit
+excursion can only be exercised under `qemu-system-x86_64` -- confirmed
+to boot this same 32-bit `fos.img` identically otherwise.
+`tapes/test_longmode_e2e.py` is one of the two e2e tests in this
+repository that launch `qemu-system-x86_64` instead of
+`qemu-system-i386`; it asserts on the shim's own serial-visible messages
+and that the shell keeps responding to ordinary commands afterward (the
+"64-BIT MODE REACHED" VGA text itself is only visible on the real screen
+-- `make run` with this tape loaded -- since it bypasses the serial-
+mirrored `putc` callback entirely). Built with `make tape-longmode`,
+producing `build/tapes/longmode.bin`.
+
+### A second `tape64_body`, written in Rust: `tapes/longmode-rs/`
+
+`tapes/longmode-rs/` is a second implementation of exactly the same
+`tape64_body` contract described above, written in ordinary `#![no_std]`
+Rust (`src/lib.rs`) instead of hand-assembled `.code64` -- proof the
+shim/body split above is a real, reusable boundary, not just a
+refactor for its own sake. It performs the identical VGA hex-dump proof
+as `tapes/longmode.S`'s body, just via safe(-ish) `write_volatile` calls
+to `0xb8000` instead of raw `mov`s, and is linked against the *exact same*
+`tapes/longmode64_shim.S` object file -- no shim changes needed at all to
+support a compiled-language body.
+
+Unlike the ordinary Rust tapes in this repository (`tapes/hello-rs`,
+`tapes/vga-colors`, `tapes/bigsieve` -- each a whole self-contained ELF32
+binary compiled as a `bin` crate with its own linker script), `longmode-rs`
+is a `staticlib` crate (see its `Cargo.toml`): it has no `_start`, no
+entry point, and no linker script of its own, since it exists only to
+provide one function that gets linked into a larger image alongside the
+shim. `make tape-longmode-rs` builds it with `cargo`, then links
+`build/tapes/longmode64_shim.o` against the resulting `.a` archive with
+the same `ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main` recipe
+`tape-longmode` uses -- the linker pulls only the one object it actually
+needs (the one defining `tape64_body`) out of the archive automatically.
+
+It also needs its own new custom Rust target, `targets/x86_64-fos-tape.json`
+-- the first genuinely 64-bit target in this repository, unlike
+`targets/i686-fos.json` every other Rust tape uses. Modeled on that file
+but for `x86_64`, it additionally disables SSE/MMX/AVX and sets
+`"rustc-abi": "softfloat"`: fos's kernel never sets CR4.OSFXSR/OSXMMEXCPT
+(bits 9/10), since it never uses floating point, so any SSE-encoded
+instruction -- including ones LLVM might silently emit for something as
+mundane as a struct copy, not just explicit float math -- would fault
+with `#UD` the instant it executed. (Confirmed necessary: an earlier
+attempt without `"rustc-abi": "softfloat"` failed to build at all, with
+`error: target feature sse2 is required by the ABI but gets disabled in
+target spec`.) It deliberately uses `"code-model": "small"`, not the
+`"kernel"` code model rustc's own builtin `x86_64-unknown-none` target
+defaults to: `"kernel"` assumes high, negative-canonical addresses like
+`0xffffffff80000000`, which is wrong for this tape's low, positive
+`0x100000` load address (`pmem::TAPE_BASE`).
+
+`tapes/test_longmode_rs_e2e.py` is the second (and, along with
+`tapes/test_longmode_e2e.py`, only other) e2e test in this repository
+that launches `qemu-system-x86_64`; it is a near-duplicate of that
+script -- same shim-emitted serial messages, same shell-still-alive
+check, a distinct multicast group/port so both can run concurrently --
+proving the shim's mode-switch mechanics behave identically no matter
+which language implemented the body that runs while briefly parked in
+64-bit mode. Built with `make tape-longmode-rs`, producing
+`build/tapes/longmode-rs.bin`.
+

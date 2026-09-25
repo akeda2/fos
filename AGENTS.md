@@ -223,6 +223,43 @@ be the *incidental* result of an oversized fixed message that could easily
 have been split to fit, and a command's normal/expected case should stay on
 one screen whenever practical.
 
+## Keeping this file itself small: moving detail to `docs/history/`
+
+This file is loaded into every session's context, so its size has a real,
+ongoing cost distinct from any other doc in this repo -- unlike
+`README.md` or `NETWORKING.md`, which are read on demand. Treat it as a
+*current-state reference*, not a project journal: architecture facts, ABI
+contracts, command syntax, the low-memory map, and build/test commands
+belong here because a future change has to keep them accurate. A
+chronological account of how something was investigated, debugged, or
+iterated on does not need to stay accurate going forward -- it only needs
+to stay findable -- so it belongs in `docs/history/` instead.
+
+Concretely, move a section (or trim it while adding new content) once it
+is mostly one of these: a bug postmortem ("X was found and fixed, root
+cause was Y"); a "first we tried A, then B" design-iteration narrative;
+detailed end-to-end verification/test narration beyond naming the test
+file; or a fully investigated-but-deliberately-deferred feature writeup
+whose reasoning won't change unless someone actually starts building it.
+Keep in this file: the resulting current behavior, the file/function names
+involved, and any constraint a future change must respect.
+
+The mechanics, matching what every existing `docs/history/*.md` file
+already does (see `development-notes.md`'s own intro paragraph): pick an
+existing thematically-matching file (`development-notes.md` as the general
+catch-all; `audio-hda.md` for sound hardware; `real-hardware-notes.md` for
+physical-machine-only findings; `networking-and-discovery.md` for the
+chat/discovery/NETFS/idle-loop cluster) or start a new one if none fits,
+and append the section's *original, unedited* text at the end of it under
+a `## <original title> (full detail)` heading followed by the original
+heading(s) and body verbatim -- never paraphrase what you're moving. Leave
+a short paragraph in its place here: what the thing is, its current
+behavior/facts, and a closing "Full detail ... is in
+`docs/history/<file>.md`." sentence. `docs/history/` files are
+append-only dumping grounds, not edited for style after the fact, and are
+never loaded automatically -- link to the right one by name rather than
+assuming a reader has seen it.
+
 ## Disk image and safety
 
 `tools/build_image.py` creates `build/fos.img`, a 16 MiB raw image with a
@@ -1254,62 +1291,18 @@ callback.
 
 ### `tapes/calc/`: the reverse-Polish-notation calculator this all was for
 
-The calculator deferred while `read_key`/`args_ptr`/`args_len` above were
-being designed now exists: `tapes/calc/`, a genuinely new tape (not a
-`docs/rust-tapes-for-dummies.md` teaching-ladder example), depending on
-`../tape-rt` the same way `vga-colors` does rather than duplicating
-`entry.S`/the panic handler/print helpers a third time.
-
-Reverse Polish notation (RPN) was chosen deliberately, not just as an
-arbitrary demo choice: evaluating it needs only a stack and one
-left-to-right pass over whitespace-separated tokens (a number pushes, an
-operator pops two operands and pushes one result) -- no operator-
-precedence table, no parentheses, no lookahead. That simplicity keeps
-this tape's own logic (`eval_line`, `next_token`, `parse_i32` in
-`tapes/calc/src/main.rs`) squarely focused on demonstrating the new ABI
-additions, not on parser design.
-
-It exercises both new additions, independently, exactly as each was
-designed to be used:
-
-- **`tape run 3 4 +`** (startup arguments): evaluates `"3 4 +"` once via
-  `args_ptr`/`args_len`, prints `= 7`, and returns immediately -- no
-  interaction at all.
-- **Plain `tape run`** (interactive `read_key`): starts a small REPL,
-  reading one line at a time from whichever source started the tape
-  (local keyboard or an active `term_net` session, indistinguishably, as
-  designed) until told to give up. This is also the first tape to
-  demonstrate a *line-based* input pattern built entirely out of the
-  kernel's one non-blocking `read_key` primitive, exactly as this
-  section above predicted a future tape would: a fixed-size line buffer
-  that grows on ordinary printable bytes, shrinks by one on a backspace
-  event (the on-screen erase already happened inside `read_key` itself,
-  so the tape only tracks its own length), and evaluates and resets on
-  `\r`/`\n`. `TAPE_EVENT_ABORT` ends the REPL the same way it would for
-  any other `read_key`-based tape.
-
-`tapes/calc/src/main.rs` intentionally never calls `should_abort` --
-consistent with this section's own warning, doing so alongside
-`read_key` would race both against the same underlying input sources.
-Its `EvalError` enum (stack underflow, division/remainder by zero,
-`i32` overflow via `checked_add`/`checked_sub`/`checked_mul`/
-`checked_div`/`checked_rem`, an unrecognized token, a full stack, or
-leftover operands once input is exhausted) reports a friendly message
-through `putc` for every failure mode rather than panicking or silently
-producing a wrong answer -- deliberately, since a calculator that
-crashes on `5 0 /` would defeat the point of a teaching example.
-
-Verified end to end over the network with `tapes/test_calc_e2e.py`
-(mirroring `tapes/test_hello_rs_e2e.py`'s one-continuous-`term-net`-
-session structure): both startup-argument evaluation (`3 4 +` = `7`) and
-an interactive session (`6 7 *` = `42`; `5 0 /` reports division by
-zero; `2 2` with a backspace then `3 -` correctly becomes `2 3 -` = `-1`,
-proving `read_key`'s backspace handling; a remote Escape byte stops the
-REPL cleanly, the same mechanism `tapes/test_vga_colors_e2e.py` already
-proves for a `should_abort`-based tape) all pass, and the same
-`term_net` session remains responsive to an ordinary command
-immediately afterward. Built with `make tape-calc` (producing
-`build/tapes/calc.bin`).
+`tapes/calc/` (depending on `../tape-rt`) is the tape that motivated the
+`read_key`/`args_ptr`/`args_len` ABI additions above. It evaluates reverse
+Polish notation, chosen because it needs only a stack and one left-to-right
+token pass -- no precedence table or parentheses. `tape run 3 4 +` evaluates
+via startup arguments and returns immediately; plain `tape run` starts an
+interactive `read_key`-based REPL (never calling `should_abort` alongside
+`read_key`, per that section's warning above). Errors (stack underflow,
+division/remainder by zero, `i32` overflow, an unrecognized token, a full
+stack, leftover operands) report a friendly message rather than panicking.
+Verified end to end with `tapes/test_calc_e2e.py`. Built with `make
+tape-calc`. Full design detail (the exact `EvalError` cases and test
+scenarios) is in `docs/history/development-notes.md`.
 
 ### Tape ABI grows kernel-managed networking: `net-chat`
 
@@ -1414,173 +1407,51 @@ Full detail (including the exact test methodology proving the fix) is in
 
 ### `poll_background_work`: one shared hook instead of four duplicated ones ("Tier 0" of the scheduler discussion)
 
-Investigating what a real preemptive/cooperative scheduler would cost
-this project (per-task stacks, a context-switch primitive, and -- the
-expensive part -- auditing every "this kernel is single-threaded"
-assumption, most critically `disk.rs`'s BIOS real-mode trampoline, which
-cannot tolerate any concurrent execution during its brief real-mode
-window) surfaced a much cheaper, already-half-built alternative: this
-kernel's several long-running blocking loops (`term_net`'s own session
-loop, `nic sniff`, `nic discover`, `chat_command`, and the tape-callback
-polling functions `poll_remote_tape_abort`/`poll_remote_tape_input`
-described just above) already each poll hardware/keyboard state once per
-iteration -- so "background work" here doesn't need real concurrency at
-all, just a handful of small, cheap, non-blocking checks called from
-every one of those loops instead of only some of them. This is
-explicitly scoped to kernel-native recurring work only, not to
-backgrounding a *tape*: a tape is structured as one big imperative
-blocking loop with its state on the stack, and making one of those
-(e.g. `tapes/router`) genuinely resumable without a real per-task stack
-would mean hand-rewriting it into an explicit coroutine/step function --
-harder, not easier, than just giving it a real stack and one `yield()`
-call once a full scheduler exists. No tape or tape ABI changed for this
-work.
-
-Auditing the four independent places this ad hoc pattern had grown
-(`relay_pending_tape_output`/`poll_remote_tape_abort` for `term_net`'s
-own relay+network polling, `poll_remote_tape_input`'s near-identical
-copy of the same for `read_key`, and `term_net`'s own session loop
-inlining the identical relay-drain a third time) also surfaced a real,
-previously invisible functional gap: `nic.watchdog()` -- the mechanism
-that notices and recovers a latched, documented adapter fault (see
-"`nic` status and ordinary foreground NIC traffic run a bounded
-watchdog" above) -- was, before this change, only ever invoked from
-`nic`/`nic list`/`nic watchdog`'s own command handlers, never from
-inside any of these long-running loops. A fault occurring mid-capture,
-mid-chat, mid-discovery, or mid-`term_net`-session (including while
-still idle waiting for a client to connect) simply sat unrecovered until
-that loop happened to return and a human thought to run `nic status`
-afterward.
-
-`poll_background_work(nic: Option<&nic::Nic>)` (`shell.rs`) is the one
-shared hook consolidating all of this: it drains the print-relay queue
-(`relay_pending_print_output`, a no-op unless a printer session is
-actually active), relays queued `term_net` output to the connected peer
-if this call is running nested inside an active session
-(`console::relay_enabled()` plus `ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE`,
-exactly the gating `poll_remote_tape_abort`/`poll_remote_tape_input`
-already used), and calls `nic.watchdog()`. It is cheap enough to call
-unconditionally on every iteration of every loop it was added to:
-`watchdog()` is a handful of register/atomic reads unless a fault is
-actually latched (see `Rtl8139::watchdog`), and each relay check is a
-single peek against an otherwise-empty queue.
-
-It is now called from: `term_net`'s outer "waiting for a `HELLO`" loop
-and its inner `'session` loop (replacing that loop's own inlined
-relay-drain duplicate); `nic_sniff`'s capture loop; `nic_discover`'s
-probe/listen loop; `chat_command`'s input/receive loop; and
-`poll_remote_tape_abort`/`poll_remote_tape_input` (replacing their own
-bespoke relay-plus-network-poll logic with one call to this same hook,
-called unconditionally before either function's own
-`console::relay_enabled()`-gated logic runs -- so a tape's watchdog
-recovery and print-relaying now also work when the tape was started
-*without* an active `term_net` session, which the old, `term_net`-only
-gated logic in those two functions never covered). No externally
-observable behavior of the tape ABI (`should_abort`/`read_key`
-semantics, or any tape's own output) changed; the tape e2e suite
-(`tapes/test_calc_e2e.py`, `tools/test_term_net_tape_e2e.py`,
-`tapes/test_net_chat_e2e.py`, `tools/test_term_net_e2e.py`) and `make
-test` all pass unmodified after this refactor, confirming the
-consolidation is behavior-preserving apart from the intended new
-watchdog coverage.
+`poll_background_work(nic: Option<&nic::Nic>)` (`shell.rs`) is one shared,
+cheap-to-call-unconditionally hook that drains the print-relay queue, relays
+queued `term_net` output when nested inside an active session, and calls
+`nic.watchdog()`. It replaces four independent, slightly-diverged copies of
+this same polling pattern that had grown across `term_net`'s loops, `nic
+sniff`, `nic discover`, `chat_command`, and the tape-callback polling
+functions -- and, in the process, fixed a real gap where NIC watchdog
+recovery only ever ran from `nic`/`nic list`/`nic watchdog`'s own command
+handlers, never from inside any long-running loop. It is deliberately
+scoped to kernel-native recurring work only, not to backgrounding a *tape*
+itself -- see "Cooperative/preemptive scheduling" below for why a real
+scheduler remains out of scope. Full detail (the four duplicated call sites
+audited, and confirmation that the tape ABI/e2e suite are unaffected) is in
+`docs/history/networking-and-discovery.md`.
 
 ### `term net` stays resident after a remote disconnect
 
-Originally, *any* session-ending event -- local F12, a remote
-`TERM_TAG_BYE`, or the remote end simply going away -- caused `term_net`
-to print a message and `return`, falling all the way through to the local
-shell. Real-hardware testing exposed the problem this caused: once the
-automatic boot-time `term net` wait's first session ended for any reason,
-the machine dropped to the local prompt and stayed there -- a remote
-operator had no way back in without a local operator physically retyping
-`term net`, defeating the point of an unattended, screen/keyboard-less
-machine being reachable by default.
-
-`term_net` was restructured so the entire "wait for `HELLO`, then run a
-session" body lives inside an outer `loop`. Each iteration tracks whether
-*local* escape (not a remote `TERM_TAG_BYE`) is what ended the session,
-via a `local_escape` flag set only in that one code path. Local escape
-still sends `TERM_TAG_BYE` to the peer and `return`s out of the whole
-function, exactly as before -- this is the only way to reach the local
-shell now, whether at boot or from a manually typed `term net`. Every
-other way a session can end (a remote `TERM_TAG_BYE`, or a fresh `HELLO`
-implicitly superseding a stale one) instead prints
-`"Remote terminal disconnected; waiting for a new one to connect ..."`
-and loops back to the top of the outer `loop`, re-entering the
-"waiting for a `HELLO`" state with no local action required. Both call
-sites (`run`'s automatic boot-time call, and `term_command`'s manually
-typed `"term net"` dispatch) share this one function, so the fix applies
-uniformly to both.
-
-One consequence worth flagging: since a serial-only operator has no way
-to trigger "local escape" (there is deliberately no serial equivalent,
-same limitation covered below), the old workaround this project's own
-tests and a serial-only human operator both relied on -- have any peer
-connect and then disconnect, which used to fall through to the local
-prompt -- no longer works, since that disconnect now just re-arms the
-wait instead. A serial-only machine's only ways back to a local prompt
-are now driving it entirely over `term net` itself, or briefly attaching
-a local keyboard to press one of the "give up" keys once. The affected
-test scripts (`tapes/test_primes_e2e.py`,
-`tapes/test_hello_rs_e2e.py`, `tapes/test_primes_vga_e2e.py`,
-`tools/test_term_net_tape_e2e.py`) were all updated to drive their
-commands over one continuous `term net` session (via `TERM_TAG_DATA`
-frames) instead of relying on that trick -- console output always mirrors
-to local VGA/serial regardless of relay state (`console::write_bytes`
-writes both unconditionally), so their existing `read_until()` assertions
-against QEMU's local serial stream kept working unchanged.
+`term_net`'s "wait for `HELLO`, then run a session" body runs inside an
+outer `loop`. Only a *local* escape (F12 etc.) sends `TERM_TAG_BYE` and
+returns to the local shell; every other way a session ends (a remote
+`TERM_TAG_BYE`, or a fresh `HELLO` superseding a stale one) prints a
+disconnect message and re-enters the "waiting for a `HELLO`" state with no
+local action required. Both call sites (`run`'s automatic boot-time call
+and `term_command`'s manual `"term net"`) share this one function. A
+serial-only operator therefore has no way back to the local prompt except
+driving everything over `term net` itself or briefly attaching a local
+keyboard -- the old "connect then disconnect" trick no longer falls
+through. Full detail (why this changed, and the affected e2e tests) is in
+`docs/history/networking-and-discovery.md`.
 
 ### `term net` at boot, and more "give up" function keys
 
-`shell::run` now calls `term_net` once, automatically, before it ever
-enters the ordinary interactive prompt loop -- so every fos machine waits
-for a remote terminal client by default at every boot, with no manual
-step required. This matters most for a machine with no attached
-screen/keyboard: it is reachable over the network the moment it finishes
-booting. `term_net` already tolerated "no NIC" gracefully (it just prints
-a message and returns via `nic_or_report`), so this needed no change to
-`term_net` itself, only one new call site in `run`. A local operator
-watching a real screen who wants the ordinary prompt immediately, without
-waiting, presses one of the "give up" keys below; if a remote client
-connects first instead, it does *not* fall through to the local shell on
-disconnect (see "`term net` stays resident after a remote disconnect"
-above) -- only local escape does that, whether during this automatic wait
-or a manually invoked `term net` session.
-
-There is deliberately no serial equivalent of "give up" for this
-automatic wait (mirrored from `term_net`'s own pre-existing convention):
-reading one byte here to mean "give up" would silently eat the first
-character of whatever a serial operator was about to type. A serial-only
-operator can no longer fall back on "have any peer connect and then
-disconnect" either, now that `term_net` re-arms itself instead of
-returning on a remote disconnect -- see the note above about this
-project's own e2e tests (`tapes/test_primes_e2e.py`, `tools/
-tapes/test_primes_vga_e2e.py`, `tapes/test_hello_rs_e2e.py`, and
-`tools/test_term_net_tape_e2e.py`) being updated to drive their commands
-over one continuous `term net` session instead of relying on that trick.
-
-Separately, `keyboard::ESCAPE_SCANCODES` (`kernel/src/keyboard.rs`) grew
-from a single F12 scancode to six: F12, F4, F6, F7, F8, and F10. F12 was
-always a deliberate choice for being a function key (same physical
-position/scancode on every keyboard layout this project targets,
-unreachable through Shift/AltGr, so nothing about the current locale
-matters) rather than an ordinary printable character that would need
-distinguishing from real typed text. The problem in practice: some
-terminal emulators, KVMs, and remote-desktop clients intercept F12
-themselves before it ever reaches a guest OS, so a fos operator using one
-of those had no working "give up" key at all. Recognizing several
-function keys instead -- whichever one actually reaches the guest works,
-with nothing to remember or configure -- fixes this without weakening the
-original rationale for using a function key in the first place. F1/F3/
-F5/F9/F11 were deliberately left out since some terminals bind those to
-their own emulator-level features (new tab, fullscreen, etc.); F12 stays
-first in the list and in every user-facing message since it remains the
-most commonly documented, most muscle-memory choice. F2 was later given
-its own distinct meaning (see the parallel-port driver discussion below)
-rather than being added to this "give up" list, since it needs to mean something
-narrower ("abandon the line I'm typing without executing it," only inside
-`term_printer`) than every other key here.
-
+`shell::run` calls `term_net` once, automatically, before entering the
+ordinary interactive prompt loop, so every fos machine waits for a remote
+terminal client by default at every boot. A local operator watching a real
+screen presses one of the "give up" keys to reach the local prompt
+immediately instead of waiting; there is deliberately no serial equivalent
+(reading one byte to mean "give up" would eat the first character of real
+serial input). `keyboard::ESCAPE_SCANCODES` recognizes six function keys --
+F12, F4, F6, F7, F8, F10 -- since some terminal emulators/KVMs intercept
+F12 itself before it reaches the guest; F12 stays first and remains the
+documented default. F2 is reserved separately for `term_printer`'s
+"abandon this line" behavior (see the parallel-port driver below), not
+added to this list. Full detail (why several function keys instead of one)
+is in `docs/history/networking-and-discovery.md`.
 
 `kernel/src/parallel.rs` is a deliberately narrow legacy-ISA
 parallel/Centronics port driver, discovered via the BIOS Data Area
@@ -1697,40 +1568,17 @@ find the target machine:
 
 ### A numbered peer address book for `send_tape.py`/`term_net.py`
 
-Both tools already broadcast the same `CHAT_TAG_DISCOVER_REQUEST` probe
-`nic discover` sends and pick the destination automatically when exactly
-one fos machine replies. With more than one on the wire, though, each
-was previously a dead end: print every MAC found and ask for `--mac`
-spelled out in full -- every single run, since a short-lived Python
-process has nowhere of its own to remember "peer 2 was that RTL8139 at
-`52:54:00:...`" the way the fos kernel's own `PEERS` table
-(`kernel/src/shell.rs`) does for a whole boot session, letting `chat`/
-`tape send` accept a small `PEER_NUMBER` instead.
-
-`send_tape.py` now keeps a small on-disk address book mirroring that
-table -- `load_known_peers`/`save_known_peers`/`remember_known_peer`/
-`resolve_peer`/`print_known_peers`, all reused by `term_net.py` (which
-already imports `send_tape` for its wire-format helpers) and the new
-`tools/peers.py`. It's a JSON file, by default `~/.cache/fos_peers.json`
-(`PEERS_CACHE_FILE`, overridable via the `FOS_PEERS_FILE` environment
-variable so tests can point it somewhere disposable instead of a real
-user's cache): every discovery either tool performs merges newly seen
-peers into it in first-seen order, exactly like `remember_peer`, and
-`--mac` on either tool now accepts either a full MAC address or a
-1-based index into this list, exactly like `chat`/`tape send` accept
-`PEER_MAC|PEER_NUMBER`.
-
-`tools/peers.py` is the standalone equivalent of `nic peers`/
-`nic discover`: no arguments just prints the cached list (no network
-traffic); `--discover` broadcasts one probe, merges replies in, and
-prints the resulting list; `--forget` empties it. The one real
-difference from the kernel's own table is persistence itself: the
-kernel's starts empty every reboot, so a stale entry there is
-self-limiting, while this one survives indefinitely across separate
-tool invocations and can go stale (a MAC that answered yesterday might
-be a different machine, or offline, today) -- hence `--forget`, so a
-person notices and resets it deliberately rather than either tool
-trying to guess when an entry has gone stale on its own.
+`send_tape.py` keeps a small on-disk JSON address book (`~/.cache/
+fos_peers.json` by default, overridable via `FOS_PEERS_FILE`) mirroring the
+kernel's own `PEERS` table, reused by `term_net.py` and `tools/peers.py`.
+Every discovery either tool performs merges newly seen peers into it in
+first-seen order; `--mac` on either tool accepts a full MAC address or a
+1-based index into this list, exactly like `chat`/`tape send`. `tools/
+peers.py` is the standalone equivalent of `nic peers`/`nic discover`: no
+arguments prints the cached list, `--discover` broadcasts a probe and
+merges replies, `--forget` empties it (needed since, unlike the kernel's
+own table, this one survives indefinitely across invocations and can go
+stale). Full detail is in `docs/history/networking-and-discovery.md`.
 
 ### `tapes/longmode.S` verified on real hardware
 
@@ -1752,188 +1600,58 @@ section above.
 
 ### Hostname-based NIC discovery, and an always-on ambient discovery loop
 
-Every peer this project's discovery mechanisms (`nic discover`/`nic
-peers`, `chat`'s own discovery, `tools/peers.py`'s address book) tracked
-was previously identified only by MAC address -- functional, but not
-memorable across a LAN with more than a couple of fos machines on it.
-`kernel/src/shell.rs` now loads an optional `hostname` file the same way
-`locate_start_file` looks for `start`, but checking *every* attached
-disk rather than stopping at the first one with a FOSFS volume:
-`load_hostname` tries `disk1` first, then every secondary disk in order
-(`0..disk::secondary_count()`), since a hostname is just as likely to
-live on a small config disk as a boot-time script is, and any error
-short of "found a valid, differently-sized file" is folded into "no
-hostname here," mirroring `locate_start_file`'s own `disk2`-is-commonly-
-blank reasoning. The file's contents are trimmed of trailing whitespace
-(`trim_trailing_whitespace`, distinct from the wire-payload
-`trim_trailing_zero` below) and capped at `HOSTNAME_CAPACITY` (16 bytes);
-an oversized file is reported and ignored rather than silently
-truncated. A machine with no `hostname` file anywhere behaves exactly as
-it always has -- this is purely additive.
+`kernel/src/shell.rs` loads an optional `hostname` file the same way
+`locate_start_file` looks for `start`, checking `disk1` then every
+secondary disk in order; contents are trimmed and capped at
+`HOSTNAME_CAPACITY` (16 bytes). `interface_hostname(index, out)` appends a
+1-based interface number to the configured base name (`myhost1`,
+`myhost2`, ...), since one machine can have several NICs; this formatted
+name is what's sent/displayed everywhere. `nic list` prints a
+`hostname: NAME` line per configured interface once one exists.
 
-Because one machine can have several NICs, and a bare hostname could not
-tell two interfaces on the same host apart, `interface_hostname(index,
-out)` formats the configured base name with a 1-based interface number
-appended (`myhost1`, `myhost2`, ...) -- consistent with every other
-1-based NIC numbering already in this project's UI (`nic list`/`nic use
-N`). This formatted, per-interface name is what actually gets sent and
-displayed everywhere below; the bare on-disk `hostname` file content is
-only ever a template for it. `nic list` prints a machine's own
-`hostname: NAME` line under each configured interface once a hostname
-exists.
+`send_chat_control` appends the formatted hostname as a payload after the
+existing tag byte on every `CHAT_TAG_DISCOVER_REQUEST`/`REPLY` frame;
+neither side validates an exact/maximum frame length, so old and new
+senders/receivers interoperate. The peer table (`Peer`, replacing the old
+bare-MAC array) holds an optional hostname per entry; `remember_peer` only
+fills in a hostname for an entry that doesn't have one yet (first-seen name
+wins for that boot). `print_peers`/`nic peers` show `MAC (name)` once
+known.
 
-**Carrying a hostname over the wire.** `send_chat_control` (the one
-function behind every `CHAT_TAG_DISCOVER_REQUEST`/`REPLY` frame this
-project sends -- confirmed to have no other caller) grew an
-`interface_index` parameter and now appends that interface's formatted
-hostname (or nothing, if unconfigured) as a payload right after the
-existing tag byte. This is safe on the wire for the same reason
-`CHAT_TAG_TEXT`/`TERM_TAG_DATA` payloads already are: neither
-`tools/send_tape.py`'s `discover()` nor `tapes/net-chat`'s frame handler
-validate an exact/maximum frame length, only the tag byte itself, so an
-older sender's shorter (no-payload) discovery frame and a newer
-receiver's longer one interoperate unchanged in both directions. The
-receiving side trims trailing zero padding (`trim_trailing_zero`,
-matching the identical convention already used for `CHAT_TAG_TEXT`) since
-Ethernet's 60-byte minimum-frame padding must never be mistaken for part
-of the name.
-
-**The peer table now remembers names, not just MACs.** The former
-`PEERS: [[u8; 6]; MAX_PEERS]` table became `[Peer; MAX_PEERS]`, `Peer`
-holding a MAC plus an optional fixed-size hostname buffer/length.
-`remember_peer(mac, hostname)` only *fills in* a hostname for an entry
-that does not have one yet -- it never overwrites an already-known
-hostname with a later, possibly different one from the same MAC. This
-was a deliberate simplicity choice (first-seen name wins for the rest of
-that boot), not a live-rename feature; a machine whose `hostname` file
-changes mid-session will not update an already-recorded peer's displayed
-name until that peer entry is naturally re-created (e.g. after a
-reboot). `print_peers`/`nic peers` show `MAC (name)` once a hostname is
-known, falling back to a bare MAC otherwise, exactly like before.
-
-**Always-on ambient discovery, not just the dedicated `nic discover`
-command.** The original ask was "can discovery just run all the time?",
-which this project's single-threaded, no-scheduler, busy-polling
-architecture (see "Scheduler" discussion elsewhere in this document)
-answers narrowly: there is no background execution at all, only
-"whichever loop happens to be running right now can also poll for this."
-Every existing long-running command loop (`chat`, `term net`, `nic
-discover`, a tape's own `should_abort`/`read_key` polling) already
-replied to an incoming discovery probe unconditionally -- those needed no
-change beyond the hostname-payload plumbing above. The one genuine gap
-was the *idle local prompt loop* in `run()`: it never touched the NIC at
-all between commands, so a fos machine sitting at its own prompt (the
-most common steady state) was invisible to discovery and could not
-receive one either, unless an operator happened to be running `nic
-discover`/`chat` at that exact moment.
-
-`poll_background_work()` -- the existing Tier-0 unification point shared
-by many short command loops -- was deliberately *not* extended to
-auto-broadcast a probe, since doing so would make every one of its many
-callers start transmitting extra frames, which was not the ask. Instead,
-a new `ambient_discovery_poll()` is called only from the idle prompt
-loop, once per iteration. Two independent behaviors, arrived at after
-explicit user steering across several iterations of this design:
-
-- **Reply and remember, always, silently.** Every iteration, it drains
-  and answers any incoming `CHAT_TAG_DISCOVER_REQUEST`/`REPLY` on every
-  interface exactly like `nic_discover`'s own loop does, but with no
-  `println!` output at all -- unlike the dedicated command, this runs
-  underneath an interactive prompt display and must never corrupt it.
-- **Self-announce on a schedule, not on every idle iteration.** The
-  first design considered ("broadcast a probe every idle iteration") was
-  rejected by the user as too noisy; the next ("only reply, never
-  broadcast") was rejected in turn since two machines that both only
-  reply and never initiate would never discover each other at all
-  without a human running `nic discover` on at least one side. The
-  design actually built: broadcast one immediate self-announce the
-  first time the idle loop starts (fast convergence right after boot),
-  then continue re-announcing every `AMBIENT_BOOT_BROADCAST_TICKS` (~3s,
-  the same cadence `nic_discover`'s own rebroadcast already uses) for
-  `AMBIENT_BOOT_BURST_TICKS` (~30s) after that first call -- explicitly
-  to cover two machines booting around the same time but not perfectly
-  in sync, so each one's boot-time burst window has a good chance of
-  overlapping the other's -- and settle to a much slower
-  `AMBIENT_STEADY_BROADCAST_TICKS` (~60s) afterward, since a machine that
-  has been up and idle for a while has little need to keep re-announcing
-  aggressively. `nic_discover`'s own command keeps its separate,
-  unmodified, faster fixed-interval rebroadcast loop -- the two are
-  intentionally not unified, since a human explicitly running `nic
-  discover` should still get its existing fast convergence regardless of
-  ambient discovery's own slower steady-state cadence.
-
-Verified end to end with a new, dedicated two-guest test,
-`tools/test_hostname_discovery_e2e.py` (not part of `make test`,
-mirroring `tapes/test_net_chat_e2e.py`'s structure): each guest is built
-from its own tiny image carrying a distinct `hostname` file (`alpha`/
-`beta`) via `build_image.py --file hostname ...`, both are driven to
-their local idle prompt (F12 out of the automatic boot-time `term net`
-wait, never running `term net`/`nic discover` themselves), and after a
-short wait for a couple of ambient-discovery rounds, `nic peers` on each
-side shows the other's formatted name (`(beta1)`/`(alpha1)`) -- proving
-the whole chain (hostname file -> wire payload -> peer table -> display)
-works purely through the idle loop's own ambient polling, with no
-dedicated discovery command ever invoked by either guest.
+`ambient_discovery_poll()`, called once per iteration only from the idle
+local-prompt loop (the one loop already proven safe to extend with silent
+background polling), does two things every fos machine needed but no
+existing loop provided: it drains and answers incoming discovery probes/
+replies on every interface with no console output at all, and it
+self-announces on a schedule -- one immediate broadcast when the idle loop
+starts, then every `AMBIENT_BOOT_BROADCAST_TICKS` (~3s) for
+`AMBIENT_BOOT_BURST_TICKS` (~30s) to catch two machines booting close
+together, settling to a much slower `AMBIENT_STEADY_BROADCAST_TICKS`
+(~60s) afterward. `nic discover`'s own command keeps its separate, faster,
+unmodified rebroadcast loop. Verified end to end by
+`tools/test_hostname_discovery_e2e.py` (not part of `make test`). Full
+detail (the exact design iterations this went through, and why ambient
+discovery only replies-and-remembers rather than also broadcasting from
+`poll_background_work`) is in `docs/history/networking-and-discovery.md`.
 
 ### NETFS: a simple network filesystem over discovered peers
 
-Once every machine on a LAN segment reliably shows up in `nic peers` by
-name, the natural next question was whether a file could be fetched
-straight from a peer's own disk without first bouncing it through a
-disk that both machines share -- motivated directly by the target use
-case `copy hostname1:disk2/file.name disk2`. NETFS is the small,
-deliberately unauthenticated protocol this project ended up with, reusing
-`CHAT_ETHERTYPE` (the same one `chat`/`nic discover`/`tape`/`term net`
-already share) and the same design philosophy as every other protocol in
-this codebase: no retransmission, no security, and an honestly documented
-accepted risk where corners were cut, rather than hidden complexity to
-paper over them.
+NETFS lets a file be fetched from, or pushed to, a discovered peer's own
+disk directly, without bouncing through a disk both machines share. It
+reuses `CHAT_ETHERTYPE` and this project's usual no-retransmission,
+no-authentication design. Ten tags continue the numbering after
+`TERM_TAG_BYE`: `NETFS_TAG_GET_REQUEST`/`GET_START`/`GET_DATA`/`GET_STOP`/
+`GET_ERROR` and `PUT_REQUEST`/`PUT_DATA`/`PUT_STOP`/`PUT_ACK`/`PUT_ERROR`.
+Both directions verify the whole file's RFC 1071 checksum once fully
+reassembled before installing/writing anything; nine error codes cover
+not-found, disk-unavailable, too-large, invalid-name, directory-full,
+data-full, checksum-mismatch, disk-error, and a peer already mid-transfer
+(`BUSY`). Peer references accept only an `nic peers` index or a known
+hostname, never a raw MAC (its colons would collide with `HOST:diskN`'s
+own).
 
-**Wire protocol.** Ten new tags continue the numbering after
-`TERM_TAG_BYE`: `NETFS_TAG_GET_REQUEST`/`GET_START`/`GET_DATA`/
-`GET_STOP`/`GET_ERROR` and `PUT_REQUEST`/`PUT_DATA`/`PUT_STOP`/`PUT_ACK`/
-`PUT_ERROR`. A GET request carries a one-byte remote disk number plus the
-file name; the server replies with a `_START` frame declaring the exact
-length and a 16-bit checksum, then a `TAPE_TAG_DATA`-shaped burst of
-`_DATA` frames (same sequence-number-and-declared-length discipline as
-`tape load net`'s own chunked transfer, for the same reason: a binary
-file's own trailing zero bytes must never be mistaken for Ethernet's
-60-byte minimum-frame padding), then `_STOP`. A PUT request instead
-carries the length and checksum up front (the client already has the
-whole file in memory before sending), followed by the same `_DATA`/
-`_STOP` shape, and the server replies with `_ACK` or a one-byte
-`_ERROR` code. Nine error codes cover not-found, disk-unavailable,
-too-large, invalid-name, directory-full, data-full, a checksum mismatch,
-a generic disk error, and `BUSY` -- the last one new to this feature: a
-peer already mid-PUT rejects a second concurrent `PUT_REQUEST` outright
-rather than letting two transfers corrupt the one shared staging buffer
-(see below).
-
-**The checksum.** Every transfer computes the standard RFC 1071 16-bit
-Internet checksum (`internet_checksum`, the same algorithm
-`tapes/tape-net`'s IPv4/UDP/TCP layers already use) over the *entire*
-file, verified only once the whole thing has been reassembled -- there is
-no partial-frame verification, matching this protocol's "no
-retransmission, abort cleanly on any detected problem" philosophy
-throughout. GET carries the checksum in `_START`, since the server only
-knows it once the file has actually been read from disk; PUT carries it
-in `_REQUEST`, since the client already holds the whole file in memory
-up front. A mismatch on either side aborts before any write happens (a
-GET never installs a corrupt tape or writes a corrupt file locally; a PUT
-server never calls `fosfs::write` with data that failed verification).
-
-**Peer references never accept a raw MAC address.** `resolve_peer` (used
-by NETFS's `parse_remote_host_token`/`parse_remote_token`) accepts only
-an `nic peers` index number or a known hostname -- deliberately not a
-colon-separated MAC address, unlike `chat`/`tape send`'s existing peer
-resolution, because a MAC's colons would be genuinely ambiguous against
-`HOST:diskN`'s own colon. This is a one-line, deliberate scope narrowing
-for NETFS specifically, not a change to `chat`/`tape send`'s own
-resolution.
-
-**Command syntax**, layered onto every existing command that already
-moves a whole file through the shared `pmem::TAPE_BASE`/`TAPE_LEN`
-staging buffer:
+Command syntax, layered onto commands that already move a whole file
+through the shared `pmem::TAPE_BASE`/`TAPE_LEN` staging buffer:
 
 ```
 copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]     remote source (NETFS GET)
@@ -1943,136 +1661,42 @@ tape save HOST[:diskN] NAME                    remote destination, from the load
 tape run @HOST[:diskN]/NAME                    remote source, as a startup-argument file
 ```
 
-A remote *source* is always written as one `HOST[:diskN]/NAME` token
-(the same reasoning `tape run`'s pre-existing `@diskN/NAME` already
-established: FOSFS names never contain `/`, so it's an unambiguous
-separator), because it needs to carry a file name alongside the host. A
-remote *destination* has no file name of its own to combine with -- the
-name always comes from the source side (or an explicit `NEW_NAME`) -- so
-it's just `HOST[:diskN]`, the same shape as a local `DST_DISK`/`diskN`
-selector; `parse_copy_destination`/`parse_save_destination` each try a
-local `diskN` selector first, falling back to a peer reference.
-`tape run`'s existing `TapeArgumentSource` enum gained a `RemoteFile`
-variant fetched into the small stack-resident `file_buffer`
-(`TAPE_ARGUMENT_FILE_CAPACITY`, 4096 bytes) that argument already used
--- deliberately *not* `pmem::TAPE_BASE`, since a tape is already resident
-there by the time `tape run` parses its arguments, and clobbering it
-mid-fetch would corrupt the very tape about to run. `copy`/`tape load`'s
-remote-GET call sites, which have no such conflict, pass the full
-`pmem::TAPE_BASE`/`TAPE_LEN` region as `netfs_get`'s destination buffer
-instead -- `netfs_get` takes that buffer as a caller-supplied slice
-specifically so both call sites can share one function with no
-special-casing; it learns the real length from the `_START` frame and
-errors out before writing anything if it would overflow the caller's
-buffer. Attempting `copy HOST1:.../NAME HOST2:...` (two remote endpoints
-at once) is explicitly rejected with a message to copy through a local
-disk in two steps instead -- NETFS moves a file to or from *this*
-machine's own disk, never directly between two other peers.
-
-**Serving is scoped to the idle prompt loop only**, mirroring ambient
-discovery's own scoping decision above and for the same reason: this is
-the one loop already proven safe to extend with extra, silent background
-polling without corrupting an interactive display. `ambient_discovery_poll`
-now also recognizes and dispatches the four request-carrying tags
-(`GET_REQUEST`/`PUT_REQUEST`/`PUT_DATA`/`PUT_STOP`) to
-`serve_netfs_get_request`/`serve_netfs_put_request`/`serve_netfs_put_data`/
-`serve_netfs_put_stop` -- unlike routine discovery traffic, NETFS activity
-*is* printed, since it is a much rarer, more consequential event than an
-ordinary discovery probe/reply. A GET is served synchronously within one
-`ambient_discovery_poll()` call (read the file, compute the checksum,
-send the whole paced burst) -- an accepted blocking cost, the same
-trade-off `tape send` already makes. A PUT is necessarily stateful across
-many idle-loop iterations instead (one frame arrives at a time), tracked
-in a small `NetfsPutTransfer` held in a `static mut` -- a second,
-concurrent `PUT_REQUEST` while one is already in flight is rejected with
-`BUSY` rather than silently clobbering it. **A fos machine must be
-sitting idle at its own local prompt to serve a NETFS request at all** --
-not inside `chat`, `nic discover`, `term net`, or a running tape's own
-polling loop, all of which keep working exactly as they did before this
-feature and simply do not answer NETFS traffic.
-
-**Accepted shared-buffer collision risk.** NETFS serving reuses the same
-`pmem::TAPE_BASE`/`TAPE_LEN` staging buffer that a locally typed
-`copy`/`tape load` command already uses. Because a PUT transfer can span
-several real seconds across many idle-loop iterations, a local operator
-typing a `copy`/`tape load` command on the *serving* machine at the same
-moment could corrupt both. This is an explicit, documented limitation of
-fos's single-threaded, no-locking design (see `NetfsPutTransfer`'s own
-doc comment in `kernel/src/shell.rs`) -- not something this feature
-guards against, consistent with how little else in this kernel guards
-against concurrent misuse of shared state.
-
-Verified end to end with `tools/test_netfs_e2e.py` (not part of `make
-test`, mirroring `test_hostname_discovery_e2e.py`'s two-guest structure,
-each guest additionally carrying its own blank second disk and the
-prebuilt `calc.bin` tape): a remote GET (`copy HOST:disk2/NAME disk2`), a
-remote PUT (`copy disk1 NAME HOST:disk2`), `tape load HOST NAME`, `tape
-run @HOST:diskN/NAME` (evaluating `3 4 +` through the `calc` tape to
-prove a fetched startup-argument file reaches a real tape), and a clean
-`NOT_FOUND` error for a nonexistent remote file all pass.
+Copying directly between two remote endpoints is rejected -- go through a
+local disk in two steps instead. **Serving is scoped to the idle prompt
+loop only** (`ambient_discovery_poll`, alongside KUP and ordinary
+discovery): a fos machine must be sitting idle at its own local prompt to
+answer NETFS traffic at all, never inside `chat`, `nic discover`, `term
+net`, or a running tape. Unlike ordinary discovery traffic, NETFS activity
+is printed. A PUT is stateful across many idle-loop iterations
+(`NetfsPutTransfer`); a second concurrent `PUT_REQUEST` is rejected with
+`BUSY`. NETFS serving reuses the same shared staging buffer a locally
+typed `copy`/`tape load` command uses, so a local operator running one of
+those on the *serving* machine during an in-flight PUT can corrupt both --
+an accepted, documented limitation of fos's single-threaded, no-locking
+design. Verified end to end by `tools/test_netfs_e2e.py` (not part of
+`make test`). Full detail (the checksum placement rationale, and every
+verified scenario) is in `docs/history/networking-and-discovery.md`.
 
 ### HLT-on-idle: letting the CPU actually rest at the idle prompt
 
-Every polling loop in this kernel busy-spins by design -- there is no
-scheduler, so "poll hardware, then loop" is how anything gets noticed at
-all. But the one loop that is *always* running whenever nothing else is --
-`shell::run`'s own idle prompt loop -- was spinning the CPU at full speed
-even while genuinely idle (the common steady state, especially for a
-debug-mode "unattended, always up" machine sitting at its own prompt
-between remote sessions). `arch::x86::halt_until_interrupt` (distinct from
-the existing `halt_forever`, which `cli`s and never returns -- this
-executes exactly one `hlt` and returns once any interrupt wakes it) lets
-that loop stop burning cycles/power/heat between polls, called only when a
-whole iteration found nothing at all to do.
-
-The reasoning for *not* needing the textbook `sti; hlt` atomic idiom here
-(which exists to close the race where a wakeup becomes pending between the
-caller's last check and `hlt` itself executing): every caller reaches this
-function with interrupts already unconditionally enabled for the entire
-life of the loop, and the PIT (IRQ0) is never masked and fires at a fixed
-100 Hz regardless of anything else -- so even a "missed" wakeup right at
-the call boundary only costs one more PIT tick (~10ms), never an
-indefinite hang. This bounded worst case is a property of this specific
-loop's environment, not a general guarantee `halt_until_interrupt` makes
-on its own; a caller anywhere PIT ticks could ever be masked, or that
-might reach this function with interrupts off, would need the full
-`sti;hlt` idiom instead.
-
-This is deliberately scoped to *only* `shell::run`'s idle loop, not
+`arch::x86::halt_until_interrupt` executes one `hlt` and returns once any
+interrupt wakes it, called only from `shell::run`'s idle prompt loop when a
+whole iteration found nothing to do -- the plain `sti;hlt` atomic idiom
+isn't needed here since interrupts are already unconditionally enabled and
+the 100 Hz PIT is never masked, bounding any missed wakeup to one tick
+(~10ms). This is deliberately scoped to *only* that one loop, not
 `term_net`'s session loop, `nic_sniff`, `nic_discover`, `chat_command`, or
-any tape network-transfer loop (`tape_load_net`, `netfs_get`/`put`,
-`nic_discover`'s own loop). Every one of those is actively polling NIC
-receive with no interrupt backing at all (every NIC backend's own ISR only
-acks/counts/flags a diagnostic `work_pending` nothing actually waits on --
-`receive()` always polls hardware directly regardless), so none of them
-are "idle" in the sense this feature targets, and halting there would add
-the same latency for zero benefit.
-
-The one loop this does apply to also happens to be the *only* one that
-serves NETFS GET/PUT and KUP traffic (`ambient_discovery_poll`, see
-"NETFS" above and "KUP" under "Debug mode" below), which arrives in paced
-chunks only a few milliseconds apart (`tools/send_kernel_update.py`'s
-default `--delay 0.003`). Halting the instant a single iteration finds
-nothing would halt right after draining one chunk while the next is still
-in flight, adding up to one PIT tick of latency *per chunk* instead of
-just once per idle stretch -- a real, roughly 3x slowdown of an
-already-working feature, not a rounding error. `ambient_discovery_poll`
-therefore returns whether it actually received a frame this call, and
-`run`'s loop only halts once `AMBIENT_IDLE_GRACE_TICKS` (2 ticks, ~20ms --
-comfortably above that ~3ms chunk pacing) have passed with no NIC activity
-*and* no local keyboard/serial byte. An active transfer keeps refreshing
-that deadline faster than it can elapse, so the loop never halts
-mid-transfer; only genuine idle time triggers it.
-
-One accepted, bounded caveat: COM1 (serial input) has no interrupt behind
-it at all (IRQ4 is never unmasked), so once the machine is truly idle and
-halting, a serial-typed byte can incur up to one PIT tick (~10ms) of added
-latency before it's noticed, versus effectively 0ms before this change.
-Verified with `make test` (its bounded waits are 10-second-scale, utterly
-unaffected) and `make test-debug-mode` (KUP is served from this exact
-loop), plus a manual re-run of `tools/test_netfs_e2e.py` and
-`tools/test_hostname_discovery_e2e.py` to confirm no throughput regression
-in the paced-transfer traffic this change is riskiest against.
+any tape network-transfer loop -- all of those actively poll NIC receive
+with no interrupt backing, so halting there would just add latency.
+Because this same loop also serves NETFS/KUP traffic arriving in paced
+chunks a few milliseconds apart, `ambient_discovery_poll` reports whether
+it received a frame this call, and the loop only halts once
+`AMBIENT_IDLE_GRACE_TICKS` (2 ticks, ~20ms) have passed with no NIC or
+keyboard/serial activity -- so an active transfer never gets halted
+mid-stream. One accepted caveat: COM1 has no interrupt behind it, so a
+serial-typed byte can incur up to one PIT tick of added latency once the
+machine is truly idle and halting. Full detail (the throughput-regression
+verification this required) is in `docs/history/networking-and-discovery.md`.
 
 ## Real-time audio streaming: the ES1370 driver, and Intel HD Audio
 
@@ -2215,122 +1839,40 @@ blocking work, exactly like ES1370/HDA's own real-hardware status above.
 
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 
-`kernel/src/lapic.rs` is a minimal local APIC driver, added specifically
-to receive Message Signaled Interrupts (MSI) -- fos's interrupt story was
-previously the legacy 8259 PIC alone (`interrupts.rs`), fed by INTx lines
-via `pci::PciAddress::interrupt_line()`/`register_pci_irq`. The PIC keeps
-running exactly as before for every existing backend (RTL8139, the
-selected 3C905 variants, Intel e1000, the NE2000-compatible clone, and
-ES1370, which predates MSI and has no such capability to find); the local
-APIC is purely additive, used only to receive MSI-delivered interrupts,
-never to relay legacy INTx lines (its LINT0/LINT1 Local Vector Table
-entries are deliberately left masked/as firmware set them), and there is
-still no I/O-APIC anywhere in this kernel, since MSI bypasses I/O-APIC
-redirection entirely and needs none.
+`kernel/src/lapic.rs` is a minimal local APIC driver, added to receive
+Message Signaled Interrupts (MSI). The legacy 8259 PIC (`interrupts.rs`)
+keeps running exactly as before for every existing backend; the local APIC
+is purely additive -- used only to receive MSI, never to relay legacy
+INTx -- and there is still no I/O-APIC anywhere in this kernel, since MSI
+bypasses I/O-APIC redirection entirely. `lapic::initialize()` runs once
+from `interrupts::initialize()`: it checks CPUID for an APIC, reads
+`IA32_APIC_BASE` via new `arch::x86::rdmsr`/`wrmsr` helpers, maps the
+LAPIC's 4 KiB MMIO window with the existing `paging::map_mmio`, and
+programs a dedicated spurious vector (`0x60`). If it ever fails (no APIC,
+or `map_mmio` has no free dynamic page table slot), every MSI-capable
+driver transparently falls back to its legacy PIC IRQ path -- not a fault.
 
-`lapic::initialize()` runs once, unconditionally, from
-`interrupts::initialize()` (right alongside the PIC/PIT setup already
-there): it checks CPUID.1:EDX bit 9 (reusing the existing `cpu::features()`
-wrapper), reads `IA32_APIC_BASE` (MSR `0x1b`, via new `arch::x86::rdmsr`/
-`wrmsr` helpers -- the first MSR access anywhere in this kernel) to find
-the LAPIC's physical MMIO base (architecturally `0xfee00000`), maps that
-one 4 KiB window with the existing `paging::map_mmio` (the same mechanism
-every BAR-mapped driver already uses), and programs the Spurious-Interrupt
-Vector Register with a dedicated vector (`lapic::SPURIOUS_VECTOR`, `0x60`)
--- mirroring the PIC's own IRQ7/IRQ15 spurious-vector convention for
-continuity, though a genuine spurious *local APIC* interrupt needs no EOI
-at all, unlike the PIC's ISR-check dance. Every real chipset since the
-Pentium era, and every CPU model QEMU emulates (even single-core, even
-the default `i440fx` machine type), has always had a local APIC, so this
-is a defensive check rather than an expected failure path; if it ever
-does fail (no APIC, or `map_mmio` has no free dynamic page table slot --
-see below), `lapic::initialize()` returns `false`, the boot narration
-says so, and every MSI-capable driver transparently falls back to its
-legacy PIC IRQ path exactly as if the feature didn't exist.
+`pci.rs` gained a capability-list walk (`PciAddress::find_capability`) and
+`PciAddress::enable_msi(vector, destination_lapic_id)`, handling only the
+simplest case (one vector, 32-bit message address -- this single-core
+kernel only ever has one destination). `interrupts.rs` reserves vectors
+`MSI_VECTOR_BASE` (`0x50`)-`0x5f` with `allocate_msi_vector`/
+`register_msi_irq`/`dispatch_msi_irq`; unlike legacy `PCI_IRQ_HANDLERS`,
+`MSI_HANDLERS` holds exactly one handler per vector, since MSI's whole
+point is exclusive ownership. `hda.rs` is the first (and only) consumer:
+`init_controller` tries LAPIC + MSI before falling back to its previous
+legacy-IRQ path; `hda status` reports which one is active. ES1370 predates
+MSI and always takes the legacy path. `pci`'s device dump also gained a
+read-only `msi=yes/no` capability-presence flag per function.
 
-`pci.rs` gained a capability-list walk (`PciAddress::find_capability`,
-bounded to a small fixed hop count against a malformed list) -- Status
-register bit 4, then the linked list at the Capabilities Pointer, offset
-`0x34` -- and `PciAddress::enable_msi(vector, destination_lapic_id)`,
-which finds the MSI capability (ID `0x05`; MSI-X, a different, table-based
-capability with ID `0x11`, is not implemented -- no current device needs
-it), writes the Message Address (`0xfee00000 | (destination_lapic_id <<
-12)`, physical destination mode, no redirection hint -- this single-core
-kernel only ever has the one destination) and Message Data (delivery mode
-fixed, the vector in the low byte -- MSI is always edge-triggered per the
-PCI spec, so there is no trigger-mode bit to set, unlike a legacy PIC IRQ
-gate), then sets the Message Control register's MSI-enable bit. Only the
-simplest case is handled: one vector, a 32-bit message address; a
-64-bit-capable device still works correctly with just its Message Upper
-Address register zeroed, since every address this kernel ever targets
-fits in 32 bits regardless.
-
-`interrupts.rs` reserves a new vector range, `MSI_VECTOR_BASE` (`0x50`)
-through `0x5f` -- clear of the CPU exception range, the PIC's remapped
-`0x20`-`0x2f`, and the new LAPIC spurious vector `0x60` (`gdt::
-DOUBLE_FAULT_TSS_SELECTOR`, `0x30`, is a GDT *selector*, a different
-namespace entirely, not a conflict) -- with `allocate_msi_vector`/
-`register_msi_irq`/`dispatch_msi_irq`. Unlike `register_pci_irq`'s
-`PCI_IRQ_HANDLERS`, which deliberately holds up to `MAX_SHARED_HANDLERS`
-handlers per legacy line (see "A real bug this test found: shared legacy
-PCI IRQ lines..." in `docs/history/audio-hda.md`), `MSI_HANDLERS` holds
-exactly one handler per vector: MSI's entire point is exclusive, unshared
-ownership, unlike legacy INTx sharing, which is a motherboard-topology
-fact no driver controls. Each generated MSI IDT gate calls
-`lapic::send_eoi()` -- a genuinely different acknowledgment mechanism
-from the PIC's own `send_eoi` (an MMIO register write instead of an `outb`
-command sequence) -- and the two are never mixed for one interrupt.
-
-`hda.rs` is the first (and, for now, only) consumer: `init_controller`
-tries `lapic::is_available()` -> `interrupts::allocate_msi_vector()` ->
-`address.enable_msi(vector, lapic::id())` before falling back to its
-previous `address.interrupt_line()` + `register_pci_irq` path, storing
-whichever succeeded as `Hda::msi_vector`/`irq`. `handle_pci_irq` matches
-an incoming byte against either field (`irq` values 0-15 and MSI vectors
-`0x50`-`0x5f` never overlap, so this is unambiguous) -- the existing
-"every controller checks its own status register, so a non-matching call
-is a harmless no-op" reasoning from the shared-legacy-line fix applies
-unchanged. `hda status` reports `"MSI enabled, vector 0x.."` with a live
-fire count when MSI is active, or the previous legacy-IRQ wording
-otherwise; ES1370 is completely untouched, since `find_capability(0x05)`
-naturally returns `None` for a device that predates MSI, and takes the
-same legacy path it always has.
-
-`kernel/src/pci.rs`'s `pci` command output also gained an `msi=yes/no`
-flag per discovered function (capability *presence*, not whether this
-kernel actually enabled it for that device) -- read-only, at no writing
-cost, useful for confirming a card the same way `pci`'s vendor/device ID
-dump already helps identify unknown hardware.
-
-**Low-memory constraint, now resolved**: the local APIC's own `map_mmio`
-call is a fourth potential consumer of `paging.rs`'s dynamic-page-table
-pool (alongside e1000/i350/HDA). At the time this feature was built, that
-pool was deliberately *not* widened from 3 to 4 slots to cover it --
-confirmed by trying it, not assumed: even one more static 4 KiB page
-table pushed `__kernel_end` past `linker.ld`'s ceiling (then `0x90000`),
-which had essentially no spare room at all. The pool is now 4 slots:
-once that ceiling grew to `0x98000` for an unrelated reason (see
-"Low-memory map" above), there was real headroom again, and the gap was
-closed deliberately rather than left as a standing, if narrow,
-MSI-availability risk. If this pool is ever exhausted anyway (4 *other*
-high regions already mapped when the LAPIC tries to map its own), the
-failure remains graceful: no local APIC, no MSI that boot, every driver
-on its legacy path -- not a fault.
-
-Verified end to end by dropping the `-device intel-hda,msi=off` workaround
-from `tapes/test_hda_playback_e2e.py`/`tapes/test_hda_capture_e2e.py`
-(previously forced off specifically because this feature didn't exist yet
--- see those files' own doc comments) and asserting the new `"MSI
-enabled, vector 0x.."` narration instead: both tests still produce real,
-non-silent captured audio exactly as before, now proven driven by
-MSI-delivered interrupts rather than a legacy IRQ. `tapes/test_hda_e2e.py`
-and `tapes/test_hda_multi_e2e.py` (which never forced `msi=off` even
-before this feature existed) continue to pass unmodified, as does
-`tapes/test_audio_multi_e2e.py` (an RTL8139 sharing legacy IRQ 11 with
-two ES1370 cards -- the exact historical shared-line scenario, still
-legacy-only since ES1370 has no MSI capability), plus `make test`,
-`make test-nic-watchdog`, `make test-stack-guard`, and
-`make test-page-protection`.
+The local APIC's own `map_mmio` call is a fourth consumer of `paging.rs`'s
+dynamic-page-table pool (alongside e1000/i350/HDA), which is why that pool
+is now 4 slots (see "Low-memory map" above) -- confirmed necessary by
+trying it at the prior, smaller ceiling. Verified end to end by dropping
+the `msi=off` QEMU workaround from the HDA e2e tests and asserting real
+MSI-driven audio capture/playback. Full detail (the exact register-level
+MSI address/data encoding, and the full verification list) is in
+`docs/history/development-notes.md`.
 
 ## Deliberately deferred work
 
@@ -2372,61 +1914,33 @@ deferred.
 
 ### Cooperative/preemptive scheduling: investigated, not yet built
 
-Raised as "what would a real scheduler cost, and what would it buy us?"
-while designing `poll_background_work` above (which is deliberately the
-much cheaper alternative, scoped to kernel-native recurring work only --
-see that section). A genuine scheduler, cooperative or preemptive, would
-need several pieces this kernel has none of today: per-task stacks and a
-small, fixed-size task-control-block table (no heap exists, so this would
-be a fixed array of TCBs, each with a statically-sized stack, mirroring
-`entry.S`'s single kernel stack/guard page just multiplied per task); a
-context-switch primitive (save/restore the full register set plus stack
-pointer) and a scheduling policy on top of it; and a cooperative-vs-
-preemptive choice (cooperative needs no timer-interrupt integration but
-only helps once something actually calls `yield()`; preemptive needs
-every switch point audited for what state is safe to interrupt). By far
-the most expensive part, though, is auditing every place this kernel
-currently assumes single-threaded execution, not building the mechanism
-itself: `disk.rs`'s BIOS real-mode trampoline is the sharpest example --
-it briefly disables paging and restores the real-mode IVT/PIC mapping to
-make one BIOS call, a window during which nothing else can safely run
-without corrupting CPU/segment state (see "Protected-mode IRQ window
-during BIOS disk calls" above) -- a scheduler would need this, and every
-similar assumption throughout `shell.rs`/`nic.rs`, either pinned off or
-redesigned entirely.
-
-Genuine concurrency would let a long-running foreground task (e.g. a
-`router` tape) share CPU time with an interactive shell instead of
-occupying it exclusively, and would let a future blocking primitive avoid
-busy-spinning -- but neither is a pressing need today: `poll_background_work`
-already gets the low-cost share of that benefit with none of the single-
-threading-audit cost, and no tape currently needs to run in the background
-while the shell keeps working. **Conclusion: revisit a real scheduler only
-if a future tape or workload genuinely needs concurrent execution; until
-then this remains a deliberately deferred, larger architectural project.**
+A genuine scheduler would need per-task stacks and a fixed-size TCB table
+(no heap exists), a context-switch primitive, and a cooperative-vs-
+preemptive choice -- but by far the most expensive part would be auditing
+every place this kernel assumes single-threaded execution, most critically
+`disk.rs`'s BIOS real-mode trampoline, which cannot tolerate any
+concurrent execution during its brief real-mode window. `poll_background_work`
+(above) already gets the low-cost share of the benefit (kernel-native
+recurring work shared across existing polling loops) with none of that
+audit cost, and no tape currently needs to run in the background while the
+shell keeps working. **Revisit a real scheduler only if a future tape or
+workload genuinely needs concurrent execution.** Full detail (the
+investigation that led to this conclusion) is in
+`docs/history/development-notes.md`.
 
 ### ISA bus support and the 3C509: investigated, not yet built
 
-Every NIC backend today (`rtl8139.rs`, `threecom.rs`, `e1000.rs`) is found
-through `pci.rs`'s PCI configuration-space walk (Mechanism #1, ports
-`0xcf8`/`0xcfc`); this project has no ISA bus code at all. A 3Com 3C509 was
-considered as a next NIC target and investigated, but deliberately not
-started: card discovery is the genuinely new, harder half (a 3C509 in its
-default ISA Plug-and-Play state needs an LFSR-derived wake-up key sequence
-and a serial-identification/CSN-assignment protocol to be assigned an I/O
-base and IRQ in software -- a real, standalone `isa.rs` subsystem this
-project has never needed; jumperless-configuring a card once via the old
-DOS `3c5x9cfg.exe` utility to always answer at one fixed, known I/O port
-sidesteps this at the cost of a one-time manual setup step), while the
-register-level driver itself would actually be simpler than the PCI
-backends already built (plain programmed I/O through a window-based FIFO,
-no bus-mastering or descriptor rings at all). No ISA machine was available
-to validate discovery either way, so nothing was implemented. QEMU's
-`-device help` lists no 3C509 model at all, unlike every PCI backend built
-so far, so this driver would have no automated `make test` coverage ever --
-every iteration on both discovery and the register-level driver would need
-real hardware permanently, a standing cost worth weighing alongside the
-discovery-protocol choice when deciding whether/when to build this driver.
+Every NIC backend today is found through `pci.rs`'s PCI configuration-space
+walk; this project has no ISA bus code at all. A 3Com 3C509 was considered
+as a next NIC target and investigated, but deliberately not started: ISA
+Plug-and-Play discovery (an LFSR wake-up key sequence and a serial-
+identification/CSN-assignment protocol) is a real, standalone `isa.rs`
+subsystem this project has never needed, while the register-level driver
+itself would actually be simpler than the PCI backends already built.
+QEMU has no 3C509 model at all, so unlike every PCI backend this driver
+would have no automated `make test` coverage ever -- a standing,
+real-hardware-only cost. Full detail (the discovery-protocol tradeoffs
+considered) is in `docs/history/development-notes.md`.
 
 Floppy drive support was investigated but not built: this project's disk
 stack is built exclusively around INT 13h's *extended* (`AH=42h`) LBA
@@ -2469,175 +1983,49 @@ wrapping/scrolling itself out of an 80x25 screen), are in
 ## A tape that visits 64-bit long mode and comes back
 
 `tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written
-tape that jumps the running 32-bit kernel into 64-bit long mode, proves
-it got there, and jumps back -- entirely inside one `tape run` call,
-leaving nothing about the kernel's own GDT, page tables (fos never
-otherwise enables paging), or IDT touched or replaced once it returns.
-This is deliberately not the same thing as "Deferred optional x86-64
-path" below: that section is about a permanent, parallel 64-bit boot
-*target* built from the ground up; this tape is a small, one-shot, fully
-reversible demonstration that the mode switch itself works, run from
-inside the existing 32-bit kernel, using CPU features stage2's own
-GDT/paging setup never touches.
+tape that jumps the running 32-bit kernel into 64-bit long mode, proves it
+got there, and jumps back -- entirely inside one `tape run` call, leaving
+the kernel's own GDT, page tables, and IDT untouched once it returns. This
+is a small, one-shot, fully reversible demonstration of the mode switch
+itself, not the same thing as "Deferred optional x86-64 path" below (a
+permanent, parallel 64-bit boot target built from the ground up).
 
-The design is deliberately split into two files with a narrow, documented
-contract between them, so the privileged mode-switch mechanics can be
-reused by any future "visits 64-bit mode" tape without rewriting them:
+The design splits into a reusable, privileged shim
+(`tapes/longmode64_shim.S`: the `tape_main` entry point, the CPUID
+long-mode check with its own early-return path, identity-mapped page
+tables, a private GDT, and the full CR0/CR3/CR4/EFER/GDTR/EFLAGS save-and-
+restore around the transition) and one implementation of a narrow
+`tape64_body` contract it calls once safely landed in 64-bit mode with
+interrupts off: an ordinary SysV64 `extern "C" fn()`, no arguments, no
+return value, free to do whatever it wants and expected to return via a
+plain `ret`. `tapes/longmode.S` implements it in hand-assembled `.code64`
+(hex-dumping a 64-bit-only immediate straight to VGA text memory, since
+calling back through the 32-bit `putc` callback would need a second nested
+mode transition); `tapes/longmode-rs/` implements the identical contract
+in ordinary `#![no_std]` Rust instead, as a `staticlib` crate with no
+`_start` of its own, using a new, genuinely 64-bit
+`targets/x86_64-fos-tape.json` (SSE/MMX/AVX disabled, `"rustc-abi":
+"softfloat"`, since the kernel never sets CR4.OSFXSR/OSXMMEXCPT;
+`"code-model": "small"`, not `"kernel"`, since this tape loads low at
+`pmem::TAPE_BASE`) -- proof the shim/body split is a real, reusable
+boundary, not just a refactor. Interrupts stay off for the whole excursion
+since the kernel's IDT is a 32-bit-format IDT, invalid to service while
+CR0/CR3/CR4/EFER/GDTR are mid-transition.
 
-- **`tapes/longmode64_shim.S`** owns everything privileged and reusable:
-  the `tape_main` entry point the kernel calls, the CPUID long-mode
-  check (with its own early-return path -- see below), the identity-
-  mapped page tables, the private GDT, the full CR0/CR3/CR4/EFER/GDTR/
-  EFLAGS save-and-restore, and both directions of the actual mode
-  transition. Its only job besides that plumbing is calling one external
-  symbol, `tape64_body`, once it has safely landed in 64-bit mode with
-  interrupts off -- and restoring everything the instant that call
-  returns.
-- **`tapes/longmode.S`** (now much shorter than before this split) is
-  just one *implementation* of `tape64_body`, written in hand-assembled
-  `.code64`: it loads a 64-bit-only immediate (`0xdeadbeefcafebabe` -- a
-  value no 32-bit `mov` could load in one instruction) and hex-dumps it
-  directly to VGA text memory, exactly like `tapes/vga-colors` writes
-  VGA, as proof that 64-bit-encoded instructions genuinely ran (this
-  can't go through the `putc` callback: calling 32-bit code from 64-bit
-  mode would need a whole second nested mode transition for one debug
-  print, so it isn't done).
-
-The `tape64_body` contract is intentionally minimal: an ordinary SysV64
-`extern "C" fn()` -- no arguments, no return value -- called only after
-the shim has already entered 64-bit mode (paging on, CR4.PAE/EFER.LME/
-CS.L set, the shim's private GDT loaded, interrupts masked), free to do
-whatever it wants, and expected to return via a plain `ret`. Because
-SysV64 requires `%rsp` 16-byte-aligned at the point of `call` (unlike the
-cdecl the shim's own 32-bit code otherwise follows), the shim saves its
-pre-alignment `%rsp` in `%r15` (callee-saved, and otherwise unused)
-immediately before the `call` and restores it immediately after --
-critical, since leaving `%rsp` misaligned by even a few bytes would
-corrupt the later 32-bit register-restore epilogue and the tape's final
-`ret` back to the kernel. Any body -- hand-written assembly or, as below,
-compiled from Rust -- just needs to define one global `tape64_body`
-symbol matching this contract and link against `longmode64_shim.o`.
-
-Mechanically, the shim builds its own tiny identity-mapped page tables
-(three static 2 MiB pages covering physical 0..6 MiB -- the kernel's own
-code/stack, 0x10000..0x98000; VGA text memory, 0xb8000; and the tape's
-own 4 MiB image, `pmem::TAPE_BASE`..+`TAPE_LEN`) and its own two-
-descriptor private GDT (a 64-bit code descriptor at selector 0x08, and a
-flat 32-bit code descriptor at selector 0x10 used only as the landing pad
-immediately after leaving 64-bit mode), then: `cli`s, saves CR0/CR3/
-CR4/EFER/GDTR/EFLAGS, clears CR0.PG before changing the kernel's non-PAE
-page-table mode, sets CR4.PAE, loads its own page tables into CR3, sets
-EFER.LME, sets CR0.PG (entering IA-32e compatibility submode), swaps in its
-private GDT, and far-jumps into 64-bit code, where it calls
-`tape64_body` as described above. A `push`+`push`+`lretq` (the standard,
-SDM-documented way to leave 64-bit mode for a fixed target, since a
-plain far jump with an immediate target isn't encodable there) returns
-to the compatibility-mode landing pad, which restores every saved
-register in reverse order -- it first clears CR0.PG, restores CR4
-(clearing PAE), CR3, EFER via `wrmsr` (clearing LME), the original GDTR,
-and a far jump back onto the kernel's own code selector to reload CS;
-only then does it restore CR0 (re-enabling the kernel's original
-non-PAE paging) and EFLAGS (re-enabling interrupts last of all) -- before
-printing a wrap-up message through the ordinary `putc` callback and
-returning to the shell exactly like any other tape.
-
-Two things make this materially different from every other tape in this
-repository:
-
-- **Interrupts stay off for the whole excursion, not just as a nicety.**
-  `kernel/src/interrupts.rs` keeps the PIT (100 Hz, IRQ0) and PS/2
-  keyboard (IRQ1) firing live the entire time the shell runs, including
-  during a tape. That IDT is a 32-bit-format IDT, invalid to service an
-  interrupt against while CR0/CR3/CR4/EFER/GDTR are mid-transition or
-  while this tape's own private GDT is loaded -- so the `cli` above is a
-  hard correctness requirement, and EFLAGS is restored (re-enabling
-  interrupts) only after every other piece of state is back to normal.
-- **The build needs a real `ld` link step, unlike `tapes/primes.S`.**
-  x86-32 ELF relocations are REL-style: GAS bakes the resolved address
-  directly into the instruction bytes at assemble time, so `primes.S`'s
-  bare `as --32` + `objcopy -O binary` pipeline (no linker at all) works
-  correctly. x86-64 ELF relocations are RELA-style instead: the resolved
-  address lives only in a separate `.rela` section that a linker-free
-  `objcopy -O binary` throws away entirely, leaving zeroed placeholders
-  everywhere this file's `.code64` region references a `.code32` label
-  or vice versa. `make tape-longmode` therefore assembles both
-  `tapes/longmode64_shim.S` and `tapes/longmode.S` with `as --64`
-  (needed for their 64-bit-context relocations, even though most of the
-  shim's instructions are still ordinary 32-bit-encoded `.code32` code),
-  links both objects together with `ld -Ttext=0x100000
-  --oformat=elf64-x86-64 -e tape_main` (matching `pmem::TAPE_BASE`, so
-  every label resolves to its real, final runtime address, and picking
-  the shim's `tape_main` -- not the body's `tape64_body` -- as the entry
-  point), and only then runs `objcopy -O binary`.
-
-If CPUID (leaf 0x80000001, EDX bit 29) reports no long-mode support, the
-shim prints a short message and returns immediately, without ever
-calling `tape64_body` or touching CR0/CR3/CR4/EFER/GDTR/EFLAGS at all.
-This matters for testing: `qemu-system-i386`'s TCG backend cannot emulate
-the long-mode CPUID bit at all (confirmed: it prints `warning: TCG
-doesn't support requested feature: CPUID[eax=80000001h].EDX.lm [bit
-29]` and reports the feature absent), so this tape's real 64-bit
-excursion can only be exercised under `qemu-system-x86_64` -- confirmed
-to boot this same 32-bit `fos.img` identically otherwise.
-`tapes/test_longmode_e2e.py` is one of the two e2e tests in this
-repository that launch `qemu-system-x86_64` instead of
-`qemu-system-i386`; it asserts on the shim's own serial-visible messages
-and that the shell keeps responding to ordinary commands afterward (the
-"64-BIT MODE REACHED" VGA text itself is only visible on the real screen
--- `make run` with this tape loaded -- since it bypasses the serial-
-mirrored `putc` callback entirely). Built with `make tape-longmode`,
-producing `build/tapes/longmode.bin`.
-
-### A second `tape64_body`, written in Rust: `tapes/longmode-rs/`
-
-`tapes/longmode-rs/` is a second implementation of exactly the same
-`tape64_body` contract described above, written in ordinary `#![no_std]`
-Rust (`src/lib.rs`) instead of hand-assembled `.code64` -- proof the
-shim/body split above is a real, reusable boundary, not just a
-refactor for its own sake. It performs the identical VGA hex-dump proof
-as `tapes/longmode.S`'s body, just via safe(-ish) `write_volatile` calls
-to `0xb8000` instead of raw `mov`s, and is linked against the *exact same*
-`tapes/longmode64_shim.S` object file -- no shim changes needed at all to
-support a compiled-language body.
-
-Unlike the ordinary Rust tapes in this repository (`tapes/hello-rs`,
-`tapes/vga-colors`, `tapes/bigsieve` -- each a whole self-contained ELF32
-binary compiled as a `bin` crate with its own linker script), `longmode-rs`
-is a `staticlib` crate (see its `Cargo.toml`): it has no `_start`, no
-entry point, and no linker script of its own, since it exists only to
-provide one function that gets linked into a larger image alongside the
-shim. `make tape-longmode-rs` builds it with `cargo`, then links
-`build/tapes/longmode64_shim.o` against the resulting `.a` archive with
-the same `ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main` recipe
-`tape-longmode` uses -- the linker pulls only the one object it actually
-needs (the one defining `tape64_body`) out of the archive automatically.
-
-It also needs its own new custom Rust target, `targets/x86_64-fos-tape.json`
--- the first genuinely 64-bit target in this repository, unlike
-`targets/i686-fos.json` every other Rust tape uses. Modeled on that file
-but for `x86_64`, it additionally disables SSE/MMX/AVX and sets
-`"rustc-abi": "softfloat"`: fos's kernel never sets CR4.OSFXSR/OSXMMEXCPT
-(bits 9/10), since it never uses floating point, so any SSE-encoded
-instruction -- including ones LLVM might silently emit for something as
-mundane as a struct copy, not just explicit float math -- would fault
-with `#UD` the instant it executed. (Confirmed necessary: an earlier
-attempt without `"rustc-abi": "softfloat"` failed to build at all, with
-`error: target feature sse2 is required by the ABI but gets disabled in
-target spec`.) It deliberately uses `"code-model": "small"`, not the
-`"kernel"` code model rustc's own builtin `x86_64-unknown-none` target
-defaults to: `"kernel"` assumes high, negative-canonical addresses like
-`0xffffffff80000000`, which is wrong for this tape's low, positive
-`0x100000` load address (`pmem::TAPE_BASE`).
-
-`tapes/test_longmode_rs_e2e.py` is the second (and, along with
-`tapes/test_longmode_e2e.py`, only other) e2e test in this repository
-that launches `qemu-system-x86_64`; it is a near-duplicate of that
-script -- same shim-emitted serial messages, same shell-still-alive
-check, a distinct multicast group/port so both can run concurrently --
-proving the shim's mode-switch mechanics behave identically no matter
-which language implemented the body that runs while briefly parked in
-64-bit mode. Built with `make tape-longmode-rs`, producing
-`build/tapes/longmode-rs.bin`.
+Because x86-64 ELF relocations are RELA-style (unlike `primes.S`'s
+REL-style x86-32 relocations, which let a linker-free `as`+`objcopy`
+pipeline work), both variants need a real `ld` link step:
+`ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main` against the
+assembled/compiled objects, before `objcopy -O binary`. Neither variant's
+real 64-bit excursion can be exercised under `qemu-system-i386` (its TCG
+backend cannot emulate the long-mode CPUID bit at all); `tapes/
+test_longmode_e2e.py` and `tapes/test_longmode_rs_e2e.py` are the only two
+e2e tests in this repository that launch `qemu-system-x86_64` instead.
+Confirmed working on real hardware too: a Pentium 4 correctly took the
+graceful no-long-mode-support path, and an AMD Athlon 64 X2 completed the
+full round trip. Built with `make tape-longmode`/`make tape-longmode-rs`.
+Full detail (the exact register save/restore sequence and page-table
+layout) is in `docs/history/development-notes.md`.
 
 ## Deferred optional x86-64 path
 
