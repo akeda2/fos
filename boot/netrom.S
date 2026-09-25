@@ -48,6 +48,7 @@
 .set INT19_VECTOR, 0x19 * 4            # IVT offset of INT 19h ("bootstrap loader"), the BIOS-conventional way an option ROM defers its actual boot action until BIOS is done with the rest of POST.
 .set PCI_VENDOR_ID, 0x10ec
 .set PCI_DEVICE_ID, 0x8139
+.set PROTECTED_STACK_TOP, 0x501000     # Same relocated protected-mode stack stage2.S uses -- see its own doc comment on this constant for why (freed from the low conventional-memory range to grow the kernel's own reserved region).
 
 # Fixed scratch RAM for this file's own mutable state (see the note above on
 # why none of it can live inside the ROM image itself). 0x600-0x6ff sits in
@@ -544,7 +545,7 @@ protected_entry:
     movw %ax, %fs
     movw %ax, %gs
     movw %ax, %ss
-    movl $0x9f000, %esp
+    movl $PROTECTED_STACK_TOP, %esp
     movl $BOOT_INFO, %ebx
     movl $KERNEL_LOAD_ADDRESS, %eax
     call *%eax

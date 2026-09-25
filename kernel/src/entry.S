@@ -108,7 +108,7 @@ kernel_stack:
     # `execute()`'s own frame was shrunk (see the `#[inline(never)]` note
     # on `execute()` in `shell.rs`). Unlike when this was first sized,
     # `__kernel_end` no longer sits comfortably below the reserved region's
-    # ceiling (`linker.ld`'s `ASSERT`, now `0x98000`) -- confirmed by
+    # ceiling (`linker.ld`'s `ASSERT`, now `0x9f000`) -- confirmed by
     # measurement (`size build/kernel.elf`), current `.bss` usage leaves
     # only a few tens of KiB of headroom before it, not room to casually
     # double this reservation again. Growing this further would likely

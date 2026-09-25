@@ -34,7 +34,7 @@ STAGE2_SECTORS = 32
 # see this module's own doc comment above for why those two specifically
 # can't just consume this file's output the way everything else here does).
 KERNEL_LOAD_ADDRESS = 0x10000
-KERNEL_RESERVED_END = 0x98000
+KERNEL_RESERVED_END = 0x9f000
 # One fixed-size slot per kernel copy, sized to the whole reserved
 # low-memory region regardless of any one build's actual kernel size, so a
 # later network kernel update (see "A/B kernel slots" below) can never grow

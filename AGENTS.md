@@ -19,10 +19,10 @@ that obscure hardware behavior.
   section below for why), loads the kernel at physical `0x10000` using bounded
   multi-transfer BIOS EDD reads that never cross a 64 KiB transfer boundary,
   and enters flat 32-bit protected mode. The reserved
-  `0x10000..0x98000` region, not the old single-transfer 127-sector
+  `0x10000..0x9f000` region, not the old single-transfer 127-sector
   convention, is the current kernel-size limit.
 - `kernel/` is a freestanding Rust binary. `linker.ld` reserves the initial
-  low-memory kernel region through `0x98000`; do not place loader, boot-info,
+  low-memory kernel region through `0x9f000`; do not place loader, boot-info,
   or disk-trampoline data there.
 - `kernel/src/entry.S` reserves a 64 KiB kernel stack with a low-end canary
   above an unmapped 4 KiB guard page. `kernel/src/gdt.rs` installs a
@@ -42,7 +42,7 @@ that obscure hardware behavior.
   bounded-transfer size), but `disk.rs` only ever requests up to
   `MAX_TRANSFER_SECTORS` (16, an 8 KiB `CHUNK` buffer) at a time -- the
   smaller value exists purely to fit the kernel's `.bss` budget below the
-  `0x98000` reserved-region ceiling, not any BIOS/hardware limit. FOSFS
+  `0x9f000` reserved-region ceiling, not any BIOS/hardware limit. FOSFS
   file reads/writes (`fosfs::cat`/`read`/`write_file_data`) loop over
   `MAX_TRANSFER_SECTORS`-sized chunks via `device_read_sectors`/
   `device_write_sectors` instead of one BIOS round trip per sector, which
@@ -165,7 +165,7 @@ Real-mode code before the kernel's own memory management exists shares a
 handful of fixed low-memory addresses across `stage1.S`, `stage2.S`, and
 `netrom.S`. There is no single enforcing mechanism for this -- it is
 convention only -- so treat this table as authoritative before adding any new
-fixed address below `0x98000`, and update it in the same change that adds one:
+fixed address below `0x9f000`, and update it in the same change that adds one:
 
 | Address | Used by | Purpose |
 | --- | --- | --- |
@@ -177,22 +177,24 @@ fixed address below `0x98000`, and update it in the same change that adds one:
 | `0x7a00` | `stage2.S`, `netrom.S` | Real-mode stack pointer during boot. |
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
-| `0x9f000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer, just below the conventional End-of-Low-Memory / EBDA boundary. |
-| `0x10000`-`0x98000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
+| `0x10000`-`0x9f000` | `stage2.S`, `netrom.S`, `kernel/linker.ld` | The Rust kernel's load address and reserved low-memory region. |
 | `0x100000`-`0x500000` | `kernel/src/pmem.rs` (`TAPE_BASE`/`TAPE_LEN`), any tape's own linker script | The fixed 4 MiB region every tape (`tape load disk`/`tape load net`) is always loaded into, carved out of `pmem`'s general frame pool at boot so `allocate`/`allocate_contiguous`/`palloc` can never hand these frames to anything else. See "Tapes: fixed load address, and writing one in Rust" below. |
+| `0x500000`-`0x501000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer during boot (one page, stack grows down from the top). Relocated here from a fixed `0x9f000` -- see below -- once the flat GDT is loaded and every segment register already points at it, this stack has no remaining reason to stay below 1 MiB; `pmem::initialize` reserves this page defensively (via `reserve_range`, alongside the tape region immediately below it) even though nothing runs concurrently with stage two's own brief setup-then-far-jump-to-`kmain` window, including `reboot::soft_reboot`'s identical re-entry into this same code. |
 
-This region's own hard outer limit is `0x9f000` (the protected-mode stack
-pointer just above it) -- `0x98000` leaves a deliberate `0x7000` (28 KiB)
-gap below that, not a number to erode casually. Measure real headroom with
-`size build/kernel.elf` (`.bss`'s end, not `kernel.bin`'s file size, is
-what actually matters -- see "`audio.rs`: a format-agnostic facade..."
-below for why) before assuming a small `.bss` addition is free: as of this
-writing there is roughly 32 KiB of slack before `0x98000` itself, all of
-it now the *first* thing to check, not the linker's own `ASSERT` failing
-after the fact. If this genuinely runs out again, the sustainable fix is
-revisiting the `0x9f000` boundary itself (e.g. relocating the transient
-boot-time protected-mode stack elsewhere), not repeatedly nudging this
-ceiling up against it.
+This region's own hard outer limit is `0x9f000`, the conventional "safely
+below the EBDA" boundary the boot-time protected-mode stack used to sit at
+directly; relocating that stack (see the table row above) reclaimed the
+entire `0x7000` (28 KiB) gap that used to exist only to leave it room, so
+the kernel's own reserved region now runs all the way up to that same
+boundary instead of stopping short of it. Measure real headroom with `size
+build/kernel.elf` (`.bss`'s end, not `kernel.bin`'s file size, is what
+actually matters -- see "`audio.rs`: a format-agnostic facade..." below for
+why) before assuming a small `.bss` addition is free: as of this writing
+there is roughly 31 KiB of slack before `0x9f000`, the *first* thing to
+check, not the linker's own `ASSERT` failing after the fact. If this
+genuinely runs out again, the sustainable fix is moving the reserved
+region's own contents to make more room (e.g. shrinking `.bss`, or reducing
+`kernel_stack`'s size), not nudging `0x9f000` itself further into the EBDA.
 
 ## Educational verbosity
 
@@ -271,7 +273,7 @@ protective MBR and primary/backup GPT metadata:
 | LBA 2048 | GPT boot payload partition |
 | First 32 payload sectors (LBA 2048-2079) | Stage-two loader |
 | LBA 2080 | One-sector A/B kernel-slot metadata block (see "Debug mode" below) |
-| LBA 2081 onward (`SLOT_SECTORS` each, slot 0 then slot 1) | The two fixed-size kernel slots -- currently 1088 sectors each, sized to the whole reserved low-memory region (`KERNEL_RESERVED_END`); see below |
+| LBA 2081 onward (`SLOT_SECTORS` each, slot 0 then slot 1) | The two fixed-size kernel slots -- currently 1144 sectors each, sized to the whole reserved low-memory region (`KERNEL_RESERVED_END`); see below |
 | Immediately after both slots (`DATA_START_LBA`) | Dedicated GPT-discovered FOSFS data partition containing README and all compiled tapes |
 | Final 33 sectors | Backup GPT entry array and header |
 
@@ -859,9 +861,9 @@ runtime. It kept growing after that (`0x70000` for ES1370 ADC capture,
 each time for the same reason: some feature's own `.bss` growth left no
 headroom under the previous ceiling.
 
-Most recently, grown again to the current `0x98000` -- this time
-deliberately, not reactively, alongside a fix to a real bug this exact
-history had already caused twice: `kernel/src/debug.rs` used to keep its
+It was then grown again to `0x98000` -- this time deliberately, not
+reactively, alongside a fix to a real bug this exact history had already
+caused twice: `kernel/src/debug.rs` used to keep its
 own hand-copied `SLOT1_LBA`/`SLOT_SECTORS` (see "A/B kernel slots and
 automatic fallback" below), and *both* of the `0x70000`/`0x80000` steps
 above required a manual, easy-to-forget update to that copy -- the first
@@ -881,9 +883,22 @@ third occurrence -- see `tools/write_layout.py`'s own doc comment and the
 All three constants (`linker.ld`'s `ASSERT`, `pmem::RESERVED_BELOW`,
 `tools/write_layout.py`'s `KERNEL_RESERVED_END`) must still always match
 by hand -- see "Low-memory map" above for why those three specifically
-can't be generated the same way, and for this region's own remaining
-headroom before its hard outer limit, the `0x9f000` real-mode stack
-pointer.
+can't be generated the same way.
+
+Most recently, grown again to the current `0x9f000` -- the sustainable
+fix "Low-memory map" above had named but not yet applied, rather than a
+reaction to a specific feature's `.bss` growth this time: the boot-time
+protected-mode stack pointer (`stage2.S`/`netrom.S`'s `protected_entry`)
+was relocated from a fixed `0x9f000` to `0x500000` (see "Low-memory map"
+above), reclaiming the entire `0x7000` (28 KiB) gap that used to exist
+purely to leave that stack room below the EBDA. This raised the
+kernel's own reserved-region ceiling all the way up to that boundary
+with no fresh safety margin needed -- `0x9f000` was already the
+conservative value the stack's own placement had chosen -- turning
+roughly 3.5 KiB of remaining headroom into roughly 31 KiB, verified with
+`size build/kernel.elf` and confirmed safe by `make test-debug-mode`,
+which exercises `reboot::soft_reboot`'s repeated re-entry into this
+exact relocated-stack code path, including a real KUP-triggered reset.
 
 Because a tape can write VGA memory and move the hardware cursor directly
 (see `tapes/primes.S` below) with no way to tell `console.rs` it did
@@ -1539,8 +1554,8 @@ remaining headroom), not the flat file's byte count. Whatever caused the
 the mechanism explained below as the current, verified one. Stage two now
 avoids the former single-transfer 127-sector ceiling by splitting kernel
 loading into bounded INT 13h extended-read calls that respect each BIOS
-64 KiB boundary. The remaining limit is the reserved `0x10000..0x98000`
-low-memory region, currently `SLOT_SECTORS` (1088) sectors, and
+64 KiB boundary. The remaining limit is the reserved `0x10000..0x9f000`
+low-memory region, currently `SLOT_SECTORS` (1144) sectors, and
 `tools/write_layout.py` emits that limit.
 
 The fix: a second allocator, the "big pool" (`BIG_BITMAP`,

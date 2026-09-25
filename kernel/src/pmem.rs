@@ -2,7 +2,7 @@
 //!
 //! It builds a fixed-size bitmap (one bit per 4 KiB frame) from the E820
 //! memory map the loader collected, marks everything below the reserved
-//! low-memory kernel region (see `linker.ld`, `__kernel_end < 0x98000`) as
+//! low-memory kernel region (see `linker.ld`, `__kernel_end < 0x9f000`) as
 //! permanently unavailable, and hands out/reclaims individual frames.
 //! `paging.rs` maps those physical frames into the current identity-mapped
 //! supervisor address space; this module deliberately remains concerned only
@@ -37,7 +37,7 @@ const BITMAP_BYTES: usize = MAX_FRAMES.div_ceil(8);
 /// "Low-memory map" for why these three specifically still have to be kept
 /// in sync by hand, unlike `kernel/src/debug.rs`'s slot constants, which
 /// are now generated from the same Python-side value instead.
-const RESERVED_BELOW: u32 = 0x98000;
+const RESERVED_BELOW: u32 = 0x9f000;
 
 /// Fixed physical address every "tape" (see `shell.rs`'s `tape_run`) is
 /// always loaded at, and the size of the region set aside for it. Unlike
@@ -51,6 +51,22 @@ const RESERVED_BELOW: u32 = 0x98000;
 /// of which is its embedded sieve array) with headroom for future tapes.
 pub const TAPE_BASE: u32 = 0x100000;
 pub const TAPE_LEN: u32 = 4 * 1024 * 1024;
+
+/// Fixed physical address of the one-page protected-mode stack
+/// `boot/stage2.S`/`boot/netrom.S` use only during their own brief
+/// setup-then-far-jump-to-`kmain` window (and identically on a
+/// `soft_reboot` re-entry) -- see `stage2.S`'s own doc comment on
+/// `PROTECTED_STACK_TOP` for why it lives here (immediately after the
+/// tape region) rather than in the low conventional-memory range this
+/// kernel used to leave for it. Genuinely used only before `pmem`
+/// itself exists, but reserved here too, defensively, so this module's
+/// own general frame pool never hands this page to something else while
+/// the kernel is running -- relevant only for a `soft_reboot`, and even
+/// then not a real hazard (the old kernel's allocations are already
+/// moot by the time stage two re-runs from scratch), just cleaner
+/// bookkeeping.
+const PROTECTED_STACK_BASE: u32 = TAPE_BASE + TAPE_LEN;
+const PROTECTED_STACK_LEN: u32 = FRAME_SIZE;
 
 /// One bit per frame. `1` means "not available to the allocator" (either
 /// outside a usable E820 region, below `RESERVED_BELOW`, or already
@@ -149,6 +165,7 @@ pub fn initialize(info: &BootInfo) {
     // `allocate`/`allocate_contiguous`/`palloc` can never hand these
     // frames to anything else.
     reserve_range(TAPE_BASE, TAPE_LEN);
+    reserve_range(PROTECTED_STACK_BASE, PROTECTED_STACK_LEN);
     let (total, _) = stats();
     let (big_total, _) = big_stats();
     crate::println!(

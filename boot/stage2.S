@@ -6,6 +6,18 @@
 .set BOOT_INFO, 0x5000
 .set MEMORY_MAP, BOOT_INFO + 48
 .set MAX_MEMORY_REGIONS, 32
+# The protected-mode stack used only during stage two's own brief
+# setup-then-far-jump-to-kmain window (cold boot) or soft_reboot's
+# re-entry here -- never touched once the kernel's own entry.S stack
+# takes over. This is genuinely usable from the very first instruction
+# after the far jump into protected_entry: the flat GDT already loaded
+# there (see `gdt` below) covers a full 4 GiB, so this stack needs no
+# below-1-MiB constraint at all, unlike real mode. Placed immediately
+# after the fixed tape region (`pmem::TAPE_BASE`/`TAPE_LEN`, which is
+# never written to during boot) rather than the low conventional-memory
+# range just below the EBDA, freeing that entire range for the kernel's
+# own reserved region -- see AGENTS.md's "Low-memory map".
+.set PROTECTED_STACK_TOP, 0x501000
 .set COM1, 0x3f8
 .set DISK_REQUEST, 0x5400
 # DISK_REQUEST holds the protected-mode call arguments and a 16-byte EDD
@@ -667,7 +679,7 @@ protected_entry:
     movw %ax, %fs
     movw %ax, %gs
     movw %ax, %ss
-    movl $0x9f000, %esp
+    movl $PROTECTED_STACK_TOP, %esp
     movl $BOOT_INFO, %ebx
 
 
