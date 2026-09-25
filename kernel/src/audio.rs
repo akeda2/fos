@@ -210,11 +210,12 @@ impl PcmRing {
 pub enum Audio {
     Es1370(&'static es1370::Es1370),
     Hda(&'static hda::Hda),
-    /// A USB Audio Class playback device discovered over UHCI -- see
-    /// `uhci::UsbAudioDevice`'s own doc comment. Playback only: this
-    /// variant's `capture`-family methods always report zero, since
-    /// isochronous capture (IN) is not implemented (see `uhci.rs`'s
-    /// module doc comment and AGENTS.md's "USB" section).
+    /// A USB Audio Class device discovered over UHCI -- see
+    /// `uhci::UsbAudioDevice`'s own doc comment. A playback endpoint is
+    /// always required to reach this variant at all; a discovered
+    /// capture endpoint is optional, and this variant's `capture`-family
+    /// methods report zero bytes/periods (never an error) when the
+    /// device has none.
     Uhci(&'static uhci::UsbAudioDevice),
 }
 
@@ -232,6 +233,22 @@ impl Audio {
             Audio::Es1370(card) => card.format(),
             Audio::Hda(card) => card.format(),
             Audio::Uhci(device) => device.format(),
+        }
+    }
+
+    /// The *capture* direction's own format. For ES1370/HDA this is a
+    /// pure delegation back to `format()`: their real hardware genuinely
+    /// shares one format between playback and capture, so there is
+    /// nothing separate to compute. USB Audio Class devices make no such
+    /// guarantee -- the real TerraTec Aureon Dual's capture interface is
+    /// mono against a stereo playback format -- so `Audio::Uhci` answers
+    /// from its own, independently discovered capture endpoint instead;
+    /// see `UsbAudioDevice::capture_format`'s own doc comment.
+    pub fn capture_format(&self) -> AudioFormat {
+        match self {
+            Audio::Es1370(card) => card.format(),
+            Audio::Hda(card) => card.format(),
+            Audio::Uhci(device) => device.capture_format(),
         }
     }
 
@@ -341,9 +358,10 @@ impl Audio {
 /// three backends now share one flat `DEVICES` array -- see
 /// `initialize`'s own doc comment for why there is no per-backend cap
 /// here, only this one combined ceiling. There is no `uhci::MAX_INSTANCES`
-/// to add instead: `uhci::find_playback_device` only ever claims the
-/// first matching device across every controller/port, so at most one
-/// USB Audio device is ever possible here regardless.
+/// to add instead: `uhci::find_uac_device` only ever claims the first
+/// matching device across every controller/port, so at most one USB
+/// Audio device (covering both its playback and capture directions) is
+/// ever possible here regardless.
 pub const MAX_DEVICES: usize = es1370::MAX_INSTANCES + hda::MAX_INSTANCES + 1;
 
 static mut DEVICES: [Option<Audio>; MAX_DEVICES] = [const { None }; MAX_DEVICES];
@@ -421,7 +439,7 @@ pub fn initialize() -> Result<usize, Status> {
         // `MAX_DEVICES`'s own doc comment -- so this is a plain `if`,
         // not a loop like the two backends above.
         if DEVICE_COUNT < MAX_DEVICES {
-            if let Some(device) = uhci::discover_playback_device() {
+            if let Some(device) = uhci::discover_usb_audio_device() {
                 DEVICES[DEVICE_COUNT] = Some(Audio::Uhci(device));
                 DEVICE_COUNT += 1;
             }

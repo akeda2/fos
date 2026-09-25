@@ -206,12 +206,24 @@ pub struct Uhci {
     /// into either root port, one device at a time.
     qh_td_pool_addr: u32,
     /// A second, dedicated page of `ISOC_TD_COUNT` Transfer Descriptors
-    /// for isochronous streaming -- kept entirely separate from the
-    /// control pool above, since isochronous TDs are never linked from
-    /// a Queue Head and are indexed completely differently (a small
-    /// rotating pool driven by `IsocOutStream`, not a bounded per-call
-    /// chain).
+    /// for isochronous OUT (playback) streaming -- kept entirely separate
+    /// from the control pool above, since isochronous TDs are never
+    /// linked from a Queue Head and are indexed completely differently (a
+    /// small rotating pool driven by `IsocOutStream`, not a bounded
+    /// per-call chain).
     isoc_td_pool_addr: u32,
+    /// A third, dedicated page of `ISOC_TD_COUNT` Transfer Descriptors
+    /// for isochronous IN (capture), kept separate from `isoc_td_pool_addr`
+    /// above rather than shared with it: `audio.rs`'s facade keeps a
+    /// playback `IsocOutStream` continuously running from the moment any
+    /// USB Audio device is discovered, and a discovered capture endpoint's
+    /// `IsocInStream` is serviced right alongside it every
+    /// `poll_background_work` call -- both streams are genuinely active
+    /// at once whenever a device offers both directions (the real
+    /// TerraTec card does), so they cannot share one pool's `entries_written
+    /// % ISOC_TD_COUNT` slot indexing without one direction's TD writes
+    /// silently clobbering the other's.
+    isoc_capture_td_pool_addr: u32,
 }
 
 impl Uhci {
@@ -304,6 +316,28 @@ impl Uhci {
 
     fn read_isoc_td_control(&self, slot: usize) -> u32 {
         unsafe { core::ptr::read_volatile((self.isoc_td_addr(slot) + 4) as *const u32) }
+    }
+
+    fn isoc_capture_td_addr(&self, slot: usize) -> u32 {
+        self.isoc_capture_td_pool_addr + (slot as u32) * 16
+    }
+
+    /// The capture-side mirror of `write_isoc_td`, into the dedicated
+    /// capture pool (`isoc_capture_td_pool_addr`) instead -- see that
+    /// field's own doc comment for why playback and capture cannot share
+    /// one pool.
+    fn write_isoc_capture_td(&self, slot: usize, control: u32, token: u32, buffer: u32) {
+        let ptr = self.isoc_capture_td_addr(slot) as *mut RawTd;
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*ptr).link, LINK_TERMINATE);
+            core::ptr::write_volatile(&raw mut (*ptr).token, token);
+            core::ptr::write_volatile(&raw mut (*ptr).buffer, buffer);
+            core::ptr::write_volatile(&raw mut (*ptr).control, control);
+        }
+    }
+
+    fn read_isoc_capture_td_control(&self, slot: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((self.isoc_capture_td_addr(slot) + 4) as *const u32) }
     }
 
     fn write_qh(&self, link: u32, element: u32) {
@@ -701,14 +735,42 @@ impl Uhci {
     /// immediately; `IsocInStream::service` keeps that window filled and
     /// harvests completed receive TDs as real time advances.
     pub fn start_isoc_in(&self, device_addr: u8, endpoint: u8, packet_bytes: u16, base: u32, capacity: usize) -> IsocInStream {
+        self.start_isoc_in_stream(device_addr, endpoint, packet_bytes, IsocInSink::Buffer { base, capacity })
+    }
+
+    /// Begins capturing continuous, open-ended PCM from `endpoint` on
+    /// `device_addr`, pushing each received packet into a network-fed
+    /// `PcmRing` (the same ring `Es1370::drain_capture_period`/`Hda`'s own
+    /// capture path already fill, via `push`) -- `audio.rs`'s USB capture
+    /// backend. Unlike `start_isoc_in`, this never finishes on its own; a
+    /// short push (the ring already has an unread backlog) is counted
+    /// (`IsocInStream::overrun_count`), the capture-side counterpart to
+    /// `IsocOutStream::underrun_count`. Allocates a small dedicated
+    /// packet-copy pool (`ISOC_TD_COUNT` slots of `packet_bytes` each),
+    /// exactly like `start_isoc_ring_out`'s own reasoning: a ring has no
+    /// single fixed memory location for hardware to write a received
+    /// packet directly into. Returns `None` only if that allocation fails.
+    pub fn start_isoc_ring_in(
+        &self,
+        device_addr: u8,
+        endpoint: u8,
+        packet_bytes: u16,
+        ring: &'static audio::PcmRing,
+    ) -> Option<IsocInStream> {
+        let pool_bytes = ISOC_TD_COUNT * packet_bytes as usize;
+        let frames = (pool_bytes as u32).div_ceil(pmem::FRAME_SIZE) as usize;
+        let packet_pool_addr = pmem::allocate_contiguous(frames)?;
+        Some(self.start_isoc_in_stream(device_addr, endpoint, packet_bytes, IsocInSink::Ring { ring, packet_pool_addr }))
+    }
+
+    fn start_isoc_in_stream(&self, device_addr: u8, endpoint: u8, packet_bytes: u16, sink: IsocInSink) -> IsocInStream {
         let start_index =
             (self.read_frame_number() & FRAME_INDEX_MASK).wrapping_add(STARTUP_GUARD_FRAMES) & FRAME_INDEX_MASK;
         let mut stream = IsocInStream {
             device_addr,
             endpoint,
             packet_bytes,
-            base,
-            capacity,
+            sink,
             next_index: start_index,
             requested_bytes: 0,
             received_bytes: 0,
@@ -716,6 +778,7 @@ impl Uhci {
             started_index: start_index,
             entries_written: 0,
             error_count: 0,
+            overrun_count: 0,
         };
         for _ in 0..ISOC_TD_COUNT {
             stream.install_next(self);
@@ -966,40 +1029,52 @@ impl IsocOutStream {
     }
 }
 
+/// Where an `IsocInStream`'s received packet bytes go. `Buffer` is
+/// `usb capture`'s own use case: a fixed, pre-allocated region of known
+/// capacity, zero-copy (the TD's buffer pointer is `base +
+/// requested_bytes`, so hardware writes samples straight into their
+/// final position), finishing once every requested byte's TD has
+/// completed. `Ring` is `audio.rs`'s USB capture backend: continuous,
+/// open-ended data pushed into the same `PcmRing`
+/// `Es1370::drain_capture_period`/`Hda`'s own capture path already fill,
+/// via a small dedicated packet-copy pool (a receive TD needs *some*
+/// fixed physical destination to write into; a ring has no single one),
+/// and never finishing on its own.
+enum IsocInSink {
+    Buffer { base: u32, capacity: usize },
+    Ring { ring: &'static audio::PcmRing, packet_pool_addr: u32 },
+}
+
 /// A single active isochronous IN stream (USB Audio Class capture),
-/// returned by `Uhci::start_isoc_in`. The mirror image of
-/// `IsocOutStream`, reusing the identical Frame-List-window-priming
-/// machinery (and, deliberately, the *same* per-controller isoc TD
-/// pool -- this plan's scope never runs playback and capture
-/// simultaneously, so a second pool isn't needed yet; duplex would need
-/// to revisit this), but with the data flow reversed in a way that
-/// changes exactly one thing structurally: for OUT, the driver already
-/// knows each packet's exact content before installing its TD; for IN,
-/// hardware decides how many bytes it actually sends (`ActLen`, read
-/// back via `decode_actlen` once `Active` clears), so a completed TD's
-/// data must be *harvested* -- read out and accounted for -- before its
-/// pool slot is reused for a fresh receive TD.
-///
-/// Zero-copy, exactly like `IsocOutStream`'s own `Buffer` source: each
-/// receive TD's buffer pointer is `base + requested_bytes`, a
-/// pre-computed offset directly into the caller's destination (the
-/// shared tape staging buffer, for `usb capture`), so hardware writes
-/// received samples straight into their final position with no
-/// intermediate copy pool. A short packet (`ActLen < packet_bytes`,
-/// legitimate under Adaptive sync) simply leaves whatever was already at
-/// the unwritten tail of that slot -- an accepted imprecision for a raw
-/// diagnostic capture, not a byte-exact protocol.
+/// returned by `Uhci::start_isoc_in`/`start_isoc_ring_in`. The mirror
+/// image of `IsocOutStream` -- reusing the identical Frame-List-window-
+/// priming machinery, and, since `audio.rs`'s facade can have a playback
+/// `IsocOutStream` and a capture `IsocInStream` both genuinely active at
+/// once (see `Uhci::isoc_capture_td_pool_addr`'s own doc comment), backed
+/// by its *own* dedicated TD pool rather than sharing the OUT direction's
+/// -- but with the data flow reversed in a way that changes exactly one
+/// thing structurally: for OUT, the driver already knows each packet's
+/// exact content before installing its TD; for IN, hardware decides how
+/// many bytes it actually sends (`ActLen`, read back via `decode_actlen`
+/// once `Active` clears), so a completed TD's data must be *harvested* --
+/// read out and folded into `sink` -- before its pool slot is reused for
+/// a fresh receive TD. A short packet (`ActLen < packet_bytes`, legitimate
+/// under Adaptive sync) simply harvests fewer bytes than requested; for a
+/// `Buffer` sink this leaves whatever was already at the unwritten tail of
+/// that slot -- an accepted imprecision for a raw diagnostic capture, not
+/// a byte-exact protocol.
 pub struct IsocInStream {
     device_addr: u8,
     endpoint: u8,
     packet_bytes: u16,
-    base: u32,
-    capacity: usize,
+    sink: IsocInSink,
     next_index: u16,
     /// Upper-bound bytes ever requested (each installed TD's `MaxLen`
     /// summed) -- known immediately at install time, the "should I
-    /// request more" check, exactly like `IsocOutStream`'s
-    /// `installed_bytes` for its `Buffer` source.
+    /// request more" check for a `Buffer` sink, exactly like
+    /// `IsocOutStream`'s `installed_bytes` for its `Buffer` source.
+    /// Purely a diagnostic running total for `Ring`, which never stops
+    /// requesting.
     requested_bytes: usize,
     /// Bytes actually confirmed received so far (summed `ActLen` across
     /// every harvested TD) -- only known after a full round trip, and
@@ -1009,37 +1084,57 @@ pub struct IsocInStream {
     started_index: u16,
     entries_written: u32,
     error_count: u32,
+    /// How many harvested packets, for a `Ring`-sourced stream, found the
+    /// ring already full and had some or all of their bytes dropped --
+    /// the isochronous-IN counterpart to `IsocOutStream::underrun_count`,
+    /// mirroring `Es1370::drain_capture_period`'s identical "short push ->
+    /// overrun" accounting. Always 0 for a `Buffer`-sourced stream (there
+    /// is no ring to overrun).
+    overrun_count: u32,
 }
 
 impl IsocInStream {
+    /// Whether a `Buffer`-sourced stream has requested every byte of
+    /// `capacity` already -- always `false` for `Ring`, which never
+    /// finishes on its own.
     fn request_exhausted(&self) -> bool {
-        self.requested_bytes >= self.capacity
+        matches!(self.sink, IsocInSink::Buffer { capacity, .. } if self.requested_bytes >= capacity)
     }
 
     /// Reads back one already-completed receive TD's actual length and
-    /// error status, folding it into `received_bytes`/`error_count`.
-    /// Called for pool slot `slot` exactly once per TD ever installed
-    /// there -- either just before `install_next` reuses that slot for a
-    /// fresh receive TD, or, for the final un-recycled batch, from
-    /// `service`'s own tail scan once capture stops (mirroring
-    /// `IsocOutStream::service`'s identical tail-scan reasoning for
-    /// errors: every pool slot holds exactly the last TD ever written to
-    /// it, and any slot reused earlier was already harvested at that
-    /// reuse point, so scanning every slot once at the end is correct
-    /// and never double-counts).
+    /// error status, folding it into `received_bytes`/`error_count` and,
+    /// for a `Ring` sink, copying the received bytes out of that slot's
+    /// fixed scratch-pool position into the ring (counting
+    /// `overrun_count` on a short push). Called for pool slot `slot`
+    /// exactly once per TD ever installed there -- either just before
+    /// `install_next` reuses that slot for a fresh receive TD, or, for
+    /// the final un-recycled batch, from `service`'s own tail scan once
+    /// capture stops (mirroring `IsocOutStream::service`'s identical
+    /// tail-scan reasoning for errors: every pool slot holds exactly the
+    /// last TD ever written to it, and any slot reused earlier was
+    /// already harvested at that reuse point, so scanning every slot
+    /// once at the end is correct and never double-counts).
     fn harvest(&mut self, uhci: &Uhci, slot: usize) {
-        let control = uhci.read_isoc_td_control(slot);
+        let control = uhci.read_isoc_capture_td_control(slot);
         if control & TD_CTRL_ERROR_MASK != 0 {
             self.error_count += 1;
             return;
         }
-        self.received_bytes += decode_actlen(control);
+        let actual = decode_actlen(control);
+        if let IsocInSink::Ring { ring, packet_pool_addr } = self.sink {
+            let buffer_addr = packet_pool_addr + (slot as u32) * u32::from(self.packet_bytes);
+            let received = unsafe { core::slice::from_raw_parts(buffer_addr as *const u8, actual) };
+            if ring.push(received) < actual {
+                self.overrun_count += 1;
+            }
+        }
+        self.received_bytes += actual;
     }
 
     /// Harvests the previous occupant of the next pool slot (if any),
     /// then writes a fresh receive TD there and points this stream's
-    /// next Frame List entry at it. A no-op once `requested_bytes` has
-    /// already reached `capacity`.
+    /// next Frame List entry at it. A no-op once a `Buffer` stream's
+    /// `requested_bytes` has already reached `capacity`.
     fn install_next(&mut self, uhci: &Uhci) {
         if self.request_exhausted() {
             return;
@@ -1048,9 +1143,17 @@ impl IsocInStream {
         if self.entries_written as usize >= ISOC_TD_COUNT {
             self.harvest(uhci, pool_slot);
         }
-        let chunk = (self.capacity - self.requested_bytes).min(self.packet_bytes as usize);
-        let buffer_addr = self.base + self.requested_bytes as u32;
-        uhci.write_isoc_td(
+        let (chunk, buffer_addr) = match self.sink {
+            IsocInSink::Buffer { base, capacity } => {
+                let chunk = (capacity - self.requested_bytes).min(self.packet_bytes as usize);
+                (chunk, base + self.requested_bytes as u32)
+            }
+            IsocInSink::Ring { packet_pool_addr, .. } => {
+                let chunk = self.packet_bytes as usize;
+                (chunk, packet_pool_addr + (pool_slot as u32) * u32::from(self.packet_bytes))
+            }
+        };
+        uhci.write_isoc_capture_td(
             pool_slot,
             TD_CTRL_ACTIVE | TD_CTRL_IOS,
             PID_IN
@@ -1059,7 +1162,7 @@ impl IsocInStream {
                 | (encode_len(chunk) << TD_TOKEN_MAXLEN_SHIFT),
             buffer_addr,
         );
-        uhci.write_frame_list_entry(self.next_index, uhci.isoc_td_addr(pool_slot));
+        uhci.write_frame_list_entry(self.next_index, uhci.isoc_capture_td_addr(pool_slot));
         self.last_pool_slot = pool_slot;
         self.requested_bytes += chunk;
         self.next_index = self.next_index.wrapping_add(1) & FRAME_INDEX_MASK;
@@ -1067,12 +1170,15 @@ impl IsocInStream {
     }
 
     /// Keeps this stream's look-ahead window filled, and reports whether
-    /// it's done -- see `IsocOutStream::service`'s own doc comment for
-    /// why the window-tracking math must use a signed gap (a caller that
-    /// goes a while between calls must resync a few frames ahead of
-    /// *now*, not silently stall forever). Call this repeatedly from a
-    /// foreground polling loop (`usb capture`) -- there is no interrupt
-    /// driving an `IsocInStream` on its own.
+    /// it's done -- always `IsocStatus::Streaming` for a `Ring`-sourced
+    /// stream, which never finishes on its own. See
+    /// `IsocOutStream::service`'s own doc comment for why the
+    /// window-tracking math must use a signed gap (a caller that goes a
+    /// while between calls must resync a few frames ahead of *now*, not
+    /// silently stall forever). Call this repeatedly from a foreground
+    /// polling loop (`usb capture`, or `audio.rs`'s `poll_background_work`
+    /// hook) -- there is no interrupt driving an `IsocInStream` on its
+    /// own.
     pub fn service(&mut self, uhci: &Uhci) -> IsocStatus {
         let current = uhci.read_frame_number() & FRAME_INDEX_MASK;
 
@@ -1094,7 +1200,7 @@ impl IsocInStream {
             }
             self.install_next(uhci);
         }
-        if self.request_exhausted() && uhci.read_isoc_td_control(self.last_pool_slot) & TD_CTRL_ACTIVE == 0 {
+        if self.request_exhausted() && uhci.read_isoc_capture_td_control(self.last_pool_slot) & TD_CTRL_ACTIVE == 0 {
             // The final `ISOC_TD_COUNT` receive TDs are never recycled by
             // `install_next` (capture stops before their pool slot would
             // be reused), so this is the only chance to harvest them.
@@ -1115,6 +1221,19 @@ impl IsocInStream {
     /// final packet or an error means this can be less than `capacity`.
     pub fn received_bytes(&self) -> usize {
         self.received_bytes
+    }
+
+    /// How many harvested packets, for a `Ring`-sourced stream, found the
+    /// ring already full -- see the field's own doc comment.
+    pub fn overrun_count(&self) -> u32 {
+        self.overrun_count
+    }
+
+    /// How many Frame List entries this stream has ever installed -- the
+    /// `periods_serviced`/`entries_written` analog `UsbAudioDevice`
+    /// reports for capture, mirroring `IsocOutStream::entries_written`.
+    pub fn entries_written(&self) -> u32 {
+        self.entries_written
     }
 
     /// Restores every Frame List entry this stream ever wrote into back
@@ -1161,6 +1280,9 @@ fn init_controller(address: PciAddress) -> Result<(), Error> {
     let Some(isoc_td_pool_addr) = pmem::allocate() else {
         return Err(Error::InitFailed);
     };
+    let Some(isoc_capture_td_pool_addr) = pmem::allocate() else {
+        return Err(Error::InitFailed);
+    };
 
     let controller = Uhci {
         instance,
@@ -1169,6 +1291,7 @@ fn init_controller(address: PciAddress) -> Result<(), Error> {
         frame_list_addr,
         qh_td_pool_addr,
         isoc_td_pool_addr,
+        isoc_capture_td_pool_addr,
     };
     controller.reset_and_start();
 
@@ -1241,7 +1364,7 @@ pub fn get(index: usize) -> Option<&'static Uhci> {
 /// by 1000 (so every isochronous packet is the same fixed size for the
 /// whole stream -- a device like a 44100 Hz one, which would need a
 /// varying packet size frame-to-frame, is deliberately out of scope; see
-/// AGENTS.md's "USB" section), and a Synchronous or Adaptive (not
+/// AGENTS.md's "UHCI" section), and a Synchronous or Adaptive (not
 /// Asynchronous, which would need an unimplemented feedback endpoint)
 /// isochronous endpoint whose declared `wMaxPacketSize` is at least this
 /// nominal per-frame byte count. `packet_bytes` is always that computed
@@ -1255,6 +1378,7 @@ pub fn get(index: usize) -> Option<&'static Uhci> {
 /// negligible; real feedback-based rate adaptation for a long-running
 /// Adaptive stream remains explicitly out of scope, the same limit
 /// already covering Asynchronous sync devices outright.
+#[derive(Clone, Copy)]
 pub struct UacEndpoint {
     pub interface_number: u8,
     pub alternate_setting: u8,
@@ -1396,7 +1520,7 @@ fn find_uac_endpoint(config: &[u8], want_in: bool) -> Option<UacEndpoint> {
 /// deliberately, not via two independent calls: this project found,
 /// empirically, that two full resets of the same real device back to
 /// back with no settle time between them can intermittently fail (see
-/// AGENTS.md's "USB" section) -- unifying discovery into one pass avoids
+/// AGENTS.md's "UHCI" section) -- unifying discovery into one pass avoids
 /// ever risking that within a single boot. Mirrors
 /// `enumerate_usb_port`'s own "reset and redo everything from scratch"
 /// sequence rather than depending on a separate, prior `usb` call having
@@ -1468,11 +1592,14 @@ pub fn find_uac_device() -> Option<(&'static Uhci, UacDevice)> {
 }
 
 /// The `audio.rs`-facing wrapper around one discovered, already-`SET_
-/// INTERFACE`d USB Audio Class playback device: an `IsocOutStream`
-/// continuously primed from a dedicated `PcmRing`, plus the endpoint
-/// metadata needed to answer `format()`. `UnsafeCell` interior
-/// mutability mirrors `PcmRing`'s own established "single-threaded, no
-/// real locking, `unsafe` mutation through a shared reference" pattern
+/// INTERFACE`d USB Audio Class device: an `IsocOutStream` continuously
+/// primed from a dedicated `PcmRing` for playback (always present --
+/// `discover_usb_audio_device` requires a playback endpoint), plus an
+/// optional `IsocInStream` for capture (`None` when the device has no
+/// microphone interface at all), and the endpoint metadata needed to
+/// answer `format()`/`capture_format()`. `UnsafeCell` interior mutability
+/// mirrors `PcmRing`'s own established "single-threaded, no real
+/// locking, `unsafe` mutation through a shared reference" pattern
 /// (`audio.rs`'s own safety-argument doc comment already justifies this
 /// once; this type relies on the identical reasoning, since only ever
 /// one foreground command/tape drives this kernel at a time).
@@ -1481,6 +1608,8 @@ pub struct UsbAudioDevice {
     endpoint: UacEndpoint,
     ring: &'static audio::PcmRing,
     stream: UnsafeCell<IsocOutStream>,
+    capture_endpoint: Option<UacEndpoint>,
+    capture_stream: UnsafeCell<Option<IsocInStream>>,
 }
 
 // Safety: see the struct's own doc comment -- exactly the same
@@ -1493,6 +1622,10 @@ impl UsbAudioDevice {
         unsafe { &mut *self.stream.get() }
     }
 
+    fn capture_stream(&self) -> Option<&mut IsocInStream> {
+        unsafe { (*self.capture_stream.get()).as_mut() }
+    }
+
     pub fn driver_name(&self) -> &'static str {
         "USB Audio"
     }
@@ -1502,6 +1635,23 @@ impl UsbAudioDevice {
             sample_rate: self.endpoint.sample_rate,
             channels: self.endpoint.channels,
             bits_per_sample: self.endpoint.bits_per_sample,
+        }
+    }
+
+    /// The capture direction's own format -- genuinely independent of
+    /// `format()`'s playback numbers on real hardware (the TerraTec
+    /// Aureon Dual's capture interface is mono against a stereo playback
+    /// format), unlike ES1370/HDA where one shared format legitimately
+    /// describes both directions. Falls back to the playback format when
+    /// no capture endpoint was ever discovered -- a harmless default,
+    /// since `capture`/`capture_backlog` already report zero bytes in
+    /// that case regardless of what format a caller thinks it's reading.
+    pub fn capture_format(&self) -> audio::AudioFormat {
+        let endpoint = self.capture_endpoint.as_ref().unwrap_or(&self.endpoint);
+        audio::AudioFormat {
+            sample_rate: endpoint.sample_rate,
+            channels: endpoint.channels,
+            bits_per_sample: endpoint.bits_per_sample,
         }
     }
 
@@ -1524,7 +1674,7 @@ impl UsbAudioDevice {
     }
 
     /// No interrupt exists for this backend at all -- every isochronous
-    /// packet is sent from foreground polling (`service_active_playback`,
+    /// packet is sent from foreground polling (`service_active_audio`,
     /// via `poll_background_work`), so `irq`/`interrupt_count` are
     /// always `None`/`0`. `entries_written` (one Frame List entry per
     /// packet) is the closest analog to `periods_serviced`.
@@ -1543,29 +1693,30 @@ impl UsbAudioDevice {
         0
     }
 
-    /// Isochronous capture (IN) is not implemented for this backend
-    /// (see `uhci.rs`'s own module doc comment and AGENTS.md's "USB"
-    /// section) -- always reports zero bytes captured, matching
-    /// `capture`'s own documented "zero simply means nothing captured
-    /// yet" contract. Not a lie: it is simply never yet true here.
-    pub fn capture(&self, _out: &mut [u8]) -> usize {
-        0
+    /// Copies out whatever captured PCM bytes are currently available --
+    /// see `Es1370::capture`'s identical contract. Zero (not an error)
+    /// whenever no capture endpoint was ever discovered for this device,
+    /// matching `capture`'s own documented "zero simply means nothing
+    /// captured yet" convention across every backend.
+    pub fn capture(&self, out: &mut [u8]) -> usize {
+        unsafe { USB_AUDIO_CAPTURE_RING.pop_upto(out.as_mut_ptr(), out.len()) }
     }
 
     pub fn capture_overrun_count(&self) -> u32 {
-        0
+        self.capture_stream().map(|stream| stream.overrun_count()).unwrap_or(0)
     }
 
     pub fn capture_backlog(&self) -> usize {
-        0
+        USB_AUDIO_CAPTURE_RING.available()
     }
 
     pub fn capture_periods(&self) -> u32 {
-        0
+        self.capture_stream().map(|stream| stream.entries_written()).unwrap_or(0)
     }
 }
 
 static USB_AUDIO_RING: audio::PcmRing = audio::PcmRing::new();
+static USB_AUDIO_CAPTURE_RING: audio::PcmRing = audio::PcmRing::new();
 /// A single-element array, not a bare `Option`, purely so every access
 /// goes through indexing -- mirroring `CONTROLLERS`'s own established
 /// pattern in this file -- rather than taking a shared reference to a
@@ -1574,14 +1725,19 @@ static USB_AUDIO_RING: audio::PcmRing = audio::PcmRing::new();
 static mut USB_AUDIO_DEVICE: [Option<UsbAudioDevice>; 1] = [None];
 static mut USB_AUDIO_DISCOVERED: bool = false;
 
-/// Discovers a USB Audio Class playback device (once -- see below) and
-/// begins continuously streaming `USB_AUDIO_RING` to it, for `audio.rs`'s
-/// `Audio::Uhci` variant. Exactly like `audio.rs`'s own "discover once at
-/// first use, never rescanned" model for ES1370/HDA: a device plugged in
-/// *after* the first call simply isn't found until the next boot -- USB
-/// hot-plug support is not something this facade's "discover once"
-/// design attempts anywhere, for any backend.
-pub fn discover_playback_device() -> Option<&'static UsbAudioDevice> {
+/// Discovers a USB Audio Class device (once -- see below) and begins
+/// continuously streaming `USB_AUDIO_RING` to its playback endpoint (a
+/// device with no playback endpoint at all is not usable here, matching
+/// every other USB Audio entry point in this file) and, when the same
+/// device also offers a capture endpoint, continuously draining its
+/// received packets into `USB_AUDIO_CAPTURE_RING` too -- both directions
+/// serviced every `poll_background_work` call via `service_active_audio`.
+/// Exactly like `audio.rs`'s own "discover once at first use, never
+/// rescanned" model for ES1370/HDA: a device plugged in *after* the first
+/// call simply isn't found until the next boot -- USB hot-plug support is
+/// not something this facade's "discover once" design attempts anywhere,
+/// for any backend.
+pub fn discover_usb_audio_device() -> Option<&'static UsbAudioDevice> {
     unsafe {
         if USB_AUDIO_DISCOVERED {
             return USB_AUDIO_DEVICE[0].as_ref();
@@ -1596,30 +1752,47 @@ pub fn discover_playback_device() -> Option<&'static UsbAudioDevice> {
     let stream =
         controller.start_isoc_ring_out(DEVICE_ADDRESS, endpoint_number, endpoint.packet_bytes, &USB_AUDIO_RING)?;
 
+    // A capture stream is genuinely optional: a playback-only device (or
+    // one where the capture pool allocation happens to fail) simply
+    // leaves `capture_stream`/`capture_endpoint` at `None`, and every
+    // `UsbAudioDevice` capture method above already treats that as "zero
+    // bytes captured", not a fatal error for the whole device.
+    let capture_endpoint = device.capture;
+    let capture_stream = capture_endpoint.and_then(|capture| {
+        let capture_endpoint_number = capture.endpoint_address & 0x0f;
+        controller.start_isoc_ring_in(DEVICE_ADDRESS, capture_endpoint_number, capture.packet_bytes, &USB_AUDIO_CAPTURE_RING)
+    });
+
     unsafe {
         USB_AUDIO_DEVICE[0] = Some(UsbAudioDevice {
             controller,
             endpoint,
             ring: &USB_AUDIO_RING,
             stream: UnsafeCell::new(stream),
+            capture_endpoint,
+            capture_stream: UnsafeCell::new(capture_stream),
         });
         USB_AUDIO_DEVICE[0].as_ref()
     }
 }
 
-/// Keeps the active USB Audio playback stream's look-ahead window
-/// filled, if one was ever discovered -- called unconditionally from
-/// `poll_background_work` (`shell.rs`), the same "cheap to call from
+/// Keeps the active USB Audio device's playback stream, and its capture
+/// stream if one was discovered, both primed -- called unconditionally
+/// from `poll_background_work` (`shell.rs`), the same "cheap to call from
 /// every long-running foreground loop" slot `nic.watchdog()` already
 /// occupies there. There is no interrupt or other background path
-/// driving this stream on its own: sitting idle at the local prompt
-/// (where `poll_background_work` is never reached) starves it, unlike
-/// ES1370/HDA's ISR-driven playback, which keeps running regardless --
-/// the honest tradeoff of having no isochronous IRQ path at all.
-pub fn service_active_playback() {
+/// driving either stream on its own: sitting idle at the local prompt
+/// (where `poll_background_work` is never reached) starves them, unlike
+/// ES1370/HDA's ISR-driven playback/capture, which keeps running
+/// regardless -- the honest tradeoff of having no isochronous IRQ path
+/// at all.
+pub fn service_active_audio() {
     unsafe {
         if let Some(device) = USB_AUDIO_DEVICE[0].as_ref() {
             device.stream().service(device.controller);
+            if let Some(capture) = device.capture_stream() {
+                capture.service(device.controller);
+            }
         }
     }
 }

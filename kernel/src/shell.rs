@@ -858,11 +858,10 @@ fn print_pci_devices() {
 /// reads, `SET_CONFIGURATION`) every time this command runs -- the same
 /// "read directly from hardware, print it" ethos as `pci`, deliberately
 /// re-run from a known state each call rather than cached, since a real
-/// device can be unplugged/replugged between commands. Isochronous
-/// transfers and USB Audio Class descriptor parsing are not implemented
-/// yet (see `uhci.rs`'s own module doc comment and AGENTS.md's "USB"
-/// section) -- this command's whole job is proving enumeration itself
-/// works, with no audio-specific code involved at all.
+/// device can be unplugged/replugged between commands. This command's
+/// own job stops at enumeration -- isochronous transfers and USB Audio
+/// Class descriptor parsing (see `usb play`/`usb capture` below, and
+/// AGENTS.md's "UHCI" section) are deliberately not involved here at all.
 fn print_usb_devices() {
     let count = uhci::count();
     if count == 0 {
@@ -992,7 +991,7 @@ fn enumerate_usb_port(port_number: u8, controller: &uhci::Uhci, port: u8) {
 /// `usb` (no arguments) prints every controller/port, exactly as before;
 /// `usb play [diskN] NAME` streams a raw PCM file to whatever USB Audio
 /// Class playback device it can find, over a real isochronous OUT
-/// transfer -- see `uhci.rs`'s `IsocOutStream` and AGENTS.md's "USB"
+/// transfer -- see `uhci.rs`'s `IsocOutStream` and AGENTS.md's "UHCI"
 /// section for the design.
 fn usb_command(info: &BootInfo, arguments: &[u8]) {
     const USAGE: &str = "Usage: usb | usb play [diskN] NAME | usb capture [diskN] NAME";
@@ -1286,8 +1285,21 @@ fn audio_status() {
             device.ring_backlog(),
             audio::RING_CAPACITY_BYTES
         );
+        // A separate format line, not folded into the playback one above:
+        // ES1370/HDA's ADC always shares that same format, but a USB
+        // Audio device's capture endpoint is not guaranteed to (the real
+        // TerraTec Aureon Dual's own microphone is mono against a stereo
+        // playback format) -- see `Audio::capture_format`'s own doc
+        // comment.
+        let capture_format = device.capture_format();
         println!(
-            "  ADC: {} periods captured; overruns (ring full): {}.",
+            "  ADC: {} Hz / {}ch / {}-bit.",
+            capture_format.sample_rate,
+            capture_format.channels,
+            capture_format.bits_per_sample
+        );
+        println!(
+            "  {} periods captured; overruns (ring full): {}.",
             device.capture_periods(),
             device.capture_overrun_count()
         );
@@ -2366,11 +2378,11 @@ fn relay_pending_tape_output(nic: &nic::Nic, peer: &[u8; 6], source: &[u8; 6]) {
 fn poll_background_work(nic: Option<&nic::Nic>) {
     relay_pending_print_output();
     // Unconditional (unlike everything below, which needs a NIC): keeps
-    // an active USB Audio playback stream's Frame List window filled,
-    // if `audio::initialize()` ever discovered one. There is no IRQ
-    // driving it on its own -- see `uhci::service_active_playback`'s own
-    // doc comment.
-    uhci::service_active_playback();
+    // an active USB Audio device's playback (and, if discovered, capture)
+    // stream's Frame List window filled, if `audio::initialize()` ever
+    // discovered one. There is no IRQ driving either stream on its own --
+    // see `uhci::service_active_audio`'s own doc comment.
+    uhci::service_active_audio();
     let Some(nic) = nic else { return };
     if console::relay_enabled() {
         if let (Some(peer), Some(source)) =
@@ -4293,6 +4305,22 @@ fn elf_u32(image: &[u8], offset: usize) -> Result<u32, &'static str> {
 ///   needs no change at all. Every
 ///   existing tape in this repository ignores all nine of these audio
 ///   callbacks, exactly like any other trailing argument under cdecl.
+/// - `tape_audio_capture_sample_rate`/`tape_audio_capture_channels_and_bits`
+///   (device 0) and their `_at`-suffixed counterparts are the final four
+///   callbacks, added because USB Audio Class capture (`uhci.rs`) broke
+///   the assumption every earlier callback relied on: that one shared
+///   format describes both `audio_submit`'s playback bytes and
+///   `audio_capture`'s recorded ones. True for ES1370/HDA's real
+///   hardware, but not for a real USB device whose capture interface can
+///   have (and, on the physically tested TerraTec Aureon Dual, does have)
+///   a genuinely different channel count from its own playback interface.
+///   These four report the *capture* direction's own format instead --
+///   identical to `audio_sample_rate`/`audio_channels_and_bits` for
+///   ES1370/HDA, where both directions already share one format, but a
+///   real, independently discovered answer for USB. A tape recording from
+///   any device must consult these, not `audio_sample_rate`/
+///   `audio_channels_and_bits`, to interpret `audio_capture`'s bytes
+///   correctly.
 ///
 /// (A tape is still ring-0 code and technically free to ignore any of
 /// these callbacks and touch hardware -- or `pmem` -- directly anyway --
@@ -4733,6 +4761,52 @@ extern "C" fn tape_audio_capture_at(index: u32, out: u32, capacity: u32) -> u32 
     let buffer =
         unsafe { core::slice::from_raw_parts_mut(out as *mut u8, capacity as usize) };
     device.capture(buffer) as u32
+}
+
+/// The *capture*-direction counterpart to `tape_audio_sample_rate`. For
+/// ES1370/HDA this reports the same number `tape_audio_sample_rate`
+/// already does -- their real hardware genuinely shares one format
+/// between playback and capture -- but a USB Audio Class device is not
+/// guaranteed to (the real TerraTec Aureon Dual's capture interface is
+/// mono against a stereo playback format), so a tape recording from any
+/// device must consult this rather than assuming `tape_audio_sample_rate`
+/// describes captured bytes too. Returns zero if no device is present.
+extern "C" fn tape_audio_capture_sample_rate() -> u32 {
+    match audio::get() {
+        Ok(device) => device.capture_format().sample_rate,
+        Err(_) => 0,
+    }
+}
+
+/// The capture-direction counterpart to `tape_audio_channels_and_bits` --
+/// see that callback's own doc comment for the packing convention.
+extern "C" fn tape_audio_capture_channels_and_bits() -> u32 {
+    match audio::get() {
+        Ok(device) => {
+            let format = device.capture_format();
+            format.channels as u32 | ((format.bits_per_sample as u32) << 8)
+        }
+        Err(_) => 0,
+    }
+}
+
+/// The `_at`-suffixed counterpart to `tape_audio_capture_sample_rate`.
+extern "C" fn tape_audio_capture_sample_rate_at(index: u32) -> u32 {
+    match audio::get_at(index as usize) {
+        Some(device) => device.capture_format().sample_rate,
+        None => 0,
+    }
+}
+
+/// The `_at`-suffixed counterpart to `tape_audio_capture_channels_and_bits`.
+extern "C" fn tape_audio_capture_channels_and_bits_at(index: u32) -> u32 {
+    match audio::get_at(index as usize) {
+        Some(device) => {
+            let format = device.capture_format();
+            format.channels as u32 | ((format.bits_per_sample as u32) << 8)
+        }
+        None => 0,
+    }
 }
 
 /// Copies one raw Ethernet frame into `out`, returning its full length or
@@ -5264,6 +5338,10 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
         audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
         audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
+        audio_capture_sample_rate: extern "C" fn() -> u32,
+        audio_capture_channels_and_bits: extern "C" fn() -> u32,
+        audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
+        audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -5302,6 +5380,10 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_audio_channels_and_bits_at,
         tape_audio_submit_at,
         tape_audio_capture_at,
+        tape_audio_capture_sample_rate,
+        tape_audio_capture_channels_and_bits,
+        tape_audio_capture_sample_rate_at,
+        tape_audio_capture_channels_and_bits_at,
     );
     unsafe {
         TAPE_BOOT_INFO = core::ptr::null();

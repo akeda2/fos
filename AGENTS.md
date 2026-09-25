@@ -1273,11 +1273,8 @@ within a single boot, rather than rediscovering it a second time by
 building capture's own independent reset path.
 
 `IsocInStream` (`uhci.rs`) is `IsocOutStream`'s mirror image, reusing
-the identical Frame-List-window-priming machinery (and, deliberately,
-the *same* per-controller isoc TD pool -- this increment never runs
-playback and capture simultaneously, so a second pool isn't needed yet;
-true duplex would have to revisit this) but with the data flow
-reversed in the one way that actually matters: for OUT, the driver
+the identical Frame-List-window-priming machinery, but with the data
+flow reversed in the one way that actually matters: for OUT, the driver
 already knows each packet's exact content before installing its TD; for
 IN, hardware decides how many bytes it actually sends (`ActLen`, read
 back via the already-existing `decode_actlen` once `Active` clears), so
@@ -1305,17 +1302,69 @@ across repeated runs. `usb play` was re-confirmed working unchanged on
 the same real device after the discovery unification, both independently
 and immediately alongside a capture session on the other interface.
 
-Wiring a discovered capture endpoint into `audio.rs`'s
-`Audio::Uhci::capture()` (currently still a stub always reporting zero,
-matching `capture`'s own documented "zero simply means nothing captured
-yet" contract -- not a lie, just not yet true for this backend) remains
-explicit follow-on work: this facade's `AudioFormat`/`format()` contract
-assumes one shared format describes both directions, true for ES1370/
-HDA's real hardware but not guaranteed for USB (this real device's own
-capture is mono against a stereo playback format) -- a
-`capture_format()`/tape-ABI extension is a real, durable-interface
-decision to make deliberately when that integration is actually built,
-not something to bolt on silently.
+#### `audio.rs` integration for capture: `capture_format()`, and a genuinely concurrent second TD pool
+
+Wiring the discovered capture endpoint into `audio.rs`'s
+`Audio::Uhci::capture()` (previously a stub always reporting zero) reused
+playback's own wiring shape almost exactly: `discover_playback_device`
+became `discover_usb_audio_device`, now starting an `IsocInStream` via a
+new `Uhci::start_isoc_ring_in` (mirroring `start_isoc_ring_out`'s own
+`Ring` source -- a small dedicated packet-copy pool, since a received
+packet has no single fixed ring address to land in) whenever the
+discovered device also offers a capture endpoint, and
+`service_active_playback` became `service_active_audio`, servicing both
+streams from the one `poll_background_work` call. `IsocInStream` itself
+grew a matching `IsocInSink` enum (`Buffer`/`Ring`, exactly mirroring
+`IsocOutSource`), with a new `overrun_count` (the capture-side
+counterpart to `underrun_count`, incremented on a short `PcmRing::push`
+exactly like `Es1370::drain_capture_period`'s identical accounting).
+
+This surfaced a real, previously undocumented hazard before it could
+ever bite on real hardware: `usb capture`'s original `IsocInStream`
+shared its per-controller isoc TD pool with `IsocOutStream`, safe only
+because that earlier increment never ran playback and capture at the
+same time. `audio.rs`'s facade keeps a playback stream continuously
+running from the moment *any* USB Audio device is discovered, so
+starting a capture stream alongside it on a device offering both
+directions -- exactly the real TerraTec card -- means both streams are
+now genuinely active at once. Sharing one pool's `entries_written %
+ISOC_TD_COUNT` slot indexing between two independently-counting streams
+would let one direction's TD writes silently clobber the other's. The
+fix: `Uhci` gained a second, dedicated `isoc_capture_td_pool_addr` page
+(a fourth `pmem::allocate` call in `init_controller`, alongside the
+existing frame list/control pool/OUT isoc pool) with its own
+`isoc_capture_td_addr`/`write_isoc_capture_td`/
+`read_isoc_capture_td_control` methods, used exclusively by
+`IsocInStream`.
+
+`Audio::capture_format()` is the new facade method this integration
+needed: for ES1370/HDA it is a pure delegation back to `format()` (their
+real hardware genuinely shares one format between directions, so there
+is nothing separate to compute), but `UsbAudioDevice::capture_format()`
+answers from its own, independently discovered capture endpoint instead,
+confirmed necessary by the real device: the TerraTec Aureon Dual's own
+capture interface is mono against its stereo playback format. Four new,
+purely additive tape-ABI callbacks --
+`tape_audio_capture_sample_rate`/`tape_audio_capture_channels_and_bits`
+(device 0) and their `_at`-suffixed counterparts, appended at the very
+end of `TapeEntry`'s parameter list following this project's established
+"cdecl caller-cleans, existing tapes ignore the extra trailing stack
+slots" convention -- let a tape correctly interpret `audio_capture`'s
+bytes without assuming they share `audio_sample_rate`'s own numbers.
+
+Verified against the real TerraTec card (no QEMU capture support exists,
+as established above, so this remains manual/real-hardware-only): the
+`audio` command's own status output now prints the capture format on its
+own line, confirmed genuinely independent of the playback line --
+`[0] USB Audio ...: 48000 Hz / 2ch / 16-bit.` immediately followed by
+`ADC: 48000 Hz / 1ch / 16-bit.` -- and, with both directions running
+simultaneously (the playback stream continuously priming silence with no
+tape ever submitting to it, and the capture stream draining the real
+microphone), both reported exactly 250 periods serviced with zero
+underruns beyond the expected "nothing submitted yet" ones and zero
+capture overruns or packet errors on either side, confirming the
+dedicated second TD pool actually prevents the slot-collision hazard
+described above rather than merely avoiding it by accident.
 
 ### Tape print callback ABI
 
@@ -2365,8 +2414,11 @@ MSI address/data encoding, and the full verification list) is in
   is no longer fully deferred -- see "UHCI: a USB host controller driver,
   and isochronous USB Audio playback" above for what's built (enumeration,
   isochronous OUT/playback, isochronous IN/capture via `usb capture`, and
-  `audio.rs`/tape-ABI integration for playback); wiring capture into
-  `audio.rs` and EHCI/OHCI/xHCI remain deferred.
+  `audio.rs`/tape-ABI integration for both directions, confirmed running
+  genuinely concurrently on real hardware); EHCI/OHCI/xHCI remain
+  deferred, and no tape yet exercises simultaneous playback+capture
+  through the tape ABI itself even though the underlying engine now
+  supports it.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.
