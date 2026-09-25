@@ -16,9 +16,11 @@
 //! tape run static LOCAL_IP/PREFIX GATEWAY [PORT]
 //! tape run static LOCAL_IP/PREFIX GATEWAY send NAME PEER_IP [PEER_PORT]
 //! tape run static LOCAL_IP/PREFIX GATEWAY capture PEER_IP [PEER_PORT]
+//! tape run static LOCAL_IP/PREFIX GATEWAY duplex PEER_IP [PEER_PORT]
 //! tape run dhcp [PORT]
 //! tape run dhcp send NAME PEER_IP [PEER_PORT]
 //! tape run dhcp capture PEER_IP [PEER_PORT]
+//! tape run dhcp duplex PEER_IP [PEER_PORT]
 //! ```
 //!
 //! `tape run` (listen mode, no stream args) queries device 0's real
@@ -46,17 +48,24 @@
 //! peer to ever resolve this tape's MAC at all (see `ip-chat`'s identical
 //! `send_arp_reply` use, which this tape copies verbatim in shape).
 //!
+//! `duplex PEER_IP [PEER_PORT]` runs `listen`+`capture` simultaneously in
+//! one invocation, receiving/playing inbound RTP while also capturing/
+//! sending outbound RTP to `PEER_IP`/`PEER_PORT` -- `duplex_mode`'s own
+//! doc comment covers exactly what's shared and what's merely
+//! near-identical between the two directions' code paths, and the one
+//! accepted startup-race limitation (a peer sending before our own ARP
+//! resolution of it finishes loses those first packets).
+//!
 //! Only device 0 is targeted, deliberately: one RTP session models
-//! exactly one media stream (one SSRC, one UDP 5-tuple), and this
-//! shell's one-foreground-tape-at-a-time model rules out true
-//! simultaneous multi-device sessions regardless of protocol -- a second
-//! device means invoking this tape again on a second port. There is no
-//! RTCP or SDP. `listen_mode` additionally recognizes one Opus payload
-//! type (`audio_rtp_tape::PAYLOAD_TYPE_OPUS`), decoded through
-//! `tapes/opus-codec`'s vendored fixed-point libopus decoder instead of
-//! the raw-PCM repack path -- see AGENTS.md's Opus section. This is
-//! decode-only: `send`/`capture` still move raw PCM exclusively, and
-//! always will.
+//! exactly one media stream (one SSRC per direction, one UDP 5-tuple per
+//! direction), and this shell's one-foreground-tape-at-a-time model
+//! rules out true simultaneous multi-device sessions regardless of
+//! protocol -- a second device means invoking this tape again on a
+//! second port. There is no RTCP or SDP. `listen_mode` additionally
+//! recognizes one Opus payload type (`audio_rtp_tape::PAYLOAD_TYPE_OPUS`),
+//! decoded through `tapes/opus-codec`'s vendored fixed-point libopus
+//! decoder instead of the raw-PCM repack path; `send`/`capture`/`duplex`
+//! can encode the same way via `opus` -- see AGENTS.md's Opus section.
 //!
 //! The tape uses no heap beyond `alloc`/`free`'s one bounded file-replay
 //! buffer, and does not own the NIC. IPv4 options, fragmentation, and
@@ -1172,6 +1181,401 @@ fn capture_mode(
     print_bytes(putc, b" byte(s) sent.\n");
 }
 
+/// The send-side encoder state `duplex_mode`'s combined loop branches on
+/// once per iteration, mirroring `capture_mode`'s own two disjoint loop
+/// shapes (Opus-encode vs raw) folded into one enum so the *receive*
+/// side's code does not need to be duplicated across two separate outer
+/// loops. `Opus`'s scratch buffers are tracked as address/capacity pairs
+/// rather than borrowed slices, so this type carries no lifetime and the
+/// slices can simply be reconstructed (a cheap pointer+length operation)
+/// wherever they're needed inside the loop -- the same "physical address
+/// is a usable pointer" convention this whole flat-memory kernel already
+/// relies on (see AGENTS.md's `tape run`/ELF-loader notes).
+enum SendEncoder {
+    Opus {
+        encoder: OpusEncoder,
+        accum_addr: u32,
+        accum_capacity: usize,
+        accum_len: usize,
+        packet_addr: u32,
+        packet_capacity: usize,
+        frame_samples: usize,
+        frame_len: usize,
+    },
+    Raw {
+        wire_bytes_per_sample: usize,
+    },
+}
+
+/// Simultaneous `listen_mode` + `capture_mode` in one invocation: receives
+/// and plays inbound RTP while also capturing and sending outbound RTP to
+/// `peer_ip`/`peer_port`, over one shared local UDP port (`DEFAULT_PORT`,
+/// matching `listen_mode`'s own default -- not separately configurable;
+/// `peer_port` already means "where outbound packets are addressed to,"
+/// an orthogonal knob from "what port inbound packets are filtered by").
+/// Reuses every existing helper and wire-format routine unchanged; this
+/// function is new orchestration only, built by folding `listen_mode`'s
+/// receive/decode/submit body and `capture_mode`'s capture/encode/send
+/// body into one shared loop with a single `nic_receive` call per
+/// iteration (not two), so ARP/RTP classification never runs twice per
+/// tick the way two independently-polling loops would.
+///
+/// One accepted, narrow limitation: `resolve_mac` (below) already answers
+/// inbound ARP for our own address while it waits for the peer's own ARP
+/// reply, but it does not classify inbound RTP during that window -- a
+/// peer that starts sending before our own resolution finishes loses
+/// those first packets to plain silence, exactly this tape's existing
+/// best-effort, no-retransmission philosophy applied to a narrow startup
+/// race rather than a real protocol gap.
+#[allow(clippy::too_many_arguments)]
+fn duplex_mode(
+    putc: Putc,
+    should_abort: ShouldAbort,
+    alloc: Alloc,
+    free: Free,
+    nic_send: NicSend,
+    nic_receive: NicReceive,
+    ticks: Ticks,
+    own_mac: MacAddress,
+    local: Ipv4Address,
+    peer_ip: Ipv4Address,
+    peer_port: u16,
+    codec: Codec,
+    audio_count: AudioCount,
+    audio_sample_rate_at: AudioSampleRateAt,
+    audio_channels_and_bits_at: AudioChannelsAndBitsAt,
+    audio_submit_at: AudioSubmitAt,
+    audio_capture_at: AudioCaptureAt,
+) {
+    let Some(format) = local_format(audio_count, audio_sample_rate_at, audio_channels_and_bits_at) else {
+        print_bytes(putc, b"audio-rtp: no audio device found.\n");
+        return;
+    };
+    let Some(payload_type) = payload_type_for(format) else {
+        print_bytes(putc, b"audio-rtp: local device format (");
+        print_format(putc, format);
+        print_bytes(putc, b") has no documented RTP payload type; cannot stream.\n");
+        return;
+    };
+    let opus_bitrate = match codec {
+        Codec::Opus { .. } if format.bits_per_sample != 16 => {
+            print_bytes(putc, b"audio-rtp: Opus duplex needs a 16-bit device format.\n");
+            return;
+        }
+        Codec::Opus { bitrate_bps } => Some(bitrate_bps.unwrap_or(opus_codec::DEFAULT_BITRATE_BPS)),
+        Codec::Raw => None,
+    };
+
+    let listen_port = DEFAULT_PORT;
+
+    print_bytes(putc, b"Local audio device: ");
+    print_format(putc, format);
+    print_bytes(putc, b" (RTP payload type ");
+    print_u32(putc, u32::from(payload_type));
+    print_bytes(putc, b").\nDuplex: listening on UDP port ");
+    print_u32(putc, u32::from(listen_port));
+    print_bytes(putc, b", streaming live capture to ");
+    print_ip(putc, peer_ip);
+    print_bytes(putc, b":");
+    print_u32(putc, u32::from(peer_port));
+    print_bytes(putc, b"; F12 (or F4/F6/F7/F8/F10) stops.\n");
+
+    // Receive-side Opus decode, exactly listen_mode's own check.
+    let mut opus_decoder = if format.bits_per_sample == 16 {
+        match OpusDecoder::new(format.sample_rate as i32, i32::from(format.channels), alloc, free) {
+            Ok(decoder) => {
+                print_bytes(putc, b"Opus decode also accepted (RTP payload type ");
+                print_u32(putc, u32::from(PAYLOAD_TYPE_OPUS));
+                print_bytes(putc, b").\n");
+                Some(decoder)
+            }
+            Err(_) => {
+                print_bytes(putc, b"audio-rtp: could not start Opus decoder; Opus packets will be ignored.\n");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut arp = ArpCache::<8>::new();
+    let peer_mac = match resolve_mac(nic_send, nic_receive, should_abort, ticks, peer_ip, own_mac, local, &mut arp) {
+        ResolveResult::Found(mac) => mac,
+        ResolveResult::Failed => {
+            print_bytes(putc, b"audio-rtp: could not resolve the peer's MAC address (ARP timed out).\n");
+            return;
+        }
+        ResolveResult::Aborted => return,
+    };
+
+    // Send-side state, exactly capture_mode's own setup.
+    let seed = derive_stream_seed(own_mac, raw_ticks(ticks));
+    let ssrc = ssrc_from_seed(seed);
+    let mut sequence = initial_sequence_from_seed(seed);
+    let mut timestamp = initial_timestamp_from_seed(seed);
+    let mut bytes_sent = 0u64;
+
+    // Opus encode scratch, allocated through the tape ABI (not the
+    // stack) for the same reason capture_mode's own Opus branch already
+    // documents -- a tape runs nested inside the shell's own call chain
+    // on the kernel's shared stack, and this buffer alone is close to
+    // 6 KB. Freed on every exit path below.
+    const ACCUM_CAPACITY: usize = OPUS_ENCODE_FRAME_CAPACITY_SAMPLES + KERNEL_PCM_SCRATCH_BYTES / 2;
+    let mut send_encoder = match opus_bitrate {
+        Some(bitrate) => {
+            let encoder = match OpusEncoder::new(format.sample_rate as i32, i32::from(format.channels), bitrate, alloc, free) {
+                Ok(encoder) => encoder,
+                Err(_) => {
+                    print_bytes(putc, b"audio-rtp: could not start the Opus encoder for this device's rate.\n");
+                    return;
+                }
+            };
+            let channels = usize::from(format.channels);
+            let frame_samples = format.sample_rate as usize / OPUS_FRAMES_PER_SECOND;
+            let frame_len = frame_samples * channels;
+            let accum_bytes = ACCUM_CAPACITY as u32 * 2;
+            let accum_addr = alloc(accum_bytes);
+            let packet_addr = alloc(RTP_PAYLOAD_BYTES as u32);
+            if accum_addr == 0 || packet_addr == 0 {
+                print_bytes(putc, b"audio-rtp: unable to allocate Opus encode scratch space.\n");
+                if accum_addr != 0 {
+                    free(accum_addr, accum_bytes);
+                }
+                if packet_addr != 0 {
+                    free(packet_addr, RTP_PAYLOAD_BYTES as u32);
+                }
+                return;
+            }
+            SendEncoder::Opus {
+                encoder,
+                accum_addr,
+                accum_capacity: ACCUM_CAPACITY,
+                accum_len: 0,
+                packet_addr,
+                packet_capacity: RTP_PAYLOAD_BYTES,
+                frame_samples,
+                frame_len,
+            }
+        }
+        None => SendEncoder::Raw {
+            wire_bytes_per_sample: if format.bits_per_sample == 24 { 3 } else { 2 },
+        },
+    };
+
+    // Receive-side state, exactly listen_mode's own setup.
+    let mut rx_frame = [0u8; MAX_FRAME_LEN];
+    let mut tx_frame = [0u8; MAX_FRAME_LEN];
+    let mut kernel_pcm = [0u8; KERNEL_PCM_SCRATCH_BYTES];
+    let mut opus_pcm = [0i16; OPUS_PCM_SCRATCH_SAMPLES];
+    let mut kernel_chunk = [0u8; KERNEL_PCM_SCRATCH_BYTES];
+    let mut wire_bytes = [0u8; RTP_PAYLOAD_BYTES];
+    let mut locked: Option<(u32, u32)> = None;
+    let mut expected_sequence: u16 = 0;
+    let mut packets_accepted = 0u64;
+    let mut bytes_submitted = 0u64;
+    let mut bytes_dropped = 0u64;
+    let mut gap_count = 0u64;
+    let mut late_or_duplicate_count = 0u64;
+    let mut last_activity = raw_ticks(ticks);
+
+    loop {
+        if should_abort() != 0 {
+            break;
+        }
+        if locked.is_some() && tick_reached(raw_ticks(ticks), last_activity.wrapping_add(RECEIVE_INACTIVITY_TICKS)) {
+            print_bytes(putc, b"audio-rtp: receive stream ended (no packets for a while).\n");
+            locked = None;
+        }
+
+        // --- Receive step: one nic_receive call serves both ARP and RTP. ---
+        let received = nic_receive(rx_frame.as_mut_ptr() as u32, MAX_FRAME_LEN as u32) as usize;
+        if received != 0 {
+            let now32 = raw_ticks(ticks) as u32;
+            let handled_arp =
+                handle_arp_frame(nic_send, &rx_frame[..received.min(MAX_FRAME_LEN)], own_mac, local, &mut arp, now32);
+            if !handled_arp {
+                'classify: {
+                    let Ok(ethernet) = EthernetFrame::parse(&rx_frame[..received.min(MAX_FRAME_LEN)]) else {
+                        break 'classify;
+                    };
+                    if ethernet.ethertype != ETHERTYPE_IPV4 {
+                        break 'classify;
+                    }
+                    let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else {
+                        break 'classify;
+                    };
+                    if packet.header.protocol != 17 {
+                        break 'classify;
+                    }
+                    let Ok(datagram) =
+                        UdpDatagram::parse(packet.payload, true, packet.header.source, packet.header.destination)
+                    else {
+                        break 'classify;
+                    };
+                    if datagram.destination_port != listen_port {
+                        break 'classify;
+                    }
+                    let Ok(rtp) = RtpPacket::parse(datagram.payload) else {
+                        break 'classify;
+                    };
+                    let is_opus = rtp.payload_type == PAYLOAD_TYPE_OPUS;
+                    if rtp.payload_type != payload_type && !(is_opus && opus_decoder.is_some()) {
+                        break 'classify;
+                    }
+
+                    let source_ip = as_u32(packet.header.source);
+                    match locked {
+                        None => {
+                            locked = Some((rtp.ssrc, source_ip));
+                            expected_sequence = rtp.sequence_number.wrapping_add(1);
+                            print_bytes(putc, b"audio-rtp: receive stream started from ");
+                            print_ip(putc, packet.header.source);
+                            print_bytes(putc, b".\n");
+                        }
+                        Some((ssrc, ip)) if ssrc == rtp.ssrc && ip == source_ip => {
+                            if rtp.sequence_number == expected_sequence {
+                                expected_sequence = expected_sequence.wrapping_add(1);
+                            } else if sequence16_at_or_after(rtp.sequence_number, expected_sequence) {
+                                gap_count += 1;
+                                expected_sequence = rtp.sequence_number.wrapping_add(1);
+                            } else {
+                                late_or_duplicate_count += 1;
+                                break 'classify;
+                            }
+                        }
+                        Some(_) => break 'classify,
+                    }
+
+                    last_activity = raw_ticks(ticks);
+                    packets_accepted += 1;
+
+                    let submit_len = if is_opus {
+                        let Some(decoder) = opus_decoder.as_mut() else {
+                            break 'classify;
+                        };
+                        match decoder.decode(rtp.payload, &mut opus_pcm, OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL) {
+                            Ok(samples_per_channel) => {
+                                samples_per_channel * usize::from(format.channels) * size_of::<i16>()
+                            }
+                            Err(_) => {
+                                bytes_dropped += rtp.payload.len() as u64;
+                                break 'classify;
+                            }
+                        }
+                    } else {
+                        wire_to_kernel_pcm(rtp.payload, format.bits_per_sample, &mut kernel_pcm)
+                    };
+                    let pcm_bytes: &[u8] = if is_opus {
+                        unsafe { slice::from_raw_parts(opus_pcm.as_ptr().cast::<u8>(), submit_len) }
+                    } else {
+                        &kernel_pcm[..submit_len]
+                    };
+
+                    let mut offset = 0usize;
+                    let mut spins = 0u32;
+                    while offset < submit_len && spins < 64 {
+                        let accepted = audio_submit_at(
+                            0,
+                            pcm_bytes[offset..submit_len].as_ptr() as u32,
+                            (submit_len - offset) as u32,
+                        ) as usize;
+                        if accepted == 0 {
+                            spins += 1;
+                            continue;
+                        }
+                        offset += accepted;
+                        bytes_submitted += accepted as u64;
+                    }
+                    bytes_dropped += (submit_len - offset) as u64;
+                }
+            }
+        }
+
+        // --- Send step: capture, encode (if configured), and send. ---
+        let captured = audio_capture_at(0, kernel_chunk.as_mut_ptr() as u32, KERNEL_PCM_SCRATCH_BYTES as u32) as usize;
+        if captured != 0 {
+            match &mut send_encoder {
+                SendEncoder::Raw { wire_bytes_per_sample } => {
+                    let wire_len = kernel_to_wire_pcm(&kernel_chunk[..captured], format.bits_per_sample, &mut wire_bytes);
+                    let frames_in_chunk = (wire_len / *wire_bytes_per_sample) as u32;
+                    let rtp = RtpPacket::new(payload_type, false, sequence, timestamp, ssrc, &wire_bytes[..wire_len]);
+                    if let Ok(length) =
+                        build_rtp_udp_frame(&mut tx_frame, own_mac, peer_mac, local, peer_ip, DEFAULT_PORT, peer_port, &rtp)
+                    {
+                        send_frame(nic_send, &tx_frame[..length], MAX_FRAME_LEN);
+                    }
+                    sequence = sequence.wrapping_add(1);
+                    timestamp = timestamp.wrapping_add(frames_in_chunk);
+                    bytes_sent += wire_len as u64;
+                }
+                SendEncoder::Opus {
+                    encoder,
+                    accum_addr,
+                    accum_capacity,
+                    accum_len,
+                    packet_addr,
+                    packet_capacity,
+                    frame_samples,
+                    frame_len,
+                } => {
+                    let accum: &mut [i16] = unsafe { slice::from_raw_parts_mut(*accum_addr as *mut i16, *accum_capacity) };
+                    let packet: &mut [u8] = unsafe { slice::from_raw_parts_mut(*packet_addr as *mut u8, *packet_capacity) };
+
+                    let captured_samples = captured / 2;
+                    let captured_i16: &[i16] =
+                        unsafe { slice::from_raw_parts(kernel_chunk.as_ptr().cast::<i16>(), captured_samples) };
+                    let copy_len = captured_samples.min(accum.len() - *accum_len);
+                    accum[*accum_len..*accum_len + copy_len].copy_from_slice(&captured_i16[..copy_len]);
+                    *accum_len += copy_len;
+
+                    while *accum_len >= *frame_len {
+                        if let Ok(packet_len) = encoder.encode(&accum[..*frame_len], *frame_samples, packet) {
+                            let rtp = RtpPacket::new(PAYLOAD_TYPE_OPUS, false, sequence, timestamp, ssrc, &packet[..packet_len]);
+                            if let Ok(length) = build_rtp_udp_frame(
+                                &mut tx_frame,
+                                own_mac,
+                                peer_mac,
+                                local,
+                                peer_ip,
+                                DEFAULT_PORT,
+                                peer_port,
+                                &rtp,
+                            ) {
+                                send_frame(nic_send, &tx_frame[..length], MAX_FRAME_LEN);
+                            }
+                            sequence = sequence.wrapping_add(1);
+                            timestamp = timestamp.wrapping_add(*frame_samples as u32);
+                            bytes_sent += packet_len as u64;
+                        }
+                        accum.copy_within(*frame_len..*accum_len, 0);
+                        *accum_len -= *frame_len;
+                    }
+                }
+            }
+        }
+    }
+
+    if let SendEncoder::Opus { accum_addr, accum_capacity, packet_addr, packet_capacity, .. } = send_encoder {
+        free(accum_addr, accum_capacity as u32 * 2);
+        free(packet_addr, packet_capacity as u32);
+    }
+
+    print_bytes(putc, b"audio-rtp: receive: ");
+    print_u32(putc, packets_accepted as u32);
+    print_bytes(putc, b" packet(s) accepted, ");
+    print_u32(putc, bytes_submitted as u32);
+    print_bytes(putc, b" byte(s) played, ");
+    print_u32(putc, bytes_dropped as u32);
+    print_bytes(putc, b" dropped, ");
+    print_u32(putc, gap_count as u32);
+    print_bytes(putc, b" gap(s), ");
+    print_u32(putc, late_or_duplicate_count as u32);
+    print_bytes(putc, b" late/duplicate.\n");
+    print_bytes(putc, b"audio-rtp: send: ");
+    print_u32(putc, bytes_sent as u32);
+    print_bytes(putc, b" byte(s) sent.\n");
+}
+
 /// Declares the complete current thirty-parameter tape ABI (see
 /// `kernel/src/shell.rs`'s `TapeEntry`). `read_key`/`terminal_position`/
 /// `fs_write`/`fs_remove`/the non-`_at` `nic_*`/`audio_*` slots are
@@ -1314,6 +1718,25 @@ pub extern "C" fn tape_main(
             audio_count,
             audio_sample_rate_at,
             audio_channels_and_bits_at,
+            audio_capture_at,
+        ),
+        StreamMode::Duplex { peer_ip, peer_port, codec } => duplex_mode(
+            putc,
+            should_abort,
+            alloc,
+            free,
+            nic_send,
+            nic_receive,
+            ticks,
+            own_mac,
+            network.local,
+            peer_ip,
+            peer_port,
+            codec,
+            audio_count,
+            audio_sample_rate_at,
+            audio_channels_and_bits_at,
+            audio_submit_at,
             audio_capture_at,
         ),
     }

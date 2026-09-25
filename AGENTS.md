@@ -2247,14 +2247,17 @@ own rate/bit-depth negotiation becoming real (see above): a fixed
 hardware's actual modern format" premise moot for the one backend
 (HDA) most real machines actually have.
 
-**Scope: device 0 only, one direction (listen, send, or capture) per
-invocation.** One RTP session models exactly one media stream; there is
-no protocol-level equivalent to `audio-net`'s single-session multi-device
-tagging, and this shell's one-foreground-tape-at-a-time model rules out
-true simultaneous multi-device sessions regardless of protocol design. A
-second device needs a second, separately invoked session on a second
-port -- a real, standards-clean answer, just a narrower single-invocation
-feature than `audio-net`'s.
+**Scope: device 0 only per invocation; `duplex` runs both directions at
+once, everything else is one direction.** One RTP session models exactly
+one media stream; there is no protocol-level equivalent to `audio-net`'s
+single-session multi-device tagging, and this shell's one-foreground-
+tape-at-a-time model rules out true simultaneous multi-device sessions
+regardless of protocol design. A second device needs a second,
+separately invoked session on a second port -- a real, standards-clean
+answer, just a narrower single-invocation feature than `audio-net`'s.
+`listen`/`send`/`capture` each still drive exactly one direction;
+`duplex` (below) is the one mode that drives both at once, still against
+only device 0.
 
 **Opus decode** is now built, via `tapes/opus-codec/` -- this project's
 first vendored C dependency, and its first build step that invokes a C
@@ -2359,12 +2362,48 @@ kvm` when available (see `kvm_available()` in either test file) -- a
 QEMU/TCG software-emulation timing artifact (any tight, uninterrupted
 guest busy loop starves QEMU's own timer/interrupt delivery under plain
 TCG, the same root cause `tapes/test_audio_net_real_mic_e2e.py` already
-found and fixed this way), not a real target-hardware concern. Two-way
-duplex (simultaneous `listen`+`send` in one invocation) and real-hardware
-interop (a genuine `ffmpeg` session against real fos hardware, and the
-24-bit path this tape's format table already accounts for -- Opus
-included, since it needs a 16-bit local device) remain future work,
-the former planned as a follow-on now that encode itself is proven.
+found and fixed this way), not a real target-hardware concern.
+
+**Two-way duplex** is now built: `duplex PEER_IP [PEER_PORT]` (`[opus]`/
+`[BITRATE]` accepted exactly like `capture`) runs `listen_mode` and
+`capture_mode`'s code paths simultaneously in one invocation --
+receiving and playing inbound RTP while also capturing and sending
+outbound RTP to `PEER_IP`/`PEER_PORT` -- over one shared local UDP port
+(always `DEFAULT_PORT`/5004, not separately configurable: `PEER_PORT`
+already means "where outbound packets are addressed to," an orthogonal
+knob from "what port inbound packets are filtered by," and a symmetric
+same-port session, the common case for `ffmpeg`-style point-to-point
+testing, needs no second port argument at all). `duplex_mode`
+(`main.rs`) is new orchestration only, not new wire-format logic: it
+reuses every existing helper and both directions' decode/encode code
+paths completely unchanged, folded into one shared loop with a single
+`nic_receive` call per iteration (not the two independent polls
+`listen`/`capture` each used alone) so ARP/RTP classification never
+double-runs per tick. The one accepted, narrow limitation: `resolve_mac`
+(run once, up front, to learn the peer's MAC before streaming to it)
+already answers inbound ARP for our own address while it waits, but does
+not classify inbound RTP during that window -- a peer sending before our
+own resolution finishes loses those first packets to plain silence, the
+same best-effort, no-retransmission philosophy this tape already applies
+everywhere else, just at a narrower startup race. Verified end to end by
+`tapes/test_audio_rtp_duplex_e2e.py`: while the host streams a
+synthesized tone to the guest's receive side (verified via the tape's
+own printed packet/byte counters, not a captured-WAV pitch check -- see
+that test's own docstring for why: QEMU's `wav` audiodev backend has no
+usable `in.path` option in this packaging, so a single guest cannot get
+both real captured-WAV output verification and a live ADC feed for the
+send side at once, the same tradeoff `tapes/test_audio_capture_e2e.py`
+already accepts), it simultaneously drains and verifies the guest's own
+outgoing RTP stream (correct payload type, monotonically increasing
+sequence number, one constant SSRC) and confirms at least one outgoing
+packet arrives *before* the host finishes sending its tone -- ruling out
+an accidental "receive fully, then send" serialization bug, not just
+proving the code compiles.
+
+Real-hardware interop (a genuine `ffmpeg` session against real fos
+hardware) and the 24-bit path this tape's format table already accounts
+for (Opus included, since it needs a 16-bit local device) remain future
+work.
 
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 

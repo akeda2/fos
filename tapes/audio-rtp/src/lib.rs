@@ -13,17 +13,23 @@
 //! tape run static LOCAL_IP/PREFIX GATEWAY [PORT]
 //! tape run static LOCAL_IP/PREFIX GATEWAY send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]
 //! tape run static LOCAL_IP/PREFIX GATEWAY capture [opus] PEER_IP [PEER_PORT] [BITRATE]
+//! tape run static LOCAL_IP/PREFIX GATEWAY duplex [opus] PEER_IP [PEER_PORT] [BITRATE]
 //! tape run dhcp [PORT]
 //! tape run dhcp send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]
 //! tape run dhcp capture [opus] PEER_IP [PEER_PORT] [BITRATE]
+//! tape run dhcp duplex [opus] PEER_IP [PEER_PORT] [BITRATE]
 //! ```
 //!
 //! `opus` selects Opus encode (via `tapes/opus-codec`'s vendored
 //! fixed-point libopus) in place of raw PCM; `BITRATE` (bits/sec) is only
 //! meaningful with `opus` and defaults to `opus_codec::DEFAULT_BITRATE_BPS`
-//! when omitted. `PORT`/`PEER_PORT` default to `5004`. `static` also
-//! accepts the legacy dotted-netmask and separate-`/PREFIX` forms `telnet`
-//! already does.
+//! when omitted. `PORT`/`PEER_PORT` default to `5004`. `duplex` is
+//! `listen` and `capture` running simultaneously in one invocation
+//! (receiving/playing inbound RTP while also capturing/sending outbound
+//! RTP to `PEER_IP`/`PEER_PORT`); its own local listen port is always
+//! `5004`, not separately configurable -- see `main.rs`'s `duplex_mode`
+//! doc comment. `static` also accepts the legacy dotted-netmask and
+//! separate-`/PREFIX` forms `telnet` already does.
 #![no_std]
 
 use tape_net::{
@@ -121,6 +127,16 @@ pub enum StreamMode<'a> {
         codec: Codec,
     },
     Capture {
+        peer_ip: Ipv4Address,
+        peer_port: u16,
+        codec: Codec,
+    },
+    /// Simultaneous `Listen` + `Capture` in one invocation: receives and
+    /// plays inbound RTP while also capturing and sending outbound RTP to
+    /// `peer_ip`/`peer_port`, over one shared local UDP port
+    /// (`DEFAULT_PORT`, not separately configurable -- see `main.rs`'s
+    /// `duplex_mode` doc comment for why).
+    Duplex {
         peer_ip: Ipv4Address,
         peer_port: u16,
         codec: Codec,
@@ -355,6 +371,25 @@ fn parse_stream_mode<'a>(
             )?;
             let codec = if is_opus { Codec::Opus { bitrate_bps } } else { Codec::Raw };
             Ok(StreamMode::Capture { peer_ip, peer_port, codec })
+        }
+        Some(b"duplex") => {
+            let is_opus = words.get(start + 1).copied().flatten() == Some(b"opus");
+            let ip_index = if is_opus { start + 2 } else { start + 1 };
+            let peer_ip = words
+                .get(ip_index)
+                .copied()
+                .flatten()
+                .and_then(parse_ipv4)
+                .ok_or(StartupError::BadAddress)?;
+            let fixed_words = ip_index + 1 - start;
+            let (peer_port, bitrate_bps) = parse_port_and_bitrate(
+                words,
+                ip_index + 1,
+                remaining.saturating_sub(fixed_words),
+                is_opus,
+            )?;
+            let codec = if is_opus { Codec::Opus { bitrate_bps } } else { Codec::Raw };
+            Ok(StreamMode::Duplex { peer_ip, peer_port, codec })
         }
         Some(word) => {
             if remaining != 1 {
@@ -666,6 +701,55 @@ mod tests {
         // word on the raw path is rejected, not silently interpreted.
         assert_eq!(
             parse_startup(b"dhcp capture 192.0.2.20 6002 128000"),
+            Err(StartupError::WrongArgumentCount)
+        );
+    }
+
+    #[test]
+    fn parses_duplex_startup_syntax() {
+        let config = parse_startup(b"dhcp duplex 192.0.2.20").unwrap();
+        assert_eq!(
+            config.stream,
+            StreamMode::Duplex {
+                peer_ip: Ipv4Address::new([192, 0, 2, 20]),
+                peer_port: DEFAULT_PORT,
+                codec: Codec::Raw,
+            }
+        );
+
+        let config = parse_startup(b"dhcp duplex 192.0.2.20 6002").unwrap();
+        assert_eq!(
+            config.stream,
+            StreamMode::Duplex {
+                peer_ip: Ipv4Address::new([192, 0, 2, 20]),
+                peer_port: 6002,
+                codec: Codec::Raw,
+            }
+        );
+
+        let config = parse_startup(b"dhcp duplex opus 192.0.2.20").unwrap();
+        assert_eq!(
+            config.stream,
+            StreamMode::Duplex {
+                peer_ip: Ipv4Address::new([192, 0, 2, 20]),
+                peer_port: DEFAULT_PORT,
+                codec: Codec::Opus { bitrate_bps: None },
+            }
+        );
+
+        let config = parse_startup(b"dhcp duplex opus 192.0.2.20 6002 128000").unwrap();
+        assert_eq!(
+            config.stream,
+            StreamMode::Duplex {
+                peer_ip: Ipv4Address::new([192, 0, 2, 20]),
+                peer_port: 6002,
+                codec: Codec::Opus { bitrate_bps: Some(128_000) },
+            }
+        );
+
+        // Same rule as `capture`: a bitrate is only accepted alongside `opus`.
+        assert_eq!(
+            parse_startup(b"dhcp duplex 192.0.2.20 6002 128000"),
             Err(StartupError::WrongArgumentCount)
         );
     }
