@@ -1531,6 +1531,28 @@ needing to physically re-flash the boot USB stick -- confirming the
 debug-mode design's own stated purpose (fast, unattended-feeling
 iteration against real hardware) in practice, not just in the abstract.
 
+**A second, independent real bug surfaced once the timing issue above was
+fixed**: promoting `disk1` and then `tape load disk1 ed.bin` (a real,
+23-sector file) failed with `TransportFailed(InitFailed)` -- `ls`/`cat`/
+small `write`s had all worked because they never requested more than a
+few sectors in one `read_10`/`write_10` call. Root cause: a single
+`bulk_transfer` TD chain is bounded by `TD_POOL_CAPACITY` (34) TDs of at
+most `max_packet` bytes each -- 2176 bytes at this device's full-speed
+64-byte packet size -- comfortably less than one `MAX_TRANSFER_SECTORS`-
+sized (16 sectors, 8192 bytes) FOSFS chunk. `bulk_transfer` itself now
+splits an oversized transfer into successive bounded TD-chain passes
+(with the same real-hardware-confirmed settle delay between them),
+transparently to every caller -- `MscDevice::command`/`command_once`
+needed no changes at all. Confirmed fixed on the real P4 with both a
+23-sector tape (`ed.bin`) and a 678-sector one (`audio-rtp.bin`, loading
+correctly with its exact real byte count both times). `tapes/
+test_usb_storage_disk_e2e.py` gained a permanent regression test
+(copying a real 24584-byte preloaded file onto and back off the attached
+USB disk via `copy`, well over the 2176-byte single-pass boundary) --
+confirmed to actually fail with the same `FirmwareFailure` symptom when
+`bulk_transfer`'s internal chunking is reverted, not just incidentally
+passing.
+
 #### Wiring USB Mass Storage into `disk.rs` as an ordinary secondary disk
 
 `disk::Device` used to be a closed two-variant enum (`Boot`/

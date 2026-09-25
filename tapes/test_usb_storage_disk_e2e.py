@@ -163,6 +163,42 @@ def main() -> None:
                 raise SystemExit(f"cat did not return the written content:\n{cat}")
             print(f"PASS: write/cat round trip through {disk} matches byte-exact.")
 
+            # A single bulk_transfer TD chain is bounded by TD_POOL_CAPACITY
+            # (34) TDs of at most max_packet bytes each -- 2176 bytes at
+            # full speed's 64-byte packet ceiling, comfortably less than
+            # one MAX_TRANSFER_SECTORS-sized (16 sectors, 8192 bytes) FOSFS
+            # chunk. A real multi-sector tape load against a genuine
+            # Kingston flash drive found this the hard way (bulk_transfer
+            # returning InitFailed) before bulk_transfer grew its own
+            # internal multi-pass chunking. `write`'s own line editor caps
+            # a command at 256 bytes, far too small to reproduce this
+            # directly, so this instead copies a real preloaded file (well
+            # over 2176 bytes) onto the USB disk and back via `copy`,
+            # which drives the same `device_write_sectors`/
+            # `device_read_sectors` chunked path FOSFS itself uses.
+            large_name = "telnet.bin"
+            large_size = 24584  # tools/build_image.py's own reported size
+            to_usb = run_command(f"copy disk1 {large_name} {disk}".encode(), timeout=30)
+            if f"Copied {large_size} byte(s)" not in to_usb:
+                raise SystemExit(
+                    f"copying {large_name} onto {disk} did not report the "
+                    f"expected byte count (multi-chunk write regression):\n{to_usb}"
+                )
+            from_usb = run_command(
+                f"copy {disk} {large_name} disk1 usbbig-check.bin".encode(), timeout=30
+            )
+            if f"Copied {large_size} byte(s)" not in from_usb:
+                raise SystemExit(
+                    f"copying {large_name} back off {disk} did not report the "
+                    f"expected byte count (multi-chunk read regression):\n{from_usb}"
+                )
+            run_command(b"rm usbbig-check.bin")
+            print(
+                f"PASS: {large_size}-byte copy round trip through {disk} "
+                "completed (exercises bulk_transfer's own internal "
+                "multi-pass chunking in both directions)."
+            )
+
             second_attach = run_command(b"usb storage attach")
             if "already attached" not in second_attach:
                 raise SystemExit(f"a second attach should be rejected:\n{second_attach}")

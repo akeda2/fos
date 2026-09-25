@@ -655,6 +655,24 @@ impl Uhci {
     /// resets the device's own toggle back to DATA0 after a failure
     /// anyway, so this function does not need to guess how many packets
     /// actually completed before a mid-chain error.
+    ///
+    /// A single TD chain is bounded by `TD_POOL_CAPACITY` (one TD per
+    /// `max_packet` bytes), which can be far smaller than `data` for a
+    /// multi-sector disk transfer at a small `max_packet` (e.g. 34 TDs *
+    /// 64 bytes = 2176 bytes at this driver's full-speed ceiling -- barely
+    /// four 512-byte sectors, well under `disk.rs`'s own up-to-16-sector
+    /// `MAX_TRANSFER_SECTORS` chunk size). Rather than making every caller
+    /// aware of that pool-capacity ceiling, `bulk_transfer` itself splits
+    /// an oversized `data` into successive `bulk_transfer_once` passes,
+    /// each within that per-call ceiling, with a settle delay between
+    /// them (the same real-hardware-required turnaround gap already
+    /// documented above `command`'s own inter-stage delays in
+    /// `usb_storage.rs` -- confirmed necessary here too, not just assumed,
+    /// by a real multi-sector tape load that failed with `InitFailed`
+    /// before this existed). `toggle` threads continuously across every
+    /// pass exactly as USB's own toggle sequence requires for one logical
+    /// multi-packet transfer, regardless of how many internal passes it
+    /// took.
     pub fn bulk_transfer(
         &self,
         device_addr: u8,
@@ -667,6 +685,40 @@ impl Uhci {
         if data.is_empty() {
             return Err(Error::InitFailed);
         }
+        let max_chunk_bytes = TD_POOL_CAPACITY * usize::from(max_packet).max(1);
+        let mut total = 0usize;
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let chunk_len = (data.len() - offset).min(max_chunk_bytes);
+            total += self.bulk_transfer_once(
+                device_addr,
+                endpoint,
+                max_packet,
+                &mut data[offset..offset + chunk_len],
+                data_is_in,
+                toggle,
+            )?;
+            offset += chunk_len;
+            if offset < data.len() {
+                wait_ticks(1);
+            }
+        }
+        Ok(total)
+    }
+
+    /// One single TD-chain pass of `bulk_transfer`, bounded by
+    /// `TD_POOL_CAPACITY`. See `bulk_transfer`'s own doc comment for why
+    /// this is a separate, wrapped primitive rather than the public
+    /// entry point itself.
+    fn bulk_transfer_once(
+        &self,
+        device_addr: u8,
+        endpoint: u8,
+        max_packet: u8,
+        data: &mut [u8],
+        data_is_in: bool,
+        toggle: &mut bool,
+    ) -> Result<usize, Error> {
         let max_packet = usize::from(max_packet).max(1);
 
         let data_pid = if data_is_in { PID_IN } else { PID_OUT };
