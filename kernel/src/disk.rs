@@ -1,5 +1,6 @@
 use crate::boot_info::{read_u32, read_u64, BootInfo};
 use crate::interrupts;
+use crate::usb_storage;
 
 const SECTOR_SIZE: usize = 512;
 
@@ -62,15 +63,48 @@ static mut GPT_DATA_LBA: u64 = 0;
 static mut GPT_DATA_SECTORS: u64 = 0;
 static mut GPT_VALID: bool = false;
 
+/// How a [`SecondaryDisk`] entry is actually reached. `Bios` is the
+/// original, only backend: a BIOS drive number the trampoline addresses
+/// exactly like the boot disk. `Usb` is a USB Mass Storage device
+/// attached via [`attach_usb_disk`] -- addressed instead through
+/// `kernel/src/usb_storage.rs`'s Bulk-Only Transport driver, with no BIOS
+/// drive number at all. Both backends report an ordinary `sector_count`
+/// and are otherwise indistinguishable to every FOSFS-level caller.
+#[derive(Clone, Copy)]
+enum SecondaryBackend {
+    Bios(u8),
+    Usb,
+}
+
 #[derive(Clone, Copy)]
 struct SecondaryDisk {
-    drive_number: u8,
+    backend: SecondaryBackend,
     sector_count: u64,
 }
 
 static mut SECONDARY_DISKS: [Option<SecondaryDisk>; MAX_SECONDARY_DISKS] =
     [None, None, None, None];
 static mut SECONDARY_COUNT: usize = 0;
+/// The single USB Mass Storage device backing whichever [`SecondaryDisk`]
+/// entry has [`SecondaryBackend::Usb`] (there is at most one -- see
+/// [`attach_usb_disk`]'s own doc comment for why this driver does not yet
+/// support more).
+static mut USB_DISK: Option<usb_storage::MscDevice> = None;
+
+/// Errors specific to *attaching* a USB Mass Storage disk -- distinct
+/// from the ordinary [`Error`] enum, which describes a failed read/write
+/// against a disk that is already attached, not why one was never
+/// attached in the first place.
+#[derive(Debug)]
+pub enum UsbAttachError {
+    /// A USB disk is already attached this boot; see [`attach_usb_disk`].
+    AlreadyAttached,
+    NoDevice,
+    NotReady,
+    Capacity(usb_storage::Error),
+    /// Every [`MAX_SECONDARY_DISKS`] slot is already in use.
+    Full,
+}
 
 /// Identifies which physical disk an FOSFS operation targets. `Boot` is the
 /// disk the machine started from (GPT-discovered FOSFS partition, as
@@ -125,11 +159,30 @@ fn secondary_disk(index: usize) -> Option<SecondaryDisk> {
     unsafe { core::ptr::addr_of!(SECONDARY_DISKS[index]).read() }
 }
 
-/// The BIOS drive number a [`Device`] should be addressed by.
+/// The BIOS drive number a [`Device`] should be addressed by, or `None`
+/// for one with no BIOS drive number at all -- the boot disk always has
+/// one, but a [`SecondaryBackend::Usb`] disk deliberately does not, since
+/// it is never addressed through the BIOS trampoline (see `transfer`/
+/// `transfer_chunk`'s own backend dispatch).
 fn drive_number(info: &BootInfo, device: Device) -> Option<u8> {
     match device {
         Device::Boot => Some(info.boot_drive),
-        Device::Secondary(index) => secondary_disk(index).map(|disk| disk.drive_number),
+        Device::Secondary(index) => match secondary_disk(index)?.backend {
+            SecondaryBackend::Bios(drive_number) => Some(drive_number),
+            SecondaryBackend::Usb => None,
+        },
+    }
+}
+
+/// Whether `device` is a [`SecondaryBackend::Usb`] disk -- `transfer`/
+/// `transfer_chunk`'s branch point between the BIOS trampoline and
+/// `usb_storage`'s Bulk-Only Transport driver.
+fn is_usb_backed(device: Device) -> bool {
+    match device {
+        Device::Boot => false,
+        Device::Secondary(index) => {
+            matches!(secondary_disk(index).map(|disk| disk.backend), Some(SecondaryBackend::Usb))
+        }
     }
 }
 
@@ -191,7 +244,7 @@ pub fn discover_secondary_disks(info: &BootInfo) {
         }
         let count = unsafe {
             SECONDARY_DISKS[SECONDARY_COUNT] = Some(SecondaryDisk {
-                drive_number,
+                backend: SecondaryBackend::Bios(drive_number),
                 sector_count,
             });
             SECONDARY_COUNT += 1;
@@ -203,6 +256,80 @@ pub fn discover_secondary_disks(info: &BootInfo) {
             drive_number,
             sector_count
         );
+    }
+}
+
+/// Whether a USB Mass Storage disk is already attached this boot -- at
+/// most one is ever supported (see [`attach_usb_disk`]'s own doc
+/// comment), so a caller must check this before attempting a second one.
+pub fn usb_disk_attached() -> bool {
+    unsafe { (*core::ptr::addr_of!(USB_DISK)).is_some() }
+}
+
+/// Discovers a USB Mass Storage (Bulk-Only Transport) device and attaches
+/// it as a new secondary disk, usable immediately afterward through the
+/// exact same `diskN` selector every BIOS-backed secondary disk already
+/// uses (`disk::device_from_number`/`strip_disk_selector` need no changes
+/// at all: a fresh entry appended to [`SECONDARY_DISKS`] just becomes the
+/// next available `diskN`). Returns the new disk's 0-based secondary
+/// index (`diskN` = index + 2) on success.
+///
+/// Deliberately **not** called automatically at boot, unlike
+/// [`discover_secondary_disks`]'s cheap, side-effect-free BIOS probes:
+/// discovering a USB Mass Storage device means calling
+/// `uhci::initialize_all()`, which resets *every* UHCI controller found --
+/// the exact operation confirmed, on a real Pentium 4, to break BIOS's own
+/// "USB Legacy Support" `INT13h` emulation for the rest of that boot (see
+/// AGENTS.md's "USB audio and USB-boot media do not reliably coexist"
+/// section). An operator must explicitly opt into this each boot (the
+/// `usb storage attach` shell command), on a machine they know is not
+/// still relying on BIOS to serve its own boot disk afterward -- the same
+/// deliberate, explicit-action convention every other UHCI-touching
+/// command (`usb`, `usb play`, `usb capture`, `audio`) already follows.
+/// At most one USB disk is supported: `usb_storage::open()` itself only
+/// ever discovers the first Bulk-Only Transport device found, and a
+/// second `attach_usb_disk` call while one is already attached is
+/// rejected outright (`UsbAttachError::AlreadyAttached`) rather than
+/// silently replacing the live device behind an already-assigned `diskN`.
+///
+/// **Confirmed, not just theoretical**: testing this very feature under
+/// QEMU found that SeaBIOS's own USB legacy support had *already* made
+/// the same physical USB Mass Storage device appear as an ordinary BIOS
+/// secondary disk (`disk2`, BIOS drive `0x81`, discovered for free by
+/// `discover_secondary_disks`'s boot-time probe) before this function
+/// ever ran -- calling this then immediately broke `disk2`'s own BIOS-
+/// backed access (`FirmwareFailure` on the very next FOSFS command
+/// against it), exactly as this doc comment already warned in the
+/// abstract, but now demonstrated concretely rather than only inferred
+/// from the real-hardware Pentium 4 finding above. The freshly attached
+/// native disk (a *different* `diskN`, e.g. `disk3` in that same test)
+/// remained fully readable/writable throughout -- only the now-redundant
+/// BIOS-backed path to the identical device broke. A real machine with
+/// any USB Mass Storage device already plugged in should be assumed to
+/// carry this same risk for *that* device's own BIOS-visible `diskN`,
+/// not only for `disk1`/the boot disk specifically.
+pub fn attach_usb_disk() -> Result<usize, UsbAttachError> {
+    if usb_disk_attached() {
+        return Err(UsbAttachError::AlreadyAttached);
+    }
+    let mut device = usb_storage::open().ok_or(UsbAttachError::NoDevice)?;
+    if !device.wait_until_ready(10) {
+        return Err(UsbAttachError::NotReady);
+    }
+    let (block_count, _block_size) = device.read_capacity_10().map_err(UsbAttachError::Capacity)?;
+
+    unsafe {
+        if SECONDARY_COUNT >= MAX_SECONDARY_DISKS {
+            return Err(UsbAttachError::Full);
+        }
+        let index = SECONDARY_COUNT;
+        SECONDARY_DISKS[index] = Some(SecondaryDisk {
+            backend: SecondaryBackend::Usb,
+            sector_count: u64::from(block_count),
+        });
+        SECONDARY_COUNT += 1;
+        USB_DISK = Some(device);
+        Ok(index)
     }
 }
 
@@ -363,6 +490,10 @@ fn transfer(info: &BootInfo, device: Device, lba: u64, direction: u32) -> Result
     if lba >= device_sector_count(info, device) {
         return Err(Error::OutOfRange);
     }
+    if is_usb_backed(device) {
+        let sector = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR.0) };
+        return usb_transfer(lba, sector, direction);
+    }
     let Some(drive_number) = drive_number(info, device) else {
         return Err(Error::Unavailable);
     };
@@ -391,6 +522,10 @@ fn transfer_chunk(
     if lba + count as u64 > device_sector_count(info, device) {
         return Err(Error::OutOfRange);
     }
+    if is_usb_backed(device) {
+        let chunk = unsafe { &mut *core::ptr::addr_of_mut!(CHUNK.0) };
+        return usb_transfer(lba, &mut chunk[..count * SECTOR_SIZE], direction);
+    }
     let Some(drive_number) = drive_number(info, device) else {
         return Err(Error::Unavailable);
     };
@@ -402,6 +537,28 @@ fn transfer_chunk(
         core::ptr::addr_of!(CHUNK) as u32,
         count as u32,
     )
+}
+
+/// The `Usb`-backed counterpart to `call_trampoline`: reads or writes
+/// `buffer` (already exactly a whole number of 512-byte blocks -- one for
+/// [`transfer`], up to [`MAX_TRANSFER_SECTORS`] for [`transfer_chunk`])
+/// through the single attached [`USB_DISK`] via `usb_storage`'s
+/// `READ(10)`/`WRITE(10)`. The caller has already bounds-checked `lba`
+/// against [`device_sector_count`]; SCSI `READ(10)`/`WRITE(10)` only carry
+/// a 32-bit LBA, so this additionally rejects (as [`Error::OutOfRange`])
+/// an address that would need more than 32 bits -- unreachable in
+/// practice for any USB flash drive's actual capacity, but a real,
+/// explicit check rather than a silent truncation.
+fn usb_transfer(lba: u64, buffer: &mut [u8], direction: u32) -> Result<(), Error> {
+    let Ok(lba) = u32::try_from(lba) else {
+        return Err(Error::OutOfRange);
+    };
+    let device = unsafe { (*core::ptr::addr_of_mut!(USB_DISK)).as_mut() };
+    let Some(device) = device else {
+        return Err(Error::Unavailable);
+    };
+    let result = if direction == 0 { device.read_10(lba, buffer) } else { device.write_10(lba, buffer) };
+    result.map_err(|_| Error::FirmwareFailure)
 }
 
 /// Invokes the `bios_disk_io` trampoline (`boot/stage2.S`) for one

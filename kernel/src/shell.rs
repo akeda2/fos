@@ -1024,15 +1024,54 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
         return;
     }
     if first.eq_ignore_ascii_case(b"storage") {
-        if !remainder.is_empty() {
-            println!("{USAGE}");
+        let (second, trailing) = take_word(remainder);
+        if second.is_empty() {
+            usb_storage_command();
             return;
         }
-        usb_storage_command();
+        if second.eq_ignore_ascii_case(b"attach") && trailing.is_empty() {
+            usb_storage_attach_command(info);
+            return;
+        }
+        println!("Usage: usb storage [attach]");
         return;
     }
 
     println!("{USAGE}");
+}
+
+/// Discovers a USB Mass Storage device and attaches it as a new
+/// secondary disk (see `disk::attach_usb_disk`'s own doc comment for why
+/// this is a deliberate, explicit operator action rather than something
+/// `discover_secondary_disks` ever does automatically at boot). On
+/// success the new disk is immediately usable through the ordinary
+/// `diskN` selector, exactly like a BIOS-backed secondary disk.
+fn usb_storage_attach_command(info: &BootInfo) {
+    println!("Resetting UHCI controllers to discover the device; this");
+    println!("can break BIOS's own USB-drive emulation for any disk");
+    println!("(including 'disk1') that BIOS is still serving over USB.");
+    match disk::attach_usb_disk() {
+        Ok(index) => {
+            let disk_number = index + 2;
+            let sectors = disk::device_sector_count(info, disk::Device::Secondary(index));
+            println!("Attached as disk{disk_number} ({sectors} sector(s)).");
+        }
+        Err(disk::UsbAttachError::AlreadyAttached) => {
+            println!("A USB disk is already attached this boot.");
+        }
+        Err(disk::UsbAttachError::NoDevice) => {
+            println!("No USB Mass Storage device found.");
+        }
+        Err(disk::UsbAttachError::NotReady) => {
+            println!("Device did not report ready.");
+        }
+        Err(disk::UsbAttachError::Capacity(error)) => {
+            println!("READ CAPACITY failed: {error:?}");
+        }
+        Err(disk::UsbAttachError::Full) => {
+            println!("No free secondary disk slot available.");
+        }
+    }
 }
 
 /// Standalone verification for `kernel/src/usb_storage.rs`, mirroring

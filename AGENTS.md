@@ -1463,11 +1463,88 @@ image's real size, and `READ(10)` of the first sector matching a known
 seeded byte pattern exactly. `write_10` was manually verified end to end
 during development (write a pattern to block 1, read it back, confirm an
 exact match) via a temporary shell-command hook removed before committing
-the read-only command; a permanent write round-trip test is more useful
-once this driver is wired into `disk.rs` as an ordinary secondary disk,
-through the same `write`/`cat`-based tests every other disk backend
-already has -- explicit follow-on work, along with the actual
-`disk::Device::Boot`-switching fix for the motivating Pentium 4 problem.
+the read-only command; `write_10` itself is now wired into `disk.rs` --
+see the next section -- so this manual verification is superseded by that
+integration's own real, permanent test.
+
+#### Wiring USB Mass Storage into `disk.rs` as an ordinary secondary disk
+
+`disk::Device` used to be a closed two-variant enum (`Boot`/
+`Secondary(usize)`) that *was* a BIOS drive number end to end -- every
+secondary disk was addressed by a `drive_number` the trampoline could
+call directly. Rather than adding a third `Device` variant (which would
+have meant threading a USB/BIOS distinction through every function that
+already matches on `Device`), the distinction was pushed one level down:
+`SecondaryDisk` (the existing per-slot struct
+`discover_secondary_disks` already populates) gained a `backend` field
+(`SecondaryBackend::Bios(u8)` or `SecondaryBackend::Usb`), so `Device`
+itself, `device_sector_count`, `device_data_partition_lba`/`sectors`,
+and the `diskN` selector parsing in `shell.rs` needed *no changes at
+all* -- a USB disk is simply one more entry in the same
+`SECONDARY_DISKS` table a BIOS secondary disk already occupies, assigned
+the next available `diskN` number exactly the same way. Only
+`transfer`/`transfer_chunk` needed a real branch: `is_usb_backed`
+checks a device's backend, and a `Usb`-backed transfer goes through a
+new `usb_transfer` helper (`usb_storage::MscDevice::read_10`/`write_10`
+against the single `USB_DISK` static) instead of `call_trampoline`,
+after the same `device_sector_count` bounds check every other transfer
+already gets.
+
+`disk::attach_usb_disk` (called only by the new `usb storage attach`
+shell command, never automatically) does the actual discovery + capacity
+read + `SECONDARY_DISKS` registration in one call, rejecting a second
+attach while one is already attached (`UsbAttachError::AlreadyAttached`
+-- at most one USB disk is supported, since `usb_storage::open()` itself
+only ever finds the first Bulk-Only Transport device). This is
+deliberately **not** part of `discover_secondary_disks`'s automatic
+boot-time BIOS probing, for the same reason the standalone `usb storage`
+command stayed read-only: discovering a USB Mass Storage device means
+calling `uhci::initialize_all()`, which resets every UHCI controller
+found -- confirmed to break BIOS's own legacy `INT13h` emulation. An
+operator must explicitly opt into `usb storage attach` each boot, and the
+command itself prints an explicit warning before doing so.
+
+**This risk turned out to be more general, and more immediate, than the
+original Pentium 4 finding alone suggested -- confirmed concretely while
+testing this exact feature, not just inferred.** Booting a plain QEMU
+guest with a `usb-storage` device attached and no special configuration
+showed `disk2: found (BIOS drive 0x81, 2048 sectors)` in the ordinary
+boot log: SeaBIOS's own USB legacy support had *already* exposed that
+same physical device as an ordinary BIOS secondary disk before any native
+USB code ever ran. Running `usb storage attach` afterward (which
+discovers a *different* `diskN`, e.g. `disk3`, for the identical device)
+immediately broke `disk2`'s own BIOS-backed access
+(`FOSFS disk error: FirmwareFailure` on the very next command against
+it) -- the newly attached native `diskN` remained fully readable and
+writable throughout, only the now-redundant BIOS path to the same
+hardware broke. This means the danger is not limited to "don't combine
+USB audio with a USB-booted machine" -- **any machine with a USB Mass
+Storage device already plugged in (very likely already reachable as an
+ordinary BIOS secondary `diskN`, courtesy of the same legacy-USB support
+that makes it USB-bootable at all) should be assumed to break that
+device's own BIOS-backed `diskN` the moment any UHCI-touching command
+runs**, not only `disk1`/the boot disk specifically. `attach_usb_disk`'s
+own doc comment records this finding in full.
+
+Verified end to end by `tapes/test_usb_storage_disk_e2e.py`: `usb storage
+attach` reports a new `diskN`, `format`/`write`/`cat` against it round-trip
+byte-exact content, and a second `usb storage attach` call is correctly
+rejected. One command in this flow was observed to occasionally fail with
+a transient `FirmwareFailure` in a busy host-scheduling environment during
+development (5 of 6 manual repeats were completely clean) -- consistent
+with this project's other UHCI-adjacent QEMU tests' documented
+host-timing jitter (see "Isochronous OUT transfers" above), not a
+reproduced logic bug; the test itself does not retry, so a failure there
+is worth one manual re-run before assuming a regression, per that test's
+own doc comment.
+
+Deliberately still out of scope, per this whole feature's original
+scoping plan: transparently switching `disk::Device::Boot` itself over to
+this driver (the part that would actually close the Pentium 4 gap this
+feature was built for) needs its own "assume the one discovered USB MSC
+device is the boot device" heuristic, and `reboot soft`'s own from-scratch
+BIOS-dependent kernel reload would still need a separate fix regardless
+-- both remain named, not-yet-scoped follow-on work.
 
 ### Tape print callback ABI
 
@@ -2123,13 +2200,18 @@ help the AMD machine's POST-time failure at all, since that happens
 before any denylist could take effect) or a native USB mass-storage
 driver, removing fos's dependency on BIOS continuing to own the
 controller for its own `INT13h` emulation once fos has taken it over --
-the only option that would also help the P4 case. This driver now has a
-first, self-contained increment (enumeration, `INQUIRY`/`READ CAPACITY`/
-`READ(10)`/`WRITE(10)`, verified standalone via the `usb storage` shell
-command -- see "USB Mass Storage (Bulk-Only Transport)" above), but
-wiring it into `disk.rs` and actually switching `disk::Device::Boot` over
-to it (the part that would close the P4 gap for real) remain separate,
-not-yet-done steps -- see "Deliberately deferred work" below.
+the only option that would also help the P4 case. This driver is now
+built and wired into `disk.rs` as an ordinary secondary disk (the
+explicit `usb storage attach` command; see "USB Mass Storage (Bulk-Only
+Transport)" and "Wiring USB Mass Storage into `disk.rs`" above) --
+including a concretely confirmed, more general version of this very
+risk, found while testing it: a USB Mass Storage device is very likely
+*already* reachable as an ordinary BIOS-backed `diskN` via legacy USB
+support before this driver ever runs, and attaching the native driver
+breaks that device's own BIOS-backed access too, not only the boot
+disk's. Actually switching `disk::Device::Boot` over to this driver (the
+part that would close the P4 gap for real) remains a separate,
+not-yet-done step -- see "Deliberately deferred work" below.
 
 ### Talking to a real fos machine from a sandboxed dev environment
 
@@ -2663,14 +2745,15 @@ MSI address/data encoding, and the full verification list) is in
   genuinely concurrently on real hardware); EHCI/OHCI/xHCI remain
   deferred, and no tape yet exercises simultaneous playback+capture
   through the tape ABI itself even though the underlying engine now
-  supports it. USB Mass Storage (Bulk-Only Transport) also has a first,
-  self-contained increment -- see "USB Mass Storage (Bulk-Only
-  Transport): a bulk-transfer primitive, and the standalone `usb storage`
-  command" above -- but only enumeration/read/write against a discovered
-  device, verified standalone; wiring it into `disk.rs` as an ordinary
-  secondary disk, and the further, separate step of transparently
-  switching `disk::Device::Boot` itself to close the real-hardware
-  Pentium 4 gap that motivated this driver, both remain deferred.
+  supports it. USB Mass Storage (Bulk-Only Transport) is also built and
+  now wired into `disk.rs` as an ordinary secondary disk -- see "USB Mass
+  Storage (Bulk-Only Transport)" and "Wiring USB Mass Storage into
+  `disk.rs`" above -- reachable via the explicit `usb storage attach`
+  shell command (never automatic at boot). Transparently switching
+  `disk::Device::Boot` itself over to this driver, the step that would
+  actually close the real-hardware Pentium 4 gap that motivated it,
+  remains deferred, along with the separate `reboot soft` fix it would
+  also need.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.

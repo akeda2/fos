@@ -438,12 +438,9 @@ impl MscDevice {
     }
 
     /// `WRITE(10)`, the mirror image of `read_10` -- same block-count
-    /// contract. Not yet called anywhere: the standalone `usb storage`
-    /// shell command is deliberately read-only (issuing a real write
-    /// against whichever USB device happens to enumerate first, with no
-    /// disk-selection safeguard, is not a safe default action), so this
-    /// is exercised by a dedicated test once `disk.rs` integration lands.
-    #[allow(dead_code)]
+    /// contract. Called from `kernel/src/disk.rs`'s `usb_transfer`, never
+    /// from the standalone `usb storage` shell command (deliberately
+    /// read-only -- see its own doc comment in `shell.rs`).
     pub fn write_10(&mut self, lba: u32, buffer: &mut [u8]) -> Result<(), Error> {
         let blocks = block_count(buffer.len())?;
         let cdb = read_write_cdb(0x2a, lba, blocks);
