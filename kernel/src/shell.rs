@@ -1033,7 +1033,11 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
             usb_storage_attach_command(info);
             return;
         }
-        println!("Usage: usb storage [attach]");
+        if second.eq_ignore_ascii_case(b"promote") && trailing.is_empty() {
+            usb_storage_promote_command(info);
+            return;
+        }
+        println!("Usage: usb storage [attach|promote]");
         return;
     }
 
@@ -1070,6 +1074,44 @@ fn usb_storage_attach_command(info: &BootInfo) {
         }
         Err(disk::UsbAttachError::Full) => {
             println!("No free secondary disk slot available.");
+        }
+    }
+}
+
+/// Discovers a USB Mass Storage device and, only if its capacity and
+/// first-sector bytes exactly match `disk1`'s own BIOS-read baseline,
+/// switches `disk1` itself over to the native driver -- see
+/// `disk::promote_boot_to_usb`'s own doc comment for the full
+/// cross-validation this performs and why it is safe to trust more than
+/// a bare "assume the only device found is the boot device" guess. This
+/// is the step that actually removes `disk1`'s own dependency on BIOS's
+/// "USB Legacy Support" staying intact once any UHCI controller has been
+/// reset.
+fn usb_storage_promote_command(info: &BootInfo) {
+    println!("Resetting UHCI controllers to discover the device; this");
+    println!("can break BIOS's own USB-drive emulation for any disk");
+    println!("still served that way. Comparing its capacity and first");
+    println!("sector against disk1's own BIOS-read baseline first.");
+    match disk::promote_boot_to_usb(info) {
+        Ok(()) => println!("disk1 now reads/writes through the native USB driver."),
+        Err(disk::BootPromoteError::AlreadyPromoted) => {
+            println!("disk1 is already USB-backed.");
+        }
+        Err(disk::BootPromoteError::BiosReadFailed) => {
+            println!("Could not read disk1's boot sector via BIOS.");
+        }
+        Err(disk::BootPromoteError::NoDevice) => {
+            println!("No USB Mass Storage device found.");
+        }
+        Err(disk::BootPromoteError::NotReady) => {
+            println!("Device did not report ready.");
+        }
+        Err(disk::BootPromoteError::Capacity(error)) => {
+            println!("READ CAPACITY failed: {error:?}");
+        }
+        Err(disk::BootPromoteError::NotSameDisk) => {
+            println!("Discovered device does not match disk1's own boot");
+            println!("sector/capacity; disk1 was left untouched.");
         }
     }
 }
@@ -7518,6 +7560,10 @@ fn print_boot_info(info: &BootInfo) {
             "unavailable"
         }
     );
+    if disk::boot_is_usb() {
+        println!("disk1 is promoted: reads/writes go through the native");
+        println!("USB driver, not BIOS (see 'usb storage promote').");
+    }
 }
 
 #[inline(never)]

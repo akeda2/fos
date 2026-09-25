@@ -1538,13 +1538,78 @@ reproduced logic bug; the test itself does not retry, so a failure there
 is worth one manual re-run before assuming a regression, per that test's
 own doc comment.
 
-Deliberately still out of scope, per this whole feature's original
-scoping plan: transparently switching `disk::Device::Boot` itself over to
-this driver (the part that would actually close the Pentium 4 gap this
-feature was built for) needs its own "assume the one discovered USB MSC
-device is the boot device" heuristic, and `reboot soft`'s own from-scratch
-BIOS-dependent kernel reload would still need a separate fix regardless
--- both remain named, not-yet-scoped follow-on work.
+#### Closing the Pentium 4 gap for real: `usb storage promote`
+
+The original scoping plan flagged transparently switching
+`disk::Device::Boot` itself over to this driver as a separate, riskier
+follow-on, needing "its own heuristic" beyond simple attachment -- fos
+has no BIOS call that answers "is drive `0x80` a USB device", and no way
+to correlate a discovered USB Mass Storage device with a specific BIOS
+drive number. The plan's own first-considered heuristic ("assume the one
+discovered device is the boot device") was deliberately **not** used:
+it's cheap to state but wrong exactly when it matters most (a machine
+with more than one USB storage device attached).
+
+`disk::promote_boot_to_usb` instead cross-validates using the disk's
+actual content. Before touching UHCI at all, it reads `disk1`'s own
+LBA 0 (its MBR -- present and BIOS-readable on every fos image
+regardless of GPT/partition layout) via the *ordinary* BIOS path, and
+also records `disk1`'s own BIOS-reported sector count. This baseline
+read is a one-shot opportunity: discovering the USB device immediately
+afterward may itself break BIOS's access to this exact disk (the
+confirmed mechanism the previous section documents), so it must happen
+strictly first. Only if the discovered USB device's own capacity *and*
+its own LBA 0 bytes match that baseline exactly does `Device::Boot`
+switch over (a new `BOOT_USB_DEVICE` static, deliberately independent of
+`USB_DISK` above -- promoting the boot disk and attaching an ordinary
+secondary USB disk are mutually exclusive uses of whatever single device
+is discovered); otherwise `promote_boot_to_usb` returns
+`BootPromoteError::NotSameDisk` and `Device::Boot` is left completely
+untouched. Two independent physical disks sharing both an exact capacity
+and a byte-identical MBR is not realistically possible by accident, so
+this is a strong, evidence-based check, not a bare guess -- though still
+documented as "confirmed, not proven," matching this whole follow-on's
+own honest framing. `is_usb_backed`/`usb_transfer` (the same dispatch
+`transfer`/`transfer_chunk` already use for a `SecondaryBackend::Usb`
+disk) were extended to also recognize a promoted `Device::Boot` and
+route it to `BOOT_USB_DEVICE` instead of `USB_DISK` -- no other function
+needed to change, since `device_data_partition_lba`/`sectors` for
+`Device::Boot` already just return the GPT-discovered (or
+loader-provided) geometry established once at `disk::initialize` time,
+which remains correct: promotion only changes *how* sectors are
+transferred, never which physical bytes they refer to.
+
+The explicit `usb storage promote` shell command (never automatic,
+printing the same kind of "this resets every UHCI controller" warning
+`usb storage attach` already does) drives this. `bootinfo` gained one
+conditional line reporting whether `disk1` is currently promoted.
+Verified end to end by `tapes/test_usb_boot_promote_e2e.py` -- the one
+test in this whole feature that actually boots `build/fos.img` itself
+from a QEMU `usb-storage` device (`-boot order=c`, SeaBIOS's own USB
+Legacy Support) rather than an ordinary IDE `-drive`, faithfully
+reproducing the real Pentium 4 scenario entirely inside QEMU: `disk1` is
+ordinarily BIOS-readable before promotion, `usb storage promote`
+discovers and confirms the very disk it just booted from, `bootinfo`
+reflects the promoted state, and `disk1` remains fully readable *and
+writable* afterward -- proving ordinary FOSFS access to the boot disk no
+longer depends on BIOS's own legacy USB emulation staying intact, even
+though discovering the device during `promote` already reset the UHCI
+controller that emulation depends on. A second scenario in the same test
+file (`test_refuses_mismatched_device`) confirms the cross-validation
+actually rejects a clearly different USB device (a distinctly-sized,
+all-zero backing image) rather than ever guessing, leaving `disk1`
+completely untouched and still BIOS-backed.
+
+**Still deliberately out of scope**: `reboot soft` re-enters
+`boot/stage2.S` from scratch and always depends on BIOS to reload the
+kernel, completely independent of this feature's own, purely Rust-level
+`BOOT_USB_DEVICE` state (which a fresh boot always reinitializes to
+`None` regardless of whether the previous boot had promoted it). If
+`disk1`'s BIOS access is already broken by the time a soft reboot is
+attempted, it fails exactly as already documented in the previous
+section -- promoted or not. A real fix would need stage two itself to
+speak USB, an undertaking on the scale of a native 16-bit real-mode USB
+driver, not attempted here.
 
 ### Tape print callback ABI
 
@@ -2209,9 +2274,12 @@ risk, found while testing it: a USB Mass Storage device is very likely
 *already* reachable as an ordinary BIOS-backed `diskN` via legacy USB
 support before this driver ever runs, and attaching the native driver
 breaks that device's own BIOS-backed access too, not only the boot
-disk's. Actually switching `disk::Device::Boot` over to this driver (the
-part that would close the P4 gap for real) remains a separate,
-not-yet-done step -- see "Deliberately deferred work" below.
+disk's. `disk::Device::Boot` itself can now also be switched over to this
+driver (`usb storage promote`, cross-validated against `disk1`'s own
+BIOS-read boot sector and capacity rather than guessed -- see "Closing
+the Pentium 4 gap for real" above), closing the P4 case for real; the one
+remaining named gap is `reboot soft`, which still depends on BIOS
+regardless of promotion -- see "Deliberately deferred work" below.
 
 ### Talking to a real fos machine from a sandboxed dev environment
 
@@ -2745,15 +2813,16 @@ MSI address/data encoding, and the full verification list) is in
   genuinely concurrently on real hardware); EHCI/OHCI/xHCI remain
   deferred, and no tape yet exercises simultaneous playback+capture
   through the tape ABI itself even though the underlying engine now
-  supports it. USB Mass Storage (Bulk-Only Transport) is also built and
-  now wired into `disk.rs` as an ordinary secondary disk -- see "USB Mass
-  Storage (Bulk-Only Transport)" and "Wiring USB Mass Storage into
-  `disk.rs`" above -- reachable via the explicit `usb storage attach`
-  shell command (never automatic at boot). Transparently switching
-  `disk::Device::Boot` itself over to this driver, the step that would
-  actually close the real-hardware Pentium 4 gap that motivated it,
-  remains deferred, along with the separate `reboot soft` fix it would
-  also need.
+  supports it. USB Mass Storage (Bulk-Only Transport) is also built,
+  wired into `disk.rs` as an ordinary secondary disk, and can also
+  transparently take over `disk::Device::Boot` itself -- see "USB Mass
+  Storage (Bulk-Only Transport)", "Wiring USB Mass Storage into
+  `disk.rs`", and "Closing the Pentium 4 gap for real" above -- via the
+  explicit `usb storage attach`/`usb storage promote` shell commands
+  (never automatic at boot). `reboot soft`'s own from-scratch,
+  BIOS-dependent kernel reload remains a separate, deliberately
+  unaddressed gap even once `disk1` is promoted -- see that section's
+  own closing paragraph.
 - A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
   trampoline is educational and intentionally narrow, not a scalable disk
   architecture.

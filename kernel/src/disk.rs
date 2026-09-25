@@ -90,6 +90,13 @@ static mut SECONDARY_COUNT: usize = 0;
 /// [`attach_usb_disk`]'s own doc comment for why this driver does not yet
 /// support more).
 static mut USB_DISK: Option<usb_storage::MscDevice> = None;
+/// Set by [`promote_boot_to_usb`] once `Device::Boot` itself has been
+/// confirmed to be this exact USB device and switched over to it --
+/// completely independent of [`USB_DISK`] above, since promoting the boot
+/// disk and attaching an ordinary secondary USB disk are mutually
+/// exclusive uses of whatever single USB Mass Storage device is
+/// discovered (see that function's own doc comment).
+static mut BOOT_USB_DEVICE: Option<usb_storage::MscDevice> = None;
 
 /// Errors specific to *attaching* a USB Mass Storage disk -- distinct
 /// from the ordinary [`Error`] enum, which describes a failed read/write
@@ -104,6 +111,26 @@ pub enum UsbAttachError {
     Capacity(usb_storage::Error),
     /// Every [`MAX_SECONDARY_DISKS`] slot is already in use.
     Full,
+}
+
+/// Errors specific to [`promote_boot_to_usb`].
+#[derive(Debug)]
+pub enum BootPromoteError {
+    /// `Device::Boot` is already USB-backed; see [`promote_boot_to_usb`].
+    AlreadyPromoted,
+    /// Could not read `disk1`'s own boot sector via BIOS before even
+    /// attempting discovery -- without this baseline there is nothing to
+    /// compare a discovered USB device against, so promotion refuses to
+    /// proceed at all rather than guessing.
+    BiosReadFailed,
+    NoDevice,
+    NotReady,
+    Capacity(usb_storage::Error),
+    /// The discovered USB device's own capacity or first-sector bytes
+    /// did not match `disk1`'s BIOS-read baseline -- almost certainly a
+    /// different physical disk. `Device::Boot` is left completely
+    /// untouched.
+    NotSameDisk,
 }
 
 /// Identifies which physical disk an FOSFS operation targets. `Boot` is the
@@ -174,12 +201,14 @@ fn drive_number(info: &BootInfo, device: Device) -> Option<u8> {
     }
 }
 
-/// Whether `device` is a [`SecondaryBackend::Usb`] disk -- `transfer`/
+/// Whether `device` is USB-backed -- either an ordinary
+/// [`SecondaryBackend::Usb`] disk, or `Device::Boot` itself once
+/// [`promote_boot_to_usb`] has switched it over. `transfer`/
 /// `transfer_chunk`'s branch point between the BIOS trampoline and
 /// `usb_storage`'s Bulk-Only Transport driver.
 fn is_usb_backed(device: Device) -> bool {
     match device {
-        Device::Boot => false,
+        Device::Boot => unsafe { (*core::ptr::addr_of!(BOOT_USB_DEVICE)).is_some() },
         Device::Secondary(index) => {
             matches!(secondary_disk(index).map(|disk| disk.backend), Some(SecondaryBackend::Usb))
         }
@@ -331,6 +360,78 @@ pub fn attach_usb_disk() -> Result<usize, UsbAttachError> {
         USB_DISK = Some(device);
         Ok(index)
     }
+}
+
+/// Whether `Device::Boot` has already been switched over to a native USB
+/// backend by [`promote_boot_to_usb`].
+pub fn boot_is_usb() -> bool {
+    is_usb_backed(Device::Boot)
+}
+
+/// Discovers a USB Mass Storage device and, **only if it can be confirmed
+/// to be the exact same physical disk `Device::Boot` already is**,
+/// switches `Device::Boot`'s own sector transfers over to it -- closing
+/// the real-hardware Pentium 4 gap this whole driver was built for: once
+/// promoted, ordinary disk access no longer depends on BIOS's "USB Legacy
+/// Support" `INT13h` emulation staying intact, so a later `usb`/`usb
+/// play`/`usb capture`/`audio` command (or another `attach_usb_disk` for
+/// a *different* device) can no longer break `disk1` merely by resetting
+/// a UHCI controller.
+///
+/// fos has no reliable way to ask BIOS "is this drive number a USB
+/// device" or to correlate a discovered USB device with a specific BIOS
+/// drive number -- so this does **not** use the weaker "assume the only
+/// discovered device is the boot device" heuristic the original scoping
+/// plan first considered. Instead it cross-validates using the disk's
+/// actual content: `disk1`'s own LBA 0 (its MBR -- present and BIOS-
+/// readable on every fos image regardless of GPT/partition layout) is
+/// read via the *ordinary* BIOS path first, strictly before any UHCI
+/// controller is ever touched (discovering the USB device below may
+/// itself break BIOS's access to this exact disk, per the confirmed
+/// mechanism `attach_usb_disk` documents -- so this baseline read is a
+/// one-shot opportunity, taken before that risk exists). Only if the
+/// discovered USB device's own capacity *and* its own LBA 0 bytes match
+/// that baseline exactly is `Device::Boot` switched over; otherwise it is
+/// almost certainly a different physical disk, and `Device::Boot` is left
+/// completely untouched (`BootPromoteError::NotSameDisk`). This is a very
+/// strong check (two independent physical disks sharing both an exact
+/// capacity and a byte-identical MBR is not realistically possible by
+/// accident), though not an absolute proof -- deliberately documented as
+/// "confirmed, not just assumed," matching this project's own "heuristic,
+/// not certainty" framing for this whole follow-on.
+///
+/// Deliberately still does **not** fix `reboot soft`: that path re-enters
+/// `boot/stage2.S` from scratch and always depends on BIOS to reload the
+/// kernel, completely independent of this function's own, purely
+/// Rust-level `BOOT_USB_DEVICE` state (which a fresh boot always
+/// reinitializes to `None` regardless). If `disk1`'s BIOS access is
+/// already broken by the time a soft reboot is attempted, it fails
+/// exactly as already documented in AGENTS.md's "USB audio and USB-boot
+/// media do not reliably coexist" section, promoted or not.
+pub fn promote_boot_to_usb(info: &BootInfo) -> Result<(), BootPromoteError> {
+    if is_usb_backed(Device::Boot) {
+        return Err(BootPromoteError::AlreadyPromoted);
+    }
+    let baseline = read_sector(info, 0, |sector| *sector).map_err(|_| BootPromoteError::BiosReadFailed)?;
+    let boot_sectors = device_sector_count(info, Device::Boot);
+
+    let mut device = usb_storage::open().ok_or(BootPromoteError::NoDevice)?;
+    if !device.wait_until_ready(10) {
+        return Err(BootPromoteError::NotReady);
+    }
+    let (block_count, _block_size) = device.read_capacity_10().map_err(BootPromoteError::Capacity)?;
+    let mut candidate = [0u8; SECTOR_SIZE];
+    if device.read_10(0, &mut candidate).is_err() {
+        return Err(BootPromoteError::NotSameDisk);
+    }
+    if u64::from(block_count) != boot_sectors || candidate != baseline {
+        return Err(BootPromoteError::NotSameDisk);
+    }
+
+    unsafe {
+        BOOT_USB_DEVICE = Some(device);
+    }
+    Ok(())
 }
 
 fn probe_drive(info: &BootInfo, drive_number: u8) -> Option<u64> {
@@ -492,7 +593,7 @@ fn transfer(info: &BootInfo, device: Device, lba: u64, direction: u32) -> Result
     }
     if is_usb_backed(device) {
         let sector = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR.0) };
-        return usb_transfer(lba, sector, direction);
+        return usb_transfer(device, lba, sector, direction);
     }
     let Some(drive_number) = drive_number(info, device) else {
         return Err(Error::Unavailable);
@@ -524,7 +625,7 @@ fn transfer_chunk(
     }
     if is_usb_backed(device) {
         let chunk = unsafe { &mut *core::ptr::addr_of_mut!(CHUNK.0) };
-        return usb_transfer(lba, &mut chunk[..count * SECTOR_SIZE], direction);
+        return usb_transfer(device, lba, &mut chunk[..count * SECTOR_SIZE], direction);
     }
     let Some(drive_number) = drive_number(info, device) else {
         return Err(Error::Unavailable);
@@ -542,19 +643,24 @@ fn transfer_chunk(
 /// The `Usb`-backed counterpart to `call_trampoline`: reads or writes
 /// `buffer` (already exactly a whole number of 512-byte blocks -- one for
 /// [`transfer`], up to [`MAX_TRANSFER_SECTORS`] for [`transfer_chunk`])
-/// through the single attached [`USB_DISK`] via `usb_storage`'s
-/// `READ(10)`/`WRITE(10)`. The caller has already bounds-checked `lba`
-/// against [`device_sector_count`]; SCSI `READ(10)`/`WRITE(10)` only carry
-/// a 32-bit LBA, so this additionally rejects (as [`Error::OutOfRange`])
-/// an address that would need more than 32 bits -- unreachable in
-/// practice for any USB flash drive's actual capacity, but a real,
-/// explicit check rather than a silent truncation.
-fn usb_transfer(lba: u64, buffer: &mut [u8], direction: u32) -> Result<(), Error> {
+/// through whichever USB device backs `device` -- [`BOOT_USB_DEVICE`] for
+/// a promoted `Device::Boot`, [`USB_DISK`] for an ordinary
+/// `SecondaryBackend::Usb` disk -- via `usb_storage`'s `READ(10)`/
+/// `WRITE(10)`. The caller has already bounds-checked `lba` against
+/// [`device_sector_count`]; SCSI `READ(10)`/`WRITE(10)` only carry a
+/// 32-bit LBA, so this additionally rejects (as [`Error::OutOfRange`]) an
+/// address that would need more than 32 bits -- unreachable in practice
+/// for any USB flash drive's actual capacity, but a real, explicit check
+/// rather than a silent truncation.
+fn usb_transfer(device: Device, lba: u64, buffer: &mut [u8], direction: u32) -> Result<(), Error> {
     let Ok(lba) = u32::try_from(lba) else {
         return Err(Error::OutOfRange);
     };
-    let device = unsafe { (*core::ptr::addr_of_mut!(USB_DISK)).as_mut() };
-    let Some(device) = device else {
+    let handle = match device {
+        Device::Boot => unsafe { (*core::ptr::addr_of_mut!(BOOT_USB_DEVICE)).as_mut() },
+        Device::Secondary(_) => unsafe { (*core::ptr::addr_of_mut!(USB_DISK)).as_mut() },
+    };
+    let Some(device) = handle else {
         return Err(Error::Unavailable);
     };
     let result = if direction == 0 { device.read_10(lba, buffer) } else { device.write_10(lba, buffer) };
