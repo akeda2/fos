@@ -16,6 +16,7 @@ mod cpu;
 mod debug;
 mod disk;
 mod e1000;
+mod e1000e;
 mod es1370;
 mod fosfs;
 mod gdt;

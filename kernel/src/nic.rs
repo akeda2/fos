@@ -7,7 +7,7 @@
 //! Device IRQs only acknowledge a cause and make a foreground poll prompt;
 //! all descriptor and protocol parsing remains in foreground code.
 
-use crate::{e1000, i350, interrupts, ne2000, pci, rtl8139, threecom};
+use crate::{e1000, e1000e, i350, interrupts, ne2000, pci, rtl8139, threecom};
 
 pub const MAX_FRAME_LEN: usize = 1514;
 const MAX_NICS: usize = pci::MAX_DEVICE_MATCHES * 4;
@@ -16,6 +16,7 @@ pub enum Nic {
     Rtl8139(&'static rtl8139::Rtl8139),
     ThreeCom(&'static threecom::ThreeCom),
     E1000(&'static e1000::E1000),
+    E1000E(&'static e1000e::E1000E),
     I350(&'static i350::I350),
     Ne2000(&'static ne2000::Ne2000),
 }
@@ -53,6 +54,7 @@ impl Nic {
             Nic::Rtl8139(_) => "RTL8139",
             Nic::ThreeCom(_) => "3C905",
             Nic::E1000(_) => "Intel e1000",
+            Nic::E1000E(_) => "Intel e1000e",
             Nic::I350(_) => "Intel I350",
             Nic::Ne2000(_) => "NE2000-compatible",
         }
@@ -63,6 +65,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.mac_address(),
             Nic::ThreeCom(nic) => nic.mac_address(),
             Nic::E1000(nic) => nic.mac_address(),
+            Nic::E1000E(nic) => nic.mac_address(),
             Nic::I350(nic) => nic.mac_address(),
             Nic::Ne2000(nic) => nic.mac_address(),
         }
@@ -70,7 +73,7 @@ impl Nic {
 
     pub fn link_up(&self) -> Option<bool> {
         match self {
-            Nic::Rtl8139(_) | Nic::E1000(_) | Nic::I350(_) | Nic::Ne2000(_) => None,
+            Nic::Rtl8139(_) | Nic::E1000(_) | Nic::E1000E(_) | Nic::I350(_) | Nic::Ne2000(_) => None,
             Nic::ThreeCom(nic) => Some(nic.link_up()),
         }
     }
@@ -80,6 +83,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.send(frame),
             Nic::ThreeCom(nic) => nic.send(frame),
             Nic::E1000(nic) => nic.send(frame),
+            Nic::E1000E(nic) => nic.send(frame),
             Nic::I350(nic) => nic.send(frame),
             Nic::Ne2000(nic) => nic.send(frame),
         }
@@ -90,6 +94,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.receive(out),
             Nic::ThreeCom(nic) => nic.receive(out),
             Nic::E1000(nic) => nic.receive(out),
+            Nic::E1000E(nic) => nic.receive(out),
             Nic::I350(nic) => nic.receive(out),
             Nic::Ne2000(nic) => nic.receive(out),
         }
@@ -100,6 +105,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.set_promiscuous(enabled),
             Nic::ThreeCom(nic) => nic.set_promiscuous(enabled),
             Nic::E1000(nic) => nic.set_promiscuous(enabled),
+            Nic::E1000E(nic) => nic.set_promiscuous(enabled),
             Nic::I350(nic) => nic.set_promiscuous(enabled),
             Nic::Ne2000(nic) => nic.set_promiscuous(enabled),
         }
@@ -110,6 +116,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.overflow_count(),
             Nic::ThreeCom(nic) => nic.overflow_count(),
             Nic::E1000(nic) => nic.overflow_count(),
+            Nic::E1000E(nic) => nic.overflow_count(),
             Nic::I350(nic) => nic.overflow_count(),
             Nic::Ne2000(nic) => nic.overflow_count(),
         }
@@ -120,6 +127,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.interrupt_stats(),
             Nic::ThreeCom(nic) => nic.interrupt_stats(),
             Nic::E1000(nic) => nic.interrupt_stats(),
+            Nic::E1000E(nic) => nic.interrupt_stats(),
             Nic::I350(nic) => nic.interrupt_stats(),
             Nic::Ne2000(nic) => nic.interrupt_stats(),
         };
@@ -136,6 +144,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.health(),
             Nic::ThreeCom(nic) => nic.health(),
             Nic::E1000(nic) => nic.health(),
+            Nic::E1000E(nic) => nic.health(),
             Nic::I350(nic) => nic.health(),
             Nic::Ne2000(nic) => nic.health(),
         }
@@ -150,6 +159,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.watchdog(),
             Nic::ThreeCom(nic) => nic.watchdog(),
             Nic::E1000(nic) => nic.watchdog(),
+            Nic::E1000E(nic) => nic.watchdog(),
             Nic::I350(nic) => nic.watchdog(),
             Nic::Ne2000(nic) => nic.watchdog(),
         }
@@ -160,6 +170,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.enable_interrupts(),
             Nic::ThreeCom(nic) => nic.enable_interrupts(),
             Nic::E1000(nic) => nic.enable_interrupts(),
+            Nic::E1000E(nic) => nic.enable_interrupts(),
             Nic::I350(nic) => nic.enable_interrupts(),
             Nic::Ne2000(nic) => nic.enable_interrupts(),
         }
@@ -174,6 +185,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.handle_interrupt(),
             Nic::ThreeCom(nic) => nic.handle_interrupt(),
             Nic::E1000(nic) => nic.handle_interrupt(),
+            Nic::E1000E(nic) => nic.handle_interrupt(),
             Nic::I350(nic) => nic.handle_interrupt(),
             Nic::Ne2000(nic) => nic.handle_interrupt(),
         }
@@ -208,12 +220,15 @@ fn add(nic: Nic) {
 }
 
 /// Initializes every supported backend instance once. Backend order remains
-/// RTL8139, 3C905, e1000, I350, then NE2000-compatible, so the first
-/// initialized card preserves the previous default selection policy.
+/// RTL8139, 3C905, e1000, e1000e, I350, then NE2000-compatible, so the
+/// first initialized card preserves the previous default selection policy.
 /// `i350::CANDIDATE_DEVICE_IDS` now carries one confirmed real device ID
 /// (see `i350.rs`'s module doc comment), so this is no longer a guaranteed
 /// no-op on hardware carrying that exact card -- its register-level
 /// behavior is otherwise still unverified against physical hardware.
+/// `e1000e::CANDIDATE_DEVICE_IDS` similarly carries one confirmed real
+/// device ID (82579V) alongside QEMU's own 82574L model -- see
+/// `e1000e.rs`'s module doc comment.
 pub fn initialize() -> Result<usize, Status> {
     unsafe {
         if INITIALIZED {
@@ -259,6 +274,17 @@ pub fn initialize() -> Result<usize, Status> {
         }
         Err(e1000::Status::NotPresent) => {}
         Err(e1000::Status::InitFailed) => init_failures += 1,
+    }
+    match e1000e::initialize_all() {
+        Ok(count) => {
+            for index in 0..count {
+                if let Some(nic) = e1000e::get(index) {
+                    add(Nic::E1000E(nic));
+                }
+            }
+        }
+        Err(e1000e::Status::NotPresent) => {}
+        Err(e1000e::Status::InitFailed) => init_failures += 1,
     }
     match i350::initialize_all() {
         Ok(count) => {

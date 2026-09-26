@@ -1010,6 +1010,63 @@ detail (the three register-layout differences from `e1000.rs`,
 scaffolding this module's effect on the reserved low-memory region) is in
 `docs/history/development-notes.md`.
 
+### e1000e: a sixth NIC backend, for Intel's 82574L/82579 family
+
+`kernel/src/e1000e.rs` targets Intel's "e1000e" family -- motivated by a
+real, physically owned ITX motherboard whose onboard NIC is an 82579V,
+confirmed via `lspci -vv` (device ID `0x1503`). Unlike the still-fully-
+real-hardware-only I350/3C509 drivers, this one also matches QEMU's own
+`-device e1000e` model (82574L, `0x10d3`), so it gets real `make test`-
+style QEMU coverage -- the same "one confirmed real device, one QEMU
+model" pairing `ac97.rs` uses, not a speculative broadening across the
+wider e1000e device-ID family. `0x1502` (82579LM) remains deliberately
+excluded until confirmed against a physical board carrying it.
+
+82579 (client, ICH/PCH-integrated) and 82574 (PCIe add-in-card-style) are
+handled by genuinely different code paths in Linux's own `e1000e` driver,
+not just two device IDs on one chip -- but both keep the classic
+single-queue legacy descriptor/ring register layout unchanged from
+`e1000.rs`'s 82540EM offsets, unlike I350's moved-and-multi-queued
+register map, so this module's shape mirrors `e1000.rs` closely rather
+than needing `i350.rs`'s more extensive rework.
+
+One real, chip-specific difference is implemented, gated to run only for
+the 82579 IDs: `acquire_pch_semaphore`/`release_pch_semaphore` implement
+82579's documented single-bit `EXTCNF_CTRL.MDIO_SW_OWNERSHIP` handshake
+(request ownership, then read back to confirm hardware actually granted
+it) before touching PHY-adjacent state around reset -- a different,
+simpler mechanism than I350's two-step `SWSM`/`SW_FW_SYNC` protocol, not
+a generalization of it. 82574L (QEMU) never runs this path. **Unverified
+against real hardware**, the same caveat `i350.rs`'s own semaphore
+carries. Deliberately *not* implemented: 82579's documented reset-hang
+erratum workaround (a real, Intel-spec-update-documented hang risk on a
+plain `CTRL.RST`, worked around in Linux's `ich8lan.c` with a specific
+PHY-register pre-reset sequence) -- guessing that sequence from memory
+risked a real-hardware-hang-prone fix subtly wrong in exactly the way
+that's hardest to diagnose remotely, so it is left as the single most
+likely real-hardware bring-up snag to watch for, not a pre-implemented
+fix. Also deliberately out of scope, consistent with every other NIC
+backend: MSI (82579 supports it, but this driver only ever uses the
+legacy PCI IRQ path), the "driver loaded" `CTRL_EXT` handshake with the
+Management Engine, K1/EEE/ULP link-power workarounds, and any flash/NVM
+access (the MAC address is read from `RAL0`/`RAH0` after reset, already
+loaded by hardware from NVM, exactly like `e1000.rs`/`i350.rs`).
+
+Verified end to end under QEMU: a single guest with `-device e1000e`
+enumerates as "Intel e1000e" with a valid MAC and transmits successfully;
+a two-guest fixture (each with its own `-device e1000e`, joined by a
+shared `socket,mcast=` netdev, the same technique
+`tapes/test_router_e2e.py`'s dual-e1000 fixture uses) confirmed genuine
+bidirectional send/receive -- `nic discover` from one guest found both
+itself and the other guest's peer entry, proving the second guest's
+`e1000e.rs` instance actually received the broadcast probe and replied.
+This exercises the shared ring/reset/send/receive plumbing, not the
+82579-only PCH semaphore path (82574L never takes it) -- that part
+remains real-hardware-only regardless of this QEMU coverage.
+
+Backend order in `nic::initialize()` is now RTL8139, 3C905, e1000,
+e1000e, I350, then NE2000-compatible.
+
 ### UHCI: a USB host controller driver, and isochronous USB Audio playback
 
 `kernel/src/uhci.rs` is a minimal UHCI (USB 1.1, I/O-port-based) host
