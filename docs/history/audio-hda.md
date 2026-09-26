@@ -2210,3 +2210,106 @@ AGENTS.md's own "Low-memory map" section has been corrected to describe
 measuring `__kernel_end` directly as the authoritative method, and to
 frame `0xA0000` (not `0x9f000`'s own EBDA-convention framing) as the real
 hard ceiling -- both corrections a direct result of this investigation.
+
+### Real-hardware verification on the P4/ICH4: a codec that (probably) isn't there
+
+With the driver confirmed correct under QEMU (register layout,
+sliding-`LVI` ring, and the `SR_FIFOE` interrupt-storm fix all verified
+via `-audiodev wav` capture -- see above), it was pushed to the real
+P4/ICH4 machine via KUP for the actual real-hardware confirmation this
+whole driver was motivated by. `pci` on that machine already showed a
+suspicious sign: `00:1f.5 8086:24d5 class=04/01 ... bar0=0x00000000`.
+`audio` reported the generic "found but could not be initialized" this
+project's `Status::InitFailed` always produces -- not enough on its own
+to diagnose *why*, so `ac97::init_card` was extended with temporary
+`println!` diagnostics at every one of its early-return points (BAR
+lookup, cold reset, `CR_RR` clear, DMA allocation, IRQ registration),
+rebuilt, and pushed again via KUP for each iteration -- the exact
+"iterate against a real machine almost as cheaply as QEMU" workflow
+"Debug mode" above exists for.
+
+First finding: `ac97: BAR0 (NAM) is not I/O-mapped; cannot proceed.` --
+confirming the `pci` dump's own `bar0=0x00000000` was the real blocker,
+not a red herring. Two hypotheses were considered: firmware simply never
+assigned this function's I/O resources (the same class of problem this
+project's "Talking to a real fos machine..." and USB sections already
+document firmware sometimes getting wrong), or the underlying hardware
+itself has no BAR to assign at all. The first hypothesis is fixable in
+software; the second is not, so it was tried first, on the theory that a
+real fix is more useful than a diagnosis alone if it's actually
+available: `PciAddress::assign_io_bar` (`pci.rs`) implements the standard
+PCI BAR-sizing idiom (write `0xffff_ffff`, read back the resulting size
+mask, restore the BAR to `0`, then write a caller-chosen base with the
+I/O-space type bit set and confirm it stuck), used as a fallback only
+when the ordinary `io_bar` read finds a completely blank BAR --
+`ac97::ensure_io_bar` tries the normal path first and only calls this on
+a `None`. Fallback bases (`NAM_FALLBACK_BASE = 0xe000`,
+`NABM_FALLBACK_BASE = 0xe100`) were chosen deliberately far above every
+I/O range this project has ever observed a real chipset use for anything
+else (this same machine's own UHCI controllers sit at
+`0xcc00`-`0xd800`), since this kernel has no system-wide I/O port
+allocation table to consult and a wrong guess risks colliding with
+something else entirely -- a real, accepted risk the user explicitly
+signed off on before this was attempted.
+
+Pushed and tested: the fallback assignment failed too, with the same
+generic message. Two more diagnostics were added to find out why rather
+than guess further: `PciAddress::debug_probe_bar` (the same
+write-all-1s/read-back/restore probe, but always returning the raw value
+for inspection instead of trying to interpret it) and
+`PciAddress::debug_power_state` (finds the PCI Power Management
+capability, ID `0x01`, and reads `PMCSR`'s current D-state -- a function
+sitting in D1/D2/D3 could plausibly ignore a BAR write until brought back
+to D0, a real, different failure mode this needed to rule out
+separately). Result: `power_state=Some(0)` (full D0 power, not a
+low-power gating issue) and `BAR0 raw=Some(0)` -- the all-1s probe came
+back as a hard, unconditional zero. Per the PCI spec, a BAR's own type
+bit (bit 0 for an I/O BAR) is hardwired and always readable regardless of
+address-field size, so a genuine I/O BAR can never probe back as fully
+zero; only a BAR with no register storage behind it at all does that.
+`BAR1`'s own raw probe was checked too (`debug_probe_bar(1)`, added in a
+follow-up iteration) and came back identically zero -- ruling out "only
+one of the two register windows is missing" in favor of the whole
+interface being unwired.
+
+One candidate explanation was tested and ruled out directly rather than
+assumed: the user reported a second, add-in PCI sound card had been
+physically installed at some point and might have "distorted" PCI
+enumeration or resource assignment for the onboard controller. It was
+removed, the machine re-tested from a fresh `pci` dump (confirming the
+card's own PCI function was in fact gone -- an 18-function bus, unchanged
+from before, no ES1370/other audio vendor ID anywhere), and the identical
+`audio` sequence re-run: byte-for-byte the same `BAR0 raw=Some(0)`,
+`power_state=Some(0)` result. This means whatever caused the BAR to read
+blank was present with or without the second card installed, ruling it
+out as the cause rather than merely suspecting it was unrelated.
+
+**Working conclusion**, not further pursued once both BARs behaved
+identically and the D0 finding ruled out power gating: this specific
+motherboard's ICH4 south bridge most likely exposes the AC'97 PCI
+*function* in configuration space for driver/inventory-detection
+purposes, but has no physical AC'97 codec chip actually populated on the
+board -- audio was frequently a discrete, skippable add-in-card option on
+boards of this generation, and some chipset implementations tie a
+function's own BAR/register presence to whether a companion component was
+ever detected present on its own private bus (the AC-link, in this
+case) at all. This is not a driver bug and not fixable by any further
+software effort along the lines already tried; the PCI-config-space
+read/write mechanism itself was independently confirmed working in the
+same session (the power-state read correctly returned a sensible D0), so
+this isn't an access-method problem either. The genuinely confirmatory
+next step would be a physical inspection of the board for an actual
+codec package (typically a small SOIC/TSSOP part near the rear audio
+jacks) versus empty, unpopulated pads -- outside the scope of what a
+remote KUP session can determine.
+
+The diagnostics that led to this conclusion were kept in the shipped
+driver (`ac97::init_card`'s BAR/power-state print, gated behind either
+BAR failing to resolve), since they directly explain a real, confirmed
+condition rather than leaving a future operator hitting the same
+`8086:24d5`-with-blank-BARs case back at square one; the exploratory
+success-path `println!`s added purely to narrate this investigation
+step-by-step (confirming each stage -- codec-ready, bus-master-channel
+reset, playback started -- succeeded in turn) were removed afterward, so
+a working card (QEMU's own, or a real one with an actual codec present)
+initializes exactly as quietly as ES1370/HDA already do.

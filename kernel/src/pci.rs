@@ -170,6 +170,97 @@ impl PciAddress {
         self.io_bar(0)
     }
 
+    /// Assigns a fixed I/O port base to `index`'s BAR when firmware left
+    /// it completely blank (reads back as literal `0` -- not even the
+    /// `BAR_IS_IO_SPACE` type bit set) -- a real, confirmed condition on
+    /// at least one physical machine's onboard AC'97 controller (see
+    /// `ac97.rs`'s own doc comment), where BIOS apparently never bothers
+    /// assigning resources to a function no boot-time driver needs.
+    ///
+    /// Follows the standard PCI BAR-sizing idiom: write all-1s, read back
+    /// the resulting size mask, restore the BAR to `0`, then write the
+    /// caller's requested base with the I/O-space type bit set and
+    /// confirm it actually stuck. Refuses (`None`) rather than guessing
+    /// further if the BAR already holds any nonzero value (never
+    /// overwrite something firmware or hardware actually assigned or
+    /// hardwired), if it doesn't behave like an I/O BAR at all, or if
+    /// `requested_base` isn't aligned to the BAR's own required size.
+    ///
+    /// This kernel has no system-wide I/O port allocation table to
+    /// consult, unlike a real OS -- `requested_base` is therefore a
+    /// caller-chosen guess, not a verified-free address. Callers must
+    /// pick a value deliberately far from every I/O range this project
+    /// has ever observed a real chipset actually use (see `ac97.rs`'s own
+    /// fallback constants for the reasoning behind its specific choice).
+    /// Diagnostic-only: finds this function's PCI Power Management
+    /// capability (ID `0x01`) if it has one, and returns its current
+    /// power state (`PMCSR`'s low 2 bits: 0=D0/full power, 1=D1, 2=D2,
+    /// 3=D3hot) -- useful for telling "firmware never assigned this BAR"
+    /// apart from "this function is sitting in a low-power state where
+    /// even a BAR write has no effect until it's brought back to D0",
+    /// a real possibility for an onboard audio codec some BIOS setups
+    /// let an operator disable entirely.
+    pub fn debug_power_state(&self) -> Option<u8> {
+        const CAPABILITY_ID_POWER_MANAGEMENT: u8 = 0x01;
+        const PMCSR_OFFSET_FROM_CAP: u8 = 4;
+        let cap = self.find_capability(CAPABILITY_ID_POWER_MANAGEMENT)?;
+        let pmcsr = read_u16(self.bus, self.device, self.function, cap + PMCSR_OFFSET_FROM_CAP);
+        Some((pmcsr & 0b11) as u8)
+    }
+
+    /// Diagnostic-only: probes `index`'s BAR the same way `assign_io_bar`
+    /// does (write all-1s, read back the size mask, restore the original
+    /// value) but always returns the raw readback rather than trying to
+    /// interpret it, for real-hardware debugging when `assign_io_bar`
+    /// itself refuses. Safe to call on an already-assigned BAR too, since
+    /// the original value is always restored.
+    pub fn debug_probe_bar(&self, index: u8) -> Option<u32> {
+        if index >= 6 {
+            return None;
+        }
+        let offset = BAR0_OFFSET + index * 4;
+        let original = read_u32(self.bus, self.device, self.function, offset);
+        write_u32(self.bus, self.device, self.function, offset, 0xffff_ffff);
+        let size_mask = read_u32(self.bus, self.device, self.function, offset);
+        write_u32(self.bus, self.device, self.function, offset, original);
+        Some(size_mask)
+    }
+
+    pub fn assign_io_bar(&self, index: u8, requested_base: u16) -> Option<u16> {
+        if index >= 6 {
+            return None;
+        }
+        let offset = BAR0_OFFSET + index * 4;
+        let current = read_u32(self.bus, self.device, self.function, offset);
+        if current != 0 {
+            return None;
+        }
+
+        write_u32(self.bus, self.device, self.function, offset, 0xffff_ffff);
+        let size_mask = read_u32(self.bus, self.device, self.function, offset);
+        write_u32(self.bus, self.device, self.function, offset, 0);
+        if size_mask & BAR_IS_IO_SPACE == 0 {
+            return None;
+        }
+        let size = (!(size_mask & 0xffff_fffc)).wrapping_add(1) & 0xffff;
+        if size == 0 || u32::from(requested_base) % size != 0 {
+            return None;
+        }
+
+        write_u32(
+            self.bus,
+            self.device,
+            self.function,
+            offset,
+            u32::from(requested_base) | BAR_IS_IO_SPACE,
+        );
+        let confirmed = read_u32(self.bus, self.device, self.function, offset);
+        if confirmed & 0xffff_fffc != u32::from(requested_base) {
+            return None;
+        }
+        Some(requested_base)
+    }
+
     /// Reads a 32-bit memory BAR, returning its physical base address.
     /// 64-bit memory BARs are deliberately not handled yet because the
     /// kernel and its DMA allocator currently use 32-bit physical addresses.

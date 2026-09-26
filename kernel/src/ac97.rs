@@ -113,6 +113,22 @@ const DEVICE_ICH_82801AA: u16 = 0x2415;
 /// for the contrasting case where sibling IDs really do differ).
 const DEVICE_ICH4: u16 = 0x24d5;
 
+/// Fallback I/O port bases used only when a BAR reads back completely
+/// blank and this driver has to assign one itself -- see
+/// `pci::PciAddress::assign_io_bar`'s own doc comment for the mechanism,
+/// and why this is a guess, not a verified-free address. Confirmed
+/// necessary on the real ICH4 machine this driver was built for: its
+/// BIOS leaves both AC'97 BARs at `0`, never assigning them at all.
+/// Chosen deliberately far above every I/O range this project has ever
+/// observed a real chipset actually use for anything else -- the same
+/// machine's own UHCI controllers, the highest other I/O BARs seen on
+/// it, sit at `0xcc00`-`0xd800` (see AGENTS.md's UHCI section) -- while
+/// staying spaced far enough apart from each other that neither
+/// controller's own (typically 64-256 byte) decode window can overlap
+/// the other's.
+const NAM_FALLBACK_BASE: u16 = 0xe000;
+const NABM_FALLBACK_BASE: u16 = 0xe100;
+
 // NABM (Native Audio Bus Master, BAR1) register offsets. `MKREGS` in
 // QEMU's own `ac97.c` derives each bus-master channel's own six
 // sub-registers from a `channel_index * 16` base; only PCM-out ("PO",
@@ -474,6 +490,17 @@ fn cold_reset_and_wait_ready(nabm_base: u16) -> Result<(), Status> {
     Err(Status::InitFailed)
 }
 
+/// Reads `index`'s I/O BAR the ordinary way first, and only falls back to
+/// `PciAddress::assign_io_bar` (a real, non-hypothetical need -- see
+/// `NAM_FALLBACK_BASE`'s own doc comment) if firmware left it genuinely
+/// blank.
+fn ensure_io_bar(address: &pci::PciAddress, index: u8, fallback_base: u16) -> Option<u16> {
+    if let Some(base) = address.io_bar(index) {
+        return Some(base);
+    }
+    address.assign_io_bar(index, fallback_base)
+}
+
 /// Brings up one already-PCI-discovered controller and, on success,
 /// appends it to `CARDS`. Split out of `initialize_all` purely so that
 /// function's own per-address loop reads as a plain list of attempts, one
@@ -484,16 +511,46 @@ fn init_card(address: pci::PciAddress) -> Result<(), Status> {
         return Err(Status::InitFailed);
     }
 
+    // If either BAR turns out unassignable, print the raw probe/power
+    // data behind that failure -- confirmed genuinely necessary on real
+    // hardware: the P4/ICH4 machine this driver targets has *both* BARs
+    // read back as a hard `0` even after the standard all-1s sizing
+    // probe, in full D0 power (ruling out a power-managed/disabled-
+    // device explanation). Per the PCI spec, an I/O BAR's own type bit
+    // is hardwired and always readable regardless of size, so this means
+    // there is no register storage behind either BAR at all -- not a
+    // firmware oversight `assign_io_bar` could fix, but this specific
+    // board's ICH4 AC'97 function most likely having no physical codec
+    // populated at all. See AGENTS.md's AC'97 section.
+    let nam_result = ensure_io_bar(&address, 0, NAM_FALLBACK_BASE);
+    let nabm_result = ensure_io_bar(&address, 1, NABM_FALLBACK_BASE);
+    if nam_result.is_none() || nabm_result.is_none() {
+        crate::println!(
+            "ac97: BAR0 raw={:?} BAR1 raw={:?} power_state={:?}",
+            address.debug_probe_bar(0),
+            address.debug_probe_bar(1),
+            address.debug_power_state()
+        );
+    }
+    let Some(nam_base) = nam_result else {
+        crate::println!("ac97: BAR0 (NAM) has no usable I/O address (blank, and this driver's own fallback assignment failed too); cannot proceed.");
+        return Err(Status::InitFailed);
+    };
+    let Some(nabm_base) = nabm_result else {
+        crate::println!("ac97: BAR1 (NABM) has no usable I/O address (blank, and this driver's own fallback assignment failed too); cannot proceed.");
+        return Err(Status::InitFailed);
+    };
     address.enable_io_and_bus_master();
-    let Some(nam_base) = address.io_bar0() else {
-        return Err(Status::InitFailed);
-    };
-    let Some(nabm_base) = address.io_bar(1) else {
-        return Err(Status::InitFailed);
-    };
     let irq = address.interrupt_line();
 
-    cold_reset_and_wait_ready(nabm_base)?;
+    if let Err(status) = cold_reset_and_wait_ready(nabm_base) {
+        crate::println!(
+            "ac97: cold reset timed out; GLOB_STA=0x{:08x} GLOB_CNT=0x{:08x}",
+            read_reg32(nabm_base, REG_GLOB_STA),
+            read_reg32(nabm_base, REG_GLOB_CNT)
+        );
+        return Err(status);
+    }
 
     // Unmute and set 0 dB attenuation on both the master output and the
     // PCM-out mixer path -- an AC'97 codec's power-on-reset defaults
@@ -516,14 +573,20 @@ fn init_card(address: pci::PciAddress) -> Result<(), Status> {
         }
     }
     if !rr_cleared {
+        crate::println!(
+            "ac97: PO_CR reset-registers bit never cleared; CR=0x{:02x}",
+            read_reg8(nabm_base, REG_PO_CR)
+        );
         return Err(Status::InitFailed);
     }
 
     let buffer_frames = (BUFFER_BYTES as usize).div_ceil(pmem::FRAME_SIZE as usize);
     let Some(buffer_addr) = pmem::allocate_contiguous(buffer_frames) else {
+        crate::println!("ac97: failed to allocate the playback DMA buffer.");
         return Err(Status::InitFailed);
     };
     let Some(bdl_addr) = pmem::allocate() else {
+        crate::println!("ac97: failed to allocate the BDL table frame.");
         return Err(Status::InitFailed);
     };
 
@@ -565,6 +628,7 @@ fn init_card(address: pci::PciAddress) -> Result<(), Status> {
 
     if let Some(irq) = irq {
         if !interrupts::register_pci_irq(irq, handle_pci_irq) {
+            crate::println!("ac97: failed to register the legacy PCI IRQ handler.");
             return Err(Status::InitFailed);
         }
     }

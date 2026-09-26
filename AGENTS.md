@@ -2123,10 +2123,37 @@ wav` output during a several-second `audio` session and verifying the
 built-in test tone's oscillation continues unbroken all the way through
 the capture, not just its first fraction of a second.
 
+**Confirmed on the real P4/ICH4 machine this driver targets -- but that
+machine's own onboard AC'97 has no physical codec behind it.**
+`PciAddress::assign_io_bar` (`pci.rs`) was added as a general fallback for
+a BAR firmware never assigns (`pci` on this machine shows `bar0=0x00000000`
+for the AC'97 function), following the standard PCI BAR-sizing idiom
+(write all-1s, read back the size mask, restore). It found nothing to
+assign: both BAR0 and BAR1 read back as a hard `0` even after that probe,
+in full D0 power (ruling out a low-power/disabled-device explanation via
+`PciAddress::debug_power_state`, added alongside it). Per the PCI spec, an
+I/O BAR's own type bit is hardwired and always readable regardless of
+size -- a probe reading back literal `0` on both BARs means there is no
+register storage behind either one in silicon at all, not a firmware
+oversight any software fix can repair. The most likely explanation: this
+specific board's ICH4 south bridge exposes the AC'97 *function* in PCI
+config space (for driver-detection purposes) even though its OEM never
+populated an actual codec chip -- audio was frequently a discrete
+add-in-card option on boards of this era. `ac97::init_card` reports the
+raw BAR/power-state readback whenever a BAR can't be resolved, so this
+diagnosis is directly visible on a real machine hitting the same
+condition, not something that requires re-deriving by hand. The driver
+itself is otherwise confirmed correct end to end under QEMU (real
+register layout, real interrupt-storm bug found and fixed, sustained
+playback confirmed via `-audiodev wav` capture) -- this is a genuine
+hardware-population gap on one specific test machine, not an unverified
+code path.
+
 Full detail (the exact register-level layout cross-checked against
 QEMU's `hw/audio/ac97.c`/`ac97.h` source, the sliding-`LVI` ring
-technique's own derivation, and the alignment-padding investigation
-narrative) is in `docs/history/audio-hda.md`.
+technique's own derivation, the alignment-padding investigation
+narrative, and the full real-hardware BAR-assignment investigation) is in
+`docs/history/audio-hda.md`.
 
 ## Real-time audio streaming over RTP/UDP: the `audio-rtp` tape
 
