@@ -210,9 +210,10 @@ fn add(nic: Nic) {
 /// Initializes every supported backend instance once. Backend order remains
 /// RTL8139, 3C905, e1000, I350, then NE2000-compatible, so the first
 /// initialized card preserves the previous default selection policy.
-/// I350 is currently a no-op in practice: `i350::CANDIDATE_DEVICE_IDS` is
-/// deliberately empty until a real card's device ID is confirmed (see
-/// `i350.rs`'s module doc comment).
+/// `i350::CANDIDATE_DEVICE_IDS` now carries one confirmed real device ID
+/// (see `i350.rs`'s module doc comment), so this is no longer a guaranteed
+/// no-op on hardware carrying that exact card -- its register-level
+/// behavior is otherwise still unverified against physical hardware.
 pub fn initialize() -> Result<usize, Status> {
     unsafe {
         if INITIALIZED {

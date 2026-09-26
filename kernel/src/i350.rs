@@ -1,19 +1,24 @@
 //! Scaffolding for Intel I350 ("Powerville") PCIe Gigabit controllers, such
 //! as the dual-port card carrying an `NHI350AM4` chip marking.
 //!
-//! **Status: not yet wired to any real hardware.** [`CANDIDATE_DEVICE_IDS`]
-//! is deliberately empty, so [`initialize_all`] always reports
-//! [`Status::NotPresent`] and this module changes nothing about the running
-//! kernel today -- it exists purely so the register-level work is ready the
-//! moment the card's exact PCI device ID is confirmed (via the `pci` shell
-//! command; see `AGENTS.md`'s "what about PCIe" discussion). To bring a
-//! confirmed card online: add its device ID to `CANDIDATE_DEVICE_IDS`, wire
-//! `i350::initialize_all`/`i350::get` into `nic.rs` exactly the way
-//! `e1000.rs` already is (this module's `Nic`-facing methods deliberately
-//! match `E1000`'s method names/signatures one-for-one to make that a
-//! mechanical copy-paste), then test against the physical card -- QEMU has
-//! no I350 model, so, like the 3C905 and NE2000 backends, every iteration
-//! here needs real hardware, permanently.
+//! **Status: device ID confirmed, register-level behavior not yet verified
+//! against real hardware.** [`CANDIDATE_DEVICE_IDS`] now carries `0x1521`
+//! (I350 copper), read via `lspci -vv` from a Linux host against a physical
+//! Intel Ethernet Server Adapter I350-T2 (dual-port copper, PCI address
+//! `04:00.1`, currently bound to Linux's own `igb` driver) -- confirmed by
+//! the reported name ("I350 Gigabit Network Connection") and subsystem
+//! string, not guessed. This module is already fully wired into `nic.rs`
+//! exactly the way `e1000.rs` is (this module's `Nic`-facing methods
+//! deliberately match `E1000`'s method names/signatures one-for-one, which
+//! made that wiring a mechanical copy-paste when it was first scaffolded),
+//! so `initialize_all`/`get` will now actually find and use this card the
+//! next time this kernel boots on that physical machine. What is **not**
+//! yet confirmed is whether any of the register-level assumptions below
+//! (offsets, the SW/FW semaphore handshake, ring enable bits) actually hold
+//! against this specific card -- QEMU has no I350 model at all, so, like
+//! the 3C905 and NE2000 backends, every remaining bit of verification here
+//! needs the real machine, permanently, and none of it can happen from
+//! this environment.
 //!
 //! I350 is a different, newer chip generation from the `82540EM`
 //! `e1000.rs` targets (which predates PCIe entirely), but shares enough of
@@ -77,14 +82,17 @@ use crate::pmem;
 
 const VENDOR_INTEL: u16 = 0x8086;
 
-/// Real I350 PCI device IDs (physical functions only), for reference once a
-/// card's exact ID is confirmed via the `pci` shell command:
-/// `0x1521` (copper), `0x1522` (fiber), `0x1523` (backplane), `0x1524`
-/// (copper, dual-port variant), `0x1526` (copper, LOM variant). Left empty
-/// deliberately -- see this module's doc comment -- until confirmed by
-/// reading the real card's ID, never guessed. **Never add `0x1520`**
-/// (I350 Virtual Function): see the module doc comment.
-const CANDIDATE_DEVICE_IDS: &[u16] = &[];
+/// Real I350 PCI device IDs (physical functions only). `0x1521` (copper) is
+/// confirmed against a physical Intel Ethernet Server Adapter I350-T2 (see
+/// this module's own doc comment) and is the only one enabled so far;
+/// `0x1522` (fiber), `0x1523` (backplane), `0x1524` (copper, dual-port
+/// variant), and `0x1526` (copper, LOM variant) remain deliberately
+/// excluded until each is confirmed the same way -- fiber/backplane
+/// variants in particular skip copper-PHY autonegotiation entirely, so
+/// enabling them without physical testing would be guessing, not
+/// confirming. **Never add `0x1520`** (I350 Virtual Function): see the
+/// module doc comment.
+const CANDIDATE_DEVICE_IDS: &[u16] = &[0x1521];
 
 // --- Registers shared with e1000.rs's 82540EM layout (unchanged offsets) ---
 const REG_CTRL: u32 = 0x0000;

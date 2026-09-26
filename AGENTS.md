@@ -986,20 +986,21 @@ it; the Intel I350 discovery below is the motivating case.
 `kernel/src/i350.rs` is a fifth NIC backend, structurally mirroring
 `e1000.rs`'s driver shape but for Intel's I350 ("Powerville") PCIe Gigabit
 Ethernet controller family -- a genuinely different, newer chip generation
-than the `82540EM` QEMU emulates as `e1000`. `i350::CANDIDATE_DEVICE_IDS` is
-deliberately an empty `&[u16]`: the module is fully wired into `nic.rs`'s
-facade and compiles as ordinary, complete code, but with no device IDs to
-match it can never actually claim a PCI device -- `0x1520` (the I350
-Virtual Function/SR-IOV ID) is deliberately excluded, since it has a
-completely different, mailbox-based register interface with no direct
-PHY/link access; enabling every plausible I350 sibling ID at once was also
-rejected, since fiber/backplane variants skip copper-PHY autonegotiation
-entirely. The intended path is to add only the one confirmed, physically
-tested ID first (read via the `pci` command below), then broaden
-deliberately to sibling copper IDs only once each has actually been tested.
-Like the 3C509 (see "Deliberately deferred work" below), this is a standing,
-permanent real-hardware-only testing cost, since I350 has no QEMU model at
-all. Full detail (the three register-layout differences from `e1000.rs`,
+than the `82540EM` QEMU emulates as `e1000`. `i350::CANDIDATE_DEVICE_IDS`
+now carries exactly one confirmed real device ID, `0x1521` (copper),
+read via `lspci -vv` against a physical Intel Ethernet Server Adapter
+I350-T2 -- `0x1520` (the I350 Virtual Function/SR-IOV ID) remains
+deliberately excluded, since it has a completely different, mailbox-based
+register interface with no direct PHY/link access; enabling every
+plausible I350 sibling ID at once was also rejected, since fiber/backplane
+variants skip copper-PHY autonegotiation entirely. The intended path
+broadens deliberately to sibling copper IDs only once each has actually
+been tested, never guessed from the datasheet alone; the register-level
+implementation itself remains unverified against real hardware regardless
+of the ID now being enabled -- QEMU has no I350 model at all, so, like the
+3C509 (see "Deliberately deferred work" below), every remaining bit of
+verification here is a standing, permanent real-hardware-only cost. Full
+detail (the three register-layout differences from `e1000.rs`,
 scaffolding this module's effect on the reserved low-memory region) is in
 `docs/history/development-notes.md`.
 
