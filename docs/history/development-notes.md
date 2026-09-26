@@ -2770,3 +2770,208 @@ it starts reproducing reliably again, ideally by capturing the exact
 since QEMU has no matching two-real-device repro) at the moment of
 failure rather than after `wait_until_ready`'s own recovery has already
 run.
+
+## The reserved low-memory kernel region's growth history (full detail)
+
+### Reserved low-memory region growth, `0x20000` through `0x9f000`
+
+The reserved low-memory kernel region (`linker.ld`/`pmem::RESERVED_BELOW`/
+`tools/write_layout.py`'s `KERNEL_RESERVED_END`) grew from `0x20000` to
+`0x40000` alongside `tape`, then to `0x50000` when paging, NIC reliability,
+and boot-script code consumed the remaining headroom. The feature's own code pushed the kernel
+binary past the previous 64 KiB ceiling with essentially no headroom left
+beforehand (the prior build was already only dozens of bytes under it), then
+to `0x60000` when scaffolding the inert `kernel/src/i350.rs` driver module
+(the Intel I350 scaffolding, discussed below) pushed `__kernel_end` to `0x51fb4` -- past
+the old `0x50000` ceiling even with `i350::CANDIDATE_DEVICE_IDS` left empty,
+since the module's per-instance static storage (`i350::NICS`) and its code
+are linked in regardless of whether any real device ID ever matches at
+runtime. It kept growing after that (`0x70000` for ES1370 ADC capture,
+`0x80000` for multi-instance ES1370, `0x90000` later still -- see
+`docs/history/audio-hda.md` for the exact measurements behind each step),
+each time for the same reason: some feature's own `.bss` growth left no
+headroom under the previous ceiling.
+
+It was then grown again to `0x98000` -- this time deliberately, not
+reactively, alongside a fix to a real bug this exact history had already
+caused twice: `kernel/src/debug.rs` used to keep its
+own hand-copied `SLOT1_LBA`/`SLOT_SECTORS` (see "A/B kernel slots and
+automatic fallback" below), and *both* of the `0x70000`/`0x80000` steps
+above required a manual, easy-to-forget update to that copy -- the first
+time this was missed, it caused a real, fully deterministic
+soft-reboot-after-KUP crash; the second time (the `0x80000` -> `0x90000`
+step, undocumented until this investigation found it) went unnoticed only
+because no kernel had yet grown large enough to actually write into the
+resulting mismatch. Both `kernel/src/debug.rs`'s slot constants and
+`tools/build_image.py`'s FOSFS partition start (`DATA_START_LBA`, which
+had *also* silently drifted to sit partly inside kernel slot 1 once
+`SLOT_SECTORS` grew enough) are now generated/derived from
+`tools/write_layout.py` instead of hand-copied, making both classes of
+drift structurally impossible rather than merely documented against a
+third occurrence -- see `tools/write_layout.py`'s own doc comment and the
+`kernel` `Makefile` target.
+
+All three constants (`linker.ld`'s `ASSERT`, `pmem::RESERVED_BELOW`,
+`tools/write_layout.py`'s `KERNEL_RESERVED_END`) must still always match
+by hand -- see "Low-memory map" above for why those three specifically
+can't be generated the same way.
+
+Most recently, grown again to the current `0x9f000` -- the sustainable
+fix "Low-memory map" above had named but not yet applied, rather than a
+reaction to a specific feature's `.bss` growth this time: the boot-time
+protected-mode stack pointer (`stage2.S`/`netrom.S`'s `protected_entry`)
+was relocated from a fixed `0x9f000` to `0x500000` (see "Low-memory map"
+above), reclaiming the entire `0x7000` (28 KiB) gap that used to exist
+purely to leave that stack room below the EBDA. This raised the
+kernel's own reserved-region ceiling all the way up to that boundary
+with no fresh safety margin needed -- `0x9f000` was already the
+conservative value the stack's own placement had chosen -- turning
+roughly 3.5 KiB of remaining headroom into roughly 31 KiB, verified with
+`size build/kernel.elf` and confirmed safe by `make test-debug-mode`,
+which exercises `reboot::soft_reboot`'s repeated re-entry into this
+exact relocated-stack code path, including a real KUP-triggered reset.
+
+### The removed `console::resync_cursor()` mechanism
+
+Because a tape can write VGA memory and move the hardware cursor directly
+(see `tapes/primes.S` below) with no way to tell `console.rs` it did
+so, `tape_run` originally called a `console::resync_cursor()` immediately
+after the tape returned -- it just re-read the CRTC cursor position the
+same way `console::initialize()` already does once at boot, so the
+shell's next line of output would continue from wherever the tape
+actually left the cursor instead of overwriting the tape's own output
+from a stale, pre-tape position. This whole mechanism (and the function
+itself) was later removed once tapes stopped touching the CRTC directly
+at all -- see the "tape print callback ABI" section further below, which
+is the current design; the paragraphs immediately following this one
+describe the tape as it worked *before* that change, for historical
+context on the bugs that shaped `primes.S`'s scroll/cursor handling.
+
+### Tape `alloc`/`free`: the abandoned first attempt
+
+`alloc`/`free` are backed by a brand new, deliberately separate memory
+pool in `kernel/src/pmem.rs`, not the existing frame allocator
+`palloc`/`pfree`/disk/NIC code already use. That existing pool (`BITMAP`,
+`TRACKED_BYTES` = 128 MiB, 4 KiB-per-frame granularity) was left
+completely alone; a first attempt at this feature just grew its bitmap
+to cover a full 1 GiB and hit a hard, easy-to-forget architectural wall
+instead: at the time, `objcopy -O binary` baked a `.bss` array's *entire*
+size into the shipped flat binary as zero bytes (there's no "reserved but
+unbacked" concept once a `no_std` freestanding binary is flattened), so a
+1 GiB bitmap (32 KiB, up from the original 4 KiB) directly inflated
+`kernel.bin` by ~28 KB. **This specific mechanism no longer applies to the
+current linker layout** -- see "`audio.rs`: a format-agnostic facade, and
+network-fed playback" below, where a much later investigation found that
+`.bss` (now `linker.ld`'s last section, with nothing loadable after it)
+is *not* baked into `kernel.bin`'s raw file size at all; `entry.S`'s own
+explicit zero-fill loop is what actually makes a large `.bss` static safe
+at runtime today, and the real enforced limit is `linker.ld`'s `ASSERT
+(__kernel_end < 0x98000, ...)` (the exact ceiling has grown several times
+since; see "Low-memory map" above for the current value and its own
+remaining headroom), not the flat file's byte count. Whatever caused the
+~28 KB growth described here was evidently something other than pure
+`.bss`-truncation behavior at that point in this project's history; take
+the mechanism explained below as the current, verified one. Stage two now
+avoids the former single-transfer 127-sector ceiling by splitting kernel
+loading into bounded INT 13h extended-read calls that respect each BIOS
+64 KiB boundary. The remaining limit is the reserved `0x10000..0x9f000`
+low-memory region, currently `SLOT_SECTORS` (1144) sectors, and
+`tools/write_layout.py` emits that limit.
+
+## e1000e reset-sequencing bugs: full investigation (full detail)
+
+**Two real reset-sequencing bugs were found and fixed after this driver
+hung real 82579V hardware at NIC init** (QEMU's 82574L model never
+surfaced either one). Both are instances of the same underlying rule,
+called out explicitly in Linux's own `e1000_reset_hw_ich8lan` source:
+`/* cannot issue a flush here because it hangs the hardware */` --
+**any register access, even a read, immediately after issuing `CTRL.RST`
+can hang e1000e-family silicon outright.** Older 82540EM/I350 silicon has
+no such hazard, which is why the identical-looking patterns in
+`e1000.rs`/`i350.rs` are safe for them and were never safe here:
+
+1. The original `reset()` mirrored `e1000.rs`/`i350.rs`: write
+   `CTRL.RST`, then immediately loop reading `CTRL` back to see the bit
+   clear. Fixed by never polling `CTRL.RST` at all -- neither of Linux's
+   two e1000e-family reset functions do -- and instead waiting a fixed,
+   register-access-free delay (`wait_ticks`, reusing `uhci.rs`'s
+   tick-based busy-wait idiom) before polling `EECD.AUTO_RD` (NVM
+   auto-read-done), the real completion signal this family uses, and
+   also the correct point at which `RAL0`/`RAH0` are safe to read.
+2. Real-hardware testing of fix #1 still hung, one register-touch later:
+   `reset()` called `release_mdio_ownership` (a register **read** of
+   `EXTCNF_CTRL`) immediately after the `CTRL.RST` write -- the same
+   forbidden access, just missed for the semaphore-release call
+   specifically. Fixed by deferring `release_mdio_ownership` until after
+   the `EECD.AUTO_RD` poll succeeds (or times out), matching Linux's own
+   `e1000_reset_hw_ich8lan`, which leaves `EXTCNF_CTRL`'s ownership bit
+   set across the reset itself and only clears it later, well after
+   other register access has already succeeded.
+
+`disable_pcie_master` (sets `CTRL.GIO_MASTER_DISABLE`, waits bounded for
+`STATUS.GIO_MASTER_ENABLE` to clear, timeout-tolerant like Linux's own
+equivalent) was added alongside fix #1, so no in-flight PCIe transaction
+is left stuck mid-transaction when the MAC reset hits -- neither
+`e1000.rs` (plain PCI, no such concept) nor `i350.rs` (PCIe, but not yet
+cross-checked against real hardware) does this. `pci::force_power_state_d0`
+was also added (called from `probe_all` before the memory BAR is ever
+touched): BIOS can leave a PCH-integrated function like this one in
+D3hot, which does not respond to memory-space accesses at all per the
+PCI PM spec, and a real OS's PCI core always forces D0 before any driver
+probe runs. This did not turn out to be the cause of either hang above,
+but is kept as correct PCI hygiene this kernel should have been doing
+anyway.
+
+Both bugs were found via real-hardware bring-up over three round trips
+(each costing a physical power-cycle to recover from the hang): fix #1
+was real but incomplete on its own; when it didn't fully resolve the
+reported hang, temporary, unconditional `println!` breadcrumbs were
+added at every register-touching step in `probe_all`/`init`/`reset`
+(deliberately not gated on success or failure, since a real hang never
+reaches either return path) -- the next attempt's serial output printed
+every line through `"issuing CTRL.RST"` and then stopped, which
+pinpointed fix #2 precisely. The breadcrumbs were removed once a
+subsequent real-hardware boot confirmed the fix.
+
+**Confirmed fixed end to end on the real 82579V ITX board this driver
+targets**: clean boot through reset, discovered as "Intel e1000e", and
+verified passing real bidirectional traffic (via `term_net`, connected
+remotely over the actual physical NIC). Also verified end to end under
+QEMU: a single guest with `-device e1000e` enumerates with a valid MAC
+and transmits successfully; a two-guest fixture (each with its own
+`-device e1000e`, joined by a shared `socket,mcast=` netdev, the same
+technique `tapes/test_router_e2e.py`'s dual-e1000 fixture uses) confirmed
+genuine bidirectional send/receive. Neither bug above was ever
+reproducible under QEMU -- both are real hardware timing hazards this
+project's emulation-based coverage structurally cannot catch, only
+real-hardware testing on the actual target board could.
+
+Both device families use the identical `EXTCNF_CTRL.MDIO_SW_OWNERSHIP`
+firmware/PHY semaphore (`acquire_mdio_ownership`/`release_mdio_ownership`),
+taken unconditionally around reset for every matched device ID -- cross-
+checked directly against Linux's `e1000_get_hw_semaphore_82573` (reused
+by 82574) and `e1000_acquire_swflag_ich8lan` (82579). An earlier version
+of this driver assumed 82574 used a different, I350-style mechanism and
+skipped the semaphore for it; that assumption was wrong, corrected once
+the real hardware bring-up above forced a closer look at Linux's source.
+
+## NE2000 receive-ring header-byte-order bug (full detail)
+
+The receive side is organized as an 8-entry ring of 256-byte pages
+(`RX_START_PAGE`..`RX_STOP_PAGE`) inside that onboard memory, each entry
+prefixed by a 4-byte header the card itself writes: byte 0 is the receive
+status (matching `RSR`), byte 1 is the next entry's page number, and bytes
+2-3 are a little-endian byte count. Getting that byte order backwards --
+which this driver's first working version did -- silently drops every real
+frame in a way that looks identical to "the card never received anything
+at all": the swapped bytes make the ring's own sanity check compare a
+receive-status value (typically `0x01`) against a page-number range
+(`0x46..0x80`), which always fails, and this driver's next poll then
+observes `recovery_pending` and performs a full software reset that erases
+the very evidence needed to diagnose it. This was conclusively diagnosed by
+attaching GDB to QEMU's own `hw/net/ne2000.c` to prove the device model
+fully writes and advances the ring before the fos driver ever sees it,
+isolating the bug to this driver's own header-field order. (`-object
+filter-dump,id=ID,netdev=NETDEV_ID,file=PATH.pcap`, a QEMU netdev capture
+filter, is a lower-effort complementary tool worth reaching for first in
+any future "does the frame even arrive" investigation.)

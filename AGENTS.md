@@ -507,33 +507,13 @@ good push of the real `build/kernel.bin`.
 
 `tools/test_realnet_e2e.py` (not part of `make test`/`make test-debug-mode`,
 and depends on host machine state -- see its own docstring) is a second,
-complementary debug-mode test proving the *client tooling* itself works,
-not just the kernel/protocol side: unlike every other test script here, it
-drives the real `tools/term_net.py`/`tools/send_kernel_update.py` CLIs as
-subprocesses (through a `CAP_NET_RAW`-tagged `python3` copy, the same
-`setcap` convention "Talking to a real fos machine from a sandboxed dev
-environment" above already uses) over a genuine host tap interface bridged
-to the QEMU guest's primary NIC, rather than reimplementing the wire
-protocol inline over a raw UDP multicast socket the way
-`test_debug_mode_e2e.py`/`test_kernel_update_e2e.py` do. It also
-demonstrates the "exercise a new NIC driver as a second interface in QEMU
-before ever touching physical hardware" workflow this section's debug-mode
-design was originally motivated by: the guest's second NIC is a real,
-QEMU-emulated `ne2k_pci` (NE2000-compatible), and `nic list` over the real
-tap confirms both interfaces are correctly identified. (Intel's I350 has
-no QEMU model at all (see the Intel I350 discussion below) -- so this pattern
-can't cover that specific driver, but it covers any NIC family QEMU does
-emulate.) One non-obvious timing detail this test has to account for:
-`term_net` runs automatically at every boot and needs no F12 escape at all
-to reach with `term_net.py` (a session HELLO can connect directly to that
-automatic wait); a local escape to the idle prompt is needed only
-immediately before a KUP push, since KUP is served solely from the idle
-loop's `ambient_discovery_poll`, never from inside an active `term_net`
-session -- escaping earlier than necessary is actively harmful here, since
-after a local escape the shell only restarts `term_net`'s own HELLO wait
-after `TERM_NET_IDLE_TICKS` (60s) of local idle time, so a command sent
-shortly after an unnecessary escape would see no listener at all until
-that window elapses.
+complementary debug-mode test proving the *client tooling* itself works
+(driving the real `term_net.py`/`send_kernel_update.py` CLIs as
+subprocesses over a genuine host tap interface bridged to the QEMU
+guest's primary NIC), not just the kernel/protocol side. Full detail
+(the exact NIC-driver-exercise workflow this enables, and a non-obvious
+`term_net`/KUP escape-timing gotcha) is in
+`docs/history/networking-and-discovery.md`.
 
 ## Build and validation
 
@@ -698,20 +678,10 @@ The receive side is organized as an 8-entry ring of 256-byte pages
 (`RX_START_PAGE`..`RX_STOP_PAGE`) inside that onboard memory, each entry
 prefixed by a 4-byte header the card itself writes: byte 0 is the receive
 status (matching `RSR`), byte 1 is the next entry's page number, and bytes
-2-3 are a little-endian byte count. Getting that byte order backwards --
-which this driver's first working version did -- silently drops every real
-frame in a way that looks identical to "the card never received anything
-at all": the swapped bytes make the ring's own sanity check compare a
-receive-status value (typically `0x01`) against a page-number range
-(`0x46..0x80`), which always fails, and this driver's next poll then
-observes `recovery_pending` and performs a full software reset that erases
-the very evidence needed to diagnose it. This was conclusively diagnosed by
-attaching GDB to QEMU's own `hw/net/ne2000.c` to prove the device model
-fully writes and advances the ring before the fos driver ever sees it,
-isolating the bug to this driver's own header-field order. (`-object
-filter-dump,id=ID,netdev=NETDEV_ID,file=PATH.pcap`, a QEMU netdev capture
-filter, is a lower-effort complementary tool worth reaching for first in
-any future "does the frame even arrive" investigation.)
+2-3 are a little-endian byte count. Getting that byte order backwards is a
+real, silent-failure-prone bug this driver's first version hit. Full
+detail (the exact failure mode and the GDB-based diagnosis method) is in
+`docs/history/development-notes.md`.
 
 `Rtl8139::set_promiscuous` is a read-modify-write toggle of `RCR`'s `AAP`
 ("accept all packets") bit, layered on top of the accept-filter bits `init`
@@ -865,74 +835,28 @@ but there is still no way back into a hung or corrupted kernel except a
 reset, consistent with "Current boundaries" in README.md.
 
 The reserved low-memory kernel region (`linker.ld`/`pmem::RESERVED_BELOW`/
-`tools/write_layout.py`'s `KERNEL_RESERVED_END`) grew from `0x20000` to
-`0x40000` alongside `tape`, then to `0x50000` when paging, NIC reliability,
-and boot-script code consumed the remaining headroom. The feature's own code pushed the kernel
-binary past the previous 64 KiB ceiling with essentially no headroom left
-beforehand (the prior build was already only dozens of bytes under it), then
-to `0x60000` when scaffolding the inert `kernel/src/i350.rs` driver module
-(the Intel I350 scaffolding, discussed below) pushed `__kernel_end` to `0x51fb4` -- past
-the old `0x50000` ceiling even with `i350::CANDIDATE_DEVICE_IDS` left empty,
-since the module's per-instance static storage (`i350::NICS`) and its code
-are linked in regardless of whether any real device ID ever matches at
-runtime. It kept growing after that (`0x70000` for ES1370 ADC capture,
-`0x80000` for multi-instance ES1370, `0x90000` later still -- see
-`docs/history/audio-hda.md` for the exact measurements behind each step),
-each time for the same reason: some feature's own `.bss` growth left no
-headroom under the previous ceiling.
-
-It was then grown again to `0x98000` -- this time deliberately, not
-reactively, alongside a fix to a real bug this exact history had already
-caused twice: `kernel/src/debug.rs` used to keep its
-own hand-copied `SLOT1_LBA`/`SLOT_SECTORS` (see "A/B kernel slots and
-automatic fallback" below), and *both* of the `0x70000`/`0x80000` steps
-above required a manual, easy-to-forget update to that copy -- the first
-time this was missed, it caused a real, fully deterministic
-soft-reboot-after-KUP crash; the second time (the `0x80000` -> `0x90000`
-step, undocumented until this investigation found it) went unnoticed only
-because no kernel had yet grown large enough to actually write into the
-resulting mismatch. Both `kernel/src/debug.rs`'s slot constants and
-`tools/build_image.py`'s FOSFS partition start (`DATA_START_LBA`, which
-had *also* silently drifted to sit partly inside kernel slot 1 once
-`SLOT_SECTORS` grew enough) are now generated/derived from
-`tools/write_layout.py` instead of hand-copied, making both classes of
-drift structurally impossible rather than merely documented against a
-third occurrence -- see `tools/write_layout.py`'s own doc comment and the
-`kernel` `Makefile` target.
-
-All three constants (`linker.ld`'s `ASSERT`, `pmem::RESERVED_BELOW`,
+`tools/write_layout.py`'s `KERNEL_RESERVED_END`) has grown many times as
+successive features' own `.bss` growth left no headroom under the
+previous ceiling, most recently to the current `0x9f000` when the
+boot-time protected-mode stack pointer (`stage2.S`/`netrom.S`'s
+`protected_entry`) was relocated from a fixed `0x9f000` to `0x500000`
+(see "Low-memory map" above), reclaiming the 28 KiB gap that used to
+exist purely to leave that stack room below the EBDA. All three
+constants (`linker.ld`'s `ASSERT`, `pmem::RESERVED_BELOW`,
 `tools/write_layout.py`'s `KERNEL_RESERVED_END`) must still always match
-by hand -- see "Low-memory map" above for why those three specifically
-can't be generated the same way.
+by hand -- see "Low-memory map" above for why. `kernel/src/debug.rs`'s
+slot-metadata constants and `tools/build_image.py`'s FOSFS partition
+start are now generated/derived from `tools/write_layout.py` rather than
+hand-copied, after two past growth steps caused real, silent drift bugs
+there (one a fully deterministic soft-reboot-after-KUP crash). Full
+detail (every growth step and both drift bugs) is in
+`docs/history/development-notes.md`.
 
-Most recently, grown again to the current `0x9f000` -- the sustainable
-fix "Low-memory map" above had named but not yet applied, rather than a
-reaction to a specific feature's `.bss` growth this time: the boot-time
-protected-mode stack pointer (`stage2.S`/`netrom.S`'s `protected_entry`)
-was relocated from a fixed `0x9f000` to `0x500000` (see "Low-memory map"
-above), reclaiming the entire `0x7000` (28 KiB) gap that used to exist
-purely to leave that stack room below the EBDA. This raised the
-kernel's own reserved-region ceiling all the way up to that boundary
-with no fresh safety margin needed -- `0x9f000` was already the
-conservative value the stack's own placement had chosen -- turning
-roughly 3.5 KiB of remaining headroom into roughly 31 KiB, verified with
-`size build/kernel.elf` and confirmed safe by `make test-debug-mode`,
-which exercises `reboot::soft_reboot`'s repeated re-entry into this
-exact relocated-stack code path, including a real KUP-triggered reset.
-
-Because a tape can write VGA memory and move the hardware cursor directly
-(see `tapes/primes.S` below) with no way to tell `console.rs` it did
-so, `tape_run` originally called a `console::resync_cursor()` immediately
-after the tape returned -- it just re-read the CRTC cursor position the
-same way `console::initialize()` already does once at boot, so the
-shell's next line of output would continue from wherever the tape
-actually left the cursor instead of overwriting the tape's own output
-from a stale, pre-tape position. This whole mechanism (and the function
-itself) was later removed once tapes stopped touching the CRTC directly
-at all -- see the "tape print callback ABI" section further below, which
-is the current design; the paragraphs immediately following this one
-describe the tape as it worked *before* that change, for historical
-context on the bugs that shaped `primes.S`'s scroll/cursor handling.
+`tape_run` no longer calls a `console::resync_cursor()` after a tape
+returns -- see the "tape print callback ABI" section further below for
+why that mechanism became unnecessary once tapes stopped touching the
+CRTC directly. Full detail on the removed mechanism is in
+`docs/history/development-notes.md`.
 
 ### `dmesg`: a kernel log ring buffer
 
@@ -1031,55 +955,21 @@ register map, so this module's shape mirrors `e1000.rs` closely rather
 than needing `i350.rs`'s more extensive rework.
 
 Both device families use the identical `EXTCNF_CTRL.MDIO_SW_OWNERSHIP`
-firmware/PHY semaphore (`acquire_mdio_ownership`/`release_mdio_ownership`),
-taken unconditionally around reset for every matched device ID -- cross-
-checked directly against Linux's `e1000_get_hw_semaphore_82573` (reused
-by 82574) and `e1000_acquire_swflag_ich8lan` (82579). An earlier version
-of this driver assumed 82574 used a different, I350-style mechanism and
-skipped the semaphore for it; that assumption was wrong, corrected once
-the real hardware bring-up below forced a closer look at Linux's source.
+firmware/PHY semaphore, taken unconditionally around reset for every
+matched device ID.
 
-**Two real reset-sequencing bugs were found and fixed after this driver
-hung real 82579V hardware at NIC init** (QEMU's 82574L model never
-surfaced either one). Both are instances of the same underlying rule,
-called out explicitly in Linux's own `e1000_reset_hw_ich8lan` source:
-`/* cannot issue a flush here because it hangs the hardware */` -- **any
-register access, even a read, immediately after issuing `CTRL.RST` can
-hang e1000e-family silicon outright.** Older 82540EM/I350 silicon has no
-such hazard, which is why the identical-looking patterns in
-`e1000.rs`/`i350.rs` are safe for them and were never safe here:
-
-1. The original `reset()` mirrored `e1000.rs`/`i350.rs`: write
-   `CTRL.RST`, then immediately loop reading `CTRL` back to see the bit
-   clear. Fixed by never polling `CTRL.RST` at all -- neither of Linux's
-   two e1000e-family reset functions do -- and instead waiting a fixed,
-   register-access-free delay (`wait_ticks`, reusing `uhci.rs`'s
-   tick-based busy-wait idiom) before polling `EECD.AUTO_RD` (NVM
-   auto-read-done), the real completion signal this family uses, and
-   also the correct point at which `RAL0`/`RAH0` are safe to read.
-2. Real-hardware testing of fix #1 still hung, one register-touch later:
-   `reset()` called `release_mdio_ownership` (a register **read** of
-   `EXTCNF_CTRL`) immediately after the `CTRL.RST` write -- the same
-   forbidden access, just missed for the semaphore-release call
-   specifically. Fixed by deferring `release_mdio_ownership` until after
-   the `EECD.AUTO_RD` poll succeeds (or times out), matching Linux's own
-   `e1000_reset_hw_ich8lan`, which leaves `EXTCNF_CTRL`'s ownership bit
-   set across the reset itself and only clears it later, well after
-   other register access has already succeeded.
-
-`disable_pcie_master` (sets `CTRL.GIO_MASTER_DISABLE`, waits bounded for
-`STATUS.GIO_MASTER_ENABLE` to clear, timeout-tolerant like Linux's own
-equivalent) was added alongside fix #1, so no in-flight PCIe transaction
-is left stuck mid-transaction when the MAC reset hits -- neither
-`e1000.rs` (plain PCI, no such concept) nor `i350.rs` (PCIe, but not yet
-cross-checked against real hardware) does this. `pci::force_power_state_d0`
-was also added (called from `probe_all` before the memory BAR is ever
-touched): BIOS can leave a PCH-integrated function like this one in
-D3hot, which does not respond to memory-space accesses at all per the
-PCI PM spec, and a real OS's PCI core always forces D0 before any driver
-probe runs. This did not turn out to be the cause of either hang above,
-but is kept as correct PCI hygiene this kernel should have been doing
-anyway.
+**Confirmed working end to end on the real 82579V ITX board this driver
+targets** (clean boot through reset, discovered as "Intel e1000e",
+passing real bidirectional traffic over `term_net`) and under QEMU
+(single-guest and a two-guest bidirectional fixture). Getting there
+required finding and fixing two real reset-sequencing bugs, both
+instances of one rule from Linux's own `e1000_reset_hw_ich8lan` source:
+any register access, even a read, immediately after issuing `CTRL.RST`
+can hang e1000e-family silicon outright -- a hazard older 82540EM/I350
+silicon doesn't have and that QEMU never reproduces. Full detail (both
+bugs, the breadcrumb-diagnostic technique that found the second one, and
+the `disable_pcie_master`/`force_power_state_d0` additions) is in
+`docs/history/development-notes.md`.
 
 Still deliberately out of scope, consistent with every other NIC backend:
 MSI (82579 supports it, but this driver only ever uses the legacy PCI IRQ
@@ -1087,19 +977,6 @@ path), the "driver loaded" `CTRL_EXT` handshake with the Management
 Engine, K1/EEE/ULP link-power workarounds, and any flash/NVM write access
 (the MAC address is only ever read from `RAL0`/`RAH0`, already loaded by
 hardware from NVM once `EECD.AUTO_RD` is set).
-
-**Confirmed fixed end to end on the real 82579V ITX board this driver
-targets**: clean boot through reset, discovered as "Intel e1000e", and
-verified passing real bidirectional traffic (via `term_net`, connected
-remotely over the actual physical NIC). Also verified end to end under
-QEMU: a single guest with `-device e1000e` enumerates with a valid MAC
-and transmits successfully; a two-guest fixture (each with its own
-`-device e1000e`, joined by a shared `socket,mcast=` netdev, the same
-technique `tapes/test_router_e2e.py`'s dual-e1000 fixture uses) confirmed
-genuine bidirectional send/receive. Neither bug above was ever
-reproducible under QEMU -- both are real hardware timing hazards this
-project's emulation-based coverage structurally cannot catch, only
-real-hardware testing on the actual target board could.
 
 Backend order in `nic::initialize()` is now RTL8139, 3C905, e1000,
 e1000e, I350, then NE2000-compatible.
@@ -1469,30 +1346,13 @@ position aligned.
 pool in `kernel/src/pmem.rs`, not the existing frame allocator
 `palloc`/`pfree`/disk/NIC code already use. That existing pool (`BITMAP`,
 `TRACKED_BYTES` = 128 MiB, 4 KiB-per-frame granularity) was left
-completely alone; a first attempt at this feature just grew its bitmap
-to cover a full 1 GiB and hit a hard, easy-to-forget architectural wall
-instead: at the time, `objcopy -O binary` baked a `.bss` array's *entire*
-size into the shipped flat binary as zero bytes (there's no "reserved but
-unbacked" concept once a `no_std` freestanding binary is flattened), so a
-1 GiB bitmap (32 KiB, up from the original 4 KiB) directly inflated
-`kernel.bin` by ~28 KB. **This specific mechanism no longer applies to the
-current linker layout** -- see "`audio.rs`: a format-agnostic facade, and
-network-fed playback" below, where a much later investigation found that
-`.bss` (now `linker.ld`'s last section, with nothing loadable after it)
-is *not* baked into `kernel.bin`'s raw file size at all; `entry.S`'s own
-explicit zero-fill loop is what actually makes a large `.bss` static safe
-at runtime today, and the real enforced limit is `linker.ld`'s `ASSERT
-(__kernel_end < 0x98000, ...)` (the exact ceiling has grown several times
-since; see "Low-memory map" above for the current value and its own
-remaining headroom), not the flat file's byte count. Whatever caused the
-~28 KB growth described here was evidently something other than pure
-`.bss`-truncation behavior at that point in this project's history; take
-the mechanism explained below as the current, verified one. Stage two now
-avoids the former single-transfer 127-sector ceiling by splitting kernel
-loading into bounded INT 13h extended-read calls that respect each BIOS
-64 KiB boundary. The remaining limit is the reserved `0x10000..0x9f000`
-low-memory region, currently `SLOT_SECTORS` (1144) sectors, and
-`tools/write_layout.py` emits that limit.
+completely alone; an earlier design (growing that same bitmap to cover a
+full 1 GiB) was abandoned once it appeared to hit a `.bss`/binary-size
+wall, since superseded by a fuller understanding of how `.bss` actually
+behaves in this kernel's linker layout (see "Low-memory map" above --
+`entry.S`'s own explicit zero-fill loop, not the flat file's byte count,
+is what makes a large `.bss` static safe today). Full detail of that
+abandoned first attempt is in `docs/history/development-notes.md`.
 
 The fix: a second allocator, the "big pool" (`BIG_BITMAP`,
 `BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 2 GiB,
@@ -2155,93 +2015,32 @@ deliberately narrow pair, not a speculative broadening across every
 ICH-generation ID, even though Intel's own AC'97 register layout is
 documented backward-compatible across generations.
 
-**Scope: playback-only, no network-fed streaming yet.** This driver
-programs only the PCM-out bus-master channel (no PCM-in/mic-in), and
-always plays its own built-in test tone -- there is no `submit`-backed
-network-fed ring yet, unlike ES1370/HDA. That gap is deliberate, not an
-oversight: a per-instance `audio::PcmRing` costs a fixed 16 KiB of
-`.bss`, and this kernel's reserved low-memory region had almost no real
-slack left when this driver was first added (see the next paragraph).
-`ac97::MAX_INSTANCES` is 1 (a real motherboard south-bridge function,
-never something a machine has more than one of, unlike an add-in ES1370
-card).
+**Scope: playback-only, no network-fed streaming yet.** Only the PCM-out
+bus-master channel is programmed (no PCM-in/mic-in), always playing a
+built-in test tone; `ac97::MAX_INSTANCES` is 1 (a motherboard
+south-bridge function, never more than one per real machine).
 
-**A genuine measurement bug in this project's own "check `size
-build/kernel.elf`" convention was found while fitting this driver in.**
-Summing `size`'s text/data/bss columns (the documented way to check
-reserved-region headroom) ignores the `ALIGN(4096)` padding gaps
-`linker.ld` inserts between `.text`/`.rodata`/`.data` -- a small, isolated
-content-size change can silently cost a full extra 4 KiB page (or two) of
-real position if it happens to push a section boundary across its next
-alignment point, with no way to see this from `size`'s own output. The
-real, trustworthy number is the linked `__kernel_end` symbol's own address
-(`nm build/kernel.elf | grep __kernel_end`, which needs a temporary
-`strip = "none"` in `kernel/Cargo.toml` since the shipped profile strips
-all symbols) -- not a sum of section sizes. Measured this way, this
-kernel had only **64 bytes** of real slack below `0x9f000` before this
-driver, not the "roughly 31 KiB" this file's own "Low-memory map" section
-previously claimed (stale since some earlier growth step, never
-re-verified with the correct method). `AGENTS.md`'s own low-memory
-guidance has been corrected to describe measuring `__kernel_end` directly
-instead of trusting `size`'s column sums.
-
-Given that real 64-byte margin, the actual fix was not growing
-`0x9f000` (a real hardware wall sits close enough above it -- 0xA0000 is
-where VGA's own memory-mapped I/O begins on every x86 PC, non-negotiable,
-unlike the softer EBDA-convention framing this file used to give
-`0x9f000` itself) but freeing existing headroom instead:
-`es1370::MAX_INSTANCES` dropped from 4 to 2, reclaiming ~65 KiB of
-`.bss` (two of its four 16 KiB ring-pairs) that no realistic machine
-running this project was ever going to use -- confirmed unaffected by
-`tapes/test_audio_multi_e2e.py`, which only ever exercises two
-simultaneous ES1370 instances. This left real slack at roughly 56 KiB
-measured the correct way, comfortable room for this driver and further
-near-term growth.
-
-A real bug was found and fixed while first bringing this driver up under
-QEMU: acknowledging only `SR_BCIS` (the period-completion status bit) and
-never enabling/clearing `SR_FIFOE` (FIFO error) left that bit permanently
-set the instant the ring's fixed-size buffer underran (immediate, under
-QEMU's own unthrottled mixer callback with no host audio backend
-attached) -- an unacknowledged status bit re-fires the shared PCI IRQ
-line (also used by the e1000 NIC in the same test configuration) the
-instant `iret` restores `EFLAGS.IF`, hanging the whole machine. This is
-the exact ES1370 interrupt-storm lesson this project already learned
-once (see `es1370.rs`'s own `acknowledge_dac1` doc comment), now hit a
-second time in a second driver; the fix is acknowledging every
-write-1-to-clear bit in `SR` on every interrupt, not only whichever one
-triggered period-refill logic. Confirmed fixed, and confirmed the
-sliding-`LVI` playback ring genuinely loops indefinitely rather than
-halting after its first two periods, by capturing real QEMU `-audiodev
-wav` output during a several-second `audio` session and verifying the
-built-in test tone's oscillation continues unbroken all the way through
-the capture, not just its first fraction of a second.
+Fitting this driver in required correcting a real measurement bug in
+this project's own "check `size build/kernel.elf`" convention (summing
+its text/data/bss columns ignores `linker.ld`'s `ALIGN(4096)` padding
+gaps -- see "Low-memory map" above for the corrected `__kernel_end`-based
+guidance) and reclaiming `.bss` headroom by dropping
+`es1370::MAX_INSTANCES` from 4 to 2. A real interrupt-storm bug (an
+unacknowledged `SR_FIFOE` status bit re-firing the shared PCI IRQ line)
+was found and fixed while bringing this driver up under QEMU -- the same
+class of bug `es1370.rs`'s own `acknowledge_dac1` doc comment already
+describes, now hit a second time in a second driver.
 
 **Confirmed on the real P4/ICH4 machine this driver targets -- but that
-machine's own onboard AC'97 has no physical codec behind it.**
-`PciAddress::assign_io_bar` (`pci.rs`) was added as a general fallback for
-a BAR firmware never assigns (`pci` on this machine shows `bar0=0x00000000`
-for the AC'97 function), following the standard PCI BAR-sizing idiom
-(write all-1s, read back the size mask, restore). It found nothing to
-assign: both BAR0 and BAR1 read back as a hard `0` even after that probe,
-in full D0 power (ruling out a low-power/disabled-device explanation via
-`PciAddress::debug_power_state`, added alongside it). Per the PCI spec, an
-I/O BAR's own type bit is hardwired and always readable regardless of
-size -- a probe reading back literal `0` on both BARs means there is no
-register storage behind either one in silicon at all, not a firmware
-oversight any software fix can repair. The most likely explanation: this
-specific board's ICH4 south bridge exposes the AC'97 *function* in PCI
-config space (for driver-detection purposes) even though its OEM never
-populated an actual codec chip -- audio was frequently a discrete
-add-in-card option on boards of this era. `ac97::init_card` reports the
-raw BAR/power-state readback whenever a BAR can't be resolved, so this
-diagnosis is directly visible on a real machine hitting the same
-condition, not something that requires re-deriving by hand. The driver
-itself is otherwise confirmed correct end to end under QEMU (real
-register layout, real interrupt-storm bug found and fixed, sustained
-playback confirmed via `-audiodev wav` capture) -- this is a genuine
-hardware-population gap on one specific test machine, not an unverified
-code path.
+machine's onboard AC'97 has no physical codec behind it.** Both BAR0 and
+BAR1 read back as a hard `0` even after `PciAddress::assign_io_bar`'s
+fallback-assignment attempt, in full D0 power -- per the PCI spec, this
+means no register storage exists behind either BAR in silicon at all,
+not a firmware oversight: this specific board's ICH4 south bridge
+exposes the AC'97 function in PCI config space without an actual codec
+chip ever populated (audio was a discrete add-in-card option on boards
+of this era). The driver itself is otherwise confirmed correct end to
+end under QEMU.
 
 Full detail (the exact register-level layout cross-checked against
 QEMU's `hw/audio/ac97.c`/`ac97.h` source, the sliding-`LVI` ring

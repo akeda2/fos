@@ -2330,3 +2330,93 @@ the same root cause; `audio` correctly reported the accurate
 controller found on the PCI bus."`), confirming the `NotPresent`-vs-
 `InitFailed` distinction fixed earlier in this same session handles both
 presentations correctly.
+
+## AC'97 in AGENTS.md: the measurement bug, interrupt-storm bug, and BAR investigation (full detail)
+
+**Scope: playback-only, no network-fed streaming yet.** This driver
+programs only the PCM-out bus-master channel (no PCM-in/mic-in), and
+always plays its own built-in test tone -- there is no `submit`-backed
+network-fed ring yet, unlike ES1370/HDA. That gap is deliberate, not an
+oversight: a per-instance `audio::PcmRing` costs a fixed 16 KiB of
+`.bss`, and this kernel's reserved low-memory region had almost no real
+slack left when this driver was first added (see the next paragraph).
+`ac97::MAX_INSTANCES` is 1 (a real motherboard south-bridge function,
+never something a machine has more than one of, unlike an add-in ES1370
+card).
+
+**A genuine measurement bug in this project's own "check `size
+build/kernel.elf`" convention was found while fitting this driver in.**
+Summing `size`'s text/data/bss columns (the documented way to check
+reserved-region headroom) ignores the `ALIGN(4096)` padding gaps
+`linker.ld` inserts between `.text`/`.rodata`/`.data` -- a small, isolated
+content-size change can silently cost a full extra 4 KiB page (or two) of
+real position if it happens to push a section boundary across its next
+alignment point, with no way to see this from `size`'s own output. The
+real, trustworthy number is the linked `__kernel_end` symbol's own address
+(`nm build/kernel.elf | grep __kernel_end`, which needs a temporary
+`strip = "none"` in `kernel/Cargo.toml` since the shipped profile strips
+all symbols) -- not a sum of section sizes. Measured this way, this
+kernel had only **64 bytes** of real slack below `0x9f000` before this
+driver, not the "roughly 31 KiB" this file's own "Low-memory map" section
+previously claimed (stale since some earlier growth step, never
+re-verified with the correct method). `AGENTS.md`'s own low-memory
+guidance has been corrected to describe measuring `__kernel_end` directly
+instead of trusting `size`'s column sums.
+
+Given that real 64-byte margin, the actual fix was not growing
+`0x9f000` (a real hardware wall sits close enough above it -- 0xA0000 is
+where VGA's own memory-mapped I/O begins on every x86 PC, non-negotiable,
+unlike the softer EBDA-convention framing this file used to give
+`0x9f000` itself) but freeing existing headroom instead:
+`es1370::MAX_INSTANCES` dropped from 4 to 2, reclaiming ~65 KiB of
+`.bss` (two of its four 16 KiB ring-pairs) that no realistic machine
+running this project was ever going to use -- confirmed unaffected by
+`tapes/test_audio_multi_e2e.py`, which only ever exercises two
+simultaneous ES1370 instances. This left real slack at roughly 56 KiB
+measured the correct way, comfortable room for this driver and further
+near-term growth.
+
+A real bug was found and fixed while first bringing this driver up under
+QEMU: acknowledging only `SR_BCIS` (the period-completion status bit) and
+never enabling/clearing `SR_FIFOE` (FIFO error) left that bit permanently
+set the instant the ring's fixed-size buffer underran (immediate, under
+QEMU's own unthrottled mixer callback with no host audio backend
+attached) -- an unacknowledged status bit re-fires the shared PCI IRQ
+line (also used by the e1000 NIC in the same test configuration) the
+instant `iret` restores `EFLAGS.IF`, hanging the whole machine. This is
+the exact ES1370 interrupt-storm lesson this project already learned
+once (see `es1370.rs`'s own `acknowledge_dac1` doc comment), now hit a
+second time in a second driver; the fix is acknowledging every
+write-1-to-clear bit in `SR` on every interrupt, not only whichever one
+triggered period-refill logic. Confirmed fixed, and confirmed the
+sliding-`LVI` playback ring genuinely loops indefinitely rather than
+halting after its first two periods, by capturing real QEMU `-audiodev
+wav` output during a several-second `audio` session and verifying the
+built-in test tone's oscillation continues unbroken all the way through
+the capture, not just its first fraction of a second.
+
+**Confirmed on the real P4/ICH4 machine this driver targets -- but that
+machine's own onboard AC'97 has no physical codec behind it.**
+`PciAddress::assign_io_bar` (`pci.rs`) was added as a general fallback for
+a BAR firmware never assigns (`pci` on this machine shows `bar0=0x00000000`
+for the AC'97 function), following the standard PCI BAR-sizing idiom
+(write all-1s, read back the size mask, restore). It found nothing to
+assign: both BAR0 and BAR1 read back as a hard `0` even after that probe,
+in full D0 power (ruling out a low-power/disabled-device explanation via
+`PciAddress::debug_power_state`, added alongside it). Per the PCI spec, an
+I/O BAR's own type bit is hardwired and always readable regardless of
+size -- a probe reading back literal `0` on both BARs means there is no
+register storage behind either one in silicon at all, not a firmware
+oversight any software fix can repair. The most likely explanation: this
+specific board's ICH4 south bridge exposes the AC'97 *function* in PCI
+config space (for driver-detection purposes) even though its OEM never
+populated an actual codec chip -- audio was frequently a discrete
+add-in-card option on boards of this era. `ac97::init_card` reports the
+raw BAR/power-state readback whenever a BAR can't be resolved, so this
+diagnosis is directly visible on a real machine hitting the same
+condition, not something that requires re-deriving by hand. The driver
+itself is otherwise confirmed correct end to end under QEMU (real
+register layout, real interrupt-storm bug found and fixed, sustained
+playback confirmed via `-audiodev wav` capture) -- this is a genuine
+hardware-population gap on one specific test machine, not an unverified
+code path.
