@@ -1030,39 +1030,66 @@ single-queue legacy descriptor/ring register layout unchanged from
 register map, so this module's shape mirrors `e1000.rs` closely rather
 than needing `i350.rs`'s more extensive rework.
 
-One real, chip-specific difference is implemented, gated to run only for
-the 82579 IDs: `acquire_pch_semaphore`/`release_pch_semaphore` implement
-82579's documented single-bit `EXTCNF_CTRL.MDIO_SW_OWNERSHIP` handshake
-(request ownership, then read back to confirm hardware actually granted
-it) before touching PHY-adjacent state around reset -- a different,
-simpler mechanism than I350's two-step `SWSM`/`SW_FW_SYNC` protocol, not
-a generalization of it. 82574L (QEMU) never runs this path. **Unverified
-against real hardware**, the same caveat `i350.rs`'s own semaphore
-carries. Deliberately *not* implemented: 82579's documented reset-hang
-erratum workaround (a real, Intel-spec-update-documented hang risk on a
-plain `CTRL.RST`, worked around in Linux's `ich8lan.c` with a specific
-PHY-register pre-reset sequence) -- guessing that sequence from memory
-risked a real-hardware-hang-prone fix subtly wrong in exactly the way
-that's hardest to diagnose remotely, so it is left as the single most
-likely real-hardware bring-up snag to watch for, not a pre-implemented
-fix. Also deliberately out of scope, consistent with every other NIC
-backend: MSI (82579 supports it, but this driver only ever uses the
-legacy PCI IRQ path), the "driver loaded" `CTRL_EXT` handshake with the
-Management Engine, K1/EEE/ULP link-power workarounds, and any flash/NVM
-access (the MAC address is read from `RAL0`/`RAH0` after reset, already
-loaded by hardware from NVM, exactly like `e1000.rs`/`i350.rs`).
+Both device families use the identical `EXTCNF_CTRL.MDIO_SW_OWNERSHIP`
+firmware/PHY semaphore (`acquire_mdio_ownership`/`release_mdio_ownership`),
+taken unconditionally around reset for every matched device ID -- cross-
+checked directly against Linux's `e1000_get_hw_semaphore_82573` (reused
+by 82574) and `e1000_acquire_swflag_ich8lan` (82579). An earlier version
+of this driver assumed 82574 used a different, I350-style mechanism and
+skipped the semaphore for it; that assumption was wrong, corrected once
+the real hardware bring-up below forced a closer look at Linux's source.
 
-Verified end to end under QEMU: a single guest with `-device e1000e`
-enumerates as "Intel e1000e" with a valid MAC and transmits successfully;
-a two-guest fixture (each with its own `-device e1000e`, joined by a
-shared `socket,mcast=` netdev, the same technique
+**A real reset-sequencing bug was found and fixed after this driver hung
+real 82579V hardware at NIC init** (QEMU's 82574L model never surfaced
+it, since it has no equivalent hardware timing hazard). The original
+`reset()` mirrored `e1000.rs`/`i350.rs`: write `CTRL.RST`, then
+immediately loop reading `CTRL` back to see the bit clear. Cross-checking
+Linux's own `e1000_reset_hw_82571`/`e1000_reset_hw_ich8lan` found the
+exact cause, called out explicitly in Linux's own source comment:
+`/* cannot issue a flush here because it hangs the hardware */` --
+**any register access, even a read, immediately after issuing `CTRL.RST`
+can hang e1000e-family silicon outright.** Older 82540EM/I350 silicon has
+no such hazard, which is why the identical-looking polling loop in
+`e1000.rs`/`i350.rs` is safe for them and was never safe here. This turned
+out to be a bug applicable to the whole e1000e family, not an 82579-only
+errata this driver had deliberately deferred. Two more real differences
+came out of the same cross-check, both now implemented:
+
+- **PCIe master disable before reset** (`disable_pcie_master`): sets
+  `CTRL.GIO_MASTER_DISABLE` and waits (bounded, timeout-tolerant -- Linux
+  itself only logs and proceeds on timeout) for `STATUS.GIO_MASTER_ENABLE`
+  to clear, so no in-flight PCIe transaction is left stuck mid-transaction
+  when the MAC reset hits. Neither `e1000.rs` (plain PCI, no such concept)
+  nor `i350.rs` (PCIe, but not yet cross-checked against real hardware)
+  does this.
+- **Reset completion is signaled by `EECD.AUTO_RD`, not `CTRL.RST`
+  clearing.** Neither of Linux's two e1000e-family reset functions ever
+  polls `CTRL.RST`; both wait for the NVM auto-read-done bit instead,
+  which is also the correct signal that `RAL0`/`RAH0` are safe to read.
+  `reset()` now does the same: after issuing `CTRL.RST` and releasing the
+  semaphore, it waits a fixed, register-access-free delay (`wait_ticks`,
+  reusing `uhci.rs`'s tick-based busy-wait idiom) before touching any
+  register again, then polls `EECD.AUTO_RD`.
+
+Still deliberately out of scope, consistent with every other NIC backend:
+MSI (82579 supports it, but this driver only ever uses the legacy PCI IRQ
+path), the "driver loaded" `CTRL_EXT` handshake with the Management
+Engine, K1/EEE/ULP link-power workarounds, and any flash/NVM write access
+(the MAC address is only ever read from `RAL0`/`RAH0`, already loaded by
+hardware from NVM once `EECD.AUTO_RD` is set).
+
+Verified end to end under QEMU (both before and after this fix, since
+QEMU's model never exhibited the hang): a single guest with `-device
+e1000e` enumerates as "Intel e1000e" with a valid MAC and transmits
+successfully; a two-guest fixture (each with its own `-device e1000e`,
+joined by a shared `socket,mcast=` netdev, the same technique
 `tapes/test_router_e2e.py`'s dual-e1000 fixture uses) confirmed genuine
 bidirectional send/receive -- `nic discover` from one guest found both
 itself and the other guest's peer entry, proving the second guest's
 `e1000e.rs` instance actually received the broadcast probe and replied.
-This exercises the shared ring/reset/send/receive plumbing, not the
-82579-only PCH semaphore path (82574L never takes it) -- that part
-remains real-hardware-only regardless of this QEMU coverage.
+None of this QEMU coverage can exercise the actual fixed bug (the hang
+only manifests against real 82579 silicon's timing); that confirmation
+came from the real ITX board this driver targets.
 
 Backend order in `nic::initialize()` is now RTL8139, 3C905, e1000,
 e1000e, I350, then NE2000-compatible.
