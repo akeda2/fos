@@ -74,32 +74,33 @@
 //! hardware from NVM once `EECD.AUTO_RD` is set), jumbo frames, and
 //! checksum/TSO offload.
 //!
-//! **Second real-hardware attempt: still hung at the same point after the
-//! fix above, motivating one further real fix plus temporary bring-up
-//! diagnostics.** `probe_all`/`init` never forced this function into D0
-//! (full power) before touching its memory BAR at all -- a real OS's PCI
-//! core does this unconditionally before any driver's own probe ever
-//! runs (Linux: `pci_set_power_state(pdev, PCI_D0)`), but this kernel has
-//! no such core, and BIOS may well leave an onboard, PCH-integrated
-//! function like this one sitting in D3hot if no boot agent uses it. Per
-//! the PCI PM spec, a function in D3hot does not respond to memory-space
-//! accesses at all; on some chipsets (integrated southbridge/PCH
-//! functions especially) an attempted access in that state can hang the
-//! bus outright rather than cleanly master-aborting -- a real, plausible
-//! explanation for a hang QEMU (which never models PM D-states for its
-//! device models) cannot reproduce. `pci::PciAddress::force_power_state_d0`
-//! now forces D0 (with a settle delay) before `enable_memory_and_bus_master`
-//! ever runs. **Unverified**: this is this session's next hypothesis, not
-//! a confirmed fix yet.
-//!
-//! Alongside it, `probe_all`/`init`/`reset` currently carry temporary,
-//! unconditional `println!` breadcrumbs at every register-touching step
-//! (`"e1000e: ..."`), deliberately not gated on success or failure: a real
-//! hang never reaches either return path, so the *last line printed*
-//! before a real-hardware hang is the only way to know exactly which
-//! step it happened in. Remove these once the actual hang point is
-//! confirmed and fixed -- they are not meant to ship permanently, unlike
-//! this driver's other (failure-path-only) diagnostics.
+//! **Second real-hardware attempt still hung, one step later than
+//! before, which is what actually found the real bug.** Two changes were
+//! made at that point: `pci::PciAddress::force_power_state_d0` was added
+//! (BIOS can leave a PCH-integrated function like this one in D3hot,
+//! which does not respond to memory-space accesses at all per the PCI PM
+//! spec -- a real OS's PCI core always forces D0 before any driver probe
+//! runs, which this kernel has no equivalent of); and temporary,
+//! unconditional `println!` breadcrumbs were added at every register-
+//! touching step in `probe_all`/`init`/`reset`, since a real hang never
+//! reaches a return path to gate diagnostics on. The next real-hardware
+//! attempt printed every line through `"issuing CTRL.RST"` and then hung
+//! -- confirming the D0 fix wasn't the (sole) issue, but pinpointing the
+//! actual bug precisely: `reset()` called `release_mdio_ownership`
+//! (a register **read** of `EXTCNF_CTRL`) immediately after the
+//! `CTRL.RST` write, with no diagnostic of its own between them. That
+//! read is exactly the forbidden immediate-post-reset register access
+//! this driver had already fixed once for the *completion-polling* case
+//! but missed for the *semaphore-release* case. Linux's own
+//! `e1000_reset_hw_ich8lan` avoids this the same way this driver now
+//! does: it leaves `EXTCNF_CTRL`'s ownership bit set across the reset
+//! itself and only clears it later, well after other register access has
+//! already succeeded -- `reset()` now defers `release_mdio_ownership`
+//! until after the `EECD.AUTO_RD` poll below, success or timeout either
+//! way. The D0 fix is kept regardless (it is correct PCI hygiene this
+//! kernel should have been doing anyway, whether or not it was ever the
+//! actual cause here), and the breadcrumb `println!`s remain in place
+//! until a real-hardware boot confirms this was the whole fix.
 
 use core::cell::Cell;
 use core::ptr::{read_volatile, write_volatile};
@@ -444,12 +445,22 @@ impl E1000E {
         acquire_mdio_ownership(mmio_base)?;
         crate::println!("e1000e: reset: issuing CTRL.RST");
         write_register(mmio_base, REG_CTRL, CTRL_RST);
-        release_mdio_ownership(mmio_base);
         crate::println!("e1000e: reset: CTRL.RST issued, waiting");
 
-        // No register access of any kind here -- see module doc comment's
-        // "cannot issue a flush" finding. Wait out the window with a pure
-        // delay before touching the device again.
+        // No register access of any kind here -- not even to release the
+        // semaphore just acquired above. This is the real, confirmed hang
+        // point on real 82579V hardware: an earlier version of this driver
+        // called release_mdio_ownership() (a register READ of EXTCNF_CTRL)
+        // immediately after the CTRL.RST write, which hung real hardware
+        // even though it printed no diagnostic of its own -- the write
+        // itself is posted and returns immediately, but the very next
+        // register access afterward is where "cannot issue a flush here
+        // because it hangs the hardware" actually bites. Linux's own
+        // e1000_reset_hw_ich8lan behaves the same way: it leaves
+        // EXTCNF_CTRL's ownership bit set across the reset and only
+        // clears it later, well after other register access has already
+        // succeeded. Wait out the window with a pure delay before
+        // touching the device again for anything, release included.
         wait_ticks(3);
 
         crate::println!("e1000e: reset: polling EECD.AUTO_RD");
@@ -457,17 +468,22 @@ impl E1000E {
         // CTRL.RST clearing (see module doc comment) -- and this is also
         // the correct point at which RAL0/RAH0 are safe to read.
         let mut attempts = 20u32;
-        loop {
+        let result = loop {
             if read_register(mmio_base, REG_EECD) & EECD_AUTO_RD != 0 {
                 crate::println!("e1000e: reset: AUTO_RD set, reset complete");
-                return Ok(());
+                break Ok(());
             }
             attempts -= 1;
             if attempts == 0 {
-                return Err(InitError::ResetTimedOut);
+                break Err(InitError::ResetTimedOut);
             }
             wait_ticks(1);
-        }
+        };
+
+        // Safe to touch EXTCNF_CTRL again now that at least one ordinary
+        // register read has already succeeded above.
+        release_mdio_ownership(mmio_base);
+        result
     }
 
     fn configure(&self) -> Result<(), InitError> {
