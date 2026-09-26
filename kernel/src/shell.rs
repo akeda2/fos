@@ -473,7 +473,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!(
                     "System: help clear vga about bootinfo memmap memory cpuinfo pci usb"
                 );
-                println!("      hexdump halt reset reboot [soft|hard]");
+                println!("      hexdump dmesg halt reset reboot [soft|hard]");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!(
                     "Disk: diskinfo/readsector/format/ls/cat/write/rm [diskN], copy SRC NAME DST"
@@ -552,6 +552,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"pci" if no_arguments(arguments) => print_pci_devices(),
+        b"dmesg" if no_arguments(arguments) => dmesg_command(),
         b"usb" => usb_command(info, arguments),
         b"printer" if no_arguments(arguments) => print_printer_ports(),
         b"print" => print_command(info, arguments),
@@ -577,7 +578,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"reboot" => reboot_command(info, arguments),
         b"debug" => debug_command(info, arguments),
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
-        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci"
+        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci" | b"dmesg"
         | b"printer" | b"start" | b"audio" | b"hda" => {
             println!("This command does not accept arguments.");
         }
@@ -851,6 +852,30 @@ fn print_pci_devices() {
     if found > shown {
         println!("({} more found but not shown; MAX_PCI_DEVICES exceeded)", found - shown);
     }
+}
+
+/// Replays `console`'s dmesg ring buffer: every byte any `println!`/
+/// `print!` in this kernel has sent out since boot, seeded with whatever
+/// `stage1.S`/`stage2.S` real-mode narration was still on screen when
+/// `console::initialize` first ran (see `console::seed_klog_from_vga`).
+/// Reports how many older bytes have already been overwritten first, so
+/// an operator does not mistake a wrapped ring for the complete bootup
+/// process -- on this kernel's own tight low-memory budget (see AGENTS.md's
+/// "Low-memory map") the ring is only a few KiB, so a busy session can
+/// evict even the boot narration itself; running `dmesg` early is the best
+/// chance to still see it. Unlike most commands, this one's output is
+/// allowed to scroll past one screen, exactly like `pci`/`ls`/`memmap`.
+fn dmesg_command() {
+    let dropped = console::dmesg_dropped_bytes();
+    if dropped == 0 {
+        println!("dmesg: {} byte(s) of kernel log since boot, nothing lost:", console::dmesg_len());
+    } else {
+        println!(
+            "dmesg: {} byte(s) of kernel log ({dropped} older byte(s) already overwritten):",
+            console::dmesg_len()
+        );
+    }
+    console::print_dmesg();
 }
 
 /// `usb` reports every discovered UHCI (USB 1.1) host controller and, for

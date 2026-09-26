@@ -141,7 +141,10 @@ booted from USB) requires. The screen is never cleared at boot, so that
 VGA-only viewers keep seeing the full real-mode narration; the kernel
 instead reads the cursor position the real-mode loader's own BIOS-teletype
 printing already left behind and continues writing from there, rather than
-resetting to row 0 and overwriting the top of that narration.
+resetting to row 0 and overwriting the top of that narration. That same
+on-screen narration also seeds the `dmesg` command's kernel log ring
+buffer once, at this same read-back, so `dmesg` can replay it even though
+the real-mode code that printed it has no notion of that ring at all.
 
 | Command | Description |
 | --- | --- |
@@ -154,6 +157,7 @@ resetting to row 0 and overwriting the top of that narration.
 | `memory` | Summarizes E820 usable and non-usable memory. |
 | `cpuinfo` | Shows the CPUID vendor and raw feature bitfields. |
 | `pci` | Dumps every PCI function found on the bus: location, vendor/device ID, class/subclass/prog-if, header type, and BAR0's raw value. Used to identify unmarked or unknown hardware (e.g. reading a NIC's real vendor/device ID) before adding driver support for it. |
+| `dmesg` | Replays the kernel log ring buffer: every byte any `println!`/`print!` has sent since boot, seeded with whatever real-mode boot narration (`stage1.S`/`stage2.S`, even BIOS's own pre-boot banner) was still on screen when the console first initialized. Reports how many older bytes have already been overwritten; the ring is only a few KiB, so run this early to catch the boot narration before busy use evicts it. |
 | `usb` | Finds every UHCI (USB 1.1) host controller on the bus, reports each one's I/O base/IRQ and whether it's running, and for each root port drives a full reset/enable and standard enumeration (device descriptor, configuration descriptor, `SET_CONFIGURATION`) against whatever full-speed device is attached. |
 | `usb play [diskN] NAME` | Streams a raw PCM file (already in the target device's exact negotiated format -- no resampling) to a discovered USB Audio Class playback device over a real isochronous OUT transfer. Press F12 to stop early. |
 | `usb capture [diskN] NAME` | Captures raw PCM from a discovered USB Audio Class capture device (e.g. a microphone) over a real isochronous IN transfer, into the named FOSFS file, until the shared 4 MiB staging buffer fills or F12 is pressed. |

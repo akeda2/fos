@@ -611,8 +611,8 @@ back to source.
 ## Current command surface
 
 System commands: `help`, `clear`, `vga [d|80x25|80x50|132x25]`, `about`,
-`bootinfo`, `memmap`, `memory`, `cpuinfo`, `hexdump ADDRESS LENGTH`, `halt`,
-`reset`, and `reboot [soft|hard]`.
+`bootinfo`, `memmap`, `memory`, `cpuinfo`, `dmesg`, `hexdump ADDRESS LENGTH`,
+`halt`, `reset`, and `reboot [soft|hard]`.
 
 ### `reboot`: a soft-reboot path alongside the existing hardware reset
 
@@ -927,6 +927,44 @@ at all -- see the "tape print callback ABI" section further below, which
 is the current design; the paragraphs immediately following this one
 describe the tape as it worked *before* that change, for historical
 context on the bugs that shaped `primes.S`'s scroll/cursor handling.
+
+### `dmesg`: a kernel log ring buffer
+
+`console.rs` keeps a small, always-on ring buffer (`KLOG`, currently 3072
+bytes -- see "Low-memory map" above; this kernel's `.bss` headroom below
+`0x9f000` is only a few KiB, all of which every kernel feature competes
+for) of every byte any `println!`/`print!` in this kernel has sent, tapped
+at `write_serial` -- the same single choke point `RELAY_QUEUE`/
+`PRINT_RELAY_QUEUE` already use, so no call site anywhere needs to know it
+exists. Unlike those two, which are opt-in and drop new bytes once full
+(losing a live session's most recent bytes would corrupt it), `KLOG` is
+always capturing and, once full, overwrites its own *oldest* bytes instead
+-- ordinary dmesg-ring semantics, appropriate for a log read after the
+fact. `KLOG_DROPPED` counts overwritten bytes so `dmesg` (`shell.rs`) can
+report when its own history is incomplete rather than silently claiming
+completeness.
+
+`console::seed_klog_from_vga`, called once from `console::initialize`
+right after it reads back the CRTC cursor position, seeds this ring with
+whatever text is already sitting in the VGA framebuffer from row 0 through
+that cursor -- `stage1.S`/`stage2.S`'s own real-mode narration (and, under
+QEMU, even SeaBIOS's own pre-boot banner), still exactly where BIOS
+teletype output left it, since the screen is never cleared at boot (see
+"Prompt" in README.md). This is the only way `dmesg` can "replay the full
+bootup process" at all, given that code is 16-bit real mode with no notion
+of this ring buffer. Because the ring is small, ordinary shell use can
+evict this narration within a couple thousand bytes of subsequent output
+-- `tools/qemu_smoke.py` runs `dmesg` immediately after boot specifically
+to catch it before that happens, and asserts stage one's own VGA-only text
+(never sent to COM1 directly, so its appearance in that serial capture at
+all proves the VGA seed, not just live COM1 mirroring) comes back out
+through it. `dmesg`'s own dump (`console::print_dmesg`) suppresses the
+ring's own capture for its duration (`KLOG_SUPPRESSED`) so replaying the
+log does not also feed the replay back into itself -- everything printed
+*before* that suppression starts, including the command's own typed-input
+echo and `dmesg`'s own status header, is fair game and legitimately
+reappears in the replayed output, which is correct: the ring is exactly
+what was written to the console, in order, nothing more, nothing less.
 
 ### A permanent `pci` device-dump command
 

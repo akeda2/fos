@@ -287,6 +287,26 @@ def main() -> None:
                     raise RuntimeError(
                         f"interactive 'start' did not report a missing start file:\n{output.decode(errors='replace')}"
                     )
+            # Run 'dmesg' now, before anything else, while its small ring
+            # buffer still holds stage one's own real-mode narration (see
+            # console::seed_klog_from_vga): stage one only ever writes to
+            # the VGA text console, never COM1 (see EXPECTED_COMMON's own
+            # comment above), so this text showing up in this serial
+            # capture at all -- for the first time, only once 'dmesg' is
+            # run -- proves the ring was actually seeded from the VGA
+            # framebuffer and not just from whatever already reached COM1.
+            local_start = len(output)
+            process.stdin.write(b"dmesg\r")
+            process.stdin.flush()
+            wait_for(output, selector, BOOT_MARKER, 10, local_start)
+            if b"dmesg: " not in output[local_start:]:
+                raise RuntimeError(
+                    f"dmesg did not print its own header:\n{output.decode(errors='replace')}"
+                )
+            if b"BIOS placed 512 bytes at 0x7c00 and jumped here." not in output[local_start:]:
+                raise RuntimeError(
+                    f"dmesg did not replay stage one's VGA-only boot narration:\n{output.decode(errors='replace')}"
+                )
             commands = [
                 b"helx\x08p\r",
                 b"about\r",

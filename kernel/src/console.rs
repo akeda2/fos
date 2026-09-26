@@ -329,6 +329,135 @@ pub fn discard_print_relay(count: usize) {
     }
 }
 
+/// `dmesg`'s backing store: a third queue, structurally similar to
+/// `RELAY_QUEUE`/`PRINT_RELAY_QUEUE` above (same `write_serial` tap point,
+/// via `klog_push` below) but with two deliberate differences. First, it
+/// is always capturing -- there is no enable/disable pair, since a kernel
+/// log an operator did not know to turn on ahead of time would be useless.
+/// Second, once full it overwrites its own *oldest* bytes instead of
+/// dropping new ones: `RELAY_QUEUE`/`PRINT_RELAY_QUEUE` protect a live
+/// session's most recent bytes (an old, already-relayed byte is safe to
+/// lose; a new one is not), but `dmesg` is read after the fact by an
+/// operator who overwhelmingly cares about recent history -- ordinary
+/// ring-buffer ("dmesg" the word itself, historically "display message
+/// buffer") semantics.
+///
+/// Deliberately small: `linker.ld`'s `ASSERT(__kernel_end < 0x9f000, ...)`
+/// is a hard outer ceiling this kernel must not grow past (see AGENTS.md's
+/// "Low-memory map" -- `0x9f000` is the conventional safe boundary below
+/// the EBDA, not an arbitrary number to nudge further), and as of this
+/// writing there is only a few KiB of `.bss` headroom left below it, all
+/// of which this ring competes for with every other kernel feature.
+/// `KLOG_DROPPED` counts bytes already overwritten, so `dmesg` can report
+/// when its own history is incomplete instead of silently claiming this
+/// is everything that ever happened.
+const KLOG_LEN: usize = 3072;
+static mut KLOG: [u8; KLOG_LEN] = [0; KLOG_LEN];
+/// Index one past the most recently written byte; wraps modulo `KLOG_LEN`.
+static mut KLOG_WRITE: usize = 0;
+/// Number of valid bytes currently held, capped at `KLOG_LEN`. The oldest
+/// byte is always at `(KLOG_WRITE + KLOG_LEN - KLOG_COUNT) % KLOG_LEN`,
+/// whether or not the ring has wrapped yet -- the same formula covers
+/// both cases, since once full (`KLOG_COUNT == KLOG_LEN`) it reduces to
+/// `KLOG_WRITE` itself, the byte about to be overwritten next.
+static mut KLOG_COUNT: usize = 0;
+/// How many bytes have been overwritten (rather than merely aged out)
+/// since boot. Only grows once the ring is full.
+static mut KLOG_DROPPED: u32 = 0;
+/// Set only for the duration of `print_dmesg`'s own dump, so replaying
+/// the log does not also feed the replayed text back into itself.
+static mut KLOG_SUPPRESSED: bool = false;
+
+/// Appends `bytes` to the dmesg ring, called from `write_serial` exactly
+/// like `relay_push`/`print_relay_push` above -- every `println!`/`print!`
+/// in this kernel, plus the tape `putc` callback and every other caller of
+/// `write_bytes`/`Console::write_str`, all funnel through that one
+/// choke point, so no call site anywhere needs to know this exists.
+fn klog_push(bytes: &[u8]) {
+    unsafe {
+        if KLOG_SUPPRESSED {
+            return;
+        }
+        for &byte in bytes {
+            KLOG[KLOG_WRITE] = byte;
+            KLOG_WRITE = (KLOG_WRITE + 1) % KLOG_LEN;
+            if KLOG_COUNT < KLOG_LEN {
+                KLOG_COUNT += 1;
+            } else {
+                KLOG_DROPPED = KLOG_DROPPED.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Seeds the dmesg ring with whatever text is already sitting in the VGA
+/// framebuffer, from row 0 through the cursor position `initialize` just
+/// read back from the CRTC. Because the screen is never cleared at boot
+/// (see `initialize`'s own comment below), this is `stage1.S`'s and
+/// `stage2.S`'s own real-mode boot narration, still exactly where BIOS
+/// teletype output (or stage two's own VGA writes) left it -- the only
+/// way `dmesg` can "replay the full bootup process" despite that code
+/// being 16-bit real mode with no notion of this ring buffer at all.
+/// Trailing spaces on a completed row are trimmed (VGA rows are
+/// space-padded, by both BIOS teletype and this module's own `newline`)
+/// so a wrapped or short line does not read back as one padded with
+/// meaningless blanks.
+unsafe fn seed_klog_from_vga(last_row: usize, last_column: usize) {
+    unsafe {
+        let mode = CURRENT_VGA_MODE;
+        // 132 columns (`VgaMode::Experimental132x25`) is the widest row
+        // any supported mode can produce.
+        let mut line = [0u8; 132];
+        for row in 0..=last_row {
+            let width = if row == last_row { last_column } else { mode.width() };
+            let mut length = 0;
+            for column in 0..width {
+                let cell = VGA_BUFFER.add(row * mode.width() + column).read_volatile();
+                line[length] = (cell & 0xff) as u8;
+                length += 1;
+            }
+            while length > 0 && line[length - 1] == b' ' {
+                length -= 1;
+            }
+            klog_push(&line[..length]);
+            if row != last_row {
+                klog_push(b"\n");
+            }
+        }
+    }
+}
+
+/// Prints the dmesg ring's current contents to the ordinary console (VGA
+/// + serial + whichever relay queue happens to be active), oldest byte
+/// first, exactly as `shell`'s `dmesg` command shows them. Suppresses the
+/// ring's own capture for the duration (see `KLOG_SUPPRESSED`) so the
+/// dump does not get fed back into the very log it is replaying.
+pub fn print_dmesg() {
+    unsafe {
+        KLOG_SUPPRESSED = true;
+        let head = (KLOG_WRITE + KLOG_LEN - KLOG_COUNT) % KLOG_LEN;
+        if head + KLOG_COUNT <= KLOG_LEN {
+            write_bytes(&KLOG[head..head + KLOG_COUNT]);
+        } else {
+            write_bytes(&KLOG[head..KLOG_LEN]);
+            write_bytes(&KLOG[0..head + KLOG_COUNT - KLOG_LEN]);
+        }
+        KLOG_SUPPRESSED = false;
+    }
+}
+
+/// Number of bytes `print_dmesg` would currently print.
+pub fn dmesg_len() -> usize {
+    unsafe { KLOG_COUNT }
+}
+
+/// How many older bytes have already been overwritten and can no longer
+/// be shown -- `shell`'s `dmesg` command reports this so an operator does
+/// not mistake a wrapped ring for the complete bootup process.
+pub fn dmesg_dropped_bytes() -> u32 {
+    unsafe { KLOG_DROPPED }
+}
+
 pub fn initialize(serial_available: bool) {
     unsafe {
         SERIAL_READY = serial_available && initialize_serial();
@@ -344,6 +473,7 @@ pub fn initialize(serial_available: bool) {
         let (row, column) = read_cursor_position();
         ROW = row;
         COLUMN = column;
+        seed_klog_from_vga(row, column);
     }
 }
 
@@ -751,6 +881,7 @@ pub fn read_serial_byte() -> Option<u8> {
 }
 
 pub fn write_serial(bytes: &[u8]) {
+    klog_push(bytes);
     relay_push(bytes);
     unsafe {
         if !SERIAL_READY {
