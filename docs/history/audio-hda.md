@@ -2313,3 +2313,20 @@ step-by-step (confirming each stage -- codec-ready, bus-master-channel
 reset, playback started -- succeeded in turn) were removed afterward, so
 a working card (QEMU's own, or a real one with an actual codec present)
 initializes exactly as quietly as ES1370/HDA already do.
+
+One further, unprompted data point reinforced this same conclusion on a
+later hardware reset (pushing the final, cleaned-up build via KUP): the
+AC'97 PCI function disappeared from the bus entirely that boot (`pci`
+reported 17 functions instead of the previous 18, with `00:1f.5` simply
+absent) rather than present-but-blank. This is consistent with, not
+contradictory to, the "no physical codec" conclusion -- some BIOS
+implementations conditionally omit an onboard peripheral from PCI
+configuration space entirely once POST fails to detect its companion
+component (here, no codec ever answering the AC-link), rather than
+always leaving the function visible with unassigned BARs. Either
+symptom (blank BARs, or the function missing outright) traces back to
+the same root cause; `audio` correctly reported the accurate
+`Status::NotPresent` message for this variant (`"No supported audio
+controller found on the PCI bus."`), confirming the `NotPresent`-vs-
+`InitFailed` distinction fixed earlier in this same session handles both
+presentations correctly.
