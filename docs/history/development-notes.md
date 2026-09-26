@@ -2702,3 +2702,71 @@ attempted, it fails exactly as already documented in the previous
 section -- promoted or not. A real fix would need stage two itself to
 speak USB, an undertaking on the scale of a native 16-bit real-mode USB
 driver, not attempted here.
+
+## Real-hardware `usb native` session: an intermittent `SET_ADDRESS` timeout, and BIOS-legacy-USB drift extends to *every* disk, not just the boot disk
+
+First real-hardware test of `usb native` against genuinely two physical
+USB Mass Storage sticks at once (previously only verified with two QEMU
+`usb-storage` devices, see `test_promotes_multiple_disks` above), on the
+same real Pentium 4 this whole driver was built for, with a second,
+identical-model Kingston stick attached to a different UHCI controller's
+port alongside the machine's existing USB-legacy-backed `disk2`.
+
+Two separate things went wrong, one already documented and one not.
+
+**The already-documented one, re-confirmed and generalized.** A `usb`/
+`usb native` command run more than once within the same boot -- while
+iterating live over `term_net`, exactly the workflow this whole
+debug-mode/KUP infrastructure exists to make cheap -- left `disk2` (a
+pre-existing BIOS-USB-legacy secondary disk, *not* the boot disk) unable
+to cross-validate against its own genuine USB device on a later call in
+that same boot, even though `disk1` had already been promoted cleanly and
+`promote_all_and_attach` re-reads every not-yet-promoted disk's BIOS
+baseline fresh on every call. AGENTS.md's "USB audio and USB-boot media
+do not reliably coexist" section already documents that any
+`uhci::initialize_all()` call breaks BIOS's own USB Legacy Support
+`INT13h` emulation for the *boot* disk specifically -- this session found
+the same mechanism reaches any BIOS-USB-legacy disk, not only the one BIOS
+happens to call drive `0x80`. The fix in practice, not in code (this is a
+BIOS-firmware behavior, nothing fos's own driver can suppress): reset the
+machine (hardware `reset`/`reboot hard`, since `reboot soft` depends on
+the very BIOS state this bug corrupts) before each fresh attempt at
+`usb`/`usb native`/`usb storage attach`/`usb storage promote` whenever
+more than one BIOS-USB-legacy disk is at stake, rather than iterating
+those commands live against a machine that already has one running.
+Confirmed by reproducing the exact sequence: `usb native` on a freshly
+reset boot promoted *both* `disk1` and `disk2` to the native driver
+correctly on the very first call (matching content, not just capacity,
+for both); repeating `usb`/`usb native` a few more times in that same
+boot without an intervening reset reliably reintroduced `disk2: no
+matching USB device found`, with a *new*, extra secondary disk attached
+instead, carrying `disk2`'s own exact sector count -- strong evidence
+(not proof) it was the same underlying physical media reappearing as an
+unrelated "new" device only because `disk2`'s own BIOS-read baseline had
+already gone stale from an earlier call's controller reset, not because
+two physically distinct disks coincidentally share one sector count.
+
+**The new one: an intermittent `SET_ADDRESS` timeout, real but
+non-reproducible.** Independently of the above, the second stick's port
+(a different UHCI controller than the first stick's port) sometimes
+failed enumeration entirely -- `initial descriptor read` (the very first,
+address-0 `GET_DESCRIPTOR` for 8 bytes) succeeded, but the immediately
+following `SET_ADDRESS` control transfer (`uhci.rs`'s `set_address`, a
+no-data control transfer with a 500 ms poll deadline) timed out. This
+reproduced across two separate `usb` runs with the physical setup
+completely unchanged, then stopped reproducing on a later run with no
+code change and no config change -- both controllers enumerated their
+respective device cleanly (`vendor=0x0951 product=0x1666` on each, same
+Kingston model on both ports) once it cleared. No root cause was found;
+this reads as a genuine, if rare, real-hardware enumeration race
+somewhere in the reset-to-`SET_ADDRESS` window (`reset_port`'s own
+TRSTRCY recovery wait, `control_transfer`'s TD setup, or the device's own
+post-reset settle time), in the same general family as the bulk-transfer
+settle-time bugs found earlier in this same driver, but -- unlike those --
+never pinned down to a specific missing delay because it stopped
+reproducing before that investigation could finish. Worth another look if
+it starts reproducing reliably again, ideally by capturing the exact
+`SET_ADDRESS` TD state (`qemu`'s `-d int` equivalent isn't available here
+since QEMU has no matching two-real-device repro) at the moment of
+failure rather than after `wait_until_ready`'s own recovery has already
+run.

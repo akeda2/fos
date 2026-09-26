@@ -1123,6 +1123,22 @@ device matching no existing disk is attached fresh as a new secondary
 disk, same as `usb storage attach`, so one command now covers both jobs
 for every disk that needs it.
 
+Confirmed on real hardware with two genuinely simultaneous USB Mass
+Storage sticks (not just two QEMU `usb-storage` devices): a fresh boot's
+first `usb native` call promotes every matching disk correctly, but
+running `usb`/`usb native`/`usb storage attach`/`usb storage promote`
+more than once in the *same* boot can degrade BIOS's own USB Legacy
+Support mapping for **any** BIOS-USB-legacy secondary disk, not only the
+boot disk as previously documented -- a later call in that boot can then
+fail to cross-validate a still-genuine secondary disk against its own
+device and instead attach it fresh as an apparently new, unrelated disk.
+Reset the machine before each fresh USB-discovery attempt when more than
+one BIOS-USB-legacy disk is at stake, rather than iterating these
+commands live against an already-touched boot. Full detail (including an
+unrelated, intermittent, never-root-caused `SET_ADDRESS` enumeration
+timeout hit during the same session) is in
+`docs/history/development-notes.md`.
+
 Verified end to end by `tapes/test_uhci_e2e.py`, `test_uhci_play_e2e.py`,
 `test_uhci_audio_facade_e2e.py`, `test_usb_storage_e2e.py`,
 `test_usb_storage_disk_e2e.py`, and `test_usb_boot_promote_e2e.py` (the
