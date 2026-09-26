@@ -208,6 +208,39 @@ impl PciAddress {
         Some((pmcsr & 0b11) as u8)
     }
 
+    /// Forces this function into D0 (full power) via its PCI Power
+    /// Management capability, if it has one. A real OS's PCI core does
+    /// this unconditionally before any driver's own probe ever runs (Linux:
+    /// `pci_set_power_state(pdev, PCI_D0)`); this kernel has no such core,
+    /// so any driver relying on a memory BAR must do it explicitly instead
+    /// of assuming BIOS already left the function in D0. Per the PCI Power
+    /// Management spec, a function in D3hot does not respond to memory/IO
+    /// space accesses at all -- on some chipsets (integrated
+    /// southbridge/PCH functions especially) an attempted access while
+    /// still in that state can hang the bus outright rather than cleanly
+    /// completing with a master-abort, which is a plausible, real
+    /// explanation for a hang that happens on real hardware but never
+    /// under QEMU (which does not model PM D-states for its device
+    /// models at all). Returns `true` if a D3hot-to-D0 transition was
+    /// requested -- the caller must still wait out the PCI PM spec's
+    /// required settle delay (typically several milliseconds) before
+    /// touching this function's BARs -- or `false` if it has no PM
+    /// capability (nothing to do) or was already in D0.
+    pub fn force_power_state_d0(&self) -> bool {
+        const CAPABILITY_ID_POWER_MANAGEMENT: u8 = 0x01;
+        const PMCSR_OFFSET_FROM_CAP: u8 = 4;
+        let Some(cap) = self.find_capability(CAPABILITY_ID_POWER_MANAGEMENT) else {
+            return false;
+        };
+        let offset = cap + PMCSR_OFFSET_FROM_CAP;
+        let pmcsr = read_u16(self.bus, self.device, self.function, offset);
+        if pmcsr & 0b11 == 0 {
+            return false;
+        }
+        write_u16(self.bus, self.device, self.function, offset, pmcsr & !0b11);
+        true
+    }
+
     /// Diagnostic-only: probes `index`'s BAR the same way `assign_io_bar`
     /// does (write all-1s, read back the size mask, restore the original
     /// value) but always returns the raw readback rather than trying to

@@ -73,6 +73,33 @@
 //! address is only ever read from `RAL0`/`RAH0`, already loaded by
 //! hardware from NVM once `EECD.AUTO_RD` is set), jumbo frames, and
 //! checksum/TSO offload.
+//!
+//! **Second real-hardware attempt: still hung at the same point after the
+//! fix above, motivating one further real fix plus temporary bring-up
+//! diagnostics.** `probe_all`/`init` never forced this function into D0
+//! (full power) before touching its memory BAR at all -- a real OS's PCI
+//! core does this unconditionally before any driver's own probe ever
+//! runs (Linux: `pci_set_power_state(pdev, PCI_D0)`), but this kernel has
+//! no such core, and BIOS may well leave an onboard, PCH-integrated
+//! function like this one sitting in D3hot if no boot agent uses it. Per
+//! the PCI PM spec, a function in D3hot does not respond to memory-space
+//! accesses at all; on some chipsets (integrated southbridge/PCH
+//! functions especially) an attempted access in that state can hang the
+//! bus outright rather than cleanly master-aborting -- a real, plausible
+//! explanation for a hang QEMU (which never models PM D-states for its
+//! device models) cannot reproduce. `pci::PciAddress::force_power_state_d0`
+//! now forces D0 (with a settle delay) before `enable_memory_and_bus_master`
+//! ever runs. **Unverified**: this is this session's next hypothesis, not
+//! a confirmed fix yet.
+//!
+//! Alongside it, `probe_all`/`init`/`reset` currently carry temporary,
+//! unconditional `println!` breadcrumbs at every register-touching step
+//! (`"e1000e: ..."`), deliberately not gated on success or failure: a real
+//! hang never reaches either return path, so the *last line printed*
+//! before a real-hardware hang is the only way to know exactly which
+//! step it happened in. Remove these once the actual hang point is
+//! confirmed and fixed -- they are not meant to ship permanently, unlike
+//! this driver's other (failure-path-only) diagnostics.
 
 use core::cell::Cell;
 use core::ptr::{read_volatile, write_volatile};
@@ -328,7 +355,21 @@ impl E1000E {
         let found = pci::find_devices(VENDOR_INTEL, CANDIDATE_DEVICE_IDS, &mut addresses);
         let mut count = 0;
         for address in addresses[..found.min(addresses.len())].iter().flatten() {
+            // BIOS may leave an onboard PCH-integrated function like this
+            // one in a low-power D-state (D3hot) rather than the D0 a real
+            // OS's PCI core would already have forced by this point --
+            // per the PCI PM spec, a function in D3hot does not respond to
+            // memory-space accesses at all, and on some chipsets this can
+            // hang the bus outright rather than cleanly master-aborting.
+            // Force D0 and wait out the settle delay before ever enabling
+            // (let alone touching) this function's memory BAR.
+            crate::println!("e1000e: probe: forcing D0 power state");
+            if address.force_power_state_d0() {
+                wait_ticks(2);
+            }
+            crate::println!("e1000e: probe: enabling memory+bus-master");
             address.enable_memory_and_bus_master();
+            crate::println!("e1000e: probe: reading memory BAR0");
             if let Some(mmio_base) = address.memory_bar(0) {
                 if count == out.len() {
                     break;
@@ -344,8 +385,11 @@ impl E1000E {
     }
 
     pub fn init(mmio_base: u32, irq: Option<u8>) -> Result<Self, InitError> {
+        crate::println!("e1000e: init: mapping mmio");
         paging::map_mmio(mmio_base, MMIO_BYTES).map_err(|_| InitError::MappingUnavailable)?;
+        crate::println!("e1000e: init: resetting");
         Self::reset(mmio_base)?;
+        crate::println!("e1000e: init: reset done, configuring");
 
         let rx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let tx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
@@ -387,28 +431,35 @@ impl E1000E {
         // Quiesce Rx/Tx and let any in-flight DMA settle before pulling the
         // rug -- matters most for the watchdog-driven re-reset path, where
         // the device may genuinely be mid-transfer.
+        crate::println!("e1000e: reset: masking interrupts, quiescing rx/tx");
         write_register(mmio_base, REG_IMC, u32::MAX);
         write_register(mmio_base, REG_RCTL, 0);
         write_register(mmio_base, REG_TCTL, TCTL_PSP);
         wait_ticks(2);
 
+        crate::println!("e1000e: reset: disabling pcie master");
         disable_pcie_master(mmio_base);
 
+        crate::println!("e1000e: reset: acquiring mdio ownership");
         acquire_mdio_ownership(mmio_base)?;
+        crate::println!("e1000e: reset: issuing CTRL.RST");
         write_register(mmio_base, REG_CTRL, CTRL_RST);
         release_mdio_ownership(mmio_base);
+        crate::println!("e1000e: reset: CTRL.RST issued, waiting");
 
         // No register access of any kind here -- see module doc comment's
         // "cannot issue a flush" finding. Wait out the window with a pure
         // delay before touching the device again.
         wait_ticks(3);
 
+        crate::println!("e1000e: reset: polling EECD.AUTO_RD");
         // This chip family signals reset completion via EECD.AUTO_RD, not
         // CTRL.RST clearing (see module doc comment) -- and this is also
         // the correct point at which RAL0/RAH0 are safe to read.
         let mut attempts = 20u32;
         loop {
             if read_register(mmio_base, REG_EECD) & EECD_AUTO_RD != 0 {
+                crate::println!("e1000e: reset: AUTO_RD set, reset complete");
                 return Ok(());
             }
             attempts -= 1;
