@@ -2037,3 +2037,176 @@ Real-hardware interop with a genuine, unmodified `ffmpeg` session (as
 opposed to this project's own hand-built test/verification scripts) and
 the 24-bit path this tape's format table already accounts for (Opus
 included, since it needs a 16-bit local device) remain future work.
+
+## AC'97: a third audio backend, a real-hardware motivation, and a low-memory-region measurement bug found along the way
+
+Motivated directly by a real-hardware session on the Pentium 4/ICH4 test
+machine used throughout this project's real-hardware sections: `pci`
+showed its onboard audio as `8086:24d5`, class `04/01` ("Multimedia
+Audio Controller"), and `audio`/`hda` both correctly reported nothing
+recognized it, since fos had drivers only for ES1370 and Intel HDA --
+architecturally unrelated to AC'97 (a much older, simpler, and
+differently-laid-out interface that predates HDA by several ICH
+generations). Scoped deliberately small for a first increment:
+playback-only (no PCM-in/mic-in), no network-fed streaming (only the
+built-in test tone), matching this project's usual "smallest working
+increment first" discipline (ES1370's own ADC support came later, as a
+separate increment, and the network-fed `PcmRing` was likewise added
+after basic playback already worked).
+
+### Register-level design, cross-checked against QEMU's own source
+
+Rather than reconstruct the NAM (Native Audio Mixer, BAR0)/NABM (Native
+Audio Bus Master, BAR1) register layout from memory, QEMU's own
+`hw/audio/ac97.c` and `hw/audio/ac97.h` were fetched directly (`curl` to
+a GitHub mirror; both files are small, self-contained, and match this
+project's own already-established "read the actual emulation source,
+don't guess" standard from the RTL8139/ES1370/HDA drivers) and read
+line-by-line before writing any code. This confirmed, byte-exact: the
+per-channel bus-master sub-register offsets (`BDBAR`=+0, `CIV`=+4,
+`LVI`=+5, `SR`=+6, `PICB`=+8, `PIV`=+10, `CR`=+11, with PCM-out at
+channel base `0x10`); the global `GLOB_CNT`(`0x2c`)/`GLOB_STA`(`0x30`)
+registers and their cold-reset (`GC_CR`, bit 1) / codec-ready
+(`GS_S0CR`, bit 8) bits; every `SR`/`CR` bit position (`SR_DCH`=1,
+`SR_CELV`=2, `SR_LVBCI`=4, `SR_BCIS`=8, `SR_FIFOE`=16; `CR_RPBM`=1,
+`CR_RR`=2, `CR_LVBIE`=4, `CR_FEIE`=8, `CR_IOCE`=16); the exact buffer-
+descriptor struct layout (`{u32 addr; u32 ctl_len}`, 8 bytes, with
+`ctl_len`'s low 16 bits holding the buffer length *in samples* -- one
+16-bit word, not one stereo frame -- and bits 30/31 holding `BUP`/`IOC`,
+not a separate 16-bit control word as an initial, unverified guess
+assumed); and the NAM mixer register indices (`AC97_Reset`=`0x00`,
+`AC97_Master_Volume_Mute`=`0x02`, `AC97_PCM_Out_Volume_Mute`=`0x18`,
+`MUTE_SHIFT`=bit 15). QEMU's own PCI ID constant
+(`PCI_DEVICE_ID_INTEL_82801AA_5` = `0x2415`) was confirmed the same way,
+from `include/hw/pci/pci_ids.h`.
+
+One design assumption this source-reading process actively disproved
+before any code was written against it: a first plan was to populate the
+32-entry buffer-descriptor ring once, write `LVI` to its last index a
+single time, and never touch it again, expecting hardware to loop the
+ring automatically forever. Tracing QEMU's own `nabm_writeb`'s
+`PI_CR`/`PO_CR`/`MC_CR` case (`r->civ = r->piv; r->piv = (r->piv + 1) %
+32; fetch_bd(...)`) and its completion-handling path (`if (r->civ ==
+r->lvi) { r->sr |= SR_DCH; }`) showed conclusively that hardware halts
+the instant `CIV` reaches `LVI`, full stop, with no automatic wraparound
+regardless of how many *other* ring entries still hold valid
+descriptors -- disproving the "set once" plan before it was ever coded.
+The actual, correct technique (matching real ICH AC'97 drivers): keep
+only two physical buffer halves (`PERIOD_COUNT`), but populate all 32
+fixed ring slots to reuse them cyclically (`slot i` -> physical half `i
+% 2`), and on every completion interrupt, refill the half that just
+finished *then* advance `LVI` by exactly one more slot -- a sliding
+window that always keeps exactly one slot of margin between `CIV` and
+`LVI`. Confirmed this genuinely loops indefinitely (not just for its
+first two periods) by capturing several real seconds of playback via
+QEMU's `-audiodev wav` backend and verifying the built-in test tone's
+oscillation continued, unbroken, through the final quarter of a
+532,252-byte (~2.8 second) capture -- not just its first fraction of a
+second, which a "halts after two periods" bug could still have passed
+by accident.
+
+### A real interrupt-storm bug, the second time this project has hit this exact class
+
+The first QEMU boot with this driver (a plain `qemu-system-i386 ...
+-device AC97 ... audio` session, no explicit `-audiodev`) appeared to
+hang the entire machine solid partway through printing the `audio`
+command's own status line -- no crash message, no further serial output
+at all, for well past a minute of real wall-clock time. Two candidate
+explanations were investigated in parallel before landing on the real
+one:
+
+1. **QEMU's own default audio backend, not the driver.** With no
+   `-audiodev` flag at all, QEMU tries to open a real host audio device
+   for its default backend; in a sandboxed/headless dev container with
+   no working PulseAudio/ALSA device, that probe itself can hang
+   indefinitely, entirely independent of anything the guest kernel does.
+   Confirmed as a real, separate variable by adding an explicit
+   `-audiodev none,id=snd0 -device AC97,audiodev=snd0` -- with a defined
+   (even if silent) backend, the *entire* `audio` status line printed
+   cleanly and returned to the shell prompt with no hang at all.
+2. **The actual driver bug, found regardless.** A prior, more
+   size-conscious draft of `handle_interrupt` acknowledged only `SR_BCIS`
+   (the period-completion bit), on the theory that never setting
+   `CR_FEIE` (the FIFO-error interrupt's own enable bit) meant `SR_FIFOE`
+   could never actually assert the interrupt line even if the hardware
+   set it. Under QEMU's own unthrottled mixer callback (fastest with no
+   real host backend actively pacing it, i.e. exactly the `none`
+   backend), the fixed-size playback ring underran almost immediately,
+   setting `SR_FIFOE` -- which then sat permanently unacknowledged,
+   leaving the shared IRQ11 line (also used by the e1000 NIC in the same
+   QEMU test configuration) permanently asserted. An unacknowledged
+   status bit re-fires the interrupt the instant `iret` restores
+   `EFLAGS.IF`, so this produced the exact same class of interrupt storm
+   ES1370's own `acknowledge_dac1` doc comment already documents from
+   this project's very first audio driver -- the second time this
+   project has hit this precise failure mode, in a second, independently
+   written driver. The fix: acknowledge every write-1-to-clear bit
+   currently set in `SR` on every interrupt (`SR_WCLEAR_MASK = SR_BCIS |
+   SR_FIFOE`), not only whichever one happened to trigger period-refill
+   logic, and enable `CR_FEIE` so the condition is at least visible
+   rather than silently masked. Confirmed fixed with the same
+   `-audiodev wav` capture methodology described above -- sustained
+   playback with no hang, even under the `none`/unthrottled backend that
+   originally triggered the underrun.
+
+Given this is now the *second* independently-discovered instance of
+"leaving a real hardware status bit unacknowledged storms the shared PCI
+IRQ line," any *future* audio (or other legacy-PCI-IRQ) driver added to
+this kernel should treat "acknowledge every documented write-1-to-clear
+status bit your enable configuration can possibly set, not just the one
+your own logic currently branches on" as a hard, non-optional rule
+learned twice now, not a per-driver judgment call.
+
+### A real measurement bug in "check `size build/kernel.elf` before assuming a `.bss` addition is free"
+
+Fitting even this deliberately minimal, playback-only driver into the
+reserved low-memory region initially appeared to fail by a wide,
+confusing margin. The investigation: summing `size build/kernel.elf`'s
+own text/data/bss columns before and after adding the driver showed only
+a ~1.7 KB real content increase, against what AGENTS.md's own "Low-memory
+map" section claimed was "roughly 31 KiB of slack" -- comfortably enough
+room. And yet `linker.ld`'s `ASSERT(__kernel_end < 0x9f000, ...)` failed
+immediately.
+
+The actual root cause: `size`'s text/data/bss column sums do not, and
+structurally cannot, account for the `ALIGN(4096)` directives
+`kernel/linker.ld` places before `.rodata` and before `.data` -- each one
+inserts up to 4095 bytes of real, un-reported padding between sections
+whenever a section's own content happens to end just short of the next
+4 KiB boundary. Getting the *real* number required building with a
+temporary `strip = "none"` in `kernel/Cargo.toml` (the shipped release
+profile fully strips symbols) and reading the linked `__kernel_end`
+symbol's own address directly via `nm build/kernel.elf | grep
+__kernel_end`, rather than trusting any section-size arithmetic at all.
+Measured this way: the kernel had only **64 bytes** of real slack below
+`0x9f000` immediately *before* this driver was added (`__kernel_end =
+0x9efc0`) -- not 31 KiB, not even the ~1.1 KB a naive `size`-sum estimate
+suggested -- and adding this driver's genuinely small ~1.7 KB of new
+code/data pushed `__kernel_end` to `0xa0fc0`, a full **8192 bytes**
+higher, because that modest content growth happened to cross *two*
+separate 4 KiB alignment boundaries it had previously fit just under.
+`0xa0fc0` is not merely past the old `0x9f000` convention -- it is past
+`0xA0000`, the real, universal, BIOS-independent physical address where
+VGA's own memory-mapped I/O begins on every x86 PC, a hard wall no amount
+of "nudge the ceiling a little further" reasoning can safely cross.
+
+Given the real, verified slack was only 64 bytes -- not enough for any
+new feature at all, let alone this one -- growing `0x9f000` itself was
+correctly ruled out (see AGENTS.md's own "Low-memory map" section on why
+`0xA0000` specifically is non-negotiable), and the fix instead was
+finding real, already-existing `.bss` waste to reclaim:
+`es1370::MAX_INSTANCES` dropped from 4 to 2. Both of the two now-removed
+instances' own 16 KiB ring-pairs (playback + capture) were genuine dead
+capacity -- no realistic machine running this project has ever had more
+than two ES1370-family sound cards installed simultaneously, and
+`tapes/test_audio_multi_e2e.py`, the one existing test that exercises
+multi-instance ES1370 at all, only ever attaches exactly two. This
+reclaimed ~65 KiB, leaving real (correctly measured) slack at roughly
+56 KiB -- comfortable room for this driver and near-term future growth,
+confirmed by `make test` and `tapes/test_audio_multi_e2e.py` both passing
+unchanged afterward.
+
+AGENTS.md's own "Low-memory map" section has been corrected to describe
+measuring `__kernel_end` directly as the authoritative method, and to
+frame `0xA0000` (not `0x9f000`'s own EBDA-convention framing) as the real
+hard ceiling -- both corrections a direct result of this investigation.

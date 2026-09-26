@@ -181,20 +181,26 @@ fixed address below `0x9f000`, and update it in the same change that adds one:
 | `0x100000`-`0x500000` | `kernel/src/pmem.rs` (`TAPE_BASE`/`TAPE_LEN`), any tape's own linker script | The fixed 4 MiB region every tape (`tape load disk`/`tape load net`) is always loaded into, carved out of `pmem`'s general frame pool at boot so `allocate`/`allocate_contiguous`/`palloc` can never hand these frames to anything else. See "Tapes: fixed load address, and writing one in Rust" below. |
 | `0x500000`-`0x501000` | `stage2.S`, `netrom.S` | Protected-mode stack pointer during boot (one page, stack grows down from the top). Relocated here from a fixed `0x9f000` -- see below -- once the flat GDT is loaded and every segment register already points at it, this stack has no remaining reason to stay below 1 MiB; `pmem::initialize` reserves this page defensively (via `reserve_range`, alongside the tape region immediately below it) even though nothing runs concurrently with stage two's own brief setup-then-far-jump-to-`kmain` window, including `reboot::soft_reboot`'s identical re-entry into this same code. |
 
-This region's own hard outer limit is `0x9f000`, the conventional "safely
-below the EBDA" boundary the boot-time protected-mode stack used to sit at
-directly; relocating that stack (see the table row above) reclaimed the
-entire `0x7000` (28 KiB) gap that used to exist only to leave it room, so
-the kernel's own reserved region now runs all the way up to that same
-boundary instead of stopping short of it. Measure real headroom with `size
-build/kernel.elf` (`.bss`'s end, not `kernel.bin`'s file size, is what
-actually matters -- see "`audio.rs`: a format-agnostic facade..." below for
-why) before assuming a small `.bss` addition is free: as of this writing
-there is roughly 31 KiB of slack before `0x9f000`, the *first* thing to
-check, not the linker's own `ASSERT` failing after the fact. If this
-genuinely runs out again, the sustainable fix is moving the reserved
-region's own contents to make more room (e.g. shrinking `.bss`, or reducing
-`kernel_stack`'s size), not nudging `0x9f000` itself further into the EBDA.
+This region's own hard outer limit is `0x9f000` -- and, more fundamentally
+than any EBDA convention, `0xA0000` is the true, non-negotiable wall
+immediately above it: VGA's own memory-mapped I/O window begins there on
+every x86 PC, so nothing reserved for the kernel may ever cross it
+regardless of how the EBDA itself is configured. Measure real headroom
+with the linked `__kernel_end` symbol's own address, **not** `size
+build/kernel.elf`'s text/data/bss column sums: those sums silently ignore
+the `ALIGN(4096)` padding gaps `linker.ld` inserts between
+`.text`/`.rodata`/`.data`, so a small, isolated content-size change can
+cost a full extra 4 KiB page (or two) of real position with no visible
+warning in `size`'s own output -- exactly the mistake that first produced
+this section's now-corrected "roughly 31 KiB of slack" claim (see the
+AC'97 section below for the full story). Get the trustworthy number with
+`nm build/kernel.elf | grep __kernel_end` (needs a temporary `strip =
+"none"` in `kernel/Cargo.toml`, since the shipped profile strips all
+symbols) before assuming a small `.bss` addition is free, not the
+linker's own `ASSERT` failing after the fact. If this genuinely runs out
+again, the sustainable fix is moving the reserved region's own contents
+to make more room (e.g. shrinking `.bss`, or reducing `kernel_stack`'s
+size), not nudging `0x9f000` itself toward the hard `0xA0000` ceiling.
 
 ## Educational verbosity
 
@@ -2037,6 +2043,90 @@ ES1370, the audio-net wire-protocol's per-device tagging design, and every
 HDA increment (discover-only, CORB/RIRB + node-graph enumeration,
 multi-controller, stream-DMA playback, capture, and multichannel
 negotiation) -- is in `docs/history/audio-hda.md`.
+
+## AC'97: a third audio backend, and reduced ES1370 headroom to make room for it
+
+`kernel/src/ac97.rs` is a third PCI sound driver, alongside ES1370 and HDA,
+for Intel's ICH-family AC'97 ("Native Audio Mixer" / "Native Audio Bus
+Master") controller -- motivated by a real, physically owned machine (the
+Pentium 4/ICH4 test box used throughout this file's real-hardware
+sections) whose onboard audio is otherwise permanently inaccessible: fos
+has no driver for any other codec family that chipset exposes. It is
+QEMU's own emulated sound device too (`-device AC97`, PCI ID `8086:2415`,
+Intel's original `82801AA`), so, unlike the still-fully-real-hardware-only
+I350/3C509 drivers, this one gets real `make test`-style QEMU coverage.
+`ac97::CANDIDATE`-equivalent discovery matches exactly two IDs: `0x2415`
+(QEMU's own model) and `0x24d5` (the confirmed real ICH4 device) -- a
+deliberately narrow pair, not a speculative broadening across every
+ICH-generation ID, even though Intel's own AC'97 register layout is
+documented backward-compatible across generations.
+
+**Scope: playback-only, no network-fed streaming yet.** This driver
+programs only the PCM-out bus-master channel (no PCM-in/mic-in), and
+always plays its own built-in test tone -- there is no `submit`-backed
+network-fed ring yet, unlike ES1370/HDA. That gap is deliberate, not an
+oversight: a per-instance `audio::PcmRing` costs a fixed 16 KiB of
+`.bss`, and this kernel's reserved low-memory region had almost no real
+slack left when this driver was first added (see the next paragraph).
+`ac97::MAX_INSTANCES` is 1 (a real motherboard south-bridge function,
+never something a machine has more than one of, unlike an add-in ES1370
+card).
+
+**A genuine measurement bug in this project's own "check `size
+build/kernel.elf`" convention was found while fitting this driver in.**
+Summing `size`'s text/data/bss columns (the documented way to check
+reserved-region headroom) ignores the `ALIGN(4096)` padding gaps
+`linker.ld` inserts between `.text`/`.rodata`/`.data` -- a small, isolated
+content-size change can silently cost a full extra 4 KiB page (or two) of
+real position if it happens to push a section boundary across its next
+alignment point, with no way to see this from `size`'s own output. The
+real, trustworthy number is the linked `__kernel_end` symbol's own address
+(`nm build/kernel.elf | grep __kernel_end`, which needs a temporary
+`strip = "none"` in `kernel/Cargo.toml` since the shipped profile strips
+all symbols) -- not a sum of section sizes. Measured this way, this
+kernel had only **64 bytes** of real slack below `0x9f000` before this
+driver, not the "roughly 31 KiB" this file's own "Low-memory map" section
+previously claimed (stale since some earlier growth step, never
+re-verified with the correct method). `AGENTS.md`'s own low-memory
+guidance has been corrected to describe measuring `__kernel_end` directly
+instead of trusting `size`'s column sums.
+
+Given that real 64-byte margin, the actual fix was not growing
+`0x9f000` (a real hardware wall sits close enough above it -- 0xA0000 is
+where VGA's own memory-mapped I/O begins on every x86 PC, non-negotiable,
+unlike the softer EBDA-convention framing this file used to give
+`0x9f000` itself) but freeing existing headroom instead:
+`es1370::MAX_INSTANCES` dropped from 4 to 2, reclaiming ~65 KiB of
+`.bss` (two of its four 16 KiB ring-pairs) that no realistic machine
+running this project was ever going to use -- confirmed unaffected by
+`tapes/test_audio_multi_e2e.py`, which only ever exercises two
+simultaneous ES1370 instances. This left real slack at roughly 56 KiB
+measured the correct way, comfortable room for this driver and further
+near-term growth.
+
+A real bug was found and fixed while first bringing this driver up under
+QEMU: acknowledging only `SR_BCIS` (the period-completion status bit) and
+never enabling/clearing `SR_FIFOE` (FIFO error) left that bit permanently
+set the instant the ring's fixed-size buffer underran (immediate, under
+QEMU's own unthrottled mixer callback with no host audio backend
+attached) -- an unacknowledged status bit re-fires the shared PCI IRQ
+line (also used by the e1000 NIC in the same test configuration) the
+instant `iret` restores `EFLAGS.IF`, hanging the whole machine. This is
+the exact ES1370 interrupt-storm lesson this project already learned
+once (see `es1370.rs`'s own `acknowledge_dac1` doc comment), now hit a
+second time in a second driver; the fix is acknowledging every
+write-1-to-clear bit in `SR` on every interrupt, not only whichever one
+triggered period-refill logic. Confirmed fixed, and confirmed the
+sliding-`LVI` playback ring genuinely loops indefinitely rather than
+halting after its first two periods, by capturing real QEMU `-audiodev
+wav` output during a several-second `audio` session and verifying the
+built-in test tone's oscillation continues unbroken all the way through
+the capture, not just its first fraction of a second.
+
+Full detail (the exact register-level layout cross-checked against
+QEMU's `hw/audio/ac97.c`/`ac97.h` source, the sliding-`LVI` ring
+technique's own derivation, and the alignment-padding investigation
+narrative) is in `docs/history/audio-hda.md`.
 
 ## Real-time audio streaming over RTP/UDP: the `audio-rtp` tape
 

@@ -34,6 +34,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::ac97;
 use crate::es1370;
 use crate::hda;
 use crate::uhci;
@@ -210,6 +211,7 @@ impl PcmRing {
 pub enum Audio {
     Es1370(&'static es1370::Es1370),
     Hda(&'static hda::Hda),
+    Ac97(&'static ac97::Ac97),
     /// A USB Audio Class device discovered over UHCI -- see
     /// `uhci::UsbAudioDevice`'s own doc comment. A playback endpoint is
     /// always required to reach this variant at all; a discovered
@@ -224,6 +226,7 @@ impl Audio {
         match self {
             Audio::Es1370(_) => "ES1370",
             Audio::Hda(_) => "Intel HDA",
+            Audio::Ac97(_) => "Intel ICH AC'97",
             Audio::Uhci(device) => device.driver_name(),
         }
     }
@@ -232,6 +235,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.format(),
             Audio::Hda(card) => card.format(),
+            Audio::Ac97(card) => card.format(),
             Audio::Uhci(device) => device.format(),
         }
     }
@@ -248,6 +252,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.format(),
             Audio::Hda(card) => card.format(),
+            Audio::Ac97(card) => card.format(),
             Audio::Uhci(device) => device.capture_format(),
         }
     }
@@ -261,6 +266,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.submit(data),
             Audio::Hda(card) => card.submit(data),
+            Audio::Ac97(card) => card.submit(data),
             Audio::Uhci(device) => device.submit(data),
         }
     }
@@ -269,6 +275,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.underrun_count(),
             Audio::Hda(card) => card.underrun_count(),
+            Audio::Ac97(card) => card.underrun_count(),
             Audio::Uhci(device) => device.underrun_count(),
         }
     }
@@ -279,6 +286,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.ring_backlog(),
             Audio::Hda(card) => card.ring_backlog(),
+            Audio::Ac97(card) => card.ring_backlog(),
             Audio::Uhci(device) => device.ring_backlog(),
         }
     }
@@ -287,6 +295,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.interrupt_stats(),
             Audio::Hda(card) => card.interrupt_stats(),
+            Audio::Ac97(card) => card.interrupt_stats(),
             Audio::Uhci(device) => device.interrupt_stats(),
         }
     }
@@ -299,6 +308,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.io_base() as u32,
             Audio::Hda(card) => card.io_base(),
+            Audio::Ac97(card) => card.io_base(),
             Audio::Uhci(device) => device.io_base(),
         }
     }
@@ -307,6 +317,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.raw_status(),
             Audio::Hda(card) => card.raw_status(),
+            Audio::Ac97(card) => card.raw_status(),
             Audio::Uhci(device) => device.raw_status(),
         }
     }
@@ -320,6 +331,11 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.capture(out),
             Audio::Hda(card) => card.capture(out),
+            // PCM-in is not implemented this increment (see `ac97.rs`'s
+            // own doc comment) -- "nothing captured", never an error,
+            // the same convention `Audio::Uhci` uses for a device with
+            // no capture endpoint at all.
+            Audio::Ac97(_) => 0,
             Audio::Uhci(device) => device.capture(out),
         }
     }
@@ -328,6 +344,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.capture_overrun_count(),
             Audio::Hda(card) => card.capture_overrun_count(),
+            Audio::Ac97(_) => 0,
             Audio::Uhci(device) => device.capture_overrun_count(),
         }
     }
@@ -338,6 +355,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.capture_backlog(),
             Audio::Hda(card) => card.capture_backlog(),
+            Audio::Ac97(_) => 0,
             Audio::Uhci(device) => device.capture_backlog(),
         }
     }
@@ -348,6 +366,7 @@ impl Audio {
         match self {
             Audio::Es1370(card) => card.capture_periods(),
             Audio::Hda(card) => card.capture_periods(),
+            Audio::Ac97(_) => 0,
             Audio::Uhci(device) => device.capture_periods(),
         }
     }
@@ -362,7 +381,8 @@ impl Audio {
 /// matching device across every controller/port, so at most one USB
 /// Audio device (covering both its playback and capture directions) is
 /// ever possible here regardless.
-pub const MAX_DEVICES: usize = es1370::MAX_INSTANCES + hda::MAX_INSTANCES + 1;
+pub const MAX_DEVICES: usize =
+    es1370::MAX_INSTANCES + hda::MAX_INSTANCES + ac97::MAX_INSTANCES + 1;
 
 static mut DEVICES: [Option<Audio>; MAX_DEVICES] = [const { None }; MAX_DEVICES];
 static mut DEVICE_COUNT: usize = 0;
@@ -449,6 +469,21 @@ pub fn initialize() -> Result<usize, Status> {
                     DEVICES[DEVICE_COUNT] = Some(Audio::Hda(controller));
                     DEVICE_COUNT += 1;
                 }
+            }
+        }
+
+        let ac97_found = match ac97::initialize_all() {
+            Ok(count) => count,
+            Err(ac97::Status::NotPresent) => 0,
+            Err(ac97::Status::InitFailed) => {
+                hardware_present = true;
+                0
+            }
+        };
+        for index in 0..ac97_found.min(MAX_DEVICES.saturating_sub(DEVICE_COUNT)) {
+            if let Some(card) = ac97::get(index) {
+                DEVICES[DEVICE_COUNT] = Some(Audio::Ac97(card));
+                DEVICE_COUNT += 1;
             }
         }
 

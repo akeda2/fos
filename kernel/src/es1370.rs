@@ -174,17 +174,19 @@ pub enum Status {
 /// independent stereo pair -- this chip's DAC1 has no way to address more
 /// than 2 channels itself (see this module's own doc comment) -- so this
 /// is also this project's current ceiling on ES1370-backed channel count:
-/// `MAX_INSTANCES * 2` (8, at the current value of 4). Deliberately not
+/// `MAX_INSTANCES * 2` (4, at the current value of 2). Deliberately not
 /// `pci::MAX_DEVICE_MATCHES` (8): each instance owns two independent
 /// `audio::RING_CAPACITY_BYTES`-sized (16 KiB) jitter rings (playback and
-/// capture), so doubling this would double that `.bss` cost for a channel
-/// count (16) well past what a real, physically installed set of vintage
-/// Sound Blaster PCI cards is ever likely to need -- 4 was chosen as
-/// enough to reach the user's stated "4 or 8 channels" target while
-/// keeping the reserved low-memory region's growth modest (see
-/// AGENTS.md's "Low-memory map" growth history for why this constant is
-/// not chosen casually).
-pub const MAX_INSTANCES: usize = 4;
+/// capture), so this constant directly trades off against the kernel's
+/// own tight reserved-low-memory-region budget (see AGENTS.md's
+/// "Low-memory map" growth history). Originally 4 (enough to reach an
+/// earlier "4 or 8 channels" target); reduced to 2 -- still comfortably
+/// above what a real, physically installed set of vintage Sound Blaster
+/// PCI cards is ever likely to need simultaneously -- to reclaim ~65 KiB
+/// of `.bss` for AC'97 (`ac97.rs`) once the reserved region's own real
+/// remaining headroom turned out to be only double-digit bytes, not the
+/// low tens of KiB a stale measurement had assumed.
+pub const MAX_INSTANCES: usize = 2;
 
 pub struct Es1370 {
     /// Which slot in `RINGS`/`CAPTURE_RINGS` (and, from the facade's own
