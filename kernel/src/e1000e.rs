@@ -29,41 +29,55 @@
 //! skipped the semaphore for it; that assumption was wrong, and the
 //! semaphore is now taken unconditionally for every matched device ID.
 //!
-//! **A genuine reset-sequencing bug was found and fixed after this driver
-//! hung real 82579V hardware at NIC init (QEMU's 82574L model never
-//! surfaced it).** The original `reset()` mirrored `e1000.rs`/`i350.rs`:
-//! write `CTRL.RST`, then immediately loop reading `CTRL` back to see the
-//! bit clear. Cross-checking Linux's own `e1000_reset_hw_82571`/
-//! `e1000_reset_hw_ich8lan` found the exact cause: **any register access
-//! -- even a read -- immediately after issuing `CTRL.RST` can hang
-//! e1000e-family silicon outright**, called out explicitly in Linux's own
-//! source as `/* cannot issue a flush here because it hangs the hardware
-//! */`. Older 82540EM/I350 silicon has no such hazard, which is exactly
-//! why `e1000.rs`/`i350.rs`'s identical-looking polling loop is safe for
-//! them and was never safe here. Two more real differences from those
-//! drivers came out of the same cross-check, both now implemented:
+//! **Two genuine reset-sequencing bugs were found and fixed after this
+//! driver hung real 82579V hardware at NIC init** (QEMU's 82574L model
+//! never surfaced either one). Both are instances of the same underlying
+//! rule, called out explicitly in Linux's own `e1000_reset_hw_ich8lan`
+//! source: `/* cannot issue a flush here because it hangs the hardware
+//! */` -- **any register access, even a read, immediately after issuing
+//! `CTRL.RST` can hang e1000e-family silicon outright.** Older 82540EM/
+//! I350 silicon has no such hazard, which is exactly why the
+//! identical-looking patterns in `e1000.rs`/`i350.rs` are safe for them
+//! and were never safe here:
 //!
-//! - **PCIe master disable before reset.** `disable_pcie_master` sets
-//!   `CTRL.GIO_MASTER_DISABLE` and waits (bounded, timeout-tolerant --
-//!   Linux itself only logs and proceeds on timeout, never treats it as
-//!   fatal) for `STATUS.GIO_MASTER_ENABLE` to clear, so no in-flight PCIe
-//!   transaction is left stuck mid-transaction when the MAC reset hits.
-//!   Neither `e1000.rs` (plain PCI, no such concept) nor `i350.rs` (PCIe,
-//!   but not yet cross-checked against real hardware) does this.
-//! - **Reset completion is signaled by `EECD.AUTO_RD`, not `CTRL.RST`
-//!   clearing.** Neither of Linux's two e1000e-family reset functions
-//!   ever polls `CTRL.RST`; both wait for the NVM auto-read-done bit
-//!   instead, which is also the correct signal that `RAL0`/`RAH0` are
-//!   safe to read afterward. `reset()` now does the same: after issuing
-//!   `CTRL.RST` and releasing the semaphore, it waits a fixed, register-
-//!   access-free delay (`wait_ticks`, reusing `uhci.rs`'s tick-based
-//!   busy-wait idiom) before touching any register again, then polls
-//!   `EECD.AUTO_RD`.
+//! 1. The original `reset()` mirrored `e1000.rs`/`i350.rs`: write
+//!    `CTRL.RST`, then immediately loop reading `CTRL` back to see the
+//!    bit clear. Fixed by never polling `CTRL.RST` at all -- neither of
+//!    Linux's two e1000e-family reset functions do -- and instead waiting
+//!    a fixed, register-access-free delay (`wait_ticks`, reusing
+//!    `uhci.rs`'s tick-based busy-wait idiom) before polling
+//!    `EECD.AUTO_RD` (NVM auto-read-done), the real completion signal
+//!    this family uses, and also the correct point at which `RAL0`/
+//!    `RAH0` are safe to read.
+//! 2. Real-hardware testing of fix #1 still hung, one step later:
+//!    `reset()` called `release_mdio_ownership` (a register **read** of
+//!    `EXTCNF_CTRL`) immediately after the `CTRL.RST` write -- the same
+//!    forbidden access, just missed for the semaphore-release call
+//!    specifically. Fixed by deferring `release_mdio_ownership` until
+//!    after the `EECD.AUTO_RD` poll succeeds (or times out), matching
+//!    Linux's own `e1000_reset_hw_ich8lan`, which leaves `EXTCNF_CTRL`'s
+//!    ownership bit set across the reset itself and only clears it later,
+//!    well after other register access has already succeeded.
 //!
-//! This turned out to be a driver bug applicable to the whole e1000e
-//! family, not an 82579-only errata this driver had deliberately deferred
-//! -- QEMU's 82574L model simply has no equivalent hardware timing hazard
-//! to expose it.
+//! `disable_pcie_master` (sets `CTRL.GIO_MASTER_DISABLE`, waits bounded
+//! for `STATUS.GIO_MASTER_ENABLE` to clear) was added alongside fix #1,
+//! so no in-flight PCIe transaction is left stuck mid-transaction when
+//! the MAC reset hits -- neither `e1000.rs` (plain PCI, no such concept)
+//! nor `i350.rs` (PCIe, but not yet cross-checked against real hardware)
+//! does this. `pci::PciAddress::force_power_state_d0` was also added
+//! (called from `probe_all` before the memory BAR is ever touched): BIOS
+//! can leave a PCH-integrated function like this one in D3hot, which does
+//! not respond to memory-space accesses at all per the PCI PM spec, and a
+//! real OS's PCI core always forces D0 before any driver probe runs. This
+//! did not turn out to be the cause of either hang above, but is kept as
+//! correct PCI hygiene this kernel should have been doing anyway.
+//!
+//! **Confirmed fixed end to end on the real 82579V ITX board this driver
+//! targets**: clean boot through reset, discovered as `Intel e1000e`,
+//! and verified passing real bidirectional traffic over `term_net`.
+//! Both bugs turned out applicable to the whole e1000e family, not
+//! 82579-only errata -- QEMU's 82574L model simply has no equivalent
+//! hardware timing hazard to expose either one.
 //!
 //! Still deliberately out of scope, consistent with every other NIC
 //! backend here: MSI (82579 supports it, but this driver only ever uses
@@ -73,34 +87,6 @@
 //! address is only ever read from `RAL0`/`RAH0`, already loaded by
 //! hardware from NVM once `EECD.AUTO_RD` is set), jumbo frames, and
 //! checksum/TSO offload.
-//!
-//! **Second real-hardware attempt still hung, one step later than
-//! before, which is what actually found the real bug.** Two changes were
-//! made at that point: `pci::PciAddress::force_power_state_d0` was added
-//! (BIOS can leave a PCH-integrated function like this one in D3hot,
-//! which does not respond to memory-space accesses at all per the PCI PM
-//! spec -- a real OS's PCI core always forces D0 before any driver probe
-//! runs, which this kernel has no equivalent of); and temporary,
-//! unconditional `println!` breadcrumbs were added at every register-
-//! touching step in `probe_all`/`init`/`reset`, since a real hang never
-//! reaches a return path to gate diagnostics on. The next real-hardware
-//! attempt printed every line through `"issuing CTRL.RST"` and then hung
-//! -- confirming the D0 fix wasn't the (sole) issue, but pinpointing the
-//! actual bug precisely: `reset()` called `release_mdio_ownership`
-//! (a register **read** of `EXTCNF_CTRL`) immediately after the
-//! `CTRL.RST` write, with no diagnostic of its own between them. That
-//! read is exactly the forbidden immediate-post-reset register access
-//! this driver had already fixed once for the *completion-polling* case
-//! but missed for the *semaphore-release* case. Linux's own
-//! `e1000_reset_hw_ich8lan` avoids this the same way this driver now
-//! does: it leaves `EXTCNF_CTRL`'s ownership bit set across the reset
-//! itself and only clears it later, well after other register access has
-//! already succeeded -- `reset()` now defers `release_mdio_ownership`
-//! until after the `EECD.AUTO_RD` poll below, success or timeout either
-//! way. The D0 fix is kept regardless (it is correct PCI hygiene this
-//! kernel should have been doing anyway, whether or not it was ever the
-//! actual cause here), and the breadcrumb `println!`s remain in place
-//! until a real-hardware boot confirms this was the whole fix.
 
 use core::cell::Cell;
 use core::ptr::{read_volatile, write_volatile};
@@ -364,13 +350,10 @@ impl E1000E {
             // hang the bus outright rather than cleanly master-aborting.
             // Force D0 and wait out the settle delay before ever enabling
             // (let alone touching) this function's memory BAR.
-            crate::println!("e1000e: probe: forcing D0 power state");
             if address.force_power_state_d0() {
                 wait_ticks(2);
             }
-            crate::println!("e1000e: probe: enabling memory+bus-master");
             address.enable_memory_and_bus_master();
-            crate::println!("e1000e: probe: reading memory BAR0");
             if let Some(mmio_base) = address.memory_bar(0) {
                 if count == out.len() {
                     break;
@@ -386,11 +369,8 @@ impl E1000E {
     }
 
     pub fn init(mmio_base: u32, irq: Option<u8>) -> Result<Self, InitError> {
-        crate::println!("e1000e: init: mapping mmio");
         paging::map_mmio(mmio_base, MMIO_BYTES).map_err(|_| InitError::MappingUnavailable)?;
-        crate::println!("e1000e: init: resetting");
         Self::reset(mmio_base)?;
-        crate::println!("e1000e: init: reset done, configuring");
 
         let rx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let tx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
@@ -432,20 +412,15 @@ impl E1000E {
         // Quiesce Rx/Tx and let any in-flight DMA settle before pulling the
         // rug -- matters most for the watchdog-driven re-reset path, where
         // the device may genuinely be mid-transfer.
-        crate::println!("e1000e: reset: masking interrupts, quiescing rx/tx");
         write_register(mmio_base, REG_IMC, u32::MAX);
         write_register(mmio_base, REG_RCTL, 0);
         write_register(mmio_base, REG_TCTL, TCTL_PSP);
         wait_ticks(2);
 
-        crate::println!("e1000e: reset: disabling pcie master");
         disable_pcie_master(mmio_base);
 
-        crate::println!("e1000e: reset: acquiring mdio ownership");
         acquire_mdio_ownership(mmio_base)?;
-        crate::println!("e1000e: reset: issuing CTRL.RST");
         write_register(mmio_base, REG_CTRL, CTRL_RST);
-        crate::println!("e1000e: reset: CTRL.RST issued, waiting");
 
         // No register access of any kind here -- not even to release the
         // semaphore just acquired above. This is the real, confirmed hang
@@ -463,14 +438,12 @@ impl E1000E {
         // touching the device again for anything, release included.
         wait_ticks(3);
 
-        crate::println!("e1000e: reset: polling EECD.AUTO_RD");
         // This chip family signals reset completion via EECD.AUTO_RD, not
         // CTRL.RST clearing (see module doc comment) -- and this is also
         // the correct point at which RAL0/RAH0 are safe to read.
         let mut attempts = 20u32;
         let result = loop {
             if read_register(mmio_base, REG_EECD) & EECD_AUTO_RD != 0 {
-                crate::println!("e1000e: reset: AUTO_RD set, reset complete");
                 break Ok(());
             }
             attempts -= 1;

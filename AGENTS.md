@@ -1039,37 +1039,47 @@ of this driver assumed 82574 used a different, I350-style mechanism and
 skipped the semaphore for it; that assumption was wrong, corrected once
 the real hardware bring-up below forced a closer look at Linux's source.
 
-**A real reset-sequencing bug was found and fixed after this driver hung
-real 82579V hardware at NIC init** (QEMU's 82574L model never surfaced
-it, since it has no equivalent hardware timing hazard). The original
-`reset()` mirrored `e1000.rs`/`i350.rs`: write `CTRL.RST`, then
-immediately loop reading `CTRL` back to see the bit clear. Cross-checking
-Linux's own `e1000_reset_hw_82571`/`e1000_reset_hw_ich8lan` found the
-exact cause, called out explicitly in Linux's own source comment:
-`/* cannot issue a flush here because it hangs the hardware */` --
-**any register access, even a read, immediately after issuing `CTRL.RST`
-can hang e1000e-family silicon outright.** Older 82540EM/I350 silicon has
-no such hazard, which is why the identical-looking polling loop in
-`e1000.rs`/`i350.rs` is safe for them and was never safe here. This turned
-out to be a bug applicable to the whole e1000e family, not an 82579-only
-errata this driver had deliberately deferred. Two more real differences
-came out of the same cross-check, both now implemented:
+**Two real reset-sequencing bugs were found and fixed after this driver
+hung real 82579V hardware at NIC init** (QEMU's 82574L model never
+surfaced either one). Both are instances of the same underlying rule,
+called out explicitly in Linux's own `e1000_reset_hw_ich8lan` source:
+`/* cannot issue a flush here because it hangs the hardware */` -- **any
+register access, even a read, immediately after issuing `CTRL.RST` can
+hang e1000e-family silicon outright.** Older 82540EM/I350 silicon has no
+such hazard, which is why the identical-looking patterns in
+`e1000.rs`/`i350.rs` are safe for them and were never safe here:
 
-- **PCIe master disable before reset** (`disable_pcie_master`): sets
-  `CTRL.GIO_MASTER_DISABLE` and waits (bounded, timeout-tolerant -- Linux
-  itself only logs and proceeds on timeout) for `STATUS.GIO_MASTER_ENABLE`
-  to clear, so no in-flight PCIe transaction is left stuck mid-transaction
-  when the MAC reset hits. Neither `e1000.rs` (plain PCI, no such concept)
-  nor `i350.rs` (PCIe, but not yet cross-checked against real hardware)
-  does this.
-- **Reset completion is signaled by `EECD.AUTO_RD`, not `CTRL.RST`
-  clearing.** Neither of Linux's two e1000e-family reset functions ever
-  polls `CTRL.RST`; both wait for the NVM auto-read-done bit instead,
-  which is also the correct signal that `RAL0`/`RAH0` are safe to read.
-  `reset()` now does the same: after issuing `CTRL.RST` and releasing the
-  semaphore, it waits a fixed, register-access-free delay (`wait_ticks`,
-  reusing `uhci.rs`'s tick-based busy-wait idiom) before touching any
-  register again, then polls `EECD.AUTO_RD`.
+1. The original `reset()` mirrored `e1000.rs`/`i350.rs`: write
+   `CTRL.RST`, then immediately loop reading `CTRL` back to see the bit
+   clear. Fixed by never polling `CTRL.RST` at all -- neither of Linux's
+   two e1000e-family reset functions do -- and instead waiting a fixed,
+   register-access-free delay (`wait_ticks`, reusing `uhci.rs`'s
+   tick-based busy-wait idiom) before polling `EECD.AUTO_RD` (NVM
+   auto-read-done), the real completion signal this family uses, and
+   also the correct point at which `RAL0`/`RAH0` are safe to read.
+2. Real-hardware testing of fix #1 still hung, one register-touch later:
+   `reset()` called `release_mdio_ownership` (a register **read** of
+   `EXTCNF_CTRL`) immediately after the `CTRL.RST` write -- the same
+   forbidden access, just missed for the semaphore-release call
+   specifically. Fixed by deferring `release_mdio_ownership` until after
+   the `EECD.AUTO_RD` poll succeeds (or times out), matching Linux's own
+   `e1000_reset_hw_ich8lan`, which leaves `EXTCNF_CTRL`'s ownership bit
+   set across the reset itself and only clears it later, well after
+   other register access has already succeeded.
+
+`disable_pcie_master` (sets `CTRL.GIO_MASTER_DISABLE`, waits bounded for
+`STATUS.GIO_MASTER_ENABLE` to clear, timeout-tolerant like Linux's own
+equivalent) was added alongside fix #1, so no in-flight PCIe transaction
+is left stuck mid-transaction when the MAC reset hits -- neither
+`e1000.rs` (plain PCI, no such concept) nor `i350.rs` (PCIe, but not yet
+cross-checked against real hardware) does this. `pci::force_power_state_d0`
+was also added (called from `probe_all` before the memory BAR is ever
+touched): BIOS can leave a PCH-integrated function like this one in
+D3hot, which does not respond to memory-space accesses at all per the
+PCI PM spec, and a real OS's PCI core always forces D0 before any driver
+probe runs. This did not turn out to be the cause of either hang above,
+but is kept as correct PCI hygiene this kernel should have been doing
+anyway.
 
 Still deliberately out of scope, consistent with every other NIC backend:
 MSI (82579 supports it, but this driver only ever uses the legacy PCI IRQ
@@ -1078,18 +1088,18 @@ Engine, K1/EEE/ULP link-power workarounds, and any flash/NVM write access
 (the MAC address is only ever read from `RAL0`/`RAH0`, already loaded by
 hardware from NVM once `EECD.AUTO_RD` is set).
 
-Verified end to end under QEMU (both before and after this fix, since
-QEMU's model never exhibited the hang): a single guest with `-device
-e1000e` enumerates as "Intel e1000e" with a valid MAC and transmits
-successfully; a two-guest fixture (each with its own `-device e1000e`,
-joined by a shared `socket,mcast=` netdev, the same technique
-`tapes/test_router_e2e.py`'s dual-e1000 fixture uses) confirmed genuine
-bidirectional send/receive -- `nic discover` from one guest found both
-itself and the other guest's peer entry, proving the second guest's
-`e1000e.rs` instance actually received the broadcast probe and replied.
-None of this QEMU coverage can exercise the actual fixed bug (the hang
-only manifests against real 82579 silicon's timing); that confirmation
-came from the real ITX board this driver targets.
+**Confirmed fixed end to end on the real 82579V ITX board this driver
+targets**: clean boot through reset, discovered as "Intel e1000e", and
+verified passing real bidirectional traffic (via `term_net`, connected
+remotely over the actual physical NIC). Also verified end to end under
+QEMU: a single guest with `-device e1000e` enumerates with a valid MAC
+and transmits successfully; a two-guest fixture (each with its own
+`-device e1000e`, joined by a shared `socket,mcast=` netdev, the same
+technique `tapes/test_router_e2e.py`'s dual-e1000 fixture uses) confirmed
+genuine bidirectional send/receive. Neither bug above was ever
+reproducible under QEMU -- both are real hardware timing hazards this
+project's emulation-based coverage structurally cannot catch, only
+real-hardware testing on the actual target board could.
 
 Backend order in `nic::initialize()` is now RTL8139, 3C905, e1000,
 e1000e, I350, then NE2000-compatible.
