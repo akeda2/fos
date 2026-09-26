@@ -367,6 +367,12 @@ pub const MAX_DEVICES: usize = es1370::MAX_INSTANCES + hda::MAX_INSTANCES + 1;
 static mut DEVICES: [Option<Audio>; MAX_DEVICES] = [const { None }; MAX_DEVICES];
 static mut DEVICE_COUNT: usize = 0;
 static mut INITIALIZED: bool = false;
+// Whether any backend below actually matched a PCI ID/class it recognizes
+// but then failed to bring the device up -- distinct from no backend
+// recognizing anything on the bus at all. Set once during the first
+// `initialize()` call and reused by the cached-idempotent path so a
+// second call reports the same, accurate `Status` as the first.
+static mut HARDWARE_PRESENT: bool = false;
 
 #[derive(Debug)]
 pub enum Status {
@@ -392,7 +398,7 @@ pub fn initialize() -> Result<usize, Status> {
     unsafe {
         if INITIALIZED {
             return if DEVICE_COUNT == 0 {
-                Err(Status::NotPresent)
+                Err(if HARDWARE_PRESENT { Status::InitFailed } else { Status::NotPresent })
             } else {
                 Ok(DEVICE_COUNT)
             };
@@ -400,10 +406,14 @@ pub fn initialize() -> Result<usize, Status> {
         INITIALIZED = true;
     }
 
+    let mut hardware_present = false;
     let found = match es1370::initialize_all() {
         Ok(count) => count,
         Err(es1370::Status::NotPresent) => 0,
-        Err(es1370::Status::InitFailed) => 0,
+        Err(es1370::Status::InitFailed) => {
+            hardware_present = true;
+            0
+        }
     };
 
     unsafe {
@@ -422,7 +432,14 @@ pub fn initialize() -> Result<usize, Status> {
         // submit a single byte to, and `hda status`/the `hda` shell
         // command remain the right place to inspect such a controller's
         // node graph regardless of whether playback ever came up.
-        let hda_found = hda::initialize_all().unwrap_or(0);
+        let hda_found = match hda::initialize_all() {
+            Ok(count) => count,
+            Err(hda::Status::NotPresent) => 0,
+            Err(hda::Status::InitFailed) => {
+                hardware_present = true;
+                0
+            }
+        };
         for index in 0..hda_found {
             if DEVICE_COUNT >= MAX_DEVICES {
                 break;
@@ -445,8 +462,9 @@ pub fn initialize() -> Result<usize, Status> {
             }
         }
 
+        HARDWARE_PRESENT = hardware_present;
         if DEVICE_COUNT == 0 {
-            Err(Status::InitFailed)
+            Err(if hardware_present { Status::InitFailed } else { Status::NotPresent })
         } else {
             Ok(DEVICE_COUNT)
         }

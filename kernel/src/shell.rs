@@ -1450,7 +1450,7 @@ fn usb_capture_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
 fn audio_status() {
     match audio::get() {
         Err(audio::Status::NotPresent) => {
-            println!("No Ensoniq ES1370 (or compatible) audio controller found.");
+            println!("No supported audio controller found on the PCI bus.");
             return;
         }
         Err(audio::Status::InitFailed) => {
