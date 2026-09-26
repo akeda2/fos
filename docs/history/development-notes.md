@@ -1947,3 +1947,758 @@ which language implemented the body that runs while briefly parked in
 64-bit mode. Built with `make tape-longmode-rs`, producing
 `build/tapes/longmode-rs.bin`.
 
+
+## UHCI: a USB host controller driver, and isochronous USB Audio playback (full detail)
+
+### UHCI: a USB host controller driver, and isochronous USB Audio playback
+
+`kernel/src/uhci.rs` is a minimal UHCI (USB 1.1, I/O-port-based) host
+controller driver, added because many class-compliant USB audio
+interfaces are full-speed (12 Mbps) even when marketed as "USB 2.0" --
+UHCI alone is enough bandwidth, and sidesteps EHCI's companion-controller
+port-handoff dance entirely. `pci::find_uhci_controllers` (`pci.rs`) is
+the second class-code PCI walk in this file (matching class 0x0C/subclass
+0x03/prog-if 0x00, alongside `find_serial_ports`'s UART walk), since
+`find_devices` only matches by vendor:device ID and every existing NIC/
+audio backend needs the full `PciAddress` (for `enable_io_and_bus_master`/
+`interrupt_line`), unlike `find_serial_ports`'s bare I/O addresses.
+
+Bring-up (`Uhci::reset_and_start`): Global Reset, then Host Controller
+Reset (self-clearing), then a single page-sized Frame List
+(`pmem::allocate`, 1024 32-bit link pointers -- one per 1 ms frame) whose
+every entry points at one fixed control Queue Head, then Run/Stop set.
+One small fixed pool (also `pmem::allocate`, sub-page) holds that QH plus
+up to `TD_POOL_CAPACITY` (34) Transfer Descriptors -- enough for one
+control-transfer pipeline; there is no general per-device
+bandwidth-reservation scheduler, since this driver only ever runs
+enumeration's control transfers, never periodic (isochronous/interrupt)
+traffic. No IRQ handler is registered: UHCI has no MSI capability (same
+bucket as ES1370), and enumeration's control transfers have no real-time
+deadline, so foreground polling of each TD's status is enough.
+
+A real, non-obvious UHCI-specific bug, found only by booting against a
+real, verified QEMU `piix3-usb-uhci` + `usb-audio` device rather than
+trusting the spec/header from memory: **UHCI never auto-enables a port
+after reset** (`Uhci::reset_port` must explicitly write the `EN` bit --
+the spec's own wording is "software sets this bit to 1 to enable the
+port"), and, separately, **`PORTSC`'s `EN`/`SUSPEND` bits are ordinary
+read/write storage, not sticky-on-zero**: a later write meant only to
+clear the write-1-to-clear `CSC`/`ENC` change bits must read-modify-write
+the whole register (or simply write back the exact value just read) --
+writing only the change-clear bits silently re-disables the port that was
+just enabled. Both were confirmed by reading QEMU's own
+`hw/usb/hcd-uhci.c`/`include/hw/usb/uhci-regs.h` directly after the first
+symptom (every control transfer failing with a CRC/timeout TD status)
+turned out to trace back to `uhci_find_device` skipping any port whose
+`UHCI_PORT_EN` bit isn't set -- the same "verify against QEMU source"
+discipline the NE2000 header-byte-order bug (above) already established
+for this project. `reset_port` also observes the USB 2.0 7.1.7.3 reset
+recovery time (`TRSTRCY`, >=10 ms) before the first request, which is
+correct per spec even though it turned out not to be this bug's root
+cause.
+
+`Uhci::control_transfer` builds one SETUP-TD -> zero-or-more data-stage
+TDs (toggling `DATA0`/`DATA1` per packet, at most `max_packet` bytes each)
+-> one zero-length STATUS-TD chain, patches each TD's own link field to
+the next TD with the Depth-First bit set (so the whole chain runs within
+one frame rather than one TD per frame), points the QH's element pointer
+at the first TD, and polls each TD's control word for `ACTIVE` clearing
+(done) or an error bit (`STALL`/`BABBLE`/CRC-`TIMEOUT`) with a 500 ms
+deadline. The STATUS stage's data toggle is always `DATA1` regardless of
+how many data packets preceded it (a USB spec correction rule, not a
+simple continuation of the alternating pattern). `get_descriptor`/
+`set_address`/`set_configuration` are thin wrappers building the matching
+standard SETUP packet.
+
+The `usb` shell command (`shell.rs`) lists every discovered controller
+(`io_base`, `irq`, whether `USBSTS.HCHALTED` is clear) and, per root port,
+drives the full standard enumeration sequence far enough to print a real
+device descriptor (vendor/product ID, class, `bMaxPacketSize0`) and
+configuration descriptor (hex-dumped, `dump_bytes`) before issuing
+`SET_CONFIGURATION` -- proving the whole chain end to end with no
+audio-specific code involved. It always resets the port and re-enumerates
+from scratch on every call rather than caching a previous result, since a
+real device can be unplugged/replugged between commands. Low-speed
+devices (realistically only HID keyboards/mice) are detected and reported
+but not enumerated further. Verified end to end by `tapes/test_uhci_e2e.py`
+against QEMU's real `piix3-usb-uhci` + `usb-audio` device (vendor:product
+`0x46f4:0x0002`, its configuration descriptor's real USB Audio Class 1.0
+`CS_INTERFACE` `HEADER` descriptor bytes, and idempotent re-enumeration
+across two independent `usb` calls in the same session).
+
+#### Isochronous OUT transfers, and `usb play`
+
+Enumeration alone cannot play audio: USB Audio Class streaming uses an
+*isochronous* endpoint, structurally unlike a control transfer -- no
+Queue Head is involved at all. `IsocOutStream` (`uhci.rs`) is a second,
+separate Transfer-Descriptor pool (`isoc_td_pool_addr`, one more
+`pmem::allocate` page, `ISOC_TD_COUNT` = 16 TDs) driven by a fundamentally
+different mechanic: because the Frame List has exactly 1024 entries and
+hardware walks through all of them once per ~1.024 real seconds,
+*continuous* streaming requires refreshing roughly one Frame List entry
+per real millisecond, sustained for the whole playback -- unlike a
+control/bulk queue, where the same Queue Head is simply revisited every
+frame. `IsocOutStream::service`, polled from a foreground loop (no IRQ or
+MSI involved -- `USBINTR` stays masked exactly as `reset_and_start`
+already leaves it), keeps a small window of entries primed ahead of
+hardware's own position, read via `USBFRNUM` (confirmed against QEMU's
+own `frame_addr = fl_base + ((frnum & 0x3ff) << 2)`: the register is
+11 bits, but only its low 10 select a Frame List entry). Each isochronous
+TD sets `TD_CTRL_IOS` ("Isochronous Select"), confirmed against QEMU's
+`uhci_complete_td` to mean exactly one try with no retry/error-counter
+semantics -- unlike every control-transfer TD here, which uses UHCI's
+ordinary 3-retry budget. Because the shared `pmem::TAPE_BASE`/`TAPE_LEN`
+staging buffer (the same one `copy`/`tape load`/NETFS already document
+reusing) is one contiguous physical block, each TD's buffer pointer
+references it directly at the right offset -- no separate packet-buffer
+pool or copy step needed.
+
+Two real bugs were found only by actually streaming audio into QEMU's
+`usb-audio` device and inspecting its recorded WAV output, not by code
+review: the TD token's endpoint field was first coded at bits 14:11
+(colliding with the *device address* field, bits 14:8) instead of the
+correct bits 18:15 -- confirmed against QEMU's own extraction,
+`uint8_t ep_id = (td->token >> 15) & 0xf;` (`hw/usb/hcd-uhci.c`) -- so
+every packet silently reached a nonexistent device address instead of
+the real one, and `IsocOutStream` reported "Playback complete" with
+correct timing throughout, because an isochronous TD's `Active` bit
+clears identically whether a packet succeeded or failed (see `IOS`
+above) and nothing was checking the error bits at all. The second fix is
+exactly that gap: `IsocOutStream::error_count` (incremented in
+`install_next`, when a soon-to-be-reused pool slot's previous occupant
+shows `TD_CTRL_ERROR_MASK`, and in a final sweep of the un-recycled tail
+batch once streaming ends) makes a genuinely failed packet visible
+instead of silently discarded -- the `usb play` command prints a warning
+whenever it's nonzero.
+
+Minimal USB Audio Class 1.0 descriptor parsing lives in `shell.rs`
+(`find_uac_playback_endpoint`), walking a configuration descriptor's raw
+bytes generically by each sub-descriptor's own `bLength`, looking for an
+AudioStreaming alternate setting (`bInterfaceClass` AUDIO/`bInterfaceSubClass`
+AUDIOSTREAMING, `bNumEndpoints == 1` -- alternate setting 0 always
+declares zero endpoints per UAC1's own "idle" convention, so it's skipped
+naturally) whose Format-Type descriptor is PCM/16-bit and whose
+isochronous OUT endpoint is Synchronous or Adaptive sync (not
+Asynchronous, which needs an unimplemented feedback endpoint). It
+requires the sample rate to be evenly divisible by 1000 and the
+endpoint's `wMaxPacketSize` to exactly match `(rate/1000) * channels *
+bytes_per_sample` -- the fixed-packet-size assumption `IsocOutStream`
+relies on -- rejecting (not attempting) any device that would need a
+per-frame varying packet size, such as a 44.1 kHz device. `Uhci::
+set_interface` (the missing standard `SET_INTERFACE` request UAC1's own
+alternate-setting convention needs) is a thin wrapper reusing
+`control_transfer`, exactly like `set_configuration`.
+
+`usb play [diskN] NAME` (`shell.rs`) mirrors `enumerate_usb_port`'s own
+"reset and redo everything from scratch" sequence -- so it never depends
+on a separate, prior `usb` call having already addressed the device --
+scanning every controller/port for the first device offering a usable
+endpoint, completing `SET_ADDRESS`/`SET_CONFIGURATION`/`set_interface`,
+then streaming the named file (raw PCM, already in the device's exact
+negotiated format -- no resampling, the same expectation every other
+audio backend here already has) through `IsocOutStream`, polling
+`keyboard::poll_term_event`/`poll_background_work` each iteration exactly
+like `nic sniff`'s exclusive loop so F12 stops playback early. On
+completion or abort, `IsocOutStream::stop` restores every Frame List
+entry the stream touched back to the control Queue Head, and
+`set_interface` quiesces the streaming interface back to alternate
+setting 0. Verified end to end by `tapes/test_uhci_play_e2e.py`: the
+command discovers the real 48 kHz/16-bit/stereo/192-byte-packet format,
+blocks for close to a seeded 1-second tone's real duration (proving
+genuine ~1 kHz-paced streaming, not an instant no-op), reports no failed
+packets, and the QEMU-captured WAV file's dominant frequency (a
+single-bin Goertzel DFT, the same dependency-free technique
+`tapes/test_audio_rtp_opus_e2e.py` already uses) matches the seeded tone
+-- real, audible, correct playback, not just a clean-looking status
+line. Isochronous *capture* (IN) remains explicit follow-on work; see
+"Deliberately deferred work" below. `audio.rs`/tape-ABI integration is
+covered next.
+
+#### Confirmed on real, non-emulated USB Audio Class hardware
+
+Unlike ES1370/HDA (still "unverified against real hardware" as of this
+writing), this driver has been confirmed against a genuine, physically
+attached class-compliant sound card -- a TerraTec Aureon Dual USB
+(C-Media chipset, `0ccd:0077`) -- via QEMU's `usb-host` PCI passthrough
+(`-device usb-host,vendorid=...,productid=...` in place of the synthetic
+`usb-audio` device), not just emulation. Real enumeration (device and
+full 253-byte configuration descriptor), `find_uac_playback_endpoint`,
+and `usb play` all worked unchanged against real silicon, and surfaced
+two things QEMU's own model never could:
+
+- **A real off-by-one in `control_transfer`'s data-stage bounds check**,
+  found only because this real device's `bMaxPacketSize0` is 8 -- the
+  smallest legal full-speed value, and far smaller than QEMU's
+  synthetic device's 64. Reading the full 253-byte configuration
+  descriptor at 8 bytes/packet needs exactly 32 data TDs (SETUP + 32
+  DATA + STATUS = all 34 of `TD_POOL_CAPACITY`'s slots, with zero to
+  spare), but the old check (`slot >= TD_POOL_CAPACITY - 1`) rejected
+  the transfer one slot too early -- it fired the instant `slot` reached
+  the last *valid* index (33, correctly reserved for STATUS), not only
+  once a write would actually go out of bounds. Fixed to
+  `slot >= TD_POOL_CAPACITY` (the first genuinely invalid index, since
+  slot 34 is where the Queue Head itself lives, immediately after the
+  TD pool). QEMU's own device, with a much larger `max_packet0`, never
+  came anywhere near this boundary, so no amount of emulated testing
+  could have found it.
+- **The Adaptive-sync `wMaxPacketSize` fix above was directly confirmed
+  necessary**, not just theoretically justified from reading the
+  descriptor: this real device's isochronous OUT endpoint declares
+  `wMaxPacketSize=200` (Adaptive sync, some slack above the 192-byte
+  nominal for 48 kHz/16-bit/stereo), which the old exact-equality check
+  would have rejected outright. With the `>=`-nominal check,
+  `find_uac_playback_endpoint` correctly computes and uses the 192-byte
+  nominal size regardless of the endpoint's own larger ceiling, and a
+  real 2-second tone streamed to physical hardware in almost exactly
+  2000 ms with zero reported packet errors.
+
+This required a one-time, explicit `sudo setfacl -m u:USER:rw
+/dev/bus/usb/BUS/DEV` grant on the specific device node (mirroring the
+project's existing `CAP_NET_RAW` precedent for raw sockets -- an agent
+never runs this silently); real hardware access is otherwise blocked by
+the host's own `snd-usb-audio`/`usbhid` kernel drivers already claiming
+every interface, which QEMU's `usb-host` backend detaches automatically
+once it has write access to the device node. No automated test exists
+for this (there's no way to attach real hardware to `make test`'s QEMU
+fixture) -- this was a manual, one-time verification session, the same
+category of confirmation `tapes/longmode.S`'s own real-hardware section
+above documents.
+
+#### `audio.rs` integration: a USB device tapes can actually target
+
+`usb play` proved the isochronous engine but only as a one-shot file
+player, invisible to the tape ABI -- a tape like `audio-net`/`audio-rtp`
+can only ever reach a device through `audio.rs`'s `Audio` enum and its
+`audio_submit_at`/... callbacks, the same way it already reaches
+ES1370/HDA. `uhci::UsbAudioDevice` (a thin wrapper: the owning
+controller, the discovered `UacEndpoint`, and an `UnsafeCell`-
+guarded `IsocOutStream` -- the same single-threaded interior-mutability
+pattern `PcmRing` itself already relies on) is now a third `Audio`
+variant, `Audio::Uhci`. `audio::initialize()` gains a third discovery
+phase after ES1370/HDA's: `uhci::discover_playback_device()` calls the
+same `find_uac_device()` `usb play`/`usb capture` use (moved into
+`uhci.rs` so all three callers share it, since `audio.rs` must not
+depend back on `shell.rs`), then immediately starts a dedicated
+`PcmRing`-fed
+`IsocOutStream` -- discovered once, like every other backend here;
+plugging a device in after that first call isn't noticed until reboot.
+
+The isochronous engine itself gained a second data source alongside
+`usb play`'s existing zero-copy fixed buffer: `IsocOutSource::Ring`,
+draining a `PcmRing` via `pop_into` (falling back to silence on
+underrun, mirroring `Es1370::fill_period` exactly) into a small
+dedicated packet-copy pool, and never reporting `Finished` -- unlike a
+file, a live network-fed stream has no natural end. Because there is no
+interrupt for this backend at all, `poll_background_work` (`shell.rs`)
+gained one more unconditional call, `uhci::service_active_playback`,
+keeping the active stream's look-ahead window filled whenever *any*
+foreground loop happens to be running (a tape's own receive loop, `nic
+sniff`, `term_net`, ...) -- sitting idle at the local prompt starves it,
+an honest tradeoff of having no isochronous IRQ path, unlike ES1370/
+HDA's unconditional ISR-driven playback.
+
+Two more real bugs surfaced building this, again only by actually
+streaming real audio rather than trusting the design on paper:
+
+- **A permanent-stall bug in `service`'s own window-tracking math.**
+  `next_index.wrapping_sub(current) & FRAME_INDEX_MASK` is *unsigned*
+  modulo 1024, so "3 frames behind schedule" (a value of 1021) is
+  indistinguishable from "1021 frames ahead" without a sign correction --
+  a caller that goes a while between calls (exactly `audio-net`'s own
+  receive loop, paced by how often network frames actually arrive, not a
+  fixed timer) looked *already caught up* by this miscalculation and
+  silently primed nothing at all from that point on, permanently
+  starving the ring. Fixed by computing a genuinely signed gap (treating
+  a raw value past half the Frame List's range as negative) and, when
+  behind, resyncing a few frames ahead of *now* rather than mechanically
+  replaying an unrecoverable backlog into slots that would otherwise
+  only play a full ~1 s lap later.
+- **`ISOC_TD_COUNT`'s look-ahead window needed real margin against host-
+  scheduling jitter, not just uniform per-call overhead.** The original
+  16 ms (sized for `usb play`'s own tight, gap-free polling loop) was
+  provably too thin for `poll_background_work`-driven servicing: an
+  otherwise-correct stream still intermittently dropped a small fraction
+  of a percent of submitted bytes under this project's own QEMU dev
+  environment, tightening to zero only once raised to 250 ms -- verified
+  by five consecutive clean (zero-drop) runs at that size, where 16 ms
+  and 64 ms each still occasionally dropped a few hundred bytes. 250 ms
+  of playback latency is imperceptible for this use case; the real fix
+  for a tighter bound would be an actual isochronous IRQ path, which
+  remains out of scope.
+
+Verified end to end by `tapes/test_uhci_audio_facade_e2e.py`: mirrors
+`tapes/test_audio_net_e2e.py`'s exact shape (the unmodified `audio-net`
+tape, loaded and run over `term net`, this script acting as the sending
+peer) but with only `piix3-usb-uhci`/`usb-audio` attached -- no ES1370/
+HDA -- so the USB device becomes `audio::get()`'s device 0 automatically
+and the tape's existing, non-indexed `audio_submit` path reaches it with
+zero tape-code changes. Confirms the discovered format, zero dropped
+bytes, and the QEMU-captured WAV file's Goertzel-DFT dominant frequency
+matching the sent tone. Also confirmed against the same real TerraTec
+card described above, via `usb-host` passthrough: the facade path
+(`audio` listing the device, `audio-net` streaming through it) works
+identically on genuine hardware, with the same "no automated coverage
+for real hardware" caveat as the rest of this section.
+
+#### Isochronous capture (IN): `usb capture`, and unifying discovery
+
+Capture is the mirror-image direction, needed before a tape can ever
+record from a USB microphone the way `audio-net`/`tapes/audio-rtp`
+already can from ES1370/HDA's ADC. It is **real-hardware-only from the
+start**: QEMU's synthetic `usb-audio` device has zero capture support at
+all (confirmed against its own source, `hw/usb/dev-audio.c` -- no
+`in.*` state, no capture altset), so unlike playback there is no QEMU
+stage to even attempt; every check here ran directly against the real
+TerraTec card, which does support it (interface 2, a genuinely different
+format from its own playback interface -- mono, not stereo).
+
+Two real-device facts forced a design change before capture could even
+be added. First, `UacPlaybackEndpoint`/`find_playback_device`'s single-
+direction assumption doesn't hold: a device's playback and capture
+interfaces can (and, on the TerraTec card, do) have entirely different
+formats, so the type is now direction-agnostic (`UacEndpoint`, used for
+either), returned in a `UacDevice { playback: Option<UacEndpoint>,
+capture: Option<UacEndpoint> }`. Second, and more importantly:
+`find_uac_device` discovers *both* directions from one single port
+reset/`SET_ADDRESS`/`GET_DESCRIPTOR` pass, walking the same fetched
+configuration descriptor twice (`find_uac_endpoint`, parameterized by
+direction) and calling `set_interface` for whichever were actually
+found -- deliberately not two independent calls. This project had
+*just* learned, empirically, that two full resets of the same real
+device back to back with no settle time between them can intermittently
+fail (the `audio.rs` facade's own first real-hardware attempt, above);
+unifying discovery avoids ever risking that same class of flakiness
+within a single boot, rather than rediscovering it a second time by
+building capture's own independent reset path.
+
+`IsocInStream` (`uhci.rs`) is `IsocOutStream`'s mirror image, reusing
+the identical Frame-List-window-priming machinery, but with the data
+flow reversed in the one way that actually matters: for OUT, the driver
+already knows each packet's exact content before installing its TD; for
+IN, hardware decides how many bytes it actually sends (`ActLen`, read
+back via the already-existing `decode_actlen` once `Active` clears), so
+a completed TD's data must be *harvested* -- read out and folded into a
+running total -- before its pool slot is reused for a fresh receive TD.
+Zero-copy, exactly like `IsocOutStream`'s own `Buffer` source: each
+receive TD's buffer pointer is a pre-computed offset directly into the
+caller's destination (the shared tape staging buffer), so hardware
+writes samples straight into their final position with no copy pool at
+all. `usb capture [diskN] NAME` (`shell.rs`) mirrors `usb play`'s own
+shape closely: discovers via `find_uac_device`, requires `.capture`,
+captures into the staging buffer until either its 4 MiB capacity is
+reached or F12 is pressed, then writes exactly however many bytes were
+actually received out to the named FOSFS file via `fosfs::write`.
+
+Verified manually against the real TerraTec card's microphone (no
+automated test is possible -- see above): `usb capture` correctly
+reports the real capture format (`48000 Hz/16-bit/1ch, 96 bytes/packet`,
+matching the card's own descriptor exactly), and the captured file, read
+back with `cat`, contains genuinely non-silent audio (a real, if quiet,
+room-noise peak/RMS reading, the same threshold-based technique
+`tapes/test_audio_net_real_mic_e2e.py` already uses for ES1370's own
+real-microphone verification) with zero reported packet errors, reliably
+across repeated runs. `usb play` was re-confirmed working unchanged on
+the same real device after the discovery unification, both independently
+and immediately alongside a capture session on the other interface.
+
+#### `audio.rs` integration for capture: `capture_format()`, and a genuinely concurrent second TD pool
+
+Wiring the discovered capture endpoint into `audio.rs`'s
+`Audio::Uhci::capture()` (previously a stub always reporting zero) reused
+playback's own wiring shape almost exactly: `discover_playback_device`
+became `discover_usb_audio_device`, now starting an `IsocInStream` via a
+new `Uhci::start_isoc_ring_in` (mirroring `start_isoc_ring_out`'s own
+`Ring` source -- a small dedicated packet-copy pool, since a received
+packet has no single fixed ring address to land in) whenever the
+discovered device also offers a capture endpoint, and
+`service_active_playback` became `service_active_audio`, servicing both
+streams from the one `poll_background_work` call. `IsocInStream` itself
+grew a matching `IsocInSink` enum (`Buffer`/`Ring`, exactly mirroring
+`IsocOutSource`), with a new `overrun_count` (the capture-side
+counterpart to `underrun_count`, incremented on a short `PcmRing::push`
+exactly like `Es1370::drain_capture_period`'s identical accounting).
+
+This surfaced a real, previously undocumented hazard before it could
+ever bite on real hardware: `usb capture`'s original `IsocInStream`
+shared its per-controller isoc TD pool with `IsocOutStream`, safe only
+because that earlier increment never ran playback and capture at the
+same time. `audio.rs`'s facade keeps a playback stream continuously
+running from the moment *any* USB Audio device is discovered, so
+starting a capture stream alongside it on a device offering both
+directions -- exactly the real TerraTec card -- means both streams are
+now genuinely active at once. Sharing one pool's `entries_written %
+ISOC_TD_COUNT` slot indexing between two independently-counting streams
+would let one direction's TD writes silently clobber the other's. The
+fix: `Uhci` gained a second, dedicated `isoc_capture_td_pool_addr` page
+(a fourth `pmem::allocate` call in `init_controller`, alongside the
+existing frame list/control pool/OUT isoc pool) with its own
+`isoc_capture_td_addr`/`write_isoc_capture_td`/
+`read_isoc_capture_td_control` methods, used exclusively by
+`IsocInStream`.
+
+`Audio::capture_format()` is the new facade method this integration
+needed: for ES1370/HDA it is a pure delegation back to `format()` (their
+real hardware genuinely shares one format between directions, so there
+is nothing separate to compute), but `UsbAudioDevice::capture_format()`
+answers from its own, independently discovered capture endpoint instead,
+confirmed necessary by the real device: the TerraTec Aureon Dual's own
+capture interface is mono against its stereo playback format. Four new,
+purely additive tape-ABI callbacks --
+`tape_audio_capture_sample_rate`/`tape_audio_capture_channels_and_bits`
+(device 0) and their `_at`-suffixed counterparts, appended at the very
+end of `TapeEntry`'s parameter list following this project's established
+"cdecl caller-cleans, existing tapes ignore the extra trailing stack
+slots" convention -- let a tape correctly interpret `audio_capture`'s
+bytes without assuming they share `audio_sample_rate`'s own numbers.
+
+Verified against the real TerraTec card (no QEMU capture support exists,
+as established above, so this remains manual/real-hardware-only): the
+`audio` command's own status output now prints the capture format on its
+own line, confirmed genuinely independent of the playback line --
+`[0] USB Audio ...: 48000 Hz / 2ch / 16-bit.` immediately followed by
+`ADC: 48000 Hz / 1ch / 16-bit.` -- and, with both directions running
+simultaneously (the playback stream continuously priming silence with no
+tape ever submitting to it, and the capture stream draining the real
+microphone), both reported exactly 250 periods serviced with zero
+underruns beyond the expected "nothing submitted yet" ones and zero
+capture overruns or packet errors on either side, confirming the
+dedicated second TD pool actually prevents the slot-collision hazard
+described above rather than merely avoiding it by accident.
+
+#### USB Mass Storage (Bulk-Only Transport): a bulk-transfer primitive, and the standalone `usb storage` command
+
+Motivated by a real, physically confirmed problem: `uhci::initialize_all()`
+resetting any UHCI controller (triggered by `usb`/`usb play`/`usb
+capture`/`audio`) breaks a real Pentium 4's BIOS "USB Legacy Support"
+`INT13h` emulation for its USB-booted disk (see "USB audio and USB-boot
+media do not reliably coexist on real hardware" below). A native USB Mass
+Storage driver is the only real fix -- it lets fos stop depending on BIOS
+continuing to own the boot disk once running -- and this increment builds
+the first, self-contained layer of it: enumeration and read/write against
+a discovered device, verified standalone, with no `disk.rs`/FOSFS
+integration yet (a separate, later step, since making a USB Mass Storage
+device transparently *become* `disk::Device::Boot` needs its own
+heuristic and is out of scope here).
+
+`Uhci::bulk_transfer` (`uhci.rs`) is the foundational new primitive: a
+sequence of data-stage packets only, with no SETUP or STATUS stage,
+reusing `control_transfer`'s exact TD-chain-building/link-patching/
+completion-polling machinery for the data stage alone. The one genuinely
+new mechanic bulk transfers need that control transfers don't: a bulk
+endpoint's DATA0/DATA1 toggle is real, persistent *endpoint* state that
+must survive across separate calls (unlike a control transfer, always a
+fresh self-contained SETUP+DATA+STATUS unit that always starts its own
+data stage at toggle 1). The caller owns this state (`toggle: &mut bool`,
+read on entry, written back only on success) rather than `Uhci` itself
+tracking per-endpoint state it has no lifetime-bounded way to associate
+with a specific device -- the same division of ownership `IsocOutStream`/
+`IsocInStream` already established for their own per-stream state. On any
+transport error, `*toggle` is left completely unchanged: USB Mass
+Storage's own Bulk-Only Transport (BOT) error-recovery procedure resets
+the device's toggle back to DATA0 anyway, so this function does not need
+to guess how many packets actually completed before a mid-chain failure.
+`Uhci::bulk_only_mass_storage_reset` (the class-specific "Bulk-Only Mass
+Storage Reset" request) and `Uhci::clear_endpoint_halt`
+(`CLEAR_FEATURE(ENDPOINT_HALT)`, targeting one bulk endpoint) are BOT's
+own mandated pair of recovery requests, both thin `control_transfer`
+wrappers mirroring `set_address`/`set_configuration`/`set_interface`'s
+existing SETUP-byte-array construction convention exactly.
+
+`kernel/src/usb_storage.rs` is a new file (not folded into `uhci.rs`
+alongside `UsbAudioDevice`, unlike everything else UHCI-related so far):
+Bulk-Only Transport's own CBW/CSW framing and the SCSI command subset
+below are a real, separate protocol layer above raw bulk transfers, the
+same reasoning that already keeps `es1370.rs`/`hda.rs` separate from
+`pci.rs` despite depending on it. `find_msc_endpoints` walks a
+configuration descriptor generically by `bLength` (the identical shape
+`uhci::find_uac_endpoint` already uses), recognizing interface class
+`0x08` (Mass Storage) / subclass `0x06` (SCSI transparent -- the
+universal choice for real USB flash drives) / protocol `0x50`
+(Bulk-Only Transport) and its two bulk endpoints; unlike USB Audio
+Class's alternate-setting-0-is-idle convention, Mass Storage has no such
+special case, so the first matching interface's endpoints are used
+directly with no `set_interface` call needed at all. `find_msc_device`
+mirrors `find_uac_device`'s exact "reset and redo everything from
+scratch, one port reset per attempt" discovery shape.
+
+`MscDevice` owns one discovered, already-`SET_CONFIGURATION`'d device:
+its two bulk endpoints, their independently tracked DATA0/DATA1 toggles,
+and a monotonically increasing CBW tag. `MscDevice::command` drives one
+full CBW-out/data-stage/CSW-in exchange and is the only place that talks
+to `bulk_transfer` directly; every other method (`inquiry`,
+`wait_until_ready` -- a bounded-retry `TEST UNIT READY` loop, since real
+removable media can report "not ready" for a moment right after
+enumeration --, `request_sense`, `read_capacity_10`, `read_10`,
+`write_10`) is a thin SCSI CDB wrapper around it. Any transport-level
+failure or CSW phase error drives BOT's own two-request reset-recovery
+procedure (`recover`, calling `bulk_only_mass_storage_reset` then
+`clear_endpoint_halt` on both endpoints and resetting both tracked
+toggles to match) before the error is returned, so the *next* command
+starts from a clean, known device state rather than compounding a stuck
+one. `read_capacity_10` rejects (`Error::Unsupported`) any device whose
+native block size isn't exactly 512 bytes, matching this project's
+established "reject rather than emulate" convention (the same one
+`audio_rtp_tape::payload_type_for` already applies to unsupported audio
+formats) rather than attempting 4Kn-to-512-byte emulation in a first cut.
+
+The standalone `usb storage` shell command (`shell.rs`'s
+`usb_storage_command`) mirrors `usb play`/`usb capture`'s own "prove the
+driver against real/QEMU hardware with a dedicated command before any
+deeper integration" precedent: it discovers the first Bulk-Only Transport
+device found, prints its `INQUIRY` vendor/product strings and `READ
+CAPACITY` result, and hex-dumps its first sector -- deliberately
+read-only, since issuing a real `WRITE(10)` against whichever USB device
+happens to enumerate first, with no disk-selection safeguard, is not a
+safe default action for an always-available diagnostic command (`write_10`
+itself is real, tested code -- see below -- just not wired into this
+command). Verified end to end by `tapes/test_usb_storage_e2e.py` against
+QEMU's synthetic `usb-storage` device: discovery, `INQUIRY` reporting
+QEMU's own vendor/product strings, `READ CAPACITY` matching a backing
+image's real size, and `READ(10)` of the first sector matching a known
+seeded byte pattern exactly. `write_10` was manually verified end to end
+during development (write a pattern to block 1, read it back, confirm an
+exact match) via a temporary shell-command hook removed before committing
+the read-only command; `write_10` itself is now wired into `disk.rs` --
+see the next section -- so this manual verification is superseded by that
+integration's own real, permanent test.
+
+#### A real bug found only on genuine UHCI hardware: bulk transfers need settle time between stages
+
+QEMU's synthetic `usb-storage` device never exposed this, but a real
+Kingston USB flash drive against real UHCI silicon reliably failed its
+very first `INQUIRY` with `TransportFailed(Timeout)` -- confirmed, via a
+temporary raw register/TD/QH dump added directly to `bulk_transfer`'s own
+timeout path, that the controller itself never cleared a TD's `Active`
+bit at all (no error bit ever set), and that the *specific* failing
+transfer varied between attempts (sometimes the data stage, sometimes the
+CSW). Root cause: unlike `control_transfer`, which keeps one Queue Head
+continuously armed across its entire SETUP+DATA+STATUS chain without
+ever stopping it mid-exchange, each stage of a bulk transfer
+(CBW/data/CSW) is a *separate* `bulk_transfer` call that stops the queue
+on its own completion and the next call restarts it completely fresh --
+with zero settle time between the stop and the next restart. Real UHCI
+hardware needs a brief turnaround gap there that this driver's design
+never provided. A 10ms (`wait_ticks(1)`) delay was added after *every*
+stage transition -- CBW-to-data, data-to-CSW, CBW-to-CSW (when there is
+no data stage), and after a command's own final CSW read completes
+(needed separately: FOSFS's own multi-sector directory reads issue
+several independent `read_10` calls back to back with no pacing of their
+own, unlike the standalone `usb storage` command's single open()-to-
+return sequence) -- fully resolving the issue. `MscDevice::command` also
+gained a bounded retry wrapper (`command_once` renamed from the original
+`command`, retried up to 3 times on a transport-level or phase error,
+never on an ordinary `CommandFailed` SCSI response) as a defense-in-depth
+measure against any remaining marginal timing on other real devices,
+though the settle delays alone were what actually fixed this specific
+drive.
+
+**A real crash was also found and fixed during this investigation**:
+before the settle delays existed, aggressively raising the retry count
+alone (without the delays) made a genuine CPU fault *more* likely, not
+less -- more attempts meant more exposure to a real hardware race: when
+a bulk transfer times out, the controller may still be mid-transaction
+on the wire at the exact moment software gives up, and immediately
+reusing that same Transfer-Descriptor-pool memory for BOT's own
+reset-recovery request (`recover`) can hit real hardware while it is
+still touching that memory. A short settle delay (`wait_ticks(2)`) was
+added to both `bulk_transfer`'s and `control_transfer`'s own timeout
+paths, after the queue is stopped but before that memory can be reused by
+any subsequent call -- eliminating the crash entirely in further testing.
+The lesson generalized here: retrying more aggressively is not a
+substitute for fixing a real timing bug, and can actively make a marginal
+hardware race more likely to manifest as a hard failure instead of a
+soft one.
+
+All of this was found and fixed through live iteration against the exact
+real Pentium 4 machine this whole feature was built for, using KUP (see
+"Debug mode" above) to push each fix over the network without ever
+needing to physically re-flash the boot USB stick -- confirming the
+debug-mode design's own stated purpose (fast, unattended-feeling
+iteration against real hardware) in practice, not just in the abstract.
+
+**A second, independent real bug surfaced once the timing issue above was
+fixed**: promoting `disk1` and then `tape load disk1 ed.bin` (a real,
+23-sector file) failed with `TransportFailed(InitFailed)` -- `ls`/`cat`/
+small `write`s had all worked because they never requested more than a
+few sectors in one `read_10`/`write_10` call. Root cause: a single
+`bulk_transfer` TD chain is bounded by `TD_POOL_CAPACITY` (34) TDs of at
+most `max_packet` bytes each -- 2176 bytes at this device's full-speed
+64-byte packet size -- comfortably less than one `MAX_TRANSFER_SECTORS`-
+sized (16 sectors, 8192 bytes) FOSFS chunk. `bulk_transfer` itself now
+splits an oversized transfer into successive bounded TD-chain passes
+(with the same real-hardware-confirmed settle delay between them),
+transparently to every caller -- `MscDevice::command`/`command_once`
+needed no changes at all. Confirmed fixed on the real P4 with both a
+23-sector tape (`ed.bin`) and a 678-sector one (`audio-rtp.bin`, loading
+correctly with its exact real byte count both times). `tapes/
+test_usb_storage_disk_e2e.py` gained a permanent regression test
+(copying a real 24584-byte preloaded file onto and back off the attached
+USB disk via `copy`, well over the 2176-byte single-pass boundary) --
+confirmed to actually fail with the same `FirmwareFailure` symptom when
+`bulk_transfer`'s internal chunking is reverted, not just incidentally
+passing.
+
+#### Wiring USB Mass Storage into `disk.rs` as an ordinary secondary disk
+
+`disk::Device` used to be a closed two-variant enum (`Boot`/
+`Secondary(usize)`) that *was* a BIOS drive number end to end -- every
+secondary disk was addressed by a `drive_number` the trampoline could
+call directly. Rather than adding a third `Device` variant (which would
+have meant threading a USB/BIOS distinction through every function that
+already matches on `Device`), the distinction was pushed one level down:
+`SecondaryDisk` (the existing per-slot struct
+`discover_secondary_disks` already populates) gained a `backend` field
+(`SecondaryBackend::Bios(u8)` or `SecondaryBackend::Usb`), so `Device`
+itself, `device_sector_count`, `device_data_partition_lba`/`sectors`,
+and the `diskN` selector parsing in `shell.rs` needed *no changes at
+all* -- a USB disk is simply one more entry in the same
+`SECONDARY_DISKS` table a BIOS secondary disk already occupies, assigned
+the next available `diskN` number exactly the same way. Only
+`transfer`/`transfer_chunk` needed a real branch: `is_usb_backed`
+checks a device's backend, and a `Usb`-backed transfer goes through a
+new `usb_transfer` helper (`usb_storage::MscDevice::read_10`/`write_10`
+against the single `USB_DISK` static) instead of `call_trampoline`,
+after the same `device_sector_count` bounds check every other transfer
+already gets.
+
+`disk::attach_usb_disk` (called only by the new `usb storage attach`
+shell command, never automatically) does the actual discovery + capacity
+read + `SECONDARY_DISKS` registration in one call, rejecting a second
+attach while one is already attached (`UsbAttachError::AlreadyAttached`
+-- at most one USB disk is supported, since `usb_storage::open()` itself
+only ever finds the first Bulk-Only Transport device). This is
+deliberately **not** part of `discover_secondary_disks`'s automatic
+boot-time BIOS probing, for the same reason the standalone `usb storage`
+command stayed read-only: discovering a USB Mass Storage device means
+calling `uhci::initialize_all()`, which resets every UHCI controller
+found -- confirmed to break BIOS's own legacy `INT13h` emulation. An
+operator must explicitly opt into `usb storage attach` each boot, and the
+command itself prints an explicit warning before doing so.
+
+**This risk turned out to be more general, and more immediate, than the
+original Pentium 4 finding alone suggested -- confirmed concretely while
+testing this exact feature, not just inferred.** Booting a plain QEMU
+guest with a `usb-storage` device attached and no special configuration
+showed `disk2: found (BIOS drive 0x81, 2048 sectors)` in the ordinary
+boot log: SeaBIOS's own USB legacy support had *already* exposed that
+same physical device as an ordinary BIOS secondary disk before any native
+USB code ever ran. Running `usb storage attach` afterward (which
+discovers a *different* `diskN`, e.g. `disk3`, for the identical device)
+immediately broke `disk2`'s own BIOS-backed access
+(`FOSFS disk error: FirmwareFailure` on the very next command against
+it) -- the newly attached native `diskN` remained fully readable and
+writable throughout, only the now-redundant BIOS path to the same
+hardware broke. This means the danger is not limited to "don't combine
+USB audio with a USB-booted machine" -- **any machine with a USB Mass
+Storage device already plugged in (very likely already reachable as an
+ordinary BIOS secondary `diskN`, courtesy of the same legacy-USB support
+that makes it USB-bootable at all) should be assumed to break that
+device's own BIOS-backed `diskN` the moment any UHCI-touching command
+runs**, not only `disk1`/the boot disk specifically. `attach_usb_disk`'s
+own doc comment records this finding in full.
+
+Verified end to end by `tapes/test_usb_storage_disk_e2e.py`: `usb storage
+attach` reports a new `diskN`, `format`/`write`/`cat` against it round-trip
+byte-exact content, and a second `usb storage attach` call is correctly
+rejected. One command in this flow was observed to occasionally fail with
+a transient `FirmwareFailure` in a busy host-scheduling environment during
+development (5 of 6 manual repeats were completely clean) -- consistent
+with this project's other UHCI-adjacent QEMU tests' documented
+host-timing jitter (see "Isochronous OUT transfers" above), not a
+reproduced logic bug; the test itself does not retry, so a failure there
+is worth one manual re-run before assuming a regression, per that test's
+own doc comment.
+
+#### Closing the Pentium 4 gap for real: `usb storage promote`
+
+The original scoping plan flagged transparently switching
+`disk::Device::Boot` itself over to this driver as a separate, riskier
+follow-on, needing "its own heuristic" beyond simple attachment -- fos
+has no BIOS call that answers "is drive `0x80` a USB device", and no way
+to correlate a discovered USB Mass Storage device with a specific BIOS
+drive number. The plan's own first-considered heuristic ("assume the one
+discovered device is the boot device") was deliberately **not** used:
+it's cheap to state but wrong exactly when it matters most (a machine
+with more than one USB storage device attached).
+
+`disk::promote_boot_to_usb` instead cross-validates using the disk's
+actual content. Before touching UHCI at all, it reads `disk1`'s own
+LBA 0 (its MBR -- present and BIOS-readable on every fos image
+regardless of GPT/partition layout) via the *ordinary* BIOS path, and
+also records `disk1`'s own BIOS-reported sector count. This baseline
+read is a one-shot opportunity: discovering the USB device immediately
+afterward may itself break BIOS's access to this exact disk (the
+confirmed mechanism the previous section documents), so it must happen
+strictly first. Only if the discovered USB device's own LBA 0 bytes
+match that baseline exactly, *and* its own reported capacity is at least
+as large as BIOS's own figure for `disk1`, does `Device::Boot` switch
+over (a new `BOOT_USB_DEVICE` static, deliberately independent of
+`USB_DISK` above -- promoting the boot disk and attaching an ordinary
+secondary USB disk are mutually exclusive uses of whatever single device
+is discovered); otherwise `promote_boot_to_usb` returns
+`BootPromoteError::NotSameDisk` and `Device::Boot` is left completely
+untouched. Capacity is deliberately a floor, not an exact match --
+**confirmed necessary on real hardware, not just a defensive choice**: a
+real, physically tested Pentium 4 machine's own USB-boot BIOS legacy
+emulation reported `disk1`'s capacity as exactly 16 MiB (32768 sectors),
+matching the *original boot image's own baked-in GPT size*, not the
+physical USB stick's real ~14.4 GB capacity -- an exact-match requirement
+would have wrongly refused to promote the machine's own genuine boot
+media every time. The MBR content match is the real identity check (two
+independent physical disks sharing a byte-identical MBR is not
+realistically possible by accident), documented as "confirmed, not just
+assumed," matching this whole follow-on's own honest framing.
+`is_usb_backed`/`usb_transfer` (the same dispatch
+`transfer`/`transfer_chunk` already use for a `SecondaryBackend::Usb`
+disk) were extended to also recognize a promoted `Device::Boot` and
+route it to `BOOT_USB_DEVICE` instead of `USB_DISK` -- no other function
+needed to change, since `device_data_partition_lba`/`sectors` for
+`Device::Boot` already just return the GPT-discovered (or
+loader-provided) geometry established once at `disk::initialize` time,
+which remains correct: promotion only changes *how* sectors are
+transferred, never which physical bytes they refer to.
+
+The explicit `usb storage promote` shell command (never automatic,
+printing the same kind of "this resets every UHCI controller" warning
+`usb storage attach` already does) drives this. `bootinfo` gained one
+conditional line reporting whether `disk1` is currently promoted.
+Verified end to end by `tapes/test_usb_boot_promote_e2e.py` -- the one
+test in this whole feature that actually boots `build/fos.img` itself
+from a QEMU `usb-storage` device (`-boot order=c`, SeaBIOS's own USB
+Legacy Support) rather than an ordinary IDE `-drive`, faithfully
+reproducing the real Pentium 4 scenario entirely inside QEMU: `disk1` is
+ordinarily BIOS-readable before promotion, `usb storage promote`
+discovers and confirms the very disk it just booted from, `bootinfo`
+reflects the promoted state, and `disk1` remains fully readable *and
+writable* afterward -- proving ordinary FOSFS access to the boot disk no
+longer depends on BIOS's own legacy USB emulation staying intact, even
+though discovering the device during `promote` already reset the UHCI
+controller that emulation depends on. A second scenario in the same test
+file (`test_refuses_mismatched_device`) confirms the cross-validation
+actually rejects a clearly different USB device (a distinctly-sized,
+all-zero backing image) rather than ever guessing, leaving `disk1`
+completely untouched and still BIOS-backed.
+
+**Confirmed on the real, physical Pentium 4 machine this whole feature
+was built for** -- not just the QEMU repro above. Live-iterated against
+it over the network via KUP (see "Debug mode" above and the bulk-transfer
+timing-bug section above, both found and fixed during this same session):
+`usb storage promote` correctly identified the machine's own genuine USB
+boot stick (a Kingston DataTraveler 3.0) despite BIOS reporting a wildly
+different, smaller capacity for it (see above), switched `disk1` over,
+and `ls`/`cat`/`write`/`rm` all continued working correctly through the
+native driver afterward -- the exact real-hardware scenario
+(`FOSFS disk error: FirmwareFailure` after any UHCI-touching command)
+that originally motivated this entire driver is now closed on the actual
+machine that exhibited it.
+
+**Still deliberately out of scope**: `reboot soft` re-enters
+`boot/stage2.S` from scratch and always depends on BIOS to reload the
+kernel, completely independent of this feature's own, purely Rust-level
+`BOOT_USB_DEVICE` state (which a fresh boot always reinitializes to
+`None` regardless of whether the previous boot had promoted it). If
+`disk1`'s BIOS access is already broken by the time a soft reboot is
+attempted, it fails exactly as already documented in the previous
+section -- promoted or not. A real fix would need stage two itself to
+speak USB, an undertaking on the scale of a native 16-bit real-mode USB
+driver, not attempted here.

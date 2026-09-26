@@ -66,14 +66,19 @@ static mut GPT_VALID: bool = false;
 /// How a [`SecondaryDisk`] entry is actually reached. `Bios` is the
 /// original, only backend: a BIOS drive number the trampoline addresses
 /// exactly like the boot disk. `Usb` is a USB Mass Storage device
-/// attached via [`attach_usb_disk`] -- addressed instead through
+/// attached via [`attach_usb_disk`], or a former `Bios` entry switched
+/// over in place by [`promote_disk_to_usb`] once confirmed to be the same
+/// physical disk -- addressed instead through
 /// `kernel/src/usb_storage.rs`'s Bulk-Only Transport driver, with no BIOS
-/// drive number at all. Both backends report an ordinary `sector_count`
-/// and are otherwise indistinguishable to every FOSFS-level caller.
+/// drive number at all. It carries its own device handle directly (rather
+/// than the single global handle this used to rely on), so more than one
+/// secondary disk can be natively USB-backed at once. Both backends
+/// report an ordinary `sector_count` and are otherwise indistinguishable
+/// to every FOSFS-level caller.
 #[derive(Clone, Copy)]
 enum SecondaryBackend {
     Bios(u8),
-    Usb,
+    Usb(usb_storage::MscDevice),
 }
 
 #[derive(Clone, Copy)]
@@ -85,27 +90,19 @@ struct SecondaryDisk {
 static mut SECONDARY_DISKS: [Option<SecondaryDisk>; MAX_SECONDARY_DISKS] =
     [None, None, None, None];
 static mut SECONDARY_COUNT: usize = 0;
-/// The single USB Mass Storage device backing whichever [`SecondaryDisk`]
-/// entry has [`SecondaryBackend::Usb`] (there is at most one -- see
-/// [`attach_usb_disk`]'s own doc comment for why this driver does not yet
-/// support more).
-static mut USB_DISK: Option<usb_storage::MscDevice> = None;
-/// Set by [`promote_boot_to_usb`] once `Device::Boot` itself has been
-/// confirmed to be this exact USB device and switched over to it --
-/// completely independent of [`USB_DISK`] above, since promoting the boot
-/// disk and attaching an ordinary secondary USB disk are mutually
-/// exclusive uses of whatever single USB Mass Storage device is
-/// discovered (see that function's own doc comment).
+/// Set by [`promote_boot_to_usb`]/[`promote_disk_to_usb`] once
+/// `Device::Boot` itself has been confirmed to be a discovered USB device
+/// and switched over to it. Kept separate from [`SECONDARY_DISKS`] since
+/// the boot disk is never one of them; a promoted secondary disk instead
+/// carries its own handle directly in its own [`SecondaryBackend::Usb`].
 static mut BOOT_USB_DEVICE: Option<usb_storage::MscDevice> = None;
 
 /// Errors specific to *attaching* a USB Mass Storage disk -- distinct
 /// from the ordinary [`Error`] enum, which describes a failed read/write
 /// against a disk that is already attached, not why one was never
 /// attached in the first place.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum UsbAttachError {
-    /// A USB disk is already attached this boot; see [`attach_usb_disk`].
-    AlreadyAttached,
     NoDevice,
     NotReady,
     Capacity(usb_storage::Error),
@@ -196,7 +193,7 @@ fn drive_number(info: &BootInfo, device: Device) -> Option<u8> {
         Device::Boot => Some(info.boot_drive),
         Device::Secondary(index) => match secondary_disk(index)?.backend {
             SecondaryBackend::Bios(drive_number) => Some(drive_number),
-            SecondaryBackend::Usb => None,
+            SecondaryBackend::Usb(_) => None,
         },
     }
 }
@@ -210,7 +207,7 @@ fn is_usb_backed(device: Device) -> bool {
     match device {
         Device::Boot => unsafe { (*core::ptr::addr_of!(BOOT_USB_DEVICE)).is_some() },
         Device::Secondary(index) => {
-            matches!(secondary_disk(index).map(|disk| disk.backend), Some(SecondaryBackend::Usb))
+            matches!(secondary_disk(index).map(|disk| disk.backend), Some(SecondaryBackend::Usb(_)))
         }
     }
 }
@@ -288,13 +285,6 @@ pub fn discover_secondary_disks(info: &BootInfo) {
     }
 }
 
-/// Whether a USB Mass Storage disk is already attached this boot -- at
-/// most one is ever supported (see [`attach_usb_disk`]'s own doc
-/// comment), so a caller must check this before attempting a second one.
-pub fn usb_disk_attached() -> bool {
-    unsafe { (*core::ptr::addr_of!(USB_DISK)).is_some() }
-}
-
 /// Discovers a USB Mass Storage (Bulk-Only Transport) device and attaches
 /// it as a new secondary disk, usable immediately afterward through the
 /// exact same `diskN` selector every BIOS-backed secondary disk already
@@ -315,11 +305,11 @@ pub fn usb_disk_attached() -> bool {
 /// still relying on BIOS to serve its own boot disk afterward -- the same
 /// deliberate, explicit-action convention every other UHCI-touching
 /// command (`usb`, `usb play`, `usb capture`, `audio`) already follows.
-/// At most one USB disk is supported: `usb_storage::open()` itself only
-/// ever discovers the first Bulk-Only Transport device found, and a
-/// second `attach_usb_disk` call while one is already attached is
-/// rejected outright (`UsbAttachError::AlreadyAttached`) rather than
-/// silently replacing the live device behind an already-assigned `diskN`.
+/// More than one native USB disk is supported (each gets its own
+/// [`SecondaryBackend::Usb`] handle -- see that variant's own doc
+/// comment); the only remaining limit is an ordinary free-slot check
+/// (`UsbAttachError::Full`), the same one every BIOS-backed secondary disk
+/// is already subject to.
 ///
 /// **Confirmed, not just theoretical**: testing this very feature under
 /// QEMU found that SeaBIOS's own USB legacy support had *already* made
@@ -336,12 +326,18 @@ pub fn usb_disk_attached() -> bool {
 /// BIOS-backed path to the identical device broke. A real machine with
 /// any USB Mass Storage device already plugged in should be assumed to
 /// carry this same risk for *that* device's own BIOS-visible `diskN`,
-/// not only for `disk1`/the boot disk specifically.
+/// not only for `disk1`/the boot disk specifically -- see
+/// [`promote_all_and_attach`], which closes this for every BIOS-backed
+/// disk a boot can match, not only `disk1`.
 pub fn attach_usb_disk() -> Result<usize, UsbAttachError> {
-    if usb_disk_attached() {
-        return Err(UsbAttachError::AlreadyAttached);
-    }
-    let mut device = usb_storage::open().ok_or(UsbAttachError::NoDevice)?;
+    let device = usb_storage::open().ok_or(UsbAttachError::NoDevice)?;
+    attach_discovered_disk(device)
+}
+
+/// Shared tail of [`attach_usb_disk`] and [`promote_all_and_attach`]:
+/// confirms an already-discovered device is ready, reads its capacity,
+/// and appends it as a new [`SecondaryBackend::Usb`] secondary disk.
+fn attach_discovered_disk(mut device: usb_storage::MscDevice) -> Result<usize, UsbAttachError> {
     if !device.wait_until_ready(10) {
         return Err(UsbAttachError::NotReady);
     }
@@ -353,11 +349,10 @@ pub fn attach_usb_disk() -> Result<usize, UsbAttachError> {
         }
         let index = SECONDARY_COUNT;
         SECONDARY_DISKS[index] = Some(SecondaryDisk {
-            backend: SecondaryBackend::Usb,
+            backend: SecondaryBackend::Usb(device),
             sector_count: u64::from(block_count),
         });
         SECONDARY_COUNT += 1;
-        USB_DISK = Some(device);
         Ok(index)
     }
 }
@@ -416,41 +411,229 @@ pub fn boot_is_usb() -> bool {
 /// already broken by the time a soft reboot is attempted, it fails
 /// exactly as already documented in AGENTS.md's "USB audio and USB-boot
 /// media do not reliably coexist" section, promoted or not.
+///
+/// This logic is no longer special-cased to `disk1`: [`read_promote_baseline`]/
+/// [`try_promote_with_candidate`] below generalize it over any [`Device`],
+/// and [`promote_all_and_attach`] uses those same two halves to protect
+/// every BIOS-backed disk a boot can match in one pass, not just the boot
+/// disk. This function is now a thin single-disk wrapper kept for `usb
+/// storage promote`'s existing, narrower behavior.
 pub fn promote_boot_to_usb(info: &BootInfo) -> Result<(), BootPromoteError> {
-    if is_usb_backed(Device::Boot) {
+    let (existing_sectors, baseline) = read_promote_baseline(info, Device::Boot)?;
+    let candidate = usb_storage::open().ok_or(BootPromoteError::NoDevice)?;
+    try_promote_with_candidate(Device::Boot, existing_sectors, &baseline, candidate)
+}
+
+/// Reads `device`'s own current baseline (its BIOS-visible sector count
+/// and LBA 0 bytes) for cross-validating a discovered USB device against
+/// it later -- the "read via BIOS, strictly before any UHCI controller is
+/// touched" half of [`promote_boot_to_usb`]'s own doc comment above,
+/// generalized to any [`Device`] and split out so [`promote_all_and_attach`]
+/// can read every not-yet-promoted disk's baseline before calling into
+/// `usb_storage` even once, rather than one disk at a time. Refuses
+/// immediately if `device` is already USB-backed
+/// (`BootPromoteError::AlreadyPromoted`) or its own BIOS read fails
+/// (`BootPromoteError::BiosReadFailed`).
+fn read_promote_baseline(
+    info: &BootInfo,
+    device: Device,
+) -> Result<(u64, [u8; SECTOR_SIZE]), BootPromoteError> {
+    if is_usb_backed(device) {
         return Err(BootPromoteError::AlreadyPromoted);
     }
-    let baseline = read_sector(info, 0, |sector| *sector).map_err(|_| BootPromoteError::BiosReadFailed)?;
-    let boot_sectors = device_sector_count(info, Device::Boot);
+    let baseline =
+        device_read_sector(info, device, 0, |sector| *sector).map_err(|_| BootPromoteError::BiosReadFailed)?;
+    Ok((device_sector_count(info, device), baseline))
+}
 
-    let mut device = usb_storage::open().ok_or(BootPromoteError::NoDevice)?;
-    if !device.wait_until_ready(10) {
+/// Cross-validates an already-discovered `candidate` against `device`'s
+/// own baseline (from [`read_promote_baseline`]) and, only on a match,
+/// switches `device` over to it -- see [`promote_boot_to_usb`]'s own doc
+/// comment for the full exact-content/capacity-floor rationale, which
+/// this applies unchanged for any [`Device`]. On any failure, `candidate`
+/// is put through BOT's own reset-recovery (`MscDevice::recover`) before
+/// the error is returned: a caller that goes on to try the same physical
+/// device against a *different* disk (see [`promote_all_and_attach`])
+/// needs it left in a known-good, freshly-reset toggle state, not
+/// whatever this attempt's own commands happened to leave it in.
+fn try_promote_with_candidate(
+    device: Device,
+    existing_sectors: u64,
+    baseline: &[u8; SECTOR_SIZE],
+    mut candidate: usb_storage::MscDevice,
+) -> Result<(), BootPromoteError> {
+    if !candidate.wait_until_ready(10) {
+        candidate.recover();
         return Err(BootPromoteError::NotReady);
     }
-    let (block_count, _block_size) = device.read_capacity_10().map_err(BootPromoteError::Capacity)?;
-    let mut candidate = [0u8; SECTOR_SIZE];
-    if device.read_10(0, &mut candidate).is_err() {
+    let (block_count, _block_size) = match candidate.read_capacity_10() {
+        Ok(result) => result,
+        Err(error) => {
+            candidate.recover();
+            return Err(BootPromoteError::Capacity(error));
+        }
+    };
+    let mut candidate_lba0 = [0u8; SECTOR_SIZE];
+    if candidate.read_10(0, &mut candidate_lba0).is_err() {
+        candidate.recover();
         return Err(BootPromoteError::NotSameDisk);
     }
-    // A real USB-boot BIOS commonly reports a *smaller* capacity for
-    // `disk1` than the physical device actually has -- confirmed on real
-    // hardware: USB Legacy emulation reports the drive geometry baked
-    // into the boot image's own GPT (the original image's size, e.g.
-    // 16 MiB) rather than querying the real flash media's true capacity.
-    // So the discovered device's capacity only needs to be *at least* as
-    // large as BIOS's own figure (it must have had room to hold whatever
-    // was imaged onto it in the first place), not exactly equal -- the
-    // real identity check is the MBR content match just below: a
+    // A real USB-boot BIOS commonly reports a *smaller* capacity for the
+    // boot disk than the physical device actually has -- confirmed on
+    // real hardware: USB Legacy emulation reports the drive geometry
+    // baked into the boot image's own GPT (the original image's size,
+    // e.g. 16 MiB) rather than querying the real flash media's true
+    // capacity. So the discovered device's capacity only needs to be *at
+    // least* as large as BIOS's own figure (it must have had room to hold
+    // whatever was imaged onto it in the first place), not exactly equal
+    // -- the real identity check is the LBA 0 content match just below: a
     // byte-for-byte 512-byte match is what actually makes this
     // "confirmed, not just assumed."
-    if u64::from(block_count) < boot_sectors || candidate != baseline {
+    if u64::from(block_count) < existing_sectors || candidate_lba0 != *baseline {
+        candidate.recover();
         return Err(BootPromoteError::NotSameDisk);
     }
 
     unsafe {
-        BOOT_USB_DEVICE = Some(device);
+        match device {
+            Device::Boot => BOOT_USB_DEVICE = Some(candidate),
+            Device::Secondary(index) => {
+                if index < MAX_SECONDARY_DISKS {
+                    if let Some(disk) = SECONDARY_DISKS[index].as_mut() {
+                        disk.backend = SecondaryBackend::Usb(candidate);
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// One outcome [`promote_all_and_attach`] reports for one disk. Purely
+/// descriptive -- the exact wording is the `usb native` shell command's
+/// own job, not this module's.
+#[derive(Clone, Copy)]
+pub enum PromoteOutcome {
+    /// Already USB-backed before this call ran; nothing to do.
+    AlreadyPromoted,
+    /// A discovered device's content/capacity matched this disk's own
+    /// baseline; it now reads/writes through the native driver.
+    Promoted,
+    /// No discovered device matched this disk's baseline (or its own
+    /// baseline could not even be read via BIOS in the first place); it
+    /// is still BIOS-backed either way.
+    NoMatch,
+    /// A discovered device matched no existing disk and was attached
+    /// fresh as a new secondary disk instead.
+    Attached,
+    /// A leftover, unmatched device could not be attached as a new
+    /// secondary disk.
+    AttachFailed(UsbAttachError),
+}
+
+/// One [`PromoteAllReport`] entry. `device` is `None` only for
+/// [`PromoteOutcome::AttachFailed`], the one outcome that has no `diskN`
+/// to report -- attaching is exactly what failed.
+#[derive(Clone, Copy)]
+pub struct PromoteResult {
+    pub device: Option<Device>,
+    pub outcome: PromoteOutcome,
+}
+
+/// An arbitrarily generous bound on how many disks one
+/// [`promote_all_and_attach`] call can report on: the boot disk plus every
+/// existing secondary disk, or every newly attached one -- a single disk
+/// only ever contributes one result, so `MAX_SECONDARY_DISKS + 1` (the
+/// most disks that can possibly exist at once) is always enough.
+pub const MAX_PROMOTE_RESULTS: usize = MAX_SECONDARY_DISKS + 1;
+
+#[derive(Clone, Copy)]
+pub struct PromoteAllReport {
+    results: [Option<PromoteResult>; MAX_PROMOTE_RESULTS],
+    count: usize,
+}
+
+impl PromoteAllReport {
+    fn new() -> Self {
+        Self { results: [None; MAX_PROMOTE_RESULTS], count: 0 }
+    }
+
+    fn push(&mut self, device: Option<Device>, outcome: PromoteOutcome) {
+        if self.count < self.results.len() {
+            self.results[self.count] = Some(PromoteResult { device, outcome });
+            self.count += 1;
+        }
+    }
+
+    pub fn results(&self) -> &[Option<PromoteResult>] {
+        &self.results[..self.count]
+    }
+}
+
+/// Generalizes [`promote_boot_to_usb`] from "always exactly `disk1`" to
+/// "every disk this boot can match to a discovered USB device": reads
+/// every not-yet-USB-backed disk's own BIOS baseline (`disk1` plus every
+/// secondary [`SecondaryBackend::Bios`] disk) via [`read_promote_baseline`]
+/// *before* touching USB at all, discovers every attached USB Mass
+/// Storage device in one [`usb_storage::open_all`] pass, and
+/// cross-validates each baseline against an unused discovered device via
+/// [`try_promote_with_candidate`] -- exactly the same rule
+/// `promote_boot_to_usb` already applied to `disk1` alone, just tried
+/// against every candidate in turn instead of giving up after one.
+/// Any discovered device matching no existing disk is attached fresh as a
+/// brand new secondary disk (see [`attach_usb_disk`]), so an operator gets
+/// both jobs -- protect every disk this machine already depends on, and
+/// pick up any genuinely new device -- from one command (`usb native`).
+pub fn promote_all_and_attach(info: &BootInfo) -> PromoteAllReport {
+    let mut report = PromoteAllReport::new();
+
+    let mut candidates: [Option<Device>; MAX_PROMOTE_RESULTS] = [None; MAX_PROMOTE_RESULTS];
+    candidates[0] = Some(Device::Boot);
+    let secondary_count = unsafe { SECONDARY_COUNT };
+    for index in 0..secondary_count.min(MAX_PROMOTE_RESULTS - 1) {
+        candidates[index + 1] = Some(Device::Secondary(index));
+    }
+
+    let mut targets: [Option<(Device, u64, [u8; SECTOR_SIZE])>; MAX_PROMOTE_RESULTS] =
+        [None; MAX_PROMOTE_RESULTS];
+    let mut target_count = 0;
+    for device in candidates.into_iter().flatten() {
+        match read_promote_baseline(info, device) {
+            Ok((sectors, baseline)) => {
+                targets[target_count] = Some((device, sectors, baseline));
+                target_count += 1;
+            }
+            Err(BootPromoteError::AlreadyPromoted) => report.push(Some(device), PromoteOutcome::AlreadyPromoted),
+            Err(_) => report.push(Some(device), PromoteOutcome::NoMatch),
+        }
+    }
+
+    let mut discovered: [Option<usb_storage::MscDevice>; MAX_PROMOTE_RESULTS] = [None; MAX_PROMOTE_RESULTS];
+    let discovered_count = usb_storage::open_all(&mut discovered);
+
+    for target in targets[..target_count].iter().flatten() {
+        let (device, existing_sectors, baseline) = *target;
+        let mut promoted = false;
+        for slot in discovered[..discovered_count].iter_mut() {
+            let Some(candidate) = *slot else { continue };
+            if try_promote_with_candidate(device, existing_sectors, &baseline, candidate).is_ok() {
+                *slot = None;
+                promoted = true;
+                break;
+            }
+        }
+        report.push(Some(device), if promoted { PromoteOutcome::Promoted } else { PromoteOutcome::NoMatch });
+    }
+
+    for slot in discovered[..discovered_count].iter_mut() {
+        let Some(candidate) = slot.take() else { continue };
+        match attach_discovered_disk(candidate) {
+            Ok(index) => report.push(Some(Device::Secondary(index)), PromoteOutcome::Attached),
+            Err(error) => report.push(None, PromoteOutcome::AttachFailed(error)),
+        }
+    }
+
+    report
 }
 
 fn probe_drive(info: &BootInfo, drive_number: u8) -> Option<u64> {
@@ -663,9 +846,14 @@ fn transfer_chunk(
 /// `buffer` (already exactly a whole number of 512-byte blocks -- one for
 /// [`transfer`], up to [`MAX_TRANSFER_SECTORS`] for [`transfer_chunk`])
 /// through whichever USB device backs `device` -- [`BOOT_USB_DEVICE`] for
-/// a promoted `Device::Boot`, [`USB_DISK`] for an ordinary
-/// `SecondaryBackend::Usb` disk -- via `usb_storage`'s `READ(10)`/
-/// `WRITE(10)`. The caller has already bounds-checked `lba` against
+/// a promoted `Device::Boot`, or the matching [`SECONDARY_DISKS`] entry's
+/// own [`SecondaryBackend::Usb`] handle for a native secondary disk -- via
+/// `usb_storage`'s `READ(10)`/`WRITE(10)`. A mutable reference straight
+/// into whichever static actually owns the handle (not a copy) is
+/// required here specifically, unlike [`secondary_disk`]'s ordinary
+/// by-value accessor: BOT's DATA0/DATA1 toggle state that `read_10`/
+/// `write_10` update must persist across calls, which a copy would lose.
+/// The caller has already bounds-checked `lba` against
 /// [`device_sector_count`]; SCSI `READ(10)`/`WRITE(10)` only carry a
 /// 32-bit LBA, so this additionally rejects (as [`Error::OutOfRange`]) an
 /// address that would need more than 32 bits -- unreachable in practice
@@ -677,7 +865,16 @@ fn usb_transfer(device: Device, lba: u64, buffer: &mut [u8], direction: u32) -> 
     };
     let handle = match device {
         Device::Boot => unsafe { (*core::ptr::addr_of_mut!(BOOT_USB_DEVICE)).as_mut() },
-        Device::Secondary(_) => unsafe { (*core::ptr::addr_of_mut!(USB_DISK)).as_mut() },
+        Device::Secondary(index) => unsafe {
+            if index >= MAX_SECONDARY_DISKS {
+                None
+            } else {
+                match (*core::ptr::addr_of_mut!(SECONDARY_DISKS))[index].as_mut() {
+                    Some(SecondaryDisk { backend: SecondaryBackend::Usb(device), .. }) => Some(device),
+                    _ => None,
+                }
+            }
+        },
     };
     let Some(device) = handle else {
         return Err(Error::Unavailable);

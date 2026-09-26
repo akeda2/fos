@@ -1558,6 +1558,34 @@ static mut CONTROLLERS: [Option<Uhci>; MAX_INSTANCES] = [const { None }; MAX_INS
 static mut CONTROLLER_COUNT: usize = 0;
 static mut INITIALIZED: bool = false;
 
+/// The next USB device address `allocate_device_address` will hand out.
+/// Shared by every discovery path in this file (`find_msc_device`,
+/// `find_uac_device`) so that more than one USB device can be addressed
+/// at once, instead of every discovery independently reusing a hardcoded
+/// address of 1 -- correct only as long as at most one device is ever
+/// live. Reset to 1 only where `initialize_all` performs the one real
+/// Host Controller Reset for this boot (see that function's own doc
+/// comment): that is the only point every previously assigned address
+/// actually goes stale at once, so it is also the only point reusing
+/// address 1 is safe.
+static mut NEXT_DEVICE_ADDRESS: u8 = 1;
+
+/// Hands out the next unused USB device address (1..=127, the full 7-bit
+/// address field), or `None` once exhausted -- a real bound rather than a
+/// silent wraparound that would collide with an already-addressed device.
+/// In practice unreachable given at most `MAX_INSTANCES * UHCI_PORTS`
+/// storage ports plus a handful of audio devices.
+pub fn allocate_device_address() -> Option<u8> {
+    unsafe {
+        if NEXT_DEVICE_ADDRESS > 127 {
+            return None;
+        }
+        let address = NEXT_DEVICE_ADDRESS;
+        NEXT_DEVICE_ADDRESS += 1;
+        Some(address)
+    }
+}
+
 fn init_controller(address: PciAddress) -> Result<(), Error> {
     let instance = unsafe { CONTROLLER_COUNT };
     if instance >= MAX_INSTANCES {
@@ -1615,6 +1643,7 @@ pub fn initialize_all() -> Result<usize, Error> {
             };
         }
         INITIALIZED = true;
+        NEXT_DEVICE_ADDRESS = 1;
     }
 
     let mut matches: [Option<PciAddress>; MAX_INSTANCES] = [None; MAX_INSTANCES];
@@ -1696,6 +1725,11 @@ pub struct UacEndpoint {
 /// for whichever direction they need rather than assuming one shared
 /// format the way `es1370`/`hda`'s own real hardware happens to have.
 pub struct UacDevice {
+    /// The USB device address this device was enumerated at (see
+    /// `allocate_device_address`) -- callers driving isochronous streams
+    /// afterward (e.g. `discover_usb_audio_device`) must address it by
+    /// this value, not by assuming it is always 1.
+    pub address: u8,
     pub playback: Option<UacEndpoint>,
     pub capture: Option<UacEndpoint>,
 }
@@ -1827,8 +1861,6 @@ fn find_uac_endpoint(config: &[u8], want_in: bool) -> Option<UacEndpoint> {
 /// already addressed the device. Shared by the `usb play`/`usb capture`
 /// shell commands and `audio.rs`'s USB playback discovery.
 pub fn find_uac_device() -> Option<(&'static Uhci, UacDevice)> {
-    const DEVICE_ADDRESS: u8 = 1;
-
     for index in 0..count() {
         let Some(controller) = get(index) else { continue };
         for port in 0..UHCI_PORTS {
@@ -1841,12 +1873,13 @@ pub fn find_uac_device() -> Option<(&'static Uhci, UacDevice)> {
                 continue;
             }
             let max_packet0 = first8[7];
-            if controller.set_address(DEVICE_ADDRESS).is_err() {
+            let Some(address) = allocate_device_address() else { continue };
+            if controller.set_address(address).is_err() {
                 continue;
             }
             let mut config_header = [0u8; 9];
             if controller
-                .get_descriptor(DEVICE_ADDRESS, max_packet0, USB_DESCRIPTOR_CONFIGURATION, &mut config_header)
+                .get_descriptor(address, max_packet0, USB_DESCRIPTOR_CONFIGURATION, &mut config_header)
                 .is_err()
             {
                 continue;
@@ -1855,7 +1888,7 @@ pub fn find_uac_device() -> Option<(&'static Uhci, UacDevice)> {
                 (u16::from_le_bytes([config_header[2], config_header[3]]) as usize).min(MAX_DESCRIPTOR_BYTES);
             let mut config = [0u8; MAX_DESCRIPTOR_BYTES];
             let Ok(read) = controller.get_descriptor(
-                DEVICE_ADDRESS,
+                address,
                 max_packet0,
                 USB_DESCRIPTOR_CONFIGURATION,
                 &mut config[..total_length],
@@ -1869,23 +1902,23 @@ pub fn find_uac_device() -> Option<(&'static Uhci, UacDevice)> {
             }
             // bConfigurationValue is the configuration descriptor's 6th byte.
             let config_value = config.get(5).copied().unwrap_or(0);
-            if controller.set_configuration(DEVICE_ADDRESS, max_packet0, config_value).is_err() {
+            if controller.set_configuration(address, max_packet0, config_value).is_err() {
                 continue;
             }
             let playback = playback.filter(|endpoint| {
                 controller
-                    .set_interface(DEVICE_ADDRESS, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
+                    .set_interface(address, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
                     .is_ok()
             });
             let capture = capture.filter(|endpoint| {
                 controller
-                    .set_interface(DEVICE_ADDRESS, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
+                    .set_interface(address, max_packet0, endpoint.interface_number, endpoint.alternate_setting)
                     .is_ok()
             });
             if playback.is_none() && capture.is_none() {
                 continue;
             }
-            return Some((controller, UacDevice { playback, capture }));
+            return Some((controller, UacDevice { address, playback, capture }));
         }
     }
     None
@@ -2047,10 +2080,10 @@ pub fn discover_usb_audio_device() -> Option<&'static UsbAudioDevice> {
 
     let (controller, device) = find_uac_device()?;
     let endpoint = device.playback?;
-    const DEVICE_ADDRESS: u8 = 1; // matches find_uac_device's own fixed address
+    let device_address = device.address;
     let endpoint_number = endpoint.endpoint_address & 0x0f;
     let stream =
-        controller.start_isoc_ring_out(DEVICE_ADDRESS, endpoint_number, endpoint.packet_bytes, &USB_AUDIO_RING)?;
+        controller.start_isoc_ring_out(device_address, endpoint_number, endpoint.packet_bytes, &USB_AUDIO_RING)?;
 
     // A capture stream is genuinely optional: a playback-only device (or
     // one where the capture pool allocation happens to fail) simply
@@ -2060,7 +2093,7 @@ pub fn discover_usb_audio_device() -> Option<&'static UsbAudioDevice> {
     let capture_endpoint = device.capture;
     let capture_stream = capture_endpoint.and_then(|capture| {
         let capture_endpoint_number = capture.endpoint_address & 0x0f;
-        controller.start_isoc_ring_in(DEVICE_ADDRESS, capture_endpoint_number, capture.packet_bytes, &USB_AUDIO_CAPTURE_RING)
+        controller.start_isoc_ring_in(device_address, capture_endpoint_number, capture.packet_bytes, &USB_AUDIO_CAPTURE_RING)
     });
 
     unsafe {

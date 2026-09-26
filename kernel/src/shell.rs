@@ -1020,7 +1020,8 @@ fn enumerate_usb_port(port_number: u8, controller: &uhci::Uhci, port: u8) {
 /// transfer -- see `uhci.rs`'s `IsocOutStream` and AGENTS.md's "UHCI"
 /// section for the design.
 fn usb_command(info: &BootInfo, arguments: &[u8]) {
-    const USAGE: &str = "Usage: usb | usb play [diskN] NAME | usb capture [diskN] NAME | usb storage";
+    const USAGE: &str =
+        "Usage: usb | usb play [diskN] NAME | usb capture [diskN] NAME | usb storage | usb native";
 
     if arguments.is_empty() {
         print_usb_devices();
@@ -1028,6 +1029,10 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
     }
 
     let (first, remainder) = take_word(arguments);
+    if first.eq_ignore_ascii_case(b"native") && remainder.is_empty() {
+        usb_native_command(info);
+        return;
+    }
     if first.eq_ignore_ascii_case(b"play") {
         let (device, remainder) = parse_disk_and_one_argument(remainder);
         let (name, trailing) = take_word(remainder);
@@ -1069,6 +1074,50 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
     println!("{USAGE}");
 }
 
+/// `usb native`: the short, self-explanatory alias for "switch every
+/// BIOS-backed disk this boot can confirm is a discovered USB device over
+/// to its native driver" -- generalizing `usb storage promote` (always
+/// exactly `disk1`) to every disk that has one, via
+/// `disk::promote_all_and_attach`. Named for what actually happens: the
+/// disk itself is the same one BIOS already booted from (or already found
+/// as an ordinary secondary disk) -- only its *mode* switches, from
+/// BIOS's "USB Legacy Support" emulation to this driver's own native
+/// Bulk-Only Transport reads/writes. Also attaches any leftover
+/// discovered device that matched no existing disk, exactly like `usb
+/// storage attach` would, so this one command covers both jobs `usb
+/// storage attach`/`usb storage promote` used to require running
+/// separately.
+fn usb_native_command(info: &BootInfo) {
+    println!("Resetting UHCI controllers to discover every attached USB");
+    println!("Mass Storage device; this can break BIOS's own USB-drive");
+    println!("emulation for any disk still served that way.");
+    let report = disk::promote_all_and_attach(info);
+    for result in report.results() {
+        let Some(result) = result else { continue };
+        let Some(device) = result.device else {
+            if let disk::PromoteOutcome::AttachFailed(error) = result.outcome {
+                println!("A leftover USB device could not be attached: {error:?}");
+            }
+            continue;
+        };
+        let reason: &str = match result.outcome {
+            disk::PromoteOutcome::AlreadyPromoted => "already native USB",
+            disk::PromoteOutcome::Promoted => "now reads/writes through the native USB driver",
+            disk::PromoteOutcome::NoMatch => "no matching USB device found; still BIOS-backed",
+            disk::PromoteOutcome::Attached => {
+                let sectors = disk::device_sector_count(info, device);
+                println!(
+                    "disk{}: a new USB device, attached natively ({sectors} sector(s)).",
+                    device_number(device)
+                );
+                continue;
+            }
+            disk::PromoteOutcome::AttachFailed(_) => continue,
+        };
+        println!("disk{}: {reason}.", device_number(device));
+    }
+}
+
 /// Discovers a USB Mass Storage device and attaches it as a new
 /// secondary disk (see `disk::attach_usb_disk`'s own doc comment for why
 /// this is a deliberate, explicit operator action rather than something
@@ -1084,9 +1133,6 @@ fn usb_storage_attach_command(info: &BootInfo) {
             let disk_number = index + 2;
             let sectors = disk::device_sector_count(info, disk::Device::Secondary(index));
             println!("Attached as disk{disk_number} ({sectors} sector(s)).");
-        }
-        Err(disk::UsbAttachError::AlreadyAttached) => {
-            println!("A USB disk is already attached this boot.");
         }
         Err(disk::UsbAttachError::NoDevice) => {
             println!("No USB Mass Storage device found.");

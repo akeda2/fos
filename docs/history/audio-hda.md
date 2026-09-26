@@ -1815,3 +1815,225 @@ project tests against negotiates to exactly 2 channels either way, so
 this change is provably additive and non-regressing for every currently
 automatable scenario.
 
+
+## Real-time audio streaming over RTP/UDP: the `audio-rtp` tape (full detail)
+
+## Real-time audio streaming over RTP/UDP: the `audio-rtp` tape
+
+`tapes/audio-rtp/` streams the same raw PCM audio `audio-net` does, but
+over genuine RTP (RFC 3550) carried in UDP/IPv4 instead of a bespoke
+raw-Ethernet tag protocol -- so a real tool (`ffmpeg`, `gstreamer`, any
+RTP client) can send to or receive from `fos` directly, not just another
+fos instance. `tapes/tape-net/src/lib.rs` gained a matching `RtpPacket`
+type (parse/encode over borrowed slices/caller-owned buffers, exactly
+like `UdpDatagram`/`IcmpEcho`) and a `sequence16_at_or_after` wraparound
+helper; see `NETWORKING.md`'s "RTP scope"/"`tapes/audio-rtp`" sections
+for the full design (payload-type table, packetization-size derivation,
+ARP-reply requirement, ES1370-test-tone-contamination test gotcha, and
+the byte-swap/24-bit-repacking translation step). This section covers
+only what's specific to *this* project's kernel/hardware side.
+
+**Format is adaptive.** Unlike `audio-net` (which just plays whatever
+`audio_sample_rate_at`/`audio_channels_and_bits_at` report, since its own
+wire protocol carries the format explicitly), `audio-rtp` must map the
+local device's actual format to one of a small set of RTP payload types
+it understands (RFC 3551's one real static entry, `L16`/44100/stereo =
+PT 10, for ES1370; two documented dynamic-range conventions for HDA's
+newly-negotiable 48 kHz/16-bit and 48 kHz/24-bit) -- and rejects anything
+else outright, rather than generalizing. This is what motivated HDA's
+own rate/bit-depth negotiation becoming real (see above): a fixed
+44.1 kHz-only target would have made this tape's whole "prefer real
+hardware's actual modern format" premise moot for the one backend
+(HDA) most real machines actually have.
+
+**Scope: device 0 only per invocation; `duplex` runs both directions at
+once, everything else is one direction.** One RTP session models exactly
+one media stream; there is no protocol-level equivalent to `audio-net`'s
+single-session multi-device tagging, and this shell's one-foreground-
+tape-at-a-time model rules out true simultaneous multi-device sessions
+regardless of protocol design. A second device needs a second,
+separately invoked session on a second port -- a real, standards-clean
+answer, just a narrower single-invocation feature than `audio-net`'s.
+`listen`/`send`/`capture` each still drive exactly one direction;
+`duplex` (below) is the one mode that drives both at once, still against
+only device 0.
+
+**Opus decode** is now built, via `tapes/opus-codec/` -- this project's
+first vendored C dependency, and its first build step that invokes a C
+compiler directly rather than through Cargo (the root Makefile's
+`opus-codec-lib` recipe, compiling `tapes/opus-codec/vendor/opus/` --
+libopus 1.5.2, BSD-3-Clause -- under the same `-m32`/no-SSE/no-MMX/
+soft-float flags `targets/i686-fos.json` implies, then linking the
+resulting archive into `tape-audio-rtp`'s build via `RUSTFLAGS`, no
+`build.rs`/`#[link(...)]` involved). It is the **fixed-point** decoder
+specifically, not the floating-point one: a real, systematic check (`nm
+-u` across every compiled object) found not one libm symbol anywhere in
+the decode-only build, matching this kernel's own no-FPU convention with
+no CR0/CR4 toggling needed, and fixed-point stays testable against known
+packet/PCM pairs in a way a float build (not guaranteed bit-identical to
+any particular reference decode) is not. `tapes/opus-codec/vendor/opus/`
+is trimmed to exactly the decode-only source files needed -- no encoder,
+no ARM/x86 SIMD, no custom-modes support (the non-custom-modes path uses
+libopus's own precomputed static CELT mode tables instead of building
+one at runtime, which is what makes decode allocation-free below the
+top-level state buffer) -- documented in `tapes/opus-codec/config.h`'s
+own header comment alongside the exact upstream version/URL.
+
+The decoder's state buffer is sized and owned through the tape ABI's own
+`alloc`/`free` callbacks (`opus_decoder_get_size` + `opus_decoder_init`,
+never libopus's own malloc-backed `opus_decoder_create`); a small
+`custom_support.h` override point redirects libopus's internal
+`opus_alloc`/`opus_free` through those same callbacks instead of a libc
+allocator this freestanding target does not have, and `tapes/opus-codec/
+src/lib.rs` also provides a bare `abs()` -- one more libc symbol this
+build's `-fno-builtin` flag (needed for the freestanding build generally)
+incidentally stops GCC from inlining away on its own.
+
+`tapes/audio-rtp/src/main.rs`'s `listen_mode` recognizes a fourth, fixed
+dynamic payload type, `PAYLOAD_TYPE_OPUS` (98), decoding through a
+persistent `opus_codec::Decoder` instead of the raw-PCM repack path
+whenever the local device's own native format is 16-bit (this vendored
+build has no float API, so `opus_decode` only ever produces 16-bit PCM)
+*and* its sample rate is one of the five libopus accepts (8/12/16/24/
+48 kHz) -- ES1370's fixed 44100 Hz satisfies neither constraint, so Opus
+decode is HDA-only today, lining up exactly with HDA's own 48 kHz/16-bit
+negotiated format described above.
+
+**Opus encode** followed the same vendoring discipline, added to
+`send`/`capture` via `send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]`/
+`capture [opus] PEER_IP [PEER_PORT] [BITRATE]` (`opus_codec::Encoder`,
+same tape-ABI-backed allocation pattern as `Decoder`, never libopus's
+malloc-backed `opus_encoder_create`). `BITRATE` defaults to
+`opus_codec::DEFAULT_BITRATE_BPS` (96 kbps, Opus's conventional
+"transparent for 48 kHz stereo" floor) when omitted; complexity is
+hardcoded at libopus's maximum (10) and the application at
+`OPUS_APPLICATION_AUDIO`, neither exposed as a choice -- this project's
+real-hardware floor is Pentium 4, and Opus's CPU cost even at max
+complexity is trivial for that era of hardware, so there is no target-
+hardware reason to ever want either lower. The same HDA-only-for-Opus
+asymmetry applies to this direction too, for the identical reason.
+
+Building this surfaced a real, previously-undiscovered stack-overflow
+bug, not a decode-side concern at all: `tapes/opus-codec/vendor/opus/`
+originally used libopus's `VAR_ARRAYS` scratch-allocation mode (plain C99
+variable-length arrays on the real call stack) for both directions, which
+decode alone never grows large enough to matter for -- but the *encoder*'s
+SILK pipeline (LPC/pitch/noise-shaping analysis, several KB of VLA-based
+scratch nested many calls deep) reliably hit fos's kernel stack guard
+page the moment a real tape build exercised it, exactly the "tapes run
+nested inside the shell's own call chain on the kernel's shared stack"
+hazard `entry.S`'s own doc comment already warns about. Two independent
+fixes were needed: moving `send_mode`/`capture_mode`'s own PCM/packet
+scratch buffers off the stack and through the tape ABI's `alloc`
+callback instead (mirroring `send_mode`'s pre-existing file-buffer
+pattern), and -- the deeper fix -- switching `config.h` from
+`VAR_ARRAYS` to libopus's `NONTHREADSAFE_PSEUDOSTACK` mode, which moves
+*all* of celt/silk's internal scratch allocation onto one lazily-
+allocated, heap-backed buffer (via the already-existing `opus_alloc`
+override, needing no new code) instead of the real machine stack --
+"nonthreadsafe" is a non-issue here, matching every other single-
+threaded, no-concurrency `static mut` this codebase already relies on.
+The first fix alone was not sufficient; only the second one actually
+resolved it, confirming the SILK encoder's own internal stack pressure
+was the dominant cause, not this tape's own new locals.
+
+Verified end to end by `tapes/test_audio_rtp_e2e.py` (raw PCM;
+`NETWORKING.md` has the full description) -- hand-built, genuinely
+spec-compliant RTP/UDP/IPv4/Ethernet frames in Python, a real ARP round
+trip in both directions, deliberate loss/duplicate injection, and a WAV
+capture checked for the *correct pitch* windowed against ES1370's own
+built-in ~441 Hz test tone contaminating the same capture -- and by
+`tapes/test_audio_rtp_opus_e2e.py` (Opus decode): real RTP/Opus packets
+from an actual `ffmpeg`+`libopus` encode (not hand-built this time),
+decoded inside a real Intel HDA QEMU guest. That test's pitch check uses
+a dependency-free single-bin Goertzel DFT rather than the raw-PCM test's
+zero-crossing estimator, which proved too easily confused by a real
+Opus/HDA-underrun-bearing signal to trust for this one, even though the
+underlying decoded audio (cross-checked against an independent FFT
+during development) was already correct. `tapes/test_audio_rtp_opus_send_e2e.py`
+covers the reverse direction (Opus encode): a known tone seeded into
+FOSFS, encoded for real by the kernel's `send opus` path, and decoded
+back by a small *host-side* build of this same vendored decoder
+(compiled fresh from `tapes/opus-codec/vendor/opus/` at test time, rather
+than depending on a second implementation like `ffmpeg` to cross-check
+against) to verify pitch and duration. Both Opus e2e tests use `-accel
+kvm` when available (see `kvm_available()` in either test file) -- a
+QEMU/TCG software-emulation timing artifact (any tight, uninterrupted
+guest busy loop starves QEMU's own timer/interrupt delivery under plain
+TCG, the same root cause `tapes/test_audio_net_real_mic_e2e.py` already
+found and fixed this way), not a real target-hardware concern.
+
+**Two-way duplex** is now built: `duplex PEER_IP [PEER_PORT]` (`[opus]`/
+`[BITRATE]` accepted exactly like `capture`) runs `listen_mode` and
+`capture_mode`'s code paths simultaneously in one invocation --
+receiving and playing inbound RTP while also capturing and sending
+outbound RTP to `PEER_IP`/`PEER_PORT` -- over one shared local UDP port
+(always `DEFAULT_PORT`/5004, not separately configurable: `PEER_PORT`
+already means "where outbound packets are addressed to," an orthogonal
+knob from "what port inbound packets are filtered by," and a symmetric
+same-port session, the common case for `ffmpeg`-style point-to-point
+testing, needs no second port argument at all). `duplex_mode`
+(`main.rs`) is new orchestration only, not new wire-format logic: it
+reuses every existing helper and both directions' decode/encode code
+paths completely unchanged, folded into one shared loop with a single
+`nic_receive` call per iteration (not the two independent polls
+`listen`/`capture` each used alone) so ARP/RTP classification never
+double-runs per tick. The one accepted, narrow limitation: `resolve_mac`
+(run once, up front, to learn the peer's MAC before streaming to it)
+already answers inbound ARP for our own address while it waits, but does
+not classify inbound RTP during that window -- a peer sending before our
+own resolution finishes loses those first packets to plain silence, the
+same best-effort, no-retransmission philosophy this tape already applies
+everywhere else, just at a narrower startup race. Verified end to end by
+`tapes/test_audio_rtp_duplex_e2e.py`: while the host streams a
+synthesized tone to the guest's receive side (verified via the tape's
+own printed packet/byte counters, not a captured-WAV pitch check -- see
+that test's own docstring for why: QEMU's `wav` audiodev backend has no
+usable `in.path` option in this packaging, so a single guest cannot get
+both real captured-WAV output verification and a live ADC feed for the
+send side at once, the same tradeoff `tapes/test_audio_capture_e2e.py`
+already accepts), it simultaneously drains and verifies the guest's own
+outgoing RTP stream (correct payload type, monotonically increasing
+sequence number, one constant SSRC) and confirms at least one outgoing
+packet arrives *before* the host finishes sending its tone -- ruling out
+an accidental "receive fully, then send" serialization bug, not just
+proving the code compiles.
+
+**Verified against the real TerraTec Aureon Dual USB** (the same
+physically tested class-compliant USB Audio device the UHCI section
+above uses), via QEMU `usb-host` passthrough: this surfaced a real bug,
+invisible on every QEMU-only test above because ES1370/HDA both happen
+to share one format between playback and capture. `capture_mode`/
+`duplex_mode` used to query only `local_format()` (the *playback*
+format) and reuse it for the send side too -- silently correct for
+ES1370/HDA, but wrong for the real TerraTec card (stereo playback, mono
+capture): the outgoing captured audio was genuinely mono but got
+RTP-labeled with the stereo payload type computed from the playback
+format, and Opus was constructed with the wrong channel count. Fixed by
+adding `capture_local_format()` (`main.rs`), a `local_format()` twin
+built on the tape ABI's dedicated capture-format callbacks
+(`audio_capture_sample_rate`/`audio_capture_channels_and_bits`, added to
+the ABI in the session that built `capture_format()` on the kernel side
+but never actually consumed by this tape until now) -- every byte
+sourced from `audio_capture_at` in either function now uses this, not
+`local_format()`. A second, related fix: requiring a raw-PCM payload
+type (`payload_type_for`, RFC 3551's one static entry plus two
+documented stereo-only 48 kHz conventions) unconditionally, even for
+Opus, meant a mono-only capture device -- which has no raw-PCM table
+entry at all, since every entry is stereo-only -- couldn't stream via
+`opus` either, even though Opus itself is channel-count-flexible and
+never needed that lookup. Both `capture_mode`/`duplex_mode` now only
+require it for `Codec::Raw`. With both fixes, `duplex opus` against the
+real card played a real tone through its line-out (400 periods, byte-
+exact match to what was sent) while simultaneously capturing real,
+non-silent microphone audio (peak 2785, stdev 57.5 after decode) and
+Opus-encoding/streaming it out, correctly labeled -- decoded back and
+verified via the same host-side vendored-decoder technique
+`tapes/test_audio_rtp_opus_send_e2e.py` already uses, confirming genuine
+concurrent real-hardware duplex, not just the QEMU-only structural proof
+above.
+
+Real-hardware interop with a genuine, unmodified `ffmpeg` session (as
+opposed to this project's own hand-built test/verification scripts) and
+the 24-bit path this tape's format table already accounts for (Opus
+included, since it needs a 16-bit local device) remain future work.

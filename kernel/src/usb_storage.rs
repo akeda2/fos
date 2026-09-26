@@ -157,18 +157,28 @@ fn find_msc_endpoints(config: &[u8]) -> Option<MscEndpoints> {
     None
 }
 
-/// Scans every discovered controller/port for a device offering a usable
-/// Bulk-Only Transport Mass Storage interface, completing
-/// `SET_ADDRESS`/`SET_CONFIGURATION` (no `set_interface` needed -- Mass
-/// Storage's default alternate setting is already the operative one).
-/// Mirrors `uhci::find_uac_device`'s exact "reset and redo everything from
-/// scratch, one port reset per attempt" shape.
-fn find_msc_device() -> Option<(&'static Uhci, u8, MscEndpoints)> {
-    const DEVICE_ADDRESS: u8 = 1;
-
+/// Scans every discovered controller/port for devices offering a usable
+/// Bulk-Only Transport Mass Storage interface, opening as many as `out`
+/// has room for -- unlike a single `find_msc_device` call used to,
+/// this does not stop at the first match, so more than one native USB
+/// Mass Storage device can be opened in one pass (see `disk.rs`'s
+/// `promote_all_and_attach`, which needs to cross-validate every
+/// BIOS-backed disk against whatever is actually attached). Each device
+/// is given its own address via `uhci::allocate_device_address` rather
+/// than a single hardcoded value, so two devices opened in the same pass
+/// don't collide. Completes `SET_ADDRESS`/`SET_CONFIGURATION` for each
+/// (no `set_interface` needed -- Mass Storage's default alternate setting
+/// is already the operative one), mirroring `uhci::find_uac_device`'s
+/// "reset and redo everything from scratch, one port reset per attempt"
+/// shape per port. Returns how many devices were opened.
+pub fn open_all(out: &mut [Option<MscDevice>]) -> usize {
+    let mut opened = 0usize;
     for index in 0..uhci::count() {
         let Some(controller) = uhci::get(index) else { continue };
         for port in 0..uhci::UHCI_PORTS {
+            if opened >= out.len() {
+                return opened;
+            }
             let Ok(low_speed) = controller.reset_port(port) else { continue };
             if low_speed {
                 continue;
@@ -178,12 +188,13 @@ fn find_msc_device() -> Option<(&'static Uhci, u8, MscEndpoints)> {
                 continue;
             }
             let max_packet0 = first8[7];
-            if controller.set_address(DEVICE_ADDRESS).is_err() {
+            let Some(device_address) = uhci::allocate_device_address() else { continue };
+            if controller.set_address(device_address).is_err() {
                 continue;
             }
             let mut config_header = [0u8; 9];
             if controller
-                .get_descriptor(DEVICE_ADDRESS, max_packet0, uhci::USB_DESCRIPTOR_CONFIGURATION, &mut config_header)
+                .get_descriptor(device_address, max_packet0, uhci::USB_DESCRIPTOR_CONFIGURATION, &mut config_header)
                 .is_err()
             {
                 continue;
@@ -192,7 +203,7 @@ fn find_msc_device() -> Option<(&'static Uhci, u8, MscEndpoints)> {
                 .min(uhci::MAX_DESCRIPTOR_BYTES);
             let mut config = [0u8; uhci::MAX_DESCRIPTOR_BYTES];
             let Ok(read) = controller.get_descriptor(
-                DEVICE_ADDRESS,
+                device_address,
                 max_packet0,
                 uhci::USB_DESCRIPTOR_CONFIGURATION,
                 &mut config[..total_length],
@@ -204,13 +215,25 @@ fn find_msc_device() -> Option<(&'static Uhci, u8, MscEndpoints)> {
             };
             // bConfigurationValue is the configuration descriptor's 6th byte.
             let config_value = config.get(5).copied().unwrap_or(0);
-            if controller.set_configuration(DEVICE_ADDRESS, max_packet0, config_value).is_err() {
+            if controller.set_configuration(device_address, max_packet0, config_value).is_err() {
                 continue;
             }
-            return Some((controller, max_packet0, endpoints));
+            out[opened] = Some(MscDevice {
+                controller,
+                endpoints,
+                device_address,
+                control_max_packet: max_packet0,
+                // Freshly `SET_CONFIGURATION`'d: the device's own toggles
+                // start at DATA0 per the USB spec's own "configuration
+                // selection resets all non-control endpoint state" rule.
+                in_toggle: false,
+                out_toggle: false,
+                next_tag: 0,
+            });
+            opened += 1;
         }
     }
-    None
+    opened
 }
 
 fn build_cbw(tag: u32, data_transfer_length: u32, data_in: bool, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
@@ -229,7 +252,14 @@ fn build_cbw(tag: u32, data_transfer_length: u32, data_in: bool, lun: u8, cdb: &
 /// Owns the persistent per-endpoint DATA0/DATA1 toggle state
 /// `uhci::Uhci::bulk_transfer` requires (see that function's own doc
 /// comment for why `Uhci` itself can't track this), plus the
-/// monotonically increasing CBW tag BOT's own spec expects.
+/// monotonically increasing CBW tag BOT's own spec expects. `Copy` (every
+/// field already is) so `disk.rs`'s multi-device matching
+/// (`promote_all_and_attach`) can freely try a discovered candidate
+/// against one disk's baseline without losing it if that attempt fails --
+/// a genuine mutation (advancing the toggle/tag state) only ever needs to
+/// persist once a device is actually kept, at which point it is moved
+/// into its owning static by value, not shared.
+#[derive(Clone, Copy)]
 pub struct MscDevice {
     controller: &'static Uhci,
     endpoints: MscEndpoints,
@@ -241,24 +271,14 @@ pub struct MscDevice {
 }
 
 /// Discovers and opens the first Bulk-Only Transport Mass Storage device
-/// found on any UHCI controller/port. Re-discovers from scratch every
-/// call, the same "no persistent handle across calls" precedent
-/// `uhci::find_uac_device` already set.
+/// found on any UHCI controller/port, via `open_all` with a one-element
+/// buffer. Re-discovers from scratch every call, the same "no persistent
+/// handle across calls" precedent `uhci::find_uac_device` already set.
 pub fn open() -> Option<MscDevice> {
-    const DEVICE_ADDRESS: u8 = 1;
-    let (controller, control_max_packet, endpoints) = find_msc_device()?;
-    Some(MscDevice {
-        controller,
-        endpoints,
-        device_address: DEVICE_ADDRESS,
-        control_max_packet,
-        // Freshly `SET_CONFIGURATION`'d: the device's own toggles start
-        // at DATA0 per the USB spec's own "configuration selection resets
-        // all non-control endpoint state" rule.
-        in_toggle: false,
-        out_toggle: false,
-        next_tag: 0,
-    })
+    let mut devices = [const { None }; 1];
+    open_all(&mut devices);
+    let [device] = devices;
+    device
 }
 
 impl MscDevice {
@@ -275,8 +295,12 @@ impl MscDevice {
     /// (this is already the failure-recovery path; there is no deeper
     /// fallback than "the next command will find out whether it worked"),
     /// mirroring `usb_play_command`'s own "best-effort teardown, not
-    /// reported" convention.
-    fn recover(&mut self) {
+    /// reported" convention. `pub(crate)` (rather than private) so
+    /// `disk.rs`'s `try_promote_with_candidate` can also call it directly
+    /// after a failed cross-validation attempt, leaving a rejected
+    /// candidate in a known-good state for a possible retry against a
+    /// different disk.
+    pub(crate) fn recover(&mut self) {
         let _ = self.controller.bulk_only_mass_storage_reset(
             self.device_address,
             self.control_max_packet,
