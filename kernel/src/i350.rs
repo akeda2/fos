@@ -75,6 +75,7 @@ use core::cell::Cell;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 
+use crate::interrupts;
 use crate::nic::{Health, WatchdogResult};
 use crate::paging;
 use crate::pci;
@@ -282,6 +283,61 @@ fn release_swfw_sync(mmio_base: u32) {
     write_register(mmio_base, REG_SW_FW_SYNC, sync & !SWFW_PHY0_SM);
 }
 
+/// Reads `RAL0`/`RAH0`, retrying with a short delay if the result is not
+/// yet a plausible MAC (all-zero or all-`0xff`), instead of failing on
+/// the very first read.
+///
+/// **Confirmed real-hardware finding**, on the same Dell Precision
+/// 3620's onboard I350: `reset` (above) only ever polls `CTRL.RST`
+/// clearing before returning, the same completion signal that is
+/// correct for the older 82540EM/e1000 family -- but `e1000e.rs`'s own
+/// module doc comment already documents a hazard where a *newer* Intel
+/// NIC generation loads its receive-address registers from NVM
+/// asynchronously, well after `CTRL.RST` itself has cleared, and reading
+/// them too early (as `configure` used to do here, immediately and only
+/// once) returns garbage -- for e1000e that garbage happened to be all
+/// zero/`0xff` too, exactly what was observed here: both real I350 ports
+/// on this same machine came back `InvalidMac` every time, never merely
+/// intermittently, consistent with reading the registers too early
+/// rather than a genuinely absent/corrupt NVM-programmed address.
+/// e1000e's own fix polls `EECD.AUTO_RD`, a documented, named completion
+/// bit for that family; this project has no confirmed equivalent bit
+/// offset for I350 to poll the same way (no datasheet at hand while
+/// fixing this against the real machine that found it), so this retries
+/// the read itself instead, on the reasoning that whatever completion
+/// signal exists, it must complete within a bounded, short real time
+/// after reset -- the same "retry the actual observable outcome instead
+/// of a specific status bit" idiom already accepted elsewhere in this
+/// project when a real register meaning is not yet known. If this
+/// still returns `None` on some other real I350 board, the next
+/// diagnostic step is finding and polling the real completion bit
+/// directly, not lengthening this retry further.
+///
+/// **Confirmed fixed end to end**: both real I350 ports on this machine
+/// now enumerate with valid, sequential MAC addresses and pass real
+/// traffic (`nic send`/`term net` both confirmed over either port).
+fn read_mac_with_retry(mmio_base: u32) -> Option<[u8; 6]> {
+    let mut attempts = 20u32;
+    loop {
+        let ral = read_register(mmio_base, REG_RAL0);
+        let rah = read_register(mmio_base, REG_RAH0);
+        let mut mac = [0u8; 6];
+        mac[0..4].copy_from_slice(&ral.to_le_bytes());
+        mac[4..6].copy_from_slice(&(rah as u16).to_le_bytes());
+        if mac.iter().any(|&byte| byte != 0) && mac != [0xff; 6] {
+            return Some(mac);
+        }
+        attempts -= 1;
+        if attempts == 0 {
+            return None;
+        }
+        let deadline = interrupts::ticks().wrapping_add(1);
+        while interrupts::ticks() < deadline {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 pub struct I350 {
     mmio_base: u32,
     mac: Cell<[u8; 6]>,
@@ -392,14 +448,7 @@ impl I350 {
 
     fn configure(&self) -> Result<(), InitError> {
         let mac = if self.mac.get() == [0; 6] {
-            let ral = read_register(self.mmio_base, REG_RAL0);
-            let rah = read_register(self.mmio_base, REG_RAH0);
-            let mut mac = [0u8; 6];
-            mac[0..4].copy_from_slice(&ral.to_le_bytes());
-            mac[4..6].copy_from_slice(&(rah as u16).to_le_bytes());
-            if mac.iter().all(|&byte| byte == 0) || mac == [0xff; 6] {
-                return Err(InitError::InvalidMac);
-            }
+            let mac = read_mac_with_retry(self.mmio_base).ok_or(InitError::InvalidMac)?;
             self.mac.set(mac);
             mac
         } else {
@@ -521,6 +570,22 @@ impl I350 {
     pub fn mac_address(&self) -> [u8; 6] {
         self.mac.get()
     }
+
+    // link_status() was deliberately removed here after a real-hardware
+    // finding: unlike e1000e.rs (confirmed correct and safe at the same
+    // offset), reading REG_STATUS on this real I350 while it was the
+    // active interface consistently made the `nic`/`nic list` shell
+    // commands never reply at all, while every other command on the
+    // same connection (including `nic use N` itself) kept working fine
+    // and the machine's own uptime kept advancing normally (ruling out
+    // a crash/reset). I350's own register map moved substantially from
+    // the classic 82540EM layout for its multi-queue architecture (see
+    // this file's other REG_* comments); assuming STATUS stayed at the
+    // classic 0x0008 offset without confirming it against a real
+    // datasheet was the likely mistake. Do not re-add this without
+    // confirming the real offset first (e.g. via a Linux `ethtool -d`
+    // register dump on real I350 hardware, the same technique that found
+    // e1000e's TCTL fix elsewhere in this project).
 
     pub fn set_promiscuous(&self, enabled: bool) {
         let mut value = read_register(self.mmio_base, REG_RCTL);

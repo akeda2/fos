@@ -2185,15 +2185,40 @@ fn term_loop(write: impl Fn(u8), read: impl Fn() -> Option<u8>) {
 /// byte here to mean "give up" would silently eat the first character of
 /// whatever a serial operator was about to type.
 fn term_net(info: &BootInfo) {
-    let Some(nic) = nic_or_report() else { return };
-    let source = nic.mac_address();
-    let active_index = nic::active_index();
-    let interface_count = nic::count();
+    if nic_or_report().is_none() {
+        return;
+    }
     println!("Waiting for a remote terminal client to connect; press F12");
     println!("(or F4/F6/F7/F8/F10) to give up.");
 
     let mut recv_buffer = [0u8; nic::MAX_FRAME_LEN];
     loop {
+        // Re-fetched every time this outer loop starts a fresh wait for a
+        // HELLO, not just once at function entry: `nic use N` can change
+        // which interface is active between sessions (or even while
+        // still waiting for the first one), and a HELLO must be accepted
+        // on whichever interface is active *now* -- see this function's
+        // own real-hardware finding below for what a stale, boot-time-
+        // only snapshot here actually breaks.
+        //
+        // **Confirmed real-hardware finding**: with I219-LM/I350 support
+        // added to this kernel, switching the active interface away from
+        // NIC 1 mid-session (`nic use 2` or later) and then trying to
+        // reconnect `term_net` on that newly active interface silently
+        // never worked -- `nic`/`source`/`active_index` used to be
+        // captured exactly once, here, before this loop, so every
+        // subsequent reconnect cycle kept checking incoming HELLOs
+        // against whatever was active at boot (always NIC 1 in
+        // practice), even though `nic list`'s own `*` marker plainly
+        // showed a different interface as active by then. The interface
+        // the HELLO must arrive on, and the one this session then
+        // actually sends/receives through for its whole lifetime, were
+        // both silently stuck at the wrong NIC.
+        let Some(nic) = nic_or_report() else { return };
+        let source = nic.mac_address();
+        let active_index = nic::active_index();
+        let interface_count = nic::count();
+
         let peer = loop {
             if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
                 println!("Gave up waiting for a remote terminal client.");
@@ -2886,6 +2911,13 @@ fn report_nic_watchdog(result: nic::WatchdogResult) {
 }
 
 fn print_nic_health(nic: &nic::Nic) {
+    if let Some((speed, full_duplex)) = nic.link_status() {
+        println!(
+            "Link: {} Mb/s {}.",
+            speed,
+            if full_duplex { "full duplex" } else { "half duplex" }
+        );
+    }
     let health = nic.health();
     println!(
         "NIC health: Rx {} frame(s), Tx {} frame(s), {} recovery/recoveries,",

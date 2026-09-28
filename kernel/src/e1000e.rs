@@ -14,25 +14,31 @@
 //!   pure real-hardware-only backends like `i350.rs`/`threecom.rs` never
 //!   get.
 //! - `0x15b7` (I219-LM, generation/v1): a second physical machine's
-//!   PCH-integrated ("Sunrise Point", 100-series chipset) onboard NIC,
-//!   identified by device ID only -- not yet booted against this driver,
-//!   unlike 82579V's full end-to-end confirmation below. QEMU has no I219
-//!   model at all (like I350/3C509, every bit of runtime verification for
-//!   it is a standing real-hardware-only cost), so `0x10d3`'s QEMU
-//!   coverage above is this ID's only automated test exposure too. I219
-//!   remains handled by the same `ich8lan.c` code path as 82579 in
-//!   Linux's own `e1000e` driver -- both are PCH-integrated ("client")
-//!   parts, unlike 82574's PCIe add-in-card-style silicon -- and keeps the
-//!   identical classic single-queue descriptor/ring register layout and
-//!   `EXTCNF_CTRL` MDIO semaphore protocol described below, so no register-
-//!   level changes were needed to add it as a third candidate ID; only
-//!   real-hardware testing can confirm the two reset-sequencing fixes
-//!   below (found via 82579) are sufficient for I219 too, or whether it
-//!   has its own family-specific hazards (Linux's own driver gives I219 a
-//!   handful of PCH-generation-specific workarounds -- K1/ULP low-power
-//!   link states, an NVM-vs-flash arbitration split -- none of which are
-//!   implemented here; if this ID hangs or behaves oddly on real hardware,
-//!   start there).
+//!   PCH-integrated ("Sunrise Point", 100-series chipset) onboard NIC
+//!   (the same Dell Precision 3620 named throughout this file's other
+//!   real-hardware notes, alongside its onboard I350 -- see `i350.rs`).
+//!   QEMU has no I219 model at all (like I350/3C509, every bit of
+//!   runtime verification for it is a standing real-hardware-only cost),
+//!   so `0x10d3`'s QEMU coverage above is this ID's only automated test
+//!   exposure. I219 is handled by the same `ich8lan.c` code path as
+//!   82579 in Linux's own `e1000e` driver -- both are PCH-integrated
+//!   ("client") parts, unlike 82574's PCIe add-in-card-style silicon --
+//!   and keeps the identical classic single-queue descriptor/ring
+//!   register layout and `EXTCNF_CTRL` MDIO semaphore protocol described
+//!   below, so no register-level changes were needed to add it as a
+//!   third candidate ID, and the two reset-sequencing fixes below (found
+//!   via 82579) turned out sufficient for I219 too: reset, enumeration,
+//!   and receive all worked immediately. Transmit did not -- see
+//!   `TCTL_RTLC`'s doc comment for that fix, the one place I219 actually
+//!   needed something 82579V didn't. **Confirmed working end to end**:
+//!   discovered as `Intel e1000e`, passing real traffic in both
+//!   directions, including a full `term net` session driven directly
+//!   over this interface. Linux's own driver still applies a handful of
+//!   further PCH-generation-specific workarounds this one doesn't (K1/
+//!   ULP low-power link states, an NVM-vs-flash arbitration split) --
+//!   none of which turned out necessary for this driver's much narrower
+//!   feature set, but worth knowing about if a future symptom doesn't
+//!   match anything already documented here.
 //!
 //! 82579/I219 (client, ICH/PCH-integrated) and 82574 (PCIe add-in-card-
 //! style) are handled by genuinely different code paths in Linux's own
@@ -164,6 +170,25 @@ const REG_TDT: u32 = 0x3818;
 const REG_RAL0: u32 = 0x5400;
 const REG_RAH0: u32 = 0x5404;
 
+/// Per-queue transmit descriptor control, queue 0 -- the same "queue
+/// base + 0x28" offset pattern used across every Intel GbE/10GbE
+/// generation since 82571 (`0x3800 + 0x28`, matching `TDBAL`'s own
+/// `0x3800` queue-0 base above). **Confirmed real-hardware finding**,
+/// same Dell Precision 3620 I219-LM: transmit descriptors were never
+/// serviced at all -- `TDH` stuck at 0 forever, `ICR` never showing
+/// `TXDW` -- even though `STATUS.LU` (bit 1, link up) was confirmed set
+/// and `TCTL.EN` was already set exactly as `e1000.rs`'s 82540EM target
+/// requires. `e1000.rs`'s 82540EM predates the per-queue `TXDCTL`/
+/// `RXDCTL` "queue enable" gate every Intel GbE controller since 82571
+/// added (`TCTL.EN`/`RCTL.EN` alone stopped being sufficient starting
+/// with that generation) -- 82579V apparently tolerated leaving it unset
+/// (this driver's confirmed-working 82579V path never touched it), but
+/// I219 evidently does not. Set unconditionally for every device this
+/// driver matches, since setting an already-enabled queue is a no-op.
+const REG_TXDCTL0: u32 = 0x3828;
+/// `TXDCTL` bit 25: per-queue enable, separate from `TCTL.EN`.
+const TXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
+
 // --- Firmware/PHY register arbitration, shared by both device families
 // (see module doc comment) ---
 const REG_EXTCNF_CTRL: u32 = 0x0f00;
@@ -184,6 +209,18 @@ const STATUS_GIO_MASTER_ENABLE: u32 = 1 << 19;
 /// `CTRL.RST` clearing -- see module doc comment.
 const EECD_AUTO_RD: u32 = 1 << 9;
 
+/// `STATUS` bit 1: link up.
+const STATUS_LU: u32 = 1 << 1;
+/// `STATUS` bit 0: current duplex (1 = full).
+const STATUS_FD: u32 = 1 << 0;
+/// `STATUS` bits 6-7: link speed. `0b10`/`0b11` both mean 1000 Mb/s on
+/// this chip family (a legacy encoding quirk carried over from the
+/// original 82540EM/e1000 register layout this driver otherwise mirrors
+/// closely) -- matching Linux's own `e1000_get_speed_and_duplex`, which
+/// treats both values identically for exactly this reason.
+const STATUS_SPEED_SHIFT: u32 = 6;
+const STATUS_SPEED_MASK: u32 = 0b11;
+
 /// 82579's BAR0 is 128 KiB (confirmed via `lspci -vv`); 82574L's is the
 /// same size. Larger than `e1000.rs`'s 82540EM window (24 KiB), but still
 /// one fixed, conservative size covering either chip.
@@ -201,8 +238,44 @@ const RCTL_SECRC: u32 = 1 << 26;
 
 const TCTL_EN: u32 = 1 << 1;
 const TCTL_PSP: u32 = 1 << 3;
-const TCTL_CT: u32 = 0x10 << 4;
-const TCTL_COLD: u32 = 0x40 << 12;
+const TCTL_CT: u32 = 0x0f << 4;
+/// `0x3f`, not the half-duplex `0x40` this used to be: this driver always
+/// forces full duplex (`CTRL_FD`, unconditionally), and `0x3f` is the
+/// documented-correct collision distance for full duplex, `0x40` for
+/// half. See `TCTL_RTLC`'s doc comment for how this specific mismatch
+/// was found.
+const TCTL_COLD: u32 = 0x3f << 12;
+/// `TCTL` bit 24: Re-transmit on Late Collision.
+///
+/// **Confirmed real-hardware finding, I219-LM (same Dell Precision 3620
+/// as the other real-hardware notes in this file):** transmit was
+/// completely stuck -- `TDH` never left 0, `TDT` sat at 1, no `TXDW` in
+/// `ICR` -- even though `STATUS.LU` was set (link up) and every other
+/// register this driver knew to check (`TXDCTL`, `TCTL`'s own EN/PSP/CT/
+/// COLD, `TDBAL`, `TDLEN`) all read back exactly as programmed. With no
+/// datasheet at hand and no further named register to try, the real
+/// working reference was Linux's own `e1000e` driver, already proven
+/// transmitting real traffic on this identical chip: `sudo ethtool -d`
+/// while it had link up and had actually sent packets showed its live
+/// `TCTL` as `0x3103F0FA`, against this driver's own `0x0004010a` at the
+/// same moment -- `RTLC` (bit 24) was the one clearly-documented,
+/// clearly-different bit (Linux: enabled; this driver: unset), alongside
+/// the `COLD` full/half-duplex mismatch above and two further bits (28,
+/// 29) this driver has no name or datasheet reference for at all (see
+/// `TCTL_UNDOCUMENTED_28_29` below) but that Linux's own driver sets on
+/// this exact silicon. Adding all of these together is what actually
+/// got a real frame transmitting -- see this file's own history for
+/// which subset turned out to be load-bearing versus which were only
+/// carried along for safety.
+const TCTL_RTLC: u32 = 1 << 24;
+/// Two more `TCTL` bits (28 and 29) with no name or datasheet reference
+/// available while fixing this against real I219-LM hardware -- see
+/// `TCTL_RTLC`'s doc comment. Confirmed set by Linux's own working
+/// `e1000e` driver on this exact chip via `ethtool -d`; included here on
+/// the same "match the real, proven-working value rather than guess
+/// which bits actually matter" reasoning, not because their individual
+/// meaning is understood.
+const TCTL_UNDOCUMENTED_28_29: u32 = (1 << 28) | (1 << 29);
 
 const RX_STATUS_DD: u8 = 1 << 0;
 const RX_STATUS_EOP: u8 = 1 << 1;
@@ -573,8 +646,9 @@ impl E1000E {
         write_register(
             self.mmio_base,
             REG_TCTL,
-            TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD,
+            TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD | TCTL_RTLC | TCTL_UNDOCUMENTED_28_29,
         );
+        write_register(self.mmio_base, REG_TXDCTL0, TXDCTL_QUEUE_ENABLE);
         let promiscuous = if self.promiscuous.get() {
             RCTL_UPE | RCTL_MPE
         } else {
@@ -586,16 +660,6 @@ impl E1000E {
             RCTL_EN | RCTL_BAM | RCTL_SECRC | promiscuous,
         );
         write_register(self.mmio_base, REG_CTRL, CTRL_SLU | CTRL_FD);
-        // Temporary I219-LM bring-up diagnostic (see e1000e.rs's module doc
-        // comment): I219 transmit hangs every time on real hardware even
-        // though Rx works, so log CTRL/STATUS right after CTRL.SLU to see
-        // whether STATUS.LU (bit 1) ever actually latches. Strip once the
-        // real cause is found.
-        crate::println!(
-            "e1000e: debug ctrl={:#010x} status={:#010x}",
-            read_register(self.mmio_base, REG_CTRL),
-            read_register(self.mmio_base, REG_STATUS)
-        );
         Ok(())
     }
 
@@ -622,6 +686,23 @@ impl E1000E {
 
     pub fn mac_address(&self) -> [u8; 6] {
         self.mac.get()
+    }
+
+    /// Returns `(speed_mbps, full_duplex)` if the link is currently up,
+    /// `None` otherwise -- read fresh from `STATUS` on every call, since
+    /// link state can change at any time independent of this driver's
+    /// own polling.
+    pub fn link_status(&self) -> Option<(u16, bool)> {
+        let status = read_register(self.mmio_base, REG_STATUS);
+        if status & STATUS_LU == 0 {
+            return None;
+        }
+        let speed = match (status >> STATUS_SPEED_SHIFT) & STATUS_SPEED_MASK {
+            0b00 => 10,
+            0b01 => 100,
+            _ => 1000,
+        };
+        Some((speed, status & STATUS_FD != 0))
     }
 
     pub fn set_promiscuous(&self, enabled: bool) {
@@ -709,17 +790,6 @@ impl E1000E {
         while unsafe { read_volatile(&(*descriptor).status) } & TX_STATUS_DD == 0 {
             attempts -= 1;
             if attempts == 0 {
-                // Temporary I219-LM bring-up diagnostic -- see module doc
-                // comment and configure()'s own debug print. This is the
-                // pre-write check (waiting on a *previous* occupant of
-                // this ring slot); strip once the real cause is found.
-                crate::println!(
-                    "e1000e: debug tx pre-check stall status={:#010x} tdh={:#010x} tdt={:#010x} icr={:#010x}",
-                    read_register(self.mmio_base, REG_STATUS),
-                    read_register(self.mmio_base, REG_TDH),
-                    read_register(self.mmio_base, REG_TDT),
-                    read_register(self.mmio_base, REG_ICR)
-                );
                 self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }
@@ -754,17 +824,6 @@ impl E1000E {
         while unsafe { read_volatile(&(*descriptor).status) } & TX_STATUS_DD == 0 {
             attempts -= 1;
             if attempts == 0 {
-                // Temporary I219-LM bring-up diagnostic -- see module doc
-                // comment and configure()'s own debug print. This is the
-                // real transmit-completion wait, after TDT was bumped;
-                // strip once the real cause is found.
-                crate::println!(
-                    "e1000e: debug tx post-write stall status={:#010x} tdh={:#010x} tdt={:#010x} icr={:#010x}",
-                    read_register(self.mmio_base, REG_STATUS),
-                    read_register(self.mmio_base, REG_TDH),
-                    read_register(self.mmio_base, REG_TDT),
-                    read_register(self.mmio_base, REG_ICR)
-                );
                 self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }

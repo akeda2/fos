@@ -150,6 +150,21 @@ impl Nic {
         }
     }
 
+    /// Returns `(speed_mbps, full_duplex)` if the link is currently up.
+    /// Only implemented for `e1000e.rs` -- see `i350.rs`'s own removed
+    /// `link_status` for why I350 doesn't have this too: reading its
+    /// `STATUS` register at the classic `0x0008` offset (correct for
+    /// e1000e, unconfirmed for I350's own substantially relocated
+    /// register map) made real I350 hardware stop replying to `nic`/
+    /// `nic list` entirely. Every other backend reports `None` rather
+    /// than guessing at a register layout this project hasn't verified.
+    pub fn link_status(&self) -> Option<(u16, bool)> {
+        match self {
+            Nic::E1000E(nic) => nic.link_status(),
+            _ => None,
+        }
+    }
+
     /// Runs a bounded, device-specific reset only after the driver has
     /// observed a documented fatal condition (such as a DMA overrun or a
     /// transmit completion timeout). It never infers a failure merely from
