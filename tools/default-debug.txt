@@ -1,0 +1,15 @@
+# fos debug-mode configuration, included on every built image by default.
+# See AGENTS.md's "Debug mode" section for what each option does.
+# (Kept under debug.rs's 1024-byte DEBUG_FILE_CAPACITY -- keep it terse.)
+
+# Reboot instead of halting forever on a fatal CPU exception, after
+# printing the crash details for reboot-delay seconds.
+reboot-on-crash
+reboot-delay 3
+
+# Enable KUP so a new kernel can be pushed over Ethernet
+# (tools/send_kernel_update.py) instead of needing a fresh physical flash.
+kernel-update
+
+# crash-on-boot is test-only (tools/test_debug_mode_e2e.py); never enable
+# it here, it would crash every real boot.

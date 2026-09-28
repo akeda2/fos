@@ -1,33 +1,55 @@
-//! Intel 82574L/82579 ("e1000e" family) PCIe Gigabit Ethernet driver.
+//! Intel 82574L/82579/I219 ("e1000e" family) PCIe Gigabit Ethernet driver.
 //!
-//! Two candidate device IDs, for two different reasons -- the same "one
-//! confirmed real device, one QEMU model" shape `ac97.rs` uses, not a
+//! Three candidate device IDs, for three different reasons -- the same
+//! "one confirmed real device, one QEMU model" shape `ac97.rs` uses, not a
 //! speculative broadening across the wider e1000e device-ID family:
 //!
 //! - `0x1503` (82579V): confirmed real hardware, read via `lspci -vv`
 //!   against a physical ITX motherboard's onboard NIC. This is the actual
-//!   target this driver was built for.
+//!   target this driver was originally built for.
 //! - `0x10d3` (82574L): QEMU's own `-device e1000e` model. Sharing enough
 //!   of the classic e1000 register lineage (see below) that it exercises
 //!   the same ring/reset/send/receive plumbing this driver needs for
-//!   82579 too, giving this driver real `make test` coverage that pure
-//!   real-hardware-only backends like `i350.rs`/`threecom.rs` never get.
+//!   82579/I219 too, giving this driver real `make test` coverage that
+//!   pure real-hardware-only backends like `i350.rs`/`threecom.rs` never
+//!   get.
+//! - `0x15b7` (I219-LM, generation/v1): a second physical machine's
+//!   PCH-integrated ("Sunrise Point", 100-series chipset) onboard NIC,
+//!   identified by device ID only -- not yet booted against this driver,
+//!   unlike 82579V's full end-to-end confirmation below. QEMU has no I219
+//!   model at all (like I350/3C509, every bit of runtime verification for
+//!   it is a standing real-hardware-only cost), so `0x10d3`'s QEMU
+//!   coverage above is this ID's only automated test exposure too. I219
+//!   remains handled by the same `ich8lan.c` code path as 82579 in
+//!   Linux's own `e1000e` driver -- both are PCH-integrated ("client")
+//!   parts, unlike 82574's PCIe add-in-card-style silicon -- and keeps the
+//!   identical classic single-queue descriptor/ring register layout and
+//!   `EXTCNF_CTRL` MDIO semaphore protocol described below, so no register-
+//!   level changes were needed to add it as a third candidate ID; only
+//!   real-hardware testing can confirm the two reset-sequencing fixes
+//!   below (found via 82579) are sufficient for I219 too, or whether it
+//!   has its own family-specific hazards (Linux's own driver gives I219 a
+//!   handful of PCH-generation-specific workarounds -- K1/ULP low-power
+//!   link states, an NVM-vs-flash arbitration split -- none of which are
+//!   implemented here; if this ID hangs or behaves oddly on real hardware,
+//!   start there).
 //!
-//! 82579 (client, ICH/PCH-integrated) and 82574 (PCIe add-in-card-style)
-//! are handled by genuinely different code paths in Linux's own `e1000e`
-//! driver (`ich8lan.c` vs `82571.c`), not just two device IDs on one chip
-//! -- but both keep the classic single-queue legacy descriptor/ring
-//! register layout unchanged from `e1000.rs`'s 82540EM offsets (`CTRL`/
-//! `ICR`/`IMS`/`IMC`/`RCTL`/`TCTL`/`TIPG`/`RDBAL..RDT`/`TDBAL..TDT`/
-//! `RAL0`/`RAH0`), so this module's shape mirrors `e1000.rs` closely --
-//! same as `i350.rs` does for its own, differently-shaped chip family.
-//! **Both device families also use the identical `EXTCNF_CTRL.
+//! 82579/I219 (client, ICH/PCH-integrated) and 82574 (PCIe add-in-card-
+//! style) are handled by genuinely different code paths in Linux's own
+//! `e1000e` driver (`ich8lan.c` vs `82571.c`), not just three device IDs
+//! on two chips -- but all three keep the classic single-queue legacy
+//! descriptor/ring register layout unchanged from `e1000.rs`'s 82540EM
+//! offsets (`CTRL`/`ICR`/`IMS`/`IMC`/`RCTL`/`TCTL`/`TIPG`/`RDBAL..RDT`/
+//! `TDBAL..TDT`/`RAL0`/`RAH0`), so this module's shape mirrors `e1000.rs`
+//! closely -- same as `i350.rs` does for its own, differently-shaped chip
+//! family. **All three device IDs also use the identical `EXTCNF_CTRL.
 //! MDIO_SW_OWNERSHIP` firmware/PHY semaphore** (cross-checked directly
 //! against Linux's `e1000_get_hw_semaphore_82573`, reused by 82574, and
-//! `e1000_acquire_swflag_ich8lan`, used by 82579) -- an earlier version of
-//! this driver assumed 82574 used a different, I350-style mechanism and
-//! skipped the semaphore for it; that assumption was wrong, and the
-//! semaphore is now taken unconditionally for every matched device ID.
+//! `e1000_acquire_swflag_ich8lan`, used by 82579 and I219) -- an earlier
+//! version of this driver assumed 82574 used a different, I350-style
+//! mechanism and skipped the semaphore for it; that assumption was wrong,
+//! and the semaphore is now taken unconditionally for every matched
+//! device ID.
 //!
 //! **Two genuine reset-sequencing bugs were found and fixed after this
 //! driver hung real 82579V hardware at NIC init** (QEMU's 82574L model
@@ -110,8 +132,12 @@ const DEVICE_82579V: u16 = 0x1503;
 /// own untested sibling IDs.
 #[allow(dead_code)]
 const DEVICE_82579LM: u16 = 0x1502;
+/// I219-LM (generation/v1, "Sunrise Point" PCH-integrated) -- confirmed
+/// real hardware by device ID, on a second physical machine -- see module
+/// doc comment for what remains unverified.
+const DEVICE_I219LM: u16 = 0x15b7;
 
-const CANDIDATE_DEVICE_IDS: &[u16] = &[DEVICE_82574L, DEVICE_82579V];
+const CANDIDATE_DEVICE_IDS: &[u16] = &[DEVICE_82574L, DEVICE_82579V, DEVICE_I219LM];
 
 // --- Registers shared with e1000.rs's 82540EM layout (unchanged offsets;
 // both 82574L and 82579 keep this classic legacy single-queue layout,
@@ -560,6 +586,16 @@ impl E1000E {
             RCTL_EN | RCTL_BAM | RCTL_SECRC | promiscuous,
         );
         write_register(self.mmio_base, REG_CTRL, CTRL_SLU | CTRL_FD);
+        // Temporary I219-LM bring-up diagnostic (see e1000e.rs's module doc
+        // comment): I219 transmit hangs every time on real hardware even
+        // though Rx works, so log CTRL/STATUS right after CTRL.SLU to see
+        // whether STATUS.LU (bit 1) ever actually latches. Strip once the
+        // real cause is found.
+        crate::println!(
+            "e1000e: debug ctrl={:#010x} status={:#010x}",
+            read_register(self.mmio_base, REG_CTRL),
+            read_register(self.mmio_base, REG_STATUS)
+        );
         Ok(())
     }
 
@@ -673,6 +709,17 @@ impl E1000E {
         while unsafe { read_volatile(&(*descriptor).status) } & TX_STATUS_DD == 0 {
             attempts -= 1;
             if attempts == 0 {
+                // Temporary I219-LM bring-up diagnostic -- see module doc
+                // comment and configure()'s own debug print. This is the
+                // pre-write check (waiting on a *previous* occupant of
+                // this ring slot); strip once the real cause is found.
+                crate::println!(
+                    "e1000e: debug tx pre-check stall status={:#010x} tdh={:#010x} tdt={:#010x} icr={:#010x}",
+                    read_register(self.mmio_base, REG_STATUS),
+                    read_register(self.mmio_base, REG_TDH),
+                    read_register(self.mmio_base, REG_TDT),
+                    read_register(self.mmio_base, REG_ICR)
+                );
                 self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }
@@ -707,6 +754,17 @@ impl E1000E {
         while unsafe { read_volatile(&(*descriptor).status) } & TX_STATUS_DD == 0 {
             attempts -= 1;
             if attempts == 0 {
+                // Temporary I219-LM bring-up diagnostic -- see module doc
+                // comment and configure()'s own debug print. This is the
+                // real transmit-completion wait, after TDT was bumped;
+                // strip once the real cause is found.
+                crate::println!(
+                    "e1000e: debug tx post-write stall status={:#010x} tdh={:#010x} tdt={:#010x} icr={:#010x}",
+                    read_register(self.mmio_base, REG_STATUS),
+                    read_register(self.mmio_base, REG_TDH),
+                    read_register(self.mmio_base, REG_TDT),
+                    read_register(self.mmio_base, REG_ICR)
+                );
                 self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }

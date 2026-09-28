@@ -8,6 +8,12 @@ kernel. Boot stages emit explanatory messages to VGA text memory and COM1.
 Keep changes small and explainable; avoid general frameworks or abstractions
 that obscure hardware behavior.
 
+See NETWORKING.md for more networking stuff
+See AUDIO.md for audio interface stuff
+See DEFERRED.md for things put aside for now.
+
+Try not to fill up this file, put new stuff in the above files or under docs/
+
 ## Current architecture
 
 - `boot/stage1.S` is the 512-byte MBR loader. It loads stage two from LBA 2048.
@@ -329,7 +335,17 @@ of per-machine config file `hostname`/`start` already are -- see
 every secondary disk in order) so an ordinary deployment with no such file
 behaves exactly as it always has: a fatal exception halts the CPU, and the
 network kernel-update service does not even acknowledge its own protocol's
-frames. One line per option, `#` comments and blank lines ignored:
+frames. `tools/default-debug.txt` is written to every image's FOSFS data
+partition by default under the name `debug` (wired into `TAPE_IMAGE_ARGS`
+in the Makefile, alongside `router.cfg`), enabling `reboot-on-crash` and
+`kernel-update` out of the box -- this project's own default deployment
+target is a real, possibly remote/inconvenient-to-reflash test machine, so
+debug mode's whole point (unattended recovery, network kernel pushes
+instead of a fresh physical flash) should already be on rather than
+something every new image has to opt into by hand. Must stay under
+`debug.rs`'s `DEBUG_FILE_CAPACITY` (1024 bytes) or the whole file is
+ignored with a warning. One line per option, `#` comments and blank lines
+ignored:
 
 | Option | Effect |
 | --- | --- |
@@ -934,7 +950,7 @@ detail (the three register-layout differences from `e1000.rs`,
 scaffolding this module's effect on the reserved low-memory region) is in
 `docs/history/development-notes.md`.
 
-### e1000e: a sixth NIC backend, for Intel's 82574L/82579 family
+### e1000e: a sixth NIC backend, for Intel's 82574L/82579/I219 family
 
 `kernel/src/e1000e.rs` targets Intel's "e1000e" family -- motivated by a
 real, physically owned ITX motherboard whose onboard NIC is an 82579V,
@@ -944,17 +960,28 @@ real-hardware-only I350/3C509 drivers, this one also matches QEMU's own
 style QEMU coverage -- the same "one confirmed real device, one QEMU
 model" pairing `ac97.rs` uses, not a speculative broadening across the
 wider e1000e device-ID family. `0x1502` (82579LM) remains deliberately
-excluded until confirmed against a physical board carrying it.
+excluded until confirmed against a physical board carrying it. `0x15b7`
+(I219-LM, generation/v1, "Sunrise Point" PCH-integrated) was added as a
+third candidate ID once identified as a second physical machine's onboard
+NIC; it shares 82579's `ich8lan.c` code path and register layout in
+Linux's own driver, but -- unlike 82579V above -- has not yet actually
+been booted against this driver, and QEMU has no I219 model to exercise
+it either, so it carries the same standing real-hardware-only
+verification cost as I350/3C509 despite being enabled by default. See
+`kernel/src/e1000e.rs`'s own module doc comment for the PCH-generation-
+specific workarounds (K1/ULP, NVM-vs-flash arbitration) Linux's driver
+has for I219 that this one does not, in case that ID needs its own fix
+once tried on real hardware.
 
-82579 (client, ICH/PCH-integrated) and 82574 (PCIe add-in-card-style) are
-handled by genuinely different code paths in Linux's own `e1000e` driver,
-not just two device IDs on one chip -- but both keep the classic
-single-queue legacy descriptor/ring register layout unchanged from
-`e1000.rs`'s 82540EM offsets, unlike I350's moved-and-multi-queued
+82579/I219 (client, ICH/PCH-integrated) and 82574 (PCIe add-in-card-style)
+are handled by genuinely different code paths in Linux's own `e1000e`
+driver, not just three device IDs on two chips -- but all three keep the
+classic single-queue legacy descriptor/ring register layout unchanged
+from `e1000.rs`'s 82540EM offsets, unlike I350's moved-and-multi-queued
 register map, so this module's shape mirrors `e1000.rs` closely rather
 than needing `i350.rs`'s more extensive rework.
 
-Both device families use the identical `EXTCNF_CTRL.MDIO_SW_OWNERSHIP`
+All three device IDs use the identical `EXTCNF_CTRL.MDIO_SW_OWNERSHIP`
 firmware/PHY semaphore, taken unconditionally around reset for every
 matched device ID.
 
@@ -1923,187 +1950,6 @@ serial-typed byte can incur up to one PIT tick of added latency once the
 machine is truly idle and halting. Full detail (the throughput-regression
 verification this required) is in `docs/history/networking-and-discovery.md`.
 
-## Real-time audio streaming: the ES1370 driver, and Intel HD Audio
-
-`kernel/src/es1370.rs` and `kernel/src/hda.rs` are two independent PCI
-sound-card drivers, exposed to tapes through a shared, format-agnostic
-facade (`kernel/src/audio.rs`, mirroring `nic.rs`'s own multi-backend
-shape) and the `audio`/`hda` shell commands. ES1370 (Ensoniq/Creative
-"Sound Blaster PCI", QEMU's `-device ES1370`) implements DAC1 (playback,
-one always-on stereo 16-bit channel with a default test tone) and ADC
-(recording) as two independent, simultaneously running DMA channels, with
-up to `MAX_INSTANCES` (4) cards supported at once. Intel HDA ("HD Audio",
-QEMU's `-device intel-hda` + a codec such as `hda-duplex`) is a genuinely
-different architecture -- a generic CORB/RIRB DMA command-transport engine
-talking to one or more codecs on a private bus, each exposing a node graph
-(root -> Audio Function Group -> DAC/ADC/pin-complex widgets) -- with
-stream-descriptor/BDL-based playback and capture, real per-codec channel-
-count negotiation (`AC_WCAP_CHAN_CNT_EXT`, up to `MAX_NEGOTIATED_CHANNELS` =
-8), and up to `MAX_INSTANCES` (2) controllers supported at once.
-
-The tape ABI's audio callbacks (trailing, append-only cdecl, after the
-`nic_*`/`ticks` set): `audio_sample_rate`/`audio_channels_and_bits`/
-`audio_submit`/`audio_capture` (device 0 only, kept for backward
-compatibility) and their indexed counterparts `audio_count`/
-`audio_sample_rate_at`/`audio_channels_and_bits_at`/`audio_submit_at`/
-`audio_capture_at`. `audio_submit`/`_at` push raw PCM into a lock-free,
-network-fed ring (`PcmRing`, 16 KiB per direction per device -- a real,
-measured link-time codegen ceiling, not an arbitrary choice) that the
-DAC's own ISR drains each period; calling it at all permanently switches
-that device from its default test tone into network-fed mode.
-`tapes/audio-net/` is the reference tape: `tape run` (listen mode, receiving
-one or more per-device-tagged network sub-streams and forwarding them to
-local playback), `tape run send NAME [MAC]` (replays a pre-recorded FOSFS
-file), and `tape run capture [MAC]` (genuine live-microphone streaming,
-round-robining every local device via `audio_capture_at`).
-
-HDA's own sample rate and bit depth are negotiated, not fixed: `hda.rs`
-queries a discovered DAC widget's `AC_PAR_PCM` capability and prefers
-48 kHz over 44.1 kHz and 24-bit over 16-bit whenever the widget actually
-advertises support, falling back to the historical 44.1 kHz/16-bit
-baseline otherwise (`negotiate_format`) -- unlike channel count, which
-was already negotiated this way via `AC_WCAP_CHAN_CNT_EXT`, this was
-previously just a hardcoded `0x4010` format value, chosen for parity with
-ES1370, not a hardware limit HDA silicon actually has. ES1370 itself is
-unaffected: it is genuinely silicon-limited to 44100 Hz/16-bit (only 4
-hardwired rates, format field only encodes 8/16-bit PCM). **24-bit
-specifically cannot be exercised under QEMU at all**: its synthetic HDA
-codec only ever implements 16-bit PCM (`QEMU_HDA_PCM_FORMATS` in
-`hda-codec-common.h`), so that path is real-hardware-only, exactly like
-this section's own already-documented "unverified against real
-hardware" status below -- and the 24-bit sample container size (a 4-byte
-container per sample, matching Linux ALSA's `S24_LE` convention, chosen
-over RFC 3190's tightly-packed 3-byte wire convention) is a documented
-assumption pending that same real-hardware confirmation, not a verified
-fact.
-
-Both drivers are, as of this writing, unverified against real hardware
-(every register offset/bit/DMA semantic was cross-checked directly against
-QEMU's own emulation source, the same rigor applied to every other driver
-here after the RTL8139 lessons in "Real hardware notes" above) -- the
-user's box of physical Sound Blaster PCI/HDA cards is the intended
-validation target. A real, previously-undiscovered kernel bug (two PCI
-devices sharing one legacy IRQ line silently broke whichever device's
-`init()` ran second) was found and fixed while testing this feature; see
-"shared PCI IRQ lines" above. Real-microphone testing on a dev machine
-surfaced two host-side QEMU/PipeWire pitfalls and one seat0/logind
-device-ACL gotcha, unrelated to fos itself.
-
-The full chronological development history -- the ES1370 interrupt-storm
-bug (a level-triggered status bit the driver never acknowledged, causing an
-interrupt storm that looked exactly like "no interrupt fired"), the
-`.bss`/link-budget investigation behind `PcmRing`'s sizing, multi-instance
-ES1370, the audio-net wire-protocol's per-device tagging design, and every
-HDA increment (discover-only, CORB/RIRB + node-graph enumeration,
-multi-controller, stream-DMA playback, capture, and multichannel
-negotiation) -- is in `docs/history/audio-hda.md`.
-
-## AC'97: a third audio backend, and reduced ES1370 headroom to make room for it
-
-`kernel/src/ac97.rs` is a third PCI sound driver, alongside ES1370 and HDA,
-for Intel's ICH-family AC'97 ("Native Audio Mixer" / "Native Audio Bus
-Master") controller -- motivated by a real, physically owned machine (the
-Pentium 4/ICH4 test box used throughout this file's real-hardware
-sections) whose onboard audio is otherwise permanently inaccessible: fos
-has no driver for any other codec family that chipset exposes. It is
-QEMU's own emulated sound device too (`-device AC97`, PCI ID `8086:2415`,
-Intel's original `82801AA`), so, unlike the still-fully-real-hardware-only
-I350/3C509 drivers, this one gets real `make test`-style QEMU coverage.
-`ac97::CANDIDATE`-equivalent discovery matches exactly two IDs: `0x2415`
-(QEMU's own model) and `0x24d5` (the confirmed real ICH4 device) -- a
-deliberately narrow pair, not a speculative broadening across every
-ICH-generation ID, even though Intel's own AC'97 register layout is
-documented backward-compatible across generations.
-
-**Scope: playback-only, no network-fed streaming yet.** Only the PCM-out
-bus-master channel is programmed (no PCM-in/mic-in), always playing a
-built-in test tone; `ac97::MAX_INSTANCES` is 1 (a motherboard
-south-bridge function, never more than one per real machine).
-
-Fitting this driver in required correcting a real measurement bug in
-this project's own "check `size build/kernel.elf`" convention (summing
-its text/data/bss columns ignores `linker.ld`'s `ALIGN(4096)` padding
-gaps -- see "Low-memory map" above for the corrected `__kernel_end`-based
-guidance) and reclaiming `.bss` headroom by dropping
-`es1370::MAX_INSTANCES` from 4 to 2. A real interrupt-storm bug (an
-unacknowledged `SR_FIFOE` status bit re-firing the shared PCI IRQ line)
-was found and fixed while bringing this driver up under QEMU -- the same
-class of bug `es1370.rs`'s own `acknowledge_dac1` doc comment already
-describes, now hit a second time in a second driver.
-
-**Confirmed on the real P4/ICH4 machine this driver targets -- but that
-machine's onboard AC'97 has no physical codec behind it.** Both BAR0 and
-BAR1 read back as a hard `0` even after `PciAddress::assign_io_bar`'s
-fallback-assignment attempt, in full D0 power -- per the PCI spec, this
-means no register storage exists behind either BAR in silicon at all,
-not a firmware oversight: this specific board's ICH4 south bridge
-exposes the AC'97 function in PCI config space without an actual codec
-chip ever populated (audio was a discrete add-in-card option on boards
-of this era). The driver itself is otherwise confirmed correct end to
-end under QEMU.
-
-Full detail (the exact register-level layout cross-checked against
-QEMU's `hw/audio/ac97.c`/`ac97.h` source, the sliding-`LVI` ring
-technique's own derivation, the alignment-padding investigation
-narrative, and the full real-hardware BAR-assignment investigation) is in
-`docs/history/audio-hda.md`.
-
-## Real-time audio streaming over RTP/UDP: the `audio-rtp` tape
-
-`tapes/audio-rtp/` streams the same raw PCM audio `audio-net` does, but
-over genuine RTP (RFC 3550) carried in UDP/IPv4 instead of a bespoke
-raw-Ethernet tag protocol, so a real tool (`ffmpeg`, `gstreamer`, any RTP
-client) can send to or receive from `fos` directly, not just another fos
-instance. `tapes/tape-net/src/lib.rs` gained a matching `RtpPacket` type
-(parse/encode over borrowed slices/caller-owned buffers) and a
-`sequence16_at_or_after` wraparound helper; see `NETWORKING.md`'s "RTP
-scope"/"`tapes/audio-rtp`" sections for the full wire-format design.
-Format is adaptive, not fixed: the tape maps the local device's actual
-format to one of a small set of RTP payload types it understands (RFC
-3551's `L16`/44100/stereo = PT 10 for ES1370; two documented dynamic-range
-conventions for HDA's negotiable 48 kHz/16-bit and 48 kHz/24-bit) and
-rejects anything else outright rather than generalizing. Scope is device 0
-only per invocation: `listen`/`send`/`capture` each drive exactly one
-direction; `duplex PEER_IP [PEER_PORT]` is the one mode that drives both
-directions at once (still device 0 only), over one shared local UDP port
-(always `DEFAULT_PORT`/5004).
-
-Opus support (`tapes/opus-codec/`, this project's first vendored C
-dependency, built from libopus 1.5.2's fixed-point, decode-and-encode
-source tree by the root Makefile's `opus-codec-lib` recipe) adds a fourth
-fixed dynamic payload type, `PAYLOAD_TYPE_OPUS` (98): `listen_mode`
-decodes it via a persistent `opus_codec::Decoder`, and `send`/`capture`/
-`duplex` accept `[opus] ... [BITRATE]` (default
-`opus_codec::DEFAULT_BITRATE_BPS`, 96 kbps) to encode via
-`opus_codec::Encoder`. Both directions are gated to HDA's negotiated
-16-bit/48 kHz-family format specifically (ES1370's fixed 44100 Hz doesn't
-match libopus's five accepted rates, and this vendored build has no float
-API so it only ever produces/consumes 16-bit PCM). The decoder/encoder
-state buffer is allocated through the tape ABI's own `alloc`/`free`
-callbacks (`custom_support.h` redirects libopus's internal
-`opus_alloc`/`opus_free`), and `config.h` uses libopus's
-`NONTHREADSAFE_PSEUDOSTACK` scratch-allocation mode rather than
-`VAR_ARRAYS`, since the encoder's SILK pipeline needs more scratch than
-fos's kernel stack guard page tolerates when tapes run nested inside the
-shell's own call chain.
-
-Verified end to end by `tapes/test_audio_rtp_e2e.py` (raw PCM),
-`test_audio_rtp_opus_e2e.py`/`test_audio_rtp_opus_send_e2e.py` (Opus
-decode/encode against a real Intel HDA QEMU guest), and
-`test_audio_rtp_duplex_e2e.py` (concurrent duplex). Confirmed against the
-real TerraTec Aureon Dual USB card (via `usb-host` passthrough, the same
-device the UHCI section above uses): this surfaced a real bug -- capture
-code was reusing the *playback* format for a device whose two directions
-differ (stereo playback, mono capture) -- fixed by `capture_local_format()`
-sourcing from the tape ABI's dedicated `audio_capture_sample_rate`/
-`audio_capture_channels_and_bits` callbacks instead of `local_format()`;
-`duplex opus` against the real card now plays and captures correctly
-labeled audio simultaneously. Real-hardware interop with a genuine,
-unmodified `ffmpeg` session, and the 24-bit path this tape's format table
-already accounts for, remain future work. Full detail (the Opus
-stack-overflow investigation, every e2e test's verification methodology,
-and the real-hardware duplex bug narrative) is in
-`docs/history/audio-hda.md`.
 
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 
@@ -2142,217 +1988,3 @@ MSI-driven audio capture/playback. Full detail (the exact register-level
 MSI address/data encoding, and the full verification list) is in
 `docs/history/development-notes.md`.
 
-## Deliberately deferred work
-
-- Per-process paging/isolation, heap allocation, filesystems beyond FOSFS,
-  userspace, scheduling,
-  further hardware IRQ drivers beyond the timer/keyboard, robust
-  fault recovery, any protocol above raw Ethernet frames (no ARP, no IPv4,
-  no sockets), and support for NIC families beyond the current RTL8139,
-  selected 3C905, Intel e1000, and NE2000-compatible backends. USB itself
-  is no longer fully deferred -- see "UHCI: a USB host controller driver,
-  and isochronous USB Audio playback" above for what's built (enumeration,
-  isochronous OUT/playback, isochronous IN/capture via `usb capture`, and
-  `audio.rs`/tape-ABI integration for both directions, confirmed running
-  genuinely concurrently on real hardware); EHCI/OHCI/xHCI remain
-  deferred, and no tape yet exercises simultaneous playback+capture
-  through the tape ABI itself even though the underlying engine now
-  supports it. USB Mass Storage (Bulk-Only Transport) is also built,
-  wired into `disk.rs` as an ordinary secondary disk, and can also
-  transparently take over `disk::Device::Boot` itself -- see "USB Mass
-  Storage (Bulk-Only Transport)", "Wiring USB Mass Storage into
-  `disk.rs`", and "Closing the Pentium 4 gap for real" above -- via the
-  explicit `usb storage attach`/`usb storage promote` shell commands
-  (never automatic at boot). `reboot soft`'s own from-scratch,
-  BIOS-dependent kernel reload remains a separate, deliberately
-  unaddressed gap even once `disk1` is promoted -- see that section's
-  own closing paragraph.
-- A native ATA/AHCI disk driver. The current protected-mode-to-real-mode BIOS
-  trampoline is educational and intentionally narrow, not a scalable disk
-  architecture.
-- Broad physical-machine support. The documented target requires legacy BIOS,
-  BIOS EDD/LBA, E820, VGA text, COM1, and PS/2-compatible input. QEMU is the
-  primary validation environment.
-
-### MSI-X: still deferred
-
-Plain MSI (one vector, capability ID `0x05`) is now built -- see "MSI/MSI-X
-support" above. MSI-X (capability ID `0x11`) is a different, table-based
-mechanism (a per-entry MMIO table rather than fixed config-space
-registers, and support for many more vectors per device) that no current
-consumer needs: `hda.rs`'s single vector is enough for one controller's
-interrupt stream, and every other backend either has no MSI capability at
-all (ES1370) or hasn't been converted (the NIC family). Worth building if
-a future device (a real, physically tested I350, most plausibly) turns
-out to need per-queue vector affinity -- not a prerequisite for anything
-working correctly today, including I350's still-empty
-`CANDIDATE_DEVICE_IDS`.
-
-Multi-core and a genuinely `hlt`-and-wake-redesigned polling loop (as
-opposed to the single idle-prompt-loop-scoped "HLT-on-idle" feature
-above, which only covers the one loop that's actually idle, not NIC-
-receive-dependent loops) remain the two things that would make MSI's
-lower, non-shared delivery latency start to matter beyond what it already
-does (removing the shared-legacy-line hazard). See "Cooperative/
-preemptive scheduling" below for why multi-core specifically remains
-deferred.
-
-### Cooperative/preemptive scheduling: investigated, not yet built
-
-A genuine scheduler would need per-task stacks and a fixed-size TCB table
-(no heap exists), a context-switch primitive, and a cooperative-vs-
-preemptive choice -- but by far the most expensive part would be auditing
-every place this kernel assumes single-threaded execution, most critically
-`disk.rs`'s BIOS real-mode trampoline, which cannot tolerate any
-concurrent execution during its brief real-mode window. `poll_background_work`
-(above) already gets the low-cost share of the benefit (kernel-native
-recurring work shared across existing polling loops) with none of that
-audit cost, and no tape currently needs to run in the background while the
-shell keeps working. **Revisit a real scheduler only if a future tape or
-workload genuinely needs concurrent execution.** Full detail (the
-investigation that led to this conclusion) is in
-`docs/history/development-notes.md`.
-
-### ISA bus support and the 3C509: investigated, not yet built
-
-Every NIC backend today is found through `pci.rs`'s PCI configuration-space
-walk; this project has no ISA bus code at all. A 3Com 3C509 was considered
-as a next NIC target and investigated, but deliberately not started: ISA
-Plug-and-Play discovery (an LFSR wake-up key sequence and a serial-
-identification/CSN-assignment protocol) is a real, standalone `isa.rs`
-subsystem this project has never needed, while the register-level driver
-itself would actually be simpler than the PCI backends already built.
-QEMU has no 3C509 model at all, so unlike every PCI backend this driver
-would have no automated `make test` coverage ever -- a standing,
-real-hardware-only cost. Full detail (the discovery-protocol tradeoffs
-considered) is in `docs/history/development-notes.md`.
-
-Floppy drive support was investigated but not built: this project's disk
-stack is built exclusively around INT 13h's *extended* (`AH=42h`) LBA
-read/write service, while real floppy BIOS support is legacy CHS
-(`AH=02h`/`03h`/`08h`) -- a genuinely different BIOS call convention needing
-its own CHS conversion, plus a drive-number parameter the trampoline call
-ABI does not have today. QEMU emulates this well (`-fda`/`isa-fdc`), so
-unlike the 3C509 this would keep full automated test coverage. A full
-accepted design (per-drive geometry caching via `AH=08h`, a new `floppy`
-command namespace alongside the untouched existing disk commands, and the
-accepted `A`/`B`-vs-file-name-collision edge case) is recorded in
-`docs/history/development-notes.md`, along with why a native FDC/8237-DMA
-driver and floppy-boot support were both set aside.
-
-A second (non-boot) hard disk (BIOS drive `0x81`, `0x82`, ...) is supported
-for config/log storage without touching the boot image, discovered at boot
-via `AH=41h`/`AH=48h` against each candidate drive number. Every FOSFS
-command (`ls`/`cat`/`write`/`rm`/`format`/`diskinfo`/`readsector`) accepts
-an optional leading `diskN` argument (`disk1` is the boot disk, the
-existing default; omitting it is unchanged from before this feature).
-`copy SRC_DISK NAME DST_DISK [NEW_NAME]` copies a file directly between two
-disks through the shared `pmem::TAPE_BASE`/`TAPE_LEN` staging buffer;
-`tape load diskN NAME`/`tape save diskN NAME` and `tape run`'s
-`@diskN/NAME` startup-argument syntax, and the tape filesystem callback
-ABI's `diskN/NAME`-prefixed references (`tapes/ed`, `tapes/router`'s
-`dhcp-lease-file`), all reuse the same `strip_disk_selector` parsing rule.
-The optional boot-time `start` script also falls back to `disk2` if
-`disk1` has none, and an interactive `start` command lets an operator
-manually re-run it (e.g. after F12-ing out of a long-running tape) without
-a full reboot.
-
-Full design/implementation detail, plus two bugs found and fixed along the
-way (a real double fault from `start` traced to inlining collapsing
-`execute`'s stack frame plus a too-small kernel stack for one extra level of
-nested `execute` calls, fixed by `#[inline(never)]` on large command
-handlers and doubling the kernel stack to 64 KiB; and `help`'s own output
-wrapping/scrolling itself out of an 80x25 screen), are in
-`docs/history/development-notes.md`.
-
-## A tape that visits 64-bit long mode and comes back
-
-`tapes/longmode64_shim.S` + `tapes/longmode.S` together are a hand-written
-tape that jumps the running 32-bit kernel into 64-bit long mode, proves it
-got there, and jumps back -- entirely inside one `tape run` call, leaving
-the kernel's own GDT, page tables, and IDT untouched once it returns. This
-is a small, one-shot, fully reversible demonstration of the mode switch
-itself, not the same thing as "Deferred optional x86-64 path" below (a
-permanent, parallel 64-bit boot target built from the ground up).
-
-The design splits into a reusable, privileged shim
-(`tapes/longmode64_shim.S`: the `tape_main` entry point, the CPUID
-long-mode check with its own early-return path, identity-mapped page
-tables, a private GDT, and the full CR0/CR3/CR4/EFER/GDTR/EFLAGS save-and-
-restore around the transition) and one implementation of a narrow
-`tape64_body` contract it calls once safely landed in 64-bit mode with
-interrupts off: an ordinary SysV64 `extern "C" fn()`, no arguments, no
-return value, free to do whatever it wants and expected to return via a
-plain `ret`. `tapes/longmode.S` implements it in hand-assembled `.code64`
-(hex-dumping a 64-bit-only immediate straight to VGA text memory, since
-calling back through the 32-bit `putc` callback would need a second nested
-mode transition); `tapes/longmode-rs/` implements the identical contract
-in ordinary `#![no_std]` Rust instead, as a `staticlib` crate with no
-`_start` of its own, using a new, genuinely 64-bit
-`targets/x86_64-fos-tape.json` (SSE/MMX/AVX disabled, `"rustc-abi":
-"softfloat"`, since the kernel never sets CR4.OSFXSR/OSXMMEXCPT;
-`"code-model": "small"`, not `"kernel"`, since this tape loads low at
-`pmem::TAPE_BASE`) -- proof the shim/body split is a real, reusable
-boundary, not just a refactor. Interrupts stay off for the whole excursion
-since the kernel's IDT is a 32-bit-format IDT, invalid to service while
-CR0/CR3/CR4/EFER/GDTR are mid-transition.
-
-Because x86-64 ELF relocations are RELA-style (unlike `primes.S`'s
-REL-style x86-32 relocations, which let a linker-free `as`+`objcopy`
-pipeline work), both variants need a real `ld` link step:
-`ld -Ttext=0x100000 --oformat=elf64-x86-64 -e tape_main` against the
-assembled/compiled objects, before `objcopy -O binary`. Neither variant's
-real 64-bit excursion can be exercised under `qemu-system-i386` (its TCG
-backend cannot emulate the long-mode CPUID bit at all); `tapes/
-test_longmode_e2e.py` and `tapes/test_longmode_rs_e2e.py` are the only two
-e2e tests in this repository that launch `qemu-system-x86_64` instead.
-Confirmed working on real hardware too: a Pentium 4 correctly took the
-graceful no-long-mode-support path, and an AMD Athlon 64 X2 completed the
-full round trip. Built with `make tape-longmode`/`make tape-longmode-rs`.
-Full detail (the exact register save/restore sequence and page-table
-layout) is in `docs/history/development-notes.md`.
-
-## Deferred optional x86-64 path
-
-Do not treat x86-64 as a compiler-target switch. BIOS begins in real mode; the
-64-bit path needs CPUID long-mode detection, a 32-bit transition, PAE, identity
-mapped early page tables (a 1 GiB 2 MiB-page map is a good initial teaching
-layout), EFER.LME, paging enablement, and a far transfer to long mode.
-
-Implement it as a parallel, optional boot path that retains the working
-32-bit kernel as fallback. Add a separate `x86_64-unknown-none` target,
-64-bit linker/entry code, and an explicitly versioned or architecture-neutral
-boot ABI. Keep VGA, serial, PS/2, shell, FOSFS format, and command policy
-portable while separating port I/O, CPU setup, interrupt entry, and pointer
-conversions into architecture modules.
-
-The 32-bit BIOS trampoline cannot be called unchanged by a long-mode kernel.
-For an initial x86-64 milestone, make post-boot FOSFS access read-only or defer
-it; prefer a native disk driver before attempting a 64-bit-to-real-mode
-transition that preserves full 64-bit state.
-
-Could this eventual path be prototyped as a tape first, the way
-`tapes/longmode.S` above proves the mode switch itself? For early,
-incremental work, plausibly yes, and it may be the better place to
-start: a tape needs no boot loader, disk image, or partition layout
-changes at all to iterate on, and most of what a real 64-bit path needs
-early on -- VGA, serial, and PS/2 drivers re-hosted as native 64-bit
-code, a 64-bit interrupt/exception setup, more generous page tables --
-is just port I/O and MMIO with no real-mode dependency, exactly the kind
-of thing that translates cleanly into a long, ambitious tape built on
-`tapes/longmode.S`'s pattern. Two real limits stop that pattern from
-covering the *whole* eventual path, though. First, disk I/O fundamentally
-needs BIOS EDD calls, which need real mode: a tape wanting real FOSFS
-access from 64-bit code would need its own, more elaborate 64-bit ->
-32-bit -> 16-bit -> BIOS -> back-up trampoline (a taller version of the
-one `kernel/src/disk.rs` already has for 32-to-16), or a native
-AHCI/ATA driver -- already listed above as deferred work either way.
-Second, and more fundamentally: a tape that *never returns* -- that
-becomes the environment for the rest of the boot, instead of a bounded
-excursion back to the 32-bit shell -- stops being "just a tape" in any
-meaningful sense and starts being exactly this section's "parallel,
-optional boot path", just entered via `tape run` instead of the boot
-loader's partition layout. That may still be a genuinely useful way to
-begin (no disk image to touch while the shape of things is still
-changing), with promotion to a real, dedicated boot entry point coming
-later, once/if this path becomes serious enough to be more than a demo.

@@ -48,7 +48,8 @@ TAPE_IMAGE_ARGS := \
 	--file router.bin $(TAPE_ROUTER_BIN) \
 	--file net-dhcp.bin $(TAPE_NET_DHCP_BIN) \
 	--file audio-rtp.bin $(TAPE_AUDIO_RTP_BIN) \
-	--file router.cfg tapes/router/router.cfg
+	--file router.cfg tapes/router/router.cfg \
+	--file debug tools/default-debug.txt
 EXTRA_FOSFS_FILES ?=
 
 # Every cargo invocation below (the kernel plus every Rust tape) shares this
