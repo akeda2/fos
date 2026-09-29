@@ -497,7 +497,13 @@ OPUS_CODEC_VENDOR := tapes/opus-codec/vendor/opus
 OPUS_CODEC_SOURCES := $(wildcard $(OPUS_CODEC_VENDOR)/celt/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/silk/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/silk/fixed/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/src/*.c)
 OPUS_CODEC_OBJS := $(patsubst $(OPUS_CODEC_VENDOR)/%.c,$(BUILD)/tapes/opus-codec/%.o,$(OPUS_CODEC_SOURCES))
 OPUS_CODEC_LIB := $(BUILD)/tapes/opus-codec/libopus_fixed.a
-OPUS_CODEC_CFLAGS := -O2 -m32 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -msoft-float -ffunction-sections -fdata-sections -DHAVE_CONFIG_H -Itapes/opus-codec -I$(OPUS_CODEC_VENDOR)/include -I$(OPUS_CODEC_VENDOR)/celt -I$(OPUS_CODEC_VENDOR)/silk -I$(OPUS_CODEC_VENDOR)/silk/fixed
+# -U_FORTIFY_SOURCE: some host toolchains (e.g. newer Ubuntu/Fedora gcc
+# spec files) enable _FORTIFY_SOURCE by default even for -ffreestanding
+# builds, which rewrites memcpy/memset calls to __memcpy_chk/__memset_chk.
+# Those _chk symbols live in glibc, not this freestanding i386 target, so
+# they end up undefined at link time; force fortify off explicitly instead
+# of depending on whichever host happens not to default it on.
+OPUS_CODEC_CFLAGS := -O2 -m32 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -msoft-float -ffunction-sections -fdata-sections -U_FORTIFY_SOURCE -DHAVE_CONFIG_H -Itapes/opus-codec -I$(OPUS_CODEC_VENDOR)/include -I$(OPUS_CODEC_VENDOR)/celt -I$(OPUS_CODEC_VENDOR)/silk -I$(OPUS_CODEC_VENDOR)/silk/fixed
 
 $(BUILD)/tapes/opus-codec/%.o: $(OPUS_CODEC_VENDOR)/%.c tapes/opus-codec/config.h tapes/opus-codec/custom_support.h
 	mkdir -p $(dir $@)
