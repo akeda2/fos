@@ -307,10 +307,16 @@ as `diskN` (`disk2`, `disk3`, ...); `disk1` always means the boot disk.
 Unlike the boot disk, a secondary disk has no GPT and no reserved low
 region -- it is one flat FOSFS volume starting at LBA 0, covering the whole
 probed drive, formatted directly with `format diskN`. `diskinfo`,
-`readsector`, `format`, `ls`, `cat`, `write`, and `rm` all accept an optional
+`readsector`, `format`, `ls`, `cat`, `write`, `rm`, `print`, `usb play`, `usb
+capture`, `tape load`, `tape save`, and `tape send` all accept an optional
 leading `diskN` selector (`disk1` may always be omitted, as shown in the
 command table above); an absent or malformed selector is treated as an
-ordinary argument rather than guessed at. This is meant for a lab machine's
+ordinary argument rather than guessed at. Every one of these accepts the
+selector written either as its own word (`cat disk2 NAME`) or joined to the
+name with a `/` (`cat disk2/NAME`), exactly like `@diskN/NAME` and
+`HOST[:diskN]/NAME` already do below -- a literal `/` is unambiguous as the
+disk/name separator, since FOSFS names can never legally contain one. This is
+meant for a lab machine's
 own config/log storage (e.g. a second USB thumb drive) kept separate from
 the tapes/data disk the build produces, not for booting -- a secondary disk
 is never GPT-formatted, partitioned, or written to by `tools/build_image.py`.
@@ -341,6 +347,11 @@ NAME` (e.g. `tape load disk2 router.bin`) joins `tape load disk`/`tape load
 net` as a third `kind` word rather than needing a separate syntax --
 `disk` alone is really just `disk1` spelled the historical way, so any
 other `diskN` selector reads that same way.
+
+`load` and `run` are also accepted bare, without the leading `tape` word, as
+shorthand for `tape load`/`tape run` -- the two tape subcommands used often
+enough that spelling out `tape` every time was pure friction. `tape status`,
+`tape save`, and `tape send` still require the `tape` prefix.
 
 `term` repurposes COM1 as a raw link to a remote machine by default, matching
 real hardware where most physical machines expose only one serial port.

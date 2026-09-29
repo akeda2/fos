@@ -479,8 +479,9 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "Disk: diskinfo/readsector/format/ls/cat/write/rm [diskN], copy SRC NAME DST"
                 );
                 println!(
-                    "      (disk1 is the boot disk, N may be omitted; disk2, disk3... are extras)"
+                    "      (disk1 is the boot disk, N may be omitted; disk2, disk3... are extras;"
                 );
+                println!("      diskN NAME may also be written diskN/NAME)");
                 println!(
                     "      start (rerun the boot 'start' script, e.g. after F12 from a tape)"
                 );
@@ -490,11 +491,13 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!(
                     "Ethernet: nic [list|use N|send|sniff|discover|peers], chat [PEER_MAC|N]"
                 );
-                println!("Tape: tape status | tape run [ARGS...|@FILE|@diskN/FILE]");
                 println!(
-                    "      tape load disk[N] NAME | tape load net | tape save [diskN] NAME"
+                    "Tape: tape status | tape run [ARGS...|@FILE|@diskN/FILE] ('load'/'run' work"
                 );
-                println!("      tape send NAME PEER");
+                println!(
+                    "      without 'tape' too) | tape load disk[N] NAME | tape load net"
+                );
+                println!("      tape save [diskN] NAME | tape send NAME PEER");
                 println!(
                     "Remote: term net (wait for a remote shell over Ethernet; same as at boot)"
                 );
@@ -561,6 +564,15 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"hda" if no_arguments(arguments) => hda_status(),
         b"chat" => chat_command(arguments),
         b"tape" => tape_command(info, arguments),
+        // `load`/`run` are accepted bare, without the `tape` prefix, as a
+        // shorthand for `tape load`/`tape run` -- the two tape subcommands
+        // used often enough (loading and running a tape) that spelling out
+        // `tape` every time was pure friction. The other subcommands
+        // (`status`/`save`/`send`) keep requiring the `tape` prefix, since
+        // they are used far less often and `save`/`send` in particular
+        // would be easy to mistake for unrelated top-level commands.
+        b"load" => tape_load_command(info, arguments),
+        b"run" => tape_run(info, arguments),
         b"halt" => {
             if !no_arguments(arguments) {
                 return;
@@ -5680,7 +5692,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
 
 #[inline(never)]
 fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
-    let (kind, remainder) = take_word(arguments);
+    let (kind, remainder) = take_word_or_slash(arguments);
     match kind {
         b"net" if remainder.is_empty() => tape_load_net(),
         b"disk" => {
@@ -5815,7 +5827,7 @@ fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
 /// afterward with no need to `tape load` it back first.
 #[inline(never)]
 fn tape_save_command(info: &BootInfo, arguments: &[u8]) {
-    let (name, remainder) = take_word(arguments);
+    let (name, remainder) = take_word_or_slash(arguments);
     let (destination, name, remainder) = match parse_save_destination(name) {
         Some(destination) => {
             let (name, remainder) = take_word(remainder);
@@ -6098,7 +6110,7 @@ fn tape_send_command(info: &BootInfo, arguments: &[u8]) {
     // `copy`) -- this used to be the one command that always read from
     // disk1/Boot regardless, a real inconsistency found while building
     // AGENTS.md's cross-tape/command syntax reference.
-    let (first_word, remainder) = take_word(arguments);
+    let (first_word, remainder) = take_word_or_slash(arguments);
     let (device, name, remainder) = match strip_disk_selector(first_word) {
         Some(device) => {
             let (name, remainder) = take_word(remainder);
@@ -7110,9 +7122,12 @@ fn strip_disk_selector(word: &[u8]) -> Option<disk::Device> {
 /// Parses an optional `diskN` selector for a command that itself takes no
 /// further arguments (`ls`, `format`, `diskinfo`): a lone leading `diskN`
 /// word is unambiguous here, since none of these commands mean anything
-/// else by their argument.
+/// else by their argument. Accepts either `diskN` alone or, via
+/// `take_word_or_slash`, a `diskN/` prefix (unused here since there is
+/// nothing to attach after it, but kept for symmetry with the other two
+/// helpers below).
 fn parse_disk_only(arguments: &[u8]) -> (disk::Device, &[u8]) {
-    let (first, remainder) = take_word(arguments);
+    let (first, remainder) = take_word_or_slash(arguments);
     match strip_disk_selector(first) {
         Some(device) => (device, remainder),
         None => (disk::Device::Boot, arguments),
@@ -7124,9 +7139,13 @@ fn parse_disk_only(arguments: &[u8]) -> (disk::Device, &[u8]) {
 /// shaped first word is only treated as a selector when something follows
 /// it; with nothing left over, it must be the command's own single
 /// argument instead -- e.g. `cat disk2` still reads a file literally named
-/// `disk2` when there is nothing else on the line to read.
+/// `disk2` when there is nothing else on the line to read. The selector and
+/// its argument may be written `diskN NAME` or `diskN/NAME` (see
+/// `take_word_or_slash`); `cat disk2` (no name at all) is unaffected by
+/// this, since a bare `diskN` with nothing after it -- space or slash --
+/// still falls through to the "no selector" case above.
 fn parse_disk_and_one_argument(arguments: &[u8]) -> (disk::Device, &[u8]) {
-    let (first, remainder) = take_word(arguments);
+    let (first, remainder) = take_word_or_slash(arguments);
     if remainder.is_empty() {
         return (disk::Device::Boot, arguments);
     }
@@ -7141,9 +7160,10 @@ fn parse_disk_and_one_argument(arguments: &[u8]) -> (disk::Device, &[u8]) {
 /// deeper: `diskN` is only a selector when a non-empty NAME *and* non-empty
 /// TEXT both remain after it, so `write disk2 hello` still means "write a
 /// file named disk2 containing 'hello'" rather than an invalid selector
-/// with a missing TEXT.
+/// with a missing TEXT. As with the two helpers above, `diskN/NAME TEXT` is
+/// accepted alongside `diskN NAME TEXT`.
 fn parse_disk_and_two_arguments(arguments: &[u8]) -> (disk::Device, &[u8]) {
-    let (first, remainder) = take_word(arguments);
+    let (first, remainder) = take_word_or_slash(arguments);
     let (name, text) = take_word(remainder);
     if name.is_empty() || text.is_empty() {
         return (disk::Device::Boot, arguments);
@@ -7170,6 +7190,27 @@ fn take_word(input: &[u8]) -> (&[u8], &[u8]) {
         .position(|byte| *byte == b' ')
         .unwrap_or(input.len());
     (&input[..end], trim_start(&input[end..]))
+}
+
+/// Like [`take_word`], but also accepts a `/` as an alternate word
+/// separator: `diskN/NAME` splits the same way `diskN NAME` does. FOSFS
+/// names and hostnames never contain `/` (see `fosfs::valid_name`), so this
+/// is unambiguous, and it lets every `[diskN] NAME`-style command accept the
+/// same compact single-token spelling `@diskN/NAME` and `HOST[:diskN]/NAME`
+/// already use elsewhere, instead of requiring the space form only. A `/`
+/// found before any space wins, since that is the only way a disk selector
+/// can be joined to what follows it.
+fn take_word_or_slash(input: &[u8]) -> (&[u8], &[u8]) {
+    let input = trim_start(input);
+    let end = input
+        .iter()
+        .position(|byte| *byte == b' ' || *byte == b'/')
+        .unwrap_or(input.len());
+    if input.get(end) == Some(&b'/') {
+        (&input[..end], &input[end + 1..])
+    } else {
+        (&input[..end], trim_start(&input[end..]))
+    }
 }
 
 fn trim_start(mut input: &[u8]) -> &[u8] {

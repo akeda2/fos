@@ -173,9 +173,10 @@ fn parse_number(text: &[u8]) -> Option<u32> {
         return None;
     }
     text.iter().try_fold(0u32, |value, &byte| {
-        (b'0'..=b'9')
-            .contains(&byte)
-            .then_some(value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?)
+        if !(b'0'..=b'9').contains(&byte) {
+            return None;
+        }
+        value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))
     })
 }
 
