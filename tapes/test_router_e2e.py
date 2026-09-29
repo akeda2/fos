@@ -679,6 +679,70 @@ def main() -> None:
         assert checksum(forwarded[14 : 14 + 20]) == 0
         print("PASS: router forwarded B to A with TTL and checksum updated.")
 
+        self_ping_identifier = 0x4242
+        self_ping_request = icmp_echo(8, self_ping_identifier, 7, b"ping the router itself")
+        links["a"].send(
+            ipv4_frame(
+                ROUTER_MAC_A,
+                LEFT_MAC,
+                LEFT_IP,
+                ROUTER_IP_A,
+                self_ping_request,
+                protocol=1,
+            )
+        )
+        self_ping_reply = wait_for_frame(
+            links["a"],
+            lambda frame: frame[0:6] == LEFT_MAC
+            and frame[6:12] == ROUTER_MAC_A
+            and frame[12:14] == b"\x08\x00"
+            and frame[23] == 1,
+            10,
+            "an ICMP echo reply from the router's own interface",
+        )
+        assert self_ping_reply[26:30] == ROUTER_IP_A
+        assert self_ping_reply[30:34] == LEFT_IP
+        assert self_ping_reply[34] == 0, "echo reply type"
+        assert int.from_bytes(self_ping_reply[38:40], "big") == self_ping_identifier
+        assert int.from_bytes(self_ping_reply[40:42], "big") == 7
+        assert self_ping_reply[42:] == b"ping the router itself"
+        assert checksum(self_ping_reply[34:]) == 0
+        print("PASS: router answered a ping addressed to its own interface.")
+
+        # A request can arrive on one interface addressed to a *different*
+        # configured interface's own address -- e.g. an upstream host
+        # pinging the router's downstream address, routed in via the
+        # uplink (matching the user-reported bug: the reply must come from
+        # the address that was actually pinged, not from whichever
+        # interface the request happened to arrive on).
+        cross_ping_identifier = 0x5252
+        cross_ping_request = icmp_echo(8, cross_ping_identifier, 3, b"ping the other interface")
+        links["a"].send(
+            ipv4_frame(
+                ROUTER_MAC_A,
+                LEFT_MAC,
+                LEFT_IP,
+                ROUTER_IP_B,
+                cross_ping_request,
+                protocol=1,
+            )
+        )
+        cross_ping_reply = wait_for_frame(
+            links["a"],
+            lambda frame: frame[0:6] == LEFT_MAC
+            and frame[6:12] == ROUTER_MAC_A
+            and frame[12:14] == b"\x08\x00"
+            and frame[23] == 1,
+            10,
+            "an ICMP echo reply for a cross-interface self-ping",
+        )
+        assert cross_ping_reply[26:30] == ROUTER_IP_B, cross_ping_reply[26:30]
+        assert cross_ping_reply[30:34] == LEFT_IP
+        assert cross_ping_reply[34] == 0, "echo reply type"
+        assert int.from_bytes(cross_ping_reply[38:40], "big") == cross_ping_identifier
+        assert checksum(cross_ping_reply[34:]) == 0
+        print("PASS: router answered a cross-interface ping from its own correct address.")
+
         client_port = 40000
         server_port = 23
         syn = tcp_segment(

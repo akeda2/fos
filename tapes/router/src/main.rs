@@ -1687,6 +1687,66 @@ fn send_icmp_echo(
             && nic_send_at(interface.nic, frame.as_ptr() as u32, length as u32) != 0
     }
 
+/// Answers an ICMP echo request addressed to one of the router's own
+/// interface addresses -- e.g. an operator pinging `192.168.0.128` to check
+/// whether the router itself is reachable, as opposed to pinging *through*
+/// it to a downstream host. `forward_ipv4` never generates this on its own:
+/// a router that only forwards traffic between other hosts has no inherent
+/// reason to also answer pings addressed to itself, and this was missing
+/// entirely until an operator noticed a ping to the router's own upstream
+/// address got no reply at all while diagnosing an unrelated forwarding
+/// question. The reply copies the request's payload verbatim (matching
+/// ordinary ICMP echo semantics -- a real `ping`'s payload bytes come back
+/// unchanged) and only rewrites the type byte and checksum.
+///
+/// `reply_source` is the request's own *destination* address -- i.e. the
+/// specific interface address that was actually pinged -- not necessarily
+/// `interface.address` (the interface the request happened to arrive on).
+/// A request can legitimately arrive on one interface addressed to
+/// *another* configured interface's address (e.g. an upstream host pinging
+/// the router's downstream address, routed in via the uplink), and the
+/// reply must come from the address that was pinged, or the requester sees
+/// a reply from an address it never contacted and can drop or misattribute
+/// it -- the exact bug an operator found by pinging the router's downstream
+/// address from outside and seeing the reply arrive from its uplink address
+/// instead.
+fn send_icmp_echo_reply(
+    interface: &RouterInterface,
+    reply_source: Ipv4Address,
+    request_source: Ipv4Address,
+    request_payload: &[u8],
+    destination_mac: MacAddress,
+    payload_buffer: &mut [u8; MAX_FRAME_LEN],
+    ip_buffer: &mut [u8; MAX_FRAME_LEN],
+    output_buffer: &mut [u8; MAX_FRAME_LEN],
+    nic_send_at: NicSendAt,
+    max_frame_len: usize,
+) -> bool {
+    let payload_len = request_payload.len();
+    if payload_len < 8 || payload_len > payload_buffer.len() {
+        return false;
+    }
+    payload_buffer[..payload_len].copy_from_slice(request_payload);
+    payload_buffer[0] = 0; // Echo Reply (request is type 8, code 0 stays 0)
+    payload_buffer[2] = 0;
+    payload_buffer[3] = 0;
+    let checksum = internet_checksum(&payload_buffer[..payload_len]);
+    payload_buffer[2..4].copy_from_slice(&checksum.to_be_bytes());
+    let packet = Ipv4Packet {
+        header: Ipv4Header::new(reply_source, request_source, 1, payload_len),
+        payload: &payload_buffer[..payload_len],
+    };
+    let Ok(ip_len) = packet.encode(ip_buffer) else {
+        return false;
+    };
+    let ethernet = EthernetFrame::new(destination_mac, interface.mac, ETHERTYPE_IPV4, &ip_buffer[..ip_len]);
+    let Ok(length) = ethernet.encode(output_buffer) else {
+        return false;
+    };
+    length <= max_frame_len
+        && nic_send_at(interface.nic, output_buffer.as_ptr() as u32, length as u32) != 0
+}
+
 /// Recognizes a genuinely fresh ARP reply from `target`, without touching
 /// any interface's ArpCache. `advance_uplink_health`'s `AwaitingArp` phase
 /// uses this instead of a cache lookup so a health round's freshness check
@@ -2227,6 +2287,49 @@ fn forward_ipv4(
         return ForwardResult::Dropped;
     }
     let now = ticks();
+    // An ICMP echo request addressed to one of the router's own interfaces
+    // -- e.g. an operator pinging `192.168.0.128` to check whether the
+    // router itself is reachable, as opposed to pinging *through* it to a
+    // downstream host -- is answered here, before the active-uplink inbound
+    // NAT/port-forward check just below: that check treats *any* packet
+    // addressed to the active uplink's own address as inbound NAT traffic
+    // needing a matching mapping, which would otherwise swallow and drop an
+    // unsolicited ping to the router's own upstream address even with NAT
+    // disabled. Any other protocol addressed to the router itself still
+    // falls through to that check (and, for a non-uplink interface, to the
+    // `is_local` drop further below) unchanged.
+    if packet.header.protocol == 1
+        && packet.payload.len() >= 8
+        && packet.payload[0] == 8
+        && packet.payload[1] == 0
+        && is_local(interfaces, count, packet.header.destination)
+    {
+        interfaces[ingress]
+            .arp
+            .insert(packet.header.source, ethernet.source, now as u32);
+        if let Some(destination_mac) = resolve_mac(
+            ingress,
+            packet.header.source,
+            interfaces,
+            nic_send_at,
+            ticks,
+            max_frame_len,
+        ) {
+            send_icmp_echo_reply(
+                &interfaces[ingress],
+                packet.header.destination,
+                packet.header.source,
+                packet.payload,
+                destination_mac,
+                transport_buffer,
+                ip_buffer,
+                output_buffer,
+                nic_send_at,
+                max_frame_len,
+            );
+        }
+        return ForwardResult::Dropped;
+    }
     let mut header = packet.header;
     let payload_len = packet.payload.len();
     let mut payload_in_transport_buffer = false;

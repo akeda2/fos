@@ -225,9 +225,12 @@ and reports whether the lease supplied an address, netmask, and router. If no
 explicit default suffix is supplied, a DHCP router option becomes NIC 1's
 default. At least two interfaces are required, NIC selections must be unique
 and exist, and an explicit gateway must be on the selected interface's
-subnet. Packets addressed to the router itself, IPv4 broadcast/multicast,
-unknown networks without a default, TTL 1, and malformed/checksum-invalid
-IPv4 packets are dropped. When enabled, the router performs TCP/UDP source NAT and ICMP echo identifier
+subnet. Packets addressed to the router itself are answered with an ordinary
+ICMP echo reply when they are an echo request (so pinging a configured
+interface address, including the active uplink's, works like pinging any
+other host) and otherwise dropped; IPv4 broadcast/multicast, unknown
+networks without a default, TTL 1, and malformed/checksum-invalid IPv4
+packets are also dropped. When enabled, the router performs TCP/UDP source NAT and ICMP echo identifier
 translation using a
 4 MiB physical-memory-backed table when traffic leaves a non-primary NIC
 through NIC 1, and reverses that mapping for replies. This provides tens of

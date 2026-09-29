@@ -161,8 +161,14 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   FOSFS file and passes its contents through the existing startup-argument
   ABI; `#` comments and newlines are accepted, with a 4096-byte fixed limit.
   `dhcp-lease-file NAME` optionally persists bound DHCP assignments through
-  the tape filesystem callbacks; omitting it keeps the router diskless. The
-  tape deliberately has no dynamic routing,
+  the tape filesystem callbacks; omitting it keeps the router diskless. An
+  ICMP echo request addressed directly to one of the router's own configured
+  interface addresses (as opposed to a downstream host reached *through* it)
+  gets an ordinary echo reply, including on the active uplink -- answered
+  before that interface's inbound NAT/port-forward check, which otherwise
+  treats any packet addressed to the active uplink's own address as inbound
+  NAT traffic needing a matching mapping and would silently drop an
+  unsolicited ping to it. The tape deliberately has no dynamic routing,
   ICMP errors, fragmentation, or IPv6.
 
 ## Low-memory map
