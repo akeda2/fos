@@ -497,7 +497,7 @@ OPUS_CODEC_VENDOR := tapes/opus-codec/vendor/opus
 OPUS_CODEC_SOURCES := $(wildcard $(OPUS_CODEC_VENDOR)/celt/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/silk/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/silk/fixed/*.c) $(wildcard $(OPUS_CODEC_VENDOR)/src/*.c)
 OPUS_CODEC_OBJS := $(patsubst $(OPUS_CODEC_VENDOR)/%.c,$(BUILD)/tapes/opus-codec/%.o,$(OPUS_CODEC_SOURCES))
 OPUS_CODEC_LIB := $(BUILD)/tapes/opus-codec/libopus_fixed.a
-OPUS_CODEC_CFLAGS := -m32 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -msoft-float -ffunction-sections -fdata-sections -DHAVE_CONFIG_H -Itapes/opus-codec -I$(OPUS_CODEC_VENDOR)/include -I$(OPUS_CODEC_VENDOR)/celt -I$(OPUS_CODEC_VENDOR)/silk -I$(OPUS_CODEC_VENDOR)/silk/fixed
+OPUS_CODEC_CFLAGS := -O2 -m32 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -msoft-float -ffunction-sections -fdata-sections -DHAVE_CONFIG_H -Itapes/opus-codec -I$(OPUS_CODEC_VENDOR)/include -I$(OPUS_CODEC_VENDOR)/celt -I$(OPUS_CODEC_VENDOR)/silk -I$(OPUS_CODEC_VENDOR)/silk/fixed
 
 $(BUILD)/tapes/opus-codec/%.o: $(OPUS_CODEC_VENDOR)/%.c tapes/opus-codec/config.h tapes/opus-codec/custom_support.h
 	mkdir -p $(dir $@)
