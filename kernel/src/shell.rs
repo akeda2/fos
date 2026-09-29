@@ -2204,34 +2204,29 @@ fn term_net(info: &BootInfo) {
     println!("(or F4/F6/F7/F8/F10) to give up.");
 
     let mut recv_buffer = [0u8; nic::MAX_FRAME_LEN];
-    loop {
-        // Re-fetched every time this outer loop starts a fresh wait for a
-        // HELLO, not just once at function entry: `nic use N` can change
-        // which interface is active between sessions (or even while
-        // still waiting for the first one), and a HELLO must be accepted
-        // on whichever interface is active *now* -- see this function's
-        // own real-hardware finding below for what a stale, boot-time-
-        // only snapshot here actually breaks.
-        //
-        // **Confirmed real-hardware finding**: with I219-LM/I350 support
-        // added to this kernel, switching the active interface away from
-        // NIC 1 mid-session (`nic use 2` or later) and then trying to
-        // reconnect `term_net` on that newly active interface silently
-        // never worked -- `nic`/`source`/`active_index` used to be
-        // captured exactly once, here, before this loop, so every
-        // subsequent reconnect cycle kept checking incoming HELLOs
-        // against whatever was active at boot (always NIC 1 in
-        // practice), even though `nic list`'s own `*` marker plainly
-        // showed a different interface as active by then. The interface
-        // the HELLO must arrive on, and the one this session then
-        // actually sends/receives through for its whole lifetime, were
-        // both silently stuck at the wrong NIC.
-        let Some(nic) = nic_or_report() else { return };
-        let source = nic.mac_address();
-        let active_index = nic::active_index();
+    'outer: loop {
+        // Re-checked every time this outer loop starts a fresh wait for a
+        // HELLO, not just once at function entry, in case every NIC has
+        // somehow gone away since the last session ended.
+        if nic_or_report().is_none() {
+            return;
+        }
         let interface_count = nic::count();
 
-        let peer = loop {
+        // A `HELLO` is accepted on *any* interface, not just whichever one
+        // happens to be `nic::active_index()` -- unlike a bare `chat`/`nic
+        // discover` box, a machine running as a router (see
+        // `tapes/router/`) has every one of its NICs doing real work at
+        // once, and a remote operator most naturally connects through
+        // whichever one is actually reachable from where they are (often a
+        // downstream/inbound LAN port, not the uplink NIC that happens to
+        // be "active" for ordinary local commands like `nic send`). This
+        // mirrors the `CHAT_TAG_DISCOVER_REQUEST` arm just below, which has
+        // never had this restriction. The interface the HELLO actually
+        // arrived on becomes this session's own NIC for its whole
+        // lifetime (see `ACTIVE_TERM_INDEX`), not necessarily the active
+        // one.
+        let (peer, session_index) = loop {
             if let Some(keyboard::KeyEvent::Escape) = keyboard::poll_term_event() {
                 println!("Gave up waiting for a remote terminal client.");
                 return;
@@ -2256,8 +2251,8 @@ fn term_net(info: &BootInfo) {
                 }
                 let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
                 match frame[14] {
-                    TERM_TAG_HELLO if index == active_index => {
-                        connected_peer = Some(peer_mac);
+                    TERM_TAG_HELLO => {
+                        connected_peer = Some((peer_mac, index));
                         break;
                     }
                     CHAT_TAG_DISCOVER_REQUEST => {
@@ -2287,13 +2282,26 @@ fn term_net(info: &BootInfo) {
                     _ => {}
                 }
             }
-            if let Some(peer) = connected_peer {
-                break peer;
+            if let Some(found) = connected_peer {
+                break found;
             }
         };
 
-        println!("Remote terminal connected from {}. Local input is disabled;", Mac(&peer));
-        println!("F12 (or F4/F6/F7/F8/F10) disconnects it.");
+        let Some(nic) = nic::get_at(session_index) else {
+            // Can't happen in practice -- a frame was just received on
+            // this very index above, and NICs never disappear once
+            // discovered at boot -- but there is no reasonable session to
+            // run without it, so just go back to waiting.
+            continue 'outer;
+        };
+        let source = nic.mac_address();
+
+        println!(
+            "Remote terminal connected from {} on NIC {}. Local input is",
+            Mac(&peer),
+            session_index + 1
+        );
+        println!("disabled; F12 (or F4/F6/F7/F8/F10) disconnects it.");
         console::enable_relay();
         // Lets `poll_remote_tape_abort` recognize this peer's own frames
         // while a nested blocking command (like `tape_run`) has this
@@ -2303,6 +2311,7 @@ fn term_net(info: &BootInfo) {
         unsafe {
             ACTIVE_TERM_PEER = Some(peer);
             ACTIVE_TERM_SOURCE = Some(source);
+            ACTIVE_TERM_INDEX = Some(session_index);
             PENDING_REMOTE_BYE = false;
             TERM_DEFERRED_INPUT_HEAD = 0;
             TERM_DEFERRED_INPUT_TAIL = 0;
@@ -2356,7 +2365,7 @@ fn term_net(info: &BootInfo) {
                         &frame_source,
                         &source,
                         CHAT_TAG_DISCOVER_REPLY,
-                        nic::active_index(),
+                        session_index,
                     );
                     continue;
                 }
@@ -2387,6 +2396,7 @@ fn term_net(info: &BootInfo) {
         unsafe {
             ACTIVE_TERM_PEER = None;
             ACTIVE_TERM_SOURCE = None;
+            ACTIVE_TERM_INDEX = None;
         }
         if local_escape {
             println!("\nRemote terminal disconnected; back at the local fos shell.");
@@ -2408,6 +2418,23 @@ fn term_net(info: &BootInfo) {
 /// thread this through, can still find out who to listen for.
 static mut ACTIVE_TERM_PEER: Option<[u8; 6]> = None;
 static mut ACTIVE_TERM_SOURCE: Option<[u8; 6]> = None;
+
+/// The interface index actually carrying the active `term_net` session, set
+/// and cleared alongside `ACTIVE_TERM_PEER`/`ACTIVE_TERM_SOURCE`. A `HELLO`
+/// is accepted on any NIC (see `term_net`'s own doc comment), so this is not
+/// necessarily `nic::active_index()` -- a router's remote operator is
+/// commonly connected through a downstream/inbound NIC while a different
+/// one serves as the uplink. Every nested-tape polling helper below that
+/// needs to talk to *this session's* peer (as opposed to whichever NIC a
+/// foreground command like `nic sniff` happens to be using) must resolve
+/// the interface through this index, not through `nic::get()`.
+static mut ACTIVE_TERM_INDEX: Option<usize> = None;
+
+/// `nic::get_at` applied to `ACTIVE_TERM_INDEX`, or `None` if no `term_net`
+/// session is currently active.
+fn active_term_nic() -> Option<&'static nic::Nic> {
+    unsafe { ACTIVE_TERM_INDEX }.and_then(nic::get_at)
+}
 
 /// Set for as long as `term_printer`'s interactive session (or a
 /// deliberately nested `execute` call it makes for a committed line) is
@@ -2648,14 +2675,24 @@ fn poll_background_work(nic: Option<&nic::Nic>) {
     // discovered one. There is no IRQ driving either stream on its own --
     // see `uhci::service_active_audio`'s own doc comment.
     uhci::service_active_audio();
-    let Some(nic) = nic else { return };
+    // Resolved through `ACTIVE_TERM_INDEX`, independently of whichever NIC
+    // (if any) the caller passed in for its own watchdog check below: the
+    // session's peer is reachable only through the specific interface its
+    // `HELLO` arrived on (see `term_net`'s own doc comment), which is not
+    // necessarily this loop's own NIC (e.g. `usb play`/`usb capture` above
+    // pass `None` here, and `nic sniff`/`chat` pass whichever NIC they were
+    // told to operate on) -- relaying through the wrong interface would
+    // simply never reach the connected peer.
     if console::relay_enabled() {
         if let (Some(peer), Some(source)) =
             (unsafe { ACTIVE_TERM_PEER }, unsafe { ACTIVE_TERM_SOURCE })
         {
-            relay_pending_tape_output(nic, &peer, &source);
+            if let Some(relay_nic) = active_term_nic() {
+                relay_pending_tape_output(relay_nic, &peer, &source);
+            }
         }
     }
+    let Some(nic) = nic else { return };
     report_nic_watchdog(nic.watchdog());
 }
 
@@ -2690,8 +2727,13 @@ fn poll_background_work(nic: Option<&nic::Nic>) {
 /// `console::relay_enabled()` false the entire time, so it never
 /// touches the network card at all beyond the watchdog check above.
 fn poll_remote_tape_abort() -> bool {
-    let nic_ref = nic::get().ok();
-    poll_background_work(nic_ref);
+    // Resolved through the session's own interface, not `nic::get()`'s
+    // active one -- see `ACTIVE_TERM_INDEX`'s doc comment. Falls back to
+    // the active NIC (matching the old, session-agnostic behavior) so the
+    // watchdog check below still runs when no `term_net` session exists at
+    // all, e.g. a tape started from the local shell.
+    let session_nic = active_term_nic();
+    poll_background_work(session_nic.or_else(|| nic::get().ok()));
     if !console::relay_enabled() {
         return false;
     }
@@ -2699,7 +2741,7 @@ fn poll_remote_tape_abort() -> bool {
     else {
         return false;
     };
-    let Some(nic) = nic_ref else { return false };
+    let Some(nic) = session_nic else { return false };
     let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let Some(received) = nic.receive(&mut buffer) else {
         return false;
@@ -2717,7 +2759,7 @@ fn poll_remote_tape_abort() -> bool {
             &frame_source,
             &source,
             CHAT_TAG_DISCOVER_REPLY,
-            nic::active_index(),
+            unsafe { ACTIVE_TERM_INDEX }.unwrap_or_else(nic::active_index),
         );
         tape_network_frame_push(frame);
         return false;
@@ -4834,8 +4876,10 @@ const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 /// longer than necessary, and a latched NIC fault unrecovered for as
 /// long as the tape kept the peer's attention.
 fn poll_remote_tape_input() -> Option<u32> {
-    let nic_ref = nic::get().ok();
-    poll_background_work(nic_ref);
+    // See `poll_remote_tape_abort`'s identical reasoning: the session's own
+    // interface, not necessarily the active one.
+    let session_nic = active_term_nic();
+    poll_background_work(session_nic.or_else(|| nic::get().ok()));
     if unsafe { TAPE_REMOTE_ABORT_PENDING } {
         unsafe { TAPE_REMOTE_ABORT_PENDING = false };
         return Some(TAPE_EVENT_ABORT);
@@ -4849,7 +4893,7 @@ fn poll_remote_tape_input() -> Option<u32> {
     let Some(peer) = (unsafe { ACTIVE_TERM_PEER }) else {
         return None;
     };
-    let Some(nic) = nic_ref else { return None };
+    let Some(nic) = session_nic else { return None };
     let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let Some(received) = nic.receive(&mut buffer) else {
         return None;

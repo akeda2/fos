@@ -2980,10 +2980,18 @@ pub extern "C" fn tape_main(
         print_bytes(putc, b" flow slots from physical memory.\n");
         NatTable::new(entries, ticks())
     } else {
-        print_bytes(
-            putc,
-            b"NAT: physical-memory allocation unavailable; using 32 flow slots.\n",
-        );
+        // Only genuinely a fallback -- and worth reporting -- when NAT is
+        // enabled at all: with `no-nat`, `nat_allocation` is deliberately
+        // left at 0 with no allocation ever attempted (see above), and this
+        // unused table is never consulted, so printing the same "allocation
+        // unavailable" message here as for a real failed `alloc` would
+        // falsely suggest the machine is short on physical memory.
+        if parsed.nat {
+            print_bytes(
+                putc,
+                b"NAT: physical-memory allocation unavailable; using 32 flow slots.\n",
+            );
+        }
         NatTable::new(&mut fallback_nat_entries, ticks())
     };
     let mut ip_buffer = [0u8; MAX_FRAME_LEN];
