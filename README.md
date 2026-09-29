@@ -65,6 +65,7 @@ implements the fast gate.
 - `rustup`, with the pinned toolchain and `rust-src` component declared in
   `rust-toolchain.toml`. `rustup` installs the pinned toolchain automatically
   on the first build when network access is available.
+- gcc-multilib
 
 Build and run:
 
