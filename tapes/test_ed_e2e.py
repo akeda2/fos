@@ -152,6 +152,20 @@ def main():
         command("first\n", marker=b". ")
         command(".\n", marker=b"ed> ")
         command("s2/replaced\n", marker=b"ed> ")
+        # cLINE/OLD/NEW changes text inside a line; eLINE pre-fills the old
+        # line so Backspace trims its end and typing appends.
+        command("c2/place/PLACE\n", marker=b"ed> ")
+        if b"2: rePLACEd" not in output:
+            raise SystemExit(f"c did not change text inside the line:\n{output.decode('utf-8', 'replace')}")
+        command("c2/nothere/x\n", marker=b"ed> ")
+        if b"text not found" not in output:
+            raise SystemExit(f"c did not report a missing OLD text:\n{output.decode('utf-8', 'replace')}")
+        command("c2/PLACE/place\n", marker=b"ed> ")
+        command("e2\n", marker=b"edit: replaced")
+        command("\x08\x08ed\n", marker=b"ed> ")
+        command("p\n", marker=b"ed> ")
+        if b"2: replaced" not in output:
+            raise SystemExit(f"e did not keep the edited line:\n{output.decode('utf-8', 'replace')}")
         command("a\n", marker=b". ")
         command("last\n", marker=b". ")
         command(".\n", marker=b"ed> ")

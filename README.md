@@ -977,7 +977,10 @@ aLINE          append lines after LINE
 iLINE          insert lines before LINE
 dLINE          delete LINE
 sLINE/TEXT     replace LINE with TEXT
-sLINE          prompt for replacement text
+sLINE          edit LINE: its old text is pre-filled after "edit:"; Backspace
+               trims the end, typing appends, Enter accepts
+cLINE/OLD/NEW  change the first OLD inside LINE to NEW (no retyping the rest)
+eLINE          same as sLINE
 eLINE          prompt for replacement text and show the old line
 w              write the file and continue editing
 x              write the file and exit

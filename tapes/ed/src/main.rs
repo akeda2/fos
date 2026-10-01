@@ -292,7 +292,7 @@ fn dispatch(
             print_bytes(
                 putc,
                 b"p print | m more-style print | a append | iN insert | dN delete\n\
-                  sN/TEXT substitute | eN edit | w write | x write+exit | q quit\n",
+                  sN/TEXT replace | eN edit | cN/OLD/NEW change | w write | x write+exit | q quit\n",
             );
         }
         b"p" => print_buffer(putc, text),
@@ -355,6 +355,7 @@ fn dispatch(
                 return CommandResult::Quit;
             }
         }
+        _ if command.first() == Some(&b'c') => change_in_line(putc, text, &command[1..]),
         _ if command.first() == Some(&b's') => {
             if substitute(putc, read_key, text, &command[1..]) {
                 return CommandResult::Quit;
@@ -366,7 +367,24 @@ fn dispatch(
 }
 
 fn read_line(putc: Putc, read_key: ReadKey, output: &mut [u8]) -> Option<usize> {
-    let mut length = 0;
+    read_line_prefilled(putc, read_key, output, b"")
+}
+
+/// Like `read_line`, but starts with `initial` already in the buffer and
+/// echoed, so the user edits the existing text instead of retyping it:
+/// Backspace removes characters from the end (the kernel's `read_key` already
+/// erases them on screen), anything typed is appended, Enter accepts. A
+/// terminal cursor cannot be moved portably through the tape's `putc`, so
+/// edits in the middle of a line use the `cLINE/OLD/NEW` command instead.
+fn read_line_prefilled(
+    putc: Putc,
+    read_key: ReadKey,
+    output: &mut [u8],
+    initial: &[u8],
+) -> Option<usize> {
+    let mut length = initial.len().min(output.len());
+    output[..length].copy_from_slice(&initial[..length]);
+    print_bytes(putc, &output[..length]);
     loop {
         let event = read_key();
         if event == 0 {
@@ -433,17 +451,70 @@ fn edit_line(putc: Putc, read_key: ReadKey, text: &mut TextBuffer<'_>, line: usi
         print_bytes(putc, b"ed: no such line\n");
         return false;
     };
-    print_bytes(putc, b"old: ");
-    print_bytes(putc, current);
-    print_bytes(putc, b"\nnew: ");
+    // The old text is pre-filled after the prompt: Backspace trims its end and
+    // typing appends; Enter keeps whatever is on screen.
+    print_bytes(putc, b"edit: ");
     let mut input = [0u8; INPUT_CAPACITY];
-    let Some(length) = read_line(putc, read_key, &mut input) else {
+    if current.len() > input.len() {
+        print_bytes(putc, b"\ned: line too long to edit here; use sLINE/TEXT\n");
+        return false;
+    }
+    let Some(length) = read_line_prefilled(putc, read_key, &mut input, current) else {
         return true;
     };
     if text.replace_line(line, &input[..length]).is_err() {
         print_bytes(putc, b"ed: replacement failed\n");
     }
     false
+}
+
+/// `cLINE/OLD/NEW`: replaces the first occurrence of OLD in the line with NEW
+/// (classic ed/sed substitution), for changing the middle of a line without
+/// retyping the rest of it.
+fn change_in_line(putc: Putc, text: &mut TextBuffer<'_>, argument: &[u8]) {
+    static mut SCRATCH: [u8; 1024] = [0; 1024];
+    let parsed = argument
+        .iter()
+        .position(|byte| *byte == b'/')
+        .and_then(|first| {
+            let rest = &argument[first + 1..];
+            let second = rest.iter().position(|byte| *byte == b'/')?;
+            Some((parse_number(&argument[..first])?, &rest[..second], &rest[second + 1..]))
+        });
+    let Some((line, old, new)) = parsed else {
+        print_bytes(putc, b"ed: use cLINE/OLD/NEW\n");
+        return;
+    };
+    let Some(current) = text.line_content(line) else {
+        print_bytes(putc, b"ed: no such line\n");
+        return;
+    };
+    let position = if old.is_empty() {
+        None
+    } else {
+        current.windows(old.len()).position(|window| window == old)
+    };
+    let Some(position) = position else {
+        print_bytes(putc, b"ed: text not found in that line\n");
+        return;
+    };
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
+    let total = current.len() - old.len() + new.len();
+    if total > scratch.len() {
+        print_bytes(putc, b"ed: resulting line too long\n");
+        return;
+    }
+    scratch[..position].copy_from_slice(&current[..position]);
+    scratch[position..position + new.len()].copy_from_slice(new);
+    scratch[position + new.len()..total].copy_from_slice(&current[position + old.len()..]);
+    if text.replace_line(line, &scratch[..total]).is_err() {
+        print_bytes(putc, b"ed: replacement failed\n");
+        return;
+    }
+    print_u32(putc, line as u32);
+    print_bytes(putc, b": ");
+    print_bytes(putc, &scratch[..total]);
+    putc(u32::from(b'\n'));
 }
 
 fn substitute(
