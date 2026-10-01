@@ -113,7 +113,8 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   A non-builtin command word `NAME` runs `NAME.sh` or loads/runs `NAME.bin`
   (`run_external_command`; disk1 then diskN, builtins win, script nesting
   capped by `MAX_SCRIPT_DEPTH`). An optional `settings` file (`load_settings`)
-  currently holds `deny-term-net`, which closes `term net`, KUP
+  holds `no-msi` (NICs stay on legacy IRQs; see "NIC MSI" below) and
+  `deny-term-net`, which closes `term net`, KUP
   (`dispatch_kup_frame`) and NETFS serving per NIC; scripts expand `$1`..`$9`/`$*`; see README.md.
 - `boot/netrom.S` is an optional, parallel boot path: a PCI expansion ROM that
   boots fos from a NIC's own boot ROM instead of disk/USB (`make netrom`,
@@ -2132,3 +2133,21 @@ MSI-driven audio capture/playback. Full detail (the exact register-level
 MSI address/data encoding, and the full verification list) is in
 `docs/history/development-notes.md`.
 
+### NIC MSI (RTL8168 and e1000e)
+
+`nic::try_enable_msi` runs per NIC in `nic::initialize` for the two backends
+that implement `trigger_test_interrupt` (RTL8168: FSWInt via `TPPOLL`; e1000e:
+Link Status Change via `ICS` -- QEMU's 82574L ignores Linux's RXSEQ choice). It
+enables the PCI MSI capability on a vector from `interrupts`, forces one
+interrupt, and waits `MSI_SELFTEST_TICKS` (3) for the message; on failure it
+disables MSI again and the NIC keeps its legacy IRQ (boards such as nForce may
+lack an HT MSI mapping). The `no-msi` settings option skips all of it.
+`nic list`/`irqstat` report the vector. NICs on MSI are exempt from the
+storm/suspect rules. `make test-msi` (part of `make test`) covers it on QEMU's
+e1000e. Confirmed on the AMD/nForce machine: both RTL8168s take MSI (the
+RTL8168G/H ignores `FSWInt`, so the test also enables Tx-OK and sends one
+broadcast frame). The I350 (`ICS` 0x1504, Link Status Change) uses the same
+path and is confirmed on the second machine (e1000e + two I350 ports, all on
+MSI, 284 KB tape loads on each with no errors); QEMU has no I350 model.
+The e1000e (82579, `8086:1503`) also takes MSI on a Sandy Bridge board (single
+NIC, so no tape-load test there; counters clean after normal term net traffic).
