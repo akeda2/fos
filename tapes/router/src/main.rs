@@ -2019,6 +2019,7 @@ fn process_arp(
     interface
         .arp
         .insert(packet.sender_protocol, packet.sender_hardware, now as u32);
+    release_held_frame(interface, packet.sender_protocol, packet.sender_hardware, now, nic_send_at);
     if packet.operation == ArpOperation::Request
         && packet.target_protocol == interface.address
         && packet.sender_hardware != interface.mac
@@ -2480,16 +2481,20 @@ fn forward_ipv4(
             return ForwardResult::Dropped;
         }
     }
-    let Some(destination_mac) = resolve_mac(
+    // On an ARP miss `resolve_mac` has already sent the request; the packet is
+    // finished below with a blank destination MAC and held (`hold_for_arp`),
+    // then sent by `process_arp` when the reply arrives. Without that, the
+    // first packet of every conversation was dropped and the sender had to
+    // retry (a ping's first reply came a second late).
+    let resolved = resolve_mac(
         egress,
         next_hop,
         interfaces,
         nic_send_at,
         ticks,
         max_frame_len,
-    ) else {
-        return ForwardResult::Dropped;
-    };
+    );
+    let destination_mac = resolved.unwrap_or(MacAddress([0; 6]));
     header.ttl -= 1;
     let forwarded = Ipv4Packet {
         header,
@@ -2514,6 +2519,15 @@ fn forward_ipv4(
     if length > max_frame_len {
         return ForwardResult::Dropped;
     }
+    if resolved.is_none() {
+        hold_for_arp(
+            interfaces[egress].nic,
+            next_hop,
+            &output_buffer[..length],
+            now,
+        );
+        return ForwardResult::Dropped;
+    }
     if nic_send_at(
         interfaces[egress].nic,
         output_buffer.as_ptr() as u32,
@@ -2524,6 +2538,62 @@ fn forward_ipv4(
     } else {
         ForwardResult::Forwarded
     }
+}
+
+/// One fully built outgoing frame waiting for its destination's ARP reply
+/// (destination MAC bytes still zero). A single slot is enough: ARP normally
+/// answers within milliseconds, a newer miss simply replaces it, and it expires
+/// after `HELD_FRAME_TICKS` so a late reply never releases a stale packet.
+struct HeldFrame {
+    active: bool,
+    nic: u32,
+    target: Ipv4Address,
+    since: u64,
+    length: usize,
+    frame: [u8; MAX_FRAME_LEN],
+}
+
+const HELD_FRAME_TICKS: u64 = 300;
+static mut HELD_FRAME: HeldFrame = HeldFrame {
+    active: false,
+    nic: 0,
+    target: Ipv4Address([0; 4]),
+    since: 0,
+    length: 0,
+    frame: [0; MAX_FRAME_LEN],
+};
+
+fn hold_for_arp(nic: u32, target: Ipv4Address, frame: &[u8], now: u64) {
+    let held = unsafe { &mut *core::ptr::addr_of_mut!(HELD_FRAME) };
+    if frame.len() > held.frame.len() {
+        return;
+    }
+    held.frame[..frame.len()].copy_from_slice(frame);
+    held.length = frame.len();
+    held.nic = nic;
+    held.target = target;
+    held.since = now;
+    held.active = true;
+}
+
+/// Sends the held frame if this ARP packet tells us the MAC it was waiting for.
+fn release_held_frame(
+    interface: &RouterInterface,
+    sender: Ipv4Address,
+    sender_mac: MacAddress,
+    now: u64,
+    nic_send_at: NicSendAt,
+) {
+    let held = unsafe { &mut *core::ptr::addr_of_mut!(HELD_FRAME) };
+    if !held.active || held.nic != interface.nic || held.target != sender {
+        return;
+    }
+    held.active = false;
+    if now.wrapping_sub(held.since) > HELD_FRAME_TICKS {
+        return;
+    }
+    held.frame[0..6].copy_from_slice(&sender_mac.0);
+    let _ = nic_send_at(held.nic, held.frame.as_ptr() as u32, held.length as u32);
 }
 
 enum ForwardResult {

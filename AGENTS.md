@@ -181,7 +181,11 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   before that interface's inbound NAT/port-forward check, which otherwise
   treats any packet addressed to the active uplink's own address as inbound
   NAT traffic needing a matching mapping and would silently drop an
-  unsolicited ping to it. The tape deliberately has no dynamic routing,
+  unsolicited ping to it. A packet that misses the ARP cache is held (one frame, `HELD_FRAME`, built
+  with a blank destination MAC and expiring after 3 s) and sent by `process_arp`
+  when the reply arrives, instead of being dropped and left to the sender's
+  retry -- previously the first ping of every conversation was lost or a second
+  late (`make test-tape-router-arp`). The tape deliberately has no dynamic routing,
   ICMP errors, fragmentation, or IPv6.
 
 ## Low-memory map
