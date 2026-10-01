@@ -29,14 +29,19 @@ MACS = [f"52:54:00:ac:00:0{n}" for n in range(1, 5)]
 
 
 class Lab:
-    def __init__(self):
+    def __init__(self, nic_args=None):
+        """`nic_args`: extra QEMU arguments for the NICs; by default four e1000
+        joined in pairs by virtual cables (QEMU hubs)."""
         tmp = tempfile.mkdtemp(prefix="fos-selftest-")
         self.monitor = os.path.join(tmp, "mon")
         command = ["qemu-system-i386", "-m", "256", "-drive", f"format=raw,file={IMAGE}", "-snapshot",
                    "-serial", "stdio", "-monitor", f"unix:{self.monitor},server,nowait", "-display", "none"]
-        for number, hub in enumerate((1, 1, 2, 2), start=1):
-            command += ["-netdev", f"hubport,id=p{number},hubid={hub}",
-                        "-device", f"e1000,netdev=p{number},mac={MACS[number - 1]}"]
+        if nic_args is None:
+            nic_args = []
+            for number, hub in enumerate((1, 1, 2, 2), start=1):
+                nic_args += ["-netdev", f"hubport,id=p{number},hubid={hub}",
+                             "-device", f"e1000,netdev=p{number},mac={MACS[number - 1]}"]
+        command += nic_args
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT)
         self.selector = selectors.DefaultSelector()
@@ -90,7 +95,7 @@ class Lab:
             self.process.kill()
 
 
-def run_scenario(lab, arguments, seconds):
+def run_scenario(lab, arguments, seconds, sink_nic=4):
     """Runs the tape with the given arguments until the generator has finished,
     stops it, and returns the parsed final counters."""
     lab.shell("tape load disk nettest.bin", b"Loaded ")
@@ -104,7 +109,7 @@ def run_scenario(lab, arguments, seconds):
     lab.wait_for(b"fos> ", mark, 30)
     text = lab.text(mark)
     stats = text[text.index("nettest stopped."):]
-    sink = re.search(r"sink NIC 4\s+rx (\d+)\s+avg (\d+) kbit/s \(now \d+\)\s+lost (\d+) \(([\d.]+)%\)"
+    sink = re.search(rf"sink NIC {sink_nic}\s+rx (\d+)\s+avg (\d+) kbit/s \(now \d+\)\s+lost (\d+) \(([\d.]+)%\)"
                      r"\s+dup (\d+)\s+reord (\d+)\s+latency us: min (\d+)\s+avg (\d+)\s+max (\d+)\s+jitter (\d+)",
                      stats)
     gen = re.search(r"gen\s+sent (\d+), failed (\d+)", stats)
@@ -151,6 +156,17 @@ def main():
         share = 100.0 * result["lost"] / max(1, result["rx"] + result["lost"])
         check(5 <= share <= 15, f"loss 10%: sink saw {share:.1f}% lost", result)
         check(19_000 <= result["lat_min"] <= 24_000, f"delay 20 ms: minimum latency {result['lat_min']} us", result)
+    finally:
+        lab.stop()
+    lab = Lab()
+    try:
+        # Routable mode: the same measurement with UDP/IP frames. The generator ARPs
+        # for the sink's address (the sink answers), then sends datagrams.
+        result = run_scenario(
+            lab, base + "gen.rate=4000 gen.ip=10.0.1.2 gen.dst=10.0.2.2 sink.ip=10.0.2.2 rate=1000 queue=40", 4)
+        check(950 <= result["avg_kbit"] <= 1050, f"UDP/IP frames: sink measured {result['avg_kbit']} kbit/s behind a 1000 kbit/s limiter", result)
+        check(result["rx"] > 400 and result["dup"] == 0 and result["reord"] == 0,
+              f"UDP/IP frames arrive intact and in order ({result['rx']} datagrams)", result)
     finally:
         lab.stop()
     print("PASS: nettest's generator and sink measure the impairment link through a four-NIC loop.")

@@ -1145,7 +1145,20 @@ Ethernet frames, header included): `gen.rate=KBIT`, `gen.size=BYTES` (60-1514),
 `gen.to=MAC` (default: the local sink's MAC, else broadcast), `gen.count=N`,
 `gen.time=SECONDS`, and `gen.run=on` to start at launch (after `gen.delay=S`
 seconds, so links can come up). At the prompt: `gen start|stop|show`, `gen rate
-KBIT`, and so on. The sink reports frames received, average and current
+KBIT`, and so on. **Routable (UDP/IP) mode.** Give the generator addresses and its frames become
+Ethernet/IPv4/UDP datagrams that can cross a router: `gen.ip=SRC gen.dst=DST
+[gen.gw=GATEWAY] [gen.port=N]` (the next hop is the gateway, or DST itself on the
+same subnet; the generator ARPs for it twice a second until it answers and sends
+nothing before that), and `sink.ip=ADDR [sink.port=N]` makes the sink accept UDP
+to that address and answer ARP for it, which is what lets a router (or the
+generator) find it. Both can be changed at the prompt (`gen ip|dst|gw|port`,
+`sink ip|port`). Example, testing the `router` tape on another machine between
+two ports of this one:
+`tape run nettest gen=1 sink=2 gen.ip=10.0.1.2 gen.dst=10.0.2.2 gen.gw=10.0.1.1
+sink.ip=10.0.2.2 gen.rate=2000 gen.run=on` with the router at 10.0.1.1 / 10.0.2.1.
+`make test-tape-nettest-router` does exactly that with two QEMU guests.
+
+The sink reports frames received, average and current
 throughput, loss (from sequence gaps), duplicates, reordering, and one-way
 latency (min/avg/max and RFC 3550 jitter) -- exact when generator and sink share
 the tape, because they share one clock. `sink [show|reset]`, `stats` and the

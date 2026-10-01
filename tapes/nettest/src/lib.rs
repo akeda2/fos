@@ -428,6 +428,157 @@ const GEN_MAX_BURST: u32 = 16;
 /// now instead of catching up, and the event is counted.
 const GEN_MAX_LAG_US: u64 = 200_000;
 
+// ---------------------------------------------------------------------------
+// Routable mode: the same numbered, timestamped payload carried in an
+// Ethernet / IPv4 / UDP frame, so it can cross a router. The generator ARPs for
+// its next hop (the gateway, or the destination itself on the same subnet) and
+// the sink answers ARP for its own address.
+
+pub const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
+pub const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
+/// Ethernet (14) + IPv4 (20) + UDP (8).
+pub const UDP_HEADERS_LEN: usize = 42;
+/// Where the test header (magic, stream, sequence, timestamp) starts and ends
+/// in a UDP frame.
+const UDP_TEST_END: usize = UDP_HEADERS_LEN + 18;
+
+/// Addresses and ports of a routable stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct UdpPlan {
+    pub source_ip: [u8; 4],
+    pub destination_ip: [u8; 4],
+    /// Whose MAC the frames are addressed to: the gateway, or the destination.
+    pub next_hop: [u8; 4],
+    pub source_port: u16,
+    pub destination_port: u16,
+}
+
+/// RFC 1071 Internet checksum of `data`, as the 16-bit value to store.
+pub fn internet_checksum(data: &[u8], initial: u32) -> u16 {
+    let mut sum = initial;
+    let mut chunks = data.chunks_exact(2);
+    for pair in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    if let [last] = chunks.remainder() {
+        sum += u32::from(*last) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Builds an Ethernet/IPv4/UDP frame of `size` bytes into `out` carrying the
+/// test header; returns `size`.
+fn build_udp_frame(
+    out: &mut [u8],
+    size: usize,
+    plan: &UdpPlan,
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    sequence: u32,
+    sent_us: u64,
+) -> usize {
+    out[0..6].copy_from_slice(&destination_mac);
+    out[6..12].copy_from_slice(&source_mac);
+    out[12..14].copy_from_slice(&ETHERTYPE_IPV4);
+    let ip_length = (size - 14) as u16;
+    out[14] = 0x45;
+    out[15] = 0;
+    out[16..18].copy_from_slice(&ip_length.to_be_bytes());
+    out[18..20].copy_from_slice(&(sequence as u16).to_be_bytes());
+    out[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // don't fragment
+    out[22] = 64; // TTL
+    out[23] = 17; // UDP
+    out[24..26].copy_from_slice(&[0, 0]);
+    out[26..30].copy_from_slice(&plan.source_ip);
+    out[30..34].copy_from_slice(&plan.destination_ip);
+    let header_checksum = internet_checksum(&out[14..34], 0);
+    out[24..26].copy_from_slice(&header_checksum.to_be_bytes());
+    let udp_length = (size - 34) as u16;
+    out[34..36].copy_from_slice(&plan.source_port.to_be_bytes());
+    out[36..38].copy_from_slice(&plan.destination_port.to_be_bytes());
+    out[38..40].copy_from_slice(&udp_length.to_be_bytes());
+    out[40..42].copy_from_slice(&[0, 0]);
+    out[42..46].copy_from_slice(GEN_MAGIC);
+    out[46..48].copy_from_slice(&0u16.to_le_bytes());
+    out[48..52].copy_from_slice(&sequence.to_le_bytes());
+    out[52..60].copy_from_slice(&sent_us.to_le_bytes());
+    for (offset, byte) in out[UDP_TEST_END..size].iter_mut().enumerate() {
+        *byte = (offset as u8).wrapping_add(sequence as u8);
+    }
+    // UDP checksum over the pseudo-header (source, destination, protocol, length)
+    // and the whole datagram; 0 would mean "none", so a computed 0 becomes 0xffff.
+    let mut pseudo = 0u32;
+    for pair in plan.source_ip.chunks(2).chain(plan.destination_ip.chunks(2)) {
+        pseudo += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    pseudo += 17 + u32::from(udp_length);
+    let udp_checksum = match internet_checksum(&out[34..size], pseudo) {
+        0 => 0xffff,
+        value => value,
+    };
+    out[40..42].copy_from_slice(&udp_checksum.to_be_bytes());
+    size
+}
+
+/// What an ARP packet says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ArpInfo {
+    pub is_reply: bool,
+    pub sender_mac: [u8; 6],
+    pub sender_ip: [u8; 4],
+    pub target_ip: [u8; 4],
+}
+
+pub fn parse_arp(frame: &[u8]) -> Option<ArpInfo> {
+    if frame.len() < 42 || frame[12..14] != ETHERTYPE_ARP || frame[14..20] != [0, 1, 8, 0, 6, 4] {
+        return None;
+    }
+    let operation = u16::from_be_bytes([frame[20], frame[21]]);
+    if operation != 1 && operation != 2 {
+        return None;
+    }
+    Some(ArpInfo {
+        is_reply: operation == 2,
+        sender_mac: frame[22..28].try_into().unwrap(),
+        sender_ip: frame[28..32].try_into().unwrap(),
+        target_ip: frame[38..42].try_into().unwrap(),
+    })
+}
+
+/// An ARP request (`target_mac` all zero, sent to broadcast) or reply (sent to
+/// `target_mac`), padded to the 60-byte Ethernet minimum. Returns 60.
+pub fn build_arp(out: &mut [u8], reply: bool, sender_mac: [u8; 6], sender_ip: [u8; 4],
+                 target_mac: [u8; 6], target_ip: [u8; 4]) -> usize {
+    out[..60].fill(0);
+    out[0..6].copy_from_slice(&if reply { target_mac } else { [0xff; 6] });
+    out[6..12].copy_from_slice(&sender_mac);
+    out[12..14].copy_from_slice(&ETHERTYPE_ARP);
+    out[14..20].copy_from_slice(&[0, 1, 8, 0, 6, 4]);
+    out[20..22].copy_from_slice(&(if reply { 2u16 } else { 1 }).to_be_bytes());
+    out[22..28].copy_from_slice(&sender_mac);
+    out[28..32].copy_from_slice(&sender_ip);
+    out[32..38].copy_from_slice(&if reply { target_mac } else { [0; 6] });
+    out[38..42].copy_from_slice(&target_ip);
+    60
+}
+
+/// Parses `a.b.c.d`.
+pub fn parse_ip(text: &[u8]) -> Option<[u8; 4]> {
+    let mut ip = [0u8; 4];
+    let mut count = 0;
+    for part in text.split(|&byte| byte == b'.') {
+        if count == 4 {
+            return None;
+        }
+        ip[count] = u8::try_from(parse_u32(part)?).ok()?;
+        count += 1;
+    }
+    (count == 4).then_some(ip)
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct GenStats {
     pub sent: u32,
@@ -450,6 +601,10 @@ pub struct Generator {
     /// Stop after this many seconds (0 = no limit).
     pub seconds_limit: u32,
     pub stats: GenStats,
+    /// Routable mode: send UDP/IP frames instead of raw ones. `destination`
+    /// then holds the next hop's MAC once `resolved`.
+    pub udp: Option<UdpPlan>,
+    pub resolved: bool,
     sequence: u32,
     /// When the next frame is due, in nanoseconds (finer than a microsecond so
     /// the rounding of a 12 us gigabit interval does not drift).
@@ -467,6 +622,8 @@ impl Generator {
             count_limit: 0,
             seconds_limit: 0,
             stats: GenStats { sent: 0, send_failed: 0, bytes: 0, lagged: 0 },
+            udp: None,
+            resolved: true,
             sequence: 0,
             next_due_ns: 0,
             started_us: 0,
@@ -485,6 +642,22 @@ impl Generator {
         self.running = false;
     }
 
+    /// Sets the UDP plan; frames wait for the next hop's MAC (`resolve`).
+    pub fn set_udp(&mut self, plan: UdpPlan) {
+        self.udp = Some(plan);
+        self.resolved = false;
+    }
+
+    /// The next hop answered ARP: from now on frames go to `mac`.
+    pub fn resolve(&mut self, mac: [u8; 6], now_us: u64) {
+        self.destination = mac;
+        if !self.resolved {
+            self.resolved = true;
+            // Frames were held, not owed: start the schedule from now.
+            self.next_due_ns = self.next_due_ns.max(now_us * 1000);
+        }
+    }
+
     /// Nanoseconds between frames for the current size and rate.
     pub fn interval_ns(&self) -> u64 {
         // bits / (rate * 1000 bit/s) seconds = bits * 1_000_000 / rate ns.
@@ -495,7 +668,7 @@ impl Generator {
     /// again for more (up to a burst limit per `pass`). The caller sends the
     /// frame and reports the outcome with `record_send`.
     pub fn next_frame(&mut self, now_us: u64, source: [u8; 6], out: &mut [u8], sent_this_pass: u32) -> Option<usize> {
-        if !self.running || sent_this_pass >= GEN_MAX_BURST {
+        if !self.running || sent_this_pass >= GEN_MAX_BURST || !self.resolved {
             return None;
         }
         if (self.count_limit != 0 && self.stats.sent + self.stats.send_failed >= self.count_limit)
@@ -514,6 +687,12 @@ impl Generator {
             self.stats.lagged = self.stats.lagged.wrapping_add(1);
         }
         let size = self.size.clamp(GEN_MIN_SIZE.max(GEN_HEADER_LEN), MAX_FRAME).min(out.len());
+        if let Some(plan) = self.udp {
+            build_udp_frame(out, size, &plan, self.destination, source, self.sequence, now_us);
+            self.sequence = self.sequence.wrapping_add(1);
+            self.next_due_ns += self.interval_ns();
+            return Some(size);
+        }
         out[0..6].copy_from_slice(&self.destination);
         out[6..12].copy_from_slice(&source);
         out[12..14].copy_from_slice(&GEN_ETHERTYPE);
@@ -559,6 +738,9 @@ pub struct SinkStats {
 /// Checks generated frames off: counts, loss, duplicates, reordering, latency.
 pub struct Sink {
     pub stats: SinkStats,
+    /// Routable mode: also accept UDP datagrams to this address and port.
+    pub udp_ip: Option<[u8; 4]>,
+    pub udp_port: u16,
     expected: u32,
     /// Bit `i` set: sequence `expected - 1 - i` has been received.
     window: u64,
@@ -569,6 +751,8 @@ pub struct Sink {
 impl Sink {
     pub const fn new() -> Self {
         Self {
+            udp_ip: None,
+            udp_port: 9000,
             stats: SinkStats {
                 received: 0, bytes: 0, lost: 0, duplicated: 0, reordered: 0, latency_min: 0,
                 latency_max: 0, latency_sum: 0, jitter: 0, first_us: 0, last_us: 0,
@@ -581,16 +765,40 @@ impl Sink {
     }
 
     pub fn reset(&mut self) {
+        let (ip, port) = (self.udp_ip, self.udp_port);
         *self = Self::new();
+        self.udp_ip = ip;
+        self.udp_port = port;
     }
 
     /// Consumes a received frame if it is one of the generator's; false if not.
     pub fn on_frame(&mut self, frame: &[u8], now_us: u64) -> bool {
-        if frame.len() < GEN_HEADER_LEN || frame[12..14] != GEN_ETHERTYPE || &frame[14..18] != GEN_MAGIC {
+        let (sequence, sent_us) = if frame.len() >= GEN_HEADER_LEN
+            && frame[12..14] == GEN_ETHERTYPE
+            && &frame[14..18] == GEN_MAGIC
+        {
+            (
+                u32::from_le_bytes(frame[20..24].try_into().unwrap()),
+                u64::from_le_bytes(frame[24..32].try_into().unwrap()),
+            )
+        } else if let (Some(ip), true) = (self.udp_ip, frame.len() >= UDP_TEST_END) {
+            if frame[12..14] != ETHERTYPE_IPV4
+                || frame[14] >> 4 != 4
+                || frame[14] & 0x0f != 5
+                || frame[23] != 17
+                || frame[30..34] != ip
+                || u16::from_be_bytes([frame[36], frame[37]]) != self.udp_port
+                || &frame[42..46] != GEN_MAGIC
+            {
+                return false;
+            }
+            (
+                u32::from_le_bytes(frame[48..52].try_into().unwrap()),
+                u64::from_le_bytes(frame[52..60].try_into().unwrap()),
+            )
+        } else {
             return false;
-        }
-        let sequence = u32::from_le_bytes(frame[20..24].try_into().unwrap());
-        let sent_us = u64::from_le_bytes(frame[24..32].try_into().unwrap());
+        };
         let latency = now_us.saturating_sub(sent_us).min(u64::from(u32::MAX)) as u32;
         let stats = &mut self.stats;
         if !self.seen_any {
@@ -967,6 +1175,83 @@ mod tests {
         }
         assert_eq!(sink.stats.lost, 3);
         assert_eq!(sink.stats.received, 5);
+    }
+
+    fn udp_plan() -> UdpPlan {
+        UdpPlan {
+            source_ip: [10, 0, 1, 2],
+            destination_ip: [10, 0, 2, 2],
+            next_hop: [10, 0, 1, 1],
+            source_port: 9001,
+            destination_port: 9000,
+        }
+    }
+
+    #[test]
+    fn udp_frames_are_valid_ipv4_and_udp() {
+        let mut generator = Generator::new();
+        generator.rate_kbit = 1_000_000;
+        generator.size = 300;
+        generator.set_udp(udp_plan());
+        generator.start(100);
+        let mut frame = [0u8; 1514];
+        // Held until the next hop's MAC is known.
+        assert_eq!(generator.next_frame(1_000, [2; 6], &mut frame, 0), None);
+        generator.resolve([0xaa; 6], 1_000);
+        let length = generator.next_frame(1_000, [2; 6], &mut frame, 0).unwrap();
+        assert_eq!(length, 300);
+        assert_eq!(frame[0..6], [0xaa; 6]);
+        assert_eq!(frame[12..14], ETHERTYPE_IPV4);
+        // A correct IPv4 header sums (with its own checksum) to zero.
+        assert_eq!(internet_checksum(&frame[14..34], 0), 0);
+        assert_eq!(u16::from_be_bytes([frame[16], frame[17]]), 286);
+        // And so does the UDP datagram with its pseudo-header.
+        let mut pseudo = 0u32;
+        for pair in [10u8, 0, 1, 2, 10, 0, 2, 2].chunks(2) {
+            pseudo += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        pseudo += 17 + 266;
+        assert_eq!(internet_checksum(&frame[34..300], pseudo), 0);
+    }
+
+    #[test]
+    fn the_sink_accepts_udp_only_for_its_address_and_port() {
+        let mut generator = Generator::new();
+        generator.rate_kbit = 1_000_000;
+        generator.size = 100;
+        generator.set_udp(udp_plan());
+        generator.resolve([1; 6], 0);
+        generator.start(0);
+        let mut frame = [0u8; 200];
+        let length = generator.next_frame(50, [2; 6], &mut frame, 0).unwrap();
+        let mut sink = Sink::new();
+        assert!(!sink.on_frame(&frame[..length], 100), "no address configured yet");
+        sink.udp_ip = Some([10, 0, 2, 2]);
+        assert!(sink.on_frame(&frame[..length], 100));
+        assert_eq!(sink.stats.received, 1);
+        assert_eq!(sink.stats.latency_min, 50);
+        sink.udp_port = 9999;
+        assert!(!sink.on_frame(&frame[..length], 100), "wrong port");
+        sink.udp_port = 9000;
+        sink.udp_ip = Some([10, 0, 2, 3]);
+        assert!(!sink.on_frame(&frame[..length], 100), "wrong address");
+    }
+
+    #[test]
+    fn arp_round_trip_and_ip_parsing() {
+        let mut buffer = [0u8; 64];
+        build_arp(&mut buffer, false, [1; 6], [10, 0, 1, 2], [0; 6], [10, 0, 1, 1]);
+        let request = parse_arp(&buffer).unwrap();
+        assert!(!request.is_reply);
+        assert_eq!(request.target_ip, [10, 0, 1, 1]);
+        build_arp(&mut buffer, true, [3; 6], [10, 0, 1, 1], [1; 6], [10, 0, 1, 2]);
+        assert_eq!(buffer[0..6], [1; 6]);
+        let reply = parse_arp(&buffer).unwrap();
+        assert!(reply.is_reply);
+        assert_eq!(reply.sender_mac, [3; 6]);
+        assert_eq!(parse_ip(b"192.168.0.17"), Some([192, 168, 0, 17]));
+        assert_eq!(parse_ip(b"192.168.0"), None);
+        assert_eq!(parse_ip(b"192.168.0.256"), None);
     }
 
     #[test]

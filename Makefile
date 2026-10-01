@@ -73,7 +73,7 @@ EXTRA_FOSFS_FILES ?=
 # directory before invoking cargo.
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-idle-cpu test-hwaccess test-nic-map test-release-loops test-msi test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-nettest tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-nettest test-tape-router test-tape-router-arp test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-idle-cpu test-hwaccess test-nic-map test-release-loops test-msi test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-nettest tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-nettest test-tape-nettest-router test-tape-router test-tape-router-arp test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -145,6 +145,7 @@ help:
 	@echo "  make test-tape-bridge - build the image/tape and run the three-guest layer-2 bridge test"
 	@echo "  make test-tape-router-arp - verify the router holds the first packet across an ARP miss"
 	@echo "  make test-nic-map     - boot five NICs on virtual cables and check that nic map finds them"
+	@echo "  make test-tape-nettest-router - nettest UDP/IP traffic through the router tape (two guests)"
 	@echo "  make test-tape-nettest - run the nettest engine unit tests and the three-guest loss/delay/rate test"
 	@echo "  make test-tape-router - build the image/tape and run the three-guest IPv4 router test"
 	@echo "  make test-tape-ed     - build the image/tape and verify editor FOSFS persistence"
@@ -594,6 +595,9 @@ tape-nettest:
 	cd tapes/nettest && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 	mkdir -p $(BUILD)/tapes
 	cp $(CARGO_TARGET_DIR)/i686-fos/release/nettest-tape $(TAPE_NETTEST_BIN)
+
+test-tape-nettest-router: image tape-nettest tape-router
+	python3 tapes/test_nettest_router_e2e.py
 
 test-tape-nettest: image tape-nettest
 	cargo +nightly-2026-09-13 test --manifest-path tapes/nettest/Cargo.toml --lib

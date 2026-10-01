@@ -25,8 +25,8 @@ extern crate nettest_tape;
 
 use core::ptr::addr_of_mut;
 use nettest_tape::{
-    Config, Direction, GEN_HEADER_LEN, Generator, MAX_FRAME, PRESETS, Rng, SLOT_BYTES, Sink,
-    parse_mac, parse_permille, parse_u32, preset,
+    ArpInfo, Config, Direction, GEN_HEADER_LEN, Generator, MAX_FRAME, PRESETS, Rng, SLOT_BYTES,
+    Sink, UdpPlan, build_arp, parse_arp, parse_ip, parse_mac, parse_permille, parse_u32, preset,
 };
 use tape_rt::{print_bytes, print_u32};
 
@@ -68,6 +68,14 @@ struct Session<'a> {
     /// `gen.delay` seconds: links often need a moment to come up).
     gen_autostart: bool,
     gen_delay_s: u32,
+    /// Routable mode pieces (`gen.ip`, `gen.dst`, `gen.gw`, `gen.port`); the
+    /// generator's `UdpPlan` is rebuilt from them whenever one changes.
+    udp_source: Option<[u8; 4]>,
+    udp_destination: Option<[u8; 4]>,
+    udp_gateway: Option<[u8; 4]>,
+    udp_port: u16,
+    /// When the generator last asked for its next hop's MAC.
+    last_arp_us: u64,
     /// The two-port impairment link is active (not when only gen/sink given).
     limiter: bool,
     /// Passes of the polling loop and when it started: a long average pass is
@@ -159,6 +167,11 @@ pub extern "C" fn tape_main(
         destination_explicit: false,
         gen_autostart: false,
         gen_delay_s: 0,
+        udp_source: None,
+        udp_destination: None,
+        udp_gateway: None,
+        udp_port: 9000,
+        last_arp_us: 0,
         limiter: true,
         passes: 0,
         loop_started_us: 0,
@@ -306,6 +319,16 @@ pub extern "C" fn tape_main(
                     break;
                 }
                 busy = true;
+                if let Some(info) = parse_arp(&frame[..received]) {
+                    // Routable mode: answer ARP for the sink's own address, so a
+                    // router (or the generator) can find it.
+                    if !info.is_reply && Some(info.target_ip) == session.sink.udp_ip {
+                        let mut reply = [0u8; 64];
+                        build_arp(&mut reply, true, sink_mac, info.target_ip, info.sender_mac, info.sender_ip);
+                        let _ = nic_send_at(nic, reply.as_ptr() as u32, 60);
+                    }
+                    continue;
+                }
                 let _ = session.sink.on_frame(&frame[..received], micros());
             }
         }
@@ -316,6 +339,27 @@ pub extern "C" fn tape_main(
                 let received = nic_receive_at(nic, frame.as_mut_ptr() as u32, max_frame_len as u32) as usize;
                 if received < ETHERNET_HEADER_LEN {
                     break;
+                }
+                // Routable mode: learn the next hop's MAC from its ARP reply, and
+                // answer ARP for the generator's own address.
+                if let (Some(info), Some(plan)) = (parse_arp(&frame[..received]), session.generator.udp) {
+                    let ArpInfo { is_reply, sender_mac, sender_ip, target_ip } = info;
+                    if is_reply && sender_ip == plan.next_hop {
+                        session.generator.resolve(sender_mac, now_us);
+                    } else if !is_reply && target_ip == plan.source_ip {
+                        let mut reply = [0u8; 64];
+                        build_arp(&mut reply, true, gen_mac, plan.source_ip, sender_mac, sender_ip);
+                        let _ = nic_send_at(nic, reply.as_ptr() as u32, 60);
+                    }
+                }
+            }
+            // Still looking for the next hop: ask twice a second.
+            if let Some(plan) = session.generator.udp {
+                if !session.generator.resolved && now_us.wrapping_sub(session.last_arp_us) >= 500_000 {
+                    session.last_arp_us = now_us;
+                    let mut request = [0u8; 64];
+                    build_arp(&mut request, false, gen_mac, plan.source_ip, [0; 6], plan.next_hop);
+                    let _ = nic_send_at(nic, request.as_ptr() as u32, 60);
                 }
             }
         }
@@ -550,6 +594,9 @@ fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
     if let Some(setting) = key.strip_prefix(b"gen.") {
         return gen_setting(session, setting, value);
     }
+    if let Some(setting) = key.strip_prefix(b"sink.") {
+        return sink_setting(session, setting, value);
+    }
     if key == b"view" {
         // Before the tape's loop starts this only records the wish; the panel
         // is drawn once the ports are known.
@@ -573,6 +620,35 @@ fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
     configure(session, name, way, &parts[..count]).is_ok()
 }
 
+/// `sink.ip=A.B.C.D` (answer ARP for it and accept UDP to it) and `sink.port=N`.
+fn sink_setting(session: &mut Session<'_>, setting: &[u8], value: &[u8]) -> bool {
+    match setting {
+        b"ip" => parse_ip(value).map(|ip| session.sink.udp_ip = Some(ip)).is_some(),
+        b"port" => parse_u32(value)
+            .filter(|&port| (1..=65535).contains(&port))
+            .map(|port| {
+                session.sink.udp_port = port as u16;
+                session.udp_port = port as u16;
+                rebuild_udp(session);
+            })
+            .is_some(),
+        _ => false,
+    }
+}
+
+/// Recomputes the generator's UDP plan once source and destination are known.
+fn rebuild_udp(session: &mut Session<'_>) {
+    if let (Some(source), Some(destination)) = (session.udp_source, session.udp_destination) {
+        session.generator.set_udp(UdpPlan {
+            source_ip: source,
+            destination_ip: destination,
+            next_hop: session.udp_gateway.unwrap_or(destination),
+            source_port: 9001,
+            destination_port: session.udp_port,
+        });
+    }
+}
+
 /// One generator setting: `rate` (kbit/s), `size` (bytes), `to` (MAC or
 /// `sink`), `count`, `time` (seconds) and `run` (`on` starts sending at launch).
 fn gen_setting(session: &mut Session<'_>, setting: &[u8], value: &[u8]) -> bool {
@@ -586,6 +662,26 @@ fn gen_setting(session: &mut Session<'_>, setting: &[u8], value: &[u8]) -> bool 
         b"count" => parse_u32(value).map(|count| generator.count_limit = count).is_some(),
         b"time" => parse_u32(value).map(|seconds| generator.seconds_limit = seconds).is_some(),
         b"delay" => parse_u32(value).map(|seconds| session.gen_delay_s = seconds).is_some(),
+        b"ip" | b"dst" | b"gw" => match parse_ip(value) {
+            Some(ip) => {
+                match setting {
+                    b"ip" => session.udp_source = Some(ip),
+                    b"dst" => session.udp_destination = Some(ip),
+                    _ => session.udp_gateway = Some(ip),
+                }
+                rebuild_udp(session);
+                true
+            }
+            None => false,
+        },
+        b"port" => match parse_u32(value).filter(|&port| (1..=65535).contains(&port)) {
+            Some(port) => {
+                session.udp_port = port as u16;
+                rebuild_udp(session);
+                true
+            }
+            None => false,
+        },
         b"to" => {
             if value == b"sink" {
                 session.destination_explicit = false;
@@ -730,6 +826,13 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
                 session.sink.reset();
                 print_bytes(putc, b"sink counters cleared\n");
             }
+            Some(setting @ (b"ip" | b"port")) => {
+                if !sink_setting(session, setting, words.get(2).copied().unwrap_or(b"")) {
+                    print_bytes(putc, b"bad value; type help\n");
+                    return Outcome::Error;
+                }
+                print_sink_line(putc, session);
+            }
             None | Some(b"show") => print_sink_line(putc, session),
             _ => {
                 print_bytes(putc, b"use: sink [show|reset]\n");
@@ -799,7 +902,7 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
             print_gen_line(putc, session);
         }
         b"show" => print_gen_config(putc, session),
-        b"rate" | b"size" | b"to" | b"count" | b"time" => {
+        b"rate" | b"size" | b"to" | b"count" | b"time" | b"ip" | b"dst" | b"gw" | b"port" => {
             let value = words.get(1).copied().unwrap_or(b"");
             if !gen_setting(session, verb, value) {
                 print_bytes(putc, b"bad value; type help\n");
@@ -838,6 +941,13 @@ fn print_hundredths(putc: Putc, value: u32) {
 }
 
 fn print_gen_config(putc: Putc, session: &Session<'_>) {
+    print_gen_config_line(putc, session);
+    putc(u32::from(b'\n'));
+    print_gen_udp_line(putc, session);
+}
+
+/// The generator's settings on one line (no newline): used by the panel too.
+fn print_gen_config_line(putc: Putc, session: &Session<'_>) {
     let generator = &session.generator;
     print_bytes(putc, b"gen  NIC ");
     match session.gen_nic {
@@ -861,7 +971,31 @@ fn print_gen_config(putc: Putc, session: &Session<'_>) {
         print_u32(putc, generator.seconds_limit);
         print_bytes(putc, b" s");
     }
-    putc(u32::from(b'\n'));
+}
+
+/// The routable-mode addresses, when set (with its own newline).
+fn print_gen_udp_line(putc: Putc, session: &Session<'_>) {
+    let generator = &session.generator;
+    if let Some(plan) = generator.udp {
+        print_bytes(putc, b"     UDP ");
+        print_ip(putc, &plan.source_ip);
+        print_bytes(putc, b" -> ");
+        print_ip(putc, &plan.destination_ip);
+        print_bytes(putc, b":");
+        print_u32(putc, u32::from(plan.destination_port));
+        print_bytes(putc, b" via ");
+        print_ip(putc, &plan.next_hop);
+        print_bytes(putc, if generator.resolved { b" (resolved)\n" } else { b" (ARP pending)\n" });
+    }
+}
+
+fn print_ip(putc: Putc, ip: &[u8; 4]) {
+    for (index, byte) in ip.iter().enumerate() {
+        if index != 0 {
+            putc(u32::from(b'.'));
+        }
+        print_u32(putc, u32::from(*byte));
+    }
 }
 
 fn print_gen_line(putc: Putc, session: &Session<'_>) {
@@ -938,7 +1072,9 @@ fn print_help(putc: Putc) {
           gen start|stop|show          the traffic generator (needs gen=N)\n\
           gen rate KBIT | size BYTES   constant bit rate of whole frames\n\
           gen to MAC|sink | count N | time S    destination; stop after N / S\n\
+          gen ip|dst|gw A.B.C.D | port N   send routable UDP/IP (ARP for the gateway)\n\
           sink [show|reset]            the receiver (needs sink=N): loss, latency\n\
+          sink ip A.B.C.D | port N     also accept UDP/IP; answer ARP for the address\n\
           quit                         stop (Escape also stops)\n",
     );
 }
@@ -1220,7 +1356,7 @@ fn view_draw(putc: Putc, session: &Session<'_>, now_tick: u64) {
     if session.gen_nic.is_some() || session.sink_nic.is_some() {
         view_row(putc, row);
         if session.gen_nic.is_some() {
-            print_gen_config(putc, session);
+            print_gen_config_line(putc, session);
         }
         csi(putc, &[], b'K');
         view_row(putc, row + 1);
