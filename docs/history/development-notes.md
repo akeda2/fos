@@ -2975,3 +2975,20 @@ isolating the bug to this driver's own header-field order. (`-object
 filter-dump,id=ID,netdev=NETDEV_ID,file=PATH.pcap`, a QEMU netdev capture
 filter, is a lower-effort complementary tool worth reaching for first in
 any future "does the frame even arrive" investigation.)
+
+## PCI IRQs silently re-masked after every BIOS disk call (full detail)
+
+Found while making idle loops `hlt` until a NIC interrupt: `irqstat` showed
+`PCI IRQ11: 0 dispatches` after 32 received frames, and QEMU's `info pic`
+showed the slave PIC fully masked (`imr=ff`, IRQ11 pending in `irr`) and the
+master's cascade line masked too. Cause: `interrupts::use_kernel_pic_mapping()`
+(run after each BIOS disk transfer in `disk::transfer`) called `remap_pic()`,
+which resets `PIC1_MASK`/`PIC2_MASK` to "timer and keyboard only". Every IRQ a
+driver had unmasked through `register_pci_irq` was therefore masked again by
+the first disk access after NIC setup, so NIC handlers were registered but
+never ran. It was invisible because every NIC path polls, and it made
+`tapes/test_bridge_e2e.py`'s "NIC interrupt notifications > 0" assertion fail.
+Fix: `use_kernel_pic_mapping` now reprograms the PIC with the saved current
+masks; only boot-time `remap_pic` resets them. A useful diagnostic: boot, send
+frames, then run `irqstat` and compare with the QEMU monitor's `info pic`.
+`test-audio-capture` fails identically with and without this fix (unrelated).

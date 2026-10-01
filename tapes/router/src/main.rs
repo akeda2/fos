@@ -2553,6 +2553,21 @@ pub extern "C" fn tape_main(
     fs_read: FsRead,
     fs_write: FsWrite,
     _fs_remove: FsRemove,
+    _audio_sample_rate: extern "C" fn() -> u32,
+    _audio_channels_and_bits: extern "C" fn() -> u32,
+    _audio_submit: extern "C" fn(u32, u32) -> u32,
+    _audio_capture: extern "C" fn(u32, u32) -> u32,
+    _audio_count: extern "C" fn() -> u32,
+    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_sample_rate: extern "C" fn() -> u32,
+    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
+    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    // Sleeps until the next interrupt; call after a pass that found no work.
+    wait_for_event: extern "C" fn(),
 ) {
     let nic_total = nic_count() as usize;
     let arguments = if args_len == 0 {
@@ -3063,6 +3078,7 @@ pub extern "C" fn tape_main(
             &configs,
             &parsed.dhcp_uplinks,
         );
+        let mut received_any = false;
         for ingress in 0..interface_count {
             if should_abort() == TAPE_EVENT_ABORT {
                 break 'router;
@@ -3075,6 +3091,7 @@ pub extern "C" fn tape_main(
             if length == 0 {
                 continue;
             }
+            received_any = true;
             let length = min(length, MAX_FRAME_LEN);
             if parsed.dhcp_server && !parsed.dhcp_uplinks[..parsed.dhcp_uplink_count]
                 .iter().flatten().any(|uplink| *uplink == interfaces[ingress].nic) {
@@ -3171,6 +3188,13 @@ pub extern "C" fn tape_main(
                     None => print_bytes(putc, b"Uplink failover: no healthy DHCP lease. Existing NAT flows may break.\n"),
                 }
             }
+        }
+        // Nothing arrived on any interface: sleep until the next frame or
+        // timer tick (at most ~10 ms) instead of spinning. The timed work at
+        // the top of this loop (health polls, DHCP renewals, lease flushes)
+        // is checked against `ticks()` and still runs within one tick.
+        if !received_any {
+            wait_for_event();
         }
     }
 

@@ -213,7 +213,7 @@ test-start:
 test-scripts-settings: image
 	python3 tools/test_scripts_settings_e2e.py
 
-test-idle-cpu: image tape-vga-colors
+test-idle-cpu: image tape-vga-colors tape-bridge tape-router
 	python3 tools/test_idle_cpu_e2e.py
 
 test-second-disk: image

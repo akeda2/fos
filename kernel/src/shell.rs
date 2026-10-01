@@ -5296,6 +5296,16 @@ extern "C" fn tape_nic_max_frame_len() -> u32 {
 /// Returns the monotonic PIT tick counter used by the kernel. Protocol
 /// retransmission and connection deadlines should use this callback rather
 /// than programming a timer or reading PIT hardware from a tape.
+/// Tape ABI callback `wait_for_event`: sleeps until the next interrupt (a
+/// received frame, a keypress, or at worst the 100 Hz PIT tick, so at most
+/// about 10 ms). A tape calls it after a polling pass that found nothing to do,
+/// instead of spinning at 100% CPU. It may return early or for no visible
+/// reason, so the tape must simply poll again; it never reports a result. If
+/// any NIC lacks a receive interrupt it returns at once (see `idle_wait`).
+extern "C" fn tape_wait_for_event() {
+    idle_wait();
+}
+
 extern "C" fn tape_ticks() -> u64 {
     interrupts::ticks()
 }
@@ -6003,6 +6013,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         audio_capture_channels_and_bits: extern "C" fn() -> u32,
         audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
         audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
+        wait_for_event: extern "C" fn(),
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -6045,6 +6056,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_audio_capture_channels_and_bits,
         tape_audio_capture_sample_rate_at,
         tape_audio_capture_channels_and_bits_at,
+        tape_wait_for_event,
     );
     unsafe {
         TAPE_BOOT_INFO = core::ptr::null();

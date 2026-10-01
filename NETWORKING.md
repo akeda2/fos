@@ -65,6 +65,15 @@ prefix remain binary-compatible. A tape that wants slot 22 must still declare
 slots 1 through 21, even if it does not use them; parameters cannot be skipped
 in the middle because that would shift later cdecl stack positions.
 
+Slots 23 through 35 are the audio callbacks (see `AUDIO.md`). Slot 36,
+`wait_for_event() -> ()`, puts the CPU to sleep until the next interrupt: call
+it after a polling pass that found no frame, key, or timer work, instead of
+spinning at 100% CPU. Every NIC's receive interrupt, the keyboard, and the
+100 Hz timer tick all end the sleep, so it costs a received frame no extra
+latency, and it may also return early, so simply poll again. It returns at
+once (no sleep) if any NIC lacks a working receive interrupt. `tapes/router/`
+and `tapes/bridge/` call it; a tape that never does behaves exactly as before.
+
 `nic_mac`/`nic_send`/`nic_receive` operate on the currently selected
 interface. `nic_count` reports how many interfaces initialized successfully;
 the `*_at` callbacks use a zero-based interface index and let a tape inspect,

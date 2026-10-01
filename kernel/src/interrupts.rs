@@ -496,9 +496,18 @@ pub fn use_bios_pic_mapping() {
     program_pic(BIOS_PIC1_OFFSET, BIOS_PIC2_OFFSET, 0xfe, 0xff);
 }
 
-/// Restores this kernel's own PIC mapping after a BIOS round trip.
+/// Restores this kernel's own PIC mapping after a BIOS round trip, keeping
+/// every IRQ the kernel had unmasked. `PIC1_MASK`/`PIC2_MASK` record the
+/// masks as `register_pci_irq` last left them, and `use_bios_pic_mapping`
+/// masks everything but IRQ0 for the BIOS call, so they must be written back
+/// here. This used to call `remap_pic()`, which resets the masks to
+/// "timer and keyboard only": the first BIOS disk transfer after NIC setup
+/// then silently re-masked every PCI IRQ (and the cascade), leaving device
+/// interrupts registered but never delivered -- invisible while everything
+/// polled, but fatal to any idle loop that sleeps until a NIC interrupt.
 pub fn use_kernel_pic_mapping() {
-    remap_pic();
+    let (master_mask, slave_mask) = unsafe { (PIC1_MASK, PIC2_MASK) };
+    program_pic(IRQ_BASE, IRQ_BASE + 8, master_mask, slave_mask);
 }
 
 fn program_pit() {

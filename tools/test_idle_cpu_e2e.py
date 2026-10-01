@@ -15,6 +15,9 @@ over a few seconds in each situation:
   3. `nic discover`, which polls every NIC           -> must be low.
   4. Control: the `vga-colors` tape, which spins      -> must be HIGH, which
      proves the measurement can see a busy guest at all.
+  5. The `bridge` and `router` tapes on a two-NIC guest, idle on the wire
+     (they call the tape ABI's `wait_for_event` after an empty polling
+     pass)                                              -> must be low.
 
 Run via `make test-idle-cpu`.
 """
@@ -26,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from test_scripts_settings_e2e import BUILD, GUEST_MACS, Guest, Mcast, build_image
+from test_scripts_settings_e2e import BUILD, GROUPS, GUEST_MACS, Guest, Mcast, build_image
 
 GROUP = ("230.42.42.83", 4283)
 LOW_LIMIT = 0.25  # fraction of one host core
@@ -73,6 +76,40 @@ def check(label: str, usage: float, low: bool) -> None:
         raise SystemExit(f"FAIL: control '{label}' used only {percent:.0f}% of a core;"
                          " the measurement cannot see a busy guest")
     print(f"PASS: {label}: {percent:.0f}% of a core")
+
+
+def test_network_tapes(tmp: Path) -> None:
+    image = tmp / "tapes.img"
+    build_image(image, {
+        "bridge.bin": BUILD / "tapes" / "bridge.bin",
+        "router.bin": BUILD / "tapes" / "router.bin",
+    })
+    monitor = str(tmp / "tapes.mon")
+    extra = ["-monitor", f"unix:{monitor},server,nowait"]
+    for index, (group, port) in enumerate(GROUPS):
+        extra += [
+            "-netdev", f"socket,id=net{index},mcast={group}:{port}",
+            "-device", f"rtl8139,netdev=net{index},mac={GUEST_MACS[index].hex(':')}",
+        ]
+    guest = Guest(image, extra)
+    try:
+        guest.read_until(b"Waiting for a remote terminal client to connect;", 20)
+        monitor_key(monitor, "f12")
+        guest.read_until(b"fos> ", 10)
+        for label, command, ready in (
+            ("bridge tape, idle", "bridge 1 2", b"learning Ethernet"),
+            ("router tape, idle", "router 1 192.168.50.1/24 2 192.168.60.1/24", b"Running"),
+        ):
+            start = len(guest.output)
+            guest.process.stdin.write(command.encode() + b"\r\n")
+            guest.process.stdin.flush()
+            guest.read_until(ready, 10, start)
+            time.sleep(1.5)
+            check(label, measure(guest), low=True)
+            monitor_key(monitor, "f12")
+            guest.read_until(b"Tape returned", 10, start)
+    finally:
+        guest.terminate()
 
 
 def main() -> None:
@@ -125,6 +162,7 @@ def main() -> None:
             guest.read_until(b"Tape returned", 10, start)
         finally:
             guest.terminate()
+        test_network_tapes(tmp)
 
 
 if __name__ == "__main__":

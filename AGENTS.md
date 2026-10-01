@@ -1970,9 +1970,14 @@ iteration found nothing, so they no longer pin the CPU. This is only done when
 every NIC has an enabled receive IRQ (`nic::all_rx_interrupt_driven`), so a
 frame wakes the CPU immediately; otherwise the loops spin as before. Loops that
 read COM1 (`term`, `chat`) must not halt: serial has no IRQ and a 16-byte FIFO
-can overflow. Tapes still spin until they call a future wait callback.
-`make test-idle-cpu` measures QEMU's host CPU use (about 7% idle vs 100% for a
-spinning tape).
+can overflow. Tapes get the same via the last ABI callback, `wait_for_event`
+(slot 36, `tape_wait_for_event` -> `idle_wait`); only `tapes/router` and
+`tapes/bridge` call it so far -- the interactive tapes (telnet, ip-chat,
+net-chat) and `tape-net`'s internal waits still spin. `make test-idle-cpu`
+measures QEMU's host CPU use (about 7% idle vs 100% for a spinning tape).
+Halting only costs a frame no latency because NIC IRQs really fire; see the
+PIC-mask note in `docs/history/development-notes.md` before touching
+`interrupts::use_kernel_pic_mapping`.
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 
 `kernel/src/lapic.rs` is a minimal local APIC driver, added to receive

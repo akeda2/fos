@@ -231,6 +231,26 @@ pub extern "C" fn tape_main(
     nic_send_at: NicSendAt,
     nic_receive_at: NicReceiveAt,
     nic_set_promiscuous_at: NicSetPromiscuousAt,
+    _terminal_position: extern "C" fn() -> u32,
+    _fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
+    _fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
+    _fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
+    _fs_remove: extern "C" fn(u32, u32) -> u32,
+    _audio_sample_rate: extern "C" fn() -> u32,
+    _audio_channels_and_bits: extern "C" fn() -> u32,
+    _audio_submit: extern "C" fn(u32, u32) -> u32,
+    _audio_capture: extern "C" fn(u32, u32) -> u32,
+    _audio_count: extern "C" fn() -> u32,
+    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_sample_rate: extern "C" fn() -> u32,
+    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
+    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    // Sleeps until the next interrupt; call after a pass that found no work.
+    wait_for_event: extern "C" fn(),
 ) {
     let nic_total = nic_count() as usize;
     if nic_total < 2 {
@@ -291,6 +311,7 @@ pub extern "C" fn tape_main(
     let mut dropped = 0u32;
 
     'bridge: loop {
+        let mut received_any = false;
         for ingress in 0..port_count {
             if should_abort() != 0 {
                 break 'bridge;
@@ -303,6 +324,7 @@ pub extern "C" fn tape_main(
             if received < ETHERNET_HEADER_LEN {
                 continue;
             }
+            received_any = true;
             let source: [u8; 6] = frame[6..12].try_into().unwrap();
             let destination: [u8; 6] = frame[0..6].try_into().unwrap();
             if local_port(&macs, port_count, &destination)
@@ -329,6 +351,11 @@ pub extern "C" fn tape_main(
         }
         if should_abort() != 0 {
             break;
+        }
+        // Idle pass: sleep until a frame arrives on any port (every NIC's
+        // receive interrupt wakes the CPU) or the next timer tick.
+        if !received_any {
+            wait_for_event();
         }
     }
 

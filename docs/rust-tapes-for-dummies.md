@@ -130,6 +130,11 @@ extern "C" fn tape_main(
   `nic_set_promiscuous_at(index, enabled)` callback enables or disables
   receive-all filtering on one interface; a layer-2 bridge needs this so it
   can receive frames addressed to hosts behind another port.
+- `wait_for_event()` is the last callback (slot 36, after the audio ones). Call
+  it when a polling pass found nothing to do: it sleeps until the next
+  interrupt (a received frame, a keypress, or at worst the 10 ms timer tick)
+  so an idle tape does not run the CPU at 100%. It may return early; just poll
+  again. See `tapes/bridge/src/main.rs` for the pattern.
 - `terminal_position()` returns the kernel's packed, 1-based ANSI cursor
   position: row in the high 16 bits and column in the low 16 bits. It is
   useful for terminal protocols that must answer a cursor-position request.
