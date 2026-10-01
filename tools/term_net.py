@@ -109,7 +109,8 @@ def recv_data_frame(raw: socket.socket, source: bytes, peer: bytes, timeout: flo
 
 
 def run_noninteractive(
-    raw: socket.socket, source: bytes, peer: bytes, commands: list[str], settle: float, initial_wait: float, command_timeout: float
+    raw: socket.socket, source: bytes, peer: bytes, commands: list[str], settle: float, initial_wait: float, command_timeout: float,
+    until: bytes | None = None,
 ) -> None:
     """Sends each of `commands` as one line, printing whatever text comes
     back before moving to the next: after sending, keeps reading
@@ -128,25 +129,48 @@ def run_noninteractive(
     a slow one has even started answering, silently dropping its output
     rather than actually waiting for it. Once at least one frame has
     arrived, subsequent waits fall back to the short `settle` period,
-    since a quiet wire genuinely means "done" from that point on."""
+    since a quiet wire genuinely means "done" from that point on.
 
-    def drain_output(timeout_first: float) -> bool:
+    A command that blocks *and* prints as it goes (since a blocking command
+    started from here now relays its output live) breaks that assumption: a
+    quiet moment no longer means it finished. For such a command pass `until`:
+    the marker text that shows it is done. It applies to the *last* command only,
+    which then waits (up to `command_timeout`) for the marker instead of for
+    silence."""
+
+    def drain_output(timeout_first: float, marker: bytes | None = None) -> bool:
         """Returns whether any output was actually received."""
         timeout = timeout_first
         received_any = False
+        seen = b""
+        deadline = time.monotonic() + timeout_first
         while True:
-            payload = recv_data_frame(raw, source, peer, timeout)
-            if payload is None:
-                return received_any
+            if marker is not None:
+                # Wait for the marker, ignoring quiet periods, until the deadline.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return received_any
+                payload = recv_data_frame(raw, source, peer, min(remaining, 1.0))
+                if payload is None:
+                    continue
+            else:
+                payload = recv_data_frame(raw, source, peer, timeout)
+                if payload is None:
+                    return received_any
             received_any = True
             sys.stdout.buffer.write(payload)
             sys.stdout.flush()
             timeout = settle
+            if marker is not None:
+                seen += payload
+                if marker in seen:
+                    return received_any
 
     connected = drain_output(initial_wait)
-    for command in commands:
+    for index, command in enumerate(commands):
         send_data(raw, peer, source, command.encode() + b"\n")
-        if drain_output(command_timeout):
+        marker = until if index == len(commands) - 1 else None
+        if drain_output(command_timeout, marker):
             connected = True
 
     # Only say goodbye to a session that was actually established: if
@@ -323,6 +347,11 @@ def main() -> None:
         "on the wire at all until it returns.",
     )
     parser.add_argument(
+        "--until",
+        help="Marker text that ends the LAST command instead of a quiet period -- for a command that blocks "
+        "and prints as it goes (e.g. 'tape load net', marker 'Tape loaded'). Waits up to --command-timeout.",
+    )
+    parser.add_argument(
         "--initial-wait", type=float, default=2.0, help="Seconds to wait for the session banner/first prompt (default: 2.0)."
     )
     args = parser.parse_args()
@@ -377,7 +406,10 @@ def main() -> None:
         if args.interactive:
             run_interactive(raw, source, destination, args.initial_wait)
         else:
-            run_noninteractive(raw, source, destination, commands, args.settle, args.initial_wait, args.command_timeout)
+            run_noninteractive(
+                raw, source, destination, commands, args.settle, args.initial_wait, args.command_timeout,
+                args.until.encode() if args.until else None,
+            )
 
 
 if __name__ == "__main__":

@@ -1928,6 +1928,11 @@ the old selection), the term session is held on a *different* NIC and never
 killed mid-load (a disconnect on another NIC cannot end the load), success
 requires the tape handle to advance (not just a matching size), a gapped
 transfer is retried slower, and a one-byte release tape always frees the wait.
+`term_net.py --until TEXT` makes its *last* command wait for a marker instead of a
+quiet period: a blocking command that prints as it goes (`tape load net` now
+relays its output live while polling a different NIC) is no longer "finished"
+the moment output pauses, which used to make the client send a disconnect and
+end the command itself.
 
 ### A numbered peer address book for `send_tape.py`/`term_net.py`
 

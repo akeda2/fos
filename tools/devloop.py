@@ -65,10 +65,12 @@ class Machine:
             capture_output=True, text=True, timeout=timeout)
         return result.stdout
 
-    def start_term(self, commands: list[str], mac: str, command_timeout: float) -> subprocess.Popen:
+    def start_term(self, commands: list[str], mac: str, command_timeout: float,
+                   until: str | None = None) -> subprocess.Popen:
+        extra = ["--until", until] if until else []
         return subprocess.Popen(
             [sys.executable, str(TOOLS / "term_net.py"), *self._iface_args(), "--mac", mac,
-             "--command-timeout", str(command_timeout), *commands],
+             "--command-timeout", str(command_timeout), *extra, *commands],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     def send_tape(self, mac: str, path: Path, delay: float) -> bool:
@@ -148,7 +150,9 @@ def cmd_tape_into(machine: Machine, args) -> int:
 
     before = machine.loaded_tape(session)
     machine.term([f"nic use {args.nic}"], mac=session)
-    client = machine.start_term(["tape load net"], session, command_timeout=args.timeout)
+    # `tape load net` prints as it waits (relayed live), so a quiet moment does not
+    # mean it finished: have the client wait for the "Tape loaded" marker instead.
+    client = machine.start_term(["tape load net"], session, command_timeout=args.timeout, until="Tape loaded")
     time.sleep(args.ready_wait)  # let the machine reach its receive loop
 
     release = Path(tempfile.mkdtemp()) / "release.bin"
