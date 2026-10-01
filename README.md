@@ -1152,8 +1152,12 @@ the tape, because they share one clock. `sink [show|reset]`, `stats` and the
 `view` panel show them. With only `gen=`/`sink=` and no port numbers there is no
 impairment link: a pure generator/sink pair, for example to test a router
 (another machine, or the `router` tape) between two ports. While the generator
-runs the tape polls without sleeping, so expect 100% CPU; it handles roughly
-tens of thousands of frames per second per direction. (In QEMU, the `e1000` model delivers nothing for about a second after a guest enables promiscuous mode -- `bridge` shows the same -- while `e1000e` does not; the tape itself is not slow.)
+runs the tape polls without sleeping, so expect 100% CPU; on a CPU with an
+invariant time-stamp counter (every recent x86) the loop keeps up with line rate:
+on the Skylake test machine, 1500-byte frames at an offered gigabit through
+generator, impairment link and sink arrived 491553 of 491553 at 981875 kbit/s.
+Without one (older CPUs, QEMU's default model) the microsecond clock falls back
+to reading the PIT, which caps the loop at roughly 40000 frames per second. (In QEMU, the `e1000` model delivers nothing for about a second after a guest enables promiscuous mode -- `bridge` shows the same -- while `e1000e` does not; the tape itself is not slow.)
 
 #### Test tape: `tapes/bridge/`
 

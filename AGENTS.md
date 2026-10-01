@@ -2186,9 +2186,13 @@ machine hear its broadcast probes (ethertype `0x88b9`, magic `FOSMAP`); it
 retries up to three rounds while nothing is heard (links coming up). Link state
 comes from `Nic::link_status` (e1000e, I350 and RTL8168 read `STATUS`; the I350
 read was removed once after a scare and works again; 3C905 has `link_up`).
-`interrupts::micros()` (ABI slot 38, `tape_rt::micros`) combines the tick counter
-with the PIT's current count; the PIT now runs in mode 2 (rate generator, one
-sweep per tick) instead of mode 3 for that reason. `send` on the e1000, e1000e
+`interrupts::micros()` (ABI slot 38, `tape_rt::micros`) reads the TSC when the CPU
+reports an invariant one (CPUID 0x80000007 EDX bit 8; calibrated once against
+the PIT clock for 50 ms on first use) and otherwise combines the tick counter
+with the PIT's current count; the PIT runs in mode 2 (rate generator, one
+sweep per tick) instead of mode 3 for that reason. The PIT path costs three
+legacy port accesses, which capped nettest at ~40k frames/s; the TSC path lifted
+it to gigabit line rate (Skylake, 1500 B frames). `send` on the e1000, e1000e
 and I350 is asynchronous: 64 TX descriptors with contiguous buffers, and it only
 waits when the descriptor it needs is still in flight (a stuck one still sets
 `recovery_pending`). `tapes/nettest/` also has a generator and a sink (`gen=N`,

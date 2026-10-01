@@ -1036,20 +1036,90 @@ pub fn ticks() -> u64 {
 /// Highest value `micros` has returned, so it never goes backwards.
 static mut LAST_MICROS: u64 = 0;
 
-/// Microseconds since boot, with the PIT's own resolution (about 0.84 us)
-/// instead of the 10 ms of `ticks()`.
+/// TSC clock state: 0 = not tried yet, 1 = not usable (use the PIT), anything
+/// larger = calibrated TSC frequency in Hz.
+static mut TSC_HZ: u64 = 0;
+/// A TSC reading and the PIT-derived microseconds at the same moment.
+static mut TSC_BASE: u64 = 0;
+static mut TSC_BASE_MICROS: u64 = 0;
+
+/// Microseconds since boot, as fine as the hardware allows.
 ///
-/// `ticks()` counts whole periods; the PIT's current count (latched with the
-/// command `0x00`, then read low byte then high byte) says how far into the
-/// present period we are -- it counts down from the reload value, so
-/// `reload - count` input-clock cycles have elapsed. The tick counter is read
-/// before and after; if it moved, a period boundary fell in between and the
-/// reading is retried. If the boundary arrived but its interrupt has not been
-/// serviced yet (interrupts off), the count has wrapped while `ticks()` has
-/// not, which would step the time back by one period, so the result is
-/// clamped to never decrease. Costs three port reads, a few microseconds:
-/// call it once per pass of a polling loop, not once per byte.
+/// The cheap source is the time-stamp counter, but only when the CPU says it
+/// ticks at a constant rate regardless of power state (CPUID `0x8000_0007`
+/// EDX bit 8, "invariant TSC"): it is calibrated once against the PIT clock
+/// below and then read with a single `rdtsc` -- tens of nanoseconds. Otherwise
+/// (older CPUs, QEMU's default model) `pit_micros` is used, which costs three
+/// legacy port accesses, a microsecond or more each on a modern chipset, so a
+/// tape polling at gigabit speed notices the difference.
 pub fn micros() -> u64 {
+    unsafe {
+        if TSC_HZ == 0 {
+            calibrate_tsc();
+        }
+        if TSC_HZ > 1 {
+            let delta = core::arch::x86::_rdtsc().wrapping_sub(TSC_BASE);
+            let seconds = delta / TSC_HZ;
+            let remainder = delta % TSC_HZ;
+            let value = TSC_BASE_MICROS + seconds * 1_000_000 + remainder * 1_000_000 / TSC_HZ;
+            if value > LAST_MICROS {
+                LAST_MICROS = value;
+            }
+            return LAST_MICROS;
+        }
+    }
+    pit_micros()
+}
+
+/// Decides whether the TSC can be used and, if so, measures its frequency over
+/// 50 ms of PIT time. Must run with interrupts enabled (the PIT clock needs
+/// ticks); a bounded spin guards against the opposite.
+unsafe fn calibrate_tsc() {
+    unsafe {
+        TSC_HZ = 1;
+        let basic = core::arch::x86::__cpuid(1);
+        let extended = core::arch::x86::__cpuid(0x8000_0000);
+        if basic.edx & (1 << 4) == 0 || extended.eax < 0x8000_0007 {
+            return;
+        }
+        if core::arch::x86::__cpuid(0x8000_0007).edx & (1 << 8) == 0 {
+            return; // not invariant: its rate may change with power state
+        }
+        let start_micros = pit_micros();
+        let start_tsc = core::arch::x86::_rdtsc();
+        let mut spins = 0u64;
+        let (end_micros, end_tsc) = loop {
+            let now = pit_micros();
+            let tsc = core::arch::x86::_rdtsc();
+            if now - start_micros >= 50_000 {
+                break (now, tsc);
+            }
+            spins += 1;
+            if spins > 200_000_000 {
+                return; // the PIT clock is not advancing: leave the TSC unused
+            }
+        };
+        let elapsed = end_micros - start_micros;
+        let hz = end_tsc.wrapping_sub(start_tsc) * 1_000_000 / elapsed;
+        if hz < 100_000_000 {
+            return; // implausibly slow: not a usable measurement
+        }
+        TSC_BASE = end_tsc;
+        TSC_BASE_MICROS = end_micros;
+        TSC_HZ = hz;
+    }
+}
+
+/// Microseconds from the PIT: the tick count says which period we are in, the
+/// PIT's present count (latched with the command `0x00`, read low byte then
+/// high byte) how far into it. It counts down from the reload value, so
+/// `reload - count` input-clock cycles (about 0.84 us each) have elapsed. The
+/// tick counter is read before and after; if it moved, a period boundary fell
+/// in between and the reading is retried. If the boundary arrived but its
+/// interrupt has not been serviced yet (interrupts off) the count has wrapped
+/// while `ticks()` has not, which would step the time back by one period, so
+/// the result is clamped to never decrease.
+fn pit_micros() -> u64 {
     const RELOAD: u64 = (PIT_INPUT_HZ / PIT_FREQUENCY_HZ) as u64;
     for _ in 0..4 {
         let before = ticks();
