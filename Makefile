@@ -598,6 +598,7 @@ tape-nettest:
 test-tape-nettest: image tape-nettest
 	cargo +nightly-2026-09-13 test --manifest-path tapes/nettest/Cargo.toml --lib
 	python3 tapes/test_nettest_e2e.py
+	python3 tapes/test_nettest_selftest_e2e.py
 
 tape-router:
 	cd tapes/router && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec

@@ -148,6 +148,11 @@ extern "C" fn tape_main(
   console. A lone Escape never reaches a tape: it is the abort event (over
   `term net`, a frame holding only `0x1b`). See `tapes/ed/src/main.rs`'s
   `read_line_cursor` for the whole pattern.
+- `micros()` is slot 38, after `set_input_mode`: microseconds since boot as a
+  `u64`, read from the PIT's own counter (about 1 us resolution, never goes
+  backwards), unlike `ticks()`'s 10 ms steps. Use it for pacing and latency;
+  call it once per pass of a polling loop (it costs a few port reads).
+  `tape_rt::set_micros_hook(micros)` once, then `tape_rt::micros()` anywhere.
 - `terminal_position()` returns the kernel's packed, 1-based ANSI cursor
   position: row in the high 16 bits and column in the low 16 bits. It is
   useful for terminal protocols that must answer a cursor-position request.

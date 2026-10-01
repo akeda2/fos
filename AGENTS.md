@@ -2179,6 +2179,23 @@ MSI, 284 KB tape loads on each with no errors); QEMU has no I350 model.
 The e1000e (82579, `8086:1503`) also takes MSI on a Sandy Bridge board (single
 NIC, so no tape-load test there; counters clean after normal term net traffic).
 
+### `nic map`, the microsecond clock, asynchronous transmit
+
+`nic map` (`shell::nic_map`) prints each NIC's link and which other NICs of the
+machine hear its broadcast probes (ethertype `0x88b9`, magic `FOSMAP`); it
+retries up to three rounds while nothing is heard (links coming up). Link state
+comes from `Nic::link_status` (e1000e, I350 and RTL8168 read `STATUS`; the I350
+read was removed once after a scare and works again; 3C905 has `link_up`).
+`interrupts::micros()` (ABI slot 38, `tape_rt::micros`) combines the tick counter
+with the PIT's current count; the PIT now runs in mode 2 (rate generator, one
+sweep per tick) instead of mode 3 for that reason. `send` on the e1000, e1000e
+and I350 is asynchronous: 64 TX descriptors with contiguous buffers, and it only
+waits when the descriptor it needs is still in flight (a stuck one still sets
+`recovery_pending`). `tapes/nettest/` also has a generator and a sink (`gen=N`,
+`sink=N`; engine in `tapes/nettest/src/lib.rs`), tested with a four-NIC QEMU
+loop (`make test-tape-nettest-selftest`); `tools/test_nic_map_e2e.py` covers
+`nic map`.
+
 ### Cursor keys in tapes
 
 Arrow/Home/End/Delete keys reach a tape through `read_key` as ANSI sequences

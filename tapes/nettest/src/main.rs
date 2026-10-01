@@ -25,7 +25,8 @@ extern crate nettest_tape;
 
 use core::ptr::addr_of_mut;
 use nettest_tape::{
-    Config, Direction, MAX_FRAME, PRESETS, Rng, SLOT_BYTES, parse_permille, parse_u32, preset,
+    Config, Direction, GEN_HEADER_LEN, Generator, MAX_FRAME, PRESETS, Rng, SLOT_BYTES, Sink,
+    parse_mac, parse_permille, parse_u32, preset,
 };
 use tape_rt::{print_bytes, print_u32};
 
@@ -33,7 +34,7 @@ const TAPE_EVENT_ABORT: u32 = 1;
 const TAPE_EVENT_BYTE_BASE: u32 = 0x100;
 const ETHERNET_HEADER_LEN: usize = 14;
 const LINE_CAPACITY: usize = 120;
-const MAX_WORDS: usize = 8;
+const MAX_WORDS: usize = 24;
 
 /// Queue storage used when the kernel's big pool cannot supply more (a QEMU
 /// guest with 128 MiB of RAM or less has none): 256 slots per direction.
@@ -54,6 +55,25 @@ struct Session<'a> {
     view: View,
     /// False while the startup arguments are being applied.
     started: bool,
+    /// The traffic generator and sink (see the module doc), each tied to a NIC
+    /// of its own. Zero-based NIC indexes; `None` means the role is off.
+    generator: Generator,
+    sink: Sink,
+    gen_nic: Option<u32>,
+    sink_nic: Option<u32>,
+    /// `gen.to=MAC` was given; otherwise frames go to the local sink's MAC, or
+    /// are broadcast when there is no local sink.
+    destination_explicit: bool,
+    /// `gen.run=on`: start sending as soon as the tape is up (after
+    /// `gen.delay` seconds: links often need a moment to come up).
+    gen_autostart: bool,
+    gen_delay_s: u32,
+    /// The two-port impairment link is active (not when only gen/sink given).
+    limiter: bool,
+    /// Passes of the polling loop and when it started: a long average pass is
+    /// the first sign that the tape itself, not the link, is the bottleneck.
+    passes: u64,
+    loop_started_us: u64,
 }
 
 enum Outcome {
@@ -104,11 +124,14 @@ pub extern "C" fn tape_main(
     _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
     _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
     wait_for_event: extern "C" fn(),
+    _set_input_mode: extern "C" fn(u32),
+    micros: extern "C" fn() -> u64,
 ) {
     tape_rt::set_wait_hook(wait_for_event);
+    tape_rt::set_micros_hook(micros);
     let nic_total = nic_count() as usize;
-    if nic_total < 2 {
-        print_bytes(putc, b"nettest needs at least two initialized NICs.\n");
+    if nic_total < 1 {
+        print_bytes(putc, b"nettest needs at least one initialized NIC.\n");
         return;
     }
 
@@ -129,6 +152,16 @@ pub extern "C" fn tape_main(
         rng: Rng::new(ticks() as u32 ^ 0x5bd1_e995),
         view: View::new(),
         started: false,
+        generator: Generator::new(),
+        sink: Sink::new(),
+        gen_nic: None,
+        sink_nic: None,
+        destination_explicit: false,
+        gen_autostart: false,
+        gen_delay_s: 0,
+        limiter: true,
+        passes: 0,
+        loop_started_us: 0,
     };
 
     let arguments = if args_len == 0 {
@@ -142,140 +175,249 @@ pub extern "C" fn tape_main(
         print_bytes(
             putc,
             b"Usage: tape run nettest [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]]\n\
-              \x20      [rate=KBIT] [queue=N] [seed=N]   or   tape run nettest @FILE\n",
+              \x20      [rate=KBIT] [queue=N] [seed=N] [gen=N] [sink=N] [gen.rate=KBIT]\n\
+              \x20      [gen.size=B] [gen.to=MAC|sink] [gen.count=N] [gen.time=S]\n\
+              \x20      [gen.run=on]   or   tape run nettest @FILE\n",
         );
         release(big, free);
         return;
     }
-    if port_count == 0 {
-        ports = [0, 1];
-    } else if port_count != 2 || ports[0] == ports[1] {
-        print_bytes(putc, b"nettest needs two distinct NIC numbers (see 'nic list').\n");
-        release(big, free);
-        return;
+    // Roles: the impairment link between two ports, a generator NIC, a sink NIC.
+    // With only `gen=`/`sink=` and no port numbers there is no impairment link.
+    let roles = session.gen_nic.is_some() || session.sink_nic.is_some();
+    session.limiter = port_count != 0 || !roles;
+    if session.limiter {
+        if port_count == 0 {
+            ports = [0, 1];
+        } else if port_count != 2 || ports[0] == ports[1] {
+            print_bytes(putc, b"nettest needs two distinct NIC numbers (see 'nic list').\n");
+            release(big, free);
+            return;
+        }
     }
-    if ports.iter().any(|&port| port as usize >= nic_total) {
-        print_bytes(putc, b"nettest: no such NIC (see 'nic list').\n");
-        release(big, free);
-        return;
+    let mut used = [u32::MAX; 4];
+    let mut used_count = 0;
+    if session.limiter {
+        used[0] = ports[0];
+        used[1] = ports[1];
+        used_count = 2;
+    }
+    for role in [session.gen_nic, session.sink_nic].into_iter().flatten() {
+        used[used_count] = role;
+        used_count += 1;
+    }
+    for (position, &nic) in used[..used_count].iter().enumerate() {
+        if nic as usize >= nic_total {
+            print_bytes(putc, b"nettest: no such NIC (see 'nic list').\n");
+            release(big, free);
+            return;
+        }
+        if used[..position].contains(&nic) {
+            print_bytes(putc, b"nettest: each role needs a NIC of its own ('nic map' shows the cabling).\n");
+            release(big, free);
+            return;
+        }
     }
     let max_frame_len = (nic_max_frame_len() as usize).clamp(ETHERNET_HEADER_LEN, MAX_FRAME);
 
     let mut macs = [[0u8; 6]; 2];
-    for (index, mac) in macs.iter_mut().enumerate() {
-        if nic_mac_at(ports[index], mac.as_mut_ptr() as u32) == 0 {
-            print_bytes(putc, b"nettest cannot start: failed to read a NIC MAC.\n");
-            release(big, free);
-            return;
+    let mut gen_mac = [0u8; 6];
+    let mut sink_mac = [0u8; 6];
+    let mac_ok = (!session.limiter
+        || (nic_mac_at(ports[0], macs[0].as_mut_ptr() as u32) != 0
+            && nic_mac_at(ports[1], macs[1].as_mut_ptr() as u32) != 0))
+        && session.gen_nic.is_none_or(|nic| nic_mac_at(nic, gen_mac.as_mut_ptr() as u32) != 0)
+        && session.sink_nic.is_none_or(|nic| nic_mac_at(nic, sink_mac.as_mut_ptr() as u32) != 0);
+    if !mac_ok {
+        print_bytes(putc, b"nettest cannot start: failed to read a NIC MAC.\n");
+        release(big, free);
+        return;
+    }
+    if session.limiter {
+        for index in 0..2 {
+            if nic_set_promiscuous_at(ports[index], 1) == 0 {
+                if index == 1 {
+                    let _ = nic_set_promiscuous_at(ports[0], 0);
+                }
+                print_bytes(putc, b"nettest cannot start: promiscuous mode failed.\n");
+                release(big, free);
+                return;
+            }
         }
     }
-    for index in 0..2 {
-        if nic_set_promiscuous_at(ports[index], 1) == 0 {
-            if index == 1 {
-                let _ = nic_set_promiscuous_at(ports[0], 0);
-            }
-            print_bytes(putc, b"nettest cannot start: promiscuous mode failed.\n");
-            release(big, free);
-            return;
-        }
+    if !session.destination_explicit {
+        session.generator.destination = if session.sink_nic.is_some() { sink_mac } else { [0xff; 6] };
     }
 
-    print_bytes(putc, b"fos nettest: NIC ");
-    print_u32(putc, ports[0] + 1);
-    print_bytes(putc, b" <-> NIC ");
-    print_u32(putc, ports[1] + 1);
-    print_bytes(putc, b" (promiscuous), ");
-    print_u32(putc, session.links[0].queue.capacity() as u32);
-    print_bytes(putc, b" frames of queue per way.\n");
+    print_bytes(putc, b"fos nettest: ");
+    if session.limiter {
+        print_bytes(putc, b"NIC ");
+        print_u32(putc, ports[0] + 1);
+        print_bytes(putc, b" <-> NIC ");
+        print_u32(putc, ports[1] + 1);
+        print_bytes(putc, b" (promiscuous), ");
+        print_u32(putc, session.links[0].queue.capacity() as u32);
+        print_bytes(putc, b" frames of queue per way.\n");
+    } else {
+        print_bytes(putc, b"no impairment link (generator/sink only).\n");
+    }
+    if let Some(nic) = session.gen_nic {
+        print_bytes(putc, b"Generator on NIC ");
+        print_u32(putc, nic + 1);
+        print_bytes(putc, b"; start it with: gen start\n");
+    }
+    if let Some(nic) = session.sink_nic {
+        print_bytes(putc, b"Sink on NIC ");
+        print_u32(putc, nic + 1);
+        print_bytes(putc, b".\n");
+    }
     print_bytes(putc, b"Type help for commands; Escape stops.\n");
     show(putc, &session);
-    let mut ports_for_view = ports;
-    ports_for_view[0] += 1;
-    ports_for_view[1] += 1;
-    session.view.ports = ports_for_view;
+    session.view.ports = [ports[0] + 1, ports[1] + 1];
 
     let mut frame = [0u8; MAX_FRAME];
     let mut line = [0u8; LINE_CAPACITY];
     let mut line_length = 0usize;
     session.started = true;
-    session.view.start_tick = ticks();
+    session.view.start_tick = micros() / 10_000;
+    if session.gen_autostart && session.gen_nic.is_some() {
+        session.generator.start(micros() + u64::from(session.gen_delay_s) * 1_000_000);
+    }
     if session.view.wanted {
         view_start(putc, &mut session);
     }
     print_bytes(putc, b"nettest> ");
+    let mut last_key_us = 0u64;
+    session.loop_started_us = micros();
+    let mut generator_was_running = session.generator.running;
     'run: loop {
-        let now_us = ticks() * 10_000;
+        let now_us = micros();
         let mut busy = false;
+        session.passes += 1;
         if session.view.on {
             view_update(putc, &mut session, now_us / 10_000);
         }
 
-        // Receive from each port and push through that direction's impairments.
-        for ingress in 0..2 {
-            let received = nic_receive_at(
-                ports[ingress],
-                frame.as_mut_ptr() as u32,
-                max_frame_len as u32,
-            ) as usize;
-            if received < ETHERNET_HEADER_LEN {
-                continue;
-            }
-            busy = true;
-            // Frames to or from this tape's own NICs are management traffic
-            // (a `term net` session), not part of the link under test.
-            let destination = &frame[0..6];
-            let source = &frame[6..12];
-            if macs.iter().any(|mac| mac == destination || mac == source) {
-                continue;
-            }
-            let Session { links, rng, .. } = &mut session;
-            links[ingress].ingest(&frame[..received], now_us, rng);
-        }
-
-        // Send whatever has come due.
-        for way in 0..2 {
-            while let Some(length) = session.links[way].release(now_us, &mut frame) {
+        // The sink first, so a frame is timestamped as soon as it is seen.
+        if let Some(nic) = session.sink_nic {
+            for _ in 0..64 {
+                let received = nic_receive_at(nic, frame.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+                if received < ETHERNET_HEADER_LEN {
+                    break;
+                }
                 busy = true;
-                let ok = nic_send_at(ports[1 - way], frame.as_ptr() as u32, length as u32) != 0;
-                session.links[way].record_send(length, ok);
+                let _ = session.sink.on_frame(&frame[..received], micros());
+            }
+        }
+        // The generator's NIC hears the wire too (ARP, discovery...): drain it
+        // so its receive ring never fills while the foreground is busy sending.
+        if let Some(nic) = session.gen_nic {
+            for _ in 0..8 {
+                let received = nic_receive_at(nic, frame.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+                if received < ETHERNET_HEADER_LEN {
+                    break;
+                }
             }
         }
 
-        // One key per pass, so forwarding is never starved by typing.
-        let event = read_key();
-        if event == TAPE_EVENT_ABORT {
-            putc(u32::from(b'\n'));
-            break 'run;
-        }
-        if event >= TAPE_EVENT_BYTE_BASE {
-            busy = true;
-            match (event - TAPE_EVENT_BYTE_BASE) as u8 {
-                b'\r' | b'\n' => {
-                    putc(u32::from(b'\n'));
-                    let outcome = run_line(putc, &mut session, &line[..line_length]);
-                    line_length = 0;
-                    if matches!(outcome, Outcome::Quit) {
-                        break 'run;
+        // Receive from each impaired port and push through that direction's faults.
+        if session.limiter {
+            for ingress in 0..2 {
+                for _ in 0..32 {
+                    let received = nic_receive_at(
+                        ports[ingress],
+                        frame.as_mut_ptr() as u32,
+                        max_frame_len as u32,
+                    ) as usize;
+                    if received < ETHERNET_HEADER_LEN {
+                        break;
                     }
-                    print_bytes(putc, b"nettest> ");
+                    busy = true;
+                    // Frames to or from this tape's own NICs are management traffic
+                    // (a `term net` session), not part of the link under test.
+                    let destination = &frame[0..6];
+                    let source = &frame[6..12];
+                    if macs.iter().any(|mac| mac == destination || mac == source) {
+                        continue;
+                    }
+                    let Session { links, rng, .. } = &mut session;
+                    links[ingress].ingest(&frame[..received], now_us, rng);
                 }
-                // The kernel's read_key already erased the character on screen.
-                8 | 127 => line_length = line_length.saturating_sub(1),
-                byte @ 32..=126 if line_length < line.len() => {
-                    line[line_length] = byte;
-                    line_length += 1;
-                    putc(u32::from(byte));
+            }
+
+            // Send whatever has come due.
+            for way in 0..2 {
+                while let Some(length) = session.links[way].release(now_us, &mut frame) {
+                    busy = true;
+                    let ok = nic_send_at(ports[1 - way], frame.as_ptr() as u32, length as u32) != 0;
+                    session.links[way].record_send(length, ok);
                 }
-                _ => {}
             }
         }
-        if !busy {
+
+        // The generator: everything that has come due, up to a burst limit.
+        if let Some(nic) = session.gen_nic {
+            let mut sent = 0;
+            while let Some(length) = session.generator.next_frame(now_us, gen_mac, &mut frame, sent) {
+                let ok = nic_send_at(nic, frame.as_ptr() as u32, length as u32) != 0;
+                session.generator.record_send(length, ok);
+                sent += 1;
+                busy = true;
+            }
+            if generator_was_running && !session.generator.running {
+                print_bytes(putc, b"\ngenerator finished: ");
+                print_gen_line(putc, &session);
+                print_bytes(putc, b"nettest> ");
+                print_bytes(putc, &line[..line_length]);
+            }
+            generator_was_running = session.generator.running;
+        }
+
+        // Keys: once per pass when idle, but at most once a millisecond while
+        // traffic is flowing, so typing never starves forwarding or pacing.
+        if !busy || now_us.wrapping_sub(last_key_us) >= 1000 {
+            last_key_us = now_us;
+            let event = read_key();
+            if event == TAPE_EVENT_ABORT {
+                putc(u32::from(b'\n'));
+                break 'run;
+            }
+            if event >= TAPE_EVENT_BYTE_BASE {
+                busy = true;
+                match (event - TAPE_EVENT_BYTE_BASE) as u8 {
+                    b'\r' | b'\n' => {
+                        putc(u32::from(b'\n'));
+                        let outcome = run_line(putc, &mut session, &line[..line_length]);
+                        line_length = 0;
+                        if matches!(outcome, Outcome::Quit) {
+                            break 'run;
+                        }
+                        generator_was_running = session.generator.running;
+                        print_bytes(putc, b"nettest> ");
+                    }
+                    // The kernel's read_key already erased the character on screen.
+                    8 | 127 => line_length = line_length.saturating_sub(1),
+                    byte @ 32..=126 if line_length < line.len() => {
+                        line[line_length] = byte;
+                        line_length += 1;
+                        putc(u32::from(byte));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Sleep only when nothing is pending: a running generator and queued
+        // frames both have deadlines finer than the 10 ms the sleep can miss.
+        let queued = session.limiter && session.links.iter().any(|link| link.queue.len() > 0);
+        if !busy && !session.generator.running && !queued {
             wait_for_event();
         }
     }
 
-    for &port in &ports {
-        let _ = nic_set_promiscuous_at(port, 0);
+    if session.limiter {
+        for &port in &ports {
+            let _ = nic_set_promiscuous_at(port, 0);
+        }
     }
     if session.view.on {
         view_stop(putc, &mut session);
@@ -323,6 +465,21 @@ fn split_words<'a>(line: &'a [u8], words: &mut [&'a [u8]; MAX_WORDS]) -> usize {
 /// Handles the startup arguments (`tape run nettest ...`, or the contents of an
 /// `@file`): segments separated by newlines or `;`, `#` comments, optional
 /// leading port numbers, then `name=value` settings or ordinary commands.
+/// More words than `split_words` can hold would be silently cut off.
+fn too_many_words(line: &[u8]) -> bool {
+    let mut words = 0;
+    let mut in_word = false;
+    for &byte in line {
+        if is_space(byte) {
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            words += 1;
+        }
+    }
+    words > MAX_WORDS
+}
+
 fn apply_startup(
     putc: Putc,
     session: &mut Session<'_>,
@@ -335,6 +492,10 @@ fn apply_startup(
             Some(hash) => &segment[..hash],
             None => segment,
         };
+        if too_many_words(segment) {
+            print_bytes(putc, b"nettest: too many words on one line; split it with ';'\n");
+            return false;
+        }
         let mut words = [&[][..]; MAX_WORDS];
         let count = split_words(segment, &mut words);
         let mut index = 0;
@@ -374,6 +535,21 @@ fn apply_startup(
 
 /// `name[.ab|.ba]=value[:value]`.
 fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
+    // Traffic roles: `gen=N` / `sink=N` pick the NICs (one-based), `gen.KEY=V`
+    // configure the generator. Handled before the value is split at ':', because
+    // a MAC address (`gen.to=aa:bb:...`) contains colons.
+    if key == b"gen" || key == b"sink" {
+        let Some(number) = parse_u32(value).filter(|&number| number >= 1) else { return false };
+        if key == b"gen" {
+            session.gen_nic = Some(number - 1);
+        } else {
+            session.sink_nic = Some(number - 1);
+        }
+        return true;
+    }
+    if let Some(setting) = key.strip_prefix(b"gen.") {
+        return gen_setting(session, setting, value);
+    }
     if key == b"view" {
         // Before the tape's loop starts this only records the wish; the panel
         // is drawn once the ports are known.
@@ -395,6 +571,39 @@ fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
         count += 1;
     }
     configure(session, name, way, &parts[..count]).is_ok()
+}
+
+/// One generator setting: `rate` (kbit/s), `size` (bytes), `to` (MAC or
+/// `sink`), `count`, `time` (seconds) and `run` (`on` starts sending at launch).
+fn gen_setting(session: &mut Session<'_>, setting: &[u8], value: &[u8]) -> bool {
+    let generator = &mut session.generator;
+    match setting {
+        b"rate" => parse_u32(value).filter(|&rate| rate >= 1).map(|rate| generator.rate_kbit = rate).is_some(),
+        b"size" => parse_u32(value)
+            .filter(|&size| (60..=MAX_FRAME as u32).contains(&size) && size as usize >= GEN_HEADER_LEN)
+            .map(|size| generator.size = size as usize)
+            .is_some(),
+        b"count" => parse_u32(value).map(|count| generator.count_limit = count).is_some(),
+        b"time" => parse_u32(value).map(|seconds| generator.seconds_limit = seconds).is_some(),
+        b"delay" => parse_u32(value).map(|seconds| session.gen_delay_s = seconds).is_some(),
+        b"to" => {
+            if value == b"sink" {
+                session.destination_explicit = false;
+                true
+            } else if let Some(mac) = parse_mac(value) {
+                generator.destination = mac;
+                session.destination_explicit = true;
+                true
+            } else {
+                false
+            }
+        }
+        b"run" => {
+            session.gen_autostart = value == b"on";
+            value == b"on" || value == b"off"
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -493,6 +702,40 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
             Some(b"off") if count == 2 => view_stop(putc, session),
             _ => print_bytes(putc, b"use: view on | view off\n"),
         },
+        b"clock" => {
+            // Diagnostic: how fine and how steady is the microsecond clock?
+            let mut previous = tape_rt::micros();
+            let (mut smallest, mut largest, mut backwards) = (u64::MAX, 0u64, 0u32);
+            for _ in 0..2000 {
+                let now = tape_rt::micros();
+                if now < previous {
+                    backwards += 1;
+                } else if now > previous {
+                    smallest = smallest.min(now - previous);
+                    largest = largest.max(now - previous);
+                }
+                previous = now;
+            }
+            print_bytes(putc, b"clock steps us: smallest ");
+            print_u32(putc, smallest as u32);
+            print_bytes(putc, b", largest ");
+            print_u32(putc, largest as u32);
+            print_bytes(putc, b", backwards ");
+            print_u32(putc, backwards);
+            putc(u32::from(b'\n'));
+        }
+        b"gen" => return gen_command(putc, session, &words[1..count]),
+        b"sink" => match words.get(1).copied() {
+            Some(b"reset") => {
+                session.sink.reset();
+                print_bytes(putc, b"sink counters cleared\n");
+            }
+            None | Some(b"show") => print_sink_line(putc, session),
+            _ => {
+                print_bytes(putc, b"use: sink [show|reset]\n");
+                return Outcome::Error;
+            }
+        },
         b"presets" => {
             for (name, description) in PRESETS {
                 print_bytes(putc, name);
@@ -531,6 +774,155 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
     Outcome::Continue
 }
 
+/// `gen start|stop|rate KBIT|size BYTES|to MAC|to sink|count N|time SECONDS|show`.
+fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcome {
+    let Some(&verb) = words.first() else {
+        print_gen_config(putc, session);
+        return Outcome::Continue;
+    };
+    if session.gen_nic.is_none() && verb != b"show" {
+        print_bytes(putc, b"no generator NIC: start with gen=N (see 'nic map')\n");
+        return Outcome::Error;
+    }
+    match verb {
+        b"start" => {
+            if !session.started {
+                session.gen_autostart = true; // from a config file: start with the loop
+            } else {
+                session.generator.start(tape_rt::micros());
+                print_bytes(putc, b"generator started\n");
+            }
+        }
+        b"stop" => {
+            session.generator.stop();
+            print_bytes(putc, b"generator stopped: ");
+            print_gen_line(putc, session);
+        }
+        b"show" => print_gen_config(putc, session),
+        b"rate" | b"size" | b"to" | b"count" | b"time" => {
+            let value = words.get(1).copied().unwrap_or(b"");
+            if !gen_setting(session, verb, value) {
+                print_bytes(putc, b"bad value; type help\n");
+                return Outcome::Error;
+            }
+            if session.started && verb == b"to" && !session.destination_explicit {
+                print_bytes(putc, b"(gen to sink takes effect at the next launch)\n");
+            }
+            print_gen_config(putc, session);
+        }
+        _ => {
+            print_bytes(putc, b"use: gen start|stop|rate|size|to|count|time|show\n");
+            return Outcome::Error;
+        }
+    }
+    Outcome::Continue
+}
+
+fn print_mac(putc: Putc, mac: &[u8; 6]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (index, byte) in mac.iter().enumerate() {
+        if index != 0 {
+            putc(u32::from(b':'));
+        }
+        putc(u32::from(HEX[usize::from(byte >> 4)]));
+        putc(u32::from(HEX[usize::from(byte & 0x0f)]));
+    }
+}
+
+/// `1234` -> `12.34`.
+fn print_hundredths(putc: Putc, value: u32) {
+    print_u32(putc, value / 100);
+    putc(u32::from(b'.'));
+    putc(u32::from(b'0' + (value / 10 % 10) as u8));
+    putc(u32::from(b'0' + (value % 10) as u8));
+}
+
+fn print_gen_config(putc: Putc, session: &Session<'_>) {
+    let generator = &session.generator;
+    print_bytes(putc, b"gen  NIC ");
+    match session.gen_nic {
+        Some(nic) => print_u32(putc, nic + 1),
+        None => print_bytes(putc, b"(none)"),
+    }
+    print_bytes(putc, b" -> ");
+    print_mac(putc, &generator.destination);
+    print_bytes(putc, if generator.running { "  RUNNING  " } else { "  stopped  " }.as_bytes());
+    print_u32(putc, generator.rate_kbit);
+    print_bytes(putc, b" kbit/s of ");
+    print_u32(putc, generator.size as u32);
+    print_bytes(putc, b" B frames");
+    if generator.count_limit != 0 {
+        print_bytes(putc, b", ");
+        print_u32(putc, generator.count_limit);
+        print_bytes(putc, b" frames");
+    }
+    if generator.seconds_limit != 0 {
+        print_bytes(putc, b", ");
+        print_u32(putc, generator.seconds_limit);
+        print_bytes(putc, b" s");
+    }
+    putc(u32::from(b'\n'));
+}
+
+fn print_gen_line(putc: Putc, session: &Session<'_>) {
+    let stats = &session.generator.stats;
+    print_bytes(putc, b"sent ");
+    print_u32(putc, stats.sent);
+    print_bytes(putc, b", failed ");
+    print_u32(putc, stats.send_failed);
+    if stats.lagged > 0 {
+        print_bytes(putc, b", fell behind schedule ");
+        print_u32(putc, stats.lagged);
+        print_bytes(putc, b"x");
+    }
+    putc(u32::from(b'\n'));
+}
+
+fn print_sink_line(putc: Putc, session: &Session<'_>) {
+    print_sink_summary(putc, session);
+    putc(u32::from(b'\n'));
+    print_sink_latency(putc, session);
+    putc(u32::from(b'\n'));
+}
+
+/// Counts, average rate and loss -- one line, no newline.
+fn print_sink_summary(putc: Putc, session: &Session<'_>) {
+    let stats = &session.sink.stats;
+    print_bytes(putc, b"sink NIC ");
+    match session.sink_nic {
+        Some(nic) => print_u32(putc, nic + 1),
+        None => print_bytes(putc, b"(none)"),
+    }
+    print_bytes(putc, b"  rx ");
+    print_u32(putc, stats.received);
+    print_bytes(putc, b"  avg ");
+    print_u32(putc, session.sink.average_kbit() as u32);
+    print_bytes(putc, b" kbit/s (now ");
+    print_u32(putc, session.view.kbit.1);
+    print_bytes(putc, b")  lost ");
+    print_u32(putc, stats.lost);
+    let expected = stats.received.saturating_add(stats.lost).max(1);
+    print_bytes(putc, b" (");
+    print_hundredths(putc, ((u64::from(stats.lost) * 10_000) / u64::from(expected)) as u32);
+    print_bytes(putc, b"%)  dup ");
+    print_u32(putc, stats.duplicated);
+    print_bytes(putc, b"  reord ");
+    print_u32(putc, stats.reordered);
+}
+
+/// One-way latency: the generator and sink share a clock, so it is exact.
+fn print_sink_latency(putc: Putc, session: &Session<'_>) {
+    let stats = &session.sink.stats;
+    print_bytes(putc, b"     latency us: min ");
+    print_u32(putc, stats.latency_min);
+    print_bytes(putc, b"  avg ");
+    print_u32(putc, (stats.latency_sum / u64::from(stats.received.max(1))) as u32);
+    print_bytes(putc, b"  max ");
+    print_u32(putc, stats.latency_max);
+    print_bytes(putc, b"  jitter ");
+    print_u32(putc, stats.jitter);
+}
+
 fn print_help(putc: Putc) {
     print_bytes(
         putc,
@@ -543,6 +935,10 @@ fn print_help(putc: Putc) {
           seed N | show | stats        repeatable randomness; settings; counters\n\
           view on|off                  live statistics panel above the prompt\n\
           reset [stats]                clean link, or clear the counters\n\
+          gen start|stop|show          the traffic generator (needs gen=N)\n\
+          gen rate KBIT | size BYTES   constant bit rate of whole frames\n\
+          gen to MAC|sink | count N | time S    destination; stop after N / S\n\
+          sink [show|reset]            the receiver (needs sink=N): loss, latency\n\
           quit                         stop (Escape also stops)\n",
     );
 }
@@ -554,6 +950,12 @@ fn print_tenths(putc: Putc, permille: u16) {
 }
 
 fn show(putc: Putc, session: &Session<'_>) {
+    if session.gen_nic.is_some() {
+        print_gen_config(putc, session);
+    }
+    if !session.limiter {
+        return;
+    }
     for index in 0..2 {
         print_config_line(putc, index, &session.links[index].config);
         putc(u32::from(b'\n'));
@@ -613,6 +1015,24 @@ fn print_config_line(putc: Putc, index: usize, config: &Config) {
 }
 
 fn print_stats(putc: Putc, session: &Session<'_>) {
+    if session.passes > 0 {
+        let elapsed = tape_rt::micros().saturating_sub(session.loop_started_us);
+        print_bytes(putc, b"loop: ");
+        print_u32(putc, session.passes as u32);
+        print_bytes(putc, b" passes, ");
+        print_u32(putc, (elapsed / session.passes) as u32);
+        print_bytes(putc, b" us each on average\n");
+    }
+    if session.gen_nic.is_some() {
+        print_bytes(putc, b"gen  ");
+        print_gen_line(putc, session);
+    }
+    if session.sink_nic.is_some() {
+        print_sink_line(putc, session);
+    }
+    if !session.limiter {
+        return;
+    }
     for (index, link) in session.links.iter().enumerate() {
         let stats = &link.stats;
         print_bytes(putc, DIRECTION_NAMES[index]);
@@ -656,7 +1076,6 @@ fn print_stats(putc: Putc, session: &Session<'_>) {
 // rows below it, so command output and the prompt scroll there and never
 // disturb the panel. Drawing costs a few hundred bytes per update.
 
-const PANEL_ROWS: u32 = 12;
 const SCREEN_ROWS: u32 = 25;
 const PANEL_INTERVAL_TICKS: u64 = 50;
 const BAR_WIDTH: usize = 24;
@@ -670,6 +1089,12 @@ struct View {
     last_tick: u64,
     previous: [(u32, u32); 2],
     rates: [(u32, u32); 2],
+    /// Panel height in rows, fixed when the panel is switched on.
+    rows: u32,
+    /// Generator bytes sent and sink bytes received at the last refresh, and
+    /// the resulting kbit/s over that interval.
+    previous_bytes: (u64, u64),
+    kbit: (u32, u32),
 }
 
 impl View {
@@ -682,6 +1107,9 @@ impl View {
             last_tick: 0,
             previous: [(0, 0); 2],
             rates: [(0, 0); 2],
+            rows: 12,
+            previous_bytes: (0, 0),
+            kbit: (0, 0),
         }
     }
 }
@@ -698,11 +1126,19 @@ fn csi(putc: Putc, parameters: &[u32], final_byte: u8) {
     putc(u32::from(final_byte));
 }
 
+/// Rows the panel needs: title and rule, four per impaired direction, four for
+/// the generator and sink, then a closing rule and the hint line.
+fn panel_rows(session: &Session<'_>) -> u32 {
+    let roles = session.gen_nic.is_some() || session.sink_nic.is_some();
+    2 + if session.limiter { 8 } else { 0 } + if roles { 4 } else { 0 } + 2
+}
+
 fn view_start(putc: Putc, session: &mut Session<'_>) {
     session.view.on = true;
     session.view.last_tick = 0;
+    session.view.rows = panel_rows(session);
     csi(putc, &[2], b'J');
-    csi(putc, &[PANEL_ROWS + 1, SCREEN_ROWS], b'r');
+    csi(putc, &[session.view.rows + 1, SCREEN_ROWS], b'r');
     csi(putc, &[SCREEN_ROWS, 1], b'H');
     view_draw(putc, session, 0);
 }
@@ -730,6 +1166,13 @@ fn view_update(putc: Putc, session: &mut Session<'_>, now_tick: u64) {
         );
         session.view.previous[index] = (stats.received, stats.sent);
     }
+    // kbit/s over the interval: bytes * 8 / 1000 per (elapsed / 100) seconds.
+    let sent = session.generator.stats.bytes;
+    let received = session.sink.stats.bytes;
+    let (previous_sent, previous_received) = session.view.previous_bytes;
+    let kbit = |now: u64, before: u64| (now.saturating_sub(before) * 8 * 100 / 1000 / u64::from(elapsed)) as u32;
+    session.view.kbit = (kbit(sent, previous_sent), kbit(received, previous_received));
+    session.view.previous_bytes = (sent, received);
     view_draw(putc, session, now_tick);
 }
 
@@ -737,16 +1180,26 @@ fn view_row(putc: Putc, row: u32) {
     csi(putc, &[row, 1], b'H');
 }
 
+fn rule(putc: Putc) {
+    for _ in 0..78 {
+        putc(u32::from(b'-'));
+    }
+}
+
 fn view_draw(putc: Putc, session: &Session<'_>, now_tick: u64) {
     putc(0x1b);
     putc(u32::from(b'['));
     putc(u32::from(b's'));
     view_row(putc, 1);
-    print_bytes(putc, b" nettest  NIC ");
-    print_u32(putc, session.view.ports[0]);
-    print_bytes(putc, b" <-> NIC ");
-    print_u32(putc, session.view.ports[1]);
-    print_bytes(putc, b"   up ");
+    print_bytes(putc, b" nettest  ");
+    if session.limiter {
+        print_bytes(putc, b"NIC ");
+        print_u32(putc, session.view.ports[0]);
+        print_bytes(putc, b" <-> NIC ");
+        print_u32(putc, session.view.ports[1]);
+        print_bytes(putc, b"   ");
+    }
+    print_bytes(putc, b"up ");
     let seconds = (now_tick.saturating_sub(session.view.start_tick) / 100) as u32;
     print_two_digits(putc, seconds / 3600);
     putc(u32::from(b':'));
@@ -755,70 +1208,113 @@ fn view_draw(putc: Putc, session: &Session<'_>, now_tick: u64) {
     print_two_digits(putc, seconds % 60);
     csi(putc, &[], b'K');
     view_row(putc, 2);
-    for _ in 0..78 {
-        putc(u32::from(b'-'));
-    }
+    rule(putc);
     csi(putc, &[], b'K');
-    for index in 0..2 {
-        let link = &session.links[index];
-        let stats = &link.stats;
-        let base = 3 + index as u32 * 4;
-        view_row(putc, base);
-        print_config_line(putc, index, &link.config);
-        csi(putc, &[], b'K');
-        view_row(putc, base + 1);
-        print_bytes(putc, b"  in ");
-        print_u32(putc, stats.received);
-        print_bytes(putc, b" (");
-        print_u32(putc, session.view.rates[index].0);
-        print_bytes(putc, b"/s)  out ");
-        print_u32(putc, stats.sent);
-        print_bytes(putc, b" (");
-        print_u32(putc, session.view.rates[index].1);
-        print_bytes(putc, b"/s)  lost ");
-        print_u32(putc, stats.lost);
-        print_bytes(putc, b"  qdrop ");
-        print_u32(putc, stats.queue_drops);
-        csi(putc, &[], b'K');
-        view_row(putc, base + 2);
-        print_bytes(putc, b"  queue [");
-        let limit = link.config.queue_limit.max(1) as usize;
-        let depth = link.queue.len();
-        let filled = (depth * BAR_WIDTH).div_ceil(limit).min(BAR_WIDTH);
-        for position in 0..BAR_WIDTH {
-            putc(u32::from(if position < filled { b'#' } else { b'.' }));
+    let mut row = 3;
+    if session.limiter {
+        for index in 0..2 {
+            draw_direction(putc, session, index, row);
+            row += 4;
         }
-        print_bytes(putc, b"] ");
-        print_u32(putc, depth as u32);
-        print_bytes(putc, b"/");
-        print_u32(putc, limit as u32);
-        print_bytes(putc, b"  max ");
-        print_u32(putc, stats.max_depth);
+    }
+    if session.gen_nic.is_some() || session.sink_nic.is_some() {
+        view_row(putc, row);
+        if session.gen_nic.is_some() {
+            print_gen_config(putc, session);
+        }
         csi(putc, &[], b'K');
-        view_row(putc, base + 3);
-        if link.config.has_faults() || stats.duplicated + stats.reordered + stats.corrupted > 0 {
-            print_fault_line(putc, &link.config);
-            print_bytes(putc, b"(done: dup ");
-            print_u32(putc, stats.duplicated);
-            print_bytes(putc, b", reorder ");
-            print_u32(putc, stats.reordered);
-            print_bytes(putc, b", corrupt ");
-            print_u32(putc, stats.corrupted);
-            print_bytes(putc, b")");
+        view_row(putc, row + 1);
+        if session.gen_nic.is_some() {
+            print_bytes(putc, b"     ");
+            print_gen_line_plain(putc, session);
+            print_bytes(putc, b"  now ");
+            print_u32(putc, session.view.kbit.0);
+            print_bytes(putc, b" kbit/s");
+        }
+        csi(putc, &[], b'K');
+        view_row(putc, row + 2);
+        if session.sink_nic.is_some() {
+            print_sink_summary(putc, session);
+        }
+        csi(putc, &[], b'K');
+        view_row(putc, row + 3);
+        if session.sink_nic.is_some() {
+            print_sink_latency(putc, session);
         }
         csi(putc, &[], b'K');
     }
-    view_row(putc, 11);
-    for _ in 0..78 {
-        putc(u32::from(b'-'));
-    }
+    view_row(putc, session.view.rows - 1);
+    rule(putc);
     csi(putc, &[], b'K');
-    view_row(putc, 12);
-    print_bytes(putc, b" view off | help | quit");
+    view_row(putc, session.view.rows);
+    print_bytes(putc, b" view off | gen start|stop | sink reset | help | quit");
     csi(putc, &[], b'K');
     putc(0x1b);
     putc(u32::from(b'['));
     putc(u32::from(b'u'));
+}
+
+fn draw_direction(putc: Putc, session: &Session<'_>, index: usize, base: u32) {
+    let link = &session.links[index];
+    let stats = &link.stats;
+    view_row(putc, base);
+    print_config_line(putc, index, &link.config);
+    csi(putc, &[], b'K');
+    view_row(putc, base + 1);
+    print_bytes(putc, b"  in ");
+    print_u32(putc, stats.received);
+    print_bytes(putc, b" (");
+    print_u32(putc, session.view.rates[index].0);
+    print_bytes(putc, b"/s)  out ");
+    print_u32(putc, stats.sent);
+    print_bytes(putc, b" (");
+    print_u32(putc, session.view.rates[index].1);
+    print_bytes(putc, b"/s)  lost ");
+    print_u32(putc, stats.lost);
+    print_bytes(putc, b"  qdrop ");
+    print_u32(putc, stats.queue_drops);
+    csi(putc, &[], b'K');
+    view_row(putc, base + 2);
+    print_bytes(putc, b"  queue [");
+    let limit = link.config.queue_limit.max(1) as usize;
+    let depth = link.queue.len();
+    let filled = (depth * BAR_WIDTH).div_ceil(limit).min(BAR_WIDTH);
+    for position in 0..BAR_WIDTH {
+        putc(u32::from(if position < filled { b'#' } else { b'.' }));
+    }
+    print_bytes(putc, b"] ");
+    print_u32(putc, depth as u32);
+    print_bytes(putc, b"/");
+    print_u32(putc, limit as u32);
+    print_bytes(putc, b"  max ");
+    print_u32(putc, stats.max_depth);
+    csi(putc, &[], b'K');
+    view_row(putc, base + 3);
+    if link.config.has_faults() || stats.duplicated + stats.reordered + stats.corrupted > 0 {
+        print_fault_line(putc, &link.config);
+        print_bytes(putc, b"(done: dup ");
+        print_u32(putc, stats.duplicated);
+        print_bytes(putc, b", reorder ");
+        print_u32(putc, stats.reordered);
+        print_bytes(putc, b", corrupt ");
+        print_u32(putc, stats.corrupted);
+        print_bytes(putc, b")");
+    }
+    csi(putc, &[], b'K');
+}
+
+/// `sent N, failed N` without the newline `print_gen_line` ends with.
+fn print_gen_line_plain(putc: Putc, session: &Session<'_>) {
+    let stats = &session.generator.stats;
+    print_bytes(putc, b"sent ");
+    print_u32(putc, stats.sent);
+    print_bytes(putc, b", failed ");
+    print_u32(putc, stats.send_failed);
+    if stats.lagged > 0 {
+        print_bytes(putc, b", behind ");
+        print_u32(putc, stats.lagged);
+        print_bytes(putc, b"x");
+    }
 }
 
 fn print_two_digits(putc: Putc, value: u32) {

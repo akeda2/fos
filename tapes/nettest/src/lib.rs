@@ -405,6 +405,268 @@ impl<'a> Direction<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Traffic generator and sink.
+//
+// The generator emits numbered, timestamped frames at a constant bit rate; the
+// sink checks them off. Because both run in the same tape on the same machine
+// they share one clock, so the sink's `now - tx timestamp` is a true one-way
+// latency with no clock synchronisation to worry about.
+
+/// Ethertype of generated frames (IEEE 802 local experimental range).
+pub const GEN_ETHERTYPE: [u8; 2] = [0x88, 0xba];
+const GEN_MAGIC: &[u8; 4] = b"FNT1";
+/// Bytes of Ethernet header plus the generator's own header (magic, stream,
+/// sequence number, timestamp): the smallest frame that can carry them.
+pub const GEN_HEADER_LEN: usize = 14 + 4 + 2 + 4 + 8;
+/// Smallest frame the generator will build (an Ethernet minimum frame).
+pub const GEN_MIN_SIZE: usize = 60;
+/// Frames sent per call at most, so a long stall cannot turn into one huge
+/// burst that overruns the far end's receive ring.
+const GEN_MAX_BURST: u32 = 16;
+/// If the schedule falls this far behind (microseconds) it is restarted from
+/// now instead of catching up, and the event is counted.
+const GEN_MAX_LAG_US: u64 = 200_000;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct GenStats {
+    pub sent: u32,
+    pub send_failed: u32,
+    pub bytes: u64,
+    /// Times the schedule fell too far behind and was restarted.
+    pub lagged: u32,
+}
+
+/// A constant-bit-rate frame generator. The bit rate counts whole Ethernet
+/// frames (header included, preamble and FCS not), so 1000 kbit/s of
+/// 1000-byte frames is 125 frames a second.
+pub struct Generator {
+    pub running: bool,
+    pub rate_kbit: u32,
+    pub size: usize,
+    pub destination: [u8; 6],
+    /// Stop after this many frames (0 = no limit).
+    pub count_limit: u32,
+    /// Stop after this many seconds (0 = no limit).
+    pub seconds_limit: u32,
+    pub stats: GenStats,
+    sequence: u32,
+    /// When the next frame is due, in nanoseconds (finer than a microsecond so
+    /// the rounding of a 12 us gigabit interval does not drift).
+    next_due_ns: u64,
+    started_us: u64,
+}
+
+impl Generator {
+    pub const fn new() -> Self {
+        Self {
+            running: false,
+            rate_kbit: 1000,
+            size: 1000,
+            destination: [0xff; 6],
+            count_limit: 0,
+            seconds_limit: 0,
+            stats: GenStats { sent: 0, send_failed: 0, bytes: 0, lagged: 0 },
+            sequence: 0,
+            next_due_ns: 0,
+            started_us: 0,
+        }
+    }
+
+    pub fn start(&mut self, now_us: u64) {
+        self.running = true;
+        self.sequence = 0;
+        self.stats = GenStats::default();
+        self.next_due_ns = now_us * 1000;
+        self.started_us = now_us;
+    }
+
+    pub fn stop(&mut self) {
+        self.running = false;
+    }
+
+    /// Nanoseconds between frames for the current size and rate.
+    pub fn interval_ns(&self) -> u64 {
+        // bits / (rate * 1000 bit/s) seconds = bits * 1_000_000 / rate ns.
+        (self.size as u64 * 8 * 1_000_000) / u64::from(self.rate_kbit.max(1))
+    }
+
+    /// If a frame is due, builds it into `out` and returns its length; call
+    /// again for more (up to a burst limit per `pass`). The caller sends the
+    /// frame and reports the outcome with `record_send`.
+    pub fn next_frame(&mut self, now_us: u64, source: [u8; 6], out: &mut [u8], sent_this_pass: u32) -> Option<usize> {
+        if !self.running || sent_this_pass >= GEN_MAX_BURST {
+            return None;
+        }
+        if (self.count_limit != 0 && self.stats.sent + self.stats.send_failed >= self.count_limit)
+            || (self.seconds_limit != 0
+                && now_us.saturating_sub(self.started_us) >= u64::from(self.seconds_limit) * 1_000_000)
+        {
+            self.running = false;
+            return None;
+        }
+        let now_ns = now_us * 1000;
+        if now_ns < self.next_due_ns {
+            return None;
+        }
+        if now_us.saturating_sub(self.next_due_ns / 1000) > GEN_MAX_LAG_US {
+            self.next_due_ns = now_ns;
+            self.stats.lagged = self.stats.lagged.wrapping_add(1);
+        }
+        let size = self.size.clamp(GEN_MIN_SIZE.max(GEN_HEADER_LEN), MAX_FRAME).min(out.len());
+        out[0..6].copy_from_slice(&self.destination);
+        out[6..12].copy_from_slice(&source);
+        out[12..14].copy_from_slice(&GEN_ETHERTYPE);
+        out[14..18].copy_from_slice(GEN_MAGIC);
+        out[18..20].copy_from_slice(&0u16.to_le_bytes());
+        out[20..24].copy_from_slice(&self.sequence.to_le_bytes());
+        out[24..32].copy_from_slice(&now_us.to_le_bytes());
+        for (offset, byte) in out[32..size].iter_mut().enumerate() {
+            *byte = (offset as u8).wrapping_add(self.sequence as u8);
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        self.next_due_ns += self.interval_ns();
+        Some(size)
+    }
+
+    pub fn record_send(&mut self, length: usize, ok: bool) {
+        if ok {
+            self.stats.sent = self.stats.sent.wrapping_add(1);
+            self.stats.bytes += length as u64;
+        } else {
+            self.stats.send_failed = self.stats.send_failed.wrapping_add(1);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SinkStats {
+    pub received: u32,
+    pub bytes: u64,
+    pub lost: u32,
+    pub duplicated: u32,
+    pub reordered: u32,
+    /// One-way latency in microseconds.
+    pub latency_min: u32,
+    pub latency_max: u32,
+    pub latency_sum: u64,
+    /// RFC 3550 interarrival jitter estimate, in microseconds.
+    pub jitter: u32,
+    pub first_us: u64,
+    pub last_us: u64,
+}
+
+/// Checks generated frames off: counts, loss, duplicates, reordering, latency.
+pub struct Sink {
+    pub stats: SinkStats,
+    expected: u32,
+    /// Bit `i` set: sequence `expected - 1 - i` has been received.
+    window: u64,
+    previous_latency: u32,
+    seen_any: bool,
+}
+
+impl Sink {
+    pub const fn new() -> Self {
+        Self {
+            stats: SinkStats {
+                received: 0, bytes: 0, lost: 0, duplicated: 0, reordered: 0, latency_min: 0,
+                latency_max: 0, latency_sum: 0, jitter: 0, first_us: 0, last_us: 0,
+            },
+            expected: 0,
+            window: 0,
+            previous_latency: 0,
+            seen_any: false,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Consumes a received frame if it is one of the generator's; false if not.
+    pub fn on_frame(&mut self, frame: &[u8], now_us: u64) -> bool {
+        if frame.len() < GEN_HEADER_LEN || frame[12..14] != GEN_ETHERTYPE || &frame[14..18] != GEN_MAGIC {
+            return false;
+        }
+        let sequence = u32::from_le_bytes(frame[20..24].try_into().unwrap());
+        let sent_us = u64::from_le_bytes(frame[24..32].try_into().unwrap());
+        let latency = now_us.saturating_sub(sent_us).min(u64::from(u32::MAX)) as u32;
+        let stats = &mut self.stats;
+        if !self.seen_any {
+            self.seen_any = true;
+            self.expected = sequence;
+            stats.first_us = now_us;
+            stats.latency_min = latency;
+        }
+        stats.received = stats.received.wrapping_add(1);
+        stats.bytes += frame.len() as u64;
+        stats.last_us = now_us;
+        stats.latency_min = stats.latency_min.min(latency);
+        stats.latency_max = stats.latency_max.max(latency);
+        stats.latency_sum += u64::from(latency);
+        let delta = latency.abs_diff(self.previous_latency);
+        stats.jitter = (stats.jitter as i64 + (i64::from(delta) - i64::from(stats.jitter)) / 16) as u32;
+        self.previous_latency = latency;
+
+        let behind = self.expected.wrapping_sub(sequence); // > 0 and < 2^31: an old frame
+        if sequence == self.expected {
+            self.window = (self.window << 1) | 1;
+            self.expected = self.expected.wrapping_add(1);
+        } else if behind != 0 && behind < 0x8000_0000 {
+            let distance = behind - 1;
+            if distance < 64 && self.window & (1 << distance) != 0 {
+                stats.duplicated = stats.duplicated.wrapping_add(1);
+            } else {
+                stats.reordered = stats.reordered.wrapping_add(1);
+                stats.lost = stats.lost.saturating_sub(1); // it was counted lost at the gap
+                if distance < 64 {
+                    self.window |= 1 << distance;
+                }
+            }
+        } else {
+            let gap = sequence.wrapping_sub(self.expected);
+            stats.lost = stats.lost.wrapping_add(gap);
+            self.window = if gap >= 63 { 1 } else { (self.window << (gap + 1)) | 1 };
+            self.expected = sequence.wrapping_add(1);
+        }
+        true
+    }
+
+    /// Average throughput between the first and the last frame, in kbit/s.
+    pub fn average_kbit(&self) -> u64 {
+        let span = self.stats.last_us.saturating_sub(self.stats.first_us);
+        if span == 0 {
+            return 0;
+        }
+        self.stats.bytes * 8 * 1000 / span
+    }
+}
+
+/// Parses `aa:bb:cc:dd:ee:ff`.
+pub fn parse_mac(text: &[u8]) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut count = 0;
+    for part in text.split(|&byte| byte == b':') {
+        if count == 6 || part.is_empty() || part.len() > 2 {
+            return None;
+        }
+        let mut value = 0u8;
+        for &digit in part {
+            let nibble = match digit {
+                b'0'..=b'9' => digit - b'0',
+                b'a'..=b'f' => digit - b'a' + 10,
+                b'A'..=b'F' => digit - b'A' + 10,
+                _ => return None,
+            };
+            value = value.checked_mul(16)?.checked_add(nibble)?;
+        }
+        mac[count] = value;
+        count += 1;
+    }
+    (count == 6).then_some(mac)
+}
+
 /// Parses a plain unsigned decimal number.
 pub fn parse_u32(text: &[u8]) -> Option<u32> {
     if text.is_empty() {
@@ -624,6 +886,95 @@ mod tests {
         }
         assert_eq!(preset(b"nope", 1000), None);
         assert_eq!(preset(b"satellite", 100).unwrap().queue_limit, 100);
+    }
+
+    #[test]
+    fn generator_paces_frames_at_the_configured_rate() {
+        let mut generator = Generator::new();
+        generator.rate_kbit = 1000; // 125 frames/s of 1000 bytes: one every 8 ms
+        generator.size = 1000;
+        generator.start(1_000_000);
+        let mut frame = [0u8; 1514];
+        assert_eq!(generator.next_frame(1_000_000, [1; 6], &mut frame, 0), Some(1000));
+        assert_eq!(generator.next_frame(1_000_000, [1; 6], &mut frame, 1), None);
+        assert_eq!(generator.next_frame(1_007_999, [1; 6], &mut frame, 0), None);
+        assert!(generator.next_frame(1_008_000, [1; 6], &mut frame, 0).is_some());
+    }
+
+    #[test]
+    fn generator_limits_a_burst_and_stops_at_its_count() {
+        let mut generator = Generator::new();
+        generator.rate_kbit = 1_000_000;
+        generator.size = 60;
+        generator.count_limit = 5;
+        generator.start(0);
+        let mut frame = [0u8; 100];
+        let mut sent = 0;
+        // Far behind schedule: still limited to GEN_MAX_BURST per pass, and 5 in all.
+        while let Some(length) = generator.next_frame(10_000, [2; 6], &mut frame, sent) {
+            generator.record_send(length, true);
+            sent += 1;
+        }
+        assert_eq!(generator.stats.sent, 5);
+        assert!(!generator.running);
+    }
+
+    #[test]
+    fn sink_counts_loss_duplicates_reordering_and_latency() {
+        let mut generator = Generator::new();
+        generator.rate_kbit = 100_000_000;
+        generator.size = 60;
+        generator.start(0);
+        let mut frames = std::vec::Vec::new();
+        let mut buffer = [0u8; 100];
+        for pass in 0..4 {
+            while let Some(length) = generator.next_frame(1000 * (pass + 1), [2; 6], &mut buffer, 0) {
+                frames.push(buffer[..length].to_vec());
+                if frames.len() % 10 == 0 {
+                    break;
+                }
+            }
+        }
+        assert!(frames.len() >= 10);
+        let mut sink = Sink::new();
+        // sequence 0,1 arrive; 2 is lost; 3 arrives; 1 again (duplicate); 4, then 2 late (reordered).
+        for index in [0usize, 1, 3, 1, 4, 2] {
+            assert!(sink.on_frame(&frames[index], 5_000));
+        }
+        assert_eq!(sink.stats.received, 6);
+        assert_eq!(sink.stats.duplicated, 1);
+        assert_eq!(sink.stats.reordered, 1);
+        assert_eq!(sink.stats.lost, 0, "the late frame cancels the gap it was counted in");
+        assert!(sink.stats.latency_min >= 1000);
+        assert!(!sink.on_frame(&[0u8; 60], 0), "other traffic is not the sink's");
+    }
+
+    #[test]
+    fn sink_reports_a_real_gap_as_loss() {
+        let mut generator = Generator::new();
+        generator.rate_kbit = 100_000_000;
+        generator.size = 100;
+        generator.start(0);
+        let mut buffer = [0u8; 200];
+        let mut frames = std::vec::Vec::new();
+        for _ in 0..8 {
+            let length = generator.next_frame(100, [2; 6], &mut buffer, 0).unwrap();
+            frames.push(buffer[..length].to_vec());
+        }
+        let mut sink = Sink::new();
+        for index in [0usize, 1, 2, 6, 7] {
+            sink.on_frame(&frames[index], 200);
+        }
+        assert_eq!(sink.stats.lost, 3);
+        assert_eq!(sink.stats.received, 5);
+    }
+
+    #[test]
+    fn parses_mac_addresses() {
+        assert_eq!(parse_mac(b"52:54:00:ab:cd:EF"), Some([0x52, 0x54, 0x00, 0xab, 0xcd, 0xef]));
+        assert_eq!(parse_mac(b"52:54:00:ab:cd"), None);
+        assert_eq!(parse_mac(b"52:54:00:ab:cd:ef:01"), None);
+        assert_eq!(parse_mac(b"zz:54:00:ab:cd:ef"), None);
     }
 
     #[test]

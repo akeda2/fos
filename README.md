@@ -197,6 +197,7 @@ the real-mode code that printed it has no notion of that ring at all.
 | `print run CMD...` | Runs `CMD` and prints only its console output (not the command line itself) to the first detected LPT port — the intended way to get a one-off paper copy of something like `help` without leaving it permanently usable-by-habit inside a printer terminal session. |
 | `nic` | Reports the active supported PCI Ethernet controller and its MAC address; the first initialized interface is selected by default. |
 | `nic list` | Lists every initialized Ethernet interface, its driver, MAC address, and active marker. |
+| `nic map` | Shows, for every NIC, its link state (speed and duplex where the driver can tell) and which of this machine's other NICs it can hear: each NIC in turn broadcasts a few tiny probe frames while the others listen, so cables between two ports show up as "direct cable" (nothing else heard on either end) and shared switches as "same network", plus a count of other hosts seen. Takes about a second, a few more if nothing is heard at first (links still coming up). Run it before a test to learn which unmarked port is which. |
 | `nic regs [N]` | Dumps the selected (or Nth) interface's key registers and ring state, for the RTL8168 and 3C905 (others report that no dump exists). |
 | `nic use N` | Selects interface N from `nic list` for the shell and legacy single-interface tape callbacks. |
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
@@ -1126,7 +1127,33 @@ the tape's own NICs are management traffic and are not impaired. Queue storage
 is 4 MiB from the big pool when the machine has RAM above 128 MiB, otherwise a
 static 256-frame queue per direction. The engine is in `tapes/nettest/src/lib.rs`
 (host unit tests: `cargo test --manifest-path tapes/nettest/Cargo.toml --lib`);
-`make test-tape-nettest` also runs a live two-NIC test. (In QEMU, the `e1000` model delivers nothing for about a second after a guest enables promiscuous mode -- `bridge` shows the same -- while `e1000e` does not; the tape itself is not slow.)
+`make test-tape-nettest` also runs a live two-NIC test.
+
+**Traffic generator and sink.** The same tape can also generate and measure
+traffic, so one machine with four or five ports is a complete test lab. `gen=N`
+makes NIC N a generator, `sink=N` makes NIC N a receiver; both can run at once
+together with the impairment link, each on a NIC of its own (`nic map` shows
+which ports are cabled together):
+
+```
+generator (NIC 1) --cable--> NIC 2 [impairment link] NIC 3 --cable--> sink (NIC 4)
+tape run nettest 2 3 gen=1 sink=4 gen.rate=20000 gen.size=1000 gen.delay=3 gen.run=on
+```
+
+The generator sends numbered, timestamped frames at a constant bit rate (whole
+Ethernet frames, header included): `gen.rate=KBIT`, `gen.size=BYTES` (60-1514),
+`gen.to=MAC` (default: the local sink's MAC, else broadcast), `gen.count=N`,
+`gen.time=SECONDS`, and `gen.run=on` to start at launch (after `gen.delay=S`
+seconds, so links can come up). At the prompt: `gen start|stop|show`, `gen rate
+KBIT`, and so on. The sink reports frames received, average and current
+throughput, loss (from sequence gaps), duplicates, reordering, and one-way
+latency (min/avg/max and RFC 3550 jitter) -- exact when generator and sink share
+the tape, because they share one clock. `sink [show|reset]`, `stats` and the
+`view` panel show them. With only `gen=`/`sink=` and no port numbers there is no
+impairment link: a pure generator/sink pair, for example to test a router
+(another machine, or the `router` tape) between two ports. While the generator
+runs the tape polls without sleeping, so expect 100% CPU; it handles roughly
+tens of thousands of frames per second per direction. (In QEMU, the `e1000` model delivers nothing for about a second after a guest enables promiscuous mode -- `bridge` shows the same -- while `e1000e` does not; the tape itself is not slow.)
 
 #### Test tape: `tapes/bridge/`
 
