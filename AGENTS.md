@@ -1031,9 +1031,15 @@ the MACs *after* `TxConfig`/`RxConfig`); Linux's per-chip PHY/ERI/OCP/ASPM
 tuning is deliberately left out. `init` logs the PCI revision, the version
 bits, the MAC and the PHY status -- read them with `dmesg`.
 
-**Confirmed working on the AMD/nForce test machine** (receive, transmit, full
-`term net` sessions, no recoveries): a TP-Link TG-3468 at 1000 Mb/s and the
-onboard LAN at 100 Mb/s. QEMU has no RTL8168 model, so nothing automated
+**Confirmed working on the AMD/nForce test machine**: a TP-Link TG-3468 at
+1000 Mb/s and the onboard LAN at 100 Mb/s. Verified: `term net` sessions, tapes
+loaded into each NIC (5 KB and 284 KB, the 5 KB one then run with the correct
+output), and 13.7 KB of session output per round byte-identical to the 3C905's
+over three rounds. A ring overflow while nothing polls a NIC (e.g. inside
+`tape load net`, which polls only the selected NIC) costs one recovery and no
+freeze. Test caveat: when running these checks put the `term net` session on a
+different NIC than the one under test, with `nic use N` done in an earlier
+session (see TODO.md). QEMU has no RTL8168 model, so nothing automated
 covers this driver; `nic` order is RTL8139, 3C905, e1000, e1000e, I350,
 NE2000, then RTL8168. `pci` also prints each function's revision and
 subsystem IDs now, which is how an unknown card gets identified.
