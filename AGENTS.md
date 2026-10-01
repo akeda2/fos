@@ -1892,6 +1892,18 @@ find the target machine:
   silently overflow its receive ring on a large tape sent from a fast,
   unpaced sender.
 
+### `tools/devloop.py`: the safe way to drive a real machine
+
+One wrapper (run it with `python3-netraw`) over `term_net.py`, `send_tape.py`
+and `send_kernel_update.py`: `wait`, `run CMD...`, `push KERNEL` (KUP, then waits
+for the new boot) and `tape-into N FILE`. Prefer it to ad-hoc scripts: it encodes
+the traps that gave false results bringing up the RTL8168 and 3C905 -- `tape
+load net` listens only on the *selected* NIC (it runs `nic use N` and restores
+the old selection), the term session is held on a *different* NIC and never
+killed mid-load (a disconnect on another NIC cannot end the load), success
+requires the tape handle to advance (not just a matching size), a gapped
+transfer is retried slower, and a one-byte release tape always frees the wait.
+
 ### A numbered peer address book for `send_tape.py`/`term_net.py`
 
 `send_tape.py` keeps a small on-disk JSON address book (`~/.cache/
