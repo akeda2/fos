@@ -7,7 +7,7 @@
 ### Hardware
 [] We need power management, not only in shell. Even "term net":s waiting for connection prompt pins the cpu at 100%.
 We need power management even in tapes. How? Do we need a scheduler for this? SMP? Multitasking is not needed right now.
-[] New RTL gigabit card
+[] New RTL gigabit card: TP-link TG-3468 chip: RTL8168H. This is important as it's the only locally available new gigabit PCIe NIC.
 
 ### Shell: Scripts and tape execution
 [] scripts - like the "start" file we already have. ".scriptname" (without .sh) - alias for " scriptname.sh"
