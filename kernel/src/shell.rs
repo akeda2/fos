@@ -829,7 +829,9 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"start" if no_arguments(arguments) => start_command(info),
         b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
-        b"pci" if no_arguments(arguments) => print_pci_devices(),
+        // `arguments.is_empty()`, not `no_arguments`: that helper prints a complaint
+        // when arguments are present, which would fire before `pci read|write`.
+        b"pci" if arguments.is_empty() => print_pci_devices(),
         b"pci" => pci_command(arguments),
         b"io" => io_command(arguments),
         b"mmio" => mmio_command(arguments),

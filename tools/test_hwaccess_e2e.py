@@ -26,6 +26,7 @@ def main() -> None:
             # PCI configuration space: i440FX host bridge is 8086:1237.
             out = guest.run("pci read 00:00.0 0 16")
             expect(out, "00: 86 80 37 12")
+            expect_absent(out, "does not accept arguments")
             out = guest.run("pci")
             expect(out, "00:00.0 8086:1237")
             out = guest.run("pci read 00:00.0 0x3c 4")
