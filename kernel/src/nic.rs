@@ -217,12 +217,13 @@ pub fn watchdog() -> Result<WatchdogResult, Status> {
 static mut NICS: [Option<Nic>; MAX_NICS] = [const { None }; MAX_NICS];
 static mut NIC_COUNT: usize = 0;
 static mut ACTIVE_INDEX: usize = 0;
-/// True once every initialized NIC has a registered, enabled receive
+/// True unless some initialized NIC lacks a registered, enabled receive
 /// interrupt. Only then can a polling loop safely `hlt` between polls: the
 /// NIC itself wakes the CPU for each arriving frame. A NIC without a usable
 /// IRQ line would otherwise be polled only once per 10 ms PIT tick and could
-/// overflow its small receive ring at wire speed.
-static mut ALL_RX_INTERRUPT_DRIVEN: bool = false;
+/// overflow its small receive ring at wire speed. With no NIC at all there is
+/// nothing to starve, so it stays true and keyboard-only loops may sleep too.
+static mut ALL_RX_INTERRUPT_DRIVEN: bool = true;
 static mut INITIALIZED: bool = false;
 
 #[derive(Debug)]

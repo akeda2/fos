@@ -15,7 +15,10 @@ over a few seconds in each situation:
   3. `nic discover`, which polls every NIC           -> must be low.
   4. Control: the `vga-colors` tape, which spins      -> must be HIGH, which
      proves the measurement can see a busy guest at all.
-  5. The `bridge` and `router` tapes on a two-NIC guest, idle on the wire
+  5. The interactive tapes `net-chat`, `ip-chat`, `calc` and `ed` sitting at
+     their prompts, and `telnet` waiting out its ARP timeout for a server
+     that does not exist (they call `tape_rt::idle`)    -> must be low.
+  6. The `bridge` and `router` tapes on a two-NIC guest, idle on the wire
      (they call the tape ABI's `wait_for_event` after an empty polling
      pass)                                              -> must be low.
 
@@ -45,12 +48,12 @@ def cpu_seconds(pid: int) -> float:
     return ticks / os.sysconf("SC_CLK_TCK")
 
 
-def measure(guest: Guest) -> float:
-    """Fraction of one host core QEMU used over SAMPLE_SECONDS. The guest's
+def measure(guest: Guest, seconds: float = SAMPLE_SECONDS) -> float:
+    """Fraction of one host core QEMU used over `seconds`. The guest's
     serial output is drained meanwhile so a full pipe cannot stall it."""
     pid = guest.process.pid
     start_cpu, start = cpu_seconds(pid), time.monotonic()
-    while time.monotonic() - start < SAMPLE_SECONDS:
+    while time.monotonic() - start < seconds:
         for key, _ in guest.selector.select(0.2):
             guest.output.extend(os.read(key.fd, 4096))
     return (cpu_seconds(pid) - start_cpu) / (time.monotonic() - start)
@@ -116,7 +119,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as name:
         tmp = Path(name)
         image = tmp / "idle.img"
-        build_image(image, {"vga-colors.bin": BUILD / "tapes" / "vga-colors.bin"})
+        build_image(image, {
+            f"{name}.bin": BUILD / "tapes" / f"{name}.bin"
+            for name in ("vga-colors", "net-chat", "ip-chat", "calc", "ed", "telnet")
+        })
         monitor = str(tmp / "idle.mon")
         guest = Guest(image, [
             "-monitor", f"unix:{monitor},server,nowait",
@@ -159,6 +165,41 @@ def main() -> None:
             time.sleep(1)
             check("vga-colors tape (control, spins)", measure(guest), low=False)
             monitor_key(monitor, "f12")
+            guest.read_until(b"Tape returned", 10, start)
+
+            # `ed` edits an existing file, so make one through the shell and
+            # wait for that command's own output rather than for a prompt.
+            start = len(guest.output)
+            guest.process.stdin.write(b"write scratch hello\r\n")
+            guest.process.stdin.flush()
+            guest.read_until(b"File written.", 10, start)
+            guest.read_until(b"fos> ", 10, start + guest.output[start:].index(b"File written."))
+
+            # (label, command, text that shows it is waiting, text after F12)
+            for label, command, ready, done in (
+                ("net-chat tape, idle", "net-chat", b"Type a line and press Enter", b"Left tape chat"),
+                ("ip-chat tape, idle", "ip-chat static 10.9.0.2/24 10.9.0.1", b"IPv4 chat ready",
+                 b"Left IPv4 chat"),
+                ("calc tape, at its prompt", "calc", b"RPN calculator", b"Exiting the calculator"),
+                ("ed tape, at its prompt", "ed scratch", b"Type h for help", b"Tape returned"),
+            ):
+                start = len(guest.output)
+                guest.process.stdin.write(command.encode() + b"\r\n")
+                guest.process.stdin.flush()
+                guest.read_until(ready, 10, start)
+                time.sleep(1)
+                check(label, measure(guest), low=True)
+                monitor_key(monitor, "f12")
+                guest.read_until(done, 10, start)
+                guest.read_until(b"fos> ", 10, start)
+
+            # telnet's ARP wait lasts 3 s (ARP_TIMEOUT_TICKS), so sample 2 s
+            # starting the moment the tape is running.
+            start = len(guest.output)
+            guest.process.stdin.write(b"telnet static 10.9.0.2/24 10.9.0.1 10.9.0.9 23\r\n")
+            guest.process.stdin.flush()
+            guest.read_until(b"Running", 10, start)
+            check("telnet tape, waiting for ARP", measure(guest, 2.0), low=True)
             guest.read_until(b"Tape returned", 10, start)
         finally:
             guest.terminate()

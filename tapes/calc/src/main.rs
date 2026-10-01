@@ -267,7 +267,38 @@ pub extern "C" fn tape_main(
     read_key: extern "C" fn() -> u32,
     args_ptr: u32,
     args_len: u32,
+    _nic_mac: extern "C" fn(u32) -> u32,
+    _nic_send: extern "C" fn(u32, u32) -> u32,
+    _nic_receive: extern "C" fn(u32, u32) -> u32,
+    _nic_max_frame_len: extern "C" fn() -> u32,
+    _ticks: extern "C" fn() -> u64,
+    _nic_count: extern "C" fn() -> u32,
+    _nic_mac_at: extern "C" fn(u32, u32) -> u32,
+    _nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
+    _nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
+    _nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
+    _terminal_position: extern "C" fn() -> u32,
+    _fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
+    _fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
+    _fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
+    _fs_remove: extern "C" fn(u32, u32) -> u32,
+    _audio_sample_rate: extern "C" fn() -> u32,
+    _audio_channels_and_bits: extern "C" fn() -> u32,
+    _audio_submit: extern "C" fn(u32, u32) -> u32,
+    _audio_capture: extern "C" fn(u32, u32) -> u32,
+    _audio_count: extern "C" fn() -> u32,
+    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_sample_rate: extern "C" fn() -> u32,
+    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
+    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    // Sleeps until the next interrupt; call after a pass that found no work.
+    wait_for_event: extern "C" fn(),
 ) {
+    tape_rt::set_wait_hook(wait_for_event);
     // Safety: `args_ptr`/`args_len` come straight from `shell::tape_run`,
     // which always passes a valid (possibly empty) slice into its own
     // already-parsed command-line buffer for the entire duration of this
@@ -304,7 +335,12 @@ Press F12 (or F4/F6/F7/F8/F10) to exit.\n",
     print_bytes(putc, b"> ");
     loop {
         match read_key() {
-            TAPE_EVENT_NONE => continue,
+            // No key yet: sleep until the next interrupt (keyboard, remote
+            // `term net` frame, or the timer tick) instead of spinning.
+            TAPE_EVENT_NONE => {
+                tape_rt::idle();
+                continue;
+            }
             TAPE_EVENT_ABORT => {
                 print_bytes(putc, b"\nExiting the calculator.\n");
                 break;

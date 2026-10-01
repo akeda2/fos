@@ -266,7 +266,35 @@ pub extern "C" fn tape_main(
     nic_mac: NicMac,
     nic_send: NicSend,
     nic_receive: NicReceive,
+    _nic_max_frame_len: extern "C" fn() -> u32,
+    _ticks: extern "C" fn() -> u64,
+    _nic_count: extern "C" fn() -> u32,
+    _nic_mac_at: extern "C" fn(u32, u32) -> u32,
+    _nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
+    _nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
+    _nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
+    _terminal_position: extern "C" fn() -> u32,
+    _fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
+    _fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
+    _fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
+    _fs_remove: extern "C" fn(u32, u32) -> u32,
+    _audio_sample_rate: extern "C" fn() -> u32,
+    _audio_channels_and_bits: extern "C" fn() -> u32,
+    _audio_submit: extern "C" fn(u32, u32) -> u32,
+    _audio_capture: extern "C" fn(u32, u32) -> u32,
+    _audio_count: extern "C" fn() -> u32,
+    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_sample_rate: extern "C" fn() -> u32,
+    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
+    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    // Sleeps until the next interrupt; call after a pass that found no work.
+    wait_for_event: extern "C" fn(),
 ) {
+    tape_rt::set_wait_hook(wait_for_event);
     let mut own_mac = [0u8; 6];
     if nic_mac(own_mac.as_mut_ptr() as u32) == 0 {
         print_bytes(
@@ -308,7 +336,10 @@ pub extern "C" fn tape_main(
     let mut peer_count = 0usize;
 
     loop {
-        match read_key() {
+        let event = read_key();
+        // No key this pass: if no frame arrives either, sleep (below).
+        let key_idle = event == TAPE_EVENT_NONE;
+        match event {
             TAPE_EVENT_NONE => {}
             TAPE_EVENT_ABORT => break,
             event if event >= TAPE_EVENT_CHAR_BASE => {
@@ -366,6 +397,8 @@ pub extern "C" fn tape_main(
                 &mut peers,
                 &mut peer_count,
             );
+        } else if key_idle {
+            tape_rt::idle();
         }
     }
 

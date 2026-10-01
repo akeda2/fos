@@ -5,7 +5,7 @@
 ## New features
 
 ### Hardware
-[] Power management: kernel loops, router and bridge now halt when idle (`wait_for_event` tape callback). Still spinning: telnet, ip-chat, net-chat, tape-net's internal waits (ARP/TCP), calc/ed and the audio tapes.
+[x] Power management: kernel loops and the router, bridge, net-chat, ip-chat, telnet, net-dhcp-test, calc and ed tapes halt when idle (`wait_for_event` tape callback). Still spinning: the audio tapes (USB isochronous has no IRQ) and beep/morse timing loops.
 [] New RTL gigabit card: TP-link TG-3468 chip: RTL8168H. This is important as it's the only locally available new gigabit PCIe NIC.
 [] NIC on MSI
 [] Finish HDA work

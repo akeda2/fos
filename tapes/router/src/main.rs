@@ -1505,6 +1505,8 @@ fn configure_dhcp(
                 &mut client,
                 now,
             );
+        } else {
+            tape_rt::idle();
         }
     }
 }
@@ -2569,6 +2571,7 @@ pub extern "C" fn tape_main(
     // Sleeps until the next interrupt; call after a pass that found no work.
     wait_for_event: extern "C" fn(),
 ) {
+    tape_rt::set_wait_hook(wait_for_event);
     let nic_total = nic_count() as usize;
     let arguments = if args_len == 0 {
         &[][..]

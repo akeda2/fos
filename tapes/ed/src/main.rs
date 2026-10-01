@@ -69,7 +69,23 @@ pub extern "C" fn tape_main(
     fs_read: FsRead,
     fs_write: FsWrite,
     _fs_remove: extern "C" fn(u32, u32) -> u32,
+    _audio_sample_rate: extern "C" fn() -> u32,
+    _audio_channels_and_bits: extern "C" fn() -> u32,
+    _audio_submit: extern "C" fn(u32, u32) -> u32,
+    _audio_capture: extern "C" fn(u32, u32) -> u32,
+    _audio_count: extern "C" fn() -> u32,
+    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_sample_rate: extern "C" fn() -> u32,
+    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
+    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    // Sleeps until the next interrupt; call after a pass that found no work.
+    wait_for_event: extern "C" fn(),
 ) {
+    tape_rt::set_wait_hook(wait_for_event);
     let Some(name) = parse_filename(args_ptr, args_len) else {
         print_bytes(putc, b"Usage: tape run ed NAME (or diskN/NAME for a secondary disk)\n");
         return;
@@ -160,10 +176,16 @@ fn parse_filename<'a>(args_ptr: u32, args_len: u32) -> Option<&'a [u8]> {
         return None;
     }
     let args: &'a [u8] = unsafe { slice::from_raw_parts(args_ptr as *const u8, args_len as usize) };
-    let mut words = args.split(|byte| *byte == b' ');
-    let command = trim_ascii(words.next()?);
-    let name = trim_ascii(words.next()?);
-    if command != b"ed" || name.is_empty() || words.next().is_some() || !valid_reference(name) {
+    let mut words = args
+        .split(|byte| *byte == b' ')
+        .map(trim_ascii)
+        .filter(|word| !word.is_empty());
+    // `tape run ed NAME` keeps its leading program word, while a bare-name run
+    // (`ed NAME`, see `shell::run_external_command`) hands the tape only NAME.
+    // Both work; a file literally named `ed` must be written `ed ed`.
+    let first = words.next()?;
+    let name = if first == b"ed" { words.next()? } else { first };
+    if words.next().is_some() || !valid_reference(name) {
         return None;
     }
     Some(name)
@@ -348,6 +370,7 @@ fn read_line(putc: Putc, read_key: ReadKey, output: &mut [u8]) -> Option<usize> 
     loop {
         let event = read_key();
         if event == 0 {
+            tape_rt::idle();
             continue;
         }
         if event == TAPE_EVENT_ABORT {
@@ -495,6 +518,7 @@ fn wait_for_more(putc: Putc, read_key: ReadKey) -> MoreAction {
             return MoreAction::Abort;
         }
         if event < TAPE_EVENT_BYTE_BASE {
+            tape_rt::idle();
             continue;
         }
         match (event - TAPE_EVENT_BYTE_BASE) as u8 {

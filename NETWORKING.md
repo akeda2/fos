@@ -71,8 +71,10 @@ it after a polling pass that found no frame, key, or timer work, instead of
 spinning at 100% CPU. Every NIC's receive interrupt, the keyboard, and the
 100 Hz timer tick all end the sleep, so it costs a received frame no extra
 latency, and it may also return early, so simply poll again. It returns at
-once (no sleep) if any NIC lacks a working receive interrupt. `tapes/router/`
-and `tapes/bridge/` call it; a tape that never does behaves exactly as before.
+once (no sleep) if any NIC lacks a working receive interrupt. Most
+networking tapes call it (through `tape_rt::set_wait_hook`/`tape_rt::idle`);
+sleep only after a pass that found no frame *and* no key. A tape that never
+calls it behaves exactly as before.
 
 `nic_mac`/`nic_send`/`nic_receive` operate on the currently selected
 interface. `nic_count` reports how many interfaces initialized successfully;

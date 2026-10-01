@@ -74,6 +74,32 @@ pub fn print_u32(putc: extern "C" fn(u32), mut value: u32) {
     }
 }
 
+/// The kernel's `wait_for_event` callback (the last tape ABI slot), stored by
+/// `set_wait_hook` so any polling loop in a tape -- including deep inside
+/// helper functions that were never passed the callback -- can call `idle()`
+/// without threading another parameter through every signature. Tapes are
+/// single-threaded and zero-initialized `.bss` leaves this `None` until set, so
+/// a tape that never sets it simply never sleeps.
+static mut WAIT_HOOK: Option<extern "C" fn()> = None;
+
+/// Remembers the kernel's `wait_for_event` callback; call once from
+/// `tape_main` before any polling loop.
+pub fn set_wait_hook(hook: extern "C" fn()) {
+    unsafe {
+        WAIT_HOOK = Some(hook);
+    }
+}
+
+/// Sleeps until the next interrupt (a received frame, a keypress, or the
+/// 10 ms timer tick). Call it when a polling pass found nothing to do instead
+/// of spinning; the sleep may end early, so just poll again. Does nothing if
+/// no hook was set.
+pub fn idle() {
+    if let Some(hook) = unsafe { WAIT_HOOK } {
+        hook();
+    }
+}
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     // A tape has nowhere to unwind to and no OS underneath it -- see

@@ -1971,9 +1971,12 @@ every NIC has an enabled receive IRQ (`nic::all_rx_interrupt_driven`), so a
 frame wakes the CPU immediately; otherwise the loops spin as before. Loops that
 read COM1 (`term`, `chat`) must not halt: serial has no IRQ and a 16-byte FIFO
 can overflow. Tapes get the same via the last ABI callback, `wait_for_event`
-(slot 36, `tape_wait_for_event` -> `idle_wait`); only `tapes/router` and
-`tapes/bridge` call it so far -- the interactive tapes (telnet, ip-chat,
-net-chat) and `tape-net`'s internal waits still spin. `make test-idle-cpu`
+(slot 36, `tape_wait_for_event` -> `idle_wait`). `tapes/tape-rt` stores it
+(`set_wait_hook`) so any loop can call `tape_rt::idle()` without a new
+parameter; `tape-net` itself is a pure protocol library with no waits. Router,
+bridge, net-chat, ip-chat, telnet, net-dhcp-test, calc and ed use it; a loop
+must sleep only on a pass with no frame *and* no key (`read_key` yields one
+event per call). The audio tapes and beep/morse timing loops still spin. `make test-idle-cpu`
 measures QEMU's host CPU use (about 7% idle vs 100% for a spinning tape).
 Halting only costs a frame no latency because NIC IRQs really fire; see the
 PIC-mask note in `docs/history/development-notes.md` before touching

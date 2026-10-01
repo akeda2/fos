@@ -134,7 +134,9 @@ extern "C" fn tape_main(
   it when a polling pass found nothing to do: it sleeps until the next
   interrupt (a received frame, a keypress, or at worst the 10 ms timer tick)
   so an idle tape does not run the CPU at 100%. It may return early; just poll
-  again. See `tapes/bridge/src/main.rs` for the pattern.
+  again. See `tapes/bridge/src/main.rs` for the pattern. A tape that depends on
+  `tape-rt` can instead call `tape_rt::set_wait_hook(wait_for_event)` once and
+  then `tape_rt::idle()` from any helper function, with no extra parameter.
 - `terminal_position()` returns the kernel's packed, 1-based ANSI cursor
   position: row in the high 16 bits and column in the low 16 bits. It is
   useful for terminal protocols that must answer a cursor-position request.

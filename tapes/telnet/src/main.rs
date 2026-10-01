@@ -359,8 +359,27 @@ fn tick_reached(now: u64, deadline: u64) -> bool {
     now.wrapping_sub(deadline) < (1u64 << 63)
 }
 
+/// Set whenever `queue_input` got a real event from `read_key`, so a session
+/// loop only sleeps (`tape_rt::idle`) after a pass with no key *and* no frame.
+/// `read_key` hands back one event per call, so a pasted remote line is drained
+/// one byte per loop pass -- sleeping between those would add a tick per byte.
+static mut KEY_SEEN: bool = false;
+
+/// Reports (and clears) `KEY_SEEN`.
+fn take_key_seen() -> bool {
+    unsafe {
+        let seen = KEY_SEEN;
+        KEY_SEEN = false;
+        seen
+    }
+}
+
 fn queue_input(read_key: ReadKey, queue: &mut ByteQueue<MAX_INPUT_QUEUE>) -> Result<bool, ()> {
-    match read_key() {
+    let event = read_key();
+    if event != TAPE_EVENT_NONE {
+        unsafe { KEY_SEEN = true };
+    }
+    match event {
         TAPE_EVENT_NONE => Ok(false),
         TAPE_EVENT_ABORT => Ok(true),
         event if event >= TAPE_EVENT_CHAR_BASE => {
@@ -495,18 +514,19 @@ fn poll_arp(
     receive_buffer: &mut [u8; MAX_FRAME_LEN],
     max_frame_len: usize,
     now: u32,
-) {
+) -> bool {
     let length = nic_receive(receive_buffer.as_mut_ptr() as u32, max_frame_len as u32) as usize;
     if length == 0 {
-        return;
+        return false;
     }
     let length = min(length, MAX_FRAME_LEN);
     let Ok(ethernet) = EthernetFrame::parse(&receive_buffer[..length]) else {
-        return;
+        return true;
     };
     if ethernet.ethertype == ETHERTYPE_ARP {
         handle_arp(ethernet, config, own_mac, arp, nic_send, max_frame_len, now);
     }
+    true
 }
 
 fn receive_dhcp(frame: &[u8], client: &mut DhcpClient<128>, now: u32) {
@@ -670,6 +690,8 @@ fn configure_dhcp(
                 &mut client,
                 now,
             );
+        } else {
+            tape_rt::idle();
         }
     }
 }
@@ -717,7 +739,7 @@ fn resolve_server_mac(
                 return ConnectResult::Failed;
             }
         }
-        poll_arp(
+        let received = poll_arp(
             nic_receive,
             nic_send,
             config,
@@ -729,6 +751,9 @@ fn resolve_server_mac(
         );
         if arp.lookup(target, ticks() as u32).is_some() {
             return ConnectResult::Connected;
+        }
+        if !received && !take_key_seen() {
+            tape_rt::idle();
         }
     }
     print_bytes(putc, b"TELNET ERROR: ARP resolution timed out\n");
@@ -1025,6 +1050,11 @@ fn run_session(
                 max_frame_len,
             );
         }
+        // Nothing arrived and no key was read: sleep until a frame, a key, or
+        // the next timer tick (which also drives the retransmit deadline).
+        if length == 0 && !take_key_seen() {
+            tape_rt::idle();
+        }
     }
     if connection.state() == TcpState::Closed {
         print_bytes(putc, MARKER_DISCONNECTED);
@@ -1148,6 +1178,12 @@ fn run_session(
             print_bytes(putc, MARKER_DISCONNECTED);
             return;
         }
+        // An idle session: no frame and no key this pass. Typed bytes already
+        // queued above were sent in this same pass, and an ACK, server data,
+        // a keypress, or the next timer tick (retransmit) wakes this sleep.
+        if length == 0 && !take_key_seen() {
+            tape_rt::idle();
+        }
     }
 }
 
@@ -1174,7 +1210,27 @@ pub extern "C" fn tape_main(
     _nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
     _nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
     terminal_position: TerminalPosition,
+    _fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
+    _fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
+    _fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
+    _fs_remove: extern "C" fn(u32, u32) -> u32,
+    _audio_sample_rate: extern "C" fn() -> u32,
+    _audio_channels_and_bits: extern "C" fn() -> u32,
+    _audio_submit: extern "C" fn(u32, u32) -> u32,
+    _audio_capture: extern "C" fn(u32, u32) -> u32,
+    _audio_count: extern "C" fn() -> u32,
+    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
+    _audio_capture_sample_rate: extern "C" fn() -> u32,
+    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
+    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
+    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
+    // Sleeps until the next interrupt; call after a pass that found no work.
+    wait_for_event: extern "C" fn(),
 ) {
+    tape_rt::set_wait_hook(wait_for_event);
     let arguments = if args_len == 0 {
         &[][..]
     } else {
