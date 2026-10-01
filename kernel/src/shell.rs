@@ -67,6 +67,7 @@ pub fn run(info: &BootInfo) -> ! {
     crate::debug::load_config(info);
     crate::debug::maybe_crash_on_boot();
     crate::debug::confirm_boot(info);
+    crate::debug::arm_watchdog();
     if keyboard_available {
         println!("PS/2 keyboard initialized. Type 'help' for commands.");
     } else {
@@ -95,6 +96,7 @@ pub fn run(info: &BootInfo) -> ! {
     let mut last_network_activity = interrupts::ticks();
 
     loop {
+        crate::debug::watchdog_pet(); // the idle prompt loop is the foreground's heartbeat
         let byte = console::read_serial_byte().or_else(keyboard::pop_char);
         if ambient_discovery_poll(info) {
             last_network_activity = interrupts::ticks();
@@ -923,6 +925,17 @@ fn debug_command(info: &BootInfo, arguments: &[u8]) {
                 crate::debug::reboot_delay_ticks() / 100,
                 crate::debug::kernel_update_enabled()
             );
+            println!(
+                "debug: watchdog={}s ({}).",
+                crate::debug::watchdog_seconds(),
+                if crate::debug::watchdog_armed() { "armed" } else { "off" }
+            );
+        }
+        b"hang" if no_arguments(rest) => {
+            println!("debug: deliberately spinning with interrupts on; only the watchdog can end this.");
+            loop {
+                core::hint::spin_loop();
+            }
         }
         b"crash" if no_arguments(rest) => {
             println!("debug: deliberately raising a test exception (int3) now...");
@@ -933,7 +946,7 @@ fn debug_command(info: &BootInfo, arguments: &[u8]) {
         b"slots" if no_arguments(rest) => {
             print_slot_metadata(info);
         }
-        _ => println!("Usage: debug status | debug crash | debug slots"),
+        _ => println!("Usage: debug status | debug crash | debug hang | debug slots"),
     }
 }
 
@@ -2988,6 +3001,7 @@ fn relay_pending_tape_output(nic: &nic::Nic, peer: &[u8; 6], source: &[u8; 6]) {
 /// queue. Takes `Option<&nic::Nic>` rather than requiring one, since a
 /// few callers (the tape polling callbacks) may run with no NIC at all.
 fn poll_background_work(nic: Option<&nic::Nic>) {
+    crate::debug::watchdog_pet();
     relay_pending_print_output();
     // Unconditional (unlike everything below, which needs a NIC): keeps
     // an active USB Audio device's playback (and, if discovered, capture)
@@ -5325,10 +5339,12 @@ extern "C" fn tape_nic_max_frame_len() -> u32 {
 /// reason, so the tape must simply poll again; it never reports a result. If
 /// any NIC lacks a receive interrupt it returns at once (see `idle_wait`).
 extern "C" fn tape_wait_for_event() {
+    crate::debug::watchdog_pet();
     idle_wait();
 }
 
 extern "C" fn tape_ticks() -> u64 {
+    crate::debug::watchdog_pet(); // a tape polling the clock is alive
     interrupts::ticks()
 }
 
@@ -5509,6 +5525,7 @@ extern "C" fn tape_audio_capture_channels_and_bits_at(index: u32) -> u32 {
 /// networking tape runs inside `term net`. A too-small-buffer poll leaves
 /// the frame in the deferred FIFO for a later retry.
 extern "C" fn tape_nic_receive(out: u32, capacity: u32) -> u32 {
+    crate::debug::watchdog_pet();
     if out == 0 || capacity as usize > nic::MAX_FRAME_LEN {
         return 0;
     }
@@ -5563,6 +5580,7 @@ extern "C" fn tape_nic_receive(out: u32, capacity: u32) -> u32 {
 /// existing terminal-aware path; other interfaces are exposed directly to
 /// the tape without being mistaken for the active `term net` input channel.
 extern "C" fn tape_nic_receive_at(index: u32, out: u32, capacity: u32) -> u32 {
+    crate::debug::watchdog_pet();
     if out == 0 || capacity as usize > nic::MAX_FRAME_LEN {
         return 0;
     }
@@ -6042,6 +6060,9 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
     unsafe {
         TAPE_BOOT_INFO = info as *const BootInfo;
     }
+    // A tape may compute for a long time without calling back into the
+    // kernel; the watchdog allows it a much longer silence (see `debug.rs`).
+    crate::debug::watchdog_tape_running(true);
     entry(
         console::print_byte,
         combined_tape_should_abort,
@@ -6080,6 +6101,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_audio_capture_channels_and_bits_at,
         tape_wait_for_event,
     );
+    crate::debug::watchdog_tape_running(false);
     unsafe {
         TAPE_BOOT_INFO = core::ptr::null();
     }

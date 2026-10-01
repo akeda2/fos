@@ -384,6 +384,17 @@ pub fn report_and_clear_previous_crash() {
     println!(
         "debug: previous boot crashed (vector {vector}) at {code_segment:04x}:{instruction_pointer:08x}, eflags 0x{eflags:08x}, stack {stack_segment:04x}:{stack_pointer:08x}, tick {ticks}, slot {booted_slot}."
     );
+    if vector == WATCHDOG_VECTOR {
+        println!("debug: that was the software watchdog: the foreground stopped making progress.");
+        // A machine that hangs soon after every boot must not be reset in an
+        // endless loop. The record's tick is the previous boot's uptime, so a
+        // watchdog reset early in a boot leaves this boot unwatched; a hang
+        // after a long healthy run (an ordinary hang) re-arms normally.
+        if ticks < WATCHDOG_EARLY_RESET_TICKS {
+            unsafe { WATCHDOG_GUARD_DISARMED = true };
+            println!("debug: reset only {}s after boot, so the watchdog stays off this boot.", ticks / 100);
+        }
+    }
     if record.has_error_code != 0 {
         let error_code = record.error_code;
         println!("debug: error code 0x{error_code:08x}.");
@@ -412,6 +423,7 @@ pub fn report_and_clear_previous_crash() {
 /// ```text
 /// reboot-on-crash        # reboot (after a short delay) instead of halting on a fatal exception
 /// reboot-delay SECONDS   # override the default delay before rebooting (default 3)
+/// watchdog [SECONDS]     # reset the machine if the foreground makes no progress for SECONDS (default 60)
 /// kernel-update          # serve the network kernel-update protocol from the idle loop
 /// crash-on-boot          # test-only: deliberately crash every boot, before the milestone
 ///                        # confirm point -- lets the consecutive-crash loop guard (which
@@ -429,6 +441,9 @@ pub struct DebugConfig {
     pub reboot_delay_ticks: u32,
     pub kernel_update: bool,
     pub crash_on_boot: bool,
+    /// Seconds without foreground progress after which the software watchdog
+    /// resets the machine; 0 = off (the default). See `watchdog_check`.
+    pub watchdog_ticks: u32,
 }
 
 impl Default for DebugConfig {
@@ -438,6 +453,7 @@ impl Default for DebugConfig {
             reboot_delay_ticks: DEFAULT_REBOOT_DELAY_TICKS,
             kernel_update: false,
             crash_on_boot: false,
+            watchdog_ticks: 0,
         }
     }
 }
@@ -452,6 +468,7 @@ static mut CONFIG: DebugConfig = DebugConfig {
     reboot_delay_ticks: DEFAULT_REBOOT_DELAY_TICKS,
     kernel_update: false,
     crash_on_boot: false,
+    watchdog_ticks: 0,
 };
 
 /// Looks for an optional `debug` file, checking the boot disk first and then
@@ -512,6 +529,10 @@ fn parse_config(contents: &[u8]) -> DebugConfig {
             }
             Some(b"kernel-update") => config.kernel_update = true,
             Some(b"crash-on-boot") => config.crash_on_boot = true,
+            Some(b"watchdog") => {
+                let seconds = words.next().and_then(parse_u32).unwrap_or(WATCHDOG_DEFAULT_SECONDS);
+                config.watchdog_ticks = seconds.saturating_mul(100);
+            }
             _ => {}
         }
     }
@@ -552,6 +573,111 @@ pub fn reboot_delay_ticks() -> u32 {
 
 pub fn kernel_update_enabled() -> bool {
     unsafe { CONFIG.kernel_update }
+}
+
+/// The crash-record vector used for a watchdog reset: outside the CPU's 0..31
+/// exception vectors and the IRQ range, so it cannot be mistaken for either.
+const WATCHDOG_VECTOR: u8 = 0xf0;
+const WATCHDOG_DEFAULT_SECONDS: u32 = 60;
+/// While a tape runs, the limit is at least this long: a compute-bound tape
+/// (a big sieve) never calls back into the kernel, but a tape that polls
+/// (`should_abort`, `read_key`, `nic_receive`...) pets the watchdog anyway.
+const WATCHDOG_TAPE_LIMIT_TICKS: u64 = 10 * 60 * 100;
+/// A watchdog reset within this uptime of the boot that was reset is treated as
+/// a hang loop and disarms the watchdog for the next boot.
+const WATCHDOG_EARLY_RESET_TICKS: u64 = 5 * 60 * 100;
+
+static mut WATCHDOG_ARMED: bool = false;
+static mut WATCHDOG_LAST_PET: u64 = 0;
+static mut WATCHDOG_TAPE_RUNNING: bool = false;
+static mut WATCHDOG_GUARD_DISARMED: bool = false;
+
+/// Records that the foreground is alive. A single memory write, safe to call
+/// from anywhere and as often as a loop likes. Called from every blocking
+/// loop's escape check (`keyboard::poll_term_event`), `poll_background_work`,
+/// the idle prompt loop, each BIOS disk call, and the polling tape callbacks.
+pub fn watchdog_pet() {
+    unsafe { WATCHDOG_LAST_PET = crate::interrupts::ticks() };
+}
+
+/// Marks a tape as running, which relaxes the limit (see
+/// `WATCHDOG_TAPE_LIMIT_TICKS`). Also counts as progress.
+pub fn watchdog_tape_running(running: bool) {
+    unsafe { WATCHDOG_TAPE_RUNNING = running };
+    watchdog_pet();
+}
+
+/// Arms the watchdog once boot has reached its working milestone (called right
+/// after `confirm_boot`, so a hang *during* boot is never reset in a loop), if
+/// the `debug` file enabled it and the hang-loop guard did not veto it.
+pub fn arm_watchdog() {
+    let ticks = unsafe { CONFIG.watchdog_ticks };
+    if ticks == 0 {
+        return;
+    }
+    if unsafe { WATCHDOG_GUARD_DISARMED } {
+        return;
+    }
+    watchdog_pet();
+    unsafe { WATCHDOG_ARMED = true };
+    println!("debug: watchdog armed: reset after {}s without foreground progress.", ticks / 100);
+}
+
+pub fn watchdog_seconds() -> u32 {
+    unsafe { CONFIG.watchdog_ticks / 100 }
+}
+
+pub fn watchdog_armed() -> bool {
+    unsafe { WATCHDOG_ARMED }
+}
+
+/// Called from the timer interrupt on every tick with the interrupted code's
+/// frame. If the foreground has not petted the watchdog for longer than the
+/// limit, this is a hang: a spin with interrupts on, an interrupt storm that
+/// starves the foreground, a wait that can never end. It records a crash record
+/// carrying where the CPU was stuck (so the next boot can report it), then
+/// resets directly. It must not use `handle_crash`: that waits on timer ticks,
+/// which cannot advance inside the timer handler, and does disk I/O through the
+/// BIOS trampoline, which is unsafe if the foreground is mid-BIOS-call. A hang
+/// with interrupts disabled never reaches here at all -- the timer is dead.
+pub fn watchdog_check(
+    code_segment: u32,
+    instruction_pointer: u32,
+    eflags: u32,
+    stack_segment: u32,
+    stack_pointer: u32,
+) {
+    unsafe {
+        if !WATCHDOG_ARMED {
+            return;
+        }
+        let mut limit = u64::from(CONFIG.watchdog_ticks);
+        if WATCHDOG_TAPE_RUNNING {
+            limit = limit.max(WATCHDOG_TAPE_LIMIT_TICKS);
+        }
+        let idle = crate::interrupts::ticks().wrapping_sub(WATCHDOG_LAST_PET);
+        if idle <= limit {
+            return;
+        }
+        WATCHDOG_ARMED = false; // never re-enter
+        let info = crate::boot_info::BootInfo::from_address(crate::boot_info::BOOT_INFO_ADDRESS);
+        record_crash(
+            WATCHDOG_VECTOR,
+            None,
+            code_segment,
+            instruction_pointer,
+            eflags,
+            stack_segment,
+            stack_pointer,
+            None,
+            info.map_or(0, |info| info.booted_slot),
+        );
+        println!(
+            "\nWATCHDOG: no foreground progress for {}s; the CPU was at {code_segment:04x}:{instruction_pointer:08x}. Resetting.",
+            idle / 100
+        );
+    }
+    crate::arch::x86::reset();
 }
 
 /// Test-only: if the `debug` file's `crash-on-boot` option is set, crash

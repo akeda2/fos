@@ -833,7 +833,7 @@ unsafe fn install_exception_handlers() {
     }
 }
 
-extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_interrupt(frame: InterruptStackFrame) {
     unsafe {
         TIMER_TICKS += 1;
         TIMER_IRQ_COUNT += 1;
@@ -844,6 +844,13 @@ extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
         );
         crate::arch::x86::halt_forever();
     }
+    crate::debug::watchdog_check(
+        frame.code_segment,
+        frame.instruction_pointer,
+        frame.flags,
+        frame.stack_segment,
+        frame.stack_pointer,
+    );
     send_eoi(TIMER_VECTOR);
 }
 

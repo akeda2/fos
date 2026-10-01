@@ -790,6 +790,7 @@ pub fn device_write_sectors(
 }
 
 fn transfer(info: &BootInfo, device: Device, lba: u64, direction: u32) -> Result<(), Error> {
+    crate::debug::watchdog_pet(); // a long run of BIOS calls (format, copy) is progress
     if lba >= device_sector_count(info, device) {
         return Err(Error::OutOfRange);
     }
@@ -819,6 +820,7 @@ fn transfer_chunk(
     count: usize,
     direction: u32,
 ) -> Result<(), Error> {
+    crate::debug::watchdog_pet();
     if count == 0 || count > MAX_TRANSFER_SECTORS {
         return Err(Error::OutOfRange);
     }

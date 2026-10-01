@@ -205,6 +205,9 @@ pub fn pop_char() -> Option<u8> {
 /// other key goes through the same shift-aware decoder as `pop_char`, so
 /// typed text still reaches the remote end as ordinary ASCII.
 pub fn poll_term_event() -> Option<KeyEvent> {
+    // Every blocking loop in the kernel checks for the escape key through here,
+    // so this one call doubles as the software watchdog's "still alive" mark.
+    crate::debug::watchdog_pet();
     unsafe {
         if PENDING_KEY_LEN != 0 {
             let byte = PENDING_KEY_BYTES[PENDING_KEY_HEAD];

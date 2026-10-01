@@ -13,3 +13,9 @@ kernel-update
 
 # crash-on-boot is test-only (tools/test_debug_mode_e2e.py); never enable
 # it here, it would crash every real boot.
+
+# Reset the machine if the foreground makes no progress for 60 seconds (a hang,
+# an interrupt storm). Armed only after boot reaches a working shell; a reset
+# soon after boot keeps it off the next boot so a machine that always hangs is
+# not reset in a loop. Delete this line to run without it.
+watchdog 60

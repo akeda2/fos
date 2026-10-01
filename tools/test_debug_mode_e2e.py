@@ -480,6 +480,42 @@ def test_kup_good_update(tmp_dir: Path, debug_text: str) -> None:
         guest.terminate()
 
 
+def test_watchdog(tmp_dir: Path) -> None:
+    """The software watchdog (`watchdog N` in the debug file): an idle prompt is
+    not a hang, a real hang (`debug hang`) is reset with the stuck address
+    recorded, and a watchdog reset soon after boot keeps it off the next boot so
+    a machine that always hangs cannot be reset in a loop."""
+    image_path = tmp_dir / "watchdog.img"
+    build_image(image_path, "watchdog 3\n")
+    guest = SerialGuest(image_path)
+    try:
+        guest.read_until(b"fos> ", 15)
+        status = guest.run_command("debug status")
+        if b"watchdog=3s (armed)" not in status:
+            raise SystemExit(f"watchdog was not armed:\n{status.decode('utf-8', 'replace')}")
+        time.sleep(7)  # well past the 3 s limit, doing nothing at the prompt
+        uptime = guest.run_command("uptime")
+        if b"Uptime:" not in uptime or b"Kernel:" in guest.output[-400:]:
+            raise SystemExit("an idle prompt tripped the watchdog or the machine reset")
+        print("PASS: an idle prompt does not trip the watchdog.")
+
+        checkpoint = len(guest.output)
+        guest.process.stdin.write(b"debug hang\r\n")
+        guest.process.stdin.flush()
+        guest.read_until(b"WATCHDOG: no foreground progress", 15, checkpoint)
+        guest.read_until(b"Kernel: protected-mode Rust entry reached.", 20, checkpoint)
+        report = guest.read_until(b"stays off this boot", 15, checkpoint).decode("utf-8", "replace")
+        if "previous boot crashed (vector 240)" not in report or "software watchdog" not in report:
+            raise SystemExit(f"watchdog reset was not reported on the next boot:\n{report}")
+        guest.read_until(b"fos> ", 10, checkpoint)
+        status = guest.run_command("debug status")
+        if b"watchdog=3s (off)" not in status:
+            raise SystemExit(f"the hang-loop guard did not keep the watchdog off:\n{status.decode('utf-8', 'replace')}")
+        print("PASS: a hang is reset by the watchdog, reported next boot, and cannot loop.")
+    finally:
+        guest.terminate()
+
+
 def main() -> None:
     for required in (STAGE1, STAGE2, KERNEL):
         if not required.exists():
@@ -497,8 +533,9 @@ def main() -> None:
         test_kup_disabled_by_default(tmp_dir)
         test_kup_bad_checksum(tmp_dir, kup_debug_text)
         test_kup_good_update(tmp_dir, kup_debug_text)
+        test_watchdog(tmp_dir)
 
-        print("PASS: debug mode (crash-reboot, loop guard, and KUP) works end to end.")
+        print("PASS: debug mode (crash-reboot, loop guard, KUP, and watchdog) works end to end.")
 
 
 if __name__ == "__main__":
