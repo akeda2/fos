@@ -167,7 +167,11 @@ const DESCRIPTOR_BYTES: usize = 16;
 /// line-rate traffic, far less than the foreground's worst-case 10 ms sleep
 /// while a tape forwards frames between NICs.
 const RX_COUNT: usize = 64;
-const TX_COUNT: usize = 4;
+/// Transmit ring depth. `send` is asynchronous: it posts a frame and returns,
+/// waiting only when the descriptor it needs is still owned by the card. 32
+/// descriptors (512 bytes) still fit the frame the two rings share, and the
+/// buffers are one contiguous run (16 pages of 2 KiB buffers).
+const TX_COUNT: usize = 32;
 /// One DMA buffer per descriptor. 2 KiB comfortably holds a maximum frame plus
 /// its 4-byte FCS (1518), so every frame arrives in a single descriptor.
 const BUFFER_BYTES: usize = 2048;
@@ -517,6 +521,18 @@ impl Rtl8168 {
             return false;
         }
         let index = self.tx_next.get();
+        let ring = self.rings + TX_RING_OFFSET;
+        // The descriptor and its buffer are free again once the card has let go
+        // of the frame it carried the last time round the ring.
+        let mut attempts = 1_000_000u32;
+        while read_opts1(ring, index) & DESC_OWN != 0 {
+            attempts -= 1;
+            if attempts == 0 {
+                self.recovery_pending.store(true, Ordering::Release);
+                return false;
+            }
+            core::hint::spin_loop();
+        }
         self.tx_next.set((index + 1) % TX_COUNT);
         let buffer = self.tx_buffers + (index * BUFFER_BYTES) as u32;
         let destination =
@@ -526,7 +542,6 @@ impl Rtl8168 {
         destination[frame.len()..length].fill(0);
 
         let eor = if index == TX_COUNT - 1 { DESC_EOR } else { 0 };
-        let ring = self.rings + TX_RING_OFFSET;
         write_descriptor(
             ring,
             index,
@@ -534,19 +549,8 @@ impl Rtl8168 {
             buffer,
         );
         write8(self.io_base, REG_TPPOLL, TPPOLL_NPQ);
-
-        let mut attempts = 1_000_000u32;
-        loop {
-            if read_opts1(ring, index) & DESC_OWN == 0 {
-                self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
-                return true;
-            }
-            attempts -= 1;
-            if attempts == 0 {
-                self.recovery_pending.store(true, Ordering::Release);
-                return false;
-            }
-        }
+        self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
+        true
     }
 
     /// Returns one received frame (without its FCS) if any is waiting.

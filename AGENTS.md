@@ -2195,7 +2195,10 @@ legacy port accesses, which capped nettest at ~40k frames/s; the TSC path lifted
 it to gigabit line rate (Skylake, 1500 B frames). `send` on the e1000, e1000e
 and I350 is asynchronous: 64 TX descriptors with contiguous buffers, and it only
 waits when the descriptor it needs is still in flight (a stuck one still sets
-`recovery_pending`). `tapes/nettest/` also has a generator and a sink (`gen=N`,
+`recovery_pending`). The RTL8139 (4 slots), RTL8168 (32 descriptors) and 3C905
+(one frame in flight, collected at the next `send`) are asynchronous the same way; the RTL8139
+is tested in QEMU, the RTL8168 and 3C905 changes are real-hardware-only and not yet
+verified (the AMD machine currently has only 3C905s and was off). `tapes/nettest/` also has a generator and a sink (`gen=N`,
 `sink=N`; engine in `tapes/nettest/src/lib.rs`), tested with a four-NIC QEMU
 loop (`make test-tape-nettest-selftest`); `tools/test_nic_map_e2e.py` covers
 `nic map`.

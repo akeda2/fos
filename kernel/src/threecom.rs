@@ -176,6 +176,9 @@ pub struct ThreeCom {
     rx_buffer_base: u32,
     tx_buffer: u32,
     rx_next: Cell<usize>,
+    /// A frame was handed to the download engine and its completion has not been
+    /// collected yet (`send` is asynchronous: it checks at the next call).
+    tx_in_flight: Cell<bool>,
     overflow_count: Cell<u32>,
     rx_progress: Cell<u32>,
     tx_progress: Cell<u32>,
@@ -247,6 +250,7 @@ impl ThreeCom {
             rx_buffer_base,
             tx_buffer,
             rx_next: Cell::new(0),
+            tx_in_flight: Cell::new(false),
             overflow_count: Cell::new(0),
             rx_progress: Cell::new(0),
             tx_progress: Cell::new(0),
@@ -320,6 +324,7 @@ impl ThreeCom {
     }
 
     fn configure(&self) -> Result<(), InitError> {
+        self.tx_in_flight.set(false);
         self.select_window(0);
         let mut mac = [0u8; 6];
         for (index, byte) in mac.chunks_exact_mut(2).enumerate() {
@@ -538,9 +543,26 @@ impl ThreeCom {
         if frame.len() > MAX_FRAME_LEN {
             return false;
         }
-        // This driver owns one download descriptor. Do not overwrite it
-        // while the card still owns the previous packet; dropping here is
-        // preferable to making a polling bridge wait on a dead link.
+        // This driver owns one download descriptor. It cannot be rewritten
+        // while the card still owns the previous packet, so first collect that
+        // packet's completion -- which is normally long past, since the last
+        // `send` returned as soon as it had started the transfer.
+        let tx_descriptor = descriptor_ptr::<TxDescriptor>(self.descriptors, RX_DESC_COUNT);
+        if self.tx_in_flight.get() {
+            let mut attempts = 100_000u32;
+            while unsafe { read_volatile(&(*tx_descriptor).status) } & DOWNLOAD_COMPLETE == 0 {
+                attempts -= 1;
+                if attempts == 0 {
+                    issue_command(self.io_base, TX_RESET);
+                    issue_command(self.io_base, TX_ENABLE);
+                    self.tx_in_flight.set(false);
+                    self.recovery_pending.store(true, Ordering::Release);
+                    return false;
+                }
+            }
+            unsafe { write_volatile(&mut (*tx_descriptor).status, 0) };
+            self.tx_in_flight.set(false);
+        }
         if read32(self.io_base, DOWN_LIST_PTR) != 0 {
             return false;
         }
@@ -568,19 +590,7 @@ impl ThreeCom {
             self.descriptors + (RX_DESC_COUNT * 16) as u32,
         );
         issue_command(self.io_base, DOWN_UNSTALL);
-
-        let descriptor = descriptor_ptr::<TxDescriptor>(self.descriptors, RX_DESC_COUNT);
-        let mut attempts = 100_000u32;
-        while unsafe { read_volatile(&(*descriptor).status) } & DOWNLOAD_COMPLETE == 0 {
-            attempts -= 1;
-            if attempts == 0 {
-                issue_command(self.io_base, TX_RESET);
-                issue_command(self.io_base, TX_ENABLE);
-                self.recovery_pending.store(true, Ordering::Release);
-                return false;
-            }
-        }
-        unsafe { write_volatile(&mut (*descriptor).status, 0) };
+        self.tx_in_flight.set(true);
         self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
         true
     }

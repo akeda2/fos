@@ -180,6 +180,8 @@ pub struct Rtl8139 {
     rx_offset: Cell<u16>,
     tx_buffers: [u32; TX_DESCRIPTORS],
     tx_next: Cell<usize>,
+    /// Slots whose frame was started but whose completion has not been seen yet.
+    tx_pending: [Cell<bool>; TX_DESCRIPTORS],
     /// Count of Rx buffer/FIFO overflow recoveries performed so far (see
     /// `recover`). Exposed only for diagnostics (e.g. the
     /// shell's `tape load net` can report it if a transfer stalls); it
@@ -264,6 +266,7 @@ impl Rtl8139 {
             rx_offset: Cell::new(0),
             tx_buffers,
             tx_next: Cell::new(0),
+            tx_pending: [const { Cell::new(false) }; TX_DESCRIPTORS],
             overflow_count: Cell::new(0),
             recovery_count: Cell::new(0),
             rx_progress: Cell::new(0),
@@ -357,6 +360,12 @@ impl Rtl8139 {
             return false;
         }
         let descriptor = self.tx_next.get();
+        // Asynchronous: `send` returns as soon as the frame is started. A slot is
+        // only waited for when its previous frame has not finished by the time the
+        // ring comes round to it again (four frames later).
+        if self.tx_pending[descriptor].get() && !self.finish_transmit(descriptor) {
+            return false;
+        }
         self.tx_next.set((descriptor + 1) % TX_DESCRIPTORS);
         let buffer = self.tx_buffers[descriptor];
 
@@ -378,19 +387,29 @@ impl Rtl8139 {
             padded_len as u32,
         );
 
+        self.tx_pending[descriptor].set(true);
+        self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
+        true
+    }
+
+    /// Waits for slot `descriptor`'s previous frame to finish; false (and a
+    /// recovery request) if it was aborted, underran or never completed.
+    fn finish_transmit(&self, descriptor: usize) -> bool {
         let mut attempts = 1_000_000u32;
         loop {
             let status = read32(self.io_base, REG_TSD0 + descriptor as u16 * 4);
             if status & (TSD_TABT | TSD_TUN) != 0 {
+                self.tx_pending[descriptor].set(false);
                 self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }
             if status & TSD_TOK != 0 {
-                self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
+                self.tx_pending[descriptor].set(false);
                 return true;
             }
             attempts -= 1;
             if attempts == 0 {
+                self.tx_pending[descriptor].set(false);
                 self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }
@@ -477,6 +496,12 @@ impl Rtl8139 {
             self.enable_interrupts();
         }
         self.rx_offset.set(0);
+        // The reset also cancelled any frame in flight and restarted the card's
+        // round-robin at slot 0.
+        self.tx_next.set(0);
+        for pending in &self.tx_pending {
+            pending.set(false);
+        }
         write16(self.io_base, REG_CAPR, 0u16.wrapping_sub(16));
 
         if had_overflow {

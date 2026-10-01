@@ -116,10 +116,18 @@ use crate::pmem;
 /// bridges also implement HDA controllers) -- confirm via the `pci`
 /// shell command before assuming this driver claims a given real device,
 /// the same caution this project already documents for every other
-/// driver (see `es1370.rs`'s own doc comment).
+/// driver (see `es1370.rs`'s own doc comment). `DEVICE_CPT` (`0x1c20`) is
+/// one such confirmed real ID: the Intel 6-series/Cougar Point PCH's HDA
+/// controller, read via the `pci` command against the same physical ITX
+/// motherboard `e1000e.rs` targets (class `04/03`, a real, non-zero
+/// 64-bit MMIO BAR -- unlike the P4/ICH4 AC'97 investigation's hard-zero
+/// BARs, nothing here suggests the controller itself is unpopulated;
+/// whether a codec actually answers on its private bus is what this
+/// addition is meant to confirm).
 const VENDOR_INTEL: u16 = 0x8086;
 const DEVICE_ICH6: u16 = 0x2668;
 const DEVICE_ICH9: u16 = 0x293e;
+const DEVICE_CPT: u16 = 0x1c20;
 
 /// The controller's whole register block (including the stream
 /// descriptors a future playback step would use) fits in one fixed
@@ -368,6 +376,13 @@ const POLL_ATTEMPTS: u32 = 100_000;
 /// "round up to what this kernel can actually measure" tradeoff already
 /// used elsewhere (e.g. `debug.rs`'s reboot-delay wait).
 const CODEC_ENUMERATION_WAIT_TICKS: u64 = 2;
+
+/// How long to hold the controller in reset before deasserting it again,
+/// in 100 Hz PIT ticks -- the HDA spec's own minimum is 100us ("for codec
+/// PLL to settle"), far shorter than this kernel's coarsest timer
+/// granularity; one tick (~10ms) is a generous, bounded stand-in. See
+/// `reset_controller`'s own doc comment for why this exists.
+const RESET_SETTLE_TICKS: u64 = 1;
 
 /// The maximum number of AFG child widgets this driver records per
 /// codec. Comfortably above what QEMU's synthetic `hda-output`/
@@ -1170,7 +1185,11 @@ pub fn initialize_all() -> Result<usize, Status> {
     }
 
     let mut matches: [Option<pci::PciAddress>; MAX_INSTANCES] = [None; MAX_INSTANCES];
-    let found = pci::find_devices(VENDOR_INTEL, &[DEVICE_ICH6, DEVICE_ICH9], &mut matches);
+    let found = pci::find_devices(
+        VENDOR_INTEL,
+        &[DEVICE_ICH6, DEVICE_ICH9, DEVICE_CPT],
+        &mut matches,
+    );
     if found == 0 {
         return Err(Status::NotPresent);
     }
@@ -1196,14 +1215,28 @@ pub fn initialize_all() -> Result<usize, Status> {
     }
 }
 
-/// Brings up one controller at the given PCI address: enables memory
-/// space/bus mastering, maps its MMIO BAR, resets it, sets up its own
-/// CORB/RIRB rings, and enumerates its codecs. Split out of
-/// `initialize_all` the same way `es1370::init_card` is split out of its
-/// own `initialize_all`, so a failure on one controller (e.g. a
+/// Brings up one controller at the given PCI address: forces D0 power
+/// state, enables memory space/bus mastering, maps its MMIO BAR, resets
+/// it, sets up its own CORB/RIRB rings, and enumerates its codecs. Split
+/// out of `initialize_all` the same way `es1370::init_card` is split out
+/// of its own `initialize_all`, so a failure on one controller (e.g. a
 /// misbehaving second card) does not prevent an earlier one from being
 /// used.
+///
+/// The `force_power_state_d0` call is a real-hardware fix (see
+/// `pci::PciAddress::force_power_state_d0`'s own doc comment for the
+/// general rationale, first added for `e1000e.rs`): an onboard
+/// controller BIOS never actively uses -- exactly the case for HD Audio
+/// on a board with no onboard-audio-dependent boot path -- can be left
+/// in a low-power D-state that `reset_controller` alone cannot recover
+/// from.
 fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Status> {
+    let forced_d0 = address.force_power_state_d0();
+    crate::println!("hda: forced_d0={forced_d0}");
+    if forced_d0 {
+        let deadline = interrupts::ticks().wrapping_add(RESET_SETTLE_TICKS);
+        while interrupts::ticks() < deadline {}
+    }
     address.enable_memory_and_bus_master();
     let Some(mmio_base) = address.memory_bar(0) else {
         return Err(Status::InitFailed);
@@ -1211,6 +1244,12 @@ fn init_controller(address: pci::PciAddress, instance: usize) -> Result<Hda, Sta
     if paging::map_mmio(mmio_base, MMIO_BYTES).is_err() {
         return Err(Status::InitFailed);
     }
+    crate::println!(
+        "hda: mmio_base={:#x} gcap_pre={:#x} gctl_pre={:#x}",
+        mmio_base,
+        read_u16(mmio_base, REG_GCAP),
+        read_u32(mmio_base, REG_GCTL)
+    );
     let irq = address.interrupt_line();
     // Try MSI first; only fall back to the legacy `irq` line above if this
     // controller has no MSI capability at all, or every MSI vector is
@@ -1645,12 +1684,28 @@ pub fn get(index: usize) -> Option<&'static Hda> {
 /// back each way before proceeding -- real hardware needs the readback
 /// polling even though QEMU's own emulation applies it instantaneously
 /// (see `intel_hda_set_g_ctl`'s unconditional `device_cold_reset` call).
+///
+/// **Found and fixed against real hardware** (a 6-series/Cougar Point
+/// PCH's onboard HDA controller, `DEVICE_CPT`): entering and exiting
+/// reset back-to-back with no settle delay between them -- fine under
+/// QEMU's instantaneous emulation -- left real silicon failing to
+/// complete the transition, so the second poll below always timed out.
+/// Cross-checked against Linux's own `snd_hdac_bus_reset_link`
+/// (`sound/hda/core/controller.c`): the HDA spec (Rev 0.9, section
+/// 5.5.1) requires "delay for >= 100us for codec PLL to settle" between
+/// asserting and deasserting the controller reset. `RESET_SETTLE_TICKS`
+/// (one 100 Hz PIT tick, ~10ms) is far more generous than that minimum,
+/// the same margin-over-spec convention `CODEC_ENUMERATION_WAIT_TICKS`
+/// below already uses for the analogous post-reset codec-init wait.
 fn reset_controller(mmio_base: u32) -> Result<(), Status> {
     let gctl = read_u32(mmio_base, REG_GCTL);
     write_u32(mmio_base, REG_GCTL, gctl & !GCTL_CRST);
     if !poll_until(|| read_u32(mmio_base, REG_GCTL) & GCTL_CRST == 0) {
         return Err(Status::InitFailed);
     }
+
+    let settle_deadline = interrupts::ticks().wrapping_add(RESET_SETTLE_TICKS);
+    while interrupts::ticks() < settle_deadline {}
 
     write_u32(mmio_base, REG_GCTL, gctl | GCTL_CRST);
     if !poll_until(|| read_u32(mmio_base, REG_GCTL) & GCTL_CRST != 0) {
