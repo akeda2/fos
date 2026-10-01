@@ -1893,6 +1893,19 @@ find the target machine:
   silently overflow its receive ring on a large tape sent from a fast,
   unpaced sender.
 
+### Ending blocking commands from a term net session
+
+`tape load net`, `nic sniff` and `nic discover` used to end only on a local
+F12: they consumed the session's own frames, and a loop polling a *different*
+NIC than the session's could never see its disconnect at all (the real machine
+had to be walked to twice). `remote_stop_frame` now treats the client's
+disconnect (`TERM_TAG_BYE`, which also sets `PENDING_REMOTE_BYE` so the session
+ends afterwards) or its escape byte (`REMOTE_ABORT_BYTE`, the remote F12) in a
+frame the loop receives as "stop"; `remote_stop_via_session_nic` polls the
+session NIC when it is not the one the loop polls. After an escape the session
+keeps working. `make test-release-loops` covers each loop on both the session
+NIC and a different one.
+
 ### Register access from the shell (`pci read|write`, `io`, `mmio`, `nic regs`)
 
 Real-hardware-only bugs are found by reading registers, and each diagnostic

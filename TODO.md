@@ -25,3 +25,4 @@
 ### Tape features
 [] Network testing tape. Simulated frame/packet loss, low bandwidth etc. Start with bridge mode. "@nettest.cfg or interactive command prompt: nettest>". Start with frame_loss=NN% randomized.
 [] ed tape - edit should edit the existing line, so we don't have to re-write the whole line again.
+[] Rare `make test` flake (roughly 2-5% per run, present on 8b2c8f3 too): in `tools/qemu_smoke.py` the PS/2 step after `tape load disk router.bin` sends `sendkey a` then `sendkey ret`; the `a` is echoed but the Enter never reaches the shell ("did not observe b'Unknown command.'"), in the plain, `--second-disk` and `--nic e1000` variants. Ruled out: the kernel's scancode queue (0 dropped), pending PIC requests, the post-BIOS keyboard drain (the only discarded bytes were early-boot ones), and a harness monitor race (waiting for QEMU's ack changed nothing). Cause unknown. A passing rerun is not evidence of a regression.

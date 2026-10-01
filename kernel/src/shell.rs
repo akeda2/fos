@@ -3096,6 +3096,43 @@ static mut TERM_DEFERRED_INPUT_TAIL: usize = 0;
 static mut TERM_DEFERRED_INPUT_COUNT: usize = 0;
 static mut TERM_DEFERRED_INPUT_OVERFLOWED: bool = false;
 
+/// For a blocking command that received `frame` itself: does it tell this
+/// command to stop? That is the active `term net` peer's disconnect
+/// (`TERM_TAG_BYE`, which also sets `PENDING_REMOTE_BYE` so the session ends
+/// once the command returns) or its escape byte inside a data frame -- the
+/// remote equivalent of pressing F12 locally. Without this a command like
+/// `nic sniff` or `tape load net` started from a remote session consumed the
+/// session's own frames and could only be ended at the machine's keyboard.
+fn remote_stop_frame(frame: &[u8]) -> bool {
+    if !console::relay_enabled()
+        || frame.len() < 15
+        || frame[12..14] != CHAT_ETHERTYPE
+        || frame[6..12] != unsafe { ACTIVE_TERM_PEER }.unwrap_or([0; 6])
+    {
+        return false;
+    }
+    match frame[14] {
+        TERM_TAG_BYE => {
+            unsafe { PENDING_REMOTE_BYE = true };
+            true
+        }
+        TERM_TAG_DATA => frame[15..].contains(&REMOTE_ABORT_BYTE),
+        _ => false,
+    }
+}
+
+/// For a blocking command that polls only the NIC with index `polled`: if the
+/// `term net` session that started it lives on a *different* NIC, nothing the
+/// command receives could ever be that session's disconnect or escape, so poll
+/// the session NIC here (`poll_remote_tape_abort`, which also relays output
+/// live). True means the command should stop.
+fn remote_stop_via_session_nic(polled: usize) -> bool {
+    match unsafe { ACTIVE_TERM_INDEX } {
+        Some(session) if console::relay_enabled() && session != polled => poll_remote_tape_abort(),
+        _ => false,
+    }
+}
+
 /// Saves one active-peer terminal frame for the suspended `LineEditor`.
 /// Oversized frames or a full queue drop the whole newest frame (never a
 /// partial command) and arrange one explicit diagnostic once the editor
@@ -3879,9 +3916,15 @@ fn nic_sniff() {
         // loop did neither, so a remote session saw nothing until the
         // capture stopped, and a mid-capture fault went unrecovered.
         poll_background_work(Some(nic));
+        if remote_stop_via_session_nic(nic::active_index()) {
+            break;
+        }
         if let Some(length) = nic.receive(&mut buffer) {
             captured += 1;
             let frame = &buffer[..length];
+            if remote_stop_frame(frame) {
+                break;
+            }
             if length >= 14 {
                 println!(
                     "#{captured} {length} bytes: dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype 0x{:02x}{:02x}",
@@ -4546,7 +4589,7 @@ fn nic_discover() {
 
     let mut buffer = [0u8; nic::MAX_FRAME_LEN];
     let mut discovered = 0u32;
-    loop {
+    'discover: loop {
         if matches!(
             keyboard::poll_term_event(),
             Some(keyboard::KeyEvent::Escape)
@@ -4585,6 +4628,9 @@ fn nic_discover() {
             };
             received_any = true;
             let frame = &buffer[..length];
+            if remote_stop_frame(frame) {
+                break 'discover;
+            }
             if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
                 continue;
             }
@@ -6614,6 +6660,14 @@ fn tape_load_net() {
             println!("\nGave up waiting; no tape loaded.");
             return;
         }
+        if remote_stop_via_session_nic(nic::active_index()) {
+            if unsafe { PENDING_REMOTE_BYE } {
+                println!("\nRemote terminal disconnected; no tape loaded.");
+            } else {
+                println!("\nGave up waiting (remote escape); no tape loaded.");
+            }
+            return;
+        }
         if transfer.is_some() && interrupts::ticks() >= next_status {
             let active = transfer.as_ref().unwrap();
             println!(
@@ -6634,6 +6688,14 @@ fn tape_load_net() {
             continue;
         };
         let frame = &buffer[..received];
+        if remote_stop_frame(frame) {
+            if unsafe { PENDING_REMOTE_BYE } {
+                println!("\nRemote terminal disconnected; no tape loaded.");
+            } else {
+                println!("\nGave up waiting (remote escape); no tape loaded.");
+            }
+            return;
+        }
         // While this nested loop owns NIC polling, do not let a command
         // from the suspended remote terminal editor vanish into the tape
         // protocol's catch-all arm. A remote hangup still ends the session
