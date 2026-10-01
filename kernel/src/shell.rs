@@ -3592,7 +3592,37 @@ fn nic_watchdog() {
     }
 }
 
+/// Recoveries seen since the last message printed, and when that was. A card
+/// that keeps faulting under load (a flooded receive path, a bad cable) used
+/// to print two lines for every recovery and bury the terminal -- and, over
+/// `term net`, delay the very traffic being recovered. The first one is
+/// reported at once, later ones are counted and summarized at most every
+/// `NIC_WATCHDOG_REPORT_TICKS` (5 s).
+static mut NIC_WATCHDOG_SUPPRESSED: u32 = 0;
+static mut NIC_WATCHDOG_LAST_REPORT: u64 = 0;
+const NIC_WATCHDOG_REPORT_TICKS: u64 = 500;
+
 fn report_nic_watchdog(result: nic::WatchdogResult) {
+    if matches!(result, nic::WatchdogResult::Healthy) {
+        return;
+    }
+    let now = interrupts::ticks();
+    let (quiet, suppressed) = unsafe {
+        let quiet = NIC_WATCHDOG_LAST_REPORT != 0
+            && now.wrapping_sub(NIC_WATCHDOG_LAST_REPORT) < NIC_WATCHDOG_REPORT_TICKS;
+        if quiet {
+            NIC_WATCHDOG_SUPPRESSED += 1;
+            (true, 0)
+        } else {
+            NIC_WATCHDOG_LAST_REPORT = now;
+            let suppressed = NIC_WATCHDOG_SUPPRESSED;
+            NIC_WATCHDOG_SUPPRESSED = 0;
+            (false, suppressed)
+        }
+    };
+    if quiet {
+        return;
+    }
     match result {
         nic::WatchdogResult::Healthy => {}
         nic::WatchdogResult::Recovered => {
@@ -3603,6 +3633,9 @@ fn report_nic_watchdog(result: nic::WatchdogResult) {
             println!("NIC watchdog: bounded adapter reset/rebuild failed; polling");
             println!("remains available, but this card may need a reset.");
         }
+    }
+    if suppressed > 0 {
+        println!("({suppressed} more since the last message.)");
     }
 }
 

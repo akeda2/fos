@@ -143,6 +143,15 @@ const SWSM_SWESMBI: u32 = 1 << 1;
 const SWFW_PHY0_SM: u32 = 1 << 0;
 
 const RING_COUNT: usize = 8;
+/// Receive ring depth. 8 descriptors were enough for the polled shell but not
+/// for a tape forwarding a gigabit stream (`nettest`, `bridge`, `router`): the
+/// foreground loop sleeps up to 10 ms between passes, ~800 full-size frames
+/// at line rate, and every frame past the ring's depth was dropped with an
+/// RX-overrun (RXO) interrupt. 128 descriptors (16 B each) still fit the one
+/// page the descriptor ring uses, and the buffers are one contiguous run of
+/// pages (`rx_buffer_base + index * 4096`), so no per-buffer array grows the
+/// kernel's tight `.bss`.
+const RX_COUNT: usize = 128;
 const RX_BUFFER_SIZE: usize = 2048;
 const TX_BUFFER_SIZE: usize = 2048;
 const MMIO_BYTES: u32 = 0x40000;
@@ -344,7 +353,7 @@ pub struct I350 {
     mac: Cell<[u8; 6]>,
     rx_descriptors: u32,
     tx_descriptors: u32,
-    rx_buffers: [u32; RING_COUNT],
+    rx_buffer_base: u32,
     tx_buffers: [u32; RING_COUNT],
     rx_next: Cell<usize>,
     tx_next: Cell<usize>,
@@ -403,10 +412,7 @@ impl I350 {
 
         let rx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let tx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        let mut rx_buffers = [0u32; RING_COUNT];
-        for buffer in &mut rx_buffers {
-            *buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        }
+        let rx_buffer_base = pmem::allocate_contiguous(RX_COUNT).ok_or(InitError::OutOfMemory)?;
         let mut tx_buffers = [0u32; RING_COUNT];
         for buffer in &mut tx_buffers {
             *buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
@@ -417,7 +423,7 @@ impl I350 {
             mac: Cell::new([0; 6]),
             rx_descriptors,
             tx_descriptors,
-            rx_buffers,
+            rx_buffer_base,
             tx_buffers,
             rx_next: Cell::new(0),
             tx_next: Cell::new(0),
@@ -476,13 +482,13 @@ impl I350 {
         write_register(self.mmio_base, REG_IMC, u32::MAX);
         let _ = read_register(self.mmio_base, REG_ICR);
 
-        for index in 0..RING_COUNT {
+        for index in 0..RX_COUNT {
             let descriptor = descriptor_pointer::<RxDescriptor>(self.rx_descriptors, index);
             unsafe {
                 write_volatile(
                     descriptor,
                     RxDescriptor {
-                        buffer_address: u64::from(self.rx_buffers[index]),
+                        buffer_address: u64::from(self.rx_buffer(index)),
                         length: 0,
                         checksum: 0,
                         status: 0,
@@ -515,7 +521,7 @@ impl I350 {
         write_register(
             self.mmio_base,
             REG_RDLEN0,
-            (RING_COUNT * core::mem::size_of::<RxDescriptor>()) as u32,
+            (RX_COUNT * core::mem::size_of::<RxDescriptor>()) as u32,
         );
         // SRRCTL's low bits give the receive buffer size in 1 KiB units for
         // legacy (non-"advanced") descriptors; RX_BUFFER_SIZE is 2048.
@@ -570,9 +576,14 @@ impl I350 {
             }
             core::hint::spin_loop();
         }
-        write_register(self.mmio_base, REG_RDT0, (RING_COUNT - 1) as u32);
+        write_register(self.mmio_base, REG_RDT0, (RX_COUNT - 1) as u32);
 
         Ok(())
+    }
+
+    /// Physical address of receive buffer `index` (one 4 KiB page each).
+    fn rx_buffer(&self, index: usize) -> u32 {
+        self.rx_buffer_base + (index * 4096) as u32
     }
 
     pub fn mac_address(&self) -> [u8; 6] {
@@ -677,9 +688,7 @@ impl I350 {
         if cause & (ICR_RXO | ICR_RXSEQ) != 0 {
             self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
         }
-        if cause & ICR_RXO != 0 {
-            self.recovery_pending.store(true, Ordering::Release);
-        }
+        // See e1000e.rs: an RX overrun is counted, not answered with a reset.
         self.work_pending.store(true, Ordering::Release);
     }
 
@@ -764,7 +773,7 @@ impl I350 {
         if valid {
             unsafe {
                 let source =
-                    core::slice::from_raw_parts(self.rx_buffers[index] as *const u8, copy_len);
+                    core::slice::from_raw_parts(self.rx_buffer(index) as *const u8, copy_len);
                 out[..copy_len].copy_from_slice(source);
             }
         }
@@ -773,7 +782,7 @@ impl I350 {
             write_volatile(&mut (*descriptor).errors, 0);
         }
         write_register(self.mmio_base, REG_RDT0, index as u32);
-        self.rx_next.set((index + 1) % RING_COUNT);
+        self.rx_next.set((index + 1) % RX_COUNT);
 
         if !valid {
             self.overflow_count.set(self.overflow_count.get() + 1);

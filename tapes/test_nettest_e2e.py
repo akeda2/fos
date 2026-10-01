@@ -120,12 +120,12 @@ def term_frame(tag, payload=b""):
 
 
 class Guest:
-    def __init__(self, memory):
+    def __init__(self, memory, model="e1000"):
         command = ["qemu-system-i386", "-m", str(memory), "-drive", f"format=raw,file={IMAGE}", "-snapshot",
                    "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown", "-display", "none"]
         for number, (port, mac) in enumerate(((SEGMENT_A_PORT, NIC_A), (SEGMENT_B_PORT, NIC_B))):
             command += ["-netdev", f"socket,id=n{number},connect=127.0.0.1:{port}",
-                        "-device", f"e1000,netdev=n{number},mac={':'.join(f'{b:02x}' for b in mac)}"]
+                        "-device", f"{model},netdev=n{number},mac={':'.join(f'{b:02x}' for b in mac)}"]
         self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
@@ -196,9 +196,9 @@ def burst(sender, count, destination, source, size=60, gap=0.002, first=0):
 def main():
     if not (ROOT / "build" / "tapes" / "nettest.bin").exists():
         raise SystemExit("build/tapes/nettest.bin missing; run `make tape-nettest` and `make image`.")
-    def launch(memory):
+    def launch(memory, model="e1000"):
         a, b = Segment(SEGMENT_A_PORT), Segment(SEGMENT_B_PORT)
-        guest = Guest(memory)
+        guest = Guest(memory, model)
         a.accept()
         b.accept()
         return guest, a, b
@@ -360,6 +360,28 @@ def main():
         check(len(seg_b.drain(0.5)) == 5, "reset restores a clean link", guest)
         quit_text = command(guest, seg_a, "quit", b"fos> ")
         check("nettest stopped." in quit_text and "Tape returned" in quit_text, "quit returns to the shell", guest)
+    finally:
+        guest.stop()
+        seg_a.close()
+        seg_b.close()
+
+    # A full-speed burst into the e1000e (the same driver family as the Skylake
+    # test machine's) must not overrun its receive ring: it used to drop all but
+    # a handful of 1000 back-to-back frames and print a "NIC watchdog" line for
+    # every adapter reset the overrun caused.
+    guest, seg_a, seg_b = launch(256, "e1000e")
+    try:
+        start_tape(guest, seg_a, "1 2")
+        seg_a.drain(3), seg_b.drain(0.1)
+        for sequence in range(1000):
+            seg_a.send(test_frame(HOST_B, HOST_A, sequence, 1000))
+        delivered = len(seg_b.drain(3))
+        guest.pump(0.5)
+        resets = guest.text().count("NIC watchdog")
+        # QEMU's e1000e model loses the very first frame after promiscuous mode
+        # is enabled (also without this change), hence "at least 995".
+        check(delivered >= 995, f"1000 back-to-back frames through an e1000e: {delivered} delivered", guest)
+        check(resets == 0, "no NIC watchdog recoveries under full-speed load", guest)
     finally:
         guest.stop()
         seg_a.close()

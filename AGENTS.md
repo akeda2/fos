@@ -74,6 +74,12 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   never an ISR or timer task. It only resets a backend after that driver
   latched a documented DMA/Tx fault, reuses its DMA allocations, restores
   interrupt/promiscuous state, and exposes progress/recovery counters.
+  The e1000e and I350 receive rings are 128 descriptors deep (`RX_COUNT`, one
+  contiguous run of buffer pages), and an RX-overrun interrupt is only counted,
+  not answered with a reset: with 8 descriptors a tape forwarding a gigabit
+  stream (`nettest`, `bridge`, `router`) overran constantly and each overrun
+  triggered a full adapter reset. `shell::report_nic_watchdog` prints the first
+  recovery at once and then at most one summary per 5 s.
 - `kernel/src/pmem.rs` is a small bitmap-based physical-frame allocator (4 KiB
   frames) built from the E820 map; it reserves everything below the kernel's
   own low-memory region.
