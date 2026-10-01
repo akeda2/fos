@@ -184,6 +184,7 @@ the real-mode code that printed it has no notion of that ring at all.
 | `rm [diskN] NAME` | Removes a FOSFS file entry from the boot disk (`disk1`, default) or an attached secondary disk. |
 | `copy SRC_DISK NAME DST_DISK [NEW_NAME]` | Copies one FOSFS file's raw bytes from `SRC_DISK` to `DST_DISK` (both must be spelled out explicitly, e.g. `disk1`/`disk2` — unlike every other disk command, neither side defaults), optionally renaming it to `NEW_NAME`. Either side may instead be a discovered NETFS peer: `copy HOST[:diskN]/NAME DST_DISK` (remote source) or `copy SRC_DISK NAME HOST[:diskN]` (remote destination) — see "NETFS: copying files to/from a discovered peer" below. Uses the same shared tape staging buffer as `tape load disk`/`tape load net`, so any previously loaded tape is invalidated by a copy; the shell reports this when it happens. |
 | `start` file | Optional boot-time command script, read from `disk1` or, if absent there, `disk2`. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
+| `NAME [ARGS]` | Not a builtin: runs `NAME.sh` as a script, or loads and runs `NAME.bin` as a tape with `ARGS` as its startup arguments (see "Running scripts and tapes by name"). |
 | `start` | Reruns the boot-time `start` script on demand (same disk1-then-disk2 lookup), e.g. after F12-ing out of a tape it launched, without needing a reset. Reports plainly if no `start` file is found on either disk. |
 | `serial` | Lists COM1..COM4 as detected by the BIOS at boot (base I/O port, or "not detected"), plus any serial controllers found on PCI/PCIe add-on cards (as `PCI0`, `PCI1`, ...), noting which is the local console. |
 | `term [COM1\|COM2\|COM3\|COM4\|PCI0\|PCI1\|...] [BAUD]` | Enters raw terminal mode: forwards PS/2 keystrokes byte-for-byte to a remote machine over the chosen port (default COM1), and displays incoming bytes locally (VGA only, not re-echoed to serial). Press F12 (or F4/F6/F7/F8/F10) to return to the shell. COM1's rate is fixed at 115200 (shared with the local console); COM2/3/4 and PCI ports accept an optional custom `BAUD` that must evenly divide 115200. |
@@ -500,6 +501,17 @@ echo 52:54:00:12:34:56 > tools/mac   # the target fos machine's MAC; see its 'ni
 sudo python3 tools/send_frame.py "hello fos"
 ```
 
+### The `settings` file
+
+An optional lowercase FOSFS file named `settings` (at most 512 bytes) is read
+at boot from `disk1`, then each secondary disk; the first one found is used.
+One option per line, `#` comments and blank lines ignored. An unknown option
+or bad value is reported and skipped.
+
+| Option | Effect |
+| --- | --- |
+| `deny-term-net N[,N...]` | `term net` ignores a remote terminal `HELLO`, KUP (the network kernel-update service) ignores update frames, and NETFS serves and accepts no files, for traffic arriving on these one-based NIC numbers (the numbers `nic list` shows). Commas and spaces both separate numbers, and repeated lines add up. Meant for a router whose outbound NIC should offer no shell, kernel push or file access. Discovery replies are not affected, and this machine's own outgoing NETFS requests (`copy HOST/...`) are not either. A denied frame is dropped silently. If every NIC is denied, `term net` returns at once instead of waiting. |
+
 ### Boot-time `start` script
 
 An optional lowercase FOSFS file named `start` turns a prepared image into a
@@ -524,6 +536,28 @@ long-running `router`), to bring the machine back to the same state as a
 fresh boot without an actual reset. Unlike the silent boot-time run, `start`
 explicitly reports `"start: no start file found on disk1 or disk2."` if
 neither disk has one.
+
+### Running scripts and tapes by name
+
+A command word that is not a builtin is looked up as a file: `NAME.sh` is run
+as a script (same line rules as `start`), otherwise `NAME.bin` is loaded as a
+tape and run immediately, with everything after the name passed as its startup
+arguments -- `calc 3 4 +` is `tape load disk calc.bin` followed by
+`tape run 3 4 +`. The search covers `disk1`, then each secondary disk in order,
+and the first disk holding either file wins. If one disk has both `NAME.sh` and
+`NAME.bin`, the script runs and a note says so. Builtins always take priority,
+so a file can never shadow `reset` or `halt`. Names are up to 12 lowercase
+letters, digits, `_` or `-`. Scripts may call other scripts, to a depth of 3
+(the `start` file counts as the first level).
+
+Inside a script, `$1`..`$9` expand to the words typed after the script name,
+`$*` to all of them, and `$$` to a literal `$`; a missing argument expands to
+nothing. It is plain text substitution done line by line before the line is
+dispatched, with no quoting, so an argument with spaces becomes several words.
+A line that grows past 256 bytes once expanded is skipped with a message. A
+script called from another script gets the words its calling line expanded to.
+The `start` file has no arguments, so its `$N` are empty. Example `tapecalc.sh`:
+`calc $1 $2 +`, run as `tapecalc 3 4`.
 
 For a router image, load `ed.bin` as usual, run `tape run ed start`, and save:
 

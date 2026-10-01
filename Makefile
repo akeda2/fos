@@ -70,7 +70,7 @@ EXTRA_FOSFS_FILES ?=
 # directory before invoking cargo.
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -101,6 +101,7 @@ help:
 	@echo "  make test-page-protection - verify kernel text rejects a supervisor write under CR0.WP"
 	@echo "  make test-nic-watchdog - inject a test-only NIC fault latch and verify foreground DMA-state recovery"
 	@echo "  make test-start - verify an optional FOSFS start boot-command script"
+	@echo "  make test-scripts-settings - verify bare-name script/tape dispatch and the settings file"
 	@echo "  make test-second-disk - verify the diskN selector on a second, non-boot disk"
 	@echo "  make test-debug-mode - verify reboot-on-crash, the crash-loop guard, and the KUP network kernel update"
 	@echo "  make test-e1000 - build the image, then run the QEMU Intel e1000 smoke test"
@@ -207,6 +208,9 @@ test-nic-watchdog:
 test-start:
 	$(MAKE) EXTRA_FOSFS_FILES="--file start tools/start-test.txt" image
 	@python3 tools/qemu_smoke.py --image $(IMAGE) --start-script-test; status=$$?; $(MAKE) image; exit $$status
+
+test-scripts-settings: image
+	python3 tools/test_scripts_settings_e2e.py
 
 test-second-disk: image
 	python3 tools/qemu_smoke.py --image $(IMAGE) --second-disk

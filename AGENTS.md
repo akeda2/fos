@@ -110,6 +110,11 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   4096 bytes; non-empty lines not beginning with `#` use the ordinary command
   dispatcher. Keep a long-running router `tape run` last, because later
   script lines cannot run until it returns.
+  A non-builtin command word `NAME` runs `NAME.sh` or loads/runs `NAME.bin`
+  (`run_external_command`; disk1 then diskN, builtins win, script nesting
+  capped by `MAX_SCRIPT_DEPTH`). An optional `settings` file (`load_settings`)
+  currently holds `deny-term-net`, which closes `term net`, KUP
+  (`dispatch_kup_frame`) and NETFS serving per NIC; scripts expand `$1`..`$9`/`$*`; see README.md.
 - `boot/netrom.S` is an optional, parallel boot path: a PCI expansion ROM that
   boots fos from a NIC's own boot ROM instead of disk/USB (`make netrom`,
   producing `build/netboot.rom`; never part of `make image`/`run`/`test`).

@@ -48,6 +48,14 @@ const INTERFACE_HOSTNAME_CAPACITY: usize = HOSTNAME_CAPACITY + 2;
 static mut HOSTNAME: [u8; HOSTNAME_CAPACITY] = [0; HOSTNAME_CAPACITY];
 static mut HOSTNAME_LEN: usize = 0;
 
+const SETTINGS_FILE_NAME: &[u8] = b"settings";
+const SETTINGS_FILE_CAPACITY: usize = 512;
+/// Bit N set means `term net` ignores a `HELLO` arriving on NIC index N
+/// (zero-based internally; the `settings` file uses the one-based numbers `nic
+/// list` prints). Loaded once at boot by `load_settings`; zero (the default)
+/// leaves every interface answering, exactly as before the file existed.
+static mut TERM_NET_DENY_MASK: u32 = 0;
+
 pub fn run(info: &BootInfo) -> ! {
     let keyboard_available = Keyboard::initialize().is_some();
     interrupts::initialize();
@@ -55,6 +63,7 @@ pub fn run(info: &BootInfo) -> ! {
     disk::initialize(info);
     disk::discover_secondary_disks(info);
     load_hostname(info);
+    load_settings(info);
     crate::debug::load_config(info);
     crate::debug::maybe_crash_on_boot();
     crate::debug::confirm_boot(info);
@@ -210,6 +219,93 @@ fn load_hostname(info: &BootInfo) {
     }
 }
 
+/// Looks for an optional `settings` file on the boot disk and then every
+/// secondary disk in order (the first one found wins), like `load_hostname`.
+/// Format: one option per line, `#` comments and blank lines ignored. The only
+/// option so far is `deny-term-net N[,N...]`: one-based NIC numbers on which
+/// `term net` must not accept a remote terminal and KUP must not accept a
+/// kernel update -- for a router that should not offer a shell or a kernel
+/// push on its outbound port, and NETFS must not serve or accept files there.
+/// Discovery replies are a separate service and are not affected. Unreadable or blank disks are silently
+/// skipped, as for `hostname`.
+fn load_settings(info: &BootInfo) {
+    let devices = core::iter::once(disk::Device::Boot)
+        .chain((0..disk::secondary_count()).map(disk::Device::Secondary));
+    for device in devices {
+        let length = match fosfs::file_length(info, device, SETTINGS_FILE_NAME) {
+            Ok(Some(length)) => length,
+            _ => continue,
+        };
+        if length > SETTINGS_FILE_CAPACITY as u64 {
+            println!(
+                "settings: ignoring a {length}-byte file (limit is {SETTINGS_FILE_CAPACITY} bytes)."
+            );
+            continue;
+        }
+        let mut contents = [0u8; SETTINGS_FILE_CAPACITY];
+        let Ok(Some(read_length)) = fosfs::read(
+            info,
+            device,
+            SETTINGS_FILE_NAME,
+            &mut contents[..length as usize],
+        ) else {
+            continue;
+        };
+        let mask = parse_settings(&contents[..read_length as usize]);
+        unsafe { TERM_NET_DENY_MASK = mask };
+        if mask != 0 {
+            print!("settings: term net, KUP and NETFS denied on NIC");
+            for bit in 0..32 {
+                if mask & (1 << bit) != 0 {
+                    print!(" {}", bit + 1);
+                }
+            }
+            println!(".");
+        }
+        return;
+    }
+}
+
+/// Parses a `settings` file's text and returns the `term net` deny mask.
+/// Unknown options and bad NIC numbers are reported and skipped rather than
+/// rejecting the whole file, so one typo cannot silently drop the rest.
+fn parse_settings(contents: &[u8]) -> u32 {
+    let mut deny_mask = 0u32;
+    for line in contents.split(|&byte| byte == b'\n') {
+        let line = trim_trailing_whitespace(trim_start(line));
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        let (option, values) = take_word(line);
+        if option != b"deny-term-net" {
+            println!(
+                "settings: unknown option '{}'.",
+                core::str::from_utf8(option).unwrap_or("?")
+            );
+            continue;
+        }
+        // Commas and spaces both separate numbers: `1,2` and `1, 2` work.
+        for value in values.split(|&byte| byte == b',' || byte == b' ') {
+            if value.is_empty() {
+                continue;
+            }
+            match parse_number(value) {
+                Some(number @ 1..=32) => deny_mask |= 1 << (number - 1),
+                _ => println!(
+                    "settings: bad NIC number '{}' (use 1-32).",
+                    core::str::from_utf8(value).unwrap_or("?")
+                ),
+            }
+        }
+    }
+    deny_mask
+}
+
+/// True when the `settings` file denies `term net` on this zero-based NIC.
+fn term_net_denied(index: usize) -> bool {
+    index < 32 && unsafe { TERM_NET_DENY_MASK } & (1 << index) != 0
+}
+
 /// Formats the configured hostname (see `load_hostname`) with a 1-based
 /// interface number appended (e.g. `myhost1`, `myhost2`), matching `nic
 /// list`'s own 1-based numbering -- this is what lets several NICs on one
@@ -262,25 +358,54 @@ fn start_command(info: &BootInfo) {
     }
 }
 
-/// Reads and runs one already-located `start` script from `device`.
+/// Reads and runs the already-located `start` script from `device`.
 fn execute_start_file(info: &BootInfo, device: disk::Device, length: u64) {
+    run_script(info, device, START_FILE_NAME, "start", length, b"");
+}
+
+/// How many scripts may be running inside one another (the `start` file
+/// counts as the first). Each level keeps a `START_FILE_CAPACITY`-byte copy of
+/// its script on the kernel stack, and tapes later run nested inside the same
+/// call chain, so this is deliberately small -- it also stops a script that
+/// names itself from recursing until the stack guard page is hit.
+const MAX_SCRIPT_DEPTH: usize = 3;
+static mut SCRIPT_DEPTH: usize = 0;
+
+/// Reads and runs one FOSFS script file (`start`, or a `NAME.sh` found by
+/// `run_external_command`). Every non-empty, non-`#` line goes through the
+/// ordinary `execute` dispatcher, so a script line may itself name another
+/// script or tape. `label` prefixes every message so output says which
+/// script is talking.
+fn run_script(
+    info: &BootInfo,
+    device: disk::Device,
+    file_name: &[u8],
+    label: &str,
+    length: u64,
+    arguments: &[u8],
+) {
     if length > START_FILE_CAPACITY as u64 {
         println!(
-            "start: {length}-byte file is too large; the boot script limit is {START_FILE_CAPACITY} bytes."
+            "{label}: {length}-byte file is too large; the script limit is {START_FILE_CAPACITY} bytes."
         );
+        return;
+    }
+    if unsafe { SCRIPT_DEPTH } >= MAX_SCRIPT_DEPTH {
+        println!("{label}: scripts are nested too deeply (limit {MAX_SCRIPT_DEPTH}).");
         return;
     }
 
     let mut contents = [0u8; START_FILE_CAPACITY];
-    let length = match fosfs::read(info, device, START_FILE_NAME, &mut contents[..length as usize]) {
+    let length = match fosfs::read(info, device, file_name, &mut contents[..length as usize]) {
         Ok(Some(length)) => length as usize,
         Ok(None) => return,
         Err(error) => {
-            println!("start: could not read the file: {error:?}");
+            println!("{label}: could not read the file: {error:?}");
             return;
         }
     };
-    println!("start: running {length}-byte boot script.");
+    println!("{label}: running {length}-byte script.");
+    unsafe { SCRIPT_DEPTH += 1 };
 
     let mut line_start = 0;
     let mut line_number = 1;
@@ -294,14 +419,146 @@ fn execute_start_file(info: &BootInfo, device: disk::Device, length: u64) {
         }
         let line = trim_start(line);
         if !line.is_empty() && line[0] != b'#' {
-            print!("start line {line_number}: ");
-            console::write_bytes(line);
-            println!();
-            execute(line, info);
+            let mut expanded = [0u8; LINE_CAPACITY];
+            match expand_script_arguments(line, arguments, &mut expanded) {
+                Some(length) => {
+                    print!("{label} line {line_number}: ");
+                    console::write_bytes(&expanded[..length]);
+                    println!();
+                    execute(&expanded[..length], info);
+                }
+                None => println!(
+                    "{label} line {line_number}: too long after expanding arguments; skipped."
+                ),
+            }
         }
         line_start = index + 1;
         line_number += 1;
     }
+    unsafe { SCRIPT_DEPTH -= 1 };
+}
+
+/// Expands `$1`..`$9` (the script's words, split on spaces), `$*` (the whole
+/// argument text) and `$$` (a literal `$`) in one script line into `out`,
+/// returning the expanded length, or `None` if it would not fit. A missing
+/// argument expands to nothing, and any other `$` is kept as typed. Expansion
+/// is plain text substitution with no quoting, so an argument containing
+/// spaces becomes several words -- the same trade the tape startup-argument
+/// ABI makes. Arguments of a nested script are whatever its calling line
+/// expanded to.
+fn expand_script_arguments(line: &[u8], arguments: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut length = 0;
+    let mut push = |bytes: &[u8]| -> Option<()> {
+        out.get_mut(length..length + bytes.len())?.copy_from_slice(bytes);
+        length += bytes.len();
+        Some(())
+    };
+    let mut index = 0;
+    while index < line.len() {
+        let byte = line[index];
+        let next = line.get(index + 1).copied();
+        match (byte, next) {
+            (b'$', Some(b'$')) => {
+                push(b"$")?;
+                index += 2;
+            }
+            (b'$', Some(b'*')) => {
+                push(arguments)?;
+                index += 2;
+            }
+            (b'$', Some(digit @ b'1'..=b'9')) => {
+                let mut rest = arguments;
+                let mut word: &[u8] = b"";
+                for _ in 0..(digit - b'0') {
+                    (word, rest) = take_word(rest);
+                }
+                push(word)?;
+                index += 2;
+            }
+            _ => {
+                push(&[byte])?;
+                index += 1;
+            }
+        }
+    }
+    Some(length)
+}
+
+/// Which kind of file a bare command word resolved to.
+#[derive(Clone, Copy, PartialEq)]
+enum ExternalKind {
+    Script,
+    Tape,
+}
+
+/// Longest bare command word that can still have `.sh`/`.bin` appended and
+/// remain a legal FOSFS name (`fosfs::MAX_NAME_LENGTH` is 16).
+const EXTERNAL_NAME_LIMIT: usize = 12;
+
+/// Fallback for a command word that is not a builtin: look for `NAME.sh`
+/// (a script) and then `NAME.bin` (a tape) on disk1, then each secondary disk
+/// in order -- the same walk `load_hostname` uses, so a deployment can keep
+/// its own scripts and tapes on whichever disk is handy. The first disk with
+/// either file wins; on one disk `.sh` beats `.bin`, with a note, rather than
+/// guessing silently. Builtins are always matched first by `execute`, so a
+/// file can never shadow `reset` or `halt`. Disk errors (including a blank,
+/// unformatted secondary disk) just mean "not here". Returns false when
+/// nothing matched so the caller can print "Unknown command".
+fn run_external_command(info: &BootInfo, name: &[u8], arguments: &[u8]) -> bool {
+    if name.len() > EXTERNAL_NAME_LIMIT
+        || !name
+            .iter()
+            .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let mut script_name = [0u8; EXTERNAL_NAME_LIMIT + 3];
+    let mut tape_name = [0u8; EXTERNAL_NAME_LIMIT + 4];
+    script_name[..name.len()].copy_from_slice(name);
+    script_name[name.len()..name.len() + 3].copy_from_slice(b".sh");
+    tape_name[..name.len()].copy_from_slice(name);
+    tape_name[name.len()..name.len() + 4].copy_from_slice(b".bin");
+    let script_name = &script_name[..name.len() + 3];
+    let tape_name = &tape_name[..name.len() + 4];
+
+    let devices = core::iter::once(disk::Device::Boot)
+        .chain((0..disk::secondary_count()).map(disk::Device::Secondary));
+    for device in devices {
+        let script = matches!(fosfs::file_length(info, device, script_name), Ok(Some(_)));
+        let tape = matches!(fosfs::file_length(info, device, tape_name), Ok(Some(_)));
+        let kind = match (script, tape) {
+            (false, false) => continue,
+            (true, true) => {
+                println!(
+                    "note: both {0}.sh and {0}.bin exist; running the script.",
+                    core::str::from_utf8(name).unwrap_or("?")
+                );
+                ExternalKind::Script
+            }
+            (true, false) => ExternalKind::Script,
+            (false, true) => ExternalKind::Tape,
+        };
+        match kind {
+            ExternalKind::Script => match fosfs::file_length(info, device, script_name) {
+                Ok(Some(length)) => run_script(
+                    info,
+                    device,
+                    script_name,
+                    core::str::from_utf8(script_name).unwrap_or("script"),
+                    length,
+                    arguments,
+                ),
+                _ => return false,
+            },
+            ExternalKind::Tape => {
+                if tape_load_disk(info, device, tape_name, false) {
+                    tape_run(info, arguments);
+                }
+            }
+        }
+        return true;
+    }
+    false
 }
 
 /// One command line's editing state: the buffer of characters typed so
@@ -485,6 +742,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!(
                     "      start (rerun the boot 'start' script, e.g. after F12 from a tape)"
                 );
+                println!("Files: NAME [ARGS] runs NAME.sh (script) or NAME.bin (tape) from any disk");
                 println!(
                     "Serial: serial (list ports), term [PORT [BAUD]] (raw terminal, F12 to exit)"
                 );
@@ -595,7 +853,11 @@ fn execute(command: &[u8], info: &BootInfo) {
             println!("This command does not accept arguments.");
         }
 
-        _ => println!("Unknown command. Type 'help' for commands."),
+        _ => {
+            if !run_external_command(info, name, arguments) {
+                println!("Unknown command. Type 'help' for commands.");
+            }
+        }
     }
 }
 
@@ -2200,6 +2462,10 @@ fn term_net(info: &BootInfo) {
     if nic_or_report().is_none() {
         return;
     }
+    if (0..nic::count()).all(term_net_denied) {
+        println!("term net: denied on every interface by the settings file.");
+        return;
+    }
     println!("Waiting for a remote terminal client to connect; press F12");
     println!("(or F4/F6/F7/F8/F10) to give up.");
 
@@ -2251,6 +2517,9 @@ fn term_net(info: &BootInfo) {
                 }
                 let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
                 match frame[14] {
+                    // A denied NIC (settings file) stays silent: no session,
+                    // no reply that confirms a terminal service exists.
+                    TERM_TAG_HELLO if term_net_denied(index) => {}
                     TERM_TAG_HELLO => {
                         connected_peer = Some((peer_mac, index));
                         break;
@@ -2273,6 +2542,7 @@ fn term_net(info: &BootInfo) {
                     }
                     tag if dispatch_kup_frame(
                         info,
+                        index,
                         interface,
                         peer_mac,
                         interface.mac_address(),
@@ -2369,7 +2639,15 @@ fn term_net(info: &BootInfo) {
                     );
                     continue;
                 }
-                if dispatch_kup_frame(info, nic, frame_source, source, frame[14], &frame[15..]) {
+                if dispatch_kup_frame(
+                    info,
+                    session_index,
+                    nic,
+                    frame_source,
+                    source,
+                    frame[14],
+                    &frame[15..],
+                ) {
                     continue;
                 }
                 if frame_source != peer {
@@ -3837,13 +4115,17 @@ static mut NEXT_AMBIENT_BROADCAST: u64 = 0;
 /// for KUP applies regardless of which loop happens to be polling for it.
 fn dispatch_kup_frame(
     info: &BootInfo,
+    nic_index: usize,
     nic: &nic::Nic,
     peer_mac: [u8; 6],
     own_mac: [u8; 6],
     tag: u8,
     payload: &[u8],
 ) -> bool {
-    if !crate::debug::kernel_update_enabled() {
+    // The `settings` file's `deny-term-net` list also closes KUP on a NIC: a
+    // port that must not offer a remote shell must not accept a new kernel
+    // either. A denied frame is left unhandled, so it is ignored silently.
+    if !crate::debug::kernel_update_enabled() || term_net_denied(nic_index) {
         return false;
     }
     match tag {
@@ -3893,6 +4175,13 @@ fn ambient_discovery_poll(info: &BootInfo) -> bool {
                 remember_peer(peer_mac, trim_trailing_zero(payload));
                 send_chat_control(nic, &peer_mac, &own_mac, CHAT_TAG_DISCOVER_REPLY, index);
             }
+            // A NIC on the `settings` file's `deny-term-net` list serves no
+            // file access either: these requests are dropped silently.
+            NETFS_TAG_GET_REQUEST
+            | NETFS_TAG_PUT_REQUEST
+            | NETFS_TAG_PUT_DATA
+            | NETFS_TAG_PUT_STOP
+                if term_net_denied(index) => {}
             NETFS_TAG_GET_REQUEST => {
                 let remote_disk_number = payload.first().copied().unwrap_or(0);
                 let name = payload.get(1..).unwrap_or(&[]);
@@ -3907,7 +4196,7 @@ fn ambient_discovery_poll(info: &BootInfo) -> bool {
             NETFS_TAG_PUT_STOP => {
                 serve_netfs_put_stop(info, nic, peer_mac, own_mac);
             }
-            tag if dispatch_kup_frame(info, nic, peer_mac, own_mac, tag, payload) => {}
+            tag if dispatch_kup_frame(info, index, nic, peer_mac, own_mac, tag, payload) => {}
             _ => {}
         }
     }
@@ -5745,7 +6034,7 @@ fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
                 println!("Usage: tape load disk NAME");
                 return;
             }
-            tape_load_disk(info, disk::Device::Boot, name);
+            tape_load_disk(info, disk::Device::Boot, name, true);
         }
         // `disk` above is really just `disk1` spelled the historical way;
         // any other `diskN` word (`disk2`, `disk3`, ...) names an attached
@@ -5757,7 +6046,7 @@ fn tape_load_command(info: &BootInfo, arguments: &[u8]) {
                 println!("Usage: tape load diskN NAME");
                 return;
             }
-            tape_load_disk(info, device, name);
+            tape_load_disk(info, device, name, true);
         }
         // A bare hostname or `nic peers` number (optionally with `:diskN`)
         // fetches the file over the network from that peer instead, via
@@ -5817,7 +6106,7 @@ fn tape_load_remote(peer: [u8; 6], remote_disk_number: u8, name: &[u8]) {
 /// Multi-sector files are read one BIOS sector at a time, and the file must
 /// fit the same fixed region used by `tape load net`.
 #[inline(never)]
-fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
+fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8], hint: bool) -> bool {
     match fosfs::file_length(info, device, name) {
         Ok(Some(length)) if length == 0 => {
             println!(
@@ -5831,20 +6120,25 @@ fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
         Ok(Some(length)) => {
             let length = length as usize;
             let Some(address) = allocate_tape_buffer(length as u32) else {
-                return;
+                return false;
             };
             let destination =
                 unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) };
             match fosfs::read(info, device, name, destination) {
                 Ok(Some(_)) => {
                     if !install_tape(address, length as u32) {
-                        return;
+                        return false;
                     }
                     println!(
                         "Loaded {length} byte(s) from '{}' at 0x{address:05x}.",
                         core::str::from_utf8(name).unwrap_or("?")
                     );
-                    println!("'tape run' to execute it.");
+                    // A bare command name (`run_external_command`) runs the
+                    // tape straight away, so the hint would be misleading.
+                    if hint {
+                        println!("'tape run' to execute it.");
+                    }
+                    return true;
                 }
                 Ok(None) => println!("File not found."),
                 Err(error) => println!("FOSFS disk error: {error:?}"),
@@ -5853,6 +6147,7 @@ fn tape_load_disk(info: &BootInfo, device: disk::Device, name: &[u8]) {
         Ok(None) => println!("File not found."),
         Err(error) => println!("FOSFS disk error: {error:?}"),
     }
+    false
 }
 
 /// Writes the currently loaded tape's exact bytes out to FOSFS, the
