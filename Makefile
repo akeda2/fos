@@ -73,7 +73,7 @@ EXTRA_FOSFS_FILES ?=
 # directory before invoking cargo.
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-idle-cpu test-hwaccess test-release-loops test-msi test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-nettest tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-nettest test-tape-router test-tape-router-arp test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-idle-cpu test-hwaccess test-nic-map test-release-loops test-msi test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-nettest tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-nettest test-tape-router test-tape-router-arp test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -144,6 +144,7 @@ help:
 	@echo "  make test-tape-telnet - run host-side unit tests for tapes/telnet"
 	@echo "  make test-tape-bridge - build the image/tape and run the three-guest layer-2 bridge test"
 	@echo "  make test-tape-router-arp - verify the router holds the first packet across an ARP miss"
+	@echo "  make test-nic-map     - boot five NICs on virtual cables and check that nic map finds them"
 	@echo "  make test-tape-nettest - run the nettest engine unit tests and the three-guest loss/delay/rate test"
 	@echo "  make test-tape-router - build the image/tape and run the three-guest IPv4 router test"
 	@echo "  make test-tape-ed     - build the image/tape and verify editor FOSFS persistence"
@@ -201,6 +202,7 @@ test: image
 	python3 tools/test_vga_modes.py --image $(IMAGE)
 	python3 tools/test_hwaccess_e2e.py
 	python3 tools/test_msi_e2e.py
+	python3 tools/test_nic_map_e2e.py
 
 test-unsafe-memory: image-unsafe-memory
 	python3 tools/qemu_smoke.py --image $(UNSAFE_MEMORY_IMAGE) --legacy-unsafe-memory
@@ -226,6 +228,9 @@ test-scripts-settings: image
 
 test-release-loops: image
 	python3 tools/test_release_loops_e2e.py
+
+test-nic-map: image
+	python3 tools/test_nic_map_e2e.py
 
 test-msi: image
 	python3 tools/test_msi_e2e.py

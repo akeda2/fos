@@ -294,7 +294,13 @@ const ICR_RXO: u32 = 1 << 6;
 const ICR_RXT0: u32 = 1 << 7;
 const INTERRUPT_MASK: u32 = ICR_TXDW | ICR_LSC | ICR_RXSEQ | ICR_RXDMT0 | ICR_RXO | ICR_RXT0;
 
-const RING_COUNT: usize = 8;
+/// Transmit ring depth. `send` is asynchronous: it queues the frame and
+/// returns, waiting only when the descriptor it needs is still in flight, so
+/// one pass of a polling loop can queue a burst instead of stalling for each
+/// frame's wire time (12 us at gigabit for 1500 bytes). 64 descriptors fit the
+/// one descriptor page; the buffers are one contiguous run of pages
+/// (`tx_buffer_base + index * 4096`).
+const TX_COUNT: usize = 64;
 /// Receive ring depth. 8 descriptors were enough for the polled shell but not
 /// for a tape forwarding a gigabit stream (`nettest`, `bridge`, `router`): the
 /// foreground loop sleeps up to 10 ms between passes, ~800 full-size frames
@@ -419,7 +425,7 @@ pub struct E1000E {
     rx_descriptors: u32,
     tx_descriptors: u32,
     rx_buffer_base: u32,
-    tx_buffers: [u32; RING_COUNT],
+    tx_buffer_base: u32,
     rx_next: Cell<usize>,
     tx_next: Cell<usize>,
     overflow_count: Cell<u32>,
@@ -489,10 +495,7 @@ impl E1000E {
         let rx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let tx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let rx_buffer_base = pmem::allocate_contiguous(RX_COUNT).ok_or(InitError::OutOfMemory)?;
-        let mut tx_buffers = [0u32; RING_COUNT];
-        for buffer in &mut tx_buffers {
-            *buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        }
+        let tx_buffer_base = pmem::allocate_contiguous(TX_COUNT).ok_or(InitError::OutOfMemory)?;
 
         let nic = Self {
             mmio_base,
@@ -500,7 +503,7 @@ impl E1000E {
             rx_descriptors,
             tx_descriptors,
             rx_buffer_base,
-            tx_buffers,
+            tx_buffer_base,
             rx_next: Cell::new(0),
             tx_next: Cell::new(0),
             overflow_count: Cell::new(0),
@@ -621,13 +624,13 @@ impl E1000E {
                 );
             }
         }
-        for index in 0..RING_COUNT {
+        for index in 0..TX_COUNT {
             let descriptor = descriptor_pointer::<TxDescriptor>(self.tx_descriptors, index);
             unsafe {
                 write_volatile(
                     descriptor,
                     TxDescriptor {
-                        buffer_address: u64::from(self.tx_buffers[index]),
+                        buffer_address: u64::from(self.tx_buffer(index)),
                         length: 0,
                         checksum_offset: 0,
                         command: 0,
@@ -655,8 +658,12 @@ impl E1000E {
             REG_TDH,
             REG_TDT,
             self.tx_descriptors,
-            RING_COUNT,
+            TX_COUNT,
         );
+        // `program_ring` leaves the tail at count-1, right for a receive ring that
+        // starts full of empty buffers; a transmit ring starts empty (head ==
+        // tail == 0), or the card would "send" the blank descriptors.
+        write_register(self.mmio_base, REG_TDT, 0);
         write_register(self.mmio_base, REG_TIPG, 0x0060_200a);
         write_register(
             self.mmio_base,
@@ -697,6 +704,11 @@ impl E1000E {
         );
         write_register(self.mmio_base, head, 0);
         write_register(self.mmio_base, tail, (count - 1) as u32);
+    }
+
+    /// Physical address of transmit buffer `index` (one 4 KiB page each).
+    fn tx_buffer(&self, index: usize) -> u32 {
+        self.tx_buffer_base + (index * 4096) as u32
     }
 
     /// Physical address of receive buffer `index` (one 4 KiB page each).
@@ -848,7 +860,7 @@ impl E1000E {
         let padded_len = frame.len().max(MIN_FRAME_LEN);
         unsafe {
             let buffer = core::slice::from_raw_parts_mut(
-                self.tx_buffers[index] as *mut u8,
+                self.tx_buffer(index) as *mut u8,
                 TX_BUFFER_SIZE,
             );
             buffer[..frame.len()].copy_from_slice(frame);
@@ -856,7 +868,7 @@ impl E1000E {
             write_volatile(
                 descriptor,
                 TxDescriptor {
-                    buffer_address: u64::from(self.tx_buffers[index]),
+                    buffer_address: u64::from(self.tx_buffer(index)),
                     length: padded_len as u16,
                     checksum_offset: 0,
                     command: TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS,
@@ -867,18 +879,9 @@ impl E1000E {
             );
         }
         fence(Ordering::SeqCst);
-        write_register(self.mmio_base, REG_TDT, ((index + 1) % RING_COUNT) as u32);
+        write_register(self.mmio_base, REG_TDT, ((index + 1) % TX_COUNT) as u32);
 
-        let mut attempts = 1_000_000u32;
-        while unsafe { read_volatile(&(*descriptor).status) } & TX_STATUS_DD == 0 {
-            attempts -= 1;
-            if attempts == 0 {
-                self.recovery_pending.store(true, Ordering::Release);
-                return false;
-            }
-            core::hint::spin_loop();
-        }
-        self.tx_next.set((index + 1) % RING_COUNT);
+        self.tx_next.set((index + 1) % TX_COUNT);
         self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
         true
     }

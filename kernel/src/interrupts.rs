@@ -70,7 +70,10 @@ const MSI_VECTOR_COUNT: usize = 16;
 /// PIC's command port.
 const PIC_READ_ISR: u8 = 0x0b;
 
-/// PIT channel 0, mode 3 (square wave), running at this tick rate.
+/// PIT channel 0, mode 2 (rate generator), running at this tick rate. Mode 2
+/// (not the square wave of mode 3) because its counter makes exactly one
+/// sweep per period, so `micros` can read the position within the current
+/// tick without needing the OUT pin to tell the two half-periods apart.
 const PIT_FREQUENCY_HZ: u32 = 100;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 const PIT_CHANNEL0_DATA: u16 = 0x40;
@@ -606,7 +609,7 @@ pub fn use_kernel_pic_mapping() {
 fn program_pit() {
     let divisor = (PIT_INPUT_HZ / PIT_FREQUENCY_HZ) as u16;
     unsafe {
-        outb(PIT_COMMAND, 0x36); // channel 0, low+high byte, mode 3, binary
+        outb(PIT_COMMAND, 0x34); // channel 0, low+high byte, mode 2, binary
         io_wait();
         outb(PIT_CHANNEL0_DATA, divisor as u8);
         io_wait();
@@ -1028,6 +1031,48 @@ pub fn pop_scancode() -> Option<u8> {
 
 pub fn ticks() -> u64 {
     read_u64_atomically(core::ptr::addr_of!(TIMER_TICKS))
+}
+
+/// Highest value `micros` has returned, so it never goes backwards.
+static mut LAST_MICROS: u64 = 0;
+
+/// Microseconds since boot, with the PIT's own resolution (about 0.84 us)
+/// instead of the 10 ms of `ticks()`.
+///
+/// `ticks()` counts whole periods; the PIT's current count (latched with the
+/// command `0x00`, then read low byte then high byte) says how far into the
+/// present period we are -- it counts down from the reload value, so
+/// `reload - count` input-clock cycles have elapsed. The tick counter is read
+/// before and after; if it moved, a period boundary fell in between and the
+/// reading is retried. If the boundary arrived but its interrupt has not been
+/// serviced yet (interrupts off), the count has wrapped while `ticks()` has
+/// not, which would step the time back by one period, so the result is
+/// clamped to never decrease. Costs three port reads, a few microseconds:
+/// call it once per pass of a polling loop, not once per byte.
+pub fn micros() -> u64 {
+    const RELOAD: u64 = (PIT_INPUT_HZ / PIT_FREQUENCY_HZ) as u64;
+    for _ in 0..4 {
+        let before = ticks();
+        let count = unsafe {
+            outb(PIT_COMMAND, 0x00); // latch channel 0's count
+            let low = u64::from(inb(PIT_CHANNEL0_DATA));
+            let high = u64::from(inb(PIT_CHANNEL0_DATA));
+            (high << 8) | low
+        };
+        if ticks() != before {
+            continue;
+        }
+        let elapsed_cycles = RELOAD.saturating_sub(count.min(RELOAD));
+        let value = before * (1_000_000 / PIT_FREQUENCY_HZ as u64)
+            + elapsed_cycles * 1_000_000 / PIT_INPUT_HZ as u64;
+        unsafe {
+            if value > LAST_MICROS {
+                LAST_MICROS = value;
+            }
+            return LAST_MICROS;
+        }
+    }
+    unsafe { LAST_MICROS }
 }
 
 pub fn tick_frequency_hz() -> u32 {

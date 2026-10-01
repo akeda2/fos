@@ -100,6 +100,26 @@ pub fn idle() {
     }
 }
 
+/// The kernel's `micros` callback (ABI slot 38): microseconds since boot, read
+/// from the PIT's own counter, so deadlines and latencies are not limited to the
+/// 10 ms tick.
+static mut MICROS_HOOK: Option<extern "C" fn() -> u64> = None;
+
+/// Remembers the kernel's `micros` callback; call once from `tape_main`.
+pub fn set_micros_hook(hook: extern "C" fn() -> u64) {
+    unsafe {
+        MICROS_HOOK = Some(hook);
+    }
+}
+
+/// Microseconds since boot, or 0 if no hook was set.
+pub fn micros() -> u64 {
+    match unsafe { MICROS_HOOK } {
+        Some(hook) => hook(),
+        None => 0,
+    }
+}
+
 /// The kernel's `set_input_mode` callback (ABI slot 37), stored like the wait
 /// hook so `set_raw_keys` can be called from anywhere.
 static mut INPUT_MODE_HOOK: Option<extern "C" fn(u32)> = None;

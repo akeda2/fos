@@ -104,6 +104,7 @@ const REG_RAL0: u32 = 0x5400;
 const REG_RAH0: u32 = 0x5404;
 
 // --- Registers that moved for I350's multi-queue/MSI-X architecture ---
+const REG_STATUS: u32 = 0x0008;
 const REG_ICR: u32 = 0x1500;
 const REG_ICS: u32 = 0x1504; // Interrupt Cause Set: writing a bit raises that cause.
 const REG_IMS: u32 = 0x1508;
@@ -142,7 +143,13 @@ const SWSM_SWESMBI: u32 = 1 << 1;
 /// touches.
 const SWFW_PHY0_SM: u32 = 1 << 0;
 
-const RING_COUNT: usize = 8;
+/// Transmit ring depth. `send` is asynchronous: it queues the frame and
+/// returns, waiting only when the descriptor it needs is still in flight, so
+/// one pass of a polling loop can queue a burst instead of stalling for each
+/// frame's wire time (12 us at gigabit for 1500 bytes). 64 descriptors fit the
+/// one descriptor page; the buffers are one contiguous run of pages
+/// (`tx_buffer_base + index * 4096`).
+const TX_COUNT: usize = 64;
 /// Receive ring depth. 8 descriptors were enough for the polled shell but not
 /// for a tape forwarding a gigabit stream (`nettest`, `bridge`, `router`): the
 /// foreground loop sleeps up to 10 ms between passes, ~800 full-size frames
@@ -354,7 +361,7 @@ pub struct I350 {
     rx_descriptors: u32,
     tx_descriptors: u32,
     rx_buffer_base: u32,
-    tx_buffers: [u32; RING_COUNT],
+    tx_buffer_base: u32,
     rx_next: Cell<usize>,
     tx_next: Cell<usize>,
     overflow_count: Cell<u32>,
@@ -414,10 +421,7 @@ impl I350 {
         let rx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let tx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let rx_buffer_base = pmem::allocate_contiguous(RX_COUNT).ok_or(InitError::OutOfMemory)?;
-        let mut tx_buffers = [0u32; RING_COUNT];
-        for buffer in &mut tx_buffers {
-            *buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        }
+        let tx_buffer_base = pmem::allocate_contiguous(TX_COUNT).ok_or(InitError::OutOfMemory)?;
 
         let nic = Self {
             mmio_base,
@@ -425,7 +429,7 @@ impl I350 {
             rx_descriptors,
             tx_descriptors,
             rx_buffer_base,
-            tx_buffers,
+            tx_buffer_base,
             rx_next: Cell::new(0),
             tx_next: Cell::new(0),
             overflow_count: Cell::new(0),
@@ -500,13 +504,13 @@ impl I350 {
                 );
             }
         }
-        for index in 0..RING_COUNT {
+        for index in 0..TX_COUNT {
             let descriptor = descriptor_pointer::<TxDescriptor>(self.tx_descriptors, index);
             unsafe {
                 write_volatile(
                     descriptor,
                     TxDescriptor {
-                        buffer_address: u64::from(self.tx_buffers[index]),
+                        buffer_address: u64::from(self.tx_buffer(index)),
                         length: 0,
                         checksum_offset: 0,
                         command: 0,
@@ -536,7 +540,7 @@ impl I350 {
         write_register(
             self.mmio_base,
             REG_TDLEN0,
-            (RING_COUNT * core::mem::size_of::<TxDescriptor>()) as u32,
+            (TX_COUNT * core::mem::size_of::<TxDescriptor>()) as u32,
         );
         write_register(self.mmio_base, REG_TDH0, 0);
         write_register(self.mmio_base, REG_TDT0, 0);
@@ -583,6 +587,11 @@ impl I350 {
         Ok(())
     }
 
+    /// Physical address of transmit buffer `index` (one 4 KiB page each).
+    fn tx_buffer(&self, index: usize) -> u32 {
+        self.tx_buffer_base + (index * 4096) as u32
+    }
+
     /// Physical address of receive buffer `index` (one 4 KiB page each).
     fn rx_buffer(&self, index: usize) -> u32 {
         self.rx_buffer_base + (index * 4096) as u32
@@ -592,21 +601,24 @@ impl I350 {
         self.mac.get()
     }
 
-    // link_status() was deliberately removed here after a real-hardware
-    // finding: unlike e1000e.rs (confirmed correct and safe at the same
-    // offset), reading REG_STATUS on this real I350 while it was the
-    // active interface consistently made the `nic`/`nic list` shell
-    // commands never reply at all, while every other command on the
-    // same connection (including `nic use N` itself) kept working fine
-    // and the machine's own uptime kept advancing normally (ruling out
-    // a crash/reset). I350's own register map moved substantially from
-    // the classic 82540EM layout for its multi-queue architecture (see
-    // this file's other REG_* comments); assuming STATUS stayed at the
-    // classic 0x0008 offset without confirming it against a real
-    // datasheet was the likely mistake. Do not re-add this without
-    // confirming the real offset first (e.g. via a Linux `ethtool -d`
-    // register dump on real I350 hardware, the same technique that found
-    // e1000e's TCTL fix elsewhere in this project).
+    /// `(speed_mbps, full_duplex)` if the link is up, from the `STATUS`
+    /// register (offset 0x0008: LU = bit 1, FD = bit 0, speed in bits 7:6).
+    /// This was removed once after a real-hardware report that reading it made
+    /// `nic list` stop replying; the driver has changed a lot since (interrupt
+    /// handling, ring sizes), so it is back for `nic map` and is exercised on
+    /// the I350 machines -- if that symptom returns, this is the first suspect.
+    pub fn link_status(&self) -> Option<(u16, bool)> {
+        let status = read_register(self.mmio_base, REG_STATUS);
+        if status & (1 << 1) == 0 {
+            return None;
+        }
+        let speed = match (status >> 6) & 0b11 {
+            0b00 => 10,
+            0b01 => 100,
+            _ => 1000,
+        };
+        Some((speed, status & 1 != 0))
+    }
 
     pub fn set_promiscuous(&self, enabled: bool) {
         let mut value = read_register(self.mmio_base, REG_RCTL);
@@ -726,7 +738,7 @@ impl I350 {
         let padded_len = frame.len().max(MIN_FRAME_LEN);
         unsafe {
             let buffer = core::slice::from_raw_parts_mut(
-                self.tx_buffers[index] as *mut u8,
+                self.tx_buffer(index) as *mut u8,
                 TX_BUFFER_SIZE,
             );
             buffer[..frame.len()].copy_from_slice(frame);
@@ -734,7 +746,7 @@ impl I350 {
             write_volatile(
                 descriptor,
                 TxDescriptor {
-                    buffer_address: u64::from(self.tx_buffers[index]),
+                    buffer_address: u64::from(self.tx_buffer(index)),
                     length: padded_len as u16,
                     checksum_offset: 0,
                     command: TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS,
@@ -745,18 +757,9 @@ impl I350 {
             );
         }
         fence(Ordering::SeqCst);
-        write_register(self.mmio_base, REG_TDT0, ((index + 1) % RING_COUNT) as u32);
+        write_register(self.mmio_base, REG_TDT0, ((index + 1) % TX_COUNT) as u32);
 
-        let mut attempts = 1_000_000u32;
-        while unsafe { read_volatile(&(*descriptor).status) } & TX_STATUS_DD == 0 {
-            attempts -= 1;
-            if attempts == 0 {
-                self.recovery_pending.store(true, Ordering::Release);
-                return false;
-            }
-            core::hint::spin_loop();
-        }
-        self.tx_next.set((index + 1) % RING_COUNT);
+        self.tx_next.set((index + 1) % TX_COUNT);
         self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
         true
     }

@@ -178,19 +178,22 @@ impl Nic {
     }
 
     /// Returns `(speed_mbps, full_duplex)` if the link is currently up.
-    /// Only implemented for `e1000e.rs` -- see `i350.rs`'s own removed
-    /// `link_status` for why I350 doesn't have this too: reading its
-    /// `STATUS` register at the classic `0x0008` offset (correct for
-    /// e1000e, unconfirmed for I350's own substantially relocated
-    /// register map) made real I350 hardware stop replying to `nic`/
-    /// `nic list` entirely. Every other backend reports `None` rather
-    /// than guessing at a register layout this project hasn't verified.
+    /// Implemented for the e1000e, I350 (see its own comment about an earlier
+    /// real-hardware scare) and RTL8168; every other backend reports `None`
+    /// rather than guessing at a register layout this project hasn't verified.
     pub fn link_status(&self) -> Option<(u16, bool)> {
         match self {
             Nic::E1000E(nic) => nic.link_status(),
+            Nic::I350(nic) => nic.link_status(),
             Nic::Rtl8168(nic) => nic.link_status(),
             _ => None,
         }
+    }
+
+    /// True if `link_status` can tell "link down" from "no idea": the
+    /// drivers with a real status register return `None` for a down link.
+    pub fn link_status_is_reliable(&self) -> bool {
+        matches!(self, Nic::E1000E(_) | Nic::I350(_) | Nic::Rtl8168(_))
     }
 
     /// Runs a bounded, device-specific reset only after the driver has

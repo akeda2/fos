@@ -3492,7 +3492,229 @@ fn nic_command(arguments: &[u8]) {
         b"peers" if remainder.is_empty() => print_peers(),
         b"watchdog" if remainder.is_empty() => nic_watchdog(),
         b"regs" => nic_regs(remainder),
-        _ => println!("Usage: nic [list|use N|send|recv|sniff|discover|peers|watchdog|regs [N]]"),
+        b"map" if remainder.is_empty() => nic_map(),
+        _ => println!("Usage: nic [list|use N|send|recv|sniff|discover|peers|watchdog|regs [N]|map]"),
+    }
+}
+
+/// Ethertype and magic of the probes `nic map` sends (IEEE 802 local
+/// experimental range, one above `TEST_ETHERTYPE`'s neighbours).
+const MAP_ETHERTYPE: [u8; 2] = [0x88, 0xb9];
+const MAP_MAGIC: &[u8; 6] = b"FOSMAP";
+const MAP_MAX_NICS: usize = 16;
+const MAP_MAX_FOREIGN: usize = 4;
+/// How long the probes of one NIC are listened for, in 100 Hz ticks.
+const MAP_LISTEN_TICKS: u64 = 4;
+
+/// `nic map`: which of this machine's NICs have a link, and which hear which.
+///
+/// The link line comes from the driver where it can tell (an `STATUS`
+/// register or the 3Com media status). The "sees" line comes from the wire:
+/// every NIC in turn broadcasts a few tiny probe frames carrying its own number
+/// while all the others listen, so two NICs on one cable -- or on one switch --
+/// find each other regardless of what the drivers can report. Frames from
+/// anything else are counted as "other hosts": a NIC that sees exactly one
+/// other of ours and nothing else is very likely on a direct cable. Takes about
+/// a second; run it before a test so you know which port is which.
+fn nic_map() {
+    let count = nic::count().min(MAP_MAX_NICS);
+    if count == 0 {
+        println!("No Ethernet controller found.");
+        return;
+    }
+    let mut macs = [[0u8; 6]; MAP_MAX_NICS];
+    for index in 0..count {
+        if let Some(nic) = nic::get_at(index) {
+            macs[index] = nic.mac_address();
+        }
+    }
+    // heard[a][b]: NIC b received a probe sent by NIC a.
+    let mut heard = [[false; MAP_MAX_NICS]; MAP_MAX_NICS];
+    let mut foreign = [[[0u8; 6]; MAP_MAX_FOREIGN]; MAP_MAX_NICS];
+    let mut foreign_count = [0usize; MAP_MAX_NICS];
+    let mut buffer = [0u8; nic::MAX_FRAME_LEN];
+
+    println!("Probing {count} NIC(s) for links and cable connections...");
+    // Poll every NIC for `ticks` ticks, noting probes and foreign sources.
+    let mut listen = |ticks: u64,
+                      heard: &mut [[bool; MAP_MAX_NICS]; MAP_MAX_NICS],
+                      foreign: &mut [[[u8; 6]; MAP_MAX_FOREIGN]; MAP_MAX_NICS],
+                      foreign_count: &mut [usize; MAP_MAX_NICS]| {
+        let start = interrupts::ticks();
+        loop {
+            let mut any = false;
+            for listener in 0..count {
+                let Some(nic) = nic::get_at(listener) else { continue };
+                while let Some(length) = nic.receive(&mut buffer) {
+                    any = true;
+                    if length < 14 {
+                        continue;
+                    }
+                    let source: [u8; 6] = buffer[6..12].try_into().unwrap();
+                    if buffer[12..14] == MAP_ETHERTYPE
+                        && length >= 21
+                        && &buffer[14..20] == MAP_MAGIC
+                    {
+                        let sender = buffer[20] as usize;
+                        if sender < count && sender != listener && macs[sender] == source {
+                            heard[sender][listener] = true;
+                        }
+                        continue;
+                    }
+                    if macs[..count].contains(&source) {
+                        continue; // one of our own NICs: not another host
+                    }
+                    let known = foreign[listener][..foreign_count[listener]].contains(&source);
+                    if !known && foreign_count[listener] < MAP_MAX_FOREIGN {
+                        foreign[listener][foreign_count[listener]] = source;
+                        foreign_count[listener] += 1;
+                    } else if !known {
+                        foreign_count[listener] += 1; // more than we list: keep counting
+                    }
+                }
+            }
+            crate::debug::watchdog_pet();
+            if interrupts::ticks().wrapping_sub(start) >= ticks && !any {
+                break;
+            }
+        }
+    };
+
+    // A card that has only just come up may still be negotiating its link, so
+    // probes sent in the first moments are lost: if a whole round hears
+    // nothing at all, wait a second and try again (up to three rounds).
+    for round in 0..3 {
+        if round > 0 {
+            println!("Nothing heard yet; the links may still be coming up. Retrying...");
+            let start = interrupts::ticks();
+            while interrupts::ticks().wrapping_sub(start) < 100 {
+                crate::debug::watchdog_pet();
+                core::hint::spin_loop();
+            }
+        }
+        for sender in 0..count {
+            let Some(nic) = nic::get_at(sender) else { continue };
+            for _ in 0..3 {
+                let mut probe = [0u8; 60];
+                probe[0..6].fill(0xff);
+                probe[6..12].copy_from_slice(&macs[sender]);
+                probe[12..14].copy_from_slice(&MAP_ETHERTYPE);
+                probe[14..20].copy_from_slice(MAP_MAGIC);
+                probe[20] = sender as u8;
+                let _ = nic.send(&probe);
+                listen(MAP_LISTEN_TICKS, &mut heard, &mut foreign, &mut foreign_count);
+            }
+        }
+        listen(10, &mut heard, &mut foreign, &mut foreign_count);
+        let heard_anything = heard.iter().any(|row| row.iter().any(|&seen| seen))
+            || foreign_count.iter().any(|&seen| seen > 0);
+        if heard_anything {
+            break;
+        }
+    }
+
+    for index in 0..count {
+        let Some(nic) = nic::get_at(index) else { continue };
+        let mac = macs[index];
+        let link = match (nic.link_status(), nic.link_up()) {
+            (Some((speed, full)), _) => {
+                let mut text = [0u8; 24];
+                let mut writer = StackText::new(&mut text);
+                let _ = core::fmt::Write::write_fmt(
+                    &mut writer,
+                    format_args!("{speed}M {}", if full { "full" } else { "half" }),
+                );
+                (writer.as_str().len(), text)
+            }
+            (None, _) if nic.link_status_is_reliable() => {
+                let mut text = [0u8; 24];
+                text[..4].copy_from_slice(b"down");
+                (4, text)
+            }
+            (None, Some(true)) => {
+                let mut text = [0u8; 24];
+                text[..2].copy_from_slice(b"up");
+                (2, text)
+            }
+            (None, Some(false)) => {
+                let mut text = [0u8; 24];
+                text[..4].copy_from_slice(b"down");
+                (4, text)
+            }
+            (None, None) => {
+                let mut text = [0u8; 24];
+                text[..7].copy_from_slice(b"unknown");
+                (7, text)
+            }
+        };
+        println!(
+            "NIC {}: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} {} link {}",
+            index + 1,
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            if index == nic::active_index() { "(active)" } else { "" },
+            core::str::from_utf8(&link.1[..link.0]).unwrap_or("?"),
+        );
+        let mut line = [0u8; 80];
+        let mut writer = StackText::new(&mut line);
+        let mut any = false;
+        for other in 0..count {
+            if other != index && (heard[other][index] || heard[index][other]) {
+                let one_way = heard[other][index] != heard[index][other];
+                let _ = core::fmt::Write::write_fmt(
+                    &mut writer,
+                    format_args!("{}NIC {}{}", if any { ", " } else { "" }, other + 1,
+                                 if one_way { " (one way)" } else { "" }),
+                );
+                any = true;
+            }
+        }
+        let others = foreign_count[index];
+        let connected_to_us = (0..count).filter(|&o| o != index && (heard[o][index] || heard[index][o])).count();
+        if any {
+            let direct = connected_to_us == 1 && others == 0;
+            let _ = core::fmt::Write::write_fmt(
+                &mut writer,
+                format_args!(" -- {}", if direct { "direct cable" } else { "same network" }),
+            );
+        }
+        if others > 0 {
+            let _ = core::fmt::Write::write_fmt(
+                &mut writer,
+                format_args!("{}{others} other host(s)", if any { "; " } else { "" }),
+            );
+        }
+        if !any && others == 0 {
+            println!("    sees nothing (no cable, or only silent peers)");
+        } else {
+            println!("    sees {}", writer.as_str());
+        }
+    }
+}
+
+/// A tiny `fmt::Write` sink over a stack buffer (no heap in this kernel).
+struct StackText<'a> {
+    buffer: &'a mut [u8],
+    length: usize,
+}
+
+impl<'a> StackText<'a> {
+    fn new(buffer: &'a mut [u8]) -> Self {
+        Self { buffer, length: 0 }
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buffer[..self.length]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for StackText<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let bytes = text.as_bytes();
+        let room = self.buffer.len() - self.length;
+        let take = bytes.len().min(room);
+        self.buffer[self.length..self.length + take].copy_from_slice(&bytes[..take]);
+        self.length += take;
+        Ok(())
     }
 }
 
@@ -3646,6 +3868,8 @@ fn print_nic_health(nic: &nic::Nic) {
             speed,
             if full_duplex { "full duplex" } else { "half duplex" }
         );
+    } else if nic.link_status_is_reliable() {
+        println!("Link: down (no carrier).");
     }
     let health = nic.health();
     println!(
@@ -5725,6 +5949,13 @@ extern "C" fn tape_wait_for_event() {
     idle_wait();
 }
 
+/// Tape ABI slot 38: microseconds since boot (`interrupts::micros`), for
+/// rate pacing and latency measurement finer than the 10 ms tick.
+extern "C" fn tape_micros() -> u64 {
+    crate::debug::watchdog_pet();
+    interrupts::micros()
+}
+
 extern "C" fn tape_ticks() -> u64 {
     crate::debug::watchdog_pet(); // a tape polling the clock is alive
     interrupts::ticks()
@@ -6440,6 +6671,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
         wait_for_event: extern "C" fn(),
         set_input_mode: extern "C" fn(u32),
+        micros: extern "C" fn() -> u64,
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -6487,6 +6719,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_audio_capture_channels_and_bits_at,
         tape_wait_for_event,
         tape_set_input_mode,
+        tape_micros,
     );
     crate::debug::watchdog_tape_running(false);
     unsafe {
