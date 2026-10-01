@@ -431,6 +431,9 @@ fn configure(session: &mut Session<'_>, name: &[u8], way: Ways, args: &[&[u8]]) 
             }
             b"rate" => config.rate_kbit = parse_u32(first).ok_or(())?,
             b"queue" => config.queue_limit = parse_u32(first).ok_or(())?,
+            b"dup" => config.dup_permille = parse_permille(first).ok_or(())?,
+            b"reorder" => config.reorder_permille = parse_permille(first).ok_or(())?,
+            b"corrupt" => config.corrupt_permille = parse_permille(first).ok_or(())?,
             _ => return Err(()),
         }
         link.set_config(config);
@@ -480,7 +483,8 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
                 putc(u32::from(b'\n'));
             }
         }
-        b"loss" | b"delay" | b"rate" | b"queue" | b"seed" | b"preset" => {
+        b"loss" | b"delay" | b"rate" | b"queue" | b"seed" | b"preset" | b"dup" | b"reorder"
+        | b"corrupt" => {
             // An optional direction word first: `loss ab 5`.
             let (way, args) = match words.get(1).and_then(|word| parse_way(word)) {
                 Some(way) if count > 1 => (way, &words[2..count]),
@@ -513,6 +517,7 @@ fn print_help(putc: Putc) {
           delay [ab|ba] MS [JITTER]    hold frames MS ms +/- JITTER ms\n\
           rate [ab|ba] KBIT            link speed; 0 = unlimited\n\
           queue [ab|ba] N              frames allowed in flight\n\
+          dup|reorder|corrupt [ab|ba] PCT   deliver twice / swap with next / flip a bit\n\
           preset [ab|ba] NAME          a named profile; \"presets\" lists them\n\
           seed N | show | stats        repeatable randomness; settings; counters\n\
           view on|off                  live statistics panel above the prompt\n\
@@ -531,6 +536,26 @@ fn show(putc: Putc, session: &Session<'_>) {
     for index in 0..2 {
         print_config_line(putc, index, &session.links[index].config);
         putc(u32::from(b'\n'));
+        if session.links[index].config.has_faults() {
+            print_fault_line(putc, &session.links[index].config);
+            putc(u32::from(b'\n'));
+        }
+    }
+}
+
+/// `dup 1.0%  reorder 2.0%  corrupt 0.5%` -- only the ones that are set.
+fn print_fault_line(putc: Putc, config: &Config) {
+    print_bytes(putc, b"     ");
+    for (name, value) in [
+        (&b"dup "[..], config.dup_permille),
+        (&b"reorder "[..], config.reorder_permille),
+        (&b"corrupt "[..], config.corrupt_permille),
+    ] {
+        if value != 0 {
+            print_bytes(putc, name);
+            print_tenths(putc, value);
+            print_bytes(putc, b"%  ");
+        }
     }
 }
 
@@ -583,6 +608,15 @@ fn print_stats(putc: Putc, session: &Session<'_>) {
         print_bytes(putc, b" (max ");
         print_u32(putc, stats.max_depth);
         print_bytes(putc, b")\n");
+        if stats.duplicated + stats.reordered + stats.corrupted > 0 {
+            print_bytes(putc, b"      duplicated ");
+            print_u32(putc, stats.duplicated);
+            print_bytes(putc, b"  reordered ");
+            print_u32(putc, stats.reordered);
+            print_bytes(putc, b"  corrupted ");
+            print_u32(putc, stats.corrupted);
+            putc(u32::from(b'\n'));
+        }
         if stats.send_failed > 0 {
             print_bytes(putc, b"      send failures ");
             print_u32(putc, stats.send_failed);
@@ -741,6 +775,16 @@ fn view_draw(putc: Putc, session: &Session<'_>, now_tick: u64) {
         print_u32(putc, stats.max_depth);
         csi(putc, &[], b'K');
         view_row(putc, base + 3);
+        if link.config.has_faults() || stats.duplicated + stats.reordered + stats.corrupted > 0 {
+            print_fault_line(putc, &link.config);
+            print_bytes(putc, b"(done: dup ");
+            print_u32(putc, stats.duplicated);
+            print_bytes(putc, b", reorder ");
+            print_u32(putc, stats.reordered);
+            print_bytes(putc, b", corrupt ");
+            print_u32(putc, stats.corrupted);
+            print_bytes(putc, b")");
+        }
         csi(putc, &[], b'K');
     }
     view_row(putc, 11);

@@ -817,7 +817,7 @@ consistency while building this table:
 | `audio-rtp` | `static LOCAL_IP/PREFIX GATEWAY [PORT]` or `dhcp [PORT]` listens and plays (raw PCM and Opus both auto-detected on receive).<br>`static ... send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]` (or `dhcp send ...`) replays a FOSFS file.<br>`... capture [opus] PEER_IP [PEER_PORT] [BITRATE]` streams the live ADC.<br>`... duplex [opus] PEER_IP [PEER_PORT] [BITRATE]` listens and streams the live ADC simultaneously. `PORT`/`PEER_PORT` default to `5004`; `duplex`'s own listen port is always `5004`, not separately configurable. |
 | `beep` | (no args) |
 | `bigsieve` | (no args) |
-| `nettest` | `[nettest] [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]] [rate=KBIT] [queue=N] [seed=N] [preset=NAME] [view=on]`, or `@nettest.cfg` (one command per line). Two-port link impairment between NICs A and B (default 1 and 2); prefix a setting with `ab.` or `ba.` for one direction. Prompt commands: `loss`, `delay`, `rate`, `queue`, `preset`, `presets`, `seed`, `show`, `stats`, `view on|off`, `reset [stats]`, `help`, `quit`. |
+| `nettest` | `[nettest] [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]] [rate=KBIT] [queue=N] [seed=N] [dup=PCT] [reorder=PCT] [corrupt=PCT] [preset=NAME] [view=on]`, or `@nettest.cfg` (one command per line). Two-port link impairment between NICs A and B (default 1 and 2); prefix a setting with `ab.` or `ba.` for one direction. Prompt commands: `loss`, `delay`, `rate`, `queue`, `dup`, `reorder`, `corrupt`, `preset`, `presets`, `seed`, `show`, `stats`, `view on|off`, `reset [stats]`, `help`, `quit`. |
 | `bridge` | (no args) bridges every initialized interface.<br>`[bridge] NIC [NIC ...]` selects specific one-based `nic list` numbers (at least two, all distinct). |
 | `calc` | (no args) starts an interactive reverse-Polish-notation REPL.<br>`EXPRESSION` evaluates one expression and returns, e.g. `3 4 +`. |
 | `cpu64-lab` | `[probe\|x87\|mmx\|sse\|all]`, default `all`. |
@@ -1104,7 +1104,11 @@ tape run nettest @nettest.cfg
 `loss=PCT[:BURST]` drops PCT percent (0.1 steps; BURST makes each loss take
 that many frames in a row), `delay=MS[:JITTER]` holds frames back (never
 reordering them), `rate=KBIT` limits the link speed with a queue, and
-`queue=N` caps the frames in flight (excess is tail-dropped). Time has the
+`dup=PCT` delivers a frame twice, `reorder=PCT` holds a frame back so the next
+one overtakes it (held at most 50 ms if nothing follows), and `corrupt=PCT`
+flips one random bit after the Ethernet header, so the frame still reaches the
+right station but fails a checksum above it. `queue=N` caps the frames in
+flight (excess is tail-dropped). Time has the
 kernel's 10 ms granularity. `seed=N` makes the random choices repeatable.
 `preset=NAME` (or `preset ab NAME` at the prompt) loads a whole profile in one
 step: `badwifi` (weak signal: 10% bursty loss, 40+-60 ms, 3 Mbit/s), `wifi`,

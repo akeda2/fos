@@ -11,6 +11,7 @@ real forwarding path, that
   * `loss` drops about the configured share (and only in the chosen direction),
   * `delay` holds frames back,
   * `rate` spaces frames out and
+  * duplication, reordering and corruption do what they say,
   * `reset`/`quit` work and return control to the shell.
 
 The queue-size line is also checked with the default 128 MiB guest (static
@@ -287,6 +288,40 @@ def main():
         burst(seg_a, 20, HOST_B, HOST_A, size=1000, gap=0.001)
         got = seg_b.drain(1.5)
         check(0 < len(got) < 20, f"queue 3 tail-dropped ({len(got)} of 20 arrived)", guest)
+
+        # Duplication, reordering and corruption.
+        command(guest, seg_a, "reset")
+        command(guest, seg_a, "dup ab 100")
+        seg_b.drain()
+        burst(seg_a, 10, HOST_B, HOST_A)
+        got = [seq for _, seq in seg_b.drain(0.5)]
+        check(sorted(got) == sorted(list(range(10)) * 2), "dup 100% delivers every frame twice", guest)
+
+        command(guest, seg_a, "reset")
+        command(guest, seg_a, "reorder ab 100")
+        seg_b.drain()
+        burst(seg_a, 10, HOST_B, HOST_A, gap=0.01)
+        got = [seq for _, seq in seg_b.drain(0.5)]
+        check(got == [1, 0, 3, 2, 5, 4, 7, 6, 9, 8], f"reorder 100% swaps neighbouring frames {got}", guest)
+        seg_b.drain()
+        seg_a.send(test_frame(HOST_B, HOST_A, 77))
+        got = [seq for _, seq in seg_b.drain(0.5)]
+        check(got == [77], "a frame held for reordering is still released if nothing follows", guest)
+
+        command(guest, seg_a, "reset")
+        command(guest, seg_a, "corrupt ab 100")
+        seg_b.drain()
+        sent = [test_frame(HOST_B, HOST_A, i, 200) for i in range(15)]
+        for frame in sent:
+            seg_a.send(frame)
+            time.sleep(0.003)
+        received = [data for _, data in seg_b.frames(0.5) if data[12:14] == TEST_ETHERTYPE]
+        flips = [sum(bin(x ^ y).count("1") for x, y in zip(a, b)) for a, b in zip(sent, received)]
+        check(len(received) == 15 and all(f == 1 for f in flips)
+              and all(a[:14] == b[:14] for a, b in zip(sent, received)),
+              f"corrupt 100% flips exactly one payload bit per frame (flips {flips})", guest)
+        counters = command(guest, seg_a, "stats")
+        check("corrupted 15" in counters, "stats counts the corrupted frames", guest)
 
         # Presets and the optional statistics panel.
         listing = command(guest, seg_a, "presets")

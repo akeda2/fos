@@ -7,7 +7,7 @@
 //!
 //! Time is microseconds. The kernel's tick counter runs at 100 Hz, so callers
 //! pass `ticks * 10_000`; delays therefore take effect with 10 ms granularity.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 /// Bytes per queue slot: a 12-byte header (due time, length) plus the largest
 /// Ethernet frame the NIC drivers hand a tape (1514 bytes).
@@ -57,6 +57,13 @@ pub struct Config {
     pub rate_kbit: u32,
     /// Most frames that may be in flight; more are tail-dropped.
     pub queue_limit: u32,
+    /// Probability, in tenths of a percent, of delivering a frame twice.
+    pub dup_permille: u16,
+    /// Probability of swapping a frame with the one after it (see `Direction`).
+    pub reorder_permille: u16,
+    /// Probability of flipping one bit in the payload (after the Ethernet
+    /// header, so the frame is still delivered to the right station).
+    pub corrupt_permille: u16,
 }
 
 impl Config {
@@ -68,18 +75,30 @@ impl Config {
             jitter_ms: 0,
             rate_kbit: 0,
             queue_limit,
+            dup_permille: 0,
+            reorder_permille: 0,
+            corrupt_permille: 0,
         }
     }
 
     pub fn is_clean(&self) -> bool {
-        self.loss_permille == 0 && self.delay_ms == 0 && self.jitter_ms == 0 && self.rate_kbit == 0
+        self.loss_permille == 0
+            && self.delay_ms == 0
+            && self.jitter_ms == 0
+            && self.rate_kbit == 0
+            && !self.has_faults()
+    }
+
+    /// True if duplication, reordering or corruption is configured.
+    pub fn has_faults(&self) -> bool {
+        self.dup_permille != 0 || self.reorder_permille != 0 || self.corrupt_permille != 0
     }
 }
 
 /// Named starting points for a realistic bad link, as `(name, description)`.
 pub const PRESETS: [(&[u8], &[u8]); 5] = [
-    (b"badwifi", b"weak signal: 10% bursty loss, 40+-60 ms, 3 Mbit/s"),
-    (b"wifi", b"busy WiFi: 3% bursty loss, 15+-10 ms, 20 Mbit/s"),
+    (b"badwifi", b"weak signal: 10% bursty loss, 40+-60 ms, 3 Mbit/s, dup+reorder"),
+    (b"wifi", b"busy WiFi: 3% bursty loss, 15+-10 ms, 20 Mbit/s, some reorder"),
     (b"cellular", b"mobile data: 1% loss, 70+-30 ms, 8 Mbit/s"),
     (b"satellite", b"600+-20 ms, 1% loss, 10 Mbit/s, deep queue"),
     (b"dsl", b"slow line: 20+-2 ms, 2 Mbit/s, shallow queue"),
@@ -89,12 +108,14 @@ pub const PRESETS: [(&[u8], &[u8]); 5] = [
 /// most the storage allows, and presets that want a shallower queue are capped
 /// by it.
 pub fn preset(name: &[u8], queue_limit: u32) -> Option<Config> {
-    let (loss_permille, burst, delay_ms, jitter_ms, rate_kbit, queue) = match name {
-        b"badwifi" => (100, 6, 40, 60, 3000, 64),
-        b"wifi" => (30, 4, 15, 10, 20_000, 128),
-        b"cellular" => (10, 1, 70, 30, 8000, 128),
-        b"satellite" => (10, 1, 600, 20, 10_000, 512),
-        b"dsl" => (0, 1, 20, 2, 2000, 48),
+    // (loss, burst, delay, jitter, rate, queue) and (duplicate, reorder) in
+    // tenths of a percent: WiFi's link-layer retries show up as both.
+    let ((loss_permille, burst, delay_ms, jitter_ms, rate_kbit, queue), extra) = match name {
+        b"badwifi" => ((100, 6, 40, 60, 3000, 64), (5, 20)),
+        b"wifi" => ((30, 4, 15, 10, 20_000, 128), (2, 5)),
+        b"cellular" => ((10, 1, 70, 30, 8000, 128), (0, 0)),
+        b"satellite" => ((10, 1, 600, 20, 10_000, 512), (0, 0)),
+        b"dsl" => ((0, 1, 20, 2, 2000, 48), (0, 0)),
         _ => return None,
     };
     Some(Config {
@@ -104,6 +125,9 @@ pub fn preset(name: &[u8], queue_limit: u32) -> Option<Config> {
         jitter_ms,
         rate_kbit,
         queue_limit: queue.min(queue_limit),
+        dup_permille: extra.0,
+        reorder_permille: extra.1,
+        corrupt_permille: 0,
     })
 }
 
@@ -117,6 +141,9 @@ pub struct Stats {
     pub send_failed: u32,
     pub bytes_sent: u32,
     pub max_depth: u32,
+    pub duplicated: u32,
+    pub reordered: u32,
+    pub corrupted: u32,
 }
 
 /// A ring of fixed-size frame slots over caller-provided storage.
@@ -166,6 +193,22 @@ impl<'a> Queue<'a> {
         true
     }
 
+    /// Flips bit `bit` (0..8) of byte `offset` of the frame most recently
+    /// pushed; false if the queue is empty or the frame is shorter.
+    pub fn corrupt_last(&mut self, offset: usize, bit: u8) -> bool {
+        if self.count == 0 {
+            return false;
+        }
+        let slot = (self.head + self.count - 1) % self.slots;
+        let base = slot * SLOT_BYTES;
+        let length = u32::from_le_bytes(self.storage[base + 8..base + 12].try_into().unwrap()) as usize;
+        if offset >= length {
+            return false;
+        }
+        self.storage[base + HEADER_BYTES + offset] ^= 1 << (bit & 7);
+        true
+    }
+
     /// When the oldest queued frame is due.
     pub fn front_due(&self) -> Option<u64> {
         if self.count == 0 {
@@ -201,7 +244,17 @@ pub struct Direction<'a> {
     link_free_us: u64,
     /// Latest due time handed out, so jitter never reorders frames.
     last_due_us: u64,
+    /// A frame held back to be swapped with the next one (`reorder`), with its
+    /// length and the time it was held; it is released on its own if no
+    /// further frame arrives within `HELD_LIMIT_US`.
+    held: [u8; MAX_FRAME],
+    held_len: usize,
+    held_due_us: u64,
+    held_since_us: u64,
 }
+
+/// Longest a frame waits to be swapped with a successor, in microseconds.
+const HELD_LIMIT_US: u64 = 50_000;
 
 impl<'a> Direction<'a> {
     pub fn new(storage: &'a mut [u8]) -> Self {
@@ -214,6 +267,10 @@ impl<'a> Direction<'a> {
             burst_left: 0,
             link_free_us: 0,
             last_due_us: 0,
+            held: [0; MAX_FRAME],
+            held_len: 0,
+            held_due_us: 0,
+            held_since_us: 0,
         }
     }
 
@@ -262,15 +319,66 @@ impl<'a> Direction<'a> {
         }
         due = due.max(self.last_due_us);
         self.last_due_us = due;
+
+        // Reordering holds this frame back so the next one overtakes it. Only
+        // one frame is held at a time; a frame arriving while one is held
+        // releases it right behind itself.
+        if self.held_len == 0
+            && config.reorder_permille > 0
+            && rng.below(1000) < u32::from(config.reorder_permille)
+            && frame.len() <= MAX_FRAME
+        {
+            self.held[..frame.len()].copy_from_slice(frame);
+            self.held_len = frame.len();
+            self.held_due_us = due;
+            self.held_since_us = now_us;
+            self.stats.reordered = self.stats.reordered.wrapping_add(1);
+            return;
+        }
         if !self.queue.push(frame, due) {
             self.stats.queue_drops = self.stats.queue_drops.wrapping_add(1);
             return;
         }
+        if config.corrupt_permille > 0 && rng.below(1000) < u32::from(config.corrupt_permille) {
+            // Leave the Ethernet header intact so the frame still reaches the
+            // right station; a real link would drop a bad frame at the FCS, but
+            // a faulty bridge or driver passes damaged payloads on.
+            if frame.len() > 14 {
+                let offset = 14 + rng.below((frame.len() - 14) as u32) as usize;
+                let bit = rng.below(8) as u8;
+                if self.queue.corrupt_last(offset, bit) {
+                    self.stats.corrupted = self.stats.corrupted.wrapping_add(1);
+                }
+            }
+        }
+        if config.dup_permille > 0 && rng.below(1000) < u32::from(config.dup_permille) {
+            if (self.queue.len() as u32) < config.queue_limit && self.queue.push(frame, due) {
+                self.stats.duplicated = self.stats.duplicated.wrapping_add(1);
+            }
+        }
+        self.flush_held();
         self.stats.max_depth = self.stats.max_depth.max(self.queue.len() as u32);
+    }
+
+    /// Queues the held frame (if any) behind whatever was just queued.
+    fn flush_held(&mut self) {
+        if self.held_len == 0 {
+            return;
+        }
+        let due = self.held_due_us.max(self.last_due_us);
+        self.last_due_us = due;
+        let length = self.held_len;
+        self.held_len = 0;
+        if !self.queue.push(&self.held[..length], due) {
+            self.stats.queue_drops = self.stats.queue_drops.wrapping_add(1);
+        }
     }
 
     /// If the oldest queued frame is due, removes it into `out`.
     pub fn release(&mut self, now_us: u64, out: &mut [u8]) -> Option<usize> {
+        if self.held_len > 0 && now_us.saturating_sub(self.held_since_us) >= HELD_LIMIT_US {
+            self.flush_held();
+        }
         if self.queue.front_due()? > now_us {
             return None;
         }
@@ -293,6 +401,7 @@ impl<'a> Direction<'a> {
         self.burst_left = 0;
         self.link_free_us = 0;
         self.last_due_us = 0;
+        self.held_len = 0;
     }
 }
 
@@ -440,6 +549,70 @@ mod tests {
                 now += 500;
             }
         }
+    }
+
+    fn drain_all(link: &mut Direction<'_>, now: u64) -> std::vec::Vec<std::vec::Vec<u8>> {
+        let mut out = [0u8; 2000];
+        let mut frames = std::vec::Vec::new();
+        while let Some(length) = link.release(now, &mut out) {
+            frames.push(out[..length].to_vec());
+        }
+        frames
+    }
+
+    #[test]
+    fn duplication_delivers_a_frame_twice() {
+        let mut storage = [0u8; SLOT_BYTES * 8];
+        let mut link = direction(&mut storage);
+        link.set_config(Config { dup_permille: 1000, ..link.config });
+        let mut rng = Rng::new(3);
+        link.ingest(&[7; 30], 0, &mut rng);
+        let frames = drain_all(&mut link, 0);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], frames[1]);
+        assert_eq!(link.stats.duplicated, 1);
+    }
+
+    #[test]
+    fn reordering_swaps_a_frame_with_its_successor() {
+        let mut storage = [0u8; SLOT_BYTES * 8];
+        let mut link = direction(&mut storage);
+        let mut rng = Rng::new(3);
+        // Hold the first frame only: reorder 100% for it, then off.
+        link.set_config(Config { reorder_permille: 1000, ..link.config });
+        link.ingest(&[1; 20], 0, &mut rng);
+        link.set_config(Config { reorder_permille: 0, ..link.config });
+        link.ingest(&[2; 20], 0, &mut rng);
+        link.ingest(&[3; 20], 0, &mut rng);
+        let order: std::vec::Vec<u8> = drain_all(&mut link, 0).iter().map(|f| f[0]).collect();
+        assert_eq!(order, [2, 1, 3]);
+        assert_eq!(link.stats.reordered, 1);
+    }
+
+    #[test]
+    fn a_held_frame_is_released_when_nothing_follows() {
+        let mut storage = [0u8; SLOT_BYTES * 4];
+        let mut link = direction(&mut storage);
+        link.set_config(Config { reorder_permille: 1000, ..link.config });
+        let mut rng = Rng::new(3);
+        link.ingest(&[9; 20], 0, &mut rng);
+        assert_eq!(drain_all(&mut link, 10_000).len(), 0);
+        assert_eq!(drain_all(&mut link, HELD_LIMIT_US).len(), 1);
+    }
+
+    #[test]
+    fn corruption_flips_exactly_one_payload_bit() {
+        let mut storage = [0u8; SLOT_BYTES * 4];
+        let mut link = direction(&mut storage);
+        link.set_config(Config { corrupt_permille: 1000, ..link.config });
+        let mut rng = Rng::new(11);
+        let original = [0x55u8; 60];
+        link.ingest(&original, 0, &mut rng);
+        let frames = drain_all(&mut link, 0);
+        assert_eq!(&frames[0][..14], &original[..14], "Ethernet header untouched");
+        let flipped: u32 = frames[0].iter().zip(original).map(|(a, b)| (a ^ b).count_ones()).sum();
+        assert_eq!(flipped, 1);
+        assert_eq!(link.stats.corrupted, 1);
     }
 
     #[test]
