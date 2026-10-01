@@ -748,6 +748,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 );
                 println!("      hexdump dmesg halt reset reboot [soft|hard]");
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
+                println!("Hardware: io|mmio r8|r16|r32 ADDR, w8|w16|w32 ADDR VAL; pci read|write B:D.F");
                 println!(
                     "Disk: diskinfo/readsector/format/ls/cat/write/rm [diskN], copy SRC NAME DST"
                 );
@@ -829,6 +830,9 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"term" => term_command(info, arguments),
         b"serial" if no_arguments(arguments) => print_serial_ports(),
         b"pci" if no_arguments(arguments) => print_pci_devices(),
+        b"pci" => pci_command(arguments),
+        b"io" => io_command(arguments),
+        b"mmio" => mmio_command(arguments),
         b"dmesg" if no_arguments(arguments) => dmesg_command(),
         b"usb" => usb_command(info, arguments),
         b"printer" if no_arguments(arguments) => print_printer_ports(),
@@ -1171,6 +1175,232 @@ fn print_pci_devices() {
     }
     if found > shown {
         println!("({} more found but not shown; MAX_PCI_DEVICES exceeded)", found - shown);
+    }
+}
+
+/// Parses `BB:DD.F` (hexadecimal bus, device, function), as the `pci` dump
+/// prints them.
+fn parse_pci_address(text: &[u8]) -> Option<(u8, u8, u8)> {
+    let colon = text.iter().position(|&byte| byte == b':')?;
+    let dot = text.iter().position(|&byte| byte == b'.')?;
+    if dot < colon {
+        return None;
+    }
+    let hex = |digits: &[u8]| -> Option<u32> {
+        if digits.is_empty() || digits.len() > 2 {
+            return None;
+        }
+        digits.iter().try_fold(0u32, |value, &digit| {
+            let nibble = match digit {
+                b'0'..=b'9' => digit - b'0',
+                b'a'..=b'f' => digit - b'a' + 10,
+                b'A'..=b'F' => digit - b'A' + 10,
+                _ => return None,
+            };
+            Some(value * 16 + u32::from(nibble))
+        })
+    };
+    let bus = hex(&text[..colon])?;
+    let device = hex(&text[colon + 1..dot])?;
+    let function = hex(&text[dot + 1..])?;
+    (device < 32 && function < 8).then_some((bus as u8, device as u8, function as u8))
+}
+
+/// `pci read B:D.F [OFFSET [LENGTH]]` dumps a function's configuration space
+/// (default the first 64 bytes, at most 256); `pci write B:D.F OFFSET VALUE`
+/// writes one dword. Raw debugging aids: find where an interrupt is routed, read
+/// a capability, flip the MSI enable bit -- without a diagnostic kernel push.
+/// Offsets are rounded down to a dword.
+fn pci_command(arguments: &[u8]) {
+    let (subcommand, rest) = take_word(arguments);
+    let (address_word, rest) = take_word(rest);
+    let Some((bus, device, function)) = parse_pci_address(address_word) else {
+        println!("Usage: pci | pci read B:D.F [OFFSET [LENGTH]] | pci write B:D.F OFFSET VALUE");
+        println!("(B:D.F in hex as the pci listing shows it, e.g. 03:00.0)");
+        return;
+    };
+    match subcommand {
+        b"read" => {
+            let (offset_word, rest) = take_word(rest);
+            let (length_word, rest) = take_word(rest);
+            let offset = if offset_word.is_empty() { Some(0) } else { parse_number(offset_word) };
+            let length = if length_word.is_empty() { Some(64) } else { parse_number(length_word) };
+            let (Some(offset), Some(length)) = (offset, length) else {
+                println!("pci read: OFFSET and LENGTH must be numbers.");
+                return;
+            };
+            if !rest.is_empty() || offset > 0xff {
+                println!("Usage: pci read B:D.F [OFFSET [LENGTH]] (offset 0-255)");
+                return;
+            }
+            let start = offset & !3;
+            let end = (offset + length.clamp(1, 256)).min(256);
+            let mut row = start & !15;
+            while row < end {
+                print!("{row:02x}:");
+                for dword in 0..4u32 {
+                    let at = row + dword * 4;
+                    if at >= start && at < end {
+                        let value = pci::config_read32(bus, device, function, at as u8);
+                        print!(" {:02x} {:02x} {:02x} {:02x}", value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, value >> 24);
+                    } else {
+                        print!("            ");
+                    }
+                }
+                println!();
+                row += 16;
+            }
+        }
+        b"write" => {
+            let (offset_word, rest) = take_word(rest);
+            let (value_word, rest) = take_word(rest);
+            let (Some(offset), Some(value)) = (parse_number(offset_word), parse_number(value_word)) else {
+                println!("Usage: pci write B:D.F OFFSET VALUE (32-bit write)");
+                return;
+            };
+            if !rest.is_empty() || offset > 0xfc {
+                println!("Usage: pci write B:D.F OFFSET VALUE (offset 0-252)");
+                return;
+            }
+            let offset = offset & !3;
+            pci::config_write32(bus, device, function, offset as u8, value);
+            println!(
+                "{bus:02x}:{device:02x}.{function} [{offset:02x}] <- {value:08x}; reads back {:08x}.",
+                pci::config_read32(bus, device, function, offset as u8)
+            );
+        }
+        _ => println!("Usage: pci | pci read B:D.F [OFFSET [LENGTH]] | pci write B:D.F OFFSET VALUE"),
+    }
+}
+
+/// Splits `r8`/`w16`/... into (is_write, width_in_bytes).
+fn parse_access(word: &[u8]) -> Option<(bool, u32)> {
+    let write = match word.first()? {
+        b'r' => false,
+        b'w' => true,
+        _ => return None,
+    };
+    match &word[1..] {
+        b"8" => Some((write, 1)),
+        b"16" => Some((write, 2)),
+        b"32" => Some((write, 4)),
+        _ => None,
+    }
+}
+
+/// `io r8|r16|r32 PORT` / `io w8|w16|w32 PORT VALUE`: raw x86 port I/O, for
+/// reading a card's registers from its I/O BAR (the `pci` dump shows the base)
+/// without a diagnostic kernel. A write to the wrong port can hang or reset the
+/// machine; this is a debugging tool.
+fn io_command(arguments: &[u8]) {
+    let (access, rest) = take_word(arguments);
+    let (port_word, rest) = take_word(rest);
+    let (value_word, rest) = take_word(rest);
+    let usage = "Usage: io r8|r16|r32 PORT | io w8|w16|w32 PORT VALUE";
+    let (Some((write, width)), Some(port)) = (parse_access(access), parse_number(port_word)) else {
+        println!("{usage}");
+        return;
+    };
+    if port > 0xffff || !rest.is_empty() || write != !value_word.is_empty() {
+        println!("{usage}");
+        return;
+    }
+    let port = port as u16;
+    if write {
+        let Some(value) = parse_number(value_word) else {
+            println!("{usage}");
+            return;
+        };
+        unsafe {
+            match width {
+                1 => crate::arch::x86::outb(port, value as u8),
+                2 => crate::arch::x86::outw(port, value as u16),
+                _ => crate::arch::x86::outl(port, value),
+            }
+        }
+        println!("port 0x{port:04x} <- 0x{value:x}");
+    } else {
+        let value = unsafe {
+            match width {
+                1 => u32::from(crate::arch::x86::inb(port)),
+                2 => u32::from(crate::arch::x86::inw(port)),
+                _ => crate::arch::x86::inl(port),
+            }
+        };
+        println!("port 0x{port:04x} = 0x{value:0w$x}", w = width as usize * 2);
+    }
+}
+
+/// `mmio r8|r16|r32 ADDR` / `mmio w8|w16|w32 ADDR VALUE`: a volatile access to
+/// physical memory, for device registers in a memory BAR or the local APIC.
+/// Only addresses the kernel has mapped are accepted (the low 2 GiB, minus the
+/// stack guard page, plus MMIO a driver registered); anything else would page-
+/// fault, so it is refused with a message instead. Writes also refuse kernel
+/// text and read-only data. Accesses must be naturally aligned.
+fn mmio_command(arguments: &[u8]) {
+    let (access, rest) = take_word(arguments);
+    let (address_word, rest) = take_word(rest);
+    let (value_word, rest) = take_word(rest);
+    let usage = "Usage: mmio r8|r16|r32 ADDR | mmio w8|w16|w32 ADDR VALUE";
+    let (Some((write, width)), Some(address)) = (parse_access(access), parse_number(address_word)) else {
+        println!("{usage}");
+        return;
+    };
+    if !rest.is_empty() || write != !value_word.is_empty() {
+        println!("{usage}");
+        return;
+    }
+    if address % width != 0 {
+        println!("mmio: 0x{address:x} is not {width}-byte aligned.");
+        return;
+    }
+    let allowed = if write { crate::paging::is_writable(address) } else { crate::paging::is_readable(address) };
+    if !allowed {
+        println!(
+            "mmio: 0x{address:x} is not accessible ({}); only mapped addresses can be {}.",
+            crate::paging::describe_address(address),
+            if write { "written" } else { "read" }
+        );
+        return;
+    }
+    if write {
+        let Some(value) = parse_number(value_word) else {
+            println!("{usage}");
+            return;
+        };
+        unsafe {
+            match width {
+                1 => core::ptr::write_volatile(address as *mut u8, value as u8),
+                2 => core::ptr::write_volatile(address as *mut u16, value as u16),
+                _ => core::ptr::write_volatile(address as *mut u32, value),
+            }
+        }
+        println!("[0x{address:08x}] <- 0x{value:x}");
+    } else {
+        let value = unsafe {
+            match width {
+                1 => u32::from(core::ptr::read_volatile(address as *const u8)),
+                2 => u32::from(core::ptr::read_volatile(address as *const u16)),
+                _ => core::ptr::read_volatile(address as *const u32),
+            }
+        };
+        println!("[0x{address:08x}] = 0x{value:0w$x}", w = width as usize * 2);
+    }
+}
+
+/// `nic regs [N]`: the selected (or Nth, 1-based) NIC's register and ring dump.
+fn nic_regs(arguments: &[u8]) {
+    let (word, rest) = take_word(arguments);
+    let nic = if word.is_empty() {
+        nic::get().ok()
+    } else if let (Some(number), true) = (parse_number(word), rest.is_empty()) {
+        number.checked_sub(1).and_then(|index| nic::get_at(index as usize))
+    } else {
+        None
+    };
+    match nic {
+        Some(nic) => nic.dump_registers(),
+        None => println!("Usage: nic regs [N] (N from 'nic list', numbering starts at 1)"),
     }
 }
 
@@ -3184,7 +3414,8 @@ fn nic_command(arguments: &[u8]) {
         b"discover" if remainder.is_empty() => nic_discover(),
         b"peers" if remainder.is_empty() => print_peers(),
         b"watchdog" if remainder.is_empty() => nic_watchdog(),
-        _ => println!("Usage: nic [list|use N|send|recv|sniff|discover|peers|watchdog]"),
+        b"regs" => nic_regs(remainder),
+        _ => println!("Usage: nic [list|use N|send|recv|sniff|discover|peers|watchdog|regs [N]]"),
     }
 }
 

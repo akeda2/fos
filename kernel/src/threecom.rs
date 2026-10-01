@@ -16,6 +16,7 @@ use crate::arch::x86::{inl, inw, outb, outl, outw};
 use crate::nic::{Health, WatchdogResult};
 use crate::pci;
 use crate::pmem;
+use crate::println;
 
 const VENDOR_3COM: u16 = 0x10b7;
 const DEVICE_IDS: &[u16] = &[0x9050, 0x9051, 0x9054, 0x9055, 0x9058, 0x905a, 0x9200];
@@ -491,6 +492,30 @@ impl ThreeCom {
     /// bit 4 RxComplete, bit 10 UpComplete (a bus-master receive finished).
     pub fn raw_status(&self) -> u16 {
         read16(self.io_base, CMD_STATUS)
+    }
+
+    /// `nic regs`: status register and receive-ring state.
+    pub fn dump_registers(&self) {
+        let mut complete = 0u32;
+        for index in 0..RX_DESC_COUNT {
+            let descriptor = descriptor_ptr::<RxDescriptor>(self.descriptors, index);
+            if unsafe { read_volatile(&(*descriptor).status) } & RX_COMPLETE != 0 {
+                complete |= 1 << index;
+            }
+        }
+        println!(
+            "3C905 I/O 0x{:04x}: status {:04x} (window {}), interrupts {}",
+            self.io_base,
+            read16(self.io_base, CMD_STATUS),
+            read16(self.io_base, CMD_STATUS) >> 13,
+            if self.interrupts_enabled.get() { "on" } else { "off" }
+        );
+        println!(
+            "rx next {} (completed descriptors mask {complete:04x}), overflow {}, recoveries {}",
+            self.rx_next.get(),
+            self.overflow_count.get(),
+            self.recovery_count.get()
+        );
     }
 
     pub fn interrupt_stats(&self) -> (Option<u8>, u32, u32, bool) {

@@ -7,6 +7,7 @@
 //! Device IRQs only acknowledge a cause and make a foreground poll prompt;
 //! all descriptor and protocol parsing remains in foreground code.
 
+use crate::println;
 use crate::{e1000, e1000e, i350, interrupts, ne2000, pci, rtl8139, rtl8168, threecom};
 
 pub const MAX_FRAME_LEN: usize = 1514;
@@ -119,6 +120,15 @@ impl Nic {
             Nic::I350(nic) => nic.set_promiscuous(enabled),
             Nic::Ne2000(nic) => nic.set_promiscuous(enabled),
             Nic::Rtl8168(nic) => nic.set_promiscuous(enabled),
+        }
+    }
+
+    /// `nic regs`: a driver-specific register and ring dump, where implemented.
+    pub fn dump_registers(&self) {
+        match self {
+            Nic::Rtl8168(nic) => nic.dump_registers(),
+            Nic::ThreeCom(nic) => nic.dump_registers(),
+            _ => println!("{}: no register dump implemented for this driver.", self.driver_name()),
         }
     }
 

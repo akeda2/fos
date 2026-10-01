@@ -124,6 +124,19 @@ fn write_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
     write_u32(bus, device, function, offset, updated);
 }
 
+/// Reads one dword of configuration space for the shell's `pci read`. Raw and
+/// unfiltered: a debugging aid, not an interface any driver should use.
+pub fn config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    read_u32(bus, device, function, offset)
+}
+
+/// Writes one dword of configuration space for the shell's `pci write`. Like
+/// `config_read32` this is a debugging aid; a wrong write can disable a device
+/// or the chipset, and a reset is then the only way back.
+pub fn config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    write_u32(bus, device, function, offset, value);
+}
+
 /// The address of one PCI function, as found by `find_devices`. Enough to
 /// re-read its BARs or reconfigure its command register without walking
 /// the bus again.

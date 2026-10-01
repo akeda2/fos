@@ -595,6 +595,51 @@ impl Rtl8168 {
         true
     }
 
+    /// `nic regs`: the registers and ring state worth looking at when this card
+    /// misbehaves, so a symptom can be read from the shell instead of by pushing
+    /// a diagnostic kernel.
+    pub fn dump_registers(&self) {
+        let io = self.io_base;
+        println!(
+            "RTL8168 I/O 0x{io:04x}: CR={:02x} IMR={:04x} ISR={:04x} PHY={:02x} CPlus={:04x}",
+            read8(io, REG_CR),
+            read16(io, REG_IMR),
+            read16(io, REG_ISR),
+            read8(io, REG_PHYSTATUS),
+            read16(io, REG_CPLUSCMD)
+        );
+        println!(
+            "TxConfig={:08x} RxConfig={:08x} RMS={:04x}",
+            read32(io, REG_TXCONFIG),
+            read32(io, REG_RXCONFIG),
+            read16(io, REG_RMS)
+        );
+        let mut rx_card = 0u32;
+        for index in 0..RX_COUNT {
+            if read_opts1(self.rings, index) & DESC_OWN != 0 {
+                rx_card |= 1 << index;
+            }
+        }
+        let mut tx_card = 0u32;
+        for index in 0..TX_COUNT {
+            if read_opts1(self.rings + TX_RING_OFFSET, index) & DESC_OWN != 0 {
+                tx_card |= 1 << index;
+            }
+        }
+        println!(
+            "rx next {} (card owns mask {rx_card:04x}), tx next {} (card owns {tx_card:x})",
+            self.rx_next.get(),
+            self.tx_next.get()
+        );
+        println!(
+            "rx[next] opts1 {:08x}; overflows {}, recoveries {}, failures {}",
+            read_opts1(self.rings, self.rx_next.get()),
+            self.overflow_count.get(),
+            self.recovery_count.get(),
+            self.recovery_failures.get()
+        );
+    }
+
     pub fn overflow_count(&self) -> u32 {
         self.overflow_count.get()
     }

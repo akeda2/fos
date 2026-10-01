@@ -272,6 +272,26 @@ pub fn describe_address(address: u32) -> &'static str {
     }
 }
 
+/// Whether the kernel can read `address` without faulting: everything in the
+/// low 2 GiB identity map except the kernel-stack guard page, plus any high MMIO
+/// a driver registered with `map_mmio`. For the shell's `mmio` debugging command.
+pub fn is_readable(address: u32) -> bool {
+    !matches!(
+        describe_address(address),
+        "unmapped high physical or PCI MMIO range" | "kernel stack guard page"
+    )
+}
+
+/// Like `is_readable`, but also refuses kernel text and read-only data, which a
+/// supervisor write would fault on (CR0.WP is set).
+pub fn is_writable(address: u32) -> bool {
+    is_readable(address)
+        && !matches!(
+            describe_address(address),
+            "kernel text (read-only)" | "kernel read-only data"
+        )
+}
+
 /// Deliberately writes to kernel text for `make test-page-protection`.
 ///
 /// The test runs only after the IDT is live, so its expected supervisor-write

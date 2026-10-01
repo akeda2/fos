@@ -1893,6 +1893,17 @@ find the target machine:
   silently overflow its receive ring on a large tape sent from a fast,
   unpaced sender.
 
+### Register access from the shell (`pci read|write`, `io`, `mmio`, `nic regs`)
+
+Real-hardware-only bugs are found by reading registers, and each diagnostic
+kernel push costs minutes, so the shell can read them directly: `pci read B:D.F
+[OFFSET [LENGTH]]` and `pci write B:D.F OFFSET VALUE` for config space (MSI
+capabilities, interrupt routing), `io r8|r16|r32 PORT` / `io w... PORT VALUE`,
+`mmio r8|r16|r32 ADDR` / `mmio w... ADDR VALUE` (only mapped addresses --
+`paging::is_readable`/`is_writable` refuse the rest instead of faulting -- and
+never kernel text), and `nic regs [N]` (RTL8168 and 3C905 dumps; add one per
+driver as needed). `make test-hwaccess` checks them against known QEMU values.
+
 ### `tools/devloop.py`: the safe way to drive a real machine
 
 One wrapper (run it with `python3-netraw`) over `term_net.py`, `send_tape.py`

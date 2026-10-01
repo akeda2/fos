@@ -157,7 +157,10 @@ the real-mode code that printed it has no notion of that ring at all.
 | `memmap` | Prints the BIOS E820 memory-map entries, decoded (usable RAM, reserved, ACPI, bad memory). |
 | `memory` | Summarizes E820 usable and non-usable memory. |
 | `cpuinfo` | Shows the CPUID vendor and raw feature bitfields. |
-| `pci` | Dumps every PCI function found on the bus: location, vendor/device ID, class/subclass/prog-if, header type, and BAR0's raw value. Used to identify unmarked or unknown hardware (e.g. reading a NIC's real vendor/device ID) before adding driver support for it. |
+| `pci` | Dumps every PCI function found on the bus: location, vendor/device ID, class/subclass/prog-if, header type, BAR0's raw value, MSI capability, revision, subsystem ID, interrupt line/pin and the command/status registers. Used to identify unmarked or unknown hardware (e.g. reading a NIC's real vendor/device ID) before adding driver support for it, and to see whether a function is asserting its interrupt (status bit 3). |
+| `pci read B:D.F [OFFSET [LENGTH]]` / `pci write B:D.F OFFSET VALUE` | Dumps (default 64 bytes, at most 256) or writes one dword of a function's PCI configuration space; `B:D.F` is the hex location the `pci` listing shows, e.g. `03:00.0`. A debugging aid for finding interrupt routing or reading a capability without a diagnostic kernel; a wrong write can disable a device. |
+| `io r8\|r16\|r32 PORT` / `io w8\|w16\|w32 PORT VALUE` | Raw x86 port I/O, e.g. reading a card's registers from its I/O BAR (the base is in the `pci` dump). A wrong write can hang the machine. |
+| `mmio r8\|r16\|r32 ADDR` / `mmio w8\|w16\|w32 ADDR VALUE` | Volatile access to physical memory or a device register. Only mapped addresses are accepted (the low 2 GiB except the stack guard page, plus MMIO a driver registered, e.g. the local APIC at `0xfee00000`); writes also refuse kernel text. Accesses must be naturally aligned. |
 | `dmesg` | Replays the kernel log ring buffer: every byte any `println!`/`print!` has sent since boot, seeded with whatever real-mode boot narration (`stage1.S`/`stage2.S`, even BIOS's own pre-boot banner) was still on screen when the console first initialized. Reports how many older bytes have already been overwritten; the ring is only a few KiB, so run this early to catch the boot narration before busy use evicts it. |
 | `usb` | Finds every UHCI (USB 1.1) host controller on the bus, reports each one's I/O base/IRQ and whether it's running, and for each root port drives a full reset/enable and standard enumeration (device descriptor, configuration descriptor, `SET_CONFIGURATION`) against whatever full-speed device is attached. |
 | `usb play [diskN] NAME` | Streams a raw PCM file (already in the target device's exact negotiated format -- no resampling) to a discovered USB Audio Class playback device over a real isochronous OUT transfer. Press F12 to stop early. |
@@ -194,6 +197,7 @@ the real-mode code that printed it has no notion of that ring at all.
 | `print run CMD...` | Runs `CMD` and prints only its console output (not the command line itself) to the first detected LPT port — the intended way to get a one-off paper copy of something like `help` without leaving it permanently usable-by-habit inside a printer terminal session. |
 | `nic` | Reports the active supported PCI Ethernet controller and its MAC address; the first initialized interface is selected by default. |
 | `nic list` | Lists every initialized Ethernet interface, its driver, MAC address, and active marker. |
+| `nic regs [N]` | Dumps the selected (or Nth) interface's key registers and ring state, for the RTL8168 and 3C905 (others report that no dump exists). |
 | `nic use N` | Selects interface N from `nic list` for the shell and legacy single-interface tape callbacks. |
 | `nic send` | Transmits one raw broadcast Ethernet test frame. |
 | `nic recv` | Polls briefly for one incoming raw Ethernet frame and, if one arrives, hex-dumps it. |
