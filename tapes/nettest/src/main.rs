@@ -25,8 +25,8 @@ extern crate nettest_tape;
 
 use core::ptr::addr_of_mut;
 use nettest_tape::{
-    ArpInfo, Config, Direction, GEN_HEADER_LEN, Generator, MAX_FRAME, PRESETS, Rng, SLOT_BYTES,
-    Sink, Sweep, UdpPlan, build_arp, parse_arp, parse_ip, parse_mac, parse_permille, parse_u32, preset,
+    ArpInfo, Config, Direction, GEN_HEADER_LEN, Generator, HISTOGRAM_BOUNDS_US, MAX_FRAME, PRESETS,
+    Rng, SLOT_BYTES, Sink, Sweep, UdpPlan, build_arp, parse_arp, parse_ip, parse_mac, parse_permille, parse_u32, preset,
 };
 use tape_rt::{print_bytes, print_u32};
 
@@ -88,6 +88,12 @@ struct Session<'a> {
     rsink: Sink,
     rev_gateway: Option<[u8; 4]>,
     last_rev_arp_us: u64,
+    /// FOSFS write callback (for `save`), the file `gen.save=NAME` writes when a
+    /// test finishes, and when the end-of-test summary is due (0 = not pending).
+    fs_write: Option<extern "C" fn(u32, u32, u32, u32) -> u32>,
+    save_name: [u8; 16],
+    save_name_len: usize,
+    summary_due_us: u64,
     /// MACs of the generator's and the sink's NICs (the reverse stream addresses
     /// the other end of the pair by them).
     gen_mac: [u8; 6],
@@ -132,7 +138,7 @@ pub extern "C" fn tape_main(
     _terminal_position: extern "C" fn() -> u32,
     _fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
     _fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
-    _fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
+    fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
     _fs_remove: extern "C" fn(u32, u32) -> u32,
     _audio_sample_rate: extern "C" fn() -> u32,
     _audio_channels_and_bits: extern "C" fn() -> u32,
@@ -153,6 +159,7 @@ pub extern "C" fn tape_main(
 ) {
     tape_rt::set_wait_hook(wait_for_event);
     tape_rt::set_micros_hook(micros);
+    let fs_write_hook = fs_write;
     let nic_total = nic_count() as usize;
     if nic_total < 1 {
         print_bytes(putc, b"nettest needs at least one initialized NIC.\n");
@@ -197,6 +204,10 @@ pub extern "C" fn tape_main(
         last_rev_arp_us: 0,
         gen_mac: [0; 6],
         sink_mac: [0; 6],
+        fs_write: None,
+        save_name: [0; 16],
+        save_name_len: 0,
+        summary_due_us: 0,
         limiter: true,
         passes: 0,
         loop_started_us: 0,
@@ -285,6 +296,7 @@ pub extern "C" fn tape_main(
     }
     session.gen_mac = gen_mac;
     session.sink_mac = sink_mac;
+    session.fs_write = Some(fs_write_hook);
     if !session.destination_explicit {
         session.generator.destination = if session.sink_nic.is_some() { sink_mac } else { [0xff; 6] };
     }
@@ -474,10 +486,25 @@ pub extern "C" fn tape_main(
             if generator_was_running && !session.generator.running {
                 print_bytes(putc, b"\ngenerator finished: ");
                 print_gen_line(putc, &session);
+                // Give the last frames a moment to arrive, then summarize.
+                session.summary_due_us = now_us + 1_000_000;
                 print_bytes(putc, b"nettest> ");
                 print_bytes(putc, &line[..line_length]);
             }
             generator_was_running = session.generator.running;
+        }
+
+        if session.summary_due_us != 0 && now_us >= session.summary_due_us {
+            session.summary_due_us = 0;
+            print_bytes(putc, b"\n");
+            print_summary(putc, &session);
+            if session.save_name_len != 0 {
+                let name = session.save_name;
+                let length = session.save_name_len;
+                save_report(putc, &session, &name[..length]);
+            }
+            print_bytes(putc, b"nettest> ");
+            print_bytes(putc, &line[..line_length]);
         }
 
         // Keys: once per pass when idle, but at most once a millisecond while
@@ -812,6 +839,14 @@ fn gen_setting(session: &mut Session<'_>, setting: &[u8], value: &[u8]) -> bool 
         b"count" => parse_u32(value).map(|count| generator.count_limit = count).is_some(),
         b"time" => parse_u32(value).map(|seconds| generator.seconds_limit = seconds).is_some(),
         b"delay" => parse_u32(value).map(|seconds| session.gen_delay_s = seconds).is_some(),
+        b"save" => {
+            if !valid_file_name(value) {
+                return false;
+            }
+            session.save_name[..value.len()].copy_from_slice(value);
+            session.save_name_len = value.len();
+            true
+        }
         b"sweep" => {
             // START:END:STEP:SECONDS, all numbers (kbit/s, kbit/s, kbit/s, s).
             let mut numbers = [0u32; 4];
@@ -966,6 +1001,15 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
             Some(b"off") if count == 2 => view_stop(putc, session),
             _ => print_bytes(putc, b"use: view on | view off\n"),
         },
+        b"summary" => print_summary(putc, session),
+        b"save" => {
+            let name = words.get(1).copied().unwrap_or(b"");
+            if !valid_file_name(name) {
+                print_bytes(putc, b"use: save NAME (up to 16 of a-z 0-9 . _ -)\n");
+                return Outcome::Error;
+            }
+            save_report(putc, session, name);
+        }
         b"clock" => {
             // Diagnostic: how fine and how steady is the microsecond clock?
             let mut previous = tape_rt::micros();
@@ -1003,6 +1047,7 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
                 print_sink_line(putc, session);
             }
             None | Some(b"show") => print_sink_line(putc, session),
+            Some(b"hist") => print_histogram(putc, &session.sink.stats, b"forward"),
             _ => {
                 print_bytes(putc, b"use: sink [show|reset]\n");
                 return Outcome::Error;
@@ -1268,7 +1313,8 @@ fn print_help(putc: Putc) {
           gen bidir on|off             also send a stream back, sink NIC -> gen NIC\n\
           gen to MAC|sink | count N | time S    destination; stop after N / S\n\
           gen ip|dst|gw A.B.C.D | port N   send routable UDP/IP (ARP for the gateway)\n\
-          sink [show|reset]            the receiver (needs sink=N): loss, latency\n\
+          sink [show|hist|reset]       the receiver (needs sink=N): loss, latency\n\
+          summary | save NAME          end-of-test summary; write a report file\n\
           sink ip A.B.C.D | port N     also accept UDP/IP; answer ARP for the address\n\
           quit                         stop (Escape also stops)\n",
     );
@@ -1343,6 +1389,170 @@ fn print_config_line(putc: Putc, index: usize, config: &Config) {
     }
     print_bytes(putc, b"  queue ");
     print_u32(putc, config.queue_limit);
+}
+
+fn valid_file_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= 16
+        && name
+            .iter()
+            .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+}
+
+/// `<N` for a bucket bound, `>5000000` for the open-ended one.
+fn print_bound(putc: Putc, bound: u32) {
+    if bound == u32::MAX {
+        print_bytes(putc, b">5000000");
+    } else {
+        putc(u32::from(b'<'));
+        print_u32(putc, bound);
+    }
+}
+
+fn print_latency_percentiles(putc: Putc, stats: &nettest_tape::SinkStats) {
+    print_bytes(putc, b"  latency us: median ");
+    print_bound(putc, stats.latency_percentile(500));
+    print_bytes(putc, b", 95% ");
+    print_bound(putc, stats.latency_percentile(950));
+    print_bytes(putc, b", 99% ");
+    print_bound(putc, stats.latency_percentile(990));
+    print_bytes(putc, b", max ");
+    print_u32(putc, stats.latency_max);
+    print_bytes(putc, b", jitter ");
+    print_u32(putc, stats.jitter);
+    putc(u32::from(b'\n'));
+}
+
+/// The end-of-test summary: what was sent, what arrived, loss and latency.
+fn print_summary(putc: Putc, session: &Session<'_>) {
+    print_bytes(putc, b"summary: sent ");
+    print_u32(putc, session.generator.stats.sent);
+    summarize_sink(putc, &session.sink, b"got ");
+    print_latency_percentiles(putc, &session.sink.stats);
+    if session.bidir {
+        print_bytes(putc, b"reverse: sent ");
+        print_u32(putc, session.rgen.stats.sent);
+        summarize_sink(putc, &session.rsink, b"got ");
+        print_latency_percentiles(putc, &session.rsink.stats);
+    }
+}
+
+/// `, got N (K kbit/s over S.S s), loss P%` and a newline.
+fn summarize_sink(putc: Putc, sink: &Sink, label: &[u8]) {
+    let stats = &sink.stats;
+    print_bytes(putc, b", ");
+    print_bytes(putc, label);
+    print_u32(putc, stats.received);
+    print_bytes(putc, b" (");
+    print_u32(putc, sink.average_kbit() as u32);
+    print_bytes(putc, b" kbit/s over ");
+    let span_ms = (stats.last_us.saturating_sub(stats.first_us) / 100_000) as u32; // tenths of a second
+    print_u32(putc, span_ms / 10);
+    putc(u32::from(b'.'));
+    print_u32(putc, span_ms % 10);
+    print_bytes(putc, b" s), loss ");
+    let expected = stats.received.saturating_add(stats.lost).max(1);
+    print_hundredths(putc, ((u64::from(stats.lost) * 10_000) / u64::from(expected)) as u32);
+    print_bytes(putc, b"%\n");
+}
+
+/// Bars for the non-empty buckets of a latency histogram.
+fn print_histogram(putc: Putc, stats: &nettest_tape::SinkStats, label: &[u8]) {
+    print_bytes(putc, label);
+    print_bytes(putc, b" latency histogram (us):\n");
+    let largest = stats.histogram.iter().copied().max().unwrap_or(0).max(1);
+    for (index, &count) in stats.histogram.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        print_bytes(putc, b"  ");
+        let bound = HISTOGRAM_BOUNDS_US.get(index).copied().unwrap_or(u32::MAX);
+        let mut text = [b' '; 9];
+        let mut writer = [0u8; 9];
+        let digits = format_bound(bound, &mut writer);
+        text[9 - digits..].copy_from_slice(&writer[..digits]);
+        print_bytes(putc, &text);
+        putc(u32::from(b' '));
+        print_u32(putc, count);
+        putc(u32::from(b' '));
+        let bar = ((u64::from(count) * 40).div_ceil(u64::from(largest))) as usize;
+        for _ in 0..bar {
+            putc(u32::from(b'#'));
+        }
+        putc(u32::from(b'\n'));
+    }
+}
+
+/// Writes `<N` / `>5000000` right-aligned material into `out`; returns its length.
+fn format_bound(bound: u32, out: &mut [u8; 9]) -> usize {
+    if bound == u32::MAX {
+        out[..8].copy_from_slice(b">5000000");
+        return 8;
+    }
+    let mut digits = [0u8; 8];
+    let mut count = 0;
+    let mut value = bound;
+    while value > 0 {
+        digits[count] = b'0' + (value % 10) as u8;
+        value /= 10;
+        count += 1;
+    }
+    out[0] = b'<';
+    for index in 0..count {
+        out[1 + index] = digits[count - 1 - index];
+    }
+    1 + count
+}
+
+/// Report text is captured here so `save` can hand it to the filesystem in one
+/// piece: the same print functions run, but with `capture` as their `putc`.
+static mut REPORT: [u8; 3072] = [0; 3072];
+static mut REPORT_LENGTH: usize = 0;
+
+extern "C" fn capture(byte: u32) {
+    unsafe {
+        let report = &mut *addr_of_mut!(REPORT);
+        if REPORT_LENGTH < report.len() {
+            report[REPORT_LENGTH] = byte as u8;
+            REPORT_LENGTH += 1;
+        }
+    }
+}
+
+/// Writes the settings, summary, counters and latency histogram to FOSFS file
+/// `name` (replacing it), so a run leaves its numbers behind.
+fn save_report(putc: Putc, session: &Session<'_>, name: &[u8]) {
+    let Some(write) = session.fs_write else {
+        print_bytes(putc, b"no file system access\n");
+        return;
+    };
+    unsafe { REPORT_LENGTH = 0 };
+    print_bytes(capture, b"nettest report\n");
+    show(capture, session);
+    print_summary(capture, session);
+    print_stats(capture, session);
+    print_histogram(capture, &session.sink.stats, b"forward");
+    if session.bidir {
+        print_histogram(capture, &session.rsink.stats, b"reverse");
+    }
+    let length = unsafe { REPORT_LENGTH };
+    let status = write(
+        name.as_ptr() as u32,
+        name.len() as u32,
+        addr_of_mut!(REPORT) as u32,
+        length as u32,
+    );
+    if status == 0 {
+        print_bytes(putc, b"saved ");
+        print_u32(putc, length as u32);
+        print_bytes(putc, b" bytes to ");
+        print_bytes(putc, name);
+        putc(u32::from(b'\n'));
+    } else {
+        print_bytes(putc, b"could not write the report (status ");
+        print_u32(putc, status);
+        print_bytes(putc, b")\n");
+    }
 }
 
 /// The reverse stream's two lines, when bidirectional.

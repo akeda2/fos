@@ -735,6 +735,38 @@ pub struct SinkStats {
     pub last_us: u64,
     /// Largest latency since the last `Sink::mark_interval` (a sweep step).
     pub interval_latency_max: u32,
+    /// Latency histogram: `histogram[i]` counts frames whose one-way latency was
+    /// below `HISTOGRAM_BOUNDS_US[i]` (and not below the previous bound); the
+    /// last bucket takes everything slower.
+    pub histogram: [u32; HISTOGRAM_BUCKETS],
+}
+
+/// Upper bounds (exclusive, microseconds) of the latency histogram's buckets.
+pub const HISTOGRAM_BOUNDS_US: [u32; 23] = [
+    50, 100, 200, 300, 500, 750, 1_000, 1_500, 2_000, 3_000, 5_000, 7_500, 10_000, 15_000, 20_000,
+    30_000, 50_000, 75_000, 100_000, 200_000, 500_000, 1_000_000, 5_000_000,
+];
+pub const HISTOGRAM_BUCKETS: usize = HISTOGRAM_BOUNDS_US.len() + 1;
+
+impl SinkStats {
+    /// Upper bound of the bucket holding the `permille`-th thousandth of the
+    /// frames (500 = median, 990 = 99th percentile); `u32::MAX` if that falls in
+    /// the open-ended last bucket, 0 with no frames.
+    pub fn latency_percentile(&self, permille: u32) -> u32 {
+        let total: u64 = self.histogram.iter().map(|&count| u64::from(count)).sum();
+        if total == 0 {
+            return 0;
+        }
+        let target = (total * u64::from(permille)).div_ceil(1000).max(1);
+        let mut seen = 0u64;
+        for (index, &count) in self.histogram.iter().enumerate() {
+            seen += u64::from(count);
+            if seen >= target {
+                return HISTOGRAM_BOUNDS_US.get(index).copied().unwrap_or(u32::MAX);
+            }
+        }
+        u32::MAX
+    }
 }
 
 /// Checks generated frames off: counts, loss, duplicates, reordering, latency.
@@ -759,6 +791,7 @@ impl Sink {
                 received: 0, bytes: 0, lost: 0, duplicated: 0, reordered: 0, latency_min: 0,
                 latency_max: 0, latency_sum: 0, jitter: 0, first_us: 0, last_us: 0,
                 interval_latency_max: 0,
+                histogram: [0; HISTOGRAM_BUCKETS],
             },
             expected: 0,
             window: 0,
@@ -816,6 +849,8 @@ impl Sink {
         stats.latency_min = stats.latency_min.min(latency);
         stats.latency_max = stats.latency_max.max(latency);
         stats.interval_latency_max = stats.interval_latency_max.max(latency);
+        let bucket = HISTOGRAM_BOUNDS_US.iter().position(|&bound| latency < bound).unwrap_or(HISTOGRAM_BOUNDS_US.len());
+        stats.histogram[bucket] += 1;
         stats.latency_sum += u64::from(latency);
         let delta = latency.abs_diff(self.previous_latency);
         stats.jitter = (stats.jitter as i64 + (i64::from(delta) - i64::from(stats.jitter)) / 16) as u32;
@@ -1410,6 +1445,28 @@ mod tests {
         assert!(third.last);
         assert_eq!(third.offered_kbit, 3000);
         assert!(!generator.running && !sweep.active);
+    }
+
+    #[test]
+    fn the_latency_histogram_gives_percentiles() {
+        let mut stats = SinkStats::default();
+        // 90 frames under 100 us, 9 under 1 ms, 1 under 10 ms.
+        stats.histogram[1] = 90;
+        stats.histogram[6] = 9;
+        stats.histogram[12] = 1;
+        assert_eq!(stats.latency_percentile(500), 100);
+        assert_eq!(stats.latency_percentile(950), 1_000);
+        assert_eq!(stats.latency_percentile(999), 10_000);
+        assert_eq!(SinkStats::default().latency_percentile(500), 0);
+        let mut sink = Sink::new();
+        let mut generator = Generator::new();
+        generator.rate_kbit = 100_000_000;
+        generator.size = 100;
+        generator.start(0);
+        let mut buffer = [0u8; 200];
+        let length = generator.next_frame(100, [2; 6], &mut buffer, 0).unwrap();
+        sink.on_frame(&buffer[..length], 100 + 150); // 150 us in flight
+        assert_eq!(sink.stats.histogram[2], 1, "150 us falls in the 100..200 bucket");
     }
 
     #[test]

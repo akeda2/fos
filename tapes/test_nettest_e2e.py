@@ -390,10 +390,17 @@ def main():
                 guest.pump(0.5)
                 check("NIC watchdog" not in guest.text(), f"{model}: no adapter reset under a full-speed burst", guest)
             # Whatever happened, the link must carry traffic again afterwards.
-            time.sleep(1.5)
-            seg_b.drain()
-            burst(seg_a, 5, HOST_B, HOST_A, first=5000)
-            check(len(seg_b.drain(1.0)) >= 4, f"{model}: still forwarding after the burst", guest)
+            # Whatever happened, the link must carry traffic again afterwards (the
+            # small-buffer cards reset themselves, which can take a few seconds).
+            resumed = False
+            for attempt in range(5):
+                time.sleep(1.5)
+                seg_b.drain()
+                burst(seg_a, 5, HOST_B, HOST_A, first=5000 + attempt * 10)
+                if len(seg_b.drain(1.0)) >= 4:
+                    resumed = True
+                    break
+            check(resumed, f"{model}: still forwarding after the burst", guest)
             if model == "e1000":
                 command(guest, seg_a, "quit", b"fos> ")
                 health = command(guest, seg_a, "nic list", b"fos> ")

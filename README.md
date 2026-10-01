@@ -1173,6 +1173,15 @@ and limits as the forward stream; in UDP mode the reverse stream goes from
 `sink.ip` to `gen.ip`, via `rev.gw=ADDR` if it has to cross a router). `stats`
 and the panel show a `rev` section next to the forward counters.
 
+**Results.** When a timed or counted test finishes, the tape waits a second for the
+last frames and prints a summary by itself -- frames sent and received, average
+rate and duration, loss, and the median / 95% / 99% latency (from a 24-bucket
+histogram, so those are bucket bounds) with the maximum and the jitter. `summary`
+repeats it, `sink hist` draws the histogram as bars, and `save NAME` (or
+`gen.save=NAME` to do it automatically at the end of every test) writes the
+settings, summary, counters and histograms to a FOSFS file; read it back with
+`cat NAME`.
+
 The sink reports frames received, average and current
 throughput, loss (from sequence gaps), duplicates, reordering, and one-way
 latency (min/avg/max and RFC 3550 jitter) -- exact when generator and sink share

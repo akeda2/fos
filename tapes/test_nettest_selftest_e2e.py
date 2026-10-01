@@ -104,7 +104,10 @@ def run_scenario(lab, arguments, seconds, sink_nic=4):
     lab.process.stdin.flush()
     lab.wait_for(b"nettest> ", mark, 30)
     lab.wait_for(b"generator finished", mark, seconds + 30)
-    lab.pump(1.0)  # let the last frames drain through the link
+    lab.wait_for(b"summary:", mark, 20)  # printed a second after the generator stops
+    if "gen.save=" in arguments:
+        lab.wait_for(b"bytes to ", mark, 20)
+    lab.pump(0.5)
     lab.sendkey("f12")
     lab.wait_for(b"fos> ", mark, 30)
     text = lab.text(mark)
@@ -122,6 +125,7 @@ def run_scenario(lab, arguments, seconds, sink_nic=4):
     if reverse:
         result["rev"] = dict(zip(("sent", "failed", "rx", "avg_kbit", "lost", "dup", "reord"),
                                  (int(v) for v in reverse.groups())))
+    result["output"] = text
     result["sweep"] = [
         tuple(float(v) for v in step)
         for step in re.findall(r"sweep (\d+) kbit: sent (\d+) rx (\d+) loss ([\d.]+)% got (\d+) kbit lat (\d+)/(\d+) us", text)
@@ -140,11 +144,16 @@ def main():
     lab = Lab()
     try:
         # A clean link: everything arrives, at about the rate it was sent.
-        result = run_scenario(lab, base + "gen.rate=8000", 4)
+        result = run_scenario(lab, base + "gen.rate=8000 gen.save=report1", 4)
         check(result["lost"] == 0 and result["rx"] == result["sent"] - 0 or abs(result["rx"] - result["sent"]) <= 2,
               f"clean link: {result['rx']} of {result['sent']} frames arrived", result)
         check(7200 <= result["avg_kbit"] <= 8800, f"clean link: sink measured {result['avg_kbit']} kbit/s for 8000 sent", result)
         check(result["lat_avg"] < 20_000, f"clean link: latency {result['lat_avg']} us", result)
+        report = lab.shell("cat report1")
+        check("nettest report" in report and "summary: sent" in report and "latency histogram (us):" in report,
+              "gen.save=report1 left a report file with settings, summary and histogram", report)
+        check("summary: sent" in result["output"] and "latency us: median" in result["output"],
+              "the end-of-test summary is printed by itself", result)
     finally:
         lab.stop()
 
