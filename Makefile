@@ -70,7 +70,7 @@ EXTRA_FOSFS_FILES ?=
 # directory before invoking cargo.
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-idle-cpu test-hwaccess test-release-loops test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-idle-cpu test-hwaccess test-release-loops test-msi test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-router test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -103,6 +103,7 @@ help:
 	@echo "  make test-start - verify an optional FOSFS start boot-command script"
 	@echo "  make test-scripts-settings - verify bare-name script/tape dispatch and the settings file"
 	@echo "  make test-release-loops - verify blocking commands can be ended from a term net session"
+	@echo "  make test-msi - verify NIC MSI (e1000e under QEMU): self-test, traffic, and the no-msi fallback"
 	@echo "  make test-hwaccess - verify the pci read/write, io and mmio register-access commands"
 	@echo "  make test-idle-cpu - verify network-waiting loops sleep instead of pinning the CPU"
 	@echo "  make test-second-disk - verify the diskN selector on a second, non-boot disk"
@@ -193,6 +194,7 @@ test: image
 	python3 tools/qemu_smoke.py --image $(IMAGE) --second-disk
 	python3 tools/test_vga_modes.py --image $(IMAGE)
 	python3 tools/test_hwaccess_e2e.py
+	python3 tools/test_msi_e2e.py
 
 test-unsafe-memory: image-unsafe-memory
 	python3 tools/qemu_smoke.py --image $(UNSAFE_MEMORY_IMAGE) --legacy-unsafe-memory
@@ -218,6 +220,9 @@ test-scripts-settings: image
 
 test-release-loops: image
 	python3 tools/test_release_loops_e2e.py
+
+test-msi: image
+	python3 tools/test_msi_e2e.py
 
 test-hwaccess: image
 	python3 tools/test_hwaccess_e2e.py

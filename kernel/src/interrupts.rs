@@ -306,6 +306,24 @@ pub fn register_msi_irq(vector: u8, handler: IrqHandler) -> bool {
     true
 }
 
+/// Frees an MSI vector claimed with `allocate_msi_vector`/`register_msi_irq`,
+/// e.g. after a device's MSI self-test failed and it fell back to a legacy IRQ.
+pub fn unregister_msi_irq(vector: u8) {
+    if vector >= MSI_VECTOR_BASE && vector < MSI_VECTOR_BASE + MSI_VECTOR_COUNT as u8 {
+        unsafe { MSI_HANDLERS[usize::from(vector - MSI_VECTOR_BASE)] = None };
+    }
+}
+
+/// Whether a handler is registered for this MSI vector (for `irqstat`).
+pub fn msi_irq_registered(vector: u8) -> bool {
+    vector >= MSI_VECTOR_BASE
+        && vector < MSI_VECTOR_BASE + MSI_VECTOR_COUNT as u8
+        && unsafe { MSI_HANDLERS[usize::from(vector - MSI_VECTOR_BASE)] }.is_some()
+}
+
+pub const MSI_FIRST_VECTOR: u8 = MSI_VECTOR_BASE;
+pub const MSI_VECTORS: u8 = MSI_VECTOR_COUNT as u8;
+
 pub fn msi_irq_count(vector: u8) -> u64 {
     if vector < MSI_VECTOR_BASE || vector >= MSI_VECTOR_BASE + MSI_VECTOR_COUNT as u8 {
         return 0;

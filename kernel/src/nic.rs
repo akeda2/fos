@@ -8,7 +8,7 @@
 //! all descriptor and protocol parsing remains in foreground code.
 
 use crate::println;
-use crate::{e1000, e1000e, i350, interrupts, ne2000, pci, rtl8139, rtl8168, threecom};
+use crate::{e1000, e1000e, i350, interrupts, lapic, ne2000, pci, rtl8139, rtl8168, threecom};
 
 pub const MAX_FRAME_LEN: usize = 1514;
 const MAX_NICS: usize = pci::MAX_DEVICE_MATCHES * 4;
@@ -218,8 +218,50 @@ impl Nic {
         }
     }
 
+    /// Whether this NIC is the source of legacy IRQ line `irq` or MSI vector
+    /// `irq` (the two ranges never overlap: lines are 0-15, vectors 0x50+). A
+    /// NIC running on MSI no longer answers its legacy line.
     fn handles_irq(&self, irq: u8) -> bool {
-        self.interrupt_stats().irq == Some(irq)
+        match self.msi_vector() {
+            Some(vector) => vector == irq,
+            None => self.interrupt_stats().irq == Some(irq),
+        }
+    }
+
+    /// The PCI location of NICs that can use MSI (the RTL8168 and e1000e,
+    /// the two backends with an MSI-capable QEMU model or real-hardware test).
+    pub fn pci_address(&self) -> Option<pci::PciAddress> {
+        match self {
+            Nic::Rtl8168(nic) => nic.pci_address(),
+            Nic::E1000E(nic) => nic.pci_address(),
+            _ => None,
+        }
+    }
+
+    /// The MSI vector this NIC is using, or `None` while it uses its legacy IRQ.
+    pub fn msi_vector(&self) -> Option<u8> {
+        match self {
+            Nic::Rtl8168(nic) => nic.msi_vector(),
+            Nic::E1000E(nic) => nic.msi_vector(),
+            _ => None,
+        }
+    }
+
+    fn set_msi_vector(&self, vector: Option<u8>) {
+        match self {
+            Nic::Rtl8168(nic) => nic.set_msi_vector(vector),
+            Nic::E1000E(nic) => nic.set_msi_vector(vector),
+            _ => {}
+        }
+    }
+
+    /// Makes the NIC raise one interrupt on demand, for the MSI self-test.
+    fn trigger_test_interrupt(&self) {
+        match self {
+            Nic::Rtl8168(nic) => nic.trigger_test_interrupt(),
+            Nic::E1000E(nic) => nic.trigger_test_interrupt(),
+            _ => {}
+        }
     }
 
     fn handle_interrupt(&self) {
@@ -384,6 +426,9 @@ pub fn initialize() -> Result<usize, Status> {
             for index in 0..NIC_COUNT {
                 let nic = NICS[index].as_ref().unwrap();
                 let mut driven = false;
+                if try_enable_msi(nic) {
+                    continue; // on MSI: interrupt-driven (the self-test proved it)
+                }
                 if let Some(irq) = nic.interrupt_stats().irq {
                     if interrupts::register_pci_irq(irq, handle_pci_irq) {
                         nic.enable_interrupts();
@@ -396,6 +441,81 @@ pub fn initialize() -> Result<usize, Status> {
             Ok(NIC_COUNT)
         }
     }
+}
+
+/// Set by the `settings` file's `no-msi` option, read when the NICs are brought
+/// up (settings are loaded first): every NIC then stays on its legacy IRQ.
+static mut MSI_DISABLED: bool = false;
+
+pub fn set_msi_disabled(disabled: bool) {
+    unsafe { MSI_DISABLED = disabled };
+}
+
+/// How long the MSI self-test waits for its forced interrupt, in 100 Hz ticks.
+const MSI_SELFTEST_TICKS: u64 = 3;
+
+/// Moves a NIC from its legacy IRQ line to Message Signaled Interrupts if the
+/// device and the platform allow it, and *proves* it works before committing.
+///
+/// MSI needs the local APIC, a free vector, an MSI capability on the device --
+/// and a chipset that actually delivers the write. That last part cannot be
+/// read from any register: some boards (nForce/HyperTransport ones in
+/// particular) need an extra "MSI mapping" bit before a device's message
+/// reaches the CPU, and without it the NIC would simply go silent. So this
+/// enables MSI, has the NIC force an interrupt on itself, and waits a few ticks
+/// for the message to arrive; if it does not, MSI is switched off again and the
+/// caller falls back to the legacy line, exactly as Linux's e1000e does
+/// (`e1000_test_msi`). Returns whether the NIC is now running on MSI.
+fn try_enable_msi(nic: &Nic) -> bool {
+    let Some(address) = nic.pci_address() else {
+        return false; // this backend has no MSI support wired up
+    };
+    if unsafe { MSI_DISABLED } {
+        println!("{}: MSI disabled by the settings file; using its legacy IRQ.", nic.driver_name());
+        return false;
+    }
+    if !lapic::is_available() {
+        println!("{}: no local APIC, so no MSI; using its legacy IRQ.", nic.driver_name());
+        return false;
+    }
+    let Some(vector) = interrupts::allocate_msi_vector() else {
+        println!("{}: no free MSI vector; using its legacy IRQ.", nic.driver_name());
+        return false;
+    };
+    if address.enable_msi(vector, lapic::id()).is_none() {
+        println!("{}: no MSI capability; using its legacy IRQ.", nic.driver_name());
+        return false;
+    }
+    interrupts::register_msi_irq(vector, handle_pci_irq);
+    nic.set_msi_vector(Some(vector));
+    nic.enable_interrupts();
+
+    let before = interrupts::msi_irq_count(vector);
+    nic.trigger_test_interrupt();
+    let started = interrupts::ticks();
+    while interrupts::msi_irq_count(vector) == before
+        && interrupts::ticks().wrapping_sub(started) < MSI_SELFTEST_TICKS
+    {
+        core::hint::spin_loop();
+    }
+    if interrupts::msi_irq_count(vector) != before {
+        println!(
+            "{}: MSI vector 0x{vector:02x} enabled (the self-test message arrived).",
+            nic.driver_name()
+        );
+        return true;
+    }
+
+    // The message never arrived: undo everything and let the caller use INTx.
+    println!(
+        "{}: MSI self-test message did not arrive within {} ticks; using its legacy IRQ.",
+        nic.driver_name(),
+        MSI_SELFTEST_TICKS
+    );
+    nic.set_msi_vector(None);
+    interrupts::unregister_msi_irq(vector);
+    let _ = address.disable_msi();
+    false
 }
 
 /// Shared legacy IRQs are normal. Each matching backend only reads and
@@ -461,7 +581,7 @@ pub fn all_rx_interrupt_driven() -> bool {
             }
             // The storm guard masked this NIC's IRQ line: no interrupt will
             // ever wake a sleeping loop for it.
-            if stats.irq.is_some_and(interrupts::pci_irq_storm_masked) {
+            if nic.msi_vector().is_none() && stats.irq.is_some_and(interrupts::pci_irq_storm_masked) {
                 return false;
             }
         }

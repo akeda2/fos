@@ -92,6 +92,7 @@ const CR_RST: u8 = 0x10; // Software reset; the card clears it when done.
 const CR_RE: u8 = 0x08; // Receiver enable.
 const CR_TE: u8 = 0x04; // Transmitter enable.
 const TPPOLL_NPQ: u8 = 0x40; // Poll the normal-priority transmit queue.
+const TPPOLL_FSWINT: u8 = 0x01; // Forced software interrupt (raises `ISR_SWINT`).
 const CFG9346_UNLOCK: u8 = 0xc0; // Allow writes to the config registers.
 const CFG9346_LOCK: u8 = 0x00;
 
@@ -100,11 +101,15 @@ const ISR_ROK: u16 = 0x0001; // Frame received.
 const ISR_RER: u16 = 0x0002; // Receive error.
 const ISR_RDU: u16 = 0x0010; // Receive descriptor unavailable (overflow).
 const ISR_LINKCHG: u16 = 0x0020; // PHY link changed.
+const ISR_SWINT: u16 = 0x0100; // Software interrupt, raised on demand via `TPPOLL_FSWINT`.
 const ISR_FOVW: u16 = 0x0040; // Receive FIFO overflow.
 const ISR_SYSERR: u16 = 0x8000; // PCI system error.
 /// Everything the handler wants to hear about. Transmit completions are
 /// polled in `send`, so no transmit interrupt is enabled.
-const INTERRUPT_MASK: u16 = ISR_ROK | ISR_RER | ISR_RDU | ISR_LINKCHG | ISR_FOVW | ISR_SYSERR;
+/// `ISR_SWINT` is included so the MSI self-test can force an interrupt; it only
+/// ever fires when `trigger_test_interrupt` asks for it.
+const INTERRUPT_MASK: u16 =
+    ISR_ROK | ISR_RER | ISR_RDU | ISR_LINKCHG | ISR_FOVW | ISR_SYSERR | ISR_SWINT;
 /// Causes that mean the receiver may be wedged and want a full reset.
 const FATAL_MASK: u16 = ISR_RDU | ISR_FOVW | ISR_SYSERR;
 
@@ -226,6 +231,7 @@ pub struct ProbeInfo {
     irq: Option<u8>,
     device_id: u16,
     revision: u8,
+    address: Option<pci::PciAddress>,
 }
 
 pub struct Rtl8168 {
@@ -247,6 +253,10 @@ pub struct Rtl8168 {
     recovery_pending: AtomicBool,
     promiscuous: Cell<bool>,
     irq: Option<u8>,
+    /// Where this card sits on the PCI bus, for `nic.rs` to program its MSI
+    /// capability, and the MSI vector in use once that succeeds (`None` = legacy).
+    pci: Cell<Option<pci::PciAddress>>,
+    msi_vector: Cell<Option<u8>>,
     interrupt_count: AtomicU32,
     interrupt_errors: AtomicU32,
     work_pending: AtomicBool,
@@ -292,6 +302,7 @@ impl Rtl8168 {
                     irq: address.interrupt_line(),
                     device_id: address.device_id(),
                     revision: address.revision(),
+                    address: Some(*address),
                 };
                 count += 1;
             }
@@ -348,6 +359,8 @@ impl Rtl8168 {
             recovery_pending: AtomicBool::new(false),
             promiscuous: Cell::new(false),
             irq: info.irq,
+            pci: Cell::new(info.address),
+            msi_vector: Cell::new(None),
             interrupt_count: AtomicU32::new(0),
             interrupt_errors: AtomicU32::new(0),
             work_pending: AtomicBool::new(false),
@@ -666,6 +679,25 @@ impl Rtl8168 {
         }
     }
 
+    pub fn pci_address(&self) -> Option<pci::PciAddress> {
+        self.pci.get()
+    }
+
+    pub fn msi_vector(&self) -> Option<u8> {
+        self.msi_vector.get()
+    }
+
+    pub fn set_msi_vector(&self, vector: Option<u8>) {
+        self.msi_vector.set(vector);
+    }
+
+    /// Forces one interrupt so `nic.rs` can check that an MSI message really
+    /// arrives: `TxPoll` bit 0 raises `ISR_SWINT` (enabled in `INTERRUPT_MASK`),
+    /// which `handle_interrupt` counts and acknowledges like any other cause.
+    pub fn trigger_test_interrupt(&self) {
+        write8(self.io_base, REG_TPPOLL, TPPOLL_FSWINT);
+    }
+
     pub fn enable_interrupts(&self) {
         write16(self.io_base, REG_ISR, 0xffff);
         write16(self.io_base, REG_IMR, INTERRUPT_MASK);
@@ -731,6 +763,7 @@ pub fn initialize_all() -> Result<usize, Status> {
                     irq: None,
                     device_id: 0,
                     revision: 0,
+                    address: None,
                 }
             }; MAX_INSTANCES];
             let found = Rtl8168::probe_all(&mut probe_info);

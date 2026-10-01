@@ -108,8 +108,7 @@
 //! hardware timing hazard to expose either one.
 //!
 //! Still deliberately out of scope, consistent with every other NIC
-//! backend here: MSI (82579 supports it, but this driver only ever uses
-//! the legacy PCI IRQ path, matching `e1000.rs`/`i350.rs`), the "driver
+//! backend here: the "driver
 //! loaded" `CTRL_EXT` handshake with the Management Engine, K1/EEE/ULP
 //! link-power workarounds, and any flash/NVM write access (the MAC
 //! address is only ever read from `RAL0`/`RAH0`, already loaded by
@@ -152,6 +151,7 @@ const REG_CTRL: u32 = 0x0000;
 const REG_STATUS: u32 = 0x0008;
 const REG_EECD: u32 = 0x0010;
 const REG_ICR: u32 = 0x00c0;
+const REG_ICS: u32 = 0x00c8; // Interrupt Cause Set: writing a bit raises that cause.
 const REG_IMS: u32 = 0x00d0;
 const REG_IMC: u32 = 0x00d8;
 const REG_RCTL: u32 = 0x0100;
@@ -421,6 +421,10 @@ pub struct E1000E {
     recovery_pending: AtomicBool,
     promiscuous: Cell<bool>,
     irq: Option<u8>,
+    /// PCI location, for `nic.rs` to program the MSI capability, and the MSI
+    /// vector in use once that succeeds (`None` = the legacy IRQ).
+    pci: Cell<Option<pci::PciAddress>>,
+    msi_vector: Cell<Option<u8>>,
     interrupt_count: AtomicU32,
     interrupt_errors: AtomicU32,
     work_pending: AtomicBool,
@@ -460,6 +464,7 @@ impl E1000E {
                 out[count] = ProbeInfo {
                     mmio_base,
                     irq: address.interrupt_line(),
+                    address: Some(*address),
                 };
                 count += 1;
             }
@@ -499,6 +504,8 @@ impl E1000E {
             recovery_pending: AtomicBool::new(false),
             promiscuous: Cell::new(false),
             irq,
+            pci: Cell::new(None),
+            msi_vector: Cell::new(None),
             interrupt_count: AtomicU32::new(0),
             interrupt_errors: AtomicU32::new(0),
             work_pending: AtomicBool::new(false),
@@ -751,6 +758,29 @@ impl E1000E {
         WatchdogResult::Recovered
     }
 
+    pub fn pci_address(&self) -> Option<pci::PciAddress> {
+        self.pci.get()
+    }
+
+    pub fn msi_vector(&self) -> Option<u8> {
+        self.msi_vector.get()
+    }
+
+    pub fn set_msi_vector(&self, vector: Option<u8>) {
+        self.msi_vector.set(vector);
+    }
+
+    /// Forces one interrupt so `nic.rs` can check that an MSI message really
+    /// arrives -- the same idea as Linux's e1000e self-test (`e1000_test_msi`):
+    /// writing a cause to `ICS` raises it as if the hardware had. Link Status
+    /// Change is used because every e1000e implements it and raising it is
+    /// harmless (the handler only counts it); Linux's own choice, RXSEQ, is not
+    /// implemented by QEMU's 82574L, whose `IMS` ignores that bit, so the test
+    /// interrupt was silently masked there.
+    pub fn trigger_test_interrupt(&self) {
+        write_register(self.mmio_base, REG_ICS, ICR_LSC);
+    }
+
     pub fn enable_interrupts(&self) {
         let _ = read_register(self.mmio_base, REG_ICR);
         write_register(self.mmio_base, REG_IMS, INTERRUPT_MASK);
@@ -876,6 +906,7 @@ impl E1000E {
 pub struct ProbeInfo {
     mmio_base: u32,
     irq: Option<u8>,
+    address: Option<pci::PciAddress>,
 }
 
 const MAX_INSTANCES: usize = pci::MAX_DEVICE_MATCHES;
@@ -897,6 +928,7 @@ pub fn initialize_all() -> Result<usize, Status> {
                 ProbeInfo {
                     mmio_base: 0,
                     irq: None,
+                    address: None,
                 }
             }; MAX_INSTANCES];
             let found = E1000E::probe_all(&mut probe_info);
@@ -904,6 +936,7 @@ pub fn initialize_all() -> Result<usize, Status> {
             for info in &probe_info[..found] {
                 match E1000E::init(info.mmio_base, info.irq) {
                     Ok(initialized) => {
+                        initialized.pci.set(info.address);
                         NICS[NIC_COUNT] = Some(initialized);
                         NIC_COUNT += 1;
                     }

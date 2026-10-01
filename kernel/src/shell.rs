@@ -268,8 +268,12 @@ fn load_settings(info: &BootInfo) {
         ) else {
             continue;
         };
-        let mask = parse_settings(&contents[..read_length as usize]);
+        let (mask, no_msi) = parse_settings(&contents[..read_length as usize]);
         unsafe { TERM_NET_DENY_MASK = mask };
+        if no_msi {
+            nic::set_msi_disabled(true);
+            println!("settings: MSI disabled; NICs keep their legacy IRQ lines.");
+        }
         if mask != 0 {
             print!("settings: term net, KUP and NETFS denied on NIC");
             for bit in 0..32 {
@@ -286,14 +290,19 @@ fn load_settings(info: &BootInfo) {
 /// Parses a `settings` file's text and returns the `term net` deny mask.
 /// Unknown options and bad NIC numbers are reported and skipped rather than
 /// rejecting the whole file, so one typo cannot silently drop the rest.
-fn parse_settings(contents: &[u8]) -> u32 {
+fn parse_settings(contents: &[u8]) -> (u32, bool) {
     let mut deny_mask = 0u32;
+    let mut no_msi = false;
     for line in contents.split(|&byte| byte == b'\n') {
         let line = trim_trailing_whitespace(trim_start(line));
         if line.is_empty() || line[0] == b'#' {
             continue;
         }
         let (option, values) = take_word(line);
+        if option == b"no-msi" {
+            no_msi = true;
+            continue;
+        }
         if option != b"deny-term-net" {
             println!(
                 "settings: unknown option '{}'.",
@@ -315,7 +324,7 @@ fn parse_settings(contents: &[u8]) -> u32 {
             }
         }
     }
-    deny_mask
+    (deny_mask, no_msi)
 }
 
 /// True when the `settings` file denies `term net` on this zero-based NIC.
@@ -1030,6 +1039,14 @@ fn print_irq_stats() {
     let (irr, isr, imr) = interrupts::pic_registers();
     println!("PIC pending {irr:04x} in-service {isr:04x} mask {imr:04x}");
     println!("(bit N = IRQ N; a pending bit that is also masked has no handler).");
+    for vector in interrupts::MSI_FIRST_VECTOR..interrupts::MSI_FIRST_VECTOR + interrupts::MSI_VECTORS {
+        if interrupts::msi_irq_registered(vector) {
+            println!(
+                "MSI vector 0x{vector:02x}: {} message(s) received.",
+                interrupts::msi_irq_count(vector)
+            );
+        }
+    }
     for irq in 3..16 {
         if interrupts::pci_irq_registered(irq) {
             println!(
@@ -3600,6 +3617,17 @@ fn print_nic_health(nic: &nic::Nic) {
 
 fn print_nic_interrupt_status(nic: &nic::Nic) {
     let stats = nic.interrupt_stats();
+    if let Some(vector) = nic.msi_vector() {
+        println!(
+            "NIC MSI vector 0x{vector:02x}: {} notification(s), {} device error notification(s),",
+            stats.count, stats.errors,
+        );
+        println!(
+            "foreground work {}.",
+            if stats.pending { "pending" } else { "not pending" }
+        );
+        return;
+    }
     match stats.irq {
         Some(irq) if interrupts::pci_irq_registered(irq) => {
             if let nic::Nic::ThreeCom(card) = nic {

@@ -484,6 +484,25 @@ impl PciAddress {
         );
         Some(())
     }
+
+    /// Clears the MSI Enable bit, returning the function to its legacy INTx
+    /// pin. Used when an MSI self-test shows the chipset never delivers the
+    /// message, so a NIC can fall back to its legacy IRQ. `None` if there is
+    /// no MSI capability.
+    pub fn disable_msi(&self) -> Option<()> {
+        const MESSAGE_CONTROL_OFFSET: u8 = 0x02;
+        const CONTROL_MSI_ENABLE: u16 = 1 << 0;
+        let capability = self.find_capability(CAPABILITY_ID_MSI)?;
+        let control = read_u16(self.bus, self.device, self.function, capability + MESSAGE_CONTROL_OFFSET);
+        write_u16(
+            self.bus,
+            self.device,
+            self.function,
+            capability + MESSAGE_CONTROL_OFFSET,
+            control & !CONTROL_MSI_ENABLE,
+        );
+        Some(())
+    }
 }
 
 /// Finds all PCI functions matching a vendor ID and one of its device IDs,
