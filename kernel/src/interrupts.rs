@@ -237,6 +237,31 @@ fn guard_against_storm(irq: u8) {
     }
 }
 
+/// Snapshot of the two 8259s as `(irr, isr, imr)`, each `slave << 8 | master`
+/// (bit N = IRQ N). IRR is the *pending* requests, ISR those being serviced,
+/// IMR the mask. A line that is asserted but masked sits in IRR with its IMR bit
+/// set -- the way to find where a device's interrupt actually lands when the
+/// line firmware recorded for it never fires. IRR/ISR are read by writing OCW3
+/// (`0x0a`/`0x0b`) to the command port and reading it back.
+pub fn pic_registers() -> (u16, u16, u16) {
+    unsafe {
+        let flags: u32;
+        asm!("pushfd", "pop {flags:e}", flags = out(reg) flags, options(nomem, preserves_flags));
+        asm!("cli", options(nomem, nostack));
+        outb(PIC1_COMMAND, 0x0a);
+        outb(PIC2_COMMAND, 0x0a);
+        let irr = u16::from(inb(PIC1_COMMAND)) | u16::from(inb(PIC2_COMMAND)) << 8;
+        outb(PIC1_COMMAND, 0x0b);
+        outb(PIC2_COMMAND, 0x0b);
+        let isr = u16::from(inb(PIC1_COMMAND)) | u16::from(inb(PIC2_COMMAND)) << 8;
+        let imr = u16::from(inb(PIC1_DATA)) | u16::from(inb(PIC2_DATA)) << 8;
+        if flags & (1 << 9) != 0 {
+            asm!("sti", options(nomem, nostack));
+        }
+        (irr, isr, imr)
+    }
+}
+
 /// Whether the storm guard has masked this PCI IRQ line (see
 /// `guard_against_storm`); it stays masked until reboot.
 pub fn pci_irq_storm_masked(irq: u8) -> bool {

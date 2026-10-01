@@ -1002,6 +1002,9 @@ fn print_irq_stats() {
         println!("PS/2 Scan Code Set 1 restoration after BIOS disk calls failed");
         println!("{keyboard_restore_failures} time(s).");
     }
+    let (irr, isr, imr) = interrupts::pic_registers();
+    println!("PIC pending {irr:04x} in-service {isr:04x} mask {imr:04x}");
+    println!("(bit N = IRQ N; a pending bit that is also masked has no handler).");
     for irq in 3..16 {
         if interrupts::pci_irq_registered(irq) {
             println!(
@@ -1121,6 +1124,10 @@ fn print_pci_devices() {
         has_msi: false,
         revision: 0,
         subsystem: 0,
+        interrupt_line: 0,
+        interrupt_pin: 0,
+        command: 0,
+        status: 0,
     }; pci::MAX_PCI_DEVICES];
     let found = pci::scan_devices(&mut devices);
     let shown = found.min(devices.len());
@@ -1136,13 +1143,17 @@ fn print_pci_devices() {
             info.subclass, info.prog_if,
         );
         println!(
-            "  header={:02x} bar0=0x{:08x} msi={} rev={:02x} subsys={:04x}:{:04x}",
+            "  hdr={:02x} bar0=0x{:08x} msi={} rev={:02x} sub={:04x}:{:04x} int={:02x}/{} cmd={:04x} st={:04x}",
             info.header_type,
             info.bar0,
             if info.has_msi { "yes" } else { "no" },
             info.revision,
             info.subsystem & 0xffff,
             info.subsystem >> 16,
+            info.interrupt_line,
+            info.interrupt_pin,
+            info.command,
+            info.status,
         );
     }
     if found > shown {
@@ -3301,6 +3312,9 @@ fn print_nic_interrupt_status(nic: &nic::Nic) {
     let stats = nic.interrupt_stats();
     match stats.irq {
         Some(irq) if interrupts::pci_irq_registered(irq) => {
+            if let nic::Nic::ThreeCom(card) = nic {
+                println!("3Com status register 0x{:04x} (bit 0 = IntLatch).", card.raw_status());
+            }
             println!(
                 "NIC IRQ{irq}: {} notification(s), {} device error notification(s),",
                 stats.count, stats.errors,
@@ -6398,6 +6412,11 @@ fn tape_load_net() {
                     continue;
                 };
                 println!("\nReceiving a {length}-byte tape from {}...", Mac(&source));
+                // Restart the progress timer: it has usually long expired
+                // while waiting for this START, and an immediate progress line
+                // would block on console output right as data frames begin
+                // arriving -- enough to overflow a small receive ring.
+                next_status = interrupts::ticks() + TAPE_STATUS_TICKS;
                 transfer = Some(TapeTransfer {
                     source,
                     address,
@@ -6422,6 +6441,7 @@ fn tape_load_net() {
                         Mac(&source),
                         active.expected_seq
                     );
+                    println!("(still listening for a new tape; resend it, or F12 to give up)");
                     transfer = None;
                     continue;
                 }
@@ -6434,6 +6454,7 @@ fn tape_load_net() {
                         Mac(&source),
                         data.len()
                     );
+                    println!("(still listening for a new tape; resend it, or F12 to give up)");
                     transfer = None;
                     continue;
                 }
@@ -6471,6 +6492,7 @@ fn tape_load_net() {
                     active.received,
                     active.length
                 );
+                println!("(still listening for a new tape; resend it, or F12 to give up)");
             }
             CHAT_TAG_DISCOVER_REQUEST => {
                 // A `send_tape.py`/`nic discover`/`chat` peer probing for

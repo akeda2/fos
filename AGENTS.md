@@ -1053,6 +1053,35 @@ an overflow or PCI error until `recover` has reset the card. A freeze seen once
 while the machine sat in `tape load net` (which polls only the selected NIC,
 leaving the other rings undrained) motivated both.
 
+### 3C905 interrupts and receive ring (found on real hardware)
+
+Three bugs, all invisible under QEMU (it has no 3C905 model) and hidden by
+polling. (1) The init-time `SET_STATUS_ENABLE` had an empty mask and
+`enable_interrupts` only sent `SET_INTERRUPT_ENABLE`; on the 3c90x an event
+must be enabled in *both* masks to raise INT#, so the card never asserted its
+line (the PIC registers in `irqstat` and the PCI status/command bits in `pci`
+were how this was diagnosed). `INTERRUPT_MASK` is now UpComplete | HostError,
+set in both. TxComplete is deliberately excluded: it stays asserted until the
+transmit status is popped, which this driver never does. (2) With interrupts
+live, three places write the command register (foreground `receive`'s
+`UP_UNSTALL`, the handler's acknowledges, init/recovery); the card ignores a
+command written while `CmdInProgress` is set, so an overlap lost an
+`UP_UNSTALL` and stalled the upload engine. Every write now goes through
+`issue_command`, which waits for the in-progress bit first. (3) A 4-descriptor
+receive ring overflowed at a 3 ms pace because `tape load net`'s start-of-
+transfer console output (VGA + 115200-baud serial) blocks longer than 12 ms,
+losing chunks a few frames in ("Gap in tape data: expected chunk #5, got #7").
+The ring is now 16 descriptors and the progress timer restarts when a START
+is accepted. Result on the test machine: one interrupt per received frame on
+all four NICs, 284 KB tapes load at 3 ms (and 1 ms) pacing, no recoveries.
+
+Diagnostics that found these, kept because they are useful for any unknown
+card: `irqstat` prints the PIC's pending/in-service/mask registers (a
+pending-but-masked bit shows where an unhandled interrupt lands), and `pci`
+prints each function's interrupt line/pin and its command/status registers
+(status bit 3 = the function is asserting INTx right now; command bit 10 =
+interrupt disable).
+
 ### UHCI: a USB host controller driver, and isochronous USB Audio playback
 
 `kernel/src/uhci.rs` is a minimal UHCI (USB 1.1, I/O-port-based) host
@@ -2003,9 +2032,9 @@ loops call `idle_wait()` (`sti; hlt`, `arch::x86::wait_for_interrupt`) when an
 iteration found nothing, so they no longer pin the CPU. This is only done when
 every NIC has an enabled receive IRQ (`nic::all_rx_interrupt_driven`), so a
 frame wakes the CPU immediately and no NIC looks silent (8+ frames
-completed with 0 interrupts -- true of the 3C905s on the AMD/nForce test
-machine, whose IRQ10 never fires; cause not yet found); otherwise the loops
-spin as before. Loops that
+completed with 0 interrupts); otherwise the loops spin as before. The 3C905s
+on the AMD/nForce test machine used to trip that check -- see "3C905 interrupts"
+below -- and now deliver one interrupt per frame. Loops that
 read COM1 (`term`, `chat`) must not halt: serial has no IRQ and a 16-byte FIFO
 can overflow. Tapes get the same via the last ABI callback, `wait_for_event`
 (slot 36, `tape_wait_for_event` -> `idle_wait`). `tapes/tape-rt` stores it

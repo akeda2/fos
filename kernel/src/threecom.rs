@@ -66,10 +66,32 @@ const DOWNLOAD_COMPLETE: u32 = 1 << 16;
 const TX_ROUNDUP_DEFEAT: u32 = 1 << 28;
 const EEPROM_READ: u16 = 0x80;
 const EEPROM_BUSY: u16 = 0x8000;
-const INTERRUPT_MASK: u16 = 0x07ff;
+const STATUS_INT_LATCH: u16 = 1 << 0;
 const STATUS_HOST_ERROR: u16 = 1 << 1;
+/// A bus-master receive finished (the card's UpComplete event).
+const STATUS_UP_COMPLETE: u16 = 1 << 10;
+/// The only events this driver enables, both as *indications* (`SET_STATUS_
+/// ENABLE`) and as *interrupt sources* (`SET_INTERRUPT_ENABLE`). On the 3c90x
+/// an event must be enabled in both masks before it can raise INT#, and each
+/// command takes its mask in its low 13 bits -- the init-time `SET_STATUS_
+/// ENABLE` is sent with an empty mask (polling needs no indications), so
+/// `enable_interrupts` must send both masks itself; until it did, the card
+/// never asserted its interrupt line at all (found on real hardware: zero
+/// interrupts despite a registered IRQ). TxComplete, TxAvailable and StatsFull
+/// are deliberately left out: TxComplete stays asserted until the transmit
+/// status is popped, which this polling driver never does, so enabling it
+/// would hold the level-triggered line high and storm.
+const INTERRUPT_MASK: u16 = STATUS_UP_COMPLETE | STATUS_HOST_ERROR;
 
-const RX_DESC_COUNT: usize = 4;
+/// Receive descriptors. This used to be 4, which at a 3 ms inter-frame pace
+/// holds only ~12 ms of arrivals: the console output that `tape load net`
+/// prints when a transfer starts (VGA plus a 115200-baud serial mirror) blocks
+/// the foreground longer than that, and the ring overflowed -- "Gap in tape
+/// data: expected chunk #5, got #7" a few frames into every large transfer
+/// (confirmed on real hardware with interrupts off, so not an interrupt bug).
+/// 16 descriptors buffer ~48 ms at that pace; the RTL8139 and Realtek NICs
+/// already hold far more.
+const RX_DESC_COUNT: usize = 16;
 const RX_BUFFER_SIZE: usize = 1536;
 pub const MIN_FRAME_LEN: usize = 60;
 pub const MAX_FRAME_LEN: usize = 1514;
@@ -117,6 +139,25 @@ fn wait_command(base: u16) -> Result<(), InitError> {
         }
     }
     Ok(())
+}
+
+/// Issues one command-register write only once the previous command has
+/// finished (`CmdInProgress`, bit 12, clear). The 3c90x ignores or garbles a
+/// command written while another is still running, and with interrupts live
+/// three places write that register -- foreground `receive` (`UP_UNSTALL`),
+/// the interrupt handler (acknowledges) and the init/recovery commands -- so
+/// an unlucky overlap silently lost an `UP_UNSTALL`, the upload engine stayed
+/// stalled and tape transfers aborted with "Gap in tape data" (found on real
+/// hardware the moment interrupts started working). Waiting *before* the write
+/// serialises them from either side. The bound (a few ms of port reads) keeps
+/// the interrupt-handler use from ever hanging; ordinary commands finish in
+/// microseconds, only the resets run long.
+fn issue_command(base: u16, command: u16) {
+    let mut attempts = 5_000u32;
+    while read16(base, CMD_STATUS) & 0x1000 != 0 && attempts > 0 {
+        attempts -= 1;
+    }
+    write16(base, CMD_STATUS, command);
 }
 
 fn descriptor_ptr<T>(base: u32, index: usize) -> *mut T {
@@ -230,12 +271,12 @@ impl ThreeCom {
     }
 
     fn command(&self, command: u16) -> Result<(), InitError> {
-        write16(self.io_base, CMD_STATUS, command);
+        issue_command(self.io_base, command);
         wait_command(self.io_base)
     }
 
     fn select_window(&self, window: u16) {
-        write16(self.io_base, CMD_STATUS, SELECT_WINDOW | window);
+        issue_command(self.io_base, SELECT_WINDOW | window);
     }
 
     fn configure_media(&self) -> Result<(), InitError> {
@@ -423,7 +464,8 @@ impl ThreeCom {
     }
 
     pub fn enable_interrupts(&self) {
-        let _ = self.command(ACK_INTERRUPT | INTERRUPT_MASK);
+        let _ = self.command(ACK_INTERRUPT | 0x07ff | STATUS_INT_LATCH);
+        let _ = self.command(SET_STATUS_ENABLE | INTERRUPT_MASK);
         let _ = self.command(SET_INTERRUPT_ENABLE | INTERRUPT_MASK);
         self.interrupts_enabled.set(true);
     }
@@ -435,13 +477,20 @@ impl ThreeCom {
         }
         // Command completion can wait, but an ISR must only acknowledge and
         // return; the card's command-in-progress bit is therefore not polled.
-        write16(self.io_base, CMD_STATUS, ACK_INTERRUPT | status);
+        issue_command(self.io_base, ACK_INTERRUPT | status | STATUS_INT_LATCH);
         self.interrupt_count.fetch_add(1, Ordering::Relaxed);
         if status & STATUS_HOST_ERROR != 0 {
             self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
             self.recovery_pending.store(true, Ordering::Release);
         }
         self.work_pending.store(true, Ordering::Release);
+    }
+
+    /// The raw `IntStatus` register, unmodified, for `nic list`'s diagnostics:
+    /// bit 0 is IntLatch (an enabled event is asserting the interrupt line),
+    /// bit 4 RxComplete, bit 10 UpComplete (a bus-master receive finished).
+    pub fn raw_status(&self) -> u16 {
+        read16(self.io_base, CMD_STATUS)
     }
 
     pub fn interrupt_stats(&self) -> (Option<u8>, u32, u32, bool) {
@@ -486,15 +535,15 @@ impl ThreeCom {
             DOWN_LIST_PTR,
             self.descriptors + (RX_DESC_COUNT * 16) as u32,
         );
-        write16(self.io_base, CMD_STATUS, DOWN_UNSTALL);
+        issue_command(self.io_base, DOWN_UNSTALL);
 
         let descriptor = descriptor_ptr::<TxDescriptor>(self.descriptors, RX_DESC_COUNT);
         let mut attempts = 100_000u32;
         while unsafe { read_volatile(&(*descriptor).status) } & DOWNLOAD_COMPLETE == 0 {
             attempts -= 1;
             if attempts == 0 {
-                write16(self.io_base, CMD_STATUS, TX_RESET);
-                write16(self.io_base, CMD_STATUS, TX_ENABLE);
+                issue_command(self.io_base, TX_RESET);
+                issue_command(self.io_base, TX_ENABLE);
                 self.recovery_pending.store(true, Ordering::Release);
                 return false;
             }
@@ -526,7 +575,7 @@ impl ThreeCom {
             }
         }
         unsafe { write_volatile(&mut (*descriptor).status, 0) };
-        write16(self.io_base, CMD_STATUS, UP_UNSTALL);
+        issue_command(self.io_base, UP_UNSTALL);
         self.rx_next.set((index + 1) % RX_DESC_COUNT);
         if !valid {
             self.overflow_count.set(self.overflow_count.get() + 1);

@@ -563,6 +563,19 @@ pub struct PciDeviceInfo {
     /// offset `0x2c`: identifies the board maker's card/model. Only meaningful
     /// for header type 0; zero for bridges, whose `0x2c` is something else.
     pub subsystem: u32,
+    /// Interrupt Line (config offset `0x3c`): the PIC input firmware says this
+    /// function's interrupt is routed to (`0xff` = none). Whether the board
+    /// really wires it there is exactly what `irqstat`'s PIC registers can show.
+    pub interrupt_line: u8,
+    /// Interrupt Pin (config offset `0x3d`): 0 = none, 1 = INTA#, 2 = INTB#...
+    pub interrupt_pin: u8,
+    /// PCI Command register (offset `0x04`). Bit 10 is "Interrupt Disable": a
+    /// function with it set never asserts INTx, whatever its driver does.
+    pub command: u16,
+    /// PCI Status register (offset `0x06`). Bit 3 is "Interrupt Status": the
+    /// function is asserting INTx right now -- a direct reading of whether a
+    /// device is raising its interrupt line at all.
+    pub status: u16,
 }
 
 /// Bounded to the largest device count this project has ever needed to
@@ -618,6 +631,10 @@ pub fn scan_devices(out: &mut [PciDeviceInfo]) -> usize {
                     bar0: read_u32(bus, device, function, BAR0_OFFSET),
                     has_msi: address.find_capability(CAPABILITY_ID_MSI).is_some(),
                     revision: read_u8(bus, device, function, 0x08),
+                    interrupt_line: read_u8(bus, device, function, 0x3c),
+                    interrupt_pin: read_u8(bus, device, function, 0x3d),
+                    command: read_u16(bus, device, function, 0x04),
+                    status: read_u16(bus, device, function, 0x06),
                     subsystem: if read_u8(bus, device, function, 0x0e) & 0x7f == 0 {
                         read_u32(bus, device, function, 0x2c)
                     } else {
