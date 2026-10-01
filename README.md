@@ -1158,6 +1158,14 @@ two ports of this one:
 sink.ip=10.0.2.2 gen.rate=2000 gen.run=on` with the router at 10.0.1.1 / 10.0.2.1.
 `make test-tape-nettest-router` does exactly that with two QEMU guests.
 
+**Rate sweep.** `gen.sweep=START:END:STEP:SECONDS` (kbit/s) at launch, or `gen
+sweep START END STEP SECONDS` at the prompt, steps the offered rate and prints one
+line per step as it finishes -- `sweep 3000 kbit: sent 749 rx 500 loss 33.24% got
+1999 kbit lat 108531/119470 us` (offered, frames sent and received in that step,
+loss, delivered rate, average/maximum one-way latency) -- so the point where a
+link, a limiter or a router stops keeping up shows up as a table. The generator
+stops after the last step.
+
 The sink reports frames received, average and current
 throughput, loss (from sequence gaps), duplicates, reordering, and one-way
 latency (min/avg/max and RFC 3550 jitter) -- exact when generator and sink share

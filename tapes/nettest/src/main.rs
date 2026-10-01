@@ -26,7 +26,7 @@ extern crate nettest_tape;
 use core::ptr::addr_of_mut;
 use nettest_tape::{
     ArpInfo, Config, Direction, GEN_HEADER_LEN, Generator, MAX_FRAME, PRESETS, Rng, SLOT_BYTES,
-    Sink, UdpPlan, build_arp, parse_arp, parse_ip, parse_mac, parse_permille, parse_u32, preset,
+    Sink, Sweep, UdpPlan, build_arp, parse_arp, parse_ip, parse_mac, parse_permille, parse_u32, preset,
 };
 use tape_rt::{print_bytes, print_u32};
 
@@ -76,6 +76,10 @@ struct Session<'a> {
     udp_port: u16,
     /// When the generator last asked for its next hop's MAC.
     last_arp_us: u64,
+    /// A rate sweep (`gen sweep`), and whether one was configured to begin at
+    /// launch (`gen.sweep=...`).
+    sweep: Sweep,
+    sweep_at_launch: bool,
     /// The two-port impairment link is active (not when only gen/sink given).
     limiter: bool,
     /// Passes of the polling loop and when it started: a long average pass is
@@ -172,6 +176,8 @@ pub extern "C" fn tape_main(
         udp_gateway: None,
         udp_port: 9000,
         last_arp_us: 0,
+        sweep: Sweep::new(),
+        sweep_at_launch: false,
         limiter: true,
         passes: 0,
         loop_started_us: 0,
@@ -294,7 +300,13 @@ pub extern "C" fn tape_main(
     session.started = true;
     session.view.start_tick = micros() / 10_000;
     if session.gen_autostart && session.gen_nic.is_some() {
-        session.generator.start(micros() + u64::from(session.gen_delay_s) * 1_000_000);
+        let begin = micros() + u64::from(session.gen_delay_s) * 1_000_000;
+        if session.sweep_at_launch {
+            let Session { sweep, generator, sink, .. } = &mut session;
+            sweep.begin(begin, generator, sink);
+        } else {
+            session.generator.start(begin);
+        }
     }
     if session.view.wanted {
         view_start(putc, &mut session);
@@ -407,6 +419,10 @@ pub extern "C" fn tape_main(
                 session.generator.record_send(length, ok);
                 sent += 1;
                 busy = true;
+            }
+            let Session { sweep, generator, sink, .. } = &mut session;
+            if let Some(result) = sweep.poll(now_us, generator, sink) {
+                print_sweep_step(putc, &result);
             }
             if generator_was_running && !session.generator.running {
                 print_bytes(putc, b"\ngenerator finished: ");
@@ -620,6 +636,35 @@ fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
     configure(session, name, way, &parts[..count]).is_ok()
 }
 
+/// Validates and stores a sweep's `[start, end, step, seconds]`.
+fn set_sweep(session: &mut Session<'_>, numbers: [u32; 4]) -> bool {
+    let [start, end, step, seconds] = numbers;
+    if start < 1 || end < start || step < 1 || seconds < 1 {
+        return false;
+    }
+    let sweep = &mut session.sweep;
+    (sweep.start, sweep.end, sweep.step, sweep.seconds) = (start, end, step, seconds);
+    true
+}
+
+fn print_sweep_step(putc: Putc, result: &nettest_tape::StepResult) {
+    print_bytes(putc, b"sweep ");
+    print_u32(putc, result.offered_kbit);
+    print_bytes(putc, b" kbit: sent ");
+    print_u32(putc, result.sent);
+    print_bytes(putc, b" rx ");
+    print_u32(putc, result.received);
+    print_bytes(putc, b" loss ");
+    print_hundredths(putc, result.loss_hundredths);
+    print_bytes(putc, b"% got ");
+    print_u32(putc, result.got_kbit);
+    print_bytes(putc, b" kbit lat ");
+    print_u32(putc, result.latency_avg);
+    putc(u32::from(b'/'));
+    print_u32(putc, result.latency_max);
+    print_bytes(putc, b" us\n");
+}
+
 /// `sink.ip=A.B.C.D` (answer ARP for it and accept UDP to it) and `sink.port=N`.
 fn sink_setting(session: &mut Session<'_>, setting: &[u8], value: &[u8]) -> bool {
     match setting {
@@ -662,6 +707,24 @@ fn gen_setting(session: &mut Session<'_>, setting: &[u8], value: &[u8]) -> bool 
         b"count" => parse_u32(value).map(|count| generator.count_limit = count).is_some(),
         b"time" => parse_u32(value).map(|seconds| generator.seconds_limit = seconds).is_some(),
         b"delay" => parse_u32(value).map(|seconds| session.gen_delay_s = seconds).is_some(),
+        b"sweep" => {
+            // START:END:STEP:SECONDS, all numbers (kbit/s, kbit/s, kbit/s, s).
+            let mut numbers = [0u32; 4];
+            let mut count = 0;
+            for part in value.split(|&byte| byte == b':') {
+                match (count < 4, parse_u32(part)) {
+                    (true, Some(number)) => numbers[count] = number,
+                    _ => return false,
+                }
+                count += 1;
+            }
+            if count != 4 || !set_sweep(session, numbers) {
+                return false;
+            }
+            session.sweep_at_launch = true;
+            session.gen_autostart = true;
+            true
+        }
         b"ip" | b"dst" | b"gw" => match parse_ip(value) {
             Some(ip) => {
                 match setting {
@@ -896,7 +959,26 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
                 print_bytes(putc, b"generator started\n");
             }
         }
+        b"sweep" => {
+            let mut numbers = [0u32; 4];
+            for (slot, word) in numbers.iter_mut().zip(words[1..].iter()) {
+                *slot = parse_u32(word).unwrap_or(0);
+            }
+            if words.len() != 5 || !set_sweep(session, numbers) {
+                print_bytes(putc, b"use: gen sweep START END STEP SECONDS (kbit/s, seconds)\n");
+                return Outcome::Error;
+            }
+            if !session.started {
+                session.sweep_at_launch = true;
+                session.gen_autostart = true;
+            } else {
+                let Session { sweep, generator, sink, .. } = session;
+                sweep.begin(tape_rt::micros(), generator, sink);
+                print_bytes(putc, b"sweep started\n");
+            }
+        }
         b"stop" => {
+            session.sweep.active = false;
             session.generator.stop();
             print_bytes(putc, b"generator stopped: ");
             print_gen_line(putc, session);
@@ -914,7 +996,7 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
             print_gen_config(putc, session);
         }
         _ => {
-            print_bytes(putc, b"use: gen start|stop|rate|size|to|count|time|show\n");
+            print_bytes(putc, b"use: gen start|stop|sweep|rate|size|to|count|time|show\n");
             return Outcome::Error;
         }
     }
@@ -1071,6 +1153,7 @@ fn print_help(putc: Putc) {
           reset [stats]                clean link, or clear the counters\n\
           gen start|stop|show          the traffic generator (needs gen=N)\n\
           gen rate KBIT | size BYTES   constant bit rate of whole frames\n\
+          gen sweep START END STEP S   step the rate, S seconds each; table of results\n\
           gen to MAC|sink | count N | time S    destination; stop after N / S\n\
           gen ip|dst|gw A.B.C.D | port N   send routable UDP/IP (ARP for the gateway)\n\
           sink [show|reset]            the receiver (needs sink=N): loss, latency\n\

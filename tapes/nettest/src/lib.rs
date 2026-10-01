@@ -733,6 +733,8 @@ pub struct SinkStats {
     pub jitter: u32,
     pub first_us: u64,
     pub last_us: u64,
+    /// Largest latency since the last `Sink::mark_interval` (a sweep step).
+    pub interval_latency_max: u32,
 }
 
 /// Checks generated frames off: counts, loss, duplicates, reordering, latency.
@@ -756,6 +758,7 @@ impl Sink {
             stats: SinkStats {
                 received: 0, bytes: 0, lost: 0, duplicated: 0, reordered: 0, latency_min: 0,
                 latency_max: 0, latency_sum: 0, jitter: 0, first_us: 0, last_us: 0,
+                interval_latency_max: 0,
             },
             expected: 0,
             window: 0,
@@ -812,6 +815,7 @@ impl Sink {
         stats.last_us = now_us;
         stats.latency_min = stats.latency_min.min(latency);
         stats.latency_max = stats.latency_max.max(latency);
+        stats.interval_latency_max = stats.interval_latency_max.max(latency);
         stats.latency_sum += u64::from(latency);
         let delta = latency.abs_diff(self.previous_latency);
         stats.jitter = (stats.jitter as i64 + (i64::from(delta) - i64::from(stats.jitter)) / 16) as u32;
@@ -841,6 +845,11 @@ impl Sink {
         true
     }
 
+    /// Starts a new measuring interval for `interval_latency_max`.
+    pub fn mark_interval(&mut self) {
+        self.stats.interval_latency_max = 0;
+    }
+
     /// Average throughput between the first and the last frame, in kbit/s.
     pub fn average_kbit(&self) -> u64 {
         let span = self.stats.last_us.saturating_sub(self.stats.first_us);
@@ -848,6 +857,123 @@ impl Sink {
             return 0;
         }
         self.stats.bytes * 8 * 1000 / span
+    }
+}
+
+/// A rate sweep: the generator steps its offered rate from `start` to `end` by
+/// `step` kbit/s, holding each rate for `seconds`, and one `StepResult` comes out
+/// per step -- offered against delivered, loss and latency -- so the point where a
+/// link or a router stops keeping up is a table, not a series of manual runs.
+pub struct Sweep {
+    pub active: bool,
+    pub start: u32,
+    pub end: u32,
+    pub step: u32,
+    pub seconds: u32,
+    current: u32,
+    step_started_us: u64,
+    snapshot: SweepSnapshot,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SweepSnapshot {
+    sent: u32,
+    received: u32,
+    bytes: u64,
+    latency_sum: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StepResult {
+    pub offered_kbit: u32,
+    pub sent: u32,
+    pub received: u32,
+    /// Loss in hundredths of a percent.
+    pub loss_hundredths: u32,
+    pub got_kbit: u32,
+    pub latency_avg: u32,
+    pub latency_max: u32,
+    /// The last step of the sweep.
+    pub last: bool,
+}
+
+impl Sweep {
+    pub const fn new() -> Self {
+        Self {
+            active: false,
+            start: 0,
+            end: 0,
+            step: 0,
+            seconds: 0,
+            current: 0,
+            step_started_us: 0,
+            snapshot: SweepSnapshot { sent: 0, received: 0, bytes: 0, latency_sum: 0 },
+        }
+    }
+
+    fn take_snapshot(&mut self, generator: &Generator, sink: &mut Sink) {
+        sink.mark_interval();
+        self.snapshot = SweepSnapshot {
+            sent: generator.stats.sent,
+            received: sink.stats.received,
+            bytes: sink.stats.bytes,
+            latency_sum: sink.stats.latency_sum,
+        };
+    }
+
+    /// Starts the sweep: sets the first rate and starts the generator.
+    pub fn begin(&mut self, now_us: u64, generator: &mut Generator, sink: &mut Sink) {
+        self.active = true;
+        self.current = self.start;
+        generator.rate_kbit = self.current.max(1);
+        generator.count_limit = 0;
+        generator.seconds_limit = 0;
+        generator.start(now_us);
+        self.step_started_us = now_us;
+        self.take_snapshot(generator, sink);
+    }
+
+    /// Call every pass; returns a result when the current step has run its time.
+    pub fn poll(&mut self, now_us: u64, generator: &mut Generator, sink: &mut Sink) -> Option<StepResult> {
+        if !self.active || !generator.running || !generator.resolved {
+            // Waiting for ARP: the clock for the step starts when frames can flow.
+            if self.active && generator.running {
+                self.step_started_us = now_us;
+                self.take_snapshot(generator, sink);
+            }
+            return None;
+        }
+        let elapsed = now_us.saturating_sub(self.step_started_us);
+        if elapsed < u64::from(self.seconds) * 1_000_000 {
+            return None;
+        }
+        let sent = generator.stats.sent.wrapping_sub(self.snapshot.sent);
+        let received = sink.stats.received.wrapping_sub(self.snapshot.received);
+        let bytes = sink.stats.bytes.saturating_sub(self.snapshot.bytes);
+        let latency_sum = sink.stats.latency_sum.saturating_sub(self.snapshot.latency_sum);
+        let lost = sent.saturating_sub(received);
+        let result = StepResult {
+            offered_kbit: self.current,
+            sent,
+            received,
+            loss_hundredths: if sent == 0 { 0 } else { (u64::from(lost) * 10_000 / u64::from(sent)) as u32 },
+            got_kbit: (bytes * 8 * 1000 / elapsed.max(1)) as u32,
+            latency_avg: if received == 0 { 0 } else { (latency_sum / u64::from(received)) as u32 },
+            latency_max: sink.stats.interval_latency_max,
+            last: false,
+        };
+        let next = self.current.saturating_add(self.step.max(1));
+        let last = next > self.end;
+        if last {
+            self.active = false;
+            generator.stop();
+        } else {
+            self.current = next;
+            generator.rate_kbit = next;
+            self.step_started_us = now_us;
+            self.take_snapshot(generator, sink);
+        }
+        Some(StepResult { last, ..result })
     }
 }
 
@@ -1252,6 +1378,38 @@ mod tests {
         assert_eq!(parse_ip(b"192.168.0.17"), Some([192, 168, 0, 17]));
         assert_eq!(parse_ip(b"192.168.0"), None);
         assert_eq!(parse_ip(b"192.168.0.256"), None);
+    }
+
+    #[test]
+    fn a_sweep_steps_the_rate_and_reports_each_step() {
+        let mut generator = Generator::new();
+        generator.size = 500;
+        let mut sink = Sink::new();
+        let mut sweep = Sweep::new();
+        (sweep.start, sweep.end, sweep.step, sweep.seconds) = (1000, 3000, 1000, 2);
+        sweep.begin(0, &mut generator, &mut sink);
+        assert_eq!(generator.rate_kbit, 1000);
+        assert!(generator.running);
+        assert_eq!(sweep.poll(1_999_999, &mut generator, &mut sink), None);
+        // Pretend 400 frames were sent and 300 arrived in 500-byte frames.
+        generator.stats.sent = 400;
+        sink.stats.received = 300;
+        sink.stats.bytes = 300 * 500;
+        sink.stats.latency_sum = 300 * 700;
+        sink.stats.interval_latency_max = 1200;
+        let first = sweep.poll(2_000_000, &mut generator, &mut sink).unwrap();
+        assert_eq!(first.offered_kbit, 1000);
+        assert_eq!((first.sent, first.received), (400, 300));
+        assert_eq!(first.loss_hundredths, 2500);
+        assert_eq!(first.got_kbit, 600); // 150000 bytes * 8 / 2 s
+        assert_eq!((first.latency_avg, first.latency_max), (700, 1200));
+        assert!(!first.last);
+        assert_eq!(generator.rate_kbit, 2000);
+        let _ = sweep.poll(4_000_000, &mut generator, &mut sink).unwrap();
+        let third = sweep.poll(6_000_000, &mut generator, &mut sink).unwrap();
+        assert!(third.last);
+        assert_eq!(third.offered_kbit, 3000);
+        assert!(!generator.running && !sweep.active);
     }
 
     #[test]

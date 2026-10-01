@@ -118,6 +118,10 @@ def run_scenario(lab, arguments, seconds, sink_nic=4):
     names = ("rx", "avg_kbit", "lost", "loss_pct", "dup", "reord", "lat_min", "lat_avg", "lat_max", "jitter")
     result = dict(zip(names, (float(v) if "." in v else int(v) for v in sink.groups())))
     result["sent"], result["failed"] = int(gen.group(1)), int(gen.group(2))
+    result["sweep"] = [
+        tuple(float(v) for v in step)
+        for step in re.findall(r"sweep (\d+) kbit: sent (\d+) rx (\d+) loss ([\d.]+)% got (\d+) kbit lat (\d+)/(\d+) us", text)
+    ]
     return result
 
 
@@ -167,6 +171,20 @@ def main():
         check(950 <= result["avg_kbit"] <= 1050, f"UDP/IP frames: sink measured {result['avg_kbit']} kbit/s behind a 1000 kbit/s limiter", result)
         check(result["rx"] > 400 and result["dup"] == 0 and result["reord"] == 0,
               f"UDP/IP frames arrive intact and in order ({result['rx']} datagrams)", result)
+    finally:
+        lab.stop()
+    lab = Lab()
+    try:
+        # A rate sweep against a 2000 kbit/s limiter: loss appears once the offered
+        # rate passes the limit, and the delivered rate flattens at the limit.
+        result = run_scenario(lab, "2 3 gen=1 sink=4 gen.size=1000 gen.delay=3 gen.sweep=1000:4000:1000:2 "
+                              "rate=2000 queue=30", 8)
+        steps = result["sweep"]
+        check([int(step[0]) for step in steps] == [1000, 2000, 3000, 4000],
+              f"the sweep reports one line per step ({[int(step[0]) for step in steps]})", result)
+        check(steps[0][3] < 1.0 and 900 <= steps[0][4] <= 1100, f"1000 kbit/s offered passes untouched: {steps[0]}", result)
+        check(steps[2][3] > 20 and steps[3][3] > steps[2][3] and 1800 <= steps[3][4] <= 2200,
+              f"above the limit loss grows and throughput stays at 2000: {steps[2:]}", result)
     finally:
         lab.stop()
     print("PASS: nettest's generator and sink measure the impairment link through a four-NIC loop.")
