@@ -1968,7 +1968,10 @@ session loops, `nic sniff`, `nic discover`, `tape load net` and the NETFS wait
 loops call `idle_wait()` (`sti; hlt`, `arch::x86::wait_for_interrupt`) when an
 iteration found nothing, so they no longer pin the CPU. This is only done when
 every NIC has an enabled receive IRQ (`nic::all_rx_interrupt_driven`), so a
-frame wakes the CPU immediately; otherwise the loops spin as before. Loops that
+frame wakes the CPU immediately and no NIC looks silent (8+ frames
+completed with 0 interrupts -- true of the 3C905s on the AMD/nForce test
+machine, whose IRQ10 never fires; cause not yet found); otherwise the loops
+spin as before. Loops that
 read COM1 (`term`, `chat`) must not halt: serial has no IRQ and a 16-byte FIFO
 can overflow. Tapes get the same via the last ABI callback, `wait_for_event`
 (slot 36, `tape_wait_for_event` -> `idle_wait`). `tapes/tape-rt` stores it

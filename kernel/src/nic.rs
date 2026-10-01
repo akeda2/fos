@@ -397,10 +397,31 @@ pub fn count() -> usize {
     initialize().unwrap_or(0)
 }
 
+/// A NIC that has completed this many frames while its interrupt count is
+/// still zero is assumed not to deliver receive interrupts. A working NIC
+/// interrupts for (nearly) every frame, so even a handful of frames is
+/// decisive; a quiet or unplugged NIC has completed none and is not judged.
+const SUSPECT_RX_FRAMES: u32 = 8;
+
 /// See `ALL_RX_INTERRUPT_DRIVEN`: whether a polling loop may halt between
-/// polls without risking a missed or late frame.
+/// polls without risking a missed or late frame. Registration alone is not
+/// proof the interrupt arrives -- on the AMD/nForce test machine both 3C905s
+/// register IRQ10 yet report zero dispatches while receiving frames -- so this
+/// also requires that no NIC looks silent: completed frames (`rx_progress`,
+/// counted by polling) with zero interrupt notifications mean sleeping would
+/// delay each frame to the next 10 ms timer tick, so loops keep polling.
 pub fn all_rx_interrupt_driven() -> bool {
-    unsafe { ALL_RX_INTERRUPT_DRIVEN }
+    if !unsafe { ALL_RX_INTERRUPT_DRIVEN } {
+        return false;
+    }
+    for index in 0..unsafe { NIC_COUNT } {
+        if let Some(nic) = unsafe { NICS[index].as_ref() } {
+            if nic.health().rx_progress >= SUSPECT_RX_FRAMES && nic.interrupt_stats().count == 0 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub fn active_index() -> usize {
