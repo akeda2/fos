@@ -149,7 +149,7 @@ the real-mode code that printed it has no notion of that ring at all.
 
 | Command | Description |
 | --- | --- |
-| `help` | Lists available commands. |
+| `help [TOPIC]` | Lists available commands. `help nic`, `tape`, `usb`, `disk`, `hw`, `term`, `print` or `audio` shows that group's full syntax, one screen each. |
 | `clear` | Clears VGA text and sends an ANSI clear request to serial terminals. |
 | `vga [d\|80x25\|80x50\|132x25]` | Shows the current mode and available modes, or changes the local VGA text mode. `d` returns to the 80x25 default; 80x50 uses the VGA 8x8-font mode; 132x25 uses experimental extended horizontal timing and may not work on every adapter or monitor. |
 | `about` | Describes this educational OS. |

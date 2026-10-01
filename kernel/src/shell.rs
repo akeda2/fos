@@ -752,7 +752,9 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("check the manual.");
                 return;
             }
-            if no_arguments(arguments) {
+            if !arguments.is_empty() {
+                help_topic(arguments);
+            } else {
                 println!(
                     "System: help clear vga about bootinfo memmap memory cpuinfo pci usb"
                 );
@@ -774,8 +776,13 @@ fn execute(command: &[u8], info: &BootInfo) {
                     "Serial: serial (list ports), term [PORT [BAUD]] (raw terminal, F12 to exit)"
                 );
                 println!(
-                    "Ethernet: nic [list|use N|send|sniff|discover|peers], chat [PEER_MAC|N]"
+                    "Ethernet: nic [list|use N|send|recv|sniff|discover|peers|map|watchdog|regs]"
                 );
+                println!(
+                    "      chat [PEER_MAC|N]; copy/tape load|save take HOST[:diskN] peers"
+                );
+                println!("Audio/USB: audio, hda (status); usb play|capture [diskN] NAME");
+                println!("      usb storage attach|promote, usb native (promote/attach all disks)");
                 println!(
                     "Tape: tape status | tape run [ARGS...|@FILE|@diskN/FILE] ('load'/'run' work"
                 );
@@ -795,6 +802,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!(
                     "Note: F12 (or F4/F6/F7/F8/F10) gives up on any blocking wait (sniff/term/chat)."
                 );
+                println!("Details: help TOPIC (nic tape usb disk hw term print audio)");
             }
         }
         b"clear" if no_arguments(arguments) => console::clear(),
@@ -892,6 +900,90 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("Unknown command. Type 'help' for commands.");
             }
         }
+    }
+}
+
+/// `help TOPIC`: a per-command page for the commands whose syntax does not
+/// fit the one-screen overview. Each page stays within 79 columns and well
+/// under 25 rows for the same reason the overview does (see `help`).
+fn help_topic(topic: &[u8]) {
+    match topic {
+        b"nic" => {
+            println!("nic                 status of the selected NIC");
+            println!("nic list            every NIC: link, MAC, health, IRQ/MSI, hostname");
+            println!("nic use N           select NIC N (1-based) for send/recv/sniff/tapes");
+            println!("nic send | recv     send one test frame / wait for one (F12 gives up)");
+            println!("nic sniff           print every frame heard, promiscuous (F12 ends)");
+            println!("nic discover        probe for fos peers and number them (F12 ends)");
+            println!("nic peers           print the numbered peer table (see chat, tape send)");
+            println!("nic map             per-NIC link, and which NICs hear which (cabling)");
+            println!("nic watchdog        run the NIC fault watchdog, show recovery counters");
+            println!("nic regs [N]        dump registers (RTL8168, 3C905)");
+            println!("chat [PEER_MAC|N]   text chat with a peer, /quit leaves");
+        }
+        b"tape" => {
+            println!("tape status                 loaded tape: length, format, entry");
+            println!("tape load disk[N] NAME      load NAME from a disk into the tape buffer");
+            println!("tape load net               wait for a tape sent over Ethernet");
+            println!("tape load HOST[:diskN] NAME fetch from a peer (NETFS)");
+            println!("tape run [ARGS|@FILE]       run it; @FILE passes a file as the arguments");
+            println!("tape save [diskN] NAME      write the loaded tape to a disk file");
+            println!("tape save HOST[:diskN] NAME push it to a peer");
+            println!("tape send NAME PEER         send a disk file to a peer as a tape");
+            println!("'load' and 'run' work without the 'tape' prefix. NAME alone runs");
+            println!("NAME.sh or NAME.bin from any disk.");
+        }
+        b"usb" => {
+            println!("usb                         list UHCI controllers/ports, enumerate");
+            println!("usb play [diskN] NAME       play a PCM file on a USB audio device");
+            println!("usb capture [diskN] NAME    record from a USB audio device");
+            println!("usb storage                 inspect the first USB mass-storage device");
+            println!("usb storage attach          add it as the next diskN");
+            println!("usb storage promote         switch disk1 to the native USB driver");
+            println!("usb native                  promote/attach every USB disk at once");
+            println!("Resets the controllers: can break BIOS USB-boot disk access until a");
+            println!("hardware reset ('reset' or 'reboot hard').");
+        }
+        b"disk" => {
+            println!("diskinfo [diskN]            geometry and FOSFS partition");
+            println!("readsector LBA              hex-dump one raw sector");
+            println!("format [diskN]              create an empty FOSFS (destroys files)");
+            println!("ls [diskN]                  list files");
+            println!("cat [diskN] NAME            print a file");
+            println!("write [diskN] NAME TEXT     create a file from printable ASCII");
+            println!("rm [diskN] NAME             delete a file");
+            println!("copy SRC NAME DST [NEW]     copy between disks; either side may be a");
+            println!("                            peer: HOST[:diskN]/NAME");
+            println!("disk1 is the boot disk; names are lowercase, up to 16 characters.");
+        }
+        b"hw" => {
+            println!("pci                         list every PCI function");
+            println!("pci read B:D.F [OFF [LEN]]  read config space");
+            println!("pci write B:D.F OFF VALUE   write config space");
+            println!("io r8|r16|r32 PORT          read an I/O port");
+            println!("io w8|w16|w32 PORT VALUE    write an I/O port");
+            println!("mmio r8|r16|r32 ADDR        read mapped memory (unmapped is refused)");
+            println!("mmio w8|w16|w32 ADDR VALUE  write mapped memory");
+            println!("hexdump ADDR LEN            dump physical memory");
+            println!("irqstat                     PIC pending/in-service/mask, IRQ counts");
+        }
+        b"term" => {
+            println!("term [PORT [BAUD]]          raw terminal on a serial port (F12 exits)");
+            println!("term net                    wait for a remote shell over Ethernet");
+            println!("term printer | LPTn         raw terminal to a parallel printer");
+            println!("serial                      list serial ports");
+        }
+        b"print" => {
+            println!("printer                     list parallel ports");
+            println!("print [diskN] NAME          print a file");
+            println!("print run CMD...            print another command's output");
+        }
+        b"audio" => {
+            println!("audio                       status of the active audio device");
+            println!("hda                         Intel HDA status (interrupt mode, codecs)");
+            println!("usb play|capture            USB audio (see help usb)");
+        }
+        _ => println!("No help for that. Topics: nic tape usb disk hw term print audio"),
     }
 }
 

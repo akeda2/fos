@@ -42,7 +42,7 @@ EXPECTED_COMMON = (
     b"PS/2 keyboard initialized.",
     b"System: help clear vga about bootinfo memmap memory cpuinfo pci",
     b"Interrupts: ticks uptime irqstat pmem palloc pfree",
-    b"Ethernet: nic [list|use N|send|sniff|discover|peers], chat [PEER_MAC|N]",
+    b"Ethernet: nic [list|use N|send|recv|sniff|discover|peers|map|watchdog|regs]",
     b"fos is a small educational 32-bit x86 operating system.",
     b"This command does not accept arguments.",
     b"Unknown command. Type 'help' for commands.",
@@ -310,7 +310,7 @@ def main() -> None:
             commands = [
                 b"helx\x08p\r",
                 b"about\r",
-                b"help extra\r",
+                b"about extra\r",
                 b"unknown\r",
                 b"vga 80x50\r",
                 b"vga 132x25\r",
