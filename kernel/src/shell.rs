@@ -97,6 +97,7 @@ pub fn run(info: &BootInfo) -> ! {
 
     loop {
         crate::debug::watchdog_pet(); // the idle prompt loop is the foreground's heartbeat
+        crate::debug::mark_stable_if_due(info);
         let byte = console::read_serial_byte().or_else(keyboard::pop_char);
         if ambient_discovery_poll(info) {
             last_network_activity = interrupts::ticks();
@@ -858,6 +859,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 return;
             }
             println!("Halting CPU. Reset or power-cycle to restart.");
+            crate::debug::note_clean_shutdown(info);
             halt_forever();
         }
         b"reset" => {
@@ -865,6 +867,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 return;
             }
             println!("Resetting the machine now (8042 keyboard-controller pulse reset)...");
+            crate::debug::note_clean_shutdown(info);
             reset();
         }
         b"reboot" => reboot_command(info, arguments),
@@ -899,10 +902,12 @@ fn reboot_command(info: &BootInfo, arguments: &[u8]) {
     match arguments {
         b"" | b"soft" => {
             println!("Soft-rebooting: re-entering the boot loader without a hardware reset...");
+            crate::debug::note_clean_shutdown(info);
             crate::reboot::soft_reboot(info);
         }
         b"hard" => {
             println!("Resetting the machine now (8042 keyboard-controller pulse reset)...");
+            crate::debug::note_clean_shutdown(info);
             reset();
         }
         _ => println!("Usage: reboot [soft|hard]"),
@@ -932,9 +937,10 @@ fn debug_command(info: &BootInfo, arguments: &[u8]) {
                 crate::debug::kernel_update_enabled()
             );
             println!(
-                "debug: watchdog={}s ({}).",
+                "debug: watchdog={}s ({}), unclean boots in a row: {}.",
                 crate::debug::watchdog_seconds(),
-                if crate::debug::watchdog_armed() { "armed" } else { "off" }
+                if crate::debug::watchdog_armed() { "armed" } else { "off" },
+                crate::debug::unclean_boots()
             );
         }
         b"hang" if no_arguments(rest) => {
@@ -7771,6 +7777,7 @@ fn serve_kup_put_stop(info: &BootInfo, nic: &nic::Nic, source: [u8; 6], own_mac:
     // network-driven iteration, so skipping POST here matters in exactly
     // the way it doesn't for `reboot-on-crash` (see that module's own
     // doc comment for why *that* path stays hardware-only).
+    crate::debug::note_clean_shutdown(info);
     crate::reboot::soft_reboot(info);
 }
 

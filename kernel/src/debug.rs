@@ -90,8 +90,13 @@ const MAX_CONSECUTIVE_CRASHES: u8 = 5;
 /// +9      crash_count (consecutive un-confirmed reboot-on-crash cycles)
 /// +10..12 slot0_sectors (u16 LE)
 /// +12..14 slot1_sectors (u16 LE)
-/// +14..512 reserved/zero
+/// +14      running (a boot that reached the milestone has not ended cleanly yet)
+/// +15      unclean_boots (consecutive boots that ended without a clean stop)
+/// +16..512 reserved/zero
 /// ```
+/// `running`/`unclean_boots` are only maintained when the `watchdog` option is
+/// on (see `confirm_boot`/`note_clean_shutdown`); `boot/stage2.S` reads and
+/// rewrites the whole sector, so it preserves them.
 #[derive(Clone, Copy, Debug)]
 pub struct SlotMetadata {
     pub active_slot: u8,
@@ -100,6 +105,8 @@ pub struct SlotMetadata {
     pub confirmed: bool,
     pub crash_count: u8,
     pub slot_sectors: [u16; 2],
+    pub running: bool,
+    pub unclean_boots: u8,
 }
 
 impl SlotMetadata {
@@ -127,6 +134,8 @@ impl SlotMetadata {
                     u16::from_le_bytes([sector[10], sector[11]]),
                     u16::from_le_bytes([sector[12], sector[13]]),
                 ],
+                running: sector[14] != 0,
+                unclean_boots: sector[15],
             })
         })
         .ok()
@@ -151,6 +160,8 @@ impl SlotMetadata {
             sector[9] = self.crash_count;
             sector[10..12].copy_from_slice(&self.slot_sectors[0].to_le_bytes());
             sector[12..14].copy_from_slice(&self.slot_sectors[1].to_le_bytes());
+            sector[14] = self.running as u8;
+            sector[15] = self.unclean_boots;
         })
     }
 
@@ -185,7 +196,12 @@ pub fn confirm_boot(info: &BootInfo) {
     let Some(mut metadata) = SlotMetadata::read(info) else {
         return;
     };
-    let already_clean = metadata.pending_slot.is_none() && metadata.crash_count == 0;
+    // The watchdog's hang-loop guard needs an on-disk "did the previous boot end
+    // cleanly" record (RAM does not survive a reset on every machine -- the
+    // AMD/nForce test machine's POST wipes it). Only tracked when the watchdog
+    // is enabled, so a machine without it never pays the extra write.
+    let tracking = watchdog_tracking();
+    let already_clean = metadata.pending_slot.is_none() && metadata.crash_count == 0 && !tracking;
     if already_clean {
         return;
     }
@@ -198,8 +214,63 @@ pub fn confirm_boot(info: &BootInfo) {
         metadata.confirmed = false;
     }
     metadata.crash_count = 0;
+    if tracking {
+        if metadata.running {
+            // The previous boot reached its milestone and never stopped cleanly:
+            // a hang, a crash, a watchdog reset, or a power cut.
+            metadata.unclean_boots = metadata.unclean_boots.saturating_add(1);
+            println!(
+                "debug: the previous boot did not shut down cleanly ({} in a row).",
+                metadata.unclean_boots
+            );
+        }
+        unsafe { UNCLEAN_BOOTS = metadata.unclean_boots };
+        metadata.running = true;
+    }
     if let Err(error) = metadata.write(info) {
         println!("debug: could not confirm this boot on disk: {error:?}");
+    }
+}
+
+/// Whether the on-disk unclean-boot record is being kept: only with `watchdog`.
+fn watchdog_tracking() -> bool {
+    unsafe { CONFIG.watchdog_ticks != 0 }
+}
+
+/// Records a deliberate stop (`halt`, `reset`, `reboot`, a KUP restart): the
+/// next boot will not count this one as unclean and the streak is cleared.
+/// Call just before stopping; a failed write only means a spurious "unclean"
+/// next time.
+pub fn note_clean_shutdown(info: &BootInfo) {
+    if !watchdog_tracking() {
+        return;
+    }
+    if let Some(mut metadata) = SlotMetadata::read(info) {
+        if metadata.running || metadata.unclean_boots != 0 {
+            metadata.running = false;
+            metadata.unclean_boots = 0;
+            let _ = metadata.write(info);
+        }
+    }
+}
+
+/// A boot that has run this long without trouble is healthy: clear the unclean
+/// streak so one bad patch does not disarm the watchdog forever. Called from the
+/// idle loop; does nothing after the first time.
+pub fn mark_stable_if_due(info: &BootInfo) {
+    unsafe {
+        if STABLE_MARKED || !watchdog_tracking() || crate::interrupts::ticks() < WATCHDOG_STABLE_TICKS {
+            return;
+        }
+        STABLE_MARKED = true;
+        if UNCLEAN_BOOTS == 0 {
+            return;
+        }
+        UNCLEAN_BOOTS = 0;
+    }
+    if let Some(mut metadata) = SlotMetadata::read(info) {
+        metadata.unclean_boots = 0;
+        let _ = metadata.write(info);
     }
 }
 
@@ -386,14 +457,6 @@ pub fn report_and_clear_previous_crash() {
     );
     if vector == WATCHDOG_VECTOR {
         println!("debug: that was the software watchdog: the foreground stopped making progress.");
-        // A machine that hangs soon after every boot must not be reset in an
-        // endless loop. The record's tick is the previous boot's uptime, so a
-        // watchdog reset early in a boot leaves this boot unwatched; a hang
-        // after a long healthy run (an ordinary hang) re-arms normally.
-        if ticks < WATCHDOG_EARLY_RESET_TICKS {
-            unsafe { WATCHDOG_GUARD_DISARMED = true };
-            println!("debug: reset only {}s after boot, so the watchdog stays off this boot.", ticks / 100);
-        }
     }
     if record.has_error_code != 0 {
         let error_code = record.error_code;
@@ -583,14 +646,18 @@ const WATCHDOG_DEFAULT_SECONDS: u32 = 60;
 /// (a big sieve) never calls back into the kernel, but a tape that polls
 /// (`should_abort`, `read_key`, `nic_receive`...) pets the watchdog anyway.
 const WATCHDOG_TAPE_LIMIT_TICKS: u64 = 10 * 60 * 100;
-/// A watchdog reset within this uptime of the boot that was reset is treated as
-/// a hang loop and disarms the watchdog for the next boot.
-const WATCHDOG_EARLY_RESET_TICKS: u64 = 5 * 60 * 100;
+/// A boot that runs this long is healthy and clears the unclean-boot streak.
+const WATCHDOG_STABLE_TICKS: u64 = 5 * 60 * 100;
+/// After this many consecutive unclean boots the watchdog stays off, so a
+/// machine that hangs after every boot is not reset in an endless loop.
+const WATCHDOG_MAX_UNCLEAN_BOOTS: u8 = 3;
 
 static mut WATCHDOG_ARMED: bool = false;
 static mut WATCHDOG_LAST_PET: u64 = 0;
 static mut WATCHDOG_TAPE_RUNNING: bool = false;
-static mut WATCHDOG_GUARD_DISARMED: bool = false;
+/// Consecutive unclean boots, as read by `confirm_boot` (0 until then).
+static mut UNCLEAN_BOOTS: u8 = 0;
+static mut STABLE_MARKED: bool = false;
 
 /// Records that the foreground is alive. A single memory write, safe to call
 /// from anywhere and as often as a loop likes. Called from every blocking
@@ -615,7 +682,9 @@ pub fn arm_watchdog() {
     if ticks == 0 {
         return;
     }
-    if unsafe { WATCHDOG_GUARD_DISARMED } {
+    let unclean = unsafe { UNCLEAN_BOOTS };
+    if unclean >= WATCHDOG_MAX_UNCLEAN_BOOTS {
+        println!("debug: watchdog stays off: {unclean} unclean boots in a row (a clean stop or a 5 minute run re-arms it).");
         return;
     }
     watchdog_pet();
@@ -625,6 +694,10 @@ pub fn arm_watchdog() {
 
 pub fn watchdog_seconds() -> u32 {
     unsafe { CONFIG.watchdog_ticks / 100 }
+}
+
+pub fn unclean_boots() -> u8 {
+    unsafe { UNCLEAN_BOOTS }
 }
 
 pub fn watchdog_armed() -> bool {

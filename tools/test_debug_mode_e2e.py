@@ -482,36 +482,66 @@ def test_kup_good_update(tmp_dir: Path, debug_text: str) -> None:
 
 def test_watchdog(tmp_dir: Path) -> None:
     """The software watchdog (`watchdog N` in the debug file): an idle prompt is
-    not a hang, a real hang (`debug hang`) is reset with the stuck address
-    recorded, and a watchdog reset soon after boot keeps it off the next boot so
-    a machine that always hangs cannot be reset in a loop."""
+    not a hang; a real hang (`debug hang`) is reset; the reset boot is counted as
+    unclean (an on-disk record, since RAM does not survive a reset on every
+    machine); a clean `reset` clears the streak; and after three unclean boots in
+    a row the watchdog stays off so a machine that always hangs cannot be reset in
+    a loop."""
     image_path = tmp_dir / "watchdog.img"
     build_image(image_path, "watchdog 3\n")
     guest = SerialGuest(image_path)
-    try:
-        guest.read_until(b"fos> ", 15)
-        status = guest.run_command("debug status")
-        if b"watchdog=3s (armed)" not in status:
-            raise SystemExit(f"watchdog was not armed:\n{status.decode('utf-8', 'replace')}")
-        time.sleep(7)  # well past the 3 s limit, doing nothing at the prompt
-        uptime = guest.run_command("uptime")
-        if b"Uptime:" not in uptime or b"Kernel:" in guest.output[-400:]:
-            raise SystemExit("an idle prompt tripped the watchdog or the machine reset")
-        print("PASS: an idle prompt does not trip the watchdog.")
 
+    def hang_and_wait_for_reboot() -> int:
         checkpoint = len(guest.output)
         guest.process.stdin.write(b"debug hang\r\n")
         guest.process.stdin.flush()
-        guest.read_until(b"WATCHDOG: no foreground progress", 15, checkpoint)
-        guest.read_until(b"Kernel: protected-mode Rust entry reached.", 20, checkpoint)
-        report = guest.read_until(b"stays off this boot", 15, checkpoint).decode("utf-8", "replace")
-        if "previous boot crashed (vector 240)" not in report or "software watchdog" not in report:
-            raise SystemExit(f"watchdog reset was not reported on the next boot:\n{report}")
-        guest.read_until(b"fos> ", 10, checkpoint)
-        status = guest.run_command("debug status")
-        if b"watchdog=3s (off)" not in status:
-            raise SystemExit(f"the hang-loop guard did not keep the watchdog off:\n{status.decode('utf-8', 'replace')}")
-        print("PASS: a hang is reset by the watchdog, reported next boot, and cannot loop.")
+        guest.read_until(b"WATCHDOG: no foreground progress", 20, checkpoint)
+        guest.read_until(b"Kernel: protected-mode Rust entry reached.", 25, checkpoint)
+        guest.read_until(b"fos> ", 15, checkpoint)
+        return checkpoint
+
+    def status() -> str:
+        return guest.run_command("debug status").decode("utf-8", "replace")
+
+    try:
+        guest.read_until(b"fos> ", 15)
+        first = status()
+        if "watchdog=3s (armed)" not in first or "unclean boots in a row: 0" not in first:
+            raise SystemExit(f"watchdog was not armed on a first boot:\n{first}")
+        time.sleep(7)  # well past the 3 s limit, doing nothing at the prompt
+        if "Uptime:" not in guest.run_command("uptime").decode("utf-8", "replace"):
+            raise SystemExit("an idle prompt tripped the watchdog or the machine reset")
+        print("PASS: an idle prompt does not trip the watchdog.")
+
+        mark = hang_and_wait_for_reboot()
+        text = guest.output[mark:].decode("utf-8", "replace")
+        if "did not shut down cleanly (1 in a row)" not in text:
+            raise SystemExit(f"the hang was not counted as an unclean boot:\n{text}")
+        if "watchdog=3s (armed), unclean boots in a row: 1" not in status():
+            raise SystemExit("after one unclean boot the watchdog should still be armed")
+        print("PASS: a hang is reset by the watchdog and counted as an unclean boot.")
+
+        # A deliberate reset is a clean stop and clears the streak.
+        mark = len(guest.output)
+        guest.process.stdin.write(b"reset\r\n")
+        guest.process.stdin.flush()
+        guest.read_until(b"Kernel: protected-mode Rust entry reached.", 25, mark)
+        guest.read_until(b"fos> ", 15, mark)
+        text = guest.output[mark:].decode("utf-8", "replace")
+        if "did not shut down cleanly" in text or "unclean boots in a row: 0" not in status():
+            raise SystemExit(f"a clean reset was counted as unclean:\n{text}")
+        print("PASS: a clean reset clears the unclean-boot streak.")
+
+        # Three hangs in a row: the third reset boot sees 3 unclean boots and stays off.
+        hang_and_wait_for_reboot()  # -> 1 unclean
+        hang_and_wait_for_reboot()  # -> 2 unclean
+        mark = hang_and_wait_for_reboot()  # -> 3 unclean
+        text = guest.output[mark:].decode("utf-8", "replace")
+        if "(3 in a row)" not in text or "watchdog stays off" not in text:
+            raise SystemExit(f"the hang-loop guard did not engage after three unclean boots:\n{text}")
+        if "watchdog=3s (off), unclean boots in a row: 3" not in status():
+            raise SystemExit("the watchdog should be off after three unclean boots")
+        print("PASS: after three unclean boots in a row the watchdog stays off (no reset loop).")
     finally:
         guest.terminate()
 
