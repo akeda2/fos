@@ -217,6 +217,12 @@ pub fn watchdog() -> Result<WatchdogResult, Status> {
 static mut NICS: [Option<Nic>; MAX_NICS] = [const { None }; MAX_NICS];
 static mut NIC_COUNT: usize = 0;
 static mut ACTIVE_INDEX: usize = 0;
+/// True once every initialized NIC has a registered, enabled receive
+/// interrupt. Only then can a polling loop safely `hlt` between polls: the
+/// NIC itself wakes the CPU for each arriving frame. A NIC without a usable
+/// IRQ line would otherwise be polled only once per 10 ms PIT tick and could
+/// overflow its small receive ring at wire speed.
+static mut ALL_RX_INTERRUPT_DRIVEN: bool = false;
 static mut INITIALIZED: bool = false;
 
 #[derive(Debug)]
@@ -334,14 +340,19 @@ pub fn initialize() -> Result<usize, Status> {
                 Err(Status::NotPresent)
             }
         } else {
+            let mut all_driven = true;
             for index in 0..NIC_COUNT {
                 let nic = NICS[index].as_ref().unwrap();
+                let mut driven = false;
                 if let Some(irq) = nic.interrupt_stats().irq {
                     if interrupts::register_pci_irq(irq, handle_pci_irq) {
                         nic.enable_interrupts();
+                        driven = true;
                     }
                 }
+                all_driven &= driven;
             }
+            ALL_RX_INTERRUPT_DRIVEN = all_driven;
             Ok(NIC_COUNT)
         }
     }
@@ -383,6 +394,12 @@ pub fn get_at(index: usize) -> Option<&'static Nic> {
 
 pub fn count() -> usize {
     initialize().unwrap_or(0)
+}
+
+/// See `ALL_RX_INTERRUPT_DRIVEN`: whether a polling loop may halt between
+/// polls without risking a missed or late frame.
+pub fn all_rx_interrupt_driven() -> bool {
+    unsafe { ALL_RX_INTERRUPT_DRIVEN }
 }
 
 pub fn active_index() -> usize {

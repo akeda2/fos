@@ -145,6 +145,21 @@ pub mod x86 {
         }
     }
 
+    /// `sti; hlt`: enable interrupts and halt until the next one arrives, as
+    /// one back-to-back pair. The CPU runs the instruction after `sti` before
+    /// it can take an interrupt, so a wakeup that becomes pending just before
+    /// this call cannot slip in between the two and be slept through -- the
+    /// race `halt_until_interrupt`'s comment argues away for the idle prompt.
+    /// Used by `shell::idle_wait` for loops that poll a NIC: the NIC's own
+    /// receive interrupt (or the 100 Hz PIT tick, at worst) ends the sleep.
+    /// Only call it where interrupts are meant to be on afterwards.
+    #[inline]
+    pub fn wait_for_interrupt() {
+        unsafe {
+            core::arch::asm!("sti", "hlt", options(nomem, nostack));
+        }
+    }
+
     /// Bound on the 8042 input-buffer-clear poll in [`reset_via_8042`]. A
     /// large, arbitrary spin count: cheap to make generous since normal
     /// hardware clears the bit almost immediately, and this path is never

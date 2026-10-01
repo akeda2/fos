@@ -1,4 +1,4 @@
-use crate::arch::x86::{halt_forever, halt_until_interrupt, reset};
+use crate::arch::x86::{halt_forever, halt_until_interrupt, reset, wait_for_interrupt};
 use crate::audio;
 use crate::boot_info::{BootInfo, MemoryRegion};
 use crate::console;
@@ -123,6 +123,20 @@ pub fn run(info: &BootInfo) -> ! {
         };
         editor.feed(byte, info);
         last_activity = interrupts::ticks();
+    }
+}
+
+/// Sleeps the CPU until the next interrupt, for a polling loop whose latest
+/// iteration found nothing to do (no frame, no key, no work due). Without it
+/// those loops spin at 100% CPU. Only sleeps when every NIC has an enabled
+/// receive interrupt (`nic::all_rx_interrupt_driven`), so an arriving frame
+/// wakes the CPU at once; the 100 Hz PIT tick and the keyboard IRQ bound every
+/// other wait to 10 ms or less. Serial input has no interrupt, so loops that
+/// read COM1 (`term`, `chat`) deliberately do not call this: a 16-byte UART
+/// FIFO could overflow during a 10 ms sleep.
+fn idle_wait() {
+    if nic::all_rx_interrupt_driven() {
+        wait_for_interrupt();
     }
 }
 
@@ -2504,6 +2518,7 @@ fn term_net(info: &BootInfo) {
             // unrecovered indefinitely.
             poll_background_work(nic::get().ok());
             let mut connected_peer = None;
+            let mut received_any = false;
             for index in 0..interface_count {
                 let Some(interface) = nic::get_at(index) else {
                     continue;
@@ -2511,6 +2526,7 @@ fn term_net(info: &BootInfo) {
                 let Some(received) = interface.receive(&mut recv_buffer) else {
                     continue;
                 };
+                received_any = true;
                 let frame = &recv_buffer[..received];
                 if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
                     continue;
@@ -2554,6 +2570,9 @@ fn term_net(info: &BootInfo) {
             }
             if let Some(found) = connected_peer {
                 break found;
+            }
+            if !received_any {
+                idle_wait();
             }
         };
 
@@ -2622,7 +2641,11 @@ fn term_net(info: &BootInfo) {
                 break 'session;
             }
 
-            if let Some(received) = nic.receive(&mut recv_buffer) {
+            let Some(received) = nic.receive(&mut recv_buffer) else {
+                idle_wait();
+                continue;
+            };
+            {
                 let frame = &recv_buffer[..received];
                 if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
                     continue;
@@ -3614,6 +3637,8 @@ fn nic_sniff() {
                 println!("#{captured} {length} bytes (too short to hold an Ethernet header).");
             }
             dump_bytes(0, frame);
+        } else {
+            idle_wait();
         }
     }
 
@@ -4282,6 +4307,7 @@ fn nic_discover() {
             }
             next_broadcast = interrupts::ticks() + DISCOVER_REBROADCAST_TICKS;
         }
+        let mut received_any = false;
         for index in 0..count {
             let Some(nic) = nic::get_at(index) else {
                 continue;
@@ -4290,6 +4316,7 @@ fn nic_discover() {
             let Some(length) = nic.receive(&mut buffer) else {
                 continue;
             };
+            received_any = true;
             let frame = &buffer[..length];
             if frame.len() < 15 || frame[12..14] != CHAT_ETHERTYPE {
                 continue;
@@ -4316,6 +4343,9 @@ fn nic_discover() {
                 }
                 _ => continue,
             }
+        }
+        if !received_any {
+            idle_wait();
         }
     }
 
@@ -6313,6 +6343,7 @@ fn tape_load_net() {
             next_status = interrupts::ticks() + TAPE_STATUS_TICKS;
         }
         let Some(received) = nic.receive(&mut buffer) else {
+            idle_wait();
             continue;
         };
         let frame = &buffer[..received];
@@ -6758,6 +6789,7 @@ fn netfs_get(
             return Err(NetfsError::NoReply);
         }
         let Some(length) = nic.receive(&mut buffer) else {
+            idle_wait();
             continue;
         };
         let frame = &buffer[..length];
@@ -6891,6 +6923,7 @@ fn netfs_put(
             return Err(NetfsError::NoReply);
         }
         let Some(length) = nic.receive(&mut buffer) else {
+            idle_wait();
             continue;
         };
         let frame = &buffer[..length];

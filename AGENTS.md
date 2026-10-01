@@ -1962,6 +1962,17 @@ machine is truly idle and halting. Full detail (the throughput-regression
 verification this required) is in `docs/history/networking-and-discovery.md`.
 
 
+
+**Network-polling loops also halt (`shell::idle_wait`).** `term_net`'s wait and
+session loops, `nic sniff`, `nic discover`, `tape load net` and the NETFS wait
+loops call `idle_wait()` (`sti; hlt`, `arch::x86::wait_for_interrupt`) when an
+iteration found nothing, so they no longer pin the CPU. This is only done when
+every NIC has an enabled receive IRQ (`nic::all_rx_interrupt_driven`), so a
+frame wakes the CPU immediately; otherwise the loops spin as before. Loops that
+read COM1 (`term`, `chat`) must not halt: serial has no IRQ and a 16-byte FIFO
+can overflow. Tapes still spin until they call a future wait callback.
+`make test-idle-cpu` measures QEMU's host CPU use (about 7% idle vs 100% for a
+spinning tape).
 ## MSI/MSI-X support: a local APIC, and Intel HDA as the first consumer
 
 `kernel/src/lapic.rs` is a minimal local APIC driver, added to receive
