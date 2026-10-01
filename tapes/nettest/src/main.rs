@@ -52,12 +52,19 @@ struct Session<'a> {
     rng: Rng,
     /// The statistics panel (`view on`); see `View`.
     view: View,
+    /// False while the startup arguments are being applied.
+    started: bool,
 }
 
 enum Outcome {
     Continue,
     Quit,
+    /// A command that was not understood or had a bad value (already
+    /// reported at the prompt; startup turns it into a usage message).
+    Error,
 }
+
+extern "C" fn silent(_byte: u32) {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(
@@ -121,6 +128,7 @@ pub extern "C" fn tape_main(
         links: [Direction::new(first), Direction::new(second)],
         rng: Rng::new(ticks() as u32 ^ 0x5bd1_e995),
         view: View::new(),
+        started: false,
     };
 
     let arguments = if args_len == 0 {
@@ -189,6 +197,7 @@ pub extern "C" fn tape_main(
     let mut frame = [0u8; MAX_FRAME];
     let mut line = [0u8; LINE_CAPACITY];
     let mut line_length = 0usize;
+    session.started = true;
     session.view.start_tick = ticks();
     if session.view.wanted {
         view_start(putc, &mut session);
@@ -347,9 +356,16 @@ fn apply_startup(
                 }
                 index += 1;
             } else {
-                // An ordinary command takes the rest of the segment.
+                // An ordinary command takes the rest of the segment; its normal
+                // echo (`show` after a change) is suppressed while starting up.
                 let start = word.as_ptr() as usize - segment.as_ptr() as usize;
-                return matches!(run_line(putc, session, &segment[start..]), Outcome::Continue);
+                if !matches!(run_line(silent, session, &segment[start..]), Outcome::Continue) {
+                    print_bytes(putc, b"nettest: cannot use '");
+                    print_bytes(putc, &segment[start..]);
+                    print_bytes(putc, b"'\n");
+                    return false;
+                }
+                break;
             }
         }
     }
@@ -471,6 +487,8 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
             }
         }
         b"view" => match words.get(1).copied() {
+            // Before the loop starts (a config file line) only note the wish.
+            Some(b"on") if count == 2 && !session.started => session.view.wanted = true,
             Some(b"on") if count == 2 => view_start(putc, session),
             Some(b"off") if count == 2 => view_stop(putc, session),
             _ => print_bytes(putc, b"use: view on | view off\n"),
@@ -501,11 +519,14 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
             }
             if configure(session, words[0], way, &cleaned[..used]).is_err() {
                 print_bytes(putc, b"bad value; type help\n");
-            } else {
-                show(putc, session);
+                return Outcome::Error;
             }
+            show(putc, session);
         }
-        _ => print_bytes(putc, b"unknown command; type help\n"),
+        _ => {
+            print_bytes(putc, b"unknown command; type help\n");
+            return Outcome::Error;
+        }
     }
     Outcome::Continue
 }

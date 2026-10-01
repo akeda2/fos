@@ -206,8 +206,11 @@ def main():
     # Default 128 MiB guest: no big pool, so the static fallback queue is used.
     guest, seg_a, seg_b = launch(128)
     try:
-        banner = start_tape(guest, seg_a, "1 2")
+        # The shipped example file (ports, a preset, a per-direction setting, a seed).
+        banner = start_tape(guest, seg_a, "@nettest.cfg")
         check("256 frames of queue per way" in banner, "128 MiB guest falls back to the static queue", guest)
+        check("NIC 1 <-> NIC 2" in banner and "loss 10.0% x6" in banner and "b>a  loss 2.0%" in banner,
+              "the shipped nettest.cfg configures ports, a preset and a per-direction loss", guest)
         command(guest, seg_a, "quit", b"fos> ")
     finally:
         guest.stop()

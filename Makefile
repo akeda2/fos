@@ -51,6 +51,7 @@ TAPE_IMAGE_ARGS := \
 	--file net-dhcp.bin $(TAPE_NET_DHCP_BIN) \
 	--file audio-rtp.bin $(TAPE_AUDIO_RTP_BIN) \
 	--file router.cfg tapes/router/router.cfg \
+	--file nettest.cfg tapes/nettest/nettest.cfg \
 	--file debug tools/default-debug.txt
 EXTRA_FOSFS_FILES ?=
 

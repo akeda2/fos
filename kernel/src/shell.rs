@@ -6241,7 +6241,9 @@ enum TapeArgumentSource<'a> {
 /// can never appear in a real file name to collide with this.
 fn tape_argument_source(arguments: &[u8]) -> TapeArgumentSource<'_> {
     let (first, remainder) = take_word(arguments);
-    let (candidate, trailing) = if first == b"router" {
+    // The tape's own name is an optional leading word, as `tape run router @FILE`
+    // always allowed; `nettest` reads its settings file the same way.
+    let (candidate, trailing) = if first == b"router" || first == b"nettest" {
         take_word(remainder)
     } else {
         (first, remainder)
