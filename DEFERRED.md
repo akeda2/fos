@@ -212,3 +212,37 @@ loader's partition layout. That may still be a genuinely useful way to
 begin (no disk image to touch while the shape of things is still
 changing), with promotion to a real, dedicated boot entry point coming
 later, once/if this path becomes serious enough to be more than a demo.
+
+## Native USB keyboard
+
+Not built. A USB keyboard works today only through the BIOS's PS/2 emulation
+("USB Legacy Support"), which is what the existing PS/2 driver sees. Estimates
+from the current code, not a prototype:
+
+- The HID boot-protocol part is small: enumerate, select configuration 1,
+  `SET_PROTOCOL(boot)`, poll the interrupt-IN endpoint for 8-byte reports
+  (modifiers + six key codes), diff consecutive reports into key-down events,
+  add key repeat and a HID-usage-to-ASCII table, then feed the same `KeyEvent`
+  stream `keyboard.rs` produces (including the ANSI cursor-key sequences).
+  About 200 lines.
+- `uhci.rs` has control, bulk and isochronous transfers but no *interrupt*
+  transfers: a new TD type queued into the frame list at the endpoint's polling
+  interval. Nothing polls USB at an idle prompt either, so it would be serviced
+  from `poll_background_work` (as the USB audio stream is), which also covers
+  tapes and blocking loops.
+- The big cost is controller coverage. The driver is UHCI only. Sandy Bridge
+  boards (the 82579 test machine) have no UHCI at all -- only EHCI
+  (`8086:1c26`/`1c2d`) and an NEC xHCI (`1033:0194`) -- so a native keyboard
+  there needs EHCI (async/periodic schedules, companion hand-off, roughly
+  800-1500 lines) or xHCI (command/event rings, slot contexts; larger), plus a
+  hub driver if the keyboard sits behind one.
+- Conflict to design around: starting UHCI breaks the BIOS's legacy USB
+  emulation (see "USB audio and USB-boot media do not reliably coexist"). A
+  native driver must take the controller over cleanly (clear the legacy-support
+  register in PCI config space) early in boot, before the PS/2 path is relied
+  on, or the keyboard that works now stops working.
+
+Verdict: only UHCI + QEMU `-device usb-kbd` is cheap (about a day) and only
+helps old machines such as the Pentium 4. Anything useful on newer machines is
+an EHCI/xHCI project. The BIOS emulation already provides a keyboard; the gain
+would be avoiding its quirks (no key-up events, some keys ignored). Deferred.
