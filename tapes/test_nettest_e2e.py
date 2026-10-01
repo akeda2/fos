@@ -220,8 +220,9 @@ def main():
               "256 MiB guest uses the big-pool queue", guest)
 
         # Clean link, both directions.
-        # Right after start the tape is slow for about a second (observed: the first
-        # frames after the prompt are forwarded ~1 s late, then it settles to ~10 ms).
+        # QEMU's e1000 model delivers nothing for about a second after the guest
+        # turns on promiscuous mode (the e1000e model does not; the bridge tape
+        # shows the same), so give it time before timing anything.
         seg_a.drain(1.5), seg_b.drain(1.5)
         burst(seg_a, 5, HOST_B, HOST_A)
         got = seg_b.drain(0.5)
@@ -286,6 +287,31 @@ def main():
         burst(seg_a, 20, HOST_B, HOST_A, size=1000, gap=0.001)
         got = seg_b.drain(1.5)
         check(0 < len(got) < 20, f"queue 3 tail-dropped ({len(got)} of 20 arrived)", guest)
+
+        # Presets and the optional statistics panel.
+        listing = command(guest, seg_a, "presets")
+        check("badwifi" in listing and "satellite" in listing, "presets lists the named presets", guest)
+        shown = command(guest, seg_a, "preset ab badwifi")
+        check("loss 10.0% x6" in shown and "delay 40+-60ms" in shown and "rate 3000kbit" in shown,
+              "preset badwifi sets bursty loss, jitter and a slow rate", guest)
+        check("b>a  clean" in shown, "a preset on one direction leaves the other clean", guest)
+        bad = command(guest, seg_a, "preset ab nonsense")
+        check("bad value" in bad, "an unknown preset is refused", guest)
+        command(guest, seg_a, "reset")
+        command(guest, seg_a, "reset stats")
+        mark = len(guest.output)
+        command(guest, seg_a, "view on")
+        panel = guest.text(mark)
+        check("nettest  NIC 1 <-> NIC 2" in panel and "\x1b[13;25r" in panel,
+              "view on draws the panel and confines scrolling below it", guest)
+        seg_b.drain()
+        burst(seg_a, 10, HOST_B, HOST_A)
+        seg_b.drain(0.2)
+        guest.pump(1.2)
+        check("in 10 (" in guest.text(mark), "the panel shows live counters", guest)
+        mark = len(guest.output)
+        command(guest, seg_a, "view off")
+        check("\x1b[r" in guest.text(mark), "view off restores full-screen scrolling", guest)
 
         # Counters, reset, quit.
         stats = command(guest, seg_a, "stats")

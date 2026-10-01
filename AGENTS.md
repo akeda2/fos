@@ -130,6 +130,13 @@ Try not to fill up this file, put new stuff in the above files or under docs/
 - `tapes/bridge/` is a raw layer-2 learning bridge tape. It uses the
   per-interface tape callbacks, enables promiscuous mode on selected ports,
   and forwards Ethernet frames without implementing IP routing.
+- `tapes/nettest/` is a two-port link impairment tape (per-direction loss with
+  bursts, delay/jitter, rate limit, queue limit, named presets such as
+  `badwifi`, optional ANSI statistics panel). The engine is `tapes/nettest/src/
+  lib.rs` (host unit tests); its e2e test links the guest NICs to the host over
+  TCP because QEMU's multicast netdev echoes a guest's own frames back to it.
+  QEMU's e1000 model also blackholes receive for ~1 s after promiscuous mode is
+  enabled (e1000e does not); see README.md "Test tape: `tapes/nettest/`".
 - `tapes/router/` is a fixed-buffer layer-3 tape. It reuses the bridge's
   polling shape, answers ARP per configured interface, and forwards IPv4
   packets between directly connected subnets while updating TTL and header

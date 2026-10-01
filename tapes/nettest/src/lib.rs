@@ -76,6 +76,37 @@ impl Config {
     }
 }
 
+/// Named starting points for a realistic bad link, as `(name, description)`.
+pub const PRESETS: [(&[u8], &[u8]); 5] = [
+    (b"badwifi", b"weak signal: 10% bursty loss, 40+-60 ms, 3 Mbit/s"),
+    (b"wifi", b"busy WiFi: 3% bursty loss, 15+-10 ms, 20 Mbit/s"),
+    (b"cellular", b"mobile data: 1% loss, 70+-30 ms, 8 Mbit/s"),
+    (b"satellite", b"600+-20 ms, 1% loss, 10 Mbit/s, deep queue"),
+    (b"dsl", b"slow line: 20+-2 ms, 2 Mbit/s, shallow queue"),
+];
+
+/// The impairments for a named preset (see [`PRESETS`]); `queue_limit` is the
+/// most the storage allows, and presets that want a shallower queue are capped
+/// by it.
+pub fn preset(name: &[u8], queue_limit: u32) -> Option<Config> {
+    let (loss_permille, burst, delay_ms, jitter_ms, rate_kbit, queue) = match name {
+        b"badwifi" => (100, 6, 40, 60, 3000, 64),
+        b"wifi" => (30, 4, 15, 10, 20_000, 128),
+        b"cellular" => (10, 1, 70, 30, 8000, 128),
+        b"satellite" => (10, 1, 600, 20, 10_000, 512),
+        b"dsl" => (0, 1, 20, 2, 2000, 48),
+        _ => return None,
+    };
+    Some(Config {
+        loss_permille,
+        burst,
+        delay_ms,
+        jitter_ms,
+        rate_kbit,
+        queue_limit: queue.min(queue_limit),
+    })
+}
+
 /// Counters for one direction (wrapping, like every counter in this kernel).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Stats {
@@ -409,6 +440,17 @@ mod tests {
                 now += 500;
             }
         }
+    }
+
+    #[test]
+    fn every_listed_preset_exists_and_unknown_ones_do_not() {
+        for (name, _) in PRESETS {
+            let config = preset(name, 1000).unwrap();
+            assert!(!config.is_clean());
+            assert!(config.burst >= 1 && config.queue_limit >= 1);
+        }
+        assert_eq!(preset(b"nope", 1000), None);
+        assert_eq!(preset(b"satellite", 100).unwrap().queue_limit, 100);
     }
 
     #[test]

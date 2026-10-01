@@ -24,7 +24,9 @@
 extern crate nettest_tape;
 
 use core::ptr::addr_of_mut;
-use nettest_tape::{Config, Direction, MAX_FRAME, Rng, SLOT_BYTES, parse_permille, parse_u32};
+use nettest_tape::{
+    Config, Direction, MAX_FRAME, PRESETS, Rng, SLOT_BYTES, parse_permille, parse_u32, preset,
+};
 use tape_rt::{print_bytes, print_u32};
 
 const TAPE_EVENT_ABORT: u32 = 1;
@@ -48,6 +50,8 @@ const DIRECTION_NAMES: [&[u8]; 2] = [b"a>b", b"b>a"];
 struct Session<'a> {
     links: [Direction<'a>; 2],
     rng: Rng,
+    /// The statistics panel (`view on`); see `View`.
+    view: View,
 }
 
 enum Outcome {
@@ -116,6 +120,7 @@ pub extern "C" fn tape_main(
     let mut session = Session {
         links: [Direction::new(first), Direction::new(second)],
         rng: Rng::new(ticks() as u32 ^ 0x5bd1_e995),
+        view: View::new(),
     };
 
     let arguments = if args_len == 0 {
@@ -176,14 +181,25 @@ pub extern "C" fn tape_main(
     print_bytes(putc, b" frames of queue per way.\n");
     print_bytes(putc, b"Type help for commands; Escape stops.\n");
     show(putc, &session);
+    let mut ports_for_view = ports;
+    ports_for_view[0] += 1;
+    ports_for_view[1] += 1;
+    session.view.ports = ports_for_view;
 
     let mut frame = [0u8; MAX_FRAME];
     let mut line = [0u8; LINE_CAPACITY];
     let mut line_length = 0usize;
+    session.view.start_tick = ticks();
+    if session.view.wanted {
+        view_start(putc, &mut session);
+    }
     print_bytes(putc, b"nettest> ");
     'run: loop {
         let now_us = ticks() * 10_000;
         let mut busy = false;
+        if session.view.on {
+            view_update(putc, &mut session, now_us / 10_000);
+        }
 
         // Receive from each port and push through that direction's impairments.
         for ingress in 0..2 {
@@ -203,7 +219,7 @@ pub extern "C" fn tape_main(
             if macs.iter().any(|mac| mac == destination || mac == source) {
                 continue;
             }
-            let Session { links, rng } = &mut session;
+            let Session { links, rng, .. } = &mut session;
             links[ingress].ingest(&frame[..received], now_us, rng);
         }
 
@@ -251,6 +267,9 @@ pub extern "C" fn tape_main(
 
     for &port in &ports {
         let _ = nic_set_promiscuous_at(port, 0);
+    }
+    if session.view.on {
+        view_stop(putc, &mut session);
     }
     print_bytes(putc, b"nettest stopped.\n");
     print_stats(putc, &session);
@@ -339,6 +358,12 @@ fn apply_startup(
 
 /// `name[.ab|.ba]=value[:value]`.
 fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
+    if key == b"view" {
+        // Before the tape's loop starts this only records the wish; the panel
+        // is drawn once the ports are known.
+        session.view.wanted = value == b"on";
+        return value == b"on" || value == b"off";
+    }
     let (name, way) = match key.iter().position(|&byte| byte == b'.') {
         Some(dot) => (&key[..dot], parse_way(&key[dot + 1..])),
         None => (key, Some(Ways::Both)),
@@ -388,6 +413,9 @@ fn configure(session: &mut Session<'_>, name: &[u8], way: Ways, args: &[&[u8]]) 
         let link = &mut session.links[index];
         let mut config: Config = link.config;
         match name {
+            b"preset" => {
+                config = preset(first, link.queue.capacity() as u32).ok_or(())?;
+            }
             b"loss" => {
                 config.loss_permille = parse_permille(first).ok_or(())?;
                 if let Some(burst) = second {
@@ -439,7 +467,20 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
                 print_bytes(putc, b"link restored to clean\n");
             }
         }
-        b"loss" | b"delay" | b"rate" | b"queue" | b"seed" => {
+        b"view" => match words.get(1).copied() {
+            Some(b"on") if count == 2 => view_start(putc, session),
+            Some(b"off") if count == 2 => view_stop(putc, session),
+            _ => print_bytes(putc, b"use: view on | view off\n"),
+        },
+        b"presets" => {
+            for (name, description) in PRESETS {
+                print_bytes(putc, name);
+                print_bytes(putc, b"  ");
+                print_bytes(putc, description);
+                putc(u32::from(b'\n'));
+            }
+        }
+        b"loss" | b"delay" | b"rate" | b"queue" | b"seed" | b"preset" => {
             // An optional direction word first: `loss ab 5`.
             let (way, args) = match words.get(1).and_then(|word| parse_way(word)) {
                 Some(way) if count > 1 => (way, &words[2..count]),
@@ -472,7 +513,9 @@ fn print_help(putc: Putc) {
           delay [ab|ba] MS [JITTER]    hold frames MS ms +/- JITTER ms\n\
           rate [ab|ba] KBIT            link speed; 0 = unlimited\n\
           queue [ab|ba] N              frames allowed in flight\n\
+          preset [ab|ba] NAME          a named profile; \"presets\" lists them\n\
           seed N | show | stats        repeatable randomness; settings; counters\n\
+          view on|off                  live statistics panel above the prompt\n\
           reset [stats]                clean link, or clear the counters\n\
           quit                         stop (Escape also stops)\n",
     );
@@ -485,37 +528,42 @@ fn print_tenths(putc: Putc, permille: u16) {
 }
 
 fn show(putc: Putc, session: &Session<'_>) {
-    for (index, link) in session.links.iter().enumerate() {
-        let config = &link.config;
-        print_bytes(putc, DIRECTION_NAMES[index]);
-        if config.is_clean() {
-            print_bytes(putc, b"  clean");
-        } else {
-            print_bytes(putc, b"  loss ");
-            print_tenths(putc, config.loss_permille);
-            print_bytes(putc, b"%");
-            if config.burst > 1 {
-                print_bytes(putc, b" x");
-                print_u32(putc, u32::from(config.burst));
-            }
-            print_bytes(putc, b"  delay ");
-            print_u32(putc, config.delay_ms);
-            if config.jitter_ms > 0 {
-                print_bytes(putc, b"+-");
-                print_u32(putc, config.jitter_ms);
-            }
-            print_bytes(putc, b"ms  rate ");
-            if config.rate_kbit == 0 {
-                print_bytes(putc, b"off");
-            } else {
-                print_u32(putc, config.rate_kbit);
-                print_bytes(putc, b"kbit");
-            }
-        }
-        print_bytes(putc, b"  queue ");
-        print_u32(putc, config.queue_limit);
+    for index in 0..2 {
+        print_config_line(putc, index, &session.links[index].config);
         putc(u32::from(b'\n'));
     }
+}
+
+/// One direction's settings on one line (no newline), shared by `show` and the
+/// statistics panel.
+fn print_config_line(putc: Putc, index: usize, config: &Config) {
+    print_bytes(putc, DIRECTION_NAMES[index]);
+    if config.is_clean() {
+        print_bytes(putc, b"  clean");
+    } else {
+        print_bytes(putc, b"  loss ");
+        print_tenths(putc, config.loss_permille);
+        print_bytes(putc, b"%");
+        if config.burst > 1 {
+            print_bytes(putc, b" x");
+            print_u32(putc, u32::from(config.burst));
+        }
+        print_bytes(putc, b"  delay ");
+        print_u32(putc, config.delay_ms);
+        if config.jitter_ms > 0 {
+            print_bytes(putc, b"+-");
+            print_u32(putc, config.jitter_ms);
+        }
+        print_bytes(putc, b"ms  rate ");
+        if config.rate_kbit == 0 {
+            print_bytes(putc, b"off");
+        } else {
+            print_u32(putc, config.rate_kbit);
+            print_bytes(putc, b"kbit");
+        }
+    }
+    print_bytes(putc, b"  queue ");
+    print_u32(putc, config.queue_limit);
 }
 
 fn print_stats(putc: Putc, session: &Session<'_>) {
@@ -541,4 +589,174 @@ fn print_stats(putc: Putc, session: &Session<'_>) {
             putc(u32::from(b'\n'));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The optional statistics panel (`view on`, or `view=on` at startup).
+//
+// It uses only ANSI sequences, so it looks the same on the local screen and on
+// a `term net` / serial terminal: the top PANEL_ROWS rows hold the panel,
+// redrawn twice a second at absolute positions between `ESC [ s` / `ESC [ u`
+// (save/restore cursor), and `ESC [ top;bottom r` confines scrolling to the
+// rows below it, so command output and the prompt scroll there and never
+// disturb the panel. Drawing costs a few hundred bytes per update.
+
+const PANEL_ROWS: u32 = 12;
+const SCREEN_ROWS: u32 = 25;
+const PANEL_INTERVAL_TICKS: u64 = 50;
+const BAR_WIDTH: usize = 24;
+
+struct View {
+    /// `view=on` was given before the ports were known.
+    wanted: bool,
+    on: bool,
+    ports: [u32; 2],
+    start_tick: u64,
+    last_tick: u64,
+    previous: [(u32, u32); 2],
+    rates: [(u32, u32); 2],
+}
+
+impl View {
+    const fn new() -> Self {
+        Self {
+            wanted: false,
+            on: false,
+            ports: [1, 2],
+            start_tick: 0,
+            last_tick: 0,
+            previous: [(0, 0); 2],
+            rates: [(0, 0); 2],
+        }
+    }
+}
+
+fn csi(putc: Putc, parameters: &[u32], final_byte: u8) {
+    putc(0x1b);
+    putc(u32::from(b'['));
+    for (index, &value) in parameters.iter().enumerate() {
+        if index != 0 {
+            putc(u32::from(b';'));
+        }
+        print_u32(putc, value);
+    }
+    putc(u32::from(final_byte));
+}
+
+fn view_start(putc: Putc, session: &mut Session<'_>) {
+    session.view.on = true;
+    session.view.last_tick = 0;
+    csi(putc, &[2], b'J');
+    csi(putc, &[PANEL_ROWS + 1, SCREEN_ROWS], b'r');
+    csi(putc, &[SCREEN_ROWS, 1], b'H');
+    view_draw(putc, session, 0);
+}
+
+fn view_stop(putc: Putc, session: &mut Session<'_>) {
+    session.view.on = false;
+    csi(putc, &[], b'r');
+    csi(putc, &[2], b'J');
+    csi(putc, &[1, 1], b'H');
+}
+
+fn view_update(putc: Putc, session: &mut Session<'_>, now_tick: u64) {
+    if now_tick - session.view.last_tick < PANEL_INTERVAL_TICKS {
+        return;
+    }
+    let elapsed = (now_tick - session.view.last_tick).max(1) as u32;
+    session.view.last_tick = now_tick;
+    for index in 0..2 {
+        let stats = session.links[index].stats;
+        let (previous_in, previous_out) = session.view.previous[index];
+        // Per second: delta * 100 ticks / elapsed ticks.
+        session.view.rates[index] = (
+            stats.received.wrapping_sub(previous_in).saturating_mul(100) / elapsed,
+            stats.sent.wrapping_sub(previous_out).saturating_mul(100) / elapsed,
+        );
+        session.view.previous[index] = (stats.received, stats.sent);
+    }
+    view_draw(putc, session, now_tick);
+}
+
+fn view_row(putc: Putc, row: u32) {
+    csi(putc, &[row, 1], b'H');
+}
+
+fn view_draw(putc: Putc, session: &Session<'_>, now_tick: u64) {
+    putc(0x1b);
+    putc(u32::from(b'['));
+    putc(u32::from(b's'));
+    view_row(putc, 1);
+    print_bytes(putc, b" nettest  NIC ");
+    print_u32(putc, session.view.ports[0]);
+    print_bytes(putc, b" <-> NIC ");
+    print_u32(putc, session.view.ports[1]);
+    print_bytes(putc, b"   up ");
+    let seconds = (now_tick.saturating_sub(session.view.start_tick) / 100) as u32;
+    print_two_digits(putc, seconds / 3600);
+    putc(u32::from(b':'));
+    print_two_digits(putc, seconds / 60 % 60);
+    putc(u32::from(b':'));
+    print_two_digits(putc, seconds % 60);
+    csi(putc, &[], b'K');
+    view_row(putc, 2);
+    for _ in 0..78 {
+        putc(u32::from(b'-'));
+    }
+    csi(putc, &[], b'K');
+    for index in 0..2 {
+        let link = &session.links[index];
+        let stats = &link.stats;
+        let base = 3 + index as u32 * 4;
+        view_row(putc, base);
+        print_config_line(putc, index, &link.config);
+        csi(putc, &[], b'K');
+        view_row(putc, base + 1);
+        print_bytes(putc, b"  in ");
+        print_u32(putc, stats.received);
+        print_bytes(putc, b" (");
+        print_u32(putc, session.view.rates[index].0);
+        print_bytes(putc, b"/s)  out ");
+        print_u32(putc, stats.sent);
+        print_bytes(putc, b" (");
+        print_u32(putc, session.view.rates[index].1);
+        print_bytes(putc, b"/s)  lost ");
+        print_u32(putc, stats.lost);
+        print_bytes(putc, b"  qdrop ");
+        print_u32(putc, stats.queue_drops);
+        csi(putc, &[], b'K');
+        view_row(putc, base + 2);
+        print_bytes(putc, b"  queue [");
+        let limit = link.config.queue_limit.max(1) as usize;
+        let depth = link.queue.len();
+        let filled = (depth * BAR_WIDTH).div_ceil(limit).min(BAR_WIDTH);
+        for position in 0..BAR_WIDTH {
+            putc(u32::from(if position < filled { b'#' } else { b'.' }));
+        }
+        print_bytes(putc, b"] ");
+        print_u32(putc, depth as u32);
+        print_bytes(putc, b"/");
+        print_u32(putc, limit as u32);
+        print_bytes(putc, b"  max ");
+        print_u32(putc, stats.max_depth);
+        csi(putc, &[], b'K');
+        view_row(putc, base + 3);
+        csi(putc, &[], b'K');
+    }
+    view_row(putc, 11);
+    for _ in 0..78 {
+        putc(u32::from(b'-'));
+    }
+    csi(putc, &[], b'K');
+    view_row(putc, 12);
+    print_bytes(putc, b" view off | help | quit");
+    csi(putc, &[], b'K');
+    putc(0x1b);
+    putc(u32::from(b'['));
+    putc(u32::from(b'u'));
+}
+
+fn print_two_digits(putc: Putc, value: u32) {
+    putc(u32::from(b'0' + (value / 10 % 10) as u8));
+    putc(u32::from(b'0' + (value % 10) as u8));
 }
