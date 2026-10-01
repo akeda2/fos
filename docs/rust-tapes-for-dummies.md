@@ -137,6 +137,17 @@ extern "C" fn tape_main(
   again. See `tapes/bridge/src/main.rs` for the pattern. A tape that depends on
   `tape-rt` can instead call `tape_rt::set_wait_hook(wait_for_event)` once and
   then `tape_rt::idle()` from any helper function, with no extra parameter.
+- `set_input_mode(mode)` is slot 37, after `wait_for_event`. Every tape starts
+  with mode 0: `read_key` erases the previous character on screen itself when
+  it returns Backspace. Bit 0 set (`tape_rt::set_raw_keys(true)`) turns that
+  off for a tape that moves the cursor and redraws on its own. Cursor keys
+  already arrive through `read_key` as ANSI sequences (`ESC [ D` is Left), the
+  same from the local keyboard and from `term net`; `tape_rt::KeyDecoder`
+  turns the bytes into `Key::Left`, `Key::Home`, `Key::Delete` and so on, and
+  output such as `ESC [ 3 D` (cursor left) is interpreted by the kernel's VGA
+  console. A lone Escape never reaches a tape: it is the abort event (over
+  `term net`, a frame holding only `0x1b`). See `tapes/ed/src/main.rs`'s
+  `read_line_cursor` for the whole pattern.
 - `terminal_position()` returns the kernel's packed, 1-based ANSI cursor
   position: row in the high 16 bits and column in the low 16 bits. It is
   useful for terminal protocols that must answer a cursor-position request.

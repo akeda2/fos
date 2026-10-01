@@ -3141,7 +3141,7 @@ fn remote_stop_frame(frame: &[u8]) -> bool {
             unsafe { PENDING_REMOTE_BYE = true };
             true
         }
-        TERM_TAG_DATA => frame[15..].contains(&REMOTE_ABORT_BYTE),
+        TERM_TAG_DATA => is_remote_abort(&frame[15..]),
         _ => false,
     }
 }
@@ -3239,6 +3239,21 @@ fn drain_deferred_term_input(editor: &mut LineEditor, info: &BootInfo) {
 /// local echo or interpretation of its own.
 const REMOTE_ABORT_BYTE: u8 = 0x1b;
 
+/// True when a `TERM_TAG_DATA` payload is the remote escape: a lone `0x1b`
+/// (ignoring Ethernet's trailing zero padding). An Escape that begins a longer
+/// payload is a terminal escape *sequence* -- `ESC [ D` for the Left arrow,
+/// `ESC [ 3 ~` for Delete -- and must reach a tape as ordinary input, so
+/// cursor keys can work in tapes over `term net`. `tools/term_net.py` sends
+/// the Escape key as its own frame (cbreak mode, one keypress per read), which
+/// is what makes this distinction possible.
+fn is_remote_abort(payload: &[u8]) -> bool {
+    let end = payload
+        .iter()
+        .rposition(|&byte| byte != 0)
+        .map_or(0, |index| index + 1);
+    payload[..end] == [REMOTE_ABORT_BYTE]
+}
+
 /// Copies whatever console output is queued in `console`'s relay buffer
 /// and forwards it to `peer` as one `TERM_TAG_DATA` frame -- the same
 /// "send, then discard" step
@@ -3335,7 +3350,7 @@ fn poll_background_work(nic: Option<&nic::Nic>) {
 ///
 /// Returns whether the caller's blocking command should stop: either the
 /// peer explicitly asked to (a `TERM_TAG_DATA` frame containing
-/// `REMOTE_ABORT_BYTE` anywhere in its payload -- the whole frame is
+/// `REMOTE_ABORT_BYTE` as its entire payload (`is_remote_abort`) -- the frame is
 /// simply dropped rather than fed to the line editor, the same way a
 /// local escape key press is consumed rather than typed as a literal
 /// character) or the peer hung up entirely (`TERM_TAG_BYE`, which also
@@ -3400,7 +3415,7 @@ fn poll_remote_tape_abort() -> bool {
             true
         }
         TERM_TAG_DATA => {
-            if frame[15..].contains(&REMOTE_ABORT_BYTE) {
+            if is_remote_abort(&frame[15..]) {
                 true
             } else {
                 defer_active_term_input(frame);
@@ -5490,7 +5505,7 @@ fn classify_remote_tape_frame(peer: &[u8; 6], frame: &[u8]) -> RemoteTapeFrame {
                 .rposition(|&byte| byte != 0)
                 .map_or(0, |index| index + 1);
             let data = &payload[..end];
-            if data.contains(&REMOTE_ABORT_BYTE) {
+            if is_remote_abort(data) {
                 return RemoteTapeFrame::Input(TAPE_EVENT_ABORT);
             }
             let Some((&first, rest)) = data.split_first() else {
@@ -5528,8 +5543,9 @@ const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 /// ever needed to notice one specific byte and could discard the rest of
 /// a payload, this one keeps every byte: the first is returned
 /// immediately, any more are queued in `TAPE_INPUT_QUEUE` for the next
-/// call. A payload containing the abort byte (`REMOTE_ABORT_BYTE`)
-/// anywhere is still treated exactly like `poll_remote_tape_abort`
+/// call. A payload that is just the abort byte (`REMOTE_ABORT_BYTE`, see
+/// `is_remote_abort`; a longer payload starting with it is a cursor-key
+/// sequence and is delivered as input) is still treated exactly like `poll_remote_tape_abort`
 /// treats it -- the whole frame is dropped as a "give up" signal, never
 /// fed to a tape as ordinary characters, so a peer's escape keypress can
 /// never accidentally end up echoed into a tape's own input.
@@ -5651,6 +5667,20 @@ extern "C" fn tape_nic_max_frame_len() -> u32 {
 /// instead of spinning at 100% CPU. It may return early or for no visible
 /// reason, so the tape must simply poll again; it never reports a result. If
 /// any NIC lacks a receive interrupt it returns at once (see `idle_wait`).
+/// Tape ABI callback `set_input_mode` (slot 37): bit 0 set switches `read_key`
+/// to raw keys, bit 0 clear (the default for every tape start) restores the
+/// original behaviour. In the default mode `read_key` erases the previous
+/// character on screen itself whenever it returns Backspace (8), which keeps a
+/// simple line reader to "decrement my length". A tape that moves the cursor
+/// (see `tape_rt::KeyDecoder`) must place the cursor and redraw on its own, so
+/// it asks for raw keys; Backspace is then just the byte 8.
+extern "C" fn tape_set_input_mode(mode: u32) {
+    unsafe { TAPE_RAW_KEYS = mode & 1 != 0 };
+}
+
+/// Set by `tape_set_input_mode`; cleared at the start of every `tape_run`.
+static mut TAPE_RAW_KEYS: bool = false;
+
 extern "C" fn tape_wait_for_event() {
     crate::debug::watchdog_pet();
     idle_wait();
@@ -5859,7 +5889,7 @@ extern "C" fn tape_nic_receive(out: u32, capacity: u32) -> u32 {
                 && frame[12..14] == CHAT_ETHERTYPE
                 && frame[6..12] == peer
                 && frame[14] == TERM_TAG_DATA
-                && !frame[15..length].contains(&REMOTE_ABORT_BYTE)
+                && !is_remote_abort(&frame[15..length])
             {
                 defer_active_term_input(&frame[..length]);
                 return 0;
@@ -5976,14 +6006,14 @@ extern "C" fn combined_tape_read_key() -> u32 {
             // tape ABI event corresponds to it, so just poll again.
             keyboard::KeyEvent::KillLine => return combined_tape_read_key(),
         };
-        if code == TAPE_EVENT_CHAR_BASE | 8 {
+        if code == TAPE_EVENT_CHAR_BASE | 8 && !unsafe { TAPE_RAW_KEYS } {
             console::erase_last_character();
         }
         return code;
     }
     match poll_remote_tape_input() {
         Some(code) => {
-            if code == TAPE_EVENT_CHAR_BASE | 8 {
+            if code == TAPE_EVENT_CHAR_BASE | 8 && !unsafe { TAPE_RAW_KEYS } {
                 console::erase_last_character();
             }
             code
@@ -6329,6 +6359,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         TAPE_NETWORK_COUNT = 0;
         TAPE_REMOTE_ABORT_PENDING = false;
         TAPE_READ_KEY_USED = false;
+        TAPE_RAW_KEYS = false;
     }
     type TapeEntry = extern "C" fn(
         putc: extern "C" fn(u32),
@@ -6367,6 +6398,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
         audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
         wait_for_event: extern "C" fn(),
+        set_input_mode: extern "C" fn(u32),
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -6413,6 +6445,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_audio_capture_sample_rate_at,
         tape_audio_capture_channels_and_bits_at,
         tape_wait_for_event,
+        tape_set_input_mode,
     );
     crate::debug::watchdog_tape_running(false);
     unsafe {

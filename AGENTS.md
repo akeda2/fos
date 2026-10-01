@@ -2151,3 +2151,16 @@ path and is confirmed on the second machine (e1000e + two I350 ports, all on
 MSI, 284 KB tape loads on each with no errors); QEMU has no I350 model.
 The e1000e (82579, `8086:1503`) also takes MSI on a Sandy Bridge board (single
 NIC, so no tape-load test there; counters clean after normal term net traffic).
+
+### Cursor keys in tapes
+
+Arrow/Home/End/Delete keys reach a tape through `read_key` as ANSI sequences
+(`keyboard.rs` generates them locally; `term net` forwards them), and
+`tape-rt`'s `KeyDecoder` decodes them. Over `term net`, only a frame holding
+a lone `0x1b` is the remote abort (`shell::is_remote_abort`); a longer payload
+starting with Escape is input. ABI slot 37, `set_input_mode` (bit 0 = raw
+keys), stops `read_key` erasing on Backspace for a tape that redraws itself
+(`tape_rt::set_raw_keys`). `ed`'s `eN` is the reference user;
+`tapes/test_ed_e2e.py` (term net) and `tapes/test_ed_keys_e2e.py` (local PS/2
+via the QEMU monitor) cover it.
+

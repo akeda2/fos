@@ -100,6 +100,163 @@ pub fn idle() {
     }
 }
 
+/// The kernel's `set_input_mode` callback (ABI slot 37), stored like the wait
+/// hook so `set_raw_keys` can be called from anywhere.
+static mut INPUT_MODE_HOOK: Option<extern "C" fn(u32)> = None;
+
+/// Remembers the kernel's `set_input_mode` callback; call once from
+/// `tape_main` before `set_raw_keys`.
+pub fn set_input_mode_hook(hook: extern "C" fn(u32)) {
+    unsafe {
+        INPUT_MODE_HOOK = Some(hook);
+    }
+}
+
+/// Chooses how the kernel's `read_key` treats Backspace. With `raw` false (the
+/// default every tape starts in) the kernel erases the previous character on
+/// screen itself whenever it returns Backspace, which suits a simple line
+/// reader that only ever edits the end of its line. With `raw` true the kernel
+/// does nothing: a tape that moves the cursor (see `KeyDecoder`) must redraw on
+/// its own, using ANSI sequences such as `ESC [ 3 D` (cursor left) and
+/// `ESC [ K` (erase to end of line), which the kernel's VGA console and a
+/// serial/`term net` terminal both understand.
+pub fn set_raw_keys(raw: bool) {
+    if let Some(hook) = unsafe { INPUT_MODE_HOOK } {
+        hook(u32::from(raw));
+    }
+}
+
+/// A decoded key. Cursor keys arrive from `read_key` as ANSI escape sequences
+/// (`ESC [ D` is Left), identically from the local PS/2 keyboard and from a
+/// remote `term net` terminal; `KeyDecoder` turns the byte stream into these.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Key {
+    /// A printable ASCII character.
+    Char(u8),
+    Enter,
+    Backspace,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    Delete,
+    Insert,
+    PageUp,
+    PageDown,
+    /// Another control byte (`1` is Ctrl-A, `5` Ctrl-E, ...).
+    Control(u8),
+}
+
+#[derive(Clone, Copy)]
+enum DecoderState {
+    Ground,
+    Escape,
+    /// Inside `ESC [`, accumulating the numeric parameter.
+    Csi(u16),
+    /// After `ESC O` (application-mode cursor keys, which some terminals send).
+    Ss3,
+}
+
+/// Incremental ANSI key decoder: feed it one byte per `read_key` event. A
+/// sequence can span several calls, so it keeps its state between them and
+/// needs no timeouts -- a lone Escape never reaches a tape (the kernel turns
+/// it into the abort event), so every `0x1b` byte starts a sequence.
+pub struct KeyDecoder {
+    state: DecoderState,
+}
+
+impl KeyDecoder {
+    pub const fn new() -> Self {
+        Self {
+            state: DecoderState::Ground,
+        }
+    }
+
+    /// Returns a key once `byte` completes one; `None` while mid-sequence or
+    /// for a sequence this decoder does not know (which is dropped).
+    pub fn feed(&mut self, byte: u8) -> Option<Key> {
+        match self.state {
+            DecoderState::Ground => match byte {
+                0x1b => {
+                    self.state = DecoderState::Escape;
+                    None
+                }
+                b'\r' | b'\n' => Some(Key::Enter),
+                8 | 127 => Some(Key::Backspace),
+                b'\t' => Some(Key::Tab),
+                32..=126 => Some(Key::Char(byte)),
+                _ => Some(Key::Control(byte)),
+            },
+            DecoderState::Escape => match byte {
+                b'[' => {
+                    self.state = DecoderState::Csi(0);
+                    None
+                }
+                b'O' => {
+                    self.state = DecoderState::Ss3;
+                    None
+                }
+                _ => {
+                    // Not a sequence we know: forget the Escape and treat the
+                    // byte as an ordinary key.
+                    self.state = DecoderState::Ground;
+                    self.feed(byte)
+                }
+            },
+            DecoderState::Csi(parameter) => match byte {
+                b'0'..=b'9' => {
+                    self.state = DecoderState::Csi(
+                        parameter.saturating_mul(10).saturating_add(u16::from(byte - b'0')),
+                    );
+                    None
+                }
+                // Modifier parameters (`ESC [ 1 ; 5 C`): keep only the last
+                // number's final key, ignoring which modifier was held.
+                b';' => {
+                    self.state = DecoderState::Csi(0);
+                    None
+                }
+                _ => {
+                    self.state = DecoderState::Ground;
+                    match byte {
+                        b'A' => Some(Key::Up),
+                        b'B' => Some(Key::Down),
+                        b'C' => Some(Key::Right),
+                        b'D' => Some(Key::Left),
+                        b'H' => Some(Key::Home),
+                        b'F' => Some(Key::End),
+                        b'~' => match parameter {
+                            1 | 7 => Some(Key::Home),
+                            2 => Some(Key::Insert),
+                            3 => Some(Key::Delete),
+                            4 | 8 => Some(Key::End),
+                            5 => Some(Key::PageUp),
+                            6 => Some(Key::PageDown),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+            },
+            DecoderState::Ss3 => {
+                self.state = DecoderState::Ground;
+                match byte {
+                    b'A' => Some(Key::Up),
+                    b'B' => Some(Key::Down),
+                    b'C' => Some(Key::Right),
+                    b'D' => Some(Key::Left),
+                    b'H' => Some(Key::Home),
+                    b'F' => Some(Key::End),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     // A tape has nowhere to unwind to and no OS underneath it -- see

@@ -16,7 +16,7 @@ extern crate ed_tape;
 
 use core::slice;
 use ed_tape::TextBuffer;
-use tape_rt::{print_bytes, print_u32};
+use tape_rt::{Key, KeyDecoder, print_bytes, print_u32, set_raw_keys};
 
 const TAPE_EVENT_ABORT: u32 = 1;
 const TAPE_EVENT_BYTE_BASE: u32 = 0x100;
@@ -29,6 +29,10 @@ const EDITOR_MIN_CAPACITY: u32 = 1024 * 1024;
 const EDITOR_MAX_CAPACITY: u32 = 4 * 1024 * 1024;
 const INPUT_CAPACITY: usize = 256;
 const PAGE_LINES: usize = 20;
+/// Longest line the cursor editor handles: it must fit in one 80-column screen
+/// row after the 6-column "edit: " prompt, because the cursor-left sequence
+/// does not wrap to the row above.
+const EDIT_WIDTH: usize = 72;
 
 // Small files must work on the default `make run` QEMU configuration, whose
 // RAM ends at the big allocator's 128 MiB starting address. Keeping the
@@ -84,8 +88,11 @@ pub extern "C" fn tape_main(
     _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
     // Sleeps until the next interrupt; call after a pass that found no work.
     wait_for_event: extern "C" fn(),
+    // Chooses whether `read_key` erases on Backspace itself (see `tape_rt::set_raw_keys`).
+    set_input_mode: extern "C" fn(u32),
 ) {
     tape_rt::set_wait_hook(wait_for_event);
+    tape_rt::set_input_mode_hook(set_input_mode);
     let Some(name) = parse_filename(args_ptr, args_len) else {
         print_bytes(putc, b"Usage: tape run ed NAME (or diskN/NAME for a secondary disk)\n");
         return;
@@ -367,24 +374,7 @@ fn dispatch(
 }
 
 fn read_line(putc: Putc, read_key: ReadKey, output: &mut [u8]) -> Option<usize> {
-    read_line_prefilled(putc, read_key, output, b"")
-}
-
-/// Like `read_line`, but starts with `initial` already in the buffer and
-/// echoed, so the user edits the existing text instead of retyping it:
-/// Backspace removes characters from the end (the kernel's `read_key` already
-/// erases them on screen), anything typed is appended, Enter accepts. A
-/// terminal cursor cannot be moved portably through the tape's `putc`, so
-/// edits in the middle of a line use the `cLINE/OLD/NEW` command instead.
-fn read_line_prefilled(
-    putc: Putc,
-    read_key: ReadKey,
-    output: &mut [u8],
-    initial: &[u8],
-) -> Option<usize> {
-    let mut length = initial.len().min(output.len());
-    output[..length].copy_from_slice(&initial[..length]);
-    print_bytes(putc, &output[..length]);
+    let mut length = 0;
     loop {
         let event = read_key();
         if event == 0 {
@@ -422,6 +412,114 @@ fn read_line_prefilled(
     }
 }
 
+/// Moves the terminal cursor with an ANSI sequence: `ESC [ n D` (left) or
+/// `ESC [ n C` (right). The kernel's VGA console and a serial/`term net`
+/// terminal both implement these.
+fn cursor_move(putc: Putc, count: usize, direction: u8) {
+    if count == 0 {
+        return;
+    }
+    putc(0x1b);
+    putc(u32::from(b'['));
+    print_u32(putc, count as u32);
+    putc(u32::from(direction));
+}
+
+/// Reads one line with a real cursor: `initial` is pre-filled and editable with
+/// Left/Right, Home/End (or Ctrl-A/Ctrl-E), Backspace and Delete; typed
+/// characters insert at the cursor. The tape asks the kernel for raw keys so
+/// it controls every character on screen, and redraws only the tail of the
+/// line after each change. `output` must be short enough to fit one screen row.
+fn read_line_cursor(
+    putc: Putc,
+    read_key: ReadKey,
+    output: &mut [u8],
+    initial: &[u8],
+) -> Option<usize> {
+    let mut length = initial.len().min(output.len());
+    output[..length].copy_from_slice(&initial[..length]);
+    let mut cursor = length;
+    print_bytes(putc, &output[..length]);
+    let mut decoder = KeyDecoder::new();
+    set_raw_keys(true);
+    let result = loop {
+        let event = read_key();
+        if event == 0 {
+            tape_rt::idle();
+            continue;
+        }
+        if event == TAPE_EVENT_ABORT {
+            print_bytes(putc, b"\n");
+            break None;
+        }
+        if event < TAPE_EVENT_BYTE_BASE {
+            continue;
+        }
+        let Some(key) = decoder.feed((event - TAPE_EVENT_BYTE_BASE) as u8) else {
+            continue;
+        };
+        match key {
+            Key::Enter => {
+                // Park the cursor at the end so the newline lands below the line.
+                cursor_move(putc, length - cursor, b'C');
+                putc(u32::from(b'\n'));
+                break Some(length);
+            }
+            Key::Left => {
+                if cursor > 0 {
+                    cursor -= 1;
+                    cursor_move(putc, 1, b'D');
+                }
+            }
+            Key::Right => {
+                if cursor < length {
+                    cursor += 1;
+                    cursor_move(putc, 1, b'C');
+                }
+            }
+            Key::Home | Key::Control(1) => {
+                cursor_move(putc, cursor, b'D');
+                cursor = 0;
+            }
+            Key::End | Key::Control(5) => {
+                cursor_move(putc, length - cursor, b'C');
+                cursor = length;
+            }
+            Key::Backspace if cursor > 0 => {
+                output.copy_within(cursor..length, cursor - 1);
+                cursor -= 1;
+                length -= 1;
+                cursor_move(putc, 1, b'D');
+                redraw_tail(putc, &output[cursor..length]);
+            }
+            Key::Delete if cursor < length => {
+                output.copy_within(cursor + 1..length, cursor);
+                length -= 1;
+                redraw_tail(putc, &output[cursor..length]);
+            }
+            Key::Char(byte) if length < output.len() => {
+                output.copy_within(cursor..length, cursor + 1);
+                output[cursor] = byte;
+                length += 1;
+                cursor += 1;
+                putc(u32::from(byte));
+                redraw_tail(putc, &output[cursor..length]);
+            }
+            _ => {}
+        }
+    };
+    set_raw_keys(false);
+    result
+}
+
+/// Reprints the text right of the cursor, blanks the character that may have
+/// been left behind by a deletion, and returns the cursor to where it was.
+fn redraw_tail(putc: Putc, tail: &[u8]) {
+    print_bytes(putc, tail);
+    putc(u32::from(b' '));
+    cursor_move(putc, tail.len() + 1, b'D');
+}
+
 fn append_lines(
     putc: Putc,
     read_key: ReadKey,
@@ -451,15 +549,15 @@ fn edit_line(putc: Putc, read_key: ReadKey, text: &mut TextBuffer<'_>, line: usi
         print_bytes(putc, b"ed: no such line\n");
         return false;
     };
-    // The old text is pre-filled after the prompt: Backspace trims its end and
-    // typing appends; Enter keeps whatever is on screen.
+    // The old text is pre-filled after the prompt and edited with the cursor
+    // keys; Enter keeps whatever is on screen.
     print_bytes(putc, b"edit: ");
     let mut input = [0u8; INPUT_CAPACITY];
-    if current.len() > input.len() {
-        print_bytes(putc, b"\ned: line too long to edit here; use sLINE/TEXT\n");
+    if current.len() > EDIT_WIDTH {
+        print_bytes(putc, b"\ned: line too long for cursor editing; use cLINE/OLD/NEW\n");
         return false;
     }
-    let Some(length) = read_line_prefilled(putc, read_key, &mut input, current) else {
+    let Some(length) = read_line_cursor(putc, read_key, &mut input[..EDIT_WIDTH], current) else {
         return true;
     };
     if text.replace_line(line, &input[..length]).is_err() {

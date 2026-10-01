@@ -595,6 +595,7 @@ test-tape-net-dhcp: image tape-net-dhcp
 
 test-tape-ed: image tape-ed
 	python3 tapes/test_ed_e2e.py
+	python3 tapes/test_ed_keys_e2e.py
 
 test-cpu64-lab: image tape-cpu64-lab
 	python3 tapes/test_cpu64_lab_e2e.py

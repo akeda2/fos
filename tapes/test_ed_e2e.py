@@ -166,6 +166,25 @@ def main():
         command("p\n", marker=b"ed> ")
         if b"2: replaced" not in output:
             raise SystemExit(f"e did not keep the edited line:\n{output.decode('utf-8', 'replace')}")
+        # Cursor keys (ESC [ ... sequences) reach the tape as input over term
+        # net instead of aborting it. Home + Delete + a typed letter turn "replaced"
+        # into "Replaced"; Right, Backspace and End + a letter then give
+        # "Rplacedd"; finally Home, Delete, "re" and End + Backspace restore it.
+        command("e2\n", marker=b"edit: replaced")
+        command("\x1b[H\x1b[3~R\n", marker=b"ed> ")
+        command("p\n", marker=b"ed> ")
+        if b"2: Replaced" not in output:
+            raise SystemExit(f"cursor editing (Home, Delete) failed:\n{output.decode('utf-8', 'replace')}")
+        command("e2\n", marker=b"edit: Replaced")
+        command("\x1b[H\x1b[C\x1b[C\x08\x1b[Fd\n", marker=b"ed> ")
+        command("p\n", marker=b"ed> ")
+        if b"2: Rplacedd" not in output:
+            raise SystemExit(f"cursor editing (Right, Backspace, End) failed:\n{output.decode('utf-8', 'replace')}")
+        command("e2\n", marker=b"edit: Rplacedd")
+        command("\x1b[H\x1b[3~re\x1b[F\x08\n", marker=b"ed> ")
+        command("p\n", marker=b"ed> ")
+        if b"2: replaced\r\n" not in output and b"2: replaced\n" not in output:
+            raise SystemExit(f"cursor editing (insert, End, Backspace) failed:\n{output.decode('utf-8', 'replace')}")
         command("a\n", marker=b". ")
         command("last\n", marker=b". ")
         command(".\n", marker=b"ed> ")
