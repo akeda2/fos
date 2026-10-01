@@ -1019,6 +1019,34 @@ hardware from NVM once `EECD.AUTO_RD` is set).
 Backend order in `nic::initialize()` is now RTL8139, 3C905, e1000,
 e1000e, I350, then NE2000-compatible.
 
+### RTL8168/RTL8111: a seventh NIC backend (two real chips confirmed)
+
+`kernel/src/rtl8168.rs` drives Realtek's PCIe gigabit family, claiming both
+`10ec:8168` and `10ec:8161` (Linux's `r8169` binds both to one register model).
+It uses the I/O-port BAR0, two small descriptor rings (16 receive, 4 transmit,
+2 KiB buffers), polled transmit completion and the RTL8139's reset-and-
+reprogram recovery. The only chip-specific branch is `CR` enable order, chosen
+from the `TxConfig` version bits (XID `0x4c0` and up, RTL8168G onward, enables
+the MACs *after* `TxConfig`/`RxConfig`); Linux's per-chip PHY/ERI/OCP/ASPM
+tuning is deliberately left out. `init` logs the PCI revision, the version
+bits, the MAC and the PHY status -- read them with `dmesg`.
+
+**Confirmed working on the AMD/nForce test machine** (receive, transmit, full
+`term net` sessions, no recoveries): a TP-Link TG-3468 at 1000 Mb/s and the
+onboard LAN at 100 Mb/s. QEMU has no RTL8168 model, so nothing automated
+covers this driver; `nic` order is RTL8139, 3C905, e1000, e1000e, I350,
+NE2000, then RTL8168. `pci` also prints each function's revision and
+subsystem IDs now, which is how an unknown card gets identified.
+
+**Interrupt-storm guard** (`interrupts::guard_against_storm`): legacy PCI IRQs
+are level-triggered, so a device whose cause a handler cannot clear freezes the
+whole machine (no F12, no crash reboot). More than 500 dispatches of one line in
+a single timer tick masks that PIC line (`irqstat` reports it, `nic.rs` stops
+sleeping on that NIC). The RTL8168 handler also turns its own interrupts off on
+an overflow or PCI error until `recover` has reset the card. A freeze seen once
+while the machine sat in `tape load net` (which polls only the selected NIC,
+leaving the other rings undrained) motivated both.
+
 ### UHCI: a USB host controller driver, and isochronous USB Audio playback
 
 `kernel/src/uhci.rs` is a minimal UHCI (USB 1.1, I/O-port-based) host

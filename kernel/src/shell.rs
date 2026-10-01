@@ -1010,6 +1010,9 @@ fn print_irq_stats() {
             );
             println!("and defer receive work).");
         }
+        if interrupts::pci_irq_storm_masked(irq) {
+            println!("IRQ{irq} MASKED by the storm guard (over 500 in one tick).");
+        }
     }
 }
 
@@ -1116,6 +1119,8 @@ fn print_pci_devices() {
         header_type: 0,
         bar0: 0,
         has_msi: false,
+        revision: 0,
+        subsystem: 0,
     }; pci::MAX_PCI_DEVICES];
     let found = pci::scan_devices(&mut devices);
     let shown = found.min(devices.len());
@@ -1131,10 +1136,13 @@ fn print_pci_devices() {
             info.subclass, info.prog_if,
         );
         println!(
-            "  header={:02x} bar0=0x{:08x} msi={}",
+            "  header={:02x} bar0=0x{:08x} msi={} rev={:02x} subsys={:04x}:{:04x}",
             info.header_type,
             info.bar0,
-            if info.has_msi { "yes" } else { "no" }
+            if info.has_msi { "yes" } else { "no" },
+            info.revision,
+            info.subsystem & 0xffff,
+            info.subsystem >> 16,
         );
     }
     if found > shown {

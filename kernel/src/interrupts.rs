@@ -151,7 +151,7 @@ pub fn register_pci_irq(irq: u8, handler: IrqHandler) -> bool {
                 false
             }
         };
-        if registered {
+        if registered && STORM_MASKED & (1 << irq) == 0 {
             if irq < 8 {
                 PIC1_MASK &= !(1 << irq);
                 outb(PIC1_DATA, PIC1_MASK);
@@ -191,6 +191,56 @@ fn dispatch_pci_irq(irq: u8) {
             handler(irq);
         }
     }
+    guard_against_storm(irq);
+}
+
+/// More dispatches of one PCI line than this within a single 10 ms timer tick
+/// (50,000 a second) is treated as an interrupt storm, not traffic.
+const STORM_LIMIT: u16 = 500;
+static mut STORM_TICK: [u64; 16] = [0; 16];
+static mut STORM_HITS: [u16; 16] = [0; 16];
+/// Bit N set: the storm guard has masked IRQ N in the PIC.
+static mut STORM_MASKED: u16 = 0;
+
+/// Protects the whole machine from one misbehaving device. Legacy PCI IRQs are
+/// level-triggered: a device whose interrupt cause the handler cannot clear
+/// keeps the line asserted, the CPU re-enters the handler the instant it
+/// returns, and the foreground code -- including the keyboard escape and the
+/// network shell -- never runs again. That is a frozen machine that only a
+/// hardware reset recovers. So count dispatches per line per timer tick and,
+/// past `STORM_LIMIT`, mask the line in the PIC. Drivers poll anyway, so a
+/// masked line costs interrupt wake-ups (callers see
+/// `pci_irq_storm_masked` and stop sleeping on that NIC) but not correctness.
+/// IRQ7/IRQ15 are the spurious-interrupt lines and are never PCI-registered.
+fn guard_against_storm(irq: u8) {
+    if irq == 7 || irq == 15 {
+        return;
+    }
+    let index = usize::from(irq);
+    unsafe {
+        let now = ticks();
+        if STORM_TICK[index] != now {
+            STORM_TICK[index] = now;
+            STORM_HITS[index] = 0;
+        }
+        STORM_HITS[index] = STORM_HITS[index].saturating_add(1);
+        if STORM_HITS[index] > STORM_LIMIT && STORM_MASKED & (1 << irq) == 0 {
+            if irq < 8 {
+                PIC1_MASK |= 1 << irq;
+                outb(PIC1_DATA, PIC1_MASK);
+            } else {
+                PIC2_MASK |= 1 << (irq - 8);
+                outb(PIC2_DATA, PIC2_MASK);
+            }
+            STORM_MASKED |= 1 << irq;
+        }
+    }
+}
+
+/// Whether the storm guard has masked this PCI IRQ line (see
+/// `guard_against_storm`); it stays masked until reboot.
+pub fn pci_irq_storm_masked(irq: u8) -> bool {
+    irq < 16 && unsafe { STORM_MASKED } & (1 << irq) != 0
 }
 
 /// One handler slot per MSI vector, deliberately unlike

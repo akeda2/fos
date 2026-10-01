@@ -33,6 +33,7 @@ mod pci;
 mod pmem;
 mod reboot;
 mod rtl8139;
+mod rtl8168;
 mod shell;
 mod stack;
 mod threecom;

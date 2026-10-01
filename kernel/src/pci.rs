@@ -142,6 +142,11 @@ impl PciAddress {
         read_u16(self.bus, self.device, self.function, 0x00)
     }
 
+    /// Reads the revision ID (config offset `0x08`).
+    pub fn revision(&self) -> u8 {
+        read_u8(self.bus, self.device, self.function, 0x08)
+    }
+
     /// Returns the legacy PCI interrupt line assigned by firmware, if this
     /// function has one. `0xff` means no usable legacy PIC line (for example,
     /// an MSI-only route), so callers must retain their polling fallback.
@@ -550,6 +555,14 @@ pub struct PciDeviceInfo {
     /// this is `true`, e.g. because every MSI vector was already claimed
     /// by the time it initialized). See "MSI/MSI-X" in `AGENTS.md`.
     pub has_msi: bool,
+    /// Revision ID (config offset `0x08`). Vendors reuse one device ID across
+    /// silicon steppings -- Realtek's `10ec:8168` covers many chip versions --
+    /// so this and `subsystem` help tell apart cards the ID alone cannot.
+    pub revision: u8,
+    /// Subsystem vendor (low 16 bits) and subsystem ID (high 16 bits), config
+    /// offset `0x2c`: identifies the board maker's card/model. Only meaningful
+    /// for header type 0; zero for bridges, whose `0x2c` is something else.
+    pub subsystem: u32,
 }
 
 /// Bounded to the largest device count this project has ever needed to
@@ -604,6 +617,12 @@ pub fn scan_devices(out: &mut [PciDeviceInfo]) -> usize {
                     header_type: read_u8(bus, device, function, 0x0e),
                     bar0: read_u32(bus, device, function, BAR0_OFFSET),
                     has_msi: address.find_capability(CAPABILITY_ID_MSI).is_some(),
+                    revision: read_u8(bus, device, function, 0x08),
+                    subsystem: if read_u8(bus, device, function, 0x0e) & 0x7f == 0 {
+                        read_u32(bus, device, function, 0x2c)
+                    } else {
+                        0
+                    },
                 };
                 if let Some(slot) = out.get_mut(found) {
                     *slot = info;

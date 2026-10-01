@@ -7,7 +7,7 @@
 //! Device IRQs only acknowledge a cause and make a foreground poll prompt;
 //! all descriptor and protocol parsing remains in foreground code.
 
-use crate::{e1000, e1000e, i350, interrupts, ne2000, pci, rtl8139, threecom};
+use crate::{e1000, e1000e, i350, interrupts, ne2000, pci, rtl8139, rtl8168, threecom};
 
 pub const MAX_FRAME_LEN: usize = 1514;
 const MAX_NICS: usize = pci::MAX_DEVICE_MATCHES * 4;
@@ -19,6 +19,7 @@ pub enum Nic {
     E1000E(&'static e1000e::E1000E),
     I350(&'static i350::I350),
     Ne2000(&'static ne2000::Ne2000),
+    Rtl8168(&'static rtl8168::Rtl8168),
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +58,7 @@ impl Nic {
             Nic::E1000E(_) => "Intel e1000e",
             Nic::I350(_) => "Intel I350",
             Nic::Ne2000(_) => "NE2000-compatible",
+            Nic::Rtl8168(_) => "Realtek RTL8168",
         }
     }
 
@@ -68,12 +70,18 @@ impl Nic {
             Nic::E1000E(nic) => nic.mac_address(),
             Nic::I350(nic) => nic.mac_address(),
             Nic::Ne2000(nic) => nic.mac_address(),
+            Nic::Rtl8168(nic) => nic.mac_address(),
         }
     }
 
     pub fn link_up(&self) -> Option<bool> {
         match self {
-            Nic::Rtl8139(_) | Nic::E1000(_) | Nic::E1000E(_) | Nic::I350(_) | Nic::Ne2000(_) => None,
+            Nic::Rtl8139(_)
+            | Nic::E1000(_)
+            | Nic::E1000E(_)
+            | Nic::I350(_)
+            | Nic::Ne2000(_)
+            | Nic::Rtl8168(_) => None,
             Nic::ThreeCom(nic) => Some(nic.link_up()),
         }
     }
@@ -86,6 +94,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.send(frame),
             Nic::I350(nic) => nic.send(frame),
             Nic::Ne2000(nic) => nic.send(frame),
+            Nic::Rtl8168(nic) => nic.send(frame),
         }
     }
 
@@ -97,6 +106,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.receive(out),
             Nic::I350(nic) => nic.receive(out),
             Nic::Ne2000(nic) => nic.receive(out),
+            Nic::Rtl8168(nic) => nic.receive(out),
         }
     }
 
@@ -108,6 +118,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.set_promiscuous(enabled),
             Nic::I350(nic) => nic.set_promiscuous(enabled),
             Nic::Ne2000(nic) => nic.set_promiscuous(enabled),
+            Nic::Rtl8168(nic) => nic.set_promiscuous(enabled),
         }
     }
 
@@ -119,6 +130,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.overflow_count(),
             Nic::I350(nic) => nic.overflow_count(),
             Nic::Ne2000(nic) => nic.overflow_count(),
+            Nic::Rtl8168(nic) => nic.overflow_count(),
         }
     }
 
@@ -130,6 +142,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.interrupt_stats(),
             Nic::I350(nic) => nic.interrupt_stats(),
             Nic::Ne2000(nic) => nic.interrupt_stats(),
+            Nic::Rtl8168(nic) => nic.interrupt_stats(),
         };
         InterruptStats {
             irq,
@@ -147,6 +160,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.health(),
             Nic::I350(nic) => nic.health(),
             Nic::Ne2000(nic) => nic.health(),
+            Nic::Rtl8168(nic) => nic.health(),
         }
     }
 
@@ -161,6 +175,7 @@ impl Nic {
     pub fn link_status(&self) -> Option<(u16, bool)> {
         match self {
             Nic::E1000E(nic) => nic.link_status(),
+            Nic::Rtl8168(nic) => nic.link_status(),
             _ => None,
         }
     }
@@ -177,6 +192,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.watchdog(),
             Nic::I350(nic) => nic.watchdog(),
             Nic::Ne2000(nic) => nic.watchdog(),
+            Nic::Rtl8168(nic) => nic.watchdog(),
         }
     }
 
@@ -188,6 +204,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.enable_interrupts(),
             Nic::I350(nic) => nic.enable_interrupts(),
             Nic::Ne2000(nic) => nic.enable_interrupts(),
+            Nic::Rtl8168(nic) => nic.enable_interrupts(),
         }
     }
 
@@ -203,6 +220,7 @@ impl Nic {
             Nic::E1000E(nic) => nic.handle_interrupt(),
             Nic::I350(nic) => nic.handle_interrupt(),
             Nic::Ne2000(nic) => nic.handle_interrupt(),
+            Nic::Rtl8168(nic) => nic.handle_interrupt(),
         }
     }
 }
@@ -242,7 +260,7 @@ fn add(nic: Nic) {
 }
 
 /// Initializes every supported backend instance once. Backend order remains
-/// RTL8139, 3C905, e1000, e1000e, I350, then NE2000-compatible, so the
+/// RTL8139, 3C905, e1000, e1000e, I350, NE2000-compatible, then RTL8168, so the
 /// first initialized card preserves the previous default selection policy.
 /// `i350::CANDIDATE_DEVICE_IDS` now carries one confirmed real device ID
 /// (see `i350.rs`'s module doc comment), so this is no longer a guaranteed
@@ -330,6 +348,17 @@ pub fn initialize() -> Result<usize, Status> {
         Err(ne2000::Status::NotPresent) => {}
         Err(ne2000::Status::InitFailed) => init_failures += 1,
     }
+    match rtl8168::initialize_all() {
+        Ok(count) => {
+            for index in 0..count {
+                if let Some(nic) = rtl8168::get(index) {
+                    add(Nic::Rtl8168(nic));
+                }
+            }
+        }
+        Err(rtl8168::Status::NotPresent) => {}
+        Err(rtl8168::Status::InitFailed) => init_failures += 1,
+    }
 
     unsafe {
         if NIC_COUNT == 0 {
@@ -416,7 +445,13 @@ pub fn all_rx_interrupt_driven() -> bool {
     }
     for index in 0..unsafe { NIC_COUNT } {
         if let Some(nic) = unsafe { NICS[index].as_ref() } {
-            if nic.health().rx_progress >= SUSPECT_RX_FRAMES && nic.interrupt_stats().count == 0 {
+            let stats = nic.interrupt_stats();
+            if nic.health().rx_progress >= SUSPECT_RX_FRAMES && stats.count == 0 {
+                return false;
+            }
+            // The storm guard masked this NIC's IRQ line: no interrupt will
+            // ever wake a sleeping loop for it.
+            if stats.irq.is_some_and(interrupts::pci_irq_storm_masked) {
                 return false;
             }
         }
