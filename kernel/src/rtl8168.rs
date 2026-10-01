@@ -98,6 +98,7 @@ const CFG9346_LOCK: u8 = 0x00;
 
 // Interrupt status/mask bits.
 const ISR_ROK: u16 = 0x0001; // Frame received.
+const ISR_TOK: u16 = 0x0004; // Frame transmitted (enabled only during the MSI self-test).
 const ISR_RER: u16 = 0x0002; // Receive error.
 const ISR_RDU: u16 = 0x0010; // Receive descriptor unavailable (overflow).
 const ISR_LINKCHG: u16 = 0x0020; // PHY link changed.
@@ -694,8 +695,19 @@ impl Rtl8168 {
     /// Forces one interrupt so `nic.rs` can check that an MSI message really
     /// arrives: `TxPoll` bit 0 raises `ISR_SWINT` (enabled in `INTERRUPT_MASK`),
     /// which `handle_interrupt` counts and acknowledges like any other cause.
+    ///
+    /// The RTL8168G and later (seen on a TP-Link RTL8168H) never set `ISR_SWINT`
+    /// from `FSWInt`, so a second, genuine cause is raised too: `ISR_TOK` is
+    /// enabled just for this test and one minimal broadcast frame is sent.
+    /// `handle_interrupt` switches `ISR_TOK` off again at the first interrupt.
     pub fn trigger_test_interrupt(&self) {
+        write16(self.io_base, REG_IMR, INTERRUPT_MASK | ISR_TOK);
         write8(self.io_base, REG_TPPOLL, TPPOLL_FSWINT);
+        let mut frame = [0u8; 14];
+        frame[..6].fill(0xff);
+        frame[6..12].copy_from_slice(&self.mac_address());
+        frame[12..].copy_from_slice(&[0x88, 0xb5]); // IEEE local-experimental ethertype
+        self.send(&frame);
     }
 
     pub fn enable_interrupts(&self) {
@@ -707,11 +719,14 @@ impl Rtl8168 {
     /// Interrupt handler body: acknowledge, count, and flag foreground work.
     /// Never touches the rings -- polling stays the authority.
     pub fn handle_interrupt(&self) {
-        let status = read16(self.io_base, REG_ISR) & INTERRUPT_MASK;
+        let status = read16(self.io_base, REG_ISR) & (INTERRUPT_MASK | ISR_TOK);
         if status == 0 {
             return; // A shared line: not ours.
         }
         write16(self.io_base, REG_ISR, status);
+        if status & ISR_TOK != 0 {
+            write16(self.io_base, REG_IMR, INTERRUPT_MASK); // Self-test only.
+        }
         self.interrupt_count.fetch_add(1, Ordering::Relaxed);
         if status & (ISR_RER | FATAL_MASK) != 0 {
             self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
