@@ -817,6 +817,7 @@ consistency while building this table:
 | `audio-rtp` | `static LOCAL_IP/PREFIX GATEWAY [PORT]` or `dhcp [PORT]` listens and plays (raw PCM and Opus both auto-detected on receive).<br>`static ... send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]` (or `dhcp send ...`) replays a FOSFS file.<br>`... capture [opus] PEER_IP [PEER_PORT] [BITRATE]` streams the live ADC.<br>`... duplex [opus] PEER_IP [PEER_PORT] [BITRATE]` listens and streams the live ADC simultaneously. `PORT`/`PEER_PORT` default to `5004`; `duplex`'s own listen port is always `5004`, not separately configurable. |
 | `beep` | (no args) |
 | `bigsieve` | (no args) |
+| `nettest` | `[nettest] [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]] [rate=KBIT] [queue=N] [seed=N]`, or `@nettest.cfg` (one command per line). Two-port link impairment between NICs A and B (default 1 and 2); prefix a setting with `ab.` or `ba.` for one direction. Prompt commands: `loss`, `delay`, `rate`, `queue`, `seed`, `show`, `stats`, `reset [stats]`, `help`, `quit`. |
 | `bridge` | (no args) bridges every initialized interface.<br>`[bridge] NIC [NIC ...]` selects specific one-based `nic list` numbers (at least two, all distinct). |
 | `calc` | (no args) starts an interactive reverse-Polish-notation REPL.<br>`EXPRESSION` evaluates one expression and returns, e.g. `3 4 +`. |
 | `cpu64-lab` | `[probe\|x87\|mmx\|sse\|all]`, default `all`. |
@@ -1087,6 +1088,33 @@ and verify it with `tapes/test_audio_net_e2e.py`, which streams a
 synthetic tone into a QEMU guest's listen-mode tape and confirms the
 guest's `-audiodev wav` capture actually contains real, non-silent audio
 matching what was sent.
+
+#### Test tape: `tapes/nettest/`
+
+A two-port link impairment tool for testing how other machines cope with a bad
+network (a router's failover, a TCP client, DHCP retries). It carries every
+frame from NIC A to NIC B and back, and on the way drops, delays or slows them.
+Each direction is configured on its own: `ab` is A to B, `ba` the reverse.
+
+```
+tape run nettest 1 2 loss=5 delay=40:10 rate=1000 seed=7
+tape run nettest @nettest.cfg
+```
+
+`loss=PCT[:BURST]` drops PCT percent (0.1 steps; BURST makes each loss take
+that many frames in a row), `delay=MS[:JITTER]` holds frames back (never
+reordering them), `rate=KBIT` limits the link speed with a queue, and
+`queue=N` caps the frames in flight (excess is tail-dropped). Time has the
+kernel's 10 ms granularity. `seed=N` makes the random choices repeatable.
+While it runs, the same settings are commands at the `nettest>` prompt (local
+keyboard or the `term net` session, which should use a NIC other than the two
+under test, or at least be addressed to the tape's own MACs): `loss ab 5`,
+`delay 50 10`, `show`, `stats`, `reset`, `quit`. Frames addressed to or from
+the tape's own NICs are management traffic and are not impaired. Queue storage
+is 4 MiB from the big pool when the machine has RAM above 128 MiB, otherwise a
+static 256-frame queue per direction. The engine is in `tapes/nettest/src/lib.rs`
+(host unit tests: `cargo test --manifest-path tapes/nettest/Cargo.toml --lib`);
+`make test-tape-nettest` also runs a live two-NIC test.
 
 #### Test tape: `tapes/bridge/`
 
