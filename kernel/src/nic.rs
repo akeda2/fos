@@ -229,7 +229,7 @@ impl Nic {
     }
 
     /// The PCI location of NICs that can use MSI (the RTL8168, e1000e and
-    /// I350; the I350 has no QEMU model, so it is real-hardware-only).
+    /// I350; the I350 has no QEMU model, so it is verified on hardware only).
     pub fn pci_address(&self) -> Option<pci::PciAddress> {
         match self {
             Nic::Rtl8168(nic) => nic.pci_address(),
