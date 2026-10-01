@@ -74,12 +74,22 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   never an ISR or timer task. It only resets a backend after that driver
   latched a documented DMA/Tx fault, reuses its DMA allocations, restores
   interrupt/promiscuous state, and exposes progress/recovery counters.
-  The e1000e and I350 receive rings are 128 descriptors deep (`RX_COUNT`, one
-  contiguous run of buffer pages), and an RX-overrun interrupt is only counted,
-  not answered with a reset: with 8 descriptors a tape forwarding a gigabit
-  stream (`nettest`, `bridge`, `router`) overran constantly and each overrun
-  triggered a full adapter reset. `shell::report_nic_watchdog` prints the first
-  recovery at once and then at most one summary per 5 s.
+  The e1000, e1000e and I350 receive rings are 128 descriptors deep, the
+  RTL8168's and 3C905's 64 (`RX_COUNT`/`RX_DESC_COUNT`, buffers as one contiguous
+  run of pages), and an RX overrun is only counted (`Health::rx_overruns`, shown
+  by `nic list`), not answered with a reset: with 8-16 descriptors a tape
+  forwarding a gigabit stream (`nettest`, `bridge`, `router`) overran constantly
+  and each overrun reset the adapter. The RTL8168 treats RDU/FOVW as soft: its
+  handler masks them until `receive` has drained the ring, so dropped frames
+  cannot become an interrupt flood; only a PCI system error still resets it.
+  Measured on the AMD/nForce machine with `python3-netraw` raw-frame blasts
+  at the 1 Gb/s TP-Link RTL8168H: before, 3983 of 5000 frames arrived and the
+  card reset itself; after, 40000 of 40000 arrived with no recovery (the
+  3C905 takes a paced 10000 frames/s with no loss). The RTL8139 (one fixed 32 KB
+  ring buffer) and NE2000 (16 KB on the card, whose DP8390 overflow procedure
+  needs a reset) keep their reset-on-overflow behavior: `tapes/test_nettest_e2e.py`
+  only requires them to keep forwarding after a burst. `shell::report_nic_watchdog`
+  prints the first recovery at once and then at most one summary per 5 s.
 - `kernel/src/pmem.rs` is a small bitmap-based physical-frame allocator (4 KiB
   frames) built from the E820 map; it reserves everything below the kernel's
   own low-memory region.

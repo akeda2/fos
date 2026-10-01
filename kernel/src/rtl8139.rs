@@ -198,6 +198,7 @@ pub struct Rtl8139 {
     irq: Option<u8>,
     interrupt_count: AtomicU32,
     interrupt_errors: AtomicU32,
+    rx_overruns: AtomicU32,
     work_pending: AtomicBool,
     overflow_pending: AtomicBool,
     interrupts_enabled: Cell<bool>,
@@ -274,6 +275,7 @@ impl Rtl8139 {
             irq,
             interrupt_count: AtomicU32::new(0),
             interrupt_errors: AtomicU32::new(0),
+            rx_overruns: AtomicU32::new(0),
             work_pending: AtomicBool::new(false),
             overflow_pending: AtomicBool::new(false),
             interrupts_enabled: Cell::new(false),
@@ -503,6 +505,7 @@ impl Rtl8139 {
             recovery_failures: self.recovery_failures.get(),
             recovery_pending: self.overflow_pending.load(Ordering::Acquire)
                 || self.recovery_pending.load(Ordering::Acquire),
+            rx_overruns: self.rx_overruns.load(Ordering::Relaxed),
         }
     }
 
@@ -538,6 +541,7 @@ impl Rtl8139 {
             self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
         }
         if status & (ISR_RXOVW | ISR_FOVW) != 0 {
+            self.rx_overruns.fetch_add(1, Ordering::Relaxed);
             self.overflow_pending.store(true, Ordering::Release);
         }
         self.work_pending.store(true, Ordering::Release);

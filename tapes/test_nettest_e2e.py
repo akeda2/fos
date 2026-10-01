@@ -365,27 +365,44 @@ def main():
         seg_a.close()
         seg_b.close()
 
-    # A full-speed burst into the e1000e (the same driver family as the Skylake
-    # test machine's) must not overrun its receive ring: it used to drop all but
-    # a handful of 1000 back-to-back frames and print a "NIC watchdog" line for
-    # every adapter reset the overrun caused.
-    guest, seg_a, seg_b = launch(256, "e1000e")
-    try:
-        start_tape(guest, seg_a, "1 2")
-        seg_a.drain(3), seg_b.drain(0.1)
-        for sequence in range(1000):
-            seg_a.send(test_frame(HOST_B, HOST_A, sequence, 1000))
-        delivered = len(seg_b.drain(3))
-        guest.pump(0.5)
-        resets = guest.text().count("NIC watchdog")
-        # QEMU's e1000e model loses the very first frame after promiscuous mode
-        # is enabled (also without this change), hence "at least 995".
-        check(delivered >= 995, f"1000 back-to-back frames through an e1000e: {delivered} delivered", guest)
-        check(resets == 0, "no NIC watchdog recoveries under full-speed load", guest)
-    finally:
-        guest.stop()
-        seg_a.close()
-        seg_b.close()
+    # A burst of 1000 back-to-back frames into each emulated NIC family. This
+    # used to overrun the 8-descriptor rings and reset the adapter (printing a
+    # "NIC watchdog" line each time). What each model can hold differs:
+    #  * e1000e applies back-pressure, so with a 128-descriptor ring everything
+    #    arrives (QEMU loses only the very first frame after promiscuous mode
+    #    is enabled, with or without this change);
+    #  * e1000 drops what does not fit the ring instantly, so at least a ring's
+    #    worth must arrive, with the overruns counted and no adapter reset;
+    #  * rtl8139 and ne2k_pci have small fixed on-chip buffers and still reset
+    #    on overflow; they must only come back and keep forwarding.
+    for model, at_least, strict in (("e1000e", 995, True), ("e1000", 128, True),
+                                    ("rtl8139", 0, False), ("ne2k_pci", 0, False)):
+        guest, seg_a, seg_b = launch(256, model)
+        try:
+            start_tape(guest, seg_a, "1 2")
+            seg_a.drain(3), seg_b.drain(0.1)
+            for sequence in range(1000):
+                seg_a.send(test_frame(HOST_B, HOST_A, sequence, 1000))
+            delivered = len(seg_b.drain(3))
+            check(delivered >= at_least, f"{model}: 1000 back-to-back frames, {delivered} delivered "
+                  f"(at least {at_least} expected)", guest)
+            if strict:
+                guest.pump(0.5)
+                check("NIC watchdog" not in guest.text(), f"{model}: no adapter reset under a full-speed burst", guest)
+            # Whatever happened, the link must carry traffic again afterwards.
+            time.sleep(1.5)
+            seg_b.drain()
+            burst(seg_a, 5, HOST_B, HOST_A, first=5000)
+            check(len(seg_b.drain(1.0)) >= 4, f"{model}: still forwarding after the burst", guest)
+            if model == "e1000":
+                command(guest, seg_a, "quit", b"fos> ")
+                health = command(guest, seg_a, "nic list", b"fos> ")
+                check("receive overrun event(s)" in health and " 0 recovery/recoveries" in health,
+                      "e1000: overruns are counted and did not reset the adapter", guest)
+        finally:
+            guest.stop()
+            seg_a.close()
+            seg_b.close()
     print("PASS: nettest loss, burst loss, delay, rate and queue limit work over a live two-NIC link.")
 
 

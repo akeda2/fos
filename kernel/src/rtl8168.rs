@@ -111,8 +111,15 @@ const ISR_SYSERR: u16 = 0x8000; // PCI system error.
 /// ever fires when `trigger_test_interrupt` asks for it.
 const INTERRUPT_MASK: u16 =
     ISR_ROK | ISR_RER | ISR_RDU | ISR_LINKCHG | ISR_FOVW | ISR_SYSERR | ISR_SWINT;
-/// Causes that mean the receiver may be wedged and want a full reset.
-const FATAL_MASK: u16 = ISR_RDU | ISR_FOVW | ISR_SYSERR;
+/// Receive overruns: the descriptor ring ran out (RDU) or the on-chip FIFO
+/// overflowed (FOVW) because the foreground was busy. Frames are lost, but the
+/// receiver keeps working once descriptors are returned (Linux's `r8169` only
+/// counts them on these chips), so they are not reset causes. The handler masks
+/// them until the foreground has drained the ring, so a flood of dropped frames
+/// cannot become an interrupt flood.
+const SOFT_MASK: u16 = ISR_RDU | ISR_FOVW;
+/// A PCI system error: the one cause that wants a full reset.
+const FATAL_MASK: u16 = ISR_SYSERR;
 
 /// `TxConfig`: inter-frame gap 3 (the IEEE 802.3 standard gap, bits 25:24),
 /// unlimited DMA burst (7 in bits 10:8), and the auto-FIFO bit (7) newer parts
@@ -156,7 +163,10 @@ const DESC_RX_RES: u32 = 1 << 21; // Receive error summary.
 const DESC_LENGTH_MASK: u32 = 0x3fff;
 
 const DESCRIPTOR_BYTES: usize = 16;
-const RX_COUNT: usize = 16;
+/// 64 receive descriptors (16 B each, 2 KiB buffers): 16 held only ~2 ms of
+/// line-rate traffic, far less than the foreground's worst-case 10 ms sleep
+/// while a tape forwards frames between NICs.
+const RX_COUNT: usize = 64;
 const TX_COUNT: usize = 4;
 /// One DMA buffer per descriptor. 2 KiB comfortably holds a maximum frame plus
 /// its 4-byte FCS (1518), so every frame arrives in a single descriptor.
@@ -260,6 +270,8 @@ pub struct Rtl8168 {
     msi_vector: Cell<Option<u8>>,
     interrupt_count: AtomicU32,
     interrupt_errors: AtomicU32,
+    rx_overruns: AtomicU32,
+    soft_masked: AtomicBool,
     work_pending: AtomicBool,
     overflow_pending: AtomicBool,
     interrupts_enabled: Cell<bool>,
@@ -364,6 +376,8 @@ impl Rtl8168 {
             msi_vector: Cell::new(None),
             interrupt_count: AtomicU32::new(0),
             interrupt_errors: AtomicU32::new(0),
+            rx_overruns: AtomicU32::new(0),
+            soft_masked: AtomicBool::new(false),
             work_pending: AtomicBool::new(false),
             overflow_pending: AtomicBool::new(false),
             interrupts_enabled: Cell::new(false),
@@ -545,6 +559,11 @@ impl Rtl8168 {
         let index = self.rx_next.get();
         let opts1 = read_opts1(self.rings, index);
         if opts1 & DESC_OWN != 0 {
+            // Drained. If an overrun silenced its interrupt, turn it back on.
+            if self.soft_masked.swap(false, Ordering::AcqRel) {
+                write16(self.io_base, REG_ISR, SOFT_MASK);
+                write16(self.io_base, REG_IMR, INTERRUPT_MASK);
+            }
             return None; // Still the card's: nothing waiting.
         }
         fence(Ordering::SeqCst);
@@ -666,6 +685,7 @@ impl Rtl8168 {
             recovery_failures: self.recovery_failures.get(),
             recovery_pending: self.overflow_pending.load(Ordering::Acquire)
                 || self.recovery_pending.load(Ordering::Acquire),
+            rx_overruns: self.rx_overruns.load(Ordering::Relaxed),
         }
     }
 
@@ -728,8 +748,14 @@ impl Rtl8168 {
             write16(self.io_base, REG_IMR, INTERRUPT_MASK); // Self-test only.
         }
         self.interrupt_count.fetch_add(1, Ordering::Relaxed);
-        if status & (ISR_RER | FATAL_MASK) != 0 {
+        if status & (ISR_RER | SOFT_MASK | FATAL_MASK) != 0 {
             self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if status & SOFT_MASK != 0 {
+            self.rx_overruns.fetch_add(1, Ordering::Relaxed);
+            // Quiet these two until `receive` has drained the ring.
+            self.soft_masked.store(true, Ordering::Release);
+            write16(self.io_base, REG_IMR, INTERRUPT_MASK & !SOFT_MASK);
         }
         if status & FATAL_MASK != 0 {
             self.overflow_pending.store(true, Ordering::Release);

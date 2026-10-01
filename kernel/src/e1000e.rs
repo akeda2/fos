@@ -436,6 +436,7 @@ pub struct E1000E {
     msi_vector: Cell<Option<u8>>,
     interrupt_count: AtomicU32,
     interrupt_errors: AtomicU32,
+    rx_overruns: AtomicU32,
     work_pending: AtomicBool,
 }
 
@@ -514,6 +515,7 @@ impl E1000E {
             msi_vector: Cell::new(None),
             interrupt_count: AtomicU32::new(0),
             interrupt_errors: AtomicU32::new(0),
+            rx_overruns: AtomicU32::new(0),
             work_pending: AtomicBool::new(false),
         };
         nic.configure()?;
@@ -745,6 +747,7 @@ impl E1000E {
             recoveries: self.recovery_count.get(),
             recovery_failures: self.recovery_failures.get(),
             recovery_pending: self.recovery_pending.load(Ordering::Acquire),
+            rx_overruns: self.rx_overruns.load(Ordering::Relaxed),
         }
     }
 
@@ -805,6 +808,9 @@ impl E1000E {
         self.interrupt_count.fetch_add(1, Ordering::Relaxed);
         if cause & (ICR_RXO | ICR_RXSEQ) != 0 {
             self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if cause & ICR_RXO != 0 {
+            self.rx_overruns.fetch_add(1, Ordering::Relaxed);
         }
         // An RX overrun only means frames arrived faster than they were
         // collected: the hardware drops them and carries on once descriptors

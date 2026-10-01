@@ -553,6 +553,7 @@ impl Ne2000 {
             recovery_failures: self.recovery_failures.get(),
             recovery_pending: self.recovery_pending.load(Ordering::Acquire)
                 || read8(self.io_base, REG_ISR) & ISR_OVW != 0,
+            rx_overruns: self.overflow_count.get(),
         }
     }
 

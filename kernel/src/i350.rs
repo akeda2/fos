@@ -371,6 +371,7 @@ pub struct I350 {
     msi_vector: Cell<Option<u8>>,
     interrupt_count: AtomicU32,
     interrupt_errors: AtomicU32,
+    rx_overruns: AtomicU32,
     work_pending: AtomicBool,
 }
 
@@ -439,6 +440,7 @@ impl I350 {
             msi_vector: Cell::new(None),
             interrupt_count: AtomicU32::new(0),
             interrupt_errors: AtomicU32::new(0),
+            rx_overruns: AtomicU32::new(0),
             work_pending: AtomicBool::new(false),
         };
         nic.configure()?;
@@ -628,6 +630,7 @@ impl I350 {
             recoveries: self.recovery_count.get(),
             recovery_failures: self.recovery_failures.get(),
             recovery_pending: self.recovery_pending.load(Ordering::Acquire),
+            rx_overruns: self.rx_overruns.load(Ordering::Relaxed),
         }
     }
 
@@ -687,6 +690,9 @@ impl I350 {
         self.interrupt_count.fetch_add(1, Ordering::Relaxed);
         if cause & (ICR_RXO | ICR_RXSEQ) != 0 {
             self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if cause & ICR_RXO != 0 {
+            self.rx_overruns.fetch_add(1, Ordering::Relaxed);
         }
         // See e1000e.rs: an RX overrun is counted, not answered with a reset.
         self.work_pending.store(true, Ordering::Release);

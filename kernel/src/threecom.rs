@@ -90,9 +90,12 @@ const INTERRUPT_MASK: u16 = STATUS_UP_COMPLETE | STATUS_HOST_ERROR;
 /// the foreground longer than that, and the ring overflowed -- "Gap in tape
 /// data: expected chunk #5, got #7" a few frames into every large transfer
 /// (confirmed on real hardware with interrupts off, so not an interrupt bug).
-/// 16 descriptors buffer ~48 ms at that pace; the RTL8139 and Realtek NICs
-/// already hold far more.
-const RX_DESC_COUNT: usize = 16;
+/// 16 descriptors buffered ~48 ms at that pace, but only ~1 ms at gigabit-class
+/// load (a tape forwarding between NICs), so the ring is now 64 descriptors:
+/// still inside the one descriptor page, with the buffers as one contiguous
+/// run of pages (`rx_buffer_base + index * 4096`) rather than an array in
+/// the kernel's tight `.bss`.
+const RX_DESC_COUNT: usize = 64;
 const RX_BUFFER_SIZE: usize = 1536;
 pub const MIN_FRAME_LEN: usize = 60;
 pub const MAX_FRAME_LEN: usize = 1514;
@@ -170,7 +173,7 @@ pub struct ThreeCom {
     b_revision: bool,
     mac: Cell<[u8; 6]>,
     descriptors: u32,
-    rx_buffers: [u32; RX_DESC_COUNT],
+    rx_buffer_base: u32,
     tx_buffer: u32,
     rx_next: Cell<usize>,
     overflow_count: Cell<u32>,
@@ -233,17 +236,15 @@ impl ThreeCom {
     fn init(io_base: u16, b_revision: bool, irq: Option<u8>) -> Result<Self, InitError> {
         Self::reset(io_base)?;
         let descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        let mut rx_buffers = [0u32; RX_DESC_COUNT];
-        for buffer in &mut rx_buffers {
-            *buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        }
+        let rx_buffer_base =
+            pmem::allocate_contiguous(RX_DESC_COUNT).ok_or(InitError::OutOfMemory)?;
         let tx_buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let nic = Self {
             io_base,
             b_revision,
             mac: Cell::new([0; 6]),
             descriptors,
-            rx_buffers,
+            rx_buffer_base,
             tx_buffer,
             rx_next: Cell::new(0),
             overflow_count: Cell::new(0),
@@ -352,7 +353,7 @@ impl ThreeCom {
                     RxDescriptor {
                         next,
                         status: 0,
-                        address: self.rx_buffers[index],
+                        address: self.rx_buffer(index),
                         length: RX_BUFFER_SIZE as u32 | LAST_FRAGMENT,
                     },
                 );
@@ -441,6 +442,7 @@ impl ThreeCom {
             recoveries: self.recovery_count.get(),
             recovery_failures: self.recovery_failures.get(),
             recovery_pending: self.recovery_pending.load(Ordering::Acquire),
+            rx_overruns: 0, // the card gives no overrun indication
         }
     }
 
@@ -469,6 +471,11 @@ impl ThreeCom {
         let _ = self.command(SET_STATUS_ENABLE | INTERRUPT_MASK);
         let _ = self.command(SET_INTERRUPT_ENABLE | INTERRUPT_MASK);
         self.interrupts_enabled.set(true);
+    }
+
+    /// Physical address of receive buffer `index` (one 4 KiB page each).
+    fn rx_buffer(&self, index: usize) -> u32 {
+        self.rx_buffer_base + (index * 4096) as u32
     }
 
     pub fn handle_interrupt(&self) {
@@ -500,7 +507,7 @@ impl ThreeCom {
         for index in 0..RX_DESC_COUNT {
             let descriptor = descriptor_ptr::<RxDescriptor>(self.descriptors, index);
             if unsafe { read_volatile(&(*descriptor).status) } & RX_COMPLETE != 0 {
-                complete |= 1 << index;
+                complete += 1;
             }
         }
         println!(
@@ -511,7 +518,7 @@ impl ThreeCom {
             if self.interrupts_enabled.get() { "on" } else { "off" }
         );
         println!(
-            "rx next {} (completed descriptors mask {complete:04x}), overflow {}, recoveries {}",
+            "rx next {} ({complete} of {RX_DESC_COUNT} descriptors completed), overflow {}, recoveries {}",
             self.rx_next.get(),
             self.overflow_count.get(),
             self.recovery_count.get()
@@ -595,7 +602,7 @@ impl ThreeCom {
         // about to parse (especially visible for a short DHCP exchange).
         if valid {
             unsafe {
-                let source = core::slice::from_raw_parts(self.rx_buffers[index] as *const u8, copy_len);
+                let source = core::slice::from_raw_parts(self.rx_buffer(index) as *const u8, copy_len);
                 out[..copy_len].copy_from_slice(source);
             }
         }

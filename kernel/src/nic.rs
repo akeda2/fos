@@ -41,6 +41,9 @@ pub struct Health {
     pub recoveries: u32,
     pub recovery_failures: u32,
     pub recovery_pending: bool,
+    /// Receive-overrun events (the ring or FIFO ran out while the foreground
+    /// was busy, so frames were dropped). 0 on drivers that cannot tell.
+    pub rx_overruns: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

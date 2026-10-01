@@ -3661,6 +3661,12 @@ fn print_nic_health(nic: &nic::Nic) {
             "no recovery pending"
         }
     );
+    if health.rx_overruns > 0 {
+        println!(
+            "{} receive overrun event(s): frames were lost while busy.",
+            health.rx_overruns
+        );
+    }
 }
 
 fn print_nic_interrupt_status(nic: &nic::Nic) {

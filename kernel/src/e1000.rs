@@ -80,6 +80,10 @@ const ICR_RXT0: u32 = 1 << 7;
 const INTERRUPT_MASK: u32 = ICR_TXDW | ICR_LSC | ICR_RXSEQ | ICR_RXDMT0 | ICR_RXO | ICR_RXT0;
 
 const RING_COUNT: usize = 8;
+/// Receive ring depth: see `e1000e.rs` -- 8 descriptors overrun under any
+/// sustained load. 128 descriptors fit the one descriptor page, and the
+/// buffers are one contiguous run of pages.
+const RX_COUNT: usize = 128;
 const RX_BUFFER_SIZE: usize = 2048;
 const TX_BUFFER_SIZE: usize = 2048;
 
@@ -130,7 +134,7 @@ pub struct E1000 {
     mac: Cell<[u8; 6]>,
     rx_descriptors: u32,
     tx_descriptors: u32,
-    rx_buffers: [u32; RING_COUNT],
+    rx_buffer_base: u32,
     tx_buffers: [u32; RING_COUNT],
     rx_next: Cell<usize>,
     tx_next: Cell<usize>,
@@ -144,6 +148,7 @@ pub struct E1000 {
     irq: Option<u8>,
     interrupt_count: AtomicU32,
     interrupt_errors: AtomicU32,
+    rx_overruns: AtomicU32,
     work_pending: AtomicBool,
 }
 
@@ -186,10 +191,7 @@ impl E1000 {
 
         let rx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
         let tx_descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        let mut rx_buffers = [0u32; RING_COUNT];
-        for buffer in &mut rx_buffers {
-            *buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        }
+        let rx_buffer_base = pmem::allocate_contiguous(RX_COUNT).ok_or(InitError::OutOfMemory)?;
         let mut tx_buffers = [0u32; RING_COUNT];
         for buffer in &mut tx_buffers {
             *buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
@@ -200,7 +202,7 @@ impl E1000 {
             mac: Cell::new([0; 6]),
             rx_descriptors,
             tx_descriptors,
-            rx_buffers,
+            rx_buffer_base,
             tx_buffers,
             rx_next: Cell::new(0),
             tx_next: Cell::new(0),
@@ -214,6 +216,7 @@ impl E1000 {
             irq,
             interrupt_count: AtomicU32::new(0),
             interrupt_errors: AtomicU32::new(0),
+            rx_overruns: AtomicU32::new(0),
             work_pending: AtomicBool::new(false),
         };
         nic.configure()?;
@@ -263,13 +266,13 @@ impl E1000 {
         write_register(self.mmio_base, REG_IMC, u32::MAX);
         let _ = read_register(self.mmio_base, REG_ICR);
 
-        for index in 0..RING_COUNT {
+        for index in 0..RX_COUNT {
             let descriptor = descriptor_pointer::<RxDescriptor>(self.rx_descriptors, index);
             unsafe {
                 write_volatile(
                     descriptor,
                     RxDescriptor {
-                        buffer_address: u64::from(self.rx_buffers[index]),
+                        buffer_address: u64::from(self.rx_buffer(index)),
                         length: 0,
                         checksum: 0,
                         status: 0,
@@ -304,7 +307,7 @@ impl E1000 {
             REG_RDH,
             REG_RDT,
             self.rx_descriptors,
-            RING_COUNT,
+            RX_COUNT,
         );
         self.program_ring(
             REG_TDBAL,
@@ -352,6 +355,11 @@ impl E1000 {
         write_register(self.mmio_base, tail, (count - 1) as u32);
     }
 
+    /// Physical address of receive buffer `index` (one 4 KiB page each).
+    fn rx_buffer(&self, index: usize) -> u32 {
+        self.rx_buffer_base + (index * 4096) as u32
+    }
+
     pub fn mac_address(&self) -> [u8; 6] {
         self.mac.get()
     }
@@ -378,6 +386,7 @@ impl E1000 {
             recoveries: self.recovery_count.get(),
             recovery_failures: self.recovery_failures.get(),
             recovery_pending: self.recovery_pending.load(Ordering::Acquire),
+            rx_overruns: self.rx_overruns.load(Ordering::Relaxed),
         }
     }
 
@@ -415,7 +424,8 @@ impl E1000 {
             self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
         }
         if cause & ICR_RXO != 0 {
-            self.recovery_pending.store(true, Ordering::Release);
+            // Counted, not answered with a reset -- see e1000e.rs.
+            self.rx_overruns.fetch_add(1, Ordering::Relaxed);
         }
         self.work_pending.store(true, Ordering::Release);
     }
@@ -498,7 +508,7 @@ impl E1000 {
         if valid {
             unsafe {
                 let source =
-                    core::slice::from_raw_parts(self.rx_buffers[index] as *const u8, copy_len);
+                    core::slice::from_raw_parts(self.rx_buffer(index) as *const u8, copy_len);
                 out[..copy_len].copy_from_slice(source);
             }
         }
@@ -507,7 +517,7 @@ impl E1000 {
             write_volatile(&mut (*descriptor).errors, 0);
         }
         write_register(self.mmio_base, REG_RDT, index as u32);
-        self.rx_next.set((index + 1) % RING_COUNT);
+        self.rx_next.set((index + 1) % RX_COUNT);
 
         if !valid {
             self.overflow_count.set(self.overflow_count.get() + 1);
