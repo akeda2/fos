@@ -1921,7 +1921,13 @@ driver as needed). `make test-hwaccess` checks them against known QEMU values.
 
 One wrapper (run it with `python3-netraw`) over `term_net.py`, `send_tape.py`
 and `send_kernel_update.py`: `wait`, `run CMD...`, `push KERNEL` (KUP, then waits
-for the new boot) and `tape-into N FILE`. Prefer it to ad-hoc scripts: it encodes
+for the new boot), `tape-into N FILE` and `put FILE NAME` (installs a file on the
+machine's FOSFS volume without reflashing: loads it as a tape, then `tape save`;
+it validates the name, refuses a `debug` file without `kernel-update` unless
+`--force`, backs up the old file to `build/devloop-backup/`, and reads the result
+back; pass a real MAC as `--mac` so it can pick a different NIC to load through).
+e.g. `devloop.py --iface IF --mac MAC put tools/default-debug.txt debug` enables
+the watchdog on a running machine. Prefer it to ad-hoc scripts: it encodes
 the traps that gave false results bringing up the RTL8168 and 3C905 -- `tape
 load net` listens only on the *selected* NIC (it runs `nic use N` and restores
 the old selection), the term session is held on a *different* NIC and never
