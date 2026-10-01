@@ -80,6 +80,18 @@ struct Session<'a> {
     /// launch (`gen.sweep=...`).
     sweep: Sweep,
     sweep_at_launch: bool,
+    /// Bidirectional mode (`bidir=on`): the sink's NIC also generates a stream
+    /// back (`rgen`) and the generator's NIC also receives one (`rsink`), so both
+    /// directions of a link or router are loaded at once with the same NICs.
+    bidir: bool,
+    rgen: Generator,
+    rsink: Sink,
+    rev_gateway: Option<[u8; 4]>,
+    last_rev_arp_us: u64,
+    /// MACs of the generator's and the sink's NICs (the reverse stream addresses
+    /// the other end of the pair by them).
+    gen_mac: [u8; 6],
+    sink_mac: [u8; 6],
     /// The two-port impairment link is active (not when only gen/sink given).
     limiter: bool,
     /// Passes of the polling loop and when it started: a long average pass is
@@ -178,6 +190,13 @@ pub extern "C" fn tape_main(
         last_arp_us: 0,
         sweep: Sweep::new(),
         sweep_at_launch: false,
+        bidir: false,
+        rgen: Generator::new(),
+        rsink: Sink::new(),
+        rev_gateway: None,
+        last_rev_arp_us: 0,
+        gen_mac: [0; 6],
+        sink_mac: [0; 6],
         limiter: true,
         passes: 0,
         loop_started_us: 0,
@@ -264,6 +283,8 @@ pub extern "C" fn tape_main(
             }
         }
     }
+    session.gen_mac = gen_mac;
+    session.sink_mac = sink_mac;
     if !session.destination_explicit {
         session.generator.destination = if session.sink_nic.is_some() { sink_mac } else { [0xff; 6] };
     }
@@ -301,12 +322,8 @@ pub extern "C" fn tape_main(
     session.view.start_tick = micros() / 10_000;
     if session.gen_autostart && session.gen_nic.is_some() {
         let begin = micros() + u64::from(session.gen_delay_s) * 1_000_000;
-        if session.sweep_at_launch {
-            let Session { sweep, generator, sink, .. } = &mut session;
-            sweep.begin(begin, generator, sink);
-        } else {
-            session.generator.start(begin);
-        }
+        let sweep = session.sweep_at_launch;
+        start_generators(&mut session, begin, sweep);
     }
     if session.view.wanted {
         view_start(putc, &mut session);
@@ -333,11 +350,16 @@ pub extern "C" fn tape_main(
                 busy = true;
                 if let Some(info) = parse_arp(&frame[..received]) {
                     // Routable mode: answer ARP for the sink's own address, so a
-                    // router (or the generator) can find it.
+                    // router (or the generator) can find it; and, for the reverse
+                    // stream, learn the MAC of the reverse generator's next hop.
                     if !info.is_reply && Some(info.target_ip) == session.sink.udp_ip {
                         let mut reply = [0u8; 64];
                         build_arp(&mut reply, true, sink_mac, info.target_ip, info.sender_mac, info.sender_ip);
                         let _ = nic_send_at(nic, reply.as_ptr() as u32, 60);
+                    } else if info.is_reply
+                        && session.rgen.udp.is_some_and(|plan| plan.next_hop == info.sender_ip)
+                    {
+                        session.rgen.resolve(info.sender_mac, now_us);
                     }
                     continue;
                 }
@@ -352,6 +374,11 @@ pub extern "C" fn tape_main(
                 if received < ETHERNET_HEADER_LEN {
                     break;
                 }
+                // The reverse stream (bidirectional mode) ends here.
+                if session.bidir && parse_arp(&frame[..received]).is_none() {
+                    let _ = session.rsink.on_frame(&frame[..received], micros());
+                    continue;
+                }
                 // Routable mode: learn the next hop's MAC from its ARP reply, and
                 // answer ARP for the generator's own address.
                 if let (Some(info), Some(plan)) = (parse_arp(&frame[..received]), session.generator.udp) {
@@ -362,6 +389,26 @@ pub extern "C" fn tape_main(
                         let mut reply = [0u8; 64];
                         build_arp(&mut reply, true, gen_mac, plan.source_ip, sender_mac, sender_ip);
                         let _ = nic_send_at(nic, reply.as_ptr() as u32, 60);
+                    }
+                }
+            }
+            // The reverse generator sends from the sink's NIC.
+            if session.bidir {
+                if let Some(sink_nic) = session.sink_nic {
+                    let mut sent = 0;
+                    while let Some(length) = session.rgen.next_frame(now_us, sink_mac, &mut frame, sent) {
+                        let ok = nic_send_at(sink_nic, frame.as_ptr() as u32, length as u32) != 0;
+                        session.rgen.record_send(length, ok);
+                        sent += 1;
+                        busy = true;
+                    }
+                    if let Some(plan) = session.rgen.udp {
+                        if !session.rgen.resolved && now_us.wrapping_sub(session.last_rev_arp_us) >= 500_000 {
+                            session.last_rev_arp_us = now_us;
+                            let mut request = [0u8; 64];
+                            build_arp(&mut request, false, sink_mac, plan.source_ip, [0; 6], plan.next_hop);
+                            let _ = nic_send_at(sink_nic, request.as_ptr() as u32, 60);
+                        }
                     }
                 }
             }
@@ -598,6 +645,21 @@ fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
     // Traffic roles: `gen=N` / `sink=N` pick the NICs (one-based), `gen.KEY=V`
     // configure the generator. Handled before the value is split at ':', because
     // a MAC address (`gen.to=aa:bb:...`) contains colons.
+    if key == b"bidir" {
+        session.bidir = value == b"on";
+        rebuild_udp(session);
+        return value == b"on" || value == b"off";
+    }
+    if key == b"rev.gw" {
+        return match parse_ip(value) {
+            Some(ip) => {
+                session.rev_gateway = Some(ip);
+                rebuild_udp(session);
+                true
+            }
+            None => false,
+        };
+    }
     if key == b"gen" || key == b"sink" {
         let Some(number) = parse_u32(value).filter(|&number| number >= 1) else { return false };
         if key == b"gen" {
@@ -636,6 +698,31 @@ fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
     configure(session, name, way, &parts[..count]).is_ok()
 }
 
+/// Starts the forward generator (or sweep) and, in bidirectional mode, the
+/// reverse generator with the same rate, size and limits.
+fn start_generators(session: &mut Session<'_>, at_us: u64, sweep: bool) {
+    if sweep {
+        let Session { sweep, generator, sink, .. } = session;
+        sweep.begin(at_us, generator, sink);
+    } else {
+        session.generator.start(at_us);
+    }
+    if session.bidir {
+        let forward = &session.generator;
+        let (rate, size, count, seconds) =
+            (forward.rate_kbit, forward.size, forward.count_limit, forward.seconds_limit);
+        let raw = session.rgen.udp.is_none();
+        session.rgen.rate_kbit = rate;
+        session.rgen.size = size;
+        session.rgen.count_limit = count;
+        session.rgen.seconds_limit = seconds;
+        if raw {
+            session.rgen.destination = session.gen_mac;
+        }
+        session.rgen.start(at_us);
+    }
+}
+
 /// Validates and stores a sweep's `[start, end, step, seconds]`.
 fn set_sweep(session: &mut Session<'_>, numbers: [u32; 4]) -> bool {
     let [start, end, step, seconds] = numbers;
@@ -668,7 +755,12 @@ fn print_sweep_step(putc: Putc, result: &nettest_tape::StepResult) {
 /// `sink.ip=A.B.C.D` (answer ARP for it and accept UDP to it) and `sink.port=N`.
 fn sink_setting(session: &mut Session<'_>, setting: &[u8], value: &[u8]) -> bool {
     match setting {
-        b"ip" => parse_ip(value).map(|ip| session.sink.udp_ip = Some(ip)).is_some(),
+        b"ip" => parse_ip(value)
+            .map(|ip| {
+                session.sink.udp_ip = Some(ip);
+                rebuild_udp(session);
+            })
+            .is_some(),
         b"port" => parse_u32(value)
             .filter(|&port| (1..=65535).contains(&port))
             .map(|port| {
@@ -691,6 +783,19 @@ fn rebuild_udp(session: &mut Session<'_>) {
             source_port: 9001,
             destination_port: session.udp_port,
         });
+        // The reverse stream swaps the ends: from the sink's address back to the
+        // generator's, using the forward stream's source port as its destination.
+        session.rsink.udp_ip = Some(source);
+        session.rsink.udp_port = 9001;
+        if let (true, Some(sink_ip)) = (session.bidir, session.sink.udp_ip) {
+            session.rgen.set_udp(UdpPlan {
+                source_ip: sink_ip,
+                destination_ip: source,
+                next_hop: session.rev_gateway.unwrap_or(source),
+                source_port: session.udp_port,
+                destination_port: 9001,
+            });
+        }
     }
 }
 
@@ -887,6 +992,7 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
         b"sink" => match words.get(1).copied() {
             Some(b"reset") => {
                 session.sink.reset();
+                session.rsink.reset();
                 print_bytes(putc, b"sink counters cleared\n");
             }
             Some(setting @ (b"ip" | b"port")) => {
@@ -955,9 +1061,14 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
             if !session.started {
                 session.gen_autostart = true; // from a config file: start with the loop
             } else {
-                session.generator.start(tape_rt::micros());
+                start_generators(session, tape_rt::micros(), false);
                 print_bytes(putc, b"generator started\n");
             }
+        }
+        b"bidir" => {
+            session.bidir = words.get(1).copied() == Some(b"on");
+            rebuild_udp(session);
+            print_bytes(putc, if session.bidir { b"bidirectional: the sink NIC sends back too\n" } else { b"one direction\n" });
         }
         b"sweep" => {
             let mut numbers = [0u32; 4];
@@ -972,14 +1083,14 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
                 session.sweep_at_launch = true;
                 session.gen_autostart = true;
             } else {
-                let Session { sweep, generator, sink, .. } = session;
-                sweep.begin(tape_rt::micros(), generator, sink);
+                start_generators(session, tape_rt::micros(), true);
                 print_bytes(putc, b"sweep started\n");
             }
         }
         b"stop" => {
             session.sweep.active = false;
             session.generator.stop();
+            session.rgen.stop();
             print_bytes(putc, b"generator stopped: ");
             print_gen_line(putc, session);
         }
@@ -996,7 +1107,7 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
             print_gen_config(putc, session);
         }
         _ => {
-            print_bytes(putc, b"use: gen start|stop|sweep|rate|size|to|count|time|show\n");
+            print_bytes(putc, b"use: gen start|stop|sweep|bidir|rate|size|to|count|time|show\n");
             return Outcome::Error;
         }
     }
@@ -1154,6 +1265,7 @@ fn print_help(putc: Putc) {
           gen start|stop|show          the traffic generator (needs gen=N)\n\
           gen rate KBIT | size BYTES   constant bit rate of whole frames\n\
           gen sweep START END STEP S   step the rate, S seconds each; table of results\n\
+          gen bidir on|off             also send a stream back, sink NIC -> gen NIC\n\
           gen to MAC|sink | count N | time S    destination; stop after N / S\n\
           gen ip|dst|gw A.B.C.D | port N   send routable UDP/IP (ARP for the gateway)\n\
           sink [show|reset]            the receiver (needs sink=N): loss, latency\n\
@@ -1233,6 +1345,35 @@ fn print_config_line(putc: Putc, index: usize, config: &Config) {
     print_u32(putc, config.queue_limit);
 }
 
+/// The reverse stream's two lines, when bidirectional.
+fn print_reverse(putc: Putc, session: &Session<'_>) {
+    if !session.bidir {
+        return;
+    }
+    let (generator, sink) = (&session.rgen.stats, &session.rsink.stats);
+    print_bytes(putc, b"rev  sent ");
+    print_u32(putc, generator.sent);
+    print_bytes(putc, b", failed ");
+    print_u32(putc, generator.send_failed);
+    print_bytes(putc, b"  rx ");
+    print_u32(putc, sink.received);
+    print_bytes(putc, b" avg ");
+    print_u32(putc, session.rsink.average_kbit() as u32);
+    print_bytes(putc, b" kbit/s lost ");
+    print_u32(putc, sink.lost);
+    print_bytes(putc, b" dup ");
+    print_u32(putc, sink.duplicated);
+    print_bytes(putc, b" reord ");
+    print_u32(putc, sink.reordered);
+    print_bytes(putc, b"\n     latency us: min ");
+    print_u32(putc, sink.latency_min);
+    print_bytes(putc, b" avg ");
+    print_u32(putc, (sink.latency_sum / u64::from(sink.received.max(1))) as u32);
+    print_bytes(putc, b" max ");
+    print_u32(putc, sink.latency_max);
+    putc(u32::from(b'\n'));
+}
+
 fn print_stats(putc: Putc, session: &Session<'_>) {
     if session.passes > 0 {
         let elapsed = tape_rt::micros().saturating_sub(session.loop_started_us);
@@ -1249,6 +1390,7 @@ fn print_stats(putc: Putc, session: &Session<'_>) {
     if session.sink_nic.is_some() {
         print_sink_line(putc, session);
     }
+    print_reverse(putc, session);
     if !session.limiter {
         return;
     }
@@ -1349,7 +1491,7 @@ fn csi(putc: Putc, parameters: &[u32], final_byte: u8) {
 /// the generator and sink, then a closing rule and the hint line.
 fn panel_rows(session: &Session<'_>) -> u32 {
     let roles = session.gen_nic.is_some() || session.sink_nic.is_some();
-    2 + if session.limiter { 8 } else { 0 } + if roles { 4 } else { 0 } + 2
+    2 + if session.limiter { 8 } else { 0 } + if roles { 4 } else { 0 } + if session.bidir { 2 } else { 0 } + 2
 }
 
 fn view_start(putc: Putc, session: &mut Session<'_>) {
@@ -1461,6 +1603,33 @@ fn view_draw(putc: Putc, session: &Session<'_>, now_tick: u64) {
             print_sink_latency(putc, session);
         }
         csi(putc, &[], b'K');
+        if session.bidir {
+            // print_reverse ends each of its two lines with a newline; the panel
+            // positions rows absolutely, so draw them one at a time.
+            let (generator, sink) = (&session.rgen.stats, &session.rsink.stats);
+            view_row(putc, row + 4);
+            print_bytes(putc, b"rev  sent ");
+            print_u32(putc, generator.sent);
+            print_bytes(putc, b"  rx ");
+            print_u32(putc, sink.received);
+            print_bytes(putc, b" avg ");
+            print_u32(putc, session.rsink.average_kbit() as u32);
+            print_bytes(putc, b" kbit/s  lost ");
+            print_u32(putc, sink.lost);
+            print_bytes(putc, b"  dup ");
+            print_u32(putc, sink.duplicated);
+            print_bytes(putc, b"  reord ");
+            print_u32(putc, sink.reordered);
+            csi(putc, &[], b'K');
+            view_row(putc, row + 5);
+            print_bytes(putc, b"     latency us: min ");
+            print_u32(putc, sink.latency_min);
+            print_bytes(putc, b"  avg ");
+            print_u32(putc, (sink.latency_sum / u64::from(sink.received.max(1))) as u32);
+            print_bytes(putc, b"  max ");
+            print_u32(putc, sink.latency_max);
+            csi(putc, &[], b'K');
+        }
     }
     view_row(putc, session.view.rows - 1);
     rule(putc);

@@ -45,7 +45,7 @@ def main():
         result = run_scenario(
             lab,
             "gen=1 sink=2 gen.ip=10.0.1.2 gen.dst=10.0.2.2 gen.gw=10.0.1.1 sink.ip=10.0.2.2 "
-            "gen.rate=2000 gen.size=500 gen.time=4 gen.delay=3 gen.run=on",
+            "gen.rate=2000 gen.size=500 gen.time=4 gen.delay=3 gen.run=on bidir=on rev.gw=10.0.2.1",
             4,
             sink_nic=2,
         )
@@ -54,7 +54,10 @@ def main():
               f"through the router: {result['rx']} of {result['sent']} arrived, {result['lost']} lost "
               "(the first one waits for the router's ARP)", result)
         check(1800 <= result["avg_kbit"] <= 2200, f"the sink measured {result['avg_kbit']} kbit/s for 2000 offered", result)
-        print("PASS: nettest UDP/IP traffic crosses the router tape, ARP and all.")
+        reverse = result["rev"]
+        check(reverse["sent"] > 800 and reverse["rx"] >= reverse["sent"] - 3 and reverse["lost"] <= 2,
+              f"the reverse stream crosses the router too: {reverse['rx']} of {reverse['sent']} arrived", result)
+        print("PASS: nettest UDP/IP traffic crosses the router tape in both directions, ARP and all.")
     finally:
         if lab:
             lab.stop()

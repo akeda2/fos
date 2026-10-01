@@ -1166,6 +1166,13 @@ loss, delivered rate, average/maximum one-way latency) -- so the point where a
 link, a limiter or a router stops keeping up shows up as a table. The generator
 stops after the last step.
 
+**Both directions at once.** `bidir=on` (or `gen bidir on`) makes the sink's NIC
+also generate a stream back to the generator's NIC, which also receives it, so
+the same four ports load a link or a router in both directions (same rate, size
+and limits as the forward stream; in UDP mode the reverse stream goes from
+`sink.ip` to `gen.ip`, via `rev.gw=ADDR` if it has to cross a router). `stats`
+and the panel show a `rev` section next to the forward counters.
+
 The sink reports frames received, average and current
 throughput, loss (from sequence gaps), duplicates, reordering, and one-way
 latency (min/avg/max and RFC 3550 jitter) -- exact when generator and sink share

@@ -118,6 +118,10 @@ def run_scenario(lab, arguments, seconds, sink_nic=4):
     names = ("rx", "avg_kbit", "lost", "loss_pct", "dup", "reord", "lat_min", "lat_avg", "lat_max", "jitter")
     result = dict(zip(names, (float(v) if "." in v else int(v) for v in sink.groups())))
     result["sent"], result["failed"] = int(gen.group(1)), int(gen.group(2))
+    reverse = re.search(r"rev\s+sent (\d+), failed (\d+)\s+rx (\d+) avg (\d+) kbit/s lost (\d+) dup (\d+) reord (\d+)", stats)
+    if reverse:
+        result["rev"] = dict(zip(("sent", "failed", "rx", "avg_kbit", "lost", "dup", "reord"),
+                                 (int(v) for v in reverse.groups())))
     result["sweep"] = [
         tuple(float(v) for v in step)
         for step in re.findall(r"sweep (\d+) kbit: sent (\d+) rx (\d+) loss ([\d.]+)% got (\d+) kbit lat (\d+)/(\d+) us", text)
@@ -185,6 +189,19 @@ def main():
         check(steps[0][3] < 1.0 and 900 <= steps[0][4] <= 1100, f"1000 kbit/s offered passes untouched: {steps[0]}", result)
         check(steps[2][3] > 20 and steps[3][3] > steps[2][3] and 1800 <= steps[3][4] <= 2200,
               f"above the limit loss grows and throughput stays at 2000: {steps[2:]}", result)
+    finally:
+        lab.stop()
+    lab = Lab()
+    try:
+        # Both directions at once with the same four NICs: the sink's NIC sends a
+        # stream back. A 2000 kbit/s limiter on each way, 3000 offered each way.
+        result = run_scenario(lab, base + "gen.rate=3000 rate=2000 queue=30 bidir=on", 4)
+        reverse = result["rev"]
+        check(1800 <= result["avg_kbit"] <= 2200 and 1800 <= reverse["avg_kbit"] <= 2200,
+              f"bidirectional: forward {result['avg_kbit']} and reverse {reverse['avg_kbit']} kbit/s behind 2000 limiters",
+              result)
+        check(reverse["sent"] > 600 and reverse["lost"] > 0 and reverse["dup"] == 0,
+              f"the reverse stream sent {reverse['sent']} frames and lost the excess ({reverse['lost']})", result)
     finally:
         lab.stop()
     print("PASS: nettest's generator and sink measure the impairment link through a four-NIC loop.")
