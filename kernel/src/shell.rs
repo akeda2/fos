@@ -882,7 +882,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"reboot" => reboot_command(info, arguments),
         b"debug" => debug_command(info, arguments),
         b"clear" | b"about" | b"bootinfo" | b"memmap" | b"memory" | b"cpuinfo" | b"ticks"
-        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"pci" | b"dmesg"
+        | b"uptime" | b"irqstat" | b"pmem" | b"palloc" | b"serial" | b"dmesg"
         | b"printer" | b"start" | b"audio" | b"hda" => {
             println!("This command does not accept arguments.");
         }
