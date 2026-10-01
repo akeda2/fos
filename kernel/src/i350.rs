@@ -105,6 +105,7 @@ const REG_RAH0: u32 = 0x5404;
 
 // --- Registers that moved for I350's multi-queue/MSI-X architecture ---
 const REG_ICR: u32 = 0x1500;
+const REG_ICS: u32 = 0x1504; // Interrupt Cause Set: writing a bit raises that cause.
 const REG_IMS: u32 = 0x1508;
 const REG_IMC: u32 = 0x150c;
 
@@ -355,6 +356,10 @@ pub struct I350 {
     recovery_pending: AtomicBool,
     promiscuous: Cell<bool>,
     irq: Option<u8>,
+    /// PCI location, for `nic.rs` to program the MSI capability, and the MSI
+    /// vector in use once that succeeds (`None` = the legacy IRQ).
+    pci: Cell<Option<pci::PciAddress>>,
+    msi_vector: Cell<Option<u8>>,
     interrupt_count: AtomicU32,
     interrupt_errors: AtomicU32,
     work_pending: AtomicBool,
@@ -384,6 +389,7 @@ impl I350 {
                 out[count] = ProbeInfo {
                     mmio_base,
                     irq: address.interrupt_line(),
+                    address: Some(*address),
                 };
                 count += 1;
             }
@@ -423,6 +429,8 @@ impl I350 {
             recovery_pending: AtomicBool::new(false),
             promiscuous: Cell::new(false),
             irq,
+            pci: Cell::new(None),
+            msi_vector: Cell::new(None),
             interrupt_count: AtomicU32::new(0),
             interrupt_errors: AtomicU32::new(0),
             work_pending: AtomicBool::new(false),
@@ -633,6 +641,28 @@ impl I350 {
         WatchdogResult::Recovered
     }
 
+    pub fn pci_address(&self) -> Option<pci::PciAddress> {
+        self.pci.get()
+    }
+
+    pub fn msi_vector(&self) -> Option<u8> {
+        self.msi_vector.get()
+    }
+
+    pub fn set_msi_vector(&self, vector: Option<u8>) {
+        self.msi_vector.set(vector);
+    }
+
+    /// Forces one interrupt so `nic.rs` can check that an MSI message really
+    /// arrives. `ICS` (0x1504) works like the e1000e's: a bit written there
+    /// raises that cause. Link Status Change is harmless -- the handler only
+    /// counts it. The I350 stays in its legacy-compatible single-vector mode
+    /// (`GPIE` untouched), where one MSI replaces the INTx line; the MSI-X
+    /// per-queue vectors the chip also offers are deliberately not used.
+    pub fn trigger_test_interrupt(&self) {
+        write_register(self.mmio_base, REG_ICS, ICR_LSC);
+    }
+
     pub fn enable_interrupts(&self) {
         let _ = read_register(self.mmio_base, REG_ICR);
         write_register(self.mmio_base, REG_IMS, INTERRUPT_MASK);
@@ -758,6 +788,7 @@ impl I350 {
 pub struct ProbeInfo {
     mmio_base: u32,
     irq: Option<u8>,
+    address: Option<pci::PciAddress>,
 }
 
 const MAX_INSTANCES: usize = pci::MAX_DEVICE_MATCHES;
@@ -779,6 +810,7 @@ pub fn initialize_all() -> Result<usize, Status> {
                 ProbeInfo {
                     mmio_base: 0,
                     irq: None,
+                    address: None,
                 }
             }; MAX_INSTANCES];
             let found = I350::probe_all(&mut probe_info);
@@ -786,6 +818,7 @@ pub fn initialize_all() -> Result<usize, Status> {
             for info in &probe_info[..found] {
                 match I350::init(info.mmio_base, info.irq) {
                     Ok(initialized) => {
+                        initialized.pci.set(info.address);
                         NICS[NIC_COUNT] = Some(initialized);
                         NIC_COUNT += 1;
                     }

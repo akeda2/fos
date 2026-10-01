@@ -228,12 +228,13 @@ impl Nic {
         }
     }
 
-    /// The PCI location of NICs that can use MSI (the RTL8168 and e1000e,
-    /// the two backends with an MSI-capable QEMU model or real-hardware test).
+    /// The PCI location of NICs that can use MSI (the RTL8168, e1000e and
+    /// I350; the I350 has no QEMU model, so it is real-hardware-only).
     pub fn pci_address(&self) -> Option<pci::PciAddress> {
         match self {
             Nic::Rtl8168(nic) => nic.pci_address(),
             Nic::E1000E(nic) => nic.pci_address(),
+            Nic::I350(nic) => nic.pci_address(),
             _ => None,
         }
     }
@@ -243,6 +244,7 @@ impl Nic {
         match self {
             Nic::Rtl8168(nic) => nic.msi_vector(),
             Nic::E1000E(nic) => nic.msi_vector(),
+            Nic::I350(nic) => nic.msi_vector(),
             _ => None,
         }
     }
@@ -251,6 +253,7 @@ impl Nic {
         match self {
             Nic::Rtl8168(nic) => nic.set_msi_vector(vector),
             Nic::E1000E(nic) => nic.set_msi_vector(vector),
+            Nic::I350(nic) => nic.set_msi_vector(vector),
             _ => {}
         }
     }
@@ -260,6 +263,7 @@ impl Nic {
         match self {
             Nic::Rtl8168(nic) => nic.trigger_test_interrupt(),
             Nic::E1000E(nic) => nic.trigger_test_interrupt(),
+            Nic::I350(nic) => nic.trigger_test_interrupt(),
             _ => {}
         }
     }

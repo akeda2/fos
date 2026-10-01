@@ -514,7 +514,7 @@ or bad value is reported and skipped.
 
 | Option | Effect |
 | --- | --- |
-| `no-msi` | Keeps every NIC on its legacy PCI IRQ instead of trying MSI. Without it, the RTL8168 and e1000e backends try Message Signaled Interrupts at boot, force a test interrupt, and fall back to the legacy IRQ if the message does not arrive within 3 ticks (as on boards lacking an MSI mapping). `nic list` and `irqstat` show which is in use. |
+| `no-msi` | Keeps every NIC on its legacy PCI IRQ instead of trying MSI. Without it, the RTL8168, e1000e and I350 backends try Message Signaled Interrupts at boot, force a test interrupt, and fall back to the legacy IRQ if the message does not arrive within 3 ticks (as on boards lacking an MSI mapping). `nic list` and `irqstat` show which is in use. |
 | `deny-term-net N[,N...]` | `term net` ignores a remote terminal `HELLO`, KUP (the network kernel-update service) ignores update frames, and NETFS serves and accepts no files, for traffic arriving on these one-based NIC numbers (the numbers `nic list` shows). Commas and spaces both separate numbers, and repeated lines add up. Meant for a router whose outbound NIC should offer no shell, kernel push or file access. Discovery replies are not affected, and this machine's own outgoing NETFS requests (`copy HOST/...`) are not either. A denied frame is dropped silently. If every NIC is denied, `term net` returns at once instead of waiting. |
 
 ### Boot-time `start` script
