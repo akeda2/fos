@@ -213,6 +213,15 @@ def main():
               f"the reverse stream sent {reverse['sent']} frames and lost the excess ({reverse['lost']})", result)
     finally:
         lab.stop()
+    lab = Lab()
+    try:
+        # The ready-made `selftest GEN LINK_IN LINK_OUT SINK`, with its 100 Mbit/s
+        # default turned down for QEMU and a limiter added after it.
+        result = run_scenario(lab, "selftest 1 2 3 4 gen.rate=4000 gen.time=3 rate=1000 queue=30", 3)
+        check(900 <= result["avg_kbit"] <= 1100 and result["lost"] > 0,
+              f"selftest keyword: {result['avg_kbit']} kbit/s behind a 1000 kbit/s limiter", result)
+    finally:
+        lab.stop()
     print("PASS: nettest's generator and sink measure the impairment link through a four-NIC loop.")
 
 

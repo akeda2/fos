@@ -226,7 +226,9 @@ pub extern "C" fn tape_main(
             b"Usage: tape run nettest [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]]\n\
               \x20      [rate=KBIT] [queue=N] [seed=N] [gen=N] [sink=N] [gen.rate=KBIT]\n\
               \x20      [gen.size=B] [gen.to=MAC|sink] [gen.count=N] [gen.time=S]\n\
-              \x20      [gen.run=on]   or   tape run nettest @FILE\n",
+              \x20      [gen.run=on]   or   tape run nettest @FILE\n\
+              Ready-made: nettest selftest GEN LINK_IN LINK_OUT SINK [settings]\n\
+              \x20           nettest routertest GEN SINK [settings]\n",
         );
         release(big, free);
         return;
@@ -599,6 +601,57 @@ fn split_words<'a>(line: &'a [u8], words: &mut [&'a [u8]; MAX_WORDS]) -> usize {
 /// Handles the startup arguments (`tape run nettest ...`, or the contents of an
 /// `@file`): segments separated by newlines or `;`, `#` comments, optional
 /// leading port numbers, then `name=value` settings or ordinary commands.
+/// The ready-made test set-ups.
+///
+/// `selftest G A B S`: generator on NIC G, the impairment link between NICs A
+/// and B, sink on NIC S -- for a machine whose ports are cabled G-A and B-S (see
+/// `nic map`), a lab on one machine. `routertest G S`: generator on NIC G and
+/// sink on NIC S with UDP/IP frames in both directions, for testing a router
+/// (or any gateway) cabled between the two ports; it assumes the router is
+/// 10.0.1.1 on G's side and 10.0.2.1 on S's side, the generator and sink are
+/// 10.0.1.2 and 10.0.2.2. Both default to 100 Mbit/s of 1000-byte frames for
+/// 10 seconds, starting after 3 seconds, and print a summary at the end; every
+/// default can be overridden by words that follow (`gen.rate=`, `loss=`, ...).
+fn scenario(
+    session: &mut Session<'_>,
+    routed: bool,
+    nics: [u32; 4],
+    ports: &mut [u32; 2],
+    port_count: &mut usize,
+) {
+    if routed {
+        session.gen_nic = Some(nics[0]);
+        session.sink_nic = Some(nics[1]);
+    } else {
+        *ports = [nics[1], nics[2]];
+        *port_count = 2;
+        session.gen_nic = Some(nics[0]);
+        session.sink_nic = Some(nics[3]);
+    }
+    for (setting, value) in [
+        (&b"rate"[..], &b"100000"[..]),
+        (b"size", b"1000"),
+        (b"delay", b"3"),
+        (b"time", b"10"),
+        (b"run", b"on"),
+    ] {
+        gen_setting(session, setting, value);
+    }
+    if routed {
+        for (setting, value) in [
+            (&b"ip"[..], &b"10.0.1.2"[..]),
+            (b"dst", b"10.0.2.2"),
+            (b"gw", b"10.0.1.1"),
+        ] {
+            gen_setting(session, setting, value);
+        }
+        sink_setting(session, b"ip", b"10.0.2.2");
+        session.bidir = true;
+        session.rev_gateway = Some([10, 0, 2, 1]);
+        rebuild_udp(session);
+    }
+}
+
 /// More words than `split_words` can hold would be silently cut off.
 fn too_many_words(line: &[u8]) -> bool {
     let mut words = 0;
@@ -638,6 +691,26 @@ fn apply_startup(
         }
         while index < count {
             let word = words[index];
+            if word == b"selftest" || word == b"routertest" {
+                // Ready-made set-ups; see `scenario`. They take their NIC numbers
+                // right after the keyword, and later words may override anything.
+                let routed = word == b"routertest";
+                let needed = if routed { 2 } else { 4 };
+                let mut nics = [0u32; 4];
+                for slot in nics.iter_mut().take(needed) {
+                    index += 1;
+                    match words[..count].get(index).and_then(|word| parse_u32(word)) {
+                        Some(number) if number >= 1 => *slot = number - 1,
+                        _ => {
+                            print_bytes(putc, b"nettest: selftest needs 4 NIC numbers (generator, link in, link out, sink); routertest needs 2 (generator, sink)\n");
+                            return false;
+                        }
+                    }
+                }
+                index += 1;
+                scenario(session, routed, nics, ports, port_count);
+                continue;
+            }
             if let Some(number) = parse_u32(word) {
                 if *port_count == 2 || number == 0 {
                     return false;

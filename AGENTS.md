@@ -2199,7 +2199,8 @@ waits when the descriptor it needs is still in flight (a stuck one still sets
 (one frame in flight, collected at the next `send`) are asynchronous the same way; the RTL8139
 is tested in QEMU, the RTL8168 and 3C905 changes are real-hardware-only and not yet
 verified (the AMD machine currently has only 3C905s and was off). `tapes/nettest/` also has a generator and a sink (`gen=N`,
-`sink=N`; engine in `tapes/nettest/src/lib.rs`), tested with a four-NIC QEMU
+`sink=N`; engine in `tapes/nettest/src/lib.rs`; ready-made `selftest`/`routertest`
+set-ups; the user manual is `docs/nettest.md`), tested with a four-NIC QEMU
 loop (`make test-tape-nettest-selftest`); `tools/test_nic_map_e2e.py` covers
 `nic map`.
 

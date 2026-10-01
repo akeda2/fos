@@ -44,8 +44,7 @@ def main():
         # subnets, which is all this needs.
         result = run_scenario(
             lab,
-            "gen=1 sink=2 gen.ip=10.0.1.2 gen.dst=10.0.2.2 gen.gw=10.0.1.1 sink.ip=10.0.2.2 "
-            "gen.rate=2000 gen.size=500 gen.time=4 gen.delay=3 gen.run=on bidir=on rev.gw=10.0.2.1",
+            "routertest 1 2 gen.rate=2000 gen.size=500 gen.time=4",
             4,
             sink_nic=2,
         )
