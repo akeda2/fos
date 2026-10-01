@@ -9,7 +9,7 @@
 [x] New RTL gigabit card: TP-link TG-3468 chip: RTL8168H. Done: `rtl8168.rs`, working on the TP-Link (1000 Mb/s) and the onboard RTL8168 (100 Mb/s); see CLAUDE.md.
 [x] 3C905 receive interrupts never fired on the AMD/nForce test machine: fixed (status-enable mask, command-register serialisation, 16-descriptor ring); see CLAUDE.md.
 [] On the test machine, `nic use N` followed by `tape load net` in the *same* term net session on NIC N never receives the tape (works in QEMU, and works when the session is on a different NIC than N); unexplained, affects the 3C905 too.
-[] NIC on MSI
+[x] NIC on MSI: RTL8168, e1000e and I350 try MSI with a forced-interrupt self-test and fall back to the legacy IRQ (`no-msi` setting turns it off). Confirmed on all three test machines; see CLAUDE.md "NIC MSI".
 [] Finish HDA work
 
 ### Shell: Scripts and tape execution
