@@ -125,6 +125,7 @@ E2E_SCRIPTS = [
     "tapes/test_usb_storage_disk_e2e.py",
     "tapes/test_usb_storage_e2e.py",
     "tapes/test_vga_colors_e2e.py",
+    "tools/test_foscopy_e2e.py",
     "tools/test_hostname_discovery_e2e.py",
     "tools/test_kernel_update_e2e.py",
     "tools/test_netfs_e2e.py",

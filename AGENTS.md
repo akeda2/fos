@@ -484,8 +484,8 @@ net`/NETFS, and mirrors NETFS's own PUT flow almost exactly:
 `ambient_discovery_poll` -- the same idle-prompt-loop hook that also serves
 NETFS and ordinary discovery -- dispatches all three request-carrying tags
 via a shared `dispatch_kup_frame` helper, gated behind
-`debug::kernel_update_enabled()`. Unlike NETFS (still idle-prompt-only --
-see that section above), KUP is **also** dispatched from both of
+`debug::kernel_update_enabled()`. Like NETFS (`dispatch_netfs_serve_frame`),
+KUP is **also** dispatched from both of
 `term_net`'s own receive loops (waiting for a `HELLO`, and an active
 session's own loop) through that same helper, so a kernel update can be
 pushed while `term_net` is running instead of requiring a local escape to
@@ -1260,11 +1260,12 @@ tape run @HOST[:diskN]/NAME                    remote source, as a startup-argum
 ```
 
 Copying directly between two remote endpoints is rejected -- go through a
-local disk in two steps instead. **Serving is scoped to the idle prompt
-loop only** (`ambient_discovery_poll`, alongside KUP and ordinary
-discovery): a fos machine must be sitting idle at its own local prompt to
-answer NETFS traffic at all, never inside `chat`, `nic discover`, `term
-net`, or a running tape. Unlike ordinary discovery traffic, NETFS activity
+local disk in two steps instead. **Serving happens at the idle prompt
+(`ambient_discovery_poll`) and in both of `term_net`'s receive loops, all
+through `dispatch_netfs_serve_frame`** (a GET pauses an active session while
+it is sent): never inside `chat`, `nic discover` or a running tape. The host
+side is `tools/foscopy.py` (`HOST[:diskN]/NAME` syntax, `--mcast` test seam;
+`tools/test_foscopy_e2e.py`, in `run_tests.py`'s `E2E_SCRIPTS`). Unlike ordinary discovery traffic, NETFS activity
 is printed. A PUT is stateful across many idle-loop iterations
 (`NetfsPutTransfer`); a second concurrent `PUT_REQUEST` is rejected with
 `BUSY`. NETFS serving reuses the same shared staging buffer a locally

@@ -1,3 +1,45 @@
+/// Serves one incoming NETFS request frame (`GET_REQUEST`, `PUT_REQUEST`,
+/// `PUT_DATA`, `PUT_STOP`), returning whether `tag` was one of them.
+/// Shared by `ambient_discovery_poll` (the idle prompt) and both of
+/// `term_net`'s receive loops, so a host tool (`tools/foscopy.py`) can reach
+/// a machine that sits in `term net` -- which is where every machine spends
+/// its time after boot -- without a local escape to the prompt first, the
+/// same reason `dispatch_kup_frame` exists. A NIC on the `settings` file's
+/// `deny-term-net` list serves no file access either: a denied request is
+/// consumed and dropped silently. The shared-staging-buffer caveat on
+/// `NetfsPutTransfer` applies unchanged. A GET is answered synchronously, so
+/// it pauses an active `term net` session for the length of the transfer.
+fn dispatch_netfs_serve_frame(
+    info: &BootInfo,
+    nic_index: usize,
+    nic: &nic::Nic,
+    peer_mac: [u8; 6],
+    own_mac: [u8; 6],
+    tag: u8,
+    payload: &[u8],
+) -> bool {
+    if !matches!(
+        tag,
+        NETFS_TAG_GET_REQUEST | NETFS_TAG_PUT_REQUEST | NETFS_TAG_PUT_DATA | NETFS_TAG_PUT_STOP
+    ) {
+        return false;
+    }
+    if term_net_denied(nic_index) {
+        return true;
+    }
+    match tag {
+        NETFS_TAG_GET_REQUEST => {
+            let remote_disk_number = payload.first().copied().unwrap_or(0);
+            let name = payload.get(1..).unwrap_or(&[]);
+            serve_netfs_get_request(info, nic, peer_mac, own_mac, remote_disk_number, name);
+        }
+        NETFS_TAG_PUT_REQUEST => serve_netfs_put_request(nic, peer_mac, own_mac, payload),
+        NETFS_TAG_PUT_DATA => serve_netfs_put_data(peer_mac, payload),
+        _ => serve_netfs_put_stop(info, nic, peer_mac, own_mac),
+    }
+    true
+}
+
 use crate::arch::x86::{halt_forever, halt_until_interrupt, reset, wait_for_interrupt};
 use crate::audio;
 use crate::boot_info::{BootInfo, MemoryRegion};
@@ -2941,6 +2983,15 @@ fn term_net(info: &BootInfo) {
                             index + 1
                         );
                     }
+                    tag if dispatch_netfs_serve_frame(
+                        info,
+                        index,
+                        interface,
+                        peer_mac,
+                        interface.mac_address(),
+                        tag,
+                        &frame[15..],
+                    ) => {}
                     tag if dispatch_kup_frame(
                         info,
                         index,
@@ -3045,6 +3096,17 @@ fn term_net(info: &BootInfo) {
                         CHAT_TAG_DISCOVER_REPLY,
                         session_index,
                     );
+                    continue;
+                }
+                if dispatch_netfs_serve_frame(
+                    info,
+                    session_index,
+                    nic,
+                    frame_source,
+                    source,
+                    frame[14],
+                    &frame[15..],
+                ) {
                     continue;
                 }
                 if dispatch_kup_frame(
@@ -4815,46 +4877,13 @@ static mut AMBIENT_DISCOVERY_STARTED_AT: Option<u64> = None;
 /// starts at 0 so the very first call always announces immediately.
 static mut NEXT_AMBIENT_BROADCAST: u64 = 0;
 
-/// The "always on" half of NIC discovery: called every iteration of the
-/// idle interactive prompt loop in `run` -- the one loop that, before this,
-/// never touched the network card at all, since every other long-running
-/// command (`chat`, `term net`, `nic discover`, a running tape, ...) already
-/// polls its own NIC and already replies to an incoming discovery probe
-/// unconditionally. It always answers a `CHAT_TAG_DISCOVER_REQUEST` and
-/// remembers a `CHAT_TAG_DISCOVER_REPLY` silently (no `println!` of its
-/// own -- unlike `nic_discover`'s dedicated command, this must never
-/// interrupt whatever the operator is typing at the ordinary prompt), and
-/// periodically re-announces itself so other machines' own shortlists stay
-/// current even when nobody is running `nic discover` at all. There is
-/// still no interrupt-driven network service in this kernel (see "Current
-/// boundaries" in `AGENTS.md`): this is only "always on" in the sense that
-/// the one loop that is always running (the idle prompt) now always
-/// participates, not that discovery runs independently of the CPU actually
-/// being here to poll for it.
-///
-/// This is also, deliberately, the *only* loop that answers NETFS requests
-/// (`NETFS_TAG_GET_REQUEST`/`PUT_REQUEST`/`PUT_DATA`/`PUT_STOP`): a peer
-/// serves NETFS only while sitting idle at its own local prompt, not while
-/// it is itself running `chat`/`nic discover`/`term net`/a tape (see
-/// "NETFS" above). Unlike routine discovery traffic, NETFS activity is
-/// rare and consequential enough to be worth a `println!` here even though
-/// discovery replies deliberately stay silent.
-///
-/// Returns `true` if any NIC actually received a frame this call (whether
-/// or not it matched a tag this function understands). `run`'s idle loop
-/// uses this to decide whether it is safe to `hlt` until the next
-/// interrupt: an in-flight NETFS/KUP transfer arrives in paced chunks only
-/// a few milliseconds apart, so as long as frames keep arriving the caller
-/// must keep polling at full speed rather than sleeping through the next
-/// chunk.
 /// Dispatches one incoming frame's tag if (and only if) it is a KUP tag
 /// and `debug::kernel_update_enabled()`, returning whether it was
 /// handled -- shared by `ambient_discovery_poll` and both of `term_net`'s
 /// own receive loops (the "waiting for a `HELLO`" wait and an active
 /// session's own loop), so a kernel update can be pushed while `term_net`
 /// is running instead of requiring a local escape to the idle prompt
-/// first. Unlike NETFS (still idle-prompt-only, see `ambient_discovery_
-/// poll`'s own doc comment for why), KUP's own transfer state
+/// first. KUP's own transfer state
 /// (`serve_kup_put_*`) is independent of whatever `term_net` itself is
 /// doing with the NIC, and a KUP push is a deliberate, operator-initiated
 /// action either way -- the same "shared staging buffer, don't run a
@@ -4884,6 +4913,37 @@ fn dispatch_kup_frame(
     true
 }
 
+/// The "always on" half of NIC discovery: called every iteration of the
+/// idle interactive prompt loop in `run` -- the one loop that, before this,
+/// never touched the network card at all, since every other long-running
+/// command (`chat`, `term net`, `nic discover`, a running tape, ...) already
+/// polls its own NIC and already replies to an incoming discovery probe
+/// unconditionally. It always answers a `CHAT_TAG_DISCOVER_REQUEST` and
+/// remembers a `CHAT_TAG_DISCOVER_REPLY` silently (no `println!` of its
+/// own -- unlike `nic_discover`'s dedicated command, this must never
+/// interrupt whatever the operator is typing at the ordinary prompt), and
+/// periodically re-announces itself so other machines' own shortlists stay
+/// current even when nobody is running `nic discover` at all. There is
+/// still no interrupt-driven network service in this kernel (see "Current
+/// boundaries" in `AGENTS.md`): this is only "always on" in the sense that
+/// the one loop that is always running (the idle prompt) now always
+/// participates, not that discovery runs independently of the CPU actually
+/// being here to poll for it.
+///
+/// NETFS requests (`NETFS_TAG_GET_REQUEST`/`PUT_REQUEST`/`PUT_DATA`/
+/// `PUT_STOP`) are served here and, through `dispatch_netfs_serve_frame`,
+/// by both of `term_net`'s receive loops, but not by `chat`/`nic discover`
+/// or a running tape (see "NETFS" above). Unlike routine discovery traffic, NETFS activity is
+/// rare and consequential enough to be worth a `println!` here even though
+/// discovery replies deliberately stay silent.
+///
+/// Returns `true` if any NIC actually received a frame this call (whether
+/// or not it matched a tag this function understands). `run`'s idle loop
+/// uses this to decide whether it is safe to `hlt` until the next
+/// interrupt: an in-flight NETFS/KUP transfer arrives in paced chunks only
+/// a few milliseconds apart, so as long as frames keep arriving the caller
+/// must keep polling at full speed rather than sleeping through the next
+/// chunk.
 fn ambient_discovery_poll(info: &BootInfo) -> bool {
     let now = interrupts::ticks();
     let started_at = unsafe {
@@ -4922,27 +4982,9 @@ fn ambient_discovery_poll(info: &BootInfo) -> bool {
                 remember_peer(peer_mac, trim_trailing_zero(payload));
                 send_chat_control(nic, &peer_mac, &own_mac, CHAT_TAG_DISCOVER_REPLY, index);
             }
-            // A NIC on the `settings` file's `deny-term-net` list serves no
-            // file access either: these requests are dropped silently.
-            NETFS_TAG_GET_REQUEST
-            | NETFS_TAG_PUT_REQUEST
-            | NETFS_TAG_PUT_DATA
-            | NETFS_TAG_PUT_STOP
-                if term_net_denied(index) => {}
-            NETFS_TAG_GET_REQUEST => {
-                let remote_disk_number = payload.first().copied().unwrap_or(0);
-                let name = payload.get(1..).unwrap_or(&[]);
-                serve_netfs_get_request(info, nic, peer_mac, own_mac, remote_disk_number, name);
-            }
-            NETFS_TAG_PUT_REQUEST => {
-                serve_netfs_put_request(nic, peer_mac, own_mac, payload);
-            }
-            NETFS_TAG_PUT_DATA => {
-                serve_netfs_put_data(peer_mac, payload);
-            }
-            NETFS_TAG_PUT_STOP => {
-                serve_netfs_put_stop(info, nic, peer_mac, own_mac);
-            }
+            tag if dispatch_netfs_serve_frame(
+                info, index, nic, peer_mac, own_mac, tag, payload,
+            ) => {}
             tag if dispatch_kup_frame(info, index, nic, peer_mac, own_mac, tag, payload) => {}
             _ => {}
         }

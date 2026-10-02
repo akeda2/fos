@@ -653,9 +653,10 @@ transfer rather than being retried. Copying directly between two remote
 peers (`copy hostA:.../NAME hostB:...`) is rejected; copy through a local
 disk in two steps instead.
 
-A peer only serves NETFS requests while sitting idle at its own local
-`fos> ` prompt (the same ambient loop that answers discovery probes) --
-not while running `chat`, `nic discover`, `term net`, or a tape. Because
+A peer serves NETFS requests while sitting idle at its own local `fos> `
+prompt (the ambient loop that answers discovery probes) and while waiting in
+or running a `term net` session (a GET pauses the session for its duration)
+-- not while running `chat`, `nic discover`, or a tape. Because
 serving reuses the same shared tape staging buffer `copy`/`tape load`
 already use locally, a local operator typing a `copy`/`tape load` command
 on the *serving* machine while a remote transfer is in flight can corrupt
@@ -674,6 +675,21 @@ network interface to send from is auto-detected (first non-loopback
 interface, preferring one that is up) unless `--iface` overrides it; and the
 ethertype defaults to the same `0x88b5` `nic send` uses, so captured frames
 are easy to recognize, but `--ethertype` can send something else.
+
+#### `tools/foscopy.py`: the same `copy` syntax from the host
+
+```sh
+python3-netraw tools/foscopy.py --iface IF router.cfg myhost1:disk1/router.cfg   # PUT
+python3-netraw tools/foscopy.py --iface IF myhost1:disk1/start ./start.copy      # GET
+python3-netraw tools/foscopy.py --iface IF --mac 3 f.txt :disk1/f.txt            # peer by number
+```
+
+It speaks NETFS directly (checksum-verified both ways, real error codes),
+so unlike `devloop.py put` it needs no tape-buffer juggling and no second
+cabled NIC. `HOST` is a hostname as `nic peers` shows it (with the NIC
+number: `myhost1`), a full MAC, or an address-book number; `:diskN`
+defaults to disk1; a PUT destination ending in `/` reuses the source's file
+name. Test: `tools/test_foscopy_e2e.py`.
 
 `chat` is a small two-way text chat built out of the same two primitives
 `nic sniff` and `term` already demonstrate separately: `nic sniff`'s
@@ -1763,8 +1779,8 @@ below never even acknowledges its own protocol.
   currently active, then the machine reboots to try it. If it doesn't
   reach a working prompt on that first try, the boot loader automatically
   falls back to the previous, known-good kernel -- no physical access
-  needed to recover from a bad push. KUP is only ever served while a
-  machine is idle at its own local prompt, same as NETFS above.
+  needed to recover from a bad push. KUP is served at the idle prompt and
+  while the machine is in `term net`, like NETFS.
 - `debug status`/`debug crash`/`debug slots` are three small, hidden
   (not listed in `help`) diagnostic commands for checking the current
   config, deliberately triggering a test crash, and inspecting the A/B
