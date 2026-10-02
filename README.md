@@ -351,6 +351,29 @@ own config/log storage (e.g. a second USB thumb drive) kept separate from
 the tapes/data disk the build produces, not for booting -- a secondary disk
 is never GPT-formatted, partitioned, or written to by `tools/build_image.py`.
 
+**Preparing a USB stick as `disk2` on real hardware.** A stick that already
+has an MBR (`0x55AA` at the end of sector 0 -- any normal formatted stick)
+is treated by the BIOS as a bootable disk and jumps ahead of the fos stick in
+boot order, so the machine boots the wrong stick, or `disk2` never appears.
+`diskprobe` shows what the BIOS presents. A drive `0x00` entry is usually a
+phantom floppy from the BIOS setup, not the stick. The fix is to make the
+stick non-bootable *before* the BIOS ever ranks it:
+
+1. On another machine, zero only sector 0 (the BIOS looks at nothing else;
+   filling the whole stick is unnecessary):
+   `sudo dd if=/dev/zero of=/dev/sdX bs=512 count=1`, and optionally
+   `sudo wipefs -a /dev/sdX` to clear leftover filesystem and GPT signatures.
+2. Boot the fos machine **without** the stick, with the fos stick chosen as
+   the boot device in the BIOS, and do one full reset.
+3. Insert the zeroed stick and reset again. The BIOS now ranks it behind the
+   fos stick; it appears as `disk2` (check with `diskinfo disk2`).
+4. `format disk2`. This writes the FOSFS superblock over sector 0 (no
+   `0x55AA`), so the stick stays non-bootable from then on.
+
+The BIOS remembers boot order per device, so a stick with an MBR that is
+inserted for the first time can reorder it; if that happens, remove the
+stick, fix the boot device in the BIOS setup, and start again from step 2.
+
 `copy SRC_DISK NAME DST_DISK [NEW_NAME]` moves one file's bytes directly
 between two disks (e.g. `copy disk1 router.cfg disk2`, or `copy disk1/router.cfg disk2/r2.cfg`) without a host round
 trip. Unlike every other disk command above, both sides must be spelled out
