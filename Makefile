@@ -73,7 +73,7 @@ EXTRA_FOSFS_FILES ?=
 # directory before invoking cargo.
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
-.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-idle-cpu test-hwaccess test-nic-map test-release-loops test-msi test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-nettest tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-nettest test-tape-nettest-router test-tape-router test-tape-router-arp test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
+.PHONY: all help kernel image image-unsafe-memory run run-unsafe-memory test test-most test-unit test-all test-unsafe-memory test-stack-guard test-page-protection test-nic-watchdog test-start test-scripts-settings test-idle-cpu test-hwaccess test-nic-map test-release-loops test-msi test-second-disk test-debug-mode test-e1000 test-dual-e1000 test-e1000-net test-ne2000 test-ne2000-net test-vga-modes netrom tapes tape-primes tape-hello-rs tape-vga-colors tape-bigsieve tape-longmode tape-longmode-rs tape-cpu64-lab tape-cpu64-show tape-calc tape-ed tape-beep tape-morse tape-net-chat tape-audio-net tape-ip-chat tape-telnet tape-bridge tape-router tape-nettest tape-net-dhcp test-tape-net test-tape-ip-chat test-tape-telnet test-tape-bridge test-tape-nettest test-tape-nettest-router test-tape-router test-tape-router-arp test-tape-ed test-tape-net-dhcp test-cpu64-lab test-cpu64-show test-audio-capture test-audio-net test-audio-multi opus-codec-lib test-tape-opus-codec clean
 
 # Plain `make` (no explicit target) keeps meaning `make image` -- the one
 # artifact `run`/`test` need for ordinary kernel/boot work -- even though
@@ -99,6 +99,9 @@ help:
 	@echo "  make run        - build the image, then boot it interactively in QEMU"
 	@echo "  make run-unsafe-memory - boot the optional unpaged teaching image interactively"
 	@echo "  make test       - build the image, then run default-NIC, e1000, dual-e1000, and VGA mode tests"
+	@echo "  make test-most  - 'make test' plus stack guard, page protection, debug mode/KUP, start, scripts, release loops"
+	@echo "  make test-unit  - host-side cargo tests of the tape crates"
+	@echo "  make test-all   - everything: test-most, test-unit and every other QEMU test (slow; prints a summary)"
 	@echo "  make test-unsafe-memory - boot the optional unpaged teaching image through the smoke test"
 	@echo "  make test-stack-guard - build a test-only guard-fault image and verify its emergency double-fault stack"
 	@echo "  make test-page-protection - verify kernel text rejects a supervisor write under CR0.WP"
@@ -204,6 +207,21 @@ test: image
 	python3 tools/test_hwaccess_e2e.py
 	python3 tools/test_msi_e2e.py
 	python3 tools/test_nic_map_e2e.py
+
+# Test groups (tools/run_tests.py): each keeps going after a failure and prints
+# one summary table. `make test` stays the fast gate and is part of test-most.
+#   test-most  make test + stack guard, page protection, debug mode/KUP, start
+#              script, scripts+settings, release loops
+#   test-unit  host-side cargo tests of the tape crates
+#   test-all   test-most + test-unit + every other QEMU test (slow)
+test-most: all
+	python3 tools/run_tests.py most
+
+test-unit:
+	python3 tools/run_tests.py unit
+
+test-all: all
+	python3 tools/run_tests.py all
 
 test-unsafe-memory: image-unsafe-memory
 	python3 tools/qemu_smoke.py --image $(UNSAFE_MEMORY_IMAGE) --legacy-unsafe-memory
