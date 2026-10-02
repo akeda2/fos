@@ -48,6 +48,7 @@ import os
 import re
 import subprocess
 import sys
+import termios
 import threading
 import time
 from pathlib import Path
@@ -222,7 +223,12 @@ def run_job(job: Job, parallel: bool) -> tuple[bool, float, str]:
     out = [f"\n=== {job.cmd}\n"]
     ok = True
     for command in job.commands:
-        result = subprocess.run(command, shell=True, cwd=ROOT, env=env,
+        # stdin=/dev/null: several tests start QEMU with `-serial stdio` and
+        # no stdin of their own. QEMU then puts the *terminal* it inherits
+        # into raw mode and restores the state it saw at start-up; with QEMUs
+        # overlapping (or one killed) the last restore can be the raw state,
+        # leaving the user's shell without echo (`stty sane`).
+        result = subprocess.run(command, shell=True, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         out.append(result.stdout.decode("utf-8", "replace"))
         if result.returncode != 0:
@@ -293,6 +299,21 @@ def main() -> int:
     parser.add_argument("-j", "--jobs", type=int, default=1, help="parallel jobs (default 1)")
     args = parser.parse_args()
     workers = max(1, args.jobs)
+    # Belt and braces for the stdin note in run_job: whatever a test does to the
+    # terminal, hand it back as we found it.
+    saved_tty = None
+    try:
+        saved_tty = termios.tcgetattr(sys.stdin.fileno())
+    except (termios.error, OSError, ValueError):
+        pass
+    try:
+        return run_group(args, workers)
+    finally:
+        if saved_tty is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved_tty)
+
+
+def run_group(args: argparse.Namespace, workers: int) -> int:
     cmds = GROUPS[args.group]
     # Exclusive jobs first (stable), so the parallel pool runs at the end.
     cmds = [c for c in cmds if c in EXCLUSIVE] + [c for c in cmds if c not in EXCLUSIVE]
