@@ -106,6 +106,28 @@ protocol code without requiring a NIC or QEMU. `make test-tape-ip-chat` runs
 the host-side tests for the IPv4/UDP chat tape's argument and packet helpers;
 `make test-tape-telnet` does the same for the Telnet tape.
 
+### Running groups of tests
+
+`make test` stays the fast gate. Three groups run more, keep going after a
+failure, and print one summary table (`tools/run_tests.py`):
+
+| Target | Runs |
+| --- | --- |
+| `make test-most` | `make test` plus the stack-guard, page-protection, debug-mode/KUP, start-script, scripts+settings and release-loops tests. Use it before committing a kernel change. |
+| `make test-unit` | The host-side `cargo test` suites of the tape crates (no QEMU). |
+| `make test-all` | Everything: `test-most`, `test-unit` and every other QEMU test, including the tape/tool scripts with no make target of their own (about 15 minutes serially). |
+
+`TEST_JOBS=N` (for example `make test-all TEST_JOBS=8`) runs independent
+tests N at a time. Tests that rewrite or swap `build/fos.img`, the
+boot-critical `test-most` group and `test-idle-cpu` still run alone first.
+The rest run from their recipes directly, QEMU gets `-snapshot` through
+`tools/qemu-snapshot/`, and tests that share a multicast group, a fixed
+port or an imported test module never overlap. Known-failing tests are shown
+as `XFAIL` and known-flaky ones are retried once; both lists are at the top
+of `tools/run_tests.py`. Tests that need a human, a host tap interface or a
+real microphone (`tools/test_realnet_e2e.py`,
+`tapes/test_audio_net_real_mic_e2e.py`) are not part of any group.
+
 `make netrom` builds an alternative, optional boot artifact,
 `build/netboot.rom`, that boots fos from a NIC's own PCI option ROM instead
 of disk/USB; see "Booting from a NIC ROM" below. It does not run as part of

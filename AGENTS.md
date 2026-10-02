@@ -605,12 +605,20 @@ make test-nic-watchdog # Verifies foreground recovery from a latched NIC fault.
 make test-start # Verifies an optional FOSFS start boot-command script.
 make test-second-disk # Verifies the diskN selector against a second, attached disk.
 make test-debug-mode # Verifies reboot-on-crash, the crash-loop guard, and KUP.
+make test-most # make test plus the boot-critical safety tests (stack guard, page protection, debug mode, start, scripts, release loops).
+make test-unit # Host-side cargo tests of the tape crates.
+make test-all  # Everything, with a summary table; TEST_JOBS=N runs independent tests in parallel.
 make all      # Builds everything: image and every test tape.
 make tapes    # Builds all test tapes only (`build/tapes/*.bin`).
 make help     # Lists every target with a one-line description.
 ```
 
 Always run `make test` for boot, loader, kernel, shell, disk, or FOSFS changes.
+Run `make test-most` before committing a kernel change; `make test-all` is the
+full sweep. Groups, the known-failing/flaky lists and the parallel rules
+(`TEST_JOBS`) live in `tools/run_tests.py`; a new e2e script with no make
+target must be added to its `E2E_SCRIPTS`, and one that boots `build/fos.img`
+and changes it must be marked in `EXCLUSIVE`.
 Also run `make test-stack-guard` when changing paging, GDT/IDT handling,
 exception paths, or kernel-stack layout.
 Run `make test-page-protection` when changing page permissions, linker section
