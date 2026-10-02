@@ -11,8 +11,8 @@ jobs:
   active: true
   path: ~/dev/fos
   test:
-    - make all 
-    - make test-all
+    - make all -j16
+    - make test-all -j16
   post-build:
     - which gb && gb -I fos.yaml -a -w
   interval: 7200
