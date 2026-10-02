@@ -13,6 +13,9 @@ const KEYBOARD_SET_LEDS: u8 = 0xed;
 const CAPS_LOCK_LED: u8 = 0x04;
 const CONTROLLER_READ_COMMAND_BYTE: u8 = 0x20;
 const CONTROLLER_WRITE_COMMAND_BYTE: u8 = 0x60;
+const CONTROLLER_DISABLE_KEYBOARD: u8 = 0xad;
+const CONTROLLER_ENABLE_KEYBOARD: u8 = 0xae;
+const CONTROLLER_KEYBOARD_CLOCK_DISABLE: u8 = 1 << 4;
 const CONTROLLER_KEYBOARD_IRQ: u8 = 1 << 0;
 const CONTROLLER_TRANSLATE_SET_2: u8 = 1 << 6;
 static BIOS_RESTORE_FAILURES: AtomicU32 = AtomicU32::new(0);
@@ -137,17 +140,40 @@ pub fn bios_restore_failures() -> u32 {
 }
 
 fn restore_controller_translation() -> bool {
+    // Hold the keyboard interface off (command 0xAD) while the controller
+    // command exchange below runs. Without this a real keystroke can reach the
+    // output buffer between "read command byte" (0x20) and its reply: the
+    // scancode would then be read *as* the command byte and written back with
+    // the flags ORed in, corrupting the controller configuration (found with
+    // QEMU's ps2/pckbd trace: 0x9c, an Enter break code, came back as 0xdd,
+    // which also set the keyboard-clock-disable bit). A held-off keyboard
+    // keeps its byte in its own buffer; 0xAE below releases it.
+    if !wait_for_input_empty() {
+        return false;
+    }
+    unsafe { outb(STATUS_PORT, CONTROLLER_DISABLE_KEYBOARD) };
     // A BIOS handler can leave a controller reply or a stale make/break byte
     // pending. Drop it before waiting for the acknowledgements below, since
     // treating it as an ACK would desynchronize the command exchange.
     while unsafe { inb(STATUS_PORT) } & STATUS_OUTPUT_FULL != 0 {
         let _ = unsafe { inb(DATA_PORT) };
     }
-    let Some(command_byte) = read_controller_command_byte() else {
-        return false;
+    let restored = match read_controller_command_byte() {
+        // Writing the byte also clears the clock-disable bit 0xAD set, so the
+        // keyboard can talk again for the 0xF4 exchange in `send_keyboard_byte`.
+        Some(command_byte) => {
+            write_controller_command_byte(
+                (command_byte & !CONTROLLER_KEYBOARD_CLOCK_DISABLE)
+                    | CONTROLLER_KEYBOARD_IRQ
+                    | CONTROLLER_TRANSLATE_SET_2,
+            ) && send_keyboard_byte(KEYBOARD_ENABLE_SCANNING)
+        }
+        None => false,
     };
-    write_controller_command_byte(command_byte | CONTROLLER_KEYBOARD_IRQ | CONTROLLER_TRANSLATE_SET_2)
-        && send_keyboard_byte(KEYBOARD_ENABLE_SCANNING)
+    if wait_for_input_empty() {
+        unsafe { outb(STATUS_PORT, CONTROLLER_ENABLE_KEYBOARD) };
+    }
+    restored
 }
 
 fn read_controller_command_byte() -> Option<u8> {
@@ -175,7 +201,19 @@ fn send_keyboard_byte(byte: u8) -> bool {
         return false;
     }
     unsafe { outb(DATA_PORT, byte) };
-    wait_for_output() && unsafe { inb(DATA_PORT) } == KEYBOARD_ACK
+    // The keyboard may send a real scancode before its ACK. Hand such bytes to
+    // the shell's queue (interrupts are off here, as in the IRQ1 handler)
+    // instead of mistaking them for the reply and losing the keystroke.
+    for _ in 0..16 {
+        if !wait_for_output() {
+            return false;
+        }
+        match unsafe { inb(DATA_PORT) } {
+            KEYBOARD_ACK => return true,
+            scancode => interrupts::push_scancode(scancode),
+        }
+    }
+    false
 }
 
 /// Reads one raw scancode directly from the controller. Called only from the

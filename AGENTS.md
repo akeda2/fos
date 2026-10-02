@@ -72,6 +72,11 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   paging for that real-mode transition, then switches back. The trampoline
   reloads stage two's GDT, so `disk.rs` restores the permanent kernel GDT
   (including the double-fault TSS descriptors) before interrupts resume.
+  `keyboard::restore_after_bios_disk_call` then repairs the 8042 (BIOS USB legacy
+  emulation can change its translation bits): it holds the keyboard interface off
+  (`0xAD`) for the command-byte exchange and re-enables it (`0xAE`), because a
+  real keystroke arriving between "read command byte" and its reply was once
+  read as the command byte and written back, corrupting the configuration.
 - `kernel/src/interrupts.rs` builds a 256-entry IDT (timer, keyboard,
   spurious-PIC, safe legacy-PCI IRQ gates, and vector 8's double-fault task
   gate), remaps the 8259 PIC clear of the CPU exception range, and arms the

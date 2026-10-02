@@ -980,7 +980,9 @@ msi_irq_handler!(msi_irq_5f_interrupt, 0x5f);
 /// service" to end, since no real interrupt was ever accepted.
 extern "x86-interrupt" fn lapic_spurious_interrupt(_frame: InterruptStackFrame) {}
 
-fn push_scancode(byte: u8) {
+/// Queues one raw keyboard scancode for the shell. Also used by `keyboard.rs`
+/// when it reads a real key while waiting for a controller reply.
+pub(crate) fn push_scancode(byte: u8) {
     // Interrupts are already disabled for the duration of this handler (it
     // was entered through an interrupt gate), so plain reads/writes here
     // cannot race with `pop_scancode`, which briefly disables interrupts
