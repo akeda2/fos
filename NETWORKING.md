@@ -876,3 +876,58 @@ invocation, multiplexing one incoming and one outgoing RTP stream over
 one UDP 5-tuple) is the next planned step, building on the same combined
 polling-loop pattern `shell.rs`'s `chat` command already uses to merge
 receive-and-print with input-and-echo -- not yet built.
+
+## Router tape detail (moved from AGENTS.md)
+
+This is the original, unedited text of AGENTS.md's `tapes/router/` bullet.
+
+- `tapes/router/` is a fixed-buffer layer-3 tape. It reuses the bridge's
+  polling shape, answers ARP per configured interface, and forwards IPv4
+  packets between directly connected subnets while updating TTL and header
+  checksum. Its syntax is `tape run router [dhcp [NIC]]... [health A.B.C.D] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]] NIC IP/PREFIX ... [default
+  NIC GATEWAY]` (legacy dotted `NIC IP NETMASK` and separate `NIC IP /PREFIX`
+  forms remain accepted); NIC numbers are one-based, `dhcp` configures NIC 1
+  (callback index zero), while `dhcp N` adds an ordered DHCP uplink. `health`
+  requires both fresh gateway ARP and ICMP echo success, fails over after
+  three missed bounded polls, and fails back on recovery. NAT and static
+  forwards are limited to the active uplink, so existing flows may break on a
+  change. Boot-time acquisition for a configured DHCP uplink is bounded but
+  non-fatal to the whole router: an uplink that gets no usable offer within
+  its own boot budget is left unconfigured and unhealthy rather than
+  aborting startup, and its `DhcpClient` keeps retrying in the background
+  (the same restart-on-`Expired`/`Failed` machinery that already drives
+  ordinary lease renewal) until it does acquire a lease, at which point the
+  ordinary failover machinery adopts it automatically. A router is only
+  refused startup for an explicit operator abort or a NIC/callback-level
+  error, never for one uplink alone failing to hear back from a DHCP
+  server -- the entire point of configuring more than one uplink is that
+  another one may still work. An explicit or active DHCP-supplied gateway handles unmatched
+  destinations. NAT is enabled by default; `no-nat` disables it for
+  deployments where upstream routing reaches the downstream subnets, while
+  `nat` explicitly enables it. When enabled, TCP/UDP traffic leaving
+  non-primary NICs through the active uplink is source-NATed through a 4 MiB
+  physical-memory-backed table and reverse-translated for replies, with a
+  32-slot fallback if allocation is unavailable, so upstream hosts do not
+  need a route back to the downstream subnet. `dhcp-server` serves every
+  configured interface
+  except DHCP uplinks using an automatically derived subnet pool with one in-memory
+  lease slot per usable address, and seven-day leases. Upstream DHCP DNS
+  values are propagated to downstream clients; a `dns SERVER [SERVER]`
+  directive overrides them. The server has no DNS implementation or
+  persistence. It also accepts `tape run router @router.cfg`: the shell reads the lowercase
+  FOSFS file and passes its contents through the existing startup-argument
+  ABI; `#` comments and newlines are accepted, with a 4096-byte fixed limit.
+  `dhcp-lease-file NAME` optionally persists bound DHCP assignments through
+  the tape filesystem callbacks; omitting it keeps the router diskless. An
+  ICMP echo request addressed directly to one of the router's own configured
+  interface addresses (as opposed to a downstream host reached *through* it)
+  gets an ordinary echo reply, including on the active uplink -- answered
+  before that interface's inbound NAT/port-forward check, which otherwise
+  treats any packet addressed to the active uplink's own address as inbound
+  NAT traffic needing a matching mapping and would silently drop an
+  unsolicited ping to it. A packet that misses the ARP cache is held (one frame, `HELD_FRAME`, built
+  with a blank destination MAC and expiring after 3 s) and sent by `process_arp`
+  when the reply arrives, instead of being dropped and left to the sender's
+  retry -- previously the first ping of every conversation was lost or a second
+  late (`make test-tape-router-arp`). The tape deliberately has no dynamic routing,
+  ICMP errors, fragmentation, or IPv6.

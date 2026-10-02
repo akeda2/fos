@@ -447,3 +447,125 @@ BIOS-read boot sector and capacity rather than guessed -- see "Closing
 the Pentium 4 gap for real" above), closing the P4 case for real; the one
 remaining named gap is `reboot soft`, which still depends on BIOS
 regardless of promotion -- see "Deliberately deferred work" below.
+
+## RTL8168/RTL8111: a seventh NIC backend (two real chips confirmed) (full detail)
+
+### RTL8168/RTL8111: a seventh NIC backend (two real chips confirmed)
+
+`kernel/src/rtl8168.rs` drives Realtek's PCIe gigabit family, claiming both
+`10ec:8168` and `10ec:8161` (Linux's `r8169` binds both to one register model).
+It uses the I/O-port BAR0, two small descriptor rings (16 receive, 4 transmit,
+2 KiB buffers), polled transmit completion and the RTL8139's reset-and-
+reprogram recovery. The only chip-specific branch is `CR` enable order, chosen
+from the `TxConfig` version bits (XID `0x4c0` and up, RTL8168G onward, enables
+the MACs *after* `TxConfig`/`RxConfig`); Linux's per-chip PHY/ERI/OCP/ASPM
+tuning is deliberately left out. `init` logs the PCI revision, the version
+bits, the MAC and the PHY status -- read them with `dmesg`.
+
+**Confirmed working on the AMD/nForce test machine**: a TP-Link TG-3468 at
+1000 Mb/s and the onboard LAN at 100 Mb/s. Verified: `term net` sessions, tapes
+loaded into each NIC (5 KB and 284 KB, the 5 KB one then run with the correct
+output), and 13.7 KB of session output per round byte-identical to the 3C905's
+over three rounds. A ring overflow while nothing polls a NIC (e.g. inside
+`tape load net`, which polls only the selected NIC) costs one recovery and no
+freeze. Test caveat: when running these checks put the `term net` session on a
+different NIC than the one under test, with `nic use N` done in an earlier
+session (see TODO.md). QEMU has no RTL8168 model, so nothing automated
+covers this driver; `nic` order is RTL8139, 3C905, e1000, e1000e, I350,
+NE2000, then RTL8168. `pci` also prints each function's revision and
+subsystem IDs now, which is how an unknown card gets identified.
+
+**Interrupt-storm guard** (`interrupts::guard_against_storm`): legacy PCI IRQs
+are level-triggered, so a device whose cause a handler cannot clear freezes the
+whole machine (no F12, no crash reboot). More than 500 dispatches of one line in
+a single timer tick masks that PIC line (`irqstat` reports it, `nic.rs` stops
+sleeping on that NIC). The RTL8168 handler also turns its own interrupts off on
+an overflow or PCI error until `recover` has reset the card. A freeze seen once
+while the machine sat in `tape load net` (which polls only the selected NIC,
+leaving the other rings undrained) motivated both.
+
+## 3C905 interrupts and receive ring (found on real hardware) (full detail)
+
+### 3C905 interrupts and receive ring (found on real hardware)
+
+Three bugs, all invisible under QEMU (it has no 3C905 model) and hidden by
+polling. (1) The init-time `SET_STATUS_ENABLE` had an empty mask and
+`enable_interrupts` only sent `SET_INTERRUPT_ENABLE`; on the 3c90x an event
+must be enabled in *both* masks to raise INT#, so the card never asserted its
+line (the PIC registers in `irqstat` and the PCI status/command bits in `pci`
+were how this was diagnosed). `INTERRUPT_MASK` is now UpComplete | HostError,
+set in both. TxComplete is deliberately excluded: it stays asserted until the
+transmit status is popped, which this driver never does. (2) With interrupts
+live, three places write the command register (foreground `receive`'s
+`UP_UNSTALL`, the handler's acknowledges, init/recovery); the card ignores a
+command written while `CmdInProgress` is set, so an overlap lost an
+`UP_UNSTALL` and stalled the upload engine. Every write now goes through
+`issue_command`, which waits for the in-progress bit first. (3) A 4-descriptor
+receive ring overflowed at a 3 ms pace because `tape load net`'s start-of-
+transfer console output (VGA + 115200-baud serial) blocks longer than 12 ms,
+losing chunks a few frames in ("Gap in tape data: expected chunk #5, got #7").
+The ring is now 16 descriptors and the progress timer restarts when a START
+is accepted. Result on the test machine: one interrupt per received frame on
+all four NICs, 284 KB tapes load at 3 ms (and 1 ms) pacing, no recoveries.
+
+Diagnostics that found these, kept because they are useful for any unknown
+card: `irqstat` prints the PIC's pending/in-service/mask registers (a
+pending-but-masked bit shows where an unhandled interrupt lands), and `pci`
+prints each function's interrupt line/pin and its command/status registers
+(status bit 3 = the function is asserting INTx right now; command bit 10 =
+interrupt disable).
+
+## Talking to a real fos machine from a sandboxed dev environment (full detail)
+
+### Talking to a real fos machine from a sandboxed dev environment
+
+`tools/send_tape.py`, `tools/term_net.py`, and `tools/send_frame.py` all
+need raw `AF_PACKET` sockets, which normally require `CAP_NET_RAW` --
+in practice, running as root. A sandboxed environment (such as this
+assistant's own bash tool) is unlikely to have interactive/passwordless
+`sudo`, and running an agent as root for an entire session is not
+something to reach for just to send one Ethernet frame. The workaround
+used throughout this project's real-hardware verification instead grants
+the capability to one dedicated binary, not system-wide:
+
+```sh
+cp "$(command -v python3)" ~/.local/bin/python3-netraw
+sudo setcap cap_net_raw+eip ~/.local/bin/python3-netraw
+```
+
+The `setcap` command itself needs a real, interactive `sudo` prompt, so a
+human has to run it (or at least approve it) once -- an agent should
+never attempt this silently on the user's behalf. After that one-time
+setup, verify it stuck with `getcap ~/.local/bin/python3-netraw`, then
+invoke any of the scripts above through that binary instead of the
+system `python3`:
+
+```sh
+~/.local/bin/python3-netraw tools/send_tape.py --iface wlp2s0 \
+    --discover-timeout 5 build/tapes/hello-rs.bin
+~/.local/bin/python3-netraw tools/term_net.py --iface wlp2s0 \
+    --mac 00:20:18:89:4a:d6 "tape status" "tape run"
+```
+
+Nothing about the copied binary's capability leaks into the ordinary
+`python3` on `PATH` or into any other process -- `cap_net_raw+eip` is
+scoped to that one file's inode, not the user, so this cannot be used to
+raw-socket from any other script or shell command without going through
+`python3-netraw` explicitly.
+
+Two things specific to this kind of environment tripped this up in
+practice, worth checking first if a raw-socket script mysteriously can't
+find the target machine:
+
+- **Interface selection.** `send_tape.py`'s `default_interface()` picks
+  the first "up" interface in alphabetical order; a sandboxed dev box can
+  easily have an unrelated VPN-style interface (alphabetically ordered
+  before the real LAN NIC) that a real fos machine is obviously never
+  reachable through. Always pass `--iface <name>` explicitly (e.g.
+  `--iface wlp2s0`) rather than relying on the default when more than one
+  interface is up.
+- **`send_tape.py`'s `--delay` default.** As covered above, real hardware
+  needs pacing between chunks (`--delay 0.003` is the current default);
+  without it, a real fos machine's polling-only RTL8139 driver can
+  silently overflow its receive ring on a large tape sent from a fast,
+  unpaced sender.

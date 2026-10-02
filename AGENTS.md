@@ -1,5 +1,12 @@
 # fos development guide
 
+> **SIZE LIMIT -- read before adding anything.** This file (`CLAUDE.md` is a
+> symlink to it) is loaded into every session, and Claude Code **refuses to
+> load it above 150,000 bytes**. Keep it under **100,000 bytes**; `make test`
+> fails above 125,000. Check with `wc -c AGENTS.md`. New material goes in
+> `docs/`, `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` or `README.md`, with at
+> most a short pointer here. See "Keeping this file itself small" below.
+
 ## Project purpose
 
 `fos` is a minimal educational operating system. The current supported path is
@@ -153,56 +160,24 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   TCP because QEMU's multicast netdev echoes a guest's own frames back to it.
   QEMU's e1000 model also blackholes receive for ~1 s after promiscuous mode is
   enabled (e1000e does not); see README.md "Test tape: `tapes/nettest/`".
-- `tapes/router/` is a fixed-buffer layer-3 tape. It reuses the bridge's
-  polling shape, answers ARP per configured interface, and forwards IPv4
-  packets between directly connected subnets while updating TTL and header
-  checksum. Its syntax is `tape run router [dhcp [NIC]]... [health A.B.C.D] [dhcp-server] [dhcp-lease-file NAME] [nat|no-nat] [forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]] NIC IP/PREFIX ... [default
-  NIC GATEWAY]` (legacy dotted `NIC IP NETMASK` and separate `NIC IP /PREFIX`
-  forms remain accepted); NIC numbers are one-based, `dhcp` configures NIC 1
-  (callback index zero), while `dhcp N` adds an ordered DHCP uplink. `health`
-  requires both fresh gateway ARP and ICMP echo success, fails over after
-  three missed bounded polls, and fails back on recovery. NAT and static
-  forwards are limited to the active uplink, so existing flows may break on a
-  change. Boot-time acquisition for a configured DHCP uplink is bounded but
-  non-fatal to the whole router: an uplink that gets no usable offer within
-  its own boot budget is left unconfigured and unhealthy rather than
-  aborting startup, and its `DhcpClient` keeps retrying in the background
-  (the same restart-on-`Expired`/`Failed` machinery that already drives
-  ordinary lease renewal) until it does acquire a lease, at which point the
-  ordinary failover machinery adopts it automatically. A router is only
-  refused startup for an explicit operator abort or a NIC/callback-level
-  error, never for one uplink alone failing to hear back from a DHCP
-  server -- the entire point of configuring more than one uplink is that
-  another one may still work. An explicit or active DHCP-supplied gateway handles unmatched
-  destinations. NAT is enabled by default; `no-nat` disables it for
-  deployments where upstream routing reaches the downstream subnets, while
-  `nat` explicitly enables it. When enabled, TCP/UDP traffic leaving
-  non-primary NICs through the active uplink is source-NATed through a 4 MiB
-  physical-memory-backed table and reverse-translated for replies, with a
-  32-slot fallback if allocation is unavailable, so upstream hosts do not
-  need a route back to the downstream subnet. `dhcp-server` serves every
-  configured interface
-  except DHCP uplinks using an automatically derived subnet pool with one in-memory
-  lease slot per usable address, and seven-day leases. Upstream DHCP DNS
-  values are propagated to downstream clients; a `dns SERVER [SERVER]`
-  directive overrides them. The server has no DNS implementation or
-  persistence. It also accepts `tape run router @router.cfg`: the shell reads the lowercase
-  FOSFS file and passes its contents through the existing startup-argument
-  ABI; `#` comments and newlines are accepted, with a 4096-byte fixed limit.
-  `dhcp-lease-file NAME` optionally persists bound DHCP assignments through
-  the tape filesystem callbacks; omitting it keeps the router diskless. An
-  ICMP echo request addressed directly to one of the router's own configured
-  interface addresses (as opposed to a downstream host reached *through* it)
-  gets an ordinary echo reply, including on the active uplink -- answered
-  before that interface's inbound NAT/port-forward check, which otherwise
-  treats any packet addressed to the active uplink's own address as inbound
-  NAT traffic needing a matching mapping and would silently drop an
-  unsolicited ping to it. A packet that misses the ARP cache is held (one frame, `HELD_FRAME`, built
-  with a blank destination MAC and expiring after 3 s) and sent by `process_arp`
-  when the reply arrives, instead of being dropped and left to the sender's
-  retry -- previously the first ping of every conversation was lost or a second
-  late (`make test-tape-router-arp`). The tape deliberately has no dynamic routing,
-  ICMP errors, fragmentation, or IPv6.
+- `tapes/router/` is a fixed-buffer layer-3 tape (no dynamic routing, ICMP
+  errors, fragmentation or IPv6). Syntax lives in README.md's "Tape
+  command-line reference"; `tape run router @router.cfg` reads a lowercase FOSFS
+  file (<= 4096 bytes, `#` comments) through the startup-argument ABI. NIC
+  numbers are one-based; `dhcp [N]` adds ordered DHCP uplinks, `health ADDR`
+  requires fresh gateway ARP *and* ICMP echo, fails over after three missed polls
+  and fails back on recovery. A DHCP uplink that gets no offer in its boot budget
+  is left unconfigured/unhealthy and keeps retrying in the background; startup is
+  only refused for an operator abort or a NIC/callback error, never for one
+  silent uplink. NAT (default on; `no-nat`/`nat`) and `forward tcp|udp` apply
+  only to the active uplink, using a 4 MiB physical-memory table (32-slot
+  fallback). `dhcp-server` serves every non-uplink interface (seven-day leases,
+  one in-memory slot per address; `dhcp-lease-file NAME` optionally persists
+  through the tape filesystem callbacks; `dns` overrides propagated DNS). A
+  forward target must be on a non-primary, non-uplink subnet. Echo requests
+  addressed to a router interface are answered before the inbound NAT check. A
+  packet that misses the ARP cache is held (`HELD_FRAME`, 3 s) and sent when the
+  reply arrives. Full detail is in NETWORKING.md ("Router tape detail").
 
 ## Low-memory map
 
@@ -282,40 +257,35 @@ one screen whenever practical.
 
 ## Keeping this file itself small: moving detail to `docs/history/`
 
-This file is loaded into every session's context, so its size has a real,
-ongoing cost distinct from any other doc in this repo -- unlike
-`README.md` or `NETWORKING.md`, which are read on demand. Treat it as a
-*current-state reference*, not a project journal: architecture facts, ABI
-contracts, command syntax, the low-memory map, and build/test commands
-belong here because a future change has to keep them accurate. A
-chronological account of how something was investigated, debugged, or
-iterated on does not need to stay accurate going forward -- it only needs
-to stay findable -- so it belongs in `docs/history/` instead.
+**Hard limit: Claude Code will not load this file above 150,000 bytes.
+Budget: stay under 100,000. `tools/check_agents_size.py` (run by `make test`)
+fails above 125,000.** This file is loaded into every session, so its size has a
+real, ongoing cost unlike `README.md` or `NETWORKING.md`, which are read on demand.
+Whoever adds text here is responsible for keeping the budget: when a change adds
+more than a few hundred bytes, trim or move something in the same change, and
+re-check `wc -c AGENTS.md`.
 
-Concretely, move a section (or trim it while adding new content) once it
-is mostly one of these: a bug postmortem ("X was found and fixed, root
-cause was Y"); a "first we tried A, then B" design-iteration narrative;
-detailed end-to-end verification/test narration beyond naming the test
-file; or a fully investigated-but-deliberately-deferred feature writeup
-whose reasoning won't change unless someone actually starts building it.
-Keep in this file: the resulting current behavior, the file/function names
-involved, and any constraint a future change must respect.
+Treat this file as a *current-state reference*, not a project journal. Keep:
+architecture facts, ABI contracts, command syntax, the low-memory map,
+constraints a future change must respect, and build/test commands. Do **not**
+add: bug postmortems ("X was found and fixed, root cause was Y"), "first we tried
+A, then B" narratives, test-run narration beyond naming the test file, or
+fully investigated-but-deferred feature writeups. Those belong in `docs/history/`,
+and per-tape or per-protocol reference belongs in `README.md` (tape table),
+`NETWORKING.md` or `AUDIO.md`.
 
-The mechanics, matching what every existing `docs/history/*.md` file
-already does (see `development-notes.md`'s own intro paragraph): pick an
-existing thematically-matching file (`development-notes.md` as the general
-catch-all; `audio-hda.md` for sound hardware; `real-hardware-notes.md` for
-physical-machine-only findings; `networking-and-discovery.md` for the
-chat/discovery/NETFS/idle-loop cluster) or start a new one if none fits,
-and append the section's *original, unedited* text at the end of it under
-a `## <original title> (full detail)` heading followed by the original
-heading(s) and body verbatim -- never paraphrase what you're moving. Leave
-a short paragraph in its place here: what the thing is, its current
-behavior/facts, and a closing "Full detail ... is in
-`docs/history/<file>.md`." sentence. `docs/history/` files are
-append-only dumping grounds, not edited for style after the fact, and are
-never loaded automatically -- link to the right one by name rather than
-assuming a reader has seen it.
+Mechanics, as every existing `docs/history/*.md` file does (see
+`development-notes.md`'s intro): pick a thematically matching file
+(`development-notes.md` as catch-all; `audio-hda.md` for sound hardware;
+`real-hardware-notes.md` for physical-machine-only findings;
+`networking-and-discovery.md` for chat/discovery/NETFS/idle-loop) or start a new
+one, append the section's *original, unedited* text at the end under a
+`## <original title> (full detail)` heading followed by the original heading(s)
+and body verbatim -- never paraphrase what you move -- and leave a short paragraph
+here: what the thing is, its current behavior, the file/function names involved,
+and a closing "Full detail ... is in `docs/history/<file>.md`." sentence.
+`docs/history/` files are append-only, never loaded automatically, and are linked
+to by name.
 
 ## Disk image and safety
 
@@ -666,761 +636,225 @@ System commands: `help`, `clear`, `vga [d|80x25|80x50|132x25]`, `about`,
 
 ### `reboot`: a soft-reboot path alongside the existing hardware reset
 
-`reset` (and `reboot hard`, its explicit alias) has always meant an
-unconditional 8042 keyboard-controller pulse reset -- a genuine hardware
-CPU reset, indistinguishable from power-cycling as far as this kernel's
-own state is concerned. `reboot`/`reboot soft` (`kernel/src/reboot.rs`,
-`shell.rs`'s `reboot_command`) instead warm-restarts the machine by
-jumping straight back into `boot/stage2.S`'s own `_start` (via a new
-`BootInfo::soft_reboot` callback pointer, `soft_reboot_entry` in
-`stage2.S`) without ever touching the CPU's hardware RESET line: BIOS
-POST is skipped entirely, but every other step of an ordinary boot still
-runs for real -- E820 memory-map collection, A20 verification,
-`select_kernel_slot`'s full A/B fallback/confirm state machine, and a
-fresh kernel load from whichever slot that state machine currently
-selects. This is why a pending KUP-installed kernel (see "KUP" below) is
-tried exactly the same way after a soft reboot as after a hardware one --
-`select_kernel_slot`'s logic has no idea, and needs no idea, which kind
-of reboot brought it here. `soft_reboot` mirrors `disk::call_trampoline`'s
-own real-mode-drop discipline (`cli`, restore the real-mode IVT and
-BIOS-conventional PIC mapping, *then* drop to real mode) for the same
-reason: stage two's own BIOS disk reads need working BIOS timer-tick
-delivery, and the currently running kernel's IDT/PIC state is otherwise
-still loaded. If a given `BootInfo` predates this callback (or the
-loader never populated it), `soft_reboot` falls back to a hardware reset
-instead of transmuting a null pointer -- the same "cleanly unavailable,
-not a fault" convention `disk.rs` already uses for a zero `bios_disk_io`
-pointer.
+`reset` (and `reboot hard`) is an unconditional 8042 pulse reset.
+`reboot`/`reboot soft` (`kernel/src/reboot.rs`, `shell.rs`'s `reboot_command`)
+instead jumps back into `boot/stage2.S`'s `_start` through the
+`BootInfo::soft_reboot` callback (`soft_reboot_entry`): BIOS POST is skipped but
+E820 collection, A20 verification, `select_kernel_slot`'s A/B state machine and
+a fresh kernel load all run, so a pending KUP kernel is tried the same way
+after either kind of reboot. `soft_reboot` follows `disk::call_trampoline`'s
+real-mode-drop discipline (`cli`, restore the real-mode IVT and BIOS PIC
+mapping, then drop) and falls back to a hardware reset when `BootInfo` has no
+callback. **`reboot-on-crash` deliberately never uses it** (`debug::handle_crash`):
+a soft reboot assumes stage two's code at `0x8000` and `BootInfo` survived,
+which a crash handler cannot assume. Two soft-reboot bugs (a stale `SLOT1_LBA`
+copy in `debug.rs`; `collect_memory_map` clearing only `%bp` of `%ebp`) are
+written up in `docs/history/development-notes.md`; both were invisible to
+hardware resets. Full detail is in `docs/history/development-notes.md`.
 
-**Deliberately not used by `reboot-on-crash`** (`debug::handle_crash`):
-that path's entire point is recovering unattended no matter how corrupted
-the running kernel's state is after a fatal exception, including the very
-low-memory stage-two code and `BootInfo` a soft reboot depends on staying
-intact. A hardware reset makes no assumptions about surviving state at
-all; a soft reboot makes several (stage two's code at `0x8000` is
-unmodified, `BootInfo` is still valid, the CPU can still safely drop to
-real mode) -- appropriate only for a deliberate, operator- or
-KUP-requested restart of an otherwise healthy kernel, never a crash
-handler's own recovery path. `reset` remains available as an explicit,
-always-usable fallback in case a soft reboot itself ever needs to be
-ruled out (e.g. it hangs, or something about the running kernel's state
-is suspect) -- exactly the situation the two debugging sessions below
-were built to rule in or out.
+### NE2000 clones, `nic sniff`, `chat`, discovery and the `tape` loader
 
-Two soft-reboot bugs were found and fixed during development, neither ever
-hit by a hardware reset (both are exactly the class of surprise a warm
-re-entry into `boot/stage2.S` predicts, since it's the first time that code
-has ever run on a CPU that wasn't freshly reset by BIOS POST): a fifth,
-previously undocumented location (`kernel/src/debug.rs`'s `SLOT1_LBA`/
-`SLOT_SECTORS` constants) had drifted out of sync with the real disk layout,
-making KUP write a freshly pushed kernel to the wrong LBA; and
-`collect_memory_map` zeroed only the low 16 bits of `%ebp` (`xorw %bp, %bp`)
-while comparing/storing the full 32-bit register, which is harmless on a
-cold BIOS boot (POST happens to leave the upper bits zero) but made a soft
-reboot's leftover register garbage abort the E820 loop immediately, reporting
-zero tracked memory and cascading into "No supported Ethernet controller
-found." Full root-cause detail, including the QEMU HMP debugging notes from
-this investigation, is in `docs/history/development-notes.md`.
+`kernel/src/ne2000.rs` (RTL8029AS, `10ec:8029`, the chip on generic "NetWare"
+PCI cards) is the only driver with no host-RAM DMA: packets live in the card's
+16 KiB, reached through remote-DMA port I/O (`REG_RSAR`/`REG_RBCR`/`REG_DATA`),
+so it never calls `pmem::allocate_contiguous`. Its receive ring is 8 pages of
+256 bytes, each entry prefixed by a 4-byte header (status, next page,
+little-endian byte count -- getting that order backwards was a silent-failure
+bug, see `docs/history/development-notes.md`).
 
-### NE2000-compatible PCI clones
+`Rtl8139::set_promiscuous` toggles `RCR.AAP` on top of `RCR_CONFIG`; `nic sniff`
+enables it, prints frames until the F12 escape and always disables it again.
+`tools/send_frame.py` (stdlib only; destination MAC from the `.gitignore`d
+`tools/mac`) sends one raw frame; keep its default ethertype equal to
+`shell.rs`'s `TEST_ETHERTYPE` (`0x88b5`).
 
-`kernel/src/ne2000.rs` is a fourth NIC backend, found by exact vendor/
-device ID (`0x10ec`/`0x8029`, the Realtek RTL8029AS) the same way every
-other backend is -- this is the chip almost every generic, unbranded PCI
-card marked only "NetWare" (no vendor name at all) actually contains, since
-NE2000 compatibility became a decades-long de facto standard for the
-cheapest possible Ethernet silicon. Unlike every other driver here, it uses
-no host-RAM DMA at all: the card has its own 16 KiB of onboard packet
-memory, addressed through a remote-DMA port-I/O interface (`REG_RSAR0/1`
-set a start address, `REG_RBCR0/1` set a byte count, then the data itself
-is streamed through one port, `REG_DATA`) rather than a descriptor ring or
-BAR-mapped buffer the driver reads/writes directly. `pmem::
-allocate_contiguous` is therefore never called by this driver, unlike
-every other one here.
+`chat` is a full-duplex loop over `CHAT_ETHERTYPE` (`0x88b6`, distinct from
+`TEST_ETHERTYPE`). Every such frame has a one-byte tag after the Ethernet
+header (`CHAT_TAG_TEXT`, `CHAT_TAG_DISCOVER_REQUEST`/`_REPLY`); text is
+trimmed of trailing zero padding, and serial input also works. `chat MAC|N`
+targets one peer. `nic discover`/`nic peers` keep a numbered table (`PEERS`,
+`MAX_PEERS` = 16, no heap): discover broadcasts a request on every NIC and
+re-sends every `DISCOVER_REBROADCAST_TICKS`; a request is answered by one
+unicast reply through the NIC it arrived on, and the requester is remembered,
+so discovery is symmetric. With no background listener a probe is only
+answered while the peer is inside `chat`, `nic discover` or the idle prompt
+(see "Hostname-based NIC discovery"). Hostnames ride after the tag byte.
 
-The receive side is organized as an 8-entry ring of 256-byte pages
-(`RX_START_PAGE`..`RX_STOP_PAGE`) inside that onboard memory, each entry
-prefixed by a 4-byte header the card itself writes: byte 0 is the receive
-status (matching `RSR`), byte 1 is the next entry's page number, and bytes
-2-3 are a little-endian byte count. Getting that byte order backwards is a
-real, silent-failure-prone bug this driver's first version hit. Full
-detail (the exact failure mode and the GDB-based diagnosis method) is in
-`docs/history/development-notes.md`.
-
-`Rtl8139::set_promiscuous` is a read-modify-write toggle of `RCR`'s `AAP`
-("accept all packets") bit, layered on top of the accept-filter bits `init`
-already sets in `RCR_CONFIG`, so it must not disturb them. `nic sniff`
-(`shell.rs`) enables it, polls `receive` in a loop printing every frame
-until `keyboard::poll_term_event()` reports the F12 escape -- the same
-mechanism and rationale `term_loop` uses -- and always disables it again on
-the way out, whether the loop ran to completion or was interrupted, so a
-later `nic send`/`nic recv` is not left seeing unrelated traffic.
-
-`tools/send_frame.py` is a standalone host-side script (not part of any
-`make` target) that sends one raw Ethernet frame from the host machine via
-an `AF_PACKET` raw socket, for testing `nic sniff` against real hardware.
-It reads the destination MAC from `tools/mac`, a small `.gitignore`d file
-(not checked in, since it names whichever physical test machine is at
-hand) rather than a required argument. Keep this script dependency-free
-(standard library only, matching the other `tools/` scripts) and keep its
-default ethertype in sync with `shell.rs`'s `TEST_ETHERTYPE` if that ever
-changes.
-
-`chat` (`shell.rs`) is built from the same two pieces `nic sniff` and
-`term` already demonstrate separately, merged into one full-duplex loop: a
-receive-and-print loop (`Rtl8139::receive` + `CHAT_ETHERTYPE` filtering, in
-`handle_incoming_chat_frame`) and a line-input-and-echo loop
-(`keyboard::poll_term_event` for local keys, `console::read_serial_byte` as
-an equally valid input source so `/quit` also works over a serial-only
-session -- unlike `term`, `chat` never repurposes the serial console, so
-there is no reason to restrict it to the keyboard). `CHAT_ETHERTYPE`
-(`0x88b6`) is deliberately distinct from `TEST_ETHERTYPE` (`0x88b5`, `nic
-send`'s), even though IEEE reserves both together for exactly this kind of
-local experiment, so a `nic sniff`/`nic recv` capture can't confuse chat
-traffic for test traffic. `chat AA:BB:CC:DD:EE:FF` (parsed by the local
-`parse_mac`, which mirrors `tools/send_frame.py`'s Python function of the
-same name) targets one peer directly instead of broadcasting; unicast
-needed no driver changes at all, since `Rtl8139::send`/`receive` already
-handle any destination address -- only the shell layer's addressing and
-inbound source-MAC filtering needed to be added.
-
-Every `CHAT_ETHERTYPE` frame carries a one-byte message tag right after the
-Ethernet header (`CHAT_TAG_TEXT`/`CHAT_TAG_DISCOVER_REQUEST`/
-`CHAT_TAG_DISCOVER_REPLY`), so the single ethertype can carry both chat
-lines and the small peer-discovery exchange below without needing a third,
-unreserved ethertype. A `CHAT_TAG_TEXT` payload is trimmed of trailing zero
-padding (the same padding `Rtl8139::send` and `tools/send_frame.py` both
-add to reach Ethernet's 60-byte minimum frame length) before being decoded
-as UTF-8.
-
-`nic discover`/`nic peers` add a small numbered peer table
-(`PEERS`/`PEER_COUNT` statics, capped at `MAX_PEERS` = 16, deliberately not
-dynamically sized since this kernel has no heap) so a peer can be named
-`chat 1` instead of a full MAC. `nic discover` broadcasts one
-`CHAT_TAG_DISCOVER_REQUEST` through every initialized NIC, re-sending it every
-`DISCOVER_REBROADCAST_TICKS` (a plain `interrupts::ticks()` comparison, not a
-timer interrupt) so a peer that only starts `chat`/`nic discover` partway
-through is still found, and busy-polls every NIC's `receive` -- printing each
-newly-seen peer as it arrives -- until `keyboard::poll_term_event()` reports
-F12, the same escape convention `nic sniff`/`term`/`chat` all use; `nic peers`
-just prints the table. A reply to an incoming probe is sent back through the
-same local NIC on which that probe arrived, so discovery works across
-different attached Ethernet segments rather than only on the primary NIC.
-Whoever receives a `CHAT_TAG_DISCOVER_REQUEST` -- whether via `nic discover`
-or a running `chat` session's own receive loop -- answers with one unicast
-`CHAT_TAG_DISCOVER_REPLY` straight back to the requester's source MAC
-(never broadcast, so replying doesn't also broadcast to every other
-listener) and remembers the requester too, making discovery symmetric
-after one round. Because this kernel has no interrupt-driven network
-service (every receive is a polled call inside a foreground loop --
-`nic_recv`, `nic sniff`, `chat`, or `nic discover` itself), a probe only
-ever gets a reply from a fos machine that happens to be inside `chat` or
-`nic discover` at that exact moment; this is a real, honestly-documented
-limit of the polling design, not a bug to eventually
-fix with a background listener.
-
-`tape` (`shell.rs`) is a "load, then run" pair: one fixed-size physical
-image buffer at `pmem::TAPE_BASE` through `pmem::TAPE_BASE + TAPE_LEN`
-(4 MiB), plus explicit metadata for the loaded length, format, entry point,
-and monotonically increasing handle. Loading a new tape overwrites that
-reserved image region; it does not allocate or free a variable-sized tape
-buffer from the general frame pool. The loader accepts validated fixed-address
-ELF32 `ET_EXEC` images and legacy raw flat images, and rejects any image that
-does not fit the reserved region.
-
-`tape load net`/`tape send` share `CHAT_ETHERTYPE` with `chat`/`nic
-discover`, adding three tags (`TAPE_TAG_START`/`TAPE_TAG_DATA`/
-`TAPE_TAG_STOP`). Unlike `CHAT_TAG_TEXT`, which gets away with trimming
-trailing zero padding because printable text never legitimately ends in
-one, a genuine binary tape's own trailing zero bytes must never be
-confused with Ethernet's 60-byte minimum-frame padding -- so `TAPE_TAG_START`
-declares the transfer's exact total length up front, and every
-`TAPE_TAG_DATA` frame's expected byte count is derived purely from its
-sequence number and that declared length, never from the received frame's
-own (possibly padded) length. A skipped or reordered sequence number aborts
-that attempt and discards the partial image immediately, since this protocol
-deliberately has no retransmission (consistent with `chat`/`nic discover`
-also being simple, best-effort, unacknowledged protocols); it does not
-retry or wait for a fresh start automatically, but `tape load net`'s own
-loop keeps listening afterward, so a resend from the sender just starts a
-fresh attempt. `tape load net` locks onto whichever sender's
-`TAPE_TAG_START` it accepts first and ignores any other sender's frames
-until that attempt finishes or aborts, the same reasoning `chat`'s unicast
-mode filters incoming text by source MAC.
-
-`tape send NAME PEER_MAC|PEER_NUMBER` reuses `chat`'s exact peer-addressing
-(`parse_mac`/`parse_number`/`peer_by_index`) so a peer found by `nic
-discover` needs no MAC typed out, and reuses `fosfs::read` (added
-alongside `tape`, mirroring `fosfs::cat` but copying bytes into a caller
-buffer instead of the console) to source its data. `tools/send_tape.py` is
-the host-side counterpart, deliberately building the identical wire frames
-by hand (rather than importing anything from the kernel side, which is not
-possible across the language/target boundary) so either end can talk to
-either implementation. Rather than requiring a `tools/mac`-style file up
-front like `tools/send_frame.py` does, it can perform its own discovery --
-broadcasting a `CHAT_TAG_DISCOVER_REQUEST` and listening briefly for
-`CHAT_TAG_DISCOVER_REPLY` frames -- since a script only used for a single,
-short transfer benefits less from a persistent MAC file than a script
-meant to be re-run against the same test machine over and over. `--mac`/
-`--mac-file` remain available to skip discovery entirely.
-
-Both senders pace their frames because `tape load net` polls a finite RTL8139
-receive ring rather than receiving through an interrupt-driven queue. The
-kernel's `tape send` waits one 100-Hz PIT tick (about 10 ms) between frames;
-`tools/send_tape.py` defaults to a 3 ms delay, which is the faster interval
-verified reliable on the documented real-hardware setup. An unpaced burst can
-overflow the receiver, causing the deliberately strict sequence check to
-report a missing or unexpected chunk rather than load corrupt data.
-
-`tape load disk NAME` reuses `fosfs::read` and now reads the complete
-multi-sector file into the tape image buffer. New Rust tape files are ELF32
-`ET_EXEC` images: the loader validates the i386 header and program-header
-table, materializes only `PT_LOAD` segments, clears BSS tails, and records the
-validated entry point. Legacy raw flat files remain accepted during migration.
-The generated image preloads every compiled tape, so a fresh boot can run them
-without a network transfer. `write NAME TEXT` remains the interactive
-printable-ASCII path; binary files are installed by the host-side image
-builder.
-
-`tape run` uses a cdecl `call` (via `core::mem::transmute`) to the validated
-ELF entry point (or the loaded buffer's address for a legacy flat file), then
-passes the append-only tape callback ABI: console output, abort/input,
-allocation, startup arguments, indexed NIC access, terminal position, and
-FOSFS file operations. This kernel's flat, unpaged memory model lets the
-tape image treat its physical address directly as a usable pointer -- the
-same convention `rtl8139.rs`'s own DMA buffers rely on. A tape that ends with
-a near `ret` returns control to the shell
-cleanly (verified end-to-end with a real one-byte `0xc3` tape sent over a
-live QEMU multicast netdev from a host-side Python script and executed);
-anything else is trusted exactly as much as any other kernel code -- a bad
-opcode is at least caught by the CPU exception handlers added earlier this
-project (see "Real hardware notes" below) rather than corrupting silently,
-but there is still no way back into a hung or corrupted kernel except a
-reset, consistent with "Current boundaries" in README.md.
-
-The reserved low-memory kernel region (`linker.ld`/`pmem::RESERVED_BELOW`/
-`tools/write_layout.py`'s `KERNEL_RESERVED_END`) has grown many times as
-successive features' own `.bss` growth left no headroom under the
-previous ceiling, most recently to the current `0x9f000` when the
-boot-time protected-mode stack pointer (`stage2.S`/`netrom.S`'s
-`protected_entry`) was relocated from a fixed `0x9f000` to `0x500000`
-(see "Low-memory map" above), reclaiming the 28 KiB gap that used to
-exist purely to leave that stack room below the EBDA. All three
-constants (`linker.ld`'s `ASSERT`, `pmem::RESERVED_BELOW`,
-`tools/write_layout.py`'s `KERNEL_RESERVED_END`) must still always match
-by hand -- see "Low-memory map" above for why. `kernel/src/debug.rs`'s
-slot-metadata constants and `tools/build_image.py`'s FOSFS partition
-start are now generated/derived from `tools/write_layout.py` rather than
-hand-copied, after two past growth steps caused real, silent drift bugs
-there (one a fully deterministic soft-reboot-after-KUP crash). Full
-detail (every growth step and both drift bugs) is in
-`docs/history/development-notes.md`.
-
-`tape_run` no longer calls a `console::resync_cursor()` after a tape
-returns -- see the "tape print callback ABI" section further below for
-why that mechanism became unnecessary once tapes stopped touching the
-CRTC directly. Full detail on the removed mechanism is in
+`tape` is "load, then run": one fixed 4 MiB buffer at `pmem::TAPE_BASE`, plus
+metadata (length, format, entry, handle); the loader accepts validated ELF32
+`ET_EXEC` images (only `PT_LOAD` segments, BSS cleared) and legacy flat images
+and rejects anything over `TAPE_LEN`. `tape load net`/`tape send` add
+`TAPE_TAG_START` (declares the exact length), `_DATA` (sequence number; its
+size comes from the sequence and declared length, never the padded frame) and
+`_STOP`. A gap aborts the attempt (no retransmission) but the loop keeps
+listening; the first accepted sender is locked in. `tape send NAME PEER`
+reuses chat's peer addressing and `fosfs::read`; `tools/send_tape.py` builds
+the same frames by hand and can discover peers itself. Senders pace frames
+(kernel: one 100 Hz tick; `send_tape.py`: 3 ms default, verified on real
+hardware) because `tape load net` polls a finite ring. `tape load disk` reads
+the whole file; the image preloads every compiled tape. `tape run` does a
+cdecl `call` to the entry with the append-only callback ABI (below); a tape
+that ends in a near `ret` returns to the shell, anything else is trusted like
+kernel code. Low-memory growth history: the reserved-region constants
+(`linker.ld` `ASSERT`, `pmem::RESERVED_BELOW`, `write_layout.py`'s
+`KERNEL_RESERVED_END`) must match by hand; slot metadata and the FOSFS
+partition start are generated from `tools/write_layout.py`. Full detail
+(including the removed `console::resync_cursor`) is in
 `docs/history/development-notes.md`.
 
 ### `dmesg`: a kernel log ring buffer
 
-`console.rs` keeps a small, always-on ring buffer (`KLOG`, currently 3072
-bytes -- see "Low-memory map" above; this kernel's `.bss` headroom below
-`0x9f000` is only a few KiB, all of which every kernel feature competes
-for) of every byte any `println!`/`print!` in this kernel has sent, tapped
-at `write_serial` -- the same single choke point `RELAY_QUEUE`/
-`PRINT_RELAY_QUEUE` already use, so no call site anywhere needs to know it
-exists. Unlike those two, which are opt-in and drop new bytes once full
-(losing a live session's most recent bytes would corrupt it), `KLOG` is
-always capturing and, once full, overwrites its own *oldest* bytes instead
--- ordinary dmesg-ring semantics, appropriate for a log read after the
-fact. `KLOG_DROPPED` counts overwritten bytes so `dmesg` (`shell.rs`) can
-report when its own history is incomplete rather than silently claiming
-completeness.
-
-`console::seed_klog_from_vga`, called once from `console::initialize`
-right after it reads back the CRTC cursor position, seeds this ring with
-whatever text is already sitting in the VGA framebuffer from row 0 through
-that cursor -- `stage1.S`/`stage2.S`'s own real-mode narration (and, under
-QEMU, even SeaBIOS's own pre-boot banner), still exactly where BIOS
-teletype output left it, since the screen is never cleared at boot (see
-"Prompt" in README.md). This is the only way `dmesg` can "replay the full
-bootup process" at all, given that code is 16-bit real mode with no notion
-of this ring buffer. Because the ring is small, ordinary shell use can
-evict this narration within a couple thousand bytes of subsequent output
--- `tools/qemu_smoke.py` runs `dmesg` immediately after boot specifically
-to catch it before that happens, and asserts stage one's own VGA-only text
-(never sent to COM1 directly, so its appearance in that serial capture at
-all proves the VGA seed, not just live COM1 mirroring) comes back out
-through it. `dmesg`'s own dump (`console::print_dmesg`) suppresses the
-ring's own capture for its duration (`KLOG_SUPPRESSED`) so replaying the
-log does not also feed the replay back into itself -- everything printed
-*before* that suppression starts, including the command's own typed-input
-echo and `dmesg`'s own status header, is fair game and legitimately
-reappears in the replayed output, which is correct: the ring is exactly
-what was written to the console, in order, nothing more, nothing less.
-
-### A permanent `pci` device-dump command
-
-`pci` (`shell.rs`) lists every discovered PCI function -- bus:device.func,
-vendor:device ID, class/subclass/prog-if, header type, and BAR0 -- using a
-new `pci::scan_devices()` that mirrors `find_serial_ports`'s own
-multi-function-aware scanning (checking `HEADER_TYPE_MULTIFUNCTION` and
-iterating functions 0..8 for a multifunction device, same as
-`find_devices` already does for NIC discovery), capped at `MAX_PCI_DEVICES`
-(64, comfortably above any real machine's populated slot count). Unlike
-`ls`/`memmap`, it is allowed to scroll past one screen, since the number of
-PCI functions on a real machine is inherently unbounded and not worth
-truncating. This exists specifically so an unknown card's exact vendor/
-device ID can be read directly from hardware -- the same information this
-project would otherwise have to guess at from a chip's silkscreen marking
-alone -- before deciding whether to add a new NIC (or other) backend for
-it; the Intel I350 discovery below is the motivating case.
-
-`kernel/src/i350.rs` is a fifth NIC backend, structurally mirroring
-`e1000.rs`'s driver shape but for Intel's I350 ("Powerville") PCIe Gigabit
-Ethernet controller family -- a genuinely different, newer chip generation
-than the `82540EM` QEMU emulates as `e1000`. `i350::CANDIDATE_DEVICE_IDS`
-now carries exactly one confirmed real device ID, `0x1521` (copper),
-read via `lspci -vv` against a physical Intel Ethernet Server Adapter
-I350-T2 -- `0x1520` (the I350 Virtual Function/SR-IOV ID) remains
-deliberately excluded, since it has a completely different, mailbox-based
-register interface with no direct PHY/link access; enabling every
-plausible I350 sibling ID at once was also rejected, since fiber/backplane
-variants skip copper-PHY autonegotiation entirely. The intended path
-broadens deliberately to sibling copper IDs only once each has actually
-been tested, never guessed from the datasheet alone; the register-level
-implementation itself remains unverified against real hardware regardless
-of the ID now being enabled -- QEMU has no I350 model at all, so, like the
-3C509 (see "Deliberately deferred work" below), every remaining bit of
-verification here is a standing, permanent real-hardware-only cost. Full
-detail (the three register-layout differences from `e1000.rs`,
-scaffolding this module's effect on the reserved low-memory region) is in
+`console.rs` keeps an always-on ring (`KLOG`, 3072 bytes -- `.bss` headroom
+below `0x9f000` is small) tapped at `write_serial`, the single choke point the
+relay queues also use. Unlike those opt-in queues it overwrites its oldest
+bytes when full and counts them in `KLOG_DROPPED`. `console::seed_klog_from_vga`
+(from `console::initialize`) seeds it from the VGA text already on screen, which
+is how `dmesg` replays the real-mode stage-one/two narration (the screen is
+never cleared at boot). `console::print_dmesg` suppresses capture
+(`KLOG_SUPPRESSED`) while dumping. `tools/qemu_smoke.py` runs `dmesg` right
+after boot, before ordinary output evicts that narration. Full detail is in
 `docs/history/development-notes.md`.
 
-### e1000e: a sixth NIC backend, for Intel's 82574L/82579/I219 family
+### `pci` and the I350 backend
 
-`kernel/src/e1000e.rs` targets Intel's "e1000e" family -- motivated by a
-real, physically owned ITX motherboard whose onboard NIC is an 82579V,
-confirmed via `lspci -vv` (device ID `0x1503`). Unlike the still-fully-
-real-hardware-only I350/3C509 drivers, this one also matches QEMU's own
-`-device e1000e` model (82574L, `0x10d3`), so it gets real `make test`-
-style QEMU coverage -- the same "one confirmed real device, one QEMU
-model" pairing `ac97.rs` uses, not a speculative broadening across the
-wider e1000e device-ID family. `0x1502` (82579LM) remains deliberately
-excluded until confirmed against a physical board carrying it. `0x15b7`
-(I219-LM, generation/v1, "Sunrise Point" PCH-integrated) was added as a
-third candidate ID once identified as a second physical machine's onboard
-NIC; it shares 82579's `ich8lan.c` code path and register layout in
-Linux's own driver, but -- unlike 82579V above -- has not yet actually
-been booted against this driver, and QEMU has no I219 model to exercise
-it either, so it carries the same standing real-hardware-only
-verification cost as I350/3C509 despite being enabled by default. See
-`kernel/src/e1000e.rs`'s own module doc comment for the PCH-generation-
-specific workarounds (K1/ULP, NVM-vs-flash arbitration) Linux's driver
-has for I219 that this one does not, in case that ID needs its own fix
-once tried on real hardware.
+`pci` lists every function (bus:dev.func, IDs, class, header type, BAR0,
+revision, subsystem, interrupt line/pin, command/status, `msi=`) via
+`pci::scan_devices()` (multifunction-aware, `MAX_PCI_DEVICES` = 64) and may
+scroll. It exists to read an unknown card's exact IDs before writing a driver.
+`kernel/src/i350.rs` mirrors `e1000.rs` for Intel's I350 (PCIe, moved and
+multi-queue register map). `i350::CANDIDATE_DEVICE_IDS` holds only `0x1521`
+(copper, confirmed with `lspci -vv` on an I350-T2); the SR-IOV VF `0x1520` is
+excluded on purpose (mailbox interface, no PHY access) and sibling IDs are added
+only after each is tested on hardware. QEMU has no I350 model, so verification
+is real-hardware only. Full detail is in `docs/history/development-notes.md`.
 
-82579/I219 (client, ICH/PCH-integrated) and 82574 (PCIe add-in-card-style)
-are handled by genuinely different code paths in Linux's own `e1000e`
-driver, not just three device IDs on two chips -- but all three keep the
-classic single-queue legacy descriptor/ring register layout unchanged
-from `e1000.rs`'s 82540EM offsets, unlike I350's moved-and-multi-queued
-register map, so this module's shape mirrors `e1000.rs` closely rather
-than needing `i350.rs`'s more extensive rework.
+### e1000e: a sixth NIC backend (82574L/82579/I219)
 
-All three device IDs use the identical `EXTCNF_CTRL.MDIO_SW_OWNERSHIP`
-firmware/PHY semaphore, taken unconditionally around reset for every
-matched device ID.
-
-**Confirmed working end to end on the real 82579V ITX board this driver
-targets** (clean boot through reset, discovered as "Intel e1000e",
-passing real bidirectional traffic over `term_net`) and under QEMU
-(single-guest and a two-guest bidirectional fixture). Getting there
-required finding and fixing two real reset-sequencing bugs, both
-instances of one rule from Linux's own `e1000_reset_hw_ich8lan` source:
-any register access, even a read, immediately after issuing `CTRL.RST`
-can hang e1000e-family silicon outright -- a hazard older 82540EM/I350
-silicon doesn't have and that QEMU never reproduces. Full detail (both
-bugs, the breadcrumb-diagnostic technique that found the second one, and
-the `disable_pcie_master`/`force_power_state_d0` additions) is in
-`docs/history/development-notes.md`.
-
-Still deliberately out of scope, consistent with every other NIC backend:
-MSI (82579 supports it, but this driver only ever uses the legacy PCI IRQ
-path), the "driver loaded" `CTRL_EXT` handshake with the Management
-Engine, K1/EEE/ULP link-power workarounds, and any flash/NVM write access
-(the MAC address is only ever read from `RAL0`/`RAH0`, already loaded by
-hardware from NVM once `EECD.AUTO_RD` is set).
-
-Backend order in `nic::initialize()` is now RTL8139, 3C905, e1000,
-e1000e, I350, then NE2000-compatible.
+`kernel/src/e1000e.rs` keeps `e1000.rs`'s legacy single-queue descriptor layout.
+Candidate IDs: `0x1503` (82579V, a real ITX board), `0x10d3` (82574L, QEMU's
+`-device e1000e`, so it has `make test` coverage) and `0x15b7` (I219-LM, enabled
+but never booted: real-hardware-only, and Linux's K1/ULP and NVM-arbitration
+workarounds for it are not implemented). `0x1502` stays excluded until
+confirmed. All IDs take `EXTCNF_CTRL.MDIO_SW_OWNERSHIP` around reset.
+Confirmed on the real 82579V and under QEMU. Rule learned from Linux's
+`e1000_reset_hw_ich8lan`: after `CTRL.RST`, **any register access, even a read,
+can hang e1000e silicon** (QEMU never shows it); see `disable_pcie_master` and
+`force_power_state_d0`. Out of scope: the Management Engine handshake, K1/EEE/ULP
+and flash writes (the MAC is read from `RAL0`/`RAH0`). Backend order in
+`nic::initialize()`: RTL8139, 3C905, e1000, e1000e, I350, NE2000, RTL8168.
+Full detail is in `docs/history/development-notes.md`.
 
 ### RTL8168/RTL8111: a seventh NIC backend (two real chips confirmed)
 
-`kernel/src/rtl8168.rs` drives Realtek's PCIe gigabit family, claiming both
-`10ec:8168` and `10ec:8161` (Linux's `r8169` binds both to one register model).
-It uses the I/O-port BAR0, two small descriptor rings (16 receive, 4 transmit,
-2 KiB buffers), polled transmit completion and the RTL8139's reset-and-
-reprogram recovery. The only chip-specific branch is `CR` enable order, chosen
-from the `TxConfig` version bits (XID `0x4c0` and up, RTL8168G onward, enables
-the MACs *after* `TxConfig`/`RxConfig`); Linux's per-chip PHY/ERI/OCP/ASPM
-tuning is deliberately left out. `init` logs the PCI revision, the version
-bits, the MAC and the PHY status -- read them with `dmesg`.
-
-**Confirmed working on the AMD/nForce test machine**: a TP-Link TG-3468 at
-1000 Mb/s and the onboard LAN at 100 Mb/s. Verified: `term net` sessions, tapes
-loaded into each NIC (5 KB and 284 KB, the 5 KB one then run with the correct
-output), and 13.7 KB of session output per round byte-identical to the 3C905's
-over three rounds. A ring overflow while nothing polls a NIC (e.g. inside
-`tape load net`, which polls only the selected NIC) costs one recovery and no
-freeze. Test caveat: when running these checks put the `term net` session on a
-different NIC than the one under test, with `nic use N` done in an earlier
-session (see TODO.md). QEMU has no RTL8168 model, so nothing automated
-covers this driver; `nic` order is RTL8139, 3C905, e1000, e1000e, I350,
-NE2000, then RTL8168. `pci` also prints each function's revision and
-subsystem IDs now, which is how an unknown card gets identified.
+`kernel/src/rtl8168.rs` claims `10ec:8168` and `10ec:8161`, uses the I/O-port
+BAR0, a 64-descriptor receive ring and 32 transmit descriptors (2 KiB buffers),
+asynchronous transmit and the RTL8139-style reset-and-reprogram recovery. The only
+chip-specific branch is `CR` enable order from the `TxConfig` version bits (XID
+`0x4c0`+ enables the MACs after `TxConfig`/`RxConfig`); Linux's PHY/ERI/OCP/ASPM
+tuning is left out. `init` logs revision, version bits, MAC and PHY status (see
+`dmesg`). Confirmed on the AMD/nForce machine (TP-Link TG-3468 at 1000 Mb/s,
+onboard LAN at 100 Mb/s): `term net`, 5 KB and 284 KB tape loads. QEMU has no
+RTL8168, so nothing automated covers it. Test caveat: keep the `term net`
+session on a different NIC than the one under test. 
 
 **Interrupt-storm guard** (`interrupts::guard_against_storm`): legacy PCI IRQs
-are level-triggered, so a device whose cause a handler cannot clear freezes the
-whole machine (no F12, no crash reboot). More than 500 dispatches of one line in
-a single timer tick masks that PIC line (`irqstat` reports it, `nic.rs` stops
-sleeping on that NIC). The RTL8168 handler also turns its own interrupts off on
-an overflow or PCI error until `recover` has reset the card. A freeze seen once
-while the machine sat in `tape load net` (which polls only the selected NIC,
-leaving the other rings undrained) motivated both.
+are level-triggered, so a cause a handler cannot clear freezes the machine. More
+than 500 dispatches of one line in one tick masks that PIC line (`irqstat`
+reports it). The RTL8168 handler also disables its own interrupts on an overflow
+or PCI error until `recover` has reset the card. Full detail is in
+`docs/history/real-hardware-notes.md`.
 
-### 3C905 interrupts and receive ring (found on real hardware)
+### 3C905 interrupts and receive ring
 
-Three bugs, all invisible under QEMU (it has no 3C905 model) and hidden by
-polling. (1) The init-time `SET_STATUS_ENABLE` had an empty mask and
-`enable_interrupts` only sent `SET_INTERRUPT_ENABLE`; on the 3c90x an event
-must be enabled in *both* masks to raise INT#, so the card never asserted its
-line (the PIC registers in `irqstat` and the PCI status/command bits in `pci`
-were how this was diagnosed). `INTERRUPT_MASK` is now UpComplete | HostError,
-set in both. TxComplete is deliberately excluded: it stays asserted until the
-transmit status is popped, which this driver never does. (2) With interrupts
-live, three places write the command register (foreground `receive`'s
-`UP_UNSTALL`, the handler's acknowledges, init/recovery); the card ignores a
-command written while `CmdInProgress` is set, so an overlap lost an
-`UP_UNSTALL` and stalled the upload engine. Every write now goes through
-`issue_command`, which waits for the in-progress bit first. (3) A 4-descriptor
-receive ring overflowed at a 3 ms pace because `tape load net`'s start-of-
-transfer console output (VGA + 115200-baud serial) blocks longer than 12 ms,
-losing chunks a few frames in ("Gap in tape data: expected chunk #5, got #7").
-The ring is now 16 descriptors and the progress timer restarts when a START
-is accepted. Result on the test machine: one interrupt per received frame on
-all four NICs, 284 KB tapes load at 3 ms (and 1 ms) pacing, no recoveries.
+Found on real hardware (QEMU has no 3C905). On the 3c90x an event must be enabled
+in **both** `SET_STATUS_ENABLE` and `SET_INTERRUPT_ENABLE` to raise INT#;
+`INTERRUPT_MASK` is UpComplete | HostError (TxComplete excluded: it stays asserted
+until the Tx status is popped, which the driver never does). Every command-register
+write goes through `issue_command`, which waits out `CmdInProgress`, because three
+places write it and the card ignores a command sent while busy. The receive ring is
+64 descriptors; a small ring overflowed during `tape load net`'s slow console
+output. Diagnostics: `irqstat` (PIC pending/in-service/mask) and `pci` (INTx status
+bit 3, command bit 10). Full detail is in `docs/history/real-hardware-notes.md`.
 
-Diagnostics that found these, kept because they are useful for any unknown
-card: `irqstat` prints the PIC's pending/in-service/mask registers (a
-pending-but-masked bit shows where an unhandled interrupt lands), and `pci`
-prints each function's interrupt line/pin and its command/status registers
-(status bit 3 = the function is asserting INTx right now; command bit 10 =
-interrupt disable).
+### UHCI: a USB host controller driver, USB Audio and USB Mass Storage
 
-### UHCI: a USB host controller driver, and isochronous USB Audio playback
+`kernel/src/uhci.rs` is a minimal UHCI (USB 1.1, I/O-port) driver found by class
+walk (0x0C/0x03/0x00), up to `uhci::MAX_INSTANCES` (4). `reset_and_start` builds
+a page-sized frame list pointing at one control QH plus a pool of
+`TD_POOL_CAPACITY` (34) TDs; there is no IRQ (no MSI on UHCI), everything is
+foreground-polled, `control_transfer` has a 500 ms deadline. `usb` lists
+controllers/ports and fully re-enumerates every time. Device addresses come from
+`uhci::allocate_device_address`.
 
-`kernel/src/uhci.rs` is a minimal UHCI (USB 1.1, I/O-port-based) host
-controller driver, discovered via `pci::find_uhci_controllers`'s class-code
-walk (class 0x0C/subclass 0x03/prog-if 0x00), supporting up to
-`uhci::MAX_INSTANCES` (4) controllers. Bring-up (`Uhci::reset_and_start`)
-builds a page-sized Frame List pointing at one fixed control Queue Head
-plus a pool of up to `TD_POOL_CAPACITY` (34) Transfer Descriptors; there is
-no IRQ handler (UHCI has no MSI capability, and enumeration's control
-transfers have no real-time deadline), so everything is foreground-polled.
-`Uhci::control_transfer` builds a SETUP+DATA+STATUS TD chain and polls each
-TD's status with a 500 ms deadline. The `usb` shell command lists every
-discovered controller/port and drives full standard enumeration (device +
-configuration descriptor dump) on demand, always resetting and
-re-enumerating from scratch rather than caching a previous result.
+- **Isochronous playback** (`usb play [diskN] NAME`): `IsocOutStream` keeps
+  `ISOC_TD_COUNT` (250, ~250 ms) frame-list entries primed ahead of `USBFRNUM`
+  and counts failed packets in `error_count`. Minimal UAC 1.0 parsing
+  (`find_uac_device`) needs PCM/16-bit, a fixed per-frame packet size and
+  Synchronous/Adaptive sync. `uhci::UsbAudioDevice` is the third `Audio` variant
+  (`Audio::Uhci`), serviced from `poll_background_work` via
+  `uhci::service_active_audio` (no isochronous IRQ, so a loop must keep priming
+  it). Sources: a fixed buffer or a `PcmRing`.
+- **Capture** (`usb capture`, real-hardware-only; QEMU's `usb-audio` cannot
+  capture): `IsocInStream` has its own TD pool; `Audio::capture_format()` and the
+  `audio_capture_*` tape callbacks expose a capture format that may differ from
+  playback (the TerraTec Aureon Dual is stereo out, mono in).
+- **Mass Storage (Bulk-Only)**: `Uhci::bulk_transfer` (caller-owned DATA0/1
+  toggle, split into `TD_POOL_CAPACITY` passes) under `kernel/src/usb_storage.rs`
+  (CBW/CSW plus a SCSI subset: `inquiry`, `wait_until_ready`, `request_sense`,
+  `read_capacity_10`, `read_10`, `write_10`; 512-byte blocks only; any transport
+  error runs BOT reset-recovery). Real hardware needs a settle delay between bulk
+  stages and before reusing TD memory after a timeout (`wait_ticks`). `usb storage`
+  stays read-only. A device is identified by controller + port
+  (`MscDevice::same_physical_device`): rediscovery resets the port and readdresses
+  it, so `disk::refresh_known_usb_device` replaces the existing disk's handle
+  instead of attaching a duplicate (`UsbAttachError::AlreadyAttached`).
+- **`diskN` integration**: `SecondaryBackend::{Bios(u8), Usb(MscDevice)}`.
+  `usb storage attach` (never automatic: `uhci::initialize_all()` resets every
+  controller and breaks BIOS USB-legacy `INT13h` for any disk still served that
+  way) adds the next `diskN`. `usb storage promote` switches `Device::Boot` to the
+  native driver after cross-validating the device against `disk1`'s BIOS-read MBR
+  and a capacity floor (`BootPromoteError::NotSameDisk` otherwise). `usb native`
+  (`disk::promote_all_and_attach`) does that for every BIOS-backed disk, then
+  attaches unmatched devices fresh. On real hardware, repeating USB discovery in
+  one boot can degrade BIOS legacy mapping for any BIOS-USB disk: reset before
+  each fresh attempt when more than one is at stake. `reboot soft` stays a gap
+  even when promoted (stage two needs BIOS to reload the kernel).
 
-**Isochronous playback (`usb play [diskN] NAME`)**: `IsocOutStream` keeps a
-rolling window of `ISOC_TD_COUNT` (250, i.e. ~250 ms of look-ahead --
-enough margin against real host-scheduling jitter when serviced from
-`poll_background_work` rather than a tight dedicated loop) Frame List
-entries primed ahead of hardware's own `USBFRNUM` position, and tracks
-`error_count` for any packet whose TD shows an error bit on reuse. Minimal
-USB Audio Class 1.0 descriptor parsing (`find_uac_playback_endpoint`/
-`find_uac_device`) requires PCM/16-bit, a fixed per-frame packet size
-(`(rate/1000) * channels * bytes_per_sample`, computed as a nominal value
-even when the endpoint's own `wMaxPacketSize` is larger under Adaptive
-sync), and Synchronous/Adaptive (not Asynchronous) sync. Confirmed working
-end to end against a real, physically attached class-compliant USB Audio
-device (a TerraTec Aureon Dual USB, `0ccd:0077`, via QEMU `usb-host`
-passthrough), not just QEMU's synthetic `usb-audio` device.
-
-**`audio.rs` integration**: `uhci::UsbAudioDevice` is a third `Audio`
-variant (`Audio::Uhci`), discovered once at `audio::initialize()` time
-alongside ES1370/HDA and kept serviced by `poll_background_work`'s
-`uhci::service_active_audio` call -- there is no isochronous IRQ path, so a
-foreground loop must keep priming it or it starves. `IsocOutStream` can
-source from either a fixed buffer (`usb play`) or a `PcmRing` (network-fed
-playback, mirroring `Es1370::fill_period`).
-
-**Isochronous capture (`usb capture [diskN] NAME`)** is real-hardware-only
--- QEMU's synthetic `usb-audio` device has no capture support at all.
-`find_uac_device` discovers both playback and capture endpoints from one
-single port-reset/enumeration pass (a device's two directions can have
-different formats -- the real TerraTec card is stereo playback/mono
-capture), and `IsocInStream` uses its own dedicated capture TD pool
-(separate from playback's, since both directions can run concurrently
-once `audio.rs` keeps a playback stream continuously running).
-`Audio::capture_format()` lets a tape read the capture format
-independently of the playback format; the tape ABI's
-`audio_capture_sample_rate`/`audio_capture_channels_and_bits` (and
-`_at`-suffixed) callbacks expose it. Confirmed on the real TerraTec card
-with both directions running simultaneously.
-
-**USB Mass Storage (Bulk-Only Transport)**: `Uhci::bulk_transfer` is a
-data-stage-only transfer primitive (a caller-owned DATA0/DATA1 toggle;
-internally split into successive bounded `TD_POOL_CAPACITY`-sized passes
-for a transfer larger than one TD chain can hold) underlying
-`kernel/src/usb_storage.rs`, which implements BOT's CBW/CSW framing and a
-SCSI CDB subset (`MscDevice::inquiry`/`wait_until_ready`/`request_sense`/
-`read_capacity_10`/`read_10`/`write_10`, thin wrappers around
-`MscDevice::command`) against a device whose native block size is exactly
-512 bytes. Any transport error drives BOT's own reset-recovery procedure
-(`bulk_only_mass_storage_reset` + `clear_endpoint_halt`). Real UHCI
-hardware needs a settle delay between bulk-transfer stages, and another
-before reusing TD-pool memory after a timeout (`wait_ticks`, in both
-`bulk_transfer` and `control_transfer`) -- found and fixed against real
-hardware, not QEMU. The standalone `usb storage` command stays read-only
-by design (discovers the first device, prints `INQUIRY`/`READ CAPACITY`,
-hex-dumps sector 0); `write_10` is exercised only through the `disk.rs`
-integration below.
-
-`disk::SecondaryDisk` gained a `backend` field
-(`SecondaryBackend::Bios(u8)`/`SecondaryBackend::Usb(MscDevice)`, the
-latter carrying its own device handle directly so more than one secondary
-disk can be natively USB-backed at once -- see `usb native` below), so a
-USB Mass Storage device becomes an ordinary `diskN` with no other
-`disk.rs`/`shell.rs` changes needed. `usb storage attach` (never automatic --
-discovering a device means calling `uhci::initialize_all()`, which resets
-every UHCI controller and is confirmed to break that same device's own
-pre-existing BIOS-backed `diskN` access via legacy USB support, not only a
-USB-booted `disk1`) registers the discovered device as the next `diskN`.
-`usb storage promote` goes further and switches `disk::Device::Boot`
-itself over to the native driver, cross-validating the discovered USB
-device against `disk1`'s own BIOS-read MBR bytes plus a capacity floor
-(not an exact match -- a real Pentium 4's legacy-USB BIOS reports a wrong,
-image-baked capacity for its own boot stick) before switching, and
-refusing (`BootPromoteError::NotSameDisk`) otherwise; `bootinfo` reports
-whether `disk1` is currently promoted. Confirmed end to end on the real
-Pentium 4 machine this whole driver was built for: `usb storage promote`
-correctly identified its genuine USB boot stick and `ls`/`cat`/`write`/`rm`
-kept working through the native driver afterward. `reboot soft` remains a
-deliberately unaddressed gap even once promoted, since stage two always
-depends on BIOS to reload the kernel from scratch.
-
-`usb native` (`disk::promote_all_and_attach`) generalizes `usb storage
-promote` from "always exactly `disk1`" to every disk a boot can match:
-`usb storage promote`/`usb storage attach` only ever protected the boot
-disk or attached one brand-new device, but any *secondary* disk that also
-happens to be BIOS-USB-legacy-backed (a real, non-hypothetical case --
-`attach_usb_disk`'s own doc comment already records finding exactly this
-under QEMU, before `usb native` existed to fix it) carried the identical
-risk with no promote path of its own. `usb native` reads every
-not-yet-USB-backed disk's own BIOS baseline (`disk1` plus every secondary
-`SecondaryBackend::Bios` disk) before touching UHCI at all, discovers
-every attached USB Mass Storage device in one `usb_storage::open_all`
-pass (each given its own address via a new shared `uhci::
-allocate_device_address` allocator -- also adopted by `uhci::
-find_uac_device`'s USB Audio discovery, so a simultaneous Mass Storage +
-Audio device no longer collide on a single hardcoded address), and
-cross-validates each baseline against an unused discovered candidate with
-the exact same content/capacity-floor rule `usb storage promote` already
-used, trying every remaining candidate rather than giving up after one
-(`disk.rs`'s `try_promote_with_candidate` puts a rejected candidate
-through `MscDevice::recover`'s BOT reset-recovery first, so its toggle
-state stays valid for a retry against a different disk). Any discovered
-device matching no existing disk is attached fresh as a new secondary
-disk, same as `usb storage attach`, so one command now covers both jobs
-for every disk that needs it.
-
-Confirmed on real hardware with two genuinely simultaneous USB Mass
-Storage sticks (not just two QEMU `usb-storage` devices): a fresh boot's
-first `usb native` call promotes every matching disk correctly, but
-running `usb`/`usb native`/`usb storage attach`/`usb storage promote`
-more than once in the *same* boot can degrade BIOS's own USB Legacy
-Support mapping for **any** BIOS-USB-legacy secondary disk, not only the
-boot disk as previously documented -- a later call in that boot can then
-fail to cross-validate a still-genuine secondary disk against its own
-device and instead attach it fresh as an apparently new, unrelated disk.
-Reset the machine before each fresh USB-discovery attempt when more than
-one BIOS-USB-legacy disk is at stake, rather than iterating these
-commands live against an already-touched boot. Full detail (including an
-unrelated, intermittent, never-root-caused `SET_ADDRESS` enumeration
-timeout hit during the same session) is in
-`docs/history/development-notes.md`.
-
-Verified end to end by `tapes/test_uhci_e2e.py`, `test_uhci_play_e2e.py`,
+Tests: `tapes/test_uhci_e2e.py`, `test_uhci_play_e2e.py`,
 `test_uhci_audio_facade_e2e.py`, `test_usb_storage_e2e.py`,
-`test_usb_storage_disk_e2e.py`, and `test_usb_boot_promote_e2e.py` (the
-first function boots `build/fos.img` from a QEMU `usb-storage` device to
-reproduce the real Pentium 4 scenario end to end; a second function,
-`test_promotes_multiple_disks`, extends this with a *second* attached
-`usb-storage` device that becomes an ordinary BIOS `disk2`, and confirms
-`usb native` promotes both disks in one pass). Full detail (every
-bug found along the way -- UHCI's port-enable/`PORTSC`-write-back
-requirements, the isochronous TD endpoint-field and missing-error-checking
-bugs, a real device's `bMaxPacketSize0`=8 off-by-one, the bulk-transfer
-settle-time and TD-pool-size bugs -- and the exact verification narration
-for each increment) is in `docs/history/development-notes.md`.
+`test_usb_storage_disk_e2e.py`, `test_usb_boot_promote_e2e.py`. Confirmed on a real
+TerraTec Aureon Dual (playback, capture, duplex) and on the Pentium 4 USB-boot
+machine. Full detail (every bug found, with verification narration) is in
+`docs/history/development-notes.md`.
 
 ### Tape print callback ABI
 
-The hand-rolled VGA/CRTC/COM1 output described above worked, but it had a
-deeper cost than just being a source of subtle bugs: it wrote to
-hardware directly, entirely bypassing `console::write_serial` -- the one
-function `term_net`'s relay queue (`console::enable_relay`/`relay_push`)
-taps into -- so a tape's own printed output could never reach a remote
-`term net` client, only whatever wrapper messages `shell.rs` itself
-printed around it (see "Remote terminal (`term net`)" below for the
-`term_net`/tape interaction in general). Duplicating scroll and cursor
-logic in assembly was also just inherently more bug-prone than reusing
-the kernel's own, already-correct implementation, as the two bugs above
-demonstrate.
-
-The fix: `tape_run`'s entry type changed from a zero-argument
-`extern "C" fn()` to `extern "C" fn(putc: extern "C" fn(u32))` (still
-cdecl), and it now calls `entry(console::print_byte)` instead of
-`entry()`. `console::print_byte` is a new, narrow `extern "C" fn(u32)`
-wrapper around the existing `console::write_bytes(&[byte as u8])` -- the
-same single function every other command's `println!` ultimately goes
-through, so it already correctly handles VGA placement, scrolling, the
-hardware cursor, the COM1 mirror, and relaying to `term_net` if active,
-all in one place. The argument is widened from `u8` to `u32` specifically
-so the calling convention at the assembly call site is unambiguous (a
-full zero-extended 32-bit stack slot), rather than depending on how a
-particular Rust/LLVM version happens to pass a sub-word argument under
-cdecl.
-
-`tapes/primes.S` was rewritten around this: its `_start` prologue
-now captures the callback pointer from `4(%esp)` (the tape's one cdecl
-argument) into a `putc_fn` data slot (replacing the old `cursor_pos`
-slot) right after computing its own PIC base, `print_char` now just
-zero-extends its byte into `%eax`, pushes it, and `call`s through
-`putc_fn`, and the old hand-rolled `print_char_newline`/
-`print_char_scroll`/`print_char_move_cursor`/`serial_putc` routines (and
-the `VGA_*`/`CRTC_*`/`COM1_*` constants they used) are gone entirely --
-none of it is needed anymore. `print_decimal`'s earlier `%ebx`-vs-`%edi`
-fix (described above) remains necessary and correct under this design
-too: `%ebx` is still this file's PIC load-base register, needed by every
-`print_char` call to locate `putc_fn` itself (`(putc_fn - get_base)(%ebx)`),
-so `print_decimal` still must not repurpose it as a digit counter.
-
-Because `console::print_byte` is a plain Rust `extern "C" fn`, the tape
-no longer needs to save/restore any of `%ebx`/`%esi`/`%edi`/`%ebp` around
-the *callback* call specifically (Rust-generated code preserves its own
-callee-saved registers automatically); it still saves/restores them
-around its own body as a whole, since `tape_run` itself still calls the
-tape's `_start` as a plain cdecl function.
-
-This also made `tape_run`'s `console::resync_cursor()` call unnecessary:
-a tape that only ever prints through the callback never touches the CRTC
-directly, so the kernel's own cached `ROW`/`COLUMN` state is never stale
-to begin with. That function and its call site were removed rather than
-kept as dead weight -- nothing currently needs a "the tape misbehaved and
-touched hardware anyway" recovery path, and one can be re-added if a
-future tape ever needs it.
-
-`tools/test_term_net_tape_e2e.py` (see "Remote terminal (`term net`)"
-below) was updated to assert the opposite of what it asserted before this
-change: the primes tape's own `78498`/`999983` digits now DO appear in
-the burst of `TERM_TAG_DATA` frames relayed to a remote `term net` client
-after `tape run` returns, proving the callback actually reaches the relay
-queue end-to-end over the network, not just in the local VGA/serial view.
+`tape_run` calls the entry as cdecl `extern "C" fn(putc: extern "C" fn(u32))`,
+passing `console::print_byte`, a thin wrapper over `console::write_bytes` -- the
+one path that handles VGA placement, scrolling, the cursor, the COM1 mirror and
+the `term net`/printer relay queues. Tapes therefore never touch the CRTC, the
+kernel's cached `ROW`/`COLUMN` is never stale, and `tape_run` needs no
+`resync_cursor`. The argument is `u32` so the stack slot is unambiguous.
+`tapes/primes.S` captures the callback from `4(%esp)`; `%ebx` stays its PIC base
+register, so `print_decimal` must not reuse it. `tools/test_term_net_tape_e2e.py`
+asserts the primes digits reach a remote `term net` client. Full detail is in
+`docs/history/development-notes.md`.
 
 ### Tapes: fixed load address, and writing one in Rust
 
-Before this, `allocate_tape_buffer` (`kernel/src/shell.rs`) called
-`pmem::allocate_contiguous`, the same general-purpose frame allocator
-everything else uses -- so a tape's load address varied depending on
-whatever contiguous run of free frames happened to be available that run.
-That's exactly why `tapes/primes.S` had to be genuinely
-position-independent: its `_start` prologue captures its own runtime base
-with the classic `call get_base` / `pop %ebx` idiom, and every label is
-addressed as an offset from that base, because the assembler/linker have
-no way to know the load address ahead of time. That PIC requirement is
-easy enough to hand-write in assembly, but neither Rust nor C has an easy
-no-dynamic-linker PIC story on a freestanding `i686` target -- their
-usual position-independent code relies on a dynamic linker computing
-relocations at load time, which this kernel doesn't have and has no
-reason to grow just for tapes.
-
-The fix follows the exact same convention the kernel itself already
-uses for its own load address: `kernel/src/pmem.rs` now reserves a fixed
-physical region, `TAPE_BASE` (`0x100000`) through `TAPE_BASE + TAPE_LEN`
-(4 MiB, comfortably above `primes.bin`'s ~1 MiB with headroom for future
-tapes), carved out of the general frame pool once at boot via a new
-`reserve_range` helper -- `mark_region_free`'s exact opposite, unmarking
-those frames as free (and out of the tracked total) the same way frames
-below `RESERVED_BELOW` never entered the pool to begin with. Because
-this happens before `shell::run` (and therefore any command) can
-allocate anything, `allocate`/`allocate_contiguous`/`palloc` can never
-hand a tape's own memory to something else, and a tape never needs to
-compete with other allocations for it.
-
-With the address now always the same, `allocate_tape_buffer` shrank to a
-bounds check (`length <= pmem::TAPE_LEN`) returning `pmem::TAPE_BASE`
-unconditionally -- no more per-load frame accounting, and no more
-`free_tape_frames`/`pmem::free` calls scattered through `tape_load_disk`/
-`tape_load_net`'s abort paths, since there are no longer any dynamically
-held frames to release: loading a new tape simply overwrites the same
-fixed region in place. `tape_take` (which existed solely to clear `TAPE`
-before freeing the old frames) became dead code and was removed along
-with it.
-
-This also means `tapes/primes.S` no longer *needs* to be
-position-independent -- but it still works unchanged (a fixed address is
-still a valid address for PIC code, it's just no longer required), so it
-was left as-is, as the assembly reference example.
-
-`tapes/hello-rs/` is the new Rust reference example, proving the
-concept: a small `no_std`/`no_main` binary crate that reuses the kernel's
-own custom target spec (`targets/i686-fos.json`) and `-Z build-std`
-invocation verbatim (see its `.cargo/config.toml`), but with its own
-`linker.ld` fixing the load address at `0x100000` (`pmem::TAPE_BASE`)
-instead of the kernel's own `0x10000`. Two things make this simpler than
-the kernel's own boot path:
-
-- `tape_run` calls a tape with an ordinary cdecl `call` (the CPU is
-  already fully set up -- protected mode, a working stack), unlike
-  `boot/stage2.S`'s raw `jmp` into the kernel, which hands off the
-  `BootInfo` address in a register rather than on the stack. So a tape
-  written in Rust needs no register-to-stack bridging assembly like
-  `kernel/src/entry.S` provides for `kmain` -- an ordinary
-  `extern "C" fn(putc: extern "C" fn(u32))` already matches `tape_run`'s
-  call site exactly.
-- `tapes/hello-rs/src/entry.S` is consequently tiny: it exists
-  solely to zero `.bss` before tail-`jmp`-ing into the real Rust entry
-  point, `tape_main`, so `tape_main`'s own `ret` returns straight to
-  `tape_run`. The ELF loader also clears each loadable segment's BSS tail;
-  retaining the stub keeps the tape startup convention explicit and
-  compatible with legacy flat images.
-
-`hello-rs`'s `tape_main` mirrors `primes.S` in miniature -- prints a
-greeting, sieves primes up to a much smaller 1,000 (168 primes, largest
-997) using a `static mut` array rather than a stack buffer (same
-reasoning as `primes.S`'s `.bss`-resident sieve: SIEVE_LIMIT bytes of
-stack in a tape running on the kernel's own stack, with no guard page,
-isn't worth the risk), and returns -- proving real, non-trivial compiled
-Rust code runs correctly at the fixed tape address, not just a string
-literal. It's built with `make tape-hello-rs` (producing
-`build/tapes/hello-rs.bin`) and verified end to end over the network with
-`tapes/test_hello_rs_e2e.py`, mirroring `test_primes_e2e.py`.
-
-The same fixed-address convention would work identically for a C tape
-(`gcc -m32 -ffreestanding -fno-pic` with a matching linker script) --
-Rust was chosen here only because it reuses the kernel's own toolchain
-and build-std setup with far less new scaffolding.
-
-See `docs/rust-tapes-for-dummies.md` for a beginner-oriented, step-by-step
-guide to writing, building, and running a new Rust tape from scratch --
-this section explains the underlying design; that document is the
-practical "how do I make one" walkthrough, and is what README.md's Rust
-tape sections point readers at too.
+Every tape loads at the fixed physical `pmem::TAPE_BASE` (`0x100000`, `TAPE_LEN` 4
+MiB), reserved from the frame pool at boot by `pmem::reserve_range`;
+`allocate_tape_buffer` is only a bounds check and loading overwrites in place, so
+tapes need not be position-independent (`primes.S` still is, as the assembly
+example). A Rust tape (`tapes/hello-rs/` is the reference) is a `no_std`/`no_main`
+crate using `targets/i686-fos.json` and the kernel's `-Z build-std` invocation,
+with its own `linker.ld` at `0x100000`. `tape_run` is a plain cdecl call into an
+already-running protected-mode CPU, so `tapes/hello-rs/src/entry.S` only zeroes
+`.bss` and tail-jumps to `tape_main` (the ELF loader also clears BSS tails). Large
+scratch arrays are `static mut`, not stack, because tapes run on the 64 KiB kernel
+stack. A C tape would work the same way. Build with `make tape-hello-rs`; test:
+`tapes/test_hello_rs_e2e.py`. `docs/rust-tapes-for-dummies.md` is the step-by-step
+guide. Full detail is in `docs/history/development-notes.md`.
 
 ### Tape ABI grows a second callback: `should_abort`, and `vga-colors`
 
@@ -1458,167 +892,39 @@ Full detail (including the exact statics/queueing involved) is in
 
 ### Tape ABI grows alloc/free: using the rest of the machine's RAM
 
-Every tape up to this point was limited to its own fixed 4 MiB region
-(`pmem::TAPE_BASE`/`TAPE_LEN`) for both code and data -- fine for a
-`static mut` sieve up to a million or so, but no way to work with, say,
-a genuinely large in-memory buffer on a machine with a real gigabyte of
-RAM behind it. `shell::tape_run`'s ABI grows two more callbacks to fix
-that: `TapeEntry` is now `extern "C" fn(putc: extern "C" fn(u32),
-should_abort: extern "C" fn() -> u32, alloc: extern "C" fn(u32) -> u32,
-free: extern "C" fn(u32, u32))`, with new `shell::tape_alloc`/
-`shell::tape_free` functions as the third and fourth arguments. Exactly
-like the `should_abort` callback before it, cdecl's caller-pushes/
-caller-cleans convention means older tapes (`primes.S`/`hello-rs`,
-one callback; `vga-colors`, two) still work unmodified even though
-`tape_run` now always pushes four arguments -- the extra pushed bytes are
-just stack space an older tape's shorter signature never reads, and
-`tape_run` cleans up all four regardless of how many the tape declared.
-The one hard rule (see `bigsieve`'s own doc comments): a tape may only
-omit a *trailing* run of parameters it doesn't use, never one in the
-middle -- a tape that wants `free` (fourth) but not `should_abort`
-(second) must still declare `should_abort` in its signature (even if
-unused, e.g. `_should_abort`) to keep every later parameter's stack
-position aligned.
-
-`alloc`/`free` are backed by a brand new, deliberately separate memory
-pool in `kernel/src/pmem.rs`, not the existing frame allocator
-`palloc`/`pfree`/disk/NIC code already use. That existing pool (`BITMAP`,
-`TRACKED_BYTES` = 128 MiB, 4 KiB-per-frame granularity) was left
-completely alone; an earlier design (growing that same bitmap to cover a
-full 1 GiB) was abandoned once it appeared to hit a `.bss`/binary-size
-wall, since superseded by a fuller understanding of how `.bss` actually
-behaves in this kernel's linker layout (see "Low-memory map" above --
-`entry.S`'s own explicit zero-fill loop, not the flat file's byte count,
-is what makes a large `.bss` static safe today). Full detail of that
-abandoned first attempt is in `docs/history/development-notes.md`.
-
-The fix: a second allocator, the "big pool" (`BIG_BITMAP`,
-`BIG_POOL_BASE` = `TRACKED_BYTES` through `BIG_POOL_END` = 2 GiB,
-`BIG_CHUNK_SIZE` = 1 MiB granularity instead of 4 KiB), tracked by its
-own tiny ~240-byte bitmap (1920 MiB / 1 MiB / 8) -- negligible compared to
-the fine-grained pool's bitmap, so `kernel.bin` barely grows at all. The
-coarser 1 MiB granularity costs nothing in practice: a tape asking for
-`alloc` almost certainly wants one big contiguous block (a buffer, not
-many small ones), and `alloc`/`free` round a request up to whole
-`BIG_CHUNK_SIZE` chunks, same as `palloc`'s existing frame-granularity
-rounding just at a coarser step. `pmem::initialize()` calls a new
-`mark_big_region_free` for each usable E820 region (alongside the
-existing `mark_region_free`) and its boot `println` reports the big
-pool's tracked/usable MiB alongside the existing frame-pool line. Like
-`palloc`/`pfree`, there is no auto-free-on-return: a tape that calls
-`alloc` and never calls `free` leaks those chunks for the rest of that
-boot, exactly as trusted and exactly as unforgiving as any other
-kernel-level allocation in this project.
-
-`tapes/bigsieve/` is the reference tape exercising this: it requests a
-64 MiB buffer via `alloc` (sixteen times `pmem::TAPE_LEN`, so it could
-never fit in the tape's own fixed region no matter how it was compiled),
-zeroes it manually (unlike a `static mut` array, memory handed back by
-`alloc` isn't pre-zeroed for you), sieves primes up to 67,108,864, prints
-the results, and calls `free` before returning. Its sieve intentionally
-does **not** reuse `hello-rs`'s algorithm unchanged: `hello-rs`'s bound
-(1,000) is small enough that squaring every candidate all the way up to
-the limit never overflows `u32`, but at 64 MiB `candidate * candidate`
-would silently wrap around (Rust's `release` profile has overflow checks
-off) for any candidate past 65,536, corrupting the sieve with bogus
-composite markings far from where they belonged -- caught by this
-tape's own e2e test asserting an exact, independently-computed prime
-count. The fix is the standard sieve refinement: only compute
-`candidate * candidate` while marking composites up to
-`sqrt(SIEVE_LIMIT)`, then a separate linear pass counts unmarked bytes
-across the full range. Built with `make tape-bigsieve` (producing
-`build/tapes/bigsieve.bin`) and verified end to end over the network
-with `tapes/test_bigsieve_e2e.py` (run with QEMU given `-m 256`, since
-its 64 MiB request only succeeds once the machine actually has more than
-128 MiB of RAM for the big pool to serve it from).
+`TapeEntry` is now `extern "C" fn(putc, should_abort, alloc: extern "C" fn(u32) ->
+u32, free: extern "C" fn(u32, u32))`, with `shell::tape_alloc`/`tape_free`. Every
+ABI extension is append-only cdecl: `tape_run` always pushes all arguments and
+cleans up, older tapes ignore the extra slots, and a tape may omit only a
+*trailing* run of parameters (to use `free` it must still declare `should_abort`).
+`alloc`/`free` use a separate "big pool" in `pmem.rs` (`BIG_BITMAP`,
+`BIG_POOL_BASE` = `TRACKED_BYTES` (128 MiB) to `BIG_POOL_END` = 2 GiB, 1 MiB
+chunks, ~240-byte bitmap), filled by `mark_big_region_free` per E820 region; the
+4 KiB frame pool is untouched. Requests round up to whole chunks, memory is **not
+zeroed**, and there is no auto-free on return (a tape that never frees leaks until
+reboot). `tapes/bigsieve/` (64 MiB sieve, exact prime-count check, avoids `u32`
+overflow of `candidate * candidate`) is the reference; `make tape-bigsieve`,
+`tapes/test_bigsieve_e2e.py` (needs QEMU `-m 256`). Full detail is in
+`docs/history/development-notes.md`.
 
 ### Tape ABI grows again: `read_key` and startup arguments
 
-Every tape so far was a pure "run once, print a summary, maybe loop
-until told to give up" program -- none could take input, whether a
-one-shot parameter (like an expression for a calculator) or ongoing
-interactive keystrokes (like a calculator's own REPL). This surfaced
-while sketching a genuinely new tape (a simple calculator) as a test of
-the whole Rust-tape workflow itself: the very first design question --
-"how does it get an expression to evaluate?" -- had no answer anywhere
-in the existing ABI. `should_abort` could detect "give up" but nothing
-else; there was no way to pass `tape run` any text, and no way for a
-running tape to read a keystroke. Building the calculator was deferred
-until this gap was closed, on the theory that the gap itself was the
-more valuable finding: exactly the kind of blind alley a less-capable
-model (or a person new to this codebase) would otherwise burn a lot of
-effort discovering the hard way, mid-tape, with no clean way out.
-
-Two additions close it, both purely additive to the existing four-
-argument ABI (see "Tape ABI grows alloc/free" above):
-
-- **Startup arguments.** `tape run` no longer requires an empty
-  remainder -- `tape run 2 + 2` now runs the loaded tape exactly as
-  before, but passes `"2 + 2"` through as two new trailing arguments,
-  `args_ptr: u32`/`args_len: u32` (the address and length of that
-  slice). This is deliberately the same one-shot, non-interactive
-  parameter passing a Unix program's `argv` provides -- no parsing
-  convention (words, quoting, ...) is imposed here at all; a tape
-  receiving `args_ptr`/`args_len` gets the raw trailing bytes exactly as
-  typed and decides for itself what they mean. The slice points directly
-  into the command line `execute`/`LineEditor::feed` already parsed, and
-  remains valid for as long as `tape_run`'s synchronous call lasts, so no
-  copy is made. Every existing tape ignores both new arguments and is
-  completely unaffected, the same cdecl "extra trailing arguments cost
-  the callee nothing" guarantee `alloc`/`free`'s own addition relied on.
-- **Interactive input.** A new fifth argument, `read_key: extern "C" fn()
-  -> u32`, gives a tape actual keystrokes -- not just abort detection --
-  from whichever source started it, local keyboard or an active
-  `term_net` session, without needing to know or care which. Non-
-  blocking, called once per polling iteration exactly like
-  `should_abort`: `0` means nothing is waiting yet, `1`
-  (`TAPE_EVENT_ABORT`, the exact same "give up" trigger `should_abort`
-  reports as `true`) means stop, and `0x100` or above encodes an
-  ordinary input byte (`value - 0x100` recovers it). A tape using
-  `read_key` should not *also* call `should_abort`: both ultimately
-  drain the same two underlying sources (`keyboard::poll_term_event`'s
-  scancode queue, and a `term_net` session's own network frames), so
-  calling both from the same loop races them for input and
-  intermittently drops keystrokes to whichever polls first -- checking
-  for `TAPE_EVENT_ABORT` already covers everything `should_abort` would
-  have reported anyway.
-
-  Implementing this surfaced one asymmetry between local and remote
-  input worth calling out: a single `TERM_TAG_DATA` frame can carry many
-  bytes at once (a whole pasted or fast-typed line), but `read_key`
-  hands back only one decoded byte per call. `poll_remote_tape_abort`
-  (the existing `should_abort`-only helper) never had to care, since it
-  only ever looked for one specific byte and safely ignored the rest of
-  a frame's payload -- but a general input callback can't discard bytes
-  it hasn't been asked to. The new `poll_remote_tape_input` fixes this by
-  queuing everything past the first byte of a frame into a small FIFO
-  (`TAPE_INPUT_QUEUE`, 256 bytes), drained by later `read_key` calls
-  before it ever polls the network again -- the same producer/consumer
-  queue shape `console`'s own output-side `RELAY_QUEUE` already uses,
-  just for input.
-
-  Backspace (ASCII `8`) gets one more piece of special handling: `read_key`
-  calls `console::erase_last_character()` itself before returning that
-  event, regardless of whether the keystroke was typed locally or
-  arrived over the network. This is the one thing a tape genuinely
-  cannot do itself even with the `putc` callback -- plain
-  `console::write_byte` does not special-case `0x08` the way
-  `erase_last_character` does (rewinding the VGA cursor and emitting the
-  `\x08 \x08` sequence a real serial terminal expects) -- so doing it
-  here keeps a tape's own line-editing logic as simple as "decrement my
-  buffer length," exactly mirroring how the ordinary shell prompt's own
-  `LineEditor::feed` already handles backspace.
-
-No tape in this repository uses either addition yet (none existed with
-a reason to before this gap was found) -- this section exists to
-document the ABI ahead of the calculator tape that motivated it, and any
-future tape needing input. `docs/rust-tapes-for-dummies.md`'s tape ABI
-section and `tapes/tape-rt/` (see "`tapes/tape-rt/`: a shared runtime,
-so far only used by `vga-colors`" above) are the natural places a
-`read_key`-based line-reading helper belongs once a tape actually needs
-one, built the same way the shell's own `LineEditor` is: ordinary Rust
-layered over one narrow, non-blocking primitive, not a second kernel
-callback.
+- **Startup arguments**: `tape run TEXT...` passes the raw trailing bytes as
+  `args_ptr: u32`/`args_len: u32`; no quoting convention is imposed and the slice
+  points into the already-parsed command line (valid during the synchronous call).
+- **`read_key: extern "C" fn() -> u32`**: non-blocking, call once per loop pass;
+  `0` = nothing, `1` (`TAPE_EVENT_ABORT`) = stop, `0x100 + byte` = input. It reads
+  whichever source started the tape (local keyboard or `term net`). **A tape using
+  `read_key` must not also call `should_abort`**: both drain the same sources and
+  would race for keystrokes. A `TERM_TAG_DATA` frame can carry many bytes, so
+  `poll_remote_tape_input` queues everything past the first into
+  `TAPE_INPUT_QUEUE` (256 bytes), drained before the network is polled again.
+  Backspace (ASCII 8) makes `read_key` call `console::erase_last_character()`
+  itself unless raw mode is set (`set_input_mode`, see "Cursor keys in tapes"), so
+  a tape's line editor just decrements its length. `tape-rt` is the natural home
+  for line-reading helpers. `tapes/calc/` is the reference user (RPN calculator;
+  `tape run 3 4 +` or an interactive REPL; `tapes/test_calc_e2e.py`). Full detail is
+  in `docs/history/development-notes.md`.
 
 ### `tapes/calc/`: the reverse-Polish-notation calculator this all was for
 
@@ -1637,86 +943,30 @@ scenarios) is in `docs/history/development-notes.md`.
 
 ### Tape ABI grows kernel-managed networking: `net-chat`
 
-The tape ABI now has three trailing callbacks after `args_ptr`/`args_len`:
-`nic_mac: extern "C" fn(u32) -> u32`, `nic_send: extern "C" fn(u32, u32)
--> u32`, and `nic_receive: extern "C" fn(u32, u32) -> u32`. They preserve
-the same append-only cdecl rule as every earlier ABI extension: existing
-tapes ignore the trailing stack slots unchanged, while a networked tape must
-declare every earlier parameter to keep these three positions aligned.
+Trailing callbacks after `args_ptr`/`args_len` (append-only cdecl, a networked tape
+must declare every earlier parameter): `nic_mac(u32)->u32`, `nic_send(u32,u32)->u32`,
+`nic_receive(u32,u32)->u32` (active interface; `nic_mac` must be called first and a
+zero return is failure, not an idle network), then `nic_max_frame_len()->u32`,
+`ticks()->u64` (the PIT tick count, for deadlines; tapes must not reprogram the
+timer), then the multi-interface set `nic_count`, `nic_mac_at`, `nic_send_at`,
+`nic_receive_at`, `nic_set_promiscuous_at` (zero-based indices, unlike the shell's
+one-based `nic use N`; promiscuous mode is for `tapes/bridge/` and must be restored
+before returning). Later slots: 36 `wait_for_event`, 37 `set_input_mode`, 38
+`micros`.
 
-The kernel retains ownership of every initialized NIC, including PCI
-discovery, bus-master/DMA allocation, receive-ring accounting, and overflow
-recovery. The original callbacks operate on the active interface;
-`nic_mac` copies its six-byte address to a tape-owned buffer and returns one
-on success; `nic_send` sends a complete tape-owned Ethernet frame;
-`nic_receive` copies one complete frame into a tape-owned buffer and returns
-its length, or zero when no frame is waiting or the operation cannot proceed.
-A tape must call `nic_mac` first and report a zero return rather
-than mistaking it for an idle network.
-
-`tapes/net-chat/` is the reference consumer: it uses exactly the shell
-`chat` ethertype/tags, supports broadcast and unicast chat plus discovery,
-and combines the callbacks with `read_key` so local PS/2 and active
-`term net` input both work. Because raw reception and remote `term net`
-input share one NIC ring, the kernel preserves non-terminal frames for the
-tape and queues terminal frames back for `read_key`; neither side silently
-steals the other's traffic. `tapes/test_net_chat_e2e.py` proves the tape
-exchanges messages with a second fos instance running the ordinary shell
-`chat` command.
-
-The ABI now appends two more callbacks after those raw Ethernet operations:
-`nic_max_frame_len: extern "C" fn() -> u32` and
-`ticks: extern "C" fn() -> u64`. The first reports the kernel's actual
-maximum frame size so a tape library does not duplicate backend constants.
-The second exposes the kernel's monotonic PIT tick count for retransmission
-and connection deadlines; tapes must not reprogram the timer merely to obtain
-protocol time.
-
-Raw frames deferred while the `read_key`/networking callbacks share the
-selected NIC receive path now lives behind a four-frame FIFO rather than one slot. A
-frame is also retained when a tape polls with a too-small output buffer,
-allowing it to retry using `nic_max_frame_len()` instead of silently losing
-the packet. The kernel still does not parse ARP, IPv4, UDP, or TCP: those
-protocols belong in the fixed-buffer `tapes/tape-net/` library, documented in
-`NETWORKING.md`.
-
-DHCPv4 is also protocol-library code, not a kernel service. Its client starts
-with the required zero/broadcast IPv4 bootstrap addresses, uses the tape
-`ticks` callback for bounded retries and lease renewal/rebind deadlines, and
-returns explicit lease configuration to the application. A consuming tape
-should expose `tape run dhcp` and a structured fallback such as
-`tape run static IP/PREFIX GATEWAY`; dotted netmasks and a separate
-`IP /PREFIX` remain accepted; argument parsing and post-configuration
-policy belong to that tape, not to `tape-net`.
-
-The ABI now appends five multi-interface callbacks after `ticks`:
-`nic_count`, `nic_mac_at`, `nic_send_at`, `nic_receive_at`, and
-`nic_set_promiscuous_at`. Their indices are zero-based, unlike the shell's
-one-based `nic list`/`nic use N` commands. The final callback toggles
-receive-all filtering for one interface; it is required by
-`tapes/bridge/`, which must receive frames addressed to hosts behind a
-different port. A bridge tape should enable it only for its selected ports
-and restore normal filtering before returning.
-
-`tapes/ip-chat/` is the reference application for this split. It uses
-ARP/IPv4/UDP from `tape-net` to implement a fixed-buffer line chat, accepts
-`static LOCAL_IP NETMASK GATEWAY [PEER_IP]` or `dhcp [PEER_IP]` startup
-arguments, and keeps `/to`, `/broadcast`, `/peers`, and `/quit` policy in the
-tape. Its focused `tapes/test_ip_chat_e2e.py` test uses two static-IP QEMU
-guests; the multicast fixture has no DHCP server, so DHCP is covered by the
-library/application unit tests rather than that integration test.
-
-`tapes/telnet/` is a single-connection Telnet client using `tape-net` for
-ARP, DHCP, and TCP. Its incremental parser negotiates the basic Telnet verbs
-plus an 80x25 `xterm` terminal type and NAWS window size, handles
-subnegotiation across TCP boundaries, doubles literal `IAC` bytes, and
-forwards UTF-8 as bytes without decoding it in the tape. The kernel's local
-VGA callback interprets a bounded VT100 subset and answers `CSI 5n`/`CSI 6n`
-using its 1-based software cursor position, while serial and `term net`
-retain raw control sequences. Keep authentication, DNS, and
-multi-connection support out of scope; the focused
-`tapes/test_telnet_e2e.py` test uses an unprivileged multicast QEMU fixture
-plus a small host-side protocol peer.
+The kernel owns every NIC (PCI, DMA, rings, overflow recovery) and never parses
+ARP/IPv4/UDP/TCP: those live in the fixed-buffer `tapes/tape-net/` library
+(NETWORKING.md). Because raw reception and `term net` input share one ring, the
+kernel keeps non-terminal frames for the tape (a four-frame FIFO, and a frame
+polled with a too-small buffer is retained for a retry sized by
+`nic_max_frame_len()`) and queues terminal frames for `read_key`. DHCPv4 is
+protocol-library code too: a consuming tape exposes `tape run dhcp` and a fallback
+such as `static IP/PREFIX GATEWAY`. References: `tapes/net-chat/` (shell `chat`
+ethertype/tags; `tapes/test_net_chat_e2e.py`), `tapes/ip-chat/` (ARP/IPv4/UDP;
+`test_ip_chat_e2e.py`, two static-IP guests), `tapes/telnet/` (single-connection
+client with a bounded VT100 subset in the kernel's local VGA callback; auth, DNS and
+multi-connection are out of scope; `test_telnet_e2e.py`). Full detail is in
+`docs/history/networking-and-discovery.md`.
 
 ### Live output relaying for `read_key`/`should_abort`-based tapes over `term net`
 
@@ -1770,57 +1020,23 @@ through. Full detail (why this changed, and the affected e2e tests) is in
 
 ### `term net` at boot, and more "give up" function keys
 
-`shell::run` calls `term_net` once, automatically, before entering the
-ordinary interactive prompt loop, so every fos machine waits for a remote
-terminal client by default at every boot. A local operator watching a real
-screen presses one of the "give up" keys to reach the local prompt
-immediately instead of waiting; there is deliberately no serial equivalent
-(reading one byte to mean "give up" would eat the first character of real
-serial input). `keyboard::ESCAPE_SCANCODES` recognizes six function keys --
-F12, F4, F6, F7, F8, F10 -- since some terminal emulators/KVMs intercept
-F12 itself before it reaches the guest; F12 stays first and remains the
-documented default. F2 is reserved separately for `term_printer`'s
-"abandon this line" behavior (see the parallel-port driver below), not
-added to this list. Full detail (why several function keys instead of one)
-is in `docs/history/networking-and-discovery.md`.
-
-`kernel/src/parallel.rs` is a deliberately narrow legacy-ISA
-parallel/Centronics port driver, discovered via the BIOS Data Area
-(`0x408`-`0x40E`, LPT1..LPT4) the same way `console::detect_ports` finds
-COM1..COM4 -- there is no PCI parallel-card discovery, matching this
-project's "ISA only" convention for the 3C509. It implements only the
-original IBM PC "SPP" (Standard Parallel Port) register set (no
-bidirectional/EPP/ECP modes); `Printer::write_byte` writes a byte, pulses
-Strobe, and polls the Busy status bit for up to `BUSY_POLL_ATTEMPTS`
-(200,000) reads before giving up and reporting a `PrinterFault`
-(`NotSelected`/`PaperOut`/`ErrorLine`/`Busy`). Status/control bit polarity
-is an explicit, documented real-hardware caveat: several Centronics signals
-are active-low, and this driver's polarities follow the most commonly cited
-convention but have only been checked against QEMU's `-parallel` emulation.
-
-`shell.rs` adds `term printer`/`term LPT1`..`LPT4` (an exclusive terminal
-mode, mirroring `term COM1`/`term_net`) and a `print` command pair
-(`print [diskN] NAME`, `print run CMD...`), backed by a second, independent
-print-relay queue in `console.rs` (`PRINT_RELAY_QUEUE`) fed from the same
-`relay_push` tap point the network relay queue already uses. Typed input in
-`term printer` is echoed live, teletype style (written to the physical
-printer the instant it is typed, not buffered until Enter); F2
-(`KeyEvent::KillLine`) abandons the local input buffer and prints a fresh
-line break, since already-inked characters cannot be un-printed. `help`
-refuses to run while a `term printer` session is active (to avoid burning
-paper), except via `print run help`. `print run CMD...`/`print [diskN] NAME`
-are nesting-aware: `console::print_relay_active()` is checked first so a
-command run from inside an already-active `term_printer` session doesn't
-split one physical print job into two. A tape's own live output also
-reaches the printer via `relay_pending_print_output()`, called from
-`combined_tape_should_abort`/`poll_remote_tape_input`, mirroring the
-identical `term_net` fix. Real-hardware follow-ups (a false "out of paper"
-report traced to a dead CMOS battery resetting the BIOS parallel-port
-config; dot-matrix printers cannot show true character-by-character
-teletype output since they buffer a full line internally; an interactive
-tape's output was initially batched until it exited) are recorded in full,
-along with the user's physical Panasonic KX-P1083 as the real-hardware
-validation target, in `docs/history/development-notes.md`.
+`shell::run` calls `term_net` once before the prompt loop, so every machine waits
+for a remote client at boot; a local operator presses a "give up" key
+(`keyboard::ESCAPE_SCANCODES`: F12 first, then F4, F6, F7, F8, F10, since some KVMs
+eat F12) to reach the prompt. There is deliberately no serial equivalent. F2 is
+reserved for `term_printer`'s "abandon this line". Parallel-port printing:
+`kernel/src/parallel.rs` is an SPP-only LPT driver found via the BIOS Data Area
+(`0x408`-`0x40E`); `Printer::write_byte` strobes and polls Busy up to
+`BUSY_POLL_ATTEMPTS` (200,000), reporting a `PrinterFault`. Status polarities
+follow the common convention and are only checked under QEMU `-parallel`.
+`term printer`/`term LPT1..4` and `print [diskN] NAME` / `print run CMD...` use a
+second relay queue (`PRINT_RELAY_QUEUE`) fed from `relay_push`; typed input is
+echoed teletype-style and F2 abandons the local buffer; `help` refuses while a
+printer session is active; tape output reaches the printer through
+`relay_pending_print_output()`. Real-hardware follow-ups (dead CMOS battery faking
+"out of paper", dot-matrix line buffering) are in
+`docs/history/development-notes.md`; the rest in
+`docs/history/networking-and-discovery.md`.
 
 ## Real hardware notes
 
@@ -1878,56 +1094,20 @@ original "Global Reset specifically" hypothesis, and the exact
 
 ### Talking to a real fos machine from a sandboxed dev environment
 
-`tools/send_tape.py`, `tools/term_net.py`, and `tools/send_frame.py` all
-need raw `AF_PACKET` sockets, which normally require `CAP_NET_RAW` --
-in practice, running as root. A sandboxed environment (such as this
-assistant's own bash tool) is unlikely to have interactive/passwordless
-`sudo`, and running an agent as root for an entire session is not
-something to reach for just to send one Ethernet frame. The workaround
-used throughout this project's real-hardware verification instead grants
-the capability to one dedicated binary, not system-wide:
+`tools/send_tape.py`, `term_net.py`, `send_frame.py` need `AF_PACKET` raw sockets.
+Do not run an agent as root; a human grants the capability once to a dedicated
+copy of Python (an agent must never attempt this silently):
 
 ```sh
 cp "$(command -v python3)" ~/.local/bin/python3-netraw
-sudo setcap cap_net_raw+eip ~/.local/bin/python3-netraw
+sudo setcap cap_net_raw+eip ~/.local/bin/python3-netraw   # verify: getcap
+~/.local/bin/python3-netraw tools/term_net.py --iface wlp2s0 --mac MAC "tape status"
 ```
 
-The `setcap` command itself needs a real, interactive `sudo` prompt, so a
-human has to run it (or at least approve it) once -- an agent should
-never attempt this silently on the user's behalf. After that one-time
-setup, verify it stuck with `getcap ~/.local/bin/python3-netraw`, then
-invoke any of the scripts above through that binary instead of the
-system `python3`:
-
-```sh
-~/.local/bin/python3-netraw tools/send_tape.py --iface wlp2s0 \
-    --discover-timeout 5 build/tapes/hello-rs.bin
-~/.local/bin/python3-netraw tools/term_net.py --iface wlp2s0 \
-    --mac 00:20:18:89:4a:d6 "tape status" "tape run"
-```
-
-Nothing about the copied binary's capability leaks into the ordinary
-`python3` on `PATH` or into any other process -- `cap_net_raw+eip` is
-scoped to that one file's inode, not the user, so this cannot be used to
-raw-socket from any other script or shell command without going through
-`python3-netraw` explicitly.
-
-Two things specific to this kind of environment tripped this up in
-practice, worth checking first if a raw-socket script mysteriously can't
-find the target machine:
-
-- **Interface selection.** `send_tape.py`'s `default_interface()` picks
-  the first "up" interface in alphabetical order; a sandboxed dev box can
-  easily have an unrelated VPN-style interface (alphabetically ordered
-  before the real LAN NIC) that a real fos machine is obviously never
-  reachable through. Always pass `--iface <name>` explicitly (e.g.
-  `--iface wlp2s0`) rather than relying on the default when more than one
-  interface is up.
-- **`send_tape.py`'s `--delay` default.** As covered above, real hardware
-  needs pacing between chunks (`--delay 0.003` is the current default);
-  without it, a real fos machine's polling-only RTL8139 driver can
-  silently overflow its receive ring on a large tape sent from a fast,
-  unpaced sender.
+Always pass `--iface` explicitly (the default is the alphabetically first up
+interface, which may be a VPN), and keep `send_tape.py`'s `--delay 0.003` pacing.
+Prefer `tools/devloop.py` (below). Full detail is in
+`docs/history/real-hardware-notes.md`.
 
 ### Ending blocking commands from a term net session
 

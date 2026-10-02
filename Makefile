@@ -197,6 +197,7 @@ run-unsafe-memory: image-unsafe-memory
 	qemu-system-i386 -drive format=raw,file=$(UNSAFE_MEMORY_IMAGE) -serial stdio -monitor none -no-reboot -no-shutdown
 
 test: image
+	python3 tools/check_agents_size.py
 	python3 tools/test_gpt.py
 	python3 tools/test_tape_elf.py
 	python3 tools/qemu_smoke.py --image $(IMAGE)

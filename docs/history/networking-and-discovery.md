@@ -632,3 +632,144 @@ after a local escape the shell only restarts `term_net`'s own HELLO wait
 after `TERM_NET_IDLE_TICKS` (60s) of local idle time, so a command sent
 shortly after an unnecessary escape would see no listener at all until
 that window elapses.
+
+## Tape ABI grows kernel-managed networking: `net-chat` (full detail)
+
+### Tape ABI grows kernel-managed networking: `net-chat`
+
+The tape ABI now has three trailing callbacks after `args_ptr`/`args_len`:
+`nic_mac: extern "C" fn(u32) -> u32`, `nic_send: extern "C" fn(u32, u32)
+-> u32`, and `nic_receive: extern "C" fn(u32, u32) -> u32`. They preserve
+the same append-only cdecl rule as every earlier ABI extension: existing
+tapes ignore the trailing stack slots unchanged, while a networked tape must
+declare every earlier parameter to keep these three positions aligned.
+
+The kernel retains ownership of every initialized NIC, including PCI
+discovery, bus-master/DMA allocation, receive-ring accounting, and overflow
+recovery. The original callbacks operate on the active interface;
+`nic_mac` copies its six-byte address to a tape-owned buffer and returns one
+on success; `nic_send` sends a complete tape-owned Ethernet frame;
+`nic_receive` copies one complete frame into a tape-owned buffer and returns
+its length, or zero when no frame is waiting or the operation cannot proceed.
+A tape must call `nic_mac` first and report a zero return rather
+than mistaking it for an idle network.
+
+`tapes/net-chat/` is the reference consumer: it uses exactly the shell
+`chat` ethertype/tags, supports broadcast and unicast chat plus discovery,
+and combines the callbacks with `read_key` so local PS/2 and active
+`term net` input both work. Because raw reception and remote `term net`
+input share one NIC ring, the kernel preserves non-terminal frames for the
+tape and queues terminal frames back for `read_key`; neither side silently
+steals the other's traffic. `tapes/test_net_chat_e2e.py` proves the tape
+exchanges messages with a second fos instance running the ordinary shell
+`chat` command.
+
+The ABI now appends two more callbacks after those raw Ethernet operations:
+`nic_max_frame_len: extern "C" fn() -> u32` and
+`ticks: extern "C" fn() -> u64`. The first reports the kernel's actual
+maximum frame size so a tape library does not duplicate backend constants.
+The second exposes the kernel's monotonic PIT tick count for retransmission
+and connection deadlines; tapes must not reprogram the timer merely to obtain
+protocol time.
+
+Raw frames deferred while the `read_key`/networking callbacks share the
+selected NIC receive path now lives behind a four-frame FIFO rather than one slot. A
+frame is also retained when a tape polls with a too-small output buffer,
+allowing it to retry using `nic_max_frame_len()` instead of silently losing
+the packet. The kernel still does not parse ARP, IPv4, UDP, or TCP: those
+protocols belong in the fixed-buffer `tapes/tape-net/` library, documented in
+`NETWORKING.md`.
+
+DHCPv4 is also protocol-library code, not a kernel service. Its client starts
+with the required zero/broadcast IPv4 bootstrap addresses, uses the tape
+`ticks` callback for bounded retries and lease renewal/rebind deadlines, and
+returns explicit lease configuration to the application. A consuming tape
+should expose `tape run dhcp` and a structured fallback such as
+`tape run static IP/PREFIX GATEWAY`; dotted netmasks and a separate
+`IP /PREFIX` remain accepted; argument parsing and post-configuration
+policy belong to that tape, not to `tape-net`.
+
+The ABI now appends five multi-interface callbacks after `ticks`:
+`nic_count`, `nic_mac_at`, `nic_send_at`, `nic_receive_at`, and
+`nic_set_promiscuous_at`. Their indices are zero-based, unlike the shell's
+one-based `nic list`/`nic use N` commands. The final callback toggles
+receive-all filtering for one interface; it is required by
+`tapes/bridge/`, which must receive frames addressed to hosts behind a
+different port. A bridge tape should enable it only for its selected ports
+and restore normal filtering before returning.
+
+`tapes/ip-chat/` is the reference application for this split. It uses
+ARP/IPv4/UDP from `tape-net` to implement a fixed-buffer line chat, accepts
+`static LOCAL_IP NETMASK GATEWAY [PEER_IP]` or `dhcp [PEER_IP]` startup
+arguments, and keeps `/to`, `/broadcast`, `/peers`, and `/quit` policy in the
+tape. Its focused `tapes/test_ip_chat_e2e.py` test uses two static-IP QEMU
+guests; the multicast fixture has no DHCP server, so DHCP is covered by the
+library/application unit tests rather than that integration test.
+
+`tapes/telnet/` is a single-connection Telnet client using `tape-net` for
+ARP, DHCP, and TCP. Its incremental parser negotiates the basic Telnet verbs
+plus an 80x25 `xterm` terminal type and NAWS window size, handles
+subnegotiation across TCP boundaries, doubles literal `IAC` bytes, and
+forwards UTF-8 as bytes without decoding it in the tape. The kernel's local
+VGA callback interprets a bounded VT100 subset and answers `CSI 5n`/`CSI 6n`
+using its 1-based software cursor position, while serial and `term net`
+retain raw control sequences. Keep authentication, DNS, and
+multi-connection support out of scope; the focused
+`tapes/test_telnet_e2e.py` test uses an unprivileged multicast QEMU fixture
+plus a small host-side protocol peer.
+
+## `term net` at boot, and more "give up" function keys (full detail)
+
+### `term net` at boot, and more "give up" function keys
+
+`shell::run` calls `term_net` once, automatically, before entering the
+ordinary interactive prompt loop, so every fos machine waits for a remote
+terminal client by default at every boot. A local operator watching a real
+screen presses one of the "give up" keys to reach the local prompt
+immediately instead of waiting; there is deliberately no serial equivalent
+(reading one byte to mean "give up" would eat the first character of real
+serial input). `keyboard::ESCAPE_SCANCODES` recognizes six function keys --
+F12, F4, F6, F7, F8, F10 -- since some terminal emulators/KVMs intercept
+F12 itself before it reaches the guest; F12 stays first and remains the
+documented default. F2 is reserved separately for `term_printer`'s
+"abandon this line" behavior (see the parallel-port driver below), not
+added to this list. Full detail (why several function keys instead of one)
+is in `docs/history/networking-and-discovery.md`.
+
+`kernel/src/parallel.rs` is a deliberately narrow legacy-ISA
+parallel/Centronics port driver, discovered via the BIOS Data Area
+(`0x408`-`0x40E`, LPT1..LPT4) the same way `console::detect_ports` finds
+COM1..COM4 -- there is no PCI parallel-card discovery, matching this
+project's "ISA only" convention for the 3C509. It implements only the
+original IBM PC "SPP" (Standard Parallel Port) register set (no
+bidirectional/EPP/ECP modes); `Printer::write_byte` writes a byte, pulses
+Strobe, and polls the Busy status bit for up to `BUSY_POLL_ATTEMPTS`
+(200,000) reads before giving up and reporting a `PrinterFault`
+(`NotSelected`/`PaperOut`/`ErrorLine`/`Busy`). Status/control bit polarity
+is an explicit, documented real-hardware caveat: several Centronics signals
+are active-low, and this driver's polarities follow the most commonly cited
+convention but have only been checked against QEMU's `-parallel` emulation.
+
+`shell.rs` adds `term printer`/`term LPT1`..`LPT4` (an exclusive terminal
+mode, mirroring `term COM1`/`term_net`) and a `print` command pair
+(`print [diskN] NAME`, `print run CMD...`), backed by a second, independent
+print-relay queue in `console.rs` (`PRINT_RELAY_QUEUE`) fed from the same
+`relay_push` tap point the network relay queue already uses. Typed input in
+`term printer` is echoed live, teletype style (written to the physical
+printer the instant it is typed, not buffered until Enter); F2
+(`KeyEvent::KillLine`) abandons the local input buffer and prints a fresh
+line break, since already-inked characters cannot be un-printed. `help`
+refuses to run while a `term printer` session is active (to avoid burning
+paper), except via `print run help`. `print run CMD...`/`print [diskN] NAME`
+are nesting-aware: `console::print_relay_active()` is checked first so a
+command run from inside an already-active `term_printer` session doesn't
+split one physical print job into two. A tape's own live output also
+reaches the printer via `relay_pending_print_output()`, called from
+`combined_tape_should_abort`/`poll_remote_tape_input`, mirroring the
+identical `term_net` fix. Real-hardware follow-ups (a false "out of paper"
+report traced to a dead CMOS battery resetting the BIOS parallel-port
+config; dot-matrix printers cannot show true character-by-character
+teletype output since they buffer a full line internally; an interactive
+tape's output was initially batched until it exited) are recorded in full,
+along with the user's physical Panasonic KX-P1083 as the real-hardware
+validation target, in `docs/history/development-notes.md`.
