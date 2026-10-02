@@ -1,0 +1,18 @@
+defaults:
+  queue-mode: serial
+jobs:
+- name: fos-cleanup
+  active: true
+  path: ~/dev/fos
+  run-mode: scheduled
+  build: make clean
+  at: "06:00"
+- name: fos
+  active: true
+  path: ~/dev/fos
+  test:
+    - make all 
+    - make test-all
+  post-build:
+    - which gb && gb -I fos.yaml -a -w
+  interval: 7200
