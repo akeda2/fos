@@ -1813,6 +1813,10 @@ fn usb_storage_attach_command(info: &BootInfo) {
         Err(disk::UsbAttachError::Full) => {
             println!("No free secondary disk slot available.");
         }
+        Err(disk::UsbAttachError::AlreadyAttached(device)) => {
+            println!("This USB device is already attached as disk{}", device_number(device));
+            println!("(its handle was refreshed after the port reset).");
+        }
     }
 }
 

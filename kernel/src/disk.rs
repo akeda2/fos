@@ -108,6 +108,9 @@ pub enum UsbAttachError {
     Capacity(usb_storage::Error),
     /// Every [`MAX_SECONDARY_DISKS`] slot is already in use.
     Full,
+    /// This physical device is already a USB-backed disk; its handle was
+    /// refreshed (discovery reset the port) and no new disk was added.
+    AlreadyAttached(Device),
 }
 
 /// Errors specific to [`promote_boot_to_usb`].
@@ -334,10 +337,42 @@ pub fn attach_usb_disk() -> Result<usize, UsbAttachError> {
     attach_discovered_disk(device)
 }
 
+/// If `candidate` is the same physical device (controller + root-hub port)
+/// as a disk that is already USB-backed -- `Device::Boot` once promoted, or
+/// a [`SecondaryBackend::Usb`] disk -- replaces that disk's handle with
+/// `candidate` and returns which disk it was. Discovery resets the port and
+/// readdresses the device, so the old handle no longer works; keeping it
+/// would leave the existing `diskN` dead while a duplicate `diskM` pointed
+/// at the same media.
+fn refresh_known_usb_device(candidate: &usb_storage::MscDevice) -> Option<Device> {
+    unsafe {
+        if let Some(existing) = (*core::ptr::addr_of_mut!(BOOT_USB_DEVICE)).as_mut() {
+            if existing.same_physical_device(candidate) {
+                *existing = *candidate;
+                return Some(Device::Boot);
+            }
+        }
+        for index in 0..SECONDARY_COUNT {
+            if let Some(SecondaryDisk { backend: SecondaryBackend::Usb(existing), .. }) =
+                SECONDARY_DISKS[index].as_mut()
+            {
+                if existing.same_physical_device(candidate) {
+                    *existing = *candidate;
+                    return Some(Device::Secondary(index));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Shared tail of [`attach_usb_disk`] and [`promote_all_and_attach`]:
 /// confirms an already-discovered device is ready, reads its capacity,
 /// and appends it as a new [`SecondaryBackend::Usb`] secondary disk.
 fn attach_discovered_disk(mut device: usb_storage::MscDevice) -> Result<usize, UsbAttachError> {
+    if let Some(existing) = refresh_known_usb_device(&device) {
+        return Err(UsbAttachError::AlreadyAttached(existing));
+    }
     if !device.wait_until_ready(10) {
         return Err(UsbAttachError::NotReady);
     }
@@ -610,6 +645,18 @@ pub fn promote_all_and_attach(info: &BootInfo) -> PromoteAllReport {
 
     let mut discovered: [Option<usb_storage::MscDevice>; MAX_PROMOTE_RESULTS] = [None; MAX_PROMOTE_RESULTS];
     let discovered_count = usb_storage::open_all(&mut discovered);
+
+    // Discovery just reset every port, so any device that is already a
+    // USB-backed disk has a new address: refresh its handle and take it out
+    // of the pool so it is neither matched to another disk's baseline nor
+    // attached a second time. (Its AlreadyPromoted line was reported above.)
+    for slot in discovered[..discovered_count].iter_mut() {
+        if let Some(candidate) = *slot {
+            if refresh_known_usb_device(&candidate).is_some() {
+                *slot = None;
+            }
+        }
+    }
 
     for target in targets[..target_count].iter().flatten() {
         let (device, existing_sectors, baseline) = *target;

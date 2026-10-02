@@ -177,7 +177,9 @@ def main() -> None:
             # which drives the same `device_write_sectors`/
             # `device_read_sectors` chunked path FOSFS itself uses.
             large_name = "telnet.bin"
-            large_size = 24584  # tools/build_image.py's own reported size
+            # Size of the preloaded tape, read from the build output so a rebuilt
+            # telnet tape cannot silently make this number stale.
+            large_size = (Path(__file__).resolve().parent.parent / "build" / "tapes" / "telnet.bin").stat().st_size
             to_usb = run_command(f"copy disk1 {large_name} {disk}".encode(), timeout=30)
             if f"Copied {large_size} byte(s)" not in to_usb:
                 raise SystemExit(
@@ -202,7 +204,16 @@ def main() -> None:
             second_attach = run_command(b"usb storage attach")
             if "already attached" not in second_attach:
                 raise SystemExit(f"a second attach should be rejected:\n{second_attach}")
+            if "disk4" in second_attach:
+                raise SystemExit(f"a second attach created a duplicate disk:\n{second_attach}")
             print("PASS: a second 'usb storage attach' is correctly rejected.")
+
+            # Rediscovery reset the port and readdressed the device, so the
+            # original handle would be dead had it not been refreshed.
+            recat = run_command(f"cat {disk} usbtest.txt".encode())
+            if FILE_CONTENTS not in recat:
+                raise SystemExit(f"{disk} stopped working after a repeated attach:\n{recat}")
+            print(f"PASS: {disk} still reads correctly after the repeated attach.")
 
             mcast.send(eth_frame(guest_mac, TERM_CLIENT_MAC, TERM_TAG_BYE))
         finally:

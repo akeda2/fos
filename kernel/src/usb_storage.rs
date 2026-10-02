@@ -223,6 +223,7 @@ pub fn open_all(out: &mut [Option<MscDevice>]) -> usize {
                 endpoints,
                 device_address,
                 control_max_packet: max_packet0,
+                port,
                 // Freshly `SET_CONFIGURATION`'d: the device's own toggles
                 // start at DATA0 per the USB spec's own "configuration
                 // selection resets all non-control endpoint state" rule.
@@ -265,6 +266,12 @@ pub struct MscDevice {
     endpoints: MscEndpoints,
     device_address: u8,
     control_max_packet: u8,
+    /// Root-hub port the device was found on. Together with `controller`
+    /// this is its physical identity: `open_all` resets the port and hands
+    /// out a fresh address on every call, so the address cannot be used to
+    /// recognise a device that is already attached (see
+    /// [`MscDevice::same_physical_device`]).
+    port: u8,
     in_toggle: bool,
     out_toggle: bool,
     next_tag: u32,
@@ -282,6 +289,16 @@ pub fn open() -> Option<MscDevice> {
 }
 
 impl MscDevice {
+    /// Whether `other` was found on the same UHCI controller and root-hub
+    /// port, i.e. is the same physical device re-discovered. Re-discovery
+    /// resets the port, which gives the device a new address and
+    /// invalidates every older handle to it; `disk.rs` uses this to
+    /// refresh the existing `diskN` handle instead of attaching the device
+    /// a second time under a new number.
+    pub fn same_physical_device(&self, other: &MscDevice) -> bool {
+        core::ptr::eq(self.controller, other.controller) && self.port == other.port
+    }
+
     fn next_tag(&mut self) -> u32 {
         self.next_tag = self.next_tag.wrapping_add(1);
         self.next_tag
