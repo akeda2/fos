@@ -802,7 +802,10 @@ controllers/ports and fully re-enumerates every time. Device addresses come from
 - **Capture** (`usb capture`, real-hardware-only; QEMU's `usb-audio` cannot
   capture): `IsocInStream` has its own TD pool; `Audio::capture_format()` and the
   `audio_capture_*` tape callbacks expose a capture format that may differ from
-  playback (the TerraTec Aureon Dual is stereo out, mono in).
+  playback (the TerraTec Aureon Dual is stereo out, mono in). `usb play`/`usb capture`
+  and `audio.rs` must address the device by `UacDevice.address`, the value
+  `find_uac_device` just took from `allocate_device_address` -- it changes on
+  every discovery, so never hardcode 1.
 - **Mass Storage (Bulk-Only)**: `Uhci::bulk_transfer` (caller-owned DATA0/1
   toggle, split into `TD_POOL_CAPACITY` passes) under `kernel/src/usb_storage.rs`
   (CBW/CSW plus a SCSI subset: `inquiry`, `wait_until_ready`, `request_sense`,

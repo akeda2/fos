@@ -134,11 +134,7 @@ E2E_SCRIPTS = [
     "tools/test_term_net_tape_e2e.py",
 ]
 
-KNOWN_FAILING = {
-    # Every isochronous packet reports an error although playback timing is
-    # right; not yet investigated (real driver bug or QEMU behavior change).
-    "python3 tapes/test_uhci_play_e2e.py": "all isochronous packets report failed",
-}
+KNOWN_FAILING: dict[str, str] = {}
 
 # Timing-sensitive against a finite polling receive ring (tape load pacing).
 FLAKY = {"python3 tapes/test_audio_rtp_opus_send_e2e.py"}

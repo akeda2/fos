@@ -1923,10 +1923,11 @@ fn usb_storage_command() {
 /// isochronous engine's TD buffer pointers reference it directly, with
 /// no separate packet-buffer pool or copy step needed.
 fn usb_play_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
-    const DEVICE_ADDRESS: u8 = 1; // matches uhci::find_uac_device's own fixed address
-
-    let found = uhci::find_uac_device().and_then(|(controller, uac)| Some((controller, uac.playback?)));
-    let Some((controller, endpoint)) = found else {
+    // The address `find_uac_device` just assigned from the shared allocator
+    // (`uhci::allocate_device_address`); it changes on every discovery.
+    let found = uhci::find_uac_device()
+        .and_then(|(controller, uac)| Some((controller, uac.address, uac.playback?)));
+    let Some((controller, device_address, endpoint)) = found else {
         println!("No USB Audio Class playback device found (needs PCM,");
         println!("16-bit, a fixed rate divisible by 1000, and a");
         println!("Synchronous/Adaptive isochronous OUT endpoint).");
@@ -1982,7 +1983,7 @@ fn usb_play_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
     }
 
     let endpoint_number = endpoint.endpoint_address & 0x0f;
-    let mut stream = controller.start_isoc_out(DEVICE_ADDRESS, endpoint_number, endpoint.packet_bytes, address, length);
+    let mut stream = controller.start_isoc_out(device_address, endpoint_number, endpoint.packet_bytes, address, length);
 
     println!("Playing {length} byte(s); press F12 to stop early.");
     let start_ticks = interrupts::ticks();
@@ -2001,7 +2002,7 @@ fn usb_play_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
     // Courteous teardown: quiesce the streaming interface back to its
     // zero-bandwidth alternate setting. A failure here isn't reported --
     // the stream itself already finished or was aborted either way.
-    let _ = controller.set_interface(DEVICE_ADDRESS, 8, endpoint.interface_number, 0);
+    let _ = controller.set_interface(device_address, 8, endpoint.interface_number, 0);
 
     let elapsed_ms = interrupts::ticks().wrapping_sub(start_ticks) * 10; // 100 Hz PIT
     if aborted {
@@ -2024,10 +2025,11 @@ fn usb_play_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
 /// resampling/reformatting -- the same expectation every other audio
 /// backend here already has for playback.
 fn usb_capture_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
-    const DEVICE_ADDRESS: u8 = 1; // matches uhci::find_uac_device's own fixed address
-
-    let found = uhci::find_uac_device().and_then(|(controller, uac)| Some((controller, uac.capture?)));
-    let Some((controller, endpoint)) = found else {
+    // The address `find_uac_device` just assigned from the shared allocator
+    // (`uhci::allocate_device_address`); it changes on every discovery.
+    let found = uhci::find_uac_device()
+        .and_then(|(controller, uac)| Some((controller, uac.address, uac.capture?)));
+    let Some((controller, device_address, endpoint)) = found else {
         println!("No USB Audio Class capture device found (needs PCM,");
         println!("16-bit, a fixed rate divisible by 1000, and a");
         println!("Synchronous/Adaptive isochronous IN endpoint).");
@@ -2045,7 +2047,7 @@ fn usb_capture_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
 
     let endpoint_number = endpoint.endpoint_address & 0x0f;
     let mut stream =
-        controller.start_isoc_in(DEVICE_ADDRESS, endpoint_number, endpoint.packet_bytes, address, capacity as usize);
+        controller.start_isoc_in(device_address, endpoint_number, endpoint.packet_bytes, address, capacity as usize);
 
     println!("Capturing up to {capacity} byte(s); press F12 to stop early.");
     let start_ticks = interrupts::ticks();
@@ -2064,7 +2066,7 @@ fn usb_capture_command(info: &BootInfo, device: disk::Device, name: &[u8]) {
     // Courteous teardown: quiesce the streaming interface back to its
     // zero-bandwidth alternate setting. A failure here isn't reported --
     // the stream itself already finished or was aborted either way.
-    let _ = controller.set_interface(DEVICE_ADDRESS, 8, endpoint.interface_number, 0);
+    let _ = controller.set_interface(device_address, 8, endpoint.interface_number, 0);
 
     let elapsed_ms = interrupts::ticks().wrapping_sub(start_ticks) * 10; // 100 Hz PIT
     let received = stream.received_bytes();
