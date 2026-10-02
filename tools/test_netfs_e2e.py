@@ -242,6 +242,19 @@ def main(nic_model: str) -> None:
                 raise SystemExit(f"alpha's received file has wrong contents:\n{result.decode('utf-8', 'replace')}")
             print("PASS: remote PUT via 'copy disk1 NAME HOST:disk2' works, checksum verified.")
 
+            # The `diskN/NAME` source and `HOST:diskN/NEWNAME` destination
+            # spelling (new name inline) over NETFS, and local copy errors.
+            result = run_command("beta", "copy disk1/reply.txt alpha1:disk2/slash.txt", 15)
+            if b"Copied" not in result:
+                raise SystemExit(f"beta's 'copy disk1/NAME HOST:diskN/NEW' failed:\n{result.decode('utf-8', 'replace')}")
+            result = run_command("alpha", "cat disk2 slash.txt")
+            if b"hello-from-beta" not in result:
+                raise SystemExit(f"alpha's slash-PUT file has wrong contents:\n{result.decode('utf-8', 'replace')}")
+            result = run_command("beta", "copy disk1/reply.txt disk2/a.txt b.txt")
+            if b"once" not in result:
+                raise SystemExit(f"two new names were not rejected:\n{result.decode('utf-8', 'replace')}")
+            print("PASS: 'copy disk1/NAME HOST:diskN/NEW' sends under the inline new name.")
+
             # `tape load HOST NAME` fetches straight into the tape buffer.
             result = run_command("alpha", "tape load beta1 reply.txt", 15)
             if b"Loaded" not in result:

@@ -804,7 +804,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 println!("Interrupts: ticks uptime irqstat pmem palloc pfree");
                 println!("Hardware: io|mmio r8|r16|r32 ADDR, w8|w16|w32 ADDR VAL; pci read|write B:D.F");
                 println!(
-                    "Disk: diskinfo/readsector/format/ls/cat/write/rm [diskN], copy SRC NAME DST"
+                    "Disk: diskinfo/readsector/format/ls/cat/write/rm [diskN], copy SRC DST"
                 );
                 println!(
                     "      (disk1 is the boot disk, N may be omitted; disk2, disk3... are extras;"
@@ -994,8 +994,9 @@ fn help_topic(topic: &[u8]) {
             println!("cat [diskN] NAME            print a file");
             println!("write [diskN] NAME TEXT     create a file from printable ASCII");
             println!("rm [diskN] NAME             delete a file");
-            println!("copy SRC NAME DST [NEW]     copy between disks; either side may be a");
-            println!("                            peer: HOST[:diskN]/NAME");
+            println!("copy SRC DST [NEW]          copy a file: disk1/NAME disk2[/NEW]; either");
+            println!("                            side may be a peer HOST[:diskN]/NAME");
+            println!("                            (older: copy SRC_DISK NAME DST [NEW])");
             println!("disk1 is the boot disk; names are lowercase, up to 16 characters.");
         }
         b"hw" => {
@@ -4779,7 +4780,7 @@ fn resolve_peer(word: &[u8]) -> Option<[u8; 6]> {
 /// 1-based disk number on that peer (defaulting to `1`, its own boot disk,
 /// when no `:diskN` suffix is given) -- the shared building block behind
 /// every NETFS-backed command (`copy`, `tape load`, `tape save`, and `tape
-/// run`'s `@HOST[:diskN]/NAME` argument source, see `parse_remote_token`).
+/// run`'s `@HOST[:diskN]/NAME` argument source, see `copy_command`).
 /// `HOST` must resolve via `resolve_peer`; an unknown host or malformed
 /// `:diskN` suffix is never guessed at, only rejected. The disk number
 /// itself is deliberately not checked against any locally-known list --
@@ -4803,22 +4804,6 @@ fn parse_remote_host_token(word: &[u8]) -> Option<([u8; 6], u8)> {
     };
     let peer = resolve_peer(host_word)?;
     Some((peer, remote_disk_number))
-}
-
-/// Parses `HOST[:diskN]/NAME`, all one token -- the form `copy`'s remote
-/// endpoints use (see `take_source_endpoint`/`take_destination_endpoint`),
-/// combining a peer reference with a file name the same way `tape run`'s
-/// existing `@diskN/NAME` argument source already combines a local disk
-/// selector with one. A literal `/` is unambiguous as the separator for
-/// the same reason it already is there: FOSFS names can never contain one.
-fn parse_remote_token(word: &[u8]) -> Option<([u8; 6], u8, &[u8])> {
-    let slash = word.iter().position(|&byte| byte == b'/')?;
-    let (head, name) = (&word[..slash], &word[slash + 1..]);
-    if name.is_empty() {
-        return None;
-    }
-    let (peer, remote_disk_number) = parse_remote_host_token(head)?;
-    Some((peer, remote_disk_number, name))
 }
 
 fn print_peers() {
@@ -8544,7 +8529,9 @@ fn remove_command(info: &BootInfo, arguments: &[u8]) {
     }
 }
 
-/// `copy SRC_DISK NAME DST_DISK [NEW_NAME]`. Unlike every other FOSFS
+/// `copy SRC_DISK NAME DST_DISK [NEW_NAME]` or, equivalently, `copy
+/// diskN/NAME DST_DISK[/NEW_NAME]` (the `diskN/NAME` spelling every other
+/// disk command takes). Unlike every other FOSFS
 /// command, both disks here must be spelled out explicitly (even `disk1`)
 /// rather than one side defaulting to the boot disk: with two disks
 /// genuinely in play, a silent default would be ambiguous about which side
@@ -8564,58 +8551,81 @@ fn remove_command(info: &BootInfo, arguments: &[u8]) {
 /// for why that is safe.
 #[inline(never)]
 fn copy_command(info: &BootInfo, arguments: &[u8]) {
+    const USAGE: [&str; 3] = [
+        "Usage: copy SRC DST [NEW_NAME]   SRC: diskN/NAME or HOST[:diskN]/NAME",
+        "       DST: diskN[/NAME] or HOST[:diskN][/NAME]",
+        "       (older form: copy SRC_DISK NAME DST [NEW_NAME])",
+    ];
+    let usage = || USAGE.iter().for_each(|line| println!("{line}"));
     let (first, remainder) = take_word(arguments);
-    if first.contains(&b'/') {
-        let Some((peer, remote_disk_number, name)) = parse_remote_token(first) else {
-            println!("Usage: copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]");
+    // The source is either one `diskN/NAME` / `HOST[:diskN]/NAME` word or,
+    // in the older spelling, `SRC_DISK NAME` as two words.
+    let (source, name, remainder) = if let Some(slash) = first.iter().position(|&b| b == b'/') {
+        let (head, name) = (&first[..slash], &first[slash + 1..]);
+        if name.is_empty() {
+            usage();
+            return;
+        }
+        if let Some(device) = strip_disk_selector(head) {
+            (CopyDestination::Local(device), name, remainder)
+        } else if let Some((peer, remote_disk_number)) = parse_remote_host_token(head) {
+            (CopyDestination::Remote(peer, remote_disk_number), name, remainder)
+        } else {
+            println!("Unknown source: SRC must be an attached disk (e.g. disk1/NAME)");
+            println!("or a discovered HOST[:diskN]/NAME.");
+            return;
+        }
+    } else {
+        let (name, remainder) = take_word(remainder);
+        let Some(device) = strip_disk_selector(first) else {
+            usage();
+            println!("SRC_DISK must name an attached disk (e.g. disk1).");
             return;
         };
-        let (destination_word, remainder) = take_word(remainder);
-        let (new_name, remainder) = take_word(remainder);
-        if destination_word.is_empty() || !remainder.is_empty() {
-            println!("Usage: copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]");
-            return;
-        }
-        let destination_name = if new_name.is_empty() { name } else { new_name };
-        match parse_copy_destination(destination_word) {
-            Some(CopyDestination::Local(destination)) => {
-                copy_from_remote(info, peer, remote_disk_number, name, destination, destination_name);
-            }
-            Some(CopyDestination::Remote(..)) => {
-                println!("copy can't move a file directly between two remote hosts;");
-                println!("copy through a local disk in two steps instead.");
-            }
-            None => {
-                println!("Usage: copy HOST[:diskN]/NAME DST_DISK [NEW_NAME]; DST_DISK must");
-                println!("name an attached disk (e.g. disk2).");
-            }
-        }
-        return;
-    }
-    let (name, remainder) = take_word(remainder);
+        (CopyDestination::Local(device), name, remainder)
+    };
     let (destination_word, remainder) = take_word(remainder);
     let (new_name, remainder) = take_word(remainder);
     if name.is_empty() || destination_word.is_empty() || !remainder.is_empty() {
-        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]");
-        println!("(SRC_DISK/DST_DISK may also be a discovered HOST[:diskN])");
+        usage();
         return;
     }
-    let Some(source) = strip_disk_selector(first) else {
-        println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; SRC_DISK must name");
-        println!("an attached disk (e.g. disk1).");
+    // `DST/NAME` carries the new name itself; a separate NEW_NAME word too
+    // would be two answers to one question.
+    let (destination_word, inline_name) =
+        match destination_word.iter().position(|&b| b == b'/') {
+            Some(slash) => (&destination_word[..slash], &destination_word[slash + 1..]),
+            None => (destination_word, &[][..]),
+        };
+    if !inline_name.is_empty() && !new_name.is_empty() {
+        println!("Give the new name once: either DST/NAME or a NEW_NAME word.");
+        return;
+    }
+    let destination_name = if !inline_name.is_empty() {
+        inline_name
+    } else if !new_name.is_empty() {
+        new_name
+    } else {
+        name
+    };
+    let Some(destination) = parse_copy_destination(destination_word) else {
+        usage();
+        println!("DST must name an attached disk or a discovered HOST[:diskN].");
         return;
     };
-    let destination_name = if new_name.is_empty() { name } else { new_name };
-    match parse_copy_destination(destination_word) {
-        Some(CopyDestination::Local(destination)) => {
+    match (source, destination) {
+        (CopyDestination::Local(source), CopyDestination::Local(destination)) => {
             copy_file(info, source, name, destination, destination_name);
         }
-        Some(CopyDestination::Remote(peer, remote_disk_number)) => {
+        (CopyDestination::Local(source), CopyDestination::Remote(peer, remote_disk_number)) => {
             copy_to_remote(info, source, name, peer, remote_disk_number, destination_name);
         }
-        None => {
-            println!("Usage: copy SRC_DISK NAME DST_DISK [NEW_NAME]; DST_DISK must name");
-            println!("an attached disk or a discovered HOST[:diskN].");
+        (CopyDestination::Remote(peer, remote_disk_number), CopyDestination::Local(destination)) => {
+            copy_from_remote(info, peer, remote_disk_number, name, destination, destination_name);
+        }
+        (CopyDestination::Remote(..), CopyDestination::Remote(..)) => {
+            println!("copy can't move a file directly between two remote hosts;");
+            println!("copy through a local disk in two steps instead.");
         }
     }
 }

@@ -448,6 +448,10 @@ def main() -> None:
                         b"write note2.txt hello-from-disk1\r",
                         b"copy disk1 note2.txt disk2 note2-copy.txt\r",
                         b"cat disk2 note2-copy.txt\r",
+                        # The diskN/NAME spelling, with the new name in DST.
+                        b"copy disk1/note2.txt disk2/note2-slash.txt\r",
+                        b"cat disk2 note2-slash.txt\r",
+                        b"rm disk2 note2-slash.txt\r",
                         b"rm disk2 note2-copy.txt\r",
                         b"rm note2.txt\r",
                         # Round-trip the much larger primes.bin (backed up
@@ -596,6 +600,8 @@ def main() -> None:
                         b"Note: this reused the shared tape buffer, so the previously",
                         b"loaded tape is gone; 'tape load' again before 'tape run'.",
                         b"Copied 16 byte(s) from disk1 'note2.txt' to disk2 'note2-copy.txt'.",
+                        b"hello-from-disk1",
+                        b"Copied 16 byte(s) from disk1 'note2.txt' to disk2 'note2-slash.txt'.",
                         b"hello-from-disk1",
                         b"Usage: tape run [ARGS...] or tape run router @CONFIG_FILE",
                         b"(or @diskN/CONFIG_FILE or @HOST[:diskN]/CONFIG_FILE)",

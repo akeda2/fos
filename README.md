@@ -207,7 +207,7 @@ the real-mode code that printed it has no notion of that ring at all.
 | `cat [diskN] NAME` | Displays a FOSFS text file from the boot disk (`disk1`, default) or an attached secondary disk. |
 | `write [diskN] NAME TEXT` | Creates or replaces a flat FOSFS file on the boot disk (`disk1`, default) or an attached secondary disk. Names use up to 16 lowercase letters, digits, `.`, `_`, or `-`; a full directory or data region is reported distinctly. |
 | `rm [diskN] NAME` | Removes a FOSFS file entry from the boot disk (`disk1`, default) or an attached secondary disk. |
-| `copy SRC_DISK NAME DST_DISK [NEW_NAME]` | Copies one FOSFS file's raw bytes from `SRC_DISK` to `DST_DISK` (both must be spelled out explicitly, e.g. `disk1`/`disk2` — unlike every other disk command, neither side defaults), optionally renaming it to `NEW_NAME`. Either side may instead be a discovered NETFS peer: `copy HOST[:diskN]/NAME DST_DISK` (remote source) or `copy SRC_DISK NAME HOST[:diskN]` (remote destination) — see "NETFS: copying files to/from a discovered peer" below. Uses the same shared tape staging buffer as `tape load disk`/`tape load net`, so any previously loaded tape is invalidated by a copy; the shell reports this when it happens. |
+| `copy SRC_DISK NAME DST_DISK [NEW_NAME]` | Copies one FOSFS file's raw bytes from `SRC_DISK` to `DST_DISK` (also spelled `copy disk1/NAME disk2[/NEW_NAME]`, like every other disk command's `diskN/NAME`; both must be spelled out explicitly, e.g. `disk1`/`disk2` — unlike every other disk command, neither side defaults), optionally renaming it to `NEW_NAME`. Either side may instead be a discovered NETFS peer: `copy HOST[:diskN]/NAME DST_DISK` (remote source) or `copy SRC_DISK NAME HOST[:diskN]` (remote destination) — see "NETFS: copying files to/from a discovered peer" below. Uses the same shared tape staging buffer as `tape load disk`/`tape load net`, so any previously loaded tape is invalidated by a copy; the shell reports this when it happens. |
 | `start` file | Optional boot-time command script, read from `disk1` or, if absent there, `disk2`. Each non-empty, non-`#` line is dispatched exactly like a shell command after disk/NIC initialization and before the automatic `term net` wait. |
 | `NAME [ARGS]` | Not a builtin: runs `NAME.sh` as a script, or loads and runs `NAME.bin` as a tape with `ARGS` as its startup arguments (see "Running scripts and tapes by name"). |
 | `start` | Reruns the boot-time `start` script on demand (same disk1-then-disk2 lookup), e.g. after F12-ing out of a tape it launched, without needing a reset. Reports plainly if no `start` file is found on either disk. |
@@ -351,7 +351,7 @@ the tapes/data disk the build produces, not for booting -- a secondary disk
 is never GPT-formatted, partitioned, or written to by `tools/build_image.py`.
 
 `copy SRC_DISK NAME DST_DISK [NEW_NAME]` moves one file's bytes directly
-between two disks (e.g. `copy disk1 router.cfg disk2`) without a host round
+between two disks (e.g. `copy disk1 router.cfg disk2`, or `copy disk1/router.cfg disk2/r2.cfg`) without a host round
 trip. Unlike every other disk command above, both sides must be spelled out
 explicitly -- with two disks genuinely in play, letting either one default
 would be ambiguous about which disk it actually meant. It stages the whole
