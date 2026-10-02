@@ -220,21 +220,23 @@ forward tcp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]
 forward udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]
 ```
 
-NIC 1 is always the external side. A rule DNATs packets addressed to its
+The active uplink (NIC 1 for bare `dhcp`, otherwise the `dhcp N` or `default N`
+NIC) is the external side. A rule DNATs packets addressed to its
 public address and named TCP/UDP port to the configured host, and rewrites
-that host's matching replies back to the NIC 1 address and external port.
+that host's matching replies back to the uplink's address and external port.
 Omitting `INTERNAL_PORT` preserves the external port. The router accepts at
 most 16 rules, rejects duplicate protocol/external-port pairs and ambiguous
 duplicate internal endpoints, and requires each target to be a unicast
-address on a configured non-primary subnet. Rules are printed at startup.
+address on a configured non-uplink subnet (NIC 1 is never accepted as a
+target, even when the uplink is another NIC). Rules are printed at startup.
 Unsolicited traffic that matches neither a static rule nor an existing
 outbound-NAT flow remains dropped.
 
 DHCP requires the same bounded polling discipline as the router: it uses only
 the indexed NIC callbacks, checks `should_abort`, retries for a finite timeout,
 and reports whether the lease supplied an address, netmask, and router. If no
-explicit default suffix is supplied, a DHCP router option becomes NIC 1's
-default. At least two interfaces are required, NIC selections must be unique
+explicit default suffix is supplied, a DHCP router option becomes the default
+route of the DHCP uplink (the active one, when several are declared). At least two interfaces are required, NIC selections must be unique
 and exist, and an explicit gateway must be on the selected interface's
 subnet. Packets addressed to the router itself are answered with an ordinary
 ICMP echo reply when they are an echo request (so pinging a configured
@@ -244,7 +246,7 @@ networks without a default, TTL 1, and malformed/checksum-invalid IPv4
 packets are also dropped. When enabled, the router performs TCP/UDP source NAT and ICMP echo identifier
 translation using a
 4 MiB physical-memory-backed table when traffic leaves a non-primary NIC
-through NIC 1, and reverses that mapping for replies. This provides tens of
+through the active uplink, and reverses that mapping for replies. This provides tens of
 thousands of flow slots and lets downstream DHCP clients reach hosts on the
 upstream LAN without requiring those hosts to learn a route back to the
 downstream subnet. If allocation is unavailable, it falls back to 32 slots.
@@ -271,7 +273,7 @@ The router can also provide a small DHCP server with the optional
 tape run router dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24
 ```
 
-Every configured interface except NIC 1 serves clients. Each pool is derived
+Every configured interface except a DHCP uplink serves clients. Each pool is derived
 from that interface's subnet and excludes the network address, broadcast
 address, and router address. The router allocates one in-memory lease slot for
 every usable address in the subnet, using the tape allocator rather than a
@@ -283,7 +285,7 @@ and the server handles the normal DISCOVER/OFFER and REQUEST/ACK exchange
 plus DECLINE and RELEASE. Replies include subnet mask, router, broadcast
 address, server identifier, lease time, and renewal timers.
 
-If NIC 1 is configured with `dhcp`, DNS server addresses from the upstream
+If an uplink is configured with `dhcp`, DNS server addresses from the upstream
 lease are copied into downstream DHCP option 6. A `dns SERVER [SERVER]`
 directive can override those values when the upstream interface is static or
 when a specific external resolver should be advertised:

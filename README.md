@@ -1296,20 +1296,21 @@ source addresses; `nat` may be written explicitly to document or re-enable
 masquerading.
 
 For permanent inbound services, configure a static rule before interface
-entries: `forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]`. NIC 1
-is the public side; matching inbound TCP/UDP traffic is DNATed to the
-configured host, and matching replies are source-translated back to NIC 1's
+entries: `forward tcp|udp EXTERNAL_PORT INTERNAL_IP [INTERNAL_PORT]`. The active
+uplink (NIC 1 for bare `dhcp`, else the `dhcp N`/`default N` NIC) is the public
+side; matching inbound TCP/UDP traffic is DNATed to the
+configured host, and matching replies are source-translated back to the uplink's
 address and external port. Omitting the internal port keeps the same port.
 The fixed no-heap list holds 16 rules, prints each at startup, rejects
 duplicate external ports or ambiguous internal endpoints per protocol, and
-only permits targets on configured non-primary subnets. Unrelated unsolicited
+only permits targets on configured non-uplink subnets (never NIC 1). Unrelated unsolicited
 traffic is still dropped.
 
 If DHCP supplies a router option and no explicit `default` suffix is present,
-that router becomes NIC 1's default route. At least two interfaces (the DHCP
+that router becomes the DHCP uplink's default route. At least two interfaces (the DHCP
 interface counts as one) are required; static NICs must be unique and present,
 and a default gateway must be on its selected interface's subnet. When NAT is
-enabled, TCP/UDP traffic leaving a non-primary NIC through NIC 1 is source-NATed using a
+enabled, TCP/UDP traffic leaving a non-uplink NIC through the active uplink is source-NATed using a
 4 MiB physical-memory-backed table, then reverse-translated for replies; this
 provides tens of thousands of flow slots and means upstream hosts do not need
 an explicit route back to the downstream DHCP subnet. If that allocation is
@@ -1320,7 +1321,7 @@ Build it with `make tape-router` and run `make test-tape-router` for the
 two-segment QEMU forwarding test.
 
 The optional `dhcp-server` word enables a DHCP server on every configured
-interface except NIC 1. Its pool is derived automatically from each
+interface except a DHCP uplink. Its pool is derived automatically from each
 interface's subnet: network, broadcast, and router addresses are excluded,
 and the router allocates one in-memory lease slot for every usable address in
 the subnet rather than imposing a small fixed lease count. Leases last seven
@@ -1334,7 +1335,7 @@ identifier, and renewal timers:
 tape run router dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24
 ```
 
-DNS option 6 is also advertised when available. With `dhcp` on NIC 1, DNS
+DNS option 6 is also advertised when available. With a DHCP uplink, DNS
 addresses received from the upstream DHCP server are propagated to downstream
 clients. A `dns SERVER [SERVER]` directive in the router configuration
 overrides those learned values, which is useful when the upstream interface is

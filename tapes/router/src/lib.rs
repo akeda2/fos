@@ -242,7 +242,7 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
 /// echo target used to verify each DHCP uplink after its gateway answers ARP.
 ///
 /// `dhcp-server` enables the built-in DHCP server on every configured
-/// interface except NIC 1. Its pool is derived from each interface subnet.
+/// interface except the DHCP uplinks (NIC 1 only when `dhcp` is bare). Its pool is derived from each interface subnet.
 ///
 /// `dhcp-lease-file NAME` enables optional persistence for the DHCP server's
 /// bound MAC-to-address assignments through the tape filesystem callbacks.
@@ -257,7 +257,7 @@ fn valid_netmask(mask: Ipv4Address) -> bool {
 /// `dns SERVER [SERVER]` overrides DNS servers learned from upstream DHCP.
 /// Up to two IPv4 DNS server addresses may be supplied.
 ///
-/// `forward` statically exposes a TCP or UDP port on NIC 1. Its internal
+/// `forward` statically exposes a TCP or UDP port on the active uplink. Its internal
 /// address must be on a configured non-primary subnet; omitting
 /// `INTERNAL_PORT` preserves `EXTERNAL_PORT`. The bounded rule list rejects
 /// duplicate external ports and ambiguous duplicate internal endpoints.
@@ -584,15 +584,21 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         }
     }
     for forward in forwards[..forward_count].iter().flatten() {
-        // NIC 1 (zero-based `nic == 0`) is the public side even with a static
-        // address, and a DHCP uplink is public too: a forward may only point
-        // at a host behind one of the remaining interfaces.
+        // The public side is whatever carries NAT/forwards: a DHCP uplink,
+        // else the NIC named by `default`, else legacy NIC 1 (`nic == 0`).
+        // A forward may only point at a host behind one of the others.
+        let is_external = |nic: u32| {
+            if dhcp_uplink_count != 0 {
+                dhcp_uplinks[..dhcp_uplink_count]
+                    .iter()
+                    .flatten()
+                    .any(|uplink| *uplink == nic)
+            } else {
+                nic == default_route.map_or(0, |route| route.nic)
+            }
+        };
         if !configs[..interface_count].iter().flatten().any(|config| {
-            config.nic != 0
-                && !dhcp_uplinks[..dhcp_uplink_count]
-                .iter()
-                .flatten()
-                .any(|uplink| *uplink == config.nic)
+            !is_external(config.nic)
                 && same_subnet(config.address, config.netmask, forward.internal_address)
         }) {
             return Err(ConfigError::ForwardTargetNotInternal);
@@ -1004,6 +1010,18 @@ mod tests {
             parse_config(b"forward udp 53 10.0.1.2 1 10.0.1.1/24 2 10.0.2.1/24"),
             Err(ConfigError::ForwardTargetNotInternal)
         );
+        // With the uplink on NIC 4, NIC 1 is an ordinary downstream port.
+        assert!(parse_config(
+            b"forward tcp 80 10.0.1.2 dhcp 4 dhcp-server 1 10.0.1.1/24 2 10.0.2.1/24"
+        )
+        .is_ok());
+        let static_uplink = b"1 10.0.1.1/24 4 10.0.4.1/24 default 4 10.0.4.254";
+        let mut ok = b"forward tcp 80 10.0.1.2 ".to_vec();
+        ok.extend_from_slice(static_uplink);
+        assert!(parse_config(&ok).is_ok());
+        let mut bad = b"forward tcp 80 10.0.4.2 ".to_vec();
+        bad.extend_from_slice(static_uplink);
+        assert_eq!(parse_config(&bad), Err(ConfigError::ForwardTargetNotInternal));
     }
 
     #[test]

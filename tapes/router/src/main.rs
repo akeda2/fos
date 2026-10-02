@@ -26,7 +26,7 @@
 //! ARP plus ICMP echo, failing over after three missed cycles and failing back
 //! to the highest-priority recovered lease. A trailing `default NIC GATEWAY`
 //! selects a static egress when no DHCP uplink is used.
-//! `dhcp-server` serves every configured interface except NIC 1, deriving a
+//! `dhcp-server` serves every configured interface except the DHCP uplinks, deriving a
 //! pool from each subnet and allocating one in-memory lease slot per usable
 //! address for this run.
 //! NAT is enabled by default; `no-nat` disables source translation for
@@ -957,7 +957,7 @@ fn print_startup(
         print_ip(putc, forward.internal_address);
         print_bytes(putc, b":");
         print_u32(putc, u32::from(forward.internal_port));
-        print_bytes(putc, b" (NIC 1 external)\n");
+        print_bytes(putc, b" (uplink external)\n");
     }
     print_bytes(
         putc,
