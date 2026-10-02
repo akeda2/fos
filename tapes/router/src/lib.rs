@@ -584,8 +584,12 @@ pub fn parse_config(input: &[u8]) -> core::result::Result<RouterConfig, ConfigEr
         }
     }
     for forward in forwards[..forward_count].iter().flatten() {
+        // NIC 1 (zero-based `nic == 0`) is the public side even with a static
+        // address, and a DHCP uplink is public too: a forward may only point
+        // at a host behind one of the remaining interfaces.
         if !configs[..interface_count].iter().flatten().any(|config| {
-            !dhcp_uplinks[..dhcp_uplink_count]
+            config.nic != 0
+                && !dhcp_uplinks[..dhcp_uplink_count]
                 .iter()
                 .flatten()
                 .any(|uplink| *uplink == config.nic)
@@ -646,6 +650,12 @@ pub fn longest_match(
     selected
 }
 
+/// Returns the first healthy DHCP uplink index, preserving declaration order.
+#[allow(dead_code)]
+pub fn select_healthy_uplink(healthy: &[bool; MAX_INTERFACES], count: usize) -> Option<usize> {
+    healthy[..count].iter().position(|healthy| *healthy)
+}
+
 /// Selects a directly connected route, or the configured default route.
 ///
 /// The returned tuple is the interface-array index and the IPv4 next hop.
@@ -661,11 +671,6 @@ pub fn route_next_hop(
         return Some((index, destination));
     }
 
-    /// Returns the first healthy DHCP uplink index, preserving declaration order.
-    #[allow(dead_code)]
-    pub fn select_healthy_uplink(healthy: &[bool; MAX_INTERFACES], count: usize) -> Option<usize> {
-        healthy[..count].iter().position(|healthy| *healthy)
-    }
     let route = default_route?;
     let index = configs[..count]
         .iter()
@@ -914,14 +919,14 @@ mod tests {
     #[test]
     fn parses_optional_dhcp_lease_file() {
         let config =
-            parse_config(b"router dhcp-server dhcp-lease-file DHCP.LEASES 1 10.0.1.1/24 2 10.0.2.1/24")
+            parse_config(b"router dhcp-server dhcp-lease-file dhcp.leases 1 10.0.1.1/24 2 10.0.2.1/24")
                 .unwrap();
         assert_eq!(
             config.dhcp_lease_file.unwrap().as_bytes(),
-            b"DHCP.LEASES"
+            b"dhcp.leases"
         );
         assert_eq!(
-            parse_config(b"router dhcp-lease-file DHCP.LEASES 1 10.0.1.1/24 2 10.0.2.1/24"),
+            parse_config(b"router dhcp-lease-file dhcp.leases 1 10.0.1.1/24 2 10.0.2.1/24"),
             Err(ConfigError::LeaseFileRequiresDhcpServer)
         );
         assert_eq!(
