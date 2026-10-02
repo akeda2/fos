@@ -21,7 +21,8 @@
 .set COM1, 0x3f8
 .set DISK_REQUEST, 0x5400
 # DISK_REQUEST holds the protected-mode call arguments and a 16-byte EDD
-# packet. Its fields are: direction byte at +0 (0=read, 1=write, 2=probe),
+# packet. Its fields are: direction byte at +0 (0=read, 1=write, 2=probe,
+# 3=drive info for `diskprobe`, whose 8 result bytes are staged at +48..+55),
 # status byte at +1, BIOS drive at +2, sector count byte at +3 (1..=126,
 # ignored by the probe direction), LBA low/high dwords at +4/+8, buffer
 # physical address at +12, and the DAP (direction 0/1) or the AH=48h "get
@@ -733,7 +734,7 @@ bios_disk_io:
     pushl %edi
     movl %esp, DISK_SAVED_ESP
     movl 8(%ebp), %eax
-    cmpl $2, %eax
+    cmpl $3, %eax
     ja bios_disk_invalid
     movl %eax, DISK_REQUEST
     movl 12(%ebp), %eax
@@ -757,8 +758,14 @@ bios_disk_io:
     movl 24(%ebp), %eax
     testl $0xffffff00, %eax
     jnz bios_disk_invalid
+    # Operation 3 (drive info, `diskprobe`) is the one request allowed to
+    # name a floppy number (0x00/0x01): finding out which kind of drive a
+    # USB stick was presented as is its whole purpose.
+    cmpl $3, DISK_REQUEST
+    je bios_disk_drive_ok
     cmpl $0x80, %eax
     jb bios_disk_invalid
+bios_disk_drive_ok:
     movb %al, DISK_REQUEST + 2
     # A 6th cdecl argument lets the caller (kernel/src/disk.rs) request up
     # to 126 contiguous sectors in one BIOS call instead of always exactly
@@ -833,6 +840,8 @@ bios_disk_real:
     sti
     cmpb $2, DISK_REQUEST
     je bios_disk_probe
+    cmpb $3, DISK_REQUEST
+    je bios_disk_driveinfo
     cmpb $0, DISK_REQUEST
     jne bios_disk_write
     movb $0x42, %ah
@@ -883,6 +892,50 @@ bios_disk_probe:
     movw %ax, %es
     movw DISK_REQUEST + 42, %di
     movw $(DISK_REQUEST + 32), %si
+    movw $8, %cx
+    cld
+    rep movsb
+    movb $0, DISK_REQUEST + 1
+    jmp bios_disk_return_to_pm
+bios_disk_driveinfo:
+    # Operation 3: describe whatever the BIOS says about drive DL, without
+    # reading or writing it. INT 13h AH=08h ("get drive parameters") works
+    # for floppies and hard disks alike; AH=41h tells whether the AH=42h/43h
+    # extended calls this kernel needs exist for the drive. Eight result
+    # bytes are staged at DISK_REQUEST+48 and copied to the caller's buffer:
+    #   0 AH status of AH=08h     1 carry flag of AH=08h (1 = failed)
+    #   2 DL = drive count        3 DH = highest head number
+    #   4-5 CX = cylinder/sector  6 BL = drive type (floppies)
+    #   7 1 if AH=41h reports extensions for this drive
+    # AH=08h is documented to trash ES:DI, so ES:DI is zeroed first (some
+    # BIOSes misbehave otherwise) and rebuilt from the +42/+44 stash after.
+    xorw %di, %di
+    movw %di, %es
+    movb $0x08, %ah
+    int $0x13
+    movb %ah, DISK_REQUEST + 48
+    movb $0, DISK_REQUEST + 49
+    jnc 1f
+    movb $1, DISK_REQUEST + 49
+1:
+    movb %dl, DISK_REQUEST + 50
+    movb %dh, DISK_REQUEST + 51
+    movw %cx, DISK_REQUEST + 52
+    movb %bl, DISK_REQUEST + 54
+    movb DISK_REQUEST + 2, %dl
+    movw $0x55aa, %bx
+    movb $0x41, %ah
+    int $0x13
+    movb $0, DISK_REQUEST + 55
+    jc 2f
+    cmpw $0xaa55, %bx
+    jne 2f
+    movb $1, DISK_REQUEST + 55
+2:
+    movw DISK_REQUEST + 44, %ax
+    movw %ax, %es
+    movw DISK_REQUEST + 42, %di
+    movw $(DISK_REQUEST + 48), %si
     movw $8, %cx
     cld
     rep movsb

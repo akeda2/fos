@@ -697,6 +697,46 @@ fn probe_drive(info: &BootInfo, drive_number: u8) -> Option<u64> {
     Some(get_u64(sector, 0))
 }
 
+/// What the BIOS says about one drive number, from `INT 13h AH=08h`/`AH=41h`
+/// (trampoline operation 3). Read-only: nothing is read from or written to
+/// the drive. `status`/`failed` are `AH=08h`'s result; `extensions` is
+/// whether the AH=42h/43h calls this kernel needs exist for the drive.
+pub struct DriveReport {
+    pub status: u8,
+    pub failed: bool,
+    pub drive_count: u8,
+    pub max_head: u8,
+    pub cylinder_sector: u16,
+    pub drive_type: u8,
+    pub extensions: bool,
+}
+
+/// Asks the BIOS about `drive_number` (any value, floppies included). This
+/// is how to find out which drive number a USB stick was presented as:
+/// BIOSes choose floppy or hard-disk emulation from the stick's contents,
+/// and [`discover_secondary_disks`] only looks at 0x81 and up.
+pub fn report_bios_drive(info: &BootInfo, drive_number: u8) -> Option<DriveReport> {
+    call_trampoline(
+        info,
+        3,
+        0,
+        drive_number,
+        core::ptr::addr_of!(SECTOR) as u32,
+        1,
+    )
+    .ok()?;
+    let sector = unsafe { &*core::ptr::addr_of!(SECTOR.0) };
+    Some(DriveReport {
+        status: sector[0],
+        failed: sector[1] != 0,
+        drive_count: sector[2],
+        max_head: sector[3],
+        cylinder_sector: u16::from_le_bytes([sector[4], sector[5]]),
+        drive_type: sector[6],
+        extensions: sector[7] != 0,
+    })
+}
+
 /// Discovers the FOSFS partition from the primary GPT, falling back to the
 /// loader-provided geometry if an older image has no valid GPT.
 pub fn initialize(info: &BootInfo) {

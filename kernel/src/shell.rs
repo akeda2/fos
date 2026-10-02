@@ -862,6 +862,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 print_disk_info(info, device);
             }
         }
+        b"diskprobe" if no_arguments(arguments) => disk_probe_command(info),
         b"ticks" if no_arguments(arguments) => print_ticks(),
         b"uptime" if no_arguments(arguments) => print_uptime(),
         b"irqstat" if no_arguments(arguments) => print_irq_stats(),
@@ -994,6 +995,7 @@ fn help_topic(topic: &[u8]) {
             println!("cat [diskN] NAME            print a file");
             println!("write [diskN] NAME TEXT     create a file from printable ASCII");
             println!("rm [diskN] NAME             delete a file");
+            println!("diskprobe                   show how the BIOS presents each drive");
             println!("copy SRC DST [NEW]          copy a file: disk1/NAME disk2[/NEW]; either");
             println!("                            side may be a peer HOST[:diskN]/NAME");
             println!("                            (older: copy SRC_DISK NAME DST [NEW])");
@@ -8466,6 +8468,37 @@ fn write_decimal(out: &mut [u8], value: usize) -> usize {
         out[index] = digits[count - 1 - index];
     }
     count
+}
+
+/// `diskprobe`: what the BIOS reports for each floppy and hard-disk drive
+/// number, so an operator can see which number a USB stick was given (BIOSes
+/// pick floppy or hard-disk emulation from the stick's contents; fos only
+/// attaches 0x81 and up, via EDD). Read-only.
+#[inline(never)]
+fn disk_probe_command(info: &BootInfo) {
+    println!("BIOS drives (INT 13h AH=08h/41h); only 0x81+ with EDD become diskN:");
+    for drive in [0x00u8, 0x01, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85] {
+        match disk::report_bios_drive(info, drive) {
+            None => println!("  0x{drive:02x}: no answer from the trampoline"),
+            Some(report) if report.failed => {
+                println!(
+                    "  0x{drive:02x}: absent (AH=0x{:02x}), edd={}",
+                    report.status,
+                    if report.extensions { "yes" } else { "no" }
+                );
+            }
+            Some(report) => {
+                println!(
+                    "  0x{drive:02x}: present, drives={} heads<={} cs=0x{:04x} type={}",
+                    report.drive_count,
+                    report.max_head,
+                    report.cylinder_sector,
+                    report.drive_type
+                );
+                println!("        edd={}", if report.extensions { "yes" } else { "no" });
+            }
+        }
+    }
 }
 
 fn filesystem_result(result: Result<(), disk::Error>, success: &str) {

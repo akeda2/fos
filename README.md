@@ -201,6 +201,7 @@ the real-mode code that printed it has no notion of that ring at all.
 | `palloc` | Allocates one 4 KiB physical frame and prints its base address. |
 | `pfree ADDRESS` | Returns a previously allocated frame to the free pool. |
 | `diskinfo [diskN]` | Shows the total image size and FOSFS partition bounds for the boot disk (`disk1`, the default) or an attached secondary disk. |
+| `diskprobe` | Read-only: asks the BIOS (`INT 13h` AH=08h/41h) about floppy drives `0x00`/`0x01` and hard-disk drives `0x80`-`0x85` and prints what each answers. Only `0x81` and up with EDD become `diskN`, so this shows which drive number a USB stick was given (BIOSes choose floppy or hard-disk emulation from its contents). Needs the matching `boot/stage2.S`: a stale stage two prints "no answer from the trampoline". |
 | `readsector [diskN] LBA` | Read-only hexadecimal/ASCII dump of one 512-byte sector on the boot disk (`disk1`, default) or an attached secondary disk. |
 | `format [diskN]` | Initializes the FOSFS partition/volume on the boot disk (`disk1`, default) or an attached secondary disk, permanently removing its files. |
 | `ls [diskN]` | Lists FOSFS files on the boot disk (`disk1`, default) or an attached secondary disk. |

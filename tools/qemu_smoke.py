@@ -441,6 +441,7 @@ def main() -> None:
                         # and confirm a loaded tape's state is invalidated
                         # since copy_file reuses the same shared scratch
                         # buffer as `tape load disk`/`tape load net`.
+                        b"diskprobe\r",
                         b"tape status\r",
                         b"copy disk2 config.txt disk1\r",
                         b"tape status\r",
@@ -596,6 +597,7 @@ def main() -> None:
                         b"hello-from-disk2",
                         b"Loaded 1000516 byte(s) from 'primes-bak.bin' at 0x100000.",
                         b"'tape run' to execute it.",
+                        b"0x81: present",
                         b"Copied 16 byte(s) from disk2 'config.txt' to disk1 'config.txt'.",
                         b"Note: this reused the shared tape buffer, so the previously",
                         b"loaded tape is gone; 'tape load' again before 'tape run'.",
