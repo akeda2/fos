@@ -432,8 +432,8 @@ device stack rather than simple port I/O (see "Current boundaries").
 `nic` initializes every supported PCI network card it can bring up:
 the Realtek RTL8139, selected 3Com 3C905/B/C variants, Intel e1000
 (82540EM), or an NE2000-compatible clone (`kernel/src/ne2000.rs`, vendor/
-device `0x10ec`/`0x8029`, the Realtek RTL8029AS -- the chip almost every
-plain "NetWare"-branded PCI NE2000 clone actually uses). The first
+device `0x10ec`/`0x8029`, the Realtek RTL8029AS; only exercised under
+QEMU's `ne2k_pci`, not verified on a real card -- see DEFERRED.md). The first
 initialized interface is active by default; `nic list` shows all
 interfaces and `nic use N` selects one for shell commands and the legacy
 single-interface tape callbacks. New tapes can enumerate and use several

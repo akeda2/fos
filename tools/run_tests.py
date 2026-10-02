@@ -80,8 +80,6 @@ E2E_MAKE = [
     "make test-unsafe-memory",
     "make test-nic-watchdog",
     "make test-idle-cpu",
-    "make test-ne2000",
-    "make test-ne2000-net",
     "make test-e1000-net",
     "make test-tape-bridge",
     "make test-tape-nettest",
@@ -138,6 +136,10 @@ KNOWN_FAILING: dict[str, str] = {}
 
 # Timing-sensitive against a finite polling receive ring (tape load pacing).
 FLAKY = {"python3 tapes/test_audio_rtp_opus_send_e2e.py"}
+
+# Not in any group on purpose: `make test-ne2000` and `make test-ne2000-net`
+# (QEMU's ne2k_pci). NE2000 support is set aside (see DEFERRED.md); both still
+# work as make targets.
 
 # Jobs that rewrite or swap build/fos.img, measure host CPU use, or are the
 # boot-critical gate itself: always run alone, even with -j.

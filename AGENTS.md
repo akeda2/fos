@@ -659,8 +659,8 @@ hardware resets. Full detail is in `docs/history/development-notes.md`.
 
 ### NE2000 clones, `nic sniff`, `chat`, discovery and the `tape` loader
 
-`kernel/src/ne2000.rs` (RTL8029AS, `10ec:8029`, the chip on generic "NetWare"
-PCI cards) is the only driver with no host-RAM DMA: packets live in the card's
+`kernel/src/ne2000.rs` (RTL8029AS, `10ec:8029`; QEMU `ne2k_pci` only -- no real
+card was ever verified, see DEFERRED.md) is the only driver with no host-RAM DMA: packets live in the card's
 16 KiB, reached through remote-DMA port I/O (`REG_RSAR`/`REG_RBCR`/`REG_DATA`),
 so it never calls `pmem::allocate_contiguous`. Its receive ring is 8 pages of
 256 bytes, each entry prefixed by a 4-byte header (status, next page,

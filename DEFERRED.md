@@ -246,3 +246,13 @@ Verdict: only UHCI + QEMU `-device usb-kbd` is cheap (about a day) and only
 helps old machines such as the Pentium 4. Anything useful on newer machines is
 an EHCI/xHCI project. The BIOS emulation already provides a keyboard; the gain
 would be avoiding its quirks (no key-up events, some keys ignored). Deferred.
+- NE2000-compatible NICs (`kernel/src/ne2000.rs`). Set aside: there is no
+  working NE2000 card on hand to verify against -- the PCI "NetWare" card
+  that motivated it turned out to be a different, 10 Mbit chip, so the
+  RTL8029AS (`10ec:8029`) support has only ever run against QEMU's `ne2k_pci`.
+  The gigabit drivers (RTL8168, e1000, e1000e, I350) are the focus. The
+  driver stays in the kernel; `make test-ne2000`/`make test-ne2000-net` still
+  work but are left out of `make test-most`/`test-all` (`tools/run_tests.py`),
+  since `test-ne2000-net` fails about 1 run in 8 under heavy CPU load (the
+  card resets on receive overflow by design) and `test-ne2000` hit an
+  unrelated, now fixed, harness race.
