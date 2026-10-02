@@ -140,7 +140,7 @@ def main() -> None:
 
     def parse_audio_status(text: bytes):
         periods = int(re.search(rb"DAC1: (\d+) periods refilled", text).group(1))
-        captured = int(re.search(rb"ADC: (\d+) periods captured; overruns \(ring full\): (\d+)", text).group(1))
+        captured = int(re.search(rb"(\d+) periods captured; overruns \(ring full\): (\d+)", text).group(1))
         overruns = int(re.search(rb"overruns \(ring full\): (\d+)", text).group(1))
         backlog = int(re.search(rb"Capture ring backlog: (\d+) of (\d+) byte", text).group(1))
         capacity = int(re.search(rb"Capture ring backlog: (\d+) of (\d+) byte", text).group(2))
