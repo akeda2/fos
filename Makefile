@@ -101,7 +101,7 @@ help:
 	@echo "  make test       - build the image, then run default-NIC, e1000, dual-e1000, and VGA mode tests"
 	@echo "  make test-most  - 'make test' plus stack guard, page protection, debug mode/KUP, start, scripts, release loops"
 	@echo "  make test-unit  - host-side cargo tests of the tape crates"
-	@echo "  make test-all   - everything: test-most, test-unit and every other QEMU test (slow; prints a summary)"
+	@echo "  make test-all   - everything: test-most, test-unit and every other QEMU test (slow; prints a summary; TEST_JOBS=N runs independent tests in parallel)"
 	@echo "  make test-unsafe-memory - boot the optional unpaged teaching image through the smoke test"
 	@echo "  make test-stack-guard - build a test-only guard-fault image and verify its emergency double-fault stack"
 	@echo "  make test-page-protection - verify kernel text rejects a supervisor write under CR0.WP"
@@ -214,14 +214,18 @@ test: image
 #              script, scripts+settings, release loops
 #   test-unit  host-side cargo tests of the tape crates
 #   test-all   test-most + test-unit + every other QEMU test (slow)
+# TEST_JOBS=N runs independent tests N at a time (see tools/run_tests.py);
+# image-rewriting and boot-critical tests still run alone. Default: serial.
+TEST_JOBS ?= 1
+
 test-most: all
-	python3 tools/run_tests.py most
+	python3 tools/run_tests.py most -j $(TEST_JOBS)
 
 test-unit:
-	python3 tools/run_tests.py unit
+	python3 tools/run_tests.py unit -j $(TEST_JOBS)
 
 test-all: all
-	python3 tools/run_tests.py all
+	python3 tools/run_tests.py all -j $(TEST_JOBS)
 
 test-unsafe-memory: image-unsafe-memory
 	python3 tools/qemu_smoke.py --image $(UNSAFE_MEMORY_IMAGE) --legacy-unsafe-memory

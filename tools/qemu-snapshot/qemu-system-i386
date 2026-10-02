@@ -1,0 +1,12 @@
+#!/bin/sh
+# Test-runner shim (tools/run_tests.py -j N): runs the real QEMU with
+# -snapshot so concurrent tests can boot the same build/fos.img read-only
+# (guest writes go to a per-process temporary overlay and are discarded).
+self_dir=$(cd "$(dirname "$0")" && pwd)
+real=$(PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$self_dir" | paste -sd:) command -v "$(basename "$0")")
+# Only guests that boot the shared build image need it; a test booting its
+# own temporary copy (or another drive) is already isolated.
+case "$*" in
+  *build/fos*) exec "$real" -snapshot "$@" ;;
+  *) exec "$real" "$@" ;;
+esac
