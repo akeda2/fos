@@ -298,7 +298,19 @@ def main() -> None:
             local_start = len(output)
             process.stdin.write(b"dmesg\r")
             process.stdin.flush()
-            wait_for(output, selector, BOOT_MARKER, 10, local_start)
+            # The replay itself contains earlier prompt text ("fos> start",
+            # "fos> dmesg"), so waiting for the first "fos> " would return
+            # in the middle of the dump and leave this harness one prompt
+            # ahead of the guest for every later command (typed input then
+            # races the guest's own output, e.g. "router.bian", or a PS/2
+            # key arrives while the previous command is still running).
+            # The dump ends with a replayed copy of dmesg's own header line,
+            # so wait for that second header and only then for the prompt.
+            header = b"dmesg: "
+            wait_for(output, selector, header, 10, local_start)
+            second_start = output.index(header, local_start) + len(header)
+            wait_for(output, selector, header, 10, second_start)
+            wait_for(output, selector, BOOT_MARKER, 10, output.index(header, second_start))
             if b"dmesg: " not in output[local_start:]:
                 raise RuntimeError(
                     f"dmesg did not print its own header:\n{output.decode(errors='replace')}"

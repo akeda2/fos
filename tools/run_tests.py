@@ -141,9 +141,7 @@ KNOWN_FAILING = {
 }
 
 # Timing-sensitive against a finite polling receive ring (tape load pacing).
-# test-ne2000 fails about 1 run in 6 even serially: the guest receives two
-# serial characters swapped ("router.bian"); cause not yet found.
-FLAKY = {"python3 tapes/test_audio_rtp_opus_send_e2e.py", "make test-ne2000"}
+FLAKY = {"python3 tapes/test_audio_rtp_opus_send_e2e.py"}
 
 # Jobs that rewrite or swap build/fos.img, measure host CPU use, or are the
 # boot-critical gate itself: always run alone, even with -j.
