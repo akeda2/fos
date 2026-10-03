@@ -179,13 +179,15 @@ def load_tape(machine: Machine, nic: int, path: Path, delay: float, attempts: in
     release = Path(tempfile.mkdtemp()) / "release.bin"
     release.write_bytes(RELEASE_TAPE)
     success = False
+    client_output = None
     for attempt in range(1, attempts + 1):
         machine.send_tape(target_mac, path, delay)
         time.sleep(3)
         # v2: the shell is busy inside `tape load net`, so `tape status` cannot be asked
         # yet; the waiting client simply ends once "Tape loaded: N bytes" appears.
         if client.poll() is not None:
-            client_output = client.communicate()[0]
+            if client_output is None:
+                client_output = client.communicate()[0]
             if f"Tape loaded: {size} bytes" in client_output:
                 success = True
                 break
@@ -197,7 +199,7 @@ def load_tape(machine: Machine, nic: int, path: Path, delay: float, attempts: in
         delay = max(delay * 3, 0.003)  # slower each time, even from an unpaced first try
     if not success:
         machine.send_tape(target_mac, release, 0.003)  # frees the waiting loop
-    if client.poll() is None:
+    if client_output is None:
         try:
             client.communicate(timeout=60)
         except subprocess.TimeoutExpired:
