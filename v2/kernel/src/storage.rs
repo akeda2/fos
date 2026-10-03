@@ -9,7 +9,7 @@ use fos_v2_abi::{BootInfo, FOSFS_TYPE_GUID, PAYLOAD_TYPE_GUID};
 
 use crate::block::{self, Backend};
 use crate::fosfs::{self, Volume};
-use crate::{ahci, gpt};
+use crate::{ahci, gpt, nvme};
 
 static mut BOOT_VOLUME: Option<Volume> = None;
 static mut BOOT_DISK: Option<usize> = None;
@@ -35,8 +35,12 @@ fn trimmed(model: &[u8]) -> &str {
 
 pub fn init(info: &BootInfo) {
     let sata = ahci::init_all(|drive, controller, port| {
-        let origin = format_origin(controller, port);
+        let origin = format_origin("SATA", controller, Some(port));
         block::register(Backend::Ahci(drive), drive.sectors, drive.model, origin.as_str());
+    });
+    let nvme = nvme::init_all(|drive, controller| {
+        let origin = format_origin("NVMe", controller, None);
+        block::register(Backend::Nvme(drive), drive.sectors, drive.model, origin.as_str());
     });
     for index in 0..block::count() {
         let disk = block::get(index).unwrap();
@@ -49,7 +53,7 @@ pub fn init(info: &BootInfo) {
         );
     }
     if block::count() == 0 {
-        crate::println!("Storage: no disks found by the drivers this kernel has ({sata} SATA).");
+        crate::println!("Storage: no disks found by the drivers this kernel has ({sata} SATA, {nvme} NVMe).");
         return;
     }
 
@@ -86,7 +90,7 @@ pub fn init(info: &BootInfo) {
     }
 }
 
-/// "SATA c:p" without allocating.
+/// "SATA c:p" or "NVMe c" without allocating.
 struct Origin {
     bytes: [u8; 16],
     length: usize,
@@ -96,10 +100,13 @@ impl Origin {
         core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
     }
 }
-fn format_origin(controller: usize, port: u8) -> Origin {
+fn format_origin(kind: &str, controller: usize, port: Option<u8>) -> Origin {
     use core::fmt::Write;
     let mut origin = Origin { bytes: [0; 16], length: 0 };
-    let _ = write!(origin, "SATA {controller}:{port}");
+    let _ = match port {
+        Some(port) => write!(origin, "{kind} {controller}:{port}"),
+        None => write!(origin, "{kind} {controller}"),
+    };
     origin
 }
 impl core::fmt::Write for Origin {

@@ -2,13 +2,14 @@
 //! interface by 512-byte sector. Drivers register disks here; the rest of the kernel
 //! (GPT, FOSFS) only knows `read`/`write` by disk number.
 
-use crate::{ahci, usb_storage};
+use crate::{ahci, nvme, usb_storage};
 
 pub const MAX_DISKS: usize = 8;
 
 #[derive(Clone, Copy)]
 pub enum Backend {
     Ahci(ahci::Drive),
+    Nvme(nvme::Drive),
     /// An index into `usb_storage`'s device table.
     Usb(usize),
 }
@@ -68,6 +69,12 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
             }
             Ok(())
         }
+        Backend::Nvme(drive) => {
+            for (index, chunk) in buffer.chunks_mut(nvme::MAX_SECTORS * 512).enumerate() {
+                drive.read(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
+            }
+            Ok(())
+        }
         Backend::Usb(device) => usb_storage::read(device, lba, buffer).map_err(|_| Error::Device),
     }
 }
@@ -82,6 +89,12 @@ pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         Backend::Ahci(drive) => {
             for (index, chunk) in buffer.chunks(ahci::MAX_SECTORS * 512).enumerate() {
                 drive.write(lba + (index * ahci::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
+            }
+            Ok(())
+        }
+        Backend::Nvme(drive) => {
+            for (index, chunk) in buffer.chunks(nvme::MAX_SECTORS * 512).enumerate() {
+                drive.write(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
             Ok(())
         }

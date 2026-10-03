@@ -36,6 +36,7 @@ mod keyboard;
 mod log;
 mod memory;
 mod msi;
+mod nvme;
 mod paging;
 mod pci;
 mod power;
@@ -44,6 +45,7 @@ mod storage;
 mod tape;
 mod term;
 mod usb_hid;
+mod usb_hub;
 mod usb_storage;
 mod xhci;
 

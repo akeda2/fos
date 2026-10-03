@@ -78,13 +78,23 @@ pub fn probe_all() -> usize {
             }
         }
     }
+    for index in 0..xhci::count() {
+        let Some(controller) = xhci::controller(index) else { continue };
+        added += crate::usb_hub::rescan(index, controller);
+    }
     added + probe_all_ehci()
 }
 
 static mut STEP: &str = "";
 
 fn probe_port(controller_index: usize, controller: &mut Controller, port: u8) -> Result<bool, xhci::Error> {
-    let mut device = controller.open_port(port)?;
+    let device = controller.open_port(port)?;
+    probe_device(controller_index, controller, device)
+}
+
+/// Identifies an addressed device (on a root port or behind a hub) and starts whatever it
+/// is: a boot keyboard, a Mass Storage disk or a hub whose own ports are then scanned.
+pub fn probe_device(controller_index: usize, controller: &mut Controller, mut device: xhci::Device) -> Result<bool, xhci::Error> {
     unsafe { STEP = "read the device descriptor (first 8 bytes)" };
     let mut descriptor = [0u8; 18];
     // The first 8 bytes of the device descriptor hold bMaxPacketSize0; a full-speed
@@ -97,10 +107,12 @@ fn probe_port(controller_index: usize, controller: &mut Controller, port: u8) ->
     controller.get_descriptor(&device, 1, 0, &mut descriptor)?;
     unsafe { STEP = "read the configuration descriptor" };
     let (vendor, product) = (u16::from_le_bytes([descriptor[8], descriptor[9]]), u16::from_le_bytes([descriptor[10], descriptor[11]]));
+    let port = device.path();
     if descriptor[4] == 9 {
-        crate::println!("USB: port {port}: a hub ({vendor:04x}:{product:04x}); hubs are not supported yet, so keyboards behind it are not seen.");
-        controller.release_slot(device.slot);
-        return Ok(false);
+        let mut configuration = [0u8; 9];
+        controller.get_descriptor(&device, 2, 0, &mut configuration)?;
+        crate::println!("USB: port {port}: a hub ({vendor:04x}:{product:04x}, {}).", xhci::speed_name(device.speed));
+        return crate::usb_hub::enumerate(controller_index, controller, device, configuration[5]);
     }
 
     let mut configuration = [0u8; 256];
@@ -351,6 +363,7 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
                 print(format_args!("  port {port}: device connected ({}){}", xhci::speed_name(speed), if controller.slot_in_use_for_port(port) { ", in use" } else { "" }));
             }
         }
+        crate::usb_hub::describe(index, controller, &print);
     }
     for index in 0..ehci::count() {
         let Some(controller) = ehci::controller(index) else { continue };

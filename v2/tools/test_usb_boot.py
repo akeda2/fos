@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Boot the v2 image *from a USB stick* and use it as the root filesystem (milestone M4).
+"""Boot the v2 image *from a USB stick* (and from an NVMe disk) and use it as the root
+filesystem (milestone M4).
 
 The image is attached as a `usb-storage` device on `qemu-xhci` (then on `usb-ehci`) with
 no SATA disk at all, so OVMF boots the loader from USB and the kernel has to find its
@@ -79,13 +80,17 @@ def boot_from_usb(controller_args, label):
 
 def main():
     for label, arguments in (("xHCI", ["-device", "qemu-xhci,id=xhci", "-device", "usb-storage,bus=xhci.0,drive=stick,bootindex=0"]),
-                             ("EHCI", ["-device", "usb-ehci,id=ehci", "-device", "usb-storage,bus=ehci.0,drive=stick,bootindex=0"])):
+                             ("EHCI", ["-device", "usb-ehci,id=ehci", "-device", "usb-storage,bus=ehci.0,drive=stick,bootindex=0"]),
+                             ("NVMe", ["-device", "nvme,drive=stick,serial=fosnvme,bootindex=0"])):
         text, outputs = boot_from_usb(arguments, label)
-        check(f"USB storage" in text and f"disk1" in text, f"{label}: the USB stick is found and registered as a disk", text)
-        check("Boot disk: disk1" in text, f"{label}: boot-disk discovery finds the stick by the loader's partition GUID", text)
-        check("FOSFS: mounted on disk1" in text, f"{label}: FOSFS mounts from the stick", text)
-        check("Welcome to FOSFS on fos v2" in outputs["cat readme.txt"], f"{label}: a file reads back through Bulk-Only Transport", outputs["cat readme.txt"])
-        check("written to a usb stick" in outputs["cat usb.txt"], f"{label}: a written file reads back (WRITE(10) then READ(10))", outputs["cat usb.txt"])
+        if label == "NVMe":
+            check("(NVMe 0)" in text, "NVMe: the controller is found, identified and registered as a disk", text)
+        else:
+            check(f"USB storage" in text and f"disk1" in text, f"{label}: the USB stick is found and registered as a disk", text)
+        check("Boot disk: disk1" in text, f"{label}: boot-disk discovery finds the disk by the loader's partition GUID", text)
+        check("FOSFS: mounted on disk1" in text, f"{label}: FOSFS mounts from the disk", text)
+        check("Welcome to FOSFS on fos v2" in outputs["cat readme.txt"], f"{label}: a file reads back", outputs["cat readme.txt"])
+        check("written to a usb stick" in outputs["cat usb.txt"], f"{label}: a written file reads back (write, flush, read)", outputs["cat usb.txt"])
     print("v2 usb boot: all checks passed")
 
 

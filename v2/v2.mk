@@ -11,7 +11,7 @@ V2_TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat
 V2_TAPE_BINS := $(foreach tape,$(V2_TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 V2_TAPE_FILES := $(foreach tape,$(V2_TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape)) --file debug=tools/default-debug.txt
 
-.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes
+.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -60,6 +60,10 @@ test-v2-keyboard: v2-image
 # Boot the image from a USB stick (qemu-xhci, then usb-ehci) and use it as the root disk.
 test-v2-usb-boot: v2-image
 	python3 v2/tools/test_usb_boot.py
+
+# Keyboards and sticks behind USB hubs (one and two tiers) on qemu-xhci.
+test-v2-hub: v2-image
+	python3 v2/tools/test_usb_hub.py
 
 # hostname / settings / debug / start files on the boot volume.
 test-v2-config: v2-image

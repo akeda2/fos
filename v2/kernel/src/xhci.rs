@@ -20,7 +20,7 @@
 use crate::{apic, memory, paging, pci};
 
 pub const MAX_CONTROLLERS: usize = 4;
-pub const MAX_SLOTS: usize = 8;
+pub const MAX_SLOTS: usize = 16;
 const RING_TRBS: usize = 256;
 const TRB_BYTES: u64 = 16;
 const DCI_COUNT: usize = 32;
@@ -208,22 +208,56 @@ fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
 struct Slot {
     used: bool,
     port: u8,
+    /// Route string: the hub port taken at each hub tier below the root port, one nibble
+    /// per tier, first tier in the lowest nibble (0 for a device on a root port).
+    route: u32,
     speed: u8,
     output: u64,
     input: u64,
     rings: [Ring; DCI_COUNT],
 }
 
-const EMPTY_SLOT: Slot = Slot { used: false, port: 0, speed: 0, output: 0, input: 0, rings: [NO_RING; DCI_COUNT] };
+const EMPTY_SLOT: Slot = Slot { used: false, port: 0, route: 0, speed: 0, output: 0, input: 0, rings: [NO_RING; DCI_COUNT] };
 
 /// A device with a slot and an address.
 #[derive(Clone, Copy)]
 pub struct Device {
     pub slot: u8,
+    /// The root port the device (or the chain of hubs above it) hangs off.
     pub port: u8,
+    /// Hub ports taken below the root port (see `Slot::route`) and how many hubs sit
+    /// between the device and the root port.
+    pub route: u32,
+    pub tier: u8,
+    /// For a low/full-speed device behind a high-speed hub: that hub's slot and the port
+    /// it is reached through, the transaction translator the controller must use.
+    pub tt: Option<(u8, u8)>,
     /// PORTSC speed ID: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeed+.
     pub speed: u8,
     pub control_max_packet: u16,
+}
+
+impl Device {
+    /// "3" for a root port, "3.2" for port 2 of a hub on root port 3, and so on.
+    pub fn path(&self) -> Path {
+        Path { port: self.port, route: self.route, tier: self.tier }
+    }
+}
+
+pub struct Path {
+    port: u8,
+    route: u32,
+    tier: u8,
+}
+
+impl core::fmt::Display for Path {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{}", self.port)?;
+        for tier in 0..self.tier {
+            write!(formatter, ".{}", (self.route >> (4 * u32::from(tier))) & 0xf)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct Controller {
@@ -526,7 +560,7 @@ impl Controller {
         if slot == 0 || usize::from(slot) > MAX_SLOTS {
             return Err(Error::Unsupported);
         }
-        let result = self.address_device(slot, port, speed, max_packet);
+        let result = self.address_device(slot, port, speed, max_packet, 0, 0, None);
         if result.is_err() {
             self.release_slot(slot);
         } else {
@@ -535,7 +569,65 @@ impl Controller {
         result
     }
 
-    fn address_device(&mut self, slot: u8, port: u8, speed: u8, max_packet: u16) -> Result<Device, Error> {
+    /// Gives a device behind a hub a slot and an address. `hub` is the hub's own device,
+    /// `hub_port` the port (1-based) the device sits on and `speed` the PORTSC speed ID
+    /// the hub reported for it (the hub, not the root port, knows).
+    pub fn open_hub_port(&mut self, hub: &Device, hub_port: u8, speed: u8) -> Result<Device, Error> {
+        if hub.tier >= 4 {
+            return Err(Error::Unsupported); // the route string holds five tiers; keep one in reserve
+        }
+        let route = hub.route | u32::from(hub_port) << (4 * u32::from(hub.tier));
+        let tt = if speed >= 3 {
+            None
+        } else if hub.speed == 3 {
+            Some((hub.slot, hub_port))
+        } else {
+            hub.tt
+        };
+        let max_packet: u16 = match speed {
+            1 | 2 => 8,
+            3 => 64,
+            _ => 512,
+        };
+        let event = self.command(0, 0, TRB_ENABLE_SLOT << 10)?;
+        let slot = event.slot();
+        if slot == 0 || usize::from(slot) > MAX_SLOTS {
+            return Err(Error::Unsupported);
+        }
+        let result = self.address_device(slot, hub.port, speed, max_packet, route, hub.tier + 1, tt);
+        if result.is_err() {
+            self.release_slot(slot);
+        } else {
+            apic::wait_ticks(1);
+        }
+        result
+    }
+
+    /// Marks a device's slot as a hub (Configure Endpoint with only the slot context
+    /// changed): the controller needs the hub flag and port count to route split
+    /// transactions through its transaction translator. Done after SET_CONFIGURATION.
+    pub fn configure_hub(&mut self, device: &Device, ports: u8, think_time: u8) -> Result<(), Error> {
+        let (input, output) = (self.slots[usize::from(device.slot)].input, self.slots[usize::from(device.slot)].output);
+        unsafe {
+            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
+            (input as *mut u32).add(1).write_volatile(1); // A0: the slot context
+            core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
+            let slot_context = self.context_slot(input) as *mut u32;
+            slot_context.write_volatile(slot_context.read_volatile() | (1 << 26)); // Hub
+            let word1 = slot_context.add(1).read_volatile() & 0x00ff_ffff;
+            slot_context.add(1).write_volatile(word1 | u32::from(ports) << 24); // number of ports
+            let word2 = slot_context.add(2).read_volatile() & !(3 << 16);
+            slot_context.add(2).write_volatile(word2 | u32::from(think_time & 3) << 16); // TT think time
+        }
+        self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24)).map(|_| ())
+    }
+
+    pub fn slot_in_use_for_route(&self, port: u8, route: u32) -> bool {
+        self.slots[1..].iter().any(|slot| slot.used && slot.port == port && slot.route == route)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn address_device(&mut self, slot: u8, port: u8, speed: u8, max_packet: u16, route: u32, tier: u8, tt: Option<(u8, u8)>) -> Result<Device, Error> {
         let input = frame().ok_or(Error::NoMemory)?;
         let output = frame().ok_or(Error::NoMemory)?;
         let control_ring = Ring::allocate().ok_or(Error::NoMemory)?;
@@ -543,6 +635,7 @@ impl Controller {
         *entry = EMPTY_SLOT;
         entry.used = true;
         entry.port = port;
+        entry.route = route;
         entry.speed = speed;
         entry.input = input;
         entry.output = output;
@@ -552,8 +645,11 @@ impl Controller {
             // Input context: add the slot context (A0) and the default pipe (A1).
             (input as *mut u32).add(1).write_volatile(0b11);
             let slot_context = self.context_slot(input) as *mut u32;
-            slot_context.write_volatile((1 << 27) | (u32::from(speed) << 20)); // one context entry, speed
+            slot_context.write_volatile((1 << 27) | (u32::from(speed) << 20) | route); // one context entry, speed, route string
             slot_context.add(1).write_volatile(u32::from(port) << 16); // root hub port number
+            if let Some((hub_slot, hub_port)) = tt {
+                slot_context.add(2).write_volatile(u32::from(hub_slot) | u32::from(hub_port) << 8); // transaction translator
+            }
             let endpoint = self.context_endpoint(input, 1) as *mut u32;
             endpoint.add(1).write_volatile((3 << 1) | (4 << 3) | (u32::from(max_packet) << 16)); // CErr 3, control, max packet
             endpoint.add(2).write_volatile(control_ring.base as u32 | 1); // dequeue pointer + cycle state
@@ -561,7 +657,7 @@ impl Controller {
             endpoint.add(4).write_volatile(8);
         }
         self.command(input, 0, (TRB_ADDRESS_DEVICE << 10) | (u32::from(slot) << 24))?;
-        Ok(Device { slot, port, speed, control_max_packet: max_packet })
+        Ok(Device { slot, port, route, tier, tt, speed, control_max_packet: max_packet })
     }
 
     /// Frees every slot this driver holds for `port` (a failed enumeration must not leave the
@@ -569,6 +665,17 @@ impl Controller {
     pub fn release_port_slots(&mut self, port: u8) {
         for slot in 1..=MAX_SLOTS as u8 {
             if self.slots[usize::from(slot)].used && self.slots[usize::from(slot)].port == port {
+                self.release_slot(slot);
+            }
+        }
+    }
+
+    /// Frees the slot of the device at exactly this route below `port` (a failed hub-port
+    /// enumeration must not leave it counted as "in use"; the hub itself stays).
+    pub fn release_route_slots(&mut self, port: u8, route: u32) {
+        for slot in 1..=MAX_SLOTS as u8 {
+            let entry = &self.slots[usize::from(slot)];
+            if entry.used && entry.port == port && entry.route == route {
                 self.release_slot(slot);
             }
         }
@@ -842,7 +949,7 @@ impl Controller {
     }
 
     pub fn reset_stalled_endpoint(&mut self, slot: u8, dci: u32) {
-        let device = Device { slot, port: 0, speed: 0, control_max_packet: 0 };
+        let device = Device { slot, port: 0, route: 0, tier: 0, tt: None, speed: 0, control_max_packet: 0 };
         self.reset_endpoint(&device, dci);
     }
 }

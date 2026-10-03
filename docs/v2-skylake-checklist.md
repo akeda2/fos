@@ -38,7 +38,7 @@ worth a paragraph), the NIC cabling notes below, a second stick if you want one 
 * SATA mode **AHCI** (v2 does not drive IDE-compat or RAID). The v1 notes mention a SATA disk
   that has to be present to avoid an F1 prompt at POST; leave it as it was.
 * Boot the stick from the one-time boot menu, entry "UEFI: <stick>".
-* USB ports: use a **root port**, not a hub (v2 has no xHCI hub support, untested here): back-panel ports
+* USB ports: a root port is the safe choice; hubs on xHCI are supported (`usb_hub.rs`) but have only run in QEMU, not on this machine: back-panel ports
   directly on the board are root ports. The stick and a keyboard both need ports; the
   keyboard also must not be behind a hub. Skylake has xHCI only, which v2 drives.
 
@@ -123,6 +123,6 @@ Kernel push (needs `kernel-update` in `debug`): `python3-netraw tools/send_kerne
 * Take the screen photo, run `dmesg` if a prompt exists, and note which NIC/USB port was used.
 * `reboot-on-crash` + `watchdog` in a `debug` file turn a hang into a reset plus a record; the
   loop guard stops after five pre-milestone crashes in a row (the loader prints the counts).
-* Known not-done (do not report as bugs): USB hubs on xHCI, keyboards behind hubs, NVMe, audio,
+* Known not-done (do not report as bugs): audio, NVMe on real hardware (QEMU only), hubs on real hardware (QEMU only),
   the legacy-BIOS path (use the v1 stick), `chat`, OHCI/UHCI.
 * To return to v1, boot the v1 stick; nothing on the machine was modified.
