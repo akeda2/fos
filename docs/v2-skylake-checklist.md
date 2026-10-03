@@ -2,8 +2,11 @@
 
 First real-hardware run of the v2 kernel (milestone M7). Everything below passed in QEMU
 (`make test-v2`, `-keyboard`, `-usb-boot`, `-config`, `-tapes`, `-nettest`, `-debug-mode`,
-`-msi`, `-router`, `-nettapes`); none of it has run on this machine. Expect surprises, and
-write down what the screen says: the kernel narrates every step, so a stop is almost always
+`-msi`, `-router`, `-nettapes`). **Status (2026-10-03):** most of it has since run on this
+machine: boot from the stick, five NICs on MSI, KUP pushes, `memtest`, `nettest`, `shutdown`,
+the watchdog (`debug hang`), a USB keyboard and `router` (including a DHCP lease that arrives
+after startup). Still untried here: the crash-loop guard, `bridge`, hubs, NVMe, audio. Expect
+surprises, and write down what the screen says: the kernel narrates every step, so a stop is almost always
 located by the last line.
 
 **Fallback at every stage:** the v1 stick still boots this machine in BIOS/CSM mode. Nothing
@@ -35,7 +38,7 @@ worth a paragraph), the NIC cabling notes below, a second stick if you want one 
 * SATA mode **AHCI** (v2 does not drive IDE-compat or RAID). The v1 notes mention a SATA disk
   that has to be present to avoid an F1 prompt at POST; leave it as it was.
 * Boot the stick from the one-time boot menu, entry "UEFI: <stick>".
-* USB ports: use a **root port**, not a hub (v2 has no xHCI hub support): back-panel ports
+* USB ports: use a **root port**, not a hub (v2 has no xHCI hub support, untested here): back-panel ports
   directly on the board are root ports. The stick and a keyboard both need ports; the
   keyboard also must not be behind a hub. Skylake has xHCI only, which v2 drives.
 
@@ -97,8 +100,9 @@ the dev machine's session MAC, not a NIC here); NICs 2-5 = four I350 ports (`a0:
 ```
 
 The wire protocol is v1's, so `term_net.py`, `send_tape.py`, `send_kernel_update.py`, `peers.py`
-should work unchanged. `tools/devloop.py` has v1 assumptions (it greps for v1 messages);
-if `devloop push` misbehaves, use the plain tools and check `debug slots`.
+should work unchanged. `tools/devloop.py` works against v2 (`wait`, `run`, `push`; `tape-into` reads plain `nic`
+when there is no `nic list`). If a push misbehaves, use the plain tools and check `debug slots`.
+The Skylake boots slowly: `wait` may time out once before the machine answers.
 
 Kernel push (needs `kernel-update` in `debug`): `python3-netraw tools/send_kernel_update.py
 --iface IF --mac MAC build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel`, then

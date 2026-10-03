@@ -96,6 +96,13 @@ class Machine:
             match = re.match(r"([ *])NIC (\d+): .*MAC ((?:[0-9a-f]{2}:){5}[0-9a-f]{2})", line)
             if match:
                 found.append((int(match.group(2)), match.group(3), match.group(1) == "*"))
+        if found:
+            return found
+        # v2 has no `nic list`; plain `nic` prints "N: variant MAC link up  (terminal)".
+        for line in self.term(["nic"]).splitlines():
+            match = re.match(r"(\d+): \S+ ((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\s+link .*?(\(terminal\))?$", line)
+            if match:
+                found.append((int(match.group(1)), match.group(2), match.group(3) is not None))
         return found
 
     def loaded_tape(self, mac: str | None = None) -> tuple[int, int] | None:
