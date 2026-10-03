@@ -189,6 +189,8 @@ pub struct Controller {
     pub ports: u8,
     frame: usize,
     next_address: u8,
+    /// What enumeration was doing when it last failed (for the boot log).
+    pub step: &'static str,
     /// The data toggle the controller left in the last completed qTD of the previous chain.
     last_toggle: bool,
     /// Root ports where a keyboard was found (bit n = port n); rescans skip them.
@@ -309,7 +311,7 @@ impl Controller {
             }
         }
         apic::wait_ticks(15);
-        Ok(Controller { pci: device, operational, ports, frame, next_address: 1, last_toggle: false, claimed_ports: 0, keyboards: [None; MAX_KEYBOARDS] })
+        Ok(Controller { pci: device, operational, ports, frame, next_address: 1, step: "", last_toggle: false, claimed_ports: 0, keyboards: [None; MAX_KEYBOARDS] })
     }
 
     fn port_register(&self, port: u8) -> usize {
@@ -323,6 +325,10 @@ impl Controller {
     pub fn port_has_device(&self, port: u8) -> bool {
         let status = self.port_status(port);
         status & PORT_CONNECTED != 0 && status & PORT_OWNER == 0
+    }
+
+    pub fn usbsts(&self) -> u32 {
+        read32(self.operational + OP_USBSTS)
     }
 
     pub fn keyboard_count(&self) -> usize {
@@ -536,13 +542,16 @@ impl Controller {
         // control packet is at least 8, so this first read is legal everywhere.
         let mut target = Target { address: 0, max_packet0: if speed == Speed::High { 64 } else { 8 }, speed, hub_address, hub_port };
         let mut first = [0u8; 8];
+        self.step = "read the first 8 bytes of the device descriptor at address 0";
         self.get_descriptor(&target, 1, 0, &mut first)?;
         target.max_packet0 = u16::from(first[7]).max(8);
         let address = self.allocate_address().ok_or(Error::Unsupported)?;
+        self.step = "SET_ADDRESS";
         self.control_transfer(&target, 0x00, 0x05, u16::from(address), 0, &mut [])?;
         apic::wait_ticks(1); // SET_ADDRESS recovery time
         target.address = address;
         let mut descriptor = [0u8; 18];
+        self.step = "read the full device descriptor at the new address";
         self.get_descriptor(&target, 1, 0, &mut descriptor)?;
         Ok(Found { target, descriptor })
     }
@@ -550,7 +559,9 @@ impl Controller {
     /// Resets a root port and addresses whatever answers, looking through one level
     /// of hub. Fills `found` with the devices (never the hub itself); returns how many.
     pub fn enumerate_port(&mut self, port: u8, found: &mut [Option<Found>; 8]) -> Result<usize, Error> {
+        self.step = "reset the root port";
         self.reset_root_port(port)?;
+        apic::wait_ticks(10); // let the device (or the hub's own reset) settle before the first transfer
         let device = self.address_default_device(Speed::High, 0, 0)?;
         if device.descriptor[4] != 9 {
             found[0] = Some(device);
@@ -558,7 +569,9 @@ impl Controller {
         }
         // A hub (on Sandy Bridge, the rate-matching hub): configure it and bring up its ports.
         let hub = device.target;
+        self.step = "configure the hub";
         self.set_configuration(&hub, 1)?;
+        self.step = "read the hub descriptor";
         let mut hub_descriptor = [0u8; 9];
         self.control_transfer(&hub, 0xa0, 0x06, 0x2900, 0, &mut hub_descriptor)?;
         let hub_ports = hub_descriptor[2].min(8);

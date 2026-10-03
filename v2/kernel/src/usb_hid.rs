@@ -55,25 +55,47 @@ pub fn probe_all() -> usize {
             if controller.port_status(port) & 1 == 0 || controller.slot_in_use_for_port(port) {
                 continue;
             }
-            match probe_port(index, controller, port) {
-                Ok(true) => added += 1,
-                Ok(false) => {}
-                Err(error) => crate::println!("USB: port {port} of xHCI {:02x}:{:02x}.{}: device not usable ({error:?}).", controller.pci.bus, controller.pci.device, controller.pci.function),
+            // Real controllers sometimes fail the first transfer after a reset; try again from
+            // scratch (reset included) a couple of times before giving up, and say what failed.
+            for attempt in 1..=3 {
+                unsafe { STEP = "open the port (reset, enable slot, address device)" };
+                match probe_port(index, controller, port) {
+                    Ok(true) => {
+                        added += 1;
+                        break;
+                    }
+                    Ok(false) => break,
+                    Err(error) => {
+                        crate::println!(
+                            "USB: xHCI {:02x}:{:02x}.{} port {port}, attempt {attempt}/3 failed at \"{}\": {error:?} (PORTSC {:#x}, USBSTS {:#x}).",
+                            controller.pci.bus, controller.pci.device, controller.pci.function,
+                            unsafe { STEP }, controller.port_status(port), controller.usbsts()
+                        );
+                        controller.release_port_slots(port);
+                        crate::apic::wait_ticks(15);
+                    }
+                }
             }
         }
     }
     added + probe_all_ehci()
 }
 
+static mut STEP: &str = "";
+
 fn probe_port(controller_index: usize, controller: &mut Controller, port: u8) -> Result<bool, xhci::Error> {
     let mut device = controller.open_port(port)?;
+    unsafe { STEP = "read the device descriptor (first 8 bytes)" };
     let mut descriptor = [0u8; 18];
     // The first 8 bytes of the device descriptor hold bMaxPacketSize0; a full-speed
     // device may differ from the guess made when it was addressed.
     controller.get_descriptor(&device, 1, 0, &mut descriptor[..8])?;
+    unsafe { STEP = "set the control max packet size" };
     let max_packet = if descriptor[7] >= 32 && device.speed >= 4 { 512 } else { u16::from(descriptor[7]).max(8) };
     controller.set_control_max_packet(&mut device, max_packet)?;
+    unsafe { STEP = "read the full device descriptor" };
     controller.get_descriptor(&device, 1, 0, &mut descriptor)?;
+    unsafe { STEP = "read the configuration descriptor" };
     let (vendor, product) = (u16::from_le_bytes([descriptor[8], descriptor[9]]), u16::from_le_bytes([descriptor[10], descriptor[11]]));
     if descriptor[4] == 9 {
         crate::println!("USB: port {port}: a hub ({vendor:04x}:{product:04x}); hubs are not supported yet, so keyboards behind it are not seen.");
@@ -236,14 +258,31 @@ fn probe_all_ehci() -> usize {
                 continue;
             }
             let mut found = [None; 8];
-            let count = match controller.enumerate_port(port, &mut found) {
+            let mut attempt = 1;
+            let count = loop {
+                match controller.enumerate_port(port, &mut found) {
+                    Err(error @ (ehci::Error::Timeout | ehci::Error::Transfer(_))) if attempt < 3 => {
+                        crate::println!(
+                            "USB: EHCI {:02x}:{:02x}.{} port {port}, attempt {attempt}/3 failed at \"{}\": {error:?} (PORTSC {:#x}, USBSTS {:#x}).",
+                            controller.pci.bus, controller.pci.device, controller.pci.function, controller.step, controller.port_status(port), controller.usbsts()
+                        );
+                        attempt += 1;
+                        crate::apic::wait_ticks(15);
+                    }
+                    other => break other,
+                }
+            };
+            let count = match count {
                 Ok(count) => count,
                 Err(ehci::Error::CompanionPort) => {
                     crate::println!("USB: EHCI {:02x}:{:02x}.{} port {port}: a full/low-speed device wired to the root port belongs to the companion controller, which has no driver.", controller.pci.bus, controller.pci.device, controller.pci.function);
                     continue;
                 }
                 Err(error) => {
-                    crate::println!("USB: EHCI {:02x}:{:02x}.{} port {port}: device not usable ({error:?}).", controller.pci.bus, controller.pci.device, controller.pci.function);
+                    crate::println!(
+                        "USB: EHCI {:02x}:{:02x}.{} port {port}: device not usable after {attempt} attempt(s): {error:?} at \"{}\" (PORTSC {:#x}, USBSTS {:#x}).",
+                        controller.pci.bus, controller.pci.device, controller.pci.function, controller.step, controller.port_status(port), controller.usbsts()
+                    );
                     continue;
                 }
             };

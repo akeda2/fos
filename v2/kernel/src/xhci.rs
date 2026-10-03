@@ -515,8 +515,10 @@ impl Controller {
         }
         let speed = ((status >> 10) & 0xf) as u8;
         let max_packet: u16 = match speed {
-            2 => 8,
-            1 | 3 => 64,
+            // Low and full speed devices may have an 8-byte default pipe; 64 would corrupt the
+            // first transfer. Evaluate Context fixes it once bMaxPacketSize0 is known.
+            1 | 2 => 8,
+            3 => 64,
             _ => 512,
         };
         let event = self.command(0, 0, TRB_ENABLE_SLOT << 10)?;
@@ -527,6 +529,8 @@ impl Controller {
         let result = self.address_device(slot, port, speed, max_packet);
         if result.is_err() {
             self.release_slot(slot);
+        } else {
+            apic::wait_ticks(1); // SET_ADDRESS recovery time, with some margin, before the first transfer
         }
         result
     }
@@ -558,6 +562,21 @@ impl Controller {
         }
         self.command(input, 0, (TRB_ADDRESS_DEVICE << 10) | (u32::from(slot) << 24))?;
         Ok(Device { slot, port, speed, control_max_packet: max_packet })
+    }
+
+    /// Frees every slot this driver holds for `port` (a failed enumeration must not leave the
+    /// device counted as "in use").
+    pub fn release_port_slots(&mut self, port: u8) {
+        for slot in 1..=MAX_SLOTS as u8 {
+            if self.slots[usize::from(slot)].used && self.slots[usize::from(slot)].port == port {
+                self.release_slot(slot);
+            }
+        }
+    }
+
+    /// USBSTS (bit 2 = host system error, bit 12 = host controller error) for diagnostics.
+    pub fn usbsts(&self) -> u32 {
+        read32(self.operational + OP_USBSTS)
     }
 
     pub fn release_slot(&mut self, slot: u8) {
