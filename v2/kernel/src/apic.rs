@@ -29,6 +29,8 @@ const PM_TIMER_HZ: u64 = 3_579_545;
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static mut BASE: u64 = 0;
 static mut X2APIC: bool = false;
+static mut PM_PORT: u16 = 0;
+static mut PM_32_BIT: bool = false;
 
 fn read(register: u32) -> u32 {
     unsafe {
@@ -69,6 +71,29 @@ pub fn ticks() -> u64 {
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     end_of_interrupt();
+}
+
+/// Waits `milliseconds` on the ACPI PM timer, with no interrupts needed (for fatal-error
+/// paths, where the tick is not running). Without a PM timer it spins a rough count.
+pub fn busy_wait_ms(milliseconds: u64) {
+    unsafe {
+        if PM_PORT == 0 {
+            for _ in 0..milliseconds * 1_000_000 {
+                core::hint::spin_loop();
+            }
+            return;
+        }
+        let mask: u64 = if PM_32_BIT { 0xffff_ffff } else { 0x00ff_ffff };
+        let mut previous = u64::from(cpu::inl(PM_PORT)) & mask;
+        let mut remaining = milliseconds * PM_TIMER_HZ / 1000;
+        while remaining > 0 {
+            let now = u64::from(cpu::inl(PM_PORT)) & mask;
+            let elapsed = now.wrapping_sub(previous) & mask;
+            previous = now;
+            remaining = remaining.saturating_sub(elapsed);
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Busy-waits `count` timer ticks (10 ms each). Needs interrupts enabled.
@@ -126,6 +151,10 @@ pub fn start_timer(fadt: &acpi::Fadt, madt_address: u64) -> Option<Report> {
     }
     if !x2apic {
         paging::map_device(base, 4096);
+    }
+    unsafe {
+        PM_PORT = fadt.pm_timer_port;
+        PM_32_BIT = fadt.pm_timer_32_bit;
     }
     write(REG_SPURIOUS, 0x100 | u32::from(SPURIOUS_VECTOR)); // software-enable the APIC
 

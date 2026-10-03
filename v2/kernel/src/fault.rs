@@ -97,7 +97,13 @@ pub fn fatal(frame: &Frame) -> ! {
         13 => println!("    selector/error detail: {:#x}", frame.error),
         _ => {}
     }
-    println!("*** halting");
     cpu::interrupts_disable();
+    let debug = crate::config::debug();
+    if debug.reboot_on_crash {
+        println!("*** debug file: reboot-on-crash; resetting in {} s", debug.reboot_delay_seconds);
+        crate::apic::busy_wait_ms(u64::from(debug.reboot_delay_seconds) * 1000);
+        crate::power::reset(crate::power::runtime_services());
+    }
+    println!("*** halting");
     cpu::halt()
 }

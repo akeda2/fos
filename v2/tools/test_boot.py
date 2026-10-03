@@ -176,9 +176,11 @@ def main():
             wire.send(guest or BROADCAST, TAG_HELLO)
             session = wire.until("fos> ", 10)
             transcript = {}
-            for name in ("help", "memory", "pci", "nic", "uptime"):
+            for name in ("help", "memory", "pci", "nic", "uptime", "disks", "ls", "cat readme.txt", "write hello.txt written over the wire", "cat hello.txt", "ls", "rm hello.txt", "cat hello.txt"):
                 wire.send(guest, TAG_DATA, name.encode() + b"\n")
-                transcript[name] = wire.until("fos> ", 10)
+                output = wire.until("fos> ", 10)
+                # A command may be run twice (`ls`, `cat hello.txt`): later runs are "name#2".
+                transcript[name if name not in transcript else name + "#2"] = output
             wire.send(guest, TAG_DATA, b"shutdown\n")
             exit_deadline = time.monotonic() + 20
             while process.poll() is None and time.monotonic() < exit_deadline:
@@ -210,8 +212,8 @@ def main():
     check("Exiting boot services" in text, "and exits boot services", text)
 
     # --- the kernel (M1) ---
-    check("FOS v2 kernel (milestone M3b): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
-    check(re.search(r"BootInfo: version 4, kernel at " + kernel.group(1), text) is not None, "BootInfo arrives intact and names the same load address", text)
+    check("FOS v2 kernel (milestone M4): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
+    check(re.search(r"BootInfo: version 5, kernel at " + kernel.group(1), text) is not None, "BootInfo arrives intact and names the same load address", text)
     managed = re.search(r"Physical memory: (\d+) MiB managed, (\d+) MiB free", text)
     check(managed is not None and 400 < int(managed.group(1)) <= 512 and int(managed.group(2)) > 300, f"the physical allocator manages the machine's RAM ({managed and managed.groups()} MiB)", text)
     check("Allocator self-test: ok" in text, "the allocator's bookkeeping, contiguity and below-4-GiB promises hold", text)
@@ -226,12 +228,21 @@ def main():
     check(re.search(r"PCI: \d+ functions found", text) is not None, "the kernel scans PCI", text)
     check(re.search(r"e1000 at [0-9a-f:.]+: MAC 52:54:00:12:34:77, link up", text) is not None, "and brings up the e1000 with its link", text)
     check(reply is not None and reply[1] == b"fos2" and guest == bytes.fromhex("525400123477"), f"a discovery probe over the wire is answered by 'fos2' ({reply})", text)
-    check("Remote terminal connected" in text and "fos> " in session and "type `help`" in session, "a term net session opens (HELLO answered with banner and prompt)", session)
+    check("Remote terminal connected" in text and "fos> " in session and "Type `help`" in session, "a term net session opens (HELLO answered with banner and prompt)", session)
     check("shutdown" in transcript["help"] and "dmesg" in transcript["help"], "`help` output arrives over the wire in DATA frames", transcript["help"])
     check(re.search(r"Managed:\s+\d+ MiB", transcript["memory"]) is not None, "`memory` reports the allocator", transcript["memory"])
     check("8086:100e network controller" in transcript["pci"], "`pci` lists the e1000 among the scanned functions", transcript["pci"])
     check("link up" in transcript["nic"] and "52:54:00:12:34:77" in transcript["nic"], "`nic` reports the interface", transcript["nic"])
     check(re.search(r"\d+ ticks at 100 Hz", transcript["uptime"]) is not None, "`uptime` reports the timer", transcript["uptime"])
+    check(re.search(r"disk1: \d+ MiB, QEMU HARDDISK \(SATA 0:\d+\)", text) is not None, "the AHCI driver finds the SATA disk and identifies it", text)
+    check("Boot disk: disk1" in text, "boot-disk discovery matches the payload partition GUID the loader passed", text)
+    check(re.search(r"FOSFS: mounted on disk1 \(\d+ MiB, 1 file\(s\)\)", text) is not None, "the FOSFS data partition on the boot disk is mounted", text)
+    check("boot disk: disk1" in transcript["disks"], "`disks` shows the boot disk", transcript["disks"])
+    check("readme.txt" in transcript["ls"], "`ls` lists the preloaded file", transcript["ls"])
+    check("Welcome to FOSFS on fos v2" in transcript["cat readme.txt"], "`cat` reads it from the disk through the AHCI driver", transcript["cat readme.txt"])
+    check("Wrote 21 bytes to hello.txt" in transcript["write hello.txt written over the wire"] and "written over the wire" in transcript["cat hello.txt"], "`write` stores a file and `cat` reads it back (DMA write + flush)", transcript["cat hello.txt"])
+    check("hello.txt" in transcript["ls#2"], "the new file shows in the directory", transcript["ls#2"])
+    check("no such file" in transcript["cat hello.txt#2"], "`rm` removes it again", transcript["cat hello.txt#2"])
     check(exited_by_itself, "`shutdown` over the network powers the machine off through the UEFI runtime services", text)
 
     # --- the framebuffer, as QEMU displays it ---

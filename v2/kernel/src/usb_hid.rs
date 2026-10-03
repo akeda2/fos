@@ -13,21 +13,23 @@
 use fos_v2_abi::keymap::hid_ascii;
 
 use crate::xhci::{self, Controller, Trb};
+use crate::{ehci, usb_storage};
 use crate::{keyboard, memory};
 
 const MAX_KEYBOARDS: usize = 4;
 
+/// Where a keyboard's reports come from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// An xHCI slot's interrupt endpoint; the controller is identified by its PCI address.
+    Xhci { bus: u8, device: u8, function: u8, slot: u8, dci: u32, buffer: u64 },
+    /// A permanent queue head on an EHCI controller.
+    Ehci { controller: usize, index: usize },
+}
+
 #[derive(Clone, Copy)]
 struct Keyboard {
-    /// The controller's PCI address identifies it.
-    bus: u8,
-    device: u8,
-    function: u8,
-    slot: u8,
-    port: u8,
-    dci: u32,
-    /// A DMA frame the controller writes each 8-byte report into.
-    buffer: u64,
+    source: Source,
     previous: [u8; 8],
     caps: bool,
     reports: u64,
@@ -53,17 +55,17 @@ pub fn probe_all() -> usize {
             if controller.port_status(port) & 1 == 0 || controller.slot_in_use_for_port(port) {
                 continue;
             }
-            match probe_port(controller, port) {
+            match probe_port(index, controller, port) {
                 Ok(true) => added += 1,
                 Ok(false) => {}
                 Err(error) => crate::println!("USB: port {port} of xHCI {:02x}:{:02x}.{}: device not usable ({error:?}).", controller.pci.bus, controller.pci.device, controller.pci.function),
             }
         }
     }
-    added
+    added + probe_all_ehci()
 }
 
-fn probe_port(controller: &mut Controller, port: u8) -> Result<bool, xhci::Error> {
+fn probe_port(controller_index: usize, controller: &mut Controller, port: u8) -> Result<bool, xhci::Error> {
     let mut device = controller.open_port(port)?;
     let mut descriptor = [0u8; 18];
     // The first 8 bytes of the device descriptor hold bMaxPacketSize0; a full-speed
@@ -84,6 +86,20 @@ fn probe_port(controller: &mut Controller, port: u8) -> Result<bool, xhci::Error
     let total = usize::from(u16::from_le_bytes([configuration[2], configuration[3]])).clamp(9, configuration.len());
     controller.get_descriptor(&device, 2, 0, &mut configuration[..total])?;
     let Some((interface, endpoint, max_packet_in, interval)) = find_boot_keyboard(&configuration[..total]) else {
+        // Not a keyboard: a USB stick (Mass Storage, Bulk-Only) becomes a disk.
+        if let Some(endpoints) = usb_storage::find_endpoints(&configuration[..total]) {
+            controller.set_configuration(&device, configuration[5])?;
+            return Ok(match usb_storage::attach_xhci(controller_index, controller, device, endpoints) {
+                Some(disk) => {
+                    crate::println!("USB storage {vendor:04x}:{product:04x} on port {port} of xHCI {:02x}:{:02x}.{} ({}): disk{}.", controller.pci.bus, controller.pci.device, controller.pci.function, xhci::speed_name(device.speed), disk + 1);
+                    true
+                }
+                None => {
+                    controller.release_slot(device.slot);
+                    false
+                }
+            });
+        }
         controller.release_slot(device.slot);
         return Ok(false);
     };
@@ -101,7 +117,12 @@ fn probe_port(controller: &mut Controller, port: u8) -> Result<bool, xhci::Error
         controller.release_slot(device.slot);
         return Ok(false);
     };
-    *slot = Some(Keyboard { bus: controller.pci.bus, device: controller.pci.device, function: controller.pci.function, slot: device.slot, port, dci, buffer, previous: [0; 8], caps: false, reports: 0 });
+    *slot = Some(Keyboard {
+        source: Source::Xhci { bus: controller.pci.bus, device: controller.pci.device, function: controller.pci.function, slot: device.slot, dci, buffer },
+        previous: [0; 8],
+        caps: false,
+        reports: 0,
+    });
     controller.queue_interrupt_in(device.slot, dci, buffer, 8);
     crate::println!(
         "USB keyboard {vendor:04x}:{product:04x} on port {port} of xHCI {:02x}:{:02x}.{} ({}): ready.",
@@ -149,20 +170,23 @@ pub fn background_event(controller: &mut Controller, event: &Trb) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    let identity = (controller.pci.bus, controller.pci.device, controller.pci.function);
     let Some(keyboard) = keyboards.iter_mut().flatten().find(|k| {
-        k.slot == event.slot_number() && k.dci == event.endpoint_index() && (k.bus, k.device, k.function) == (controller.pci.bus, controller.pci.device, controller.pci.function)
+        matches!(k.source, Source::Xhci { bus, device, function, slot, dci, .. }
+            if slot == event.slot_number() && dci == event.endpoint_index() && (bus, device, function) == identity)
     }) else {
         return;
     };
+    let Source::Xhci { slot, dci, buffer, .. } = keyboard.source else { return };
     match event.completion() {
         xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT => {
-            let report: [u8; 8] = unsafe { core::ptr::read_volatile(keyboard.buffer as *const [u8; 8]) };
+            let report: [u8; 8] = unsafe { core::ptr::read_volatile(buffer as *const [u8; 8]) };
             keyboard.reports += 1;
             decode(keyboard, &report);
         }
-        _ => controller.reset_stalled_endpoint(keyboard.slot, keyboard.dci), // un-halt, then re-arm below
+        _ => controller.reset_stalled_endpoint(slot, dci), // un-halt, then re-arm below
     }
-    controller.queue_interrupt_in(keyboard.slot, keyboard.dci, keyboard.buffer, 8);
+    controller.queue_interrupt_in(slot, dci, buffer, 8);
 }
 
 /// Keys present now that were not in the previous report are new presses.
@@ -181,7 +205,8 @@ fn decode(keyboard: &mut Keyboard, report: &[u8; 8]) {
     keyboard.previous = *report;
 }
 
-/// Drains every controller's event ring (call from the main loop).
+/// Drains every controller's event ring and polls every EHCI keyboard queue (call
+/// from the main loop).
 pub fn poll() {
     for index in 0..xhci::count() {
         let Some(controller) = xhci::controller(index) else { continue };
@@ -189,6 +214,91 @@ pub fn poll() {
             background_event(controller, &event);
         }
     }
+    let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    for keyboard in keyboards.iter_mut().flatten() {
+        if let Source::Ehci { controller, index } = keyboard.source {
+            if let Some(report) = ehci::controller(controller).and_then(|c| c.poll_keyboard(index)) {
+                keyboard.reports += 1;
+                decode(keyboard, &report);
+            }
+        }
+    }
+}
+
+/// Probes every EHCI controller's connected ports (not yet claimed by a keyboard)
+/// for boot keyboards, directly or behind a hub. Returns how many were added.
+fn probe_all_ehci() -> usize {
+    let mut added = 0;
+    for index in 0..ehci::count() {
+        let Some(controller) = ehci::controller(index) else { continue };
+        for port in 1..=controller.ports {
+            if !controller.port_has_device(port) || controller.claimed_ports & (1 << port) != 0 {
+                continue;
+            }
+            let mut found = [None; 8];
+            let count = match controller.enumerate_port(port, &mut found) {
+                Ok(count) => count,
+                Err(ehci::Error::CompanionPort) => {
+                    crate::println!("USB: EHCI {:02x}:{:02x}.{} port {port}: a full/low-speed device wired to the root port belongs to the companion controller, which has no driver.", controller.pci.bus, controller.pci.device, controller.pci.function);
+                    continue;
+                }
+                Err(error) => {
+                    crate::println!("USB: EHCI {:02x}:{:02x}.{} port {port}: device not usable ({error:?}).", controller.pci.bus, controller.pci.device, controller.pci.function);
+                    continue;
+                }
+            };
+            for device in found[..count].iter().flatten() {
+                match setup_ehci_keyboard(index, controller, device) {
+                    Ok(true) => {
+                        controller.claimed_ports |= 1 << port;
+                        added += 1;
+                    }
+                    Ok(false) => {}
+                    Err(error) => crate::println!("USB: EHCI port {port}: device not usable ({error:?})."),
+                }
+            }
+        }
+    }
+    added
+}
+
+fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controller, found: &ehci::Found) -> Result<bool, ehci::Error> {
+    let target = found.target;
+    let (vendor, product) = (u16::from_le_bytes([found.descriptor[8], found.descriptor[9]]), u16::from_le_bytes([found.descriptor[10], found.descriptor[11]]));
+    let mut configuration = [0u8; 256];
+    controller.get_descriptor(&target, 2, 0, &mut configuration[..9])?;
+    let total = usize::from(u16::from_le_bytes([configuration[2], configuration[3]])).clamp(9, configuration.len());
+    controller.get_descriptor(&target, 2, 0, &mut configuration[..total])?;
+    let Some((interface, endpoint, max_packet, _interval)) = find_boot_keyboard(&configuration[..total]) else {
+        if let Some(endpoints) = usb_storage::find_endpoints(&configuration[..total]) {
+            controller.set_configuration(&target, configuration[5])?;
+            if let Some(disk) = usb_storage::attach_ehci(controller_index, target, endpoints) {
+                crate::println!("USB storage {vendor:04x}:{product:04x} on EHCI {:02x}:{:02x}.{}: disk{}.", controller.pci.bus, controller.pci.device, controller.pci.function, disk + 1);
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    };
+    controller.set_configuration(&target, configuration[5])?;
+    controller.control_transfer(&target, 0x21, 0x0b, 0, u16::from(interface), &mut [])?; // SET_PROTOCOL(boot)
+    let _ = controller.control_transfer(&target, 0x21, 0x0a, 0, u16::from(interface), &mut []); // SET_IDLE(0)
+    let index = controller.add_keyboard(target, endpoint, max_packet)?;
+    let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    let Some(slot) = keyboards.iter_mut().find(|entry| entry.is_none()) else { return Ok(false) };
+    *slot = Some(Keyboard { source: Source::Ehci { controller: controller_index, index }, previous: [0; 8], caps: false, reports: 0 });
+    crate::println!(
+        "USB keyboard {vendor:04x}:{product:04x} on EHCI {:02x}:{:02x}.{} ({}{}): ready.",
+        controller.pci.bus,
+        controller.pci.device,
+        controller.pci.function,
+        match target.speed {
+            ehci::Speed::High => "high speed",
+            ehci::Speed::Full => "full speed, split transactions",
+            ehci::Speed::Low => "low speed, split transactions",
+        },
+        if target.hub_address != 0 { ", behind a hub" } else { "" }
+    );
+    Ok(true)
 }
 
 pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
@@ -200,6 +310,15 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
             if status & 1 != 0 {
                 let speed = ((status >> 10) & 0xf) as u8;
                 print(format_args!("  port {port}: device connected ({}){}", xhci::speed_name(speed), if controller.slot_in_use_for_port(port) { ", in use" } else { "" }));
+            }
+        }
+    }
+    for index in 0..ehci::count() {
+        let Some(controller) = ehci::controller(index) else { continue };
+        print(format_args!("EHCI {:02x}:{:02x}.{}: {} ports", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports));
+        for port in 1..=controller.ports {
+            if controller.port_has_device(port) {
+                print(format_args!("  port {port}: device connected{}", if controller.claimed_ports & (1 << port) != 0 { ", keyboard" } else { "" }));
             }
         }
     }

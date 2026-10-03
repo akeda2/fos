@@ -7,7 +7,10 @@
 2. A USB keyboard (`usb-kbd` on `qemu-xhci`, with the PS/2 controller switched off so
    the keys can only arrive through the xHCI driver and its HID boot-keyboard
    handling).
-3. No keyboard at all (`-machine q35,i8042=off`: no 8042 on the board): the kernel
+3. A USB keyboard on `usb-ehci` (high speed; the split-transaction path for full/low
+   speed devices behind a hub's transaction translator needs real hardware, since
+   QEMU has no TT).
+4. No keyboard at all (`-machine q35,i8042=off`: no 8042 on the board): the kernel
    must still boot to its network shell, reporting the missing controller and
    carrying on. A keyboard is never a boot dependency.
 
@@ -85,9 +88,13 @@ def main():
     check("Unknown command: xz" in text, "Backspace edits the line", text)
 
     text = boot("q35,i8042=off", ps2_session, ["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"])
-    check("USB: 1 xHCI controller(s), 1 keyboard(s) found" in text, "the xHCI driver finds the USB keyboard", text)
+    check("USB: 1 xHCI and 0 EHCI controller(s), 1 usable device(s)" in text, "the xHCI driver finds the USB keyboard", text)
     check("USB keyboard 0627:0001" in text and "ready" in text, "and sets it up as a HID boot keyboard", text)
     check("ticks at 100 Hz" in text and "Unknown command: H" in text and "Unknown command: xz" in text, "keys typed on the USB keyboard reach the shell (letters, Shift, Backspace)", text)
+
+    text = boot("q35,i8042=off", ps2_session, ["-device", "usb-ehci,id=ehci", "-device", "usb-kbd,bus=ehci.0"])
+    check("USB: 0 xHCI and 1 EHCI controller(s), 1 usable device(s)" in text, "the EHCI driver finds a keyboard on a high-speed port", text)
+    check("ticks at 100 Hz" in text and "Unknown command: H" in text and "Unknown command: xz" in text, "keys typed on the EHCI keyboard reach the shell (its interrupt endpoint polled through the async schedule)", text)
 
     text = boot("q35,i8042=off", lambda send, wait_for: None)
     check("no 8042 controller" in text, "with no PS/2 controller the kernel reports it", text)

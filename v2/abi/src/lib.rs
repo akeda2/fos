@@ -9,7 +9,7 @@ pub mod keymap;
 
 /// "FOSV2BI\0" as a little-endian `u64`.
 pub const BOOT_INFO_MAGIC: u64 = u64::from_le_bytes(*b"FOSV2BI\0");
-pub const BOOT_INFO_VERSION: u32 = 4;
+pub const BOOT_INFO_VERSION: u32 = 5;
 
 /// The memory map, in the firmware's own format. Entries are `descriptor_size`
 /// bytes apart (never `size_of::<MemoryDescriptor>()`: the firmware may use a
@@ -73,6 +73,13 @@ pub struct BootInfo {
     /// Which A/B slot the kernel was loaded from.
     pub boot_slot: u32,
     pub reserved: u32,
+    /// The payload partition the loader read the kernel from: its unique GPT GUID
+    /// (on-disk byte order) and position. After `ExitBootServices` the kernel has no
+    /// firmware to ask which disk that was, so it scans its own drivers' disks for
+    /// the partition with this GUID, start and length (docs/v2-design.md, section 8).
+    pub payload_guid: [u8; 16],
+    pub payload_start: u64,
+    pub payload_sectors: u64,
 }
 
 impl BootInfo {
@@ -98,6 +105,9 @@ pub const SECTOR: usize = 512;
 /// GPT partition type GUID of the payload partition (a fos-specific value),
 /// in the mixed-endian byte order GPT stores GUIDs in.
 pub const PAYLOAD_TYPE_GUID: [u8; 16] = guid_bytes(0xf05b2a01, 0x0000, 0x4f05, [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa1]);
+/// GPT partition type GUID of the FOSFS data partition (v1's value, so a v1 data
+/// partition is recognised as is).
+pub const FOSFS_TYPE_GUID: [u8; 16] = guid_bytes(0x0f6f7362, 0x0000, 0x4f53, [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04]);
 /// Sector 0 of the payload partition is the metadata block; slot 0 starts at
 /// sector 1 and slot 1 follows it, each `SLOT_SECTORS` long (8 MiB).
 pub const SLOT_SECTORS: u64 = 16384;

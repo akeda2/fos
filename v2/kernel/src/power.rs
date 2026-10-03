@@ -4,6 +4,33 @@
 
 use crate::cpu;
 
+static mut RUNTIME_SERVICES: u64 = 0;
+
+/// Remembers the runtime-services table so a fault handler can reset the machine.
+pub fn set_runtime_services(table: u64) {
+    unsafe { RUNTIME_SERVICES = table };
+}
+
+pub fn runtime_services() -> u64 {
+    unsafe { RUNTIME_SERVICES }
+}
+
+/// Resets the machine: the UEFI `ResetSystem(EfiResetCold)` if available, else the 8042
+/// keyboard controller's CPU-reset line. Does not return.
+pub fn reset(runtime_services: u64) -> ! {
+    cpu::interrupts_disable();
+    if runtime_services != 0 {
+        let reset_system = unsafe { ((runtime_services + 24 + 10 * 8) as *const u64).read_unaligned() };
+        if reset_system != 0 {
+            let call: extern "efiapi" fn(kind: u32, status: usize, size: usize, data: *const u8) -> ! =
+                unsafe { core::mem::transmute(reset_system as usize) };
+            call(0, 0, 0, core::ptr::null())
+        }
+    }
+    cpu::outb(0x64, 0xfe);
+    cpu::halt()
+}
+
 /// Calls `ResetSystem(EfiResetShutdown)` through the runtime-services table. Returns
 /// only if the firmware does (then the caller halts).
 pub fn shutdown(runtime_services: u64) {

@@ -103,6 +103,9 @@ pub extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -
             kernel_size: kernel.size,
             boot_slot: slot as u32,
             reserved: 0,
+            payload_guid: payload.guid,
+            payload_start: payload.start,
+            payload_sectors: payload.sectors,
         });
     }
     println!("BootInfo at {:#x}. Exiting boot services: the firmware console, Block I/O and", info as usize);

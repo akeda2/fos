@@ -28,6 +28,10 @@ ESP_SECTORS = 36 * 2048            # 36 MiB: above FAT32's 65525-cluster floor a
 SLOT_SECTORS = 16384               # 8 MiB per kernel slot (v2/abi: SLOT_SECTORS)
 PAYLOAD_START = ESP_START + ESP_SECTORS
 PAYLOAD_SECTORS = 17 * 2048        # metadata sector + two slots, rounded up to 1 MiB
+FOSFS_TYPE_GUID = uuid.UUID("0f6f7362-0000-4f53-8000-000000000004")
+FOSFS_GUID = uuid.UUID("f05b2a00-0000-4f05-8000-000000000004")
+FOSFS_START = PAYLOAD_START + PAYLOAD_SECTORS
+FOSFS_SECTORS = 32 * 2048          # 32 MiB data partition (FOSFS v3, see kernel/src/fosfs.rs)
 GPT_ENTRIES = 128
 GPT_ENTRY_SIZE = 128
 GPT_ENTRY_SECTORS = GPT_ENTRIES * GPT_ENTRY_SIZE // SECTOR
@@ -178,7 +182,37 @@ def build_payload(kernel: bytes) -> bytes:
     return bytes(partition)
 
 
-def build_image(loader: bytes, kernel: bytes) -> bytes:
+def build_fosfs(files) -> bytes:
+    """A preformatted FOSFS v3 volume (the same layout as v1's tools/build_image.py):
+    a superblock, eight directory sectors of 64-byte entries, contiguous extents."""
+    directory_sectors, entry_size, data_start = 8, 64, 9
+    volume = bytearray(FOSFS_SECTORS * SECTOR)
+    superblock = bytearray(SECTOR)
+    superblock[0:8] = b"FOSFS3\0\0"
+    struct.pack_into("<HHIIQQ", superblock, 8, 3, entry_size, 1, directory_sectors, data_start, FOSFS_SECTORS - data_start)
+    volume[0:SECTOR] = superblock
+    next_sector = data_start
+    for index, (name, contents) in enumerate(files):
+        raw = name.encode("ascii")
+        if not (0 < len(raw) <= 16 and all(byte in b"abcdefghijklmnopqrstuvwxyz0123456789._-" for byte in raw)):
+            raise SystemExit(f"invalid FOSFS name {name!r}")
+        if index >= directory_sectors * SECTOR // entry_size:
+            raise SystemExit("too many FOSFS files")
+        count = (len(contents) + SECTOR - 1) // SECTOR
+        if next_sector + count > FOSFS_SECTORS:
+            raise SystemExit("FOSFS volume full")
+        entry = bytearray(entry_size)
+        entry[0], entry[1] = 1, len(raw)
+        struct.pack_into("<QQQ", entry, 4, next_sector, len(contents), count)
+        entry[28:28 + len(raw)] = raw
+        at = SECTOR + index * entry_size
+        volume[at:at + entry_size] = entry
+        volume[next_sector * SECTOR:next_sector * SECTOR + len(contents)] = contents
+        next_sector += count
+    return bytes(volume)
+
+
+def build_image(loader: bytes, kernel: bytes, files=()) -> bytes:
     image = bytearray(IMAGE_SECTORS * SECTOR)
     # Protective MBR: one partition of type 0xEE covering the disk.
     mbr = bytearray(SECTOR)
@@ -188,6 +222,7 @@ def build_image(loader: bytes, kernel: bytes) -> bytes:
 
     entries = (gpt_entry(ESP_TYPE_GUID, ESP_GUID, ESP_START, ESP_SECTORS, "EFI System")
                + gpt_entry(PAYLOAD_TYPE_GUID, PAYLOAD_GUID, PAYLOAD_START, PAYLOAD_SECTORS, "fos payload")
+               + gpt_entry(FOSFS_TYPE_GUID, FOSFS_GUID, FOSFS_START, FOSFS_SECTORS, "FOSFS data")
                ).ljust(GPT_ENTRIES * GPT_ENTRY_SIZE, b"\0")
     entries_crc = crc32(entries)
 
@@ -201,6 +236,8 @@ def build_image(loader: bytes, kernel: bytes) -> bytes:
     image[ESP_START * SECTOR:ESP_START * SECTOR + len(esp)] = esp
     payload = build_payload(kernel)
     image[PAYLOAD_START * SECTOR:PAYLOAD_START * SECTOR + len(payload)] = payload
+    fosfs = build_fosfs(files)
+    image[FOSFS_START * SECTOR:FOSFS_START * SECTOR + len(fosfs)] = fosfs
     return bytes(image)
 
 
@@ -209,9 +246,14 @@ def main():
     parser.add_argument("--loader", required=True, type=Path, help="the loader's PE image (BOOTX64.EFI)")
     parser.add_argument("--kernel", required=True, type=Path, help="the kernel ELF64, written to slot 0")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--file", action="append", default=[], metavar="NAME=PATH", help="preload a FOSFS file (repeatable)")
     arguments = parser.parse_args()
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
-    arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes()))
+    files = [("readme.txt", b"Welcome to FOSFS on fos v2.\nTry: ls, cat readme.txt, write NAME TEXT.\n")]
+    for spec in arguments.file:
+        name, _, path = spec.partition("=")
+        files = [item for item in files if item[0] != name] + [(name, Path(path).read_bytes())]
+    arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files))
     print(f"wrote {arguments.output}")
 
 

@@ -23,6 +23,8 @@ pub struct Partition {
     /// First LBA of the partition on its disk, and its length in sectors.
     pub start: u64,
     pub sectors: u64,
+    /// The partition's unique GUID (GPT on-disk byte order).
+    pub guid: [u8; 16],
 }
 
 impl Partition {
@@ -81,7 +83,7 @@ pub fn find_payload(boot: &BootServices) -> Option<Partition> {
             if entry[0..16] == PAYLOAD_TYPE_GUID {
                 let first = u64::from_le_bytes(entry[32..40].try_into().unwrap());
                 let last = u64::from_le_bytes(entry[40..48].try_into().unwrap());
-                return Some(Partition { block_io, media_id: media.media_id, start: first, sectors: last - first + 1 });
+                return Some(Partition { block_io, media_id: media.media_id, start: first, sectors: last - first + 1, guid: entry[16..32].try_into().unwrap() });
             }
         }
     }

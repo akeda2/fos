@@ -16,11 +16,17 @@
 #![no_main]
 
 mod acpi;
+mod ahci;
+mod block;
 mod apic;
+mod config;
 mod cpu;
 mod e1000;
+mod ehci;
 mod fault;
+mod fosfs;
 mod font_data;
+mod gpt;
 mod framebuffer;
 mod gdt;
 mod idt;
@@ -32,8 +38,10 @@ mod paging;
 mod pci;
 mod power;
 mod serial;
+mod storage;
 mod term;
 mod usb_hid;
+mod usb_storage;
 mod xhci;
 
 use core::fmt::Write;
@@ -103,13 +111,14 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("FOS v2 kernel (milestone M3b): running in 64-bit long mode.");
+    println!("FOS v2 kernel (milestone M4): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
         println!("BootInfo is not valid (magic {:#x}, version {}): stopping.", info.magic, info.version);
         cpu::halt();
     }
+    power::set_runtime_services(info.runtime_services);
     println!("BootInfo: version {}, kernel at {:#x} ({} KiB), booted from slot {}.", info.version, info.kernel_base, info.kernel_size / 1024, info.boot_slot);
     let fb = &info.framebuffer;
     println!(
@@ -239,14 +248,26 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     // ---- USB keyboards (xHCI) ----
     let controllers = xhci::init_all();
-    if controllers == 0 {
-        println!("USB: no xHCI controller (EHCI keyboards come next).");
+    let ehci_controllers = ehci::init_all();
+    if controllers + ehci_controllers == 0 {
+        println!("USB: no xHCI or EHCI controller.");
     } else {
         let keyboards = usb_hid::probe_all();
-        println!("USB: {controllers} xHCI controller(s), {keyboards} keyboard(s) found.");
+        println!("USB: {controllers} xHCI and {ehci_controllers} EHCI controller(s), {keyboards} usable device(s) (keyboards, disks).");
     }
 
-    println!("FOS v2 kernel: M3 complete. Waiting for a term net client (hostname {}).", term::HOSTNAME);
+    // ---- storage: find the boot disk by its partition GUID, mount FOSFS ----
+    storage::init(info);
+
+    // ---- per-machine configuration files, then the start script ----
+    config::load();
+    if config::debug().crash_on_boot {
+        println!("debug: crash-on-boot is set; faulting now.");
+        unsafe { core::arch::asm!("ud2") };
+    }
+    config::run_start(term::run_line);
+
+    println!("FOS v2 kernel: M3 complete. Waiting for a term net client.");
     term::start_local();
     loop {
         while let Some(key) = keyboard::pop() {

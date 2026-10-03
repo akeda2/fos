@@ -722,6 +722,104 @@ impl Controller {
         self.ring_doorbell(slot, dci);
     }
 
+    /// Adds a device's two bulk endpoints (Configure Endpoint). `*_endpoint` are endpoint
+    /// addresses (bit 7 = IN); `burst` is the SuperSpeed companion's max burst.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_bulk_endpoints(&mut self, device: &Device, in_endpoint: u8, in_max_packet: u16, in_burst: u8, out_endpoint: u8, out_max_packet: u16, out_burst: u8) -> Result<(), Error> {
+        let slot = usize::from(device.slot);
+        let in_dci = u32::from(in_endpoint & 0x0f) * 2 + 1;
+        let out_dci = u32::from(out_endpoint & 0x0f) * 2;
+        if in_dci >= DCI_COUNT as u32 || out_dci == 0 || out_dci >= DCI_COUNT as u32 {
+            return Err(Error::Unsupported);
+        }
+        let in_ring = Ring::allocate().ok_or(Error::NoMemory)?;
+        let out_ring = Ring::allocate().ok_or(Error::NoMemory)?;
+        let (input, output) = (self.slots[slot].input, self.slots[slot].output);
+        unsafe {
+            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
+            (input as *mut u32).add(1).write_volatile(1 | (1 << in_dci) | (1 << out_dci)); // add the slot context and both endpoints
+            core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
+            let slot_context = self.context_slot(input) as *mut u32;
+            let word0 = slot_context.read_volatile() & !(0x1f << 27);
+            slot_context.write_volatile(word0 | (in_dci.max(out_dci) << 27));
+            for (dci, ring, endpoint_type, max_packet, burst) in [(in_dci, in_ring, 6u32, in_max_packet, in_burst), (out_dci, out_ring, 2u32, out_max_packet, out_burst)] {
+                let context = self.context_endpoint(input, dci) as *mut u32;
+                context.add(1).write_volatile((3 << 1) | (endpoint_type << 3) | (u32::from(burst) << 8) | (u32::from(max_packet) << 16));
+                context.add(2).write_volatile(ring.base as u32 | 1);
+                context.add(3).write_volatile((ring.base >> 32) as u32);
+                context.add(4).write_volatile(1024);
+            }
+        }
+        self.slots[slot].rings[in_dci as usize] = in_ring;
+        self.slots[slot].rings[out_dci as usize] = out_ring;
+        self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24))?;
+        Ok(())
+    }
+
+    /// One bulk transfer between the device and the physical buffer at `buffer` (IN when
+    /// bit 7 of `endpoint` is set). No TRB may cross a 64 KiB boundary, so a transfer
+    /// is split into several chained TRBs. Returns the bytes moved.
+    pub fn bulk_transfer(&mut self, device: &Device, endpoint: u8, buffer: u64, length: u32, max_packet: u16) -> Result<usize, Error> {
+        const BOUNDARY: u64 = 64 * 1024;
+        let data_in = endpoint & 0x80 != 0;
+        let dci = u32::from(endpoint & 0x0f) * 2 + u32::from(data_in);
+        if length == 0 || length > 1024 * 1024 || dci == 0 || dci >= DCI_COUNT as u32 {
+            return Err(Error::Unsupported);
+        }
+        let ring = &mut self.slots[usize::from(device.slot)].rings[dci as usize];
+        if !ring.is_allocated() {
+            return Err(Error::Unsupported);
+        }
+        let mut offset = 0u32;
+        let mut last = 0;
+        // (TRB address, offset into the buffer, length): turns a short packet's TRB address into a byte count.
+        let mut pieces = [(0u64, 0u32, 0u32); 33];
+        let mut piece_count = 0;
+        while offset < length {
+            let address = buffer + u64::from(offset);
+            let piece = (length - offset).min((BOUNDARY - address % BOUNDARY) as u32);
+            let after = length - offset - piece;
+            // TD size: packets still to come after this TRB, capped at 31.
+            let td_size = after.div_ceil(u32::from(max_packet.max(1))).min(31);
+            let mut control = TRB_NORMAL << 10;
+            control |= if after != 0 { 1 << 4 } else { TRB_IOC }; // chain, or interrupt on the last
+            if data_in {
+                control |= TRB_ISP;
+            }
+            last = ring.push(address, piece | (td_size << 17), control);
+            pieces[piece_count] = (last, offset, piece);
+            piece_count += 1;
+            offset += piece;
+        }
+        self.ring_doorbell(device.slot, dci);
+        let mut short = None;
+        loop {
+            let slot = device.slot;
+            let event = self.wait_event(500, |event| event.kind() == TRB_TRANSFER_EVENT && event.slot() == slot && event.endpoint() == dci)?;
+            match event.code() {
+                CC_SUCCESS if event.parameter == last => break,
+                CC_SHORT_PACKET => {
+                    short = Some((event.parameter, event.status & 0x00ff_ffff));
+                    break; // a short packet ends the whole TD: no further events
+                }
+                CC_SUCCESS => {}
+                code => return Err(Error::Transfer(code)),
+            }
+        }
+        Ok(match short {
+            Some((trb, residual)) => pieces[..piece_count].iter().find(|piece| piece.0 == trb).map_or(length as usize, |&(_, at, piece)| (at + piece.saturating_sub(residual)) as usize),
+            None => length as usize,
+        })
+    }
+
+    /// Clears a halted bulk endpoint on both sides: the controller's (Reset Endpoint)
+    /// and the device's (CLEAR_FEATURE ENDPOINT_HALT).
+    pub fn clear_endpoint_halt(&mut self, device: &Device, endpoint: u8) {
+        let dci = u32::from(endpoint & 0x0f) * 2 + u32::from(endpoint & 0x80 != 0);
+        self.reset_endpoint(device, dci);
+        let _ = self.control_transfer(device, 0x02, 0x01, 0, u16::from(endpoint), &mut []);
+    }
+
     pub fn reset_stalled_endpoint(&mut self, slot: u8, dci: u32) {
         let device = Device { slot, port: 0, speed: 0, control_max_packet: 0 };
         self.reset_endpoint(&device, dci);

@@ -20,7 +20,25 @@ const TAG_HELLO: u8 = 0x20;
 const TAG_DATA: u8 = 0x21;
 const TAG_BYE: u8 = 0x22;
 const DATA_CAPACITY: usize = 1024;
-pub const HOSTNAME: &str = "fos2";
+/// The name announced in discovery replies: `NAME1` from the `hostname` file, or "fos2".
+fn hostname(out: &mut [u8; 20]) -> usize {
+    use core::fmt::Write;
+    struct Cursor<'a>(&'a mut [u8; 20], usize);
+    impl Write for Cursor<'_> {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let take = text.len().min(20 - self.1);
+            self.0[self.1..self.1 + take].copy_from_slice(&text.as_bytes()[..take]);
+            self.1 += take;
+            Ok(())
+        }
+    }
+    let mut cursor = Cursor(out, 0);
+    let _ = match crate::config::hostname() {
+        Some(base) => write!(cursor, "{base}1"),
+        None => write!(cursor, "fos2"),
+    };
+    cursor.1
+}
 
 static mut NIC: Option<E1000> = None;
 static mut PEER: Option<[u8; 6]> = None;
@@ -108,9 +126,12 @@ pub fn poll() {
         match frame[14] {
             TAG_DISCOVER_REQUEST => {
                 if let Some(nic) = nic() {
-                    send(nic, &source, TAG_DISCOVER_REPLY, HOSTNAME.as_bytes());
+                    let mut name = [0u8; 20];
+                    let length = hostname(&mut name);
+                    send(nic, &source, TAG_DISCOVER_REPLY, &name[..length]);
                 }
             }
+            TAG_HELLO if crate::config::deny_term_net() => {} // closed by the settings file: stay silent
             TAG_HELLO => {
                 // A new HELLO replaces any earlier session (the old client is gone or
                 // restarting); the screen and serial port show who connected.
@@ -121,7 +142,7 @@ pub fn poll() {
                     LAST_WAS_CR = false;
                 }
                 crate::println!("Remote terminal connected from {}.", Mac(&source));
-                crate::println!("{HOSTNAME}: type `help` for the commands.");
+                crate::println!("Type `help` for the commands.");
                 prompt();
             }
             TAG_DATA if session_open() && unsafe { *core::ptr::addr_of!(PEER) } == Some(source) => {
@@ -141,6 +162,11 @@ pub fn poll() {
     if session_open() {
         flush();
     }
+}
+
+/// Runs one command line (used by the `start` script).
+pub fn run_line(line: &str) {
+    execute(line);
 }
 
 /// Starts the local shell: prints the prompt for a keyboard at the machine.
@@ -215,6 +241,11 @@ fn execute(command: &str) {
             crate::println!("memory    physical memory statistics");
             crate::println!("pci       list PCI functions");
             crate::println!("nic       the network interface");
+            crate::println!("disks     disks found by the drivers");
+            crate::println!("ls        list FOSFS files");
+            crate::println!("cat NAME  show a file");
+            crate::println!("write NAME TEXT   create or replace a file");
+            crate::println!("rm NAME   delete a file");
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
             crate::println!("uptime    time since the timer started");
             crate::println!("dmesg     the boot log");
@@ -251,6 +282,64 @@ fn execute(command: &str) {
             }
             None => crate::println!("No network interface."),
         },
+        "disks" => {
+            for index in 0..crate::block::count() {
+                let disk = crate::block::get(index).unwrap();
+                crate::println!(
+                    "disk{}: {} MiB {} {}",
+                    index + 1,
+                    disk.sectors / 2048,
+                    core::str::from_utf8(&disk.origin[..disk.origin_length]).unwrap_or("?"),
+                    core::str::from_utf8(&disk.model).unwrap_or("?").trim()
+                );
+            }
+            match crate::storage::boot_disk() {
+                Some(disk) => crate::println!("boot disk: disk{}", disk + 1),
+                None => crate::println!("boot disk: not identified"),
+            }
+        }
+        "ls" => files(|volume| {
+            let mut any = false;
+            let outcome = volume.for_each(|entry| {
+                any = true;
+                crate::println!("{:<16} {:>8} bytes", core::str::from_utf8(entry.name()).unwrap_or("?"), entry.length);
+            });
+            match outcome {
+                Ok(()) if !any => crate::println!("FOSFS is empty."),
+                Ok(()) => {}
+                Err(error) => crate::println!("ls: {error:?}"),
+            }
+        }),
+        "cat" => {
+            let name = words.next().unwrap_or("");
+            files(|volume| match read_file(&volume, name.as_bytes()) {
+                Ok(Some(length)) => {
+                    let text = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(FILE_BUFFER) as *const u8, length) };
+                    crate::print(format_args!("{}", String8(text)));
+                    if !text.ends_with(b"\n") {
+                        crate::println!();
+                    }
+                }
+                Ok(None) => crate::println!("cat: no such file."),
+                Err(error) => crate::println!("cat: {error:?}"),
+            });
+        }
+        "write" => {
+            let name = words.next().unwrap_or("");
+            let text = command[command.find(name).map_or(0, |at| at + name.len())..].trim_start();
+            files(|volume| match volume.write(name.as_bytes(), text.as_bytes()) {
+                Ok(()) => crate::println!("Wrote {} bytes to {name}.", text.len()),
+                Err(error) => crate::println!("write: {error:?}"),
+            });
+        }
+        "rm" => {
+            let name = words.next().unwrap_or("");
+            files(|volume| match volume.remove(name.as_bytes()) {
+                Ok(true) => crate::println!("Removed {name}."),
+                Ok(false) => crate::println!("rm: no such file."),
+                Err(error) => crate::println!("rm: {error:?}"),
+            });
+        }
         "usb" => {
             if words.next() == Some("rescan") {
                 let added = crate::usb_hid::probe_all();
@@ -275,5 +364,33 @@ fn execute(command: &str) {
             cpu::outb(0x64, 0xfe);
         }
         other => crate::println!("Unknown command: {other} (try `help`)."),
+    }
+}
+
+/// Runs `action` on the boot volume, or says there is none.
+fn files(action: impl FnOnce(crate::fosfs::Volume)) {
+    match crate::storage::boot_volume() {
+        Some(volume) => action(volume),
+        None => crate::println!("No FOSFS volume is mounted (see `disks`)."),
+    }
+}
+
+const FILE_CAPACITY: usize = 64 * 1024;
+static mut FILE_BUFFER: [u8; FILE_CAPACITY] = [0; FILE_CAPACITY];
+
+fn read_file(volume: &crate::fosfs::Volume, name: &[u8]) -> Result<Option<usize>, crate::fosfs::Error> {
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(FILE_BUFFER) };
+    volume.read(name, buffer)
+}
+
+/// Prints bytes as text, replacing anything that is not printable ASCII or a newline.
+struct String8<'a>(&'a [u8]);
+impl core::fmt::Display for String8<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+        for &byte in self.0 {
+            let shown = if byte == b'\n' || (0x20..0x7f).contains(&byte) { byte as char } else { '.' };
+            core::fmt::Write::write_char(formatter, shown)?;
+        }
+        Ok(())
     }
 }
