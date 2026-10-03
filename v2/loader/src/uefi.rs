@@ -15,10 +15,18 @@ pub type Status = usize;
 
 pub const SUCCESS: Status = 0;
 
+/// `AllocatePages` types and the memory type the loader allocates as.
+pub const ALLOCATE_ANY_PAGES: u32 = 0;
+pub const ALLOCATE_ADDRESS: u32 = 2;
+pub const LOADER_DATA: u32 = 2;
+/// `LocateHandleBuffer` search type: every handle supporting a protocol.
+pub const BY_PROTOCOL: u32 = 2;
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Guid(pub u32, pub u16, pub u16, pub [u8; 8]);
 
+pub const BLOCK_IO_PROTOCOL: Guid = Guid(0x964e5b21, 0x6459, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
 pub const GRAPHICS_OUTPUT_PROTOCOL: Guid =
     Guid(0x9042a9de, 0x23dc, 0x4a38, [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a]);
 pub const ACPI_20_TABLE: Guid = Guid(0x8868e871, 0xe4f1, 0x11d3, [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81]);
@@ -78,7 +86,7 @@ pub struct BootServices {
     pub header: TableHeader,
     pub raise_tpl: usize,
     pub restore_tpl: usize,
-    pub allocate_pages: usize,
+    pub allocate_pages: extern "efiapi" fn(kind: u32, memory_type: u32, pages: usize, address: *mut u64) -> Status,
     pub free_pages: usize,
     pub get_memory_map: extern "efiapi" fn(
         size: *mut usize,
@@ -87,7 +95,7 @@ pub struct BootServices {
         descriptor_size: *mut usize,
         descriptor_version: *mut u32,
     ) -> Status,
-    pub allocate_pool: usize,
+    pub allocate_pool: extern "efiapi" fn(memory_type: u32, size: usize, buffer: *mut *mut c_void) -> Status,
     pub free_pool: usize,
     pub create_event: usize,
     pub set_timer: usize,
@@ -98,7 +106,7 @@ pub struct BootServices {
     pub install_protocol_interface: usize,
     pub reinstall_protocol_interface: usize,
     pub uninstall_protocol_interface: usize,
-    pub handle_protocol: usize,
+    pub handle_protocol: extern "efiapi" fn(handle: Handle, protocol: *const Guid, interface: *mut *mut c_void) -> Status,
     pub reserved: usize,
     pub register_protocol_notify: usize,
     pub locate_handle: usize,
@@ -108,7 +116,7 @@ pub struct BootServices {
     pub start_image: usize,
     pub exit: usize,
     pub unload_image: usize,
-    pub exit_boot_services: usize,
+    pub exit_boot_services: extern "efiapi" fn(image: Handle, map_key: usize) -> Status,
     pub get_next_monotonic_count: usize,
     pub stall: usize,
     pub set_watchdog_timer: extern "efiapi" fn(timeout: usize, code: u64, data_size: usize, data: *const u16) -> Status,
@@ -118,7 +126,13 @@ pub struct BootServices {
     pub close_protocol: usize,
     pub open_protocol_information: usize,
     pub protocols_per_handle: usize,
-    pub locate_handle_buffer: usize,
+    pub locate_handle_buffer: extern "efiapi" fn(
+        search_type: u32,
+        protocol: *const Guid,
+        search_key: *mut c_void,
+        count: *mut usize,
+        buffer: *mut *mut Handle,
+    ) -> Status,
     pub locate_protocol:
         extern "efiapi" fn(protocol: *const Guid, registration: *mut c_void, interface: *mut *mut c_void) -> Status,
 }
@@ -154,6 +168,35 @@ pub struct MemoryDescriptor {
     pub virtual_start: u64,
     pub pages: u64,
     pub attribute: u64,
+}
+
+/// Block I/O: sector reads on any block device the firmware has a driver for,
+/// including every disk and partition. Only valid before `ExitBootServices`: the
+/// kernel needs its own storage drivers (docs/v2-design.md, section 8).
+#[repr(C)]
+pub struct BlockIo {
+    pub revision: u64,
+    pub media: *mut BlockIoMedia,
+    pub reset: usize,
+    pub read_blocks:
+        extern "efiapi" fn(this: *mut BlockIo, media_id: u32, lba: u64, size: usize, buffer: *mut c_void) -> Status,
+    pub write_blocks: usize,
+    pub flush_blocks: usize,
+}
+
+#[repr(C)]
+pub struct BlockIoMedia {
+    pub media_id: u32,
+    pub removable_media: bool,
+    pub media_present: bool,
+    /// True for a partition handle, false for a whole disk (the loader wants the
+    /// whole disk, to read the GPT and any partition by LBA).
+    pub logical_partition: bool,
+    pub read_only: bool,
+    pub write_caching: bool,
+    pub block_size: u32,
+    pub io_align: u32,
+    pub last_block: u64,
 }
 
 #[repr(C)]

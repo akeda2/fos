@@ -153,7 +153,7 @@ help:
 	@echo "  make test-nic-map     - boot five NICs on virtual cables and check that nic map finds them"
 	@echo "  make test-tape-nettest-router - nettest UDP/IP traffic through the router tape (two guests)"
 	@echo "  make test-xhci - xHCI driver: addressing, usb storage attach/native over a QEMU xHCI stick"
-	@echo "  make v2-image / test-v2-loader - fos v2 UEFI loader (milestone M0) under QEMU + OVMF; see docs/v2-design.md"
+	@echo "  make v2-image / test-v2 - fos v2 UEFI loader + 64-bit kernel (milestone M1) under QEMU + OVMF; see docs/v2-design.md"
 	@echo "  make test-ahci - AHCI driver: sata, sata drives, sata attach with FOSFS on a QEMU SATA disk"
 	@echo "  make test-ehci - EHCI driver: addressing, usb storage attach/native over a QEMU EHCI stick"
 	@echo "  make test-usb-hosts - 'usb hosts' lists UHCI/OHCI/EHCI/xHCI controllers (QEMU with all four)"

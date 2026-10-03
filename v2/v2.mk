@@ -4,20 +4,27 @@
 
 V2_BUILD := $(BUILD)/v2
 V2_LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fos-loader.efi
+V2_KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fos-v2-kernel
 V2_IMAGE := $(V2_BUILD)/v2.img
 
-.PHONY: v2-loader v2-image v2-run test-v2-loader
+.PHONY: v2-loader v2-kernel v2-image v2-run test-v2
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
 v2-loader:
 	cd v2/loader && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
 
+# The kernel: an ELF64 at a fixed physical address (v2/kernel/linker.ld) for the
+# custom x86_64-fos-kernel target.
+v2-kernel:
+	cd v2/kernel && cargo +nightly-2026-09-13 build --release -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec
+
 # A bootable disk image: GPT + a FAT32 EFI System Partition with \EFI\BOOT\BOOTX64.EFI
-# (v2/tools/build_image.py; standard library only).
-v2-image: v2-loader
+# and a payload partition with the kernel in slot 0 (v2/tools/build_image.py;
+# standard library only).
+v2-image: v2-loader v2-kernel
 	mkdir -p $(V2_BUILD)
-	python3 v2/tools/build_image.py --loader $(V2_LOADER_EFI) --output $(V2_IMAGE)
+	python3 v2/tools/build_image.py --loader $(V2_LOADER_EFI) --kernel $(V2_KERNEL_ELF) --output $(V2_IMAGE)
 
 # Boot the image under QEMU + OVMF with the serial console on the terminal.
 v2-run: v2-image
@@ -27,5 +34,7 @@ v2-run: v2-image
 		-drive if=pflash,format=raw,file=$(V2_BUILD)/vars.fd \
 		-drive format=raw,file=$(V2_IMAGE)
 
-test-v2-loader: v2-image
-	python3 v2/tools/test_loader.py
+# Loader + kernel under QEMU + OVMF, including a framebuffer screendump check.
+test-v2: v2-image
+	cargo +nightly-2026-09-13 test --manifest-path v2/abi/Cargo.toml
+	python3 v2/tools/test_boot.py

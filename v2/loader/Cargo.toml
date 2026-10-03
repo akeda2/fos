@@ -14,3 +14,6 @@ codegen-units = 1
 lto = true
 opt-level = "z"
 strip = "symbols"
+
+[dependencies]
+fos-v2-abi = { path = "../abi" }

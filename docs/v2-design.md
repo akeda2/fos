@@ -94,8 +94,13 @@ Loader steps:
 2. Read the A/B slot metadata block and run `select_kernel_slot`'s state machine
    (a port of the logic now in `boot/stage2.S`), exactly as v1: one try for a
    pending slot, automatic fallback, same on-disk metadata bytes.
-3. Read the chosen slot's kernel (raw, by LBA, through Block I/O) and load its
-   ELF64 `PT_LOAD` segments at their linked physical addresses.
+3. Read the chosen slot's kernel (raw, by LBA, through Block I/O) and load it as a
+   **position-independent** ELF64 image: the loader allocates whatever physical
+   pages the firmware has free, copies the `PT_LOAD` segments there and applies
+   the `R_X86_64_RELATIVE` relocations. (The first M1 attempt linked the kernel
+   at a fixed address, 16 MiB, and the very first firmware tested, OVMF, refused:
+   its own boot-services data lives there. Real firmware memory maps differ even
+   more, so a fixed address was never going to be robust.)
 4. Collect the memory map, GOP framebuffer description, RSDP pointer, the boot
    disk's GPT partition GUID, and the UEFI runtime-services pointer into a
    `BootInfo` v4.
@@ -120,7 +125,7 @@ A GPT disk with three partitions:
 | Partition | Contents |
 | --- | --- |
 | ESP (FAT32, ~32 MiB) | `\EFI\BOOT\BOOTX64.EFI` (the loader) and nothing else the kernel depends on |
-| Payload (raw) | slot metadata block, then kernel slot 0 and slot 1 (A/B), same layout idea as v1 |
+| Payload (raw, GPT type `f05b2a01-0000-4f05-8000-0000000000a1`) | slot metadata block in v1's byte layout, then kernel slot 0 and slot 1 (A/B, 8 MiB each) |
 | FOSFS | the data partition (tapes, `debug`, `hostname`, `start`, `router.cfg`...) |
 
 The kernel is deliberately **not** a file on the ESP: KUP writes the inactive
@@ -135,8 +140,8 @@ there). `tools/build_image.py` gains a small pure-Python FAT32 writer for the ES
 - **Target**: a custom `x86_64-fos` target (no red zone, no SSE in the kernel,
   `panic = abort`), built with `-Z build-std` like v1. Kernel code never uses
   SSE; tapes may enable it for themselves.
-- **Memory map**: the kernel is linked at a fixed physical address above 1 MiB
-  and is no longer size-constrained. One physical allocator over the whole
+- **Memory map**: the kernel is a position-independent image the loader places
+  wherever the firmware has room, and is no longer size-constrained. One physical allocator over the whole
   memory map replaces `pmem`'s two pools; its bitmap is allocated at boot from
   the first usable region large enough, not baked into `.bss`. Allocation takes a
   "below 4 GiB" flag for DMA devices that need it (RTL8139, EHCI/UHCI, and anything
@@ -264,7 +269,7 @@ debug/watchdog/crash-record machinery, `devloop`.
 | # | Milestone | Done when |
 | --- | --- | --- |
 | M0 (done) | Loader skeleton | OVMF boots `BOOTX64.EFI`; it narrates to serial + firmware console, prints the memory map, GOP mode and RSDP. QEMU smoke test. |
-| M1 | Kernel hello | Loader loads an ELF64 kernel from a raw slot and exits boot services; kernel switches to its own GDT/page tables and prints through serial + framebuffer. |
+| M1 (done) | Kernel hello | Loader loads an ELF64 kernel from a raw slot and exits boot services; kernel switches to its own GDT/page tables and prints through serial + framebuffer. |
 | M2 | Memory and interrupts | Physical allocator, identity map with NX/guard pages, IDT, LAPIC timer tick, faults reported legibly. |
 | M3 | Shell and network | PCI scan, one NIC (e1000 under QEMU), `term net` session working from boot. This is the first point `devloop` can drive v2. |
 | M3b | Local keyboard | PS/2 (QEMU) and USB HID boot-protocol keyboards (xHCI/EHCI interrupt-IN) deliver keys to the shell prompt; tested in QEMU with `usb-kbd` on `qemu-xhci` and `usb-ehci`; verified on the Skylake once it is reachable. |

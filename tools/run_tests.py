@@ -89,7 +89,7 @@ E2E_MAKE = [
     "make test-xhci",
     "make test-ehci",
     "make test-ahci",
-    "make test-v2-loader",
+    "make test-v2",
     "make test-tape-nettest-router",
     "make test-tape-router",
     "make test-tape-router-arp",

@@ -1,0 +1,9 @@
+[package]
+name = "fos-v2-abi"
+version = "0.1.0"
+edition = "2024"
+
+# The contract between the v2 loader and the v2 kernel: the BootInfo the loader
+# hands over, and the on-disk layout of the payload partition (A/B kernel slots).
+# Plain data and a little parsing, no_std, so both sides (different targets) and
+# the host unit tests can use it.
