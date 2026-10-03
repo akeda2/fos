@@ -121,6 +121,7 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   physical-pointer compatibility for DMA and the BIOS trampoline while
   leaving unrelated high ranges unmapped for useful page-fault
   diagnostics; it is not userspace isolation.
+  `MAX_DYNAMIC_PAGE_TABLES` is 8.
   `make image-unsafe-memory` is the explicit teaching comparison: it builds
   a separate unpaged artifact, so it has neither those absent ranges nor the
   guard page and must not replace the default deployment image.
@@ -230,6 +231,9 @@ linker's own `ASSERT` failing after the fact. If this genuinely runs out
 again, the sustainable fix is moving the reserved region's own contents
 to make more room (e.g. shrinking `.bss`, or reducing `kernel_stack`'s
 size), not nudging `0x9f000` itself toward the hard `0xA0000` ceiling.
+The audio PCM jitter rings (`audio::PcmRing`, 160 KiB of `.bss` once) now take
+their bytes from `pmem` on first use, which is what made room for xHCI: the
+linked `__kernel_end` was `0x9efc8`-ish before and is about `0x7b000` after.
 
 ## Educational verbosity
 
@@ -831,6 +835,19 @@ controllers/ports and fully re-enumerates every time. Device addresses come from
   one boot can degrade BIOS legacy mapping for any BIOS-USB disk: reset before
   each fresh attempt when more than one is at stake. `reboot soft` stays a gap
   even when promoted (stage two needs BIOS to reload the kernel).
+
+- **xHCI** (`kernel/src/xhci.rs`, `usb xhci`, `usb hosts`): a polling-only xHCI
+  driver (root ports only, no hubs, one event-ring segment) built for USB Mass
+  Storage: BIOS handoff, controller reset, command/event/transfer rings, Address
+  Device, control and bulk transfers (64 KiB TRB-boundary splitting), Configure
+  Endpoint. `usb_storage.rs` drives either host through its `Host` enum
+  (`open_all` tries UHCI ports, then xHCI ports; xHCI skips UHCI's settle
+  delays), so `usb storage [attach|promote]` and `usb native` work over both.
+  Like UHCI it must not run at boot: taking the controller ends the BIOS's INT13h
+  emulation of the boot stick, so `promote` reads its BIOS baselines first. Real
+  machines: Skylake = xHCI only; Sandy Bridge = 2 EHCI (boot sticks) + NEC xHCI;
+  AMD/nForce = OHCI + EHCI (no driver yet). Tests: `make test-xhci`,
+  `test-usb-hosts` (QEMU `qemu-xhci` + `usb-storage`).
 
 Tests: `tapes/test_uhci_e2e.py`, `test_uhci_play_e2e.py`,
 `test_uhci_audio_facade_e2e.py`, `test_usb_storage_e2e.py`,

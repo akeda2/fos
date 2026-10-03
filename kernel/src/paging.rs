@@ -51,7 +51,7 @@ const PAGE_DIRECTORY_ENTRIES: usize = 1024;
 /// legacy PIC IRQ path, the same "cleanly unavailable, not a fault"
 /// convention `disk.rs` already uses for a zero `bios_disk_io` pointer.
 #[cfg(not(feature = "legacy-unsafe-memory"))]
-const MAX_DYNAMIC_PAGE_TABLES: usize = 4;
+const MAX_DYNAMIC_PAGE_TABLES: usize = 8; // see the history above: 4 were enough until xHCI joined
 
 #[cfg(not(feature = "legacy-unsafe-memory"))]
 const PAGE_PRESENT: u32 = 1 << 0;

@@ -56,6 +56,7 @@ const SUBCLASS_SERIAL: u8 = 0x00;
 const CLASS_SERIAL_BUS: u8 = 0x0c;
 const SUBCLASS_USB: u8 = 0x03;
 const PROG_IF_UHCI: u8 = 0x00;
+const PROG_IF_XHCI: u8 = 0x30;
 
 const HEADER_TYPE_MULTIFUNCTION: u8 = 0x80;
 const BAR0_OFFSET: u8 = 0x10;
@@ -330,6 +331,42 @@ impl PciAddress {
         }
         let base = bar & 0xffff_fff0;
         (base != 0).then_some(base)
+    }
+
+    /// A memory BAR's physical base and size in bytes, accepting 64-bit BARs
+    /// whose upper half is zero (xHCI controllers commonly advertise a 64-bit
+    /// BAR even when it sits below 4 GiB; the kernel's `u32` physical addresses
+    /// cannot use one that does not). The size comes from the usual probe --
+    /// write all ones, read back the mask, restore -- done with memory decoding
+    /// switched off in the command register, so the device never answers at a
+    /// bogus address while the BAR holds the probe value.
+    pub fn memory_bar_region(&self, index: u8) -> Option<(u32, u32)> {
+        if index >= 6 {
+            return None;
+        }
+        let offset = BAR0_OFFSET + index * 4;
+        let original = read_u32(self.bus, self.device, self.function, offset);
+        if original & BAR_IS_IO_SPACE != 0 {
+            return None;
+        }
+        let is_64_bit = (original >> 1) & 0b11 == 0b10;
+        if is_64_bit {
+            if index >= 5 || read_u32(self.bus, self.device, self.function, offset + 4) != 0 {
+                return None;
+            }
+        }
+        let base = original & 0xffff_fff0;
+        if base == 0 {
+            return None;
+        }
+        let command = read_u32(self.bus, self.device, self.function, 0x04);
+        write_u32(self.bus, self.device, self.function, 0x04, command & !0x7);
+        write_u32(self.bus, self.device, self.function, offset, 0xffff_ffff);
+        let mask = read_u32(self.bus, self.device, self.function, offset);
+        write_u32(self.bus, self.device, self.function, offset, original);
+        write_u32(self.bus, self.device, self.function, 0x04, command);
+        let size = (!(mask & 0xffff_fff0)).wrapping_add(1);
+        (size != 0).then_some((base, size))
     }
 
     /// Sets the I/O Space Enable (bit 0) and Bus Master Enable (bit 2)
@@ -750,7 +787,7 @@ pub fn find_serial_ports(out: &mut [u16]) -> usize {
 /// needs `enable_io_and_bus_master()` (UHCI is DMA-capable, walking its
 /// Frame List/Queue Heads/Transfer Descriptors by bus mastering) and
 /// `interrupt_line()`.
-pub fn find_uhci_controllers(out: &mut [Option<PciAddress>]) -> usize {
+pub fn find_usb_controllers(wanted_prog_if: u8, out: &mut [Option<PciAddress>]) -> usize {
     let mut count = 0;
     for bus in 0..=255u8 {
         for device in 0..32u8 {
@@ -776,7 +813,7 @@ pub fn find_uhci_controllers(out: &mut [Option<PciAddress>]) -> usize {
                 let class = read_u8(bus, device, function, 0x0b);
                 let subclass = read_u8(bus, device, function, 0x0a);
                 let prog_if = read_u8(bus, device, function, 0x09);
-                if class != CLASS_SERIAL_BUS || subclass != SUBCLASS_USB || prog_if != PROG_IF_UHCI
+                if class != CLASS_SERIAL_BUS || subclass != SUBCLASS_USB || prog_if != wanted_prog_if
                 {
                     continue;
                 }
@@ -793,4 +830,14 @@ pub fn find_uhci_controllers(out: &mut [Option<PciAddress>]) -> usize {
         }
     }
     count
+}
+
+/// UHCI (USB 1.1) host controllers: see `find_usb_controllers`.
+pub fn find_uhci_controllers(out: &mut [Option<PciAddress>]) -> usize {
+    find_usb_controllers(PROG_IF_UHCI, out)
+}
+
+/// xHCI (USB 3.x) host controllers: see `find_usb_controllers`.
+pub fn find_xhci_controllers(out: &mut [Option<PciAddress>]) -> usize {
+    find_usb_controllers(PROG_IF_XHCI, out)
 }

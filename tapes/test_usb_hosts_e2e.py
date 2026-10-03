@@ -24,11 +24,12 @@ def main():
         for kind, found in lines.items():
             check(len(found) == 1, f"exactly one {kind} controller is listed", text)
         check("8086:7020" in lines["UHCI"][0] and "[driver]" in lines["UHCI"][0], "UHCI is the PIIX3's and has a driver", text)
-        check("[driver]" not in "".join(lines["OHCI"] + lines["EHCI"] + lines["xHCI"]), "the others are marked as having no driver", text)
+        check("[driver]" not in "".join(lines["OHCI"] + lines["EHCI"]), "OHCI and EHCI are marked as having no driver", text)
+        check("[driver]" in lines["xHCI"][0], "xHCI has a driver", text)
         check("1033:" in lines["xHCI"][0] or "1b36:000d" in lines["xHCI"][0], "xHCI is QEMU's qemu-xhci", text)
         check(max(len(line) for line in text.splitlines()[1:]) <= 79, "every line fits 80 columns", text)
         text = lab.shell("usb")
-        check("USB hosts: 1 UHCI, 1 OHCI, 1 EHCI, 1 xHCI" in text, "plain `usb` opens with the tally", text)
+        check("USB hosts: 1 UHCI, 1 OHCI, 1 EHCI, 1 xHCI (drivers: UHCI, xHCI)" in text, "plain `usb` opens with the tally", text)
     finally:
         lab.stop()
     print("usb hosts e2e: all checks passed")

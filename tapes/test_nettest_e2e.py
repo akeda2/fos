@@ -203,14 +203,28 @@ def main():
         b.accept()
         return guest, a, b
 
-    # Default 128 MiB guest: no big pool, so the static fallback queue is used.
-    guest, seg_a, seg_b = launch(128)
+    # A guest too small for `alloc` to find even frame-pool room (the kernel keeps
+    # a 4 MiB frame reserve): the static fallback queue is used. (A 128 MiB guest
+    # has no big pool but `alloc` now falls back to the frame pool, so it gets
+    # the full-size queue: checked below.)
+    guest, seg_a, seg_b = launch(12)
     try:
         # The shipped example file (ports, a preset, a per-direction setting, a seed).
         banner = start_tape(guest, seg_a, "@nettest.cfg")
-        check("256 frames of queue per way" in banner, "128 MiB guest falls back to the static queue", guest)
+        check("256 frames of queue per way" in banner, "a 12 MiB guest falls back to the static queue", guest)
         check("NIC 1 <-> NIC 2" in banner and "loss 10.0% x6" in banner and "b>a  loss 2.0%" in banner,
               "the shipped nettest.cfg configures ports, a preset and a per-direction loss", guest)
+        command(guest, seg_a, "quit", b"fos> ")
+    finally:
+        guest.stop()
+        seg_a.close()
+        seg_b.close()
+
+    guest, seg_a, seg_b = launch(128)
+    try:
+        banner = start_tape(guest, seg_a, "1 2 seed=5")
+        check("frames of queue per way" in banner and "256 frames" not in banner,
+              "a 128 MiB guest (no big pool) takes the queue from the frame pool", guest)
         command(guest, seg_a, "quit", b"fos> ")
     finally:
         guest.stop()

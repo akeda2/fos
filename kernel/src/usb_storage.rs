@@ -26,6 +26,7 @@
 //! it as an ordinary secondary disk is later, separate work.
 
 use crate::uhci::{self, Uhci};
+use crate::xhci::{self, Xhci};
 
 const MSC_CLASS: u8 = 0x08;
 const MSC_SUBCLASS_SCSI: u8 = 0x06;
@@ -80,9 +81,23 @@ fn wait_ticks(count: u64) {
 struct MscEndpoints {
     interface_number: u8,
     in_endpoint: u8,
-    in_max_packet: u8,
+    /// As declared by the device (512 for a high-speed stick, 1024 SuperSpeed);
+    /// the UHCI path clamps it to full speed's 64 where it hands it to the
+    /// controller.
+    in_max_packet: u16,
+    in_burst: u8,
     out_endpoint: u8,
-    out_max_packet: u8,
+    out_max_packet: u16,
+    out_burst: u8,
+}
+
+/// The host controller a device hangs off: UHCI (USB 1.1, full-speed sticks
+/// only) or xHCI (any speed, where the controller tracks toggles and slots
+/// itself and the driver hands back a slot-bearing handle).
+#[derive(Clone, Copy)]
+enum Host {
+    Uhci(&'static Uhci),
+    Xhci(&'static Xhci, xhci::Device),
 }
 
 /// Walks a configuration descriptor's raw bytes generically, one
@@ -96,13 +111,19 @@ struct MscEndpoints {
 fn find_msc_endpoints(config: &[u8]) -> Option<MscEndpoints> {
     const DESC_INTERFACE: u8 = 0x04;
     const DESC_ENDPOINT: u8 = 0x05;
+    /// SuperSpeed Endpoint Companion: follows each endpoint descriptor of a
+    /// SuperSpeed device; byte 2 is bMaxBurst (packets per burst minus one).
+    const DESC_SS_COMPANION: u8 = 0x30;
     const TRANSFER_TYPE_BULK: u8 = 0x02;
 
     let mut offset = 0usize;
     let mut interface_number = 0u8;
     let mut in_msc_interface = false;
-    let mut in_endpoint: Option<(u8, u8)> = None;
-    let mut out_endpoint: Option<(u8, u8)> = None;
+    // (address, max packet, burst) of each bulk endpoint seen so far.
+    let mut in_endpoint: Option<(u8, u16, u8)> = None;
+    let mut out_endpoint: Option<(u8, u16, u8)> = None;
+    // Which endpoint a following SuperSpeed companion descriptor belongs to.
+    let mut last_was_in = false;
 
     while offset + 1 < config.len() {
         let length = config[offset] as usize;
@@ -112,6 +133,11 @@ fn find_msc_endpoints(config: &[u8]) -> Option<MscEndpoints> {
         let descriptor_type = config[offset + 1];
         match descriptor_type {
             DESC_INTERFACE if length >= 9 => {
+                // The first matching interface wins: once its endpoints are
+                // known (companions included), the next interface ends the scan.
+                if in_endpoint.is_some() && out_endpoint.is_some() {
+                    break;
+                }
                 let candidate_interface = config[offset + 2];
                 let class = config[offset + 5];
                 let subclass = config[offset + 6];
@@ -127,34 +153,40 @@ fn find_msc_endpoints(config: &[u8]) -> Option<MscEndpoints> {
             DESC_ENDPOINT if in_msc_interface && length >= 7 => {
                 let endpoint_address = config[offset + 2];
                 let attributes = config[offset + 3];
-                let max_packet_size = u16::from_le_bytes([config[offset + 4], config[offset + 5]]);
+                let max_packet_size = u16::from_le_bytes([config[offset + 4], config[offset + 5]]) & 0x07ff;
                 if attributes & 0x03 == TRANSFER_TYPE_BULK {
-                    // Full-speed bulk is capped at 64 bytes/packet; UHCI
-                    // (this driver's only host-controller family) is
-                    // full-speed-only, so a larger declared value can't
-                    // legitimately occur here.
-                    let max_packet = max_packet_size.min(64) as u8;
-                    if endpoint_address & 0x80 != 0 {
-                        in_endpoint = Some((endpoint_address, max_packet));
+                    last_was_in = endpoint_address & 0x80 != 0;
+                    if last_was_in {
+                        in_endpoint = Some((endpoint_address, max_packet_size, 0));
                     } else {
-                        out_endpoint = Some((endpoint_address, max_packet));
+                        out_endpoint = Some((endpoint_address, max_packet_size, 0));
                     }
                 }
-                if let (Some((in_addr, in_mp)), Some((out_addr, out_mp))) = (in_endpoint, out_endpoint) {
-                    return Some(MscEndpoints {
-                        interface_number,
-                        in_endpoint: in_addr,
-                        in_max_packet: in_mp,
-                        out_endpoint: out_addr,
-                        out_max_packet: out_mp,
-                    });
+            }
+            DESC_SS_COMPANION if in_msc_interface && length >= 3 => {
+                let burst = config[offset + 2];
+                if last_was_in {
+                    if let Some(endpoint) = in_endpoint.as_mut() {
+                        endpoint.2 = burst;
+                    }
+                } else if let Some(endpoint) = out_endpoint.as_mut() {
+                    endpoint.2 = burst;
                 }
             }
             _ => {}
         }
         offset += length;
     }
-    None
+    let ((in_addr, in_mp, in_burst), (out_addr, out_mp, out_burst)) = (in_endpoint?, out_endpoint?);
+    Some(MscEndpoints {
+        interface_number,
+        in_endpoint: in_addr,
+        in_max_packet: in_mp,
+        in_burst,
+        out_endpoint: out_addr,
+        out_max_packet: out_mp,
+        out_burst,
+    })
 }
 
 /// Scans every discovered controller/port for devices offering a usable
@@ -219,7 +251,7 @@ pub fn open_all(out: &mut [Option<MscDevice>]) -> usize {
                 continue;
             }
             out[opened] = Some(MscDevice {
-                controller,
+                host: Host::Uhci(controller),
                 endpoints,
                 device_address,
                 control_max_packet: max_packet0,
@@ -234,7 +266,70 @@ pub fn open_all(out: &mut [Option<MscDevice>]) -> usize {
             opened += 1;
         }
     }
+    for index in 0..xhci::count() {
+        let Some(controller) = xhci::get(index) else { continue };
+        for port in 1..=controller.port_count() {
+            if opened >= out.len() {
+                return opened;
+            }
+            if let Some(device) = open_xhci_port(controller, port) {
+                out[opened] = Some(device);
+                opened += 1;
+            }
+        }
+    }
     opened
+}
+
+/// The xHCI half of `open_all`'s per-port work: address the device, read its
+/// descriptors, and -- if it offers a Bulk-Only Mass Storage interface -- tell
+/// the controller about its bulk endpoints and select the configuration (in that
+/// order, as Linux does). Anything that is not such a device, or that fails
+/// along the way, gives its slot back and yields `None`.
+fn open_xhci_port(controller: &'static Xhci, port: u8) -> Option<MscDevice> {
+    let mut device = controller.open_port(port).ok()?;
+    let opened = (|| -> Result<MscEndpoints, xhci::Error> {
+        let mut first8 = [0u8; 8];
+        controller.get_descriptor(&device, uhci::USB_DESCRIPTOR_DEVICE, 0, &mut first8)?;
+        if device.speed <= 2 {
+            // A full- or low-speed device may use a smaller default-pipe
+            // packet size than the controller was told at address time.
+            controller.set_control_max_packet(&mut device, u16::from(first8[7]))?;
+        }
+        let mut header = [0u8; 9];
+        controller.get_descriptor(&device, uhci::USB_DESCRIPTOR_CONFIGURATION, 0, &mut header)?;
+        let total = (u16::from_le_bytes([header[2], header[3]]) as usize).min(uhci::MAX_DESCRIPTOR_BYTES);
+        let mut config = [0u8; uhci::MAX_DESCRIPTOR_BYTES];
+        let read = controller.get_descriptor(&device, uhci::USB_DESCRIPTOR_CONFIGURATION, 0, &mut config[..total])?;
+        let endpoints = find_msc_endpoints(&config[..read]).ok_or(xhci::Error::Unsupported)?;
+        controller.configure_bulk_endpoints(
+            &device,
+            endpoints.in_endpoint,
+            endpoints.in_max_packet,
+            endpoints.in_burst,
+            endpoints.out_endpoint,
+            endpoints.out_max_packet,
+            endpoints.out_burst,
+        )?;
+        controller.set_configuration(&device, config.get(5).copied().unwrap_or(1))?;
+        Ok(endpoints)
+    })();
+    match opened {
+        Ok(endpoints) => Some(MscDevice {
+            host: Host::Xhci(controller, device),
+            endpoints,
+            device_address: device.slot,
+            control_max_packet: device.control_max_packet.min(255) as u8,
+            port,
+            in_toggle: false,
+            out_toggle: false,
+            next_tag: 0,
+        }),
+        Err(_) => {
+            controller.release_slot(device.slot);
+            None
+        }
+    }
 }
 
 fn build_cbw(tag: u32, data_transfer_length: u32, data_in: bool, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
@@ -262,7 +357,7 @@ fn build_cbw(tag: u32, data_transfer_length: u32, data_in: bool, lun: u8, cdb: &
 /// into its owning static by value, not shared.
 #[derive(Clone, Copy)]
 pub struct MscDevice {
-    controller: &'static Uhci,
+    host: Host,
     endpoints: MscEndpoints,
     device_address: u8,
     control_max_packet: u8,
@@ -296,7 +391,48 @@ impl MscDevice {
     /// refresh the existing `diskN` handle instead of attaching the device
     /// a second time under a new number.
     pub fn same_physical_device(&self, other: &MscDevice) -> bool {
-        core::ptr::eq(self.controller, other.controller) && self.port == other.port
+        let same_controller = match (self.host, other.host) {
+            (Host::Uhci(a), Host::Uhci(b)) => core::ptr::eq(a, b),
+            (Host::Xhci(a, _), Host::Xhci(b, _)) => core::ptr::eq(a, b),
+            _ => false,
+        };
+        same_controller && self.port == other.port
+    }
+
+    /// Whether this device is behind xHCI, whose controller already paces its
+    /// own transfers: the real-hardware settle delays UHCI needed between
+    /// stages are skipped.
+    fn settle(&self) {
+        if matches!(self.host, Host::Uhci(_)) {
+            wait_ticks(1);
+        }
+    }
+
+    /// One bulk transfer on the data (`data_in` = IN endpoint) or command
+    /// (`false` = OUT endpoint) pipe. UHCI tracks the DATA0/DATA1 toggle in this
+    /// struct; xHCI keeps its own state per endpoint.
+    fn bulk(&mut self, data_in: bool, buffer: &mut [u8]) -> Result<usize, crate::uhci::Error> {
+        let (endpoint, max_packet) = if data_in {
+            (self.endpoints.in_endpoint, self.endpoints.in_max_packet)
+        } else {
+            (self.endpoints.out_endpoint, self.endpoints.out_max_packet)
+        };
+        match self.host {
+            Host::Uhci(controller) => {
+                let toggle = if data_in { &mut self.in_toggle } else { &mut self.out_toggle };
+                controller.bulk_transfer(
+                    self.device_address,
+                    endpoint & 0x0f,
+                    max_packet.min(64) as u8,
+                    buffer,
+                    data_in,
+                    toggle,
+                )
+            }
+            Host::Xhci(controller, ref device) => {
+                controller.bulk_transfer(device, endpoint, buffer, max_packet).map_err(|error| error.as_uhci())
+            }
+        }
     }
 
     fn next_tag(&mut self) -> u32 {
@@ -318,19 +454,30 @@ impl MscDevice {
     /// candidate in a known-good state for a possible retry against a
     /// different disk.
     pub(crate) fn recover(&mut self) {
-        let _ = self.controller.bulk_only_mass_storage_reset(
-            self.device_address,
-            self.control_max_packet,
-            self.endpoints.interface_number,
-        );
-        let _ =
-            self.controller
-                .clear_endpoint_halt(self.device_address, self.control_max_packet, self.endpoints.in_endpoint);
-        let _ = self.controller.clear_endpoint_halt(
-            self.device_address,
-            self.control_max_packet,
-            self.endpoints.out_endpoint,
-        );
+        match self.host {
+            Host::Uhci(controller) => {
+                let _ = controller.bulk_only_mass_storage_reset(
+                    self.device_address,
+                    self.control_max_packet,
+                    self.endpoints.interface_number,
+                );
+                let _ = controller.clear_endpoint_halt(
+                    self.device_address,
+                    self.control_max_packet,
+                    self.endpoints.in_endpoint,
+                );
+                let _ = controller.clear_endpoint_halt(
+                    self.device_address,
+                    self.control_max_packet,
+                    self.endpoints.out_endpoint,
+                );
+            }
+            Host::Xhci(controller, ref device) => {
+                let _ = controller.bulk_only_mass_storage_reset(device, self.endpoints.interface_number);
+                let _ = controller.clear_endpoint_halt(device, self.endpoints.in_endpoint);
+                let _ = controller.clear_endpoint_halt(device, self.endpoints.out_endpoint);
+            }
+        }
         self.in_toggle = false;
         self.out_toggle = false;
     }
@@ -378,40 +525,23 @@ impl MscDevice {
     fn command_once(&mut self, lun: u8, cdb: &[u8], buffer: &mut [u8], data_in: bool) -> Result<usize, Error> {
         let tag = self.next_tag();
         let mut cbw = build_cbw(tag, buffer.len() as u32, data_in, lun, cdb);
-        if let Err(error) = self.controller.bulk_transfer(
-            self.device_address,
-            self.endpoints.out_endpoint & 0x0f,
-            self.endpoints.out_max_packet,
-            &mut cbw,
-            false,
-            &mut self.out_toggle,
-        ) {
+        if let Err(error) = self.bulk(false, &mut cbw) {
             self.recover();
             return Err(Error::TransportFailed(error));
         }
-        // Every bulk_transfer call stops the queue on its own completion
+        // Every UHCI bulk_transfer call stops the queue on its own completion
         // and the *next* one restarts it fresh from scratch -- unlike
         // `control_transfer`, which keeps one QH continuously armed across
         // its entire SETUP+DATA+STATUS chain without ever stopping it
         // mid-exchange. A brief settle delay here, before the very next
         // stage restarts that queue, is the same real-hardware-only
         // turnaround-time accommodation already confirmed necessary
-        // between the data stage and the CSW below.
-        wait_ticks(1);
+        // between the data stage and the CSW below. (xHCI needs none.)
+        self.settle();
 
         let mut transferred = 0usize;
         if !buffer.is_empty() {
-            let endpoint = if data_in { self.endpoints.in_endpoint } else { self.endpoints.out_endpoint };
-            let max_packet = if data_in { self.endpoints.in_max_packet } else { self.endpoints.out_max_packet };
-            let toggle = if data_in { &mut self.in_toggle } else { &mut self.out_toggle };
-            match self.controller.bulk_transfer(
-                self.device_address,
-                endpoint & 0x0f,
-                max_packet,
-                buffer,
-                data_in,
-                toggle,
-            ) {
+            match self.bulk(data_in, buffer) {
                 Ok(len) => transferred = len,
                 Err(error) => {
                     self.recover();
@@ -426,18 +556,11 @@ impl MscDevice {
             // (Active never clears) on a genuine Kingston flash drive,
             // even though the exact same IN endpoint just successfully
             // completed the data stage moments earlier.
-            wait_ticks(1);
+            self.settle();
         }
 
         let mut csw = [0u8; CSW_LEN];
-        if let Err(error) = self.controller.bulk_transfer(
-            self.device_address,
-            self.endpoints.in_endpoint & 0x0f,
-            self.endpoints.in_max_packet,
-            &mut csw,
-            true,
-            &mut self.in_toggle,
-        ) {
+        if let Err(error) = self.bulk(true, &mut csw) {
             self.recover();
             return Err(Error::TransportFailed(error));
         }
@@ -448,7 +571,7 @@ impl MscDevice {
         // `read_10` calls in a tight loop with no caller-side pacing of
         // its own), the same real-hardware-only turnaround-time
         // requirement as the intra-command delays above.
-        wait_ticks(1);
+        self.settle();
 
         let signature = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
         let csw_tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);

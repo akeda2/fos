@@ -31,7 +31,6 @@
 //! bytes-per-frame the active device's own `AudioFormat` implies, with no
 //! assumption about bit depth or channel count baked in beyond that.
 
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ac97;
@@ -99,8 +98,17 @@ pub const RING_CAPACITY_BYTES: usize = 16384;
 /// byte it implies is valid -- sufficient on this project's x86 target
 /// for the producer/consumer byte-visibility guarantee this needs, the
 /// same reasoning already used for those two existing queues.
+///
+/// The backing store is **not** a static array: the kernel's low-memory region
+/// is nearly full (see AGENTS.md's "Low-memory map"), and four of these rings
+/// (two per audio driver) plus two for USB audio were 160 KiB of `.bss` that no
+/// machine without that sound hardware ever uses. The bytes now come from
+/// `pmem` the first time something is pushed (`buffer`), and the ring simply
+/// reads as empty until then.
 pub struct PcmRing {
-    buffer: UnsafeCell<[u8; RING_CAPACITY_BYTES]>,
+    /// Physical address of the `RING_CAPACITY_BYTES` of storage, 0 until the
+    /// first `push` allocates it.
+    buffer_address: AtomicU32,
     write_pos: AtomicU32,
     read_pos: AtomicU32,
 }
@@ -114,10 +122,27 @@ unsafe impl Sync for PcmRing {}
 impl PcmRing {
     pub const fn new() -> Self {
         PcmRing {
-            buffer: UnsafeCell::new([0u8; RING_CAPACITY_BYTES]),
+            buffer_address: AtomicU32::new(0),
             write_pos: AtomicU32::new(0),
             read_pos: AtomicU32::new(0),
         }
+    }
+
+    /// The ring's storage, allocating it on first use when `allocate` is set.
+    /// Only the producer (`push`) allocates; the interrupt-side consumers just
+    /// see "nothing yet", so no allocation ever happens inside an ISR.
+    fn buffer(&self, allocate: bool) -> Option<*mut u8> {
+        let current = self.buffer_address.load(Ordering::Acquire);
+        if current != 0 {
+            return Some(current as *mut u8);
+        }
+        if !allocate {
+            return None;
+        }
+        let frames = RING_CAPACITY_BYTES.div_ceil(crate::pmem::FRAME_SIZE as usize);
+        let address = crate::pmem::allocate_contiguous(frames)?;
+        self.buffer_address.store(address, Ordering::Release);
+        Some(address as *mut u8)
     }
 
     /// Appends as many bytes of `data` as currently fit, returning how
@@ -127,6 +152,7 @@ impl PcmRing {
     /// same "accepted length, caller paces itself" convention
     /// `nic_send`/`nic_receive`'s own ABI already uses.
     pub fn push(&self, data: &[u8]) -> usize {
+        let Some(buffer) = self.buffer(true) else { return 0 };
         let write = self.write_pos.load(Ordering::Relaxed);
         let read = self.read_pos.load(Ordering::Acquire);
         let capacity = RING_CAPACITY_BYTES as u32;
@@ -136,7 +162,7 @@ impl PcmRing {
         for (i, &byte) in data[..to_write].iter().enumerate() {
             let index = (write as usize + i) % RING_CAPACITY_BYTES;
             unsafe {
-                (*self.buffer.get())[index] = byte;
+                core::ptr::write_volatile(buffer.add(index), byte);
             }
         }
         self.write_pos
@@ -156,6 +182,7 @@ impl PcmRing {
     /// # Safety
     /// `dest` must be valid for `len` writes.
     pub unsafe fn pop_into(&self, dest: *mut u8, len: usize) -> bool {
+        let Some(buffer) = self.buffer(false) else { return false };
         let read = self.read_pos.load(Ordering::Relaxed);
         let write = self.write_pos.load(Ordering::Acquire);
         let available = write.wrapping_sub(read) as usize;
@@ -164,7 +191,7 @@ impl PcmRing {
         }
         for i in 0..len {
             let index = (read as usize + i) % RING_CAPACITY_BYTES;
-            let byte = unsafe { (*self.buffer.get())[index] };
+            let byte = unsafe { core::ptr::read_volatile(buffer.add(index)) };
             unsafe {
                 core::ptr::write_volatile(dest.add(i), byte);
             }
@@ -191,13 +218,14 @@ impl PcmRing {
     /// # Safety
     /// `dest` must be valid for `max_len` writes.
     pub unsafe fn pop_upto(&self, dest: *mut u8, max_len: usize) -> usize {
+        let Some(buffer) = self.buffer(false) else { return 0 };
         let read = self.read_pos.load(Ordering::Relaxed);
         let write = self.write_pos.load(Ordering::Acquire);
         let available = write.wrapping_sub(read) as usize;
         let to_read = available.min(max_len);
         for i in 0..to_read {
             let index = (read as usize + i) % RING_CAPACITY_BYTES;
-            let byte = unsafe { (*self.buffer.get())[index] };
+            let byte = unsafe { core::ptr::read_volatile(buffer.add(index)) };
             unsafe {
                 core::ptr::write_volatile(dest.add(i), byte);
             }

@@ -86,6 +86,7 @@ E2E_MAKE = [
     "make test-tape-nettest",
     "make test-tape-memtest",
     "make test-usb-hosts",
+    "make test-xhci",
     "make test-tape-nettest-router",
     "make test-tape-router",
     "make test-tape-router-arp",

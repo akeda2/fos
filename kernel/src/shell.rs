@@ -56,6 +56,7 @@ use crate::parallel;
 use crate::pci;
 use crate::pmem;
 use crate::uhci;
+use crate::xhci;
 use crate::usb_storage;
 use crate::{print, println};
 
@@ -977,6 +978,8 @@ fn help_topic(topic: &[u8]) {
             println!("NAME.sh or NAME.bin from any disk.");
         }
         b"usb" => {
+            println!("usb xhci                    xHCI controllers: ports, devices (takes over");
+            println!("                            the controller from the BIOS)");
             println!("usb hosts                   every PCI USB host controller (UHCI/OHCI/");
             println!("                            EHCI/xHCI) and whether fos has a driver");
             println!("usb                         list UHCI controllers/ports, enumerate");
@@ -1657,7 +1660,7 @@ fn print_usb_hosts(summary: bool) {
     }
     if summary {
         println!(
-            "USB hosts: {} UHCI, {} OHCI, {} EHCI, {} xHCI (driver: UHCI only; 'usb hosts')",
+            "USB hosts: {} UHCI, {} OHCI, {} EHCI, {} xHCI (drivers: UHCI, xHCI)",
             counts[0], counts[1], counts[2], counts[3]
         );
         return;
@@ -1678,11 +1681,75 @@ fn print_usb_hosts(summary: bool) {
             info.interrupt_line,
             info.interrupt_pin,
             if info.has_msi { "yes" } else { "no" },
-            if info.prog_if == 0x00 { "  [driver]" } else { "" },
+            if info.prog_if == 0x00 || info.prog_if == 0x30 { "  [driver]" } else { "" },
         );
     }
     if !any {
         println!("No PCI USB host controllers found.");
+    }
+}
+
+/// `usb xhci`: starts every xHCI controller (ending the BIOS's own INT13h
+/// emulation of any USB disk behind it, like `usb` does for UHCI) and, for each
+/// root port, shows what is connected: reset, address, read the device
+/// descriptor, release the slot again.
+fn print_xhci_devices() {
+    let count = xhci::count();
+    if count == 0 {
+        println!("No xHCI controller found, or it would not start.");
+        return;
+    }
+    for index in 0..count {
+        let Some(controller) = xhci::get(index) else { continue };
+        println!(
+            "xHCI {}: registers at 0x{:08x}, {} root port(s)",
+            controller.instance(),
+            controller.bar(),
+            controller.port_count()
+        );
+        for port in 1..=controller.port_count() {
+            let status = controller.port_status(port);
+            let major = controller.port_major(port);
+            if status & 1 == 0 {
+                println!("  port {port}: USB{major}, no device");
+                continue;
+            }
+            if let Some(slot) = controller.slot_in_use_for_port(port) {
+                // Opening the port again would reset the device and replace its
+                // slot, breaking whichever disk is using it.
+                println!("  port {port}: USB{major}, device in use (slot {slot}); left alone");
+                continue;
+            }
+            let mut device = match controller.open_port(port) {
+                Ok(device) => device,
+                Err(error) => {
+                    println!("  port {port}: USB{major}, connected, could not address it ({error:?})");
+                    continue;
+                }
+            };
+            let mut descriptor = [0u8; 18];
+            let mut first = [0u8; 8];
+            let mut result = controller.get_descriptor(&device, 1, 0, &mut first).map(|_| ());
+            if result.is_ok() && device.speed <= 2 {
+                result = controller.set_control_max_packet(&mut device, u16::from(first[7]));
+            }
+            if result.is_ok() {
+                result = controller.get_descriptor(&device, 1, 0, &mut descriptor).map(|_| ());
+            }
+            match result {
+                Ok(()) => println!(
+                    "  port {port}: {} device {:04x}:{:04x} class {:02x}/{:02x}, slot {}",
+                    xhci::speed_name(device.speed),
+                    u16::from_le_bytes([descriptor[8], descriptor[9]]),
+                    u16::from_le_bytes([descriptor[10], descriptor[11]]),
+                    descriptor[4],
+                    descriptor[5],
+                    device.slot,
+                ),
+                Err(error) => println!("  port {port}: addressed ({}) but descriptor read failed: {error:?}", xhci::speed_name(device.speed)),
+            }
+            controller.release_slot(device.slot);
+        }
     }
 }
 
@@ -1820,7 +1887,7 @@ fn enumerate_usb_port(port_number: u8, controller: &uhci::Uhci, port: u8) {
 /// section for the design.
 fn usb_command(info: &BootInfo, arguments: &[u8]) {
     const USAGE: &str =
-        "Usage: usb | usb hosts | usb play [diskN] NAME | usb capture [diskN] NAME | usb storage | usb native";
+        "Usage: usb | usb hosts | usb xhci | usb play [diskN] NAME | usb capture [diskN] NAME | usb storage | usb native";
 
     if arguments.is_empty() {
         print_usb_devices();
@@ -1830,6 +1897,10 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
     let (first, remainder) = take_word(arguments);
     if first.eq_ignore_ascii_case(b"hosts") && remainder.is_empty() {
         print_usb_hosts(false);
+        return;
+    }
+    if first.eq_ignore_ascii_case(b"xhci") && remainder.is_empty() {
+        print_xhci_devices();
         return;
     }
     if first.eq_ignore_ascii_case(b"native") && remainder.is_empty() {
@@ -1891,7 +1962,7 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
 /// storage attach`/`usb storage promote` used to require running
 /// separately.
 fn usb_native_command(info: &BootInfo) {
-    println!("Resetting UHCI controllers to discover every attached USB");
+    println!("Resetting USB host controllers (UHCI, xHCI) to discover every USB");
     println!("Mass Storage device; this can break BIOS's own USB-drive");
     println!("emulation for any disk still served that way.");
     let report = disk::promote_all_and_attach(info);
@@ -1928,7 +1999,7 @@ fn usb_native_command(info: &BootInfo) {
 /// success the new disk is immediately usable through the ordinary
 /// `diskN` selector, exactly like a BIOS-backed secondary disk.
 fn usb_storage_attach_command(info: &BootInfo) {
-    println!("Resetting UHCI controllers to discover the device; this");
+    println!("Resetting USB host controllers (UHCI, xHCI) to find the device; this");
     println!("can break BIOS's own USB-drive emulation for any disk");
     println!("(including 'disk1') that BIOS is still serving over USB.");
     match disk::attach_usb_disk() {
@@ -1966,7 +2037,7 @@ fn usb_storage_attach_command(info: &BootInfo) {
 /// "USB Legacy Support" staying intact once any UHCI controller has been
 /// reset.
 fn usb_storage_promote_command(info: &BootInfo) {
-    println!("Resetting UHCI controllers to discover the device; this");
+    println!("Resetting USB host controllers (UHCI, xHCI) to find the device; this");
     println!("can break BIOS's own USB-drive emulation for any disk");
     println!("still served that way. Comparing its capacity and first");
     println!("sector against disk1's own BIOS-read baseline first.");
