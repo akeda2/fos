@@ -108,7 +108,12 @@ class Machine:
     def loaded_tape(self, mac: str | None = None) -> tuple[int, int] | None:
         """`(handle, size)` of the loaded tape, or None."""
         match = re.search(r"Tape loaded: #(\d+); (\d+) byte", self.term(["tape status"], mac=mac))
-        return (int(match.group(1)), int(match.group(2))) if match else None
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        # v2: "Tape network: ..., N bytes staged." has no handle; -1 marks "unknown",
+        # so success then rests on the staged size alone (a same-size reload is not seen).
+        match = re.search(r"(\d+) bytes staged", self.term(["tape status"], mac=mac))
+        return (-1, int(match.group(1))) if match else None
 
 
 def cmd_wait(machine: Machine, args) -> int:
@@ -177,19 +182,27 @@ def load_tape(machine: Machine, nic: int, path: Path, delay: float, attempts: in
     for attempt in range(1, attempts + 1):
         machine.send_tape(target_mac, path, delay)
         time.sleep(3)
-        after = machine.loaded_tape(session)
-        if after and after[1] == size and (before is None or after[0] > before[0]):
+        # v2: the shell is busy inside `tape load net`, so `tape status` cannot be asked
+        # yet; the waiting client simply ends once "Tape loaded: N bytes" appears.
+        if client.poll() is not None:
+            client_output = client.communicate()[0]
+            if f"Tape loaded: {size} bytes" in client_output:
+                success = True
+                break
+        after = machine.loaded_tape(session) if client.poll() is None else None
+        if after and after[1] == size and (before is None or after[0] == -1 or after[0] > before[0]):
             success = True
             break
         print(f"attempt {attempt} at {delay}s did not load; retrying slower", file=sys.stderr)
         delay = max(delay * 3, 0.003)  # slower each time, even from an unpaced first try
     if not success:
         machine.send_tape(target_mac, release, 0.003)  # frees the waiting loop
-    try:
-        client.communicate(timeout=60)
-    except subprocess.TimeoutExpired:
-        client.kill()
-        client.communicate()
+    if client.poll() is None:
+        try:
+            client.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            client.kill()
+            client.communicate()
     machine.term([f"nic use {original}"], mac=session)
     final = machine.loaded_tape(session)
     return success, before, final, None
