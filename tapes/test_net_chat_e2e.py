@@ -32,6 +32,12 @@ MCAST_PORT = 4256
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "build" / "fos.img"
 TAPE = ROOT / "build" / "tapes" / "net-chat.bin"
+# FOS_V2=1 runs this test against the v2 kernel (see tapes/test_router_e2e.py).
+V2 = os.environ.get("FOS_V2") == "1"
+if V2:
+    IMAGE = ROOT / "build" / "v2" / "v2.img"
+    TAPE = ROOT / "build" / "cargo-target" / "x86_64-fos-tape" / "release" / "net-chat"
+WAIT_MARKER = b"M3 complete" if V2 else b"Waiting for a remote terminal client to connect"
 MONITOR_SOCKS = {
     "shell": Path("/tmp/fos-test-net-chat-shell-monitor.sock"),
     "tape": Path("/tmp/fos-test-net-chat-tape-monitor.sock"),
@@ -162,7 +168,7 @@ def main(nic_model: str) -> None:
         # Bring up the shell-chat guest first so its broadcast HELLO cannot
         # accidentally connect both guests to one terminal client.
         start_guest("shell", with_monitor=True)
-        read_until("shell", b"Waiting for a remote terminal client to connect", 30)
+        read_until("shell", WAIT_MARKER, 120 if V2 else 30)
         mcast.send(term_frame(b"\xff" * 6, CHAT_CLIENT_MAC, TERM_TAG_HELLO))
         read_until("shell", b"Remote terminal connected", 10)
         read_until("shell", b"fos> ", 5)
@@ -183,7 +189,7 @@ def main(nic_model: str) -> None:
         # The tape guest now receives a distinct HELLO/session and can be
         # driven through read_key while the other guest remains in `chat`.
         start_guest("tape", with_monitor=True)
-        read_until("tape", b"Waiting for a remote terminal client to connect", 30)
+        read_until("tape", WAIT_MARKER, 120 if V2 else 30)
         mcast.send(term_frame(b"\xff" * 6, TAPE_CLIENT_MAC, TERM_TAG_HELLO))
         read_until("tape", b"Remote terminal connected", 10)
         read_until("tape", b"fos> ", 5)

@@ -37,6 +37,17 @@ pub fn write_byte(byte: u8) {
     outb(COM1, byte);
 }
 
+/// A received byte, if one is waiting (LSR bit 0). A machine with no UART reads 0xff from
+/// the line-status register, which must not be mistaken for data. There is no interrupt: the
+/// foreground polls (the 16-byte FIFO covers a 10 ms idle tick at typing speed).
+pub fn read_byte() -> Option<u8> {
+    let status = inb(COM1 + 5);
+    if status == 0xff || status & 1 == 0 {
+        return None;
+    }
+    Some(inb(COM1))
+}
+
 pub struct Serial;
 
 impl fmt::Write for Serial {

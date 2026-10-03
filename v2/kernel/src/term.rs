@@ -57,6 +57,8 @@ static mut NICS: [Option<E1000>; MAX_NICS] = [const { None }; MAX_NICS];
 static mut NIC_COUNT: usize = 0;
 /// The interface the open session's HELLO arrived on: console output goes out of it.
 static mut SESSION_NIC: usize = 0;
+/// Tick of the last frame from the session's peer (for the stale-session takeover rule).
+static mut PEER_ACTIVITY: u64 = 0;
 static mut PEER: Option<[u8; 6]> = None;
 static mut RELAY: [u8; 16384] = [0; 16384];
 static mut RELAY_LENGTH: usize = 0;
@@ -158,7 +160,9 @@ pub fn poll() {
     for index in 0..nic_count() {
         loop {
             let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
-            handle_frame(index, &buffer[..length]);
+            if !handle_frame(index, &buffer[..length]) {
+                queue_frame(index, &buffer[..length]);
+            }
         }
     }
     if session_open() {
@@ -185,12 +189,18 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
         TAG_KUP_DATA if crate::config::debug().kernel_update => kup_data(source, &frame[15..]),
         TAG_KUP_STOP if crate::config::debug().kernel_update => kup_stop(index, source),
         TAG_HELLO if crate::config::deny_term_net() => {} // closed by the settings file: stay silent
+        // A session is open: another client's HELLO does not steal it (as in v1, where only the
+        // waiting state accepts a new peer), unless the owner has been silent for five minutes.
+        TAG_HELLO if session_open()
+            && unsafe { *core::ptr::addr_of!(PEER) } != Some(source)
+            && apic::ticks().wrapping_sub(unsafe { PEER_ACTIVITY }) < 5 * 60 * apic::TICK_HZ => {}
         TAG_HELLO => {
             // A new HELLO replaces any earlier session (the old client is gone or
             // restarting); the screen and serial port show who connected.
             unsafe {
                 *core::ptr::addr_of_mut!(PEER) = Some(source);
                 SESSION_NIC = index;
+                PEER_ACTIVITY = apic::ticks();
                 RELAY_LENGTH = 0;
                 LINE_LENGTH = 0;
                 LAST_WAS_CR = false;
@@ -201,6 +211,7 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
         }
         TAG_DATA if session_open() && unsafe { *core::ptr::addr_of!(PEER) } == Some(source) && unsafe { SESSION_NIC } == index => {
             let payload = &frame[15..];
+            unsafe { PEER_ACTIVITY = apic::ticks() };
             if unsafe { TAPE_MODE } {
                 // A running tape owns the input. A lone Escape byte is "stop".
                 if payload.first() == Some(&0x1b) && payload.iter().rposition(|&b| b != 0) == Some(0) {
@@ -377,8 +388,6 @@ pub fn set_tape_mode(on: bool) {
         TAPE_MODE = on;
         TAPE_INPUT_HEAD = 0;
         TAPE_INPUT_TAIL = 0;
-        FRAME_HEAD = [0; MAX_NICS];
-        FRAME_TAIL = [0; MAX_NICS];
     }
     if !on {
         flush();
@@ -396,6 +405,33 @@ static mut FRAME_TAIL: [usize; MAX_NICS] = [0; MAX_NICS];
 static mut FRAMES_DROPPED: u32 = 0;
 static mut FRAMES_QUEUED: u32 = 0;
 
+/// Keeps a frame that is not the terminal's for a tape (`tape load net` listens for its own
+/// protocol, `nic_receive` for everything else). Frames that arrive before a tape is
+/// listening wait here instead of being lost.
+fn queue_frame(index: usize, frame: &[u8]) {
+    unsafe {
+        let head = FRAME_HEAD[index];
+        let next = (head + 1) % FRAME_FIFO;
+        if next == FRAME_TAIL[index] {
+            FRAME_TAIL[index] = (FRAME_TAIL[index] + 1) % FRAME_FIFO; // full: drop the oldest
+            FRAMES_DROPPED += 1;
+        }
+        let slot = index * FRAME_FIFO + head;
+        core::slice::from_raw_parts_mut((core::ptr::addr_of_mut!(FRAMES) as *mut u8).add(slot * 1600), frame.len()).copy_from_slice(frame);
+        FRAME_LENGTHS[slot] = frame.len();
+        FRAME_HEAD[index] = next;
+        FRAMES_QUEUED += 1;
+    }
+}
+
+/// Forgets frames queued for tapes (a tape about to run should not see stale traffic).
+pub fn clear_frame_queue() {
+    unsafe {
+        FRAME_HEAD = [0; MAX_NICS];
+        FRAME_TAIL = [0; MAX_NICS];
+    }
+}
+
 /// Everything a tape callback must keep serviced: USB keyboards, local keys, the
 /// network (terminal frames handled, the rest queued per interface), console output out.
 fn tape_service() {
@@ -411,19 +447,7 @@ fn tape_service() {
             if handle_frame(index, &buffer[..length]) {
                 continue;
             }
-            unsafe {
-                let head = FRAME_HEAD[index];
-                let next = (head + 1) % FRAME_FIFO;
-                if next == FRAME_TAIL[index] {
-                    FRAME_TAIL[index] = (FRAME_TAIL[index] + 1) % FRAME_FIFO; // full: drop the oldest
-                    FRAMES_DROPPED += 1;
-                }
-                let slot = index * FRAME_FIFO + head;
-                core::slice::from_raw_parts_mut((core::ptr::addr_of_mut!(FRAMES) as *mut u8).add(slot * 1600), length).copy_from_slice(&buffer[..length]);
-                FRAME_LENGTHS[slot] = length;
-                FRAME_HEAD[index] = next;
-                FRAMES_QUEUED += 1;
-            }
+            queue_frame(index, &buffer[..length]);
         }
     }
     flush();
@@ -457,6 +481,11 @@ pub fn tape_should_abort() -> bool {
 /// terminal's.
 pub fn tape_receive(index: usize, out: &mut [u8]) -> usize {
     tape_service();
+    pop_frame(index, out)
+}
+
+/// The oldest queued non-terminal frame of interface `index`, copied into `out`.
+fn pop_frame(index: usize, out: &mut [u8]) -> usize {
     if index >= MAX_NICS {
         return 0;
     }
@@ -594,7 +623,8 @@ fn execute(command: &str) {
             crate::println!("Remote: term net, tools/term_net.py, devloop.py work as on v1.");
         }
         "about" => {
-            crate::println!("fos v2: UEFI loader, 64-bit kernel. Milestone M3: PCI, e1000, term net.");
+            crate::println!("fos is a small educational 64-bit x86 operating system.");
+            crate::println!("This is v2: a UEFI loader and a 64-bit kernel.");
             crate::println!("Design: docs/v2-design.md.");
         }
         "memory" => {
@@ -617,6 +647,16 @@ fn execute(command: &str) {
                 );
             }
         }
+        "nic" if matches!(words.clone().next(), Some("send")) => nic_send_test(),
+        "nic" if matches!(words.clone().next(), Some("recv")) => nic_recv_test(),
+        "hexdump" => {
+            let address = words.next().and_then(parse_number);
+            let length = words.next().and_then(parse_number).unwrap_or(64);
+            match address {
+                Some(address) if length <= 4096 => hexdump(address, length as usize),
+                _ => crate::println!("Usage: hexdump ADDRESS [LENGTH <= 4096]  (decimal or 0x hex)"),
+            }
+        }
         "nic" => {
             if nic_count() == 0 {
                 crate::println!("No network interface.");
@@ -625,6 +665,10 @@ fn execute(command: &str) {
                 if let Some(nic) = nic_at(index) {
                     crate::println!("{}: e1000 {}  {}{}", index + 1, Mac(&nic.mac), if nic.link_up() { "link up" } else { "link DOWN" }, if unsafe { SESSION_NIC } == index && session_open() { "  (terminal)" } else { "" });
                     crate::println!("   frames: {} received, {} sent", nic.frames_received, nic.frames_sent);
+                    // v1's `nic` reported "NIC IRQn: N notifications"; keep that line (tools grep for it).
+                    if let crate::e1000::Delivery::Msi(v) | crate::e1000::Delivery::Msix(v) | crate::e1000::Delivery::Intx { vector: v, .. } = nic.delivery {
+                        crate::println!("   NIC IRQ{v}: {} notifications", crate::e1000::ISR[index].interrupts.load(core::sync::atomic::Ordering::Relaxed));
+                    }
                     match nic.delivery {
                         crate::e1000::Delivery::Polled => crate::println!("   interrupts: polled"),
                         crate::e1000::Delivery::Intx { gsi, vector } => {
@@ -788,4 +832,86 @@ impl core::fmt::Display for String8<'_> {
         }
         Ok(())
     }
+}
+
+fn parse_number(word: &str) -> Option<u64> {
+    match word.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => word.parse().ok(),
+    }
+}
+
+/// `xxd`-style dump: offset, hex bytes, printable characters.
+fn dump_bytes(base: u64, bytes: &[u8]) {
+    for (row, chunk) in bytes.chunks(16).enumerate() {
+        crate::print(format_args!("{:#012x}: ", base + (row * 16) as u64));
+        for byte in chunk {
+            crate::print(format_args!("{byte:02x} "));
+        }
+        for _ in chunk.len()..16 {
+            crate::print(format_args!("   "));
+        }
+        crate::print(format_args!("|"));
+        for byte in chunk {
+            crate::print(format_args!("{}", if (0x20..=0x7e).contains(byte) { *byte as char } else { '.' }));
+        }
+        crate::println!("|");
+    }
+}
+
+/// Dumps physical memory (identity mapped), refusing pages that are not mapped instead of faulting.
+fn hexdump(address: u64, length: usize) {
+    let mut at = address;
+    let end = address + length as u64;
+    while at < end {
+        let page_end = ((at & !0xfff) + 0x1000).min(end);
+        if !crate::paging::is_mapped(at) {
+            return crate::println!("{at:#x}: not mapped.");
+        }
+        let chunk = unsafe { core::slice::from_raw_parts(at as *const u8, (page_end - at) as usize) };
+        dump_bytes(at, chunk);
+        at = page_end;
+    }
+}
+
+/// `nic send`: one broadcast test frame (ethertype 0x88b5, v1's TEST_ETHERTYPE) out of interface 1.
+fn nic_send_test() {
+    let mut mac = [0u8; 6];
+    if !nic_mac(0, &mut mac) {
+        return crate::println!("No network interface.");
+    }
+    let payload = b"fos raw ethernet test frame";
+    let mut frame = [0u8; 14 + 27];
+    frame[0..6].copy_from_slice(&[0xff; 6]);
+    frame[6..12].copy_from_slice(&mac);
+    frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+    frame[14..].copy_from_slice(payload);
+    if nic_send(0, &frame) {
+        crate::println!("Sent {} bytes: broadcast test frame (ethertype 0x88b5).", frame.len());
+    } else {
+        crate::println!("Send failed.");
+    }
+}
+
+/// `nic recv`: waits up to three seconds for a frame that is not the terminal's, then dumps it.
+fn nic_recv_test() {
+    let deadline = apic::ticks() + 3 * apic::TICK_HZ;
+    while apic::ticks() < deadline {
+        poll();
+        for index in 0..nic_count() {
+            let mut buffer = [0u8; 1600];
+            let length = pop_frame(index, &mut buffer);
+            if length >= 14 {
+                let f = &buffer[..length];
+                crate::println!(
+                    "Received {length} bytes: dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype 0x{:02x}{:02x}",
+                    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13]
+                );
+                return dump_bytes(0, f);
+            }
+        }
+        crate::debug::pet();
+        unsafe { core::arch::asm!("hlt") };
+    }
+    crate::println!("No frame received (timed out waiting).");
 }

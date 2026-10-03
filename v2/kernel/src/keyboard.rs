@@ -39,8 +39,13 @@ pub fn push(byte: u8) {
     HEAD.store(next, Ordering::Release);
 }
 
-/// The next typed byte, if any.
+/// The next typed byte, if any: the local keyboards' queue first, then the serial port (so a
+/// machine with only a serial console is driven the same way).
 pub fn pop() -> Option<u8> {
+    pop_keyboard().or_else(crate::serial::read_byte)
+}
+
+fn pop_keyboard() -> Option<u8> {
     let tail = TAIL.load(Ordering::Relaxed);
     if tail == HEAD.load(Ordering::Acquire) {
         return None;

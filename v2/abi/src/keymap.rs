@@ -65,6 +65,11 @@ impl Set1Decoder {
             0x3a if !extended && !released => self.caps = !self.caps,
             _ => {}
         }
+        // The "give up" keys (F12 first; F4/F6/F7/F8/F10 for KVMs that eat F12), the same set
+        // v1 uses: each acts as Escape, which is what stops a running tape.
+        if !released && !extended && matches!(code, 0x58 | 0x3e | 0x40 | 0x41 | 0x42 | 0x44) {
+            return Some(0x1b);
+        }
         if released || extended || code as usize >= SET1_PLAIN.len() || byte == 0xfa || byte == 0xfe || byte == 0xaa {
             return None;
         }
@@ -75,6 +80,10 @@ impl Set1Decoder {
 /// ASCII for a HID keyboard usage (usage page 0x07) with the given modifiers.
 /// `modifiers` is the boot report's modifier byte (bit 0/4 Ctrl, bit 1/5 Shift).
 pub fn hid_ascii(usage: u8, modifiers: u8, caps: bool) -> Option<u8> {
+    // HID usages of F4, F6, F7, F8, F10, F12: the "give up" keys, acting as Escape.
+    if matches!(usage, 0x3d | 0x3f | 0x40 | 0x41 | 0x43 | 0x45) {
+        return Some(0x1b);
+    }
     let index = usize::from(usage.checked_sub(4)?);
     if index >= HID_PLAIN.len() {
         return None;
@@ -109,6 +118,15 @@ mod tests {
         assert_eq!(type_set1(&[0x1d, 0x2e, 0xae, 0x9d]), &[3]); // Ctrl-C
         assert_eq!(type_set1(&[0xe0, 0x48, 0xe0, 0xc8]), b""); // up arrow: ignored
         assert_eq!(type_set1(&[0xfa, 0xaa]), b""); // controller reply bytes
+    }
+
+    #[test]
+    fn function_keys_that_give_up_act_as_escape() {
+        assert_eq!(type_set1(&[0x58, 0xd8]), &[0x1b]); // F12
+        assert_eq!(type_set1(&[0x44, 0xc4]), &[0x1b]); // F10
+        assert_eq!(type_set1(&[0x3b, 0xbb]), b""); // F1 does nothing
+        assert_eq!(hid_ascii(0x45, 0, false), Some(0x1b)); // F12
+        assert_eq!(hid_ascii(0x3a, 0, false), None); // F1
     }
 
     #[test]

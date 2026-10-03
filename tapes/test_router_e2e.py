@@ -26,6 +26,15 @@ import send_tape  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "build" / "fos.img"
 TAPE = ROOT / "build" / "tapes" / "router.bin"
+# FOS_V2=1 runs this same test against the v2 kernel (UEFI image, 64-bit tape): a `qemu-system-i386`
+# shim on PATH (v2/tools/qemu_v1_shim.py) turns the v1 command line into an OVMF one, and only
+# the serial markers and file names below differ.
+V2 = os.environ.get("FOS_V2") == "1"
+if V2:
+    IMAGE = ROOT / "build" / "v2" / "v2.img"
+    TAPE = ROOT / "build" / "cargo-target" / "x86_64-fos-tape" / "release" / "router"
+WAIT_MARKER = b"M3 complete" if V2 else b"Waiting for a remote terminal client to connect"
+LOAD_MARKER = b"Waiting for a tape over the network" if V2 else b"Have the sender target this card's MAC address"
 CONFIG = ROOT / "tapes" / "router" / "router.cfg"
 SEGMENT_A = ("230.42.42.80", 4280)
 SEGMENT_B = ("230.42.42.81", 4281)
@@ -465,12 +474,12 @@ def main() -> None:
         )
         assert process.stdout is not None
         selector.register(process.stdout, selectors.EVENT_READ)
-        read_until(b"Waiting for a remote terminal client to connect", 30)
+        read_until(WAIT_MARKER, 120 if V2 else 30)
         links["a"].send(term_frame(b"\xff" * 6, TERM_CLIENT_MAC, TERM_TAG_HELLO))
         read_until(b"fos> ", 10)
 
         load_start = send_command(b"tape load net")
-        read_until(b"Have the sender target this card's MAC address", 10, load_start)
+        read_until(LOAD_MARKER, 10, load_start)
         send_tape.send_tape(
             links["a"],
             ROUTER_MAC_A,
@@ -1078,10 +1087,10 @@ def test_uplink_boot_timeout_is_not_fatal() -> None:
                 process.stdin.flush()
                 time.sleep(0.002)
 
-        read_until(b"Waiting for a remote terminal client to connect", 30)
+        read_until(WAIT_MARKER, 120 if V2 else 30)
         send_monitor_command(monitor_path, "sendkey f12")
         read_until(b"fos> ", 10)
-        type_line(b"tape load disk router.bin\r")
+        type_line(b"tape load disk " + (b"router" if V2 else b"router.bin") + b"\r")
         read_until(b"'tape run' to execute it.", 10)
         start = len(output)
         type_line(b"tape run dhcp 1 dhcp 2 3 10.0.20.1/24\r")

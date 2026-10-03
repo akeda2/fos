@@ -247,6 +247,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         fs_remove: api_fs_remove,
         nic_set_promiscuous: api_nic_set_promiscuous,
     };
+    term::clear_frame_queue();
     term::set_tape_mode(true);
     crate::debug::set_tape_running(true);
     unsafe {
@@ -267,6 +268,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
     crate::debug::set_tape_running(false);
     term::set_tape_mode(false);
     memory::free(stack, STACK_BYTES / memory::FRAME);
+    crate::println!("Tape returned; back at the fos shell.");
     Ok(())
 }
 
@@ -365,12 +367,14 @@ pub fn command(arguments: &str) {
     let rest = rest.trim();
     match word {
         "load" => {
+            // v1 spelled it `tape load disk NAME`: accept that too.
+            let rest = rest.strip_prefix("disk").map_or(rest, str::trim_start);
             let (name, outcome) = if rest == "net" { ("network", receive_from_network()) } else { (rest, load_from_file(rest)) };
             match outcome {
                 Ok(length) => {
                     set_staged_length(length);
                     match load_staged(name) {
-                        Ok(()) => crate::println!("Tape loaded: {length} bytes from {name}; type `tape run [ARGS]`."),
+                        Ok(()) => crate::println!("Tape loaded: {length} bytes from {name}; type 'tape run' to execute it."),
                         Err(error) => crate::println!("tape: not a usable tape ({error:?})."),
                     }
                 }

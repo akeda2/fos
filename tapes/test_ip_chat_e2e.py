@@ -27,6 +27,12 @@ MCAST_PORT = 4259
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "build" / "fos.img"
 TAPE = ROOT / "build" / "tapes" / "ip-chat.bin"
+# FOS_V2=1 runs this test against the v2 kernel (see tapes/test_router_e2e.py).
+V2 = os.environ.get("FOS_V2") == "1"
+if V2:
+    IMAGE = ROOT / "build" / "v2" / "v2.img"
+    TAPE = ROOT / "build" / "cargo-target" / "x86_64-fos-tape" / "release" / "ip-chat"
+WAIT_MARKER = b"M3 complete" if V2 else b"Waiting for a remote terminal client to connect"
 CHAT_ETHERTYPE = bytes((0x88, 0xB6))
 TERM_TAG_HELLO = 0x20
 TERM_TAG_DATA = 0x21
@@ -82,7 +88,7 @@ def main() -> None:
                 "-netdev",
                 f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}",
                 "-device",
-                f"rtl8139,netdev=net0,mac={send_tape.format_mac(config['mac'])}",
+                f"{'e1000' if V2 else 'rtl8139'},netdev=net0,mac={send_tape.format_mac(config['mac'])}",
                 "-display",
                 "none",
             ],
@@ -148,7 +154,7 @@ def main() -> None:
         mcast = McastSocket(MCAST_GROUP, MCAST_PORT)
         for name in ("a", "b"):
             start_guest(name)
-            read_until(name, b"Waiting for a remote terminal client to connect", 30)
+            read_until(name, WAIT_MARKER, 120 if V2 else 30)
             config = GUESTS[name]
             mcast.send(term_frame(config["mac"], config["client"], TERM_TAG_HELLO))
             read_until(name, b"Remote terminal connected", 10)
@@ -206,7 +212,7 @@ def main() -> None:
             read_until(name, b"Tape returned; back at the fos shell.", 10, start)
 
         recovery = run_shell_command("a", b"about")
-        if b"fos is a small educational 32-bit x86 operating system." not in recovery:
+        if (b"fos is a small educational 64-bit x86 operating system." if V2 else b"fos is a small educational 32-bit x86 operating system.") not in recovery:
             raise SystemExit("shell did not recover after the IPv4 chat tape returned")
         print("PASS: IPv4 chat returned cleanly and the remote shell stayed usable.")
 

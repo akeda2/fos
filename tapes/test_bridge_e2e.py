@@ -27,6 +27,12 @@ import send_tape  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "build" / "fos.img"
 TAPE = ROOT / "build" / "tapes" / "bridge.bin"
+# FOS_V2=1 runs this test against the v2 kernel (see tapes/test_router_e2e.py).
+V2 = os.environ.get("FOS_V2") == "1"
+if V2:
+    IMAGE = ROOT / "build" / "v2" / "v2.img"
+    TAPE = ROOT / "build" / "cargo-target" / "x86_64-fos-tape" / "release" / "bridge"
+WAIT_MARKER = b"M3 complete" if V2 else b"Waiting for a remote terminal client to connect"
 SEGMENT_A = ("230.42.42.70", 4270)
 SEGMENT_B = ("230.42.42.71", 4271)
 TERM_TAG_HELLO = 0x20
@@ -202,17 +208,17 @@ def main() -> None:
             "bridge",
             [("a", "e1000", BRIDGE_MAC_A), ("b", "e1000", BRIDGE_MAC_B)],
         )
-        read_until("bridge", b"Waiting for a remote terminal client to connect", 30)
+        read_until("bridge", WAIT_MARKER, 120 if V2 else 30)
         multicast["a"].send(term_frame(b"\xff" * 6, BRIDGE_CLIENT_MAC, TERM_TAG_HELLO))
         read_until("bridge", b"fos> ", 10)
 
         start_guest("sender", [("a", "e1000", SENDER_MAC)])
-        read_until("sender", b"Waiting for a remote terminal client to connect", 30)
+        read_until("sender", WAIT_MARKER, 120 if V2 else 30)
         multicast["a"].send(term_frame(b"\xff" * 6, SENDER_CLIENT_MAC, TERM_TAG_HELLO))
         read_until("sender", b"fos> ", 10)
 
         start_guest("receiver", [("b", "e1000", RECEIVER_MAC)])
-        read_until("receiver", b"Waiting for a remote terminal client to connect", 30)
+        read_until("receiver", WAIT_MARKER, 120 if V2 else 30)
         multicast["b"].send(term_frame(b"\xff" * 6, RECEIVER_CLIENT_MAC, TERM_TAG_HELLO))
         read_until("receiver", b"fos> ", 10)
 

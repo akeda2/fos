@@ -7,11 +7,11 @@ V2_LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fos-loader.efi
 V2_KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fos-v2-kernel
 V2_IMAGE := $(V2_BUILD)/v2.img
 # v2 tapes: crates under v2/tapes/, each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-V2_TAPES := hello calc memtest nettest
+V2_TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat
 V2_TAPE_BINS := $(foreach tape,$(V2_TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 V2_TAPE_FILES := $(foreach tape,$(V2_TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 
-.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi
+.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -81,3 +81,14 @@ test-v2-debug-mode: v2-image
 # the classic e1000 staying polled, and the no-msi setting.
 test-v2-msi: v2-image
 	python3 v2/tools/test_msi.py
+
+# v1 end-to-end tests re-run against the v2 kernel through a qemu-system-i386 shim (the same
+# wire-level checks: the router's ARP/forwarding/DHCP/NAT/failover, the bridge, ip-chat).
+# (net-chat's test also drives the v1 shell `chat` command, which v2 does not have yet.)
+V2_SHIM_DIR := $(V2_BUILD)/shim
+test-v2-router: v2-image
+	mkdir -p $(V2_SHIM_DIR) && cp v2/tools/qemu_v1_shim.py $(V2_SHIM_DIR)/qemu-system-i386
+	PATH=$(abspath $(V2_SHIM_DIR)):$$PATH FOS_V2=1 python3 tapes/test_router_e2e.py
+test-v2-nettapes: v2-image
+	mkdir -p $(V2_SHIM_DIR) && cp v2/tools/qemu_v1_shim.py $(V2_SHIM_DIR)/qemu-system-i386
+	for t in bridge ip_chat; do PATH=$(abspath $(V2_SHIM_DIR)):$$PATH FOS_V2=1 python3 tapes/test_$${t}_e2e.py || exit 1; done
