@@ -3,7 +3,7 @@
 //! ```text
 //! tape run memtest [size=MB] [passes=N] [tests=addr,walk,moving,random] [hold=SECONDS]
 //!                  [seed=N] [inject=WORD] [chunk=MB]
-//! tape run memtest soak [for=90|5m|2h] [status=S] [churn=on|off]
+//! tape run memtest soak [for=90|5m|2h] [status=S] [net=A,B] [net.fps=N] [churn=on|off]
 //!                  [disk=soakNAME [disk.kb=N] [disk.every=S]]  ... plus any option above
 //! ```
 //!
@@ -21,14 +21,17 @@
 //!    (overlapping allocations show as corrupt data), then claims the memory again;
 //!  * compares `micros()` with the 100 Hz tick (drift, lost timer interrupts);
 //!  * compares the kernel's free-page count before and after (leaks);
+//!  * with `net=A,B` (two NICs cabled to each other, one-based as `nic` lists them; keep
+//!    `term net` on another NIC) each sends checksummed frames of varying length to the other
+//!    at `net.fps` frames/s (default 1000) and counts lost, corrupt, duplicated and
+//!    reordered ones;
 //!  * with `disk=NAME` (never on by itself: the machine may boot from a USB stick, and a
 //!    disk test writes), writes a pseudo-random file through FOSFS every `disk.every`
 //!    seconds, reads it back and compares. The name must start with `soak`, so a real file
 //!    can never be overwritten; it is removed at the end.
 //!
 //! A status line prints every `status=` seconds and the run ends with PASS/FAIL and every
-//! reason. The test engine is `engine.rs`. Network soak (two cabled NICs) returns with
-//! multi-NIC support.
+//! reason. The test engine is `engine.rs`.
 #![no_std]
 #![no_main]
 
@@ -62,6 +65,8 @@ struct Options {
     soak_seconds: u64,
     status_seconds: u64,
     churn: bool,
+    net: Option<(usize, usize)>,
+    net_fps: u64,
     disk: Option<[u8; 16]>,
     disk_length: usize,
     disk_kb: usize,
@@ -81,7 +86,7 @@ fn parse_duration(text: &str) -> Option<u64> {
 fn parse(arguments: &str) -> Result<Options, &str> {
     let mut options = Options {
         size_mb: None, passes: 1, addr: true, walk: true, moving: true, random: true, hold: 0, seed: 1, inject: None,
-        chunk_mb: 64, soak: false, soak_seconds: 90, status_seconds: 10, churn: true, disk: None, disk_length: 0, disk_kb: 32, disk_every: 120,
+        chunk_mb: 64, soak: false, soak_seconds: 90, status_seconds: 10, churn: true, net: None, net_fps: 1000, disk: None, disk_length: 0, disk_kb: 32, disk_every: 120,
     };
     for word in arguments.split_ascii_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -100,6 +105,15 @@ fn parse(arguments: &str) -> Result<Options, &str> {
             "for" => options.soak_seconds = parse_duration(value).ok_or(word)?,
             "status" => options.status_seconds = number()?.max(1),
             "churn" => options.churn = value != "off",
+            "net" => {
+                let (a, b) = value.split_once(',').ok_or(word)?;
+                let (a, b) = (a.parse::<usize>().map_err(|_| word)?, b.parse::<usize>().map_err(|_| word)?);
+                if a == 0 || b == 0 || a == b {
+                    return Err("net=A,B needs two different NICs numbered from 1");
+                }
+                options.net = Some((a - 1, b - 1));
+            }
+            "net.fps" => options.net_fps = number()?.clamp(1, 20_000),
             "disk" => {
                 if !value.starts_with("soak") || value.len() > 16 {
                     return Err("disk= must name a file starting with `soak` (up to 16 characters)");
@@ -129,6 +143,74 @@ fn parse(arguments: &str) -> Result<Options, &str> {
     Ok(options)
 }
 
+const FRAME_BUFFER: usize = 1536;
+static mut TX_FRAME: [u8; FRAME_BUFFER] = [0; FRAME_BUFFER];
+static mut RX_FRAME: [u8; FRAME_BUFFER] = [0; FRAME_BUFFER];
+
+/// Two cabled NICs exchanging checksummed frames, one stream per direction.
+struct NetPair {
+    nic: [usize; 2],
+    mac: [[u8; 6]; 2],
+    fps: u64,
+    max_frame: usize,
+    started: u64,
+    /// `stats[d]`: the stream sent by `nic[d]` and received by `nic[1 - d]`.
+    stats: [LinkStats; 2],
+    sequence: [u32; 2],
+}
+
+impl NetPair {
+    /// Sends what is due (at most 16 frames per direction per call) and drains both
+    /// receive rings. Called from the engine's poll hook, so it must stay cheap when idle.
+    fn service(&mut self, api: &TapeApi, now: u64) {
+        let tx = unsafe { &mut *core::ptr::addr_of_mut!(TX_FRAME) };
+        let rx = unsafe { &mut *core::ptr::addr_of_mut!(RX_FRAME) };
+        let due = (now - self.started) * self.fps / 1_000_000;
+        for direction in 0..2 {
+            let mut burst = 0;
+            while u64::from(self.sequence[direction]) < due && burst < 16 {
+                let sequence = self.sequence[direction];
+                // A pseudo-random length from 60 bytes up to the NIC's limit.
+                let span = self.max_frame - MIN_FRAME + 1;
+                let length = MIN_FRAME + (sequence.wrapping_mul(2_654_435_761) >> 8) as usize % span;
+                let built = build_frame(tx, self.mac[1 - direction], self.mac[direction], sequence, length);
+                if (api.nic_send)(self.nic[direction], tx.as_ptr(), built) == 0 {
+                    self.stats[direction].send_failures += 1;
+                    break; // try again later, with the same sequence number
+                }
+                self.stats[direction].sent += 1;
+                self.sequence[direction] += 1;
+                burst += 1;
+            }
+        }
+        for receiver in 0..2 {
+            for _ in 0..16 {
+                let length = (api.nic_receive)(self.nic[receiver], rx.as_mut_ptr(), self.max_frame);
+                if length < 14 {
+                    break;
+                }
+                let frame = &rx[..length.min(FRAME_BUFFER)];
+                let sender = 1 - receiver;
+                if frame[6..12] != self.mac[sender] {
+                    continue; // somebody else's traffic
+                }
+                match check_frame(frame) {
+                    FrameCheck::Good(sequence) => self.stats[sender].on_good(sequence),
+                    FrameCheck::Corrupt => self.stats[sender].corrupt += 1,
+                    FrameCheck::NotOurs => {}
+                }
+            }
+        }
+    }
+
+    fn sent(&self) -> u32 {
+        self.stats[0].sent + self.stats[1].sent
+    }
+    fn received(&self) -> u32 {
+        self.stats[0].received + self.stats[1].received
+    }
+}
+
 /// What the engine's `poll` hook drives: abort, fault injection, the soak scheduler.
 struct Controller<'a> {
     api: &'a TapeApi,
@@ -137,6 +219,7 @@ struct Controller<'a> {
     injected: bool,
     soak: bool,
     clock: ClockMonitor,
+    net: Option<NetPair>,
     next_sample: u64,
     next_status: u64,
     status_every: u64,
@@ -152,6 +235,9 @@ impl Control for Controller<'_> {
             return false;
         }
         let now = tape_rt::micros();
+        if let Some(net) = self.net.as_mut() {
+            net.service(self.api, now);
+        }
         if now >= self.next_sample {
             self.clock.sample(now, tape_rt::ticks());
             self.next_sample = now + 500_000;
@@ -166,6 +252,15 @@ impl Control for Controller<'_> {
                 self.clock.drift_ppm(),
                 self.clock.stalls
             );
+            if let Some(net) = &self.net {
+                println!(
+                    "         net tx {} rx {} missing {} bad {}",
+                    net.sent(),
+                    net.received(),
+                    net.stats[0].missing() + net.stats[1].missing(),
+                    net.stats[0].corrupt + net.stats[1].corrupt
+                );
+            }
         }
         true
     }
@@ -333,9 +428,36 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return;
     }
 
+    // Set up the network pair first-class: a bad `net=` should not run a long test first.
+    let mut net = None;
+    if let Some((first, second)) = options.net {
+        let nics = (api.nic_count)();
+        if first >= nics || second >= nics {
+            println!("memtest: net=A,B names a NIC this machine does not have ({nics} found; see `nic`).");
+            release(api, &mut blocks, &mut count);
+            return;
+        }
+        let mut macs = [[0u8; 6]; 2];
+        (api.nic_mac)(first, macs[0].as_mut_ptr());
+        (api.nic_mac)(second, macs[1].as_mut_ptr());
+        net = Some(NetPair {
+            nic: [first, second],
+            mac: macs,
+            fps: options.net_fps,
+            max_frame: (api.nic_max_frame_len)().clamp(MIN_FRAME, FRAME_BUFFER),
+            started: 0,
+            stats: [LinkStats::default(); 2],
+            sequence: [0; 2],
+        });
+        println!("memtest: network soak between NIC {} and NIC {} at {} frames/s each way.", first + 1, second + 1, options.net_fps);
+    }
+
     let started = tape_rt::micros();
+    if let Some(pair) = net.as_mut() {
+        pair.started = started;
+    }
     let mut control = Controller {
-        api, abort: false, inject: options.inject, injected: false, soak: options.soak, clock: ClockMonitor::new(),
+        api, abort: false, inject: options.inject, injected: false, soak: options.soak, clock: ClockMonitor::new(), net,
         next_sample: 0, next_status: started + options.status_seconds * 1_000_000, status_every: options.status_seconds,
         started, errors_seen: 0, passes_done: 0,
     };
@@ -442,6 +564,34 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             note("the kernel's free-page count shrank (memory leak)");
         }
         println!("kernel free pages: {pages_before} before, {pages_after} after.");
+        if let Some(net) = control.net.as_mut() {
+            // Let the last frames in flight arrive before counting.
+            for _ in 0..50 {
+                net.service(api, net.started);
+            }
+            for direction in 0..2 {
+                let stats = &net.stats[direction];
+                println!(
+                    "net NIC {} -> NIC {}: sent {} received {} missing {} corrupt {} duplicate/reordered {} send failures {}",
+                    net.nic[direction] + 1,
+                    net.nic[1 - direction] + 1,
+                    stats.sent,
+                    stats.received,
+                    stats.missing(),
+                    stats.corrupt,
+                    stats.out_of_order,
+                    stats.send_failures
+                );
+            }
+            if net.sent() != 0 && net.received() == 0 {
+                note("no soak frame ever arrived (cable? net=A,B must be cabled together)");
+            } else if net.stats.iter().any(|link| link.missing() != 0 || link.corrupt != 0 || link.out_of_order != 0) {
+                note("soak frames lost, corrupted or duplicated");
+            }
+            if net.stats.iter().any(|link| link.send_failures != 0) {
+                note("net: frames could not be transmitted");
+            }
+        }
     }
     if errors.total != 0 {
         note("RAM errors were found");

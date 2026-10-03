@@ -476,3 +476,106 @@ impl ClockMonitor {
         if elapsed == 0 { 0 } else { self.skew_us * 1_000_000 / elapsed }
     }
 }
+
+/// Ethertype of the soak traffic (an experimental value, like the other test
+/// tapes' own).
+pub const SOAK_ETHERTYPE: u16 = 0x88bb;
+/// Smallest frame the generator builds (Ethernet's minimum without the FCS).
+pub const MIN_FRAME: usize = 60;
+const FRAME_MAGIC: [u8; 4] = *b"FSOK";
+const FRAME_FILLER_AT: usize = 28;
+
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for &byte in bytes {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Builds one soak frame of `total_len` bytes (clamped to `MIN_FRAME..=out.len()`)
+/// into `out` and returns that length. Layout: Ethernet header, `FSOK`, the
+/// sequence number (u32), the real frame length (u16, because short frames are
+/// padded on the wire), an FNV-1a checksum (u32) of the filler, then pseudo-random
+/// filler seeded by the sequence number. The length is what makes a truncated
+/// frame detectable; the checksum catches flipped bits anywhere in the filler.
+pub fn build_frame(out: &mut [u8], destination: [u8; 6], source: [u8; 6], sequence: u32, total_len: usize) -> usize {
+    let total = total_len.clamp(MIN_FRAME, out.len());
+    out[0..6].copy_from_slice(&destination);
+    out[6..12].copy_from_slice(&source);
+    out[12..14].copy_from_slice(&SOAK_ETHERTYPE.to_be_bytes());
+    out[14..18].copy_from_slice(&FRAME_MAGIC);
+    out[18..22].copy_from_slice(&sequence.to_le_bytes());
+    out[22..24].copy_from_slice(&(total as u16).to_le_bytes());
+    fill_bytes(&mut out[FRAME_FILLER_AT..total], sequence ^ 0x5a5a_a5a5);
+    let checksum = fnv1a(&out[FRAME_FILLER_AT..total]);
+    out[24..28].copy_from_slice(&checksum.to_le_bytes());
+    total
+}
+
+/// What `check_frame` made of a received frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameCheck {
+    /// Not a soak frame (ARP, discovery, a `term net` session...): ignore it.
+    NotOurs,
+    /// A soak frame whose length or checksum is wrong.
+    Corrupt,
+    Good(u32),
+}
+
+pub fn check_frame(frame: &[u8]) -> FrameCheck {
+    if frame.len() < FRAME_FILLER_AT
+        || frame[12..14] != SOAK_ETHERTYPE.to_be_bytes()
+        || frame[14..18] != FRAME_MAGIC
+    {
+        return FrameCheck::NotOurs;
+    }
+    let sequence = u32::from_le_bytes([frame[18], frame[19], frame[20], frame[21]]);
+    let declared = u16::from_le_bytes([frame[22], frame[23]]) as usize;
+    let checksum = u32::from_le_bytes([frame[24], frame[25], frame[26], frame[27]]);
+    if declared != frame.len().max(MIN_FRAME).min(declared) || declared > frame.len() || declared < MIN_FRAME {
+        return FrameCheck::Corrupt;
+    }
+    if fnv1a(&frame[FRAME_FILLER_AT..declared]) != checksum
+        || first_mismatch(&frame[FRAME_FILLER_AT..declared], sequence ^ 0x5a5a_a5a5).is_some()
+    {
+        return FrameCheck::Corrupt;
+    }
+    FrameCheck::Good(sequence)
+}
+
+/// Counters for one direction of the soak traffic.
+#[derive(Clone, Copy, Default)]
+pub struct LinkStats {
+    pub sent: u32,
+    pub send_failures: u32,
+    pub received: u32,
+    pub corrupt: u32,
+    /// Sequence numbers skipped (frames that never arrived, so far).
+    pub lost: u32,
+    /// Frames that arrived twice or after a later one.
+    pub out_of_order: u32,
+    expected: u32,
+}
+
+impl LinkStats {
+    /// Records a good frame with this sequence number.
+    pub fn on_good(&mut self, sequence: u32) {
+        self.received += 1;
+        if sequence == self.expected {
+            self.expected += 1;
+        } else if sequence > self.expected {
+            self.lost += sequence - self.expected;
+            self.expected = sequence + 1;
+        } else {
+            self.out_of_order += 1;
+        }
+    }
+
+    /// Frames still unaccounted for: gaps minus frames that turned up late.
+    /// (A duplicate also counts as "late", so a duplicated frame can hide one
+    /// missing frame; both show in `out_of_order` anyway.)
+    pub fn missing(&self) -> u32 {
+        self.lost.saturating_sub(self.out_of_order)
+    }
+}

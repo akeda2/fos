@@ -35,7 +35,10 @@ def main():
         command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-drive", f"format=raw,file={image}",
-                   "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:7a"]
+                   "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:7a",
+                   # NICs 2 and 3 share a QEMU hub: a cable between them, for memtest's network soak.
+                   "-netdev", "hubport,id=cable2,hubid=7", "-device", "e1000,netdev=cable2,mac=52:54:00:12:34:7c",
+                   "-netdev", "hubport,id=cable3,hubid=7", "-device", "e1000,netdev=cable3,mac=52:54:00:12:34:7d"]
         wire = Wire()
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         raw = bytearray()
@@ -110,6 +113,11 @@ def main():
             check("memtest: FAIL" in injected and "mismatching word" in injected and "bad bits: 5(" in injected, "memtest detects a deliberately flipped bit and names it", injected)
             soak = run("run memtest soak for=9 status=3 size=4 disk=soakwire disk.every=3 disk.kb=8", timeout=150)
             check("memtest: PASS" in soak and "disk checks:" in soak and "disk checks: 0" not in soak, "soak mode runs (churn, clock, kernel health, a disk write/read-back check)", soak)
+            net_soak = run("run memtest soak for=8 status=4 size=4 net=2,3 net.fps=2000", timeout=150)
+            check("memtest: PASS" in net_soak and "net NIC 2 -> NIC 3: sent" in net_soak and "net NIC 3 -> NIC 2: sent" in net_soak and "received 0 " not in net_soak,
+                  "network soak: checksummed frames of every size cross the cable between two NICs in both directions, none lost or corrupt", net_soak)
+            bad_nic = run("run memtest soak for=3 net=2,9", timeout=60)
+            check("names a NIC this machine does not have" in bad_nic, "net= with a NIC that does not exist is refused up front", bad_nic)
             check("soakwire" not in run("ls"), "and removes its test file afterwards", "")
             wire.send(guest, TAG_DATA, b"shutdown\n")
             for _ in range(100):
