@@ -504,9 +504,13 @@ impl Controller {
     }
 
     fn command(&mut self, parameter: u64, status: u32, control: u32) -> Result<Trb, Error> {
+        // Address Device sends SET_ADDRESS to the device, and a controller keeps retrying a
+        // silent device for up to ~5 s before it reports failure: give it longer than that,
+        // or the next command queues behind a command we already gave up on.
+        let ticks = if control >> 10 & 0x3f == TRB_ADDRESS_DEVICE { 700 } else { TIMEOUT_TICKS };
         let at = self.command_ring.push(parameter, status, control);
         self.ring_doorbell(0, 0);
-        let event = self.wait_event(TIMEOUT_TICKS, |event| event.kind() == TRB_COMMAND_COMPLETION && event.parameter == at)?;
+        let event = self.wait_event(ticks, |event| event.kind() == TRB_COMMAND_COMPLETION && event.parameter == at)?;
         match event.code() {
             CC_SUCCESS => Ok(event),
             code => Err(Error::Command(code)),
