@@ -88,7 +88,50 @@ def main():
         check("RESULT: PASS" in text, "and they pass", text)
     finally:
         lab.stop()
+    soak_checks()
     print("memtest e2e: all checks passed")
+
+
+def soak_checks():
+    """Soak mode on the selftest lab: four e1000 NICs, 1<->2 and 3<->4 cabled."""
+    lab = Lab()  # four NICs, 256 MiB, snapshot (disk writes are thrown away)
+    try:
+        before = free_frames(lab)
+        text = run_memtest(lab, "soak for=20 status=5 size=2 tests=addr net=1,2 net.fps=200 "
+                           "disk=soak.tmp disk.every=5 disk.kb=16", 120)
+        check("RESULT: PASS, no errors" in text, "a clean soak passes", text)
+        check("disk: WRITES 16 KiB to 'soak.tmp'" in text, "the disk test announces that it writes", text)
+        sent = re.search(r"net NIC 1 -> 2: sent (\d+) rx (\d+) missing 0 bad 0", text)
+        check(sent is not None and int(sent.group(1)) > 2000 and sent.group(1) == sent.group(2),
+              f"all soak frames arrived NIC 1 -> 2 ({sent and sent.groups()})", text)
+        check(re.search(r"net NIC 2 -> 1: sent (\d+) rx \1 missing 0 bad 0", text) is not None,
+              "and NIC 2 -> 1", text)
+        disk = re.search(r"disk: (\d+) rounds, ok (\d+) mismatches 0 errors 0", text)
+        check(disk is not None and int(disk.group(2)) >= 2 and disk.group(1) == disk.group(2),
+              f"the disk file was written and read back correctly ({disk and disk.groups()})", text)
+        check("churn ... ok" not in text and "RESULT: PASS" in text and "churn: on" in text,
+              "allocator churn ran quietly between passes", text)
+        check("backwards 0, tick stalls 0" in text, "the clock behaved", text)
+        check(re.search(r"\d\d:\d\d:\d\d pass \d+ errors 0 \| clock skew", text) is not None, "status lines were printed", text)
+        check(max(len(line) for line in text.splitlines()[1:]) <= 79, "every line fits an 80-column screen", text)
+        check(free_frames(lab) == before, "no frames leaked", text)
+        check("soak.tmp" not in lab.shell("ls"), "the scratch file was removed", text)
+
+        text = run_memtest(lab, "soak for=6 size=2 tests=addr")
+        check("disk: off, never automatic" in text and "disk: " + "0 rounds" not in text and "RESULT: PASS" in text,
+              "without disk= the disk is never touched", text)
+
+        text = run_memtest(lab, "soak for=6 size=2 tests=addr disk=readme.txt")
+        check("Usage: tape run memtest" in text, "disk= refuses a name that does not start with soak", text)
+
+        text = run_memtest(lab, "soak for=8 size=2 tests=addr net=1,3 net.fps=100")
+        check("RESULT: FAIL" in text and "no soak frame ever arrived" in text,
+              "an uncabled net pair is reported as a failure", text)
+
+        text = run_memtest(lab, "soak for=6 size=2 tests=random inject=10 churn=off")
+        check("RESULT: FAIL" in text and "memory errors" in text, "soak reports injected memory errors", text)
+    finally:
+        lab.stop()
 
 
 if __name__ == "__main__":

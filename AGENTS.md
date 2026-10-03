@@ -961,7 +961,8 @@ timer), then the multi-interface set `nic_count`, `nic_mac_at`, `nic_send_at`,
 one-based `nic use N`; promiscuous mode is for `tapes/bridge/` and must be restored
 before returning). Later slots: 36 `wait_for_event`, 37 `set_input_mode`, 38
 `micros`, 39/40 `alloc_frames`/`free_frames` (the 4 KiB frame pool below the big
-pool's 128 MiB start; the kernel keeps a 4 MiB reserve; `tapes/memtest/`).
+pool's 128 MiB start; the kernel keeps a 4 MiB reserve; `tapes/memtest/`), 41
+`kernel_stat(id, arg)` (free frames/big chunks, per-NIC recoveries/overruns).
 
 The kernel owns every NIC (PCI, DMA, rings, overflow recovery) and never parses
 ARP/IPv4/UDP/TCP: those live in the fixed-buffer `tapes/tape-net/` library

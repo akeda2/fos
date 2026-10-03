@@ -880,7 +880,7 @@ consistency while building this table:
 | `audio-rtp` | `static LOCAL_IP/PREFIX GATEWAY [PORT]` or `dhcp [PORT]` listens and plays (raw PCM and Opus both auto-detected on receive).<br>`static ... send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]` (or `dhcp send ...`) replays a FOSFS file.<br>`... capture [opus] PEER_IP [PEER_PORT] [BITRATE]` streams the live ADC.<br>`... duplex [opus] PEER_IP [PEER_PORT] [BITRATE]` listens and streams the live ADC simultaneously. `PORT`/`PEER_PORT` default to `5004`; `duplex`'s own listen port is always `5004`, not separately configurable. |
 | `beep` | (no args) |
 | `bigsieve` | (no args) |
-| `memtest` | `[memtest] [size=MB] [passes=N] [tests=addr,walk,moving,random] [hold=SECONDS] [frames=on\|off] [seed=N] [inject=WORD]`. RAM tester: claims free RAM (frame pool and big pool), runs the tests, reports bad addresses, bits and MiB blocks. `passes=0` repeats until Escape; see `tapes/memtest/` below. |
+| `memtest` | `[memtest] [soak [for=90\|5m\|2h] [status=S] [net=A,B] [net.fps=N] [churn=on\|off] [disk=soakNAME [disk.kb=N] [disk.every=S]]] [size=MB] [passes=N] [tests=addr,walk,moving,random] [hold=SECONDS] [frames=on\|off] [seed=N] [inject=WORD]`. RAM tester: claims free RAM (frame pool and big pool), runs the tests, reports bad addresses, bits and MiB blocks. `passes=0` repeats until Escape; `soak` is the long-run stress mode, see `tapes/memtest/` below. |
 | `nettest` | `[nettest] selftest GEN IN OUT SINK`, `[nettest] routertest GEN SINK` (ready-made lab / router test, see `docs/nettest.md`), or `[nettest] [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]] [rate=KBIT] [queue=N] [seed=N] [dup=PCT] [reorder=PCT] [corrupt=PCT] [preset=NAME] [view=on]`, or `@nettest.cfg` (one command per line; an annotated example, `nettest.cfg`, is installed on every image, source `tapes/nettest/nettest.cfg`). Two-port link impairment between NICs A and B (default 1 and 2); prefix a setting with `ab.` or `ba.` for one direction. Prompt commands: `loss`, `delay`, `rate`, `queue`, `dup`, `reorder`, `corrupt`, `preset`, `presets`, `seed`, `show`, `stats`, `view on|off`, `reset [stats]`, `help`, `quit`. |
 | `bridge` | (no args) bridges every initialized interface.<br>`[bridge] NIC [NIC ...]` selects specific one-based `nic list` numbers (at least two, all distinct). |
 | `calc` | (no args) starts an interactive reverse-Polish-notation REPL.<br>`EXPRESSION` evaluates one expression and returns, e.g. `3 4 +`. |
@@ -1166,8 +1166,30 @@ a bit on purpose to prove detection works, since QEMU's RAM never fails. It does
 not cover the tape's own 4 MiB, the kernel's low memory, its frame reserve or RAM
 above 2 GiB (unmapped), and it prints what it claimed so "PASS" is never
 vaguer than that. The engine is `tapes/memtest/src/lib.rs` (host unit tests);
-`make test-tape-memtest` also boots QEMU. Planned next: a soak mode that adds
-disk, network and clock checks for long runs.
+`make test-tape-memtest` also boots QEMU.
+
+**Soak mode** (`tape run memtest soak ...`) is for long, heavy use of the whole
+OS: the memory tests repeat until `for=` (seconds, `5m`, `2h`) or Escape, and
+between passes an allocator churn frees every block, allocates random-sized
+blocks from both pools, fills and checks each with its own random data, frees
+them in another order and claims everything again (overlapping allocations show
+as corrupt data, lost memory as a smaller claim or a changed free-frame count).
+`net=A,B` makes two cabled NICs (one-based) send checksummed frames of varying
+size to each other at `net.fps` (default 500) frames/s each way, counting loss,
+corruption and reordering; keep `term net` on a different NIC. The clock check
+compares `micros()` with the 100 Hz tick (drift, lost timer interrupts, going
+backwards), and ABI slot 41 `kernel_stat` lets it compare free frames/big-pool
+chunks and the NICs' watchdog recoveries before and after. A status line prints
+every `status=` seconds (default 10), then a summary and a PASS/FAIL verdict
+that names every reason.
+
+**The disk is never tested unless asked.** The machine may boot from a USB flash
+stick, so `disk=NAME` is the only way in: every `disk.every` seconds (default 120,
+at least 5) a `disk.kb` KiB (default 32, at most 128) pseudo-random file is
+written through the filesystem, read back and compared. The name must start with
+`soak` (a real file can never be overwritten) and may select another disk
+(`disk=disk2/soak.tmp`, the way to spare the boot stick); the file is removed
+at the end.
 
 #### Test tape: `tapes/nettest/`
 

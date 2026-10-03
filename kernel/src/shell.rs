@@ -6495,6 +6495,24 @@ extern "C" fn tape_free_frames(address: u32, bytes: u32) {
     }
 }
 
+/// Tape ABI slot 41: `kernel_stat(id, arg) -> value`, read-only health
+/// counters a long-running tape (`memtest soak`) compares before and after to
+/// notice leaks and silent NIC trouble that the tape cannot see by itself.
+/// `id` 0: free 4 KiB frames; 1: free 1 MiB big-pool chunks; 2/3/4: for the
+/// NIC with zero-based index `arg`, watchdog recoveries / receive overruns /
+/// failed recoveries. Anything unknown (or a missing NIC) returns `u32::MAX`.
+extern "C" fn tape_kernel_stat(id: u32, arg: u32) -> u32 {
+    let health = || nic::get_at(arg as usize).map(|nic| nic.health());
+    match id {
+        0 => pmem::stats().1 as u32,
+        1 => pmem::big_stats().1 as u32,
+        2 => health().map_or(u32::MAX, |health| health.recoveries),
+        3 => health().map_or(u32::MAX, |health| health.rx_overruns),
+        4 => health().map_or(u32::MAX, |health| health.recovery_failures),
+        _ => u32::MAX,
+    }
+}
+
 fn tape_boot_info() -> Option<&'static BootInfo> {
     let pointer = unsafe { TAPE_BOOT_INFO };
     (!pointer.is_null()).then(|| unsafe { &*pointer })
@@ -6833,6 +6851,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         micros: extern "C" fn() -> u64,
         alloc_frames: extern "C" fn(u32) -> u32,
         free_frames: extern "C" fn(u32, u32),
+        kernel_stat: extern "C" fn(u32, u32) -> u32,
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -6883,6 +6902,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_micros,
         tape_alloc_frames,
         tape_free_frames,
+        tape_kernel_stat,
     );
     crate::debug::watchdog_tape_running(false);
     unsafe {
