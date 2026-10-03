@@ -180,6 +180,12 @@ there). `tools/build_image.py` gains a small pure-Python FAT32 writer for the ES
   local input on that machine and gets its own milestone early (M3b, section 11)
   instead of being left until the end. The firmware's own `SimpleTextInput`
   covers the loader and the first moments of the kernel until then.
+  **Decided: a machine must also boot with no local keyboard at all** (headless
+  lab boxes, a stick unplugged, a keyboard that never enumerates). Nothing in the
+  boot path may wait for, or fail because of, a missing or silent keyboard: the
+  kernel reaches the `term net` wait and the shell loop whether or not any key
+  source exists, and keyboard bring-up failures are reported and ignored. The
+  keyboard is an additional input, never a boot dependency.
 
 ## 8. Storage and the boot disk
 
@@ -257,7 +263,7 @@ debug/watchdog/crash-record machinery, `devloop`.
 
 | # | Milestone | Done when |
 | --- | --- | --- |
-| M0 | Loader skeleton | OVMF boots `BOOTX64.EFI`; it narrates to serial + firmware console, prints the memory map, GOP mode and RSDP. QEMU smoke test. |
+| M0 (done) | Loader skeleton | OVMF boots `BOOTX64.EFI`; it narrates to serial + firmware console, prints the memory map, GOP mode and RSDP. QEMU smoke test. |
 | M1 | Kernel hello | Loader loads an ELF64 kernel from a raw slot and exits boot services; kernel switches to its own GDT/page tables and prints through serial + framebuffer. |
 | M2 | Memory and interrupts | Physical allocator, identity map with NX/guard pages, IDT, LAPIC timer tick, faults reported legibly. |
 | M3 | Shell and network | PCI scan, one NIC (e1000 under QEMU), `term net` session working from boot. This is the first point `devloop` can drive v2. |

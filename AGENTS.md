@@ -15,6 +15,10 @@ kernel. Boot stages emit explanatory messages to VGA text memory and COM1.
 Keep changes small and explainable; avoid general frameworks or abstractions
 that obscure hardware behavior.
 
+**v2** (UEFI loader + 64-bit kernel, in `v2/`) is being built alongside this v1
+tree; design and milestones are in `docs/v2-design.md`, targets are `make v2-*`.
+Everything below describes v1 unless it says otherwise.
+
 See NETWORKING.md for more networking stuff
 See AUDIO.md for audio interface stuff
 See DEFERRED.md for things put aside for now.

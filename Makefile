@@ -153,6 +153,7 @@ help:
 	@echo "  make test-nic-map     - boot five NICs on virtual cables and check that nic map finds them"
 	@echo "  make test-tape-nettest-router - nettest UDP/IP traffic through the router tape (two guests)"
 	@echo "  make test-xhci - xHCI driver: addressing, usb storage attach/native over a QEMU xHCI stick"
+	@echo "  make v2-image / test-v2-loader - fos v2 UEFI loader (milestone M0) under QEMU + OVMF; see docs/v2-design.md"
 	@echo "  make test-ahci - AHCI driver: sata, sata drives, sata attach with FOSFS on a QEMU SATA disk"
 	@echo "  make test-ehci - EHCI driver: addressing, usb storage attach/native over a QEMU EHCI stick"
 	@echo "  make test-usb-hosts - 'usb hosts' lists UHCI/OHCI/EHCI/xHCI controllers (QEMU with all four)"
@@ -711,4 +712,7 @@ test-audio-multi: image
 # directories from before that change; harmless to list even once they no
 # longer exist, since `rm -rf` on a missing path is a no-op.
 clean:
-	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/beep/target tapes/morse/target tapes/net-chat/target tapes/audio-net/target tapes/ip-chat/target tapes/telnet/target tapes/audio-rtp/target tapes/opus-codec/target tapes/bridge/target tapes/nettest/target tapes/memtest/target tapes/router/target tapes/net-dhcp-test/target
+	rm -rf $(BUILD) kernel/target tapes/hello-rs/target tapes/vga-colors/target tapes/bigsieve/target tapes/longmode-rs/target tapes/cpu64-lab/target tapes/cpu64-show/target tapes/calc/target tapes/ed/target tapes/beep/target tapes/morse/target tapes/net-chat/target tapes/audio-net/target tapes/ip-chat/target tapes/telnet/target tapes/audio-rtp/target tapes/opus-codec/target tapes/bridge/target tapes/nettest/target tapes/memtest/target tapes/router/target tapes/net-dhcp-test/target v2/loader/target
+
+# fos v2 (UEFI loader, 64-bit kernel): v2-* targets, see v2/v2.mk and docs/v2-design.md.
+include v2/v2.mk
