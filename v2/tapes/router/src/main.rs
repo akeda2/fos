@@ -2451,6 +2451,8 @@ fn forward_ipv4(
                     print_ip(putc, interfaces[egress].address);
                     print_bytes(putc, b":");
                     print_u32(putc, u32::from(port));
+                    print_bytes(putc, b" next hop ");
+                    print_ip(putc, next_hop);
                     print_bytes(putc, b".\n");
                 }
                 port
