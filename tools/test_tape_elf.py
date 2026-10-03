@@ -16,6 +16,7 @@ TAPE_NAMES = (
     "telnet",
     "bridge",
     "router",
+    "memtest",
 )
 
 

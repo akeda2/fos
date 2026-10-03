@@ -880,6 +880,7 @@ consistency while building this table:
 | `audio-rtp` | `static LOCAL_IP/PREFIX GATEWAY [PORT]` or `dhcp [PORT]` listens and plays (raw PCM and Opus both auto-detected on receive).<br>`static ... send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]` (or `dhcp send ...`) replays a FOSFS file.<br>`... capture [opus] PEER_IP [PEER_PORT] [BITRATE]` streams the live ADC.<br>`... duplex [opus] PEER_IP [PEER_PORT] [BITRATE]` listens and streams the live ADC simultaneously. `PORT`/`PEER_PORT` default to `5004`; `duplex`'s own listen port is always `5004`, not separately configurable. |
 | `beep` | (no args) |
 | `bigsieve` | (no args) |
+| `memtest` | `[memtest] [size=MB] [passes=N] [tests=addr,walk,moving,random] [hold=SECONDS] [frames=on\|off] [seed=N] [inject=WORD]`. RAM tester: claims free RAM (frame pool and big pool), runs the tests, reports bad addresses, bits and MiB blocks. `passes=0` repeats until Escape; see `tapes/memtest/` below. |
 | `nettest` | `[nettest] selftest GEN IN OUT SINK`, `[nettest] routertest GEN SINK` (ready-made lab / router test, see `docs/nettest.md`), or `[nettest] [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]] [rate=KBIT] [queue=N] [seed=N] [dup=PCT] [reorder=PCT] [corrupt=PCT] [preset=NAME] [view=on]`, or `@nettest.cfg` (one command per line; an annotated example, `nettest.cfg`, is installed on every image, source `tapes/nettest/nettest.cfg`). Two-port link impairment between NICs A and B (default 1 and 2); prefix a setting with `ab.` or `ba.` for one direction. Prompt commands: `loss`, `delay`, `rate`, `queue`, `dup`, `reorder`, `corrupt`, `preset`, `presets`, `seed`, `show`, `stats`, `view on|off`, `reset [stats]`, `help`, `quit`. |
 | `bridge` | (no args) bridges every initialized interface.<br>`[bridge] NIC [NIC ...]` selects specific one-based `nic list` numbers (at least two, all distinct). |
 | `calc` | (no args) starts an interactive reverse-Polish-notation REPL.<br>`EXPRESSION` evaluates one expression and returns, e.g. `3 4 +`. |
@@ -1151,6 +1152,22 @@ and verify it with `tapes/test_audio_net_e2e.py`, which streams a
 synthetic tone into a QEMU guest's listen-mode tape and confirms the
 guest's `-audiodev wav` capture actually contains real, non-silent audio
 matching what was sent.
+
+#### Test tape: `tapes/memtest/`
+
+A RAM tester. `tape run memtest` claims every free block it can get (the 4 KiB
+frame pool through ABI slot 39 `alloc_frames`, which keeps a 4 MiB reserve for the
+kernel, then the 1 MiB big pool through `alloc`), runs address, walking
+ones/zeros, moving-inversion and random tests over each block, and prints every
+mismatch with its physical address, the bit positions that flipped and the 1 MiB
+blocks that went bad. `size=MB` limits how much is tested, `passes=0` loops until
+Escape, `hold=S` adds a retention test (fill, wait, verify). `inject=WORD` flips
+a bit on purpose to prove detection works, since QEMU's RAM never fails. It does
+not cover the tape's own 4 MiB, the kernel's low memory, its frame reserve or RAM
+above 2 GiB (unmapped), and it prints what it claimed so "PASS" is never
+vaguer than that. The engine is `tapes/memtest/src/lib.rs` (host unit tests);
+`make test-tape-memtest` also boots QEMU. Planned next: a soak mode that adds
+disk, network and clock checks for long runs.
 
 #### Test tape: `tapes/nettest/`
 

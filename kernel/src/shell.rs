@@ -6463,6 +6463,38 @@ extern "C" fn tape_free(address: u32, bytes: u32) {
     pmem::free_big(address, chunks);
 }
 
+/// Frames of the 4 KiB pool `tape_alloc_frames` never hands out (4 MiB): the
+/// kernel still allocates from this pool at run time (NIC rings, USB), and a
+/// tape that took every last frame would leave it unable to.
+const TAPE_FRAME_RESERVE: usize = 1024;
+
+/// Tape ABI slot 39: `alloc_frames(bytes) -> address`, the 4 KiB-frame-pool
+/// twin of `alloc`. The big pool `alloc` serves only starts at 128 MiB, so
+/// without this a tape could never touch the first 128 MiB of a machine's RAM
+/// (and a machine with 128 MiB or less would have nothing at all to offer).
+/// `bytes` rounds up to whole frames; the memory is physically contiguous, not
+/// zeroed, and zero comes back when no run is free or when taking it would
+/// leave fewer than `TAPE_FRAME_RESERVE` frames for the kernel. Release it with
+/// `tape_free_frames`; there is no automatic free when the tape returns.
+extern "C" fn tape_alloc_frames(bytes: u32) -> u32 {
+    let count = bytes.div_ceil(pmem::FRAME_SIZE) as usize;
+    let (_, free) = pmem::stats();
+    if count == 0 || free < count.saturating_add(TAPE_FRAME_RESERVE) {
+        return 0;
+    }
+    pmem::allocate_contiguous(count).unwrap_or(0)
+}
+
+/// Tape ABI slot 40: releases what `tape_alloc_frames` returned (same `bytes`).
+/// `pmem::free` ignores out-of-range or already-free frames, so a wrong
+/// length cannot corrupt the accounting.
+extern "C" fn tape_free_frames(address: u32, bytes: u32) {
+    let count = bytes.div_ceil(pmem::FRAME_SIZE);
+    for frame in 0..count {
+        pmem::free(address.wrapping_add(frame * pmem::FRAME_SIZE));
+    }
+}
+
 fn tape_boot_info() -> Option<&'static BootInfo> {
     let pointer = unsafe { TAPE_BOOT_INFO };
     (!pointer.is_null()).then(|| unsafe { &*pointer })
@@ -6799,6 +6831,8 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         wait_for_event: extern "C" fn(),
         set_input_mode: extern "C" fn(u32),
         micros: extern "C" fn() -> u64,
+        alloc_frames: extern "C" fn(u32) -> u32,
+        free_frames: extern "C" fn(u32, u32),
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -6847,6 +6881,8 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_wait_for_event,
         tape_set_input_mode,
         tape_micros,
+        tape_alloc_frames,
+        tape_free_frames,
     );
     crate::debug::watchdog_tape_running(false);
     unsafe {
