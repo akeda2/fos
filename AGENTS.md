@@ -862,6 +862,16 @@ controllers/ports and fully re-enumerates every time. Device addresses come from
   hardware-only). `debug::crumb`/`debug crumb` (see the low-memory map) helped
   find where bring-up stalled.
 
+- **AHCI** (`kernel/src/ahci.rs`; `sata`, `sata drives`, `sata attach`): a polling
+  SATA driver (one command slot, 512-byte sectors, LBA48 with 28-bit fallback,
+  bounce buffer, cache flush after each write). `disk.rs` gains
+  `SecondaryBackend::Ahci` (secondary `diskN` only; boot-disk promotion is not
+  implemented). Explicit only, like USB: it must not run at boot, because the BIOS
+  reads those disks through the same HBA. Only AHCI-mode controllers qualify
+  (`sata` shows which machines have them); IDE-compatibility mode, NVMe and RAID
+  are not driven. Test: `make test-ahci` (QEMU `ich9-ahci`; 28-bit commands have no
+  automated coverage).
+
 Tests: `tapes/test_uhci_e2e.py`, `test_uhci_play_e2e.py`,
 `test_uhci_audio_facade_e2e.py`, `test_usb_storage_e2e.py`,
 `test_usb_storage_disk_e2e.py`, `test_usb_boot_promote_e2e.py`. Confirmed on a real

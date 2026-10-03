@@ -800,7 +800,7 @@ pub fn find_serial_ports(out: &mut [u16]) -> usize {
 /// needs `enable_io_and_bus_master()` (UHCI is DMA-capable, walking its
 /// Frame List/Queue Heads/Transfer Descriptors by bus mastering) and
 /// `interrupt_line()`.
-pub fn find_usb_controllers(wanted_prog_if: u8, out: &mut [Option<PciAddress>]) -> usize {
+pub fn find_controllers(wanted_class: u8, wanted_subclass: u8, wanted_prog_if: u8, out: &mut [Option<PciAddress>]) -> usize {
     let mut count = 0;
     for bus in 0..=255u8 {
         for device in 0..32u8 {
@@ -826,7 +826,7 @@ pub fn find_usb_controllers(wanted_prog_if: u8, out: &mut [Option<PciAddress>]) 
                 let class = read_u8(bus, device, function, 0x0b);
                 let subclass = read_u8(bus, device, function, 0x0a);
                 let prog_if = read_u8(bus, device, function, 0x09);
-                if class != CLASS_SERIAL_BUS || subclass != SUBCLASS_USB || prog_if != wanted_prog_if
+                if class != wanted_class || subclass != wanted_subclass || prog_if != wanted_prog_if
                 {
                     continue;
                 }
@@ -843,6 +843,17 @@ pub fn find_usb_controllers(wanted_prog_if: u8, out: &mut [Option<PciAddress>]) 
         }
     }
     count
+}
+
+/// USB host controllers of one programming interface (UHCI 0x00, EHCI 0x20,
+/// xHCI 0x30): see `find_controllers`.
+pub fn find_usb_controllers(wanted_prog_if: u8, out: &mut [Option<PciAddress>]) -> usize {
+    find_controllers(CLASS_SERIAL_BUS, SUBCLASS_USB, wanted_prog_if, out)
+}
+
+/// AHCI (SATA) host bus adapters: mass storage (0x01), SATA (0x06), AHCI 1.0 (0x01).
+pub fn find_ahci_controllers(out: &mut [Option<PciAddress>]) -> usize {
+    find_controllers(0x01, 0x06, 0x01, out)
 }
 
 /// UHCI (USB 1.1) host controllers: see `find_usb_controllers`.

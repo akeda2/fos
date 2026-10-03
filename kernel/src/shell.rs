@@ -56,6 +56,7 @@ use crate::parallel;
 use crate::pci;
 use crate::pmem;
 use crate::uhci;
+use crate::ahci;
 use crate::ehci;
 use crate::xhci;
 use crate::usb_storage;
@@ -827,6 +828,7 @@ fn execute(command: &[u8], info: &BootInfo) {
                 );
                 println!("Audio/USB: audio, hda (status); usb play|capture [diskN] NAME");
                 println!("      usb storage attach|promote, usb native (promote/attach all disks)");
+                println!("      usb hosts|ehci|xhci; sata [drives|attach] (SATA disks via AHCI)");
                 println!(
                     "Tape: tape status | tape run [ARGS...|@FILE|@diskN/FILE] ('load'/'run' work"
                 );
@@ -900,6 +902,7 @@ fn execute(command: &[u8], info: &BootInfo) {
         b"mmio" => mmio_command(arguments),
         b"dmesg" if no_arguments(arguments) => dmesg_command(),
         b"usb" => usb_command(info, arguments),
+        b"sata" => sata_command(arguments),
         b"printer" if no_arguments(arguments) => print_printer_ports(),
         b"print" => print_command(info, arguments),
         b"nic" => nic_command(arguments),
@@ -1633,6 +1636,107 @@ fn usb_host_kind(prog_if: u8) -> &'static str {
 /// BIOS's own (INT13h) access to a USB stick is the only way to read it. Run
 /// on each real machine to learn which drivers it would need. `summary` prints
 /// just the one-line tally that the plain `usb` command shows first.
+/// `sata`: every PCI mass-storage controller (class 0x01) and how it presents
+/// itself. Only controllers in AHCI mode (subclass 0x06, programming interface
+/// 0x01) are candidates for a native driver; a SATA controller the BIOS left in
+/// IDE-compatibility mode (class 0x01/0x01) is driven through legacy ATA ports
+/// instead. NVMe is class 0x01/0x08. Run on each real machine to see what it has.
+fn sata_command(arguments: &[u8]) {
+    match arguments {
+        b"" => {}
+        b"drives" => {
+            print_ahci_drives();
+            return;
+        }
+        b"attach" => {
+            match disk::attach_ahci_disks() {
+                Ok(added) => println!("Attached {added} new SATA disk(s); see 'ls' on the new diskN."),
+                Err(disk::UsbAttachError::NoDevice) => println!("No SATA drive found on an AHCI controller."),
+                Err(disk::UsbAttachError::Full) => println!("No free diskN slot left."),
+                Err(error) => println!("Could not attach: {error:?}"),
+            }
+            return;
+        }
+        _ => {
+            println!("Usage: sata | sata drives | sata attach");
+            return;
+        }
+    }
+    let mut devices = [pci::PciDeviceInfo {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        class: 0,
+        subclass: 0,
+        prog_if: 0,
+        header_type: 0,
+        bar0: 0,
+        has_msi: false,
+        revision: 0,
+        subsystem: 0,
+        interrupt_line: 0,
+        interrupt_pin: 0,
+        command: 0,
+        status: 0,
+    }; pci::MAX_PCI_DEVICES];
+    let found = pci::scan_devices(&mut devices).min(devices.len());
+    let mut any = false;
+    for info in devices[..found].iter().filter(|info| info.class == 0x01) {
+        any = true;
+        let kind = match (info.subclass, info.prog_if) {
+            (0x06, 0x01) => "SATA AHCI [driver]",
+            (0x06, _) => "SATA (not AHCI)",
+            (0x01, _) => "IDE/ATA legacy",
+            (0x04, _) => "RAID",
+            (0x05, _) => "ATA (ADMA)",
+            (0x07, _) => "SAS",
+            (0x08, 0x02) => "NVMe",
+            (0x08, _) => "NVM (not NVMe)",
+            _ => "other storage",
+        };
+        println!(
+            "{:02x}:{:02x}.{} {:04x}:{:04x} {} (class {:02x}/{:02x}/{:02x})",
+            info.bus, info.device, info.function, info.vendor_id, info.device_id, kind,
+            info.class, info.subclass, info.prog_if,
+        );
+    }
+    if !any {
+        println!("No PCI mass-storage controllers found.");
+    }
+}
+
+/// `sata drives`: starts every AHCI controller (see `ahci.rs`: the BIOS's own
+/// access to those disks stops working) and lists each drive's model and size.
+fn print_ahci_drives() {
+    let count = ahci::count();
+    if count == 0 {
+        println!("No AHCI controller found, or it would not start.");
+        return;
+    }
+    for index in 0..count {
+        let Some(controller) = ahci::get(index) else { continue };
+        println!(
+            "AHCI {}: registers at 0x{:08x}, {} drive(s)",
+            controller.instance(),
+            controller.bar(),
+            controller.drive_count()
+        );
+        for drive_index in 0..controller.drive_count() {
+            let Some(drive) = controller.drive(drive_index) else { continue };
+            let model = controller.model(drive_index);
+            println!(
+                "  port {}: {} - {} sectors ({} MiB)",
+                drive.location().1,
+                core::str::from_utf8(model).unwrap_or("?").trim(),
+                drive.sectors(),
+                drive.sectors() / 2048,
+            );
+        }
+    }
+}
+
 fn print_usb_hosts(summary: bool) {
     let mut devices = [pci::PciDeviceInfo {
         bus: 0,

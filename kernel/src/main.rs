@@ -8,6 +8,7 @@ compile_error!("page-protection-test requires the default paged memory mode");
 core::arch::global_asm!(include_str!("entry.S"));
 
 mod ac97;
+mod ahci;
 mod arch;
 mod audio;
 mod boot_info;

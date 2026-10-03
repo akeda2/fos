@@ -1,3 +1,4 @@
+use crate::ahci;
 use crate::boot_info::{read_u32, read_u64, BootInfo};
 use crate::interrupts;
 use crate::usb_storage;
@@ -79,6 +80,8 @@ static mut GPT_VALID: bool = false;
 enum SecondaryBackend {
     Bios(u8),
     Usb(usb_storage::MscDevice),
+    /// A SATA drive on an AHCI controller, driven natively (`sata attach`).
+    Ahci(ahci::Drive),
 }
 
 #[derive(Clone, Copy)]
@@ -196,7 +199,7 @@ fn drive_number(info: &BootInfo, device: Device) -> Option<u8> {
         Device::Boot => Some(info.boot_drive),
         Device::Secondary(index) => match secondary_disk(index)?.backend {
             SecondaryBackend::Bios(drive_number) => Some(drive_number),
-            SecondaryBackend::Usb(_) => None,
+            SecondaryBackend::Usb(_) | SecondaryBackend::Ahci(_) => None,
         },
     }
 }
@@ -213,6 +216,54 @@ fn is_usb_backed(device: Device) -> bool {
             matches!(secondary_disk(index).map(|disk| disk.backend), Some(SecondaryBackend::Usb(_)))
         }
     }
+}
+
+/// The native AHCI drive behind `device`, if it is one.
+fn ahci_drive(device: Device) -> Option<ahci::Drive> {
+    match device {
+        Device::Boot => None,
+        Device::Secondary(index) => match secondary_disk(index)?.backend {
+            SecondaryBackend::Ahci(drive) => Some(drive),
+            _ => None,
+        },
+    }
+}
+
+/// Attaches every SATA drive found on an AHCI controller that is not attached
+/// yet as the next free `diskN`, returning how many were added. Explicit only
+/// (`sata attach`): taking over the controller invalidates the BIOS's own view of
+/// those disks, so any `diskN` that is the same drive through the BIOS stops
+/// working. Fails with `Full` only if nothing could be added for lack of slots.
+pub fn attach_ahci_disks() -> Result<usize, UsbAttachError> {
+    let mut added = 0;
+    let mut saw_drive = false;
+    for controller_index in 0..ahci::count() {
+        let Some(controller) = ahci::get(controller_index) else { continue };
+        for drive_index in 0..controller.drive_count() {
+            let Some(drive) = controller.drive(drive_index) else { continue };
+            saw_drive = true;
+            let known = (0..unsafe { SECONDARY_COUNT }).any(|index| {
+                matches!(secondary_disk(index).map(|disk| disk.backend),
+                    Some(SecondaryBackend::Ahci(existing)) if existing.location() == drive.location())
+            });
+            if known {
+                continue;
+            }
+            unsafe {
+                if SECONDARY_COUNT >= MAX_SECONDARY_DISKS {
+                    return if added > 0 { Ok(added) } else { Err(UsbAttachError::Full) };
+                }
+                SECONDARY_DISKS[SECONDARY_COUNT] =
+                    Some(SecondaryDisk { backend: SecondaryBackend::Ahci(drive), sector_count: drive.sectors() });
+                SECONDARY_COUNT += 1;
+            }
+            added += 1;
+        }
+    }
+    if added == 0 && !saw_drive {
+        return Err(UsbAttachError::NoDevice);
+    }
+    Ok(added)
 }
 
 /// How many sectors are addressable on `device`, for bounds-checking reads
@@ -888,6 +939,10 @@ fn transfer(info: &BootInfo, device: Device, lba: u64, direction: u32) -> Result
     if lba >= device_sector_count(info, device) {
         return Err(Error::OutOfRange);
     }
+    if let Some(drive) = ahci_drive(device) {
+        let sector = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR.0) };
+        return ahci_transfer(&drive, lba, sector, direction);
+    }
     if is_usb_backed(device) {
         let sector = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR.0) };
         return usb_transfer(device, lba, sector, direction);
@@ -921,6 +976,10 @@ fn transfer_chunk(
     if lba + count as u64 > device_sector_count(info, device) {
         return Err(Error::OutOfRange);
     }
+    if let Some(drive) = ahci_drive(device) {
+        let chunk = unsafe { &mut *core::ptr::addr_of_mut!(CHUNK.0) };
+        return ahci_transfer(&drive, lba, &mut chunk[..count * SECTOR_SIZE], direction);
+    }
     if is_usb_backed(device) {
         let chunk = unsafe { &mut *core::ptr::addr_of_mut!(CHUNK.0) };
         return usb_transfer(device, lba, &mut chunk[..count * SECTOR_SIZE], direction);
@@ -936,6 +995,13 @@ fn transfer_chunk(
         core::ptr::addr_of!(CHUNK) as u32,
         count as u32,
     )
+}
+
+/// The AHCI counterpart to `usb_transfer`: `buffer` is a whole number of sectors
+/// (at most `MAX_TRANSFER_SECTORS`), read or written through the drive's DMA engine.
+fn ahci_transfer(drive: &ahci::Drive, lba: u64, buffer: &mut [u8], direction: u32) -> Result<(), Error> {
+    let result = if direction == 0 { drive.read(lba, buffer) } else { drive.write(lba, buffer) };
+    result.map_err(|_| Error::FirmwareFailure)
 }
 
 /// The `Usb`-backed counterpart to `call_trampoline`: reads or writes
