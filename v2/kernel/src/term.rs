@@ -52,7 +52,7 @@ fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
     cursor.1
 }
 
-pub const MAX_NICS: usize = 4;
+pub const MAX_NICS: usize = 8;
 static mut NICS: [Option<E1000>; MAX_NICS] = [const { None }; MAX_NICS];
 static mut NIC_COUNT: usize = 0;
 /// The interface the open session's HELLO arrived on: console output goes out of it.
@@ -160,7 +160,9 @@ pub fn poll() {
     for index in 0..nic_count() {
         loop {
             let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
-            if !handle_frame(index, &buffer[..length]) {
+            // Frames a tape may be about to want (its own load protocol, over the fos ethertype)
+            // wait in the queue; the rest of a busy LAN's traffic is not worth keeping.
+            if !handle_frame(index, &buffer[..length]) && length >= 14 && buffer[12..14] == ETHERTYPE {
                 queue_frame(index, &buffer[..length]);
             }
         }

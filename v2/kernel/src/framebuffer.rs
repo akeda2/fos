@@ -1,9 +1,12 @@
 //! A text console on the firmware's linear framebuffer: an 8x16 bitmap font drawn
 //! pixel by pixel, with a cursor, line wrap and scrolling.
 //!
-//! The framebuffer is plain memory the display reads. M1 draws to it with ordinary
-//! stores through an uncached mapping, which is correct but slow to scroll; a later
-//! milestone maps it write-combining (PAT) and keeps a shadow copy.
+//! The framebuffer is plain memory the display reads, mapped write-combining: stores are
+//! fast, *reads are not* (about uncached speed). Scrolling by copying pixels reads the
+//! whole screen per line, which made a 16 KiB `dmesg` take over a minute on real hardware.
+//! So text lives in a character grid in ordinary RAM; writing text and scrolling only
+//! touch the grid, and one repaint at the end of each print draws just the cells that
+//! changed since they were last painted. The framebuffer is only ever written.
 
 use crate::font_data::{FONT, FONT_HEIGHT, FONT_WIDTH};
 use core::fmt;
@@ -22,6 +25,12 @@ pub struct Console {
     foreground: u32,
     background: u32,
 }
+
+/// The largest text grid kept (256 columns x 100 rows covers up to 2048x1600 at 8x16).
+const MAX_CELLS: usize = 256 * 100;
+static mut CELLS: [u8; MAX_CELLS] = [b' '; MAX_CELLS];
+/// What is currently drawn on screen, cell by cell.
+static mut PAINTED: [u8; MAX_CELLS] = [b' '; MAX_CELLS];
 
 static mut CONSOLE: Option<Console> = None;
 
@@ -56,13 +65,12 @@ impl Console {
         }
     }
 
-    /// Moves every text row up by one and clears the last.
+    /// Moves every text row up by one in the grid and clears the last (nothing is drawn yet).
     fn scroll(&mut self) {
-        let row_pixels = FONT_HEIGHT * self.stride;
-        let used = (self.rows - 1) * row_pixels;
-        unsafe { core::ptr::copy(self.base.add(row_pixels), self.base, used) };
-        let background = self.background;
-        self.fill(0, (self.rows - 1) * FONT_HEIGHT, self.width, FONT_HEIGHT, background);
+        let columns = self.columns;
+        let cells = unsafe { &mut *core::ptr::addr_of_mut!(CELLS) };
+        cells.copy_within(columns..self.rows * columns, 0);
+        cells[(self.rows - 1) * columns..self.rows * columns].fill(b' ');
     }
 
     fn newline(&mut self) {
@@ -71,6 +79,21 @@ impl Console {
             self.scroll();
         } else {
             self.row += 1;
+        }
+    }
+
+    /// Draws every cell whose character differs from what is on screen.
+    fn repaint(&mut self) {
+        let columns = self.columns;
+        for row in 0..self.rows {
+            for column in 0..columns {
+                let index = row * columns + column;
+                let wanted = unsafe { CELLS[index] };
+                if wanted != unsafe { PAINTED[index] } {
+                    self.draw_glyph(wanted, column, row);
+                    unsafe { PAINTED[index] = wanted };
+                }
+            }
         }
     }
 
@@ -84,7 +107,7 @@ impl Console {
                 }
                 // Anything outside the font's printable range shows as '?'.
                 let shown = if byte == b'\t' || (0x20..0x7f).contains(&byte) { if byte == b'\t' { b' ' } else { byte } } else { b'?' };
-                self.draw_glyph(shown, self.column, self.row);
+                unsafe { CELLS[self.row * self.columns + self.column] = shown };
                 self.column += 1;
             }
         }
@@ -96,6 +119,7 @@ impl fmt::Write for Console {
         for byte in text.bytes() {
             self.put(byte);
         }
+        self.repaint();
         Ok(())
     }
 }
@@ -123,7 +147,14 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
     console.background = console.pixel(0x00, 0x00, 0x20);
     let (width, height, background) = (console.width, console.height, console.background);
     console.fill(0, 0, width, height, background);
-    unsafe { *core::ptr::addr_of_mut!(CONSOLE) = Some(console) };
+    if console.columns * console.rows > MAX_CELLS {
+        return false; // a screen bigger than the grid: serial only
+    }
+    unsafe {
+        (*core::ptr::addr_of_mut!(CELLS)).fill(b' ');
+        (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
+        *core::ptr::addr_of_mut!(CONSOLE) = Some(console);
+    }
     true
 }
 

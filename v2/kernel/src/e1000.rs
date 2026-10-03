@@ -186,7 +186,7 @@ pub struct IsrState {
     pub link_changes: core::sync::atomic::AtomicU64,
 }
 
-pub const MAX_INTERFACES: usize = 4;
+pub const MAX_INTERFACES: usize = 8;
 pub static ISR: [IsrState; MAX_INTERFACES] = [const {
     IsrState {
         registers: core::sync::atomic::AtomicUsize::new(0),
@@ -252,6 +252,7 @@ pub enum Error {
     OutOfMemory,
     ResetTimeout,
     BadMac,
+    NoSlot,
 }
 
 fn read(registers: usize, offset: usize) -> u32 {
@@ -364,6 +365,9 @@ fn reset_e1000e(registers: usize) -> Result<(), Error> {
 
 impl E1000 {
     pub fn init(device: &pci::Device, index: usize) -> Result<E1000, Error> {
+        if index >= MAX_INTERFACES {
+            return Err(Error::NoSlot); // more NICs than interface slots: skip it, do not index past the tables
+        }
         device.force_power_state_d0(); // a PCH-integrated function can be left in D3hot by the BIOS
         device.enable_memory_and_bus_master();
         let (base, size) = device.memory_bar(0).ok_or(Error::NoBar)?;
