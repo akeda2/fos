@@ -977,6 +977,8 @@ fn help_topic(topic: &[u8]) {
             println!("NAME.sh or NAME.bin from any disk.");
         }
         b"usb" => {
+            println!("usb hosts                   every PCI USB host controller (UHCI/OHCI/");
+            println!("                            EHCI/xHCI) and whether fos has a driver");
             println!("usb                         list UHCI controllers/ports, enumerate");
             println!("usb play [diskN] NAME       play a PCM file on a USB audio device");
             println!("usb capture [diskN] NAME    record from a USB audio device");
@@ -1600,7 +1602,92 @@ fn dmesg_command() {
 /// own job stops at enumeration -- isochronous transfers and USB Audio
 /// Class descriptor parsing (see `usb play`/`usb capture` below, and
 /// AGENTS.md's "UHCI" section) are deliberately not involved here at all.
+/// The USB host controller types PCI distinguishes by the programming
+/// interface byte of class 0x0C/0x03: UHCI and OHCI (USB 1.1, Intel/VIA and
+/// everyone else), EHCI (USB 2.0) and xHCI (USB 3.x, which also carries the
+/// 2.0 ports on newer chipsets).
+fn usb_host_kind(prog_if: u8) -> &'static str {
+    match prog_if {
+        0x00 => "UHCI",
+        0x10 => "OHCI",
+        0x20 => "EHCI",
+        0x30 => "xHCI",
+        0x80 => "other",
+        0xfe => "device",
+        _ => "?",
+    }
+}
+
+/// `usb hosts`: every USB host controller on the PCI bus and whether fos has a
+/// driver for it. Only UHCI does today, so on a machine with other kinds the
+/// BIOS's own (INT13h) access to a USB stick is the only way to read it. Run
+/// on each real machine to learn which drivers it would need. `summary` prints
+/// just the one-line tally that the plain `usb` command shows first.
+fn print_usb_hosts(summary: bool) {
+    let mut devices = [pci::PciDeviceInfo {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        class: 0,
+        subclass: 0,
+        prog_if: 0,
+        header_type: 0,
+        bar0: 0,
+        has_msi: false,
+        revision: 0,
+        subsystem: 0,
+        interrupt_line: 0,
+        interrupt_pin: 0,
+        command: 0,
+        status: 0,
+    }; pci::MAX_PCI_DEVICES];
+    let found = pci::scan_devices(&mut devices).min(devices.len());
+    let hosts = || {
+        devices[..found]
+            .iter()
+            .filter(|info| info.class == 0x0c && info.subclass == 0x03)
+    };
+    let mut counts = [0usize; 4];
+    for info in hosts() {
+        if let Some(slot) = [0x00, 0x10, 0x20, 0x30].iter().position(|&kind| kind == info.prog_if) {
+            counts[slot] += 1;
+        }
+    }
+    if summary {
+        println!(
+            "USB hosts: {} UHCI, {} OHCI, {} EHCI, {} xHCI (driver: UHCI only; 'usb hosts')",
+            counts[0], counts[1], counts[2], counts[3]
+        );
+        return;
+    }
+    let mut any = false;
+    for info in hosts() {
+        any = true;
+        println!(
+            "{:02x}:{:02x}.{} {} {:04x}:{:04x} rev {:02x} bar0 {:08x} int {:02x}/{} msi {}{}",
+            info.bus,
+            info.device,
+            info.function,
+            usb_host_kind(info.prog_if),
+            info.vendor_id,
+            info.device_id,
+            info.revision,
+            info.bar0 & !0xf,
+            info.interrupt_line,
+            info.interrupt_pin,
+            if info.has_msi { "yes" } else { "no" },
+            if info.prog_if == 0x00 { "  [driver]" } else { "" },
+        );
+    }
+    if !any {
+        println!("No PCI USB host controllers found.");
+    }
+}
+
 fn print_usb_devices() {
+    print_usb_hosts(true);
     let count = uhci::count();
     if count == 0 {
         println!("No UHCI controllers found.");
@@ -1733,7 +1820,7 @@ fn enumerate_usb_port(port_number: u8, controller: &uhci::Uhci, port: u8) {
 /// section for the design.
 fn usb_command(info: &BootInfo, arguments: &[u8]) {
     const USAGE: &str =
-        "Usage: usb | usb play [diskN] NAME | usb capture [diskN] NAME | usb storage | usb native";
+        "Usage: usb | usb hosts | usb play [diskN] NAME | usb capture [diskN] NAME | usb storage | usb native";
 
     if arguments.is_empty() {
         print_usb_devices();
@@ -1741,6 +1828,10 @@ fn usb_command(info: &BootInfo, arguments: &[u8]) {
     }
 
     let (first, remainder) = take_word(arguments);
+    if first.eq_ignore_ascii_case(b"hosts") && remainder.is_empty() {
+        print_usb_hosts(false);
+        return;
+    }
     if first.eq_ignore_ascii_case(b"native") && remainder.is_empty() {
         usb_native_command(info);
         return;
