@@ -253,10 +253,22 @@ interrupts a second), and **proves delivery** by raising a link-status interrupt
 and waiting for the message. The handler only reads `ICR` (which acknowledges) and counts;
 frames are still drained by the foreground. When every NIC has an interrupt, `wait_for_event`
 is a real `hlt` (an idle tape used 1% of a host core under QEMU, against 100% when spinning).
-The e1000 driver now also drives the e1000e family (82574L, 82579V, I219-LM) with Linux's
-stricter reset sequence; the I219's K1/ULP workarounds are not implemented, so that part is
-unproven until the Skylake. No MSI-X yet (not needed by these parts); no legacy-INTx fallback
-through the I/O APIC (polling is the fallback).
+Delivery is tried in order: **MSI-X** (only with the `prefer-msix` setting, and only on the
+82574, where `IVAR` maps causes to a vector; a test hook, since MSI is enough for every part
+here), **MSI**, then **legacy INTx through the I/O APIC**. INTx needs the interrupt's pin, which
+ACPI's `_PRT` normally supplies and the kernel cannot read (no AML interpreter), so the driver
+*probes*: it routes candidate pins (the firmware's interrupt-line hint, then GSI 16-23) to a
+vector one at a time, makes the card raise an interrupt on purpose and keeps the pin where it
+arrives. INTx handlers share a line (every handler on a vector runs, each clears its own
+cause) and a per-tick storm guard masks a pin that floods. Whatever path is used must pass the
+self-test, otherwise the NIC stays polled.
+
+The e1000 driver covers three families by register table (`Regs`): the classic 82540EM,
+the **e1000e** family (82574L, 82579V, I219-LM) with Linux's stricter reset sequence and the
+TCTL values v1 found on a real I219-LM, and the **I350** (the Skylake's four-port card: moved
+registers, explicit queue enables, the `SWSM`/`SW_FW_SYNC` PHY handshake, an MAC that is only
+readable some ticks after reset). I350 and I219 are ports of v1 code that was verified on the
+Skylake; QEMU has neither, so in v2 they are unrun until that machine is reachable.
 
 ## 10. What ports how
 

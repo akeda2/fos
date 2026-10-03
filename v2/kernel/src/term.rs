@@ -627,10 +627,19 @@ fn execute(command: &str) {
                     crate::println!("   frames: {} received, {} sent", nic.frames_received, nic.frames_sent);
                     match nic.delivery {
                         crate::e1000::Delivery::Polled => crate::println!("   interrupts: polled"),
-                        crate::e1000::Delivery::Msi(vector) => {
+                        crate::e1000::Delivery::Intx { gsi, vector } => {
                             let state = &crate::e1000::ISR[index];
                             crate::println!(
-                                "   interrupts: MSI vector {vector:#x}: {} taken, {} receive overruns, {} link changes",
+                                "   interrupts: INTx pin {gsi}, vector {vector:#x}: {} taken ({} storms masked)",
+                                state.interrupts.load(core::sync::atomic::Ordering::Relaxed),
+                                crate::msi::storms()
+                            );
+                        }
+                        crate::e1000::Delivery::Msi(vector) | crate::e1000::Delivery::Msix(vector) => {
+                            let state = &crate::e1000::ISR[index];
+                            crate::println!(
+                                "   interrupts: {} vector {vector:#x}: {} taken, {} receive overruns, {} link changes",
+                                if matches!(nic.delivery, crate::e1000::Delivery::Msix(_)) { "MSI-X" } else { "MSI" },
                                 state.interrupts.load(core::sync::atomic::Ordering::Relaxed),
                                 state.overruns.load(core::sync::atomic::Ordering::Relaxed),
                                 state.link_changes.load(core::sync::atomic::Ordering::Relaxed)

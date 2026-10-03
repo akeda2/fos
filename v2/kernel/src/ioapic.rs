@@ -75,3 +75,40 @@ pub fn route_isa(irq: u8, vector: u8) -> Option<u32> {
     write(0x10 + 2 * pin, low);
     Some(gsi)
 }
+
+/// Routes global system interrupt `gsi` to `vector` on this CPU, with the given trigger
+/// mode and polarity (PCI interrupts are level-triggered, active low). False if no I/O
+/// APIC pin serves that GSI.
+pub fn route_gsi(gsi: u32, vector: u8, level: bool, active_low: bool) -> bool {
+    unsafe {
+        if BASE == 0 || gsi < GSI_BASE || gsi >= GSI_BASE + PINS {
+            return false;
+        }
+        let pin = gsi - GSI_BASE;
+        let mut low = u32::from(vector);
+        if active_low {
+            low |= 1 << 13;
+        }
+        if level {
+            low |= 1 << 15;
+        }
+        write(0x10 + 2 * pin + 1, apic::id() << 24);
+        write(0x10 + 2 * pin, low);
+    }
+    true
+}
+
+/// Masks the pin of `gsi` (an interrupt storm, or a failed probe).
+pub fn mask_gsi(gsi: u32) {
+    unsafe {
+        if BASE != 0 && gsi >= GSI_BASE && gsi < GSI_BASE + PINS {
+            let pin = gsi - GSI_BASE;
+            write(0x10 + 2 * pin, read(0x10 + 2 * pin) | (1 << 16));
+        }
+    }
+}
+
+/// Number of pins and the first GSI served (for probing candidates).
+pub fn gsi_range() -> (u32, u32) {
+    unsafe { (GSI_BASE, GSI_BASE + PINS) }
+}

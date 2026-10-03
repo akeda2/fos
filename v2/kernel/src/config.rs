@@ -25,6 +25,7 @@ pub struct Debug {
 static mut DEBUG: Debug = Debug { reboot_on_crash: false, reboot_delay_seconds: 3, crash_on_boot: false, watchdog_seconds: None, kernel_update: false };
 static mut DENY_TERM_NET: bool = false;
 static mut NO_MSI: bool = false;
+static mut PREFER_MSIX: bool = false;
 static mut HOSTNAME: [u8; 16] = [0; 16];
 static mut HOSTNAME_LENGTH: usize = 0;
 static mut BUFFER: [u8; FILE_CAPACITY] = [0; FILE_CAPACITY];
@@ -37,6 +38,12 @@ pub fn debug() -> &'static Debug {
 /// MSI misbehaves).
 pub fn no_msi() -> bool {
     unsafe { NO_MSI }
+}
+
+/// `prefer-msix` in `settings`: try MSI-X before MSI on devices that support both (a test
+/// hook: MSI is enough for every part this kernel drives).
+pub fn prefer_msix() -> bool {
+    unsafe { PREFER_MSIX }
 }
 
 pub fn deny_term_net() -> bool {
@@ -84,6 +91,7 @@ pub fn load() {
                     unsafe { DENY_TERM_NET = true };
                     crate::println!("settings: deny-term-net -- the network terminal is closed.");
                 }
+                Some("prefer-msix") => unsafe { PREFER_MSIX = true },
                 Some("no-msi") => {
                     unsafe { NO_MSI = true };
                     crate::println!("settings: no-msi -- NICs stay on polling.");

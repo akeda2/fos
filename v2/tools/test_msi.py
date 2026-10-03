@@ -64,7 +64,7 @@ def idle_cpu(machine):
 
 def main():
     results = {}
-    for label, model, files in (("e1000e", "e1000e", {}), ("e1000 (no MSI capability)", "e1000", {}), ("e1000e with no-msi", "e1000e", {"settings": "no-msi\n"})):
+    for label, model, files in (("e1000e", "e1000e", {}), ("e1000 (no MSI capability)", "e1000", {}), ("e1000e with no-msi", "e1000e", {"settings": "no-msi\n"}), ("e1000e with prefer-msix", "e1000e", {"settings": "prefer-msix\n"})):
         with tempfile.TemporaryDirectory() as tmp:
             machine = ModelMachine(tmp, files, model)
             machine.start()
@@ -88,10 +88,17 @@ def main():
     check(later > taken, f"and the count keeps rising with traffic ({taken} -> {later})", after)
 
     text, nic, polled_classic = results["e1000 (no MSI capability)"]
-    check("interrupts: polled (the device has no MSI capability)" in text and "interrupts: polled" in nic, "classic e1000: stays polled and says why", text)
+    check("interrupts: legacy INTx, I/O APIC pin" in text and "interrupts: INTx pin" in nic, "classic e1000 (no MSI capability): falls back to legacy INTx through the I/O APIC, found by probing", text)
+    taken = int(re.search(r"INTx pin \d+, vector 0x\w+: (\d+) taken", nic).group(1))
+    check(taken >= 2, f"and its interrupts arrive on the probed pin ({taken} taken)", nic)
+    check(polled_classic < 0.35, f"an idle tape on INTx sleeps in hlt too (QEMU host CPU {polled_classic:.0%})", "")
 
     text, nic, polled_forced = results["e1000e with no-msi"]
     check("interrupts: polled (settings: no-msi)" in text and "interrupts: polled" in nic, "`no-msi` keeps an MSI-capable NIC polled", text)
+
+    text, nic, msix_cpu = results["e1000e with prefer-msix"]
+    check("interrupts: MSI-X on vector 0x50" in text, "`prefer-msix`: the 82574 takes MSI-X (IVAR-mapped, self-test message arrives)", text)
+    check(msix_cpu < 0.35 and "MSI-X vector 0x50" in nic, f"and an idle tape sleeps in hlt on it (QEMU host CPU {msix_cpu:.0%})", nic)
 
     check(cpu < 0.35, f"with MSI an idle tape sleeps in hlt (QEMU host CPU {cpu:.0%})", "")
     check(polled_forced > 0.6, f"with a polled NIC the idle tape still yields in a spin loop (QEMU host CPU {polled_forced:.0%})", "")

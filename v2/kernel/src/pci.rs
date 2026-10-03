@@ -112,6 +112,46 @@ impl Device {
         true
     }
 
+    /// Programs MSI-X table entry 0 for one vector and enables MSI-X (the function mask is held
+    /// while the entry is written). MSI-X keeps its message table in a device BAR instead of
+    /// config space: the capability gives the table's BAR and offset. Returns false if the
+    /// device has no MSI-X capability or its table BAR cannot be mapped.
+    pub fn enable_msix(&self, vector: u8, apic_id: u32) -> bool {
+        let Some(capability) = self.find_capability(0x11) else { return false };
+        let header = self.read32(capability);
+        let control = (header >> 16) as u16;
+        let table = self.read32(capability + 4);
+        let (bar, offset) = ((table & 7) as u8, u64::from(table & !7));
+        let Some((base, size)) = self.memory_bar(bar) else { return false };
+        crate::paging::map_device(base, size);
+        // Enable + function-mask first, so nothing fires while entry 0 is half written.
+        self.write32(capability, (header & 0xffff) | (u32::from(control | (1 << 15) | (1 << 14)) << 16));
+        let entry = (base + offset) as *mut u32;
+        unsafe {
+            entry.write_volatile(0xfee0_0000 | (apic_id << 12)); // message address low
+            entry.add(1).write_volatile(0); // address high
+            entry.add(2).write_volatile(u32::from(vector)); // message data
+            entry.add(3).write_volatile(0); // vector control: bit 0 = masked, clear it
+        }
+        self.write32(capability, (header & 0xffff) | (u32::from((control | (1 << 15)) & !(1 << 14)) << 16));
+        self.write32(4, (self.read32(4) & 0xffff) | (1 << 10)); // INTx off
+        true
+    }
+
+    pub fn disable_msix(&self) {
+        if let Some(capability) = self.find_capability(0x11) {
+            let header = self.read32(capability);
+            self.write32(capability, (header & 0xffff) | (u32::from((header >> 16) as u16 & !(1 << 15)) << 16));
+            self.write32(4, (self.read32(4) & 0xffff) & !(1 << 10));
+        }
+    }
+
+    /// The legacy interrupt line register (config 0x3c): what the firmware programmed, which
+    /// on APIC systems is only a hint (0 and 0xff mean "none").
+    pub fn interrupt_line(&self) -> u8 {
+        self.read32(0x3c) as u8
+    }
+
     /// Turns MSI off again (and re-enables the INTx pin).
     pub fn disable_msi(&self) {
         if let Some(capability) = self.find_capability(0x05) {

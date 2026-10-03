@@ -104,6 +104,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             debug::watchdog_tick(frame);
         }
         v if msi::handles(v) => msi::dispatch(v),
+        v if msi::handles_intx(v) => msi::dispatch_intx(v),
         v if v == u64::from(keyboard::KEYBOARD_VECTOR) => {
             keyboard::interrupt();
             apic::end_of_interrupt();
@@ -273,8 +274,11 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
                 if config::no_msi() {
                     println!("  interrupts: polled (settings: no-msi).");
                 } else {
-                    match nic.enable_msi(&device) {
-                        Ok(vector) => println!("  interrupts: MSI on vector {vector:#x} (the self-test message arrived); frames wake the CPU instead of being polled for."),
+                    match nic.enable_interrupts(&device, config::prefer_msix()) {
+                        Ok(e1000::Delivery::Msix(vector)) => println!("  interrupts: MSI-X on vector {vector:#x} (the self-test message arrived)."),
+                        Ok(e1000::Delivery::Msi(vector)) => println!("  interrupts: MSI on vector {vector:#x} (the self-test message arrived); frames wake the CPU instead of being polled for."),
+                        Ok(e1000::Delivery::Intx { gsi, vector }) => println!("  interrupts: legacy INTx, I/O APIC pin {gsi} on vector {vector:#x} (found by probing; the self-test interrupt arrived)."),
+                        Ok(e1000::Delivery::Polled) => {}
                         Err(reason) => println!("  interrupts: polled ({reason})."),
                     }
                 }
