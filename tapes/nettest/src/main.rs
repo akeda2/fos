@@ -100,6 +100,13 @@ struct Session<'a> {
     sink_mac: [u8; 6],
     /// The two-port impairment link is active (not when only gen/sink given).
     limiter: bool,
+    /// The impaired link's two NICs and their MACs, plus what is needed to
+    /// re-point any role while the tape runs (`link`, `gen nic`, `sink nic`).
+    ports: [u32; 2],
+    macs: [[u8; 6]; 2],
+    nic_total: usize,
+    mac_at: extern "C" fn(u32, u32) -> u32,
+    promisc_at: extern "C" fn(u32, u32) -> u32,
     /// Passes of the polling loop and when it started: a long average pass is
     /// the first sign that the tape itself, not the link, is the bottleneck.
     passes: u64,
@@ -209,6 +216,11 @@ pub extern "C" fn tape_main(
         save_name_len: 0,
         summary_due_us: 0,
         limiter: true,
+        ports: [0, 1],
+        macs: [[0; 6]; 2],
+        nic_total,
+        mac_at: nic_mac_at,
+        promisc_at: nic_set_promiscuous_at,
         passes: 0,
         loop_started_us: 0,
     };
@@ -298,6 +310,8 @@ pub extern "C" fn tape_main(
     }
     session.gen_mac = gen_mac;
     session.sink_mac = sink_mac;
+    session.ports = ports;
+    session.macs = macs;
     session.fs_write = Some(fs_write_hook);
     if !session.destination_explicit {
         session.generator.destination = if session.sink_nic.is_some() { sink_mac } else { [0xff; 6] };
@@ -368,7 +382,7 @@ pub extern "C" fn tape_main(
                     // stream, learn the MAC of the reverse generator's next hop.
                     if !info.is_reply && Some(info.target_ip) == session.sink.udp_ip {
                         let mut reply = [0u8; 64];
-                        build_arp(&mut reply, true, sink_mac, info.target_ip, info.sender_mac, info.sender_ip);
+                        build_arp(&mut reply, true, session.sink_mac, info.target_ip, info.sender_mac, info.sender_ip);
                         let _ = nic_send_at(nic, reply.as_ptr() as u32, 60);
                     } else if info.is_reply
                         && session.rgen.udp.is_some_and(|plan| plan.next_hop == info.sender_ip)
@@ -401,7 +415,7 @@ pub extern "C" fn tape_main(
                         session.generator.resolve(sender_mac, now_us);
                     } else if !is_reply && target_ip == plan.source_ip {
                         let mut reply = [0u8; 64];
-                        build_arp(&mut reply, true, gen_mac, plan.source_ip, sender_mac, sender_ip);
+                        build_arp(&mut reply, true, session.gen_mac, plan.source_ip, sender_mac, sender_ip);
                         let _ = nic_send_at(nic, reply.as_ptr() as u32, 60);
                     }
                 }
@@ -410,7 +424,7 @@ pub extern "C" fn tape_main(
             if session.bidir {
                 if let Some(sink_nic) = session.sink_nic {
                     let mut sent = 0;
-                    while let Some(length) = session.rgen.next_frame(now_us, sink_mac, &mut frame, sent) {
+                    while let Some(length) = session.rgen.next_frame(now_us, session.sink_mac, &mut frame, sent) {
                         let ok = nic_send_at(sink_nic, frame.as_ptr() as u32, length as u32) != 0;
                         session.rgen.record_send(length, ok);
                         sent += 1;
@@ -420,7 +434,7 @@ pub extern "C" fn tape_main(
                         if !session.rgen.resolved && now_us.wrapping_sub(session.last_rev_arp_us) >= 500_000 {
                             session.last_rev_arp_us = now_us;
                             let mut request = [0u8; 64];
-                            build_arp(&mut request, false, sink_mac, plan.source_ip, [0; 6], plan.next_hop);
+                            build_arp(&mut request, false, session.sink_mac, plan.source_ip, [0; 6], plan.next_hop);
                             let _ = nic_send_at(sink_nic, request.as_ptr() as u32, 60);
                         }
                     }
@@ -431,7 +445,7 @@ pub extern "C" fn tape_main(
                 if !session.generator.resolved && now_us.wrapping_sub(session.last_arp_us) >= 500_000 {
                     session.last_arp_us = now_us;
                     let mut request = [0u8; 64];
-                    build_arp(&mut request, false, gen_mac, plan.source_ip, [0; 6], plan.next_hop);
+                    build_arp(&mut request, false, session.gen_mac, plan.source_ip, [0; 6], plan.next_hop);
                     let _ = nic_send_at(nic, request.as_ptr() as u32, 60);
                 }
             }
@@ -442,7 +456,7 @@ pub extern "C" fn tape_main(
             for ingress in 0..2 {
                 for _ in 0..32 {
                     let received = nic_receive_at(
-                        ports[ingress],
+                        session.ports[ingress],
                         frame.as_mut_ptr() as u32,
                         max_frame_len as u32,
                     ) as usize;
@@ -454,7 +468,7 @@ pub extern "C" fn tape_main(
                     // (a `term net` session), not part of the link under test.
                     let destination = &frame[0..6];
                     let source = &frame[6..12];
-                    if macs.iter().any(|mac| mac == destination || mac == source) {
+                    if session.macs.iter().any(|mac| mac == destination || mac == source) {
                         continue;
                     }
                     let Session { links, rng, .. } = &mut session;
@@ -466,7 +480,7 @@ pub extern "C" fn tape_main(
             for way in 0..2 {
                 while let Some(length) = session.links[way].release(now_us, &mut frame) {
                     busy = true;
-                    let ok = nic_send_at(ports[1 - way], frame.as_ptr() as u32, length as u32) != 0;
+                    let ok = nic_send_at(session.ports[1 - way], frame.as_ptr() as u32, length as u32) != 0;
                     session.links[way].record_send(length, ok);
                 }
             }
@@ -475,7 +489,7 @@ pub extern "C" fn tape_main(
         // The generator: everything that has come due, up to a burst limit.
         if let Some(nic) = session.gen_nic {
             let mut sent = 0;
-            while let Some(length) = session.generator.next_frame(now_us, gen_mac, &mut frame, sent) {
+            while let Some(length) = session.generator.next_frame(now_us, session.gen_mac, &mut frame, sent) {
                 let ok = nic_send_at(nic, frame.as_ptr() as u32, length as u32) != 0;
                 session.generator.record_send(length, ok);
                 sent += 1;
@@ -551,7 +565,7 @@ pub extern "C" fn tape_main(
     }
 
     if session.limiter {
-        for &port in &ports {
+        for port in session.ports {
             let _ = nic_set_promiscuous_at(port, 0);
         }
     }
@@ -1074,6 +1088,11 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
             Some(b"off") if count == 2 => view_stop(putc, session),
             _ => print_bytes(putc, b"use: view on | view off\n"),
         },
+        b"link" => {
+            let arg = words.get(1).copied().unwrap_or(b"");
+            let second = words.get(2).copied().unwrap_or(b"");
+            return relink(putc, session, arg, second);
+        }
         b"summary" => print_summary(putc, session),
         b"save" => {
             let name = words.get(1).copied().unwrap_or(b"");
@@ -1107,6 +1126,9 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
         }
         b"gen" => return gen_command(putc, session, &words[1..count]),
         b"sink" => match words.get(1).copied() {
+            Some(b"nic") => {
+                return retarget(putc, session, Role::Sink, words.get(2).copied().unwrap_or(b""));
+            }
             Some(b"reset") => {
                 session.sink.reset();
                 session.rsink.reset();
@@ -1170,6 +1192,9 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
         print_gen_config(putc, session);
         return Outcome::Continue;
     };
+    if verb == b"nic" {
+        return retarget(putc, session, Role::Gen, words.get(1).copied().unwrap_or(b""));
+    }
     if session.gen_nic.is_none() && verb != b"show" {
         print_bytes(putc, b"no generator NIC: start with gen=N (see 'nic map')\n");
         return Outcome::Error;
@@ -1229,6 +1254,140 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
             return Outcome::Error;
         }
     }
+    Outcome::Continue
+}
+
+enum Role {
+    Gen,
+    Sink,
+}
+
+/// NICs in use right now, as one-based-checked zero-based numbers.
+fn nic_in_use(session: &Session<'_>, nic: u32, skip: Option<&Role>) -> bool {
+    (session.limiter && session.ports.contains(&nic))
+        || (!matches!(skip, Some(Role::Gen)) && session.gen_nic == Some(nic))
+        || (!matches!(skip, Some(Role::Sink)) && session.sink_nic == Some(nic))
+}
+
+/// `gen nic N|off` / `sink nic N|off`: move a role to another NIC without
+/// leaving the tape. The old traffic is stopped (a generator) or its counters
+/// cleared (a sink), since they described a different wire.
+fn retarget(putc: Putc, session: &mut Session<'_>, role: Role, arg: &[u8]) -> Outcome {
+    let new = if arg == b"off" {
+        None
+    } else {
+        match parse_u32(arg).filter(|&number| number >= 1) {
+            Some(number) if (number as usize) <= session.nic_total => Some(number - 1),
+            _ => {
+                print_bytes(putc, b"use: nic N (see 'nic map') or nic off\n");
+                return Outcome::Error;
+            }
+        }
+    };
+    if let Some(nic) = new {
+        if nic_in_use(session, nic, Some(&role)) {
+            print_bytes(putc, b"that NIC already has another role\n");
+            return Outcome::Error;
+        }
+    }
+    let mut mac = [0u8; 6];
+    if let Some(nic) = new {
+        if (session.mac_at)(nic, mac.as_mut_ptr() as u32) == 0 {
+            print_bytes(putc, b"failed to read that NIC's MAC\n");
+            return Outcome::Error;
+        }
+    }
+    match role {
+        Role::Gen => {
+            session.sweep.active = false;
+            session.generator.stop();
+            session.rgen.stop();
+            session.gen_nic = new;
+            session.gen_mac = mac;
+            if !session.destination_explicit {
+                session.generator.destination =
+                    if session.sink_nic.is_some() { session.sink_mac } else { [0xff; 6] };
+            }
+            session.rsink.reset();
+            print_bytes(putc, b"generator stopped; ");
+        }
+        Role::Sink => {
+            session.sink_nic = new;
+            session.sink_mac = mac;
+            session.sink.reset();
+            session.rsink.reset();
+            if !session.destination_explicit && session.gen_nic.is_some() {
+                session.generator.destination = if new.is_some() { mac } else { [0xff; 6] };
+            }
+            print_bytes(putc, b"sink counters cleared; ");
+        }
+    }
+    match new {
+        Some(nic) => {
+            print_u32(putc, nic + 1);
+            print_bytes(putc, b" is now the NIC\n");
+        }
+        None => print_bytes(putc, b"role switched off\n"),
+    }
+    Outcome::Continue
+}
+
+/// `link A B` / `link off`: re-point the impaired link at two other NICs.
+/// Promiscuous mode moves with it; queued frames of the old ports are dropped.
+fn relink(putc: Putc, session: &mut Session<'_>, first: &[u8], second: &[u8]) -> Outcome {
+    if first == b"off" {
+        if session.limiter {
+            for port in session.ports {
+                let _ = (session.promisc_at)(port, 0);
+            }
+        }
+        session.limiter = false;
+        print_bytes(putc, b"impairment link off\n");
+        return Outcome::Continue;
+    }
+    let numbers = (parse_u32(first), parse_u32(second));
+    let (Some(a), Some(b)) = numbers else {
+        print_bytes(putc, b"use: link A B (NIC numbers) | link off\n");
+        return Outcome::Error;
+    };
+    let total = session.nic_total as u32;
+    if a < 1 || b < 1 || a > total || b > total || a == b {
+        print_bytes(putc, b"link needs two distinct NIC numbers (see 'nic list')\n");
+        return Outcome::Error;
+    }
+    let (a, b) = (a - 1, b - 1);
+    for nic in [a, b] {
+        if session.gen_nic == Some(nic) || session.sink_nic == Some(nic) {
+            print_bytes(putc, b"that NIC already has another role\n");
+            return Outcome::Error;
+        }
+    }
+    let mut macs = [[0u8; 6]; 2];
+    if (session.mac_at)(a, macs[0].as_mut_ptr() as u32) == 0
+        || (session.mac_at)(b, macs[1].as_mut_ptr() as u32) == 0
+    {
+        print_bytes(putc, b"failed to read a NIC MAC\n");
+        return Outcome::Error;
+    }
+    if session.limiter {
+        for port in session.ports {
+            let _ = (session.promisc_at)(port, 0);
+        }
+    }
+    if (session.promisc_at)(a, 1) == 0 || (session.promisc_at)(b, 1) == 0 {
+        let _ = (session.promisc_at)(a, 0);
+        session.limiter = false;
+        print_bytes(putc, b"promiscuous mode failed; link is off\n");
+        return Outcome::Error;
+    }
+    for link in session.links.iter_mut() {
+        link.reset();
+    }
+    session.limiter = true;
+    session.ports = [a, b];
+    session.macs = macs;
+    session.view.ports = [a + 1, b + 1];
+    print_bytes(putc, b"impairment link moved\n");
     Outcome::Continue
 }
 
@@ -1381,6 +1540,7 @@ fn print_help(putc: Putc) {
           view on|off                  live statistics panel above the prompt\n\
           reset [stats]                clean link, or clear the counters\n\
           gen start|stop|show          the traffic generator (needs gen=N)\n\
+          gen nic N|off | sink nic N|off | link A B|off   re-point a role\n\
           gen rate KBIT | size BYTES   constant bit rate of whole frames\n\
           gen sweep START END STEP S   step the rate, S seconds each; table of results\n\
           gen bidir on|off             also send a stream back, sink NIC -> gen NIC\n\

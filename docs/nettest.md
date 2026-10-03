@@ -262,6 +262,11 @@ Generator settings:
 Commands: `gen start`, `gen stop`, `gen show`, and `gen rate|size|to|count|time
 VALUE`. `sink`, `sink show`, `sink reset` and `sink hist` show or clear the sink.
 
+Roles can be re-pointed at the prompt without quitting: `gen nic N|off`,
+`sink nic N|off` and `link A B|off` (one-based NIC numbers; each NIC may have
+only one role). Moving the generator stops it, moving the sink clears its
+counters, and `link` clears the queues and moves promiscuous mode with it.
+
 The generator never sleeps while running, so expect 100% CPU on that machine; it
 sends everything that has come due each pass, up to 16 frames, and counts the
 times it fell too far behind its schedule ("fell behind schedule 4x" in the
