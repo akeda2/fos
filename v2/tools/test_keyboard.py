@@ -80,7 +80,33 @@ def ps2_session(send, wait_for):
     wait_for("Unknown command: xz")
 
 
+def erase_on_screen_session(shots):
+    """Types two letters and erases both: the *screen* (not just the serial echo) must end up
+    exactly as it was. The shell echoes Backspace as "\\x08 \\x08", which the framebuffer
+    console once drew as '?', a blank and '?'."""
+    def session(send, wait_for):
+        time.sleep(1)
+        send(f"screendump {shots[0]}")
+        time.sleep(1)
+        type_keys(send, ["x", "y"])
+        time.sleep(0.5)
+        send(f"screendump {shots[1]}")
+        time.sleep(1)
+        type_keys(send, ["backspace", "backspace"])
+        time.sleep(0.5)
+        send(f"screendump {shots[2]}")
+        time.sleep(1)
+    return session
+
+
 def main():
+    with tempfile.TemporaryDirectory() as tmp:
+        shots = [Path(tmp) / f"screen{n}.ppm" for n in range(3)]
+        boot("q35", erase_on_screen_session(shots))
+        before, typed, erased = (shot.read_bytes() for shot in shots)
+        check(before != typed, "typed letters appear on the screen", "")
+        check(before == erased, "Backspace erases them on the screen too (the console honours the \\x08 echo)", "")
+
     text = boot("q35", ps2_session)
     check("PS/2 keyboard: 8042 ready" in text, "the PS/2 controller is initialised and its IRQ routed through the I/O APIC", text)
     check("ticks at 100 Hz" in text, "typed `uptime` runs the command", text)

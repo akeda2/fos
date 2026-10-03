@@ -101,6 +101,9 @@ impl Console {
         match character {
             b'\n' => self.newline(),
             b'\r' => self.column = 0,
+            // The shell erases a typed character with "\x08 \x08" (back, blank, back): a serial
+            // terminal interprets it, so the grid has to as well.
+            0x08 => self.column = self.column.saturating_sub(1),
             byte => {
                 if self.column >= self.columns {
                     self.newline();
