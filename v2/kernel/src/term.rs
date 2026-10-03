@@ -133,6 +133,7 @@ pub fn poll() {
                 flush();
                 unsafe { *core::ptr::addr_of_mut!(PEER) = None };
                 crate::println!("Remote terminal disconnected.");
+                prompt();
             }
             _ => {}
         }
@@ -140,6 +141,18 @@ pub fn poll() {
     if session_open() {
         flush();
     }
+}
+
+/// Starts the local shell: prints the prompt for a keyboard at the machine.
+pub fn start_local() {
+    prompt();
+}
+
+/// A key typed at the machine's own keyboard. It shares the line editor with the
+/// network session (mixing the two on one line would garble it, which is fine for a
+/// lab machine with one operator at a time).
+pub fn local_input(byte: u8) {
+    feed(byte);
 }
 
 pub struct Mac<'a>(pub &'a [u8; 6]);
@@ -170,9 +183,7 @@ fn feed(byte: u8) {
                 if let Ok(text) = core::str::from_utf8(&copy[..length]) {
                     execute(text.trim());
                 }
-                if session_open() {
-                    prompt();
-                }
+                prompt();
             }
             0x08 | 0x7f => {
                 LAST_WAS_CR = false;
@@ -204,6 +215,7 @@ fn execute(command: &str) {
             crate::println!("memory    physical memory statistics");
             crate::println!("pci       list PCI functions");
             crate::println!("nic       the network interface");
+            crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
             crate::println!("uptime    time since the timer started");
             crate::println!("dmesg     the boot log");
             crate::println!("shutdown  power off");
@@ -239,6 +251,13 @@ fn execute(command: &str) {
             }
             None => crate::println!("No network interface."),
         },
+        "usb" => {
+            if words.next() == Some("rescan") {
+                let added = crate::usb_hid::probe_all();
+                crate::println!("{added} new keyboard(s).");
+            }
+            crate::usb_hid::describe_devices(|arguments| crate::println!("{}", arguments));
+        }
         "uptime" => {
             let ticks = apic::ticks();
             crate::println!("{} ticks at {} Hz ({} s)", ticks, apic::TICK_HZ, ticks / apic::TICK_HZ);

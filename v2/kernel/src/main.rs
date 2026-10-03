@@ -24,6 +24,8 @@ mod font_data;
 mod framebuffer;
 mod gdt;
 mod idt;
+mod ioapic;
+mod keyboard;
 mod log;
 mod memory;
 mod paging;
@@ -31,6 +33,8 @@ mod pci;
 mod power;
 mod serial;
 mod term;
+mod usb_hid;
+mod xhci;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -85,6 +89,10 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             println!("Breakpoint exception at {:#x}: handled, execution continues.", frame.rip);
         }
         v if v == u64::from(apic::TIMER_VECTOR) => apic::tick(),
+        v if v == u64::from(keyboard::KEYBOARD_VECTOR) => {
+            keyboard::interrupt();
+            apic::end_of_interrupt();
+        }
         v if v == u64::from(apic::SPURIOUS_VECTOR) => {} // a spurious interrupt needs no EOI
         v if v < 32 => fault::fatal(frame),
         v => println!("Unexpected interrupt vector {v}."),
@@ -95,7 +103,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("FOS v2 kernel (milestone M3): running in 64-bit long mode.");
+    println!("FOS v2 kernel (milestone M3b): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
@@ -202,6 +210,19 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     provoke_fault_if_requested();
 
+    // ---- local keyboard (never a boot dependency: failures are reported and ignored) ----
+    match madt.as_ref().and_then(ioapic::init) {
+        Some(pins) => {
+            println!("I/O APIC: {pins} pins; ISA interrupts routed through it.");
+            match keyboard::init_ps2() {
+                keyboard::Ps2::Ready { gsi } => println!("PS/2 keyboard: 8042 ready, scancode set 1, IRQ 1 on GSI {gsi} -> vector {:#x}.", keyboard::KEYBOARD_VECTOR),
+                keyboard::Ps2::NoInterrupt => println!("PS/2 keyboard: controller present but its interrupt could not be routed; no PS/2 input."),
+                keyboard::Ps2::Absent => println!("PS/2 keyboard: no 8042 controller; no PS/2 input."),
+            }
+        }
+        None => println!("No I/O APIC: no PS/2 keyboard interrupt (USB keyboards and the network still work)."),
+    }
+
     // ---- PCI and the network ----
     let count = pci::scan();
     println!("PCI: {count} functions found (`pci` lists them).");
@@ -216,8 +237,22 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         None => println!("No supported network interface found (this milestone drives the e1000 only)."),
     }
 
+    // ---- USB keyboards (xHCI) ----
+    let controllers = xhci::init_all();
+    if controllers == 0 {
+        println!("USB: no xHCI controller (EHCI keyboards come next).");
+    } else {
+        let keyboards = usb_hid::probe_all();
+        println!("USB: {controllers} xHCI controller(s), {keyboards} keyboard(s) found.");
+    }
+
     println!("FOS v2 kernel: M3 complete. Waiting for a term net client (hostname {}).", term::HOSTNAME);
+    term::start_local();
     loop {
+        while let Some(key) = keyboard::pop() {
+            term::local_input(key);
+        }
+        usb_hid::poll();
         term::poll();
         // Sleep until the next timer tick (or a NIC-less machine's only wakeup).
         unsafe { core::arch::asm!("hlt") };

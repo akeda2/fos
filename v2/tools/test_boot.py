@@ -210,7 +210,7 @@ def main():
     check("Exiting boot services" in text, "and exits boot services", text)
 
     # --- the kernel (M1) ---
-    check("FOS v2 kernel (milestone M3): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
+    check("FOS v2 kernel (milestone M3b): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
     check(re.search(r"BootInfo: version 4, kernel at " + kernel.group(1), text) is not None, "BootInfo arrives intact and names the same load address", text)
     managed = re.search(r"Physical memory: (\d+) MiB managed, (\d+) MiB free", text)
     check(managed is not None and 400 < int(managed.group(1)) <= 512 and int(managed.group(2)) > 300, f"the physical allocator manages the machine's RAM ({managed and managed.groups()} MiB)", text)

@@ -7,7 +7,7 @@ V2_LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fos-loader.efi
 V2_KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fos-v2-kernel
 V2_IMAGE := $(V2_BUILD)/v2.img
 
-.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults
+.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -43,3 +43,7 @@ test-v2: v2-image
 # including a kernel stack overflow reported through the double-fault stack.
 test-v2-faults: v2-loader v2-kernel
 	python3 v2/tools/test_faults.py
+
+# Local keyboard: PS/2 keys through the QEMU monitor, and a boot with no keyboard.
+test-v2-keyboard: v2-image
+	python3 v2/tools/test_keyboard.py

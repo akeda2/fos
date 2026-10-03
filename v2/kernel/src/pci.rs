@@ -54,6 +54,36 @@ impl Device {
         self.write32(4, (command & 0xffff) | 0x6);
     }
 
+    /// Offset of capability `id` in the device's capability list, if it has one.
+    pub fn find_capability(&self, id: u8) -> Option<u8> {
+        if self.read32(4) >> 16 & (1 << 4) == 0 {
+            return None; // status bit 4: no capability list
+        }
+        let mut offset = (self.read32(0x34) & 0xfc) as u8;
+        for _ in 0..48 {
+            if offset < 0x40 {
+                return None;
+            }
+            let header = self.read32(offset);
+            if header & 0xff == u32::from(id) {
+                return Some(offset);
+            }
+            offset = ((header >> 8) & 0xfc) as u8;
+        }
+        None
+    }
+
+    /// Wakes a function a firmware left in power state D3 (it would not answer MMIO).
+    pub fn force_power_state_d0(&self) {
+        if let Some(capability) = self.find_capability(0x01) {
+            let control = self.read32(capability + 4);
+            if control & 3 != 0 {
+                self.write32(capability + 4, control & !3);
+                crate::apic::wait_ticks(1); // D3hot -> D0 needs 10 ms
+            }
+        }
+    }
+
     /// Base address and size of memory BAR `index`, or None for an I/O or absent BAR.
     /// A 64-bit BAR takes two slots. Sizing writes all-ones and reads back which bits
     /// stuck, with decoding switched off while the BAR holds that bogus value.

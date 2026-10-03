@@ -5,6 +5,8 @@
 //! layout of the payload partition (a metadata sector, then two kernel slots).
 #![cfg_attr(not(test), no_std)]
 
+pub mod keymap;
+
 /// "FOSV2BI\0" as a little-endian `u64`.
 pub const BOOT_INFO_MAGIC: u64 = u64::from_le_bytes(*b"FOSV2BI\0");
 pub const BOOT_INFO_VERSION: u32 = 4;

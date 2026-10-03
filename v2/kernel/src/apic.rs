@@ -50,6 +50,11 @@ fn write(register: u32, value: u32) {
     }
 }
 
+/// This CPU's local APIC id (the destination an I/O APIC entry names).
+pub fn id() -> u32 {
+    unsafe { if X2APIC { read(0x20) } else { read(0x20) >> 24 } }
+}
+
 /// Acknowledges the interrupt being serviced.
 pub fn end_of_interrupt() {
     write(REG_EOI, 0);
@@ -64,6 +69,14 @@ pub fn ticks() -> u64 {
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     end_of_interrupt();
+}
+
+/// Busy-waits `count` timer ticks (10 ms each). Needs interrupts enabled.
+pub fn wait_ticks(count: u64) {
+    let start = ticks();
+    while ticks().wrapping_sub(start) < count {
+        core::hint::spin_loop();
+    }
 }
 
 /// Reads the PM timer, masked to its width.

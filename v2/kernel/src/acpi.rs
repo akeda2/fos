@@ -89,12 +89,18 @@ pub struct Madt {
     /// Enabled processors seen (not used to start them: single core for now).
     pub processors: u32,
     pub io_apics: u32,
+    /// The first I/O APIC: its register window and the first interrupt (GSI) it serves.
+    pub io_apic_address: u64,
+    pub io_apic_gsi_base: u32,
+    /// ISA interrupt source overrides: (ISA irq, GSI, MPS INTI flags).
+    pub overrides: [(u8, u32, u16); 16],
+    pub override_count: usize,
 }
 
 pub fn madt(tables: &Tables) -> Option<Madt> {
     let table = tables.find(b"APIC")?;
     let length = u64::from(read_u32(table + 4));
-    let mut result = Madt { local_apic_address: u64::from(read_u32(table + 36)), processors: 0, io_apics: 0 };
+    let mut result = Madt { local_apic_address: u64::from(read_u32(table + 36)), processors: 0, io_apics: 0, io_apic_address: 0, io_apic_gsi_base: 0, overrides: [(0, 0, 0); 16], override_count: 0 };
     let mut at = table + 44;
     while at + 2 <= table + length {
         let (kind, size) = (read_u8(at), u64::from(read_u8(at + 1)));
@@ -103,7 +109,17 @@ pub fn madt(tables: &Tables) -> Option<Madt> {
         }
         match kind {
             0 if read_u32(at + 4) & 1 != 0 => result.processors += 1, // local APIC, enabled
-            1 => result.io_apics += 1,
+            1 => {
+                if result.io_apics == 0 {
+                    result.io_apic_address = u64::from(read_u32(at + 4));
+                    result.io_apic_gsi_base = read_u32(at + 8);
+                }
+                result.io_apics += 1;
+            }
+            2 if result.override_count < 16 => {
+                result.overrides[result.override_count] = (read_u8(at + 3), read_u32(at + 4), read_u16(at + 8));
+                result.override_count += 1;
+            }
             5 => result.local_apic_address = read_u64(at + 4), // address override
             _ => {}
         }
