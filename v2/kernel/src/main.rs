@@ -211,6 +211,11 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     if let Some(fadt) = &fadt {
         power::set_acpi_reset(fadt.reset);
+        power::set_acpi_s5(fadt.pm1a_control, fadt.pm1b_control, fadt.s5);
+        match fadt.s5 {
+            Some((a, b)) => println!("ACPI soft-off: S5 sleep type {a}/{b}, PM1a control port {:#x}.", fadt.pm1a_control),
+            None => println!("ACPI soft-off: no _S5_ object found in the DSDT; shutdown falls back to the firmware."),
+        }
     }
     if let (Some(fadt), Some(madt)) = (&fadt, &madt) {
         match apic::start_timer(fadt, madt.local_apic_address) {

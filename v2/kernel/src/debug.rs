@@ -52,6 +52,8 @@ pub struct CrashRecord {
     pub ticks: u64,
     pub boot_slot: u64,
     pub registers: [u64; 8], // rax rbx rcx rdx rsi rdi rbp r8
+    /// CR2: the address a page fault was about.
+    pub cr2: u64,
 }
 
 static mut PAYLOAD: Option<(usize, u64)> = None; // (disk, first sector of the payload partition)
@@ -199,6 +201,7 @@ pub fn record_crash(frame: &Frame) {
         ticks: apic::ticks(),
         boot_slot: u64::from(unsafe { BOOT_SLOT }),
         registers: [frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp, frame.r8],
+        cr2: crate::cpu::read_cr2(),
     };
     unsafe { (CRASH_RECORD_ADDRESS as *mut CrashRecord).write_volatile(record) };
 }
@@ -222,7 +225,7 @@ pub fn report_previous_crash() {
         record.boot_slot,
         record.ticks
     );
-    crate::println!("  RIP {:#018x}  CS {:#x}  RFLAGS {:#x}  RSP {:#018x}  SS {:#x}", record.rip, record.cs, record.rflags, record.rsp, record.ss);
+    crate::println!("  RIP {:#018x}  CS {:#x}  RFLAGS {:#x}  RSP {:#018x}  SS {:#x}  CR2 {:#x}", record.rip, record.cs, record.rflags, record.rsp, record.ss, record.cr2);
     crate::println!(
         "  RAX {:#x} RBX {:#x} RCX {:#x} RDX {:#x} RSI {:#x} RDI {:#x} RBP {:#x} R8 {:#x}",
         record.registers[0], record.registers[1], record.registers[2], record.registers[3], record.registers[4], record.registers[5], record.registers[6], record.registers[7]

@@ -69,9 +69,27 @@ pub fn reset(runtime_services: u64) -> ! {
     cpu::halt()
 }
 
-/// Calls `ResetSystem(EfiResetShutdown)` through the runtime-services table. Returns
-/// only if the firmware does (then the caller halts).
+static mut ACPI_S5: Option<(u16, u16, u8, u8)> = None;
+
+/// Remembers the PM1 control ports and the S5 sleep types for `shutdown` (None if the DSDT had no `_S5_`).
+pub fn set_acpi_s5(pm1a: u16, pm1b: u16, s5: Option<(u8, u8)>) {
+    unsafe { ACPI_S5 = if pm1a != 0 { s5.map(|(a, b)| (pm1a, pm1b, a, b)) } else { None } };
+}
+
+/// Powers the machine off: ACPI soft-off first (SLP_TYP for S5 plus SLP_EN written to PM1a/PM1b
+/// control, what the firmware itself does underneath), then the UEFI `ResetSystem(EfiResetShutdown)`.
+/// The firmware call goes second because on the Skylake it dereferenced a null pointer inside the
+/// firmware's runtime code. Returns only if neither worked (then the caller halts).
 pub fn shutdown(runtime_services: u64) {
+    cpu::interrupts_disable();
+    if let Some((pm1a, pm1b, type_a, type_b)) = unsafe { ACPI_S5 } {
+        const SLP_EN: u16 = 1 << 13;
+        cpu::outw(pm1a, (u16::from(type_a) << 10) | SLP_EN);
+        if pm1b != 0 {
+            cpu::outw(pm1b, (u16::from(type_b) << 10) | SLP_EN);
+        }
+        crate::apic::busy_wait_ms(500);
+    }
     if runtime_services == 0 {
         return;
     }
@@ -81,7 +99,6 @@ pub fn shutdown(runtime_services: u64) {
     if reset_system == 0 {
         return;
     }
-    cpu::interrupts_disable();
     let reset: extern "efiapi" fn(kind: u32, status: usize, size: usize, data: *const u8) -> ! =
         unsafe { core::mem::transmute(reset_system as usize) };
     reset(2, 0, 0, core::ptr::null())

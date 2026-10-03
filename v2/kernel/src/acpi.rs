@@ -73,6 +73,10 @@ pub struct Fadt {
     /// The ACPI reset register (if the FADT advertises one): address space (1 = system I/O,
     /// 0 = memory), address, and the value to write.
     pub reset: Option<(u8, u64, u8)>,
+    pub pm1b_control: u16,
+    /// SLP_TYPa/SLP_TYPb for the soft-off state (S5), found by scanning the DSDT for the `_S5_`
+    /// object (no AML interpreter: the package is read as bytes, the way every hobby kernel does).
+    pub s5: Option<(u8, u8)>,
 }
 
 pub fn fadt(tables: &Tables) -> Option<Fadt> {
@@ -83,8 +87,48 @@ pub fn fadt(tables: &Tables) -> Option<Fadt> {
         pm_timer_32_bit: flags & (1 << 8) != 0,
         pm1a_control: read_u32(table + 64) as u16,
         sci_interrupt: read_u16(table + 46),
+        pm1b_control: read_u32(table + 68) as u16,
+        s5: s5_sleep_types(table),
         reset: (flags & (1 << 10) != 0 && read_u64(table + 120) != 0).then(|| (read_u8(table + 116), read_u64(table + 120), read_u8(table + 128))),
     })
+}
+
+/// Reads the S5 sleep type values out of the DSDT the FADT at `fadt` points to. The object is
+/// `Name (_S5_, Package () { SLP_TYPa, SLP_TYPb, ... })`; in AML bytes that is `_S5_`, 0x12
+/// (PackageOp), a variable-length PkgLength, the element count, then the elements, each either a
+/// single 0/1 (ZeroOp/OneOp) or 0x0A followed by a byte.
+fn s5_sleep_types(fadt: u64) -> Option<(u8, u8)> {
+    let length = u64::from(read_u32(fadt + 4));
+    let dsdt = if length >= 148 && read_u64(fadt + 140) != 0 { read_u64(fadt + 140) } else { u64::from(read_u32(fadt + 40)) };
+    if dsdt == 0 {
+        return None;
+    }
+    let dsdt_length = u64::from(read_u32(dsdt + 4)).min(4 * 1024 * 1024);
+    let mut at = dsdt + 36;
+    while at + 16 < dsdt + dsdt_length {
+        if read_u32(at) == u32::from_le_bytes(*b"_S5_") && read_u8(at + 4) == 0x12 {
+            let mut p = at + 5;
+            p += 1 + u64::from(read_u8(p) >> 6); // PkgLength: lead byte + (bits 7:6) more bytes
+            p += 1; // element count
+            let mut values = [0u8; 2];
+            for value in values.iter_mut() {
+                match read_u8(p) {
+                    0x0a => {
+                        *value = read_u8(p + 1);
+                        p += 2;
+                    }
+                    constant @ (0x00 | 0x01) => {
+                        *value = constant;
+                        p += 1;
+                    }
+                    _ => return None,
+                }
+            }
+            return Some((values[0], values[1]));
+        }
+        at += 1;
+    }
+    None
 }
 
 /// What the kernel takes from the MADT.

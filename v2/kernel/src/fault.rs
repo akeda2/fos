@@ -110,6 +110,9 @@ fn report_and_stop(frame: &Frame, always_reset: bool) -> ! {
     }
     cpu::interrupts_disable();
     crate::debug::record_crash(frame);
+    // Send the report to a connected term net client too (output is normally queued for the
+    // next poll, which a fatal exception never reaches): a remote machine's only witness.
+    crate::term::flush_output();
     let debug = crate::config::debug();
     if debug.reboot_on_crash || always_reset {
         if crate::debug::crash_loop_tripped() {
