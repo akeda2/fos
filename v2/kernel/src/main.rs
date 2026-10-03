@@ -39,6 +39,7 @@ mod pci;
 mod power;
 mod serial;
 mod storage;
+mod tape;
 mod term;
 mod usb_hid;
 mod usb_storage;
@@ -119,6 +120,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         cpu::halt();
     }
     power::set_runtime_services(info.runtime_services);
+    tape::set_boot_info(info);
     println!("BootInfo: version {}, kernel at {:#x} ({} KiB), booted from slot {}.", info.version, info.kernel_base, info.kernel_size / 1024, info.boot_slot);
     let fb = &info.framebuffer;
     println!(
@@ -235,15 +237,20 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     // ---- PCI and the network ----
     let count = pci::scan();
     println!("PCI: {count} functions found (`pci` lists them).");
-    match pci::find(e1000::VENDOR_INTEL, e1000::DEVICE_IDS) {
-        Some(device) => match e1000::E1000::init(&device) {
+    let mut interfaces = 0;
+    for device in pci::devices().filter(|d| d.vendor == e1000::VENDOR_INTEL && e1000::DEVICE_IDS.contains(&d.id)) {
+        match e1000::E1000::init(&device) {
             Ok(nic) => {
                 println!("e1000 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, term::Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
-                term::install(nic, info.runtime_services);
+                if term::install(nic, info.runtime_services).is_some() {
+                    interfaces += 1;
+                }
             }
             Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        },
-        None => println!("No supported network interface found (this milestone drives the e1000 only)."),
+        }
+    }
+    if interfaces == 0 {
+        println!("No supported network interface found (this milestone drives the e1000 only).");
     }
 
     // ---- USB keyboards (xHCI) ----

@@ -20,8 +20,10 @@ const TAG_HELLO: u8 = 0x20;
 const TAG_DATA: u8 = 0x21;
 const TAG_BYE: u8 = 0x22;
 const DATA_CAPACITY: usize = 1024;
-/// The name announced in discovery replies: `NAME1` from the `hostname` file, or "fos2".
-fn hostname(out: &mut [u8; 20]) -> usize {
+/// The name announced in discovery replies for interface `index`: `NAME<n>` from the
+/// `hostname` file (n is the one-based interface number, as v1 does), or "fos2" (then
+/// "fos2-2", "fos2-3"... for further interfaces).
+fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
     use core::fmt::Write;
     struct Cursor<'a>(&'a mut [u8; 20], usize);
     impl Write for Cursor<'_> {
@@ -33,14 +35,19 @@ fn hostname(out: &mut [u8; 20]) -> usize {
         }
     }
     let mut cursor = Cursor(out, 0);
-    let _ = match crate::config::hostname() {
-        Some(base) => write!(cursor, "{base}1"),
-        None => write!(cursor, "fos2"),
+    let _ = match (crate::config::hostname(), index) {
+        (Some(base), _) => write!(cursor, "{base}{}", index + 1),
+        (None, 0) => write!(cursor, "fos2"),
+        (None, _) => write!(cursor, "fos2-{}", index + 1),
     };
     cursor.1
 }
 
-static mut NIC: Option<E1000> = None;
+pub const MAX_NICS: usize = 4;
+static mut NICS: [Option<E1000>; MAX_NICS] = [const { None }; MAX_NICS];
+static mut NIC_COUNT: usize = 0;
+/// The interface the open session's HELLO arrived on: console output goes out of it.
+static mut SESSION_NIC: usize = 0;
 static mut PEER: Option<[u8; 6]> = None;
 static mut RELAY: [u8; 16384] = [0; 16384];
 static mut RELAY_LENGTH: usize = 0;
@@ -50,15 +57,30 @@ static mut LINE: [u8; 120] = [0; 120];
 static mut LINE_LENGTH: usize = 0;
 static mut LAST_WAS_CR: bool = false;
 
-pub fn install(nic: E1000, runtime_services: u64) {
+/// Adds a network interface; returns its zero-based index.
+pub fn install(nic: E1000, runtime_services: u64) -> Option<usize> {
     unsafe {
-        *core::ptr::addr_of_mut!(NIC) = Some(nic);
         RUNTIME_SERVICES = runtime_services;
+        if NIC_COUNT == MAX_NICS {
+            return None;
+        }
+        (*core::ptr::addr_of_mut!(NICS))[NIC_COUNT] = Some(nic);
+        NIC_COUNT += 1;
+        Some(NIC_COUNT - 1)
     }
 }
 
+pub fn nic_count() -> usize {
+    unsafe { NIC_COUNT }
+}
+
+fn nic_at(index: usize) -> Option<&'static mut E1000> {
+    unsafe { (*core::ptr::addr_of_mut!(NICS)).get_mut(index)?.as_mut() }
+}
+
+/// The session's interface.
 fn nic() -> Option<&'static mut E1000> {
-    unsafe { (*core::ptr::addr_of_mut!(NIC)).as_mut() }
+    nic_at(unsafe { SESSION_NIC })
 }
 
 fn session_open() -> bool {
@@ -116,52 +138,225 @@ fn send(nic: &mut E1000, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool
 /// Handles whatever the NIC has received. Call this from the main loop.
 pub fn poll() {
     let mut buffer = [0u8; 1600];
-    loop {
-        let Some(length) = nic().and_then(|nic| nic.receive(&mut buffer)) else { break };
-        let frame = &buffer[..length];
-        if frame.len() < 15 || frame[12..14] != ETHERTYPE {
-            continue;
-        }
-        let source: [u8; 6] = frame[6..12].try_into().unwrap();
-        match frame[14] {
-            TAG_DISCOVER_REQUEST => {
-                if let Some(nic) = nic() {
-                    let mut name = [0u8; 20];
-                    let length = hostname(&mut name);
-                    send(nic, &source, TAG_DISCOVER_REPLY, &name[..length]);
-                }
-            }
-            TAG_HELLO if crate::config::deny_term_net() => {} // closed by the settings file: stay silent
-            TAG_HELLO => {
-                // A new HELLO replaces any earlier session (the old client is gone or
-                // restarting); the screen and serial port show who connected.
-                unsafe {
-                    *core::ptr::addr_of_mut!(PEER) = Some(source);
-                    RELAY_LENGTH = 0;
-                    LINE_LENGTH = 0;
-                    LAST_WAS_CR = false;
-                }
-                crate::println!("Remote terminal connected from {}.", Mac(&source));
-                crate::println!("Type `help` for the commands.");
-                prompt();
-            }
-            TAG_DATA if session_open() && unsafe { *core::ptr::addr_of!(PEER) } == Some(source) => {
-                for &byte in &frame[15..] {
-                    feed(byte);
-                }
-            }
-            TAG_BYE if unsafe { *core::ptr::addr_of!(PEER) } == Some(source) => {
-                flush();
-                unsafe { *core::ptr::addr_of_mut!(PEER) = None };
-                crate::println!("Remote terminal disconnected.");
-                prompt();
-            }
-            _ => {}
+    for index in 0..nic_count() {
+        loop {
+            let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
+            handle_frame(index, &buffer[..length]);
         }
     }
     if session_open() {
         flush();
     }
+}
+
+/// Handles one received frame if it is the terminal's or a discovery probe's business;
+/// returns false for anything else (which a running tape may want).
+fn handle_frame(index: usize, frame: &[u8]) -> bool {
+    if frame.len() < 15 || frame[12..14] != ETHERTYPE {
+        return false;
+    }
+    let source: [u8; 6] = frame[6..12].try_into().unwrap();
+    match frame[14] {
+        TAG_DISCOVER_REQUEST => {
+            if let Some(nic) = nic_at(index) {
+                let mut name = [0u8; 20];
+                let length = hostname(index, &mut name);
+                send(nic, &source, TAG_DISCOVER_REPLY, &name[..length]);
+            }
+        }
+        TAG_HELLO if crate::config::deny_term_net() => {} // closed by the settings file: stay silent
+        TAG_HELLO => {
+            // A new HELLO replaces any earlier session (the old client is gone or
+            // restarting); the screen and serial port show who connected.
+            unsafe {
+                *core::ptr::addr_of_mut!(PEER) = Some(source);
+                SESSION_NIC = index;
+                RELAY_LENGTH = 0;
+                LINE_LENGTH = 0;
+                LAST_WAS_CR = false;
+            }
+            crate::println!("Remote terminal connected from {} on interface {}.", Mac(&source), index + 1);
+            crate::println!("Type `help` for the commands.");
+            prompt();
+        }
+        TAG_DATA if session_open() && unsafe { *core::ptr::addr_of!(PEER) } == Some(source) && unsafe { SESSION_NIC } == index => {
+            let payload = &frame[15..];
+            if unsafe { TAPE_MODE } {
+                // A running tape owns the input. A lone Escape byte is "stop".
+                if payload.first() == Some(&0x1b) && payload.iter().rposition(|&b| b != 0) == Some(0) {
+                    tape_input_push(TAPE_ABORT);
+                } else {
+                    for &byte in payload {
+                        tape_input_push(u16::from(byte));
+                    }
+                }
+            } else {
+                for &byte in payload {
+                    feed(byte);
+                }
+            }
+        }
+        TAG_BYE if unsafe { *core::ptr::addr_of!(PEER) } == Some(source) => {
+            flush();
+            unsafe { *core::ptr::addr_of_mut!(PEER) = None };
+            crate::println!("Remote terminal disconnected.");
+            if unsafe { TAPE_MODE } {
+                tape_input_push(TAPE_ABORT);
+            } else {
+                prompt();
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+// ---- support for running tapes (see tape.rs) ----
+
+const TAPE_ABORT: u16 = 0x100;
+const TAPE_INPUT_CAPACITY: usize = 256;
+static mut TAPE_MODE: bool = false;
+static mut TAPE_INPUT: [u16; TAPE_INPUT_CAPACITY] = [0; TAPE_INPUT_CAPACITY];
+static mut TAPE_INPUT_HEAD: usize = 0;
+static mut TAPE_INPUT_TAIL: usize = 0;
+
+fn tape_input_push(value: u16) {
+    unsafe {
+        let next = (TAPE_INPUT_HEAD + 1) % TAPE_INPUT_CAPACITY;
+        if next != TAPE_INPUT_TAIL {
+            (*core::ptr::addr_of_mut!(TAPE_INPUT))[TAPE_INPUT_HEAD] = value;
+            TAPE_INPUT_HEAD = next;
+        }
+    }
+}
+
+/// While a tape runs, input goes to the tape instead of the line editor.
+pub fn set_tape_mode(on: bool) {
+    unsafe {
+        TAPE_MODE = on;
+        TAPE_INPUT_HEAD = 0;
+        TAPE_INPUT_TAIL = 0;
+        FRAME_HEAD = [0; MAX_NICS];
+        FRAME_TAIL = [0; MAX_NICS];
+    }
+    if !on {
+        flush();
+    }
+}
+
+/// Frames that were not the terminal's, kept per interface for the tape's `nic_receive`
+/// (a short FIFO: a tape that does not poll loses the oldest traffic, like a NIC ring
+/// overrun).
+const FRAME_FIFO: usize = 64;
+static mut FRAMES: [[u8; 1600]; MAX_NICS * FRAME_FIFO] = [[0; 1600]; MAX_NICS * FRAME_FIFO];
+static mut FRAME_LENGTHS: [usize; MAX_NICS * FRAME_FIFO] = [0; MAX_NICS * FRAME_FIFO];
+static mut FRAME_HEAD: [usize; MAX_NICS] = [0; MAX_NICS];
+static mut FRAME_TAIL: [usize; MAX_NICS] = [0; MAX_NICS];
+static mut FRAMES_DROPPED: u32 = 0;
+static mut FRAMES_QUEUED: u32 = 0;
+
+/// Everything a tape callback must keep serviced: USB keyboards, local keys, the
+/// network (terminal frames handled, the rest queued per interface), console output out.
+fn tape_service() {
+    crate::usb_hid::poll();
+    while let Some(key) = crate::keyboard::pop() {
+        tape_input_push(if key == 0x1b { TAPE_ABORT } else { u16::from(key) });
+    }
+    let mut buffer = [0u8; 1600];
+    for index in 0..nic_count() {
+        loop {
+            let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
+            if handle_frame(index, &buffer[..length]) {
+                continue;
+            }
+            unsafe {
+                let head = FRAME_HEAD[index];
+                let next = (head + 1) % FRAME_FIFO;
+                if next == FRAME_TAIL[index] {
+                    FRAME_TAIL[index] = (FRAME_TAIL[index] + 1) % FRAME_FIFO; // full: drop the oldest
+                    FRAMES_DROPPED += 1;
+                }
+                let slot = index * FRAME_FIFO + head;
+                core::slice::from_raw_parts_mut((core::ptr::addr_of_mut!(FRAMES) as *mut u8).add(slot * 1600), length).copy_from_slice(&buffer[..length]);
+                FRAME_LENGTHS[slot] = length;
+                FRAME_HEAD[index] = next;
+                FRAMES_QUEUED += 1;
+            }
+        }
+    }
+    flush();
+}
+
+/// A tape's `read_key`: 0 none, 1 abort, 0x100 + byte.
+pub fn tape_key() -> u32 {
+    tape_service();
+    unsafe {
+        if TAPE_INPUT_TAIL == TAPE_INPUT_HEAD {
+            return 0;
+        }
+        let value = (*core::ptr::addr_of!(TAPE_INPUT))[TAPE_INPUT_TAIL];
+        TAPE_INPUT_TAIL = (TAPE_INPUT_TAIL + 1) % TAPE_INPUT_CAPACITY;
+        if value == TAPE_ABORT { 1 } else { 0x100 + u32::from(value) }
+    }
+}
+
+/// A tape's `should_abort`: drains input, true if the operator asked to stop.
+pub fn tape_should_abort() -> bool {
+    loop {
+        match tape_key() {
+            0 => return false,
+            1 => return true,
+            _ => {}
+        }
+    }
+}
+
+/// A tape's `nic_receive`: the next queued frame of interface `index` that is not the
+/// terminal's.
+pub fn tape_receive(index: usize, out: &mut [u8]) -> usize {
+    tape_service();
+    if index >= MAX_NICS {
+        return 0;
+    }
+    unsafe {
+        if FRAME_TAIL[index] == FRAME_HEAD[index] {
+            return 0;
+        }
+        let slot = index * FRAME_FIFO + FRAME_TAIL[index];
+        let length = FRAME_LENGTHS[slot].min(out.len());
+        out[..length].copy_from_slice(core::slice::from_raw_parts((core::ptr::addr_of!(FRAMES) as *const u8).add(slot * 1600), length));
+        FRAME_TAIL[index] = (FRAME_TAIL[index] + 1) % FRAME_FIFO;
+        length
+    }
+}
+
+pub fn nic_mac(index: usize, out: &mut [u8; 6]) -> bool {
+    match nic_at(index) {
+        Some(nic) => {
+            *out = nic.mac;
+            true
+        }
+        None => false,
+    }
+}
+
+pub fn nic_send(index: usize, frame: &[u8]) -> bool {
+    nic_at(index).is_some_and(|nic| nic.send(frame))
+}
+
+pub fn nic_set_promiscuous(index: usize, on: bool) -> bool {
+    match nic_at(index) {
+        Some(nic) => {
+            nic.set_promiscuous(on);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Flushes queued console output to the client (public for tape callbacks).
+pub fn flush_output() {
+    flush();
 }
 
 /// Runs one command line (used by the `start` script).
@@ -246,6 +441,8 @@ fn execute(command: &str) {
             crate::println!("cat NAME  show a file");
             crate::println!("write NAME TEXT   create or replace a file");
             crate::println!("rm NAME   delete a file");
+            crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
+            crate::println!("run NAME [ARGS]   load a tape from FOSFS and run it");
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
             crate::println!("uptime    time since the timer started");
             crate::println!("dmesg     the boot log");
@@ -275,13 +472,22 @@ fn execute(command: &str) {
                 );
             }
         }
-        "nic" => match nic() {
-            Some(nic) => {
-                crate::println!("e1000 {}  {}", Mac(&nic.mac), if nic.link_up() { "link up" } else { "link DOWN" });
-                crate::println!("frames: {} received, {} sent", nic.frames_received, nic.frames_sent);
+        "nic" => {
+            if nic_count() == 0 {
+                crate::println!("No network interface.");
             }
-            None => crate::println!("No network interface."),
-        },
+            for index in 0..nic_count() {
+                if let Some(nic) = nic_at(index) {
+                    crate::println!("{}: e1000 {}  {}{}", index + 1, Mac(&nic.mac), if nic.link_up() { "link up" } else { "link DOWN" }, if unsafe { SESSION_NIC } == index && session_open() { "  (terminal)" } else { "" });
+                    crate::println!("   frames: {} received, {} sent", nic.frames_received, nic.frames_sent);
+                    if index == 0 {
+                        crate::println!("   tape frame queue: {} queued, {} dropped", unsafe { FRAMES_QUEUED }, unsafe { FRAMES_DROPPED });
+                    }
+                }
+            }
+        }
+        "tape" => crate::tape::command(command.strip_prefix("tape").unwrap_or("")),
+        "run" => crate::tape::run_named(command.strip_prefix("run").unwrap_or("")),
         "disks" => {
             for index in 0..crate::block::count() {
                 let disk = crate::block::get(index).unwrap();

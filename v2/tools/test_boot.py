@@ -236,7 +236,7 @@ def main():
     check(re.search(r"\d+ ticks at 100 Hz", transcript["uptime"]) is not None, "`uptime` reports the timer", transcript["uptime"])
     check(re.search(r"disk1: \d+ MiB, QEMU HARDDISK \(SATA 0:\d+\)", text) is not None, "the AHCI driver finds the SATA disk and identifies it", text)
     check("Boot disk: disk1" in text, "boot-disk discovery matches the payload partition GUID the loader passed", text)
-    check(re.search(r"FOSFS: mounted on disk1 \(\d+ MiB, 1 file\(s\)\)", text) is not None, "the FOSFS data partition on the boot disk is mounted", text)
+    check(re.search(r"FOSFS: mounted on disk1 \(\d+ MiB, \d+ file\(s\)\)", text) is not None, "the FOSFS data partition on the boot disk is mounted", text)
     check("boot disk: disk1" in transcript["disks"], "`disks` shows the boot disk", transcript["disks"])
     check("readme.txt" in transcript["ls"], "`ls` lists the preloaded file", transcript["ls"])
     check("Welcome to FOSFS on fos v2" in transcript["cat readme.txt"], "`cat` reads it from the disk through the AHCI driver", transcript["cat readme.txt"])

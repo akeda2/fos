@@ -29,6 +29,7 @@ const PM_TIMER_HZ: u64 = 3_579_545;
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static mut BASE: u64 = 0;
 static mut X2APIC: bool = false;
+static mut PER_TICK: u32 = 0;
 static mut PM_PORT: u16 = 0;
 static mut PM_32_BIT: bool = false;
 
@@ -71,6 +72,25 @@ pub fn ticks() -> u64 {
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     end_of_interrupt();
+}
+
+/// Microseconds since boot: the tick count refined by how far the local APIC timer has
+/// counted down within the current tick.
+pub fn micros() -> u64 {
+    unsafe {
+        if PER_TICK == 0 {
+            return 0;
+        }
+        loop {
+            let before = ticks();
+            let current = u64::from(read(REG_TIMER_CURRENT));
+            if ticks() != before {
+                continue; // the tick rolled over while reading
+            }
+            let elapsed = (u64::from(PER_TICK) - current.min(u64::from(PER_TICK))) * 10_000 / u64::from(PER_TICK);
+            return before * 10_000 + elapsed;
+        }
+    }
 }
 
 /// Waits `milliseconds` on the ACPI PM timer, with no interrupts needed (for fatal-error
@@ -170,6 +190,7 @@ pub fn start_timer(fadt: &acpi::Fadt, madt_address: u64) -> Option<Report> {
     // `counted` timer ticks took 10 ms, so one 100 Hz tick is exactly that many.
     let per_tick = counted * 100 / TICK_HZ;
     write(REG_LVT_TIMER, 1 << 17 | u32::from(TIMER_VECTOR)); // periodic, unmasked
+    unsafe { PER_TICK = per_tick as u32 };
     write(REG_TIMER_INITIAL, per_tick as u32);
     Some(Report { x2apic, base, timer_hz: counted * 100 * 16 })
 }

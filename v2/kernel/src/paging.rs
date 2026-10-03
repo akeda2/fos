@@ -229,6 +229,43 @@ pub fn build_and_load(info: &BootInfo, framebuffer: &Framebuffer) {
     cpu::write_cr3(root);
 }
 
+/// Makes `[start, start + length)` executable (or not): clears or sets the NX bit of every
+/// mapping in the range. Both ends must be 2 MiB aligned. Used for the tape region, the
+/// one place the kernel runs code it did not link (tapes are trusted like kernel code;
+/// this is not isolation).
+pub fn set_executable(start: u64, length: u64, executable: bool) {
+    assert!(start % HUGE == 0 && length % HUGE == 0, "tape region must be 2 MiB aligned");
+    let root = unsafe { ROOT };
+    let apply = |entry: *mut u64| unsafe {
+        if executable {
+            *entry &= !NO_EXECUTE;
+        } else {
+            *entry |= NO_EXECUTE;
+        }
+    };
+    let mut address = start;
+    while address < start + length {
+        unsafe {
+            let directory = directory_entry(root, address);
+            if *directory & LARGE != 0 {
+                apply(directory);
+            } else {
+                // Mapped with 4 KiB pages (it shares a 2 MiB chunk with the kernel image):
+                // the directory entry must allow execution too; the pages decide.
+                *directory &= !NO_EXECUTE;
+                let table = (*directory & ADDRESS_MASK) as *mut u64;
+                for index in 0..512 {
+                    if *table.add(index) & PRESENT != 0 {
+                        apply(table.add(index));
+                    }
+                }
+            }
+        }
+        address += HUGE;
+    }
+    cpu::write_cr3(cpu::read_cr3()); // flush the TLB
+}
+
 pub fn root() -> u64 {
     unsafe { ROOT }
 }

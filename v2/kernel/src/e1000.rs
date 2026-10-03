@@ -163,6 +163,14 @@ impl E1000 {
         Ok(E1000 { registers, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, tx_next: 0, frames_received: 0, frames_sent: 0 })
     }
 
+    /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
+    /// (RCTL.UPE unicast, MPE multicast). A bridge or a link-impairment tape needs it.
+    pub fn set_promiscuous(&mut self, on: bool) {
+        let control = read(self.registers, REG_RCTL);
+        let bits = (1 << 3) | (1 << 4);
+        write(self.registers, REG_RCTL, if on { control | bits } else { control & !bits });
+    }
+
     pub fn link_up(&self) -> bool {
         read(self.registers, REG_STATUS) & STATUS_LU != 0
     }
