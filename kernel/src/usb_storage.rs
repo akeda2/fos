@@ -26,6 +26,7 @@
 //! it as an ordinary secondary disk is later, separate work.
 
 use crate::uhci::{self, Uhci};
+use crate::ehci::{self, Ehci};
 use crate::xhci::{self, Xhci};
 
 const MSC_CLASS: u8 = 0x08;
@@ -72,7 +73,9 @@ pub enum Error {
 
 fn wait_ticks(count: u64) {
     let start = crate::interrupts::ticks();
-    while crate::interrupts::ticks().wrapping_sub(start) < count {}
+    while crate::interrupts::ticks().wrapping_sub(start) < count {
+        crate::debug::watchdog_pet();
+    }
 }
 
 /// The two bulk endpoints (and their owning interface) of a discovered
@@ -92,11 +95,13 @@ struct MscEndpoints {
 }
 
 /// The host controller a device hangs off: UHCI (USB 1.1, full-speed sticks
-/// only) or xHCI (any speed, where the controller tracks toggles and slots
+/// only), EHCI (USB 2.0 high speed, DATA0/DATA1 tracked by this struct like
+/// UHCI) or xHCI (any speed, where the controller tracks toggles and slots
 /// itself and the driver hands back a slot-bearing handle).
 #[derive(Clone, Copy)]
 enum Host {
     Uhci(&'static Uhci),
+    Ehci(&'static Ehci),
     Xhci(&'static Xhci, xhci::Device),
 }
 
@@ -266,8 +271,10 @@ pub fn open_all(out: &mut [Option<MscDevice>]) -> usize {
             opened += 1;
         }
     }
+    crate::debug::crumb(0x5200);
     for index in 0..xhci::count() {
         let Some(controller) = xhci::get(index) else { continue };
+        crate::debug::crumb(0x5201);
         for port in 1..=controller.port_count() {
             if opened >= out.len() {
                 return opened;
@@ -278,7 +285,64 @@ pub fn open_all(out: &mut [Option<MscDevice>]) -> usize {
             }
         }
     }
+    opened + open_all_ehci(&mut out[opened..])
+}
+
+/// The EHCI part of `open_all` on its own (also what `usb ehci storage` uses to
+/// test that host controller without xHCI devices getting in the way).
+pub fn open_all_ehci(out: &mut [Option<MscDevice>]) -> usize {
+    let mut opened = 0usize;
+    for index in 0..ehci::count() {
+        let Some(controller) = ehci::get(index) else { continue };
+        for port in 1..=controller.port_count() {
+            if opened >= out.len() {
+                return opened;
+            }
+            if controller.port_status(port) & 1 == 0 {
+                continue; // nothing connected
+            }
+            let _ = controller.enumerate_port(port, &mut |device| {
+                if opened < out.len() {
+                    if let Some(found) = open_ehci_device(controller, device) {
+                        out[opened] = Some(found);
+                        opened += 1;
+                    }
+                }
+            });
+        }
+    }
     opened
+}
+
+/// The EHCI half of `open_all`: given a freshly addressed device (on a root
+/// port, or behind the hub on one), read its configuration, and if it offers a
+/// Bulk-Only Mass Storage interface select that configuration.
+fn open_ehci_device(controller: &'static Ehci, device: &ehci::EnumeratedDevice) -> Option<MscDevice> {
+    let mut header = [0u8; 9];
+    controller
+        .get_descriptor(device.address, device.max_packet0, uhci::USB_DESCRIPTOR_CONFIGURATION, 0, &mut header)
+        .ok()?;
+    let total = (u16::from_le_bytes([header[2], header[3]]) as usize).min(uhci::MAX_DESCRIPTOR_BYTES);
+    let mut config = [0u8; uhci::MAX_DESCRIPTOR_BYTES];
+    let read = controller
+        .get_descriptor(device.address, device.max_packet0, uhci::USB_DESCRIPTOR_CONFIGURATION, 0, &mut config[..total])
+        .ok()?;
+    let endpoints = find_msc_endpoints(&config[..read])?;
+    controller
+        .set_configuration(device.address, device.max_packet0, config.get(5).copied().unwrap_or(1))
+        .ok()?;
+    Some(MscDevice {
+        host: Host::Ehci(controller),
+        endpoints,
+        device_address: device.address,
+        control_max_packet: device.max_packet0.min(255) as u8,
+        // Root port in the high nibble, hub port (0: none) in the low one: with the
+        // controller that is the device's physical identity.
+        port: device.root_port << 4 | device.hub_port,
+        in_toggle: false,
+        out_toggle: false,
+        next_tag: 0,
+    })
 }
 
 /// The xHCI half of `open_all`'s per-port work: address the device, read its
@@ -287,7 +351,9 @@ pub fn open_all(out: &mut [Option<MscDevice>]) -> usize {
 /// order, as Linux does). Anything that is not such a device, or that fails
 /// along the way, gives its slot back and yields `None`.
 fn open_xhci_port(controller: &'static Xhci, port: u8) -> Option<MscDevice> {
+    crate::debug::crumb(0x5300 + u32::from(port));
     let mut device = controller.open_port(port).ok()?;
+    crate::debug::crumb(0x5400 + u32::from(port));
     let opened = (|| -> Result<MscEndpoints, xhci::Error> {
         let mut first8 = [0u8; 8];
         controller.get_descriptor(&device, uhci::USB_DESCRIPTOR_DEVICE, 0, &mut first8)?;
@@ -394,6 +460,7 @@ impl MscDevice {
         let same_controller = match (self.host, other.host) {
             (Host::Uhci(a), Host::Uhci(b)) => core::ptr::eq(a, b),
             (Host::Xhci(a, _), Host::Xhci(b, _)) => core::ptr::eq(a, b),
+            (Host::Ehci(a), Host::Ehci(b)) => core::ptr::eq(a, b),
             _ => false,
         };
         same_controller && self.port == other.port
@@ -428,6 +495,12 @@ impl MscDevice {
                     data_in,
                     toggle,
                 )
+            }
+            Host::Ehci(controller) => {
+                let toggle = if data_in { &mut self.in_toggle } else { &mut self.out_toggle };
+                controller
+                    .bulk_transfer(self.device_address, endpoint & 0x0f, max_packet, buffer, data_in, toggle)
+                    .map_err(|error| error.as_uhci())
             }
             Host::Xhci(controller, ref device) => {
                 controller.bulk_transfer(device, endpoint, buffer, max_packet).map_err(|error| error.as_uhci())
@@ -471,6 +544,16 @@ impl MscDevice {
                     self.control_max_packet,
                     self.endpoints.out_endpoint,
                 );
+            }
+            Host::Ehci(controller) => {
+                let _ = controller.bulk_only_mass_storage_reset(
+                    self.device_address,
+                    u16::from(self.control_max_packet),
+                    self.endpoints.interface_number,
+                );
+                for endpoint in [self.endpoints.in_endpoint, self.endpoints.out_endpoint] {
+                    let _ = controller.clear_endpoint_halt(self.device_address, u16::from(self.control_max_packet), endpoint);
+                }
             }
             Host::Xhci(controller, ref device) => {
                 let _ = controller.bulk_only_mass_storage_reset(device, self.endpoints.interface_number);

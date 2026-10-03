@@ -629,6 +629,7 @@ pub fn promote_all_and_attach(info: &BootInfo) -> PromoteAllReport {
         candidates[index + 1] = Some(Device::Secondary(index));
     }
 
+    crate::debug::crumb(0x5000);
     let mut targets: [Option<(Device, u64, [u8; SECTOR_SIZE])>; MAX_PROMOTE_RESULTS] =
         [None; MAX_PROMOTE_RESULTS];
     let mut target_count = 0;
@@ -643,8 +644,10 @@ pub fn promote_all_and_attach(info: &BootInfo) -> PromoteAllReport {
         }
     }
 
+    crate::debug::crumb(0x5001);
     let mut discovered: [Option<usb_storage::MscDevice>; MAX_PROMOTE_RESULTS] = [None; MAX_PROMOTE_RESULTS];
     let discovered_count = usb_storage::open_all(&mut discovered);
+    crate::debug::crumb(0x5002 + discovered_count as u32);
 
     // Discovery just reset every port, so any device that is already a
     // USB-backed disk has a new address: refresh its handle and take it out
@@ -660,10 +663,14 @@ pub fn promote_all_and_attach(info: &BootInfo) -> PromoteAllReport {
 
     for target in targets[..target_count].iter().flatten() {
         let (device, existing_sectors, baseline) = *target;
+        crate::debug::crumb(0x5100);
         let mut promoted = false;
         for slot in discovered[..discovered_count].iter_mut() {
             let Some(candidate) = *slot else { continue };
-            if try_promote_with_candidate(device, existing_sectors, &baseline, candidate).is_ok() {
+            crate::debug::crumb(0x5110);
+            let outcome = try_promote_with_candidate(device, existing_sectors, &baseline, candidate);
+            crate::debug::crumb(0x5120);
+            if outcome.is_ok() {
                 *slot = None;
                 promoted = true;
                 break;

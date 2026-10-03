@@ -30,10 +30,10 @@ ROOT = Path(__file__).resolve().parent.parent
 TELNET = ROOT / "build" / "tapes" / "telnet.bin"
 
 
-def make_lab(backing):
+def make_lab(backing, controller="qemu-xhci,id=xhci", bus="xhci.0"):
     return Lab(nic_args=["-netdev", "user,id=n0", "-device", "e1000,netdev=n0",
-                         "-device", "qemu-xhci,id=xhci", "-drive", f"if=none,id=usb0,format=raw,file={backing}",
-                         "-device", "usb-storage,drive=usb0"])
+                         "-device", controller, "-drive", f"if=none,id=usb0,format=raw,file={backing}",
+                         "-device", f"usb-storage,bus={bus},drive=usb0"])
 
 
 def exercise_disk(lab, disk, label):

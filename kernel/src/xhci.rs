@@ -279,13 +279,18 @@ fn write64(address: u32, value: u64) {
 
 fn wait_ticks(count: u64) {
     let start = interrupts::ticks();
-    while interrupts::ticks().wrapping_sub(start) < count {}
+    while interrupts::ticks().wrapping_sub(start) < count {
+        // Waiting is progress as far as the watchdog is concerned: a whole USB
+        // discovery (many ports, retries) can take longer than its limit.
+        crate::debug::watchdog_pet();
+    }
 }
 
 /// Polls `condition` until it is true or `ticks` timer ticks (10 ms each) pass.
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
     let start = interrupts::ticks();
     loop {
+        crate::debug::watchdog_pet();
         if condition() {
             return true;
         }
@@ -685,6 +690,7 @@ impl Xhci {
     fn wait_event(&self, ticks: u64, mut wanted: impl FnMut(&Trb) -> bool) -> Result<Trb, Error> {
         let start = interrupts::ticks();
         loop {
+            crate::debug::watchdog_pet();
             while let Some(event) = self.next_event() {
                 if wanted(&event) {
                     return Ok(event);

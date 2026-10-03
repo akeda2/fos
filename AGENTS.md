@@ -204,6 +204,7 @@ fixed address below `0x9f000`, and update it in the same change that adds one:
 | `0x5000` | `stage2.S`, `netrom.S`, `kernel/` | The packed `BootInfo` struct: the loader/kernel ABI. |
 | `0x5400`-`0x5447` | `stage2.S` BIOS disk trampoline | One EDD request/DAP plus saved protected-mode stack pointer and CR0, used while temporarily entering real mode. |
 | `0x5500`-`0x5547` | `kernel/src/debug.rs` (`CRASH_RECORD_ADDR`) | A `CrashRecord` written by a fault handler and read back on the *next* boot, so a real-hardware operator can see what a previous fatal exception looked like without having watched it happen live. See "Debug mode" below. |
+| `0x5600`-`0x560b` | `kernel/src/debug.rs` (`CRUMB_ADDR`) | `debug::crumb`: the last progress marker a driver left (`debug crumb` shows it after a hang reset), for bring-up on hardware with no other way to see where a freeze happened. |
 | `0x7a00` | `stage2.S`, `netrom.S` | Real-mode stack pointer during boot. |
 | `0x7c00` | `stage1.S` | MBR load address (fixed by the BIOS). |
 | `0x8000` | `stage2.S` | Stage-two load address (fixed by `stage1.S`). |
@@ -836,18 +837,30 @@ controllers/ports and fully re-enumerates every time. Device addresses come from
   each fresh attempt when more than one is at stake. `reboot soft` stays a gap
   even when promoted (stage two needs BIOS to reload the kernel).
 
-- **xHCI** (`kernel/src/xhci.rs`, `usb xhci`, `usb hosts`): a polling-only xHCI
-  driver (root ports only, no hubs, one event-ring segment) built for USB Mass
-  Storage: BIOS handoff, controller reset, command/event/transfer rings, Address
-  Device, control and bulk transfers (64 KiB TRB-boundary splitting), Configure
-  Endpoint. `usb_storage.rs` drives either host through its `Host` enum
-  (`open_all` tries UHCI ports, then xHCI ports; xHCI skips UHCI's settle
-  delays), so `usb storage [attach|promote]` and `usb native` work over both.
-  Like UHCI it must not run at boot: taking the controller ends the BIOS's INT13h
-  emulation of the boot stick, so `promote` reads its BIOS baselines first. Real
-  machines: Skylake = xHCI only; Sandy Bridge = 2 EHCI (boot sticks) + NEC xHCI;
-  AMD/nForce = OHCI + EHCI (no driver yet). Tests: `make test-xhci`,
-  `test-usb-hosts` (QEMU `qemu-xhci` + `usb-storage`).
+- **xHCI and EHCI** (`kernel/src/xhci.rs`, `ehci.rs`; `usb xhci`, `usb ehci`,
+  `usb ehci storage`, `usb hosts`): polling-only drivers built for USB Mass
+  Storage. xHCI: BIOS handoff, controller reset, command/event/transfer rings,
+  Address Device, control and bulk transfers (64 KiB TRB-boundary splitting),
+  Configure Endpoint, root ports only. EHCI: one reprogrammed async-schedule QH
+  with the schedule switched off between transfers, qTD chains with explicit data
+  toggles, high-speed only (full/low speed goes to the companion), and **one level
+  of hub** -- required on Sandy Bridge, whose EHCI ports sit behind Intel's
+  rate-matching hub. `usb_storage.rs` drives all three hosts through its `Host`
+  enum (`open_all`: UHCI, xHCI, then EHCI ports), so `usb storage [attach|promote]`
+  and `usb native` work over each. Like UHCI they must not run at boot: taking a
+  controller ends the BIOS's INT13h emulation of the stick behind it, so
+  `promote` reads its BIOS baselines first; after a takeover reset the machine
+  before pushing a kernel (KUP needs the BIOS disk). USB waits pet the watchdog.
+  `usb native` takes tens of seconds and a remote term session usually loses its
+  output: read it with `dmesg`. `usb xhci`/`usb ehci` leave ports a disk uses alone
+  (reopening a port replaces its slot/address and kills that disk's handle).
+  Real machines (all confirmed): Skylake = xHCI only (boot stick promoted);
+  Sandy Bridge = 2 EHCI behind the rate-matching hub (boot stick promoted) + NEC
+  xHCI; AMD/nForce = OHCI + EHCI (boot stick promoted; OHCI has no driver).
+  Tests: `make test-xhci`, `test-ehci`, `test-usb-hosts` (QEMU `qemu-xhci`/
+  `usb-ehci` + `usb-storage`; QEMU's hub is full speed, so hub code is
+  hardware-only). `debug::crumb`/`debug crumb` (see the low-memory map) helped
+  find where bring-up stalled.
 
 Tests: `tapes/test_uhci_e2e.py`, `test_uhci_play_e2e.py`,
 `test_uhci_audio_facade_e2e.py`, `test_usb_storage_e2e.py`,

@@ -56,6 +56,7 @@ const SUBCLASS_SERIAL: u8 = 0x00;
 const CLASS_SERIAL_BUS: u8 = 0x0c;
 const SUBCLASS_USB: u8 = 0x03;
 const PROG_IF_UHCI: u8 = 0x00;
+const PROG_IF_EHCI: u8 = 0x20;
 const PROG_IF_XHCI: u8 = 0x30;
 
 const HEADER_TYPE_MULTIFUNCTION: u8 = 0x80;
@@ -152,6 +153,18 @@ pub const MAX_DEVICE_MATCHES: usize = 8;
 
 impl PciAddress {
     /// Reads the PCI device identifier for this function.
+    pub fn bus(&self) -> u8 {
+        self.bus
+    }
+
+    pub fn device(&self) -> u8 {
+        self.device
+    }
+
+    pub fn function(&self) -> u8 {
+        self.function
+    }
+
     pub fn device_id(&self) -> u16 {
         read_u16(self.bus, self.device, self.function, 0x00)
     }
@@ -835,6 +848,11 @@ pub fn find_usb_controllers(wanted_prog_if: u8, out: &mut [Option<PciAddress>]) 
 /// UHCI (USB 1.1) host controllers: see `find_usb_controllers`.
 pub fn find_uhci_controllers(out: &mut [Option<PciAddress>]) -> usize {
     find_usb_controllers(PROG_IF_UHCI, out)
+}
+
+/// EHCI (USB 2.0) host controllers: see `find_usb_controllers`.
+pub fn find_ehci_controllers(out: &mut [Option<PciAddress>]) -> usize {
+    find_usb_controllers(PROG_IF_EHCI, out)
 }
 
 /// xHCI (USB 3.x) host controllers: see `find_usb_controllers`.

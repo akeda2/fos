@@ -345,6 +345,33 @@ pub fn install_kernel_update(info: &BootInfo, slot: u8, data: &[u8]) -> Result<(
 /// `crash_count` above (persisted on disk, not here) is the loop-guard's
 /// actual safety net either way.
 pub const CRASH_RECORD_ADDR: usize = 0x5500;
+
+/// Where [`crumb`] leaves its last progress marker: a hang that resets the machine
+/// (the watchdog, or a triple fault) otherwise leaves nothing to say where it was,
+/// and a driver being brought up on real hardware has no other way to tell.
+/// `debug crumb` prints it on the next boot (RAM survives a reset on every
+/// machine but the AMD/nForce one).
+pub const CRUMB_ADDR: usize = 0x5600;
+const CRUMB_MAGIC: u32 = 0x4352_4d42; // "BMRC"
+
+/// Records "I got this far": a code of the caller's choosing and the tick count.
+pub fn crumb(code: u32) {
+    unsafe {
+        let words = CRUMB_ADDR as *mut u32;
+        words.write_volatile(CRUMB_MAGIC);
+        words.add(1).write_volatile(code);
+        words.add(2).write_volatile(crate::interrupts::ticks() as u32);
+    }
+}
+
+/// The last marker `crumb` left (this boot's or, if nothing has been written
+/// yet, the previous boot's): `(code, tick)`.
+pub fn last_crumb() -> Option<(u32, u32)> {
+    unsafe {
+        let words = CRUMB_ADDR as *const u32;
+        (words.read_volatile() == CRUMB_MAGIC).then(|| (words.add(1).read_volatile(), words.add(2).read_volatile()))
+    }
+}
 const CRASH_RECORD_MAGIC: u32 = 0x4841_5343; // "CSAH" read little-endian as bytes b"CSAH"
 const CRASH_RECORD_VERSION: u16 = 1;
 
