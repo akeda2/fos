@@ -666,7 +666,7 @@ fn execute(command: &str) {
             for index in 0..nic_count() {
                 if let Some(nic) = nic_at(index) {
                     crate::println!("{}: e1000 {}  {}{}", index + 1, Mac(&nic.mac), if nic.link_up() { "link up" } else { "link DOWN" }, if unsafe { SESSION_NIC } == index && session_open() { "  (terminal)" } else { "" });
-                    crate::println!("   frames: {} received, {} sent", nic.frames_received, nic.frames_sent);
+                    crate::println!("   frames: {} received, {} sent{}", nic.frames_received, nic.frames_sent, if nic.frames_dropped_no_link != 0 { " (some dropped: no link)" } else { "" });
                     // v1's `nic` reported "NIC IRQn: N notifications"; keep that line (tools grep for it).
                     if let crate::e1000::Delivery::Msi(v) | crate::e1000::Delivery::Msix(v) | crate::e1000::Delivery::Intx { vector: v, .. } = nic.delivery {
                         crate::println!("   NIC IRQ{v}: {} notifications", crate::e1000::ISR[index].interrupts.load(core::sync::atomic::Ordering::Relaxed));

@@ -1596,7 +1596,7 @@ fn poll_dhcp_renewals(
                 } else {
                     print_bytes(putc, b"DHCP acquisition failed on NIC ");
                 }
-                print_u32(putc, nic);
+                print_u32(putc, nic + 1);
                 print_bytes(putc, b"; restarting acquisition.\n");
             }
             dhcp_clients[index] = Some(fresh_dhcp_client(own_mac, ticks));
@@ -1613,7 +1613,7 @@ fn poll_dhcp_renewals(
         {
             if !quiet {
                 print_bytes(putc, b"DHCP lease renewed on NIC ");
-                print_u32(putc, nic);
+                print_u32(putc, nic + 1);
                 print_bytes(putc, b": ");
                 print_ip(putc, lease.address);
                 print_bytes(putc, b"/");
@@ -1636,6 +1636,16 @@ fn poll_dhcp_renewals(
                 .find(|uplink| uplink.interface == index)
             && uplink.gateway != lease.router
         {
+            // An uplink whose lease arrived after startup (no server answered inside the boot
+            // budget, or the cable was moved) starts with no gateway and is marked unhealthy,
+            // and nothing promotes it when a gateway shows up unless `health ADDR` probing is
+            // configured: the router then kept "no healthy DHCP lease" and forwarded nothing.
+            // Treat a first-learned gateway like a gateway known at boot (healthy); probing,
+            // if configured, corrects it within a few cycles.
+            if uplink.gateway == Ipv4Address::UNSPECIFIED {
+                uplink.healthy = true;
+                uplink.misses = 0;
+            }
             uplink.gateway = lease.router;
             changed = true;
         }

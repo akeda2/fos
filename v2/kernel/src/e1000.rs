@@ -244,6 +244,8 @@ pub struct E1000 {
     tx_next: usize,
     pub frames_received: u64,
     pub frames_sent: u64,
+    /// Frames "sent" while the link was down (lost, as on an unplugged cable).
+    pub frames_dropped_no_link: u64,
 }
 
 #[derive(Debug)]
@@ -468,7 +470,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, tx_next: 0, frames_received: 0, frames_sent: 0 })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0 })
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -508,6 +510,14 @@ impl E1000 {
     pub fn send(&mut self, frame: &[u8]) -> bool {
         if frame.len() > MAX_FRAME {
             return false;
+        }
+        // No link: the card will not transmit and the descriptor would never complete, so a
+        // sender would wait out its timeout and report a hardware failure. A cable that is not
+        // plugged in just loses the frame; do the same, so protocol code (a router starting
+        // with a dead uplink, say) keeps working and retries as it would on a real wire.
+        if !self.link_up() {
+            self.frames_dropped_no_link += 1;
+            return true;
         }
         let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
         let mut waited = 0u32;
