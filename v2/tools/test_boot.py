@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Boots the v2 image under QEMU + OVMF and checks the whole chain (milestones M0
-and M1): the loader narrates the firmware and finds the payload partition, reads
+"""Boots the v2 image under QEMU + OVMF and checks the whole chain (milestones M0,
+M1 and M2): the loader narrates the firmware and finds the payload partition, reads
 the kernel from its A/B slot, loads it as a position-independent ELF and leaves the
 firmware; the 64-bit kernel then reports its state over serial, and draws on the
 framebuffer, which the test verifies from a QEMU screendump (three colour bars
-drawn in logical red, green and blue, so a wrong pixel format would show).
+drawn in logical red, green and blue, so a wrong pixel format would show). M2 adds
+the physical allocator, the kernel's own page tables, the IDT, the local APIC timer
+(checked against the independent ACPI PM timer) and a clean power-off, which the
+test requires: QEMU must exit by itself.
 
 OVMF mirrors the firmware console to the serial port, so loader and kernel
 narration arrive on the same `-serial` stream (escape sequences stripped before
@@ -28,7 +31,7 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
                    "/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd"]
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
-FINAL_MARKER = "M1 complete"
+FINAL_MARKER = "M2 complete"
 
 
 def find(variable, candidates):
@@ -99,7 +102,7 @@ def main():
                 ready, _, _ = select.select([process.stdout], [], [], 0.2)
                 if ready:
                     raw.extend(os.read(process.stdout.fileno(), 4096))
-            time.sleep(0.5)
+            time.sleep(0.3)
             text = clean(bytes(raw))
             monitor(monitor_path, f"screendump {shot}")
             for _ in range(50):
@@ -108,6 +111,14 @@ def main():
                 time.sleep(0.1)
             time.sleep(0.3)
             width, height, pixel = read_ppm(shot) if shot.exists() else (0, 0, None)
+            # The kernel powers the machine off a couple of seconds after its last line.
+            exit_deadline = time.monotonic() + 20
+            while process.poll() is None and time.monotonic() < exit_deadline:
+                ready, _, _ = select.select([process.stdout], [], [], 0.2)
+                if ready:
+                    raw.extend(os.read(process.stdout.fileno(), 4096))
+            exited_by_itself = process.poll() == 0
+            text = clean(bytes(raw))
         finally:
             process.terminate()
             try:
@@ -131,13 +142,20 @@ def main():
     check("Exiting boot services" in text, "and exits boot services", text)
 
     # --- the kernel (M1) ---
-    check("FOS v2 kernel (milestone M1): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
+    check("FOS v2 kernel (milestone M2): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
     check(re.search(r"BootInfo: version 4, kernel at " + kernel.group(1), text) is not None, "BootInfo arrives intact and names the same load address", text)
-    check(re.search(r"Memory map: \d+ entries, \d+ MiB of conventional", text) is not None, "the kernel reads the memory map", text)
-    check("EFER" in text and "LME 1, LMA 1" in text, "EFER confirms long mode is active", text)
-    check("GDT loaded: kernel code selector 0x8, data 0x10." in text, "the kernel installs its own GDT", text)
-    check(re.search(r"Paging: identity map of \d+ MiB RAM", text) is not None, "and its own identity-mapped page tables", text)
-    check(re.search(r"Framebuffer console ready: \d+ columns x \d+ rows", text) is not None, "the framebuffer console comes up", text)
+    managed = re.search(r"Physical memory: (\d+) MiB managed, (\d+) MiB free", text)
+    check(managed is not None and 400 < int(managed.group(1)) <= 512 and int(managed.group(2)) > 300, f"the physical allocator manages the machine's RAM ({managed and managed.groups()} MiB)", text)
+    check("Allocator self-test: ok" in text, "the allocator's bookkeeping, contiguity and below-4-GiB promises hold", text)
+    check("GDT + TSS loaded" in text and "IDT loaded: 256 gates" in text, "the kernel installs its own GDT, TSS and IDT", text)
+    check("NX and write-protect on" in text and "stack guard pages unmapped" in text, "and its own page tables with NX, read-only text and guard pages", text)
+    check(re.search(r"Framebuffer console ready: \d+ columns x \d+ rows, mapped (write-combining|uncached)", text) is not None, "the framebuffer console comes up", text)
+    check(re.search(r"ACPI 2\.0\+: PM timer at port 0x[0-9a-f]+ \(\d+-bit\), local APIC at 0x[0-9a-f]+", text) is not None, "the kernel reads the ACPI FADT and MADT", text)
+    check("ticking at 100 Hz" in text, "the local APIC timer is calibrated and running", text)
+    check("1 breakpoint(s) delivered and handled" in text, "a breakpoint exception is delivered and handled", text)
+    milliseconds = re.search(r"100 ticks took (\d+) ms by the PM timer", text)
+    check(milliseconds is not None and 900 <= int(milliseconds.group(1)) <= 1100, f"100 timer ticks take about a second by the independent PM timer ({milliseconds and milliseconds.group(1)} ms)", text)
+    check(exited_by_itself, "the machine powers itself off through the UEFI runtime services", text)
 
     # --- the framebuffer, as QEMU displays it ---
     check(pixel is not None and width >= 640, f"QEMU produced a screendump ({width}x{height})", text)
@@ -148,7 +166,7 @@ def main():
     check(pixel(width - 10, height // 2) == (0, 0, 0x20), f"the background fill is the console colour {pixel(width - 10, height // 2)}", text)
     lit = sum(1 for y in range(0, 16 * 12) for x in range(0, 8 * 60) if pixel(x, y) == (0xc0, 0xc0, 0xc0))
     check(lit > 400, f"text is drawn on screen ({lit} foreground pixels in the first rows)", text)
-    print("v2 boot (M0+M1): all checks passed")
+    print("v2 boot (M0-M2): all checks passed")
 
 
 if __name__ == "__main__":

@@ -270,7 +270,7 @@ debug/watchdog/crash-record machinery, `devloop`.
 | --- | --- | --- |
 | M0 (done) | Loader skeleton | OVMF boots `BOOTX64.EFI`; it narrates to serial + firmware console, prints the memory map, GOP mode and RSDP. QEMU smoke test. |
 | M1 (done) | Kernel hello | Loader loads an ELF64 kernel from a raw slot and exits boot services; kernel switches to its own GDT/page tables and prints through serial + framebuffer. |
-| M2 | Memory and interrupts | Physical allocator, identity map with NX/guard pages, IDT, LAPIC timer tick, faults reported legibly. |
+| M2 (done) | Memory and interrupts | Physical allocator, identity map with NX/guard pages, IDT, LAPIC timer tick, faults reported legibly. |
 | M3 | Shell and network | PCI scan, one NIC (e1000 under QEMU), `term net` session working from boot. This is the first point `devloop` can drive v2. |
 | M3b | Local keyboard | PS/2 (QEMU) and USB HID boot-protocol keyboards (xHCI/EHCI interrupt-IN) deliver keys to the shell prompt; tested in QEMU with `usb-kbd` on `qemu-xhci` and `usb-ehci`; verified on the Skylake once it is reachable. |
 | M4 | Storage | xHCI + AHCI (+ EHCI) native, boot-disk discovery by GUID, FOSFS read/write, `start`/`hostname`/`debug` honoured. |

@@ -14,3 +14,12 @@ opt-level = "z"
 
 [dependencies]
 fos-v2-abi = { path = "../abi" }
+
+# Deliberate-fault builds for the exception tests (make test-v2-faults): each one
+# provokes one kind of fault right after boot so the report can be checked.
+[features]
+fault-null = []
+fault-text-write = []
+fault-nx = []
+fault-stack = []
+fault-ud = []

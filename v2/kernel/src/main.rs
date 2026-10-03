@@ -1,25 +1,37 @@
-//! fos v2 kernel, milestone M1: reached from the loader in 64-bit long mode, it
-//! checks what it was handed, installs its own GDT and page tables, brings up the
-//! serial port and a framebuffer text console, and says so.
+//! fos v2 kernel, milestone M2: memory and interrupts.
 //!
-//! The interesting part is what is *not* here: no real-mode trampoline, no 640 KiB
-//! budget, no BIOS. The CPU is already in long mode with paging on when the first
-//! instruction runs (the firmware did that), so the work is replacing the
-//! firmware's state with the kernel's own. Later milestones add the physical
-//! allocator, interrupts, PCI and the rest (docs/v2-design.md, section 11).
+//! On top of M1 (loader handoff, own GDT, serial and framebuffer console) the kernel
+//! now owns the machine's memory and its interrupts:
+//!
+//! * a physical page allocator built from the firmware's memory map;
+//! * its own page tables with NX, read-only text and unmapped guard pages;
+//! * a TSS-backed IDT, so a fault is reported in words (and a stack overflow, which
+//!   takes down the normal stack, still gets a clean report on a stack of its own);
+//! * ACPI tables, the local APIC and a calibrated 100 Hz timer tick;
+//! * a clean power-off through the UEFI runtime services.
+//!
+//! See docs/v2-design.md, section 11.
 #![no_std]
 #![no_main]
 
+mod acpi;
+mod apic;
+mod cpu;
+mod fault;
 mod font_data;
 mod framebuffer;
 mod gdt;
+mod idt;
 mod log;
+mod memory;
 mod paging;
+mod power;
 mod serial;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use fos_v2_abi::{BootInfo, PIXEL_RGB, TYPE_CONVENTIONAL};
+use fault::Frame;
+use fos_v2_abi::{BootInfo, PIXEL_RGB};
 
 core::arch::global_asm!(
     r#"
@@ -35,9 +47,10 @@ core::arch::global_asm!(
         jmp 2b
     "#
 );
+core::arch::global_asm!(include_str!("isr_stubs.S"));
 
-/// `println!` goes to the serial port and, once it exists, the framebuffer.
-fn print(arguments: core::fmt::Arguments) {
+/// `println!` goes to the serial port, the boot log and, once it exists, the framebuffer.
+pub fn print(arguments: core::fmt::Arguments) {
     struct Both;
     impl Write for Both {
         fn write_str(&mut self, text: &str) -> core::fmt::Result {
@@ -50,76 +63,92 @@ fn print(arguments: core::fmt::Arguments) {
     let _ = Both.write_fmt(arguments);
 }
 
+#[macro_export]
 macro_rules! println {
-    () => { print(format_args!("\n")) };
-    ($($argument:tt)*) => { print(format_args!("{}\n", format_args!($($argument)*))) };
+    () => { $crate::print(format_args!("\n")) };
+    ($($argument:tt)*) => { $crate::print(format_args!("{}\n", format_args!($($argument)*))) };
+}
+
+static BREAKPOINTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Every interrupt and exception arrives here, from `isr_common` (isr_stubs.S).
+#[unsafe(no_mangle)]
+extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
+    match frame.vector {
+        3 => {
+            BREAKPOINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            println!("Breakpoint exception at {:#x}: handled, execution continues.", frame.rip);
+        }
+        v if v == u64::from(apic::TIMER_VECTOR) => apic::tick(),
+        v if v == u64::from(apic::SPURIOUS_VECTOR) => {} // a spurious interrupt needs no EOI
+        v if v < 32 => fault::fatal(frame),
+        v => println!("Unexpected interrupt vector {v}."),
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("FOS v2 kernel (milestone M1): running in 64-bit long mode.");
+    println!("FOS v2 kernel (milestone M2): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
         println!("BootInfo is not valid (magic {:#x}, version {}): stopping.", info.magic, info.version);
-        halt();
+        cpu::halt();
     }
-    println!(
-        "BootInfo: version {}, kernel at {:#x} ({} KiB), booted from slot {}.",
-        info.version,
-        info.kernel_base,
-        info.kernel_size / 1024,
-        info.boot_slot
-    );
-
-    let (mut conventional, mut total_entries) = (0u64, 0);
-    for descriptor in info.memory_descriptors() {
-        total_entries += 1;
-        if descriptor.kind == TYPE_CONVENTIONAL {
-            conventional += descriptor.pages;
-        }
-    }
-    println!("Memory map: {total_entries} entries, {} MiB of conventional (free) RAM.", conventional / 256);
+    println!("BootInfo: version {}, kernel at {:#x} ({} KiB), booted from slot {}.", info.version, info.kernel_base, info.kernel_size / 1024, info.boot_slot);
     let fb = &info.framebuffer;
     println!(
-        "Framebuffer: {}x{} {} at {:#x}, {} pixels per line.",
+        "Framebuffer: {}x{} {} at {:#x}. ACPI RSDP at {:#x}.",
         fb.width,
         fb.height,
         if fb.format == PIXEL_RGB { "RGB" } else { "BGR" },
         fb.base,
-        fb.stride
-    );
-    println!("ACPI RSDP at {:#x}; UEFI runtime services at {:#x}.", info.acpi_rsdp, info.runtime_services);
-
-    println!(
-        "CPU state from the firmware: CR0 {:#x}, CR4 {:#x}, EFER {:#x} (LME {}, LMA {}).",
-        paging::read_cr0(),
-        paging::read_cr4(),
-        paging::read_efer(),
-        (paging::read_efer() >> 8) & 1,
-        (paging::read_efer() >> 10) & 1
+        info.acpi_rsdp
     );
 
-    gdt::load();
-    println!("GDT loaded: kernel code selector {:#x}, data {:#x}.", gdt::KERNEL_CODE, gdt::KERNEL_DATA);
+    // ---- physical memory ----
+    let map_bytes = info.memory_map_count * info.memory_map_descriptor_size;
+    memory::init(
+        info,
+        &[
+            (info.kernel_base, info.kernel_size),
+            (info as *const BootInfo as u64, 4096),
+            (info.memory_map, map_bytes),
+            (info.acpi_rsdp & !0xfff, 8192),
+        ],
+    );
+    let stats = memory::stats();
+    println!("Physical memory: {} MiB managed, {} MiB free (one bitmap, one pool).", stats.frames * memory::FRAME / (1024 * 1024), stats.free * memory::FRAME / (1024 * 1024));
+    self_test_allocator();
 
-    let report = paging::build_and_load(info, fb);
+    // ---- descriptor tables, then page tables ----
+    let layout = paging::layout();
+    let double_fault_stack_top = unsafe {
+        unsafe extern "C" {
+            static __ist_top: u8;
+        }
+        core::ptr::addr_of!(__ist_top) as u64
+    };
+    gdt::load(double_fault_stack_top);
+    idt::load();
+    println!("GDT + TSS loaded (double-fault stack at {:#x}); IDT loaded: 256 gates.", double_fault_stack_top);
+    paging::build_and_load(info, fb);
     println!(
-        "Paging: identity map of {} MiB RAM in 2 MiB pages (+{} skipped above 64 GiB), CR3 = {:#x}.",
-        report.ram_pages * 2,
-        report.skipped,
-        report.cr3
+        "Paging: own page tables at {:#x}; NX and write-protect on; text {:#x}-{:#x} read+execute, rodata read-only, data/bss/stacks no-execute; page 0 and stack guard pages unmapped.",
+        paging::root(),
+        layout.text.0,
+        layout.text.1
     );
 
     if framebuffer::init(fb) {
-        // Everything printed so far went to the serial port only: replay it.
         framebuffer::write_str(log::contents());
         let (columns, rows) = framebuffer::size().unwrap_or((0, 0));
-        println!("Framebuffer console ready: {columns} columns x {rows} rows.");
-        // Three colour bars in logical RGB, whatever the framebuffer's byte order:
-        // if the format handling is right they look red, green and blue.
+        println!(
+            "Framebuffer console ready: {columns} columns x {rows} rows, mapped {}.",
+            if paging::write_combining_enabled() { "write-combining" } else { "uncached" }
+        );
         framebuffer::fill_rect(0, fb.height as usize - 48, 64, 32, 255, 0, 0);
         framebuffer::fill_rect(80, fb.height as usize - 48, 64, 32, 0, 255, 0);
         framebuffer::fill_rect(160, fb.height as usize - 48, 64, 32, 0, 0, 255);
@@ -127,18 +156,138 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         println!("No framebuffer: serial console only.");
     }
 
-    println!("FOS v2 kernel: M1 complete. Halting.");
-    halt()
+    // ---- ACPI, interrupts and the clock ----
+    let tables = acpi::open(info.acpi_rsdp);
+    let (fadt, madt) = match &tables {
+        Some(tables) => (acpi::fadt(tables), acpi::madt(tables)),
+        None => (None, None),
+    };
+    match (&tables, &fadt, &madt) {
+        (Some(tables), Some(fadt), Some(madt)) => {
+            println!(
+                "ACPI {}: PM timer at port {:#x} ({}-bit), local APIC at {:#x}, {} processor(s), {} I/O APIC(s).",
+                if tables.revision >= 2 { "2.0+" } else { "1.0" },
+                fadt.pm_timer_port,
+                if fadt.pm_timer_32_bit { 32 } else { 24 },
+                madt.local_apic_address,
+                madt.processors,
+                madt.io_apics
+            );
+        }
+        _ => println!("ACPI: FADT/MADT not found; no timer tick."),
+    }
+
+    if let (Some(fadt), Some(madt)) = (&fadt, &madt) {
+        match apic::start_timer(fadt, madt.local_apic_address) {
+            Some(report) => {
+                println!(
+                    "Local APIC ({} mode) at {:#x}; timer clock {} MHz, ticking at {} Hz on vector {:#x}.",
+                    if report.x2apic { "x2APIC" } else { "xAPIC" },
+                    report.base,
+                    report.timer_hz / 1_000_000,
+                    apic::TICK_HZ,
+                    apic::TIMER_VECTOR
+                );
+                cpu::interrupts_enable();
+                self_test_interrupts(fadt);
+            }
+            None => println!("No usable local APIC or PM timer: no clock tick."),
+        }
+    }
+
+    provoke_fault_if_requested();
+
+    println!("FOS v2 kernel: M2 complete. Powering off in two seconds.");
+    // Linger briefly (on the timer tick, if there is one) so a screen or a test can
+    // look at the final state before the machine goes away.
+    if apic::ticks() > 0 {
+        let until = apic::ticks() + 2 * apic::TICK_HZ;
+        while apic::ticks() < until {
+            unsafe { core::arch::asm!("hlt") };
+        }
+    }
+    power::shutdown(info.runtime_services);
+    println!("Shutdown returned: halting.");
+    cpu::halt()
 }
 
-fn halt() -> ! {
-    loop {
+/// Allocates and frees frames, checking the bookkeeping and the contiguity and
+/// address-limit promises.
+fn self_test_allocator() {
+    let before = memory::stats().free;
+    let single = memory::allocate().expect("one frame");
+    let run = memory::allocate_contiguous(8, None).expect("eight contiguous frames");
+    let low = memory::allocate_contiguous(4, Some(1 << 32)).expect("four frames below 4 GiB");
+    let zeroed = (0..(8 * memory::FRAME / 8)).all(|index| unsafe { (run as *const u64).add(index as usize).read() == 0 });
+    let after_allocation = memory::stats().free;
+    memory::free(single, 1);
+    memory::free(run, 8);
+    memory::free(low, 4);
+    let after_free = memory::stats().free;
+    let ok = zeroed && low + 4 * memory::FRAME <= (1 << 32) && before - after_allocation == 13 && after_free == before;
+    println!(
+        "Allocator self-test: {} (13 frames out and back, contiguous run zeroed, low frames below 4 GiB).",
+        if ok { "ok" } else { "FAILED" }
+    );
+}
+
+/// Takes a breakpoint (a handled exception) and measures the timer tick against the
+/// ACPI PM timer, which is an independent clock.
+fn self_test_interrupts(fadt: &acpi::Fadt) {
+    unsafe { core::arch::asm!("int3") };
+    println!("Exception self-test: {} breakpoint(s) delivered and handled.", BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed));
+
+    let start_ticks = apic::ticks();
+    let mask: u64 = if fadt.pm_timer_32_bit { 0xffff_ffff } else { 0x00ff_ffff };
+    let pm_start = u64::from(cpu::inl(fadt.pm_timer_port)) & mask;
+    while apic::ticks() - start_ticks < 100 {
         unsafe { core::arch::asm!("hlt") };
+    }
+    let pm_elapsed = (u64::from(cpu::inl(fadt.pm_timer_port)) & mask).wrapping_sub(pm_start) & mask;
+    let milliseconds = pm_elapsed * 1000 / 3_579_545;
+    println!("Timer self-test: 100 ticks took {milliseconds} ms by the PM timer (expected about 1000).");
+}
+
+/// The deliberate-fault builds (see Cargo.toml `[features]`): provoke one fault so the
+/// exception report can be checked.
+fn provoke_fault_if_requested() {
+    #[cfg(feature = "fault-null")]
+    unsafe {
+        println!("Provoking a fault: reading the null page.");
+        core::ptr::read_volatile(0x10 as *const u64);
+    }
+    #[cfg(feature = "fault-text-write")]
+    unsafe {
+        println!("Provoking a fault: writing to kernel code.");
+        (paging::layout().text.0 as *mut u8).write_volatile(0);
+    }
+    #[cfg(feature = "fault-nx")]
+    unsafe {
+        println!("Provoking a fault: executing from a data page.");
+        static mut CODE: [u8; 16] = [0xc3; 16];
+        let function: extern "C" fn() = core::mem::transmute(core::ptr::addr_of!(CODE) as usize);
+        function();
+    }
+    #[cfg(feature = "fault-ud")]
+    unsafe {
+        println!("Provoking a fault: an invalid opcode.");
+        core::arch::asm!("ud2");
+    }
+    #[cfg(feature = "fault-stack")]
+    {
+        println!("Provoking a fault: unbounded recursion (kernel stack overflow).");
+        #[inline(never)]
+        fn recurse(depth: u64) -> u64 {
+            let padding = [depth; 64];
+            let below = recurse(depth + 1);
+            below + core::hint::black_box(padding)[3]
+        }
+        core::hint::black_box(recurse(0));
     }
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("\nFOS v2 kernel PANIC: {info}");
-    halt()
+    cpu::halt()
 }
