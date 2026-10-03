@@ -120,7 +120,8 @@ def cmd_wait(machine: Machine, args) -> int:
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         out = machine.term(["uptime"], command_timeout=5, timeout=40)
-        match = re.search(r"Uptime: ([\d.]+) seconds", out)
+        # v1 prints "Uptime: N seconds", v2 "N ticks at 100 Hz (S s)".
+        match = re.search(r"Uptime: ([\d.]+) seconds", out) or re.search(r"ticks at 100 Hz \((\d+) s\)", out)
         if match:
             print(f"up (uptime {match.group(1)} s)")
             return 0
