@@ -277,18 +277,20 @@ impl Controller {
         }
         write32(operational + OP_USBINTR, 0); // polling only
 
-        let frame = memory::allocate_contiguous(1, Some(1 << 32)).ok_or(Error::NoMemory)? as usize;
+        // Low memory (below 256 MiB), like v1: the first real EHCI (a Sandy Bridge PCH) halted with a host
+        // system error on a frame near 3 GiB; the cause is not understood, so stay where v1 worked.
+        let frame = memory::allocate_contiguous(1, Some(256 << 20)).ok_or(Error::NoMemory)? as usize;
         if hccparams & 1 != 0 {
             write32(operational + OP_CTRLDSSEGMENT, 0); // 64-bit capable: all our DMA memory is below 4 GiB
         }
-        // The async list: control QH -> keyboard QHs -> back to the control QH, which is
-        // the head of the reclamation list (H bit). Keyboard QHs start idle: no qTD, not active.
+        // The async list starts as the control QH alone, pointing at itself and marked head of the
+        // reclamation list (H bit). Keyboard QHs are linked in only when a keyboard is added
+        // (`relink`), so the controller never walks an empty one; real silicon is stricter than QEMU.
         let qh_at = |index: usize| (frame + if index == 0 { OFFSET_CONTROL_QH } else { OFFSET_KEYBOARD_QH + (index - 1) * 0x40 }) as u32;
         for index in 0..=MAX_KEYBOARDS {
             let words = qh_at(index) as *mut u32;
-            let next = qh_at((index + 1) % (MAX_KEYBOARDS + 1));
             unsafe {
-                words.write_volatile(next | LINK_QH);
+                words.write_volatile(qh_at(0) | LINK_QH);
                 words.add(1).write_volatile(if index == 0 { 1 << 15 } else { 0 });
                 words.add(2).write_volatile(1 << 30);
                 words.add(4).write_volatile(TERMINATE);
@@ -646,11 +648,27 @@ impl Controller {
         self.frame + OFFSET_KEYBOARD_BUFFER + index * 0x20
     }
 
+    /// Rebuilds the async list: control QH, then every keyboard QH in use, back to the control QH.
+    /// The schedule is switched off while the links change.
+    fn relink(&mut self) {
+        self.set_async(false);
+        let mut previous = self.frame + OFFSET_CONTROL_QH;
+        for index in 0..MAX_KEYBOARDS {
+            if self.keyboards[index].is_some() {
+                let qh = self.keyboard_qh(index);
+                unsafe { (previous as *mut u32).write_volatile(qh as u32 | LINK_QH) };
+                previous = qh;
+            }
+        }
+        unsafe { (previous as *mut u32).write_volatile((self.frame + OFFSET_CONTROL_QH) as u32 | LINK_QH) };
+    }
+
     /// Dedicates a queue head to a keyboard's interrupt-IN endpoint and arms it.
     /// Returns the keyboard's index on this controller.
     pub fn add_keyboard(&mut self, target: Target, endpoint: u8, max_packet: u16) -> Result<usize, Error> {
         let index = self.keyboards.iter().position(Option::is_none).ok_or(Error::Unsupported)?;
         self.keyboards[index] = Some(KeyboardPipe { target, endpoint, max_packet, toggle: false });
+        self.relink();
         unsafe {
             let words = self.keyboard_qh(index) as *mut u32;
             words.add(1).write_volatile(qh_characteristics(&target, endpoint, max_packet, false, false));

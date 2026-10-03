@@ -15,22 +15,57 @@ pub fn runtime_services() -> u64 {
     unsafe { RUNTIME_SERVICES }
 }
 
-/// Resets the machine: the UEFI `ResetSystem(EfiResetWarm)` if available, else the 8042
-/// keyboard controller's CPU-reset line. Does not return.
+static mut ACPI_RESET: Option<(u8, u64, u8)> = None;
+static mut RESET_ATTEMPTED: u8 = 0;
+
+/// Remembers the FADT's reset register for `reset`.
+pub fn set_acpi_reset(register: Option<(u8, u64, u8)>) {
+    unsafe { ACPI_RESET = register };
+}
+
+/// Resets the machine, trying in order the ways that need nothing from the firmware: the ACPI
+/// reset register (if the FADT has one), the PCI reset control port 0xCF9 (a hard reset: the
+/// CPU and chipset restart, DRAM keeps its contents, so the crash record survives), the 8042
+/// keyboard controller's reset line, and only then the UEFI `ResetSystem(EfiResetWarm)`.
+/// The firmware call goes last because on the Skylake it page-faulted inside the firmware (a
+/// runtime region the kernel does not map?), and a fault while handling a fault is no way to
+/// leave. Does not return.
 pub fn reset(runtime_services: u64) -> ! {
     cpu::interrupts_disable();
-    if runtime_services != 0 {
-        let reset_system = unsafe { ((runtime_services + 24 + 10 * 8) as *const u64).read_unaligned() };
-        if reset_system != 0 {
-            let call: extern "efiapi" fn(kind: u32, status: usize, size: usize, data: *const u8) -> ! =
-                unsafe { core::mem::transmute(reset_system as usize) };
-            // EfiResetWarm (1): on a PC the firmware usually implements it as a CPU reset
-            // that skips memory training, which is what lets the crash record in RAM
-            // survive. A firmware without warm reset treats it as a cold one.
-            call(1, 0, 0, core::ptr::null())
+    unsafe {
+        // Each method gets one try; a method that did not reset the machine falls through to the next.
+        if RESET_ATTEMPTED == 0 {
+            RESET_ATTEMPTED = 1;
+            if let Some((space, address, value)) = ACPI_RESET {
+                match space {
+                    1 => cpu::outb(address as u16, value),
+                    0 if crate::paging::is_mapped(address) => (address as *mut u8).write_volatile(value),
+                    _ => {}
+                }
+                crate::apic::busy_wait_ms(50);
+            }
+        }
+        if RESET_ATTEMPTED == 1 {
+            RESET_ATTEMPTED = 2;
+            cpu::outb(0xcf9, 0x02);
+            crate::apic::busy_wait_ms(5);
+            cpu::outb(0xcf9, 0x06);
+            crate::apic::busy_wait_ms(50);
+        }
+        if RESET_ATTEMPTED == 2 {
+            RESET_ATTEMPTED = 3;
+            cpu::outb(0x64, 0xfe);
+            crate::apic::busy_wait_ms(50);
+        }
+        if RESET_ATTEMPTED == 3 && runtime_services != 0 {
+            RESET_ATTEMPTED = 4;
+            let reset_system = ((runtime_services + 24 + 10 * 8) as *const u64).read_unaligned();
+            if reset_system != 0 {
+                let call: extern "efiapi" fn(kind: u32, status: usize, size: usize, data: *const u8) -> ! = core::mem::transmute(reset_system as usize);
+                call(1, 0, 0, core::ptr::null())
+            }
         }
     }
-    cpu::outb(0x64, 0xfe);
     cpu::halt()
 }
 

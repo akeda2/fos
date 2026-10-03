@@ -209,6 +209,9 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         _ => println!("ACPI: FADT/MADT not found; no timer tick."),
     }
 
+    if let Some(fadt) = &fadt {
+        power::set_acpi_reset(fadt.reset);
+    }
     if let (Some(fadt), Some(madt)) = (&fadt, &madt) {
         match apic::start_timer(fadt, madt.local_apic_address) {
             Some(report) => {

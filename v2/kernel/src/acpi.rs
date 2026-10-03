@@ -70,6 +70,9 @@ pub struct Fadt {
     pub pm_timer_32_bit: bool,
     pub pm1a_control: u16,
     pub sci_interrupt: u16,
+    /// The ACPI reset register (if the FADT advertises one): address space (1 = system I/O,
+    /// 0 = memory), address, and the value to write.
+    pub reset: Option<(u8, u64, u8)>,
 }
 
 pub fn fadt(tables: &Tables) -> Option<Fadt> {
@@ -80,6 +83,7 @@ pub fn fadt(tables: &Tables) -> Option<Fadt> {
         pm_timer_32_bit: flags & (1 << 8) != 0,
         pm1a_control: read_u32(table + 64) as u16,
         sci_interrupt: read_u16(table + 46),
+        reset: (flags & (1 << 10) != 0 && read_u64(table + 120) != 0).then(|| (read_u8(table + 116), read_u64(table + 120), read_u8(table + 128))),
     })
 }
 
