@@ -38,7 +38,7 @@ worth a paragraph), the NIC cabling notes below, a second stick if you want one 
 * SATA mode **AHCI** (v2 does not drive IDE-compat or RAID). The v1 notes mention a SATA disk
   that has to be present to avoid an F1 prompt at POST; leave it as it was.
 * Boot the stick from the one-time boot menu, entry "UEFI: <stick>".
-* USB ports: a root port is the safe choice; hubs on xHCI are supported (`usb_hub.rs`) but have only run in QEMU, not on this machine: back-panel ports
+* USB ports: a root port is the safe choice; hubs on xHCI are supported (`usb_hub.rs`) and confirmed here with a hub plugged in after boot (this machine would not POST with that hub attached; run `usb rescan`): back-panel ports
   directly on the board are root ports. The stick and a keyboard both need ports; the
   keyboard also must not be behind a hub. Skylake has xHCI only, which v2 drives.
 
