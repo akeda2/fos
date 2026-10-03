@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Boots the v2 image under QEMU + OVMF and checks the whole chain (milestones M0,
-M1 and M2): the loader narrates the firmware and finds the payload partition, reads
+M1, M2 and M3): the loader narrates the firmware and finds the payload partition, reads
 the kernel from its A/B slot, loads it as a position-independent ELF and leaves the
 firmware; the 64-bit kernel then reports its state over serial, and draws on the
 framebuffer, which the test verifies from a QEMU screendump (three colour bars
 drawn in logical red, green and blue, so a wrong pixel format would show). M2 adds
 the physical allocator, the kernel's own page tables, the IDT, the local APIC timer
 (checked against the independent ACPI PM timer) and a clean power-off, which the
-test requires: QEMU must exit by itself.
+test requires: QEMU must exit by itself. M3 adds PCI, the e1000 driver and the
+network terminal: the test joins the guest's QEMU multicast network, discovers it,
+opens a `term net` session (the v1 wire protocol), runs shell commands and finally
+sends `shutdown` over the wire.
 
 OVMF mirrors the firmware console to the serial port, so loader and kernel
 narration arrive on the same `-serial` stream (escape sequences stripped before
@@ -19,6 +22,7 @@ import re
 import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -31,7 +35,52 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
                    "/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd"]
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
-FINAL_MARKER = "M2 complete"
+FINAL_MARKER = "M3 complete"
+MCAST_GROUP, MCAST_PORT = "230.42.42.44", 4244
+HOST_MAC = bytes.fromhex("02deadbeef03")
+BROADCAST = b"\xff" * 6
+ETHERTYPE = b"\x88\xb6"
+TAG_DISCOVER_REQUEST, TAG_DISCOVER_REPLY, TAG_HELLO, TAG_DATA, TAG_BYE = 0x02, 0x03, 0x20, 0x21, 0x22
+
+
+class Wire:
+    """The host's end of the guest's QEMU `socket,mcast=` network: one raw Ethernet
+    frame per UDP datagram, so no privileges are needed."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", MCAST_PORT))
+        membership = struct.pack("4sl", socket.inet_aton(MCAST_GROUP), socket.INADDR_ANY)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+
+    def send(self, destination, tag, payload=b""):
+        frame = destination + HOST_MAC + ETHERTYPE + bytes([tag]) + payload
+        self.sock.sendto(frame.ljust(60, b"\0"), (MCAST_GROUP, MCAST_PORT))
+
+    def frames(self, timeout):
+        """Yields (source, tag, payload) of fos frames addressed to us or broadcast."""
+        self.sock.settimeout(timeout)
+        try:
+            packet = self.sock.recv(2048)
+        except socket.timeout:
+            return
+        if len(packet) >= 15 and packet[6:12] != HOST_MAC and packet[12:14] == ETHERTYPE and packet[:6] in (HOST_MAC, BROADCAST):
+            yield packet[6:12], packet[14], packet[15:]
+
+    def until(self, marker, timeout, expect_tag=TAG_DATA):
+        """Collects DATA payload until `marker` appears in it; returns it as text."""
+        deadline = time.monotonic() + timeout
+        collected = bytearray()
+        while marker.encode() not in collected:
+            if time.monotonic() > deadline:
+                raise SystemExit(f"FAIL: terminal output never contained {marker!r}; got:\n{collected.decode('utf-8', 'replace')}")
+            for _, tag, payload in self.frames(0.2):
+                if tag == expect_tag:
+                    collected.extend(payload.rstrip(b"\0") if expect_tag != TAG_DATA else payload)
+        return collected.decode("utf-8", "replace")
+
 
 
 def find(variable, candidates):
@@ -91,7 +140,10 @@ def main():
                    "-serial", "stdio", "-monitor", f"unix:{monitor_path},server,nowait", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
                    "-drive", f"if=pflash,format=raw,file={vars_copy}",
-                   "-drive", f"format=raw,file={IMAGE}"]
+                   "-drive", f"format=raw,file={IMAGE}",
+                   "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}",
+                   "-device", "e1000,netdev=net0,mac=52:54:00:12:34:77"]
+        wire = Wire()
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         raw = bytearray()
         deadline = time.monotonic() + 90
@@ -111,7 +163,23 @@ def main():
                 time.sleep(0.1)
             time.sleep(0.3)
             width, height, pixel = read_ppm(shot) if shot.exists() else (0, 0, None)
-            # The kernel powers the machine off a couple of seconds after its last line.
+            # Over the wire: discovery, a terminal session, commands, then shutdown.
+            wire.send(BROADCAST, TAG_DISCOVER_REQUEST, b"host")
+            reply = None
+            for _ in range(30):
+                for source, tag, payload in wire.frames(0.2):
+                    if tag == TAG_DISCOVER_REPLY:
+                        reply = (source, payload.rstrip(b"\0"))
+                if reply:
+                    break
+            guest = reply[0] if reply else None
+            wire.send(guest or BROADCAST, TAG_HELLO)
+            session = wire.until("fos> ", 10)
+            transcript = {}
+            for name in ("help", "memory", "pci", "nic", "uptime"):
+                wire.send(guest, TAG_DATA, name.encode() + b"\n")
+                transcript[name] = wire.until("fos> ", 10)
+            wire.send(guest, TAG_DATA, b"shutdown\n")
             exit_deadline = time.monotonic() + 20
             while process.poll() is None and time.monotonic() < exit_deadline:
                 ready, _, _ = select.select([process.stdout], [], [], 0.2)
@@ -142,7 +210,7 @@ def main():
     check("Exiting boot services" in text, "and exits boot services", text)
 
     # --- the kernel (M1) ---
-    check("FOS v2 kernel (milestone M2): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
+    check("FOS v2 kernel (milestone M3): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
     check(re.search(r"BootInfo: version 4, kernel at " + kernel.group(1), text) is not None, "BootInfo arrives intact and names the same load address", text)
     managed = re.search(r"Physical memory: (\d+) MiB managed, (\d+) MiB free", text)
     check(managed is not None and 400 < int(managed.group(1)) <= 512 and int(managed.group(2)) > 300, f"the physical allocator manages the machine's RAM ({managed and managed.groups()} MiB)", text)
@@ -155,7 +223,16 @@ def main():
     check("1 breakpoint(s) delivered and handled" in text, "a breakpoint exception is delivered and handled", text)
     milliseconds = re.search(r"100 ticks took (\d+) ms by the PM timer", text)
     check(milliseconds is not None and 900 <= int(milliseconds.group(1)) <= 1100, f"100 timer ticks take about a second by the independent PM timer ({milliseconds and milliseconds.group(1)} ms)", text)
-    check(exited_by_itself, "the machine powers itself off through the UEFI runtime services", text)
+    check(re.search(r"PCI: \d+ functions found", text) is not None, "the kernel scans PCI", text)
+    check(re.search(r"e1000 at [0-9a-f:.]+: MAC 52:54:00:12:34:77, link up", text) is not None, "and brings up the e1000 with its link", text)
+    check(reply is not None and reply[1] == b"fos2" and guest == bytes.fromhex("525400123477"), f"a discovery probe over the wire is answered by 'fos2' ({reply})", text)
+    check("Remote terminal connected" in text and "fos> " in session and "type `help`" in session, "a term net session opens (HELLO answered with banner and prompt)", session)
+    check("shutdown" in transcript["help"] and "dmesg" in transcript["help"], "`help` output arrives over the wire in DATA frames", transcript["help"])
+    check(re.search(r"Managed:\s+\d+ MiB", transcript["memory"]) is not None, "`memory` reports the allocator", transcript["memory"])
+    check("8086:100e network controller" in transcript["pci"], "`pci` lists the e1000 among the scanned functions", transcript["pci"])
+    check("link up" in transcript["nic"] and "52:54:00:12:34:77" in transcript["nic"], "`nic` reports the interface", transcript["nic"])
+    check(re.search(r"\d+ ticks at 100 Hz", transcript["uptime"]) is not None, "`uptime` reports the timer", transcript["uptime"])
+    check(exited_by_itself, "`shutdown` over the network powers the machine off through the UEFI runtime services", text)
 
     # --- the framebuffer, as QEMU displays it ---
     check(pixel is not None and width >= 640, f"QEMU produced a screendump ({width}x{height})", text)
@@ -166,7 +243,7 @@ def main():
     check(pixel(width - 10, height // 2) == (0, 0, 0x20), f"the background fill is the console colour {pixel(width - 10, height // 2)}", text)
     lit = sum(1 for y in range(0, 16 * 12) for x in range(0, 8 * 60) if pixel(x, y) == (0xc0, 0xc0, 0xc0))
     check(lit > 400, f"text is drawn on screen ({lit} foreground pixels in the first rows)", text)
-    print("v2 boot (M0-M2): all checks passed")
+    print("v2 boot (M0-M3): all checks passed")
 
 
 if __name__ == "__main__":

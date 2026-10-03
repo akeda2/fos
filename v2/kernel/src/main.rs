@@ -1,4 +1,5 @@
-//! fos v2 kernel, milestone M2: memory and interrupts.
+//! fos v2 kernel, milestone M3: PCI, an e1000 NIC and the network terminal (on top of
+//! M2, memory and interrupts).
 //!
 //! On top of M1 (loader handoff, own GDT, serial and framebuffer console) the kernel
 //! now owns the machine's memory and its interrupts:
@@ -17,6 +18,7 @@
 mod acpi;
 mod apic;
 mod cpu;
+mod e1000;
 mod fault;
 mod font_data;
 mod framebuffer;
@@ -25,8 +27,10 @@ mod idt;
 mod log;
 mod memory;
 mod paging;
+mod pci;
 mod power;
 mod serial;
+mod term;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -57,6 +61,7 @@ pub fn print(arguments: core::fmt::Arguments) {
             let _ = serial::Serial.write_str(text);
             log::push(text);
             framebuffer::write_str(text);
+            term::relay(text);
             Ok(())
         }
     }
@@ -90,7 +95,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("FOS v2 kernel (milestone M2): running in 64-bit long mode.");
+    println!("FOS v2 kernel (milestone M3): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
@@ -197,18 +202,26 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     provoke_fault_if_requested();
 
-    println!("FOS v2 kernel: M2 complete. Powering off in two seconds.");
-    // Linger briefly (on the timer tick, if there is one) so a screen or a test can
-    // look at the final state before the machine goes away.
-    if apic::ticks() > 0 {
-        let until = apic::ticks() + 2 * apic::TICK_HZ;
-        while apic::ticks() < until {
-            unsafe { core::arch::asm!("hlt") };
-        }
+    // ---- PCI and the network ----
+    let count = pci::scan();
+    println!("PCI: {count} functions found (`pci` lists them).");
+    match pci::find(e1000::VENDOR_INTEL, e1000::DEVICE_IDS) {
+        Some(device) => match e1000::E1000::init(&device) {
+            Ok(nic) => {
+                println!("e1000 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, term::Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
+                term::install(nic, info.runtime_services);
+            }
+            Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
+        },
+        None => println!("No supported network interface found (this milestone drives the e1000 only)."),
     }
-    power::shutdown(info.runtime_services);
-    println!("Shutdown returned: halting.");
-    cpu::halt()
+
+    println!("FOS v2 kernel: M3 complete. Waiting for a term net client (hostname {}).", term::HOSTNAME);
+    loop {
+        term::poll();
+        // Sleep until the next timer tick (or a NIC-less machine's only wakeup).
+        unsafe { core::arch::asm!("hlt") };
+    }
 }
 
 /// Allocates and frees frames, checking the bookkeeping and the contiguity and
