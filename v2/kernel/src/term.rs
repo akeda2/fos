@@ -20,6 +20,15 @@ const TAG_HELLO: u8 = 0x20;
 const TAG_DATA: u8 = 0x21;
 const TAG_BYE: u8 = 0x22;
 const DATA_CAPACITY: usize = 1024;
+const TAG_KUP_REQUEST: u8 = 0x3a;
+const TAG_KUP_DATA: u8 = 0x3b;
+const TAG_KUP_STOP: u8 = 0x3c;
+const TAG_KUP_ACK: u8 = 0x3d;
+const TAG_KUP_ERROR: u8 = 0x3e;
+const KUP_TOO_LARGE: u8 = 1;
+const KUP_CHECKSUM_MISMATCH: u8 = 2;
+const KUP_DISK_ERROR: u8 = 3;
+const KUP_BUSY: u8 = 4;
 /// The name announced in discovery replies for interface `index`: `NAME<n>` from the
 /// `hostname` file (n is the one-based interface number, as v1 does), or "fos2" (then
 /// "fos2-2", "fos2-3"... for further interfaces).
@@ -164,6 +173,9 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
                 send(nic, &source, TAG_DISCOVER_REPLY, &name[..length]);
             }
         }
+        TAG_KUP_REQUEST if crate::config::debug().kernel_update => kup_request(index, source, &frame[15..]),
+        TAG_KUP_DATA if crate::config::debug().kernel_update => kup_data(source, &frame[15..]),
+        TAG_KUP_STOP if crate::config::debug().kernel_update => kup_stop(index, source),
         TAG_HELLO if crate::config::deny_term_net() => {} // closed by the settings file: stay silent
         TAG_HELLO => {
             // A new HELLO replaces any earlier session (the old client is gone or
@@ -209,6 +221,127 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
         _ => return false,
     }
     true
+}
+
+// ---- KUP: the network kernel-update service ----
+//
+// Wire format (v1's, so `tools/send_kernel_update.py` works unchanged): REQUEST carries
+// the image length (u32 LE) and its RFC 1071 checksum (u16 LE); DATA carries a sequence
+// number (u32 LE) and up to 1024 bytes; STOP ends the transfer. The image is staged in
+// RAM, verified (length, checksum), and only then written to the *inactive* kernel slot,
+// which becomes the pending slot. The loader's A/B state machine gives it exactly one
+// try; if it never reaches its milestone the machine reverts to the old kernel by
+// itself. Only enabled by the `kernel-update` option in the `debug` file.
+
+struct Kup {
+    active: bool,
+    source: [u8; 6],
+    expected: usize,
+    checksum: u16,
+    received: usize,
+    next_sequence: u32,
+    last_activity: u64,
+}
+
+static mut KUP: Kup = Kup { active: false, source: [0; 6], expected: 0, checksum: 0, received: 0, next_sequence: 0, last_activity: 0 };
+/// Tick at which to reset the machine after an accepted update (0 = none pending).
+static mut RESET_AT: u64 = 0;
+
+fn kup_reply(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) {
+    if let Some(nic) = nic_at(index) {
+        send(nic, destination, tag, payload);
+    }
+}
+
+fn kup_request(index: usize, source: [u8; 6], payload: &[u8]) {
+    let kup = unsafe { &mut *core::ptr::addr_of_mut!(KUP) };
+    // A transfer from someone else that is still alive keeps the staging buffer.
+    if kup.active && kup.source != source && apic::ticks().wrapping_sub(kup.last_activity) < 500 {
+        return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_BUSY]);
+    }
+    if payload.len() < 6 {
+        return;
+    }
+    let expected = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let checksum = u16::from_le_bytes(payload[4..6].try_into().unwrap());
+    if expected == 0 || expected > crate::tape::STAGE_BYTES || expected.div_ceil(512) as u64 > fos_v2_abi::SLOT_SECTORS || crate::tape::staging().is_none() {
+        kup.active = false;
+        return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_TOO_LARGE]);
+    }
+    *kup = Kup { active: true, source, expected, checksum, received: 0, next_sequence: 0, last_activity: apic::ticks() };
+    crate::println!("KUP: receiving a kernel image of {expected} bytes from {}.", Mac(&source));
+}
+
+fn kup_data(source: [u8; 6], payload: &[u8]) {
+    let kup = unsafe { &mut *core::ptr::addr_of_mut!(KUP) };
+    if !kup.active || kup.source != source || payload.len() < 4 {
+        return;
+    }
+    let sequence = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    if sequence != kup.next_sequence {
+        // A gap or a reorder abandons the transfer; there is no retransmission.
+        kup.active = false;
+        return crate::println!("KUP: chunk {sequence} arrived where {} was expected; transfer abandoned.", kup.next_sequence);
+    }
+    let Some(staging) = crate::tape::staging() else { return };
+    // The chunk's size comes from the declared length, never from the (padded) frame.
+    let take = (payload.len() - 4).min(1024).min(kup.expected - kup.received);
+    staging[kup.received..kup.received + take].copy_from_slice(&payload[4..4 + take]);
+    kup.received += take;
+    kup.next_sequence += 1;
+    kup.last_activity = apic::ticks();
+}
+
+fn kup_stop(index: usize, source: [u8; 6]) {
+    let kup = unsafe { &mut *core::ptr::addr_of_mut!(KUP) };
+    if !kup.active || kup.source != source {
+        return;
+    }
+    kup.active = false;
+    let Some(staging) = crate::tape::staging() else { return };
+    if kup.received != kup.expected {
+        return crate::println!("KUP: transfer ended after {} of {} bytes; abandoned.", kup.received, kup.expected);
+    }
+    // Verify before writing anything: a mismatch leaves the running kernel and the slot
+    // metadata completely untouched.
+    if fos_v2_abi::internet_checksum(&staging[..kup.expected]) != kup.checksum {
+        crate::println!("KUP: checksum mismatch; image rejected.");
+        return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_CHECKSUM_MISMATCH]);
+    }
+    let (Some(metadata), Some(disk), Some(payload)) = (crate::debug::read_metadata(), crate::storage::boot_disk(), crate::storage::payload_start()) else {
+        return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_DISK_ERROR]);
+    };
+    let slot = 1 - (metadata.active_slot & 1);
+    let sectors = kup.expected.div_ceil(512);
+    staging[kup.expected..sectors * 512].fill(0);
+    if crate::block::write(disk, payload + fos_v2_abi::slot_start(u64::from(slot)), &staging[..sectors * 512]).is_err() {
+        crate::println!("KUP: writing slot {slot} failed.");
+        return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_DISK_ERROR]);
+    }
+    let updated = crate::debug::update_metadata(|m| {
+        m.pending_slot = Some(slot);
+        m.attempted = false;
+        m.confirmed = false;
+        m.slot_sectors[usize::from(slot)] = sectors as u16;
+    });
+    if updated.is_none() {
+        return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_DISK_ERROR]);
+    }
+    crate::println!("KUP: image verified and written to slot {slot} (pending); restarting in about a second to try it.");
+    kup_reply(index, &source, TAG_KUP_ACK, &[]);
+    flush();
+    unsafe { RESET_AT = apic::ticks() + apic::TICK_HZ };
+}
+
+/// Main-loop work: restart after an accepted kernel update.
+pub fn housekeeping() {
+    unsafe {
+        if RESET_AT != 0 && apic::ticks() >= RESET_AT {
+            RESET_AT = 0;
+            crate::debug::mark_clean_stop();
+            power::reset(RUNTIME_SERVICES);
+        }
+    }
 }
 
 // ---- support for running tapes (see tape.rs) ----
@@ -258,6 +391,7 @@ static mut FRAMES_QUEUED: u32 = 0;
 /// Everything a tape callback must keep serviced: USB keyboards, local keys, the
 /// network (terminal frames handled, the rest queued per interface), console output out.
 fn tape_service() {
+    crate::debug::pet();
     crate::usb_hid::poll();
     while let Some(key) = crate::keyboard::pop() {
         tape_input_push(if key == 0x1b { TAPE_ABORT } else { u16::from(key) });
@@ -447,7 +581,8 @@ fn execute(command: &str) {
             crate::println!("uptime    time since the timer started");
             crate::println!("dmesg     the boot log");
             crate::println!("shutdown  power off");
-            crate::println!("reset     reset the machine");
+            crate::println!("reset     restart through the firmware (reboot is the same)");
+            crate::println!("debug ... status | slots | crash | hang");
             crate::println!("Remote: term net, tools/term_net.py, devloop.py work as on v1.");
         }
         "about" => {
@@ -561,14 +696,37 @@ fn execute(command: &str) {
         "shutdown" | "halt" => {
             crate::println!("Powering off.");
             flush();
+            crate::debug::mark_clean_stop();
             power::shutdown(unsafe { RUNTIME_SERVICES });
             crate::println!("Shutdown returned.");
         }
-        "reset" => {
+        "reset" | "reboot" => {
+            // Through the firmware, so the loader runs again (and a pending kernel slot is tried).
             crate::println!("Resetting.");
             flush();
-            cpu::outb(0x64, 0xfe);
+            crate::debug::mark_clean_stop();
+            power::reset(unsafe { RUNTIME_SERVICES });
         }
+        "debug" => match words.next() {
+            Some("status") | Some("slots") | None => {
+                let debug = crate::config::debug();
+                crate::println!("reboot-on-crash {}, reboot-delay {} s, kernel-update {}, crash-on-boot {}", debug.reboot_on_crash, debug.reboot_delay_seconds, debug.kernel_update, debug.crash_on_boot);
+                crate::debug::slot_summary(|arguments| crate::println!("{}", arguments));
+            }
+            Some("crash") => {
+                crate::println!("Raising an invalid-opcode exception on purpose.");
+                flush();
+                unsafe { core::arch::asm!("ud2") };
+            }
+            Some("hang") => {
+                crate::println!("Spinning with interrupts on and no progress; the watchdog (if armed) should reset the machine.");
+                flush();
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+            Some(_) => crate::println!("debug: status | slots | crash | hang"),
+        },
         other => crate::println!("Unknown command: {other} (try `help`)."),
     }
 }

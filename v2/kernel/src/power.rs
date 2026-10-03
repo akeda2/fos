@@ -15,7 +15,7 @@ pub fn runtime_services() -> u64 {
     unsafe { RUNTIME_SERVICES }
 }
 
-/// Resets the machine: the UEFI `ResetSystem(EfiResetCold)` if available, else the 8042
+/// Resets the machine: the UEFI `ResetSystem(EfiResetWarm)` if available, else the 8042
 /// keyboard controller's CPU-reset line. Does not return.
 pub fn reset(runtime_services: u64) -> ! {
     cpu::interrupts_disable();
@@ -24,7 +24,10 @@ pub fn reset(runtime_services: u64) -> ! {
         if reset_system != 0 {
             let call: extern "efiapi" fn(kind: u32, status: usize, size: usize, data: *const u8) -> ! =
                 unsafe { core::mem::transmute(reset_system as usize) };
-            call(0, 0, 0, core::ptr::null())
+            // EfiResetWarm (1): on a PC the firmware usually implements it as a CPU reset
+            // that skips memory training, which is what lets the crash record in RAM
+            // survive. A firmware without warm reset treats it as a cold one.
+            call(1, 0, 0, core::ptr::null())
         }
     }
     cpu::outb(0x64, 0xfe);

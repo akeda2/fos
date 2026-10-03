@@ -32,7 +32,7 @@ pub struct Frame {
     pub ss: u64,
 }
 
-fn exception_name(vector: u64) -> &'static str {
+pub fn exception_name(vector: u64) -> &'static str {
     match vector {
         0 => "#DE divide error",
         1 => "#DB debug",
@@ -53,12 +53,23 @@ fn exception_name(vector: u64) -> &'static str {
         18 => "#MC machine check",
         19 => "#XM SIMD floating-point error",
         20 => "#VE virtualization exception",
+        240 => "watchdog timeout (the foreground made no progress)",
         _ => "reserved exception",
     }
 }
 
 /// Reports a fatal exception and stops the machine.
 pub fn fatal(frame: &Frame) -> ! {
+    report_and_stop(frame, false)
+}
+
+/// The watchdog's fatal path: report, record, then reset regardless of `reboot-on-crash`
+/// (a hang is exactly what a watchdog exists to recover from).
+pub fn fatal_reset(frame: &Frame) -> ! {
+    report_and_stop(frame, true)
+}
+
+fn report_and_stop(frame: &Frame, always_reset: bool) -> ! {
     // The kernel may have been in the middle of printing; start on a fresh line.
     println!();
     println!("*** CPU EXCEPTION: {} (vector {}), error code {:#x}", exception_name(frame.vector), frame.vector, frame.error);
@@ -98,11 +109,19 @@ pub fn fatal(frame: &Frame) -> ! {
         _ => {}
     }
     cpu::interrupts_disable();
+    crate::debug::record_crash(frame);
     let debug = crate::config::debug();
-    if debug.reboot_on_crash {
-        println!("*** debug file: reboot-on-crash; resetting in {} s", debug.reboot_delay_seconds);
-        crate::apic::busy_wait_ms(u64::from(debug.reboot_delay_seconds) * 1000);
-        crate::power::reset(crate::power::runtime_services());
+    if debug.reboot_on_crash || always_reset {
+        if crate::debug::crash_loop_tripped() {
+            println!(
+                "*** crash loop: {} boots in a row never reached the milestone; not resetting again. Halting for an operator.",
+                crate::debug::boot_crash_count()
+            );
+        } else {
+            println!("*** resetting in {} s", debug.reboot_delay_seconds);
+            crate::apic::busy_wait_ms(u64::from(debug.reboot_delay_seconds) * 1000);
+            crate::power::reset(crate::power::runtime_services());
+        }
     }
     println!("*** halting");
     cpu::halt()

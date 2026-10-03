@@ -24,7 +24,7 @@ mod elf;
 mod uefi;
 
 use core::panic::PanicInfo;
-use fos_v2_abi::{BootInfo, Framebuffer, SlotMetadata, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, SECTOR, slot_start};
+use fos_v2_abi::{BootInfo, Framebuffer, SlotChoice, SlotMetadata, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, RUNNING_BOOTING, RUNNING_UP, SECTOR, select_slot, slot_start};
 use uefi::{Handle, MemoryDescriptor, Status, SystemTable};
 
 /// Room for the memory map the kernel receives (it stays allocated for the kernel):
@@ -67,12 +67,38 @@ pub extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -
     if payload.read(0, sector.as_mut_ptr(), 1).is_err() {
         fatal("cannot read the slot-metadata sector");
     }
-    let Some(metadata) = SlotMetadata::parse(&sector) else { fatal("the slot-metadata sector is not valid") };
-    let slot = u64::from(metadata.active_slot & 1);
+    let Some(mut metadata) = SlotMetadata::parse(&sector) else { fatal("the slot-metadata sector is not valid") };
+
+    // Did the previous boot end badly? `running` is 1 from the moment this loader hands
+    // over until the kernel reaches its milestone, 2 after that, 0 after a clean stop.
+    match metadata.running {
+        RUNNING_BOOTING => {
+            metadata.crash_count = metadata.crash_count.saturating_add(1);
+            println!("Previous boot never reached the kernel's milestone (crash, hang or power loss): {} in a row.", metadata.crash_count);
+        }
+        RUNNING_UP => {
+            metadata.unclean_boots = metadata.unclean_boots.saturating_add(1);
+            println!("Previous boot ended without a clean stop (after reaching its milestone): {} unclean boot(s).", metadata.unclean_boots);
+        }
+        _ => {}
+    }
+    let SlotChoice::Boot(slot) = select_slot(&mut metadata);
+    let slot = u64::from(slot);
+    println!(
+        "Slot metadata: booting slot {slot} (active {}, pending {:?}, attempted {}, confirmed {}).",
+        metadata.active_slot, metadata.pending_slot, metadata.attempted, metadata.confirmed
+    );
     let sectors = metadata.slot_sectors[slot as usize] as usize;
-    println!("Slot metadata: active slot {slot}, {sectors} sectors ({} KiB).", sectors / 2);
+    println!("Kernel slot {slot}: {sectors} sectors ({} KiB).", sectors / 2);
     if sectors == 0 {
-        fatal("the active slot is empty");
+        fatal("the selected slot is empty");
+    }
+    metadata.running = RUNNING_BOOTING;
+    let boot_crash_count = metadata.crash_count;
+    let mut written = [0u8; SECTOR];
+    metadata.write_into(&mut written);
+    if payload.write(0, written.as_ptr(), 1).is_err() {
+        println!("Warning: the slot metadata could not be written back (read-only media?); fallback and crash tracking are off this boot.");
     }
     let kernel_image = read_slot(boot, &payload, slot, sectors);
     println!("Kernel image read ({} bytes). Loading its ELF64 segments...", sectors * SECTOR);
@@ -102,7 +128,7 @@ pub extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -
             kernel_base: kernel.base,
             kernel_size: kernel.size,
             boot_slot: slot as u32,
-            reserved: 0,
+            crash_count: u32::from(boot_crash_count),
             payload_guid: payload.guid,
             payload_start: payload.start,
             payload_sectors: payload.sectors,

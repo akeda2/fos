@@ -74,7 +74,9 @@ pub struct BootInfo {
     pub kernel_size: u64,
     /// Which A/B slot the kernel was loaded from.
     pub boot_slot: u32,
-    pub reserved: u32,
+    /// Consecutive boots that never reached the kernel's milestone, counting this one
+    /// if the previous one crashed (the loader's crash-loop evidence; M6).
+    pub crash_count: u32,
     /// The payload partition the loader read the kernel from: its unique GPT GUID
     /// (on-disk byte order) and position. After `ExitBootServices` the kernel has no
     /// firmware to ask which disk that was, so it scans its own drivers' disks for
@@ -130,22 +132,38 @@ pub const fn guid_bytes(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
     [a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]
 }
 
-/// The slot-metadata fields the loader needs. The byte layout is v1's, unchanged
-/// (`kernel/src/debug.rs`), so the same host tooling and the same state machine
-/// apply: `+0 "FOSM"`, `+4 version`, `+5 active slot`, `+6 pending slot (0xff =
-/// none)`, `+7 attempted`, `+8 confirmed`, `+10/+12 slot sizes in sectors (u16 LE)`.
+/// The slot-metadata sector (payload sector 0), v1's byte layout unchanged
+/// (`kernel/src/debug.rs`), so the same host tooling and state machine apply:
+/// `+0 "FOSM"`, `+4 version`, `+5 active slot`, `+6 pending slot (0xff = none)`,
+/// `+7 attempted`, `+8 confirmed`, `+9 crash count`, `+10/+12 slot sizes in sectors
+/// (u16 LE)`, `+14 running`, `+15 unclean boots`.
+///
+/// Meaning of the last three (see docs/v2-design.md, M6): `running` is 1 while a boot
+/// has not yet reached the kernel's milestone, 2 once it has, 0 after a clean stop
+/// (shutdown, reset, reboot, a kernel update restart). The loader, seeing 1 at the next
+/// boot, knows the previous boot crashed or hung *before* the milestone and bumps
+/// `crash_count`; the kernel zeroes `crash_count` at the milestone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotMetadata {
     pub active_slot: u8,
     pub pending_slot: Option<u8>,
     pub attempted: bool,
     pub confirmed: bool,
+    pub crash_count: u8,
     pub slot_sectors: [u16; 2],
+    pub running: u8,
+    pub unclean_boots: u8,
 }
+
+pub const RUNNING_STOPPED: u8 = 0;
+pub const RUNNING_BOOTING: u8 = 1;
+pub const RUNNING_UP: u8 = 2;
+/// Consecutive pre-milestone crashes after which the loader refuses to boot again.
+pub const MAX_CONSECUTIVE_CRASHES: u8 = 5;
 
 impl SlotMetadata {
     pub fn parse(sector: &[u8]) -> Option<SlotMetadata> {
-        if sector.len() < 14 || sector[0..4] != METADATA_MAGIC || sector[4] != METADATA_VERSION {
+        if sector.len() < 16 || sector[0..4] != METADATA_MAGIC || sector[4] != METADATA_VERSION {
             return None;
         }
         let pending = sector[6];
@@ -154,9 +172,80 @@ impl SlotMetadata {
             pending_slot: if pending == NO_PENDING_SLOT { None } else { Some(pending) },
             attempted: sector[7] != 0,
             confirmed: sector[8] != 0,
+            crash_count: sector[9],
             slot_sectors: [u16::from_le_bytes([sector[10], sector[11]]), u16::from_le_bytes([sector[12], sector[13]])],
+            running: sector[14],
+            unclean_boots: sector[15],
         })
     }
+
+    /// Writes the fields into a metadata sector (zeroing the reserved bytes).
+    pub fn write_into(&self, sector: &mut [u8]) {
+        sector.fill(0);
+        sector[0..4].copy_from_slice(&METADATA_MAGIC);
+        sector[4] = METADATA_VERSION;
+        sector[5] = self.active_slot;
+        sector[6] = self.pending_slot.unwrap_or(NO_PENDING_SLOT);
+        sector[7] = self.attempted as u8;
+        sector[8] = self.confirmed as u8;
+        sector[9] = self.crash_count;
+        sector[10..12].copy_from_slice(&self.slot_sectors[0].to_le_bytes());
+        sector[12..14].copy_from_slice(&self.slot_sectors[1].to_le_bytes());
+        sector[14] = self.running;
+        sector[15] = self.unclean_boots;
+    }
+}
+
+/// What the loader decided about which kernel to boot (the A/B fallback state machine,
+/// v1's `select_kernel_slot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotChoice {
+    /// Boot this slot; the metadata may have been changed and must be written back.
+    Boot(u8),
+}
+
+/// The A/B state machine, run by the loader before it reads a kernel:
+/// * no pending slot: boot the active one;
+/// * a pending slot not yet attempted: mark it attempted and boot it (**one** try);
+/// * attempted and confirmed (the kernel reached its milestone but reset before it could
+///   clear the flags): promote it and boot it;
+/// * attempted but not confirmed (it crashed, hung or lost power first): give up on it
+///   and boot the unchanged active slot.
+/// Returns the slot to boot and updates `metadata`; the caller writes it back.
+pub fn select_slot(metadata: &mut SlotMetadata) -> SlotChoice {
+    match metadata.pending_slot {
+        None => SlotChoice::Boot(metadata.active_slot & 1),
+        Some(pending) if !metadata.attempted => {
+            metadata.attempted = true;
+            SlotChoice::Boot(pending & 1)
+        }
+        Some(pending) if metadata.confirmed => {
+            metadata.active_slot = pending & 1;
+            (metadata.pending_slot, metadata.attempted, metadata.confirmed) = (None, false, false);
+            SlotChoice::Boot(metadata.active_slot)
+        }
+        Some(_) => {
+            (metadata.pending_slot, metadata.attempted, metadata.confirmed) = (None, false, false);
+            SlotChoice::Boot(metadata.active_slot & 1)
+        }
+    }
+}
+
+/// RFC 1071 Internet checksum (the 16-bit ones-complement sum of the data), as KUP and
+/// NETFS use it.
+pub fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for pair in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    if let [last] = chunks.remainder() {
+        sum += u32::from(*last) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 #[cfg(test)]
@@ -178,6 +267,43 @@ mod tests {
         assert_eq!(metadata.slot_sectors, [300, 512]);
         sector[4] = 2;
         assert!(SlotMetadata::parse(&sector).is_none());
+    }
+
+    fn state(pending: Option<u8>, attempted: bool, confirmed: bool) -> SlotMetadata {
+        SlotMetadata { active_slot: 0, pending_slot: pending, attempted, confirmed, crash_count: 0, slot_sectors: [1, 1], running: 0, unclean_boots: 0 }
+    }
+
+    #[test]
+    fn a_b_state_machine_gives_a_pending_kernel_exactly_one_try() {
+        let mut m = state(None, false, false);
+        assert_eq!(select_slot(&mut m), SlotChoice::Boot(0));
+        // fresh pending slot: boot it, mark attempted
+        let mut m = state(Some(1), false, false);
+        assert_eq!(select_slot(&mut m), SlotChoice::Boot(1));
+        assert!(m.attempted && m.pending_slot == Some(1) && m.active_slot == 0);
+        // it never confirmed: the next boot falls back and forgets it
+        assert_eq!(select_slot(&mut m), SlotChoice::Boot(0));
+        assert_eq!((m.pending_slot, m.attempted, m.active_slot), (None, false, 0));
+        // it confirmed but reset before clearing: promote
+        let mut m = state(Some(1), true, true);
+        assert_eq!(select_slot(&mut m), SlotChoice::Boot(1));
+        assert_eq!((m.pending_slot, m.active_slot, m.confirmed), (None, 1, false));
+    }
+
+    #[test]
+    fn metadata_write_into_round_trips() {
+        let m = SlotMetadata { active_slot: 1, pending_slot: Some(0), attempted: true, confirmed: false, crash_count: 3, slot_sectors: [321, 400], running: 2, unclean_boots: 4 };
+        let mut sector = [0xaau8; 512];
+        m.write_into(&mut sector);
+        assert_eq!(SlotMetadata::parse(&sector), Some(m));
+        assert!(sector[16..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn internet_checksum_matches_rfc_1071() {
+        // RFC 1071 example: 00 01 f2 03 f4 f5 f6 f7 sums to 0xddf2, checksum 0x220d.
+        assert_eq!(internet_checksum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]), 0x220d);
+        assert_eq!(internet_checksum(&[0x01]), !0x0100);
     }
 
     #[test]

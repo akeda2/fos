@@ -120,6 +120,7 @@ pub fn busy_wait_ms(milliseconds: u64) {
 pub fn wait_ticks(count: u64) {
     let start = ticks();
     while ticks().wrapping_sub(start) < count {
+        crate::debug::pet();
         core::hint::spin_loop();
     }
 }

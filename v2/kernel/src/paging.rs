@@ -266,6 +266,34 @@ pub fn set_executable(start: u64, length: u64, executable: bool) {
     cpu::write_cr3(cpu::read_cr3()); // flush the TLB
 }
 
+/// Whether `address` is mapped (present) in the kernel's tables: used before touching a
+/// fixed physical page the firmware's memory map may not have described.
+pub fn is_mapped(address: u64) -> bool {
+    let root = unsafe { ROOT };
+    if root == 0 {
+        return false;
+    }
+    unsafe {
+        let pml4 = (root as *const u64).add(((address >> 39) & 511) as usize).read();
+        if pml4 & PRESENT == 0 {
+            return false;
+        }
+        let pdpt = ((pml4 & ADDRESS_MASK) as *const u64).add(((address >> 30) & 511) as usize).read();
+        if pdpt & PRESENT == 0 {
+            return false;
+        }
+        let directory = ((pdpt & ADDRESS_MASK) as *const u64).add(((address >> 21) & 511) as usize).read();
+        if directory & PRESENT == 0 {
+            return false;
+        }
+        if directory & LARGE != 0 {
+            return true;
+        }
+        let entry = ((directory & ADDRESS_MASK) as *const u64).add(((address >> 12) & 511) as usize).read();
+        entry & PRESENT != 0
+    }
+}
+
 pub fn root() -> u64 {
     unsafe { ROOT }
 }

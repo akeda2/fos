@@ -13,9 +13,16 @@ use crate::{ahci, gpt};
 
 static mut BOOT_VOLUME: Option<Volume> = None;
 static mut BOOT_DISK: Option<usize> = None;
+static mut PAYLOAD_START: Option<u64> = None;
 
 pub fn boot_volume() -> Option<Volume> {
     unsafe { *core::ptr::addr_of!(BOOT_VOLUME) }
+}
+
+/// First sector of the payload partition on the boot disk (where the slot metadata and
+/// the kernel slots live).
+pub fn payload_start() -> Option<u64> {
+    unsafe { *core::ptr::addr_of!(PAYLOAD_START) }
 }
 
 pub fn boot_disk() -> Option<usize> {
@@ -60,7 +67,10 @@ pub fn init(info: &BootInfo) {
         return;
     };
     crate::println!("Boot disk: disk{} (its GPT holds the payload partition the loader booted from).", disk + 1);
-    unsafe { BOOT_DISK = Some(disk) };
+    unsafe {
+        BOOT_DISK = Some(disk);
+        PAYLOAD_START = Some(info.payload_start);
+    }
     match gpt::find(disk, &FOSFS_TYPE_GUID, |_| true) {
         Some(partition) => match Volume::mount(disk, partition.start, partition.sectors) {
             Ok(volume) => {

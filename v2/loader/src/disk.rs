@@ -41,6 +41,24 @@ impl Partition {
     }
 }
 
+impl Partition {
+    /// Writes `sectors` sectors starting at `sector` (relative to the partition), then
+    /// flushes. The loader writes only the slot-metadata sector.
+    pub fn write(&self, sector: u64, buffer: *const u8, sectors: usize) -> Result<(), uefi::Status> {
+        if sector + sectors as u64 > self.sectors {
+            return Err(1);
+        }
+        let status = unsafe {
+            ((*self.block_io).write_blocks)(self.block_io, self.media_id, self.start + sector, sectors * SECTOR, buffer as *const c_void)
+        };
+        if status != uefi::SUCCESS {
+            return Err(status);
+        }
+        let status = unsafe { ((*self.block_io).flush_blocks)(self.block_io) };
+        if status == uefi::SUCCESS { Ok(()) } else { Err(status) }
+    }
+}
+
 fn read_disk(block_io: *mut BlockIo, media_id: u32, lba: u64, sectors: usize) -> Option<&'static [u8]> {
     let buffer = core::ptr::addr_of_mut!(SCRATCH) as *mut u8;
     let status = unsafe { ((*block_io).read_blocks)(block_io, media_id, lba, sectors * SECTOR, buffer as *mut c_void) };

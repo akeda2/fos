@@ -11,7 +11,7 @@ V2_TAPES := hello calc memtest nettest
 V2_TAPE_BINS := $(foreach tape,$(V2_TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 V2_TAPE_FILES := $(foreach tape,$(V2_TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 
-.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest
+.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -72,3 +72,7 @@ test-v2-tapes: v2-image
 # nettest between two e1000 NICs on host-played TCP segments.
 test-v2-nettest: v2-image
 	python3 v2/tools/test_nettest.py
+
+# Crash records, reboot-on-crash, the loop guard, the watchdog, KUP and the A/B fallback.
+test-v2-debug-mode: v2-image
+	python3 v2/tools/test_debug_mode.py

@@ -193,6 +193,7 @@ fn write64(address: usize, value: u64) {
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
     let start = apic::ticks();
     loop {
+        crate::debug::pet();
         if condition() {
             return true;
         }
@@ -454,6 +455,7 @@ impl Controller {
     fn wait_event(&mut self, ticks: u64, wanted: impl Fn(&Trb) -> bool) -> Result<Trb, Error> {
         let start = apic::ticks();
         loop {
+            crate::debug::pet();
             while let Some(event) = self.next_event() {
                 if wanted(&event) {
                     return Ok(event);

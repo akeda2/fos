@@ -247,6 +247,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_set_promiscuous: api_nic_set_promiscuous,
     };
     term::set_tape_mode(true);
+    crate::debug::set_tape_running(true);
     unsafe {
         // Switch to the tape's stack for the call, then back. r12/r13 are callee-saved,
         // so the tape preserves them: r13 keeps our stack pointer across the call.
@@ -262,6 +263,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
             clobber_abi("C"),
         );
     }
+    crate::debug::set_tape_running(false);
     term::set_tape_mode(false);
     memory::free(stack, STACK_BYTES / memory::FRAME);
     Ok(())

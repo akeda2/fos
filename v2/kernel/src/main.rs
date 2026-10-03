@@ -20,6 +20,7 @@ mod ahci;
 mod block;
 mod apic;
 mod config;
+mod debug;
 mod cpu;
 mod e1000;
 mod ehci;
@@ -97,7 +98,10 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             BREAKPOINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             println!("Breakpoint exception at {:#x}: handled, execution continues.", frame.rip);
         }
-        v if v == u64::from(apic::TIMER_VECTOR) => apic::tick(),
+        v if v == u64::from(apic::TIMER_VECTOR) => {
+            apic::tick();
+            debug::watchdog_tick(frame);
+        }
         v if v == u64::from(keyboard::KEYBOARD_VECTOR) => {
             keyboard::interrupt();
             apic::end_of_interrupt();
@@ -166,6 +170,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         layout.text.1
     );
 
+    debug::init(info); // after paging: it checks that the crash-record page is mapped
     if framebuffer::init(fb) {
         framebuffer::write_str(log::contents());
         let (columns, rows) = framebuffer::size().unwrap_or((0, 0));
@@ -265,6 +270,10 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     // ---- storage: find the boot disk by its partition GUID, mount FOSFS ----
     storage::init(info);
+    if let Some(disk) = storage::boot_disk() {
+        debug::set_payload(disk, info.payload_start);
+    }
+    debug::report_previous_crash();
 
     // ---- per-machine configuration files, then the start script ----
     config::load();
@@ -274,9 +283,14 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     }
     config::run_start(term::run_line);
 
+    // The milestone: from here the machine can be used (locally or over the network).
+    debug::confirm_boot(config::debug().watchdog_seconds);
     println!("FOS v2 kernel: M3 complete. Waiting for a term net client.");
     term::start_local();
     loop {
+        debug::pet();
+        debug::housekeeping();
+        term::housekeeping();
         while let Some(key) = keyboard::pop() {
             term::local_input(key);
         }

@@ -3,8 +3,8 @@
 //! * `hostname`: the base name announced in discovery replies (`NAME` + the interface
 //!   number, so `lab` becomes `lab1`);
 //! * `settings`: `deny-term-net` closes the network terminal;
-//! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` and
-//!   `kernel-update` are parsed and reported but only take effect with milestone M6;
+//! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` arms the
+//!   software watchdog and `kernel-update` enables KUP (both in `debug.rs`/`term.rs`);
 //! * `start`: a command script run once at boot (up to 4096 bytes; blank lines and
 //!   lines starting with `#` are skipped).
 //!
@@ -97,7 +97,7 @@ pub fn load() {
             }
         }
         crate::println!(
-            "debug file: reboot-on-crash {}, reboot-delay {} s, crash-on-boot {}; watchdog and kernel-update arrive with M6 (asked: watchdog {:?}, kernel-update {}).",
+            "debug file: reboot-on-crash {}, reboot-delay {} s, crash-on-boot {}, watchdog {:?}, kernel-update {}.",
             debug.reboot_on_crash,
             debug.reboot_delay_seconds,
             debug.crash_on_boot,

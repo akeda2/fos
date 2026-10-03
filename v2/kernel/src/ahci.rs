@@ -84,6 +84,7 @@ fn write32(address: usize, value: u32) {
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
     let start = apic::ticks();
     loop {
+        crate::debug::pet();
         if condition() {
             return true;
         }

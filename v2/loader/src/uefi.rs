@@ -180,8 +180,9 @@ pub struct BlockIo {
     pub reset: usize,
     pub read_blocks:
         extern "efiapi" fn(this: *mut BlockIo, media_id: u32, lba: u64, size: usize, buffer: *mut c_void) -> Status,
-    pub write_blocks: usize,
-    pub flush_blocks: usize,
+    pub write_blocks:
+        extern "efiapi" fn(this: *mut BlockIo, media_id: u32, lba: u64, size: usize, buffer: *const c_void) -> Status,
+    pub flush_blocks: extern "efiapi" fn(this: *mut BlockIo) -> Status,
 }
 
 #[repr(C)]

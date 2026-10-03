@@ -206,7 +206,7 @@ def main():
     check(re.search(r"Graphics: \d+x\d+ (RGB|BGR)", text) is not None, "it finds the GOP framebuffer", text)
     check("ACPI 2.0+ RSDP at" in text and "signature valid" in text, "and a valid ACPI 2.0+ RSDP", text)
     check(re.search(r"Payload partition: LBA \d+ \+ \d+ sectors", text) is not None, "it finds the payload partition by its GPT type", text)
-    check(re.search(r"Slot metadata: active slot 0, \d+ sectors", text) is not None, "reads the slot metadata", text)
+    check(re.search(r"Slot metadata: booting slot 0 \(active 0, pending None", text) is not None, "reads the slot metadata", text)
     kernel = re.search(r"Kernel at (0x[0-9a-f]+), (\d+) KiB, entry (0x[0-9a-f]+)", text)
     check(kernel is not None, "loads the kernel ELF at an address of its own choosing", text)
     check("Exiting boot services" in text, "and exits boot services", text)
