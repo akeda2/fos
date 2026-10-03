@@ -79,6 +79,14 @@ pub fn install(nic: E1000, runtime_services: u64) -> Option<usize> {
     }
 }
 
+/// True when every interface delivers interrupts (MSI), so a frame wakes the CPU and a
+/// tape may sleep in `hlt` instead of polling. One polled NIC is enough to say no: its
+/// frames would only be noticed at the next timer tick.
+pub fn all_interrupt_driven() -> bool {
+    let count = nic_count();
+    count > 0 && (0..count).all(|index| nic_at(index).is_some_and(|nic| nic.delivery != crate::e1000::Delivery::Polled))
+}
+
 pub fn nic_count() -> usize {
     unsafe { NIC_COUNT }
 }
@@ -597,13 +605,15 @@ fn execute(command: &str) {
         "pci" => {
             for device in pci::devices() {
                 crate::println!(
-                    "{:02x}:{:02x}.{} {:04x}:{:04x} {}",
+                    "{:02x}:{:02x}.{} {:04x}:{:04x} {}{}{}",
                     device.bus,
                     device.device,
                     device.function,
                     device.vendor,
                     device.id,
-                    pci::class_name(device.class, device.subclass)
+                    pci::class_name(device.class, device.subclass),
+                    if device.find_capability(0x05).is_some() { " msi" } else { "" },
+                    if device.find_capability(0x11).is_some() { " msi-x" } else { "" }
                 );
             }
         }
@@ -615,6 +625,18 @@ fn execute(command: &str) {
                 if let Some(nic) = nic_at(index) {
                     crate::println!("{}: e1000 {}  {}{}", index + 1, Mac(&nic.mac), if nic.link_up() { "link up" } else { "link DOWN" }, if unsafe { SESSION_NIC } == index && session_open() { "  (terminal)" } else { "" });
                     crate::println!("   frames: {} received, {} sent", nic.frames_received, nic.frames_sent);
+                    match nic.delivery {
+                        crate::e1000::Delivery::Polled => crate::println!("   interrupts: polled"),
+                        crate::e1000::Delivery::Msi(vector) => {
+                            let state = &crate::e1000::ISR[index];
+                            crate::println!(
+                                "   interrupts: MSI vector {vector:#x}: {} taken, {} receive overruns, {} link changes",
+                                state.interrupts.load(core::sync::atomic::Ordering::Relaxed),
+                                state.overruns.load(core::sync::atomic::Ordering::Relaxed),
+                                state.link_changes.load(core::sync::atomic::Ordering::Relaxed)
+                            );
+                        }
+                    }
                     if index == 0 {
                         crate::println!("   tape frame queue: {} queued, {} dropped", unsafe { FRAMES_QUEUED }, unsafe { FRAMES_DROPPED });
                     }

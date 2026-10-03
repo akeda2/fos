@@ -101,7 +101,7 @@ def main():
                    "-drive", f"format=raw,file={image}"]
         for number, (port, mac) in enumerate(((SEGMENT_A_PORT, NIC_A), (SEGMENT_B_PORT, NIC_B))):
             command += ["-netdev", f"socket,id=n{number},connect=127.0.0.1:{port}",
-                        "-device", f"e1000,netdev=n{number},mac={':'.join(f'{x:02x}' for x in mac)}"]
+                        "-device", f"{os.environ.get('FOS_NIC_MODEL', 'e1000')},netdev=n{number},mac={':'.join(f'{x:02x}' for x in mac)}"]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)

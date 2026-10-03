@@ -60,14 +60,21 @@ class Wire:
         self.sock.sendto(frame.ljust(60, b"\0"), (MCAST_GROUP, MCAST_PORT))
 
     def frames(self, timeout):
-        """Yields (source, tag, payload) of fos frames addressed to us or broadcast."""
-        self.sock.settimeout(timeout)
-        try:
-            packet = self.sock.recv(2048)
-        except socket.timeout:
-            return
-        if len(packet) >= 15 and packet[6:12] != HOST_MAC and packet[12:14] == ETHERTYPE and packet[:6] in (HOST_MAC, BROADCAST):
-            yield packet[6:12], packet[14], packet[15:]
+        """Yields (source, tag, payload) of fos frames addressed to us or broadcast, reading
+        for up to `timeout` seconds. (The multicast group echoes our own datagrams back, so
+        a single read can be our own frame: keep reading until the time is up.)"""
+        end = time.monotonic() + timeout
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            self.sock.settimeout(remaining)
+            try:
+                packet = self.sock.recv(2048)
+            except socket.timeout:
+                return
+            if len(packet) >= 15 and packet[6:12] != HOST_MAC and packet[12:14] == ETHERTYPE and packet[:6] in (HOST_MAC, BROADCAST):
+                yield packet[6:12], packet[14], packet[15:]
 
     def until(self, marker, timeout, expect_tag=TAG_DATA):
         """Collects DATA payload until `marker` appears in it; returns it as text."""
@@ -226,7 +233,7 @@ def main():
     milliseconds = re.search(r"100 ticks took (\d+) ms by the PM timer", text)
     check(milliseconds is not None and 900 <= int(milliseconds.group(1)) <= 1100, f"100 timer ticks take about a second by the independent PM timer ({milliseconds and milliseconds.group(1)} ms)", text)
     check(re.search(r"PCI: \d+ functions found", text) is not None, "the kernel scans PCI", text)
-    check(re.search(r"e1000 at [0-9a-f:.]+: MAC 52:54:00:12:34:77, link up", text) is not None, "and brings up the e1000 with its link", text)
+    check(re.search(r"e1000 \(\w+\) at [0-9a-f:.]+: MAC 52:54:00:12:34:77, link up", text) is not None, "and brings up the e1000 with its link", text)
     check(reply is not None and reply[1] == b"fos2" and guest == bytes.fromhex("525400123477"), f"a discovery probe over the wire is answered by 'fos2' ({reply})", text)
     check("Remote terminal connected" in text and "fos> " in session and "Type `help`" in session, "a term net session opens (HELLO answered with banner and prompt)", session)
     check("shutdown" in transcript["help"] and "dmesg" in transcript["help"], "`help` output arrives over the wire in DATA frames", transcript["help"])

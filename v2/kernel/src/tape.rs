@@ -123,11 +123,12 @@ extern "C" fn api_read_key() -> u32 {
 extern "C" fn api_set_input_mode(_mode: u32) {}
 extern "C" fn api_wait_for_event() {
     term::flush_output();
-    if term::nic_count() == 0 {
+    if term::nic_count() == 0 || term::all_interrupt_driven() {
+        // Nothing to wait for but interrupts: a frame (MSI), a key, the 10 ms tick.
         unsafe { core::arch::asm!("hlt") };
     } else {
-        // The NICs are polled, not interrupt-driven, so sleeping until the next 10 ms tick
-        // would add up to 10 ms to every frame. Yield briefly instead (about 100 us).
+        // A polled NIC would only be noticed at the next 10 ms tick, adding that to every
+        // frame. Yield briefly instead (about 100 us).
         let until = apic::micros() + 100;
         while apic::micros() < until {
             core::hint::spin_loop();

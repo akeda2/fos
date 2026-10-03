@@ -2,7 +2,7 @@
 //!
 //! * `hostname`: the base name announced in discovery replies (`NAME` + the interface
 //!   number, so `lab` becomes `lab1`);
-//! * `settings`: `deny-term-net` closes the network terminal;
+//! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling;
 //! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` arms the
 //!   software watchdog and `kernel-update` enables KUP (both in `debug.rs`/`term.rs`);
 //! * `start`: a command script run once at boot (up to 4096 bytes; blank lines and
@@ -24,12 +24,19 @@ pub struct Debug {
 
 static mut DEBUG: Debug = Debug { reboot_on_crash: false, reboot_delay_seconds: 3, crash_on_boot: false, watchdog_seconds: None, kernel_update: false };
 static mut DENY_TERM_NET: bool = false;
+static mut NO_MSI: bool = false;
 static mut HOSTNAME: [u8; 16] = [0; 16];
 static mut HOSTNAME_LENGTH: usize = 0;
 static mut BUFFER: [u8; FILE_CAPACITY] = [0; FILE_CAPACITY];
 
 pub fn debug() -> &'static Debug {
     unsafe { &*core::ptr::addr_of!(DEBUG) }
+}
+
+/// `no-msi` in the `settings` file: NICs stay on polling (a bring-up aid for hardware whose
+/// MSI misbehaves).
+pub fn no_msi() -> bool {
+    unsafe { NO_MSI }
 }
 
 pub fn deny_term_net() -> bool {
@@ -77,7 +84,10 @@ pub fn load() {
                     unsafe { DENY_TERM_NET = true };
                     crate::println!("settings: deny-term-net -- the network terminal is closed.");
                 }
-                Some("no-msi") => {} // v2 uses no MSI yet
+                Some("no-msi") => {
+                    unsafe { NO_MSI = true };
+                    crate::println!("settings: no-msi -- NICs stay on polling.");
+                }
                 _ => crate::println!("settings: unknown line `{line}` ignored."),
             }
         }

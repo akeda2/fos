@@ -84,6 +84,43 @@ impl Device {
         }
     }
 
+    /// Programs the MSI capability for one vector aimed at local APIC `apic_id` and turns it
+    /// on (and turns the legacy INTx pin off). False if the device has no MSI capability.
+    ///
+    /// Capability layout (dword offsets from the capability): +0 id/next/message control,
+    /// +4 address low, +8 address high (64-bit capable devices only), then the 16-bit
+    /// message data (the vector). Control bit 0 enables, bits 4-6 choose how many vectors
+    /// (0 = one), bit 7 says the device takes a 64-bit address.
+    pub fn enable_msi(&self, vector: u8, apic_id: u32) -> bool {
+        let Some(capability) = self.find_capability(0x05) else { return false };
+        let header = self.read32(capability);
+        let control = (header >> 16) as u16;
+        let data_offset = if control & (1 << 7) != 0 {
+            self.write32(capability + 8, 0); // upper address bits
+            capability + 12
+        } else {
+            capability + 8
+        };
+        // Physical destination mode, fixed delivery, to one local APIC.
+        self.write32(capability + 4, 0xfee0_0000 | (apic_id << 12));
+        let data = self.read32(data_offset);
+        self.write32(data_offset, (data & 0xffff_0000) | u32::from(vector));
+        // Enable with a single vector (clear the multiple-message-enable bits).
+        let enabled = (control & !(0x7 << 4)) | 1;
+        self.write32(capability, (header & 0xffff) | (u32::from(enabled) << 16));
+        self.write32(4, (self.read32(4) & 0xffff) | (1 << 10)); // command bit 10: INTx disable
+        true
+    }
+
+    /// Turns MSI off again (and re-enables the INTx pin).
+    pub fn disable_msi(&self) {
+        if let Some(capability) = self.find_capability(0x05) {
+            let header = self.read32(capability);
+            self.write32(capability, (header & 0xffff) | (u32::from((header >> 16) as u16 & !1) << 16));
+            self.write32(4, (self.read32(4) & 0xffff) & !(1 << 10));
+        }
+    }
+
     /// Base address and size of memory BAR `index`, or None for an I/O or absent BAR.
     /// A 64-bit BAR takes two slots. Sizing writes all-ones and reads back which bits
     /// stuck, with decoding switched off while the BAR holds that bogus value.

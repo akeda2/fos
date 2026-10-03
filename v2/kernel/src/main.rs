@@ -35,6 +35,7 @@ mod ioapic;
 mod keyboard;
 mod log;
 mod memory;
+mod msi;
 mod paging;
 mod pci;
 mod power;
@@ -102,6 +103,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             apic::tick();
             debug::watchdog_tick(frame);
         }
+        v if msi::handles(v) => msi::dispatch(v),
         v if v == u64::from(keyboard::KEYBOARD_VECTOR) => {
             keyboard::interrupt();
             apic::end_of_interrupt();
@@ -242,22 +244,6 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     // ---- PCI and the network ----
     let count = pci::scan();
     println!("PCI: {count} functions found (`pci` lists them).");
-    let mut interfaces = 0;
-    for device in pci::devices().filter(|d| d.vendor == e1000::VENDOR_INTEL && e1000::DEVICE_IDS.contains(&d.id)) {
-        match e1000::E1000::init(&device) {
-            Ok(nic) => {
-                println!("e1000 at {:02x}:{:02x}.{}: MAC {}, link {}.", device.bus, device.device, device.function, term::Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
-                if term::install(nic, info.runtime_services).is_some() {
-                    interfaces += 1;
-                }
-            }
-            Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
-        }
-    }
-    if interfaces == 0 {
-        println!("No supported network interface found (this milestone drives the e1000 only).");
-    }
-
     // ---- USB keyboards (xHCI) ----
     let controllers = xhci::init_all();
     let ehci_controllers = ehci::init_all();
@@ -277,6 +263,32 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     // ---- per-machine configuration files, then the start script ----
     config::load();
+
+    // ---- network interfaces (after the settings file: `no-msi` decides how they take interrupts) ----
+    let mut interfaces = 0;
+    for device in pci::devices().filter(|d| d.vendor == e1000::VENDOR_INTEL && e1000::DEVICE_IDS.contains(&d.id)) {
+        match e1000::E1000::init(&device, interfaces) {
+            Ok(mut nic) => {
+                println!("e1000 ({:?}) at {:02x}:{:02x}.{}: MAC {}, link {}.", nic.variant, device.bus, device.device, device.function, term::Mac(&nic.mac), if nic.link_up() { "up" } else { "down" });
+                if config::no_msi() {
+                    println!("  interrupts: polled (settings: no-msi).");
+                } else {
+                    match nic.enable_msi(&device) {
+                        Ok(vector) => println!("  interrupts: MSI on vector {vector:#x} (the self-test message arrived); frames wake the CPU instead of being polled for."),
+                        Err(reason) => println!("  interrupts: polled ({reason})."),
+                    }
+                }
+                if term::install(nic, info.runtime_services).is_some() {
+                    interfaces += 1;
+                }
+            }
+            Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
+        }
+    }
+    if interfaces == 0 {
+        println!("No supported network interface found (this milestone drives the e1000 only).");
+    }
+
     if config::debug().crash_on_boot {
         println!("debug: crash-on-boot is set; faulting now.");
         unsafe { core::arch::asm!("ud2") };

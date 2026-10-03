@@ -97,6 +97,7 @@ E2E_MAKE = [
     "make test-v2-tapes",
     "make test-v2-nettest",
     "make test-v2-debug-mode",
+    "make test-v2-msi",
     "make test-tape-nettest-router",
     "make test-tape-router",
     "make test-tape-router-arp",

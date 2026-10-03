@@ -50,9 +50,11 @@ def internet_checksum(data: bytes) -> int:
 class Machine:
     """A QEMU+OVMF guest on one persistent image."""
 
-    def __init__(self, tmp, files):
+    def __init__(self, tmp, files, binaries=None):
         self.tmp = Path(tmp)
         arguments = []
+        for name, path in (binaries or {}).items():
+            arguments += ["--file", f"{name}={path}"]
         for name, content in files.items():
             path = self.tmp / f"file-{name}"
             path.write_text(content)
