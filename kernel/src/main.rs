@@ -59,7 +59,7 @@ pub extern "C" fn kmain(boot_info_address: u32) -> ! {
     println!("Kernel: validated loader boot information.");
     #[cfg(not(feature = "legacy-unsafe-memory"))]
     {
-        if paging::initialize().is_err() {
+        if paging::initialize(boot_info).is_err() {
             println!("KERNEL ERROR: CPU lacks 4 MiB page support required for");
             println!("the paging foundation.");
             halt_forever();

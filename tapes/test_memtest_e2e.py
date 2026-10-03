@@ -43,7 +43,7 @@ def main():
     try:
         before = free_frames(lab)
         text = run_memtest(lab, "size=4")
-        check("(frame pool)" in text and "testing 4 MiB" in text, "claims 4 MiB from the frame pool", text)
+        check("(frame pool)" in text and "testing 4 of " in text, "claims 4 MiB from the frame pool", text)
         check("RESULT: PASS, no errors" in text, "clean RAM passes every test", text)
         for name in ("addr", "walk", "moving", "random"):
             check(f"pass 1 {name} ... ok" in text, f"the {name} test ran and passed", text)
@@ -82,14 +82,81 @@ def main():
     lab = Lab(nic_args=NIC, memory=32)
     try:
         text = run_memtest(lab, "size=100")
-        total = re.search(r"testing (\d+) MiB", text)
+        total = re.search(r"testing (\d+) of", text)
         check(total is not None and 4 <= int(total.group(1)) <= 28 and "(big pool)" not in text,
               f"a 32 MiB guest has no big pool; {total and total.group(1)} MiB of frames were tested", text)
         check("RESULT: PASS" in text, "and they pass", text)
     finally:
         lab.stop()
     soak_checks()
+    high_memory_checks()
     print("memtest e2e: all checks passed")
+
+
+def high_memory_checks():
+    """RAM above 2 GiB through the big pool, and above 4 GiB through the
+    64-bit excursions. QEMU's i386 CPU has no long mode, so those use
+    qemu-system-x86_64 (it boots the same image)."""
+    lab = Lab(nic_args=NIC, memory=5120, binary="qemu-system-x86_64")
+    try:
+        text = lab.shell("memory")
+        tracked = re.search(r"kernel pools track (\d+) MiB", text)
+        above = re.search(r"Above 4 GiB .*?: (\d+) MiB", text)
+        check(tracked is not None and int(tracked.group(1)) > 3000,
+              f"the kernel pools track RAM up to the PCI hole ({tracked and tracked.group(1)} MiB of 5 GiB)", text)
+        check(above is not None and int(above.group(1)) == 2048, "and the 2 GiB above 4 GiB is reported separately", text)
+        before = free_frames(lab)
+
+        text = run_memtest(lab, "frames=off size=2200 tests=addr high=0", 240)
+        addresses = [int(a, 16) for a in re.findall(r"block \d+: 0x([0-9a-f]{8}) \+", text)]
+        check(max(addresses) >= 0x8000_0000 and "RESULT: PASS" in text,
+              f"the big pool hands out and tests RAM above 2 GiB ({[hex(a) for a in addresses]})", text)
+
+        text = run_memtest(lab, "size=2 high=64 tests=addr,walk,moving,random")
+        check("high 1: 0x0000000100000000 + 65536 KiB (64-bit mode)" in text, "RAM above 4 GiB is claimed for long mode", text)
+        check("RESULT: PASS, no errors" in text and "left out" in text, "all four tests pass in 64-bit mode", text)
+
+        text = run_memtest(lab, "size=1 high=32 tests=random inject=100")
+        check("RESULT: FAIL" in text and "0x0000000100000320 want" in text,
+              "an injected flip above 4 GiB is reported at its exact 64-bit address", text)
+        check("bit flips: bit3=" in text and "0x0000000100000000=" in text, "with its bit and 1 MiB block", text)
+
+        lab.shell("tape load disk memtest.bin", b"Loaded ")
+        mark = len(lab.output)
+        lab.process.stdin.write(b"tape run memtest size=1 high=64 tests=moving passes=0\n")
+        lab.process.stdin.flush()
+        lab.wait_for(b"pass 2 moving", mark, 90)
+        lab.sendkey("f12")
+        lab.wait_for(b"fos> ", mark, 60)
+        check("memtest stopped:" in lab.text(mark), "Escape stops a run in 64-bit mode", lab.text(mark))
+
+        text = run_memtest(lab, "soak for=8 status=4 size=1 high=64 tests=moving", 120)
+        check("RESULT: PASS" in text and "tick stalls 0" in text and "backwards 0" in text,
+              "soak with 64-bit slices keeps the clock and everything else healthy", text)
+        check(free_frames(lab) == before, "nothing leaked in all of that", text)
+    finally:
+        lab.stop()
+
+    lab = Lab(nic_args=NIC, memory=5120)  # qemu-system-i386: no long mode
+    try:
+        text = run_memtest(lab, "size=2 tests=addr")
+        check("left out: this CPU has no long mode" in text and "RESULT: PASS" in text,
+              "without long mode the RAM above 4 GiB is reported as left out", text)
+    finally:
+        lab.stop()
+
+    lab = Lab(nic_args=NIC, memory=128)
+    try:
+        before = free_frames(lab)
+        lab.shell("tape load disk bigsieve.bin", b"Loaded ")
+        text = lab.shell("tape run", b"Tape returned", 240)
+        address = re.search(r"allocated at physical 0x([0-9a-f]{8})", text)
+        check(address is not None and int(address.group(1), 16) < 0x0800_0000
+              and "primes found:  3957809" in text,
+              "alloc falls back to the frame pool when there is no big pool (128 MiB guest)", text)
+        check(free_frames(lab) == before, "and free() returns those frames", text)
+    finally:
+        lab.stop()
 
 
 def soak_checks():

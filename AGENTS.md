@@ -106,7 +106,11 @@ Try not to fill up this file, put new stuff in the above files or under docs/
   frames) built from the E820 map; it reserves everything below the kernel's
   own low-memory region.
 - `kernel/src/paging.rs` enables supervisor-only identity mappings for the
-  first 2 GiB. The low 4 MiB uses 4 KiB PTEs to leave the kernel-stack guard
+  first 2 GiB, plus RAM from 2 to 4 GiB only where a whole 4 MiB page lies inside
+  usable E820 regions (`range_is_usable_ram`; never the PCI hole, and
+  `identity_mapped()` tells `pmem` which big-pool chunks are safe). RAM above
+  4 GiB is out of a 32-bit kernel's reach (no PAE); only `memtest`'s long-mode
+  excursions touch it. The low 4 MiB uses 4 KiB PTEs to leave the kernel-stack guard
   page absent and make page-aligned kernel text/read-only data non-writable;
   the remaining low range uses 4 MiB PSE mappings. High PCI MMIO is absent
   until `map_mmio` registers a driver's exact BAR range, using at most
@@ -906,9 +910,11 @@ ABI extension is append-only cdecl: `tape_run` always pushes all arguments and
 cleans up, older tapes ignore the extra slots, and a tape may omit only a
 *trailing* run of parameters (to use `free` it must still declare `should_abort`).
 `alloc`/`free` use a separate "big pool" in `pmem.rs` (`BIG_BITMAP`,
-`BIG_POOL_BASE` = `TRACKED_BYTES` (128 MiB) to `BIG_POOL_END` = 2 GiB, 1 MiB
-chunks, ~240-byte bitmap), filled by `mark_big_region_free` per E820 region; the
-4 KiB frame pool is untouched. Requests round up to whole chunks, memory is **not
+`BIG_POOL_BASE` = `TRACKED_BYTES` (128 MiB) to `BIG_POOL_END` = 4 GiB (`u64`), 1 MiB
+chunks, ~500-byte bitmap), filled by `mark_big_region_free` per E820 region (only
+chunks `paging::identity_mapped`). If the big pool has no run that long, `alloc`
+falls back to the 4 KiB frame pool (4 MiB reserve kept); `free` tells them apart
+by address, so a 128 MiB guest can still `alloc`. Requests round up to whole chunks, memory is **not
 zeroed**, and there is no auto-free on return (a tape that never frees leaks until
 reboot). `tapes/bigsieve/` (64 MiB sieve, exact prime-count check, avoids `u32`
 overflow of `candidate * candidate`) is the reference; `make tape-bigsieve`,
@@ -962,7 +968,8 @@ one-based `nic use N`; promiscuous mode is for `tapes/bridge/` and must be resto
 before returning). Later slots: 36 `wait_for_event`, 37 `set_input_mode`, 38
 `micros`, 39/40 `alloc_frames`/`free_frames` (the 4 KiB frame pool below the big
 pool's 128 MiB start; the kernel keeps a 4 MiB reserve; `tapes/memtest/`), 41
-`kernel_stat(id, arg)` (free frames/big chunks, per-NIC recoveries/overruns).
+`kernel_stat(id, arg)` (free frames/big chunks, per-NIC recoveries/overruns, RAM reach), 42
+`e820_entry(index, out)`. `alloc`/`free` use the big pool, falling back to frames.
 
 The kernel owns every NIC (PCI, DMA, rings, overflow recovery) and never parses
 ARP/IPv4/UDP/TCP: those live in the fixed-buffer `tapes/tape-net/` library

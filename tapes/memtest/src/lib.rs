@@ -63,13 +63,15 @@ impl Test {
     }
 }
 
-/// One wrong word.
+/// One wrong word: 32 bits wide from the ordinary tests, 64 bits wide (and
+/// possibly above 4 GiB) from the long-mode ones.
 #[derive(Clone, Copy, Debug)]
 pub struct Mismatch {
-    pub address: u32,
-    pub expected: u32,
-    pub actual: u32,
+    pub address: u64,
+    pub expected: u64,
+    pub actual: u64,
     pub test: Test,
+    pub wide: bool,
 }
 
 /// Everything the tests found, accumulated across regions and passes.
@@ -78,7 +80,7 @@ pub struct Errors {
     pub recorded: [Mismatch; MAX_RECORDED],
     pub recorded_count: usize,
     /// How often each bit position was wrong (a stuck bit piles up in one slot).
-    pub bit_flips: [u32; 32],
+    pub bit_flips: [u32; 64],
     /// `(address >> 20, errors)` for each 1 MiB block with at least one error.
     pub bad_blocks: [(u32, u32); MAX_BAD_BLOCKS],
     pub bad_block_count: usize,
@@ -90,9 +92,10 @@ impl Errors {
     pub const fn new() -> Self {
         Errors {
             total: 0,
-            recorded: [Mismatch { address: 0, expected: 0, actual: 0, test: Test::Address }; MAX_RECORDED],
+            recorded: [Mismatch { address: 0, expected: 0, actual: 0, test: Test::Address, wide: false };
+                MAX_RECORDED],
             recorded_count: 0,
-            bit_flips: [0; 32],
+            bit_flips: [0; 64],
             bad_blocks: [(0, 0); MAX_BAD_BLOCKS],
             bad_block_count: 0,
             bytes_checked: 0,
@@ -107,11 +110,37 @@ impl Errors {
                 self.bit_flips[bit] = self.bit_flips[bit].saturating_add(1);
             }
         }
-        let block = address >> 20;
+        self.note(u64::from(address), u64::from(expected), u64::from(actual), test, false, 1);
+    }
+
+    /// Adds the outcome of one long-mode call: `count` wrong 64-bit words in
+    /// all, of which the first few were recorded in full (`records`: address,
+    /// expected, actual), plus the per-bit flip counts of every wrong word.
+    pub fn merge_wide(&mut self, count: u64, records: &[(u64, u64, u64)], flips: &[u64; 64], test: Test) {
+        if count == 0 {
+            return;
+        }
+        self.total = self.total.saturating_add(count.min(u64::from(u32::MAX)) as u32);
+        for (slot, &flipped) in self.bit_flips.iter_mut().zip(flips) {
+            *slot = slot.saturating_add(flipped.min(u64::from(u32::MAX)) as u32);
+        }
+        // Errors beyond the recorded ones are attributed to the first
+        // recorded address's MiB, so a bad block is never under-reported.
+        let unrecorded = count.saturating_sub(records.len() as u64).min(u64::from(u32::MAX)) as u32;
+        for (index, &(address, expected, actual)) in records.iter().enumerate() {
+            let extra = if index == 0 { unrecorded } else { 0 };
+            self.note(address, expected, actual, test, true, 1 + extra);
+        }
+    }
+
+    /// Bookkeeping shared by both widths: the bad-block table and the list of
+    /// first mismatches (one line per bad address).
+    fn note(&mut self, address: u64, expected: u64, actual: u64, test: Test, wide: bool, weight: u32) {
+        let block = (address >> 20) as u32;
         match self.bad_blocks[..self.bad_block_count].iter_mut().find(|entry| entry.0 == block) {
-            Some(entry) => entry.1 = entry.1.saturating_add(1),
+            Some(entry) => entry.1 = entry.1.saturating_add(weight),
             None if self.bad_block_count < MAX_BAD_BLOCKS => {
-                self.bad_blocks[self.bad_block_count] = (block, 1);
+                self.bad_blocks[self.bad_block_count] = (block, weight);
                 self.bad_block_count += 1;
             }
             None => {}
@@ -120,7 +149,7 @@ impl Errors {
         // repeats would push the other bad addresses off the list.
         let known = self.recorded[..self.recorded_count].iter().any(|seen| seen.address == address);
         if self.recorded_count < MAX_RECORDED && !known {
-            self.recorded[self.recorded_count] = Mismatch { address, expected, actual, test };
+            self.recorded[self.recorded_count] = Mismatch { address, expected, actual, test, wide };
             self.recorded_count += 1;
         }
     }
@@ -355,6 +384,41 @@ pub fn random_test(region: &Region, errors: &mut Errors, control: &mut dyn Contr
         }
     }
     true
+}
+
+/// 2 MiB, the large-page size the long-mode part maps RAM with.
+pub const HIGH_PAGE: u64 = 2 * 1024 * 1024;
+/// RAM above this is where the kernel's pools and 32-bit pointers stop.
+pub const FOUR_GIB: u64 = 1 << 32;
+/// The long-mode part maps up to this much physical memory (one page-directory
+/// page per GiB, so this is also its table budget).
+pub const HIGH_LIMIT: u64 = 64 << 30;
+/// Most separate usable ranges above 4 GiB that are remembered.
+pub const MAX_HIGH_RANGES: usize = 8;
+
+/// Usable RAM above 4 GiB, trimmed to whole 2 MiB pages and to `HIGH_LIMIT`:
+/// `(base, length)` pairs from the firmware's memory map entries
+/// `(base, length, type)`. Only type 1 counts; an entry that overlaps one
+/// already accepted is skipped rather than guessed at.
+pub fn high_ranges(entries: impl Iterator<Item = (u64, u64, u32)>) -> ([(u64, u64); MAX_HIGH_RANGES], usize) {
+    let mut ranges = [(0u64, 0u64); MAX_HIGH_RANGES];
+    let mut count = 0;
+    for (base, length, kind) in entries {
+        if kind != 1 {
+            continue;
+        }
+        let start = base.max(FOUR_GIB).div_ceil(HIGH_PAGE) * HIGH_PAGE;
+        let end = base.saturating_add(length).min(HIGH_LIMIT) / HIGH_PAGE * HIGH_PAGE;
+        if end <= start || count == MAX_HIGH_RANGES {
+            continue;
+        }
+        if ranges[..count].iter().any(|&(other, size)| start < other + size && other < end) {
+            continue;
+        }
+        ranges[count] = (start, end - start);
+        count += 1;
+    }
+    (ranges, count)
 }
 
 /// Fills the region with a seeded pseudo-random stream (the soak mode's
@@ -659,6 +723,7 @@ mod tests {
             let first = errors.recorded[0];
             assert_eq!(first.address, 0x0200_0000 + 123 * 4, "{name}");
             assert_eq!(first.expected ^ first.actual, 8, "{name}");
+            assert!(!first.wide, "{name}");
             assert_eq!(errors.bit_flips[3], errors.total, "{name}");
             assert_eq!(errors.bad_block_count, 1, "{name}");
             assert_eq!(errors.bad_blocks[0].0, 0x0200_0000 >> 20, "{name}");
@@ -835,5 +900,40 @@ mod tests {
         assert_eq!(errors.total, 0);
         assert!(stream_verify(&first, &mut errors, &mut control, Test::Churn, 1));
         assert_eq!(errors.total, 1000);
+    }
+
+    #[test]
+    fn wide_results_merge_with_attribution() {
+        let mut errors = Errors::new();
+        let mut flips = [0u64; 64];
+        flips[40] = 1000;
+        let records = [(0x1_2340_0000u64, 0u64, 1u64 << 40), (0x1_2340_0008, 0, 1 << 40)];
+        errors.merge_wide(1000, &records, &flips, Test::Moving);
+        assert_eq!(errors.total, 1000);
+        assert_eq!(errors.bit_flips[40], 1000);
+        assert_eq!(errors.recorded_count, 2);
+        assert!(errors.recorded[0].wide);
+        // 998 unrecorded errors land on the first record's MiB (both records
+        // are in the same MiB: 1000 in all).
+        assert_eq!(errors.bad_blocks[0], ((0x1_2340_0000u64 >> 20) as u32, 1000));
+        assert_eq!(errors.bad_block_count, 1);
+    }
+
+    #[test]
+    fn high_ranges_trim_to_pages_and_skip_the_rest() {
+        let gib = 1u64 << 30;
+        let entries = [
+            (0, 0x9f000, 1),                      // low RAM: ignored
+            (0x1_0000_0000 - 0x1000, 0x1000 + 0x40_0001, 1), // straddles 4 GiB: starts at 4 GiB, ends mid-page
+            (0x1_0040_0000 + 5 * gib, gib, 2),    // reserved: ignored
+            (6 * gib + 3, gib - 3, 1),            // unaligned start
+            (6 * gib, gib, 1),                    // overlaps the previous one: skipped
+            (63 * gib, 4 * gib, 1),               // clipped at 64 GiB
+        ];
+        let (ranges, count) = high_ranges(entries.into_iter());
+        assert_eq!(count, 3);
+        assert_eq!(ranges[0], (4 * gib, 0x40_0000));
+        assert_eq!(ranges[1], (6 * gib + HIGH_PAGE, gib - HIGH_PAGE));
+        assert_eq!(ranges[2], (63 * gib, gib));
     }
 }

@@ -29,12 +29,12 @@ MACS = [f"52:54:00:ac:00:0{n}" for n in range(1, 5)]
 
 
 class Lab:
-    def __init__(self, nic_args=None, memory="256"):
+    def __init__(self, nic_args=None, memory="256", binary="qemu-system-i386"):
         """`nic_args`: extra QEMU arguments for the NICs; by default four e1000
         joined in pairs by virtual cables (QEMU hubs)."""
         tmp = tempfile.mkdtemp(prefix="fos-selftest-")
         self.monitor = os.path.join(tmp, "mon")
-        command = ["qemu-system-i386", "-m", str(memory), "-drive", f"format=raw,file={IMAGE}", "-snapshot",
+        command = [binary, "-m", str(memory), "-drive", f"format=raw,file={IMAGE}", "-snapshot",
                    "-serial", "stdio", "-monitor", f"unix:{self.monitor},server,nowait", "-display", "none"]
         if nic_args is None:
             nic_args = []

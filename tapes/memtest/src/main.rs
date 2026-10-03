@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! tape run memtest [size=MB] [passes=N] [tests=addr,walk,moving,random]
-//!                  [hold=SECONDS] [frames=on|off] [seed=N] [inject=WORD]
+//!                  [hold=SECONDS] [frames=on|off] [high=MB] [seed=N] [inject=WORD]
 //! tape run memtest soak [for=90|5m|2h] [status=S] [net=A,B] [net.fps=N]
 //!                  [churn=on|off] [disk=soakNAME [disk.kb=N] [disk.every=S]]
 //!                  ... plus any memory option above
@@ -10,12 +10,16 @@
 //!
 //! **Memory mode.** It claims every free block of RAM it can get from the
 //! kernel -- the 4 KiB frame pool through `alloc_frames` (ABI slot 39) and the
-//! 1 MiB big pool through `alloc` -- up to `size=` MiB in total (default:
-//! everything), runs the selected tests over each block and reports mismatches
-//! with their physical addresses. `passes=0` repeats until Escape. The kernel
-//! keeps a 4 MiB reserve of frames for itself, and the tape's own 4 MiB, the
-//! kernel's low-memory region and anything above 2 GiB (unmapped) are out of
-//! reach, so "no errors" covers what was claimed, which the tape prints up front.
+//! 1 MiB big pool through `alloc` (up to the RAM the kernel maps below 4 GiB) --
+//! and, on a CPU with long mode, the RAM above 4 GiB, which only a short
+//! 64-bit excursion per 32 MiB slice (`longmode.S`) can address. `size=` caps the
+//! total in MiB (default: everything), `high=MB` sizes the above-4 GiB part on
+//! its own (`high=0` skips it). It runs the selected tests over each block and
+//! reports mismatches with their physical addresses; `passes=0` repeats until
+//! Escape. The kernel keeps a 4 MiB reserve of frames for itself, and the
+//! tape's own 4 MiB and the kernel's low-memory region are out of reach, so "no
+//! errors" covers what was claimed, which the tape prints up front (against the
+//! firmware's own total).
 //!
 //! **Soak mode** is for "how does the whole OS hold up under long, heavy use".
 //! The memory tests run on repeat (until `for=` elapses or Escape), and the
@@ -48,11 +52,13 @@
 
 extern crate memtest_tape;
 
+mod longmode;
+
 use core::ptr::addr_of_mut;
 use memtest_tape::{
-    ClockMonitor, Control, Errors, FrameCheck, LinkStats, MIN_FRAME, Region, Rng, Test, address_test, build_frame,
-    check_frame, fill_bytes, fill_pattern, first_mismatch, moving_test, random_test, stream_fill, stream_verify,
-    verify_pattern, walking_test,
+    ClockMonitor, Control, Errors, FrameCheck, HIGH_PAGE, LinkStats, MAX_HIGH_RANGES, MIN_FRAME, MOVING_PATTERNS,
+    Region, Rng, Test, address_test, build_frame, check_frame, fill_bytes, fill_pattern, first_mismatch, high_ranges,
+    moving_test, random_test, stream_fill, stream_verify, verify_pattern, walking_test,
 };
 use tape_rt::{print_bytes, print_u32};
 
@@ -76,6 +82,7 @@ const STAT_FREE_FRAMES: u32 = 0;
 const STAT_FREE_BIG: u32 = 1;
 const STAT_NIC_RECOVERIES: u32 = 2;
 const STAT_NIC_OVERRUNS: u32 = 3;
+const STAT_RAM_USABLE: u32 = 5;
 
 // A tape runs on the 64 KiB kernel stack, so every sizeable buffer is static.
 static mut TX_FRAME: [u8; FRAME_BUFFER] = [0; FRAME_BUFFER];
@@ -102,6 +109,8 @@ struct Options<'a> {
     random: bool,
     hold_s: u32,
     frames: bool,
+    /// Cap (MiB) for the long-mode tranche above 4 GiB; 0 switches it off.
+    high_mib: Option<u32>,
     seed: u32,
     inject: Option<usize>,
     soak: bool,
@@ -399,6 +408,7 @@ fn parse_options(arguments: &[u8]) -> Option<Options<'_>> {
         random: true,
         hold_s: 0,
         frames: true,
+        high_mib: None,
         seed: 1,
         inject: None,
         soak: false,
@@ -429,6 +439,7 @@ fn parse_options(arguments: &[u8]) -> Option<Options<'_>> {
             }
             b"hold" => options.hold_s = parse_u32(value)?,
             b"seed" => options.seed = parse_u32(value)?,
+            b"high" => options.high_mib = Some(parse_u32(value)?),
             b"inject" => options.inject = Some(parse_u32(value)? as usize),
             b"for" => options.for_s = parse_duration(value)?,
             b"status" => options.status_s = parse_duration(value).filter(|&seconds| seconds >= 1)?,
@@ -490,6 +501,20 @@ fn print_hex(putc: Putc, value: u32) {
     }
 }
 
+/// Sixteen hex digits (a 64-bit data word).
+fn print_hex64(putc: Putc, value: u64) {
+    print_hex(putc, (value >> 32) as u32);
+    print_hex(putc, value as u32);
+}
+
+/// A physical address: eight hex digits, or sixteen once it needs them.
+fn print_address(putc: Putc, value: u64) {
+    if value >> 32 != 0 {
+        print_hex(putc, (value >> 32) as u32);
+    }
+    print_hex(putc, value as u32);
+}
+
 fn print_signed(putc: Putc, value: i64) {
     if value < 0 {
         putc(u32::from(b'-'));
@@ -531,7 +556,7 @@ fn claim(
     granule: u32,
     minimum: u32,
     from_frames: bool,
-    alloc: extern "C" fn(u32) -> u32,
+    alloc: &dyn Fn(u32) -> u32,
 ) {
     let mut want = (*remaining).min(pool_max) / granule * granule;
     while want >= minimum && *count < MAX_REGIONS && *remaining >= granule {
@@ -557,6 +582,18 @@ struct Pools {
 }
 
 impl Pools {
+    /// `alloc` serves the big pool and falls back to the frame pool when the
+    /// big one has nothing. This tape claims the frame pool explicitly (and
+    /// `frames=off` must mean it), so a fallback allocation is handed straight back.
+    fn alloc_big_only(&self, bytes: u32) -> u32 {
+        let address = (self.alloc)(bytes);
+        if address != 0 && address < FRAME_POOL_MAX {
+            (self.free)(address, bytes);
+            return 0;
+        }
+        address
+    }
+
     fn release(&self, block: Block) {
         if block.from_frames {
             (self.free_frames)(block.address, block.bytes);
@@ -571,9 +608,9 @@ impl Pools {
         let mut count = 0;
         let mut remaining = options.size_mib.map_or(u32::MAX, |mib| mib.saturating_mul(MIB));
         if options.frames {
-            claim(blocks, &mut count, &mut remaining, FRAME_POOL_MAX, 4096, MIN_FRAME_BLOCK, true, self.alloc_frames);
+            claim(blocks, &mut count, &mut remaining, FRAME_POOL_MAX, 4096, MIN_FRAME_BLOCK, true, &|bytes| (self.alloc_frames)(bytes));
         }
-        claim(blocks, &mut count, &mut remaining, BIG_POOL_MAX, MIB, MIB, false, self.alloc);
+        claim(blocks, &mut count, &mut remaining, BIG_POOL_MAX, MIB, MIB, false, &|bytes| self.alloc_big_only(bytes));
         let total = blocks[..count].iter().map(|block| u64::from(block.bytes)).sum();
         (count, total)
     }
@@ -691,6 +728,7 @@ pub extern "C" fn tape_main(
     alloc_frames: extern "C" fn(u32) -> u32,
     free_frames: extern "C" fn(u32, u32),
     kernel_stat: extern "C" fn(u32, u32) -> u32,
+    e820_entry: extern "C" fn(u32, u32) -> u32,
 ) {
     let arguments = if args_len == 0 {
         &[][..]
@@ -706,6 +744,7 @@ pub extern "C" fn tape_main(
             b"Usage: tape run memtest [size=MB] [passes=N] [hold=S] [seed=N]\n\
               \x20      [tests=addr,walk,moving,random] [frames=on|off] [inject=WORD]\n\
               passes=0 repeats until Escape; hold=S adds a retention test.\n\
+              high=MB sizes the RAM above 4 GiB (64-bit excursions); high=0 skips it.\n\
               Soak: tape run memtest soak [for=90|5m|2h] [status=S] [net=A,B]\n\
               \x20      [net.fps=N] [churn=on|off] [disk=soakNAME [disk.kb=N] [disk.every=S]]\n\
               disk= is never on by itself; the name must start with 'soak'.\n",
@@ -745,7 +784,13 @@ pub extern "C" fn tape_main(
     // big pool cannot), then the big pool.
     let mut blocks = [NO_BLOCK; MAX_REGIONS];
     let (mut count, claimed_bytes) = pools.claim_all(&options, &mut blocks);
-    if count == 0 {
+    // RAM above 4 GiB: only a 64-bit excursion can touch it.
+    let long_mode = longmode::supported();
+    let (high, high_left_out) = find_high(e820_entry, &options, long_mode, claimed_bytes);
+    if high.count != 0 {
+        longmode::prepare();
+    }
+    if count == 0 && high.count == 0 {
         print_bytes(putc, b"memtest: no free memory could be claimed (try frames=on; the big pool\n");
         print_bytes(putc, b"only exists above 128 MiB).\n");
         return;
@@ -760,10 +805,27 @@ pub extern "C" fn tape_main(
         print_u32(putc, block.bytes / 1024);
         print_bytes(putc, if block.from_frames { b" KiB (frame pool)" } else { b" KiB (big pool)" });
     }
+    for (index, &(start, length)) in high.ranges[..high.count].iter().enumerate() {
+        print_bytes(putc, b"\nhigh ");
+        print_u32(putc, index as u32 + 1);
+        print_bytes(putc, b": 0x");
+        print_hex64(putc, start);
+        print_bytes(putc, b" + ");
+        print_u32(putc, (length / 1024) as u32);
+        print_bytes(putc, b" KiB (64-bit mode)");
+    }
     print_bytes(putc, b"\ntesting ");
-    print_u32(putc, (claimed_bytes / u64::from(MIB)) as u32);
-    print_bytes(putc, b" MiB; Escape stops. Not covered: the tape's own 4 MiB, the kernel's\n");
-    print_bytes(putc, b"low memory, the kernel's 4 MiB frame reserve, and RAM above 2 GiB.\n");
+    print_u32(putc, ((claimed_bytes + high.bytes()) / u64::from(MIB)) as u32);
+    print_bytes(putc, b" of ");
+    print_u32(putc, kernel_stat(STAT_RAM_USABLE, 0));
+    print_bytes(putc, b" MiB RAM (E820); Escape stops.\n");
+    if high_left_out != 0 {
+        print_u32(putc, (high_left_out / u64::from(MIB)) as u32);
+        print_bytes(putc, b" MiB above 4 GiB left out: ");
+        print_bytes(putc, if !long_mode { b"this CPU has no long mode.\n" } else { b"size=/high= limit.\n" });
+    }
+    print_bytes(putc, b"Not covered: the tape's own 4 MiB, kernel low memory, the 4 MiB frame\n");
+    print_bytes(putc, b"reserve, and 2-4 GiB RAM the kernel did not map (PCI hole edges).\n");
     if let Some(soak) = soak.as_mut() {
         // The clock starts when the tests do, not while memory was being claimed.
         let now = micros();
@@ -826,6 +888,9 @@ pub extern "C" fn tape_main(
                 if !finished {
                     break;
                 }
+            }
+            if high.count != 0 && !control.aborted && !control.timed_out {
+                run_high_test(test, &high, &mut errors, &mut control, &options, pass, micros);
             }
             if !options.soak || errors.total != before {
                 if options.soak {
@@ -907,7 +972,7 @@ pub extern "C" fn tape_main(
         print_bytes(putc, b"\nbad MiB blocks:");
         for &(block, flips) in &errors.bad_blocks[..errors.bad_block_count] {
             print_bytes(putc, b" 0x");
-            print_hex(putc, block << 20);
+            print_address(putc, u64::from(block) << 20);
             print_bytes(putc, b"=");
             print_u32(putc, flips);
         }
@@ -960,11 +1025,19 @@ fn print_new_mismatches(putc: Putc, errors: &Errors, printed: &mut usize) {
     while *printed < errors.recorded_count {
         let mismatch = errors.recorded[*printed];
         print_bytes(putc, b"  0x");
-        print_hex(putc, mismatch.address);
+        print_address(putc, mismatch.address);
         print_bytes(putc, b" want ");
-        print_hex(putc, mismatch.expected);
+        if mismatch.wide {
+            print_hex64(putc, mismatch.expected);
+        } else {
+            print_hex(putc, mismatch.expected as u32);
+        }
         print_bytes(putc, b" got ");
-        print_hex(putc, mismatch.actual);
+        if mismatch.wide {
+            print_hex64(putc, mismatch.actual);
+        } else {
+            print_hex(putc, mismatch.actual as u32);
+        }
         print_bytes(putc, b" (");
         print_bytes(putc, mismatch.test.name());
         print_bytes(putc, b")\n");
@@ -1227,6 +1300,212 @@ impl Verdict {
             }
         }
     }
+}
+
+
+/// Memory above 4 GiB, tested through `longmode.rs` in slices.
+struct High {
+    ranges: [(u64, u64); MAX_HIGH_RANGES],
+    count: usize,
+}
+
+/// A slice is one excursion's window: short enough that the timer interrupt
+/// is off for a few milliseconds at most.
+const HIGH_SLICE: u64 = 32 * 1024 * 1024;
+
+impl High {
+    fn bytes(&self) -> u64 {
+        self.ranges[..self.count].iter().map(|range| range.1).sum()
+    }
+
+    /// Runs `visit(base, bytes)` over every slice, stopping early (and returning
+    /// `false`) if it says so.
+    fn for_each_slice(&self, mut visit: impl FnMut(u64, u64) -> bool) -> bool {
+        for &(start, length) in &self.ranges[..self.count] {
+            let mut offset = 0;
+            while offset < length {
+                let bytes = HIGH_SLICE.min(length - offset);
+                if !visit(start + offset, bytes) {
+                    return false;
+                }
+                offset += bytes;
+            }
+        }
+        true
+    }
+}
+
+/// Reads the firmware memory map and works out which usable RAM above 4 GiB
+/// to test, capped by `high=`. Returns the ranges and whether any RAM there
+/// had to be left out for lack of long mode (or `high=0`).
+fn find_high(
+    e820_entry: extern "C" fn(u32, u32) -> u32,
+    options: &Options<'_>,
+    long_mode: bool,
+    claimed: u64,
+) -> (High, u64) {
+    let mut buffer = [0u8; 24];
+    let mut entries = [(0u64, 0u64, 0u32); 32];
+    let mut total = 0;
+    while total < entries.len() && e820_entry(total as u32, buffer.as_mut_ptr() as u32) != 0 {
+        let word = |at: usize| u64::from_le_bytes(buffer[at..at + 8].try_into().unwrap());
+        entries[total] = (word(0), word(8), u32::from_le_bytes(buffer[16..20].try_into().unwrap()));
+        total += 1;
+    }
+    let (mut ranges, mut count) = high_ranges(entries[..total].iter().copied());
+    let available: u64 = ranges[..count].iter().map(|range| range.1).sum();
+    // `high=MB` sets this tranche's size; without it, `size=` is the total for
+    // everything, so the long-mode part gets what the pools did not use.
+    let cap = match (options.high_mib, options.size_mib) {
+        (Some(mib), _) => u64::from(mib) * u64::from(MIB),
+        (None, Some(mib)) => (u64::from(mib) * u64::from(MIB)).saturating_sub(claimed),
+        (None, None) => u64::MAX,
+    } / HIGH_PAGE
+        * HIGH_PAGE;
+    if !long_mode || cap == 0 {
+        return (High { ranges, count: 0 }, available);
+    }
+    let mut left = cap;
+    for index in 0..count {
+        ranges[index].1 = ranges[index].1.min(left);
+        left -= ranges[index].1;
+        if ranges[index].1 == 0 {
+            count = index;
+            break;
+        }
+    }
+    let high = High { ranges, count };
+    let tested = high.bytes();
+    (high, available - tested)
+}
+
+/// One long-mode operation, its results merged into `errors`.
+fn wide_op(errors: &mut Errors, test: Test, op: u64, base: u64, qwords: u64, arg0: u64, arg1: u64, arg2: u64) {
+    let job = longmode::run(op, base, qwords, arg0, arg1, arg2);
+    if matches!(op, longmode::OP_VERIFY_PATTERN | longmode::OP_VERIFY_ADDRESS | longmode::OP_VERIFY_RANDOM | longmode::OP_SWEEP) {
+        errors.bytes_checked += qwords * 8;
+    }
+    let recorded = (job.recorded as usize).min(job.records.len());
+    let mut records = [(0u64, 0u64, 0u64); 16];
+    for (slot, record) in records.iter_mut().zip(&job.records[..recorded]) {
+        *slot = (record[0], record[1], record[2]);
+    }
+    errors.merge_wide(job.errors, &records[..recorded], &job.flips, test);
+}
+
+/// The test's fault injection for the long-mode part: flip bit 3 of one
+/// qword (`inject=` counts qwords here), once per write sweep, like the
+/// 32-bit `Control::after_write`.
+fn wide_inject(control: &Kernel<'_>, errors: &mut Errors, test: Test, base: u64, qwords: u64) {
+    if let Some(index) = control.inject {
+        if (index as u64) < qwords {
+            wide_op(errors, test, longmode::OP_FLIP, 0, 0, base + index as u64 * 8, 0x8, 0);
+        }
+    }
+}
+
+fn replicate(pattern: u32) -> u64 {
+    u64::from(pattern) << 32 | u64::from(pattern)
+}
+
+/// One test over every slice of the high memory. Returns `false` if aborted.
+fn run_high_test(
+    test: Test,
+    high: &High,
+    errors: &mut Errors,
+    control: &mut Kernel<'_>,
+    options: &Options<'_>,
+    pass: u32,
+    micros: extern "C" fn() -> u64,
+) -> bool {
+    use longmode::*;
+    if test == Test::Retention {
+        for pattern in [0xaaaa_aaaa_aaaa_aaaa_u64, 0x5555_5555_5555_5555] {
+            let filled = high.for_each_slice(|base, bytes| {
+                map_window(base, bytes, true);
+                wide_op(errors, test, OP_FILL_PATTERN, base, bytes / 8, pattern, 0, 0);
+                map_window(base, bytes, false);
+                control.poll()
+            });
+            let deadline = micros() + u64::from(options.hold_s) * 1_000_000;
+            let mut waiting = filled;
+            while waiting && micros() < deadline {
+                waiting = control.poll();
+            }
+            let verified = waiting
+                && high.for_each_slice(|base, bytes| {
+                    map_window(base, bytes, true);
+                    wide_op(errors, test, OP_VERIFY_PATTERN, base, bytes / 8, pattern, 0, 0);
+                    map_window(base, bytes, false);
+                    control.poll()
+                });
+            if !verified {
+                return false;
+            }
+        }
+        return true;
+    }
+    high.for_each_slice(|base, bytes| {
+        let qwords = bytes / 8;
+        map_window(base, bytes, true);
+        let finished = (|| {
+            match test {
+                Test::Address => {
+                    for invert in [0, u64::MAX] {
+                        wide_op(errors, test, OP_FILL_ADDRESS, base, qwords, 0, invert, 0);
+                        wide_inject(control, errors, test, base, qwords);
+                        wide_op(errors, test, OP_VERIFY_ADDRESS, base, qwords, 0, invert, 0);
+                        if !control.poll() {
+                            return false;
+                        }
+                    }
+                }
+                Test::Walking => {
+                    // All 64 data lines, each as a lone one and a lone zero.
+                    for bit in 0..64 {
+                        for pattern in [1u64 << bit, !(1u64 << bit)] {
+                            wide_op(errors, test, OP_FILL_PATTERN, base, qwords, pattern, 0, 0);
+                            wide_inject(control, errors, test, base, qwords);
+                            wide_op(errors, test, OP_VERIFY_PATTERN, base, qwords, pattern, 0, 0);
+                            if !control.poll() {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                Test::Moving => {
+                    for pattern in MOVING_PATTERNS {
+                        let pattern = replicate(pattern);
+                        wide_op(errors, test, OP_FILL_PATTERN, base, qwords, pattern, 0, 0);
+                        wide_inject(control, errors, test, base, qwords);
+                        for (expected, replacement, ascending) in [(pattern, !pattern, 1), (!pattern, pattern, 0)] {
+                            wide_op(errors, test, OP_SWEEP, base, qwords, expected, replacement, ascending);
+                            wide_inject(control, errors, test, base, qwords);
+                        }
+                        wide_op(errors, test, OP_VERIFY_PATTERN, base, qwords, pattern, 0, 0);
+                        if !control.poll() {
+                            return false;
+                        }
+                    }
+                }
+                Test::Random => {
+                    let seed = u64::from(options.seed.wrapping_add(pass)) << 32 | (base >> 21);
+                    for invert in [0, u64::MAX] {
+                        wide_op(errors, test, OP_FILL_RANDOM, base, qwords, seed, invert, 0);
+                        wide_inject(control, errors, test, base, qwords);
+                        wide_op(errors, test, OP_VERIFY_RANDOM, base, qwords, seed, invert, 0);
+                        if !control.poll() {
+                            return false;
+                        }
+                    }
+                }
+                Test::Retention | Test::Churn => {}
+            }
+            true
+        })();
+        map_window(base, bytes, false);
+        finished
+    })
 }
 
 /// Retention: fill with a pattern, leave it alone for `seconds`, verify; then

@@ -19,6 +19,9 @@
 use core::arch::asm;
 
 #[cfg(not(feature = "legacy-unsafe-memory"))]
+use crate::boot_info::{BootInfo, MemoryRegion};
+
+#[cfg(not(feature = "legacy-unsafe-memory"))]
 use crate::cpu;
 
 #[cfg(not(feature = "legacy-unsafe-memory"))]
@@ -115,7 +118,7 @@ unsafe extern "C" {
 /// owns its BAR. Leaving every other high range absent gives the page-fault
 /// handler a useful signal without breaking established address ranges.
 #[cfg(not(feature = "legacy-unsafe-memory"))]
-pub fn initialize() -> Result<(), Error> {
+pub fn initialize(info: &BootInfo) -> Result<(), Error> {
     let (feature_edx, _) = cpu::features();
     if feature_edx & CPUID_PAGE_SIZE_EXTENSIONS == 0 {
         return Err(Error::MissingPageSizeExtensions);
@@ -143,6 +146,10 @@ pub fn initialize() -> Result<(), Error> {
             let entry = if index == 0 {
                 low_page_table as u32 | PAGE_PRESENT | PAGE_WRITABLE
             } else if address < IDENTITY_LOW_END {
+                address | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE
+            } else if range_is_usable_ram(info, address, LARGE_PAGE_SIZE) {
+                // 2-4 GiB: only 4 MiB pages that are wholly usable RAM, so
+                // the PCI hole (where BARs live) stays absent.
                 address | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE
             } else {
                 0
@@ -179,6 +186,66 @@ pub fn initialize() -> Result<(), Error> {
     );
     flush_tlb(directory_address);
     Ok(())
+}
+
+/// Whether `[start, start + length)` lies entirely inside type-1 (usable)
+/// E820 regions. Adjacent or overlapping regions are followed one after the
+/// other, so a firmware that reports RAM in several pieces still counts.
+#[cfg(not(feature = "legacy-unsafe-memory"))]
+fn range_is_usable_ram(info: &BootInfo, start: u32, length: u32) -> bool {
+    let end = u64::from(start) + u64::from(length);
+    let count = usize::from(unsafe {
+        core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_region_count))
+    });
+    let mut position = u64::from(start);
+    while position < end {
+        let mut next = None;
+        for index in 0..count {
+            let region: MemoryRegion = unsafe {
+                core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index]))
+            };
+            let (kind, base, size) = unsafe {
+                (
+                    core::ptr::read_unaligned(core::ptr::addr_of!(region.kind)),
+                    core::ptr::read_unaligned(core::ptr::addr_of!(region.base)),
+                    core::ptr::read_unaligned(core::ptr::addr_of!(region.length)),
+                )
+            };
+            let region_end = base.saturating_add(size);
+            if kind == 1 && base <= position && position < region_end {
+                next = Some(next.map_or(region_end, |best: u64| best.max(region_end)));
+            }
+        }
+        match next {
+            Some(region_end) => position = region_end,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Whether `address` is plain RAM the kernel mapped at boot: everything below
+/// 2 GiB, and above that only the 4 MiB pages `initialize` found to be usable
+/// RAM. The big pool asks this so it never offers a chunk that would fault.
+pub fn identity_mapped(address: u32) -> bool {
+    #[cfg(feature = "legacy-unsafe-memory")]
+    {
+        let _ = address;
+        true
+    }
+    #[cfg(not(feature = "legacy-unsafe-memory"))]
+    {
+        if address < IDENTITY_LOW_END {
+            return true;
+        }
+        let pde = unsafe {
+            core::ptr::addr_of!(PAGE_DIRECTORY.0)
+                .cast::<u32>()
+                .add((address / LARGE_PAGE_SIZE) as usize)
+                .read()
+        };
+        pde & PAGE_PRESENT != 0 && pde & PAGE_LARGE != 0
+    }
 }
 
 /// Maps one PCI memory-BAR range at its physical address.
@@ -265,6 +332,9 @@ pub fn describe_address(address: u32) -> &'static str {
         if address < IDENTITY_LOW_END {
             return "low physical identity map";
         }
+        if identity_mapped(address) {
+            return "RAM above 2 GiB (identity map)";
+        }
         if is_dynamic_mapping_present(address) {
             return "registered PCI MMIO";
         }
@@ -343,6 +413,10 @@ fn dynamic_page_table(directory: *mut u32, pde_index: usize) -> Result<*mut u32,
     unsafe {
         let directory_entry = directory.add(pde_index);
         let existing = directory_entry.read();
+        if existing & PAGE_LARGE != 0 && existing & PAGE_PRESENT != 0 {
+            // A 4 MiB RAM page (2-4 GiB): a BAR can never be inside RAM.
+            return Err(MapError::PageTableCapacity);
+        }
         if existing & PAGE_PRESENT != 0 {
             return Ok((existing & 0xffff_f000) as *mut u32);
         }

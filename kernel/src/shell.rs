@@ -6446,9 +6446,19 @@ extern "C" fn combined_tape_read_key() -> u32 {
 /// kernel code" reasoning `tape_run`'s own doc comment already gives for
 /// tapes in general, and the same manual-only contract `palloc`/`pfree`
 /// already have from the shell.
+///
+/// **One allocator for tapes, two pools underneath.** The big pool (1 MiB
+/// chunks, 128 MiB up to the mapped RAM below 4 GiB) is tried first. If it has
+/// no run that long -- always, on a machine with 128 MiB of RAM or less --
+/// the 4 KiB frame pool serves the request instead (rounded up to whole
+/// frames, still leaving `TAPE_FRAME_RESERVE` free for the kernel). The two
+/// ranges never overlap, so `tape_free` tells them apart by address alone.
 extern "C" fn tape_alloc(bytes: u32) -> u32 {
     let chunks = bytes.div_ceil(pmem::BIG_CHUNK_SIZE) as usize;
-    pmem::allocate_big_contiguous(chunks).unwrap_or(0)
+    match pmem::allocate_big_contiguous(chunks) {
+        Some(address) => address,
+        None => tape_alloc_frames(bytes),
+    }
 }
 
 /// `tape_alloc`'s exact opposite: releases the same `bytes` (rounded up
@@ -6459,6 +6469,10 @@ extern "C" fn tape_alloc(bytes: u32) -> u32 {
 /// than corrupting accounting, so a slightly-wrong `bytes` value here is
 /// safe, if still a bug worth fixing in the tape itself.
 extern "C" fn tape_free(address: u32, bytes: u32) {
+    if address < pmem::BIG_POOL_BASE {
+        tape_free_frames(address, bytes);
+        return;
+    }
     let chunks = bytes.div_ceil(pmem::BIG_CHUNK_SIZE) as usize;
     pmem::free_big(address, chunks);
 }
@@ -6500,7 +6514,9 @@ extern "C" fn tape_free_frames(address: u32, bytes: u32) {
 /// notice leaks and silent NIC trouble that the tape cannot see by itself.
 /// `id` 0: free 4 KiB frames; 1: free 1 MiB big-pool chunks; 2/3/4: for the
 /// NIC with zero-based index `arg`, watchdog recoveries / receive overruns /
-/// failed recoveries. Anything unknown (or a missing NIC) returns `u32::MAX`.
+/// failed recoveries; 5/6/7: MiB of usable RAM per the firmware, tracked by the
+/// kernel's pools, and above 4 GiB. Anything unknown (or a missing NIC)
+/// returns `u32::MAX`.
 extern "C" fn tape_kernel_stat(id: u32, arg: u32) -> u32 {
     let health = || nic::get_at(arg as usize).map(|nic| nic.health());
     match id {
@@ -6509,8 +6525,44 @@ extern "C" fn tape_kernel_stat(id: u32, arg: u32) -> u32 {
         2 => health().map_or(u32::MAX, |health| health.recoveries),
         3 => health().map_or(u32::MAX, |health| health.rx_overruns),
         4 => health().map_or(u32::MAX, |health| health.recovery_failures),
+        5..=7 => {
+            let Some(info) = tape_boot_info() else { return u32::MAX };
+            let reach = pmem::memory_reach(info);
+            let bytes = match id {
+                5 => reach.usable,
+                6 => reach.pooled,
+                _ => reach.above_4g,
+            };
+            (bytes / (1024 * 1024)).min(u64::from(u32::MAX - 1)) as u32
+        }
         _ => u32::MAX,
     }
+}
+
+/// Tape ABI slot 42: `e820_entry(index, out) -> 1|0`. Copies firmware memory
+/// map entry `index` to `out` as 24 bytes: base (u64), length (u64), type
+/// (u32, 1 = usable RAM), padding (u32); returns 0 when `index` is past the
+/// end. Lets a tape find RAM the kernel's pools cannot reach (above 4 GiB),
+/// which only the long-mode part of `memtest` touches.
+extern "C" fn tape_e820_entry(index: u32, out: u32) -> u32 {
+    let Some(info) = tape_boot_info() else { return 0 };
+    let count = usize::from(read_u16(core::ptr::addr_of!(info.memory_region_count)));
+    if out == 0 || index as usize >= count {
+        return 0;
+    }
+    let region: MemoryRegion = unsafe {
+        core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index as usize]))
+    };
+    let base = read_u64(core::ptr::addr_of!(region.base));
+    let length = read_u64(core::ptr::addr_of!(region.length));
+    let kind = read_u32(core::ptr::addr_of!(region.kind));
+    unsafe {
+        core::ptr::write_unaligned(out as *mut u64, base);
+        core::ptr::write_unaligned((out + 8) as *mut u64, length);
+        core::ptr::write_unaligned((out + 16) as *mut u32, kind);
+        core::ptr::write_unaligned((out + 20) as *mut u32, 0);
+    }
+    1
 }
 
 fn tape_boot_info() -> Option<&'static BootInfo> {
@@ -6852,6 +6904,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         alloc_frames: extern "C" fn(u32) -> u32,
         free_frames: extern "C" fn(u32, u32),
         kernel_stat: extern "C" fn(u32, u32) -> u32,
+        e820_entry: extern "C" fn(u32, u32) -> u32,
     );
     let entry: TapeEntry =
         unsafe { core::mem::transmute::<usize, TapeEntry>(tape_entry() as usize) };
@@ -6903,6 +6956,7 @@ fn tape_run(info: &BootInfo, arguments: &[u8]) {
         tape_alloc_frames,
         tape_free_frames,
         tape_kernel_stat,
+        tape_e820_entry,
     );
     crate::debug::watchdog_tape_running(false);
     unsafe {
@@ -9097,6 +9151,20 @@ fn print_memory_summary(info: &BootInfo) {
     }
     println!("E820 summary: {usable} usable bytes; {reserved} non-usable bytes");
     println!("(reserved/ACPI/bad).");
+    // What the firmware reports is not what the kernel can hand out: a 32-bit
+    // kernel without PAE sees nothing above 4 GiB, and RAM next to the PCI
+    // hole only counts where whole 4 MiB pages are mapped.
+    let reach = pmem::memory_reach(info);
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    println!(
+        "Usable RAM {} MiB; kernel pools track {} MiB of it.",
+        mib(reach.usable),
+        mib(reach.pooled)
+    );
+    println!(
+        "Above 4 GiB (no pool, only long-mode memtest): {} MiB.",
+        mib(reach.above_4g)
+    );
 }
 
 fn print_region(index: usize, region: MemoryRegion) {

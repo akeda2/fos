@@ -880,7 +880,7 @@ consistency while building this table:
 | `audio-rtp` | `static LOCAL_IP/PREFIX GATEWAY [PORT]` or `dhcp [PORT]` listens and plays (raw PCM and Opus both auto-detected on receive).<br>`static ... send [opus] NAME PEER_IP [PEER_PORT] [BITRATE]` (or `dhcp send ...`) replays a FOSFS file.<br>`... capture [opus] PEER_IP [PEER_PORT] [BITRATE]` streams the live ADC.<br>`... duplex [opus] PEER_IP [PEER_PORT] [BITRATE]` listens and streams the live ADC simultaneously. `PORT`/`PEER_PORT` default to `5004`; `duplex`'s own listen port is always `5004`, not separately configurable. |
 | `beep` | (no args) |
 | `bigsieve` | (no args) |
-| `memtest` | `[memtest] [soak [for=90\|5m\|2h] [status=S] [net=A,B] [net.fps=N] [churn=on\|off] [disk=soakNAME [disk.kb=N] [disk.every=S]]] [size=MB] [passes=N] [tests=addr,walk,moving,random] [hold=SECONDS] [frames=on\|off] [seed=N] [inject=WORD]`. RAM tester: claims free RAM (frame pool and big pool), runs the tests, reports bad addresses, bits and MiB blocks. `passes=0` repeats until Escape; `soak` is the long-run stress mode, see `tapes/memtest/` below. |
+| `memtest` | `[memtest] [soak [for=90\|5m\|2h] [status=S] [net=A,B] [net.fps=N] [churn=on\|off] [disk=soakNAME [disk.kb=N] [disk.every=S]]] [size=MB] [passes=N] [tests=addr,walk,moving,random] [hold=SECONDS] [frames=on\|off] [high=MB] [seed=N] [inject=WORD]`. RAM tester: claims free RAM (frame pool, big pool, and above 4 GiB through 64-bit excursions), runs the tests, reports bad addresses, bits and MiB blocks. `passes=0` repeats until Escape; `soak` is the long-run stress mode, see `tapes/memtest/` below. |
 | `nettest` | `[nettest] selftest GEN IN OUT SINK`, `[nettest] routertest GEN SINK` (ready-made lab / router test, see `docs/nettest.md`), or `[nettest] [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]] [rate=KBIT] [queue=N] [seed=N] [dup=PCT] [reorder=PCT] [corrupt=PCT] [preset=NAME] [view=on]`, or `@nettest.cfg` (one command per line; an annotated example, `nettest.cfg`, is installed on every image, source `tapes/nettest/nettest.cfg`). Two-port link impairment between NICs A and B (default 1 and 2); prefix a setting with `ab.` or `ba.` for one direction. Prompt commands: `loss`, `delay`, `rate`, `queue`, `dup`, `reorder`, `corrupt`, `preset`, `presets`, `seed`, `show`, `stats`, `view on|off`, `reset [stats]`, `help`, `quit`. |
 | `bridge` | (no args) bridges every initialized interface.<br>`[bridge] NIC [NIC ...]` selects specific one-based `nic list` numbers (at least two, all distinct). |
 | `calc` | (no args) starts an interactive reverse-Polish-notation REPL.<br>`EXPRESSION` evaluates one expression and returns, e.g. `3 4 +`. |
@@ -1157,16 +1157,30 @@ matching what was sent.
 
 A RAM tester. `tape run memtest` claims every free block it can get (the 4 KiB
 frame pool through ABI slot 39 `alloc_frames`, which keeps a 4 MiB reserve for the
-kernel, then the 1 MiB big pool through `alloc`), runs address, walking
+kernel, then the 1 MiB big pool through `alloc`, which reaches the RAM the kernel
+maps below 4 GiB, PCI hole excluded), runs address, walking
 ones/zeros, moving-inversion and random tests over each block, and prints every
 mismatch with its physical address, the bit positions that flipped and the 1 MiB
 blocks that went bad. `size=MB` limits how much is tested, `passes=0` loops until
 Escape, `hold=S` adds a retention test (fill, wait, verify). `inject=WORD` flips
 a bit on purpose to prove detection works, since QEMU's RAM never fails. It does
-not cover the tape's own 4 MiB, the kernel's low memory, its frame reserve or RAM
-above 2 GiB (unmapped), and it prints what it claimed so "PASS" is never
-vaguer than that. The engine is `tapes/memtest/src/lib.rs` (host unit tests);
-`make test-tape-memtest` also boots QEMU.
+not cover the tape's own 4 MiB, the kernel's low memory or its frame reserve, and
+it prints what it tested against the firmware's total so "PASS" is never vaguer
+than that.
+
+**RAM above 4 GiB** (a 16 GiB machine has most of its memory there) is beyond a
+32-bit kernel, so on a CPU with long mode memtest reads the firmware map
+(ABI slot 42 `e820_entry`) and tests those ranges through short 64-bit excursions
+(`tapes/memtest/src/longmode.S`, the same safe mode switch as `tapes/longmode64_shim.S`), 32 MiB
+per excursion so the keyboard, watchdog and network are served between slices.
+It tests all 64 data lines, and `high=MB` sizes this part on its own (`high=0`
+skips it; otherwise `size=` is the total). Interrupts are off during each
+excursion, and an NMI during one would find a 32-bit IDT. Without long mode (a
+Pentium 4) the RAM above 4 GiB is reported as left out. QEMU's i386 CPU has no long
+mode: the e2e test uses `qemu-system-x86_64` for that part.
+
+The engine is `tapes/memtest/src/lib.rs` (host unit tests); `make test-tape-memtest`
+also boots QEMU.
 
 **Soak mode** (`tape run memtest soak ...`) is for long, heavy use of the whole
 OS: the memory tests repeat until `for=` (seconds, `5m`, `2h`) or Escape, and

@@ -94,13 +94,17 @@ pub const BIG_CHUNK_SIZE: u32 = 1024 * 1024;
 /// so the two pools can never both claim the same physical memory.
 pub const BIG_POOL_BASE: u32 = TRACKED_BYTES;
 /// Total physical address space this pool tracks, `BIG_POOL_BASE`
-/// through this address -- 2 GiB, matching the largest current 32-bit
-/// physical-memory target (see AGENTS.md). A machine with less
-/// RAM than this simply never has the extra chunks marked free in the
-/// first place (see `initialize`); raising this constant costs only a
-/// little more bitmap space, never memory that has to actually exist.
-pub const BIG_POOL_END: u32 = 2 * 1024 * 1024 * 1024;
-const BIG_POOL_CHUNKS: usize = ((BIG_POOL_END - BIG_POOL_BASE) / BIG_CHUNK_SIZE) as usize;
+/// through this address -- 4 GiB, the most a 32-bit kernel without PAE can
+/// address at all (a `u64` because 4 GiB itself does not fit a `u32`). A
+/// machine with less RAM than this simply never has the extra chunks marked
+/// free in the first place (see `initialize`); raising this constant costs
+/// only a little more bitmap space, never memory that has to actually exist.
+/// RAM above 2 GiB is only offered where `paging::initialize` really mapped
+/// it (whole 4 MiB pages inside usable E820 regions, so never the PCI hole),
+/// and RAM above 4 GiB is out of this pool's reach entirely (see
+/// `memory_reach`).
+pub const BIG_POOL_END: u64 = 4 * 1024 * 1024 * 1024;
+const BIG_POOL_CHUNKS: usize = ((BIG_POOL_END - BIG_POOL_BASE as u64) / BIG_CHUNK_SIZE as u64) as usize;
 const BIG_BITMAP_BYTES: usize = BIG_POOL_CHUNKS.div_ceil(8);
 
 static mut BIG_BITMAP: [u8; BIG_BITMAP_BYTES] = [0xff; BIG_BITMAP_BYTES];
@@ -240,10 +244,16 @@ fn mark_big_region_free(base: u64, length: u64) {
         return;
     }
     let start = start.max(u64::from(BIG_POOL_BASE));
-    let end = end.min(u64::from(BIG_POOL_END));
+    let end = end.min(BIG_POOL_END);
     let mut address = start;
     while address < end {
         let index = big_chunk_index(address as u32);
+        // A chunk the page tables do not map would fault the moment a tape
+        // touched it (the unmapped tail of RAM above 2 GiB, see paging.rs).
+        if !crate::paging::identity_mapped(address as u32) {
+            address += u64::from(BIG_CHUNK_SIZE);
+            continue;
+        }
         if !big_is_free(index) {
             big_set_free(index, true);
             unsafe {
@@ -390,6 +400,46 @@ pub fn free_big(address: u32, count: usize) {
 /// is exactly 1 MiB (`BIG_CHUNK_SIZE`), so these numbers double as MiB.
 pub fn big_stats() -> (usize, usize) {
     unsafe { (BIG_TOTAL_CHUNKS, BIG_FREE_CHUNKS) }
+}
+
+/// How much of the machine's RAM the kernel can hand out, from the firmware's
+/// own E820 numbers: what exists, what the two pools actually offer, and what
+/// lies beyond a 32-bit kernel's reach.
+pub struct Reach {
+    /// Every byte of type-1 (usable) E820 RAM, including the low megabyte, the
+    /// kernel's own region and the tape region.
+    pub usable: u64,
+    /// The part of `usable` at or above 4 GiB (PCI-hole remapped RAM): no
+    /// pool, no 32-bit pointer; only the long-mode memtest reaches it.
+    pub above_4g: u64,
+    /// Bytes the frame pool plus the big pool track (their free + allocated
+    /// total, so it does not change as things are allocated).
+    pub pooled: u64,
+}
+
+pub fn memory_reach(info: &BootInfo) -> Reach {
+    let count = usize::from(read_u16(core::ptr::addr_of!(info.memory_region_count)));
+    let mut usable = 0u64;
+    let mut above_4g = 0u64;
+    for index in 0..count {
+        let region: MemoryRegion =
+            unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index])) };
+        if read_u32(core::ptr::addr_of!(region.kind)) != 1 {
+            continue;
+        }
+        let base = read_u64(core::ptr::addr_of!(region.base));
+        let length = read_u64(core::ptr::addr_of!(region.length));
+        usable = usable.saturating_add(length);
+        let end = base.saturating_add(length);
+        above_4g = above_4g.saturating_add(end.saturating_sub(base.max(1 << 32)));
+    }
+    let (frames, _) = stats();
+    let (chunks, _) = big_stats();
+    Reach {
+        usable,
+        above_4g,
+        pooled: frames as u64 * u64::from(FRAME_SIZE) + chunks as u64 * u64::from(BIG_CHUNK_SIZE),
+    }
 }
 
 fn read_u16(pointer: *const u16) -> u16 {
