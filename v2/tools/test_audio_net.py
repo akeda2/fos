@@ -319,7 +319,44 @@ def main():
             measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])
             check(abs(measured - frequency) < tolerance, f"the {name} tone is {measured:.0f} Hz (wanted {frequency})", "")
     dhcp_test()
+    duplex_test()
     print("v2 audio-net: all checks passed")
+
+
+def duplex_test():
+    """`duplex`: each guest sends and plays at once. A sends a 440 Hz tone, B an 880 Hz one (QEMU's USB audio has no capture side); both run the
+    send and receive loops as two tasks of one tape. each recording must hold the other's tone."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_a, wav_b = Path(tmp) / "a.wav", Path(tmp) / "b.wav"
+        usb = lambda wav: ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"]
+        a = Guest(tmp, "duplex-a", "52:54:00:12:34:d1", usb(wav_a))
+        b = Guest(tmp, "duplex-b", "52:54:00:12:34:d2", usb(wav_b))
+        try:
+            for guest in (a, b):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark_a = a.send("run audio-net duplex src=tone=440 from=52:54:00:12:34:d2 secs=8 target=10")
+            mark_b = b.send("run audio-net duplex src=tone=880 from=52:54:00:12:34:d1 secs=8 target=10")
+            for guest, mark in ((a, mark_a), (b, mark_b)):
+                guest.wait_for("Received ", 90, mark)
+                guest.wait_for("fos> ", 30, mark)
+            text_a, text_b = a.text()[mark_a:], b.text()[mark_b:]
+            check("Sent " in text_a and "Sent " in text_b, "both guests sent", text_a[-800:] + text_b[-800:])
+            for name, text in (("A", text_a), ("B", text_b)):
+                packets = int(text.split("Received ")[-1].split(" ")[0])
+                check(packets >= 4000, f"{name} received {packets} packets while sending", text[-800:])
+        finally:
+            a.stop()
+            b.stop()
+        for name, wav, wanted in (("A", wav_a, 880), ("B", wav_b, 440)):
+            with wave.open(str(wav)) as recording:
+                rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
+                samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
+            loud = [i for i, value in enumerate(samples) if abs(value) > 500]
+            check(len(loud) > 3 * rate, f"{name}'s recording holds sound ({len(loud) / rate:.1f} s)", "")
+            middle = (loud[0] + loud[-1]) // 2
+            measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])
+            check(abs(measured - wanted) < 30, f"{name} played the other's tone: {measured:.0f} Hz (wanted {wanted})", "")
 
 
 def dhcp_test():

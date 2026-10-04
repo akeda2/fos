@@ -3,6 +3,7 @@
 //! ```text
 //! tape run audio-net send [proto=raw|rtp] [nic=N] [to=MAC|IP[:PORT]] [rate=48000] [ch=3-4] [bits=24]
 //!                         [src=capture|tone=HZ] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP] [pt=96]
+//! tape run audio-net duplex [options of both; in=CH out=CH instead of ch=]
 //! tape run audio-net recv [proto=raw|rtp] [nic=N] [from=MAC] [port=5004] [chan=N] [ch=1-2] [target=MS]
 //!                         [group=239.1.2.3] [codec=pcm|opus]
 //!                         [rate=48000] [bits=24] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP]
@@ -41,6 +42,7 @@
 #![no_std]
 #![no_main]
 
+mod duplex;
 mod igmp;
 mod net;
 mod opus;
@@ -55,11 +57,12 @@ const BROADCAST: [u8; 6] = [0xff; 6];
 const RING_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Proto {
+pub enum Proto {
     Raw,
     Rtp,
 }
 
+#[derive(Clone)]
 pub struct Options<'a> {
     proto: Proto,
     nic: usize,
@@ -90,6 +93,9 @@ pub struct Options<'a> {
     complexity: u32,
     /// `recv group=239.1.2.3`: join this multicast group (IGMP) and receive it.
     group: &'a str,
+    /// `duplex`: the device input channels to send (`in=`) and the output channels to play on (`out=`).
+    in_channels: Option<ChannelSet>,
+    out_channels: Option<ChannelSet>,
 }
 
 fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -105,7 +111,7 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "",
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", in_channels: None, out_channels: None,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -131,6 +137,8 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
             "pt" => options.payload_type = value.parse().ok().filter(|&p| p < 128).ok_or("pt= is 0 to 127")?,
             "drift" => options.resample = match value { "resample" => true, "slip" => false, _ => return Err("drift= is resample or slip") },
             "skew" => options.skew_ppm = value.parse().map_err(|_| "skew= needs a number of ppm")?,
+            "in" => options.in_channels = Some(ChannelSet::parse(value).ok_or("in= is like 1-2 or 9-10,1")?),
+            "out" => options.out_channels = Some(ChannelSet::parse(value).ok_or("out= is like 1-2 or 9-10,1")?),
             "group" => options.group = value,
             "codec" => options.opus = match value { "pcm" => false, "opus" => true, _ => return Err("codec= is pcm or opus") },
             "bitrate" => options.bitrate = value.parse::<u32>().ok().filter(|&b| (6..=512).contains(&b)).ok_or("bitrate= is kbit/s per stereo pair, 6 to 512")? * 1000,
@@ -235,7 +243,7 @@ enum Destination {
     Rtp { mac: MacAddress, ip: Ipv4Address, ttl: u8 },
 }
 
-fn send(api: &'static TapeApi, options: &Options) {
+pub fn send(api: &'static TapeApi, options: &Options) {
     let tone = options.tone;
     let mut info = AudioInfo::default();
     let device = (api.audio_info)(&mut info) != 0 && info.capture_channels != 0;
@@ -286,6 +294,7 @@ fn send(api: &'static TapeApi, options: &Options) {
         println!("SDP for the receiver (save as stream.sdp; e.g. ffplay -protocol_whitelist file,udp,rtp stream.sdp):");
         println!("{}", core::str::from_utf8(&text[..length]).unwrap_or(""));
     }
+    duplex::go();
     let mut frame = [0u8; 1514];
     let mut payload = [0u8; 1514];
     let mut capture = [0u8; 8192];
@@ -432,7 +441,7 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
     }
 }
 
-fn receive(api: &'static TapeApi, options: &Options) {
+pub fn receive(api: &'static TapeApi, options: &Options) {
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
         return println!("audio-net recv: no USB audio device with outputs.");
@@ -672,6 +681,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return println!("audio-net: this machine has no NIC {}.", options.nic + 1);
     }
     match mode {
+        "duplex" => duplex::run(api, &options),
         "send" | "recv" if options.opus && options.proto != Proto::Rtp => println!("audio-net: codec=opus needs proto=rtp."),
         "send" if options.opus => opus::send(api, &options),
         "recv" if options.opus => opus::receive(api, &options),

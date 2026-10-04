@@ -355,7 +355,16 @@ firmware, so a pending slot is tried on the next boot.
   RTL8168 already accepts all). The QEMU test injects a query and checks the report, the leave and a tone through a
   group. Hardware (Skylake to Sandy Bridge via the lab switch, 30 s): 1502 of 1502 packets, 0 lost; the lab switch
   sent no queries (0 answered).
-  Plan: duplex (capture and playback in one tape), AVTP (AVB) raw mode. The UFX's 12-channel capture alternate is
+  **Duplex:** `audio-net duplex` (options of both sides, `in=` for the capture channels to send and `out=` for the playback
+  channels, both PCM and Opus, raw and RTP) sends the capture side and plays a received stream at once. The send and
+  receive loops run unchanged as two cooperative tasks: `duplex.rs` switches stacks (a dozen instructions of
+  assembly) inside `tape_rt::idle()` (a new idle hook), and gives the loops a copy of the tape API whose `should_abort`
+  is sticky and whose `audio_start`/`audio_stop` merge the two directions into one device start. QEMU test: two
+  guests exchange 440 and 880 Hz tones (QEMU's USB audio has no capture side, so the capture merge is hardware-only).
+  Hardware (H6 on the Skylake and UFX on the Sandy Bridge sending to each other over RTP, 24-bit, 20 s): each side sent
+  ~20,060 packets and received ~20,040 (7 lost), no transfer errors. A shell command line is limited to about 100
+  characters, so a long option list is cut off (`secs=` then fails to parse): leave out options at their defaults.
+  Plan: AVTP (AVB) raw mode. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
   is proprietary; AES67 mode is the open way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload

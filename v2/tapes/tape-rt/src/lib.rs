@@ -335,9 +335,19 @@ impl KeyDecoder {
     }
 }
 
+static mut IDLE_HOOK: Option<fn()> = None;
+
+/// Runs `hook` after every `idle()` (a tape running two cooperative tasks switches between them there).
+pub fn set_idle_hook(hook: Option<fn()>) {
+    unsafe { IDLE_HOOK = hook };
+}
+
 /// Sleeps until the next interrupt; call it when a polling pass found nothing to do.
 pub fn idle() {
     (api().wait_for_event)();
+    if let Some(hook) = unsafe { IDLE_HOOK } {
+        hook();
+    }
 }
 
 pub fn ticks() -> u64 {

@@ -85,6 +85,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     // Capture is read in whatever sizes the ring offers; whole Opus frames are cut from the front.
     let capture = unsafe { core::slice::from_raw_parts_mut(if capture_bytes == 0 { core::ptr::NonNull::dangling().as_ptr() } else { capture_address as *mut u8 }, capture_bytes * 2) };
     let mut held = 0usize;
+    crate::duplex::go();
     let mut pcm = [0i16; MAX_FRAME * 2];
     let mut packet = [0u8; 1275];
     let mut frame = [0u8; 1514];
