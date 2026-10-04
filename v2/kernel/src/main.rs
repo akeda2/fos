@@ -309,7 +309,15 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
                     Some((speed, full)) => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link up at {speed} Mb/s {}.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac), if full { "full duplex" } else { "half duplex" }),
                     None => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link down.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac)),
                 }
-                println!("  interrupts: polled (this driver does not use them yet).");
+                let mut nic = nic;
+                if config::no_msi() {
+                    println!("  interrupts: polled (settings: no-msi).");
+                } else {
+                    match nic.enable_interrupts(&device) {
+                        Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived); frames wake the CPU instead of being polled for."),
+                        Err(reason) => println!("  interrupts: polled ({reason})."),
+                    }
+                }
                 if term::install(nic::Nic::Rtl8168(nic), info.runtime_services).is_some() {
                     interfaces += 1;
                 }

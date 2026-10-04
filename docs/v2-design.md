@@ -248,7 +248,11 @@ firmware, so a pending slot is tried on the next boot.
   register order, a frame sent with no link dropped like on the e1000. The terminal, tapes and
   `nic` reach every NIC family through the `nic::Nic` enum. QEMU has no RTL8168 model, so nothing
   automated covers the chip itself (as in v1); on the Skylake (NIC 6, an RTL8168H cabled to I350 port 2)
-  `memtest soak net=2,6 net.fps=2000` ran 60 s with 257,560 frames both ways, none lost or corrupt. Not done: interrupts (MSI), the NIC watchdog counters, `nic regs`.
+  `memtest soak net=2,6` ran clean at 2,000 frames/s (polled) and, once MSI worked, at 8,000 frames/s each
+  way for 60 s: 539,409 frames each way, none lost or corrupt, 532,581 MSI interrupts, 0 overruns. Interrupts: MSI, with a self-test (forced interrupt plus one transmitted frame, since the 8168G/H ignore
+  the forced bit) and v1's rule that receive-descriptor-unavailable/FIFO-overflow are masked until the ring is
+  drained, never answered with a reset; polled when MSI fails or `no-msi` is set. Not done: the NIC watchdog
+  counters, `nic regs`, legacy-INTx fallback.
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

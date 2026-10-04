@@ -61,7 +61,7 @@ impl Nic {
     pub fn delivery(&self) -> Delivery {
         match self {
             Nic::E1000(nic) => nic.delivery,
-            Nic::Rtl8168(_) => Delivery::Polled,
+            Nic::Rtl8168(nic) => nic.delivery,
         }
     }
 

@@ -14,15 +14,19 @@
 //! `TxConfig`/`RxConfig`, older ones before. Linux's PHY, ERI, OCP and ASPM tuning is left out,
 //! as in v1; the v1 notes record that this was enough for real gigabit links.
 //!
-//! This driver is polling only (no interrupts): `Delivery::Polled`. v1's notes record that the
-//! chip's receive-descriptor-unavailable and FIFO-overflow interrupts must be handled softly
-//! (never answered with a reset); with no interrupts here there is nothing to flood, and a
-//! reset happens only when a transmit descriptor stays owned by the card for a long time or the
-//! PCI system-error bit is seen.
+//! Interrupts: the foreground always polls the rings; MSI (when the chip and chipset pass a
+//! self-test, `enable_interrupts`) only wakes the CPU from `hlt` when a frame arrives, as on the
+//! e1000 family. v1's notes record that the receive-descriptor-unavailable and FIFO-overflow
+//! causes must be handled softly (never answered with a reset, or a gigabit stream resets the
+//! card constantly): the handler masks them until `receive` has drained the ring. Only a PCI
+//! system error, or a transmit descriptor the card never gives back, resets the chip.
+//! The RTL8168G/H ignore the "forced software interrupt" bit the self-test raises, so the test
+//! also enables the transmit-OK cause and sends one broadcast frame, whose completion interrupts.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering, fence};
 
+use crate::e1000::{Delivery, ISR, MAX_INTERFACES};
 use crate::{apic, cpu, memory, pci};
 
 pub const VENDOR_REALTEK: u16 = 0x10ec;
@@ -53,7 +57,52 @@ const CR_TE: u8 = 0x04;
 const TPPOLL_NPQ: u8 = 0x40;
 const CFG9346_UNLOCK: u8 = 0xc0;
 const CFG9346_LOCK: u8 = 0x00;
+const ISR_ROK: u16 = 0x0001;
+const ISR_RER: u16 = 0x0002;
+const ISR_TOK: u16 = 0x0004; // transmit OK (enabled only during the self-test)
+const ISR_RDU: u16 = 0x0010; // receive descriptor unavailable
+const ISR_LINKCHG: u16 = 0x0020;
+const ISR_FOVW: u16 = 0x0040; // receive FIFO overflow
+const ISR_SWINT: u16 = 0x0100;
 const ISR_SYSERR: u16 = 0x8000;
+const INTERRUPT_MASK: u16 = ISR_ROK | ISR_RER | ISR_RDU | ISR_LINKCHG | ISR_FOVW | ISR_SYSERR | ISR_SWINT;
+const SOFT_MASK: u16 = ISR_RDU | ISR_FOVW;
+const TPPOLL_FSWINT: u8 = 0x01;
+
+/// Per-interface state the interrupt handler needs (it gets only the interface number).
+static IO_BASE: [AtomicU16; MAX_INTERFACES] = [const { AtomicU16::new(0) }; MAX_INTERFACES];
+static SOFT_MASKED: [AtomicBool; MAX_INTERFACES] = [const { AtomicBool::new(false) }; MAX_INTERFACES];
+static FATAL: [AtomicBool; MAX_INTERFACES] = [const { AtomicBool::new(false) }; MAX_INTERFACES];
+
+/// The MSI handler: acknowledge the causes (write 1 to clear), count them, and mask what must not
+/// storm. Descriptor work stays in the foreground.
+fn isr(index: usize) {
+    let base = IO_BASE[index].load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let status = read16(base, REG_ISR) & (INTERRUPT_MASK | ISR_TOK);
+    if status == 0 {
+        return;
+    }
+    write16(base, REG_ISR, status);
+    ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
+    if status & ISR_TOK != 0 {
+        write16(base, REG_IMR, INTERRUPT_MASK); // the self-test's extra cause is no longer wanted
+    }
+    if status & ISR_LINKCHG != 0 {
+        ISR[index].link_changes.fetch_add(1, Ordering::Relaxed);
+    }
+    if status & SOFT_MASK != 0 {
+        ISR[index].overruns.fetch_add(1, Ordering::Relaxed);
+        SOFT_MASKED[index].store(true, Ordering::Release);
+        write16(base, REG_IMR, INTERRUPT_MASK & !SOFT_MASK);
+    }
+    if status & ISR_SYSERR != 0 {
+        FATAL[index].store(true, Ordering::Release);
+        write16(base, REG_IMR, 0);
+    }
+}
 
 const TXCONFIG_VALUE: u32 = (3 << 24) | (7 << 8) | (1 << 7); // standard IFG, max DMA burst
 const RX_ACCEPT_ALL_PHYS: u32 = 0x01;
@@ -133,6 +182,9 @@ fn rx_opts1(index: usize) -> u32 {
 }
 
 pub struct Rtl8168 {
+    index: usize,
+    pub delivery: Delivery,
+    interrupts_enabled: bool,
     io_base: u16,
     rings: u64,
     rx_buffers: u64,
@@ -164,7 +216,7 @@ fn wait_reset(base: u16) -> bool {
 }
 
 impl Rtl8168 {
-    pub fn init(device: &pci::Device, _index: usize) -> Result<Rtl8168, Error> {
+    pub fn init(device: &pci::Device, index: usize) -> Result<Rtl8168, Error> {
         device.force_power_state_d0();
         // Memory decoding is not needed (the I/O BAR is used) but I/O decoding and bus mastering are.
         let command = device.read32(4);
@@ -189,7 +241,11 @@ impl Rtl8168 {
         for (index, byte) in mac.iter_mut().enumerate() {
             *byte = read8(io_base, REG_IDR0 + index as u16);
         }
+        IO_BASE[index].store(io_base, Ordering::Relaxed);
         Ok(Rtl8168 {
+            index,
+            delivery: Delivery::Polled,
+            interrupts_enabled: false,
             io_base,
             rings,
             rx_buffers,
@@ -206,6 +262,43 @@ impl Rtl8168 {
             recovery_pending: false,
             version,
         })
+    }
+
+    /// Switches this NIC from polling to MSI if the capability exists and the self-test passes
+    /// (an interrupt must really arrive within three ticks). Needs interrupts enabled and the
+    /// local APIC running. On failure the NIC stays polled and says why.
+    pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
+        if device.find_capability(0x05).is_none() {
+            return Err("no MSI capability");
+        }
+        let Some(vector) = crate::msi::allocate(isr, self.index) else { return Err("no free MSI vector") };
+        if !device.enable_msi(vector, apic::id()) {
+            crate::msi::release(vector);
+            return Err("could not enable MSI");
+        }
+        write16(self.io_base, REG_ISR, 0xffff);
+        write16(self.io_base, REG_IMR, INTERRUPT_MASK | ISR_TOK);
+        let before = crate::msi::count(vector);
+        write8(self.io_base, REG_TPPOLL, TPPOLL_FSWINT); // older chips raise a software interrupt...
+        let mut frame = [0u8; 14];
+        frame[..6].fill(0xff);
+        frame[6..12].copy_from_slice(&self.mac);
+        frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+        self.send(&frame); // ...the RTL8168G/H need a completed transmit instead
+        let start = apic::ticks();
+        while crate::msi::count(vector) == before && apic::ticks().wrapping_sub(start) < 3 {
+            core::hint::spin_loop();
+        }
+        if crate::msi::count(vector) == before {
+            write16(self.io_base, REG_IMR, 0);
+            device.disable_msi();
+            crate::msi::release(vector);
+            return Err("the MSI self-test message never arrived");
+        }
+        self.interrupts_enabled = true;
+        self.delivery = Delivery::Msi(vector);
+        write16(self.io_base, REG_IMR, INTERRUPT_MASK);
+        Ok(self.delivery)
     }
 
     pub fn io_base(&self) -> u16 {
@@ -242,6 +335,12 @@ impl Rtl8168 {
         self.rx_next = 0;
         self.tx_next = 0;
         program(self.io_base, self.rings, self.enable_after_config, self.promiscuous);
+        FATAL[self.index].store(false, Ordering::Relaxed);
+        SOFT_MASKED[self.index].store(false, Ordering::Relaxed);
+        if self.interrupts_enabled {
+            write16(self.io_base, REG_ISR, 0xffff);
+            write16(self.io_base, REG_IMR, INTERRUPT_MASK);
+        }
         self.recoveries += 1;
         self.recovery_pending = false;
         true
@@ -284,13 +383,21 @@ impl Rtl8168 {
 
     /// Copies the next received frame (without the FCS) into `out`; `None` if the ring is empty.
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
-        if self.recovery_pending || read16(self.io_base, REG_ISR) & ISR_SYSERR != 0 {
+        // With interrupts the handler records a system error; polled, look at the status register.
+        let fatal = FATAL[self.index].swap(false, Ordering::AcqRel)
+            || (!self.interrupts_enabled && read16(self.io_base, REG_ISR) & ISR_SYSERR != 0);
+        if self.recovery_pending || fatal {
             self.recover();
             write16(self.io_base, REG_ISR, 0xffff);
         }
         let index = self.rx_next;
         let opts1 = read_opts1(self.rings, index);
         if opts1 & DESC_OWN != 0 {
+            // The ring is drained: the overflow causes the handler masked may fire again.
+            if SOFT_MASKED[self.index].swap(false, Ordering::AcqRel) {
+                write16(self.io_base, REG_ISR, SOFT_MASK);
+                write16(self.io_base, REG_IMR, INTERRUPT_MASK);
+            }
             return None;
         }
         fence(Ordering::SeqCst);
