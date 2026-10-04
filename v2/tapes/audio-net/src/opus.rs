@@ -196,6 +196,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let channels = options.chan;
     let streams = channels.div_ceil(2);
     let Some(mut transport) = Transport::open(api, options) else { return };
+    if !transport.join_group(api, options) {
+        return;
+    }
     let mut lanes: [Option<Lane>; MAX_STREAMS] = [const { None }; MAX_STREAMS];
     for (index, lane) in lanes.iter_mut().enumerate().take(streams) {
         let width = stream_channels(index, channels);
@@ -246,6 +249,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         if (api.should_abort)() != 0 || (options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000) {
             break;
         }
+        transport.igmp_service(api, options.nic, None);
         let length = (api.nic_receive)(options.nic, frame.as_mut_ptr(), frame.len());
         if length == 0 {
             if play.is_some() && tape_rt::micros() > last_packet + 2_000_000 {
@@ -258,6 +262,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                 }
             }
             tape_rt::idle();
+            continue;
+        }
+        if transport.igmp_service(api, options.nic, Some(&frame[..length])) {
             continue;
         }
         let now = (api.ticks)() as u32;
@@ -419,6 +426,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             }
         }
     }
+    transport.leave_group(api, options.nic);
     let mut stats = AudioStats::default();
     (api.audio_stats)(&mut stats);
     (api.audio_stop)();

@@ -101,6 +101,9 @@ pub struct TapeApi {
     pub audio_write: extern "C" fn(*const u8, usize) -> usize,
     /// Fills `AudioStats` with the counters of the running streams.
     pub audio_stats: extern "C" fn(*mut AudioStats),
+    /// Receive every multicast frame on an interface (on) or only broadcasts and our own address (off); 1 on
+    /// success. A tape that joins an IGMP group needs this: the NIC drops multicast it has no filter for.
+    pub nic_set_multicast: extern "C" fn(usize, u32) -> u32,
 }
 
 /// What `audio_info` reports. Slot bytes: how many bytes each sample takes in the stream (a 24-bit

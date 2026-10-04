@@ -218,6 +218,9 @@ extern "C" fn api_nic_count() -> usize {
 extern "C" fn api_nic_set_promiscuous(index: usize, on: u32) -> u32 {
     u32::from(term::nic_set_promiscuous(index, on != 0))
 }
+extern "C" fn api_nic_set_multicast(index: usize, on: u32) -> u32 {
+    u32::from(term::nic_set_multicast(index, on != 0))
+}
 extern "C" fn api_nic_mac(index: usize, out: *mut u8) -> u32 {
     let mut mac = [0u8; 6];
     if !term::nic_mac(index, &mut mac) {
@@ -302,6 +305,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         audio_read: api_audio_read,
         audio_write: api_audio_write,
         audio_stats: api_audio_stats,
+        nic_set_multicast: api_nic_set_multicast,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

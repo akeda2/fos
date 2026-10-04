@@ -481,6 +481,13 @@ impl E1000 {
         write(self.registers, REG_RCTL, if on { control | bits } else { control & !bits });
     }
 
+    /// Multicast promiscuous (RCTL.MPE, bit 4): receive every multicast frame. The multicast table array is left
+    /// empty, so without this the NIC drops all multicast, including IGMP queries.
+    pub fn set_multicast(&mut self, on: bool) {
+        let control = read(self.registers, REG_RCTL);
+        write(self.registers, REG_RCTL, if on { control | (1 << 4) } else { control & !(1 << 4) });
+    }
+
     pub fn link_up(&self) -> bool {
         read(self.registers, REG_STATUS) & STATUS_LU != 0
     }

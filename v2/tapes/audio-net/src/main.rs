@@ -4,6 +4,7 @@
 //! tape run audio-net send [proto=raw|rtp] [nic=N] [to=MAC|IP[:PORT]] [rate=48000] [ch=3-4] [bits=24]
 //!                         [src=capture|tone=HZ] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP] [pt=96]
 //! tape run audio-net recv [proto=raw|rtp] [nic=N] [from=MAC] [port=5004] [chan=N] [ch=1-2] [target=MS]
+//!                         [group=239.1.2.3] [codec=pcm|opus]
 //!                         [rate=48000] [bits=24] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP]
 //! ```
 //!
@@ -32,9 +33,15 @@
 //! from RTP (SDP carries it), so give `chan=` (default 2) and `bits=`. There is no PTP, so clocks are not
 //! synchronised: the receiver follows the sender (an AES67 device that insists on a PTP reference will not
 //! accept the stream, but the packet format is exactly AES67's).
+//!
+//! **Multicast.** `send to=239.1.2.3` goes to a multicast group (MAC 01:00:5e:..., no ARP). A receiver gets it with
+//! `recv group=239.1.2.3`: the tape joins the group with an IGMP report (so a snooping switch forwards it to this
+//! port), answers the querier's queries, and sends a leave when it stops; the NIC is told to accept all multicast
+//! while it runs. `codec=opus` (see `opus.rs`) sends Opus instead of PCM.
 #![no_std]
 #![no_main]
 
+mod igmp;
 mod net;
 mod opus;
 
@@ -81,6 +88,8 @@ pub struct Options<'a> {
     /// Opus frame time in tenths of a millisecond (200 = 20 ms).
     frame_x10: u32,
     complexity: u32,
+    /// `recv group=239.1.2.3`: join this multicast group (IGMP) and receive it.
+    group: &'a str,
 }
 
 fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -96,7 +105,7 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "",
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -122,6 +131,7 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
             "pt" => options.payload_type = value.parse().ok().filter(|&p| p < 128).ok_or("pt= is 0 to 127")?,
             "drift" => options.resample = match value { "resample" => true, "slip" => false, _ => return Err("drift= is resample or slip") },
             "skew" => options.skew_ppm = value.parse().map_err(|_| "skew= needs a number of ppm")?,
+            "group" => options.group = value,
             "codec" => options.opus = match value { "pcm" => false, "opus" => true, _ => return Err("codec= is pcm or opus") },
             "bitrate" => options.bitrate = value.parse::<u32>().ok().filter(|&b| (6..=512).contains(&b)).ok_or("bitrate= is kbit/s per stereo pair, 6 to 512")? * 1000,
             "frame" => options.frame_x10 = match value.split_once('.') { Some((whole, tenth)) => whole.parse::<u32>().ok().zip(tenth.parse::<u32>().ok()).map(|(w, t)| w * 10 + t), None => value.parse::<u32>().ok().map(|w| w * 10) }.ok_or("frame= is milliseconds")?,
@@ -148,6 +158,7 @@ pub struct Transport {
     arp: ArpCache<8>,
     port: u16,
     payload_type: u8,
+    igmp: Option<igmp::Igmp>,
 }
 
 impl Transport {
@@ -179,7 +190,42 @@ impl Transport {
             let ip = config.ip.0;
             println!("Network: {}.{}.{}.{} on NIC {}.", ip[0], ip[1], ip[2], ip[3], options.nic + 1);
         }
-        Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type })
+        Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None })
+    }
+
+    /// `group=`: joins the multicast group on the receive NIC. False (after a message) if it cannot.
+    pub fn join_group(&mut self, api: &TapeApi, options: &Options) -> bool {
+        if options.group.is_empty() {
+            return true;
+        }
+        let Some(group) = net::parse_ip(options.group).filter(|group| audio_wire::is_multicast_address(group.0)) else {
+            println!("audio-net: group= is a multicast address (224.0.0.0 to 239.255.255.255).");
+            return false;
+        };
+        if options.proto != Proto::Rtp {
+            println!("audio-net: group= needs proto=rtp.");
+            return false;
+        }
+        let mut igmp = igmp::Igmp::new(group.0);
+        igmp.join(api, options.nic, &self.config);
+        println!("Joined multicast group {} (IGMP report sent).", options.group);
+        self.igmp = Some(igmp);
+        true
+    }
+
+    /// Per loop pass: sends a due IGMP answer and, given a frame, consumes it if it is IGMP. True if consumed.
+    pub fn igmp_service(&mut self, api: &TapeApi, nic: usize, frame: Option<&[u8]>) -> bool {
+        let Some(igmp) = self.igmp.as_mut() else { return false };
+        let now = tape_rt::micros();
+        igmp.poll(api, nic, &self.config, now);
+        frame.is_some_and(|frame| igmp.handle(frame, now))
+    }
+
+    pub fn leave_group(&mut self, api: &TapeApi, nic: usize) {
+        if let Some(mut igmp) = self.igmp.take() {
+            println!("Left the multicast group ({} queries answered, {} reports sent).", igmp.queries, igmp.reports);
+            igmp.leave(api, nic, &self.config);
+        }
     }
 }
 
@@ -394,6 +440,9 @@ fn receive(api: &'static TapeApi, options: &Options) {
     let (device_channels, slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
     let device_frame = device_channels * slot;
     let Some(mut transport) = Transport::open(api, options) else { return };
+    if !transport.join_group(api, options) {
+        return;
+    }
     // Start playback now, at `rate=` (default 48000): starting a USB stream takes a while (control requests,
     // Configure Endpoint), and doing it when the first packet arrives made the frames that came meanwhile pile
     // up and overflow. A stream at another rate restarts it, once.
@@ -428,6 +477,7 @@ fn receive(api: &'static TapeApi, options: &Options) {
         if options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000 {
             break;
         }
+        transport.igmp_service(api, options.nic, None);
         let t_receive = tape_rt::micros();
         let length = (api.nic_receive)(options.nic, frame.as_mut_ptr(), frame.len());
         let spent_receive = tape_rt::micros() - t_receive;
@@ -438,6 +488,9 @@ fn receive(api: &'static TapeApi, options: &Options) {
                 locked = None; // playback keeps running (silence), ready for the next stream
             }
             tape_rt::idle();
+            continue;
+        }
+        if transport.igmp_service(api, options.nic, Some(&frame[..length])) {
             continue;
         }
         let Some(packet) = classify(api, options, &mut transport, &frame[..length]) else { continue };
@@ -587,6 +640,7 @@ fn receive(api: &'static TapeApi, options: &Options) {
             }
         }
     }
+    transport.leave_group(api, options.nic);
     let mut stats = AudioStats::default();
     (api.audio_stats)(&mut stats);
     if running {

@@ -58,6 +58,14 @@ impl Nic {
         }
     }
 
+    /// Accept all multicast frames (see `TapeApi::nic_set_multicast`).
+    pub fn set_multicast(&mut self, on: bool) {
+        match self {
+            Nic::E1000(nic) => nic.set_multicast(on),
+            Nic::Rtl8168(_) => {} // already accepts every multicast frame (its hash filter is all ones)
+        }
+    }
+
     pub fn delivery(&self) -> Delivery {
         match self {
             Nic::E1000(nic) => nic.delivery,

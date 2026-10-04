@@ -348,9 +348,16 @@ firmware, so a pending slot is tried on the next boot.
   worst). The receiver's underrun counter also counts the idle time before and after the stream, so compare it
   with the stream length. The ring level seen by the servo is the trough between bursts, so `target=` is the
   margin before an underrun, not the average latency (that is about a frame longer).
-  Plan: E multicast/IGMP,
-  alternate-setting choice and duplex, AVTP (AVB) raw mode. (Dante itself is proprietary; AES67 mode is the open
-  way in.)
+  **Multicast and IGMP:** `recv group=239.1.2.3` joins the group (an IGMPv2 report, sent twice), answers general and
+  group-specific queries after a random delay (a v2 report for a v2 query, v3 for a v3 one), and sends a leave when
+  the tape ends (`igmp.rs`); `send to=239.x.y.z` already worked. A new tape API call, `nic_set_multicast`, makes the
+  e1000 family accept all multicast (RCTL.MPE; its multicast table is empty, so it dropped everything before; the
+  RTL8168 already accepts all). The QEMU test injects a query and checks the report, the leave and a tone through a
+  group. Hardware (Skylake to Sandy Bridge via the lab switch, 30 s): 1502 of 1502 packets, 0 lost; the lab switch
+  sent no queries (0 answered).
+  Plan: duplex (capture and playback in one tape), AVTP (AVB) raw mode. The UFX's 12-channel capture alternate is
+  not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
+  is proprietary; AES67 mode is the open way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

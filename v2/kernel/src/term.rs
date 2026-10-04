@@ -544,6 +544,16 @@ pub fn nic_set_promiscuous(index: usize, on: bool) -> bool {
     }
 }
 
+pub fn nic_set_multicast(index: usize, on: bool) -> bool {
+    match nic_at(index) {
+        Some(nic) => {
+            nic.set_multicast(on);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Flushes queued console output to the client (public for tape callbacks).
 pub fn flush_output() {
     flush();

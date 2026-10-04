@@ -98,6 +98,41 @@ def sniff(seconds, frames):
     sock.close()
 
 
+def sniff_until(stop, frames):
+    """Like `sniff`, but runs until the event `stop` is set."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", PORT))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(GROUP) + socket.inet_aton("0.0.0.0"))
+    sock.settimeout(0.2)
+    while not stop.is_set():
+        try:
+            data, _ = sock.recvfrom(4096)
+            frames.append((time.monotonic(), data))
+        except socket.timeout:
+            pass
+    sock.close()
+
+
+def igmp_query_frame():
+    """A general IGMPv2 membership query (maximum response 1 s) from a made-up querier, as a raw Ethernet frame."""
+    igmp = bytes([0x11, 10, 0, 0, 0, 0, 0, 0])
+    igmp = igmp[:2] + struct.pack(">H", checksum(igmp)) + igmp[4:]
+    ip = bytes([0x46, 0xC0]) + struct.pack(">H", 24 + 8) + bytes([0, 0, 0x40, 0, 1, 2, 0, 0, 192, 168, 50, 254, 224, 0, 0, 1, 0x94, 4, 0, 0])
+    ip = ip[:10] + struct.pack(">H", checksum(ip)) + ip[12:]
+    return bytes.fromhex("01005e000001") + bytes.fromhex("525400123400") + b"\x08\x00" + ip + igmp
+
+
+def igmp_messages(frames, mac):
+    """(time, type, group) of the IGMP messages sent by `mac` among the captured frames."""
+    found = []
+    for stamp, frame in frames:
+        if len(frame) >= 14 + 24 + 8 and frame[6:12] == mac and frame[12:14] == b"\x08\x00" and frame[23] == 2:
+            igmp = frame[14 + 24:]
+            found.append((stamp, igmp[0], ".".join(str(b) for b in (igmp[4:8] if igmp[0] != 0x22 else igmp[12:16]))))
+    return found
+
+
 def check_rtp(frames):
     """Parses the captured frames as RTP over UDP over IPv4 and checks what AES67 expects of the stream."""
     packets = []
@@ -134,7 +169,7 @@ def main():
             for guest in (receiver, sender):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            for run in ("a", "b", "c", "d", "e"):
+            for run in ("a", "b", "c", "d", "e", "f"):
                 if run == "a":
                     # Stereo 24-bit, 440 Hz, 3 seconds, to everyone.
                     mark = receiver.send("run audio-net recv")
@@ -190,6 +225,40 @@ def main():
                     stamp_sets = [{p[3] for p in v} for v in by_stream.values()]
                     check(stamp_sets[0] == stamp_sets[1], "both streams carry the same timestamps, so a receiver can line them up", "")
                     continue
+                elif run == "f":
+                    # Multicast with IGMP: the receiver joins 239.1.2.3, answers a query, and leaves at the end.
+                    mark = receiver.send("run audio-net recv proto=rtp codec=opus ip=192.168.50.2/24 chan=2 group=239.1.2.3")
+                    receiver.wait_for("Joined multicast group 239.1.2.3", 30, mark)
+                    receiver.wait_for("Listening on NIC 1 for Opus/RTP", 30, mark)
+                    receiver.pump(3.0)
+                    captured, stop = [], threading.Event()
+                    thread = threading.Thread(target=sniff_until, args=(stop, captured))
+                    thread.start()
+                    time.sleep(0.5)
+                    query_sent = time.monotonic()
+                    inject = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    inject.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+                    inject.sendto(igmp_query_frame(), (GROUP, PORT))
+                    inject.close()
+                    receiver.pump(2.5)
+                    answers = [m for m in igmp_messages(captured, bytes.fromhex("5254001234b2")) if m[1] == 0x16 and m[0] >= query_sent]
+                    check(len(answers) >= 1 and answers[0][2] == "239.1.2.3", f"the receiver answers an IGMP query with a report for 239.1.2.3 ({len(answers)} seen)", "")
+                    mark = sender.send("run audio-net send proto=rtp codec=opus ip=192.168.50.1/24 to=239.1.2.3 src=tone=550 secs=3")
+                    sender.wait_for("Sent ", 60, mark)
+                    receiver.pump(1.0)
+                    mark = len(receiver.text())
+                    receiver.process.stdin.write(b"\x1b")
+                    receiver.process.stdin.flush()
+                    receiver.wait_for("Received ", 30, mark - 200)
+                    receiver.wait_for("fos> ", 30, mark)
+                    stop.set()
+                    thread.join()
+                    report = receiver.text()[mark - 200:]
+                    leaves = [m for m in igmp_messages(captured, bytes.fromhex("5254001234b2")) if m[1] == 0x17]
+                    check(len(leaves) == 1 and leaves[0][2] == "239.1.2.3", "it sends an IGMP leave for the group when it stops", str(leaves))
+                    packets = int(report.split("Received ")[-1].split(" ")[0])
+                    check(packets >= 140, f"it received {packets} Opus packets from the multicast group", report)
+                    continue
                 else:
                     # Mono 16-bit, 880 Hz, to the receiver's MAC, after the receiver has been restarted.
                     mark = receiver.send("run audio-net recv from=52:54:00:12:34:b1 target=8")
@@ -234,7 +303,7 @@ def main():
             rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
             samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
         loud = [i for i, value in enumerate(samples) if abs(value) > 500]
-        check(len(loud) > 10 * rate, f"the recording holds sound ({len(loud) / rate:.1f} s of it)", "")
+        check(len(loud) > 12 * rate, f"the recording holds sound ({len(loud) / rate:.1f} s of it)", "")
         # Split into the separate tones at silences longer than half a second; measure each one's middle second.
         segments, begin = [], loud[0]
         for before, after in zip(loud, loud[1:]):
@@ -243,8 +312,8 @@ def main():
                 begin = after
         segments.append((begin, loud[-1]))
         segments = [seg for seg in segments if seg[1] - seg[0] > rate]
-        wanted = [("raw, stereo 24-bit", 440, 20), ("raw, mono 16-bit, converted", 880, 30), ("RTP/UDP, stereo 24-bit", 660, 25), ("Opus/RTP", 770, 30)]
-        check(len(segments) == 4, f"the recording holds {len(segments)} separate tones (wanted 4)", str(segments))
+        wanted = [("raw, stereo 24-bit", 440, 20), ("raw, mono 16-bit, converted", 880, 30), ("RTP/UDP, stereo 24-bit", 660, 25), ("Opus/RTP", 770, 30), ("Opus/RTP multicast", 550, 30)]
+        check(len(segments) == 5, f"the recording holds {len(segments)} separate tones (wanted 5)", str(segments))
         for (name, frequency, tolerance), (start, end) in zip(wanted, segments):
             middle = (start + end) // 2
             measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])
