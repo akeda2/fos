@@ -463,6 +463,17 @@ firmware, so a pending slot is tried on the next boot.
   does not thrash it, it is withdrawn when a stream starts (the stream announces itself, keeping the DHCP lease) and when
   the panel closes, and entries expire if not heard for 20 s. It needs the RTP network (the announcements are IP
   multicast). Duplex then works from the pick: both panels open, each picks the other, each presses `S`.
+  **Real PPM meters:** the live view shows one horizontal meter per channel (labelled with the device input or output
+  it is), one cell per dB from -60 dBFS to full scale, on the Nordic scale (IEC 60268-10 type I: TEST = 0 at -18 dBFS,
+  maximum permitted level +9 at -9 dBFS, digital full scale at +18) with a number per channel to a tenth of a dB, a
+  three-second peak-hold marker, a latched CLIP flag for samples at full scale, `#` above the permitted maximum, and
+  `U` to switch the scale and numbers to dBFS. The detector (`audio_wire::meter`, host-tested: a 1 kHz line-up tone at -18
+  dBFS reads TEST, a 5 ms burst reads about 2 dB low, the fall is 20 dB in 1.7 s, also at 96 kHz) is a quasi-peak
+  integrator that costs one multiply per sample; the panel reads the highest reading since its last look so a short peak
+  between redraws still shows. Pages of 12 channels (`N`/`B`) keep it inside a 24-row terminal. Cost control: the drawing
+  is spread over many short calls (three rows at a time, only the cells that changed), the counters line shows the
+  longest the drawing has held the stream loop up ("UI stall"), and `M` switches the meters off, which also stops the
+  per-sample detector work.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself

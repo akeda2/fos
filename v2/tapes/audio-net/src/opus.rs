@@ -81,6 +81,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     println!("{}", core::str::from_utf8(&text[..length]).unwrap_or(""));
     transport.announcer_start(&text[..length]);
     println!("Announcing this stream as '{name}' (SAP, every 5 s).");
+    crate::stats::get().rate = RATE;
     let device_frame = device_channels * slot;
     let capture_bytes = device_frame * frame_samples; // 0 for a tone: no device
     let capture_address = if capture_bytes == 0 { 1 } else { (api.alloc)(capture_bytes * 2) };

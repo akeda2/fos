@@ -364,6 +364,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         Proto::Avtp => 1500 - audio_wire::avtp::HEADER_LEN,
     };
     let per_packet = frames_per_packet(options.rate, channels, bits, max_payload);
+    stats::get().rate = options.rate;
     let frame_bytes = channels * bits / 8;
     let packet_us = u64::from(per_packet as u32) * 1_000_000 / u64::from(options.rate);
     // `skew=` (tone source only) paces packets as if the sender's clock were off by that many ppm.

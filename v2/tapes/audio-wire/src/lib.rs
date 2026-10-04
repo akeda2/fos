@@ -499,6 +499,105 @@ pub fn device_sample_16(slot_bytes: &[u8]) -> i16 {
     (device_sample(slot_bytes) >> 16) as i16
 }
 
+/// A programme peak meter (PPM) in the Nordic style (IEC 60268-10 type I): a quasi-peak detector that charges fast
+/// (a 5 ms burst reads about 2 dB below its height, 10 ms about 1 dB) and falls back slowly, 20 dB in about
+/// 1.7 s, whatever the level. Integer arithmetic only, one multiply per sample. Levels are magnitudes scaled to 2^31 =
+/// digital full scale; `db_tenths` turns them into tenths of a dB below/above full scale.
+///
+/// The Nordic scale has TEST (0) at -18 dBFS (the EBU line-up level) and the permitted maximum level at +9, which is
+/// -9 dBFS; digital full scale is +18 on that scale.
+pub mod meter {
+    /// Full scale in the detector's units (the 16 bits of a sample moved to the top of an `i32`).
+    pub const FULL_SCALE: u32 = 0x7fff_0000;
+    /// The Nordic scale's 0 (TEST) in dBFS.
+    pub const NORDIC_TEST_DBFS: i32 = -18;
+    /// A sample this close to full scale (about -0.04 dB) counts as clipping.
+    pub const CLIP: u32 = 0x7ff0_0000;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Coefficients {
+        /// Fraction (of 2^16) of the gap to a higher input closed per sample.
+        attack: u32,
+        /// Fraction (of 2^26) of the level lost per sample.
+        release: u32,
+    }
+
+    impl Coefficients {
+        /// An inert value to start from (`for_rate` makes a useful one).
+        pub const ZERO: Coefficients = Coefficients { attack: 0, release: 0 };
+
+        /// For a sample rate: a 5 ms burst reads about 2 dB low and a 10 ms one about 1 dB low (type I), and the level falls back 20 dB in
+        /// 1.7 s.
+        pub fn for_rate(rate: u32) -> Coefficients {
+            let rate = rate.max(8_000);
+            Coefficients { attack: (1000 * 48_000 / rate).max(1), release: (1893 * 48_000 / rate).max(1) }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Ppm {
+        /// The detector's reading now.
+        pub level: u32,
+        /// The highest reading since `take_max` last looked (the display samples a few times a second; a peak
+        /// that came and went in between must still show).
+        pub highest: u32,
+    }
+
+    impl Ppm {
+        pub const fn new() -> Ppm {
+            Ppm { level: 0, highest: 0 }
+        }
+
+        /// Feeds the magnitude of one sample.
+        #[inline]
+        pub fn feed(&mut self, magnitude: u32, c: &Coefficients) {
+            if magnitude > self.level {
+                self.level += (u64::from(magnitude - self.level) * u64::from(c.attack) >> 16) as u32;
+            } else {
+                self.level -= ((u64::from(self.level) * u64::from(c.release)) >> 26) as u32;
+            }
+            if self.level > self.highest {
+                self.highest = self.level;
+            }
+        }
+
+        /// The highest reading since the last call (and restarts from the current one).
+        pub fn take_max(&mut self) -> u32 {
+            let highest = self.highest;
+            self.highest = self.level;
+            highest
+        }
+    }
+
+    /// log2 of `value` (> 0) in Q16, by the squaring method: exact to well under 0.001 dB.
+    pub fn log2_q16(value: u32) -> i32 {
+        let whole = 31 - value.leading_zeros() as i32;
+        // Normalise to [1, 2) in Q31.
+        let mut mantissa = u64::from(value) << (31 - whole);
+        let mut fraction = 0u32;
+        for _ in 0..16 {
+            mantissa = (mantissa * mantissa) >> 31;
+            fraction <<= 1;
+            if mantissa >= 1 << 32 {
+                mantissa >>= 1;
+                fraction |= 1;
+            }
+        }
+        (whole << 16) + fraction as i32
+    }
+
+    /// A level as tenths of a dB relative to digital full scale (0 at full scale, negative below). Silence gives
+    /// -1200 (-120 dB).
+    pub fn db_tenths(level: u32) -> i32 {
+        if level < 64 {
+            return -1200;
+        }
+        let octaves = i64::from(log2_q16(level) - log2_q16(FULL_SCALE));
+        // 6.0206 dB per octave = 60.206 tenths.
+        ((octaves * 60_206 / 1000 + (1 << 15)) >> 16) as i32
+    }
+}
+
 /// IEEE 1722 (AVTP) audio: the AAF PCM format, the layer-2 transport of AVB. An AVTPDU is a 24-byte header and
 /// the samples, big endian and interleaved, directly in an Ethernet frame of ethertype 0x22f0.
 pub mod avtp {
@@ -1075,5 +1174,63 @@ mod tests {
         assert!(sap::parse(&[0x40, 0, 0, 0, 1, 2, 3, 4, b'v', b'=', b'0']).is_none());
         assert!(sap::parse(&[0x20]).is_none());
         assert!(sap::parse_sdp(b"v=0\r\ns=x\r\n").is_none());
+    }
+
+    fn run_sine(amplitude_dbfs: f64, millis: u32, ppm: &mut meter::Ppm, c: &meter::Coefficients) {
+        let amplitude = meter::FULL_SCALE as f64 * 10f64.powf(amplitude_dbfs / 20.0);
+        for index in 0..48 * millis {
+            let sample = (amplitude * (2.0 * core::f64::consts::PI * 1000.0 * f64::from(index) / 48_000.0).sin()).abs();
+            ppm.feed(sample as u32, c);
+        }
+    }
+
+    #[test]
+    fn db_of_known_levels() {
+        assert_eq!(meter::db_tenths(meter::FULL_SCALE), 0);
+        assert_eq!(meter::db_tenths(meter::FULL_SCALE / 2), -60); // half amplitude: -6.0 dB
+        assert!((meter::db_tenths(meter::FULL_SCALE / 8) + 181).abs() <= 2); // -18.06 dB
+        assert_eq!(meter::db_tenths(0), -1200);
+        for tenths in [-100, -450, -900, -1100] {
+            let level = (meter::FULL_SCALE as f64 * 10f64.powf(f64::from(tenths) / 200.0)) as u32;
+            assert!((meter::db_tenths(level) - tenths).abs() <= 1, "{tenths}");
+        }
+    }
+
+    #[test]
+    fn a_line_up_tone_reads_test_level() {
+        // 1 kHz at -18 dBFS is the Nordic TEST level: the meter should read about -18 dBFS (0 on its scale).
+        let c = meter::Coefficients::for_rate(48_000);
+        let mut ppm = meter::Ppm::new();
+        run_sine(-18.0, 300, &mut ppm, &c);
+        let reading = meter::db_tenths(ppm.take_max());
+        assert!((-195..=-170).contains(&reading), "{reading}");
+    }
+
+    #[test]
+    fn a_short_burst_reads_almost_its_height_and_falls_back_slowly() {
+        let c = meter::Coefficients::for_rate(48_000);
+        let mut ppm = meter::Ppm::new();
+        run_sine(-6.0, 5, &mut ppm, &c); // a 5 ms burst: within about 3 dB of the peak
+        let burst = meter::db_tenths(ppm.take_max());
+        assert!((-90..=-55).contains(&burst), "{burst}");
+        // Then silence: 20 dB down after about 1.7 s.
+        run_sine(-200.0, 1700, &mut ppm, &c);
+        let after = meter::db_tenths(ppm.level);
+        assert!((burst - after - 200).abs() <= 60, "{burst} -> {after}");
+    }
+
+    #[test]
+    fn the_rate_changes_the_coefficients_not_the_timing() {
+        let c = meter::Coefficients::for_rate(96_000);
+        let mut ppm = meter::Ppm::new();
+        for _ in 0..96 * 300 {
+            ppm.feed(meter::FULL_SCALE / 4, &c);
+        }
+        assert!((meter::db_tenths(ppm.level) + 120).abs() <= 6); // steady input reads its level (-12 dB)
+        for _ in 0..96 * 1700 {
+            ppm.feed(0, &c);
+        }
+        let fallen = -120 - meter::db_tenths(ppm.level);
+        assert!((140..=260).contains(&fallen), "{fallen}"); // about 20 dB in 1.7 s at 96 kHz too
     }
 }

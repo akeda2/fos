@@ -12,7 +12,7 @@ use crate::stats;
 use audio_wire::sap;
 use tape_net::MacAddress;
 use crate::{MacText, Options, Transport, parse, peers, run_once};
-use audio_wire::{ChannelSet, Cursor};
+use audio_wire::{ChannelSet, Cursor, meter};
 use core::fmt::Write;
 use tape_rt::{AudioInfo, Key, KeyDecoder, TapeApi};
 
@@ -540,99 +540,323 @@ fn toggle_boot(settings: &Settings) -> &'static str {
     }
 }
 
+/// Where the meters are drawn on the live screen (a 24-row terminal must fit them).
+const BAR_COL: usize = 9;
+/// Cells 0..=60, one per dB from -60 dBFS to full scale.
+const CELLS: i32 = 61;
+const NUMBER_COL: usize = 71;
+const CLIP_COL: usize = 77;
+const ROW_SCALE: usize = 7;
+const ROW_FIRST: usize = 9;
+const PAGE_ROWS: usize = 12;
+/// The Nordic scale's TEST (0) is -18 dBFS: cell 42. The permitted maximum level (+9) is -9 dBFS: cell 51.
+const TEST_CELL: i32 = 42;
+const PML_CELL: i32 = 51;
+const HOLD_MICROS: u64 = 3_000_000;
+const MAX_ROWS: usize = 2 * stats::MAX_CHANNELS;
+
 /// The live view's state, shared with the hook that draws it from inside the stream loops.
 struct Run {
     stop: bool,
     next_draw: u64,
     started: u64,
-    send_channels: usize,
-    receive_channels: usize,
-    /// The address line has been brought up to date with the address a DHCP lease gave.
+    /// One row per channel sent, then one per channel received; each says which device channel it is.
+    rows: usize,
+    sends: usize,
+    labels: [u8; MAX_ROWS],
+    page: usize,
+    /// The scale and the numbers in Nordic units (TEST = 0) instead of dBFS.
+    nordic: bool,
+    /// Rows (and the footer) still to be drawn from scratch; the drawing is spread over many calls so that none of
+    /// them holds the stream up for long.
+    needs_full: [bool; MAX_ROWS],
+    footer_dirty: bool,
+    cursor: usize,
+    next_counters: u64,
     ip_shown: bool,
     mac: [u8; 6],
     nic: usize,
     counters: Text<100>,
     message: Text<100>,
-    meters: [i8; 2 * stats::MAX_CHANNELS],
+    shown_cell: [i16; MAX_ROWS],
+    shown_hold: [i16; MAX_ROWS],
+    shown_number: [i16; MAX_ROWS],
+    shown_clip: [bool; MAX_ROWS],
+    hold: [u32; MAX_ROWS],
+    hold_at: [u64; MAX_ROWS],
+    clip_at: [u64; MAX_ROWS],
+    /// The longest the panel's own drawing has held up the stream loop since the run began (microseconds).
+    ui_worst: u64,
 }
 
-static mut RUN: Run = Run { stop: false, next_draw: 0, started: 0, send_channels: 0, receive_channels: 0, ip_shown: false, mac: [0; 6], nic: 0, counters: Text::new(), message: Text::new(), meters: [-1; 2 * stats::MAX_CHANNELS] };
+const fn blank_run() -> Run {
+    Run {
+        stop: false, next_draw: 0, started: 0, rows: 0, sends: 0, labels: [0; MAX_ROWS], page: 0, nordic: true, needs_full: [true; MAX_ROWS], footer_dirty: true, cursor: 0, next_counters: 0, ip_shown: false, mac: [0; 6], nic: 0,
+        counters: Text::new(), message: Text::new(), shown_cell: [-1; MAX_ROWS], shown_hold: [-1; MAX_ROWS], shown_number: [i16::MIN; MAX_ROWS], shown_clip: [false; MAX_ROWS],
+        hold: [0; MAX_ROWS], hold_at: [0; MAX_ROWS], clip_at: [0; MAX_ROWS], ui_worst: 0,
+    }
+}
+
+impl Run {
+    /// Everything on the meter screen is redrawn from scratch over the next calls (new page, new scale).
+    fn mark_all(&mut self) {
+        self.needs_full = [true; MAX_ROWS];
+        self.footer_dirty = true;
+        self.cursor = 0;
+    }
+}
+
+static mut RUN: Run = blank_run();
 
 fn run_state() -> &'static mut Run {
     unsafe { &mut *(&raw mut RUN) }
 }
 
-const METER_ROW: usize = 9;
-
-/// Where meter `index` of a group (0 send, 1 receive) is drawn: four to a row.
-fn meter_position(group: usize, index: usize, send_rows: usize) -> (usize, usize) {
-    let base = METER_ROW + if group == 0 { 0 } else { send_rows + 1 };
-    (base + index / 4, 2 + (index % 4) * 19)
-}
-
-fn draw_meters(group: usize, count: usize, send_rows: usize, peaks: &mut [u32; stats::MAX_CHANNELS], cache: &mut [i8]) {
-    for index in 0..count.min(stats::MAX_CHANNELS) {
-        let steps = stats::steps_below_full(peaks[index]);
-        peaks[index] = 0;
-        let cells = ((20 - steps) / 2) as i8;
-        if cache[group * stats::MAX_CHANNELS + index] == cells {
-            continue;
-        }
-        cache[group * stats::MAX_CHANNELS + index] = cells;
-        let (row, column) = meter_position(group, index, send_rows);
-        at(row, column);
-        draw!("{:>2} [", index + 1);
-        for cell in 0..10 {
-            draw!("{}", if cell < cells { '#' } else { '.' });
-        }
-        draw!("]");
+/// The character in cell `cell` of a bar whose level is at `level` (and peak-hold marker at `hold`): filled up to the
+/// level (`=`, and `#` above the permitted maximum), the hold marker `|`, else the scale: `:` at TEST, `.` every 6 dB.
+fn bar_char(cell: i32, level: i32, hold: i32) -> char {
+    if cell <= level {
+        if cell > PML_CELL { '#' } else { '=' }
+    } else if cell == hold {
+        '|'
+    } else if cell == TEST_CELL {
+        ':'
+    } else if cell % 6 == 0 {
+        '.'
+    } else {
+        ' '
     }
 }
 
-/// Called from inside the stream loops (as `should_abort`): reads a key, and a couple of times a second brings the
-/// counters, the last message and the meters up to date. Only what changed is sent, because every byte costs time
-/// the stream needs.
+/// A level in tenths of a dB as text of six columns, signed with one decimal.
+fn tenths_text(tenths: i32, out: &mut Text<8>) {
+    let magnitude = tenths.unsigned_abs();
+    let _ = write!(out, "{:>6}", {
+        let mut text = Text::<8>::new();
+        let _ = write!(text, "{}{}.{}", if tenths < 0 { '-' } else { '+' }, magnitude / 10, magnitude % 10);
+        text
+    }.as_str());
+}
+
+fn draw_scale(run: &Run) {
+    at(ROW_SCALE, 1);
+    draw!("\x1b[K");
+    for mark in (-42..=18).step_by(6) {
+        let cell = (mark + 42) as usize; // the cell is the same on both scales (the Nordic number is dBFS + 18)
+        let value = if run.nordic { mark } else { mark - 18 };
+        let mut label = Text::<8>::new();
+        let _ = write!(label, "{value}");
+        let column = (BAR_COL + cell).saturating_sub((label.length.max(1) - 1) / 2).max(1);
+        at(ROW_SCALE, column);
+        draw!("{}", label.as_str());
+    }
+    at(ROW_SCALE + 1, 1);
+    draw!("\x1b[K");
+    at(ROW_SCALE + 1, 2);
+    draw!("{}", if run.nordic { "Nordic" } else { "dBFS" });
+    for mark in (0..CELLS).step_by(6) {
+        at(ROW_SCALE + 1, BAR_COL + mark as usize);
+        draw!("{}", if mark == TEST_CELL { 'T' } else { '|' });
+    }
+    at(ROW_SCALE + 1, BAR_COL + PML_CELL as usize);
+    draw!("M");
+}
+
+fn draw_footer(run: &Run) {
+    let first = run.page * PAGE_ROWS;
+    let last = (first + PAGE_ROWS).min(run.rows);
+    at(ROW_FIRST + PAGE_ROWS, 2);
+    draw!("Channels {}-{} of {}   N: next page   B: previous page\x1b[K", first + 1, last, run.rows);
+    at(ROW_FIRST + PAGE_ROWS + 1, 2);
+    draw!("T = TEST level, -18 dBFS    M = maximum permitted level, -9 dBFS    # = above it\x1b[K");
+    at(ROW_FIRST + PAGE_ROWS + 2, 2);
+    draw!("U: Nordic/dBFS   R: reset hold   M: meters off/on   Esc or Q: stop and return\x1b[K");
+}
+
+/// Rows drawn per call: each call is short, and a whole page is refreshed within 100 ms.
+const ROWS_PER_CALL: usize = 3;
+
+/// Brings the visible meter rows up to date, a few rows per call. Reads each channel's detector (the highest
+/// reading since the last look, so a short peak between looks still shows), keeps a three-second peak hold and a
+/// latched clip indicator, and draws only what changed.
+fn update_meters(run: &mut Run, now: u64) {
+    let shown = stats::get();
+    let first = run.page * PAGE_ROWS;
+    for _ in 0..ROWS_PER_CALL {
+        let slot = run.cursor;
+        run.cursor = (run.cursor + 1) % PAGE_ROWS;
+        let index = first + slot;
+        let row = ROW_FIRST + slot;
+        if index >= run.rows {
+            let flag = index.min(MAX_ROWS - 1);
+            if run.needs_full[flag] {
+                at(row, 1);
+                draw!("\x1b[K");
+                run.needs_full[flag] = false;
+            }
+            continue;
+        }
+        let full = run.needs_full[index];
+        run.needs_full[index] = false;
+        let is_send = index < run.sends;
+        let channel = if is_send { index } else { index - run.sends };
+        let (detector, clip_flag) = if is_send { (&mut shown.send[channel], &mut shown.send_clip[channel]) } else { (&mut shown.receive[channel], &mut shown.receive_clip[channel]) };
+        let peak = detector.take_max();
+        if *clip_flag {
+            *clip_flag = false;
+            run.clip_at[index] = now;
+        }
+        if peak >= run.hold[index] || now > run.hold_at[index] + HOLD_MICROS {
+            run.hold[index] = peak;
+            run.hold_at[index] = now;
+        }
+        let tenths = meter::db_tenths(peak);
+        let cell = ((tenths + 600).div_euclid(10)).clamp(0, CELLS - 1);
+        let hold_cell = ((meter::db_tenths(run.hold[index]) + 600).div_euclid(10)).clamp(0, CELLS - 1);
+        let hold_cell = if hold_cell > cell && run.hold[index] >= 64 { hold_cell } else { -1 };
+        let number = if peak < 64 { i16::MAX } else { (tenths + if run.nordic { 180 } else { 0 }) as i16 };
+        let clipped = now < run.clip_at[index] + HOLD_MICROS && run.clip_at[index] != 0;
+        if full {
+            at(row, 1);
+            draw!("\x1b[K");
+            at(row, 2);
+            draw!("{}{:>2}", if is_send { "In " } else { "Out" }, run.labels[index]);
+        }
+        let (old_cell, old_hold) = (i32::from(run.shown_cell[index]), i32::from(run.shown_hold[index]));
+        if full || old_cell != cell || old_hold != hold_cell {
+            let (low, high) = if full {
+                (0, CELLS - 1)
+            } else {
+                let mut low = cell.min(old_cell.max(0));
+                let mut high = cell.max(old_cell);
+                for marker in [hold_cell, old_hold] {
+                    if marker >= 0 {
+                        low = low.min(marker);
+                        high = high.max(marker);
+                    }
+                }
+                (low.max(0), high.min(CELLS - 1))
+            };
+            at(row, BAR_COL + low as usize);
+            for c in low..=high {
+                draw!("{}", bar_char(c, cell, hold_cell));
+            }
+            run.shown_cell[index] = cell as i16;
+            run.shown_hold[index] = hold_cell as i16;
+        }
+        if full || run.shown_number[index] != number {
+            at(row, NUMBER_COL);
+            if number == i16::MAX {
+                draw!("  -inf");
+            } else {
+                let mut text = Text::<8>::new();
+                tenths_text(i32::from(number), &mut text);
+                draw!("{}", text.as_str());
+            }
+            run.shown_number[index] = number;
+        }
+        if full || run.shown_clip[index] != clipped {
+            at(row, CLIP_COL);
+            draw!("{}", if clipped { "CLIP" } else { "    " });
+            run.shown_clip[index] = clipped;
+        }
+    }
+}
+
+/// Called from inside the stream loops (as `should_abort`): reads a key, and ten times a second brings the counters,
+/// the last message and the meters up to date. Only what changed is sent, because every byte costs time the stream
+/// needs.
 extern "C" fn panel_hook() -> u32 {
     let run = run_state();
     if run.stop {
         return 1;
     }
     let event = (tape_rt::api().read_key)();
-    if event == 1 || event == 0x100 + u32::from(b'q') || event == 0x100 + u32::from(b'Q') {
+    if event == 1 {
         run.stop = true;
         return 1;
+    }
+    if event >= 0x100 {
+        match (event & 0xff) as u8 {
+            b'q' | b'Q' => {
+                run.stop = true;
+                return 1;
+            }
+            b'n' | b'N' => {
+                run.page = (run.page + 1) % run.rows.div_ceil(PAGE_ROWS).max(1);
+                run.mark_all();
+            }
+            b'b' | b'B' => {
+                let pages = run.rows.div_ceil(PAGE_ROWS).max(1);
+                run.page = (run.page + pages - 1) % pages;
+                run.mark_all();
+            }
+            b'u' | b'U' => {
+                run.nordic = !run.nordic;
+                run.mark_all();
+                draw_scale(run);
+            }
+            b'r' | b'R' => {
+                run.hold = [0; MAX_ROWS];
+                run.clip_at = [0; MAX_ROWS];
+            }
+            b'm' | b'M' => {
+                // Meters off: no detector work per sample and no meter drawing, in case the machine is too slow for
+                // them (the counters line shows the longest the drawing has held the stream up).
+                let stats = stats::get();
+                stats.meters_on = !stats.meters_on;
+                for slot in 0..PAGE_ROWS {
+                    at(ROW_FIRST + slot, 1);
+                    draw!("\x1b[K");
+                }
+                if stats.meters_on {
+                    run.mark_all();
+                } else {
+                    at(ROW_FIRST, 2);
+                    draw!("Meters are off (M turns them on again).");
+                }
+            }
+            _ => {}
+        }
     }
     let now = tape_rt::micros();
     if now < run.next_draw {
         return 0;
     }
-    run.next_draw = now + 250_000;
-    if !run.ip_shown {
-        if let Some(ip) = crate::current_ip() {
-            run.ip_shown = true;
-            at(3, 1);
-            draw!(" NIC {}  MAC {}  IP {}.{}.{}.{}\x1b[K", run.nic + 1, MacText(run.mac), ip[0], ip[1], ip[2], ip[3]);
+    run.next_draw = now + 25_000;
+    // One small piece of drawing per call, so that no call holds the stream up for long.
+    if run.footer_dirty && stats::get().meters_on {
+        run.footer_dirty = false;
+        draw_footer(run);
+    } else if now >= run.next_counters {
+        run.next_counters = now + 250_000;
+        if !run.ip_shown {
+            if let Some(ip) = crate::current_ip() {
+                run.ip_shown = true;
+                at(3, 1);
+                draw!(" NIC {}  MAC {}  IP {}.{}.{}.{}\x1b[K", run.nic + 1, MacText(run.mac), ip[0], ip[1], ip[2], ip[3]);
+            }
         }
+        let shown = stats::get();
+        let mut counters = Text::<100>::new();
+        let seconds = (now - run.started) / 1_000_000;
+        let _ = write!(counters, "Sent {} Recv {} Lost {} Ring {}/{} ms Clock {:+} ppm UI stall {} ms {}:{:02}", shown.sent, shown.received, shown.lost, ms(shown.level_frames, shown.rate), ms(shown.target_frames, shown.rate), shown.offset_ppm, run.ui_worst / 1000, seconds / 60, seconds % 60);
+        if counters != run.counters {
+            at(5, 2);
+            draw!("{}\x1b[K", counters.as_str());
+            run.counters = counters;
+        }
+        let message = Text::<100>::from(tape_rt::last_message());
+        if message != run.message {
+            at(6, 2);
+            draw!("{}\x1b[K", message.as_str());
+            run.message = message;
+        }
+    } else if stats::get().meters_on {
+        update_meters(run, now);
     }
-    let shown = stats::get();
-    let mut counters = Text::<100>::new();
-    let seconds = (now - run.started) / 1_000_000;
-    let _ = write!(counters, "Sent {}   Received {}   Lost {}   Ring {} ms (target {})   Clock {:+} ppm   {}:{:02}", shown.sent, shown.received, shown.lost, ms(shown.level_frames, shown.rate), ms(shown.target_frames, shown.rate), shown.offset_ppm, seconds / 60, seconds % 60);
-    if counters != run.counters {
-        at(5, 2);
-        draw!("{}\x1b[K", counters.as_str());
-        run.counters = counters;
-    }
-    let message = Text::<100>::from(tape_rt::last_message());
-    if message != run.message {
-        at(6, 2);
-        draw!("{}\x1b[K", message.as_str());
-        run.message = message;
-    }
-    let send_rows = run.send_channels.min(stats::MAX_CHANNELS).div_ceil(4);
-    let (send_channels, receive_channels) = (run.send_channels, run.receive_channels);
-    draw_meters(0, send_channels, send_rows, &mut shown.send_peaks, &mut run.meters);
-    draw_meters(1, receive_channels, send_rows, &mut shown.receive_peaks, &mut run.meters);
+    // How long this call took: the stream loop was not running meanwhile.
+    run.ui_worst = run.ui_worst.max(tape_rt::micros() - now);
     0
 }
 
@@ -651,12 +875,32 @@ fn run_stream(settings: &Settings) {
         }
     };
     let run = run_state();
-    *run = Run { stop: false, next_draw: 0, started: tape_rt::micros(), send_channels: 0, receive_channels: 0, ip_shown: false, mac: [0; 6], nic: options.nic, counters: Text::new(), message: Text::new(), meters: [-1; 2 * stats::MAX_CHANNELS] };
+    *run = blank_run();
+    run.started = tape_rt::micros();
+    run.nic = options.nic;
+    // One meter row per channel: the ones sent (labelled with the device input they come from), then the ones played.
+    let mut add = |channels: Option<ChannelSet>, fallback: usize, run: &mut Run| {
+        let numbers: [u8; stats::MAX_CHANNELS] = {
+            let mut list = [0u8; stats::MAX_CHANNELS];
+            if let Some(set) = channels {
+                for (index, channel) in set.channels().enumerate().take(stats::MAX_CHANNELS) {
+                    list[index] = channel as u8 + 1;
+                }
+            }
+            list
+        };
+        let count = channels.map_or(fallback, |set| set.count()).min(stats::MAX_CHANNELS);
+        for index in 0..count {
+            run.labels[run.rows] = if numbers[index] != 0 { numbers[index] } else { index as u8 + 1 };
+            run.rows += 1;
+        }
+        count
+    };
     if mode != "recv" {
-        run.send_channels = ChannelSet::parse(settings.send.as_str()).map_or(2, |set| set.count());
+        run.sends = add(ChannelSet::parse(settings.send.as_str()), 2, run);
     }
     if mode != "send" {
-        run.receive_channels = ChannelSet::parse(settings.receive.as_str()).map_or(2, |set| set.count());
+        add(ChannelSet::parse(settings.receive.as_str()), 2, run);
     }
     stats::reset();
     at(1, 1);
@@ -673,18 +917,7 @@ fn run_stream(settings: &Settings) {
     draw!(" NIC {}  MAC {}  IP {}\x1b[K", options.nic + 1, MacText(mac), if !settings.rtp() { "(layer 2 only)" } else if settings.dhcp { "(asking the DHCP server...)" } else { settings.ip.as_str() });
     at(4, 1);
     draw!(" {:-<78}", "");
-    let send_rows = run.send_channels.min(stats::MAX_CHANNELS).div_ceil(4);
-    if run.send_channels > 0 {
-        at(METER_ROW - 1, 2);
-        draw!("Sending, peak level per channel (6 dB per step)");
-    }
-    if run.receive_channels > 0 {
-        at(METER_ROW + if run.send_channels > 0 { send_rows + 1 } else { 0 } - 1, 2);
-        draw!("Receiving, peak level per channel");
-    }
-    let bottom = METER_ROW + send_rows + run.receive_channels.min(stats::MAX_CHANNELS).div_ceil(4) + 2;
-    at(bottom.min(23), 2);
-    draw!("Esc or Q: stop and return to the settings");
+    draw_scale(run);
     tape_rt::set_quiet(true);
     let shim = abort::wrap_with(real, panel_hook);
     let mut run_options = options.clone();
