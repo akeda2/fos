@@ -274,9 +274,12 @@ firmware, so a pending slot is tried on the next boot.
   any stream a tape leaves running): `record NAME [SECONDS] [RATE]` captures every input channel into RAM and
   writes NAME.wav (hardware only: QEMU's `usb-audio` has no input), `play NAME.wav` streams a PCM WAV file,
   converting width and channel count (tested in QEMU: 16-bit stereo and 24-bit mono files, 439/879 Hz measured).
-  Not done: the asynchronous feedback endpoint (the device's real clock; playback runs at the nominal rate),
-  capture and playback together, interrupt-driven event handling (events are handled whenever the xHCI ring is
-  drained, from tape/shell loops).
+  An asynchronous playback stream also runs its feedback endpoint (3-byte 10.14 at full speed, 4-byte 16.16 at
+  high speed): reports within 10% of nominal set the frames-per-packet step, so playback follows the device's own
+  clock; `audio` shows the report count and the device's clock against nominal. On the H6: 313 reports in 5 s,
+  none rejected, exactly nominal at 48 kHz (QEMU's `usb-audio` has no feedback endpoint, so it is hardware-only).
+  Not done: capture and playback together, interrupt-driven event handling (events are handled whenever the
+  xHCI ring is drained, from tape/shell loops).
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

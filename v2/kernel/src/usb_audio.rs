@@ -27,6 +27,8 @@ pub struct StreamAlt {
     pub interval: u8,
     /// The explicit feedback endpoint of an asynchronous OUT stream, if any.
     pub feedback: u8,
+    pub feedback_packet: u16,
+    pub feedback_interval: u8,
     /// Class 1.0 lists its discrete sample rates in the format descriptor (0 rates = continuous range).
     pub rates: [u32; 6],
     pub rate_count: usize,
@@ -133,6 +135,8 @@ pub fn parse(configuration: &[u8]) -> Description {
                     // isochronous: a data endpoint (usage 0 or 2) or an explicit feedback one (usage 1)
                     if (attributes >> 4) & 3 == 1 {
                         current.feedback = d[2];
+                        current.feedback_packet = u16::from_le_bytes([d[4], d[5]]) & 0x7ff;
+                        current.feedback_interval = d[6];
                     } else if current.endpoint == 0 {
                         current.endpoint = d[2];
                         current.sync = (attributes >> 2) & 3;
@@ -279,8 +283,11 @@ struct Stream {
     next: usize,
     trbs: [u64; WINDOW],
     pub ring: Ring,
-    /// Playback only: fractional frames per packet, as an accumulator in units of 1/packets-per-second.
-    accumulator: u32,
+    /// Playback only: frames per packet in Q16 fixed point (nominal, or what the device's feedback endpoint
+    /// last reported) and the fractional remainder carried from packet to packet.
+    step_q16: u32,
+    accumulator_q16: u32,
+    feedback: Option<Feedback>,
     packets_per_second: u32,
     rate: u32,
     pub packets: u64,
@@ -288,6 +295,23 @@ struct Stream {
     pub errors: u64,
     pub underruns: u64,
 }
+
+/// The explicit feedback endpoint of an asynchronous playback stream: the device says, every so often, how
+/// many samples per frame its own clock consumes. Full speed sends it as 10.14 fixed point in 3 bytes
+/// (samples per 1 ms frame), high speed as 16.16 in 4 bytes (samples per 125 us microframe).
+struct Feedback {
+    dci: u32,
+    buffers: u64,
+    trbs: [u64; FEEDBACK_WINDOW],
+    next: usize,
+    packet: u16,
+    /// The last accepted value, in Q16 samples per packet, and how many were received / rejected.
+    last_q16: u32,
+    received: u64,
+    rejected: u64,
+}
+
+const FEEDBACK_WINDOW: usize = 8;
 
 struct AudioDevice {
     controller: (u8, u8, u8),
@@ -414,7 +438,9 @@ fn start_stream(controller: &mut Controller, device: &Device, description: &Desc
         next: 0,
         trbs: [0; WINDOW],
         ring,
-        accumulator: 0,
+        step_q16: 0,
+        accumulator_q16: 0,
+        feedback: None,
         packets_per_second: packets_per_second.max(1),
         rate,
         packets: 0,
@@ -422,11 +448,79 @@ fn start_stream(controller: &mut Controller, device: &Device, description: &Desc
         errors: 0,
         underruns: 0,
     };
+    stream.step_q16 = ((u64::from(rate) << 16) / u64::from(stream.packets_per_second)) as u32;
+    if !capture && alt.feedback != 0 && alt.feedback_packet >= 3 {
+        stream.feedback = start_feedback(controller, device, &alt);
+    }
     for slot in 0..WINDOW {
         queue_slot(controller, device.slot, &mut stream, slot, capture);
     }
     controller.start_endpoint(device.slot, dci);
     Ok(stream)
+}
+
+/// Configures the playback stream's feedback endpoint (an isochronous IN endpoint) and queues a few
+/// transfers on it. Optional: if anything fails the stream simply runs at the nominal rate.
+fn start_feedback(controller: &mut Controller, device: &Device, alt: &StreamAlt) -> Option<Feedback> {
+    let buffers = memory::allocate_contiguous(1, Some(1 << 32))?;
+    let dci = match controller.configure_isoc_endpoint(device, alt.feedback, alt.feedback_packet, alt.feedback_interval.max(1)) {
+        Ok(dci) => dci,
+        Err(_) => {
+            memory::free(buffers, 1);
+            return None;
+        }
+    };
+    let mut feedback = Feedback { dci, buffers, trbs: [0; FEEDBACK_WINDOW], next: 0, packet: alt.feedback_packet.min(4), last_q16: 0, received: 0, rejected: 0 };
+    for slot in 0..FEEDBACK_WINDOW {
+        feedback.trbs[slot] = controller.queue_isoc(device.slot, dci, buffers + (slot * 16) as u64, u32::from(feedback.packet));
+    }
+    controller.start_endpoint(device.slot, dci);
+    Some(feedback)
+}
+
+/// Handles one feedback transfer event of `stream`; true if it was one.
+fn feedback_event(controller: &mut Controller, xhci_slot: u8, stream: &mut Stream, event: &xhci::Trb, high_speed: bool) -> bool {
+    let nominal = stream.step_q16_nominal();
+    let Some(feedback) = stream.feedback.as_mut() else { return false };
+    if event.endpoint_index() != feedback.dci {
+        return false;
+    }
+    let slot = if feedback.trbs[feedback.next] == event.trb_address() { feedback.next } else { feedback.trbs.iter().position(|&a| a == event.trb_address()).unwrap_or(feedback.next) };
+    feedback.next = (slot + 1) % FEEDBACK_WINDOW;
+    let length = usize::from(feedback.packet).saturating_sub(event.residual() as usize);
+    if matches!(event.completion(), xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT) && (length == 3 || length == 4) {
+        let bytes = unsafe { core::slice::from_raw_parts((feedback.buffers + (slot * 16) as u64) as *const u8, length) };
+        let mut value = 0u64;
+        for (index, &byte) in bytes.iter().enumerate() {
+            value |= u64::from(byte) << (8 * index);
+        }
+        // 3 bytes: 10.14 (samples per 1 ms frame); 4 bytes: 16.16 (samples per microframe). Convert to
+        // Q16 samples per *packet*, a packet being 2^(bInterval-1) such frames.
+        let per_frame_q16 = if length == 3 { value << 2 } else { value };
+        let frames_per_packet = u64::from(if high_speed { 8000 } else { 1000 } / stream.packets_per_second.max(1));
+        let step = per_frame_q16 * frames_per_packet;
+        // Believe only values within 10% of the nominal rate: a garbage report must not wreck the stream.
+        if step >= u64::from(nominal) * 9 / 10 && step <= u64::from(nominal) * 11 / 10 {
+            stream.step_q16 = step as u32;
+            if let Some(feedback) = stream.feedback.as_mut() {
+                feedback.last_q16 = step as u32;
+                feedback.received += 1;
+            }
+        } else if let Some(feedback) = stream.feedback.as_mut() {
+            feedback.rejected += 1;
+        }
+    }
+    if let Some(feedback) = stream.feedback.as_mut() {
+        feedback.trbs[slot] = controller.queue_isoc(xhci_slot, feedback.dci, feedback.buffers + (slot * 16) as u64, u32::from(feedback.packet));
+        controller.start_endpoint(xhci_slot, feedback.dci);
+    }
+    true
+}
+
+impl Stream {
+    fn step_q16_nominal(&self) -> u32 {
+        ((u64::from(self.rate) << 16) / u64::from(self.packets_per_second)) as u32
+    }
 }
 
 /// Fills (playback) or just aims (capture) packet slot `slot` and queues its transfer.
@@ -435,11 +529,12 @@ fn queue_slot(controller: &mut Controller, xhci_slot: u8, stream: &mut Stream, s
     let length = if capture {
         u32::from(stream.alt.max_packet)
     } else {
-        // This packet's frame count: rate / packets-per-second, with the remainder carried over so
-        // 44.1 kHz comes out as 44 frames per packet with a 45 once in ten.
-        stream.accumulator += stream.rate;
-        let frames = stream.accumulator / stream.packets_per_second;
-        stream.accumulator %= stream.packets_per_second;
+        // This packet's frame count: the Q16 frames-per-packet step (nominal rate / packets per second, or
+        // the device's own figure from its feedback endpoint), with the fraction carried over so 44.1 kHz
+        // comes out as 44 frames per packet with a 45 once in ten.
+        let total = u64::from(stream.accumulator_q16) + u64::from(stream.step_q16);
+        let frames = (total >> 16) as u32;
+        stream.accumulator_q16 = (total & 0xffff) as u32;
         let frame_bytes = usize::from(stream.alt.channels) * usize::from(stream.alt.subslot_bytes);
         let wanted = (frames as usize * frame_bytes).min(usize::from(stream.alt.max_packet));
         let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, wanted) };
@@ -464,8 +559,12 @@ pub fn background_event(controller: &mut Controller, event: &xhci::Trb) -> bool 
         return false;
     }
     let slot = device.device.slot;
+    let high_speed = device.device.speed >= 3;
     for (stream, capture) in [(device.capture.as_mut(), true), (device.playback.as_mut(), false)] {
         let Some(stream) = stream else { continue };
+        if !capture && feedback_event(controller, slot, stream, event, high_speed) {
+            return true;
+        }
         if event.endpoint_index() != stream.dci {
             continue;
         }
@@ -519,6 +618,11 @@ pub fn start(controller: &mut Controller, rate: u32, want_capture: bool, want_pl
 }
 
 fn stop_stream(controller: &mut Controller, device: &Device, stream: &mut Stream) {
+    if let Some(feedback) = stream.feedback.take() {
+        controller.stop_endpoint(device.slot, feedback.dci);
+        controller.drop_endpoint(device, feedback.dci);
+        memory::free(feedback.buffers, 1);
+    }
     controller.stop_endpoint(device.slot, stream.dci);
     controller.drop_endpoint(device, stream.dci);
     let _ = controller.control_transfer(device, 0x01, 0x0b, 0, u16::from(stream.alt.interface), &mut []); // back to alternate setting 0
@@ -574,6 +678,16 @@ pub fn status() {
                 stream.rate, stream.alt.channels, stream.alt.bits, stream.packets, stream.bytes, stream.errors, stream.underruns, stream.ring.available(), stream.ring.overruns
             ),
             None => crate::println!("  {name}: stopped"),
+        }
+        if let Some(feedback) = stream.and_then(|stream| stream.feedback.as_ref()) {
+            let stream = stream.unwrap();
+            let q = |value: u32| (value >> 16, ((value & 0xffff) * 1000) >> 16);
+            let (device_whole, device_fraction) = q(feedback.last_q16);
+            let (nominal_whole, nominal_fraction) = q(stream.step_q16_nominal());
+            crate::println!(
+                "    feedback: {} reports, {} rejected; device clock {device_whole}.{device_fraction:03} vs nominal {nominal_whole}.{nominal_fraction:03} frames/packet",
+                feedback.received, feedback.rejected
+            );
         }
     }
 }
