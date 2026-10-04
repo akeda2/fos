@@ -483,6 +483,90 @@ pub fn device_sample_16(slot_bytes: &[u8]) -> i16 {
     (device_sample(slot_bytes) >> 16) as i16
 }
 
+/// IEEE 1722 (AVTP) audio: the AAF PCM format, the layer-2 transport of AVB. An AVTPDU is a 24-byte header and
+/// the samples, big endian and interleaved, directly in an Ethernet frame of ethertype 0x22f0.
+pub mod avtp {
+    pub const ETHERTYPE: u16 = 0x22f0;
+    pub const HEADER_LEN: usize = 24;
+    /// Subtype of the AVTP Audio Format.
+    const SUBTYPE_AAF: u8 = 0x02;
+    /// The AAF `format` values for integer PCM.
+    pub const FORMAT_INT24: u8 = 3;
+    pub const FORMAT_INT16: u8 = 4;
+    /// The AAF `nsr` (nominal sample rate) codes: 8, 16, 32, 44.1, 48, 88.2, 96, 176.4, 192 kHz.
+    const RATES: [u32; 9] = [8_000, 16_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+
+    pub fn rate_code(rate: u32) -> Option<u8> {
+        RATES.iter().position(|&known| known == rate).map(|index| index as u8 + 1)
+    }
+
+    pub fn code_rate(code: u8) -> Option<u32> {
+        RATES.get(usize::from(code).checked_sub(1)?).copied()
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Header {
+        /// Only 8 bits on the wire.
+        pub sequence: u8,
+        /// Whether `timestamp` (the presentation time, nanoseconds of the gPTP clock) is valid.
+        pub timestamp_valid: bool,
+        pub stream_id: [u8; 8],
+        pub timestamp: u32,
+        pub channels: u16,
+        pub bits: u8,
+        pub rate: u32,
+        /// Bytes of samples after the header.
+        pub data_length: u16,
+    }
+
+    impl Header {
+        /// Writes the 24 bytes; false if the rate or bit depth has no AAF code.
+        pub fn encode(&self, out: &mut [u8]) -> bool {
+            let (Some(code), format) = (rate_code(self.rate), if self.bits == 24 { FORMAT_INT24 } else { FORMAT_INT16 }) else { return false };
+            out[0] = SUBTYPE_AAF;
+            out[1] = 0x80 | if self.timestamp_valid { 0x01 } else { 0 }; // sv = 1, version 0, mr/gv 0, tv
+            out[2] = self.sequence;
+            out[3] = 0; // tu: timestamp uncertain
+            out[4..12].copy_from_slice(&self.stream_id);
+            out[12..16].copy_from_slice(&self.timestamp.to_be_bytes());
+            out[16] = format;
+            out[17] = (code << 4) | ((self.channels >> 8) & 3) as u8; // nsr (4 bits), 2 reserved, channels (10 bits)
+            out[18] = self.channels as u8;
+            out[19] = self.bits;
+            out[20..22].copy_from_slice(&self.data_length.to_be_bytes());
+            out[22] = 0; // sp, evt
+            out[23] = 0;
+            true
+        }
+
+        pub fn parse(bytes: &[u8]) -> Option<Header> {
+            if bytes.len() < HEADER_LEN || bytes[0] != SUBTYPE_AAF || bytes[1] & 0x80 == 0 || (bytes[1] >> 4) & 7 != 0 {
+                return None;
+            }
+            let format = bytes[16];
+            let bits = bytes[19];
+            if !(format == FORMAT_INT24 && bits == 24 || format == FORMAT_INT16 && bits == 16) {
+                return None;
+            }
+            let channels = (u16::from(bytes[17] & 3) << 8) | u16::from(bytes[18]);
+            let data_length = u16::from_be_bytes([bytes[20], bytes[21]]);
+            if channels == 0 || usize::from(data_length) > bytes.len() - HEADER_LEN || usize::from(data_length) % (usize::from(channels) * usize::from(bits) / 8) != 0 {
+                return None;
+            }
+            Some(Header {
+                sequence: bytes[2],
+                timestamp_valid: bytes[1] & 1 != 0,
+                stream_id: bytes[4..12].try_into().ok()?,
+                timestamp: u32::from_be_bytes(bytes[12..16].try_into().ok()?),
+                channels,
+                bits,
+                rate: code_rate(bytes[17] >> 4)?,
+                data_length,
+            })
+        }
+    }
+}
+
 /// The Ethernet destination for an IPv4 multicast address: 01:00:5e plus the low 23 bits (RFC 1112).
 pub fn multicast_mac(address: [u8; 4]) -> [u8; 6] {
     [0x01, 0x00, 0x5e, address[1] & 0x7f, address[2], address[3]]
@@ -743,5 +827,29 @@ mod tests {
         assert_eq!(fill.advise(250), Slip::None);
         assert_eq!(fill.advise(300), Slip::Drop);
         assert_eq!(fill.advise(60), Slip::Repeat);
+    }
+
+    #[test]
+    fn avtp_header_round_trip() {
+        let header = avtp::Header { sequence: 200, timestamp_valid: true, stream_id: [1, 2, 3, 4, 5, 6, 0, 1], timestamp: 0x1234_5678, channels: 8, bits: 24, rate: 96_000, data_length: 8 * 3 * 4 };
+        let mut bytes = [0u8; 24 + 96];
+        assert!(header.encode(&mut bytes));
+        assert_eq!(&bytes[..4], &[0x02, 0x81, 200, 0]);
+        assert_eq!(bytes[16], 3);
+        assert_eq!(bytes[17], 0x70); // nsr 7 (96 kHz), channels high bits 0
+        assert_eq!(bytes[18], 8);
+        assert_eq!(avtp::Header::parse(&bytes), Some(header));
+        assert_eq!(avtp::Header::parse(&bytes[..100]), None); // data longer than the frame
+    }
+
+    #[test]
+    fn avtp_rejects_other_formats() {
+        let header = avtp::Header { sequence: 0, timestamp_valid: false, stream_id: [0; 8], timestamp: 0, channels: 2, bits: 16, rate: 48_000, data_length: 4 };
+        let mut bytes = [0u8; 28];
+        assert!(header.encode(&mut bytes));
+        assert!(avtp::Header::parse(&bytes).is_some());
+        bytes[0] = 0; // not AAF
+        assert_eq!(avtp::Header::parse(&bytes), None);
+        assert!(!avtp::Header { rate: 12_345, ..header }.encode(&mut [0u8; 28]));
     }
 }

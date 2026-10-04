@@ -364,7 +364,17 @@ firmware, so a pending slot is tried on the next boot.
   Hardware (H6 on the Skylake and UFX on the Sandy Bridge sending to each other over RTP, 24-bit, 20 s): each side sent
   ~20,060 packets and received ~20,040 (7 lost), no transfer errors. A shell command line is limited to about 100
   characters, so a long option list is cut off (`secs=` then fails to parse): leave out options at their defaults.
-  Plan: AVTP (AVB) raw mode. The UFX's 12-channel capture alternate is
+  **AVTP (AVB layer 2):** `proto=avtp` sends and receives IEEE 1722 AAF (ethertype 0x22f0): the 24-byte AVTPDU header
+  (`audio_wire::avtp`, host-tested) and big-endian 16/24-bit samples, the sample rate as the AAF `nsr` code, an 8-bit
+  sequence number (the receiver widens it so its gap logic sees no false jump at the wrap), a stream id made of our MAC
+  and a number, default destination 91:e0:f0:00:fe:01 (`to=MAC` overrides). The NIC is told to accept multicast so a
+  listener hears a multicast stream address. fos has no gPTP clock and no MSRP stream reservation, so the presentation
+  time is marked not valid (tv = 0) and the listener plays on arrival: this interoperates with AVTP listeners that
+  accept that, not with a full Milan device. The header layout is written from the standard and checked only against
+  our own parser and by eye (no AVB device or dissector at hand; tcpdump has none). QEMU test: header fields, 8-bit
+  sequence stepping and a played tone; hardware (H6 on the Skylake to the UFX, 30 s, 1 ms packets): 30,019 of 30,019
+  packets, 0 lost.
+  Plan: streaming `record` to disk; a real AVB device or a Wireshark capture to confirm the AAF header. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
   is proprietary; AES67 mode is the open way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload

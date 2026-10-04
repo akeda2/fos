@@ -169,7 +169,7 @@ def main():
             for guest in (receiver, sender):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            for run in ("a", "b", "c", "d", "e", "f"):
+            for run in ("a", "b", "c", "d", "e", "f", "g"):
                 if run == "a":
                     # Stereo 24-bit, 440 Hz, 3 seconds, to everyone.
                     mark = receiver.send("run audio-net recv")
@@ -259,6 +259,28 @@ def main():
                     packets = int(report.split("Received ")[-1].split(" ")[0])
                     check(packets >= 140, f"it received {packets} Opus packets from the multicast group", report)
                     continue
+                elif run == "g":
+                    # AVTP (IEEE 1722 AAF): stereo 24-bit 600 Hz to the default stream address.
+                    mark = receiver.send("run audio-net recv proto=avtp")
+                    receiver.wait_for("Listening on NIC 1 for AVTP", 30, mark)
+                    receiver.pump(3.0)
+                    captured = []
+                    thread = threading.Thread(target=sniff, args=(4.0, captured))
+                    thread.start()
+                    mark = sender.send("run audio-net send proto=avtp src=tone=600 secs=3")
+                    sender.wait_for("Sent ", 60, mark)
+                    thread.join()
+                    frames = [f for _, f in captured if f[12:14] == b"\x22\xf0"]
+                    check(len(frames) >= 2800, f"the sniffer saw {len(frames)} AVTP frames", "")
+                    first = frames[0]
+                    check(first[0:6] == bytes.fromhex("91e0f000fe01"), "sent to the stream address 91:e0:f0:00:fe:01", first[:6].hex())
+                    h = first[14:]
+                    check(h[0] == 0x02 and h[1] >> 7 == 1 and (h[1] >> 4) & 7 == 0, "AAF subtype, sv set, version 0", h[:2].hex())
+                    check(h[16] == 3 and h[19] == 24 and h[17] >> 4 == 5 and ((h[17] & 3) << 8 | h[18]) == 2, "format INT24, 24 bits, 48 kHz (nsr 5), 2 channels", h[16:20].hex())
+                    check(int.from_bytes(h[20:22], "big") == 288 and len(h) - 24 >= 288, "stream_data_length 288 bytes (48 frames of stereo L24)", "")
+                    check(h[4:10] == first[6:12], "stream id starts with the sender's MAC", h[4:12].hex())
+                    steps = {(b[14 + 2] - a[14 + 2]) & 0xFF for a, b in zip(frames, frames[1:])}
+                    check(steps == {1}, "the 8-bit sequence number steps by 1 (wrapping)", str(steps))
                 else:
                     # Mono 16-bit, 880 Hz, to the receiver's MAC, after the receiver has been restarted.
                     mark = receiver.send("run audio-net recv from=52:54:00:12:34:b1 target=8")
@@ -276,7 +298,9 @@ def main():
                 receiver.wait_for("fos> ", 30, mark)
                 report = receiver.text()[mark - 200:]
                 locked = report.split("Locked onto a stream:")[-1].split("\n")[0]
-                if run == "d":
+                if run == "g":
+                    check("2 channel(s), 24-bit, 48000 Hz" in locked, "the receiver locks onto the AVTP stream", locked)
+                elif run == "d":
                     check("Opus packets" in report, "the receiver decodes the Opus stream", report)
                 elif run == "c":
                     check("2 channel(s), 24-bit, 48000 Hz, from 192.168.50.1" in locked, "the receiver locks onto the RTP stream from the sender's IP address", locked)
@@ -312,8 +336,8 @@ def main():
                 begin = after
         segments.append((begin, loud[-1]))
         segments = [seg for seg in segments if seg[1] - seg[0] > rate]
-        wanted = [("raw, stereo 24-bit", 440, 20), ("raw, mono 16-bit, converted", 880, 30), ("RTP/UDP, stereo 24-bit", 660, 25), ("Opus/RTP", 770, 30), ("Opus/RTP multicast", 550, 30)]
-        check(len(segments) == 5, f"the recording holds {len(segments)} separate tones (wanted 5)", str(segments))
+        wanted = [("raw, stereo 24-bit", 440, 20), ("raw, mono 16-bit, converted", 880, 30), ("RTP/UDP, stereo 24-bit", 660, 25), ("Opus/RTP", 770, 30), ("Opus/RTP multicast", 550, 30), ("AVTP", 600, 30)]
+        check(len(segments) == 6, f"the recording holds {len(segments)} separate tones (wanted 6)", str(segments))
         for (name, frequency, tolerance), (start, end) in zip(wanted, segments):
             middle = (start + end) // 2
             measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])

@@ -35,6 +35,11 @@
 //! synchronised: the receiver follows the sender (an AES67 device that insists on a PTP reference will not
 //! accept the stream, but the packet format is exactly AES67's).
 //!
+//! **AVTP.** `proto=avtp` sends and receives IEEE 1722 AAF (the audio format of AVB, layer 2, ethertype 0x22f0):
+//! 16- or 24-bit PCM at the standard rates, `to=` a MAC (default 91:e0:f0:00:fe:01), no addresses needed. fos has no
+//! gPTP clock, so the presentation time is marked invalid and a listener plays on arrival; it does not implement
+//! AVB's stream reservation (MSRP) or time synchronisation, so this talks to AVTP listeners that do not insist on them.
+//!
 //! **Multicast.** `send to=239.1.2.3` goes to a multicast group (MAC 01:00:5e:..., no ARP). A receiver gets it with
 //! `recv group=239.1.2.3`: the tape joins the group with an IGMP report (so a snooping switch forwards it to this
 //! port), answers the querier's queries, and sends a leave when it stops; the NIC is told to accept all multicast
@@ -60,7 +65,12 @@ const RING_BYTES: usize = 1 << 20;
 pub enum Proto {
     Raw,
     Rtp,
+    /// IEEE 1722 AAF, the AVB layer-2 audio transport.
+    Avtp,
 }
+
+/// The default destination of an AVTP stream: an address in the 91:e0:f0:00:fe:xx block IEEE 1722 reserves for streams.
+const AVTP_DEFAULT_MAC: [u8; 6] = [0x91, 0xe0, 0xf0, 0x00, 0xfe, 0x01];
 
 #[derive(Clone)]
 pub struct Options<'a> {
@@ -116,7 +126,7 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
-            "proto" => options.proto = match value { "raw" => Proto::Raw, "rtp" => Proto::Rtp, _ => return Err("proto= is raw or rtp") },
+            "proto" => options.proto = match value { "raw" => Proto::Raw, "rtp" => Proto::Rtp, "avtp" => Proto::Avtp, _ => return Err("proto= is raw, rtp or avtp") },
             "nic" => options.nic = value.parse::<usize>().ok().filter(|&n| n >= 1).ok_or("nic=N needs a number from 1")? - 1,
             "to" => options.to = value,
             "from" => options.from = Some(parse_mac(value).ok_or("from= takes a MAC address like 00:11:22:33:44:55")?),
@@ -167,6 +177,8 @@ pub struct Transport {
     port: u16,
     payload_type: u8,
     igmp: Option<igmp::Igmp>,
+    /// AVTP's 8-bit sequence number and its widened value, for the receiver.
+    avtp_sequence: Option<(u8, u16)>,
 }
 
 impl Transport {
@@ -198,11 +210,15 @@ impl Transport {
             let ip = config.ip.0;
             println!("Network: {}.{}.{}.{} on NIC {}.", ip[0], ip[1], ip[2], ip[3], options.nic + 1);
         }
-        Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None })
+        Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None })
     }
 
     /// `group=`: joins the multicast group on the receive NIC. False (after a message) if it cannot.
     pub fn join_group(&mut self, api: &TapeApi, options: &Options) -> bool {
+        if options.proto == Proto::Avtp {
+            (api.nic_set_multicast)(options.nic, 1); // AVTP streams go to multicast MAC addresses
+            return true;
+        }
         if options.group.is_empty() {
             return true;
         }
@@ -230,6 +246,9 @@ impl Transport {
     }
 
     pub fn leave_group(&mut self, api: &TapeApi, nic: usize) {
+        if self.proto == Proto::Avtp {
+            (api.nic_set_multicast)(nic, 0);
+        }
         if let Some(mut igmp) = self.igmp.take() {
             println!("Left the multicast group ({} queries answered, {} reports sent).", igmp.queries, igmp.reports);
             igmp.leave(api, nic, &self.config);
@@ -258,7 +277,11 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     }
     let bits = options.bits;
     let Some(mut transport) = Transport::open(api, options) else { return };
-    let max_payload = if options.proto == Proto::Rtp { MAX_RTP_PAYLOAD } else { MAX_RAW_PAYLOAD };
+    let max_payload = match options.proto {
+        Proto::Rtp => MAX_RTP_PAYLOAD,
+        Proto::Raw => MAX_RAW_PAYLOAD,
+        Proto::Avtp => 1500 - audio_wire::avtp::HEADER_LEN,
+    };
     let per_packet = frames_per_packet(options.rate, channels, bits, max_payload);
     let frame_bytes = channels * bits / 8;
     let packet_us = u64::from(per_packet as u32) * 1_000_000 / u64::from(options.rate);
@@ -266,6 +289,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let paced_us_x1000 = (packet_us as i64 * 1000 * (1_000_000 - options.skew_ppm) / 1_000_000) as u64;
     let destination = match options.proto {
         Proto::Raw => Destination::Raw(if options.to.is_empty() { BROADCAST } else { match parse_mac(options.to) { Some(mac) => mac, None => return println!("audio-net send: to= takes a MAC address for proto=raw.") } }),
+        Proto::Avtp => Destination::Raw(if options.to.is_empty() { AVTP_DEFAULT_MAC } else { match parse_mac(options.to) { Some(mac) => mac, None => return println!("audio-net send: to= takes a MAC address for proto=avtp.") } }),
         Proto::Rtp => {
             let (host, _) = options.to.split_once(':').unwrap_or((options.to, ""));
             let Some(ip) = net::parse_ip(host) else { return println!("audio-net send: proto=rtp needs to=IP (a unicast address or a multicast group).") };
@@ -285,7 +309,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         "Sending {channels} channel(s), {bits}-bit, {} Hz, {per_packet} frames ({packet_us} us) per packet, from {} over {}.",
         options.rate,
         if tone.is_some() { "a test tone" } else { "the capture device" },
-        if options.proto == Proto::Rtp { "RTP/UDP" } else { "raw Ethernet" }
+        proto_name(options.proto)
     );
     let stream = (tape_rt::micros() as u32) ^ 0x5a5a_a5a5;
     if let Destination::Rtp { ip, .. } = destination {
@@ -346,6 +370,23 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         }
         let length = per_packet * frame_bytes;
         let total = match destination {
+            Destination::Raw(mac) if options.proto == Proto::Avtp => {
+                frame[0..6].copy_from_slice(&mac);
+                frame[6..12].copy_from_slice(&transport.mac);
+                frame[12..14].copy_from_slice(&audio_wire::avtp::ETHERTYPE.to_be_bytes());
+                // Stream id: our MAC and a unique id. The presentation time needs a gPTP clock, which fos does not
+                // have, so it is marked not valid (tv = 0): a listener plays on arrival, as `recv` does.
+                let mut stream_id = [0u8; 8];
+                stream_id[..6].copy_from_slice(&transport.mac);
+                stream_id[6..].copy_from_slice(&1u16.to_be_bytes());
+                let header = audio_wire::avtp::Header { sequence: sequence as u8, timestamp_valid: false, stream_id, timestamp: 0, channels: channels as u16, bits: bits as u8, rate: options.rate, data_length: length as u16 };
+                if !header.encode(&mut frame[ETHERNET_HEADER..]) {
+                    return println!("audio-net send: AVTP has no code for {} Hz.", options.rate);
+                }
+                let start = ETHERNET_HEADER + audio_wire::avtp::HEADER_LEN;
+                frame[start..start + length].copy_from_slice(&payload[..length]);
+                Some(start + length)
+            }
             Destination::Raw(mac) => {
                 frame[0..6].copy_from_slice(&mac);
                 frame[6..12].copy_from_slice(&transport.mac);
@@ -390,9 +431,52 @@ struct Packet {
     payload: core::ops::Range<usize>,
 }
 
+fn proto_name(proto: Proto) -> &'static str {
+    match proto {
+        Proto::Raw => "raw Ethernet",
+        Proto::Rtp => "RTP/UDP",
+        Proto::Avtp => "AVTP (IEEE 1722 AAF)",
+    }
+}
+
 /// Classifies one frame for the active protocol. For RTP this also answers ARP.
 fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: &[u8]) -> Option<Packet> {
     match transport.proto {
+        Proto::Avtp => {
+            if frame.len() < ETHERNET_HEADER + audio_wire::avtp::HEADER_LEN || frame[12..14] != audio_wire::avtp::ETHERTYPE.to_be_bytes() {
+                return None;
+            }
+            let header = audio_wire::avtp::Header::parse(&frame[ETHERNET_HEADER..])?;
+            let sender: [u8; 6] = frame[6..12].try_into().ok()?;
+            if options.from.is_some_and(|wanted| wanted != sender) {
+                return None;
+            }
+            // The sequence number is 8 bits on the wire; widen it so the receiver's gap logic (16 bits) sees no
+            // false jump at the wrap.
+            let widened = match transport.avtp_sequence {
+                None => u16::from(header.sequence),
+                Some((last, wide)) => {
+                    let step = header.sequence.wrapping_sub(last);
+                    if step < 128 { wide.wrapping_add(u16::from(step)) } else { wide.wrapping_sub(256 - u16::from(step)) }
+                }
+            };
+            transport.avtp_sequence = Some((header.sequence, widened));
+            let mut source = [0u8; 8];
+            source[..6].copy_from_slice(&sender);
+            let frame_bytes = usize::from(header.channels) * usize::from(header.bits) / 8;
+            let start = ETHERNET_HEADER + audio_wire::avtp::HEADER_LEN;
+            let id = header.stream_id;
+            Some(Packet {
+                stream: u32::from_be_bytes([id[4], id[5], id[6], id[7]]),
+                source,
+                sequence: widened,
+                channels: usize::from(header.channels),
+                bits: usize::from(header.bits),
+                rate: header.rate,
+                frames: usize::from(header.data_length) / frame_bytes,
+                payload: start..start + usize::from(header.data_length),
+            })
+        }
         Proto::Raw => {
             if frame.len() < ETHERNET_HEADER + HEADER_LEN || frame[12..14] != ETHERTYPE.to_be_bytes() {
                 return None;
@@ -460,7 +544,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     if status != 0 {
         return println!("audio-net recv: cannot start playback at {running_rate} Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
     }
-    println!("Listening on NIC {} for {} audio; playing on {device_channels} output channel(s) of {}-bit. Escape stops.", options.nic + 1, if options.proto == Proto::Rtp { "RTP/UDP" } else { "raw Ethernet" }, info.playback_bits);
+    println!("Listening on NIC {} for {} audio; playing on {device_channels} output channel(s) of {}-bit. Escape stops.", options.nic + 1, proto_name(options.proto), info.playback_bits);
     let mut frame = [0u8; 1514];
     let mut staging = [0u8; 8192];
     let mut locked: Option<(u32, [u8; 8])> = None;
