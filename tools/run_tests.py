@@ -96,6 +96,7 @@ E2E_MAKE = [
     "make test-v2-hub",
     "make test-v2-disks",
     "make test-v2-stick-guids",
+    "make test-v2-format",
     "make test-v2-config",
     "make test-v2-tapes",
     "make test-v2-nettest",

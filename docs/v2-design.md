@@ -225,6 +225,13 @@ firmware, so a pending slot is tried on the next boot.
   sets one, `label diskN|@LABEL -` clears it, a label may be on one volume only, and `ls`, `cat`,
   `write` and `rm` take `diskN` or `@LABEL` as their first word to pick a volume. `build_image.py
   --label NAME` sets one at build time.
+* **`format diskN [NAME] [force]`** creates a FOSFS volume. It announces what it would erase and
+  does nothing until the very next command is `format diskN confirm`. Never the boot disk. A disk
+  that already has a FOSFS partition gets just that volume cleared (other partitions untouched); a
+  blank disk gets a fresh GPT (random GUIDs, both copies, CRCs) with one FOSFS partition covering
+  it; any other disk (an MBR, a file system, a GPT with only foreign partitions) needs `force`
+  because its partition table is replaced. The data area is not wiped, only the superblock and
+  directory. Test: `make test-v2-format`.
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

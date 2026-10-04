@@ -68,6 +68,7 @@ pub enum Error {
     DirectoryFull,
     DataFull,
     TooBig,
+    TooSmall,
 }
 
 impl From<block::Error> for Error {
@@ -103,6 +104,32 @@ impl Volume {
             && get_u64(&sector, 20) == DATA_START
             && get_u64(&sector, 28) == sectors.saturating_sub(DATA_START);
         if valid { Ok(volume) } else { Err(Error::NotFormatted) }
+    }
+
+    /// Writes an empty FOSFS v3 volume over the `sectors` sectors at `base` of `disk`: the
+    /// superblock (magic, version, geometry, optional label) and eight zeroed directory
+    /// sectors. The data area is not touched (it is unreachable until a file is written).
+    /// Destroys whatever volume was there; callers confirm first.
+    pub fn format(disk: usize, base: u64, sectors: u64, label: &[u8]) -> Result<Volume, Error> {
+        if sectors < DATA_START + 8 {
+            return Err(Error::TooSmall);
+        }
+        if !label.is_empty() && !valid_name(label) {
+            return Err(Error::InvalidName);
+        }
+        let mut sector = [0u8; 512];
+        sector[..8].copy_from_slice(MAGIC);
+        sector[8..10].copy_from_slice(&VERSION.to_le_bytes());
+        sector[10..12].copy_from_slice(&(ENTRY_SIZE as u16).to_le_bytes());
+        sector[12..16].copy_from_slice(&1u32.to_le_bytes());
+        sector[16..20].copy_from_slice(&(DIRECTORY_SECTORS as u32).to_le_bytes());
+        sector[20..28].copy_from_slice(&DATA_START.to_le_bytes());
+        sector[28..36].copy_from_slice(&(sectors - DATA_START).to_le_bytes());
+        sector[LABEL_OFFSET..LABEL_OFFSET + label.len()].copy_from_slice(label);
+        // Directory first, superblock last: a half-finished format is not a valid volume.
+        block::write(disk, base + 1, &[0u8; DIRECTORY_SECTORS as usize * 512])?;
+        block::write(disk, base, &sector)?;
+        Volume::mount(disk, base, sectors)
     }
 
     /// The volume's label (empty if it has none).
