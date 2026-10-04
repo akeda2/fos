@@ -6,8 +6,12 @@
 //! panel can write the `start` file that launches it at boot.
 
 use crate::abort;
+use crate::igmp::Igmp;
+use crate::net::{self, DhcpStep, DhcpTask};
 use crate::stats;
-use crate::{MacText, Options, parse, peers, run_once};
+use audio_wire::sap;
+use tape_net::MacAddress;
+use crate::{MacText, Options, Transport, parse, peers, run_once};
 use audio_wire::{ChannelSet, Cursor};
 use core::fmt::Write;
 use tape_rt::{AudioInfo, Key, KeyDecoder, TapeApi};
@@ -360,7 +364,7 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
         R_GATEWAY => dash(settings.gateway.as_str(), out),
         R_NAME => {
             if settings.name.is_empty() {
-                let _ = write!(out, "(automatic: fos- and the MAC)");
+                let _ = write!(out, "{}  (automatic: fos- and the end of the MAC; type a name to change it)", effective_name(settings).as_str());
             } else {
                 let _ = write!(out, "{}", settings.name.as_str());
             }
@@ -398,7 +402,7 @@ fn read_audio_info() -> AudioInfo {
 fn draw_form(settings: &Settings, selected: usize, editing: bool, info: &AudioInfo, message: &str) {
     draw!("\x1b[2J");
     at(1, 1);
-    draw!(" fos audio-net: settings\x1b[K");
+    draw!(" fos audio-net: settings        this machine is called {}\x1b[K", effective_name(settings).as_str());
     at(2, 1);
     if info.capture_channels == 0 && info.playback_channels == 0 {
         draw!(" Device: no USB audio device found (send can use a test tone)\x1b[K");
@@ -691,73 +695,289 @@ fn run_stream(settings: &Settings) {
     tape_rt::set_quiet(false);
 }
 
-/// P: listens for announcements and lets the user pick a peer by number.
-fn pick_peer(settings: &mut Settings) -> &'static str {
-    let mut forced = *settings;
-    forced.network = 0;
-    let Ok((_, options)) = build(&forced) else { return "Fill in a valid IP address first (the announcements travel over IP)." };
-    if !settings.rtp() {
-        return "Announcements travel over IP: set the network to RTP first.";
+/// The name this machine announces under: the configured one or `fos-` and the end of the MAC.
+fn effective_name(settings: &Settings) -> Text<24> {
+    let mut mac = [0u8; 6];
+    (tape_rt::api().nic_mac)(settings.nic.saturating_sub(1), mac.as_mut_ptr());
+    let mut buffer = [0u8; sap::MAX_NAME];
+    Text::from(peers::session_name(settings.name.as_str(), mac, &mut buffer))
+}
+
+/// How long the panel waits after the last change before it (re)starts announcing: typing must not thrash it.
+const PRESENCE_DELAY: u64 = 1_200_000;
+/// An announcement not heard for this long means the machine went away (they repeat every 5 s).
+const PRESENCE_EXPIRY: u64 = 20_000_000;
+
+enum Link {
+    Off,
+    Dhcp(DhcpTask),
+    Up,
+    Failed(&'static str, u64),
+}
+
+/// The panel's presence on the network while it sits on the form: it announces this machine (name, address, what it
+/// would listen for) and listens to everybody else's announcements, so the user can pick a peer by name before any
+/// stream exists. It needs an IP address, so it runs only for the RTP network; it never blocks (DHCP is stepped).
+struct Presence {
+    link: Link,
+    transport: Option<Transport>,
+    igmp: Igmp,
+    directory: peers::Directory,
+    /// Not before this time (micros): the settings were just changed.
+    start_at: u64,
+    status: Text<100>,
+    shown: Text<100>,
+}
+
+impl Presence {
+    fn new() -> Presence {
+        Presence { link: Link::Off, transport: None, igmp: Igmp::new(sap::GROUP), directory: peers::Directory::new(), start_at: tape_rt::micros() + PRESENCE_DELAY, status: Text::new(), shown: Text::new() }
     }
-    at(5 + ROWS + 2, 1);
-    draw!(" Listening for announcements for 8 s (Esc stops)...\x1b[K");
-    tape_rt::set_quiet(true);
-    let real = tape_rt::api();
-    let Some(mut transport) = crate::Transport::open(real, &options) else {
-        tape_rt::set_quiet(false);
-        return if settings.dhcp { "No DHCP answer within 8 s: check the cable and the network, or set Addressing to Static." } else { "Could not set up the network: check the IP address." };
-    };
-    let mut short = options.clone();
-    short.seconds = 8;
-    let directory = peers::listen(real, &short, &mut transport, 8, |_| false);
-    tape_rt::set_quiet(false);
-    // Senders are what a receiver wants, listeners what a sender wants; a duplex machine takes either.
-    let wanted = |entry: &peers::Entry| match settings.mode {
-        0 => entry.session.receive_only,
-        1 => !entry.session.receive_only,
-        _ => true,
-    };
-    let mut names: [Text<24>; 9] = [Text::new(); 9];
-    let mut count = 0;
-    at(1, 1);
-    draw!("\x1b[2J");
-    at(1, 1);
-    draw!(" fos audio-net: announced peers\x1b[K");
-    let ip = transport.config.ip.0;
-    at(2, 1);
-    draw!(" Listened for 8 s on NIC {} as {}.{}.{}.{}\x1b[K", options.nic + 1, ip[0], ip[1], ip[2], ip[3]);
-    for entry in directory.iter().filter(|entry| wanted(entry)) {
-        if count < 9 {
-            names[count] = Text::from(entry.session.name());
-            let (ip, s) = (entry.from_ip, &entry.session);
-            at(4 + count, 1);
-            draw!(" {}  {:<24} {:<8} {}.{}.{}.{} {}  {} ch\x1b[K", count + 1, s.name(), if s.receive_only { "listens" } else { "sends" }, ip[0], ip[1], ip[2], ip[3], MacText(entry.from_mac), s.channels);
-            count += 1;
+
+    /// Withdraws the announcement and goes back to Off (the settings changed, or a stream is about to start).
+    fn stop(&mut self, forget_address: bool) {
+        let api = tape_rt::api();
+        if let Some(mut transport) = self.transport.take() {
+            transport.announce_stop(api, transport_nic(&transport));
+            self.igmp.leave(api, NIC_IN_USE.get(), &transport.config);
         }
+        if forget_address {
+            crate::forget_config();
+        }
+        self.link = Link::Off;
+        self.directory = peers::Directory::new();
+        self.start_at = tape_rt::micros() + PRESENCE_DELAY;
     }
-    if count == 0 {
-        at(4, 1);
-        draw!(" Nothing was announced by {}.", if settings.mode == 0 { "a listener" } else if settings.mode == 1 { "a sender" } else { "any peer" });
-        at(5, 1);
-        draw!(" A machine announces itself only while it is running audio-net over RTP, so start the other end first");
-        at(6, 1);
-        draw!(" (a sender to find a sender, a receiver to find a listener), on the same switch or network.");
+
+    fn machines(&self) -> usize {
+        let mut names: [Text<24>; 24] = [Text::new(); 24];
+        let mut count = 0;
+        for entry in self.directory.iter() {
+            let name = Text::<24>::from(entry.session.name());
+            if !names[..count].contains(&name) && count < 24 {
+                names[count] = name;
+                count += 1;
+            }
+        }
+        count
     }
-    at(14, 1);
-    draw!(" Press a number to choose, any other key to go back.");
-    let mut decoder = KeyDecoder::new();
-    loop {
-        if let Some(key) = next_key(&mut decoder) {
-            if let Key::Char(digit @ b'1'..=b'9') = key {
-                let index = usize::from(digit - b'1');
-                if index < count {
-                    settings.peer = names[index];
-                    return "Peer chosen.";
+
+    /// One non-blocking pass: advance DHCP, announce when due, read what is waiting. Call it whenever idle.
+    fn tick(&mut self, settings: &Settings) {
+        let api = tape_rt::api();
+        let now = tape_rt::micros();
+        if !settings.rtp() {
+            self.status = Text::from("Finding peers needs the RTP network (the announcements travel over IP).");
+            return;
+        }
+        match &mut self.link {
+            Link::Off => {
+                if now < self.start_at {
+                    self.status = Text::from("Starting to look for other machines...");
+                    return;
+                }
+                let mut forced = *settings;
+                forced.network = 0;
+                let Ok((_, options)) = build(&forced) else {
+                    self.status = Text::from("Fix the settings above to find peers.");
+                    return;
+                };
+                NIC_IN_USE.set(options.nic);
+                let mut mac = [0u8; 6];
+                (api.nic_mac)(options.nic, mac.as_mut_ptr());
+                if settings.dhcp {
+                    self.link = Link::Dhcp(DhcpTask::new(api, options.nic, MacAddress(mac)));
+                } else {
+                    match net::static_config(MacAddress(mac), settings.ip.as_str(), settings.gateway.as_str()) {
+                        Ok(config) => self.bring_up(settings, &options, mac, config),
+                        Err(reason) => self.link = Link::Failed(reason, now + 5_000_000),
+                    }
                 }
             }
-            return "";
+            Link::Dhcp(task) => match task.step(api) {
+                DhcpStep::Waiting => self.status = Text::from("Getting an address from the DHCP server..."),
+                DhcpStep::Failed => self.link = Link::Failed("No DHCP answer: check the cable and the network, or set Addressing to Static.", now + 10_000_000),
+                DhcpStep::Bound(config) => {
+                    let mut forced = *settings;
+                    forced.network = 0;
+                    if let Ok((_, options)) = build(&forced) {
+                        let mac = config.mac.0;
+                        self.bring_up(settings, &options, mac, config);
+                    } else {
+                        self.link = Link::Off;
+                    }
+                }
+            },
+            Link::Failed(reason, retry) => {
+                self.status = Text::from(reason);
+                if now >= *retry {
+                    self.link = Link::Off;
+                    self.start_at = now;
+                }
+            }
+            Link::Up => self.poll(settings),
         }
-        tape_rt::idle();
+    }
+
+    fn bring_up(&mut self, settings: &Settings, options: &Options<'static>, mac: [u8; 6], config: net::NetConfig) {
+        let api = tape_rt::api();
+        let mut transport = Transport::from_config(options, mac, config);
+        let mut buffer = [0u8; sap::MAX_NAME];
+        let name = peers::session_name(settings.name.as_str(), mac, &mut buffer);
+        let mut text = [0u8; 900];
+        let length = peers::receiver_sdp(options, &config, name, true, &mut text);
+        transport.announcer.start(&text[..length]);
+        self.igmp = Igmp::new(sap::GROUP);
+        self.igmp.join(api, options.nic, &config);
+        self.transport = Some(transport);
+        self.link = Link::Up;
+    }
+
+    fn poll(&mut self, settings: &Settings) {
+        let api = tape_rt::api();
+        let nic = NIC_IN_USE.get();
+        let Some(transport) = self.transport.as_mut() else { return };
+        let now = tape_rt::micros();
+        transport.announce_service(api, nic);
+        self.igmp.poll(api, nic, &transport.config, now);
+        let mut frame = [0u8; 1514];
+        for _ in 0..8 {
+            let length = (api.nic_receive)(nic, frame.as_mut_ptr(), frame.len());
+            if length == 0 {
+                break;
+            }
+            if self.igmp.handle(&frame[..length], now) {
+                continue;
+            }
+            let ticks = (api.ticks)() as u32;
+            if let crate::net::Inbound::Udp { source, payload, .. } = net::inbound(api, nic, &transport.config, &mut transport.arp, &frame[..length], sap::PORT..=sap::PORT, ticks) {
+                if source != transport.config.ip {
+                    if let Some(packet) = sap::parse(payload) {
+                        self.directory.update(&packet, frame[6..12].try_into().unwrap_or([0; 6]));
+                    }
+                }
+            }
+        }
+        self.directory.expire(PRESENCE_EXPIRY);
+        let ip = transport.config.ip.0;
+        let mut status = Text::<100>::new();
+        let others = self.machines();
+        let _ = write!(status, "Announcing as {}  ({}.{}.{}.{})   {} other machine{} seen", effective_name(settings).as_str(), ip[0], ip[1], ip[2], ip[3], others, if others == 1 { "" } else { "s" });
+        self.status = status;
+    }
+}
+
+/// The NIC the presence runs on (a global because `Transport` does not carry it).
+struct NicCell(core::cell::Cell<usize>);
+unsafe impl Sync for NicCell {}
+impl NicCell {
+    fn get(&self) -> usize {
+        self.0.get()
+    }
+    fn set(&self, nic: usize) {
+        self.0.set(nic)
+    }
+}
+static NIC_IN_USE: NicCell = NicCell(core::cell::Cell::new(0));
+
+fn transport_nic(_transport: &Transport) -> usize {
+    NIC_IN_USE.get()
+}
+
+fn draw_presence_status(presence: &mut Presence) {
+    if presence.status != presence.shown {
+        at(5 + ROWS + 3, 1);
+        draw!(" {}\x1b[K", presence.status.as_str());
+        presence.shown = presence.status;
+    }
+}
+
+/// One machine in the picker: everything announced under one name and address.
+#[derive(Clone, Copy)]
+struct Machine {
+    name: Text<24>,
+    ip: [u8; 4],
+    mac: [u8; 6],
+    sends: bool,
+    listens: bool,
+    idle: bool,
+    channels: usize,
+}
+
+fn machines(presence: &Presence) -> ([Machine; 9], usize) {
+    let blank = Machine { name: Text::new(), ip: [0; 4], mac: [0; 6], sends: false, listens: false, idle: false, channels: 0 };
+    let mut rows = [blank; 9];
+    let mut count = 0;
+    for entry in presence.directory.iter() {
+        let name = Text::<24>::from(entry.session.name());
+        let at = rows[..count].iter().position(|row| row.name == name && row.ip == entry.from_ip).or_else(|| {
+            if count < 9 {
+                rows[count] = Machine { name, ip: entry.from_ip, mac: entry.from_mac, ..blank };
+                count += 1;
+                Some(count - 1)
+            } else {
+                None
+            }
+        });
+        if let Some(at) = at {
+            let row = &mut rows[at];
+            if entry.session.receive_only {
+                row.listens = true;
+                row.idle |= entry.session.idle;
+            } else {
+                row.sends = true;
+            }
+            row.channels = row.channels.max(entry.session.channels);
+        }
+    }
+    (rows, count)
+}
+
+/// P: the machines announced on the network (live, from the presence), picked by number.
+fn pick_peer(settings: &mut Settings, presence: &mut Presence) -> &'static str {
+    if !settings.rtp() {
+        return "Finding peers works over IP: set the network to RTP first.";
+    }
+    let mut decoder = KeyDecoder::new();
+    let mut shown: Option<(usize, usize)> = None;
+    draw!("\x1b[2J");
+    loop {
+        presence.tick(settings);
+        let (rows, count) = machines(presence);
+        let summary = (count, rows[..count].iter().map(|row| usize::from(row.sends) + 2 * usize::from(row.listens) + 4 * usize::from(row.idle)).sum::<usize>());
+        if shown != Some(summary) {
+            shown = Some(summary);
+            draw!("\x1b[2J");
+            at(1, 1);
+            draw!(" fos audio-net: machines on the network\x1b[K");
+            at(2, 1);
+            draw!(" This machine: {}   {}\x1b[K", effective_name(settings).as_str(), presence.status.as_str());
+            for (index, row) in rows[..count].iter().enumerate() {
+                let state = if row.sends && row.listens && !row.idle { "sending and listening" } else if row.sends { "sending" } else if row.idle { "idle" } else { "listening" };
+                at(4 + index, 1);
+                draw!(" {}  {:<24} {}.{}.{}.{} {}  {}\x1b[K", index + 1, row.name.as_str(), row.ip[0], row.ip[1], row.ip[2], row.ip[3], MacText(row.mac), state);
+            }
+            if count == 0 {
+                at(4, 1);
+                draw!(" No other machine heard yet. Other machines show up here while their panel is open or while they stream");
+                at(5, 1);
+                draw!(" over RTP, on the same switch or network. Give it a few seconds; this list updates by itself.");
+            }
+            at(15, 1);
+            draw!(" Press a number to choose a peer, any other key to go back.");
+        }
+        match next_key(&mut decoder) {
+            Some(Key::Char(digit @ b'1'..=b'9')) => {
+                let index = usize::from(digit - b'1');
+                if index < count {
+                    settings.peer = rows[index].name;
+                    return "Peer chosen.";
+                }
+                return "";
+            }
+            Some(_) => return "",
+            None => tape_rt::idle(),
+        }
     }
 }
 
@@ -786,10 +1006,13 @@ pub fn run(real: &'static TapeApi) {
     let mut message = "";
     let mut decoder = KeyDecoder::new();
     let mut info = read_audio_info();
+    let mut presence = Presence::new();
     draw_form(&settings, selected, editing, &info, message);
     let mut quit = false;
     while !quit {
         let mut dirty = Dirty { full: false, rows: 0, info: false };
+        let mut changed = false; // a setting changed (the announcement must be rebuilt)
+        let mut network_changed = false; // the address may have changed too
         let mut any = false;
         // Handle every key that is waiting before drawing once: typing quickly must not lose keys to the drawing.
         while let Some(key) = next_key(&mut decoder) {
@@ -811,6 +1034,8 @@ pub fn run(real: &'static TapeApi) {
                     editing = false;
                 }
                 dirty.row(row);
+                changed = true;
+                network_changed |= matches!(row, R_IP | R_GATEWAY);
                 continue;
             }
             if !message.is_empty() {
@@ -830,6 +1055,8 @@ pub fn run(real: &'static TapeApi) {
                     let step = if matches!(key, Key::Left | Key::Char(b'h')) { -1 } else { 1 };
                     cycle(&mut settings, selected, step);
                     dirty.row(selected);
+                    changed = true;
+                    network_changed |= matches!(selected, R_NETWORK | R_NIC | R_ADDRESSING);
                     // Another mode or network changes which rows apply.
                     dirty.full |= matches!(selected, R_MODE | R_NETWORK | R_ADDRESSING);
                 }
@@ -839,10 +1066,13 @@ pub fn run(real: &'static TapeApi) {
                     } else {
                         cycle(&mut settings, selected, 1);
                         dirty.full |= matches!(selected, R_MODE | R_NETWORK | R_ADDRESSING);
+                        changed = true;
+                        network_changed |= matches!(selected, R_NETWORK | R_NIC | R_ADDRESSING);
                     }
                     dirty.row(selected);
                 }
                 Key::Char(b's') | Key::Char(b'S') => {
+                    presence.stop(false); // the stream announces itself from here on
                     run_stream(&settings);
                     // Back from the live view: show how it ended, then wait for a key.
                     at(23, 2);
@@ -857,8 +1087,9 @@ pub fn run(real: &'static TapeApi) {
                     dirty.full = true;
                 }
                 Key::Char(b'p') | Key::Char(b'P') => {
-                    message = pick_peer(&mut settings);
+                    message = pick_peer(&mut settings, &mut presence);
                     dirty.full = true;
+                    changed = true;
                 }
                 Key::Char(b'w') | Key::Char(b'W') => {
                     message = save_settings(&settings);
@@ -892,12 +1123,18 @@ pub fn run(real: &'static TapeApi) {
         if quit {
             break;
         }
+        if changed && !editing {
+            presence.stop(network_changed);
+        }
         if !any {
+            presence.tick(&settings);
+            draw_presence_status(&mut presence);
             tape_rt::idle();
             continue;
         }
         if dirty.full {
             draw_form(&settings, selected, editing, &info, message);
+            presence.shown = Text::new(); // the full redraw wiped the status line
         } else {
             for row in 0..ROWS {
                 if dirty.rows & (1 << row) != 0 {
@@ -908,7 +1145,9 @@ pub fn run(real: &'static TapeApi) {
                 draw_info(&settings, message);
             }
         }
+        draw_presence_status(&mut presence);
     }
+    presence.stop(false);
     at(1, 1);
     draw!("\x1b[2J");
     at(1, 1);

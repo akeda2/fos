@@ -371,6 +371,8 @@ pub struct Sdp<'a> {
     pub name: &'a str,
     /// True for a receiver announcing where it listens (`a=recvonly`) rather than a sender (`a=sendonly`).
     pub receive_only: bool,
+    /// A machine that is only present (its panel is open) and not streaming: `a=x-fos-idle`.
+    pub idle: bool,
     pub origin: [u8; 4],
     pub destination: [u8; 4],
     pub port: u16,
@@ -441,6 +443,9 @@ pub fn write_sdp(sdp: &Sdp<'_>, out: &mut [u8]) -> usize {
     }
     let m = sdp.mac;
     let _ = write!(cursor, "a=ts-refclk:localmac={:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}\r\na=mediaclk:direct=0\r\na={}\r\n", m[0], m[1], m[2], m[3], m[4], m[5], if sdp.receive_only { "recvonly" } else { "sendonly" });
+    if sdp.idle {
+        let _ = write!(cursor, "a=x-fos-idle\r\n");
+    }
     cursor.length
 }
 
@@ -450,6 +455,8 @@ pub fn write_sdp(sdp: &Sdp<'_>, out: &mut [u8]) -> usize {
 pub struct SdpOpus<'a> {
     pub name: &'a str,
     pub receive_only: bool,
+    /// A machine that is only present (its panel is open) and not streaming: `a=x-fos-idle`.
+    pub idle: bool,
     pub origin: [u8; 4],
     pub destination: [u8; 4],
     pub port: u16,
@@ -470,6 +477,9 @@ pub fn write_sdp_opus(sdp: &SdpOpus<'_>, out: &mut [u8]) -> usize {
         let _ = write!(cursor, "/32");
     }
     let _ = write!(cursor, "\r\nt=0 0\r\na={}\r\n", if sdp.receive_only { "recvonly" } else { "sendonly" });
+    if sdp.idle {
+        let _ = write!(cursor, "a=x-fos-idle\r\n");
+    }
     let streams = sdp.channels.div_ceil(2);
     for stream in 0..streams {
         let stereo = !(stream == streams - 1 && sdp.channels % 2 == 1);
@@ -642,6 +652,8 @@ pub mod sap {
         /// Microseconds (PCM) or the Opus frame time.
         pub packet_us: u32,
         pub receive_only: bool,
+        /// The announcer is only present, not streaming.
+        pub idle: bool,
     }
 
     impl Session {
@@ -663,7 +675,7 @@ pub mod sap {
     /// connection address, the name, and the first `rtpmap` for the codec.
     pub fn parse_sdp(sdp: &[u8]) -> Option<Session> {
         let text = core::str::from_utf8(sdp).ok()?;
-        let mut session = Session { name: [0; MAX_NAME], name_length: 0, session: 0, origin: [0; 4], destination: [0; 4], port: 0, payload_type: 0, codec: Codec::L24, rate: 48_000, channels: 0, packet_us: 1000, receive_only: false };
+        let mut session = Session { name: [0; MAX_NAME], name_length: 0, session: 0, origin: [0; 4], destination: [0; 4], port: 0, payload_type: 0, codec: Codec::L24, rate: 48_000, channels: 0, packet_us: 1000, receive_only: false, idle: false };
         let (mut have_media, mut have_codec, mut media_lines, mut last_mono) = (false, false, 0usize, false);
         for line in text.lines() {
             let line = line.trim_end();
@@ -729,6 +741,8 @@ pub mod sap {
                             micros += u32::from(digit - b'0') * [100, 10, 1][index];
                         }
                         session.packet_us = micros;
+                    } else if value == "x-fos-idle" {
+                        session.idle = true;
                     } else if value == "recvonly" {
                         session.receive_only = true;
                     }
@@ -845,7 +859,7 @@ mod tests {
 
     #[test]
     fn sdp_for_a_stereo_stream() {
-        let sdp = Sdp { name: "studio", receive_only: false, origin: [192, 168, 1, 10], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [0x18, 0x66, 0xda, 0x25, 0x1f, 0x73], session: 7 };
+        let sdp = Sdp { name: "studio", receive_only: false, idle: false, origin: [192, 168, 1, 10], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [0x18, 0x66, 0xda, 0x25, 0x1f, 0x73], session: 7 };
         let mut out = [0u8; 512];
         let length = write_sdp(&sdp, &mut out);
         let text = core::str::from_utf8(&out[..length]).unwrap();
@@ -860,7 +874,7 @@ mod tests {
 
     #[test]
     fn sdp_packet_times_and_unicast() {
-        let mut sdp = Sdp { name: "x", receive_only: false, origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 6000, payload_type: 97, channels: 22, rate: 96_000, bits: 16, packet_us: 125, mac: [0; 6], session: 1 };
+        let mut sdp = Sdp { name: "x", receive_only: false, idle: false, origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 6000, payload_type: 97, channels: 22, rate: 96_000, bits: 16, packet_us: 125, mac: [0; 6], session: 1 };
         let mut out = [0u8; 512];
         let length = write_sdp(&sdp, &mut out);
         let text = core::str::from_utf8(&out[..length]).unwrap();
@@ -979,7 +993,7 @@ mod tests {
 
     #[test]
     fn opus_sdp_has_a_media_line_per_pair() {
-        let sdp = SdpOpus { name: "opus-test", receive_only: false, origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 5004, payload_type: 96, channels: 5, packet_ms_x10: 100, session: 3 };
+        let sdp = SdpOpus { name: "opus-test", receive_only: false, idle: false, origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 5004, payload_type: 96, channels: 5, packet_ms_x10: 100, session: 3 };
         let mut out = [0u8; 1024];
         let length = write_sdp_opus(&sdp, &mut out);
         let text = core::str::from_utf8(&out[..length]).unwrap();
@@ -1032,7 +1046,7 @@ mod tests {
 
     #[test]
     fn sap_round_trip_and_session_parse() {
-        let sdp = Sdp { name: "studio-a", receive_only: false, origin: [192, 168, 1, 20], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 4, rate: 48_000, bits: 24, packet_us: 250, mac: [0; 6], session: 77 };
+        let sdp = Sdp { name: "studio-a", receive_only: false, idle: false, origin: [192, 168, 1, 20], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 4, rate: 48_000, bits: 24, packet_us: 250, mac: [0; 6], session: 77 };
         let mut text = [0u8; 600];
         let length = write_sdp(&sdp, &mut text);
         let mut packet = [0u8; 700];
@@ -1048,7 +1062,7 @@ mod tests {
 
     #[test]
     fn opus_session_counts_streams_and_receivers_say_so() {
-        let sdp = SdpOpus { name: "hall", receive_only: true, origin: [10, 0, 0, 5], destination: [10, 0, 0, 5], port: 5004, payload_type: 96, channels: 5, packet_ms_x10: 100, session: 3 };
+        let sdp = SdpOpus { name: "hall", receive_only: true, idle: false, origin: [10, 0, 0, 5], destination: [10, 0, 0, 5], port: 5004, payload_type: 96, channels: 5, packet_ms_x10: 100, session: 3 };
         let mut text = [0u8; 900];
         let length = write_sdp_opus(&sdp, &mut text);
         let session = sap::parse_sdp(&text[..length]).unwrap();

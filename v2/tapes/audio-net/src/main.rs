@@ -193,6 +193,11 @@ impl core::fmt::Display for MacText {
 /// The address configuration a run settled on (NIC, config), so that a retry or the second task does not repeat DHCP.
 static mut CONFIG_CACHE: Option<(usize, NetConfig)> = None;
 
+/// Forgets the settled address configuration (the settings changed, so the next `open` starts afresh).
+pub fn forget_config() {
+    unsafe { CONFIG_CACHE = None };
+}
+
 /// The address the run is using (after a DHCP lease or from `ip=`), once known.
 pub fn current_ip() -> Option<[u8; 4]> {
     unsafe { (*(&raw const CONFIG_CACHE)).map(|(_, config)| config.ip.0) }
@@ -252,6 +257,13 @@ impl Transport {
         Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() })
     }
 
+    /// A transport on an address configuration that is already settled (the panel's presence announcements);
+    /// remembers it so the stream started from the panel does not repeat DHCP.
+    pub fn from_config(options: &Options, mac: [u8; 6], config: NetConfig) -> Transport {
+        unsafe { CONFIG_CACHE = Some((options.nic, config)) };
+        Transport { proto: Proto::Rtp, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() }
+    }
+
     /// `group=`: joins the multicast group on the receive NIC. False (after a message) if it cannot.
     pub fn join_group(&mut self, api: &TapeApi, options: &Options) -> bool {
         if options.proto == Proto::Avtp {
@@ -298,7 +310,7 @@ impl Transport {
         let mut buffer = [0u8; audio_wire::sap::MAX_NAME];
         let name = peers::session_name(options.name, self.mac, &mut buffer);
         let mut text = [0u8; 900];
-        let length = peers::receiver_sdp(options, &self.config, name, &mut text);
+        let length = peers::receiver_sdp(options, &self.config, name, false, &mut text);
         self.announcer.start(&text[..length]);
     }
 
@@ -386,7 +398,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         let mut text = [0u8; 600];
         let mut name_buffer = [0u8; audio_wire::sap::MAX_NAME];
         let name = peers::session_name(options.name, transport.mac, &mut name_buffer);
-        let length = write_sdp(&Sdp { name, receive_only: false, origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, rate: options.rate, bits, packet_us: packet_us as u32, mac: transport.mac, session: stream }, &mut text);
+        let length = write_sdp(&Sdp { name, receive_only: false, idle: false, origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, rate: options.rate, bits, packet_us: packet_us as u32, mac: transport.mac, session: stream }, &mut text);
         println!("SDP for the receiver (save as stream.sdp; e.g. ffplay -protocol_whitelist file,udp,rtp stream.sdp):");
         println!("{}", core::str::from_utf8(&text[..length]).unwrap_or(""));
         transport.announcer.start(&text[..length]);

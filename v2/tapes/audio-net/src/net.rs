@@ -26,6 +26,13 @@ pub fn parse_cidr(text: &str) -> Option<(Ipv4Address, Ipv4Address)> {
     Some((address, Ipv4Address(mask.to_be_bytes())))
 }
 
+/// A static configuration from `A.B.C.D/N` and an optional gateway.
+pub fn static_config(mac: MacAddress, ip: &str, gateway: &str) -> Result<NetConfig, &'static str> {
+    let (address, netmask) = parse_cidr(ip).ok_or("the IP address must be like 192.168.1.20/24")?;
+    let gateway = if gateway.is_empty() { Ipv4Address([0; 4]) } else { parse_ip(gateway).ok_or("the gateway must be an IP address")? };
+    Ok(NetConfig { mac, ip: address, netmask, gateway })
+}
+
 pub fn parse_ip(text: &str) -> Option<Ipv4Address> {
     let mut octets = [0u8; 4];
     let mut parts = text.split('.');
@@ -164,40 +171,64 @@ pub fn resolve(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpCache
 }
 
 /// DHCP (the same client `ip-chat` and `router` use): broadcasts DISCOVER, waits up to 8 s for a lease.
-pub fn dhcp(api: &TapeApi, nic: usize, mac: MacAddress) -> Option<NetConfig> {
-    let seconds = || (api.ticks)() as u32 / 100;
-    let transaction = (tape_rt::micros() as u32) ^ u32::from_be_bytes([mac.0[2], mac.0[3], mac.0[4], mac.0[5]]);
-    let mut client = DhcpClient::<128>::new(mac, transaction, 1, 5);
-    let started = seconds();
-    let mut payload = [0u8; 600];
-    let mut frame = [0u8; MAX_FRAME];
-    loop {
-        let now = seconds();
-        if now.wrapping_sub(started) > 8 || client.state() == DhcpClientState::Failed {
-            return None;
+/// A DHCP exchange that can be advanced a bit at a time (the panel keeps answering keys while it waits).
+pub struct DhcpTask {
+    client: DhcpClient<128>,
+    started: u32,
+    mac: MacAddress,
+    nic: usize,
+}
+
+pub enum DhcpStep {
+    Waiting,
+    Bound(NetConfig),
+    Failed,
+}
+
+impl DhcpTask {
+    pub fn new(api: &TapeApi, nic: usize, mac: MacAddress) -> DhcpTask {
+        let transaction = (tape_rt::micros() as u32) ^ u32::from_be_bytes([mac.0[2], mac.0[3], mac.0[4], mac.0[5]]);
+        DhcpTask { client: DhcpClient::<128>::new(mac, transaction, 1, 5), started: (api.ticks)() as u32 / 100, mac, nic }
+    }
+
+    /// Does what is due (sends a request, reads the frames waiting) without blocking.
+    pub fn step(&mut self, api: &TapeApi) -> DhcpStep {
+        let (nic, mac) = (self.nic, self.mac);
+        let now = (api.ticks)() as u32 / 100;
+        if now.wrapping_sub(self.started) > 8 || self.client.state() == DhcpClientState::Failed {
+            return DhcpStep::Failed;
         }
-        if let Ok(Some(length)) = client.poll(now, &mut payload) {
-            let transmit = client.transmit();
+        let mut payload = [0u8; 600];
+        let mut frame = [0u8; MAX_FRAME];
+        if let Ok(Some(length)) = self.client.poll(now, &mut payload) {
+            let transmit = self.client.transmit();
             let mut udp = [0u8; MAX_FRAME];
-            let udp_len = UdpDatagram::new(DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &payload[..length]).encode_with_checksum(&mut udp, transmit.source, transmit.destination, false).ok()?;
             let mut ip = [0u8; MAX_FRAME];
-            let ip_len = Ipv4Packet { header: Ipv4Header::new(transmit.source, transmit.destination, 17, udp_len), payload: &udp[..udp_len] }.encode(&mut ip).ok()?;
-            let total = EthernetFrame::new(MacAddress::BROADCAST, mac, ETHERTYPE_IPV4, &ip[..ip_len]).encode(&mut frame).ok()?;
-            send_frame(api, nic, &frame[..total]);
-        }
-        if client.state() == DhcpClientState::Bound {
-            let lease = client.lease()?;
-            if lease.subnet_mask == Ipv4Address([0; 4]) {
-                return None;
+            let sent = UdpDatagram::new(DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &payload[..length])
+                .encode_with_checksum(&mut udp, transmit.source, transmit.destination, false)
+                .ok()
+                .and_then(|udp_len| Ipv4Packet { header: Ipv4Header::new(transmit.source, transmit.destination, 17, udp_len), payload: &udp[..udp_len] }.encode(&mut ip).ok())
+                .and_then(|ip_len| EthernetFrame::new(MacAddress::BROADCAST, mac, ETHERTYPE_IPV4, &ip[..ip_len]).encode(&mut frame).ok());
+            match sent {
+                Some(total) => {
+                    send_frame(api, nic, &frame[..total]);
+                }
+                None => return DhcpStep::Failed,
             }
-            return Some(NetConfig { mac, ip: lease.address, netmask: lease.subnet_mask, gateway: lease.router });
         }
-        let length = (api.nic_receive)(nic, frame.as_mut_ptr(), frame.len());
-        if length == 0 {
-            tape_rt::idle();
-            continue;
+        if self.client.state() == DhcpClientState::Bound {
+            return match self.client.lease() {
+                Some(lease) if lease.subnet_mask != Ipv4Address([0; 4]) => DhcpStep::Bound(NetConfig { mac, ip: lease.address, netmask: lease.subnet_mask, gateway: lease.router }),
+                _ => DhcpStep::Failed,
+            };
         }
-        if let Ok(ethernet) = EthernetFrame::parse(&frame[..length]) {
+        // Read what is waiting (a few frames at most per step).
+        for _ in 0..8 {
+            let length = (api.nic_receive)(nic, frame.as_mut_ptr(), frame.len());
+            if length == 0 {
+                break;
+            }
+            let Ok(ethernet) = EthernetFrame::parse(&frame[..length]) else { continue };
             if ethernet.ethertype != ETHERTYPE_IPV4 {
                 continue;
             }
@@ -208,9 +239,21 @@ pub fn dhcp(api: &TapeApi, nic: usize, mac: MacAddress) -> Option<NetConfig> {
             let Ok(datagram) = UdpDatagram::parse(packet.payload, false, packet.header.source, packet.header.destination) else { continue };
             if datagram.source_port == DHCP_SERVER_PORT && datagram.destination_port == DHCP_CLIENT_PORT {
                 if let Ok(dhcp) = DhcpPacket::parse(datagram.payload) {
-                    let _ = client.receive(now, &dhcp);
+                    let _ = self.client.receive(now, &dhcp);
                 }
             }
+        }
+        DhcpStep::Waiting
+    }
+}
+
+pub fn dhcp(api: &TapeApi, nic: usize, mac: MacAddress) -> Option<NetConfig> {
+    let mut task = DhcpTask::new(api, nic, mac);
+    loop {
+        match task.step(api) {
+            DhcpStep::Bound(config) => return Some(config),
+            DhcpStep::Failed => return None,
+            DhcpStep::Waiting => tape_rt::idle(),
         }
     }
 }

@@ -94,13 +94,13 @@ pub fn session_name<'a>(configured: &str, mac: [u8; 6], buffer: &'a mut [u8; sap
 
 /// A receiver's announcement: where and how it listens. `destination` is the multicast group when it joined one,
 /// else its own address.
-pub fn receiver_sdp(options: &Options, config: &NetConfig, name: &str, out: &mut [u8]) -> usize {
+pub fn receiver_sdp(options: &Options, config: &NetConfig, name: &str, idle: bool, out: &mut [u8]) -> usize {
     let destination = net::parse_ip(options.group).unwrap_or(config.ip).0;
     let session = (tape_rt::micros() >> 20) as u32;
     if options.opus {
-        write_sdp_opus(&SdpOpus { name, receive_only: true, origin: config.ip.0, destination, port: options.port, payload_type: options.payload_type, channels: options.chan, packet_ms_x10: options.frame_x10, session }, out)
+        write_sdp_opus(&SdpOpus { name, receive_only: true, idle, origin: config.ip.0, destination, port: options.port, payload_type: options.payload_type, channels: options.chan, packet_ms_x10: options.frame_x10, session }, out)
     } else {
-        write_sdp(&Sdp { name, receive_only: true, origin: config.ip.0, destination, port: options.port, payload_type: options.payload_type, channels: options.chan, rate: options.rate, bits: options.bits, packet_us: 1000, mac: config.mac.0, session }, out)
+        write_sdp(&Sdp { name, receive_only: true, idle, origin: config.ip.0, destination, port: options.port, payload_type: options.payload_type, channels: options.chan, rate: options.rate, bits: options.bits, packet_us: 1000, mac: config.mac.0, session }, out)
     }
 }
 
@@ -110,6 +110,8 @@ pub struct Entry {
     /// Who sent the announcement, and from which MAC (a router's, if it came across one).
     pub from_ip: [u8; 4],
     pub from_mac: [u8; 6],
+    /// When (micros) the announcement was last heard, so a machine that went away drops out of a long-lived list.
+    pub seen: u64,
 }
 
 pub struct Directory {
@@ -121,7 +123,7 @@ impl Directory {
         Directory { entries: [None; MAX_ENTRIES] }
     }
 
-    fn update(&mut self, packet: &sap::Packet, from_mac: [u8; 6]) {
+    pub fn update(&mut self, packet: &sap::Packet, from_mac: [u8; 6]) {
         let Some(session) = sap::parse_sdp(packet.sdp) else { return };
         let same = |entry: &Entry| entry.from_ip == packet.origin && entry.session.name() == session.name() && entry.session.receive_only == session.receive_only;
         if packet.delete {
@@ -132,11 +134,21 @@ impl Directory {
             }
             return;
         }
-        let entry = Entry { session, from_ip: packet.origin, from_mac };
+        let entry = Entry { session, from_ip: packet.origin, from_mac, seen: tape_rt::micros() };
         if let Some(slot) = self.entries.iter_mut().find(|slot| slot.as_ref().is_some_and(same)) {
             *slot = Some(entry);
         } else if let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(entry);
+        }
+    }
+
+    /// Forgets announcements not heard for `micros` (they are repeated every 5 s).
+    pub fn expire(&mut self, micros: u64) {
+        let now = tape_rt::micros();
+        for slot in self.entries.iter_mut() {
+            if slot.as_ref().is_some_and(|entry| now.saturating_sub(entry.seen) > micros) {
+                *slot = None;
+            }
         }
     }
 

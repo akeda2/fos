@@ -565,8 +565,17 @@ def panel_test():
             check("> Addressing" in b.text()[-500:], "and moving up skips them the same way", b.text()[-500:])
             keys(b, "l")  # static
             keys(b, "j\r" + "\x7f" * 20 + "192.168.50.1/24\r")
-            keys(b, "jj\r192.168.50.2\r")
-            check("192.168.50.1/24" in b.text()[mark_b:] and "192.168.50.2" in b.text()[mark_b:], "the form shows the edited address and peer", b.text()[-600:])
+            check("this machine is called fos-1234b2" in b.text()[mark_b:], "the form says what this machine is called (automatic name from the MAC)", b.text()[-600:])
+            # The peer is picked by name from the machines announced on the network: A's panel is open (idle) with its address set.
+            keys(b, "p")
+            end = time.monotonic() + 25
+            while "fos-1234b1" not in b.text()[mark_b:].split("machines on the network")[-1] and time.monotonic() < end:
+                b.pump(0.5)
+            picker = b.text()[mark_b:].split("machines on the network")[-1]
+            check("fos-1234b1" in picker and "192.168.50.2" in picker and "idle" in picker, "the peer picker lists the other machine by name, with its address, while it is idle (no stream running)", picker[:600])
+            keys(b, "1")
+            check("fos-1234b1" in b.text()[-900:], "choosing it fills in the Peer row", b.text()[-900:])
+            check("192.168.50.1/24" in b.text()[mark_b:], "the form shows the edited address", b.text()[-600:])
             keys(a, "s")
             a.pump(3.0)
             keys(b, "s")
@@ -576,8 +585,8 @@ def panel_test():
             check("Sent " in text_b and "Lost 0" in text_a, "both live views show counters", text_a[-500:] + text_b[-500:])
             sent = [int(part.split(" ")[0]) for part in text_b.split("Sent ")[1:] if part.split(" ")[0].isdigit()]
             received = [int(part.split(" ")[0]) for part in text_a.split("Received ")[1:] if part.split(" ")[0].isdigit()]
-            check(sent and sent[-1] >= 3000, f"the sender's counter reached {sent[-1] if sent else 0}", text_b[-500:])
-            check(received and received[-1] >= 2000, f"the receiver's counter reached {received[-1] if received else 0}", text_a[-500:])
+            check(sent and max(sent) >= 3000, f"the sender's counter reached {max(sent) if sent else 0}", text_b[-500:])
+            check(received and max(received) >= 2000, f"the receiver's counter reached {max(received) if received else 0}", text_a[-500:])
             check("[#" in text_b and "[#" in text_a, "and both draw level meters with signal", "")
             # Escape stops the stream and returns to the panel; W saves the configuration.
             for guest in (b, a):
@@ -593,7 +602,7 @@ def panel_test():
             mark = b.send("cat audio.cfg")
             b.pump(1.5)
             config = b.text()[mark:]
-            check("mode send" in config and "ip 192.168.50.1/24" in config and "to 192.168.50.2" in config and "src tone" not in config, "the saved cfg holds the settings (and not the test tone)", config)
+            check("mode send" in config and "ip 192.168.50.1/24" in config and "to fos-1234b1" in config and "src tone" not in config, "the saved cfg holds the settings (and not the test tone)", config)
         finally:
             a.stop()
             b.stop()

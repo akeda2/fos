@@ -76,7 +76,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let mut text = [0u8; 900];
     let mut name_buffer = [0u8; audio_wire::sap::MAX_NAME];
     let name = crate::peers::session_name(options.name, transport.mac, &mut name_buffer);
-    let length = write_sdp_opus(&SdpOpus { name, receive_only: false, origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, packet_ms_x10: options.frame_x10, session }, &mut text);
+    let length = write_sdp_opus(&SdpOpus { name, receive_only: false, idle: false, origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, packet_ms_x10: options.frame_x10, session }, &mut text);
     println!("SDP for the receiver (save as stream.sdp; e.g. ffplay -protocol_whitelist file,udp,rtp stream.sdp):");
     println!("{}", core::str::from_utf8(&text[..length]).unwrap_or(""));
     transport.announcer_start(&text[..length]);

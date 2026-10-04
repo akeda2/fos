@@ -454,6 +454,15 @@ firmware, so a pending slot is tried on the next boot.
   duplex machine looks up the peer's `source=` only after its sending half is streaming (the receiving half is a task
   that retries until found), so there is no cycle, and either machine may start first. Frames from our own address are
   ignored (virtual networks echo them). Tested with two QEMU guests, the first started eight seconds before the second.
+  **Presence: peers by name before any stream:** with the panel open on the form, a machine is announced (its name,
+  address and the settings it would listen with, marked `a=x-fos-idle`) and it keeps a live directory of every other
+  announcement, so `P` shows the machines on the network at once (name, IP, MAC, and whether each is idle, sending or
+  listening) and the user picks one by number: nobody needs to know a name in advance. The panel's header and Name row
+  say what this machine is called (`fos-` and the end of its MAC unless a name is typed). Presence never blocks the
+  panel: DHCP is stepped from the idle loop (`net::DhcpTask`), it starts a second after the last change so that typing
+  does not thrash it, it is withdrawn when a stream starts (the stream announces itself, keeping the DHCP lease) and when
+  the panel closes, and entries expire if not heard for 20 s. It needs the RTP network (the announcements are IP
+  multicast). Duplex then works from the pick: both panels open, each picks the other, each presses `S`.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
