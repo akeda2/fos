@@ -275,6 +275,7 @@ pub fn adopt_sender(options: &mut Options<'static>, entry: &Entry, my_ip: [u8; 4
     options.rate = s.rate;
     options.port = s.port;
     options.payload_type = s.payload_type;
+    options.adopted_receive = true;
     if audio_wire::is_multicast_address(s.destination) {
         options.group = address_text(0, s.destination);
         Ok(())
@@ -289,6 +290,7 @@ pub fn adopt_sender(options: &mut Options<'static>, entry: &Entry, my_ip: [u8; 4
 pub fn adopt_listener(options: &mut Options<'static>, entry: &Entry) {
     let s = &entry.session;
     options.to = address_text(1, s.destination);
+    options.adopted_send = true;
     options.port = s.port;
     options.payload_type = s.payload_type;
     options.opus = s.codec == Codec::Opus;

@@ -623,6 +623,8 @@ struct Run {
     clip_at: [u64; MAX_ROWS],
     /// The longest the panel's own drawing has held up the stream loop since the run began (microseconds).
     ui_worst: u64,
+    /// When the screen was last drawn (micros): drawing is held back while the playback buffer is low.
+    last_draw: u64,
     /// The same over the last ten seconds (so a start-up stall does not hide how it behaves now).
     ui_recent: u64,
     ui_recent_since: u64,
@@ -632,7 +634,7 @@ const fn blank_run() -> Run {
     Run {
         stop: false, next_draw: 0, started: 0, rows: 0, sends: 0, labels: [0; MAX_ROWS], page: 0, nordic: true, needs_full: [true; MAX_ROWS], footer_dirty: true, cursor: 0, next_counters: 0, ip_shown: false, mac: [0; 6], nic: 0,
         counters: Text::new(), message: Text::new(), actual: Text::new(), shown_cell: [-1; MAX_ROWS], shown_hold: [-1; MAX_ROWS], shown_number: [i16::MIN; MAX_ROWS], shown_clip: [false; MAX_ROWS],
-        hold: [0; MAX_ROWS], hold_at: [0; MAX_ROWS], clip_at: [0; MAX_ROWS], ui_worst: 0, ui_recent: 0, ui_recent_since: 0,
+        hold: [0; MAX_ROWS], hold_at: [0; MAX_ROWS], clip_at: [0; MAX_ROWS], ui_worst: 0, last_draw: 0, ui_recent: 0, ui_recent_since: 0,
     }
 }
 
@@ -865,6 +867,16 @@ extern "C" fn panel_hook() -> u32 {
         return 0;
     }
     run.next_draw = now + 25_000;
+    // Drawing holds the stream loop up for a few milliseconds, which is only safe while the playback buffer has some to
+    // spare: hold it back while the buffer is low (at most two seconds, so the screen never freezes for long).
+    {
+        let shown = stats::get();
+        let level_ms = ms(shown.level_frames, shown.rate);
+        if shown.target_frames != 0 && level_ms < 8 && now < run.last_draw + 2_000_000 {
+            return 0;
+        }
+        run.last_draw = now;
+    }
     // One small piece of drawing per call, so that no call holds the stream up for long.
     if run.footer_dirty && stats::get().meters_on {
         run.footer_dirty = false;
@@ -985,6 +997,8 @@ fn run_stream(settings: &Settings) {
     // goes away. The last message line says what it is waiting for.
     loop {
         let mut run_options = options.clone();
+        // Drawing the screen stalls the stream loop briefly, so the panel plays out with a little more margin (12 ms).
+        run_options.target_ms = run_options.target_ms.max(12);
         if crate::resolve_names(shim, mode, &mut run_options) {
             run_once(shim, mode, &run_options);
         }
