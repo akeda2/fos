@@ -610,10 +610,10 @@ fn execute(command: &str) {
             crate::println!("pci       list PCI functions");
             crate::println!("nic       the network interface");
             crate::println!("disks     disks found by the drivers");
-            crate::println!("ls        list FOSFS files");
-            crate::println!("cat NAME  show a file");
-            crate::println!("write NAME TEXT   create or replace a file");
-            crate::println!("rm NAME   delete a file");
+            crate::println!("ls [diskN]        list FOSFS files");
+            crate::println!("cat [diskN] NAME  show a file");
+            crate::println!("write [diskN] NAME TEXT   create or replace a file");
+            crate::println!("rm [diskN] NAME   delete a file");
             crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
             crate::println!("run NAME [ARGS]   load a tape from FOSFS and run it");
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
@@ -716,7 +716,7 @@ fn execute(command: &str) {
                 None => crate::println!("boot disk: not identified"),
             }
         }
-        "ls" => files(|volume| {
+        "ls" => files(&mut words, |volume, _| {
             let mut any = false;
             let outcome = volume.for_each(|entry| {
                 any = true;
@@ -729,8 +729,9 @@ fn execute(command: &str) {
             }
         }),
         "cat" => {
-            let name = words.next().unwrap_or("");
-            files(|volume| match read_file(&volume, name.as_bytes()) {
+            files(&mut words, |volume, mut words| {
+                let name = words.next().unwrap_or("");
+                match read_file(&volume, name.as_bytes()) {
                 Ok(Some(length)) => {
                     let text = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(FILE_BUFFER) as *const u8, length) };
                     crate::print(format_args!("{}", String8(text)));
@@ -740,22 +741,28 @@ fn execute(command: &str) {
                 }
                 Ok(None) => crate::println!("cat: no such file."),
                 Err(error) => crate::println!("cat: {error:?}"),
+                }
             });
         }
         "write" => {
-            let name = words.next().unwrap_or("");
-            let text = command[command.find(name).map_or(0, |at| at + name.len())..].trim_start();
-            files(|volume| match volume.write(name.as_bytes(), text.as_bytes()) {
-                Ok(()) => crate::println!("Wrote {} bytes to {name}.", text.len()),
-                Err(error) => crate::println!("write: {error:?}"),
+            files(&mut words, |volume, mut words| {
+                let name = words.next().unwrap_or("");
+                // The text is everything after the name in the original line.
+                let text = command[command.find(name).map_or(0, |at| at + name.len())..].trim_start();
+                match volume.write(name.as_bytes(), text.as_bytes()) {
+                    Ok(()) => crate::println!("Wrote {} bytes to {name}.", text.len()),
+                    Err(error) => crate::println!("write: {error:?}"),
+                }
             });
         }
         "rm" => {
-            let name = words.next().unwrap_or("");
-            files(|volume| match volume.remove(name.as_bytes()) {
-                Ok(true) => crate::println!("Removed {name}."),
-                Ok(false) => crate::println!("rm: no such file."),
-                Err(error) => crate::println!("rm: {error:?}"),
+            files(&mut words, |volume, mut words| {
+                let name = words.next().unwrap_or("");
+                match volume.remove(name.as_bytes()) {
+                    Ok(true) => crate::println!("Removed {name}."),
+                    Ok(false) => crate::println!("rm: no such file."),
+                    Err(error) => crate::println!("rm: {error:?}"),
+                }
             });
         }
         "usb" => {
@@ -808,11 +815,31 @@ fn execute(command: &str) {
     }
 }
 
-/// Runs `action` on the boot volume, or says there is none.
-fn files(action: impl FnOnce(crate::fosfs::Volume)) {
-    match crate::storage::boot_volume() {
-        Some(volume) => action(volume),
-        None => crate::println!("No FOSFS volume is mounted (see `disks`)."),
+/// Runs `action` on the volume the command names -- an optional leading `diskN` word picks
+/// that disk's FOSFS data partition (mounted on the spot) -- or on the boot volume. The
+/// action gets the rest of the command's words.
+fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(crate::fosfs::Volume, core::str::SplitWhitespace<'a>)) {
+    let mut rest = words.clone();
+    let disk = rest.next().and_then(|word| word.strip_prefix("disk")).and_then(|number| number.parse::<usize>().ok());
+    let Some(number) = disk else {
+        match crate::storage::boot_volume() {
+            Some(volume) => action(volume, words.clone()),
+            None => crate::println!("No FOSFS volume is mounted (see `disks`)."),
+        }
+        return;
+    };
+    if number == 0 || number > crate::block::count() {
+        crate::println!("disk{number}: no such disk (see `disks`).");
+        return;
+    }
+    let disk = number - 1;
+    match crate::gpt::find(disk, &fos_v2_abi::FOSFS_TYPE_GUID, |_| true) {
+        Some(partition) => match crate::fosfs::Volume::mount(disk, partition.start, partition.sectors) {
+            Ok(volume) => action(volume, rest),
+            Err(crate::fosfs::Error::NotFormatted) => crate::println!("disk{number}: its data partition holds no FOSFS v3 volume."),
+            Err(error) => crate::println!("disk{number}: cannot read the data partition ({error:?})."),
+        },
+        None => crate::println!("disk{number}: no FOSFS data partition (a GPT partition of the FOSFS type)."),
     }
 }
 
