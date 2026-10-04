@@ -44,8 +44,48 @@ pub fn args() -> &'static [u8] {
 
 pub struct Console;
 
+static mut QUIET: bool = false;
+static mut LINE: [u8; 160] = [0; 160];
+static mut LINE_LENGTH: usize = 0;
+static mut LAST: [u8; 160] = [0; 160];
+static mut LAST_LENGTH: usize = 0;
+
+/// While quiet, `print!`/`println!` do not reach the screen: a tape that draws its own full-screen panel keeps the
+/// text its worker code prints from scribbling over it. The last complete line is kept (`last_message`) so the panel
+/// can show it where it wants.
+pub fn set_quiet(quiet: bool) {
+    unsafe { QUIET = quiet };
+}
+
+/// The last complete line printed while quiet.
+pub fn last_message() -> &'static str {
+    unsafe {
+        let last: &'static [u8; 160] = &*(&raw const LAST);
+        core::str::from_utf8(&last[..LAST_LENGTH]).unwrap_or("")
+    }
+}
+
 impl Write for Console {
     fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        if unsafe { QUIET } {
+            for &byte in text.as_bytes() {
+                unsafe {
+                    let line: &mut [u8; 160] = &mut *(&raw mut LINE);
+                    if byte == b'\n' {
+                        if LINE_LENGTH > 0 {
+                            let last: &mut [u8; 160] = &mut *(&raw mut LAST);
+                            last[..LINE_LENGTH].copy_from_slice(&line[..LINE_LENGTH]);
+                            LAST_LENGTH = LINE_LENGTH;
+                        }
+                        LINE_LENGTH = 0;
+                    } else if byte >= b' ' && LINE_LENGTH < 160 {
+                        line[LINE_LENGTH] = byte;
+                        LINE_LENGTH += 1;
+                    }
+                }
+            }
+            return Ok(());
+        }
         for &byte in text.as_bytes() {
             (api().putc)(u32::from(byte));
         }

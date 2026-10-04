@@ -427,7 +427,23 @@ firmware, so a pending slot is tried on the next boot.
   such device here). Raw Ethernet and AVTP have no IP and are not announced. QEMU test: list, `source=`, `to=` and the
   withdrawal; hardware: the Skylake's 'h6' listed on the Sandy Bridge, which received it by name with no other
   parameters, and the Skylake's list showed the Sandy Bridge as a listener.
-  Plan: the shell panel with meters and codec presets; a Wireshark
+  **The settings panel:** `tape run audio-net` with no arguments shows a full-screen form (mode: send, receive or
+  duplex; network: RTP over IP, raw Ethernet or AVTP; NIC with its MAC; IP address or `dhcp`, gateway, peer, codec
+  preset, send and receive channels, name, multicast group) and the bandwidth the choice needs. Codecs are presets:
+  PCM 24-bit, PCM 16-bit, Opus balanced (96 kbit/s per pair), low bandwidth (48) and low delay (128, 5 ms frames); Opus
+  is offered only over RTP. Up/Down or Tab move, Left/Right or Enter change (Enter edits a text row), `S` starts, `P`
+  listens for announcements and lets the user pick the peer by number (listeners for a sender, senders for a receiver),
+  `W` saves the settings as `audio.cfg`, `B` writes (or removes) a `start` file `run audio-net @audio.cfg` so the machine
+  streams at boot (it refuses to touch a start file with other commands), `Q` or Esc quits. The panel starts from an
+  existing `audio.cfg`. While a stream runs the screen shows the sent/received/lost counters, the ring level against its
+  target, the clock offset, the last message the stream printed (`tape_rt::set_quiet` keeps the worker's output off the
+  screen and remembers the last line) and a peak meter per channel in 6 dB steps (up to 32 each way); Esc or Q stops and
+  returns to the form. It works on the local screen and over `term net` (keys through `read_key`). The console learned
+  `ESC [ row ; col H` for it (a kernel change); redraws touch only what changed, because the serial line is slow and a
+  serial receiver has a 16-byte FIFO (an early version redrew the whole form per key and dropped typed characters).
+  The QEMU test drives two panels with keystrokes over the serial line: edit the address and peer, start, check the
+  counters and meters, Escape, `W`, and the saved cfg.
+  Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
   is proprietary; AES67 mode is the open way in.)

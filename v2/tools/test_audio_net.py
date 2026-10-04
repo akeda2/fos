@@ -381,6 +381,7 @@ def main():
     duplex_test()
     config_test()
     peers_test()
+    panel_test()
     print("v2 audio-net: all checks passed")
 
 
@@ -532,6 +533,62 @@ def peers_test():
             middle = (start + end) // 2
             measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])
             check(abs(measured - wanted) < 30, f"a tone of {measured:.0f} Hz was played (wanted {wanted})", "")
+
+
+def panel_test():
+    """The settings panel (`audio-net` with no arguments), driven by keystrokes over the serial line: B edits its IP
+    address and peer and starts sending (a test tone: QEMU's USB audio has no input), A switches to Receive, sets its
+    address and starts. Both live views must show counters and meters; Escape stops, W saves audio.cfg."""
+    keys = lambda guest, text: (guest.process.stdin.write(text.encode()), guest.process.stdin.flush(), guest.pump(0.4))
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = Path(tmp) / "panel.wav"
+        a = Guest(tmp, "panel-a", "52:54:00:12:34:b1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"])
+        b = Guest(tmp, "panel-b", "52:54:00:12:34:b2")
+        try:
+            for guest in (a, b):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark_a = a.send("run audio-net")
+            mark_b = b.send("run audio-net")
+            a.wait_for("audio-net: settings", 30, mark_a)
+            b.wait_for("audio-net: settings", 30, mark_b)
+            # A: mode Receive; IP address.
+            keys(a, "l")
+            keys(a, "jjj\r" + "\x7f" * 4 + "192.168.50.2/24\r")
+            # B: IP address, then the peer's address.
+            keys(b, "jjj\r" + "\x7f" * 4 + "192.168.50.1/24\r")
+            keys(b, "jj\r192.168.50.2\r")
+            check("192.168.50.1/24" in b.text()[mark_b:] and "192.168.50.2" in b.text()[mark_b:], "the form shows the edited address and peer", b.text()[-600:])
+            keys(a, "s")
+            a.pump(3.0)
+            keys(b, "s")
+            a.pump(5.0)
+            b.pump(2.0)
+            text_a, text_b = a.text()[mark_a:], b.text()[mark_b:]
+            check("Sent " in text_b and "Lost 0" in text_a, "both live views show counters", text_a[-500:] + text_b[-500:])
+            sent = [int(part.split(" ")[0]) for part in text_b.split("Sent ")[1:] if part.split(" ")[0].isdigit()]
+            received = [int(part.split(" ")[0]) for part in text_a.split("Received ")[1:] if part.split(" ")[0].isdigit()]
+            check(sent and sent[-1] >= 3000, f"the sender's counter reached {sent[-1] if sent else 0}", text_b[-500:])
+            check(received and received[-1] >= 2000, f"the receiver's counter reached {received[-1] if received else 0}", text_a[-500:])
+            check("[#" in text_b and "[#" in text_a, "and both draw level meters with signal", "")
+            # Escape stops the stream and returns to the panel; W saves the configuration.
+            for guest in (b, a):
+                guest.process.stdin.write(b"\x1b")
+                guest.process.stdin.flush()
+                guest.pump(1.5)
+                check("Press any key for the settings" in guest.text(), f"Escape stops the stream ({guest.name})", guest.text()[-400:])
+                keys(guest, " ")
+            keys(b, "w")
+            check("Saved audio.cfg" in b.text(), "W saves audio.cfg", b.text()[-400:])
+            keys(b, "q")
+            b.wait_for("fos> ", 30)
+            mark = b.send("cat audio.cfg")
+            b.pump(1.5)
+            config = b.text()[mark:]
+            check("mode send" in config and "ip 192.168.50.1/24" in config and "to 192.168.50.2" in config and "src tone" not in config, "the saved cfg holds the settings (and not the test tone)", config)
+        finally:
+            a.stop()
+            b.stop()
 
 
 def dhcp_test():

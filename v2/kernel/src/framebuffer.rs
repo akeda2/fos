@@ -27,6 +27,9 @@ pub struct Console {
     /// ANSI escape parsing: 0 = none, 1 = after ESC, 2 = inside `ESC [` collecting a number.
     escape: u8,
     parameter: usize,
+    /// The parameter before a `;` (`ESC [ row ; column H`), and whether there was one.
+    first_parameter: usize,
+    has_first: bool,
 }
 
 /// The largest text grid kept (256 columns x 100 rows covers up to 2048x1600 at 8x16).
@@ -101,7 +104,8 @@ impl Console {
     }
 
     /// The few ANSI sequences a tape's screen editor sends: `ESC [ n C` / `ESC [ n D` (cursor
-    /// right/left, stopping at the row's ends), `ESC [ K` (erase to the end of the row) and
+    /// right/left, stopping at the row's ends), `ESC [ H` / `ESC [ row ; column H` (cursor position,
+    /// so a tape can redraw a panel in place), `ESC [ K` (erase to the end of the row) and
     /// `ESC [ 2 J` (clear the screen, cursor home). Anything else is swallowed. A serial or
     /// `term net` terminal gets the same bytes and does these itself.
     fn control_sequence(&mut self, last: u8) {
@@ -113,6 +117,12 @@ impl Console {
                 let start = self.row * self.columns + self.column.min(self.columns - 1);
                 let end = (self.row + 1) * self.columns;
                 unsafe { (&mut *core::ptr::addr_of_mut!(CELLS))[start..end].fill(b' ') };
+            }
+            // `ESC [ H` and `ESC [ row ; column H` (1-based): move the cursor, so a tape can redraw a panel in place.
+            b'H' | b'f' => {
+                let (row, column) = if self.has_first { (self.first_parameter, self.parameter) } else { (self.parameter, 1) };
+                self.row = row.max(1).min(self.rows) - 1;
+                self.column = column.max(1).min(self.columns) - 1;
             }
             b'J' if self.parameter == 2 => {
                 unsafe { (&mut *core::ptr::addr_of_mut!(CELLS))[..self.rows * self.columns].fill(b' ') };
@@ -128,12 +138,16 @@ impl Console {
             1 => {
                 self.escape = if character == b'[' { 2 } else { 0 };
                 self.parameter = 0;
+                self.has_first = false;
                 return;
             }
             2 => {
                 match character {
                     b'0'..=b'9' => self.parameter = self.parameter.saturating_mul(10).saturating_add(usize::from(character - b'0')),
-                    b';' => self.parameter = 0,
+                    b';' => {
+                        (self.first_parameter, self.has_first) = (self.parameter, true);
+                        self.parameter = 0;
+                    }
                     last => {
                         self.escape = 0;
                         self.control_sequence(last);
@@ -193,6 +207,8 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
         background: 0,
         escape: 0,
         parameter: 0,
+        first_parameter: 0,
+        has_first: false,
     };
     console.foreground = console.pixel(0xc0, 0xc0, 0xc0);
     console.background = console.pixel(0x00, 0x00, 0x20);

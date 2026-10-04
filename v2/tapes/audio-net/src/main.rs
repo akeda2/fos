@@ -1,6 +1,7 @@
 //! `audio-net`: streams audio between hosts, from and to the USB audio device.
 //!
 //! ```text
+//! tape run audio-net                       the settings panel (see panel.rs)
 //! tape run audio-net send [proto=raw|rtp] [nic=N] [to=MAC|IP[:PORT]] [rate=48000] [ch=3-4] [bits=24]
 //!                         [src=capture|tone=HZ] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP] [pt=96]
 //! tape run audio-net duplex [options of both; in=CH out=CH instead of ch=]
@@ -52,6 +53,8 @@ mod abort;
 mod duplex;
 mod igmp;
 mod net;
+mod panel;
+mod stats;
 mod peers;
 mod opus;
 
@@ -123,7 +126,7 @@ fn parse_mac(text: &str) -> Option<[u8; 6]> {
     parts.next().is_none().then_some(mac)
 }
 
-fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'static str> {
+pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'static str> {
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
@@ -436,6 +439,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             continue;
         }
         let length = per_packet * frame_bytes;
+        stats::peaks_from_wire(&payload[..length], channels, bits, per_packet, true);
         let total = match destination {
             Destination::Raw(mac) if options.proto == Proto::Avtp => {
                 frame[0..6].copy_from_slice(&mac);
@@ -473,6 +477,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         sequence = sequence.wrapping_add(1);
         timestamp = timestamp.wrapping_add(per_packet as u32);
         sent += 1;
+        stats::get().sent = sent;
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;
             print!(".");
@@ -753,6 +758,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             continue;
         }
         let payload = &frame[packet.payload.clone()];
+        stats::peaks_from_wire(payload, wire_channels, packet.bits, frames, false);
         let work_start = tape_rt::micros();
         if options.resample {
             // Steer the resampler from the ring level, run the packet through it, place and write the result.
@@ -794,6 +800,8 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         work_total += spent;
         work_max = work_max.max(spent);
         packets += 1;
+        let shown = stats::get();
+        (shown.received, shown.lost, shown.level_frames, shown.target_frames, shown.offset_ppm, shown.rate) = (packets, lost, level as u32, fill.target() as u32, servo.offset_ppm(), packet.rate);
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;
             print!(".");
@@ -824,7 +832,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
 /// ready-made words (`proto=rtp`, `verbose`, `send`); `#` starts a comment.
 static mut CONFIG_TEXT: [u8; 4096] = [0; 4096];
 static mut CONFIG_WORDS: [u8; 4608] = [0; 4608];
-const MAX_WORDS: usize = 64;
+pub const MAX_WORDS: usize = 64;
 
 fn load_config(api: &TapeApi, name: &str, words: &mut [&'static str; MAX_WORDS], count: &mut usize) -> Result<(), &'static str> {
     let text = unsafe { &mut *(&raw mut CONFIG_TEXT) };
@@ -833,6 +841,12 @@ fn load_config(api: &TapeApi, name: &str, words: &mut [&'static str; MAX_WORDS],
         return Err(if length == tape_rt::FS_NOT_FOUND { "the configuration file does not exist" } else { "the configuration file cannot be read (is it over 4096 bytes?)" });
     }
     let text = core::str::from_utf8(&text[..length as usize]).map_err(|_| "the configuration file is not text")?;
+    normalize(text, words, count)
+}
+
+/// Splits configuration text into option words (see `load_config`). The words live in a static buffer, so only one
+/// text's words exist at a time.
+pub fn normalize(text: &str, words: &mut [&'static str; MAX_WORDS], count: &mut usize) -> Result<(), &'static str> {
     let out = unsafe { &mut *(&raw mut CONFIG_WORDS) };
     let mut used = 0;
     for line in text.lines() {
@@ -894,7 +908,7 @@ fn collect(api: &TapeApi, arguments: &'static str) -> Result<([&'static str; MAX
 
 /// Turns `source=NAME` and a `to=NAME` that is not an address into the stream's parameters. False if a name could not
 /// be found (or Escape was pressed while looking).
-fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'static>) -> bool {
+pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'static>) -> bool {
     let wants_source = !options.source.is_empty() && matches!(mode, "recv" | "duplex");
     let to_name = !options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none();
     let wants_listener = to_name && matches!(mode, "send" | "duplex") && options.proto == Proto::Rtp;
@@ -917,7 +931,7 @@ fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'stati
     true
 }
 
-fn run_once(api: &'static TapeApi, mode: &str, options: &Options) {
+pub fn run_once(api: &'static TapeApi, mode: &str, options: &Options) {
     match mode {
         "duplex" => duplex::run(api, options),
         "send" if options.opus => opus::send(api, options),
@@ -931,6 +945,9 @@ fn run_once(api: &'static TapeApi, mode: &str, options: &Options) {
 pub extern "C" fn tape_main(real: &'static TapeApi) {
     tape_rt::init(real);
     let arguments = core::str::from_utf8(tape_rt::args()).unwrap_or("");
+    if arguments.trim().is_empty() {
+        return panel::run(real);
+    }
     let (words, count) = match collect(real, arguments) {
         Ok(found) => found,
         Err(reason) => return println!("audio-net: {reason}."),

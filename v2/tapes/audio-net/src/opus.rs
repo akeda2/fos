@@ -145,6 +145,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
                     };
                 }
             }
+            crate::stats::peaks_from_i16(&pcm[..frame_samples * width], width, frame_samples, stream * 2, true);
             let Some(encoder) = encoders[stream].as_mut() else { continue };
             let Ok(length) = encoder.encode(&pcm[..frame_samples * width], frame_samples, &mut packet) else { continue };
             let port = options.port + 2 * stream as u16;
@@ -164,6 +165,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         sequence = sequence.wrapping_add(1);
         timestamp = timestamp.wrapping_add(frame_samples as u32);
         sent += 1;
+        crate::stats::get().sent = sent;
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;
             print!(".");
@@ -349,6 +351,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         match lane.decoder.decode(rtp.payload, &mut pcm, samples) {
             Ok(decoded) => {
                 place(timeline, rtp.timestamp, first_channel, lane_channels, &pcm[..decoded * lane_channels], decoded);
+                crate::stats::peaks_from_i16(&pcm[..decoded * lane_channels], lane_channels, decoded, first_channel, false);
                 lane.next = rtp.timestamp.wrapping_add(decoded as u32);
                 lane.last_frame = decoded;
             }
@@ -405,6 +408,8 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             continue;
         }
         resampler.step = servo.update(level, frames, RATE);
+        let shown = crate::stats::get();
+        (shown.received, shown.lost, shown.level_frames, shown.target_frames, shown.offset_ppm, shown.rate) = (packets, lost, level as u32, target_frames as u32, servo.offset_ppm(), RATE);
         let mut remaining = frames;
         while remaining > 0 {
             let chunk = remaining.min(work.len() / channels);

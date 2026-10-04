@@ -35,6 +35,18 @@ pub fn wrap(api: &'static TapeApi) -> &'static TapeApi {
     }
 }
 
+static mut COPY_CUSTOM: MaybeUninit<TapeApi> = MaybeUninit::uninit();
+
+/// A copy of `api` whose `should_abort` is `hook`: the panel uses it to poll keys and redraw while a stream runs.
+pub fn wrap_with(api: &'static TapeApi, hook: extern "C" fn() -> u32) -> &'static TapeApi {
+    unsafe {
+        core::ptr::copy_nonoverlapping(api as *const TapeApi, (&raw mut COPY_CUSTOM).cast::<TapeApi>(), 1);
+        let copy = &mut *(&raw mut COPY_CUSTOM).cast::<TapeApi>();
+        copy.should_abort = hook;
+        &*(&raw const COPY_CUSTOM).cast::<TapeApi>()
+    }
+}
+
 pub fn aborted() -> bool {
     unsafe { ABORTED }
 }
