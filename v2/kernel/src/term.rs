@@ -10,7 +10,7 @@
 //! Console output reaches the client through a relay ring that `print` fills while a
 //! session is open; it is flushed to the wire in 1 KiB DATA frames.
 
-use crate::e1000::E1000;
+use crate::nic::Nic;
 use crate::{apic, cpu, memory, pci, power};
 
 const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
@@ -53,7 +53,7 @@ fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
 }
 
 pub const MAX_NICS: usize = 8;
-static mut NICS: [Option<E1000>; MAX_NICS] = [const { None }; MAX_NICS];
+static mut NICS: [Option<Nic>; MAX_NICS] = [const { None }; MAX_NICS];
 static mut NIC_COUNT: usize = 0;
 /// The interface the open session's HELLO arrived on: console output goes out of it.
 static mut SESSION_NIC: usize = 0;
@@ -69,7 +69,7 @@ static mut LINE_LENGTH: usize = 0;
 static mut LAST_WAS_CR: bool = false;
 
 /// Adds a network interface; returns its zero-based index.
-pub fn install(nic: E1000, runtime_services: u64) -> Option<usize> {
+pub fn install(nic: Nic, runtime_services: u64) -> Option<usize> {
     unsafe {
         RUNTIME_SERVICES = runtime_services;
         if NIC_COUNT == MAX_NICS {
@@ -86,19 +86,19 @@ pub fn install(nic: E1000, runtime_services: u64) -> Option<usize> {
 /// frames would only be noticed at the next timer tick.
 pub fn all_interrupt_driven() -> bool {
     let count = nic_count();
-    count > 0 && (0..count).all(|index| nic_at(index).is_some_and(|nic| nic.delivery != crate::e1000::Delivery::Polled))
+    count > 0 && (0..count).all(|index| nic_at(index).is_some_and(|nic| nic.delivery() != crate::e1000::Delivery::Polled))
 }
 
 pub fn nic_count() -> usize {
     unsafe { NIC_COUNT }
 }
 
-fn nic_at(index: usize) -> Option<&'static mut E1000> {
+fn nic_at(index: usize) -> Option<&'static mut Nic> {
     unsafe { (*core::ptr::addr_of_mut!(NICS)).get_mut(index)?.as_mut() }
 }
 
 /// The session's interface.
-fn nic() -> Option<&'static mut E1000> {
+fn nic() -> Option<&'static mut Nic> {
     nic_at(unsafe { SESSION_NIC })
 }
 
@@ -144,10 +144,10 @@ fn flush() {
     }
 }
 
-fn send(nic: &mut E1000, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
+fn send(nic: &mut Nic, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
     let mut frame = [0u8; 15 + DATA_CAPACITY];
     frame[0..6].copy_from_slice(destination);
-    frame[6..12].copy_from_slice(&nic.mac);
+    frame[6..12].copy_from_slice(&nic.mac());
     frame[12..14].copy_from_slice(&ETHERTYPE);
     frame[14] = tag;
     frame[15..15 + payload.len()].copy_from_slice(payload);
@@ -518,7 +518,7 @@ fn pop_frame(index: usize, out: &mut [u8]) -> usize {
 pub fn nic_mac(index: usize, out: &mut [u8; 6]) -> bool {
     match nic_at(index) {
         Some(nic) => {
-            *out = nic.mac;
+            *out = nic.mac();
             true
         }
         None => false,
@@ -694,13 +694,14 @@ fn execute(command: &str) {
             }
             for index in 0..nic_count() {
                 if let Some(nic) = nic_at(index) {
-                    crate::println!("{}: {} {}  {}{}", index + 1, match nic.variant { crate::e1000::Variant::Classic => "e1000", crate::e1000::Variant::E1000e => "e1000e", crate::e1000::Variant::I350 => "i350" }, Mac(&nic.mac), if nic.link_up() { "link up" } else { "link DOWN" }, if unsafe { SESSION_NIC } == index && session_open() { "  (terminal)" } else { "" });
-                    crate::println!("   frames: {} received, {} sent{}", nic.frames_received, nic.frames_sent, if nic.frames_dropped_no_link != 0 { " (some dropped: no link)" } else { "" });
+                    crate::println!("{}: {} {}  {}{}", index + 1, nic.family(), Mac(&nic.mac()), if nic.link_up() { "link up" } else { "link DOWN" }, if unsafe { SESSION_NIC } == index && session_open() { "  (terminal)" } else { "" });
+                    let (received, sent, dropped) = nic.counters();
+                    crate::println!("   frames: {} received, {} sent{}", received, sent, if dropped != 0 { " (some dropped: no link)" } else { "" });
                     // v1's `nic` reported "NIC IRQn: N notifications"; keep that line (tools grep for it).
-                    if let crate::e1000::Delivery::Msi(v) | crate::e1000::Delivery::Msix(v) | crate::e1000::Delivery::Intx { vector: v, .. } = nic.delivery {
+                    if let crate::e1000::Delivery::Msi(v) | crate::e1000::Delivery::Msix(v) | crate::e1000::Delivery::Intx { vector: v, .. } = nic.delivery() {
                         crate::println!("   NIC IRQ{v}: {} notifications", crate::e1000::ISR[index].interrupts.load(core::sync::atomic::Ordering::Relaxed));
                     }
-                    match nic.delivery {
+                    match nic.delivery() {
                         crate::e1000::Delivery::Polled => crate::println!("   interrupts: polled"),
                         crate::e1000::Delivery::Intx { gsi, vector } => {
                             let state = &crate::e1000::ISR[index];
@@ -714,7 +715,7 @@ fn execute(command: &str) {
                             let state = &crate::e1000::ISR[index];
                             crate::println!(
                                 "   interrupts: {} vector {vector:#x}: {} taken, {} receive overruns, {} link changes",
-                                if matches!(nic.delivery, crate::e1000::Delivery::Msix(_)) { "MSI-X" } else { "MSI" },
+                                if matches!(nic.delivery(), crate::e1000::Delivery::Msix(_)) { "MSI-X" } else { "MSI" },
                                 state.interrupts.load(core::sync::atomic::Ordering::Relaxed),
                                 state.overruns.load(core::sync::atomic::Ordering::Relaxed),
                                 state.link_changes.load(core::sync::atomic::Ordering::Relaxed)

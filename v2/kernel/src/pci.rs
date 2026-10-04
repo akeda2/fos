@@ -161,6 +161,12 @@ impl Device {
         }
     }
 
+    /// The port base of I/O BAR `index`, or None for a memory or absent BAR.
+    pub fn io_bar(&self, index: u8) -> Option<u16> {
+        let low = self.read32(0x10 + index * 4);
+        (low & 1 == 1 && low & 0xfffc != 0).then_some((low & 0xfffc) as u16)
+    }
+
     /// Base address and size of memory BAR `index`, or None for an I/O or absent BAR.
     /// A 64-bit BAR takes two slots. Sizing writes all-ones and reads back which bits
     /// stuck, with decoding switched off while the BAR holds that bogus value.

@@ -37,9 +37,11 @@ mod keyboard;
 mod log;
 mod memory;
 mod msi;
+mod nic;
 mod nvme;
 mod paging;
 mod pci;
+mod rtl8168;
 mod power;
 mod serial;
 mod storage;
@@ -293,15 +295,30 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
                         Err(reason) => println!("  interrupts: polled ({reason})."),
                     }
                 }
-                if term::install(nic, info.runtime_services).is_some() {
+                if term::install(nic::Nic::E1000(nic), info.runtime_services).is_some() {
                     interfaces += 1;
                 }
             }
             Err(error) => println!("e1000 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
         }
     }
+    for device in pci::devices().filter(|d| d.vendor == rtl8168::VENDOR_REALTEK && rtl8168::DEVICE_IDS.contains(&d.id)) {
+        match rtl8168::Rtl8168::init(&device, interfaces) {
+            Ok(nic) => {
+                match nic.link_speed() {
+                    Some((speed, full)) => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link up at {speed} Mb/s {}.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac), if full { "full duplex" } else { "half duplex" }),
+                    None => println!("rtl8168 at {:02x}:{:02x}.{} (chip version {:#05x}, I/O {:#06x}): MAC {}, link down.", device.bus, device.device, device.function, nic.version, nic.io_base(), term::Mac(&nic.mac)),
+                }
+                println!("  interrupts: polled (this driver does not use them yet).");
+                if term::install(nic::Nic::Rtl8168(nic), info.runtime_services).is_some() {
+                    interfaces += 1;
+                }
+            }
+            Err(error) => println!("rtl8168 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
+        }
+    }
     if interfaces == 0 {
-        println!("No supported network interface found (this milestone drives the e1000 only).");
+        println!("No supported network interface found (e1000, e1000e, I350 and RTL8168 are driven).");
     }
 
     if config::debug().crash_on_boot {

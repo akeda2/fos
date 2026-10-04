@@ -243,6 +243,12 @@ firmware, so a pending slot is tried on the next boot.
   pins), `pci read|write B:D.F`, `io r8|w8..` and `mmio r32|w32..` (mapped addresses only, never the
   kernel image) and `clear` report or poke the machine from the shell. Tests: `make test-v2-ed`,
   `test-v2-disks`, `test-v2-diag`.
+* **RTL8168/RTL8111 NICs** (`rtl8168.rs`, PCI 10ec:8168 and 10ec:8161, ported from v1) are driven
+  polled, through the I/O-port BAR: 64 receive and 32 transmit descriptors, the 8168G-and-later
+  register order, a frame sent with no link dropped like on the e1000. The terminal, tapes and
+  `nic` reach every NIC family through the `nic::Nic` enum. QEMU has no RTL8168 model, so nothing
+  automated covers the chip itself (as in v1); it initialises and receives on the Skylake
+  (`rtl8168`, NIC 6). Not done: interrupts (MSI), the NIC watchdog counters, `nic regs`.
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with
