@@ -118,13 +118,15 @@ def play_tapes_test():
         with wave.open(str(wav)) as recording:
             rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
             samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
-        found = segments(samples, rate)
-        check(len(found) == 2, f"the recording holds two separate sounds ({len(found)} found)", repr(found))
-        for (start, end), wanted in zip(found, (440, 880)):
-            body = samples[start:end]
-            crossings = sum(1 for a, b in zip(body, body[1:]) if a < 0 <= b)
-            frequency = crossings * rate / len(body)
-            check(abs(frequency - wanted) < 20, f"one is {frequency:.0f} Hz (wanted {wanted}), {len(body) / rate:.1f} s long", "")
+        # QEMU's WAV backend only writes while a stream runs, so the gap between the two tapes may not be
+        # recorded at all: measure the first and the last second of the sound instead of looking for a gap.
+        loud = [i for i, value in enumerate(samples) if abs(value) > 500]
+        start, end = loud[0], loud[-1]
+        check((end - start) / rate > 2.5, f"the recording holds both tones ({(end - start) / rate:.1f} s of sound)", "")
+        for part, wanted in ((samples[start:start + rate], 440), (samples[end - rate:end], 880)):
+            crossings = sum(1 for x, y in zip(part, part[1:]) if x < 0 <= y)
+            frequency = crossings * rate / len(part)
+            check(abs(frequency - wanted) < 20, f"{'the first' if wanted == 440 else 'the last'} second is {frequency:.0f} Hz (wanted {wanted})", "")
 
 
 def boot_with_commands(extra, commands, image=None):
