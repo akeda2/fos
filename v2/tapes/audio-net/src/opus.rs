@@ -241,6 +241,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
     let mut level;
+    let mut trimming = false;
     loop {
         if (api.should_abort)() != 0 || (options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000) {
             break;
@@ -367,8 +368,16 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         }
         (api.audio_info)(&mut info);
         level = (RING_BYTES - info.playback_space as usize) / device_frame;
+        // Far too full (a stall, or a sender that starts with a burst): the ring cannot be emptied, so discard
+        // incoming audio, and keep discarding until the ring has played down to the target, instead of leaving
+        // the rest to the servo (which is limited to +-2000 ppm and would take tens of seconds).
         if level > target_frames * 4 + 64 {
-            dropped += frames as u64; // far too full after a stall: skip ahead
+            trimming = true;
+        } else if level <= target_frames {
+            trimming = false;
+        }
+        if trimming {
+            dropped += frames as u64;
             for step in 0..frames {
                 let at = (position.wrapping_add(step as u32) as usize % TIMELINE) * MAX_CHANNELS;
                 timeline[at..at + MAX_CHANNELS].fill(0);

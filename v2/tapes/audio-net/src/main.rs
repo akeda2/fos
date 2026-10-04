@@ -419,6 +419,7 @@ fn receive(api: &'static TapeApi, options: &Options) {
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
     let mut level = 0usize;
+    let mut trimming = false;
     let (mut work_total, mut work_max, mut slow_receive, mut slow_info, mut gaps_shown) = (0u64, 0u64, 0u64, 0u64, 0u32);
     loop {
         if (api.should_abort)() != 0 {
@@ -524,8 +525,15 @@ fn receive(api: &'static TapeApi, options: &Options) {
             info.playback_space as usize
         }) / device_frame;
         slow_info = slow_info.max(tape_rt::micros() - t_info);
+        // Far too full (after a stall): discard whole packets until the ring has played down to the target, rather
+        // than leaving it to the servo (limited to +-2000 ppm, so tens of seconds).
         if level > fill.target() * 4 + 64 {
-            dropped += frames as u64; // far too full (after a stall): discard whole packets to catch up quickly
+            trimming = true;
+        } else if level <= fill.target() {
+            trimming = false;
+        }
+        if trimming {
+            dropped += frames as u64;
             packets += 1;
             continue;
         }
