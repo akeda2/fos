@@ -58,6 +58,18 @@ pub fn build_rtp_frame(out: &mut [u8], config: &NetConfig, destination_mac: MacA
     EthernetFrame::new(destination_mac, config.mac, ETHERTYPE_IPV4, &ip_bytes[..ip_len]).encode(out).ok()
 }
 
+/// Builds Ethernet + IPv4 + UDP around `payload` into `out` (a datagram that is not RTP, such as a SAP announcement).
+#[allow(clippy::too_many_arguments)]
+pub fn build_udp_frame(out: &mut [u8], config: &NetConfig, destination_mac: MacAddress, destination_ip: Ipv4Address, source_port: u16, destination_port: u16, ttl: u8, payload: &[u8]) -> Option<usize> {
+    let mut udp_bytes = [0u8; MAX_FRAME];
+    let udp_len = UdpDatagram::new(source_port, destination_port, payload).encode(&mut udp_bytes, config.ip, destination_ip).ok()?;
+    let mut header = Ipv4Header::new(config.ip, destination_ip, 17, udp_len);
+    header.ttl = ttl;
+    let mut ip_bytes = [0u8; MAX_FRAME];
+    let ip_len = Ipv4Packet { header, payload: &udp_bytes[..udp_len] }.encode(&mut ip_bytes).ok()?;
+    EthernetFrame::new(destination_mac, config.mac, ETHERTYPE_IPV4, &ip_bytes[..ip_len]).encode(out).ok()
+}
+
 /// What the network layer made of one received frame.
 pub enum Inbound<'a> {
     /// Not for us, or handled here (an ARP exchange).

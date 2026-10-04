@@ -74,9 +74,13 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     println!("Sending {channels} channel(s) as {streams} Opus stream(s), {} kbit/s per pair, {}.{} ms frames, to {host}, ports {}..{}.", options.bitrate / 1000, options.frame_x10 / 10, options.frame_x10 % 10, options.port, options.port as usize + 2 * (streams - 1));
     let session = (tape_rt::micros() as u32) ^ 0x5a5a_a5a5;
     let mut text = [0u8; 900];
-    let length = write_sdp_opus(&SdpOpus { origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, packet_ms_x10: options.frame_x10, session }, &mut text);
+    let mut name_buffer = [0u8; audio_wire::sap::MAX_NAME];
+    let name = crate::peers::session_name(options.name, transport.mac, &mut name_buffer);
+    let length = write_sdp_opus(&SdpOpus { name, receive_only: false, origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, packet_ms_x10: options.frame_x10, session }, &mut text);
     println!("SDP for the receiver (save as stream.sdp; e.g. ffplay -protocol_whitelist file,udp,rtp stream.sdp):");
     println!("{}", core::str::from_utf8(&text[..length]).unwrap_or(""));
+    transport.announcer_start(&text[..length]);
+    println!("Announcing this stream as '{name}' (SAP, every 5 s).");
     let device_frame = device_channels * slot;
     let capture_bytes = device_frame * frame_samples; // 0 for a tone: no device
     let capture_address = if capture_bytes == 0 { 1 } else { (api.alloc)(capture_bytes * 2) };
@@ -107,6 +111,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         if (api.should_abort)() != 0 || (options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000) {
             break;
         }
+        transport.announce_service(api, options.nic);
         let ready = if options.tone.is_some() {
             tape_rt::micros() >= started + sent * paced_x1000 / 1000
         } else {
@@ -171,6 +176,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         (api.free)(capture_address, capture_bytes * 2);
     }
     println!();
+    transport.announce_stop(api, options.nic);
     println!("Sent {sent} frames x {streams} stream(s); {} bytes of Opus ({} kbit/s); encoding took {} us per frame on average, {} us at worst.", bytes_total, bytes_total * 8 * 1000 / (sent.max(1) * frame_us) , encode_total / sent.max(1), encode_max);
 }
 
@@ -218,6 +224,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     for (index, device_channel) in targets.channels().enumerate().take(channels) {
         placement[index] = Some(device_channel);
     }
+    transport.announce_receiver(options);
     println!("Listening on NIC {} for Opus/RTP: {streams} stream(s) on ports {}..{}, {channels} channel(s). Escape stops.", options.nic + 1, options.port, options.port as usize + 2 * (streams - 1));
     let timeline = unsafe { &mut *core::ptr::addr_of_mut!(TIMELINE_DATA) };
     timeline.fill(0);

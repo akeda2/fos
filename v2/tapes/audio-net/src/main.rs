@@ -52,6 +52,7 @@ mod abort;
 mod duplex;
 mod igmp;
 mod net;
+mod peers;
 mod opus;
 
 use audio_wire::{ChannelSet, ETHERNET_HEADER, ETHERTYPE, Fill, HEADER_LEN, Header, MAX_RAW_PAYLOAD, MAX_RTP_PAYLOAD, Resampler, Sdp, Servo, Slip, frames_per_packet, frames_to_device, pack, unpack, wire_to_frames, write_sdp};
@@ -105,6 +106,9 @@ pub struct Options<'a> {
     complexity: u32,
     /// `recv group=239.1.2.3`: join this multicast group (IGMP) and receive it.
     group: &'a str,
+    /// `name=`: what this machine announces itself as; `source=NAME`: receive the stream that sender announces.
+    name: &'a str,
+    source: &'a str,
     /// `duplex`: the device input channels to send (`in=`) and the output channels to play on (`out=`).
     in_channels: Option<ChannelSet>,
     out_channels: Option<ChannelSet>,
@@ -123,7 +127,7 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", in_channels: None, out_channels: None,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", in_channels: None, out_channels: None,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -152,6 +156,8 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
             "in" => options.in_channels = Some(ChannelSet::parse(value).ok_or("in= is like 1-2 or 9-10,1")?),
             "out" => options.out_channels = Some(ChannelSet::parse(value).ok_or("out= is like 1-2 or 9-10,1")?),
             "group" => options.group = value,
+            "name" => options.name = Some(value).filter(|name| !name.is_empty() && name.len() <= 24 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')).ok_or("name= is up to 24 letters, digits, - _ .")?,
+            "source" => options.source = value,
             "codec" => options.opus = match value { "pcm" => false, "opus" => true, _ => return Err("codec= is pcm or opus") },
             "bitrate" => options.bitrate = value.parse::<u32>().ok().filter(|&b| (6..=512).contains(&b)).ok_or("bitrate= is kbit/s per stereo pair, 6 to 512")? * 1000,
             "frame" => options.frame_x10 = match value.split_once('.') { Some((whole, tenth)) => whole.parse::<u32>().ok().zip(tenth.parse::<u32>().ok()).map(|(w, t)| w * 10 + t), None => value.parse::<u32>().ok().map(|w| w * 10) }.ok_or("frame= is milliseconds")?,
@@ -181,6 +187,9 @@ impl core::fmt::Display for MacText {
     }
 }
 
+/// The address configuration a run settled on (NIC, config), so that a retry or the second task does not repeat DHCP.
+static mut CONFIG_CACHE: Option<(usize, NetConfig)> = None;
+
 pub struct Transport {
     proto: Proto,
     mac: [u8; 6],
@@ -191,6 +200,7 @@ pub struct Transport {
     igmp: Option<igmp::Igmp>,
     /// AVTP's 8-bit sequence number and its widened value, for the receiver.
     avtp_sequence: Option<(u8, u16)>,
+    announcer: peers::Announcer,
 }
 
 impl Transport {
@@ -198,6 +208,12 @@ impl Transport {
         let mut mac = [0u8; 6];
         (api.nic_mac)(options.nic, mac.as_mut_ptr());
         let mut config = NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) };
+        if let (Some((nic, cached)), Proto::Rtp) = (unsafe { *(&raw const CONFIG_CACHE) }, options.proto) {
+            // A retry, or the second task of a duplex run: the address is already settled (no second DHCP exchange).
+            if nic == options.nic {
+                return Some(Transport { proto: options.proto, mac, config: cached, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() });
+            }
+        }
         if options.proto == Proto::Rtp {
             if options.ip == "dhcp" {
                 println!("DHCP: asking for an address on NIC {}...", options.nic + 1);
@@ -221,10 +237,11 @@ impl Transport {
             }
             let ip = config.ip.0;
             println!("Network: {}.{}.{}.{} on NIC {} (MAC {}).", ip[0], ip[1], ip[2], ip[3], options.nic + 1, MacText(mac));
+            unsafe { CONFIG_CACHE = Some((options.nic, config)) };
         } else {
             println!("Network: NIC {} (MAC {}), layer 2 only, no IP address.", options.nic + 1, MacText(mac));
         }
-        Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None })
+        Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() })
     }
 
     /// `group=`: joins the multicast group on the receive NIC. False (after a message) if it cannot.
@@ -251,8 +268,37 @@ impl Transport {
         true
     }
 
+    /// Per loop pass: sends this stream's announcement when due.
+    pub fn announce_service(&mut self, api: &TapeApi, nic: usize) {
+        self.announcer.poll(api, nic, &self.config);
+    }
+
+    /// Withdraws the announcement (the tape is stopping).
+    pub fn announcer_start(&mut self, sdp: &[u8]) {
+        self.announcer.start(sdp);
+    }
+
+    pub fn announce_stop(&mut self, api: &TapeApi, nic: usize) {
+        self.announcer.withdraw(api, nic, &self.config);
+    }
+
+    /// A receiver announces where and how it listens (RTP only).
+    pub fn announce_receiver(&mut self, options: &Options) {
+        if options.proto != Proto::Rtp {
+            return;
+        }
+        let mut buffer = [0u8; audio_wire::sap::MAX_NAME];
+        let name = peers::session_name(options.name, self.mac, &mut buffer);
+        let mut text = [0u8; 900];
+        let length = peers::receiver_sdp(options, &self.config, name, &mut text);
+        self.announcer.start(&text[..length]);
+    }
+
     /// Per loop pass: sends a due IGMP answer and, given a frame, consumes it if it is IGMP. True if consumed.
     pub fn igmp_service(&mut self, api: &TapeApi, nic: usize, frame: Option<&[u8]>) -> bool {
+        if frame.is_none() {
+            self.announce_service(api, nic);
+        }
         let Some(igmp) = self.igmp.as_mut() else { return false };
         let now = tape_rt::micros();
         igmp.poll(api, nic, &self.config, now);
@@ -260,6 +306,7 @@ impl Transport {
     }
 
     pub fn leave_group(&mut self, api: &TapeApi, nic: usize) {
+        self.announce_stop(api, nic);
         if self.proto == Proto::Avtp {
             (api.nic_set_multicast)(nic, 0);
         }
@@ -329,9 +376,13 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let stream = (tape_rt::micros() as u32) ^ 0x5a5a_a5a5;
     if let Destination::Rtp { ip, .. } = destination {
         let mut text = [0u8; 600];
-        let length = write_sdp(&Sdp { origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, rate: options.rate, bits, packet_us: packet_us as u32, mac: transport.mac, session: stream }, &mut text);
+        let mut name_buffer = [0u8; audio_wire::sap::MAX_NAME];
+        let name = peers::session_name(options.name, transport.mac, &mut name_buffer);
+        let length = write_sdp(&Sdp { name, receive_only: false, origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, rate: options.rate, bits, packet_us: packet_us as u32, mac: transport.mac, session: stream }, &mut text);
         println!("SDP for the receiver (save as stream.sdp; e.g. ffplay -protocol_whitelist file,udp,rtp stream.sdp):");
         println!("{}", core::str::from_utf8(&text[..length]).unwrap_or(""));
+        transport.announcer.start(&text[..length]);
+        println!("Announcing this stream as '{name}' (SAP, every 5 s).");
     }
     duplex::go();
     let mut frame = [0u8; 1514];
@@ -349,6 +400,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         if options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000 {
             break;
         }
+        transport.announce_service(api, options.nic);
         let have_packet = if let Some(frequency) = tone {
             // Paced by the clock: packet number `sent` is due at started + sent * packet time.
             if tape_rt::micros() >= started + sent * paced_us_x1000 / 1000 {
@@ -430,6 +482,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         (api.audio_stop)();
     }
     println!();
+    transport.announce_stop(api, options.nic);
     println!("Sent {sent} packets ({} frames).", sent * per_packet as u64);
 }
 
@@ -559,6 +612,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     if status != 0 {
         return println!("audio-net recv: cannot start playback at {running_rate} Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
     }
+    transport.announce_receiver(options);
     println!("Listening on NIC {} for {} audio; playing on {device_channels} output channel(s) of {}-bit. Escape stops.", options.nic + 1, proto_name(options.proto), info.playback_bits);
     let mut frame = [0u8; 1514];
     let mut staging = [0u8; 8192];
@@ -838,6 +892,31 @@ fn collect(api: &TapeApi, arguments: &'static str) -> Result<([&'static str; MAX
     Ok((words, count))
 }
 
+/// Turns `source=NAME` and a `to=NAME` that is not an address into the stream's parameters. False if a name could not
+/// be found (or Escape was pressed while looking).
+fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'static>) -> bool {
+    let wants_source = !options.source.is_empty() && matches!(mode, "recv" | "duplex");
+    let to_name = !options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none();
+    let wants_listener = to_name && matches!(mode, "send" | "duplex") && options.proto == Proto::Rtp;
+    if !wants_source && !wants_listener {
+        return true;
+    }
+    options.proto = Proto::Rtp;
+    let Some(mut transport) = Transport::open(api, options) else { return false };
+    if wants_source {
+        let Some(entry) = peers::find(api, options, &mut transport, options.source, false) else { return false };
+        if let Err(reason) = peers::adopt_sender(options, &entry, transport.config.ip.0) {
+            println!("audio-net: '{}': {reason}.", options.source);
+            return false;
+        }
+    }
+    if wants_listener {
+        let Some(entry) = peers::find(api, options, &mut transport, options.to, true) else { return false };
+        peers::adopt_listener(options, &entry);
+    }
+    true
+}
+
 fn run_once(api: &'static TapeApi, mode: &str, options: &Options) {
     match mode {
         "duplex" => duplex::run(api, options),
@@ -858,11 +937,11 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
     };
     // The mode is the last bare mode word (the command line overrides the file); everything else is an option.
     let mut mode = "";
-    let mut options_words: [&str; MAX_WORDS] = [""; MAX_WORDS];
+    let mut options_words: [&'static str; MAX_WORDS] = [""; MAX_WORDS];
     let mut kept = 0;
     for &word in &words[..count] {
         match word.strip_prefix("mode=").unwrap_or(word) {
-            "send" | "recv" | "duplex" => mode = word.strip_prefix("mode=").unwrap_or(word),
+            "send" | "recv" | "duplex" | "list" => mode = word.strip_prefix("mode=").unwrap_or(word),
             _ => {
                 options_words[kept] = word;
                 kept += 1;
@@ -870,9 +949,9 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
         }
     }
     if mode.is_empty() {
-        return println!("Usage: tape run audio-net send|recv|duplex [options]   or   tape run audio-net @audio.cfg [options]\n(see the header of v2/tapes/audio-net/src/main.rs, or docs/v2-design.md, for the options and the file format)");
+        return println!("Usage: tape run audio-net send|recv|duplex|list [options]   or   tape run audio-net @audio.cfg [options]\n(see the header of v2/tapes/audio-net/src/main.rs, or docs/v2-design.md, for the options and the file format)");
     }
-    let options = match parse(options_words[..kept].iter().copied()) {
+    let mut options: Options<'static> = match parse(options_words[..kept].iter().copied()) {
         Ok(options) => options,
         Err(reason) => return println!("audio-net: {reason}. See the header of v2/tapes/audio-net/src/main.rs for the options."),
     };
@@ -882,10 +961,15 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
     if options.opus && options.proto != Proto::Rtp {
         return println!("audio-net: codec=opus needs proto=rtp.");
     }
+    if mode == "list" {
+        options.proto = Proto::Rtp;
+        return peers::list(abort::wrap(real), &options);
+    }
+    let by_name = !options.source.is_empty() || (!options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none());
     println!(
         "audio-net {mode}: {} {} on NIC {}{}. Escape stops.",
-        proto_name(options.proto),
-        if options.opus { "Opus" } else { "PCM" },
+        if by_name { "RTP/UDP, parameters from the peer's announcement," } else { proto_name(options.proto) },
+        if by_name { "" } else if options.opus { "Opus" } else { "PCM" },
         options.nic + 1,
         if options.seconds != 0 { "" } else { "; if the stream ends it is restarted every 5 s" }
     );
@@ -894,7 +978,21 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
     // therefore keeps trying until the other side is up.
     let api = abort::wrap(real);
     loop {
-        run_once(api, mode, &options);
+        // Names instead of addresses: `source=NAME` (a receiver) and `to=NAME` (a sender) are looked up in the
+        // announcements. The result is used for this run only, so a peer that moved is found again on a retry.
+        let mut run_options = options.clone();
+        if !resolve_names(api, mode, &mut run_options) {
+            if abort::aborted() {
+                break;
+            }
+            println!("audio-net: trying again in 5 s.");
+            let until = tape_rt::micros() + 5_000_000;
+            while tape_rt::micros() < until && (api.should_abort)() == 0 {
+                tape_rt::idle();
+            }
+            continue;
+        }
+        run_once(api, mode, &run_options);
         if abort::aborted() || options.seconds != 0 {
             break;
         }

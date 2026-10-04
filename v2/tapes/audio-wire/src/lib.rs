@@ -366,7 +366,11 @@ impl Servo {
 }
 
 /// Everything an SDP description of one RTP audio stream needs.
-pub struct Sdp {
+pub struct Sdp<'a> {
+    /// The session name (`s=`): what a peer list shows.
+    pub name: &'a str,
+    /// True for a receiver announcing where it listens (`a=recvonly`) rather than a sender (`a=sendonly`).
+    pub receive_only: bool,
     pub origin: [u8; 4],
     pub destination: [u8; 4],
     pub port: u16,
@@ -407,14 +411,14 @@ fn is_multicast(address: [u8; 4]) -> bool {
 /// length. Lines end in CRLF as SDP requires. The `ts-refclk` is the sender's MAC (`localmac`), since this
 /// stack has no PTP: a receiver that insists on a PTP reference will not accept the stream, one that only
 /// needs the packet format will (ffplay, GStreamer, VLC with the right flags).
-pub fn write_sdp(sdp: &Sdp, out: &mut [u8]) -> usize {
+pub fn write_sdp(sdp: &Sdp<'_>, out: &mut [u8]) -> usize {
     use core::fmt::Write;
     let mut cursor = Cursor { bytes: out, length: 0 };
     let a = sdp.origin;
     let d = sdp.destination;
     let milliseconds = sdp.packet_us / 1000;
     let thousandths = sdp.packet_us % 1000;
-    let _ = write!(cursor, "v=0\r\no=- {0} {0} IN IP4 {1}.{2}.{3}.{4}\r\ns=fos audio-net\r\n", sdp.session, a[0], a[1], a[2], a[3]);
+    let _ = write!(cursor, "v=0\r\no=- {0} {0} IN IP4 {1}.{2}.{3}.{4}\r\ns={5}\r\n", sdp.session, a[0], a[1], a[2], a[3], sdp.name);
     let _ = write!(cursor, "c=IN IP4 {}.{}.{}.{}", d[0], d[1], d[2], d[3]);
     if is_multicast(d) {
         let _ = write!(cursor, "/32");
@@ -436,14 +440,16 @@ pub fn write_sdp(sdp: &Sdp, out: &mut [u8]) -> usize {
         let _ = write!(cursor, "a=ptime:{milliseconds}.{}\r\n", core::str::from_utf8(&fraction[..end]).unwrap_or("0"));
     }
     let m = sdp.mac;
-    let _ = write!(cursor, "a=ts-refclk:localmac={:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}\r\na=mediaclk:direct=0\r\na=sendonly\r\n", m[0], m[1], m[2], m[3], m[4], m[5]);
+    let _ = write!(cursor, "a=ts-refclk:localmac={:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}\r\na=mediaclk:direct=0\r\na={}\r\n", m[0], m[1], m[2], m[3], m[4], m[5], if sdp.receive_only { "recvonly" } else { "sendonly" });
     cursor.length
 }
 
 /// An SDP for an Opus session: one RTP stream per stereo pair (and one mono stream for an odd channel), on
 /// consecutive UDP ports `port`, `port + 2`, ... (RFC 7587 `opus/48000/2`; `stereo=1` and `sprop-stereo=1` say the
 /// stream is stereo, and a mono last stream says `0`).
-pub struct SdpOpus {
+pub struct SdpOpus<'a> {
+    pub name: &'a str,
+    pub receive_only: bool,
     pub origin: [u8; 4],
     pub destination: [u8; 4],
     pub port: u16,
@@ -454,16 +460,16 @@ pub struct SdpOpus {
     pub session: u32,
 }
 
-pub fn write_sdp_opus(sdp: &SdpOpus, out: &mut [u8]) -> usize {
+pub fn write_sdp_opus(sdp: &SdpOpus<'_>, out: &mut [u8]) -> usize {
     use core::fmt::Write;
     let mut cursor = Cursor { bytes: out, length: 0 };
     let (a, d) = (sdp.origin, sdp.destination);
-    let _ = write!(cursor, "v=0\r\no=- {0} {0} IN IP4 {1}.{2}.{3}.{4}\r\ns=fos audio-net (Opus)\r\n", sdp.session, a[0], a[1], a[2], a[3]);
+    let _ = write!(cursor, "v=0\r\no=- {0} {0} IN IP4 {1}.{2}.{3}.{4}\r\ns={5}\r\n", sdp.session, a[0], a[1], a[2], a[3], sdp.name);
     let _ = write!(cursor, "c=IN IP4 {}.{}.{}.{}", d[0], d[1], d[2], d[3]);
     if is_multicast(d) {
         let _ = write!(cursor, "/32");
     }
-    let _ = write!(cursor, "\r\nt=0 0\r\n");
+    let _ = write!(cursor, "\r\nt=0 0\r\na={}\r\n", if sdp.receive_only { "recvonly" } else { "sendonly" });
     let streams = sdp.channels.div_ceil(2);
     for stream in 0..streams {
         let stereo = !(stream == streams - 1 && sdp.channels % 2 == 1);
@@ -564,6 +570,177 @@ pub mod avtp {
                 data_length,
             })
         }
+    }
+}
+
+/// Session announcements: SAP (RFC 2974) carrying SDP, and a reader for the SDP this stack writes (and the simple
+/// SDP other AES67 gear announces). Senders and receivers announce themselves on 239.255.255.255:9875 so a peer list
+/// can show them and a name can stand in for an address.
+pub mod sap {
+    pub const GROUP: [u8; 4] = [239, 255, 255, 255];
+    pub const PORT: u16 = 9875;
+    pub const MAX_NAME: usize = 24;
+
+    /// Writes a SAP packet (version 1, IPv4 origin, no authentication or compression, payload type `application/sdp`)
+    /// into `out`; `delete` says the session is going away. Returns the length.
+    pub fn encode(origin: [u8; 4], delete: bool, id: u16, sdp: &[u8], out: &mut [u8]) -> usize {
+        const TYPE: &[u8] = b"application/sdp\0";
+        out[0] = 0x20 | if delete { 0x04 } else { 0 }; // V=1, A=0 (IPv4), R=0, T, E=0, C=0
+        out[1] = 0; // no authentication data
+        out[2..4].copy_from_slice(&id.to_be_bytes());
+        out[4..8].copy_from_slice(&origin);
+        out[8..8 + TYPE.len()].copy_from_slice(TYPE);
+        let start = 8 + TYPE.len();
+        out[start..start + sdp.len()].copy_from_slice(sdp);
+        start + sdp.len()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct Packet<'a> {
+        pub origin: [u8; 4],
+        pub delete: bool,
+        pub id: u16,
+        pub sdp: &'a [u8],
+    }
+
+    /// Reads a SAP packet; `None` for IPv6, encrypted, compressed or malformed ones.
+    pub fn parse(bytes: &[u8]) -> Option<Packet<'_>> {
+        if bytes.len() < 8 || bytes[0] >> 5 != 1 || bytes[0] & 0x10 != 0 || bytes[0] & 0x03 != 0 {
+            return None;
+        }
+        let authentication = usize::from(bytes[1]) * 4;
+        let mut start = 8 + authentication;
+        let body = bytes.get(start..)?;
+        // An optional NUL-terminated payload type; absent when the payload already starts with "v=0".
+        if !body.starts_with(b"v=0") {
+            start += body.iter().position(|&byte| byte == 0)? + 1;
+        }
+        Some(Packet { origin: bytes[4..8].try_into().ok()?, delete: bytes[0] & 0x04 != 0, id: u16::from_be_bytes([bytes[2], bytes[3]]), sdp: bytes.get(start..)? })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Codec {
+        L16,
+        L24,
+        Opus,
+    }
+
+    /// What a peer list needs from an SDP.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Session {
+        pub name: [u8; MAX_NAME],
+        pub name_length: usize,
+        /// The session id from `o=`: a peer that restarts with new parameters changes it.
+        pub session: u32,
+        pub origin: [u8; 4],
+        pub destination: [u8; 4],
+        pub port: u16,
+        pub payload_type: u8,
+        pub codec: Codec,
+        pub rate: u32,
+        pub channels: usize,
+        /// Microseconds (PCM) or the Opus frame time.
+        pub packet_us: u32,
+        pub receive_only: bool,
+    }
+
+    impl Session {
+        pub fn name(&self) -> &str {
+            core::str::from_utf8(&self.name[..self.name_length]).unwrap_or("?")
+        }
+    }
+
+    fn parse_ip(text: &str) -> Option<[u8; 4]> {
+        let mut octets = [0u8; 4];
+        let mut parts = text.split('.');
+        for octet in octets.iter_mut() {
+            *octet = parts.next()?.parse().ok()?;
+        }
+        parts.next().is_none().then_some(octets)
+    }
+
+    /// Reads a session description: one or more `m=audio` lines (an Opus session has one per stereo pair), the
+    /// connection address, the name, and the first `rtpmap` for the codec.
+    pub fn parse_sdp(sdp: &[u8]) -> Option<Session> {
+        let text = core::str::from_utf8(sdp).ok()?;
+        let mut session = Session { name: [0; MAX_NAME], name_length: 0, session: 0, origin: [0; 4], destination: [0; 4], port: 0, payload_type: 0, codec: Codec::L24, rate: 48_000, channels: 0, packet_us: 1000, receive_only: false };
+        let (mut have_media, mut have_codec, mut media_lines, mut last_mono) = (false, false, 0usize, false);
+        for line in text.lines() {
+            let line = line.trim_end();
+            let Some((kind, value)) = line.split_once('=') else { continue };
+            match kind {
+                "s" => {
+                    let bytes = value.as_bytes();
+                    session.name_length = bytes.len().min(MAX_NAME);
+                    session.name[..session.name_length].copy_from_slice(&bytes[..session.name_length]);
+                }
+                "o" => {
+                    let mut fields = value.split_ascii_whitespace();
+                    fields.next();
+                    session.session = fields.next().and_then(|id| id.parse().ok()).unwrap_or(0);
+                    session.origin = fields.nth(3).and_then(parse_ip).unwrap_or([0; 4]);
+                }
+                "c" => {
+                    let address = value.split_ascii_whitespace().nth(2)?.split('/').next()?;
+                    session.destination = parse_ip(address)?;
+                }
+                "m" => {
+                    let mut fields = value.split_ascii_whitespace();
+                    if fields.next() != Some("audio") {
+                        continue;
+                    }
+                    let port: u16 = fields.next()?.parse().ok()?;
+                    let payload_type: u8 = fields.nth(1)?.parse().ok()?;
+                    if !have_media {
+                        (session.port, session.payload_type, have_media) = (port, payload_type, true);
+                    }
+                    media_lines += 1;
+                    last_mono = false;
+                }
+                "a" => {
+                    if let Some(map) = value.strip_prefix("rtpmap:") {
+                        let (payload, encoding) = map.split_once(' ')?;
+                        if payload.parse::<u8>().ok() != Some(session.payload_type) || have_codec {
+                            continue;
+                        }
+                        let mut parts = encoding.split('/');
+                        let encoding_name = parts.next()?;
+                        let codec = if encoding_name.eq_ignore_ascii_case("l16") {
+                            Codec::L16
+                        } else if encoding_name.eq_ignore_ascii_case("l24") {
+                            Codec::L24
+                        } else if encoding_name.eq_ignore_ascii_case("opus") {
+                            Codec::Opus
+                        } else {
+                            return None;
+                        };
+                        session.codec = codec;
+                        session.rate = parts.next()?.parse().ok()?;
+                        if codec != Codec::Opus {
+                            session.channels = parts.next().and_then(|count| count.parse().ok()).unwrap_or(1);
+                        }
+                        have_codec = true;
+                    } else if value.starts_with("fmtp:") && value.contains("stereo=0") {
+                        last_mono = true;
+                    } else if let Some(time) = value.strip_prefix("ptime:") {
+                        let (whole, fraction) = time.split_once('.').unwrap_or((time, "0"));
+                        let mut micros = whole.parse::<u32>().ok()? * 1000;
+                        for (index, digit) in fraction.bytes().take(3).enumerate() {
+                            micros += u32::from(digit - b'0') * [100, 10, 1][index];
+                        }
+                        session.packet_us = micros;
+                    } else if value == "recvonly" {
+                        session.receive_only = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if session.codec == Codec::Opus {
+            session.channels = media_lines * 2 - usize::from(last_mono);
+            session.packet_us = if session.packet_us == 1000 { 20_000 } else { session.packet_us };
+        }
+        (have_media && have_codec && session.channels > 0).then_some(session)
     }
 }
 
@@ -668,7 +845,7 @@ mod tests {
 
     #[test]
     fn sdp_for_a_stereo_stream() {
-        let sdp = Sdp { origin: [192, 168, 1, 10], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [0x18, 0x66, 0xda, 0x25, 0x1f, 0x73], session: 7 };
+        let sdp = Sdp { name: "studio", receive_only: false, origin: [192, 168, 1, 10], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [0x18, 0x66, 0xda, 0x25, 0x1f, 0x73], session: 7 };
         let mut out = [0u8; 512];
         let length = write_sdp(&sdp, &mut out);
         let text = core::str::from_utf8(&out[..length]).unwrap();
@@ -683,7 +860,7 @@ mod tests {
 
     #[test]
     fn sdp_packet_times_and_unicast() {
-        let mut sdp = Sdp { origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 6000, payload_type: 97, channels: 22, rate: 96_000, bits: 16, packet_us: 125, mac: [0; 6], session: 1 };
+        let mut sdp = Sdp { name: "x", receive_only: false, origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 6000, payload_type: 97, channels: 22, rate: 96_000, bits: 16, packet_us: 125, mac: [0; 6], session: 1 };
         let mut out = [0u8; 512];
         let length = write_sdp(&sdp, &mut out);
         let text = core::str::from_utf8(&out[..length]).unwrap();
@@ -802,7 +979,7 @@ mod tests {
 
     #[test]
     fn opus_sdp_has_a_media_line_per_pair() {
-        let sdp = SdpOpus { origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 5004, payload_type: 96, channels: 5, packet_ms_x10: 100, session: 3 };
+        let sdp = SdpOpus { name: "opus-test", receive_only: false, origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 5004, payload_type: 96, channels: 5, packet_ms_x10: 100, session: 3 };
         let mut out = [0u8; 1024];
         let length = write_sdp_opus(&sdp, &mut out);
         let text = core::str::from_utf8(&out[..length]).unwrap();
@@ -851,5 +1028,38 @@ mod tests {
         bytes[0] = 0; // not AAF
         assert_eq!(avtp::Header::parse(&bytes), None);
         assert!(!avtp::Header { rate: 12_345, ..header }.encode(&mut [0u8; 28]));
+    }
+
+    #[test]
+    fn sap_round_trip_and_session_parse() {
+        let sdp = Sdp { name: "studio-a", receive_only: false, origin: [192, 168, 1, 20], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 4, rate: 48_000, bits: 24, packet_us: 250, mac: [0; 6], session: 77 };
+        let mut text = [0u8; 600];
+        let length = write_sdp(&sdp, &mut text);
+        let mut packet = [0u8; 700];
+        let total = sap::encode([192, 168, 1, 20], false, 0x1234, &text[..length], &mut packet);
+        let parsed = sap::parse(&packet[..total]).unwrap();
+        assert_eq!((parsed.origin, parsed.delete, parsed.id), ([192, 168, 1, 20], false, 0x1234));
+        let session = sap::parse_sdp(parsed.sdp).unwrap();
+        assert_eq!((session.name(), session.session, session.destination, session.port), ("studio-a", 77, [239, 69, 1, 1], 5004));
+        assert_eq!((session.codec, session.rate, session.channels, session.packet_us, session.receive_only), (sap::Codec::L24, 48_000, 4, 250, false));
+        let total = sap::encode([1, 2, 3, 4], true, 9, &text[..length], &mut packet);
+        assert!(sap::parse(&packet[..total]).unwrap().delete);
+    }
+
+    #[test]
+    fn opus_session_counts_streams_and_receivers_say_so() {
+        let sdp = SdpOpus { name: "hall", receive_only: true, origin: [10, 0, 0, 5], destination: [10, 0, 0, 5], port: 5004, payload_type: 96, channels: 5, packet_ms_x10: 100, session: 3 };
+        let mut text = [0u8; 900];
+        let length = write_sdp_opus(&sdp, &mut text);
+        let session = sap::parse_sdp(&text[..length]).unwrap();
+        assert_eq!((session.codec, session.channels, session.packet_us, session.receive_only), (sap::Codec::Opus, 5, 10_000, true));
+        assert_eq!(session.name(), "hall");
+    }
+
+    #[test]
+    fn sap_rejects_other_versions_and_garbage() {
+        assert!(sap::parse(&[0x40, 0, 0, 0, 1, 2, 3, 4, b'v', b'=', b'0']).is_none());
+        assert!(sap::parse(&[0x20]).is_none());
+        assert!(sap::parse_sdp(b"v=0\r\ns=x\r\n").is_none());
     }
 }

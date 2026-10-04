@@ -380,6 +380,7 @@ def main():
     dhcp_test()
     duplex_test()
     config_test()
+    peers_test()
     print("v2 audio-net: all checks passed")
 
 
@@ -462,6 +463,75 @@ def config_test():
         finally:
             a.stop()
             b.stop()
+
+
+def peers_test():
+    """Announcements and the peer list. B sends a multicast Opus stream as 'studio-a' and A, which has never been told
+    its parameters, lists it, then receives it with `source=studio-a`. Then A listens as 'hall' and B sends PCM to
+    `to=hall`, resolved from A's announcement; when A stops its announcement is withdrawn."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = Path(tmp) / "peers.wav"
+        a = Guest(tmp, "peers-a", "52:54:00:12:34:a1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"])
+        b = Guest(tmp, "peers-b", "52:54:00:12:34:a2")
+        try:
+            for guest in (a, b):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark_b = b.send("run audio-net send proto=rtp codec=opus name=studio-a ip=192.168.50.1/24 to=239.1.2.3 src=tone=500 secs=40")
+            b.wait_for("Announcing this stream as 'studio-a'", 60, mark_b)
+            mark = a.send("run audio-net list ip=192.168.50.2/24 secs=8")
+            a.wait_for("fos> ", 60, mark)
+            listing = a.text()[mark:]
+            row = [line for line in listing.splitlines() if "studio-a" in line and "sends" in line]
+            check(len(row) == 1, "the peer list shows the sender 'studio-a'", listing[-900:])
+            check("192.168.50.1 52:54:00:12:34:a2" in row[0] and "Opus" in row[0] and "239.1.2.3:5004" in row[0], "with its IP, MAC, codec and multicast address", row[0])
+            mark = a.send("run audio-net recv source=studio-a ip=192.168.50.2/24 secs=10 target=30")
+            a.wait_for("Received ", 90, mark)
+            a.wait_for("fos> ", 30, mark)
+            text = a.text()[mark:]
+            check("Found 'studio-a': 192.168.50.1" in text and "Joined multicast group 239.1.2.3" in text, "source=studio-a finds the sender and joins its group", text[-900:])
+            packets = int(text.split("Received ")[-1].split(" ")[0])
+            check(packets >= 300, f"and receives its Opus stream ({packets} packets) without being told codec, channels or port", text[-600:])
+            b.wait_for("Sent ", 60, mark_b)
+            # A listens as 'hall'; B finds it by name.
+            mark_a = a.send("run audio-net recv proto=rtp ip=192.168.50.2/24 name=hall secs=30 target=30")
+            a.wait_for("Listening on NIC 1 for RTP/UDP", 60, mark_a)
+            a.pump(3.0)
+            mark_b = b.send("run audio-net send proto=rtp ip=192.168.50.1/24 to=hall src=tone=700 secs=3")
+            b.wait_for("Sent ", 90, mark_b)
+            text_b = b.text()[mark_b:]
+            check("Found 'hall': 192.168.50.2" in text_b and "Sending to 192.168.50.2" in text_b, "to=hall finds the listener and sends to its address", text_b[-900:])
+            a.pump(1.0)
+            mark = len(a.text())
+            a.process.stdin.write(b"\x1b")
+            a.process.stdin.flush()
+            a.wait_for("Received ", 30, mark_a)
+            a.wait_for("fos> ", 30, mark)
+            packets = int(a.text()[mark_a:].split("Received ")[-1].split(" ")[0])
+            check(packets >= 2500, f"the listener received {packets} packets", a.text()[-600:])
+            # Its announcement is withdrawn: a new list from B no longer shows 'hall'.
+            mark = b.send("run audio-net list ip=192.168.50.1/24 secs=6")
+            b.wait_for("fos> ", 60, mark)
+            check("hall" not in b.text()[mark:].split("Listening for announcements")[-1], "once the listener stops, its announcement is withdrawn", b.text()[mark:][-700:])
+        finally:
+            a.stop()
+            b.stop()
+        with wave.open(str(wav)) as recording:
+            rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
+            samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
+        loud = [i for i, value in enumerate(samples) if abs(value) > 500]
+        segments, begin = [], loud[0]
+        for before, after in zip(loud, loud[1:]):
+            if after - before > rate // 2:
+                segments.append((begin, before))
+                begin = after
+        segments.append((begin, loud[-1]))
+        segments = [seg for seg in segments if seg[1] - seg[0] > rate]
+        check(len(segments) == 2, f"two tones were played ({len(segments)})", str(segments))
+        for wanted, (start, end) in zip((500, 700), segments):
+            middle = (start + end) // 2
+            measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])
+            check(abs(measured - wanted) < 30, f"a tone of {measured:.0f} Hz was played (wanted {wanted})", "")
 
 
 def dhcp_test():

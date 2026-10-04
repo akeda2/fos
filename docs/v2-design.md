@@ -414,7 +414,20 @@ firmware, so a pending slot is tried on the next boot.
   resolved the peer. The QEMU test boots a receiver from a `start` file and cfg, sends from a cfg, and checks the
   retry loop and that Escape ends it. The shell `write NAME text` writes a one-line file; longer ones come from `ed`
   or `devloop put`.
-  Plan: announcements and a peer list (SAP-compatible), the shell panel with meters and codec presets; a Wireshark
+  **Announcements and the peer list:** every `audio-net` that streams over RTP announces itself on the SAP group
+  (239.255.255.255:9875, RFC 2974) every 5 s, a sender with the SDP of its stream (`a=sendonly`), a receiver with an SDP
+  of what it accepts (`a=recvonly`), under `name=` (default `fos-` and the last three MAC bytes), and withdraws the
+  announcement (SAP's deletion flag) when it stops. `audio-net list [secs=N]` joins the group with IGMP, listens and prints
+  a table: name, role (sends/listens), the announcer's IP and MAC, codec, channels, rate and address:port (marked when the
+  address is this machine's). A receiver can say `source=NAME`: it waits (15 s) for the sender's announcement and takes
+  codec, channel count, rate, port and multicast group from the SDP, so the cfg of a receiver can be just `mode recv`,
+  `ip ...` and `source studio-a`; a sender can say `to=NAME` and sends to the listener's address and port with the
+  codec it announced. Names are looked up again on every retry. The SDP parser (`audio_wire::sap`, host-tested) reads
+  L16/L24 and Opus sessions, so announcements from other AES67 gear that use these are listed too (not tested: no
+  such device here). Raw Ethernet and AVTP have no IP and are not announced. QEMU test: list, `source=`, `to=` and the
+  withdrawal; hardware: the Skylake's 'h6' listed on the Sandy Bridge, which received it by name with no other
+  parameters, and the Skylake's list showed the Sandy Bridge as a listener.
+  Plan: the shell panel with meters and codec presets; a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
   is proprietary; AES67 mode is the open way in.)
