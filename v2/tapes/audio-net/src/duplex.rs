@@ -139,7 +139,7 @@ extern "C" fn task_entry() -> ! {
 }
 
 /// Runs the send loop and the receive loop together.
-pub fn run(api: &'static TapeApi, options: &Options) {
+pub fn run(api: &'static TapeApi, options: &Options<'static>) {
     if options.opus != (options.proto == Proto::Rtp && options.opus) {
         return println!("audio-net: codec=opus needs proto=rtp.");
     }
@@ -163,6 +163,16 @@ pub fn run(api: &'static TapeApi, options: &Options) {
     }
     let shim: &'static TapeApi = unsafe { &*(&raw const SHIM).cast::<TapeApi>() };
     let mut receive_body = || {
+        // `source=NAME`: find the peer's stream now, while the sending half already streams, and take its codec,
+        // channels and port. Keep looking until found or Escape.
+        while !receiving.source.is_empty() {
+            if crate::resolve_source(shim, &mut receiving) {
+                break;
+            }
+            if (shim.should_abort)() != 0 {
+                return;
+            }
+        }
         if receiving.opus {
             opus::receive(shim, &receiving);
         } else {

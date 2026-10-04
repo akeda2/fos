@@ -382,6 +382,7 @@ def main():
     config_test()
     peers_test()
     panel_test()
+    duplex_names_test()
     print("v2 audio-net: all checks passed")
 
 
@@ -596,6 +597,45 @@ def panel_test():
         finally:
             a.stop()
             b.stop()
+
+
+def duplex_names_test():
+    """Two machines in duplex find each other by name although neither has anything to announce until it starts:
+    each announces where it listens while it looks, so the other can start sending; the stream announcements follow.
+    C starts first and must wait for D."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wavs = {name: Path(tmp) / f"{name}.wav" for name in "cd"}
+        usb = lambda wav: ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"]
+        c = Guest(tmp, "dn-c", "52:54:00:12:34:c3", usb(wavs["c"]))
+        d = Guest(tmp, "dn-d", "52:54:00:12:34:d4", usb(wavs["d"]))
+        try:
+            for guest in (c, d):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark_c = c.send("run audio-net duplex proto=rtp name=c ip=192.168.50.1/24 to=d source=d src=tone=440 secs=40")
+            c.pump(8.0)
+            check("Looking for the announcement of the listener 'd'" in c.text()[mark_c:], "the first machine waits for its peer", c.text()[-600:])
+            mark_d = d.send("run audio-net duplex proto=rtp name=d ip=192.168.50.2/24 to=c source=c src=tone=880 secs=25")
+            d.wait_for("Received ", 120, mark_d)
+            d.wait_for("fos> ", 30, mark_d)
+            c.wait_for("Received ", 120, mark_c)
+            for name, guest, mark in (("c", c, mark_c), ("d", d, mark_d)):
+                text = guest.text()[mark:]
+                check("Found 'd'" in text if name == "c" else "Found 'c'" in text, f"{name} found its peer by name", text[-700:])
+                packets = int(text.split("Received ")[-1].split(" ")[0])
+                check(packets >= 2500, f"{name} received {packets} packets while sending", text[-500:])
+        finally:
+            c.stop()
+            d.stop()
+        for name, wanted in (("c", 880), ("d", 440)):
+            with wave.open(str(wavs[name])) as recording:
+                rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
+                samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
+            loud = [i for i, value in enumerate(samples) if abs(value) > 500]
+            check(len(loud) > 3 * rate, f"{name}'s recording holds sound ({len(loud) / rate:.1f} s)", "")
+            middle = (loud[0] + loud[-1]) // 2
+            measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])
+            check(abs(measured - wanted) < 30, f"{name} played its peer's tone: {measured:.0f} Hz (wanted {wanted})", "")
 
 
 def dhcp_test():

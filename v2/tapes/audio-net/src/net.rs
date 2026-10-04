@@ -104,8 +104,8 @@ pub fn inbound<'a>(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpC
                 Ok(packet) => packet,
                 Err(_) => return Inbound::Rejected("bad IPv4 header or checksum"),
             };
-            if packet.header.protocol != 17 {
-                return Inbound::Nothing;
+            if packet.header.protocol != 17 || (packet.header.source == config.ip && config.ip.0 != [0; 4]) {
+                return Inbound::Nothing; // not UDP, or our own frame coming back (some virtual networks echo them)
             }
             let datagram = match UdpDatagram::parse(packet.payload, true, packet.header.source, packet.header.destination) {
                 Ok(datagram) => datagram,

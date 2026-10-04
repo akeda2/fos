@@ -914,14 +914,24 @@ fn collect(api: &TapeApi, arguments: &'static str) -> Result<([&'static str; MAX
 /// Turns `source=NAME` and a `to=NAME` that is not an address into the stream's parameters. False if a name could not
 /// be found (or Escape was pressed while looking).
 pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'static>) -> bool {
-    let wants_source = !options.source.is_empty() && matches!(mode, "recv" | "duplex");
+    let wants_source = !options.source.is_empty() && mode == "recv";
     let to_name = !options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none();
     let wants_listener = to_name && matches!(mode, "send" | "duplex") && options.proto == Proto::Rtp;
+    let announces_listening = matches!(mode, "recv" | "duplex") && (!options.source.is_empty() || wants_listener);
     if !wants_source && !wants_listener {
         return true;
     }
     options.proto = Proto::Rtp;
     let Some(mut transport) = Transport::open(api, options) else { return false };
+    // Be findable while looking: a peer that sends to our name needs our listening address before it can start,
+    // and it may be waiting for the same of us. (A duplex machine looks up its `source=` later, while it sends.)
+    if announces_listening {
+        transport.announce_receiver(options);
+    }
+    if wants_listener {
+        let Some(entry) = peers::find(api, options, &mut transport, options.to, true) else { return false };
+        peers::adopt_listener(options, &entry);
+    }
     if wants_source {
         let Some(entry) = peers::find(api, options, &mut transport, options.source, false) else { return false };
         if let Err(reason) = peers::adopt_sender(options, &entry, transport.config.ip.0) {
@@ -929,14 +939,24 @@ pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'s
             return false;
         }
     }
-    if wants_listener {
-        let Some(entry) = peers::find(api, options, &mut transport, options.to, true) else { return false };
-        peers::adopt_listener(options, &entry);
+    true
+}
+
+/// `source=NAME` for the receiving half of a duplex run: looked up while the sending half is already streaming (the
+/// peer's receiver may need our stream to exist before it announces the stream we are looking for).
+pub fn resolve_source(api: &'static TapeApi, options: &mut Options<'static>) -> bool {
+    options.proto = Proto::Rtp;
+    let Some(mut transport) = Transport::open(api, options) else { return false };
+    transport.announce_receiver(options);
+    let Some(entry) = peers::find(api, options, &mut transport, options.source, false) else { return false };
+    if let Err(reason) = peers::adopt_sender(options, &entry, transport.config.ip.0) {
+        println!("audio-net: '{}': {reason}.", options.source);
+        return false;
     }
     true
 }
 
-pub fn run_once(api: &'static TapeApi, mode: &str, options: &Options) {
+pub fn run_once(api: &'static TapeApi, mode: &str, options: &Options<'static>) {
     match mode {
         "duplex" => duplex::run(api, options),
         "send" if options.opus => opus::send(api, options),

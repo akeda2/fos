@@ -162,6 +162,7 @@ pub fn listen(api: &TapeApi, options: &Options, transport: &mut Transport, secon
             break;
         }
         igmp.poll(api, options.nic, &transport.config, tape_rt::micros());
+        transport.announce_service(api, options.nic); // a peer that is being looked up for must stay findable meanwhile
         let length = (api.nic_receive)(options.nic, frame.as_mut_ptr(), frame.len());
         if length == 0 {
             tape_rt::idle();

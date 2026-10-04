@@ -448,6 +448,12 @@ firmware, so a pending slot is tried on the next boot.
   after a successful Address Device (ports 15 and 17, three attempts each), so a USB 3 boot stick plugged straight in is not
   found; through a USB 2.0 hub it enumerates and boots normally. High-speed devices (the UFX) work on the same
   controller. Not investigated further: there is no way to push a debug kernel to a machine that cannot see its boot stick.
+  **Duplex by name:** two machines in duplex that know each other only by name used to deadlock, since a machine
+  announces its stream only once it runs and each waited for the other's announcement before starting. Now a
+  machine in receive or duplex mode announces where it listens (`a=recvonly`) while it looks, so the peer can start sending; a
+  duplex machine looks up the peer's `source=` only after its sending half is streaming (the receiving half is a task
+  that retries until found), so there is no cycle, and either machine may start first. Frames from our own address are
+  ignored (virtual networks echo them). Tested with two QEMU guests, the first started eight seconds before the second.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
