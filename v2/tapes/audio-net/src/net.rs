@@ -65,11 +65,11 @@ pub enum Inbound<'a> {
     /// Why an IPv4/UDP frame for this tape was refused (for `verbose`).
     Rejected(&'static str),
     /// A UDP datagram addressed to `port`: its source address and the UDP payload.
-    Udp { source: Ipv4Address, source_port: u16, payload: &'a [u8] },
+    Udp { source: Ipv4Address, source_port: u16, destination_port: u16, payload: &'a [u8] },
 }
 
 /// Handles ARP (answers requests for our address, learns replies) and returns UDP datagrams for `port`.
-pub fn inbound<'a>(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpCache<8>, frame: &'a [u8], port: u16, now: u32) -> Inbound<'a> {
+pub fn inbound<'a>(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpCache<8>, frame: &'a [u8], ports: core::ops::RangeInclusive<u16>, now: u32) -> Inbound<'a> {
     let Ok(ethernet) = EthernetFrame::parse(frame) else { return Inbound::Nothing };
     match ethernet.ethertype {
         ETHERTYPE_ARP => {
@@ -99,10 +99,10 @@ pub fn inbound<'a>(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpC
                 Ok(datagram) => datagram,
                 Err(_) => return Inbound::Rejected("bad UDP length or checksum"),
             };
-            if datagram.destination_port != port {
+            if !ports.contains(&datagram.destination_port) {
                 return Inbound::Nothing;
             }
-            Inbound::Udp { source: packet.header.source, source_port: datagram.source_port, payload: datagram.payload }
+            Inbound::Udp { source: packet.header.source, source_port: datagram.source_port, destination_port: datagram.destination_port, payload: datagram.payload }
         }
         _ => Inbound::Nothing,
     }
@@ -143,7 +143,7 @@ pub fn resolve(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpCache
             tape_rt::idle();
             continue;
         }
-        let _ = inbound(api, nic, config, arp, &frame[..length], 0, 0);
+        let _ = inbound(api, nic, config, arp, &frame[..length], 0..=0, 0);
         if let Some(mac) = arp.lookup(next_hop, 0) {
             return Some(mac);
         }

@@ -119,6 +119,39 @@ impl Decoder {
     }
 }
 
+impl Decoder {
+    /// Packet-loss concealment: asks libopus to synthesise `frame_size` frames per channel for a packet that never
+    /// arrived (it extrapolates from the last good audio).
+    pub fn conceal(&mut self, pcm: &mut [i16], frame_size: usize) -> Result<usize> {
+        if pcm.len() < frame_size * self.channels as usize {
+            return Err(OpusError::OutputTooSmall);
+        }
+        let n = unsafe { opus_decode(self.state, core::ptr::null(), 0, pcm.as_mut_ptr(), frame_size as i32, 0) };
+        if n < 0 { Err(OpusError::from_code(n)) } else { Ok(n as usize) }
+    }
+}
+
+/// Samples per channel (at 48 kHz) a packet decodes to, read from its first byte (the TOC, RFC 6716 section 3.1):
+/// the configuration number gives the frame duration, the code says how many frames the packet holds. `None` for
+/// an empty or malformed packet.
+pub fn packet_samples(packet: &[u8]) -> Option<usize> {
+    let toc = *packet.first()?;
+    let config = usize::from(toc >> 3);
+    // Frame duration in 48 kHz samples: SILK-only 10/20/40/60 ms (configs 0-11), hybrid 10/20 ms (12-15),
+    // CELT-only 2.5/5/10/20 ms (16-31).
+    let frame = match config {
+        0..=11 => [480, 960, 1920, 2880][config % 4],
+        12..=15 => [480, 960][config % 2],
+        _ => [120, 240, 480, 960][config % 4],
+    };
+    let frames = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => usize::from(*packet.get(1)? & 0x3f),
+    };
+    (frames != 0).then_some(frame * frames)
+}
+
 impl Drop for Decoder {
     fn drop(&mut self) {
         (api().free)(self.state as usize, self.state_len);

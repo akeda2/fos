@@ -440,6 +440,49 @@ pub fn write_sdp(sdp: &Sdp, out: &mut [u8]) -> usize {
     cursor.length
 }
 
+/// An SDP for an Opus session: one RTP stream per stereo pair (and one mono stream for an odd channel), on
+/// consecutive UDP ports `port`, `port + 2`, ... (RFC 7587 `opus/48000/2`; `stereo=1` and `sprop-stereo=1` say the
+/// stream is stereo, and a mono last stream says `0`).
+pub struct SdpOpus {
+    pub origin: [u8; 4],
+    pub destination: [u8; 4],
+    pub port: u16,
+    pub payload_type: u8,
+    pub channels: usize,
+    /// Milliseconds of audio per packet (the Opus frame size), times ten (25 for 2.5 ms).
+    pub packet_ms_x10: u32,
+    pub session: u32,
+}
+
+pub fn write_sdp_opus(sdp: &SdpOpus, out: &mut [u8]) -> usize {
+    use core::fmt::Write;
+    let mut cursor = Cursor { bytes: out, length: 0 };
+    let (a, d) = (sdp.origin, sdp.destination);
+    let _ = write!(cursor, "v=0\r\no=- {0} {0} IN IP4 {1}.{2}.{3}.{4}\r\ns=fos audio-net (Opus)\r\n", sdp.session, a[0], a[1], a[2], a[3]);
+    let _ = write!(cursor, "c=IN IP4 {}.{}.{}.{}", d[0], d[1], d[2], d[3]);
+    if is_multicast(d) {
+        let _ = write!(cursor, "/32");
+    }
+    let _ = write!(cursor, "\r\nt=0 0\r\n");
+    let streams = sdp.channels.div_ceil(2);
+    for stream in 0..streams {
+        let stereo = !(stream == streams - 1 && sdp.channels % 2 == 1);
+        let _ = write!(cursor, "m=audio {} RTP/AVP {}\r\n", sdp.port as usize + 2 * stream, sdp.payload_type);
+        let _ = write!(cursor, "a=rtpmap:{0} opus/48000/2\r\na=fmtp:{0} stereo={1};sprop-stereo={1};maxplaybackrate=48000\r\n", sdp.payload_type, u8::from(stereo));
+        if sdp.packet_ms_x10 % 10 == 0 {
+            let _ = write!(cursor, "a=ptime:{}\r\n", sdp.packet_ms_x10 / 10);
+        } else {
+            let _ = write!(cursor, "a=ptime:{}.{}\r\n", sdp.packet_ms_x10 / 10, sdp.packet_ms_x10 % 10);
+        }
+    }
+    cursor.length
+}
+
+/// The 16-bit value of a device-format slot (`slot` little-endian bytes, left-justified): its top 16 bits.
+pub fn device_sample_16(slot_bytes: &[u8]) -> i16 {
+    (device_sample(slot_bytes) >> 16) as i16
+}
+
 /// The Ethernet destination for an IPv4 multicast address: 01:00:5e plus the low 23 bits (RFC 1112).
 pub fn multicast_mac(address: [u8; 4]) -> [u8; 6] {
     [0x01, 0x00, 0x5e, address[1] & 0x7f, address[2], address[3]]
@@ -671,6 +714,26 @@ mod tests {
         let mut device = [0u8; 6];
         frames_to_device(&frames, 2, 1, &[Some(0), Some(1)], 3, 2, &mut device);
         assert_eq!(device, [0x56, 0x34, 0x12, 0xfe, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn opus_sdp_has_a_media_line_per_pair() {
+        let sdp = SdpOpus { origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 5004, payload_type: 96, channels: 5, packet_ms_x10: 100, session: 3 };
+        let mut out = [0u8; 1024];
+        let length = write_sdp_opus(&sdp, &mut out);
+        let text = core::str::from_utf8(&out[..length]).unwrap();
+        assert_eq!(text.matches("m=audio").count(), 3, "5 channels: two stereo streams and a mono one");
+        assert!(text.contains("m=audio 5004 RTP/AVP 96") && text.contains("m=audio 5006 RTP/AVP 96") && text.contains("m=audio 5008 RTP/AVP 96"));
+        assert!(text.contains("a=rtpmap:96 opus/48000/2"));
+        assert!(text.contains("stereo=0;sprop-stereo=0"), "the last, odd channel is a mono stream");
+        assert!(text.contains("a=ptime:10\r\n"));
+    }
+
+    #[test]
+    fn device_sample_to_16_bits() {
+        assert_eq!(device_sample_16(&[0x00, 0x34, 0x12]), 0x1234); // 24-bit: the top two bytes
+        assert_eq!(device_sample_16(&[0xff, 0x7f]), 0x7fff); // 16-bit slot unchanged
+        assert_eq!(device_sample_16(&[0x00, 0x00, 0x80]), -0x8000);
     }
 
     #[test]

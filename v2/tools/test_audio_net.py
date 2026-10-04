@@ -134,7 +134,7 @@ def main():
             for guest in (receiver, sender):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            for run in ("a", "b", "c"):
+            for run in ("a", "b", "c", "d", "e"):
                 if run == "a":
                     # Stereo 24-bit, 440 Hz, 3 seconds, to everyone.
                     mark = receiver.send("run audio-net recv")
@@ -155,6 +155,41 @@ def main():
                     thread.join()
                     sdp = sender.text()[mark:]
                     check("a=rtpmap:96 L24/48000/2" in sdp and "a=ptime:1" in sdp and "m=audio 5004 RTP/AVP 96" in sdp, "the sender prints an AES67-style SDP (L24/48000/2, ptime 1)", sdp[:600])
+                elif run == "d":
+                    # Opus over RTP: stereo 770 Hz, 20 ms frames, 96 kbit/s.
+                    mark = receiver.send("run audio-net recv proto=rtp codec=opus ip=192.168.50.2/24 chan=2")
+                    receiver.wait_for("Listening on NIC 1 for Opus/RTP", 30, mark)
+                    receiver.pump(3.0)
+                    captured = []
+                    thread = threading.Thread(target=sniff, args=(4.0, captured))
+                    thread.start()
+                    mark = sender.send("run audio-net send proto=rtp codec=opus bitrate=96 ip=192.168.50.1/24 to=192.168.50.2 src=tone=770 secs=3")
+                    sender.wait_for("Sent ", 60, mark)
+                    thread.join()
+                    sdp = sender.text()[mark:]
+                    check("a=rtpmap:96 opus/48000/2" in sdp and "a=ptime:20" in sdp, "the Opus sender prints an SDP with opus/48000/2 and ptime 20", sdp[:600])
+                    rtp = check_rtp(captured)
+                    check(len(rtp) >= 140, f"the sniffer saw {len(rtp)} Opus packets (about 150 expected)", "")
+                    check(all(p[5] < 400 for p in rtp), "each far smaller than the 3840 bytes of the PCM it carries", str(max(p[5] for p in rtp)))
+                    stamps = {(b[3] - a[3]) & 0xFFFFFFFF for a, b in zip(rtp, rtp[1:])}
+                    check(stamps == {960}, "timestamps step by 960 (20 ms at 48 kHz)", str(stamps))
+                elif run == "e":
+                    # Three channels as two Opus streams (a pair and a mono one) to a multicast group: ports 5004 and 5006.
+                    captured = []
+                    thread = threading.Thread(target=sniff, args=(3.0, captured))
+                    thread.start()
+                    mark = sender.send("run audio-net send proto=rtp codec=opus ch=1-3 frame=10 ip=192.168.50.1/24 to=239.1.2.3 src=tone=500 secs=2")
+                    sender.wait_for("Sent ", 60, mark)
+                    thread.join()
+                    text = sender.text()[mark:]
+                    check("2 Opus stream(s)" in text and "m=audio 5006 RTP/AVP 96" in text, "three channels become two streams, the second on port 5006", text[:700])
+                    rtp = check_rtp(captured)
+                    streams = {p[4] for p in rtp}
+                    check(len(streams) == 2, f"two SSRCs on the wire ({len(rtp)} packets)", "")
+                    by_stream = {s: [p for p in rtp if p[4] == s] for s in streams}
+                    stamp_sets = [{p[3] for p in v} for v in by_stream.values()]
+                    check(stamp_sets[0] == stamp_sets[1], "both streams carry the same timestamps, so a receiver can line them up", "")
+                    continue
                 else:
                     # Mono 16-bit, 880 Hz, to the receiver's MAC, after the receiver has been restarted.
                     mark = receiver.send("run audio-net recv from=52:54:00:12:34:b1 target=8")
@@ -162,6 +197,8 @@ def main():
                     receiver.pump(3.0)
                     mark = sender.send("run audio-net send src=tone=880 ch=1 bits=16 to=52:54:00:12:34:b2 secs=3")
                     sender.wait_for("Sent ", 60, mark)
+                if run == "e":
+                    continue
                 receiver.pump(1.0)
                 mark = len(receiver.text())
                 receiver.process.stdin.write(b"\x1b")  # Escape: stop the tape
@@ -170,15 +207,17 @@ def main():
                 receiver.wait_for("fos> ", 30, mark)
                 report = receiver.text()[mark - 200:]
                 locked = report.split("Locked onto a stream:")[-1].split("\n")[0]
-                if run == "c":
+                if run == "d":
+                    check("Opus packets" in report, "the receiver decodes the Opus stream", report)
+                elif run == "c":
                     check("2 channel(s), 24-bit, 48000 Hz, from 192.168.50.1" in locked, "the receiver locks onto the RTP stream from the sender's IP address", locked)
                 elif run == "a":
                     check("2 channel(s), 24-bit, 48000 Hz" in locked, "the receiver locks onto a stereo 24-bit 48 kHz stream", locked)
                 else:
                     check("1 channel(s), 16-bit, 48000 Hz" in locked, "and onto a mono 16-bit one, from a chosen sender", locked)
-                packets = int(report.split("Received ")[-1].split(" packets")[0])
-                lost = int(report.split(" packets: ")[-1].split(" lost")[0])
-                check(packets >= 2900, f"it received {packets} packets (about 3000 expected)", report)
+                packets = int(report.split("Received ")[-1].split(" ")[0])
+                lost = int(report.split(" packets: ")[-1].split(" lost")[0]) if run != "d" else int(report.split("packets: ")[-1].split(" lost")[0])
+                check(packets >= (140 if run == "d" else 2900), f"it received {packets} packets", report)
                 check(lost <= 5, f"with {lost} lost", report)
                 if run == "c":
                     rtp = check_rtp(captured)
@@ -195,15 +234,21 @@ def main():
             rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
             samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
         loud = [i for i, value in enumerate(samples) if abs(value) > 500]
-        check(len(loud) > 7 * rate, f"the recording holds sound ({len(loud) / rate:.1f} s of it)", "")
-        first = samples[loud[0]:loud[0] + rate]
-        middle_at = (loud[0] + loud[-1]) // 2
-        middle = samples[middle_at - rate // 2:middle_at + rate // 2]
-        last = samples[loud[-1] - rate:loud[-1]]
-        f1, f2, f3 = (tone_frequency(samples, rate, part) for part in (first, middle, last))
-        check(abs(f1 - 440) < 20, f"the first tone (raw, stereo 24-bit) is {f1:.0f} Hz (wanted 440)", "")
-        check(abs(f2 - 880) < 30, f"the second (raw, mono 16-bit, converted) is {f2:.0f} Hz (wanted 880)", "")
-        check(abs(f3 - 660) < 25, f"the third (RTP/UDP, stereo 24-bit) is {f3:.0f} Hz (wanted 660)", "")
+        check(len(loud) > 10 * rate, f"the recording holds sound ({len(loud) / rate:.1f} s of it)", "")
+        # Split into the separate tones at silences longer than half a second; measure each one's middle second.
+        segments, begin = [], loud[0]
+        for before, after in zip(loud, loud[1:]):
+            if after - before > rate // 2:
+                segments.append((begin, before))
+                begin = after
+        segments.append((begin, loud[-1]))
+        segments = [seg for seg in segments if seg[1] - seg[0] > rate]
+        wanted = [("raw, stereo 24-bit", 440, 20), ("raw, mono 16-bit, converted", 880, 30), ("RTP/UDP, stereo 24-bit", 660, 25), ("Opus/RTP", 770, 30)]
+        check(len(segments) == 4, f"the recording holds {len(segments)} separate tones (wanted 4)", str(segments))
+        for (name, frequency, tolerance), (start, end) in zip(wanted, segments):
+            middle = (start + end) // 2
+            measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])
+            check(abs(measured - frequency) < tolerance, f"the {name} tone is {measured:.0f} Hz (wanted {frequency})", "")
     dhcp_test()
     print("v2 audio-net: all checks passed")
 

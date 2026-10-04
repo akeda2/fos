@@ -333,7 +333,16 @@ firmware, so a pending slot is tried on the next boot.
   -400 ppm gave +64 and -737 ppm, a difference of 801), again with nothing dropped. A caution: console output
   is slow (about 10 ms a line over serial), so any per-packet or per-loss message makes a receiver lose the next
   packets; `verbose` therefore prints only a few gap lines and one status line per 10 s.
-  Plan: C Opus (the tape target can enable SSE/FPU, so libopus's float build is an option), E multicast/IGMP,
+  **Stage C, Opus:** `codec=opus` (with `proto=rtp`, 48 kHz) sends and receives Opus (RFC 7587, `opus/48000/2`) from the
+  vendored fixed-point libopus (`build.rs` links `build/v2/opus-fixed/libopus_fixed.a`). One RTP stream per stereo
+  pair (an odd last channel is a mono stream) on UDP ports `port`, `port+2`, ..., each with its own SSRC and the
+  same RTP timestamps; `send` prints an SDP with one media line per stream. Options: `bitrate=` (kbit/s per pair,
+  default 128), `frame=` (2.5, 5, 10, 20, 40, 60 ms; default 20), `complexity=` (0-10, default 5). The receiver
+  decodes every stream, conceals a short gap with libopus's own loss concealment, writes the decoded frames on
+  a shared timeline at their RTP timestamps (so pairs stay aligned), and plays the frames all streams have reached
+  through the same resampler and servo. QEMU test: a stereo 770 Hz tone (150 packets, 0 lost, measured 765 Hz,
+  timestamp step 960) and three channels as two multicast streams with equal timestamps.
+  Plan: E multicast/IGMP,
   alternate-setting choice and duplex, AVTP (AVB) raw mode. (Dante itself is proprietary; AES67 mode is the open
   way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload

@@ -36,6 +36,7 @@
 #![no_main]
 
 mod net;
+mod opus;
 
 use audio_wire::{ChannelSet, ETHERNET_HEADER, ETHERTYPE, Fill, HEADER_LEN, Header, MAX_RAW_PAYLOAD, MAX_RTP_PAYLOAD, Resampler, Sdp, Servo, Slip, frames_per_packet, frames_to_device, pack, unpack, wire_to_frames, write_sdp};
 use net::{Inbound, NetConfig};
@@ -52,7 +53,7 @@ enum Proto {
     Rtp,
 }
 
-struct Options<'a> {
+pub struct Options<'a> {
     proto: Proto,
     nic: usize,
     to: &'a str,
@@ -73,6 +74,13 @@ struct Options<'a> {
     resample: bool,
     /// Test aid for `send src=tone`: run the sender's clock this many ppm fast (negative: slow).
     skew_ppm: i64,
+    /// `codec=opus`: PCM (default) or Opus over RTP.
+    opus: bool,
+    /// Opus bit rate per stereo pair, bits/s.
+    bitrate: u32,
+    /// Opus frame time in tenths of a millisecond (200 = 20 ms).
+    frame_x10: u32,
+    complexity: u32,
 }
 
 fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -88,6 +96,7 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -113,6 +122,10 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
             "pt" => options.payload_type = value.parse().ok().filter(|&p| p < 128).ok_or("pt= is 0 to 127")?,
             "drift" => options.resample = match value { "resample" => true, "slip" => false, _ => return Err("drift= is resample or slip") },
             "skew" => options.skew_ppm = value.parse().map_err(|_| "skew= needs a number of ppm")?,
+            "codec" => options.opus = match value { "pcm" => false, "opus" => true, _ => return Err("codec= is pcm or opus") },
+            "bitrate" => options.bitrate = value.parse::<u32>().ok().filter(|&b| (6..=512).contains(&b)).ok_or("bitrate= is kbit/s per stereo pair, 6 to 512")? * 1000,
+            "frame" => options.frame_x10 = match value.split_once('.') { Some((whole, tenth)) => whole.parse::<u32>().ok().zip(tenth.parse::<u32>().ok()).map(|(w, t)| w * 10 + t), None => value.parse::<u32>().ok().map(|w| w * 10) }.ok_or("frame= is milliseconds")?,
+            "complexity" => options.complexity = value.parse().ok().filter(|&c| c <= 10).ok_or("complexity= is 0 to 10")?,
             "verbose" => options.verbose = true,
             _ => return Err("unknown option"),
         }
@@ -121,14 +134,14 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
 }
 
 /// A parabola per half cycle standing in for a sine (integer only): a quarter of full scale, 16 bits.
-fn tone_sample(phase: u32) -> i32 {
+pub fn tone_sample(phase: u32) -> i32 {
     let half = i64::from(phase & 0x7fff);
     let magnitude = (half * (0x8000 - half)) >> 13;
     (if phase & 0x8000 != 0 { -magnitude } else { magnitude } / 4) as i32
 }
 
 /// Everything the network side needs: raw needs only a MAC; RTP a full IPv4 configuration.
-struct Transport {
+pub struct Transport {
     proto: Proto,
     mac: [u8; 6],
     config: NetConfig,
@@ -138,7 +151,7 @@ struct Transport {
 }
 
 impl Transport {
-    fn open(api: &TapeApi, options: &Options) -> Option<Transport> {
+    pub fn open(api: &TapeApi, options: &Options) -> Option<Transport> {
         let mut mac = [0u8; 6];
         (api.nic_mac)(options.nic, mac.as_mut_ptr());
         let mut config = NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) };
@@ -341,7 +354,7 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
         }
         Proto::Rtp => {
             let now = (api.ticks)() as u32;
-            let (source, payload) = match net::inbound(api, options.nic, &transport.config, &mut transport.arp, frame, transport.port, now) {
+            let (source, payload) = match net::inbound(api, options.nic, &transport.config, &mut transport.arp, frame, transport.port..=transport.port, now) {
                 Inbound::Udp { source, payload, .. } => (source, payload),
                 Inbound::Rejected(reason) => {
                     if options.verbose {
@@ -597,6 +610,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return println!("audio-net: this machine has no NIC {}.", options.nic + 1);
     }
     match mode {
+        "send" | "recv" if options.opus && options.proto != Proto::Rtp => println!("audio-net: codec=opus needs proto=rtp."),
+        "send" if options.opus => opus::send(api, &options),
+        "recv" if options.opus => opus::receive(api, &options),
         "send" => send(api, &options),
         "recv" => receive(api, &options),
         _ => println!("Usage: tape run audio-net send|recv [proto=raw|rtp] [options]   (see the tape's header for the options)"),

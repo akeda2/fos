@@ -7,6 +7,7 @@ edition = "2024"
 tape-rt = { path = "../tape-rt" }
 audio-wire = { path = "../audio-wire" }
 tape-net = { path = "../../../tapes/tape-net" }
+opus-codec = { path = "../opus-codec" }
 
 [profile.release]
 panic = "abort"
