@@ -436,6 +436,11 @@ pub fn clear_frame_queue() {
 
 /// Everything a tape callback must keep serviced: USB keyboards, local keys, the
 /// network (terminal frames handled, the rest queued per interface), console output out.
+/// Drains whatever a running tape's loop must keep draining (input, the network, USB events).
+pub fn tape_poll() {
+    tape_service();
+}
+
 fn tape_service() {
     crate::debug::pet();
     crate::usb_hid::poll();

@@ -269,9 +269,14 @@ firmware, so a pending slot is tried on the next boot.
   `usb-audio` and checks the WAV it records (439 Hz for 440). Confirmed on a Zoom H6 in multichannel mode on
   the Skylake (class 2.0, high speed, rates 44.1/48/88.2/96 kHz): capture of 6 channels 24-bit at 48 kHz gave
   47,984-48,016 frames/s with no errors, playback of 2 channels 24-bit streamed 8,000 packets/s with no errors.
+  Tapes reach it through six appended `TapeApi` callbacks (`audio_info`, `audio_start`, `audio_stop`,
+  `audio_read`, `audio_write`, `audio_stats`; `audio_read/write` also drain the USB events, and the kernel stops
+  any stream a tape leaves running): `record NAME [SECONDS] [RATE]` captures every input channel into RAM and
+  writes NAME.wav (hardware only: QEMU's `usb-audio` has no input), `play NAME.wav` streams a PCM WAV file,
+  converting width and channel count (tested in QEMU: 16-bit stereo and 24-bit mono files, 439/879 Hz measured).
   Not done: the asynchronous feedback endpoint (the device's real clock; playback runs at the nominal rate),
-  the tape-facing `audio_*` ABI, capture/playback together, PCM format conversion, interrupt-driven event
-  handling (events are handled whenever the xHCI ring is drained, from tape/shell loops).
+  capture and playback together, interrupt-driven event handling (events are handled whenever the xHCI ring is
+  drained, from tape/shell loops).
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

@@ -235,6 +235,27 @@ extern "C" fn api_nic_send(index: usize, frame: *const u8, length: usize) -> u32
 extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) -> usize {
     term::tape_receive(index, unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
 }
+extern "C" fn api_audio_info(out: *mut fos_v2_abi::tape::AudioInfo) -> u32 {
+    u32::from(crate::usb_audio::fill_info(unsafe { &mut *out }))
+}
+extern "C" fn api_audio_start(rate: u32, capture: u32, playback: u32) -> i32 {
+    crate::usb_audio::start_for_tape(rate, capture != 0, playback != 0)
+}
+extern "C" fn api_audio_stop() {
+    crate::usb_audio::stop_for_tape();
+}
+extern "C" fn api_audio_read(buffer: *mut u8, length: usize) -> usize {
+    term::tape_poll(); // drains the xHCI event ring, which is what moves audio
+    crate::usb_audio::read(unsafe { core::slice::from_raw_parts_mut(buffer, length) })
+}
+extern "C" fn api_audio_write(data: *const u8, length: usize) -> usize {
+    term::tape_poll();
+    crate::usb_audio::write(unsafe { core::slice::from_raw_parts(data, length) })
+}
+extern "C" fn api_audio_stats(out: *mut fos_v2_abi::tape::AudioStats) {
+    crate::usb_audio::fill_stats(unsafe { &mut *out });
+}
+
 extern "C" fn api_nic_max_frame_len() -> usize {
     1514
 }
@@ -275,6 +296,12 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         free_pages: api_free_pages,
         fs_remove: api_fs_remove,
         nic_set_promiscuous: api_nic_set_promiscuous,
+        audio_info: api_audio_info,
+        audio_start: api_audio_start,
+        audio_stop: api_audio_stop,
+        audio_read: api_audio_read,
+        audio_write: api_audio_write,
+        audio_stats: api_audio_stats,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
@@ -295,6 +322,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         );
     }
     crate::debug::set_tape_running(false);
+    crate::usb_audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an isochronous stream running
     term::set_tape_mode(false);
     memory::free(stack, STACK_BYTES / memory::FRAME);
     crate::println!("Tape returned; back at the fos shell.");

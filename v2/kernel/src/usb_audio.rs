@@ -592,3 +592,70 @@ pub fn playback_format() -> Option<(u8, u8)> {
 pub fn playback_space() -> usize {
     audio().and_then(|device| device.playback.as_ref()).map_or(0, |stream| stream.ring.space())
 }
+
+/// Fills the tape ABI's `AudioInfo`; false if there is no audio device.
+pub fn fill_info(info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
+    let Some(device) = audio() else { return false };
+    let mut out = fos_v2_abi::tape::AudioInfo::default();
+    out.class_version = u32::from(device.description.class_version.max(1));
+    if let Some(alt) = find_alt(&device.description, false) {
+        out.playback_channels = u32::from(alt.channels);
+        out.playback_slot_bytes = u32::from(alt.subslot_bytes);
+        out.playback_bits = u32::from(alt.bits);
+    }
+    if let Some(alt) = find_alt(&device.description, true) {
+        out.capture_channels = u32::from(alt.channels);
+        out.capture_slot_bytes = u32::from(alt.subslot_bytes);
+        out.capture_bits = u32::from(alt.bits);
+    }
+    out.rate_count = device.rate_count as u32;
+    out.rates[..device.rate_count].copy_from_slice(&device.rates[..device.rate_count]);
+    if let Some(stream) = &device.capture {
+        out.capture_rate = stream.rate;
+        out.capture_available = stream.ring.available() as u32;
+    }
+    if let Some(stream) = &device.playback {
+        out.playback_rate = stream.rate;
+        out.playback_space = stream.ring.space() as u32;
+    }
+    *info = out;
+    true
+}
+
+pub fn fill_stats(stats: &mut fos_v2_abi::tape::AudioStats) {
+    let mut out = fos_v2_abi::tape::AudioStats::default();
+    if let Some(device) = audio() {
+        if let Some(stream) = &device.capture {
+            out.capture_packets = stream.packets;
+            out.capture_bytes = stream.bytes;
+            out.capture_errors = stream.errors;
+            out.capture_overruns = stream.ring.overruns;
+        }
+        if let Some(stream) = &device.playback {
+            out.playback_packets = stream.packets;
+            out.playback_errors = stream.errors;
+            out.playback_underruns = stream.underruns;
+        }
+    }
+    *stats = out;
+}
+
+/// Starts streams for a tape; the result is an `AUDIO_*` code or 0.
+pub fn start_for_tape(rate: u32, capture: bool, playback: bool) -> i32 {
+    use fos_v2_abi::tape::*;
+    let Some(controller) = controller() else { return AUDIO_NO_DEVICE };
+    match start(controller, rate, capture, playback) {
+        Ok(()) => 0,
+        Err("no USB audio device") => AUDIO_NO_DEVICE,
+        Err("already running") => AUDIO_BUSY,
+        Err("the device does not offer that sample rate") => AUDIO_BAD_RATE,
+        Err("the device has no capture stream") | Err("the device has no playback stream") => AUDIO_NO_DIRECTION,
+        Err(_) => AUDIO_FAILED,
+    }
+}
+
+pub fn stop_for_tape() {
+    if let Some(controller) = controller() {
+        stop(controller);
+    }
+}

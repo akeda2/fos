@@ -84,4 +84,64 @@ pub struct TapeApi {
     /// Promiscuous mode on/off for an interface (receive every frame); 1 on success.
     /// A tape that turns it on must turn it off before returning.
     pub nic_set_promiscuous: extern "C" fn(usize, u32) -> u32,
+    /// USB audio. Fills `AudioInfo` (what the attached audio device offers and what is running);
+    /// returns 1 if there is a device, 0 if not.
+    pub audio_info: extern "C" fn(*mut AudioInfo) -> u32,
+    /// Starts streams at `rate` Hz: capture and/or playback (non-zero = yes). 0 on success, or a
+    /// negative `AUDIO_*` code. A started stream keeps running until `audio_stop`.
+    pub audio_start: extern "C" fn(u32, u32, u32) -> i32,
+    /// Stops every running stream and releases its buffers.
+    pub audio_stop: extern "C" fn(),
+    /// Copies up to `len` bytes of captured audio (interleaved frames, the format `AudioInfo` says) into
+    /// the buffer; returns how many bytes it had. Never blocks; call it from the tape's loop, which is
+    /// also what lets the kernel service the device's isochronous transfers.
+    pub audio_read: extern "C" fn(*mut u8, usize) -> usize,
+    /// Queues up to `len` bytes of playback audio (interleaved frames); returns how many fitted in the
+    /// kernel's ring. A short return means "full: come back later".
+    pub audio_write: extern "C" fn(*const u8, usize) -> usize,
+    /// Fills `AudioStats` with the counters of the running streams.
+    pub audio_stats: extern "C" fn(*mut AudioStats),
 }
+
+/// What `audio_info` reports. Slot bytes: how many bytes each sample takes in the stream (a 24-bit
+/// sample usually travels in 3 bytes, little-endian, signed).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AudioInfo {
+    pub class_version: u32,
+    pub playback_channels: u32,
+    pub playback_slot_bytes: u32,
+    pub playback_bits: u32,
+    pub capture_channels: u32,
+    pub capture_slot_bytes: u32,
+    pub capture_bits: u32,
+    pub rate_count: u32,
+    pub rates: [u32; 8],
+    /// Non-zero while the stream runs: the sample rate it runs at.
+    pub capture_rate: u32,
+    pub playback_rate: u32,
+    /// Bytes of room in the playback ring and bytes waiting in the capture ring.
+    pub playback_space: u32,
+    pub capture_available: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AudioStats {
+    pub capture_packets: u64,
+    pub capture_bytes: u64,
+    pub capture_errors: u64,
+    /// Captured bytes dropped because the tape did not read them in time.
+    pub capture_overruns: u64,
+    pub playback_packets: u64,
+    pub playback_errors: u64,
+    /// Packets sent as silence because the tape had not written audio in time.
+    pub playback_underruns: u64,
+}
+
+/// `audio_start` errors (negative).
+pub const AUDIO_NO_DEVICE: i32 = -1;
+pub const AUDIO_BAD_RATE: i32 = -2;
+pub const AUDIO_BUSY: i32 = -3;
+pub const AUDIO_NO_DIRECTION: i32 = -4;
+pub const AUDIO_FAILED: i32 = -5;
