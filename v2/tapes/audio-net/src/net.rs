@@ -62,6 +62,8 @@ pub fn build_rtp_frame(out: &mut [u8], config: &NetConfig, destination_mac: MacA
 pub enum Inbound<'a> {
     /// Not for us, or handled here (an ARP exchange).
     Nothing,
+    /// Why an IPv4/UDP frame for this tape was refused (for `verbose`).
+    Rejected(&'static str),
     /// A UDP datagram addressed to `port`: its source address and the UDP payload.
     Udp { source: Ipv4Address, source_port: u16, payload: &'a [u8] },
 }
@@ -86,11 +88,17 @@ pub fn inbound<'a>(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpC
             Inbound::Nothing
         }
         ETHERTYPE_IPV4 => {
-            let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else { return Inbound::Nothing };
+            let packet = match Ipv4Packet::parse(ethernet.payload, true) {
+                Ok(packet) => packet,
+                Err(_) => return Inbound::Rejected("bad IPv4 header or checksum"),
+            };
             if packet.header.protocol != 17 {
                 return Inbound::Nothing;
             }
-            let Ok(datagram) = UdpDatagram::parse(packet.payload, true, packet.header.source, packet.header.destination) else { return Inbound::Nothing };
+            let datagram = match UdpDatagram::parse(packet.payload, true, packet.header.source, packet.header.destination) {
+                Ok(datagram) => datagram,
+                Err(_) => return Inbound::Rejected("bad UDP length or checksum"),
+            };
             if datagram.destination_port != port {
                 return Inbound::Nothing;
             }

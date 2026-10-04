@@ -331,8 +331,25 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
         }
         Proto::Rtp => {
             let now = (api.ticks)() as u32;
-            let Inbound::Udp { source, payload, .. } = net::inbound(api, options.nic, &transport.config, &mut transport.arp, frame, transport.port, now) else { return None };
-            let rtp = RtpPacket::parse(payload).ok()?;
+            let (source, payload) = match net::inbound(api, options.nic, &transport.config, &mut transport.arp, frame, transport.port, now) {
+                Inbound::Udp { source, payload, .. } => (source, payload),
+                Inbound::Rejected(reason) => {
+                    if options.verbose {
+                        println!(" [dropped a {}-byte frame: {reason}]", frame.len());
+                    }
+                    return None;
+                }
+                _ => return None,
+            };
+            let rtp = match RtpPacket::parse(payload) {
+                Ok(rtp) => rtp,
+                Err(_) => {
+                    if options.verbose {
+                        println!(" [dropped a {}-byte UDP payload: not RTP]", payload.len());
+                    }
+                    return None;
+                }
+            };
             let frame_bytes = options.chan * options.bits / 8;
             let frames = rtp.payload.len() / frame_bytes;
             if frames == 0 {
