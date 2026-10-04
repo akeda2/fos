@@ -252,6 +252,68 @@ impl Volume {
         Ok(())
     }
 
+    /// Reserves a file for streaming: one contiguous extent of `max_bytes` (the largest free extent when 0), with
+    /// a directory entry of length 0 that `write_extent` grows. Replaces an existing file of that name. Returns the
+    /// entry and the reserved capacity in bytes. Nothing is written to the extent, so the old contents show through
+    /// until they are overwritten; that is why the length stays 0 until data has really been written.
+    pub fn reserve(&self, name: &[u8], max_bytes: u64) -> Result<(Entry, u64), Error> {
+        if !valid_name(name) {
+            return Err(Error::InvalidName);
+        }
+        let existing = self.find(name)?;
+        let slot = match &existing {
+            Some(entry) => (entry.directory_lba, entry.index),
+            None => self.free_slot()?.ok_or(Error::DirectoryFull)?,
+        };
+        let (start, count) = if max_bytes == 0 {
+            self.largest_free_extent(existing.as_ref())?.ok_or(Error::DataFull)?
+        } else {
+            let count = max_bytes.div_ceil(512);
+            (self.free_extent(count, existing.as_ref())?.ok_or(Error::DataFull)?, count)
+        };
+        let mut directory = self.read_sector(slot.0)?;
+        let at = slot.1 * ENTRY_SIZE;
+        directory[at..at + ENTRY_SIZE].fill(0);
+        directory[at] = 1;
+        directory[at + 1] = name.len() as u8;
+        directory[at + 4..at + 12].copy_from_slice(&start.to_le_bytes());
+        directory[at + 20..at + 28].copy_from_slice(&count.to_le_bytes());
+        directory[at + 28..at + 28 + name.len()].copy_from_slice(name);
+        block::write(self.disk, self.base + slot.0, &directory)?;
+        let mut entry = Entry { directory_lba: slot.0, index: slot.1, start, length: 0, sector_count: count, name: [0; MAX_NAME], name_length: name.len() };
+        entry.name[..name.len()].copy_from_slice(name);
+        Ok((entry, count * 512))
+    }
+
+    /// Writes `data` into a reserved file at byte `offset` (a multiple of 512; a final partial sector is padded) and,
+    /// when `file_length` is non-zero, records it as the file's length. The data goes first and the length last, so a
+    /// reset keeps everything up to the previous length.
+    pub fn write_extent(&self, entry: &Entry, offset: u64, data: &[u8], file_length: u64) -> Result<(), Error> {
+        if offset % 512 != 0 || offset + data.len() as u64 > entry.sector_count * 512 {
+            return Err(Error::TooBig);
+        }
+        self.write_data(entry.start + offset / 512, data)?;
+        if file_length != 0 {
+            let mut directory = self.read_sector(entry.directory_lba)?;
+            let at = entry.index * ENTRY_SIZE;
+            directory[at + 12..at + 20].copy_from_slice(&file_length.to_le_bytes());
+            block::write(self.disk, self.base + entry.directory_lba, &directory)?;
+        }
+        Ok(())
+    }
+
+    /// Ends a streamed file: records its final length and gives the unused part of the reservation back, so the
+    /// space a take reserved but did not fill is free again.
+    pub fn trim_extent(&self, entry: &Entry, file_length: u64) -> Result<(), Error> {
+        let sectors = file_length.div_ceil(512).min(entry.sector_count);
+        let mut directory = self.read_sector(entry.directory_lba)?;
+        let at = entry.index * ENTRY_SIZE;
+        directory[at + 12..at + 20].copy_from_slice(&file_length.to_le_bytes());
+        directory[at + 20..at + 28].copy_from_slice(&sectors.to_le_bytes());
+        block::write(self.disk, self.base + entry.directory_lba, &directory)?;
+        Ok(())
+    }
+
     pub fn remove(&self, name: &[u8]) -> Result<bool, Error> {
         let Some(entry) = self.find(name)? else { return Ok(false) };
         let mut directory = self.read_sector(entry.directory_lba)?;
@@ -281,6 +343,34 @@ impl Volume {
             }
         }
         Ok(None)
+    }
+
+    /// The largest run of free sectors (start, count), ignoring the extent of `replacing`.
+    fn largest_free_extent(&self, replacing: Option<&Entry>) -> Result<Option<(u64, u64)>, Error> {
+        let mut extents = [(0u64, 0u64); MAX_ENTRIES];
+        let mut used = 0;
+        self.for_each(|entry| {
+            if replacing.is_some_and(|r| r.directory_lba == entry.directory_lba && r.index == entry.index) {
+                return;
+            }
+            if used < extents.len() {
+                extents[used] = (entry.start, entry.start + entry.sector_count);
+                used += 1;
+            }
+        })?;
+        let extents = &mut extents[..used];
+        extents.sort_unstable();
+        let (mut best, mut candidate) = ((0u64, 0u64), DATA_START);
+        for &(start, end) in extents.iter() {
+            if start > candidate && start - candidate > best.1 {
+                best = (candidate, start - candidate);
+            }
+            candidate = candidate.max(end);
+        }
+        if self.sectors > candidate && self.sectors - candidate > best.1 {
+            best = (candidate, self.sectors - candidate);
+        }
+        Ok((best.1 > 0).then_some(best))
     }
 
     /// First-fit search for `count` free sectors, ignoring the extent of `replacing`.

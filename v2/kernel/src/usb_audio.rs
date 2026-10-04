@@ -246,32 +246,36 @@ const WINDOW: usize = 192;
 const PLAYBACK_WINDOW_MS: u32 = 6;
 /// PCM ring size in bytes (about a second of 6-channel 24-bit audio at 48 kHz fits).
 const RING_BYTES: usize = 1 << 20;
+/// The capture ring is bigger: a recording to a USB stick can stall for seconds while the stick erases flash, and
+/// the ring is what rides that out (16 MiB is five seconds of 22 channels of 24-bit audio).
+const CAPTURE_RING_BYTES: usize = 16 << 20;
 const FEEDBACK_WINDOW: usize = 8;
 
 /// A byte FIFO between the foreground and the interrupt handler (one producer, one consumer).
 pub struct PcmRing {
     base: u64,
+    size: usize,
     head: AtomicUsize, // next byte to write (producer)
     tail: AtomicUsize, // next byte to read (consumer)
     overruns: AtomicU64,
 }
 
 impl PcmRing {
-    fn allocate() -> Option<PcmRing> {
-        Some(PcmRing { base: memory::allocate_contiguous((RING_BYTES / 4096) as u64, None)?, head: AtomicUsize::new(0), tail: AtomicUsize::new(0), overruns: AtomicU64::new(0) })
+    fn allocate(size: usize) -> Option<PcmRing> {
+        Some(PcmRing { base: memory::allocate_contiguous((size / 4096) as u64, None)?, size, head: AtomicUsize::new(0), tail: AtomicUsize::new(0), overruns: AtomicU64::new(0) })
     }
     pub fn available(&self) -> usize {
         self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire))
     }
     fn space(&self) -> usize {
-        RING_BYTES - self.available()
+        self.size - self.available()
     }
     /// Appends what fits; the rest is dropped and counted (the reader is too slow).
     fn push(&self, data: &[u8]) -> usize {
         let count = data.len().min(self.space());
         let head = self.head.load(Ordering::Relaxed);
         for (offset, &byte) in data[..count].iter().enumerate() {
-            unsafe { ((self.base as usize + (head + offset) % RING_BYTES) as *mut u8).write_volatile(byte) };
+            unsafe { ((self.base as usize + (head + offset) % self.size) as *mut u8).write_volatile(byte) };
         }
         self.head.store(head.wrapping_add(count), Ordering::Release);
         if count < data.len() {
@@ -283,14 +287,14 @@ impl PcmRing {
         let count = out.len().min(self.available());
         let tail = self.tail.load(Ordering::Relaxed);
         for (offset, slot) in out[..count].iter_mut().enumerate() {
-            *slot = unsafe { ((self.base as usize + (tail + offset) % RING_BYTES) as *const u8).read_volatile() };
+            *slot = unsafe { ((self.base as usize + (tail + offset) % self.size) as *const u8).read_volatile() };
         }
         self.tail.store(tail.wrapping_add(count), Ordering::Release);
         count
     }
     fn free(&self) {
         if self.base != 0 {
-            memory::free(self.base, (RING_BYTES / 4096) as u64);
+            memory::free(self.base, (self.size / 4096) as u64);
         }
     }
 }
@@ -456,7 +460,7 @@ fn build_stream(controller: &mut Controller, device: &Device, description: &Desc
     }
     let frames = ((WINDOW * usize::from(alt.max_packet)).div_ceil(4096)) as u64;
     let buffers = memory::allocate_contiguous(frames, Some(1 << 32)).ok_or("no memory for the packet buffers")?;
-    let Some(pcm) = PcmRing::allocate() else {
+    let Some(pcm) = PcmRing::allocate(if capture { CAPTURE_RING_BYTES } else { RING_BYTES }) else {
         memory::free(buffers, frames);
         return Err("no memory for the PCM ring");
     };

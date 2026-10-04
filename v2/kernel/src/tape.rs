@@ -198,6 +198,39 @@ extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8,
         Err(_) => FS_ERROR,
     }
 }
+/// The file a tape is streaming into (`fs_stream_open`): its volume and reserved entry.
+static mut STREAM: Option<(crate::fosfs::Volume, crate::fosfs::Entry)> = None;
+
+extern "C" fn api_fs_stream_open(name: *const u8, name_length: usize, max_bytes: u64) -> isize {
+    let (volume, name) = match resolve_file(unsafe { core::slice::from_raw_parts(name, name_length) }) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    match volume.reserve(name, max_bytes) {
+        Ok((entry, capacity)) => {
+            unsafe { STREAM = Some((volume, entry)) };
+            capacity as isize
+        }
+        Err(crate::fosfs::Error::InvalidName) => FS_BAD_NAME,
+        Err(_) => FS_ERROR,
+    }
+}
+extern "C" fn api_fs_stream_write(offset: u64, data: *const u8, length: usize, file_length: u64) -> isize {
+    let Some((volume, entry)) = (unsafe { *(&raw const STREAM) }) else { return FS_ERROR };
+    let data = unsafe { core::slice::from_raw_parts(data, length) };
+    match volume.write_extent(&entry, offset, data, file_length) {
+        Ok(()) => 0,
+        Err(crate::fosfs::Error::TooBig) => FS_TOO_BIG,
+        Err(_) => FS_ERROR,
+    }
+}
+extern "C" fn api_fs_stream_close(file_length: u64) -> isize {
+    let Some((volume, entry)) = (unsafe { (*(&raw mut STREAM)).take() }) else { return FS_ERROR };
+    match volume.trim_extent(&entry, file_length) {
+        Ok(()) => 0,
+        Err(_) => FS_ERROR,
+    }
+}
 extern "C" fn api_free_pages() -> usize {
     memory::stats().free as usize
 }
@@ -306,6 +339,9 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         audio_write: api_audio_write,
         audio_stats: api_audio_stats,
         nic_set_multicast: api_nic_set_multicast,
+        fs_stream_open: api_fs_stream_open,
+        fs_stream_write: api_fs_stream_write,
+        fs_stream_close: api_fs_stream_close,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

@@ -104,6 +104,16 @@ pub struct TapeApi {
     /// Receive every multicast frame on an interface (on) or only broadcasts and our own address (off); 1 on
     /// success. A tape that joins an IGMP group needs this: the NIC drops multicast it has no filter for.
     pub nic_set_multicast: extern "C" fn(usize, u32) -> u32,
+    /// `fs_stream_open(name, name_len, max_bytes)`: starts a file that grows as it is written, for recording to disk.
+    /// A file is one contiguous run of sectors, so the space is reserved now: `max_bytes`, or the largest free run
+    /// when 0. Returns the reserved size in bytes, or a negative code. One stream at a time; opening replaces the last.
+    pub fs_stream_open: extern "C" fn(*const u8, usize, u64) -> isize,
+    /// `fs_stream_write(offset, data, len, file_length)`: writes at a byte offset (a multiple of 512; the last sector
+    /// of the data is padded) and, if `file_length` is not 0, makes that the file's length. 0 or a negative code.
+    pub fs_stream_write: extern "C" fn(u64, *const u8, usize, u64) -> isize,
+    /// `fs_stream_close(file_length)`: ends the stream, making `file_length` the final length and freeing the rest of
+    /// the reserved space. Without it the whole reservation stays allocated to the file.
+    pub fs_stream_close: extern "C" fn(u64) -> isize,
 }
 
 /// What `audio_info` reports. Slot bytes: how many bytes each sample takes in the stream (a 24-bit

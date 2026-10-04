@@ -374,7 +374,22 @@ firmware, so a pending slot is tried on the next boot.
   our own parser and by eye (no AVB device or dissector at hand; tcpdump has none). QEMU test: header fields, 8-bit
   sequence stepping and a played tone; hardware (H6 on the Skylake to the UFX, 30 s, 1 ms packets): 30,019 of 30,019
   packets, 0 lost.
-  Plan: streaming `record` to disk; a real AVB device or a Wireshark capture to confirm the AAF header. The UFX's 12-channel capture alternate is
+  **`record` streams to disk:** the take is written to the volume as it arrives, in 256 KiB blocks, so its length is
+  limited by free space (and WAV's 4 GiB), not by RAM. A FOSFS file is one contiguous extent, so the tape reserves
+  the space first (`fs_stream_open`: `SECONDS` worth, or the largest free run for an open-ended take),
+  writes at sector-aligned offsets (`fs_stream_write`) and gives the unused part back at the end (`fs_stream_close`).
+  The directory length and the WAV header move forward together every two seconds, so a power cut keeps the take up to
+  that point with a consistent header (tested by killing QEMU). `record NAME 0` records until Escape or until the
+  reservation is full; `diskN/NAME` and `@LABEL/NAME` pick another volume; `tone=HZ` records a test tone through the
+  same path (QEMU's USB audio has no capture side). The capture ring is 16 MiB now (playback stays 1 MiB) so a stick
+  that stalls while writing does not overrun the take at once. Tests: `make test-v2-record` parses the image on the
+  host (timed take exact, Escape take, power-cut take). Hardware: the H6 on the Skylake at 96 kHz, 6 channels
+  (1.7 MB/s) filled the volume's 31 MiB in 19 s with no overruns; the UFX's 22 channels (3.2 MB/s) onto the Sandy
+  Bridge's boot stick (Kingston DataTraveler on EHCI, 2.6 MB/s while writing) failed after ~21 MiB each time, a
+  block taking ~5 s and then returning a disk error (which leaves the stick unusable until a hardware reset, not
+  a KUP restart): that stick, or our EHCI write path, cannot sustain it. A real take needs a bigger, faster volume
+  (the Skylake's SATA SSD has no FOSFS partition yet).
+  Plan: a Wireshark capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
   is proprietary; AES67 mode is the open way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
