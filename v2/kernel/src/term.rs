@@ -974,6 +974,29 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             ua::status();
             ua::stop(controller);
         }
+        Some("duplex") => {
+            // Capture and playback at once (the playback side gets silence, the capture side is discarded):
+            // a load test of the shared xHCI event ring and both isochronous endpoints.
+            let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(5).clamp(1, 60);
+            let rate = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(48_000);
+            let Some(controller) = ua::controller() else { return crate::println!("No USB audio device.") };
+            if let Err(reason) = ua::start(controller, rate, true, true) {
+                return crate::println!("audio: {reason}.");
+            }
+            let end = apic::ticks() + seconds * apic::TICK_HZ;
+            let mut scratch = [0u8; 4096];
+            let silence = [0u8; 2048];
+            while apic::ticks() < end {
+                crate::debug::pet();
+                crate::usb_hid::poll();
+                while ua::read(&mut scratch) > 0 {}
+                if ua::playback_space() >= silence.len() {
+                    ua::write(&silence);
+                }
+            }
+            ua::status();
+            ua::stop(controller);
+        }
         Some("tone") => {
             let frequency = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(440).clamp(20, 20_000);
             let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(3).clamp(1, 60);
@@ -1016,7 +1039,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             ua::status();
             ua::stop(controller);
         }
-        Some(_) => crate::println!("Usage: audio | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE]"),
+        Some(_) => crate::println!("Usage: audio | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
     }
 }
 

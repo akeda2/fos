@@ -278,7 +278,8 @@ firmware, so a pending slot is tried on the next boot.
   high speed): reports within 10% of nominal set the frames-per-packet step, so playback follows the device's own
   clock; `audio` shows the report count and the device's clock against nominal. On the H6: 313 reports in 5 s,
   none rejected, exactly nominal at 48 kHz (QEMU's `usb-audio` has no feedback endpoint, so it is hardware-only).
-  Not done: capture and playback together, interrupt-driven event handling (events are handled whenever the
+  Capture and playback together (`audio duplex 10`) ran 10 s on the H6 with 80,016 + 80,007 packets (about 16,000
+  transfer events/s) and no errors. Not done: interrupt-driven event handling (events are handled whenever the
   xHCI ring is drained, from tape/shell loops).
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
