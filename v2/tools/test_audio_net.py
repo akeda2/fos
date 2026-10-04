@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`audio-net` between two v2 guests on one virtual segment.
+"""`audio-net` between two v2 guests on one virtual segment, over raw Ethernet and over RTP/UDP.
 
 Guest B (the receiver) has a `usb-audio` device whose output QEMU records to a WAV file; guest A (the
 sender) needs no audio hardware and sends a test tone (`src=tone=440`). Over raw Ethernet the tone must
@@ -9,6 +9,8 @@ too. Run with `make test-v2-audio-net`."""
 
 import os
 import select
+import socket
+import threading
 import shutil
 import struct
 import subprocess
@@ -70,6 +72,53 @@ class Guest:
             self.process.kill()
 
 
+def checksum(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack(f">{len(data) // 2}H", data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def sniff(seconds, frames):
+    """Collects the Ethernet frames the QEMU multicast netdev carries for `seconds` into `frames`."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", PORT))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(GROUP) + socket.inet_aton("0.0.0.0"))
+    sock.settimeout(0.2)
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            data, _ = sock.recvfrom(4096)
+            frames.append((time.monotonic(), data))
+        except socket.timeout:
+            pass
+    sock.close()
+
+
+def check_rtp(frames):
+    """Parses the captured frames as RTP over UDP over IPv4 and checks what AES67 expects of the stream."""
+    packets = []
+    for stamp, frame in frames:
+        if len(frame) < 14 + 20 + 8 + 12 or frame[12:14] != b"\x08\x00" or frame[14 + 9] != 17:
+            continue
+        ip = frame[14:34]
+        if ip[0] != 0x45 or checksum(ip) != 0:
+            raise SystemExit("FAIL: an IPv4 header checksum is wrong")
+        udp = frame[34:]
+        length = struct.unpack(">H", udp[4:6])[0]
+        pseudo = ip[12:20] + bytes([0, 17]) + struct.pack(">H", length)
+        if struct.unpack(">H", udp[6:8])[0] != 0 and checksum(pseudo + udp[:length]) != 0:
+            raise SystemExit("FAIL: a UDP checksum is wrong")
+        rtp = udp[8:length]
+        if rtp[0] >> 6 != 2:
+            continue
+        packets.append((stamp, rtp[1] & 0x7F, struct.unpack(">H", rtp[2:4])[0], struct.unpack(">I", rtp[4:8])[0], struct.unpack(">I", rtp[8:12])[0], len(rtp) - 12))
+    return packets
+
+
 def tone_frequency(samples, rate, window):
     crossings = sum(1 for x, y in zip(window, window[1:]) if x < 0 <= y)
     return crossings * rate / len(window)
@@ -85,7 +134,7 @@ def main():
             for guest in (receiver, sender):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            for run in ("a", "b"):
+            for run in ("a", "b", "c"):
                 if run == "a":
                     # Stereo 24-bit, 440 Hz, 3 seconds, to everyone.
                     mark = receiver.send("run audio-net recv")
@@ -93,6 +142,19 @@ def main():
                     receiver.pump(3.0)  # QEMU's emulated USB audio keeps the receiver busy for a while after it starts
                     mark = sender.send("run audio-net send src=tone=440 secs=3")
                     sender.wait_for("Sent ", 60, mark)
+                elif run == "c":
+                    # RTP over UDP: stereo 24-bit 660 Hz between two static addresses (ARP resolves the peer).
+                    mark = receiver.send("run audio-net recv proto=rtp ip=192.168.50.2/24 chan=2 bits=24")
+                    receiver.wait_for("Listening on NIC 1 for RTP/UDP", 30, mark)
+                    receiver.pump(3.0)
+                    captured = []
+                    thread = threading.Thread(target=sniff, args=(4.0, captured))
+                    thread.start()
+                    mark = sender.send("run audio-net send proto=rtp ip=192.168.50.1/24 to=192.168.50.2 src=tone=660 secs=3")
+                    sender.wait_for("Sent ", 60, mark)
+                    thread.join()
+                    sdp = sender.text()[mark:]
+                    check("a=rtpmap:96 L24/48000/2" in sdp and "a=ptime:1" in sdp and "m=audio 5004 RTP/AVP 96" in sdp, "the sender prints an AES67-style SDP (L24/48000/2, ptime 1)", sdp[:600])
                 else:
                     # Mono 16-bit, 880 Hz, to the receiver's MAC, after the receiver has been restarted.
                     mark = receiver.send("run audio-net recv from=52:54:00:12:34:b1 target=8")
@@ -108,7 +170,9 @@ def main():
                 receiver.wait_for("fos> ", 30, mark)
                 report = receiver.text()[mark - 200:]
                 locked = report.split("Locked onto a stream:")[-1].split("\n")[0]
-                if run == "a":
+                if run == "c":
+                    check("2 channel(s), 24-bit, 48000 Hz, from 192.168.50.1" in locked, "the receiver locks onto the RTP stream from the sender's IP address", locked)
+                elif run == "a":
                     check("2 channel(s), 24-bit, 48000 Hz" in locked, "the receiver locks onto a stereo 24-bit 48 kHz stream", locked)
                 else:
                     check("1 channel(s), 16-bit, 48000 Hz" in locked, "and onto a mono 16-bit one, from a chosen sender", locked)
@@ -116,6 +180,14 @@ def main():
                 lost = int(report.split(" packets: ")[-1].split(" lost")[0])
                 check(packets >= 2900, f"it received {packets} packets (about 3000 expected)", report)
                 check(lost <= 5, f"with {lost} lost", report)
+                if run == "c":
+                    rtp = check_rtp(captured)
+                    check(len(rtp) >= 2800, f"the sniffer saw {len(rtp)} well-formed RTP/UDP/IPv4 packets (IP and UDP checksums valid)", "")
+                    check({p[1] for p in rtp} == {96} and len({p[4] for p in rtp}) == 1, "all payload type 96 with one SSRC", "")
+                    check(all(p[5] == 288 for p in rtp), "each carrying 288 bytes: 48 frames of stereo L24 (1 ms)", "")
+                    steps = {(b[2] - a[2]) & 0xFFFF for a, b in zip(rtp, rtp[1:])}
+                    stamps = {(b[3] - a[3]) & 0xFFFFFFFF for a, b in zip(rtp, rtp[1:])}
+                    check(steps == {1} and stamps == {48}, "sequence numbers step by 1 and timestamps by 48 frames", f"{steps} {stamps}")
         finally:
             receiver.stop()
             sender.stop()
@@ -123,13 +195,44 @@ def main():
             rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
             samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
         loud = [i for i, value in enumerate(samples) if abs(value) > 500]
-        check(len(loud) > 4 * rate, f"the recording holds sound ({len(loud) / rate:.1f} s of it)", "")
+        check(len(loud) > 7 * rate, f"the recording holds sound ({len(loud) / rate:.1f} s of it)", "")
         first = samples[loud[0]:loud[0] + rate]
+        middle_at = (loud[0] + loud[-1]) // 2
+        middle = samples[middle_at - rate // 2:middle_at + rate // 2]
         last = samples[loud[-1] - rate:loud[-1]]
-        f1, f2 = tone_frequency(samples, rate, first), tone_frequency(samples, rate, last)
-        check(abs(f1 - 440) < 20, f"the first tone is {f1:.0f} Hz (wanted 440)", "")
-        check(abs(f2 - 880) < 30, f"the second tone (mono, 16-bit, converted) is {f2:.0f} Hz (wanted 880)", "")
+        f1, f2, f3 = (tone_frequency(samples, rate, part) for part in (first, middle, last))
+        check(abs(f1 - 440) < 20, f"the first tone (raw, stereo 24-bit) is {f1:.0f} Hz (wanted 440)", "")
+        check(abs(f2 - 880) < 30, f"the second (raw, mono 16-bit, converted) is {f2:.0f} Hz (wanted 880)", "")
+        check(abs(f3 - 660) < 25, f"the third (RTP/UDP, stereo 24-bit) is {f3:.0f} Hz (wanted 660)", "")
+    dhcp_test()
     print("v2 audio-net: all checks passed")
+
+
+def dhcp_test():
+    """`ip=dhcp` against QEMU's built-in DHCP server (slirp hands out 10.0.2.15 with gateway 10.0.2.2)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        guest = Guest(tmp, "dhcp", "52:54:00:12:34:c1")
+        # Replace the multicast NIC with a user-mode one (it has a DHCP server).
+        guest.stop()
+        code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
+        vars_copy = Path(tmp) / "dhcp-vars2.fd"
+        shutil.copy(variables, vars_copy)
+        disk = Path(tmp) / "dhcp2.img"
+        shutil.copy(IMAGE, disk)
+        command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
+                   "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
+                   "-drive", f"format=raw,file={disk}", "-netdev", "user,id=net0", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:c2"]
+        guest.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        guest.raw = bytearray()
+        try:
+            guest.wait_for("M3 complete")
+            guest.wait_for("fos> ")
+            mark = guest.send("run audio-net send proto=rtp ip=dhcp to=10.0.2.2 src=tone=440 secs=1")
+            guest.wait_for("Sent ", 60, mark)
+            text = guest.text()[mark:]
+            check("Network: 10.0.2.15 on NIC 1." in text, "ip=dhcp obtains a lease (10.0.2.15) and streams from it", text[:800])
+        finally:
+            guest.stop()
 
 
 if __name__ == "__main__":

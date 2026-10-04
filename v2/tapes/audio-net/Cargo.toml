@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 tape-rt = { path = "../tape-rt" }
 audio-wire = { path = "../audio-wire" }
+tape-net = { path = "../../../tapes/tape-net" }
 
 [profile.release]
 panic = "abort"

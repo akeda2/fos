@@ -225,6 +225,90 @@ impl Fill {
     }
 }
 
+/// Everything an SDP description of one RTP audio stream needs.
+pub struct Sdp {
+    pub origin: [u8; 4],
+    pub destination: [u8; 4],
+    pub port: u16,
+    pub payload_type: u8,
+    pub channels: usize,
+    pub rate: u32,
+    pub bits: usize,
+    /// Microseconds of audio per packet (AES67: 125, 250, 333, 1000 or 4000).
+    pub packet_us: u32,
+    /// The sender's MAC: stands in for a PTP clock in `ts-refclk` (RFC 7273's `localmac`).
+    pub mac: [u8; 6],
+    pub session: u32,
+}
+
+/// A tiny `core::fmt::Write` into a byte slice.
+pub struct Cursor<'a> {
+    pub bytes: &'a mut [u8],
+    pub length: usize,
+}
+
+impl core::fmt::Write for Cursor<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let end = self.length + text.len();
+        if end > self.bytes.len() {
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.length..end].copy_from_slice(text.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
+
+fn is_multicast(address: [u8; 4]) -> bool {
+    (224..=239).contains(&address[0])
+}
+
+/// Writes an AES67-style SDP (RFC 4566, RFC 3190 `L16`/`L24`, RFC 7273 clocking) into `out` and returns its
+/// length. Lines end in CRLF as SDP requires. The `ts-refclk` is the sender's MAC (`localmac`), since this
+/// stack has no PTP: a receiver that insists on a PTP reference will not accept the stream, one that only
+/// needs the packet format will (ffplay, GStreamer, VLC with the right flags).
+pub fn write_sdp(sdp: &Sdp, out: &mut [u8]) -> usize {
+    use core::fmt::Write;
+    let mut cursor = Cursor { bytes: out, length: 0 };
+    let a = sdp.origin;
+    let d = sdp.destination;
+    let milliseconds = sdp.packet_us / 1000;
+    let thousandths = sdp.packet_us % 1000;
+    let _ = write!(cursor, "v=0\r\no=- {0} {0} IN IP4 {1}.{2}.{3}.{4}\r\ns=fos audio-net\r\n", sdp.session, a[0], a[1], a[2], a[3]);
+    let _ = write!(cursor, "c=IN IP4 {}.{}.{}.{}", d[0], d[1], d[2], d[3]);
+    if is_multicast(d) {
+        let _ = write!(cursor, "/32");
+    }
+    let _ = write!(cursor, "\r\nt=0 0\r\nm=audio {} RTP/AVP {}\r\n", sdp.port, sdp.payload_type);
+    let _ = write!(cursor, "a=rtpmap:{} L{}/{}/{}\r\n", sdp.payload_type, sdp.bits, sdp.rate, sdp.channels);
+    if thousandths == 0 {
+        let _ = write!(cursor, "a=ptime:{milliseconds}\r\n");
+    } else {
+        // 0.125, 0.25, 0.333 ...: the fraction without trailing zeros
+        let mut fraction = [b'0'; 3];
+        fraction[0] = b'0' + (thousandths / 100) as u8;
+        fraction[1] = b'0' + (thousandths / 10 % 10) as u8;
+        fraction[2] = b'0' + (thousandths % 10) as u8;
+        let mut end = 3;
+        while end > 1 && fraction[end - 1] == b'0' {
+            end -= 1;
+        }
+        let _ = write!(cursor, "a=ptime:{milliseconds}.{}\r\n", core::str::from_utf8(&fraction[..end]).unwrap_or("0"));
+    }
+    let m = sdp.mac;
+    let _ = write!(cursor, "a=ts-refclk:localmac={:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}\r\na=mediaclk:direct=0\r\na=sendonly\r\n", m[0], m[1], m[2], m[3], m[4], m[5]);
+    cursor.length
+}
+
+/// The Ethernet destination for an IPv4 multicast address: 01:00:5e plus the low 23 bits (RFC 1112).
+pub fn multicast_mac(address: [u8; 4]) -> [u8; 6] {
+    [0x01, 0x00, 0x5e, address[1] & 0x7f, address[2], address[3]]
+}
+
+pub fn is_multicast_address(address: [u8; 4]) -> bool {
+    is_multicast(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +397,43 @@ mod tests {
         let placement: Vec<Option<usize>> = (0..6).map(Some).collect();
         unpack(&wire, 6, 24, 4, &placement, 3, 6, &mut back);
         assert_eq!(back, device);
+    }
+
+    #[test]
+    fn sdp_for_a_stereo_stream() {
+        let sdp = Sdp { origin: [192, 168, 1, 10], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [0x18, 0x66, 0xda, 0x25, 0x1f, 0x73], session: 7 };
+        let mut out = [0u8; 512];
+        let length = write_sdp(&sdp, &mut out);
+        let text = core::str::from_utf8(&out[..length]).unwrap();
+        assert!(text.starts_with("v=0\r\no=- 7 7 IN IP4 192.168.1.10\r\n"));
+        assert!(text.contains("c=IN IP4 239.69.1.1/32\r\n"), "multicast carries a TTL");
+        assert!(text.contains("m=audio 5004 RTP/AVP 96\r\n"));
+        assert!(text.contains("a=rtpmap:96 L24/48000/2\r\n"));
+        assert!(text.contains("a=ptime:1\r\n"));
+        assert!(text.contains("a=ts-refclk:localmac=18-66-DA-25-1F-73\r\n"));
+        assert!(text.contains("a=mediaclk:direct=0\r\n"));
+    }
+
+    #[test]
+    fn sdp_packet_times_and_unicast() {
+        let mut sdp = Sdp { origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 6000, payload_type: 97, channels: 22, rate: 96_000, bits: 16, packet_us: 125, mac: [0; 6], session: 1 };
+        let mut out = [0u8; 512];
+        let length = write_sdp(&sdp, &mut out);
+        let text = core::str::from_utf8(&out[..length]).unwrap();
+        assert!(text.contains("c=IN IP4 10.0.0.2\r\n"), "unicast has no TTL");
+        assert!(text.contains("a=ptime:0.125\r\n"));
+        assert!(text.contains("a=rtpmap:97 L16/96000/22\r\n"));
+        sdp.packet_us = 250;
+        let length = write_sdp(&sdp, &mut out);
+        assert!(core::str::from_utf8(&out[..length]).unwrap().contains("a=ptime:0.25\r\n"));
+        assert!(write_sdp(&sdp, &mut [0u8; 20]) <= 20, "a short buffer is not overrun");
+    }
+
+    #[test]
+    fn multicast_mapping() {
+        assert_eq!(multicast_mac([239, 255, 1, 2]), [0x01, 0x00, 0x5e, 0x7f, 1, 2]);
+        assert_eq!(multicast_mac([224, 128, 0, 1]), [0x01, 0x00, 0x5e, 0x00, 0, 1], "the top bit of the second octet is dropped");
+        assert!(is_multicast_address([239, 1, 1, 1]) && !is_multicast_address([192, 168, 1, 1]));
     }
 
     #[test]

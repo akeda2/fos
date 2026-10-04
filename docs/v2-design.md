@@ -311,8 +311,17 @@ firmware, so a pending slot is tried on the next boot.
   whole window after it is filled, so the window is the latency). `micros()` no longer goes backwards when
   the timer interrupt is late (a pending timer interrupt counts as an elapsed tick, and the value is clamped).
   Tested between two QEMU guests (`make test-v2-audio-net`: stereo 24-bit and mono 16-bit tones, 0 lost,
-  measured 438/877 Hz). Plan: stage B RTP/UDP L24 with AES67-style packets and SDP, C Opus, D resampler,
-  E multicast, alternate-setting choice and duplex. (Dante itself is proprietary; AES67 mode is the open way in.)
+  measured 438/877 Hz). **Stage B, RTP over UDP:** `proto=rtp` sends and receives standard RTP (RFC 3550) over
+  UDP over IPv4 with `L16`/`L24` big-endian samples, dynamic payload type 96 (`pt=`), packet times of 125 us to
+  1 ms chosen so a packet is at most 1440 bytes (AES67's limit), correct IP and UDP checksums, a multicast
+  destination mapped to its 01:00:5e MAC (no ARP; no IGMP join yet), and an SDP description printed by `send`
+  (`rtpmap L24/rate/channels`, `ptime`, `ts-refclk:localmac=...` since there is no PTP, `mediaclk:direct=0`) for the
+  other side. Addressing: `ip=A.B.C.D/N` with `gw=`, or `ip=dhcp` (the client shared with `ip-chat`/`router`);
+  ARP is answered and resolved. `recv` takes `chan=` and `bits=` (RTP does not carry the channel count). The
+  two-guest test sniffs the segment and checks the packets (version, payload type, single SSRC, 288-byte payloads,
+  sequence +1, timestamp +48, valid checksums) and measures the played tone; `ip=dhcp` is tested against QEMU's
+  slirp DHCP. Plan: C Opus, D resampler, E multicast/IGMP, alternate-setting choice and duplex, AVTP (AVB) raw
+  mode. (Dante itself is proprietary; AES67 mode is the open way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with
