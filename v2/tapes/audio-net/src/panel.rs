@@ -85,16 +85,17 @@ const CODECS: [&str; 5] = ["PCM 24-bit (best quality)", "PCM 16-bit", "Opus, bal
 const R_MODE: usize = 0;
 const R_NETWORK: usize = 1;
 const R_NIC: usize = 2;
-const R_IP: usize = 3;
-const R_GATEWAY: usize = 4;
-const R_PEER: usize = 5;
-const R_CODEC: usize = 6;
-const R_SEND: usize = 7;
-const R_RECEIVE: usize = 8;
-const R_NAME: usize = 9;
-const R_GROUP: usize = 10;
-const ROWS: usize = 11;
-const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "IP address", "Gateway", "Peer", "Codec", "Send channels", "Receive channels", "Name", "Multicast group"];
+const R_ADDRESSING: usize = 3;
+const R_IP: usize = 4;
+const R_GATEWAY: usize = 5;
+const R_PEER: usize = 6;
+const R_CODEC: usize = 7;
+const R_SEND: usize = 8;
+const R_RECEIVE: usize = 9;
+const R_NAME: usize = 10;
+const R_GROUP: usize = 11;
+const ROWS: usize = 12;
+const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec", "Send channels", "Receive channels", "Name", "Multicast group"];
 
 #[derive(Clone, Copy)]
 struct Settings {
@@ -102,6 +103,8 @@ struct Settings {
     network: usize,
     nic: usize,
     codec: usize,
+    /// Get the address from a DHCP server (the usual case) instead of the static `ip` and `gateway`.
+    dhcp: bool,
     ip: Text<24>,
     gateway: Text<16>,
     peer: Text<24>,
@@ -113,7 +116,7 @@ struct Settings {
 
 impl Settings {
     fn new() -> Settings {
-        Settings { mode: 0, network: 0, nic: 1, codec: 0, ip: Text::from("dhcp"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2") }
+        Settings { mode: 0, network: 0, nic: 1, codec: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2") }
     }
 
     fn rtp(&self) -> bool {
@@ -122,7 +125,8 @@ impl Settings {
 
     fn applies(&self, row: usize) -> bool {
         match row {
-            R_IP | R_GATEWAY | R_NAME | R_GROUP => self.rtp(),
+            R_ADDRESSING | R_NAME | R_GROUP => self.rtp(),
+            R_IP | R_GATEWAY => self.rtp() && !self.dhcp,
             R_SEND => self.mode != 1,
             R_RECEIVE => self.mode != 0,
             _ => true,
@@ -149,7 +153,10 @@ impl Settings {
         let _ = writeln!(out, "proto {}", ["rtp", "raw", "avtp"][self.network]);
         let _ = writeln!(out, "nic {}", self.nic);
         if self.rtp() {
-            for (key, value) in [("ip", self.ip.as_str()), ("gw", self.gateway.as_str()), ("name", self.name.as_str()), ("group", self.group.as_str())] {
+            if self.dhcp {
+                let _ = writeln!(out, "ip dhcp");
+            }
+            for (key, value) in [("ip", if self.dhcp { "" } else { self.ip.as_str() }), ("gw", if self.dhcp { "" } else { self.gateway.as_str() }), ("name", self.name.as_str()), ("group", self.group.as_str())] {
                 if !value.is_empty() {
                     let _ = writeln!(out, "{key} {value}");
                 }
@@ -220,7 +227,8 @@ impl Settings {
             match key {
                 "proto" => self.network = ["rtp", "raw", "avtp"].iter().position(|name| *name == value).unwrap_or(0),
                 "nic" => self.nic = value.parse().unwrap_or(1),
-                "ip" => self.ip = Text::from(value),
+                "ip" if value == "dhcp" => self.dhcp = true,
+                "ip" => (self.dhcp, self.ip) = (false, Text::from(value)),
                 "gw" => self.gateway = Text::from(value),
                 "name" => self.name = Text::from(value),
                 "group" => self.group = Text::from(value),
@@ -311,7 +319,7 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
         let _ = write!(out, "{}", if text.is_empty() { "-" } else { text });
     };
     if !settings.applies(row) {
-        let _ = write!(out, "-");
+        let _ = write!(out, "{}", if settings.rtp() && settings.dhcp && matches!(row, R_IP | R_GATEWAY) { "(from DHCP)" } else { "-" });
         return;
     }
     match row {
@@ -328,6 +336,9 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
         }
         R_CODEC => {
             let _ = write!(out, "{}", CODECS[settings.codec]);
+        }
+        R_ADDRESSING => {
+            let _ = write!(out, "{}", if settings.dhcp { "DHCP (the address comes from the network's DHCP server)" } else { "Static (type the address below)" });
         }
         R_PEER => {
             if settings.peer.is_empty() {
@@ -463,6 +474,7 @@ fn cycle(settings: &mut Settings, row: usize, step: isize) {
     let wrap = |value: usize, count: usize| ((value as isize + step).rem_euclid(count as isize)) as usize;
     match row {
         R_MODE => settings.mode = wrap(settings.mode, 3),
+        R_ADDRESSING => settings.dhcp = !settings.dhcp,
         R_NETWORK => {
             settings.network = wrap(settings.network, 3);
             if !settings.rtp() && settings.codec >= 2 {
@@ -531,12 +543,16 @@ struct Run {
     started: u64,
     send_channels: usize,
     receive_channels: usize,
+    /// The address line has been brought up to date with the address a DHCP lease gave.
+    ip_shown: bool,
+    mac: [u8; 6],
+    nic: usize,
     counters: Text<100>,
     message: Text<100>,
     meters: [i8; 2 * stats::MAX_CHANNELS],
 }
 
-static mut RUN: Run = Run { stop: false, next_draw: 0, started: 0, send_channels: 0, receive_channels: 0, counters: Text::new(), message: Text::new(), meters: [-1; 2 * stats::MAX_CHANNELS] };
+static mut RUN: Run = Run { stop: false, next_draw: 0, started: 0, send_channels: 0, receive_channels: 0, ip_shown: false, mac: [0; 6], nic: 0, counters: Text::new(), message: Text::new(), meters: [-1; 2 * stats::MAX_CHANNELS] };
 
 fn run_state() -> &'static mut Run {
     unsafe { &mut *(&raw mut RUN) }
@@ -587,6 +603,13 @@ extern "C" fn panel_hook() -> u32 {
         return 0;
     }
     run.next_draw = now + 250_000;
+    if !run.ip_shown {
+        if let Some(ip) = crate::current_ip() {
+            run.ip_shown = true;
+            at(3, 1);
+            draw!(" NIC {}  MAC {}  IP {}.{}.{}.{}\x1b[K", run.nic + 1, MacText(run.mac), ip[0], ip[1], ip[2], ip[3]);
+        }
+    }
     let shown = stats::get();
     let mut counters = Text::<100>::new();
     let seconds = (now - run.started) / 1_000_000;
@@ -624,7 +647,7 @@ fn run_stream(settings: &Settings) {
         }
     };
     let run = run_state();
-    *run = Run { stop: false, next_draw: 0, started: tape_rt::micros(), send_channels: 0, receive_channels: 0, counters: Text::new(), message: Text::new(), meters: [-1; 2 * stats::MAX_CHANNELS] };
+    *run = Run { stop: false, next_draw: 0, started: tape_rt::micros(), send_channels: 0, receive_channels: 0, ip_shown: false, mac: [0; 6], nic: options.nic, counters: Text::new(), message: Text::new(), meters: [-1; 2 * stats::MAX_CHANNELS] };
     if mode != "recv" {
         run.send_channels = ChannelSet::parse(settings.send.as_str()).map_or(2, |set| set.count());
     }
@@ -642,7 +665,8 @@ fn run_stream(settings: &Settings) {
     at(3, 1);
     let mut mac = [0u8; 6];
     (real.nic_mac)(options.nic, mac.as_mut_ptr());
-    draw!(" NIC {}  MAC {}  IP {}\x1b[K", options.nic + 1, MacText(mac), if settings.rtp() { settings.ip.as_str() } else { "(layer 2 only)" });
+    run.mac = mac;
+    draw!(" NIC {}  MAC {}  IP {}\x1b[K", options.nic + 1, MacText(mac), if !settings.rtp() { "(layer 2 only)" } else if settings.dhcp { "(asking the DHCP server...)" } else { settings.ip.as_str() });
     at(4, 1);
     draw!(" {:-<78}", "");
     let send_rows = run.send_channels.min(stats::MAX_CHANNELS).div_ceil(4);
@@ -795,14 +819,14 @@ pub fn run(real: &'static TapeApi) {
                     cycle(&mut settings, selected, step);
                     dirty.row(selected);
                     // Another mode or network changes which rows apply.
-                    dirty.full |= matches!(selected, R_MODE | R_NETWORK);
+                    dirty.full |= matches!(selected, R_MODE | R_NETWORK | R_ADDRESSING);
                 }
                 Key::Enter => {
                     if settings.applies(selected) && settings.text_mut(selected).is_some() {
                         editing = true;
                     } else {
                         cycle(&mut settings, selected, 1);
-                        dirty.full |= matches!(selected, R_MODE | R_NETWORK);
+                        dirty.full |= matches!(selected, R_MODE | R_NETWORK | R_ADDRESSING);
                     }
                     dirty.row(selected);
                 }

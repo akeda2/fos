@@ -193,6 +193,11 @@ impl core::fmt::Display for MacText {
 /// The address configuration a run settled on (NIC, config), so that a retry or the second task does not repeat DHCP.
 static mut CONFIG_CACHE: Option<(usize, NetConfig)> = None;
 
+/// The address the run is using (after a DHCP lease or from `ip=`), once known.
+pub fn current_ip() -> Option<[u8; 4]> {
+    unsafe { (*(&raw const CONFIG_CACHE)).map(|(_, config)| config.ip.0) }
+}
+
 pub struct Transport {
     proto: Proto,
     mac: [u8; 6],

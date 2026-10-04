@@ -554,9 +554,12 @@ def panel_test():
             b.wait_for("audio-net: settings", 30, mark_b)
             # A: mode Receive; IP address.
             keys(a, "l")
-            keys(a, "jjj\r" + "\x7f" * 4 + "192.168.50.2/24\r")
+            keys(a, "jjjl")  # addressing: static
+            check("Static" in a.text()[mark_a:], "the Addressing row toggles between DHCP and static", a.text()[-500:])
+            keys(a, "j\r" + "\x7f" * 20 + "192.168.50.2/24\r")
             # B: IP address, then the peer's address.
-            keys(b, "jjj\r" + "\x7f" * 4 + "192.168.50.1/24\r")
+            keys(b, "jjjl")
+            keys(b, "j\r" + "\x7f" * 20 + "192.168.50.1/24\r")
             keys(b, "jj\r192.168.50.2\r")
             check("192.168.50.1/24" in b.text()[mark_b:] and "192.168.50.2" in b.text()[mark_b:], "the form shows the edited address and peer", b.text()[-600:])
             keys(a, "s")
