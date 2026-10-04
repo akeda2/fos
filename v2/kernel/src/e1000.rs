@@ -24,7 +24,9 @@ const CLASSIC_IDS: &[u16] = &[0x100e, 0x100f, 0x1004];
 /// for this narrow use). They keep the legacy descriptor
 /// layout but have a stricter reset sequence (see `reset_e1000e`) and a couple of extra
 /// control bits.
-const E1000E_IDS: &[u16] = &[0x10d3, 0x1503, 0x15b7];
+/// 0x156f is the other I219-LM of the same Skylake PCH generation (Linux's `board_pch_spt` takes 0x156f and 0x15b7
+/// alike; a Dell Latitude E7270 has it), added on that evidence: not yet run on that laptop.
+const E1000E_IDS: &[u16] = &[0x10d3, 0x1503, 0x15b7, 0x156f];
 /// The I350 ("igb" family, a server NIC; the Skylake test machine has four ports). Same
 /// legacy descriptors, but the registers moved (multi-queue layout, see `IGB_REGS`), each
 /// queue needs an explicit enable bit, and the PHY is shared with management firmware
@@ -32,7 +34,7 @@ const E1000E_IDS: &[u16] = &[0x10d3, 0x1503, 0x15b7];
 /// confirmed on real hardware by v1. Never add 0x1520, the SR-IOV virtual function: it has
 /// no PHY access and would hang this sequence.
 const I350_IDS: &[u16] = &[0x1521];
-pub const DEVICE_IDS: &[u16] = &[0x100e, 0x100f, 0x1004, 0x10d3, 0x1503, 0x15b7, 0x1521];
+pub const DEVICE_IDS: &[u16] = &[0x100e, 0x100f, 0x1004, 0x10d3, 0x1503, 0x15b7, 0x156f, 0x1521];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Variant {
