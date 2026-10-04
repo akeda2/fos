@@ -946,7 +946,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             let (channels, slot) = (usize::from(channels), usize::from(slot));
             let mut data = [0u8; 4096];
             for second in 1..=seconds {
-                let mut peaks = [0u32; 8];
+                let mut peaks = [0u32; 32];
                 let mut carry = 0usize; // bytes of an incomplete frame left from the previous read
                 let end = apic::ticks() + apic::TICK_HZ;
                 let mut frames = 0u64;
@@ -959,7 +959,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
                     let total = carry + got;
                     let whole = total / frame_bytes * frame_bytes;
                     for frame in data[..whole].chunks(frame_bytes) {
-                        for (channel, sample) in frame.chunks(slot).enumerate().take(8) {
+                        for (channel, sample) in frame.chunks(slot).enumerate().take(32) {
                             // little-endian signed PCM in `slot` bytes: sign-extend, take the magnitude
                             let mut value = 0i64;
                             for (index, &byte) in sample.iter().enumerate() {
@@ -976,11 +976,17 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
                     data.copy_within(whole..total, 0);
                     carry = total - whole;
                 }
-                crate::print(format_args!("[{second:>2} s] {frames} frames; peak per channel:"));
-                for peak in &peaks[..channels.min(8)] {
-                    crate::print(format_args!(" {peak:>8}"));
+                // Peaks, eight channels per line, and the loudest channel named (devices have up to 32 here).
+                let shown = channels.min(32);
+                let loudest = (0..shown).max_by_key(|&channel| peaks[channel]).unwrap_or(0);
+                crate::println!("[{second:>2} s] {frames} frames; loudest channel {} (peak {})", loudest + 1, peaks[loudest]);
+                for (line, group) in peaks[..shown].chunks(8).enumerate() {
+                    crate::print(format_args!("   ch {:>2}-{:>2}:", line * 8 + 1, line * 8 + group.len()));
+                    for peak in group {
+                        crate::print(format_args!(" {peak:>8}"));
+                    }
+                    crate::println!();
                 }
-                crate::println!();
                 flush();
             }
             ua::status();
