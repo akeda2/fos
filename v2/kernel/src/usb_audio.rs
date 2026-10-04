@@ -24,6 +24,8 @@ pub struct StreamAlt {
     /// Bits 3:2 of the endpoint's attributes: 0 none, 1 asynchronous, 2 adaptive, 3 synchronous.
     pub sync: u8,
     pub max_packet: u16,
+    /// High-bandwidth endpoints (high speed): extra transactions per microframe, 0 to 2 (wMaxPacketSize bits 12:11).
+    pub extra_transactions: u8,
     pub interval: u8,
     /// The explicit feedback endpoint of an asynchronous OUT stream, if any.
     pub feedback: u8,
@@ -35,7 +37,7 @@ pub struct StreamAlt {
     pub continuous_range: (u32, u32),
 }
 
-pub const MAX_ALTS: usize = 16;
+pub const MAX_ALTS: usize = 40;
 
 pub struct Description {
     /// 1 or 2 (Audio Class 1.0 / 2.0), 0 if the control interface said nothing.
@@ -140,7 +142,9 @@ pub fn parse(configuration: &[u8]) -> Description {
                     } else if current.endpoint == 0 {
                         current.endpoint = d[2];
                         current.sync = (attributes >> 2) & 3;
-                        current.max_packet = u16::from_le_bytes([d[4], d[5]]) & 0x7ff;
+                        let raw = u16::from_le_bytes([d[4], d[5]]);
+                        current.max_packet = raw & 0x7ff;
+                        current.extra_transactions = ((raw >> 11) & 3) as u8;
                         current.interval = d[6];
                     }
                 }
@@ -178,7 +182,7 @@ pub fn report(description: &Description, path: &dyn core::fmt::Display, vendor: 
     );
     for alt in &description.alts[..description.alt_count] {
         crate::println!(
-            "  interface {} alt {}: {} {} ch, {}-bit in {}-byte slots, endpoint {:#04x} isochronous ({}), max packet {}, interval {}",
+            "  interface {} alt {}: {} {} ch, {}-bit in {}-byte slots, endpoint {:#04x} isochronous ({}), max packet {}{}, interval {}",
             alt.interface,
             alt.alt,
             if alt.endpoint & 0x80 != 0 { "capture" } else { "playback" },
@@ -188,6 +192,11 @@ pub fn report(description: &Description, path: &dyn core::fmt::Display, vendor: 
             alt.endpoint,
             sync_name(alt.sync),
             alt.max_packet,
+            match alt.extra_transactions {
+                1 => " x2 per microframe",
+                2 => " x3 per microframe",
+                _ => "",
+            },
             alt.interval
         );
         if alt.rate_count > 0 {
