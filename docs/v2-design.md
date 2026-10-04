@@ -389,7 +389,33 @@ firmware, so a pending slot is tried on the next boot.
   block taking ~5 s and then returning a disk error (which leaves the stick unusable until a hardware reset, not
   a KUP restart): that stick, or our EHCI write path, cannot sustain it. A real take needs a bigger, faster volume
   (the Skylake's SATA SSD has no FOSFS partition yet).
-  Plan: a Wireshark capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
+  **Configuration file and autostart:** `audio-net @audio.cfg` reads its options from a FOSFS file (`@diskN/name`
+  works too) and the words after it override the file. A line is `key value` (becoming `key=value`) or ready-made
+  words, `#` starts a comment, and the mode (`send`, `recv` or `duplex`) is a line of its own:
+
+  ```
+  # audio.cfg: send the UFX's channels 9-10 to the studio over RTP, Opus
+  mode send
+  proto rtp
+  codec opus
+  bitrate 96
+  ip 192.168.1.20/24
+  gw 192.168.1.1
+  to 192.168.1.50
+  ch 9-10
+  ```
+
+  A boot `start` file containing `run audio-net @audio.cfg` brings the stream up with nobody at the machine. The
+  tape supervises: unless Escape was pressed (or `secs=` ran out) a run that ends is an error that is retried every
+  5 s (the peer is not up yet, the cable was pulled, the device was unplugged), so a headless machine converges on
+  its own. A `term net` client can watch it and press Escape (the remote abort) to stop it. The first line says
+  what is running, and the identity lines give the user what they need to troubleshoot: `Network: 192.168.1.20 on NIC
+  1 (MAC xx:xx:...)` (or the MAC and "layer 2 only" for raw/AVTP) and `Sending to 192.168.1.50, MAC ...` once ARP has
+  resolved the peer. The QEMU test boots a receiver from a `start` file and cfg, sends from a cfg, and checks the
+  retry loop and that Escape ends it. The shell `write NAME text` writes a one-line file; longer ones come from `ed`
+  or `devloop put`.
+  Plan: announcements and a peer list (SAP-compatible), the shell panel with meters and codec presets; a Wireshark
+  capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
   is proprietary; AES67 mode is the open way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload

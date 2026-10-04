@@ -56,6 +56,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let Some(mac) = net::resolve(api, options.nic, &transport.config, &mut transport.arp, ip) else {
         return println!("audio-net send: no answer from {host} (ARP); is it on this subnet, or is gw= set?");
     };
+    println!("Sending to {host}, MAC {}.", crate::MacText(mac.0));
     let ttl = if audio_wire::is_multicast_address(ip.0) { 32 } else { 64 };
     let mut encoders: [Option<Encoder>; MAX_STREAMS] = [const { None }; MAX_STREAMS];
     for (index, encoder) in encoders.iter_mut().enumerate().take(streams) {

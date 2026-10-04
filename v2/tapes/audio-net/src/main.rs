@@ -4,6 +4,7 @@
 //! tape run audio-net send [proto=raw|rtp] [nic=N] [to=MAC|IP[:PORT]] [rate=48000] [ch=3-4] [bits=24]
 //!                         [src=capture|tone=HZ] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP] [pt=96]
 //! tape run audio-net duplex [options of both; in=CH out=CH instead of ch=]
+//! tape run audio-net @audio.cfg [options that override the file]
 //! tape run audio-net recv [proto=raw|rtp] [nic=N] [from=MAC] [port=5004] [chan=N] [ch=1-2] [target=MS]
 //!                         [group=239.1.2.3] [codec=pcm|opus]
 //!                         [rate=48000] [bits=24] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP]
@@ -47,6 +48,7 @@
 #![no_std]
 #![no_main]
 
+mod abort;
 mod duplex;
 mod igmp;
 mod net;
@@ -169,6 +171,16 @@ pub fn tone_sample(phase: u32) -> i32 {
 }
 
 /// Everything the network side needs: raw needs only a MAC; RTP a full IPv4 configuration.
+/// A MAC address as text, for messages: the user needs the MAC and the IP address to troubleshoot.
+pub struct MacText(pub [u8; 6]);
+
+impl core::fmt::Display for MacText {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let m = self.0;
+        write!(formatter, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5])
+    }
+}
+
 pub struct Transport {
     proto: Proto,
     mac: [u8; 6],
@@ -208,7 +220,9 @@ impl Transport {
                 })?;
             }
             let ip = config.ip.0;
-            println!("Network: {}.{}.{}.{} on NIC {}.", ip[0], ip[1], ip[2], ip[3], options.nic + 1);
+            println!("Network: {}.{}.{}.{} on NIC {} (MAC {}).", ip[0], ip[1], ip[2], ip[3], options.nic + 1, MacText(mac));
+        } else {
+            println!("Network: NIC {} (MAC {}), layer 2 only, no IP address.", options.nic + 1, MacText(mac));
         }
         Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None })
     }
@@ -296,6 +310,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             let Some(mac) = net::resolve(api, options.nic, &transport.config, &mut transport.arp, ip) else {
                 return println!("audio-net send: no answer from {host} (ARP); is it on this subnet, or is gw= set?");
             };
+            println!("Sending to {host}, MAC {}.", MacText(mac.0));
             Destination::Rtp { mac, ip, ttl: if audio_wire::is_multicast_address(ip.0) { 32 } else { 64 } }
         }
     };
@@ -751,26 +766,145 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     }
 }
 
+/// The configuration file's lines as option words. A line is `key value` (becomes `key=value`) or any number of
+/// ready-made words (`proto=rtp`, `verbose`, `send`); `#` starts a comment.
+static mut CONFIG_TEXT: [u8; 4096] = [0; 4096];
+static mut CONFIG_WORDS: [u8; 4608] = [0; 4608];
+const MAX_WORDS: usize = 64;
+
+fn load_config(api: &TapeApi, name: &str, words: &mut [&'static str; MAX_WORDS], count: &mut usize) -> Result<(), &'static str> {
+    let text = unsafe { &mut *(&raw mut CONFIG_TEXT) };
+    let length = (api.fs_read)(name.as_ptr(), name.len(), text.as_mut_ptr(), text.len());
+    if length < 0 {
+        return Err(if length == tape_rt::FS_NOT_FOUND { "the configuration file does not exist" } else { "the configuration file cannot be read (is it over 4096 bytes?)" });
+    }
+    let text = core::str::from_utf8(&text[..length as usize]).map_err(|_| "the configuration file is not text")?;
+    let out = unsafe { &mut *(&raw mut CONFIG_WORDS) };
+    let mut used = 0;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut parts = line.split_ascii_whitespace();
+        let (first, second, third) = (parts.next(), parts.next(), parts.next());
+        let Some(first) = first else { continue };
+        let pair = !first.contains('=') && second.is_some() && third.is_none();
+        let pieces: &[&str] = if pair { &[first, "=", second.unwrap_or("")] } else { &[] };
+        let mut push = |piece: &str, out: &mut [u8; 4608], used: &mut usize| -> Result<(), &'static str> {
+            if *used + piece.len() > out.len() {
+                return Err("the configuration file has too many words");
+            }
+            out[*used..*used + piece.len()].copy_from_slice(piece.as_bytes());
+            *used += piece.len();
+            Ok(())
+        };
+        let start = used;
+        if pair {
+            for piece in pieces {
+                push(piece, out, &mut used)?;
+            }
+            push(" ", out, &mut used)?;
+        } else {
+            for word in line.split_ascii_whitespace() {
+                push(word, out, &mut used)?;
+                push(" ", out, &mut used)?;
+            }
+        }
+        for word in core::str::from_utf8(&out[start..used]).unwrap_or("").split_ascii_whitespace() {
+            if *count >= MAX_WORDS {
+                return Err("the configuration file has too many words");
+            }
+            // The words live in the static buffer for the rest of the run.
+            words[*count] = unsafe { core::mem::transmute::<&str, &'static str>(word) };
+            *count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// What to run, from the configuration file (`@NAME`, any `diskN/NAME` works) and then the words on the command
+/// line, which override it. The mode is a bare `send`/`recv`/`duplex` or `mode=...`.
+fn collect(api: &TapeApi, arguments: &'static str) -> Result<([&'static str; MAX_WORDS], usize), &'static str> {
+    let mut words: [&'static str; MAX_WORDS] = [""; MAX_WORDS];
+    let mut count = 0;
+    for word in arguments.split_ascii_whitespace() {
+        if let Some(name) = word.strip_prefix('@') {
+            load_config(api, name, &mut words, &mut count)?;
+        } else if count < MAX_WORDS {
+            words[count] = word;
+            count += 1;
+        } else {
+            return Err("too many words");
+        }
+    }
+    Ok((words, count))
+}
+
+fn run_once(api: &'static TapeApi, mode: &str, options: &Options) {
+    match mode {
+        "duplex" => duplex::run(api, options),
+        "send" if options.opus => opus::send(api, options),
+        "recv" if options.opus => opus::receive(api, options),
+        "send" => send(api, options),
+        _ => receive(api, options),
+    }
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn tape_main(api: &'static TapeApi) {
-    tape_rt::init(api);
+pub extern "C" fn tape_main(real: &'static TapeApi) {
+    tape_rt::init(real);
     let arguments = core::str::from_utf8(tape_rt::args()).unwrap_or("");
-    let mut words = arguments.split_ascii_whitespace();
-    let mode = words.next().unwrap_or("");
-    let options = match parse(words) {
+    let (words, count) = match collect(real, arguments) {
+        Ok(found) => found,
+        Err(reason) => return println!("audio-net: {reason}."),
+    };
+    // The mode is the last bare mode word (the command line overrides the file); everything else is an option.
+    let mut mode = "";
+    let mut options_words: [&str; MAX_WORDS] = [""; MAX_WORDS];
+    let mut kept = 0;
+    for &word in &words[..count] {
+        match word.strip_prefix("mode=").unwrap_or(word) {
+            "send" | "recv" | "duplex" => mode = word.strip_prefix("mode=").unwrap_or(word),
+            _ => {
+                options_words[kept] = word;
+                kept += 1;
+            }
+        }
+    }
+    if mode.is_empty() {
+        return println!("Usage: tape run audio-net send|recv|duplex [options]   or   tape run audio-net @audio.cfg [options]\n(see the header of v2/tapes/audio-net/src/main.rs, or docs/v2-design.md, for the options and the file format)");
+    }
+    let options = match parse(options_words[..kept].iter().copied()) {
         Ok(options) => options,
         Err(reason) => return println!("audio-net: {reason}. See the header of v2/tapes/audio-net/src/main.rs for the options."),
     };
-    if (api.nic_count)() <= options.nic {
+    if (real.nic_count)() <= options.nic {
         return println!("audio-net: this machine has no NIC {}.", options.nic + 1);
     }
-    match mode {
-        "duplex" => duplex::run(api, &options),
-        "send" | "recv" if options.opus && options.proto != Proto::Rtp => println!("audio-net: codec=opus needs proto=rtp."),
-        "send" if options.opus => opus::send(api, &options),
-        "recv" if options.opus => opus::receive(api, &options),
-        "send" => send(api, &options),
-        "recv" => receive(api, &options),
-        _ => println!("Usage: tape run audio-net send|recv [proto=raw|rtp] [options]   (see the tape's header for the options)"),
+    if options.opus && options.proto != Proto::Rtp {
+        return println!("audio-net: codec=opus needs proto=rtp.");
+    }
+    println!(
+        "audio-net {mode}: {} {} on NIC {}{}. Escape stops.",
+        proto_name(options.proto),
+        if options.opus { "Opus" } else { "PCM" },
+        options.nic + 1,
+        if options.seconds != 0 { "" } else { "; if the stream ends it is restarted every 5 s" }
+    );
+    // Supervise: unless Escape was pressed (or `secs=` ran out), a run that ends is an error to retry: the peer was
+    // not there yet, the device was unplugged, the link dropped. A headless machine started from the `start` file
+    // therefore keeps trying until the other side is up.
+    let api = abort::wrap(real);
+    loop {
+        run_once(api, mode, &options);
+        if abort::aborted() || options.seconds != 0 {
+            break;
+        }
+        println!("audio-net: the stream ended; trying again in 5 s.");
+        let until = tape_rt::micros() + 5_000_000;
+        while tape_rt::micros() < until && (api.should_abort)() == 0 {
+            tape_rt::idle();
+        }
+        if abort::aborted() {
+            break;
+        }
     }
 }

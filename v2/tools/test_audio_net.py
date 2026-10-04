@@ -26,13 +26,48 @@ from test_boot import CODE_CANDIDATES, IMAGE, VARS_CANDIDATES, check, clean, fin
 GROUP, PORT = "230.42.42.77", 4277
 
 
+def fosfs_add(image, files):
+    """Adds `files` ({name: text}) to the first FOSFS volume of a disk image (a first-fit append after the last extent)."""
+    data = bytearray(Path(image).read_bytes())
+    entries_lba = struct.unpack_from("<Q", data, 512 + 72)[0]
+    count, size = struct.unpack_from("<II", data, 512 + 80)
+    for index in range(count):
+        entry = data[entries_lba * 512 + index * size:entries_lba * 512 + (index + 1) * size]
+        first = struct.unpack_from("<Q", entry, 32)[0]
+        if entry[:16] != bytes(16) and data[first * 512:first * 512 + 8] == b"FOSFS3\0\0":
+            break
+    else:
+        raise SystemExit("FAIL: no FOSFS volume in the image")
+    for name, text in files.items():
+        body = text.encode()
+        end, slot = 9, None
+        for sector in range(1, 9):
+            for number in range(8):
+                at = (first + sector) * 512 + number * 64
+                if data[at]:
+                    start, _, sectors = struct.unpack_from("<QQQ", data, at + 4)
+                    end = max(end, start + sectors)
+                elif slot is None:
+                    slot = at
+        sectors = -(-len(body) // 512)
+        data[(first + end) * 512:(first + end) * 512 + len(body)] = body
+        data[slot:slot + 64] = bytes(64)
+        data[slot] = 1
+        data[slot + 1] = len(name)
+        struct.pack_into("<QQQ", data, slot + 4, end, len(body), sectors)
+        data[slot + 28:slot + 28 + len(name)] = name.encode()
+    Path(image).write_bytes(data)
+
+
 class Guest:
-    def __init__(self, tmp, name, mac, extra=()):
+    def __init__(self, tmp, name, mac, extra=(), files=None):
         code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
         vars_copy = Path(tmp) / f"{name}-vars.fd"
         shutil.copy(variables, vars_copy)
         disk = Path(tmp) / f"{name}.img"
         shutil.copy(IMAGE, disk)
+        if files:
+            fosfs_add(disk, files)
         command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-drive", f"format=raw,file={disk}",
@@ -344,6 +379,7 @@ def main():
             check(abs(measured - frequency) < tolerance, f"the {name} tone is {measured:.0f} Hz (wanted {frequency})", "")
     dhcp_test()
     duplex_test()
+    config_test()
     print("v2 audio-net: all checks passed")
 
 
@@ -383,6 +419,51 @@ def duplex_test():
             check(abs(measured - wanted) < 30, f"{name} played the other's tone: {measured:.0f} Hz (wanted {wanted})", "")
 
 
+def config_test():
+    """The configuration file and the boot script. Receiver A starts `audio-net @rx.cfg` from its `start` file at boot
+    and sender B `audio-net @tx.cfg` (a file of `key value` lines and comments); A must play B's tone. Then a sender
+    whose peer is not there must keep retrying, and Escape must end it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = Path(tmp) / "cfg.wav"
+        rx = "# the receiver\nmode recv\nproto raw   # layer 2, no addresses\ntarget 8\n"
+        tx = "mode send\nproto raw\nsrc tone=550\nsecs 3\n"
+        a = Guest(tmp, "cfg-a", "52:54:00:12:34:f1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"],
+                  {"rx.cfg": rx, "start": "run audio-net @rx.cfg\n"})
+        b = Guest(tmp, "cfg-b", "52:54:00:12:34:f2", files={"tx.cfg": tx})
+        try:
+            a.wait_for("Listening on NIC 1 for raw Ethernet", 90)
+            check("audio-net recv: raw Ethernet PCM on NIC 1" in a.text() and "(MAC 52:54:00:12:34:f1)" in a.text(), "the start file launches the receiver from its cfg and it reports its MAC", a.text()[-900:])
+            b.wait_for("fos> ", 90)
+            a.pump(3.0)  # the emulated USB audio keeps the receiver busy for a while after it starts
+            mark_b = b.send("run audio-net @tx.cfg")
+            b.wait_for("Sent ", 120, mark_b)
+            a.pump(2.0)
+            mark = len(a.text())
+            a.process.stdin.write(b"\x1b")
+            a.process.stdin.flush()
+            a.wait_for("Received ", 30, mark - 300)
+            report = a.text()[mark - 300:]
+            packets = int(report.split("Received ")[-1].split(" ")[0])
+            check(packets >= 2500, f"the cfg-driven receiver got {packets} packets from the cfg-driven sender", report)
+            check("trying again" not in a.text(), "and Escape ended it without a retry", "")
+            a.wait_for("fos> ", 30, mark)
+            mark = b.send("run audio-net send proto=rtp ip=192.168.50.1/24 to=192.168.50.9 src=tone=440")
+            end = time.monotonic() + 60
+            while b.text()[mark:].count("trying again in 5 s") < 2 and time.monotonic() < end:
+                b.pump(0.5)
+            text = b.text()[mark:]
+            check(text.count("trying again in 5 s") >= 2, "a sender whose peer is not there keeps retrying", text[-800:])
+            b.process.stdin.write(b"\x1b")
+            b.process.stdin.flush()
+            b.wait_for("Tape returned", 30, mark)
+            n = b.text()[mark:].count("trying again in 5 s")
+            b.pump(8.0)
+            check(b.text()[mark:].count("trying again in 5 s") == n, "Escape stops the retrying", "")
+        finally:
+            a.stop()
+            b.stop()
+
+
 def dhcp_test():
     """`ip=dhcp` against QEMU's built-in DHCP server (slirp hands out 10.0.2.15 with gateway 10.0.2.2)."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -405,7 +486,7 @@ def dhcp_test():
             mark = guest.send("run audio-net send proto=rtp ip=dhcp to=10.0.2.2 src=tone=440 secs=1")
             guest.wait_for("Sent ", 60, mark)
             text = guest.text()[mark:]
-            check("Network: 10.0.2.15 on NIC 1." in text, "ip=dhcp obtains a lease (10.0.2.15) and streams from it", text[:800])
+            check("Network: 10.0.2.15 on NIC 1 (MAC 52:54:00:12:34:c2)." in text, "ip=dhcp obtains a lease (10.0.2.15) and streams from it", text[:800])
         finally:
             guest.stop()
 
