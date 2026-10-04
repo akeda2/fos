@@ -264,41 +264,125 @@ impl Rtl8168 {
         })
     }
 
-    /// Switches this NIC from polling to MSI if the capability exists and the self-test passes
-    /// (an interrupt must really arrive within three ticks). Needs interrupts enabled and the
-    /// local APIC running. On failure the NIC stays polled and says why.
-    pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
-        if device.find_capability(0x05).is_none() {
-            return Err("no MSI capability");
-        }
-        let Some(vector) = crate::msi::allocate(isr, self.index) else { return Err("no free MSI vector") };
-        if !device.enable_msi(vector, apic::id()) {
-            crate::msi::release(vector);
-            return Err("could not enable MSI");
-        }
+    /// Raises one interrupt by hand and reports whether `arrived` saw it within three ticks: the
+    /// proof that the chosen delivery path really works. Older chips raise a software interrupt
+    /// when `TPPOLL.FSWINT` is written; the RTL8168G/H ignore that bit, so one broadcast frame is
+    /// sent too, whose completion (transmit OK, enabled just for this test) interrupts instead.
+    fn self_test(&mut self, arrived: impl Fn() -> u64) -> bool {
         write16(self.io_base, REG_ISR, 0xffff);
         write16(self.io_base, REG_IMR, INTERRUPT_MASK | ISR_TOK);
-        let before = crate::msi::count(vector);
-        write8(self.io_base, REG_TPPOLL, TPPOLL_FSWINT); // older chips raise a software interrupt...
+        let before = arrived();
+        write8(self.io_base, REG_TPPOLL, TPPOLL_FSWINT);
         let mut frame = [0u8; 14];
         frame[..6].fill(0xff);
         frame[6..12].copy_from_slice(&self.mac);
         frame[12..14].copy_from_slice(&[0x88, 0xb5]);
-        self.send(&frame); // ...the RTL8168G/H need a completed transmit instead
+        self.send(&frame);
         let start = apic::ticks();
-        while crate::msi::count(vector) == before && apic::ticks().wrapping_sub(start) < 3 {
+        while arrived() == before && apic::ticks().wrapping_sub(start) < 3 {
             core::hint::spin_loop();
         }
-        if crate::msi::count(vector) == before {
-            write16(self.io_base, REG_IMR, 0);
-            device.disable_msi();
-            crate::msi::release(vector);
-            return Err("the MSI self-test message never arrived");
-        }
+        arrived() != before
+    }
+
+    fn finish_interrupts(&mut self, delivery: Delivery) -> Delivery {
         self.interrupts_enabled = true;
-        self.delivery = Delivery::Msi(vector);
+        self.delivery = delivery;
         write16(self.io_base, REG_IMR, INTERRUPT_MASK);
-        Ok(self.delivery)
+        delivery
+    }
+
+    /// Switches this NIC from polling to interrupts, trying MSI and then legacy INTx through the
+    /// I/O APIC (probing candidate pins, as the e1000 driver does, since the ACPI routing table
+    /// is not read). A path is kept only if its self-test interrupt arrives; otherwise the NIC
+    /// stays polled and says why. Needs interrupts enabled and the local APIC running.
+    pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
+        let mut reason = "no interrupt path passed its self-test";
+        if device.find_capability(0x05).is_some() {
+            match crate::msi::allocate(isr, self.index) {
+                Some(vector) if device.enable_msi(vector, apic::id()) => {
+                    if self.self_test(|| crate::msi::count(vector)) {
+                        return Ok(self.finish_interrupts(Delivery::Msi(vector)));
+                    }
+                    write16(self.io_base, REG_IMR, 0);
+                    device.disable_msi();
+                    crate::msi::release(vector);
+                    reason = "the MSI self-test message never arrived";
+                }
+                Some(vector) => crate::msi::release(vector),
+                None => reason = "no free MSI vector",
+            }
+        } else {
+            reason = "no MSI capability";
+        }
+        // Legacy INTx: the firmware's interrupt line (a hint) and the PCI pins an Intel/QEMU
+        // chipset routes to the I/O APIC (GSI 16-23).
+        let (first, end) = crate::ioapic::gsi_range();
+        let mut candidates = [u32::MAX; 9];
+        candidates[0] = u32::from(device.interrupt_line());
+        for (slot, gsi) in (16..24u32).enumerate() {
+            candidates[slot + 1] = gsi;
+        }
+        for (position, &gsi) in candidates.iter().enumerate() {
+            if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
+                continue;
+            }
+            let Some(vector) = crate::msi::attach_intx(gsi, isr, self.index) else { continue };
+            if self.self_test(|| crate::msi::intx_count(vector)) {
+                return Ok(self.finish_interrupts(Delivery::Intx { gsi, vector }));
+            }
+            write16(self.io_base, REG_IMR, 0);
+            crate::msi::detach_intx(vector, self.index);
+            reason = "no I/O APIC pin delivered the self-test interrupt";
+        }
+        Err(reason)
+    }
+
+    /// The `nic` command's driver-specific line.
+    pub fn describe(&self) {
+        match self.link_speed() {
+            Some((speed, full)) => crate::println!(
+                "   rtl8168: chip version {:#05x}, {speed} Mb/s {}, {} recoveries",
+                self.version,
+                if full { "full duplex" } else { "half duplex" },
+                self.recoveries
+            ),
+            None => crate::println!("   rtl8168: chip version {:#05x}, no link, {} recoveries", self.version, self.recoveries),
+        }
+    }
+
+    /// `nic regs`: the registers that matter when a link or interrupt misbehaves, and the ring
+    /// state (which descriptors the card still owns).
+    pub fn dump_registers(&self) {
+        let io = self.io_base;
+        crate::println!(
+            "RTL8168 I/O {io:#06x}: CR={:02x} IMR={:04x} ISR={:04x} PHY={:02x} CPlus={:04x}",
+            read8(io, REG_CR),
+            read16(io, REG_IMR),
+            read16(io, REG_ISR),
+            read8(io, REG_PHYSTATUS),
+            read16(io, REG_CPLUSCMD)
+        );
+        crate::println!("TxConfig={:08x} RxConfig={:08x} RMS={:04x}", read32(io, REG_TXCONFIG), read32(io, REG_RXCONFIG), read16(io, REG_RMS));
+        let (mut rx_card, mut tx_card) = (0u64, 0u64);
+        for index in 0..RX_COUNT {
+            if read_opts1(self.rings, index) & DESC_OWN != 0 {
+                rx_card |= 1 << index;
+            }
+        }
+        for index in 0..TX_COUNT {
+            if read_opts1(self.rings + TX_RING_OFFSET, index) & DESC_OWN != 0 {
+                tx_card |= 1 << index;
+            }
+        }
+        crate::println!("rx next {} (card owns {rx_card:016x}), tx next {} (card owns {tx_card:08x})", self.rx_next, self.tx_next);
+        crate::println!(
+            "rx[next] opts1 {:08x}; recoveries {}, pending {}, interrupts {:?}",
+            read_opts1(self.rings, self.rx_next),
+            self.recoveries,
+            self.recovery_pending,
+            self.delivery
+        );
     }
 
     pub fn io_base(&self) -> u16 {

@@ -251,8 +251,11 @@ firmware, so a pending slot is tried on the next boot.
   `memtest soak net=2,6` ran clean at 2,000 frames/s (polled) and, once MSI worked, at 8,000 frames/s each
   way for 60 s: 539,409 frames each way, none lost or corrupt, 532,581 MSI interrupts, 0 overruns. Interrupts: MSI, with a self-test (forced interrupt plus one transmitted frame, since the 8168G/H ignore
   the forced bit) and v1's rule that receive-descriptor-unavailable/FIFO-overflow are masked until the ring is
-  drained, never answered with a reset; polled when MSI fails or `no-msi` is set. Not done: the NIC watchdog
-  counters, `nic regs`, legacy-INTx fallback.
+  drained, never answered with a reset; polled when MSI fails or `no-msi` is set. Legacy INTx is the fallback
+  when MSI fails (tested on the Skylake by forcing MSI off: pin 11, 475,729 frames each way at 8,000/s, no loss,
+  847,604 interrupts, no storms). `nic` shows the chip version, link speed/duplex and recoveries; `nic regs [N]`
+  dumps the chip's registers and which descriptors the card owns. Not done: a periodic watchdog (a stuck
+  transmit descriptor or a PCI system error resets the chip inline, counted as a recovery).
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

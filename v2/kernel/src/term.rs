@@ -688,6 +688,19 @@ fn execute(command: &str) {
                 _ => crate::println!("Usage: hexdump ADDRESS [LENGTH <= 4096]  (decimal or 0x hex)"),
             }
         }
+        "nic" if matches!(words.clone().next(), Some("regs")) => {
+            words.next();
+            let wanted = words.next().and_then(|word| word.parse::<usize>().ok());
+            for index in 0..nic_count() {
+                if wanted.is_some_and(|number| number != index + 1) {
+                    continue;
+                }
+                if let Some(nic) = nic_at(index) {
+                    crate::println!("{}: {} {}", index + 1, nic.family(), Mac(&nic.mac()));
+                    nic.dump_registers();
+                }
+            }
+        }
         "nic" => {
             if nic_count() == 0 {
                 crate::println!("No network interface.");
@@ -722,6 +735,7 @@ fn execute(command: &str) {
                             );
                         }
                     }
+                    nic.describe();
                     if index == 0 {
                         crate::println!("   tape frame queue: {} queued, {} dropped", unsafe { FRAMES_QUEUED }, unsafe { FRAMES_DROPPED });
                     }

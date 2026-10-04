@@ -73,6 +73,21 @@ impl Nic {
         }
     }
 
+    /// A driver-specific line for `nic` (nothing for the e1000 family, whose counters are shared).
+    pub fn describe(&self) {
+        if let Nic::Rtl8168(nic) = self {
+            nic.describe();
+        }
+    }
+
+    /// `nic regs`: a register dump, for drivers that have one.
+    pub fn dump_registers(&self) {
+        match self {
+            Nic::Rtl8168(nic) => nic.dump_registers(),
+            Nic::E1000(_) => crate::println!("   (no register dump for this driver)"),
+        }
+    }
+
     /// The e1000 interrupt bookkeeping index; only e1000-family NICs have any.
     pub fn is_e1000(&self) -> bool {
         matches!(self, Nic::E1000(_))
