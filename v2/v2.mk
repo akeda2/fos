@@ -7,11 +7,11 @@ V2_LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fos-loader.efi
 V2_KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fos-v2-kernel
 V2_IMAGE := $(V2_BUILD)/v2.img
 # v2 tapes: crates under v2/tapes/, each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-V2_TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record play
+V2_TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record play audio-net
 V2_TAPE_BINS := $(foreach tape,$(V2_TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 V2_TAPE_FILES := $(foreach tape,$(V2_TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape)) --file debug=tools/default-debug.txt
 
-.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio
+.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio test-v2-audio-net test-v2-audio-net
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -88,6 +88,10 @@ test-v2-diag: v2-image
 # USB audio class 1.0 against QEMU's usb-audio: discovery, a played tone recorded to WAV, capture.
 test-v2-usb-audio: v2-image
 	python3 v2/tools/test_usb_audio.py
+
+# audio-net: a tone sent over raw Ethernet between two guests and recorded from the receiver's usb-audio.
+test-v2-audio-net: v2-image
+	python3 v2/tools/test_audio_net.py
 
 # hostname / settings / debug / start files on the boot volume.
 test-v2-config: v2-image

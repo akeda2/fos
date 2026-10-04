@@ -100,6 +100,7 @@ E2E_MAKE = [
     "make test-v2-ed",
     "make test-v2-diag",
     "make test-v2-usb-audio",
+    "make test-v2-audio-net",
     "make test-v2-config",
     "make test-v2-tapes",
     "make test-v2-nettest",

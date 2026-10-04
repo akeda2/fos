@@ -299,6 +299,20 @@ firmware, so a pending slot is tried on the next boot.
   interrupt once the ring is empty); `enable_interrupts` also falls back to MSI-X if plain MSI fails. The Zoom
   H6 on the Skylake shows signal from a microphone on input 1 on the third of its six capture channels.
   Not done: streaming a long take to disk (the `record` tape still captures into RAM first, up to 64 MiB).
+* **`audio-net` (network audio, stage A: raw Ethernet).** One tape, `audio-net send|recv`, with an `audio-wire`
+  crate (host-tested) for the formats. Raw mode (ethertype 0x88ba): an 18-byte header (sequence, frame
+  timestamp, stream id, channels, bit depth, frames, rate) and big-endian 16/24-bit interleaved samples,
+  1 ms packets for a stereo pair and shorter for many channels so a packet fits one frame. `send` takes the
+  capture side of the USB audio device (`ch=9-10,1` picks channels, `bits=`, `to=MAC`) or a test tone
+  (`src=tone=440`, no audio hardware needed); `recv` locks onto the first sender, plays on the device
+  (`ch=` places the stream's channels on output channels), bridges short sequence gaps with silence, resyncs
+  after long ones, and keeps the playback ring near `target=` ms by dropping or repeating one frame at a
+  time (a resampler replaces that in a later stage). Playback's transfer window is now ~6 ms (a packet plays a
+  whole window after it is filled, so the window is the latency). `micros()` no longer goes backwards when
+  the timer interrupt is late (a pending timer interrupt counts as an elapsed tick, and the value is clamped).
+  Tested between two QEMU guests (`make test-v2-audio-net`: stereo 24-bit and mono 16-bit tones, 0 lost,
+  measured 438/877 Hz). Plan: stage B RTP/UDP L24 with AES67-style packets and SDP, C Opus, D resampler,
+  E multicast, alternate-setting choice and duplex. (Dante itself is proprietary; AES67 mode is the open way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

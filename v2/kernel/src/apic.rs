@@ -15,6 +15,8 @@ const REG_LVT_TIMER: u32 = 0x320;
 const REG_TIMER_INITIAL: u32 = 0x380;
 const REG_TIMER_CURRENT: u32 = 0x390;
 const REG_TIMER_DIVIDE: u32 = 0x3e0;
+/// The interrupt request registers: eight 32-bit words, 0x10 apart; vector V is bit V%32 of word V/32.
+const REG_IRR: u32 = 0x200;
 
 pub const TIMER_VECTOR: u8 = 0x40;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
@@ -27,6 +29,8 @@ const APIC_BASE_X2APIC: u64 = 1 << 10;
 const PM_TIMER_HZ: u64 = 3_579_545;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// The last value `micros()` returned: it never goes below it.
+static LAST_MICROS: AtomicU64 = AtomicU64::new(0);
 static mut BASE: u64 = 0;
 static mut X2APIC: bool = false;
 static mut PER_TICK: u32 = 0;
@@ -76,6 +80,12 @@ pub fn tick() {
 
 /// Microseconds since boot: the tick count refined by how far the local APIC timer has
 /// counted down within the current tick.
+///
+/// When the timer interrupt is late (interrupts disabled for a while, or the virtual CPU stalled) the
+/// countdown has already restarted while `ticks()` has not yet advanced, which used to make the clock
+/// jump back by up to 10 ms and then forward again. A timer interrupt that is requested but not yet
+/// serviced (its bit in the local APIC's IRR) is therefore counted as an elapsed tick, and the result is
+/// clamped so the clock never goes backwards whatever else happens.
 pub fn micros() -> u64 {
     unsafe {
         if PER_TICK == 0 {
@@ -84,11 +94,14 @@ pub fn micros() -> u64 {
         loop {
             let before = ticks();
             let current = u64::from(read(REG_TIMER_CURRENT));
+            let pending = read(REG_IRR + 0x10 * (u32::from(TIMER_VECTOR) / 32)) & (1 << (TIMER_VECTOR % 32)) != 0;
             if ticks() != before {
                 continue; // the tick rolled over while reading
             }
             let elapsed = (u64::from(PER_TICK) - current.min(u64::from(PER_TICK))) * 10_000 / u64::from(PER_TICK);
-            return before * 10_000 + elapsed;
+            let value = (before + u64::from(pending)) * 10_000 + elapsed;
+            let previous = LAST_MICROS.fetch_max(value, Ordering::Relaxed);
+            return value.max(previous);
         }
     }
 }

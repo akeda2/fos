@@ -238,8 +238,12 @@ use crate::memory;
 use crate::xhci::{self, Controller, Device, Ring as TransferRing};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-/// Transfers kept queued per stream.
+/// Most transfers kept queued per stream (the array size). Capture keeps all of them (24 ms at high speed: a
+/// capture packet is delivered when it completes, so a long window adds no latency). Playback keeps only about
+/// `PLAYBACK_WINDOW_MS` of them, because a packet is filled when it is queued and plays a whole window later:
+/// the window *is* the playback latency.
 const WINDOW: usize = 192;
+const PLAYBACK_WINDOW_MS: u32 = 6;
 /// PCM ring size in bytes (about a second of 6-channel 24-bit audio at 48 kHz fits).
 const RING_BYTES: usize = 1 << 20;
 const FEEDBACK_WINDOW: usize = 8;
@@ -319,6 +323,8 @@ struct Stream {
     /// Slot whose completion is expected next, and the TRB address queued for each slot.
     next: usize,
     trbs: [u64; WINDOW],
+    /// How many of `trbs` are in use (capture: all; playback: about 6 ms worth).
+    window: usize,
     pcm: PcmRing,
     /// Playback only: frames per packet in Q16 fixed point (nominal, or what the device's feedback endpoint
     /// last reported) and the fractional remainder carried from packet to packet.
@@ -490,6 +496,7 @@ fn build_stream(controller: &mut Controller, device: &Device, description: &Desc
         frames,
         next: 0,
         trbs: [0; WINDOW],
+        window: WINDOW,
         pcm,
         step_q16: 0,
         accumulator_q16: 0,
@@ -503,6 +510,9 @@ fn build_stream(controller: &mut Controller, device: &Device, description: &Desc
         underruns: AtomicU64::new(0),
     };
     stream.step_q16 = stream.nominal_step();
+    if !capture {
+        stream.window = ((stream.packets_per_second * PLAYBACK_WINDOW_MS / 1000) as usize).clamp(8, WINDOW);
+    }
     if !capture && alt.feedback != 0 && alt.feedback_packet >= 3 {
         stream.feedback = build_feedback(controller, device, &alt);
     }
@@ -628,7 +638,7 @@ pub fn irq_event(index: usize, event: &xhci::Trb) -> bool {
         }
         // Completions arrive in queue order; if one was missed, resynchronise on the TRB address.
         let slot = if stream.trbs[stream.next] == event.trb_address() { stream.next } else { stream.trbs.iter().position(|&a| a == event.trb_address()).unwrap_or(stream.next) };
-        stream.next = (slot + 1) % WINDOW;
+        stream.next = (slot + 1) % stream.window;
         stream.packets.fetch_add(1, Ordering::Relaxed);
         let ok = matches!(event.completion(), xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT);
         if !ok {
@@ -654,7 +664,7 @@ fn publish(slot: &mut Option<Stream>, stream: Stream) {
     let was = crate::cpu::interrupts_save_and_disable();
     *slot = Some(stream);
     let stream = slot.as_mut().unwrap();
-    for position in 0..WINDOW {
+    for position in 0..stream.window {
         queue_slot(stream, position);
     }
     if let Some(feedback) = stream.feedback.as_mut() {
