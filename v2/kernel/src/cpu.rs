@@ -19,6 +19,12 @@ pub fn outl(port: u16, value: u32) {
     unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack)) };
 }
 
+pub fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe { core::arch::asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
 pub fn inl(port: u16) -> u32 {
     let value: u32;
     unsafe { core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack)) };

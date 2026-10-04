@@ -232,6 +232,17 @@ firmware, so a pending slot is tried on the next boot.
   it; any other disk (an MBR, a file system, a GPT with only foreign partitions) needs `force`
   because its partition table is replaced. The data area is not wiped, only the superblock and
   directory. Test: `make test-v2-format`.
+* **`ed`, `copy` and the diagnostic commands (ported from v1).** `ed` (`run ed NAME`, also
+  `diskN/NAME` and `@LABEL/NAME`) is the v1 line editor; its cursor-key line editor needs the
+  arrow/Home/End/Delete keys, which both keyboard decoders now produce as private codes
+  (`keymap::KEY_*`) and a running tape receives as the ANSI sequences a terminal would send, and
+  the framebuffer console now understands `ESC [ n C`, `ESC [ n D`, `ESC [ K` and `ESC [ 2 J`.
+  The tape file callbacks (`fs_read`/`fs_write`/`fs_remove`) accept the same `diskN/NAME` and
+  `@LABEL/NAME` references. `copy SRC NAME DST [NEWNAME]` moves a file between volumes through a
+  page-allocator buffer (no 64 KiB limit). `cpuinfo`, `bootinfo`, `memmap`, `irqstat` (the I/O APIC
+  pins), `pci read|write B:D.F`, `io r8|w8..` and `mmio r32|w32..` (mapped addresses only, never the
+  kernel image) and `clear` report or poke the machine from the shell. Tests: `make test-v2-ed`,
+  `test-v2-disks`, `test-v2-diag`.
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

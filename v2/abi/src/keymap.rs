@@ -3,6 +3,37 @@
 //! produce plain ASCII for a US layout, which is all the shell needs. Pure functions
 //! and a small state machine, so the host unit tests cover them.
 
+/// Private codes for the keys that have no ASCII value, queued like any other key byte. They
+/// are all >= 0x80, which the shell's line editor ignores; a running tape gets them expanded
+/// to the ANSI sequences a terminal sends (`ESC [ A` for Up, ...), see `ansi_sequence`.
+pub const KEY_UP: u8 = 0x81;
+pub const KEY_DOWN: u8 = 0x82;
+pub const KEY_RIGHT: u8 = 0x83;
+pub const KEY_LEFT: u8 = 0x84;
+pub const KEY_HOME: u8 = 0x85;
+pub const KEY_END: u8 = 0x86;
+pub const KEY_DELETE: u8 = 0x87;
+pub const KEY_INSERT: u8 = 0x88;
+pub const KEY_PAGE_UP: u8 = 0x89;
+pub const KEY_PAGE_DOWN: u8 = 0x8a;
+
+/// The bytes after `ESC [` that a terminal sends for one of the private key codes above.
+pub fn ansi_sequence(code: u8) -> Option<&'static [u8]> {
+    Some(match code {
+        KEY_UP => b"A",
+        KEY_DOWN => b"B",
+        KEY_RIGHT => b"C",
+        KEY_LEFT => b"D",
+        KEY_HOME => b"H",
+        KEY_END => b"F",
+        KEY_DELETE => b"3~",
+        KEY_INSERT => b"2~",
+        KEY_PAGE_UP => b"5~",
+        KEY_PAGE_DOWN => b"6~",
+        _ => return None,
+    })
+}
+
 const SET1_PLAIN: &[u8; 0x3a] = b"\0\x1b1234567890-=\x08\tqwertyuiop[]\n\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 ";
 const SET1_SHIFT: &[u8; 0x3a] = b"\0\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 ";
 
@@ -70,6 +101,25 @@ impl Set1Decoder {
         if !released && !extended && matches!(code, 0x58 | 0x3e | 0x40 | 0x41 | 0x42 | 0x44) {
             return Some(0x1b);
         }
+        if extended && !released {
+            // The cursor block (and the Insert/Delete/Home/End/Page keys above it) are extended keys.
+            let key = match code {
+                0x48 => KEY_UP,
+                0x50 => KEY_DOWN,
+                0x4d => KEY_RIGHT,
+                0x4b => KEY_LEFT,
+                0x47 => KEY_HOME,
+                0x4f => KEY_END,
+                0x53 => KEY_DELETE,
+                0x52 => KEY_INSERT,
+                0x49 => KEY_PAGE_UP,
+                0x51 => KEY_PAGE_DOWN,
+                _ => 0,
+            };
+            if key != 0 {
+                return Some(key);
+            }
+        }
         if released || extended || code as usize >= SET1_PLAIN.len() || byte == 0xfa || byte == 0xfe || byte == 0xaa {
             return None;
         }
@@ -83,6 +133,19 @@ pub fn hid_ascii(usage: u8, modifiers: u8, caps: bool) -> Option<u8> {
     // HID usages of F4, F6, F7, F8, F10, F12: the "give up" keys, acting as Escape.
     if matches!(usage, 0x3d | 0x3f | 0x40 | 0x41 | 0x43 | 0x45) {
         return Some(0x1b);
+    }
+    match usage {
+        0x49 => return Some(KEY_INSERT),
+        0x4a => return Some(KEY_HOME),
+        0x4b => return Some(KEY_PAGE_UP),
+        0x4c => return Some(KEY_DELETE),
+        0x4d => return Some(KEY_END),
+        0x4e => return Some(KEY_PAGE_DOWN),
+        0x4f => return Some(KEY_RIGHT),
+        0x50 => return Some(KEY_LEFT),
+        0x51 => return Some(KEY_DOWN),
+        0x52 => return Some(KEY_UP),
+        _ => {}
     }
     let index = usize::from(usage.checked_sub(4)?);
     if index >= HID_PLAIN.len() {
@@ -116,7 +179,11 @@ mod tests {
     #[test]
     fn set1_ctrl_and_extended() {
         assert_eq!(type_set1(&[0x1d, 0x2e, 0xae, 0x9d]), &[3]); // Ctrl-C
-        assert_eq!(type_set1(&[0xe0, 0x48, 0xe0, 0xc8]), b""); // up arrow: ignored
+        assert_eq!(type_set1(&[0xe0, 0x48, 0xe0, 0xc8]), &[KEY_UP]); // up arrow: a private code on press, nothing on release
+        assert_eq!(type_set1(&[0xe0, 0x4b, 0xe0, 0xcb, 0xe0, 0x53, 0xe0, 0xd3]), &[KEY_LEFT, KEY_DELETE]);
+        assert_eq!(ansi_sequence(KEY_LEFT), Some(&b"D"[..]));
+        assert_eq!(ansi_sequence(KEY_DELETE), Some(&b"3~"[..]));
+        assert_eq!(ansi_sequence(b'a'), None);
         assert_eq!(type_set1(&[0xfa, 0xaa]), b""); // controller reply bytes
     }
 
@@ -142,5 +209,7 @@ mod tests {
         assert_eq!(hid_ascii(0x06, 0x01, false), Some(3)); // Ctrl-C
         assert_eq!(hid_ascii(0x39, 0, false), None); // caps lock itself
         assert_eq!(hid_ascii(0x00, 0, false), None);
+        assert_eq!(hid_ascii(0x50, 0, false), Some(KEY_LEFT));
+        assert_eq!(hid_ascii(0x4c, 0, false), Some(KEY_DELETE));
     }
 }

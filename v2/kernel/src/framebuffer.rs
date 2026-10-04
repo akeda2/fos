@@ -24,6 +24,9 @@ pub struct Console {
     row: usize,
     foreground: u32,
     background: u32,
+    /// ANSI escape parsing: 0 = none, 1 = after ESC, 2 = inside `ESC [` collecting a number.
+    escape: u8,
+    parameter: usize,
 }
 
 /// The largest text grid kept (256 columns x 100 rows covers up to 2048x1600 at 8x16).
@@ -97,8 +100,51 @@ impl Console {
         }
     }
 
+    /// The few ANSI sequences a tape's screen editor sends: `ESC [ n C` / `ESC [ n D` (cursor
+    /// right/left, stopping at the row's ends), `ESC [ K` (erase to the end of the row) and
+    /// `ESC [ 2 J` (clear the screen, cursor home). Anything else is swallowed. A serial or
+    /// `term net` terminal gets the same bytes and does these itself.
+    fn control_sequence(&mut self, last: u8) {
+        let count = self.parameter.max(1);
+        match last {
+            b'C' => self.column = (self.column + count).min(self.columns - 1),
+            b'D' => self.column = self.column.saturating_sub(count),
+            b'K' => {
+                let start = self.row * self.columns + self.column.min(self.columns - 1);
+                let end = (self.row + 1) * self.columns;
+                unsafe { (&mut *core::ptr::addr_of_mut!(CELLS))[start..end].fill(b' ') };
+            }
+            b'J' if self.parameter == 2 => {
+                unsafe { (&mut *core::ptr::addr_of_mut!(CELLS))[..self.rows * self.columns].fill(b' ') };
+                self.row = 0;
+                self.column = 0;
+            }
+            _ => {}
+        }
+    }
+
     fn put(&mut self, character: u8) {
+        match self.escape {
+            1 => {
+                self.escape = if character == b'[' { 2 } else { 0 };
+                self.parameter = 0;
+                return;
+            }
+            2 => {
+                match character {
+                    b'0'..=b'9' => self.parameter = self.parameter.saturating_mul(10).saturating_add(usize::from(character - b'0')),
+                    b';' => self.parameter = 0,
+                    last => {
+                        self.escape = 0;
+                        self.control_sequence(last);
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
         match character {
+            0x1b => self.escape = 1,
             b'\n' => self.newline(),
             b'\r' => self.column = 0,
             // The shell erases a typed character with "\x08 \x08" (back, blank, back): a serial
@@ -145,6 +191,8 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
         row: 0,
         foreground: 0,
         background: 0,
+        escape: 0,
+        parameter: 0,
     };
     console.foreground = console.pixel(0xc0, 0xc0, 0xc0);
     console.background = console.pixel(0x00, 0x00, 0x20);

@@ -27,6 +27,15 @@ fn write(register: u32, value: u32) {
     }
 }
 
+/// One pin's redirection entry (low, high dwords), or `None` past the last pin.
+pub fn entry(pin: u32) -> Option<(u32, u32)> {
+    (pin < unsafe { PINS }).then(|| (read(0x10 + 2 * pin), read(0x11 + 2 * pin)))
+}
+
+pub fn first_gsi() -> u32 {
+    unsafe { GSI_BASE }
+}
+
 /// Maps the first I/O APIC and masks every pin. Returns the number of pins.
 pub fn init(madt: &acpi::Madt) -> Option<u32> {
     if madt.io_apics == 0 || madt.io_apic_address == 0 {

@@ -440,7 +440,19 @@ fn tape_service() {
     crate::debug::pet();
     crate::usb_hid::poll();
     while let Some(key) = crate::keyboard::pop() {
-        tape_input_push(if key == 0x1b { TAPE_ABORT } else { u16::from(key) });
+        if key == 0x1b {
+            tape_input_push(TAPE_ABORT);
+        } else if let Some(sequence) = fos_v2_abi::keymap::ansi_sequence(key) {
+            // A cursor key (a private code from the keyboard decoders): the tape sees the bytes a
+            // terminal would send, ESC [ A for Up and so on, like a `term net` client's keys.
+            tape_input_push(0x1b);
+            tape_input_push(u16::from(b'['));
+            for &byte in sequence {
+                tape_input_push(u16::from(byte));
+            }
+        } else {
+            tape_input_push(u16::from(key));
+        }
     }
     let mut buffer = [0u8; 1600];
     for index in 0..nic_count() {
@@ -610,11 +622,15 @@ fn execute(command: &str) {
             crate::println!("help      this list");
             crate::println!("about     what this is");
             crate::println!("memory    physical memory statistics");
-            crate::println!("pci       list PCI functions");
+            crate::println!("pci       list PCI functions (pci read|write B:D.F ... reaches config space)");
+            crate::println!("cpuinfo bootinfo memmap irqstat   what the CPU, loader and firmware report");
+            crate::println!("hexdump ADDRESS [LENGTH]   dump mapped memory; io r8|w8.. PORT; mmio r32|w32.. ADDR");
+            crate::println!("clear     clear the screen");
             crate::println!("nic       the network interface");
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
+            crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL)");
             crate::println!("ls [diskN]        list FOSFS files");
             crate::println!("cat [diskN] NAME  show a file");
             crate::println!("write [diskN] NAME TEXT   create or replace a file");
@@ -639,6 +655,7 @@ fn execute(command: &str) {
             crate::println!("Managed:   {} MiB ({} frames of 4 KiB)", stats.frames * memory::FRAME / (1024 * 1024), stats.frames);
             crate::println!("Free:      {} MiB ({} frames)", stats.free * memory::FRAME / (1024 * 1024), stats.free);
         }
+        "pci" if crate::diag::pci_access(words.clone()) => {}
         "pci" => {
             for device in pci::devices() {
                 crate::println!(
@@ -656,6 +673,13 @@ fn execute(command: &str) {
         }
         "nic" if matches!(words.clone().next(), Some("send")) => nic_send_test(),
         "nic" if matches!(words.clone().next(), Some("recv")) => nic_recv_test(),
+        "cpuinfo" => crate::diag::cpuinfo(),
+        "bootinfo" => crate::diag::bootinfo(),
+        "memmap" => crate::diag::memmap(),
+        "irqstat" => crate::diag::irqstat(),
+        "io" => crate::diag::io(words),
+        "mmio" => crate::diag::mmio(words),
+        "clear" => crate::print(format_args!("\x1b[2J")),
         "hexdump" => {
             let address = words.next().and_then(parse_number);
             let length = words.next().and_then(parse_number).unwrap_or(64);
@@ -707,6 +731,7 @@ fn execute(command: &str) {
         "run" => crate::tape::run_named(command.strip_prefix("run").unwrap_or("")),
         "label" => label_command(words),
         "format" => format_command(words),
+        "copy" => copy_command(words),
         "disks" => {
             for index in 0..crate::block::count() {
                 let disk = crate::block::get(index).unwrap();
@@ -848,6 +873,91 @@ fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(cra
         Ok(volume) => action(volume, rest),
         Err(error) => crate::println!("disk{number}: {error}."),
     }
+}
+
+/// A volume named by a command word: `diskN` or `@LABEL`. `None` if the word is neither.
+fn volume_word(word: &str) -> Option<Result<(usize, crate::fosfs::Volume), String8Error>> {
+    if let Some(label) = word.strip_prefix('@') {
+        return Some(crate::storage::volume_labelled(label.as_bytes()).ok_or(String8Error::NoLabel));
+    }
+    let number = word.strip_prefix("disk")?.parse::<usize>().ok()?;
+    Some(crate::storage::volume_on(number).map(|volume| (number, volume)).map_err(String8Error::Volume))
+}
+
+enum String8Error {
+    NoLabel,
+    Volume(crate::storage::VolumeError),
+}
+
+/// `copy SRC NAME DST [NEWNAME]`: one file from one volume to another, where SRC and DST are
+/// `diskN` or `@LABEL`. The whole file goes through a buffer taken from the page allocator, so
+/// it can be larger than the shell's own 64 KiB file buffer. The source is only read.
+fn copy_command(mut words: core::str::SplitWhitespace) {
+    let (Some(source), Some(name), Some(destination)) = (words.next(), words.next(), words.next()) else {
+        return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (SRC and DST: diskN or @LABEL)");
+    };
+    let new_name = words.next().unwrap_or(name);
+    let mut resolve = |word: &str| match volume_word(word) {
+        Some(Ok(found)) => Some(found),
+        Some(Err(String8Error::NoLabel)) => {
+            crate::println!("copy: no volume carries the label in {word}.");
+            None
+        }
+        Some(Err(String8Error::Volume(error))) => {
+            crate::println!("copy: {word}: {error}.");
+            None
+        }
+        None => {
+            crate::println!("copy: {word} is not diskN or @LABEL.");
+            None
+        }
+    };
+    let Some((source_number, source_volume)) = resolve(source) else { return };
+    let Some((destination_number, destination_volume)) = resolve(destination) else { return };
+    if source_number == destination_number && name == new_name {
+        return crate::println!("copy: source and destination are the same file.");
+    }
+    if !crate::fosfs::valid_name(new_name.as_bytes()) {
+        return crate::println!("copy: {new_name} is not a valid file name.");
+    }
+    let length = match source_volume.file_length(name.as_bytes()) {
+        Ok(Some(length)) => length as usize,
+        Ok(None) => return crate::println!("copy: {name}: no such file on {source}."),
+        Err(error) => return crate::println!("copy: {name}: {error:?}"),
+    };
+    const LIMIT: usize = 64 << 20;
+    if length > LIMIT {
+        return crate::println!("copy: {name} is {} MiB; the limit is {} MiB.", length >> 20, LIMIT >> 20);
+    }
+    let frames = (length.max(1) as u64).div_ceil(crate::memory::FRAME);
+    let Some(buffer) = crate::memory::allocate_contiguous(frames, None) else {
+        return crate::println!("copy: not enough free memory for {length} bytes.");
+    };
+    let data = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, length) };
+    let outcome = match source_volume.read(name.as_bytes(), data) {
+        Ok(Some(read)) if read == length => destination_volume.write(new_name.as_bytes(), &data[..length]).map_err(|error| copy_error("write", error)),
+        Ok(_) => Err(CopyError("the source changed while it was being read")),
+        Err(error) => Err(copy_error("read", error)),
+    };
+    crate::memory::free(buffer, frames);
+    match outcome {
+        Ok(()) => crate::println!("Copied {name} ({length} bytes) from {source} to {destination} as {new_name}."),
+        Err(CopyError(reason)) => crate::println!("copy: {reason}."),
+    }
+}
+
+struct CopyError(&'static str);
+
+#[allow(non_snake_case)]
+fn copy_error(stage: &'static str, error: crate::fosfs::Error) -> CopyError {
+    use crate::fosfs::Error;
+    CopyError(match (stage, error) {
+        ("write", Error::DirectoryFull) => "the destination directory is full",
+        ("write", Error::DataFull) => "the destination volume is full",
+        ("write", Error::InvalidName) => "the destination name is invalid",
+        ("write", _) => "writing the destination failed",
+        _ => "reading the source failed",
+    })
 }
 
 /// A `format` that was announced and awaits `format diskN confirm`.

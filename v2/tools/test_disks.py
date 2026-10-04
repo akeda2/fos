@@ -105,6 +105,18 @@ def main():
             check("no FOSFS" in run("label disk3 x"), "a disk without a FOSFS volume cannot be labelled", "")
             check("no volume carries that label" in run("ls @nothing"), "an unknown label is refused, not answered from the boot volume", "")
             check("label cleared" in run("label @boot -") and "disk1: (no label)" in run("label"), "`label @NAME -` clears it", "")
+
+            check("Copied only2" in run("copy disk2 only2 disk1"), "`copy disk2 NAME disk1` copies a file between volumes", "")
+            check("lives on the second disk only" in run("cat only2"), "and the copy reads back on the destination", "")
+            check("as moved2" in run("copy @backup only2 disk1 moved2") and "lives on the second" in run("cat moved2"), "`copy` takes @LABEL volumes and a new name", "")
+            check("same file" in run("copy disk1 only2 disk1"), "copying a file onto itself is refused", "")
+            check("no such file" in run("copy disk1 missing disk2"), "a missing source file is refused", "")
+            check("not diskN or @LABEL" in run("copy boot only2 disk2"), "a bad volume word is refused", "")
+            big = run("ls")
+            size = [line.split()[1] for line in big.splitlines() if line.startswith("router")][0]
+            check(int(size) > 65536, "(the router tape is larger than the shell's 64 KiB file buffer)", big)
+            check("Copied router" in run("copy disk1 router @backup"), "a file larger than 64 KiB copies too", "")
+            check(f"router" in run("ls @backup") and size in run("ls @backup"), "and arrives with the same length", "")
             wire.send(guest, TAG_DATA, b"shutdown\n")
         finally:
             process.terminate()

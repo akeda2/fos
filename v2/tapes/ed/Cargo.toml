@@ -1,0 +1,22 @@
+[package]
+name = "ed-tape"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ed_tape"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ed"
+path = "src/main.rs"
+
+[dependencies]
+tape-rt = { path = "../tape-rt" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = "symbols"

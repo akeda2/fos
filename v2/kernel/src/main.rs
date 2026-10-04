@@ -21,6 +21,7 @@ mod block;
 mod apic;
 mod config;
 mod debug;
+mod diag;
 mod cpu;
 mod e1000;
 mod ehci;

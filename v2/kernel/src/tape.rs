@@ -30,6 +30,11 @@ static mut LOADED_NAME_LENGTH: usize = 0;
 static mut INFO: *const BootInfo = core::ptr::null();
 static LOADED_SPAN: AtomicU64 = AtomicU64::new(0);
 
+/// The loader's BootInfo, for diagnostics (`bootinfo`, `memmap`).
+pub fn boot_info() -> Option<&'static BootInfo> {
+    unsafe { INFO.as_ref() }
+}
+
 pub fn set_boot_info(info: &BootInfo) {
     unsafe { INFO = info };
 }
@@ -152,9 +157,27 @@ extern "C" fn api_free(address: usize, bytes: usize) {
         memory::free(address as u64, (bytes as u64).div_ceil(memory::FRAME));
     }
 }
+/// Resolves a tape's file reference: a plain `NAME` is on the boot volume, `diskN/NAME` on
+/// that disk's FOSFS volume and `@LABEL/NAME` on the volume carrying that label.
+fn resolve_file(reference: &[u8]) -> Result<(crate::fosfs::Volume, &[u8]), isize> {
+    let Some(slash) = reference.iter().position(|&byte| byte == b'/') else {
+        return storage::boot_volume().map(|volume| (volume, reference)).ok_or(FS_NO_VOLUME);
+    };
+    let (selector, name) = (&reference[..slash], &reference[slash + 1..]);
+    let volume = if let Some(label) = selector.strip_prefix(b"@") {
+        storage::volume_labelled(label).map(|(_, volume)| volume)
+    } else {
+        let number = selector.strip_prefix(b"disk").and_then(|digits| core::str::from_utf8(digits).ok()).and_then(|digits| digits.parse::<usize>().ok());
+        number.and_then(|number| storage::volume_on(number).ok())
+    };
+    volume.map(|volume| (volume, name)).ok_or(FS_NO_VOLUME)
+}
 extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, capacity: usize) -> isize {
-    let Some(volume) = storage::boot_volume() else { return FS_NO_VOLUME };
-    let name = unsafe { core::slice::from_raw_parts(name, name_length) };
+    let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
+    let (volume, name) = match resolve_file(reference) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
     let buffer = unsafe { core::slice::from_raw_parts_mut(buffer, capacity) };
     match volume.read(name, buffer) {
         Ok(Some(length)) => length as isize,
@@ -164,8 +187,11 @@ extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, 
     }
 }
 extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8, length: usize) -> isize {
-    let Some(volume) = storage::boot_volume() else { return FS_NO_VOLUME };
-    let (name, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
+    let (reference, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
+    let (volume, name) = match resolve_file(reference) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
     match volume.write(name, data) {
         Ok(()) => 0,
         Err(crate::fosfs::Error::InvalidName) => FS_BAD_NAME,
@@ -176,8 +202,11 @@ extern "C" fn api_free_pages() -> usize {
     memory::stats().free as usize
 }
 extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {
-    let Some(volume) = storage::boot_volume() else { return FS_NO_VOLUME };
-    match volume.remove(unsafe { core::slice::from_raw_parts(name, name_length) }) {
+    let (volume, name) = match resolve_file(unsafe { core::slice::from_raw_parts(name, name_length) }) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    match volume.remove(name) {
         Ok(true) => 0,
         Ok(false) => FS_NOT_FOUND,
         Err(_) => FS_ERROR,

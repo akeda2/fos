@@ -146,6 +146,14 @@ impl Volume {
         Ok(label)
     }
 
+    /// The length in bytes of file `name`, or `None` if there is no such file.
+    pub fn file_length(&self, name: &[u8]) -> Result<Option<u64>, Error> {
+        if !valid_name(name) {
+            return Err(Error::InvalidName);
+        }
+        Ok(self.find(name)?.map(|entry| entry.length))
+    }
+
     /// Sets the label; an empty slice clears it.
     pub fn set_label(&self, label: &[u8]) -> Result<(), Error> {
         if !label.is_empty() && !valid_name(label) {
