@@ -365,7 +365,7 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
 pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
     for index in 0..xhci::count() {
         let Some(controller) = xhci::controller(index) else { continue };
-        print(format_args!("xHCI {:02x}:{:02x}.{}: {} ports, events by {}", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports, if controller.interrupt_driven { "MSI" } else { "polling" }));
+        print(format_args!("xHCI {:02x}:{:02x}.{}: {} ports, events by {}", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports, if !controller.interrupt_driven { "polling" } else if controller.uses_msix { "MSI-X" } else { "MSI" }));
         for port in 1..=controller.ports {
             let status = controller.port_status(port);
             if status & 1 != 0 {

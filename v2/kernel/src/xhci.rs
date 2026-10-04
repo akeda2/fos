@@ -295,6 +295,8 @@ pub struct Controller {
     pub index: usize,
     /// True once MSI delivers this controller's events (otherwise the foreground drains the ring).
     pub interrupt_driven: bool,
+    /// Whether the interrupt path in use is MSI-X (otherwise plain MSI).
+    pub uses_msix: bool,
     dcbaa: u64,
     command_ring: Ring,
     slots: [Slot; MAX_SLOTS + 1],
@@ -417,7 +419,7 @@ pub fn enable_interrupts_all(no_msi: bool) {
             continue;
         }
         match controller.enable_interrupts() {
-            Ok(vector) => crate::println!("xHCI {:02x}:{:02x}.{}: MSI on vector {vector:#x} (the self-test interrupt arrived); events no longer need the foreground.", controller.pci.bus, controller.pci.device, controller.pci.function),
+            Ok(vector) => crate::println!("xHCI {:02x}:{:02x}.{}: {} on vector {vector:#x} (the self-test interrupt arrived); events no longer need the foreground.", controller.pci.bus, controller.pci.device, controller.pci.function, if controller.uses_msix { "MSI-X" } else { "MSI" }),
             Err(reason) => crate::println!("xHCI {:02x}:{:02x}.{}: events polled ({reason}).", controller.pci.bus, controller.pci.device, controller.pci.function),
         }
     }
@@ -573,6 +575,7 @@ impl Controller {
             context_bytes: if hccparams1 & (1 << 2) != 0 { 64 } else { 32 },
             index,
             interrupt_driven: false,
+            uses_msix: false,
             dcbaa,
             command_ring,
             slots: [EMPTY_SLOT; MAX_SLOTS + 1],
@@ -624,45 +627,62 @@ impl Controller {
         soft_pop(self.index)
     }
 
-    /// Switches this controller's events to MSI (or MSI-X, table entry 0 = interrupter 0, when the plain
-    /// capability is missing, as on QEMU's xHCI). Returns the vector, or why it stays polled.
+    /// Switches this controller's events to MSI, falling back to MSI-X (table entry 0 = interrupter 0) if
+    /// the plain-MSI self-test fails or the capability is missing (QEMU's xHCI has only MSI-X; the NEC
+    /// uPD720200 on the Sandy Bridge machine has both but only MSI-X works, as Linux's xhci also tries
+    /// it first). Returns the vector, or why the controller stays polled.
     pub fn enable_interrupts(&mut self) -> Result<u8, &'static str> {
         let msi = self.pci.find_capability(0x05).is_some();
         let msix = self.pci.find_capability(0x11).is_some();
         if !msi && !msix {
             return Err("no MSI or MSI-X capability");
         }
-        let Some(vector) = crate::msi::allocate(interrupt, self.index) else { return Err("no free MSI vector") };
-        let enabled = if msi { self.pci.enable_msi(vector, apic::id()) } else { self.pci.enable_msix(vector, apic::id()) };
-        if !enabled {
-            crate::msi::release(vector);
-            return Err("could not enable MSI");
-        }
-        let interrupter = self.runtime + 0x20;
-        write32(interrupter + 0x04, 4000); // IMOD: at most one interrupt per 4000 x 250 ns = 1 ms
-        write32(interrupter, 0b11); // IMAN: clear a pending bit, enable the interrupter
-        write32(self.operational + OP_USBCMD, read32(self.operational + OP_USBCMD) | (1 << 2)); // USBCMD.INTE
-        let before = crate::msi::count(vector);
-        if self.command(0, 0, TRB_NOOP_COMMAND << 10).is_err() {
-            return Err("the self-test command failed");
-        }
-        let start = apic::ticks();
-        while crate::msi::count(vector) == before && apic::ticks().wrapping_sub(start) < 3 {
-            core::hint::spin_loop();
-        }
-        if crate::msi::count(vector) == before {
+        let mut reason = "no interrupt path passed its self-test";
+        for use_msix in [false, true] {
+            if (use_msix && !msix) || (!use_msix && !msi) {
+                continue;
+            }
+            let Some(vector) = crate::msi::allocate(interrupt, self.index) else { return Err("no free MSI vector") };
+            let enabled = if use_msix { self.pci.enable_msix(vector, apic::id()) } else { self.pci.enable_msi(vector, apic::id()) };
+            if !enabled {
+                crate::msi::release(vector);
+                reason = "could not enable MSI";
+                continue;
+            }
+            let interrupter = self.runtime + 0x20;
+            write32(interrupter + 0x04, 4000); // IMOD: at most one interrupt per 4000 x 250 ns = 1 ms
+            write32(interrupter, 0b11); // IMAN: clear a pending bit, enable the interrupter
+            write32(self.operational + OP_USBCMD, read32(self.operational + OP_USBCMD) | (1 << 2)); // USBCMD.INTE
+            let before = crate::msi::count(vector);
+            // Queue the no-op and wait for the interrupt WITHOUT draining the event ring ourselves: some
+            // controllers (the NEC uPD720200) drop a moderated interrupt if the ring is emptied before the
+            // moderation timer expires. Once the interrupt is in (or the wait times out) the handler or
+            // `wait_event` below consumes the completion.
+            let command = self.command_ring.push(0, 0, TRB_NOOP_COMMAND << 10);
+            self.ring_doorbell(0, 0);
+            let start = apic::ticks();
+            while crate::msi::count(vector) == before && apic::ticks().wrapping_sub(start) < 5 {
+                core::hint::spin_loop();
+            }
+            if self.wait_event(TIMEOUT_TICKS, |event| event.kind() == TRB_COMMAND_COMPLETION && event.parameter == command).is_err() {
+                return Err("the self-test command failed");
+            }
+            if crate::msi::count(vector) != before {
+                self.interrupt_driven = true;
+                self.uses_msix = use_msix;
+                return Ok(vector);
+            }
             write32(self.operational + OP_USBCMD, read32(self.operational + OP_USBCMD) & !(1 << 2));
             write32(interrupter, 1); // IMAN: IE off
-            if msi {
-                self.pci.disable_msi();
-            } else {
+            if use_msix {
                 self.pci.disable_msix();
+            } else {
+                self.pci.disable_msi();
             }
             crate::msi::release(vector);
-            return Err("the MSI self-test interrupt never arrived");
+            reason = if use_msix { "the MSI-X self-test interrupt never arrived" } else { "the MSI self-test interrupt never arrived" };
         }
-        self.interrupt_driven = true;
-        Ok(vector)
+        Err(reason)
     }
 
     /// The doorbell register address for `slot`, for code (the audio stream handlers) that rings it

@@ -290,6 +290,14 @@ firmware, so a pending slot is tried on the next boot.
   `audio start 48000 both`, `sleep 8` (a shell command that blocks without polling) and `audio` on the H6 showed
   68,436 capture and 68,520 playback packets, no errors, while the foreground did nothing. Audio objects shared
   with the handler are atomics or published/unpublished with interrupts off (see the comment in `usb_audio.rs`).
+  **RME Fireface UFX** (class compliant, Audio Class 2.0, high speed, on the Sandy Bridge machine's NEC
+  uPD720200 xHCI): 22-channel 24-bit capture (a 12-channel alternate too) and 22-channel playback (a stereo
+  alternate), 1,024-byte endpoints (no high-bandwidth endpoints needed), async with feedback, rates 44.1 to
+  192 kHz. Capture at 48 kHz, duplex at 48 and 96 kHz (96 kHz: 38 MB of capture in 6 s) and an 8 s blocked-foreground
+  run all gave no errors; its feedback shows its clock a few hundred ppm off nominal and the playback follows it.
+  The NEC controller needed the MSI self-test not to drain the ring before the interrupt (it drops a moderated
+  interrupt once the ring is empty); `enable_interrupts` also falls back to MSI-X if plain MSI fails. The Zoom
+  H6 on the Skylake shows signal from a microphone on input 1 on the third of its six capture channels.
   Not done: streaming a long take to disk (the `record` tape still captures into RAM first, up to 64 MiB).
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
