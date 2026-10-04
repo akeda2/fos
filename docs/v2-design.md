@@ -342,6 +342,12 @@ firmware, so a pending slot is tried on the next boot.
   a shared timeline at their RTP timestamps (so pairs stay aligned), and plays the frames all streams have reached
   through the same resampler and servo. QEMU test: a stereo 770 Hz tone (150 packets, 0 lost, measured 765 Hz,
   timestamp step 960) and three channels as two multicast streams with equal timestamps.
+  Hardware (H6 on the Skylake, NIC 3, to the UFX on the Sandy Bridge machine, 20 ms frames, 128 kbit/s, 60 s): 3003
+  of 3003 packets, 0 lost, no underruns while streaming, learned clock offset -4 ppm (it takes ~30 s to settle from
+  the first guess because Opus frames arrive in 20 ms bursts); encoding takes 233 us per frame on the Skylake (459 us
+  worst). The receiver's underrun counter also counts the idle time before and after the stream, so compare it
+  with the stream length. The ring level seen by the servo is the trough between bursts, so `target=` is the
+  margin before an underrun, not the average latency (that is about a frame longer).
   Plan: E multicast/IGMP,
   alternate-setting choice and duplex, AVTP (AVB) raw mode. (Dante itself is proprietary; AES67 mode is the open
   way in.)
