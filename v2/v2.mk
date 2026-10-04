@@ -11,7 +11,7 @@ V2_TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed
 V2_TAPE_BINS := $(foreach tape,$(V2_TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 V2_TAPE_FILES := $(foreach tape,$(V2_TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape)) --file debug=tools/default-debug.txt
 
-.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag
+.PHONY: v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -84,6 +84,10 @@ test-v2-ed: v2-image
 # cpuinfo, bootinfo, memmap, irqstat, pci read/write, io, mmio.
 test-v2-diag: v2-image
 	python3 v2/tools/test_diag.py
+
+# USB audio class 1.0 against QEMU's usb-audio: discovery, a played tone recorded to WAV, capture.
+test-v2-usb-audio: v2-image
+	python3 v2/tools/test_usb_audio.py
 
 # hostname / settings / debug / start files on the boot volume.
 test-v2-config: v2-image

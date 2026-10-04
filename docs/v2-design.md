@@ -256,11 +256,22 @@ firmware, so a pending slot is tried on the next boot.
   847,604 interrupts, no storms). `nic` shows the chip version, link speed/duplex and recoveries; `nic regs [N]`
   dumps the chip's registers and which descriptors the card owns. Not done: a periodic watchdog (a stuck
   transmit descriptor or a PCI system error resets the chip inline, counted as a recovery).
-* **USB audio (in progress).** `usb_audio.rs` recognises Audio Class devices on xHCI and prints their
-  streaming alternate settings (channels, bit depth, isochronous endpoint, sync type, sample rates, feedback
-  endpoint) from the configuration descriptor. A Zoom H6 in stereo mode on the Skylake reports as Audio Class
-  1.0, full speed: 2-channel 16-bit playback (asynchronous, feedback endpoint 0x81) and capture, 44,100 and
-  48,000 Hz. Streaming (xHCI isochronous endpoints, a PCM ring, the tape `audio_*` callbacks) is the next step.
+* **USB audio (xHCI isochronous, Audio Class 1.0 and 2.0).** `usb_audio.rs` recognises Audio Class devices,
+  prints their streaming alternate settings (channels, bit depth, endpoint, sync type, rates, feedback
+  endpoint), keeps the device, and streams: it selects the sample rate (class 1.0: SET_CUR on the endpoint;
+  class 2.0: SET_CUR on the clock source, and the offered rates come from its GET RANGE), selects the alternate
+  setting, configures the isochronous endpoint (`xhci::configure_isoc_endpoint`) and keeps a window of 192
+  one-packet transfers queued (`queue_isoc`, start-ASAP). Each completion event refills (playback) or drains
+  (capture) a packet slot through a 1 MiB PCM ring; the events come in through the normal xHCI event draining
+  (a 1024-entry event ring: a high-speed endpoint completes 8,000 transfers/s). Shell commands: `audio`
+  (status), `audio start|stop`, `audio capture SECONDS [RATE]` (per-second frame counts and per-channel
+  peaks), `audio tone [HZ] [SECONDS] [RATE]`. `make test-v2-usb-audio` plays a tone through QEMU's class 1.0
+  `usb-audio` and checks the WAV it records (439 Hz for 440). Confirmed on a Zoom H6 in multichannel mode on
+  the Skylake (class 2.0, high speed, rates 44.1/48/88.2/96 kHz): capture of 6 channels 24-bit at 48 kHz gave
+  47,984-48,016 frames/s with no errors, playback of 2 channels 24-bit streamed 8,000 packets/s with no errors.
+  Not done: the asynchronous feedback endpoint (the device's real clock; playback runs at the nominal rate),
+  the tape-facing `audio_*` ABI, capture/playback together, PCM format conversion, interrupt-driven event
+  handling (events are handled whenever the xHCI ring is drained, from tape/shell loops).
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

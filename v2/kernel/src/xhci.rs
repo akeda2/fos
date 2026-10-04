@@ -22,6 +22,9 @@ use crate::{apic, memory, paging, pci};
 pub const MAX_CONTROLLERS: usize = 4;
 pub const MAX_SLOTS: usize = 16;
 const RING_TRBS: usize = 256;
+/// The event ring is four frames: a high-speed isochronous stream completes a transfer every 125 us
+/// (8000 events/s), and the foreground only drains the ring between other work.
+const EVENT_TRBS: usize = 1024;
 const TRB_BYTES: u64 = 16;
 const DCI_COUNT: usize = 32;
 const TIMEOUT_TICKS: u64 = 100; // 1 s
@@ -55,6 +58,7 @@ const PORTSC_CHANGE_BITS: u32 = 0x7f << 17;
 const PORTSC_PRESERVE: u32 = (1 << 0) | (1 << 3) | (0xf << 10) | (1 << 30) | (0xf << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
 
 const TRB_NORMAL: u32 = 1;
+const TRB_ISOCH: u32 = 5;
 const TRB_SETUP: u32 = 2;
 const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
@@ -66,6 +70,7 @@ const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_EVALUATE_CONTEXT: u32 = 13;
 const TRB_RESET_ENDPOINT: u32 = 14;
 const TRB_SET_TR_DEQUEUE: u32 = 16;
+const TRB_STOP_ENDPOINT: u32 = 15;
 const TRB_NOOP_COMMAND: u32 = 23;
 const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_COMMAND_COMPLETION: u32 = 33;
@@ -407,13 +412,13 @@ impl Controller {
 
         // Event ring (interrupter 0): a one-entry segment table. ERSTSZ and ERDP are
         // written before ERSTBA, whose write arms the ring.
-        let event_ring = frame().ok_or(Error::NoMemory)?;
+        let event_ring = memory::allocate_contiguous((EVENT_TRBS * TRB_BYTES as usize / 4096) as u64, Some(1 << 32)).ok_or(Error::NoMemory)?;
         let segment_table = frame().ok_or(Error::NoMemory)?;
         unsafe {
             let entry = segment_table as *mut u32;
             entry.write_volatile(event_ring as u32);
             entry.add(1).write_volatile((event_ring >> 32) as u32);
-            entry.add(2).write_volatile(RING_TRBS as u32);
+            entry.add(2).write_volatile(EVENT_TRBS as u32);
         }
         let interrupter = runtime + 0x20;
         write32(interrupter + 0x08, 1);
@@ -475,7 +480,7 @@ impl Controller {
             return None;
         }
         self.event_index += 1;
-        if self.event_index == RING_TRBS {
+        if self.event_index == EVENT_TRBS {
             self.event_index = 0;
             self.event_cycle = !self.event_cycle;
         }
@@ -854,6 +859,82 @@ impl Controller {
         self.ring_doorbell(slot, dci);
     }
 
+    /// Adds an isochronous endpoint (Configure Endpoint) and returns its device-context index.
+    /// `interval` is the descriptor's bInterval; for isochronous endpoints it is an exponent at every
+    /// speed (the period is 2^(bInterval-1) frames at full speed, microframes at high speed). The
+    /// slot's "context entries" only ever grows, so an audio interface can add its playback,
+    /// feedback and capture endpoints one at a time.
+    pub fn configure_isoc_endpoint(&mut self, device: &Device, endpoint: u8, max_packet: u16, interval: u8) -> Result<u32, Error> {
+        let slot = usize::from(device.slot);
+        let input_endpoint = endpoint & 0x80 != 0;
+        let dci = u32::from(endpoint & 0x0f) * 2 + u32::from(input_endpoint);
+        if dci < 2 || dci >= DCI_COUNT as u32 {
+            return Err(Error::Unsupported);
+        }
+        let ring = Ring::allocate().ok_or(Error::NoMemory)?;
+        let (input, output) = (self.slots[slot].input, self.slots[slot].output);
+        // Interval field: an exponent of 125 us microframes. High speed: bInterval-1. Full speed:
+        // frames are 1 ms = 8 microframes, so (bInterval-1) + 3.
+        let exponent = if device.speed >= 3 { u32::from(interval.clamp(1, 16)) - 1 } else { u32::from(interval.clamp(1, 16)) - 1 + 3 };
+        unsafe {
+            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
+            (input as *mut u32).add(1).write_volatile(1 | (1 << dci));
+            core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
+            let slot_context = self.context_slot(input) as *mut u32;
+            let word0 = slot_context.read_volatile();
+            let entries = ((word0 >> 27) & 0x1f).max(dci);
+            slot_context.write_volatile((word0 & !(0x1f << 27)) | (entries << 27));
+            let context = self.context_endpoint(input, dci) as *mut u32;
+            context.write_volatile(exponent << 16);
+            // CErr 0 (isochronous transfers are never retried), endpoint type 5 (isoc IN) or 1 (isoc OUT).
+            context.add(1).write_volatile(((if input_endpoint { 5 } else { 1 }) << 3) | (u32::from(max_packet) << 16));
+            context.add(2).write_volatile(ring.base as u32 | 1);
+            context.add(3).write_volatile((ring.base >> 32) as u32);
+            context.add(4).write_volatile(u32::from(max_packet) | (u32::from(max_packet) << 16)); // average TRB length, max ESIT payload
+        }
+        self.slots[slot].rings[dci as usize] = ring;
+        self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24))?;
+        Ok(dci)
+    }
+
+    /// Queues one isochronous transfer (one service interval's worth of data) without ringing the
+    /// doorbell; `start_endpoint` does that once several are queued. "Start isochronous ASAP" (SIA)
+    /// lets the controller choose the frame, each transfer following the previous one. Every
+    /// transfer asks for an event (IOC) so the foreground learns its actual length.
+    pub fn queue_isoc(&mut self, slot: u8, dci: u32, buffer: u64, length: u32) -> u64 {
+        let ring = &mut self.slots[usize::from(slot)].rings[dci as usize];
+        ring.push(buffer, length, (TRB_ISOCH << 10) | TRB_IOC | TRB_ISP | (1 << 31))
+    }
+
+    /// Rings an endpoint's doorbell: the controller looks at its transfer ring.
+    pub fn start_endpoint(&mut self, slot: u8, dci: u32) {
+        self.ring_doorbell(slot, dci);
+    }
+
+    /// Stops an endpoint's transfers (Stop Endpoint command); queued ones are abandoned.
+    pub fn stop_endpoint(&mut self, slot: u8, dci: u32) {
+        let _ = self.command(0, 0, (TRB_STOP_ENDPOINT << 10) | (dci << 16) | (u32::from(slot) << 24));
+    }
+
+    /// Releases a stopped endpoint's ring and tells the controller to forget the endpoint
+    /// (Configure Endpoint with its drop flag set).
+    pub fn drop_endpoint(&mut self, device: &Device, dci: u32) {
+        let slot = usize::from(device.slot);
+        let ring = self.slots[slot].rings[dci as usize];
+        let input = self.slots[slot].input;
+        unsafe {
+            core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
+            (input as *mut u32).write_volatile(1 << dci); // drop flags (D)
+            (input as *mut u32).add(1).write_volatile(1); // A0: the slot context
+            core::ptr::copy_nonoverlapping(self.slots[slot].output as *const u8, self.context_slot(input) as *mut u8, 32);
+        }
+        let _ = self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24));
+        if ring.is_allocated() {
+            memory::free(ring.base, 1);
+        }
+        self.slots[slot].rings[dci as usize] = NO_RING;
+    }
+
     /// Adds a device's two bulk endpoints (Configure Endpoint). `*_endpoint` are endpoint
     /// addresses (bit 7 = IN); `burst` is the SuperSpeed companion's max burst.
     #[allow(clippy::too_many_arguments)]
@@ -959,6 +1040,14 @@ impl Controller {
 }
 
 impl Trb {
+    /// For a transfer event: the bytes the transfer did NOT move (the short-packet residual).
+    pub fn residual(&self) -> u32 {
+        self.status & 0x00ff_ffff
+    }
+    /// For a transfer event: the address of the TRB it reports.
+    pub fn trb_address(&self) -> u64 {
+        self.parameter
+    }
     pub fn is_transfer(&self) -> bool {
         self.kind() == TRB_TRANSFER_EVENT
     }

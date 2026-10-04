@@ -138,6 +138,9 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
         if crate::usb_audio::is_audio(&configuration[..total]) {
             let description = crate::usb_audio::parse(&configuration[..total]);
             crate::usb_audio::report(&description, &device.path(), vendor, product, xhci::speed_name(device.speed));
+            if crate::usb_audio::attach(controller, device, description, configuration[5]) {
+                return Ok(true);
+            }
             controller.release_slot(device.slot);
             return Ok(false);
         }
@@ -208,6 +211,9 @@ fn find_boot_keyboard(descriptors: &[u8]) -> Option<(u8, u8, u16, u8)> {
 /// Handles an event nobody was waiting for: a keyboard's report completing.
 pub fn background_event(controller: &mut Controller, event: &Trb) {
     if !event.is_transfer() {
+        return;
+    }
+    if crate::usb_audio::background_event(controller, event) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };

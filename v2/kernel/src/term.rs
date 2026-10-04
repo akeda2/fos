@@ -745,6 +745,7 @@ fn execute(command: &str) {
         "tape" => crate::tape::command(command.strip_prefix("tape").unwrap_or("")),
         "run" => crate::tape::run_named(command.strip_prefix("run").unwrap_or("")),
         "label" => label_command(words),
+        "audio" => audio_command(words),
         "format" => format_command(words),
         "copy" => copy_command(words),
         "disks" => {
@@ -887,6 +888,130 @@ fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(cra
     match crate::storage::volume_on(number) {
         Ok(volume) => action(volume, rest),
         Err(error) => crate::println!("disk{number}: {error}."),
+    }
+}
+
+/// `audio` shows the USB audio device; `audio start RATE [capture|playback|both]` / `audio stop`
+/// control streams; `audio capture SECONDS [RATE]` records for a few seconds and prints, per second,
+/// the packet counters and the peak level of every channel (a quick way to see that a device's inputs
+/// are alive without writing a tape).
+fn audio_command(mut words: core::str::SplitWhitespace) {
+    use crate::usb_audio as ua;
+    match words.next() {
+        None => ua::status(),
+        Some("stop") => {
+            if let Some(controller) = ua::controller() {
+                ua::stop(controller);
+            }
+            ua::status();
+        }
+        Some("start") => {
+            let rate = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(48_000);
+            let (capture, playback) = match words.next() {
+                Some("capture") => (true, false),
+                Some("playback") => (false, true),
+                _ => (true, true),
+            };
+            let Some(controller) = ua::controller() else { return crate::println!("No USB audio device.") };
+            match ua::start(controller, rate, capture, playback) {
+                Ok(()) => ua::status(),
+                Err(reason) => crate::println!("audio: {reason}."),
+            }
+        }
+        Some("capture") => {
+            let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(3).clamp(1, 30);
+            let rate = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(48_000);
+            let Some(controller) = ua::controller() else { return crate::println!("No USB audio device.") };
+            if let Err(reason) = ua::start(controller, rate, true, false) {
+                return crate::println!("audio: {reason}.");
+            }
+            let Some((channels, slot)) = ua::capture_format() else { return };
+            let (channels, slot) = (usize::from(channels), usize::from(slot));
+            let mut data = [0u8; 4096];
+            for second in 1..=seconds {
+                let mut peaks = [0u32; 8];
+                let mut carry = 0usize; // bytes of an incomplete frame left from the previous read
+                let end = apic::ticks() + apic::TICK_HZ;
+                let mut frames = 0u64;
+                while apic::ticks() < end {
+                    crate::debug::pet();
+                    crate::usb_hid::poll();
+                    let frame_bytes = channels * slot;
+                    let room = (4096 - carry) / frame_bytes * frame_bytes;
+                    let got = ua::read(&mut data[carry..carry + room]);
+                    let total = carry + got;
+                    let whole = total / frame_bytes * frame_bytes;
+                    for frame in data[..whole].chunks(frame_bytes) {
+                        for (channel, sample) in frame.chunks(slot).enumerate().take(8) {
+                            // little-endian signed PCM in `slot` bytes: sign-extend, take the magnitude
+                            let mut value = 0i64;
+                            for (index, &byte) in sample.iter().enumerate() {
+                                value |= i64::from(byte) << (8 * index);
+                            }
+                            let bits = 8 * slot as u32;
+                            if value >> (bits - 1) != 0 {
+                                value -= 1 << bits;
+                            }
+                            peaks[channel] = peaks[channel].max(value.unsigned_abs() as u32);
+                        }
+                        frames += 1;
+                    }
+                    data.copy_within(whole..total, 0);
+                    carry = total - whole;
+                }
+                crate::print(format_args!("[{second:>2} s] {frames} frames; peak per channel:"));
+                for peak in &peaks[..channels.min(8)] {
+                    crate::print(format_args!(" {peak:>8}"));
+                }
+                crate::println!();
+                flush();
+            }
+            ua::status();
+            ua::stop(controller);
+        }
+        Some("tone") => {
+            let frequency = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(440).clamp(20, 20_000);
+            let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(3).clamp(1, 60);
+            let rate = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(48_000);
+            let Some(controller) = ua::controller() else { return crate::println!("No USB audio device.") };
+            if let Err(reason) = ua::start(controller, rate, false, true) {
+                return crate::println!("audio: {reason}.");
+            }
+            let Some((channels, slot)) = ua::playback_format() else { return };
+            let (channels, slot) = (usize::from(channels), usize::from(slot));
+            // A phase accumulator in 1/65536 of a cycle; a parabola per half cycle stands in for a sine
+            // (integer-only, and plenty to hear or to measure the fundamental).
+            let step = (u64::from(frequency) << 16) / u64::from(rate);
+            let mut phase = 0u64;
+            let end = apic::ticks() + seconds * apic::TICK_HZ;
+            let frame_bytes = channels * slot;
+            let mut chunk = [0u8; 2048];
+            while apic::ticks() < end {
+                crate::debug::pet();
+                crate::usb_hid::poll();
+                // Only as many frames as the ring has room for, so the tone never has a gap.
+                let frames = (chunk.len() / frame_bytes).min(ua::playback_space() / frame_bytes);
+                if frames == 0 {
+                    continue;
+                }
+                for frame in chunk[..frames * frame_bytes].chunks_mut(frame_bytes) {
+                    let half = (phase & 0x7fff) as i64;
+                    let magnitude = (half * (0x8000 - half)) >> 13; // 0..32768
+                    let sample = (if phase & 0x8000 != 0 { -magnitude } else { magnitude }) / 4; // a quarter of full scale
+                    phase = (phase + step) & 0xffff;
+                    let value = sample << (8 * slot as u32 - 16); // scale 16-bit to the slot's width
+                    for sample_slot in frame.chunks_mut(slot) {
+                        for (index, byte) in sample_slot.iter_mut().enumerate() {
+                            *byte = (value >> (8 * index)) as u8;
+                        }
+                    }
+                }
+                ua::write(&chunk[..frames * frame_bytes]);
+            }
+            ua::status();
+            ua::stop(controller);
+        }
+        Some(_) => crate::println!("Usage: audio | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE]"),
     }
 }
 
