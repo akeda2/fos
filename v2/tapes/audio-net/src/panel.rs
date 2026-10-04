@@ -927,10 +927,24 @@ fn run_stream(settings: &Settings) {
     draw_scale(run);
     tape_rt::set_quiet(true);
     let shim = abort::wrap_with(real, panel_hook);
-    let mut run_options = options.clone();
-    let ok = crate::resolve_names(shim, mode, &mut run_options);
-    if ok {
-        run_once(shim, mode, &run_options);
+    // Like a configuration-file run, keep trying until Escape: the peer may not be up yet (a receiver started before
+    // its sender waits for the sender's announcement, staying findable meanwhile), or the stream may end when the peer
+    // goes away. The last message line says what it is waiting for.
+    loop {
+        let mut run_options = options.clone();
+        if crate::resolve_names(shim, mode, &mut run_options) {
+            run_once(shim, mode, &run_options);
+        }
+        if run_state().stop {
+            break;
+        }
+        let until = tape_rt::micros() + 3_000_000;
+        while tape_rt::micros() < until && (shim.should_abort)() == 0 {
+            tape_rt::idle();
+        }
+        if run_state().stop {
+            break;
+        }
     }
     tape_rt::set_quiet(false);
 }

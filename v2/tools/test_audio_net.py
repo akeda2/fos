@@ -384,6 +384,7 @@ def main():
     panel_test()
     duplex_names_test()
     codec_follows_listener_test()
+    panel_wait_test()
     print("v2 audio-net: all checks passed")
 
 
@@ -667,6 +668,48 @@ def codec_follows_listener_test():
             check("Opus stream(s)" in text, "a PCM-configured sender that looks the peer up by name sends Opus, as the peer announced", text[-700:])
             a.pump(2.0)
             check("Receiving Opus from 192.168.50.1" in a.text()[mark_a:], "and the Opus receiver gets it", a.text()[-500:])
+        finally:
+            a.stop()
+            b.stop()
+
+
+def panel_wait_test():
+    """A receiver started from the panel before its sender keeps waiting (it does not give up after one look) and stays
+    findable: the sender's panel lists it, picks it, starts, and the receiver then gets the stream."""
+    keys = lambda guest, text: (guest.process.stdin.write(text.encode()), guest.process.stdin.flush(), guest.pump(0.4))
+    with tempfile.TemporaryDirectory() as tmp:
+        a = Guest(tmp, "pw-a", "52:54:00:12:34:b3", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={Path(tmp) / 'pw.wav'}", "-device", "usb-audio,audiodev=snd"])
+        b = Guest(tmp, "pw-b", "52:54:00:12:34:b4")
+        try:
+            for guest in (a, b):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark_a = a.send("run audio-net")
+            mark_b = b.send("run audio-net")
+            a.wait_for("audio-net: settings", 30, mark_a)
+            b.wait_for("audio-net: settings", 30, mark_b)
+            # A: Receive from the sender 'fos-1234b4' (not running yet), static address, start.
+            keys(a, "l")
+            keys(a, "jjjl")
+            keys(a, "j\r" + "\x7f" * 20 + "192.168.50.3/24\r")
+            keys(a, "jj\rfos-1234b4\r")
+            keys(a, "s")
+            a.pump(20.0)  # longer than one 15 s look: it must go on waiting
+            check("Looking for the announcement of the sender 'fos-1234b4'" in a.text()[mark_a:], "the receiver waits for its sender", a.text()[-400:])
+            # B: Send, static address, pick the waiting receiver from the list, start.
+            keys(b, "jjjl")
+            keys(b, "j\r" + "\x7f" * 20 + "192.168.50.4/24\r")
+            keys(b, "p")
+            end = time.monotonic() + 25
+            while "fos-1234b3" not in b.text()[mark_b:].split("machines on the network")[-1] and time.monotonic() < end:
+                b.pump(0.5)
+            picker = b.text()[mark_b:].split("machines on the network")[-1]
+            check("fos-1234b3" in picker and "listening" in picker, "the waiting receiver is listed as listening (it announces while it waits)", picker[:500])
+            keys(b, "1")
+            keys(b, "s")
+            a.pump(10.0)
+            received = [int(part.split(" ")[0]) for part in a.text()[mark_a:].split("Recv ")[1:] if part.split(" ")[0].isdigit()]
+            check(received and max(received) >= 500, f"the receiver then gets the stream ({max(received) if received else 0} packets)", a.text()[-600:])
         finally:
             a.stop()
             b.stop()
