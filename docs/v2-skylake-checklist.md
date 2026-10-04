@@ -20,8 +20,11 @@ ls -l build/v2/v2.img
 sudo python3 v2/tools/write_stick.py /dev/sdX   # or: sudo dd if=build/v2/v2.img of=/dev/sdX bs=4M conv=fsync status=progress
 ```
 
-`dd` is fine; the script is `dd` with the checks (whole removable disk, nothing mounted, size
-sane, you type the name back). Triple-check `lsblk` first: this erases the stick.
+`dd` is fine for one stick; the script is `dd` with the checks (whole removable disk, nothing mounted,
+size sane, you type the name back). It also gives each stick fresh random GUIDs: the kernel finds its
+boot disk by the payload partition's GUID, so two sticks written from the same image (or by plain `dd`)
+cannot be told apart when both are plugged in. `--keep-guids` opts out. Triple-check `lsblk` first:
+this erases the stick.
 
 Optional files on the stick's FOSFS (build them in with `--file NAME=PATH`, or write them
 later with `write`): `debug` (`reboot-on-crash`, `reboot-delay 3`, `kernel-update`,

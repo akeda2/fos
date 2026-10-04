@@ -212,6 +212,25 @@ KUP keeps its design: write the inactive slot through the native driver and
 update the metadata block, A/B fallback in the loader. `reboot` goes through
 firmware, so a pending slot is tried on the next boot.
 
+### Disk numbers, volume labels and stick GUIDs
+
+* **`disk1` is always the boot disk.** The drivers number disks in the order they find them
+  (USB sticks by root port, then SATA, then NVMe), which changes when a stick is plugged into
+  another port. Once the boot disk is known (by the payload-partition GUID the loader passes),
+  `block::move_to_front` makes it `disk1`; the others keep their discovery order behind it and
+  anything attached later goes at the end. The other numbers are *not* stable.
+* **Volume labels name a volume independent of numbering.** A FOSFS volume has an optional label
+  (a file-name-style word, up to 16 characters) in 16 spare bytes of the superblock (offset 64;
+  v1 ignores them and a v1 `format` clears them). `label` lists them, `label diskN|@LABEL NAME`
+  sets one, `label diskN|@LABEL -` clears it, a label may be on one volume only, and `ls`, `cat`,
+  `write` and `rm` take `diskN` or `@LABEL` as their first word to pick a volume. `build_image.py
+  --label NAME` sets one at build time.
+* **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
+  partition's GUID, so two sticks written from one image would be indistinguishable.
+  `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with
+  their CRCs) with random ones as it writes (`--keep-guids` to opt out; plain `dd` of the image
+  keeps the shared GUIDs). Tests: `make test-v2-disks`, `make test-v2-stick-guids`.
+
 ## 9. Tape ABI v2
 
 v1's tape ABI is a cdecl call with 43 appended arguments. v2 replaces it with

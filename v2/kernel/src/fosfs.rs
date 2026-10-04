@@ -14,6 +14,26 @@ const ENTRY_SIZE: usize = 64;
 const ENTRIES_PER_SECTOR: usize = 512 / ENTRY_SIZE;
 const MAX_ENTRIES: usize = DIRECTORY_SECTORS as usize * ENTRIES_PER_SECTOR;
 pub const MAX_NAME: usize = 16;
+/// Where the volume label lives in the superblock: 16 bytes, zero padded, written by `label`
+/// (v1's FOSFS leaves these bytes alone, and a v1 `format` clears them).
+const LABEL_OFFSET: usize = 64;
+
+/// A volume label: the same characters as a file name, up to 16 of them. It names a volume
+/// in a way that survives disks being numbered differently from one boot to the next.
+#[derive(Clone, Copy)]
+pub struct Label {
+    bytes: [u8; MAX_NAME],
+    length: usize,
+}
+
+impl Label {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+}
 
 /// A mounted volume: a disk and the partition on it.
 #[derive(Clone, Copy)]
@@ -83,6 +103,32 @@ impl Volume {
             && get_u64(&sector, 20) == DATA_START
             && get_u64(&sector, 28) == sectors.saturating_sub(DATA_START);
         if valid { Ok(volume) } else { Err(Error::NotFormatted) }
+    }
+
+    /// The volume's label (empty if it has none).
+    pub fn label(&self) -> Result<Label, Error> {
+        let sector = self.read_sector(0)?;
+        let field = &sector[LABEL_OFFSET..LABEL_OFFSET + MAX_NAME];
+        let length = field.iter().position(|&byte| byte == 0).unwrap_or(MAX_NAME);
+        let mut label = Label { bytes: [0; MAX_NAME], length };
+        label.bytes[..length].copy_from_slice(&field[..length]);
+        // A field holding anything but a valid name (junk in a volume some other tool made) counts as no label.
+        if length != 0 && !valid_name(&label.bytes[..length]) {
+            return Ok(Label { bytes: [0; MAX_NAME], length: 0 });
+        }
+        Ok(label)
+    }
+
+    /// Sets the label; an empty slice clears it.
+    pub fn set_label(&self, label: &[u8]) -> Result<(), Error> {
+        if !label.is_empty() && !valid_name(label) {
+            return Err(Error::InvalidName);
+        }
+        let mut sector = self.read_sector(0)?;
+        sector[LABEL_OFFSET..LABEL_OFFSET + MAX_NAME].fill(0);
+        sector[LABEL_OFFSET..LABEL_OFFSET + label.len()].copy_from_slice(label);
+        block::write(self.disk, self.base, &sector)?;
+        Ok(())
     }
 
     /// Calls `visit` for every valid directory entry.

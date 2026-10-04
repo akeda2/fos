@@ -145,12 +145,12 @@ def build_esp(loader: bytes) -> bytes:
     return bytes(volume)
 
 
-def gpt_header(current_lba, backup_lba, entries_lba, entries_crc) -> bytes:
+def gpt_header(current_lba, backup_lba, entries_lba, entries_crc, disk_guid=DISK_GUID) -> bytes:
     header = bytearray(92)
     header[0:8] = b"EFI PART"
     struct.pack_into("<IIIIQQQQ", header, 8, 0x00010000, 92, 0, 0,
                      current_lba, backup_lba, 34, IMAGE_SECTORS - 34)
-    header[56:72] = DISK_GUID.bytes_le
+    header[56:72] = disk_guid.bytes_le
     struct.pack_into("<QIII", header, 72, entries_lba, GPT_ENTRIES, GPT_ENTRY_SIZE, entries_crc)
     struct.pack_into("<I", header, 16, crc32(bytes(header)))
     return bytes(header).ljust(SECTOR, b"\0")
@@ -182,7 +182,7 @@ def build_payload(kernel: bytes) -> bytes:
     return bytes(partition)
 
 
-def build_fosfs(files) -> bytes:
+def build_fosfs(files, label: str = "") -> bytes:
     """A preformatted FOSFS v3 volume (the same layout as v1's tools/build_image.py):
     a superblock, eight directory sectors of 64-byte entries, contiguous extents."""
     directory_sectors, entry_size, data_start = 8, 64, 9
@@ -190,6 +190,11 @@ def build_fosfs(files) -> bytes:
     superblock = bytearray(SECTOR)
     superblock[0:8] = b"FOSFS3\0\0"
     struct.pack_into("<HHIIQQ", superblock, 8, 3, entry_size, 1, directory_sectors, data_start, FOSFS_SECTORS - data_start)
+    if label:
+        raw_label = label.encode("ascii")
+        if not (len(raw_label) <= 16 and all(byte in b"abcdefghijklmnopqrstuvwxyz0123456789._-" for byte in raw_label)):
+            raise SystemExit(f"invalid FOSFS label {label!r}")
+        superblock[64:64 + len(raw_label)] = raw_label  # the volume label (see kernel/src/fosfs.rs)
     volume[0:SECTOR] = superblock
     next_sector = data_start
     for index, (name, contents) in enumerate(files):
@@ -212,7 +217,32 @@ def build_fosfs(files) -> bytes:
     return bytes(volume)
 
 
-def build_image(loader: bytes, kernel: bytes, files=()) -> bytes:
+def write_gpt(image: bytearray, disk_guid: uuid.UUID, payload_guid: uuid.UUID, fosfs_guid: uuid.UUID) -> None:
+    """Writes both copies of the GPT (headers, entry arrays, CRCs) into `image`."""
+    entries = (gpt_entry(ESP_TYPE_GUID, ESP_GUID, ESP_START, ESP_SECTORS, "EFI System")
+               + gpt_entry(PAYLOAD_TYPE_GUID, payload_guid, PAYLOAD_START, PAYLOAD_SECTORS, "fos payload")
+               + gpt_entry(FOSFS_TYPE_GUID, fosfs_guid, FOSFS_START, FOSFS_SECTORS, "FOSFS data")
+               ).ljust(GPT_ENTRIES * GPT_ENTRY_SIZE, b"\0")
+    entries_crc = crc32(entries)
+    image[SECTOR:2 * SECTOR] = gpt_header(1, IMAGE_SECTORS - 1, 2, entries_crc, disk_guid)
+    image[2 * SECTOR:(2 + GPT_ENTRY_SECTORS) * SECTOR] = entries
+    backup_entries_lba = IMAGE_SECTORS - 1 - GPT_ENTRY_SECTORS
+    image[backup_entries_lba * SECTOR:(backup_entries_lba + GPT_ENTRY_SECTORS) * SECTOR] = entries
+    image[(IMAGE_SECTORS - 1) * SECTOR:] = gpt_header(IMAGE_SECTORS - 1, 1, backup_entries_lba, entries_crc, disk_guid)
+
+
+def randomize_guids(image: bytearray) -> uuid.UUID:
+    """Gives a finished image fresh random GUIDs (the disk, the payload partition and the FOSFS
+    partition), rewriting both GPT copies and their CRCs; returns the payload partition's.
+
+    The kernel finds the disk it booted from by the payload partition's GUID, so two sticks
+    written from the same image (identical GUIDs) could not be told apart."""
+    payload_guid = uuid.uuid4()
+    write_gpt(image, uuid.uuid4(), payload_guid, uuid.uuid4())
+    return payload_guid
+
+
+def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload_guid: uuid.UUID = PAYLOAD_GUID) -> bytes:
     image = bytearray(IMAGE_SECTORS * SECTOR)
     # Protective MBR: one partition of type 0xEE covering the disk.
     mbr = bytearray(SECTOR)
@@ -220,23 +250,13 @@ def build_image(loader: bytes, kernel: bytes, files=()) -> bytes:
     mbr[510:512] = b"\x55\xAA"
     image[0:SECTOR] = mbr
 
-    entries = (gpt_entry(ESP_TYPE_GUID, ESP_GUID, ESP_START, ESP_SECTORS, "EFI System")
-               + gpt_entry(PAYLOAD_TYPE_GUID, PAYLOAD_GUID, PAYLOAD_START, PAYLOAD_SECTORS, "fos payload")
-               + gpt_entry(FOSFS_TYPE_GUID, FOSFS_GUID, FOSFS_START, FOSFS_SECTORS, "FOSFS data")
-               ).ljust(GPT_ENTRIES * GPT_ENTRY_SIZE, b"\0")
-    entries_crc = crc32(entries)
-
-    image[SECTOR:2 * SECTOR] = gpt_header(1, IMAGE_SECTORS - 1, 2, entries_crc)
-    image[2 * SECTOR:(2 + GPT_ENTRY_SECTORS) * SECTOR] = entries
-    backup_entries_lba = IMAGE_SECTORS - 1 - GPT_ENTRY_SECTORS
-    image[backup_entries_lba * SECTOR:(backup_entries_lba + GPT_ENTRY_SECTORS) * SECTOR] = entries
-    image[(IMAGE_SECTORS - 1) * SECTOR:] = gpt_header(IMAGE_SECTORS - 1, 1, backup_entries_lba, entries_crc)
+    write_gpt(image, DISK_GUID, payload_guid, FOSFS_GUID)
 
     esp = build_esp(loader)
     image[ESP_START * SECTOR:ESP_START * SECTOR + len(esp)] = esp
     payload = build_payload(kernel)
     image[PAYLOAD_START * SECTOR:PAYLOAD_START * SECTOR + len(payload)] = payload
-    fosfs = build_fosfs(files)
+    fosfs = build_fosfs(files, label)
     image[FOSFS_START * SECTOR:FOSFS_START * SECTOR + len(fosfs)] = fosfs
     return bytes(image)
 
@@ -247,13 +267,17 @@ def main():
     parser.add_argument("--kernel", required=True, type=Path, help="the kernel ELF64, written to slot 0")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--file", action="append", default=[], metavar="NAME=PATH", help="preload a FOSFS file (repeatable)")
+    parser.add_argument("--label", default="", help="the FOSFS volume label (lowercase name, up to 16 characters)")
+    parser.add_argument("--payload-guid", type=uuid.UUID, default=PAYLOAD_GUID,
+                        help="unique GUID of the payload partition; the kernel finds its boot disk by it, so two disks "
+                             "built from the same image need different ones")
     arguments = parser.parse_args()
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     files = [("readme.txt", b"Welcome to FOSFS on fos v2.\nTry: ls, cat readme.txt, write NAME TEXT.\n")]
     for spec in arguments.file:
         name, _, path = spec.partition("=")
         files = [item for item in files if item[0] != name] + [(name, Path(path).read_bytes())]
-    arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files))
+    arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files, arguments.label, arguments.payload_guid))
     print(f"wrote {arguments.output}")
 
 

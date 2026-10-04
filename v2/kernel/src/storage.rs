@@ -25,6 +25,62 @@ pub fn payload_start() -> Option<u64> {
     unsafe { *core::ptr::addr_of!(PAYLOAD_START) }
 }
 
+/// How a freshly attached disk is named in a message. Disk numbers are settled once the
+/// boot disk is known (it becomes disk1), so a stick found before that cannot honestly be
+/// given a number yet; `disks` lists the final numbering.
+pub struct DiskNumber(pub usize);
+
+impl core::fmt::Display for DiskNumber {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if boot_disk().is_some() {
+            write!(formatter, "disk{}", self.0 + 1)
+        } else {
+            write!(formatter, "attached (numbered after the boot disk is found; see `disks`)")
+        }
+    }
+}
+
+/// Why a disk has no usable FOSFS volume.
+#[derive(Debug)]
+pub enum VolumeError {
+    NoSuchDisk,
+    NoPartition,
+    NotFormatted,
+    Unreadable(fosfs::Error),
+}
+
+impl core::fmt::Display for VolumeError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            VolumeError::NoSuchDisk => write!(formatter, "no such disk (see `disks`)"),
+            VolumeError::NoPartition => write!(formatter, "no FOSFS data partition (a GPT partition of the FOSFS type)"),
+            VolumeError::NotFormatted => write!(formatter, "its data partition holds no FOSFS v3 volume"),
+            VolumeError::Unreadable(error) => write!(formatter, "cannot read the data partition ({error:?})"),
+        }
+    }
+}
+
+/// Mounts the FOSFS data partition of disk number `number` (1-based, as `disks` lists).
+pub fn volume_on(number: usize) -> Result<Volume, VolumeError> {
+    if number == 0 || number > block::count() {
+        return Err(VolumeError::NoSuchDisk);
+    }
+    let disk = number - 1;
+    let partition = gpt::find(disk, &FOSFS_TYPE_GUID, |_| true).ok_or(VolumeError::NoPartition)?;
+    Volume::mount(disk, partition.start, partition.sectors).map_err(|error| match error {
+        fosfs::Error::NotFormatted => VolumeError::NotFormatted,
+        other => VolumeError::Unreadable(other),
+    })
+}
+
+/// The first volume, in disk order, whose label is `label`.
+pub fn volume_labelled(label: &[u8]) -> Option<(usize, Volume)> {
+    (1..=block::count()).find_map(|number| {
+        let volume = volume_on(number).ok()?;
+        (volume.label().ok()?.as_bytes() == label).then_some((number, volume))
+    })
+}
+
 pub fn boot_disk() -> Option<usize> {
     unsafe { *core::ptr::addr_of!(BOOT_DISK) }
 }
@@ -42,6 +98,29 @@ pub fn init(info: &BootInfo) {
         let origin = format_origin("NVMe", controller, None);
         block::register(Backend::Nvme(drive), drive.sectors, drive.model, origin.as_str());
     });
+    if block::count() == 0 {
+        crate::println!("Storage: no disks found by the drivers this kernel has ({sata} SATA, {nvme} NVMe).");
+        return;
+    }
+
+    // The boot disk is the one holding the payload partition the loader read. It becomes
+    // disk1 whatever order the drivers found the disks in, so `disk1` always means "the
+    // disk this system started from".
+    let mut found = None;
+    for index in 0..block::count() {
+        let hit = gpt::find(index, &PAYLOAD_TYPE_GUID, |p| p.unique_guid == info.payload_guid && p.start == info.payload_start && p.sectors == info.payload_sectors);
+        if hit.is_some() {
+            found = Some(index);
+            break;
+        }
+    }
+    let found = found.map(|index| {
+        let moved = index != 0;
+        if moved {
+            crate::println!("The boot disk was found as driver disk {}; renumbering it to disk1 (the others keep their order behind it).", index + 1);
+        }
+        block::move_to_front(index)
+    });
     for index in 0..block::count() {
         let disk = block::get(index).unwrap();
         crate::println!(
@@ -51,20 +130,6 @@ pub fn init(info: &BootInfo) {
             trimmed(&disk.model),
             core::str::from_utf8(&disk.origin[..disk.origin_length]).unwrap_or("?")
         );
-    }
-    if block::count() == 0 {
-        crate::println!("Storage: no disks found by the drivers this kernel has ({sata} SATA, {nvme} NVMe).");
-        return;
-    }
-
-    // The boot disk is the one holding the payload partition the loader read.
-    let mut found = None;
-    for index in 0..block::count() {
-        let hit = gpt::find(index, &PAYLOAD_TYPE_GUID, |p| p.unique_guid == info.payload_guid && p.start == info.payload_start && p.sectors == info.payload_sectors);
-        if hit.is_some() {
-            found = Some(index);
-            break;
-        }
     }
     let Some(disk) = found else {
         crate::println!("Boot disk: not found among the disks above (the payload partition GUID matches none); no FOSFS.");

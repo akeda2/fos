@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""The `diskN` selector of `ls`, `cat`, `write` and `rm` (v2 shell).
+"""The `diskN` selector and volume labels (v2 shell).
 
 The guest boots from a SATA disk and has a second SATA disk with a FOSFS volume of its own
 (built with one extra file). `ls disk2` must show that disk's files and not the boot disk's,
 `cat disk2 NAME` must read from it, `write disk2 ...` must change only it, and a disk
 without a FOSFS volume or a number that does not exist must be refused with a message --
-never silently answered from the boot volume, which is what `ls disk3` used to do."""
+never silently answered from the boot volume, which is what `ls disk3` used to do.
+
+The boot disk is deliberately attached *behind* the second disk, so the drivers find it second;
+the kernel must still number it disk1. The second disk carries the label `backup`, and
+`@backup` must select it however the disks are numbered, while `label` sets, shows, refuses
+duplicates and clears."""
 
 import shutil
 import subprocess
@@ -34,7 +39,8 @@ def main():
         marker.write_text("this file lives on the second disk only\n")
         second = tmp / "second.img"
         subprocess.run([sys.executable, str(ROOT / "v2/tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(KERNEL),
-                        "--output", str(second), "--file", f"only2={marker}"], check=True, capture_output=True)
+                        "--output", str(second), "--file", f"only2={marker}", "--label", "backup",
+                        "--payload-guid", "f05b2a00-0000-4f05-8000-0000000000aa"], check=True, capture_output=True)
         blank = tmp / "blank.img"
         blank.write_bytes(bytes(8 << 20))
         vars_copy = tmp / "vars.fd"
@@ -42,8 +48,8 @@ def main():
         command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-device", "ich9-ahci,id=ahci",
-                   "-drive", f"if=none,id=d1,format=raw,file={boot}", "-device", "ide-hd,drive=d1,bus=ahci.0,bootindex=0",
-                   "-drive", f"if=none,id=d2,format=raw,file={second}", "-device", "ide-hd,drive=d2,bus=ahci.1",
+                   "-drive", f"if=none,id=d2,format=raw,file={second}", "-device", "ide-hd,drive=d2,bus=ahci.0",
+                   "-drive", f"if=none,id=d1,format=raw,file={boot}", "-device", "ide-hd,drive=d1,bus=ahci.1,bootindex=0",
                    "-drive", f"if=none,id=d3,format=raw,file={blank}", "-device", "ide-hd,drive=d3,bus=ahci.2",
                    "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:79"]
         wire = Wire()
@@ -72,6 +78,7 @@ def main():
                 wire.send(guest, TAG_DATA, line.encode() + b"\n")
                 return wire.until("fos> ", 15)
 
+            check("renumbering it to disk1" in clean(bytes(raw)), "the boot disk, found second by the drivers, is renumbered to disk1", clean(bytes(raw))[-2500:])
             disks = run("disks")
             check("disk1" in disks and "disk2" in disks and "disk3" in disks, "three disks are found", disks)
             boot_listing = run("ls")
@@ -87,6 +94,17 @@ def main():
             blank_answer = run("ls disk3")
             check("no FOSFS data partition" in blank_answer and "readme.txt" not in blank_answer, "a disk without a FOSFS volume is refused, not answered from the boot volume", blank_answer)
             check("no such disk" in run("ls disk9"), "a disk that does not exist is refused", "")
+
+            listing = run("label")
+            check("disk2: @backup" in listing and "disk1: (no label)" in listing, "`label` lists each volume's label", listing)
+            check("only2" in run("ls @backup"), "`ls @backup` selects the labelled volume", "")
+            check("lives on the second disk only" in run("cat @backup only2"), "`cat @backup NAME` reads from it", "")
+            check("is now @boot" in run("label disk1 boot") and "disk1: @boot" in run("label disk1"), "`label disk1 NAME` sets a label", "")
+            check("already carries" in run("label disk1 backup"), "a label already in use is refused", "")
+            check("up to 16 lowercase" in run("label disk1 Bad/Name"), "an invalid label is refused", "")
+            check("no FOSFS" in run("label disk3 x"), "a disk without a FOSFS volume cannot be labelled", "")
+            check("no volume carries that label" in run("ls @nothing"), "an unknown label is refused, not answered from the boot volume", "")
+            check("label cleared" in run("label @boot -") and "disk1: (no label)" in run("label"), "`label @NAME -` clears it", "")
             wire.send(guest, TAG_DATA, b"shutdown\n")
         finally:
             process.terminate()

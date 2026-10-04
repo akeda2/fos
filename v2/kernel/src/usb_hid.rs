@@ -125,7 +125,7 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
             controller.set_configuration(&device, configuration[5])?;
             return Ok(match usb_storage::attach_xhci(controller_index, controller, device, endpoints) {
                 Some(disk) => {
-                    crate::println!("USB storage {vendor:04x}:{product:04x} on port {port} of xHCI {:02x}:{:02x}.{} ({}): disk{}.", controller.pci.bus, controller.pci.device, controller.pci.function, xhci::speed_name(device.speed), disk + 1);
+                    crate::println!("USB storage {vendor:04x}:{product:04x} on port {port} of xHCI {:02x}:{:02x}.{} ({}): {}.", controller.pci.bus, controller.pci.device, controller.pci.function, xhci::speed_name(device.speed), crate::storage::DiskNumber(disk));
                     true
                 }
                 None => {
@@ -324,7 +324,7 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
         if let Some(endpoints) = usb_storage::find_endpoints(&configuration[..total]) {
             controller.set_configuration(&target, configuration[5])?;
             if let Some(disk) = usb_storage::attach_ehci(controller_index, target, endpoints) {
-                crate::println!("USB storage {vendor:04x}:{product:04x} on EHCI {:02x}:{:02x}.{}: disk{}.", controller.pci.bus, controller.pci.device, controller.pci.function, disk + 1);
+                crate::println!("USB storage {vendor:04x}:{product:04x} on EHCI {:02x}:{:02x}.{}: {}.", controller.pci.bus, controller.pci.device, controller.pci.function, crate::storage::DiskNumber(disk));
                 return Ok(true);
             }
         }

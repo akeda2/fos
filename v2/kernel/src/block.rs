@@ -48,6 +48,21 @@ pub fn register(backend: Backend, sectors: u64, model: [u8; 40], origin: &str) -
     }
 }
 
+/// Moves disk `index` to the front (disk number 1), keeping every other disk in its
+/// order behind it, and returns its new index (0). The boot disk is always `disk1` this
+/// way, whatever order the drivers happened to find the disks in (USB sticks by root port,
+/// then SATA, then NVMe), so scripts and files that name `disk1` keep meaning the same disk.
+/// Only meant for start-up, before anything has remembered a disk index.
+pub fn move_to_front(index: usize) -> usize {
+    unsafe {
+        if index < COUNT {
+            (&mut *core::ptr::addr_of_mut!(DISKS))[..=index].rotate_right(1);
+            return 0;
+        }
+    }
+    index
+}
+
 pub fn count() -> usize {
     unsafe { COUNT }
 }

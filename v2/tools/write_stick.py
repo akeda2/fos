@@ -20,6 +20,9 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import build_image  # noqa: E402
+
 
 def sysfs(device: str, name: str) -> str:
     try:
@@ -41,6 +44,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("device", help="the whole-disk device node of the stick, e.g. /dev/sdb")
     parser.add_argument("--image", default="build/v2/v2.img", type=Path)
+    parser.add_argument("--keep-guids", action="store_true",
+                        help="write the image's GUIDs as they are instead of fresh random ones (two sticks written "
+                             "that way cannot be told apart by the kernel's boot-disk discovery)")
     arguments = parser.parse_args()
 
     device = Path(arguments.device)
@@ -70,9 +76,16 @@ def main() -> int:
     if sys.stdin.readline().strip() != name:
         return fail("not confirmed; nothing written")
 
+    data = bytearray(arguments.image.read_bytes())
+    if not arguments.keep_guids:
+        # Every stick gets its own GUIDs: the kernel finds the disk it booted from by the payload
+        # partition's, and two sticks from one image would otherwise be indistinguishable.
+        guid = build_image.randomize_guids(data)
+        print(f"Payload partition GUID for this stick: {guid}")
     copied = 0
-    with open(arguments.image, "rb") as source, open(device, "wb", buffering=0) as target:
-        while chunk := source.read(4 << 20):
+    with open(device, "wb", buffering=0) as target:
+        for at in range(0, len(data), 4 << 20):
+            chunk = data[at:at + (4 << 20)]
             target.write(chunk)
             copied += len(chunk)
             print(f"\r{copied >> 20} / {image_size >> 20} MiB", end="", flush=True)
