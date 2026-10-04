@@ -86,6 +86,10 @@ impl Write for Console {
             }
             return Ok(());
         }
+        if api().version >= 2 {
+            (api().puts)(text.as_ptr(), text.len());
+            return Ok(());
+        }
         for &byte in text.as_bytes() {
             (api().putc)(u32::from(byte));
         }

@@ -20,23 +20,58 @@ const CONFIG_FILE: &str = "audio.cfg";
 const START_FILE: &str = "start";
 const START_LINE: &str = "run audio-net @audio.cfg";
 
+/// The screen is written through a buffer and handed to the console in one call (`present`): printing a byte at a time
+/// makes the console repaint its whole text grid for every byte, which is what once held a stream up for 20 ms.
+static mut FRAME: [u8; 2048] = [0; 2048];
+static mut FRAME_LENGTH: usize = 0;
+
 struct Screen;
 
 impl Write for Screen {
     fn write_str(&mut self, text: &str) -> core::fmt::Result {
         for &byte in text.as_bytes() {
-            (tape_rt::api().putc)(u32::from(byte));
+            unsafe {
+                if FRAME_LENGTH == 2048 {
+                    present();
+                }
+                (*(&raw mut FRAME))[FRAME_LENGTH] = byte;
+                FRAME_LENGTH += 1;
+            }
         }
         Ok(())
     }
 }
 
-macro_rules! draw {
-    ($($argument:tt)*) => {{ let _ = Screen.write_fmt(format_args!($($argument)*)); }};
+/// Sends what has been drawn since the last call to the console.
+fn present() {
+    unsafe {
+        if FRAME_LENGTH == 0 {
+            return;
+        }
+        let frame: &[u8; 2048] = &*(&raw const FRAME);
+        let api = tape_rt::api();
+        if api.version >= 2 {
+            (api.puts)(frame.as_ptr(), FRAME_LENGTH);
+        } else {
+            for &byte in &frame[..FRAME_LENGTH] {
+                (api.putc)(u32::from(byte));
+            }
+        }
+        FRAME_LENGTH = 0;
+    }
 }
 
+/// Draws text and presents the whole buffer (a cursor move from `at` goes out with the text that follows it).
+macro_rules! draw {
+    ($($argument:tt)*) => {{
+        let _ = Screen.write_fmt(format_args!($($argument)*));
+        present();
+    }};
+}
+
+/// Moves the cursor; it is sent together with the next `draw!`.
 fn at(row: usize, column: usize) {
-    draw!("\x1b[{row};{column}H");
+    let _ = write!(Screen, "\x1b[{row};{column}H");
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -588,13 +623,16 @@ struct Run {
     clip_at: [u64; MAX_ROWS],
     /// The longest the panel's own drawing has held up the stream loop since the run began (microseconds).
     ui_worst: u64,
+    /// The same over the last ten seconds (so a start-up stall does not hide how it behaves now).
+    ui_recent: u64,
+    ui_recent_since: u64,
 }
 
 const fn blank_run() -> Run {
     Run {
         stop: false, next_draw: 0, started: 0, rows: 0, sends: 0, labels: [0; MAX_ROWS], page: 0, nordic: true, needs_full: [true; MAX_ROWS], footer_dirty: true, cursor: 0, next_counters: 0, ip_shown: false, mac: [0; 6], nic: 0,
         counters: Text::new(), message: Text::new(), actual: Text::new(), shown_cell: [-1; MAX_ROWS], shown_hold: [-1; MAX_ROWS], shown_number: [i16::MIN; MAX_ROWS], shown_clip: [false; MAX_ROWS],
-        hold: [0; MAX_ROWS], hold_at: [0; MAX_ROWS], clip_at: [0; MAX_ROWS], ui_worst: 0,
+        hold: [0; MAX_ROWS], hold_at: [0; MAX_ROWS], clip_at: [0; MAX_ROWS], ui_worst: 0, ui_recent: 0, ui_recent_since: 0,
     }
 }
 
@@ -739,9 +777,11 @@ fn update_meters(run: &mut Run, now: u64) {
                 (low.max(0), high.min(CELLS - 1))
             };
             at(row, BAR_COL + low as usize);
+            let mut bar = Text::<64>::new();
             for c in low..=high {
-                draw!("{}", bar_char(c, cell, hold_cell));
+                let _ = write!(bar, "{}", bar_char(c, cell, hold_cell));
             }
+            draw!("{}", bar.as_str());
             run.shown_cell[index] = cell as i16;
             run.shown_hold[index] = hold_cell as i16;
         }
@@ -841,7 +881,14 @@ extern "C" fn panel_hook() -> u32 {
         let shown = stats::get();
         let mut counters = Text::<100>::new();
         let seconds = (now - run.started) / 1_000_000;
-        let _ = write!(counters, "Sent {} Recv {} Lost {} Ring {}/{} ms Clock {:+} ppm UI stall {} ms {}:{:02}", shown.sent, shown.received, shown.lost, ms(shown.level_frames, shown.rate), ms(shown.target_frames, shown.rate), shown.offset_ppm, run.ui_worst / 1000, seconds / 60, seconds % 60);
+        let mut device = tape_rt::AudioStats::default();
+        (tape_rt::api().audio_stats)(&mut device);
+        let _ = write!(
+            counters,
+            "Tx {} Rx {} Lost {} Ring {}/{}ms {:+}ppm UI {}/{}ms Un {} Ov {} {}:{:02}",
+            shown.sent, shown.received, shown.lost, ms(shown.level_frames, shown.rate), ms(shown.target_frames, shown.rate), shown.offset_ppm,
+            run.ui_recent / 1000, run.ui_worst / 1000, device.playback_underruns, device.capture_overruns, seconds / 60, seconds % 60
+        );
         if counters != run.counters {
             at(5, 2);
             draw!("{}\x1b[K", counters.as_str());
@@ -865,7 +912,13 @@ extern "C" fn panel_hook() -> u32 {
         update_meters(run, now);
     }
     // How long this call took: the stream loop was not running meanwhile.
-    run.ui_worst = run.ui_worst.max(tape_rt::micros() - now);
+    let spent = tape_rt::micros() - now;
+    run.ui_worst = run.ui_worst.max(spent);
+    if now > run.ui_recent_since + 10_000_000 {
+        run.ui_recent_since = now;
+        run.ui_recent = 0;
+    }
+    run.ui_recent = run.ui_recent.max(spent);
     0
 }
 

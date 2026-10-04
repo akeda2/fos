@@ -10,7 +10,9 @@
 //! and a tape built against a newer one can check `size` before using a late field.
 //! `read_key` and `should_abort` drain the same input: use one or the other.
 
-pub const TAPE_API_VERSION: u32 = 1;
+/// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
+/// using it, so it still runs on a kernel that only has version 1.
+pub const TAPE_API_VERSION: u32 = 2;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -114,6 +116,9 @@ pub struct TapeApi {
     /// `fs_stream_close(file_length)`: ends the stream, making `file_length` the final length and freeing the rest of
     /// the reserved space. Without it the whole reservation stays allocated to the file.
     pub fs_stream_close: extern "C" fn(u64) -> isize,
+    /// `puts(text, length)`: prints a string through the console in one call (version 2). Printing a byte at a time with
+    /// `putc` repaints the whole text grid for every byte; a full-screen tape needs this one.
+    pub puts: extern "C" fn(*const u8, usize),
 }
 
 /// What `audio_info` reports. Slot bytes: how many bytes each sample takes in the stream (a 24-bit

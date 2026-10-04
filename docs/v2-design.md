@@ -481,6 +481,14 @@ firmware, so a pending slot is tried on the next boot.
   receiver set to something else will not understand it (Opus decoder errors, or silence). The live view's second line
   shows what is actually sent and received ("Sending: Opus 96 kbit/s per pair, 2 ch   Receiving: PCM 24-bit, 2 ch"),
   since the form shows only the choice made on that machine. Tested: a PCM sender finding an Opus listener by name sends Opus.
+  **Screen cost, measured on hardware:** the first readings of the panel's "UI stall" were 5 ms (laptop) and 20 ms (Skylake).
+  The cause: a tape's `putc` prints one byte per call, and the framebuffer console repaints its whole text grid for every
+  byte (a 1080p screen is about 16,000 cells), so a few hundred bytes of meter drawing cost milliseconds each time. Tape API
+  version 2 adds `puts(text, length)`, a whole string in one console call (one repaint, one relay frame); `tape_rt`'s
+  `print!` uses it when the kernel is version 2 or later (it falls back to `putc` otherwise, so a new tape still runs on an
+  old kernel), and the panel draws through a frame buffer presented once per drawing step. In QEMU the stall fell from 24 ms
+  to 4 ms. The counters line now shows `UI recent/worst ms` (the recent figure covers the last ten seconds) and the
+  device's playback underruns (`Un`) and capture overruns (`Ov`), so a dropout can be matched to the drawing.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself

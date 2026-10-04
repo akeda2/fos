@@ -119,6 +119,19 @@ extern "C" fn api_putc(byte: u32) {
     let text = if byte < 0x80 { (byte as char).encode_utf8(&mut utf8) } else { "?" };
     crate::print(format_args!("{text}"));
 }
+/// A whole string in one console call (one repaint, one relay frame), where `putc` costs a repaint per byte.
+extern "C" fn api_puts(text: *const u8, length: usize) {
+    let bytes = unsafe { core::slice::from_raw_parts(text, length) };
+    match core::str::from_utf8(bytes) {
+        Ok(text) => crate::print(format_args!("{text}")),
+        Err(_) => {
+            // Not UTF-8: print what is ASCII and '?' for the rest, as `putc` does.
+            for &byte in bytes {
+                api_putc(u32::from(byte));
+            }
+        }
+    }
+}
 extern "C" fn api_should_abort() -> u32 {
     u32::from(term::tape_should_abort())
 }
@@ -342,6 +355,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         fs_stream_open: api_fs_stream_open,
         fs_stream_write: api_fs_stream_write,
         fs_stream_close: api_fs_stream_close,
+        puts: api_puts,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

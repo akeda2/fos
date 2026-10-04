@@ -584,9 +584,9 @@ def panel_test():
             a.pump(5.0)
             b.pump(2.0)
             text_a, text_b = a.text()[mark_a:], b.text()[mark_b:]
-            check("Sent " in text_b and "Lost 0" in text_a, "both live views show counters", text_a[-500:] + text_b[-500:])
-            sent = [int(part.split(" ")[0]) for part in text_b.split("Sent ")[1:] if part.split(" ")[0].isdigit()]
-            received = [int(part.split(" ")[0]) for part in text_a.split("Recv ")[1:] if part.split(" ")[0].isdigit()]
+            check("Tx " in text_b and "Lost 0" in text_a, "both live views show counters", text_a[-500:] + text_b[-500:])
+            sent = [int(part.split(" ")[0]) for part in text_b.split("Tx ")[1:] if part.split(" ")[0].isdigit()]
+            received = [int(part.split(" ")[0]) for part in text_a.split("Rx ")[1:] if part.split(" ")[0].isdigit()]
             check(sent and max(sent) >= 3000, f"the sender's counter reached {max(sent) if sent else 0}", text_b[-500:])
             check(received and max(received) >= 2000, f"the receiver's counter reached {max(received) if received else 0}", text_a[-500:])
             check("=====" in text_b and "=====" in text_a and "Nordic" in text_a and "+5." in text_b, "and both draw level meters on a Nordic scale (a -12 dBFS tone reads +6)", "")
@@ -708,7 +708,7 @@ def panel_wait_test():
             keys(b, "1")
             keys(b, "s")
             a.pump(10.0)
-            received = [int(part.split(" ")[0]) for part in a.text()[mark_a:].split("Recv ")[1:] if part.split(" ")[0].isdigit()]
+            received = [int(part.split(" ")[0]) for part in a.text()[mark_a:].split("Rx ")[1:] if part.split(" ")[0].isdigit()]
             check(received and max(received) >= 500, f"the receiver then gets the stream ({max(received) if received else 0} packets)", a.text()[-600:])
         finally:
             a.stop()
