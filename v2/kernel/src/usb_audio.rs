@@ -209,80 +209,108 @@ pub fn report(description: &Description, path: &dyn core::fmt::Display, vendor: 
 // Streaming
 // ------------------------------------------------------------------------------------------
 //
-// A started stream keeps a *window* of isochronous transfers queued on its endpoint, one packet
-// each (a packet is what the endpoint carries per service interval: 1 ms at full speed, 125 us
-// at high speed). The controller completes them in order, one event each, and the foreground
-// (any call that drains the xHCI event ring: `usb_hid::poll` from the tape loops) handles the
-// event: capture appends the received bytes to a PCM ring, playback fills the packet from a PCM
-// ring (silence when it is empty, counted as an underrun) and both put the packet's slot back at
-// the end of the window. Nothing here sleeps or blocks; a window of ~25 ms (high speed) / 190 ms
-// (full speed) absorbs the gaps between polls.
+// A started stream keeps a *window* of isochronous transfers queued on its endpoint, one packet each
+// (what the endpoint carries per service interval: 1 ms at full speed, 125 us at high speed). The
+// controller completes them in order, one event each. Those events are handled **inline by whoever
+// drains the xHCI event ring** (`xhci::drain`: the MSI interrupt handler, or the foreground with
+// interrupts off when MSI is not in use) through `irq_event`: capture appends the received bytes to a
+// PCM ring, playback fills the packet from a PCM ring (silence when it is empty, counted as an
+// underrun), and the packet slot goes back to the end of the window. So audio keeps flowing while the
+// foreground is busy with something long, such as a disk write; with MSI the foreground need not run at
+// all. The window (~24 ms at high speed, ~190 ms at full speed) only has to outlast interrupt latency.
+//
+// Concurrency: `irq_event` runs in interrupt context, the shell and tapes in the foreground. They share
+// only (a) the PCM rings, single-producer single-consumer with atomic head/tail, (b) counters, atomics,
+// and (c) a stream object, which the foreground builds completely, publishes with interrupts off, and
+// later unpublishes the same way after clearing its `active` flag. Everything else about a published
+// stream (its position in the window, its transfer ring, the feedback state) belongs to `irq_event`.
 
-use crate::xhci::{self, Controller, Device};
 use crate::memory;
+use crate::xhci::{self, Controller, Device, Ring as TransferRing};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Transfers kept queued per stream.
 const WINDOW: usize = 192;
 /// PCM ring size in bytes (about a second of 6-channel 24-bit audio at 48 kHz fits).
 const RING_BYTES: usize = 1 << 20;
+const FEEDBACK_WINDOW: usize = 8;
 
-pub struct Ring {
+/// A byte FIFO between the foreground and the interrupt handler (one producer, one consumer).
+pub struct PcmRing {
     base: u64,
-    head: usize, // next byte to write
-    tail: usize, // next byte to read
-    pub overruns: u64,
+    head: AtomicUsize, // next byte to write (producer)
+    tail: AtomicUsize, // next byte to read (consumer)
+    overruns: AtomicU64,
 }
 
-impl Ring {
-    const fn empty() -> Ring {
-        Ring { base: 0, head: 0, tail: 0, overruns: 0 }
-    }
-    fn allocate() -> Option<Ring> {
-        Some(Ring { base: memory::allocate_contiguous((RING_BYTES / 4096) as u64, None)?, head: 0, tail: 0, overruns: 0 })
+impl PcmRing {
+    fn allocate() -> Option<PcmRing> {
+        Some(PcmRing { base: memory::allocate_contiguous((RING_BYTES / 4096) as u64, None)?, head: AtomicUsize::new(0), tail: AtomicUsize::new(0), overruns: AtomicU64::new(0) })
     }
     pub fn available(&self) -> usize {
-        self.head.wrapping_sub(self.tail)
+        self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire))
     }
     fn space(&self) -> usize {
         RING_BYTES - self.available()
     }
     /// Appends what fits; the rest is dropped and counted (the reader is too slow).
-    fn push(&mut self, data: &[u8]) -> usize {
+    fn push(&self, data: &[u8]) -> usize {
         let count = data.len().min(self.space());
+        let head = self.head.load(Ordering::Relaxed);
         for (offset, &byte) in data[..count].iter().enumerate() {
-            unsafe { ((self.base as usize + (self.head + offset) % RING_BYTES) as *mut u8).write(byte) };
+            unsafe { ((self.base as usize + (head + offset) % RING_BYTES) as *mut u8).write_volatile(byte) };
         }
-        self.head = self.head.wrapping_add(count);
+        self.head.store(head.wrapping_add(count), Ordering::Release);
         if count < data.len() {
-            self.overruns += 1;
+            self.overruns.fetch_add(1, Ordering::Relaxed);
         }
         count
     }
-    fn pop(&mut self, out: &mut [u8]) -> usize {
+    fn pop(&self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.available());
+        let tail = self.tail.load(Ordering::Relaxed);
         for (offset, slot) in out[..count].iter_mut().enumerate() {
-            *slot = unsafe { ((self.base as usize + (self.tail + offset) % RING_BYTES) as *const u8).read() };
+            *slot = unsafe { ((self.base as usize + (tail + offset) % RING_BYTES) as *const u8).read_volatile() };
         }
-        self.tail = self.tail.wrapping_add(count);
+        self.tail.store(tail.wrapping_add(count), Ordering::Release);
         count
     }
-    fn release(&mut self) {
+    fn free(&self) {
         if self.base != 0 {
             memory::free(self.base, (RING_BYTES / 4096) as u64);
         }
-        *self = Ring::empty();
     }
+}
+
+/// The explicit feedback endpoint of an asynchronous playback stream: the device says, every so often,
+/// how many samples per frame its own clock consumes. Full speed sends it as 10.14 fixed point in 3 bytes
+/// (samples per 1 ms frame), high speed as 16.16 in 4 bytes (samples per 125 us microframe).
+struct Feedback {
+    dci: u32,
+    ring: TransferRing,
+    doorbell: usize,
+    buffers: u64,
+    trbs: [u64; FEEDBACK_WINDOW],
+    next: usize,
+    packet: u16,
+    /// The last accepted value, in Q16 samples per packet, and how many were received / rejected.
+    last_q16: u32,
+    received: AtomicU64,
+    rejected: AtomicU64,
 }
 
 struct Stream {
     alt: StreamAlt,
     dci: u32,
+    capture: bool,
+    ring: TransferRing,
+    doorbell: usize,
     buffers: u64,
     frames: u64,
     /// Slot whose completion is expected next, and the TRB address queued for each slot.
     next: usize,
     trbs: [u64; WINDOW],
-    pub ring: Ring,
+    pcm: PcmRing,
     /// Playback only: frames per packet in Q16 fixed point (nominal, or what the device's feedback endpoint
     /// last reported) and the fractional remainder carried from packet to packet.
     step_q16: u32,
@@ -290,30 +318,22 @@ struct Stream {
     feedback: Option<Feedback>,
     packets_per_second: u32,
     rate: u32,
-    pub packets: u64,
-    pub bytes: u64,
-    pub errors: u64,
-    pub underruns: u64,
+    /// Set (with interrupts off) when the stream is published, cleared before it is torn down.
+    active: AtomicBool,
+    packets: AtomicU64,
+    bytes: AtomicU64,
+    errors: AtomicU64,
+    underruns: AtomicU64,
 }
 
-/// The explicit feedback endpoint of an asynchronous playback stream: the device says, every so often, how
-/// many samples per frame its own clock consumes. Full speed sends it as 10.14 fixed point in 3 bytes
-/// (samples per 1 ms frame), high speed as 16.16 in 4 bytes (samples per 125 us microframe).
-struct Feedback {
-    dci: u32,
-    buffers: u64,
-    trbs: [u64; FEEDBACK_WINDOW],
-    next: usize,
-    packet: u16,
-    /// The last accepted value, in Q16 samples per packet, and how many were received / rejected.
-    last_q16: u32,
-    received: u64,
-    rejected: u64,
+impl Stream {
+    fn nominal_step(&self) -> u32 {
+        ((u64::from(self.rate) << 16) / u64::from(self.packets_per_second)) as u32
+    }
 }
-
-const FEEDBACK_WINDOW: usize = 8;
 
 struct AudioDevice {
+    controller_index: usize,
     controller: (u8, u8, u8),
     device: Device,
     description: Description,
@@ -337,6 +357,12 @@ pub fn attach(controller: &mut Controller, device: Device, description: Descript
     }
     let mut rates = [0u32; 8];
     let mut rate_count = 0;
+    let mut add = |rate: u32, rates: &mut [u32; 8], count: &mut usize| {
+        if rate != 0 && *count < rates.len() && !rates[..*count].contains(&rate) {
+            rates[*count] = rate;
+            *count += 1;
+        }
+    };
     if description.class_version == 2 && description.clock_count > 0 {
         // GET RANGE (request 2) on the clock source's sampling-frequency control: a count, then
         // (minimum, maximum, resolution) triplets of 32-bit values.
@@ -344,12 +370,6 @@ pub fn attach(controller: &mut Controller, device: Device, description: Descript
         let index = (u16::from(description.clock_sources[0]) << 8) | u16::from(description.control_interface);
         if controller.control_transfer(&device, 0xa1, 0x02, 0x0100, index, &mut data).is_ok() {
             let ranges = usize::from(u16::from_le_bytes([data[0], data[1]])).min(8);
-            let mut add = |rate: u32, rates: &mut [u32; 8], count: &mut usize| {
-                if rate != 0 && *count < rates.len() && !rates[..*count].contains(&rate) {
-                    rates[*count] = rate;
-                    *count += 1;
-                }
-            };
             for range in 0..ranges {
                 let at = 2 + 12 * range;
                 let (low, high, step) = (
@@ -372,15 +392,13 @@ pub fn attach(controller: &mut Controller, device: Device, description: Descript
     } else {
         for alt in &description.alts[..description.alt_count] {
             for &rate in &alt.rates[..alt.rate_count] {
-                if !rates[..rate_count].contains(&rate) && rate_count < rates.len() {
-                    rates[rate_count] = rate;
-                    rate_count += 1;
-                }
+                add(rate, &mut rates, &mut rate_count);
             }
         }
     }
     unsafe {
         DEVICE = Some(AudioDevice {
+            controller_index: controller.index,
             controller: (controller.pci.bus, controller.pci.device, controller.pci.function),
             device,
             description,
@@ -416,117 +434,106 @@ fn set_rate(controller: &mut Controller, device: &Device, description: &Descript
     }
 }
 
-fn start_stream(controller: &mut Controller, device: &Device, description: &Description, alt: StreamAlt, rate: u32, capture: bool) -> Result<Stream, &'static str> {
+/// Everything a stream needs, built with interrupts enabled and the stream not yet visible to `irq_event`.
+fn build_stream(controller: &mut Controller, device: &Device, description: &Description, alt: StreamAlt, rate: u32, capture: bool) -> Result<Stream, &'static str> {
     if alt.max_packet == 0 {
         return Err("the endpoint has no packet size");
     }
     let frames = ((WINDOW * usize::from(alt.max_packet)).div_ceil(4096)) as u64;
     let buffers = memory::allocate_contiguous(frames, Some(1 << 32)).ok_or("no memory for the packet buffers")?;
-    let ring = Ring::allocate().ok_or("no memory for the PCM ring")?;
-    controller.control_transfer(device, 0x01, 0x0b, u16::from(alt.alt), u16::from(alt.interface), &mut []).map_err(|_| "SET_INTERFACE failed")?;
+    let Some(pcm) = PcmRing::allocate() else {
+        memory::free(buffers, frames);
+        return Err("no memory for the PCM ring");
+    };
+    let Some(ring) = TransferRing::allocate() else {
+        memory::free(buffers, frames);
+        pcm.free();
+        return Err("no memory for the transfer ring");
+    };
+    let cleanup = |ring: &TransferRing, pcm: &PcmRing| {
+        memory::free(buffers, frames);
+        memory::free(ring.base(), 1);
+        pcm.free();
+    };
+    if controller.control_transfer(device, 0x01, 0x0b, u16::from(alt.alt), u16::from(alt.interface), &mut []).is_err() {
+        cleanup(&ring, &pcm);
+        return Err("SET_INTERFACE failed");
+    }
     if !set_rate(controller, device, description, &alt, rate) {
         crate::println!("audio: the device refused sample rate {rate} (carrying on at whatever it uses).");
     }
-    let dci = controller.configure_isoc_endpoint(device, alt.endpoint, alt.max_packet, alt.interval).map_err(|_| "Configure Endpoint failed")?;
+    let dci = match controller.configure_isoc_endpoint(device, alt.endpoint, alt.max_packet, alt.interval, &ring) {
+        Ok(dci) => dci,
+        Err(_) => {
+            cleanup(&ring, &pcm);
+            return Err("Configure Endpoint failed");
+        }
+    };
     let interval_shift = u32::from(alt.interval.clamp(1, 16)) - 1;
     let packets_per_second = if device.speed >= 3 { 8000 >> interval_shift } else { 1000 >> interval_shift };
     let mut stream = Stream {
         alt,
         dci,
+        capture,
+        ring,
+        doorbell: controller.doorbell_address(device.slot),
         buffers,
         frames,
         next: 0,
         trbs: [0; WINDOW],
-        ring,
+        pcm,
         step_q16: 0,
         accumulator_q16: 0,
         feedback: None,
         packets_per_second: packets_per_second.max(1),
         rate,
-        packets: 0,
-        bytes: 0,
-        errors: 0,
-        underruns: 0,
+        active: AtomicBool::new(false),
+        packets: AtomicU64::new(0),
+        bytes: AtomicU64::new(0),
+        errors: AtomicU64::new(0),
+        underruns: AtomicU64::new(0),
     };
-    stream.step_q16 = ((u64::from(rate) << 16) / u64::from(stream.packets_per_second)) as u32;
+    stream.step_q16 = stream.nominal_step();
     if !capture && alt.feedback != 0 && alt.feedback_packet >= 3 {
-        stream.feedback = start_feedback(controller, device, &alt);
+        stream.feedback = build_feedback(controller, device, &alt);
     }
-    for slot in 0..WINDOW {
-        queue_slot(controller, device.slot, &mut stream, slot, capture);
-    }
-    controller.start_endpoint(device.slot, dci);
     Ok(stream)
 }
 
-/// Configures the playback stream's feedback endpoint (an isochronous IN endpoint) and queues a few
-/// transfers on it. Optional: if anything fails the stream simply runs at the nominal rate.
-fn start_feedback(controller: &mut Controller, device: &Device, alt: &StreamAlt) -> Option<Feedback> {
+/// The feedback endpoint (an isochronous IN endpoint). Optional: if anything fails the stream simply
+/// runs at the nominal rate.
+fn build_feedback(controller: &mut Controller, device: &Device, alt: &StreamAlt) -> Option<Feedback> {
     let buffers = memory::allocate_contiguous(1, Some(1 << 32))?;
-    let dci = match controller.configure_isoc_endpoint(device, alt.feedback, alt.feedback_packet, alt.feedback_interval.max(1)) {
-        Ok(dci) => dci,
+    let Some(ring) = TransferRing::allocate() else {
+        memory::free(buffers, 1);
+        return None;
+    };
+    let packet = alt.feedback_packet.min(4);
+    match controller.configure_isoc_endpoint(device, alt.feedback, packet, alt.feedback_interval.max(1), &ring) {
+        Ok(dci) => Some(Feedback {
+            dci,
+            ring,
+            doorbell: controller.doorbell_address(device.slot),
+            buffers,
+            trbs: [0; FEEDBACK_WINDOW],
+            next: 0,
+            packet,
+            last_q16: 0,
+            received: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        }),
         Err(_) => {
             memory::free(buffers, 1);
-            return None;
+            memory::free(ring.base(), 1);
+            None
         }
-    };
-    let mut feedback = Feedback { dci, buffers, trbs: [0; FEEDBACK_WINDOW], next: 0, packet: alt.feedback_packet.min(4), last_q16: 0, received: 0, rejected: 0 };
-    for slot in 0..FEEDBACK_WINDOW {
-        feedback.trbs[slot] = controller.queue_isoc(device.slot, dci, buffers + (slot * 16) as u64, u32::from(feedback.packet));
-    }
-    controller.start_endpoint(device.slot, dci);
-    Some(feedback)
-}
-
-/// Handles one feedback transfer event of `stream`; true if it was one.
-fn feedback_event(controller: &mut Controller, xhci_slot: u8, stream: &mut Stream, event: &xhci::Trb, high_speed: bool) -> bool {
-    let nominal = stream.step_q16_nominal();
-    let Some(feedback) = stream.feedback.as_mut() else { return false };
-    if event.endpoint_index() != feedback.dci {
-        return false;
-    }
-    let slot = if feedback.trbs[feedback.next] == event.trb_address() { feedback.next } else { feedback.trbs.iter().position(|&a| a == event.trb_address()).unwrap_or(feedback.next) };
-    feedback.next = (slot + 1) % FEEDBACK_WINDOW;
-    let length = usize::from(feedback.packet).saturating_sub(event.residual() as usize);
-    if matches!(event.completion(), xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT) && (length == 3 || length == 4) {
-        let bytes = unsafe { core::slice::from_raw_parts((feedback.buffers + (slot * 16) as u64) as *const u8, length) };
-        let mut value = 0u64;
-        for (index, &byte) in bytes.iter().enumerate() {
-            value |= u64::from(byte) << (8 * index);
-        }
-        // 3 bytes: 10.14 (samples per 1 ms frame); 4 bytes: 16.16 (samples per microframe). Convert to
-        // Q16 samples per *packet*, a packet being 2^(bInterval-1) such frames.
-        let per_frame_q16 = if length == 3 { value << 2 } else { value };
-        let frames_per_packet = u64::from(if high_speed { 8000 } else { 1000 } / stream.packets_per_second.max(1));
-        let step = per_frame_q16 * frames_per_packet;
-        // Believe only values within 10% of the nominal rate: a garbage report must not wreck the stream.
-        if step >= u64::from(nominal) * 9 / 10 && step <= u64::from(nominal) * 11 / 10 {
-            stream.step_q16 = step as u32;
-            if let Some(feedback) = stream.feedback.as_mut() {
-                feedback.last_q16 = step as u32;
-                feedback.received += 1;
-            }
-        } else if let Some(feedback) = stream.feedback.as_mut() {
-            feedback.rejected += 1;
-        }
-    }
-    if let Some(feedback) = stream.feedback.as_mut() {
-        feedback.trbs[slot] = controller.queue_isoc(xhci_slot, feedback.dci, feedback.buffers + (slot * 16) as u64, u32::from(feedback.packet));
-        controller.start_endpoint(xhci_slot, feedback.dci);
-    }
-    true
-}
-
-impl Stream {
-    fn step_q16_nominal(&self) -> u32 {
-        ((u64::from(self.rate) << 16) / u64::from(self.packets_per_second)) as u32
     }
 }
 
-/// Fills (playback) or just aims (capture) packet slot `slot` and queues its transfer.
-fn queue_slot(controller: &mut Controller, xhci_slot: u8, stream: &mut Stream, slot: usize, capture: bool) {
+/// Fills (playback) or just aims (capture) packet slot `slot` and queues its transfer. Interrupt context.
+fn queue_slot(stream: &mut Stream, slot: usize) {
     let address = stream.buffers + (slot * usize::from(stream.alt.max_packet)) as u64;
-    let length = if capture {
+    let length = if stream.capture {
         u32::from(stream.alt.max_packet)
     } else {
         // This packet's frame count: the Q16 frames-per-packet step (nominal rate / packets per second, or
@@ -538,62 +545,118 @@ fn queue_slot(controller: &mut Controller, xhci_slot: u8, stream: &mut Stream, s
         let frame_bytes = usize::from(stream.alt.channels) * usize::from(stream.alt.subslot_bytes);
         let wanted = (frames as usize * frame_bytes).min(usize::from(stream.alt.max_packet));
         let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, wanted) };
-        let got = stream.ring.pop(buffer);
+        let got = stream.pcm.pop(buffer);
         if got < wanted {
             buffer[got..].fill(0);
-            stream.underruns += 1;
+            stream.underruns.fetch_add(1, Ordering::Relaxed);
         }
         wanted as u32
     };
-    stream.trbs[slot] = controller.queue_isoc(xhci_slot, stream.dci, address, length);
+    stream.trbs[slot] = xhci::push_isoc(&mut stream.ring, address, length);
 }
 
-/// Called with every transfer event the xHCI driver has no one waiting for; returns true if it was
-/// an audio stream's.
-pub fn background_event(controller: &mut Controller, event: &xhci::Trb) -> bool {
-    let Some(device) = audio() else { return false };
-    if !event.is_transfer() || event.slot_number() != device.device.slot {
+/// Handles one feedback transfer event of `stream`. Interrupt context.
+fn feedback_event(stream: &mut Stream, event: &xhci::Trb, high_speed: bool) -> bool {
+    let nominal = stream.nominal_step();
+    let packets_per_second = stream.packets_per_second.max(1);
+    let Some(feedback) = stream.feedback.as_mut() else { return false };
+    if event.endpoint_index() != feedback.dci {
         return false;
     }
-    if (controller.pci.bus, controller.pci.device, controller.pci.function) != device.controller {
-        return false;
-    }
-    let slot = device.device.slot;
-    let high_speed = device.device.speed >= 3;
-    for (stream, capture) in [(device.capture.as_mut(), true), (device.playback.as_mut(), false)] {
-        let Some(stream) = stream else { continue };
-        if !capture && feedback_event(controller, slot, stream, event, high_speed) {
-            return true;
+    let slot = if feedback.trbs[feedback.next] == event.trb_address() { feedback.next } else { feedback.trbs.iter().position(|&a| a == event.trb_address()).unwrap_or(feedback.next) };
+    feedback.next = (slot + 1) % FEEDBACK_WINDOW;
+    let length = usize::from(feedback.packet).saturating_sub(event.residual() as usize);
+    let mut new_step = None;
+    if matches!(event.completion(), xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT) && (length == 3 || length == 4) {
+        let bytes = unsafe { core::slice::from_raw_parts((feedback.buffers + (slot * 16) as u64) as *const u8, length) };
+        let mut value = 0u64;
+        for (index, &byte) in bytes.iter().enumerate() {
+            value |= u64::from(byte) << (8 * index);
         }
-        if event.endpoint_index() != stream.dci {
+        // 3 bytes: 10.14 (samples per 1 ms frame); 4 bytes: 16.16 (samples per microframe). Convert to
+        // Q16 samples per *packet*, a packet being 2^(bInterval-1) such frames.
+        let per_frame_q16 = if length == 3 { value << 2 } else { value };
+        let frames_per_packet = u64::from(if high_speed { 8000 } else { 1000 } / packets_per_second);
+        let step = per_frame_q16 * frames_per_packet;
+        // Believe only values within 10% of the nominal rate: a garbage report must not wreck the stream.
+        if step >= u64::from(nominal) * 9 / 10 && step <= u64::from(nominal) * 11 / 10 {
+            feedback.last_q16 = step as u32;
+            feedback.received.fetch_add(1, Ordering::Relaxed);
+            new_step = Some(step as u32);
+        } else {
+            feedback.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    feedback.trbs[slot] = xhci::push_isoc(&mut feedback.ring, feedback.buffers + (slot * 16) as u64, u32::from(feedback.packet));
+    xhci::ring_doorbell_at(feedback.doorbell, feedback.dci);
+    if let Some(step) = new_step {
+        stream.step_q16 = step;
+    }
+    true
+}
+
+/// Called by the xHCI event drain (interrupt context, or the foreground with interrupts off) for every
+/// event; returns true if it belonged to an audio stream and was handled. Must not allocate, print or wait.
+pub fn irq_event(index: usize, event: &xhci::Trb) -> bool {
+    if !event.is_transfer() {
+        return false;
+    }
+    let Some(device) = audio() else { return false };
+    if device.controller_index != index || event.slot_number() != device.device.slot {
+        return false;
+    }
+    let high_speed = device.device.speed >= 3;
+    for stream in [device.capture.as_mut(), device.playback.as_mut()].into_iter().flatten() {
+        let ours = event.endpoint_index() == stream.dci || stream.feedback.as_ref().is_some_and(|feedback| feedback.dci == event.endpoint_index());
+        if !ours {
             continue;
         }
+        if !stream.active.load(Ordering::Acquire) {
+            return true; // a stream being set up or torn down: its events are of no interest
+        }
+        if !stream.capture && feedback_event(stream, event, high_speed) {
+            return true;
+        }
         // Completions arrive in queue order; if one was missed, resynchronise on the TRB address.
-        let slot_index = if stream.trbs[stream.next] == event.trb_address() {
-            stream.next
-        } else {
-            stream.trbs.iter().position(|&address| address == event.trb_address()).unwrap_or(stream.next)
-        };
-        stream.next = (slot_index + 1) % WINDOW;
-        stream.packets += 1;
+        let slot = if stream.trbs[stream.next] == event.trb_address() { stream.next } else { stream.trbs.iter().position(|&a| a == event.trb_address()).unwrap_or(stream.next) };
+        stream.next = (slot + 1) % WINDOW;
+        stream.packets.fetch_add(1, Ordering::Relaxed);
         let ok = matches!(event.completion(), xhci::COMPLETION_SUCCESS | xhci::COMPLETION_SHORT);
         if !ok {
-            stream.errors += 1;
+            stream.errors.fetch_add(1, Ordering::Relaxed);
         }
-        if capture && ok {
-            let address = stream.buffers + (slot_index * usize::from(stream.alt.max_packet)) as u64;
+        if stream.capture && ok {
+            let address = stream.buffers + (slot * usize::from(stream.alt.max_packet)) as u64;
             let length = usize::from(stream.alt.max_packet).saturating_sub(event.residual() as usize);
             let data = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
-            stream.bytes += length as u64;
-            stream.ring.push(data);
-        } else if !capture {
-            stream.bytes += u64::from(stream.alt.max_packet.min(1)); // counted below by packets; bytes unused for playback
+            stream.bytes.fetch_add(length as u64, Ordering::Relaxed);
+            stream.pcm.push(data);
         }
-        queue_slot(controller, slot, stream, slot_index, capture);
-        controller.start_endpoint(slot, stream.dci);
+        queue_slot(stream, slot);
+        xhci::ring_doorbell_at(stream.doorbell, stream.dci);
         return true;
     }
     false
+}
+
+/// Publishes a built stream and queues its first window, all with interrupts off, so `irq_event` sees
+/// it complete or not at all, and cannot push to its ring while the first window is being queued.
+fn publish(slot: &mut Option<Stream>, stream: Stream) {
+    let was = crate::cpu::interrupts_save_and_disable();
+    *slot = Some(stream);
+    let stream = slot.as_mut().unwrap();
+    for position in 0..WINDOW {
+        queue_slot(stream, position);
+    }
+    if let Some(feedback) = stream.feedback.as_mut() {
+        for position in 0..FEEDBACK_WINDOW {
+            feedback.trbs[position] = xhci::push_isoc(&mut feedback.ring, feedback.buffers + (position * 16) as u64, u32::from(feedback.packet));
+        }
+        xhci::ring_doorbell_at(feedback.doorbell, feedback.dci);
+    }
+    stream.active.store(true, Ordering::Release);
+    xhci::ring_doorbell_at(stream.doorbell, stream.dci);
+    crate::cpu::interrupts_restore(was);
 }
 
 /// Starts capture and/or playback at `rate`. Returns a reason on failure.
@@ -606,38 +669,65 @@ pub fn start(controller: &mut Controller, rate: u32, want_capture: bool, want_pl
         return Err("the device does not offer that sample rate");
     }
     let dev = device.device;
+    let description = Description { ..clone_description(&device.description) };
     if want_capture {
-        let alt = find_alt(&device.description, true).ok_or("the device has no capture stream")?;
-        device.capture = Some(start_stream(controller, &dev, &device.description, alt, rate, true)?);
+        let alt = find_alt(&description, true).ok_or("the device has no capture stream")?;
+        let stream = build_stream(controller, &dev, &description, alt, rate, true)?;
+        publish(&mut device.capture, stream);
     }
     if want_playback {
-        let alt = find_alt(&device.description, false).ok_or("the device has no playback stream")?;
-        device.playback = Some(start_stream(controller, &dev, &device.description, alt, rate, false)?);
+        let alt = find_alt(&description, false).ok_or("the device has no playback stream")?;
+        let stream = build_stream(controller, &dev, &description, alt, rate, false)?;
+        publish(&mut device.playback, stream);
     }
     Ok(())
 }
 
-fn stop_stream(controller: &mut Controller, device: &Device, stream: &mut Stream) {
+fn clone_description(description: &Description) -> Description {
+    Description {
+        class_version: description.class_version,
+        control_interface: description.control_interface,
+        clock_sources: description.clock_sources,
+        clock_count: description.clock_count,
+        alts: description.alts,
+        alt_count: description.alt_count,
+    }
+}
+
+fn stop_stream(controller: &mut Controller, device: &Device, mut stream: Stream) {
     if let Some(feedback) = stream.feedback.take() {
         controller.stop_endpoint(device.slot, feedback.dci);
         controller.drop_endpoint(device, feedback.dci);
         memory::free(feedback.buffers, 1);
+        memory::free(feedback.ring.base(), 1);
     }
     controller.stop_endpoint(device.slot, stream.dci);
     controller.drop_endpoint(device, stream.dci);
     let _ = controller.control_transfer(device, 0x01, 0x0b, 0, u16::from(stream.alt.interface), &mut []); // back to alternate setting 0
     memory::free(stream.buffers, stream.frames);
-    stream.ring.release();
+    memory::free(stream.ring.base(), 1);
+    stream.pcm.free();
 }
 
 pub fn stop(controller: &mut Controller) {
     let Some(device) = audio() else { return };
     let dev = device.device;
-    if let Some(mut stream) = device.capture.take() {
-        stop_stream(controller, &dev, &mut stream);
+    // 1. Tell `irq_event` to stop touching the streams (their events are swallowed from now on).
+    let was = crate::cpu::interrupts_save_and_disable();
+    for stream in [device.capture.as_ref(), device.playback.as_ref()].into_iter().flatten() {
+        stream.active.store(false, Ordering::Release);
     }
-    if let Some(mut stream) = device.playback.take() {
-        stop_stream(controller, &dev, &mut stream);
+    crate::cpu::interrupts_restore(was);
+    // 2. Take them out, stop their endpoints (commands: interrupts must be on), release the memory.
+    let was = crate::cpu::interrupts_save_and_disable();
+    let capture = device.capture.take();
+    let playback = device.playback.take();
+    crate::cpu::interrupts_restore(was);
+    if let Some(stream) = capture {
+        stop_stream(controller, &dev, stream);
+    }
+    if let Some(stream) = playback {
+        stop_stream(controller, &dev, stream);
     }
 }
 
@@ -647,19 +737,29 @@ pub fn controller() -> Option<&'static mut Controller> {
     (0..xhci::count()).find_map(|index| xhci::controller(index).filter(|c| (c.pci.bus, c.pci.device, c.pci.function) == identity))
 }
 
-/// Identity of the controller the audio device is on, to find it again.
-pub fn controller_identity() -> Option<(u8, u8, u8)> {
-    audio().map(|device| device.controller)
-}
-
 /// Copies captured bytes (interleaved frames) out of the PCM ring.
 pub fn read(out: &mut [u8]) -> usize {
-    audio().and_then(|device| device.capture.as_mut()).map_or(0, |stream| stream.ring.pop(out))
+    audio().and_then(|device| device.capture.as_ref()).map_or(0, |stream| stream.pcm.pop(out))
 }
 
 /// Queues playback bytes (interleaved frames); returns how many fitted.
 pub fn write(data: &[u8]) -> usize {
-    audio().and_then(|device| device.playback.as_mut()).map_or(0, |stream| stream.ring.push(data))
+    audio().and_then(|device| device.playback.as_ref()).map_or(0, |stream| stream.pcm.push(data))
+}
+
+/// Bytes of room in the playback PCM ring.
+pub fn playback_space() -> usize {
+    audio().and_then(|device| device.playback.as_ref()).map_or(0, |stream| stream.pcm.space())
+}
+
+/// Channel layout of the capture stream: (channels, bytes per sample slot).
+pub fn capture_format() -> Option<(u8, u8)> {
+    audio().and_then(|device| device.capture.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
+}
+
+/// Channel layout of the playback stream: (channels, bytes per sample slot).
+pub fn playback_format() -> Option<(u8, u8)> {
+    audio().and_then(|device| device.playback.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
 }
 
 /// `audio` with no arguments: what the device offers and how a running stream is doing.
@@ -675,36 +775,31 @@ pub fn status() {
         match stream {
             Some(stream) => crate::println!(
                 "  {name}: {} Hz, {} ch {}-bit, {} packets, {} bytes, {} errors, {} underruns, ring {} bytes ({} overruns)",
-                stream.rate, stream.alt.channels, stream.alt.bits, stream.packets, stream.bytes, stream.errors, stream.underruns, stream.ring.available(), stream.ring.overruns
+                stream.rate,
+                stream.alt.channels,
+                stream.alt.bits,
+                stream.packets.load(Ordering::Relaxed),
+                stream.bytes.load(Ordering::Relaxed),
+                stream.errors.load(Ordering::Relaxed),
+                stream.underruns.load(Ordering::Relaxed),
+                stream.pcm.available(),
+                stream.pcm.overruns.load(Ordering::Relaxed)
             ),
             None => crate::println!("  {name}: stopped"),
         }
-        if let Some(feedback) = stream.and_then(|stream| stream.feedback.as_ref()) {
-            let stream = stream.unwrap();
-            let q = |value: u32| (value >> 16, ((value & 0xffff) * 1000) >> 16);
-            let (device_whole, device_fraction) = q(feedback.last_q16);
-            let (nominal_whole, nominal_fraction) = q(stream.step_q16_nominal());
-            crate::println!(
-                "    feedback: {} reports, {} rejected; device clock {device_whole}.{device_fraction:03} vs nominal {nominal_whole}.{nominal_fraction:03} frames/packet",
-                feedback.received, feedback.rejected
-            );
+        if let Some(stream) = stream {
+            if let Some(feedback) = stream.feedback.as_ref() {
+                let q = |value: u32| (value >> 16, ((value & 0xffff) * 1000) >> 16);
+                let (device_whole, device_fraction) = q(feedback.last_q16);
+                let (nominal_whole, nominal_fraction) = q(stream.nominal_step());
+                crate::println!(
+                    "    feedback: {} reports, {} rejected; device clock {device_whole}.{device_fraction:03} vs nominal {nominal_whole}.{nominal_fraction:03} frames/packet",
+                    feedback.received.load(Ordering::Relaxed),
+                    feedback.rejected.load(Ordering::Relaxed)
+                );
+            }
         }
     }
-}
-
-/// Channel layout of the capture stream: (channels, bytes per sample slot).
-pub fn capture_format() -> Option<(u8, u8)> {
-    audio().and_then(|device| device.capture.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
-}
-
-/// Channel layout of the playback stream: (channels, bytes per sample slot).
-pub fn playback_format() -> Option<(u8, u8)> {
-    audio().and_then(|device| device.playback.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
-}
-
-/// Bytes of room in the playback PCM ring.
-pub fn playback_space() -> usize {
-    audio().and_then(|device| device.playback.as_ref()).map_or(0, |stream| stream.ring.space())
 }
 
 /// Fills the tape ABI's `AudioInfo`; false if there is no audio device.
@@ -726,11 +821,11 @@ pub fn fill_info(info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
     out.rates[..device.rate_count].copy_from_slice(&device.rates[..device.rate_count]);
     if let Some(stream) = &device.capture {
         out.capture_rate = stream.rate;
-        out.capture_available = stream.ring.available() as u32;
+        out.capture_available = stream.pcm.available() as u32;
     }
     if let Some(stream) = &device.playback {
         out.playback_rate = stream.rate;
-        out.playback_space = stream.ring.space() as u32;
+        out.playback_space = stream.pcm.space() as u32;
     }
     *info = out;
     true
@@ -740,15 +835,15 @@ pub fn fill_stats(stats: &mut fos_v2_abi::tape::AudioStats) {
     let mut out = fos_v2_abi::tape::AudioStats::default();
     if let Some(device) = audio() {
         if let Some(stream) = &device.capture {
-            out.capture_packets = stream.packets;
-            out.capture_bytes = stream.bytes;
-            out.capture_errors = stream.errors;
-            out.capture_overruns = stream.ring.overruns;
+            out.capture_packets = stream.packets.load(Ordering::Relaxed);
+            out.capture_bytes = stream.bytes.load(Ordering::Relaxed);
+            out.capture_errors = stream.errors.load(Ordering::Relaxed);
+            out.capture_overruns = stream.pcm.overruns.load(Ordering::Relaxed);
         }
         if let Some(stream) = &device.playback {
-            out.playback_packets = stream.packets;
-            out.playback_errors = stream.errors;
-            out.playback_underruns = stream.underruns;
+            out.playback_packets = stream.packets.load(Ordering::Relaxed);
+            out.playback_errors = stream.errors.load(Ordering::Relaxed);
+            out.playback_underruns = stream.underruns.load(Ordering::Relaxed);
         }
     }
     *stats = out;

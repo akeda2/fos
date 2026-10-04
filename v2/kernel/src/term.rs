@@ -643,7 +643,7 @@ fn execute(command: &str) {
             crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
             crate::println!("run NAME [ARGS]   load a tape from FOSFS and run it");
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
-            crate::println!("uptime    time since the timer started");
+            crate::println!("uptime    time since the timer started; sleep N waits N seconds");
             crate::println!("dmesg     the boot log");
             crate::println!("shutdown  power off");
             crate::println!("reset     restart through the firmware (reboot is the same)");
@@ -824,6 +824,18 @@ fn execute(command: &str) {
                 crate::println!("{added} new keyboard(s).");
             }
             crate::usb_hid::describe_devices(|arguments| crate::println!("{}", arguments));
+        }
+        "sleep" => {
+            // Blocks the shell for N seconds without polling anything (the watchdog is fed): what a long disk
+            // write or any other slow command looks like to the rest of the kernel. USB audio must keep
+            // flowing meanwhile (test: `audio start`, `sleep`, `audio`).
+            let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(1).min(60);
+            let end = apic::ticks() + seconds * apic::TICK_HZ;
+            while apic::ticks() < end {
+                crate::debug::pet();
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+            }
+            crate::println!("Slept {seconds} s.");
         }
         "uptime" => {
             let ticks = apic::ticks();

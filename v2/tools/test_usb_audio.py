@@ -34,11 +34,16 @@ def main():
         extra = ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}",
                  "-device", "usb-audio,audiodev=snd"]
         # The shell is reached over the serial port, which the guest also reads as a keyboard.
-        text = boot_with_commands(extra, ["usb rescan", "audio", "audio tone 440 3", "audio capture 2"])
+        text = boot_with_commands(extra, ["usb rescan", "audio", "audio tone 440 3", "audio capture 2",
+                                          "audio start 48000 playback", "sleep 3", "audio", "audio stop"])
+        check("xHCI 00:03.0: MSI on vector" in text, "the xHCI controller takes its events by MSI (the self-test interrupt arrived)", text[-3000:])
         check("USB audio" in text and "Audio Class 1.0" in text, "the USB audio device is recognised (class 1.0)", text)
         check("playback 2 ch, 16-bit" in text and "48000" in text, "its streaming interfaces and sample rates are reported", text)
         tone = text.split("audio tone 440 3")[-1].split("audio capture")[0]
         check("playback: 48000 Hz" in tone and "0 errors" in tone, "playback runs at 48 kHz with no transfer errors", tone)
+        blocked = text.split("audio start 48000 playback")[-1]
+        packets = [int(n) for n in re.findall(r"playback: 48000 Hz, 2 ch 16-bit, (\d+) packets", blocked)]
+        check(packets and packets[-1] > 2500, f"audio keeps streaming while the foreground is blocked ({packets} packets after a 3 s sleep; ~3000 expected)", blocked[-600:])
         check("no capture stream" in text.split("audio capture 2")[-1], "capture is refused cleanly when the device has no input", text[-400:])
 
         if wav.exists() and wav.stat().st_size > 44:

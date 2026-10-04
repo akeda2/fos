@@ -213,9 +213,6 @@ pub fn background_event(controller: &mut Controller, event: &Trb) {
     if !event.is_transfer() {
         return;
     }
-    if crate::usb_audio::background_event(controller, event) {
-        return;
-    }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
     let identity = (controller.pci.bus, controller.pci.device, controller.pci.function);
     let Some(keyboard) = keyboards.iter_mut().flatten().find(|k| {
@@ -368,7 +365,7 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
 pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
     for index in 0..xhci::count() {
         let Some(controller) = xhci::controller(index) else { continue };
-        print(format_args!("xHCI {:02x}:{:02x}.{}: {} ports", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports));
+        print(format_args!("xHCI {:02x}:{:02x}.{}: {} ports, events by {}", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports, if controller.interrupt_driven { "MSI" } else { "polling" }));
         for port in 1..=controller.ports {
             let status = controller.port_status(port);
             if status & 1 != 0 {

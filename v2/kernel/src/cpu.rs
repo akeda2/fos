@@ -97,3 +97,18 @@ pub fn halt() -> ! {
 pub const MSR_APIC_BASE: u32 = 0x1b;
 pub const MSR_PAT: u32 = 0x277;
 pub const MSR_EFER: u32 = 0xc000_0080;
+
+/// Disables interrupts and returns whether they were enabled, for a short critical section that the
+/// caller ends with `interrupts_restore(was)` (so nested sections and sections entered with
+/// interrupts already off both behave).
+pub fn interrupts_save_and_disable() -> bool {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, preserves_flags)) };
+    flags & (1 << 9) != 0
+}
+
+pub fn interrupts_restore(was_enabled: bool) {
+    if was_enabled {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
+}

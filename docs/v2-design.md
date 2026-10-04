@@ -279,8 +279,18 @@ firmware, so a pending slot is tried on the next boot.
   clock; `audio` shows the report count and the device's clock against nominal. On the H6: 313 reports in 5 s,
   none rejected, exactly nominal at 48 kHz (QEMU's `usb-audio` has no feedback endpoint, so it is hardware-only).
   Capture and playback together (`audio duplex 10`) ran 10 s on the H6 with 80,016 + 80,007 packets (about 16,000
-  transfer events/s) and no errors. Not done: interrupt-driven event handling (events are handled whenever the
-  xHCI ring is drained, from tape/shell loops).
+  transfer events/s) and no errors.
+  **xHCI events by interrupt.** After the settings file is read (`no-msi` decides), `xhci::enable_interrupts_all`
+  moves each controller's events to MSI (MSI-X table entry 0 when only that exists, as on QEMU's xHCI), with a
+  self-test (a no-op command whose completion must raise the interrupt) and 1 ms interrupt moderation; a
+  controller that fails stays polled. The event ring is consumed by one function, `xhci::drain`, run by the
+  interrupt handler or, otherwise, by the foreground with interrupts off: audio transfer events are handled
+  inline there (`usb_audio::irq_event`: refill a packet, copy captured bytes, requeue) and everything else goes
+  to a soft queue the foreground reads (`Controller::next_event`). So audio no longer depends on the foreground:
+  `audio start 48000 both`, `sleep 8` (a shell command that blocks without polling) and `audio` on the H6 showed
+  68,436 capture and 68,520 playback packets, no errors, while the foreground did nothing. Audio objects shared
+  with the handler are atomics or published/unpublished with interrupts off (see the comment in `usb_audio.rs`).
+  Not done: streaming a long take to disk (the `record` tape still captures into RAM first, up to 64 MiB).
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with

@@ -115,9 +115,22 @@ impl Trb {
     }
 }
 
+/// Queues one isochronous transfer (one service interval's worth of data) on `ring`, without ringing the
+/// doorbell. "Start isochronous ASAP" (SIA) lets the controller choose the frame, each transfer following the
+/// previous one; every transfer asks for an event (IOC), so the stream handler learns its actual length.
+/// Returns the TRB's address, which names its completion event.
+pub fn push_isoc(ring: &mut Ring, buffer: u64, length: u32) -> u64 {
+    ring.push(buffer, length, (TRB_ISOCH << 10) | TRB_IOC | TRB_ISP | (1 << 31))
+}
+
+/// Rings a doorbell register (`Controller::doorbell_address`) for endpoint `dci`.
+pub fn ring_doorbell_at(address: usize, dci: u32) {
+    write32(address, dci);
+}
+
 /// A producer ring: one frame of TRBs whose last entry links back to the start.
 #[derive(Clone, Copy)]
-struct Ring {
+pub struct Ring {
     base: u64,
     enqueue: usize,
     cycle: bool,
@@ -152,10 +165,14 @@ fn read_trb(address: u64) -> Trb {
 }
 
 impl Ring {
-    fn allocate() -> Option<Ring> {
+    pub fn allocate() -> Option<Ring> {
         let base = frame()?;
         write_trb(base + (RING_TRBS as u64 - 1) * TRB_BYTES, &Trb { parameter: base, status: 0, control: TRB_LINK << 10 | TRB_TOGGLE_CYCLE });
         Some(Ring { base, enqueue: 0, cycle: true })
+    }
+
+    pub fn base(&self) -> u64 {
+        self.base
     }
 
     fn is_allocated(&self) -> bool {
@@ -168,7 +185,7 @@ impl Ring {
 
     /// Queues one TRB (`control` without its cycle bit); returns its address, which is
     /// how its completion event names it.
-    fn push(&mut self, parameter: u64, status: u32, control: u32) -> u64 {
+    pub fn push(&mut self, parameter: u64, status: u32, control: u32) -> u64 {
         let at = self.enqueue_address();
         write_trb(at, &Trb { parameter, status, control: control | u32::from(self.cycle) });
         self.enqueue += 1;
@@ -274,16 +291,137 @@ pub struct Controller {
     pub ports: u8,
     /// Context records are 64 bytes instead of 32 when HCCPARAMS1.CSZ is set.
     context_bytes: u64,
-    event_ring: u64,
+    /// Position in `CONTROLLERS`: events, the soft queue and the interrupt handler are keyed by it.
+    pub index: usize,
+    /// True once MSI delivers this controller's events (otherwise the foreground drains the ring).
+    pub interrupt_driven: bool,
     dcbaa: u64,
     command_ring: Ring,
-    event_index: usize,
-    event_cycle: bool,
     slots: [Slot; MAX_SLOTS + 1],
 }
 
 static mut CONTROLLERS: [Option<Controller>; MAX_CONTROLLERS] = [const { None }; MAX_CONTROLLERS];
 static mut COUNT: usize = 0;
+
+/// Where this controller's event ring stands, kept outside `Controller` because the interrupt handler
+/// consumes the ring too and must never alias the `&mut Controller` the foreground holds.
+#[derive(Clone, Copy)]
+struct EventState {
+    base: u64,
+    index: usize,
+    cycle: bool,
+    /// Addresses of interrupter 0's ERDP and IMAN registers and of USBSTS.
+    erdp: usize,
+    iman: usize,
+    usbsts: usize,
+    ready: bool,
+}
+
+static mut EVENTS: [EventState; MAX_CONTROLLERS] = [EventState { base: 0, index: 0, cycle: true, erdp: 0, iman: 0, usbsts: 0, ready: false }; MAX_CONTROLLERS];
+
+/// Events nobody handled inline (command completions, port changes, a keyboard's report, the transfers
+/// the foreground waits for), handed from whoever drained the ring to the foreground. One producer at a
+/// time (the interrupt handler, or the foreground with interrupts off) and one consumer: a plain
+/// head/tail ring is enough.
+const SOFT_CAPACITY: usize = 512;
+
+struct SoftQueue {
+    items: [Trb; SOFT_CAPACITY],
+    head: core::sync::atomic::AtomicUsize,
+    tail: core::sync::atomic::AtomicUsize,
+    dropped: core::sync::atomic::AtomicU64,
+}
+
+static mut SOFT: [SoftQueue; MAX_CONTROLLERS] = [const {
+    SoftQueue { items: [Trb { parameter: 0, status: 0, control: 0 }; SOFT_CAPACITY], head: core::sync::atomic::AtomicUsize::new(0), tail: core::sync::atomic::AtomicUsize::new(0), dropped: core::sync::atomic::AtomicU64::new(0) }
+}; MAX_CONTROLLERS];
+
+fn soft_push(index: usize, trb: Trb) {
+    use core::sync::atomic::Ordering;
+    let queue = unsafe { &mut (*core::ptr::addr_of_mut!(SOFT))[index] };
+    let head = queue.head.load(Ordering::Relaxed);
+    let next = (head + 1) % SOFT_CAPACITY;
+    if next == queue.tail.load(Ordering::Acquire) {
+        queue.dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    queue.items[head] = trb;
+    queue.head.store(next, Ordering::Release);
+}
+
+fn soft_pop(index: usize) -> Option<Trb> {
+    use core::sync::atomic::Ordering;
+    let queue = unsafe { &mut (*core::ptr::addr_of_mut!(SOFT))[index] };
+    let tail = queue.tail.load(Ordering::Relaxed);
+    if tail == queue.head.load(Ordering::Acquire) {
+        return None;
+    }
+    let trb = queue.items[tail];
+    queue.tail.store((tail + 1) % SOFT_CAPACITY, Ordering::Release);
+    Some(trb)
+}
+
+/// Consumes every event the controller has written. Audio transfer events are handled on the spot
+/// (`usb_audio::irq_event`: refill a packet, copy captured bytes) so audio never depends on the
+/// foreground; everything else goes to the soft queue. Called from the interrupt handler, or by the
+/// foreground with interrupts disabled: never from both at once.
+fn drain(index: usize) {
+    let state = unsafe { &mut (*core::ptr::addr_of_mut!(EVENTS))[index] };
+    if !state.ready {
+        return;
+    }
+    let mut consumed = false;
+    loop {
+        let at = state.base + state.index as u64 * TRB_BYTES;
+        let trb = read_trb(at);
+        if (trb.control & TRB_CYCLE != 0) != state.cycle {
+            break;
+        }
+        state.index += 1;
+        if state.index == EVENT_TRBS {
+            state.index = 0;
+            state.cycle = !state.cycle;
+        }
+        consumed = true;
+        if !crate::usb_audio::irq_event(index, &trb) {
+            soft_push(index, trb);
+        }
+    }
+    if consumed {
+        let dequeue = state.base + state.index as u64 * TRB_BYTES;
+        write64(state.erdp, dequeue | (1 << 3)); // bit 3: clear "event handler busy"
+    }
+}
+
+/// The MSI handler: acknowledge the interrupt (IMAN.IP and USBSTS.EINT are write-1-to-clear), then drain.
+fn interrupt(index: usize) {
+    let state = unsafe { (*core::ptr::addr_of!(EVENTS))[index] };
+    if !state.ready {
+        return;
+    }
+    write32(state.iman, 0b11); // clear IP, keep IE
+    write32(state.usbsts, 1 << 3); // clear EINT
+    drain(index);
+}
+
+/// Switches controllers from foreground draining to MSI (call after the settings file is read: `no-msi`
+/// decides). Each controller needs the MSI capability and must pass a self-test (a no-op command whose
+/// completion must raise the interrupt); interrupt moderation is set to 1 ms so a high-speed isochronous
+/// stream's 8,000 completions per second cost about 1,000 interrupts. A controller that fails stays in
+/// the polled mode, where the foreground drains the ring itself as before.
+pub fn enable_interrupts_all(no_msi: bool) {
+    for index in 0..count() {
+        let Some(controller) = controller(index) else { continue };
+        if no_msi {
+            crate::println!("xHCI {:02x}:{:02x}.{}: interrupts polled (settings: no-msi).", controller.pci.bus, controller.pci.device, controller.pci.function);
+            continue;
+        }
+        match controller.enable_interrupts() {
+            Ok(vector) => crate::println!("xHCI {:02x}:{:02x}.{}: MSI on vector {vector:#x} (the self-test interrupt arrived); events no longer need the foreground.", controller.pci.bus, controller.pci.device, controller.pci.function),
+            Err(reason) => crate::println!("xHCI {:02x}:{:02x}.{}: events polled ({reason}).", controller.pci.bus, controller.pci.device, controller.pci.function),
+        }
+    }
+}
 
 pub fn count() -> usize {
     unsafe { COUNT }
@@ -311,7 +449,7 @@ pub fn init_all() -> usize {
         if count() == MAX_CONTROLLERS {
             break;
         }
-        match Controller::init(device) {
+        match Controller::init(device, count()) {
             Ok(controller) => unsafe {
                 CONTROLLERS[COUNT] = Some(controller);
                 COUNT += 1;
@@ -353,7 +491,7 @@ fn take_ownership_from_firmware(mmio: usize, hccparams1: u32) {
 }
 
 impl Controller {
-    fn init(device: pci::Device) -> Result<Controller, Error> {
+    fn init(device: pci::Device, index: usize) -> Result<Controller, Error> {
         device.force_power_state_d0();
         device.enable_memory_and_bus_master();
         let (base, size) = device.memory_bar(0).ok_or(Error::NoDevice)?;
@@ -433,13 +571,15 @@ impl Controller {
             doorbells,
             ports,
             context_bytes: if hccparams1 & (1 << 2) != 0 { 64 } else { 32 },
-            event_ring,
+            index,
+            interrupt_driven: false,
             dcbaa,
             command_ring,
-            event_index: 0,
-            event_cycle: true,
             slots: [EMPTY_SLOT; MAX_SLOTS + 1],
         };
+        unsafe {
+            (*core::ptr::addr_of_mut!(EVENTS))[index] = EventState { base: event_ring, index: 0, cycle: true, erdp: interrupter + 0x18, iman: interrupter, usbsts: operational + OP_USBSTS, ready: true };
+        }
         write32(operational + OP_USBCMD, CMD_RUN);
         if !wait_until(100, || read32(operational + OP_USBSTS) & STS_HALTED == 0) {
             return Err(Error::Timeout);
@@ -472,21 +612,63 @@ impl Controller {
         write32(self.doorbells + usize::from(slot) * 4, target);
     }
 
-    /// The next event the controller has written (its cycle bit matches ours), if any.
+    /// The next event for the foreground, if any: from the soft queue, else by draining the ring now
+    /// (with interrupts off, so the interrupt handler cannot drain at the same moment).
     pub fn next_event(&mut self) -> Option<Trb> {
-        let at = self.event_ring + self.event_index as u64 * TRB_BYTES;
-        let trb = read_trb(at);
-        if (trb.control & TRB_CYCLE != 0) != self.event_cycle {
-            return None;
+        if let Some(trb) = soft_pop(self.index) {
+            return Some(trb);
         }
-        self.event_index += 1;
-        if self.event_index == EVENT_TRBS {
-            self.event_index = 0;
-            self.event_cycle = !self.event_cycle;
+        let was = crate::cpu::interrupts_save_and_disable();
+        drain(self.index);
+        crate::cpu::interrupts_restore(was);
+        soft_pop(self.index)
+    }
+
+    /// Switches this controller's events to MSI (or MSI-X, table entry 0 = interrupter 0, when the plain
+    /// capability is missing, as on QEMU's xHCI). Returns the vector, or why it stays polled.
+    pub fn enable_interrupts(&mut self) -> Result<u8, &'static str> {
+        let msi = self.pci.find_capability(0x05).is_some();
+        let msix = self.pci.find_capability(0x11).is_some();
+        if !msi && !msix {
+            return Err("no MSI or MSI-X capability");
         }
-        let dequeue = self.event_ring + self.event_index as u64 * TRB_BYTES;
-        write64(self.runtime + 0x20 + 0x18, dequeue | (1 << 3)); // bit 3: clear "event handler busy"
-        Some(trb)
+        let Some(vector) = crate::msi::allocate(interrupt, self.index) else { return Err("no free MSI vector") };
+        let enabled = if msi { self.pci.enable_msi(vector, apic::id()) } else { self.pci.enable_msix(vector, apic::id()) };
+        if !enabled {
+            crate::msi::release(vector);
+            return Err("could not enable MSI");
+        }
+        let interrupter = self.runtime + 0x20;
+        write32(interrupter + 0x04, 4000); // IMOD: at most one interrupt per 4000 x 250 ns = 1 ms
+        write32(interrupter, 0b11); // IMAN: clear a pending bit, enable the interrupter
+        write32(self.operational + OP_USBCMD, read32(self.operational + OP_USBCMD) | (1 << 2)); // USBCMD.INTE
+        let before = crate::msi::count(vector);
+        if self.command(0, 0, TRB_NOOP_COMMAND << 10).is_err() {
+            return Err("the self-test command failed");
+        }
+        let start = apic::ticks();
+        while crate::msi::count(vector) == before && apic::ticks().wrapping_sub(start) < 3 {
+            core::hint::spin_loop();
+        }
+        if crate::msi::count(vector) == before {
+            write32(self.operational + OP_USBCMD, read32(self.operational + OP_USBCMD) & !(1 << 2));
+            write32(interrupter, 1); // IMAN: IE off
+            if msi {
+                self.pci.disable_msi();
+            } else {
+                self.pci.disable_msix();
+            }
+            crate::msi::release(vector);
+            return Err("the MSI self-test interrupt never arrived");
+        }
+        self.interrupt_driven = true;
+        Ok(vector)
+    }
+
+    /// The doorbell register address for `slot`, for code (the audio stream handlers) that rings it
+    /// without holding the controller.
+    pub fn doorbell_address(&self, slot: u8) -> usize {
+        self.doorbells + usize::from(slot) * 4
     }
 
     /// Waits for an event accepted by `wanted`. Anything else (port changes, reports
@@ -864,14 +1046,13 @@ impl Controller {
     /// speed (the period is 2^(bInterval-1) frames at full speed, microframes at high speed). The
     /// slot's "context entries" only ever grows, so an audio interface can add its playback,
     /// feedback and capture endpoints one at a time.
-    pub fn configure_isoc_endpoint(&mut self, device: &Device, endpoint: u8, max_packet: u16, interval: u8) -> Result<u32, Error> {
+    pub fn configure_isoc_endpoint(&mut self, device: &Device, endpoint: u8, max_packet: u16, interval: u8, ring: &Ring) -> Result<u32, Error> {
         let slot = usize::from(device.slot);
         let input_endpoint = endpoint & 0x80 != 0;
         let dci = u32::from(endpoint & 0x0f) * 2 + u32::from(input_endpoint);
         if dci < 2 || dci >= DCI_COUNT as u32 {
             return Err(Error::Unsupported);
         }
-        let ring = Ring::allocate().ok_or(Error::NoMemory)?;
         let (input, output) = (self.slots[slot].input, self.slots[slot].output);
         // Interval field: an exponent of 125 us microframes. High speed: bInterval-1. Full speed:
         // frames are 1 ms = 8 microframes, so (bInterval-1) + 3.
@@ -892,23 +1073,8 @@ impl Controller {
             context.add(3).write_volatile((ring.base >> 32) as u32);
             context.add(4).write_volatile(u32::from(max_packet) | (u32::from(max_packet) << 16)); // average TRB length, max ESIT payload
         }
-        self.slots[slot].rings[dci as usize] = ring;
         self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24))?;
         Ok(dci)
-    }
-
-    /// Queues one isochronous transfer (one service interval's worth of data) without ringing the
-    /// doorbell; `start_endpoint` does that once several are queued. "Start isochronous ASAP" (SIA)
-    /// lets the controller choose the frame, each transfer following the previous one. Every
-    /// transfer asks for an event (IOC) so the foreground learns its actual length.
-    pub fn queue_isoc(&mut self, slot: u8, dci: u32, buffer: u64, length: u32) -> u64 {
-        let ring = &mut self.slots[usize::from(slot)].rings[dci as usize];
-        ring.push(buffer, length, (TRB_ISOCH << 10) | TRB_IOC | TRB_ISP | (1 << 31))
-    }
-
-    /// Rings an endpoint's doorbell: the controller looks at its transfer ring.
-    pub fn start_endpoint(&mut self, slot: u8, dci: u32) {
-        self.ring_doorbell(slot, dci);
     }
 
     /// Stops an endpoint's transfers (Stop Endpoint command); queued ones are abandoned.
@@ -916,11 +1082,10 @@ impl Controller {
         let _ = self.command(0, 0, (TRB_STOP_ENDPOINT << 10) | (dci << 16) | (u32::from(slot) << 24));
     }
 
-    /// Releases a stopped endpoint's ring and tells the controller to forget the endpoint
+    /// Tells the controller to forget a stopped endpoint (the caller frees its transfer ring)
     /// (Configure Endpoint with its drop flag set).
     pub fn drop_endpoint(&mut self, device: &Device, dci: u32) {
         let slot = usize::from(device.slot);
-        let ring = self.slots[slot].rings[dci as usize];
         let input = self.slots[slot].input;
         unsafe {
             core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
@@ -929,10 +1094,6 @@ impl Controller {
             core::ptr::copy_nonoverlapping(self.slots[slot].output as *const u8, self.context_slot(input) as *mut u8, 32);
         }
         let _ = self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24));
-        if ring.is_allocated() {
-            memory::free(ring.base, 1);
-        }
-        self.slots[slot].rings[dci as usize] = NO_RING;
     }
 
     /// Adds a device's two bulk endpoints (Configure Endpoint). `*_endpoint` are endpoint
