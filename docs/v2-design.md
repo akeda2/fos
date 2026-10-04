@@ -474,6 +474,13 @@ firmware, so a pending slot is tried on the next boot.
   is spread over many short calls (three rows at a time, only the cells that changed), the counters line shows the
   longest the drawing has held the stream loop up ("UI stall"), and `M` switches the meters off, which also stops the
   per-sample detector work.
+  **Whose codec is used:** with names, the receiver's choice wins. A sender that looks its peer up (`to=NAME`) adopts
+  the codec, depth, rate and port the peer announced it listens with, and a receiver that looks a sender up (`source=NAME`)
+  adopts what the sender announced, so the two ends cannot disagree. In duplex each direction therefore follows the
+  *receiving* machine's setting. With a plain IP address or MAC nothing is adopted: a sender sends what it is set to, and a
+  receiver set to something else will not understand it (Opus decoder errors, or silence). The live view's second line
+  shows what is actually sent and received ("Sending: Opus 96 kbit/s per pair, 2 ch   Receiving: PCM 24-bit, 2 ch"),
+  since the form shows only the choice made on that machine. Tested: a PCM sender finding an Opus listener by name sends Opus.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself

@@ -394,6 +394,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         if tone.is_some() { "a test tone" } else { "the capture device" },
         proto_name(options.proto)
     );
+    stats::set_send(format_args!("PCM {bits}-bit, {channels} ch"));
     let stream = (tape_rt::micros() as u32) ^ 0x5a5a_a5a5;
     if let Destination::Rtp { ip, .. } = destination {
         let mut text = [0u8; 600];
@@ -635,6 +636,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     if status != 0 {
         return println!("audio-net recv: cannot start playback at {running_rate} Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
     }
+    stats::set_receive(format_args!("waiting for a PCM {}-bit stream", options.bits));
     transport.announce_receiver(options);
     println!("Listening on NIC {} for {} audio; playing on {device_channels} output channel(s) of {}-bit. Escape stops.", options.nic + 1, proto_name(options.proto), info.playback_bits);
     let mut frame = [0u8; 1514];
@@ -717,6 +719,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                     needed -= written.min(needed);
                 }
                 let id = packet.source;
+                stats::set_receive(format_args!("PCM {}-bit, {} ch", packet.bits, packet.channels));
                 if options.proto == Proto::Rtp {
                     println!("Locked onto a stream: {} channel(s), {}-bit, {} Hz, from {}.{}.{}.{}.", packet.channels, packet.bits, packet.rate, id[0], id[1], id[2], id[3]);
                 } else {

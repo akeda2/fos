@@ -7,6 +7,46 @@ use audio_wire::meter::{CLIP, Coefficients, Ppm};
 
 pub const MAX_CHANNELS: usize = 32;
 
+/// A short text kept in a static (no allocation).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Label {
+    bytes: [u8; 48],
+    length: usize,
+}
+
+impl Label {
+    pub const fn new() -> Label {
+        Label { bytes: [0; 48], length: 0 }
+    }
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for Label {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        for &byte in text.as_bytes() {
+            if self.length < self.bytes.len() {
+                self.bytes[self.length] = byte;
+                self.length += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn set_send(text: core::fmt::Arguments) {
+    let mut label = Label::new();
+    let _ = core::fmt::Write::write_fmt(&mut label, text);
+    get().send_codec = label;
+}
+
+pub fn set_receive(text: core::fmt::Arguments) {
+    let mut label = Label::new();
+    let _ = core::fmt::Write::write_fmt(&mut label, text);
+    get().receive_codec = label;
+}
+
 pub struct Stats {
     pub sent: u64,
     pub received: u64,
@@ -23,6 +63,10 @@ pub struct Stats {
     pub receive_clip: [bool; MAX_CHANNELS],
     pub send_channels: usize,
     pub receive_channels: usize,
+    /// What is actually being sent and received (codec, depth, channels), for the panel: the configured choice can be
+    /// replaced by what a peer announced.
+    pub send_codec: Label,
+    pub receive_codec: Label,
     /// Meters on: the detectors run on every sample. Off (the panel's M key) skips that work entirely.
     pub meters_on: bool,
     coefficients: Coefficients,
@@ -33,7 +77,7 @@ const fn fresh() -> Stats {
     Stats {
         sent: 0, received: 0, lost: 0, level_frames: 0, target_frames: 0, offset_ppm: 0, rate: 48_000,
         send: [Ppm::new(); MAX_CHANNELS], receive: [Ppm::new(); MAX_CHANNELS], send_clip: [false; MAX_CHANNELS], receive_clip: [false; MAX_CHANNELS],
-        send_channels: 0, receive_channels: 0, meters_on: true, coefficients: Coefficients::ZERO, coefficients_rate: 0,
+        send_channels: 0, receive_channels: 0, send_codec: Label::new(), receive_codec: Label::new(), meters_on: true, coefficients: Coefficients::ZERO, coefficients_rate: 0,
     }
 }
 

@@ -578,6 +578,7 @@ struct Run {
     nic: usize,
     counters: Text<100>,
     message: Text<100>,
+    actual: Text<100>,
     shown_cell: [i16; MAX_ROWS],
     shown_hold: [i16; MAX_ROWS],
     shown_number: [i16; MAX_ROWS],
@@ -592,7 +593,7 @@ struct Run {
 const fn blank_run() -> Run {
     Run {
         stop: false, next_draw: 0, started: 0, rows: 0, sends: 0, labels: [0; MAX_ROWS], page: 0, nordic: true, needs_full: [true; MAX_ROWS], footer_dirty: true, cursor: 0, next_counters: 0, ip_shown: false, mac: [0; 6], nic: 0,
-        counters: Text::new(), message: Text::new(), shown_cell: [-1; MAX_ROWS], shown_hold: [-1; MAX_ROWS], shown_number: [i16::MIN; MAX_ROWS], shown_clip: [false; MAX_ROWS],
+        counters: Text::new(), message: Text::new(), actual: Text::new(), shown_cell: [-1; MAX_ROWS], shown_hold: [-1; MAX_ROWS], shown_number: [i16::MIN; MAX_ROWS], shown_clip: [false; MAX_ROWS],
         hold: [0; MAX_ROWS], hold_at: [0; MAX_ROWS], clip_at: [0; MAX_ROWS], ui_worst: 0,
     }
 }
@@ -846,6 +847,14 @@ extern "C" fn panel_hook() -> u32 {
             draw!("{}\x1b[K", counters.as_str());
             run.counters = counters;
         }
+        // What is really sent and received: a peer's announcement can replace the choice made on this machine.
+        let mut actual = Text::<100>::new();
+        let _ = write!(actual, "Sending: {}   Receiving: {}", if shown.send_codec.as_str().is_empty() { "-" } else { shown.send_codec.as_str() }, if shown.receive_codec.as_str().is_empty() { "-" } else { shown.receive_codec.as_str() });
+        if actual != run.actual {
+            at(4, 2);
+            draw!("{}\x1b[K", actual.as_str());
+            run.actual = actual;
+        }
         let message = Text::<100>::from(tape_rt::last_message());
         if message != run.message {
             at(6, 2);
@@ -915,8 +924,6 @@ fn run_stream(settings: &Settings) {
     (real.nic_mac)(options.nic, mac.as_mut_ptr());
     run.mac = mac;
     draw!(" NIC {}  MAC {}  IP {}\x1b[K", options.nic + 1, MacText(mac), if !settings.rtp() { "(layer 2 only)" } else if settings.dhcp { "(asking the DHCP server...)" } else { settings.ip.as_str() });
-    at(4, 1);
-    draw!(" {:-<78}", "");
     draw_scale(run);
     tape_rt::set_quiet(true);
     let shim = abort::wrap_with(real, panel_hook);

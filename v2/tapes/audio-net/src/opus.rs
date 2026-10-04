@@ -71,6 +71,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             return println!("audio-net send: cannot start capture at 48000 Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
         }
     }
+    crate::stats::set_send(format_args!("Opus {} kbit/s per pair, {} ch", options.bitrate / 1000, channels));
     println!("Sending {channels} channel(s) as {streams} Opus stream(s), {} kbit/s per pair, {}.{} ms frames, to {host}, ports {}..{}.", options.bitrate / 1000, options.frame_x10 / 10, options.frame_x10 % 10, options.port, options.port as usize + 2 * (streams - 1));
     let session = (tape_rt::micros() as u32) ^ 0x5a5a_a5a5;
     let mut text = [0u8; 900];
@@ -227,6 +228,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     for (index, device_channel) in targets.channels().enumerate().take(channels) {
         placement[index] = Some(device_channel);
     }
+    crate::stats::set_receive(format_args!("Opus, {} ch", channels));
     transport.announce_receiver(options);
     println!("Listening on NIC {} for Opus/RTP: {streams} stream(s) on ports {}..{}, {channels} channel(s). Escape stops.", options.nic + 1, options.port, options.port as usize + 2 * (streams - 1));
     let timeline = unsafe { &mut *core::ptr::addr_of_mut!(TIMELINE_DATA) };

@@ -383,6 +383,7 @@ def main():
     peers_test()
     panel_test()
     duplex_names_test()
+    codec_follows_listener_test()
     print("v2 audio-net: all checks passed")
 
 
@@ -645,6 +646,30 @@ def duplex_names_test():
             middle = (loud[0] + loud[-1]) // 2
             measured = tone_frequency(samples, rate, samples[middle - rate // 2:middle + rate // 2])
             check(abs(measured - wanted) < 30, f"{name} played its peer's tone: {measured:.0f} Hz (wanted {wanted})", "")
+
+
+def codec_follows_listener_test():
+    """A sender set to PCM that finds its peer by name sends what that peer announced it listens for (Opus here), so the
+    two ends cannot disagree; a sender given a plain address keeps its own setting."""
+    with tempfile.TemporaryDirectory() as tmp:
+        a = Guest(tmp, "cf-a", "52:54:00:12:34:e1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={Path(tmp) / 'cf.wav'}", "-device", "usb-audio,audiodev=snd"])
+        b = Guest(tmp, "cf-b", "52:54:00:12:34:e2")
+        try:
+            for guest in (a, b):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark_a = a.send("run audio-net recv proto=rtp codec=opus name=hall ip=192.168.50.2/24 secs=30")
+            a.wait_for("Listening on NIC 1 for Opus/RTP", 60, mark_a)
+            a.pump(3.0)
+            mark_b = b.send("run audio-net send proto=rtp ip=192.168.50.1/24 to=hall src=tone=500 secs=4")
+            b.wait_for("Sent ", 90, mark_b)
+            text = b.text()[mark_b:]
+            check("Opus stream(s)" in text, "a PCM-configured sender that looks the peer up by name sends Opus, as the peer announced", text[-700:])
+            a.pump(2.0)
+            check("Receiving Opus from 192.168.50.1" in a.text()[mark_a:], "and the Opus receiver gets it", a.text()[-500:])
+        finally:
+            a.stop()
+            b.stop()
 
 
 def dhcp_test():
