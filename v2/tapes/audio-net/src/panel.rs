@@ -705,7 +705,7 @@ fn pick_peer(settings: &mut Settings) -> &'static str {
     let real = tape_rt::api();
     let Some(mut transport) = crate::Transport::open(real, &options) else {
         tape_rt::set_quiet(false);
-        return "Could not set up the network (no DHCP lease?).";
+        return if settings.dhcp { "No DHCP answer within 8 s: check the cable and the network, or set Addressing to Static." } else { "Could not set up the network: check the IP address." };
     };
     let mut short = options.clone();
     short.seconds = 8;
@@ -723,18 +723,25 @@ fn pick_peer(settings: &mut Settings) -> &'static str {
     draw!("\x1b[2J");
     at(1, 1);
     draw!(" fos audio-net: announced peers\x1b[K");
+    let ip = transport.config.ip.0;
+    at(2, 1);
+    draw!(" Listened for 8 s on NIC {} as {}.{}.{}.{}\x1b[K", options.nic + 1, ip[0], ip[1], ip[2], ip[3]);
     for entry in directory.iter().filter(|entry| wanted(entry)) {
         if count < 9 {
             names[count] = Text::from(entry.session.name());
             let (ip, s) = (entry.from_ip, &entry.session);
-            at(3 + count, 1);
+            at(4 + count, 1);
             draw!(" {}  {:<24} {:<8} {}.{}.{}.{} {}  {} ch\x1b[K", count + 1, s.name(), if s.receive_only { "listens" } else { "sends" }, ip[0], ip[1], ip[2], ip[3], MacText(entry.from_mac), s.channels);
             count += 1;
         }
     }
     if count == 0 {
-        at(3, 1);
-        draw!(" Nothing announced for this mode. A peer announces itself while it streams over RTP.");
+        at(4, 1);
+        draw!(" Nothing was announced by {}.", if settings.mode == 0 { "a listener" } else if settings.mode == 1 { "a sender" } else { "any peer" });
+        at(5, 1);
+        draw!(" A machine announces itself only while it is running audio-net over RTP, so start the other end first");
+        at(6, 1);
+        draw!(" (a sender to find a sender, a receiver to find a listener), on the same switch or network.");
     }
     at(14, 1);
     draw!(" Press a number to choose, any other key to go back.");
@@ -811,8 +818,13 @@ pub fn run(real: &'static TapeApi) {
                 dirty.info = true;
             }
             let before = selected;
+            // The direction of travel, so that skipping a row that does not apply continues the same way.
+            let mut direction = 1;
             match key {
-                Key::Up | Key::Char(b'k') => selected = (selected + ROWS - 1) % ROWS,
+                Key::Up | Key::Char(b'k') => {
+                    selected = (selected + ROWS - 1) % ROWS;
+                    direction = ROWS - 1;
+                }
                 Key::Down | Key::Char(b'j') | Key::Tab => selected = (selected + 1) % ROWS,
                 Key::Left | Key::Char(b'h') | Key::Right | Key::Char(b'l') | Key::Char(b' ') => {
                     let step = if matches!(key, Key::Left | Key::Char(b'h')) { -1 } else { 1 };
@@ -867,7 +879,7 @@ pub fn run(real: &'static TapeApi) {
             if !settings.applies(selected) {
                 // Landed on a row that does not apply (after changing the mode or the network): move to the next that does.
                 for step in 1..ROWS {
-                    let candidate = (selected + step) % ROWS;
+                    let candidate = (selected + step * direction) % ROWS;
                     if settings.applies(candidate) {
                         dirty.row(selected);
                         selected = candidate;

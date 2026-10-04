@@ -558,7 +558,11 @@ def panel_test():
             check("Static" in a.text()[mark_a:], "the Addressing row toggles between DHCP and static", a.text()[-500:])
             keys(a, "j\r" + "\x7f" * 20 + "192.168.50.2/24\r")
             # B: IP address, then the peer's address.
-            keys(b, "jjjl")
+            keys(b, "jjjj")  # Network, NIC, Addressing, then Peer: the IP and gateway rows do not apply with DHCP
+            check("> Peer" in b.text()[-700:], "moving down skips the rows that do not apply (DHCP)", b.text()[-700:])
+            keys(b, "k")
+            check("> Addressing" in b.text()[-500:], "and moving up skips them the same way", b.text()[-500:])
+            keys(b, "l")  # static
             keys(b, "j\r" + "\x7f" * 20 + "192.168.50.1/24\r")
             keys(b, "jj\r192.168.50.2\r")
             check("192.168.50.1/24" in b.text()[mark_b:] and "192.168.50.2" in b.text()[mark_b:], "the form shows the edited address and peer", b.text()[-600:])
