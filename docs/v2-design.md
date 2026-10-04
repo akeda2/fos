@@ -443,6 +443,11 @@ firmware, so a pending slot is tried on the next boot.
   serial receiver has a 16-byte FIFO (an early version redrew the whole form per key and dropped typed characters).
   The QEMU test drives two panels with keystrokes over the serial line: edit the address and peer, start, check the
   counters and meters, Escape, `W`, and the saved cfg.
+  **Dell Latitude E7270 (I219-LM `8086:156f`):** the NIC is in the e1000e family and works on the real machine (link, MSI,
+  term net). Open issue: its xHCI (Sunrise Point) times out reading the device descriptor of SuperSpeed devices
+  after a successful Address Device (ports 15 and 17, three attempts each), so a USB 3 boot stick plugged straight in is not
+  found; through a USB 2.0 hub it enumerates and boots normally. High-speed devices (the UFX) work on the same
+  controller. Not investigated further: there is no way to push a debug kernel to a machine that cannot see its boot stick.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
