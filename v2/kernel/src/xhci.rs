@@ -727,7 +727,7 @@ impl Controller {
     /// bytes the data stage moved.
     pub fn control_transfer(&mut self, device: &Device, request_type: u8, request: u8, value: u16, index: u16, data: &mut [u8]) -> Result<usize, Error> {
         let data_in = request_type & 0x80 != 0;
-        if data.len() > 1024 {
+        if data.len() > 4096 {
             return Err(Error::Unsupported);
         }
         let bounce = frame().ok_or(Error::NoMemory)?;

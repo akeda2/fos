@@ -115,7 +115,7 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
         return crate::usb_hub::enumerate(controller_index, controller, device, configuration[5]);
     }
 
-    let mut configuration = [0u8; 256];
+    let mut configuration = [0u8; 2048];
     controller.get_descriptor(&device, 2, 0, &mut configuration[..9])?;
     let total = usize::from(u16::from_le_bytes([configuration[2], configuration[3]])).clamp(9, configuration.len());
     controller.get_descriptor(&device, 2, 0, &mut configuration[..total])?;
@@ -133,6 +133,13 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
                     false
                 }
             });
+        }
+        // Not a keyboard, not a stick: an audio device is described (see `usb_audio`); nothing else is handled.
+        if crate::usb_audio::is_audio(&configuration[..total]) {
+            let description = crate::usb_audio::parse(&configuration[..total]);
+            crate::usb_audio::report(&description, &device.path(), vendor, product, xhci::speed_name(device.speed));
+            controller.release_slot(device.slot);
+            return Ok(false);
         }
         controller.release_slot(device.slot);
         return Ok(false);

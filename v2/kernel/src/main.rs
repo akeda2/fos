@@ -47,6 +47,7 @@ mod serial;
 mod storage;
 mod tape;
 mod term;
+mod usb_audio;
 mod usb_hid;
 mod usb_hub;
 mod usb_storage;

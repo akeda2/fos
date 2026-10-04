@@ -256,6 +256,11 @@ firmware, so a pending slot is tried on the next boot.
   847,604 interrupts, no storms). `nic` shows the chip version, link speed/duplex and recoveries; `nic regs [N]`
   dumps the chip's registers and which descriptors the card owns. Not done: a periodic watchdog (a stuck
   transmit descriptor or a PCI system error resets the chip inline, counted as a recovery).
+* **USB audio (in progress).** `usb_audio.rs` recognises Audio Class devices on xHCI and prints their
+  streaming alternate settings (channels, bit depth, isochronous endpoint, sync type, sample rates, feedback
+  endpoint) from the configuration descriptor. A Zoom H6 in stereo mode on the Skylake reports as Audio Class
+  1.0, full speed: 2-channel 16-bit playback (asynchronous, feedback endpoint 0x81) and capture, 44,100 and
+  48,000 Hz. Streaming (xHCI isochronous endpoints, a PCM ring, the tape `audio_*` callbacks) is the next step.
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with
