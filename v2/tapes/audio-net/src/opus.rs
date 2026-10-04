@@ -297,6 +297,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             bad += 1;
             continue;
         };
+        if locked_source.is_none() {
+            println!("Receiving Opus from {}.{}.{}.{}.", source.0[0], source.0[1], source.0[2], source.0[3]);
+        }
         locked_source = Some(source.0);
         last_packet = tape_rt::micros();
         if lane.ssrc.is_none() {
