@@ -225,6 +225,146 @@ impl Fill {
     }
 }
 
+/// Network samples (big endian, 16 or 24 bits) to 32-bit signed values with the sample in the top bits, the
+/// working format of the resampler. `frames` frames of `channels` channels go to `out[..frames * channels]`.
+pub fn wire_to_frames(wire: &[u8], channels: usize, bits: usize, frames: usize, out: &mut [i32]) {
+    let sample_bytes = bits / 8;
+    for index in 0..frames * channels {
+        let at = index * sample_bytes;
+        let mut value = 0u32;
+        for (byte_index, &byte) in wire[at..at + sample_bytes].iter().enumerate() {
+            value |= u32::from(byte) << (8 * (3 - byte_index));
+        }
+        out[index] = value as i32;
+    }
+}
+
+/// 32-bit working frames to device-format frames (`slot`-byte little-endian slots, `device_channels` channels),
+/// placing channel `i` of the frames on device channel `placement[i]` (`None` drops it); the rest stay silent.
+pub fn frames_to_device(frames: &[i32], channels: usize, count: usize, placement: &[Option<usize>], slot: usize, device_channels: usize, out: &mut [u8]) -> usize {
+    let device_frame = slot * device_channels;
+    for frame in 0..count {
+        let target = &mut out[frame * device_frame..(frame + 1) * device_frame];
+        target.fill(0);
+        for (channel, destination) in placement.iter().enumerate().take(channels) {
+            let Some(destination) = *destination else { continue };
+            if destination >= device_channels {
+                continue;
+            }
+            let bytes = (frames[frame * channels + channel] as u32).to_le_bytes();
+            target[destination * slot..(destination + 1) * slot].copy_from_slice(&bytes[4 - slot..]);
+        }
+    }
+    count * device_frame
+}
+
+/// A variable-rate resampler for multichannel audio: it plays a stream recorded on one clock out on another
+/// whose rate differs by a few hundred parts per million, without dropping or repeating a sample.
+///
+/// Each channel keeps its last four input samples; an output sample is the Catmull-Rom cubic through them,
+/// evaluated at a fractional position between the middle two. Feeding one input frame moves the position
+/// forward by one; every output frame moves it back by `step` (input frames per output frame, in Q16, 1.0 =
+/// 65536). With `step` exactly 1.0 the position stays 0 and the output is the input delayed by one frame,
+/// bit for bit; otherwise the interpolation brings a small high-frequency loss (about 0.1 dB at 5 kHz, 1 dB
+/// at 15 kHz in the worst case) that is the price of continuous, click-free rate adaptation. Integer
+/// arithmetic only.
+pub struct Resampler {
+    channels: usize,
+    history: [[i32; MAX_CHANNELS]; 4],
+    /// Position of the next output sample between `history[1]` and `history[2]`, Q16.
+    position: u32,
+    pub step: u32,
+    primed: u8,
+}
+
+pub const UNITY_STEP: u32 = 1 << 16;
+
+impl Resampler {
+    pub fn new(channels: usize) -> Resampler {
+        Resampler { channels: channels.min(MAX_CHANNELS), history: [[0; MAX_CHANNELS]; 4], position: UNITY_STEP, step: UNITY_STEP, primed: 0 }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Resampler::new(self.channels);
+    }
+
+    /// Feeds one input frame (`channels` values); returns whether an output frame is due, and if so writes it
+    /// to `out`. Call again with the same frame's successors via `next_output` until it says no.
+    pub fn push(&mut self, frame: &[i32]) {
+        self.history[0] = self.history[1];
+        self.history[1] = self.history[2];
+        self.history[2] = self.history[3];
+        self.history[3][..self.channels].copy_from_slice(&frame[..self.channels]);
+        self.position = self.position.saturating_sub(UNITY_STEP);
+        self.primed = (self.primed + 1).min(4);
+    }
+
+    /// The next output frame for the frames pushed so far, if the position allows one.
+    pub fn next_output(&mut self, out: &mut [i32]) -> bool {
+        if self.position >= UNITY_STEP || self.primed < 4 {
+            return false;
+        }
+        let t = i64::from(self.position);
+        for channel in 0..self.channels {
+            let (h0, h1, h2, h3) = (i64::from(self.history[0][channel]), i64::from(self.history[1][channel]), i64::from(self.history[2][channel]), i64::from(self.history[3][channel]));
+            let a = -h0 + 3 * h1 - 3 * h2 + h3;
+            let b = 2 * h0 - 5 * h1 + 4 * h2 - h3;
+            let c = h2 - h0;
+            let inner = ((a * t) >> 16) + b;
+            let middle = ((inner * t) >> 16) + c;
+            let value = h1 + (((middle * t) >> 16) >> 1);
+            out[channel] = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        }
+        self.position += self.step;
+        true
+    }
+}
+
+/// The rate controller for a receiver. It watches how full the playback ring is and sets the resampler's step:
+/// if the ring runs above its target the receiver is producing too much, so each output frame should use up
+/// *more* input (step above 1); if it runs low, less. A proportional term reacts to the level, an integral term
+/// learns the steady clock difference (a few hundred ppm), so the level settles on the target and the step on
+/// the true ratio. The step is limited to +-2000 ppm.
+#[derive(Clone, Copy)]
+pub struct Servo {
+    target_frames: i32,
+    /// The learned steady offset, in parts per billion (to keep integer precision).
+    integral_ppb: i64,
+    pub step: u32,
+}
+
+const MAX_PPB: i64 = 2_000_000;
+
+impl Servo {
+    pub fn new(target_frames: usize) -> Servo {
+        Servo { target_frames: target_frames as i32, integral_ppb: 0, step: UNITY_STEP }
+    }
+
+    pub fn target(&self) -> usize {
+        self.target_frames as usize
+    }
+
+    /// One update: the ring `level` in frames, after `frames` input frames at `rate` Hz. Returns the new step.
+    pub fn update(&mut self, level: usize, frames: usize, rate: u32) -> u32 {
+        let error = i64::from(level as i32 - self.target_frames);
+        // The plant is an integrator (the level moves by rate x step offset per second), so the loop is second
+        // order: natural frequency w = sqrt(Ki * rate), damping z = Kp * rate / (2 w). At 48 kHz these gains give
+        // w = 0.14 rad/s (a ~45 s period) and z = 0.87: it settles without ringing.
+        // Integral: 4e-7 per frame-second -> 400 ppb * error * (frames / rate).
+        self.integral_ppb = (self.integral_ppb + 400 * error * frames as i64 / i64::from(rate.max(1))).clamp(-MAX_PPB, MAX_PPB);
+        // Proportional: 5 ppm per frame of error.
+        let proportional = 5000 * error;
+        let ppb = (self.integral_ppb + proportional).clamp(-MAX_PPB, MAX_PPB);
+        self.step = (i64::from(UNITY_STEP) + ppb * i64::from(UNITY_STEP) / 1_000_000_000) as u32;
+        self.step
+    }
+
+    /// The learned steady offset in parts per million (for the statistics line).
+    pub fn offset_ppm(&self) -> i32 {
+        (self.integral_ppb / 1000) as i32
+    }
+}
+
 /// Everything an SDP description of one RTP audio stream needs.
 pub struct Sdp {
     pub origin: [u8; 4],
@@ -434,6 +574,103 @@ mod tests {
         assert_eq!(multicast_mac([239, 255, 1, 2]), [0x01, 0x00, 0x5e, 0x7f, 1, 2]);
         assert_eq!(multicast_mac([224, 128, 0, 1]), [0x01, 0x00, 0x5e, 0x00, 0, 1], "the top bit of the second octet is dropped");
         assert!(is_multicast_address([239, 1, 1, 1]) && !is_multicast_address([192, 168, 1, 1]));
+    }
+
+    fn sine_frames(count: usize, frequency: f64, rate: f64) -> Vec<i32> {
+        (0..count).map(|n| ((n as f64 * frequency * 2.0 * core::f64::consts::PI / rate).sin() * 0.5 * i32::MAX as f64) as i32).collect()
+    }
+
+    #[test]
+    fn unity_step_is_a_one_frame_delay_and_exact() {
+        let mut resampler = Resampler::new(2);
+        let input: Vec<i32> = (0..400).flat_map(|n| [n * 1000, -n * 777]).collect();
+        let mut output = Vec::new();
+        let mut frame = [0i32; 2];
+        for pair in input.chunks(2) {
+            resampler.push(pair);
+            while resampler.next_output(&mut frame) {
+                output.extend_from_slice(&frame);
+            }
+        }
+        // After the four-frame warm-up every input frame yields one output, equal to the input two frames back.
+        let produced = output.len() / 2;
+        assert!(produced >= 395 - 4, "{produced}");
+        for index in 0..produced {
+            let source = index + 1; // the first output is history[1] when the fourth frame arrived: input frame 1
+            assert_eq!(&output[index * 2..index * 2 + 2], &input[source * 2..source * 2 + 2], "frame {index}");
+        }
+    }
+
+    #[test]
+    fn a_small_ratio_changes_the_length_and_keeps_the_tone() {
+        let rate = 48_000.0;
+        let input = sine_frames(48_000, 1000.0, rate);
+        for &(ppm, label) in &[(300i64, "input faster"), (-300, "input slower")] {
+            let mut resampler = Resampler::new(1);
+            resampler.step = (65_536 + ppm * 65_536 / 1_000_000) as u32;
+            let mut output = Vec::new();
+            let mut frame = [0i32; 1];
+            for &sample in &input {
+                resampler.push(&[sample]);
+                while resampler.next_output(&mut frame) {
+                    output.push(frame[0]);
+                }
+            }
+            // Output count = input count / step (within a frame or two).
+            let expected = (input.len() as f64 / (1.0 + ppm as f64 * 1e-6)) as i64;
+            assert!((output.len() as i64 - expected).abs() <= 4, "{label}: {} vs {expected}", output.len());
+            // The output is the 1 kHz sine sampled at a slightly different rate: compare against the ideal.
+            let mut worst = 0.0f64;
+            for (index, &value) in output.iter().enumerate().skip(8).take(40_000) {
+                let position = index as f64 * (f64::from(resampler.step) / 65_536.0) + 1.0; // input time of output sample `index` (the step as actually quantised)
+                let ideal = (position * 1000.0 * 2.0 * core::f64::consts::PI / rate).sin() * 0.5 * i32::MAX as f64;
+                worst = worst.max((f64::from(value) - ideal).abs());
+            }
+            // Catmull-Rom on a 1 kHz tone at 48 kHz is accurate to ~ -80 dB of full scale.
+            assert!(worst < 0.5 * i32::MAX as f64 * 1e-3, "{label}: worst error {worst}");
+        }
+    }
+
+    #[test]
+    fn the_servo_learns_a_clock_difference() {
+        // The sender's clock runs 400 ppm fast: 48,019.2 frames per device second. Each loop iteration is one
+        // 1 ms packet of 48 input frames; the device drains the ring at exactly 48,000 per second.
+        let mut servo = Servo::new(288);
+        let mut resampler = Resampler::new(1);
+        let (mut level, mut producer_credit) = (288i64, 0f64);
+        let mut frame = [0i32; 1];
+        let mut worst_late = 0i64;
+        for millisecond in 0..60_000 {
+            // 48 frames arrive per ms of *sender* time; the device's ms is 1/(1+400ppm) of that: it drains 47.9808 frames.
+            for _ in 0..48 {
+                resampler.step = servo.step;
+                resampler.push(&[0]);
+                while resampler.next_output(&mut frame) {
+                    level += 1;
+                }
+            }
+            producer_credit += 47.980_8; // frames drained by the device per sender millisecond
+            let drained = producer_credit as i64;
+            producer_credit -= drained as f64;
+            level -= drained;
+            servo.update(level.max(0) as usize, 48, 48_000);
+            if millisecond > 50_000 {
+                worst_late = worst_late.max((level - 288).abs());
+            }
+        }
+        assert!(worst_late < 20, "the level should settle near the target: off by {worst_late}");
+        assert!((servo.offset_ppm() - 400).abs() < 25, "learned {} ppm, wanted about 400", servo.offset_ppm());
+    }
+
+    #[test]
+    fn working_format_round_trip() {
+        let wire = [0x12, 0x34, 0x56, 0xff, 0xff, 0xfe];
+        let mut frames = [0i32; 2];
+        wire_to_frames(&wire, 2, 24, 1, &mut frames);
+        assert_eq!(frames, [0x1234_5600, (0xfffffe00u32) as i32]);
+        let mut device = [0u8; 6];
+        frames_to_device(&frames, 2, 1, &[Some(0), Some(1)], 3, 2, &mut device);
+        assert_eq!(device, [0x56, 0x34, 0x12, 0xfe, 0xff, 0xff]);
     }
 
     #[test]

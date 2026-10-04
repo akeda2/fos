@@ -15,9 +15,11 @@
 //!
 //! **recv** listens on NIC `N` for a stream, starts the device's playback and plays it. `ch=` says which
 //! output channels the stream's channels go to (default 1, 2, ...). The two hosts' clocks differ slightly, so
-//! the receiver keeps the playback ring near `target=` ms by dropping or repeating a single frame when it
-//! drifts away; a lost packet is replaced by silence of the same length. `secs=` ends either side after that
-//! long; Escape always does.
+//! the receiver keeps the playback ring near `target=` ms: by default a variable-rate resampler (4-point cubic,
+//! integer) steered by a small PI servo learns the true clock ratio, a few hundred ppm, and follows it without
+//! ever dropping or repeating a sample (`drift=resample`); `drift=slip` instead drops or repeats one frame when
+//! the level strays. A lost packet is replaced by silence of the same length. `secs=` ends either side after
+//! that long; Escape always does.
 //!
 //! **Protocols.** `proto=raw` (default) is a bare Ethernet frame (`audio-wire`'s format): works between two
 //! hosts on one segment with no addresses at all. `proto=rtp` is standard RTP (RFC 3550) over UDP over
@@ -35,7 +37,7 @@
 
 mod net;
 
-use audio_wire::{ChannelSet, ETHERNET_HEADER, ETHERTYPE, Fill, HEADER_LEN, Header, MAX_RAW_PAYLOAD, MAX_RTP_PAYLOAD, Sdp, Slip, frames_per_packet, pack, unpack, write_sdp};
+use audio_wire::{ChannelSet, ETHERNET_HEADER, ETHERTYPE, Fill, HEADER_LEN, Header, MAX_RAW_PAYLOAD, MAX_RTP_PAYLOAD, Resampler, Sdp, Servo, Slip, frames_per_packet, frames_to_device, pack, unpack, wire_to_frames, write_sdp};
 use net::{Inbound, NetConfig};
 use tape_net::{ArpCache, Ipv4Address, MacAddress, RtpPacket};
 use tape_rt::{AudioInfo, AudioStats, TapeApi, print, println};
@@ -67,6 +69,10 @@ struct Options<'a> {
     port: u16,
     payload_type: u8,
     from: Option<[u8; 6]>,
+    /// Clock-drift handling: a resampler steered by a servo (default) or single-frame slips.
+    resample: bool,
+    /// Test aid for `send src=tone`: run the sender's clock this many ppm fast (negative: slow).
+    skew_ppm: i64,
 }
 
 fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -81,7 +87,7 @@ fn parse_mac(text: &str) -> Option<[u8; 6]> {
 fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'static str> {
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
-        ip: "", gateway: "", port: 5004, payload_type: 96, from: None,
+        ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -105,6 +111,8 @@ fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'stat
             "gw" => options.gateway = value,
             "port" => options.port = value.parse().map_err(|_| "port= needs a number")?,
             "pt" => options.payload_type = value.parse().ok().filter(|&p| p < 128).ok_or("pt= is 0 to 127")?,
+            "drift" => options.resample = match value { "resample" => true, "slip" => false, _ => return Err("drift= is resample or slip") },
+            "skew" => options.skew_ppm = value.parse().map_err(|_| "skew= needs a number of ppm")?,
             "verbose" => options.verbose = true,
             _ => return Err("unknown option"),
         }
@@ -187,6 +195,8 @@ fn send(api: &'static TapeApi, options: &Options) {
     let per_packet = frames_per_packet(options.rate, channels, bits, max_payload);
     let frame_bytes = channels * bits / 8;
     let packet_us = u64::from(per_packet as u32) * 1_000_000 / u64::from(options.rate);
+    // `skew=` (tone source only) paces packets as if the sender's clock were off by that many ppm.
+    let paced_us_x1000 = (packet_us as i64 * 1000 * (1_000_000 - options.skew_ppm) / 1_000_000) as u64;
     let destination = match options.proto {
         Proto::Raw => Destination::Raw(if options.to.is_empty() { BROADCAST } else { match parse_mac(options.to) { Some(mac) => mac, None => return println!("audio-net send: to= takes a MAC address for proto=raw.") } }),
         Proto::Rtp => {
@@ -234,7 +244,7 @@ fn send(api: &'static TapeApi, options: &Options) {
         }
         let have_packet = if let Some(frequency) = tone {
             // Paced by the clock: packet number `sent` is due at started + sent * packet time.
-            if tape_rt::micros() >= started + sent * packet_us {
+            if tape_rt::micros() >= started + sent * paced_us_x1000 / 1000 {
                 for index in 0..per_packet {
                     let sample = tone_sample(phase) << 8; // 16-bit tone as a 24-bit value
                     phase = (phase + (u64::from(frequency) * 65_536 / u64::from(options.rate)) as u32) & 0xffff;
@@ -386,12 +396,17 @@ fn receive(api: &'static TapeApi, options: &Options) {
     let (mut expected, mut running) = (0u16, true);
     let (mut packets, mut lost, mut dropped, mut repeated, mut foreign) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut fill = Fill::new(0);
+    let mut servo = Servo::new(0);
+    let mut resampler = Resampler::new(2);
+    let mut work = [0i32; 4096];
+    let mut resampled = [0i32; 4096];
     let mut placement = [None; audio_wire::MAX_CHANNELS];
     let mut wire_channels = 0usize;
     let mut last_packet = tape_rt::micros();
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
     let mut level = 0usize;
+    let (mut work_total, mut work_max, mut slow_receive, mut slow_info, mut gaps_shown) = (0u64, 0u64, 0u64, 0u64, 0u32);
     loop {
         if (api.should_abort)() != 0 {
             break;
@@ -399,7 +414,10 @@ fn receive(api: &'static TapeApi, options: &Options) {
         if options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000 {
             break;
         }
+        let t_receive = tape_rt::micros();
         let length = (api.nic_receive)(options.nic, frame.as_mut_ptr(), frame.len());
+        let spent_receive = tape_rt::micros() - t_receive;
+        slow_receive = slow_receive.max(if length != 0 { spent_receive } else { 0 });
         if length == 0 {
             if locked.is_some() && tape_rt::micros() > last_packet + 2_000_000 {
                 println!("\nThe sender went quiet; waiting for a stream again.");
@@ -434,6 +452,8 @@ fn receive(api: &'static TapeApi, options: &Options) {
                 running = true;
                 let target_frames = (packet.rate as usize * options.target_ms as usize / 1000).max(1);
                 fill = Fill::new(target_frames);
+                servo = Servo::new(target_frames);
+                resampler = Resampler::new(wire_channels);
                 // Pre-fill the ring with silence up to the target, so the first packets have somewhere to land.
                 let silence = [0u8; 1024];
                 let mut needed = target_frames * device_frame;
@@ -463,7 +483,9 @@ fn receive(api: &'static TapeApi, options: &Options) {
         let gap = packet.sequence.wrapping_sub(expected);
         if gap != 0 && gap < 0x8000 {
             lost += u64::from(gap);
-            if options.verbose {
+            // Printing is slow (a serial console moves ~10 ms per line): a loss message would itself lose packets.
+            if options.verbose && gaps_shown < 3 {
+                gaps_shown += 1;
                 println!(" [gap of {gap} before sequence {} at packet {packets}]", packet.sequence);
             }
             if gap <= 8 {
@@ -483,38 +505,64 @@ fn receive(api: &'static TapeApi, options: &Options) {
         expected = packet.sequence.wrapping_add(1);
         // Convert, with at most one frame dropped or repeated if the ring level has drifted.
         let frames = packet.frames.min(staging.len() / device_frame - 1);
+        let t_info = tape_rt::micros();
         level = (RING_BYTES - {
             (api.audio_info)(&mut info);
             info.playback_space as usize
         }) / device_frame;
+        slow_info = slow_info.max(tape_rt::micros() - t_info);
         if level > fill.target() * 4 + 64 {
             dropped += frames as u64; // far too full (after a stall): discard whole packets to catch up quickly
             packets += 1;
             continue;
         }
         let payload = &frame[packet.payload.clone()];
-        let mut out_frames = frames;
-        let advice = fill.advise(level);
-        let skip = usize::from(advice == Slip::Drop);
-        dropped += skip as u64;
-        let wire_skip = skip * wire_channels * packet.bits / 8;
-        out_frames -= skip.min(out_frames);
-        unpack(&payload[wire_skip..], wire_channels, packet.bits, out_frames, &placement[..wire_channels], slot, device_channels, &mut staging);
-        if advice == Slip::Repeat && out_frames > 0 {
-            repeated += 1;
-            staging.copy_within((out_frames - 1) * device_frame..out_frames * device_frame, out_frames * device_frame);
-            out_frames += 1;
+        let work_start = tape_rt::micros();
+        if options.resample {
+            // Steer the resampler from the ring level, run the packet through it, place and write the result.
+            resampler.step = servo.update(level, frames, packet.rate);
+            wire_to_frames(payload, wire_channels, packet.bits, frames, &mut work);
+            let mut produced = 0;
+            let mut out_frame = [0i32; audio_wire::MAX_CHANNELS];
+            for frame_index in 0..frames {
+                resampler.push(&work[frame_index * wire_channels..(frame_index + 1) * wire_channels]);
+                while resampler.next_output(&mut out_frame) && (produced + 1) * wire_channels <= resampled.len() && (produced + 1) * device_frame <= staging.len() {
+                    resampled[produced * wire_channels..(produced + 1) * wire_channels].copy_from_slice(&out_frame[..wire_channels]);
+                    produced += 1;
+                }
+            }
+            frames_to_device(&resampled, wire_channels, produced, &placement[..wire_channels], slot, device_channels, &mut staging);
+            let bytes = produced * device_frame;
+            if (api.audio_write)(staging.as_ptr(), bytes) < bytes {
+                dropped += 1; // the ring is full (the sender runs fast, or the device stalled)
+            }
+        } else {
+            let mut out_frames = frames;
+            let advice = fill.advise(level);
+            let skip = usize::from(advice == Slip::Drop);
+            dropped += skip as u64;
+            let wire_skip = skip * wire_channels * packet.bits / 8;
+            out_frames -= skip.min(out_frames);
+            unpack(&payload[wire_skip..], wire_channels, packet.bits, out_frames, &placement[..wire_channels], slot, device_channels, &mut staging);
+            if advice == Slip::Repeat && out_frames > 0 {
+                repeated += 1;
+                staging.copy_within((out_frames - 1) * device_frame..out_frames * device_frame, out_frames * device_frame);
+                out_frames += 1;
+            }
+            let bytes = out_frames * device_frame;
+            if (api.audio_write)(staging.as_ptr(), bytes) < bytes {
+                dropped += 1; // the ring is full (the sender runs fast, or the device stalled)
+            }
         }
-        let bytes = out_frames * device_frame;
-        if (api.audio_write)(staging.as_ptr(), bytes) < bytes {
-            dropped += 1; // the ring is full (the sender runs fast, or the device stalled)
-        }
+        let spent = tape_rt::micros() - work_start;
+        work_total += spent;
+        work_max = work_max.max(spent);
         packets += 1;
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;
             print!(".");
-            if options.verbose {
-                println!(" [{packets} packets, {lost} lost, level {level} frames (target {}), {dropped} dropped, {repeated} repeated]", fill.target());
+            if options.verbose && (next_report - started) / 1_000_000 % 10 == 0 {
+                println!(" [{packets} packets, {lost} lost, level {level} frames (target {}), {dropped} dropped, {repeated} repeated, clock offset {} ppm]", fill.target(), servo.offset_ppm());
             }
         }
     }
@@ -525,7 +573,14 @@ fn receive(api: &'static TapeApi, options: &Options) {
     }
     let _ = level;
     println!();
-    println!("Received {packets} packets: {lost} lost, {dropped} frame(s) dropped and {repeated} repeated for clock drift, {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", stats.playback_packets, stats.playback_underruns, stats.playback_errors);
+    if options.verbose && packets > 0 {
+        println!("Processing took {} us per packet on average, {} us at worst; nic_receive up to {slow_receive} us, audio_info up to {slow_info} us.", work_total / packets, work_max);
+    }
+    if options.resample {
+        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) discarded, clock offset learned {} ppm (resampled, no frames dropped or repeated for drift), {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats.playback_underruns, stats.playback_errors);
+    } else {
+        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) dropped and {repeated} repeated for clock drift, {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", stats.playback_packets, stats.playback_underruns, stats.playback_errors);
+    }
 }
 
 #[unsafe(no_mangle)]

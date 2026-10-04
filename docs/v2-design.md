@@ -320,8 +320,22 @@ firmware, so a pending slot is tried on the next boot.
   ARP is answered and resolved. `recv` takes `chan=` and `bits=` (RTP does not carry the channel count). The
   two-guest test sniffs the segment and checks the packets (version, payload type, single SSRC, 288-byte payloads,
   sequence +1, timestamp +48, valid checksums) and measures the played tone; `ip=dhcp` is tested against QEMU's
-  slirp DHCP. Plan: C Opus, D resampler, E multicast/IGMP, alternate-setting choice and duplex, AVTP (AVB) raw
-  mode. (Dante itself is proprietary; AES67 mode is the open way in.)
+  slirp DHCP. Interoperability confirmed with `ffmpeg` both ways (it decodes our RTP from the printed SDP; we
+  play its `L24` RTP with 5 ms and 1 ms packets) on the lab network.
+  **Stage D, resampler:** the receiver no longer drops or repeats frames for clock drift. `audio_wire::Resampler`
+  is a 4-point Catmull-Rom interpolator in integer arithmetic (bit-exact one-frame delay at step 1.0; accurate to
+  about -60 dB at 1 kHz otherwise) and `Servo` a PI controller on the playback ring level (second order,
+  w = 0.14 rad/s, z = 0.87, limited to +-2000 ppm) that learns the steady clock ratio; `drift=slip` keeps the old
+  behaviour. Host unit tests cover the filter, the servo's convergence on a 400 ppm offset and the formats.
+  Hardware (H6 on the Skylake to the UFX on the Sandy Bridge machine, raw Ethernet, 100 s, 100,045 packets): 0 lost,
+  0 frames dropped or repeated, learned offset 8 ppm (so the two interfaces' clocks agree to ~10 ppm). With the
+  sender deliberately skewed (`skew=` on a tone source) the learned offset moves by exactly the skew (+400 then
+  -400 ppm gave +64 and -737 ppm, a difference of 801), again with nothing dropped. A caution: console output
+  is slow (about 10 ms a line over serial), so any per-packet or per-loss message makes a receiver lose the next
+  packets; `verbose` therefore prints only a few gap lines and one status line per 10 s.
+  Plan: C Opus (the tape target can enable SSE/FPU, so libopus's float build is an option), E multicast/IGMP,
+  alternate-setting choice and duplex, AVTP (AVB) raw mode. (Dante itself is proprietary; AES67 mode is the open
+  way in.)
 * **Every stick gets its own GUIDs.** The kernel finds the disk it booted from by the payload
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with
