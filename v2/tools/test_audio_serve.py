@@ -135,6 +135,36 @@ def main():
             check(header.startswith("HTTP/1.1 404"), "an unknown path is a 404", header)
             header, body = fetch("/live.opus", 2.0)
             check(header.startswith("HTTP/1.1 200") and len(pages(body)) > 20, "a second client is served after the first", header)
+            # A phone's VLC opens a second connection while the first plays: both must keep streaming (the first is not dropped).
+            first = socket.create_connection(("127.0.0.1", HOST_PORT), timeout=10)
+            first.sendall(b"GET /live.opus HTTP/1.1\r\nHost: fos\r\nUser-Agent: test\r\n\r\n")
+            data_first, end = b"", time.monotonic() + 1.5
+            first.settimeout(0.3)
+            while time.monotonic() < end:
+                try:
+                    data_first += first.recv(65536)
+                except socket.timeout:
+                    pass
+            second = socket.create_connection(("127.0.0.1", HOST_PORT), timeout=10)
+            second.sendall(b"GET /live.opus HTTP/1.1\r\nHost: fos\r\nRange: bytes=0-\r\n\r\n")
+            data_second = b""
+            end = time.monotonic() + 2.0
+            second.settimeout(0.3)
+            while time.monotonic() < end:
+                for sock_, name in ((first, "first"), (second, "second")):
+                    try:
+                        chunk = sock_.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if name == "first":
+                        data_first += chunk
+                    else:
+                        data_second += chunk
+            first.close()
+            second.close()
+            pages_first, pages_second = pages(data_first.partition(b"\r\n\r\n")[2]), pages(data_second.partition(b"\r\n\r\n")[2])
+            check(len(pages_first) > 150 and all(p[4] for p in pages_first) and [p[2] for p in pages_first] == list(range(len(pages_first))), f"a second connection does not stop the first ({len(pages_first)} pages, no gap)", "")
+            check(len(pages_second) > 60 and all(p[4] for p in pages_second) and pages_second[0][3][:8] == b"OpusHead", f"and the second gets its own stream from the start ({len(pages_second)} pages)", "")
             # A client that stops reading for 4 s (its receive window closes, or slirp buffers for it) and then goes on: the
             # stream resumes with whole, valid pages (any that did not fit in the meantime are dropped, never cut).
             sock = socket.socket()
