@@ -26,6 +26,9 @@ def main():
         work = Path(tmp)
         big = bytes((index * 7 + index // 251) % 256 for index in range(37_000))
         (work / "big.bin").write_bytes(big)
+        import random
+        large = random.Random(7).randbytes(300_000)  # random data: a 32-bit checksum accumulator used to overflow here
+        (work / "large.bin").write_bytes(large)
         (work / "note.txt").write_text("hello from the host\n")
         a = Guest(tmp, "netfs-a", "52:54:00:12:34:f1", files={"hostname": "alpha", "alpha.txt": "file on alpha\n"})
         b = Guest(tmp, "netfs-b", "52:54:00:12:34:f2", files={"hostname": "bravo", "bravo.txt": "file on bravo\n"})
@@ -45,6 +48,11 @@ def main():
             check(result.returncode == 0, "a file of 37,000 bytes (37 chunks) is stored", result.stderr[-600:])
             result = foscopy(["--mac", mac_a, ":disk1/big.bin", "back.bin"], work)
             check(result.returncode == 0 and (work / "back.bin").read_bytes() == big, "and read back byte for byte", result.stderr[-600:])
+
+            result = foscopy(["--mac", mac_a, "large.bin", ":disk1/large.bin"], work)
+            check(result.returncode == 0, "300,000 bytes of random data are stored (the checksum must not overflow)", result.stderr[-600:])
+            result = foscopy(["--mac", mac_a, ":disk1/large.bin", "large.back"], work)
+            check(result.returncode == 0 and (work / "large.back").read_bytes() == large, "and read back byte for byte", result.stderr[-600:])
 
             result = foscopy(["--mac", mac_a, ":disk1/nosuchfile", "x.bin"], work)
             check(result.returncode != 0 and "file not found" in result.stderr + result.stdout, "a missing file is reported as such", result.stderr[-400:])

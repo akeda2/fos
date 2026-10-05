@@ -234,13 +234,16 @@ pub fn select_slot(metadata: &mut SlotMetadata) -> SlotChoice {
 /// RFC 1071 Internet checksum (the 16-bit ones-complement sum of the data), as KUP and
 /// NETFS use it.
 pub fn internet_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+    // A 64-bit accumulator: with 32 bits, 260 KB of high-entropy data (an average 16-bit word of 32768) overflowed it and
+    // the checksum came out wrong for large files (found with a 300 KB NETFS transfer; KUP's mostly-zero kernel images
+    // never got near it).
+    let mut sum: u64 = 0;
     let mut chunks = data.chunks_exact(2);
     for pair in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        sum += u64::from(u16::from_be_bytes([pair[0], pair[1]]));
     }
     if let [last] = chunks.remainder() {
-        sum += u32::from(*last) << 8;
+        sum += u64::from(*last) << 8;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -319,5 +322,23 @@ mod tests {
     fn slots_follow_the_metadata_sector() {
         assert_eq!(slot_start(0), 1);
         assert_eq!(slot_start(1), 1 + SLOT_SECTORS);
+    }
+
+    #[test]
+    fn checksum_of_a_large_buffer_does_not_overflow() {
+        // 400,000 bytes of 0xff words sum to 200,000 * 65,535, far beyond a 32-bit accumulator.
+        let data = [0xffu8; 400_000];
+        // The ones-complement sum of all-ones words is 0xffff, whose complement is 0.
+        assert_eq!(internet_checksum(&data), 0);
+        // And a ramp (high entropy-ish) against a straightforward folding reference.
+        let ramp: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let mut reference: u64 = 0;
+        for pair in ramp.chunks(2) {
+            reference += (u64::from(pair[0]) << 8) | u64::from(*pair.get(1).unwrap_or(&0));
+        }
+        while reference >> 16 != 0 {
+            reference = (reference & 0xffff) + (reference >> 16);
+        }
+        assert_eq!(internet_checksum(&ramp), !(reference as u16));
     }
 }
