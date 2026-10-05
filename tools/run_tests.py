@@ -104,6 +104,7 @@ E2E_MAKE = [
     "make test-v2-record",
     "make test-v2-lineedit",
     "make test-v2-scripts",
+    "make test-v2-nic",
     "make test-v2-config",
     "make test-v2-tapes",
     "make test-v2-nettest",

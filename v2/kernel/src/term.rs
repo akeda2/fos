@@ -99,6 +99,30 @@ fn nic() -> Option<&'static mut Nic> {
     nic_at(unsafe { SESSION_NIC })
 }
 
+/// Set while a shell command that runs until Escape is in charge of the input.
+static mut BLOCKING: bool = false;
+static mut BREAK: bool = false;
+
+/// True once Escape was typed at the machine, on the serial line or by the remote client.
+fn break_requested() -> bool {
+    while let Some(key) = crate::keyboard::pop() {
+        if key == 0x1b {
+            unsafe { BREAK = true };
+        }
+    }
+    unsafe { BREAK }
+}
+
+fn blocking(on: bool) {
+    unsafe {
+        BLOCKING = on;
+        BREAK = false;
+    }
+}
+
+/// The NIC the nic subcommands default to (zero-based): `nic use N`.
+static mut ACTIVE_NIC: usize = 0;
+
 fn session_open() -> bool {
     unsafe { (*core::ptr::addr_of!(PEER)).is_some() }
 }
@@ -218,6 +242,11 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
                     for &byte in payload {
                         tape_input_push(u16::from(byte));
                     }
+                }
+            } else if unsafe { BLOCKING } {
+                // A shell command that runs until interrupted (nic sniff...) owns the input: Escape stops it.
+                if payload.contains(&0x1b) {
+                    unsafe { BREAK = true };
                 }
             } else {
                 for &byte in payload {
@@ -731,7 +760,7 @@ fn execute(command: &str) {
             crate::println!("cpuinfo bootinfo memmap irqstat   what the CPU, loader and firmware report");
             crate::println!("hexdump ADDRESS [LENGTH]   dump mapped memory; io r8|w8.. PORT; mmio r32|w32.. ADDR");
             crate::println!("clear     clear the screen");
-            crate::println!("nic       the network interface");
+            crate::println!("nic       the network interfaces (list); nic use|sniff|discover|peers|map|regs|send|recv");
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
@@ -777,6 +806,17 @@ fn execute(command: &str) {
                 );
             }
         }
+        "nic" if matches!(words.clone().next(), Some("use")) => {
+            words.next();
+            nic_use(words.next());
+        }
+        "nic" if matches!(words.clone().next(), Some("sniff")) => {
+            words.next();
+            nic_sniff(words.next());
+        }
+        "nic" if matches!(words.clone().next(), Some("discover")) => nic_discover(),
+        "nic" if matches!(words.clone().next(), Some("peers")) => print_peers(),
+        "nic" if matches!(words.clone().next(), Some("map")) => nic_map(),
         "nic" if matches!(words.clone().next(), Some("send")) => nic_send_test(),
         "nic" if matches!(words.clone().next(), Some("recv")) => nic_recv_test(),
         "cpuinfo" => crate::diag::cpuinfo(),
@@ -1484,6 +1524,310 @@ fn hexdump(address: u64, length: usize) {
 }
 
 /// `nic send`: one broadcast test frame (ethertype 0x88b5, v1's TEST_ETHERTYPE) out of interface 1.
+/// `nic use N`: the interface the other nic subcommands default to.
+fn nic_use(argument: Option<&str>) {
+    match argument.and_then(|word| word.parse::<usize>().ok()) {
+        Some(number) if number >= 1 && number <= nic_count() => {
+            unsafe { ACTIVE_NIC = number - 1 };
+            crate::println!("Using NIC {number} for nic sniff.");
+        }
+        _ => crate::println!("Usage: nic use N   (N from 1 to {}; `nic` lists them). Now: NIC {}.", nic_count(), unsafe { ACTIVE_NIC } + 1),
+    }
+}
+
+/// Receives every waiting frame on every interface. The terminal's and discovery's own frames are handled as usual
+/// (so the session stays alive while a command runs); everything else goes to `visit(interface, frame)`.
+fn drain_nics(mut visit: impl FnMut(usize, &[u8])) {
+    let mut buffer = [0u8; 1600];
+    for index in 0..nic_count() {
+        loop {
+            let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
+            if !handle_frame(index, &buffer[..length]) {
+                visit(index, &buffer[..length]);
+            }
+        }
+    }
+    if session_open() {
+        flush();
+    }
+}
+
+/// A short line of text on the stack.
+struct Line {
+    bytes: [u8; 110],
+    length: usize,
+}
+
+impl Line {
+    fn new() -> Line {
+        Line { bytes: [0; 110], length: 0 }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for Line {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let take = text.len().min(self.bytes.len() - self.length);
+        self.bytes[self.length..self.length + take].copy_from_slice(&text.as_bytes()[..take]);
+        self.length += take;
+        Ok(())
+    }
+}
+
+/// One line about a frame: the addresses, the type and what is inside, as far as the common protocols go.
+fn describe_frame(frame: &[u8], line: &mut Line) {
+    use core::fmt::Write;
+    if frame.len() < 14 {
+        let _ = write!(line, "runt frame");
+        return;
+    }
+    let ip = |at: usize| -> (u8, u8, u8, u8) { (frame[at], frame[at + 1], frame[at + 2], frame[at + 3]) };
+    let kind = u16::from_be_bytes([frame[12], frame[13]]);
+    let _ = write!(line, "{} > {} ", Mac(&frame[6..12].try_into().unwrap()), Mac(&frame[0..6].try_into().unwrap()));
+    match kind {
+        0x0806 if frame.len() >= 42 => {
+            let (sender, target) = (ip(28), ip(38));
+            if frame[21] == 1 {
+                let _ = write!(line, "ARP who has {}.{}.{}.{}? tell {}.{}.{}.{}", target.0, target.1, target.2, target.3, sender.0, sender.1, sender.2, sender.3);
+            } else {
+                let _ = write!(line, "ARP {}.{}.{}.{} is at {}", sender.0, sender.1, sender.2, sender.3, Mac(&frame[22..28].try_into().unwrap()));
+            }
+        }
+        0x0800 if frame.len() >= 34 => {
+            let (source, destination) = (ip(26), ip(30));
+            let header = usize::from(frame[14] & 15) * 4;
+            let _ = write!(line, "IPv4 {}.{}.{}.{} > {}.{}.{}.{} ", source.0, source.1, source.2, source.3, destination.0, destination.1, destination.2, destination.3);
+            let ports = |frame: &[u8]| {
+                let at = 14 + header;
+                (frame.get(at..at + 4).map_or(0, |bytes| u16::from_be_bytes([bytes[0], bytes[1]])), frame.get(at..at + 4).map_or(0, |bytes| u16::from_be_bytes([bytes[2], bytes[3]])))
+            };
+            match frame[23] {
+                1 => {
+                    let _ = write!(line, "ICMP type {}", frame.get(14 + header).copied().unwrap_or(0));
+                }
+                6 => {
+                    let (a, b) = ports(frame);
+                    let _ = write!(line, "TCP {a} > {b}");
+                }
+                17 => {
+                    let (a, b) = ports(frame);
+                    let _ = write!(line, "UDP {a} > {b}");
+                    match (a, b) {
+                        (67 | 68, _) | (_, 67 | 68) => {
+                            let _ = write!(line, " (DHCP)");
+                        }
+                        (53, _) | (_, 53) => {
+                            let _ = write!(line, " (DNS)");
+                        }
+                        (9875, _) | (_, 9875) => {
+                            let _ = write!(line, " (SAP)");
+                        }
+                        (5004..=5100, _) | (_, 5004..=5100) => {
+                            let _ = write!(line, " (RTP?)");
+                        }
+                        _ => {}
+                    }
+                }
+                other => {
+                    let _ = write!(line, "protocol {other}");
+                }
+            }
+        }
+        0x86dd => {
+            let _ = write!(line, "IPv6");
+        }
+        0x8100 => {
+            let _ = write!(line, "VLAN tag");
+        }
+        0x22f0 => {
+            let _ = write!(line, "AVTP (IEEE 1722)");
+        }
+        0x88b5 => {
+            let _ = write!(line, "fos test frame");
+        }
+        0x88b6 => {
+            let _ = write!(line, "fos terminal/chat tag {:#04x}", frame.get(14).copied().unwrap_or(0));
+        }
+        0x88ba => {
+            let _ = write!(line, "audio-net raw audio");
+        }
+        0x88cc => {
+            let _ = write!(line, "LLDP");
+        }
+        other => {
+            let _ = write!(line, "type {other:#06x}");
+        }
+    }
+}
+
+/// `nic sniff [N]`: shows every frame the interface hears (it listens to everything, not just its own traffic) until
+/// Escape. The terminal's own frames are not shown, or the display would feed on itself.
+fn nic_sniff(argument: Option<&str>) {
+    let index = match argument.and_then(|word| word.parse::<usize>().ok()) {
+        Some(number) if number >= 1 && number <= nic_count() => number - 1,
+        Some(_) => return crate::println!("nic sniff: no such interface (`nic` lists them)."),
+        None => unsafe { ACTIVE_NIC }.min(nic_count().saturating_sub(1)),
+    };
+    let Some(nic) = nic_at(index) else { return crate::println!("No network interface.") };
+    nic.set_promiscuous(true);
+    crate::println!("Sniffing NIC {} (promiscuous). Escape stops.", index + 1);
+    blocking(true);
+    let (mut shown, mut skipped) = (0u32, 0u32);
+    while !break_requested() {
+        let mut budget = 40u32; // lines per pass: a busy network must not make the screen the bottleneck
+        drain_nics(|from, frame| {
+            if from != index {
+                return;
+            }
+            if budget == 0 {
+                skipped += 1;
+                return;
+            }
+            budget -= 1;
+            shown += 1;
+            let mut line = Line::new();
+            describe_frame(frame, &mut line);
+            crate::println!("{shown:>5} {:>4}B {}", frame.len(), line.as_str());
+        });
+        crate::debug::pet();
+        unsafe { core::arch::asm!("hlt") };
+    }
+    blocking(false);
+    if let Some(nic) = nic_at(index) {
+        nic.set_promiscuous(false);
+    }
+    crate::println!("Stopped: {shown} frame(s) shown{}.", if skipped > 0 { ", some skipped to keep up" } else { "" });
+}
+
+const MAX_PEERS: usize = 16;
+/// What `nic discover` heard: (MAC, name, name length, interface).
+static mut PEERS: [([u8; 6], [u8; 20], usize, usize); MAX_PEERS] = [([0; 6], [0; 20], 0, 0); MAX_PEERS];
+static mut PEER_COUNT: usize = 0;
+
+fn remember_peer(index: usize, mac: [u8; 6], name: &[u8]) {
+    unsafe {
+        let peers = &mut *core::ptr::addr_of_mut!(PEERS);
+        let count = PEER_COUNT;
+        if let Some(entry) = peers[..count].iter_mut().find(|entry| entry.0 == mac) {
+            if entry.2 == 0 {
+                entry.2 = name.len().min(20);
+                entry.1[..entry.2].copy_from_slice(&name[..entry.2]);
+            }
+            return;
+        }
+        if count < MAX_PEERS {
+            let length = name.len().min(20);
+            peers[count] = (mac, [0; 20], length, index);
+            peers[count].1[..length].copy_from_slice(&name[..length]);
+            PEER_COUNT = count + 1;
+        }
+    }
+}
+
+fn print_peers() {
+    let count = unsafe { PEER_COUNT };
+    if count == 0 {
+        return crate::println!("No peers known yet (`nic discover` looks for them).");
+    }
+    for number in 0..count {
+        let (mac, name, length, nic) = unsafe { (*core::ptr::addr_of!(PEERS))[number] };
+        crate::println!("{:>2}: {}  {}  (via NIC {})", number + 1, Mac(&mac), core::str::from_utf8(&name[..length]).unwrap_or("?"), nic + 1);
+    }
+}
+
+/// `nic discover`: asks every interface who else runs fos (a broadcast probe, repeated each second for three seconds)
+/// and lists the answers with their host names. Machines also answer on their own, whenever they are running.
+fn nic_discover() {
+    if nic_count() == 0 {
+        return crate::println!("No network interface.");
+    }
+    crate::println!("Looking for other fos machines (3 s)...");
+    unsafe { PEER_COUNT = 0 };
+    blocking(true);
+    let started = apic::ticks();
+    let mut next_probe = started;
+    while apic::ticks() < started + 3 * apic::TICK_HZ && !break_requested() {
+        if apic::ticks() >= next_probe {
+            next_probe += apic::TICK_HZ;
+            for index in 0..nic_count() {
+                if let Some(nic) = nic_at(index) {
+                    let mut name = [0u8; 20];
+                    let length = hostname(index, &mut name);
+                    send(nic, &[0xff; 6], TAG_DISCOVER_REQUEST, &name[..length]);
+                }
+            }
+        }
+        drain_nics(|index, frame| {
+            if frame.len() >= 15 && frame[12..14] == ETHERTYPE && frame[14] == TAG_DISCOVER_REPLY {
+                remember_peer(index, frame[6..12].try_into().unwrap(), &frame[15..]);
+            }
+        });
+        crate::debug::pet();
+        unsafe { core::arch::asm!("hlt") };
+    }
+    blocking(false);
+    print_peers();
+}
+
+/// `nic map`: which interfaces hear which. Every interface with a link sends a probe and the others listen; with
+/// two ports cabled together this shows the cable. It retries up to three rounds while nothing is heard (links
+/// coming up take a moment).
+fn nic_map() {
+    let count = nic_count();
+    if count == 0 {
+        return crate::println!("No network interface.");
+    }
+    let mut heard = [[false; MAX_NICS]; MAX_NICS];
+    blocking(true);
+    for round in 0..3 {
+        for from in 0..count {
+            let Some(nic) = nic_at(from) else { continue };
+            if !nic.link_up() {
+                continue;
+            }
+            let mut frame = [0u8; 14 + 8];
+            frame[0..6].copy_from_slice(&[0xff; 6]);
+            frame[6..12].copy_from_slice(&nic.mac());
+            frame[12..14].copy_from_slice(&[0x88, 0xb9]);
+            frame[14..20].copy_from_slice(b"FOSMAP");
+            frame[20] = from as u8;
+            nic.send(&frame);
+            let until = apic::ticks() + apic::TICK_HZ / 5;
+            while apic::ticks() < until {
+                drain_nics(|to, received| {
+                    if received.len() >= 21 && received[12..14] == [0x88, 0xb9] && &received[14..20] == b"FOSMAP" {
+                        let sender = usize::from(received[20]);
+                        // Only our own interfaces' probes count (another machine on the same network sends some too).
+                        if sender < MAX_NICS && sender != to && nic_at(sender).is_some_and(|nic| nic.mac() == received[6..12]) {
+                            heard[sender][to] = true;
+                        }
+                    }
+                });
+                crate::debug::pet();
+            }
+        }
+        if heard.iter().any(|row| row.iter().any(|&seen| seen)) || break_requested() {
+            break;
+        }
+        crate::println!("Nothing heard yet (round {})...", round + 1);
+    }
+    blocking(false);
+    for from in 0..count {
+        let Some(nic) = nic_at(from) else { continue };
+        crate::print(format_args!("NIC {} {} ({}): ", from + 1, Mac(&nic.mac()), if nic.link_up() { "link up" } else { "link DOWN" }));
+        let mut any = false;
+        for to in 0..count {
+            if heard[from][to] {
+                crate::print(format_args!("{}NIC {}", if any { ", " } else { "heard by " }, to + 1));
+                any = true;
+            }
+        }
+        crate::println!("{}", if any { "" } else { "heard by nobody" });
+    }
+}
+
 fn nic_send_test() {
     let mut mac = [0u8; 6];
     if !nic_mac(0, &mut mac) {

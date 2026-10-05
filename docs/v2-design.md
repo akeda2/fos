@@ -509,6 +509,15 @@ firmware, so a pending slot is tried on the next boot.
   the old one with a double fault. The same overflow was already crashing `tapes/test_bridge_e2e.py` (`nic recv` inside a
   nested command) on older commits; with the bigger stack that test no longer crashes but still does not see the bridged frame
   (not investigated yet). Tested by `make test-v2-scripts`.
+  **`nic` subcommands:** `nic sniff [N]` puts an interface in promiscuous mode and prints one line per frame (addresses,
+  then ARP who-has/is-at, IPv4 with TCP/UDP ports and tags for DHCP, DNS, SAP, RTP, AVTP, audio-net, LLDP, fos frames) until
+  Escape, at most 40 lines per pass so a busy network does not make the screen the bottleneck (it says if it skipped);
+  the terminal's own frames are handled, not shown, and Escape also works from a `term net` client. `nic discover` probes
+  every interface for three seconds and lists the fos machines that answer with their host names (`nic peers` shows the
+  table again), `nic map` sends a probe from every interface with a link and shows which of this machine's other
+  interfaces hear it (cabling; up to three rounds while links come up), `nic use N` picks the interface the others
+  default to. `nic regs`, `nic send` and `nic recv` were already there. Tested over the serial line with injected
+  frames, a second guest and a guest with two NICs on a QEMU hub (`make test-v2-nic`).
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
