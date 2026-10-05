@@ -89,18 +89,28 @@ def recv_data_frame(raw: socket.socket, source: bytes, peer: bytes, timeout: flo
     None if nothing arrived in time. Also silently notices a TERM_TAG_BYE
     from `peer`, raising SystemExit so callers do not have to check for it
     themselves everywhere."""
-    raw.settimeout(timeout)
-    try:
-        packet = raw.recv(2048)
-    except socket.timeout:
-        return None
-    if len(packet) < 15 or packet[12:14] != CHAT_ETHERTYPE.to_bytes(2, "big") or packet[6:12] != peer:
-        return None
-    tag = packet[14]
-    if tag == TERM_TAG_BYE:
-        raise SystemExit("\nRemote fos shell closed the session (sent TERM_TAG_BYE).")
-    if tag != TERM_TAG_DATA:
-        return None
+    # A frame that is not ours (a broadcast, a SAP announcement, another host's
+    # discovery reply, a non-data tag) must not look like "nothing arrived": callers
+    # read None as a quiet wire and stop collecting output, which lost the output of
+    # commands on busy segments.  Keep waiting until the deadline.
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        raw.settimeout(remaining)
+        try:
+            packet = raw.recv(2048)
+        except socket.timeout:
+            return None
+        if len(packet) < 15 or packet[12:14] != CHAT_ETHERTYPE.to_bytes(2, "big") or packet[6:12] != peer:
+            continue
+        tag = packet[14]
+        if tag == TERM_TAG_BYE:
+            raise SystemExit("\nRemote fos shell closed the session (sent TERM_TAG_BYE).")
+        if tag != TERM_TAG_DATA:
+            continue
+        break
     payload = packet[15:]
     end = len(payload)
     while end > 0 and payload[end - 1] == 0:
