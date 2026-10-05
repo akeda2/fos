@@ -76,13 +76,13 @@ const MEDIA_LINK_BEAT: u16 = 1 << 11;
 const RX_COMPLETE: u32 = 1 << 15;
 const RX_ERROR: u32 = 1 << 14;
 const LAST_FRAGMENT: u32 = 1 << 31;
-const TX_INDICATE: u32 = 1 << 15;
 const DOWNLOAD_COMPLETE: u32 = 1 << 16;
 const TX_ROUNDUP_DEFEAT: u32 = 1 << 28;
 const EEPROM_READ: u16 = 0x80;
 const EEPROM_BUSY: u16 = 0x8000;
 const STATUS_INT_LATCH: u16 = 1 << 0;
 const STATUS_HOST_ERROR: u16 = 1 << 1;
+const STATUS_TX_COMPLETE: u16 = 1 << 2;
 const STATUS_INT_REQUESTED: u16 = 1 << 6;
 const STATUS_UP_COMPLETE: u16 = 1 << 10;
 const INTERRUPT_MASK: u16 = STATUS_UP_COMPLETE | STATUS_HOST_ERROR;
@@ -150,6 +150,8 @@ fn descriptor(base: u64, index: usize) -> *mut Descriptor {
 /// Per-interface state the interrupt handler needs.
 static IO_BASE: [core::sync::atomic::AtomicU16; MAX_INTERFACES] = [const { core::sync::atomic::AtomicU16::new(0) }; MAX_INTERFACES];
 static FATAL: [AtomicBool; MAX_INTERFACES] = [const { AtomicBool::new(false) }; MAX_INTERFACES];
+/// Host (PCI bus) errors the card reported, for `nic`.
+static HOST_ERRORS: [core::sync::atomic::AtomicU32; MAX_INTERFACES] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_INTERFACES];
 
 /// The interrupt handler: acknowledge what the card says, note a host error for the foreground to recover from, and return.
 fn isr(index: usize) {
@@ -166,6 +168,7 @@ fn isr(index: usize) {
     ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
     if status & STATUS_HOST_ERROR != 0 {
         FATAL[index].store(true, Ordering::Release);
+        HOST_ERRORS[index].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -189,6 +192,18 @@ pub struct ThreeCom {
     pub frames_dropped_no_link: u64,
     pub bad_frames: u32,
     pub recoveries: u32,
+    /// Sends abandoned because the card did not finish the previous frame in time.
+    pub tx_timeouts: u32,
+    /// Frames dropped because the card was still busy with the previous one.
+    pub tx_busy_drops: u32,
+    /// TxStatus entries that reported an error (collisions, underrun, jabber, overflow).
+    pub tx_status_errors: u32,
+    /// What the transmit descriptor and the download list pointer held at the last send timeout (for `nic`).
+    last_timeout: (u32, u32, u16),
+    /// DMACtrl and TxStatus at that moment.
+    last_timeout_dma: (u32, u8),
+    /// Times a stalled download engine was woken again by a repeated `DownUnstall`.
+    pub unstall_retries: u32,
     recovery_pending: bool,
 }
 
@@ -228,6 +243,12 @@ impl ThreeCom {
             frames_dropped_no_link: 0,
             bad_frames: 0,
             recoveries: 0,
+            tx_timeouts: 0,
+            tx_busy_drops: 0,
+            tx_status_errors: 0,
+            last_timeout: (0, 0, 0),
+            last_timeout_dma: (0, 0),
+            unstall_retries: 0,
             recovery_pending: false,
         };
         nic.configure()?;
@@ -443,11 +464,15 @@ impl ThreeCom {
     /// The `nic` command's driver-specific line.
     pub fn describe(&self) {
         crate::println!(
-            "   3c905{}: I/O {:#06x}, {} bad frames, {} recoveries, status {:#06x}",
+            "   3c905{}: I/O {:#06x}, {} bad frames, {} recoveries ({} host errors, {} send timeouts), {} sends dropped busy, {} transmit errors, status {:#06x}",
             if self.b_revision { "B/C" } else { "" },
             self.io_base,
             self.bad_frames,
             self.recoveries,
+            HOST_ERRORS[self.index].load(Ordering::Relaxed),
+            self.tx_timeouts,
+            self.tx_busy_drops,
+            self.tx_status_errors,
             read16(self.io_base, CMD_STATUS)
         );
     }
@@ -461,6 +486,10 @@ impl ThreeCom {
             }
         }
         let status = read16(self.io_base, CMD_STATUS);
+        crate::println!(
+            "last send timeout: descriptor status {:08x}, down list {:08x}, card status {:04x}, DMACtrl {:08x}, TxStatus {:02x}; {} unstall retries",
+            self.last_timeout.0, self.last_timeout.1, self.last_timeout.2, self.last_timeout_dma.0, self.last_timeout_dma.1, self.unstall_retries
+        );
         crate::println!("3C905 I/O {:#06x}: status {status:04x} (window {}), interrupts {}, {:?}", self.io_base, status >> 13, if self.interrupts_enabled { "on" } else { "off" }, self.delivery);
         crate::println!(
             "rx next {} ({complete} of {RX_COUNT} descriptors completed), bad frames {}, recoveries {}, down list {:08x}, up list {:08x}",
@@ -470,6 +499,31 @@ impl ThreeCom {
             read32(self.io_base, DOWN_LIST_PTR),
             read32(self.io_base, UP_LIST_PTR)
         );
+    }
+
+    /// Empties the TxStatus stack (window 1, offset 0x1b) if the card says it holds entries, and re-enables the transmitter
+    /// as the 3Com drivers do: an error entry (jabber, underrun) needs a transmit reset first, a plain one just `TxEnable`.
+    fn service_tx_status(&mut self) {
+        if read16(self.io_base, CMD_STATUS) & STATUS_TX_COMPLETE == 0 {
+            return;
+        }
+        self.select_window(1);
+        let mut reset = false;
+        for _ in 0..40 {
+            let status = cpu::inb(self.io_base + 0x1b);
+            if status & 0x80 == 0 {
+                break;
+            }
+            cpu::outb(self.io_base + 0x1b, 0); // pop
+            self.tx_status_errors += u32::from(status & 0x3c != 0);
+            reset |= status & 0x30 != 0;
+        }
+        if reset {
+            issue_command(self.io_base, TX_RESET);
+            self.tx_in_flight = false;
+        }
+        issue_command(self.io_base, TX_ENABLE);
+        issue_command(self.io_base, ACK_INTERRUPT | STATUS_TX_COMPLETE | STATUS_INT_LATCH);
     }
 
     /// Queues one frame (padded to 60 bytes). The card has one download descriptor, so the previous frame's completion is
@@ -482,24 +536,41 @@ impl ThreeCom {
             self.frames_dropped_no_link += 1;
             return true;
         }
+        self.service_tx_status();
         let tx = descriptor(self.descriptors, RX_COUNT);
         if self.tx_in_flight {
             let mut attempts = 100_000u32;
             while unsafe { read_volatile(&(*tx).status) } & DOWNLOAD_COMPLETE == 0 {
                 attempts -= 1;
+                // The download engine can be left stalled; a repeated DownUnstall costs nothing if it is running.
+                if attempts % 10_000 == 0 && attempts > 0 {
+                    issue_command(self.io_base, DOWN_UNSTALL);
+                    self.unstall_retries += 1;
+                }
                 if attempts == 0 {
+                    self.last_timeout = (unsafe { read_volatile(&(*tx).status) }, read32(self.io_base, DOWN_LIST_PTR), read16(self.io_base, CMD_STATUS));
+                    self.select_window(1);
+                    self.last_timeout_dma = (read32(self.io_base, PKT_STATUS), cpu::inb(self.io_base + 0x1b));
                     issue_command(self.io_base, TX_RESET);
                     issue_command(self.io_base, TX_ENABLE);
                     self.tx_in_flight = false;
                     self.recovery_pending = true;
+                    self.tx_timeouts += 1;
                     return false;
                 }
             }
             unsafe { write_volatile(&mut (*tx).status, 0) };
             self.tx_in_flight = false;
         }
-        if read32(self.io_base, DOWN_LIST_PTR) != 0 {
-            return false;
+        // The card keeps the list pointer until it has the whole frame out: on a 10 Mb/s link that is nearly a millisecond for a
+        // 1 KiB frame, so a sender pacing frames a millisecond apart finds it busy. Wait (bounded) instead of dropping.
+        let deadline = apic::micros() + 50_000;
+        while read32(self.io_base, DOWN_LIST_PTR) != 0 {
+            if apic::micros() > deadline {
+                self.tx_busy_drops += 1;
+                return false;
+            }
+            core::hint::spin_loop();
         }
         let padded = frame.len().max(MIN_FRAME);
         unsafe {
@@ -507,7 +578,10 @@ impl ThreeCom {
             buffer[..frame.len()].copy_from_slice(frame);
             buffer[frame.len()..padded].fill(0);
             // B/C cards use the B-revision frame start: ask for a completion indication, no length rounding.
-            let start = if self.b_revision { TX_INDICATE | TX_ROUNDUP_DEFEAT } else { padded as u32 };
+            // No `TxIndicate` bit: each frame that asks for it pushes an entry on the card's 31-deep TxStatus stack that nothing
+            // here pops, and when the stack overflows (after ~30 frames) the transmitter stops dead. The completion this driver
+            // waits for is the DownloadComplete bit the card writes into the descriptor.
+            let start = padded as u32 | if self.b_revision { TX_ROUNDUP_DEFEAT } else { 0 };
             write_volatile(&mut (*tx).status, start);
             write_volatile(&mut (*tx).length, padded as u32 | LAST_FRAGMENT);
         }

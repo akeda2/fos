@@ -537,6 +537,18 @@ firmware, so a pending slot is tried on the next boot.
   enabled in both the status and interrupt masks to raise INT#. The card has no MSI, so legacy INTx through the I/O APIC is
   tried (pins probed) and kept only if the card's `RequestInterrupt` self-test arrives. QEMU has no such card, so nothing
   automated covers it: it needs the real card (a 3C905C-TX is in the Skylake).
+  Confirmed on the real card (3C905C-TX in the Skylake, link up, INTx pin 11 delivering): `nic map` sees it hear the I350
+  on the same switch, and NETFS round trips of 300 KB and 2 MB through it (foscopy both ways, compared with `cmp`) are
+  identical with 0 errors. Two bugs surfaced that QEMU could not: (1) the transmit frame header asked for a `TxIndicate`
+  status entry per frame, which pushes an entry on the card's 31-deep TxStatus stack that nothing popped, so after about 30
+  frames the stack overflowed and the transmitter stopped (the sender saw the download never complete and lost frames
+  from chunk 29 on; v1 carried the same latent bug, hidden by short transfers). The bit is gone, and `send` empties the
+  TxStatus stack and re-enables the transmitter if the card reports `TxComplete` (error entries: jabber and underrun get a
+  transmit reset first). (2) `send` also waits (bounded, 50 ms) for the download list pointer to clear instead of dropping
+  a frame when the card is still busy, and `nic` shows the driver's error counters (host errors, send timeouts, drops,
+  transmit errors).
+  A third bug was not the card's: `internet_checksum` summed into 32 bits, which overflows on about 260 KB of high-entropy
+  data, so large NETFS files were rejected as "damaged" (KUP's mostly-zero kernel images never got near it); it uses 64 bits now.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
