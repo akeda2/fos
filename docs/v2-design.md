@@ -481,8 +481,8 @@ firmware, so a pending slot is tried on the next boot.
   muxer is `audio_wire::ogg`, host-tested), `GET /` a page with an `<audio>` player, anything else a 404. The machine
   answers ARP and ping. The TCP is `tape-net`'s (one connection, one segment in flight), so the throughput is one segment
   per round trip; audio waits in a 12 KiB queue and a page that finds it full is dropped (the player conceals it) rather
-  than letting the delay grow, and a client that stops acknowledging for 10 s is dropped. Safari plays Ogg Opus only in
-  recent versions; VLC does. Test: `make test-v2-audio-serve` (QEMU user networking with a forwarded port; checks every
+  than letting the delay grow, a client that stops acknowledging for 10 s is dropped, and a new connection replaces the current one (players open a second one). Safari plays Ogg Opus only in
+  recent versions; VLC does. The panel offers it as a fourth Mode (the Network row is fixed to IP, peer/name/group/receive rows disappear, Codec offers the Opus choices, an "HTTP port" row defaults to 8000, `audio.cfg` gets `mode serve` and `http N`); its live view names the URL once the address is known and shows the same meters. Test: `make test-v2-audio-serve` (QEMU user networking with a forwarded port; checks every
   page's CRC, the headers, the granule positions, `ffprobe`, and that `ffmpeg` decodes 440 Hz).
   **Real PPM meters:** the live view shows one horizontal meter per channel (labelled with the device input or output
   it is), one cell per dB from -60 dBFS to full scale, on the Nordic scale (IEC 60268-10 type I: TEST = 0 at -18 dBFS,

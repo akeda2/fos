@@ -117,7 +117,9 @@ impl<const N: usize> Write for Text<N> {
     }
 }
 
-const MODES: [&str; 3] = ["Send", "Receive", "Duplex (send and receive)"];
+const MODES: [&str; 4] = ["Send", "Receive", "Duplex (send and receive)", "Serve (Ogg Opus over HTTP, for a browser or VLC)"];
+/// `Settings::mode` of the HTTP server.
+const SERVE: usize = 3;
 const NETWORKS: [&str; 3] = ["RTP over IP (routable, AES67-style)", "Raw Ethernet (same switch, no IP)", "AVTP (AVB, same switch, no IP)"];
 const CODECS: [&str; 5] = ["PCM 24-bit (best quality)", "PCM 16-bit", "Opus, balanced (96 kbit/s per stereo pair)", "Opus, low bandwidth (48 kbit/s per pair)", "Opus, low delay (128 kbit/s per pair, 5 ms)"];
 
@@ -133,8 +135,9 @@ const R_SEND: usize = 8;
 const R_RECEIVE: usize = 9;
 const R_NAME: usize = 10;
 const R_GROUP: usize = 11;
-const ROWS: usize = 12;
-const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Send channels", "Receive channels", "Name", "Multicast group"];
+const R_PORT: usize = 12;
+const ROWS: usize = 13;
+const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Send channels", "Receive channels", "Name", "Multicast group", "HTTP port"];
 
 #[derive(Clone, Copy)]
 struct Settings {
@@ -151,23 +154,29 @@ struct Settings {
     group: Text<16>,
     send: Text<24>,
     receive: Text<24>,
+    /// `serve`: the TCP port; empty means the default, 8000.
+    port: Text<6>,
 }
 
 impl Settings {
     fn new() -> Settings {
-        Settings { mode: 0, network: 0, nic: 1, codec: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2") }
+        Settings { mode: 0, network: 0, nic: 1, codec: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new() }
     }
 
+    /// The network needs an IP address: RTP, or the HTTP server (which has no other network).
     fn rtp(&self) -> bool {
-        self.network == 0
+        self.network == 0 || self.mode == SERVE
     }
 
     fn applies(&self, row: usize) -> bool {
         match row {
-            R_ADDRESSING | R_NAME | R_GROUP => self.rtp(),
+            R_NETWORK | R_PEER => self.mode != SERVE,
+            R_NAME | R_GROUP => self.rtp() && self.mode != SERVE,
+            R_ADDRESSING => self.rtp(),
             R_IP | R_GATEWAY => self.rtp() && !self.dhcp,
             R_SEND => self.mode != 1,
-            R_RECEIVE => self.mode != 0,
+            R_RECEIVE => self.mode == 1 || self.mode == 2,
+            R_PORT => self.mode == SERVE,
             _ => true,
         }
     }
@@ -181,6 +190,7 @@ impl Settings {
             R_GROUP => Some(&mut self.group),
             R_SEND => Some(&mut self.send),
             R_RECEIVE => Some(&mut self.receive),
+            R_PORT => Some(&mut self.port),
             _ => None,
         }
     }
@@ -188,8 +198,8 @@ impl Settings {
     /// The settings as a configuration file (`audio-net @audio.cfg` runs it).
     fn cfg(&self, out: &mut Cursor<'_>, for_run: bool) {
         let _ = writeln!(out, "# audio-net configuration, written by the panel");
-        let _ = writeln!(out, "mode {}", ["send", "recv", "duplex"][self.mode]);
-        let _ = writeln!(out, "proto {}", ["rtp", "raw", "avtp"][self.network]);
+        let _ = writeln!(out, "mode {}", ["send", "recv", "duplex", "serve"][self.mode]);
+        let _ = writeln!(out, "proto {}", ["rtp", "raw", "avtp"][if self.mode == SERVE { 0 } else { self.network }]);
         // By MAC address: the NIC numbers change when cards are moved, the addresses do not.
         let mut mac = [0u8; 6];
         (tape_rt::api().nic_mac)(self.nic - 1, mac.as_mut_ptr());
@@ -198,13 +208,13 @@ impl Settings {
             if self.dhcp {
                 let _ = writeln!(out, "ip dhcp");
             }
-            for (key, value) in [("ip", if self.dhcp { "" } else { self.ip.as_str() }), ("gw", if self.dhcp { "" } else { self.gateway.as_str() }), ("name", self.name.as_str()), ("group", self.group.as_str())] {
+            for (key, value) in [("ip", if self.dhcp { "" } else { self.ip.as_str() }), ("gw", if self.dhcp { "" } else { self.gateway.as_str() }), ("name", if self.mode == SERVE { "" } else { self.name.as_str() }), ("group", if self.mode == SERVE { "" } else { self.group.as_str() })] {
                 if !value.is_empty() {
                     let _ = writeln!(out, "{key} {value}");
                 }
             }
         }
-        let peer = self.peer.as_str();
+        let peer = if self.mode == SERVE { "" } else { self.peer.as_str() };
         if !peer.is_empty() {
             if self.mode != 1 {
                 let _ = writeln!(out, "to {peer}");
@@ -233,8 +243,11 @@ impl Settings {
         if for_run && self.mode != 1 && read_audio_info().capture_channels == 0 {
             let _ = writeln!(out, "src tone=440"); // no device with inputs: send a test tone
         }
+        if self.mode == SERVE && !self.port.is_empty() {
+            let _ = writeln!(out, "http {}", self.port.as_str());
+        }
         match self.mode {
-            0 => {
+            0 | SERVE => {
                 let _ = writeln!(out, "ch {}", self.send.as_str());
             }
             1 => {
@@ -244,7 +257,7 @@ impl Settings {
                 let _ = writeln!(out, "in {}\nout {}", self.send.as_str(), self.receive.as_str());
             }
         }
-        if self.mode != 0 {
+        if self.mode == 1 || self.mode == 2 {
             let count = ChannelSet::parse(self.receive.as_str()).map_or(2, |set| set.count());
             let _ = writeln!(out, "chan {count}");
         }
@@ -256,6 +269,7 @@ impl Settings {
             "send" => Some(0),
             "recv" => Some(1),
             "duplex" => Some(2),
+            "serve" => Some(SERVE),
             _ => None,
         };
         for word in words {
@@ -277,6 +291,7 @@ impl Settings {
                 "gw" => self.gateway = Text::from(value),
                 "name" => self.name = Text::from(value),
                 "group" => self.group = Text::from(value),
+                "http" => self.port = Text::from(value),
                 "to" | "source" | "from" => self.peer = Text::from(value),
                 "codec" => opus = value == "opus",
                 "bitrate" => bitrate = value.parse().unwrap_or(96),
@@ -297,6 +312,9 @@ impl Settings {
         };
         if !self.rtp() && self.codec >= 2 {
             self.codec = 0;
+        }
+        if self.mode == SERVE && self.codec < 2 {
+            self.codec = 2; // Ogg Opus: there is no PCM here
         }
     }
 }
@@ -345,7 +363,7 @@ fn build(settings: &Settings) -> Result<(&'static str, Options<'static>), &'stat
     let mut kept_count = 0;
     for &word in &words[..count] {
         match word.strip_prefix("mode=").unwrap_or(word) {
-            "send" | "recv" | "duplex" => mode = word.strip_prefix("mode=").unwrap_or(word),
+            "send" | "recv" | "duplex" | "serve" => mode = word.strip_prefix("mode=").unwrap_or(word),
             _ => {
                 kept[kept_count] = word;
                 kept_count += 1;
@@ -363,6 +381,10 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
     let dash = |text: &str, out: &mut Text<100>| {
         let _ = write!(out, "{}", if text.is_empty() { "-" } else { text });
     };
+    if row == R_NETWORK && settings.mode == SERVE {
+        let _ = write!(out, "IP (HTTP needs an address)");
+        return;
+    }
     if !settings.applies(row) {
         let _ = write!(out, "{}", if settings.rtp() && settings.dhcp && matches!(row, R_IP | R_GATEWAY) { "(from DHCP)" } else { "-" });
         return;
@@ -401,6 +423,13 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
                 let _ = write!(out, "{text}   (the device has {available})");
             }
         }
+        R_PORT => {
+            if settings.port.is_empty() {
+                let _ = write!(out, "8000  (the default; type a port to change it)");
+            } else {
+                let _ = write!(out, "{}", settings.port.as_str());
+            }
+        }
         R_IP => dash(settings.ip.as_str(), out),
         R_GATEWAY => dash(settings.gateway.as_str(), out),
         R_NAME => {
@@ -426,7 +455,7 @@ fn bandwidth(settings: &Settings) -> u32 {
         _ => count.div_ceil(2) * 128,
     };
     match settings.mode {
-        0 => per(send),
+        0 | SERVE => per(send),
         1 => per(receive),
         _ => per(send).max(per(receive)),
     }
@@ -486,6 +515,7 @@ fn draw_row(settings: &Settings, row: usize, selected: usize, editing: bool, inf
             R_PEER => settings.peer.as_str(),
             R_NAME => settings.name.as_str(),
             R_GROUP => settings.group.as_str(),
+            R_PORT => settings.port.as_str(),
             R_SEND => settings.send.as_str(),
             _ => settings.receive.as_str(),
         };
@@ -518,7 +548,12 @@ fn is_escape(key: &Key) -> bool {
 fn cycle(settings: &mut Settings, row: usize, step: isize) {
     let wrap = |value: usize, count: usize| ((value as isize + step).rem_euclid(count as isize)) as usize;
     match row {
-        R_MODE => settings.mode = wrap(settings.mode, 3),
+        R_MODE => {
+            settings.mode = wrap(settings.mode, MODES.len());
+            if settings.mode == SERVE && settings.codec < 2 {
+                settings.codec = 2; // Ogg Opus: there is no PCM here
+            }
+        }
         R_ADDRESSING => settings.dhcp = !settings.dhcp,
         R_NETWORK => {
             settings.network = wrap(settings.network, 3);
@@ -528,8 +563,13 @@ fn cycle(settings: &mut Settings, row: usize, step: isize) {
         }
         R_NIC => settings.nic = 1 + wrap(settings.nic - 1, ((tape_rt::api().nic_count)()).max(1)),
         R_CODEC => {
-            let count = if settings.rtp() { CODECS.len() } else { 2 };
-            settings.codec = wrap(settings.codec, count);
+            if settings.mode == SERVE {
+                // The Opus choices only (2 to 4), wrapping.
+                settings.codec = 2 + (settings.codec.max(2) - 2 + if step < 0 { 2 } else { 1 }) % 3;
+            } else {
+                let count = if settings.rtp() { CODECS.len() } else { 2 };
+                settings.codec = wrap(settings.codec, count);
+            }
         }
         _ => {}
     }
@@ -615,6 +655,8 @@ struct Run {
     cursor: usize,
     next_counters: u64,
     ip_shown: bool,
+    /// `serve`: the HTTP port, so that the live view can show the URL once the address is known (0 otherwise).
+    serve_port: u16,
     mac: [u8; 6],
     nic: usize,
     counters: Text<100>,
@@ -638,7 +680,7 @@ struct Run {
 
 const fn blank_run() -> Run {
     Run {
-        stop: false, next_draw: 0, started: 0, rows: 0, sends: 0, labels: [0; MAX_ROWS], page: 0, nordic: true, needs_full: [true; MAX_ROWS], footer_dirty: true, cursor: 0, next_counters: 0, ip_shown: false, mac: [0; 6], nic: 0,
+        stop: false, next_draw: 0, started: 0, rows: 0, sends: 0, labels: [0; MAX_ROWS], page: 0, nordic: true, needs_full: [true; MAX_ROWS], footer_dirty: true, cursor: 0, next_counters: 0, ip_shown: false, serve_port: 0, mac: [0; 6], nic: 0,
         counters: Text::new(), message: Text::new(), actual: Text::new(), shown_cell: [-1; MAX_ROWS], shown_hold: [-1; MAX_ROWS], shown_number: [i16::MIN; MAX_ROWS], shown_clip: [false; MAX_ROWS],
         hold: [0; MAX_ROWS], hold_at: [0; MAX_ROWS], clip_at: [0; MAX_ROWS], ui_worst: 0, last_draw: 0, ui_recent: 0, ui_recent_since: 0,
     }
@@ -895,6 +937,10 @@ extern "C" fn panel_hook() -> u32 {
                 run.ip_shown = true;
                 at(3, 1);
                 draw!(" NIC {}  MAC {}  IP {}.{}.{}.{}\x1b[K", run.nic + 1, MacText(run.mac), ip[0], ip[1], ip[2], ip[3]);
+                if run.serve_port != 0 {
+                    at(2, 1);
+                    draw!(" Open http://{}.{}.{}.{}:{}/live.opus (VLC) or http://{}.{}.{}.{}:{}/ (browser)\x1b[K", ip[0], ip[1], ip[2], ip[3], run.serve_port, ip[0], ip[1], ip[2], ip[3], run.serve_port);
+                }
             }
         }
         let shown = stats::get();
@@ -980,7 +1026,7 @@ fn run_stream(settings: &Settings) {
     if mode != "recv" {
         run.sends = add(ChannelSet::parse(settings.send.as_str()), 2, run);
     }
-    if mode != "send" {
+    if mode == "recv" || mode == "duplex" {
         add(ChannelSet::parse(settings.receive.as_str()), 2, run);
     }
     stats::reset();
@@ -990,7 +1036,12 @@ fn run_stream(settings: &Settings) {
     draw!(" fos audio-net: {} ({})\x1b[K", MODES[settings.mode], CODECS[settings.codec]);
     at(2, 1);
     let peer = settings.peer.as_str();
-    draw!(" Peer: {}   Network: {}\x1b[K", if peer.is_empty() { "-" } else { peer }, NETWORKS[settings.network]);
+    if settings.mode == SERVE {
+        run.serve_port = options.http;
+        draw!(" Waiting for the address; the player URL shows here.\x1b[K");
+    } else {
+        draw!(" Peer: {}   Network: {}\x1b[K", if peer.is_empty() { "-" } else { peer }, NETWORKS[settings.network]);
+    }
     at(3, 1);
     let mut mac = [0u8; 6];
     (real.nic_mac)(options.nic, mac.as_mut_ptr());
@@ -1094,6 +1145,10 @@ impl Presence {
     fn tick(&mut self, settings: &Settings) {
         let api = tape_rt::api();
         let now = tape_rt::micros();
+        if settings.mode == SERVE {
+            self.status = Text::from("Serve: press S to start; the address and the URL to open are shown then.");
+            return;
+        }
         if !settings.rtp() {
             self.status = Text::from("Finding peers needs the RTP network (the announcements travel over IP).");
             return;

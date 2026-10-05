@@ -74,9 +74,10 @@ def fetch(path, seconds=None, port=HOST_PORT):
     return header.decode(errors="replace"), body
 
 
-def main():
-    with tempfile.TemporaryDirectory() as tmp:
-        guest = Guest(tmp, "serve", "52:54:00:12:34:d1")
+def boot(tmp, name="serve"):
+    """A guest on QEMU user-mode networking (slirp DHCP: 10.0.2.15), host ports 18000 and 18080 forwarded to 8000 and 8080."""
+    if True:
+        guest = Guest(tmp, name, "52:54:00:12:34:d1")
         guest.stop()
         code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
         vars_copy, disk = Path(tmp) / "serve-vars2.fd", Path(tmp) / "serve2.img"
@@ -85,12 +86,18 @@ def main():
         command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-drive", f"format=raw,file={disk}",
-                   "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{HOST_PORT}-:8000", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:d1"]
+                   "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{HOST_PORT}-:8000,hostfwd=tcp:127.0.0.1:{HOST_PORT + 80}-:8080", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:d1"]
         guest.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         guest.raw = bytearray()
+        guest.wait_for("M3 complete")
+        guest.wait_for("fos> ")
+        return guest
+
+
+def main():
+    with tempfile.TemporaryDirectory() as tmp:
+        guest = boot(tmp)
         try:
-            guest.wait_for("M3 complete")
-            guest.wait_for("fos> ")
             mark = guest.send("run audio-net serve ip=dhcp src=tone=440 secs=120")
             guest.wait_for("Serving Ogg Opus", 60, mark)
             guest.pump(1.0)
@@ -130,7 +137,56 @@ def main():
             check(header.startswith("HTTP/1.1 200") and len(pages(body)) > 20, "a second client is served after the first", header)
         finally:
             guest.stop()
+    panel_test()
     print("v2 audio-net serve: all checks passed")
+
+
+def panel_test():
+    """The settings panel offers Serve: the mode row reaches it, the rows that do not apply disappear, the HTTP port row
+    shows 8000 by default and S serves there (the live view names the URL); with 8080 typed the stream moves there, and the
+    saved audio.cfg says `mode serve` and `http 8080`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        guest = boot(tmp, "serve-panel")
+        keys = lambda text: (guest.process.stdin.write(text.encode()), guest.process.stdin.flush(), guest.pump(0.5))
+        try:
+            mark = guest.send("run audio-net")
+            guest.wait_for("audio-net: settings", 30, mark)
+            keys("lll")
+            form = guest.text()[mark:]
+            check("Serve (Ogg Opus over HTTP" in form.split("Mode")[-1][:200], "the Mode row reaches Serve", form[-600:])
+            check("8000  (the default" in form, "the HTTP port row shows the default 8000", form[-900:])
+            keys("jjjjj")
+            check("> HTTP port" in guest.text()[-400:], "moving down lands on the HTTP port row (the rows that do not apply are skipped)", guest.text()[-600:])
+            keys("s")
+            guest.wait_for("http://10.0.2.15:8000/live.opus", 40, mark)
+            header, body = fetch("/live.opus", 3.0)
+            found = pages(body)
+            check(header.startswith("HTTP/1.1 200") and len(found) > 50 and all(page[4] for page in found), f"S serves Ogg Opus on the default port ({len(found)} pages)", header)
+            check("Tx " in guest.text()[mark:] and "=====" in guest.text()[mark:], "the live view shows the counter and meters", guest.text()[-500:])
+            guest.process.stdin.write(b"\x1b")
+            guest.process.stdin.flush()
+            guest.wait_for("Press any key for the settings", 20, mark)
+            keys(" ")
+            keys("\r8080\r")
+            check("8080" in guest.text()[-600:], "a port can be typed", guest.text()[-600:])
+            keys("s")
+            guest.wait_for("http://10.0.2.15:8080/live.opus", 40, mark)
+            header, body = fetch("/live.opus", 3.0, HOST_PORT + 80)
+            check(header.startswith("HTTP/1.1 200") and len(pages(body)) > 50, "and the stream is there", header)
+            guest.process.stdin.write(b"\x1b")
+            guest.process.stdin.flush()
+            guest.wait_for("Press any key for the settings", 20, mark)
+            keys(" ")
+            keys("w")
+            check("Saved audio.cfg" in guest.text(), "W saves audio.cfg", guest.text()[-400:])
+            keys("q")
+            guest.wait_for("fos> ", 30, mark)
+            cat = guest.send("cat audio.cfg")
+            guest.pump(1.5)
+            config = guest.text()[cat:]
+            check("mode serve" in config and "http 8080" in config and "proto rtp" in config and "codec opus" in config and "\nto " not in config, "the saved cfg holds mode serve and the port", config)
+        finally:
+            guest.stop()
 
 
 if __name__ == "__main__":

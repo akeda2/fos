@@ -1,13 +1,14 @@
 //! `audio-net serve`: the Opus stream as Ogg Opus over HTTP, for trying a machine from a browser or VLC (`vlc
 //! http://IP:8000/live.opus`) when the RTP receiver is out of reach, such as a phone. It is a test aid, not a
-//! distribution server: one listener at a time and no authentication.
+//! distribution server: one client at a time (the newest connection wins) and no authentication.
 //!
 //! The machine answers ARP and ping, accepts one TCP connection on `http=PORT` (default 8000) and serves
 //! `GET /live.opus` as an endless `audio/ogg` response (one Opus packet per Ogg page, see `audio_wire::ogg`);
 //! `GET /` is a page with an `<audio>` element pointing at it. The TCP layer is `tape-net`'s: one segment in
 //! flight, retransmitted on a timer, so throughput is one segment per round trip. Audio waits in a 12 KiB queue
 //! (about a second at 128 kbit/s); a page that finds the queue full is dropped whole, which the player sees as a lost
-//! packet, so a slow client cannot make the delay grow. A client that stops acknowledging for 10 s is dropped.
+//! packet, so a slow client cannot make the delay grow. A client that stops acknowledging for 10 s is dropped; a new
+//! connection replaces the current one.
 
 use crate::net::{self, MAX_FRAME, NetConfig};
 use crate::{Options, Transport, tone_sample};
@@ -149,10 +150,10 @@ impl Server<'_> {
     }
 
     fn segment(&mut self, segment: &TcpSegment, mac: MacAddress, ip: Ipv4Address, now: u32) {
-        if self.client.is_none() {
-            if segment.flags & (TCP_SYN | TCP_ACK) != TCP_SYN {
-                return;
-            }
+        let new_endpoint = self.client.as_ref().is_none_or(|client| client.ip != ip || client.port != segment.source_port);
+        if new_endpoint && segment.flags & (TCP_SYN | TCP_ACK) == TCP_SYN {
+            // A new connection takes over: players open a second connection (VLC probes first, a browser reconnects), and
+            // the old one may be half closed. The old client is simply forgotten; it times out or is reset.
             let iss = tape_rt::micros() as u32;
             let tcp = TcpConnection::<MSS>::listen(self.config.ip, self.port, ip, segment.source_port, iss, RETRANSMIT_TICKS);
             self.client = Some(Client { tcp, mac, ip, port: segment.source_port, phase: Phase::Request, progress: now });
@@ -162,7 +163,7 @@ impl Server<'_> {
         }
         let Some(client) = self.client.as_mut() else { return };
         if client.ip != ip || client.port != segment.source_port {
-            return; // a second client has to wait for the first
+            return;
         }
         client.mac = mac;
         client.progress = now;
@@ -345,6 +346,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
     let (mut sent, mut phase) = (0u64, 0u32);
     let frame_us = frame_samples as u64 * 1_000_000 / u64::from(RATE);
     let started = tape_rt::micros();
+    crate::stats::get().rate = RATE;
     loop {
         if (api.should_abort)() != 0 || (options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000) {
             break;
@@ -373,19 +375,22 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
             }
             continue;
         }
-        if server.streaming() {
-            for index in 0..frame_samples {
-                for lane in 0..channels {
-                    pcm[index * channels + lane] = if let Some(frequency) = options.tone {
-                        (tone_sample(phase.wrapping_add((frequency * 65_536 / RATE) * index as u32) & 0xffff)) as i16
-                    } else {
-                        let at = index * device_frame + channel_list[lane] * slot;
-                        device_sample_16(&capture[at..at + slot])
-                    };
-                }
+        // The frame's samples, whether or not anyone listens: the meters on the panel show what would be sent.
+        for index in 0..frame_samples {
+            for lane in 0..channels {
+                pcm[index * channels + lane] = if let Some(frequency) = options.tone {
+                    (tone_sample(phase.wrapping_add((frequency * 65_536 / RATE) * index as u32) & 0xffff)) as i16
+                } else {
+                    let at = index * device_frame + channel_list[lane] * slot;
+                    device_sample_16(&capture[at..at + slot])
+                };
             }
+        }
+        crate::stats::peaks_from_i16(&pcm[..frame_samples * channels], channels, frame_samples, 0, true);
+        if server.streaming() {
             if let Ok(length) = encoder.encode(&pcm[..frame_samples * channels], frame_samples, &mut packet) {
                 server.push_packet(&packet[..length], frame_samples as u32);
+                crate::stats::get().sent += 1;
             }
         }
         if let Some(frequency) = options.tone {
