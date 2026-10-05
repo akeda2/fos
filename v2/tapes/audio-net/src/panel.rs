@@ -576,11 +576,11 @@ fn toggle_boot(settings: &Settings) -> &'static str {
 }
 
 /// Where the meters are drawn on the live screen (a 24-row terminal must fit them).
-const BAR_COL: usize = 9;
+const BAR_COL: usize = 10;
 /// Cells 0..=60, one per dB from -60 dBFS to full scale.
 const CELLS: i32 = 61;
-const NUMBER_COL: usize = 71;
-const CLIP_COL: usize = 77;
+const NUMBER_COL: usize = 72;
+const CLIP_COL: usize = 79;
 const ROW_SCALE: usize = 7;
 const ROW_FIRST: usize = 9;
 const PAGE_ROWS: usize = 12;
@@ -709,7 +709,7 @@ fn draw_footer(run: &Run) {
     at(ROW_FIRST + PAGE_ROWS, 2);
     draw!("Channels {}-{} of {}   N: next page   B: previous page\x1b[K", first + 1, last, run.rows);
     at(ROW_FIRST + PAGE_ROWS + 1, 2);
-    draw!("T = TEST level, -18 dBFS    M = maximum permitted level, -9 dBFS    # = above it\x1b[K");
+    draw!("T = TEST level, -18 dBFS   M = maximum permitted, -9 dBFS   # = above it   ! = clipped\x1b[K");
     at(ROW_FIRST + PAGE_ROWS + 2, 2);
     draw!("U: Nordic/dBFS   R: reset hold   M: meters off/on   Esc or Q: stop and return\x1b[K");
 }
@@ -761,7 +761,8 @@ fn update_meters(run: &mut Run, now: u64) {
             at(row, 1);
             draw!("\x1b[K");
             at(row, 2);
-            draw!("{}{:>2}", if is_send { "In " } else { "Out" }, run.labels[index]);
+            // Labelled by the direction of the stream (what the user is setting up), with the device channel number.
+            draw!("{} {:>2}", if is_send { "Send" } else { "Recv" }, run.labels[index]);
         }
         let (old_cell, old_hold) = (i32::from(run.shown_cell[index]), i32::from(run.shown_hold[index]));
         if full || old_cell != cell || old_hold != hold_cell {
@@ -800,7 +801,7 @@ fn update_meters(run: &mut Run, now: u64) {
         }
         if full || run.shown_clip[index] != clipped {
             at(row, CLIP_COL);
-            draw!("{}", if clipped { "CLIP" } else { "    " });
+            draw!("{}", if clipped { "!" } else { " " });
             run.shown_clip[index] = clipped;
         }
     }
