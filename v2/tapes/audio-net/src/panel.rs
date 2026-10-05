@@ -190,7 +190,10 @@ impl Settings {
         let _ = writeln!(out, "# audio-net configuration, written by the panel");
         let _ = writeln!(out, "mode {}", ["send", "recv", "duplex"][self.mode]);
         let _ = writeln!(out, "proto {}", ["rtp", "raw", "avtp"][self.network]);
-        let _ = writeln!(out, "nic {}", self.nic);
+        // By MAC address: the NIC numbers change when cards are moved, the addresses do not.
+        let mut mac = [0u8; 6];
+        (tape_rt::api().nic_mac)(self.nic - 1, mac.as_mut_ptr());
+        let _ = writeln!(out, "nic {}", MacText(mac));
         if self.rtp() {
             if self.dhcp {
                 let _ = writeln!(out, "ip dhcp");
@@ -265,7 +268,10 @@ impl Settings {
             let Some((key, value)) = word.split_once('=') else { continue };
             match key {
                 "proto" => self.network = ["rtp", "raw", "avtp"].iter().position(|name| *name == value).unwrap_or(0),
-                "nic" => self.nic = value.parse().unwrap_or(1),
+                "nic" => self.nic = match crate::parse_mac(value) {
+                    Some(mac) => crate::nic_by_mac(mac).map_or(1, |index| index + 1), // a card that is gone: back to the first
+                    None => value.parse().unwrap_or(1),
+                },
                 "ip" if value == "dhcp" => self.dhcp = true,
                 "ip" => (self.dhcp, self.ip) = (false, Text::from(value)),
                 "gw" => self.gateway = Text::from(value),

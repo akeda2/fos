@@ -431,7 +431,7 @@ def config_test():
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "cfg.wav"
         rx = "# the receiver\nmode recv\nproto raw   # layer 2, no addresses\ntarget 8\n"
-        tx = "mode send\nproto raw\nsrc tone=550\nsecs 3\n"
+        tx = "mode send\nproto raw\nnic 52:54:00:12:34:f2\nsrc tone=550\nsecs 3\n"  # the NIC by its MAC address
         a = Guest(tmp, "cfg-a", "52:54:00:12:34:f1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"],
                   {"rx.cfg": rx, "start": "run audio-net @rx.cfg\n"})
         b = Guest(tmp, "cfg-b", "52:54:00:12:34:f2", files={"tx.cfg": tx})
@@ -442,6 +442,10 @@ def config_test():
             a.pump(3.0)  # the emulated USB audio keeps the receiver busy for a while after it starts
             mark_b = b.send("run audio-net @tx.cfg")
             b.wait_for("Sent ", 120, mark_b)
+            check("on NIC 1 (MAC 52:54:00:12:34:f2)" in b.text() or "(MAC 52:54:00:12:34:f2)" in b.text(), "nic <MAC> in a cfg picks the NIC with that address", b.text()[-600:])
+            mark_bad = b.send("run audio-net send nic=52:54:00:99:99:99")
+            b.wait_for("fos> ", 30, mark_bad)
+            check("no NIC in this machine has that MAC address" in b.text()[mark_bad:], "a MAC no NIC has is refused with a clear message", b.text()[mark_bad:])
             a.pump(2.0)
             mark = len(a.text())
             a.process.stdin.write(b"\x1b")

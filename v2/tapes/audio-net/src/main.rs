@@ -2,11 +2,11 @@
 //!
 //! ```text
 //! tape run audio-net                       the settings panel (see panel.rs)
-//! tape run audio-net send [proto=raw|rtp] [nic=N] [to=MAC|IP[:PORT]] [rate=48000] [ch=3-4] [bits=24]
+//! tape run audio-net send [proto=raw|rtp] [nic=N|MAC] [to=MAC|IP[:PORT]] [rate=48000] [ch=3-4] [bits=24]
 //!                         [src=capture|tone=HZ] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP] [pt=96]
 //! tape run audio-net duplex [options of both; in=CH out=CH instead of ch=]
 //! tape run audio-net @audio.cfg [options that override the file]
-//! tape run audio-net recv [proto=raw|rtp] [nic=N] [from=MAC] [port=5004] [chan=N] [ch=1-2] [target=MS]
+//! tape run audio-net recv [proto=raw|rtp] [nic=N|MAC] [from=MAC] [port=5004] [chan=N] [ch=1-2] [target=MS]
 //!                         [group=239.1.2.3] [codec=pcm|opus]
 //!                         [rate=48000] [bits=24] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP]
 //! ```
@@ -124,13 +124,23 @@ pub struct Options<'a> {
     out_channels: Option<ChannelSet>,
 }
 
-fn parse_mac(text: &str) -> Option<[u8; 6]> {
+pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
     let mut mac = [0u8; 6];
     let mut parts = text.split(':');
     for byte in mac.iter_mut() {
         *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
     }
     parts.next().is_none().then_some(mac)
+}
+
+/// The zero-based number of the NIC with this MAC address (NIC numbers change when cards are moved; MACs do not).
+pub fn nic_by_mac(mac: [u8; 6]) -> Option<usize> {
+    let api = tape_rt::api();
+    (0..(api.nic_count)()).find(|&index| {
+        let mut found = [0u8; 6];
+        (api.nic_mac)(index, found.as_mut_ptr());
+        found == mac
+    })
 }
 
 pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'static str> {
@@ -143,7 +153,10 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
             "proto" => options.proto = match value { "raw" => Proto::Raw, "rtp" => Proto::Rtp, "avtp" => Proto::Avtp, _ => return Err("proto= is raw, rtp or avtp") },
-            "nic" => options.nic = value.parse::<usize>().ok().filter(|&n| n >= 1).ok_or("nic=N needs a number from 1")? - 1,
+            "nic" => options.nic = match parse_mac(value) {
+                Some(mac) => nic_by_mac(mac).ok_or("nic=MAC: no NIC in this machine has that MAC address (`nic list` shows them)")?,
+                None => value.parse::<usize>().ok().filter(|&n| n >= 1).ok_or("nic= takes a number from 1 or a MAC address")? - 1,
+            },
             "to" => options.to = value,
             "from" => options.from = Some(parse_mac(value).ok_or("from= takes a MAC address like 00:11:22:33:44:55")?),
             "rate" => options.rate = value.parse().map_err(|_| "rate= needs a number")?,

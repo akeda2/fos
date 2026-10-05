@@ -408,6 +408,10 @@ firmware, so a pending slot is tried on the next boot.
   ch 9-10
   ```
 
+  **Choosing the NIC:** `nic=N` (one-based) or `nic=MAC` (or `nic 00:11:22:33:44:55` in the file) picks the network
+  interface. The panel saves the MAC, so the setting follows the card if the NICs change places; a MAC no NIC has is an
+  error when running, and the panel falls back to NIC 1.
+
   A boot `start` file containing `run audio-net @audio.cfg` brings the stream up with nobody at the machine. The
   tape supervises: unless Escape was pressed (or `secs=` ran out) a run that ends is an error that is retried every
   5 s (the peer is not up yet, the cable was pulled, the device was unplugged), so a headless machine converges on
