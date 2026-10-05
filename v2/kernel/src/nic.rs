@@ -4,10 +4,12 @@
 
 use crate::e1000::{Delivery, E1000};
 use crate::rtl8168::Rtl8168;
+use crate::threecom::ThreeCom;
 
 pub enum Nic {
     E1000(E1000),
     Rtl8168(Rtl8168),
+    ThreeCom(ThreeCom),
 }
 
 impl Nic {
@@ -15,6 +17,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.mac,
             Nic::Rtl8168(nic) => nic.mac,
+            Nic::ThreeCom(nic) => nic.mac,
         }
     }
 
@@ -27,6 +30,7 @@ impl Nic {
                 crate::e1000::Variant::I350 => "i350",
             },
             Nic::Rtl8168(_) => "rtl8168",
+            Nic::ThreeCom(_) => "3c905",
         }
     }
 
@@ -34,6 +38,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.link_up(),
             Nic::Rtl8168(nic) => nic.link_up(),
+            Nic::ThreeCom(nic) => nic.link_up(),
         }
     }
 
@@ -41,6 +46,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.receive(out),
             Nic::Rtl8168(nic) => nic.receive(out),
+            Nic::ThreeCom(nic) => nic.receive(out),
         }
     }
 
@@ -48,6 +54,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.send(frame),
             Nic::Rtl8168(nic) => nic.send(frame),
+            Nic::ThreeCom(nic) => nic.send(frame),
         }
     }
 
@@ -55,6 +62,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.set_promiscuous(on),
             Nic::Rtl8168(nic) => nic.set_promiscuous(on),
+            Nic::ThreeCom(nic) => nic.set_promiscuous(on),
         }
     }
 
@@ -63,6 +71,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.set_multicast(on),
             Nic::Rtl8168(_) => {} // already accepts every multicast frame (its hash filter is all ones)
+            Nic::ThreeCom(nic) => nic.set_multicast(on),
         }
     }
 
@@ -70,6 +79,7 @@ impl Nic {
         match self {
             Nic::E1000(nic) => nic.delivery,
             Nic::Rtl8168(nic) => nic.delivery,
+            Nic::ThreeCom(nic) => nic.delivery,
         }
     }
 
@@ -78,13 +88,16 @@ impl Nic {
         match self {
             Nic::E1000(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
             Nic::Rtl8168(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
+            Nic::ThreeCom(nic) => (nic.frames_received, nic.frames_sent, nic.frames_dropped_no_link),
         }
     }
 
     /// A driver-specific line for `nic` (nothing for the e1000 family, whose counters are shared).
     pub fn describe(&self) {
-        if let Nic::Rtl8168(nic) = self {
-            nic.describe();
+        match self {
+            Nic::Rtl8168(nic) => nic.describe(),
+            Nic::ThreeCom(nic) => nic.describe(),
+            Nic::E1000(_) => {}
         }
     }
 
@@ -92,6 +105,7 @@ impl Nic {
     pub fn dump_registers(&self) {
         match self {
             Nic::Rtl8168(nic) => nic.dump_registers(),
+            Nic::ThreeCom(nic) => nic.dump_registers(),
             Nic::E1000(_) => crate::println!("   (no register dump for this driver)"),
         }
     }

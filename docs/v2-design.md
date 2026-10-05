@@ -530,6 +530,13 @@ firmware, so a pending slot is tried on the next boot.
   carry a full Ethernet frame (it panicked on anything over 1024 bytes). Not done: `chat`, `tape load HOST NAME`,
   `tape send`. Tested (`make test-v2-netfs`): foscopy both ways with a 37-chunk round trip compared byte for byte,
   refusals, and two guests copying to and from each other.
+  **3Com 3C905 driver (`threecom.rs`):** ported from v1 (3C905, 3C905B, 3C905C: `10b7:9050` to `10b7:9200`), I/O-port BAR1 (or
+  BAR0), a 64-descriptor upload ring and one download descriptor, all DMA below 4 GiB, polling with interrupts only to wake
+  the CPU. The v1 hardware lessons are kept and written at the top of the file: every command-register write waits for
+  `CmdInProgress`, the upload engine is un-stalled after the list is posted and after each frame, and an event must be
+  enabled in both the status and interrupt masks to raise INT#. The card has no MSI, so legacy INTx through the I/O APIC is
+  tried (pins probed) and kept only if the card's `RequestInterrupt` self-test arrives. QEMU has no such card, so nothing
+  automated covers it: it needs the real card (a 3C905C-TX is in the Skylake).
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
