@@ -382,6 +382,8 @@ def main():
     config_test()
     peers_test()
     panel_test()
+    layer_2_names_test()
+    layer_2_panel_test()
     duplex_names_test()
     codec_follows_listener_test()
     panel_wait_test()
@@ -609,6 +611,108 @@ def panel_test():
             b.pump(1.5)
             config = b.text()[mark:]
             check("mode send" in config and "ip 192.168.50.1/24" in config and "to fos-1234b1" in config and "src tone" not in config, "the saved cfg holds the settings (and not the test tone)", config)
+        finally:
+            a.stop()
+            b.stop()
+
+
+def layer_2_names_test():
+    """On raw Ethernet and AVTP (no IP) a peer's name stands for its MAC address, found in announcements that travel in
+    plain Ethernet frames: `to=NAME` on a sender, `source=NAME` on a receiver, and `list`."""
+    usb = lambda wav: ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"]
+    for proto in ("raw", "avtp"):
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = Path(tmp) / "l2.wav"
+            rx = Guest(tmp, f"l2-rx-{proto}", "52:54:00:12:34:f2", usb(wav))
+            tx = Guest(tmp, f"l2-tx-{proto}", "52:54:00:12:34:f1")
+            try:
+                for guest in (rx, tx):
+                    guest.wait_for("M3 complete")
+                    guest.wait_for("fos> ")
+                # The sender names its listener.
+                mark_rx = rx.send(f"run audio-net recv proto={proto} name=rx secs=40")
+                rx.wait_for("Listening on NIC 1", 30, mark_rx)
+                rx.pump(3.0)
+                mark_tx = tx.send(f"run audio-net send proto={proto} name=tx to=rx src=tone=440 secs=4")
+                tx.wait_for("Sent ", 60, mark_tx)
+                text = tx.text()[mark_tx:]
+                check("Found 'rx': MAC 52:54:00:12:34:f2" in text, f"{proto}: to=NAME finds the listener's MAC from its announcement", text[-600:])
+                check("Announcing this stream as 'tx' (layer 2" in text, f"{proto}: the sender announces its stream", text[-600:])
+                rx.pump(2.0)
+                check("Locked onto a stream" in rx.text()[mark_rx:], f"{proto}: and the named listener gets the stream", rx.text()[-600:])
+                # `list` shows both, as a table with their MACs.
+                mark_tx = tx.send(f"run audio-net list proto={proto} secs=8")
+                tx.wait_for("Listening for announcements", 30, mark_tx)
+                tx.pump(9.0)
+                listing = tx.text()[mark_tx:]
+                check("rx" in listing and "52:54:00:12:34:f2" in listing and "listens" in listing, f"{proto}: list shows the listener with its MAC", listing[-600:])
+                rx.process.stdin.write(b"\x1b")
+                rx.process.stdin.flush()
+                rx.wait_for("fos> ", 30, mark_rx + len(rx.text()[mark_rx:]) - 10)
+                # The receiver names its sender.
+                mark_tx = tx.send(f"run audio-net send proto={proto} name=tx src=tone=660 secs=25")
+                tx.wait_for("Announcing this stream", 60, mark_tx)
+                mark_rx = rx.send(f"run audio-net recv proto={proto} name=rx source=tx secs=6")
+                rx.wait_for("Found 'tx'", 40, mark_rx)
+                text = rx.text()[mark_rx:]
+                check("Found 'tx': MAC 52:54:00:12:34:f1" in text, f"{proto}: source=NAME finds the sender's MAC", text[-600:])
+                rx.wait_for("Received ", 60, mark_rx)
+                text = rx.text()[mark_rx:]
+                check("Locked onto a stream" in text, f"{proto}: and receives its stream", text[-600:])
+            finally:
+                rx.stop()
+                tx.stop()
+
+
+def layer_2_panel_test():
+    """The panel's peer picker on a layer 2 network: the other machine's panel is open (idle), so it is listed with its MAC
+    and kind of network, picking it fills in the Peer row, and the stream starts with the name resolved to the MAC."""
+    keys = lambda guest, text: (guest.process.stdin.write(text.encode()), guest.process.stdin.flush(), guest.pump(0.4))
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = Path(tmp) / "l2panel.wav"
+        a = Guest(tmp, "l2p-a", "52:54:00:12:34:b1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"])
+        b = Guest(tmp, "l2p-b", "52:54:00:12:34:b2")
+        try:
+            for guest in (a, b):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark_a = a.send("run audio-net")
+            mark_b = b.send("run audio-net")
+            a.wait_for("audio-net: settings", 30, mark_a)
+            b.wait_for("audio-net: settings", 30, mark_b)
+            keys(a, "l")        # Receive
+            keys(a, "jl")       # network: raw Ethernet
+            keys(b, "jl")       # network: raw Ethernet (B sends)
+            check("Raw Ethernet" in a.text()[mark_a:] and "Raw Ethernet" in b.text()[mark_b:], "both panels are on the raw Ethernet network", b.text()[-500:])
+            keys(b, "p")
+            end = time.monotonic() + 25
+            while "fos-1234b1" not in b.text()[mark_b:].split("machines on the network")[-1] and time.monotonic() < end:
+                b.pump(0.5)
+            picker = b.text()[mark_b:].split("machines on the network")[-1]
+            check("fos-1234b1" in picker and "layer 2" in picker and "52:54:00:12:34:b1" in picker and "idle" in picker, "the picker lists the other machine by name with its MAC, on the layer 2 network", picker[:600])
+            keys(b, "1")
+            check("> Peer" in b.text()[-900:] or "fos-1234b1" in b.text()[-900:], "choosing it fills in the Peer row", b.text()[-900:])
+            keys(a, "s")
+            a.pump(3.0)
+            keys(b, "s")
+            a.pump(6.0)
+            b.pump(2.0)
+            text_a, text_b = a.text()[mark_a:], b.text()[mark_b:]
+            sent = [int(part.split(" ")[0]) for part in text_b.split("Tx ")[1:] if part.split(" ")[0].isdigit()]
+            received = [int(part.split(" ")[0]) for part in text_a.split("Rx ")[1:] if part.split(" ")[0].isdigit()]
+            check(sent and max(sent) >= 1000 and received and max(received) >= 500, f"the stream started by name runs (Tx {max(sent) if sent else 0}, Rx {max(received) if received else 0})", text_b[-500:] + text_a[-500:])
+            for guest in (b, a):
+                guest.process.stdin.write(b"\x1b")
+                guest.process.stdin.flush()
+                guest.pump(1.5)
+                keys(guest, " ")
+            keys(b, "w")
+            keys(b, "q")
+            b.wait_for("fos> ", 30)
+            mark = b.send("cat audio.cfg")
+            b.pump(1.5)
+            config = b.text()[mark:]
+            check("proto raw" in config and "to fos-1234b1" in config, "the saved cfg holds the raw network and the peer's name", config)
         finally:
             a.stop()
             b.stop()

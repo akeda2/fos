@@ -15,6 +15,9 @@
 pub mod ogg;
 
 pub const ETHERTYPE: u16 = 0x88ba;
+/// Announcements of machines on a layer 2 network (raw Ethernet or AVTP, no IP): the same SAP packets as on the
+/// IP network, carried straight in Ethernet frames to the broadcast address, so that a name can stand for a MAC.
+pub const ANNOUNCE_ETHERTYPE: u16 = 0x88bb;
 pub const HEADER_LEN: usize = 18;
 pub const ETHERNET_HEADER: usize = 14;
 /// Payload bytes a raw frame may carry: a 1500-byte Ethernet payload minus our header.
@@ -755,6 +758,8 @@ pub mod sap {
         pub receive_only: bool,
         /// The announcer is only present, not streaming.
         pub idle: bool,
+        /// A layer 2 announcement (`a=x-fos-l2:raw` or `avtp`): 0 for an IP one, 1 raw Ethernet, 2 AVTP.
+        pub l2: u8,
     }
 
     impl Session {
@@ -776,7 +781,7 @@ pub mod sap {
     /// connection address, the name, and the first `rtpmap` for the codec.
     pub fn parse_sdp(sdp: &[u8]) -> Option<Session> {
         let text = core::str::from_utf8(sdp).ok()?;
-        let mut session = Session { name: [0; MAX_NAME], name_length: 0, session: 0, origin: [0; 4], destination: [0; 4], port: 0, payload_type: 0, codec: Codec::L24, rate: 48_000, channels: 0, packet_us: 1000, receive_only: false, idle: false };
+        let mut session = Session { name: [0; MAX_NAME], name_length: 0, session: 0, origin: [0; 4], destination: [0; 4], port: 0, payload_type: 0, codec: Codec::L24, rate: 48_000, channels: 0, packet_us: 1000, receive_only: false, idle: false, l2: 0 };
         let (mut have_media, mut have_codec, mut media_lines, mut last_mono) = (false, false, 0usize, false);
         for line in text.lines() {
             let line = line.trim_end();
@@ -844,6 +849,8 @@ pub mod sap {
                         session.packet_us = micros;
                     } else if value == "x-fos-idle" {
                         session.idle = true;
+                    } else if let Some(kind) = value.strip_prefix("x-fos-l2:") {
+                        session.l2 = if kind == "avtp" { 2 } else { 1 };
                     } else if value == "recvonly" {
                         session.receive_only = true;
                     }
@@ -1234,5 +1241,21 @@ mod tests {
         }
         let fallen = -120 - meter::db_tenths(ppm.level);
         assert!((140..=260).contains(&fallen), "{fallen}"); // about 20 dB in 1.7 s at 96 kHz too
+    }
+
+    #[test]
+    fn layer_2_announcement_parses() {
+        let mut text = [0u8; 600];
+        let length = write_sdp(&Sdp { name: "rx", receive_only: true, idle: true, origin: [0; 4], destination: [0; 4], port: 0, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [2, 0, 0, 0, 0, 1], session: 7 }, &mut text);
+        let mut sdp = text[..length].to_vec();
+        sdp.extend_from_slice(b"a=x-fos-l2:avtp\r\n");
+        let session = sap::parse_sdp(&sdp).unwrap();
+        assert_eq!((session.name(), session.receive_only, session.idle, session.l2, session.channels), ("rx", true, true, 2, 2));
+        // An IP announcement has no marker.
+        assert_eq!(sap::parse_sdp(&text[..length]).unwrap().l2, 0);
+        // The announcement travels as a SAP packet in an Ethernet payload.
+        let mut packet = [0u8; 700];
+        let size = sap::encode([0; 4], false, 5, &sdp, &mut packet);
+        assert_eq!(sap::parse(&packet[..size]).unwrap().sdp, &sdp[..]);
     }
 }

@@ -84,6 +84,8 @@ const AVTP_DEFAULT_MAC: [u8; 6] = [0x91, 0xe0, 0xf0, 0x00, 0xfe, 0x01];
 #[derive(Clone)]
 pub struct Options<'a> {
     proto: Proto,
+    /// `proto=` was given (so `source=NAME` and `to=NAME` stay on that network instead of implying RTP).
+    proto_explicit: bool,
     nic: usize,
     to: &'a str,
     rate: u32,
@@ -152,20 +154,23 @@ pub fn nic_by_mac(mac: [u8; 6]) -> Option<usize> {
 
 pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'static str> {
     let mut options = Options {
-        proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
+        proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
         opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
-            "proto" => options.proto = match value { "raw" => Proto::Raw, "rtp" => Proto::Rtp, "avtp" => Proto::Avtp, _ => return Err("proto= is raw, rtp or avtp") },
+            "proto" => {
+                options.proto = match value { "raw" => Proto::Raw, "rtp" => Proto::Rtp, "avtp" => Proto::Avtp, _ => return Err("proto= is raw, rtp or avtp") };
+                options.proto_explicit = true;
+            }
             "nic" => options.nic = match parse_mac(value) {
                 Some(mac) => nic_by_mac(mac).ok_or("nic=MAC: no NIC in this machine has that MAC address (`nic list` shows them)")?,
                 None => value.parse::<usize>().ok().filter(|&n| n >= 1).ok_or("nic= takes a number from 1 or a MAC address")? - 1,
             },
             "to" => options.to = value,
-            "from" => options.from = Some(parse_mac(value).ok_or("from= takes a MAC address like 00:11:22:33:44:55")?),
+            "from" => options.from = Some(parse_mac(value).ok_or("from= takes a MAC address like 00:11:22:33:44:55 (a machine's name goes in source=NAME)")?),
             "rate" => options.rate = value.parse().map_err(|_| "rate= needs a number")?,
             "ch" => options.channels = Some(ChannelSet::parse(value).ok_or("ch= is like 1-2 or 9-10,1 (channels 1 to 32)")?),
             "chan" => options.chan = value.parse().ok().filter(|&n| (1..=audio_wire::MAX_CHANNELS).contains(&n)).ok_or("chan= is 1 to 32")?,
@@ -295,6 +300,12 @@ impl Transport {
         Transport { proto: Proto::Rtp, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() }
     }
 
+    /// A transport on a layer 2 network with nothing printed (the panel's presence announcements).
+    pub fn from_l2(options: &Options, mac: [u8; 6]) -> Transport {
+        let config = NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) };
+        Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() }
+    }
+
     /// `group=`: joins the multicast group on the receive NIC. False (after a message) if it cannot.
     pub fn join_group(&mut self, api: &TapeApi, options: &Options) -> bool {
         if options.proto == Proto::Avtp {
@@ -335,12 +346,15 @@ impl Transport {
 
     /// A receiver announces where and how it listens (RTP only).
     pub fn announce_receiver(&mut self, options: &Options) {
-        if options.proto != Proto::Rtp {
-            return;
-        }
         let mut buffer = [0u8; audio_wire::sap::MAX_NAME];
         let name = peers::session_name(options.name, self.mac, &mut buffer);
         let mut text = [0u8; 900];
+        if options.proto != Proto::Rtp {
+            // Layer 2: the same announcement in an Ethernet frame (see peers.rs).
+            let length = peers::l2_sdp(options, self.mac, name, true, false, options.chan, &mut text);
+            self.announcer.start(&text[..length]);
+            return;
+        }
         let length = peers::receiver_sdp(options, &self.config, name, false, &mut text);
         self.announcer.start(&text[..length]);
     }
@@ -446,6 +460,15 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         println!("{}", core::str::from_utf8(&text[..length]).unwrap_or(""));
         transport.announcer.start(&text[..length]);
         println!("Announcing this stream as '{name}' (SAP, every 5 s).");
+    }
+    if let Destination::Raw(_) = destination {
+        // Layer 2: announce what is sent, so that a receiver can pick this machine by name.
+        let mut text = [0u8; 600];
+        let mut name_buffer = [0u8; audio_wire::sap::MAX_NAME];
+        let name = peers::session_name(options.name, transport.mac, &mut name_buffer);
+        let length = peers::l2_sdp(options, transport.mac, name, false, false, channels, &mut text);
+        transport.announcer.start(&text[..length]);
+        println!("Announcing this stream as '{name}' (layer 2, every 5 s).");
     }
     duplex::go();
     let mut frame = [0u8; 1514];
@@ -978,14 +1001,18 @@ fn collect(api: &TapeApi, arguments: &'static str) -> Result<([&'static str; MAX
 /// Turns `source=NAME` and a `to=NAME` that is not an address into the stream's parameters. False if a name could not
 /// be found (or Escape was pressed while looking).
 pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'static>) -> bool {
+    // With `proto=raw|avtp` given, names are looked up in layer 2 announcements; otherwise a name means RTP.
+    let layer_2 = options.proto_explicit && options.proto != Proto::Rtp;
     let wants_source = !options.source.is_empty() && mode == "recv";
     let to_name = !options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none();
-    let wants_listener = to_name && matches!(mode, "send" | "duplex") && options.proto == Proto::Rtp;
+    let wants_listener = to_name && matches!(mode, "send" | "duplex") && (options.proto == Proto::Rtp || layer_2);
     let announces_listening = matches!(mode, "recv" | "duplex") && (!options.source.is_empty() || wants_listener);
     if !wants_source && !wants_listener {
         return true;
     }
-    options.proto = Proto::Rtp;
+    if !layer_2 {
+        options.proto = Proto::Rtp;
+    }
     let Some(mut transport) = Transport::open(api, options) else { return false };
     // Be findable while looking: a peer that sends to our name needs our listening address before it can start,
     // and it may be waiting for the same of us. (A duplex machine looks up its `source=` later, while it sends.)
@@ -994,11 +1021,17 @@ pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'s
     }
     if wants_listener {
         let Some(entry) = peers::find(api, options, &mut transport, options.to, true) else { return false };
-        peers::adopt_listener(options, &entry);
+        if layer_2 {
+            peers::adopt_listener_l2(options, &entry);
+        } else {
+            peers::adopt_listener(options, &entry);
+        }
     }
     if wants_source {
         let Some(entry) = peers::find(api, options, &mut transport, options.source, false) else { return false };
-        if let Err(reason) = peers::adopt_sender(options, &entry, transport.config.ip.0) {
+        if layer_2 {
+            peers::adopt_sender_l2(options, &entry);
+        } else if let Err(reason) = peers::adopt_sender(options, &entry, transport.config.ip.0) {
             println!("audio-net: '{}': {reason}.", options.source);
             return false;
         }
@@ -1009,11 +1042,16 @@ pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'s
 /// `source=NAME` for the receiving half of a duplex run: looked up while the sending half is already streaming (the
 /// peer's receiver may need our stream to exist before it announces the stream we are looking for).
 pub fn resolve_source(api: &'static TapeApi, options: &mut Options<'static>) -> bool {
-    options.proto = Proto::Rtp;
+    let layer_2 = options.proto_explicit && options.proto != Proto::Rtp;
+    if !layer_2 {
+        options.proto = Proto::Rtp;
+    }
     let Some(mut transport) = Transport::open(api, options) else { return false };
     transport.announce_receiver(options);
     let Some(entry) = peers::find(api, options, &mut transport, options.source, false) else { return false };
-    if let Err(reason) = peers::adopt_sender(options, &entry, transport.config.ip.0) {
+    if layer_2 {
+        peers::adopt_sender_l2(options, &entry);
+    } else if let Err(reason) = peers::adopt_sender(options, &entry, transport.config.ip.0) {
         println!("audio-net: '{}': {reason}.", options.source);
         return false;
     }
@@ -1072,7 +1110,9 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
         return println!("audio-net: codec=opus needs proto=rtp.");
     }
     if mode == "list" {
-        options.proto = Proto::Rtp;
+        if !(options.proto_explicit && options.proto != Proto::Rtp) {
+            options.proto = Proto::Rtp;
+        }
         return peers::list(abort::wrap(real), &options);
     }
     let by_name = !options.source.is_empty() || (!options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none());

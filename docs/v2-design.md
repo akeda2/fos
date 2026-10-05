@@ -434,6 +434,13 @@ firmware, so a pending slot is tried on the next boot.
   such device here). Raw Ethernet and AVTP have no IP and are not announced. QEMU test: list, `source=`, `to=` and the
   withdrawal; hardware: the Skylake's 'h6' listed on the Sandy Bridge, which received it by name with no other
   parameters, and the Skylake's list showed the Sandy Bridge as a listener.
+  **Names on layer 2 (raw Ethernet and AVTP):** the same announcements work without IP. They travel as the same SAP packets
+  (an SDP with `a=x-fos-l2:raw|avtp`) straight in Ethernet frames of ethertype `0x88bb` to the broadcast address, every 5 s, and a
+  name then stands for the MAC the frame came from. With `proto=raw|avtp` given, `to=NAME` (a sender), `source=NAME` (a receiver)
+  and `audio-net list` look names up there, a sender and a receiver announce themselves while they run, and the panel's presence and
+  `P` picker work on those networks (the list shows the MAC and the kind of network instead of an IP address). A typed MAC address still
+  works: `to=MAC`, `from=MAC` (`from=` takes only a MAC; a name goes in `source=`). Without `proto=`, a name still implies RTP. Test:
+  `layer_2_names_test` and `layer_2_panel_test` in `test_audio_net.py`.
   **The settings panel:** `tape run audio-net` with no arguments shows a full-screen form (mode: send, receive or
   duplex; network: RTP over IP, raw Ethernet or AVTP; NIC with its MAC; IP address or `dhcp`, gateway, peer, codec
   preset, send and receive channels, name, multicast group) and the bandwidth the choice needs. Codecs are presets:

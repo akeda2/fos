@@ -224,7 +224,9 @@ impl Settings {
                 let _ = writeln!(out, "to {peer}");
             }
             if self.mode != 0 {
-                let _ = writeln!(out, "{} {peer}", if self.rtp() { "source" } else { "from" });
+                // A name is looked up in the announcements (`source`); on a layer 2 network a typed MAC address is `from`.
+                let is_mac = !self.rtp() && crate::parse_mac(peer).is_some();
+                let _ = writeln!(out, "{} {peer}", if is_mac { "from" } else { "source" });
             }
         }
         match self.codec {
@@ -1138,7 +1140,9 @@ impl Presence {
         let api = tape_rt::api();
         if let Some(mut transport) = self.transport.take() {
             transport.announce_stop(api, transport_nic(&transport));
-            self.igmp.leave(api, NIC_IN_USE.get(), &transport.config);
+            if transport.config.ip.0 != [0; 4] {
+                self.igmp.leave(api, NIC_IN_USE.get(), &transport.config);
+            }
         }
         if forget_address {
             crate::forget_config();
@@ -1170,7 +1174,25 @@ impl Presence {
             return;
         }
         if !settings.rtp() {
-            self.status = Text::from("Finding peers needs the RTP network (the announcements travel over IP).");
+            // Raw Ethernet and AVTP: no address to get, the announcements are plain Ethernet frames (peers.rs).
+            match &self.link {
+                Link::Off => {
+                    if now < self.start_at {
+                        self.status = Text::from("Starting to look for other machines...");
+                        return;
+                    }
+                    let Ok((_, options)) = build(settings) else {
+                        self.status = Text::from("Fix the settings above to find peers.");
+                        return;
+                    };
+                    NIC_IN_USE.set(options.nic);
+                    let mut mac = [0u8; 6];
+                    (api.nic_mac)(options.nic, mac.as_mut_ptr());
+                    self.bring_up_l2(settings, &options, mac);
+                }
+                Link::Up => self.poll(settings),
+                _ => self.link = Link::Off,
+            }
             return;
         }
         match &mut self.link {
@@ -1236,7 +1258,44 @@ impl Presence {
         self.link = Link::Up;
     }
 
+    /// The presence on a layer 2 network: announce that this machine is here, and what it would listen for.
+    fn bring_up_l2(&mut self, settings: &Settings, options: &Options<'static>, mac: [u8; 6]) {
+        let mut transport = Transport::from_l2(options, mac);
+        let mut buffer = [0u8; sap::MAX_NAME];
+        let name = peers::session_name(settings.name.as_str(), mac, &mut buffer);
+        let mut text = [0u8; 900];
+        let length = peers::l2_sdp(options, mac, name, true, true, options.chan, &mut text);
+        transport.announcer.start(&text[..length]);
+        self.transport = Some(transport);
+        self.link = Link::Up;
+    }
+
+    /// One pass of the layer 2 presence: announce when due, read the announcements waiting.
+    fn poll_l2(&mut self, settings: &Settings) {
+        let api = tape_rt::api();
+        let nic = NIC_IN_USE.get();
+        let Some(transport) = self.transport.as_mut() else { return };
+        transport.announce_service(api, nic);
+        let mut frame = [0u8; 1514];
+        for _ in 0..8 {
+            let length = (api.nic_receive)(nic, frame.as_mut_ptr(), frame.len());
+            if length == 0 {
+                break;
+            }
+            peers::l2_announcement(&frame[..length], transport.mac, &mut self.directory);
+        }
+        let mac = transport.mac;
+        self.directory.expire(PRESENCE_EXPIRY);
+        let mut status = Text::<100>::new();
+        let others = self.machines();
+        let _ = write!(status, "Announcing as {} (layer 2, MAC {})   {} other machine{} seen", effective_name(settings).as_str(), MacText(mac), others, if others == 1 { "" } else { "s" });
+        self.status = status;
+    }
+
     fn poll(&mut self, settings: &Settings) {
+        if self.transport.as_ref().is_some_and(|transport| transport.config.ip.0 == [0; 4]) {
+            return self.poll_l2(settings);
+        }
         let api = tape_rt::api();
         let nic = NIC_IN_USE.get();
         let Some(transport) = self.transport.as_mut() else { return };
@@ -1305,17 +1364,19 @@ struct Machine {
     listens: bool,
     idle: bool,
     channels: usize,
+    /// 0 on an IP network, else 1 raw Ethernet or 2 AVTP (the kind of layer 2 network it announced on).
+    l2: u8,
 }
 
 fn machines(presence: &Presence) -> ([Machine; 9], usize) {
-    let blank = Machine { name: Text::new(), ip: [0; 4], mac: [0; 6], sends: false, listens: false, idle: false, channels: 0 };
+    let blank = Machine { name: Text::new(), ip: [0; 4], mac: [0; 6], sends: false, listens: false, idle: false, channels: 0, l2: 0 };
     let mut rows = [blank; 9];
     let mut count = 0;
     for entry in presence.directory.iter() {
         let name = Text::<24>::from(entry.session.name());
         let at = rows[..count].iter().position(|row| row.name == name && row.ip == entry.from_ip).or_else(|| {
             if count < 9 {
-                rows[count] = Machine { name, ip: entry.from_ip, mac: entry.from_mac, ..blank };
+                rows[count] = Machine { name, ip: entry.from_ip, mac: entry.from_mac, l2: entry.session.l2, ..blank };
                 count += 1;
                 Some(count - 1)
             } else {
@@ -1338,9 +1399,6 @@ fn machines(presence: &Presence) -> ([Machine; 9], usize) {
 
 /// P: the machines announced on the network (live, from the presence), picked by number.
 fn pick_peer(settings: &mut Settings, presence: &mut Presence) -> &'static str {
-    if !settings.rtp() {
-        return "Finding peers works over IP: set the network to RTP first.";
-    }
     let mut decoder = KeyDecoder::new();
     let mut shown: Option<(usize, usize)> = None;
     draw!("\x1b[2J");
@@ -1358,13 +1416,17 @@ fn pick_peer(settings: &mut Settings, presence: &mut Presence) -> &'static str {
             for (index, row) in rows[..count].iter().enumerate() {
                 let state = if row.sends && row.listens && !row.idle { "sending and listening" } else if row.sends { "sending" } else if row.idle { "idle" } else { "listening" };
                 at(4 + index, 1);
-                draw!(" {}  {:<24} {}.{}.{}.{} {}  {}\x1b[K", index + 1, row.name.as_str(), row.ip[0], row.ip[1], row.ip[2], row.ip[3], MacText(row.mac), state);
+                if row.l2 != 0 {
+                    draw!(" {}  {:<24} {:<15} {}  {} ({})\x1b[K", index + 1, row.name.as_str(), "layer 2", MacText(row.mac), state, if row.l2 == 2 { "AVTP" } else { "raw" });
+                } else {
+                    draw!(" {}  {:<24} {}.{}.{}.{} {}  {}\x1b[K", index + 1, row.name.as_str(), row.ip[0], row.ip[1], row.ip[2], row.ip[3], MacText(row.mac), state);
+                }
             }
             if count == 0 {
                 at(4, 1);
                 draw!(" No other machine heard yet. Other machines show up here while their panel is open or while they stream");
                 at(5, 1);
-                draw!(" over RTP, on the same switch or network. Give it a few seconds; this list updates by itself.");
+                draw!(" on the same kind of network (RTP, or raw Ethernet / AVTP on the same switch). It updates by itself.");
             }
             at(15, 1);
             draw!(" Press a number to choose a peer, any other key to go back.");
