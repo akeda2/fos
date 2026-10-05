@@ -5,6 +5,8 @@
 //! tape run audio-net send [proto=raw|rtp] [nic=N|MAC] [to=MAC|IP[:PORT]] [rate=48000] [ch=3-4] [bits=24]
 //!                         [src=capture|tone=HZ] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP] [pt=96]
 //! tape run audio-net duplex [options of both; in=CH out=CH instead of ch=]
+//! tape run audio-net serve [http=8000] [ch=1-2] [src=capture|tone=HZ] [bitrate=KBIT] [frame=20] [ip=A.B.C.D/N|dhcp]
+//!                          [secs=N]        Ogg Opus over HTTP, for a browser or VLC (see serve.rs)
 //! tape run audio-net @audio.cfg [options that override the file]
 //! tape run audio-net recv [proto=raw|rtp] [nic=N|MAC] [from=MAC] [port=5004] [chan=N] [ch=1-2] [target=MS]
 //!                         [group=239.1.2.3] [codec=pcm|opus]
@@ -56,6 +58,7 @@ mod net;
 mod panel;
 mod stats;
 mod peers;
+mod serve;
 mod opus;
 
 use audio_wire::{ChannelSet, ETHERNET_HEADER, ETHERTYPE, Fill, HEADER_LEN, Header, MAX_RAW_PAYLOAD, MAX_RTP_PAYLOAD, Resampler, Sdp, Servo, Slip, frames_per_packet, frames_to_device, pack, unpack, wire_to_frames, write_sdp};
@@ -122,6 +125,8 @@ pub struct Options<'a> {
     /// `duplex`: the device input channels to send (`in=`) and the output channels to play on (`out=`).
     in_channels: Option<ChannelSet>,
     out_channels: Option<ChannelSet>,
+    /// `serve`: the TCP port of the HTTP server.
+    http: u16,
 }
 
 pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -147,7 +152,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -187,6 +192,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "bitrate" => options.bitrate = value.parse::<u32>().ok().filter(|&b| (6..=512).contains(&b)).ok_or("bitrate= is kbit/s per stereo pair, 6 to 512")? * 1000,
             "frame" => options.frame_x10 = match value.split_once('.') { Some((whole, tenth)) => whole.parse::<u32>().ok().zip(tenth.parse::<u32>().ok()).map(|(w, t)| w * 10 + t), None => value.parse::<u32>().ok().map(|w| w * 10) }.ok_or("frame= is milliseconds")?,
             "complexity" => options.complexity = value.parse().ok().filter(|&c| c <= 10).ok_or("complexity= is 0 to 10")?,
+            "http" => options.http = value.parse().ok().filter(|&p| p != 0).ok_or("http= is a TCP port, 1 to 65535")?,
             "verbose" => options.verbose = true,
             _ => return Err("unknown option"),
         }
@@ -1014,6 +1020,7 @@ pub fn resolve_source(api: &'static TapeApi, options: &mut Options<'static>) -> 
 pub fn run_once(api: &'static TapeApi, mode: &str, options: &Options<'static>) {
     match mode {
         "duplex" => duplex::run(api, options),
+        "serve" => serve::serve(api, options),
         "send" if options.opus => opus::send(api, options),
         "recv" if options.opus => opus::receive(api, options),
         "send" => send(api, options),
@@ -1038,7 +1045,7 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
     let mut kept = 0;
     for &word in &words[..count] {
         match word.strip_prefix("mode=").unwrap_or(word) {
-            "send" | "recv" | "duplex" | "list" => mode = word.strip_prefix("mode=").unwrap_or(word),
+            "send" | "recv" | "duplex" | "list" | "serve" => mode = word.strip_prefix("mode=").unwrap_or(word),
             _ => {
                 options_words[kept] = word;
                 kept += 1;
@@ -1046,7 +1053,7 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
         }
     }
     if mode.is_empty() {
-        return println!("Usage: tape run audio-net send|recv|duplex|list [options]   or   tape run audio-net @audio.cfg [options]\n(see the header of v2/tapes/audio-net/src/main.rs, or docs/v2-design.md, for the options and the file format)");
+        return println!("Usage: tape run audio-net send|recv|duplex|serve|list [options]   or   tape run audio-net @audio.cfg [options]\n(see the header of v2/tapes/audio-net/src/main.rs, or docs/v2-design.md, for the options and the file format)");
     }
     let mut options: Options<'static> = match parse(options_words[..kept].iter().copied()) {
         Ok(options) => options,
@@ -1054,6 +1061,9 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
     };
     if (real.nic_count)() <= options.nic {
         return println!("audio-net: this machine has no NIC {}.", options.nic + 1);
+    }
+    if mode == "serve" {
+        options.proto = Proto::Rtp; // HTTP needs an IP address (ip=A.B.C.D/N or ip=dhcp)
     }
     if options.opus && options.proto != Proto::Rtp {
         return println!("audio-net: codec=opus needs proto=rtp.");

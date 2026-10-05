@@ -474,6 +474,16 @@ firmware, so a pending slot is tried on the next boot.
   the one-based NIC number (`myhost1`), or `fos2`, the same name discovery announces, so the DHCP/DNS server knows the
   machine by name. The tape reads it through the `hostname(nic, buf, cap)` call at the end of `TapeApi`;
   `tape-net`'s `DhcpClient::set_host_name` adds the option (v1 tapes using the client send none until they call it).
+  **`audio-net serve` (Ogg Opus over HTTP):** a test aid for listening from a browser or VLC (a phone, say) when an RTP
+  receiver is out of reach. `serve` takes the same source (`src=capture` or `tone=`), `ch=` (at most two channels),
+  `bitrate=` and `frame=` as an Opus `send`, takes an address like RTP (`ip=` or `ip=dhcp`) and listens on `http=PORT`
+  (default 8000): `GET /live.opus` is an endless `audio/ogg` response with one Opus packet per Ogg page (RFC 7845; the
+  muxer is `audio_wire::ogg`, host-tested), `GET /` a page with an `<audio>` player, anything else a 404. The machine
+  answers ARP and ping. The TCP is `tape-net`'s (one connection, one segment in flight), so the throughput is one segment
+  per round trip; audio waits in a 12 KiB queue and a page that finds it full is dropped (the player conceals it) rather
+  than letting the delay grow, and a client that stops acknowledging for 10 s is dropped. Safari plays Ogg Opus only in
+  recent versions; VLC does. Test: `make test-v2-audio-serve` (QEMU user networking with a forwarded port; checks every
+  page's CRC, the headers, the granule positions, `ffprobe`, and that `ffmpeg` decodes 440 Hz).
   **Real PPM meters:** the live view shows one horizontal meter per channel (labelled with the device input or output
   it is), one cell per dB from -60 dBFS to full scale, on the Nordic scale (IEC 60268-10 type I: TEST = 0 at -18 dBFS,
   maximum permitted level +9 at -9 dBFS, digital full scale at +18) with a number per channel to a tenth of a dB, a

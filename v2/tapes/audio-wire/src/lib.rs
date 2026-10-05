@@ -12,6 +12,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod ogg;
+
 pub const ETHERTYPE: u16 = 0x88ba;
 pub const HEADER_LEN: usize = 18;
 pub const ETHERNET_HEADER: usize = 14;

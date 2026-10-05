@@ -262,3 +262,10 @@ pub fn dhcp(api: &TapeApi, nic: usize, mac: MacAddress) -> Option<NetConfig> {
         }
     }
 }
+
+/// Builds Ethernet + IPv4 around `payload` (protocol `protocol`: 1 ICMP, 6 TCP) into `out`; returns the frame's length.
+pub fn build_ip_frame(out: &mut [u8], config: &NetConfig, destination_mac: MacAddress, destination_ip: Ipv4Address, protocol: u8, payload: &[u8]) -> Option<usize> {
+    let mut ip_bytes = [0u8; MAX_FRAME];
+    let ip_len = Ipv4Packet { header: Ipv4Header::new(config.ip, destination_ip, protocol, payload.len()), payload }.encode(&mut ip_bytes).ok()?;
+    EthernetFrame::new(destination_mac, config.mac, ETHERTYPE_IPV4, &ip_bytes[..ip_len]).encode(out).ok()
+}
