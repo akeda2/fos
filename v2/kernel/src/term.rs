@@ -1431,6 +1431,26 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
     use crate::usb_audio as ua;
     match words.next() {
         None => ua::status(),
+        Some("modes") => ua::print_modes(),
+        Some("use") => {
+            let capture = match words.next() {
+                Some("capture") => true,
+                Some("playback") => false,
+                _ => return crate::println!("Usage: audio use capture|playback N|auto   (`audio modes` lists the numbers)"),
+            };
+            let mode = match words.next() {
+                Some("auto") | Some("0") => 0,
+                Some(word) => match word.parse::<u32>() {
+                    Ok(number) => number,
+                    Err(_) => return crate::println!("Usage: audio use capture|playback N|auto"),
+                },
+                None => return crate::println!("Usage: audio use capture|playback N|auto"),
+            };
+            match ua::select(capture, mode) {
+                Ok(()) => crate::println!("{} mode: {}.", if capture { "Capture" } else { "Playback" }, if mode == 0 { "automatic" } else { "picked (`audio modes` shows which)" }),
+                Err(reason) => crate::println!("audio: {reason}."),
+            }
+        }
         Some("stop") => {
             if let Some(controller) = ua::controller() {
                 ua::stop(controller);
@@ -1572,7 +1592,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             ua::status();
             ua::stop(controller);
         }
-        Some(_) => crate::println!("Usage: audio | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
+        Some(_) => crate::println!("Usage: audio | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
     }
 }
 

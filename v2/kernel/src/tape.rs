@@ -290,6 +290,13 @@ extern "C" fn api_audio_info(out: *mut fos_v2_abi::tape::AudioInfo) -> u32 {
 extern "C" fn api_audio_start(rate: u32, capture: u32, playback: u32) -> i32 {
     crate::usb_audio::start_for_tape(rate, capture != 0, playback != 0)
 }
+extern "C" fn api_audio_select(direction: u32, mode: u32) -> i32 {
+    match crate::usb_audio::select(direction == 0, mode) {
+        Ok(()) => 0,
+        Err("no USB audio device") => fos_v2_abi::tape::AUDIO_NO_DEVICE,
+        Err(_) => fos_v2_abi::tape::AUDIO_FAILED,
+    }
+}
 extern "C" fn api_audio_stop() {
     crate::usb_audio::stop_for_tape();
 }
@@ -356,6 +363,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         fs_stream_write: api_fs_stream_write,
         fs_stream_close: api_fs_stream_close,
         puts: api_puts,
+        audio_select: api_audio_select,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

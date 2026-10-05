@@ -435,8 +435,98 @@ pub fn present() -> bool {
 }
 
 /// The device's alternate setting for a direction, if it has one.
-fn find_alt(description: &Description, capture: bool) -> Option<StreamAlt> {
-    description.alts[..description.alt_count].iter().copied().find(|alt| (alt.endpoint & 0x80 != 0) == capture)
+/// The mode (alternate setting, by index into the description) the user picked for capture and for playback; None picks
+/// automatically. Set by `select`.
+static mut SELECTED: [Option<usize>; 2] = [None, None];
+
+fn direction(capture: bool) -> usize {
+    usize::from(!capture)
+}
+
+/// The alternate settings that carry audio in one direction, in the device's order: these are the "modes" a user picks from.
+fn modes(description: &Description, capture: bool) -> impl Iterator<Item = (usize, &StreamAlt)> {
+    description.alts[..description.alt_count].iter().enumerate().filter(move |(_, alt)| (alt.endpoint & 0x80 != 0) == capture)
+}
+
+/// Whether a mode can run at `rate`. Class 1.0 lists its rates per mode (a PCM2902 records mono and stereo at several rates
+/// but plays at three); class 2.0 has one clock for the whole device.
+fn offers(device_rates: &[u32], class_version: u8, alt: &StreamAlt, rate: u32) -> bool {
+    if class_version == 2 || (alt.rate_count == 0 && alt.continuous_range == (0, 0)) {
+        return device_rates.is_empty() || device_rates.contains(&rate);
+    }
+    if alt.rate_count > 0 { alt.rates[..alt.rate_count].contains(&rate) } else { rate >= alt.continuous_range.0 && rate <= alt.continuous_range.1 }
+}
+
+/// The mode to start at `rate`: the one the user picked (it must offer the rate), else the best that does: most channels,
+/// then most bits.
+fn choose_alt(device: &AudioDevice, capture: bool, rate: u32) -> Result<StreamAlt, &'static str> {
+    let rates = &device.rates[..device.rate_count];
+    let class = device.description.class_version;
+    if let Some(index) = unsafe { (*core::ptr::addr_of!(SELECTED))[direction(capture)] } {
+        let alt = device.description.alts[index];
+        return if offers(rates, class, &alt, rate) { Ok(alt) } else { Err("the chosen mode does not offer that sample rate (`audio modes` lists what each offers)") };
+    }
+    if modes(&device.description, capture).next().is_none() {
+        return Err(if capture { "the device has no capture stream" } else { "the device has no playback stream" });
+    }
+    modes(&device.description, capture)
+        .filter(|(_, alt)| offers(rates, class, alt, rate))
+        .max_by_key(|(_, alt)| (alt.channels, alt.bits))
+        .map(|(_, alt)| *alt)
+        .ok_or(if capture { "no capture mode of the device offers that sample rate" } else { "no playback mode of the device offers that sample rate" })
+}
+
+/// The mode a tape sees before it has started anything: the picked one, else the best at 48 kHz (or at any rate).
+fn default_alt(device: &AudioDevice, capture: bool) -> Option<StreamAlt> {
+    let rates = &device.rates[..device.rate_count];
+    let class = device.description.class_version;
+    if let Some(index) = unsafe { (*core::ptr::addr_of!(SELECTED))[direction(capture)] } {
+        return Some(device.description.alts[index]);
+    }
+    modes(&device.description, capture).max_by_key(|(_, alt)| (offers(rates, class, alt, 48_000), alt.channels, alt.bits)).map(|(_, alt)| *alt)
+}
+
+/// `mode` is the 1-based number `audio modes` shows for that direction; 0 means automatic. It applies to the next start (a
+/// running stream keeps its mode).
+pub fn select(capture: bool, mode: u32) -> Result<(), &'static str> {
+    let device = audio().ok_or("no USB audio device")?;
+    let index = if mode == 0 {
+        None
+    } else {
+        Some(modes(&device.description, capture).nth(mode as usize - 1).map(|(index, _)| index).ok_or("no such mode (`audio modes` lists them)")?)
+    };
+    unsafe { (*core::ptr::addr_of_mut!(SELECTED))[direction(capture)] = index };
+    Ok(())
+}
+
+/// `audio modes`: what the device offers in each direction, numbered, with the picked one marked.
+pub fn print_modes() {
+    let Some(device) = audio() else { return crate::println!("No USB audio device.") };
+    for (capture, name) in [(false, "Playback"), (true, "Capture")] {
+        let picked = unsafe { (*core::ptr::addr_of!(SELECTED))[direction(capture)] };
+        crate::println!("{name} modes (`audio use {} N`, or `auto`):", if capture { "capture" } else { "playback" });
+        let mut any = false;
+        for (number, (index, alt)) in modes(&device.description, capture).enumerate() {
+            any = true;
+            crate::print(format_args!("  {}{:>2}: {} ch, {}-bit,", if picked == Some(index) { '*' } else { ' ' }, number + 1, alt.channels, alt.bits));
+            if device.description.class_version == 2 || alt.rate_count == 0 && alt.continuous_range == (0, 0) {
+                crate::print(format_args!(" the device's rates"));
+            } else if alt.rate_count > 0 {
+                for rate in &alt.rates[..alt.rate_count] {
+                    crate::print(format_args!(" {rate}"));
+                }
+            } else {
+                crate::print(format_args!(" {}-{}", alt.continuous_range.0, alt.continuous_range.1));
+            }
+            crate::println!(" Hz, {}", ["no sync", "asynchronous", "adaptive", "synchronous"][usize::from(alt.sync & 3)]);
+        }
+        if !any {
+            crate::println!("  none");
+        }
+        if picked.is_none() && any {
+            crate::println!("  (automatic: the mode with the most channels and bits that offers the rate asked for)");
+        }
+    }
 }
 
 /// Selects the sample rate: class 1.0 sets it on the streaming endpoint (SET_CUR, 3 bytes), class 2.0
@@ -694,12 +784,12 @@ pub fn start(controller: &mut Controller, rate: u32, want_capture: bool, want_pl
     let dev = device.device;
     let description = Description { ..clone_description(&device.description) };
     if want_capture {
-        let alt = find_alt(&description, true).ok_or("the device has no capture stream")?;
+        let alt = choose_alt(device, true, rate)?;
         let stream = build_stream(controller, &dev, &description, alt, rate, true)?;
         publish(&mut device.capture, stream);
     }
     if want_playback {
-        let alt = find_alt(&description, false).ok_or("the device has no playback stream")?;
+        let alt = choose_alt(device, false, rate)?;
         let stream = build_stream(controller, &dev, &description, alt, rate, false)?;
         publish(&mut device.playback, stream);
     }
@@ -830,12 +920,15 @@ pub fn fill_info(info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
     let Some(device) = audio() else { return false };
     let mut out = fos_v2_abi::tape::AudioInfo::default();
     out.class_version = u32::from(device.description.class_version.max(1));
-    if let Some(alt) = find_alt(&device.description, false) {
+    // A running stream's mode, else the picked one or the best at 48 kHz.
+    let playback_alt = device.playback.as_ref().map(|stream| stream.alt).or_else(|| default_alt(device, false));
+    let capture_alt = device.capture.as_ref().map(|stream| stream.alt).or_else(|| default_alt(device, true));
+    if let Some(alt) = playback_alt {
         out.playback_channels = u32::from(alt.channels);
         out.playback_slot_bytes = u32::from(alt.subslot_bytes);
         out.playback_bits = u32::from(alt.bits);
     }
-    if let Some(alt) = find_alt(&device.description, true) {
+    if let Some(alt) = capture_alt {
         out.capture_channels = u32::from(alt.channels);
         out.capture_slot_bytes = u32::from(alt.subslot_bytes);
         out.capture_bits = u32::from(alt.bits);

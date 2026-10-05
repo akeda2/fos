@@ -299,6 +299,9 @@ firmware, so a pending slot is tried on the next boot.
   interrupt once the ring is empty); `enable_interrupts` also falls back to MSI-X if plain MSI fails. The Zoom
   H6 on the Skylake shows signal from a microphone on input 1 on the third of its six capture channels.
   Not done: streaming a long take to disk (the `record` tape still captures into RAM first, up to 64 MiB).
+  **Modes:** each alternate setting of a streaming interface is a mode (channels, bit depth, rates). `audio modes` lists
+  them per direction; `audio use capture|playback N|auto` picks one (applies to the next start; the chosen mode must offer the
+  rate, otherwise the best one that does is used); tapes use `audio_select` and audio-net's `inmode=`/`outmode=`.
 * **`audio-net` (network audio, stage A: raw Ethernet).** One tape, `audio-net send|recv`, with an `audio-wire`
   crate (host-tested) for the formats. Raw mode (ethertype 0x88ba): an 18-byte header (sequence, frame
   timestamp, stream id, channels, bit depth, frames, rate) and big-endian 16/24-bit interleaved samples,

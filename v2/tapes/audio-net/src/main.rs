@@ -115,6 +115,10 @@ pub struct Options<'a> {
     /// Set when a peer's announcement replaced this machine's choice of codec for the stream it sends / receives.
     adopted_send: bool,
     adopted_receive: bool,
+    /// `inmode=N` / `outmode=N`: which of the device's modes (channels, bit depth; `audio modes` lists them) to capture and play
+    /// with; 0 picks automatically.
+    in_mode: u32,
+    out_mode: u32,
     /// `duplex`: the device input channels to send (`in=`) and the output channels to play on (`out=`).
     in_channels: Option<ChannelSet>,
     out_channels: Option<ChannelSet>,
@@ -133,7 +137,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_channels: None, out_channels: None,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -164,6 +168,8 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "group" => options.group = value,
             "name" => options.name = Some(value).filter(|name| !name.is_empty() && name.len() <= 24 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')).ok_or("name= is up to 24 letters, digits, - _ .")?,
             "source" => options.source = value,
+            "inmode" => options.in_mode = value.parse().map_err(|_| "inmode= needs a mode number (0 = automatic)")?,
+            "outmode" => options.out_mode = value.parse().map_err(|_| "outmode= needs a mode number (0 = automatic)")?,
             "codec" => options.opus = match value { "pcm" => false, "opus" => true, _ => return Err("codec= is pcm or opus") },
             "bitrate" => options.bitrate = value.parse::<u32>().ok().filter(|&b| (6..=512).contains(&b)).ok_or("bitrate= is kbit/s per stereo pair, 6 to 512")? * 1000,
             "frame" => options.frame_x10 = match value.split_once('.') { Some((whole, tenth)) => whole.parse::<u32>().ok().zip(tenth.parse::<u32>().ok()).map(|(w, t)| w * 10 + t), None => value.parse::<u32>().ok().map(|w| w * 10) }.ok_or("frame= is milliseconds")?,
@@ -348,12 +354,15 @@ enum Destination {
 
 pub fn send(api: &'static TapeApi, options: &Options) {
     let tone = options.tone;
+    if options.in_mode != 0 {
+        (api.audio_select)(0, options.in_mode);
+    }
     let mut info = AudioInfo::default();
     let device = (api.audio_info)(&mut info) != 0 && info.capture_channels != 0;
     if tone.is_none() && !device {
         return println!("audio-net send: no USB audio device with inputs (use src=tone=440 to send a test tone).");
     }
-    let (device_channels, slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+    let (mut device_channels, mut slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
     let selection = options.channels.unwrap_or(ChannelSet(0b11));
     let channels = selection.count();
     if tone.is_none() && selection.channels().any(|channel| channel >= device_channels) {
@@ -389,6 +398,13 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         let status = (api.audio_start)(options.rate, 1, 0);
         if status != 0 {
             return println!("audio-net send: cannot start capture at {} Hz (code {status}); the device offers {:?}.", options.rate, &info.rates[..info.rate_count as usize]);
+        }
+        // The mode that runs is chosen when the stream starts (automatically: the best one that offers the rate), so ask again.
+        (api.audio_info)(&mut info);
+        (device_channels, slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+        if selection.channels().any(|channel| channel >= device_channels) {
+            (api.audio_stop)();
+            return println!("audio-net send: the capture mode at {} Hz has {device_channels} channel(s); ch= asks for more (`audio modes` lists the modes, inmode= picks one).", options.rate);
         }
     }
     println!(
@@ -621,6 +637,9 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
 }
 
 pub fn receive(api: &'static TapeApi, options: &Options) {
+    if options.out_mode != 0 {
+        (api.audio_select)(1, options.out_mode);
+    }
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
         return println!("audio-net recv: no USB audio device with outputs.");
@@ -639,6 +658,10 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     if status != 0 {
         return println!("audio-net recv: cannot start playback at {running_rate} Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
     }
+    // The mode that runs is chosen when the stream starts, so ask again what it is.
+    (api.audio_info)(&mut info);
+    let (device_channels, slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
+    let device_frame = device_channels * slot;
     stats::set_receive(format_args!("waiting for PCM {}-bit{}", options.bits, if options.adopted_receive { " (peer's choice)" } else { "" }));
     transport.announce_receiver(options);
     println!("Listening on NIC {} for {} audio; playing on {device_channels} output channel(s) of {}-bit. Escape stops.", options.nic + 1, proto_name(options.proto), info.playback_bits);

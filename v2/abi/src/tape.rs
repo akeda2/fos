@@ -119,6 +119,10 @@ pub struct TapeApi {
     /// `puts(text, length)`: prints a string through the console in one call (version 2). Printing a byte at a time with
     /// `putc` repaints the whole text grid for every byte; a full-screen tape needs this one.
     pub puts: extern "C" fn(*const u8, usize),
+    /// `audio_select(direction, mode)`: picks which of the device's modes (alternate settings: channels and bit depth) the next
+    /// `audio_start` uses; direction 0 capture, 1 playback; mode is the 1-based number `audio modes` shows, 0 = automatic (the
+    /// best one that offers the rate). 0 on success, else an `AUDIO_*` code. It applies to the next start.
+    pub audio_select: extern "C" fn(u32, u32) -> i32,
 }
 
 /// What `audio_info` reports. Slot bytes: how many bytes each sample takes in the stream (a 24-bit

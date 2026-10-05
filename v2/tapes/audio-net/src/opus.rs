@@ -31,6 +31,9 @@ fn stream_channels(index: usize, channels: usize) -> usize {
 }
 
 pub fn send(api: &'static TapeApi, options: &Options) {
+    if options.in_mode != 0 {
+        (api.audio_select)(0, options.in_mode);
+    }
     let mut info = AudioInfo::default();
     let device = (api.audio_info)(&mut info) != 0 && info.capture_channels != 0;
     if options.tone.is_none() && !device {
@@ -39,7 +42,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     if options.rate != RATE {
         return println!("audio-net send: codec=opus is 48000 Hz only.");
     }
-    let (device_channels, slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+    let (mut device_channels, mut slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
     let selection = options.channels.unwrap_or(ChannelSet(0b11));
     let channels = selection.count();
     if options.tone.is_none() && selection.channels().any(|channel| channel >= device_channels) {
@@ -69,6 +72,12 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         let status = (api.audio_start)(RATE, 1, 0);
         if status != 0 {
             return println!("audio-net send: cannot start capture at 48000 Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
+        }
+        (api.audio_info)(&mut info);
+        (device_channels, slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+        if selection.channels().any(|channel| channel >= device_channels) {
+            (api.audio_stop)();
+            return println!("audio-net send: the capture mode at 48000 Hz has {device_channels} channel(s); ch= asks for more (`audio modes` lists the modes, inmode= picks one).");
         }
     }
     crate::stats::set_send(format_args!("Opus {} kbit/s per pair, {} ch{}", options.bitrate / 1000, channels, if options.adopted_send { " (peer's choice)" } else { "" }));
@@ -196,6 +205,9 @@ struct Lane {
 }
 
 pub fn receive(api: &'static TapeApi, options: &Options) {
+    if options.out_mode != 0 {
+        (api.audio_select)(1, options.out_mode);
+    }
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
         return println!("audio-net recv: no USB audio device with outputs.");
@@ -223,6 +235,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     if status != 0 {
         return println!("audio-net recv: cannot start playback at 48000 Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
     }
+    (api.audio_info)(&mut info);
+    let (device_channels, slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
+    let device_frame = device_channels * slot;
     let targets = options.channels.unwrap_or(ChannelSet((1u64 << channels.min(device_channels)).wrapping_sub(1) as u32));
     let mut placement = [None; MAX_CHANNELS];
     for (index, device_channel) in targets.channels().enumerate().take(channels) {
