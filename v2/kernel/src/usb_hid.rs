@@ -85,6 +85,31 @@ pub fn probe_all() -> usize {
     added + probe_all_ehci()
 }
 
+/// `usb try PORT [hot|warm]`: a diagnostic for a port that will not enumerate: optionally resets it by hand, then goes
+/// through the ordinary enumeration once and says where it stopped.
+pub fn try_port(port: u8, how: Option<&str>) {
+    let Some(controller) = xhci::controller(0) else { return crate::println!("usb try: no xHCI controller.") };
+    crate::println!("port {port}: PORTSC {:#010x} before.", controller.port_status(port));
+    match how {
+        Some("hot") | Some("warm") => {
+            let done = controller.reset_port_raw(port, how == Some("warm"));
+            crate::println!("port {port}: {} reset {}; PORTSC {:#010x}.", how.unwrap_or(""), if done { "completed" } else { "did not complete" }, controller.port_status(port));
+        }
+        _ => {}
+    }
+    controller.release_port_slots(port);
+    unsafe { STEP = "open the port (reset, enable slot, address device)" };
+    match probe_port(0, controller, port) {
+        Ok(true) => crate::println!("port {port}: enumerated, a device was added."),
+        Ok(false) => crate::println!("port {port}: enumerated, nothing to use on it."),
+        Err(error) => {
+            crate::println!("port {port}: failed at \"{}\": {error:?}.", unsafe { STEP });
+            controller.release_port_slots(port);
+        }
+    }
+    crate::println!("port {port}: PORTSC {:#010x} after, USBSTS {:#x}.", controller.port_status(port), controller.usbsts());
+}
+
 static mut STEP: &str = "";
 
 fn probe_port(controller_index: usize, controller: &mut Controller, port: u8) -> Result<bool, xhci::Error> {
@@ -148,6 +173,7 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
             return Ok(false);
         }
         controller.release_slot(device.slot);
+        crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (device class {:#04x}, {}): nothing here uses it.", descriptor[4], xhci::speed_name(device.speed));
         return Ok(false);
     };
 

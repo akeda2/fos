@@ -1322,9 +1322,16 @@ fn execute(command: &str) {
             });
         }
         "usb" => {
-            if words.next() == Some("rescan") {
+            let sub = words.next();
+            if sub == Some("rescan") {
                 let added = crate::usb_hid::probe_all();
                 crate::println!("{added} new keyboard(s).");
+            } else if sub == Some("try") {
+                match words.next().and_then(|word| word.parse::<u8>().ok()) {
+                    Some(port) => crate::usb_hid::try_port(port, words.next()),
+                    None => crate::println!("Usage: usb try PORT [hot|warm]   (a diagnostic: reset the port by hand, then enumerate it once)"),
+                }
+                return;
             }
             crate::usb_hid::describe_devices(|arguments| crate::println!("{}", arguments));
         }

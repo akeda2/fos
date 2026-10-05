@@ -732,6 +732,18 @@ impl Controller {
         context + self.context_bytes * (1 + u64::from(dci))
     }
 
+    /// Resets a root port by hand (`usb try`): a hot reset (PR), or for a SuperSpeed port a warm reset (WPR), which also
+    /// retrains the link from scratch. Returns whether the reset completed.
+    pub fn reset_port_raw(&mut self, port: u8, warm: bool) -> bool {
+        let register = self.port_register(port);
+        let (request, done_bit) = if warm { (1u32 << 31, 1u32 << 19) } else { (PORTSC_RESET, PORTSC_PRC) };
+        write32(register, (read32(register) & PORTSC_PRESERVE) | request);
+        let done = wait_until(100, || read32(register) & done_bit != 0);
+        write32(register, (read32(register) & PORTSC_PRESERVE) | PORTSC_CHANGE_BITS);
+        apic::wait_ticks(3);
+        done
+    }
+
     /// Resets a connected root port, gives the device a slot and an address.
     pub fn open_port(&mut self, port: u8) -> Result<Device, Error> {
         if port == 0 || port > self.ports {
@@ -771,7 +783,27 @@ impl Controller {
         if slot == 0 || usize::from(slot) > MAX_SLOTS {
             return Err(Error::Unsupported);
         }
-        let result = self.address_device(slot, port, speed, max_packet, 0, 0, None);
+        let mut result = self.address_device(slot, port, speed, max_packet, 0, 0, None);
+        if result.is_err() && speed >= 4 {
+            // A SuperSpeed port whose link trained by itself is left alone, which works for most devices; some (an internal
+            // device on the Latitude E7270's second USB 3 port) do not answer SET_ADDRESS until the port has been reset.
+            self.release_slot(slot);
+            if !self.reset_port_raw(port, false) || read32(register) & PORTSC_ENABLED == 0 {
+                return Err(Error::NoDevice);
+            }
+            let event = self.command(0, 0, TRB_ENABLE_SLOT << 10)?;
+            let slot = event.slot();
+            if slot == 0 || usize::from(slot) > MAX_SLOTS {
+                return Err(Error::Unsupported);
+            }
+            result = self.address_device(slot, port, speed, max_packet, 0, 0, None);
+            if result.is_err() {
+                self.release_slot(slot);
+            } else {
+                apic::wait_ticks(1);
+            }
+            return result;
+        }
         if result.is_err() {
             self.release_slot(slot);
         } else {

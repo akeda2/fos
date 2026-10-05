@@ -555,6 +555,15 @@ firmware, so a pending slot is tried on the next boot.
   device descriptor: Timeout"). SuperSpeed devices were never working in v2; the Skylake desktop's sticks sat on USB 2 ports.
   Found with a USB 3 stick in the laptop's side port while the boot stick stayed on the USB 2 hub (so kernels could still
   be pushed): the stick now enumerates as `USB storage 0951:1666 on port 13 ... (SuperSpeed)` and its GPT is read.
+  **The E7270's second SuperSpeed port (port 17) was an internal device that needs a port reset:** a Dell WWAN modem
+  (`413c:81b6`, class 0). It trained its link on its own and then ignored SET_ADDRESS (command completion code 4, a
+  transaction error) until the port was reset; the enumeration code leaves a SuperSpeed port whose link is already up alone,
+  which works for most devices. `open_port` now resets the port (a hot reset) and tries once more when Address Device fails on
+  a SuperSpeed port; after that the modem enumerates. A device nothing uses is now named in the boot log (`USB: port 17:
+  413c:81b6 (device class 0x00, SuperSpeed): nothing here uses it.`; the other internal devices on this laptop show as a
+  Realtek camera `0bda:5686`, a Broadcom fingerprint reader `0a5c:5832` and an Intel Bluetooth `8087:0a2b`). The hidden
+  command `usb try PORT [hot|warm]` resets a port by hand and enumerates it once, printing where it stopped, which is how
+  this was found.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
