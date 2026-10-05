@@ -64,9 +64,6 @@ static mut RELAY: [u8; 16384] = [0; 16384];
 static mut RELAY_LENGTH: usize = 0;
 static mut RUNTIME_SERVICES: u64 = 0;
 
-static mut LINE: [u8; 120] = [0; 120];
-static mut LINE_LENGTH: usize = 0;
-static mut LAST_WAS_CR: bool = false;
 
 /// Adds a network interface; returns its zero-based index.
 pub fn install(nic: Nic, runtime_services: u64) -> Option<usize> {
@@ -204,9 +201,8 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
                 SESSION_NIC = index;
                 PEER_ACTIVITY = apic::ticks();
                 RELAY_LENGTH = 0;
-                LINE_LENGTH = 0;
-                LAST_WAS_CR = false;
             }
+            crate::lineedit::reset();
             crate::println!("Remote terminal connected from {} on interface {}.", Mac(&source), index + 1);
             crate::println!("Type `help` for the commands.");
             prompt();
@@ -588,41 +584,14 @@ fn prompt() {
     crate::print(format_args!("fos> "));
 }
 
-/// One typed byte: echo it, edit the line, run the command on Enter.
+/// One typed byte: the line editor (`lineedit.rs`) handles the keys; a finished line runs here.
 fn feed(byte: u8) {
-    unsafe {
-        let line = &mut *core::ptr::addr_of_mut!(LINE);
-        match byte {
-            b'\n' if LAST_WAS_CR => LAST_WAS_CR = false,
-            b'\r' | b'\n' => {
-                LAST_WAS_CR = byte == b'\r';
-                crate::println!();
-                let length = LINE_LENGTH;
-                LINE_LENGTH = 0;
-                let mut copy = [0u8; 120];
-                copy[..length].copy_from_slice(&line[..length]);
-                if let Ok(text) = core::str::from_utf8(&copy[..length]) {
-                    execute(text.trim());
-                }
-                prompt();
-            }
-            0x08 | 0x7f => {
-                LAST_WAS_CR = false;
-                if LINE_LENGTH > 0 {
-                    LINE_LENGTH -= 1;
-                    crate::print(format_args!("\x08 \x08"));
-                }
-            }
-            0x20..=0x7e => {
-                LAST_WAS_CR = false;
-                if LINE_LENGTH < line.len() {
-                    line[LINE_LENGTH] = byte;
-                    LINE_LENGTH += 1;
-                    crate::print(format_args!("{}", byte as char));
-                }
-            }
-            _ => LAST_WAS_CR = false,
+    let mut line = [0u8; crate::lineedit::LINE_MAX];
+    if let Some(length) = crate::lineedit::feed(byte, &mut line) {
+        if let Ok(text) = core::str::from_utf8(&line[..length]) {
+            execute(text.trim());
         }
+        prompt();
     }
 }
 

@@ -34,6 +34,7 @@ mod gdt;
 mod idt;
 mod ioapic;
 mod keyboard;
+mod lineedit;
 mod log;
 mod memory;
 mod msi;

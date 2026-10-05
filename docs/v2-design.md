@@ -491,6 +491,15 @@ firmware, so a pending slot is tried on the next boot.
   old kernel), and the panel draws through a frame buffer presented once per drawing step. In QEMU the stall fell from 24 ms
   to 4 ms. The counters line now shows `UI recent/worst ms` (the recent figure covers the last ten seconds) and the
   device's playback underruns (`Un`) and capture overruns (`Ov`), so a dropout can be matched to the drawing.
+  **The shell's line editor (`lineedit.rs`):** the prompt now edits like a normal one. Insert and delete anywhere in the line
+  (Left/Right, Home/End, Delete, Backspace), Ctrl-A/E (start/end), Ctrl-K (delete to the end), Ctrl-U (delete to the
+  start), Ctrl-W (delete a word), Ctrl-L (clear the screen), Ctrl-C (abandon the line), and a history of the last sixteen
+  commands on Up/Down (no empty entries, no repeats of the previous one; the half-typed line comes back after browsing).
+  It serves the local keyboard (arrow keys arrive as single private codes) and `term net` or a serial terminal (ANSI
+  sequences, `ESC [ A` and `ESC O A` forms, assembled by a small state machine). Redrawing uses carriage return, cursor
+  left/right and erase-to-end-of-line, which the framebuffer console and every terminal do; a change in the middle of the
+  line redraws the line from the prompt, and typing at the end just echoes. Tab completion is not done. Tested over the
+  serial line (`make test-v2-lineedit`). The history is not kept across reboots.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
