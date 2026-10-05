@@ -64,7 +64,7 @@ def main():
             mark = a.send("nic discover")
             a.wait_for("fos> ", 30, mark)
             text = a.text()[mark:]
-            check("52:54:00:12:34:a2" in text and "bravo" in text, "nic discover lists the other machine with the name from its hostname file", text[-500:])
+            check("52:54:00:12:34:a2" in text and "bravo1" in text, "nic discover lists the other machine with the name from its hostname file", text[-500:])
             mark = a.send("nic peers")
             a.pump(1.0)
             check("bravo" in a.text()[mark:], "nic peers shows the table again", a.text()[mark:])

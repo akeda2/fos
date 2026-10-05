@@ -518,6 +518,18 @@ firmware, so a pending slot is tried on the next boot.
   interfaces hear it (cabling; up to three rounds while links come up), `nic use N` picks the interface the others
   default to. `nic regs`, `nic send` and `nic recv` were already there. Tested over the serial line with injected
   frames, a second guest and a guest with two NICs on a QEMU hub (`make test-v2-nic`).
+  **NETFS (files between machines):** the v1 wire format on the chat ethertype (tags 0x30-0x39), so `tools/foscopy.py`
+  works on v2 machines unchanged: `foscopy.py note.txt MAC:disk1/note.txt`, `foscopy.py :disk1/start ./start-copy --mac MAC`.
+  A machine serves GET and PUT at its prompt and in `term net`, never while a tape runs (the staging buffer is the tape's)
+  and not when `settings` says `deny-term-net`; files up to 4 MiB; both directions carry the RFC 1071 checksum, verified
+  before anything is stored, and the machine answers a refusal with an error code (not found, no such disk, too large or
+  empty, bad name, directory or data area full, disk error, checksum mismatch, busy); a gap aborts (no retransmission).
+  The shell side is `copy HOST[:diskN]/NAME DST [NEWNAME]` (fetch) and `copy SRC NAME HOST[:diskN] [NEWNAME]` (store), HOST
+  being a name from `nic peers` (a host name carries its NIC number: `alpha1`; discovery runs if the name is not known), a
+  MAC address or a peer number. Data frames go out one a millisecond, a pace real hardware keeps up with. `send` can now
+  carry a full Ethernet frame (it panicked on anything over 1024 bytes). Not done: `chat`, `tape load HOST NAME`,
+  `tape send`. Tested (`make test-v2-netfs`): foscopy both ways with a 37-chunk round trip compared byte for byte,
+  refusals, and two guests copying to and from each other.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
