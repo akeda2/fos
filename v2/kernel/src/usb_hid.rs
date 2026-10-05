@@ -101,7 +101,10 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
     // device may differ from the guess made when it was addressed.
     controller.get_descriptor(&device, 1, 0, &mut descriptor[..8])?;
     unsafe { STEP = "set the control max packet size" };
-    let max_packet = if descriptor[7] >= 32 && device.speed >= 4 { 512 } else { u16::from(descriptor[7]).max(8) };
+    // SuperSpeed devices give bMaxPacketSize0 as an exponent (9 means 2^9 = 512 bytes; it is always 9), the other speeds as the
+    // size itself. Taking the 9 as a size set the default pipe to 9 bytes and every later control transfer on a SuperSpeed
+    // device timed out.
+    let max_packet = if device.speed >= 4 { 512 } else { u16::from(descriptor[7]).max(8) };
     controller.set_control_max_packet(&mut device, max_packet)?;
     unsafe { STEP = "read the full device descriptor" };
     controller.get_descriptor(&device, 1, 0, &mut descriptor)?;

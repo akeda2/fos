@@ -549,6 +549,12 @@ firmware, so a pending slot is tried on the next boot.
   transmit errors).
   A third bug was not the card's: `internet_checksum` summed into 32 bits, which overflows on about 260 KB of high-entropy
   data, so large NETFS files were rejected as "damaged" (KUP's mostly-zero kernel images never got near it); it uses 64 bits now.
+  **Fixed (2026-10-05): the E7270's SuperSpeed enumeration failure was a driver bug, not the controller.** A SuperSpeed device
+  reports `bMaxPacketSize0` as an exponent (always 9, meaning 2^9 = 512 bytes), and `probe_device` took the 9 as a size: it
+  re-programmed the default pipe to 9 bytes with Evaluate Context, so every later control transfer timed out ("read the full
+  device descriptor: Timeout"). SuperSpeed devices were never working in v2; the Skylake desktop's sticks sat on USB 2 ports.
+  Found with a USB 3 stick in the laptop's side port while the boot stick stayed on the USB 2 hub (so kernels could still
+  be pushed): the stick now enumerates as `USB storage 0951:1666 on port 13 ... (SuperSpeed)` and its GPT is read.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself
