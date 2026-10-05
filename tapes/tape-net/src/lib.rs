@@ -1780,6 +1780,11 @@ pub struct TcpConnection<const RX: usize = TCP_RX_CAPACITY> {
     retransmit_ticks: u32,
     receive_buffer: [u8; RX],
     receive_len: usize,
+    /// Streaming sender (`stream_send`): the oldest sequence number the peer has not acknowledged, the peer's last
+    /// advertised window, and whether any data went out this way (it then owns the retransmission timer).
+    stream_una: u32,
+    peer_window: u32,
+    stream_active: bool,
 }
 
 impl<const RX: usize> TcpConnection<RX> {
@@ -1809,6 +1814,9 @@ impl<const RX: usize> TcpConnection<RX> {
             retransmit_ticks,
             receive_buffer: [0; RX],
             receive_len: 0,
+            stream_una: initial_sequence,
+            peer_window: 0xffff,
+            stream_active: false,
         }
     }
 
@@ -1895,6 +1903,8 @@ impl<const RX: usize> TcpConnection<RX> {
                     self.receive_next = segment.sequence.wrapping_add(1);
                     self.pending = false;
                     self.deadline = None;
+                    self.stream_una = self.send_next;
+                    self.peer_window = u32::from(segment.window);
                     let length =
                         self.emit(self.send_next, self.receive_next, TCP_ACK, &[], output)?;
                     self.state = TcpState::Established;
@@ -1907,6 +1917,8 @@ impl<const RX: usize> TcpConnection<RX> {
                 if segment.flags & TCP_ACK != 0 && segment.acknowledgment == self.send_next {
                     self.pending = false;
                     self.deadline = None;
+                    self.stream_una = self.send_next;
+                    self.peer_window = u32::from(segment.window);
                     self.state = TcpState::Established;
                 }
                 Ok(None)
@@ -1921,6 +1933,12 @@ impl<const RX: usize> TcpConnection<RX> {
                     return Err(Error::BufferTooSmall);
                 }
                 self.accept_ack(segment.acknowledgment);
+                self.peer_window = u32::from(segment.window);
+                if self.stream_active && !self.pending {
+                    // Streaming data in flight keeps the retransmission timer running from the latest acknowledgement.
+                    self.deadline = (self.stream_una != self.send_next)
+                        .then(|| now.wrapping_add(self.retransmit_ticks));
+                }
                 let mut response = false;
                 if !segment.data.is_empty() && segment.sequence == self.receive_next {
                     let available = RX.saturating_sub(self.receive_len);
@@ -1982,6 +2000,58 @@ impl<const RX: usize> TcpConnection<RX> {
     }
 
     /// Start an orderly close with FIN.  A peer ACK moves the state forward.
+    /// Bytes sent with `stream_send` (or `send_data`) that the peer has not acknowledged yet.
+    pub fn stream_in_flight(&self) -> usize {
+        self.send_next.wrapping_sub(self.stream_una) as usize
+    }
+
+    /// The peer's last advertised receive window, in bytes (this stack offers no window scaling, so it is the plain
+    /// 16-bit value).
+    pub fn peer_window(&self) -> usize {
+        self.peer_window as usize
+    }
+
+    /// Sends `data` (at most `RX` bytes) at once without waiting for earlier data to be acknowledged: several segments
+    /// can be in flight.  The caller keeps the unacknowledged bytes (they are `stream_in_flight()` bytes long, at the
+    /// front of whatever it still holds) and hands them back to `stream_retransmit` when the timer is due; it also
+    /// decides how much to have in flight (`peer_window()` is the limit the peer set).  Do not mix with `send_data`.
+    pub fn stream_send(&mut self, data: &[u8], now: u32, output: &mut [u8]) -> Result<usize> {
+        if self.state != TcpState::Established || self.pending || data.len() > RX {
+            return Err(Error::Unexpected);
+        }
+        let sequence = self.send_next;
+        let length = self.emit(sequence, self.receive_next, TCP_ACK | TCP_PSH, data, output)?;
+        self.send_next = sequence.wrapping_add(data.len() as u32);
+        self.stream_active = true;
+        if self.deadline.is_none() {
+            self.deadline = Some(now.wrapping_add(self.retransmit_ticks));
+        }
+        Ok(length)
+    }
+
+    /// When the timer is due, sends the oldest unacknowledged data again: the first bytes of `unacknowledged` (the
+    /// caller's copy, starting at the oldest unacknowledged byte), at most one segment's worth.
+    pub fn stream_retransmit(
+        &mut self,
+        unacknowledged: &[u8],
+        now: u32,
+        output: &mut [u8],
+    ) -> Result<Option<usize>> {
+        if !self.stream_active || self.pending || !self.retransmission_due(now) || self.stream_in_flight() == 0 {
+            return Ok(None);
+        }
+        let count = unacknowledged.len().min(RX).min(self.stream_in_flight());
+        let length = self.emit(
+            self.stream_una,
+            self.receive_next,
+            TCP_ACK | TCP_PSH,
+            &unacknowledged[..count],
+            output,
+        )?;
+        self.deadline = Some(now.wrapping_add(self.retransmit_ticks));
+        Ok(Some(length))
+    }
+
     pub fn close(&mut self, now: u32, output: &mut [u8]) -> Result<usize> {
         if (self.state != TcpState::Established && self.state != TcpState::CloseWait)
             || self.pending
@@ -2061,6 +2131,11 @@ impl<const RX: usize> TcpConnection<RX> {
     }
 
     fn accept_ack(&mut self, acknowledgment: u32) {
+        if seq_at_or_after(acknowledgment, self.stream_una)
+            && seq_at_or_after(self.send_next, acknowledgment)
+        {
+            self.stream_una = acknowledgment;
+        }
         if self.pending && seq_at_or_after(acknowledgment, self.pending_end) {
             self.pending = false;
             self.deadline = None;
@@ -2559,6 +2634,46 @@ mod tests {
         client.on_segment(&fin_ack, 121, &mut out).unwrap();
         assert_eq!(client.state(), TcpState::Closed);
         let _ = syn_len;
+    }
+
+    #[test]
+    fn tcp_stream_keeps_several_segments_in_flight() {
+        let mut server = TcpConnection::<8>::listen(IP_B, 2000, IP_A, 1000, 90, 4);
+        let mut out = [0u8; 64];
+        let (syn_bytes, syn_len) = segment(1000, 2000, 7, 0, TCP_SYN, &[]);
+        let syn = TcpSegment::parse(&syn_bytes[..syn_len], IP_A, IP_B, true).unwrap();
+        server.on_segment(&syn, 1, &mut out).unwrap();
+        let (ack_bytes, ack_len) = segment(1000, 2000, 8, 91, TCP_ACK, &[]);
+        let ack = TcpSegment::parse(&ack_bytes[..ack_len], IP_A, IP_B, true).unwrap();
+        server.on_segment(&ack, 2, &mut out).unwrap();
+        assert_eq!(server.stream_in_flight(), 0);
+
+        // Three segments go out back to back; none waits for the one before.
+        for (index, chunk) in [b"aaaa", b"bbbb", b"cccc"].iter().enumerate() {
+            let length = server.stream_send(*chunk, 10, &mut out).unwrap();
+            let sent = TcpSegment::parse(&out[..length], IP_B, IP_A, true).unwrap();
+            assert_eq!(sent.sequence, 91 + 4 * index as u32);
+        }
+        assert_eq!(server.stream_in_flight(), 12);
+        assert_eq!(server.retransmission_deadline(), Some(14));
+
+        // A cumulative acknowledgement of the first two leaves four bytes in flight and restarts the timer.
+        let (ack_bytes, ack_len) = segment(1000, 2000, 8, 99, TCP_ACK, &[]);
+        let ack = TcpSegment::parse(&ack_bytes[..ack_len], IP_A, IP_B, true).unwrap();
+        assert_eq!(server.on_segment(&ack, 12, &mut out).unwrap(), None);
+        assert_eq!(server.stream_in_flight(), 4);
+        assert_eq!(server.retransmission_deadline(), Some(16));
+
+        // When the timer runs out the oldest unacknowledged bytes are sent again.
+        let length = server.stream_retransmit(b"cccc", 16, &mut out).unwrap().unwrap();
+        let again = TcpSegment::parse(&out[..length], IP_B, IP_A, true).unwrap();
+        assert_eq!((again.sequence, again.data), (99, &b"cccc"[..]));
+
+        // The last acknowledgement stops the timer.
+        let (ack_bytes, ack_len) = segment(1000, 2000, 8, 103, TCP_ACK, &[]);
+        let ack = TcpSegment::parse(&ack_bytes[..ack_len], IP_A, IP_B, true).unwrap();
+        server.on_segment(&ack, 17, &mut out).unwrap();
+        assert_eq!((server.stream_in_flight(), server.retransmission_deadline()), (0, None));
     }
 
     #[test]

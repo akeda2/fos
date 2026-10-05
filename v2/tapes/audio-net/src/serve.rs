@@ -4,9 +4,10 @@
 //!
 //! The machine answers ARP and ping, accepts one TCP connection on `http=PORT` (default 8000) and serves
 //! `GET /live.opus` as an endless `audio/ogg` response (one Opus packet per Ogg page, see `audio_wire::ogg`);
-//! `GET /` is a page with an `<audio>` element pointing at it. The TCP layer is `tape-net`'s: one segment in
-//! flight, retransmitted on a timer, so throughput is one segment per round trip. Audio waits in a 12 KiB queue
-//! (about a second at 128 kbit/s); a page that finds the queue full is dropped whole, which the player sees as a lost
+//! `GET /` is a page with an `<audio>` element pointing at it. The TCP layer is `tape-net`'s, used as a stream: up to
+//! four segments in flight (and no more than the peer's window), cumulative acknowledgements, the oldest segment
+//! retransmitted on a timer, so a phone that delays its acknowledgements does not throttle the stream. Audio waits in
+//! a 16 KiB queue (about two seconds at 64 kbit/s); a page that finds the queue full is dropped whole, which the player sees as a lost
 //! packet, so a slow client cannot make the delay grow. A client that stops acknowledging for 10 s is dropped; a new
 //! connection replaces the current one.
 
@@ -20,11 +21,13 @@ use tape_rt::{AudioInfo, TapeApi, println};
 
 const RATE: u32 = 48_000;
 const MAX_FRAME_SAMPLES: usize = 2880;
-/// Payload bytes per TCP segment (`tape-net` keeps one segment in flight, so this is also its receive window).
+/// Payload bytes per TCP segment, and the size of the connection's receive buffer (the request is small).
 const MSS: usize = 1400;
-const QUEUE: usize = 16 * 1024;
+const QUEUE: usize = 24 * 1024;
 /// Audio pages are dropped above this much queued data; headers always fit in the rest.
-const QUEUE_LIMIT: usize = 12 * 1024;
+const QUEUE_LIMIT: usize = 16 * 1024;
+/// Most bytes in flight (sent, not yet acknowledged): four full segments.
+const WINDOW: usize = 4 * MSS;
 /// Ticks (10 ms) without an acknowledgement before the client is given up on.
 const STALL_TICKS: u32 = 1000;
 /// Ticks before an unacknowledged segment is sent again.
@@ -86,7 +89,10 @@ struct Server<'a> {
     port: u16,
     client: Option<Client>,
     queued: usize,
+    /// The first `unacked` bytes of the queue are sent but not yet acknowledged.
+    unacked: usize,
     dropped: u64,
+    retransmits: u64,
     clients: u32,
     serial: u32,
     page_sequence: u32,
@@ -104,12 +110,8 @@ impl Server<'_> {
         true
     }
 
-    /// Wraps `payload` (an ICMP message or a TCP segment) in IPv4 and Ethernet and sends it.
     fn send_ip(&self, mac: MacAddress, ip: Ipv4Address, protocol: u8, payload: &[u8]) {
-        let mut frame = [0u8; MAX_FRAME];
-        if let Some(total) = net::build_ip_frame(&mut frame, &self.config, mac, ip, protocol, payload) {
-            net::send_frame(self.api, self.nic, &frame[..total]);
-        }
+        send_ip_frame(self.api, self.nic, &self.config, mac, ip, protocol, payload);
     }
 
     /// One received Ethernet frame: ARP and ping are answered, TCP segments for our port go to the client.
@@ -158,6 +160,7 @@ impl Server<'_> {
             let tcp = TcpConnection::<MSS>::listen(self.config.ip, self.port, ip, segment.source_port, iss, RETRANSMIT_TICKS);
             self.client = Some(Client { tcp, mac, ip, port: segment.source_port, phase: Phase::Request, progress: now });
             self.queued = 0;
+            self.unacked = 0;
             self.clients += 1;
             println!("HTTP client {}.{}.{}.{}:{} connected.", ip.0[0], ip.0[1], ip.0[2], ip.0[3], segment.source_port);
         }
@@ -228,41 +231,74 @@ impl Server<'_> {
     }
 }
 
+/// Wraps `payload` (an ICMP message or a TCP segment) in IPv4 and Ethernet and sends it.
+fn send_ip_frame(api: &TapeApi, nic: usize, config: &NetConfig, mac: MacAddress, ip: Ipv4Address, protocol: u8, payload: &[u8]) {
+    let mut frame = [0u8; MAX_FRAME];
+    if let Some(total) = net::build_ip_frame(&mut frame, config, mac, ip, protocol, payload) {
+        net::send_frame(api, nic, &frame[..total]);
+    }
+}
+
 impl Server<'_> {
-    /// Sends what is due: a retransmission, the next chunk of the queue once the last one is acknowledged, the FIN of a
-    /// finished response; and forgets a client that is gone or stalled.
+    /// Does what is due for the client: frees the queue bytes it acknowledged, retransmits the oldest unacknowledged data
+    /// when the timer is up, sends new data while the window allows (up to `WINDOW` bytes in flight and whatever the peer
+    /// advertises, several segments at once so a slow acknowledgement does not throttle the stream), finishes a short
+    /// response with a FIN; and forgets a client that is gone or stalled.
     fn pump(&mut self, now: u32) {
+        let (api, nic, config) = (self.api, self.nic, self.config);
         let Some(client) = self.client.as_mut() else { return };
         let (mac, ip) = (client.mac, client.ip);
         let mut out = [0u8; 1500];
-        let mut send: Option<usize> = None;
+        let queue = queue_data();
+        // Bytes the peer acknowledged since the last pass leave the queue.
+        let in_flight = client.tcp.stream_in_flight().min(self.unacked);
+        if self.unacked > in_flight {
+            let acked = self.unacked - in_flight;
+            queue.copy_within(acked..self.queued, 0);
+            self.queued -= acked;
+            self.unacked = in_flight;
+            client.progress = now;
+        }
         if let Ok(Some(length)) = client.tcp.retransmit(now, &mut out) {
-            send = Some(length);
-        } else if client.tcp.state() == TcpState::CloseWait && client.phase == Phase::Streaming {
+            send_ip_frame(api, nic, &config, mac, ip, 6, &out[..length]); // the handshake
+        }
+        if let Ok(Some(length)) = client.tcp.stream_retransmit(&queue[..self.unacked.min(MSS)], now, &mut out) {
+            send_ip_frame(api, nic, &config, mac, ip, 6, &out[..length]);
+            self.retransmits += 1;
+        }
+        if client.tcp.state() == TcpState::CloseWait && client.phase == Phase::Streaming {
             client.phase = Phase::Closing; // the player went away: finish with a FIN
             self.queued = 0;
-        } else if self.queued > 0 && matches!(client.phase, Phase::Streaming | Phase::Closing) {
-            let chunk = self.queued.min(MSS);
-            let data = &queue_data()[..chunk];
-            if let Ok(length) = client.tcp.send_data(data, now, &mut out) {
-                send = Some(length);
-                client.progress = now;
-                queue_data().copy_within(chunk..self.queued, 0);
-                self.queued -= chunk;
+            self.unacked = 0;
+        }
+        if matches!(client.phase, Phase::Streaming | Phase::Closing) {
+            loop {
+                let in_flight = client.tcp.stream_in_flight();
+                let window = client.tcp.peer_window().min(WINDOW);
+                let room = if in_flight == 0 { window.max(1) } else { window.saturating_sub(in_flight) }; // an empty pipe always sends: a zero window is probed
+                let count = (self.queued - self.unacked).min(MSS).min(room);
+                if count == 0 {
+                    break;
+                }
+                match client.tcp.stream_send(&queue[self.unacked..self.unacked + count], now, &mut out) {
+                    Ok(length) => {
+                        send_ip_frame(api, nic, &config, mac, ip, 6, &out[..length]);
+                        self.unacked += count;
+                    }
+                    Err(_) => break,
+                }
             }
-        } else if client.phase == Phase::Closing && self.queued == 0 {
+        }
+        if client.phase == Phase::Closing && self.queued == 0 {
             if let Ok(length) = client.tcp.close(now, &mut out) {
-                send = Some(length);
+                send_ip_frame(api, nic, &config, mac, ip, 6, &out[..length]);
             }
         }
-        let gone = client.tcp.state() == TcpState::Closed || now.wrapping_sub(client.progress) > STALL_TICKS;
-        if let Some(length) = send {
-            self.send_ip(mac, ip, 6, &out[..length]);
-        }
-        if gone {
-            println!("HTTP client gone ({} audio pages dropped so far).", self.dropped);
+        if client.tcp.state() == TcpState::Closed || now.wrapping_sub(client.progress) > STALL_TICKS {
+            println!("HTTP client gone ({} audio pages dropped, {} segments retransmitted so far).", self.dropped, self.retransmits);
             self.client = None;
             self.queued = 0;
+            self.unacked = 0;
         }
     }
 
@@ -337,7 +373,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
         }
         list
     };
-    let mut server = Server { api, nic: options.nic, config: transport.config, port: options.http, client: None, queued: 0, dropped: 0, clients: 0, serial: 0, page_sequence: 2, granule: 0, channels: channels as u8 };
+    let mut server = Server { api, nic: options.nic, config: transport.config, port: options.http, client: None, queued: 0, unacked: 0, dropped: 0, retransmits: 0, clients: 0, serial: 0, page_sequence: 2, granule: 0, channels: channels as u8 };
     let mut arp = ArpCache::<8>::new();
     let mut held = 0usize;
     let mut pcm = [0i16; MAX_FRAME_SAMPLES * 2];
@@ -390,7 +426,9 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
         if server.streaming() {
             if let Ok(length) = encoder.encode(&pcm[..frame_samples * channels], frame_samples, &mut packet) {
                 server.push_packet(&packet[..length], frame_samples as u32);
-                crate::stats::get().sent += 1;
+                let stats = crate::stats::get();
+                stats.sent += 1;
+                stats.lost = server.dropped; // the live view's "Lost": audio pages dropped because the client was behind
             }
         }
         if let Some(frequency) = options.tone {

@@ -135,6 +135,29 @@ def main():
             check(header.startswith("HTTP/1.1 404"), "an unknown path is a 404", header)
             header, body = fetch("/live.opus", 2.0)
             check(header.startswith("HTTP/1.1 200") and len(pages(body)) > 20, "a second client is served after the first", header)
+            # A client that stops reading for 4 s (its receive window closes, or slirp buffers for it) and then goes on: the
+            # stream resumes with whole, valid pages (any that did not fit in the meantime are dropped, never cut).
+            sock = socket.socket()
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.connect(("127.0.0.1", HOST_PORT))
+            sock.sendall(b"GET /live.opus HTTP/1.1\r\nHost: fos\r\n\r\n")
+            data = b""
+            for pause in (1.0, 4.0, 3.0):
+                end = time.monotonic() + pause
+                if pause == 4.0:
+                    time.sleep(pause)
+                    continue
+                sock.settimeout(0.5)
+                while time.monotonic() < end:
+                    try:
+                        chunk = sock.recv(65536)
+                    except socket.timeout:
+                        continue
+                    data += chunk
+            sock.close()
+            body = data.partition(b"\r\n\r\n")[2]
+            found = pages(body)
+            check(len(found) > 100 and all(page[4] for page in found), f"a client that stops reading for 4 s then resumes gets whole valid pages ({len(found)})", guest.text()[-600:])
         finally:
             guest.stop()
     panel_test()
