@@ -792,7 +792,9 @@ write goes through `issue_command`, which waits out `CmdInProgress`, because thr
 places write it and the card ignores a command sent while busy. The receive ring is
 64 descriptors; a small ring overflowed during `tape load net`'s slow console
 output. Diagnostics: `irqstat` (PIC pending/in-service/mask) and `pci` (INTx status
-bit 3, command bit 10). Full detail is in `docs/history/real-hardware-notes.md`.
+bit 3, command bit 10). `send` sets no TxIndicate (the 31-deep TxStatus stack
+overflowed after ~30 frames and stopped the transmitter) and `service_tx_status` pops error entries; both ported from v2,
+where they were confirmed on the real card; not yet run on real hardware in v1. Full detail is in `docs/history/real-hardware-notes.md`.
 
 ### UHCI: a USB host controller driver, USB Audio and USB Mass Storage
 

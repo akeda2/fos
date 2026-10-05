@@ -12,7 +12,7 @@ use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::arch::x86::{inl, inw, outb, outl, outw};
+use crate::arch::x86::{inb, inl, inw, outb, outl, outw};
 use crate::nic::{Health, WatchdogResult};
 use crate::pci;
 use crate::pmem;
@@ -62,13 +62,14 @@ const MEDIA_LINK_BEAT: u16 = 1 << 11;
 const RX_COMPLETE: u32 = 1 << 15;
 const RX_ERROR: u32 = 1 << 14;
 const LAST_FRAGMENT: u32 = 1 << 31;
-const TX_INDICATE: u32 = 1 << 15;
 const DOWNLOAD_COMPLETE: u32 = 1 << 16;
 const TX_ROUNDUP_DEFEAT: u32 = 1 << 28;
 const EEPROM_READ: u16 = 0x80;
 const EEPROM_BUSY: u16 = 0x8000;
 const STATUS_INT_LATCH: u16 = 1 << 0;
 const STATUS_HOST_ERROR: u16 = 1 << 1;
+/// A transmit finished and left an entry on the card's TxStatus stack (window 1, offset 0x1b).
+const STATUS_TX_COMPLETE: u16 = 1 << 2;
 /// A bus-master receive finished (the card's UpComplete event).
 const STATUS_UP_COMPLETE: u16 = 1 << 10;
 /// The only events this driver enables, both as *indications* (`SET_STATUS_
@@ -539,10 +540,37 @@ impl ThreeCom {
         )
     }
 
+    /// Empties the TxStatus stack (window 1, offset 0x1b) if the card says it holds entries, and re-enables the transmitter
+    /// as the 3Com drivers do: an error entry (jabber, underrun) needs a transmit reset first, a plain one just `TX_ENABLE`.
+    /// The stack is 31 entries deep and the transmitter stops when it is full, which is why `send` does not ask for a
+    /// completion indication on every frame: only errors leave entries now, and this pops them.
+    fn service_tx_status(&self) {
+        if read16(self.io_base, CMD_STATUS) & STATUS_TX_COMPLETE == 0 {
+            return;
+        }
+        self.select_window(1);
+        let mut reset = false;
+        for _ in 0..40 {
+            let status = unsafe { inb(self.io_base + 0x1b) };
+            if status & 0x80 == 0 {
+                break;
+            }
+            unsafe { outb(self.io_base + 0x1b, 0) }; // pop the entry
+            reset |= status & 0x30 != 0; // jabber or underrun
+        }
+        if reset {
+            issue_command(self.io_base, TX_RESET);
+            self.tx_in_flight.set(false);
+        }
+        issue_command(self.io_base, TX_ENABLE);
+        issue_command(self.io_base, ACK_INTERRUPT | STATUS_TX_COMPLETE | STATUS_INT_LATCH);
+    }
+
     pub fn send(&self, frame: &[u8]) -> bool {
         if frame.len() > MAX_FRAME_LEN {
             return false;
         }
+        self.service_tx_status();
         // This driver owns one download descriptor. It cannot be rewritten
         // while the card still owns the previous packet, so first collect that
         // packet's completion -- which is normally long past, since the last
@@ -563,8 +591,14 @@ impl ThreeCom {
             unsafe { write_volatile(&mut (*tx_descriptor).status, 0) };
             self.tx_in_flight.set(false);
         }
-        if read32(self.io_base, DOWN_LIST_PTR) != 0 {
-            return false;
+        // The card keeps the list pointer until it has the whole frame out (nearly a millisecond for a 1 KiB frame at
+        // 10 Mb/s), so a sender that paces frames a millisecond apart finds it busy: wait a bounded time instead of dropping.
+        let mut attempts = 50_000u32;
+        while read32(self.io_base, DOWN_LIST_PTR) != 0 {
+            attempts -= 1;
+            if attempts == 0 {
+                return false;
+            }
         }
         let padded_len = frame.len().max(MIN_FRAME_LEN);
         unsafe {
@@ -572,15 +606,11 @@ impl ThreeCom {
             buffer[..frame.len()].copy_from_slice(frame);
             buffer[frame.len()..padded_len].fill(0);
             let descriptor = descriptor_ptr::<TxDescriptor>(self.descriptors, RX_DESC_COUNT);
-            let frame_start = if self.b_revision {
-                // 3C905B/C cards use the B-revision frame-start header:
-                // request completion indication and disable hardware
-                // packet-length rounding. The payload length belongs in the
-                // final-fragment field below.
-                TX_INDICATE | TX_ROUNDUP_DEFEAT
-            } else {
-                padded_len as u32
-            };
+            // 3C905B/C cards use the B-revision frame-start header: disable hardware packet-length rounding. There is
+            // no TxIndicate bit: each frame that asked for it pushed an entry on the 31-deep TxStatus stack that nothing
+            // popped, and after ~30 frames the transmitter stopped dead. The completion this driver waits for is the
+            // DownloadComplete bit the card writes into the descriptor.
+            let frame_start = padded_len as u32 | if self.b_revision { TX_ROUNDUP_DEFEAT } else { 0 };
             write_volatile(&mut (*descriptor).status, frame_start);
             write_volatile(&mut (*descriptor).length, padded_len as u32 | LAST_FRAGMENT);
         }
