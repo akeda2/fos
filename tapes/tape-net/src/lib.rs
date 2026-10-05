@@ -804,6 +804,7 @@ pub const DHCP_BOOTSTRAP_DESTINATION: Ipv4Address = Ipv4Address([255, 255, 255, 
 pub const DHCP_OPTION_PAD: u8 = 0;
 pub const DHCP_OPTION_SUBNET_MASK: u8 = 1;
 pub const DHCP_OPTION_ROUTER: u8 = 3;
+pub const DHCP_OPTION_HOST_NAME: u8 = 12;
 pub const DHCP_OPTION_DNS: u8 = 6;
 pub const DHCP_OPTION_BROADCAST_ADDRESS: u8 = 28;
 pub const DHCP_OPTION_REQUESTED_IP: u8 = 50;
@@ -1237,6 +1238,8 @@ pub struct DhcpLease {
 }
 
 const DHCP_OPTION_SCRATCH: usize = 64;
+/// Longest host name the client will send (option 12).
+pub const DHCP_HOST_NAME_MAX: usize = 32;
 
 /// A bounded DHCP client implementing DISCOVER/OFFER/REQUEST/ACK.
 ///
@@ -1259,6 +1262,8 @@ pub struct DhcpClient<const OPTION_CAP: usize = DHCP_OPTION_SCRATCH> {
     offered_server: Ipv4Address,
     lease: Option<DhcpLease>,
     option_scratch: [u8; OPTION_CAP],
+    host_name: [u8; DHCP_HOST_NAME_MAX],
+    host_name_len: usize,
 }
 
 impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
@@ -1280,7 +1285,17 @@ impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
             offered_server: Ipv4Address::UNSPECIFIED,
             lease: None,
             option_scratch: [0; OPTION_CAP],
+            host_name: [0; DHCP_HOST_NAME_MAX],
+            host_name_len: 0,
         }
+    }
+
+    /// Send `name` as the host name option (12) in every request, so the DHCP/DNS server
+    /// learns this machine's name.  Truncated to `DHCP_HOST_NAME_MAX`; empty sends none.
+    pub fn set_host_name(&mut self, name: &[u8]) {
+        let take = name.len().min(DHCP_HOST_NAME_MAX);
+        self.host_name[..take].copy_from_slice(&name[..take]);
+        self.host_name_len = take;
     }
 
     pub fn state(&self) -> DhcpClientState {
@@ -1508,6 +1523,9 @@ impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
             if message_type == DhcpMessageType::Request && !renewal {
                 writer.push_ipv4(DHCP_OPTION_REQUESTED_IP, self.offered_address)?;
                 writer.push_ipv4(DHCP_OPTION_SERVER_IDENTIFIER, self.offered_server)?;
+            }
+            if self.host_name_len > 0 {
+                writer.push(DHCP_OPTION_HOST_NAME, &self.host_name[..self.host_name_len])?;
             }
             writer.push(
                 DHCP_OPTION_PARAMETER_REQUEST_LIST,

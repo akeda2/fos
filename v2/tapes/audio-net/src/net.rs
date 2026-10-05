@@ -188,7 +188,12 @@ pub enum DhcpStep {
 impl DhcpTask {
     pub fn new(api: &TapeApi, nic: usize, mac: MacAddress) -> DhcpTask {
         let transaction = (tape_rt::micros() as u32) ^ u32::from_be_bytes([mac.0[2], mac.0[3], mac.0[4], mac.0[5]]);
-        DhcpTask { client: DhcpClient::<128>::new(mac, transaction, 1, 5), started: (api.ticks)() as u32 / 100, mac, nic }
+        let mut client = DhcpClient::<128>::new(mac, transaction, 1, 5);
+        // Tell the DHCP server our name (the `hostname` file's, plus the interface number).
+        let mut name = [0u8; 20];
+        let length = (api.hostname)(nic, name.as_mut_ptr(), name.len());
+        client.set_host_name(&name[..length]);
+        DhcpTask { client, started: (api.ticks)() as u32 / 100, mac, nic }
     }
 
     /// Does what is due (sends a request, reads the frames waiting) without blocking.

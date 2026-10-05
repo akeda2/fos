@@ -123,6 +123,10 @@ pub struct TapeApi {
     /// `audio_start` uses; direction 0 capture, 1 playback; mode is the 1-based number `audio modes` shows, 0 = automatic (the
     /// best one that offers the rate). 0 on success, else an `AUDIO_*` code. It applies to the next start.
     pub audio_select: extern "C" fn(u32, u32) -> i32,
+    /// `hostname(nic, buffer, capacity)`: the name this machine announces on interface `nic` (zero-based; the `hostname`
+    /// file's name plus the one-based interface number, or `fos2`), copied into the buffer; its length, 0 if it did not fit.
+    /// A tape puts it in its DHCP requests so the server learns the machine's name.
+    pub hostname: extern "C" fn(usize, *mut u8, usize) -> usize,
 }
 
 /// What `audio_info` reports. Slot bytes: how many bytes each sample takes in the stream (a 24-bit

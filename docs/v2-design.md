@@ -470,6 +470,10 @@ firmware, so a pending slot is tried on the next boot.
   does not thrash it, it is withdrawn when a stream starts (the stream announces itself, keeping the DHCP lease) and when
   the panel closes, and entries expire if not heard for 20 s. It needs the RTP network (the announcements are IP
   multicast). Duplex then works from the pick: both panels open, each picks the other, each presses `S`.
+  **Hostname in DHCP:** every audio-net DHCP request carries the machine's name (option 12): the `hostname` file's text plus
+  the one-based NIC number (`myhost1`), or `fos2`, the same name discovery announces, so the DHCP/DNS server knows the
+  machine by name. The tape reads it through the `hostname(nic, buf, cap)` call at the end of `TapeApi`;
+  `tape-net`'s `DhcpClient::set_host_name` adds the option (v1 tapes using the client send none until they call it).
   **Real PPM meters:** the live view shows one horizontal meter per channel (labelled with the device input or output
   it is), one cell per dB from -60 dBFS to full scale, on the Nordic scale (IEC 60268-10 type I: TEST = 0 at -18 dBFS,
   maximum permitted level +9 at -9 dBFS, digital full scale at +18) with a number per channel to a tenth of a dB, a

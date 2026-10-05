@@ -53,7 +53,7 @@ const KUP_BUSY: u8 = 4;
 /// The name announced in discovery replies for interface `index`: `NAME<n>` from the
 /// `hostname` file (n is the one-based interface number, as v1 does), or "fos2" (then
 /// "fos2-2", "fos2-3"... for further interfaces).
-fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
+pub fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
     use core::fmt::Write;
     struct Cursor<'a>(&'a mut [u8; 20], usize);
     impl Write for Cursor<'_> {

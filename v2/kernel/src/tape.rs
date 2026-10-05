@@ -262,6 +262,15 @@ extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {
         Err(_) => FS_ERROR,
     }
 }
+extern "C" fn api_hostname(index: usize, out: *mut u8, capacity: usize) -> usize {
+    let mut name = [0u8; 20];
+    let length = term::hostname(index, &mut name);
+    if length > capacity {
+        return 0;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, length) };
+    length
+}
 extern "C" fn api_nic_count() -> usize {
     term::nic_count()
 }
@@ -368,6 +377,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         fs_stream_close: api_fs_stream_close,
         puts: api_puts,
         audio_select: api_audio_select,
+        hostname: api_hostname,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
