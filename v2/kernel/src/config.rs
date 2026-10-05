@@ -55,9 +55,9 @@ pub fn hostname() -> Option<&'static str> {
     unsafe { (HOSTNAME_LENGTH != 0).then(|| core::str::from_utf8(core::slice::from_raw_parts(core::ptr::addr_of!(HOSTNAME) as *const u8, HOSTNAME_LENGTH)).unwrap_or("")) }
 }
 
-/// Reads `name` from the boot volume into the shared buffer; the text, if present.
+/// Reads `name` into the shared buffer (from the boot volume, else the first other disk that has it); the text, if present.
 fn read(name: &str) -> Option<&'static str> {
-    let volume = storage::boot_volume()?;
+    let volume = storage::volume_with_file(name.as_bytes())?;
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
     match volume.read(name.as_bytes(), buffer) {
         Ok(Some(length)) => core::str::from_utf8(&buffer[..length]).ok(),

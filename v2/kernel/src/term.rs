@@ -994,17 +994,41 @@ static mut SCRIPT_TEXT: [[u8; SCRIPT_CAPACITY]; MAX_SCRIPT_DEPTH] = [[0; SCRIPT_
 
 /// Finds a file by name on the boot volume first, then on the other disks.
 fn find_file(name: &[u8]) -> Option<crate::fosfs::Volume> {
-    let mut candidates = [None; 9];
-    candidates[0] = crate::storage::boot_volume();
-    for number in 1..=8 {
-        candidates[number] = crate::storage::volume_on(number).ok();
-    }
-    candidates.into_iter().flatten().find(|volume| matches!(volume.file_length(name), Ok(Some(_))))
+    crate::storage::volume_with_file(name)
 }
 
 /// A command word that is not built in: `NAME.sh` runs as a script (lines of commands, `#` starts a comment, `$1`..`$9`
 /// are the arguments and `$*` all of them), else the tape `NAME` runs. False if there is neither.
 fn external_command(word: &str, rest: &str) -> bool {
+    // `diskN/NAME` and `@LABEL/NAME` name the volume to run from.
+    if let Some((volume_text, file)) = split_volume(word) {
+        let Some(Ok((_, volume))) = volume_word(volume_text) else { return false };
+        let base = file.strip_suffix(".sh").unwrap_or(file);
+        let mut script = [0u8; 24];
+        if base.len() + 3 <= script.len() {
+            script[..base.len()].copy_from_slice(base.as_bytes());
+            script[base.len()..base.len() + 3].copy_from_slice(b".sh");
+            let script = &script[..base.len() + 3];
+            if crate::fosfs::valid_name(script) && matches!(volume.file_length(script), Ok(Some(_))) {
+                run_script(volume, script, base, rest);
+                return true;
+            }
+        }
+        if !file.contains('.') && matches!(volume.file_length(file.as_bytes()), Ok(Some(_))) {
+            let mut line = [0u8; 160];
+            let text = if rest.is_empty() { word.len() } else { word.len() + 1 + rest.len() };
+            if text <= line.len() {
+                line[..word.len()].copy_from_slice(word.as_bytes());
+                if !rest.is_empty() {
+                    line[word.len()] = b' ';
+                    line[word.len() + 1..text].copy_from_slice(rest.as_bytes());
+                }
+                crate::tape::run_named(core::str::from_utf8(&line[..text]).unwrap_or(word));
+            }
+            return true;
+        }
+        return false;
+    }
     // `NAME` and `NAME.sh` both mean the script file NAME.sh.
     let base = word.strip_suffix(".sh").unwrap_or(word);
     let mut file_name = [0u8; 24];
@@ -1272,7 +1296,7 @@ fn execute(command: &str) {
                 None => crate::println!("boot disk: not identified"),
             }
         }
-        "ls" => files(&mut words, |volume, _| {
+        "ls" => files(&mut words, |volume, _, _| {
             let mut any = false;
             let outcome = volume.for_each(|entry| {
                 any = true;
@@ -1285,8 +1309,8 @@ fn execute(command: &str) {
             }
         }),
         "cat" => {
-            files(&mut words, |volume, mut words| {
-                let name = words.next().unwrap_or("");
+            files(&mut words, |volume, name, mut words| {
+                let name = name.or_else(|| words.next()).unwrap_or("");
                 match read_file(&volume, name.as_bytes()) {
                 Ok(Some(length)) => {
                     let text = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(FILE_BUFFER) as *const u8, length) };
@@ -1301,8 +1325,8 @@ fn execute(command: &str) {
             });
         }
         "write" => {
-            files(&mut words, |volume, mut words| {
-                let name = words.next().unwrap_or("");
+            files(&mut words, |volume, name, mut words| {
+                let name = name.or_else(|| words.next()).unwrap_or("");
                 // The text is everything after the name in the original line.
                 let text = command[command.find(name).map_or(0, |at| at + name.len())..].trim_start();
                 match volume.write(name.as_bytes(), text.as_bytes()) {
@@ -1312,8 +1336,8 @@ fn execute(command: &str) {
             });
         }
         "rm" => {
-            files(&mut words, |volume, mut words| {
-                let name = words.next().unwrap_or("");
+            files(&mut words, |volume, name, mut words| {
+                let name = name.or_else(|| words.next()).unwrap_or("");
                 match volume.remove(name.as_bytes()) {
                     Ok(true) => crate::println!("Removed {name}."),
                     Ok(false) => crate::println!("rm: no such file."),
@@ -1399,12 +1423,24 @@ fn execute(command: &str) {
 /// that disk's FOSFS data partition (mounted on the spot), `@LABEL` the volume carrying that
 /// label (see `label`; unlike a disk number it does not change when the disks are found in
 /// another order) -- or on the boot volume. The action gets the rest of the command's words.
-fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(crate::fosfs::Volume, core::str::SplitWhitespace<'a>)) {
+///
+/// A file may also be written `diskN/NAME` or `@LABEL/NAME` (the form tapes and `copy` use): the action then gets the name
+/// as its first argument, the other words after it.
+fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(crate::fosfs::Volume, Option<&'a str>, core::str::SplitWhitespace<'a>)) {
     let mut rest = words.clone();
     let first = rest.next().unwrap_or("");
+    if let Some((volume_text, name)) = split_volume(first) {
+        match volume_word(volume_text) {
+            Some(Ok((_, volume))) => action(volume, Some(name), rest),
+            Some(Err(String8Error::NoLabel)) => crate::println!("{volume_text}: no volume carries that label (see `label`)."),
+            Some(Err(String8Error::Volume(error))) => crate::println!("{volume_text}: {error}."),
+            None => {}
+        }
+        return;
+    }
     if let Some(label) = first.strip_prefix('@') {
         match crate::storage::volume_labelled(label.as_bytes()) {
-            Some((_, volume)) => action(volume, rest),
+            Some((_, volume)) => action(volume, None, rest),
             None => crate::println!("@{label}: no volume carries that label (see `label`)."),
         }
         return;
@@ -1412,13 +1448,13 @@ fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(cra
     let disk = first.strip_prefix("disk").and_then(|number| number.parse::<usize>().ok());
     let Some(number) = disk else {
         match crate::storage::boot_volume() {
-            Some(volume) => action(volume, words.clone()),
+            Some(volume) => action(volume, None, words.clone()),
             None => crate::println!("No FOSFS volume is mounted (see `disks`)."),
         }
         return;
     };
     match crate::storage::volume_on(number) {
-        Ok(volume) => action(volume, rest),
+        Ok(volume) => action(volume, None, rest),
         Err(error) => crate::println!("disk{number}: {error}."),
     }
 }
@@ -1596,6 +1632,14 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
     }
 }
 
+/// `diskN/NAME` or `@LABEL/NAME` split into the volume word and the file name. `None` for anything else (a plain name, or
+/// `HOST/NAME`, which names another machine).
+fn split_volume(word: &str) -> Option<(&str, &str)> {
+    let (volume, name) = word.split_once('/')?;
+    let is_volume = volume.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) || volume.strip_prefix('@').is_some_and(|label| !label.is_empty());
+    (is_volume && !name.is_empty()).then_some((volume, name))
+}
+
 /// A volume named by a command word: `diskN` or `@LABEL`. `None` if the word is neither.
 fn volume_word(word: &str) -> Option<Result<(usize, crate::fosfs::Volume), String8Error>> {
     if let Some(label) = word.strip_prefix('@') {
@@ -1617,6 +1661,15 @@ fn copy_command(mut words: core::str::SplitWhitespace) {
     let Some(source) = words.next() else {
         return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (diskN or @LABEL); copy HOST[:diskN]/NAME DST [NEWNAME]; copy SRC NAME HOST[:diskN] [NEWNAME]");
     };
+    // `copy diskN/NAME DST[/NEWNAME]` is `copy diskN NAME DST NEWNAME`.
+    if let Some((volume, name)) = split_volume(source) {
+        let Some(destination) = words.next() else { return crate::println!("copy: where to? (copy diskN/NAME diskM[/NEWNAME])") };
+        let (destination, new_name) = match split_volume(destination) {
+            Some((volume, new_name)) => (volume, new_name),
+            None => (destination, words.next().unwrap_or(name)),
+        };
+        return copy_between(volume, name, destination, new_name);
+    }
     // `copy HOST[:diskN]/NAME DST [NEWNAME]`: fetch a file from another machine.
     if volume_word(source).is_none() && source.contains('/') {
         let Some(destination) = words.next() else { return crate::println!("copy: where to? (copy HOST[:diskN]/NAME DST [NEWNAME])") };
@@ -1625,11 +1678,19 @@ fn copy_command(mut words: core::str::SplitWhitespace) {
     let (Some(name), Some(destination)) = (words.next(), words.next()) else {
         return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (diskN or @LABEL); copy HOST[:diskN]/NAME DST [NEWNAME]; copy SRC NAME HOST[:diskN] [NEWNAME]");
     };
-    let new_name = words.next().unwrap_or(name);
+    let (destination, new_name) = match split_volume(destination) {
+        Some((volume, new_name)) => (volume, new_name),
+        None => (destination, words.next().unwrap_or(name)),
+    };
     // `copy SRC NAME HOST[:diskN] [NEWNAME]`: store a local file on another machine.
     if volume_word(destination).is_none() {
         return copy_to_peer(source, name, destination, new_name);
     }
+    copy_between(source, name, destination, new_name)
+}
+
+/// The copy of one file between two local volumes (`diskN` or `@LABEL` words).
+fn copy_between(source: &str, name: &str, destination: &str, new_name: &str) {
     let mut resolve = |word: &str| match volume_word(word) {
         Some(Ok(found)) => Some(found),
         Some(Err(String8Error::NoLabel)) => {

@@ -112,6 +112,15 @@ def main():
             check("same file" in run("copy disk1 only2 disk1"), "copying a file onto itself is refused", "")
             check("no such file" in run("copy disk1 missing disk2"), "a missing source file is refused", "")
             check("not diskN or @LABEL" in run("copy boot only2 disk2"), "a bad volume word is refused", "")
+            # The same files written as `diskN/NAME` (the form tapes use), in every command that takes a file.
+            check("lives on the second disk only" in run("cat disk2/only2"), "`cat disk2/NAME` reads from the second disk", "")
+            check("Copied only2" in run("copy disk2/only2 disk1/slash1") and "lives on the second" in run("cat slash1"), "`copy disk2/NAME disk1/NEWNAME` works", "")
+            check("as slash2" in run("copy disk2/only2 disk1 slash2") and "lives on the second" in run("cat slash2"), "`copy disk2/NAME disk1 NEWNAME` works", "")
+            check("Copied only2" in run("copy @backup/only2 disk1/slash3"), "`copy @LABEL/NAME` works too", "")
+            check("Wrote" in run("write disk2/slashw hello") and "slashw" in run("ls disk2") and "slashw" not in run("ls"), "`write disk2/NAME` writes to that disk only", "")
+            check("Removed slashw" in run("rm disk2/slashw"), "`rm disk2/NAME` removes it", "")
+            check("no such file" in run("cat disk1/missing"), "a missing file in disk1/NAME is reported", "")
+            check("no volume carries" in run("cat @nothere/x"), "an unknown label in @LABEL/NAME is reported", "")
             big = run("ls")
             size = [line.split()[1] for line in big.splitlines() if line.startswith("router")][0]
             check(int(size) > 65536, "(the router tape is larger than the shell's 64 KiB file buffer)", big)

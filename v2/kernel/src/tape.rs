@@ -172,9 +172,13 @@ extern "C" fn api_free(address: usize, bytes: usize) {
 }
 /// Resolves a tape's file reference: a plain `NAME` is on the boot volume, `diskN/NAME` on
 /// that disk's FOSFS volume and `@LABEL/NAME` on the volume carrying that label.
-fn resolve_file(reference: &[u8]) -> Result<(crate::fosfs::Volume, &[u8]), isize> {
+///
+/// A bare name is the boot volume's; for reading (`reading`) it falls back to the first other disk that has the file, so
+/// a configuration file moved to another disk is still found.
+fn resolve_file(reference: &[u8], reading: bool) -> Result<(crate::fosfs::Volume, &[u8]), isize> {
     let Some(slash) = reference.iter().position(|&byte| byte == b'/') else {
-        return storage::boot_volume().map(|volume| (volume, reference)).ok_or(FS_NO_VOLUME);
+        let found = if reading { storage::volume_with_file(reference) } else { None };
+        return found.or_else(storage::boot_volume).map(|volume| (volume, reference)).ok_or(FS_NO_VOLUME);
     };
     let (selector, name) = (&reference[..slash], &reference[slash + 1..]);
     let volume = if let Some(label) = selector.strip_prefix(b"@") {
@@ -187,7 +191,7 @@ fn resolve_file(reference: &[u8]) -> Result<(crate::fosfs::Volume, &[u8]), isize
 }
 extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, capacity: usize) -> isize {
     let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
-    let (volume, name) = match resolve_file(reference) {
+    let (volume, name) = match resolve_file(reference, true) {
         Ok(found) => found,
         Err(code) => return code,
     };
@@ -201,7 +205,7 @@ extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, 
 }
 extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8, length: usize) -> isize {
     let (reference, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
-    let (volume, name) = match resolve_file(reference) {
+    let (volume, name) = match resolve_file(reference, false) {
         Ok(found) => found,
         Err(code) => return code,
     };
@@ -215,7 +219,7 @@ extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8,
 static mut STREAM: Option<(crate::fosfs::Volume, crate::fosfs::Entry)> = None;
 
 extern "C" fn api_fs_stream_open(name: *const u8, name_length: usize, max_bytes: u64) -> isize {
-    let (volume, name) = match resolve_file(unsafe { core::slice::from_raw_parts(name, name_length) }) {
+    let (volume, name) = match resolve_file(unsafe { core::slice::from_raw_parts(name, name_length) }, false) {
         Ok(found) => found,
         Err(code) => return code,
     };
@@ -248,7 +252,7 @@ extern "C" fn api_free_pages() -> usize {
     memory::stats().free as usize
 }
 extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {
-    let (volume, name) = match resolve_file(unsafe { core::slice::from_raw_parts(name, name_length) }) {
+    let (volume, name) = match resolve_file(unsafe { core::slice::from_raw_parts(name, name_length) }, false) {
         Ok(found) => found,
         Err(code) => return code,
     };
@@ -468,10 +472,28 @@ fn receive_from_network() -> Result<usize, &'static str> {
     result
 }
 
+/// A file as a command line spells it, as the reference `resolve_file` takes: `NAME`, `diskN/NAME` and `@LABEL/NAME` stay
+/// as they are, and the v1 spelling `diskN NAME` (or `@LABEL NAME`) becomes `diskN/NAME` in `buffer`.
+fn file_reference<'a>(text: &'a str, buffer: &'a mut [u8; 64]) -> &'a str {
+    let text = text.trim();
+    if let Some((volume, name)) = text.split_once(char::is_whitespace) {
+        let name = name.trim();
+        let is_volume = volume.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) || volume.starts_with('@');
+        if is_volume && !name.is_empty() && volume.len() + 1 + name.len() <= buffer.len() {
+            buffer[..volume.len()].copy_from_slice(volume.as_bytes());
+            buffer[volume.len()] = b'/';
+            buffer[volume.len() + 1..volume.len() + 1 + name.len()].copy_from_slice(name.as_bytes());
+            return core::str::from_utf8(&buffer[..volume.len() + 1 + name.len()]).unwrap_or(text);
+        }
+    }
+    text
+}
+
 fn load_from_file(name: &str) -> Result<usize, &'static str> {
-    let volume = storage::boot_volume().ok_or("no FOSFS volume is mounted")?;
+    let mut spelled = [0u8; 64];
+    let (volume, name) = resolve_file(file_reference(name, &mut spelled).as_bytes(), true).map_err(|_| "no such volume")?;
     let staging = staging().ok_or("no memory for the staging buffer")?;
-    match volume.read(name.as_bytes(), staging) {
+    match volume.read(name, staging) {
         Ok(Some(length)) => Ok(length),
         Ok(None) => Err("no such file"),
         Err(crate::fosfs::Error::TooBig) => Err("the file does not fit the 4 MiB staging buffer"),
@@ -487,7 +509,10 @@ pub fn command(arguments: &str) {
     match word {
         "load" => {
             // v1 spelled it `tape load disk NAME`: accept that too.
-            let rest = rest.strip_prefix("disk").map_or(rest, str::trim_start);
+            let rest = match rest.strip_prefix("disk") {
+                Some(after) if after.starts_with(char::is_whitespace) => after.trim_start(),
+                _ => rest,
+            };
             let (name, outcome) = if rest == "net" { ("network", receive_from_network()) } else { (rest, load_from_file(rest)) };
             match outcome {
                 Ok(length) => {
@@ -507,12 +532,13 @@ pub fn command(arguments: &str) {
         }
         "save" => {
             let length = staged_length();
-            let Some(volume) = storage::boot_volume() else { return crate::println!("tape save: no FOSFS volume is mounted.") };
+            let mut spelled = [0u8; 64];
+            let Ok((volume, file)) = resolve_file(file_reference(rest, &mut spelled).as_bytes(), false) else { return crate::println!("tape save: no such volume.") };
             let Some(staging) = staging() else { return };
             if length == 0 {
                 return crate::println!("tape save: nothing is staged (tape load first).");
             }
-            match volume.write(rest.as_bytes(), &staging[..length]) {
+            match volume.write(file, &staging[..length]) {
                 Ok(()) => crate::println!("Saved {length} bytes as {rest}."),
                 Err(error) => crate::println!("tape save: {error:?}"),
             }

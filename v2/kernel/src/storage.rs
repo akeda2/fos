@@ -73,6 +73,16 @@ pub fn volume_on(number: usize) -> Result<Volume, VolumeError> {
     })
 }
 
+/// The volume holding the file `name`: the boot volume first, then the other disks in order (the same search v1 does for
+/// `start`, `hostname`, `settings` and `debug`). A disk with no FOSFS volume is simply skipped.
+pub fn volume_with_file(name: &[u8]) -> Option<Volume> {
+    let has = |volume: &Volume| matches!(volume.file_length(name), Ok(Some(_)));
+    if let Some(volume) = boot_volume().filter(|volume| has(volume)) {
+        return Some(volume);
+    }
+    (1..=block::count()).find_map(|number| volume_on(number).ok().filter(|volume| has(volume)))
+}
+
 /// The first volume, in disk order, whose label is `label`.
 pub fn volume_labelled(label: &[u8]) -> Option<(usize, Volume)> {
     (1..=block::count()).find_map(|number| {
