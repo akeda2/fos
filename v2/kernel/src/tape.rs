@@ -489,6 +489,18 @@ fn file_reference<'a>(text: &'a str, buffer: &'a mut [u8; 64]) -> &'a str {
     text
 }
 
+/// True for a word naming a local volume: `diskN` or `@LABEL`.
+fn is_volume_word(word: &str) -> bool {
+    word.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) || word.starts_with('@')
+}
+
+/// `HOST[:diskN] NAME` (a machine, not a local volume) split into its two words.
+fn remote_reference(text: &str) -> Option<(&str, &str)> {
+    let (host, name) = text.trim().split_once(char::is_whitespace)?;
+    let name = name.trim();
+    (!is_volume_word(host) && host != "disk" && !name.is_empty() && !name.contains(char::is_whitespace)).then_some((host, name))
+}
+
 fn load_from_file(name: &str) -> Result<usize, &'static str> {
     let mut spelled = [0u8; 64];
     let (volume, name) = resolve_file(file_reference(name, &mut spelled).as_bytes(), true).map_err(|_| "no such volume")?;
@@ -513,7 +525,13 @@ pub fn command(arguments: &str) {
                 Some(after) if after.starts_with(char::is_whitespace) => after.trim_start(),
                 _ => rest,
             };
-            let (name, outcome) = if rest == "net" { ("network", receive_from_network()) } else { (rest, load_from_file(rest)) };
+            let (name, outcome) = if rest == "net" {
+                ("network", receive_from_network())
+            } else if let Some((host, file)) = remote_reference(rest) {
+                (file, term::tape_fetch(host, file))
+            } else {
+                (rest, load_from_file(rest))
+            };
             match outcome {
                 Ok(length) => {
                     set_staged_length(length);
@@ -532,6 +550,15 @@ pub fn command(arguments: &str) {
         }
         "save" => {
             let length = staged_length();
+            if length == 0 {
+                return crate::println!("tape save: nothing is staged (tape load first).");
+            }
+            if let Some((host, file)) = remote_reference(rest) {
+                return match term::tape_store(host, file, length) {
+                    Ok(()) => crate::println!("Saved {length} bytes to {host} as {file}."),
+                    Err(reason) => crate::println!("tape save: {reason}."),
+                };
+            }
             let mut spelled = [0u8; 64];
             let Ok((volume, file)) = resolve_file(file_reference(rest, &mut spelled).as_bytes(), false) else { return crate::println!("tape save: no such volume.") };
             let Some(staging) = staging() else { return };
@@ -543,11 +570,24 @@ pub fn command(arguments: &str) {
                 Err(error) => crate::println!("tape save: {error:?}"),
             }
         }
+        "send" => {
+            // `tape send [diskN] NAME PEER`: a file from a disk, as a tape for a machine waiting in `tape load net`.
+            let Some((file, peer)) = rest.rsplit_once(char::is_whitespace) else { return crate::println!("Usage: tape send [diskN] NAME PEER   (PEER: a name or number from `nic peers`, or a MAC)") };
+            match load_from_file(file) {
+                Ok(length) => {
+                    if let Err(reason) = term::tape_send(peer.trim(), length) {
+                        return crate::println!("tape send: {reason}.");
+                    }
+                    crate::println!("Sent {length} bytes.");
+                }
+                Err(reason) => crate::println!("tape send: {file}: {reason}."),
+            }
+        }
         "status" | "" => match loaded() {
             Some((name, entry, span)) => crate::println!("Tape {name}: entry {entry:#x}, {span} bytes in memory, {} bytes staged.", staged_length()),
             None => crate::println!("No tape loaded."),
         },
-        _ => crate::println!("tape: load NAME|net, run [ARGS], save NAME, status."),
+        _ => crate::println!("tape: load [diskN] NAME|HOST[:diskN] NAME|net, run [ARGS], save NAME|HOST[:diskN] NAME, send [diskN] NAME PEER, status."),
     }
 }
 

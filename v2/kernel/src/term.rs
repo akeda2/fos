@@ -1788,6 +1788,57 @@ fn copy_to_peer(source: &str, name: &str, host: &str, new_name: &str) {
     }
 }
 
+/// `tape load HOST[:diskN] NAME`: the file from another machine into the tape staging buffer; its length.
+pub fn tape_fetch(spec: &str, name: &str) -> Result<usize, &'static str> {
+    if !crate::fosfs::valid_name(name.as_bytes()) {
+        return Err("invalid file name");
+    }
+    let (mac, nic, disk) = netfs_peer(spec).ok_or("no such machine answered (see `nic peers`)")?;
+    crate::println!("Fetching {name} from {} disk{disk}...", Mac(&mac));
+    netfs_fetch(mac, nic, disk, name)
+}
+
+/// `tape save HOST[:diskN] NAME`: the first `length` staged bytes to another machine as a file.
+pub fn tape_store(spec: &str, name: &str, length: usize) -> Result<(), &'static str> {
+    if !crate::fosfs::valid_name(name.as_bytes()) {
+        return Err("invalid file name");
+    }
+    let (mac, nic, disk) = netfs_peer(spec).ok_or("no such machine answered (see `nic peers`)")?;
+    crate::println!("Sending {name} ({length} bytes) to {} disk{disk}...", Mac(&mac));
+    netfs_store(mac, nic, disk, name, length)
+}
+
+/// `tape send FILE PEER`: the first `length` staged bytes as a tape for a machine waiting in `tape load net` (START with
+/// the length, numbered DATA chunks, STOP; the receiver does not acknowledge, and there is no retransmission). PEER is a
+/// name, a number from `nic peers`, or a MAC address.
+pub fn tape_send(peer: &str, length: usize) -> Result<(), &'static str> {
+    let (mac, nic, _) = netfs_peer(peer).ok_or("no such machine answered (see `nic peers`)")?;
+    let staging = crate::tape::staging().ok_or("no memory for the transfer buffer")?;
+    crate::println!("Sending {length} bytes to {} as a tape (it must be in `tape load net`)...", Mac(&mac));
+    netfs_reply(nic, &mac, 0x10, &(length as u32).to_le_bytes());
+    let mut next = apic::micros() + 10_000;
+    blocking(true);
+    for (sequence, chunk) in staging[..length].chunks(NETFS_CHUNK).enumerate() {
+        let mut frame = [0u8; 4 + NETFS_CHUNK];
+        frame[0..4].copy_from_slice(&(sequence as u32).to_le_bytes());
+        frame[4..4 + chunk.len()].copy_from_slice(chunk);
+        // One frame per 3 ms (as tools/send_tape.py): the receiver polls a finite ring (the sender is not told about a lost frame).
+        while apic::micros() < next {
+            core::hint::spin_loop();
+        }
+        next = apic::micros() + 3000;
+        netfs_reply(nic, &mac, 0x11, &frame[..4 + chunk.len()]);
+        crate::debug::pet();
+        if break_requested() {
+            blocking(false);
+            return Err("interrupted");
+        }
+    }
+    netfs_reply(nic, &mac, 0x12, &[]);
+    blocking(false);
+    Ok(())
+}
+
 struct CopyError(&'static str);
 
 #[allow(non_snake_case)]

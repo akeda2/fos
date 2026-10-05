@@ -588,6 +588,13 @@ firmware, so a pending slot is tried on the next boot.
 and a bare name that a tape reads (`audio-net @audio.cfg`, `fs_read`) and a bare command word are searched on the boot
 volume first, then on every other disk in order (`storage::volume_with_file`); writes with a bare name stay on the boot volume.
 
+**Tapes between machines.** `tape load HOST[:diskN] NAME` fetches a tape from another machine's disk (NETFS GET into the
+staging buffer, then loaded as usual); `tape save HOST[:diskN] NAME` stores the loaded tape there (NETFS PUT);
+`tape send [diskN] NAME PEER` sends a file from a local disk as a tape to a machine waiting in `tape load net` (the
+v1 START/DATA/STOP frames, one chunk per 3 ms, no acknowledgement). HOST/PEER is a name or number from `nic peers`, or a
+MAC. Not done: `tape run @HOST/NAME` (a startup-argument file on another machine; tapes read their own `@` files through
+`fs_read`, which only knows local volumes). Test: `make test-v2-netfs`.
+
 ## 9. Tape ABI v2
 
 v1's tape ABI is a cdecl call with 43 appended arguments. v2 replaces it with
