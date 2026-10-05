@@ -51,12 +51,12 @@ SECTIONS
     *(COMMON)
     /* Stacks sit last, each with a guard page below it that is left unmapped, so
      * an overflow faults instead of corrupting whatever lies beneath. The boot
-     * stack is 64 KiB; the double-fault stack (used through the TSS's IST1) 16 KiB. */
+     * stack is 256 KiB (scripts nest shell commands, and the shell's command function has large frames); the double-fault stack (used through the TSS's IST1) 16 KiB. */
     . = ALIGN(4096);
     __stack_guard = .;
     . += 4096;
     __stack_bottom = .;
-    . += 64K;
+    . += 256K;
     __stack_top = .;
     __ist_guard = .;
     . += 4096;

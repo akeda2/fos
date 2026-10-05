@@ -500,6 +500,15 @@ firmware, so a pending slot is tried on the next boot.
   left/right and erase-to-end-of-line, which the framebuffer console and every terminal do; a change in the middle of the
   line redraws the line from the prompt, and typing at the end just echoes. Tab completion is not done. Tested over the
   serial line (`make test-v2-lineedit`). The history is not kept across reboots.
+  **Scripts and bare command names:** a word that is not built in runs `NAME.sh` (or `NAME` as a tape): `NAME.sh` is a file
+  of commands, `#` starts a comment, blank lines are skipped, `$1`..`$9` are the arguments and `$*` all of them, each
+  command is echoed as `NAME.sh> command`, and scripts may call scripts four deep. Both are looked up on the boot volume,
+  then on the other disks (a file with no dot in its name is taken for a tape; a built-in command of the same name always
+  wins). The `start` file can use them. Scripts nest shell commands, which have large stack frames (the command function
+  holds several 4 KiB buffers), so the kernel stack grew from 64 to 256 KiB; the three-deep recursion test had overflowed
+  the old one with a double fault. The same overflow was already crashing `tapes/test_bridge_e2e.py` (`nic recv` inside a
+  nested command) on older commits; with the bigger stack that test no longer crashes but still does not see the bridged frame
+  (not investigated yet). Tested by `make test-v2-scripts`.
   Plan: a Wireshark
   capture or a real AVB device to confirm the AAF header; recording onto the Skylake's SSD. The UFX's 12-channel capture alternate is
   not needed: the first alternate (22 channels) works at 48 and 96 kHz, which is what `find_alt` takes. (Dante itself

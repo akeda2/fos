@@ -595,6 +595,127 @@ fn feed(byte: u8) {
     }
 }
 
+/// The longest script a file may hold, and how deep scripts may call scripts.
+const SCRIPT_CAPACITY: usize = 4096;
+const MAX_SCRIPT_DEPTH: usize = 4;
+static mut SCRIPT_DEPTH: usize = 0;
+static mut SCRIPT_TEXT: [[u8; SCRIPT_CAPACITY]; MAX_SCRIPT_DEPTH] = [[0; SCRIPT_CAPACITY]; MAX_SCRIPT_DEPTH];
+
+/// Finds a file by name on the boot volume first, then on the other disks.
+fn find_file(name: &[u8]) -> Option<crate::fosfs::Volume> {
+    let mut candidates = [None; 9];
+    candidates[0] = crate::storage::boot_volume();
+    for number in 1..=8 {
+        candidates[number] = crate::storage::volume_on(number).ok();
+    }
+    candidates.into_iter().flatten().find(|volume| matches!(volume.file_length(name), Ok(Some(_))))
+}
+
+/// A command word that is not built in: `NAME.sh` runs as a script (lines of commands, `#` starts a comment, `$1`..`$9`
+/// are the arguments and `$*` all of them), else the tape `NAME` runs. False if there is neither.
+fn external_command(word: &str, rest: &str) -> bool {
+    // `NAME` and `NAME.sh` both mean the script file NAME.sh.
+    let base = word.strip_suffix(".sh").unwrap_or(word);
+    let mut file_name = [0u8; 24];
+    if base.len() + 3 > file_name.len() {
+        return false;
+    }
+    file_name[..base.len()].copy_from_slice(base.as_bytes());
+    file_name[base.len()..base.len() + 3].copy_from_slice(b".sh");
+    let script_name = &file_name[..base.len() + 3];
+    if crate::fosfs::valid_name(script_name) {
+        if let Some(volume) = find_file(script_name) {
+            run_script(volume, script_name, base, rest);
+            return true;
+        }
+    }
+    // A file with no dot in its name is taken for a tape (data files such as `readme.txt` carry a suffix); if it is not a
+    // usable tape `run` says so.
+    if !word.contains('.') && crate::fosfs::valid_name(word.as_bytes()) && find_file(word.as_bytes()).is_some() {
+        let mut line = [0u8; 160];
+        let text = if rest.is_empty() { word.len() } else { word.len() + 1 + rest.len() };
+        if text <= line.len() {
+            line[..word.len()].copy_from_slice(word.as_bytes());
+            if !rest.is_empty() {
+                line[word.len()] = b' ';
+                line[word.len() + 1..text].copy_from_slice(rest.as_bytes());
+            }
+            crate::tape::run_named(core::str::from_utf8(&line[..text]).unwrap_or(word));
+        }
+        return true;
+    }
+    false
+}
+
+/// Runs a script file line by line, echoing each command as `NAME.sh> command`.
+fn run_script(volume: crate::fosfs::Volume, file: &[u8], name: &str, arguments: &str) {
+    let depth = unsafe { SCRIPT_DEPTH };
+    if depth >= MAX_SCRIPT_DEPTH {
+        crate::println!("{name}.sh: scripts are nested too deep (limit {MAX_SCRIPT_DEPTH}).");
+        return;
+    }
+    let buffer = unsafe { &mut (*(&raw mut SCRIPT_TEXT))[depth] };
+    let length = match volume.read(file, buffer) {
+        Ok(Some(length)) => length,
+        Ok(None) => return,
+        Err(_) => {
+            crate::println!("{name}.sh: cannot read it (over {SCRIPT_CAPACITY} bytes?).");
+            return;
+        }
+    };
+    let Ok(text) = core::str::from_utf8(&buffer[..length]) else {
+        crate::println!("{name}.sh: not text.");
+        return;
+    };
+    // The script text lives in this depth's buffer for the whole run: commands may read other files, nested scripts
+    // use the next buffer.
+    let text: &'static str = unsafe { core::mem::transmute::<&str, &'static str>(text) };
+    unsafe { SCRIPT_DEPTH = depth + 1 };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut expanded = [0u8; 240];
+        let mut used = 0;
+        let mut chars = line.chars().peekable();
+        while let Some(character) = chars.next() {
+            let substitution: Option<&str> = if character == '$' {
+                match chars.peek().copied() {
+                    Some('*') => {
+                        chars.next();
+                        Some(arguments)
+                    }
+                    Some(digit @ '1'..='9') => {
+                        chars.next();
+                        Some(arguments.split_whitespace().nth(digit as usize - '1' as usize).unwrap_or(""))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let mut utf8 = [0u8; 4];
+            let piece = match substitution {
+                Some(text) => text,
+                None => character.encode_utf8(&mut utf8),
+            };
+            if used + piece.len() > expanded.len() {
+                break;
+            }
+            expanded[used..used + piece.len()].copy_from_slice(piece.as_bytes());
+            used += piece.len();
+        }
+        let command = core::str::from_utf8(&expanded[..used]).unwrap_or("").trim();
+        if command.is_empty() {
+            continue;
+        }
+        crate::println!("{name}.sh> {command}");
+        execute(command);
+    }
+    unsafe { SCRIPT_DEPTH = depth };
+}
+
 fn execute(command: &str) {
     let mut words = command.split_whitespace();
     let Some(word) = words.next() else { return };
@@ -620,6 +741,7 @@ fn execute(command: &str) {
             crate::println!("write [diskN] NAME TEXT   create or replace a file");
             crate::println!("rm [diskN] NAME   delete a file");
             crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
+            crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");
             crate::println!("run NAME [ARGS]   load a tape from FOSFS and run it");
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
             crate::println!("uptime    time since the timer started; sleep N waits N seconds");
@@ -855,7 +977,12 @@ fn execute(command: &str) {
             }
             Some(_) => crate::println!("debug: status | slots | crash | hang"),
         },
-        other => crate::println!("Unknown command: {other} (try `help`)."),
+        other => {
+            let rest = command[other.len()..].trim();
+            if !external_command(other, rest) {
+                crate::println!("Unknown command: {other} (try `help`).");
+            }
+        }
     }
 }
 
