@@ -581,6 +581,13 @@ firmware, so a pending slot is tried on the next boot.
   their CRCs) with random ones as it writes (`--keep-guids` to opt out; plain `dd` of the image
   keeps the shared GUIDs). Tests: `make test-v2-disks`, `make test-v2-stick-guids`.
 
+**Files on other disks.** Every command that takes a file accepts `NAME` (the boot volume), `diskN NAME` and `diskN/NAME`
+(also `@LABEL NAME`, `@LABEL/NAME`), as v1 does: `cat disk2/audio.cfg`, `copy disk2/a.cfg disk1/b.cfg`,
+`copy disk2/a.cfg disk1 b.cfg`, `write disk2/note hi`, `rm disk2/note`, `tape load disk2/audio-net`, `tape save disk2/x`,
+`disk2/NAME args` (run a tape or script from that disk). The boot-time files (`start`, `hostname`, `settings`, `debug`)
+and a bare name that a tape reads (`audio-net @audio.cfg`, `fs_read`) and a bare command word are searched on the boot
+volume first, then on every other disk in order (`storage::volume_with_file`); writes with a bare name stay on the boot volume.
+
 ## 9. Tape ABI v2
 
 v1's tape ABI is a cdecl call with 43 appended arguments. v2 replaces it with
@@ -731,9 +738,3 @@ waits, preserve serial output on failure, wait for the prompt before typing.
 3. Boot that same image on the Skylake as an early reality check: if firmware
    quirks bite, we want to know before the kernel exists.
 
-**Files on other disks.** Every command that takes a file accepts `NAME` (the boot volume), `diskN NAME` and `diskN/NAME`
-(also `@LABEL NAME`, `@LABEL/NAME`), as v1 does: `cat disk2/audio.cfg`, `copy disk2/a.cfg disk1/b.cfg`,
-`copy disk2/a.cfg disk1 b.cfg`, `write disk2/note hi`, `rm disk2/note`, `tape load disk2/audio-net`, `tape save disk2/x`,
-`disk2/NAME args` (run a tape or script from that disk). The boot-time files (`start`, `hostname`, `settings`, `debug`)
-and a bare name that a tape reads (`audio-net @audio.cfg`, `fs_read`) and a bare command word are searched on the boot
-volume first, then on every other disk in order (`storage::volume_with_file`); writes with a bare name stay on the boot volume.
