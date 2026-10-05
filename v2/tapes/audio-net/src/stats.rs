@@ -10,13 +10,13 @@ pub const MAX_CHANNELS: usize = 32;
 /// A short text kept in a static (no allocation).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Label {
-    bytes: [u8; 48],
+    bytes: [u8; 96],
     length: usize,
 }
 
 impl Label {
     pub const fn new() -> Label {
-        Label { bytes: [0; 48], length: 0 }
+        Label { bytes: [0; 96], length: 0 }
     }
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
@@ -69,6 +69,8 @@ pub struct Stats {
     pub receive_codec: Label,
     /// Meters on: the detectors run on every sample. Off (the panel's M key) skips that work entirely.
     pub meters_on: bool,
+    /// `serve`: the clients line of the live view.
+    pub serve_status: Label,
     coefficients: Coefficients,
     coefficients_rate: u32,
 }
@@ -77,7 +79,7 @@ const fn fresh() -> Stats {
     Stats {
         sent: 0, received: 0, lost: 0, level_frames: 0, target_frames: 0, offset_ppm: 0, rate: 48_000,
         send: [Ppm::new(); MAX_CHANNELS], receive: [Ppm::new(); MAX_CHANNELS], send_clip: [false; MAX_CHANNELS], receive_clip: [false; MAX_CHANNELS],
-        send_channels: 0, receive_channels: 0, send_codec: Label::new(), receive_codec: Label::new(), meters_on: true, coefficients: Coefficients::ZERO, coefficients_rate: 0,
+        send_channels: 0, receive_channels: 0, send_codec: Label::new(), receive_codec: Label::new(), meters_on: true, serve_status: Label::new(), coefficients: Coefficients::ZERO, coefficients_rate: 0,
     }
 }
 

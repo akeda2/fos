@@ -13,14 +13,16 @@
 //! does not throttle the stream. Audio waits in a 16 KiB queue per client (about two seconds at 64 kbit/s); a page that
 //! finds the queue full is dropped whole, which the player sees as a lost packet, so a slow client cannot make the delay
 //! grow. A client that stops acknowledging for 10 s is dropped. What each client asked for and why it ended is printed
-//! (`dmesg` keeps it).
+//! (the live view's second line summarises the clients). `prebuffer=MS` sends the last MS of encoded audio to a new
+//! client at once, so that its player starts with a full buffer (at the price of that much extra delay).
 
 use crate::net::{self, MAX_FRAME, NetConfig};
-use crate::{Options, Transport, tone_sample};
+use crate::{Options, Transport, stats, tone_sample};
 use audio_wire::{MAX_CHANNELS, ChannelSet, device_sample_16, ogg};
 use opus_codec::Encoder;
 use tape_net::{ArpCache, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthernetFrame, IcmpEcho, Ipv4Address, Ipv4Packet, MacAddress, TCP_SYN, TCP_ACK, TcpConnection, TcpSegment, TcpState};
 use tape_rt::{AudioInfo, TapeApi, println};
+use core::fmt::Write as _;
 
 const RATE: u32 = 48_000;
 const MAX_FRAME_SAMPLES: usize = 2880;
@@ -120,6 +122,51 @@ fn header_value<'a>(request: &'a [u8], name: &str) -> Option<&'a str> {
     })
 }
 
+/// The most recent encoded Opus packets, for `prebuffer=`: a new client gets them first.
+struct History {
+    data: [u8; 8192],
+    lengths: [u16; 40],
+    count: usize,
+    bytes: usize,
+    /// How many packets to keep (0 = prebuffering off).
+    keep: usize,
+}
+
+impl History {
+    const fn new() -> History {
+        History { data: [0; 8192], lengths: [0; 40], count: 0, bytes: 0, keep: 0 }
+    }
+
+    fn remember(&mut self, packet: &[u8]) {
+        if self.keep == 0 || packet.len() > self.data.len() {
+            return;
+        }
+        while self.count == self.keep || self.bytes + packet.len() > self.data.len() {
+            let oldest = usize::from(self.lengths[0]);
+            self.data.copy_within(oldest..self.bytes, 0);
+            self.lengths.copy_within(1..self.count, 0);
+            self.bytes -= oldest;
+            self.count -= 1;
+        }
+        self.data[self.bytes..self.bytes + packet.len()].copy_from_slice(packet);
+        self.lengths[self.count] = packet.len() as u16;
+        self.bytes += packet.len();
+        self.count += 1;
+    }
+}
+
+/// Ogg page for one Opus packet of `samples` samples per channel, queued for the client, or counted as dropped if the
+/// client is behind.
+fn add_page(client: &mut Client, slot: usize, packet: &[u8], samples: u32) {
+    client.granule += u64::from(samples);
+    let mut page = [0u8; 1400];
+    let Some(length) = ogg::write_page(&mut page, 0, u64::from(ogg::PRE_SKIP) + client.granule, client.serial, client.page_sequence, packet) else { return };
+    client.page_sequence = client.page_sequence.wrapping_add(1);
+    if !client.queue(slot, &page[..length], QUEUE_LIMIT) {
+        client.dropped += 1;
+    }
+}
+
 struct Server<'a> {
     api: &'a TapeApi,
     nic: usize,
@@ -130,6 +177,12 @@ struct Server<'a> {
     /// Audio pages dropped and segments retransmitted over all clients, for the closing line.
     dropped: u64,
     channels: u8,
+    history: History,
+    /// Samples per channel in one packet.
+    frame_samples: u32,
+    /// What happened last, for the live view's clients line; `changed` asks for it to be redrawn.
+    last: stats::Label,
+    changed: bool,
 }
 
 /// Wraps `payload` (an ICMP message or a TCP segment) in IPv4 and Ethernet and sends it.
@@ -203,6 +256,7 @@ impl Server<'_> {
                 self.clients[slot] = Some(Client { tcp, mac, ip, port: segment.source_port, phase: Phase::Request, progress: now, queued: 0, unacked: 0, serial: 0, page_sequence: 2, granule: 0, dropped: 0, retransmits: 0, sent: 0, opened: now });
                 self.connections += 1;
                 println!("HTTP client {}.{}.{}.{}:{} connected (slot {slot}).", ip.0[0], ip.0[1], ip.0[2], ip.0[3], segment.source_port);
+                self.event(format_args!("slot {slot} connected"));
                 slot
             }
         };
@@ -218,7 +272,8 @@ impl Server<'_> {
 
     /// Reads each new request once it is complete and queues the response.
     fn answer(&mut self) {
-        let channels = self.channels;
+        let (channels, frame_samples) = (self.channels, self.frame_samples);
+        let mut event: Option<stats::Label> = None;
         for slot in 0..MAX_CLIENTS {
             let Some(client) = self.clients[slot].as_mut() else { continue };
             if client.phase != Phase::Request {
@@ -252,6 +307,16 @@ impl Server<'_> {
                     let tags_length = ogg::opus_tags("fos audio-net", &mut tags);
                     let length = ogg::write_page(&mut page, 0, 0, client.serial, 1, &tags[..tags_length]).unwrap_or(0);
                     client.queue(slot, &page[..length], QUEUE);
+                    // Prebuffering: the last few packets go first, so that the player's buffer fills at once.
+                    let mut at = 0;
+                    for index in 0..self.history.count {
+                        let end = at + usize::from(self.history.lengths[index]);
+                        add_page(client, slot, &self.history.data[at..end], frame_samples);
+                        at = end;
+                    }
+                    let mut label = stats::Label::new();
+                    let _ = write!(label, "slot {slot} is streaming{}", if self.history.count > 0 { " (prebuffered)" } else { "" });
+                    event = Some(label);
                 }
                 Route::Page => {
                     client.phase = Phase::Closing;
@@ -271,6 +336,27 @@ impl Server<'_> {
                 }
             }
         }
+        if let Some(label) = event {
+            self.last = label;
+            self.changed = true;
+        }
+    }
+
+    /// Notes what happened last for the clients line.
+    fn event(&mut self, what: core::fmt::Arguments) {
+        let mut label = stats::Label::new();
+        let _ = label.write_fmt(what);
+        self.last = label;
+        self.changed = true;
+    }
+
+    /// Publishes the clients line of the live view: how many are streaming, how many connections so far, what happened last.
+    fn publish(&mut self) {
+        self.changed = false;
+        let streaming = self.clients.iter().flatten().filter(|client| client.phase == Phase::Streaming).count();
+        let mut label = stats::Label::new();
+        let _ = write!(label, "{streaming} streaming, {} connection(s) so far; last: {}", self.connections, self.last.as_str());
+        stats::get().serve_status = label;
     }
 
     /// Does what is due for every client: frees the queue bytes it acknowledged, retransmits the oldest unacknowledged data
@@ -339,7 +425,10 @@ impl Server<'_> {
             if let Some(reason) = reason {
                 println!("HTTP client {}.{}.{}.{}:{} gone after {} s: {reason} ({} bytes sent, {} pages dropped, {} segments retransmitted).", ip.0[0], ip.0[1], ip.0[2], ip.0[3], client.port, now.wrapping_sub(client.opened) / 100, client.sent, client.dropped, client.retransmits);
                 self.dropped += client.dropped;
+                let seconds = now.wrapping_sub(client.opened) / 100;
+                let short = if client.tcp.state() == TcpState::Closed { "closed" } else { "silent for 10 s" };
                 self.clients[slot] = None;
+                self.event(format_args!("slot {slot} gone after {seconds} s ({short})"));
             }
         }
     }
@@ -351,17 +440,11 @@ impl Server<'_> {
     /// One encoded Opus packet of `samples` samples per channel becomes an Ogg page for every streaming client, or is
     /// dropped for one that is behind.
     fn push_packet(&mut self, packet: &[u8], samples: u32) {
+        self.history.remember(packet);
         for slot in 0..MAX_CLIENTS {
             let Some(client) = self.clients[slot].as_mut() else { continue };
-            if client.phase != Phase::Streaming {
-                continue;
-            }
-            client.granule += u64::from(samples);
-            let mut page = [0u8; 1400];
-            let Some(length) = ogg::write_page(&mut page, 0, u64::from(ogg::PRE_SKIP) + client.granule, client.serial, client.page_sequence, packet) else { continue };
-            client.page_sequence = client.page_sequence.wrapping_add(1);
-            if !client.queue(slot, &page[..length], QUEUE_LIMIT) {
-                client.dropped += 1;
+            if client.phase == Phase::Streaming {
+                add_page(client, slot, packet, samples);
             }
         }
     }
@@ -427,7 +510,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
         }
         list
     };
-    let mut server = Server { api, nic: options.nic, config: transport.config, port: options.http, clients: [const { None }; MAX_CLIENTS], connections: 0, dropped: 0, channels: channels as u8 };
+    let mut server = Server { api, nic: options.nic, config: transport.config, port: options.http, clients: [const { None }; MAX_CLIENTS], connections: 0, dropped: 0, channels: channels as u8, history: History::new(), frame_samples: frame_samples as u32, last: stats::Label::new(), changed: true };
     let mut arp = ArpCache::<8>::new();
     let mut held = 0usize;
     let mut pcm = [0i16; MAX_FRAME_SAMPLES * 2];
@@ -435,6 +518,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
     let mut frame = [0u8; MAX_FRAME];
     let (mut sent, mut phase) = (0u64, 0u32);
     let frame_us = frame_samples as u64 * 1_000_000 / u64::from(RATE);
+    server.history.keep = ((u64::from(options.prebuffer_ms) * 1000).div_ceil(frame_us) as usize).min(40);
     let started = tape_rt::micros();
     crate::stats::get().rate = RATE;
     loop {
@@ -477,13 +561,19 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
             }
         }
         crate::stats::peaks_from_i16(&pcm[..frame_samples * channels], channels, frame_samples, 0, true);
-        if server.streaming() {
+        if server.streaming() || server.history.keep > 0 {
             if let Ok(length) = encoder.encode(&pcm[..frame_samples * channels], frame_samples, &mut packet) {
+                let live = server.streaming();
                 server.push_packet(&packet[..length], frame_samples as u32);
-                let stats = crate::stats::get();
-                stats.sent += 1;
-                stats.lost = server.dropped_total(); // the live view's "Lost": audio pages dropped because the client was behind
+                if live {
+                    let stats = crate::stats::get();
+                    stats.sent += 1;
+                    stats.lost = server.dropped_total(); // the live view's "Lost": audio pages dropped because the client was behind
+                }
             }
+        }
+        if server.changed {
+            server.publish();
         }
         if let Some(frequency) = options.tone {
             phase = phase.wrapping_add((frequency * 65_536 / RATE) * frame_samples as u32) & 0xffff;

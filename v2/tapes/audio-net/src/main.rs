@@ -5,7 +5,7 @@
 //! tape run audio-net send [proto=raw|rtp] [nic=N|MAC] [to=MAC|IP[:PORT]] [rate=48000] [ch=3-4] [bits=24]
 //!                         [src=capture|tone=HZ] [secs=N] [ip=A.B.C.D/N|dhcp] [gw=IP] [pt=96]
 //! tape run audio-net duplex [options of both; in=CH out=CH instead of ch=]
-//! tape run audio-net serve [http=8000] [ch=1-2] [src=capture|tone=HZ] [bitrate=KBIT] [frame=20] [ip=A.B.C.D/N|dhcp]
+//! tape run audio-net serve [http=8000] [prebuffer=MS] [ch=1-2] [src=capture|tone=HZ] [bitrate=KBIT] [frame=20] [ip=A.B.C.D/N|dhcp]
 //!                          [secs=N]        Ogg Opus over HTTP, for a browser or VLC (see serve.rs)
 //! tape run audio-net @audio.cfg [options that override the file]
 //! tape run audio-net recv [proto=raw|rtp] [nic=N|MAC] [from=MAC] [port=5004] [chan=N] [ch=1-2] [target=MS]
@@ -127,6 +127,8 @@ pub struct Options<'a> {
     out_channels: Option<ChannelSet>,
     /// `serve`: the TCP port of the HTTP server.
     http: u16,
+    /// `serve`: milliseconds of recent audio sent to a new client at once, so that its player starts with a full buffer.
+    prebuffer_ms: u32,
 }
 
 pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -152,7 +154,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
     let mut options = Options {
         proto: Proto::Raw, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -193,6 +195,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "frame" => options.frame_x10 = match value.split_once('.') { Some((whole, tenth)) => whole.parse::<u32>().ok().zip(tenth.parse::<u32>().ok()).map(|(w, t)| w * 10 + t), None => value.parse::<u32>().ok().map(|w| w * 10) }.ok_or("frame= is milliseconds")?,
             "complexity" => options.complexity = value.parse().ok().filter(|&c| c <= 10).ok_or("complexity= is 0 to 10")?,
             "http" => options.http = value.parse().ok().filter(|&p| p != 0).ok_or("http= is a TCP port, 1 to 65535")?,
+            "prebuffer" => options.prebuffer_ms = value.parse().ok().filter(|&ms| ms <= 1000).ok_or("prebuffer= is 0 to 1000 milliseconds")?,
             "verbose" => options.verbose = true,
             _ => return Err("unknown option"),
         }

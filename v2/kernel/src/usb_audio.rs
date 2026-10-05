@@ -568,7 +568,10 @@ fn build_stream(controller: &mut Controller, device: &Device, description: &Desc
         cleanup(&ring, &pcm);
         return Err("SET_INTERFACE failed");
     }
-    if !set_rate(controller, device, description, &alt, rate) {
+    // A class 1.0 alternate setting that offers exactly one rate (a fixed-rate device such as a PCM2902) has nothing to
+    // select, and such devices stall the request: skip it instead of warning on every start.
+    let fixed_rate = description.class_version != 2 && alt.rate_count == 1 && alt.rates[0] == rate;
+    if !fixed_rate && !set_rate(controller, device, description, &alt, rate) {
         crate::println!("audio: the device refused sample rate {rate} (carrying on at whatever it uses).");
     }
     let dci = match controller.configure_isoc_endpoint(device, alt.endpoint, alt.max_packet, alt.interval, &ring) {

@@ -136,8 +136,9 @@ const R_RECEIVE: usize = 9;
 const R_NAME: usize = 10;
 const R_GROUP: usize = 11;
 const R_PORT: usize = 12;
-const ROWS: usize = 13;
-const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Send channels", "Receive channels", "Name", "Multicast group", "HTTP port"];
+const R_PREBUFFER: usize = 13;
+const ROWS: usize = 14;
+const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Send channels", "Receive channels", "Name", "Multicast group", "HTTP port", "Pre-buffer"];
 
 #[derive(Clone, Copy)]
 struct Settings {
@@ -156,11 +157,13 @@ struct Settings {
     receive: Text<24>,
     /// `serve`: the TCP port; empty means the default, 8000.
     port: Text<6>,
+    /// `serve`: milliseconds of audio sent ahead to a new client; empty or 0 = off.
+    prebuffer: Text<6>,
 }
 
 impl Settings {
     fn new() -> Settings {
-        Settings { mode: 0, network: 0, nic: 1, codec: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new() }
+        Settings { mode: 0, network: 0, nic: 1, codec: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new(), prebuffer: Text::new() }
     }
 
     /// The network needs an IP address: RTP, or the HTTP server (which has no other network).
@@ -176,7 +179,7 @@ impl Settings {
             R_IP | R_GATEWAY => self.rtp() && !self.dhcp,
             R_SEND => self.mode != 1,
             R_RECEIVE => self.mode == 1 || self.mode == 2,
-            R_PORT => self.mode == SERVE,
+            R_PORT | R_PREBUFFER => self.mode == SERVE,
             _ => true,
         }
     }
@@ -191,6 +194,7 @@ impl Settings {
             R_SEND => Some(&mut self.send),
             R_RECEIVE => Some(&mut self.receive),
             R_PORT => Some(&mut self.port),
+            R_PREBUFFER => Some(&mut self.prebuffer),
             _ => None,
         }
     }
@@ -246,6 +250,9 @@ impl Settings {
         if self.mode == SERVE && !self.port.is_empty() {
             let _ = writeln!(out, "http {}", self.port.as_str());
         }
+        if self.mode == SERVE && !self.prebuffer.is_empty() && self.prebuffer.as_str() != "0" {
+            let _ = writeln!(out, "prebuffer {}", self.prebuffer.as_str());
+        }
         match self.mode {
             0 | SERVE => {
                 let _ = writeln!(out, "ch {}", self.send.as_str());
@@ -292,6 +299,7 @@ impl Settings {
                 "name" => self.name = Text::from(value),
                 "group" => self.group = Text::from(value),
                 "http" => self.port = Text::from(value),
+                "prebuffer" => self.prebuffer = Text::from(value),
                 "to" | "source" | "from" => self.peer = Text::from(value),
                 "codec" => opus = value == "opus",
                 "bitrate" => bitrate = value.parse().unwrap_or(96),
@@ -430,6 +438,13 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
                 let _ = write!(out, "{}", settings.port.as_str());
             }
         }
+        R_PREBUFFER => {
+            if settings.prebuffer.is_empty() || settings.prebuffer.as_str() == "0" {
+                let _ = write!(out, "off  (type milliseconds, e.g. 200, to fill the player's buffer at once; adds that delay)");
+            } else {
+                let _ = write!(out, "{} ms", settings.prebuffer.as_str());
+            }
+        }
         R_IP => dash(settings.ip.as_str(), out),
         R_GATEWAY => dash(settings.gateway.as_str(), out),
         R_NAME => {
@@ -516,6 +531,7 @@ fn draw_row(settings: &Settings, row: usize, selected: usize, editing: bool, inf
             R_NAME => settings.name.as_str(),
             R_GROUP => settings.group.as_str(),
             R_PORT => settings.port.as_str(),
+            R_PREBUFFER => settings.prebuffer.as_str(),
             R_SEND => settings.send.as_str(),
             _ => settings.receive.as_str(),
         };
@@ -961,7 +977,11 @@ extern "C" fn panel_hook() -> u32 {
         }
         // What is really sent and received: a peer's announcement can replace the choice made on this machine.
         let mut actual = Text::<100>::new();
-        let _ = write!(actual, "Sending: {}   Receiving: {}", if shown.send_codec.as_str().is_empty() { "-" } else { shown.send_codec.as_str() }, if shown.receive_codec.as_str().is_empty() { "-" } else { shown.receive_codec.as_str() });
+        if run.serve_port != 0 {
+            let _ = write!(actual, "Clients: {}", if shown.serve_status.as_str().is_empty() { "waiting for the first" } else { shown.serve_status.as_str() });
+        } else {
+            let _ = write!(actual, "Sending: {}   Receiving: {}", if shown.send_codec.as_str().is_empty() { "-" } else { shown.send_codec.as_str() }, if shown.receive_codec.as_str().is_empty() { "-" } else { shown.receive_codec.as_str() });
+        }
         if actual != run.actual {
             at(4, 2);
             draw!("{}\x1b[K", actual.as_str());

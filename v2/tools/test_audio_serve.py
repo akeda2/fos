@@ -98,10 +98,23 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         guest = boot(tmp)
         try:
-            mark = guest.send("run audio-net serve ip=dhcp src=tone=440 secs=120")
+            mark = guest.send("run audio-net serve ip=dhcp src=tone=440 prebuffer=200 secs=120")
             guest.wait_for("Serving Ogg Opus", 60, mark)
             guest.pump(1.0)
 
+            # prebuffer=200: the last 200 ms (ten pages) arrive at once, ahead of real time.
+            early = socket.create_connection(("127.0.0.1", HOST_PORT), timeout=10)
+            early.sendall(b"GET /live.opus HTTP/1.1\r\nHost: fos\r\n\r\n")
+            early.settimeout(0.1)
+            seen, end = b"", time.monotonic() + 0.3
+            while time.monotonic() < end:
+                try:
+                    seen += early.recv(65536)
+                except socket.timeout:
+                    pass
+            early.close()
+            early_pages = pages(seen.partition(b"\r\n\r\n")[2])
+            check(len(early_pages) >= 14, f"prebuffer=200 sends ten pages at once on top of the two headers ({len(early_pages)} pages in 0.3 s; real time would give about 17)", guest.text()[-400:])
             header, body = fetch("/live.opus", 4.0)
             check(header.startswith("HTTP/1.1 200") and "audio/ogg" in header, "GET /live.opus is 200 audio/ogg", header)
             found = pages(body)
@@ -215,7 +228,9 @@ def panel_test():
             header, body = fetch("/live.opus", 3.0)
             found = pages(body)
             check(header.startswith("HTTP/1.1 200") and len(found) > 50 and all(page[4] for page in found), f"S serves Ogg Opus on the default port ({len(found)} pages)", header)
+            guest.pump(1.0)  # the guest's serial output is only read while pumping
             check("Tx " in guest.text()[mark:] and "=====" in guest.text()[mark:], "the live view shows the counter and meters", guest.text()[-500:])
+            check("Clients: 1 streaming" in guest.text()[mark:], "the live view has a clients line (1 streaming)", guest.text()[-700:])
             guest.process.stdin.write(b"\x1b")
             guest.process.stdin.flush()
             guest.wait_for("Press any key for the settings", 20, mark)
