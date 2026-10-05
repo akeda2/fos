@@ -474,13 +474,15 @@ firmware, so a pending slot is tried on the next boot.
   is spread over many short calls (three rows at a time, only the cells that changed), the counters line shows the
   longest the drawing has held the stream loop up ("UI stall"), and `M` switches the meters off, which also stops the
   per-sample detector work.
-  **Whose codec is used:** with names, the receiver's choice wins. A sender that looks its peer up (`to=NAME`) adopts
-  the codec, depth, rate and port the peer announced it listens with, and a receiver that looks a sender up (`source=NAME`)
-  adopts what the sender announced, so the two ends cannot disagree. In duplex each direction therefore follows the
-  *receiving* machine's setting. With a plain IP address or MAC nothing is adopted: a sender sends what it is set to, and a
-  receiver set to something else will not understand it (Opus decoder errors, or silence). The live view's second line
-  shows what is actually sent and received ("Sending: Opus 96 kbit/s per pair, 2 ch   Receiving: PCM 24-bit, 2 ch"),
-  since the form shows only the choice made on that machine. Tested: a PCM sender finding an Opus listener by name sends Opus.
+  **Whose codec is used: the sender's.** The Codec row is what this machine *sends*. A receiver that picked its sender by
+  name (`source=NAME`, which the panel's Peer row sets for Receive and Duplex) follows what the sender announced: codec,
+  depth, rate, channels, port, multicast group; its own Codec setting does not matter then. A sender that looks its peer up
+  (`to=NAME`) takes only the address and port from the peer's announcement and keeps its own codec; if the peer announced
+  that it listens for something else it prints a note (a receiver that is only waiting on a port cannot follow). In duplex
+  each direction is therefore its sender's setting. With a plain IP address or MAC nothing is adopted. (An earlier version
+  had the sender follow the receiver's announced setting, which surprised the first users: a sender set to PCM 24 sent
+  Opus because the other machine's form still said Opus. The live view's second line shows what is actually sent and
+  received, "(peer's choice)" marking a codec taken from a peer, because the form shows only this machine's choice.)
   **Screen cost, measured on hardware:** the first readings of the panel's "UI stall" were 5 ms (laptop) and 20 ms (Skylake).
   The cause: a tape's `putc` prints one byte per call, and the framebuffer console repaints its whole text grid for every
   byte (a 1080p screen is about 16,000 cells), so a few hundred bytes of meter drawing cost milliseconds each time. Tape API

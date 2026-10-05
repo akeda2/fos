@@ -286,16 +286,21 @@ pub fn adopt_sender(options: &mut Options<'static>, entry: &Entry, my_ip: [u8; 4
     }
 }
 
-/// `to=NAME`: the destination from a listener's announcement (its address or its group, and its port).
+/// `to=NAME`: where to send, from a listener's announcement (its address or group, and its port). The codec stays what
+/// this machine was set to send: the sender decides, and a receiver that picked this sender by name follows it
+/// (`adopt_sender`). A listener that is only waiting on a port cannot follow, so a different codec is reported.
 pub fn adopt_listener(options: &mut Options<'static>, entry: &Entry) {
     let s = &entry.session;
     options.to = address_text(1, s.destination);
-    options.adopted_send = true;
     options.port = s.port;
     options.payload_type = s.payload_type;
-    options.opus = s.codec == Codec::Opus;
-    if s.codec != Codec::Opus {
-        options.bits = if s.codec == Codec::L16 { 16 } else { 24 };
+    let expects_opus = s.codec == Codec::Opus;
+    if expects_opus != options.opus {
+        tape_rt::println!(
+            "Note: '{}' was set to listen for {}; this machine sends {}. It follows if it picked this sender by name.",
+            s.name(),
+            if expects_opus { "Opus" } else { "PCM" },
+            if options.opus { "Opus" } else { "PCM" }
+        );
     }
-    options.rate = s.rate;
 }

@@ -650,24 +650,25 @@ def duplex_names_test():
 
 
 def codec_follows_listener_test():
-    """A sender set to PCM that finds its peer by name sends what that peer announced it listens for (Opus here), so the
-    two ends cannot disagree; a sender given a plain address keeps its own setting."""
+    """The sender decides the codec and a receiver that picked it by name follows. B is set to send PCM; A is set to
+    Opus but looks B up with `source=`, so A ends up receiving PCM, and B (finding A by name) keeps sending PCM."""
     with tempfile.TemporaryDirectory() as tmp:
-        a = Guest(tmp, "cf-a", "52:54:00:12:34:e1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={Path(tmp) / 'cf.wav'}", "-device", "usb-audio,audiodev=snd"])
+        wav = Path(tmp) / "cf.wav"
+        a = Guest(tmp, "cf-a", "52:54:00:12:34:e1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"])
         b = Guest(tmp, "cf-b", "52:54:00:12:34:e2")
         try:
             for guest in (a, b):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            mark_a = a.send("run audio-net recv proto=rtp codec=opus name=hall ip=192.168.50.2/24 secs=30")
-            a.wait_for("Listening on NIC 1 for Opus/RTP", 60, mark_a)
+            mark_a = a.send("run audio-net recv proto=rtp codec=opus name=a source=b ip=192.168.50.2/24 secs=40")
             a.pump(3.0)
-            mark_b = b.send("run audio-net send proto=rtp ip=192.168.50.1/24 to=hall src=tone=500 secs=4")
+            mark_b = b.send("run audio-net send proto=rtp name=b ip=192.168.50.1/24 to=a src=tone=500 secs=6")
             b.wait_for("Sent ", 90, mark_b)
-            text = b.text()[mark_b:]
-            check("Opus stream(s)" in text, "a PCM-configured sender that looks the peer up by name sends Opus, as the peer announced", text[-700:])
+            text_b = b.text()[mark_b:]
+            check("Sending 2 channel(s), 24-bit" in text_b and "Opus" not in text_b.split("Sending 2")[1][:200], "the sender keeps the codec it was set to (PCM) although its listener was set to Opus", text_b[-700:])
             a.pump(2.0)
-            check("Receiving Opus from 192.168.50.1" in a.text()[mark_a:], "and the Opus receiver gets it", a.text()[-500:])
+            text_a = a.text()[mark_a:]
+            check("Locked onto a stream: 2 channel(s), 24-bit" in text_a, "and the receiver, which picked it by name, follows: PCM, not its own Opus setting", text_a[-700:])
         finally:
             a.stop()
             b.stop()

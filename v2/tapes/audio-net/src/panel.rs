@@ -134,7 +134,7 @@ const R_RECEIVE: usize = 9;
 const R_NAME: usize = 10;
 const R_GROUP: usize = 11;
 const ROWS: usize = 12;
-const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec", "Send channels", "Receive channels", "Name", "Multicast group"];
+const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Send channels", "Receive channels", "Name", "Multicast group"];
 
 #[derive(Clone, Copy)]
 struct Settings {
