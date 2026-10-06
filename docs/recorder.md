@@ -63,8 +63,8 @@ cluster size follows the volume size as Windows chooses it (4 KiB up to 256 MiB,
 kernel (`fatvol::format_exfat`) first writes a GPT with one basic-data partition at 1 MiB, so a PC mounts the stick directly.
 
 * Shell: `format diskN exfat [LABEL]` says what the disk holds now and what will be erased, then `format diskN confirm`.
-* Recorder: `X` on the chosen disk asks for its number as confirmation (any other key cancels). A disk with no volume is
-  listed as `no volume` and a take on it is refused until it is formatted. The label is `FOS`.
+* Recorder: `X` on the chosen disk asks for a volume label (default `FOS`, up to 11 characters; Esc cancels), then for the disk's number as confirmation (any other key cancels). A disk with no volume is
+  listed as `no volume` and a take on it is refused until it is formatted.
 * Both go through the kernel and refuse the boot disk; the tape call is `disk_format_exfat`. Formatting takes a second or
   two, during which the recorder's capture overruns.
 * Tests: `formatted_exfat_volumes_pass_fsck_and_work` (host, `fsck.exfat`), `make test-v2-format-exfat` (shell) and

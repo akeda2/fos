@@ -196,7 +196,9 @@ struct App {
     /// The file name being typed (`F`), if the user is editing it.
     editing: Option<Text<12>>,
     /// `X` was pressed: the number of the disk waiting for its confirming keypress.
-    confirming: Option<usize>,
+    confirming: Option<(usize, Text<12>)>,
+    /// `X` pressed: the volume label being typed for the disk about to be formatted.
+    label_editing: Option<(usize, Text<12>)>,
     custom_prefix: &'static str,
     choices: [Choice; MAX_DISKS],
     choice_count: usize,
@@ -378,6 +380,10 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
             let _ = write!(line, "MONITORING  pre-roll holds {} s  (up {} s)   next: {}{:03}.wav", s, (now - started) / 1_000_000, app.base.as_str(), app.next_number);
         }
     }
+    if let Some((number, typed)) = app.label_editing.as_ref() {
+        line.clear();
+        let _ = write!(line, "Format disk{number} as exFAT. Volume label: {}_   (Enter: next, Esc: cancel)", typed.as_str());
+    }
     if let Some(typed) = app.editing.as_ref() {
         line.clear();
         let _ = write!(line, "File name: {}_   (letters, digits, _ -; Enter: ok, Esc: cancel)", typed.as_str());
@@ -520,7 +526,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut detector = Detector::new(options.silence, rate);
     let mut auto = options.auto;
     let mut app = App {
-        api, base: Text::from(file_part), editing: None, confirming: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
         message: Text::from("Meters and pre-roll are running. Space or R starts a take."), errors: 0, last_take_frames: 0,
     };
 
@@ -550,7 +556,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if event == 0 {
                 break;
             }
-            if let Some(number) = app.confirming.take() {
+            if let Some((number, label)) = app.confirming.take() {
                 // Any key other than the disk's number cancels.
                 if (event & 0xff) as u8 == b'0' + number as u8 && event != 1 {
                     {
@@ -558,10 +564,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                         let _ = write!(text, "Formatting disk{number}: audio capture overruns while this runs...");
                         show(6, text.as_str());
                     }
-                    let status = (api.disk_format_exfat)(number, b"FOS".as_ptr(), 3);
+                    let status = (api.disk_format_exfat)(number, label.as_str().as_ptr(), label.len());
                     if status == 0 {
                         app.refresh_free();
-                        say!(app, "disk{number} is now one exFAT volume (label FOS), readable on a PC.");
+                        say!(app, "disk{number} is now one exFAT volume, label \"{}\", readable on a PC.", label.as_str());
                     } else if status == FORMAT_BOOT_DISK {
                         say!(app, "disk{number} is the boot disk and is never formatted.");
                     } else {
@@ -569,6 +575,26 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     }
                 } else {
                     say!(app, "Format cancelled.");
+                }
+                continue;
+            }
+            if let Some((number, typed)) = app.label_editing.as_mut() {
+                // The volume label: up to 11 printable characters (not the few exFAT forbids), case kept.
+                let byte = (event & 0xff) as u8;
+                if event == 1 {
+                    app.label_editing = None;
+                    say!(app, "Format cancelled.");
+                } else if byte == b'\r' || byte == b'\n' {
+                    let (number, label) = (*number, *typed);
+                    app.label_editing = None;
+                    let mut size = Text::<100>::new();
+                    size_text(app.choices[app.selected].sectors * 512, &mut size);
+                    say!(app, "ERASE disk{number} ({}) as exFAT \"{}\"? Press {number} to confirm; other key cancels.", size.as_str(), label.as_str());
+                    app.confirming = Some((number, label));
+                } else if byte == 8 || byte == 127 {
+                    typed.pop();
+                } else if (0x20..0x7f).contains(&byte) && !b"\"*/:<>?\\|".contains(&byte) && typed.len() < 11 {
+                    typed.push(byte);
                 }
                 continue;
             }
@@ -607,11 +633,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     } else if app.choices[app.selected].boot {
                         say!(app, "disk{} is the boot disk and is never formatted.", app.choices[app.selected].number);
                     } else {
-                        let choice = app.choices[app.selected];
-                        let mut size = Text::<100>::new();
-                        size_text(choice.sectors * 512, &mut size);
-                        say!(app, "ERASE disk{} ({}) as exFAT? Press {} to confirm; any other key cancels.", choice.number, size.as_str(), choice.number);
-                        app.confirming = Some(choice.number);
+                        app.label_editing = Some((app.choices[app.selected].number, Text::from("FOS")));
                     }
                 }
                 b'f' | b'F' => {
