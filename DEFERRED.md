@@ -256,3 +256,44 @@ would be avoiding its quirks (no key-up events, some keys ignored). Deferred.
   since `test-ne2000-net` fails about 1 run in 8 under heavy CPU load (the
   card resets on receive overflow by design) and `test-ne2000` hit an
   unrelated, now fixed, harness race.
+
+## v2: recording in `audio-net`, and non-blocking USB writes (decided 2026-10-07: not now)
+
+Not needed at the moment; the findings, so that the question does not have to be rediscovered.
+
+**Why disk writes do not belong in an `audio-net` stream loop.** A write blocks the tape's single thread. A 256 KiB write to a
+USB stick takes about 25 ms normally and up to 3 s when the stick flushes its cache (measured: Kingston USB 3, worst block 3121 ms,
+~5 MB/s sustained). The receiver's playback target is ~12 ms and its NIC/network ring holds ~64 ms, so recording to a USB stick
+inside the loop would drop audible audio and lose packets at every stall; smaller writes do not help (the stall hits any write).
+An SSD over AHCI/NVMe writes 256 KiB in ~1 ms and stalls little, so live writes would be fine there.
+
+**Options for `rec=NAME` if it is wanted later** (the pieces exist: `audio-rec::recorder::Recorder`, `wav`, `StreamSink`, the
+disk menu and speed test in `v2/tapes/recorder`):
+1. Record to a big RAM buffer (the multi-block ring approach, `audio_set_capture_ring` is the capture side only; a tape would use
+   `alloc`) and write the file after the stream ends or on a key. No effect on the stream; limited by RAM (22 ch/24-bit: ~40 min per
+   8 GB, stereo: hours), a long flush at the end on a USB stick, and a power cut loses the take.
+2. Write live only when the target disk is an SSD, measured by the speed test (`worst_ms` small), else fall back to 1.
+3. Non-blocking USB writes (below), which would make live writing safe on sticks too.
+
+Open questions: which streams to record (`recv`, the captured side of `send`, both in `duplex` as two files), fill lost packets
+with silence so the file keeps true time (the natural answer), WAV in the stream's channels and depth (Opus: the decoded 16-bit
+audio), `NAMEnnn.wav` on a chosen disk.
+
+**A capture-side policy question for `send`.** The kernel's capture buffer is 16 MiB by default. A bigger one keeps audio
+continuous after a stall but plays it back late (backlog is latency); for a low-latency link dropping may be better than delaying.
+`audio-net`'s live view now shows `Capture late now/peak ms` so a stall's size can be seen. A catch-up policy (drop to the newest
+N ms after a stall) is not implemented.
+
+**Non-blocking USB storage writes (roadmap, low priority).** The recorder's UI freezes while a stick flushes (audio is never
+affected: the kernel buffer holds minutes). Two ways: (a) a yield hook in the kernel's wait loop -- little gain, since feeding
+the meters needs audio reads inside the write, and `audio_read` drains the same xHCI event ring the write's wait loop drains
+(re-entrancy in the most delicate part of the USB code); (b) true async: start the bulk transfer, return, finish it from event
+processing, i.e. the command/data/status sequence as a state machine with its error recovery, and file-system metadata writes
+queued behind it. (b) is a real project with real stability risk (USB storage is where the hardest real-hardware bugs were). Only
+with these conditions: opt-in, the blocking path stays the default, a matrix of real sticks, error recovery proven first. A cheaper
+alternative that needs no code: record to an internal SATA/NVMe SSD formatted exFAT (`format diskN exfat`).
+
+**Other reuse ideas, not done:** `audio-rec`'s pre-roll ring and sound/silence trigger in `audio-net` (squelch, history for late
+joiners); `play` from a named FAT disk (`fs_read` already reads FAT files, untested); a wall-clock call in the tape ABI so tapes
+can log with real time.
+
