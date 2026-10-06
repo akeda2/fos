@@ -1150,6 +1150,7 @@ fn execute(command: &str) {
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
+            crate::println!("format diskN exfat [LABEL]    erase a disk and make it one exFAT volume for PCs");
             crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL;");
             crate::println!("          a FAT32/exFAT disk too, by its diskN: ls cat write rm copy)");
             crate::println!("ls [diskN]        list FOSFS files (a FAT32/exFAT disk too, if named)");
@@ -2130,6 +2131,8 @@ struct PendingFormat {
     label: [u8; crate::fosfs::MAX_NAME],
     label_length: usize,
     force: bool,
+    /// `format diskN exfat`: a PC-readable exFAT volume instead of FOSFS.
+    exfat: bool,
 }
 static mut PENDING_FORMAT: Option<PendingFormat> = None;
 
@@ -2159,7 +2162,7 @@ fn plan_format(disk: usize, force: bool) -> Result<FormatPlan, &'static str> {
 /// partition; any other disk needs `force` because its partition table is replaced.
 fn format_command(mut words: core::str::SplitWhitespace) {
     let Some(target) = words.next() else {
-        return crate::println!("Usage: format diskN [NAME] [force]   (then: format diskN confirm)");
+        return crate::println!("Usage: format diskN [NAME] [force]   or   format diskN exfat [LABEL]   (then: format diskN confirm)");
     };
     let Some(number) = target.strip_prefix("disk").and_then(|number| number.parse::<usize>().ok()) else {
         return crate::println!("Usage: format diskN [NAME] [force]   (then: format diskN confirm)");
@@ -2171,15 +2174,16 @@ fn format_command(mut words: core::str::SplitWhitespace) {
     if crate::storage::boot_disk() == Some(disk) {
         return crate::println!("disk{number} is the boot disk (the running kernel's); format refuses it. Use `rm` for its files.");
     }
-    let (mut confirm, mut force, mut label) = (false, false, "");
+    let (mut confirm, mut force, mut exfat, mut label) = (false, false, false, "");
     for word in words {
         match word {
             "confirm" => confirm = true,
             "force" => force = true,
+            "exfat" => exfat = true,
             name => label = name,
         }
     }
-    if !label.is_empty() && !crate::fosfs::valid_name(label.as_bytes()) {
+    if !exfat && !label.is_empty() && !crate::fosfs::valid_name(label.as_bytes()) {
         return crate::println!("format: a label is up to 16 lowercase letters, digits, `.`, `_` or `-`.");
     }
     if confirm {
@@ -2187,7 +2191,40 @@ fn format_command(mut words: core::str::SplitWhitespace) {
         let Some(pending) = pending.filter(|pending| pending.number == number) else {
             return crate::println!("format: nothing is waiting for confirmation on disk{number}; run `format disk{number}` first.");
         };
+        if pending.exfat {
+            return match crate::fatvol::format_exfat(disk, &pending.label[..pending.label_length]) {
+                Ok(megabytes) => crate::println!("disk{number}: formatted as exFAT ({megabytes} MiB, GPT). A PC can read it; `ls disk{number}`, or record to it."),
+                Err(error) => crate::println!("format: disk{number}: {error}."),
+            };
+        }
         return do_format(disk, number, &pending.label[..pending.label_length], pending.force);
+    }
+    if exfat {
+        // What the disk holds now, so that the user knows what the confirmation will destroy.
+        crate::println!("disk{number}: {} MiB, {} ({}).", info.sectors / 2048, core::str::from_utf8(&info.model).unwrap_or("?").trim(), core::str::from_utf8(&info.origin[..info.origin_length]).unwrap_or("?"));
+        if label.len() > 11 {
+            return crate::println!("format: an exFAT label is up to 11 characters.");
+        }
+        if let Ok(volume) = crate::storage::volume_on(number) {
+            let mut files = 0;
+            let _ = volume.for_each(|_| files += 1);
+            crate::println!("It holds a FOSFS volume with {files} file(s).");
+        } else if let Some(mut fs) = crate::fatvol::mount(disk) {
+            let mut files = 0;
+            let _ = fs.list(|_| files += 1);
+            crate::println!("It holds a {} volume with {files} file(s).", if fs.kind() == fat::Kind::ExFat { "exFAT" } else { "FAT32" });
+        } else {
+            match crate::gpt::inspect(disk) {
+                Some(crate::gpt::Summary::Blank) => crate::println!("It is blank."),
+                Some(crate::gpt::Summary::Gpt { .. }) => crate::println!("It holds a GPT partition table (not a volume this kernel knows)."),
+                _ => crate::println!("It holds data this kernel does not recognise."),
+            }
+        }
+        crate::println!("ALL of it will be erased: one exFAT partition of about {} MiB replaces it.", info.sectors / 2048 - 1);
+        let mut stored = PendingFormat { number, label: [0; crate::fosfs::MAX_NAME], label_length: label.len(), force: false, exfat: true };
+        stored.label[..label.len()].copy_from_slice(label.as_bytes());
+        unsafe { PENDING_FORMAT = Some(stored) };
+        return crate::println!("To go ahead, type exactly: format disk{number} confirm");
     }
     let plan = match plan_format(disk, force) {
         Ok(plan) => plan,
@@ -2215,7 +2252,7 @@ fn format_command(mut words: core::str::SplitWhitespace) {
             crate::println!("It will be repartitioned as one FOSFS partition of {} MiB, replacing {replaces}.", info.sectors / 2048 - 1);
         }
     }
-    let mut stored = PendingFormat { number, label: [0; crate::fosfs::MAX_NAME], label_length: label.len(), force };
+    let mut stored = PendingFormat { number, label: [0; crate::fosfs::MAX_NAME], label_length: label.len(), force, exfat: false };
     stored.label[..label.len()].copy_from_slice(label.as_bytes());
     unsafe { PENDING_FORMAT = Some(stored) };
     crate::println!("To go ahead, type exactly: format disk{number} confirm");

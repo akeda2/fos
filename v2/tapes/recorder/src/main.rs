@@ -29,13 +29,13 @@ use audio_wire::meter::{Coefficients, Ppm};
 use core::fmt::Write;
 use tape_panel::meters::MeterBank;
 use tape_panel::{Text, at, draw};
-use tape_rt::{AudioInfo, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_NOT_FOUND, TapeApi, println};
+use tape_rt::{AudioInfo, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FORMAT_BOOT_DISK, FS_NOT_FOUND, TapeApi, println};
 
 const MAX_CHANNELS: usize = 32;
 const PAGE_ROWS: usize = 12;
 const ROW_SCALE: usize = 8;
 const ROW_FIRST: usize = 10;
-const HINT: &str = "Space/R: record  A: auto  D: disk  F: file name  U: scale  H: holds  Q/Esc: quit";
+const HINT: &str = "Space: record  A: auto  D: disk  F: name  X: format  U: scale  H: holds  Q: quit";
 /// Bytes written to disk at a time: a multiple of the sector size, small enough that one disk write takes well under
 /// the capture ring's headroom even on a slow USB stick.
 const CHUNK: usize = 256 << 10;
@@ -126,7 +126,7 @@ impl Choice {
             DISK_FOSFS => "FOSFS",
             DISK_FAT32 => "FAT32",
             DISK_EXFAT => "exFAT",
-            _ => "?",
+            _ => "no volume",
         };
         let megabytes = self.sectors / 2048;
         let _ = write!(out, "disk{}  {kind}  ", self.number);
@@ -169,7 +169,7 @@ fn find_disks(api: &TapeApi, choices: &mut [Choice; MAX_DISKS]) -> usize {
         if (api.disk_info)(number, &mut info) == 0 {
             break;
         }
-        if info.kind == 0 || count == MAX_DISKS {
+        if count == MAX_DISKS {
             continue;
         }
         let mut model = Text::<24>::new();
@@ -195,6 +195,8 @@ struct App {
     base: Text<12>,
     /// The file name being typed (`F`), if the user is editing it.
     editing: Option<Text<12>>,
+    /// `X` was pressed: the number of the disk waiting for its confirming keypress.
+    confirming: Option<usize>,
     custom_prefix: &'static str,
     choices: [Choice; MAX_DISKS],
     choice_count: usize,
@@ -232,6 +234,8 @@ impl App {
         let number = self.choices[self.selected].number;
         let mut info = DiskInfo::default();
         if (self.api.disk_info)(number, &mut info) != 0 {
+            self.choices[self.selected].kind = info.kind;
+            self.choices[self.selected].sectors = info.sectors;
             self.choices[self.selected].free = info.free_bytes;
             self.choices[self.selected].largest = info.largest_bytes;
         }
@@ -277,6 +281,10 @@ impl App {
 
     /// Begins a take with `lead` bytes of the pre-roll ring ahead of the live audio.
     fn start(&mut self, ring: &PreRoll, lead: usize, now: u64) {
+        if self.choice_count > 0 && self.custom_prefix.is_empty() && self.choices[self.selected].kind == 0 {
+            say!(self, "disk{} has no volume to record to: X formats it as exFAT, D chooses another disk.", self.choices[self.selected].number);
+            return;
+        }
         self.done_bytes = 0;
         self.files = 0;
         if !self.open_file() {
@@ -512,7 +520,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut detector = Detector::new(options.silence, rate);
     let mut auto = options.auto;
     let mut app = App {
-        api, base: Text::from(file_part), editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        api, base: Text::from(file_part), editing: None, confirming: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
         message: Text::from("Meters and pre-roll are running. Space or R starts a take."), errors: 0, last_take_frames: 0,
     };
 
@@ -542,6 +550,28 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if event == 0 {
                 break;
             }
+            if let Some(number) = app.confirming.take() {
+                // Any key other than the disk's number cancels.
+                if (event & 0xff) as u8 == b'0' + number as u8 && event != 1 {
+                    {
+                        let mut text = Text::<100>::new();
+                        let _ = write!(text, "Formatting disk{number}: audio capture overruns while this runs...");
+                        show(6, text.as_str());
+                    }
+                    let status = (api.disk_format_exfat)(number, b"FOS".as_ptr(), 3);
+                    if status == 0 {
+                        app.refresh_free();
+                        say!(app, "disk{number} is now one exFAT volume (label FOS), readable on a PC.");
+                    } else if status == FORMAT_BOOT_DISK {
+                        say!(app, "disk{number} is the boot disk and is never formatted.");
+                    } else {
+                        say!(app, "Formatting disk{number} failed (code {status}).");
+                    }
+                } else {
+                    say!(app, "Format cancelled.");
+                }
+                continue;
+            }
             if let Some(typed) = app.editing.as_mut() {
                 // Typing a file name: letters (lower-cased), digits, `_` and `-` are the characters every volume takes.
                 let byte = (event & 0xff) as u8;
@@ -569,6 +599,21 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 break;
             }
             match (event & 0xff) as u8 {
+                b'x' | b'X' => {
+                    if app.take.is_some() {
+                        say!(app, "A take is running: stop it (Space) before formatting.");
+                    } else if app.choice_count == 0 || !app.custom_prefix.is_empty() || (api.size as usize) < core::mem::size_of::<TapeApi>() {
+                        say!(app, "No disk to format here.");
+                    } else if app.choices[app.selected].boot {
+                        say!(app, "disk{} is the boot disk and is never formatted.", app.choices[app.selected].number);
+                    } else {
+                        let choice = app.choices[app.selected];
+                        let mut size = Text::<100>::new();
+                        size_text(choice.sectors * 512, &mut size);
+                        say!(app, "ERASE disk{} ({}) as exFAT? Press {} to confirm; any other key cancels.", choice.number, size.as_str(), choice.number);
+                        app.confirming = Some(choice.number);
+                    }
+                }
                 b'f' | b'F' => {
                     if app.take.is_some() {
                         say!(app, "A take is running: stop it (Space) before changing the file name.");

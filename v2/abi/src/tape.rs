@@ -132,7 +132,17 @@ pub struct TapeApi {
     /// menu opens, not every frame. A tape built against a kernel without this call sees `size` smaller than its own
     /// `TapeApi` and must not call it.
     pub disk_info: extern "C" fn(usize, *mut DiskInfo) -> u32,
+    /// `disk_format_exfat(number, label, label_len)`: erases disk `number` (one-based) and makes it one exFAT volume that
+    /// a PC can read (GPT, cluster size chosen from the disk's size); `label` is up to 11 ASCII characters, may be empty.
+    /// 0 on success, else a `FORMAT_*` code. Everything on the disk is lost, so the tape must have asked the user; the boot
+    /// disk is refused here whatever the tape says.
+    pub disk_format_exfat: extern "C" fn(usize, *const u8, usize) -> i32,
 }
+
+pub const FORMAT_NO_DISK: i32 = -1;
+pub const FORMAT_BOOT_DISK: i32 = -2;
+pub const FORMAT_BAD_LABEL: i32 = -3;
+pub const FORMAT_FAILED: i32 = -4;
 
 /// `DiskInfo::kind`: what a disk's volume is. FAT32 and exFAT disks are reached as `diskN/NAME`, like a FOSFS one.
 pub const DISK_NO_VOLUME: u32 = 0;

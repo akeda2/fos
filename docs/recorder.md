@@ -54,3 +54,18 @@ unused tail is freed when the take ends.
   FAT; FOSFS to FAT keeps the name, FAT to FOSFS needs a legal FOSFS name or a new one). A bare name, `@LABEL`, scripts,
   tapes and the start/config files only ever look at FOSFS. Whole files go through memory (64 MiB limit). `cat diskN NAME` shows files up to 64 KiB and `write diskN NAME TEXT` creates or replaces a file (not an empty one).
 * Not supported: subdirectories (FOSFS is flat, FAT/exFAT are only for moving files to another OS).
+
+## Formatting a stick as exFAT
+
+`fat::format_exfat` (`v2/fat/src/format.rs`) writes a complete exFAT volume: boot region and its backup, FAT, allocation
+bitmap, an up-case table (`v2/tools/gen_upcase.py` generates `upcase.bin` from Unicode data) and an empty root directory. The
+cluster size follows the volume size as Windows chooses it (4 KiB up to 256 MiB, 32 KiB up to 32 GiB, 128 KiB above). The
+kernel (`fatvol::format_exfat`) first writes a GPT with one basic-data partition at 1 MiB, so a PC mounts the stick directly.
+
+* Shell: `format diskN exfat [LABEL]` says what the disk holds now and what will be erased, then `format diskN confirm`.
+* Recorder: `X` on the chosen disk asks for its number as confirmation (any other key cancels). A disk with no volume is
+  listed as `no volume` and a take on it is refused until it is formatted. The label is `FOS`.
+* Both go through the kernel and refuse the boot disk; the tape call is `disk_format_exfat`. Formatting takes a second or
+  two, during which the recorder's capture overruns.
+* Tests: `formatted_exfat_volumes_pass_fsck_and_work` (host, `fsck.exfat`), `make test-v2-format-exfat` (shell) and
+  `make test-v2-recorder-format` (the UI).

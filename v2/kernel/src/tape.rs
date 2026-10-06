@@ -371,6 +371,17 @@ extern "C" fn api_disk_info(number: usize, out: *mut fos_v2_abi::tape::DiskInfo)
     unsafe { *out = info };
     1
 }
+extern "C" fn api_disk_format_exfat(number: usize, label: *const u8, length: usize) -> i32 {
+    use crate::fatvol::FormatError;
+    let label = unsafe { core::slice::from_raw_parts(label, length) };
+    match number.checked_sub(1).map_or(Err(FormatError::NoSuchDisk), |disk| crate::fatvol::format_exfat(disk, label)) {
+        Ok(_) => 0,
+        Err(FormatError::NoSuchDisk) => fos_v2_abi::tape::FORMAT_NO_DISK,
+        Err(FormatError::BootDisk) => fos_v2_abi::tape::FORMAT_BOOT_DISK,
+        Err(FormatError::BadLabel) => fos_v2_abi::tape::FORMAT_BAD_LABEL,
+        Err(FormatError::Failed) => fos_v2_abi::tape::FORMAT_FAILED,
+    }
+}
 extern "C" fn api_nic_count() -> usize {
     term::nic_count()
 }
@@ -479,6 +490,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         audio_select: api_audio_select,
         hostname: api_hostname,
         disk_info: api_disk_info,
+        disk_format_exfat: api_disk_format_exfat,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

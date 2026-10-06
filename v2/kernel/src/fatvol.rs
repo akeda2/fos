@@ -88,3 +88,45 @@ pub type Fs = fat::Fs<Partition>;
 pub fn stamp(fs: &mut Fs) {
     fs.set_time(crate::clock::now().unwrap_or(fat::Time::DEFAULT));
 }
+
+/// Why `format_exfat` did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatError {
+    NoSuchDisk,
+    /// The boot disk is never formatted.
+    BootDisk,
+    BadLabel,
+    /// Writing the partition table or the volume failed.
+    Failed,
+}
+
+impl core::fmt::Display for FormatError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            FormatError::NoSuchDisk => "no such disk",
+            FormatError::BootDisk => "that is the boot disk",
+            FormatError::BadLabel => "a label is up to 11 printable ASCII characters, without \" * / : < > ? \\ |",
+            FormatError::Failed => "writing to the disk failed",
+        })
+    }
+}
+
+/// Replaces disk index `disk`'s partition table with one GPT partition of exFAT and formats it, with the cluster size
+/// `fat::format_exfat` picks for its size. Everything on the disk is lost. The shell's `format diskN exfat` and the tape
+/// call `disk_format_exfat` both come here (each asks the user first). Returns the volume's size in MiB.
+pub fn format_exfat(disk: usize, label: &[u8]) -> Result<u64, FormatError> {
+    let info = block::get(disk).ok_or(FormatError::NoSuchDisk)?;
+    if crate::storage::boot_disk() == Some(disk) {
+        return Err(FormatError::BootDisk);
+    }
+    if label.len() > 11 || !label.iter().all(|&byte| (0x20..0x7f).contains(&byte) && !b"\"*/:<>?\\|".contains(&byte)) {
+        return Err(FormatError::BadLabel);
+    }
+    let _ = info;
+    let partition = gpt::write_single_partition(disk, &BASIC_DATA_GUID, "exFAT data").map_err(|_| FormatError::Failed)?;
+    let mut device = Partition { disk, base: partition.start, sectors: partition.sectors };
+    // A serial number that differs between volumes: the tick and time-stamp counters, mixed.
+    let serial = (unsafe { core::arch::x86_64::_rdtsc() } as u32) ^ (crate::apic::ticks() as u32).rotate_left(16);
+    fat::format_exfat(&mut device, partition.sectors, partition.start, label, serial, crate::clock::now().unwrap_or(fat::Time::DEFAULT)).map_err(|_| FormatError::Failed)?;
+    Ok(partition.sectors / 2048)
+}

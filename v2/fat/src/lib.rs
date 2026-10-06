@@ -20,6 +20,8 @@
 #![cfg_attr(not(test), no_std)]
 
 mod exfat;
+mod format;
+pub use format::{cluster_sectors, format_exfat};
 mod fat32;
 mod name;
 

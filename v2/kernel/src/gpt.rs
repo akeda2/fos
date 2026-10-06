@@ -127,6 +127,11 @@ static mut ENTRY_ARRAY: [u8; 128 * 128] = [0; 128 * 128];
 /// is touched, but the old partitions become unreachable. Order: backup copy first, primary
 /// header last, so an interrupted write never leaves a valid-looking table that is half new.
 pub fn write_single_fosfs_partition(disk: usize) -> Result<Partition, block::Error> {
+    write_single_partition(disk, &FOSFS_TYPE_GUID, "FOSFS data")
+}
+
+/// The same for a partition of any type (`exFAT data` uses the basic-data type GUID, which is what PCs expect).
+pub fn write_single_partition(disk: usize, type_guid: &[u8; 16], name: &str) -> Result<Partition, block::Error> {
     let total = block::get(disk).ok_or(block::Error::NoSuchDisk)?.sectors;
     if total < 8192 {
         return Err(block::Error::OutOfRange);
@@ -136,11 +141,11 @@ pub fn write_single_fosfs_partition(disk: usize) -> Result<Partition, block::Err
     let partition = Partition { unique_guid: random_guid(total), start: first, sectors: last - first + 1 };
     let entries = unsafe { &mut *core::ptr::addr_of_mut!(ENTRY_ARRAY) };
     entries.fill(0);
-    entries[0..16].copy_from_slice(&FOSFS_TYPE_GUID);
+    entries[0..16].copy_from_slice(type_guid);
     entries[16..32].copy_from_slice(&partition.unique_guid);
     entries[32..40].copy_from_slice(&first.to_le_bytes());
     entries[40..48].copy_from_slice(&last.to_le_bytes());
-    for (index, unit) in "FOSFS data".encode_utf16().enumerate() {
+    for (index, unit) in name.encode_utf16().enumerate() {
         entries[56 + 2 * index..58 + 2 * index].copy_from_slice(&unit.to_le_bytes());
     }
     let entries_crc = crc32(entries);

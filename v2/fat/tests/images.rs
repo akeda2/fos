@@ -258,3 +258,32 @@ fn fat32_free_space_is_not_offered() {
     make_image(&path, 128, &["mkfs.vfat", "-F", "32", "-s", "1"]);
     assert_eq!(open(&path).free_space(), Err(Error::Unsupported));
 }
+
+#[test]
+fn formatted_exfat_volumes_pass_fsck_and_work() {
+    if !tool("fsck.exfat") {
+        return;
+    }
+    // Small (4 KiB clusters), medium (32 KiB) and one that needs a multi-cluster bitmap's worth of FAT.
+    for (megabytes, name) in [(64u64, "fmt64.img"), (600, "fmt600.img"), (3000, "fmt3000.img")] {
+        let path = scratch(name);
+        let _cleanup = Cleanup(path.clone());
+        let file = File::create(&path).unwrap();
+        file.set_len(megabytes << 20).unwrap();
+        // Old data that a format must not trust: a stale FAT/bitmap area.
+        let mut device = FileDevice(OpenOptions::new().read(true).write(true).open(&path).unwrap());
+        device.write(128, &[0xa5u8; 4096]).unwrap();
+        let clusters = fat::format_exfat(&mut device, megabytes << 11, 2048, b"FOS TEST", 0x1234_5678, Time::DEFAULT).unwrap();
+        assert!(clusters > 1000);
+        drop(device);
+        fsck(&path, &["fsck.exfat", "-n"]);
+        let mut fs = open(&path);
+        assert_eq!(fs.kind(), Kind::ExFat);
+        let (free, longest) = fs.free_space().unwrap();
+        assert!(free > (megabytes << 20) * 9 / 10 && free == longest, "{free} {longest}");
+        record(&mut fs, b"take001.wav", 0, 3_000_017, 262_144);
+        verify_read(&mut fs, b"take001.wav", 3_000_017);
+        drop(fs);
+        fsck(&path, &["fsck.exfat", "-n"]);
+    }
+}
