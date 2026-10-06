@@ -256,28 +256,85 @@ pub fn set_capture_ring(bytes: u64) {
     WANTED_CAPTURE_RING.store(bytes as usize, Ordering::Relaxed);
 }
 
-/// The capture ring: the size asked for, or the longest run of memory there is if that is less (never below the default).
-/// A ring has to be one contiguous block, so on a machine whose RAM is split by the PCI hole this is the biggest piece, not
-/// the free total.
-fn allocate_capture_ring() -> Option<PcmRing> {
-    let wanted = WANTED_CAPTURE_RING.load(Ordering::Relaxed).max(CAPTURE_RING_BYTES) as u64;
-    let mut size = (wanted.min(memory::largest_free_run() * memory::FRAME) as usize).max(CAPTURE_RING_BYTES) & !4095;
-    loop {
-        if let Some(ring) = PcmRing::allocate(size) {
-            ring.check();
-            return Some(ring);
-        }
-        if size <= CAPTURE_RING_BYTES {
-            return None;
-        }
-        size = (size / 2).max(CAPTURE_RING_BYTES) & !4095;
+/// Exercises a ring made of three separate blocks of different sizes (so frames and chunks straddle block boundaries and
+/// the wrap-around): pushes and pops odd-sized pieces of a counting pattern for many laps and checks every byte. Run at boot,
+/// since the recorder's multi-gigabyte capture ring is built the same way and a mistake here would silently scramble audio.
+pub fn ring_self_test() {
+    let sizes = [8192usize, 12288, 4096];
+    let mut ring = PcmRing::empty();
+    for &size in &sizes {
+        // A separate allocation each time, with a gap kept between them so they are not one block.
+        let Some(base) = memory::allocate_contiguous((size / 4096) as u64, None) else {
+            crate::println!("PCM ring self-test: no memory for the test blocks (skipped).");
+            ring.free();
+            return;
+        };
+        ring.push_segment(base, size);
     }
+    let (mut next_in, mut next_out) = (0u32, 0u32);
+    let mut buffer = [0u8; 5000];
+    let mut ok = true;
+    let mut step = 1usize;
+    for round in 0..4000usize {
+        // Push a piece of a size that varies, whole or not at all.
+        step = (step * 7 + 13 + round) % 4999 + 1;
+        for (index, byte) in buffer[..step].iter_mut().enumerate() {
+            *byte = (next_in.wrapping_add(index as u32) % 251) as u8;
+        }
+        if ring.push_whole(&buffer[..step]) == step {
+            next_in = next_in.wrapping_add(step as u32);
+        }
+        // Pop a different varying amount and check it is the next bytes in order.
+        let want = (step * 3 + round) % 4000 + 1;
+        let got = ring.pop(&mut buffer[..want]);
+        for (index, &byte) in buffer[..got].iter().enumerate() {
+            ok &= byte == (next_out.wrapping_add(index as u32) % 251) as u8;
+        }
+        next_out = next_out.wrapping_add(got as u32);
+    }
+    ok &= ring.available() as u32 == next_in.wrapping_sub(next_out);
+    ring.free();
+    crate::println!("PCM ring self-test ({} blocks, {} laps): {}.", sizes.len(), next_in as usize / (8192 + 12288 + 4096), if ok { "passed" } else { "FAILED" });
+}
+
+/// The capture ring: as much as was asked for, taken from as many blocks as it needs. A block is one contiguous run of
+/// memory and the biggest run on a machine whose RAM is split by the PCI hole is a fraction of the free total, so the ring
+/// is built from the biggest run, then the next biggest, until it is big enough or the memory (or `MAX_SEGMENTS`) is used
+/// up. The first block is at least the default size, or there is no ring.
+fn allocate_capture_ring() -> Option<PcmRing> {
+    let wanted = WANTED_CAPTURE_RING.load(Ordering::Relaxed).max(CAPTURE_RING_BYTES);
+    let mut ring = PcmRing::empty();
+    while ring.size < wanted && ring.count < MAX_SEGMENTS {
+        let run = memory::largest_free_run() as usize * memory::FRAME as usize;
+        let here = (wanted - ring.size).min(run) & !4095;
+        // Later blocks smaller than this are not worth a slot.
+        if here < MIN_SEGMENT && !(ring.count == 0 && here > 0) {
+            break;
+        }
+        match memory::allocate_contiguous((here / 4096) as u64, None) {
+            Some(base) => ring.push_segment(base, here),
+            None => break,
+        }
+    }
+    if ring.size < CAPTURE_RING_BYTES {
+        ring.free();
+        return None;
+    }
+    ring.check();
+    Some(ring)
 }
 const FEEDBACK_WINDOW: usize = 8;
 
-/// A byte FIFO between the foreground and the interrupt handler (one producer, one consumer).
+/// Most blocks a ring can be made of, and the smallest block worth adding after the first.
+const MAX_SEGMENTS: usize = 32;
+const MIN_SEGMENT: usize = 16 << 20;
+
+/// A byte FIFO between the foreground and the interrupt handler (one producer, one consumer). Its memory is one or more
+/// blocks (`segments`: physical address and length) that together make a ring of `size` bytes; a position in the FIFO is
+/// found by walking them, and a copy that crosses from one block to the next is two copies.
 pub struct PcmRing {
-    base: u64,
+    segments: [(u64, usize); MAX_SEGMENTS],
+    count: usize,
     size: usize,
     head: AtomicUsize, // next byte to write (producer)
     tail: AtomicUsize, // next byte to read (consumer)
@@ -285,28 +342,58 @@ pub struct PcmRing {
 }
 
 impl PcmRing {
-    fn allocate(size: usize) -> Option<PcmRing> {
-        Some(PcmRing { base: memory::allocate_contiguous((size / 4096) as u64, None)?, size, head: AtomicUsize::new(0), tail: AtomicUsize::new(0), overruns: AtomicU64::new(0) })
+    fn empty() -> PcmRing {
+        PcmRing { segments: [(0, 0); MAX_SEGMENTS], count: 0, size: 0, head: AtomicUsize::new(0), tail: AtomicUsize::new(0), overruns: AtomicU64::new(0) }
     }
-    /// Proves the ring's memory can be written and read back at its start, middle and end, and says where it is: a ring
+
+    fn push_segment(&mut self, base: u64, length: usize) {
+        self.segments[self.count] = (base, length);
+        self.count += 1;
+        self.size += length;
+    }
+
+    fn allocate(size: usize) -> Option<PcmRing> {
+        let mut ring = PcmRing::empty();
+        ring.push_segment(memory::allocate_contiguous((size / 4096) as u64, None)?, size);
+        Some(ring)
+    }
+
+    /// The address of byte `position` of the FIFO (counted from its start, wrapping at `size`) and how many bytes follow it
+    /// in the same block.
+    fn locate(&self, position: usize) -> (usize, usize) {
+        let mut offset = position % self.size;
+        for &(base, length) in &self.segments[..self.count] {
+            if offset < length {
+                return (base as usize + offset, length - offset);
+            }
+            offset -= length;
+        }
+        (0, 0)
+    }
+
+    /// Proves each block of the ring's memory can be written and read back at both ends, and says where the ring is: a ring
     /// of gigabytes lies mostly above 4 GiB, which nothing in the kernel had used before.
     fn check(&self) {
-        let ok = [0, (self.size / 2) & !7, self.size - 8].iter().all(|&offset| {
-            let at = (self.base as usize + offset) as *mut u64;
-            unsafe {
-                at.write_volatile(0x5a5a_a5a5_0f0f_f0f0 ^ offset as u64);
-                let good = at.read_volatile() == 0x5a5a_a5a5_0f0f_f0f0 ^ offset as u64;
-                at.write_volatile(0);
-                good
+        let mut ok = true;
+        let mut highest = 0u64;
+        for &(base, length) in &self.segments[..self.count] {
+            for offset in [0, length - 8] {
+                let at = (base as usize + offset) as *mut u64;
+                unsafe {
+                    at.write_volatile(0x5a5a_a5a5_0f0f_f0f0 ^ offset as u64);
+                    ok &= at.read_volatile() == 0x5a5a_a5a5_0f0f_f0f0 ^ offset as u64;
+                    at.write_volatile(0);
+                }
             }
-        });
+            highest = highest.max(base + length as u64);
+        }
         if self.size > CAPTURE_RING_BYTES {
             crate::println!(
-                "USB audio: capture ring of {} MiB at {:#x}..{:#x}{}: {}.",
+                "USB audio: capture ring of {} MiB in {} block(s), up to {:#x}{}: {}.",
                 self.size >> 20,
-                self.base,
-                self.base + self.size as u64,
-                if self.base + self.size as u64 > 1 << 32 { " (above 4 GiB)" } else { "" },
+                self.count,
+                highest,
+                if highest > 1 << 32 { " (above 4 GiB)" } else { "" },
                 if ok { "memory checked" } else { "READ-BACK FAILED" }
             );
         }
@@ -334,8 +421,12 @@ impl PcmRing {
     fn push(&self, data: &[u8]) -> usize {
         let count = data.len().min(self.space());
         let head = self.head.load(Ordering::Relaxed);
-        for (offset, &byte) in data[..count].iter().enumerate() {
-            unsafe { ((self.base as usize + (head + offset) % self.size) as *mut u8).write_volatile(byte) };
+        let mut done = 0;
+        while done < count {
+            let (address, run) = self.locate(head.wrapping_add(done));
+            let chunk = run.min(count - done);
+            unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), address as *mut u8, chunk) };
+            done += chunk;
         }
         self.head.store(head.wrapping_add(count), Ordering::Release);
         if count < data.len() {
@@ -346,15 +437,21 @@ impl PcmRing {
     fn pop(&self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.available());
         let tail = self.tail.load(Ordering::Relaxed);
-        for (offset, slot) in out[..count].iter_mut().enumerate() {
-            *slot = unsafe { ((self.base as usize + (tail + offset) % self.size) as *const u8).read_volatile() };
+        let mut done = 0;
+        while done < count {
+            let (address, run) = self.locate(tail.wrapping_add(done));
+            let chunk = run.min(count - done);
+            unsafe { core::ptr::copy_nonoverlapping(address as *const u8, out[done..].as_mut_ptr(), chunk) };
+            done += chunk;
         }
         self.tail.store(tail.wrapping_add(count), Ordering::Release);
         count
     }
     fn free(&self) {
-        if self.base != 0 {
-            memory::free(self.base, (self.size / 4096) as u64);
+        for &(base, length) in &self.segments[..self.count] {
+            if base != 0 {
+                memory::free(base, (length / 4096) as u64);
+            }
         }
     }
 }

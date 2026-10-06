@@ -37,6 +37,7 @@ def main():
         text = boot_with_commands(extra, ["usb rescan", "audio", "audio tone 440 3", "audio capture 2",
                                           "audio start 48000 playback", "sleep 3", "audio", "audio stop"])
         check(re.search(r"xHCI 00:03.0: MSI(-X)? on vector", text) is not None, "the xHCI controller takes its events by MSI (the self-test interrupt arrived)", text[-3000:])
+        check("PCM ring self-test (3 blocks" in text and "laps): passed" in text, "the multi-block PCM ring passes its boot self-test (chunks straddle block boundaries and wrap)", text[:2500])
         check("USB audio" in text and "Audio Class 1.0" in text, "the USB audio device is recognised (class 1.0)", text)
         check("playback 2 ch, 16-bit" in text and "48000" in text, "its streaming interfaces and sample rates are reported", text)
         tone = text.split("audio tone 440 3")[-1].split("audio capture")[0]

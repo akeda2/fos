@@ -163,6 +163,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     let stats = memory::stats();
     println!("Physical memory: {} MiB managed, {} MiB free (one bitmap, one pool).", stats.frames * memory::FRAME / (1024 * 1024), stats.free * memory::FRAME / (1024 * 1024));
     self_test_allocator();
+    usb_audio::ring_self_test();
 
     // ---- descriptor tables, then page tables ----
     let layout = paging::layout();
