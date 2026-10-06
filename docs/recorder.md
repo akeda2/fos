@@ -74,3 +74,18 @@ kernel (`fatvol::format_exfat`) first writes a GPT with one basic-data partition
   two, during which the recorder's capture overruns.
 * Tests: `formatted_exfat_volumes_pass_fsck_and_work` (host, `fsck.exfat`), `make test-v2-format-exfat` (shell) and
   `make test-v2-recorder-format` (the UI).
+
+## Never losing audio
+
+Audio waits in the kernel's capture ring while the tape writes to disk. The recorder asks the kernel for as much memory
+as can be spared (all free memory except 256 MiB, at most 4 GiB; `buffer=MB` sets it) through `audio_set_capture_ring`, so a
+laptop with 16 GB holds many minutes of audio and a slow stretch or a long flash stall costs nothing. The size granted is
+shown at start and the disk line shows the backlog against it: `Backlog 0.2/1006.4 s`.
+
+* **Speed test:** when a disk is chosen (at start and after `D`; `T` repeats it, `notest` skips it) the recorder writes a
+  scratch file for up to 3 s or 64 MiB and reports the sustained speed and the slowest block, then deletes the file.
+* **Warnings** (line 7, replacing the free-space line): `!! SLOW DISK` when the disk is slower than the audio (with how long the
+  buffer lasts), `Marginal disk` below twice the audio rate, `BACKLOG n%` during a take when over a quarter of the buffer is
+  waiting, and `AUDIO LOST` if the ring ever overruns.
+* The ring takes whole packets only: a full ring used to be able to keep half a packet, shifting every later frame and
+  scrambling the channels for the rest of the take.

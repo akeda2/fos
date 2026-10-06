@@ -137,6 +137,11 @@ pub struct TapeApi {
     /// 0 on success, else a `FORMAT_*` code. Everything on the disk is lost, so the tape must have asked the user; the boot
     /// disk is refused here whatever the tape says.
     pub disk_format_exfat: extern "C" fn(usize, *const u8, usize) -> i32,
+    /// `audio_set_capture_ring(bytes)`: the size of the capture ring the next `audio_start` makes (the default is 16 MiB; the
+    /// kernel halves a request it cannot satisfy down to that). The ring is what absorbs a disk that stalls or is slower
+    /// than the audio, so a recorder asks for as much memory as it can spare. The size granted is `capture_ring_bytes` in
+    /// `AudioInfo` once capture runs. The request is forgotten when the tape ends.
+    pub audio_set_capture_ring: extern "C" fn(u64),
 }
 
 pub const FORMAT_NO_DISK: i32 = -1;

@@ -249,6 +249,26 @@ const RING_BYTES: usize = 1 << 20;
 /// The capture ring is bigger: a recording to a USB stick can stall for seconds while the stick erases flash, and
 /// the ring is what rides that out (16 MiB is five seconds of 22 channels of 24-bit audio).
 const CAPTURE_RING_BYTES: usize = 16 << 20;
+/// The capture ring size a tape asked for (`audio_set_capture_ring`), 0 for the default.
+static WANTED_CAPTURE_RING: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_capture_ring(bytes: u64) {
+    WANTED_CAPTURE_RING.store(bytes.min(u64::from(u32::MAX)) as usize, Ordering::Relaxed);
+}
+
+/// The capture ring: the size asked for, halved until the allocator has a run that long, never below the default.
+fn allocate_capture_ring() -> Option<PcmRing> {
+    let mut size = WANTED_CAPTURE_RING.load(Ordering::Relaxed).max(CAPTURE_RING_BYTES) & !4095;
+    loop {
+        if let Some(ring) = PcmRing::allocate(size) {
+            return Some(ring);
+        }
+        if size <= CAPTURE_RING_BYTES {
+            return None;
+        }
+        size = (size / 2).max(CAPTURE_RING_BYTES) & !4095;
+    }
+}
 const FEEDBACK_WINDOW: usize = 8;
 
 /// A byte FIFO between the foreground and the interrupt handler (one producer, one consumer).
@@ -562,7 +582,7 @@ fn build_stream(controller: &mut Controller, device: &Device, description: &Desc
     }
     let frames = ((WINDOW * usize::from(alt.max_packet)).div_ceil(4096)) as u64;
     let buffers = memory::allocate_contiguous(frames, Some(1 << 32)).ok_or("no memory for the packet buffers")?;
-    let Some(pcm) = PcmRing::allocate(if capture { CAPTURE_RING_BYTES } else { RING_BYTES }) else {
+    let Some(pcm) = (if capture { allocate_capture_ring() } else { PcmRing::allocate(RING_BYTES) }) else {
         memory::free(buffers, frames);
         return Err("no memory for the PCM ring");
     };
@@ -953,7 +973,7 @@ pub fn fill_info(info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
     if let Some(stream) = &device.capture {
         out.capture_rate = stream.rate;
         out.capture_available = stream.pcm.available() as u32;
-        out.capture_ring_bytes = stream.pcm.size as u32;
+        out.capture_ring_bytes = stream.pcm.size.min(u32::MAX as usize) as u32;
     }
     if let Some(stream) = &device.playback {
         out.playback_rate = stream.rate;
@@ -996,6 +1016,7 @@ pub fn start_for_tape(rate: u32, capture: bool, playback: bool) -> i32 {
 }
 
 pub fn stop_for_tape() {
+    WANTED_CAPTURE_RING.store(0, Ordering::Relaxed); // a tape's request for a big ring ends with the tape
     if let Some(controller) = controller() {
         stop(controller);
     }

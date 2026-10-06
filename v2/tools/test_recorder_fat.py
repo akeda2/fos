@@ -87,7 +87,7 @@ def main():
             check("disk3" in listing, "three disks are found", listing)
             for disk, base, presses in (("disk2", "fa", 2), ("disk3", "ex", 0)):
                 # No volume in the name: the menu starts on the first exFAT disk (disk3) and `D` steps on through the disks.
-                mark = guest.send(f"run recorder {base} tone=440 pre=1")
+                mark = guest.send(f"run recorder {base} tone=440 notest pre=1")
                 guest.wait_for("fos recorder", 30, mark)
                 guest.wait_for("Record to: disk3  exFAT", 10, mark)  # the default: the first exFAT disk
                 guest.wait_for("longest run", 10, mark)
@@ -117,12 +117,29 @@ def main():
                 guest.process.stdin.flush()
                 guest.wait_for("file(s) written", 30, mark)
                 check("(with errors)" not in guest.text()[mark:], f"the take on {disk} had no errors", guest.text()[mark:][-1500:])
+            # The disk speed test: it runs on the chosen disk at start and after `D`, reports the speed, and leaves nothing behind.
+            mark = guest.send("run recorder st tone=440")
+            guest.wait_for("disk3: ", 60, mark)
+            guest.wait_for("sustained over", 60, mark)
+            for _ in range(2):  # disk3 -> disk1 -> disk2 (FAT32)
+                guest.process.stdin.write(b"d")
+                guest.process.stdin.flush()
+                guest.pump(0.8)
+            guest.wait_for("disk2: ", 60, mark)
+            check("KiB/s sustained" in guest.text()[mark:], "the speed test reports the disk's speed", guest.text()[mark:][-800:])
+            guest.process.stdin.write(b"t")  # and T tests again
+            guest.process.stdin.flush()
+            guest.pump(3.0)
+            guest.process.stdin.write(b"q")
+            guest.process.stdin.flush()
+            guest.wait_for("file(s) written", 30, mark)
         finally:
             guest.process.kill()
             guest.process.wait()
         for command, image in ((["fsck.vfat", "-n"], fat32), (["fsck.exfat", "-n"], exfat)):
             result = subprocess.run([*command, str(image)], capture_output=True, text=True)
             check(result.returncode == 0, f"{command[0]} finds {image.name} clean", result.stdout + result.stderr)
+        check("spdtest.tmp" not in exfat_files(exfat) and not fat32_file(fat32, "spdtest.tmp"), "the speed test file is gone from both volumes", "")
         for name, blob in (("fa001.wav", fat32_file(fat32, "fa001.wav")), ("ex001.wav", exfat_files(exfat).get("ex001.wav"))):
             check(blob is not None, f"{name} can be read back out of its volume", "")
             channels, rate, bits, samples, declared = wav(blob)

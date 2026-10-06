@@ -27,7 +27,7 @@ def main():
             guest.wait_for("M3 complete")
             guest.wait_for("fos> ")
             # Silence trigger: tone 0-2 s, quiet 2-6 s, tone 6-8 s, quiet 8-12 s, ...
-            mark = guest.send("run recorder auto tone=440 gate=2,4 pre=3 thresh=-40 sound=100 silence=1500")
+            mark = guest.send("run recorder auto tone=440 notest gate=2,4 pre=3 thresh=-40 sound=100 silence=1500")
             guest.wait_for("fos recorder", 30, mark)
             guest.wait_for("Saved 1 file", 30, mark)
             guest.wait_for("Recording disk1/take002.wav", 30, mark)
@@ -36,7 +36,7 @@ def main():
             guest.process.stdin.flush()
             guest.wait_for("file(s) written", 30, mark)
             # Manual take with pre-roll: started by Space after 4 s, stopped 3 s later.
-            mark = guest.send("run recorder man tone=440 pre=2")
+            mark = guest.send("run recorder man tone=440 notest pre=2")
             guest.wait_for("fos recorder", 30, mark)
             # Rename the files in the UI: F, erase the old name, type `EDTx` (letters are lower-cased), Backspace, Enter.
             for keys in (b"f", b"\x7f\x7f\x7f", b"EDTx", b"\x7f", b"\r"):
@@ -57,7 +57,7 @@ def main():
             guest.wait_for("file(s) written", 30, mark)
             # Channel selection: the test tone is 440 Hz on channel 1 and 880 Hz on channel 2. `ch=2` records only the right
             # channel; in another run `C` picks channel 2 in the UI, and a bad choice is refused.
-            mark = guest.send("run recorder cha ch=2 tone=440 pre=1")
+            mark = guest.send("run recorder cha ch=2 tone=440 notest pre=1")
             guest.wait_for("recording 2 (1)", 30, mark)
             guest.pump(1.5)
             for keys in (b" ",):
@@ -71,7 +71,7 @@ def main():
             guest.process.stdin.write(b"q")
             guest.process.stdin.flush()
             guest.wait_for("file(s) written", 30, mark)
-            mark = guest.send("run recorder chb tone=440 pre=1")
+            mark = guest.send("run recorder chb tone=440 notest pre=1")
             guest.wait_for("recording all (2)", 30, mark)
             for keys in (b"c", b"7", b"\r"):
                 guest.process.stdin.write(keys)

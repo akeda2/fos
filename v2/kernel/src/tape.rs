@@ -382,6 +382,9 @@ extern "C" fn api_disk_format_exfat(number: usize, label: *const u8, length: usi
         Err(FormatError::Failed) => fos_v2_abi::tape::FORMAT_FAILED,
     }
 }
+extern "C" fn api_audio_set_capture_ring(bytes: u64) {
+    crate::usb_audio::set_capture_ring(bytes);
+}
 extern "C" fn api_nic_count() -> usize {
     term::nic_count()
 }
@@ -491,6 +494,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         hostname: api_hostname,
         disk_info: api_disk_info,
         disk_format_exfat: api_disk_format_exfat,
+        audio_set_capture_ring: api_audio_set_capture_ring,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

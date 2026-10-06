@@ -30,7 +30,7 @@ def main():
         try:
             guest.wait_for("M3 complete")
             guest.wait_for("fos> ")
-            mark = guest.send("run recorder fm tone=440 pre=1")
+            mark = guest.send("run recorder fm tone=440 notest pre=1")
             guest.wait_for("Record to: disk1  FOSFS", 30, mark)
             key(b"d")
             guest.wait_for("Record to: disk2  no volume", 10, mark)
@@ -65,7 +65,7 @@ def main():
             key(b"q")
             guest.wait_for("file(s) written", 30, mark)
             check("(with errors)" not in guest.text()[mark:], "the take on the formatted disk had no errors", guest.text()[mark:][-1500:])
-            mark = guest.send("run recorder fm2 tone=440")
+            mark = guest.send("run recorder fm2 tone=440 notest")
             guest.wait_for("Record to: disk2  exFAT", 30, mark)  # now the default: the first exFAT disk
             key(b"d")
             guest.wait_for("Record to: disk1  FOSFS", 10, mark)

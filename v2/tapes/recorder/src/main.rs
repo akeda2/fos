@@ -37,7 +37,7 @@ const MAX_CHANNELS: usize = 32;
 const PAGE_ROWS: usize = 12;
 const ROW_SCALE: usize = 8;
 const ROW_FIRST: usize = 10;
-const HINT: &str = "Space: record  A: auto  D: disk  F: name  C: channels  X: format  U: scale  Q: quit";
+const HINT: &str = "Space: rec  A: auto  D: disk  F: name  C: chans  T: speed  X: format  Q: quit";
 /// Bytes written to disk at a time: a multiple of the sector size, small enough that one disk write takes well under
 /// the capture ring's headroom even on a slow USB stick.
 const CHUNK: usize = 256 << 10;
@@ -62,13 +62,21 @@ struct Options<'a> {
     gate: Option<(u32, u32)>,
     /// `ch=9-12`: the channels to record (None: all of them).
     channels: Option<ChannelSet>,
+    /// `buffer=MB`: the capture buffer in MiB; 0 (the default) takes as much memory as can be spared.
+    buffer_mib: u64,
+    /// `notest`: no disk speed test.
+    speed_test: bool,
 }
 
 fn parse(text: &str) -> Option<Options<'_>> {
-    let mut options = Options { name: "take", rate: 48_000, pre_seconds: 5, silence: Config::DEFAULT, auto: false, tone: None, gate: None, channels: None };
+    let mut options = Options { name: "take", rate: 48_000, pre_seconds: 5, silence: Config::DEFAULT, auto: false, tone: None, gate: None, channels: None, buffer_mib: 0, speed_test: true };
     for word in text.split_ascii_whitespace() {
         if word == "auto" {
             options.auto = true;
+            continue;
+        }
+        if word == "notest" {
+            options.speed_test = false;
             continue;
         }
         let (key, value) = match word.split_once('=') {
@@ -83,6 +91,7 @@ fn parse(text: &str) -> Option<Options<'_>> {
             "sound" => options.silence.sound_ms = value.parse().ok()?,
             "silence" => options.silence.silence_ms = value.parse().ok()?,
             "tone" => options.tone = Some(value.parse().ok()?),
+            "buffer" => options.buffer_mib = if value == "auto" { 0 } else { value.parse().ok()? },
             "ch" => options.channels = if value == "all" { None } else { Some(ChannelSet::parse(value)?) },
             "gate" => {
                 let (on, off) = value.split_once(',')?;
@@ -110,6 +119,11 @@ macro_rules! say {
 }
 
 const MAX_DISKS: usize = 8;
+/// The disk speed test: up to this many bytes or this long, whichever comes first.
+const SPEED_TEST_BYTES: u64 = 64 << 20;
+const SPEED_TEST_MICROS: u64 = 3_000_000;
+/// Memory left to the kernel and everything else when the capture buffer takes "as much as can be spared".
+const MEMORY_RESERVE: usize = 256 << 20;
 
 /// A disk the files can go to, for the `D` menu.
 #[derive(Clone, Copy)]
@@ -120,13 +134,16 @@ struct Choice {
     /// Free bytes in all and in the longest run (`u64::MAX`: not known).
     free: u64,
     largest: u64,
+    /// The last speed test: KiB/s written and the slowest 256 KiB block in ms (0: not tested).
+    speed_kib: u64,
+    worst_ms: u64,
     boot: bool,
     model: Text<24>,
     label: Text<16>,
 }
 
 impl Choice {
-    const EMPTY: Choice = Choice { number: 0, kind: 0, sectors: 0, free: u64::MAX, largest: u64::MAX, boot: false, model: Text::new(), label: Text::new() };
+    const EMPTY: Choice = Choice { number: 0, kind: 0, sectors: 0, free: u64::MAX, largest: u64::MAX, speed_kib: 0, worst_ms: 0, boot: false, model: Text::new(), label: Text::new() };
 
     fn describe(&self, out: &mut Text<100>) {
         let kind = match self.kind {
@@ -187,7 +204,7 @@ fn find_disks(api: &TapeApi, choices: &mut [Choice; MAX_DISKS]) -> usize {
         for &byte in info.label.iter().take_while(|&&byte| byte != 0) {
             label.push(byte);
         }
-        choices[count] = Choice { number, kind: info.kind, sectors: info.sectors, free: info.free_bytes, largest: info.largest_bytes, boot: info.boot != 0, model, label };
+        choices[count] = Choice { number, kind: info.kind, sectors: info.sectors, free: info.free_bytes, largest: info.largest_bytes, speed_kib: 0, worst_ms: 0, boot: info.boot != 0, model, label };
         count += 1;
     }
     count
@@ -216,6 +233,8 @@ struct App {
     frame: usize,
     /// Bytes of a device frame (all the channels), for the backlog figure.
     device_frame: usize,
+    /// The kernel's capture buffer in bytes (0 for the test tone, which has none).
+    buffer_bytes: u64,
     staging: usize,
     take: Option<Recorder<'static, StreamSink>>,
     name: Text<40>,
@@ -252,6 +271,57 @@ impl App {
             self.choices[self.selected].free = info.free_bytes;
             self.choices[self.selected].largest = info.largest_bytes;
         }
+    }
+
+    /// Writes a scratch file to the chosen disk for up to three seconds (or 64 MiB) and records how fast the disk took it:
+    /// the one thing a recorder must know before it is trusted with audio that cannot be taken twice. The file is
+    /// removed again. Capture goes on meanwhile into the kernel's buffer; this does not read it.
+    fn speed_test(&mut self) {
+        if self.choice_count == 0 || !self.custom_prefix.is_empty() {
+            return;
+        }
+        let choice = self.choices[self.selected];
+        if choice.kind == 0 {
+            return;
+        }
+        let mut name = Text::<40>::new();
+        let _ = write!(name, "disk{}/spdtest.tmp", choice.number);
+        let mut line = Text::<100>::new();
+        let _ = write!(line, "Testing the speed of disk{} (up to 3 s)...", choice.number);
+        show(6, line.as_str());
+        let api = self.api;
+        let capacity = (api.fs_stream_open)(name.as_str().as_ptr(), name.len(), SPEED_TEST_BYTES);
+        if capacity < SPEED_TEST_BYTES as isize / 4 {
+            if capacity >= 0 {
+                (api.fs_stream_close)(0);
+                (api.fs_remove)(name.as_str().as_ptr(), name.len());
+            }
+            say!(self, "Not enough free space on disk{} to test its speed.", choice.number);
+            return;
+        }
+        let staging = self.staging();
+        let (started, mut offset, mut worst) = (tape_rt::micros(), 0u64, 0u64);
+        let mut failed = false;
+        while offset + CHUNK as u64 <= capacity as u64 && offset < SPEED_TEST_BYTES && tape_rt::micros() - started < SPEED_TEST_MICROS {
+            let began = tape_rt::micros();
+            if (api.fs_stream_write)(offset, staging.as_ptr(), CHUNK, 0) != 0 {
+                failed = true;
+                break;
+            }
+            worst = worst.max(tape_rt::micros() - began);
+            offset += CHUNK as u64;
+        }
+        let elapsed = (tape_rt::micros() - started).max(1);
+        (api.fs_stream_close)(0); // a FAT volume deletes the empty file; FOSFS keeps an empty one, removed next
+        (api.fs_remove)(name.as_str().as_ptr(), name.len());
+        if failed || offset == 0 {
+            say!(self, "The speed test could not write to disk{}.", choice.number);
+            return;
+        }
+        let kib = offset * 1_000_000 / 1024 / elapsed;
+        self.choices[self.selected].speed_kib = kib;
+        self.choices[self.selected].worst_ms = worst / 1000;
+        say!(self, "disk{}: {} KiB/s sustained over {} MiB, slowest block {} ms.", choice.number, kib, offset >> 20, worst / 1000);
     }
 
     fn staging(&self) -> &'static mut [u8] {
@@ -377,6 +447,30 @@ impl App {
     }
 }
 
+/// The warning that matters most right now, or empty. Audio that cannot be taken twice is why these exist: audio is lost
+/// when the kernel's capture buffer fills, which happens when the disk is slower than the audio, or stalls for longer than
+/// the buffer lasts.
+fn warning(app: &App, backlog_bytes: u64, overruns: u64, out: &mut Text<100>) {
+    let audio_rate = (u64::from(app.format.rate) * app.frame as u64).max(1); // bytes per second written
+    if overruns > 0 {
+        let _ = write!(out, "!! AUDIO LOST: {overruns} overrun(s). The disk could not keep up. !!");
+    } else if app.buffer_bytes > 0 && backlog_bytes * 4 > app.buffer_bytes {
+        let _ = write!(out, "!! BACKLOG {}% of the buffer: the disk is falling behind !!", backlog_bytes * 100 / app.buffer_bytes);
+    } else if app.choice_count > 0 && app.custom_prefix.is_empty() && app.choices[app.selected].speed_kib > 0 {
+        let choice = &app.choices[app.selected];
+        let disk = choice.speed_kib * 1024;
+        if disk < audio_rate {
+            // The backlog grows by the difference every second; the buffer lasts this long.
+            let minutes = app.buffer_bytes / (audio_rate - disk).max(1) / 60;
+            let _ = write!(out, "!! SLOW DISK: {} KB/s vs {} KB/s of audio. Buffer lasts {} min !!", disk / 1000, audio_rate / 1000, minutes);
+        } else if disk < audio_rate * 2 {
+            let _ = write!(out, "!! Marginal disk: only {}.{}x the audio rate; long stalls could fill the buffer !!", disk / audio_rate, disk * 10 / audio_rate % 10);
+        } else if choice.worst_ms * audio_rate / 1000 > app.buffer_bytes && app.buffer_bytes > 0 {
+            let _ = write!(out, "!! The disk stalled {} ms in the test: longer than the buffer holds !!", choice.worst_ms);
+        }
+    }
+}
+
 fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, options: &Options, now: u64, started: u64) {
     let seconds = |bytes: u64| bytes / app.frame as u64 / u64::from(app.format.rate);
     let mut line = Text::<100>::new();
@@ -419,7 +513,7 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
             let _ = write!(line, " = room for {}h{:02}m at this format", minutes / 60, minutes % 60);
         }
     }
-    show(7, line.as_str());
+    let free_line = line;
     let mut line = Text::<100>::new();
     let _ = write!(
         line,
@@ -458,6 +552,9 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
         stats.capture_overruns
     );
     show(5, line.as_str());
+    let mut alarm = Text::<100>::new();
+    warning(app, u64::from(info.capture_available), stats.capture_overruns, &mut alarm);
+    show(7, if alarm.is_empty() { free_line.as_str() } else { alarm.as_str() });
     // Row 6 is the message line, and also where a prompt being typed into appears (so row 3 stays the state line).
     let mut prompt = Text::<100>::new();
     if let Some(typed) = app.channel_editing.as_ref() {
@@ -546,6 +643,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut pre_bytes = (u64::from(options.pre_seconds) * u64::from(rate)) as usize * rec_frame;
     let mut trigger_bytes = ((u64::from(options.pre_seconds) * 1000 + u64::from(options.silence.sound_ms)) * u64::from(rate) / 1000) as usize * rec_frame;
 
+    // The capture buffer: audio waits in the kernel's ring while a disk write is in progress, and a ring that is big
+    // enough means a slow disk or a long stall costs nothing. Audio must never be lost, so take all the memory that can be
+    // spared (`buffer=MB` for a fixed size). The kernel gives less if it has no run of memory that long.
+    if options.tone.is_none() {
+        let spare = ((api.free_pages)() * 4096).saturating_sub(MEMORY_RESERVE);
+        let wanted = if options.buffer_mib != 0 { (options.buffer_mib << 20) as usize } else { spare };
+        (api.audio_set_capture_ring)(wanted.min(u32::MAX as usize & !4095) as u64);
+    }
     // Capture starts now, not when a take does: the meters and the pre-roll need it.
     let status = if options.tone.is_some() { 0 } else { (api.audio_start)(rate, 1, 0) };
     if status != 0 {
@@ -570,9 +675,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let coefficients = Coefficients::for_rate(rate);
     let mut detector = Detector::new(options.silence, rate);
     let mut auto = options.auto;
+    let buffer_bytes = if options.tone.is_none() {
+        let mut running = AudioInfo::default();
+        (api.audio_info)(&mut running);
+        u64::from(running.capture_ring_bytes)
+    } else {
+        0
+    };
     let mut app = App {
-        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, device_frame: frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
-        message: Text::from("Meters and pre-roll are running. Space or R starts a take."), errors: 0, last_take_frames: 0,
+        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, device_frame: frame, buffer_bytes, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        message: Text::from("Meters and pre-roll are running. Space starts a take."), errors: 0, last_take_frames: 0,
     };
 
     if custom_prefix.is_empty() {
@@ -600,6 +712,23 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     draw_title!();
     meters.draw_scale();
+    if buffer_bytes > 0 {
+        let seconds = buffer_bytes / (u64::from(rate) * rec_frame as u64).max(1);
+        say!(app, "Capture buffer {} MiB = {}m{:02}s of audio. Space starts a take.", buffer_bytes >> 20, seconds / 60, seconds % 60);
+    }
+    if options.speed_test {
+        let buffer_message = app.message;
+        app.speed_test();
+        if app.message.as_str().starts_with("Not enough") || app.message.as_str().starts_with("The speed test") {
+            // keep the failure message
+        } else if buffer_bytes > 0 {
+            let mut text = Text::<100>::new();
+            let _ = write!(text, "{} Buffer {} MiB.", app.message.as_str(), buffer_bytes >> 20);
+            app.message = text;
+        } else {
+            let _ = buffer_message;
+        }
+    }
 
     let started = tape_rt::micros();
     let (mut produced, mut phase, mut phase2) = (0u64, 0u32, 0u32);
@@ -739,6 +868,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                         app.label_editing = Some((app.choices[app.selected].number, Text::from("FOS")));
                     }
                 }
+                b't' | b'T' => {
+                    if app.take.is_some() {
+                        say!(app, "A take is running: the speed test waits until it is stopped.");
+                    } else {
+                        app.speed_test();
+                    }
+                }
                 b'c' | b'C' => {
                     if app.take.is_some() {
                         say!(app, "A take is running: stop it (Space) before changing the channels.");
@@ -769,6 +905,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                         let mut text = Text::<100>::new();
                         app.choices[app.selected].describe(&mut text);
                         say!(app, "Recording to {}.", text.as_str());
+                        if options.speed_test {
+                            app.speed_test();
+                        }
                     } else {
                         say!(app, "There is no other disk with a volume to record to (FOSFS, FAT32 or exFAT).");
                     }
