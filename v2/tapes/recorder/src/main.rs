@@ -31,7 +31,7 @@ use audio_wire::meter::{Coefficients, Ppm};
 use core::fmt::Write;
 use tape_panel::meters::MeterBank;
 use tape_panel::{Text, at, draw};
-use tape_rt::{AudioInfo, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FORMAT_BOOT_DISK, FS_NOT_FOUND, TapeApi, println};
+use tape_rt::{AudioBuffer, AudioInfo, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FORMAT_BOOT_DISK, FS_NOT_FOUND, TapeApi, println};
 
 const MAX_CHANNELS: usize = 32;
 const PAGE_ROWS: usize = 12;
@@ -122,7 +122,7 @@ const MAX_DISKS: usize = 8;
 /// The disk speed test: up to this many bytes or this long, whichever comes first.
 const SPEED_TEST_BYTES: u64 = 64 << 20;
 const SPEED_TEST_MICROS: u64 = 3_000_000;
-/// Memory left to the kernel and everything else when the capture buffer takes "as much as can be spared".
+/// Memory left to the kernel and everything else when the capture buffer takes "as much as can be spared" (no other cap).
 const MEMORY_RESERVE: usize = 256 << 20;
 
 /// A disk the files can go to, for the `D` menu.
@@ -532,12 +532,12 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
     }
     // The backlog: audio the device has delivered that the tape has not taken yet (the kernel's capture ring). It grows
     // while a disk write stalls, and audio is lost only if it reaches the ring's size.
-    let mut info = AudioInfo::default();
+    let mut buffer = AudioBuffer::default();
     if options.tone.is_none() {
-        (app.api.audio_info)(&mut info);
+        (app.api.audio_buffer)(&mut buffer);
     }
     let per_second = (u64::from(app.format.rate) * app.device_frame as u64).max(1);
-    let (backlog, room) = (u64::from(info.capture_available) * 10 / per_second, u64::from(info.capture_ring_bytes) * 10 / per_second);
+    let (backlog, room) = (buffer.available_bytes * 10 / per_second, buffer.ring_bytes * 10 / per_second);
     let mut line = Text::<100>::new();
     let _ = write!(
         line,
@@ -553,7 +553,7 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
     );
     show(5, line.as_str());
     let mut alarm = Text::<100>::new();
-    warning(app, u64::from(info.capture_available), stats.capture_overruns, &mut alarm);
+    warning(app, buffer.available_bytes, stats.capture_overruns, &mut alarm);
     show(7, if alarm.is_empty() { free_line.as_str() } else { alarm.as_str() });
     // Row 6 is the message line, and also where a prompt being typed into appears (so row 3 stays the state line).
     let mut prompt = Text::<100>::new();
@@ -649,7 +649,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if options.tone.is_none() {
         let spare = ((api.free_pages)() * 4096).saturating_sub(MEMORY_RESERVE);
         let wanted = if options.buffer_mib != 0 { (options.buffer_mib << 20) as usize } else { spare };
-        (api.audio_set_capture_ring)(wanted.min(u32::MAX as usize & !4095) as u64);
+        (api.audio_set_capture_ring)(wanted as u64);
     }
     // Capture starts now, not when a take does: the meters and the pre-roll need it.
     let status = if options.tone.is_some() { 0 } else { (api.audio_start)(rate, 1, 0) };
@@ -676,9 +676,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut detector = Detector::new(options.silence, rate);
     let mut auto = options.auto;
     let buffer_bytes = if options.tone.is_none() {
-        let mut running = AudioInfo::default();
-        (api.audio_info)(&mut running);
-        u64::from(running.capture_ring_bytes)
+        let mut running = AudioBuffer::default();
+        (api.audio_buffer)(&mut running);
+        running.ring_bytes
     } else {
         0
     };

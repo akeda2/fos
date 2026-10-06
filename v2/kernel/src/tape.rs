@@ -382,6 +382,10 @@ extern "C" fn api_disk_format_exfat(number: usize, label: *const u8, length: usi
         Err(FormatError::Failed) => fos_v2_abi::tape::FORMAT_FAILED,
     }
 }
+extern "C" fn api_audio_buffer(out: *mut fos_v2_abi::tape::AudioBuffer) {
+    let (ring_bytes, available_bytes) = crate::usb_audio::buffer_info();
+    unsafe { *out = fos_v2_abi::tape::AudioBuffer { ring_bytes, available_bytes } };
+}
 extern "C" fn api_audio_set_capture_ring(bytes: u64) {
     crate::usb_audio::set_capture_ring(bytes);
 }
@@ -494,6 +498,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         hostname: api_hostname,
         disk_info: api_disk_info,
         disk_format_exfat: api_disk_format_exfat,
+        audio_buffer: api_audio_buffer,
         audio_set_capture_ring: api_audio_set_capture_ring,
     };
     term::clear_frame_queue();

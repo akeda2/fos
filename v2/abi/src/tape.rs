@@ -137,11 +137,26 @@ pub struct TapeApi {
     /// 0 on success, else a `FORMAT_*` code. Everything on the disk is lost, so the tape must have asked the user; the boot
     /// disk is refused here whatever the tape says.
     pub disk_format_exfat: extern "C" fn(usize, *const u8, usize) -> i32,
+    /// `audio_buffer(out)`: the capture ring's size and how much is waiting in it (64-bit, unlike `AudioInfo`'s 32-bit
+    /// `capture_available`): the backlog a slow disk builds, against the room before audio is dropped. Zeros when capture is not
+    /// running. A separate call, not more fields in `AudioInfo`, so that tapes built before it was added never have the kernel
+    /// write past the end of their copy of that struct.
+    pub audio_buffer: extern "C" fn(*mut AudioBuffer),
     /// `audio_set_capture_ring(bytes)`: the size of the capture ring the next `audio_start` makes (the default is 16 MiB; the
     /// kernel halves a request it cannot satisfy down to that). The ring is what absorbs a disk that stalls or is slower
     /// than the audio, so a recorder asks for as much memory as it can spare. The size granted is `capture_ring_bytes` in
     /// `AudioInfo` once capture runs. The request is forgotten when the tape ends.
     pub audio_set_capture_ring: extern "C" fn(u64),
+}
+
+/// What `audio_buffer` reports.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AudioBuffer {
+    /// The capture ring's size in bytes.
+    pub ring_bytes: u64,
+    /// Bytes in it that the tape has not read yet.
+    pub available_bytes: u64,
 }
 
 pub const FORMAT_NO_DISK: i32 = -1;
@@ -199,8 +214,6 @@ pub struct AudioInfo {
     /// Bytes of room in the playback ring and bytes waiting in the capture ring.
     pub playback_space: u32,
     pub capture_available: u32,
-    /// The capture ring's size in bytes (what `capture_available` can grow to before audio is dropped).
-    pub capture_ring_bytes: u32,
 }
 
 #[repr(C)]

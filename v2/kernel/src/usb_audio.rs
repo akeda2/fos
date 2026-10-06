@@ -253,7 +253,7 @@ const CAPTURE_RING_BYTES: usize = 16 << 20;
 static WANTED_CAPTURE_RING: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_capture_ring(bytes: u64) {
-    WANTED_CAPTURE_RING.store(bytes.min(u64::from(u32::MAX)) as usize, Ordering::Relaxed);
+    WANTED_CAPTURE_RING.store(bytes as usize, Ordering::Relaxed);
 }
 
 /// The capture ring: the size asked for, halved until the allocator has a run that long, never below the default.
@@ -261,6 +261,7 @@ fn allocate_capture_ring() -> Option<PcmRing> {
     let mut size = WANTED_CAPTURE_RING.load(Ordering::Relaxed).max(CAPTURE_RING_BYTES) & !4095;
     loop {
         if let Some(ring) = PcmRing::allocate(size) {
+            ring.check();
             return Some(ring);
         }
         if size <= CAPTURE_RING_BYTES {
@@ -284,6 +285,30 @@ impl PcmRing {
     fn allocate(size: usize) -> Option<PcmRing> {
         Some(PcmRing { base: memory::allocate_contiguous((size / 4096) as u64, None)?, size, head: AtomicUsize::new(0), tail: AtomicUsize::new(0), overruns: AtomicU64::new(0) })
     }
+    /// Proves the ring's memory can be written and read back at its start, middle and end, and says where it is: a ring
+    /// of gigabytes lies mostly above 4 GiB, which nothing in the kernel had used before.
+    fn check(&self) {
+        let ok = [0, (self.size / 2) & !7, self.size - 8].iter().all(|&offset| {
+            let at = (self.base as usize + offset) as *mut u64;
+            unsafe {
+                at.write_volatile(0x5a5a_a5a5_0f0f_f0f0 ^ offset as u64);
+                let good = at.read_volatile() == 0x5a5a_a5a5_0f0f_f0f0 ^ offset as u64;
+                at.write_volatile(0);
+                good
+            }
+        });
+        if self.size > CAPTURE_RING_BYTES {
+            crate::println!(
+                "USB audio: capture ring of {} MiB at {:#x}..{:#x}{}: {}.",
+                self.size >> 20,
+                self.base,
+                self.base + self.size as u64,
+                if self.base + self.size as u64 > 1 << 32 { " (above 4 GiB)" } else { "" },
+                if ok { "memory checked" } else { "READ-BACK FAILED" }
+            );
+        }
+    }
+
     pub fn available(&self) -> usize {
         self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire))
     }
@@ -973,7 +998,6 @@ pub fn fill_info(info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
     if let Some(stream) = &device.capture {
         out.capture_rate = stream.rate;
         out.capture_available = stream.pcm.available() as u32;
-        out.capture_ring_bytes = stream.pcm.size.min(u32::MAX as usize) as u32;
     }
     if let Some(stream) = &device.playback {
         out.playback_rate = stream.rate;
@@ -1013,6 +1037,11 @@ pub fn start_for_tape(rate: u32, capture: bool, playback: bool) -> i32 {
         Err("the device has no capture stream") | Err("the device has no playback stream") => AUDIO_NO_DIRECTION,
         Err(_) => AUDIO_FAILED,
     }
+}
+
+/// The capture ring's size and backlog, for `audio_buffer`.
+pub fn buffer_info() -> (u64, u64) {
+    audio().and_then(|device| device.capture.as_ref()).map_or((0, 0), |stream| (stream.pcm.size as u64, stream.pcm.available() as u64))
 }
 
 pub fn stop_for_tape() {
