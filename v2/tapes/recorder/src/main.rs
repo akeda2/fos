@@ -248,6 +248,9 @@ struct App {
     device_frame: usize,
     /// The kernel's capture buffer in bytes (0 for the test tone, which has none).
     buffer_bytes: u64,
+    /// The most audio that has been waiting in the kernel's buffer since the take began (sampled every pass of the main loop,
+    /// so a stall of the disk shows as the backlog it built up).
+    peak_backlog: u64,
     staging: usize,
     take: Option<Recorder<'static, StreamSink>>,
     name: Text<40>,
@@ -396,6 +399,7 @@ impl App {
     /// Begins a take with `lead` bytes of the pre-roll ring ahead of the live audio.
     fn start(&mut self, ring: &PreRoll, lead: usize, now: u64) {
         self.cancel_speed_test();
+        self.peak_backlog = 0; // the peak is per take
         if self.choice_count > 0 && self.custom_prefix.is_empty() && self.choices[self.selected].kind == 0 {
             say!(self, "disk{} has no volume to record to: X formats it as exFAT, D chooses another disk.", self.choices[self.selected].number);
             return;
@@ -570,17 +574,19 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
         (app.api.audio_buffer)(&mut buffer);
     }
     let per_second = (u64::from(app.format.rate) * app.device_frame as u64).max(1);
-    let (backlog, room) = (buffer.available_bytes * 10 / per_second, buffer.ring_bytes * 10 / per_second);
+    let (backlog, room) = (buffer.available_bytes * 10 / per_second, buffer.ring_bytes / per_second);
+    let peak = app.peak_backlog.max(buffer.available_bytes) * 10 / per_second;
     let mut line = Text::<100>::new();
     let _ = write!(
         line,
-        "Disk {} KiB/s, worst {} ms  Backlog {}.{}/{}.{} s  Errors {}  Overruns {}",
+        "Disk {} KiB/s, worst {} ms  Backlog {}.{} (peak {}.{}) of {} s  Err {} Ovr {}",
         sink.kib_per_second(),
         sink.write_max_us / 1000,
         backlog / 10,
         backlog % 10,
-        room / 10,
-        room % 10,
+        peak / 10,
+        peak % 10,
+        room,
         stats.capture_errors,
         stats.capture_overruns
     );
@@ -723,7 +729,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         0
     };
     let mut app = App {
-        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, speed: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, device_frame: frame, buffer_bytes, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, speed: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, device_frame: frame, buffer_bytes, peak_backlog: 0, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
         message: Text::from("Meters and pre-roll are running. Space starts a take."), errors: 0, last_take_frames: 0,
     };
 
@@ -955,6 +961,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
 
         // ---- audio ----
+        if options.tone.is_none() {
+            // The backlog right now: after a long disk write this is the audio that piled up while it ran.
+            let mut waiting = AudioBuffer::default();
+            (api.audio_buffer)(&mut waiting);
+            app.peak_backlog = app.peak_backlog.max(waiting.available_bytes);
+        }
         let got = if let Some(frequency) = options.tone {
             // Paced by the clock like a device. With a gate the tone alternates with silence.
             let due = (tape_rt::micros() - started) * u64::from(rate) / 1_000_000;

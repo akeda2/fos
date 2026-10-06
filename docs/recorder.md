@@ -80,7 +80,7 @@ kernel (`fatvol::format_exfat`) first writes a GPT with one basic-data partition
 Audio waits in the kernel's capture ring while the tape writes to disk. The recorder asks the kernel for as much memory
 as can be spared (all free memory except 256 MiB, at most 4 GiB; `buffer=MB` sets it) through `audio_set_capture_ring`, so a
 laptop with 16 GB holds many minutes of audio and a slow stretch or a long flash stall costs nothing. The size granted is
-shown at start and the disk line shows the backlog against it: `Backlog 0.2/1006.4 s`.
+shown at start and the disk line shows the backlog, its peak since the take began and the buffer's size in seconds: `Backlog 0.2 (peak 3.4) of 2582 s`.
 
 * **Speed test:** when a disk is chosen (at start and after `D`; `T` repeats it, `notest` skips it) the recorder writes a
   scratch file for up to 3 s or 64 MiB and reports the sustained speed and the slowest block, then deletes the file.
