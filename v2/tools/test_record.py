@@ -41,15 +41,28 @@ def fosfs_files(image: Path):
     raise SystemExit("FAIL: no FOSFS volume found in the image")
 
 
-def wav_info(blob: bytes):
-    """(channels, rate, bits, data bytes declared, samples of channel 0) of a canonical 44-byte-header WAV."""
-    check(blob[:4] == b"RIFF" and blob[8:16] == b"WAVEfmt ", "a RIFF/WAVE header", blob[:16].hex())
-    channels, rate = struct.unpack_from("<HI", blob, 22)
-    bits = struct.unpack_from("<H", blob, 34)[0]
-    declared = struct.unpack_from("<I", blob, 40)[0]
-    check(struct.unpack_from("<I", blob, 4)[0] == 36 + declared, "RIFF size = 36 + data size", "")
-    body = blob[44:44 + declared]
+def wav(blob: bytes):
+    """(channels, rate, bits, samples of channel 0, data length declared) by walking the chunks."""
+    check(blob[:4] == b"RIFF" and blob[8:12] == b"WAVE", "a RIFF/WAVE header", blob[:16].hex())
+    at, fmt, declared, body = 12, None, None, b""
+    while at + 8 <= len(blob):
+        tag, size = blob[at:at + 4], struct.unpack_from("<I", blob, at + 4)[0]
+        if tag == b"fmt ":
+            fmt = struct.unpack_from("<HHIIHH", blob, at + 8)
+        if tag == b"data":
+            declared, body = size, blob[at + 8:at + 8 + size]
+            check(len(blob) == at + 8 + size, "the file is exactly header + data", f"{len(blob)} vs {at + 8 + size}")
+            check(struct.unpack_from("<I", blob, 4)[0] == at + size, "RIFF size = everything after the first 8 bytes", "")
+            break
+        at += 8 + size
+    check(fmt is not None and declared is not None, "fmt and data chunks present", "")
+    channels, rate, bits = fmt[1], fmt[2], fmt[5]
     samples = struct.unpack(f"<{len(body) // 2}h", body[:len(body) // 2 * 2])[::channels]
+    return channels, rate, bits, samples, declared
+
+
+def wav_info(blob: bytes):
+    channels, rate, bits, samples, declared = wav(blob)
     return channels, rate, bits, declared, samples
 
 
@@ -81,17 +94,16 @@ def main():
         files = fosfs_files(image)
         channels, rate, bits, declared, samples = wav_info(files["t1.wav"])
         check((channels, rate, bits, declared) == (2, 48000, 16, 240000 * 4), f"t1.wav: 2 channels, 48 kHz, 16 bit, {declared} data bytes", "")
-        check(len(files["t1.wav"]) == 44 + declared, "and the file is exactly header + data", "")
         measured = tone_frequency(samples, rate, samples[rate:2 * rate])
         check(abs(measured - 440) < 5, f"the recorded tone is {measured:.1f} Hz (wanted 440)", "")
         channels, rate, bits, declared, samples = wav_info(files["t2.wav"])
         check(3.5 * rate * 4 < declared < 5.5 * rate * 4, f"t2.wav (Escape after ~4 s) holds {declared / 4 / rate:.1f} s", "")
-        check(len(files["t2.wav"]) == 44 + declared, "with a header that matches its length", "")
+        check(True, "with a header that matches its length", "")
         measured = tone_frequency(samples, rate, samples[rate:2 * rate])
         check(abs(measured - 880) < 8, f"and {measured:.1f} Hz inside (wanted 880)", "")
         channels, rate, bits, declared, samples = wav_info(files["t3.wav"])
         check(2.5 * rate * 4 < declared <= 7.5 * rate * 4, f"t3.wav (power cut after ~7 s) kept {declared / 4 / rate:.1f} s", "")
-        check(len(files["t3.wav"]) == 44 + declared, "with a header that matches its length (checkpointed)", "")
+        check(True, "with a header that matches its length (checkpointed)", "")
         measured = tone_frequency(samples, rate, samples[rate:2 * rate])
         check(abs(measured - 660) < 8, f"and {measured:.1f} Hz inside (wanted 660)", "")
     print("v2 record: all checks passed")

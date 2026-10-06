@@ -1150,8 +1150,10 @@ fn execute(command: &str) {
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
-            crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL)");
-            crate::println!("ls [diskN]        list FOSFS files");
+            crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL;");
+            crate::println!("          a FAT32/exFAT disk too, by its diskN: ls cat write rm copy)");
+            crate::println!("ls [diskN]        list FOSFS files (a FAT32/exFAT disk too, if named)");
+            crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");
             crate::println!("cat [diskN] NAME  show a file");
             crate::println!("write [diskN] NAME TEXT   create or replace a file");
             crate::println!("rm [diskN] NAME   delete a file");
@@ -1294,6 +1296,42 @@ fn execute(command: &str) {
             match crate::storage::boot_disk() {
                 Some(disk) => crate::println!("boot disk: disk{}", disk + 1),
                 None => crate::println!("boot disk: not identified"),
+            }
+        }
+        "date" => date_command(words),
+        "cat" if words.clone().next().and_then(fat_disk).is_some() => {
+            let first = words.next().unwrap_or("");
+            let named = first.split_once('/').map(|(_, name)| name).filter(|name| !name.is_empty()).or_else(|| words.next());
+            match (fat_disk(first), named) {
+                (Some((_, fs, _)), Some(name)) => fat_cat(fs, name),
+                _ => crate::println!("Usage: cat diskN NAME   (or diskN/NAME)"),
+            }
+        }
+        "write" if words.clone().next().and_then(fat_disk).is_some() => {
+            let first = words.clone().next().unwrap_or("");
+            let has_slash = first.split_once('/').is_some_and(|(_, name)| !name.is_empty());
+            let (name, skipped) = if has_slash { (first.split_once('/').map(|(_, name)| name), 2) } else { (words.clone().nth(1), 3) };
+            // The text is everything after the volume (and name) words of the original line.
+            let mut text = command.trim_start();
+            for _ in 0..skipped {
+                text = text.trim_start().split_once(char::is_whitespace).map_or("", |(_, rest)| rest);
+            }
+            match (fat_disk(first), name) {
+                (Some((_, fs, _)), Some(name)) => fat_write(fs, name, text.trim_start()),
+                _ => crate::println!("Usage: write diskN NAME TEXT   (or diskN/NAME TEXT)"),
+            }
+        }
+        "ls" if words.clone().next().and_then(fat_disk).is_some() => {
+            if let Some((number, fs, _)) = words.next().and_then(fat_disk) {
+                fat_list(number, fs);
+            }
+        }
+        "rm" if words.clone().next().and_then(fat_disk).is_some() => {
+            let first = words.next().unwrap_or("");
+            let named = first.split_once('/').map(|(_, name)| name).filter(|name| !name.is_empty()).or_else(|| words.next());
+            match (fat_disk(first), named) {
+                (Some((_, fs, _)), Some(name)) => fat_remove(fs, name),
+                _ => crate::println!("Usage: rm diskN NAME   (or diskN/NAME)"),
             }
         }
         "ls" => files(&mut words, |volume, _, _| {
@@ -1654,6 +1692,234 @@ enum String8Error {
     Volume(crate::storage::VolumeError),
 }
 
+/// `diskN` (or `diskN/NAME`) naming a disk that has a FAT32/exFAT volume and no FOSFS one: the volume and the file
+/// name after the slash, if any. FAT is only ever reached by naming its disk; a bare name, `@LABEL` and every search
+/// the shell does for its own files (`start`, scripts, tapes) look at FOSFS volumes alone.
+fn fat_disk(word: &str) -> Option<(usize, crate::fatvol::Fs, Option<&str>)> {
+    let (disk, name) = match word.split_once('/') {
+        Some((disk, name)) => (disk, Some(name)),
+        None => (word, None),
+    };
+    let number = disk.strip_prefix("disk")?.parse::<usize>().ok()?;
+    if number == 0 || crate::storage::volume_on(number).is_ok() {
+        return None;
+    }
+    crate::fatvol::mount(number - 1).map(|fs| (number, fs, name))
+}
+
+fn fat_error_text(error: fat::Error) -> &'static str {
+    match error {
+        fat::Error::Device => "the disk failed",
+        fat::Error::NoSpace => "no room on the volume",
+        fat::Error::BadName => "that name cannot be used on a FAT volume",
+        fat::Error::NotFound => "no such file",
+        fat::Error::Corrupt => "the file system is damaged (check it on a PC)",
+        _ => "the volume cannot be used",
+    }
+}
+
+/// `ls diskN` on a FAT volume: names, sizes and the time each was last written.
+fn fat_list(number: usize, mut fs: crate::fatvol::Fs) {
+    let kind = if fs.kind() == fat::Kind::ExFat { "exFAT" } else { "FAT32" };
+    let mut any = false;
+    let outcome = fs.list(|entry| {
+        any = true;
+        let name = core::str::from_utf8(entry.name()).unwrap_or("?");
+        match entry.modified {
+            Some(time) => {
+                if entry.is_directory {
+                    crate::println!("{name:<28} {:>10}        {}", "<dir>", crate::clock::Display(time));
+                } else {
+                    crate::println!("{name:<28} {:>10} bytes  {}", entry.size, crate::clock::Display(time));
+                }
+            }
+            None if entry.is_directory => crate::println!("{name:<28} {:>10}", "<dir>"),
+            None => crate::println!("{name:<28} {:>10} bytes", entry.size),
+        }
+    });
+    match outcome {
+        Ok(()) if !any => crate::println!("disk{number} ({kind}) is empty."),
+        Ok(()) => {}
+        Err(error) => crate::println!("ls: disk{number}: {}.", fat_error_text(error)),
+    }
+}
+
+/// `rm diskN NAME` / `rm diskN/NAME` on a FAT volume.
+fn fat_remove(mut fs: crate::fatvol::Fs, name: &str) {
+    match fs.remove(name.as_bytes()) {
+        Ok(true) => crate::println!("Removed {name}."),
+        Ok(false) => crate::println!("rm: no such file (directories are not removed here)."),
+        Err(error) => crate::println!("rm: {}.", fat_error_text(error)),
+    }
+}
+
+/// `cat diskN NAME` on a FAT volume (up to the shell's file buffer; anything but printable text shows as dots).
+fn fat_cat(mut fs: crate::fatvol::Fs, name: &str) {
+    let entry = match fs.entry(name.as_bytes()) {
+        Ok(Some(entry)) if !entry.is_directory => entry,
+        Ok(_) => return crate::println!("cat: no such file."),
+        Err(error) => return crate::println!("cat: {}.", fat_error_text(error)),
+    };
+    if entry.size as usize > FILE_CAPACITY {
+        return crate::println!("cat: {name} is {} bytes; only files up to {FILE_CAPACITY} bytes are shown (copy it to FOSFS or use a PC).", entry.size);
+    }
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(FILE_BUFFER) };
+    match fs.read(&entry.file(), 0, &mut buffer[..entry.size as usize]) {
+        Ok(length) => {
+            let text = &buffer[..length];
+            crate::print(format_args!("{}", String8(text)));
+            if !text.ends_with(b"\n") {
+                crate::println!();
+            }
+        }
+        Err(error) => crate::println!("cat: {}.", fat_error_text(error)),
+    }
+}
+
+/// `write diskN NAME TEXT` on a FAT volume: creates or replaces the file with the text.
+fn fat_write(mut fs: crate::fatvol::Fs, name: &str, text: &str) {
+    if text.is_empty() {
+        return crate::println!("write: nothing to write (an empty file cannot be created on a FAT volume here).");
+    }
+    let outcome = fs.create(name.as_bytes(), text.len() as u64).and_then(|stream| {
+        fs.write(&stream, 0, text.as_bytes(), text.len() as u64)?;
+        fs.finish(&stream, name.as_bytes(), text.len() as u64)
+    });
+    match outcome {
+        Ok(()) => crate::println!("Wrote {} bytes to {name}.", text.len()),
+        Err(error) => crate::println!("write: {}.", fat_error_text(error)),
+    }
+}
+
+/// `date` shows the clock; `date set YYYY-MM-DD HH:MM[:SS]` sets it (local time) and writes the RTC.
+fn date_command(mut words: core::str::SplitWhitespace) {
+    match words.next() {
+        None => match crate::clock::now() {
+            Some(time) => crate::println!("{} (local time, from the RTC)", crate::clock::Display(time)),
+            None => crate::println!("The clock is not set (the RTC held no valid time). `date set YYYY-MM-DD HH:MM`."),
+        },
+        Some("set") => {
+            let parsed = (|| {
+                let date = words.next()?;
+                let time = words.next()?;
+                let mut parts = date.split('-');
+                let (year, month, day) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+                let mut parts = time.split(':');
+                let (hour, minute) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+                let second = parts.next().map_or(Some(0), |word| word.parse().ok())?;
+                Some(fat::Time { year, month, day, hour, minute, second })
+            })();
+            match parsed {
+                None => crate::println!("Usage: date set YYYY-MM-DD HH:MM[:SS]   (local time)"),
+                Some(time) => match crate::clock::set(&time) {
+                    Ok(()) => crate::println!("The clock is {}.", crate::clock::Display(time)),
+                    Err(reason) => crate::println!("date: {reason}"),
+                },
+            }
+        }
+        Some(_) => crate::println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
+    }
+}
+
+/// A file copied to or from a FAT volume (one of the two ends is FAT). Through memory, like the FOSFS copy.
+fn copy_with_fat(source: &str, name: &str, destination: &str, new_name: &str, source_fat: Option<(usize, crate::fatvol::Fs, Option<&str>)>, destination_fat: Option<(usize, crate::fatvol::Fs, Option<&str>)>) {
+    const LIMIT: usize = 64 << 20;
+    if let (Some((a, _, _)), Some((b, _, _))) = (&source_fat, &destination_fat) {
+        if a == b && name == new_name {
+            return crate::println!("copy: source and destination are the same file.");
+        }
+    }
+    // The source: its length, and later its bytes.
+    let mut source_fosfs = None;
+    let mut source_fs = source_fat.map(|(_, fs, _)| fs);
+    let mut entry = None;
+    let length = if let Some(fs) = source_fs.as_mut() {
+        match fs.entry(name.as_bytes()) {
+            Ok(Some(found)) if !found.is_directory => {
+                entry = Some(found);
+                found.size as usize
+            }
+            Ok(_) => return crate::println!("copy: {name}: no such file on {source}."),
+            Err(error) => return crate::println!("copy: {}.", fat_error_text(error)),
+        }
+    } else {
+        match volume_word(source) {
+            Some(Ok((_, volume))) => match volume.file_length(name.as_bytes()) {
+                Ok(Some(length)) => {
+                    source_fosfs = Some(volume);
+                    length as usize
+                }
+                Ok(None) => return crate::println!("copy: {name}: no such file on {source}."),
+                Err(error) => return crate::println!("copy: {name}: {error:?}"),
+            },
+            Some(Err(String8Error::NoLabel)) => return crate::println!("copy: no volume carries the label in {source}."),
+            Some(Err(String8Error::Volume(error))) => return crate::println!("copy: {source}: {error}."),
+            None => return crate::println!("copy: {source} is not diskN or @LABEL."),
+        }
+    };
+    if destination_fat.is_none() && !crate::fosfs::valid_name(new_name.as_bytes()) {
+        return crate::println!("copy: {new_name} is not a FOSFS file name (lowercase letters, digits . _ -, up to 16): give a new name, `copy {source} {name} {destination} NEWNAME`.");
+    }
+    if length > LIMIT {
+        return crate::println!("copy: {name} is {} MiB; the limit is {} MiB.", length >> 20, LIMIT >> 20);
+    }
+    if length == 0 && destination_fat.is_some() {
+        return crate::println!("copy: an empty file cannot be written to a FAT volume here.");
+    }
+    let destination_volume = if destination_fat.is_none() {
+        match volume_word(destination) {
+            Some(Ok((_, volume))) => Some(volume),
+            Some(Err(String8Error::NoLabel)) => return crate::println!("copy: no volume carries the label in {destination}."),
+            Some(Err(String8Error::Volume(error))) => return crate::println!("copy: {destination}: {error}."),
+            None => return crate::println!("copy: {destination} is not diskN or @LABEL."),
+        }
+    } else {
+        None
+    };
+    let frames = (length.max(1) as u64).div_ceil(crate::memory::FRAME);
+    let Some(buffer) = crate::memory::allocate_contiguous(frames, None) else {
+        return crate::println!("copy: not enough free memory for {length} bytes.");
+    };
+    let data = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, length) };
+    let outcome: Result<(), &'static str> = (|| {
+        // Read.
+        match (source_fs.as_mut(), source_fosfs) {
+            (Some(fs), _) => {
+                let file = entry.unwrap().file();
+                match fs.read(&file, 0, data) {
+                    Ok(read) if read == length => {}
+                    Ok(_) => return Err("the source changed while it was being read"),
+                    Err(error) => return Err(fat_error_text(error)),
+                }
+            }
+            (None, Some(volume)) => match volume.read(name.as_bytes(), data) {
+                Ok(Some(read)) if read == length => {}
+                Ok(_) => return Err("the source changed while it was being read"),
+                Err(_) => return Err("reading the source failed"),
+            },
+            (None, None) => return Err("no source"),
+        }
+        // Write.
+        if let Some((_, mut fs, _)) = destination_fat {
+            let stream = fs.create(new_name.as_bytes(), length as u64).map_err(fat_error_text)?;
+            let mut offset = 0;
+            while offset < length {
+                let count = (1 << 20).min(length - offset);
+                fs.write(&stream, offset as u64, &data[offset..offset + count], (offset + count) as u64).map_err(fat_error_text)?;
+                offset += count;
+            }
+            fs.finish(&stream, new_name.as_bytes(), length as u64).map_err(fat_error_text)
+        } else {
+            destination_volume.unwrap().write(new_name.as_bytes(), data).map_err(|error| copy_error("write", error).0)
+        }
+    })();
+    crate::memory::free(buffer, frames);
+    match outcome {
+        Ok(()) => crate::println!("Copied {name} ({length} bytes) from {source} to {destination} as {new_name}."),
+        Err(reason) => crate::println!("copy: {reason}."),
+    }
+}
+
 /// `copy SRC NAME DST [NEWNAME]`: one file from one volume to another, where SRC and DST are
 /// `diskN` or `@LABEL`. The whole file goes through a buffer taken from the page allocator, so
 /// it can be larger than the shell's own 64 KiB file buffer. The source is only read.
@@ -1691,6 +1957,10 @@ fn copy_command(mut words: core::str::SplitWhitespace) {
 
 /// The copy of one file between two local volumes (`diskN` or `@LABEL` words).
 fn copy_between(source: &str, name: &str, destination: &str, new_name: &str) {
+    let (source_fat, destination_fat) = (fat_disk(source), fat_disk(destination));
+    if source_fat.is_some() || destination_fat.is_some() {
+        return copy_with_fat(source, name, destination, new_name, source_fat, destination_fat);
+    }
     let mut resolve = |word: &str| match volume_word(word) {
         Some(Ok(found)) => Some(found),
         Some(Err(String8Error::NoLabel)) => {

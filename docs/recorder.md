@@ -1,0 +1,52 @@
+# `recorder` and the pieces under it (v2)
+
+`v2/tapes/recorder` is a field recorder for a USB audio interface: meters from the moment the tape starts, a
+pre-roll buffer, takes started by hand or by sound and ended by silence, written straight to disk as WAV.
+`tape run recorder [NAME] [pre=SECONDS] [rate=HZ] [auto] [thresh=DB] [sound=MS] [silence=MS]`
+(`tone=HZ [gate=ON,OFF]` replaces the device with a test tone, for tests without audio hardware).
+`NAME` may carry a volume (`disk2/gig`, `@label/gig`); files are `NAMEnnn.wav`, the next free number.
+
+Keys: Space/R take on/off, A auto on/off, N/B meter pages, U Nordic/dBFS, H clear holds, Q/Esc quit.
+
+## Libraries (all host-testable)
+
+| Crate | What |
+| --- | --- |
+| `v2/tapes/tape-panel` | Buffered screen output (`draw!`, `at`, `Text`) and `MeterBank`: Nordic-style PPM bars, peak hold, clip latch, paging. Used by `audio-net` and `recorder`. |
+| `v2/tapes/audio-rec` | `wav` (plain PCM / WAVE_FORMAT_EXTENSIBLE / RF64 headers), `preroll` (ring of the last seconds), `silence` (sound/silence trigger with timing), `peaks` (meters from device-format samples), `recorder` (`Recorder` over a `Sink`: block writes, header and length move together at checkpoints, split when a file is full). |
+| `v2/tapes/tape-rt` `abort` | The sticky `should_abort` wrapper (was in `audio-net`). |
+| `v2/fat` | FAT32 and exFAT: mount, root-directory lookup and read, and one contiguous file at a time written as it grows. |
+
+`cargo test --manifest-path v2/fat/Cargo.toml` runs the file systems against images made by `mkfs.vfat` /
+`mkfs.exfat`, checked with `fsck.vfat` / `fsck.exfat` (and read back by 7-Zip for FAT32; 7-Zip cannot open exFAT).
+`make test-v2-recorder` (FOSFS, gated tone through manual and automatic takes) and `make test-v2-recorder-fat`
+(FAT32 and exFAT disks in QEMU) are the end-to-end tests.
+
+## Pre-roll and the trigger
+
+Capture starts with the tape. Audio goes to the ring while no take runs; a take begins by writing the last `pre`
+seconds from the ring, then the live audio. A take started by the trigger additionally gets `sound` ms of lead, so it
+starts at the sound's onset rather than `sound` ms late. After a take ends the ring is cleared (what was in it is
+already in the file). The silence that ended an automatic take (`silence` ms) stays at the end of the file.
+
+## Files on FAT32 and exFAT
+
+The kernel's `fs_stream_*` tape calls (and `fs_read`, used to find a free name) take `diskN/NAME` for a disk that
+has no FOSFS partition but has a FAT32 or exFAT volume: a GPT basic-data partition, an MBR partition of type
+0x0b/0x0c/0x07, or a whole-disk volume (`v2/kernel/src/fatvol.rs`). A recording is one contiguous run of clusters
+reserved when the file is created (exFAT: "no FAT chain" and a bitmap claim; FAT32: the chain written once), so
+nothing is allocated while audio flows; the directory entry's size advances at checkpoints (every 2 s) and the
+unused tail is freed when the take ends.
+
+* FAT32 files are capped at 4 GiB - 1; a take that reaches the cap continues in the next numbered file with no gap.
+  WAV headers go to RF64 past 4 GiB, which only exFAT (and FOSFS) can hold.
+* Only the root directory, ASCII names up to 60 characters, 512-byte sectors, one FAT copy on exFAT.
+* Files are stamped with the clock (`v2/kernel/src/clock.rs`): the CMOS RTC read at boot, taken as local time, then
+  advanced by the APIC timer; `date` shows it and `date set YYYY-MM-DD HH:MM` sets it and writes the RTC. A dead
+  battery (no valid RTC time) gives the fixed stamp 2026-01-01 until `date set`. The modify time follows each checkpoint.
+* A power cut leaves FAT32's reserved run chained to the file (`fsck` trims it) and exFAT's unused part marked
+  allocated in the bitmap (a check frees it); the file itself holds everything up to the last checkpoint.
+* FAT is reached only by naming its disk: `ls diskN`, `rm diskN NAME`, `copy diskN NAME diskM [NEW]` (either end may be
+  FAT; FOSFS to FAT keeps the name, FAT to FOSFS needs a legal FOSFS name or a new one). A bare name, `@LABEL`, scripts,
+  tapes and the start/config files only ever look at FOSFS. Whole files go through memory (64 MiB limit). `cat diskN NAME` shows files up to 64 KiB and `write diskN NAME TEXT` creates or replaces a file (not an empty one).
+* Not supported: subdirectories (FOSFS is flat, FAT/exFAT are only for moving files to another OS).

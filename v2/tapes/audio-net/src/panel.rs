@@ -5,117 +5,21 @@
 //! net` alike. Settings are loaded from and saved to `audio.cfg` (the same file `audio-net @audio.cfg` runs), and the
 //! panel can write the `start` file that launches it at boot.
 
-use crate::abort;
 use crate::igmp::Igmp;
 use crate::net::{self, DhcpStep, DhcpTask};
 use crate::stats;
 use audio_wire::sap;
 use tape_net::MacAddress;
 use crate::{MacText, Options, Transport, parse, peers, run_once};
-use audio_wire::{ChannelSet, Cursor, meter};
+use audio_wire::{ChannelSet, Cursor};
 use core::fmt::Write;
+use tape_panel::meters::MeterBank;
+use tape_panel::{Text, at, draw};
 use tape_rt::{AudioInfo, Key, KeyDecoder, TapeApi};
 
 const CONFIG_FILE: &str = "audio.cfg";
 const START_FILE: &str = "start";
 const START_LINE: &str = "run audio-net @audio.cfg";
-
-/// The screen is written through a buffer and handed to the console in one call (`present`): printing a byte at a time
-/// makes the console repaint its whole text grid for every byte, which is what once held a stream up for 20 ms.
-static mut FRAME: [u8; 2048] = [0; 2048];
-static mut FRAME_LENGTH: usize = 0;
-
-struct Screen;
-
-impl Write for Screen {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        for &byte in text.as_bytes() {
-            unsafe {
-                if FRAME_LENGTH == 2048 {
-                    present();
-                }
-                (*(&raw mut FRAME))[FRAME_LENGTH] = byte;
-                FRAME_LENGTH += 1;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Sends what has been drawn since the last call to the console.
-fn present() {
-    unsafe {
-        if FRAME_LENGTH == 0 {
-            return;
-        }
-        let frame: &[u8; 2048] = &*(&raw const FRAME);
-        let api = tape_rt::api();
-        if api.version >= 2 {
-            (api.puts)(frame.as_ptr(), FRAME_LENGTH);
-        } else {
-            for &byte in &frame[..FRAME_LENGTH] {
-                (api.putc)(u32::from(byte));
-            }
-        }
-        FRAME_LENGTH = 0;
-    }
-}
-
-/// Draws text and presents the whole buffer (a cursor move from `at` goes out with the text that follows it).
-macro_rules! draw {
-    ($($argument:tt)*) => {{
-        let _ = Screen.write_fmt(format_args!($($argument)*));
-        present();
-    }};
-}
-
-/// Moves the cursor; it is sent together with the next `draw!`.
-fn at(row: usize, column: usize) {
-    let _ = write!(Screen, "\x1b[{row};{column}H");
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Text<const N: usize> {
-    bytes: [u8; N],
-    length: usize,
-}
-
-impl<const N: usize> Text<N> {
-    const fn new() -> Self {
-        Text { bytes: [0; N], length: 0 }
-    }
-    fn from(text: &str) -> Self {
-        let mut result = Self::new();
-        for &byte in text.as_bytes() {
-            result.push(byte);
-        }
-        result
-    }
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
-    }
-    fn push(&mut self, byte: u8) {
-        if self.length < N {
-            self.bytes[self.length] = byte;
-            self.length += 1;
-        }
-    }
-    fn pop(&mut self) {
-        self.length = self.length.saturating_sub(1);
-    }
-    fn is_empty(&self) -> bool {
-        self.length == 0
-    }
-}
-
-impl<const N: usize> Write for Text<N> {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        for &byte in text.as_bytes() {
-            self.push(byte);
-        }
-        Ok(())
-    }
-}
 
 const MODES: [&str; 4] = ["Send", "Receive", "Duplex (send and receive)", "Serve (Ogg Opus over HTTP, for a browser or VLC)"];
 /// `Settings::mode` of the HTTP server.
@@ -344,7 +248,7 @@ impl<const N: usize> TextField for Text<N> {
         Text::pop(self)
     }
     fn clear(&mut self) {
-        self.length = 0;
+        Text::clear(self);
     }
     fn current(&self) -> &str {
         self.as_str()
@@ -640,37 +544,20 @@ fn toggle_boot(settings: &Settings) -> &'static str {
 }
 
 /// Where the meters are drawn on the live screen (a 24-row terminal must fit them).
-const BAR_COL: usize = 10;
-/// Cells 0..=60, one per dB from -60 dBFS to full scale.
-const CELLS: i32 = 61;
-const NUMBER_COL: usize = 72;
-const CLIP_COL: usize = 79;
 const ROW_SCALE: usize = 7;
 const ROW_FIRST: usize = 9;
 const PAGE_ROWS: usize = 12;
-/// The Nordic scale's TEST (0) is -18 dBFS: cell 42. The permitted maximum level (+9) is -9 dBFS: cell 51.
-const TEST_CELL: i32 = 42;
-const PML_CELL: i32 = 51;
-const HOLD_MICROS: u64 = 3_000_000;
 const MAX_ROWS: usize = 2 * stats::MAX_CHANNELS;
+const HINT: &str = "U: Nordic/dBFS   R: reset hold   M: meters off/on   Esc or Q: stop and return";
 
 /// The live view's state, shared with the hook that draws it from inside the stream loops.
 struct Run {
     stop: bool,
     next_draw: u64,
     started: u64,
-    /// One row per channel sent, then one per channel received; each says which device channel it is.
-    rows: usize,
+    /// One meter row per channel sent, then one per channel received.
+    meters: MeterBank<MAX_ROWS>,
     sends: usize,
-    labels: [u8; MAX_ROWS],
-    page: usize,
-    /// The scale and the numbers in Nordic units (TEST = 0) instead of dBFS.
-    nordic: bool,
-    /// Rows (and the footer) still to be drawn from scratch; the drawing is spread over many calls so that none of
-    /// them holds the stream up for long.
-    needs_full: [bool; MAX_ROWS],
-    footer_dirty: bool,
-    cursor: usize,
     next_counters: u64,
     ip_shown: bool,
     /// `serve`: the HTTP port, so that the live view can show the URL once the address is known (0 otherwise).
@@ -680,13 +567,6 @@ struct Run {
     counters: Text<100>,
     message: Text<100>,
     actual: Text<100>,
-    shown_cell: [i16; MAX_ROWS],
-    shown_hold: [i16; MAX_ROWS],
-    shown_number: [i16; MAX_ROWS],
-    shown_clip: [bool; MAX_ROWS],
-    hold: [u32; MAX_ROWS],
-    hold_at: [u64; MAX_ROWS],
-    clip_at: [u64; MAX_ROWS],
     /// The longest the panel's own drawing has held up the stream loop since the run began (microseconds).
     ui_worst: u64,
     /// When the screen was last drawn (micros): drawing is held back while the playback buffer is low.
@@ -698,18 +578,8 @@ struct Run {
 
 const fn blank_run() -> Run {
     Run {
-        stop: false, next_draw: 0, started: 0, rows: 0, sends: 0, labels: [0; MAX_ROWS], page: 0, nordic: true, needs_full: [true; MAX_ROWS], footer_dirty: true, cursor: 0, next_counters: 0, ip_shown: false, serve_port: 0, mac: [0; 6], nic: 0,
-        counters: Text::new(), message: Text::new(), actual: Text::new(), shown_cell: [-1; MAX_ROWS], shown_hold: [-1; MAX_ROWS], shown_number: [i16::MIN; MAX_ROWS], shown_clip: [false; MAX_ROWS],
-        hold: [0; MAX_ROWS], hold_at: [0; MAX_ROWS], clip_at: [0; MAX_ROWS], ui_worst: 0, last_draw: 0, ui_recent: 0, ui_recent_since: 0,
-    }
-}
-
-impl Run {
-    /// Everything on the meter screen is redrawn from scratch over the next calls (new page, new scale).
-    fn mark_all(&mut self) {
-        self.needs_full = [true; MAX_ROWS];
-        self.footer_dirty = true;
-        self.cursor = 0;
+        stop: false, next_draw: 0, started: 0, meters: MeterBank::new(ROW_SCALE, ROW_FIRST, PAGE_ROWS), sends: 0, next_counters: 0, ip_shown: false, serve_port: 0, mac: [0; 6], nic: 0,
+        counters: Text::new(), message: Text::new(), actual: Text::new(), ui_worst: 0, last_draw: 0, ui_recent: 0, ui_recent_since: 0,
     }
 }
 
@@ -717,160 +587,6 @@ static mut RUN: Run = blank_run();
 
 fn run_state() -> &'static mut Run {
     unsafe { &mut *(&raw mut RUN) }
-}
-
-/// The character in cell `cell` of a bar whose level is at `level` (and peak-hold marker at `hold`): filled up to the
-/// level (`=`, and `#` above the permitted maximum), the hold marker `|`, else the scale: `:` at TEST, `.` every 6 dB.
-fn bar_char(cell: i32, level: i32, hold: i32) -> char {
-    if cell <= level {
-        if cell > PML_CELL { '#' } else { '=' }
-    } else if cell == hold {
-        '|'
-    } else if cell == TEST_CELL {
-        ':'
-    } else if cell % 6 == 0 {
-        '.'
-    } else {
-        ' '
-    }
-}
-
-/// A level in tenths of a dB as text of six columns, signed with one decimal.
-fn tenths_text(tenths: i32, out: &mut Text<8>) {
-    let magnitude = tenths.unsigned_abs();
-    let _ = write!(out, "{:>6}", {
-        let mut text = Text::<8>::new();
-        let _ = write!(text, "{}{}.{}", if tenths < 0 { '-' } else { '+' }, magnitude / 10, magnitude % 10);
-        text
-    }.as_str());
-}
-
-fn draw_scale(run: &Run) {
-    at(ROW_SCALE, 1);
-    draw!("\x1b[K");
-    for mark in (-42..=18).step_by(6) {
-        let cell = (mark + 42) as usize; // the cell is the same on both scales (the Nordic number is dBFS + 18)
-        let value = if run.nordic { mark } else { mark - 18 };
-        let mut label = Text::<8>::new();
-        let _ = write!(label, "{value}");
-        let column = (BAR_COL + cell).saturating_sub((label.length.max(1) - 1) / 2).max(1);
-        at(ROW_SCALE, column);
-        draw!("{}", label.as_str());
-    }
-    at(ROW_SCALE + 1, 1);
-    draw!("\x1b[K");
-    at(ROW_SCALE + 1, 2);
-    draw!("{}", if run.nordic { "Nordic" } else { "dBFS" });
-    for mark in (0..CELLS).step_by(6) {
-        at(ROW_SCALE + 1, BAR_COL + mark as usize);
-        draw!("{}", if mark == TEST_CELL { 'T' } else { '|' });
-    }
-    at(ROW_SCALE + 1, BAR_COL + PML_CELL as usize);
-    draw!("M");
-}
-
-fn draw_footer(run: &Run) {
-    let first = run.page * PAGE_ROWS;
-    let last = (first + PAGE_ROWS).min(run.rows);
-    at(ROW_FIRST + PAGE_ROWS, 2);
-    draw!("Channels {}-{} of {}   N: next page   B: previous page\x1b[K", first + 1, last, run.rows);
-    at(ROW_FIRST + PAGE_ROWS + 1, 2);
-    draw!("T = TEST level, -18 dBFS   M = maximum permitted, -9 dBFS   # = above it   ! = clipped\x1b[K");
-    at(ROW_FIRST + PAGE_ROWS + 2, 2);
-    draw!("U: Nordic/dBFS   R: reset hold   M: meters off/on   Esc or Q: stop and return\x1b[K");
-}
-
-/// Rows drawn per call: each call is short, and a whole page is refreshed within 100 ms.
-const ROWS_PER_CALL: usize = 3;
-
-/// Brings the visible meter rows up to date, a few rows per call. Reads each channel's detector (the highest
-/// reading since the last look, so a short peak between looks still shows), keeps a three-second peak hold and a
-/// latched clip indicator, and draws only what changed.
-fn update_meters(run: &mut Run, now: u64) {
-    let shown = stats::get();
-    let first = run.page * PAGE_ROWS;
-    for _ in 0..ROWS_PER_CALL {
-        let slot = run.cursor;
-        run.cursor = (run.cursor + 1) % PAGE_ROWS;
-        let index = first + slot;
-        let row = ROW_FIRST + slot;
-        if index >= run.rows {
-            let flag = index.min(MAX_ROWS - 1);
-            if run.needs_full[flag] {
-                at(row, 1);
-                draw!("\x1b[K");
-                run.needs_full[flag] = false;
-            }
-            continue;
-        }
-        let full = run.needs_full[index];
-        run.needs_full[index] = false;
-        let is_send = index < run.sends;
-        let channel = if is_send { index } else { index - run.sends };
-        let (detector, clip_flag) = if is_send { (&mut shown.send[channel], &mut shown.send_clip[channel]) } else { (&mut shown.receive[channel], &mut shown.receive_clip[channel]) };
-        let peak = detector.take_max();
-        if *clip_flag {
-            *clip_flag = false;
-            run.clip_at[index] = now;
-        }
-        if peak >= run.hold[index] || now > run.hold_at[index] + HOLD_MICROS {
-            run.hold[index] = peak;
-            run.hold_at[index] = now;
-        }
-        let tenths = meter::db_tenths(peak);
-        let cell = ((tenths + 600).div_euclid(10)).clamp(0, CELLS - 1);
-        let hold_cell = ((meter::db_tenths(run.hold[index]) + 600).div_euclid(10)).clamp(0, CELLS - 1);
-        let hold_cell = if hold_cell > cell && run.hold[index] >= 64 { hold_cell } else { -1 };
-        let number = if peak < 64 { i16::MAX } else { (tenths + if run.nordic { 180 } else { 0 }) as i16 };
-        let clipped = now < run.clip_at[index] + HOLD_MICROS && run.clip_at[index] != 0;
-        if full {
-            at(row, 1);
-            draw!("\x1b[K");
-            at(row, 2);
-            // Labelled by the direction of the stream (what the user is setting up), with the device channel number.
-            draw!("{} {:>2}", if is_send { "Send" } else { "Recv" }, run.labels[index]);
-        }
-        let (old_cell, old_hold) = (i32::from(run.shown_cell[index]), i32::from(run.shown_hold[index]));
-        if full || old_cell != cell || old_hold != hold_cell {
-            let (low, high) = if full {
-                (0, CELLS - 1)
-            } else {
-                let mut low = cell.min(old_cell.max(0));
-                let mut high = cell.max(old_cell);
-                for marker in [hold_cell, old_hold] {
-                    if marker >= 0 {
-                        low = low.min(marker);
-                        high = high.max(marker);
-                    }
-                }
-                (low.max(0), high.min(CELLS - 1))
-            };
-            at(row, BAR_COL + low as usize);
-            let mut bar = Text::<64>::new();
-            for c in low..=high {
-                let _ = write!(bar, "{}", bar_char(c, cell, hold_cell));
-            }
-            draw!("{}", bar.as_str());
-            run.shown_cell[index] = cell as i16;
-            run.shown_hold[index] = hold_cell as i16;
-        }
-        if full || run.shown_number[index] != number {
-            at(row, NUMBER_COL);
-            if number == i16::MAX {
-                draw!("  -inf");
-            } else {
-                let mut text = Text::<8>::new();
-                tenths_text(i32::from(number), &mut text);
-                draw!("{}", text.as_str());
-            }
-            run.shown_number[index] = number;
-        }
-        if full || run.shown_clip[index] != clipped {
-            at(row, CLIP_COL);
-            draw!("{}", if clipped { "!" } else { " " });
-            run.shown_clip[index] = clipped;
-        }
-    }
 }
 
 /// Called from inside the stream loops (as `should_abort`): reads a key, and ten times a second brings the counters,
@@ -892,38 +608,20 @@ extern "C" fn panel_hook() -> u32 {
                 run.stop = true;
                 return 1;
             }
-            b'n' | b'N' => {
-                run.page = (run.page + 1) % run.rows.div_ceil(PAGE_ROWS).max(1);
-                run.mark_all();
-            }
-            b'b' | b'B' => {
-                let pages = run.rows.div_ceil(PAGE_ROWS).max(1);
-                run.page = (run.page + pages - 1) % pages;
-                run.mark_all();
-            }
-            b'u' | b'U' => {
-                run.nordic = !run.nordic;
-                run.mark_all();
-                draw_scale(run);
-            }
-            b'r' | b'R' => {
-                run.hold = [0; MAX_ROWS];
-                run.clip_at = [0; MAX_ROWS];
-            }
+            b'n' | b'N' => run.meters.next_page(),
+            b'b' | b'B' => run.meters.previous_page(),
+            b'u' | b'U' => run.meters.toggle_scale(),
+            b'r' | b'R' => run.meters.reset_hold(),
             b'm' | b'M' => {
                 // Meters off: no detector work per sample and no meter drawing, in case the machine is too slow for
                 // them (the counters line shows the longest the drawing has held the stream up).
                 let stats = stats::get();
                 stats.meters_on = !stats.meters_on;
-                for slot in 0..PAGE_ROWS {
-                    at(ROW_FIRST + slot, 1);
-                    draw!("\x1b[K");
-                }
                 if stats.meters_on {
-                    run.mark_all();
+                    run.meters.blank(None);
+                    run.meters.mark_all();
                 } else {
-                    at(ROW_FIRST, 2);
-                    draw!("Meters are off (M turns them on again).");
+                    run.meters.blank(Some("Meters are off (M turns them on again)."));
                 }
             }
             _ => {}
@@ -945,9 +643,8 @@ extern "C" fn panel_hook() -> u32 {
         run.last_draw = now;
     }
     // One small piece of drawing per call, so that no call holds the stream up for long.
-    if run.footer_dirty && stats::get().meters_on {
-        run.footer_dirty = false;
-        draw_footer(run);
+    if stats::get().meters_on && run.meters.take_footer_dirty() {
+        run.meters.draw_footer(HINT);
     } else if now >= run.next_counters {
         run.next_counters = now + 250_000;
         if !run.ip_shown {
@@ -996,7 +693,12 @@ extern "C" fn panel_hook() -> u32 {
             run.message = message;
         }
     } else if stats::get().meters_on {
-        update_meters(run, now);
+        let shown = stats::get();
+        let sends = run.sends;
+        run.meters.update(now, |index| {
+            let (detector, clip) = if index < sends { (&mut shown.send[index], &mut shown.send_clip[index]) } else { (&mut shown.receive[index - sends], &mut shown.receive_clip[index - sends]) };
+            (detector.take_max(), core::mem::take(clip))
+        });
     }
     // How long this call took: the stream loop was not running meanwhile.
     let spent = tape_rt::micros() - now;
@@ -1028,7 +730,7 @@ fn run_stream(settings: &Settings) {
     run.started = tape_rt::micros();
     run.nic = options.nic;
     // One meter row per channel: the ones sent (labelled with the device input they come from), then the ones played.
-    let mut add = |channels: Option<ChannelSet>, fallback: usize, run: &mut Run| {
+    let add = |channels: Option<ChannelSet>, fallback: usize, sending: bool, run: &mut Run| {
         let numbers: [u8; stats::MAX_CHANNELS] = {
             let mut list = [0u8; stats::MAX_CHANNELS];
             if let Some(set) = channels {
@@ -1040,16 +742,19 @@ fn run_stream(settings: &Settings) {
         };
         let count = channels.map_or(fallback, |set| set.count()).min(stats::MAX_CHANNELS);
         for index in 0..count {
-            run.labels[run.rows] = if numbers[index] != 0 { numbers[index] } else { index as u8 + 1 };
-            run.rows += 1;
+            // Labelled by the direction of the stream (what the user is setting up), with the device channel number.
+            let number = if numbers[index] != 0 { numbers[index] } else { index as u8 + 1 };
+            let mut label = Text::<8>::new();
+            let _ = write!(label, "{} {:>2}", if sending { "Send" } else { "Recv" }, number);
+            run.meters.add_row(label.as_str());
         }
         count
     };
     if mode != "recv" {
-        run.sends = add(ChannelSet::parse(settings.send.as_str()), 2, run);
+        run.sends = add(ChannelSet::parse(settings.send.as_str()), 2, true, run);
     }
     if mode == "recv" || mode == "duplex" {
-        add(ChannelSet::parse(settings.receive.as_str()), 2, run);
+        add(ChannelSet::parse(settings.receive.as_str()), 2, false, run);
     }
     stats::reset();
     at(1, 1);
@@ -1069,9 +774,9 @@ fn run_stream(settings: &Settings) {
     (real.nic_mac)(options.nic, mac.as_mut_ptr());
     run.mac = mac;
     draw!(" NIC {}  MAC {}  IP {}\x1b[K", options.nic + 1, MacText(mac), if !settings.rtp() { "(layer 2 only)" } else if settings.dhcp { "(asking the DHCP server...)" } else { settings.ip.as_str() });
-    draw_scale(run);
+    run.meters.draw_scale();
     tape_rt::set_quiet(true);
-    let shim = abort::wrap_with(real, panel_hook);
+    let shim = tape_rt::abort::wrap_with(real, panel_hook);
     // Like a configuration-file run, keep trying until Escape: the peer may not be up yet (a receiver started before
     // its sender waits for the sender's announcement, staying findable meanwhile), or the stream may end when the peer
     // goes away. The last message line says what it is waiting for.

@@ -7,7 +7,7 @@ V2_LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fos-loader.efi
 V2_KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fos-v2-kernel
 V2_IMAGE := $(V2_BUILD)/v2.img
 # v2 tapes: crates under v2/tapes/, each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-V2_TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record play audio-net
+V2_TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net
 V2_TAPE_BINS := $(foreach tape,$(V2_TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 V2_TAPE_FILES := $(foreach tape,$(V2_TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape)) --file debug=tools/default-debug.txt
 
@@ -24,7 +24,7 @@ V2_OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fn
 V2_TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: v2-opus-lib v2-tape-opus-bench v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio test-v2-audio-net test-v2-audio-serve test-v2-record test-v2-lineedit test-v2-scripts test-v2-nic test-v2-netfs
+.PHONY: v2-opus-lib v2-tape-opus-bench v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio test-v2-audio-net test-v2-audio-serve test-v2-record test-v2-recorder test-v2-recorder-fat test-v2-fat-shell test-v2-lineedit test-v2-scripts test-v2-nic test-v2-netfs
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -59,6 +59,8 @@ v2-run: v2-image
 # Loader + kernel under QEMU + OVMF, including a framebuffer screendump check.
 test-v2: v2-image
 	cargo +nightly-2026-09-13 test --manifest-path v2/abi/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path v2/fat/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path v2/tapes/audio-rec/Cargo.toml
 	python3 v2/tools/test_boot.py
 
 # Deliberate-fault kernels (one Cargo feature each): checks the exception reports,
@@ -129,6 +131,18 @@ test-v2-lineedit: v2-image
 # record: streaming a take to disk (a test tone through the real disk path), checked by parsing the image.
 test-v2-record: v2-image
 	python3 v2/tools/test_record.py
+
+# recorder: meters and pre-roll from the start, manual and silence-triggered takes (test tone with a gate).
+test-v2-recorder: v2-image
+	python3 v2/tools/test_recorder.py
+
+# recorder onto FAT32 and exFAT volumes (made by mkfs, checked by fsck and read back).
+test-v2-recorder-fat: v2-image
+	python3 v2/tools/test_recorder_fat.py
+
+# ls/copy/rm on FAT32 and exFAT disks, and the clock.
+test-v2-fat-shell: v2-image
+	python3 v2/tools/test_fat_shell.py
 
 # hostname / settings / debug / start files on the boot volume.
 test-v2-config: v2-image

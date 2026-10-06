@@ -140,7 +140,7 @@ pub fn frames_per_packet(rate: u32, channels: usize, bits: usize, max_payload: u
 
 /// Reads one sample from a device-format slot (little-endian, signed, left-justified in its bytes) as a
 /// 32-bit value with the sample in the top bits.
-fn device_sample(slot: &[u8]) -> i32 {
+pub fn device_sample(slot: &[u8]) -> i32 {
     let mut value = 0u32;
     for (index, &byte) in slot.iter().enumerate() {
         value |= u32::from(byte) << (8 * (4 - slot.len() + index));

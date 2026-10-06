@@ -9,6 +9,7 @@ dependencies = [
  "audio-wire",
  "opus-codec",
  "tape-net",
+ "tape-panel",
  "tape-rt",
 ]
 
@@ -30,6 +31,14 @@ dependencies = [
 [[package]]
 name = "tape-net"
 version = "0.1.0"
+
+[[package]]
+name = "tape-panel"
+version = "0.1.0"
+dependencies = [
+ "audio-wire",
+ "tape-rt",
+]
 
 [[package]]
 name = "tape-rt"

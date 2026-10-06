@@ -7,6 +7,8 @@
 //! functions deep in a tape can print or poll without it being threaded through.
 #![no_std]
 
+pub mod abort;
+
 pub use fos_v2_abi::tape::*;
 
 use core::fmt::Write;

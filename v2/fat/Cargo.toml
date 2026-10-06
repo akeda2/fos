@@ -1,0 +1,12 @@
+[package]
+name = "fos-v2-fat"
+version = "0.1.0"
+edition = "2024"
+
+# FAT32 and exFAT for the v2 kernel: enough of each to mount a volume a PC formatted, find and read files in its
+# root directory, and write one big contiguous file as it grows (a recording). `no_std`, no allocation, and
+# independent of the kernel (a `Device` trait stands in for the disk), so the host unit tests can run it against
+# images made by `mkfs.vfat` / `mkfs.exfat` and check them with `fsck`.
+[lib]
+name = "fat"
+path = "src/lib.rs"

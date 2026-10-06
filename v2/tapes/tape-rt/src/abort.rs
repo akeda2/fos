@@ -4,7 +4,7 @@
 //! `should_abort` is sticky: the first nonzero answer is kept, and every later call repeats it.
 
 use core::mem::MaybeUninit;
-use tape_rt::TapeApi;
+use crate::TapeApi;
 
 static mut ABORTED: bool = false;
 static mut REAL: Option<&'static TapeApi> = None;

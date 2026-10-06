@@ -51,7 +51,6 @@
 #![no_std]
 #![no_main]
 
-mod abort;
 mod duplex;
 mod igmp;
 mod net;
@@ -1113,7 +1112,7 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
         if !(options.proto_explicit && options.proto != Proto::Rtp) {
             options.proto = Proto::Rtp;
         }
-        return peers::list(abort::wrap(real), &options);
+        return peers::list(tape_rt::abort::wrap(real), &options);
     }
     let by_name = !options.source.is_empty() || (!options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none());
     println!(
@@ -1126,13 +1125,13 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
     // Supervise: unless Escape was pressed (or `secs=` ran out), a run that ends is an error to retry: the peer was
     // not there yet, the device was unplugged, the link dropped. A headless machine started from the `start` file
     // therefore keeps trying until the other side is up.
-    let api = abort::wrap(real);
+    let api = tape_rt::abort::wrap(real);
     loop {
         // Names instead of addresses: `source=NAME` (a receiver) and `to=NAME` (a sender) are looked up in the
         // announcements. The result is used for this run only, so a peer that moved is found again on a retry.
         let mut run_options = options.clone();
         if !resolve_names(api, mode, &mut run_options) {
-            if abort::aborted() {
+            if tape_rt::abort::aborted() {
                 break;
             }
             println!("audio-net: trying again in 5 s.");
@@ -1143,7 +1142,7 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
             continue;
         }
         run_once(api, mode, &run_options);
-        if abort::aborted() || options.seconds != 0 {
+        if tape_rt::abort::aborted() || options.seconds != 0 {
             break;
         }
         println!("audio-net: the stream ended; trying again in 5 s.");
@@ -1151,7 +1150,7 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
         while tape_rt::micros() < until && (api.should_abort)() == 0 {
             tape_rt::idle();
         }
-        if abort::aborted() {
+        if tape_rt::abort::aborted() {
             break;
         }
     }

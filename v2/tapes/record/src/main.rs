@@ -8,7 +8,7 @@
 //! ```
 //!
 //! The audio is written to the volume as it arrives, in 256 KiB blocks, so the length of a take is limited by the
-//! free space of the volume (and the WAV format's 4 GiB), not by RAM. A FOSFS file is one contiguous run of sectors,
+//! free space of the volume, not by RAM (the WAV header becomes RF64 past 4 GiB). A FOSFS file is one contiguous run of sectors,
 //! so the space is reserved when the recording starts: `SECONDS` worth, or the largest free run when it is 0. The
 //! file length (and the WAV header) are brought up to date every two seconds, so a power cut or reset keeps what was
 //! recorded up to then. The file holds every input channel the device has (6 for a Zoom H6 in multichannel mode,
@@ -18,13 +18,20 @@
 #![no_std]
 #![no_main]
 
-use tape_rt::{AudioInfo, AudioStats};
-use tape_rt::{TapeApi, print, println};
+use audio_rec::recorder::Recorder;
+use audio_rec::stream::StreamSink;
+use audio_rec::wav::Format;
+use tape_rt::{AudioInfo, AudioStats, TapeApi};
+use tape_rt::{print, println};
 
 /// Bytes written to disk at a time: a multiple of the sector size, small enough that one disk write takes well under
 /// the capture ring's headroom even on a slow USB stick.
 const CHUNK: usize = 256 << 10;
-const WAV_LIMIT: u64 = 0xffff_ffff - 36;
+/// Audio is taken from the device this much at a time.
+const BLOCK: usize = 64 << 10;
+
+static mut BLOCK_BUFFER: [u8; BLOCK] = [0; BLOCK];
+static mut SINK: Option<StreamSink> = None;
 
 fn parse_args(text: &str) -> Option<(&str, u64, u32, Option<u32>)> {
     let mut words = text.split_ascii_whitespace();
@@ -45,23 +52,6 @@ fn tone_sample(phase: u32) -> i16 {
     (if phase & 0x8000 != 0 { -magnitude } else { magnitude } / 4) as i16
 }
 
-/// The 44-byte WAV header for `data_bytes` of audio.
-fn wav_header(header: &mut [u8], channels: usize, slot: usize, rate: u32, data_bytes: u64) {
-    let frame_bytes = channels * slot;
-    header[0..4].copy_from_slice(b"RIFF");
-    header[4..8].copy_from_slice(&((36 + data_bytes) as u32).to_le_bytes());
-    header[8..16].copy_from_slice(b"WAVEfmt ");
-    header[16..20].copy_from_slice(&16u32.to_le_bytes());
-    header[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
-    header[22..24].copy_from_slice(&(channels as u16).to_le_bytes());
-    header[24..28].copy_from_slice(&rate.to_le_bytes());
-    header[28..32].copy_from_slice(&((rate as usize * frame_bytes) as u32).to_le_bytes());
-    header[32..34].copy_from_slice(&(frame_bytes as u16).to_le_bytes());
-    header[34..36].copy_from_slice(&((slot * 8) as u16).to_le_bytes());
-    header[36..40].copy_from_slice(b"data");
-    header[40..44].copy_from_slice(&(data_bytes as u32).to_le_bytes());
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     tape_rt::init(api);
@@ -79,8 +69,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
     }
     // A test tone stands in for the device as 2 channels of 16 bits.
-    let (channels, slot, bits) = if tone.is_some() { (2, 2, 16) } else { (info.capture_channels as usize, info.capture_slot_bytes as usize, info.capture_bits) };
+    let (channels, slot, bits) = if tone.is_some() { (2, 2, 16) } else { (info.capture_channels as usize, info.capture_slot_bytes as usize, info.capture_bits as usize) };
     let frame_bytes = channels * slot;
+    if frame_bytes == 0 || frame_bytes > BLOCK {
+        return println!("record: unusable capture format.");
+    }
+    let format = Format { channels: channels as u16, rate, slot: slot as u16, bits: bits as u16 };
     let mut file_name = [0u8; 40];
     let mut length = 0;
     for &byte in name.as_bytes().iter().take(30) {
@@ -93,95 +87,77 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let file_name = &file_name[..length];
     let shown = core::str::from_utf8(file_name).unwrap_or("?");
-    let wanted = if seconds == 0 { 0 } else { 44 + u64::from(rate) * frame_bytes as u64 * seconds };
-    let capacity = (api.fs_stream_open)(file_name.as_ptr(), file_name.len(), wanted);
-    if capacity < 0 {
-        return println!("record: cannot reserve {} MiB for {shown} (code {capacity}); the volume may be full or the name invalid.", wanted >> 20);
-    }
-    let limit = (capacity as u64).min(WAV_LIMIT);
-    let buffer = (api.alloc)(CHUNK);
-    if buffer == 0 {
+    let target = if seconds == 0 { u64::MAX } else { u64::from(rate) * frame_bytes as u64 * seconds };
+    let wanted = if seconds == 0 { 0 } else { audio_rec::wav::header_len(&format) as u64 + target };
+    let staging_address = (api.alloc)(CHUNK);
+    if staging_address == 0 {
         return println!("record: out of memory.");
     }
-    let staging = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, CHUNK) };
+    let staging: &'static mut [u8] = unsafe { core::slice::from_raw_parts_mut(staging_address as *mut u8, CHUNK) };
+    unsafe { SINK = Some(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, CHUNK / 2)) };
+    let sink = unsafe { (*(&raw mut SINK)).as_mut().unwrap() };
+    let mut recorder = match Recorder::begin(sink, staging, format, file_name, wanted) {
+        Ok(recorder) => recorder,
+        Err(error) => {
+            (api.free)(staging_address, CHUNK);
+            return println!("record: cannot reserve {} MiB for {shown} (code {}); the volume may be full or the name invalid.", wanted >> 20, error.0);
+        }
+    };
     let status = if tone.is_some() { 0 } else { (api.audio_start)(rate, 1, 0) };
     if status != 0 {
-        (api.free)(buffer, CHUNK);
+        let _ = recorder.finish(); // nothing recorded: the file is removed again
+        (api.free)(staging_address, CHUNK);
         return println!("record: cannot start capture at {rate} Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
     }
     println!(
         "Recording {channels} channel(s), {bits}-bit, {rate} Hz into {shown} ({} MiB reserved){}. Escape stops.",
-        capacity >> 20,
+        recorder.capacity() >> 20,
         if seconds == 0 { ", until Escape" } else { "" }
     );
-    // The first block starts with the WAV header; its first sector is kept to be rewritten as the take grows.
-    let mut first_sector = [0u8; 512];
-    let mut have_first = false;
-    let mut filled = 44usize; // bytes in `staging`; the first 44 are the header
-    let mut offset = 0u64; // file offset of staging[0]
-    let mut failed = 0isize;
+    let block = unsafe { &mut *(&raw mut BLOCK_BUFFER) };
+    let mut failed = 0;
     let (mut aborted, mut full) = (false, false);
     let mut next_report = tape_rt::micros() + 1_000_000;
     let mut next_checkpoint = tape_rt::micros() + 2_000_000;
-    let target = if seconds == 0 { u64::MAX } else { u64::from(rate) * frame_bytes as u64 * seconds };
-    let mut audio_bytes = 0u64;
-    let (mut write_total, mut write_max, mut writes, mut written_bytes) = (0u64, 0u64, 0u64, 0u64);
     let (started, mut produced, mut phase) = (tape_rt::micros(), 0u64, 0u32);
     loop {
         if (api.should_abort)() != 0 {
             aborted = true;
             break;
         }
-        let left = (limit - offset - filled as u64).min(target - audio_bytes).min(usize::MAX as u64) as usize; // reserved space and time left
-        let room = (CHUNK - filled).min(left);
-        let got = if room == 0 {
-            0
-        } else if let Some(frequency) = tone {
+        let left = target - recorder.audio_bytes();
+        if left == 0 {
+            break;
+        }
+        let room = (BLOCK as u64).min(left) as usize / frame_bytes * frame_bytes;
+        let got = if let Some(frequency) = tone {
             // Paced by the clock like a device: the frames due so far, as many as fit.
             let due = (tape_rt::micros() - started) * u64::from(rate) / 1_000_000;
             let frames = (due - produced).min((room / frame_bytes) as u64) as usize;
             for index in 0..frames {
                 let sample = tone_sample(phase).to_le_bytes();
                 phase = (phase + (u64::from(frequency) * 65_536 / u64::from(rate)) as u32) & 0xffff;
-                let at = filled + index * frame_bytes;
-                staging[at..at + 2].copy_from_slice(&sample);
-                staging[at + 2..at + 4].copy_from_slice(&sample);
+                block[index * frame_bytes..index * frame_bytes + 2].copy_from_slice(&sample);
+                block[index * frame_bytes + 2..index * frame_bytes + 4].copy_from_slice(&sample);
             }
             produced += frames as u64;
             frames * frame_bytes
         } else {
-            (api.audio_read)(staging[filled..].as_mut_ptr(), room)
+            (api.audio_read)(block.as_mut_ptr(), room)
         };
-        filled += got;
-        audio_bytes += got as u64;
-        let at_end = audio_bytes >= target || offset + filled as u64 >= limit;
-        if filled == CHUNK || (at_end && filled > 0) {
-            // Whole blocks keep the next offset a multiple of 512; the last, partial one is padded by the kernel.
-            if offset == 0 {
-                wav_header(staging, channels, slot, rate, audio_bytes);
-                if filled >= 512 {
-                    first_sector.copy_from_slice(&staging[..512]);
-                    have_first = true;
+        if got > 0 {
+            match recorder.push(&block[..got]) {
+                Ok(taken) if taken < got => {
+                    full = true; // the reserved space ran out
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    failed = error.0;
+                    break;
                 }
             }
-            // The length (and, at a checkpoint, the header) only advance together: a reset must find a file whose
-            // header matches its length. The first block carries its own header, so it can set the length.
-            let length = if offset == 0 || at_end { offset + filled as u64 } else { 0 };
-            let began = tape_rt::micros();
-            failed = (api.fs_stream_write)(offset, staging.as_ptr(), filled, length);
-            let spent = tape_rt::micros() - began;
-            (write_total, write_max, writes, written_bytes) = (write_total + spent, write_max.max(spent), writes + 1, written_bytes + filled as u64);
-            if failed != 0 {
-                break;
-            }
-            offset += filled as u64;
-            filled = 0;
-            if at_end {
-                full = audio_bytes < target;
-                break;
-            }
-        }
-        if got == 0 {
+        } else {
             tape_rt::idle();
         }
         let now = tape_rt::micros();
@@ -189,12 +165,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             next_report += 1_000_000;
             print!(".");
         }
-        if now >= next_checkpoint && have_first {
+        if now >= next_checkpoint {
             next_checkpoint = now + 2_000_000;
-            // Bring the first sector's header up to date so a reset keeps the take so far.
-            wav_header(&mut first_sector, channels, slot, rate, offset - 44);
-            failed = (api.fs_stream_write)(0, first_sector.as_ptr(), 512, offset);
-            if failed != 0 {
+            if let Err(error) = recorder.checkpoint() {
+                failed = error.0;
                 break;
             }
         }
@@ -205,43 +179,27 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         (api.audio_stop)();
     }
     println!();
-    if failed == 0 && filled > 0 {
-        // The unwritten rest: Escape was pressed in the middle of a block.
-        if offset == 0 {
-            wav_header(staging, channels, slot, rate, audio_bytes);
-            if filled >= 512 {
-                first_sector.copy_from_slice(&staging[..512]);
-                have_first = true;
+    // The unwritten rest, the final header and the final length.
+    let summary = recorder.finish();
+    (api.free)(staging_address, CHUNK);
+    let sink = unsafe { (*(&raw const SINK)).as_ref().unwrap() };
+    match summary {
+        Ok(summary) if failed == 0 => {
+            println!(
+                "Recorded {} frames ({} s){}{}; {} transfer error(s), {} overrun(s).",
+                summary.frames,
+                summary.frames / u64::from(rate),
+                if aborted { ", stopped early" } else { "" },
+                if full { ", the reserved space ran out" } else { "" },
+                stats.capture_errors,
+                stats.capture_overruns
+            );
+            if sink.writes > 0 {
+                println!("Disk: {} blocks, {} KiB/s while writing, slowest block {} ms.", sink.writes, sink.kib_per_second(), sink.write_max_us / 1000);
             }
+            println!("Wrote {shown} ({} bytes).", summary.bytes);
         }
-        failed = (api.fs_stream_write)(offset, staging.as_ptr(), filled, offset + filled as u64);
-        offset += filled as u64;
-    }
-    let total = offset;
-    if failed == 0 && have_first {
-        // Final header, with the exact data length.
-        wav_header(&mut first_sector, channels, slot, rate, total - 44);
-        failed = (api.fs_stream_write)(0, first_sector.as_ptr(), 512, total);
-    }
-    if failed == 0 {
-        failed = (api.fs_stream_close)(total); // free the reserved space the take did not use
-    }
-    (api.free)(buffer, CHUNK);
-    let frames = (total.saturating_sub(44)) / frame_bytes as u64;
-    println!(
-        "Recorded {frames} frames ({} s){}{}; {} transfer error(s), {} overrun(s).",
-        frames / u64::from(rate),
-        if aborted { ", stopped early" } else { "" },
-        if full { ", the reserved space ran out" } else { "" },
-        stats.capture_errors,
-        stats.capture_overruns
-    );
-    if writes > 0 {
-        println!("Disk: {writes} blocks, {} KiB/s while writing, slowest block {} ms.", written_bytes * 1000 / 1024 / (write_total / 1000).max(1), write_max / 1000);
-    }
-    if failed == 0 {
-        println!("Wrote {shown} ({total} bytes).");
-    } else {
-        println!("record: writing {shown} failed (code {failed}); what was written up to the last checkpoint is kept.");
+        Ok(_) => println!("record: writing {shown} failed (code {failed}); what was written up to the last checkpoint is kept."),
+        Err(error) => println!("record: writing {shown} failed (code {}); what was written up to the last checkpoint is kept.", error.0),
     }
 }

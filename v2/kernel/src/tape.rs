@@ -189,8 +189,42 @@ fn resolve_file(reference: &[u8], reading: bool) -> Result<(crate::fosfs::Volume
     };
     volume.map(|volume| (volume, name)).ok_or(FS_NO_VOLUME)
 }
+/// A FAT32/exFAT volume named by a reference: `diskN/NAME` where disk N holds no FOSFS volume of ours but a FAT one
+/// (a stick or card a PC formatted). A disk with a FOSFS partition always means FOSFS.
+fn resolve_fat(reference: &[u8]) -> Option<(crate::fatvol::Fs, &[u8])> {
+    let slash = reference.iter().position(|&byte| byte == b'/')?;
+    let (selector, name) = (&reference[..slash], &reference[slash + 1..]);
+    let number = selector.strip_prefix(b"disk").and_then(|digits| core::str::from_utf8(digits).ok()).and_then(|digits| digits.parse::<usize>().ok())?;
+    if storage::volume_on(number).is_ok() {
+        return None;
+    }
+    crate::fatvol::mount(number - 1).map(|fs| (fs, name))
+}
+
+fn fat_error(error: fat::Error) -> isize {
+    match error {
+        fat::Error::NotFound => FS_NOT_FOUND,
+        fat::Error::BadName => FS_BAD_NAME,
+        _ => FS_ERROR,
+    }
+}
+
 extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, capacity: usize) -> isize {
     let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
+    if let Some((mut fs, name)) = resolve_fat(reference) {
+        return match fs.find(name) {
+            Ok(Some(file)) if file.size as usize > capacity => FS_TOO_BIG,
+            Ok(Some(file)) => {
+                let buffer = unsafe { core::slice::from_raw_parts_mut(buffer, capacity) };
+                match fs.read(&file, 0, &mut buffer[..file.size as usize]) {
+                    Ok(length) => length as isize,
+                    Err(error) => fat_error(error),
+                }
+            }
+            Ok(None) => FS_NOT_FOUND,
+            Err(error) => fat_error(error),
+        };
+    }
     let (volume, name) = match resolve_file(reference, true) {
         Ok(found) => found,
         Err(code) => return code,
@@ -217,9 +251,31 @@ extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8,
 }
 /// The file a tape is streaming into (`fs_stream_open`): its volume and reserved entry.
 static mut STREAM: Option<(crate::fosfs::Volume, crate::fosfs::Entry)> = None;
+/// Or, on a FAT32/exFAT volume: the mounted volume, the stream and the file's name (for `finish`).
+static mut FAT_STREAM: Option<(crate::fatvol::Fs, fat::Stream, [u8; 64], usize)> = None;
 
 extern "C" fn api_fs_stream_open(name: *const u8, name_length: usize, max_bytes: u64) -> isize {
-    let (volume, name) = match resolve_file(unsafe { core::slice::from_raw_parts(name, name_length) }, false) {
+    let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
+    unsafe {
+        STREAM = None;
+        FAT_STREAM = None;
+    }
+    if let Some((mut fs, file)) = resolve_fat(reference) {
+        if file.len() > 64 {
+            return FS_BAD_NAME;
+        }
+        return match fs.create(file, max_bytes) {
+            Ok(stream) => {
+                let mut stored = [0u8; 64];
+                stored[..file.len()].copy_from_slice(file);
+                let capacity = stream.capacity();
+                unsafe { FAT_STREAM = Some((fs, stream, stored, file.len())) };
+                capacity as isize
+            }
+            Err(error) => fat_error(error),
+        };
+    }
+    let (volume, name) = match resolve_file(reference, false) {
         Ok(found) => found,
         Err(code) => return code,
     };
@@ -233,8 +289,16 @@ extern "C" fn api_fs_stream_open(name: *const u8, name_length: usize, max_bytes:
     }
 }
 extern "C" fn api_fs_stream_write(offset: u64, data: *const u8, length: usize, file_length: u64) -> isize {
-    let Some((volume, entry)) = (unsafe { *(&raw const STREAM) }) else { return FS_ERROR };
     let data = unsafe { core::slice::from_raw_parts(data, length) };
+    if let Some((fs, stream, _, _)) = unsafe { (*(&raw mut FAT_STREAM)).as_mut() } {
+        crate::fatvol::stamp(fs);
+        return match fs.write(stream, offset, data, file_length) {
+            Ok(()) => 0,
+            Err(fat::Error::OutOfRange) => FS_TOO_BIG,
+            Err(error) => fat_error(error),
+        };
+    }
+    let Some((volume, entry)) = (unsafe { *(&raw const STREAM) }) else { return FS_ERROR };
     match volume.write_extent(&entry, offset, data, file_length) {
         Ok(()) => 0,
         Err(crate::fosfs::Error::TooBig) => FS_TOO_BIG,
@@ -242,6 +306,13 @@ extern "C" fn api_fs_stream_write(offset: u64, data: *const u8, length: usize, f
     }
 }
 extern "C" fn api_fs_stream_close(file_length: u64) -> isize {
+    if let Some((mut fs, stream, name, length)) = unsafe { (*(&raw mut FAT_STREAM)).take() } {
+        crate::fatvol::stamp(&mut fs);
+        return match fs.finish(&stream, &name[..length], file_length) {
+            Ok(()) => 0,
+            Err(error) => fat_error(error),
+        };
+    }
     let Some((volume, entry)) = (unsafe { (*(&raw mut STREAM)).take() }) else { return FS_ERROR };
     match volume.trim_extent(&entry, file_length) {
         Ok(()) => 0,

@@ -19,12 +19,14 @@ mod acpi;
 mod ahci;
 mod block;
 mod apic;
+mod clock;
 mod config;
 mod debug;
 mod diag;
 mod cpu;
 mod e1000;
 mod ehci;
+mod fatvol;
 mod fault;
 mod fosfs;
 mod font_data;
@@ -238,6 +240,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
                 );
                 cpu::interrupts_enable();
                 self_test_interrupts(fadt);
+                clock::init(fadt.century);
             }
             None => println!("No usable local APIC or PM timer: no clock tick."),
         }

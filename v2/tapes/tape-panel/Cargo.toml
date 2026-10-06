@@ -1,0 +1,12 @@
+[package]
+name = "tape-panel"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tape_panel"
+path = "src/lib.rs"
+
+[dependencies]
+tape-rt = { path = "../tape-rt" }
+audio-wire = { path = "../audio-wire" }

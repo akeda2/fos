@@ -74,6 +74,8 @@ pub struct Fadt {
     /// 0 = memory), address, and the value to write.
     pub reset: Option<(u8, u64, u8)>,
     pub pm1b_control: u16,
+    /// CMOS register holding the century of the RTC date (0 = none).
+    pub century: u8,
     /// SLP_TYPa/SLP_TYPb for the soft-off state (S5), found by scanning the DSDT for the `_S5_`
     /// object (no AML interpreter: the package is read as bytes, the way every hobby kernel does).
     pub s5: Option<(u8, u8)>,
@@ -88,6 +90,7 @@ pub fn fadt(tables: &Tables) -> Option<Fadt> {
         pm1a_control: read_u32(table + 64) as u16,
         sci_interrupt: read_u16(table + 46),
         pm1b_control: read_u32(table + 68) as u16,
+        century: if read_u32(table + 4) >= 109 { read_u8(table + 108) } else { 0 },
         s5: s5_sleep_types(table),
         reset: (flags & (1 << 10) != 0 && read_u64(table + 120) != 0).then(|| (read_u8(table + 116), read_u64(table + 120), read_u8(table + 128))),
     })
