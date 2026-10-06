@@ -164,6 +164,14 @@ pub fn largest_free_run() -> u64 {
 /// `count` physically contiguous frames, zeroed, optionally entirely below
 /// `below` (exclusive). Returns the physical address.
 pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
+    let address = allocate_contiguous_uncleared(count, below)?;
+    unsafe { core::ptr::write_bytes(address as *mut u8, 0, (count * FRAME) as usize) };
+    Some(address)
+}
+
+/// The same without clearing the memory: for a caller that only ever reads what it has written itself (a ring buffer, whose
+/// head and tail say which bytes are valid), where clearing gigabytes would just be a delay.
+pub fn allocate_contiguous_uncleared(count: u64, below: Option<u64>) -> Option<u64> {
     let a = allocator();
     let limit = below.map_or(a.frames, |address| (address / FRAME).min(a.frames));
     if count == 0 || count > limit {
@@ -184,7 +192,6 @@ pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
                         a.set(taken, true);
                     }
                     a.hint = frame + 1;
-                    unsafe { core::ptr::write_bytes((first * FRAME) as *mut u8, 0, (count * FRAME) as usize) };
                     return Some(first * FRAME);
                 }
             }

@@ -119,14 +119,15 @@ def main():
                 check("(with errors)" not in guest.text()[mark:], f"the take on {disk} had no errors", guest.text()[mark:][-1500:])
             # The disk speed test: it runs on the chosen disk at start and after `D`, reports the speed, and leaves nothing behind.
             mark = guest.send("run recorder st tone=440")
+            guest.wait_for("Testing the speed of disk3", 30, mark)  # shown while the test runs: the UI is not frozen
             guest.wait_for("disk3: ", 60, mark)
-            guest.wait_for("sustained over", 60, mark)
+            guest.wait_for("KiB/s over", 60, mark)
             for _ in range(2):  # disk3 -> disk1 -> disk2 (FAT32)
                 guest.process.stdin.write(b"d")
                 guest.process.stdin.flush()
                 guest.pump(0.8)
             guest.wait_for("disk2: ", 60, mark)
-            check("KiB/s sustained" in guest.text()[mark:], "the speed test reports the disk's speed", guest.text()[mark:][-800:])
+            check("KiB/s over" in guest.text()[mark:], "the speed test reports the disk's speed", guest.text()[mark:][-800:])
             guest.process.stdin.write(b"t")  # and T tests again
             guest.process.stdin.flush()
             guest.pump(3.0)

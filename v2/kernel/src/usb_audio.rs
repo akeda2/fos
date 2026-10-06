@@ -311,7 +311,8 @@ fn allocate_capture_ring() -> Option<PcmRing> {
         if here < MIN_SEGMENT && !(ring.count == 0 && here > 0) {
             break;
         }
-        match memory::allocate_contiguous((here / 4096) as u64, None) {
+        // Not cleared: a ring is only read where it has been written, and clearing gigabytes delays the start of capture.
+        match memory::allocate_contiguous_uncleared((here / 4096) as u64, None) {
             Some(base) => ring.push_segment(base, here),
             None => break,
         }

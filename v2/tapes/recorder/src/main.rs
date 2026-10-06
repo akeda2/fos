@@ -118,6 +118,17 @@ macro_rules! say {
     }};
 }
 
+/// A speed test in progress (see `App::start_speed_test`).
+#[derive(Clone, Copy)]
+struct SpeedRun {
+    name: Text<40>,
+    number: usize,
+    capacity: u64,
+    offset: u64,
+    write_us: u64,
+    worst_us: u64,
+}
+
 const MAX_DISKS: usize = 8;
 /// The disk speed test: up to this many bytes or this long, whichever comes first.
 const SPEED_TEST_BYTES: u64 = 64 << 20;
@@ -225,6 +236,8 @@ struct App {
     label_editing: Option<(usize, Text<12>)>,
     /// `C` pressed: the channel list being typed.
     channel_editing: Option<Text<40>>,
+    /// The disk speed test, while it runs.
+    speed: Option<SpeedRun>,
     custom_prefix: &'static str,
     choices: [Choice; MAX_DISKS],
     choice_count: usize,
@@ -273,11 +286,13 @@ impl App {
         }
     }
 
-    /// Writes a scratch file to the chosen disk for up to three seconds (or 64 MiB) and records how fast the disk took it:
-    /// the one thing a recorder must know before it is trusted with audio that cannot be taken twice. The file is
-    /// removed again. Capture goes on meanwhile into the kernel's buffer; this does not read it.
-    fn speed_test(&mut self) {
-        if self.choice_count == 0 || !self.custom_prefix.is_empty() {
+    /// Starts the disk speed test: a scratch file written in 256 KiB steps, one per pass of the main loop (`speed_step`), so
+    /// that meters, keys and the pre-roll carry on meanwhile. It measures how fast the chosen disk takes writes, the one
+    /// thing a recorder must know before it is trusted with audio that cannot be taken twice. It ends after 2.5 s of writing or
+    /// 64 MiB and the file is removed. Starting a take cancels it.
+    fn start_speed_test(&mut self) {
+        self.cancel_speed_test();
+        if self.choice_count == 0 || !self.custom_prefix.is_empty() || self.take.is_some() {
             return;
         }
         let choice = self.choices[self.selected];
@@ -286,9 +301,6 @@ impl App {
         }
         let mut name = Text::<40>::new();
         let _ = write!(name, "disk{}/spdtest.tmp", choice.number);
-        let mut line = Text::<100>::new();
-        let _ = write!(line, "Testing the speed of disk{} (up to 3 s)...", choice.number);
-        show(6, line.as_str());
         let api = self.api;
         let capacity = (api.fs_stream_open)(name.as_str().as_ptr(), name.len(), SPEED_TEST_BYTES);
         if capacity < SPEED_TEST_BYTES as isize / 4 {
@@ -299,29 +311,48 @@ impl App {
             say!(self, "Not enough free space on disk{} to test its speed.", choice.number);
             return;
         }
-        let staging = self.staging();
-        let (started, mut offset, mut worst) = (tape_rt::micros(), 0u64, 0u64);
-        let mut failed = false;
-        while offset + CHUNK as u64 <= capacity as u64 && offset < SPEED_TEST_BYTES && tape_rt::micros() - started < SPEED_TEST_MICROS {
-            let began = tape_rt::micros();
-            if (api.fs_stream_write)(offset, staging.as_ptr(), CHUNK, 0) != 0 {
-                failed = true;
-                break;
-            }
-            worst = worst.max(tape_rt::micros() - began);
-            offset += CHUNK as u64;
+        self.speed = Some(SpeedRun { name, number: choice.number, capacity: capacity as u64, offset: 0, write_us: 0, worst_us: 0 });
+    }
+
+    /// One step of the speed test, if one is running.
+    fn speed_step(&mut self) {
+        let Some(run) = self.speed.as_mut() else { return };
+        let api = self.api;
+        let staging = unsafe { core::slice::from_raw_parts(self.staging as *const u8, CHUNK) };
+        let began = tape_rt::micros();
+        let failed = (api.fs_stream_write)(run.offset, staging.as_ptr(), CHUNK, 0) != 0;
+        let spent = tape_rt::micros() - began;
+        if !failed {
+            run.offset += CHUNK as u64;
+            run.write_us += spent;
+            run.worst_us = run.worst_us.max(spent);
         }
-        let elapsed = (tape_rt::micros() - started).max(1);
-        (api.fs_stream_close)(0); // a FAT volume deletes the empty file; FOSFS keeps an empty one, removed next
-        (api.fs_remove)(name.as_str().as_ptr(), name.len());
-        if failed || offset == 0 {
-            say!(self, "The speed test could not write to disk{}.", choice.number);
+        let done = failed || run.offset + CHUNK as u64 > run.capacity || run.offset >= SPEED_TEST_BYTES || run.write_us >= SPEED_TEST_MICROS;
+        if !done {
             return;
         }
-        let kib = offset * 1_000_000 / 1024 / elapsed;
-        self.choices[self.selected].speed_kib = kib;
-        self.choices[self.selected].worst_ms = worst / 1000;
-        say!(self, "disk{}: {} KiB/s sustained over {} MiB, slowest block {} ms.", choice.number, kib, offset >> 20, worst / 1000);
+        let run = *run;
+        self.speed = None;
+        (api.fs_stream_close)(0); // a FAT volume deletes the empty file; FOSFS keeps an empty one, removed next
+        (api.fs_remove)(run.name.as_str().as_ptr(), run.name.len());
+        if failed || run.offset == 0 {
+            say!(self, "The speed test could not write to disk{}.", run.number);
+            return;
+        }
+        let kib = run.offset * 1_000_000 / 1024 / run.write_us.max(1);
+        if let Some(choice) = self.choices[..self.choice_count].iter_mut().find(|choice| choice.number == run.number) {
+            choice.speed_kib = kib;
+            choice.worst_ms = run.worst_us / 1000;
+        }
+        say!(self, "disk{}: {} KiB/s over {} MiB, slowest block {} ms. Buffer {} MiB.", run.number, kib, run.offset >> 20, run.worst_us / 1000, self.buffer_bytes >> 20);
+    }
+
+    /// Stops a running speed test and removes its file (a take is about to use the file system, or the tape is ending).
+    fn cancel_speed_test(&mut self) {
+        if let Some(run) = self.speed.take() {
+            (self.api.fs_stream_close)(0);
+            (self.api.fs_remove)(run.name.as_str().as_ptr(), run.name.len());
+        }
     }
 
     fn staging(&self) -> &'static mut [u8] {
@@ -364,6 +395,7 @@ impl App {
 
     /// Begins a take with `lead` bytes of the pre-roll ring ahead of the live audio.
     fn start(&mut self, ring: &PreRoll, lead: usize, now: u64) {
+        self.cancel_speed_test();
         if self.choice_count > 0 && self.custom_prefix.is_empty() && self.choices[self.selected].kind == 0 {
             say!(self, "disk{} has no volume to record to: X formats it as exFAT, D chooses another disk.", self.choices[self.selected].number);
             return;
@@ -569,6 +601,11 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
         prompt.clear();
         let _ = write!(prompt, "File name: {}_   (letters, digits, _ -; Enter: ok, Esc: cancel)", typed.as_str());
     }
+    if prompt.is_empty() {
+        if let Some(run) = app.speed.as_ref() {
+            let _ = write!(prompt, "Testing the speed of disk{} ({} MiB written)...", run.number, run.offset >> 20);
+        }
+    }
     show(6, if prompt.is_empty() { app.message.as_str() } else { prompt.as_str() });
 }
 
@@ -683,7 +720,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         0
     };
     let mut app = App {
-        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, device_frame: frame, buffer_bytes, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, speed: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, device_frame: frame, buffer_bytes, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
         message: Text::from("Meters and pre-roll are running. Space starts a take."), errors: 0, last_take_frames: 0,
     };
 
@@ -717,17 +754,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         say!(app, "Capture buffer {} MiB = {}m{:02}s of audio. Space starts a take.", buffer_bytes >> 20, seconds / 60, seconds % 60);
     }
     if options.speed_test {
-        let buffer_message = app.message;
-        app.speed_test();
-        if app.message.as_str().starts_with("Not enough") || app.message.as_str().starts_with("The speed test") {
-            // keep the failure message
-        } else if buffer_bytes > 0 {
-            let mut text = Text::<100>::new();
-            let _ = write!(text, "{} Buffer {} MiB.", app.message.as_str(), buffer_bytes >> 20);
-            app.message = text;
-        } else {
-            let _ = buffer_message;
-        }
+        app.start_speed_test();
     }
 
     let started = tape_rt::micros();
@@ -753,6 +780,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                         let _ = write!(text, "Formatting disk{number}: audio capture overruns while this runs...");
                         show(6, text.as_str());
                     }
+                    app.cancel_speed_test(); // its scratch file may be on the very disk about to be erased
                     let status = (api.disk_format_exfat)(number, label.as_str().as_ptr(), label.len());
                     if status == 0 {
                         app.refresh_free();
@@ -872,7 +900,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     if app.take.is_some() {
                         say!(app, "A take is running: the speed test waits until it is stopped.");
                     } else {
-                        app.speed_test();
+                        app.start_speed_test();
                     }
                 }
                 b'c' | b'C' => {
@@ -906,7 +934,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                         app.choices[app.selected].describe(&mut text);
                         say!(app, "Recording to {}.", text.as_str());
                         if options.speed_test {
-                            app.speed_test();
+                            app.start_speed_test();
                         }
                     } else {
                         say!(app, "There is no other disk with a volume to record to (FOSFS, FAT32 or exFAT).");
@@ -988,6 +1016,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             // Nothing to do: let the CPU rest until the next interrupt.
             tape_rt::idle();
         }
+        app.speed_step();
         // A key with no audio waiting is handled at the next block (a device that is running delivers one every ms).
         let now = tape_rt::micros();
         if now >= next_meters && meters.rows() > 0 {
@@ -1004,6 +1033,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
     }
 
+    app.cancel_speed_test();
     app.stop();
     let (stats_errors, stats_overruns) = {
         let mut stats = AudioStats::default();
