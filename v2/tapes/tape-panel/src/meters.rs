@@ -73,6 +73,14 @@ impl<const N: usize> MeterBank<N> {
         true
     }
 
+    /// Changes a row's label (it is redrawn on the next `update`).
+    pub fn set_label(&mut self, row: usize, label: &str) {
+        if row < self.rows && self.labels[row].as_str() != label {
+            self.labels[row] = Text::from(label);
+            self.needs_full[row] = true;
+        }
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }

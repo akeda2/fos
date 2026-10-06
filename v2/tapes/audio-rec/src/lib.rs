@@ -10,6 +10,7 @@
 pub mod peaks;
 pub mod preroll;
 pub mod recorder;
+pub mod select;
 pub mod silence;
 pub mod stream;
 pub mod wav;

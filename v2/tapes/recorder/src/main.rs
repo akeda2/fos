@@ -22,9 +22,11 @@
 use audio_rec::peaks;
 use audio_rec::preroll::PreRoll;
 use audio_rec::recorder::Recorder;
+use audio_rec::select;
 use audio_rec::stream::StreamSink;
 use audio_rec::silence::{Config, Detector, Event};
 use audio_rec::wav::Format;
+use audio_wire::ChannelSet;
 use audio_wire::meter::{Coefficients, Ppm};
 use core::fmt::Write;
 use tape_panel::meters::MeterBank;
@@ -35,7 +37,7 @@ const MAX_CHANNELS: usize = 32;
 const PAGE_ROWS: usize = 12;
 const ROW_SCALE: usize = 8;
 const ROW_FIRST: usize = 10;
-const HINT: &str = "Space: record  A: auto  D: disk  F: name  X: format  U: scale  H: holds  Q: quit";
+const HINT: &str = "Space: record  A: auto  D: disk  F: name  C: channels  X: format  U: scale  Q: quit";
 /// Bytes written to disk at a time: a multiple of the sector size, small enough that one disk write takes well under
 /// the capture ring's headroom even on a slow USB stick.
 const CHUNK: usize = 256 << 10;
@@ -46,6 +48,8 @@ static mut DETECTORS: [Ppm; MAX_CHANNELS] = [Ppm::new(); MAX_CHANNELS];
 static mut CLIPS: [bool; MAX_CHANNELS] = [false; MAX_CHANNELS];
 static mut METERS: MeterBank<MAX_CHANNELS> = MeterBank::new(ROW_SCALE, ROW_FIRST, PAGE_ROWS);
 static mut BLOCK_BUFFER: [u8; BLOCK] = [0; BLOCK];
+/// The selected channels of one block, in the device's format.
+static mut SELECT_BUFFER: [u8; BLOCK] = [0; BLOCK];
 static mut SINK: Option<StreamSink> = None;
 
 struct Options<'a> {
@@ -56,10 +60,12 @@ struct Options<'a> {
     auto: bool,
     tone: Option<u32>,
     gate: Option<(u32, u32)>,
+    /// `ch=9-12`: the channels to record (None: all of them).
+    channels: Option<ChannelSet>,
 }
 
 fn parse(text: &str) -> Option<Options<'_>> {
-    let mut options = Options { name: "take", rate: 48_000, pre_seconds: 5, silence: Config::DEFAULT, auto: false, tone: None, gate: None };
+    let mut options = Options { name: "take", rate: 48_000, pre_seconds: 5, silence: Config::DEFAULT, auto: false, tone: None, gate: None, channels: None };
     for word in text.split_ascii_whitespace() {
         if word == "auto" {
             options.auto = true;
@@ -77,6 +83,7 @@ fn parse(text: &str) -> Option<Options<'_>> {
             "sound" => options.silence.sound_ms = value.parse().ok()?,
             "silence" => options.silence.silence_ms = value.parse().ok()?,
             "tone" => options.tone = Some(value.parse().ok()?),
+            "ch" => options.channels = if value == "all" { None } else { Some(ChannelSet::parse(value)?) },
             "gate" => {
                 let (on, off) = value.split_once(',')?;
                 options.gate = Some((on.parse().ok()?, off.parse().ok()?));
@@ -199,6 +206,8 @@ struct App {
     confirming: Option<(usize, Text<12>)>,
     /// `X` pressed: the volume label being typed for the disk about to be formatted.
     label_editing: Option<(usize, Text<12>)>,
+    /// `C` pressed: the channel list being typed.
+    channel_editing: Option<Text<40>>,
     custom_prefix: &'static str,
     choices: [Choice; MAX_DISKS],
     choice_count: usize,
@@ -380,6 +389,10 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
             let _ = write!(line, "MONITORING  pre-roll holds {} s  (up {} s)   next: {}{:03}.wav", s, (now - started) / 1_000_000, app.base.as_str(), app.next_number);
         }
     }
+    if let Some(typed) = app.channel_editing.as_ref() {
+        line.clear();
+        let _ = write!(line, "Channels to record (9-12, 1,3,5-8 or all): {}_   (Enter: ok, Esc: cancel)", typed.as_str());
+    }
     if let Some((number, typed)) = app.label_editing.as_ref() {
         line.clear();
         let _ = write!(line, "Format disk{number} as exFAT. Volume label: {}_   (Enter: next, Esc: cancel)", typed.as_str());
@@ -458,8 +471,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     // A test tone stands in for the device as 2 channels of 16 bits.
     let (channels, slot, bits) = if options.tone.is_some() { (2, 2, 16) } else { (info.capture_channels as usize, info.capture_slot_bytes as usize, info.capture_bits as usize) };
     let rate = options.rate;
-    let frame = channels * slot;
-    let format = Format { channels: channels as u16, rate, slot: slot as u16, bits: bits as u16 };
+    let frame = channels * slot; // a device frame: all the channels
+    let full_mask: u32 = if channels >= 32 { !0 } else { (1u32 << channels) - 1 };
+    let mut selection: u32 = options.channels.map_or(full_mask, |set| set.0);
+    if selection & !full_mask != 0 {
+        return println!("recorder: ch= names a channel the device does not have (it has {channels}).");
+    }
+    let mut rec_channels = selection.count_ones() as usize;
+    let mut rec_frame = rec_channels * slot; // a recorded frame: the selected channels
+    let format = Format { channels: rec_channels as u16, rate, slot: slot as u16, bits: bits as u16 };
     // `NAME` may start with a volume (`disk2/gig`, `@label/gig`): a diskN picks that disk in the menu, anything else is
     // used as typed and the menu leaves it alone.
     let (volume_word, file_part) = match options.name.rsplit_once('/') {
@@ -497,9 +517,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         ring_bytes /= 2;
     }
     let ring_memory: &'static mut [u8] = if ring_address != 0 { unsafe { core::slice::from_raw_parts_mut(ring_address as *mut u8, ring_bytes) } } else { &mut [] };
-    let mut ring = PreRoll::new(ring_memory, frame);
-    let pre_bytes = (u64::from(options.pre_seconds) * u64::from(rate)) as usize * frame;
-    let trigger_bytes = ((u64::from(options.pre_seconds) * 1000 + u64::from(options.silence.sound_ms)) * u64::from(rate) / 1000) as usize * frame;
+    let ring_memory_pointer = ring_address;
+    let ring_bytes_for = |recorded_frame: usize| (((wanted_ms * u64::from(rate) / 1000) as usize) * recorded_frame).min(ring_bytes);
+    let mut ring = PreRoll::new(&mut ring_memory[..ring_bytes_for(rec_frame)], rec_frame);
+    let mut pre_bytes = (u64::from(options.pre_seconds) * u64::from(rate)) as usize * rec_frame;
+    let mut trigger_bytes = ((u64::from(options.pre_seconds) * 1000 + u64::from(options.silence.sound_ms)) * u64::from(rate) / 1000) as usize * rec_frame;
 
     // Capture starts now, not when a take does: the meters and the pre-roll need it.
     let status = if options.tone.is_some() { 0 } else { (api.audio_start)(rate, 1, 0) };
@@ -519,14 +541,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     meters.clear();
     for channel in 0..channels.min(MAX_CHANNELS) {
         let mut label = Text::<8>::new();
-        let _ = write!(label, "In {:>2}", channel + 1);
+        let _ = write!(label, "{} {:>2}", if selection & (1 << channel) != 0 { "Rec" } else { "In " }, channel + 1);
         meters.add_row(label.as_str());
     }
     let coefficients = Coefficients::for_rate(rate);
     let mut detector = Detector::new(options.silence, rate);
     let mut auto = options.auto;
     let mut app = App {
-        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
         message: Text::from("Meters and pre-roll are running. Space or R starts a take."), errors: 0, last_take_frames: 0,
     };
 
@@ -538,12 +560,19 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 
     at(1, 1);
     draw!("\x1b[2J");
-    at(1, 2);
-    draw!("fos recorder: {channels} channel(s), {bits}-bit in {slot}-byte slots, {rate} Hz, pre-roll {} s{}\x1b[K", options.pre_seconds, if options.tone.is_some() { " (test tone)" } else { "" });
+    macro_rules! draw_title {
+        () => {{
+            let mut chosen = Text::<40>::new();
+            select::describe(selection, channels, &mut chosen);
+            at(1, 2);
+            draw!("fos recorder: {channels} ch {bits}-bit {rate} Hz  recording {} ({rec_channels})  pre-roll {} s{}\x1b[K", chosen.as_str(), options.pre_seconds, if options.tone.is_some() { "  (test tone)" } else { "" });
+        }};
+    }
+    draw_title!();
     meters.draw_scale();
 
     let started = tape_rt::micros();
-    let (mut produced, mut phase) = (0u64, 0u32);
+    let (mut produced, mut phase, mut phase2) = (0u64, 0u32, 0u32);
     let mut next_status = started;
     let mut next_meters = started;
     let mut quit = false;
@@ -575,6 +604,49 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     }
                 } else {
                     say!(app, "Format cancelled.");
+                }
+                continue;
+            }
+            if let Some(typed) = app.channel_editing.as_mut() {
+                // The channels to record: `9-12`, `1,3,5-8` or `all`.
+                let byte = (event & 0xff) as u8;
+                if event == 1 {
+                    app.channel_editing = None;
+                    say!(app, "Channels unchanged.");
+                } else if byte == b'\r' || byte == b'\n' {
+                    let text = *typed;
+                    app.channel_editing = None;
+                    let wanted = if text.as_str() == "all" { Some(full_mask) } else { ChannelSet::parse(text.as_str()).map(|set| set.0) };
+                    match wanted {
+                        Some(mask) if mask & !full_mask == 0 => {
+                            selection = mask;
+                            rec_channels = selection.count_ones() as usize;
+                            rec_frame = rec_channels * slot;
+                            app.format.channels = rec_channels as u16;
+                            app.frame = rec_frame;
+                            // The pre-roll held the old selection's frames: start it again for the new one.
+                            let memory: &'static mut [u8] = if ring_memory_pointer != 0 { unsafe { core::slice::from_raw_parts_mut(ring_memory_pointer as *mut u8, ring_bytes) } } else { &mut [] };
+                            ring = PreRoll::new(&mut memory[..ring_bytes_for(rec_frame)], rec_frame);
+                            pre_bytes = (u64::from(options.pre_seconds) * u64::from(rate)) as usize * rec_frame;
+                            trigger_bytes = ((u64::from(options.pre_seconds) * 1000 + u64::from(options.silence.sound_ms)) * u64::from(rate) / 1000) as usize * rec_frame;
+                            detector.reset();
+                            for channel in 0..channels.min(MAX_CHANNELS) {
+                                let mut label = Text::<8>::new();
+                                let _ = write!(label, "{} {:>2}", if selection & (1 << channel) != 0 { "Rec" } else { "In " }, channel + 1);
+                                meters.set_label(channel, label.as_str());
+                            }
+                            draw_title!();
+                            let mut chosen = Text::<40>::new();
+                            select::describe(selection, channels, &mut chosen);
+                            say!(app, "Recording channel(s) {} ({} of {channels}); the pre-roll starts over.", chosen.as_str(), rec_channels);
+                        }
+                        Some(_) => say!(app, "The device has only {channels} channels."),
+                        None => say!(app, "Channels are like 9-12 or 1,3,5-8 or all."),
+                    }
+                } else if byte == 8 || byte == 127 {
+                    typed.pop();
+                } else if (byte.is_ascii_digit() || byte == b',' || byte == b'-' || b"all".contains(&byte.to_ascii_lowercase())) && typed.len() < 39 {
+                    typed.push(byte.to_ascii_lowercase());
                 }
                 continue;
             }
@@ -636,6 +708,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                         app.label_editing = Some((app.choices[app.selected].number, Text::from("FOS")));
                     }
                 }
+                b'c' | b'C' => {
+                    if app.take.is_some() {
+                        say!(app, "A take is running: stop it (Space) before changing the channels.");
+                    } else {
+                        app.channel_editing = Some(Text::new());
+                    }
+                }
                 b'f' | b'F' => {
                     if app.take.is_some() {
                         say!(app, "A take is running: stop it (Space) before changing the file name.");
@@ -683,9 +762,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 let second = (produced + index as u64) / u64::from(rate);
                 let on = options.gate.is_none_or(|(on, off)| second % u64::from(on + off).max(1) < u64::from(on));
                 let sample = if on { tone_sample(phase) } else { 0 }.to_le_bytes();
+                // The right channel carries twice the frequency, so that a test can tell the channels apart.
+                let right = if on { tone_sample(phase2) } else { 0 }.to_le_bytes();
                 phase = (phase + (u64::from(frequency) * 65_536 / u64::from(rate)) as u32) & 0xffff;
+                phase2 = (phase2 + (u64::from(frequency) * 2 * 65_536 / u64::from(rate)) as u32) & 0xffff;
                 block_buffer[index * frame..index * frame + 2].copy_from_slice(&sample);
-                block_buffer[index * frame + 2..index * frame + 4].copy_from_slice(&sample);
+                block_buffer[index * frame + 2..index * frame + 4].copy_from_slice(&right);
             }
             produced += frames as u64;
             frames * frame
@@ -694,8 +776,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         };
         let now = tape_rt::micros();
         if got > 0 {
-            let block = &block_buffer[..got];
-            let loudest = peaks::feed(block, channels, slot, &coefficients, detectors, clips);
+            let device_block = &block_buffer[..got];
+            let loudest = peaks::feed(device_block, channels, slot, &coefficients, detectors, clips, selection);
+            // What is recorded: the selected channels (the block itself when that is all of them).
+            let block: &[u8] = if selection == full_mask {
+                device_block
+            } else {
+                let selected = unsafe { &mut *(&raw mut SELECT_BUFFER) };
+                let length = select::extract(device_block, channels, slot, selection, selected);
+                &selected[..length]
+            };
             let event = detector.feed(loudest, (got / frame) as u32);
             let recording = app.take.is_some();
             let (mut start, mut stop, mut lead) = (toggle && !recording, toggle && recording, pre_bytes);

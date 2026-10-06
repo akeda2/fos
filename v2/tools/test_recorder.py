@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_audio_net import Guest  # noqa: E402
+from test_audio_net import Guest, tone_frequency  # noqa: E402
 from test_boot import check  # noqa: E402
 from test_record import fosfs_files, wav  # noqa: E402
 
@@ -55,6 +55,45 @@ def main():
             guest.process.stdin.write(b"q")
             guest.process.stdin.flush()
             guest.wait_for("file(s) written", 30, mark)
+            # Channel selection: the test tone is 440 Hz on channel 1 and 880 Hz on channel 2. `ch=2` records only the right
+            # channel; in another run `C` picks channel 2 in the UI, and a bad choice is refused.
+            mark = guest.send("run recorder cha ch=2 tone=440 pre=1")
+            guest.wait_for("recording 2 (1)", 30, mark)
+            guest.pump(1.5)
+            for keys in (b" ",):
+                guest.process.stdin.write(keys)
+                guest.process.stdin.flush()
+            guest.wait_for("Recording disk1/cha001.wav", 10, mark)
+            guest.pump(2.0)
+            guest.process.stdin.write(b" ")
+            guest.process.stdin.flush()
+            guest.wait_for("Saved 1 file", 15, mark)
+            guest.process.stdin.write(b"q")
+            guest.process.stdin.flush()
+            guest.wait_for("file(s) written", 30, mark)
+            mark = guest.send("run recorder chb tone=440 pre=1")
+            guest.wait_for("recording all (2)", 30, mark)
+            for keys in (b"c", b"7", b"\r"):
+                guest.process.stdin.write(keys)
+                guest.process.stdin.flush()
+                guest.pump(0.4)
+            guest.wait_for("The device has only 2 channels", 10, mark)
+            for keys in (b"c", b"2", b"\r"):
+                guest.process.stdin.write(keys)
+                guest.process.stdin.flush()
+                guest.pump(0.4)
+            guest.wait_for("Recording channel(s) 2 (1 of 2)", 10, mark)
+            guest.pump(1.5)
+            guest.process.stdin.write(b" ")
+            guest.process.stdin.flush()
+            guest.wait_for("Recording disk1/chb001.wav", 10, mark)
+            guest.pump(2.0)
+            guest.process.stdin.write(b" ")
+            guest.process.stdin.flush()
+            guest.wait_for("Saved 1 file", 15, mark)
+            guest.process.stdin.write(b"q")
+            guest.process.stdin.flush()
+            guest.wait_for("file(s) written", 30, mark)
         finally:
             guest.process.kill()
             guest.process.wait()
@@ -75,6 +114,11 @@ def main():
         seconds = len(samples) / rate
         check(4.4 < seconds < 5.9, f"edt001.wav (2 s of pre-roll + 3 s taken by hand) is {seconds:.1f} s", "")
         check(loud(samples, 0, rate) > 4000, "and starts with tone from before the key press", "")
+    for name in ("cha001.wav", "chb001.wav"):
+        channels, rate, bits, samples, declared = wav(files[name])
+        check(channels == 1, f"{name} has one channel", str(channels))
+        measured = tone_frequency(samples, rate, samples[rate // 2:rate // 2 + rate])
+        check(abs(measured - 880) < 12, f"{name} holds channel 2 (880 Hz), measured {measured:.0f}", "")
     print("v2 recorder: all checks passed")
 
 

@@ -7,8 +7,9 @@ use audio_wire::meter::{CLIP, Coefficients, Ppm};
 
 /// Feeds every frame of `data` to `detectors` (one per channel, at most `detectors.len()` of the `channels` are
 /// used), latching `clips[channel]` for a sample at or near full scale. Returns the loudest magnitude seen in the
-/// block over all channels (for the silence detector), in the meter's scale (2^31 = full scale).
-pub fn feed(data: &[u8], channels: usize, slot: usize, coefficients: &Coefficients, detectors: &mut [Ppm], clips: &mut [bool]) -> u32 {
+/// block over the channels in `mask` (bit n = channel n+1; for the silence detector, which should only listen to what is
+/// being recorded), in the meter's scale (2^31 = full scale).
+pub fn feed(data: &[u8], channels: usize, slot: usize, coefficients: &Coefficients, detectors: &mut [Ppm], clips: &mut [bool], mask: u32) -> u32 {
     let mut loudest = 0u32;
     if channels == 0 || !(2..=4).contains(&slot) {
         return 0;
@@ -23,7 +24,9 @@ pub fn feed(data: &[u8], channels: usize, slot: usize, coefficients: &Coefficien
             if magnitude >= CLIP {
                 clips[channel] = true;
             }
-            loudest = loudest.max(magnitude);
+            if mask & (1 << channel) != 0 {
+                loudest = loudest.max(magnitude);
+            }
         }
     }
     loudest
@@ -40,12 +43,15 @@ mod tests {
         let mut clips = [false; 2];
         // Two 24-bit frames: ch0 = +0x400000 (a half scale of 24 bits... 0x40_0000 of 0x80_0000), ch1 = -full scale.
         let data = [0x00, 0x00, 0x40, 0x00, 0x00, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x80];
-        let loudest = feed(&data, 2, 3, &c, &mut detectors, &mut clips);
+        let loudest = feed(&data, 2, 3, &c, &mut detectors, &mut clips, !0);
         assert!(loudest >= CLIP);
         assert_eq!(clips, [false, true]);
         assert!(detectors[0].level > 0 && detectors[1].level > detectors[0].level);
         // 16-bit silence gives zero.
-        let loudest = feed(&[0u8; 8], 2, 2, &c, &mut detectors, &mut clips);
+        let loudest = feed(&[0u8; 8], 2, 2, &c, &mut detectors, &mut clips, !0);
         assert_eq!(loudest, 0);
+        // The loudest is taken over the masked channels only.
+        let data = [0x00, 0x00, 0x40, 0x00, 0x00, 0x10]; // ch0 loud, ch1 quiet (24-bit)
+        assert!(feed(&data, 2, 3, &c, &mut detectors, &mut clips, 0b01) > feed(&data, 2, 3, &c, &mut detectors, &mut clips, 0b10));
     }
 }

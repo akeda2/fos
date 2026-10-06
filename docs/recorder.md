@@ -10,7 +10,12 @@ size, model); `D` steps through the disks that have a volume, starting at the bo
 contiguous run, which is what one take can use, and how long a recording that is at the current format. The list comes from the
 `disk_info` tape call (kernel `api_disk_info`); on a kernel without it the tape records to the boot volume.
 
-Keys: Space/R take on/off, A auto on/off, D choose the disk to record to and F type the file name (neither during a take), N/B meter pages, U Nordic/dBFS, H clear holds, Q/Esc quit.
+Channels: a take records only the channels you pick (`ch=9-12`, or `C` in the UI: `9-12`, `1,3,5-8` or `all`; not
+during a take). The meters always show every input (`Rec` marks the recorded ones, `In` the others), the silence trigger listens
+to the recorded channels only, and the WAV has just those channels (in the device's own sample format). Changing the channels
+starts the pre-roll over, since it holds frames of the old selection.
+
+Keys: Space/R take on/off, A auto on/off, C choose channels, D choose the disk to record to and F type the file name (neither during a take), N/B meter pages, U Nordic/dBFS, H clear holds, Q/Esc quit.
 
 ## Libraries (all host-testable)
 
