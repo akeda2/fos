@@ -14,7 +14,7 @@ use crate::{MacText, Options, Transport, parse, peers, run_once};
 use audio_wire::{ChannelSet, Cursor};
 use core::fmt::Write;
 use tape_panel::meters::MeterBank;
-use tape_panel::{Text, at, draw};
+use tape_panel::{Text, at, begin_batch, draw, end_batch};
 use tape_rt::{AudioInfo, Key, KeyDecoder, TapeApi};
 
 const CONFIG_FILE: &str = "audio.cfg";
@@ -574,12 +574,17 @@ struct Run {
     /// The same over the last ten seconds (so a start-up stall does not hide how it behaves now).
     ui_recent: u64,
     ui_recent_since: u64,
+    /// The most audio that has waited in the kernel's capture buffer since the run began, in bytes (sampled at every call of
+    /// the hook): on the sending side this is audio that is late, that is latency.
+    cap_peak: u64,
+    /// Bytes of one captured device frame (all its input channels): what turns the buffer's bytes into milliseconds.
+    cap_frame: u64,
 }
 
 const fn blank_run() -> Run {
     Run {
         stop: false, next_draw: 0, started: 0, meters: MeterBank::new(ROW_SCALE, ROW_FIRST, PAGE_ROWS), sends: 0, next_counters: 0, ip_shown: false, serve_port: 0, mac: [0; 6], nic: 0,
-        counters: Text::new(), message: Text::new(), actual: Text::new(), ui_worst: 0, last_draw: 0, ui_recent: 0, ui_recent_since: 0,
+        counters: Text::new(), message: Text::new(), actual: Text::new(), ui_worst: 0, last_draw: 0, ui_recent: 0, ui_recent_since: 0, cap_peak: 0, cap_frame: 0,
     }
 }
 
@@ -593,6 +598,15 @@ fn run_state() -> &'static mut Run {
 /// the last message and the meters up to date. Only what changed is sent, because every byte costs time the stream
 /// needs.
 extern "C" fn panel_hook() -> u32 {
+    // Everything this call draws goes to the console as one write: the console compares its whole text grid after each
+    // write, so one write per update holds the stream loop up far less than one per counter line and meter row.
+    begin_batch();
+    let result = panel_hook_inner();
+    end_batch();
+    result
+}
+
+fn panel_hook_inner() -> u32 {
     let run = run_state();
     if run.stop {
         return 1;
@@ -601,6 +615,11 @@ extern "C" fn panel_hook() -> u32 {
     if event == 1 {
         run.stop = true;
         return 1;
+    }
+    {
+        let mut waiting = tape_rt::AudioBuffer::default();
+        (tape_rt::api().audio_buffer)(&mut waiting);
+        run.cap_peak = run.cap_peak.max(waiting.available_bytes);
     }
     if event >= 0x100 {
         match (event & 0xff) as u8 {
@@ -680,6 +699,13 @@ extern "C" fn panel_hook() -> u32 {
             let _ = write!(actual, "Clients: {}", if shown.serve_status.as_str().is_empty() { "waiting for the first" } else { shown.serve_status.as_str() });
         } else {
             let _ = write!(actual, "Sending: {}   Receiving: {}", if shown.send_codec.as_str().is_empty() { "-" } else { shown.send_codec.as_str() }, if shown.receive_codec.as_str().is_empty() { "-" } else { shown.receive_codec.as_str() });
+            // Capture side: audio waiting for the sender to take it is audio that is late. Now and the peak, in ms.
+            let mut waiting = tape_rt::AudioBuffer::default();
+            (tape_rt::api().audio_buffer)(&mut waiting);
+            if waiting.ring_bytes != 0 && run.cap_frame != 0 && shown.rate != 0 {
+                let per_ms = (u64::from(shown.rate) * run.cap_frame / 1000).max(1);
+                let _ = write!(actual, "   Capture late {}/{} ms", waiting.available_bytes / per_ms, run.cap_peak / per_ms);
+            }
         }
         if actual != run.actual {
             at(4, 2);
@@ -728,6 +754,12 @@ fn run_stream(settings: &Settings) {
     let run = run_state();
     *run = blank_run();
     run.started = tape_rt::micros();
+    {
+        let mut device = tape_rt::AudioInfo::default();
+        if (real.audio_info)(&mut device) != 0 {
+            run.cap_frame = u64::from(device.capture_channels) * u64::from(device.capture_slot_bytes);
+        }
+    }
     run.nic = options.nic;
     // One meter row per channel: the ones sent (labelled with the device input they come from), then the ones played.
     let add = |channels: Option<ChannelSet>, fallback: usize, sending: bool, run: &mut Run| {
