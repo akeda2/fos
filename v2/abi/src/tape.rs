@@ -9,6 +9,10 @@
 //! bytes the kernel's table has, so a tape built against an older layout is unaffected
 //! and a tape built against a newer one can check `size` before using a late field.
 //! `read_key` and `should_abort` drain the same input: use one or the other.
+//!
+//! The same rule holds for the structs the kernel *fills in* for a tape (`AudioInfo`, `AudioStats`, `DiskInfo`): never add a
+//! field to one. A tape built before the field would hand the kernel a smaller struct than it writes, and the kernel would write
+//! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
 /// using it, so it still runs on a kernel that only has version 1.

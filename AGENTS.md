@@ -22,6 +22,7 @@ Everything below describes v1 unless it says otherwise.
 See NETWORKING.md for more networking stuff
 See AUDIO.md for audio interface stuff
 See DEFERRED.md for things put aside for now.
+See docs/recorder.md for the v2 recorder tape, FAT32/exFAT, the clock and `grow`.
 
 Try not to fill up this file, put new stuff in the above files or under docs/
 
