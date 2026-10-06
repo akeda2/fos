@@ -38,10 +38,16 @@ def main():
             # Manual take with pre-roll: started by Space after 4 s, stopped 3 s later.
             mark = guest.send("run recorder man tone=440 pre=2")
             guest.wait_for("fos recorder", 30, mark)
-            guest.pump(4.0)
+            # Rename the files in the UI: F, erase the old name, type `EDTx` (letters are lower-cased), Backspace, Enter.
+            for keys in (b"f", b"\x7f\x7f\x7f", b"EDTx", b"\x7f", b"\r"):
+                guest.process.stdin.write(keys)
+                guest.process.stdin.flush()
+                guest.pump(0.4)
+            guest.wait_for("Files will be called edtnnn.wav", 10, mark)
+            guest.pump(3.0)
             guest.process.stdin.write(b" ")
             guest.process.stdin.flush()
-            guest.wait_for("Recording disk1/man001.wav", 10, mark)
+            guest.wait_for("Recording disk1/edt001.wav", 10, mark)
             guest.pump(3.0)
             guest.process.stdin.write(b" ")
             guest.process.stdin.flush()
@@ -53,7 +59,7 @@ def main():
             guest.process.kill()
             guest.process.wait()
         files = fosfs_files(image)
-        check({"take001.wav", "take002.wav", "man001.wav"} <= set(files), "take001.wav, take002.wav and man001.wav exist", str(sorted(files)))
+        check({"take001.wav", "take002.wav", "edt001.wav"} <= set(files), "take001.wav, take002.wav and edt001.wav exist", str(sorted(files)))
         channels, rate, bits, samples, declared = wav(files["take001.wav"])
         check((channels, rate, bits) == (2, 48000, 16), "take001.wav is 2 channels, 48 kHz, 16 bit", "")
         seconds = len(samples) / rate
@@ -65,9 +71,9 @@ def main():
         # Tone starts at 6 s; the take began after silence ended take 1 (3.6 s) so the pre-roll holds ~2.4 s of quiet.
         check(loud(samples, 0, rate) == 0, "take002.wav starts with silence from the pre-roll", "")
         check(loud(samples, int(3.2 * rate), int(4.5 * rate)) > 4000, "and holds the tone after it", "")
-        channels, rate, bits, samples, declared = wav(files["man001.wav"])
+        channels, rate, bits, samples, declared = wav(files["edt001.wav"])
         seconds = len(samples) / rate
-        check(4.4 < seconds < 5.9, f"man001.wav (2 s of pre-roll + 3 s taken by hand) is {seconds:.1f} s", "")
+        check(4.4 < seconds < 5.9, f"edt001.wav (2 s of pre-roll + 3 s taken by hand) is {seconds:.1f} s", "")
         check(loud(samples, 0, rate) > 4000, "and starts with tone from before the key press", "")
     print("v2 recorder: all checks passed")
 

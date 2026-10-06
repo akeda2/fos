@@ -35,7 +35,7 @@ const MAX_CHANNELS: usize = 32;
 const PAGE_ROWS: usize = 12;
 const ROW_SCALE: usize = 8;
 const ROW_FIRST: usize = 10;
-const HINT: &str = "Space/R: record   A: auto   D: disk   U: scale   H: clear holds   Q/Esc: quit";
+const HINT: &str = "Space/R: record  A: auto  D: disk  F: file name  U: scale  H: holds  Q/Esc: quit";
 /// Bytes written to disk at a time: a multiple of the sector size, small enough that one disk write takes well under
 /// the capture ring's headroom even on a slow USB stick.
 const CHUNK: usize = 256 << 10;
@@ -177,7 +177,9 @@ struct App {
     api: &'static TapeApi,
     /// The file name before the number (`take` for take001.wav) and where the files go: a volume prefix the user typed
     /// (`@label/`, which the disk menu leaves alone) or one of the disks in `choices`.
-    base: &'static str,
+    base: Text<12>,
+    /// The file name being typed (`F`), if the user is editing it.
+    editing: Option<Text<12>>,
     custom_prefix: &'static str,
     choices: [Choice; MAX_DISKS],
     choice_count: usize,
@@ -218,7 +220,7 @@ impl App {
             self.name.clear();
             let mut prefix = Text::<40>::new();
             self.prefix(&mut prefix);
-            let _ = write!(self.name, "{}{}{number:03}.wav", prefix.as_str(), self.base);
+            let _ = write!(self.name, "{}{}{number:03}.wav", prefix.as_str(), self.base.as_str());
             let status = (self.api.fs_read)(self.name.as_str().as_ptr(), self.name.len(), core::ptr::null_mut(), 0);
             if status == FS_NOT_FOUND {
                 self.next_number = number + 1;
@@ -227,7 +229,7 @@ impl App {
             }
         }
         if !found {
-            say!(self, "No free file name for {}nnn.wav.", self.base);
+            say!(self, "No free file name for {}nnn.wav.", self.base.as_str());
             return false;
         }
         let sink = sink();
@@ -336,8 +338,12 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
         }
         None => {
             let s = seconds(ring.len() as u64);
-            let _ = write!(line, "MONITORING  pre-roll holds {} s  (up {} s)", s, (now - started) / 1_000_000);
+            let _ = write!(line, "MONITORING  pre-roll holds {} s  (up {} s)   next: {}{:03}.wav", s, (now - started) / 1_000_000, app.base.as_str(), app.next_number);
         }
+    }
+    if let Some(typed) = app.editing.as_ref() {
+        line.clear();
+        let _ = write!(line, "File name: {}_   (letters, digits, _ -; Enter: ok, Esc: cancel)", typed.as_str());
     }
     show(3, line.as_str());
     let mut line = Text::<100>::new();
@@ -460,7 +466,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut detector = Detector::new(options.silence, rate);
     let mut auto = options.auto;
     let mut app = App {
-        api, base: unsafe { core::mem::transmute::<&str, &'static str>(file_part) }, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        api, base: Text::from(file_part), editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
         message: Text::from("Meters and pre-roll are running. Space or R starts a take."), errors: 0, last_take_frames: 0,
     };
 
@@ -490,11 +496,40 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if event == 0 {
                 break;
             }
+            if let Some(typed) = app.editing.as_mut() {
+                // Typing a file name: letters (lower-cased), digits, `_` and `-` are the characters every volume takes.
+                let byte = (event & 0xff) as u8;
+                if event == 1 {
+                    app.editing = None; // Escape cancels
+                    say!(app, "File name unchanged.");
+                } else if byte == b'\r' || byte == b'\n' {
+                    if typed.is_empty() {
+                        say!(app, "A file name needs at least one character.");
+                    } else {
+                        app.base = *typed;
+                        app.next_number = 1;
+                        app.editing = None;
+                        say!(app, "Files will be called {}nnn.wav.", app.base.as_str());
+                    }
+                } else if byte == 8 || byte == 127 {
+                    typed.pop();
+                } else if (byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') && typed.len() < 9 {
+                    typed.push(byte.to_ascii_lowercase());
+                }
+                continue;
+            }
             if event == 1 {
                 quit = true;
                 break;
             }
             match (event & 0xff) as u8 {
+                b'f' | b'F' => {
+                    if app.take.is_some() {
+                        say!(app, "A take is running: stop it (Space) before changing the file name.");
+                    } else {
+                        app.editing = Some(Text::from(app.base.as_str()));
+                    }
+                }
                 b'q' | b'Q' => quit = true,
                 b' ' | b'r' | b'R' => toggle = true,
                 b'a' | b'A' => {

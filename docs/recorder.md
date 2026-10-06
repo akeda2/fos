@@ -9,7 +9,7 @@ pre-roll buffer, takes started by hand or by sound and ended by silence, written
 size, model); `D` steps through the disks that have a volume, starting at the boot disk. The list comes from the
 `disk_info` tape call (kernel `api_disk_info`); on a kernel without it the tape records to the boot volume.
 
-Keys: Space/R take on/off, A auto on/off, D choose the disk to record to (not during a take), N/B meter pages, U Nordic/dBFS, H clear holds, Q/Esc quit.
+Keys: Space/R take on/off, A auto on/off, D choose the disk to record to and F type the file name (neither during a take), N/B meter pages, U Nordic/dBFS, H clear holds, Q/Esc quit.
 
 ## Libraries (all host-testable)
 
