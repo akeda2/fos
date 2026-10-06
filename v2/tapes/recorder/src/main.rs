@@ -214,6 +214,8 @@ struct App {
     selected: usize,
     format: Format,
     frame: usize,
+    /// Bytes of a device frame (all the channels), for the backlog figure.
+    device_frame: usize,
     staging: usize,
     take: Option<Recorder<'static, StreamSink>>,
     name: Text<40>,
@@ -434,8 +436,27 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
     if options.tone.is_none() {
         (app.api.audio_stats)(&mut stats);
     }
+    // The backlog: audio the device has delivered that the tape has not taken yet (the kernel's capture ring). It grows
+    // while a disk write stalls, and audio is lost only if it reaches the ring's size.
+    let mut info = AudioInfo::default();
+    if options.tone.is_none() {
+        (app.api.audio_info)(&mut info);
+    }
+    let per_second = (u64::from(app.format.rate) * app.device_frame as u64).max(1);
+    let (backlog, room) = (u64::from(info.capture_available) * 10 / per_second, u64::from(info.capture_ring_bytes) * 10 / per_second);
     let mut line = Text::<100>::new();
-    let _ = write!(line, "Disk: {} KiB/s, slowest block {} ms   Device: {} transfer errors, {} overruns", sink.kib_per_second(), sink.write_max_us / 1000, stats.capture_errors, stats.capture_overruns);
+    let _ = write!(
+        line,
+        "Disk {} KiB/s, worst {} ms  Backlog {}.{}/{}.{} s  Errors {}  Overruns {}",
+        sink.kib_per_second(),
+        sink.write_max_us / 1000,
+        backlog / 10,
+        backlog % 10,
+        room / 10,
+        room % 10,
+        stats.capture_errors,
+        stats.capture_overruns
+    );
     show(5, line.as_str());
     // Row 6 is the message line, and also where a prompt being typed into appears (so row 3 stays the state line).
     let mut prompt = Text::<100>::new();
@@ -550,17 +571,20 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut detector = Detector::new(options.silence, rate);
     let mut auto = options.auto;
     let mut app = App {
-        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        api, base: Text::from(file_part), editing: None, confirming: None, label_editing: None, channel_editing: None, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame: rec_frame, device_frame: frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
         message: Text::from("Meters and pre-roll are running. Space or R starts a take."), errors: 0, last_take_frames: 0,
     };
 
     if custom_prefix.is_empty() {
         app.choice_count = find_disks(api, &mut app.choices);
-        // The disk asked for by name, else the first exFAT disk (a disk kept for recordings), else the boot disk, else the first.
-        app.selected = (0..app.choice_count)
-            .find(|&index| Some(app.choices[index].number) == wanted_disk)
-            .or_else(|| (0..app.choice_count).find(|&index| app.choices[index].kind == DISK_EXFAT))
-            .or_else(|| (0..app.choice_count).find(|&index| app.choices[index].boot))
+        // The disk asked for by name; else by priority: the first exFAT disk (kept for recordings), the first FAT32 disk,
+        // a FOSFS disk that is not the boot disk, the boot disk, anything.
+        let first = |wanted: &dyn Fn(&Choice) -> bool| (0..app.choice_count).find(|&index| wanted(&app.choices[index]));
+        app.selected = first(&|choice| Some(choice.number) == wanted_disk)
+            .or_else(|| first(&|choice| choice.kind == DISK_EXFAT))
+            .or_else(|| first(&|choice| choice.kind == DISK_FAT32))
+            .or_else(|| first(&|choice| choice.kind == DISK_FOSFS && !choice.boot))
+            .or_else(|| first(&|choice| choice.boot))
             .unwrap_or(0);
     }
 

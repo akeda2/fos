@@ -270,6 +270,18 @@ impl PcmRing {
     fn space(&self) -> usize {
         self.size - self.available()
     }
+    /// Appends the data if all of it fits; otherwise none of it is taken and the overrun is counted (the reader is too
+    /// slow). Never part of it: a captured packet is whole frames, and a ring that took half a packet would leave every
+    /// later frame shifted by a few bytes, scrambling the channels for the rest of a recording.
+    fn push_whole(&self, data: &[u8]) -> usize {
+        if data.len() <= self.space() {
+            self.push(data)
+        } else {
+            self.overruns.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
+
     /// Appends what fits; the rest is dropped and counted (the reader is too slow).
     fn push(&self, data: &[u8]) -> usize {
         let count = data.len().min(self.space());
@@ -746,7 +758,7 @@ pub fn irq_event(index: usize, event: &xhci::Trb) -> bool {
             let length = usize::from(stream.alt.max_packet).saturating_sub(event.residual() as usize);
             let data = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
             stream.bytes.fetch_add(length as u64, Ordering::Relaxed);
-            stream.pcm.push(data);
+            stream.pcm.push_whole(data);
         }
         queue_slot(stream, slot);
         xhci::ring_doorbell_at(stream.doorbell, stream.dci);
@@ -941,6 +953,7 @@ pub fn fill_info(info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
     if let Some(stream) = &device.capture {
         out.capture_rate = stream.rate;
         out.capture_available = stream.pcm.available() as u32;
+        out.capture_ring_bytes = stream.pcm.size as u32;
     }
     if let Some(stream) = &device.playback {
         out.playback_rate = stream.rate;

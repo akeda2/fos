@@ -194,6 +194,8 @@ pub struct AudioInfo {
     /// Bytes of room in the playback ring and bytes waiting in the capture ring.
     pub playback_space: u32,
     pub capture_available: u32,
+    /// The capture ring's size in bytes (what `capture_available` can grow to before audio is dropped).
+    pub capture_ring_bytes: u32,
 }
 
 #[repr(C)]
