@@ -389,18 +389,6 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
             let _ = write!(line, "MONITORING  pre-roll holds {} s  (up {} s)   next: {}{:03}.wav", s, (now - started) / 1_000_000, app.base.as_str(), app.next_number);
         }
     }
-    if let Some(typed) = app.channel_editing.as_ref() {
-        line.clear();
-        let _ = write!(line, "Channels to record (9-12, 1,3,5-8 or all): {}_   (Enter: ok, Esc: cancel)", typed.as_str());
-    }
-    if let Some((number, typed)) = app.label_editing.as_ref() {
-        line.clear();
-        let _ = write!(line, "Format disk{number} as exFAT. Volume label: {}_   (Enter: next, Esc: cancel)", typed.as_str());
-    }
-    if let Some(typed) = app.editing.as_ref() {
-        line.clear();
-        let _ = write!(line, "File name: {}_   (letters, digits, _ -; Enter: ok, Esc: cancel)", typed.as_str());
-    }
     show(3, line.as_str());
     let mut line = Text::<100>::new();
     if app.choice_count > 0 && app.custom_prefix.is_empty() {
@@ -449,7 +437,21 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
     let mut line = Text::<100>::new();
     let _ = write!(line, "Disk: {} KiB/s, slowest block {} ms   Device: {} transfer errors, {} overruns", sink.kib_per_second(), sink.write_max_us / 1000, stats.capture_errors, stats.capture_overruns);
     show(5, line.as_str());
-    show(6, app.message.as_str());
+    // Row 6 is the message line, and also where a prompt being typed into appears (so row 3 stays the state line).
+    let mut prompt = Text::<100>::new();
+    if let Some(typed) = app.channel_editing.as_ref() {
+        prompt.clear();
+        let _ = write!(prompt, "Channels to record (9-12, 1,3,5-8 or all): {}_   (Enter: ok, Esc: cancel)", typed.as_str());
+    }
+    if let Some((number, typed)) = app.label_editing.as_ref() {
+        prompt.clear();
+        let _ = write!(prompt, "Format disk{number} as exFAT. Volume label: {}_   (Enter: next, Esc: cancel)", typed.as_str());
+    }
+    if let Some(typed) = app.editing.as_ref() {
+        prompt.clear();
+        let _ = write!(prompt, "File name: {}_   (letters, digits, _ -; Enter: ok, Esc: cancel)", typed.as_str());
+    }
+    show(6, if prompt.is_empty() { app.message.as_str() } else { prompt.as_str() });
 }
 
 #[unsafe(no_mangle)]
@@ -585,6 +587,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if event == 0 {
                 break;
             }
+            next_status = 0; // a key press redraws the status at once, so that typing shows as it is typed
             if let Some((number, label)) = app.confirming.take() {
                 // Any key other than the disk's number cancels.
                 if (event & 0xff) as u8 == b'0' + number as u8 && event != 1 {
