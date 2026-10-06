@@ -353,11 +353,18 @@ extern "C" fn api_disk_info(number: usize, out: *mut fos_v2_abi::tape::DiskInfo)
                 let bytes = label.as_bytes();
                 info.label[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
             }
+            if let Ok((free, largest)) = volume.free_space() {
+                (info.free_bytes, info.largest_bytes) = (free, largest);
+            }
             DISK_FOSFS
         }
-        Err(_) => match crate::fatvol::mount(number - 1).map(|fs| fs.kind()) {
-            Some(fat::Kind::Fat32) => DISK_FAT32,
-            Some(fat::Kind::ExFat) => DISK_EXFAT,
+        Err(_) => match crate::fatvol::mount(number - 1) {
+            Some(mut fs) => {
+                if let Ok((free, largest)) = fs.free_space() {
+                    (info.free_bytes, info.largest_bytes) = (free, largest);
+                }
+                if fs.kind() == fat::Kind::ExFat { DISK_EXFAT } else { DISK_FAT32 }
+            }
             None => DISK_NO_VOLUME,
         },
     };

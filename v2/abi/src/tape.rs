@@ -145,6 +145,10 @@ pub const DISK_EXFAT: u32 = 3;
 #[derive(Clone, Copy)]
 pub struct DiskInfo {
     pub sectors: u64,
+    /// Free bytes in all and in the longest contiguous run (a recording needs one run); `u64::MAX` when not known
+    /// (FAT32, or a disk with no volume).
+    pub free_bytes: u64,
+    pub largest_bytes: u64,
     /// `DISK_*`: the volume a tape can write files to (a disk with none is listed but unusable).
     pub kind: u32,
     /// 1 for the disk the system booted from.
@@ -156,7 +160,7 @@ pub struct DiskInfo {
 
 impl Default for DiskInfo {
     fn default() -> Self {
-        DiskInfo { sectors: 0, kind: 0, boot: 0, model: [0; 40], label: [0; 16] }
+        DiskInfo { sectors: 0, free_bytes: u64::MAX, largest_bytes: u64::MAX, kind: 0, boot: 0, model: [0; 40], label: [0; 16] }
     }
 }
 

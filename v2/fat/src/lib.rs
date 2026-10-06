@@ -252,6 +252,15 @@ impl<D: Device> Fs<D> {
         }
     }
 
+    /// (free bytes in all, bytes of the longest free run) -- the second is what one recording can use. exFAT only: on
+    /// FAT32 this would mean reading the whole FAT, which a slow stick makes take a long time, so it says `Unsupported`.
+    pub fn free_space(&mut self) -> Result<(u64, u64), Error> {
+        match self.kind {
+            Kind::ExFat => self.exfat_free_space(),
+            Kind::Fat32 => Err(Error::Unsupported),
+        }
+    }
+
     /// Walks the root directory until `visit` returns true.
     fn walk(&mut self, visit: &mut dyn FnMut(&Entry) -> bool) -> Result<(), Error> {
         match self.kind {

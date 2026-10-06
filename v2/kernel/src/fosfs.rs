@@ -345,6 +345,16 @@ impl Volume {
         Ok(None)
     }
 
+    /// (free bytes in all, bytes of the largest free run): a recording needs one contiguous run, so the second figure
+    /// is what a take can use.
+    pub fn free_space(&self) -> Result<(u64, u64), Error> {
+        let mut used = 0u64;
+        self.for_each(|entry| used += entry.sector_count)?;
+        let total = self.sectors.saturating_sub(DATA_START).saturating_sub(used);
+        let largest = self.largest_free_extent(None)?.map_or(0, |(_, count)| count);
+        Ok((total * 512, largest * 512))
+    }
+
     /// The largest run of free sectors (start, count), ignoring the extent of `replacing`.
     fn largest_free_extent(&self, replacing: Option<&Entry>) -> Result<Option<(u64, u64)>, Error> {
         let mut extents = [(0u64, 0u64); MAX_ENTRIES];

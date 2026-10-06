@@ -110,13 +110,16 @@ struct Choice {
     number: usize,
     kind: u32,
     sectors: u64,
+    /// Free bytes in all and in the longest run (`u64::MAX`: not known).
+    free: u64,
+    largest: u64,
     boot: bool,
     model: Text<24>,
     label: Text<16>,
 }
 
 impl Choice {
-    const EMPTY: Choice = Choice { number: 0, kind: 0, sectors: 0, boot: false, model: Text::new(), label: Text::new() };
+    const EMPTY: Choice = Choice { number: 0, kind: 0, sectors: 0, free: u64::MAX, largest: u64::MAX, boot: false, model: Text::new(), label: Text::new() };
 
     fn describe(&self, out: &mut Text<100>) {
         let kind = match self.kind {
@@ -139,6 +142,18 @@ impl Choice {
         if self.boot {
             let _ = write!(out, "  (boot disk)");
         }
+    }
+}
+
+/// `12.3 GiB` / `850 MiB`.
+fn size_text(bytes: u64, out: &mut Text<100>) {
+    if bytes >= 10 << 30 {
+        let _ = write!(out, "{} GiB", bytes >> 30);
+    } else if bytes >= 1 << 30 {
+        let tenths = (bytes * 10) >> 30;
+        let _ = write!(out, "{}.{} GiB", tenths / 10, tenths % 10);
+    } else {
+        let _ = write!(out, "{} MiB", bytes >> 20);
     }
 }
 
@@ -165,7 +180,7 @@ fn find_disks(api: &TapeApi, choices: &mut [Choice; MAX_DISKS]) -> usize {
         for &byte in info.label.iter().take_while(|&&byte| byte != 0) {
             label.push(byte);
         }
-        choices[count] = Choice { number, kind: info.kind, sectors: info.sectors, boot: info.boot != 0, model, label };
+        choices[count] = Choice { number, kind: info.kind, sectors: info.sectors, free: info.free_bytes, largest: info.largest_bytes, boot: info.boot != 0, model, label };
         count += 1;
     }
     count
@@ -206,6 +221,19 @@ impl App {
             let _ = write!(out, "{}", self.custom_prefix);
         } else if self.choice_count > 0 {
             let _ = write!(out, "disk{}/", self.choices[self.selected].number);
+        }
+    }
+
+    /// Asks the kernel again what the chosen disk has free (after a take, or when it was just chosen).
+    fn refresh_free(&mut self) {
+        if self.choice_count == 0 || (self.api.size as usize) < core::mem::size_of::<TapeApi>() {
+            return;
+        }
+        let number = self.choices[self.selected].number;
+        let mut info = DiskInfo::default();
+        if (self.api.disk_info)(number, &mut info) != 0 {
+            self.choices[self.selected].free = info.free_bytes;
+            self.choices[self.selected].largest = info.largest_bytes;
         }
     }
 
@@ -310,6 +338,7 @@ impl App {
             say!(self, "Saved {} file(s), {} s: last {}.", self.files, seconds, self.name.as_str());
         }
         self.last_take_frames = 0;
+        self.refresh_free();
     }
 
     fn checkpoint(&mut self, now: u64) {
@@ -357,6 +386,23 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
         let _ = write!(line, "Record to: the boot volume");
     }
     show(2, line.as_str());
+    // Row 7: room on the disk. One take needs one contiguous run, so that is what the time is worked out from.
+    let mut line = Text::<100>::new();
+    if app.choice_count > 0 && app.custom_prefix.is_empty() {
+        let choice = &app.choices[app.selected];
+        if choice.largest == u64::MAX {
+            let _ = write!(line, "Free space: not shown for this kind of volume");
+        } else {
+            let _ = write!(line, "Free: ");
+            size_text(choice.free, &mut line);
+            let _ = write!(line, ", longest run ");
+            size_text(choice.largest, &mut line);
+            let per_second = u64::from(app.format.rate) * app.frame as u64;
+            let minutes = choice.largest / per_second.max(1) / 60;
+            let _ = write!(line, " = room for {}h{:02}m at this format", minutes / 60, minutes % 60);
+        }
+    }
+    show(7, line.as_str());
     let mut line = Text::<100>::new();
     let _ = write!(
         line,
@@ -542,6 +588,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     } else if app.choice_count > 1 {
                         app.selected = (app.selected + 1) % app.choice_count;
                         app.next_number = 1; // numbering starts again on the new disk
+                        app.refresh_free();
                         let mut text = Text::<100>::new();
                         app.choices[app.selected].describe(&mut text);
                         say!(app, "Recording to {}.", text.as_str());

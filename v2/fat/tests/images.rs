@@ -229,3 +229,32 @@ fn a_file_over_4_gib_on_exfat_is_not() {
     fs.read(&file, 5 << 30, &mut check).unwrap();
     assert!(check == data);
 }
+
+#[test]
+fn exfat_free_space_follows_the_files() {
+    if !tool("mkfs.exfat") {
+        return;
+    }
+    let path = scratch("exfat4.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 128, &["mkfs.exfat", "-c", "4096"]);
+    let mut fs = open(&path);
+    let (before, longest) = fs.free_space().unwrap();
+    assert!(before > 100 << 20 && longest <= before && longest > 100 << 20, "{before} {longest}");
+    record(&mut fs, b"a.wav", 0, 5 << 20, 262_144); // takes the biggest run, then gives back what it did not use
+    let (after, _) = fs.free_space().unwrap();
+    assert!(before - after >= 5 << 20 && before - after < (5 << 20) + (64 << 10), "{before} {after}");
+    assert!(fs.remove(b"a.wav").unwrap());
+    assert_eq!(fs.free_space().unwrap().0, before);
+}
+
+#[test]
+fn fat32_free_space_is_not_offered() {
+    if !tool("mkfs.vfat") {
+        return;
+    }
+    let path = scratch("fat32d.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 128, &["mkfs.vfat", "-F", "32", "-s", "1"]);
+    assert_eq!(open(&path).free_space(), Err(Error::Unsupported));
+}

@@ -90,11 +90,17 @@ def main():
                 mark = guest.send(f"run recorder {base} tone=440 pre=1")
                 guest.wait_for("fos recorder", 30, mark)
                 guest.wait_for("Record to: disk1  FOSFS", 10, mark)
+                guest.wait_for("Free: ", 10, mark)  # FOSFS shows free space too
                 for _ in range(presses):
                     guest.process.stdin.write(b"d")
                     guest.process.stdin.flush()
                     guest.pump(0.6)
                 guest.wait_for(f"Record to: {disk}  {'FAT32' if disk == 'disk2' else 'exFAT'}", 10, mark)
+                if disk == "disk2":
+                    guest.wait_for("Free space: not shown for this kind of volume", 10, mark)
+                else:
+                    guest.wait_for("longest run", 10, mark)
+                    check("room for" in guest.text()[mark:] and "GiB" in guest.text()[mark:] or "MiB" in guest.text()[mark:], "an exFAT disk shows its free space and the time that fits", "")
                 guest.pump(2.0)
                 guest.process.stdin.write(b" ")
                 guest.process.stdin.flush()

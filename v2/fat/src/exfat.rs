@@ -215,6 +215,39 @@ impl<D: Device> Fs<D> {
         Ok((best_start, best_count))
     }
 
+    /// (free bytes in all, bytes of the longest free run) from the allocation bitmap.
+    pub(crate) fn exfat_free_space(&mut self) -> Result<(u64, u64), Error> {
+        let (mut free, mut longest, mut run) = (0u64, 0u64, 0u64);
+        let bitmap_lba = self.cluster_lba(self.bitmap_cluster);
+        let total_bytes = u64::from(self.clusters).div_ceil(8);
+        let mut buffer = [0u8; 4096];
+        let mut done_bytes = 0u64;
+        let mut cluster = 0u32; // counted from the first cluster
+        while done_bytes < total_bytes {
+            let sectors = (total_bytes - done_bytes).div_ceil(SECTOR as u64).min(8) as usize;
+            self.device.read(bitmap_lba + done_bytes / SECTOR as u64, &mut buffer[..sectors * SECTOR])?;
+            let bytes = (sectors * SECTOR).min((total_bytes - done_bytes) as usize);
+            for &byte in &buffer[..bytes] {
+                for bit in 0..8 {
+                    if cluster >= self.clusters {
+                        break;
+                    }
+                    if byte & (1 << bit) == 0 {
+                        free += 1;
+                        run += 1;
+                        longest = longest.max(run);
+                    } else {
+                        run = 0;
+                    }
+                    cluster += 1;
+                }
+            }
+            done_bytes += bytes as u64;
+        }
+        let cluster_bytes = self.cluster_bytes();
+        Ok((free * cluster_bytes, longest * cluster_bytes))
+    }
+
     pub(crate) fn exfat_create(&mut self, name: &[u8], reserve: u64) -> Result<Stream, Error> {
         name::validate(name)?;
         let cluster_bytes = self.cluster_bytes();
