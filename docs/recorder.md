@@ -4,9 +4,12 @@
 pre-roll buffer, takes started by hand or by sound and ended by silence, written straight to disk as WAV.
 `tape run recorder [NAME] [pre=SECONDS] [rate=HZ] [auto] [thresh=DB] [sound=MS] [silence=MS]`
 (`tone=HZ [gate=ON,OFF]` replaces the device with a test tone, for tests without audio hardware).
-`NAME` may carry a volume (`disk2/gig`, `@label/gig`); files are `NAMEnnn.wav`, the next free number.
+`NAME` may carry a volume (`disk2/gig` preselects disk2 in the menu, `@label/gig` is used as typed); files are
+`NAMEnnn.wav`, the next free number on the chosen disk. The `Record to:` line shows the disk (FOSFS, FAT32 or exFAT,
+size, model); `D` steps through the disks that have a volume, starting at the boot disk. The list comes from the
+`disk_info` tape call (kernel `api_disk_info`); on a kernel without it the tape records to the boot volume.
 
-Keys: Space/R take on/off, A auto on/off, N/B meter pages, U Nordic/dBFS, H clear holds, Q/Esc quit.
+Keys: Space/R take on/off, A auto on/off, D choose the disk to record to (not during a take), N/B meter pages, U Nordic/dBFS, H clear holds, Q/Esc quit.
 
 ## Libraries (all host-testable)
 

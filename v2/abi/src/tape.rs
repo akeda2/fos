@@ -127,6 +127,37 @@ pub struct TapeApi {
     /// file's name plus the one-based interface number, or `fos2`), copied into the buffer; its length, 0 if it did not fit.
     /// A tape puts it in its DHCP requests so the server learns the machine's name.
     pub hostname: extern "C" fn(usize, *mut u8, usize) -> usize,
+    /// `disk_info(number, out)`: what disk `number` (one-based, as `disks` lists them) holds, for a tape that lets the user
+    /// choose where to write. 0 if there is no such disk. The kernel mounts the volume to find out, so call it when a
+    /// menu opens, not every frame. A tape built against a kernel without this call sees `size` smaller than its own
+    /// `TapeApi` and must not call it.
+    pub disk_info: extern "C" fn(usize, *mut DiskInfo) -> u32,
+}
+
+/// `DiskInfo::kind`: what a disk's volume is. FAT32 and exFAT disks are reached as `diskN/NAME`, like a FOSFS one.
+pub const DISK_NO_VOLUME: u32 = 0;
+pub const DISK_FOSFS: u32 = 1;
+pub const DISK_FAT32: u32 = 2;
+pub const DISK_EXFAT: u32 = 3;
+
+/// What `disk_info` reports about one disk.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DiskInfo {
+    pub sectors: u64,
+    /// `DISK_*`: the volume a tape can write files to (a disk with none is listed but unusable).
+    pub kind: u32,
+    /// 1 for the disk the system booted from.
+    pub boot: u32,
+    /// The drive's model text, space padded, and the FOSFS volume label (zero padded; empty for FAT).
+    pub model: [u8; 40],
+    pub label: [u8; 16],
+}
+
+impl Default for DiskInfo {
+    fn default() -> Self {
+        DiskInfo { sectors: 0, kind: 0, boot: 0, model: [0; 40], label: [0; 16] }
+    }
 }
 
 /// What `audio_info` reports. Slot bytes: how many bytes each sample takes in the stream (a 24-bit

@@ -342,6 +342,28 @@ extern "C" fn api_hostname(index: usize, out: *mut u8, capacity: usize) -> usize
     unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, length) };
     length
 }
+extern "C" fn api_disk_info(number: usize, out: *mut fos_v2_abi::tape::DiskInfo) -> u32 {
+    use fos_v2_abi::tape::{DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DISK_NO_VOLUME};
+    let Some(disk) = number.checked_sub(1).and_then(crate::block::get) else { return 0 };
+    let mut info = fos_v2_abi::tape::DiskInfo { sectors: disk.sectors, boot: u32::from(storage::boot_disk() == Some(number - 1)), ..Default::default() };
+    info.model.copy_from_slice(&disk.model);
+    info.kind = match storage::volume_on(number) {
+        Ok(volume) => {
+            if let Ok(label) = volume.label() {
+                let bytes = label.as_bytes();
+                info.label[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
+            }
+            DISK_FOSFS
+        }
+        Err(_) => match crate::fatvol::mount(number - 1).map(|fs| fs.kind()) {
+            Some(fat::Kind::Fat32) => DISK_FAT32,
+            Some(fat::Kind::ExFat) => DISK_EXFAT,
+            None => DISK_NO_VOLUME,
+        },
+    };
+    unsafe { *out = info };
+    1
+}
 extern "C" fn api_nic_count() -> usize {
     term::nic_count()
 }
@@ -449,6 +471,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         puts: api_puts,
         audio_select: api_audio_select,
         hostname: api_hostname,
+        disk_info: api_disk_info,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

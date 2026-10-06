@@ -29,13 +29,13 @@ use audio_wire::meter::{Coefficients, Ppm};
 use core::fmt::Write;
 use tape_panel::meters::MeterBank;
 use tape_panel::{Text, at, draw};
-use tape_rt::{AudioInfo, AudioStats, FS_NOT_FOUND, TapeApi, println};
+use tape_rt::{AudioInfo, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FS_NOT_FOUND, TapeApi, println};
 
 const MAX_CHANNELS: usize = 32;
 const PAGE_ROWS: usize = 12;
 const ROW_SCALE: usize = 8;
 const ROW_FIRST: usize = 10;
-const HINT: &str = "Space/R: record   A: auto (silence trigger)   U: scale   H: clear holds   Q/Esc: quit";
+const HINT: &str = "Space/R: record   A: auto   D: disk   U: scale   H: clear holds   Q/Esc: quit";
 /// Bytes written to disk at a time: a multiple of the sector size, small enough that one disk write takes well under
 /// the capture ring's headroom even on a slow USB stick.
 const CHUNK: usize = 256 << 10;
@@ -102,11 +102,86 @@ macro_rules! say {
     }};
 }
 
+const MAX_DISKS: usize = 8;
+
+/// A disk the files can go to, for the `D` menu.
+#[derive(Clone, Copy)]
+struct Choice {
+    number: usize,
+    kind: u32,
+    sectors: u64,
+    boot: bool,
+    model: Text<24>,
+    label: Text<16>,
+}
+
+impl Choice {
+    const EMPTY: Choice = Choice { number: 0, kind: 0, sectors: 0, boot: false, model: Text::new(), label: Text::new() };
+
+    fn describe(&self, out: &mut Text<100>) {
+        let kind = match self.kind {
+            DISK_FOSFS => "FOSFS",
+            DISK_FAT32 => "FAT32",
+            DISK_EXFAT => "exFAT",
+            _ => "?",
+        };
+        let megabytes = self.sectors / 2048;
+        let _ = write!(out, "disk{}  {kind}  ", self.number);
+        if megabytes >= 10_240 {
+            let _ = write!(out, "{} GiB", megabytes >> 10);
+        } else {
+            let _ = write!(out, "{megabytes} MiB");
+        }
+        let _ = write!(out, "  {}", self.model.as_str().trim());
+        if !self.label.is_empty() {
+            let _ = write!(out, "  @{}", self.label.as_str());
+        }
+        if self.boot {
+            let _ = write!(out, "  (boot disk)");
+        }
+    }
+}
+
+/// The disks with a volume to write to (FOSFS, FAT32 or exFAT), in disk order; the count of them.
+fn find_disks(api: &TapeApi, choices: &mut [Choice; MAX_DISKS]) -> usize {
+    // A kernel older than this tape has no `disk_info`: the table is shorter.
+    if (api.size as usize) < core::mem::size_of::<TapeApi>() {
+        return 0;
+    }
+    let mut count = 0;
+    for number in 1..=16 {
+        let mut info = DiskInfo::default();
+        if (api.disk_info)(number, &mut info) == 0 {
+            break;
+        }
+        if info.kind == 0 || count == MAX_DISKS {
+            continue;
+        }
+        let mut model = Text::<24>::new();
+        let mut label = Text::<16>::new();
+        for &byte in info.model.iter().take(24).take_while(|&&byte| byte != 0) {
+            model.push(if (0x20..0x7f).contains(&byte) { byte } else { b'?' });
+        }
+        for &byte in info.label.iter().take_while(|&&byte| byte != 0) {
+            label.push(byte);
+        }
+        choices[count] = Choice { number, kind: info.kind, sectors: info.sectors, boot: info.boot != 0, model, label };
+        count += 1;
+    }
+    count
+}
+
 /// Everything a running recorder has besides the pre-roll ring (which is passed in beside it, so that the ring's
 /// audio can be read while the take is written).
 struct App {
     api: &'static TapeApi,
+    /// The file name before the number (`take` for take001.wav) and where the files go: a volume prefix the user typed
+    /// (`@label/`, which the disk menu leaves alone) or one of the disks in `choices`.
     base: &'static str,
+    custom_prefix: &'static str,
+    choices: [Choice; MAX_DISKS],
+    choice_count: usize,
+    selected: usize,
     format: Format,
     frame: usize,
     staging: usize,
@@ -123,6 +198,15 @@ struct App {
 }
 
 impl App {
+    /// The volume part of a file reference: `diskN/` for the chosen disk, the user's own prefix, or nothing (the boot volume).
+    fn prefix(&self, out: &mut Text<40>) {
+        if !self.custom_prefix.is_empty() {
+            let _ = write!(out, "{}", self.custom_prefix);
+        } else if self.choice_count > 0 {
+            let _ = write!(out, "disk{}/", self.choices[self.selected].number);
+        }
+    }
+
     fn staging(&self) -> &'static mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.staging as *mut u8, CHUNK) }
     }
@@ -132,7 +216,9 @@ impl App {
         let mut found = false;
         for number in self.next_number..self.next_number + 1000 {
             self.name.clear();
-            let _ = write!(self.name, "{}{number:03}.wav", self.base);
+            let mut prefix = Text::<40>::new();
+            self.prefix(&mut prefix);
+            let _ = write!(self.name, "{}{}{number:03}.wav", prefix.as_str(), self.base);
             let status = (self.api.fs_read)(self.name.as_str().as_ptr(), self.name.len(), core::ptr::null_mut(), 0);
             if status == FS_NOT_FOUND {
                 self.next_number = number + 1;
@@ -255,6 +341,17 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
     }
     show(3, line.as_str());
     let mut line = Text::<100>::new();
+    if app.choice_count > 0 && app.custom_prefix.is_empty() {
+        let _ = write!(line, "Record to: ");
+        app.choices[app.selected].describe(&mut line);
+        let _ = write!(line, "{}", if app.take.is_some() { "   (locked)" } else { "   (D: change)" });
+    } else if !app.custom_prefix.is_empty() {
+        let _ = write!(line, "Record to: {}", app.custom_prefix);
+    } else {
+        let _ = write!(line, "Record to: the boot volume");
+    }
+    show(2, line.as_str());
+    let mut line = Text::<100>::new();
     let _ = write!(
         line,
         "Auto {}: start above {} dB for {} ms, stop below it for {} ms   [{}]",
@@ -297,7 +394,20 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let rate = options.rate;
     let frame = channels * slot;
     let format = Format { channels: channels as u16, rate, slot: slot as u16, bits: bits as u16 };
-    if options.name.rsplit('/').next().unwrap_or(options.name).len() > 9 {
+    // `NAME` may start with a volume (`disk2/gig`, `@label/gig`): a diskN picks that disk in the menu, anything else is
+    // used as typed and the menu leaves it alone.
+    let (volume_word, file_part) = match options.name.rsplit_once('/') {
+        Some((volume, file)) => (volume, file),
+        None => ("", options.name),
+    };
+    let wanted_disk = volume_word.strip_prefix("disk").and_then(|digits| digits.parse::<usize>().ok());
+    let custom_prefix: &'static str = if !volume_word.is_empty() && wanted_disk.is_none() {
+        // The word stays alive for the whole run (the arguments are), as does the file part below.
+        unsafe { core::mem::transmute::<&str, &'static str>(&options.name[..volume_word.len() + 1]) }
+    } else {
+        ""
+    };
+    if file_part.len() > 9 {
         return println!("recorder: the name must be 9 characters or fewer (NAMEnnn.wav has to fit 16).");
     }
     if frame == 0 || frame > BLOCK {
@@ -350,9 +460,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut detector = Detector::new(options.silence, rate);
     let mut auto = options.auto;
     let mut app = App {
-        api, base: unsafe { core::mem::transmute::<&str, &'static str>(options.name) }, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
+        api, base: unsafe { core::mem::transmute::<&str, &'static str>(file_part) }, custom_prefix, choices: [Choice::EMPTY; MAX_DISKS], choice_count: 0, selected: 0, format, frame, staging, take: None, name: Text::new(), next_number: 1, done_bytes: 0, files: 0, next_checkpoint: 0,
         message: Text::from("Meters and pre-roll are running. Space or R starts a take."), errors: 0, last_take_frames: 0,
     };
+
+    if custom_prefix.is_empty() {
+        app.choice_count = find_disks(api, &mut app.choices);
+        // The disk asked for by name, else the boot disk, else the first usable one.
+        app.selected = (0..app.choice_count).find(|&index| Some(app.choices[index].number) == wanted_disk).or_else(|| (0..app.choice_count).find(|&index| app.choices[index].boot)).unwrap_or(0);
+    }
 
     at(1, 1);
     draw!("\x1b[2J");
@@ -384,6 +500,19 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 b'a' | b'A' => {
                     auto = !auto;
                     detector.force(app.take.is_some());
+                }
+                b'd' | b'D' => {
+                    if app.take.is_some() {
+                        say!(app, "A take is running: stop it (Space) before changing disk.");
+                    } else if app.choice_count > 1 {
+                        app.selected = (app.selected + 1) % app.choice_count;
+                        app.next_number = 1; // numbering starts again on the new disk
+                        let mut text = Text::<100>::new();
+                        app.choices[app.selected].describe(&mut text);
+                        say!(app, "Recording to {}.", text.as_str());
+                    } else {
+                        say!(app, "There is no other disk with a volume to record to (FOSFS, FAT32 or exFAT).");
+                    }
                 }
                 b'n' | b'N' => meters.next_page(),
                 b'b' | b'B' => meters.previous_page(),

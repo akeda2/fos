@@ -85,13 +85,24 @@ def main():
             guest.pump(1.0)
             listing = guest.text()[mark:]
             check("disk3" in listing, "three disks are found", listing)
-            for disk, base in (("disk2", "fa"), ("disk3", "ex")):
-                mark = guest.send(f"run recorder {disk}/{base} tone=440 pre=1")
+            for disk, base, presses in (("disk2", "fa", 1), ("disk3", "ex", 2)):
+                # No volume in the name: the menu starts on the boot disk and `D` steps through the disks.
+                mark = guest.send(f"run recorder {base} tone=440 pre=1")
                 guest.wait_for("fos recorder", 30, mark)
-                guest.pump(2.5)
+                guest.wait_for("Record to: disk1  FOSFS", 10, mark)
+                for _ in range(presses):
+                    guest.process.stdin.write(b"d")
+                    guest.process.stdin.flush()
+                    guest.pump(0.6)
+                guest.wait_for(f"Record to: {disk}  {'FAT32' if disk == 'disk2' else 'exFAT'}", 10, mark)
+                guest.pump(2.0)
                 guest.process.stdin.write(b" ")
                 guest.process.stdin.flush()
                 guest.wait_for(f"Recording {disk}/{base}001.wav", 10, mark)
+                guest.process.stdin.write(b"d")
+                guest.process.stdin.flush()
+                guest.wait_for("stop it (Space) before changing disk", 10, mark)
+                check(f"Record to: {disk}" in guest.text()[mark:], "the disk cannot be changed during a take", "")
                 guest.pump(3.0)
                 guest.process.stdin.write(b" ")
                 guest.process.stdin.flush()
