@@ -132,6 +132,35 @@ pub fn reserve(start: u64, length: u64) {
     }
 }
 
+/// The longest run of free frames there is (a request for a big contiguous block is limited by it, not by the free total).
+pub fn largest_free_run() -> u64 {
+    let a = allocator();
+    let (mut best, mut run) = (0u64, 0u64);
+    let mut frame = 0;
+    while frame < a.frames {
+        // Whole words of used or free frames at a time.
+        let word = unsafe { a.bitmap.add((frame / 64) as usize).read() };
+        if frame % 64 == 0 && frame + 64 <= a.frames && (word == u64::MAX || word == 0) {
+            if word == 0 {
+                run += 64;
+                best = best.max(run);
+            } else {
+                run = 0;
+            }
+            frame += 64;
+            continue;
+        }
+        if word & (1 << (frame % 64)) == 0 {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+        frame += 1;
+    }
+    best
+}
+
 /// `count` physically contiguous frames, zeroed, optionally entirely below
 /// `below` (exclusive). Returns the physical address.
 pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {

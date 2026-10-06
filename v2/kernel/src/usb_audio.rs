@@ -256,9 +256,12 @@ pub fn set_capture_ring(bytes: u64) {
     WANTED_CAPTURE_RING.store(bytes as usize, Ordering::Relaxed);
 }
 
-/// The capture ring: the size asked for, halved until the allocator has a run that long, never below the default.
+/// The capture ring: the size asked for, or the longest run of memory there is if that is less (never below the default).
+/// A ring has to be one contiguous block, so on a machine whose RAM is split by the PCI hole this is the biggest piece, not
+/// the free total.
 fn allocate_capture_ring() -> Option<PcmRing> {
-    let mut size = WANTED_CAPTURE_RING.load(Ordering::Relaxed).max(CAPTURE_RING_BYTES) & !4095;
+    let wanted = WANTED_CAPTURE_RING.load(Ordering::Relaxed).max(CAPTURE_RING_BYTES) as u64;
+    let mut size = (wanted.min(memory::largest_free_run() * memory::FRAME) as usize).max(CAPTURE_RING_BYTES) & !4095;
     loop {
         if let Some(ring) = PcmRing::allocate(size) {
             ring.check();
