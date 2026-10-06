@@ -8,7 +8,7 @@
 //! The bank knows nothing about where levels come from: `update` asks a closure for each visible row's reading, so a
 //! stream, a recorder or a test can feed it.
 
-use crate::{Text, at, draw};
+use crate::{Text, at, begin_batch, draw, end_batch};
 use audio_wire::meter;
 use core::fmt::Write;
 
@@ -22,7 +22,9 @@ pub const CLIP_COL: usize = 79;
 pub const TEST_CELL: i32 = 42;
 pub const PML_CELL: i32 = 51;
 pub const HOLD_MICROS: u64 = 3_000_000;
-/// Rows drawn per `update` call: each call is short, and a whole page is refreshed within 100 ms.
+/// Rows drawn per `update` call unless `set_rows_per_call` says otherwise: each call is short, and a whole page of 12 is
+/// refreshed in four. A caller that can spare more time per call (a recorder, whose loop is not timing-critical to the
+/// millisecond) asks for more.
 const ROWS_PER_CALL: usize = 3;
 
 pub struct MeterBank<const N: usize> {
@@ -30,6 +32,7 @@ pub struct MeterBank<const N: usize> {
     scale_row: usize,
     first_row: usize,
     page_rows: usize,
+    rows_per_call: usize,
     rows: usize,
     labels: [Text<8>; N],
     page: usize,
@@ -53,14 +56,21 @@ impl<const N: usize> MeterBank<N> {
     /// `page_rows` channels at a time (the footer takes the three rows after them).
     pub const fn new(scale_row: usize, first_row: usize, page_rows: usize) -> Self {
         MeterBank {
-            scale_row, first_row, page_rows, rows: 0, labels: [Text::new(); N], page: 0, nordic: true, needs_full: [true; N], footer_dirty: true, cursor: 0,
+            scale_row, first_row, page_rows, rows_per_call: ROWS_PER_CALL, rows: 0, labels: [Text::new(); N], page: 0, nordic: true, needs_full: [true; N], footer_dirty: true, cursor: 0,
             shown_cell: [-1; N], shown_hold: [-1; N], shown_number: [i16::MIN; N], shown_clip: [false; N], hold: [0; N], hold_at: [0; N], clip_at: [0; N],
         }
     }
 
     /// Forgets every row and all display state (a new run).
     pub fn clear(&mut self) {
+        let rows_per_call = self.rows_per_call;
         *self = Self::new(self.scale_row, self.first_row, self.page_rows);
+        self.rows_per_call = rows_per_call;
+    }
+
+    /// How many rows one `update` call draws (all in one write to the console).
+    pub fn set_rows_per_call(&mut self, rows: usize) {
+        self.rows_per_call = rows.max(1);
     }
 
     /// Adds a row labelled `label` (up to 8 characters); false if the bank is full.
@@ -217,8 +227,9 @@ impl<const N: usize> MeterBank<N> {
     /// last look (so a short peak between looks still shows) and whether a clip happened since. Keeps a three-second
     /// peak hold and a latched clip indicator, and draws only what changed.
     pub fn update(&mut self, now: u64, mut read: impl FnMut(usize) -> (u32, bool)) {
+        begin_batch(); // the rows of this call go to the console as one write
         let first = self.page * self.page_rows;
-        for _ in 0..ROWS_PER_CALL {
+        for _ in 0..self.rows_per_call {
             let slot = self.cursor;
             self.cursor = (self.cursor + 1) % self.page_rows;
             let index = first + slot;
@@ -295,5 +306,6 @@ impl<const N: usize> MeterBank<N> {
                 self.shown_clip[index] = clipped;
             }
         }
+        end_batch();
     }
 }

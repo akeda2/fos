@@ -30,7 +30,7 @@ use audio_wire::ChannelSet;
 use audio_wire::meter::{Coefficients, Ppm};
 use core::fmt::Write;
 use tape_panel::meters::MeterBank;
-use tape_panel::{Text, at, draw};
+use tape_panel::{Text, at, begin_batch, draw, end_batch};
 use tape_rt::{AudioBuffer, AudioInfo, AudioStats, DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DiskInfo, FORMAT_BOOT_DISK, FS_NOT_FOUND, TapeApi, println};
 
 const MAX_CHANNELS: usize = 32;
@@ -504,6 +504,7 @@ fn warning(app: &App, backlog_bytes: u64, overruns: u64, out: &mut Text<100>) {
 }
 
 fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, options: &Options, now: u64, started: u64) {
+    begin_batch(); // every status row in one write to the console
     let seconds = |bytes: u64| bytes / app.frame as u64 / u64::from(app.format.rate);
     let mut line = Text::<100>::new();
     match app.take.as_ref() {
@@ -607,6 +608,7 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
         }
     }
     show(6, if prompt.is_empty() { app.message.as_str() } else { prompt.as_str() });
+    end_batch();
 }
 
 #[unsafe(no_mangle)]
@@ -704,6 +706,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     *clips = [false; MAX_CHANNELS];
     unsafe { SINK = Some(StreamSink::new(api.fs_stream_open, api.fs_stream_write, api.fs_stream_close, tape_rt::micros, CHUNK / 2)) };
     meters.clear();
+    meters.set_rows_per_call(6); // a page of 12 in two calls; they go to the console as one write each
     for channel in 0..channels.min(MAX_CHANNELS) {
         let mut label = Text::<8>::new();
         let _ = write!(label, "{} {:>2}", if selection & (1 << channel) != 0 { "Rec" } else { "In " }, channel + 1);

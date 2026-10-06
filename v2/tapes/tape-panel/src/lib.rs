@@ -23,7 +23,7 @@ impl Write for Screen {
         for &byte in text.as_bytes() {
             unsafe {
                 if FRAME_LENGTH == 2048 {
-                    present();
+                    flush();
                 }
                 (*(&raw mut FRAME))[FRAME_LENGTH] = byte;
                 FRAME_LENGTH += 1;
@@ -33,8 +33,33 @@ impl Write for Screen {
     }
 }
 
-/// Sends what has been drawn since the last call to the console.
+/// While a batch is open (`begin_batch`), `present` does nothing, so that several draws go out as one `puts` call: the
+/// console compares every cell of its text grid after each call and repaints the ones that differ, so one call for a
+/// whole update costs far less than one per row, and an erase-then-redraw inside it never shows (or paints) the blank.
+static mut BATCH: usize = 0;
+
+pub fn begin_batch() {
+    unsafe { BATCH += 1 };
+}
+
+pub fn end_batch() {
+    unsafe {
+        BATCH = BATCH.saturating_sub(1);
+        if BATCH == 0 {
+            flush();
+        }
+    }
+}
+
+/// Sends what has been drawn since the last call to the console, unless a batch is open.
 pub fn present() {
+    if unsafe { BATCH } == 0 {
+        flush();
+    }
+}
+
+/// Sends what has been drawn so far to the console, batch or not.
+fn flush() {
     unsafe {
         if FRAME_LENGTH == 0 {
             return;
