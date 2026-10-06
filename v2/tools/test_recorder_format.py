@@ -66,7 +66,9 @@ def main():
             guest.wait_for("file(s) written", 30, mark)
             check("(with errors)" not in guest.text()[mark:], "the take on the formatted disk had no errors", guest.text()[mark:][-1500:])
             mark = guest.send("run recorder fm2 tone=440")
-            guest.wait_for("Record to: disk1  FOSFS", 30, mark)
+            guest.wait_for("Record to: disk2  exFAT", 30, mark)  # now the default: the first exFAT disk
+            key(b"d")
+            guest.wait_for("Record to: disk1  FOSFS", 10, mark)
             key(b"x")
             guest.wait_for("is the boot disk and is never formatted", 10, mark)
             key(b"q")

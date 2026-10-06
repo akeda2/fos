@@ -556,8 +556,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 
     if custom_prefix.is_empty() {
         app.choice_count = find_disks(api, &mut app.choices);
-        // The disk asked for by name, else the boot disk, else the first usable one.
-        app.selected = (0..app.choice_count).find(|&index| Some(app.choices[index].number) == wanted_disk).or_else(|| (0..app.choice_count).find(|&index| app.choices[index].boot)).unwrap_or(0);
+        // The disk asked for by name, else the first exFAT disk (a disk kept for recordings), else the boot disk, else the first.
+        app.selected = (0..app.choice_count)
+            .find(|&index| Some(app.choices[index].number) == wanted_disk)
+            .or_else(|| (0..app.choice_count).find(|&index| app.choices[index].kind == DISK_EXFAT))
+            .or_else(|| (0..app.choice_count).find(|&index| app.choices[index].boot))
+            .unwrap_or(0);
     }
 
     at(1, 1);
