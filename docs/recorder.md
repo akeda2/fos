@@ -89,3 +89,13 @@ shown at start and the disk line shows the backlog against it: `Backlog 0.2/1006
   waiting, and `AUDIO LOST` if the ring ever overruns.
 * The ring takes whole packets only: a full ring used to be able to keep half a packet, shifting every later frame and
   scrambling the channels for the rest of the take.
+
+## Growing the FOSFS volume
+
+A stick flashed from the 96 MiB image has a 32 MiB FOSFS data partition and the rest of the stick unused, which is a few seconds
+of 22-channel audio. `grow diskN` (`v2/kernel/src/term.rs`, `gpt::grow_last_partition`, `fosfs::Volume::grow`) makes the volume fill
+the disk and keeps the files: the new backup GPT goes to the real end of the disk first, then the primary entries and header, then
+the old backup (now inside the partition) is cleared. Only a FOSFS partition that is the last on the disk can grow. FOSFS mounting
+now accepts a volume smaller than its partition (the superblock's size is the volume's size), so an interrupted grow leaves a
+volume that mounts either way and running `grow` again finishes it. `make test-v2-grow` checks the result with `sgdisk --verify`
+and a second boot from the grown image.

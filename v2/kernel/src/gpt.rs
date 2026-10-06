@@ -185,3 +185,100 @@ pub fn write_single_partition(disk: usize, type_guid: &[u8; 16], name: &str) -> 
     block::write(disk, 1, &header(1, total - 1, 2))?;
     Ok(partition)
 }
+
+/// Why `grow_last_partition` did nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowError {
+    /// No GPT, or one this code does not understand.
+    NoGpt,
+    /// No partition of that type.
+    NoPartition,
+    /// Another partition lies after it: only the last partition of a disk can grow.
+    NotLast,
+    /// It already reaches (nearly) the end of the disk.
+    NothingToGrow,
+    Disk,
+}
+
+/// Grows the first partition of `type_guid` to the end of the disk, moving the backup GPT to the new end. Only the last
+/// partition on the disk can grow. The order is the safe one, as for a new table: the new backup copy first, then the
+/// primary entries and header, and the old backup (now inside the partition) is cleared last, so an interruption leaves a
+/// table that is valid either as it was or as it will be. Returns the partition as it now is.
+pub fn grow_last_partition(disk: usize, type_guid: &[u8; 16]) -> Result<Partition, GrowError> {
+    let total = block::get(disk).ok_or(GrowError::Disk)?.sectors;
+    let mut header = [0u8; 512];
+    block::read(disk, 1, &mut header).map_err(|_| GrowError::Disk)?;
+    if &header[0..8] != b"EFI PART" {
+        return Err(GrowError::NoGpt);
+    }
+    let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+    let old_backup = u64::from_le_bytes(header[32..40].try_into().unwrap());
+    if !(128..=512).contains(&size) || count == 0 || count * size > 128 * 128 || entries_lba < 2 {
+        return Err(GrowError::NoGpt);
+    }
+    let bytes = count * size;
+    let entry_sectors = bytes.div_ceil(512) as u64;
+    let entries = unsafe { &mut *core::ptr::addr_of_mut!(ENTRY_ARRAY) };
+    entries.fill(0);
+    for sector in 0..entry_sectors as usize {
+        block::read(disk, entries_lba + sector as u64, &mut entries[sector * 512..sector * 512 + 512]).map_err(|_| GrowError::Disk)?;
+    }
+    // Find the partition, and the highest end of any partition.
+    let (mut found, mut highest) = (None, 0u64);
+    for index in 0..count {
+        let entry = &entries[index * size..(index + 1) * size];
+        if entry[0..16].iter().all(|&byte| byte == 0) {
+            continue;
+        }
+        let last = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+        highest = highest.max(last);
+        if found.is_none() && &entry[0..16] == type_guid {
+            found = Some((index, u64::from_le_bytes(entry[32..40].try_into().unwrap()), last));
+        }
+    }
+    let (index, first, last) = found.ok_or(GrowError::NoPartition)?;
+    if last != highest {
+        return Err(GrowError::NotLast);
+    }
+    let backup_entries = total - 1 - entry_sectors;
+    let new_last = backup_entries - 1; // the last usable sector
+    if new_last < last + 2048 {
+        return Err(GrowError::NothingToGrow);
+    }
+    entries[index * size + 40..index * size + 48].copy_from_slice(&new_last.to_le_bytes());
+    let entries_crc = crc32(&entries[..bytes]);
+    let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let make_header = |current: u64, backup: u64, array: u64| {
+        let mut sector = header;
+        sector[16..20].fill(0);
+        sector[24..32].copy_from_slice(&current.to_le_bytes());
+        sector[32..40].copy_from_slice(&backup.to_le_bytes());
+        sector[48..56].copy_from_slice(&new_last.to_le_bytes());
+        sector[72..80].copy_from_slice(&array.to_le_bytes());
+        sector[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        let crc = crc32(&sector[..header_size.min(512)]);
+        sector[16..20].copy_from_slice(&crc.to_le_bytes());
+        sector
+    };
+    let write_entries = |lba: u64| -> Result<(), GrowError> {
+        for sector in 0..entry_sectors as usize {
+            block::write(disk, lba + sector as u64, &entries[sector * 512..sector * 512 + 512]).map_err(|_| GrowError::Disk)?;
+        }
+        Ok(())
+    };
+    // New backup first, primary last.
+    write_entries(backup_entries)?;
+    block::write(disk, total - 1, &make_header(total - 1, 1, backup_entries)).map_err(|_| GrowError::Disk)?;
+    write_entries(entries_lba)?;
+    block::write(disk, 1, &make_header(1, total - 1, entries_lba)).map_err(|_| GrowError::Disk)?;
+    // The old backup GPT now lies inside the partition's new space: clear it, so that no tool finds a second, stale table.
+    if old_backup != total - 1 && old_backup > entry_sectors {
+        let zeros = [0u8; 512];
+        for lba in old_backup - entry_sectors..=old_backup {
+            let _ = block::write(disk, lba, &zeros);
+        }
+    }
+    Ok(Partition { unique_guid: entries[index * size + 16..index * size + 32].try_into().unwrap(), start: first, sectors: new_last - first + 1 })
+}

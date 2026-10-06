@@ -1151,6 +1151,7 @@ fn execute(command: &str) {
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
             crate::println!("format diskN exfat [LABEL]    erase a disk and make it one exFAT volume for PCs");
+            crate::println!("grow diskN        make a disk's FOSFS volume fill the disk (files are kept)");
             crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL;");
             crate::println!("          a FAT32/exFAT disk too, by its diskN: ls cat write rm copy)");
             crate::println!("ls [diskN]        list FOSFS files (a FAT32/exFAT disk too, if named)");
@@ -1282,6 +1283,7 @@ fn execute(command: &str) {
         "label" => label_command(words),
         "audio" => audio_command(words),
         "format" => format_command(words),
+        "grow" => grow_command(words),
         "copy" => copy_command(words),
         "disks" => {
             for index in 0..crate::block::count() {
@@ -2154,6 +2156,48 @@ fn plan_format(disk: usize, force: bool) -> Result<FormatPlan, &'static str> {
         Summary::Gpt { .. } => Err("it holds a GPT with partitions but no FOSFS one; add `force` to replace the partition table"),
         Summary::Unknown => Err("its first sectors hold data that is not a GPT (an MBR or a file system); add `force` to replace it"),
     }
+}
+
+/// `grow diskN`: makes the disk's FOSFS volume fill the disk. A stick flashed from the 96 MiB image keeps a 32 MiB data
+/// partition and leaves the rest of the stick unused; this moves the backup partition table to the real end of the disk,
+/// extends the FOSFS partition to it and the volume to the partition. Files are kept (a FOSFS volume is extents addressed from
+/// its start, so new space is just free space). Only a FOSFS partition that is the last on the disk can grow.
+fn grow_command(mut words: core::str::SplitWhitespace) {
+    let Some(number) = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok()) else {
+        return crate::println!("Usage: grow diskN   (make the disk's FOSFS volume fill the disk; files are kept)");
+    };
+    let Some(info) = number.checked_sub(1).and_then(crate::block::get) else {
+        return crate::println!("disk{number}: no such disk (see `disks`).");
+    };
+    let disk = number - 1;
+    let before = match crate::storage::volume_on(number) {
+        Ok(volume) => volume.sectors,
+        Err(error) => return crate::println!("grow: disk{number}: {error}."),
+    };
+    use crate::gpt::GrowError;
+    let partition = match crate::gpt::grow_last_partition(disk, &fos_v2_abi::FOSFS_TYPE_GUID) {
+        Ok(partition) => partition,
+        Err(GrowError::NothingToGrow) => {
+            // The partition may already fill the disk while the volume does not (an interrupted grow): finish that.
+            match crate::gpt::find(disk, &fos_v2_abi::FOSFS_TYPE_GUID, |_| true) {
+                Some(partition) if partition.sectors > before + 2048 => partition,
+                _ => return crate::println!("disk{number}: the FOSFS volume ({} MiB) already fills the disk.", before / 2048),
+            }
+        }
+        Err(GrowError::NoGpt) => return crate::println!("grow: disk{number} has no GPT this kernel understands."),
+        Err(GrowError::NoPartition) => return crate::println!("grow: disk{number} has no FOSFS partition."),
+        Err(GrowError::NotLast) => return crate::println!("grow: another partition lies after the FOSFS one; only the last partition can grow."),
+        Err(GrowError::Disk) => return crate::println!("grow: disk{number}: reading or writing the partition table failed."),
+    };
+    let volume = match crate::fosfs::Volume::mount(disk, partition.start, partition.sectors).and_then(|volume| volume.grow(partition.sectors)) {
+        Ok(volume) => volume,
+        Err(error) => return crate::println!("grow: the partition grew but the volume could not ({error:?}); run `grow disk{number}` again."),
+    };
+    if crate::storage::boot_disk() == Some(disk) {
+        crate::storage::remount_boot();
+    }
+    let _ = info;
+    crate::println!("disk{number}: FOSFS volume grown from {} MiB to {} MiB; the files are unchanged.", before / 2048, volume.sectors / 2048);
 }
 
 /// `format diskN [NAME] [force]` says what it would erase and waits; `format diskN confirm`

@@ -193,3 +193,14 @@ impl core::fmt::Write for Origin {
         Ok(())
     }
 }
+
+/// Mounts the boot disk's FOSFS volume again (after `grow` changed its size).
+pub fn remount_boot() {
+    if let Some(disk) = boot_disk() {
+        if let Some(partition) = gpt::find(disk, &FOSFS_TYPE_GUID, |_| true) {
+            if let Ok(volume) = Volume::mount(disk, partition.start, partition.sectors) {
+                unsafe { BOOT_VOLUME = Some(volume) };
+            }
+        }
+    }
+}

@@ -92,18 +92,39 @@ impl Volume {
         Ok(sector)
     }
 
-    /// Checks the superblock; `Err(NotFormatted)` if this is not a FOSFS v3 volume of this size.
+    /// Checks the superblock; `Err(NotFormatted)` if this is not a FOSFS v3 volume that fits the `sectors` of its partition.
+    /// The volume may be smaller than its partition (the partition was grown first, `grow` is about to enlarge the volume,
+    /// or it was interrupted between the two): the superblock's size is the volume's size.
     pub fn mount(disk: usize, base: u64, sectors: u64) -> Result<Volume, Error> {
-        let volume = Volume { disk, base, sectors };
+        let mut volume = Volume { disk, base, sectors };
         let sector = volume.read_sector(0)?;
+        let recorded = get_u64(&sector, 28);
         let valid = &sector[..8] == MAGIC
             && u16::from_le_bytes([sector[8], sector[9]]) == VERSION
             && u16::from_le_bytes([sector[10], sector[11]]) as usize == ENTRY_SIZE
             && u32::from_le_bytes(sector[12..16].try_into().unwrap()) == 1
             && u32::from_le_bytes(sector[16..20].try_into().unwrap()) == DIRECTORY_SECTORS as u32
             && get_u64(&sector, 20) == DATA_START
-            && get_u64(&sector, 28) == sectors.saturating_sub(DATA_START);
-        if valid { Ok(volume) } else { Err(Error::NotFormatted) }
+            && recorded >= 8
+            && recorded <= sectors.saturating_sub(DATA_START);
+        if !valid {
+            return Err(Error::NotFormatted);
+        }
+        volume.sectors = DATA_START + recorded;
+        Ok(volume)
+    }
+
+    /// Enlarges the volume to `sectors` sectors of its (grown) partition: only the size in the superblock changes, since
+    /// files are extents addressed from the start of the volume and the new space is simply free. Returns the volume as it is
+    /// now. The partition must already be at least that big.
+    pub fn grow(&self, sectors: u64) -> Result<Volume, Error> {
+        if sectors <= self.sectors {
+            return Ok(*self);
+        }
+        let mut sector = self.read_sector(0)?;
+        sector[28..36].copy_from_slice(&(sectors - DATA_START).to_le_bytes());
+        block::write(self.disk, self.base, &sector)?;
+        Volume::mount(self.disk, self.base, sectors)
     }
 
     /// Writes an empty FOSFS v3 volume over the `sectors` sectors at `base` of `disk`: the
