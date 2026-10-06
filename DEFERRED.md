@@ -294,6 +294,6 @@ with these conditions: opt-in, the blocking path stays the default, a matrix of 
 alternative that needs no code: record to an internal SATA/NVMe SSD formatted exFAT (`format diskN exfat`).
 
 **Other reuse ideas, not done:** `audio-rec`'s pre-roll ring and sound/silence trigger in `audio-net` (squelch, history for late
-joiners); `play` from a named FAT disk (`fs_read` already reads FAT files, untested); a wall-clock call in the tape ABI so tapes
-can log with real time.
+joiners); `play` from a named FAT disk (`fs_read` already reads FAT files, untested).
+(A wall-clock call in the tape ABI, `wall_clock`, was done on 2026-10-07; see docs/recorder.md.)
 

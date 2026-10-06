@@ -48,6 +48,8 @@ def main():
             guest.process.stdin.write(b" ")
             guest.process.stdin.flush()
             guest.wait_for("Recording disk1/edt001.wav", 10, mark)
+            import re
+            check(re.search(r"Recording disk1/edt001.wav from \d\d:\d\d:\d\d", guest.text()[mark:]) is not None, "a take says when it began (the tape gets the wall clock from the kernel)", guest.text()[mark:][-600:])
             guest.pump(3.0)
             guest.process.stdin.write(b" ")
             guest.process.stdin.flush()

@@ -414,7 +414,12 @@ impl App {
         self.push(older);
         self.push(newer);
         let mut text = Text::<100>::new();
-        let _ = write!(text, "Recording {} (with {} ms of pre-roll).", self.name.as_str(), (older.len() + newer.len()) as u64 / self.frame as u64 * 1000 / u64::from(self.format.rate));
+        let clock = tape_rt::wall_clock();
+        let _ = write!(text, "Recording {}{} (with {} ms of pre-roll).", self.name.as_str(), clock.map_or(Text::<20>::new(), |time| {
+            let mut at = Text::<20>::new();
+            let _ = write!(at, " from {:02}:{:02}:{:02}", time.hour, time.minute, time.second);
+            at
+        }).as_str(), (older.len() + newer.len()) as u64 / self.frame as u64 * 1000 / u64::from(self.format.rate));
         self.message = text;
     }
 
@@ -509,6 +514,10 @@ fn warning(app: &App, backlog_bytes: u64, overruns: u64, out: &mut Text<100>) {
 
 fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, options: &Options, now: u64, started: u64) {
     begin_batch(); // every status row in one write to the console
+    if let Some(time) = tape_rt::wall_clock() {
+        at(1, 72);
+        draw!("{:02}:{:02}:{:02}", time.hour, time.minute, time.second);
+    }
     let seconds = |bytes: u64| bytes / app.frame as u64 / u64::from(app.format.rate);
     let mut line = Text::<100>::new();
     match app.take.as_ref() {

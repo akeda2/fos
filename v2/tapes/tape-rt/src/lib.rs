@@ -400,6 +400,16 @@ pub fn ticks() -> u64 {
     (api().ticks)()
 }
 
+/// The local time of day, if the machine's clock is set (a kernel without the call, or a dead RTC battery, gives None).
+pub fn wall_clock() -> Option<WallClock> {
+    let table = api();
+    if (table.size as usize) < core::mem::size_of::<TapeApi>() {
+        return None;
+    }
+    let mut now = WallClock::default();
+    ((table.wall_clock)(&mut now) != 0).then_some(now)
+}
+
 pub fn micros() -> u64 {
     (api().micros)()
 }

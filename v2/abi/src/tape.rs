@@ -151,6 +151,23 @@ pub struct TapeApi {
     /// than the audio, so a recorder asks for as much memory as it can spare. The size granted is `capture_ring_bytes` in
     /// `AudioInfo` once capture runs. The request is forgotten when the tape ends.
     pub audio_set_capture_ring: extern "C" fn(u64),
+    /// `wall_clock(out)`: the local time of day (the machine's RTC, read once at boot and advanced by the timer; `date set` sets
+    /// it). 1 and `out` filled if the clock is set, 0 if the RTC held no valid time (a dead battery) -- a tape then has no
+    /// date to show and must not invent one.
+    pub wall_clock: extern "C" fn(*mut WallClock) -> u32,
+}
+
+/// What `wall_clock` reports: local time, to the second.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct WallClock {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub reserved: u8,
 }
 
 /// What `audio_buffer` reports.

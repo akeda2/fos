@@ -99,3 +99,11 @@ the old backup (now inside the partition) is cleared. Only a FOSFS partition tha
 now accepts a volume smaller than its partition (the superblock's size is the volume's size), so an interrupted grow leaves a
 volume that mounts either way and running `grow` again finishes it. `make test-v2-grow` checks the result with `sgdisk --verify`
 and a second boot from the grown image.
+
+## The wall clock for tapes
+
+`wall_clock(out)` in the tape ABI (kernel `api_wall_clock`, helper `tape_rt::wall_clock()`) gives a tape the local time of day:
+the RTC read at boot and advanced by the timer, the same clock `date` shows and the file systems stamp files with. It returns
+nothing when the clock is not set (a dead RTC battery), and a tape must not invent a date then; a kernel without the call is
+handled by checking the table's `size`. The recorder shows the time on its title row and says when a take began
+(`Recording disk2/take001.wav from 14:31:02`). A tape cannot set the clock; `date set` does that.

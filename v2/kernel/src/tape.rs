@@ -386,6 +386,15 @@ extern "C" fn api_audio_buffer(out: *mut fos_v2_abi::tape::AudioBuffer) {
     let (ring_bytes, available_bytes) = crate::usb_audio::buffer_info();
     unsafe { *out = fos_v2_abi::tape::AudioBuffer { ring_bytes, available_bytes } };
 }
+extern "C" fn api_wall_clock(out: *mut fos_v2_abi::tape::WallClock) -> u32 {
+    match crate::clock::now() {
+        Some(time) => {
+            unsafe { *out = fos_v2_abi::tape::WallClock { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second, reserved: 0 } };
+            1
+        }
+        None => 0,
+    }
+}
 extern "C" fn api_audio_set_capture_ring(bytes: u64) {
     crate::usb_audio::set_capture_ring(bytes);
 }
@@ -500,6 +509,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         disk_format_exfat: api_disk_format_exfat,
         audio_buffer: api_audio_buffer,
         audio_set_capture_ring: api_audio_set_capture_ring,
+        wall_clock: api_wall_clock,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
