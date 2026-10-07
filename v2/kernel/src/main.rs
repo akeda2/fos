@@ -34,6 +34,7 @@ mod gpt;
 mod framebuffer;
 mod gdt;
 mod idt;
+mod install;
 mod ioapic;
 mod keyboard;
 mod lineedit;

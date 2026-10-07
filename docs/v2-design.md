@@ -232,6 +232,16 @@ firmware, so a pending slot is tried on the next boot.
   it; any other disk (an MBR, a file system, a GPT with only foreign partitions) needs `force`
   because its partition table is replaced. The data area is not wiped, only the superblock and
   directory. Test: `make test-v2-format`.
+* **`install diskN [LABEL] [bare] [force]`** (DOS's `sys`, plus the files) makes another disk bootable from the running
+  system: a new GPT with fresh GUIDs (so boot-disk discovery can tell the copy from the original), the boot disk's ESP
+  copied sector for sector (the firmware boots it through the removable-media fallback path, so no NVRAM entry is
+  written), the *running* kernel (the slot named in BootInfo) as slot 0 with fresh slot metadata, and a FOSFS volume
+  filling the rest of the disk holding every file of the boot volume (`bare` skips the files; a label is optional and
+  not copied, since a label may be on one volume only). Same discipline as `format`: announce, then
+  `install diskN confirm` as the very next command; never the boot disk; a disk that is neither blank nor an earlier
+  fos disk needs `force`. Code: `kernel/src/install.rs`, `gpt::write_table`. Test: `make test-v2-install` (installs
+  onto a blank disk, checks the GPT with `sgdisk`, boots the copy alone). Not tested on hardware yet (the Skylake's
+  SATA SSD is the intended first target).
 * **`ed`, `copy` and the diagnostic commands (ported from v1).** `ed` (`run ed NAME`, also
   `diskN/NAME` and `@LABEL/NAME`) is the v1 line editor; its cursor-key line editor needs the
   arrow/Home/End/Delete keys, which both keyboard decoders now produce as private codes

@@ -24,7 +24,7 @@ V2_OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fn
 V2_TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: v2-opus-lib v2-tape-opus-bench v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio test-v2-audio-net test-v2-audio-serve test-v2-record test-v2-recorder test-v2-recorder-fat test-v2-fat-shell test-v2-format-exfat test-v2-recorder-format test-v2-grow test-v2-lineedit test-v2-scripts test-v2-nic test-v2-netfs
+.PHONY: v2-opus-lib v2-tape-opus-bench v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio test-v2-audio-net test-v2-audio-serve test-v2-record test-v2-recorder test-v2-recorder-fat test-v2-fat-shell test-v2-format-exfat test-v2-recorder-format test-v2-grow test-v2-install test-v2-lineedit test-v2-scripts test-v2-nic test-v2-netfs
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -155,6 +155,10 @@ test-v2-recorder-format: v2-image
 # grow diskN: the FOSFS partition and volume fill the disk; sgdisk verifies the GPT.
 test-v2-grow: v2-image
 	python3 v2/tools/test_grow.py
+
+# `install diskN`: clone the boot disk onto a blank disk, then boot that disk alone.
+test-v2-install: v2-image
+	python3 v2/tools/test_install.py
 
 # hostname / settings / debug / start files on the boot volume.
 test-v2-config: v2-image

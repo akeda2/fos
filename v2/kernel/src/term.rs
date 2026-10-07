@@ -1137,6 +1137,9 @@ fn execute(command: &str) {
     if word != "format" {
         unsafe { PENDING_FORMAT = None }; // a format needs its confirmation as the very next command
     }
+    if word != "install" {
+        crate::install::cancel(); // and so does an install
+    }
     match word {
         "help" => {
             crate::println!("help      this list");
@@ -1152,6 +1155,7 @@ fn execute(command: &str) {
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
             crate::println!("format diskN exfat [LABEL]    erase a disk and make it one exFAT volume for PCs");
             crate::println!("grow diskN        make a disk's FOSFS volume fill the disk (files are kept)");
+            crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
             crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL;");
             crate::println!("          a FAT32/exFAT disk too, by its diskN: ls cat write rm copy)");
             crate::println!("ls [diskN]        list FOSFS files (a FAT32/exFAT disk too, if named)");
@@ -1284,6 +1288,7 @@ fn execute(command: &str) {
         "audio" => audio_command(words),
         "format" => format_command(words),
         "grow" => grow_command(words),
+        "install" => crate::install::command(words),
         "copy" => copy_command(words),
         "disks" => {
             for index in 0..crate::block::count() {

@@ -132,21 +132,47 @@ pub fn write_single_fosfs_partition(disk: usize) -> Result<Partition, block::Err
 
 /// The same for a partition of any type (`exFAT data` uses the basic-data type GUID, which is what PCs expect).
 pub fn write_single_partition(disk: usize, type_guid: &[u8; 16], name: &str) -> Result<Partition, block::Error> {
+    let mut made = [Partition { unique_guid: [0; 16], start: 0, sectors: 0 }];
+    write_table(disk, &[(type_guid, name, None)], &mut made)?;
+    Ok(made[0])
+}
+
+/// The EFI System Partition's type GUID (C12A7328-F81F-11D2-BA4B-00A0C93EC93B).
+pub const ESP_TYPE_GUID: [u8; 16] = fos_v2_abi::guid_bytes(0xc12a7328, 0xf81f, 0x11d2, [0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b]);
+
+/// Replaces the disk's partition table with a protective MBR and a GPT of up to eight partitions, laid out one after
+/// another from sector 2048 (1 MiB aligned). Each `spec` is (type GUID, name, sectors); `None` means "the rest of the
+/// disk" and is only meaningful for the last. Every partition and the disk get fresh random GUIDs, returned in `made`.
+/// Nothing else on the disk is touched; the order is backup copy first, primary header last, so an interrupted write never
+/// leaves a valid-looking table that is half new.
+pub fn write_table(disk: usize, specs: &[(&[u8; 16], &str, Option<u64>)], made: &mut [Partition]) -> Result<(), block::Error> {
     let total = block::get(disk).ok_or(block::Error::NoSuchDisk)?.sectors;
-    if total < 8192 {
+    if total < 8192 || specs.len() > made.len() || specs.len() > 8 {
         return Err(block::Error::OutOfRange);
     }
-    let first = 2048u64;
-    let last = total - 34; // the backup entry array (32 sectors) and header (1) follow it
-    let partition = Partition { unique_guid: random_guid(total), start: first, sectors: last - first + 1 };
+    let usable_last = total - 34; // the backup entry array (32 sectors) and header (1) follow it
     let entries = unsafe { &mut *core::ptr::addr_of_mut!(ENTRY_ARRAY) };
     entries.fill(0);
-    entries[0..16].copy_from_slice(type_guid);
-    entries[16..32].copy_from_slice(&partition.unique_guid);
-    entries[32..40].copy_from_slice(&first.to_le_bytes());
-    entries[40..48].copy_from_slice(&last.to_le_bytes());
-    for (index, unit) in name.encode_utf16().enumerate() {
-        entries[56 + 2 * index..58 + 2 * index].copy_from_slice(&unit.to_le_bytes());
+    let mut next = 2048u64;
+    for (index, (type_guid, name, size)) in specs.iter().enumerate() {
+        let sectors = match size {
+            Some(sectors) => *sectors,
+            None => (usable_last + 1).checked_sub(next).ok_or(block::Error::OutOfRange)?,
+        };
+        if sectors == 0 || next + sectors - 1 > usable_last {
+            return Err(block::Error::OutOfRange);
+        }
+        let last = next + sectors - 1;
+        made[index] = Partition { unique_guid: random_guid(total ^ index as u64), start: next, sectors };
+        let entry = &mut entries[index * 128..(index + 1) * 128];
+        entry[0..16].copy_from_slice(*type_guid);
+        entry[16..32].copy_from_slice(&made[index].unique_guid);
+        entry[32..40].copy_from_slice(&next.to_le_bytes());
+        entry[40..48].copy_from_slice(&last.to_le_bytes());
+        for (unit_index, unit) in name.encode_utf16().enumerate() {
+            entry[56 + 2 * unit_index..58 + 2 * unit_index].copy_from_slice(&unit.to_le_bytes());
+        }
+        next = (last + 1).next_multiple_of(2048);
     }
     let entries_crc = crc32(entries);
     let disk_guid = random_guid(total ^ 0x5555);
@@ -159,7 +185,7 @@ pub fn write_single_partition(disk: usize, type_guid: &[u8; 16], name: &str) -> 
         sector[24..32].copy_from_slice(&current.to_le_bytes());
         sector[32..40].copy_from_slice(&backup.to_le_bytes());
         sector[40..48].copy_from_slice(&34u64.to_le_bytes()); // first usable LBA
-        sector[48..56].copy_from_slice(&(total - 34).to_le_bytes()); // last usable LBA
+        sector[48..56].copy_from_slice(&usable_last.to_le_bytes()); // last usable LBA
         sector[56..72].copy_from_slice(&disk_guid);
         sector[72..80].copy_from_slice(&entries_lba.to_le_bytes());
         sector[80..84].copy_from_slice(&128u32.to_le_bytes()); // entry count
@@ -183,7 +209,7 @@ pub fn write_single_partition(disk: usize, type_guid: &[u8; 16], name: &str) -> 
     mbr[511] = 0xaa;
     block::write(disk, 0, &mbr)?;
     block::write(disk, 1, &header(1, total - 1, 2))?;
-    Ok(partition)
+    Ok(())
 }
 
 /// Why `grow_last_partition` did nothing.

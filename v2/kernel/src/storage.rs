@@ -14,6 +14,12 @@ use crate::{ahci, gpt, nvme};
 static mut BOOT_VOLUME: Option<Volume> = None;
 static mut BOOT_DISK: Option<usize> = None;
 static mut PAYLOAD_START: Option<u64> = None;
+static mut BOOT_SLOT: u32 = 0;
+
+/// The A/B slot the running kernel was loaded from (`install` copies exactly that one).
+pub fn boot_slot() -> u32 {
+    unsafe { BOOT_SLOT }
+}
 
 pub fn boot_volume() -> Option<Volume> {
     unsafe { *core::ptr::addr_of!(BOOT_VOLUME) }
@@ -100,6 +106,7 @@ fn trimmed(model: &[u8]) -> &str {
 }
 
 pub fn init(info: &BootInfo) {
+    unsafe { BOOT_SLOT = info.boot_slot };
     let sata = ahci::init_all(|drive, controller, port| {
         let origin = format_origin("SATA", controller, Some(port));
         block::register(Backend::Ahci(drive), drive.sectors, drive.model, origin.as_str());
