@@ -1154,6 +1154,7 @@ fn execute(command: &str) {
             crate::println!("clear     clear the screen");
             crate::println!("nic       the network interfaces (list); nic use|sniff|discover|peers|map|regs|send|recv");
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
+            crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
             crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code from stage1.bin/stage2.bin");
             crate::println!("sector diskN LBA [COUNT]   raw read-only dump of disk sectors (a GPT header, the slot metadata)");
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
@@ -1336,6 +1337,7 @@ fn execute(command: &str) {
         "grow" => grow_command(words),
         "install" => crate::install::command(words),
         "bootcode" => crate::bootcode::command(words),
+        "videomodes" => videomodes_command(),
         "copy" => copy_command(words),
         "disks" => {
             for index in 0..crate::block::count() {
@@ -1503,12 +1505,36 @@ fn execute(command: &str) {
             }
             Some("video") => {
                 use fos_v2_abi::FLAG_SKIP_VIDEO;
+                let mut hint: Option<(u16, u16)> = None;
                 let change = match words.next() {
                     Some("skip") => Some(true),
                     Some("auto") => Some(false),
+                    // `size WxH` tells the BIOS stage two the monitor's size when the video BIOS cannot (no DDC/EDID, as on the
+                    // AMD/nForce board's NVIDIA card); `size auto` forgets it.
+                    Some("size") => {
+                        match words.next() {
+                            Some("auto") => hint = Some((0, 0)),
+                            Some(text) => match text.split_once('x').and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))) {
+                                Some((width, height)) if (640..=8192).contains(&width) && (480..=8192).contains(&height) => hint = Some((width, height)),
+                                _ => return crate::println!("debug video size WIDTHxHEIGHT (640x480 to 8192x8192) | size auto"),
+                            },
+                            None => return crate::println!("debug video size WIDTHxHEIGHT | size auto"),
+                        }
+                        None
+                    }
                     None | Some("status") => None,
-                    Some(_) => return crate::println!("debug video [skip|auto]"),
+                    Some(_) => return crate::println!("debug video [skip|auto|size WxH|size auto]"),
                 };
+                if let Some(size) = hint {
+                    if crate::debug::update_metadata(|metadata| metadata.monitor_hint = size).is_none() {
+                        return crate::println!("debug video: the slot metadata could not be read or written.");
+                    }
+                    if size == (0, 0) {
+                        crate::println!("Monitor size hint cleared: a BIOS boot trusts the monitor's EDID, else the old 1280x1024 rule.");
+                    } else {
+                        crate::println!("Monitor size hint {}x{}: a BIOS boot without an EDID picks the VBE mode whose shape fits it best.", size.0, size.1);
+                    }
+                }
                 let updated = match change {
                     Some(skip) => crate::debug::update_metadata(|metadata| {
                         if skip { metadata.flags |= FLAG_SKIP_VIDEO } else { metadata.flags &= !FLAG_SKIP_VIDEO }
@@ -1521,7 +1547,7 @@ fn execute(command: &str) {
                     None => crate::println!("debug video: the slot metadata could not be read or written."),
                 }
             }
-            Some(_) => crate::println!("debug: status | slots | crash | hang | video [skip|auto]"),
+            Some(_) => crate::println!("debug: status | slots | crash | hang | video [skip|auto|size WxH]"),
         },
         other => {
             let rest = command[other.len()..].trim();
@@ -1873,6 +1899,30 @@ fn fat_write(mut fs: crate::fatvol::Fs, name: &str, text: &str) {
     match outcome {
         Ok(()) => crate::println!("Wrote {} bytes to {name}.", text.len()),
         Err(error) => crate::println!("write: {}.", fat_error_text(error)),
+    }
+}
+
+/// `videomodes`: what the video BIOS offered when the BIOS boot path picked the screen mode. Stage two (boot/bios/stage2.S) leaves
+/// a table in low memory, which stays intact because the kernel treats everything below 1 MiB as reserved loader data: "VBET" at
+/// 0x3600, the number of modes at 0x3604, then one 8-byte record per mode from 0x3608 (mode number, width, height, bits per pixel,
+/// usable flag); the DDC (monitor data channel) results sit at 0x35f0 (capabilities AX, BX; EDID AX) and the native size read from
+/// the EDID at 0x35f8/0x35fc. Nothing there on a UEFI boot (the magic is missing).
+fn videomodes_command() {
+    let read16 = |address: u64| unsafe { (address as *const u16).read_unaligned() };
+    let read32 = |address: u64| unsafe { (address as *const u32).read_unaligned() };
+    if !crate::paging::is_mapped(0x3000) || !crate::paging::is_mapped(0x3600) || read32(0x3600) != 0x5445_4256 {
+        return crate::println!("No VBE mode table: this machine was not started by the BIOS boot path (or stage two is too old).");
+    }
+    let count = usize::from(read16(0x3604)).min(62);
+    crate::println!("DDC capabilities call: AX={:04x} BX={:04x}   EDID call: AX={:04x}   native size from EDID: {}x{}",
+        read16(0x35f0), read16(0x35f2), read16(0x35f4), read32(0x35f8), read32(0x35fc));
+    crate::println!("(AX=004f: the call worked; BL bit 1 of the capabilities: DDC2, which the EDID needs.)");
+    crate::println!("{count} video mode(s) from the video BIOS ('*' = usable: supported, colour, graphics, linear framebuffer):");
+    for index in 0..count {
+        let at = 0x3608 + 8 * index as u64;
+        let (mode, width, height) = (read16(at), read16(at + 2), read16(at + 4));
+        let (bits, usable) = (unsafe { ((at + 6) as *const u8).read() }, unsafe { ((at + 7) as *const u8).read() });
+        crate::println!(" {} {:#06x}: {width}x{height}, {bits} bits per pixel", if usable == 1 { '*' } else { ' ' }, mode);
     }
 }
 

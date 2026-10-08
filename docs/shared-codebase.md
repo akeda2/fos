@@ -198,6 +198,12 @@ preserved by the loader and the kernel; `debug video auto` clears it). `make tes
 flag survives a reboot. The catch: with the mode switch skipped the kernel has no framebuffer and only the serial port, because
 there is no VGA text console to fall back on (a small text backend for the 80x25 screen would close that gap).
 
+Mode choice diagnostics: stage two leaves its mode table (including modes found by probing the unlisted numbers 0x100-0x1FF) and
+the DDC/EDID results in low memory (`VBET` at 0x3600, EDID size at 0x35f8), and the kernel command `videomodes` prints them (no
+table on UEFI). Shapes are scored by area discounted by the shape error, so a slightly smaller mode of the right shape beats a
+bigger stretched one. Without an EDID, `debug video size WxH` (slot-metadata bytes 17-20; `size auto` clears it) supplies the
+monitor size. `make test-bios-edid` and `test-bios-video` cover them.
+
 Still open: nothing has run on real hardware (unreal mode, A20, E820 and VBE quirks are the usual surprises; the AMD/nForce
 board is the first target); the VGA text fallback above; the 4 GiB identity map in stage two limits where the kernel can be
 placed (fine: it moves its own page tables first thing).

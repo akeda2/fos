@@ -306,6 +306,13 @@ the monitor whose shape matches it (`make test-bios-edid`); without an EDID it k
 (2x at 1920x1080), with the console's rows and columns following the scale, would keep it readable. Needs a look on the real
 monitors first (the AMD board's DVI monitor, `bootinfo` shows the mode in use).
 
+Follow-up, 2026-10-08: on the AMD board (NVIDIA GF108) a DisplayPort-to-DVI adapter gave no EDID (DDC capabilities `BX=0000`) and
+a 1280x1024 picture on a 16:9 monitor; with a DVI-to-DVI cable the same card reports DDC2 and 1920x1080. Even then its video BIOS
+lists no 1920 mode (VESA modes to 1280x1024, NVIDIA's 1280x800 and, found by probing, 1600x1200), so the graded shape score picks
+1280x800. `videomodes` shows the list stage two saw (and the DDC/EDID results); `debug video size WxH` gives stage two a monitor
+size when there is no EDID; stage two also probes the unlisted mode numbers 0x100-0x1FF. A real 1920x1080 on such a card needs a
+native GPU driver.
+
 ## Skylake: no picture after the monitor's input is switched away from DisplayPort and back
 
 Reported 2026-10-08: switching the monitor from the Skylake's DisplayPort input to another machine's DVI input and back leaves

@@ -155,6 +155,9 @@ pub struct SlotMetadata {
     /// Boot options the BIOS stage two reads before it can read any file (byte 16): `FLAG_*`. The UEFI loader keeps them
     /// untouched.
     pub flags: u8,
+    /// The monitor's size as the operator says it (bytes 17-20: width and height, u16 LE; 0 = not set), for a BIOS stage two
+    /// whose video BIOS cannot supply an EDID: it then chooses the VBE mode whose shape fits this size best (`debug video size`).
+    pub monitor_hint: (u16, u16),
     pub active_slot: u8,
     pub pending_slot: Option<u8>,
     pub attempted: bool,
@@ -183,6 +186,7 @@ impl SlotMetadata {
         let pending = sector[6];
         Some(SlotMetadata {
             flags: sector[16],
+            monitor_hint: (u16::from_le_bytes([sector[17], sector[18]]), u16::from_le_bytes([sector[19], sector[20]])),
             active_slot: sector[5],
             pending_slot: if pending == NO_PENDING_SLOT { None } else { Some(pending) },
             attempted: sector[7] != 0,
@@ -209,6 +213,8 @@ impl SlotMetadata {
         sector[14] = self.running;
         sector[15] = self.unclean_boots;
         sector[16] = self.flags;
+        sector[17..19].copy_from_slice(&self.monitor_hint.0.to_le_bytes());
+        sector[19..21].copy_from_slice(&self.monitor_hint.1.to_le_bytes());
     }
 }
 
@@ -314,7 +320,7 @@ mod tests {
     }
 
     fn state(pending: Option<u8>, attempted: bool, confirmed: bool) -> SlotMetadata {
-        SlotMetadata { flags: 0, active_slot: 0, pending_slot: pending, attempted, confirmed, crash_count: 0, slot_sectors: [1, 1], running: 0, unclean_boots: 0 }
+        SlotMetadata { flags: 0, monitor_hint: (0, 0), active_slot: 0, pending_slot: pending, attempted, confirmed, crash_count: 0, slot_sectors: [1, 1], running: 0, unclean_boots: 0 }
     }
 
     #[test]
@@ -336,12 +342,13 @@ mod tests {
 
     #[test]
     fn metadata_write_into_round_trips() {
-        let m = SlotMetadata { flags: FLAG_SKIP_VIDEO, active_slot: 1, pending_slot: Some(0), attempted: true, confirmed: false, crash_count: 3, slot_sectors: [321, 400], running: 2, unclean_boots: 4 };
+        let m = SlotMetadata { flags: FLAG_SKIP_VIDEO, monitor_hint: (1920, 1080), active_slot: 1, pending_slot: Some(0), attempted: true, confirmed: false, crash_count: 3, slot_sectors: [321, 400], running: 2, unclean_boots: 4 };
         let mut sector = [0xaau8; 512];
         m.write_into(&mut sector);
         assert_eq!(SlotMetadata::parse(&sector), Some(m));
         assert_eq!(sector[16], FLAG_SKIP_VIDEO);
-        assert!(sector[17..].iter().all(|&b| b == 0), "everything after the flags byte stays zero");
+        assert_eq!(&sector[17..21], &[0x80, 0x07, 0x38, 0x04]);
+        assert!(sector[21..].iter().all(|&b| b == 0), "everything after the monitor hint stays zero");
     }
 
     #[test]

@@ -725,14 +725,27 @@ rsdp_scan:
 read_edid:
     xorw %ax, %ax
     movw %ax, %es
+    movw $0x4f15, %ax
+    xorw %bx, %bx                       /* BL=0: report the DDC capabilities (BL=1 below reads the EDID) */
+    xorw %cx, %cx                       /* controller 0 */
+    xorw %dx, %dx
+    movw $0x3400, %di
+    sti
+    int $0x10
+    cli
+    movw %ax, ddc_caps_ax               /* kept for the kernel's `videomodes`: AX=004F means supported, AH says why not */
+    movw %bx, ddc_caps_bx               /* BL: bit 0 DDC1, bit 1 DDC2; BH: seconds to transfer an EDID block */
+    xorw %ax, %ax
+    movw %ax, %es
     movw $0x3400, %di
     movw $0x4f15, %ax
-    movw $0x0001, %bx                   /* BL=1: read EDID (BL=0 would only report DDC capabilities) */
-    xorw %cx, %cx                       /* controller 0 */
+    movw $0x0001, %bx                   /* BL=1: read EDID */
+    xorw %cx, %cx
     xorw %dx, %dx                       /* EDID block 0 */
     sti
     int $0x10
     cli
+    movw %ax, ddc_edid_ax
     cmpw $0x004f, %ax
     jne 9f
     xorw %ax, %ax
@@ -817,7 +830,36 @@ vbe_setup:
     jne vbe_skipped
     testb $1, meta+16
     jnz vbe_skipped
+    movw $0, vbe_table_count
     call read_edid                      /* the monitor's own idea of its native size, if it will tell (ES is 0 again after) */
+    cmpl $0, native_width
+    jne no_hint
+    /* A video BIOS that cannot report DDC (the NVIDIA card on the AMD/nForce board answers "no DDC support") cannot say what
+     * monitor is attached, so the operator can: `debug video size 1920x1080` puts the size in the slot metadata (bytes 17-20),
+     * and it is used here exactly as an EDID's would be. */
+    movzwl meta+17, %eax
+    movzwl meta+19, %edx
+    cmpl $640, %eax
+    jb no_hint
+    cmpl $8192, %eax
+    ja no_hint
+    cmpl $480, %edx
+    jb no_hint
+    cmpl $8192, %edx
+    ja no_hint
+    movl %eax, native_width
+    movl %edx, native_height
+    movw $m_hint, %si
+    call puts16
+    movl native_width, %eax
+    call putdec32
+    movw $m_by, %si
+    call puts16
+    movl native_height, %eax
+    call putdec32
+    movw $m_crlf, %si
+    call puts16
+no_hint:
     movl $0x32454256, %es:0x3000        /* "VBE2" in the signature field asks for VBE 2.0+ information */
     movw $0x3000, %di
     movw $0x4f00, %ax                   /* VBE function 00h: controller information */
@@ -836,15 +878,39 @@ vbe_setup:
     jb vbe_none
     movw %es:0x300e, %ax                /* VideoModePtr: a far pointer (offset, then segment) to a list ending in 0xFFFF */
     movw %ax, vbe_list_offset
+    movw %ax, vbe_list_start
     movw %es:0x3010, %ax
     movw %ax, vbe_list_segment
 vbe_next:
+    cmpw $0, vbe_probe
+    jne vbe_probe_next
     movw vbe_list_segment, %fs          /* reloaded each time: the BIOS call below need not keep it */
     movw vbe_list_offset, %bx
     movw %fs:(%bx), %cx
     cmpw $0xffff, %cx
-    je vbe_listed
+    je vbe_list_done
     addw $2, vbe_list_offset
+    jmp vbe_have_mode
+vbe_list_done:
+    movw $0x100, vbe_probe              /* the list is exhausted: now the mode numbers it does not mention */
+vbe_probe_next:
+    /* Some video BIOSes accept (and describe) modes they do not list; this card's list stops at 1280x1024 although the GPU
+     * does 1920x1080, so ask about every number from 0x100 to 0x1FF that the list left out. A number the BIOS does not know
+     * just fails function 01h. */
+    movw vbe_probe, %cx
+    cmpw $0x200, %cx
+    jae vbe_listed
+    incw vbe_probe
+    movw vbe_list_segment, %fs
+    movw vbe_list_start, %bx
+1:  movw %fs:(%bx), %ax
+    cmpw $0xffff, %ax
+    je vbe_have_mode                    /* not in the list: ask */
+    cmpw %ax, %cx
+    je vbe_next                         /* listed: already looked at */
+    addw $2, %bx
+    jmp 1b
+vbe_have_mode:
     movw %cx, vbe_candidate
     xorw %ax, %ax
     movw %ax, %es
@@ -857,7 +923,31 @@ vbe_next:
     jne vbe_next
     xorw %ax, %ax
     movw %ax, %es
-    movw %es:0x3200, %ax                /* ModeAttributes */
+    /* Record the mode for the kernel's `videomodes` (a table at 0x3608, 8 bytes each: mode, width, height, bits per pixel,
+     * usable = 1 if it is supported, colour, graphics and has a linear framebuffer). It costs nothing and is the only way to
+     * see what a video BIOS offers once the kernel runs, since INT 10h is gone by then. */
+    movw vbe_table_count, %bx
+    cmpw $62, %bx
+    jae 7f
+    cmpw $0, %es:0x3212                 /* a mode with no width is not a mode (a probed number the BIOS half-answers) */
+    je 7f
+    shlw $3, %bx
+    addw $0x3608, %bx
+    movw vbe_candidate, %ax
+    movw %ax, %es:(%bx)
+    movw %es:0x3212, %ax
+    movw %ax, %es:2(%bx)
+    movw %es:0x3214, %ax
+    movw %ax, %es:4(%bx)
+    movb %es:0x3219, %al
+    movb %al, %es:6(%bx)
+    movw %es:0x3200, %ax
+    andw $0x0099, %ax
+    cmpw $0x0099, %ax
+    sete %al
+    movb %al, %es:7(%bx)
+    incw vbe_table_count
+7:  movw %es:0x3200, %ax                /* ModeAttributes */
     andw $0x0099, %ax
     cmpw $0x0099, %ax                   /* supported, colour, graphics, linear framebuffer available */
     jne vbe_next
@@ -903,11 +993,24 @@ vbe_next:
     subl %edi, %esi
     jns 4f
     negl %esi
-4:  imull $50, %esi, %esi               /* |difference| * 50 <= h * native width means the shapes agree within 2% */
-    cmpl %edi, %esi
-    jbe 5f
-    shrl $2, %eax                       /* ... but a quarter of it if the shape differs: a monitor stretches a mode of the */
-                                        /* wrong shape (or leaves bars), which is what made the text look blurry */
+4:  /* esi = |w * native height - h * native width|, edi = h * native width: their ratio is how far this mode's shape is from
+     * the monitor's. A monitor stretches a mode of the wrong shape or leaves bars, which is what made the text look blurry, so
+     * the score falls with the error: area * 100 / (100 + 3 * error in percent). (16:10 beats 5:4 on a 16:9 monitor; an exact
+     * shape keeps its whole area.) */
+    pushl %edx                          /* the pixel format of this mode (0 RGB, 1 BGR): mull and divl overwrite edx */
+    pushl %eax                          /* the area */
+    movl %esi, %eax
+    movl $100, %esi
+    mull %esi                           /* edx:eax = error * 100 */
+    divl %edi                           /* eax = the shape error in percent */
+    imull $3, %eax, %eax
+    addl $100, %eax
+    movl %eax, %edi                     /* the divisor */
+    popl %eax
+    movl $100, %esi
+    mull %esi                           /* edx:eax = area * 100 */
+    divl %edi
+    popl %edx                           /* the pixel format again */
 5:  cmpl vbe_area, %eax
     jbe vbe_next
     movl %eax, vbe_area
@@ -922,6 +1025,21 @@ vbe_next:
     movl %eax, fb_base
     jmp vbe_next
 vbe_listed:
+    xorw %ax, %ax
+    movw %ax, %es
+    movl $0x54454256, %es:0x3600        /* "VBET": the table is valid */
+    movw vbe_table_count, %ax
+    movw %ax, %es:0x3604
+    movw ddc_caps_ax, %ax               /* the DDC calls' results, for `videomodes` */
+    movw %ax, %es:0x35f0
+    movw ddc_caps_bx, %ax
+    movw %ax, %es:0x35f2
+    movw ddc_edid_ax, %ax
+    movw %ax, %es:0x35f4
+    movl native_width, %eax
+    movl %eax, %es:0x35f8
+    movl native_height, %eax
+    movl %eax, %es:0x35fc
     cmpl $0, vbe_area
     je vbe_none
     movw $m_video, %si                  /* narrate while text output still works */
@@ -1408,12 +1526,18 @@ rh_chunk:         .long 0
 .balign 8
 kernel_size:      .quad 0
 vbe_area:         .long 0
+ddc_caps_ax:      .word 0
+ddc_caps_bx:      .word 0
+ddc_edid_ax:      .word 0
+vbe_table_count:  .word 0
 native_width:     .long 0
 native_height:    .long 0
 vbe_version:      .word 0
 vbe_mode:         .word 0
 vbe_candidate:    .word 0
 vbe_list_offset:  .word 0
+vbe_list_start:   .word 0
+vbe_probe:        .word 0
 vbe_list_segment: .word 0
 .balign 4
 fb_base:          .long 0
@@ -1461,6 +1585,7 @@ m_place_staging: .asciz ", read buffer at 0x"
 m_no_room:    .asciz "FAILED: no usable RAM region above 1 MiB is large enough for the kernel and its read buffer (about 16 MiB).\r\n"
 m_load:       .asciz "  Reading the kernel slot (INT 13h EDD) and copying it above 1 MiB (unreal mode): "
 m_long:       .asciz "  Entering long mode (PAE, EFER.LME, paging); next the ELF segments are placed and the kernel starts.\r\n"
+m_hint:       .asciz "  Video: the video BIOS gives no EDID; using the operator's monitor size hint: "
 m_edid:       .asciz "  Video: the monitor reports its native size (EDID): "
 m_video:      .asciz "  Video: VBE 0x"
 m_video_mode: .asciz ", mode 0x"

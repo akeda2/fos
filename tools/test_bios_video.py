@@ -22,11 +22,11 @@ from test_boot import IMAGE, check, clean, monitor  # noqa: E402
 class Machine:
     """One QEMU through SeaBIOS with the serial port on pipes; the monitor on a socket. It may reboot itself."""
 
-    def __init__(self, tmp, image):
+    def __init__(self, tmp, image, extra=()):
         self.monitor_path = str(Path(tmp) / "monitor")
         self.process = subprocess.Popen(
             ["qemu-system-x86_64", "-machine", "q35", "-m", "256", "-display", "none", "-serial", "stdio",
-             "-monitor", f"unix:{self.monitor_path},server,nowait", "-drive", f"format=raw,file={image}"],
+             "-monitor", f"unix:{self.monitor_path},server,nowait", "-drive", f"format=raw,file={image}", *extra],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.raw = bytearray()
 
@@ -105,6 +105,31 @@ def main():
             machine.wait_for("chosen automatically", 20, mark)
             third = reboot(machine)
             check("Video: VBE" in third and "Framebuffer console ready" in third, "`debug video auto` brings the framebuffer back at the next boot", third[-1500:])
+        finally:
+            machine.close()
+
+    # --- a video BIOS that gives no EDID: the operator tells stage two the monitor's size ---
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        image = tmp / "hint.img"
+        shutil.copy(IMAGE, image)
+        machine = Machine(tmp, image, extra=("-vga", "none", "-device", "VGA,edid=off"))
+        try:
+            text = machine.wait_for("fos> ")
+            check("native size (EDID)" not in text and "Video: VBE" in text, "without an EDID and without a hint, stage two keeps its old rule", text[:1500])
+            mark = machine.send("debug video size 1366x768")
+            seen = machine.wait_for("fits it best", 20, mark)[mark:]
+            check("picks the VBE mode whose shape fits it best" in seen, "`debug video size 1366x768` stores the hint", seen)
+            mark = machine.send("debug slots")
+            seen = machine.wait_for("hint: 1366x768", 20, mark)[mark:]
+            check("monitor size hint: set" in seen, "and `debug slots` shows it", seen)
+            second = reboot(machine)
+            check("using the operator's monitor size hint: 1366x768" in second, "after a reboot stage two uses the hint (the video BIOS gave no EDID)", second[:1800])
+            check("mode 0x" in second and "1280x720 32 bpp" in second, "and takes the 16:9 mode closest to it (1280x720)", second[:1800])
+            mark = machine.send("debug video size auto")
+            machine.wait_for("Monitor size hint cleared", 20, mark)
+            third = reboot(machine)
+            check("monitor size hint" not in third and "1280x1024 32 bpp" in third, "`debug video size auto` returns to the old rule", third[:1800])
         finally:
             machine.close()
     print("bios video: all checks passed")

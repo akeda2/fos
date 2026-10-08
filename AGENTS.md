@@ -170,7 +170,7 @@ shows what a disk has; with `stage1.bin` and `stage2.bin` (from `build/bios/`) o
 both back (fos disks only; the UEFI loader on the ESP is not covered). `make test-bios-bootcode` runs it for real.
 
 BIOS boots only: a video BIOS that hangs in the VBE mode switch can be skipped once by holding Shift during the
-boot, or for good with `debug video skip` (a flag in the slot-metadata sector, byte 16; `debug video auto` undoes it).
+boot, or for good with `debug video skip` (a flag in the slot-metadata sector, byte 16; `debug video auto` undoes it). `videomodes` lists the modes stage two saw and the EDID result; `debug video size WxH` gives it a monitor size when the card has no EDID.
 The kernel is then serial-only, since there is no VGA text console yet.
 
 Talking to a real machine from a sandbox needs `AF_PACKET` raw sockets; a human grants

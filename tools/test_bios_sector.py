@@ -48,6 +48,13 @@ def main():
             bad = run("sector disk1 999999999", "failed")
             check("read failed" in bad, "a sector beyond the disk is a clear error", bad)
 
+            modes = run("videomodes", "mode(s) from the video BIOS")
+            machine.wait_for("fos> ", 20)
+            modes = machine.text()[machine.text().rindex("fos> videomodes") if "fos> videomodes" in machine.text() else 0:]
+            check("EDID call: AX=004f" in modes and "native size from EDID: 1280x800" in modes, "`videomodes` shows what the monitor told stage two (QEMU's 1280x800)", modes)
+            check("mode(s) from the video BIOS" in modes and " * 0x" in modes.replace("  ", " ") or "* 0x" in modes, "and the video BIOS's mode list with the usable ones starred", modes)
+            check("1280x800, 32 bits per pixel" in modes, "including the mode that was chosen", modes)
+
             good = run("debug slots", "watchdog:")
             check("slot metadata: not readable" not in good and "crash count:" in good, "`debug slots` reads the metadata normally", good)
             with open(image, "r+b") as handle:      # corrupt it behind the kernel's back

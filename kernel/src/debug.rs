@@ -187,7 +187,12 @@ pub fn slot_summary(print: impl Fn(core::fmt::Arguments)) {
         Ok(m) => {
             print(format_args!("active slot: {}, pending: {:?}, attempted: {}, confirmed: {}", m.active_slot, m.pending_slot, m.attempted, m.confirmed));
             print(format_args!("slot sizes (sectors): {} / {}", m.slot_sectors[0], m.slot_sectors[1]));
-            print(format_args!("BIOS video mode switch: {} (`debug video skip|auto`)", if m.flags & fos_v2_abi::FLAG_SKIP_VIDEO != 0 { "skipped" } else { "automatic" }));
+            print(format_args!("BIOS video mode switch: {} (`debug video skip|auto`), monitor size hint: {} (`debug video size WxH|auto`)",
+                if m.flags & fos_v2_abi::FLAG_SKIP_VIDEO != 0 { "skipped" } else { "automatic" },
+                if m.monitor_hint == (0, 0) { "none" } else { "set" }));
+            if m.monitor_hint != (0, 0) {
+                print(format_args!("  hint: {}x{}", m.monitor_hint.0, m.monitor_hint.1));
+            }
             print(format_args!("crash count: {} (loader saw {} at boot), running: {}, unclean boots: {}", m.crash_count, unsafe { BOOT_CRASH_COUNT }, m.running, m.unclean_boots));
         }
         Err(MetadataProblem::NoPayload) => print(format_args!("slot metadata: not readable (the payload partition was never located)")),

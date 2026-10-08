@@ -195,7 +195,7 @@ fn run(boot: usize, disk: usize, number: usize, pending: &Pending) {
     if let Err(error) = copy_sectors(boot, layout.payload.start + slot_start(slot), disk, payload.start + slot_start(0), u64::from(kernel_sectors)) {
         return crate::println!("install: copying the kernel failed ({error:?}); disk{number} is not bootable.");
     }
-    metadata = SlotMetadata { flags: 0, active_slot: 0, pending_slot: None, attempted: false, confirmed: false, crash_count: 0, slot_sectors: [kernel_sectors, 0], running: 0, unclean_boots: 0 };
+    metadata = SlotMetadata { flags: 0, monitor_hint: (0, 0), active_slot: 0, pending_slot: None, attempted: false, confirmed: false, crash_count: 0, slot_sectors: [kernel_sectors, 0], running: 0, unclean_boots: 0 };
     metadata.write_into(&mut sector);
     if block::write(disk, payload.start, &sector).is_err() {
         return crate::println!("install: writing the slot metadata failed; disk{number} is not bootable.");
