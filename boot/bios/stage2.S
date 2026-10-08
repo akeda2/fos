@@ -15,6 +15,8 @@
  *   4. Read the chosen kernel slot (an ELF64 position-independent image) with EDD in 16 KiB
  *      pieces into a low buffer and copy each piece above 1 MiB ("unreal mode", see enter_unreal)
  *      to a staging area: the BIOS can only write below 1 MiB and real mode only addresses 1 MiB.
+ *   4b. Video: set a VBE linear-framebuffer mode (last, so narration still works) and describe it in
+ *      BootInfo like the UEFI loader describes GOP; the kernel's framebuffer console then needs no change.
  *   5. Identity-map the first 4 GiB (2 MiB pages), enter long mode (PAE, EFER.LME, paging), and
  *      in 64-bit code: place the ELF's PT_LOAD segments at KERNEL_BASE, apply its
  *      R_X86_64_RELATIVE relocations, convert the E820 map to UEFI memory descriptors, fill in
@@ -313,6 +315,7 @@ chosen:
     /* ---- 5. long mode ---- */
     movw $m_long, %si
     call puts16
+    call vbe_setup                      /* last real-mode job: after this the screen may no longer take INT 10h text */
     cli
     lgdt gdt_descriptor
     movl %cr0, %eax
@@ -619,6 +622,154 @@ rsdp_scan:
     incw %ax                            /* next paragraph */
     movw %ax, %es
     loop 3b
+    ret
+
+/* ---- Video: VBE (VESA BIOS Extensions) linear framebuffer ----
+ * The UEFI loader passes the firmware's graphics framebuffer; a BIOS machine's equivalent is VBE. Ask the video BIOS
+ * for its list of modes (INT 10h AX=4F00h), look at each (AX=4F01h) and keep the largest mode that is a 32-bit-per-pixel
+ * direct-colour mode with a linear framebuffer (attribute bits 0 supported, 3 colour, 4 graphics, 7 linear), whose
+ * colour layout is one the kernel's console draws (blue in the low byte = BGR, or red in the low byte = RGB), and no
+ * larger than 1280x1024. Then set it (AX=4F02h, bit 14 = use the linear framebuffer) and describe it in BootInfo
+ * exactly as the UEFI loader describes GOP. This is the last real-mode step, because many video BIOSes stop honouring
+ * text output in a graphics mode. If anything is missing the screen stays in text mode and the kernel is serial-only.
+ * Buffers: 0x3000 controller information (512 bytes), 0x3200 mode information (256 bytes). */
+vbe_setup:
+    movl $0, vbe_area
+    movl $0, fb_base
+    xorw %ax, %ax
+    movw %ax, %es
+    movl $0x32454256, %es:0x3000        /* "VBE2" in the signature field asks for VBE 2.0+ information */
+    movw $0x3000, %di
+    movw $0x4f00, %ax                   /* VBE function 00h: controller information */
+    sti
+    int $0x10
+    cli
+    cmpw $0x004f, %ax                   /* AL = 4Fh: function supported, AH = 0: succeeded */
+    jne vbe_none
+    xorw %ax, %ax
+    movw %ax, %es
+    cmpl $0x41534556, %es:0x3000        /* "VESA" */
+    jne vbe_none
+    movw %es:0x3004, %ax                /* VbeVersion, BCD: 0x0200 = 2.0 */
+    movw %ax, vbe_version
+    cmpw $0x0200, %ax                   /* linear framebuffers are a VBE 2.0 feature */
+    jb vbe_none
+    movw %es:0x300e, %ax                /* VideoModePtr: a far pointer (offset, then segment) to a list ending in 0xFFFF */
+    movw %ax, vbe_list_offset
+    movw %es:0x3010, %ax
+    movw %ax, vbe_list_segment
+vbe_next:
+    movw vbe_list_segment, %fs          /* reloaded each time: the BIOS call below need not keep it */
+    movw vbe_list_offset, %bx
+    movw %fs:(%bx), %cx
+    cmpw $0xffff, %cx
+    je vbe_listed
+    addw $2, vbe_list_offset
+    movw %cx, vbe_candidate
+    xorw %ax, %ax
+    movw %ax, %es
+    movw $0x3200, %di
+    movw $0x4f01, %ax                   /* VBE function 01h: information about mode CX */
+    sti
+    int $0x10
+    cli
+    cmpw $0x004f, %ax
+    jne vbe_next
+    xorw %ax, %ax
+    movw %ax, %es
+    movw %es:0x3200, %ax                /* ModeAttributes */
+    andw $0x0099, %ax
+    cmpw $0x0099, %ax                   /* supported, colour, graphics, linear framebuffer available */
+    jne vbe_next
+    cmpb $32, %es:0x3219                /* BitsPerPixel */
+    jne vbe_next
+    cmpb $6, %es:0x321b                 /* MemoryModel 6 = direct colour */
+    jne vbe_next
+    movb %es:0x3220, %al                /* RedFieldPosition */
+    movb %es:0x3224, %ah                /* BlueFieldPosition */
+    cmpb $16, %al
+    jne 1f
+    testb %ah, %ah                      /* red at bit 16, blue at bit 0: bytes B, G, R in memory = UEFI's BGR (1) */
+    jnz vbe_next
+    movl $1, %edx
+    jmp 2f
+1:  testb %al, %al                      /* red at bit 0, blue at bit 16: UEFI's RGB (0) */
+    jnz vbe_next
+    cmpb $16, %ah
+    jne vbe_next
+    xorl %edx, %edx
+2:  movzwl %es:0x3212, %eax             /* XResolution */
+    cmpl $640, %eax
+    jb vbe_next
+    cmpl $1280, %eax
+    ja vbe_next
+    movzwl %es:0x3214, %ecx             /* YResolution */
+    cmpl $1024, %ecx
+    ja vbe_next
+    movl %eax, %ebx
+    imull %ecx, %eax                    /* area: the largest mode wins */
+    cmpl vbe_area, %eax
+    jbe vbe_next
+    movl %eax, vbe_area
+    movw vbe_candidate, %ax
+    movw %ax, vbe_mode
+    movl %ebx, fb_width
+    movl %ecx, fb_height
+    movl %edx, fb_format
+    movzwl %es:0x3210, %eax             /* BytesPerScanLine */
+    movl %eax, fb_pitch
+    movl %es:0x3228, %eax               /* PhysBasePtr: where the linear framebuffer is */
+    movl %eax, fb_base
+    jmp vbe_next
+vbe_listed:
+    cmpl $0, vbe_area
+    je vbe_none
+    movw $m_video, %si                  /* narrate while text output still works */
+    call puts16
+    movzwl vbe_version, %eax
+    call puthex16
+    movw $m_video_mode, %si
+    call puts16
+    movzwl vbe_mode, %eax
+    call puthex16
+    movw $m_colon, %si
+    call puts16
+    movl fb_width, %eax
+    call putdec32
+    movw $m_by, %si
+    call puts16
+    movl fb_height, %eax
+    call putdec32
+    movw $m_video_at, %si
+    call puts16
+    movl fb_base, %eax
+    call puthex32
+    movw $m_crlf, %si
+    call puts16
+    movw vbe_mode, %bx
+    orw $0x4000, %bx                    /* bit 14: use the linear framebuffer */
+    movw $0x4f02, %ax                   /* VBE function 02h: set mode */
+    sti
+    int $0x10
+    cli
+    cmpw $0x004f, %ax
+    jne vbe_failed
+    movl fb_pitch, %eax                 /* the size, and the stride in pixels (4 bytes each), as BootInfo wants them */
+    mull fb_height
+    movl %eax, fb_size
+    movl fb_pitch, %eax
+    shrl $2, %eax
+    movl %eax, fb_stride
+    ret
+vbe_failed:
+    movl $0, fb_base
+    movw $m_video_failed, %si
+    call puts16
+    ret
+vbe_none:
+    movl $0, fb_base
+    movw $m_video_none, %si
+    call puts16
     ret
 
 /* ---- console: every character to COM1 and the screen (BIOS teletype) ---- */
@@ -929,7 +1080,18 @@ mm_done:
     movq $MEMORY_MAP, 16(%rdx)
     movq %r8, 24(%rdx)                  /* memory_map_count */
     movq $MEMORY_MAP_STRIDE, 32(%rdx)   /* memory_map_descriptor_size */
-    /* framebuffer at 40..71 stays zero: this path leaves the display in VGA text mode */
+    movl fb_base, %eax                  /* framebuffer, as the UEFI loader fills it (zero base = none: text mode) */
+    movq %rax, 40(%rdx)
+    movl fb_size, %eax
+    movq %rax, 48(%rdx)
+    movl fb_width, %eax
+    movl %eax, 56(%rdx)
+    movl fb_height, %eax
+    movl %eax, 60(%rdx)
+    movl fb_stride, %eax
+    movl %eax, 64(%rdx)
+    movl fb_format, %eax
+    movl %eax, 68(%rdx)
     movl rsdp_address, %eax
     movq %rax, 72(%rdx)                 /* acpi_rsdp */
     /* runtime_services at 80 stays zero: there is no firmware to call after boot */
@@ -1031,6 +1193,20 @@ rd_dest:          .long 0
 rh_chunk:         .long 0
 .balign 8
 kernel_size:      .quad 0
+vbe_area:         .long 0
+vbe_version:      .word 0
+vbe_mode:         .word 0
+vbe_candidate:    .word 0
+vbe_list_offset:  .word 0
+vbe_list_segment: .word 0
+.balign 4
+fb_base:          .long 0
+fb_size:          .long 0
+fb_width:         .long 0
+fb_height:        .long 0
+fb_stride:        .long 0
+fb_format:        .long 0
+fb_pitch:         .long 0
 payload_guid:     .space 16
 rsdp_copy:        .space 36
 .balign 4
@@ -1064,6 +1240,12 @@ m_kib_end:    .asciz " KiB).\r\n"
 m_meta_ro:    .asciz "  Warning: the slot metadata could not be written back; fallback tracking is off this boot.\r\n"
 m_load:       .asciz "  Reading the kernel slot (INT 13h EDD) and copying it above 1 MiB (unreal mode): "
 m_long:       .asciz "  Entering long mode (PAE, EFER.LME, paging); next the ELF segments are placed and the kernel starts.\r\n"
+m_video:      .asciz "  Video: VBE 0x"
+m_video_mode: .asciz ", mode 0x"
+m_by:         .asciz "x"
+m_video_at:   .asciz " 32 bpp, linear framebuffer at 0x"
+m_video_none: .asciz "  Video: no usable VBE mode (a 32-bit linear one is needed); text mode stays, the kernel is serial only.\r\n"
+m_video_failed: .asciz "  Video: the video BIOS refused the mode; the kernel is serial only.\r\n"
 m_ok:         .asciz "ok\r\n"
 m_crlf:       .asciz "\r\n"
 m_a20_fail:   .asciz "FAILED, cannot enable A20.\r\n"

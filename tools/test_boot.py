@@ -245,10 +245,9 @@ def main():
     check("Allocator self-test: ok" in text, "the allocator's bookkeeping, contiguity and below-4-GiB promises hold", text)
     check("GDT + TSS loaded" in text and "IDT loaded: 256 gates" in text, "the kernel installs its own GDT, TSS and IDT", text)
     check("NX and write-protect on" in text and "stack guard pages unmapped" in text, "and its own page tables with NX, read-only text and guard pages", text)
+    check(re.search(r"Framebuffer console ready: \d+ columns x \d+ rows, mapped (write-combining|uncached)", text) is not None, "the framebuffer console comes up", text)
     if BIOS:
-        check("No framebuffer: serial console only." in text, "without a framebuffer the console is serial only", text)
-    else:
-        check(re.search(r"Framebuffer console ready: \d+ columns x \d+ rows, mapped (write-combining|uncached)", text) is not None, "the framebuffer console comes up", text)
+        check(re.search(r"Video: VBE 0x[0-9A-F]{4}, mode 0x[0-9A-F]{4}: \d+x\d+ 32 bpp, linear framebuffer at 0x[0-9A-F]{8}", text) is not None, "stage two sets a VBE linear-framebuffer mode and says which", text)
     check(re.search(r"ACPI (1\.0|2\.0\+): PM timer at port 0x[0-9a-f]+ \(\d+-bit\), local APIC at 0x[0-9a-f]+", text) is not None, "the kernel reads the ACPI FADT and MADT", text)
     check("ticking at 100 Hz" in text, "the local APIC timer is calibrated and running", text)
     check("1 breakpoint(s) delivered and handled" in text, "a breakpoint exception is delivered and handled", text)
@@ -274,9 +273,6 @@ def main():
     check("no such file" in transcript["cat hello.txt#2"], "`rm` removes it again", transcript["cat hello.txt#2"])
     check(exited_by_itself, "`shutdown` over the network powers the machine off through the UEFI runtime services", text)
 
-    if BIOS:
-        print("v2 boot via BIOS: all checks passed")
-        return
     # --- the framebuffer, as QEMU displays it ---
     check(pixel is not None and width >= 640, f"QEMU produced a screendump ({width}x{height})", text)
     bar_y = height - 48 + 16
@@ -286,7 +282,7 @@ def main():
     check(pixel(width - 10, height // 2) == (0, 0, 0x20), f"the background fill is the console colour {pixel(width - 10, height // 2)}", text)
     lit = sum(1 for y in range(0, 16 * 12) for x in range(0, 8 * 60) if pixel(x, y) == (0xc0, 0xc0, 0xc0))
     check(lit > 400, f"text is drawn on screen ({lit} foreground pixels in the first rows)", text)
-    print("v2 boot (M0-M3): all checks passed")
+    print("v2 boot via BIOS: all checks passed" if BIOS else "v2 boot (M0-M3): all checks passed")
 
 
 if __name__ == "__main__":

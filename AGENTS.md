@@ -21,20 +21,21 @@ Keep changes small and explainable; avoid frameworks and abstractions that obscu
 hardware behaviour. Boot stages and kernel subsystems **narrate** what they do and
 why (which firmware call, what a PIC/APIC setup accomplishes), not just "done".
 
-**Editions.** This tree is the only line under development: a 64-bit kernel that
-boots through UEFI today and, per `docs/shared-codebase.md`, through a new 64-bit
-BIOS path next (one kernel, only POST/boot differs). The previous 32-bit BIOS
-edition is frozen at tag `legacy-v1` / branch `legacy` (Pentium 4 machines, the
-protected-mode teaching tree); its old guide is `docs/legacy-v1-guide.md`. Do not
-backport features to it without being asked. Some names still say `v2`
-(`build/v2/`, crate names `fos-v2-*`, `FOS_V2_IMAGE`); renaming them to Fosfor is a
-separate mechanical step (`docs/shared-codebase.md`, section 7).
+**Editions.** This tree is the only line under development: one 64-bit kernel that boots
+through **UEFI** (`boot/uefi/`) or **BIOS** (`boot/bios/`); only POST/boot differs, and both
+hand the kernel the same `BootInfo`. The previous 32-bit BIOS edition is frozen at tag
+`legacy-v1` / branch `legacy` (Pentium 4 machines, the protected-mode teaching tree); its old
+guide is `docs/legacy-v1-guide.md`. Do not backport features to it without being asked. The
+plan and status are in `docs/shared-codebase.md`. Some names still say `v2` (`build/v2/`,
+crate names `fos-v2-*`, `FOS_V2_IMAGE`); renaming them to Fosfor is a separate mechanical step
+(that doc, section 7).
 
 ## Source map
 
 | Path | What |
 | --- | --- |
 | `boot/uefi/` | The UEFI loader (PE/COFF, `x86_64-unknown-uefi`): narrates, runs the A/B slot state machine, loads the kernel ELF, builds `BootInfo`, `ExitBootServices`. |
+| `boot/bios/` | The BIOS boot chain, plain GNU as/ld: `stage1.S` (the MBR) and `stage2.S` (real mode -> long mode: A20, E820, ACPI RSDP, GPT, the same A/B slot logic, the kernel read above 1 MiB through unreal mode, a VBE framebuffer, ELF placement, `BootInfo`). Lives in the MBR and the GPT gap at LBA 64, so one disk image boots under both firmwares. |
 | `kernel/` | The one 64-bit kernel (`x86_64-fos-kernel` target, no SSE, `panic = abort`). Shell is `term.rs`; drivers, `fosfs.rs`, `fatvol.rs`, `tape.rs` (the tape ABI implementation), `debug.rs`, `audio.rs` (backend facade over `usb_audio.rs` and `hda.rs`). |
 | `abi/` | `no_std` crate shared by loader, kernel and tapes: `BootInfo`, slot metadata + `select_slot`, the `TapeApi` table (`abi/src/tape.rs`), ELF helpers, keymaps. |
 | `fat/` | FAT32/exFAT crate with host tests (root directory only, contiguous-run writer, `format_exfat`). |
@@ -48,12 +49,17 @@ Also read on demand: `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put asid
 
 ## Boot, memory, disks
 
-- **Boot (UEFI)**: firmware -> `\EFI\BOOT\BOOTX64.EFI` -> kernel ELF64 read by LBA
-  from an A/B slot -> long mode, identity-mapped, interrupts off. The kernel is a
-  position-independent image placed wherever the firmware has room. `BootInfo`
-  (`abi/src/lib.rs`, currently version 5) is the loader/kernel ABI, passed by pointer;
-  validate magic, version and size before use. A BIOS boot path is planned to hand
-  over the same `BootInfo`; code outside boot must not care which firmware booted it.
+- **Boot**: UEFI: firmware -> `\EFI\BOOT\BOOTX64.EFI`. BIOS: MBR -> stage two (see
+  `boot/bios/stage2.S`'s header for the steps and its low-memory map; the kernel's crash-record
+  page at `0x5000` must stay untouched). Either way the kernel ELF64 is read by LBA from an A/B
+  slot and entered in long mode, identity-mapped, interrupts off; it is a position-independent
+  image placed wherever the loader chooses (BIOS: 4 MiB, staging at 16 MiB, so about 24 MiB of
+  RAM is needed). `BootInfo` (`abi/src/lib.rs`, version 5) is the loader/kernel ABI, passed by
+  pointer; validate magic, version and size. Stage two writes it by hand, so a unit test in
+  `abi` pins its layout: change both together. On BIOS `runtime_services` is 0 and the memory
+  map is E820 converted to UEFI descriptor types (usable RAM below 1 MiB is "loader data").
+  Code outside boot must not care which firmware booted it (the ACPI reader, for one, maps
+  table pages the map does not describe, because a BIOS may label them reserved).
 - **Image** (`tools/build_image.py`): GPT with an ESP (FAT32), a raw payload partition
   (GPT type `f05b2a01-0000-4f05-8000-0000000000a1`: slot metadata block, then kernel
   slot 0 and 1, 8 MiB each) and a FOSFS data partition. Never add host block-device
@@ -122,10 +128,13 @@ make image            # build/v2/v2.img: loader + kernel + every tape (default g
 make run              # boot it in QEMU + OVMF, serial on the terminal
 make test             # unit tests (abi, fat, audio-rec) and the boot/framebuffer test
 make test-NAME        # one end-to-end test; `make help`, or the .PHONY list in the Makefile
+make test-bios        # 15 of them again, booted through BIOS (SeaBIOS); test-bios-NAME for one
 make test-all         # every test-* target (slow, ~30 min); prints PASS/FAIL per target
 ```
 
-Run `make test` for any kernel or loader change and the matching `make test-NAME` for
+The BIOS runs reuse the UEFI tests through `tools/qemu_bios_shim.py`, which drops the OVMF drives
+from the test's QEMU command line (`FOS_FIRMWARE=bios`); a check that greps loader wording must
+use the shared text or `LOADER_BANNER`/`BIOS` from `tools/test_boot.py`. Run `make test` for any kernel or loader change and the matching `make test-NAME` for
 the area you touched (`test-debug-mode` for crash/KUP/watchdog, `test-hda` and
 `test-usb-audio` for audio, `test-nic` and `test-rtl8139` for NICs, `test-recorder*`
 for the recorder, ...). Known failing: `test-nettapes` (the bridge test through the

@@ -1,13 +1,13 @@
 # Fosfor OS: one 64-bit codebase, two boot paths
 
-Status (2026-10-08): **P0, the driver ports and P2 are done on branch `unify-64`; the BIOS path
-(B1-B5), the shared-crate move (P3) and the rename (R) are not started.** Built so far: tag
+Status (2026-10-08): **P0, the driver ports, P2, B1, B2 and the VBE framebuffer are done and merged into
+`main` (except VBE, on branch `bios-vbe`); B3-B5, the shared-crate move (P3) and the rename (R) are not started.** Built so far: tag
 `legacy-v1` and branch `legacy` at `055c093`; RTL8139 and Intel HD Audio ported into the 64-bit
 kernel (`make test-rtl8139`, `make test-hda`); tape API 3 (`audio_devices`, `audio_use_device`);
 the tree promoted to the top level (`abi/`, `kernel/`, `boot/uefi/`, `fat/`, `tapes/`, `tools/`)
 with the v2-prefixed make targets renamed (`make image`, `make test-NAME`, `make test-all`).
-32 of 33 tests pass; `test-nettapes` failed before the move too. **B1 (BIOS spike) is done**: see
-section 4.4. This note supersedes the
+32 of 33 tests pass; `test-nettapes` failed before the move too. **B1 (BIOS spike) and B2 (the real kernel through BIOS) are done**: see
+section 4.4 and 4.5. This note supersedes the
 "v1 and v2 live side by side, drivers copied and widened" decision in v2-design.md
 section 3 and the "v1 is maintained" paragraph in section 12.
 
@@ -169,6 +169,26 @@ marker at the end of its own image. What this settles:
 - A builder bug worth remembering: patching a `bytearray` with a slice of a different length shrinks
   it silently, which shifted every data address by four bytes and showed up as garbled strings and a
   BIOS disk error; `tools/build_bios_spike.py` now asserts the length is unchanged.
+
+### 4.5 B2 result and VBE (2026-10-08)
+
+The real kernel boots through BIOS (`boot/bios/stage2.S`, `make test-bios`: 15 existing tests, 270 checks, under SeaBIOS).
+Stage two now does what 4.4 listed as not done, except the items under "Still open": the 8042 A20 fallback, GPT discovery of
+the payload partition, the A/B state machine (`abi::select_slot` byte for byte, plus the `running` / `crash_count` /
+`unclean_boots` bookkeeping and the write-back), the ACPI RSDP scan, E820 -> UEFI memory descriptors, ELF64 PT_LOAD placement
+and R_X86_64_RELATIVE relocations in long mode, and `BootInfo` v5. The video path is the UEFI one: stage two picks the largest
+32-bit direct-colour VBE linear mode up to 1280x1024 with a BGR or RGB layout, sets it last, and fills the framebuffer fields,
+so the kernel's framebuffer console is unchanged (`make test-bios-boot` runs the screen-dump checks too). One image boots under
+both firmwares: stage one is the MBR's code, stage two sits at LBA 64 in the GPT gap.
+
+Decisions and surprises: the kernel's ACPI reader now maps any table page the memory map did not describe (SeaBIOS reports its
+tables as plain reserved); interrupts stay off from the moment ES gets its 4 GiB limit until the copy ends (a BIOS handler
+reloading ES resets it); stage two's scratch memory stays below 0x5000 because the kernel keeps its crash record in that page.
+
+Still open: `install diskN` does not copy the MBR code or stage two (a clone boots only under UEFI); the kernel base (4 MiB)
+and staging (16 MiB) are fixed instead of chosen from E820; nothing has run on real hardware (unreal mode, A20, E820 and VBE
+quirks are the usual surprises; the AMD/nForce board is the first target); a failed VBE call is only checked at each step,
+there is no operator override to skip graphics on a card that hangs.
 
 ## 5. Migration, in order
 
