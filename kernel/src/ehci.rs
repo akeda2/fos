@@ -181,6 +181,8 @@ struct KeyboardPipe {
     endpoint: u8,
     max_packet: u16,
     toggle: bool,
+    /// The root port this keyboard is on, or that its hub is on: what `claimed_ports` records.
+    root_port: u8,
 }
 
 pub struct Controller {
@@ -709,9 +711,9 @@ impl Controller {
 
     /// Dedicates a queue head to a keyboard's interrupt-IN endpoint and arms it.
     /// Returns the keyboard's index on this controller.
-    pub fn add_keyboard(&mut self, target: Target, endpoint: u8, max_packet: u16) -> Result<usize, Error> {
+    pub fn add_keyboard(&mut self, target: Target, endpoint: u8, max_packet: u16, root_port: u8) -> Result<usize, Error> {
         let index = self.keyboards.iter().position(Option::is_none).ok_or(Error::Unsupported)?;
-        self.keyboards[index] = Some(KeyboardPipe { target, endpoint, max_packet, toggle: false });
+        self.keyboards[index] = Some(KeyboardPipe { target, endpoint, max_packet, toggle: false, root_port });
         self.relink();
         unsafe {
             let words = self.keyboard_qh(index) as *mut u32;
@@ -720,6 +722,24 @@ impl Controller {
         }
         self.arm_keyboard(index);
         Ok(index)
+    }
+
+    /// Takes the keyboards behind root `port` off the async list (the device was unplugged, or unplugged and plugged back in)
+    /// and frees their entries for the next enumeration. Returns a bit mask of the removed keyboard indexes. `relink` stops
+    /// the schedule while it rewrites the links, so the controller never walks a queue head that is being dropped.
+    pub fn remove_keyboards_on_port(&mut self, port: u8) -> u8 {
+        let mut removed = 0u8;
+        for index in 0..MAX_KEYBOARDS {
+            if self.keyboards[index].is_some_and(|pipe| pipe.root_port == port) {
+                self.keyboards[index] = None;
+                removed |= 1 << index;
+            }
+        }
+        if removed != 0 {
+            self.relink();
+            self.set_async(true);
+        }
+        removed
     }
 
     /// Queues one IN transfer of a report on keyboard `index`'s queue head.

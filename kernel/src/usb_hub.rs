@@ -146,7 +146,7 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
                 Ok(false) => break,
                 Err(error) => {
                     crate::println!("USB: hub port {}.{port}, attempt {attempt}/3 failed: {error:?}.", hub.device.path());
-                    controller.release_route_slots(hub.device.port, route);
+                    crate::usb_hid::release_port(controller, hub.device.port, Some(route));
                     crate::apic::wait_ticks(15);
                 }
             }

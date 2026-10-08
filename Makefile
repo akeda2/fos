@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug
 
 all: image tapes
 
@@ -26,6 +26,10 @@ help:
 # A stick that is unplugged and plugged back in (QEMU monitor device_del / device_add) gets its disk number back.
 test-usb-replug: image
 	python3 tools/test_usb_replug.py
+
+# A keyboard that is unplugged and plugged back in keeps working, five times over (xHCI and EHCI).
+test-usb-kbd-replug: image
+	python3 tools/test_usb_kbd_replug.py
 
 # `make -s print-image`: the path `make image` writes (tools/build_image.py's DEFAULT_IMAGE must equal it; test-stick-guids checks).
 print-image:
