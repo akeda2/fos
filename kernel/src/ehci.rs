@@ -504,6 +504,27 @@ impl Controller {
         self.control_transfer(target, 0x00, 0x09, u16::from(value), 0, &mut []).map(|_| ())
     }
 
+    /// Waits until the port has shown a device continuously for `stable_ms` (checked every 10 ms), for at most `timeout_ms`.
+    /// A device that was just plugged in bounces for a moment, and a USB 3 stick on a USB 2 port may drop off the bus and
+    /// come back while it falls back from SuperSpeed (seen on a Kingston DataTraveler 3.0 on an nForce EHCI port): a reset
+    /// during a bounce finds nothing. Other systems debounce the same way (100 ms of stable connection, up to 2 s).
+    pub fn wait_port_stable(&self, port: u8, stable_ms: u32, timeout_ms: u32) -> bool {
+        let (mut stable, mut waited) = (0, 0);
+        while waited < timeout_ms {
+            if self.port_has_device(port) {
+                stable += 10;
+                if stable >= stable_ms {
+                    return true;
+                }
+            } else {
+                stable = 0;
+            }
+            apic::wait_ticks(1);
+            waited += 10;
+        }
+        false
+    }
+
     /// Resets a root port with a device on it and leaves a high-speed device enabled
     /// at address 0. Anything slower is released to the companion controller.
     fn reset_root_port(&mut self, port: u8) -> Result<(), Error> {
@@ -512,6 +533,10 @@ impl Controller {
         if status & PORT_CONNECTED == 0 || status & PORT_OWNER != 0 {
             return Err(Error::NoDevice);
         }
+        if !self.wait_port_stable(port, 100, 2000) {
+            return Err(Error::NoDevice); // it did not hold still long enough to be worth resetting
+        }
+        let status = read32(register);
         // Line state "K" (01) is a low-speed device, which EHCI cannot drive directly.
         if (status >> 10) & 3 == 1 {
             write32(register, (status & PORT_KEEP) | PORT_OWNER);
@@ -523,7 +548,7 @@ impl Controller {
         if !wait_until(5, || read32(register) & PORT_RESET == 0) {
             return Err(Error::NoDevice);
         }
-        apic::wait_ticks(3); // reset recovery
+        apic::wait_ticks(6); // reset recovery (the standard asks for 10 ms; flash sticks coming out of a USB 3 fallback want more)
         let after = read32(register);
         write32(register, (after & PORT_KEEP) | PORT_CHANGE_BITS);
         if after & PORT_CONNECTED == 0 {
@@ -552,7 +577,19 @@ impl Controller {
         let mut target = Target { address: 0, max_packet0: if speed == Speed::High { 64 } else { 8 }, speed, hub_address, hub_port };
         let mut first = [0u8; 8];
         self.step = "read the first 8 bytes of the device descriptor at address 0";
-        self.get_descriptor(&target, 1, 0, &mut first)?;
+        // A device fresh out of reset may not answer the first request (it is still starting up): ask a few times, 50 ms
+        // apart, before giving the port up for a full reset (the same is done by other systems' enumeration code).
+        let mut tries = 0;
+        loop {
+            match self.get_descriptor(&target, 1, 0, &mut first) {
+                Ok(_) => break,
+                Err(error) if tries >= 3 => return Err(error),
+                Err(_) => {
+                    tries += 1;
+                    apic::wait_ticks(5);
+                }
+            }
+        }
         target.max_packet0 = u16::from(first[7]).max(8);
         let address = self.allocate_address().ok_or(Error::Unsupported)?;
         self.step = "SET_ADDRESS";

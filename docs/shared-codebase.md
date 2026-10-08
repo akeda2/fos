@@ -223,6 +223,15 @@ and a returning stick takes over its old disk (`make test-usb-replug`); audio ta
 frame, and the link is not up yet at init); no OHCI/UHCI driver (USB keyboards there rely on BIOS legacy emulation);
 the xHCI storage path has no replug recovery.
 
+Replug on real hardware (the same board, 2026-10-08): a USB 3.0 stick (Kingston DataTraveler 3.0) on an nForce EHCI port drops
+off the bus and comes back during its first reset after a hot plug (`PORTSC` went 0x1005 -> 0x1002 while the first descriptor
+read failed with a transaction error), although it enumerates fine at boot, where the BIOS has already settled it. The port
+register read steadily 0x1803 (connected, not enabled, J state) when idle, so it was not bouncing at rest. Fix: wait for the
+connection to be stable for 100 ms before every reset, 60 ms reset recovery, retry the first descriptor read three times 50 ms
+apart, and up to five whole-port attempts that wait for the reconnection between them (`ehci::wait_port_stable`). Result on the
+board: attempt 1 still fails, attempt 2 succeeds, "is back; disk1 works again". `usb` no longer labels a claimed disk port
+"keyboard".
+
 ## 5. Migration, in order
 
 | # | Step | Done when |

@@ -1437,7 +1437,7 @@ fn execute(command: &str) {
             let sub = words.next();
             if sub == Some("rescan") {
                 let added = crate::usb_hid::probe_all();
-                crate::println!("{added} new keyboard(s).");
+                crate::println!("{added} new device(s) (keyboards or disks).");
             } else if sub == Some("try") {
                 match words.next().and_then(|word| word.parse::<u8>().ok()) {
                     Some(port) => crate::usb_hid::try_port(port, words.next()),

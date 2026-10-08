@@ -323,13 +323,17 @@ fn probe_all_ehci() -> usize {
             let mut attempt = 1;
             let count = loop {
                 match controller.enumerate_port(port, &mut found) {
-                    Err(error @ (ehci::Error::Timeout | ehci::Error::Transfer(_))) if attempt < 3 => {
+                    // NoDevice mid-way is a bounce, not necessarily a removal: wait for the connection again (below) and retry.
+                    Err(error @ (ehci::Error::Timeout | ehci::Error::Transfer(_) | ehci::Error::NoDevice)) if attempt < 5 => {
                         crate::println!(
-                            "USB: EHCI {:02x}:{:02x}.{} port {port}, attempt {attempt}/3 failed at \"{}\": {error:?} (PORTSC {:#x}, USBSTS {:#x}).",
+                            "USB: EHCI {:02x}:{:02x}.{} port {port}, attempt {attempt}/5 failed at \"{}\": {error:?} (PORTSC {:#x}, USBSTS {:#x}).",
                             controller.pci.bus, controller.pci.device, controller.pci.function, controller.step, controller.port_status(port), controller.usbsts()
                         );
                         attempt += 1;
                         crate::apic::wait_ticks(15);
+                        if !controller.wait_port_stable(port, 100, 1500) {
+                            break Err(ehci::Error::NoDevice); // it really is gone
+                        }
                     }
                     other => break other,
                 }
@@ -420,7 +424,7 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
         print(format_args!("EHCI {:02x}:{:02x}.{}: {} ports", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports));
         for port in 1..=controller.ports {
             if controller.port_has_device(port) {
-                print(format_args!("  port {port}: device connected{}", if controller.claimed_ports & (1 << port) != 0 { ", keyboard" } else { "" }));
+                print(format_args!("  port {port}: device connected{}", if controller.claimed_ports & (1 << port) != 0 { ", in use (a keyboard or a disk)" } else { "" }));
             }
         }
     }
