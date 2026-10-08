@@ -618,6 +618,13 @@ impl Controller {
         self.slots[1..].iter().any(|slot| slot.used && slot.port == port)
     }
 
+    /// The root port and route string of a slot that is in use (`None` if the slot is free): lets a driver find the devices
+    /// it keeps of its own (the HID keyboards) that sit on a port about to be released.
+    pub fn slot_location(&self, slot: u8) -> Option<(u8, u32)> {
+        let entry = self.slots.get(usize::from(slot))?;
+        entry.used.then_some((entry.port, entry.route))
+    }
+
     fn ring_doorbell(&self, slot: u8, target: u32) {
         write32(self.doorbells + usize::from(slot) * 4, target);
     }

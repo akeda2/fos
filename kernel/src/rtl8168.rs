@@ -104,6 +104,10 @@ fn isr(index: usize) {
     }
 }
 
+/// Deferred interrupt setup: ticks (100 Hz) between attempts, and how many attempts in all.
+const RETRY_TICKS: u64 = 300;
+const RETRY_LIMIT: u8 = 3;
+
 const TXCONFIG_VALUE: u32 = (3 << 24) | (7 << 8) | (1 << 7); // standard IFG, max DMA burst
 const RX_ACCEPT_ALL_PHYS: u32 = 0x01;
 const RX_ACCEPT_MY_PHYS: u32 = 0x02;
@@ -199,6 +203,11 @@ pub struct Rtl8168 {
     pub frames_dropped_no_link: u64,
     pub recoveries: u32,
     recovery_pending: bool,
+    /// Set when `enable_interrupts` found no link, so its self-test (which needs a frame to go out) could not run: the
+    /// PCI device to try again with once the link is up, and the tick before which not to try (`retry_interrupts`).
+    retry: Option<pci::Device>,
+    retry_after: u64,
+    retry_attempts: u8,
     /// The chip version bits of `TxConfig` (0x4c0 and up: RTL8168G or later).
     pub version: u16,
 }
@@ -260,6 +269,9 @@ impl Rtl8168 {
             frames_dropped_no_link: 0,
             recoveries: 0,
             recovery_pending: false,
+            retry: None,
+            retry_after: 0,
+            retry_attempts: 0,
             version,
         })
     }
@@ -297,6 +309,14 @@ impl Rtl8168 {
     /// is not read). A path is kept only if its self-test interrupt arrives; otherwise the NIC
     /// stays polled and says why. Needs interrupts enabled and the local APIC running.
     pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
+        // The RTL8168G/H ignore the forced software interrupt, so the self-test needs a frame to go out, and `send` drops
+        // frames while there is no link: with no cable at boot the test could only fail. Stay polled and try again from
+        // `receive` when the link comes up, instead of giving up for the whole session.
+        if !self.link_up() {
+            self.retry = Some(*device);
+            self.retry_after = apic::ticks() + RETRY_TICKS;
+            return Err("no link yet, so the self-test cannot send a frame; it is retried when the link comes up");
+        }
         let mut reason = "no interrupt path passed its self-test";
         if device.find_capability(0x05).is_some() {
             match crate::msi::allocate(isr, self.index) {
@@ -336,6 +356,33 @@ impl Rtl8168 {
             reason = "no I/O APIC pin delivered the self-test interrupt";
         }
         Err(reason)
+    }
+
+    /// The deferred half of `enable_interrupts`: called from `receive`, it waits for the link, then runs the self-test once
+    /// (at most `RETRY_LIMIT` times, `RETRY_TICKS` apart, so a path that really does not work costs three short stalls).
+    fn retry_interrupts(&mut self) {
+        let Some(device) = self.retry else { return };
+        if self.interrupts_enabled || apic::ticks() < self.retry_after || !self.link_up() {
+            return;
+        }
+        // The self-test waits for timer ticks: never run it with interrupts off.
+        let was_enabled = cpu::interrupts_save_and_disable();
+        cpu::interrupts_restore(was_enabled);
+        if !was_enabled {
+            return;
+        }
+        self.retry = None;
+        self.retry_attempts += 1;
+        match self.enable_interrupts(&device) {
+            Ok(delivery) => crate::println!("rtl8168 {}: link is up; interrupts: {delivery:?} (the self-test interrupt arrived).", self.index + 1),
+            Err(reason) => {
+                crate::println!("rtl8168 {}: link is up, interrupts stay polled ({reason}).", self.index + 1);
+                if self.retry_attempts < RETRY_LIMIT && !self.interrupts_enabled {
+                    self.retry = Some(device);
+                    self.retry_after = apic::ticks() + RETRY_TICKS;
+                }
+            }
+        }
     }
 
     /// The `nic` command's driver-specific line.
@@ -467,6 +514,9 @@ impl Rtl8168 {
 
     /// Copies the next received frame (without the FCS) into `out`; `None` if the ring is empty.
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
+        if self.retry.is_some() {
+            self.retry_interrupts();
+        }
         // With interrupts the handler records a system error; polled, look at the status register.
         let fatal = FATAL[self.index].swap(false, Ordering::AcqRel)
             || (!self.interrupts_enabled && read16(self.io_base, REG_ISR) & ISR_SYSERR != 0);

@@ -45,6 +45,32 @@ pub fn reports_seen() -> u64 {
     unsafe { (*core::ptr::addr_of!(KEYBOARDS)).iter().flatten().map(|keyboard| keyboard.reports).sum() }
 }
 
+/// Releases the controller slots of whatever is on `port` (only the device at `route` below it if given) and forgets the
+/// keyboards that were in them. Without this a replugged keyboard left its old entry behind: the table filled up after
+/// four replugs, `usb` counted ghosts, and the slot number the new device was given matched the old entry's event
+/// lookup, so its reports were read from the freed report buffer.
+pub fn release_port(controller: &mut Controller, port: u8, route: Option<u32>) {
+    let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    let identity = (controller.pci.bus, controller.pci.device, controller.pci.function);
+    let mut buffers = [0u64; MAX_KEYBOARDS];
+    for (entry, buffer) in keyboards.iter_mut().zip(buffers.iter_mut()) {
+        let Some(Keyboard { source: Source::Xhci { bus, device, function, slot, buffer: report, .. }, .. }) = *entry else { continue };
+        let there = controller.slot_location(slot).is_some_and(|(p, r)| p == port && route.is_none_or(|wanted| wanted == r));
+        if (bus, device, function) == identity && there {
+            *entry = None;
+            *buffer = report;
+        }
+    }
+    // The slots go first: the controller must stop writing reports before their buffer is handed back.
+    match route {
+        Some(route) => controller.release_route_slots(port, route),
+        None => controller.release_port_slots(port),
+    }
+    for buffer in buffers.into_iter().filter(|&buffer| buffer != 0) {
+        memory::free(buffer, 1);
+    }
+}
+
 /// Looks at every connected root port that is not already in use and starts any boot
 /// keyboard found. Returns how many keyboards were added.
 pub fn probe_all() -> usize {
@@ -60,7 +86,7 @@ pub fn probe_all() -> usize {
                     continue;
                 }
                 usb_storage::mark_xhci_port_stale(index, port); // before the slots go: nothing may use them again
-                controller.release_port_slots(port);
+                release_port(controller, port, None);
                 crate::println!("USB: xHCI {:02x}:{:02x}.{} port {port}: its device was unplugged or replugged; looking at the port again.",
                     controller.pci.bus, controller.pci.device, controller.pci.function);
             }
@@ -83,7 +109,7 @@ pub fn probe_all() -> usize {
                             controller.pci.bus, controller.pci.device, controller.pci.function,
                             unsafe { STEP }, controller.port_status(port), controller.usbsts()
                         );
-                        controller.release_port_slots(port);
+                        release_port(controller, port, None);
                         crate::apic::wait_ticks(15);
                     }
                 }
@@ -109,14 +135,14 @@ pub fn try_port(port: u8, how: Option<&str>) {
         }
         _ => {}
     }
-    controller.release_port_slots(port);
+    release_port(controller, port, None);
     unsafe { STEP = "open the port (reset, enable slot, address device)" };
     match probe_port(0, controller, port) {
         Ok(true) => crate::println!("port {port}: enumerated, a device was added."),
         Ok(false) => crate::println!("port {port}: enumerated, nothing to use on it."),
         Err(error) => {
             crate::println!("port {port}: failed at \"{}\": {error:?}.", unsafe { STEP });
-            controller.release_port_slots(port);
+            release_port(controller, port, None);
         }
     }
     crate::println!("port {port}: PORTSC {:#010x} after, USBSTS {:#x}.", controller.port_status(port), controller.usbsts());
@@ -325,6 +351,7 @@ fn probe_all_ehci() -> usize {
                 // returned). Forget the claim and look at the port afresh; a disk that comes back is recognised in
                 // usb_storage::register and takes over its old disk number.
                 controller.claimed_ports &= !(1 << port);
+                forget_ehci_keyboards(index, controller, port);
                 crate::println!("USB: EHCI {:02x}:{:02x}.{} port {port}: its device was unplugged or replugged; looking at the port again.",
                     controller.pci.bus, controller.pci.device, controller.pci.function);
             }
@@ -365,7 +392,7 @@ fn probe_all_ehci() -> usize {
                 }
             };
             for device in found[..count].iter().flatten() {
-                match setup_ehci_keyboard(index, controller, device, if device.target.hub_address == 0 { port } else { 0 }) {
+                match setup_ehci_keyboard(index, controller, device, if device.target.hub_address == 0 { port } else { 0 }, port) {
                     Ok(true) => {
                         controller.claimed_ports |= 1 << port;
                         added += 1;
@@ -379,7 +406,19 @@ fn probe_all_ehci() -> usize {
     added
 }
 
-fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controller, found: &ehci::Found, root_port: u8) -> Result<bool, ehci::Error> {
+/// Forgets the keyboards of an EHCI root port whose device went away: their queue heads leave the async list and their
+/// table entries are freed (a stale entry kept being polled, and the table filled up after four replugs).
+fn forget_ehci_keyboards(controller_index: usize, controller: &mut ehci::Controller, port: u8) {
+    let removed = controller.remove_keyboards_on_port(port);
+    let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    for entry in keyboards.iter_mut() {
+        if matches!(*entry, Some(Keyboard { source: Source::Ehci { controller: c, index }, .. }) if c == controller_index && removed & (1 << index) != 0) {
+            *entry = None;
+        }
+    }
+}
+
+fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controller, found: &ehci::Found, root_port: u8, claimed_port: u8) -> Result<bool, ehci::Error> {
     let target = found.target;
     let (vendor, product) = (u16::from_le_bytes([found.descriptor[8], found.descriptor[9]]), u16::from_le_bytes([found.descriptor[10], found.descriptor[11]]));
     let mut configuration = [0u8; 256];
@@ -399,7 +438,7 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
     controller.set_configuration(&target, configuration[5])?;
     controller.control_transfer(&target, 0x21, 0x0b, 0, u16::from(interface), &mut [])?; // SET_PROTOCOL(boot)
     let _ = controller.control_transfer(&target, 0x21, 0x0a, 0, u16::from(interface), &mut []); // SET_IDLE(0)
-    let index = controller.add_keyboard(target, endpoint, max_packet)?;
+    let index = controller.add_keyboard(target, endpoint, max_packet, claimed_port)?;
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
     let Some(slot) = keyboards.iter_mut().find(|entry| entry.is_none()) else { return Ok(false) };
     *slot = Some(Keyboard { source: Source::Ehci { controller: controller_index, index }, previous: [0; 8], caps: false, reports: 0 });
