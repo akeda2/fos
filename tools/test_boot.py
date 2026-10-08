@@ -15,7 +15,7 @@ sends `shutdown` over the wire.
 OVMF mirrors the firmware console to the serial port, so loader and kernel
 narration arrive on the same `-serial` stream (escape sequences stripped before
 matching). Firmware images come from the usual places or FOS_OVMF_CODE /
-FOS_OVMF_VARS. Run with `make test-v2`."""
+FOS_OVMF_VARS. Run with `make test`."""
 
 import os
 import re
@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-IMAGE = Path(os.environ.get("FOS_V2_IMAGE", ROOT / "build" / "v2" / "v2.img"))
+IMAGE = Path(os.environ.get("FOSFOR_IMAGE", ROOT / "build" / "fosfor" / "fosfor.img"))
 CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd",
                    "/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd"]
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
@@ -41,7 +41,7 @@ FINAL_MARKER = "M3 complete"
 # different there, everything the kernel and the shell do must be the same.
 BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
 # What each boot path prints once per boot, for the tests that count boots.
-LOADER_BANNER = "Fosfor stage 2 (BIOS path)" if BIOS else "FOS v2 loader (milestone M1)"
+LOADER_BANNER = "Fosfor stage 2 (BIOS path)" if BIOS else "Fosfor OS loader (milestone M1)"
 MCAST_GROUP, MCAST_PORT = "230.42.42.44", 4244
 HOST_MAC = bytes.fromhex("02deadbeef03")
 BROADCAST = b"\xff" * 6
@@ -168,7 +168,7 @@ def read_ppm(path: Path):
 
 def main():
     if not IMAGE.exists():
-        raise SystemExit(f"{IMAGE} missing; run `make v2-image` first")
+        raise SystemExit(f"{IMAGE} missing; run `make image` first")
     code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
     with tempfile.TemporaryDirectory() as tmp:
         vars_copy = Path(tmp) / "vars.fd"
@@ -249,7 +249,7 @@ def main():
         kernel = re.search(r"BootInfo: version 5, kernel at (0x[0-9a-f]+)", text)
         check(kernel is not None, "places the kernel ELF at its base address", text)
     else:
-        check("FOS v2 loader (milestone M1): UEFI application running." in text, "OVMF boots BOOTX64.EFI from the ESP", text)
+        check("Fosfor OS loader (milestone M1): UEFI application running." in text, "OVMF boots BOOTX64.EFI from the ESP", text)
         check(re.search(r"UEFI specification \d+\.\d+", text) is not None, "the loader reports the UEFI version", text)
         entries = re.search(r"Memory map: (\d+) entries", text)
         check(entries is not None and int(entries.group(1)) > 10, "it reads the memory map", text)
@@ -265,7 +265,7 @@ def main():
 
 
     # --- the kernel (M1) ---
-    check("FOS v2 kernel (milestone M4): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
+    check("Fosfor OS kernel (milestone M4): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
     check(re.search(r"BootInfo: version 5, kernel at " + kernel.group(1), text) is not None, "BootInfo arrives intact and names the same load address", text)
     managed = re.search(r"Physical memory: (\d+) MiB managed, (\d+) MiB free", text)
     check(managed is not None and 400 < int(managed.group(1)) <= 512 and int(managed.group(2)) > 300, f"the physical allocator manages the machine's RAM ({managed and managed.groups()} MiB)", text)
@@ -299,7 +299,7 @@ def main():
     check(re.search(r"FOSFS: mounted on disk1 \(\d+ MiB, \d+ file\(s\)\)", text) is not None, "the FOSFS data partition on the boot disk is mounted", text)
     check("boot disk: disk1" in transcript["disks"], "`disks` shows the boot disk", transcript["disks"])
     check("readme.txt" in transcript["ls"], "`ls` lists the preloaded file", transcript["ls"])
-    check("Welcome to FOSFS on fos v2" in transcript["cat readme.txt"], "`cat` reads it from the disk through the AHCI driver", transcript["cat readme.txt"])
+    check("Welcome to FOSFS on Fosfor OS" in transcript["cat readme.txt"], "`cat` reads it from the disk through the AHCI driver", transcript["cat readme.txt"])
     check("Wrote 21 bytes to hello.txt" in transcript["write hello.txt written over the wire"] and "written over the wire" in transcript["cat hello.txt"], "`write` stores a file and `cat` reads it back (DMA write + flush)", transcript["cat hello.txt"])
     check("hello.txt" in transcript["ls#2"], "the new file shows in the directory", transcript["ls#2"])
     check("no such file" in transcript["cat hello.txt#2"], "`rm` removes it again", transcript["cat hello.txt#2"])
@@ -314,7 +314,7 @@ def main():
     check(pixel(width - 10, height // 2) == (0, 0, 0x20), f"the background fill is the console colour {pixel(width - 10, height // 2)}", text)
     lit = sum(1 for y in range(0, 16 * 12) for x in range(0, 8 * 60) if pixel(x, y) == (0xc0, 0xc0, 0xc0))
     check(lit > 400, f"text is drawn on screen ({lit} foreground pixels in the first rows)", text)
-    print("v2 boot via BIOS: all checks passed" if BIOS else "v2 boot (M0-M3): all checks passed")
+    print("boot via BIOS: all checks passed" if BIOS else "boot (M0-M3): all checks passed")
 
 
 if __name__ == "__main__":

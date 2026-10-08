@@ -30,8 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_boot import (BROADCAST, CODE_CANDIDATES, ROOT, TAG_DATA, TAG_DISCOVER_REPLY, TAG_DISCOVER_REQUEST, TAG_HELLO,  # noqa: E402
                        VARS_CANDIDATES, Wire, check, clean, find, MCAST_GROUP, MCAST_PORT)
 
-LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 TARGET_DIR = ROOT / "build/cargo-target"
 KUP_REQUEST, KUP_DATA, KUP_STOP, KUP_ACK, KUP_ERROR = 0x3a, 0x3b, 0x3c, 0x3d, 0x3e
 
@@ -250,7 +250,7 @@ def main():
             check(machine.push(good_kernel) is None, "without `kernel-update` the KUP frames are not even answered", "")
         finally:
             machine.stop()
-    print("v2 debug mode: all checks passed")
+    print("debug mode: all checks passed")
 
 
 if __name__ == "__main__":

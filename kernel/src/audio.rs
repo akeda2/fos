@@ -15,7 +15,7 @@
 
 use crate::{hda, usb_audio as usb};
 pub use crate::usb_audio::PcmRing;
-use fos_v2_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO_KIND_USB, AUDIO_NO_DEVICE};
+use fosfor_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO_KIND_USB, AUDIO_NO_DEVICE};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -265,7 +265,7 @@ pub fn buffer_info() -> (u64, u64) {
 
 /// The tape ABI's `AUDIO_*` code for a failed start (0 for success).
 fn code(result: Result<(), &'static str>) -> i32 {
-    use fos_v2_abi::tape::*;
+    use fosfor_abi::tape::*;
     match result {
         Ok(()) => 0,
         Err("no USB audio device") | Err("no HD Audio device") | Err("no audio device") => AUDIO_NO_DEVICE,

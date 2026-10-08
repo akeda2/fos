@@ -89,9 +89,9 @@ def main():
             check(f"USB storage" in text and f"disk1" in text, f"{label}: the USB stick is found and registered as a disk", text)
         check("Boot disk: disk1" in text, f"{label}: boot-disk discovery finds the disk by the loader's partition GUID", text)
         check("FOSFS: mounted on disk1" in text, f"{label}: FOSFS mounts from the disk", text)
-        check("Welcome to FOSFS on fos v2" in outputs["cat readme.txt"], f"{label}: a file reads back", outputs["cat readme.txt"])
+        check("Welcome to FOSFS on Fosfor OS" in outputs["cat readme.txt"], f"{label}: a file reads back", outputs["cat readme.txt"])
         check("written to a usb stick" in outputs["cat usb.txt"], f"{label}: a written file reads back (write, flush, read)", outputs["cat usb.txt"])
-    print("v2 usb boot: all checks passed")
+    print("usb boot: all checks passed")
 
 
 if __name__ == "__main__":

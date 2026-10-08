@@ -24,8 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_image  # noqa: E402
 from test_boot import CODE_CANDIDATES, IMAGE, ROOT, VARS_CANDIDATES, check, clean, find  # noqa: E402
 
-LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 SECTOR = 512
 
 
@@ -90,7 +90,7 @@ def default_image_checks():
     printed = subprocess.run(["make", "-s", "print-image"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     check(Path(printed) == build_image.DEFAULT_IMAGE, f"the default image path equals the Makefile's IMAGE ({printed})", str(build_image.DEFAULT_IMAGE))
     # From another directory, with a device that is not a whole disk: the complaint must be about the device, not about a
-    # missing image (the old default, "build/v2/v2.img", only resolved from the repository root).
+    # missing image (the old default, "build/fosfor/fosfor.img", only resolved from the repository root).
     result = subprocess.run([sys.executable, str(ROOT / "tools" / "write_stick.py"), "/dev/null"], cwd="/", capture_output=True, text=True)
     check("not a whole-disk block device" in result.stderr and "does not exist" not in result.stderr,
           "write_stick.py finds its default image when run from another directory", result.stderr)
@@ -131,7 +131,7 @@ def main():
         text = boot(images, 1)  # b is booted but found second by the drivers
         check("renumbering it to disk1" in text, "the booted stick, found second, is renumbered to disk1", text[-1500:])
         check("FOSFS: mounted on disk1 (32 MiB, 3 file(s))" in text, "and it is the right stick (b: three files), not the first one found", text[-1500:])
-    print("v2 stick guids: all checks passed")
+    print("stick guids: all checks passed")
 
 
 if __name__ == "__main__":

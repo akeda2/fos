@@ -8,7 +8,7 @@
    counting zero crossings) at about the right length, with no underruns reported.
 
 QEMU's `usb-audio` is output-only and class 1.0, so capture (isochronous IN) and Audio Class 2.0 /
-high speed (what a Zoom H6 in multichannel mode presents) are checked on real hardware only. Run with `make test-v2-usb-audio`."""
+high speed (what a Zoom H6 in multichannel mode presents) are checked on real hardware only. Run with `make test-usb-audio`."""
 
 import re
 import struct
@@ -64,7 +64,7 @@ def main():
         else:
             check(False, "QEMU's WAV backend recorded the stream", "no wav file")
     play_tapes_test()
-    print("v2 usb audio: all checks passed")
+    print("usb audio: all checks passed")
 
 
 def write_wav(path, rate, channels, width_bytes, frequency, seconds):
@@ -100,8 +100,8 @@ def segments(samples, rate):
 def play_tapes_test():
     import subprocess
     from test_boot import IMAGE, ROOT
-    loader = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-    kernel = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+    loader = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+    kernel = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
     tapes = ROOT / "build/cargo-target/x86_64-fos-tape/release"
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)

@@ -12,7 +12,7 @@
 //! code/data stays reserved (it holds the kernel image, `BootInfo` and the memory
 //! map), as do the runtime-services regions, ACPI tables, MMIO and everything else.
 
-use fos_v2_abi::BootInfo;
+use fosfor_abi::BootInfo;
 
 pub const FRAME: u64 = 4096;
 

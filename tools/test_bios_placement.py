@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-IMAGE = ROOT / "build" / "v2" / "v2.img"
+IMAGE = ROOT / "build" / "fosfor" / "fosfor.img"
 FAILURES = []
 
 
@@ -51,7 +51,7 @@ def main():
     if not IMAGE.exists():
         sys.exit(f"{IMAGE} is missing; run `make image` first")
     for memory in (512, 40):
-        text = boot(memory, "FOS v2 kernel: M3 complete")
+        text = boot(memory, "Fosfor OS kernel: M3 complete")
         found = re.search(r"kernel image at 0x([0-9A-F]{8}), read buffer at 0x([0-9A-F]{8})", text)
         check(found is not None and int(found.group(1), 16) % 0x200000 == 0 and int(found.group(1), 16) >= 0x100000
               and int(found.group(2), 16) == int(found.group(1), 16) + 0x800000,

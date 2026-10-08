@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The diagnostic shell commands: `cpuinfo`, `bootinfo`, `memmap`, `irqstat`, `pci read|write`,
 `io` and `mmio`, against QEMU's q35 (whose host bridge, LAPIC and 8042 have known values).
-Run with `make test-v2-diag`."""
+Run with `make test-diag`."""
 
 import sys
 import tempfile
@@ -42,7 +42,7 @@ def main():
             check("hexdump" in run("help") and "cpuinfo" in run("help"), "help lists the new commands", "")
         finally:
             machine.stop()
-    print("v2 diag: all checks passed")
+    print("diag: all checks passed")
 
 
 if __name__ == "__main__":

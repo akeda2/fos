@@ -187,7 +187,7 @@ def main():
                 process.kill()
             a.sock and a.sock.close()
             b.sock and b.sock.close()
-    print("v2 nettest: all checks passed")
+    print("nettest: all checks passed")
 
 
 if __name__ == "__main__":

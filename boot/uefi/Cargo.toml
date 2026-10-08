@@ -1,5 +1,5 @@
 [package]
-name = "fos-loader"
+name = "fosfor-loader"
 version = "0.1.0"
 edition = "2024"
 
@@ -16,4 +16,4 @@ opt-level = "z"
 strip = "symbols"
 
 [dependencies]
-fos-v2-abi = { path = "../../abi" }
+fosfor-abi = { path = "../../abi" }

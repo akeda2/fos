@@ -1579,12 +1579,12 @@ pub fn status(index: usize) {
     }
 }
 
-pub fn fill_info(index: usize, info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
+pub fn fill_info(index: usize, info: &mut fosfor_abi::tape::AudioInfo) -> bool {
     if !present(index) {
         return false;
     }
     let hda = controller(index);
-    let mut out = fos_v2_abi::tape::AudioInfo::default();
+    let mut out = fosfor_abi::tape::AudioInfo::default();
     out.class_version = 0; // not USB: there is no audio class
     if let Some((channels, bits)) = hda.mode(false) {
         out.playback_channels = u32::from(channels);
@@ -1617,9 +1617,9 @@ pub fn fill_info(index: usize, info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
     true
 }
 
-pub fn fill_stats(index: usize, stats: &mut fos_v2_abi::tape::AudioStats) {
+pub fn fill_stats(index: usize, stats: &mut fosfor_abi::tape::AudioStats) {
     let hda = controller(index);
-    let mut out = fos_v2_abi::tape::AudioStats::default();
+    let mut out = fosfor_abi::tape::AudioStats::default();
     if hda.capture.active.load(Ordering::Acquire) {
         out.capture_packets = hda.capture.periods.load(Ordering::Relaxed);
         out.capture_bytes = hda.capture.bytes.load(Ordering::Relaxed);

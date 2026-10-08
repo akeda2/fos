@@ -11,7 +11,7 @@ arrive through USB:
 
 (QEMU numbers its USB 2 ports after the four USB 3 ones, so `port=1` shows up as root port 5.)
 QEMU emulates the hub's ports but not a real transaction translator, so split-transaction
-timing stays a real-hardware matter. Run with `make test-v2-hub`."""
+timing stays a real-hardware matter. Run with `make test-hub`."""
 
 import re
 import sys
@@ -44,7 +44,7 @@ def main():
         "-device", "usb-kbd,bus=xhci.0,port=1.1.4"])
     check(re.search(r"USB keyboard .* on port \d+\.1\.4 of xHCI", text), "a keyboard behind two hubs is found (path root.1.4)", text)
     check("Unknown command: xz" in text, "and typing on it reaches the shell", text)
-    print("v2 usb hub: all checks passed")
+    print("usb hub: all checks passed")
 
 
 if __name__ == "__main__":

@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_boot import (BROADCAST, CODE_CANDIDATES, IMAGE, ROOT, TAG_DATA, TAG_DISCOVER_REPLY, TAG_DISCOVER_REQUEST,  # noqa: E402
                        TAG_HELLO, VARS_CANDIDATES, Wire, check, clean, find, MCAST_GROUP, MCAST_PORT)
 
-LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 
 
 def main():
@@ -133,7 +133,7 @@ def main():
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-    print("v2 disks: all checks passed")
+    print("disks: all checks passed")
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ TAPE = ROOT / "build" / "tapes" / "ip-chat.bin"
 # FOS_V2=1 runs this test against the v2 kernel (see tapes/test_router_e2e.py).
 V2 = os.environ.get("FOS_V2") == "1"
 if V2:
-    IMAGE = ROOT / "build" / "v2" / "v2.img"
+    IMAGE = ROOT / "build" / "fosfor" / "fosfor.img"
     TAPE = ROOT / "build" / "cargo-target" / "x86_64-fos-tape" / "release" / "ip-chat"
 WAIT_MARKER = b"M3 complete" if V2 else b"Waiting for a remote terminal client to connect"
 CHAT_ETHERTYPE = bytes((0x88, 0xB6))

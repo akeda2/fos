@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """`format diskN exfat [LABEL]` (v2): a blank disk becomes one GPT partition of exFAT that `fsck.exfat` accepts, the
 shell can use, and a second format over it announces what it will erase. The boot disk is refused.
-Run with `make test-v2-format-exfat`."""
+Run with `make test-format-exfat`."""
 
 import struct
 import subprocess
@@ -59,7 +59,7 @@ def main():
         check(result.returncode == 0, "fsck.exfat finds the volume clean", result.stdout + result.stderr)
         dump = subprocess.run(["dump.exfat", str(volume)], capture_output=True, text=True).stdout
         check("4096" in dump or "cluster" in dump.lower(), "dump.exfat reads its boot sector", dump[:300])
-    print("v2 format exfat: all checks passed")
+    print("format exfat: all checks passed")
 
 
 if __name__ == "__main__":

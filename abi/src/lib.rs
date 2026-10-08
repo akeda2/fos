@@ -1,4 +1,4 @@
-//! The loader/kernel contract of fos v2 (see `docs/v2-design.md`, sections 4-5).
+//! The loader/kernel contract of fos v2 (see `docs/design.md`, sections 4-5).
 //!
 //! Two things live here because both sides must agree on them byte for byte:
 //! [`BootInfo`], the structure the loader passes to the kernel by pointer, and the
@@ -80,7 +80,7 @@ pub struct BootInfo {
     /// The payload partition the loader read the kernel from: its unique GPT GUID
     /// (on-disk byte order) and position. After `ExitBootServices` the kernel has no
     /// firmware to ask which disk that was, so it scans its own drivers' disks for
-    /// the partition with this GUID, start and length (docs/v2-design.md, section 8).
+    /// the partition with this GUID, start and length (docs/design.md, section 8).
     pub payload_guid: [u8; 16],
     pub payload_start: u64,
     pub payload_sectors: u64,
@@ -145,7 +145,7 @@ pub const fn guid_bytes(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
 /// `+7 attempted`, `+8 confirmed`, `+9 crash count`, `+10/+12 slot sizes in sectors
 /// (u16 LE)`, `+14 running`, `+15 unclean boots`, `+16 flags` (see `FLAG_SKIP_VIDEO`).
 ///
-/// Meaning of the last three (see docs/v2-design.md, M6): `running` is 1 while a boot
+/// Meaning of the last three (see docs/design.md, M6): `running` is 1 while a boot
 /// has not yet reached the kernel's milestone, 2 once it has, 0 after a clean stop
 /// (shutdown, reset, reboot, a kernel update restart). The loader, seeing 1 at the next
 /// boot, knows the previous boot crashed or hung *before* the milestone and bumps

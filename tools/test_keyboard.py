@@ -14,7 +14,7 @@
    must still boot to its network shell, reporting the missing controller and
    carrying on. A keyboard is never a boot dependency.
 
-Run with `make test-v2-keyboard`."""
+Run with `make test-keyboard`."""
 
 import os
 import select
@@ -125,7 +125,7 @@ def main():
     text = boot("q35,i8042=off", lambda send, wait_for: None)
     check("no 8042 controller" in text, "with no PS/2 controller the kernel reports it", text)
     check("M3 complete" in text, "and still boots to its shell", text)
-    print("v2 keyboard: all checks passed")
+    print("keyboard: all checks passed")
 
 
 if __name__ == "__main__":

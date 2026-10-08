@@ -10,7 +10,7 @@
 //!
 //! Nothing here can stop the boot: every failure is reported and the port skipped.
 
-use fos_v2_abi::keymap::hid_ascii;
+use fosfor_abi::keymap::hid_ascii;
 
 use crate::xhci::{self, Controller, Trb};
 use crate::{ehci, usb_storage};

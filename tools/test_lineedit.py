@@ -83,7 +83,7 @@ def main():
             check(guest.text().count("fos> ") > before, "history keeps working after many commands", guest.text()[-300:])
         finally:
             guest.stop()
-    print("v2 lineedit: all checks passed")
+    print("lineedit: all checks passed")
 
 
 if __name__ == "__main__":

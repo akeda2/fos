@@ -84,7 +84,7 @@ def main():
         finally:
             for guest in (a, b, c):
                 guest.stop()
-    print("v2 nic tools: all checks passed")
+    print("nic tools: all checks passed")
 
 
 if __name__ == "__main__":

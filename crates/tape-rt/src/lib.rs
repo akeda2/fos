@@ -9,7 +9,7 @@
 
 pub mod abort;
 
-pub use fos_v2_abi::tape::*;
+pub use fosfor_abi::tape::*;
 
 use core::fmt::Write;
 
@@ -196,7 +196,7 @@ pub mod compat {
     use super::api;
     // (A pattern `FS_NOT_FOUND =>` with the constant not in scope is a catch-all binding: every
     // error used to be reported as "not found".)
-    use fos_v2_abi::tape::FS_NOT_FOUND;
+    use fosfor_abi::tape::FS_NOT_FOUND;
 
     pub fn should_abort() -> u32 {
         (api().should_abort)()

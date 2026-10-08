@@ -231,7 +231,7 @@ firmware, so a pending slot is tried on the next boot.
   blank disk gets a fresh GPT (random GUIDs, both copies, CRCs) with one FOSFS partition covering
   it; any other disk (an MBR, a file system, a GPT with only foreign partitions) needs `force`
   because its partition table is replaced. The data area is not wiped, only the superblock and
-  directory. Test: `make test-v2-format`.
+  directory. Test: `make test-format`.
 * **`install diskN [LABEL] [bare] [force]`** (DOS's `sys`, plus the files) makes another disk bootable from the running
   system: a new GPT with fresh GUIDs (so boot-disk discovery can tell the copy from the original), the boot disk's ESP
   copied sector for sector (the firmware boots it through the removable-media fallback path, so no NVRAM entry is
@@ -239,7 +239,7 @@ firmware, so a pending slot is tried on the next boot.
   filling the rest of the disk holding every file of the boot volume (`bare` skips the files; a label is optional and
   not copied, since a label may be on one volume only). Same discipline as `format`: announce, then
   `install diskN confirm` as the very next command; never the boot disk; a disk that is neither blank nor an earlier
-  fos disk needs `force`. Code: `kernel/src/install.rs`, `gpt::write_table`. Test: `make test-v2-install` (installs
+  fos disk needs `force`. Code: `kernel/src/install.rs`, `gpt::write_table`. Test: `make test-install` (installs
   onto a blank disk, checks the GPT with `sgdisk`, boots the copy alone). Not tested on hardware yet (the Skylake's
   SATA SSD is the intended first target).
 * **`ed`, `copy` and the diagnostic commands (ported from v1).** `ed` (`run ed NAME`, also
@@ -251,7 +251,7 @@ firmware, so a pending slot is tried on the next boot.
   `@LABEL/NAME` references. `copy SRC NAME DST [NEWNAME]` moves a file between volumes through a
   page-allocator buffer (no 64 KiB limit). `cpuinfo`, `bootinfo`, `memmap`, `irqstat` (the I/O APIC
   pins), `pci read|write B:D.F`, `io r8|w8..` and `mmio r32|w32..` (mapped addresses only, never the
-  kernel image) and `clear` report or poke the machine from the shell. Tests: `make test-v2-ed`,
+  kernel image) and `clear` report or poke the machine from the shell. Tests: `make test-ed`,
   `test-v2-disks`, `test-v2-diag`.
 * **RTL8168/RTL8111 NICs** (`rtl8168.rs`, PCI 10ec:8168 and 10ec:8161, ported from v1) are driven
   polled, through the I/O-port BAR: 64 receive and 32 transmit descriptors, the 8168G-and-later
@@ -275,7 +275,7 @@ firmware, so a pending slot is tried on the next boot.
   (capture) a packet slot through a 1 MiB PCM ring; the events come in through the normal xHCI event draining
   (a 1024-entry event ring: a high-speed endpoint completes 8,000 transfers/s). Shell commands: `audio`
   (status), `audio start|stop`, `audio capture SECONDS [RATE]` (per-second frame counts and per-channel
-  peaks), `audio tone [HZ] [SECONDS] [RATE]`. `make test-v2-usb-audio` plays a tone through QEMU's class 1.0
+  peaks), `audio tone [HZ] [SECONDS] [RATE]`. `make test-usb-audio` plays a tone through QEMU's class 1.0
   `usb-audio` and checks the WAV it records (439 Hz for 440). Confirmed on a Zoom H6 in multichannel mode on
   the Skylake (class 2.0, high speed, rates 44.1/48/88.2/96 kHz): capture of 6 channels 24-bit at 48 kHz gave
   47,984-48,016 frames/s with no errors, playback of 2 channels 24-bit streamed 8,000 packets/s with no errors.
@@ -329,7 +329,7 @@ firmware, so a pending slot is tried on the next boot.
   with a self-test that needs no audio (one verb with the RIRB response interrupt on), else legacy INTx probed through
   the I/O APIC, else polled (`no-msi`, or nothing worked; the foreground then services from `audio_read/write`).
   DMA memory is below 4 GiB unless `GCAP.64OK`. `hda` dumps the controllers, widgets and chosen paths (what to read on an
-  unknown machine); `audio device` lists/selects among USB audio and HD Audio controllers. `make test-v2-hda` covers MSI,
+  unknown machine); `audio device` lists/selects among USB audio and HD Audio controllers. `make test-hda` covers MSI,
   INTx and polled delivery, a 440 Hz tone through QEMU's WAV backend, the `play` and `record` tapes, capture (QEMU's WAV
   backend has no input, so silence from the `none` backend; the capture buffer is pre-filled with a pattern, so a
   peak of 0 shows the controller's DMA wrote it), and USB audio next to HD Audio. **Unverified on real hardware:**
@@ -348,7 +348,7 @@ firmware, so a pending slot is tried on the next boot.
   time (a resampler replaces that in a later stage). Playback's transfer window is now ~6 ms (a packet plays a
   whole window after it is filled, so the window is the latency). `micros()` no longer goes backwards when
   the timer interrupt is late (a pending timer interrupt counts as an elapsed tick, and the value is clamped).
-  Tested between two QEMU guests (`make test-v2-audio-net`: stereo 24-bit and mono 16-bit tones, 0 lost,
+  Tested between two QEMU guests (`make test-audio-net`: stereo 24-bit and mono 16-bit tones, 0 lost,
   measured 438/877 Hz). **Stage B, RTP over UDP:** `proto=rtp` sends and receives standard RTP (RFC 3550) over
   UDP over IPv4 with `L16`/`L24` big-endian samples, dynamic payload type 96 (`pt=`), packet times of 125 us to
   1 ms chosen so a packet is at most 1440 bytes (AES67's limit), correct IP and UDP checksums, a multicast
@@ -372,7 +372,7 @@ firmware, so a pending slot is tried on the next boot.
   is slow (about 10 ms a line over serial), so any per-packet or per-loss message makes a receiver lose the next
   packets; `verbose` therefore prints only a few gap lines and one status line per 10 s.
   **Stage C, Opus:** `codec=opus` (with `proto=rtp`, 48 kHz) sends and receives Opus (RFC 7587, `opus/48000/2`) from the
-  vendored fixed-point libopus (`build.rs` links `build/v2/opus-fixed/libopus_fixed.a`). One RTP stream per stereo
+  vendored fixed-point libopus (`build.rs` links `build/fosfor/opus-fixed/libopus_fixed.a`). One RTP stream per stereo
   pair (an odd last channel is a mono stream) on UDP ports `port`, `port+2`, ..., each with its own SSRC and the
   same RTP timestamps; `send` prints an SDP with one media line per stream. Options: `bitrate=` (kbit/s per pair,
   default 128), `frame=` (2.5, 5, 10, 20, 40, 60 ms; default 20), `complexity=` (0-10, default 5). The receiver
@@ -420,7 +420,7 @@ firmware, so a pending slot is tried on the next boot.
   that point with a consistent header (tested by killing QEMU). `record NAME 0` records until Escape or until the
   reservation is full; `diskN/NAME` and `@LABEL/NAME` pick another volume; `tone=HZ` records a test tone through the
   same path (QEMU's USB audio has no capture side). The capture ring is 16 MiB now (playback stays 1 MiB) so a stick
-  that stalls while writing does not overrun the take at once. Tests: `make test-v2-record` parses the image on the
+  that stalls while writing does not overrun the take at once. Tests: `make test-record` parses the image on the
   host (timed take exact, Escape take, power-cut take). Hardware: the H6 on the Skylake at 96 kHz, 6 channels
   (1.7 MB/s) filled the volume's 31 MiB in 19 s with no overruns; the UFX's 22 channels (3.2 MB/s) onto the Sandy
   Bridge's boot stick (Kingston DataTraveler on EHCI, 2.6 MB/s while writing) failed after ~21 MiB each time, a
@@ -524,7 +524,7 @@ firmware, so a pending slot is tried on the next boot.
   answers ARP and ping. The TCP is `tape-net`'s (one connection, one segment in flight), so the throughput is one segment
   per round trip; audio waits in a 12 KiB queue and a page that finds it full is dropped (the player conceals it) rather
   than letting the delay grow, a client that stops acknowledging for 10 s is dropped, and a new connection replaces the current one (players open a second one). `prebuffer=MS` (a panel row "Pre-buffer", off by default) sends the last MS of encoded audio to a new client at once so its player starts with a full buffer, at the price of that much delay. Up to three clients stream at once, each with its own queue and Ogg stream (a phone's VLC opens a second connection while the first plays), and the live view's second line summarises them ("1 streaming, 3 connection(s) so far; last: slot 1 gone after 4 s (closed)"). The per-client details (request, Range, User-Agent, why it ended) are printed, but the panel runs quiet, so they reach only the message line; run `serve` from a `term net` session to see them all. The kernel no longer sends the class 1.0 "set sample rate" request (and no longer warns) when the alternate setting offers exactly the one rate asked for, as on a PCM2902. Safari plays Ogg Opus only in
-  recent versions; VLC does. The panel offers it as a fourth Mode (the Network row is fixed to IP, peer/name/group/receive rows disappear, Codec offers the Opus choices, an "HTTP port" row defaults to 8000, `audio.cfg` gets `mode serve` and `http N`); its live view names the URL once the address is known and shows the same meters. Test: `make test-v2-audio-serve` (QEMU user networking with a forwarded port; checks every
+  recent versions; VLC does. The panel offers it as a fourth Mode (the Network row is fixed to IP, peer/name/group/receive rows disappear, Codec offers the Opus choices, an "HTTP port" row defaults to 8000, `audio.cfg` gets `mode serve` and `http N`); its live view names the URL once the address is known and shows the same meters. Test: `make test-audio-serve` (QEMU user networking with a forwarded port; checks every
   page's CRC, the headers, the granule positions, `ffprobe`, and that `ffmpeg` decodes 440 Hz).
   **Real PPM meters:** the live view shows one horizontal meter per channel (labelled with the device input or output
   it is), one cell per dB from -60 dBFS to full scale, on the Nordic scale (IEC 60268-10 type I: TEST = 0 at -18 dBFS,
@@ -562,7 +562,7 @@ firmware, so a pending slot is tried on the next boot.
   sequences, `ESC [ A` and `ESC O A` forms, assembled by a small state machine). Redrawing uses carriage return, cursor
   left/right and erase-to-end-of-line, which the framebuffer console and every terminal do; a change in the middle of the
   line redraws the line from the prompt, and typing at the end just echoes. Tab completion is not done. Tested over the
-  serial line (`make test-v2-lineedit`). The history is not kept across reboots.
+  serial line (`make test-lineedit`). The history is not kept across reboots.
   **Scripts and bare command names:** a word that is not built in runs `NAME.sh` (or `NAME` as a tape): `NAME.sh` is a file
   of commands, `#` starts a comment, blank lines are skipped, `$1`..`$9` are the arguments and `$*` all of them, each
   command is echoed as `NAME.sh> command`, and scripts may call scripts four deep. Both are looked up on the boot volume,
@@ -571,7 +571,7 @@ firmware, so a pending slot is tried on the next boot.
   holds several 4 KiB buffers), so the kernel stack grew from 64 to 256 KiB; the three-deep recursion test had overflowed
   the old one with a double fault. The same overflow was already crashing `tapes/test_bridge_e2e.py` (`nic recv` inside a
   nested command) on older commits; with the bigger stack that test no longer crashes but still does not see the bridged frame
-  (not investigated yet). Tested by `make test-v2-scripts`.
+  (not investigated yet). Tested by `make test-scripts`.
   **`nic` subcommands:** `nic sniff [N]` puts an interface in promiscuous mode and prints one line per frame (addresses,
   then ARP who-has/is-at, IPv4 with TCP/UDP ports and tags for DHCP, DNS, SAP, RTP, AVTP, audio-net, LLDP, fos frames) until
   Escape, at most 40 lines per pass so a busy network does not make the screen the bottleneck (it says if it skipped);
@@ -580,7 +580,7 @@ firmware, so a pending slot is tried on the next boot.
   table again), `nic map` sends a probe from every interface with a link and shows which of this machine's other
   interfaces hear it (cabling; up to three rounds while links come up), `nic use N` picks the interface the others
   default to. `nic regs`, `nic send` and `nic recv` were already there. Tested over the serial line with injected
-  frames, a second guest and a guest with two NICs on a QEMU hub (`make test-v2-nic`).
+  frames, a second guest and a guest with two NICs on a QEMU hub (`make test-nic`).
   **NETFS (files between machines):** the v1 wire format on the chat ethertype (tags 0x30-0x39), so `tools/foscopy.py`
   works on v2 machines unchanged: `foscopy.py note.txt MAC:disk1/note.txt`, `foscopy.py :disk1/start ./start-copy --mac MAC`.
   A machine serves GET and PUT at its prompt and in `term net`, never while a tape runs (the staging buffer is the tape's)
@@ -591,7 +591,7 @@ firmware, so a pending slot is tried on the next boot.
   being a name from `nic peers` (a host name carries its NIC number: `alpha1`; discovery runs if the name is not known), a
   MAC address or a peer number. Data frames go out one a millisecond, a pace real hardware keeps up with. `send` can now
   carry a full Ethernet frame (it panicked on anything over 1024 bytes). Not done: `chat`, `tape load HOST NAME`,
-  `tape send`. Tested (`make test-v2-netfs`): foscopy both ways with a 37-chunk round trip compared byte for byte,
+  `tape send`. Tested (`make test-netfs`): foscopy both ways with a 37-chunk round trip compared byte for byte,
   refusals, and two guests copying to and from each other.
   **RTL8139 driver (`rtl8139.rs`):** ported from v1 (`10ec:8139`), I/O-port BAR0, one 32 KiB receive ring with `WRAP` and four
   transmit slots, all DMA below 4 GiB, polling with interrupts only to wake the CPU. The v1 hardware lessons are kept and
@@ -601,7 +601,7 @@ firmware, so a pending slot is tried on the next boot.
   interrupt arrives; the card has no "interrupt now" command, so the self-test uses its timer (`TimerInt`/`TCTR`, `ISR.TimeOut`).
   Differences from v1: `set_multicast` programs the `MAR` hash filter (v1 left it zero, which dropped multicast frames), and
   promiscuous mode resets and reprograms the card instead of editing `RCR` in place, because QEMU restarts the receive ring on
-  any `RCR` write. Tested with `make test-v2-rtl8139` (QEMU `-device rtl8139` as the only NIC: INTx self-test, discovery both
+  any `RCR` write. Tested with `make test-rtl8139` (QEMU `-device rtl8139` as the only NIC: INTx self-test, discovery both
   ways against an e1000 guest, promiscuous sniff of a frame for another MAC, NETFS round trips up to 300 KB). Link-recovery,
   overflow and the real chip's `RCR` behaviour are not covered by QEMU.
   **3Com 3C905 driver (`threecom.rs`):** ported from v1 (3C905, 3C905B, 3C905C: `10b7:9050` to `10b7:9200`), I/O-port BAR1 (or
@@ -646,7 +646,7 @@ firmware, so a pending slot is tried on the next boot.
   partition's GUID, so two sticks written from one image would be indistinguishable.
   `write_stick.py` therefore rewrites the disk, payload and FOSFS GUIDs (and both GPT copies with
   their CRCs) with random ones as it writes (`--keep-guids` to opt out; plain `dd` of the image
-  keeps the shared GUIDs). Tests: `make test-v2-disks`, `make test-v2-stick-guids`.
+  keeps the shared GUIDs). Tests: `make test-disks`, `make test-stick-guids`.
 
 **Files on other disks.** Every command that takes a file accepts `NAME` (the boot volume), `diskN NAME` and `diskN/NAME`
 (also `@LABEL NAME`, `@LABEL/NAME`), as v1 does: `cat disk2/audio.cfg`, `copy disk2/a.cfg disk1/b.cfg`,
@@ -660,7 +660,7 @@ staging buffer, then loaded as usual); `tape save HOST[:diskN] NAME` stores the 
 `tape send [diskN] NAME PEER` sends a file from a local disk as a tape to a machine waiting in `tape load net` (the
 v1 START/DATA/STOP frames, one chunk per 3 ms, no acknowledgement). HOST/PEER is a name or number from `nic peers`, or a
 MAC. Not done: `tape run @HOST/NAME` (a startup-argument file on another machine; tapes read their own `@` files through
-`fs_read`, which only knows local volumes). Test: `make test-v2-netfs`.
+`fs_read`, which only knows local volumes). Test: `make test-netfs`.
 
 ## 9. Tape ABI v2
 
@@ -750,10 +750,10 @@ debug/watchdog/crash-record machinery, `devloop`.
 | M1 (done) | Kernel hello | Loader loads an ELF64 kernel from a raw slot and exits boot services; kernel switches to its own GDT/page tables and prints through serial + framebuffer. |
 | M2 (done) | Memory and interrupts | Physical allocator, identity map with NX/guard pages, IDT, LAPIC timer tick, faults reported legibly. |
 | M3 (done) | Shell and network | PCI scan, one NIC (e1000 under QEMU), `term net` session working from boot. This is the first point `devloop` can drive v2. |
-| M3b (done) | Local keyboard | PS/2 (8042 + I/O APIC IRQ 1) and USB HID boot keyboards on xHCI root ports and on EHCI (directly, or behind a hub through its transaction translator with split transactions) deliver keys to the shell; tested in QEMU (`make test-v2-keyboard`: PS/2, `usb-kbd` on `qemu-xhci` and on `usb-ehci`, and a boot with no keyboard at all). **Not covered:** the split-transaction path (QEMU has no TT; needs the Sandy Bridge), keyboards behind hubs on xHCI, full/low-speed devices wired to an EHCI root port (companion UHCI/OHCI, no driver), hot-plug other than `usb rescan`. Verify on the Skylake and Sandy Bridge once reachable. |
-| M4 (done) | Storage | AHCI, and USB Mass Storage (Bulk-Only) over xHCI and EHCI, behind one block layer; boot-disk discovery by the payload partition GUID the loader passes (BootInfo v5); FOSFS v3 read/write (byte-compatible with v1); `ls`/`cat`/`write`/`rm`/`disks`; `hostname`, `settings` (`deny-term-net`), `debug` (`reboot-on-crash`, `reboot-delay`, `crash-on-boot`) and `start` honoured. Tested in QEMU: boot from SATA (`make test-v2`), from a USB stick on `qemu-xhci` and on `usb-ehci` (`make test-v2-usb-boot`), configuration files and crash-reset (`make test-v2-config`). **Added later:** NVMe (`nvme.rs`: polling, one I/O queue, 512-byte namespace 1, boot from it tested in QEMU) and hubs on xHCI (`usb_hub.rs`: route strings, hub slot contexts, transaction-translator fields; keyboards, sticks and nested hubs tested on `qemu-xhci`, `make test-v2-hub`). **Confirmed on the Skylake (2026-10-03):** a 4-port USB 2 hub (1a40:0101) on a root port with a low-speed keyboard behind it, plugged in after boot and found by `usb rescan` (the machine would not POST with the hub attached, so it cannot be present at boot there). **Not yet:** USB sticks behind an EHCI hub's transaction translator beyond the Sandy Bridge case (the split path is hardware-only), NVMe on real hardware, NVMe interrupts and multiple queues.
-| M5 (done) | Tapes | `TapeApi` v1 (one versioned table, `v2/abi/src/tape.rs`), tapes as ELF64 position-independent executables (relocated into a 4 MiB executable region, run on a stack of their own), `tape load NAME\|net` / `run` / `save` (the v1 `tape load net` protocol, so `send_tape.py` works), multi-NIC (up to 4 e1000, per-interface terminal session, promiscuous mode), and four tapes: `hello`, `calc`, `memtest` (memory + soak, no pools or long-mode excursion) and `nettest`. Tests: `make test-v2-tapes`, `make test-v2-nettest`. **Deviations from the sketch above:** tapes are PIE, not fixed-address (a fixed address may not be free RAM on a given firmware); `fs_remove`, `free_pages` and `nic_set_promiscuous` were appended to the table. **Not yet:** `tape-net` (needed by `router`/`bridge`/`ip-chat`, M8), audio (the network soak, `memtest soak net=A,B`, is back and tested over a QEMU hub cable), NIC interrupts (now done, see "NIC interrupts (MSI)" below).
-| M6 (done) | Update and recovery | The loader runs the A/B slot state machine (one try for a pending kernel, automatic fallback) and tracks `running`/`crash_count` in the metadata sector; the kernel confirms a pending slot at its milestone; KUP over the network (v1 wire format, `tools/send_kernel_update.py` unchanged) writes the inactive slot and restarts; crash record in RAM (page `0x5000`), read back and printed by the next boot; reboot-on-crash through UEFI `ResetSystem(EfiResetWarm)`; crash-loop guard (five pre-milestone crashes in a row: the kernel stops resetting and halts); software watchdog (`watchdog [N]`, vector 240, longer limit while a tape runs, stays off after three unclean boots); `debug status\|slots\|crash\|hang`, `reboot`, `reset`. Test: `make test-v2-debug-mode` (crash + record, bad and good KUP, fallback after a pushed kernel crashes, watchdog, loop guard, KUP disabled). **Not done:** the NVRAM copy of the crash record (UEFI `SetVariable` from a fault handler is risky; warm reset is the mitigation for RAM-wiping resets, unverified on real hardware), KUP from inside a running tape is accepted but untested, and nothing here has run on the Skylake.
+| M3b (done) | Local keyboard | PS/2 (8042 + I/O APIC IRQ 1) and USB HID boot keyboards on xHCI root ports and on EHCI (directly, or behind a hub through its transaction translator with split transactions) deliver keys to the shell; tested in QEMU (`make test-keyboard`: PS/2, `usb-kbd` on `qemu-xhci` and on `usb-ehci`, and a boot with no keyboard at all). **Not covered:** the split-transaction path (QEMU has no TT; needs the Sandy Bridge), keyboards behind hubs on xHCI, full/low-speed devices wired to an EHCI root port (companion UHCI/OHCI, no driver), hot-plug other than `usb rescan`. Verify on the Skylake and Sandy Bridge once reachable. |
+| M4 (done) | Storage | AHCI, and USB Mass Storage (Bulk-Only) over xHCI and EHCI, behind one block layer; boot-disk discovery by the payload partition GUID the loader passes (BootInfo v5); FOSFS v3 read/write (byte-compatible with v1); `ls`/`cat`/`write`/`rm`/`disks`; `hostname`, `settings` (`deny-term-net`), `debug` (`reboot-on-crash`, `reboot-delay`, `crash-on-boot`) and `start` honoured. Tested in QEMU: boot from SATA (`make test`), from a USB stick on `qemu-xhci` and on `usb-ehci` (`make test-usb-boot`), configuration files and crash-reset (`make test-config`). **Added later:** NVMe (`nvme.rs`: polling, one I/O queue, 512-byte namespace 1, boot from it tested in QEMU) and hubs on xHCI (`usb_hub.rs`: route strings, hub slot contexts, transaction-translator fields; keyboards, sticks and nested hubs tested on `qemu-xhci`, `make test-hub`). **Confirmed on the Skylake (2026-10-03):** a 4-port USB 2 hub (1a40:0101) on a root port with a low-speed keyboard behind it, plugged in after boot and found by `usb rescan` (the machine would not POST with the hub attached, so it cannot be present at boot there). **Not yet:** USB sticks behind an EHCI hub's transaction translator beyond the Sandy Bridge case (the split path is hardware-only), NVMe on real hardware, NVMe interrupts and multiple queues.
+| M5 (done) | Tapes | `TapeApi` v1 (one versioned table, `v2/abi/src/tape.rs`), tapes as ELF64 position-independent executables (relocated into a 4 MiB executable region, run on a stack of their own), `tape load NAME\|net` / `run` / `save` (the v1 `tape load net` protocol, so `send_tape.py` works), multi-NIC (up to 4 e1000, per-interface terminal session, promiscuous mode), and four tapes: `hello`, `calc`, `memtest` (memory + soak, no pools or long-mode excursion) and `nettest`. Tests: `make test-tapes`, `make test-nettest`. **Deviations from the sketch above:** tapes are PIE, not fixed-address (a fixed address may not be free RAM on a given firmware); `fs_remove`, `free_pages` and `nic_set_promiscuous` were appended to the table. **Not yet:** `tape-net` (needed by `router`/`bridge`/`ip-chat`, M8), audio (the network soak, `memtest soak net=A,B`, is back and tested over a QEMU hub cable), NIC interrupts (now done, see "NIC interrupts (MSI)" below).
+| M6 (done) | Update and recovery | The loader runs the A/B slot state machine (one try for a pending kernel, automatic fallback) and tracks `running`/`crash_count` in the metadata sector; the kernel confirms a pending slot at its milestone; KUP over the network (v1 wire format, `tools/send_kernel_update.py` unchanged) writes the inactive slot and restarts; crash record in RAM (page `0x5000`), read back and printed by the next boot; reboot-on-crash through UEFI `ResetSystem(EfiResetWarm)`; crash-loop guard (five pre-milestone crashes in a row: the kernel stops resetting and halts); software watchdog (`watchdog [N]`, vector 240, longer limit while a tape runs, stays off after three unclean boots); `debug status\|slots\|crash\|hang`, `reboot`, `reset`. Test: `make test-debug-mode` (crash + record, bad and good KUP, fallback after a pushed kernel crashes, watchdog, loop guard, KUP disabled). **Not done:** the NVRAM copy of the crash record (UEFI `SetVariable` from a fault handler is risky; warm reset is the mitigation for RAM-wiping resets, unverified on real hardware), KUP from inside a running tape is accepted but untested, and nothing here has run on the Skylake.
 | M7 (running) | Skylake | **Done on the Skylake and the Sandy Bridge (2026-10-03):** UEFI boot from a stick through xHCI (Skylake) and EHCI behind the rate-matching hub (Sandy Bridge); boot-disk discovery, FOSFS, KUP over the network with promotion, `reboot`; five NICs on the Skylake (I219-LM + 4x I350) all on MSI, the 82579V on MSI; tapes run; `memtest` over all 15.9 GiB (addr+moving+random) passes in 130 s; `nettest` through the cabled I350 ports forwards 71,851 of 71,862 generated 1500-byte frames at 900 Mbit/s with 0 lost (the rest were in flight at stop). Real-hardware bugs found and fixed: a fifth NIC overflowed the interrupt tables; the first control transfer after a port reset failed on Intel xHCI (retries, 8-byte default pipe for low/full speed); the PCH EHCI halted with a host system error until its DMA frame was in low memory; the UEFI `ResetSystem` call page-faulted on the Skylake (reset now uses the ACPI reset register / port 0xCF9 first); the UEFI Shutdown call faulted too (`shutdown` now enters ACPI S5 from the DSDT `_S5_` object first); a router started with a dead uplink refused to start because the e1000 refused frames with no link (now dropped), and its late DHCP lease was never promoted to the active uplink (fixed in both routers); `dmesg` took minutes because the framebuffer was scrolled by reading write-combining memory. Also confirmed on the Skylake: `shutdown`, the watchdog (`debug hang`), a USB keyboard, `router` with NAT and a DHCP server (internet through it, also after a late uplink lease). **Not yet tried on hardware:** the crash-loop guard, `bridge`, hubs, NVMe, audio, the I219 under sustained load.
 | M8 | The rest | Remaining NIC drivers, audio, `router`/`bridge`, USB HID keyboard, polish. |
 | M9 (done) | Recorder, FAT and the clock | `v2/tapes/recorder`: a field recorder for a USB audio interface -- meters from the moment the tape starts, a pre-roll buffer, takes by hand or by a sound/silence trigger, channel selection, WAV streamed to disk (RF64 past 4 GiB), a capture buffer of all spare RAM (several blocks, above 4 GiB) so a slow disk or a stall costs no audio, a disk speed test and slow-disk/backlog/audio-lost warnings. Disks: FOSFS, FAT32 and exFAT (`v2/fat`, root directory only, one contiguous run per file; exFAT can be formatted with `format diskN exfat`), chosen and formatted from the UI. Also: CMOS RTC clock (`date`, local time), `grow diskN` (FOSFS volume fills its disk), `ls`/`cat`/`write`/`rm`/`copy` on a named FAT disk, the shared libraries `tape-panel` and `audio-rec`. Tape ABI additions: `fs_stream_*`, `audio_select`, `disk_info`, `disk_format_exfat`, `audio_buffer`, `audio_set_capture_ring`. Full detail, limits and tests: `docs/recorder.md`. **Confirmed on the laptop (22-channel UFX to a USB stick and to exFAT):** pre-roll, trigger, channel picker, disk menu, format, grow. **Not yet:** exFAT mounted by a PC OS beyond what the user tried, a ring take that crosses a block boundary (hours at low channel counts; the logic has a boot self-test), non-blocking USB writes (a stalling stick freezes the recorder's UI, never the audio). |
@@ -769,7 +769,7 @@ waits, preserve serial output on failure, wait for the prompt before typing.
   protected-mode teaching edition. Bug fixes land there; features may or may not.
 - v2 develops under `v2/` on `main`. The two editions share the repository, the
   host tools and the docs; v1 remains the default build (`make` builds v1,
-  `make v2-...` targets build v2) until v2 is good enough to promote.
+  `make ...` targets build v2) until v2 is good enough to promote.
 - Wire and disk formats are shared, so one set of host tools drives both.
 - The README and `AGENTS.md` grow a "which edition" paragraph; v2 gets its own
   `AGENTS.md` section kept small, with detail in `docs/`.
@@ -809,7 +809,7 @@ waits, preserve serial output on failure, wait for the prompt before typing.
 1. ~~Settle layout/branching~~ (decided: `v2/` in this repo).
 2. Build M0 on this machine: a `x86_64-unknown-uefi` loader that prints the
    memory map under OVMF, plus the Python ESP/GPT image writer it needs, plus a
-   `make test-v2-loader` smoke test.
+   `make test-loader` smoke test.
 3. Boot that same image on the Skylake as an early reality check: if firmware
    quirks bite, we want to know before the kernel exists.
 

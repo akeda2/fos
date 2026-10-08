@@ -172,7 +172,7 @@ pub struct MemoryDescriptor {
 
 /// Block I/O: sector reads on any block device the firmware has a driver for,
 /// including every disk and partition. Only valid before `ExitBootServices`: the
-/// kernel needs its own storage drivers (docs/v2-design.md, section 8).
+/// kernel needs its own storage drivers (docs/design.md, section 8).
 #[repr(C)]
 pub struct BlockIo {
     pub revision: u64,

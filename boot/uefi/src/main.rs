@@ -2,7 +2,7 @@
 //! the firmware behind and jump into the 64-bit kernel.
 //!
 //! This is the v2 counterpart of `boot/stage2.S`, and like it, it narrates. The
-//! sequence (docs/v2-design.md, section 4):
+//! sequence (docs/design.md, section 4):
 //!
 //! 1. say what the firmware is and what memory, graphics and ACPI it provides;
 //! 2. find the payload partition on the boot disk (a GPT partition of the fos
@@ -24,7 +24,7 @@ mod elf;
 mod uefi;
 
 use core::panic::PanicInfo;
-use fos_v2_abi::{BootInfo, Framebuffer, SlotChoice, SlotMetadata, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, RUNNING_BOOTING, RUNNING_UP, SECTOR, select_slot, slot_start};
+use fosfor_abi::{BootInfo, Framebuffer, SlotChoice, SlotMetadata, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, RUNNING_BOOTING, RUNNING_UP, SECTOR, select_slot, slot_start};
 use uefi::{Handle, MemoryDescriptor, Status, SystemTable};
 
 /// Room for the memory map the kernel receives (it stays allocated for the kernel):
@@ -42,7 +42,7 @@ pub extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -
     let boot = unsafe { &*table.boot_services };
 
     println!();
-    println!("FOS v2 loader (milestone M1): UEFI application running.");
+    println!("Fosfor OS loader (milestone M1): UEFI application running.");
     println!();
     describe_firmware(table);
 
@@ -235,7 +235,7 @@ fn summarize_memory(boot: &uefi::BootServices) {
 /// The graphics output protocol: a linear framebuffer the kernel draws its text
 /// console into, if the firmware set one up. Returns what to tell the kernel.
 fn describe_graphics(boot: &uefi::BootServices) -> Framebuffer {
-    let none = Framebuffer { base: 0, size: 0, width: 0, height: 0, stride: 0, format: fos_v2_abi::PIXEL_NONE };
+    let none = Framebuffer { base: 0, size: 0, width: 0, height: 0, stride: 0, format: fosfor_abi::PIXEL_NONE };
     let mut interface: *mut core::ffi::c_void = core::ptr::null_mut();
     let status = (boot.locate_protocol)(&uefi::GRAPHICS_OUTPUT_PROTOCOL, core::ptr::null_mut(), &mut interface);
     if status != uefi::SUCCESS || interface.is_null() {
@@ -259,7 +259,7 @@ fn describe_graphics(boot: &uefi::BootServices) -> Framebuffer {
         mode.frame_buffer_base,
         mode.frame_buffer_size / 1024
     );
-    if info.pixel_format == fos_v2_abi::PIXEL_NONE {
+    if info.pixel_format == fosfor_abi::PIXEL_NONE {
         return none;
     }
     Framebuffer {
@@ -299,7 +299,7 @@ fn describe_acpi(table: &SystemTable) -> u64 {
 /// still alive when this is called, so the message reaches the console).
 fn fatal(message: &str) -> ! {
     println!();
-    println!("FOS v2 loader FATAL: {message}");
+    println!("Fosfor OS loader FATAL: {message}");
     loop {
         unsafe { core::arch::asm!("hlt") };
     }
@@ -307,7 +307,7 @@ fn fatal(message: &str) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("\nFOS v2 loader PANIC: {info}");
+    println!("\nFosfor OS loader PANIC: {info}");
     loop {
         unsafe { core::arch::asm!("hlt") };
     }

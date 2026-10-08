@@ -5,7 +5,7 @@ The guest takes a DHCP lease from slirp (10.0.2.15) and serves a 440 Hz test ton
 `/live.opus` for a few seconds and checks the bytes as an Ogg stream (every page's CRC, the OpusHead and OpusTags
 packets, a continuing granule position), that `ffprobe` and `ffmpeg` accept and decode it to a 440 Hz tone, then that `/`
 is the player page, an unknown path is a 404, and a second client is served once the first has gone. Run with
-`make test-v2-audio-serve`."""
+`make test-audio-serve`."""
 
 import shutil
 import socket
@@ -204,7 +204,7 @@ def main():
         finally:
             guest.stop()
     panel_test()
-    print("v2 audio-net serve: all checks passed")
+    print("audio-net serve: all checks passed")
 
 
 def panel_test():

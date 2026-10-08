@@ -1,5 +1,5 @@
 //! A thin Rust wrapper around a vendored libopus (BSD-3-Clause, `tapes/opus-codec/vendor/opus`, v1.5.2), built
-//! freestanding for the 64-bit tape target by `make v2-opus-lib`: no libc, no malloc. libopus's own allocations
+//! freestanding for the 64-bit tape target by `make opus-lib`: no libc, no malloc. libopus's own allocations
 //! (a scratch "pseudo stack" and the codec state) go through the tape API's `alloc`/`free`, remembered with a
 //! small size header in front of each block, so a tape needs nothing from the system but the table it already
 //! has. Only one encoder and one decoder at a time are expected per stream, but any number of instances work.

@@ -10,7 +10,7 @@
 
 use crate::font_data::{FONT, FONT_HEIGHT, FONT_WIDTH};
 use core::fmt;
-use fos_v2_abi::{Framebuffer, PIXEL_RGB};
+use fosfor_abi::{Framebuffer, PIXEL_RGB};
 
 pub struct Console {
     base: *mut u32,
@@ -190,7 +190,7 @@ impl fmt::Write for Console {
 /// Starts the console on `framebuffer` (cleared to the background colour). Does
 /// nothing if the firmware gave us no linear framebuffer.
 pub fn init(framebuffer: &Framebuffer) -> bool {
-    if framebuffer.format >= fos_v2_abi::PIXEL_NONE || framebuffer.base == 0 || framebuffer.width == 0 {
+    if framebuffer.format >= fosfor_abi::PIXEL_NONE || framebuffer.base == 0 || framebuffer.width == 0 {
         return false;
     }
     let mut console = Console {

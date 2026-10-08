@@ -104,7 +104,7 @@ def main():
         finally:
             a.stop()
             b.stop()
-    print("v2 netfs: all checks passed")
+    print("netfs: all checks passed")
 
 
 if __name__ == "__main__":

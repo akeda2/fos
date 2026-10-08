@@ -17,7 +17,7 @@
 //! Still a single flat address space, still identity-mapped (virtual = physical).
 
 use crate::{cpu, memory};
-use fos_v2_abi::{BootInfo, Framebuffer};
+use fosfor_abi::{BootInfo, Framebuffer};
 
 const PAGE: u64 = 4096;
 const HUGE: u64 = 2 * 1024 * 1024;

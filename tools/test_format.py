@@ -30,8 +30,8 @@ from test_boot import (BROADCAST, CODE_CANDIDATES, IMAGE, ROOT, TAG_DATA, TAG_DI
                        TAG_HELLO, VARS_CANDIDATES, Wire, check, clean, find, MCAST_GROUP, MCAST_PORT)
 from test_stick_guids import gpt_problems  # noqa: E402
 
-LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 SECTOR = 512
 LINUX_TYPE = bytes.fromhex("af3dc60f838472478e793d69d8477de4")  # 0fc63daf-8483-4772-8e79-3d69d8477de4, on-disk order
 
@@ -167,7 +167,7 @@ def main():
         after = second.read_bytes()
         untouched = sum(1 for at in range(0, 54 * 1024 * 1024, 1 << 20) if before[at:at + (1 << 20)] == after[at:at + (1 << 20)])
         check(untouched == 54, "reformatting the data volume left the ESP and payload partitions untouched", f"{untouched}/54 MiB blocks identical")
-    print("v2 format: all checks passed")
+    print("format: all checks passed")
 
 
 if __name__ == "__main__":

@@ -73,7 +73,7 @@ def main():
         out = session(tmp, "inst2", target, ["ls", "cat marker.txt", "debug slots"])
         check("marker.txt" in out[0], "the installed disk boots on its own and has the files", out[0])
         check("installed copy" in out[1], "with their contents", out[1])
-        print("v2 install: all checks passed")
+        print("install: all checks passed")
 
 
 if __name__ == "__main__":

@@ -107,7 +107,7 @@ def main():
     import subprocess
     outcome = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "test_nettest.py")], env=dict(os.environ, FOS_NIC_MODEL="e1000e"), capture_output=True, text=True)
     check(outcome.returncode == 0 and "all checks passed" in outcome.stdout, "nettest forwards between two MSI-driven e1000e NICs (frames wake the tape from hlt)", outcome.stdout + outcome.stderr)
-    print("v2 msi: all checks passed")
+    print("msi: all checks passed")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@
 //! * ACPI tables, the local APIC and a calibrated 100 Hz timer tick;
 //! * a clean power-off through the UEFI runtime services.
 //!
-//! See docs/v2-design.md, section 11.
+//! See docs/design.md, section 11.
 #![no_std]
 #![no_main]
 
@@ -65,7 +65,7 @@ mod xhci;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use fault::Frame;
-use fos_v2_abi::{BootInfo, PIXEL_RGB};
+use fosfor_abi::{BootInfo, PIXEL_RGB};
 
 core::arch::global_asm!(
     r#"
@@ -135,7 +135,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
 pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     println!();
-    println!("FOS v2 kernel (milestone M4): running in 64-bit long mode.");
+    println!("Fosfor OS kernel (milestone M4): running in 64-bit long mode.");
 
     let info = unsafe { &*info };
     if !info.is_valid() {
@@ -408,7 +408,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     // The milestone: from here the machine can be used (locally or over the network).
     debug::confirm_boot(config::debug().watchdog_seconds);
-    println!("FOS v2 kernel: M3 complete. Waiting for a term net client.");
+    println!("Fosfor OS kernel: M3 complete. Waiting for a term net client.");
     term::start_local();
     loop {
         debug::pet();
@@ -511,6 +511,6 @@ fn provoke_fault_if_requested() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("\nFOS v2 kernel PANIC: {info}");
+    println!("\nFosfor OS kernel PANIC: {info}");
     cpu::halt()
 }

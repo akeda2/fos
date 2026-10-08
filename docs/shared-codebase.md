@@ -1,13 +1,13 @@
 # Fosfor OS: one 64-bit codebase, two boot paths
 
-Status (2026-10-08): **P0, the driver ports, P2, B1, B2 and the VBE framebuffer are done and merged into
-`main` (except VBE, on branch `bios-vbe`); B3-B5, the shared-crate move (P3) and the rename (R) are not started.** Built so far: tag
-`legacy-v1` and branch `legacy` at `055c093`; RTL8139 and Intel HD Audio ported into the 64-bit
-kernel (`make test-rtl8139`, `make test-hda`); tape API 3 (`audio_devices`, `audio_use_device`);
-the tree promoted to the top level (`abi/`, `kernel/`, `boot/uefi/`, `fat/`, `tapes/`, `tools/`)
-with the v2-prefixed make targets renamed (`make image`, `make test-NAME`, `make test-all`).
-32 of 33 tests pass; `test-nettapes` failed before the move too. **B1 (BIOS spike) and B2 (the real kernel through BIOS) are done**: see
-section 4.4 and 4.5. This note supersedes the
+Status (2026-10-09): **everything in section 5 is done: P0, P2, P3, B1-B5 and R.** The tree is one 64-bit
+codebase on `main` that boots through UEFI or BIOS (`make test`, `make test-bios`), the shared libraries are in
+`crates/`, the project is named Fosfor OS (`build/fosfor/fosfor.img`, crates `fosfor-*`), and the 32-bit edition
+lives on at tag `legacy-v1` / branch `legacy`. The README is rewritten for this tree (the old one is
+`docs/legacy-v1-readme.md`); `docs/history/v1-tests-not-ported.md` says which v1 tests were dropped and which
+are worth porting. First real-hardware results (AMD/nForce through BIOS, Skylake and a laptop through UEFI)
+are in sections 4.5-4.6 and in `DEFERRED.md`. Still open: font scaling on large modes, a VGA text backend for
+the BIOS "skip video" case, the UEFI loader update path and what `DEFERRED.md` lists. This note supersedes the
 "v1 and v2 live side by side, drivers copied and widened" decision in v2-design.md
 section 3 and the "v1 is maintained" paragraph in section 12.
 
@@ -267,7 +267,7 @@ and reversible; pushing it is the user's call.
 
 ## 6. Tests
 
-- The existing v2 tests (`make test-v2-*`) keep their meaning and become the UEFI half
+- The existing v2 tests (`make test-*`) keep their meaning and become the UEFI half
   of the matrix.
 - v1's e2e scripts are not carried over blindly: for each, either the behaviour is
   already covered by a v2 test (drop it), or it is ported to the shared harness with

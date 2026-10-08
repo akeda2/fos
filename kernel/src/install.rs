@@ -15,7 +15,7 @@
 //! writes to the boot disk, and needs `force` to replace a partition table that is not a fos disk's (a blank disk or
 //! a disk that already has a fos payload partition, i.e. an earlier install, does not).
 
-use fos_v2_abi::{slot_start, SlotMetadata, BIOS_STAGE2_LBA, BIOS_STAGE2_SECTORS, FOSFS_TYPE_GUID, PAYLOAD_TYPE_GUID};
+use fosfor_abi::{slot_start, SlotMetadata, BIOS_STAGE2_LBA, BIOS_STAGE2_SECTORS, FOSFS_TYPE_GUID, PAYLOAD_TYPE_GUID};
 
 use crate::gpt::{self, Partition, ESP_TYPE_GUID};
 use crate::{block, fosfs, storage};

@@ -16,7 +16,7 @@
 //! front of a complete stage two, or a stage two that is merely newer than its MBR -- never an MBR pointing at a half-written
 //! stage two. It does not touch the UEFI loader on the ESP, and it never writes to the boot disk's partitions.
 
-use fos_v2_abi::{BIOS_STAGE2_LBA, BIOS_STAGE2_SECTORS, PAYLOAD_TYPE_GUID};
+use fosfor_abi::{BIOS_STAGE2_LBA, BIOS_STAGE2_SECTORS, PAYLOAD_TYPE_GUID};
 
 use crate::{block, gpt, storage};
 

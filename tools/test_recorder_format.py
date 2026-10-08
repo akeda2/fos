@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Formatting a blank disk as exFAT from the recorder's UI (v2): `D` shows a disk with no volume, a take on it is refused,
 `X` asks for confirmation (any other key cancels), and after the format the disk takes a recording that `fsck.exfat`
-accepts. Run with `make test-v2-recorder-format`."""
+accepts. Run with `make test-recorder-format`."""
 
 import struct
 import subprocess
@@ -83,7 +83,7 @@ def main():
         check("My Disk".encode("utf-16le") in volume.read_bytes(), "the label typed in the UI is in the volume", "")
         result = subprocess.run(["fsck.exfat", "-n", str(volume)], capture_output=True, text=True)
         check(result.returncode == 0 and "files 1" in result.stdout.replace(",", ""), "fsck.exfat finds the volume clean, with the one take on it", result.stdout + result.stderr)
-    print("v2 recorder format: all checks passed")
+    print("recorder format: all checks passed")
 
 
 if __name__ == "__main__":

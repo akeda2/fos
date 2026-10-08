@@ -1,5 +1,5 @@
 [package]
-name = "fos-v2-abi"
+name = "fosfor-abi"
 version = "0.1.0"
 edition = "2024"
 

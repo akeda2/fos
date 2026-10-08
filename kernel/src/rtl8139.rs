@@ -1,6 +1,6 @@
 //! A driver for the Realtek RTL8139 Fast Ethernet controller (`10ec:8139`), ported from v1's `rtl8139.rs`, which was run on real
 //! cards and is QEMU's classic emulated NIC (`-device rtl8139`), so unlike the 3C905 this one has automated coverage
-//! (`make test-v2-rtl8139`).
+//! (`make test-rtl8139`).
 //!
 //! How the card works, briefly. All registers sit in an I/O-port window (BAR0). There are no descriptor rings of the modern
 //! kind: *receive* is one contiguous ring buffer in host RAM (here 32 KiB plus slack) into which the card DMAs each frame,
@@ -274,7 +274,7 @@ impl Rtl8139 {
 
     /// Promiscuous mode is `RCR.AAP`, but writing `RCR` is not harmless: QEMU's model restarts the receive ring (read and write
     /// pointers to the start) on any `RCR` write, while the datasheet says nothing of the kind, so a driver that kept its own
-    /// read offset would be left chasing a ring that moved (found by `make test-v2-rtl8139`: the sniffer then read garbage and
+    /// read offset would be left chasing a ring that moved (found by `make test-rtl8139`: the sniffer then read garbage and
     /// took the nonsensical-length recovery). The behaviour that is correct on either is to make the ring state a known one:
     /// reset the card and reprogram it with the new filter, which also resets the offset. Frames still in the ring are lost,
     /// which a mode switch for sniffing can afford.

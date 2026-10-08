@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "fos-v2-abi"
+name = "fosfor-abi"
 version = "0.1.0"
 
 [[package]]
@@ -25,5 +25,5 @@ dependencies = [
 name = "tape-rt"
 version = "0.1.0"
 dependencies = [
- "fos-v2-abi",
+ "fosfor-abi",
 ]

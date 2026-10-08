@@ -5,7 +5,7 @@ Guest B (the receiver) has a `usb-audio` device whose output QEMU records to a W
 sender) needs no audio hardware and sends a test tone (`src=tone=440`). Over raw Ethernet the tone must
 arrive, be played and be recorded at the right frequency and length, the receiver must report no lost
 packets, and a stream with another channel count/bit depth (mono, 16-bit) must be converted and played
-too. Run with `make test-v2-audio-net`."""
+too. Run with `make test-audio-net`."""
 
 import os
 import select
@@ -387,7 +387,7 @@ def main():
     duplex_names_test()
     codec_follows_listener_test()
     panel_wait_test()
-    print("v2 audio-net: all checks passed")
+    print("audio-net: all checks passed")
 
 
 def duplex_test():

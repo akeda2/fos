@@ -130,7 +130,7 @@ def main():
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-    print("v2 tapes: all checks passed")
+    print("tapes: all checks passed")
 
 
 if __name__ == "__main__":

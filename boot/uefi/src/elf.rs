@@ -17,19 +17,19 @@ pub struct LoadedKernel {
 
 #[derive(Debug)]
 pub enum Error {
-    Elf(fos_v2_abi::elf::Error),
+    Elf(fosfor_abi::elf::Error),
     /// The firmware would not give us enough pages.
     PagesUnavailable { status: usize },
 }
 
 /// Loads `image` and returns where it ended up.
 pub fn load(boot: &BootServices, image: &[u8]) -> Result<LoadedKernel, Error> {
-    let span = fos_v2_abi::elf::span(image).map_err(Error::Elf)? as u64;
+    let span = fosfor_abi::elf::span(image).map_err(Error::Elf)? as u64;
     let mut base = 0u64;
     let status = (boot.allocate_pages)(uefi::ALLOCATE_ANY_PAGES, uefi::LOADER_DATA, (span / 4096) as usize, &mut base);
     if status != uefi::SUCCESS {
         return Err(Error::PagesUnavailable { status });
     }
-    let entry = unsafe { fos_v2_abi::elf::load(image, base) }.map_err(Error::Elf)?;
+    let entry = unsafe { fosfor_abi::elf::load(image, base) }.map_err(Error::Elf)?;
     Ok(LoadedKernel { entry, base, size: span })
 }

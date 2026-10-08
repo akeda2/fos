@@ -26,9 +26,9 @@ through **UEFI** (`boot/uefi/`) or **BIOS** (`boot/bios/`); only POST/boot diffe
 hand the kernel the same `BootInfo`. The previous 32-bit BIOS edition is frozen at tag
 `legacy-v1` / branch `legacy` (Pentium 4 machines, the protected-mode teaching tree); its old
 guide is `docs/legacy-v1-guide.md`. Do not backport features to it without being asked. The
-plan and status are in `docs/shared-codebase.md`. Some names still say `v2` (`build/v2/`,
-crate names `fos-v2-*`, `FOS_V2_IMAGE`); renaming them to Fosfor is a separate mechanical step
-(that doc, section 7).
+plan and status are in `docs/shared-codebase.md`. The v2 prefix is gone from build outputs
+(`build/fosfor/fosfor.img`, crate names `fosfor-*`, `FOSFOR_IMAGE`); `fos` stays in `fosfs`,
+`foscopy`, wire magics and the GPT GUID on purpose (section 7 of that doc).
 
 ## Source map
 
@@ -42,7 +42,7 @@ crate names `fos-v2-*`, `FOS_V2_IMAGE`); renaming them to Fosfor is a separate m
 | `tapes/` | One crate per tape (library and binary together) (the shared libraries they use are in `crates/`). `tapes/tape.ld` is the shared linker script, `tapes/.cargo/config.toml` the shared target setup. |
 | `tools/` | Image builder (`build_image.py`), host tools (`devloop.py`, `term_net.py`, `send_tape.py`, `send_kernel_update.py`, `foscopy.py`, `peers.py`, `send_frame.py`), and the end-to-end test scripts (`test_*.py`). |
 | `targets/` | Rust target specs. `x86_64-fos-tape.json` (soft-float) is what tapes really build with. |
-| `docs/` | `shared-codebase.md` (the unification plan and its status), `v2-design.md` (the design and milestone log), `recorder.md`, `nettest.md`, `rust-tapes-for-dummies.md`, `history/` (append-only write-ups). |
+| `docs/` | `shared-codebase.md` (the unification plan and its status), `design.md` (the design and milestone log), `recorder.md`, `nettest.md`, `rust-tapes-for-dummies.md`, `history/` (append-only write-ups). |
 
 Also read on demand: `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put aside),
 `README.md`.
@@ -131,7 +131,7 @@ Python 3 (stdlib only for tools), `qemu-system-x86_64` with OVMF
 (`/usr/share/OVMF/OVMF_CODE_4M.fd`). All cargo builds share `build/cargo-target`.
 
 ```sh
-make image            # build/v2/v2.img: loader + kernel + every tape (default goal)
+make image            # build/fosfor/fosfor.img: loader + kernel + every tape (default goal)
 make run              # boot it in QEMU + OVMF, serial on the terminal
 make test             # unit tests (abi, fat, audio-rec) and the boot/framebuffer test
 make test-NAME        # one end-to-end test; `make help`, or the .PHONY list in the Makefile
@@ -194,7 +194,7 @@ maintainer's memory notes, not in this repository.
 - Every shell command's output fits an 80-column text grid; keep each print line to at
   most 79 columns and split long messages rather than relying on wrapping.
 - Lower-case names throughout (FOSFS entries, files, tape names).
-- Docs that move with code: README's command/tape tables, `docs/v2-design.md` (a
+- Docs that move with code: README's tape table, `docs/design.md` (a
   paragraph per feature, milestone status), this file's pointers.
 - Commit messages say what was verified and what only real hardware can verify. Do not
   commit or push unless asked.

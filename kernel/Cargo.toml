@@ -1,5 +1,5 @@
 [package]
-name = "fos-v2-kernel"
+name = "fosfor-kernel"
 version = "0.1.0"
 edition = "2024"
 
@@ -13,10 +13,10 @@ lto = true
 opt-level = "z"
 
 [dependencies]
-fos-v2-abi = { path = "../abi" }
-fos-v2-fat = { path = "../crates/fat" }
+fosfor-abi = { path = "../abi" }
+fosfor-fat = { path = "../crates/fat" }
 
-# Deliberate-fault builds for the exception tests (make test-v2-faults): each one
+# Deliberate-fault builds for the exception tests (make test-faults): each one
 # provokes one kind of fault right after boot so the report can be checked.
 [features]
 fault-null = []

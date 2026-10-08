@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-IMAGE = ROOT / "build" / "v2" / "v2.img"
+IMAGE = ROOT / "build" / "fosfor" / "fosfor.img"
 FAILURES = []
 
 # (QEMU VGA properties, the EDID size stage two should report or None, the mode it should end up with)

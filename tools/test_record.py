@@ -5,7 +5,7 @@ QEMU's USB audio has no capture side, so the tape records a test tone (`tone=HZ`
 disk path. A host-side parse of the image then checks the WAV files: a timed take has the exact length and a valid
 header, a take ended with Escape is shorter and consistent, and a take cut off by killing QEMU (a power cut) keeps
 what was recorded up to the last two-second checkpoint, with a header that matches the file length. Run with
-`make test-v2-record`."""
+`make test-record`."""
 
 import struct
 import sys
@@ -106,7 +106,7 @@ def main():
         check(True, "with a header that matches its length (checkpointed)", "")
         measured = tone_frequency(samples, rate, samples[rate:2 * rate])
         check(abs(measured - 660) < 8, f"and {measured:.1f} Hz inside (wanted 660)", "")
-    print("v2 record: all checks passed")
+    print("record: all checks passed")
 
 
 if __name__ == "__main__":

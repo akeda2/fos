@@ -3,7 +3,7 @@
 
     sudo python3 tools/write_stick.py /dev/sdX [--image PATH]
 
-The image defaults to what `make image` builds (build_image.DEFAULT_IMAGE, build/v2/v2.img in this repository), wherever
+The image defaults to what `make image` builds (build_image.DEFAULT_IMAGE, build/fosfor/fosfor.img in this repository), wherever
 the script is run from. `dd if=IMAGE of=/dev/sdX bs=4M conv=fsync status=progress` does exactly the same
 copy; this script only refuses the mistakes that cost people their disks: it will not touch
 anything that is mounted, not a whole disk, not removable, smaller than the image, or

@@ -2,7 +2,7 @@
 """`grow diskN` (v2): a stick flashed from the 96 MiB image has a 32 MiB FOSFS partition and unused space after it; `grow`
 moves the backup GPT to the real end of the disk, extends the FOSFS partition and volume to fill it, and keeps the files.
 Checked three ways: the shell's own report, `sgdisk --verify` (an independent GPT checker: CRCs, backup at the end, no
-overlap), and a second boot from the grown image that still finds its files and its new size. Run with `make test-v2-grow`."""
+overlap), and a second boot from the grown image that still finds its files and its new size. Run with `make test-grow`."""
 
 import shutil
 import subprocess
@@ -60,7 +60,7 @@ def main():
         check("hello grown" in outputs[2], "with the file's contents unchanged", outputs[2])
         verify = subprocess.run(["sgdisk", "--verify", str(tmp / "grow2.img")], capture_output=True, text=True)
         check("No problems found" in verify.stdout, "and the table is still consistent after the second boot", verify.stdout)
-    print("v2 grow: all checks passed")
+    print("grow: all checks passed")
 
 
 if __name__ == "__main__":

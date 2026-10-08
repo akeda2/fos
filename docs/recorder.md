@@ -28,7 +28,7 @@ Keys: Space/R take on/off, A auto on/off, C choose channels, D choose the disk t
 
 `cargo test --manifest-path v2/fat/Cargo.toml` runs the file systems against images made by `mkfs.vfat` /
 `mkfs.exfat`, checked with `fsck.vfat` / `fsck.exfat` (and read back by 7-Zip for FAT32; 7-Zip cannot open exFAT).
-`make test-v2-recorder` (FOSFS, gated tone through manual and automatic takes) and `make test-v2-recorder-fat`
+`make test-recorder` (FOSFS, gated tone through manual and automatic takes) and `make test-recorder-fat`
 (FAT32 and exFAT disks in QEMU) are the end-to-end tests.
 
 ## Pre-roll and the trigger
@@ -72,8 +72,8 @@ kernel (`fatvol::format_exfat`) first writes a GPT with one basic-data partition
   listed as `no volume` and a take on it is refused until it is formatted.
 * Both go through the kernel and refuse the boot disk; the tape call is `disk_format_exfat`. Formatting takes a second or
   two, during which the recorder's capture overruns.
-* Tests: `formatted_exfat_volumes_pass_fsck_and_work` (host, `fsck.exfat`), `make test-v2-format-exfat` (shell) and
-  `make test-v2-recorder-format` (the UI).
+* Tests: `formatted_exfat_volumes_pass_fsck_and_work` (host, `fsck.exfat`), `make test-format-exfat` (shell) and
+  `make test-recorder-format` (the UI).
 
 ## Never losing audio
 
@@ -97,7 +97,7 @@ of 22-channel audio. `grow diskN` (`v2/kernel/src/term.rs`, `gpt::grow_last_part
 the disk and keeps the files: the new backup GPT goes to the real end of the disk first, then the primary entries and header, then
 the old backup (now inside the partition) is cleared. Only a FOSFS partition that is the last on the disk can grow. FOSFS mounting
 now accepts a volume smaller than its partition (the superblock's size is the volume's size), so an interrupted grow leaves a
-volume that mounts either way and running `grow` again finishes it. `make test-v2-grow` checks the result with `sgdisk --verify`
+volume that mounts either way and running `grow` again finishes it. `make test-grow` checks the result with `sgdisk --verify`
 and a second boot from the grown image.
 
 ## The wall clock for tapes

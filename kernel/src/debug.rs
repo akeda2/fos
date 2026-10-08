@@ -2,7 +2,7 @@
 //! record, the crash-loop guard and the software watchdog. Everything the v1 "debug
 //! mode" does, redone for the UEFI boot path.
 //!
-//! **Slot metadata** (payload sector 0, `fos_v2_abi::SlotMetadata`) is shared with the
+//! **Slot metadata** (payload sector 0, `fosfor_abi::SlotMetadata`) is shared with the
 //! loader. The loader runs the A/B fallback state machine and marks a boot `running = 1`
 //! (booting); this module sets `running = 2` at the kernel's *milestone*
 //! ([`confirm_boot`]: the point where a person or a remote client could use the machine),
@@ -25,7 +25,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use fos_v2_abi::{BootInfo, MAX_CONSECUTIVE_CRASHES, RUNNING_STOPPED, RUNNING_UP, SlotMetadata, slot_start};
+use fosfor_abi::{BootInfo, MAX_CONSECUTIVE_CRASHES, RUNNING_STOPPED, RUNNING_UP, SlotMetadata, slot_start};
 
 use crate::{apic, block, fault::Frame, paging, storage};
 
@@ -188,7 +188,7 @@ pub fn slot_summary(print: impl Fn(core::fmt::Arguments)) {
             print(format_args!("active slot: {}, pending: {:?}, attempted: {}, confirmed: {}", m.active_slot, m.pending_slot, m.attempted, m.confirmed));
             print(format_args!("slot sizes (sectors): {} / {}", m.slot_sectors[0], m.slot_sectors[1]));
             print(format_args!("BIOS video mode switch: {} (`debug video skip|auto`), monitor size hint: {} (`debug video size WxH|auto`)",
-                if m.flags & fos_v2_abi::FLAG_SKIP_VIDEO != 0 { "skipped" } else { "automatic" },
+                if m.flags & fosfor_abi::FLAG_SKIP_VIDEO != 0 { "skipped" } else { "automatic" },
                 if m.monitor_hint == (0, 0) { "none" } else { "set" }));
             if m.monitor_hint != (0, 0) {
                 print(format_args!("  hint: {}x{}", m.monitor_hint.0, m.monitor_hint.1));

@@ -1,7 +1,7 @@
-# v2 on the Skylake: a visit checklist
+# Fosfor OS on the Skylake: a visit checklist
 
 First real-hardware run of the v2 kernel (milestone M7). Everything below passed in QEMU
-(`make test-v2`, `-keyboard`, `-usb-boot`, `-config`, `-tapes`, `-nettest`, `-debug-mode`,
+(`make test`, `-keyboard`, `-usb-boot`, `-config`, `-tapes`, `-nettest`, `-debug-mode`,
 `-msi`, `-router`, `-nettapes`). **Status (2026-10-03):** most of it has since run on this
 machine: boot from the stick, five NICs on MSI, KUP pushes, `memtest`, `nettest`, `shutdown`,
 the watchdog (`debug hang`), a USB keyboard and `router` (including a DHCP lease that arrives
@@ -15,9 +15,9 @@ here touches the internal disk (the AHCI driver only reads it, and only `disks` 
 ## 0. Before leaving the desk
 
 ```sh
-make v2-image                          # build/v2/v2.img (96 MiB: ESP + payload + FOSFS)
-ls -l build/v2/v2.img
-sudo python3 tools/write_stick.py /dev/sdX   # or: sudo dd if=build/v2/v2.img of=/dev/sdX bs=4M conv=fsync status=progress
+make image                          # build/fosfor/fosfor.img (96 MiB: ESP + payload + FOSFS)
+ls -l build/fosfor/fosfor.img
+sudo python3 tools/write_stick.py /dev/sdX   # or: sudo dd if=build/fosfor/fosfor.img of=/dev/sdX bs=4M conv=fsync status=progress
 ```
 
 `dd` is fine for one stick; the script is `dd` with the checks (whole removable disk, nothing mounted,
@@ -50,11 +50,11 @@ worth a paragraph), the NIC cabling notes below, a second stick if you want one 
 | Last line you see | Meaning |
 | --- | --- |
 | nothing / firmware menu | not UEFI-booting the stick: boot mode, Secure Boot, wrong entry |
-| `FOS v2 loader (milestone M1)` ... `Graphics: WxH`, `ACPI 2.0+ RSDP` | loader running; firmware found |
+| `Fosfor OS loader (milestone M1)` ... `Graphics: WxH`, `ACPI 2.0+ RSDP` | loader running; firmware found |
 | `Payload partition: LBA ...`, `Slot metadata: booting slot 0 ...` | stick read through firmware Block I/O |
 | `Kernel at 0x..., entry ...` then `Exiting boot services` | loader done; next line is the kernel |
 | (nothing after Exiting) | kernel died before serial/framebuffer: send me the screen photo of the last loader lines; try `reboot-on-crash` is not loaded yet at this point |
-| `FOS v2 kernel (milestone M4): running in 64-bit long mode.` | kernel alive |
+| `Fosfor OS kernel (milestone M4): running in 64-bit long mode.` | kernel alive |
 | `GDT + TSS loaded`, `Paging: own page tables`, `Framebuffer console ready` | memory/paging fine; from here text is also on screen |
 | `ACPI 2.0+: PM timer at port ...`, `Local APIC ... ticking at 100 Hz` | interrupts and the clock |
 | `Timer self-test: 100 ticks took ~1000 ms` | **verify**: 900-1100 ms |
@@ -64,7 +64,7 @@ worth a paragraph), the NIC cabling notes below, a second stick if you want one 
 | `e1000 (I350) at ...` (x4) | same, per port |
 | `USB: N xHCI ...` and `USB keyboard ... ready` / `USB storage ...: diskN` | xHCI up; the stick as a disk |
 | `Boot disk: disk1` and `FOSFS: mounted on disk1` | boot-disk discovery by GUID worked |
-| `FOS v2 kernel: M3 complete. Waiting for a term net client.` and `fos> ` | milestone reached |
+| `Fosfor OS kernel: M3 complete. Waiting for a term net client.` and `fos> ` | milestone reached |
 
 A crash prints `*** CPU EXCEPTION ...` with the faulting RIP and a plain-words cause; with
 `reboot-on-crash` it resets and the next boot prints "Previous boot crashed".
@@ -108,7 +108,7 @@ when there is no `nic list`). If a push misbehaves, use the plain tools and chec
 The Skylake boots slowly: `wait` may time out once before the machine answers.
 
 Kernel push (needs `kernel-update` in `debug`): `python3-netraw tools/send_kernel_update.py
---iface IF --mac MAC build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel`, then
+--iface IF --mac MAC build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel`, then
 `debug slots` (booted slot 1, active 1, nothing pending = promoted).
 
 ## 5. Load tests (in this order; stop at the first problem)

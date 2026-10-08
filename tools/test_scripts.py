@@ -67,7 +67,7 @@ def main():
             check("Unknown command: nosuchcommand" in guest.text()[mark:], "an unknown word is still reported", guest.text()[mark:])
         finally:
             guest.stop()
-    print("v2 scripts: all checks passed")
+    print("scripts: all checks passed")
 
 
 if __name__ == "__main__":

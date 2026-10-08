@@ -16,7 +16,7 @@
  * Both device kinds at once: with a USB audio device present as well, `audio` lists both, USB stays the automatic
    choice, `audio device 2` switches to HD Audio and the tone lands in the HD Audio recording, not the USB one.
 
-Run with `make test-v2-hda`."""
+Run with `make test-hda`."""
 
 import re
 import struct
@@ -30,8 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_boot import ROOT, check  # noqa: E402
 from test_usb_audio import boot_with_commands, segments, write_wav  # noqa: E402
 
-LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 TAPES = ROOT / "build/cargo-target/x86_64-fos-tape/release"
 
 
@@ -206,7 +206,7 @@ def main():
     interrupt_paths()
     both_devices()
     tape_picks_device()
-    print("v2 hda: all checks passed")
+    print("hda: all checks passed")
 
 
 if __name__ == "__main__":

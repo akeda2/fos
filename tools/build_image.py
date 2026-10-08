@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Builds a bootable fos v2 disk image: a GPT disk with a FAT32 EFI System
+"""Builds a bootable Fosfor OS disk image: a GPT disk with a FAT32 EFI System
 Partition holding the loader at \\EFI\\BOOT\\BOOTX64.EFI (the removable-media path
 every UEFI firmware tries when it has no boot entry for the disk) and a payload
 partition holding the A/B kernel slots.
@@ -9,7 +9,7 @@ no sgdisk. The FAT32 writer is deliberately minimal (one cluster per sector, no
 long file names, files laid out contiguously) because it only ever writes a
 handful of files once.
 
-Payload partition layout (docs/v2-design.md section 5, abi/src/lib.rs): sector 0
+Payload partition layout (docs/design.md section 5, abi/src/lib.rs): sector 0
 is the slot-metadata block in v1's byte layout, slot 0 starts at sector 1 and slot 1
 SLOT_SECTORS later. M1 writes the kernel ELF into slot 0. The FOSFS data partition
 arrives with M4.
@@ -24,7 +24,7 @@ from pathlib import Path
 # Where `make image` writes the finished disk image (the Makefile's IMAGE; a test keeps the two equal). Absolute, built from
 # this file's location, so a tool that defaults to it works from any directory.
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_IMAGE = REPO / "build" / "v2" / "v2.img"
+DEFAULT_IMAGE = REPO / "build" / "fosfor" / "fosfor.img"
 
 SECTOR = 512
 IMAGE_SECTORS = 96 * 2048          # 96 MiB
@@ -311,7 +311,7 @@ def main():
     if bool(arguments.bios_stage1) != bool(arguments.bios_stage2):
         parser.error("--bios-stage1 and --bios-stage2 go together")
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
-    files = [("readme.txt", b"Welcome to FOSFS on fos v2.\nTry: ls, cat readme.txt, write NAME TEXT.\n")]
+    files = [("readme.txt", b"Welcome to FOSFS on Fosfor OS.\nTry: ls, cat readme.txt, write NAME TEXT.\n")]
     for spec in arguments.file:
         name, _, path = spec.partition("=")
         files = [item for item in files if item[0] != name] + [(name, Path(path).read_bytes())]

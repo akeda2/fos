@@ -4,11 +4,11 @@
 //! filesystem. It looks at every whole-disk block device, reads the GPT, and takes
 //! the first partition carrying the fos payload type GUID. (M1 takes the first
 //! such disk; the kernel's later boot-disk discovery matches the partition GUID
-//! the loader passes along instead, see docs/v2-design.md section 8.)
+//! the loader passes along instead, see docs/design.md section 8.)
 
 use crate::uefi::{self, BlockIo, BootServices, Handle};
 use core::ffi::c_void;
-use fos_v2_abi::{PAYLOAD_TYPE_GUID, SECTOR};
+use fosfor_abi::{PAYLOAD_TYPE_GUID, SECTOR};
 
 /// Scratch for GPT sectors and the partition entry array; aligned because some
 /// firmware Block I/O drivers require an aligned buffer.

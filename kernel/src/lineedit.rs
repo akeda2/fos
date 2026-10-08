@@ -5,11 +5,11 @@
 //!
 //! Input arrives a byte at a time. A `term net` client (and a serial terminal) sends arrow keys as ANSI sequences
 //! (`ESC [ A` and so on), which a small state machine here assembles; the local keyboard decoders deliver the same
-//! keys as single private codes (`fos_v2_abi::keymap`). Editing is drawn with the sequences the framebuffer console
+//! keys as single private codes (`fosfor_abi::keymap`). Editing is drawn with the sequences the framebuffer console
 //! and every terminal understand: carriage return, cursor left/right, erase to the end of the line, clear screen. A
 //! change in the middle of the line redraws the line from the prompt; typing at the end just echoes the character.
 
-use fos_v2_abi::keymap::{KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
+use fosfor_abi::keymap::{KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
 
 /// The longest command line.
 pub const LINE_MAX: usize = 120;

@@ -3,7 +3,7 @@
 
 `ls`, `copy` and `rm` work on a FAT disk only when it is named (`diskN`); a bare name never reaches one. The files
 are stamped with the clock, which `date set` can change (the RTC is local time). The volumes are checked with `fsck`
-afterwards. Run with `make test-v2-fat-shell`."""
+afterwards. Run with `make test-fat-shell`."""
 
 import datetime
 import subprocess
@@ -77,7 +77,7 @@ def main():
         for command, image in ((["fsck.vfat", "-n"], fat32), (["fsck.exfat", "-n"], exfat)):
             result = subprocess.run([*command, str(image)], capture_output=True, text=True)
             check(result.returncode == 0, f"{command[0]} finds {image.name} clean", result.stdout + result.stderr)
-    print("v2 fat shell: all checks passed")
+    print("fat shell: all checks passed")
 
 
 if __name__ == "__main__":

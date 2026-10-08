@@ -4,7 +4,7 @@
 Two extra SATA disks, one made by `mkfs.vfat -F 32` and one by `mkfs.exfat`, are attached to the guest; the tape records a
 test tone onto each as `diskN/NAMEnnn.wav`. Afterwards `fsck.vfat` and `fsck.exfat` check the volumes (they know the
 formats independently of this kernel) and the WAV files are read back out of the images and parsed.
-Run with `make test-v2-recorder-fat`."""
+Run with `make test-recorder-fat`."""
 
 import shutil
 import struct
@@ -148,7 +148,7 @@ def main():
             check((channels, rate, bits) == (2, 48000, 16), f"{name} is 2 channels, 48 kHz, 16 bit", "")
             check(3.8 < seconds < 6.2, f"{name} holds {seconds:.1f} s (1 s pre-roll + 3 s by hand)", "")
             check(loud(samples, 0, rate) > 4000 and loud(samples, 2 * rate, 3 * rate) > 4000, f"and the tone is in it", "")
-    print("v2 recorder on FAT: all checks passed")
+    print("recorder on FAT: all checks passed")
 
 
 if __name__ == "__main__":

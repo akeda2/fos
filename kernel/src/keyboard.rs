@@ -10,7 +10,7 @@
 //! its IRQ 1 is routed through the I/O APIC to `KEYBOARD_VECTOR`.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use fos_v2_abi::keymap::Set1Decoder;
+use fosfor_abi::keymap::Set1Decoder;
 
 use crate::{cpu, ioapic};
 

@@ -8,7 +8,7 @@ address, a plain-words cause. The stack overflow is the interesting one: the nor
 stack is the thing that failed, so the report can only appear because the double-fault
 handler runs on its own stack through the TSS.
 
-Run with `make test-v2-faults` (it rebuilds the kernel five times, then restores the
+Run with `make test-faults` (it rebuilds the kernel five times, then restores the
 normal build)."""
 
 import os
@@ -27,8 +27,8 @@ from test_boot import CODE_CANDIDATES, VARS_CANDIDATES, clean, find  # noqa: E40
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
 TARGET_DIR = BUILD / "cargo-target"
-LOADER = TARGET_DIR / "x86_64-unknown-uefi" / "release" / "fos-loader.efi"
-KERNEL = TARGET_DIR / "x86_64-fos-kernel" / "release" / "fos-v2-kernel"
+LOADER = TARGET_DIR / "x86_64-unknown-uefi" / "release" / "fosfor-loader.efi"
+KERNEL = TARGET_DIR / "x86_64-fos-kernel" / "release" / "fosfor-kernel"
 
 # feature -> checks on the report (all must appear)
 FAULTS = {
@@ -82,11 +82,11 @@ def boot(image, code, variables):
 def main():
     code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
     if not LOADER.exists():
-        raise SystemExit("build the loader first (`make v2-loader`)")
+        raise SystemExit("build the loader first (`make loader`)")
     try:
         for feature, expectations in FAULTS.items():
             build_kernel(feature)
-            image = BUILD / "v2" / f"{feature}.img"
+            image = BUILD / "fosfor" / f"{feature}.img"
             subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER),
                             "--kernel", str(KERNEL), "--output", str(image)], check=True, capture_output=True)
             text = boot(image, code, variables)
@@ -98,7 +98,7 @@ def main():
             image.unlink()
     finally:
         build_kernel("")  # restore the normal kernel build
-    print("v2 faults: all checks passed")
+    print("faults: all checks passed")
 
 
 if __name__ == "__main__":

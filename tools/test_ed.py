@@ -8,7 +8,7 @@ understands. Checks the edited line, the saved file (read back with `cat`), `dis
 `@LABEL/NAME` file references through the tape's file callbacks, and a screendump of the
 framebuffer after cursor editing to confirm no stray characters were drawn.
 
-Run with `make test-v2-ed`."""
+Run with `make test-ed`."""
 
 import os
 import selectors
@@ -23,8 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_boot import CODE_CANDIDATES, IMAGE, ROOT, VARS_CANDIDATES, check, clean, find  # noqa: E402
 
-LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 
 
 def main():
@@ -186,7 +186,7 @@ def main():
                 qemu.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 qemu.kill()
-    print("v2 ed: all checks passed")
+    print("ed: all checks passed")
 
 
 if __name__ == "__main__":

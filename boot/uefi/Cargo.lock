@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "fos-loader"
+name = "fosfor-abi"
 version = "0.1.0"
-dependencies = [
- "fos-v2-abi",
-]
 
 [[package]]
-name = "fos-v2-abi"
+name = "fosfor-loader"
 version = "0.1.0"
+dependencies = [
+ "fosfor-abi",
+]

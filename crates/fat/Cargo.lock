@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "fos-v2-fat"
+name = "fosfor-fat"
 version = "0.1.0"

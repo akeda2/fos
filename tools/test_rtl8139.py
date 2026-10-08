@@ -5,7 +5,7 @@ Proved: the card is found at boot with its MAC and link up, its legacy-INTx inte
 frames flow both ways: `nic discover` against an e1000 guest in each direction (the RTL8139 sends and receives), a promiscuous
 `nic sniff` of injected frames, and NETFS round trips with the host's `foscopy.py` of 37 KB and 300 KB (the latter wraps the
 32 KiB receive ring many times and runs the four transmit slots round robin), compared byte for byte, plus a file fetched from
-the e1000 guest. Run with `make test-v2-rtl8139`."""
+the e1000 guest. Run with `make test-rtl8139`."""
 
 import random
 import shutil
@@ -117,7 +117,7 @@ def main():
         finally:
             for guest in (r, b):
                 guest.stop()
-    print("v2 rtl8139: all checks passed")
+    print("rtl8139: all checks passed")
 
 
 if __name__ == "__main__":

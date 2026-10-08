@@ -390,7 +390,7 @@ fn netfs_get_request(index: usize, source: [u8; 6], payload: &[u8]) {
         Err(crate::fosfs::Error::TooBig) => return reply_error(NETFS_TOO_LARGE),
         Err(_) => return reply_error(NETFS_DISK_ERROR),
     };
-    let checksum = fos_v2_abi::internet_checksum(&staging[..length]);
+    let checksum = fosfor_abi::internet_checksum(&staging[..length]);
     let mut start = [0u8; 6];
     start[0..4].copy_from_slice(&(length as u32).to_le_bytes());
     start[4..6].copy_from_slice(&checksum.to_le_bytes());
@@ -470,7 +470,7 @@ fn netfs_put_stop(index: usize, source: [u8; 6]) {
         crate::println!("NETFS: transfer ended after {} of {} bytes; abandoned.", put.received, put.expected);
         return reply_error(NETFS_CHECKSUM);
     }
-    if fos_v2_abi::internet_checksum(&staging[..put.expected]) != put.checksum {
+    if fosfor_abi::internet_checksum(&staging[..put.expected]) != put.checksum {
         crate::println!("NETFS: checksum mismatch; file rejected.");
         return reply_error(NETFS_CHECKSUM);
     }
@@ -581,7 +581,7 @@ fn netfs_fetch(mac: [u8; 6], nic_index: usize, disk: usize, name: &str) -> Resul
                 }
                 TAG_GET_STOP => {
                     outcome = Some(match total {
-                        Some(length) if received == length && fos_v2_abi::internet_checksum(&staging[..length]) == checksum => Ok(()),
+                        Some(length) if received == length && fosfor_abi::internet_checksum(&staging[..length]) == checksum => Ok(()),
                         Some(length) if received == length => Err("checksum mismatch; the data was damaged in transit"),
                         _ => Err("the transfer ended early"),
                     });
@@ -603,7 +603,7 @@ fn netfs_fetch(mac: [u8; 6], nic_index: usize, disk: usize, name: &str) -> Resul
 /// Sends the first `length` bytes of the staging buffer to a peer as a file.
 fn netfs_store(mac: [u8; 6], nic_index: usize, disk: usize, name: &str, length: usize) -> Result<(), &'static str> {
     let staging = crate::tape::staging().ok_or("no memory for the transfer buffer")?;
-    let checksum = fos_v2_abi::internet_checksum(&staging[..length]);
+    let checksum = fosfor_abi::internet_checksum(&staging[..length]);
     let mut request = [0u8; 7 + 16];
     request[0] = disk as u8;
     request[1..5].copy_from_slice(&(length as u32).to_le_bytes());
@@ -672,7 +672,7 @@ fn kup_request(index: usize, source: [u8; 6], payload: &[u8]) {
     }
     let expected = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
     let checksum = u16::from_le_bytes(payload[4..6].try_into().unwrap());
-    if expected == 0 || expected > crate::tape::STAGE_BYTES || expected.div_ceil(512) as u64 > fos_v2_abi::SLOT_SECTORS || crate::tape::staging().is_none() {
+    if expected == 0 || expected > crate::tape::STAGE_BYTES || expected.div_ceil(512) as u64 > fosfor_abi::SLOT_SECTORS || crate::tape::staging().is_none() {
         kup.active = false;
         return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_TOO_LARGE]);
     }
@@ -712,7 +712,7 @@ fn kup_stop(index: usize, source: [u8; 6]) {
     }
     // Verify before writing anything: a mismatch leaves the running kernel and the slot
     // metadata completely untouched.
-    if fos_v2_abi::internet_checksum(&staging[..kup.expected]) != kup.checksum {
+    if fosfor_abi::internet_checksum(&staging[..kup.expected]) != kup.checksum {
         crate::println!("KUP: checksum mismatch; image rejected.");
         return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_CHECKSUM_MISMATCH]);
     }
@@ -722,7 +722,7 @@ fn kup_stop(index: usize, source: [u8; 6]) {
     let slot = 1 - (metadata.active_slot & 1);
     let sectors = kup.expected.div_ceil(512);
     staging[kup.expected..sectors * 512].fill(0);
-    if crate::block::write(disk, payload + fos_v2_abi::slot_start(u64::from(slot)), &staging[..sectors * 512]).is_err() {
+    if crate::block::write(disk, payload + fosfor_abi::slot_start(u64::from(slot)), &staging[..sectors * 512]).is_err() {
         crate::println!("KUP: writing slot {slot} failed.");
         return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_DISK_ERROR]);
     }
@@ -834,7 +834,7 @@ fn tape_service() {
     while let Some(key) = crate::keyboard::pop() {
         if key == 0x1b {
             tape_input_push(TAPE_ABORT);
-        } else if let Some(sequence) = fos_v2_abi::keymap::ansi_sequence(key) {
+        } else if let Some(sequence) = fosfor_abi::keymap::ansi_sequence(key) {
             // A cursor key (a private code from the keyboard decoders): the tape sees the bytes a
             // terminal would send, ESC [ A for Up and so on, like a `term net` client's keys.
             tape_input_push(0x1b);
@@ -1178,12 +1178,12 @@ fn execute(command: &str) {
             crate::println!("shutdown  power off");
             crate::println!("reset     restart through the firmware (reboot is the same)");
             crate::println!("debug ... status | slots | crash | hang");
-            crate::println!("Remote: term net, tools/term_net.py, devloop.py work as on v1.");
+            crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
         }
         "about" => {
-            crate::println!("fos is a small educational 64-bit x86 operating system.");
-            crate::println!("This is v2: a UEFI loader and a 64-bit kernel.");
-            crate::println!("Design: docs/v2-design.md.");
+            crate::println!("Fosfor OS (fos) is a small educational 64-bit x86 operating system.");
+            crate::println!("One kernel, booted by a UEFI loader or by the BIOS boot code.");
+            crate::println!("Design: docs/design.md.");
         }
         "memory" => {
             let stats = memory::stats();
@@ -1511,7 +1511,7 @@ fn execute(command: &str) {
                 }
             }
             Some("video") => {
-                use fos_v2_abi::FLAG_SKIP_VIDEO;
+                use fosfor_abi::FLAG_SKIP_VIDEO;
                 let mut hint: Option<(u16, u16)> = None;
                 let change = match words.next() {
                     Some("skip") => Some(true),
@@ -2314,11 +2314,11 @@ fn grow_command(mut words: core::str::SplitWhitespace) {
         Err(error) => return crate::println!("grow: disk{number}: {error}."),
     };
     use crate::gpt::GrowError;
-    let partition = match crate::gpt::grow_last_partition(disk, &fos_v2_abi::FOSFS_TYPE_GUID) {
+    let partition = match crate::gpt::grow_last_partition(disk, &fosfor_abi::FOSFS_TYPE_GUID) {
         Ok(partition) => partition,
         Err(GrowError::NothingToGrow) => {
             // The partition may already fill the disk while the volume does not (an interrupted grow): finish that.
-            match crate::gpt::find(disk, &fos_v2_abi::FOSFS_TYPE_GUID, |_| true) {
+            match crate::gpt::find(disk, &fosfor_abi::FOSFS_TYPE_GUID, |_| true) {
                 Some(partition) if partition.sectors > before + 2048 => partition,
                 _ => return crate::println!("disk{number}: the FOSFS volume ({} MiB) already fills the disk.", before / 2048),
             }

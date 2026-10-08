@@ -1,6 +1,6 @@
 # Fosfor OS build. The 64-bit tree: a UEFI loader (boot/uefi), one kernel (kernel/), the tapes (tapes/)
 # and the host tools (tools/). See docs/shared-codebase.md for where this is going (a BIOS boot path next
-# to the UEFI one) and docs/v2-design.md for the design so far.
+# to the UEFI one) and docs/design.md for the design so far.
 #
 # Every cargo invocation shares one target directory, so -Z build-std's core/compiler_builtins and the
 # shared path crates (abi, tape-rt, tape-net ...) compile once. None of the crates is a workspace member;
@@ -15,7 +15,7 @@ export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 all: image tapes
 
 help:
-	@echo "make image        build $(BUILD)/v2/v2.img (UEFI loader + kernel + every tape)"
+	@echo "make image        build $(BUILD)/fosfor/fosfor.img (UEFI loader + kernel + every tape)"
 	@echo "make run          build it and boot it in QEMU + OVMF with the serial console on the terminal"
 	@echo "make test         unit tests of abi/fat/audio-rec, then the boot test (loader, kernel, framebuffer)"
 	@echo "make test-NAME    one end-to-end test (see the .PHONY list below), e.g. test-nic, test-hda, test-recorder"
@@ -42,13 +42,13 @@ print-image:
 clean:
 	rm -rf $(BUILD)
 
-OUT := $(BUILD)/v2
+OUT := $(BUILD)/fosfor
 # The BIOS boot chain's binaries; defined here, before the `image` rule, because prerequisites are expanded when read.
 BIOS_OUT := $(BUILD)/bios
 BIOS_STAGES := $(BIOS_OUT)/stage1.bin $(BIOS_OUT)/stage2.bin
-LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fos-loader.efi
-KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fos-v2-kernel
-IMAGE := $(OUT)/v2.img
+LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
+KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
+IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
 TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))

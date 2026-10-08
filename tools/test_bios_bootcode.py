@@ -22,8 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_boot import IMAGE, ROOT, check, clean  # noqa: E402
 
-LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 STAGE1 = ROOT / "build/bios/stage1.bin"
 STAGE2 = ROOT / "build/bios/stage2.bin"
 OLD, NEW = b"(BIOS path)", b"(BIOS PATH)"

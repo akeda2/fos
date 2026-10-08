@@ -2,7 +2,7 @@
 //! optionally its unique GUID). Only the primary table is read; the loader and the
 //! image builder write both copies.
 
-use fos_v2_abi::FOSFS_TYPE_GUID;
+use fosfor_abi::FOSFS_TYPE_GUID;
 
 use crate::block;
 
@@ -138,7 +138,7 @@ pub fn write_single_partition(disk: usize, type_guid: &[u8; 16], name: &str) -> 
 }
 
 /// The EFI System Partition's type GUID (C12A7328-F81F-11D2-BA4B-00A0C93EC93B).
-pub const ESP_TYPE_GUID: [u8; 16] = fos_v2_abi::guid_bytes(0xc12a7328, 0xf81f, 0x11d2, [0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b]);
+pub const ESP_TYPE_GUID: [u8; 16] = fosfor_abi::guid_bytes(0xc12a7328, 0xf81f, 0x11d2, [0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b]);
 
 /// Replaces the disk's partition table with a protective MBR and a GPT of up to eight partitions, laid out one after
 /// another from sector 2048 (1 MiB aligned). Each `spec` is (type GUID, name, sectors); `None` means "the rest of the

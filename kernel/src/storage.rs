@@ -5,7 +5,7 @@
 //! disk. Boot-disk discovery is what lets a USB stick or a SATA disk be the root
 //! filesystem without any BIOS help.
 
-use fos_v2_abi::{BootInfo, FOSFS_TYPE_GUID, PAYLOAD_TYPE_GUID};
+use fosfor_abi::{BootInfo, FOSFS_TYPE_GUID, PAYLOAD_TYPE_GUID};
 
 use crate::block::{self, Backend};
 use crate::fosfs::{self, Volume};

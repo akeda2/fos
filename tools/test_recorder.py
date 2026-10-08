@@ -2,7 +2,7 @@
 """`recorder` (v2): meters and pre-roll from the moment the tape starts, a take started by hand, and takes started and
 ended by the silence trigger. QEMU's USB audio has no capture side, so the tape uses its test tone (`tone=HZ`, with
 `gate=ON,OFF` seconds of tone and silence). The WAV files are parsed from the disk image afterwards.
-Run with `make test-v2-recorder`."""
+Run with `make test-recorder`."""
 
 import struct
 import sys
@@ -121,7 +121,7 @@ def main():
         check(channels == 1, f"{name} has one channel", str(channels))
         measured = tone_frequency(samples, rate, samples[rate // 2:rate // 2 + rate])
         check(abs(measured - 880) < 12, f"{name} holds channel 2 (880 Hz), measured {measured:.0f}", "")
-    print("v2 recorder: all checks passed")
+    print("recorder: all checks passed")
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ TAPE = ROOT / "build" / "tapes" / "router.bin"
 # the serial markers and file names below differ.
 V2 = os.environ.get("FOS_V2") == "1"
 if V2:
-    IMAGE = ROOT / "build" / "v2" / "v2.img"
+    IMAGE = ROOT / "build" / "fosfor" / "fosfor.img"
     TAPE = ROOT / "build" / "cargo-target" / "x86_64-fos-tape" / "release" / "router"
 WAIT_MARKER = b"M3 complete" if V2 else b"Waiting for a remote terminal client to connect"
 LOAD_MARKER = b"Waiting for a tape over the network" if V2 else b"Have the sender target this card's MAC address"

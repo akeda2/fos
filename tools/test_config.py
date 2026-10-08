@@ -21,8 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_boot import (BROADCAST, CODE_CANDIDATES, ROOT, TAG_DATA, TAG_DISCOVER_REPLY, TAG_DISCOVER_REQUEST, TAG_HELLO,  # noqa: E402
                        VARS_CANDIDATES, Wire, check, clean, find, MCAST_GROUP, MCAST_PORT, LOADER_BANNER)
 
-LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fos-loader.efi"
-KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fos-v2-kernel"
+LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
+KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
 
 
 def run(files, wait_for, extra_after=None, no_reboot=True, seconds=90, times=1):
@@ -107,7 +107,7 @@ def main():
     text = run({"debug": "reboot-on-crash\nreboot-delay 1\ncrash-on-boot\n"}, "resetting in 1 s", no_reboot=False, times=2)
     check("CPU EXCEPTION: #UD invalid opcode" in text, "crash-on-boot raises a real exception at boot", text)
     check(text.count(LOADER_BANNER) >= 2, "reboot-on-crash resets the machine, and it boots (and crashes) again", text)
-    print("v2 config: all checks passed")
+    print("config: all checks passed")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 //! Loading and running tapes: small ELF64 programs the kernel runs in its own address
-//! space (trusted like kernel code; this is not isolation). See `fos_v2_abi::tape` for
-//! the ABI and `docs/v2-design.md` section 9.
+//! space (trusted like kernel code; this is not isolation). See `fosfor_abi::tape` for
+//! the ABI and `docs/design.md` section 9.
 //!
 //! A tape is a position-independent executable, so it can land anywhere: the kernel
 //! keeps one 4 MiB, 2 MiB-aligned region (made executable, the only such RAM) and one
@@ -11,8 +11,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use fos_v2_abi::tape::*;
-use fos_v2_abi::{BootInfo, elf};
+use fosfor_abi::tape::*;
+use fosfor_abi::{BootInfo, elf};
 
 use crate::{apic, memory, paging, storage, term};
 
@@ -367,10 +367,10 @@ extern "C" fn api_hostname(index: usize, out: *mut u8, capacity: usize) -> usize
     unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, length) };
     length
 }
-extern "C" fn api_disk_info(number: usize, out: *mut fos_v2_abi::tape::DiskInfo) -> u32 {
-    use fos_v2_abi::tape::{DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DISK_NO_VOLUME};
+extern "C" fn api_disk_info(number: usize, out: *mut fosfor_abi::tape::DiskInfo) -> u32 {
+    use fosfor_abi::tape::{DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DISK_NO_VOLUME};
     let Some(disk) = number.checked_sub(1).and_then(crate::block::get) else { return 0 };
-    let mut info = fos_v2_abi::tape::DiskInfo { sectors: disk.sectors, boot: u32::from(storage::boot_disk() == Some(number - 1)), ..Default::default() };
+    let mut info = fosfor_abi::tape::DiskInfo { sectors: disk.sectors, boot: u32::from(storage::boot_disk() == Some(number - 1)), ..Default::default() };
     info.model.copy_from_slice(&disk.model);
     info.kind = match storage::volume_on(number) {
         Ok(volume) => {
@@ -401,20 +401,20 @@ extern "C" fn api_disk_format_exfat(number: usize, label: *const u8, length: usi
     let label = unsafe { core::slice::from_raw_parts(label, length) };
     match number.checked_sub(1).map_or(Err(FormatError::NoSuchDisk), |disk| crate::fatvol::format_exfat(disk, label)) {
         Ok(_) => 0,
-        Err(FormatError::NoSuchDisk) => fos_v2_abi::tape::FORMAT_NO_DISK,
-        Err(FormatError::BootDisk) => fos_v2_abi::tape::FORMAT_BOOT_DISK,
-        Err(FormatError::BadLabel) => fos_v2_abi::tape::FORMAT_BAD_LABEL,
-        Err(FormatError::Failed) => fos_v2_abi::tape::FORMAT_FAILED,
+        Err(FormatError::NoSuchDisk) => fosfor_abi::tape::FORMAT_NO_DISK,
+        Err(FormatError::BootDisk) => fosfor_abi::tape::FORMAT_BOOT_DISK,
+        Err(FormatError::BadLabel) => fosfor_abi::tape::FORMAT_BAD_LABEL,
+        Err(FormatError::Failed) => fosfor_abi::tape::FORMAT_FAILED,
     }
 }
-extern "C" fn api_audio_buffer(out: *mut fos_v2_abi::tape::AudioBuffer) {
+extern "C" fn api_audio_buffer(out: *mut fosfor_abi::tape::AudioBuffer) {
     let (ring_bytes, available_bytes) = crate::audio::buffer_info();
-    unsafe { *out = fos_v2_abi::tape::AudioBuffer { ring_bytes, available_bytes } };
+    unsafe { *out = fosfor_abi::tape::AudioBuffer { ring_bytes, available_bytes } };
 }
-extern "C" fn api_wall_clock(out: *mut fos_v2_abi::tape::WallClock) -> u32 {
+extern "C" fn api_wall_clock(out: *mut fosfor_abi::tape::WallClock) -> u32 {
     match crate::clock::now() {
         Some(time) => {
-            unsafe { *out = fos_v2_abi::tape::WallClock { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second, reserved: 0 } };
+            unsafe { *out = fosfor_abi::tape::WallClock { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second, reserved: 0 } };
             1
         }
         None => 0,
@@ -449,13 +449,13 @@ extern "C" fn api_nic_send(index: usize, frame: *const u8, length: usize) -> u32
 extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) -> usize {
     term::tape_receive(index, unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
 }
-extern "C" fn api_audio_info(out: *mut fos_v2_abi::tape::AudioInfo) -> u32 {
+extern "C" fn api_audio_info(out: *mut fosfor_abi::tape::AudioInfo) -> u32 {
     u32::from(crate::audio::fill_info(unsafe { &mut *out }))
 }
 extern "C" fn api_audio_start(rate: u32, capture: u32, playback: u32) -> i32 {
     crate::audio::start_for_tape(rate, capture != 0, playback != 0)
 }
-extern "C" fn api_audio_devices(number: u32, out: *mut fos_v2_abi::tape::AudioDevice) -> u32 {
+extern "C" fn api_audio_devices(number: u32, out: *mut fosfor_abi::tape::AudioDevice) -> u32 {
     if !out.is_null() {
         if let Some(device) = crate::audio::device_info(number as usize) {
             unsafe { out.write(device) };
@@ -482,7 +482,7 @@ extern "C" fn api_audio_write(data: *const u8, length: usize) -> usize {
     term::tape_poll();
     crate::audio::write(unsafe { core::slice::from_raw_parts(data, length) })
 }
-extern "C" fn api_audio_stats(out: *mut fos_v2_abi::tape::AudioStats) {
+extern "C" fn api_audio_stats(out: *mut fosfor_abi::tape::AudioStats) {
     crate::audio::fill_stats(unsafe { &mut *out });
 }
 

@@ -1080,9 +1080,9 @@ pub fn status() {
 }
 
 /// Fills the tape ABI's `AudioInfo`; false if there is no audio device.
-pub fn fill_info(info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
+pub fn fill_info(info: &mut fosfor_abi::tape::AudioInfo) -> bool {
     let Some(device) = audio() else { return false };
-    let mut out = fos_v2_abi::tape::AudioInfo::default();
+    let mut out = fosfor_abi::tape::AudioInfo::default();
     out.class_version = u32::from(device.description.class_version.max(1));
     // A running stream's mode, else the picked one or the best at 48 kHz.
     let playback_alt = device.playback.as_ref().map(|stream| stream.alt).or_else(|| default_alt(device, false));
@@ -1111,8 +1111,8 @@ pub fn fill_info(info: &mut fos_v2_abi::tape::AudioInfo) -> bool {
     true
 }
 
-pub fn fill_stats(stats: &mut fos_v2_abi::tape::AudioStats) {
-    let mut out = fos_v2_abi::tape::AudioStats::default();
+pub fn fill_stats(stats: &mut fosfor_abi::tape::AudioStats) {
+    let mut out = fosfor_abi::tape::AudioStats::default();
     if let Some(device) = audio() {
         if let Some(stream) = &device.capture {
             out.capture_packets = stream.packets.load(Ordering::Relaxed);

@@ -1096,7 +1096,7 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
         }
     }
     if mode.is_empty() {
-        return println!("Usage: tape run audio-net send|recv|duplex|serve|list [options]   or   tape run audio-net @audio.cfg [options]\n(see the header of v2/tapes/audio-net/src/main.rs, or docs/v2-design.md, for the options and the file format)");
+        return println!("Usage: tape run audio-net send|recv|duplex|serve|list [options]   or   tape run audio-net @audio.cfg [options]\n(see the header of v2/tapes/audio-net/src/main.rs, or docs/design.md, for the options and the file format)");
     }
     let mut options: Options<'static> = match parse(options_words[..kept].iter().copied()) {
         Ok(options) => options,
