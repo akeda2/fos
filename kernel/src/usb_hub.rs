@@ -37,6 +37,7 @@ const STATUS_CONNECTED: u32 = 1 << 0;
 const STATUS_ENABLED: u32 = 1 << 1;
 const STATUS_LOW_SPEED: u32 = 1 << 9;
 const STATUS_HIGH_SPEED: u32 = 1 << 10;
+const CHANGE_CONNECTION: u32 = 1 << 16;
 const CHANGE_RESET: u32 = 1 << (16 + 4);
 
 #[derive(Clone, Copy)]
@@ -102,6 +103,26 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
     Ok(true)
 }
 
+/// Whether the device at `route` below root `port` has vanished from the hub it hangs on: asks that hub (a cheap control
+/// transfer on a device that is still there) whether anything is connected to the port. A disk behind a hub gets no
+/// controller-side removal signal, and a bulk transfer to the missing device takes minutes to give up, so the storage
+/// driver asks before it starts. Only "nothing connected" (or a hub that no longer answers) counts: the change bit alone
+/// could be a glitch, and `scan` deals with a replug.
+pub fn child_vanished(controller_index: usize, port: u8, route: u32) -> bool {
+    let Some(controller) = xhci::controller(controller_index) else { return true };
+    for hub in hubs().iter().flatten() {
+        if hub.controller != controller_index || hub.device.port != port {
+            continue;
+        }
+        for hub_port in 1..=hub.ports {
+            if route_of(&hub.device, hub_port) == route {
+                return port_status(controller, &hub.device, hub_port).map_or(true, |status| status & STATUS_CONNECTED == 0);
+            }
+        }
+    }
+    false
+}
+
 /// Looks for devices on every known hub of this controller that are not yet in use.
 /// Whether a hub this driver tracks hangs off root port `port` of controller `controller_index`: the devices below it share
 /// that root port's connection state, so unplug detection for the port as a whole must leave them alone.
@@ -133,7 +154,17 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
         }
         let route = route_of(&hub.device, port);
         if controller.slot_in_use_for_route(hub.device.port, route) {
-            continue;
+            // A device we enumerated here earlier. The hub sets the port's connection-change bit when it goes away or is
+            // replaced (we cleared it after enumerating), so a set bit means "not the device we know": mark its disk
+            // stale (a returning stick takes its old number back in usb_storage::register), release its slot and any
+            // keyboard in it, and enumerate the port afresh.
+            if status & CHANGE_CONNECTION == 0 {
+                continue;
+            }
+            crate::println!("USB: xHCI hub port {}.{port}: its device was unplugged or replugged; looking at the port again.", hub.device.path());
+            crate::usb_storage::mark_xhci_route_stale(controller_index, hub.device.port, route);
+            crate::usb_hid::release_port(controller, hub.device.port, Some(route));
+            let _ = port_feature(controller, &hub.device, REQUEST_CLEAR_FEATURE, FEATURE_C_PORT_CONNECTION, port);
         }
         // Real hubs and devices sometimes fail the first attempt: start over (reset
         // included) a few times, and say what failed.

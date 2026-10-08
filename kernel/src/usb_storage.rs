@@ -152,6 +152,7 @@ impl Msc {
             // SuperSpeed link, and failing a working boot disk at once would be worse than a slow failure. (A replug is still
             // handled: `usb rescan` sees the change bit and checks the old handle by really using it.)
             Host::Xhci { controller, device } if device.route == 0 => xhci::controller(controller).map_or(true, |c| c.port_status(device.port) & 1 == 0),
+            Host::Xhci { controller, device } => crate::usb_hub::child_vanished(controller, device.port, device.route),
             _ => false,
         }
     }
@@ -338,6 +339,20 @@ pub fn mark_xhci_port_stale(controller_index: usize, port: u8) {
     for slot in 0..MAX_DEVICES {
         if let Some(Msc { host: Host::Xhci { controller, device }, stale, .. }) = device(slot) {
             if *controller == controller_index && device.port == port {
+                *stale = true;
+            }
+        }
+    }
+}
+
+/// The same for the disks behind one hub port: the device on `port` at hub-port `route` (and anything below it, when it is a
+/// hub itself) went away or was replaced. Used by `usb_hub::scan`, which sees it in the hub's port status.
+pub fn mark_xhci_route_stale(controller_index: usize, port: u8, route: u32) {
+    let nibbles = (32 - route.leading_zeros()).div_ceil(4);
+    let mask = if nibbles >= 8 { u32::MAX } else { (1u32 << (4 * nibbles)) - 1 };
+    for slot in 0..MAX_DEVICES {
+        if let Some(Msc { host: Host::Xhci { controller, device }, stale, .. }) = device(slot) {
+            if *controller == controller_index && device.port == port && device.route & mask == route {
                 *stale = true;
             }
         }
