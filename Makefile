@@ -305,7 +305,7 @@ test-bios-placement: image
 	python3 tools/test_bios_placement.py
 
 # Every test-* target in turn (slow); prints a summary and fails if any failed. Run one by name for quick iteration.
-ALL_TESTS := $(filter-out test-all test-bios test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode
+ALL_TESTS := $(filter-out test-all test-bios test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode,$(filter test-%,$(shell sed -n '/[$$]/d;s/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode
 .PHONY: test-all
 test-all: image
 	@failed=""; for t in $(ALL_TESTS); do \
