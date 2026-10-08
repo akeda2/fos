@@ -124,6 +124,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             apic::end_of_interrupt();
         }
         v if v == u64::from(apic::SPURIOUS_VECTOR) => {} // a spurious interrupt needs no EOI
+        v if (u64::from(apic::LEGACY_PIC_BASE)..u64::from(apic::LEGACY_PIC_BASE) + 16).contains(&v) => apic::legacy_pic_interrupt(),
         v if v < 32 => fault::fatal(frame),
         v => println!("Unexpected interrupt vector {v}."),
     }
@@ -447,6 +448,16 @@ fn self_test_allocator() {
 fn self_test_interrupts(fadt: &acpi::Fadt) {
     unsafe { core::arch::asm!("int3") };
     println!("Exception self-test: {} breakpoint(s) delivered and handled.", BREAKPOINTS.load(core::sync::atomic::Ordering::Relaxed));
+    // The retired 8259s can still deliver a spurious IRQ7 (vector 0x37) now and then; inject one by software to prove it is
+    // ignored instead of taken for a fault (the real thing stopped an AMD/nForce board at exactly this point).
+    let before = apic::legacy_pic_interrupts();
+    unsafe { core::arch::asm!("int 0x37") };
+    println!(
+        "Legacy PIC: remapped to vectors {:#x}-{:#x} and masked; a spurious IRQ7 ({} injected) is ignored.",
+        apic::LEGACY_PIC_BASE,
+        apic::LEGACY_PIC_BASE + 15,
+        apic::legacy_pic_interrupts() - before
+    );
 
     let start_ticks = apic::ticks();
     let mask: u64 = if fadt.pm_timer_32_bit { 0xffff_ffff } else { 0x00ff_ffff };

@@ -1420,7 +1420,7 @@ fn execute(command: &str) {
         }
         "uptime" => {
             let ticks = apic::ticks();
-            crate::println!("{} ticks at {} Hz ({} s)", ticks, apic::TICK_HZ, ticks / apic::TICK_HZ);
+            crate::println!("{} ticks at {} Hz ({} s); spurious legacy-PIC interrupts: {}", ticks, apic::TICK_HZ, ticks / apic::TICK_HZ, apic::legacy_pic_interrupts());
         }
         "dmesg" => crate::print(format_args!("{}", crate::log::contents())),
         "shutdown" | "halt" => {

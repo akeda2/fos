@@ -127,6 +127,32 @@ def monitor(path: str, command: str):
         time.sleep(0.5)
 
 
+def monitor_output(path: str, command: str) -> str:
+    """Sends one human-monitor command and returns what the monitor printed in answer."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(2)
+        for _ in range(100):
+            try:
+                sock.connect(path)
+                break
+            except OSError:
+                time.sleep(0.05)
+        sock.sendall(command.encode() + b"\n")
+        answer = bytearray()
+        end = time.monotonic() + 3
+        while time.monotonic() < end:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            answer.extend(chunk)
+            if answer.rstrip().endswith(b"(qemu)") and command.encode() in answer:
+                break
+        return answer.decode("utf-8", "replace")
+
+
 def read_ppm(path: Path):
     data = path.read_bytes()
     match = re.match(rb"P6\s+(\d+)\s+(\d+)\s+(\d+)\s", data)
@@ -169,6 +195,7 @@ def main():
                     raw.extend(os.read(process.stdout.fileno(), 4096))
             time.sleep(0.3)
             text = clean(bytes(raw))
+            pic = monitor_output(monitor_path, "info pic")
             monitor(monitor_path, f"screendump {shot}")
             for _ in range(50):
                 if shot.exists() and shot.stat().st_size > 1000:
@@ -251,6 +278,11 @@ def main():
     check(re.search(r"ACPI (1\.0|2\.0\+): PM timer at port 0x[0-9a-f]+ \(\d+-bit\), local APIC at 0x[0-9a-f]+", text) is not None, "the kernel reads the ACPI FADT and MADT", text)
     check("ticking at 100 Hz" in text, "the local APIC timer is calibrated and running", text)
     check("1 breakpoint(s) delivered and handled" in text, "a breakpoint exception is delivered and handled", text)
+    check("Legacy PIC: remapped to vectors 0x30-0x3f and masked; a spurious IRQ7 (1 injected) is ignored." in text,
+          "a spurious legacy IRQ7 (vector 0x37) is ignored, not taken for a fault", text)
+    # The controllers themselves, as QEMU models them: re-initialised away from the exception vectors and fully masked.
+    check("pic0:" in pic and "irq_base=30" in pic and "pic1:" in pic and "irq_base=38" in pic and pic.count("imr=ff") == 2,
+          "and the 8259 pair is remapped to 0x30/0x38 with every line masked (BIOS defaults: 0x08/0x70)", pic)
     milliseconds = re.search(r"100 ticks took (\d+) ms by the PM timer", text)
     check(milliseconds is not None and 900 <= int(milliseconds.group(1)) <= 1100, f"100 timer ticks take about a second by the independent PM timer ({milliseconds and milliseconds.group(1)} ms)", text)
     check(re.search(r"PCI: \d+ functions found", text) is not None, "the kernel scans PCI", text)

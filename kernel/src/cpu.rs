@@ -5,6 +5,12 @@ pub fn outb(port: u16, value: u8) {
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
 }
 
+/// A write to the unused "POST code" port 0x80: about a microsecond on the ISA bus, which is what the 8259 needs between
+/// the bytes of its initialisation sequence (some chipsets' PICs lose a byte sent back to back).
+pub fn io_wait() {
+    outb(0x80, 0);
+}
+
 pub fn outw(port: u16, value: u16) {
     unsafe { core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) };
 }

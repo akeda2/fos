@@ -95,7 +95,9 @@ this kernel.
 Hardware rules that apply to every driver (details in `docs/history/` and the
 drivers' own header comments): after a reset, even a register read can hang some
 silicon; bounded waits only; every command-register write on the 3C905 waits for
-`CmdInProgress`; RTL8168 RDU/FOVW are masked until the ring is drained; QEMU accepts
+`CmdInProgress`; RTL8168 RDU/FOVW are masked until the ring is drained; the legacy 8259s are
+re-initialised to vectors 0x30-0x3F and masked before interrupts are enabled (masking alone lets a real
+8259 deliver a spurious IRQ7 as vector 15, which stopped the AMD/nForce board); QEMU accepts
 orderings real chips do not, so say in the commit message what only real hardware can
 check. Inline documentation is mandatory for hardware-facing code: ABI, register
 behaviour, timing assumptions, and why.

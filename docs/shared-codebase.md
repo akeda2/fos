@@ -202,6 +202,19 @@ Still open: nothing has run on real hardware (unreal mode, A20, E820 and VBE qui
 board is the first target); the VGA text fallback above; the 4 GiB identity map in stage two limits where the kernel can be
 placed (fine: it moves its own page tables first thing).
 
+### 4.6 First real hardware: AMD/nForce (2026-10-08)
+
+Photographed from the screen (no serial adapter at hand): the BIOS path got all the way to the kernel's interrupt
+self-test on the real board -- stage two, E820, GPT, the ELF placement, long mode and the VBE framebuffer all worked on
+real silicon -- and stopped with `reserved exception (vector 15)` right after interrupts were enabled. Cause: the BIOS leaves
+the 8259 PICs on vectors 8-15; the kernel only masked them, and masking a line that had already raised INT makes a real
+8259 answer the next acknowledge with a spurious IRQ7 (vector 15, which the dispatcher treats as a fatal exception).
+Fix: `apic::retire_legacy_pic` runs the 8259 initialisation sequence (clearing any pending request), moves the pair to
+vectors 0x30-0x3F, masks every line, and `interrupt_dispatch` ignores anything arriving there (counted; `uptime` shows it).
+QEMU never produces the real condition, so the tests inject a spurious IRQ7 by software (`int 0x37`) and read QEMU's
+`info pic` for the remap and masks. Lesson recorded in AGENTS.md: a firmware's leftover interrupt-controller state is
+a hardware fact the emulator hides.
+
 ## 5. Migration, in order
 
 | # | Step | Done when |

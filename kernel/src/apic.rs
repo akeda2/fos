@@ -20,6 +20,57 @@ const REG_IRR: u32 = 0x200;
 
 pub const TIMER_VECTOR: u8 = 0x40;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
+/// Where the retired 8259 pair's sixteen lines are moved: vectors 0x30-0x3F, which nothing else uses (the timer is 0x40,
+/// the keyboard 0x41, MSI 0x50, legacy INTx 0x60).
+pub const LEGACY_PIC_BASE: u8 = 0x30;
+/// Interrupts that arrived on those vectors. With every line masked the only ones that can are *spurious*: see
+/// [`retire_legacy_pic`].
+static LEGACY_PIC_INTERRUPTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The legacy 8259 interrupt controllers are not used (the local APIC and the I/O APIC are), but they cannot just be left
+/// alone or masked:
+///
+/// * A BIOS leaves them delivering IRQ0-7 on vectors 8-15 and IRQ8-15 on 0x70-0x77. Vectors 8-15 are CPU exceptions, so a
+///   legacy interrupt arriving there is taken for a fault (vector 8 is the double fault).
+/// * Masking a line that has already raised the CPU's INT pin makes a real 8259 answer the next interrupt acknowledge
+///   with a *spurious IRQ7* (vector 15, "reserved exception"). The kernel enables interrupts moments after this, so the
+///   machine stops right there. Emulators do not do this; an AMD/nForce board did.
+///
+/// So: run the controllers' initialisation sequence (ICW1-ICW4), which also clears any pending request, give them bases
+/// 0x30 and 0x38 so that nothing they can deliver collides with an exception, then mask all sixteen lines. A spurious
+/// IRQ7 or IRQ15 can still happen occasionally (a glitch on a line); it arrives on 0x37 or 0x3F and
+/// [`legacy_pic_interrupt`] ignores it. Interrupts must still be off when this runs.
+fn retire_legacy_pic() {
+    cpu::outb(0x20, 0x11); // ICW1: initialise, expect ICW4, cascade mode
+    cpu::io_wait();
+    cpu::outb(0xa0, 0x11);
+    cpu::io_wait();
+    cpu::outb(0x21, LEGACY_PIC_BASE); // ICW2: the master's vector base (IRQ0-7)
+    cpu::io_wait();
+    cpu::outb(0xa1, LEGACY_PIC_BASE + 8); // ICW2: the slave's (IRQ8-15)
+    cpu::io_wait();
+    cpu::outb(0x21, 4); // ICW3: the slave hangs off the master's IRQ2
+    cpu::io_wait();
+    cpu::outb(0xa1, 2); // ICW3: the slave's cascade identity
+    cpu::io_wait();
+    cpu::outb(0x21, 0x01); // ICW4: 8086 mode
+    cpu::io_wait();
+    cpu::outb(0xa1, 0x01);
+    cpu::io_wait();
+    cpu::outb(0x21, 0xff); // OCW1: mask every line
+    cpu::outb(0xa1, 0xff);
+}
+
+/// An interrupt on one of the retired PIC's vectors. They are all masked, so this is a spurious one (or a glitch): no
+/// end-of-interrupt is sent (a spurious interrupt is not "in service", and sending one would acknowledge a different line).
+pub fn legacy_pic_interrupt() {
+    LEGACY_PIC_INTERRUPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many have been seen since boot.
+pub fn legacy_pic_interrupts() -> u64 {
+    LEGACY_PIC_INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed)
+}
 /// The kernel's tick rate.
 pub const TICK_HZ: u64 = 100;
 
@@ -168,10 +219,7 @@ pub fn start_timer(fadt: &acpi::Fadt, madt_address: u64) -> Option<Report> {
     if edx & (1 << 9) == 0 {
         return None; // no local APIC
     }
-    // The legacy 8259 pair is not used: mask every line so a stray legacy interrupt
-    // cannot reach the CPU.
-    cpu::outb(0x21, 0xff);
-    cpu::outb(0xa1, 0xff);
+    retire_legacy_pic();
 
     let msr = cpu::read_msr(cpu::MSR_APIC_BASE);
     let x2apic = msr & APIC_BASE_X2APIC != 0;
