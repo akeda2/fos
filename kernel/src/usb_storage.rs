@@ -106,6 +106,11 @@ struct Msc {
     /// The INQUIRY data and the size, to recognise the same stick when it comes back after being unplugged.
     identity: [u8; 36],
     blocks: u64,
+    /// The controller released this device's slot (its port was found changed and enumerated afresh). The handle names a slot
+    /// number that may now be free (its rings are gone: a command through it would write to a null ring) or reused by the
+    /// very device that came back (a command would succeed against the wrong connection, and the returning stick would look like
+    /// a second disk). A stale handle is dead: it fails at once and is only ever replaced.
+    stale: bool,
 }
 
 static mut DEVICES: [Option<Msc>; MAX_DEVICES] = [None; MAX_DEVICES];
@@ -136,6 +141,9 @@ impl Msc {
     /// if it were gone): its root port reports no device or a connection change since it was enumerated. Asking the port is
     /// instant; letting a transfer to a missing device time out takes seconds per attempt, and a filesystem lookup makes many.
     fn is_gone(&self) -> bool {
+        if self.stale {
+            return true;
+        }
         match self.host {
             Host::Ehci { controller, root_port, .. } if root_port != 0 => {
                 ehci::controller(controller).map_or(true, |c| !c.port_has_device(root_port) || c.port_connect_changed(root_port))
@@ -323,17 +331,30 @@ pub fn write(index: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Called when xHCI root port `port` of controller `controller_index` is about to have its slots released: every disk on that
+/// port (a hub's devices share its root port) becomes stale (see `Msc::stale`). It stays registered, so that the same stick
+/// coming back takes over its disk number.
+pub fn mark_xhci_port_stale(controller_index: usize, port: u8) {
+    for slot in 0..MAX_DEVICES {
+        if let Some(Msc { host: Host::Xhci { controller, device }, stale, .. }) = device(slot) {
+            if *controller == controller_index && device.port == port {
+                *stale = true;
+            }
+        }
+    }
+}
+
 /// Registers a freshly addressed xHCI device with a Mass Storage interface as a disk.
 /// The caller has already issued SET_CONFIGURATION. Returns the block-layer disk number.
 pub fn attach_xhci(controller_index: usize, controller: &mut xhci::Controller, device: xhci::Device, endpoints: Endpoints) -> Option<usize> {
     controller.configure_bulk_endpoints(&device, endpoints.in_endpoint, endpoints.in_max_packet, endpoints.in_burst, endpoints.out_endpoint, endpoints.out_max_packet, endpoints.out_burst).ok()?;
-    register(Msc { host: Host::Xhci { controller: controller_index, device }, endpoints, tag: 0, identity: [0; 36], blocks: 0 }, "USB xHCI")
+    register(Msc { host: Host::Xhci { controller: controller_index, device }, endpoints, tag: 0, identity: [0; 36], blocks: 0, stale: false }, "USB xHCI")
 }
 
 /// `root_port` is the EHCI root port the device sits on directly (1-based), or 0 behind a hub: only a direct device's removal
 /// can be seen from the controller's port register, and that is what lets a vanished disk fail at once.
 pub fn attach_ehci(controller_index: usize, target: ehci::Target, root_port: u8, endpoints: Endpoints) -> Option<usize> {
-    register(Msc { host: Host::Ehci { controller: controller_index, target, root_port, in_toggle: false, out_toggle: false }, endpoints, tag: 0, identity: [0; 36], blocks: 0 }, "USB EHCI")
+    register(Msc { host: Host::Ehci { controller: controller_index, target, root_port, in_toggle: false, out_toggle: false }, endpoints, tag: 0, identity: [0; 36], blocks: 0, stale: false }, "USB EHCI")
 }
 
 fn register(mut msc: Msc, origin: &str) -> Option<usize> {

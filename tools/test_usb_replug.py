@@ -24,13 +24,16 @@ from test_boot import IMAGE, check, clean, monitor_output  # noqa: E402
 
 
 class Machine:
-    def __init__(self, tmp, boot, stick, controller="usb-ehci"):
+    def __init__(self, tmp, boot, stick, controller="usb-ehci", boot_from_stick=False):
         self.monitor_path = str(Path(tmp) / "monitor")
+        disks = [] if boot_from_stick else ["-drive", f"format=raw,file={boot}"]
+        # the stick sits on an explicit root port so that a replug lands on the same port, as a person's does
+        device = "usb-storage,bus=hc.0,drive=stick,id=stickdev,port=1" + (",bootindex=0" if boot_from_stick else "")
         self.process = subprocess.Popen(
             ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio",
-             "-monitor", f"unix:{self.monitor_path},server,nowait", "-drive", f"format=raw,file={boot}",
+             "-monitor", f"unix:{self.monitor_path},server,nowait", *disks,
              "-device", f"{controller},id=hc", "-drive", f"if=none,id=stick,format=raw,file={stick}",
-             "-device", "usb-storage,bus=hc.0,drive=stick,id=stickdev"],
+             "-device", device],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.raw = bytearray()
 
@@ -92,7 +95,7 @@ def scenario(controller):
 
             # QEMU drops the stick's backing drive along with the device; the same image file is the same stick.
             monitor_output(machine.monitor_path, f"drive_add 0 if=none,id=stick2,format=raw,file={stick}")
-            added = monitor_output(machine.monitor_path, "device_add usb-storage,bus=hc.0,drive=stick2,id=stickdev2")
+            added = monitor_output(machine.monitor_path, "device_add usb-storage,bus=hc.0,drive=stick2,id=stickdev2,port=1")
             check("Error" not in added, "QEMU plugs the same stick back in", added)
             machine.pump(2)
             rescan = machine.run("usb rescan", 60)
@@ -107,9 +110,42 @@ def scenario(controller):
             machine.close()
 
 
+def boot_disk_scenario():
+    """The machine's own boot stick (on xHCI) is unplugged and plugged back in on the same port: it must come back as
+    disk1, not as a second disk. (Found on the Skylake: the old handle named a slot number that was freed and, depending on
+    the numbering, either aliased the new connection -- so the old disk looked healthy and the returning stick became a
+    duplicate -- or pointed at a freed ring and crashed the kernel.)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        image = tmp / "boot.img"
+        shutil.copy(IMAGE, image)
+        machine = Machine(tmp, image, image, "qemu-xhci", boot_from_stick=True)
+        try:
+            machine.wait_for("fos> ", 90)
+            disks = machine.run("disks")
+            check("disk1:" in disks and "USB xHCI" in disks and "disk2" not in disks, "xHCI boot stick: it is disk1, the only disk", disks)
+            monitor_output(machine.monitor_path, "device_del stickdev")
+            machine.pump(2)
+            monitor_output(machine.monitor_path, f"drive_add 0 if=none,id=stick2,format=raw,file={image}")
+            added = monitor_output(machine.monitor_path, "device_add usb-storage,bus=hc.0,drive=stick2,id=stickdev2,port=1")
+            check("Error" not in added, "xHCI boot stick: plugged back in on the same port", added)
+            machine.pump(2)
+            rescan = machine.run("usb rescan", 60)
+            alive = machine.process.poll() is None and "CPU EXCEPTION" not in machine.text()
+            check(alive, "the kernel survives `usb rescan` (no fault through a released slot)", machine.text()[-1500:])
+            check("is back; disk1 works again" in machine.text(), "the returning boot stick takes over disk1", rescan)
+            disks = machine.run("disks")
+            check("disk2" not in disks, "and no duplicate disk2 appears", disks)
+            files = machine.run("ls")
+            check("readme.txt" in files, "`ls` on the boot volume works again", files)
+        finally:
+            machine.close()
+
+
 def main():
     for controller in ("usb-ehci", "qemu-xhci"):
         scenario(controller)
+    boot_disk_scenario()
     print("usb replug: all checks passed")
 
 

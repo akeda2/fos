@@ -297,3 +297,20 @@ alternative that needs no code: record to an internal SATA/NVMe SSD formatted ex
 joiners); `play` from a named FAT disk (`fs_read` already reads FAT files, untested).
 (A wall-clock call in the tape ABI, `wall_clock`, was done on 2026-10-07; see docs/recorder.md.)
 
+## BIOS path: the VBE mode does not fill the screen and the text looks pixelated
+
+Reported 2026-10-08 after the first real-hardware runs (AMD/nForce, BIOS mode). Stage two picks the *largest* 32-bit linear
+VBE mode up to **1280x1024** (`boot/bios/stage2.S`, `vbe_setup`). On a monitor whose native mode is bigger or of a different
+shape (a 1920x1080 panel), that mode is scaled by the monitor: the picture does not fill the screen (4:3 or 5:4 on a 16:9
+panel) and the 8x16 bitmap font is stretched, which looks pixelated. UEFI machines get the firmware's own GOP mode (the
+Skylake: 1920x1080 at its native size), so they look right.
+
+Ideas, roughly in order of value:
+1. Ask the monitor: VBE/DDC (INT 10h AX=4F15h, BL=01h reads the EDID) gives the preferred timing (native width x height);
+   pick the VBE mode that matches it, falling back to the largest mode below the cap.
+2. Raise or remove the 1280x1024 cap (it was chosen for speed; the kernel maps the framebuffer write-combining, so a larger
+   mode should be fine) and prefer the mode with the biggest area whose aspect ratio is closest to the EDID's.
+3. Scale the console font by an integer factor when the mode is large (2x at 1920x1080), so text keeps a readable size
+   instead of getting tiny; the console's rows and columns follow the scale.
+Not decided; needs a look at what the video BIOS of the machines at hand reports (`bootinfo` shows the mode in use).
+

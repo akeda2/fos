@@ -59,6 +59,7 @@ pub fn probe_all() -> usize {
                 if crate::usb_hub::has_hub_on_port(index, port) || (controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port)) {
                     continue;
                 }
+                usb_storage::mark_xhci_port_stale(index, port); // before the slots go: nothing may use them again
                 controller.release_port_slots(port);
                 crate::println!("USB: xHCI {:02x}:{:02x}.{} port {port}: its device was unplugged or replugged; looking at the port again.",
                     controller.pci.bus, controller.pci.device, controller.pci.function);
