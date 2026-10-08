@@ -568,6 +568,17 @@ firmware, so a pending slot is tried on the next boot.
   carry a full Ethernet frame (it panicked on anything over 1024 bytes). Not done: `chat`, `tape load HOST NAME`,
   `tape send`. Tested (`make test-v2-netfs`): foscopy both ways with a 37-chunk round trip compared byte for byte,
   refusals, and two guests copying to and from each other.
+  **RTL8139 driver (`rtl8139.rs`):** ported from v1 (`10ec:8139`), I/O-port BAR0, one 32 KiB receive ring with `WRAP` and four
+  transmit slots, all DMA below 4 GiB, polling with interrupts only to wake the CPU. The v1 hardware lessons are kept and
+  listed at the top of the file: `CR.TE|RE` before `RCR`/`TCR`, the standard interframe gap, bad-status frames stepped over,
+  and a full software reset for a nonsensical ring length, a link down-to-up transition (`MSR.LINKB`), receive overflow or a
+  transmit abort. The card has no MSI, so legacy INTx through the I/O APIC is tried (pins probed) and kept only if a self-test
+  interrupt arrives; the card has no "interrupt now" command, so the self-test uses its timer (`TimerInt`/`TCTR`, `ISR.TimeOut`).
+  Differences from v1: `set_multicast` programs the `MAR` hash filter (v1 left it zero, which dropped multicast frames), and
+  promiscuous mode resets and reprograms the card instead of editing `RCR` in place, because QEMU restarts the receive ring on
+  any `RCR` write. Tested with `make test-v2-rtl8139` (QEMU `-device rtl8139` as the only NIC: INTx self-test, discovery both
+  ways against an e1000 guest, promiscuous sniff of a frame for another MAC, NETFS round trips up to 300 KB). Link-recovery,
+  overflow and the real chip's `RCR` behaviour are not covered by QEMU.
   **3Com 3C905 driver (`threecom.rs`):** ported from v1 (3C905, 3C905B, 3C905C: `10b7:9050` to `10b7:9200`), I/O-port BAR1 (or
   BAR0), a 64-descriptor upload ring and one download descriptor, all DMA below 4 GiB, polling with interrupts only to wake
   the CPU. The v1 hardware lessons are kept and written at the top of the file: every command-register write waits for

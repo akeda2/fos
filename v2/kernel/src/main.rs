@@ -45,6 +45,7 @@ mod nic;
 mod nvme;
 mod paging;
 mod pci;
+mod rtl8139;
 mod rtl8168;
 mod threecom;
 mod power;
@@ -335,6 +336,33 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
             Err(error) => println!("rtl8168 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
         }
     }
+    for device in pci::devices().filter(|d| d.vendor == rtl8139::VENDOR_REALTEK && rtl8139::DEVICE_IDS.contains(&d.id)) {
+        match rtl8139::Rtl8139::init(&device, interfaces) {
+            Ok(mut nic) => {
+                println!(
+                    "rtl8139 at {:02x}:{:02x}.{} (I/O {:#06x}): MAC {}, link {}.",
+                    device.bus,
+                    device.device,
+                    device.function,
+                    nic.io_base(),
+                    term::Mac(&nic.mac),
+                    if nic.link_up() { "up" } else { "down" }
+                );
+                if config::no_msi() {
+                    println!("  interrupts: polled (settings: no-msi).");
+                } else {
+                    match nic.enable_interrupts(&device) {
+                        Ok(delivery) => println!("  interrupts: {delivery:?} (the self-test interrupt arrived); frames wake the CPU instead of being polled for."),
+                        Err(reason) => println!("  interrupts: polled ({reason})."),
+                    }
+                }
+                if term::install(nic::Nic::Rtl8139(nic), info.runtime_services).is_some() {
+                    interfaces += 1;
+                }
+            }
+            Err(error) => println!("rtl8139 at {:02x}:{:02x}.{}: initialisation failed ({error:?}).", device.bus, device.device, device.function),
+        }
+    }
     for device in pci::devices().filter(|d| d.vendor == threecom::VENDOR_3COM && threecom::DEVICE_IDS.contains(&d.id)) {
         match threecom::ThreeCom::init(&device, interfaces) {
             Ok(mut nic) => {
@@ -363,7 +391,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         }
     }
     if interfaces == 0 {
-        println!("No supported network interface found (e1000, e1000e, I350, RTL8168 and 3c905 are driven).");
+        println!("No supported network interface found (e1000, e1000e, I350, RTL8139, RTL8168 and 3c905 are driven).");
     }
 
     if config::debug().crash_on_boot {
