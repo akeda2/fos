@@ -150,6 +150,15 @@ pub fn try_port(port: u8, how: Option<&str>) {
 
 static mut STEP: &str = "";
 
+/// Names the enumeration step in progress, for the "attempt failed at ..." message (the hub setup in `usb_hub` uses it too).
+pub fn set_step(step: &'static str) {
+    unsafe { STEP = step };
+}
+
+pub fn step() -> &'static str {
+    unsafe { STEP }
+}
+
 fn probe_port(controller_index: usize, controller: &mut Controller, port: u8) -> Result<bool, xhci::Error> {
     let device = controller.open_port(port)?;
     probe_device(controller_index, controller, device)

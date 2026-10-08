@@ -68,11 +68,18 @@ fn port_feature(controller: &mut Controller, hub: &Device, request: u8, feature:
 /// powers them and scans for devices. `configuration` is its only configuration's value.
 pub fn enumerate(controller_index: usize, controller: &mut Controller, device: Device, configuration: u8) -> Result<bool, xhci::Error> {
     let super_speed = device.speed >= 4;
+    crate::usb_hid::set_step("set the hub's configuration");
     controller.set_configuration(&device, configuration)?;
     if super_speed {
+        crate::usb_hid::set_step("set the SuperSpeed hub depth");
         // A SuperSpeed hub must be told how many hubs lie between it and the root.
+        // A Realtek 0bda:0401 (the SuperSpeed half of a USB 3 hub on the Skylake) stalls this request. Carrying on without it
+        // lets the hub enumerate, but the device behind it then times out, and a command that times out leaves the xHCI
+        // unable to read the boot disk (the A/B fallback had to revert that kernel): so such a hub stays unsupported, failing
+        // fast here, until command aborts are implemented (DEFERRED.md).
         controller.control_transfer(&device, 0x20, REQUEST_SET_HUB_DEPTH, u16::from(device.tier), 0, &mut [])?;
     }
+    crate::usb_hid::set_step("read the hub descriptor");
     let mut descriptor = [0u8; 12];
     let kind: u16 = if super_speed { 0x2a } else { 0x29 }; // hub descriptor types for USB 3 / USB 2
     controller.control_transfer(&device, 0xa0, REQUEST_GET_DESCRIPTOR, kind << 8, 0, &mut descriptor)?;
@@ -84,6 +91,7 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
         controller.release_slot(device.slot);
         return Ok(false);
     }
+    crate::usb_hid::set_step("tell the controller this slot is a hub");
     controller.configure_hub(&device, ports, ((characteristics >> 5) & 3) as u8)?;
     let slot = hubs().iter_mut().find(|entry| entry.is_none());
     let Some(slot) = slot else {
@@ -176,7 +184,7 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
                 }
                 Ok(false) => break,
                 Err(error) => {
-                    crate::println!("USB: hub port {}.{port}, attempt {attempt}/3 failed: {error:?}.", hub.device.path());
+                    crate::println!("USB: hub port {}.{port}, attempt {attempt}/3 failed at \"{}\": {error:?}.", hub.device.path(), crate::usb_hid::step());
                     crate::usb_hid::release_port(controller, hub.device.port, Some(route));
                     crate::apic::wait_ticks(15);
                 }
@@ -188,6 +196,7 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
 
 fn probe_port(controller_index: usize, controller: &mut Controller, hub: &Hub, port: u8) -> Result<bool, xhci::Error> {
     // Reset the port and wait for the hub to say the reset finished.
+    crate::usb_hid::set_step("reset the hub port");
     port_feature(controller, &hub.device, REQUEST_SET_FEATURE, FEATURE_PORT_RESET, port)?;
     let start = crate::apic::ticks();
     let mut status = 0;
@@ -215,6 +224,7 @@ fn probe_port(controller_index: usize, controller: &mut Controller, hub: &Hub, p
         1
     };
     crate::apic::wait_ticks(3); // reset recovery
+    crate::usb_hid::set_step("address the device behind the hub (enable slot, address device)");
     let device = controller.open_hub_port(&hub.device, port, speed)?;
     crate::usb_hid::probe_device(controller_index, controller, device)
 }

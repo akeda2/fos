@@ -328,3 +328,15 @@ Observations (2026-10-08): typing `reset` over the console while the screen is b
 alive); the AMD board, whose monitor connection is DVI (VBE framebuffer on the BIOS path), recovers fine when the monitor's
 input is switched away and back -- consistent with DisplayPort needing a link retrain that a DVI link does not.
 
+
+## xHCI: SuperSpeed hubs (Realtek 0bda:0401) and command aborts
+
+Found 2026-10-08 on the Skylake with a USB 3 hub (a USB 3 hub is two hubs on one cable: its USB 2 half works, sticks that
+negotiate USB 2 behind it recover from a replug, see `make test-usb-replug`). The SuperSpeed half stalls `SET_HUB_DEPTH`
+(`Transfer(6)` at "set the SuperSpeed hub depth"), so it is not used, and a USB 3 stick in that hub is not found.
+Tolerating the stall (depth 0 is the default) does make the hub enumerate, but the stick behind it then times out on
+Enable Slot/Address Device, and after those command timeouts the xHCI could no longer read the boot disk (FOSFS not
+mounted, slot metadata unwritable): the A/B fallback reverted that kernel. A proper fix needs xHCI command aborts (stop
+the command ring with CA, wait for the Command Ring Stopped event, restart it) so that a timed-out command cannot wedge
+the controller, and then a look at what the stick behind the SuperSpeed hub does at Address Device (a USB 3 device
+behind a hub needs the route string and the hub's depth in its slot context).
