@@ -152,6 +152,9 @@ impl Msc {
             // SuperSpeed link, and failing a working boot disk at once would be worse than a slow failure. (A replug is still
             // handled: `usb rescan` sees the change bit and checks the old handle by really using it.)
             Host::Xhci { controller, device } if device.route == 0 => xhci::controller(controller).map_or(true, |c| c.port_status(device.port) & 1 == 0),
+            Host::Ehci { controller, target, .. } if target.hub_address != 0 => {
+                ehci::controller(controller).map_or(true, |c| c.hub_child_vanished(target.hub_address, target.hub_port))
+            }
             Host::Xhci { controller, device } => crate::usb_hub::child_vanished(controller, device.port, device.route),
             _ => false,
         }
@@ -353,6 +356,18 @@ pub fn mark_xhci_route_stale(controller_index: usize, port: u8, route: u32) {
     for slot in 0..MAX_DEVICES {
         if let Some(Msc { host: Host::Xhci { controller, device }, stale, .. }) = device(slot) {
             if *controller == controller_index && device.port == port && device.route & mask == route {
+                *stale = true;
+            }
+        }
+    }
+}
+
+/// The EHCI counterpart: the disks behind hub `hub_address` (only the one on `hub_port`, or all of them when it is 0) went
+/// away or were replaced, so their handles are dead.
+pub fn mark_ehci_hub_stale(controller_index: usize, hub_address: u8, hub_port: u8) {
+    for slot in 0..MAX_DEVICES {
+        if let Some(Msc { host: Host::Ehci { controller, target, .. }, stale, .. }) = device(slot) {
+            if *controller == controller_index && target.hub_address == hub_address && (hub_port == 0 || target.hub_port == hub_port) {
                 *stale = true;
             }
         }

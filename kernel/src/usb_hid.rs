@@ -345,7 +345,15 @@ fn probe_all_ehci() -> usize {
         for port in 1..=controller.ports {
             if controller.claimed_ports & (1 << port) != 0 {
                 if !controller.port_connect_changed(port) {
-                    continue; // still the device we enumerated
+                    // Still the device we enumerated. If it is a hub, its own ports may have changed: nothing tells the
+                    // host, so ask the hub.
+                    added += rescan_ehci_hub(index, controller, port);
+                    continue;
+                }
+                // The root port itself changed: a hub on it is gone with everything behind it.
+                if let Some(hub_address) = controller.hub_address_on_port(port) {
+                    usb_storage::mark_ehci_hub_stale(index, hub_address, 0);
+                    controller.forget_hub(port);
                 }
                 // It was unplugged, or unplugged and plugged back in (a bumped cable, a stick moved to another machine and
                 // returned). Forget the claim and look at the port afresh; a disk that comes back is recognised in
@@ -410,6 +418,43 @@ fn probe_all_ehci() -> usize {
 /// table entries are freed (a stale entry kept being polled, and the table filled up after four replugs).
 fn forget_ehci_keyboards(controller_index: usize, controller: &mut ehci::Controller, port: u8) {
     let removed = controller.remove_keyboards_on_port(port);
+    let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    for entry in keyboards.iter_mut() {
+        if matches!(*entry, Some(Keyboard { source: Source::Ehci { controller: c, index }, .. }) if c == controller_index && removed & (1 << index) != 0) {
+            *entry = None;
+        }
+    }
+}
+
+/// Asks the hub on EHCI root `port` about its ports: a disk or keyboard that went away is forgotten (disk handles go stale,
+/// so a returning stick takes its old number back in `usb_storage::register`), and what appeared is set up. Returns how
+/// many devices were added.
+fn rescan_ehci_hub(controller_index: usize, controller: &mut ehci::Controller, port: u8) -> usize {
+    let Some(hub_address) = controller.hub_address_on_port(port) else { return 0 };
+    let mut found = [None; 8];
+    let (departed, count) = controller.rescan_hub(port, &mut found);
+    for hub_port in 1..16u8 {
+        if departed & (1 << hub_port) == 0 {
+            continue;
+        }
+        crate::println!("USB: EHCI {:02x}:{:02x}.{} hub port {port}.{hub_port}: its device was unplugged or replugged; looking at the port again.",
+            controller.pci.bus, controller.pci.device, controller.pci.function);
+        usb_storage::mark_ehci_hub_stale(controller_index, hub_address, hub_port);
+        let removed = controller.remove_keyboards_behind(hub_address, hub_port);
+        drop_ehci_keyboard_entries(controller_index, removed);
+    }
+    let mut added = 0;
+    for device in found[..count].iter().flatten() {
+        match setup_ehci_keyboard(controller_index, controller, device, 0, port) {
+            Ok(true) => added += 1,
+            Ok(false) => {}
+            Err(error) => crate::println!("USB: EHCI port {port}: device not usable ({error:?})."),
+        }
+    }
+    added
+}
+
+fn drop_ehci_keyboard_entries(controller_index: usize, removed: u8) {
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
     for entry in keyboards.iter_mut() {
         if matches!(*entry, Some(Keyboard { source: Source::Ehci { controller: c, index }, .. }) if c == controller_index && removed & (1 << index) != 0) {

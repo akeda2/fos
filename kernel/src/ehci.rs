@@ -175,6 +175,21 @@ pub struct Found {
     pub descriptor: [u8; 18],
 }
 
+/// A hub found on a root port (one level is supported): kept so that its ports can be asked about later, because nothing
+/// tells the host when a device behind a hub comes or goes (a root port has a status-change bit; a hub's port is only
+/// visible by asking the hub).
+#[derive(Clone, Copy)]
+struct Hub {
+    root_port: u8,
+    target: Target,
+    ports: u8,
+    /// Bit n: the device on hub port n was addressed by us and is still believed to be there.
+    claimed: u16,
+    power_good_ticks: u64,
+}
+
+const MAX_HUBS: usize = 4;
+
 #[derive(Clone, Copy)]
 struct KeyboardPipe {
     target: Target,
@@ -197,6 +212,7 @@ pub struct Controller {
     last_toggle: bool,
     /// Root ports where a keyboard was found (bit n = port n); rescans skip them.
     pub claimed_ports: u16,
+    hubs: [Option<Hub>; MAX_HUBS],
     keyboards: [Option<KeyboardPipe>; MAX_KEYBOARDS],
 }
 
@@ -315,7 +331,7 @@ impl Controller {
             }
         }
         apic::wait_ticks(15);
-        Ok(Controller { pci: device, operational, ports, frame, next_address: 1, step: "", last_toggle: false, claimed_ports: 0, keyboards: [None; MAX_KEYBOARDS] })
+        Ok(Controller { pci: device, operational, ports, frame, next_address: 1, step: "", last_toggle: false, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
     }
 
     fn port_register(&self, port: u8) -> usize {
@@ -624,21 +640,103 @@ impl Controller {
         self.control_transfer(&hub, 0xa0, 0x06, 0x2900, 0, &mut hub_descriptor)?;
         let hub_ports = hub_descriptor[2].min(8);
         let power_good_ticks = u64::from(hub_descriptor[5]).max(10) * 2 / 10 + 1; // bPwrOn2PwrGood is in 2 ms units
+        crate::println!("USB: EHCI port {port}: a hub with {hub_ports} port(s), vendor {:04x} product {:04x}.", u16::from_le_bytes([device.descriptor[8], device.descriptor[9]]), u16::from_le_bytes([device.descriptor[10], device.descriptor[11]]));
         let mut count = 0;
+        let mut claimed = 0u16;
         for hub_port in 1..=hub_ports {
             match self.hub_bring_up_port(&hub, hub_port, power_good_ticks) {
                 Ok(speed) => {
                     if let Ok(child) = self.address_default_device(speed, hub.address, hub_port) {
+                        claimed |= 1 << hub_port;
                         if count < found.len() {
                             found[count] = Some(child);
                             count += 1;
                         }
                     }
                 }
-                Err(_) => continue, // nothing there, or it would not reset
+                Err(error) => {
+                    // "look for a device" failing just means the port is empty; anything later is worth saying.
+                    if self.step != "look for a device on a hub port" {
+                        crate::println!("USB: EHCI hub port {port}.{hub_port}: bring-up failed ({error:?} at \"{}\").", self.step);
+                    }
+                    continue;
+                }
             }
         }
+        self.forget_hub(port);
+        if let Some(slot) = self.hubs.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(Hub { root_port: port, target: hub, ports: hub_ports, claimed, power_good_ticks });
+        }
         Ok(count)
+    }
+
+    /// The hub on root `port`, if one was enumerated there: its USB address, for marking the disks behind it stale.
+    pub fn hub_address_on_port(&self, port: u8) -> Option<u8> {
+        self.hubs.iter().flatten().find(|hub| hub.root_port == port).map(|hub| hub.target.address)
+    }
+
+    /// Drops what is known about the hub on root `port` (the port's device went away, or is about to be enumerated again).
+    pub fn forget_hub(&mut self, port: u8) {
+        for slot in self.hubs.iter_mut() {
+            if slot.is_some_and(|hub| hub.root_port == port) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// A hub port's status and change words (`GET_STATUS`, class request to the port).
+    fn hub_port_status(&mut self, hub: &Target, port: u8) -> Result<(u16, u16), Error> {
+        let mut raw = [0u8; 4];
+        self.control_transfer(hub, 0xa3, 0x00, 0, u16::from(port), &mut raw)?;
+        Ok((u16::from_le_bytes([raw[0], raw[1]]), u16::from_le_bytes([raw[2], raw[3]])))
+    }
+
+    /// Whether the device behind `hub_address`'s port `hub_port` has gone: its root port has lost the hub, the hub no longer
+    /// answers, or the hub says nothing is connected. A disk behind a hub gets no removal signal from the controller, and a
+    /// transfer to a missing device takes a long time to give up, so the storage driver asks first.
+    pub fn hub_child_vanished(&mut self, hub_address: u8, hub_port: u8) -> bool {
+        let Some(hub) = self.hubs.iter().flatten().find(|hub| hub.target.address == hub_address).copied() else { return true };
+        if !self.port_has_device(hub.root_port) || self.port_connect_changed(hub.root_port) {
+            return true;
+        }
+        self.hub_port_status(&hub.target, hub_port).map_or(true, |(state, _)| state & 1 == 0)
+    }
+
+    /// Looks at every port of the hub on root `port`: a device that went away or was replaced (the port's connection-change
+    /// bit, which we cleared after addressing it) is reported in the returned mask of hub ports, and a device on a port we
+    /// have no claim on is brought up and put in `found`. Returns `(departed mask, found count)`.
+    pub fn rescan_hub(&mut self, port: u8, found: &mut [Option<Found>; 8]) -> (u16, usize) {
+        let Some(mut hub) = self.hubs.iter().flatten().find(|hub| hub.root_port == port).copied() else { return (0, 0) };
+        const C_PORT_CONNECTION: u16 = 16;
+        let (mut departed, mut count) = (0u16, 0usize);
+        for hub_port in 1..=hub.ports {
+            let Ok((state, change)) = self.hub_port_status(&hub.target, hub_port) else { break };
+            let claimed = hub.claimed & (1 << hub_port) != 0;
+            if claimed && (state & 1 == 0 || change & 1 != 0) {
+                departed |= 1 << hub_port;
+                hub.claimed &= !(1 << hub_port);
+                let _ = self.control_transfer(&hub.target, 0x23, 0x01, C_PORT_CONNECTION, u16::from(hub_port), &mut []);
+            }
+            if hub.claimed & (1 << hub_port) == 0 && state & 1 != 0 {
+                match self.hub_bring_up_port(&hub.target, hub_port, hub.power_good_ticks) {
+                    Ok(speed) => match self.address_default_device(speed, hub.target.address, hub_port) {
+                        Ok(child) => {
+                            hub.claimed |= 1 << hub_port;
+                            if count < found.len() {
+                                found[count] = Some(child);
+                                count += 1;
+                            }
+                        }
+                        Err(error) => crate::println!("USB: EHCI hub port {port}.{hub_port}: a device is there but would not address ({error:?} at \"{}\").", self.step),
+                    },
+                    Err(error) => crate::println!("USB: EHCI hub port {port}.{hub_port}: a device is there but its port would not reset ({error:?}; hub status {state:#06x})."),
+                }
+            }
+        }
+        if let Some(slot) = self.hubs.iter_mut().flatten().find(|slot| slot.root_port == port) {
+            *slot = hub;
+        }
+        (departed, count)
     }
 
     /// Powers a hub port, waits for a device, resets it, and returns the speed it
@@ -654,11 +752,18 @@ impl Controller {
             controller.control_transfer(hub, 0xa3, 0x00, 0, port_index, &mut raw)?;
             Ok((u16::from_le_bytes([raw[0], raw[1]]), u16::from_le_bytes([raw[2], raw[3]])))
         };
+        self.step = "power a hub port";
         self.control_transfer(hub, 0x23, 0x03, PORT_POWER_FEATURE, port_index, &mut [])?;
         apic::wait_ticks(power_good_ticks.max(10));
-        if status(self)?.0 & 1 == 0 {
+        self.step = "look for a device on a hub port";
+        let (state, change) = status(self)?;
+        if state & 1 == 0 {
+            if state & !0x0100 != 0 || change != 0 {
+                crate::println!("USB: EHCI hub port {port}: nothing connected, but status {state:#06x} change {change:#06x}.");
+            }
             return Err(Error::NoDevice);
         }
+        self.step = "reset a hub port";
         let _ = self.control_transfer(hub, 0x23, 0x01, C_PORT_CONNECTION, port_index, &mut []);
         self.control_transfer(hub, 0x23, 0x03, PORT_RESET_FEATURE, port_index, &mut [])?;
         for _ in 0..20 {
@@ -731,6 +836,23 @@ impl Controller {
         let mut removed = 0u8;
         for index in 0..MAX_KEYBOARDS {
             if self.keyboards[index].is_some_and(|pipe| pipe.root_port == port) {
+                self.keyboards[index] = None;
+                removed |= 1 << index;
+            }
+        }
+        if removed != 0 {
+            self.relink();
+            self.set_async(true);
+        }
+        removed
+    }
+
+    /// Takes the keyboards behind hub port `hub_port` of hub `hub_address` off the async list (that device was unplugged or
+    /// replaced). Returns a bit mask of the removed keyboard indexes.
+    pub fn remove_keyboards_behind(&mut self, hub_address: u8, hub_port: u8) -> u8 {
+        let mut removed = 0u8;
+        for index in 0..MAX_KEYBOARDS {
+            if self.keyboards[index].is_some_and(|pipe| pipe.target.hub_address == hub_address && pipe.target.hub_port == hub_port) {
                 self.keyboards[index] = None;
                 removed |= 1 << index;
             }
