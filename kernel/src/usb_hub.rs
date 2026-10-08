@@ -70,19 +70,24 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
     let super_speed = device.speed >= 4;
     crate::usb_hid::set_step("set the hub's configuration");
     controller.set_configuration(&device, configuration)?;
+    // `usb try` experiments on a Realtek 0bda:0401 (the SuperSpeed half of a USB 3 hub on the Skylake) showed that the first
+    // hub-class request after SET_CONFIGURATION is stalled, whichever it is (depth, hub descriptor), and the next one works.
+    // The hub is still starting up after being configured (USB allows a device 50 ms to recover from SET_CONFIGURATION), so
+    // give it that time and, if it stalls anyway, ask again once (`control_transfer` has already cleared the stall).
+    crate::apic::wait_ticks(5);
     if super_speed {
         crate::usb_hid::set_step("set the SuperSpeed hub depth");
         // A SuperSpeed hub must be told how many hubs lie between it and the root.
-        // A Realtek 0bda:0401 (the SuperSpeed half of a USB 3 hub on the Skylake) stalls this request. Carrying on without it
-        // lets the hub enumerate, but the device behind it then times out, and a command that times out leaves the xHCI
-        // unable to read the boot disk (the A/B fallback had to revert that kernel): so such a hub stays unsupported, failing
-        // fast here, until command aborts are implemented (DEFERRED.md).
-        controller.control_transfer(&device, 0x20, REQUEST_SET_HUB_DEPTH, u16::from(device.tier), 0, &mut [])?;
+        if controller.control_transfer(&device, 0x20, REQUEST_SET_HUB_DEPTH, u16::from(device.tier), 0, &mut []).is_err() {
+            controller.control_transfer(&device, 0x20, REQUEST_SET_HUB_DEPTH, u16::from(device.tier), 0, &mut [])?;
+        }
     }
     crate::usb_hid::set_step("read the hub descriptor");
     let mut descriptor = [0u8; 12];
     let kind: u16 = if super_speed { 0x2a } else { 0x29 }; // hub descriptor types for USB 3 / USB 2
-    controller.control_transfer(&device, 0xa0, REQUEST_GET_DESCRIPTOR, kind << 8, 0, &mut descriptor)?;
+    if controller.control_transfer(&device, 0xa0, REQUEST_GET_DESCRIPTOR, kind << 8, 0, &mut descriptor).is_err() {
+        controller.control_transfer(&device, 0xa0, REQUEST_GET_DESCRIPTOR, kind << 8, 0, &mut descriptor)?; // the same one-shot stall
+    }
     let ports = descriptor[2];
     let characteristics = u16::from_le_bytes([descriptor[3], descriptor[4]]);
     let power_good_ms = u64::from(descriptor[5]) * 2; // bPwrOn2PwrGood is in 2 ms units

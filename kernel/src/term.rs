@@ -1445,6 +1445,13 @@ fn execute(command: &str) {
             if sub == Some("rescan") {
                 let added = crate::usb_hid::probe_all();
                 crate::println!("{added} new device(s) (keyboards or disks).");
+            } else if sub == Some("abort-test") {
+                // A hidden test hook: see `Controller::abort_self_test`.
+                match crate::xhci::controller(0) {
+                    Some(controller) => crate::println!("xHCI command abort self-test: {}.", if controller.abort_self_test() { "passed (the ring carries on)" } else { "FAILED" }),
+                    None => crate::println!("xHCI command abort self-test: no xHCI controller."),
+                }
+                return;
             } else if sub == Some("try") {
                 match words.next().and_then(|word| word.parse::<u8>().ok()) {
                     Some(port) => crate::usb_hid::try_port(port, words.next()),

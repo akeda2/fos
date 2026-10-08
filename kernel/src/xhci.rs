@@ -38,6 +38,9 @@ const OP_USBCMD: usize = 0x00;
 const OP_USBSTS: usize = 0x04;
 const OP_PAGESIZE: usize = 0x08;
 const OP_CRCR: usize = 0x18;
+/// CRCR bits: Command Abort (write 1), and Command Ring Running (read-only, 1 while the controller is working through the ring).
+const CRCR_CA: u64 = 1 << 2;
+const CRCR_CRR: u32 = 1 << 3;
 const OP_DCBAAP: usize = 0x30;
 const OP_CONFIG: usize = 0x38;
 const OP_PORTS: usize = 0x400;
@@ -729,13 +732,68 @@ impl Controller {
         // silent device for up to ~5 s before it reports failure: give it longer than that,
         // or the next command queues behind a command we already gave up on.
         let ticks = if control >> 10 & 0x3f == TRB_ADDRESS_DEVICE { 700 } else { TIMEOUT_TICKS };
+        let cycle = self.command_ring.cycle;
         let at = self.command_ring.push(parameter, status, control);
         self.ring_doorbell(0, 0);
-        let event = self.wait_event(ticks, |event| event.kind() == TRB_COMMAND_COMPLETION && event.parameter == at)?;
+        let event = match self.wait_event(ticks, |event| event.kind() == TRB_COMMAND_COMPLETION && event.parameter == at) {
+            Ok(event) => event,
+            Err(error) => {
+                if matches!(error, Error::Timeout) {
+                    self.abort_command_ring(at, cycle);
+                }
+                return Err(error);
+            }
+        };
         match event.code() {
             CC_SUCCESS => Ok(event),
             code => Err(Error::Command(code)),
         }
+    }
+
+    /// A command that never completed (Address Device to a device behind a hub that does not route, say) keeps the
+    /// controller busy on it, and every command queued behind it waits too: without this the whole controller stopped
+    /// answering after one such timeout (on the Skylake it could no longer read the boot disk). The sequence of xHCI
+    /// 4.6.1.2: write CRCR.CA and wait for CRCR.CRR to clear (the controller stops, with its dequeue pointer still on the
+    /// dead command, and posts a Command Ring Stopped event and a Command Aborted completion). The CRCR pointer can only
+    /// be set to a 64-byte boundary, and TRBs are 16 bytes, so the ring is not moved: as Linux does, the dead TRB (`at`,
+    /// written with `cycle`) is rewritten as a No-Op with the same cycle bit and the doorbell is rung, so the controller
+    /// skips it and carries on with whatever is queued behind.
+    fn abort_command_ring(&mut self, at: u64, cycle: bool) {
+        let crcr = self.operational + OP_CRCR;
+        // The abort bit only means something while the ring is running; written to a stopped ring it can stay pending
+        // and abort the next command (QEMU does exactly that).
+        if read32(crcr) & CRCR_CRR != 0 {
+            write64(crcr, CRCR_CA);
+        }
+        if !wait_until(50, || read32(crcr) & CRCR_CRR == 0) {
+            crate::println!("USB: xHCI {:02x}:{:02x}.{}: a command timed out and the command ring did not stop when aborted.", self.pci.bus, self.pci.device, self.pci.function);
+            return;
+        }
+        write_trb(at, &Trb { parameter: 0, status: 0, control: TRB_NOOP_COMMAND << 10 | u32::from(cycle) });
+        self.ring_doorbell(0, 0);
+        // The Command Ring Stopped, Command Aborted and No-Op completion events: take them off the event ring (anything
+        // else goes to the background handler).
+        let start = apic::ticks();
+        while apic::ticks().wrapping_sub(start) < 3 {
+            while let Some(event) = self.next_event() {
+                crate::usb_hid::background_event(self, &event);
+            }
+        }
+        crate::println!("USB: xHCI {:02x}:{:02x}.{}: a command timed out; the command ring was aborted and restarted.", self.pci.bus, self.pci.device, self.pci.function);
+    }
+
+    /// `usb abort-test`: queues a command with the wrong cycle bit (the controller sees an empty ring and never answers),
+    /// lets it time out, aborts, and then runs a real command (No-Op) to prove the ring carries on behind the dead TRB.
+    /// QEMU never leaves a command hanging, so this is the only way to run `abort_command_ring`'s pointer arithmetic there.
+    pub fn abort_self_test(&mut self) -> bool {
+        let cycle = self.command_ring.cycle;
+        self.command_ring.cycle = !cycle;
+        let dead = self.command_ring.push(0, 0, TRB_NOOP_COMMAND << 10);
+        self.command_ring.cycle = cycle;
+        self.ring_doorbell(0, 0);
+        let answered = self.wait_event(TIMEOUT_TICKS, |event| event.kind() == TRB_COMMAND_COMPLETION && event.parameter == dead).is_ok();
+        self.abort_command_ring(dead, cycle);
+        !answered && self.command(0, 0, TRB_NOOP_COMMAND << 10).is_ok() && self.command(0, 0, TRB_NOOP_COMMAND << 10).is_ok()
     }
 
     fn context_slot(&self, context: u64) -> u64 {

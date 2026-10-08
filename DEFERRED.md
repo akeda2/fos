@@ -329,14 +329,15 @@ alive); the AMD board, whose monitor connection is DVI (VBE framebuffer on the B
 input is switched away and back -- consistent with DisplayPort needing a link retrain that a DVI link does not.
 
 
-## xHCI: SuperSpeed hubs (Realtek 0bda:0401) and command aborts
+## xHCI: SuperSpeed hubs (Realtek 0bda:0401): done 2026-10-08
 
-Found 2026-10-08 on the Skylake with a USB 3 hub (a USB 3 hub is two hubs on one cable: its USB 2 half works, sticks that
-negotiate USB 2 behind it recover from a replug, see `make test-usb-replug`). The SuperSpeed half stalls `SET_HUB_DEPTH`
-(`Transfer(6)` at "set the SuperSpeed hub depth"), so it is not used, and a USB 3 stick in that hub is not found.
-Tolerating the stall (depth 0 is the default) does make the hub enumerate, but the stick behind it then times out on
-Enable Slot/Address Device, and after those command timeouts the xHCI could no longer read the boot disk (FOSFS not
-mounted, slot metadata unwritable): the A/B fallback reverted that kernel. A proper fix needs xHCI command aborts (stop
-the command ring with CA, wait for the Command Ring Stopped event, restart it) so that a timed-out command cannot wedge
-the controller, and then a look at what the stick behind the SuperSpeed hub does at Address Device (a USB 3 device
-behind a hub needs the route string and the hub's depth in its slot context).
+On the Skylake a USB 3 hub is two hubs on one cable. Its SuperSpeed half used to fail at "set the SuperSpeed hub depth"
+(`Transfer(6)`), so a USB 3 stick behind it was not found. `usb try` experiments (every ordering of SET_CONFIGURATION,
+SET_HUB_DEPTH and the hub descriptor read, cold and after a warm reset) showed that the hub stalls the *first* hub-class
+request after SET_CONFIGURATION, whichever it is, and then answers normally: it is still starting up. `usb_hub::enumerate`
+now waits 50 ms after configuring a hub and retries that first request once; the stick behind the hub is found. Not tested on
+real hardware: replugging a disk behind a SuperSpeed hub, and a hub behind a hub (QEMU's hub is full speed).
+
+A command that times out no longer wedges the controller: `Controller::abort_command_ring` (CRCR.CA, then the dead TRB is
+rewritten as a No-Op and the ring restarted) runs after every command timeout; `make test-xhci-abort` checks the recovery
+in QEMU, which cannot make a command hang, so a really busy controller is untested.

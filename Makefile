@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort
 
 all: image tapes
 
@@ -30,6 +30,10 @@ test-usb-replug: image
 # A keyboard that is unplugged and plugged back in keeps working, five times over (xHCI and EHCI).
 test-usb-kbd-replug: image
 	python3 tools/test_usb_kbd_replug.py
+
+# A timed-out xHCI command is aborted and the command ring carries on (usb abort-test).
+test-xhci-abort: image
+	python3 tools/test_xhci_abort.py
 
 # `make -s print-image`: the path `make image` writes (tools/build_image.py's DEFAULT_IMAGE must equal it; test-stick-guids checks).
 print-image:
