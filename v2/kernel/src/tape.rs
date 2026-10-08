@@ -430,6 +430,19 @@ extern "C" fn api_audio_info(out: *mut fos_v2_abi::tape::AudioInfo) -> u32 {
 extern "C" fn api_audio_start(rate: u32, capture: u32, playback: u32) -> i32 {
     crate::audio::start_for_tape(rate, capture != 0, playback != 0)
 }
+extern "C" fn api_audio_devices(number: u32, out: *mut fos_v2_abi::tape::AudioDevice) -> u32 {
+    if !out.is_null() {
+        if let Some(device) = crate::audio::device_info(number as usize) {
+            unsafe { out.write(device) };
+        }
+    }
+    crate::audio::device_count() as u32
+}
+
+extern "C" fn api_audio_use_device(number: u32) -> i32 {
+    crate::audio::use_device_for_tape(number)
+}
+
 extern "C" fn api_audio_select(direction: u32, mode: u32) -> i32 {
     crate::audio::select_for_tape(direction == 0, mode)
 }
@@ -506,6 +519,8 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         audio_buffer: api_audio_buffer,
         audio_set_capture_ring: api_audio_set_capture_ring,
         wall_clock: api_wall_clock,
+        audio_devices: api_audio_devices,
+        audio_use_device: api_audio_use_device,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

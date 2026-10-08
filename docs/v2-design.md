@@ -334,8 +334,9 @@ firmware, so a pending slot is tried on the next boot.
   backend has no input, so silence from the `none` backend; the capture buffer is pre-filled with a pattern, so a
   peak of 0 shows the controller's DMA wrote it), and USB audio next to HD Audio. **Unverified on real hardware:**
   everything QEMU's two-widget synthetic codec cannot exercise: mixers/selectors, pin sensing, EAPD, mic bias,
-  24-bit containers, multi-codec buses, the chipset snoop/traffic-class quirks, HDMI codecs. A tape cannot pick the
-  device; the operator does (`audio device N`) before running it.
+  24-bit containers, multi-codec buses, the chipset snoop/traffic-class quirks, HDMI codecs. A tape picks the device with
+  `audio_use_device(N)` (API version 3, with `audio_devices` to list them; `play device=N NAME` is the example); the
+  choice is undone when the tape ends, so the operator's `audio device N` is never overridden.
 * **`audio-net` (network audio, stage A: raw Ethernet).** One tape, `audio-net send|recv`, with an `audio-wire`
   crate (host-tested) for the formats. Raw mode (ethertype 0x88ba): an 18-byte header (sequence, frame
   timestamp, stream id, channels, bit depth, frames, rate) and big-endian 16/24-bit interleaved samples,

@@ -15,7 +15,7 @@
 
 use crate::{hda, usb_audio as usb};
 pub use crate::usb_audio::PcmRing;
-use fos_v2_abi::tape::{AudioInfo, AudioStats};
+use fos_v2_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO_KIND_USB, AUDIO_NO_DEVICE};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -25,6 +25,9 @@ pub enum Backend {
 
 /// The device the user picked; `None` is automatic.
 static mut CHOSEN: Option<Backend> = None;
+/// While a tape has chosen a device (`audio_use_device`), what the operator had chosen before, to put back when the tape ends.
+/// `None` = no tape has chosen anything.
+static mut OPERATOR_CHOICE: Option<Option<Backend>> = None;
 
 fn available(backend: Backend) -> bool {
     match backend {
@@ -81,6 +84,51 @@ pub fn choose(number: Option<usize>) -> Result<(), &'static str> {
     stop();
     unsafe { *core::ptr::addr_of_mut!(CHOSEN) = backend };
     Ok(())
+}
+
+/// How many devices `audio` lists (and `audio_devices` counts).
+pub fn device_count() -> usize {
+    devices().1
+}
+
+/// The `AudioDevice` for device `number` (1-based), for the tape call `audio_devices`.
+pub fn device_info(number: usize) -> Option<AudioDevice> {
+    let (list, count) = devices();
+    if number == 0 || number > count {
+        return None;
+    }
+    let backend = list[number - 1];
+    let active = active() == Some(backend);
+    Some(match backend {
+        Backend::Usb => AudioDevice { kind: AUDIO_KIND_USB, active: active as u32, ..AudioDevice::default() },
+        Backend::Hda(index) => {
+            let (bus, device, function, vendor, id) = hda::label(index);
+            AudioDevice {
+                kind: AUDIO_KIND_HDA,
+                active: active as u32,
+                pci_location: (u32::from(bus) << 16) | (u32::from(device) << 8) | u32::from(function),
+                vendor,
+                id,
+            }
+        }
+    })
+}
+
+/// The tape call `audio_use_device`: like `audio device N|auto`, but remembered as the tape's own choice, so
+/// `stop_for_tape` can put the operator's back. 0 for automatic.
+pub fn use_device_for_tape(number: u32) -> i32 {
+    let before = unsafe { *core::ptr::addr_of!(CHOSEN) };
+    match choose(if number == 0 { None } else { Some(number as usize) }) {
+        Ok(()) => {
+            // Only the first choice of a tape records what to restore: a second call must not turn the tape's own pick into "the operator's".
+            let saved = unsafe { &mut *core::ptr::addr_of_mut!(OPERATOR_CHOICE) };
+            if saved.is_none() {
+                *saved = Some(before);
+            }
+            0
+        }
+        Err(_) => AUDIO_NO_DEVICE,
+    }
 }
 
 /// The ordinary starter for the shell and tapes. The error strings are the ones `start_for_tape` maps to codes.
@@ -240,4 +288,8 @@ pub fn select_for_tape(capture: bool, mode: u32) -> i32 {
 pub fn stop_for_tape() {
     usb::set_capture_ring(0);
     stop();
+    // A device the tape picked is not the operator's choice: put the operator's back.
+    if let Some(before) = unsafe { (*core::ptr::addr_of_mut!(OPERATOR_CHOICE)).take() } {
+        unsafe { *core::ptr::addr_of_mut!(CHOSEN) = before };
+    }
 }

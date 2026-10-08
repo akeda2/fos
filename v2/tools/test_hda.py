@@ -178,12 +178,34 @@ def both_devices():
         check("*1: USB audio" in text.split("audio device auto")[-1], "`audio device auto` returns to the automatic choice", text[-800:])
 
 
+def tape_picks_device():
+    """A tape chooses the device itself (`play device=2`, `audio_use_device`) and the operator's choice is not disturbed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        usb_wav, hda_wav = tmp / "usb.wav", tmp / "hda.wav"
+        write_wav(tmp / "a.wav", 48_000, 2, 2, 660, 1.5)
+        image = make_image(tmp, {"play": TAPES / "play", "a.wav": tmp / "a.wav", "debug": ROOT / "tools/default-debug.txt"})
+        extra = ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=usbsnd,path={usb_wav}", "-device", "usb-audio,audiodev=usbsnd",
+                 "-audiodev", f"wav,id=hdasnd,path={hda_wav}", "-device", "intel-hda", "-device", "hda-duplex,audiodev=hdasnd"]
+        text = boot_with_commands(extra, ["usb rescan", "run play device=2 a.wav", "audio", "run play device=9 a.wav"], image)
+        check("Playing a.wav: 48000 Hz, 2 channel(s), 16-bit" in text.split("run play device=2 a.wav")[1].split("fos> ")[0],
+              "`play device=2` plays on the second device (HD Audio) although USB audio is the automatic choice", text[-1500:])
+        check_tone(hda_wav, 660, "tape-chosen HD Audio")
+        if usb_wav.exists() and usb_wav.stat().st_size > 44:
+            rate, samples = read_wav(usb_wav)
+            check(not [value for value in samples if abs(value) > 500], "and nothing reached the USB device", "")
+        after = text.split("fos> audio")[-1].split("fos> ")[0]
+        check("*1: USB audio" in after, "after the tape ended the automatic choice is back (the tape's pick is forgotten)", after)
+        check("there is no audio device 9" in text, "a device number that does not exist is refused by the tape call", text[-600:])
+
+
 def main():
     discovery_and_playback()
     tapes_playback()
     capture_tests()
     interrupt_paths()
     both_devices()
+    tape_picks_device()
     print("v2 hda: all checks passed")
 
 

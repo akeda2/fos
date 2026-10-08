@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1.
-pub const TAPE_API_VERSION: u32 = 2;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`.
+pub const TAPE_API_VERSION: u32 = 3;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -155,6 +155,34 @@ pub struct TapeApi {
     /// it). 1 and `out` filled if the clock is set, 0 if the RTC held no valid time (a dead battery) -- a tape then has no
     /// date to show and must not invent one.
     pub wall_clock: extern "C" fn(*mut WallClock) -> u32,
+    /// `audio_devices(number, out)` (version 3): how many audio devices the machine has, numbered as `audio` lists them (USB
+    /// audio first, then each HD Audio controller that has a playback or capture path). If `number` is 1 to that count, `out` is
+    /// filled with that device's `AudioDevice`; `number` 0 only counts. Check `version >= 3` and `size` before calling.
+    pub audio_devices: extern "C" fn(u32, *mut AudioDevice) -> u32,
+    /// `audio_use_device(number)` (version 3): makes device `number` (1-based, as `audio_devices` numbers them) the one every other
+    /// `audio_*` call uses; 0 means automatic (USB audio if present, else the best HD Audio controller). Stops anything running
+    /// first. 0 on success, `AUDIO_NO_DEVICE` for a number that does not exist. The choice is undone when the tape ends, so a
+    /// tape never changes what the operator picked with `audio device N`.
+    pub audio_use_device: extern "C" fn(u32) -> i32,
+}
+
+/// `AudioDevice::kind` values.
+pub const AUDIO_KIND_USB: u32 = 1;
+pub const AUDIO_KIND_HDA: u32 = 2;
+
+/// What `audio_devices` reports for one device. A new struct (not more fields in `AudioInfo`), per the rule at the top of this file.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct AudioDevice {
+    /// `AUDIO_KIND_USB` or `AUDIO_KIND_HDA`.
+    pub kind: u32,
+    /// 1 if this is the device the `audio_*` calls currently use.
+    pub active: u32,
+    /// PCI location as `bus << 16 | device << 8 | function` for an HD Audio controller; 0 for USB audio.
+    pub pci_location: u32,
+    /// PCI vendor and device ID of an HD Audio controller; 0 for USB audio.
+    pub vendor: u16,
+    pub id: u16,
 }
 
 /// What `wall_clock` reports: local time, to the second.
