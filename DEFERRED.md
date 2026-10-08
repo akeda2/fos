@@ -297,20 +297,27 @@ alternative that needs no code: record to an internal SATA/NVMe SSD formatted ex
 joiners); `play` from a named FAT disk (`fs_read` already reads FAT files, untested).
 (A wall-clock call in the tape ABI, `wall_clock`, was done on 2026-10-07; see docs/recorder.md.)
 
-## BIOS path: the VBE mode does not fill the screen and the text looks pixelated
+## BIOS path: font scaling on big framebuffers (the mode-fill problem itself is done)
 
-Reported 2026-10-08 after the first real-hardware runs (AMD/nForce, BIOS mode). Stage two picks the *largest* 32-bit linear
-VBE mode up to **1280x1024** (`boot/bios/stage2.S`, `vbe_setup`). On a monitor whose native mode is bigger or of a different
-shape (a 1920x1080 panel), that mode is scaled by the monitor: the picture does not fill the screen (4:3 or 5:4 on a 16:9
-panel) and the 8x16 bitmap font is stretched, which looks pixelated. UEFI machines get the firmware's own GOP mode (the
-Skylake: 1920x1080 at its native size), so they look right.
+The VBE mode used to be "the largest up to 1280x1024", which a 16:9 monitor stretched (the screen was not filled and the 8x16
+font looked pixelated). Done 2026-10-08: stage two reads the monitor's EDID (VBE 4F15h) and picks the largest mode no bigger than
+the monitor whose shape matches it (`make test-bios-edid`); without an EDID it keeps the old 1280x1024 rule. Not done: at
+1920x1080 and above the 8x16 console font is small (67 rows x 240 columns); scaling it by an integer factor on big modes
+(2x at 1920x1080), with the console's rows and columns following the scale, would keep it readable. Needs a look on the real
+monitors first (the AMD board's DVI monitor, `bootinfo` shows the mode in use).
 
-Ideas, roughly in order of value:
-1. Ask the monitor: VBE/DDC (INT 10h AX=4F15h, BL=01h reads the EDID) gives the preferred timing (native width x height);
-   pick the VBE mode that matches it, falling back to the largest mode below the cap.
-2. Raise or remove the 1280x1024 cap (it was chosen for speed; the kernel maps the framebuffer write-combining, so a larger
-   mode should be fine) and prefer the mode with the biggest area whose aspect ratio is closest to the EDID's.
-3. Scale the console font by an integer factor when the mode is large (2x at 1920x1080), so text keeps a readable size
-   instead of getting tiny; the console's rows and columns follow the scale.
-Not decided; needs a look at what the video BIOS of the machines at hand reports (`bootinfo` shows the mode in use).
+## Skylake: no picture after the monitor's input is switched away from DisplayPort and back
+
+Reported 2026-10-08: switching the monitor from the Skylake's DisplayPort input to another machine's DVI input and back leaves
+the Skylake without a picture until it is reset (the machine itself keeps running). Not known whether it ever behaved
+differently. Probable cause: the console is the firmware's framebuffer (UEFI GOP, or VBE on the BIOS path) and the kernel has
+no display driver. When the monitor stops listening on DisplayPort the link goes down; getting a picture back needs the GPU's
+DisplayPort link to be retrained after the hot-plug event, which only a display driver (or the firmware, at POST) does.
+How to tell: (1) while there is no picture, `devloop.py ... run uptime` -- if it answers, the kernel is fine and it is only
+the display; (2) do the same switch while the machine sits in the firmware setup screen -- if the picture returns there but
+not under fos, the firmware handles hot-plug and the kernel does not. A fix would be a native Intel (Gen9) display driver, a
+large project; until then the workaround is `reset` over the network (`devloop.py ... run reset`) instead of walking over.
+Observations (2026-10-08): typing `reset` over the console while the screen is black does reset the Skylake (the kernel is
+alive); the AMD board, whose monitor connection is DVI (VBE framebuffer on the BIOS path), recovers fine when the monitor's
+input is switched away and back -- consistent with DisplayPort needing a link retrain that a DVI link does not.
 

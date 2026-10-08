@@ -715,6 +715,77 @@ rsdp_scan:
     loop 3b
     ret
 
+/* ---- The monitor's native size, from its EDID ----
+ * A monitor describes itself in a 128-byte EDID block, read over the display cable's DDC channel; the video BIOS offers it
+ * through VBE function 15h (INT 10h AX=4F15h, BL=01h: read EDID block DX of controller CX into ES:DI). The block starts with
+ * 00 FF FF FF FF FF FF 00, sums to zero modulo 256, and its first 18-byte "detailed timing descriptor" (offset 54) is the
+ * monitor's preferred -- native -- mode: horizontal active pixels are byte 56 plus the high nibble of byte 58 (as bits 8-11),
+ * vertical active lines are byte 59 plus the high nibble of byte 61. Anything unexpected leaves native_width at 0, which
+ * means "unknown". Buffer: 0x3400, 128 bytes. Returns with ES = 0. */
+read_edid:
+    xorw %ax, %ax
+    movw %ax, %es
+    movw $0x3400, %di
+    movw $0x4f15, %ax
+    movw $0x0001, %bx                   /* BL=1: read EDID (BL=0 would only report DDC capabilities) */
+    xorw %cx, %cx                       /* controller 0 */
+    xorw %dx, %dx                       /* EDID block 0 */
+    sti
+    int $0x10
+    cli
+    cmpw $0x004f, %ax
+    jne 9f
+    xorw %ax, %ax
+    movw %ax, %es
+    cmpl $0xffffff00, %es:0x3400        /* 00 FF FF FF */
+    jne 9f
+    cmpl $0x00ffffff, %es:0x3404        /* FF FF FF 00 */
+    jne 9f
+    xorw %si, %si
+    xorb %dl, %dl
+    movw $128, %cx
+1:  addb %es:0x3400(%si), %dl
+    incw %si
+    loop 1b
+    testb %dl, %dl
+    jnz 9f                              /* the checksum is wrong: do not trust it */
+    cmpw $0, %es:0x3436                 /* a detailed timing descriptor starts with a non-zero pixel clock */
+    je 9f
+    movzbl %es:0x3438, %eax             /* horizontal active, low 8 bits */
+    movzbl %es:0x343a, %edx
+    andl $0xf0, %edx
+    shll $4, %edx                       /* high nibble of byte 58 -> bits 8-11 */
+    orl %edx, %eax
+    movl %eax, %ebx
+    movzbl %es:0x343b, %eax             /* vertical active, low 8 bits */
+    movzbl %es:0x343d, %edx
+    andl $0xf0, %edx
+    shll $4, %edx
+    orl %edx, %eax
+    cmpl $640, %ebx                     /* sanity: a real monitor */
+    jb 9f
+    cmpl $8192, %ebx
+    ja 9f
+    cmpl $480, %eax
+    jb 9f
+    cmpl $8192, %eax
+    ja 9f
+    movl %ebx, native_width
+    movl %eax, native_height
+    movw $m_edid, %si                   /* narrate while text output still works */
+    call puts16
+    movl native_width, %eax
+    call putdec32
+    movw $m_by, %si
+    call puts16
+    movl native_height, %eax
+    call putdec32
+    movw $m_crlf, %si
+    call puts16
+9:  xorw %ax, %ax
+    movw %ax, %es
+    ret
+
 /* ---- Video: VBE (VESA BIOS Extensions) linear framebuffer ----
  * The UEFI loader passes the firmware's graphics framebuffer; a BIOS machine's equivalent is VBE. Ask the video BIOS
  * for its list of modes (INT 10h AX=4F00h), look at each (AX=4F01h) and keep the largest mode that is a 32-bit-per-pixel
@@ -727,6 +798,8 @@ rsdp_scan:
 vbe_setup:
     movl $0, vbe_area
     movl $0, fb_base
+    movl $0, native_width
+    movl $0, native_height
     /* The operator's way out of a video BIOS that hangs: either the slot-metadata flag (`debug video skip` in the
      * shell, byte 16 bit 0) or a Shift key held down right now. The BIOS keeps the keyboard's shift state in its data
      * area (0x417: bit 0 right Shift, bit 1 left Shift), but only updates it when it handles the key interrupt, so let
@@ -744,6 +817,7 @@ vbe_setup:
     jne vbe_skipped
     testb $1, meta+16
     jnz vbe_skipped
+    call read_edid                      /* the monitor's own idea of its native size, if it will tell (ES is 0 again after) */
     movl $0x32454256, %es:0x3000        /* "VBE2" in the signature field asks for VBE 2.0+ information */
     movw $0x3000, %di
     movw $0x4f00, %ax                   /* VBE function 00h: controller information */
@@ -807,14 +881,34 @@ vbe_next:
 2:  movzwl %es:0x3212, %eax             /* XResolution */
     cmpl $640, %eax
     jb vbe_next
-    cmpl $1280, %eax
-    ja vbe_next
     movzwl %es:0x3214, %ecx             /* YResolution */
+    movl %eax, %ebx                     /* ebx = width, ecx = height, from here on */
+    cmpl $0, native_width
+    jne 3f
+    cmpl $1280, %ebx                    /* no EDID: the old, safe rule -- the largest mode up to 1280x1024, since a mode */
+    ja vbe_next                         /* the monitor cannot show would be worse than a scaled one */
     cmpl $1024, %ecx
     ja vbe_next
-    movl %eax, %ebx
-    imull %ecx, %eax                    /* area: the largest mode wins */
-    cmpl vbe_area, %eax
+    imull %ecx, %eax                    /* score = area */
+    jmp 5f
+3:  cmpl native_width, %ebx             /* with the EDID: never larger than the monitor ... */
+    ja vbe_next
+    cmpl native_height, %ecx
+    ja vbe_next
+    imull %ecx, %eax                    /* ... and score = area ... */
+    movl %ebx, %esi
+    imull native_height, %esi           /* w * native height */
+    movl %ecx, %edi
+    imull native_width, %edi            /* h * native width: equal when the shapes (aspect ratios) are equal */
+    subl %edi, %esi
+    jns 4f
+    negl %esi
+4:  imull $50, %esi, %esi               /* |difference| * 50 <= h * native width means the shapes agree within 2% */
+    cmpl %edi, %esi
+    jbe 5f
+    shrl $2, %eax                       /* ... but a quarter of it if the shape differs: a monitor stretches a mode of the */
+                                        /* wrong shape (or leaves bars), which is what made the text look blurry */
+5:  cmpl vbe_area, %eax
     jbe vbe_next
     movl %eax, vbe_area
     movw vbe_candidate, %ax
@@ -1314,6 +1408,8 @@ rh_chunk:         .long 0
 .balign 8
 kernel_size:      .quad 0
 vbe_area:         .long 0
+native_width:     .long 0
+native_height:    .long 0
 vbe_version:      .word 0
 vbe_mode:         .word 0
 vbe_candidate:    .word 0
@@ -1365,6 +1461,7 @@ m_place_staging: .asciz ", read buffer at 0x"
 m_no_room:    .asciz "FAILED: no usable RAM region above 1 MiB is large enough for the kernel and its read buffer (about 16 MiB).\r\n"
 m_load:       .asciz "  Reading the kernel slot (INT 13h EDD) and copying it above 1 MiB (unreal mode): "
 m_long:       .asciz "  Entering long mode (PAE, EFER.LME, paging); next the ELF segments are placed and the kernel starts.\r\n"
+m_edid:       .asciz "  Video: the monitor reports its native size (EDID): "
 m_video:      .asciz "  Video: VBE 0x"
 m_video_mode: .asciz ", mode 0x"
 m_by:         .asciz "x"
