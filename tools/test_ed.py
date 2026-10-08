@@ -37,6 +37,10 @@ def main():
         subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(KERNEL),
                         "--output", str(second), "--label", "backup", "--payload-guid", "f05b2a00-0000-4f05-8000-0000000000aa"],
                        check=True, capture_output=True)
+        exfat = tmp / "exfat.img"                       # a PC-style disk: ed must be able to save to it too
+        with open(exfat, "wb") as handle:
+            handle.truncate(64 << 20)
+        subprocess.run(["mkfs.exfat", str(exfat)], check=True, capture_output=True)
         vars_copy = tmp / "vars.fd"
         shutil.copy(variables, vars_copy)
         monitor = str(tmp / "monitor")
@@ -45,7 +49,8 @@ def main():
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-device", "ich9-ahci,id=ahci",
                    "-drive", f"if=none,id=d1,format=raw,file={boot}", "-device", "ide-hd,drive=d1,bus=ahci.0,bootindex=0",
-                   "-drive", f"if=none,id=d2,format=raw,file={second}", "-device", "ide-hd,drive=d2,bus=ahci.1"]
+                   "-drive", f"if=none,id=d2,format=raw,file={second}", "-device", "ide-hd,drive=d2,bus=ahci.1",
+                   "-drive", f"if=none,id=d3,format=raw,file={exfat}", "-device", "ide-hd,drive=d3,bus=ahci.2"]
         qemu = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         selector = selectors.DefaultSelector()
         selector.register(qemu.stdout, selectors.EVENT_READ)
@@ -150,6 +155,31 @@ def main():
             wait_for("fos> ", 20)
             serial_line("cat disk2 new.txt", "two")
             check("two" in text(), "a file written through diskN/NAME lands on that disk", text()[-500:])
+
+            # The same on an exFAT disk (disk3): create a file, then edit it. (`ed` could read FAT/exFAT but not save to it.)
+            serial_line("run ed disk3/memo.txt", "ed> ")
+            check("(new file)" in text(), "ed starts a new file on an exFAT disk", text()[-500:])
+            keys("a", "ret")
+            for name in ("t", "w", "o", "ret", "dot", "ret"):
+                sendkey(name)
+            keys("w", "ret")
+            wait_for("written disk3/memo.txt")
+            check("cannot" not in text().split("written disk3/memo.txt")[0].split("ed> ")[-1], "and saves it (written disk3/memo.txt)", text()[-600:])
+            keys("q", "ret")
+            wait_for("fos> ", 20)
+            serial_line("cat disk3 memo.txt", "two")
+            check("two" in text(), "the file is on the exFAT disk", text()[-500:])
+            serial_line("run ed disk3/memo.txt", "ed> ")
+            check("(1 lines)" in text(), "ed opens it again from the exFAT disk", text()[-500:])
+            keys("a", "ret")
+            for name in ("o", "n", "e", "ret", "dot", "ret"):
+                sendkey(name)
+            keys("w", "ret")
+            wait_for("written disk3/memo.txt")
+            keys("q", "ret")
+            wait_for("fos> ", 20)
+            serial_line("cat disk3 memo.txt", "one")
+            check("one" in text() and "two" in text(), "saving over an existing file on the exFAT disk replaces it", text()[-500:])
         finally:
             qemu.terminate()
             try:

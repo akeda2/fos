@@ -239,6 +239,23 @@ extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, 
 }
 extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8, length: usize) -> isize {
     let (reference, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
+    // A FAT32/exFAT disk named explicitly (`diskN/NAME`), as `fs_read` already allows: replace the file the way the shell's
+    // `write` does -- reserve its whole length, write it, then finish (the directory entry appears with the final size).
+    // (`ed` could read such a file but not save it back: this call resolved FOSFS volumes only.)
+    if let Some((mut fs, file)) = resolve_fat(reference) {
+        if data.is_empty() {
+            return FS_ERROR; // an empty file cannot be created on a FAT volume here (the shell's `write` says the same)
+        }
+        crate::fatvol::stamp(&mut fs);
+        let outcome = fs.create(file, data.len() as u64).and_then(|stream| {
+            fs.write(&stream, 0, data, data.len() as u64)?;
+            fs.finish(&stream, file, data.len() as u64)
+        });
+        return match outcome {
+            Ok(()) => 0,
+            Err(error) => fat_error(error),
+        };
+    }
     let (volume, name) = match resolve_file(reference, false) {
         Ok(found) => found,
         Err(code) => return code,
@@ -323,7 +340,15 @@ extern "C" fn api_free_pages() -> usize {
     memory::stats().free as usize
 }
 extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {
-    let (volume, name) = match resolve_file(unsafe { core::slice::from_raw_parts(name, name_length) }, false) {
+    let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
+    if let Some((mut fs, file)) = resolve_fat(reference) {
+        return match fs.remove(file) {
+            Ok(true) => 0,
+            Ok(false) => FS_NOT_FOUND,
+            Err(error) => fat_error(error),
+        };
+    }
+    let (volume, name) = match resolve_file(reference, false) {
         Ok(found) => found,
         Err(code) => return code,
     };
