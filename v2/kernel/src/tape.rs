@@ -383,7 +383,7 @@ extern "C" fn api_disk_format_exfat(number: usize, label: *const u8, length: usi
     }
 }
 extern "C" fn api_audio_buffer(out: *mut fos_v2_abi::tape::AudioBuffer) {
-    let (ring_bytes, available_bytes) = crate::usb_audio::buffer_info();
+    let (ring_bytes, available_bytes) = crate::audio::buffer_info();
     unsafe { *out = fos_v2_abi::tape::AudioBuffer { ring_bytes, available_bytes } };
 }
 extern "C" fn api_wall_clock(out: *mut fos_v2_abi::tape::WallClock) -> u32 {
@@ -396,7 +396,7 @@ extern "C" fn api_wall_clock(out: *mut fos_v2_abi::tape::WallClock) -> u32 {
     }
 }
 extern "C" fn api_audio_set_capture_ring(bytes: u64) {
-    crate::usb_audio::set_capture_ring(bytes);
+    crate::usb_audio::set_capture_ring(bytes); // the capture ring belongs to whichever device starts next
 }
 extern "C" fn api_nic_count() -> usize {
     term::nic_count()
@@ -425,31 +425,27 @@ extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) ->
     term::tape_receive(index, unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
 }
 extern "C" fn api_audio_info(out: *mut fos_v2_abi::tape::AudioInfo) -> u32 {
-    u32::from(crate::usb_audio::fill_info(unsafe { &mut *out }))
+    u32::from(crate::audio::fill_info(unsafe { &mut *out }))
 }
 extern "C" fn api_audio_start(rate: u32, capture: u32, playback: u32) -> i32 {
-    crate::usb_audio::start_for_tape(rate, capture != 0, playback != 0)
+    crate::audio::start_for_tape(rate, capture != 0, playback != 0)
 }
 extern "C" fn api_audio_select(direction: u32, mode: u32) -> i32 {
-    match crate::usb_audio::select(direction == 0, mode) {
-        Ok(()) => 0,
-        Err("no USB audio device") => fos_v2_abi::tape::AUDIO_NO_DEVICE,
-        Err(_) => fos_v2_abi::tape::AUDIO_FAILED,
-    }
+    crate::audio::select_for_tape(direction == 0, mode)
 }
 extern "C" fn api_audio_stop() {
-    crate::usb_audio::stop_for_tape();
+    crate::audio::stop_for_tape();
 }
 extern "C" fn api_audio_read(buffer: *mut u8, length: usize) -> usize {
-    term::tape_poll(); // drains the xHCI event ring, which is what moves audio
-    crate::usb_audio::read(unsafe { core::slice::from_raw_parts_mut(buffer, length) })
+    term::tape_poll(); // drains the xHCI event ring, which is what moves USB audio
+    crate::audio::read(unsafe { core::slice::from_raw_parts_mut(buffer, length) })
 }
 extern "C" fn api_audio_write(data: *const u8, length: usize) -> usize {
     term::tape_poll();
-    crate::usb_audio::write(unsafe { core::slice::from_raw_parts(data, length) })
+    crate::audio::write(unsafe { core::slice::from_raw_parts(data, length) })
 }
 extern "C" fn api_audio_stats(out: *mut fos_v2_abi::tape::AudioStats) {
-    crate::usb_audio::fill_stats(unsafe { &mut *out });
+    crate::audio::fill_stats(unsafe { &mut *out });
 }
 
 extern "C" fn api_nic_max_frame_len() -> usize {
@@ -530,7 +526,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         );
     }
     crate::debug::set_tape_running(false);
-    crate::usb_audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an isochronous stream running
+    crate::audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an audio stream running
     term::set_tape_mode(false);
     memory::free(stack, STACK_BYTES / memory::FRAME);
     crate::println!("Tape returned; back at the fos shell.");

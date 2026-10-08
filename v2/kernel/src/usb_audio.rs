@@ -245,7 +245,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 const WINDOW: usize = 192;
 const PLAYBACK_WINDOW_MS: u32 = 6;
 /// PCM ring size in bytes (about a second of 6-channel 24-bit audio at 48 kHz fits).
-const RING_BYTES: usize = 1 << 20;
+pub(crate) const RING_BYTES: usize = 1 << 20;
 /// The capture ring is bigger: a recording to a USB stick can stall for seconds while the stick erases flash, and
 /// the ring is what rides that out (16 MiB is five seconds of 22 channels of 24-bit audio).
 const CAPTURE_RING_BYTES: usize = 16 << 20;
@@ -301,7 +301,7 @@ pub fn ring_self_test() {
 /// memory and the biggest run on a machine whose RAM is split by the PCI hole is a fraction of the free total, so the ring
 /// is built from the biggest run, then the next biggest, until it is big enough or the memory (or `MAX_SEGMENTS`) is used
 /// up. The first block is at least the default size, or there is no ring.
-fn allocate_capture_ring() -> Option<PcmRing> {
+pub(crate) fn allocate_capture_ring() -> Option<PcmRing> {
     let wanted = WANTED_CAPTURE_RING.load(Ordering::Relaxed).max(CAPTURE_RING_BYTES);
     let mut ring = PcmRing::empty();
     while ring.size < wanted && ring.count < MAX_SEGMENTS {
@@ -336,24 +336,27 @@ const MIN_SEGMENT: usize = 16 << 20;
 pub struct PcmRing {
     segments: [(u64, usize); MAX_SEGMENTS],
     count: usize,
-    size: usize,
+    pub(crate) size: usize,
     head: AtomicUsize, // next byte to write (producer)
     tail: AtomicUsize, // next byte to read (consumer)
-    overruns: AtomicU64,
+    pub(crate) overruns: AtomicU64,
 }
 
 impl PcmRing {
-    fn empty() -> PcmRing {
-        PcmRing { segments: [(0, 0); MAX_SEGMENTS], count: 0, size: 0, head: AtomicUsize::new(0), tail: AtomicUsize::new(0), overruns: AtomicU64::new(0) }
+    /// An empty ring, all zero (usable in a `static`, so it can live in `.bss`).
+    pub(crate) const EMPTY: PcmRing = PcmRing { segments: [(0, 0); MAX_SEGMENTS], count: 0, size: 0, head: AtomicUsize::new(0), tail: AtomicUsize::new(0), overruns: AtomicU64::new(0) };
+
+    pub(crate) fn empty() -> PcmRing {
+        PcmRing::EMPTY
     }
 
-    fn push_segment(&mut self, base: u64, length: usize) {
+    pub(crate) fn push_segment(&mut self, base: u64, length: usize) {
         self.segments[self.count] = (base, length);
         self.count += 1;
         self.size += length;
     }
 
-    fn allocate(size: usize) -> Option<PcmRing> {
+    pub(crate) fn allocate(size: usize) -> Option<PcmRing> {
         let mut ring = PcmRing::empty();
         ring.push_segment(memory::allocate_contiguous((size / 4096) as u64, None)?, size);
         Some(ring)
@@ -400,16 +403,16 @@ impl PcmRing {
         }
     }
 
-    pub fn available(&self) -> usize {
+    pub(crate) fn available(&self) -> usize {
         self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire))
     }
-    fn space(&self) -> usize {
+    pub(crate) fn space(&self) -> usize {
         self.size - self.available()
     }
     /// Appends the data if all of it fits; otherwise none of it is taken and the overrun is counted (the reader is too
     /// slow). Never part of it: a captured packet is whole frames, and a ring that took half a packet would leave every
     /// later frame shifted by a few bytes, scrambling the channels for the rest of a recording.
-    fn push_whole(&self, data: &[u8]) -> usize {
+    pub(crate) fn push_whole(&self, data: &[u8]) -> usize {
         if data.len() <= self.space() {
             self.push(data)
         } else {
@@ -419,7 +422,7 @@ impl PcmRing {
     }
 
     /// Appends what fits; the rest is dropped and counted (the reader is too slow).
-    fn push(&self, data: &[u8]) -> usize {
+    pub(crate) fn push(&self, data: &[u8]) -> usize {
         let count = data.len().min(self.space());
         let head = self.head.load(Ordering::Relaxed);
         let mut done = 0;
@@ -435,7 +438,7 @@ impl PcmRing {
         }
         count
     }
-    fn pop(&self, out: &mut [u8]) -> usize {
+    pub(crate) fn pop(&self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.available());
         let tail = self.tail.load(Ordering::Relaxed);
         let mut done = 0;
@@ -448,7 +451,7 @@ impl PcmRing {
         self.tail.store(tail.wrapping_add(count), Ordering::Release);
         count
     }
-    fn free(&self) {
+    pub(crate) fn free(&self) {
         for &(base, length) in &self.segments[..self.count] {
             if base != 0 {
                 memory::free(base, (length / 4096) as u64);
@@ -1126,28 +1129,7 @@ pub fn fill_stats(stats: &mut fos_v2_abi::tape::AudioStats) {
     *stats = out;
 }
 
-/// Starts streams for a tape; the result is an `AUDIO_*` code or 0.
-pub fn start_for_tape(rate: u32, capture: bool, playback: bool) -> i32 {
-    use fos_v2_abi::tape::*;
-    let Some(controller) = controller() else { return AUDIO_NO_DEVICE };
-    match start(controller, rate, capture, playback) {
-        Ok(()) => 0,
-        Err("no USB audio device") => AUDIO_NO_DEVICE,
-        Err("already running") => AUDIO_BUSY,
-        Err("the device does not offer that sample rate") => AUDIO_BAD_RATE,
-        Err("the device has no capture stream") | Err("the device has no playback stream") => AUDIO_NO_DIRECTION,
-        Err(_) => AUDIO_FAILED,
-    }
-}
-
 /// The capture ring's size and backlog, for `audio_buffer`.
 pub fn buffer_info() -> (u64, u64) {
     audio().and_then(|device| device.capture.as_ref()).map_or((0, 0), |stream| (stream.pcm.size as u64, stream.pcm.available() as u64))
-}
-
-pub fn stop_for_tape() {
-    WANTED_CAPTURE_RING.store(0, Ordering::Relaxed); // a tape's request for a big ring ends with the tape
-    if let Some(controller) = controller() {
-        stop(controller);
-    }
 }

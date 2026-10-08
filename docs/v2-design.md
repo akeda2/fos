@@ -312,6 +312,30 @@ firmware, so a pending slot is tried on the next boot.
   **Modes:** each alternate setting of a streaming interface is a mode (channels, bit depth, rates). `audio modes` lists
   them per direction; `audio use capture|playback N|auto` picks one (applies to the next start; the chosen mode must offer the
   rate, otherwise the best one that does is used); tapes use `audio_select` and audio-net's `inmode=`/`outmode=`.
+* **Intel HD Audio, behind the same tape calls.** `audio.rs` is a small facade (`enum Backend { Usb, Hda(index) }`): the
+  `audio_*` calls of the tape ABI go to *the active device*, which is the one `audio device N` picked, else USB audio if
+  present (so nothing changes for a machine that had one), else the best HD Audio controller. No tape-ABI change was
+  needed: `AudioInfo` reports class version 0 for HD Audio, slot bytes 2 (16-bit) or 4 (24 bits left-justified in 32, as
+  the hardware carries them), and the rates the converters offer; `play`, `record`, `recorder` and `audio-net` run on it
+  unchanged. `hda.rs` (ported from v1's QEMU-only driver, with what real codecs need): reset with a settle hold, codec
+  discovery, CORB/RIRB of 2/16/256 entries, a walk of every widget (capabilities, PCM rates and sizes, pin default
+  configuration, connection lists with ranges and long form), a **path search** through mixers and selectors (playback:
+  output pin down to a DAC; capture: ADC down to an input pin) scored by what the pin is (line out/in over speaker/mic, no
+  connection skipped, plugged-jack bonus where the pin can sense one), then at `audio_start` the stream descriptor, BDL
+  (8 periods of 512 frames, interrupt on each), format word, converter stream tag, connection selects, amplifier unmuting
+  at 0 dB along the path, power states, EAPD, pin control (microphone bias for mic pins). The interrupt handler services
+  every period the hardware has finished since last time, found from the DMA position buffer (LPIB if that does not
+  work), so a late or merged interrupt loses nothing; PCM moves through the same `PcmRing` as USB audio. Interrupts: MSI
+  with a self-test that needs no audio (one verb with the RIRB response interrupt on), else legacy INTx probed through
+  the I/O APIC, else polled (`no-msi`, or nothing worked; the foreground then services from `audio_read/write`).
+  DMA memory is below 4 GiB unless `GCAP.64OK`. `hda` dumps the controllers, widgets and chosen paths (what to read on an
+  unknown machine); `audio device` lists/selects among USB audio and HD Audio controllers. `make test-v2-hda` covers MSI,
+  INTx and polled delivery, a 440 Hz tone through QEMU's WAV backend, the `play` and `record` tapes, capture (QEMU's WAV
+  backend has no input, so silence from the `none` backend; the capture buffer is pre-filled with a pattern, so a
+  peak of 0 shows the controller's DMA wrote it), and USB audio next to HD Audio. **Unverified on real hardware:**
+  everything QEMU's two-widget synthetic codec cannot exercise: mixers/selectors, pin sensing, EAPD, mic bias,
+  24-bit containers, multi-codec buses, the chipset snoop/traffic-class quirks, HDMI codecs. A tape cannot pick the
+  device; the operator does (`audio device N`) before running it.
 * **`audio-net` (network audio, stage A: raw Ethernet).** One tape, `audio-net send|recv`, with an `audio-wire`
   crate (host-tested) for the formats. Raw mode (ethertype 0x88ba): an 18-byte header (sequence, frame
   timestamp, stream id, channels, bit depth, frames, rate) and big-endian 16/24-bit interleaved samples,

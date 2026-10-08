@@ -24,7 +24,7 @@ V2_OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fn
 V2_TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: v2-opus-lib v2-tape-opus-bench v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio test-v2-audio-net test-v2-audio-serve test-v2-record test-v2-recorder test-v2-recorder-fat test-v2-fat-shell test-v2-format-exfat test-v2-recorder-format test-v2-grow test-v2-install test-v2-lineedit test-v2-scripts test-v2-nic test-v2-netfs test-v2-rtl8139
+.PHONY: v2-opus-lib v2-tape-opus-bench v2-loader v2-kernel v2-image v2-run test-v2 test-v2-faults test-v2-keyboard test-v2-usb-boot test-v2-config test-v2-tapes test-v2-nettest test-v2-debug-mode test-v2-msi test-v2-router test-v2-nettapes test-v2-hub test-v2-disks test-v2-stick-guids test-v2-format test-v2-ed test-v2-diag test-v2-usb-audio test-v2-hda test-v2-audio-net test-v2-audio-serve test-v2-record test-v2-recorder test-v2-recorder-fat test-v2-fat-shell test-v2-format-exfat test-v2-recorder-format test-v2-grow test-v2-install test-v2-lineedit test-v2-scripts test-v2-nic test-v2-netfs test-v2-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -103,6 +103,11 @@ test-v2-diag: v2-image
 # USB audio class 1.0 against QEMU's usb-audio: discovery, a played tone recorded to WAV, capture.
 test-v2-usb-audio: v2-image
 	python3 v2/tools/test_usb_audio.py
+
+# Intel HD Audio against QEMU's intel-hda + hda-duplex: discovery, widget paths, MSI/INTx/polled, a played tone recorded to WAV,
+# capture (silence: QEMU's WAV backend has no input), the unchanged play/record tapes, and USB audio next to it.
+test-v2-hda: v2-image
+	python3 v2/tools/test_hda.py
 
 # audio-net: a tone sent over raw Ethernet between two guests and recorded from the receiver's usb-audio.
 test-v2-audio-net: v2-image

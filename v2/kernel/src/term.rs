@@ -1286,6 +1286,7 @@ fn execute(command: &str) {
         "run" => crate::tape::run_named(command.strip_prefix("run").unwrap_or("")),
         "label" => label_command(words),
         "audio" => audio_command(words),
+        "hda" => crate::hda::describe(),
         "format" => format_command(words),
         "grow" => grow_command(words),
         "install" => crate::install::command(words),
@@ -1505,12 +1506,12 @@ fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(cra
     }
 }
 
-/// `audio` shows the USB audio device; `audio start RATE [capture|playback|both]` / `audio stop`
+/// `audio` shows the audio device (USB audio or HD Audio; `audio device N` picks one when there are several); `audio start RATE [capture|playback|both]` / `audio stop`
 /// control streams; `audio capture SECONDS [RATE]` records for a few seconds and prints, per second,
 /// the packet counters and the peak level of every channel (a quick way to see that a device's inputs
 /// are alive without writing a tape).
 fn audio_command(mut words: core::str::SplitWhitespace) {
-    use crate::usb_audio as ua;
+    use crate::audio as ua;
     match words.next() {
         None => ua::status(),
         Some("modes") => ua::print_modes(),
@@ -1533,10 +1534,21 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
                 Err(reason) => crate::println!("audio: {reason}."),
             }
         }
-        Some("stop") => {
-            if let Some(controller) = ua::controller() {
-                ua::stop(controller);
+        Some("device") => {
+            let number = match words.next() {
+                Some("auto") | None => None,
+                Some(word) => match word.parse::<usize>() {
+                    Ok(number) => Some(number),
+                    Err(_) => return crate::println!("Usage: audio device N|auto   (`audio` lists the devices)"),
+                },
+            };
+            match ua::choose(number) {
+                Ok(()) => ua::status(),
+                Err(reason) => crate::println!("audio: {reason}."),
             }
+        }
+        Some("stop") => {
+            ua::stop();
             ua::status();
         }
         Some("start") => {
@@ -1546,8 +1558,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
                 Some("playback") => (false, true),
                 _ => (true, true),
             };
-            let Some(controller) = ua::controller() else { return crate::println!("No USB audio device.") };
-            match ua::start(controller, rate, capture, playback) {
+            match ua::start(rate, capture, playback) {
                 Ok(()) => ua::status(),
                 Err(reason) => crate::println!("audio: {reason}."),
             }
@@ -1555,8 +1566,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
         Some("capture") => {
             let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(3).clamp(1, 30);
             let rate = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(48_000);
-            let Some(controller) = ua::controller() else { return crate::println!("No USB audio device.") };
-            if let Err(reason) = ua::start(controller, rate, true, false) {
+            if let Err(reason) = ua::start(rate, true, false) {
                 return crate::println!("audio: {reason}.");
             }
             let Some((channels, slot)) = ua::capture_format() else { return };
@@ -1570,6 +1580,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
                 while apic::ticks() < end {
                     crate::debug::pet();
                     crate::usb_hid::poll();
+                    ua::poll();
                     let frame_bytes = channels * slot;
                     let room = (4096 - carry) / frame_bytes * frame_bytes;
                     let got = ua::read(&mut data[carry..carry + room]);
@@ -1607,15 +1618,14 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
                 flush();
             }
             ua::status();
-            ua::stop(controller);
+            ua::stop();
         }
         Some("duplex") => {
             // Capture and playback at once (the playback side gets silence, the capture side is discarded):
             // a load test of the shared xHCI event ring and both isochronous endpoints.
             let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(5).clamp(1, 60);
             let rate = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(48_000);
-            let Some(controller) = ua::controller() else { return crate::println!("No USB audio device.") };
-            if let Err(reason) = ua::start(controller, rate, true, true) {
+            if let Err(reason) = ua::start(rate, true, true) {
                 return crate::println!("audio: {reason}.");
             }
             let end = apic::ticks() + seconds * apic::TICK_HZ;
@@ -1624,20 +1634,20 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             while apic::ticks() < end {
                 crate::debug::pet();
                 crate::usb_hid::poll();
+                    ua::poll();
                 while ua::read(&mut scratch) > 0 {}
                 if ua::playback_space() >= silence.len() {
                     ua::write(&silence);
                 }
             }
             ua::status();
-            ua::stop(controller);
+            ua::stop();
         }
         Some("tone") => {
             let frequency = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(440).clamp(20, 20_000);
             let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(3).clamp(1, 60);
             let rate = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(48_000);
-            let Some(controller) = ua::controller() else { return crate::println!("No USB audio device.") };
-            if let Err(reason) = ua::start(controller, rate, false, true) {
+            if let Err(reason) = ua::start(rate, false, true) {
                 return crate::println!("audio: {reason}.");
             }
             let Some((channels, slot)) = ua::playback_format() else { return };
@@ -1652,6 +1662,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             while apic::ticks() < end {
                 crate::debug::pet();
                 crate::usb_hid::poll();
+                    ua::poll();
                 // Only as many frames as the ring has room for, so the tone never has a gap.
                 let frames = (chunk.len() / frame_bytes).min(ua::playback_space() / frame_bytes);
                 if frames == 0 {
@@ -1672,9 +1683,9 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
                 ua::write(&chunk[..frames * frame_bytes]);
             }
             ua::status();
-            ua::stop(controller);
+            ua::stop();
         }
-        Some(_) => crate::println!("Usage: audio | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
+        Some(_) => crate::println!("Usage: audio | audio device N|auto | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
     }
 }
 

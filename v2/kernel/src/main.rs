@@ -16,6 +16,7 @@
 #![no_main]
 
 mod acpi;
+mod audio;
 mod ahci;
 mod block;
 mod apic;
@@ -31,6 +32,7 @@ mod fault;
 mod fosfs;
 mod font_data;
 mod gpt;
+mod hda;
 mod framebuffer;
 mod gdt;
 mod idt;
@@ -288,6 +290,8 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     config::load();
     // xHCI events by MSI (decided by the settings file's `no-msi`, so only now; until here the foreground drained the ring)
     xhci::enable_interrupts_all(config::no_msi());
+    // HD Audio controllers: reset, find codecs, choose playback/capture paths, prove an interrupt path (MSI, INTx or none)
+    hda::init_all(config::no_msi());
 
     // ---- network interfaces (after the settings file: `no-msi` decides how they take interrupts) ----
     let mut interfaces = 0;
