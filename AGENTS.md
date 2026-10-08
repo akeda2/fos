@@ -53,8 +53,8 @@ Also read on demand: `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put asid
   `boot/bios/stage2.S`'s header for the steps and its low-memory map; the kernel's crash-record
   page at `0x5000` must stay untouched). Either way the kernel ELF64 is read by LBA from an A/B
   slot and entered in long mode, identity-mapped, interrupts off; it is a position-independent
-  image placed wherever the loader chooses (BIOS: 4 MiB, staging at 16 MiB, so about 24 MiB of
-  RAM is needed). `BootInfo` (`abi/src/lib.rs`, version 5) is the loader/kernel ABI, passed by
+  image placed wherever the loader chooses (BIOS: chosen from the E820 map, the lowest 2 MiB-aligned
+  usable region with about 10 MiB free above 1 MiB). `BootInfo` (`abi/src/lib.rs`, version 5) is the loader/kernel ABI, passed by
   pointer; validate magic, version and size. Stage two writes it by hand, so a unit test in
   `abi` pins its layout: change both together. On BIOS `runtime_services` is 0 and the memory
   map is E820 converted to UEFI descriptor types (usable RAM below 1 MiB is "loader data").
@@ -128,7 +128,7 @@ make image            # build/v2/v2.img: loader + kernel + every tape (default g
 make run              # boot it in QEMU + OVMF, serial on the terminal
 make test             # unit tests (abi, fat, audio-rec) and the boot/framebuffer test
 make test-NAME        # one end-to-end test; `make help`, or the .PHONY list in the Makefile
-make test-bios        # 15 of them again, booted through BIOS (SeaBIOS); test-bios-NAME for one
+make test-bios        # 16 of them, booted through BIOS (SeaBIOS) incl. install and kernel placement; test-bios-NAME for one
 make test-all         # every test-* target (slow, ~30 min); prints PASS/FAIL per target
 ```
 

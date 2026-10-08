@@ -185,10 +185,16 @@ Decisions and surprises: the kernel's ACPI reader now maps any table page the me
 tables as plain reserved); interrupts stay off from the moment ES gets its 4 GiB limit until the copy ends (a BIOS handler
 reloading ES resets it); stage two's scratch memory stays below 0x5000 because the kernel keeps its crash record in that page.
 
-Still open: `install diskN` does not copy the MBR code or stage two (a clone boots only under UEFI); the kernel base (4 MiB)
-and staging (16 MiB) are fixed instead of chosen from E820; nothing has run on real hardware (unreal mode, A20, E820 and VBE
-quirks are the usual surprises; the AMD/nForce board is the first target); a failed VBE call is only checked at each step,
-there is no operator override to skip graphics on a card that hangs.
+Since then: `install diskN` copies the BIOS boot code too (stage two byte for byte at LBA 64, stage one's code into the new
+disk's MBR, written last), so a cloned disk boots under both firmwares (`make test-install`, `make test-bios-install`); stage
+two chooses the kernel's address from E820 (`choose_placement`: the lowest 2 MiB-aligned usable region above 1 MiB that holds
+8 MiB for the image plus the slot's size for the read buffer, below 4 GiB; a clear message if there is none;
+`make test-bios-placement` boots with 512 MiB, 40 MiB and 8 MiB).
+
+Still open: nothing has run on real hardware (unreal mode, A20, E820 and VBE quirks are the usual surprises; the AMD/nForce
+board is the first target); each VBE call is checked, but there is no operator override to skip graphics on a video card
+that hangs in a mode switch; the 4 GiB identity map in stage two limits where the kernel can be placed (fine: it moves its
+own page tables first thing).
 
 ## 5. Migration, in order
 

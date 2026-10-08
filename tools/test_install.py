@@ -2,7 +2,7 @@
 """`install diskN` (v2): copies the running system (ESP, kernel, files) onto another disk and makes it bootable.
 Boots the image with a blank 128 MiB second disk, checks the announce/confirm discipline and the boot-disk refusal,
 installs, verifies the new GPT with `sgdisk --verify` (and that its GUIDs differ from the boot disk's), then boots the
-installed disk *alone* and checks that it comes up with the files. Run with `make test-v2-install`."""
+installed disk *alone* and checks that it comes up with the files. Run with `make test-install`; `make test-bios-install` boots both the original and the copy through BIOS."""
 
 import shutil
 import subprocess
@@ -62,6 +62,13 @@ def main():
         check("No problems found" in verify.stdout, "sgdisk finds the new GPT consistent", verify.stdout + verify.stderr)
         table = guids(target)
         check("EFI System" in table and "fos payload" in table and "FOSFS data" in table, "three partitions: ESP, payload, FOSFS", table)
+        # The BIOS boot chain came along, if the boot disk has one: stage one in the MBR's code area, stage two at LBA 64.
+        source, copy = boot.read_bytes(), target.read_bytes()
+        source_has_bios = any(source[:446]) and any(source[64 * 512:(64 + 24) * 512])
+        if source_has_bios:
+            check(copy[:446] == source[:446] and copy[510:512] == b"\x55\xaa", "stage one (the MBR's code) is copied, signature kept", copy[:64].hex())
+            check(copy[64 * 512:(64 + 24) * 512] == source[64 * 512:(64 + 24) * 512], "and stage two, byte for byte, at LBA 64", "")
+            check("BIOS boot code" in out[8], "the install says so", out[8])
         # Booting the installed disk alone: it must find itself by its own new GUIDs.
         out = session(tmp, "inst2", target, ["ls", "cat marker.txt", "debug slots"])
         check("marker.txt" in out[0], "the installed disk boots on its own and has the files", out[0])

@@ -258,18 +258,22 @@ bios: $(BIOS_STAGES)
 # make test-bios-NAME: the existing test tools/test_NAME.py, with QEMU's firmware swapped for SeaBIOS so the image is booted
 # by the BIOS path (tools/qemu_bios_shim.py strips the OVMF drives from every qemu command line the test builds).
 BIOS_SHIM := $(BIOS_OUT)/shim
-BIOS_TESTS := boot config debug-mode tapes scripts lineedit ed msi nic netfs nettest diag format disks stick-guids
+BIOS_TESTS := boot config debug-mode tapes scripts lineedit ed msi nic netfs nettest diag format disks stick-guids install
 $(BIOS_SHIM)/qemu-system-x86_64: tools/qemu_bios_shim.py
 	mkdir -p $(BIOS_SHIM)
 	cp $< $@
 	chmod +x $@
-.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios
+.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios test-bios-placement
 $(addprefix test-bios-,$(BIOS_TESTS)): test-bios-%: image $(BIOS_SHIM)/qemu-system-x86_64
 	PATH=$(abspath $(BIOS_SHIM)):$$PATH FOS_FIRMWARE=bios python3 tools/test_$(subst -,_,$*).py
-test-bios: $(addprefix test-bios-,$(BIOS_TESTS))
+test-bios: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement
+
+# Stage two picks the kernel's address from the E820 map: boots with 512 MiB, 40 MiB and (expected to stop with a message) 8 MiB.
+test-bios-placement: image
+	python3 tools/test_bios_placement.py
 
 # Every test-* target in turn (slow); prints a summary and fails if any failed. Run one by name for quick iteration.
-ALL_TESTS := $(filter-out test-all test-bios,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS))
+ALL_TESTS := $(filter-out test-all test-bios test-bios-placement,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement
 .PHONY: test-all
 test-all: image
 	@failed=""; for t in $(ALL_TESTS); do \

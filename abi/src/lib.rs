@@ -119,6 +119,13 @@ pub const METADATA_MAGIC: [u8; 4] = *b"FOSM";
 pub const METADATA_VERSION: u8 = 1;
 pub const NO_PENDING_SLOT: u8 = 0xff;
 
+/// Where the BIOS boot chain (boot/bios) lives on a disk: stage one is the first 446 bytes of sector 0 (the MBR; the
+/// protective partition entry and the 0x55aa signature stay), stage two is `BIOS_STAGE2_SECTORS` sectors at LBA
+/// `BIOS_STAGE2_LBA`, in the gap a GPT leaves between its entry array (LBA 2-33) and the first partition (LBA 2048).
+/// Keep equal to boot/bios/stage1.S and tools/build_image.py.
+pub const BIOS_STAGE2_LBA: u64 = 64;
+pub const BIOS_STAGE2_SECTORS: u64 = 24;
+
 /// First sector of kernel slot `slot` (0 or 1) within the payload partition.
 pub const fn slot_start(slot: u64) -> u64 {
     1 + slot * SLOT_SECTORS

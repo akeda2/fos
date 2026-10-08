@@ -18,19 +18,19 @@
  *   4b. Video: set a VBE linear-framebuffer mode (last, so narration still works) and describe it in
  *      BootInfo like the UEFI loader describes GOP; the kernel's framebuffer console then needs no change.
  *   5. Identity-map the first 4 GiB (2 MiB pages), enter long mode (PAE, EFER.LME, paging), and
- *      in 64-bit code: place the ELF's PT_LOAD segments at KERNEL_BASE, apply its
+ *      in 64-bit code: place the ELF's PT_LOAD segments at kernel_base, apply its
  *      R_X86_64_RELATIVE relocations, convert the E820 map to UEFI memory descriptors, fill in
  *      BootInfo and jump to the kernel entry with a pointer to it in RDI.
  *
- * Memory used (all below the kernel at KERNEL_BASE; the kernel treats everything below 1 MiB as
+ * Memory used (all below the kernel at kernel_base; the kernel treats everything below 1 MiB as
  * reserved loader data because the memory map we give it says so):
  *   0x1000 BootInfo (144 bytes)   0x1100 raw E820 table   0x2000 UEFI-style memory map
  *   0x5000-0x5fff is left alone: the kernel keeps its crash record there so the next boot can report it
  *   0x7a00 real-mode stack        0x7c00 stage one        0x8000 this code and its data
  *   0x10000 read buffer (64 KiB aligned: an EDD read must not cross a 64 KiB boundary)
  *   0x20000 page tables (PML4, PDPT, four page directories)      0x90000 64-bit stack
- *   0x1000000 staging area for the kernel ELF (up to 8 MiB; needs a machine with > 24 MiB)
- *   0x400000 KERNEL_BASE: where the kernel image is placed (needs RAM there)
+ *   kernel_base / staging_base: chosen from the E820 map (choose_placement): the lowest usable region above 1 MiB
+ *   that holds 8 MiB for the placed kernel image followed by room for the ELF as read from disk
  */
 .code16
 .set BOOT_INFO, 0x1000
@@ -43,8 +43,7 @@
 .set PAGE_TABLES, 0x20000
 .set STACK16, 0x7a00
 .set STACK64, 0x90000
-.set STAGING, 0x1000000
-.set KERNEL_BASE, 0x400000
+.set KERNEL_SPAN, 0x800000              /* room reserved for the placed kernel image: 8 MiB (its memory size must fit) */
 .set SLOT_SECTORS, 16384                /* abi::SLOT_SECTORS: 8 MiB per kernel slot */
 
 .global _start
@@ -295,7 +294,18 @@ chosen:
     call puts16
 1:
 
-    /* ---- 4. read the kernel slot above 1 MiB ---- */
+    /* ---- 4. choose where the kernel goes, then read the slot above 1 MiB ---- */
+    call choose_placement
+    movw $m_place, %si
+    call puts16
+    movl kernel_base, %eax
+    call puthex32
+    movw $m_place_staging, %si
+    call puts16
+    movl staging_base, %eax
+    call puthex32
+    movw $m_crlf, %si
+    call puts16
     movw $m_load, %si
     call puts16
     movl payload_first, %eax
@@ -306,7 +316,8 @@ chosen:
 1:  movl %eax, rd_lba
     movl kernel_sectors, %eax
     movl %eax, rd_sectors
-    movl $STAGING, rd_dest
+    movl staging_base, %eax
+    movl %eax, rd_dest
     call read_high
     jc disk_fail_code
     movw $m_ok, %si
@@ -396,6 +407,57 @@ rh_done:
 rh_error:
     stc
     ret
+
+/* ---- where the kernel goes: from the E820 map, not a fixed address ----
+ * The kernel image needs KERNEL_SPAN bytes (8 MiB; the real image is about 2 MiB, its .bss included) and the ELF as read
+ * from disk needs the slot's size again (up to 8 MiB) as a staging area, both below 4 GiB (the copy and the page tables
+ * here reach that far). Take the lowest usable E820 region above 1 MiB that can hold both back to back, starting on a
+ * 2 MiB boundary: kernel_base = that start, staging_base = kernel_base + KERNEL_SPAN. Fails with a message if there is none
+ * (a machine with a memory hole right above 1 MiB needs a region of about this size somewhere). */
+choose_placement:
+    movl kernel_sectors, %eax
+    shll $9, %eax                       /* bytes of the slot image ... */
+    addl $0xfffff, %eax
+    andl $0xfff00000, %eax              /* ... rounded up to 1 MiB */
+    addl $KERNEL_SPAN, %eax
+    movl %eax, place_need
+    movw $E820_TABLE, %bx
+    movl e820_count, %eax
+    movl %eax, e820_left
+1:  cmpl $0, e820_left
+    je place_fail
+    cmpl $1, 16(%bx)                    /* usable RAM only */
+    jne 5f
+    cmpl $0, 4(%bx)                     /* base above 4 GiB: out of reach */
+    jne 5f
+    movl (%bx), %eax                    /* base */
+    movl 8(%bx), %edx
+    addl %eax, %edx                     /* end = base + length, low dword; carry into the high one */
+    movl 12(%bx), %ecx
+    adcl $0, %ecx
+    jz 3f
+    movl $0xfffff000, %edx              /* the region reaches past 4 GiB: use it up to there */
+3:  cmpl $0x100000, %eax
+    jae 4f
+    movl $0x100000, %eax                /* nothing below 1 MiB: BIOS data, stage two and the page tables live there */
+4:  addl $0x1fffff, %eax
+    jc 5f
+    andl $0xffe00000, %eax              /* start on a 2 MiB boundary */
+    cmpl %eax, %edx
+    jbe 5f
+    subl %eax, %edx                     /* how much is there from that start */
+    cmpl place_need, %edx
+    jb 5f
+    movl %eax, kernel_base
+    addl $KERNEL_SPAN, %eax
+    movl %eax, staging_base
+    ret
+5:  addw $24, %bx
+    decl e820_left
+    jmp 1b
+place_fail:
+    movw $m_no_room, %si
+    jmp fail
 
 /* ---- unreal mode: ES gets a flat 4 GiB limit, then we return to real mode (the limit stays cached) ---- */
 enter_unreal:
@@ -922,8 +984,8 @@ long64:
     movw %ax, %es
     movw %ax, %ss
     movq $STACK64, %rsp
-    movq $KERNEL_BASE, %rbx             /* rbx = where the image goes, for the whole ELF phase */
-    movq $STAGING, %rbp                 /* rbp = the ELF as read from disk */
+    movl kernel_base, %ebx              /* rbx = where the image goes, for the whole ELF phase */
+    movl staging_base, %ebp             /* rbp = the ELF as read from disk */
 
     cmpl $0x464c457f, (%rbp)            /* "\x7fELF" */
     jne elf_bad
@@ -968,6 +1030,8 @@ ph_next:
     decl %r13d
     jmp ph_loop
 ph_done:
+    cmpq $KERNEL_SPAN, %r11             /* the placed image (segments plus .bss) must fit the room reserved for it */
+    ja image_too_big
     addq $0xfff, %r11
     andq $-4096, %r11                   /* kernel_size: the image, rounded up to a page */
     movq %r11, kernel_size
@@ -1135,6 +1199,9 @@ emit:
 elf_bad:
     leaq m_elf_bad(%rip), %rsi
     jmp fail64
+image_too_big:
+    leaq m_image_big(%rip), %rsi
+    jmp fail64
 reloc_bad:
     leaq m_reloc_bad(%rip), %rsi
 fail64:
@@ -1187,6 +1254,9 @@ gpt_entry_size:   .long 0
 payload_first:    .long 0
 payload_sectors:  .long 0
 kernel_sectors:   .long 0
+kernel_base:      .long 0
+staging_base:     .long 0
+place_need:       .long 0
 rd_lba:           .long 0
 rd_sectors:       .long 0
 rd_dest:          .long 0
@@ -1238,6 +1308,9 @@ m_colon:      .asciz ": "
 m_sectors_kib:.asciz " sectors ("
 m_kib_end:    .asciz " KiB).\r\n"
 m_meta_ro:    .asciz "  Warning: the slot metadata could not be written back; fallback tracking is off this boot.\r\n"
+m_place:      .asciz "  Placement (from the memory map): kernel image at 0x"
+m_place_staging: .asciz ", read buffer at 0x"
+m_no_room:    .asciz "FAILED: no usable RAM region above 1 MiB is large enough for the kernel and its read buffer (about 16 MiB).\r\n"
 m_load:       .asciz "  Reading the kernel slot (INT 13h EDD) and copying it above 1 MiB (unreal mode): "
 m_long:       .asciz "  Entering long mode (PAE, EFER.LME, paging); next the ELF segments are placed and the kernel starts.\r\n"
 m_video:      .asciz "  Video: VBE 0x"
@@ -1256,4 +1329,5 @@ m_meta_bad:   .asciz "FAILED, the slot-metadata sector is not valid.\r\n"
 m_slot_empty: .asciz "FAILED, the selected kernel slot is empty or larger than a slot.\r\n"
 m_disk_fail:  .asciz " <- FAILED, BIOS disk error (INT 13h status above).\r\n"
 m_elf_bad:    .asciz "FAILED: the kernel slot does not hold a position-independent ELF64 image.\r\n"
+m_image_big:  .asciz "FAILED: the kernel image is larger than the 8 MiB reserved for it.\r\n"
 m_reloc_bad:  .asciz "FAILED: the kernel has a relocation other than R_X86_64_RELATIVE.\r\n"

@@ -5,7 +5,8 @@
 //! 1. a new GPT: an EFI System Partition and a payload partition the same size as the boot disk's, and a FOSFS
 //!    partition filling the rest of the disk;
 //! 2. the ESP is copied sector for sector (it holds only `\EFI\BOOT\BOOTX64.EFI`, so the firmware's removable-media
-//!    fallback boots it; no NVRAM boot entry is written);
+//!    fallback boots it; no NVRAM boot entry is written), and so is the BIOS boot chain if the boot disk has one
+//!    (stage one in the MBR's code area, stage two in the GPT gap at LBA 64), so the copy boots under BIOS too;
 //! 3. the payload gets the kernel that is *running* (the slot named in BootInfo) as slot 0, and fresh slot metadata
 //!    (active slot 0, nothing pending, no crash history), so the copy boots exactly what this boot booted;
 //! 4. the FOSFS volume is formatted and every file of the boot volume is copied (`bare` skips the files).
@@ -14,7 +15,7 @@
 //! writes to the boot disk, and needs `force` to replace a partition table that is not a fos disk's (a blank disk or
 //! a disk that already has a fos payload partition, i.e. an earlier install, does not).
 
-use fos_v2_abi::{slot_start, SlotMetadata, FOSFS_TYPE_GUID, PAYLOAD_TYPE_GUID};
+use fos_v2_abi::{slot_start, SlotMetadata, BIOS_STAGE2_LBA, BIOS_STAGE2_SECTORS, FOSFS_TYPE_GUID, PAYLOAD_TYPE_GUID};
 
 use crate::gpt::{self, Partition, ESP_TYPE_GUID};
 use crate::{block, fosfs, storage};
@@ -106,13 +107,33 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         Some(gpt::Summary::Unknown) => return crate::println!("install: disk{number}'s first sectors hold data that is not a GPT; add `force` to replace it."),
         None => return crate::println!("install: cannot read disk{number}."),
     }
-    crate::println!("It will get the boot disk's ESP ({} MiB), the running kernel (slot {}) and a FOSFS volume of about {} MiB{}.",
+    crate::println!("It will get the boot disk's ESP ({} MiB) and BIOS boot code, the running kernel (slot {}) and a FOSFS volume of about {} MiB{}.",
         layout.esp.sectors / 2048, storage::boot_slot(), (info.sectors - needed + MIN_FOSFS_SECTORS) / 2048, if bare { ", empty" } else { " with every file of the boot volume" });
     crate::println!("ALL of disk{number} is replaced.");
     let mut stored = Pending { number, label: [0; fosfs::MAX_NAME], label_length: label.len(), bare };
     stored.label[..label.len()].copy_from_slice(label.as_bytes());
     unsafe { PENDING = Some(stored) };
     crate::println!("To go ahead, type exactly: install disk{number} confirm");
+}
+
+/// Copies the BIOS boot chain (boot/bios) from the boot disk to `disk`: stage two first, then stage one's code into the MBR's
+/// code area, so a disk interrupted half way has no code in the MBR and is simply not BIOS-bootable (the protective partition
+/// entry and signature `gpt::write_table` wrote stay). `Ok(false)` if the boot disk has none (a UEFI-only image).
+fn copy_bios_boot_code(boot: usize, disk: usize) -> Result<bool, block::Error> {
+    let mut mbr = [0u8; 512];
+    block::read(boot, 0, &mut mbr)?;
+    let mut stage2 = [0u8; 512];
+    block::read(boot, BIOS_STAGE2_LBA, &mut stage2)?;
+    let has_code = mbr[510] == 0x55 && mbr[511] == 0xaa && mbr[..446].iter().any(|&byte| byte != 0) && stage2.iter().any(|&byte| byte != 0);
+    if !has_code {
+        return Ok(false);
+    }
+    copy_sectors(boot, BIOS_STAGE2_LBA, disk, BIOS_STAGE2_LBA, BIOS_STAGE2_SECTORS)?;
+    let mut target = [0u8; 512];
+    block::read(disk, 0, &mut target)?;
+    target[..446].copy_from_slice(&mbr[..446]);
+    block::write(disk, 0, &target)?;
+    Ok(true)
 }
 
 /// Copies `sectors` sectors from `from_lba` on `from` to `to_lba` on `to`, 64 KiB at a time.
@@ -160,6 +181,11 @@ fn run(boot: usize, disk: usize, number: usize, pending: &Pending) {
     let [esp, payload, data] = made;
     crate::println!("disk{number}: new partition table: ESP {} MiB, payload {} MiB, FOSFS {} MiB (new GUIDs).", esp.sectors / 2048, payload.sectors / 2048, data.sectors / 2048);
 
+    match copy_bios_boot_code(boot, disk) {
+        Ok(true) => crate::println!("Copied the BIOS boot code (stage one in the MBR, stage two at LBA {BIOS_STAGE2_LBA}): the disk boots on BIOS machines too."),
+        Ok(false) => crate::println!("The boot disk has no BIOS boot code (a UEFI-only image): disk{number} will boot on UEFI machines only."),
+        Err(error) => crate::println!("install: copying the BIOS boot code failed ({error:?}); disk{number} will boot on UEFI machines only."),
+    }
     crate::println!("Copying the EFI System Partition ({} MiB)...", esp.sectors / 2048);
     if let Err(error) = copy_sectors(boot, layout.esp.start, disk, esp.start, esp.sectors) {
         return crate::println!("install: copying the ESP failed ({error:?}); disk{number} is not bootable.");
