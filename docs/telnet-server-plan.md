@@ -23,7 +23,7 @@ unattended.
 - The kernel has no TCP/IP stack and is not getting one. `kernel/Cargo.toml`
   has zero dependencies; NIC drivers only do raw Ethernet frame send/receive
   (`kernel/src/nic.rs:75,84`). All ARP/IPv4/TCP logic lives in the shared
-  `tapes/tape-net` crate, linked per-tape (see `NETWORKING.md`). A telnet
+  `crates/tape-net` crate, linked per-tape (see `NETWORKING.md`). A telnet
   server therefore has to be a tape, not a kernel feature, and it has to
   carry its own TCP handling.
 - The existing nested-tape pattern (`term net`, `term printer`) only works

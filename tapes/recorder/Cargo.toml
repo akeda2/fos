@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tape-rt = { path = "../tape-rt" }
-tape-panel = { path = "../tape-panel" }
-audio-wire = { path = "../audio-wire" }
-audio-rec = { path = "../audio-rec" }
+tape-rt = { path = "../../crates/tape-rt" }
+tape-panel = { path = "../../crates/tape-panel" }
+audio-wire = { path = "../../crates/audio-wire" }
+audio-rec = { path = "../../crates/audio-rec" }
 
 [profile.release]
 panic = "abort"

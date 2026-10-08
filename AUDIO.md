@@ -129,7 +129,7 @@ narrative, and the full real-hardware BAR-assignment investigation) is in
 over genuine RTP (RFC 3550) carried in UDP/IPv4 instead of a bespoke
 raw-Ethernet tag protocol, so a real tool (`ffmpeg`, `gstreamer`, any RTP
 client) can send to or receive from `fos` directly, not just another fos
-instance. `tapes/tape-net/src/lib.rs` gained a matching `RtpPacket` type
+instance. `crates/tape-net/src/lib.rs` gained a matching `RtpPacket` type
 (parse/encode over borrowed slices/caller-owned buffers) and a
 `sequence16_at_or_after` wraparound helper; see `NETWORKING.md`'s "RTP
 scope"/"`tapes/audio-rtp`" sections for the full wire-format design.
@@ -143,7 +143,7 @@ direction; `duplex PEER_IP [PEER_PORT]` is the one mode that drives both
 directions at once (still device 0 only), over one shared local UDP port
 (always `DEFAULT_PORT`/5004).
 
-Opus support (`tapes/opus-codec/`, this project's first vendored C
+Opus support (`crates/opus-codec/`, this project's first vendored C
 dependency, built from libopus 1.5.2's fixed-point, decode-and-encode
 source tree by the root Makefile's `opus-codec-lib` recipe) adds a fourth
 fixed dynamic payload type, `PAYLOAD_TYPE_OPUS` (98): `listen_mode`

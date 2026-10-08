@@ -12,7 +12,7 @@ name = "ed"
 path = "src/main.rs"
 
 [dependencies]
-tape-rt = { path = "../tape-rt" }
+tape-rt = { path = "../../crates/tape-rt" }
 
 [profile.release]
 panic = "abort"

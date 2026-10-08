@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tape-rt = { path = "../tape-rt" }
-opus-codec = { path = "../opus-codec" }
+tape-rt = { path = "../../crates/tape-rt" }
+opus-codec = { path = "../../crates/opus-codec" }
 
 [profile.release]
 panic = "abort"

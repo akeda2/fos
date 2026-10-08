@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes fat/src/upcase.bin: an exFAT up-case table made from Python's Unicode data (simple one-to-one upper-case
+"""Writes crates/fat/src/upcase.bin: an exFAT up-case table made from Python's Unicode data (simple one-to-one upper-case
 mappings of the Basic Multilingual Plane), in the format's compressed form: a run of unchanged characters is the pair
 0xFFFF, count; everything else is the upper-case value of the next character. The table ends after the last character that
 changes (the rest map to themselves). Run it again only if the table should change; the result is committed."""
@@ -34,7 +34,7 @@ def main():
             table.append(mapping[code])
             code += 1
     data = struct.pack(f"<{len(table)}H", *table)
-    out = Path(__file__).resolve().parents[1] / "fat/src/upcase.bin"
+    out = Path(__file__).resolve().parents[1] / "crates/fat/src/upcase.bin"
     out.write_bytes(data)
     print(f"{out}: {len(data)} bytes, covers characters up to {end - 1:#x}", file=sys.stderr)
 

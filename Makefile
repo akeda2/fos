@@ -49,21 +49,21 @@ BIOS_STAGES := $(BIOS_OUT)/stage1.bin $(BIOS_OUT)/stage2.bin
 LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fos-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fos-v2-kernel
 IMAGE := $(OUT)/v2.img
-# v2 tapes: crates under tapes/, each built to build/cargo-target/x86_64-fos-tape/release/NAME.
+# tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
 TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 TAPE_FILES := $(foreach tape,$(TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape)) --file debug=tools/default-debug.txt
 
 # ---- Opus (stage C of audio-net): libopus built freestanding for the 64-bit tape target ----
-# The vendored tree (tapes/opus-codec/vendor/opus, v1.5.2, fixed-point, trimmed to what the build needs) is compiled
+# The vendored tree (crates/opus-codec/vendor/opus, v1.5.2, fixed-point, trimmed to what the build needs) is compiled
 # with the C compiler directly, position-independent and without the red zone or any SSE registers
 # (-mgeneral-regs-only), and archived; a tape links the archive through RUSTFLAGS (which replaces the shared
-# .cargo/config.toml rustflags, so those are repeated). See tapes/opus-codec.
-OPUS_VENDOR := tapes/opus-codec/vendor/opus
+# .cargo/config.toml rustflags, so those are repeated). See crates/opus-codec.
+OPUS_VENDOR := crates/opus-codec/vendor/opus
 OPUS_SOURCES := $(wildcard $(OPUS_VENDOR)/celt/*.c) $(wildcard $(OPUS_VENDOR)/silk/*.c) $(wildcard $(OPUS_VENDOR)/silk/fixed/*.c) $(wildcard $(OPUS_VENDOR)/src/*.c)
 OPUS_OBJS := $(patsubst $(OPUS_VENDOR)/%.c,$(OUT)/opus-fixed/%.o,$(OPUS_SOURCES))
 OPUS_LIB := $(OUT)/opus-fixed/libopus_fixed.a
-OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-asynchronous-unwind-tables -mgeneral-regs-only -mno-red-zone -ffunction-sections -fdata-sections -U_FORTIFY_SOURCE -DHAVE_CONFIG_H -Itapes/opus-codec -I$(OPUS_VENDOR)/include -I$(OPUS_VENDOR)/celt -I$(OPUS_VENDOR)/silk -I$(OPUS_VENDOR)/silk/fixed
+OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-asynchronous-unwind-tables -mgeneral-regs-only -mno-red-zone -ffunction-sections -fdata-sections -U_FORTIFY_SOURCE -DHAVE_CONFIG_H -Icrates/opus-codec -I$(OPUS_VENDOR)/include -I$(OPUS_VENDOR)/celt -I$(OPUS_VENDOR)/silk -I$(OPUS_VENDOR)/silk/fixed
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
@@ -103,8 +103,8 @@ run: image
 # Loader + kernel under QEMU + OVMF, including a framebuffer screendump check.
 test: image
 	cargo +nightly-2026-09-13 test --manifest-path abi/Cargo.toml
-	cargo +nightly-2026-09-13 test --manifest-path fat/Cargo.toml
-	cargo +nightly-2026-09-13 test --manifest-path tapes/audio-rec/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/fat/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	python3 tools/test_boot.py
 
 # Deliberate-fault kernels (one Cargo feature each): checks the exception reports,
@@ -246,7 +246,7 @@ test-nettapes: image
 	for t in bridge ip_chat; do PATH=$(abspath $(SHIM_DIR)):$$PATH FOS_V2=1 python3 tapes/test_$${t}_e2e.py || exit 1; done
 
 
-$(OUT)/opus-fixed/%.o: $(OPUS_VENDOR)/%.c tapes/opus-codec/config.h tapes/opus-codec/custom_support.h
+$(OUT)/opus-fixed/%.o: $(OPUS_VENDOR)/%.c crates/opus-codec/config.h crates/opus-codec/custom_support.h
 	mkdir -p $(dir $@)
 	gcc $(OPUS_CFLAGS) -c $< -o $@
 

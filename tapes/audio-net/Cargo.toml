@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tape-rt = { path = "../tape-rt" }
-audio-wire = { path = "../audio-wire" }
-tape-panel = { path = "../tape-panel" }
-tape-net = { path = "../tape-net" }
-opus-codec = { path = "../opus-codec" }
+tape-rt = { path = "../../crates/tape-rt" }
+audio-wire = { path = "../../crates/audio-wire" }
+tape-panel = { path = "../../crates/tape-panel" }
+tape-net = { path = "../../crates/tape-net" }
+opus-codec = { path = "../../crates/opus-codec" }
 
 [profile.release]
 panic = "abort"

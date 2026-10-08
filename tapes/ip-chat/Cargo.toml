@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 # One source for the protocol library: v1 and v2 tapes share it (it is plain no_std Rust).
-tape-net = { path = "../tape-net" }
-tape-rt = { path = "../tape-rt" }
+tape-net = { path = "../../crates/tape-net" }
+tape-rt = { path = "../../crates/tape-rt" }
 
 [profile.release]
 panic = "abort"

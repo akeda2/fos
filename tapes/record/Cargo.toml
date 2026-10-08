@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tape-rt = { path = "../tape-rt" }
-audio-rec = { path = "../audio-rec" }
+tape-rt = { path = "../../crates/tape-rt" }
+audio-rec = { path = "../../crates/audio-rec" }
 
 [profile.release]
 panic = "abort"

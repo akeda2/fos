@@ -1,7 +1,7 @@
 # fos networking
 
 This document describes the boundary between the protected-mode kernel and
-networking tapes, and the shared protocol code in `tapes/tape-net/`. It is
+networking tapes, and the shared protocol code in `crates/tape-net/`. It is
 intentionally more detailed than the command table in `README.md`: networking
 is a teaching path through several layers of hardware and protocol state, not
 a general socket implementation.
@@ -447,9 +447,9 @@ general interrupt-driven network queue. The RTL8139 remains polling-only and
 can still overflow when a sender transmits an unpaced burst; use the existing
 3 ms pacing convention for large tape transfers.
 
-## `tapes/tape-net`
+## `crates/tape-net`
 
-`tapes/tape-net` is a `#![no_std]` library, not a tape binary. It contains
+`crates/tape-net` is a `#![no_std]` library, not a tape binary. It contains
 protocol building blocks that can be linked into multiple tapes:
 
 - Ethernet II header parsing and frame construction.
@@ -672,7 +672,7 @@ manual test.
 (`ffmpeg`, `gstreamer`, ...) can send to or receive from this tape
 directly; nothing about the wire format is fos-specific except the
 payload-type convention described in "RTP scope" above. `listen` mode
-accepts one fixed Opus payload type, decoded through `tapes/opus-codec`'s
+accepts one fixed Opus payload type, decoded through `crates/opus-codec`'s
 vendored fixed-point libopus decoder; `send`/`capture` can now *encode*
 Opus too (`send opus`/`capture opus`, see the startup forms below). Both
 directions rely on the same vendored decoder/encoder; see `AGENTS.md`'s
@@ -835,7 +835,7 @@ ICMP before UDP and UDP before TCP.
 Run the focused checks with:
 
 ```sh
-cargo test --manifest-path tapes/tape-net/Cargo.toml
+cargo test --manifest-path crates/tape-net/Cargo.toml
 make test-tape-ip-chat
 make test-tape-telnet
 make test-tape-audio-rtp
@@ -872,7 +872,7 @@ hardware boundary.
 RTCP and SDP-based negotiation remain deliberately deferred for
 `tapes/audio-rtp/`. Opus (both decode and encode, plain FEC/DTX aside)
 is no longer deferred -- see `AGENTS.md`'s "Real-time audio streaming
-over RTP/UDP" section for `tapes/opus-codec`'s vendored fixed-point
+over RTP/UDP" section for `crates/opus-codec`'s vendored fixed-point
 libopus codec. Two-way duplex (simultaneous `listen`+`send` in one
 invocation, multiplexing one incoming and one outgoing RTP stream over
 one UDP 5-tuple) is the next planned step, building on the same combined

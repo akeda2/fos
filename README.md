@@ -110,7 +110,7 @@ validation path, while the focused tape tests below cover host-side protocol
 helpers and selected multi-guest scenarios.
 
 `make test-tape-net` runs the host-side unit suite for the no-heap shared
-networking library in `tapes/tape-net/`. Its synthetic-frame tests cover the
+networking library in `crates/tape-net/`. Its synthetic-frame tests cover the
 protocol code without requiring a NIC or QEMU. `make test-tape-ip-chat` runs
 the host-side tests for the IPv4/UDP chat tape's argument and packet helpers;
 `make test-tape-telnet` does the same for the Telnet tape.
@@ -156,7 +156,7 @@ with a one-line description.
 The kernel/tape networking boundary and the shared protocol library are
 documented separately in [`NETWORKING.md`](NETWORKING.md). That document
 covers the raw NIC callbacks, timer/queue semantics, and the staged
-Ethernet/ARP/IPv4/ICMP/UDP/TCP implementation in `tapes/tape-net/`.
+Ethernet/ARP/IPv4/ICMP/UDP/TCP implementation in `crates/tape-net/`.
 
 ## Prompt
 
@@ -532,7 +532,7 @@ DMA memory, while ordinary polling remains the fallback if recovery fails.
 experimental ethertype (`0x88b5`); and `nic recv` polls briefly for one
 incoming frame and hex-dumps it. The shell commands remain deliberately
 raw-Ethernet demonstrations. Higher protocols are implemented by networking
-tapes through the shared `tapes/tape-net/` library rather than being hidden
+tapes through the shared `crates/tape-net/` library rather than being hidden
 inside the kernel.
 
 `nic sniff` is a small link-level packet sniffer: it asks the selected
@@ -681,7 +681,7 @@ A remote reference is always `HOST[:diskN]` (disk1 if omitted), where
 `HOST` is either an `nic peers` number or a discovered hostname -- never a
 raw MAC address, since a MAC's own colons would collide with `:diskN`.
 Every transfer is verified with a 16-bit Internet checksum (RFC 1071, the
-same algorithm `tapes/tape-net`'s IPv4/UDP/TCP layers use) computed over
+same algorithm `crates/tape-net`'s IPv4/UDP/TCP layers use) computed over
 the whole file; a mismatch aborts before anything is written locally or
 remotely. Like every other protocol in this project, there is no
 retransmission and no authentication: anyone on the same Ethernet segment
@@ -980,8 +980,8 @@ it with `make tape-vga-colors` (producing `build/tapes/vga-colors.bin`).
 
 Unlike `hello-rs`/`bigsieve`, this tape doesn't keep its own copy of
 `entry.S`, the panic handler, or `print_bytes` -- it depends on
-`tapes/tape-rt/`, a small shared crate providing all three, instead (see
-`tapes/tape-rt/src/lib.rs`'s header comment for why this crate exists,
+`crates/tape-rt/`, a small shared crate providing all three, instead (see
+`crates/tape-rt/src/lib.rs`'s header comment for why this crate exists,
 and why only this tape uses it -- `hello-rs`/`bigsieve` stay fully
 self-contained on purpose, as beginner-facing teaching examples). Any
 new future Rust tape (not a from-scratch teaching-ladder example) should
@@ -1499,7 +1499,7 @@ directly.
 
 #### Test tape: `tapes/ip-chat/`
 
-An IPv4/UDP line-chat application built on the shared `tapes/tape-net/`
+An IPv4/UDP line-chat application built on the shared `crates/tape-net/`
 library. It resolves peers with ARP, routes off-subnet traffic through the
 configured gateway, and keeps application policy in the tape rather than the
 kernel. Start it with `tape run static LOCAL_IP/PREFIX GATEWAY [PEER_IP]`
@@ -1517,7 +1517,7 @@ shell recovery afterward.
 #### Test tape: `tapes/telnet/`
 
 A fixed-buffer TCP terminal client for generic Unix-like Telnet servers. It
-uses the shared `tapes/tape-net/` ARP/TCP/DHCP implementation. Choose static
+uses the shared `crates/tape-net/` ARP/TCP/DHCP implementation. Choose static
 configuration for deterministic setups:
 
 ```text
@@ -2015,7 +2015,7 @@ general-purpose one), interrupt-driven IRQ0/IRQ1 handling for the timer and
 keyboard, and four polling-mode PCI network card drivers (RTL8139,
 selected 3C905 variants, Intel e1000, and an NE2000-compatible clone, with
 raw frame access in the kernel and
-ARP/IPv4/ICMP/UDP/TCP/DHCP protocol code in `tapes/tape-net/`; no NIC
+ARP/IPv4/ICMP/UDP/TCP/DHCP protocol code in `crates/tape-net/`; no NIC
 interrupt handling), but no other hardware IRQ
 drivers (no native disk or USB interrupt handling). The optional NIC-ROM boot
 path (see "Booting from a NIC ROM") does not implement the BIOS-disk

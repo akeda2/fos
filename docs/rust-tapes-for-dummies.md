@@ -216,10 +216,10 @@ corresponding build target to the repository `Makefile` in section 4.
 
 For this walkthrough, copy from `tapes/hello-rs/` specifically, not
 `tapes/vga-colors/`: `vga-colors` no longer keeps its own `src/entry.S`,
-panic handler, or `print_bytes` -- it depends on `tapes/tape-rt/`, a
+panic handler, or `print_bytes` -- it depends on `crates/tape-rt/`, a
 small shared crate providing all three, instead (see
-`tapes/tape-rt/src/lib.rs`'s header comment, and AGENTS.md's
-"`tapes/tape-rt/`: a shared runtime, so far only used by `vga-colors`"
+`crates/tape-rt/src/lib.rs`'s header comment, and AGENTS.md's
+"`crates/tape-rt/`: a shared runtime, so far only used by `vga-colors`"
 section, for the full story). `hello-rs` and `bigsieve` were left fully
 self-contained on purpose, specifically so a walkthrough like this one
 can show every line that actually runs, with nothing imported from an
@@ -591,7 +591,7 @@ in ordinary Rust, rather than a second kernel callback.
 
 For protocol applications, keep the same boundary as `tapes/ip-chat/`:
 the kernel owns the RTL8139 and exposes only raw-frame callbacks, while
-`tapes/tape-net/` owns Ethernet, ARP, IPv4, UDP, TCP, and DHCP packet/state
+`crates/tape-net/` owns Ethernet, ARP, IPv4, UDP, TCP, and DHCP packet/state
 logic. The tape owns configuration policy, fixed buffers, input, output, and
 the polling loop. Do not duplicate PCI discovery, DMA setup, receive-ring
 management, or NIC reset logic in the tape.
@@ -642,7 +642,7 @@ tape tests.
   demonstrating both `read_key` (an interactive REPL) and startup
   arguments (`tape run 3 4 +`), the section 7 additions above, in a
   complete real tape.
-- `tapes/tape-net/src/lib.rs` -- the shared fixed-buffer networking library,
+- `crates/tape-net/src/lib.rs` -- the shared fixed-buffer networking library,
   including Ethernet, ARP, IPv4, ICMP, UDP, DHCPv4, and bounded TCP. See
   `NETWORKING.md` for how an application tape should select `dhcp` or
   `static IP NETMASK GATEWAY` mode and drive the library with the kernel
