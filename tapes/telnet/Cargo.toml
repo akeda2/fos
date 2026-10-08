@@ -6,17 +6,15 @@ edition = "2024"
 [lib]
 name = "telnet_tape"
 path = "src/lib.rs"
-test = true
-bench = false
 
 [[bin]]
-name = "telnet-tape"
+name = "telnet"
 path = "src/main.rs"
-test = false
-bench = false
 
-[profile.dev]
-panic = "abort"
+[dependencies]
+# One source for the protocol library: v1 and v2 tapes share it (it is plain no_std Rust).
+tape-net = { path = "../tape-net" }
+tape-rt = { path = "../tape-rt" }
 
 [profile.release]
 panic = "abort"
@@ -24,9 +22,3 @@ codegen-units = 1
 lto = true
 opt-level = "z"
 strip = "symbols"
-
-[dependencies]
-tape-net = { path = "../tape-net" }
-
-[target.'cfg(target_os = "none")'.dependencies]
-tape-rt = { path = "../tape-rt" }

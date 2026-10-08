@@ -63,11 +63,11 @@ const TAPE_EVENT_ABORT: u32 = 1;
 const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 
 type Putc = extern "C" fn(u32);
-type ReadKey = extern "C" fn() -> u32;
-type NicMac = extern "C" fn(u32) -> u32;
-type NicSend = extern "C" fn(u32, u32) -> u32;
-type NicReceive = extern "C" fn(u32, u32) -> u32;
-type Ticks = extern "C" fn() -> u64;
+type ReadKey = fn() -> u32;
+type NicMac = fn(usize) -> u32;
+type NicSend = fn(usize, u32) -> u32;
+type NicReceive = fn(usize, u32) -> u32;
+type Ticks = fn() -> u64;
 
 #[derive(Clone, Copy)]
 enum ResolveResult {
@@ -154,7 +154,7 @@ fn send_frame(nic_send: NicSend, frame: &mut [u8], length: usize, max_frame_len:
     if length < EthernetFrame::HEADER_LEN || length > max_frame_len {
         return false;
     }
-    nic_send(frame.as_ptr() as u32, length as u32) != 0
+    nic_send(frame.as_ptr() as usize, length as u32) != 0
 }
 
 fn send_arp_request(
@@ -317,7 +317,7 @@ fn resolve_mac(
             }
         }
 
-        let length = nic_receive(receive_buffer.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+        let length = nic_receive(receive_buffer.as_mut_ptr() as usize, max_frame_len as u32) as usize;
         if length != 0 {
             process_frame(
                 putc,
@@ -639,7 +639,7 @@ fn configure_dhcp(
             return None;
         }
 
-        let length = nic_receive(receive_buffer.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+        let length = nic_receive(receive_buffer.as_mut_ptr() as usize, max_frame_len as u32) as usize;
         if length != 0 {
             receive_dhcp(
                 &receive_buffer[..min(length, MAX_FRAME_LEN)],
@@ -658,48 +658,15 @@ fn configure_dhcp(
 /// frames.  `ticks` is the kernel's 100 Hz PIT count; DHCP converts it to
 /// seconds because DHCP lease fields are specified in seconds.
 #[unsafe(no_mangle)]
-pub extern "C" fn tape_main(
-    putc: Putc,
-    _should_abort: extern "C" fn() -> u32,
-    _alloc: extern "C" fn(u32) -> u32,
-    _free: extern "C" fn(u32, u32),
-    read_key: ReadKey,
-    args_ptr: u32,
-    args_len: u32,
-    nic_mac: NicMac,
-    nic_send: NicSend,
-    nic_receive: NicReceive,
-    nic_max_frame_len: extern "C" fn() -> u32,
-    ticks: Ticks,
-    _nic_count: extern "C" fn() -> u32,
-    _nic_mac_at: extern "C" fn(u32, u32) -> u32,
-    _nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
-    _nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
-    _nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
-    _terminal_position: extern "C" fn() -> u32,
-    _fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
-    _fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
-    _fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
-    _fs_remove: extern "C" fn(u32, u32) -> u32,
-    _audio_sample_rate: extern "C" fn() -> u32,
-    _audio_channels_and_bits: extern "C" fn() -> u32,
-    _audio_submit: extern "C" fn(u32, u32) -> u32,
-    _audio_capture: extern "C" fn(u32, u32) -> u32,
-    _audio_count: extern "C" fn() -> u32,
-    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_sample_rate: extern "C" fn() -> u32,
-    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
-    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    // Sleeps until the next interrupt; call after a pass that found no work.
-    wait_for_event: extern "C" fn(),
-) {
-    tape_rt::set_wait_hook(wait_for_event);
+pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
+    tape_rt::init(api);
+    use tape_rt::compat::*;
+    let putc = api.putc;
+    let args = tape_rt::args();
+    let (args_ptr, args_len) = (args.as_ptr() as usize, args.len() as u32);
+
     let mut mac_bytes = [0u8; 6];
-    if nic_mac(mac_bytes.as_mut_ptr() as u32) == 0 {
+    if nic_mac(mac_bytes.as_mut_ptr() as usize) == 0 {
         print_bytes(putc, b"IPv4 chat cannot start: no supported NIC is available.\n");
         return;
     }
@@ -827,7 +794,7 @@ pub extern "C" fn tape_main(
             _ => {}
         }
 
-        let length = nic_receive(receive_buffer.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+        let length = nic_receive(receive_buffer.as_mut_ptr() as usize, max_frame_len as u32) as usize;
         if length != 0 {
             process_frame(
                 putc,

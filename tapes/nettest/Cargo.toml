@@ -1,10 +1,19 @@
 [package]
-name = "nettest-tape"
+name = "nettest"
 version = "0.1.0"
 edition = "2024"
 
-[profile.dev]
-panic = "abort"
+# The engine (lib.rs, host-testable) and the tape (main.rs) in one crate.
+[lib]
+name = "nettest_tape"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nettest"
+path = "src/main.rs"
+
+[dependencies]
+tape-rt = { path = "../tape-rt" }
 
 [profile.release]
 panic = "abort"
@@ -12,6 +21,3 @@ codegen-units = 1
 lto = true
 opt-level = "z"
 strip = "symbols"
-
-[dependencies]
-tape-rt = { path = "../tape-rt" }

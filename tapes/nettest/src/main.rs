@@ -28,7 +28,11 @@ use nettest_tape::{
     ArpInfo, Config, Direction, GEN_HEADER_LEN, Generator, HISTOGRAM_BOUNDS_US, MAX_FRAME, PRESETS,
     Rng, SLOT_BYTES, Sink, Sweep, UdpPlan, build_arp, parse_arp, parse_ip, parse_mac, parse_permille, parse_u32, preset,
 };
-use tape_rt::{print_bytes, print_u32};
+use tape_rt::{TapeApi, micros, print_bytes, print_u32};
+
+fn wait_for_event() {
+    tape_rt::idle();
+}
 
 const TAPE_EVENT_ABORT: u32 = 1;
 const TAPE_EVENT_BYTE_BASE: u32 = 0x100;
@@ -90,7 +94,7 @@ struct Session<'a> {
     last_rev_arp_us: u64,
     /// FOSFS write callback (for `save`), the file `gen.save=NAME` writes when a
     /// test finishes, and when the end-of-test summary is due (0 = not pending).
-    fs_write: Option<extern "C" fn(u32, u32, u32, u32) -> u32>,
+    fs_write: Option<fn(usize, u32, usize, u32) -> u32>,
     save_name: [u8; 16],
     save_name_len: usize,
     summary_due_us: u64,
@@ -105,8 +109,8 @@ struct Session<'a> {
     ports: [u32; 2],
     macs: [[u8; 6]; 2],
     nic_total: usize,
-    mac_at: extern "C" fn(u32, u32) -> u32,
-    promisc_at: extern "C" fn(u32, u32) -> u32,
+    mac_at: fn(u32, usize) -> u32,
+    promisc_at: fn(u32, u32) -> u32,
     /// Passes of the polling loop and when it started: a long average pass is
     /// the first sign that the tape itself, not the link, is the bottleneck.
     passes: u64,
@@ -123,50 +127,45 @@ enum Outcome {
 
 extern "C" fn silent(_byte: u32) {}
 
+/// The v1 tape ABI passed ~40 callbacks as parameters; v2 has one table. These small
+/// functions keep the names the rest of this file was written against, now taking
+/// 64-bit pointers (a buffer may live anywhere in RAM, not just below 4 GiB).
+fn nic_count() -> u32 {
+    (tape_rt::api().nic_count)() as u32
+}
+fn nic_mac_at(nic: u32, out: usize) -> u32 {
+    (tape_rt::api().nic_mac)(nic as usize, out as *mut u8)
+}
+fn nic_send_at(nic: u32, frame: usize, length: u32) -> u32 {
+    (tape_rt::api().nic_send)(nic as usize, frame as *const u8, length as usize)
+}
+fn nic_receive_at(nic: u32, buffer: usize, capacity: u32) -> u32 {
+    (tape_rt::api().nic_receive)(nic as usize, buffer as *mut u8, capacity as usize) as u32
+}
+fn nic_set_promiscuous_at(nic: u32, on: u32) -> u32 {
+    (tape_rt::api().nic_set_promiscuous)(nic as usize, on)
+}
+fn nic_max_frame_len() -> u32 {
+    (tape_rt::api().nic_max_frame_len)() as u32
+}
+fn ticks() -> u64 {
+    (tape_rt::api().ticks)()
+}
+fn read_key() -> u32 {
+    (tape_rt::api().read_key)()
+}
+fn alloc(bytes: u32) -> usize {
+    (tape_rt::api().alloc)(bytes as usize)
+}
+/// Writes a file on the boot volume; 0 on success.
+fn fs_write(name: usize, name_length: u32, data: usize, length: u32) -> u32 {
+    u32::from((tape_rt::api().fs_write)(name as *const u8, name_length as usize, data as *const u8, length as usize) != 0)
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn tape_main(
-    putc: Putc,
-    _should_abort: extern "C" fn() -> u32,
-    alloc: extern "C" fn(u32) -> u32,
-    free: extern "C" fn(u32, u32),
-    read_key: extern "C" fn() -> u32,
-    args_ptr: u32,
-    args_len: u32,
-    _nic_mac: extern "C" fn(u32) -> u32,
-    _nic_send: extern "C" fn(u32, u32) -> u32,
-    _nic_receive: extern "C" fn(u32, u32) -> u32,
-    nic_max_frame_len: extern "C" fn() -> u32,
-    ticks: extern "C" fn() -> u64,
-    nic_count: extern "C" fn() -> u32,
-    nic_mac_at: extern "C" fn(u32, u32) -> u32,
-    nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
-    nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
-    nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
-    _terminal_position: extern "C" fn() -> u32,
-    _fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
-    _fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
-    fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
-    _fs_remove: extern "C" fn(u32, u32) -> u32,
-    _audio_sample_rate: extern "C" fn() -> u32,
-    _audio_channels_and_bits: extern "C" fn() -> u32,
-    _audio_submit: extern "C" fn(u32, u32) -> u32,
-    _audio_capture: extern "C" fn(u32, u32) -> u32,
-    _audio_count: extern "C" fn() -> u32,
-    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_sample_rate: extern "C" fn() -> u32,
-    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
-    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    wait_for_event: extern "C" fn(),
-    _set_input_mode: extern "C" fn(u32),
-    micros: extern "C" fn() -> u64,
-) {
-    tape_rt::set_wait_hook(wait_for_event);
-    tape_rt::set_micros_hook(micros);
-    let fs_write_hook = fs_write;
+pub extern "C" fn tape_main(api: &'static TapeApi) {
+    tape_rt::init(api);
+    let putc = api.putc;
     let nic_total = nic_count() as usize;
     if nic_total < 1 {
         print_bytes(putc, b"nettest needs at least one initialized NIC.\n");
@@ -225,11 +224,7 @@ pub extern "C" fn tape_main(
         loop_started_us: 0,
     };
 
-    let arguments = if args_len == 0 {
-        &[][..]
-    } else {
-        unsafe { core::slice::from_raw_parts(args_ptr as *const u8, args_len as usize) }
-    };
+    let arguments = tape_rt::args();
     let mut ports = [0u32; 2];
     let mut port_count = 0;
     if !apply_startup(putc, &mut session, arguments, &mut ports, &mut port_count) {
@@ -242,7 +237,7 @@ pub extern "C" fn tape_main(
               Ready-made: nettest selftest GEN LINK_IN LINK_OUT SINK [settings]\n\
               \x20           nettest routertest GEN SINK [settings]\n",
         );
-        release(big, free);
+        release(big);
         return;
     }
     // Roles: the impairment link between two ports, a generator NIC, a sink NIC.
@@ -254,7 +249,7 @@ pub extern "C" fn tape_main(
             ports = [0, 1];
         } else if port_count != 2 || ports[0] == ports[1] {
             print_bytes(putc, b"nettest needs two distinct NIC numbers (see 'nic list').\n");
-            release(big, free);
+            release(big);
             return;
         }
     }
@@ -272,12 +267,12 @@ pub extern "C" fn tape_main(
     for (position, &nic) in used[..used_count].iter().enumerate() {
         if nic as usize >= nic_total {
             print_bytes(putc, b"nettest: no such NIC (see 'nic list').\n");
-            release(big, free);
+            release(big);
             return;
         }
         if used[..position].contains(&nic) {
             print_bytes(putc, b"nettest: each role needs a NIC of its own ('nic map' shows the cabling).\n");
-            release(big, free);
+            release(big);
             return;
         }
     }
@@ -287,13 +282,13 @@ pub extern "C" fn tape_main(
     let mut gen_mac = [0u8; 6];
     let mut sink_mac = [0u8; 6];
     let mac_ok = (!session.limiter
-        || (nic_mac_at(ports[0], macs[0].as_mut_ptr() as u32) != 0
-            && nic_mac_at(ports[1], macs[1].as_mut_ptr() as u32) != 0))
-        && session.gen_nic.is_none_or(|nic| nic_mac_at(nic, gen_mac.as_mut_ptr() as u32) != 0)
-        && session.sink_nic.is_none_or(|nic| nic_mac_at(nic, sink_mac.as_mut_ptr() as u32) != 0);
+        || (nic_mac_at(ports[0], macs[0].as_mut_ptr() as usize) != 0
+            && nic_mac_at(ports[1], macs[1].as_mut_ptr() as usize) != 0))
+        && session.gen_nic.is_none_or(|nic| nic_mac_at(nic, gen_mac.as_mut_ptr() as usize) != 0)
+        && session.sink_nic.is_none_or(|nic| nic_mac_at(nic, sink_mac.as_mut_ptr() as usize) != 0);
     if !mac_ok {
         print_bytes(putc, b"nettest cannot start: failed to read a NIC MAC.\n");
-        release(big, free);
+        release(big);
         return;
     }
     if session.limiter {
@@ -303,7 +298,7 @@ pub extern "C" fn tape_main(
                     let _ = nic_set_promiscuous_at(ports[0], 0);
                 }
                 print_bytes(putc, b"nettest cannot start: promiscuous mode failed.\n");
-                release(big, free);
+                release(big);
                 return;
             }
         }
@@ -312,7 +307,7 @@ pub extern "C" fn tape_main(
     session.sink_mac = sink_mac;
     session.ports = ports;
     session.macs = macs;
-    session.fs_write = Some(fs_write_hook);
+    session.fs_write = Some(fs_write);
     if !session.destination_explicit {
         session.generator.destination = if session.sink_nic.is_some() { sink_mac } else { [0xff; 6] };
     }
@@ -371,7 +366,7 @@ pub extern "C" fn tape_main(
         // The sink first, so a frame is timestamped as soon as it is seen.
         if let Some(nic) = session.sink_nic {
             for _ in 0..64 {
-                let received = nic_receive_at(nic, frame.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+                let received = nic_receive_at(nic, frame.as_mut_ptr() as usize, max_frame_len as u32) as usize;
                 if received < ETHERNET_HEADER_LEN {
                     break;
                 }
@@ -383,7 +378,7 @@ pub extern "C" fn tape_main(
                     if !info.is_reply && Some(info.target_ip) == session.sink.udp_ip {
                         let mut reply = [0u8; 64];
                         build_arp(&mut reply, true, session.sink_mac, info.target_ip, info.sender_mac, info.sender_ip);
-                        let _ = nic_send_at(nic, reply.as_ptr() as u32, 60);
+                        let _ = nic_send_at(nic, reply.as_ptr() as usize, 60);
                     } else if info.is_reply
                         && session.rgen.udp.is_some_and(|plan| plan.next_hop == info.sender_ip)
                     {
@@ -398,7 +393,7 @@ pub extern "C" fn tape_main(
         // so its receive ring never fills while the foreground is busy sending.
         if let Some(nic) = session.gen_nic {
             for _ in 0..8 {
-                let received = nic_receive_at(nic, frame.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+                let received = nic_receive_at(nic, frame.as_mut_ptr() as usize, max_frame_len as u32) as usize;
                 if received < ETHERNET_HEADER_LEN {
                     break;
                 }
@@ -416,7 +411,7 @@ pub extern "C" fn tape_main(
                     } else if !is_reply && target_ip == plan.source_ip {
                         let mut reply = [0u8; 64];
                         build_arp(&mut reply, true, session.gen_mac, plan.source_ip, sender_mac, sender_ip);
-                        let _ = nic_send_at(nic, reply.as_ptr() as u32, 60);
+                        let _ = nic_send_at(nic, reply.as_ptr() as usize, 60);
                     }
                 }
             }
@@ -425,7 +420,7 @@ pub extern "C" fn tape_main(
                 if let Some(sink_nic) = session.sink_nic {
                     let mut sent = 0;
                     while let Some(length) = session.rgen.next_frame(now_us, session.sink_mac, &mut frame, sent) {
-                        let ok = nic_send_at(sink_nic, frame.as_ptr() as u32, length as u32) != 0;
+                        let ok = nic_send_at(sink_nic, frame.as_ptr() as usize, length as u32) != 0;
                         session.rgen.record_send(length, ok);
                         sent += 1;
                         busy = true;
@@ -435,7 +430,7 @@ pub extern "C" fn tape_main(
                             session.last_rev_arp_us = now_us;
                             let mut request = [0u8; 64];
                             build_arp(&mut request, false, session.sink_mac, plan.source_ip, [0; 6], plan.next_hop);
-                            let _ = nic_send_at(sink_nic, request.as_ptr() as u32, 60);
+                            let _ = nic_send_at(sink_nic, request.as_ptr() as usize, 60);
                         }
                     }
                 }
@@ -446,7 +441,7 @@ pub extern "C" fn tape_main(
                     session.last_arp_us = now_us;
                     let mut request = [0u8; 64];
                     build_arp(&mut request, false, session.gen_mac, plan.source_ip, [0; 6], plan.next_hop);
-                    let _ = nic_send_at(nic, request.as_ptr() as u32, 60);
+                    let _ = nic_send_at(nic, request.as_ptr() as usize, 60);
                 }
             }
         }
@@ -457,7 +452,7 @@ pub extern "C" fn tape_main(
                 for _ in 0..32 {
                     let received = nic_receive_at(
                         session.ports[ingress],
-                        frame.as_mut_ptr() as u32,
+                        frame.as_mut_ptr() as usize,
                         max_frame_len as u32,
                     ) as usize;
                     if received < ETHERNET_HEADER_LEN {
@@ -480,7 +475,7 @@ pub extern "C" fn tape_main(
             for way in 0..2 {
                 while let Some(length) = session.links[way].release(now_us, &mut frame) {
                     busy = true;
-                    let ok = nic_send_at(session.ports[1 - way], frame.as_ptr() as u32, length as u32) != 0;
+                    let ok = nic_send_at(session.ports[1 - way], frame.as_ptr() as usize, length as u32) != 0;
                     session.links[way].record_send(length, ok);
                 }
             }
@@ -490,7 +485,7 @@ pub extern "C" fn tape_main(
         if let Some(nic) = session.gen_nic {
             let mut sent = 0;
             while let Some(length) = session.generator.next_frame(now_us, session.gen_mac, &mut frame, sent) {
-                let ok = nic_send_at(nic, frame.as_ptr() as u32, length as u32) != 0;
+                let ok = nic_send_at(nic, frame.as_ptr() as usize, length as u32) != 0;
                 session.generator.record_send(length, ok);
                 sent += 1;
                 busy = true;
@@ -574,12 +569,12 @@ pub extern "C" fn tape_main(
     }
     print_bytes(putc, b"nettest stopped.\n");
     print_stats(putc, &session);
-    release(big, free);
+    release(big);
 }
 
-fn release(big: u32, free: extern "C" fn(u32, u32)) {
+fn release(big: usize) {
     if big != 0 {
-        free(big, BIG_BYTES);
+        (tape_rt::api().free)(big, BIG_BYTES as usize);
     }
 }
 
@@ -1292,7 +1287,7 @@ fn retarget(putc: Putc, session: &mut Session<'_>, role: Role, arg: &[u8]) -> Ou
     }
     let mut mac = [0u8; 6];
     if let Some(nic) = new {
-        if (session.mac_at)(nic, mac.as_mut_ptr() as u32) == 0 {
+        if (session.mac_at)(nic, mac.as_mut_ptr() as usize) == 0 {
             print_bytes(putc, b"failed to read that NIC's MAC\n");
             return Outcome::Error;
         }
@@ -1363,8 +1358,8 @@ fn relink(putc: Putc, session: &mut Session<'_>, first: &[u8], second: &[u8]) ->
         }
     }
     let mut macs = [[0u8; 6]; 2];
-    if (session.mac_at)(a, macs[0].as_mut_ptr() as u32) == 0
-        || (session.mac_at)(b, macs[1].as_mut_ptr() as u32) == 0
+    if (session.mac_at)(a, macs[0].as_mut_ptr() as usize) == 0
+        || (session.mac_at)(b, macs[1].as_mut_ptr() as usize) == 0
     {
         print_bytes(putc, b"failed to read a NIC MAC\n");
         return Outcome::Error;
@@ -1770,9 +1765,9 @@ fn save_report(putc: Putc, session: &Session<'_>, name: &[u8]) {
     }
     let length = unsafe { REPORT_LENGTH };
     let status = write(
-        name.as_ptr() as u32,
+        name.as_ptr() as usize,
         name.len() as u32,
-        addr_of_mut!(REPORT) as u32,
+        addr_of_mut!(REPORT) as usize,
         length as u32,
     );
     if status == 0 {

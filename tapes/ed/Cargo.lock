@@ -10,5 +10,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fos-v2-abi"
+version = "0.1.0"
+
+[[package]]
 name = "tape-rt"
 version = "0.1.0"
+dependencies = [
+ "fos-v2-abi",
+]

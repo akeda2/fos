@@ -117,20 +117,20 @@ const LEASE_FILE_STATUS_BUFFER_TOO_SMALL: u32 = 3;
 const TAPE_EVENT_ABORT: u32 = 1;
 
 type Putc = extern "C" fn(u32);
-type ShouldAbort = extern "C" fn() -> u32;
-type Alloc = extern "C" fn(u32) -> u32;
-type Free = extern "C" fn(u32, u32);
-type NicCount = extern "C" fn() -> u32;
-type NicMacAt = extern "C" fn(u32, u32) -> u32;
-type NicSendAt = extern "C" fn(u32, u32, u32) -> u32;
-type NicReceiveAt = extern "C" fn(u32, u32, u32) -> u32;
-type NicSetPromiscuousAt = extern "C" fn(u32, u32) -> u32;
-type TerminalPosition = extern "C" fn() -> u32;
-type FsFileLength = extern "C" fn(u32, u32, u32) -> u32;
-type FsRead = extern "C" fn(u32, u32, u32, u32, u32) -> u32;
-type FsWrite = extern "C" fn(u32, u32, u32, u32) -> u32;
-type FsRemove = extern "C" fn(u32, u32) -> u32;
-type Ticks = extern "C" fn() -> u64;
+type ShouldAbort = fn() -> u32;
+type Alloc = fn(u32) -> usize;
+type Free = fn(usize, u32);
+type NicCount = fn() -> u32;
+type NicMacAt = fn(u32, usize) -> u32;
+type NicSendAt = fn(u32, usize, u32) -> u32;
+type NicReceiveAt = fn(u32, usize, u32) -> u32;
+type NicSetPromiscuousAt = fn(u32, u32) -> u32;
+type TerminalPosition = fn() -> u32;
+type FsFileLength = fn(usize, u32, usize) -> u32;
+type FsRead = fn(usize, u32, usize, u32, usize) -> u32;
+type FsWrite = fn(usize, u32, usize, u32) -> u32;
+type FsRemove = fn(usize, u32) -> u32;
+type Ticks = fn() -> u64;
 
 struct RouterInterface {
     nic: u32,
@@ -718,7 +718,7 @@ fn restore_lease_file<'a>(
 
 fn flush_lease_file<'a>(
     name: FileName,
-    buffer_address: u32,
+    buffer_address: usize,
     capacity: usize,
     interfaces: &[RouterInterface; MAX_INTERFACES],
     servers: &mut [Option<DhcpServer<'a>>; MAX_INTERFACES],
@@ -757,7 +757,7 @@ fn flush_lease_file<'a>(
     lease_put_u32(buffer, 12, record_count);
     lease_put_u32(buffer, 16, lease_checksum(&buffer[LEASE_FILE_HEADER_SIZE..offset]));
     fs_write(
-        name.as_bytes().as_ptr() as u32,
+        name.as_bytes().as_ptr() as usize,
         name.len as u32,
         buffer_address,
         offset as u32,
@@ -771,7 +771,7 @@ fn lease_servers_dirty<'a>(servers: &[Option<DhcpServer<'a>>; MAX_INTERFACES]) -
 fn persist_leases<'a>(
     putc: Putc,
     name: FileName,
-    storage: &mut Option<(u32, usize)>,
+    storage: &mut Option<(usize, usize)>,
     needs_flush: &mut bool,
     interfaces: &[RouterInterface; MAX_INTERFACES],
     servers: &mut [Option<DhcpServer<'a>>; MAX_INTERFACES],
@@ -799,7 +799,7 @@ fn persist_leases<'a>(
 }
 
 fn free_dhcp_allocations(
-    allocations: &mut [Option<(u32, u32)>; MAX_INTERFACES],
+    allocations: &mut [Option<(usize, u32)>; MAX_INTERFACES],
     free: Free,
 ) {
     for allocation in allocations.iter_mut() {
@@ -986,7 +986,7 @@ fn send_arp_request(
     let Ok(length) = ethernet.encode(&mut frame) else {
         return false;
     };
-    length <= max_frame_len && nic_send_at(interface.nic, frame.as_ptr() as u32, length as u32) != 0
+    length <= max_frame_len && nic_send_at(interface.nic, frame.as_ptr() as usize, length as u32) != 0
 }
 
 fn send_arp_reply(
@@ -1006,7 +1006,7 @@ fn send_arp_reply(
     let Ok(length) = ethernet.encode(&mut frame) else {
         return false;
     };
-    length <= max_frame_len && nic_send_at(interface.nic, frame.as_ptr() as u32, length as u32) != 0
+    length <= max_frame_len && nic_send_at(interface.nic, frame.as_ptr() as usize, length as u32) != 0
 }
 
 fn receive_dhcp(frame: &[u8], client: &mut DhcpClient<128>, now: u32) {
@@ -1069,7 +1069,7 @@ fn send_dhcp_payload(
     let Ok(length) = ethernet.encode(&mut frame) else {
         return false;
     };
-    length <= max_frame_len && nic_send_at(nic, frame.as_ptr() as u32, length as u32) != 0
+    length <= max_frame_len && nic_send_at(nic, frame.as_ptr() as usize, length as u32) != 0
 }
 
 fn dhcp_pool(interface: &RouterInterface) -> Option<(u32, u32)> {
@@ -1498,7 +1498,7 @@ fn configure_dhcp(
         }
 
         let length =
-            nic_receive_at(nic, receive_buffer.as_mut_ptr() as u32, max_frame_len as u32) as usize;
+            nic_receive_at(nic, receive_buffer.as_mut_ptr() as usize, max_frame_len as u32) as usize;
         if length != 0 {
             receive_dhcp(
                 &receive_buffer[..min(length, MAX_FRAME_LEN)],
@@ -1696,7 +1696,7 @@ fn send_icmp_echo(
             return false;
         };
         length <= max_frame_len
-            && nic_send_at(interface.nic, frame.as_ptr() as u32, length as u32) != 0
+            && nic_send_at(interface.nic, frame.as_ptr() as usize, length as u32) != 0
     }
 
 /// Answers an ICMP echo request addressed to one of the router's own
@@ -1756,7 +1756,7 @@ fn send_icmp_echo_reply(
         return false;
     };
     length <= max_frame_len
-        && nic_send_at(interface.nic, output_buffer.as_ptr() as u32, length as u32) != 0
+        && nic_send_at(interface.nic, output_buffer.as_ptr() as usize, length as u32) != 0
 }
 
 /// Recognizes a genuinely fresh ARP reply from `target`, without touching
@@ -2542,7 +2542,7 @@ fn forward_ipv4(
     }
     if nic_send_at(
         interfaces[egress].nic,
-        output_buffer.as_ptr() as u32,
+        output_buffer.as_ptr() as usize,
         length as u32,
     ) == 0
     {
@@ -2605,7 +2605,7 @@ fn release_held_frame(
         return;
     }
     held.frame[0..6].copy_from_slice(&sender_mac.0);
-    let _ = nic_send_at(held.nic, held.frame.as_ptr() as u32, held.length as u32);
+    let _ = nic_send_at(held.nic, held.frame.as_ptr() as usize, held.length as u32);
 }
 
 enum ForwardResult {
@@ -2614,46 +2614,13 @@ enum ForwardResult {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn tape_main(
-    putc: Putc,
-    should_abort: ShouldAbort,
-    alloc: Alloc,
-    free: Free,
-    _read_key: extern "C" fn() -> u32,
-    args_ptr: u32,
-    args_len: u32,
-    _nic_mac: extern "C" fn(u32) -> u32,
-    _nic_send: extern "C" fn(u32, u32) -> u32,
-    _nic_receive: extern "C" fn(u32, u32) -> u32,
-    nic_max_frame_len: extern "C" fn() -> u32,
-    ticks: Ticks,
-    nic_count: NicCount,
-    nic_mac_at: NicMacAt,
-    nic_send_at: NicSendAt,
-    nic_receive_at: NicReceiveAt,
-    nic_set_promiscuous_at: NicSetPromiscuousAt,
-    _terminal_position: TerminalPosition,
-    fs_file_length: FsFileLength,
-    fs_read: FsRead,
-    fs_write: FsWrite,
-    _fs_remove: FsRemove,
-    _audio_sample_rate: extern "C" fn() -> u32,
-    _audio_channels_and_bits: extern "C" fn() -> u32,
-    _audio_submit: extern "C" fn(u32, u32) -> u32,
-    _audio_capture: extern "C" fn(u32, u32) -> u32,
-    _audio_count: extern "C" fn() -> u32,
-    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_sample_rate: extern "C" fn() -> u32,
-    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
-    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    // Sleeps until the next interrupt; call after a pass that found no work.
-    wait_for_event: extern "C" fn(),
-) {
-    tape_rt::set_wait_hook(wait_for_event);
+pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
+    tape_rt::init(api);
+    use tape_rt::compat::*;
+    let putc = api.putc;
+    let args = tape_rt::args();
+    let (args_ptr, args_len) = (args.as_ptr() as usize, args.len() as u32);
+
     let nic_total = nic_count() as usize;
     let arguments = if args_len == 0 {
         &[][..]
@@ -2717,7 +2684,7 @@ pub extern "C" fn tape_main(
     let mut dns_from_uplink = false;
     for (priority, nic) in parsed.dhcp_uplinks[..parsed.dhcp_uplink_count].iter().flatten().enumerate() {
         let mut mac = [0u8; 6];
-        if nic_mac_at(*nic, mac.as_mut_ptr() as u32) == 0 {
+        if nic_mac_at(*nic, mac.as_mut_ptr() as usize) == 0 {
             print_bytes(putc, b"Router cannot start: failed to read a DHCP NIC MAC.\n");
             return;
         }
@@ -2775,7 +2742,7 @@ pub extern "C" fn tape_main(
 
     for config in parsed.interfaces[..parsed.interface_count].iter().flatten() {
         let mut mac = [0u8; 6];
-        if nic_mac_at(config.nic, mac.as_mut_ptr() as u32) == 0 {
+        if nic_mac_at(config.nic, mac.as_mut_ptr() as usize) == 0 {
             print_bytes(
                 putc,
                 b"Router cannot start: failed to read a selected NIC MAC.\n",
@@ -2887,7 +2854,7 @@ pub extern "C" fn tape_main(
             return;
         }
     }
-    let mut lease_file_storage: Option<(u32, usize)> = None;
+    let mut lease_file_storage: Option<(usize, usize)> = None;
     let mut lease_file_needs_flush = false;
     if let Some(lease_file) = parsed.dhcp_lease_file {
         match lease_file_capacity(&dhcp_servers) {
@@ -2903,9 +2870,9 @@ pub extern "C" fn tape_main(
                         lease_file_storage = Some((buffer_address, capacity));
                         let mut file_length = 0u64;
                         match fs_file_length(
-                            lease_file.as_bytes().as_ptr() as u32,
+                            lease_file.as_bytes().as_ptr() as usize,
                             lease_file.len as u32,
-                            (&mut file_length as *mut u64) as u32,
+                            (&mut file_length as *mut u64) as usize,
                         ) {
                             LEASE_FILE_STATUS_NOT_FOUND => {
                                 print_bytes(
@@ -2918,11 +2885,11 @@ pub extern "C" fn tape_main(
                             {
                                 let mut read_length = 0u32;
                                 let status = fs_read(
-                                    lease_file.as_bytes().as_ptr() as u32,
+                                    lease_file.as_bytes().as_ptr() as usize,
                                     lease_file.len as u32,
                                     buffer_address,
                                     capacity_u32,
-                                    (&mut read_length as *mut u32) as u32,
+                                    (&mut read_length as *mut u32) as usize,
                                 );
                                 if status == LEASE_FILE_STATUS_OK {
                                     let bytes = unsafe {
@@ -3170,7 +3137,7 @@ pub extern "C" fn tape_main(
             }
             let length = nic_receive_at(
                 interfaces[ingress].nic,
-                receive_buffer.as_mut_ptr() as u32,
+                receive_buffer.as_mut_ptr() as usize,
                 max_frame_len as u32,
             ) as usize;
             if length == 0 {

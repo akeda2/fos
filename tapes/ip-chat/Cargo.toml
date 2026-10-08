@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-test = true
-bench = false
+name = "ip_chat_tape"
+path = "src/lib.rs"
 
-[profile.dev]
-panic = "abort"
+[[bin]]
+name = "ip-chat"
+path = "src/main.rs"
+
+[dependencies]
+# One source for the protocol library: v1 and v2 tapes share it (it is plain no_std Rust).
+tape-net = { path = "../tape-net" }
+tape-rt = { path = "../tape-rt" }
 
 [profile.release]
 panic = "abort"
@@ -16,7 +22,3 @@ codegen-units = 1
 lto = true
 opt-level = "z"
 strip = "symbols"
-
-[dependencies]
-tape-net = { path = "../tape-net" }
-tape-rt = { path = "../tape-rt" }

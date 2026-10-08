@@ -1,25 +1,37 @@
-//! Minimal polling driver for 3Com 3C905/B/C PCI Ethernet controllers.
+//! A driver for 3Com 3C905/3C905B/3C905C PCI Ethernet cards ("Cyclone"/"Tornado", `10b7:9050`-`10b7:9200`), ported from v1's
+//! `threecom.rs`, which was confirmed on real cards (three of them in the AMD/nForce test machine).
 //!
-//! These cards use the Cyclone/Tornado bus-master interface: receive and
-//! transmit descriptors live in physical memory, while the device is
-//! controlled through a windowed command register at BAR0/BAR1. This driver
-//! intentionally implements only the raw Ethernet operations the kernel
-//! already exposes to tapes. Legacy IRQs only acknowledge and defer work to
-//! foreground polling; it does not add link management, checksum offload, or
-//! a general descriptor allocator.
+//! How the card works, briefly. Registers sit in an I/O-port window (BAR1 on most cards, BAR0 on some), and most of them are
+//! "windowed": a `SelectWindow` command picks which bank the low 16 bytes show. Only the command/status register at offset
+//! 0x0e is always visible. Frames move by bus-master DMA through linked lists of descriptors in host RAM: the *upload* list
+//! (card to host, receive) is a ring of descriptors whose status word gets the `UpComplete` bit when a frame is in, and the
+//! *download* list (host to card, transmit) is a list this driver keeps to a single descriptor. The card's DMA addresses are
+//! 32 bits, so every buffer is taken from memory below 4 GiB.
+//!
+//! Hard-won rules carried over from v1 (all found on real hardware, none visible in QEMU, which has no such card):
+//! * A command written while the previous one is still running (`CmdInProgress`, bit 12) is ignored or garbled, and three
+//!   places write the command register (foreground receive, the interrupt handler, init/recovery), so every write goes
+//!   through `issue_command`, which waits first.
+//! * After `RX_RESET` the upload engine can stay stalled: `UP_UNSTALL` must be sent after the list is posted, and after
+//!   every received descriptor is handed back.
+//! * An event raises INT# only if it is enabled in *both* `SET_STATUS_ENABLE` and `SET_INTERRUPT_ENABLE`. `TxComplete` is
+//!   left out: it stays asserted until the transmit status is popped, which this driver never does, so it would storm the
+//!   level-triggered line.
+//! * 16 receive descriptors were not enough (console output blocks the foreground for longer than they buffer): 64.
+//!
+//! Interrupts only wake the CPU (as on the other NICs): the foreground always polls the ring. The card has no MSI, so legacy
+//! INTx through the I/O APIC is tried (candidate pins probed, as for the RTL8168) and kept only if a self-test interrupt,
+//! raised by the card's `RequestInterrupt` command, arrives.
 
-use core::cell::Cell;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch::x86::{inb, inl, inw, outb, outl, outw};
-use crate::nic::{Health, WatchdogResult};
-use crate::pci;
-use crate::pmem;
-use crate::println;
+use crate::e1000::{Delivery, ISR, MAX_INTERFACES};
+use crate::{apic, cpu, memory, pci};
 
-const VENDOR_3COM: u16 = 0x10b7;
-const DEVICE_IDS: &[u16] = &[0x9050, 0x9051, 0x9054, 0x9055, 0x9058, 0x905a, 0x9200];
+pub const VENDOR_3COM: u16 = 0x10b7;
+/// 3C905 (Boomerang) 9050/9051, 3C905B 9055 and its variants, 3C905C 9200.
+pub const DEVICE_IDS: &[u16] = &[0x9050, 0x9051, 0x9054, 0x9055, 0x9058, 0x905a, 0x9200];
 
 const CMD_STATUS: u16 = 0x0e;
 const EEPROM_COMMAND: u16 = 0x0a;
@@ -38,16 +50,18 @@ const SELECT_WINDOW: u16 = 1 << 11;
 const RX_ENABLE: u16 = 4 << 11;
 const RX_RESET: u16 = 5 << 11;
 const UP_UNSTALL: u16 = (6 << 11) + 1;
+const DOWN_UNSTALL: u16 = (6 << 11) + 3;
 const TX_ENABLE: u16 = 9 << 11;
 const TX_RESET: u16 = 11 << 11;
+const REQUEST_INTERRUPT: u16 = 12 << 11;
 const ACK_INTERRUPT: u16 = 13 << 11;
+const SET_INTERRUPT_ENABLE: u16 = 14 << 11;
 const SET_STATUS_ENABLE: u16 = 15 << 11;
 const SET_RX_FILTER: u16 = 16 << 11;
 const SET_RX_THRESHOLD: u16 = 17 << 11;
-const DOWN_UNSTALL: u16 = (6 << 11) + 3;
-const SET_INTERRUPT_ENABLE: u16 = 14 << 11;
 
 const RX_STATION: u16 = 1;
+const RX_MULTICAST: u16 = 2;
 const RX_BROADCAST: u16 = 4;
 const RX_PROMISCUOUS: u16 = 8;
 
@@ -68,95 +82,50 @@ const EEPROM_READ: u16 = 0x80;
 const EEPROM_BUSY: u16 = 0x8000;
 const STATUS_INT_LATCH: u16 = 1 << 0;
 const STATUS_HOST_ERROR: u16 = 1 << 1;
-/// A transmit finished and left an entry on the card's TxStatus stack (window 1, offset 0x1b).
 const STATUS_TX_COMPLETE: u16 = 1 << 2;
-/// A bus-master receive finished (the card's UpComplete event).
+const STATUS_INT_REQUESTED: u16 = 1 << 6;
 const STATUS_UP_COMPLETE: u16 = 1 << 10;
-/// The only events this driver enables, both as *indications* (`SET_STATUS_
-/// ENABLE`) and as *interrupt sources* (`SET_INTERRUPT_ENABLE`). On the 3c90x
-/// an event must be enabled in both masks before it can raise INT#, and each
-/// command takes its mask in its low 13 bits -- the init-time `SET_STATUS_
-/// ENABLE` is sent with an empty mask (polling needs no indications), so
-/// `enable_interrupts` must send both masks itself; until it did, the card
-/// never asserted its interrupt line at all (found on real hardware: zero
-/// interrupts despite a registered IRQ). TxComplete, TxAvailable and StatsFull
-/// are deliberately left out: TxComplete stays asserted until the transmit
-/// status is popped, which this polling driver never does, so enabling it
-/// would hold the level-triggered line high and storm.
 const INTERRUPT_MASK: u16 = STATUS_UP_COMPLETE | STATUS_HOST_ERROR;
 
-/// Receive descriptors. This used to be 4, which at a 3 ms inter-frame pace
-/// holds only ~12 ms of arrivals: the console output that `tape load net`
-/// prints when a transfer starts (VGA plus a 115200-baud serial mirror) blocks
-/// the foreground longer than that, and the ring overflowed -- "Gap in tape
-/// data: expected chunk #5, got #7" a few frames into every large transfer
-/// (confirmed on real hardware with interrupts off, so not an interrupt bug).
-/// 16 descriptors buffered ~48 ms at that pace, but only ~1 ms at gigabit-class
-/// load (a tape forwarding between NICs), so the ring is now 64 descriptors:
-/// still inside the one descriptor page, with the buffers as one contiguous
-/// run of pages (`rx_buffer_base + index * 4096`) rather than an array in
-/// the kernel's tight `.bss`.
-const RX_DESC_COUNT: usize = 64;
+const RX_COUNT: usize = 64;
 const RX_BUFFER_SIZE: usize = 1536;
-pub const MIN_FRAME_LEN: usize = 60;
-pub const MAX_FRAME_LEN: usize = 1514;
+const MIN_FRAME: usize = 60;
+pub const MAX_FRAME: usize = 1514;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct RxDescriptor {
+struct Descriptor {
     next: u32,
     status: u32,
     address: u32,
     length: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TxDescriptor {
-    next: u32,
-    status: u32,
-    address: u32,
-    length: u32,
+#[derive(Debug)]
+pub enum Error {
+    NoIoBar,
+    NotResponding,
+    OutOfMemory,
+    ResetTimedOut,
+    CommandTimedOut,
+    EepromTimedOut,
+    InvalidMac,
 }
 
 fn read16(base: u16, offset: u16) -> u16 {
-    unsafe { inw(base + offset) }
+    cpu::inw(base + offset)
 }
-
 fn write16(base: u16, offset: u16, value: u16) {
-    unsafe { outw(base + offset, value) }
+    cpu::outw(base + offset, value)
 }
-
-fn write32(base: u16, offset: u16, value: u32) {
-    unsafe { outl(base + offset, value) }
-}
-
 fn read32(base: u16, offset: u16) -> u32 {
-    unsafe { inl(base + offset) }
+    cpu::inl(base + offset)
+}
+fn write32(base: u16, offset: u16, value: u32) {
+    cpu::outl(base + offset, value)
 }
 
-fn wait_command(base: u16) -> Result<(), InitError> {
-    let mut attempts = 100_000u32;
-    while read16(base, CMD_STATUS) & 0x1000 != 0 {
-        attempts -= 1;
-        if attempts == 0 {
-            return Err(InitError::CommandTimedOut);
-        }
-    }
-    Ok(())
-}
-
-/// Issues one command-register write only once the previous command has
-/// finished (`CmdInProgress`, bit 12, clear). The 3c90x ignores or garbles a
-/// command written while another is still running, and with interrupts live
-/// three places write that register -- foreground `receive` (`UP_UNSTALL`),
-/// the interrupt handler (acknowledges) and the init/recovery commands -- so
-/// an unlucky overlap silently lost an `UP_UNSTALL`, the upload engine stayed
-/// stalled and tape transfers aborted with "Gap in tape data" (found on real
-/// hardware the moment interrupts started working). Waiting *before* the write
-/// serialises them from either side. The bound (a few ms of port reads) keeps
-/// the interrupt-handler use from ever hanging; ordinary commands finish in
-/// microseconds, only the resets run long.
+/// Waits (bounded) for the previous command to finish, then writes the next: see the rules above.
 fn issue_command(base: u16, command: u16) {
     let mut attempts = 5_000u32;
     while read16(base, CMD_STATUS) & 0x1000 != 0 && attempts > 0 {
@@ -165,119 +134,133 @@ fn issue_command(base: u16, command: u16) {
     write16(base, CMD_STATUS, command);
 }
 
-fn descriptor_ptr<T>(base: u32, index: usize) -> *mut T {
-    (base as usize + index * 16) as *mut T
+fn wait_command(base: u16) -> Result<(), Error> {
+    for _ in 0..100_000u32 {
+        if read16(base, CMD_STATUS) & 0x1000 == 0 {
+            return Ok(());
+        }
+    }
+    Err(Error::CommandTimedOut)
+}
+
+fn descriptor(base: u64, index: usize) -> *mut Descriptor {
+    (base as usize + index * 16) as *mut Descriptor
+}
+
+/// Per-interface state the interrupt handler needs.
+static IO_BASE: [core::sync::atomic::AtomicU16; MAX_INTERFACES] = [const { core::sync::atomic::AtomicU16::new(0) }; MAX_INTERFACES];
+static FATAL: [AtomicBool; MAX_INTERFACES] = [const { AtomicBool::new(false) }; MAX_INTERFACES];
+/// Host (PCI bus) errors the card reported, for `nic`.
+static HOST_ERRORS: [core::sync::atomic::AtomicU32; MAX_INTERFACES] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_INTERFACES];
+
+/// The interrupt handler: acknowledge what the card says, note a host error for the foreground to recover from, and return.
+fn isr(index: usize) {
+    let base = IO_BASE[index].load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let status = read16(base, CMD_STATUS) & (INTERRUPT_MASK | STATUS_INT_REQUESTED);
+    if status == 0 {
+        return;
+    }
+    // Commands are not waited for to completion here, but the write itself must not land on a running one.
+    issue_command(base, ACK_INTERRUPT | status | STATUS_INT_LATCH);
+    ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
+    if status & STATUS_HOST_ERROR != 0 {
+        FATAL[index].store(true, Ordering::Release);
+        HOST_ERRORS[index].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub struct ThreeCom {
+    index: usize,
+    pub delivery: Delivery,
+    interrupts_enabled: bool,
     io_base: u16,
     b_revision: bool,
-    mac: Cell<[u8; 6]>,
-    descriptors: u32,
-    rx_buffer_base: u32,
-    tx_buffer: u32,
-    rx_next: Cell<usize>,
-    /// A frame was handed to the download engine and its completion has not been
-    /// collected yet (`send` is asynchronous: it checks at the next call).
-    tx_in_flight: Cell<bool>,
-    overflow_count: Cell<u32>,
-    rx_progress: Cell<u32>,
-    tx_progress: Cell<u32>,
-    recovery_count: Cell<u32>,
-    recovery_failures: Cell<u32>,
-    recovery_pending: AtomicBool,
-    promiscuous: Cell<bool>,
-    interrupts_enabled: Cell<bool>,
-    irq: Option<u8>,
-    interrupt_count: AtomicU32,
-    interrupt_errors: AtomicU32,
-    work_pending: AtomicBool,
-}
-
-struct ProbeInfo {
-    io_base: u16,
-    irq: Option<u8>,
-    b_revision: bool,
-}
-
-#[derive(Debug)]
-pub enum InitError {
-    OutOfMemory,
-    ResetTimedOut,
-    CommandTimedOut,
-    EepromTimedOut,
-    InvalidMac,
+    pub mac: [u8; 6],
+    descriptors: u64,
+    rx_buffers: u64,
+    tx_buffer: u64,
+    rx_next: usize,
+    /// A frame was handed to the download engine and its completion has not been collected (`send` is asynchronous).
+    tx_in_flight: bool,
+    promiscuous: bool,
+    multicast: bool,
+    pub frames_received: u64,
+    pub frames_sent: u64,
+    pub frames_dropped_no_link: u64,
+    pub bad_frames: u32,
+    pub recoveries: u32,
+    /// Sends abandoned because the card did not finish the previous frame in time.
+    pub tx_timeouts: u32,
+    /// Frames dropped because the card was still busy with the previous one.
+    pub tx_busy_drops: u32,
+    /// TxStatus entries that reported an error (collisions, underrun, jabber, overflow).
+    pub tx_status_errors: u32,
+    /// What the transmit descriptor and the download list pointer held at the last send timeout (for `nic`).
+    last_timeout: (u32, u32, u16),
+    /// DMACtrl and TxStatus at that moment.
+    last_timeout_dma: (u32, u8),
+    /// Times a stalled download engine was woken again by a repeated `DownUnstall`.
+    pub unstall_retries: u32,
+    recovery_pending: bool,
 }
 
 impl ThreeCom {
-    /// Finds every supported 3C905/B/C function with a usable I/O BAR.
-    /// Cyclone and Tornado cards commonly expose the register window at
-    /// BAR1, while some BIOSes leave a usable BAR0.
-    fn probe_all(out: &mut [ProbeInfo]) -> usize {
-        let mut addresses = [None; pci::MAX_DEVICE_MATCHES];
-        let found = pci::find_devices(VENDOR_3COM, DEVICE_IDS, &mut addresses);
-        let mut count = 0;
-        for address in addresses[..found.min(addresses.len())].iter().flatten() {
-            address.enable_io_and_bus_master();
-            if let Some(io_base) = address.io_bar(1).or_else(|| address.io_bar(0)) {
-                if count == out.len() {
-                    break;
-                }
-                out[count] = ProbeInfo {
-                    io_base,
-                    irq: address.interrupt_line(),
-                    b_revision: matches!(
-                        address.device_id(),
-                        0x9054 | 0x9055 | 0x9058 | 0x905a | 0x9200
-                    ),
-                };
-                count += 1;
-            }
+    pub fn init(device: &pci::Device, index: usize) -> Result<ThreeCom, Error> {
+        device.force_power_state_d0();
+        let command = device.read32(4);
+        device.write32(4, (command & 0xffff) | 0x5); // I/O decoding and bus mastering
+        // The register window is BAR1 on most cards and BAR0 on some.
+        let io_base = device.io_bar(1).or_else(|| device.io_bar(0)).ok_or(Error::NoIoBar)?;
+        if read16(io_base, CMD_STATUS) == 0xffff {
+            return Err(Error::NotResponding);
         }
-        count
-    }
-
-    fn init(io_base: u16, b_revision: bool, irq: Option<u8>) -> Result<Self, InitError> {
-        Self::reset(io_base)?;
-        let descriptors = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        let rx_buffer_base =
-            pmem::allocate_contiguous(RX_DESC_COUNT).ok_or(InitError::OutOfMemory)?;
-        let tx_buffer = pmem::allocate_contiguous(1).ok_or(InitError::OutOfMemory)?;
-        let nic = Self {
+        let b_revision = matches!(device.id, 0x9054 | 0x9055 | 0x9058 | 0x905a | 0x9200);
+        write16(io_base, CMD_STATUS, TOTAL_RESET | RESET_NETWORK);
+        wait_command(io_base).map_err(|_| Error::ResetTimedOut)?;
+        let below = Some(1u64 << 32); // 32-bit DMA addresses
+        let descriptors = memory::allocate_contiguous(1, below).ok_or(Error::OutOfMemory)?;
+        let rx_buffers = memory::allocate_contiguous(RX_COUNT as u64, below).ok_or(Error::OutOfMemory)?;
+        let tx_buffer = memory::allocate_contiguous(1, below).ok_or(Error::OutOfMemory)?;
+        let mut nic = ThreeCom {
+            index,
+            delivery: Delivery::Polled,
+            interrupts_enabled: false,
             io_base,
             b_revision,
-            mac: Cell::new([0; 6]),
+            mac: [0; 6],
             descriptors,
-            rx_buffer_base,
+            rx_buffers,
             tx_buffer,
-            rx_next: Cell::new(0),
-            tx_in_flight: Cell::new(false),
-            overflow_count: Cell::new(0),
-            rx_progress: Cell::new(0),
-            tx_progress: Cell::new(0),
-            recovery_count: Cell::new(0),
-            recovery_failures: Cell::new(0),
-            recovery_pending: AtomicBool::new(false),
-            promiscuous: Cell::new(false),
-            interrupts_enabled: Cell::new(false),
-            irq,
-            interrupt_count: AtomicU32::new(0),
-            interrupt_errors: AtomicU32::new(0),
-            work_pending: AtomicBool::new(false),
+            rx_next: 0,
+            tx_in_flight: false,
+            promiscuous: false,
+            multicast: false,
+            frames_received: 0,
+            frames_sent: 0,
+            frames_dropped_no_link: 0,
+            bad_frames: 0,
+            recoveries: 0,
+            tx_timeouts: 0,
+            tx_busy_drops: 0,
+            tx_status_errors: 0,
+            last_timeout: (0, 0, 0),
+            last_timeout_dma: (0, 0),
+            unstall_retries: 0,
+            recovery_pending: false,
         };
         nic.configure()?;
+        IO_BASE[index].store(io_base, Ordering::Relaxed);
         Ok(nic)
     }
 
-    fn reset(io_base: u16) -> Result<(), InitError> {
-        write16(io_base, CMD_STATUS, TOTAL_RESET | RESET_NETWORK);
-        wait_command(io_base).map_err(|error| match error {
-            InitError::CommandTimedOut => InitError::ResetTimedOut,
-            other => other,
-        })
+    pub fn io_base(&self) -> u16 {
+        self.io_base
     }
 
-    fn command(&self, command: u16) -> Result<(), InitError> {
+    fn command(&self, command: u16) -> Result<(), Error> {
         issue_command(self.io_base, command);
         wait_command(self.io_base)
     }
@@ -286,16 +269,26 @@ impl ThreeCom {
         issue_command(self.io_base, SELECT_WINDOW | window);
     }
 
-    fn configure_media(&self) -> Result<(), InitError> {
+    fn read_eeprom(&self, address: u16) -> Result<u16, Error> {
+        self.select_window(0);
+        write16(self.io_base, EEPROM_COMMAND, EEPROM_READ | address);
+        for _ in 0..100_000u32 {
+            if read16(self.io_base, EEPROM_COMMAND) & EEPROM_BUSY == 0 {
+                return Ok(read16(self.io_base, EEPROM_DATA));
+            }
+        }
+        Err(Error::EepromTimedOut)
+    }
+
+    /// Picks the media (twisted pair with autonegotiation on the cards we know) the way the 3Com driver does: from the
+    /// media options in window 3, overridden by the user configuration word in the EEPROM on B/C revisions.
+    fn configure_media(&self) -> Result<(), Error> {
         self.select_window(3);
         let mut options = read16(self.io_base, MEDIA_OPTIONS);
         if !self.b_revision {
             options &= 0x7f;
         }
-        let link_type = if options & 0x0a == 0x0a
-            || options & 0x0a == 0x02
-            || options & 0x0a == 0x08
-        {
+        let link_type = if options & 0x0a == 0x0a || options & 0x0a == 0x02 || options & 0x0a == 0x08 {
             LINK_AUTONEGOTIATE
         } else if options & 0x40 != 0 {
             LINK_MII
@@ -310,22 +303,19 @@ impl ThreeCom {
         };
         let link_type = if self.b_revision {
             let user_config = self.read_eeprom(0x16)?;
-            if user_config & 0xff00 == 0x5a00 {
-                u32::from(user_config & 0x000f)
-            } else {
-                link_type
-            }
+            self.select_window(3);
+            if user_config & 0xff00 == 0x5a00 { u32::from(user_config & 0x000f) } else { link_type }
         } else {
             link_type
         };
-        let config =
-            (read32(self.io_base, INTERNAL_CONFIG) & !(0x0f << 20)) | (link_type << 20);
+        let config = (read32(self.io_base, INTERNAL_CONFIG) & !(0x0f << 20)) | (link_type << 20);
         write32(self.io_base, INTERNAL_CONFIG, config);
         Ok(())
     }
 
-    fn configure(&self) -> Result<(), InitError> {
-        self.tx_in_flight.set(false);
+    /// (Re)builds the rings and programs the card; used at init and after a reset.
+    fn configure(&mut self) -> Result<(), Error> {
+        self.tx_in_flight = false;
         self.select_window(0);
         let mut mac = [0u8; 6];
         for (index, byte) in mac.chunks_exact_mut(2).enumerate() {
@@ -333,382 +323,302 @@ impl ThreeCom {
             byte.copy_from_slice(&value.to_be_bytes());
         }
         if mac.iter().all(|&byte| byte == 0) || mac == [0xff; 6] {
-            return Err(InitError::InvalidMac);
+            return Err(Error::InvalidMac);
         }
-        self.mac.set(mac);
-
+        self.mac = mac;
         self.select_window(2);
         for (index, byte) in mac.iter().enumerate() {
-            unsafe { outb(self.io_base + index as u16, *byte) };
+            cpu::outb(self.io_base + index as u16, *byte);
         }
         for offset in (6..12).step_by(2) {
             write16(self.io_base, offset, 0);
         }
         self.configure_media()?;
 
-        let rx_desc = self.descriptors as usize as *mut RxDescriptor;
-        for index in 0..RX_DESC_COUNT {
-            let next = if index + 1 == RX_DESC_COUNT {
-                self.descriptors
-            } else {
-                self.descriptors + ((index + 1) * 16) as u32
-            };
+        // The upload (receive) ring: 64 descriptors linked in a circle, each pointing at one page.
+        for index in 0..RX_COUNT {
+            let next = if index + 1 == RX_COUNT { self.descriptors } else { self.descriptors + ((index + 1) * 16) as u64 };
             unsafe {
                 write_volatile(
-                    rx_desc.add(index),
-                    RxDescriptor {
-                        next,
-                        status: 0,
-                        address: self.rx_buffer(index),
-                        length: RX_BUFFER_SIZE as u32 | LAST_FRAGMENT,
-                    },
+                    descriptor(self.descriptors, index),
+                    Descriptor { next: next as u32, status: 0, address: self.rx_buffer(index) as u32, length: RX_BUFFER_SIZE as u32 | LAST_FRAGMENT },
                 );
             }
         }
-        let tx_desc = descriptor_ptr::<TxDescriptor>(self.descriptors, RX_DESC_COUNT);
-        unsafe {
-            write_volatile(
-                tx_desc,
-                TxDescriptor {
-                    next: 0,
-                    status: 0,
-                    address: self.tx_buffer,
-                    length: 0,
-                },
-            );
-        }
+        // The single download (transmit) descriptor sits after them.
+        unsafe { write_volatile(descriptor(self.descriptors, RX_COUNT), Descriptor { next: 0, status: 0, address: self.tx_buffer as u32, length: 0 }) };
 
         self.command(TX_RESET)?;
         self.command(RX_RESET | 0x04)?;
-
         self.select_window(7);
         write32(self.io_base, PKT_STATUS, 0x20);
-        write32(self.io_base, UP_LIST_PTR, self.descriptors);
+        write32(self.io_base, UP_LIST_PTR, self.descriptors as u32);
         write32(self.io_base, DOWN_LIST_PTR, 0);
-
         self.select_window(3);
         write16(self.io_base, MAX_PACKET_SIZE, RX_BUFFER_SIZE as u16);
-        self.command(SET_STATUS_ENABLE)?;
+        self.command(SET_STATUS_ENABLE)?; // polling needs no indications yet
         self.command(SET_RX_THRESHOLD | (RX_BUFFER_SIZE as u16 / 4))?;
-        self.command(
-            SET_RX_FILTER | RX_STATION | RX_BROADCAST
-                | if self.promiscuous.get() { RX_PROMISCUOUS } else { 0 },
-        )?;
+        self.command(SET_RX_FILTER | self.filter())?;
         self.command(RX_ENABLE)?;
-        // RX_ENABLE accepts frames at the MAC, but the Cyclone/Tornado DMA
-        // upload engine can remain stalled after RX_RESET. The upload list is
-        // already posted above; explicitly resume it so the first broadcast
-        // (such as a DHCP DISCOVER) reaches its descriptor instead of waiting
-        // for a receive completion that can never occur.
+        // The upload engine can stay stalled after RX_RESET: resume it now that the list is posted.
         self.command(UP_UNSTALL)?;
         self.command(TX_ENABLE)?;
         self.command(ACK_INTERRUPT | 0x07ff)?;
         Ok(())
     }
 
-    fn read_eeprom(&self, address: u16) -> Result<u16, InitError> {
-        self.select_window(0);
-        write16(self.io_base, EEPROM_COMMAND, EEPROM_READ | address);
-        let mut attempts = 100_000u32;
-        while read16(self.io_base, EEPROM_COMMAND) & EEPROM_BUSY != 0 {
-            attempts -= 1;
-            if attempts == 0 {
-                return Err(InitError::EepromTimedOut);
-            }
-        }
-        Ok(read16(self.io_base, EEPROM_DATA))
+    fn filter(&self) -> u16 {
+        RX_STATION | RX_BROADCAST | if self.multicast { RX_MULTICAST } else { 0 } | if self.promiscuous { RX_PROMISCUOUS } else { 0 }
     }
 
-    pub fn mac_address(&self) -> [u8; 6] {
-        self.mac.get()
+    /// Physical address of receive buffer `index` (one 4 KiB page each).
+    fn rx_buffer(&self, index: usize) -> u64 {
+        self.rx_buffers + (index * 4096) as u64
     }
 
-    /// Reads the 3Com media-status link-beat bit. This is intentionally a
-    /// small diagnostic rather than a complete MII link-state abstraction.
+    /// The media-status link-beat bit: a small diagnostic, not a full MII link abstraction.
     pub fn link_up(&self) -> bool {
         self.select_window(4);
         read16(self.io_base, MEDIA_STATUS) & MEDIA_LINK_BEAT != 0
     }
 
-    pub fn set_promiscuous(&self, enabled: bool) {
+    pub fn set_promiscuous(&mut self, on: bool) {
+        self.promiscuous = on;
         self.select_window(1);
-        let filter = RX_STATION | RX_BROADCAST | if enabled { RX_PROMISCUOUS } else { 0 };
-        let _ = self.command(SET_RX_FILTER | filter);
-        self.promiscuous.set(enabled);
+        let _ = self.command(SET_RX_FILTER | self.filter());
     }
 
-    pub fn overflow_count(&self) -> u32 {
-        self.overflow_count.get()
+    pub fn set_multicast(&mut self, on: bool) {
+        self.multicast = on;
+        self.select_window(1);
+        let _ = self.command(SET_RX_FILTER | self.filter());
     }
 
-    pub fn health(&self) -> Health {
-        Health {
-            rx_progress: self.rx_progress.get(),
-            tx_progress: self.tx_progress.get(),
-            recoveries: self.recovery_count.get(),
-            recovery_failures: self.recovery_failures.get(),
-            recovery_pending: self.recovery_pending.load(Ordering::Acquire),
-            rx_overruns: 0, // the card gives no overrun indication
-        }
-    }
-
-    /// The 3C905 Host Error interrupt and a bounded download timeout are
-    /// documented adapter failures. Reset and rebuild the existing list
-    /// in place; this never allocates, frees, or moves DMA memory.
-    pub fn watchdog(&self) -> WatchdogResult {
-        if !self.recovery_pending.swap(false, Ordering::AcqRel) {
-            return WatchdogResult::Healthy;
-        }
-
-        if Self::reset(self.io_base).is_err() || self.configure().is_err() {
-            self.recovery_failures.set(self.recovery_failures.get().wrapping_add(1));
-            return WatchdogResult::Failed;
-        }
-        self.rx_next.set(0);
-        if self.interrupts_enabled.get() {
-            self.enable_interrupts();
-        }
-        self.recovery_count.set(self.recovery_count.get().wrapping_add(1));
-        WatchdogResult::Recovered
-    }
-
-    pub fn enable_interrupts(&self) {
+    /// Raises one interrupt by hand (`RequestInterrupt`) and reports whether `arrived` saw it within three ticks.
+    fn self_test(&mut self, arrived: impl Fn() -> u64) -> bool {
+        let mask = INTERRUPT_MASK | STATUS_INT_REQUESTED;
         let _ = self.command(ACK_INTERRUPT | 0x07ff | STATUS_INT_LATCH);
+        let _ = self.command(SET_STATUS_ENABLE | mask);
+        let _ = self.command(SET_INTERRUPT_ENABLE | mask);
+        let before = arrived();
+        issue_command(self.io_base, REQUEST_INTERRUPT);
+        let start = apic::ticks();
+        while arrived() == before && apic::ticks().wrapping_sub(start) < 3 {
+            core::hint::spin_loop();
+        }
+        arrived() != before
+    }
+
+    fn finish_interrupts(&mut self, delivery: Delivery) -> Delivery {
+        self.interrupts_enabled = true;
+        self.delivery = delivery;
+        // From here only the events the driver wants: a received frame and a host error (see the rules at the top).
         let _ = self.command(SET_STATUS_ENABLE | INTERRUPT_MASK);
         let _ = self.command(SET_INTERRUPT_ENABLE | INTERRUPT_MASK);
-        self.interrupts_enabled.set(true);
+        delivery
     }
 
-    /// Physical address of receive buffer `index` (one 4 KiB page each).
-    fn rx_buffer(&self, index: usize) -> u32 {
-        self.rx_buffer_base + (index * 4096) as u32
-    }
-
-    pub fn handle_interrupt(&self) {
-        let status = read16(self.io_base, CMD_STATUS) & INTERRUPT_MASK;
-        if status == 0 {
-            return;
+    /// Switches from polling to legacy interrupts through the I/O APIC, keeping a pin only if the self-test interrupt arrives.
+    pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
+        let mut reason = "no I/O APIC pin delivered the self-test interrupt";
+        let (first, end) = crate::ioapic::gsi_range();
+        let mut candidates = [u32::MAX; 9];
+        candidates[0] = u32::from(device.interrupt_line());
+        for (slot, gsi) in (16..24u32).enumerate() {
+            candidates[slot + 1] = gsi;
         }
-        // Command completion can wait, but an ISR must only acknowledge and
-        // return; the card's command-in-progress bit is therefore not polled.
-        issue_command(self.io_base, ACK_INTERRUPT | status | STATUS_INT_LATCH);
-        self.interrupt_count.fetch_add(1, Ordering::Relaxed);
-        if status & STATUS_HOST_ERROR != 0 {
-            self.interrupt_errors.fetch_add(1, Ordering::Relaxed);
-            self.recovery_pending.store(true, Ordering::Release);
+        for (position, &gsi) in candidates.iter().enumerate() {
+            if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
+                continue;
+            }
+            let Some(vector) = crate::msi::attach_intx(gsi, isr, self.index) else { continue };
+            if self.self_test(|| crate::msi::intx_count(vector)) {
+                return Ok(self.finish_interrupts(Delivery::Intx { gsi, vector }));
+            }
+            let _ = self.command(SET_INTERRUPT_ENABLE);
+            let _ = self.command(SET_STATUS_ENABLE);
+            crate::msi::detach_intx(vector, self.index);
+            reason = "no I/O APIC pin delivered the self-test interrupt";
         }
-        self.work_pending.store(true, Ordering::Release);
+        Err(reason)
     }
 
-    /// The raw `IntStatus` register, unmodified, for `nic list`'s diagnostics:
-    /// bit 0 is IntLatch (an enabled event is asserting the interrupt line),
-    /// bit 4 RxComplete, bit 10 UpComplete (a bus-master receive finished).
-    pub fn raw_status(&self) -> u16 {
-        read16(self.io_base, CMD_STATUS)
+    /// Resets the card and rebuilds the rings in place (the memory is reused).
+    fn recover(&mut self) -> bool {
+        write16(self.io_base, CMD_STATUS, TOTAL_RESET | RESET_NETWORK);
+        if wait_command(self.io_base).is_err() || self.configure().is_err() {
+            return false;
+        }
+        self.rx_next = 0;
+        FATAL[self.index].store(false, Ordering::Relaxed);
+        self.recovery_pending = false;
+        if self.interrupts_enabled {
+            let _ = self.command(ACK_INTERRUPT | 0x07ff | STATUS_INT_LATCH);
+            let _ = self.command(SET_STATUS_ENABLE | INTERRUPT_MASK);
+            let _ = self.command(SET_INTERRUPT_ENABLE | INTERRUPT_MASK);
+        }
+        self.recoveries += 1;
+        true
     }
 
-    /// `nic regs`: status register and receive-ring state.
+    /// The `nic` command's driver-specific line.
+    pub fn describe(&self) {
+        crate::println!(
+            "   3c905{}: I/O {:#06x}, {} bad frames, {} recoveries ({} host errors, {} send timeouts), {} sends dropped busy, {} transmit errors, status {:#06x}",
+            if self.b_revision { "B/C" } else { "" },
+            self.io_base,
+            self.bad_frames,
+            self.recoveries,
+            HOST_ERRORS[self.index].load(Ordering::Relaxed),
+            self.tx_timeouts,
+            self.tx_busy_drops,
+            self.tx_status_errors,
+            read16(self.io_base, CMD_STATUS)
+        );
+    }
+
+    /// `nic regs`: the status register, the receive ring and the transmit descriptor.
     pub fn dump_registers(&self) {
         let mut complete = 0u32;
-        for index in 0..RX_DESC_COUNT {
-            let descriptor = descriptor_ptr::<RxDescriptor>(self.descriptors, index);
-            if unsafe { read_volatile(&(*descriptor).status) } & RX_COMPLETE != 0 {
+        for index in 0..RX_COUNT {
+            if unsafe { read_volatile(&(*descriptor(self.descriptors, index)).status) } & RX_COMPLETE != 0 {
                 complete += 1;
             }
         }
-        println!(
-            "3C905 I/O 0x{:04x}: status {:04x} (window {}), interrupts {}",
-            self.io_base,
-            read16(self.io_base, CMD_STATUS),
-            read16(self.io_base, CMD_STATUS) >> 13,
-            if self.interrupts_enabled.get() { "on" } else { "off" }
+        let status = read16(self.io_base, CMD_STATUS);
+        crate::println!(
+            "last send timeout: descriptor status {:08x}, down list {:08x}, card status {:04x}, DMACtrl {:08x}, TxStatus {:02x}; {} unstall retries",
+            self.last_timeout.0, self.last_timeout.1, self.last_timeout.2, self.last_timeout_dma.0, self.last_timeout_dma.1, self.unstall_retries
         );
-        println!(
-            "rx next {} ({complete} of {RX_DESC_COUNT} descriptors completed), overflow {}, recoveries {}",
-            self.rx_next.get(),
-            self.overflow_count.get(),
-            self.recovery_count.get()
+        crate::println!("3C905 I/O {:#06x}: status {status:04x} (window {}), interrupts {}, {:?}", self.io_base, status >> 13, if self.interrupts_enabled { "on" } else { "off" }, self.delivery);
+        crate::println!(
+            "rx next {} ({complete} of {RX_COUNT} descriptors completed), bad frames {}, recoveries {}, down list {:08x}, up list {:08x}",
+            self.rx_next,
+            self.bad_frames,
+            self.recoveries,
+            read32(self.io_base, DOWN_LIST_PTR),
+            read32(self.io_base, UP_LIST_PTR)
         );
-    }
-
-    pub fn interrupt_stats(&self) -> (Option<u8>, u32, u32, bool) {
-        (
-            self.irq,
-            self.interrupt_count.load(Ordering::Relaxed),
-            self.interrupt_errors.load(Ordering::Relaxed),
-            self.work_pending.load(Ordering::Acquire),
-        )
     }
 
     /// Empties the TxStatus stack (window 1, offset 0x1b) if the card says it holds entries, and re-enables the transmitter
-    /// as the 3Com drivers do: an error entry (jabber, underrun) needs a transmit reset first, a plain one just `TX_ENABLE`.
-    /// The stack is 31 entries deep and the transmitter stops when it is full, which is why `send` does not ask for a
-    /// completion indication on every frame: only errors leave entries now, and this pops them.
-    fn service_tx_status(&self) {
+    /// as the 3Com drivers do: an error entry (jabber, underrun) needs a transmit reset first, a plain one just `TxEnable`.
+    fn service_tx_status(&mut self) {
         if read16(self.io_base, CMD_STATUS) & STATUS_TX_COMPLETE == 0 {
             return;
         }
         self.select_window(1);
         let mut reset = false;
         for _ in 0..40 {
-            let status = unsafe { inb(self.io_base + 0x1b) };
+            let status = cpu::inb(self.io_base + 0x1b);
             if status & 0x80 == 0 {
                 break;
             }
-            unsafe { outb(self.io_base + 0x1b, 0) }; // pop the entry
-            reset |= status & 0x30 != 0; // jabber or underrun
+            cpu::outb(self.io_base + 0x1b, 0); // pop
+            self.tx_status_errors += u32::from(status & 0x3c != 0);
+            reset |= status & 0x30 != 0;
         }
         if reset {
             issue_command(self.io_base, TX_RESET);
-            self.tx_in_flight.set(false);
+            self.tx_in_flight = false;
         }
         issue_command(self.io_base, TX_ENABLE);
         issue_command(self.io_base, ACK_INTERRUPT | STATUS_TX_COMPLETE | STATUS_INT_LATCH);
     }
 
-    pub fn send(&self, frame: &[u8]) -> bool {
-        if frame.len() > MAX_FRAME_LEN {
+    /// Queues one frame (padded to 60 bytes). The card has one download descriptor, so the previous frame's completion is
+    /// collected first; a frame sent with no link is dropped, as on the other drivers.
+    pub fn send(&mut self, frame: &[u8]) -> bool {
+        if frame.len() > MAX_FRAME {
             return false;
         }
+        if !self.link_up() {
+            self.frames_dropped_no_link += 1;
+            return true;
+        }
         self.service_tx_status();
-        // This driver owns one download descriptor. It cannot be rewritten
-        // while the card still owns the previous packet, so first collect that
-        // packet's completion -- which is normally long past, since the last
-        // `send` returned as soon as it had started the transfer.
-        let tx_descriptor = descriptor_ptr::<TxDescriptor>(self.descriptors, RX_DESC_COUNT);
-        if self.tx_in_flight.get() {
+        let tx = descriptor(self.descriptors, RX_COUNT);
+        if self.tx_in_flight {
             let mut attempts = 100_000u32;
-            while unsafe { read_volatile(&(*tx_descriptor).status) } & DOWNLOAD_COMPLETE == 0 {
+            while unsafe { read_volatile(&(*tx).status) } & DOWNLOAD_COMPLETE == 0 {
                 attempts -= 1;
+                // The download engine can be left stalled; a repeated DownUnstall costs nothing if it is running.
+                if attempts % 10_000 == 0 && attempts > 0 {
+                    issue_command(self.io_base, DOWN_UNSTALL);
+                    self.unstall_retries += 1;
+                }
                 if attempts == 0 {
+                    self.last_timeout = (unsafe { read_volatile(&(*tx).status) }, read32(self.io_base, DOWN_LIST_PTR), read16(self.io_base, CMD_STATUS));
+                    self.select_window(1);
+                    self.last_timeout_dma = (read32(self.io_base, PKT_STATUS), cpu::inb(self.io_base + 0x1b));
                     issue_command(self.io_base, TX_RESET);
                     issue_command(self.io_base, TX_ENABLE);
-                    self.tx_in_flight.set(false);
-                    self.recovery_pending.store(true, Ordering::Release);
+                    self.tx_in_flight = false;
+                    self.recovery_pending = true;
+                    self.tx_timeouts += 1;
                     return false;
                 }
             }
-            unsafe { write_volatile(&mut (*tx_descriptor).status, 0) };
-            self.tx_in_flight.set(false);
+            unsafe { write_volatile(&mut (*tx).status, 0) };
+            self.tx_in_flight = false;
         }
-        // The card keeps the list pointer until it has the whole frame out (nearly a millisecond for a 1 KiB frame at
-        // 10 Mb/s), so a sender that paces frames a millisecond apart finds it busy: wait a bounded time instead of dropping.
-        let mut attempts = 50_000u32;
+        // The card keeps the list pointer until it has the whole frame out: on a 10 Mb/s link that is nearly a millisecond for a
+        // 1 KiB frame, so a sender pacing frames a millisecond apart finds it busy. Wait (bounded) instead of dropping.
+        let deadline = apic::micros() + 50_000;
         while read32(self.io_base, DOWN_LIST_PTR) != 0 {
-            attempts -= 1;
-            if attempts == 0 {
+            if apic::micros() > deadline {
+                self.tx_busy_drops += 1;
                 return false;
             }
+            core::hint::spin_loop();
         }
-        let padded_len = frame.len().max(MIN_FRAME_LEN);
+        let padded = frame.len().max(MIN_FRAME);
         unsafe {
-            let buffer = core::slice::from_raw_parts_mut(self.tx_buffer as *mut u8, MAX_FRAME_LEN);
+            let buffer = core::slice::from_raw_parts_mut(self.tx_buffer as *mut u8, MAX_FRAME);
             buffer[..frame.len()].copy_from_slice(frame);
-            buffer[frame.len()..padded_len].fill(0);
-            let descriptor = descriptor_ptr::<TxDescriptor>(self.descriptors, RX_DESC_COUNT);
-            // 3C905B/C cards use the B-revision frame-start header: disable hardware packet-length rounding. There is
-            // no TxIndicate bit: each frame that asked for it pushed an entry on the 31-deep TxStatus stack that nothing
-            // popped, and after ~30 frames the transmitter stopped dead. The completion this driver waits for is the
-            // DownloadComplete bit the card writes into the descriptor.
-            let frame_start = padded_len as u32 | if self.b_revision { TX_ROUNDUP_DEFEAT } else { 0 };
-            write_volatile(&mut (*descriptor).status, frame_start);
-            write_volatile(&mut (*descriptor).length, padded_len as u32 | LAST_FRAGMENT);
+            buffer[frame.len()..padded].fill(0);
+            // B/C cards use the B-revision frame start: ask for a completion indication, no length rounding.
+            // No `TxIndicate` bit: each frame that asks for it pushes an entry on the card's 31-deep TxStatus stack that nothing
+            // here pops, and when the stack overflows (after ~30 frames) the transmitter stops dead. The completion this driver
+            // waits for is the DownloadComplete bit the card writes into the descriptor.
+            let start = padded as u32 | if self.b_revision { TX_ROUNDUP_DEFEAT } else { 0 };
+            write_volatile(&mut (*tx).status, start);
+            write_volatile(&mut (*tx).length, padded as u32 | LAST_FRAGMENT);
         }
-        write32(
-            self.io_base,
-            DOWN_LIST_PTR,
-            self.descriptors + (RX_DESC_COUNT * 16) as u32,
-        );
+        write32(self.io_base, DOWN_LIST_PTR, (self.descriptors + (RX_COUNT * 16) as u64) as u32);
         issue_command(self.io_base, DOWN_UNSTALL);
-        self.tx_in_flight.set(true);
-        self.tx_progress.set(self.tx_progress.get().wrapping_add(1));
+        self.tx_in_flight = true;
+        self.frames_sent += 1;
         true
     }
 
-    pub fn receive(&self, out: &mut [u8]) -> Option<usize> {
-        self.work_pending.store(false, Ordering::Release);
-        let index = self.rx_next.get();
-        let descriptor = descriptor_ptr::<RxDescriptor>(self.descriptors, index);
-        let status = unsafe { read_volatile(&(*descriptor).status) };
+    /// Copies the next received frame into `out`; `None` if the ring is empty (or the frame was bad).
+    pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
+        if self.recovery_pending || FATAL[self.index].swap(false, Ordering::AcqRel) {
+            self.recover();
+        }
+        let index = self.rx_next;
+        let slot = descriptor(self.descriptors, index);
+        let status = unsafe { read_volatile(&(*slot).status) };
         if status & RX_COMPLETE == 0 {
             return None;
         }
         let length = (status & 0x1fff) as usize;
         let valid = status & RX_ERROR == 0 && length <= RX_BUFFER_SIZE;
-        let copy_len = length.min(out.len()).min(MAX_FRAME_LEN);
-        // Returning a completed descriptor makes its DMA buffer available to
-        // the adapter immediately. Copy before clearing its status so a new
-        // wire packet cannot overwrite the frame the foreground protocol is
-        // about to parse (especially visible for a short DHCP exchange).
+        let count = length.min(out.len()).min(MAX_FRAME);
+        // Copy before handing the descriptor back: once it is free a new frame may overwrite the buffer.
         if valid {
-            unsafe {
-                let source = core::slice::from_raw_parts(self.rx_buffer(index) as *const u8, copy_len);
-                out[..copy_len].copy_from_slice(source);
-            }
+            let source = unsafe { core::slice::from_raw_parts(self.rx_buffer(index) as *const u8, count) };
+            out[..count].copy_from_slice(source);
         }
-        unsafe { write_volatile(&mut (*descriptor).status, 0) };
+        unsafe { write_volatile(&mut (*slot).status, 0) };
         issue_command(self.io_base, UP_UNSTALL);
-        self.rx_next.set((index + 1) % RX_DESC_COUNT);
+        self.rx_next = (index + 1) % RX_COUNT;
         if !valid {
-            self.overflow_count.set(self.overflow_count.get() + 1);
+            self.bad_frames += 1;
             return None;
         }
-        self.rx_progress.set(self.rx_progress.get().wrapping_add(1));
-        Some(copy_len)
-    }
-}
-
-const MAX_INSTANCES: usize = pci::MAX_DEVICE_MATCHES;
-static mut NICS: [Option<ThreeCom>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
-static mut NIC_COUNT: usize = 0;
-static mut INITIALIZED: bool = false;
-
-#[derive(Debug)]
-pub enum Status {
-    NotPresent,
-    InitFailed,
-}
-
-pub fn initialize_all() -> Result<usize, Status> {
-    unsafe {
-        if !INITIALIZED {
-            INITIALIZED = true;
-            let mut probe_info = [const {
-                ProbeInfo {
-                    io_base: 0,
-                    irq: None,
-                    b_revision: false,
-                }
-            }; MAX_INSTANCES];
-            let found = ThreeCom::probe_all(&mut probe_info);
-            let mut first_error = None;
-            for info in &probe_info[..found] {
-                match ThreeCom::init(info.io_base, info.b_revision, info.irq) {
-                    Ok(initialized) => {
-                        NICS[NIC_COUNT] = Some(initialized);
-                        NIC_COUNT += 1;
-                    }
-                    Err(error) if first_error.is_none() => first_error = Some(error),
-                    Err(_) => {}
-                }
-            }
-            if NIC_COUNT == 0 {
-                return                 if first_error.is_some() {
-                    Err(Status::InitFailed)
-                } else {
-                    Err(Status::NotPresent)
-                };
-            }
-        }
-        Ok(NIC_COUNT)
-    }
-}
-
-pub fn get(index: usize) -> Option<&'static ThreeCom> {
-    unsafe {
-        if index >= NIC_COUNT {
-            return None;
-        }
-        NICS[index].as_ref()
+        self.frames_received += 1;
+        Some(count)
     }
 }

@@ -1,10 +1,14 @@
 [package]
-name = "audio-net-tape"
+name = "audio-net"
 version = "0.1.0"
 edition = "2024"
 
-[profile.dev]
-panic = "abort"
+[dependencies]
+tape-rt = { path = "../tape-rt" }
+audio-wire = { path = "../audio-wire" }
+tape-panel = { path = "../tape-panel" }
+tape-net = { path = "../tape-net" }
+opus-codec = { path = "../opus-codec" }
 
 [profile.release]
 panic = "abort"
@@ -12,6 +16,3 @@ codegen-units = 1
 lto = true
 opt-level = "z"
 strip = "symbols"
-
-[dependencies]
-tape-rt = { path = "../tape-rt" }

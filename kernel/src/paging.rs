@@ -1,459 +1,316 @@
-//! The first paging step: an identity-mapped, supervisor-only address space.
+//! The kernel's page tables, built from the physical allocator and the memory map.
 //!
-//! The kernel and its drivers still use physical addresses directly, as do
-//! DMA descriptors and the BIOS disk trampoline. Mapping a virtual address to
-//! the same physical address therefore lets the existing educational code
-//! keep working while making page translation, CR3 ownership, and page-fault
-//! diagnostics explicit foundations for later isolation work.
+//! The firmware leaves the CPU in long mode with an identity map of its own. The
+//! kernel replaces it with one derived from what the machine actually has:
 //!
-//! This is deliberately not userspace protection yet. All mapped pages are
-//! supervisor-only and writable, so ring-0 kernel code and trusted tapes keep
-//! their current access. The absent 2-3.5 GiB range does, however, turn many
-//! wild high pointers into a legible page fault instead of an arbitrary bus
-//! access. A PCI memory BAR retains its physical address as its
-//! volatile-pointer address only after its driver explicitly registers the
-//! needed range.
-//! The low 4 MiB is split into ordinary 4 KiB pages solely so the page
-//! immediately below the kernel stack can remain absent as an overflow guard.
+//! * RAM the kernel may use is mapped read/write and **no-execute**, in 2 MiB pages;
+//! * the kernel image is mapped in 4 KiB pages with per-section permissions: text
+//!   read + execute only, read-only data read-only, data and bss read/write
+//!   no-execute (W^X: nothing is both writable and executable);
+//! * page 0 and the guard pages below the kernel's stacks are *not mapped*, so a
+//!   null pointer or a stack overflow faults at once with a legible report;
+//! * UEFI runtime-services regions keep the permissions the firmware expects
+//!   (executable), so `ResetSystem` and friends still work;
+//! * the framebuffer is mapped write-combining (via the PAT) when the CPU has one,
+//!   uncached otherwise; device registers are mapped on demand by `map_device`.
+//!
+//! Still a single flat address space, still identity-mapped (virtual = physical).
 
-use core::arch::asm;
+use crate::{cpu, memory};
+use fos_v2_abi::{BootInfo, Framebuffer};
 
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-use crate::boot_info::{BootInfo, MemoryRegion};
+const PAGE: u64 = 4096;
+const HUGE: u64 = 2 * 1024 * 1024;
 
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-use crate::cpu;
+const PRESENT: u64 = 1 << 0;
+const WRITABLE: u64 = 1 << 1;
+const WRITE_THROUGH: u64 = 1 << 3;
+const CACHE_DISABLE: u64 = 1 << 4;
+const LARGE: u64 = 1 << 7;
+const NO_EXECUTE: u64 = 1 << 63;
+const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const LARGE_PAGE_SIZE: u32 = 4 * 1024 * 1024;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const IDENTITY_LOW_END: u32 = 2 * 1024 * 1024 * 1024;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const PAGE_SIZE: u32 = 4096;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const PAGE_DIRECTORY_ENTRIES: usize = 1024;
-/// One dynamic table per distinct 4 MiB-aligned high region a `map_mmio`
-/// caller has ever registered. Originally kept at 3 (covering e1000/i350/
-/// HDA's own BAR mappings) rather than bumped to cover the local APIC's
-/// own fixed MMIO window (`0xFEE00000`, one more `map_mmio` consumer
-/// alongside those three -- see `lapic.rs`) when MSI support was added,
-/// since the reserved low-memory kernel region had no spare room for
-/// another static 4 KiB page table at the time -- confirmed by trying it,
-/// not assumed. Bumped to 4 once that region's own ceiling grew for an
-/// unrelated reason (see `AGENTS.md`'s "Low-memory map"), closing the gap
-/// deliberately rather than leaving it as a standing, if narrow, MSI
-/// availability risk. If this pool is ever exhausted anyway (all 4 slots
-/// already claimed by 4 *other* simultaneously-mapped high regions), the
-/// failure is still graceful: `map_mmio` simply returns `Err`, and
-/// whichever caller wanted the mapping falls back accordingly -- for the
-/// LAPIC specifically, `lapic::initialize()` reports no local APIC
-/// available and every MSI-capable driver transparently falls back to its
-/// legacy PIC IRQ path, the same "cleanly unavailable, not a fault"
-/// convention `disk.rs` already uses for a zero `bios_disk_io` pointer.
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const MAX_DYNAMIC_PAGE_TABLES: usize = 8; // see the history above: 4 were enough until xHCI joined
+/// UEFI sets this bit in a descriptor's attributes for memory the firmware needs at
+/// run time (runtime-services code and data, and some device regions).
+const ATTRIBUTE_RUNTIME: u64 = 1 << 63;
 
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const PAGE_PRESENT: u32 = 1 << 0;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const PAGE_WRITABLE: u32 = 1 << 1;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const PAGE_LARGE: u32 = 1 << 7;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const CR0_WRITE_PROTECT: u32 = 1 << 16;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const CR0_PAGING: u32 = 1 << 31;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const CR4_PAGE_SIZE_EXTENSIONS: u32 = 1 << 4;
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-const CPUID_PAGE_SIZE_EXTENSIONS: u32 = 1 << 3;
-
-/// A page directory must begin on a 4 KiB boundary because CR3 stores its
-/// physical address with the low 12 bits reserved for flags.
-#[repr(C, align(4096))]
-struct PageDirectory([u32; 1024]);
-
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-#[repr(C, align(4096))]
-struct PageTable([u32; PAGE_DIRECTORY_ENTRIES]);
-
-static mut PAGE_DIRECTORY: PageDirectory = PageDirectory([0; 1024]);
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-static mut LOW_PAGE_TABLE: PageTable = PageTable([0; PAGE_DIRECTORY_ENTRIES]);
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-static mut DYNAMIC_PAGE_TABLES: [PageTable; MAX_DYNAMIC_PAGE_TABLES] =
-    [const { PageTable([0; PAGE_DIRECTORY_ENTRIES]) }; MAX_DYNAMIC_PAGE_TABLES];
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-static mut DYNAMIC_TABLE_PDES: [u16; MAX_DYNAMIC_PAGE_TABLES] =
-    [u16::MAX; MAX_DYNAMIC_PAGE_TABLES];
-
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
-    MissingPageSizeExtensions,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "legacy-unsafe-memory", allow(dead_code))]
-pub enum MapError {
-    EmptyRange,
-    AddressOverflow,
-    PageTableCapacity,
-}
-
-#[cfg(not(feature = "legacy-unsafe-memory"))]
 unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
     static __text_start: u8;
     static __text_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+    static __stack_guard: u8;
+    static __stack_bottom: u8;
+    static __ist_guard: u8;
 }
 
-/// Builds and enables the one global address space.
-///
-/// Four-megabyte pages keep this bootstrap table to one 4 KiB directory. The
-/// low 2 GiB range covers all physical memory the current allocator can give
-/// to the kernel or a tape, plus any firmware holes within that range. The
-/// device MMIO is initially absent and is registered only by the driver that
-/// owns its BAR. Leaving every other high range absent gives the page-fault
-/// handler a useful signal without breaking established address ranges.
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-pub fn initialize(info: &BootInfo) -> Result<(), Error> {
-    let (feature_edx, _) = cpu::features();
-    if feature_edx & CPUID_PAGE_SIZE_EXTENSIONS == 0 {
-        return Err(Error::MissingPageSizeExtensions);
-    }
+fn address_of(symbol: *const u8) -> u64 {
+    symbol as u64
+}
 
-    // Paging is still disabled and interrupts are not initialized, so this
-    // one early-boot writer has exclusive access to the static directory.
-    let directory = unsafe { core::ptr::addr_of_mut!(PAGE_DIRECTORY.0).cast::<u32>() };
-    let low_page_table = unsafe { core::ptr::addr_of_mut!(LOW_PAGE_TABLE.0).cast::<u32>() };
-    let stack_guard = crate::stack::guard_page_address();
-    for index in 0..PAGE_DIRECTORY_ENTRIES {
-        let address = (index as u32) * PAGE_SIZE;
-        unsafe {
-            low_page_table.add(index).write(if address == stack_guard {
-                0
-            } else {
-                address | PAGE_PRESENT | PAGE_WRITABLE
-            });
-        }
-    }
+/// The kernel's own layout, as runtime addresses.
+pub struct Layout {
+    pub image: (u64, u64),
+    pub text: (u64, u64),
+    pub rodata: (u64, u64),
+    pub stack_guard: u64,
+    pub stack_bottom: u64,
+    pub ist_guard: u64,
+}
 
-    for index in 0..PAGE_DIRECTORY_ENTRIES {
-        let address = (index as u32) * LARGE_PAGE_SIZE;
-        unsafe {
-            let entry = if index == 0 {
-                low_page_table as u32 | PAGE_PRESENT | PAGE_WRITABLE
-            } else if address < IDENTITY_LOW_END {
-                address | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE
-            } else if range_is_usable_ram(info, address, LARGE_PAGE_SIZE) {
-                // 2-4 GiB: only 4 MiB pages that are wholly usable RAM, so
-                // the PCI hole (where BARs live) stays absent.
-                address | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE
-            } else {
-                0
-            };
-            directory.add(index).write(entry);
-        }
-    }
-
-    let directory_address = directory as u32;
+pub fn layout() -> Layout {
     unsafe {
-        // Load CR3 before CR0.PG. Until the final write below, these pointers
-        // are ordinary physical addresses because paging is still off.
-        asm!("mov cr3, {directory_address:e}", directory_address = in(reg) directory_address, options(nostack, preserves_flags));
-
-        let mut cr4: u32;
-        asm!("mov {cr4:e}, cr4", cr4 = out(reg) cr4, options(nostack, preserves_flags));
-        cr4 |= CR4_PAGE_SIZE_EXTENSIONS;
-        asm!("mov cr4, {cr4:e}", cr4 = in(reg) cr4, options(nostack, preserves_flags));
-
-        let mut cr0: u32;
-        asm!("mov {cr0:e}, cr0", cr0 = out(reg) cr0, options(nostack, preserves_flags));
-        // WP matters only after future mappings become read-only, but setting
-        // it now prevents ring 0 from silently bypassing that protection.
-        cr0 |= CR0_WRITE_PROTECT | CR0_PAGING;
-        asm!("mov cr0, {cr0:e}", cr0 = in(reg) cr0, options(nostack, preserves_flags));
+        Layout {
+            image: (address_of(&__kernel_start), address_of(&__kernel_end)),
+            text: (address_of(&__text_start), address_of(&__text_end)),
+            rodata: (address_of(&__rodata_start), address_of(&__rodata_end)),
+            stack_guard: address_of(&__stack_guard),
+            stack_bottom: address_of(&__stack_bottom),
+            ist_guard: address_of(&__ist_guard),
+        }
     }
-    mark_kernel_range_read_only(
-        linker_address(core::ptr::addr_of!(__text_start)),
-        linker_address(core::ptr::addr_of!(__text_end)),
-    );
-    mark_kernel_range_read_only(
-        linker_address(core::ptr::addr_of!(__rodata_start)),
-        linker_address(core::ptr::addr_of!(__rodata_end)),
-    );
-    flush_tlb(directory_address);
-    Ok(())
 }
 
-/// Whether `[start, start + length)` lies entirely inside type-1 (usable)
-/// E820 regions. Adjacent or overlapping regions are followed one after the
-/// other, so a firmware that reports RAM in several pieces still counts.
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-fn range_is_usable_ram(info: &BootInfo, start: u32, length: u32) -> bool {
-    let end = u64::from(start) + u64::from(length);
-    let count = usize::from(unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_region_count))
-    });
-    let mut position = u64::from(start);
-    while position < end {
-        let mut next = None;
-        for index in 0..count {
-            let region: MemoryRegion = unsafe {
-                core::ptr::read_unaligned(core::ptr::addr_of!(info.memory_regions[index]))
-            };
-            let (kind, base, size) = unsafe {
-                (
-                    core::ptr::read_unaligned(core::ptr::addr_of!(region.kind)),
-                    core::ptr::read_unaligned(core::ptr::addr_of!(region.base)),
-                    core::ptr::read_unaligned(core::ptr::addr_of!(region.length)),
-                )
-            };
-            let region_end = base.saturating_add(size);
-            if kind == 1 && base <= position && position < region_end {
-                next = Some(next.map_or(region_end, |best: u64| best.max(region_end)));
-            }
+static mut ROOT: u64 = 0;
+static mut WRITE_COMBINING: bool = false;
+
+/// What a faulting address is, for the exception report.
+pub fn describe(address: u64) -> &'static str {
+    let layout = layout();
+    if address < PAGE {
+        "the null page (a null pointer was used)"
+    } else if (layout.stack_guard..layout.stack_bottom).contains(&address) {
+        "the kernel stack guard page (stack overflow)"
+    } else if (layout.ist_guard..layout.ist_guard + PAGE).contains(&address) {
+        "the double-fault stack guard page"
+    } else if (layout.text.0..layout.text.1).contains(&address) {
+        "kernel code (read-only)"
+    } else if (layout.rodata.0..layout.rodata.1).contains(&address) {
+        "kernel read-only data"
+    } else if (layout.image.0..layout.image.1).contains(&address) {
+        "kernel data"
+    } else {
+        "unmapped memory"
+    }
+}
+
+/// Allocates one zeroed page-table page (the physical allocator hands out zeroed frames).
+fn new_table() -> *mut u64 {
+    match memory::allocate() {
+        Some(address) => address as *mut u64,
+        None => cpu::halt(),
+    }
+}
+
+/// The table an entry points to, creating it if the entry is empty.
+unsafe fn next_level(entry: *mut u64) -> *mut u64 {
+    unsafe {
+        if *entry & PRESENT == 0 {
+            *entry = new_table() as u64 | PRESENT | WRITABLE;
         }
-        match next {
-            Some(region_end) => position = region_end,
-            None => return false,
+        (*entry & ADDRESS_MASK) as *mut u64
+    }
+}
+
+/// Walks to the page-directory entry for `address` (levels 4 -> 3 -> 2).
+unsafe fn directory_entry(root: u64, address: u64) -> *mut u64 {
+    unsafe {
+        let pml4 = root as *mut u64;
+        let pdpt = next_level(pml4.add(((address >> 39) & 511) as usize));
+        let directory = next_level(pdpt.add(((address >> 30) & 511) as usize));
+        directory.add(((address >> 21) & 511) as usize)
+    }
+}
+
+/// Maps one 2 MiB page.
+fn map_huge(root: u64, address: u64, flags: u64) {
+    unsafe { *directory_entry(root, address) = address | flags | PRESENT | LARGE };
+}
+
+/// Maps one 4 KiB page (`virtual_address` -> `physical`).
+fn map_page(root: u64, virtual_address: u64, physical: u64, flags: u64) {
+    unsafe {
+        let entry = directory_entry(root, virtual_address);
+        assert!(*entry & LARGE == 0, "a 4 KiB mapping inside a 2 MiB page");
+        let table = next_level(entry);
+        *table.add(((virtual_address >> 12) & 511) as usize) = physical | flags | PRESENT;
+    }
+}
+
+/// Permissions for one 4 KiB page, or `None` if it must stay unmapped. `default` is
+/// what the page's memory region would get as a bulk mapping.
+fn page_flags(address: u64, default: u64, layout: &Layout) -> Option<u64> {
+    if address < PAGE {
+        return None; // the null page
+    }
+    let in_image = (layout.image.0..layout.image.1).contains(&address);
+    if !in_image {
+        return Some(default);
+    }
+    if address >= layout.stack_guard && address < layout.stack_bottom || (layout.ist_guard..layout.ist_guard + PAGE).contains(&address) {
+        return None; // guard pages
+    }
+    Some(if (layout.text.0..layout.text.1).contains(&address) {
+        0 // read + execute
+    } else if (layout.rodata.0..layout.rodata.1).contains(&address) {
+        NO_EXECUTE // read only
+    } else {
+        WRITABLE | NO_EXECUTE // data, bss, stacks
+    })
+}
+
+/// Maps `[start, end)` of one memory region: 2 MiB pages where a whole aligned
+/// chunk is plain, 4 KiB pages at the edges and wherever the kernel image or page 0
+/// needs finer permissions.
+fn map_region(root: u64, start: u64, end: u64, default: u64, layout: &Layout) {
+    let special = |from: u64, to: u64| from < PAGE || (from < layout.image.1 && to > layout.image.0);
+    let mut address = start & !(PAGE - 1);
+    while address < end {
+        if address % HUGE == 0 && address + HUGE <= end && !special(address, address + HUGE) {
+            map_huge(root, address, default);
+            address += HUGE;
+        } else {
+            if let Some(flags) = page_flags(address, default, layout) {
+                map_page(root, address, address, flags);
+            }
+            address += PAGE;
         }
     }
+}
+
+/// Programs the PAT so that the "PWT only" combination means write-combining
+/// instead of write-through, if the CPU has a PAT. Returns whether it did.
+fn setup_write_combining() -> bool {
+    let (_, _, _, edx) = cpu::cpuid(1, 0);
+    if edx & (1 << 16) == 0 {
+        return false;
+    }
+    // Entries (low byte first): WB, WC (was WT), UC-, UC, then the same again.
+    unsafe { core::arch::asm!("wbinvd", options(nomem, nostack)) };
+    cpu::write_msr(cpu::MSR_PAT, 0x0007_0106_0007_0106);
     true
 }
 
-/// Whether `address` is plain RAM the kernel mapped at boot: everything below
-/// 2 GiB, and above that only the 4 MiB pages `initialize` found to be usable
-/// RAM. The big pool asks this so it never offers a chunk that would fault.
-pub fn identity_mapped(address: u32) -> bool {
-    #[cfg(feature = "legacy-unsafe-memory")]
-    {
-        let _ = address;
-        true
-    }
-    #[cfg(not(feature = "legacy-unsafe-memory"))]
-    {
-        if address < IDENTITY_LOW_END {
-            return true;
-        }
-        let pde = unsafe {
-            core::ptr::addr_of!(PAGE_DIRECTORY.0)
-                .cast::<u32>()
-                .add((address / LARGE_PAGE_SIZE) as usize)
-                .read()
+/// Builds the tables and switches to them. After this, the firmware's mappings are
+/// gone: only what is described above is reachable.
+pub fn build_and_load(info: &BootInfo, framebuffer: &Framebuffer) {
+    let layout = layout();
+    let write_combining = setup_write_combining();
+    unsafe { WRITE_COMBINING = write_combining };
+    let root = new_table() as u64;
+
+    for descriptor in info.memory_descriptors() {
+        let start = descriptor.physical_start;
+        let end = start + descriptor.pages * PAGE;
+        let runtime = descriptor.attribute & ATTRIBUTE_RUNTIME != 0;
+        let flags = match descriptor.kind {
+            // Device memory the firmware needs at run time (variable store flash...).
+            11 | 12 if runtime => WRITABLE | NO_EXECUTE | CACHE_DISABLE | WRITE_THROUGH,
+            11 | 12 => continue, // other device memory is mapped by its driver
+            // Runtime-services code and data: left executable, as the firmware expects.
+            5 | 6 => WRITABLE,
+            1..=4 | 7 | 9 | 10 => WRITABLE | NO_EXECUTE,
+            _ => continue, // reserved, unusable, persistent...: not ours to touch
         };
-        pde & PAGE_PRESENT != 0 && pde & PAGE_LARGE != 0
+        map_region(root, start, end, flags, &layout);
     }
-}
-
-/// Maps one PCI memory-BAR range at its physical address.
-///
-/// Low physical addresses are already identity mapped for the current frame
-/// and tape allocators. Addresses above that compatibility range consume one
-/// of the small, on-demand page tables instead of making an entire PCI window
-/// reachable by accident.
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-pub fn map_mmio(base: u32, length: u32) -> Result<(), MapError> {
-    if length == 0 {
-        return Err(MapError::EmptyRange);
-    }
-    let last = base
-        .checked_add(length - 1)
-        .ok_or(MapError::AddressOverflow)?;
-    let first_page = base & !(PAGE_SIZE - 1);
-    let last_page = last & !(PAGE_SIZE - 1);
-    let directory = unsafe { core::ptr::addr_of_mut!(PAGE_DIRECTORY.0).cast::<u32>() };
-
-    let mut address = first_page;
-    loop {
-        if address >= IDENTITY_LOW_END {
-            let pde_index = (address / LARGE_PAGE_SIZE) as usize;
-            let pte_index = ((address % LARGE_PAGE_SIZE) / PAGE_SIZE) as usize;
-            let table = dynamic_page_table(directory, pde_index)?;
-            unsafe {
-                table
-                    .add(pte_index)
-                    .write(address | PAGE_PRESENT | PAGE_WRITABLE);
-            }
-        }
-        if address == last_page {
-            break;
-        }
-        address = address
-            .checked_add(PAGE_SIZE)
-            .ok_or(MapError::AddressOverflow)?;
-    }
-    flush_tlb(directory as u32);
-    Ok(())
-}
-
-/// The unpaged teaching image retains physical pointers directly, so no
-/// translation work is necessary for a driver's BAR.
-#[cfg(feature = "legacy-unsafe-memory")]
-pub fn map_mmio(_base: u32, length: u32) -> Result<(), MapError> {
-    if length == 0 {
-        Err(MapError::EmptyRange)
-    } else {
-        Ok(())
-    }
-}
-
-/// Returns the physical address in CR3 for task-state restoration.
-pub fn directory_address() -> u32 {
-    core::ptr::addr_of!(PAGE_DIRECTORY) as u32
-}
-
-/// Labels the most useful paging region for a fatal page-fault diagnostic.
-pub fn describe_address(address: u32) -> &'static str {
-    #[cfg(feature = "legacy-unsafe-memory")]
-    {
-        let _ = address;
-        return "legacy unpaged physical-address mode";
+    if framebuffer.base != 0 {
+        let flags = WRITABLE | NO_EXECUTE | if write_combining { WRITE_THROUGH } else { CACHE_DISABLE | WRITE_THROUGH };
+        map_region(root, framebuffer.base, framebuffer.base + framebuffer.size, flags, &layout);
     }
 
-    #[cfg(not(feature = "legacy-unsafe-memory"))]
-    {
-        let text_start = linker_address(core::ptr::addr_of!(__text_start));
-        let text_end = linker_address(core::ptr::addr_of!(__text_end));
-        if (text_start..text_end).contains(&address) {
-            return "kernel text (read-only)";
-        }
-        let rodata_start = linker_address(core::ptr::addr_of!(__rodata_start));
-        let rodata_end = linker_address(core::ptr::addr_of!(__rodata_end));
-        if (rodata_start..rodata_end).contains(&address) {
-            return "kernel read-only data";
-        }
-        let guard = crate::stack::guard_page_address();
-        if (guard..guard + PAGE_SIZE).contains(&address) {
-            return "kernel stack guard page";
-        }
-        if address < IDENTITY_LOW_END {
-            return "low physical identity map";
-        }
-        if identity_mapped(address) {
-            return "RAM above 2 GiB (identity map)";
-        }
-        if is_dynamic_mapping_present(address) {
-            return "registered PCI MMIO";
-        }
-        "unmapped high physical or PCI MMIO range"
-    }
+    // NXE lets the NX bit in page entries mean something (otherwise it is a reserved
+    // bit and any entry with it set faults); WP makes ring 0 respect read-only pages.
+    cpu::write_msr(cpu::MSR_EFER, cpu::read_msr(cpu::MSR_EFER) | (1 << 11));
+    cpu::write_cr0(cpu::read_cr0() | (1 << 16));
+    unsafe { ROOT = root };
+    cpu::write_cr3(root);
 }
 
-/// Whether the kernel can read `address` without faulting: everything in the
-/// low 2 GiB identity map except the kernel-stack guard page, plus any high MMIO
-/// a driver registered with `map_mmio`. For the shell's `mmio` debugging command.
-pub fn is_readable(address: u32) -> bool {
-    !matches!(
-        describe_address(address),
-        "unmapped high physical or PCI MMIO range" | "kernel stack guard page"
-    )
-}
-
-/// Like `is_readable`, but also refuses kernel text and read-only data, which a
-/// supervisor write would fault on (CR0.WP is set).
-pub fn is_writable(address: u32) -> bool {
-    is_readable(address)
-        && !matches!(
-            describe_address(address),
-            "kernel text (read-only)" | "kernel read-only data"
-        )
-}
-
-/// Deliberately writes to kernel text for `make test-page-protection`.
-///
-/// The test runs only after the IDT is live, so its expected supervisor-write
-/// fault exercises both CR0.WP and the text PTEs without risking a fault before
-/// diagnostics are installed.
-#[cfg(feature = "page-protection-test")]
-pub fn trigger_text_write_for_test() {
-    let address = linker_address(core::ptr::addr_of!(__text_start));
-    unsafe {
-        core::ptr::write_volatile(address as *mut u8, 0);
-    }
-}
-
-/// Returns CR2, the linear address that caused the most recent page fault.
-pub fn fault_address() -> u32 {
-    let address: u32;
-    unsafe {
-        asm!("mov {address:e}, cr2", address = out(reg) address, options(nostack, preserves_flags));
-    }
-    address
-}
-
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-fn linker_address(symbol: *const u8) -> u32 {
-    symbol as u32
-}
-
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-fn mark_kernel_range_read_only(start: u32, end: u32) {
-    let first = start & !(PAGE_SIZE - 1);
-    let last = (end - 1) & !(PAGE_SIZE - 1);
-    let table = unsafe { core::ptr::addr_of_mut!(LOW_PAGE_TABLE.0).cast::<u32>() };
-    let mut address = first;
-    loop {
-        let index = (address / PAGE_SIZE) as usize;
+/// Makes `[start, start + length)` executable (or not): clears or sets the NX bit of every
+/// mapping in the range. Both ends must be 2 MiB aligned. Used for the tape region, the
+/// one place the kernel runs code it did not link (tapes are trusted like kernel code;
+/// this is not isolation).
+pub fn set_executable(start: u64, length: u64, executable: bool) {
+    assert!(start % HUGE == 0 && length % HUGE == 0, "tape region must be 2 MiB aligned");
+    let root = unsafe { ROOT };
+    let apply = |entry: *mut u64| unsafe {
+        if executable {
+            *entry &= !NO_EXECUTE;
+        } else {
+            *entry |= NO_EXECUTE;
+        }
+    };
+    let mut address = start;
+    while address < start + length {
         unsafe {
-            let entry = table.add(index);
-            entry.write(entry.read() & !PAGE_WRITABLE);
-        }
-        if address == last {
-            break;
-        }
-        address += PAGE_SIZE;
-    }
-}
-
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-fn dynamic_page_table(directory: *mut u32, pde_index: usize) -> Result<*mut u32, MapError> {
-    unsafe {
-        let directory_entry = directory.add(pde_index);
-        let existing = directory_entry.read();
-        if existing & PAGE_LARGE != 0 && existing & PAGE_PRESENT != 0 {
-            // A 4 MiB RAM page (2-4 GiB): a BAR can never be inside RAM.
-            return Err(MapError::PageTableCapacity);
-        }
-        if existing & PAGE_PRESENT != 0 {
-            return Ok((existing & 0xffff_f000) as *mut u32);
-        }
-
-        for index in 0..MAX_DYNAMIC_PAGE_TABLES {
-            if DYNAMIC_TABLE_PDES[index] == u16::MAX {
-                let table = core::ptr::addr_of_mut!(DYNAMIC_PAGE_TABLES[index].0).cast::<u32>();
-                for entry in 0..PAGE_DIRECTORY_ENTRIES {
-                    table.add(entry).write(0);
+            let directory = directory_entry(root, address);
+            if *directory & LARGE != 0 {
+                apply(directory);
+            } else {
+                // Mapped with 4 KiB pages (it shares a 2 MiB chunk with the kernel image):
+                // the directory entry must allow execution too; the pages decide.
+                *directory &= !NO_EXECUTE;
+                let table = (*directory & ADDRESS_MASK) as *mut u64;
+                for index in 0..512 {
+                    if *table.add(index) & PRESENT != 0 {
+                        apply(table.add(index));
+                    }
                 }
-                DYNAMIC_TABLE_PDES[index] = pde_index as u16;
-                directory_entry.write(table as u32 | PAGE_PRESENT | PAGE_WRITABLE);
-                return Ok(table);
             }
         }
+        address += HUGE;
     }
-    Err(MapError::PageTableCapacity)
+    cpu::write_cr3(cpu::read_cr3()); // flush the TLB
 }
 
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-fn is_dynamic_mapping_present(address: u32) -> bool {
-    let pde_index = (address / LARGE_PAGE_SIZE) as usize;
-    let pte_index = ((address % LARGE_PAGE_SIZE) / PAGE_SIZE) as usize;
+/// Whether `address` is mapped (present) in the kernel's tables: used before touching a
+/// fixed physical page the firmware's memory map may not have described.
+pub fn is_mapped(address: u64) -> bool {
+    let root = unsafe { ROOT };
+    if root == 0 {
+        return false;
+    }
     unsafe {
-        let directory = core::ptr::addr_of!(PAGE_DIRECTORY.0).cast::<u32>();
-        let pde = directory.add(pde_index).read();
-        if pde & PAGE_PRESENT == 0 || pde & PAGE_LARGE != 0 {
+        let pml4 = (root as *const u64).add(((address >> 39) & 511) as usize).read();
+        if pml4 & PRESENT == 0 {
             return false;
         }
-        let table = (pde & 0xffff_f000) as *const u32;
-        table.add(pte_index).read() & PAGE_PRESENT != 0
+        let pdpt = ((pml4 & ADDRESS_MASK) as *const u64).add(((address >> 30) & 511) as usize).read();
+        if pdpt & PRESENT == 0 {
+            return false;
+        }
+        let directory = ((pdpt & ADDRESS_MASK) as *const u64).add(((address >> 21) & 511) as usize).read();
+        if directory & PRESENT == 0 {
+            return false;
+        }
+        if directory & LARGE != 0 {
+            return true;
+        }
+        let entry = ((directory & ADDRESS_MASK) as *const u64).add(((address >> 12) & 511) as usize).read();
+        entry & PRESENT != 0
     }
 }
 
-#[cfg(not(feature = "legacy-unsafe-memory"))]
-fn flush_tlb(directory_address: u32) {
-    unsafe {
-        asm!("mov cr3, {directory_address:e}", directory_address = in(reg) directory_address, options(nostack, preserves_flags));
+pub fn root() -> u64 {
+    unsafe { ROOT }
+}
+
+pub fn write_combining_enabled() -> bool {
+    unsafe { WRITE_COMBINING }
+}
+
+/// Maps `length` bytes of device registers at physical `address`, uncached and
+/// no-execute (identity: the virtual address is the physical one). The registers must
+/// not lie inside a 2 MiB page the kernel already maps as RAM.
+pub fn map_device(address: u64, length: u64) {
+    let root = unsafe { ROOT };
+    let mut page = address & !(PAGE - 1);
+    while page < address + length {
+        map_page(root, page, page, WRITABLE | NO_EXECUTE | CACHE_DISABLE | WRITE_THROUGH);
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags)) };
+        page += PAGE;
     }
 }

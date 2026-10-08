@@ -2,19 +2,15 @@
 name = "opus-codec"
 version = "0.1.0"
 edition = "2024"
-description = "Rust FFI wrapper around a vendored, fixed-point-only libopus decoder for fos tapes"
+description = "Rust FFI wrapper around a vendored libopus for v2 tapes"
 license = "BSD-3-Clause"
 
-[lib]
-test = true
-bench = false
-
-[profile.dev]
-panic = "abort"
+[dependencies]
+tape-rt = { path = "../tape-rt" }
 
 [profile.release]
 panic = "abort"
 codegen-units = 1
 lto = true
-opt-level = "z"
+opt-level = 3
 strip = "symbols"

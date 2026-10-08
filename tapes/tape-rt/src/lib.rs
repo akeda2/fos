@@ -1,150 +1,254 @@
-//! A small shared runtime for ordinary 32-bit Rust tapes -- the bits every
-//! such tape needs (`_start`, a panic handler, `putc`-based print
-//! helpers) but that have nothing to do with any individual tape's own
-//! purpose. `tapes/vga-colors` depends on this crate instead of keeping
-//! its own copies of these; see below for why it, specifically, was
-//! chosen for this and why `tapes/hello-rs`/`tapes/bigsieve` were
-//! deliberately left as they were.
+//! The runtime every v2 tape shares: `_start`, a panic handler, `print!`/`println!`
+//! over the kernel's `putc`, and a few helpers for the callbacks in `TapeApi`.
 //!
-//! This mirrors, for ordinary 32-bit tapes, the same "reusable plumbing
-//! in one place, swappable per-tape logic elsewhere" split that
-//! `tapes/longmode64_shim.S` uses for 64-bit-excursion tapes (see
-//! AGENTS.md's "A tape that visits 64-bit long mode and comes back"):
-//! there, the shim owns the CPU-mode-switch mechanics and calls out to an
-//! external `tape64_body`; here, this crate owns the startup/panic/print
-//! mechanics and a tape's own `src/main.rs` supplies `tape_main`. Same
-//! idea, one exists in assembly for a privileged mode transition, the
-//! other in Rust for ordinary boilerplate.
-//!
-//! Why only `vga-colors` uses this, and `hello-rs`/`bigsieve` still keep
-//! their own local, duplicated copies of `entry.S`/the panic handler/
-//! `print_bytes`/`print_u32`: this project's Rust tapes exist primarily
-//! as *teaching examples* (see `docs/rust-tapes-for-dummies.md`), and a
-//! beginner reading `tapes/hello-rs/src/main.rs` top to bottom is meant
-//! to see the *entire* tape -- every line that runs, with nothing
-//! imported from an unfamiliar sibling crate -- in one file. Introducing
-//! a shared dependency there would trade that self-containedness for a
-//! small amount of saved duplication, a bad trade for a from-scratch
-//! walkthrough's very first and second examples. `vga-colors` was
-//! refactored to use this crate instead specifically to demonstrate the
-//! *other* valid pattern -- extracting shared plumbing once duplication
-//! starts to feel real -- so a reader curious about it has a working
-//! example to study, without disturbing the two simpler ones. Any
-//! genuinely new future tape (not a teaching-ladder example) should
-//! prefer depending on this crate the way `vga-colors` does, rather than
-//! copying `entry.S`/the panic handler/the print helpers a fourth time.
+//! A tape's `main.rs` is `#![no_std] #![no_main]` and defines
+//! `#[unsafe(no_mangle)] pub extern "C" fn tape_main(api: &'static TapeApi)`; this crate
+//! supplies the rest. The API pointer is also stored globally (`api()`), so helper
+//! functions deep in a tape can print or poll without it being threaded through.
 #![no_std]
 
-use core::panic::PanicInfo;
+pub mod abort;
 
-core::arch::global_asm!(include_str!("entry.S"));
+pub use fos_v2_abi::tape::*;
 
-/// Prints one byte through the callback the kernel passed in -- see
-/// `console::print_byte` in kernel/src/console.rs, the only thing on the
-/// other end of this function pointer.
+use core::fmt::Write;
+
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .global _start
+    _start:
+        // rdi = &TapeApi, the stack is the tape's own (already 16-byte aligned at the call).
+        push rbp                 // re-align for the call below
+        mov rbp, rsp
+        call tape_main
+        pop rbp
+        ret
+    "#
+);
+
+static mut API: *const TapeApi = core::ptr::null();
+
+/// Called first thing by `tape_main`.
+pub fn init(api: &'static TapeApi) {
+    unsafe { API = api };
+}
+
+pub fn api() -> &'static TapeApi {
+    unsafe { &*API }
+}
+
+/// The text after `tape run`.
+pub fn args() -> &'static [u8] {
+    let api = api();
+    unsafe { core::slice::from_raw_parts(api.args, api.args_len) }
+}
+
+pub struct Console;
+
+static mut QUIET: bool = false;
+static mut LINE: [u8; 160] = [0; 160];
+static mut LINE_LENGTH: usize = 0;
+static mut LAST: [u8; 160] = [0; 160];
+static mut LAST_LENGTH: usize = 0;
+
+/// While quiet, `print!`/`println!` do not reach the screen: a tape that draws its own full-screen panel keeps the
+/// text its worker code prints from scribbling over it. The last complete line is kept (`last_message`) so the panel
+/// can show it where it wants.
+pub fn set_quiet(quiet: bool) {
+    unsafe { QUIET = quiet };
+}
+
+/// The last complete line printed while quiet.
+pub fn last_message() -> &'static str {
+    unsafe {
+        let last: &'static [u8; 160] = &*(&raw const LAST);
+        core::str::from_utf8(&last[..LAST_LENGTH]).unwrap_or("")
+    }
+}
+
+impl Write for Console {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        if unsafe { QUIET } {
+            for &byte in text.as_bytes() {
+                unsafe {
+                    let line: &mut [u8; 160] = &mut *(&raw mut LINE);
+                    if byte == b'\n' {
+                        if LINE_LENGTH > 0 {
+                            let last: &mut [u8; 160] = &mut *(&raw mut LAST);
+                            last[..LINE_LENGTH].copy_from_slice(&line[..LINE_LENGTH]);
+                            LAST_LENGTH = LINE_LENGTH;
+                        }
+                        LINE_LENGTH = 0;
+                    } else if byte >= b' ' && LINE_LENGTH < 160 {
+                        line[LINE_LENGTH] = byte;
+                        LINE_LENGTH += 1;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if api().version >= 2 {
+            (api().puts)(text.as_ptr(), text.len());
+            return Ok(());
+        }
+        for &byte in text.as_bytes() {
+            (api().putc)(u32::from(byte));
+        }
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! print {
+    ($($argument:tt)*) => {{ let _ = core::fmt::Write::write_fmt(&mut $crate::Console, format_args!($($argument)*)); }};
+}
+
+#[macro_export]
+macro_rules! println {
+    () => { $crate::print!("\n") };
+    ($($argument:tt)*) => {{ $crate::print!($($argument)*); $crate::print!("\n"); }};
+}
+
+/// Prints raw bytes through a `putc` callback (kept for tapes ported from v1, which pass
+/// the callback around explicitly).
 pub fn print_bytes(putc: extern "C" fn(u32), bytes: &[u8]) {
     for &byte in bytes {
         putc(u32::from(byte));
     }
 }
 
-/// Prints an unsigned integer in decimal, most significant digit first,
-/// without `core::fmt`/allocation -- just a fixed stack buffer, the same
-/// spirit as `console.rs`'s own number formatting. Not currently used by
-/// `vga-colors` itself, but kept here (matching `hello-rs`/`bigsieve`'s
-/// own copies) as a ready-made utility for whatever future tape depends
-/// on this crate next.
+/// Prints an unsigned integer in decimal through a `putc` callback.
 pub fn print_u32(putc: extern "C" fn(u32), mut value: u32) {
     let mut digits = [0u8; 10];
     let mut count = 0;
-
-    if value == 0 {
-        print_bytes(putc, b"0");
-        return;
-    }
-
-    while value > 0 {
+    loop {
         digits[count] = b'0' + (value % 10) as u8;
-        value /= 10;
         count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
     }
-
     for &digit in digits[..count].iter().rev() {
         putc(u32::from(digit));
     }
 }
 
-/// The kernel's `wait_for_event` callback (the last tape ABI slot), stored by
-/// `set_wait_hook` so any polling loop in a tape -- including deep inside
-/// helper functions that were never passed the callback -- can call `idle()`
-/// without threading another parameter through every signature. Tapes are
-/// single-threaded and zero-initialized `.bss` leaves this `None` until set, so
-/// a tape that never sets it simply never sleeps.
-static mut WAIT_HOOK: Option<extern "C" fn()> = None;
+/// The v1 tape ABI was a long list of cdecl parameters with 32-bit addresses; tapes ported from
+/// it keep their bodies and use these functions, which have the v1 names and shapes but take
+/// 64-bit pointers (as `usize`) and go through the v2 table. Not for new tapes: use `api()`.
+pub mod compat {
+    use super::api;
+    // (A pattern `FS_NOT_FOUND =>` with the constant not in scope is a catch-all binding: every
+    // error used to be reported as "not found".)
+    use fos_v2_abi::tape::FS_NOT_FOUND;
 
-/// Remembers the kernel's `wait_for_event` callback; call once from
-/// `tape_main` before any polling loop.
-pub fn set_wait_hook(hook: extern "C" fn()) {
-    unsafe {
-        WAIT_HOOK = Some(hook);
+    pub fn should_abort() -> u32 {
+        (api().should_abort)()
     }
+    pub fn read_key() -> u32 {
+        (api().read_key)()
+    }
+    pub fn wait_for_event() {
+        (api().wait_for_event)();
+    }
+    pub fn ticks() -> u64 {
+        (api().ticks)()
+    }
+    pub fn micros() -> u64 {
+        (api().micros)()
+    }
+    pub fn alloc(bytes: u32) -> usize {
+        (api().alloc)(bytes as usize)
+    }
+    pub fn free(address: usize, bytes: u32) {
+        (api().free)(address, bytes as usize)
+    }
+    pub fn nic_count() -> u32 {
+        (api().nic_count)() as u32
+    }
+    /// The "active" interface of v1 is interface 0 here.
+    pub fn nic_mac(out: usize) -> u32 {
+        (api().nic_mac)(0, out as *mut u8)
+    }
+    pub fn nic_send(frame: usize, length: u32) -> u32 {
+        (api().nic_send)(0, frame as *const u8, length as usize)
+    }
+    pub fn nic_receive(buffer: usize, capacity: u32) -> u32 {
+        (api().nic_receive)(0, buffer as *mut u8, capacity as usize) as u32
+    }
+    pub fn nic_mac_at(nic: u32, out: usize) -> u32 {
+        (api().nic_mac)(nic as usize, out as *mut u8)
+    }
+    pub fn nic_send_at(nic: u32, frame: usize, length: u32) -> u32 {
+        (api().nic_send)(nic as usize, frame as *const u8, length as usize)
+    }
+    pub fn nic_receive_at(nic: u32, buffer: usize, capacity: u32) -> u32 {
+        (api().nic_receive)(nic as usize, buffer as *mut u8, capacity as usize) as u32
+    }
+    pub fn nic_set_promiscuous_at(nic: u32, on: u32) -> u32 {
+        (api().nic_set_promiscuous)(nic as usize, on)
+    }
+    pub fn nic_max_frame_len() -> u32 {
+        (api().nic_max_frame_len)() as u32
+    }
+    pub fn set_input_mode(mode: u32) {
+        (api().set_input_mode)(mode)
+    }
+
+    /// v1 `fs_write(name, name_len, data, len)`: 0 on success.
+    pub fn fs_write(name: usize, name_length: u32, data: usize, length: u32) -> u32 {
+        u32::from((api().fs_write)(name as *const u8, name_length as usize, data as *const u8, length as usize) != 0)
+    }
+    /// v1 `fs_file_length(name, name_len, out_u64)`: status 0 ok, 1 not found (the lease-file
+    /// statuses router uses), 2 other failure.
+    pub fn fs_file_length(name: usize, name_length: u32, out: usize) -> u32 {
+        // v2 has no length call: read into a scratch region to learn it (lease files are small).
+        let capacity = 16 * 1024;
+        let scratch = (api().alloc)(capacity);
+        if scratch == 0 {
+            return 2;
+        }
+        let result = (api().fs_read)(name as *const u8, name_length as usize, scratch as *mut u8, capacity);
+        (api().free)(scratch, capacity);
+        match result {
+            length if length >= 0 => {
+                unsafe { (out as *mut u64).write_unaligned(length as u64) };
+                0
+            }
+            FS_NOT_FOUND => 1,
+            _ => 2,
+        }
+    }
+    /// v1 `fs_read(name, name_len, buffer, capacity, out_len_u32)`: status 0 ok, 1 not found.
+    pub fn fs_read(name: usize, name_length: u32, buffer: usize, capacity: u32, out_length: usize) -> u32 {
+        match (api().fs_read)(name as *const u8, name_length as usize, buffer as *mut u8, capacity as usize) {
+            length if length >= 0 => {
+                unsafe { (out_length as *mut u32).write_unaligned(length as u32) };
+                0
+            }
+            FS_NOT_FOUND => 1,
+            _ => 2,
+        }
+    }
+    pub fn fs_remove(name: usize, name_length: u32) -> u32 {
+        u32::from((api().fs_remove)(name as *const u8, name_length as usize) != 0)
+    }
+    pub fn terminal_position() -> u32 {
+        0
+    }
+
+    // v1 tapes registered hooks with tape-rt; the v2 table makes that unnecessary.
+    pub fn set_wait_hook(_hook: extern "C" fn()) {}
+    pub fn set_micros_hook(_hook: extern "C" fn() -> u64) {}
 }
 
-/// Sleeps until the next interrupt (a received frame, a keypress, or the
-/// 10 ms timer tick). Call it when a polling pass found nothing to do instead
-/// of spinning; the sleep may end early, so just poll again. Does nothing if
-/// no hook was set.
-pub fn idle() {
-    if let Some(hook) = unsafe { WAIT_HOOK } {
-        hook();
-    }
-}
-
-/// The kernel's `micros` callback (ABI slot 38): microseconds since boot, read
-/// from the PIT's own counter, so deadlines and latencies are not limited to the
-/// 10 ms tick.
-static mut MICROS_HOOK: Option<extern "C" fn() -> u64> = None;
-
-/// Remembers the kernel's `micros` callback; call once from `tape_main`.
-pub fn set_micros_hook(hook: extern "C" fn() -> u64) {
-    unsafe {
-        MICROS_HOOK = Some(hook);
-    }
-}
-
-/// Microseconds since boot, or 0 if no hook was set.
-pub fn micros() -> u64 {
-    match unsafe { MICROS_HOOK } {
-        Some(hook) => hook(),
-        None => 0,
-    }
-}
-
-/// The kernel's `set_input_mode` callback (ABI slot 37), stored like the wait
-/// hook so `set_raw_keys` can be called from anywhere.
-static mut INPUT_MODE_HOOK: Option<extern "C" fn(u32)> = None;
-
-/// Remembers the kernel's `set_input_mode` callback; call once from
-/// `tape_main` before `set_raw_keys`.
-pub fn set_input_mode_hook(hook: extern "C" fn(u32)) {
-    unsafe {
-        INPUT_MODE_HOOK = Some(hook);
-    }
-}
-
-/// Chooses how the kernel's `read_key` treats Backspace. With `raw` false (the
-/// default every tape starts in) the kernel erases the previous character on
-/// screen itself whenever it returns Backspace, which suits a simple line
-/// reader that only ever edits the end of its line. With `raw` true the kernel
-/// does nothing: a tape that moves the cursor (see `KeyDecoder`) must redraw on
-/// its own, using ANSI sequences such as `ESC [ 3 D` (cursor left) and
-/// `ESC [ K` (erase to end of line), which the kernel's VGA console and a
-/// serial/`term net` terminal both understand.
-pub fn set_raw_keys(raw: bool) {
-    if let Some(hook) = unsafe { INPUT_MODE_HOOK } {
-        hook(u32::from(raw));
-    }
-}
+/// The v1 `set_input_mode`/`set_raw_keys` pair, kept so ported tapes compile unchanged. On v2
+/// the kernel never erases on Backspace for a tape, so every tape is already in "raw" mode and
+/// does its own echo and erasing.
+pub fn set_input_mode_hook(_hook: extern "C" fn(u32)) {}
+pub fn set_raw_keys(_raw: bool) {}
 
 /// A decoded key. Cursor keys arrive from `read_key` as ANSI escape sequences
 /// (`ESC [ D` is Left), identically from the local PS/2 keyboard and from a
@@ -277,16 +381,50 @@ impl KeyDecoder {
     }
 }
 
+static mut IDLE_HOOK: Option<fn()> = None;
+
+/// Runs `hook` after every `idle()` (a tape running two cooperative tasks switches between them there).
+pub fn set_idle_hook(hook: Option<fn()>) {
+    unsafe { IDLE_HOOK = hook };
+}
+
+/// Sleeps until the next interrupt; call it when a polling pass found nothing to do.
+pub fn idle() {
+    (api().wait_for_event)();
+    if let Some(hook) = unsafe { IDLE_HOOK } {
+        hook();
+    }
+}
+
+pub fn ticks() -> u64 {
+    (api().ticks)()
+}
+
+/// The local time of day, if the machine's clock is set (a kernel without the call, or a dead RTC battery, gives None).
+pub fn wall_clock() -> Option<WallClock> {
+    let table = api();
+    if (table.size as usize) < core::mem::size_of::<TapeApi>() {
+        return None;
+    }
+    let mut now = WallClock::default();
+    ((table.wall_clock)(&mut now) != 0).then_some(now)
+}
+
+pub fn micros() -> u64 {
+    (api().micros)()
+}
+
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    // A tape has nowhere to unwind to and no OS underneath it -- see
-    // `panic = "abort"` in the dependent tape's Cargo.toml -- so this can
-    // only spin forever, exactly like the kernel's own panic handler in
-    // kernel/src/main.rs (a tape faulting or hanging is documented as
-    // unrecoverable; see `tape_run`'s doc comment). Living here instead
-    // of in each tape's own `main.rs` is safe because a panic handler is
-    // a single global lang item: exactly one may exist anywhere in a
-    // binary's whole dependency graph, so any tape depending on this
-    // crate must not (and does not) define its own.
-    loop {}
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // A tape has nowhere to unwind to: say what happened, then wait for the operator to
+    // abort (the kernel's Escape handling is what ends a tape that will not return).
+    println!("\ntape panic: {info}");
+    loop {
+        if (api().should_abort)() != 0 {
+            // Cannot return from a panic; park. (The operator resets, or the kernel's
+            // watchdog does, from M6.)
+            idle();
+        }
+        idle();
+    }
 }

@@ -3,5 +3,17 @@
 version = 4
 
 [[package]]
-name = "fos-kernel"
+name = "fos-v2-abi"
 version = "0.1.0"
+
+[[package]]
+name = "fos-v2-fat"
+version = "0.1.0"
+
+[[package]]
+name = "fos-v2-kernel"
+version = "0.1.0"
+dependencies = [
+ "fos-v2-abi",
+ "fos-v2-fat",
+]

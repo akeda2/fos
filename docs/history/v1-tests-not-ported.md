@@ -1,0 +1,71 @@
+# v1 end-to-end tests not carried into the 64-bit tree
+
+Removed from the main line by the unification (docs/shared-codebase.md). Every file is still
+available at tag `legacy-v1`. Triage still to do: for each, either a `make test-*` target of the
+64-bit tree already covers the behaviour, or it is ported, or it goes away with a driver that was not ported.
+
+- `tapes/test_ahci_e2e.py`
+- `tapes/test_audio_capture_e2e.py`
+- `tapes/test_audio_multi_e2e.py`
+- `tapes/test_audio_net_e2e.py`
+- `tapes/test_audio_net_multi_e2e.py`
+- `tapes/test_audio_net_real_mic_e2e.py`
+- `tapes/test_audio_rtp_duplex_e2e.py`
+- `tapes/test_audio_rtp_e2e.py`
+- `tapes/test_audio_rtp_opus_e2e.py`
+- `tapes/test_audio_rtp_opus_send_e2e.py`
+- `tapes/test_beep_e2e.py`
+- `tapes/test_bigsieve_e2e.py`
+- `tapes/test_calc_e2e.py`
+- `tapes/test_cpu64_lab_e2e.py`
+- `tapes/test_cpu64_show_e2e.py`
+- `tapes/test_ed_e2e.py`
+- `tapes/test_ed_keys_e2e.py`
+- `tapes/test_ehci_e2e.py`
+- `tapes/test_hda_capture_e2e.py`
+- `tapes/test_hda_e2e.py`
+- `tapes/test_hda_multi_e2e.py`
+- `tapes/test_hda_playback_e2e.py`
+- `tapes/test_hello_rs_e2e.py`
+- `tapes/test_longmode_e2e.py`
+- `tapes/test_longmode_rs_e2e.py`
+- `tapes/test_memtest_e2e.py`
+- `tapes/test_morse_e2e.py`
+- `tapes/test_net_chat_e2e.py`
+- `tapes/test_net_dhcp_e2e.py`
+- `tapes/test_nettest_e2e.py`
+- `tapes/test_nettest_retarget_e2e.py`
+- `tapes/test_nettest_selftest_e2e.py`
+- `tapes/test_primes_e2e.py`
+- `tapes/test_primes_vga_e2e.py`
+- `tapes/test_router_arp_queue_e2e.py`
+- `tapes/test_telnet_e2e.py`
+- `tapes/test_uhci_audio_facade_e2e.py`
+- `tapes/test_uhci_e2e.py`
+- `tapes/test_uhci_play_e2e.py`
+- `tapes/test_usb_boot_promote_e2e.py`
+- `tapes/test_usb_hosts_e2e.py`
+- `tapes/test_usb_storage_disk_e2e.py`
+- `tapes/test_usb_storage_e2e.py`
+- `tapes/test_vga_colors_e2e.py`
+- `tapes/test_xhci_e2e.py`
+- `tools/test_debug_mode_e2e.py`
+- `tools/test_foscopy_e2e.py`
+- `tools/test_gpt.py`
+- `tools/test_hostname_discovery_e2e.py`
+- `tools/test_hwaccess_e2e.py`
+- `tools/test_idle_cpu_e2e.py`
+- `tools/test_kernel_update_e2e.py`
+- `tools/test_msi_e2e.py`
+- `tools/test_netfs_e2e.py`
+- `tools/test_nic_map_e2e.py`
+- `tools/test_page_protection.py`
+- `tools/test_realnet_e2e.py`
+- `tools/test_release_loops_e2e.py`
+- `tools/test_reset_e2e.py`
+- `tools/test_scripts_settings_e2e.py`
+- `tools/test_stack_guard.py`
+- `tools/test_tape_elf.py`
+- `tools/test_term_net_e2e.py`
+- `tools/test_term_net_tape_e2e.py`
+- `tools/test_vga_modes.py`

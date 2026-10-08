@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "build" / "fos.img"
 TAPE = ROOT / "build" / "tapes" / "router.bin"
 # FOS_V2=1 runs this same test against the v2 kernel (UEFI image, 64-bit tape): a `qemu-system-i386`
-# shim on PATH (v2/tools/qemu_v1_shim.py) turns the v1 command line into an OVMF one, and only
+# shim on PATH (tools/qemu_v1_shim.py) turns the v1 command line into an OVMF one, and only
 # the serial markers and file names below differ.
 V2 = os.environ.get("FOS_V2") == "1"
 if V2:

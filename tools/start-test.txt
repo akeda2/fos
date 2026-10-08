@@ -1,3 +1,0 @@
-# Confirm that comments and blank lines do not dispatch commands.
-
-about

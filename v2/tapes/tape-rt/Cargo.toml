@@ -1,9 +1,0 @@
-[package]
-name = "tape-rt"
-version = "0.1.0"
-edition = "2024"
-
-# The small runtime every v2 tape shares: the entry stub, a panic handler, and print
-# helpers over the TapeApi table.
-[dependencies]
-fos-v2-abi = { path = "../../abi" }

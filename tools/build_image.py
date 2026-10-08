@@ -1,247 +1,284 @@
 #!/usr/bin/env python3
-"""Create a fixed-layout GPT disk image without touching host block devices.
+"""Builds a bootable fos v2 disk image: a GPT disk with a FAT32 EFI System
+Partition holding the loader at \\EFI\\BOOT\\BOOTX64.EFI (the removable-media path
+every UEFI firmware tries when it has no boot entry for the disk) and a payload
+partition holding the A/B kernel slots.
 
-Produces `build/fos.img`: a 16 MiB raw disk with a protective MBR, primary
-and backup GPT, a raw boot payload partition (stage two loader + kernel), and
-a separate FOSFS data partition. The data partition is preformatted with
-`readme.txt` and every compiled tape passed through `--file NAME PATH`. See
-the top-level README's "Disk image layout" section for the full diagram.
+Pure Python standard library, like every other tool here: no mkfs.fat, no mtools,
+no sgdisk. The FAT32 writer is deliberately minimal (one cluster per sector, no
+long file names, files laid out contiguously) because it only ever writes a
+handful of files once.
+
+Payload partition layout (docs/v2-design.md section 5, abi/src/lib.rs): sector 0
+is the slot-metadata block in v1's byte layout, slot 0 starts at sector 1 and slot 1
+SLOT_SECTORS later. M1 writes the kernel ELF into slot 0. The FOSFS data partition
+arrives with M4.
 """
 
-from argparse import ArgumentParser
-from pathlib import Path
+import argparse
 import struct
+import uuid
 import zlib
+from pathlib import Path
 
-from write_layout import (
-    DATA_SECTORS,
-    DATA_START_LBA,
-    IMAGE_SECTORS,
-    METADATA_LBA,
-    SLOT0_LBA,
-    SLOT1_LBA,
-    SLOT_SECTORS,
-)
-
-SECTOR_SIZE = 512
-PAYLOAD_START_LBA = 2048
-STAGE2_SECTORS = 32
-MIN_IMAGE_SECTORS = IMAGE_SECTORS
-# A fresh image's boot metadata sector: version 1, slot 0 active, no
-# pending update, both slots recorded as holding the freshly built kernel
-# (both copies are identical at build time; see `write_boot_metadata`
-# below and boot/stage2.S's `select_kernel_slot`).
-METADATA_MAGIC = b"FOSM"
-# FOSFS reserves one superblock sector plus this many fixed directory
-# sectors (64 entries total, 64 bytes each) before file data begins.
-DIRECTORY_SECTORS = 8
-ENTRY_SIZE = 64
-DATA_START = 1 + DIRECTORY_SECTORS
-GPT_ENTRY_COUNT = 128
+SECTOR = 512
+IMAGE_SECTORS = 96 * 2048          # 96 MiB
+ESP_START = 2048                   # 1 MiB aligned, like every partitioning tool
+ESP_SECTORS = 36 * 2048            # 36 MiB: above FAT32's 65525-cluster floor at 512 B/cluster
+SLOT_SECTORS = 16384               # 8 MiB per kernel slot (abi: SLOT_SECTORS)
+PAYLOAD_START = ESP_START + ESP_SECTORS
+PAYLOAD_SECTORS = 17 * 2048        # metadata sector + two slots, rounded up to 1 MiB
+FOSFS_TYPE_GUID = uuid.UUID("0f6f7362-0000-4f53-8000-000000000004")
+FOSFS_GUID = uuid.UUID("f05b2a00-0000-4f05-8000-000000000004")
+FOSFS_START = PAYLOAD_START + PAYLOAD_SECTORS
+FOSFS_SECTORS = 32 * 2048          # 32 MiB data partition (FOSFS v3, see kernel/src/fosfs.rs)
+GPT_ENTRIES = 128
 GPT_ENTRY_SIZE = 128
-GPT_PRIMARY_HEADER_LBA = 1
-GPT_PRIMARY_ENTRIES_LBA = 2
-GPT_BACKUP_HEADER_LBA = IMAGE_SECTORS - 1
-GPT_BACKUP_ENTRIES_LBA = IMAGE_SECTORS - 33
+GPT_ENTRY_SECTORS = GPT_ENTRIES * GPT_ENTRY_SIZE // SECTOR
+
+ESP_TYPE_GUID = uuid.UUID("C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
+# The fos payload partition type (abi: PAYLOAD_TYPE_GUID).
+PAYLOAD_TYPE_GUID = uuid.UUID("f05b2a01-0000-4f05-8000-0000000000a1")
+PAYLOAD_GUID = uuid.UUID("f05b2a00-0000-4f05-8000-000000000003")
+# Fixed GUIDs so two builds of the same inputs give the same image.
+DISK_GUID = uuid.UUID("f05b2a00-0000-4f05-8000-000000000001")
+ESP_GUID = uuid.UUID("f05b2a00-0000-4f05-8000-000000000002")
 
 
-def valid_name(name: bytes) -> bool:
-    return (
-        0 < len(name) <= 16
-        and all(byte in b"abcdefghijklmnopqrstuvwxyz0123456789._-" for byte in name)
+def crc32(data: bytes) -> int:
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def fat_date_time():
+    # 2026-10-03 12:00:00, fixed for reproducible images.
+    date = ((2026 - 1980) << 9) | (10 << 5) | 3
+    time = (12 << 11)
+    return date, time
+
+
+def short_entry(name83: bytes, attribute: int, cluster: int, size: int) -> bytes:
+    assert len(name83) == 11
+    date, time = fat_date_time()
+    return struct.pack(
+        "<11sBBBHHHHHHHI",
+        name83, attribute, 0, 0, time, date, date, cluster >> 16, time, date, cluster & 0xFFFF, size,
     )
 
 
-def preformat_fosfs(image: bytearray, files: list[tuple[str, bytes]]) -> None:
-    """Writes a ready-to-use FOSFS filesystem into the data partition.
+def build_esp(loader: bytes) -> bytes:
+    """A FAT32 volume of ESP_SECTORS sectors holding /EFI/BOOT/BOOTX64.EFI."""
+    sectors = ESP_SECTORS
+    reserved = 32
+    fats = 2
+    # One sector per cluster; solve for the FAT size.
+    fat_sectors = 1
+    while True:
+        clusters = sectors - reserved - fats * fat_sectors
+        needed = (clusters + 2) * 4 // SECTOR + 1
+        if needed <= fat_sectors:
+            break
+        fat_sectors = needed
+    clusters = sectors - reserved - fats * fat_sectors
+    assert clusters >= 65525, "too few clusters for FAT32"
+    data_start = reserved + fats * fat_sectors
 
-    Lays down the superblock (magic, version, geometry), a flat directory,
-    and contiguous file extents, so a fresh image boots straight into a
-    usable filesystem without requiring a `format` first. See
-    `kernel/src/fosfs.rs` for the on-disk layout this mirrors.
-    """
-    offset = DATA_START_LBA * SECTOR_SIZE
-    superblock = bytearray(SECTOR_SIZE)
-    superblock[:8] = b"FOSFS3\0\0"
-    superblock[8:10] = (3).to_bytes(2, "little")
-    superblock[10:12] = ENTRY_SIZE.to_bytes(2, "little")
-    superblock[12:16] = (1).to_bytes(4, "little")
-    superblock[16:20] = DIRECTORY_SECTORS.to_bytes(4, "little")
-    superblock[20:28] = DATA_START.to_bytes(8, "little")
-    superblock[28:36] = (DATA_SECTORS - DATA_START).to_bytes(8, "little")
-    image[offset:offset + SECTOR_SIZE] = superblock
-    next_sector = DATA_START
+    # --- boot sector, FSInfo, backups ---
+    boot = bytearray(SECTOR)
+    boot[0:3] = b"\xEB\x58\x90"
+    boot[3:11] = b"FOSV2   "
+    struct.pack_into("<HBHBHHBHHHII", boot, 11,
+                     SECTOR, 1, reserved, fats, 0, 0, 0xF8, 0, 63, 255, ESP_START, sectors)
+    struct.pack_into("<IHHIHH12s", boot, 36, fat_sectors, 0, 0, 2, 1, 6, b"\0" * 12)
+    struct.pack_into("<BBBI11s8s", boot, 64, 0x80, 0, 0x29, 0xF05B2A00, b"NO NAME    ", b"FAT32   ")
+    boot[510:512] = b"\x55\xAA"
+    fsinfo = bytearray(SECTOR)
+    struct.pack_into("<I", fsinfo, 0, 0x41615252)
+    struct.pack_into("<I", fsinfo, 484, 0x61417272)
+    # Free cluster count and the next one to try, as a mounting OS would compute them.
+    file_clusters_used = max(1, (len(loader) + SECTOR - 1) // SECTOR)
+    struct.pack_into("<II", fsinfo, 488, clusters - 3 - file_clusters_used, 5 + file_clusters_used)
+    struct.pack_into("<I", fsinfo, 508, 0xAA550000)
+
+    # --- allocation: root = cluster 2, EFI = 3, BOOT = 4, file from 5 ---
+    file_clusters = max(1, (len(loader) + SECTOR - 1) // SECTOR)
+    fat = bytearray(fat_sectors * SECTOR)
+    struct.pack_into("<II", fat, 0, 0x0FFFFFF8, 0x0FFFFFFF)
+    end_of_chain = 0x0FFFFFFF
+    for cluster in (2, 3, 4):
+        struct.pack_into("<I", fat, cluster * 4, end_of_chain)
+    for index in range(file_clusters):
+        cluster = 5 + index
+        struct.pack_into("<I", fat, cluster * 4, cluster + 1 if index + 1 < file_clusters else end_of_chain)
+
+    def directory(entries) -> bytes:
+        return b"".join(entries).ljust(SECTOR, b"\0")
+
+    root = directory([short_entry(b"EFI        ", 0x10, 3, 0)])
+    efi = directory([
+        short_entry(b".          ", 0x10, 3, 0),
+        short_entry(b"..         ", 0x10, 0, 0),
+        short_entry(b"BOOT       ", 0x10, 4, 0),
+    ])
+    boot_dir = directory([
+        short_entry(b".          ", 0x10, 4, 0),
+        short_entry(b"..         ", 0x10, 3, 0),
+        short_entry(b"BOOTX64 EFI", 0x20, 5, len(loader)),
+    ])
+
+    volume = bytearray(sectors * SECTOR)
+    volume[0:SECTOR] = boot
+    volume[SECTOR:2 * SECTOR] = fsinfo
+    volume[6 * SECTOR:7 * SECTOR] = boot
+    volume[7 * SECTOR:8 * SECTOR] = fsinfo
+    for copy in range(fats):
+        start = (reserved + copy * fat_sectors) * SECTOR
+        volume[start:start + len(fat)] = fat
+
+    def put_cluster(cluster: int, data: bytes):
+        offset = (data_start + cluster - 2) * SECTOR
+        volume[offset:offset + len(data)] = data
+
+    put_cluster(2, root)
+    put_cluster(3, efi)
+    put_cluster(4, boot_dir)
+    put_cluster(5, loader.ljust(file_clusters * SECTOR, b"\0"))
+    return bytes(volume)
+
+
+def gpt_header(current_lba, backup_lba, entries_lba, entries_crc, disk_guid=DISK_GUID) -> bytes:
+    header = bytearray(92)
+    header[0:8] = b"EFI PART"
+    struct.pack_into("<IIIIQQQQ", header, 8, 0x00010000, 92, 0, 0,
+                     current_lba, backup_lba, 34, IMAGE_SECTORS - 34)
+    header[56:72] = disk_guid.bytes_le
+    struct.pack_into("<QIII", header, 72, entries_lba, GPT_ENTRIES, GPT_ENTRY_SIZE, entries_crc)
+    struct.pack_into("<I", header, 16, crc32(bytes(header)))
+    return bytes(header).ljust(SECTOR, b"\0")
+
+
+def gpt_entry(type_guid, unique_guid, first, sectors, name) -> bytes:
+    entry = bytearray(GPT_ENTRY_SIZE)
+    entry[0:16] = type_guid.bytes_le
+    entry[16:32] = unique_guid.bytes_le
+    struct.pack_into("<QQQ", entry, 32, first, first + sectors - 1, 0)
+    entry[56:56 + 2 * len(name)] = name.encode("utf-16-le")
+    return bytes(entry)
+
+
+def build_payload(kernel: bytes) -> bytes:
+    """The payload partition: the metadata sector, then kernel slot 0 (and an
+    empty slot 1)."""
+    sectors = (len(kernel) + SECTOR - 1) // SECTOR
+    assert sectors <= SLOT_SECTORS, "the kernel does not fit a slot"
+    partition = bytearray(PAYLOAD_SECTORS * SECTOR)
+    metadata = bytearray(SECTOR)
+    metadata[0:4] = b"FOSM"
+    metadata[4] = 1            # version
+    metadata[5] = 0            # active slot
+    metadata[6] = 0xFF         # no pending slot
+    struct.pack_into("<HH", metadata, 10, sectors, 0)
+    partition[0:SECTOR] = metadata
+    partition[SECTOR:SECTOR + len(kernel)] = kernel
+    return bytes(partition)
+
+
+def build_fosfs(files, label: str = "") -> bytes:
+    """A preformatted FOSFS v3 volume (the same layout as v1's tools/build_image.py):
+    a superblock, eight directory sectors of 64-byte entries, contiguous extents."""
+    directory_sectors, entry_size, data_start = 8, 64, 9
+    volume = bytearray(FOSFS_SECTORS * SECTOR)
+    superblock = bytearray(SECTOR)
+    superblock[0:8] = b"FOSFS3\0\0"
+    struct.pack_into("<HHIIQQ", superblock, 8, 3, entry_size, 1, directory_sectors, data_start, FOSFS_SECTORS - data_start)
+    if label:
+        raw_label = label.encode("ascii")
+        if not (len(raw_label) <= 16 and all(byte in b"abcdefghijklmnopqrstuvwxyz0123456789._-" for byte in raw_label)):
+            raise SystemExit(f"invalid FOSFS label {label!r}")
+        superblock[64:64 + len(raw_label)] = raw_label  # the volume label (see kernel/src/fosfs.rs)
+    volume[0:SECTOR] = superblock
+    next_sector = data_start
     for index, (name, contents) in enumerate(files):
-        name_bytes = name.encode("ascii")
-        if not valid_name(name_bytes):
-            raise ValueError(f"invalid FOSFS name: {name!r}")
-        if index >= DIRECTORY_SECTORS * (SECTOR_SIZE // ENTRY_SIZE):
-            raise ValueError("FOSFS directory cannot contain all requested files")
-        sector_count = (len(contents) + SECTOR_SIZE - 1) // SECTOR_SIZE
-        if next_sector + sector_count > DATA_SECTORS:
-            raise ValueError(f"FOSFS data partition is too small for {name!r}")
-        entry = bytearray(ENTRY_SIZE)
-        entry[0] = 1
-        entry[1] = len(name_bytes)
-        entry[4:12] = next_sector.to_bytes(8, "little")
-        entry[12:20] = len(contents).to_bytes(8, "little")
-        entry[20:28] = sector_count.to_bytes(8, "little")
-        entry[28:28 + len(name_bytes)] = name_bytes
-        directory_offset = offset + SECTOR_SIZE + index * ENTRY_SIZE
-        image[directory_offset:directory_offset + ENTRY_SIZE] = entry
-        file_offset = offset + next_sector * SECTOR_SIZE
-        image[file_offset:file_offset + len(contents)] = contents
-        next_sector += sector_count
+        raw = name.encode("ascii")
+        if not (0 < len(raw) <= 16 and all(byte in b"abcdefghijklmnopqrstuvwxyz0123456789._-" for byte in raw)):
+            raise SystemExit(f"invalid FOSFS name {name!r}")
+        if index >= directory_sectors * SECTOR // entry_size:
+            raise SystemExit("too many FOSFS files")
+        count = (len(contents) + SECTOR - 1) // SECTOR
+        if next_sector + count > FOSFS_SECTORS:
+            raise SystemExit("FOSFS volume full")
+        entry = bytearray(entry_size)
+        entry[0], entry[1] = 1, len(raw)
+        struct.pack_into("<QQQ", entry, 4, next_sector, len(contents), count)
+        entry[28:28 + len(raw)] = raw
+        at = SECTOR + index * entry_size
+        volume[at:at + entry_size] = entry
+        volume[next_sector * SECTOR:next_sector * SECTOR + len(contents)] = contents
+        next_sector += count
+    return bytes(volume)
 
 
-def pad(data: bytes, sectors: int) -> bytes:
-    """Right-pads `data` with zero bytes to fill exactly `sectors` sectors."""
-    if len(data) > sectors * SECTOR_SIZE:
-        raise ValueError(f"artifact exceeds its {sectors}-sector allocation")
-    return data.ljust(sectors * SECTOR_SIZE, b"\0")
+def write_gpt(image: bytearray, disk_guid: uuid.UUID, payload_guid: uuid.UUID, fosfs_guid: uuid.UUID) -> None:
+    """Writes both copies of the GPT (headers, entry arrays, CRCs) into `image`."""
+    entries = (gpt_entry(ESP_TYPE_GUID, ESP_GUID, ESP_START, ESP_SECTORS, "EFI System")
+               + gpt_entry(PAYLOAD_TYPE_GUID, payload_guid, PAYLOAD_START, PAYLOAD_SECTORS, "fos payload")
+               + gpt_entry(FOSFS_TYPE_GUID, fosfs_guid, FOSFS_START, FOSFS_SECTORS, "FOSFS data")
+               ).ljust(GPT_ENTRIES * GPT_ENTRY_SIZE, b"\0")
+    entries_crc = crc32(entries)
+    image[SECTOR:2 * SECTOR] = gpt_header(1, IMAGE_SECTORS - 1, 2, entries_crc, disk_guid)
+    image[2 * SECTOR:(2 + GPT_ENTRY_SECTORS) * SECTOR] = entries
+    backup_entries_lba = IMAGE_SECTORS - 1 - GPT_ENTRY_SECTORS
+    image[backup_entries_lba * SECTOR:(backup_entries_lba + GPT_ENTRY_SECTORS) * SECTOR] = entries
+    image[(IMAGE_SECTORS - 1) * SECTOR:] = gpt_header(IMAGE_SECTORS - 1, 1, backup_entries_lba, entries_crc, disk_guid)
 
 
-def write_boot_metadata(image: bytearray, kernel_sectors: int) -> None:
-    """Writes the one-sector A/B kernel-slot metadata boot/stage2.S reads.
+def randomize_guids(image: bytearray) -> uuid.UUID:
+    """Gives a finished image fresh random GUIDs (the disk, the payload partition and the FOSFS
+    partition), rewriting both GPT copies and their CRCs; returns the payload partition's.
 
-    A fresh image always boots from slot 0 with no pending update; both
-    slots hold an identical copy of the freshly built kernel (see
-    `main`), so a stage2 fallback to slot 1 (e.g. after a corrupted
-    metadata sector defaults elsewhere, or once a real update has been
-    tried and reverted) still finds a bootable kernel. Byte layout must
-    exactly match `select_kernel_slot` in boot/stage2.S and
-    `kernel/src/debug.rs`'s `SlotMetadata`.
-    """
-    metadata = bytearray(SECTOR_SIZE)
-    metadata[0:4] = METADATA_MAGIC
-    metadata[4] = 1  # version
-    metadata[5] = 0  # active_slot
-    metadata[6] = 0xFF  # pending_slot (none)
-    metadata[7] = 0  # attempted
-    metadata[8] = 0  # confirmed
-    metadata[10:12] = kernel_sectors.to_bytes(2, "little")  # slot0_sectors
-    metadata[12:14] = kernel_sectors.to_bytes(2, "little")  # slot1_sectors
-    offset = METADATA_LBA * SECTOR_SIZE
-    image[offset:offset + SECTOR_SIZE] = metadata
+    The kernel finds the disk it booted from by the payload partition's GUID, so two sticks
+    written from the same image (identical GUIDs) could not be told apart."""
+    payload_guid = uuid.uuid4()
+    write_gpt(image, uuid.uuid4(), payload_guid, uuid.uuid4())
+    return payload_guid
 
 
-def guid_bytes(text: str) -> bytes:
-    """Encode a deterministic GPT GUID in the on-disk mixed-endian form."""
-    words = text.split("-")
-    if len(words) != 5:
-        raise ValueError(f"invalid GUID {text!r}")
-    first = int(words[0], 16).to_bytes(4, "little")
-    second = int(words[1], 16).to_bytes(2, "little")
-    third = int(words[2], 16).to_bytes(2, "little")
-    return first + second + third + bytes.fromhex(words[3] + words[4])
+def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload_guid: uuid.UUID = PAYLOAD_GUID) -> bytes:
+    image = bytearray(IMAGE_SECTORS * SECTOR)
+    # Protective MBR: one partition of type 0xEE covering the disk.
+    mbr = bytearray(SECTOR)
+    struct.pack_into("<B3sB3sII", mbr, 446, 0, b"\x00\x02\x00", 0xEE, b"\xFF\xFF\xFF", 1, IMAGE_SECTORS - 1)
+    mbr[510:512] = b"\x55\xAA"
+    image[0:SECTOR] = mbr
+
+    write_gpt(image, DISK_GUID, payload_guid, FOSFS_GUID)
+
+    esp = build_esp(loader)
+    image[ESP_START * SECTOR:ESP_START * SECTOR + len(esp)] = esp
+    payload = build_payload(kernel)
+    image[PAYLOAD_START * SECTOR:PAYLOAD_START * SECTOR + len(payload)] = payload
+    fosfs = build_fosfs(files, label)
+    image[FOSFS_START * SECTOR:FOSFS_START * SECTOR + len(fosfs)] = fosfs
+    return bytes(image)
 
 
-def write_gpt(image: bytearray, payload_sectors: int) -> None:
-    """Write a protective MBR and primary/backup GPT metadata."""
-    image[446:462] = bytes([0, 0, 2, 0, 0xEE, 0xFF, 0xFF, 0xFF]) + (
-        1
-    ).to_bytes(4, "little") + min(IMAGE_SECTORS - 1, 0xFFFFFFFF).to_bytes(4, "little")
-    image[462:510] = b"\0" * 48
-
-    entries = bytearray(GPT_ENTRY_COUNT * GPT_ENTRY_SIZE)
-    fosfs_type = guid_bytes("0f6f7362-0000-4f53-8000-000000000004")
-    payload_type = guid_bytes("0f6f7362-0000-4f53-8000-000000000001")
-    payload_guid = guid_bytes("0f6f7362-0000-4f53-8000-000000000002")
-    data_guid = guid_bytes("0f6f7362-0000-4f53-8000-000000000003")
-    entries[0:16] = payload_type
-    entries[16:32] = payload_guid
-    struct.pack_into("<QQ", entries, 32, PAYLOAD_START_LBA, PAYLOAD_START_LBA + payload_sectors - 1)
-    entries[56:56 + len("FOS payload".encode("utf-16le"))] = "FOS payload".encode("utf-16le")
-    entries[128:144] = fosfs_type
-    entries[144:160] = data_guid
-    struct.pack_into(
-        "<QQ",
-        entries,
-        160,
-        DATA_START_LBA,
-        DATA_START_LBA + DATA_SECTORS - 1,
-    )
-    entries[184:184 + len("FOSFS data".encode("utf-16le"))] = "FOSFS data".encode("utf-16le")
-
-    def header(current: int, backup: int, entries_lba: int) -> bytes:
-        raw = bytearray(SECTOR_SIZE)
-        raw[:8] = b"EFI PART"
-        struct.pack_into("<I", raw, 8, 0x00010000)
-        struct.pack_into("<I", raw, 12, 92)
-        struct.pack_into("<Q", raw, 24, current)
-        struct.pack_into("<Q", raw, 32, backup)
-        struct.pack_into("<QQ", raw, 40, 34, IMAGE_SECTORS - 34)
-        raw[56:72] = guid_bytes("0f6f7362-0000-4f53-8000-000000000010")
-        struct.pack_into("<Q", raw, 72, entries_lba)
-        struct.pack_into("<I", raw, 80, GPT_ENTRY_COUNT)
-        struct.pack_into("<I", raw, 84, GPT_ENTRY_SIZE)
-        struct.pack_into("<I", raw, 88, zlib.crc32(entries) & 0xFFFFFFFF)
-        crc = zlib.crc32(raw[:92]) & 0xFFFFFFFF
-        struct.pack_into("<I", raw, 16, crc)
-        return bytes(raw)
-
-    primary_entries = GPT_PRIMARY_ENTRIES_LBA * SECTOR_SIZE
-    backup_entries = GPT_BACKUP_ENTRIES_LBA * SECTOR_SIZE
-    image[primary_entries:primary_entries + len(entries)] = entries
-    image[backup_entries:backup_entries + len(entries)] = entries
-    image[GPT_PRIMARY_HEADER_LBA * SECTOR_SIZE:(GPT_PRIMARY_HEADER_LBA + 1) * SECTOR_SIZE] = header(
-        GPT_PRIMARY_HEADER_LBA, GPT_BACKUP_HEADER_LBA, GPT_PRIMARY_ENTRIES_LBA
-    )
-    image[GPT_BACKUP_HEADER_LBA * SECTOR_SIZE:(GPT_BACKUP_HEADER_LBA + 1) * SECTOR_SIZE] = header(
-        GPT_BACKUP_HEADER_LBA, GPT_PRIMARY_HEADER_LBA, GPT_BACKUP_ENTRIES_LBA
-    )
-
-
-def main() -> None:
-    parser = ArgumentParser()
-    parser.add_argument("--stage1", type=Path, required=True)
-    parser.add_argument("--stage2", type=Path, required=True)
-    parser.add_argument("--kernel", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--file",
-        nargs=2,
-        action="append",
-        default=[],
-        metavar=("NAME", "PATH"),
-        help="preload one flat FOSFS file from PATH",
-    )
-    args = parser.parse_args()
-
-    stage1 = args.stage1.read_bytes()
-    if len(stage1) != SECTOR_SIZE or stage1[510:] != b"\x55\xaa":
-        raise SystemExit("stage 1 must be exactly one boot-signature-bearing sector")
-    stage2 = pad(args.stage2.read_bytes(), STAGE2_SECTORS)
-    kernel = args.kernel.read_bytes()
-    kernel_sectors = (len(kernel) + SECTOR_SIZE - 1) // SECTOR_SIZE
-    if not 0 < kernel_sectors <= SLOT_SECTORS:
-        raise SystemExit(f"kernel must occupy between 1 and {SLOT_SECTORS} sectors")
-
-    image = bytearray(MIN_IMAGE_SECTORS * SECTOR_SIZE)
-    image[:SECTOR_SIZE] = stage1
-    # The payload partition always reserves the full metadata-sector +
-    # two-slot region, regardless of this build's actual kernel size, so a
-    # later network kernel update (which may be a different size) never
-    # needs to grow the partition itself -- only the metadata sector's
-    # per-slot sector counts change.
-    payload_sectors = STAGE2_SECTORS + 1 + 2 * SLOT_SECTORS
-    write_gpt(image, payload_sectors)
-    image[PAYLOAD_START_LBA * SECTOR_SIZE:(PAYLOAD_START_LBA + STAGE2_SECTORS) * SECTOR_SIZE] = stage2
-    write_boot_metadata(image, kernel_sectors)
-    for slot_lba in (SLOT0_LBA, SLOT1_LBA):
-        slot_start = slot_lba * SECTOR_SIZE
-        image[slot_start:slot_start + len(kernel)] = kernel
-    readme = b"Welcome to FOSFS.\nUse ls, cat readme.txt, and write NAME TEXT.\n"
-    files = [("readme.txt", readme)]
-    files.extend((name, Path(path).read_bytes()) for name, path in args.file)
-    if len({name for name, _ in files}) != len(files):
-        raise SystemExit("FOSFS file names must be unique")
-    try:
-        preformat_fosfs(image, files)
-    except (OSError, ValueError) as error:
-        raise SystemExit(str(error)) from error
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_bytes(image)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--loader", required=True, type=Path, help="the loader's PE image (BOOTX64.EFI)")
+    parser.add_argument("--kernel", required=True, type=Path, help="the kernel ELF64, written to slot 0")
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--file", action="append", default=[], metavar="NAME=PATH", help="preload a FOSFS file (repeatable)")
+    parser.add_argument("--label", default="", help="the FOSFS volume label (lowercase name, up to 16 characters)")
+    parser.add_argument("--payload-guid", type=uuid.UUID, default=PAYLOAD_GUID,
+                        help="unique GUID of the payload partition; the kernel finds its boot disk by it, so two disks "
+                             "built from the same image need different ones")
+    arguments = parser.parse_args()
+    arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    files = [("readme.txt", b"Welcome to FOSFS on fos v2.\nTry: ls, cat readme.txt, write NAME TEXT.\n")]
+    for spec in arguments.file:
+        name, _, path = spec.partition("=")
+        files = [item for item in files if item[0] != name] + [(name, Path(path).read_bytes())]
+    arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files, arguments.label, arguments.payload_guid))
+    print(f"wrote {arguments.output}")
 
 
 if __name__ == "__main__":

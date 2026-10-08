@@ -1,13 +1,7 @@
 [package]
-name = "fos-kernel"
+name = "fos-v2-kernel"
 version = "0.1.0"
 edition = "2024"
-
-[features]
-legacy-unsafe-memory = []
-page-protection-test = []
-stack-guard-test = []
-nic-watchdog-test = []
 
 [profile.dev]
 panic = "abort"
@@ -17,4 +11,16 @@ panic = "abort"
 codegen-units = 1
 lto = true
 opt-level = "z"
-strip = "symbols"
+
+[dependencies]
+fos-v2-abi = { path = "../abi" }
+fos-v2-fat = { path = "../fat" }
+
+# Deliberate-fault builds for the exception tests (make test-v2-faults): each one
+# provokes one kind of fault right after boot so the report can be checked.
+[features]
+fault-null = []
+fault-text-write = []
+fault-nx = []
+fault-stack = []
+fault-ud = []

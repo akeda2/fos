@@ -23,12 +23,12 @@ const ETHERNET_HEADER_LEN: usize = 14;
 const BROADCAST_MAC: [u8; 6] = [0xff; 6];
 
 type Putc = extern "C" fn(u32);
-type ShouldAbort = extern "C" fn() -> u32;
-type NicCount = extern "C" fn() -> u32;
-type NicMacAt = extern "C" fn(u32, u32) -> u32;
-type NicSendAt = extern "C" fn(u32, u32, u32) -> u32;
-type NicReceiveAt = extern "C" fn(u32, u32, u32) -> u32;
-type NicSetPromiscuousAt = extern "C" fn(u32, u32) -> u32;
+type ShouldAbort = fn() -> u32;
+type NicCount = fn() -> u32;
+type NicMacAt = fn(u32, usize) -> u32;
+type NicSendAt = fn(u32, usize, u32) -> u32;
+type NicReceiveAt = fn(u32, usize, u32) -> u32;
+type NicSetPromiscuousAt = fn(u32, u32) -> u32;
 
 #[derive(Clone, Copy)]
 struct LearnedMac {
@@ -204,7 +204,7 @@ fn forward_frame(
         if egress == ingress || learned.is_some_and(|port| port != egress) {
             continue;
         }
-        if nic_send_at(ports[egress], frame.as_ptr() as u32, frame.len() as u32) != 0 {
+        if nic_send_at(ports[egress], frame.as_ptr() as usize, frame.len() as u32) != 0 {
             *forwarded += 1;
         } else {
             *dropped += 1;
@@ -213,45 +213,12 @@ fn forward_frame(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn tape_main(
-    putc: Putc,
-    should_abort: ShouldAbort,
-    _alloc: extern "C" fn(u32) -> u32,
-    _free: extern "C" fn(u32, u32),
-    _read_key: extern "C" fn() -> u32,
-    args_ptr: u32,
-    args_len: u32,
-    nic_mac: extern "C" fn(u32) -> u32,
-    _nic_send: extern "C" fn(u32, u32) -> u32,
-    _nic_receive: extern "C" fn(u32, u32) -> u32,
-    nic_max_frame_len: extern "C" fn() -> u32,
-    _ticks: extern "C" fn() -> u64,
-    nic_count: NicCount,
-    nic_mac_at: NicMacAt,
-    nic_send_at: NicSendAt,
-    nic_receive_at: NicReceiveAt,
-    nic_set_promiscuous_at: NicSetPromiscuousAt,
-    _terminal_position: extern "C" fn() -> u32,
-    _fs_file_length: extern "C" fn(u32, u32, u32) -> u32,
-    _fs_read: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
-    _fs_write: extern "C" fn(u32, u32, u32, u32) -> u32,
-    _fs_remove: extern "C" fn(u32, u32) -> u32,
-    _audio_sample_rate: extern "C" fn() -> u32,
-    _audio_channels_and_bits: extern "C" fn() -> u32,
-    _audio_submit: extern "C" fn(u32, u32) -> u32,
-    _audio_capture: extern "C" fn(u32, u32) -> u32,
-    _audio_count: extern "C" fn() -> u32,
-    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_sample_rate: extern "C" fn() -> u32,
-    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
-    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    // Sleeps until the next interrupt; call after a pass that found no work.
-    wait_for_event: extern "C" fn(),
-) {
+pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
+    tape_rt::init(api);
+    use tape_rt::compat::*;
+    let putc = api.putc;
+    let args = tape_rt::args();
+    let (args_ptr, args_len) = (args.as_ptr() as usize, args.len() as u32);
     let nic_total = nic_count() as usize;
     if nic_total < 2 {
         print_bytes(putc, b"Bridge needs at least two initialized NICs.\n");
@@ -282,13 +249,13 @@ pub extern "C" fn tape_main(
 
     let mut macs = [[0u8; 6]; MAX_PORTS];
     for index in 0..port_count {
-        if nic_mac_at(ports[index], macs[index].as_mut_ptr() as u32) == 0 {
+        if nic_mac_at(ports[index], macs[index].as_mut_ptr() as usize) == 0 {
             print_bytes(putc, b"Bridge cannot start: failed to read a selected NIC MAC.\n");
             return;
         }
     }
     let mut default_mac = [0u8; 6];
-    if nic_mac(default_mac.as_mut_ptr() as u32) == 0 {
+    if nic_mac(default_mac.as_mut_ptr() as usize) == 0 {
         print_bytes(putc, b"Bridge cannot start: no active NIC is available.\n");
         return;
     }
@@ -318,7 +285,7 @@ pub extern "C" fn tape_main(
             }
             let received = nic_receive_at(
                 ports[ingress],
-                frame.as_mut_ptr() as u32,
+                frame.as_mut_ptr() as usize,
                 max_frame_len as u32,
             ) as usize;
             if received < ETHERNET_HEADER_LEN {

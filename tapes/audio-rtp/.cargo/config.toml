@@ -1,8 +1,0 @@
-[build]
-# Keep the same default as the other Rust tapes.  Host tests explicitly pass
-# `--target x86_64-unknown-linux-gnu`; freestanding builds use the nightly
-# `-Z build-std` flags from the repository's tape workflow.
-target = "../../targets/i686-fos.json"
-
-[target.i686-fos]
-rustflags = ["-C", "link-arg=-Tlinker.ld"]

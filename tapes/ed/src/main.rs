@@ -42,64 +42,27 @@ static mut EDITOR_BUFFER: [u8; EDITOR_MIN_CAPACITY as usize] =
     [0; EDITOR_MIN_CAPACITY as usize];
 
 type Putc = extern "C" fn(u32);
-type ReadKey = extern "C" fn() -> u32;
-type Alloc = extern "C" fn(u32) -> u32;
-type Free = extern "C" fn(u32, u32);
-type FsFileLength = extern "C" fn(u32, u32, u32) -> u32;
-type FsRead = extern "C" fn(u32, u32, u32, u32, u32) -> u32;
-type FsWrite = extern "C" fn(u32, u32, u32, u32) -> u32;
+type ReadKey = fn() -> u32;
+type FsWrite = fn(usize, u32, usize, u32) -> u32;
 
 #[unsafe(no_mangle)]
-pub extern "C" fn tape_main(
-    putc: Putc,
-    _should_abort: extern "C" fn() -> u32,
-    alloc: Alloc,
-    free: Free,
-    read_key: ReadKey,
-    args_ptr: u32,
-    args_len: u32,
-    _nic_mac: extern "C" fn(u32) -> u32,
-    _nic_send: extern "C" fn(u32, u32) -> u32,
-    _nic_receive: extern "C" fn(u32, u32) -> u32,
-    _nic_max_frame_len: extern "C" fn() -> u32,
-    _ticks: extern "C" fn() -> u64,
-    _nic_count: extern "C" fn() -> u32,
-    _nic_mac_at: extern "C" fn(u32, u32) -> u32,
-    _nic_send_at: extern "C" fn(u32, u32, u32) -> u32,
-    _nic_receive_at: extern "C" fn(u32, u32, u32) -> u32,
-    _nic_set_promiscuous_at: extern "C" fn(u32, u32) -> u32,
-    _terminal_position: extern "C" fn() -> u32,
-    fs_file_length: FsFileLength,
-    fs_read: FsRead,
-    fs_write: FsWrite,
-    _fs_remove: extern "C" fn(u32, u32) -> u32,
-    _audio_sample_rate: extern "C" fn() -> u32,
-    _audio_channels_and_bits: extern "C" fn() -> u32,
-    _audio_submit: extern "C" fn(u32, u32) -> u32,
-    _audio_capture: extern "C" fn(u32, u32) -> u32,
-    _audio_count: extern "C" fn() -> u32,
-    _audio_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    _audio_submit_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_at: extern "C" fn(u32, u32, u32) -> u32,
-    _audio_capture_sample_rate: extern "C" fn() -> u32,
-    _audio_capture_channels_and_bits: extern "C" fn() -> u32,
-    _audio_capture_sample_rate_at: extern "C" fn(u32) -> u32,
-    _audio_capture_channels_and_bits_at: extern "C" fn(u32) -> u32,
-    // Sleeps until the next interrupt; call after a pass that found no work.
-    wait_for_event: extern "C" fn(),
-    // Chooses whether `read_key` erases on Backspace itself (see `tape_rt::set_raw_keys`).
-    set_input_mode: extern "C" fn(u32),
-) {
-    tape_rt::set_wait_hook(wait_for_event);
-    tape_rt::set_input_mode_hook(set_input_mode);
+pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
+    tape_rt::init(api);
+    let putc: Putc = api.putc;
+    let read_key: ReadKey = tape_rt::compat::read_key;
+    let fs_file_length = tape_rt::compat::fs_file_length;
+    let fs_read = tape_rt::compat::fs_read;
+    let fs_write: FsWrite = tape_rt::compat::fs_write;
+    let alloc = tape_rt::compat::alloc;
+    let free = tape_rt::compat::free;
+    let (args_ptr, args_len) = (api.args as usize, api.args_len as u32);
     let Some(name) = parse_filename(args_ptr, args_len) else {
-        print_bytes(putc, b"Usage: tape run ed NAME (or diskN/NAME for a secondary disk)\n");
+        print_bytes(putc, b"Usage: tape run ed NAME (or diskN/NAME, @LABEL/NAME for another volume)\n");
         return;
     };
 
     let mut file_length = 0u64;
-    let length_status = fs_file_length(name.as_ptr() as u32, name.len() as u32, &mut file_length as *mut u64 as u32);
+    let length_status = fs_file_length(name.as_ptr() as usize, name.len() as u32, &mut file_length as *mut u64 as usize);
     if length_status != FS_OK && length_status != FS_NOT_FOUND {
         print_bytes(putc, b"ed: cannot inspect file (status ");
         print_u32(putc, length_status);
@@ -117,7 +80,7 @@ pub extern "C" fn tape_main(
         .saturating_mul(u64::from(EDITOR_MIN_CAPACITY)) as u32;
     let uses_static_buffer = capacity == EDITOR_MIN_CAPACITY;
     let address = if uses_static_buffer {
-        core::ptr::addr_of_mut!(EDITOR_BUFFER) as *mut u8 as u32
+        core::ptr::addr_of_mut!(EDITOR_BUFFER) as *mut u8 as usize
     } else {
         alloc(capacity)
     };
@@ -134,11 +97,11 @@ pub extern "C" fn tape_main(
         if length_status == FS_OK {
             let mut read_length = 0u32;
             let status = fs_read(
-                name.as_ptr() as u32,
+                name.as_ptr() as usize,
                 name.len() as u32,
                 address,
                 capacity,
-                &mut read_length as *mut u32 as u32,
+                &mut read_length as *mut u32 as usize,
             );
             if status != FS_OK {
                 print_bytes(putc, b"ed: cannot read file (status ");
@@ -178,7 +141,7 @@ pub extern "C" fn tape_main(
     }
 }
 
-fn parse_filename<'a>(args_ptr: u32, args_len: u32) -> Option<&'a [u8]> {
+fn parse_filename<'a>(args_ptr: usize, args_len: u32) -> Option<&'a [u8]> {
     if args_ptr == 0 || args_len == 0 {
         return None;
     }
@@ -219,6 +182,9 @@ fn valid_reference(reference: &[u8]) -> bool {
 /// without knowing which disks are actually attached (the kernel rejects an
 /// unattached or malformed selector once the reference reaches it).
 fn is_disk_selector(word: &[u8]) -> bool {
+    if let Some(label) = word.strip_prefix(b"@") {
+        return valid_name(label); // a volume label has the same shape as a file name
+    }
     match word.strip_prefix(b"disk") {
         Some(suffix) => !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit),
         None => false,
@@ -394,8 +360,12 @@ fn read_line(putc: Putc, read_key: ReadKey, output: &mut [u8]) -> Option<usize> 
                 putc(u32::from(b'\n'));
                 return Some(length);
             }
-            8 => {
-                length = length.saturating_sub(1);
+            8 | 127 => {
+                // v1's kernel erased the character on screen itself; on v2 the tape does.
+                if length > 0 {
+                    length -= 1;
+                    print_bytes(putc, b"\x08 \x08");
+                }
             }
             32..=126 => {
                 if length < output.len() {
@@ -706,9 +676,9 @@ fn wait_for_more(putc: Putc, read_key: ReadKey) -> MoreAction {
 
 fn save(putc: Putc, name: &[u8], text: &TextBuffer<'_>, fs_write: FsWrite) -> bool {
     let status = fs_write(
-        name.as_ptr() as u32,
+        name.as_ptr() as usize,
         name.len() as u32,
-        text.as_bytes().as_ptr() as u32,
+        text.as_bytes().as_ptr() as usize,
         text.len() as u32,
     );
     if status == FS_OK {

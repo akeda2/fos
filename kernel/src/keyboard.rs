@@ -1,493 +1,137 @@
-use crate::arch::x86::{inb, outb};
-use crate::interrupts;
-use core::arch::asm;
-use core::sync::atomic::{AtomicU32, Ordering};
+//! Local keyboards. Every source (PS/2 here, USB HID later) pushes ASCII into one
+//! small queue that the main loop drains into the shell.
+//!
+//! A keyboard is never a boot dependency: each source reports what it found and a
+//! missing or silent one is simply not there. A machine with no keyboard at all
+//! still boots, and is driven over the network.
+//!
+//! PS/2: the 8042 controller sits behind ports 0x60 (data) and 0x64 (status/command).
+//! It is switched into "translate to scancode set 1" mode so one decoder suffices, and
+//! its IRQ 1 is routed through the I/O APIC to `KEYBOARD_VECTOR`.
 
-const DATA_PORT: u16 = 0x60;
-const STATUS_PORT: u16 = 0x64;
-const STATUS_OUTPUT_FULL: u8 = 1;
-const STATUS_INPUT_FULL: u8 = 2;
-const KEYBOARD_ACK: u8 = 0xfa;
-const KEYBOARD_ENABLE_SCANNING: u8 = 0xf4;
-const KEYBOARD_SET_LEDS: u8 = 0xed;
-const CAPS_LOCK_LED: u8 = 0x04;
-const CONTROLLER_READ_COMMAND_BYTE: u8 = 0x20;
-const CONTROLLER_WRITE_COMMAND_BYTE: u8 = 0x60;
-const CONTROLLER_DISABLE_KEYBOARD: u8 = 0xad;
-const CONTROLLER_ENABLE_KEYBOARD: u8 = 0xae;
-const CONTROLLER_KEYBOARD_CLOCK_DISABLE: u8 = 1 << 4;
-const CONTROLLER_KEYBOARD_IRQ: u8 = 1 << 0;
-const CONTROLLER_TRANSLATE_SET_2: u8 = 1 << 6;
-static BIOS_RESTORE_FAILURES: AtomicU32 = AtomicU32::new(0);
+use core::sync::atomic::{AtomicUsize, Ordering};
+use fos_v2_abi::keymap::Set1Decoder;
 
-/// Scan Code Set 1 make codes for the function keys recognized as "leave
-/// this mode" keys throughout `shell.rs` (`term`, `term net`, `nic sniff`,
-/// `chat`, `tape load net`, ...). Function keys sit at the same physical
-/// position and produce the same scancode on every keyboard layout this
-/// project targets (US, UK, Nordic, ...): unlike letter/symbol keys, they
-/// are never reached through Shift or AltGr. F12 was the original choice
-/// for exactly that reason, but some terminal emulators and KVMs
-/// intercept F12 themselves (for their own menus/binds) before it ever
-/// reaches a guest, so several other function keys are recognized too --
-/// whichever one actually reaches the guest works, with no need to
-/// remember which; F1/F2/F3/F5/F9/F11 are left free since some terminals
-/// use those for other emulator-level bindings, and F12 stays first in
-/// this list since it remains the documented, most-mentioned choice.
-const ESCAPE_SCANCODES: [u8; 6] = [
-    0x58, // F12
-    0x3e, // F4
-    0x40, // F6
-    0x41, // F7
-    0x42, // F8
-    0x44, // F10
-];
+use crate::{cpu, ioapic};
 
-/// Scan Code Set 1 make code for F2, used only by `shell::term_printer`'s
-/// line-buffered typing loop to discard the not-yet-printed current line
-/// (see that function's doc comment for why this needs its own key,
-/// distinct from ordinary backspace). F2 is one of the function keys this
-/// project deliberately leaves free of any other meaning (see the comment
-/// on `ESCAPE_SCANCODES` above), and is layout-independent for the same
-/// reason F12 is.
-const KILL_LINE_SCANCODE: u8 = 0x3c;
+pub const KEYBOARD_VECTOR: u8 = 0x41;
 
-/// One decoded keyboard event as seen by `term`'s raw pass-through loop
-/// (and `term_printer`'s own typing loop, which additionally recognizes
-/// `KillLine`).
-pub enum KeyEvent {
-    /// An ordinary key was pressed; forward this byte to the remote end.
-    Char(u8),
-    /// One of `ESCAPE_SCANCODES` was pressed: stop forwarding and return
-    /// to the fos shell.
-    Escape,
-    /// F2 was pressed: `term_printer` discards its current, not-yet-sent
-    /// input line. Ignored by every other `poll_term_event` caller.
-    KillLine,
+const DATA: u16 = 0x60;
+const STATUS: u16 = 0x64;
+const OUTPUT_FULL: u8 = 1 << 0;
+const INPUT_FULL: u8 = 1 << 1;
+
+const CAPACITY: usize = 64;
+static mut QUEUE: [u8; CAPACITY] = [0; CAPACITY];
+static HEAD: AtomicUsize = AtomicUsize::new(0); // next slot to write (interrupt side)
+static TAIL: AtomicUsize = AtomicUsize::new(0); // next slot to read (main loop)
+static mut DECODER: Set1Decoder = Set1Decoder::new();
+static mut BYTES_SEEN: u64 = 0;
+
+/// Adds a key to the queue (called from interrupt context and by other key sources).
+pub fn push(byte: u8) {
+    let head = HEAD.load(Ordering::Relaxed);
+    let next = (head + 1) % CAPACITY;
+    if next == TAIL.load(Ordering::Acquire) {
+        return; // full: drop the key
+    }
+    unsafe { (*core::ptr::addr_of_mut!(QUEUE))[head] = byte };
+    HEAD.store(next, Ordering::Release);
 }
 
-pub struct Keyboard {
-    left_shift: bool,
-    right_shift: bool,
-    caps_lock: bool,
+/// The next typed byte, if any: the local keyboards' queue first, then the serial port (so a
+/// machine with only a serial console is driven the same way).
+pub fn pop() -> Option<u8> {
+    pop_keyboard().or_else(crate::serial::read_byte)
 }
 
-/// Shift-key decoding state for scancodes drained from the IRQ1 queue.
-/// Single-threaded and only ever touched by `pop_char`, which callers use
-/// from the main shell loop (not from interrupt context).
-static mut DECODER: Keyboard = Keyboard {
-    left_shift: false,
-    right_shift: false,
-    caps_lock: false,
-};
-const PENDING_KEY_BYTES_LEN: usize = 8;
-static mut PENDING_KEY_BYTES: [u8; PENDING_KEY_BYTES_LEN] = [0; PENDING_KEY_BYTES_LEN];
-static mut PENDING_KEY_HEAD: usize = 0;
-static mut PENDING_KEY_LEN: usize = 0;
-static mut EXTENDED_SCANCODE: bool = false;
-
-impl Keyboard {
-    /// Enables scanning on the PS/2 keyboard. Must run before
-    /// `interrupts::initialize` unmasks IRQ1, since this handshake polls the
-    /// controller directly rather than going through the interrupt queue.
-    pub fn initialize() -> Option<()> {
-        send_keyboard_byte(KEYBOARD_ENABLE_SCANNING).then_some(())
-    }
-
-    fn decode_scancode(&mut self, scancode: u8) -> Option<u8> {
-        let released = scancode & 0x80 != 0;
-        let code = scancode & 0x7f;
-        match code {
-            0x2a => self.left_shift = !released,
-            0x36 => self.right_shift = !released,
-            0x3a if !released => {
-                self.caps_lock = !self.caps_lock;
-                set_caps_lock_led(self.caps_lock);
-            }
-
-            _ if released => {}
-            0x1c => return Some(b'\n'),
-            0x0e => return Some(8),
-            0x0f => return Some(b'\t'),
-            _ => {
-                return keycode_to_ascii(code, self.left_shift || self.right_shift, self.caps_lock);
-            }
-        }
-        None
-    }
-}
-
-/// Reasserts the shell's Scan Code Set 1 *output* contract after a BIOS disk
-/// call.
-///
-/// Physical PS/2 keyboards normally emit Set 2, while the 8042 translates it
-/// to the Set 1 bytes the decoder below expects. USB keyboards using firmware
-/// legacy emulation can have that controller translation (or its keyboard IRQ
-/// enable bit) changed by BIOS code while it services `INT 13h`. Restore those
-/// controller bits rather than changing the keyboard's own scan set: doing so
-/// preserves the standard Set 2 -> Set 1 path on both physical 8042s and
-/// QEMU. `disk` calls this with interrupts disabled after the protected-mode
-/// IDT/PIC are back; controller replies are polled and cannot be mistaken for
-/// queued input.
-pub fn restore_after_bios_disk_call() {
-    if !restore_controller_translation() {
-        BIOS_RESTORE_FAILURES.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Returns failed post-BIOS keyboard restoration attempts for `irqstat`.
-pub fn bios_restore_failures() -> u32 {
-    BIOS_RESTORE_FAILURES.load(Ordering::Relaxed)
-}
-
-fn restore_controller_translation() -> bool {
-    // Hold the keyboard interface off (command 0xAD) while the controller
-    // command exchange below runs. Without this a real keystroke can reach the
-    // output buffer between "read command byte" (0x20) and its reply: the
-    // scancode would then be read *as* the command byte and written back with
-    // the flags ORed in, corrupting the controller configuration (found with
-    // QEMU's ps2/pckbd trace: 0x9c, an Enter break code, came back as 0xdd,
-    // which also set the keyboard-clock-disable bit). A held-off keyboard
-    // keeps its byte in its own buffer; 0xAE below releases it.
-    if !wait_for_input_empty() {
-        return false;
-    }
-    unsafe { outb(STATUS_PORT, CONTROLLER_DISABLE_KEYBOARD) };
-    // A BIOS handler can leave a controller reply or a stale make/break byte
-    // pending. Drop it before waiting for the acknowledgements below, since
-    // treating it as an ACK would desynchronize the command exchange.
-    while unsafe { inb(STATUS_PORT) } & STATUS_OUTPUT_FULL != 0 {
-        let _ = unsafe { inb(DATA_PORT) };
-    }
-    let restored = match read_controller_command_byte() {
-        // Writing the byte also clears the clock-disable bit 0xAD set, so the
-        // keyboard can talk again for the 0xF4 exchange in `send_keyboard_byte`.
-        Some(command_byte) => {
-            write_controller_command_byte(
-                (command_byte & !CONTROLLER_KEYBOARD_CLOCK_DISABLE)
-                    | CONTROLLER_KEYBOARD_IRQ
-                    | CONTROLLER_TRANSLATE_SET_2,
-            ) && send_keyboard_byte(KEYBOARD_ENABLE_SCANNING)
-        }
-        None => false,
-    };
-    if wait_for_input_empty() {
-        unsafe { outb(STATUS_PORT, CONTROLLER_ENABLE_KEYBOARD) };
-    }
-    restored
-}
-
-fn read_controller_command_byte() -> Option<u8> {
-    if !wait_for_input_empty() {
+fn pop_keyboard() -> Option<u8> {
+    let tail = TAIL.load(Ordering::Relaxed);
+    if tail == HEAD.load(Ordering::Acquire) {
         return None;
     }
-    unsafe { outb(STATUS_PORT, CONTROLLER_READ_COMMAND_BYTE) };
-    wait_for_output().then(|| unsafe { inb(DATA_PORT) })
+    let byte = unsafe { (*core::ptr::addr_of!(QUEUE))[tail] };
+    TAIL.store((tail + 1) % CAPACITY, Ordering::Release);
+    Some(byte)
 }
 
-fn write_controller_command_byte(byte: u8) -> bool {
-    if !wait_for_input_empty() {
-        return false;
-    }
-    unsafe { outb(STATUS_PORT, CONTROLLER_WRITE_COMMAND_BYTE) };
-    if !wait_for_input_empty() {
-        return false;
-    }
-    unsafe { outb(DATA_PORT, byte) };
-    true
+fn wait_input_ready() -> bool {
+    (0..100_000).any(|_| cpu::inb(STATUS) & INPUT_FULL == 0)
 }
 
-fn send_keyboard_byte(byte: u8) -> bool {
-    if !wait_for_input_empty() {
-        return false;
+fn wait_output_ready() -> bool {
+    (0..100_000).any(|_| cpu::inb(STATUS) & OUTPUT_FULL != 0)
+}
+
+fn command(byte: u8) -> bool {
+    wait_input_ready() && {
+        cpu::outb(STATUS, byte);
+        true
     }
-    unsafe { outb(DATA_PORT, byte) };
-    // The keyboard may send a real scancode before its ACK. Hand such bytes to
-    // the shell's queue (interrupts are off here, as in the IRQ1 handler)
-    // instead of mistaking them for the reply and losing the keystroke.
+}
+
+/// What `init_ps2` found, for the boot log.
+pub enum Ps2 {
+    /// No 8042 answered (status reads as 0xff): common on USB-only boards.
+    Absent,
+    /// The controller is there but the interrupt could not be routed.
+    NoInterrupt,
+    Ready { gsi: u32 },
+}
+
+/// Brings up the PS/2 keyboard. Never blocks for long and never fails the boot.
+pub fn init_ps2() -> Ps2 {
+    if cpu::inb(STATUS) == 0xff {
+        return Ps2::Absent;
+    }
+    // Drain anything pending, then read the controller's configuration byte.
     for _ in 0..16 {
-        if !wait_for_output() {
-            return false;
-        }
-        match unsafe { inb(DATA_PORT) } {
-            KEYBOARD_ACK => return true,
-            scancode => interrupts::push_scancode(scancode),
+        if cpu::inb(STATUS) & OUTPUT_FULL != 0 {
+            cpu::inb(DATA);
         }
     }
-    false
+    if !command(0x20) || !wait_output_ready() {
+        return Ps2::Absent;
+    }
+    let mut configuration = cpu::inb(DATA);
+    configuration |= 1 << 0; // enable the first port's interrupt
+    configuration |= 1 << 6; // translate scancode set 2 to set 1
+    configuration &= !(1 << 4); // first port clock enabled
+    if !(command(0x60) && wait_input_ready()) {
+        return Ps2::Absent;
+    }
+    cpu::outb(DATA, configuration);
+    command(0xae); // enable the first port
+    if wait_input_ready() {
+        cpu::outb(DATA, 0xf4); // keyboard: enable scanning (reply 0xfa is ignored by the decoder)
+    }
+    let routed = ioapic::route_isa(1, KEYBOARD_VECTOR);
+    // The keyboard's reply to the enable-scanning command (0xfa) arrived before the
+    // interrupt was routed. The 8042 holds one byte and raises IRQ 1 only on a new
+    // byte, so an unread reply would silence the keyboard for good: read it now.
+    for _ in 0..1000 {
+        core::hint::spin_loop();
+    }
+    interrupt();
+    match routed {
+        Some(gsi) => Ps2::Ready { gsi },
+        None => Ps2::NoInterrupt,
+    }
 }
 
-/// Reads one raw scancode directly from the controller. Called only from the
-/// IRQ1 handler, which already knows a byte is waiting.
-pub fn read_pending_scancode() -> Option<u8> {
-    if unsafe { inb(STATUS_PORT) } & STATUS_OUTPUT_FULL == 0 {
-        return None;
-    }
-    Some(unsafe { inb(DATA_PORT) })
-}
-
-/// Drains one interrupt-queued scancode and decodes it to ASCII, tracking
-/// shift state across calls. Safe to call repeatedly from the shell's main
-/// loop; briefly disables interrupts internally (via `interrupts::pop_scancode`)
-/// to avoid racing the IRQ1 handler.
-pub fn pop_char() -> Option<u8> {
-    let scancode = interrupts::pop_scancode()?;
-    #[allow(static_mut_refs)]
-    unsafe {
-        DECODER.decode_scancode(scancode)
-    }
-}
-
-/// Drains one interrupt-queued scancode for `term`'s raw pass-through loop.
-/// Recognizes any of `ESCAPE_SCANCODES` ("leave raw mode" make codes)
-/// before decoding, so they are never forwarded as characters; every
-/// other key goes through the same shift-aware decoder as `pop_char`, so
-/// typed text still reaches the remote end as ordinary ASCII.
-pub fn poll_term_event() -> Option<KeyEvent> {
-    // Every blocking loop in the kernel checks for the escape key through here,
-    // so this one call doubles as the software watchdog's "still alive" mark.
-    crate::debug::watchdog_pet();
-    unsafe {
-        if PENDING_KEY_LEN != 0 {
-            let byte = PENDING_KEY_BYTES[PENDING_KEY_HEAD];
-            PENDING_KEY_HEAD = (PENDING_KEY_HEAD + 1) % PENDING_KEY_BYTES_LEN;
-            PENDING_KEY_LEN -= 1;
-            return Some(KeyEvent::Char(byte));
-        }
-    }
-    let scancode = interrupts::pop_scancode()?;
-    let released = scancode & 0x80 != 0;
-    if scancode == 0xe0 {
+/// IRQ 1: read the byte, decode, queue. Reading port 0x60 is what clears the request.
+pub fn interrupt() {
+    while cpu::inb(STATUS) & OUTPUT_FULL != 0 {
+        let byte = cpu::inb(DATA);
         unsafe {
-            EXTENDED_SCANCODE = true;
-        }
-        return None;
-    }
-    if ESCAPE_SCANCODES.contains(&(scancode & 0x7f)) {
-        return if released {
-            None
-        } else {
-            Some(KeyEvent::Escape)
-        };
-    }
-    if scancode & 0x7f == KILL_LINE_SCANCODE {
-        return if released {
-            None
-        } else {
-            Some(KeyEvent::KillLine)
-        };
-    }
-    let extended = unsafe {
-        let extended = EXTENDED_SCANCODE;
-        EXTENDED_SCANCODE = false;
-        extended
-    };
-    if extended {
-        if !released {
-            if let Some(sequence) = extended_key_sequence(scancode & 0x7f) {
-                unsafe {
-                    for &byte in sequence {
-                        if PENDING_KEY_LEN == PENDING_KEY_BYTES_LEN {
-                            break;
-                        }
-                        let tail = (PENDING_KEY_HEAD + PENDING_KEY_LEN) % PENDING_KEY_BYTES_LEN;
-                        PENDING_KEY_BYTES[tail] = byte;
-                        PENDING_KEY_LEN += 1;
-                    }
-                }
+            BYTES_SEEN += 1;
+            if let Some(key) = (*core::ptr::addr_of_mut!(DECODER)).feed(byte) {
+                push(key);
             }
         }
-        return poll_term_event();
-    }
-    if !released {
-        if let Some(sequence) = function_key_sequence(scancode & 0x7f) {
-            unsafe {
-                for &byte in sequence {
-                    if PENDING_KEY_LEN == PENDING_KEY_BYTES_LEN {
-                        break;
-                    }
-                    let tail = (PENDING_KEY_HEAD + PENDING_KEY_LEN) % PENDING_KEY_BYTES_LEN;
-                    PENDING_KEY_BYTES[tail] = byte;
-                    PENDING_KEY_LEN += 1;
-                }
-            }
-            return poll_term_event();
-        }
-    }
-    #[allow(static_mut_refs)]
-    let decoded = unsafe { DECODER.decode_scancode(scancode) };
-    decoded.map(KeyEvent::Char)
-}
-
-fn extended_key_sequence(code: u8) -> Option<&'static [u8]> {
-    match code {
-        0x48 => Some(b"\x1b[A"),
-        0x50 => Some(b"\x1b[B"),
-        0x4d => Some(b"\x1b[C"),
-        0x4b => Some(b"\x1b[D"),
-        0x47 => Some(b"\x1b[H"),
-        0x4f => Some(b"\x1b[F"),
-        0x52 => Some(b"\x1b[2~"),
-        0x53 => Some(b"\x1b[3~"),
-        0x49 => Some(b"\x1b[5~"),
-        0x51 => Some(b"\x1b[6~"),
-        _ => None,
     }
 }
 
-fn function_key_sequence(code: u8) -> Option<&'static [u8]> {
-    match code {
-        0x3b => Some(b"\x1bOP"),
-        0x3c => Some(b"\x1bOQ"),
-        0x3d => Some(b"\x1bOR"),
-        0x3f => Some(b"\x1bOS"),
-        0x43 => Some(b"\x1b[20~"),
-        0x57 => Some(b"\x1b[23~"),
-        _ => None,
-    }
-}
-
-/// `extern "C" fn() -> u32` callback a tape's entry point can call once
-/// per loop iteration to check whether a local operator wants it to stop
-/// -- backed by the exact same `poll_term_event`/`ESCAPE_SCANCODES` check
-/// every other blocking shell loop (`term`, `term net`, `nic sniff`,
-/// `chat`, `tape load net`, ...) already uses to recognize "give up".
-/// `shell::tape_run` passes this as a tape's second argument, alongside
-/// `console::print_byte` as the first (see that function's doc comment
-/// for the full tape ABI).
-///
-/// Safe to use even when a tape was started by a *remote* `tape run`
-/// (dispatched through an active `term_net` session): `interrupts::
-/// pop_scancode`'s queue is a single, consuming FIFO shared by every
-/// caller in this single-threaded kernel, and `term_net`'s own session
-/// loop is paused for the entire time a nested command like a tape is
-/// running. So a local escape keypress a tape's own loop consumes here to
-/// stop *itself* is gone from the queue by the time control returns to
-/// `term_net` -- it can never also be seen there afterward as "disconnect
-/// the remote session". The one extra wrinkle, a physical key press's
-/// paired release scancode, is harmless for the same reason
-/// `poll_term_event` already documents: `released` events decode to
-/// `None`, so `term_net`'s later poll of that leftover byte never reads
-/// as an escape either.
-pub extern "C" fn tape_should_abort() -> u32 {
-    matches!(poll_term_event(), Some(KeyEvent::Escape)) as u32
-}
-
-fn wait_for_input_empty() -> bool {
-    for _ in 0..100_000 {
-        if unsafe { inb(STATUS_PORT) } & STATUS_INPUT_FULL == 0 {
-            return true;
-        }
-    }
-    false
-}
-
-fn wait_for_output() -> bool {
-    for _ in 0..100_000 {
-        if unsafe { inb(STATUS_PORT) } & STATUS_OUTPUT_FULL != 0 {
-            return true;
-        }
-    }
-    false
-}
-
-fn keycode_to_ascii(code: u8, shifted: bool, caps_lock: bool) -> Option<u8> {
-    let normal = match code {
-        0x02..=0x0b => b"1234567890"[(code - 0x02) as usize],
-        0x10..=0x19 => b"qwertyuiop"[(code - 0x10) as usize],
-        0x1e..=0x26 => b"asdfghjkl"[(code - 0x1e) as usize],
-        0x2c..=0x32 => b"zxcvbnm"[(code - 0x2c) as usize],
-        0x39 => b' ',
-        0x0c => b'-',
-        0x0d => b'=',
-        0x1a => b'[',
-        0x1b => b']',
-        0x27 => b';',
-        0x28 => b'\'',
-        0x29 => b'`',
-        0x2b => b'\\',
-        0x33 => b',',
-        0x34 => b'.',
-        0x35 => b'/',
-        _ => return None,
-    };
-    if normal.is_ascii_lowercase() {
-        if shifted ^ caps_lock {
-            return Some(normal - b'a' + b'A');
-        }
-        return Some(normal);
-    }
-    if !shifted {
-        return Some(normal);
-    }
-    Some(match normal {
-        b'1' => b'!',
-        b'2' => b'@',
-        b'3' => b'#',
-        b'4' => b'$',
-        b'5' => b'%',
-        b'6' => b'^',
-        b'7' => b'&',
-        b'8' => b'*',
-        b'9' => b'(',
-        b'0' => b')',
-        b'-' => b'_',
-        b'=' => b'+',
-        b'[' => b'{',
-        b']' => b'}',
-        b';' => b':',
-        b'\'' => b'"',
-        b'`' => b'~',
-        b'\\' => b'|',
-        b',' => b'<',
-        b'.' => b'>',
-        b'/' => b'?',
-        _ => normal,
-    })
-}
-
-fn set_caps_lock_led(enabled: bool) {
-    unsafe {
-        asm!("cli", options(nomem, nostack));
-        if wait_for_input_empty() {
-            outb(DATA_PORT, KEYBOARD_SET_LEDS);
-            if wait_for_output() && inb(DATA_PORT) == KEYBOARD_ACK {
-                outb(DATA_PORT, if enabled { CAPS_LOCK_LED } else { 0 });
-                let _ = wait_for_output().then(|| inb(DATA_PORT));
-            }
-        }
-        asm!("sti", options(nomem, nostack));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{extended_key_sequence, function_key_sequence, keycode_to_ascii};
-
-    #[test]
-    fn translates_us_keyboard_letters_and_shifted_symbols() {
-        assert_eq!(keycode_to_ascii(0x23, false, false), Some(b'h'));
-        assert_eq!(keycode_to_ascii(0x23, true, false), Some(b'H'));
-        assert_eq!(keycode_to_ascii(0x23, false, true), Some(b'H'));
-        assert_eq!(keycode_to_ascii(0x23, true, true), Some(b'h'));
-        assert_eq!(keycode_to_ascii(0x02, true, false), Some(b'!'));
-        assert_eq!(keycode_to_ascii(0x02, false, true), Some(b'1'));
-    }
-
-    #[test]
-    fn decodes_tab_make_code_as_tab() {
-        let mut keyboard = super::Keyboard {
-            left_shift: false,
-            right_shift: false,
-            caps_lock: false,
-        };
-        assert_eq!(keyboard.decode_scancode(0x0f), Some(b'\t'));
-    }
-
-    #[test]
-    fn maps_navigation_keys_to_terminal_sequences() {
-        assert_eq!(extended_key_sequence(0x48), Some(&b"\x1b[A"[..]));
-        assert_eq!(extended_key_sequence(0x53), Some(&b"\x1b[3~"[..]));
-        assert_eq!(function_key_sequence(0x3b), Some(&b"\x1bOP"[..]));
-        assert_eq!(function_key_sequence(0x3e), None);
-    }
+pub fn ps2_bytes_seen() -> u64 {
+    unsafe { BYTES_SEEN }
 }
