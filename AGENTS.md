@@ -23,6 +23,8 @@ See NETWORKING.md for more networking stuff
 See AUDIO.md for audio interface stuff
 See DEFERRED.md for things put aside for now.
 See docs/recorder.md for the v2 recorder tape, FAT32/exFAT, the clock and `grow`.
+See docs/shared-codebase.md: the plan to make the 64-bit tree the one codebase
+(UEFI + new BIOS boot path), freeze this v1 as `legacy-v1`, and rename to Fosfor OS.
 
 Try not to fill up this file, put new stuff in the above files or under docs/
 
