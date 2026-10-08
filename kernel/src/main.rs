@@ -19,6 +19,7 @@ mod acpi;
 mod audio;
 mod ahci;
 mod block;
+mod bootcode;
 mod apic;
 mod clock;
 mod config;

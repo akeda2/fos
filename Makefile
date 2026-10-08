@@ -271,14 +271,18 @@ $(BIOS_SHIM)/qemu-system-x86_64: tools/qemu_bios_shim.py
 	mkdir -p $(BIOS_SHIM)
 	cp $< $@
 	chmod +x $@
-.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios test-bios-placement test-bios-video test-bios-sector test-bios-edid
+.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode
 $(addprefix test-bios-,$(BIOS_TESTS)): test-bios-%: image $(BIOS_SHIM)/qemu-system-x86_64
 	PATH=$(abspath $(BIOS_SHIM)):$$PATH FOS_FIRMWARE=bios python3 tools/test_$(subst -,_,$*).py
-test-bios: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector test-bios-edid
+test-bios: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode
 
 # The two ways to skip the video mode switch: a held Shift key, and `debug video skip` (a flag in the slot metadata).
 test-bios-video: image
 	python3 tools/test_bios_video.py
+
+# `bootcode update`: the BIOS boot code of a running disk is replaced (a patched stage two runs at the next boot); bad inputs are refused.
+test-bios-bootcode: image
+	python3 tools/test_bios_bootcode.py
 
 # The VBE mode follows the monitor's EDID (QEMU's VGA playing 1280x800, 1920x1080, 1366x768, 1024x768 and no EDID at all).
 test-bios-edid: image
@@ -293,7 +297,7 @@ test-bios-placement: image
 	python3 tools/test_bios_placement.py
 
 # Every test-* target in turn (slow); prints a summary and fails if any failed. Run one by name for quick iteration.
-ALL_TESTS := $(filter-out test-all test-bios test-bios-placement test-bios-video test-bios-sector test-bios-edid,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector test-bios-edid
+ALL_TESTS := $(filter-out test-all test-bios test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode
 .PHONY: test-all
 test-all: image
 	@failed=""; for t in $(ALL_TESTS); do \

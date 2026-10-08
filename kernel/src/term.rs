@@ -1140,6 +1140,9 @@ fn execute(command: &str) {
     if word != "install" {
         crate::install::cancel(); // and so does an install
     }
+    if word != "bootcode" {
+        crate::bootcode::cancel(); // and a boot-code update
+    }
     match word {
         "help" => {
             crate::println!("help      this list");
@@ -1151,6 +1154,7 @@ fn execute(command: &str) {
             crate::println!("clear     clear the screen");
             crate::println!("nic       the network interfaces (list); nic use|sniff|discover|peers|map|regs|send|recv");
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
+            crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code from stage1.bin/stage2.bin");
             crate::println!("sector diskN LBA [COUNT]   raw read-only dump of disk sectors (a GPT header, the slot metadata)");
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
@@ -1331,6 +1335,7 @@ fn execute(command: &str) {
         "format" => format_command(words),
         "grow" => grow_command(words),
         "install" => crate::install::command(words),
+        "bootcode" => crate::bootcode::command(words),
         "copy" => copy_command(words),
         "disks" => {
             for index in 0..crate::block::count() {

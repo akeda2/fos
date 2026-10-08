@@ -232,6 +232,15 @@ apart, and up to five whole-port attempts that wait for the reconnection between
 board: attempt 1 still fails, attempt 2 succeeds, "is back; disk1 works again". `usb` no longer labels a claimed disk port
 "keyboard".
 
+Updating stage one/two without rewriting the stick (2026-10-08): `bootcode` (`kernel/src/bootcode.rs`). KUP only replaces kernel
+slots, so every stage-two change used to need `tools/write_stick.py` and cost the stick's files. Now `stage1.bin` and `stage2.bin`
+go onto the boot volume as ordinary files and `bootcode update` / `bootcode update confirm` (announce, then confirm as the very next
+command, like `format` and `install`) validates them (stage one exactly one sector with the 0x55aa signature and an empty
+partition-table area; stage two at most 24 sectors, starting with `cli`, carrying its banner), writes stage two first and reads it
+back, then stage one's code into the MBR and reads that back. `make test-bios-bootcode` patches one letter of the banner, updates,
+reboots and sees the new banner. The UEFI loader on the ESP has no such path yet (the `fat` crate writes the root directory only,
+and BOOTX64.EFI is in `\EFI\BOOT`).
+
 ## 5. Migration, in order
 
 | # | Step | Done when |

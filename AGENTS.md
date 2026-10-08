@@ -164,6 +164,11 @@ falls back automatically. **KUP** (`tools/send_kernel_update.py`) pushes a kerne
 Ethernet into the inactive slot; the wire formats (KUP, NETFS, `term net`, chat) are
 shared with the legacy edition so the host tools work against both.
 
+The BIOS boot code (stage one in the MBR, stage two at LBA 64) is not in a kernel slot, so KUP cannot update it. `bootcode`
+shows what a disk has; with `stage1.bin` and `stage2.bin` (from `build/bios/`) on the boot volume (`foscopy.py FILE
+:disk1/stage2.bin`), `bootcode update` announces and `bootcode update confirm` writes stage two, then stage one's code, reading
+both back (fos disks only; the UEFI loader on the ESP is not covered). `make test-bios-bootcode` runs it for real.
+
 BIOS boots only: a video BIOS that hangs in the VBE mode switch can be skipped once by holding Shift during the
 boot, or for good with `debug video skip` (a flag in the slot-metadata sector, byte 16; `debug video auto` undoes it).
 The kernel is then serial-only, since there is no VGA text console yet.
