@@ -17,7 +17,7 @@ here touches the internal disk (the AHCI driver only reads it, and only `disks` 
 ```sh
 make v2-image                          # build/v2/v2.img (96 MiB: ESP + payload + FOSFS)
 ls -l build/v2/v2.img
-sudo python3 v2/tools/write_stick.py /dev/sdX   # or: sudo dd if=build/v2/v2.img of=/dev/sdX bs=4M conv=fsync status=progress
+sudo python3 tools/write_stick.py /dev/sdX   # or: sudo dd if=build/v2/v2.img of=/dev/sdX bs=4M conv=fsync status=progress
 ```
 
 `dd` is fine for one stick; the script is `dd` with the checks (whole removable disk, nothing mounted,

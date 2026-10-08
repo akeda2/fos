@@ -1455,7 +1455,27 @@ fn execute(command: &str) {
                     core::hint::spin_loop();
                 }
             }
-            Some(_) => crate::println!("debug: status | slots | crash | hang"),
+            Some("video") => {
+                use fos_v2_abi::FLAG_SKIP_VIDEO;
+                let change = match words.next() {
+                    Some("skip") => Some(true),
+                    Some("auto") => Some(false),
+                    None | Some("status") => None,
+                    Some(_) => return crate::println!("debug video [skip|auto]"),
+                };
+                let updated = match change {
+                    Some(skip) => crate::debug::update_metadata(|metadata| {
+                        if skip { metadata.flags |= FLAG_SKIP_VIDEO } else { metadata.flags &= !FLAG_SKIP_VIDEO }
+                    }),
+                    None => crate::debug::read_metadata(),
+                };
+                match updated {
+                    Some(metadata) if metadata.flags & FLAG_SKIP_VIDEO != 0 => crate::println!("BIOS boot: the video mode switch is skipped (text mode stays, the kernel is serial only). `debug video auto` undoes it. UEFI boots ignore this."),
+                    Some(_) => crate::println!("BIOS boot: the video mode (VBE framebuffer) is chosen automatically. Holding Shift during a boot skips it once; `debug video skip` skips it for good."),
+                    None => crate::println!("debug video: the slot metadata could not be read or written."),
+                }
+            }
+            Some(_) => crate::println!("debug: status | slots | crash | hang | video [skip|auto]"),
         },
         other => {
             let rest = command[other.len()..].trim();

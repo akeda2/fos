@@ -191,10 +191,16 @@ two chooses the kernel's address from E820 (`choose_placement`: the lowest 2 MiB
 8 MiB for the image plus the slot's size for the read buffer, below 4 GiB; a clear message if there is none;
 `make test-bios-placement` boots with 512 MiB, 40 MiB and 8 MiB).
 
+The video step has an override for a video BIOS that hangs: hold Shift during the boot (stage two samples the BIOS keyboard
+state at every disk call and again before the mode switch, so a key held from power-on or pressed at any time while stage two
+runs counts), or `debug video skip` in the shell, a flag in the slot-metadata sector (`SlotMetadata::flags`, byte 16 bit 0,
+preserved by the loader and the kernel; `debug video auto` clears it). `make test-bios-video` checks both, including that the
+flag survives a reboot. The catch: with the mode switch skipped the kernel has no framebuffer and only the serial port, because
+there is no VGA text console to fall back on (a small text backend for the 80x25 screen would close that gap).
+
 Still open: nothing has run on real hardware (unreal mode, A20, E820 and VBE quirks are the usual surprises; the AMD/nForce
-board is the first target); each VBE call is checked, but there is no operator override to skip graphics on a video card
-that hangs in a mode switch; the 4 GiB identity map in stage two limits where the kernel can be placed (fine: it moves its
-own page tables first thing).
+board is the first target); the VGA text fallback above; the 4 GiB identity map in stage two limits where the kernel can be
+placed (fine: it moves its own page tables first thing).
 
 ## 5. Migration, in order
 

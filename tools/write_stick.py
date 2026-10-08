@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Writes a v2 image to a USB stick (what `dd` does, with the guard rails).
 
-    sudo python3 tools/write_stick.py /dev/sdX [--image build/v2/v2.img]
+    sudo python3 tools/write_stick.py /dev/sdX [--image PATH]
 
-`dd if=build/v2/v2.img of=/dev/sdX bs=4M conv=fsync status=progress` does exactly the same
+The image defaults to what `make image` builds (build_image.DEFAULT_IMAGE, build/v2/v2.img in this repository), wherever
+the script is run from. `dd if=IMAGE of=/dev/sdX bs=4M conv=fsync status=progress` does exactly the same
 copy; this script only refuses the mistakes that cost people their disks: it will not touch
 anything that is mounted, not a whole disk, not removable, smaller than the image, or
 larger than 256 GiB (a stick, not a system drive), and it shows what it found and asks you
@@ -43,7 +44,7 @@ def mounted_partitions(device: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("device", help="the whole-disk device node of the stick, e.g. /dev/sdb")
-    parser.add_argument("--image", default="build/v2/v2.img", type=Path)
+    parser.add_argument("--image", default=build_image.DEFAULT_IMAGE, type=Path, help="default: %(default)s")
     parser.add_argument("--keep-guids", action="store_true",
                         help="write the image's GUIDs as they are instead of fresh random ones (two sticks written "
                              "that way cannot be told apart by the kernel's boot-disk discovery)")
@@ -52,7 +53,7 @@ def main() -> int:
     device = Path(arguments.device)
     name = device.name
     if not arguments.image.exists():
-        return fail(f"{arguments.image} does not exist; run `make v2-image` first")
+        return fail(f"{arguments.image} does not exist; run `make image` in {build_image.REPO} first")
     if not device.exists() or not Path(f"/sys/block/{name}").exists():
         return fail(f"{device} is not a whole-disk block device (give /dev/sdX, not a partition like /dev/sdX1)")
     size = int(sysfs(name, "size") or 0) * 512

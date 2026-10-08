@@ -85,7 +85,19 @@ def boot(images, boot_index):
         return clean(bytes(raw))
 
 
+def default_image_checks():
+    """write_stick.py's default image is the one `make image` builds, and it is found from any working directory."""
+    printed = subprocess.run(["make", "-s", "print-image"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    check(Path(printed) == build_image.DEFAULT_IMAGE, f"the default image path equals the Makefile's IMAGE ({printed})", str(build_image.DEFAULT_IMAGE))
+    # From another directory, with a device that is not a whole disk: the complaint must be about the device, not about a
+    # missing image (the old default, "build/v2/v2.img", only resolved from the repository root).
+    result = subprocess.run([sys.executable, str(ROOT / "tools" / "write_stick.py"), "/dev/null"], cwd="/", capture_output=True, text=True)
+    check("not a whole-disk block device" in result.stderr and "does not exist" not in result.stderr,
+          "write_stick.py finds its default image when run from another directory", result.stderr)
+
+
 def main():
+    default_image_checks()
     original = IMAGE.read_bytes()
     first = bytearray(original)
     guid = build_image.randomize_guids(first)

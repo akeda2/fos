@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios
+.PHONY: all help clean bios print-image
 
 all: image tapes
 
@@ -22,6 +22,10 @@ help:
 	@echo "make test-all     every test-* target in turn, with a summary"
 	@echo "make loader|kernel|tapes   build one part"
 	@echo "make clean        remove $(BUILD)/"
+
+# `make -s print-image`: the path `make image` writes (tools/build_image.py's DEFAULT_IMAGE must equal it; test-stick-guids checks).
+print-image:
+	@echo $(abspath $(IMAGE))
 
 clean:
 	rm -rf $(BUILD)
@@ -263,17 +267,21 @@ $(BIOS_SHIM)/qemu-system-x86_64: tools/qemu_bios_shim.py
 	mkdir -p $(BIOS_SHIM)
 	cp $< $@
 	chmod +x $@
-.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios test-bios-placement
+.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios test-bios-placement test-bios-video
 $(addprefix test-bios-,$(BIOS_TESTS)): test-bios-%: image $(BIOS_SHIM)/qemu-system-x86_64
 	PATH=$(abspath $(BIOS_SHIM)):$$PATH FOS_FIRMWARE=bios python3 tools/test_$(subst -,_,$*).py
-test-bios: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement
+test-bios: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video
+
+# The two ways to skip the video mode switch: a held Shift key, and `debug video skip` (a flag in the slot metadata).
+test-bios-video: image
+	python3 tools/test_bios_video.py
 
 # Stage two picks the kernel's address from the E820 map: boots with 512 MiB, 40 MiB and (expected to stop with a message) 8 MiB.
 test-bios-placement: image
 	python3 tools/test_bios_placement.py
 
 # Every test-* target in turn (slow); prints a summary and fails if any failed. Run one by name for quick iteration.
-ALL_TESTS := $(filter-out test-all test-bios test-bios-placement,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement
+ALL_TESTS := $(filter-out test-all test-bios test-bios-placement test-bios-video,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video
 .PHONY: test-all
 test-all: image
 	@failed=""; for t in $(ALL_TESTS); do \

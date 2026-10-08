@@ -143,7 +143,7 @@ pub const fn guid_bytes(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
 /// (`kernel/src/debug.rs`), so the same host tooling and state machine apply:
 /// `+0 "FOSM"`, `+4 version`, `+5 active slot`, `+6 pending slot (0xff = none)`,
 /// `+7 attempted`, `+8 confirmed`, `+9 crash count`, `+10/+12 slot sizes in sectors
-/// (u16 LE)`, `+14 running`, `+15 unclean boots`.
+/// (u16 LE)`, `+14 running`, `+15 unclean boots`, `+16 flags` (see `FLAG_SKIP_VIDEO`).
 ///
 /// Meaning of the last three (see docs/v2-design.md, M6): `running` is 1 while a boot
 /// has not yet reached the kernel's milestone, 2 once it has, 0 after a clean stop
@@ -152,6 +152,9 @@ pub const fn guid_bytes(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
 /// `crash_count`; the kernel zeroes `crash_count` at the milestone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotMetadata {
+    /// Boot options the BIOS stage two reads before it can read any file (byte 16): `FLAG_*`. The UEFI loader keeps them
+    /// untouched.
+    pub flags: u8,
     pub active_slot: u8,
     pub pending_slot: Option<u8>,
     pub attempted: bool,
@@ -161,6 +164,10 @@ pub struct SlotMetadata {
     pub running: u8,
     pub unclean_boots: u8,
 }
+
+/// `SlotMetadata::flags` bit 0: the BIOS stage two does not switch the video mode (a video BIOS that hangs in a VBE call);
+/// the kernel then runs on serial only. Set with `debug video skip`; holding Shift during a BIOS boot does the same once.
+pub const FLAG_SKIP_VIDEO: u8 = 1;
 
 pub const RUNNING_STOPPED: u8 = 0;
 pub const RUNNING_BOOTING: u8 = 1;
@@ -175,6 +182,7 @@ impl SlotMetadata {
         }
         let pending = sector[6];
         Some(SlotMetadata {
+            flags: sector[16],
             active_slot: sector[5],
             pending_slot: if pending == NO_PENDING_SLOT { None } else { Some(pending) },
             attempted: sector[7] != 0,
@@ -200,6 +208,7 @@ impl SlotMetadata {
         sector[12..14].copy_from_slice(&self.slot_sectors[1].to_le_bytes());
         sector[14] = self.running;
         sector[15] = self.unclean_boots;
+        sector[16] = self.flags;
     }
 }
 
@@ -305,7 +314,7 @@ mod tests {
     }
 
     fn state(pending: Option<u8>, attempted: bool, confirmed: bool) -> SlotMetadata {
-        SlotMetadata { active_slot: 0, pending_slot: pending, attempted, confirmed, crash_count: 0, slot_sectors: [1, 1], running: 0, unclean_boots: 0 }
+        SlotMetadata { flags: 0, active_slot: 0, pending_slot: pending, attempted, confirmed, crash_count: 0, slot_sectors: [1, 1], running: 0, unclean_boots: 0 }
     }
 
     #[test]
@@ -327,11 +336,12 @@ mod tests {
 
     #[test]
     fn metadata_write_into_round_trips() {
-        let m = SlotMetadata { active_slot: 1, pending_slot: Some(0), attempted: true, confirmed: false, crash_count: 3, slot_sectors: [321, 400], running: 2, unclean_boots: 4 };
+        let m = SlotMetadata { flags: FLAG_SKIP_VIDEO, active_slot: 1, pending_slot: Some(0), attempted: true, confirmed: false, crash_count: 3, slot_sectors: [321, 400], running: 2, unclean_boots: 4 };
         let mut sector = [0xaau8; 512];
         m.write_into(&mut sector);
         assert_eq!(SlotMetadata::parse(&sector), Some(m));
-        assert!(sector[16..].iter().all(|&b| b == 0));
+        assert_eq!(sector[16], FLAG_SKIP_VIDEO);
+        assert!(sector[17..].iter().all(|&b| b == 0), "everything after the flags byte stays zero");
     }
 
     #[test]

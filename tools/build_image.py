@@ -21,6 +21,11 @@ import uuid
 import zlib
 from pathlib import Path
 
+# Where `make image` writes the finished disk image (the Makefile's IMAGE; a test keeps the two equal). Absolute, built from
+# this file's location, so a tool that defaults to it works from any directory.
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_IMAGE = REPO / "build" / "v2" / "v2.img"
+
 SECTOR = 512
 IMAGE_SECTORS = 96 * 2048          # 96 MiB
 ESP_START = 2048                   # 1 MiB aligned, like every partitioning tool

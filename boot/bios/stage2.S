@@ -363,7 +363,12 @@ disk_call:
     movw $dap, %si
     sti                                 /* some BIOSes wait for a disk interrupt inside INT 13h */
     int $0x13
+    pushf                               /* keep the call's carry flag (error) through the check below */
     cli                                 /* and nothing may interrupt us while ES holds its 4 GiB limit (enter_unreal) */
+    testb $3, 0x417                     /* BIOS data area: a Shift key is down? interrupts were on, so it is current */
+    jz 1f
+    movb $1, shift_seen                 /* remembered: the video step is later, and a key held at power-on may be lost */
+1:  popf
     ret
 
 /* Reads rd_sectors from rd_lba and copies them to the linear address rd_dest (above 1 MiB), piece by piece.
@@ -698,8 +703,23 @@ rsdp_scan:
 vbe_setup:
     movl $0, vbe_area
     movl $0, fb_base
+    /* The operator's way out of a video BIOS that hangs: either the slot-metadata flag (`debug video skip` in the
+     * shell, byte 16 bit 0) or a Shift key held down right now. The BIOS keeps the keyboard's shift state in its data
+     * area (0x417: bit 0 right Shift, bit 1 left Shift), but only updates it when it handles the key interrupt, so let
+     * interrupts through for a moment first. */
+    sti
+    movw $0xffff, %cx
+1:  inb $0x80, %al                      /* ~1 us per read on the ISA bus: about 65 ms for pending key events to be handled */
+    loop 1b
+    cli
     xorw %ax, %ax
     movw %ax, %es
+    testb $3, %es:0x417
+    jnz vbe_skipped
+    cmpb $0, shift_seen                 /* or it was seen at any disk call since this program started */
+    jne vbe_skipped
+    testb $1, meta+16
+    jnz vbe_skipped
     movl $0x32454256, %es:0x3000        /* "VBE2" in the signature field asks for VBE 2.0+ information */
     movw $0x3000, %di
     movw $0x4f00, %ax                   /* VBE function 00h: controller information */
@@ -822,6 +842,11 @@ vbe_listed:
     movl fb_pitch, %eax
     shrl $2, %eax
     movl %eax, fb_stride
+    ret
+vbe_skipped:
+    movl $0, fb_base
+    movw $m_video_skipped, %si
+    call puts16
     ret
 vbe_failed:
     movl $0, fb_base
@@ -1241,6 +1266,7 @@ payload_type_guid:
 magic_value:      .ascii "FOSV2BI\0"
 
 boot_drive:       .byte 0
+shift_seen:       .byte 0
 slot:             .byte 0
 boot_crash_count: .byte 0
 a20_saved_low:    .byte 0
@@ -1289,7 +1315,7 @@ dap_lba:          .quad 0
 .balign 16
 meta:             .space 512
 
-m_banner:     .asciz "Fosfor stage 2 (BIOS path): real mode, 16-bit.\r\n"
+m_banner:     .asciz "Fosfor stage 2 (BIOS path): real mode, 16-bit. (Hold Shift to skip the graphics mode.)\r\n"
 m_a20:        .asciz "  A20 line: "
 m_e820:       .asciz "  Memory map (INT 15h E820): "
 m_e820_line:  .asciz "    0x"
@@ -1317,6 +1343,7 @@ m_video:      .asciz "  Video: VBE 0x"
 m_video_mode: .asciz ", mode 0x"
 m_by:         .asciz "x"
 m_video_at:   .asciz " 32 bpp, linear framebuffer at 0x"
+m_video_skipped: .asciz "  Video: skipped (Shift is held, or `debug video skip` is set): text mode stays, the kernel is serial only.\r\n"
 m_video_none: .asciz "  Video: no usable VBE mode (a 32-bit linear one is needed); text mode stays, the kernel is serial only.\r\n"
 m_video_failed: .asciz "  Video: the video BIOS refused the mode; the kernel is serial only.\r\n"
 m_ok:         .asciz "ok\r\n"

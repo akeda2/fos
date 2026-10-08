@@ -128,7 +128,7 @@ make image            # build/v2/v2.img: loader + kernel + every tape (default g
 make run              # boot it in QEMU + OVMF, serial on the terminal
 make test             # unit tests (abi, fat, audio-rec) and the boot/framebuffer test
 make test-NAME        # one end-to-end test; `make help`, or the .PHONY list in the Makefile
-make test-bios        # 16 of them, booted through BIOS (SeaBIOS) incl. install and kernel placement; test-bios-NAME for one
+make test-bios        # 16 of them, booted through BIOS (SeaBIOS), plus kernel placement and the skip-video override
 make test-all         # every test-* target (slow, ~30 min); prints PASS/FAIL per target
 ```
 
@@ -156,6 +156,10 @@ loop. The loader runs the A/B slot state machine: a pushed kernel gets one try, 
 falls back automatically. **KUP** (`tools/send_kernel_update.py`) pushes a kernel over
 Ethernet into the inactive slot; the wire formats (KUP, NETFS, `term net`, chat) are
 shared with the legacy edition so the host tools work against both.
+
+BIOS boots only: a video BIOS that hangs in the VBE mode switch can be skipped once by holding Shift during the
+boot, or for good with `debug video skip` (a flag in the slot-metadata sector, byte 16; `debug video auto` undoes it).
+The kernel is then serial-only, since there is no VGA text console yet.
 
 Talking to a real machine from a sandbox needs `AF_PACKET` raw sockets; a human grants
 the capability once to a *dedicated copy* of Python (an agent must never do this
