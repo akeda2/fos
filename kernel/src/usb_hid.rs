@@ -52,7 +52,18 @@ pub fn probe_all() -> usize {
     for index in 0..xhci::count() {
         let Some(controller) = xhci::controller(index) else { continue };
         for port in 1..=controller.ports {
-            if controller.port_status(port) & 1 == 0 || controller.slot_in_use_for_port(port) {
+            if controller.slot_in_use_for_port(port) {
+                // A device we enumerated here earlier. If the port says it went away (or went away and came back), drop its
+                // slot and look at the port afresh; a disk that returns is recognised in usb_storage::register and takes
+                // over its old disk number. A port with a hub on it is left alone (its devices have their own states).
+                if crate::usb_hub::has_hub_on_port(index, port) || (controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port)) {
+                    continue;
+                }
+                controller.release_port_slots(port);
+                crate::println!("USB: xHCI {:02x}:{:02x}.{} port {port}: its device was unplugged or replugged; looking at the port again.",
+                    controller.pci.bus, controller.pci.device, controller.pci.function);
+            }
+            if controller.port_status(port) & 1 == 0 {
                 continue;
             }
             // Real controllers sometimes fail the first transfer after a reset; try again from

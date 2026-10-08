@@ -103,6 +103,12 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
 }
 
 /// Looks for devices on every known hub of this controller that are not yet in use.
+/// Whether a hub this driver tracks hangs off root port `port` of controller `controller_index`: the devices below it share
+/// that root port's connection state, so unplug detection for the port as a whole must leave them alone.
+pub fn has_hub_on_port(controller_index: usize, port: u8) -> bool {
+    hubs().iter().flatten().any(|hub| hub.controller == controller_index && hub.device.port == port)
+}
+
 pub fn rescan(controller_index: usize, controller: &mut Controller) -> usize {
     let mut added = 0;
     for index in 0..MAX_HUBS {

@@ -140,6 +140,10 @@ impl Msc {
             Host::Ehci { controller, root_port, .. } if root_port != 0 => {
                 ehci::controller(controller).map_or(true, |c| !c.port_has_device(root_port) || c.port_connect_changed(root_port))
             }
+            // Only "nothing is connected" is conclusive on xHCI; a change bit alone could come from a glitch on a healthy
+            // SuperSpeed link, and failing a working boot disk at once would be worse than a slow failure. (A replug is still
+            // handled: `usb rescan` sees the change bit and checks the old handle by really using it.)
+            Host::Xhci { controller, device } if device.route == 0 => xhci::controller(controller).map_or(true, |c| c.port_status(device.port) & 1 == 0),
             _ => false,
         }
     }

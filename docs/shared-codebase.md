@@ -221,7 +221,7 @@ being in another machine); stage two reads the metadata back after writing it; a
 and a returning stick takes over its old disk (`make test-usb-replug`); audio tapes name their device and accept
 `device=N`. Not done: the RTL8168H on that board stays on polled interrupts (its MSI self-test needs a transmitted
 frame, and the link is not up yet at init); no OHCI/UHCI driver (USB keyboards there rely on BIOS legacy emulation);
-the xHCI storage path has no replug recovery.
+the xHCI replug path (disks directly on a root port, tested in QEMU; not yet on the Skylake) leaves a replugged keyboard's old entry behind and does not cover disks behind hubs.
 
 Replug on real hardware (the same board, 2026-10-08): a USB 3.0 stick (Kingston DataTraveler 3.0) on an nForce EHCI port drops
 off the bus and comes back during its first reset after a hot plug (`PORTSC` went 0x1005 -> 0x1002 while the first descriptor

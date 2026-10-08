@@ -607,6 +607,13 @@ impl Controller {
         read32(self.port_register(port))
     }
 
+    /// The port's connect-status-change bit (PORTSC bit 17): set by the controller whenever a device is plugged in or removed,
+    /// cleared only by software (enumerating the port clears it). Set again on a port we already enumerated, it says the
+    /// device came or went since, even if something is connected now (an unplug and replug leaves no other trace).
+    pub fn port_connect_changed(&self, port: u8) -> bool {
+        self.port_status(port) & (1 << 17) != 0
+    }
+
     pub fn slot_in_use_for_port(&self, port: u8) -> bool {
         self.slots[1..].iter().any(|slot| slot.used && slot.port == port)
     }
