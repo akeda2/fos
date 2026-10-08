@@ -8,17 +8,39 @@
 //! I/O APICs. The tables live in ACPI-reclaimable or NVS memory, which the page
 //! tables map.
 
+/// Makes sure every page of `[address, address + length)` is mapped before it is read. UEFI describes the ACPI tables as
+/// ACPI-reclaimable or NVS memory, which the page tables map; a BIOS often reports them as plain reserved memory instead
+/// (QEMU's SeaBIOS does: a 132 KiB range just below the top of RAM), and the BIOS ROM area holds the RSDP. Mapping on
+/// demand makes the reader independent of how the firmware labelled the range.
+fn ensure_mapped(address: u64, length: u64) {
+    let mut page = address & !0xfff;
+    while page < address + length {
+        if !crate::paging::is_mapped(page) {
+            crate::paging::map_device(page, 4096);
+        }
+        page += 4096;
+    }
+}
 fn read_u8(address: u64) -> u8 {
+    ensure_mapped(address, 1);
     unsafe { (address as *const u8).read_unaligned() }
 }
 fn read_u16(address: u64) -> u16 {
+    ensure_mapped(address, 2);
     unsafe { (address as *const u16).read_unaligned() }
 }
 fn read_u32(address: u64) -> u32 {
+    ensure_mapped(address, 4);
     unsafe { (address as *const u32).read_unaligned() }
 }
 fn read_u64(address: u64) -> u64 {
+    ensure_mapped(address, 8);
     unsafe { (address as *const u64).read_unaligned() }
+}
+/// The four-byte signature at `address`.
+fn signature_at(address: u64) -> [u8; 4] {
+    ensure_mapped(address, 4);
+    unsafe { (address as *const [u8; 4]).read_unaligned() }
 }
 
 /// Whether the byte sum of `[address, address + length)` is zero, which is how
@@ -36,7 +58,7 @@ pub struct Tables {
 
 /// Validates the RSDP at `rsdp` and locates the root table.
 pub fn open(rsdp: u64) -> Option<Tables> {
-    if rsdp == 0 || unsafe { core::slice::from_raw_parts(rsdp as *const u8, 8) } != b"RSD PTR " || !checksum_ok(rsdp, 20) {
+    if rsdp == 0 || read_u64(rsdp) != u64::from_le_bytes(*b"RSD PTR ") || !checksum_ok(rsdp, 20) {
         return None;
     }
     let revision = read_u8(rsdp + 15);
@@ -55,7 +77,7 @@ impl Tables {
         for index in 0..entries {
             let at = self.root + 36 + index * self.entry_size;
             let table = if self.entry_size == 8 { read_u64(at) } else { u64::from(read_u32(at)) };
-            if table != 0 && unsafe { core::slice::from_raw_parts(table as *const u8, 4) } == signature && checksum_ok(table, read_u32(table + 4) as usize) {
+            if table != 0 && signature_at(table) == *signature && checksum_ok(table, read_u32(table + 4) as usize) {
                 return Some(table);
             }
         }

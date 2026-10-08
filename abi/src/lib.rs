@@ -255,6 +255,31 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
 mod tests {
     use super::*;
 
+    /// The BIOS boot path (boot/bios/stage2.S) writes `BootInfo` by hand, byte for byte. If this test fails, a field was
+    /// added or moved: update the `BI_*` offsets in boot/bios/stage2.S in the same change.
+    #[test]
+    fn boot_info_layout_matches_the_bios_loader() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<BootInfo>(), 144);
+        assert_eq!(offset_of!(BootInfo, magic), 0);
+        assert_eq!(offset_of!(BootInfo, version), 8);
+        assert_eq!(offset_of!(BootInfo, size), 12);
+        assert_eq!(offset_of!(BootInfo, memory_map), 16);
+        assert_eq!(offset_of!(BootInfo, memory_map_count), 24);
+        assert_eq!(offset_of!(BootInfo, memory_map_descriptor_size), 32);
+        assert_eq!(offset_of!(BootInfo, framebuffer), 40);
+        assert_eq!(offset_of!(BootInfo, acpi_rsdp), 72);
+        assert_eq!(offset_of!(BootInfo, runtime_services), 80);
+        assert_eq!(offset_of!(BootInfo, kernel_base), 88);
+        assert_eq!(offset_of!(BootInfo, kernel_size), 96);
+        assert_eq!(offset_of!(BootInfo, boot_slot), 104);
+        assert_eq!(offset_of!(BootInfo, crash_count), 108);
+        assert_eq!(offset_of!(BootInfo, payload_guid), 112);
+        assert_eq!(offset_of!(BootInfo, payload_start), 128);
+        assert_eq!(offset_of!(BootInfo, payload_sectors), 136);
+        assert_eq!(size_of::<MemoryDescriptor>(), 40, "UEFI's descriptor is 40 bytes; the firmware may use a larger stride");
+    }
+
     #[test]
     fn metadata_round_trips_the_v1_layout() {
         let mut sector = [0u8; 512];

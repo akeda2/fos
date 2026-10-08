@@ -242,13 +242,34 @@ def randomize_guids(image: bytearray) -> uuid.UUID:
     return payload_guid
 
 
-def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload_guid: uuid.UUID = PAYLOAD_GUID) -> bytes:
+# The BIOS boot chain (boot/bios): stage one is the MBR's code (bytes 0-445; the partition table and signature stay),
+# stage two sits in the GPT "BIOS boot gap" between the entry array (LBA 2-33) and the first partition (LBA 2048),
+# where nothing else lives. Keep both constants equal to boot/bios/stage1.S.
+BIOS_STAGE2_LBA = 64
+BIOS_STAGE2_SECTORS = 24
+
+
+def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload_guid: uuid.UUID = PAYLOAD_GUID,
+                bios_stage1=None, bios_stage2=None) -> bytes:
+    if bios_stage1 is None and bios_stage2 is None:
+        # Not told: use the BIOS boot code `make` built, if it is there, so every image the tests build is bootable by BIOS too.
+        root = Path(__file__).resolve().parent.parent
+        first, second = root / "build/bios/stage1.bin", root / "build/bios/stage2.bin"
+        bios_stage1, bios_stage2 = (first.read_bytes(), second.read_bytes()) if first.exists() and second.exists() else (b"", b"")
     image = bytearray(IMAGE_SECTORS * SECTOR)
     # Protective MBR: one partition of type 0xEE covering the disk.
     mbr = bytearray(SECTOR)
+    if bios_stage1:
+        if len(bios_stage1) != SECTOR or bios_stage1[510:512] != b"\x55\xAA" or any(bios_stage1[446:510]):
+            raise SystemExit("stage one must be a 512-byte sector with its code below byte 446 and the 0x55AA signature")
+        if len(bios_stage2) > BIOS_STAGE2_SECTORS * SECTOR:
+            raise SystemExit(f"stage two is {len(bios_stage2)} bytes; stage one loads only {BIOS_STAGE2_SECTORS * SECTOR}")
+        mbr[0:446] = bios_stage1[0:446]
     struct.pack_into("<B3sB3sII", mbr, 446, 0, b"\x00\x02\x00", 0xEE, b"\xFF\xFF\xFF", 1, IMAGE_SECTORS - 1)
     mbr[510:512] = b"\x55\xAA"
     image[0:SECTOR] = mbr
+    if bios_stage2:
+        image[BIOS_STAGE2_LBA * SECTOR:BIOS_STAGE2_LBA * SECTOR + len(bios_stage2)] = bios_stage2
 
     write_gpt(image, DISK_GUID, payload_guid, FOSFS_GUID)
 
@@ -271,13 +292,27 @@ def main():
     parser.add_argument("--payload-guid", type=uuid.UUID, default=PAYLOAD_GUID,
                         help="unique GUID of the payload partition; the kernel finds its boot disk by it, so two disks "
                              "built from the same image need different ones")
+    parser.add_argument("--bios-stage1", type=Path, help="boot/bios stage one (512 bytes): makes the disk bootable by BIOS too "
+                        "(default: build/bios/stage1.bin if `make` has built it)")
+    parser.add_argument("--bios-stage2", type=Path, help="boot/bios stage two, written into the GPT boot gap at LBA 64 "
+                        "(default: build/bios/stage2.bin)")
+    parser.add_argument("--no-bios", action="store_true", help="build a UEFI-only image")
     arguments = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    if not arguments.no_bios and not arguments.bios_stage1 and not arguments.bios_stage2:
+        stage1, stage2 = root / "build/bios/stage1.bin", root / "build/bios/stage2.bin"
+        if stage1.exists() and stage2.exists():
+            arguments.bios_stage1, arguments.bios_stage2 = stage1, stage2
+    if bool(arguments.bios_stage1) != bool(arguments.bios_stage2):
+        parser.error("--bios-stage1 and --bios-stage2 go together")
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     files = [("readme.txt", b"Welcome to FOSFS on fos v2.\nTry: ls, cat readme.txt, write NAME TEXT.\n")]
     for spec in arguments.file:
         name, _, path = spec.partition("=")
         files = [item for item in files if item[0] != name] + [(name, Path(path).read_bytes())]
-    arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files, arguments.label, arguments.payload_guid))
+    arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files, arguments.label, arguments.payload_guid,
+                                                arguments.bios_stage1.read_bytes() if arguments.bios_stage1 else b"",
+                                                arguments.bios_stage2.read_bytes() if arguments.bios_stage2 else b""))
     print(f"wrote {arguments.output}")
 
 

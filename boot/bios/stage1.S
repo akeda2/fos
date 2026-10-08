@@ -13,7 +13,7 @@
  */
 .code16
 .set STAGE2_LBA, 64
-.set STAGE2_SECTORS, 16
+.set STAGE2_SECTORS, 24
 .set STAGE2_ADDRESS, 0x8000
 
 .global _start

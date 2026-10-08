@@ -36,6 +36,12 @@ CODE_CANDIDATES = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE
 VARS_CANDIDATES = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd",
                    "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"]
 FINAL_MARKER = "M3 complete"
+# `make test-bios-boot` runs this same test with a qemu shim that drops the OVMF drives (tools/qemu_bios_shim.py), so the
+# image is booted through boot/bios instead of the UEFI loader: the loader's own narration and the framebuffer are
+# different there, everything the kernel and the shell do must be the same.
+BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
+# What each boot path prints once per boot, for the tests that count boots.
+LOADER_BANNER = "Fosfor stage 2 (BIOS path)" if BIOS else "FOS v2 loader (milestone M1)"
 MCAST_GROUP, MCAST_PORT = "230.42.42.44", 4244
 HOST_MAC = bytes.fromhex("02deadbeef03")
 BROADCAST = b"\xff" * 6
@@ -204,19 +210,32 @@ def main():
                 process.kill()
 
     # --- the loader (M0 + M1) ---
-    check("FOS v2 loader (milestone M1): UEFI application running." in text, "OVMF boots BOOTX64.EFI from the ESP", text)
-    check(re.search(r"UEFI specification \d+\.\d+", text) is not None, "the loader reports the UEFI version", text)
-    entries = re.search(r"Memory map: (\d+) entries", text)
-    check(entries is not None and int(entries.group(1)) > 10, "it reads the memory map", text)
-    reusable = re.search(r"Reusable after ExitBootServices: (\d+) MiB", text)
-    check(reusable is not None and 300 < int(reusable.group(1)) < 520, f"most of the 512 MiB guest is reusable ({reusable and reusable.group(1)} MiB)", text)
-    check(re.search(r"Graphics: \d+x\d+ (RGB|BGR)", text) is not None, "it finds the GOP framebuffer", text)
-    check("ACPI 2.0+ RSDP at" in text and "signature valid" in text, "and a valid ACPI 2.0+ RSDP", text)
-    check(re.search(r"Payload partition: LBA \d+ \+ \d+ sectors", text) is not None, "it finds the payload partition by its GPT type", text)
-    check(re.search(r"Slot metadata: booting slot 0 \(active 0, pending None", text) is not None, "reads the slot metadata", text)
-    kernel = re.search(r"Kernel at (0x[0-9a-f]+), (\d+) KiB, entry (0x[0-9a-f]+)", text)
-    check(kernel is not None, "loads the kernel ELF at an address of its own choosing", text)
-    check("Exiting boot services" in text, "and exits boot services", text)
+    if BIOS:
+        check("Fosfor stage 2 (BIOS path): real mode, 16-bit." in text, "SeaBIOS boots the MBR and stage two", text)
+        check("A20 line: ok" in text, "stage two enables and verifies A20", text)
+        entries = re.findall(r"^    0x[0-9A-F]{16} \+ 0x[0-9A-F]{16} type \d\d", text, re.M)
+        check(len(entries) >= 4, f"it reads the BIOS memory map ({len(entries)} E820 entries)", text)
+        check(re.search(r"ACPI RSDP: [0-9A-F]{8}", text) is not None, "and finds the ACPI RSDP in BIOS memory", text)
+        check(re.search(r"looking for the payload partition\.\.\. found at LBA 0x[0-9A-F]{8}, 0x[0-9A-F]{8}", text) is not None, "it finds the payload partition by its GPT type", text)
+        check("Slot metadata: booting slot 0\r\n" in text or "Slot metadata: booting slot 0\n" in text, "reads the slot metadata and runs the A/B state machine", text)
+        check("copying it above 1 MiB (unreal mode): ok" in text and "Entering long mode" in text, "reads the kernel slot, copies it above 1 MiB and enters long mode", text)
+        kernel = re.search(r"BootInfo: version 5, kernel at (0x[0-9a-f]+)", text)
+        check(kernel is not None, "places the kernel ELF at its base address", text)
+    else:
+        check("FOS v2 loader (milestone M1): UEFI application running." in text, "OVMF boots BOOTX64.EFI from the ESP", text)
+        check(re.search(r"UEFI specification \d+\.\d+", text) is not None, "the loader reports the UEFI version", text)
+        entries = re.search(r"Memory map: (\d+) entries", text)
+        check(entries is not None and int(entries.group(1)) > 10, "it reads the memory map", text)
+        reusable = re.search(r"Reusable after ExitBootServices: (\d+) MiB", text)
+        check(reusable is not None and 300 < int(reusable.group(1)) < 520, f"most of the 512 MiB guest is reusable ({reusable and reusable.group(1)} MiB)", text)
+        check(re.search(r"Graphics: \d+x\d+ (RGB|BGR)", text) is not None, "it finds the GOP framebuffer", text)
+        check("ACPI 2.0+ RSDP at" in text and "signature valid" in text, "and a valid ACPI 2.0+ RSDP", text)
+        check(re.search(r"Payload partition: LBA \d+ \+ \d+ sectors", text) is not None, "it finds the payload partition by its GPT type", text)
+        check(re.search(r"Slot metadata: booting slot 0 \(active 0, pending None", text) is not None, "reads the slot metadata", text)
+        kernel = re.search(r"Kernel at (0x[0-9a-f]+), (\d+) KiB, entry (0x[0-9a-f]+)", text)
+        check(kernel is not None, "loads the kernel ELF at an address of its own choosing", text)
+        check("Exiting boot services" in text, "and exits boot services", text)
+
 
     # --- the kernel (M1) ---
     check("FOS v2 kernel (milestone M4): running in 64-bit long mode." in text, "the kernel starts in long mode", text)
@@ -226,8 +245,11 @@ def main():
     check("Allocator self-test: ok" in text, "the allocator's bookkeeping, contiguity and below-4-GiB promises hold", text)
     check("GDT + TSS loaded" in text and "IDT loaded: 256 gates" in text, "the kernel installs its own GDT, TSS and IDT", text)
     check("NX and write-protect on" in text and "stack guard pages unmapped" in text, "and its own page tables with NX, read-only text and guard pages", text)
-    check(re.search(r"Framebuffer console ready: \d+ columns x \d+ rows, mapped (write-combining|uncached)", text) is not None, "the framebuffer console comes up", text)
-    check(re.search(r"ACPI 2\.0\+: PM timer at port 0x[0-9a-f]+ \(\d+-bit\), local APIC at 0x[0-9a-f]+", text) is not None, "the kernel reads the ACPI FADT and MADT", text)
+    if BIOS:
+        check("No framebuffer: serial console only." in text, "without a framebuffer the console is serial only", text)
+    else:
+        check(re.search(r"Framebuffer console ready: \d+ columns x \d+ rows, mapped (write-combining|uncached)", text) is not None, "the framebuffer console comes up", text)
+    check(re.search(r"ACPI (1\.0|2\.0\+): PM timer at port 0x[0-9a-f]+ \(\d+-bit\), local APIC at 0x[0-9a-f]+", text) is not None, "the kernel reads the ACPI FADT and MADT", text)
     check("ticking at 100 Hz" in text, "the local APIC timer is calibrated and running", text)
     check("1 breakpoint(s) delivered and handled" in text, "a breakpoint exception is delivered and handled", text)
     milliseconds = re.search(r"100 ticks took (\d+) ms by the PM timer", text)
@@ -252,6 +274,9 @@ def main():
     check("no such file" in transcript["cat hello.txt#2"], "`rm` removes it again", transcript["cat hello.txt#2"])
     check(exited_by_itself, "`shutdown` over the network powers the machine off through the UEFI runtime services", text)
 
+    if BIOS:
+        print("v2 boot via BIOS: all checks passed")
+        return
     # --- the framebuffer, as QEMU displays it ---
     check(pixel is not None and width >= 640, f"QEMU produced a screendump ({width}x{height})", text)
     bar_y = height - 48 + 16

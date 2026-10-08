@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_boot import check  # noqa: E402
+from test_boot import BIOS, check  # noqa: E402
 from test_debug_mode import Machine  # noqa: E402
 
 
@@ -25,7 +25,8 @@ def main():
             boot = run("bootinfo")
             check("version 5" in boot and "graphics" in boot and "payload" in boot, "bootinfo shows the loader's handoff", boot)
             memory = run("memmap")
-            check("usable" in memory and "MiB of conventional" in memory and "runtime" in memory, "memmap lists the firmware's map and totals the usable memory", memory)
+            # a BIOS memory map has no UEFI runtime-services regions
+            check("usable" in memory and "MiB of conventional" in memory and ("runtime" in memory or BIOS), "memmap lists the firmware's map and totals the usable memory", memory)
             pci = run("pci read 0:0.0 0 16")
             check("0x00: 29c08086" in pci, "pci read dumps config space (q35 host bridge 8086:29c0)", pci)
             check("no device" in run("pci read 0:1f.7"), "pci read says when nothing answers", "")

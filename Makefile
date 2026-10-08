@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios-spike
+.PHONY: all help clean bios
 
 all: image tapes
 
@@ -27,6 +27,9 @@ clean:
 	rm -rf $(BUILD)
 
 OUT := $(BUILD)/v2
+# The BIOS boot chain's binaries; defined here, before the `image` rule, because prerequisites are expanded when read.
+BIOS_OUT := $(BUILD)/bios
+BIOS_STAGES := $(BIOS_OUT)/stage1.bin $(BIOS_OUT)/stage2.bin
 LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fos-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fos-v2-kernel
 IMAGE := $(OUT)/v2.img
@@ -68,9 +71,10 @@ tapes: $(OPUS_LIB)
 # A bootable disk image: GPT + a FAT32 EFI System Partition with \EFI\BOOT\BOOTX64.EFI
 # and a payload partition with the kernel in slot 0 (tools/build_image.py;
 # standard library only).
-image: loader kernel tapes
+image: loader kernel tapes $(BIOS_STAGES)
 	mkdir -p $(OUT)
-	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) --output $(IMAGE) $(TAPE_FILES)
+	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) --output $(IMAGE) \
+		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin $(TAPE_FILES)
 
 # Boot the image under QEMU + OVMF with the serial console on the terminal.
 run: image
@@ -239,33 +243,36 @@ opus-lib: $(OPUS_LIB)
 tape-opus-bench: $(OPUS_LIB)
 	cd tapes/opus-bench && RUSTFLAGS="$(TAPE_LINK) -L $(CURDIR)/$(OUT)/opus-fixed -l static=opus_fixed" cargo +nightly-2026-09-13 build --release
 
+# ---- The BIOS boot path (boot/bios) ----
+# Stage one (the MBR, 512 bytes) and stage two (real mode -> long mode -> the kernel) are plain GNU as/ld, flat binaries
+# linked at their load addresses; `as --64` accepts the .code16/.code32 sections they contain. `make image` writes both
+# into the disk image (the MBR's code area and the GPT boot gap), so the one image boots under UEFI and under BIOS.
+BIOS_ADDRESS_stage1 := 0x7c00
+BIOS_ADDRESS_stage2 := 0x8000
+$(BIOS_OUT)/%.bin: boot/bios/%.S
+	mkdir -p $(BIOS_OUT)
+	as --64 -o $(BIOS_OUT)/$*.o $<
+	ld -m elf_x86_64 -Ttext=$(BIOS_ADDRESS_$*) --oformat binary -o $@ $(BIOS_OUT)/$*.o
+bios: $(BIOS_STAGES)
+
+# make test-bios-NAME: the existing test tools/test_NAME.py, with QEMU's firmware swapped for SeaBIOS so the image is booted
+# by the BIOS path (tools/qemu_bios_shim.py strips the OVMF drives from every qemu command line the test builds).
+BIOS_SHIM := $(BIOS_OUT)/shim
+BIOS_TESTS := boot config debug-mode tapes scripts lineedit ed msi nic netfs nettest diag format disks stick-guids
+$(BIOS_SHIM)/qemu-system-x86_64: tools/qemu_bios_shim.py
+	mkdir -p $(BIOS_SHIM)
+	cp $< $@
+	chmod +x $@
+.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios
+$(addprefix test-bios-,$(BIOS_TESTS)): test-bios-%: image $(BIOS_SHIM)/qemu-system-x86_64
+	PATH=$(abspath $(BIOS_SHIM)):$$PATH FOS_FIRMWARE=bios python3 tools/test_$(subst -,_,$*).py
+test-bios: $(addprefix test-bios-,$(BIOS_TESTS))
+
 # Every test-* target in turn (slow); prints a summary and fails if any failed. Run one by name for quick iteration.
-ALL_TESTS := $(filter-out test-all,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile)))
+ALL_TESTS := $(filter-out test-all test-bios,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS))
 .PHONY: test-all
 test-all: image
 	@failed=""; for t in $(ALL_TESTS); do \
 		if $(MAKE) --no-print-directory $$t; then echo "PASS $$t"; else echo "FAIL $$t"; failed="$$failed $$t"; fi; done; \
 	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi; echo "all tests passed"
 
-# ---- BIOS boot path, spike B1 (docs/shared-codebase.md): stage one + stage two + a 64-bit test kernel ----
-# Plain GNU as/ld: the 16-, 32- and 64-bit parts are all assembled with `as --64` (which accepts .code16/.code32) and
-# linked as flat binaries at their load addresses.
-BIOS_SPIKE := $(BUILD)/bios-spike
-$(BIOS_SPIKE)/%.bin: boot/bios/%.S
-	mkdir -p $(BIOS_SPIKE)
-	as --64 -o $(BIOS_SPIKE)/$*.o $<
-	ld -m elf_x86_64 -Ttext=$(BIOS_SPIKE_ADDRESS_$*) --oformat binary -o $@ $(BIOS_SPIKE)/$*.o
-BIOS_SPIKE_ADDRESS_stage1 := 0x7c00
-BIOS_SPIKE_ADDRESS_stage2 := 0x8000
-$(BIOS_SPIKE)/spike_kernel.bin: boot/bios/spike_kernel.S
-	mkdir -p $(BIOS_SPIKE)
-	as --64 -o $(BIOS_SPIKE)/spike_kernel.o $<
-	ld -m elf_x86_64 -Ttext=0x100000 --oformat binary -o $@ $(BIOS_SPIKE)/spike_kernel.o
-$(BIOS_SPIKE)/spike.img: $(BIOS_SPIKE)/stage1.bin $(BIOS_SPIKE)/stage2.bin $(BIOS_SPIKE)/spike_kernel.bin tools/build_bios_spike.py
-	python3 tools/build_bios_spike.py --stage1 $(BIOS_SPIKE)/stage1.bin --stage2 $(BIOS_SPIKE)/stage2.bin --kernel $(BIOS_SPIKE)/spike_kernel.bin --output $@
-bios-spike: $(BIOS_SPIKE)/spike.img
-
-.PHONY: test-bios-spike
-# SeaBIOS (QEMU's default firmware) boots the spike image into long mode on two chipsets and memory sizes.
-test-bios-spike: bios-spike
-	python3 tools/test_bios_spike.py
