@@ -1,4 +1,4 @@
-//! `play NAME`: plays a WAV file on the USB audio device's outputs.
+//! `play NAME`: plays a WAV file on the audio device's outputs (USB audio or HD Audio).
 //!
 //! ```text
 //! tape run play tone.wav
@@ -6,7 +6,7 @@
 //! ```
 //!
 //! `device=N` picks the audio device (numbered as the `audio` command lists them) for this run only; without it the
-//! operator's choice, or the automatic one, is used. It needs a kernel with tape API version 3.
+//! operator's choice, or the automatic one, is used. It needs a kernel with tape API version 3. Every audio tape takes it.
 //!
 //! Reads PCM WAV files of 8, 16, 24 or 32 bits. The file's sample rate must be one the device
 //! offers; its sample width and channel count are converted to the device's playback format (a
@@ -71,26 +71,16 @@ fn sample(bytes: &[u8], bits: usize) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     tape_rt::init(api);
-    let mut name = core::str::from_utf8(tape_rt::args()).unwrap_or("").trim();
-    if let Some(rest) = name.strip_prefix("device=") {
-        let (number, file) = rest.split_once(' ').unwrap_or((rest, ""));
-        let Ok(number) = number.parse::<u32>() else {
-            return println!("Usage: tape run play [device=N] NAME.wav");
-        };
-        if api.version < 3 || (api.size as usize) < core::mem::size_of::<TapeApi>() {
-            return println!("play: this kernel cannot choose an audio device (tape API version 3 needed).");
-        }
-        if (api.audio_use_device)(number) != 0 {
-            return println!("play: there is no audio device {number} (`audio` lists them).");
-        }
-        name = file.trim();
-    }
+    let name = match tape_rt::take_audio_device_arg(api, core::str::from_utf8(tape_rt::args()).unwrap_or("").trim()) {
+        Ok(rest) => rest.trim(),
+        Err(reason) => return println!("play: {reason}."),
+    };
     if name.is_empty() {
         return println!("Usage: tape run play [device=N] NAME.wav");
     }
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 {
-        return println!("play: no USB audio device.");
+        return println!("play: no audio device (USB audio or HD Audio).");
     }
     if info.playback_channels == 0 {
         return println!("play: the device has no outputs.");

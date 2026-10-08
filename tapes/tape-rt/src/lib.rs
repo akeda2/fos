@@ -44,6 +44,60 @@ pub fn args() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(api.args, api.args_len) }
 }
 
+/// Whether the kernel's table has the version-3 audio-device calls (`audio_devices`, `audio_use_device`): a tape built for
+/// 3 can still run on an older kernel, where it simply cannot choose or name the device.
+pub fn has_audio_device_calls(api: &TapeApi) -> bool {
+    api.version >= 3 && (api.size as usize) >= core::mem::size_of::<TapeApi>()
+}
+
+/// The audio device the `audio_*` calls currently use (`audio device N|auto`, or a tape's `device=N`), if the kernel can say.
+pub fn active_audio_device(api: &TapeApi) -> Option<AudioDevice> {
+    if !has_audio_device_calls(api) {
+        return None;
+    }
+    let count = (api.audio_devices)(0, core::ptr::null_mut());
+    for number in 1..=count {
+        let mut device = AudioDevice::default();
+        (api.audio_devices)(number, &mut device);
+        if device.active == 1 {
+            return Some(device);
+        }
+    }
+    None
+}
+
+/// How to show an audio device to a person: "USB audio" or "HD Audio 00:07.0 (10de:044a)" (PCI location and IDs).
+pub struct AudioDeviceName(pub AudioDevice);
+
+impl core::fmt::Display for AudioDeviceName {
+    fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let device = &self.0;
+        if device.kind == AUDIO_KIND_HDA {
+            let location = device.pci_location;
+            write!(out, "HD Audio {:02x}:{:02x}.{} ({:04x}:{:04x})", (location >> 16) & 0xff, (location >> 8) & 0xff, location & 7, device.vendor, device.id)
+        } else {
+            write!(out, "USB audio")
+        }
+    }
+}
+
+/// Every audio tape accepts a leading `device=N` (the number `audio` lists; 0 = automatic): it picks the audio device for
+/// this run, and is removed from the arguments. Returns what is left, or why the device cannot be chosen. The choice is
+/// undone by the kernel when the tape ends, so the operator's own `audio device N` is never overridden.
+pub fn take_audio_device_arg<'a>(api: &TapeApi, arguments: &'a str) -> Result<&'a str, &'static str> {
+    let trimmed = arguments.trim_start();
+    let Some(rest) = trimmed.strip_prefix("device=") else { return Ok(arguments) };
+    let (number, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let Ok(number) = number.parse::<u32>() else { return Err("device=N needs a number (`audio` lists the devices; 0 = automatic)") };
+    if !has_audio_device_calls(api) {
+        return Err("this kernel cannot choose an audio device (tape API 3 needed)");
+    }
+    if (api.audio_use_device)(number) != 0 {
+        return Err("there is no such audio device (`audio` lists them)");
+    }
+    Ok(after.trim_start())
+}
+
 pub struct Console;
 
 static mut QUIET: bool = false;

@@ -305,7 +305,18 @@ fn probe_all_ehci() -> usize {
     for index in 0..ehci::count() {
         let Some(controller) = ehci::controller(index) else { continue };
         for port in 1..=controller.ports {
-            if !controller.port_has_device(port) || controller.claimed_ports & (1 << port) != 0 {
+            if controller.claimed_ports & (1 << port) != 0 {
+                if !controller.port_connect_changed(port) {
+                    continue; // still the device we enumerated
+                }
+                // It was unplugged, or unplugged and plugged back in (a bumped cable, a stick moved to another machine and
+                // returned). Forget the claim and look at the port afresh; a disk that comes back is recognised in
+                // usb_storage::register and takes over its old disk number.
+                controller.claimed_ports &= !(1 << port);
+                crate::println!("USB: EHCI {:02x}:{:02x}.{} port {port}: its device was unplugged or replugged; looking at the port again.",
+                    controller.pci.bus, controller.pci.device, controller.pci.function);
+            }
+            if !controller.port_has_device(port) {
                 continue;
             }
             let mut found = [None; 8];
@@ -338,7 +349,7 @@ fn probe_all_ehci() -> usize {
                 }
             };
             for device in found[..count].iter().flatten() {
-                match setup_ehci_keyboard(index, controller, device) {
+                match setup_ehci_keyboard(index, controller, device, if device.target.hub_address == 0 { port } else { 0 }) {
                     Ok(true) => {
                         controller.claimed_ports |= 1 << port;
                         added += 1;
@@ -352,7 +363,7 @@ fn probe_all_ehci() -> usize {
     added
 }
 
-fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controller, found: &ehci::Found) -> Result<bool, ehci::Error> {
+fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controller, found: &ehci::Found, root_port: u8) -> Result<bool, ehci::Error> {
     let target = found.target;
     let (vendor, product) = (u16::from_le_bytes([found.descriptor[8], found.descriptor[9]]), u16::from_le_bytes([found.descriptor[10], found.descriptor[11]]));
     let mut configuration = [0u8; 256];
@@ -362,7 +373,7 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
     let Some((interface, endpoint, max_packet, _interval)) = find_boot_keyboard(&configuration[..total]) else {
         if let Some(endpoints) = usb_storage::find_endpoints(&configuration[..total]) {
             controller.set_configuration(&target, configuration[5])?;
-            if let Some(disk) = usb_storage::attach_ehci(controller_index, target, endpoints) {
+            if let Some(disk) = usb_storage::attach_ehci(controller_index, target, root_port, endpoints) {
                 crate::println!("USB storage {vendor:04x}:{product:04x} on EHCI {:02x}:{:02x}.{}: {}.", controller.pci.bus, controller.pci.device, controller.pci.function, crate::storage::DiskNumber(disk));
                 return Ok(true);
             }

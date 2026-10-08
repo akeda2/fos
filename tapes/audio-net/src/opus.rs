@@ -37,7 +37,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let mut info = AudioInfo::default();
     let device = (api.audio_info)(&mut info) != 0 && info.capture_channels != 0;
     if options.tone.is_none() && !device {
-        return println!("audio-net send: no USB audio device with inputs (use src=tone=440 to send a test tone).");
+        return println!("audio-net send: no audio device with inputs (use src=tone=440 to send a test tone).");
     }
     if options.rate != RATE {
         return println!("audio-net send: codec=opus is 48000 Hz only.");
@@ -210,7 +210,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     }
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
-        return println!("audio-net recv: no USB audio device with outputs.");
+        return println!("audio-net recv: no audio device with outputs.");
     }
     if options.rate != RATE {
         return println!("audio-net recv: codec=opus is 48000 Hz only.");

@@ -289,8 +289,32 @@ chosen:
     movw $1, dap_count
     movw $0, dap_offset
     call disk_write
-    jnc 1f
-    movw $m_meta_ro, %si                /* read-only media: carry on, but fallback tracking is off this boot */
+    jc 2f
+    /* Some BIOSes report a USB write as done without it taking effect (or corrupt it), and the kernel's
+     * crash tracking and A/B fallback live in this sector: read it back and compare before trusting it. */
+    movl payload_first, %eax
+    movl %eax, dap_lba
+    movw $1, dap_count
+    movw $0, dap_offset
+    call disk_read
+    jc 2f
+    movw $BUFFER_SEGMENT, %ax
+    movw %ax, %es
+    xorw %di, %di
+    movw $meta, %si
+    movw $512, %cx
+    cld
+    repe cmpsb                          /* DS:SI (our copy) against ES:DI (what the disk now holds) */
+    xorw %ax, %ax
+    movw %ax, %es
+    jne 3f
+    movw $m_meta_ok, %si
+    call puts16
+    jmp 1f
+3:  movw $m_meta_mismatch, %si          /* it did not stick: say so, the disk's old content is what the kernel will see */
+    call puts16
+    jmp 1f
+2:  movw $m_meta_ro, %si                /* read-only media: carry on, but fallback tracking is off this boot */
     call puts16
 1:
 
@@ -1333,6 +1357,8 @@ m_kernel_slot:.asciz "  Kernel slot "
 m_colon:      .asciz ": "
 m_sectors_kib:.asciz " sectors ("
 m_kib_end:    .asciz " KiB).\r\n"
+m_meta_ok:    .asciz "  Slot metadata written back and read back identical.\r\n"
+m_meta_mismatch: .asciz "  WARNING: the slot metadata read back DIFFERENT from what was written (the BIOS write did not take effect, or corrupted it).\r\n"
 m_meta_ro:    .asciz "  Warning: the slot metadata could not be written back; fallback tracking is off this boot.\r\n"
 m_place:      .asciz "  Placement (from the memory map): kernel image at 0x"
 m_place_staging: .asciz ", read buffer at 0x"

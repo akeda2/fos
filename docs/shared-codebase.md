@@ -215,6 +215,14 @@ QEMU never produces the real condition, so the tests inject a spurious IRQ7 by s
 `info pic` for the remap and masks. Lesson recorded in AGENTS.md: a firmware's leftover interrupt-controller state is
 a hardware fact the emulator hides.
 
+Follow-ups from that first run (all in QEMU-tested code; the AMD board has not run them yet): `debug slots` and
+`sector diskN LBA` explain a metadata sector that cannot be read (the first AMD "not readable" was simply the boot stick
+being in another machine); stage two reads the metadata back after writing it; an unplugged EHCI disk fails immediately
+and a returning stick takes over its old disk (`make test-usb-replug`); audio tapes name their device and accept
+`device=N`. Not done: the RTL8168H on that board stays on polled interrupts (its MSI self-test needs a transmitted
+frame, and the link is not up yet at init); no OHCI/UHCI driver (USB keyboards there rely on BIOS legacy emulation);
+the xHCI storage path has no replug recovery.
+
 ## 5. Migration, in order
 
 | # | Step | Done when |

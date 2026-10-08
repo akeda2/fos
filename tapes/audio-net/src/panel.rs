@@ -396,9 +396,12 @@ fn draw_form(settings: &Settings, selected: usize, editing: bool, info: &AudioIn
     draw!(" fos audio-net: settings        this machine is called {}\x1b[K", effective_name(settings).as_str());
     at(2, 1);
     if info.capture_channels == 0 && info.playback_channels == 0 {
-        draw!(" Device: no USB audio device found (send can use a test tone)\x1b[K");
+        draw!(" Device: no audio device found (send can use a test tone)\x1b[K");
     } else {
-        draw!(" Device: USB audio (class {}.0), {} inputs / {} outputs, {} bit\x1b[K", info.class_version, info.capture_channels, info.playback_channels, info.capture_bits);
+        match tape_rt::active_audio_device(tape_rt::api()) {
+            Some(device) => draw!(" Device: {}, {} inputs / {} outputs, {} bit\x1b[K", tape_rt::AudioDeviceName(device), info.capture_channels, info.playback_channels, info.capture_bits),
+            None => draw!(" Device: USB audio (class {}.0), {} inputs / {} outputs, {} bit\x1b[K", info.class_version, info.capture_channels, info.playback_channels, info.capture_bits),
+        }
     }
     at(3, 1);
     draw!(" {:-<78}", "");

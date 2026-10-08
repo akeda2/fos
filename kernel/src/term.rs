@@ -1151,6 +1151,7 @@ fn execute(command: &str) {
             crate::println!("clear     clear the screen");
             crate::println!("nic       the network interfaces (list); nic use|sniff|discover|peers|map|regs|send|recv");
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
+            crate::println!("sector diskN LBA [COUNT]   raw read-only dump of disk sectors (a GPT header, the slot metadata)");
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
             crate::println!("format diskN exfat [LABEL]    erase a disk and make it one exFAT volume for PCs");
@@ -1226,6 +1227,46 @@ fn execute(command: &str) {
             match address {
                 Some(address) if length <= 4096 => hexdump(address, length as usize),
                 _ => crate::println!("Usage: hexdump ADDRESS [LENGTH <= 4096]  (decimal or 0x hex)"),
+            }
+        }
+        "sector" => {
+            // `sector diskN LBA [COUNT]`: a raw read-only dump, to look at what is really on a disk (a GPT header, the slot
+            // metadata, a boot sector) when a driver or loader misbehaves on hardware we cannot attach a debugger to.
+            const USAGE: &str = "Usage: sector diskN LBA [COUNT <= 4]   (decimal or 0x hex; read-only)";
+            let disk = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
+            let lba = words.next().and_then(parse_number);
+            let count = words.next().and_then(parse_number).unwrap_or(1);
+            let (Some(number), Some(lba)) = (disk, lba) else { return crate::println!("{USAGE}") };
+            if number == 0 || count == 0 || count > 4 {
+                return crate::println!("{USAGE}");
+            }
+            for offset in 0..count {
+                let mut sector = [0u8; 512];
+                if let Err(error) = crate::block::read(number - 1, lba + offset, &mut sector) {
+                    return crate::println!("disk{number} sector {}: read failed ({error:?}).", lba + offset);
+                }
+                crate::println!("disk{number} sector {}:", lba + offset);
+                let mut skipped = false;
+                for (row, bytes) in sector.chunks(16).enumerate() {
+                    // runs of identical rows (zeros, mostly) are folded into one "*" line, as hexdump does
+                    if row > 0 && row < 31 && bytes == &sector[(row - 1) * 16..row * 16] && bytes == &sector[(row + 1) * 16..(row + 2) * 16] {
+                        if !skipped {
+                            crate::println!("*");
+                            skipped = true;
+                        }
+                        continue;
+                    }
+                    skipped = false;
+                    crate::print(format_args!("{:03x}  ", row * 16));
+                    for byte in bytes {
+                        crate::print(format_args!("{byte:02x} "));
+                    }
+                    crate::print(format_args!(" "));
+                    for &byte in bytes {
+                        crate::print(format_args!("{}", if (0x20..0x7f).contains(&byte) { byte as char } else { '.' }));
+                    }
+                    crate::println!();
+                }
             }
         }
         "nic" if matches!(words.clone().next(), Some("regs")) => {

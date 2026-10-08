@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image
+.PHONY: all help clean bios print-image test-usb-replug
 
 all: image tapes
 
@@ -22,6 +22,10 @@ help:
 	@echo "make test-all     every test-* target in turn, with a summary"
 	@echo "make loader|kernel|tapes   build one part"
 	@echo "make clean        remove $(BUILD)/"
+
+# A stick that is unplugged and plugged back in (QEMU monitor device_del / device_add) gets its disk number back.
+test-usb-replug: image
+	python3 tools/test_usb_replug.py
 
 # `make -s print-image`: the path `make image` writes (tools/build_image.py's DEFAULT_IMAGE must equal it; test-stick-guids checks).
 print-image:
@@ -267,21 +271,25 @@ $(BIOS_SHIM)/qemu-system-x86_64: tools/qemu_bios_shim.py
 	mkdir -p $(BIOS_SHIM)
 	cp $< $@
 	chmod +x $@
-.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios test-bios-placement test-bios-video
+.PHONY: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios test-bios-placement test-bios-video test-bios-sector
 $(addprefix test-bios-,$(BIOS_TESTS)): test-bios-%: image $(BIOS_SHIM)/qemu-system-x86_64
 	PATH=$(abspath $(BIOS_SHIM)):$$PATH FOS_FIRMWARE=bios python3 tools/test_$(subst -,_,$*).py
-test-bios: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video
+test-bios: $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector
 
 # The two ways to skip the video mode switch: a held Shift key, and `debug video skip` (a flag in the slot metadata).
 test-bios-video: image
 	python3 tools/test_bios_video.py
+
+# `sector diskN LBA`, the metadata write-back check in stage two, and why `debug slots` cannot read a bad metadata sector.
+test-bios-sector: image
+	python3 tools/test_bios_sector.py
 
 # Stage two picks the kernel's address from the E820 map: boots with 512 MiB, 40 MiB and (expected to stop with a message) 8 MiB.
 test-bios-placement: image
 	python3 tools/test_bios_placement.py
 
 # Every test-* target in turn (slow); prints a summary and fails if any failed. Run one by name for quick iteration.
-ALL_TESTS := $(filter-out test-all test-bios test-bios-placement test-bios-video,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video
+ALL_TESTS := $(filter-out test-all test-bios test-bios-placement test-bios-video test-bios-sector,$(filter test-%,$(shell sed -n 's/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector
 .PHONY: test-all
 test-all: image
 	@failed=""; for t in $(ALL_TESTS); do \

@@ -1,4 +1,4 @@
-//! `recorder`: a field recorder for the USB audio interface.
+//! `recorder [device=N]`: a field recorder for the audio interface (USB audio or HD Audio).
 //!
 //! ```text
 //! tape run recorder                          meters and a pre-roll buffer at once; R starts a take
@@ -629,14 +629,17 @@ fn draw_status(app: &App, ring: &PreRoll, detector: &Detector, auto: bool, optio
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     tape_rt::init(api);
-    let arguments = core::str::from_utf8(tape_rt::args()).unwrap_or("");
+    let arguments = match tape_rt::take_audio_device_arg(api, core::str::from_utf8(tape_rt::args()).unwrap_or("")) {
+        Ok(rest) => rest,
+        Err(reason) => return println!("recorder: {reason}."),
+    };
     let Some(options) = parse(arguments) else {
-        return println!("Usage: tape run recorder [NAME] [pre=SECONDS] [rate=HZ] [auto] [thresh=DB] [sound=MS] [silence=MS] [tone=HZ [gate=ON,OFF]]");
+        return println!("Usage: tape run recorder [device=N] [NAME] [pre=SECONDS] [rate=HZ] [auto] [thresh=DB] [sound=MS] [silence=MS] [tone=HZ [gate=ON,OFF]]");
     };
     let mut info = AudioInfo::default();
     if options.tone.is_none() {
         if (api.audio_info)(&mut info) == 0 {
-            return println!("recorder: no USB audio device.");
+            return println!("recorder: no audio device (USB audio or HD Audio).");
         }
         if info.capture_channels == 0 {
             return println!("recorder: the device has no inputs.");

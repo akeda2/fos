@@ -92,11 +92,29 @@ pub fn set_payload(disk: usize, start: u64) {
 
 // ---- slot metadata ----
 
-pub fn read_metadata() -> Option<SlotMetadata> {
-    let (disk, start) = unsafe { PAYLOAD }?;
+/// Why the slot-metadata sector could not be used.
+pub enum MetadataProblem {
+    /// The payload partition was never located (no boot disk found).
+    NoPayload,
+    /// The disk driver failed the read.
+    Read(block::Error),
+    /// The sector was read but is not valid metadata: its first bytes, for the operator to compare with `"FOSM"` + version 1.
+    Invalid([u8; 16]),
+}
+
+pub fn read_metadata_checked() -> Result<SlotMetadata, MetadataProblem> {
+    let (disk, start) = unsafe { PAYLOAD }.ok_or(MetadataProblem::NoPayload)?;
     let mut sector = [0u8; 512];
-    block::read(disk, start, &mut sector).ok()?;
-    SlotMetadata::parse(&sector)
+    block::read(disk, start, &mut sector).map_err(MetadataProblem::Read)?;
+    SlotMetadata::parse(&sector).ok_or_else(|| {
+        let mut head = [0u8; 16];
+        head.copy_from_slice(&sector[..16]);
+        MetadataProblem::Invalid(head)
+    })
+}
+
+pub fn read_metadata() -> Option<SlotMetadata> {
+    read_metadata_checked().ok()
 }
 
 pub fn write_metadata(metadata: &SlotMetadata) -> bool {
@@ -165,14 +183,19 @@ pub fn housekeeping() {
 
 pub fn slot_summary(print: impl Fn(core::fmt::Arguments)) {
     print(format_args!("booted slot: {}", unsafe { BOOT_SLOT }));
-    match read_metadata() {
-        Some(m) => {
+    match read_metadata_checked().map_err(|problem| problem) {
+        Ok(m) => {
             print(format_args!("active slot: {}, pending: {:?}, attempted: {}, confirmed: {}", m.active_slot, m.pending_slot, m.attempted, m.confirmed));
             print(format_args!("slot sizes (sectors): {} / {}", m.slot_sectors[0], m.slot_sectors[1]));
             print(format_args!("BIOS video mode switch: {} (`debug video skip|auto`)", if m.flags & fos_v2_abi::FLAG_SKIP_VIDEO != 0 { "skipped" } else { "automatic" }));
             print(format_args!("crash count: {} (loader saw {} at boot), running: {}, unclean boots: {}", m.crash_count, unsafe { BOOT_CRASH_COUNT }, m.running, m.unclean_boots));
         }
-        None => print(format_args!("slot metadata: not readable")),
+        Err(MetadataProblem::NoPayload) => print(format_args!("slot metadata: not readable (the payload partition was never located)")),
+        Err(MetadataProblem::Read(error)) => print(format_args!("slot metadata: not readable (the disk read failed: {error:?})")),
+        Err(MetadataProblem::Invalid(head)) => {
+            print(format_args!("slot metadata: not readable (the sector is not valid metadata; `sector disk1 N` shows it)"));
+            print(format_args!("  it starts: {:02x?}   wanted: 46 4f 53 4d 01 (\"FOSM\", version 1)", head));
+        }
     }
     let ticks = unsafe { WATCHDOG_TICKS };
     if ticks == 0 {

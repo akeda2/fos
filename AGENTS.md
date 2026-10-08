@@ -78,6 +78,9 @@ Also read on demand: `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put asid
   reachable by explicit `diskN`. Disk-destroying commands (`format`, `install`)
   announce what they would erase and need `... confirm` as the very next command;
   never the boot disk.
+  A USB disk that is unplugged fails at once (its EHCI root port says so; no multi-second timeouts) and, when the same stick
+  (INQUIRY identity and size) comes back, `usb rescan` gives it its old disk number again. `sector diskN LBA [COUNT]` dumps
+  raw sectors read-only; `debug slots` says why the slot metadata cannot be read. (xHCI disks do not have the replug path yet.)
 - **FOSFS v3** (flat, 64 entries, 64-bit contiguous extents) is byte-compatible
   with the legacy edition. File names: up to 16 of lowercase letters, digits, `.`, `_`,
   `-`; enforced in `kernel/src/fosfs.rs`, the tape file-system calls and
@@ -116,6 +119,8 @@ A tape is a position-independent ELF64 executable whose entry is
 - **After any ABI change rebuild and redeploy every tape** (`make tapes`, then copy to the
   machines); a running tape also blocks NETFS serving.
 - `read_key` and `should_abort` drain the same input: use one or the other.
+- Audio tapes (`play`, `record`, `recorder`, `audio-net`) take a leading `device=N` (`tape-rt::take_audio_device_arg`) and show
+  the device by name (`tape-rt::AudioDeviceName`).
 - Audio: tape calls go to the *active* device (`audio device N|auto`, or a tape's own
   `audio_use_device`, undone when it ends). USB audio wins automatically when present.
 

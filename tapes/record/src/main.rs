@@ -1,4 +1,5 @@
-//! `record NAME [SECONDS] [RATE]`: records from the USB audio device's inputs into a WAV file, straight to disk.
+//! `record [device=N] NAME [SECONDS] [RATE]`: records from the audio device's inputs (USB audio or HD Audio) into a WAV file,
+//! straight to disk.
 //!
 //! ```text
 //! tape run record take1 10        10 seconds at 48000 Hz into take1.wav
@@ -55,14 +56,17 @@ fn tone_sample(phase: u32) -> i16 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     tape_rt::init(api);
-    let arguments = core::str::from_utf8(tape_rt::args()).unwrap_or("");
+    let arguments = match tape_rt::take_audio_device_arg(api, core::str::from_utf8(tape_rt::args()).unwrap_or("")) {
+        Ok(rest) => rest,
+        Err(reason) => return println!("record: {reason}."),
+    };
     let Some((name, seconds, rate, tone)) = parse_args(arguments) else {
-        return println!("Usage: tape run record NAME [SECONDS] [RATE] [tone=HZ]   (NAME.wav is written; SECONDS 0 = until Escape)");
+        return println!("Usage: tape run record [device=N] NAME [SECONDS] [RATE] [tone=HZ]   (NAME.wav is written; SECONDS 0 = until Escape)");
     };
     let mut info = AudioInfo::default();
     if tone.is_none() {
         if (api.audio_info)(&mut info) == 0 {
-            return println!("record: no USB audio device.");
+            return println!("record: no audio device (USB audio or HD Audio).");
         }
         if info.capture_channels == 0 {
             return println!("record: the device has no inputs.");

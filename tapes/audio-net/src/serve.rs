@@ -462,7 +462,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
     let mut info = AudioInfo::default();
     let device = (api.audio_info)(&mut info) != 0 && info.capture_channels != 0;
     if options.tone.is_none() && !device {
-        return println!("audio-net serve: no USB audio device with inputs (use src=tone=440 to serve a test tone).");
+        return println!("audio-net serve: no audio device with inputs (use src=tone=440 to serve a test tone).");
     }
     let (mut device_channels, mut slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
     let selection = options.channels.unwrap_or(ChannelSet(0b11));

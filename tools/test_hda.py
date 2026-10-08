@@ -196,7 +196,7 @@ def tape_picks_device():
             check(not [value for value in samples if abs(value) > 500], "and nothing reached the USB device", "")
         after = text.split("fos> audio")[-1].split("fos> ")[0]
         check("*1: USB audio" in after, "after the tape ended the automatic choice is back (the tape's pick is forgotten)", after)
-        check("there is no audio device 9" in text, "a device number that does not exist is refused by the tape call", text[-600:])
+        check("there is no such audio device" in text, "a device number that does not exist is refused by the tape call", text[-600:])
 
 
 def main():

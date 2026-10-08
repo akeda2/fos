@@ -95,7 +95,7 @@ pub fn find_endpoints(config: &[u8]) -> Option<Endpoints> {
 #[derive(Clone, Copy)]
 enum Host {
     Xhci { controller: usize, device: xhci::Device },
-    Ehci { controller: usize, target: ehci::Target, in_toggle: bool, out_toggle: bool },
+    Ehci { controller: usize, target: ehci::Target, root_port: u8, in_toggle: bool, out_toggle: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -103,6 +103,9 @@ struct Msc {
     host: Host,
     endpoints: Endpoints,
     tag: u32,
+    /// The INQUIRY data and the size, to recognise the same stick when it comes back after being unplugged.
+    identity: [u8; 36],
+    blocks: u64,
 }
 
 static mut DEVICES: [Option<Msc>; MAX_DEVICES] = [None; MAX_DEVICES];
@@ -129,6 +132,18 @@ pub fn count() -> usize {
 }
 
 impl Msc {
+    /// The device has been unplugged (or unplugged and replugged, which gives it a new USB address, so this handle is as dead as
+    /// if it were gone): its root port reports no device or a connection change since it was enumerated. Asking the port is
+    /// instant; letting a transfer to a missing device time out takes seconds per attempt, and a filesystem lookup makes many.
+    fn is_gone(&self) -> bool {
+        match self.host {
+            Host::Ehci { controller, root_port, .. } if root_port != 0 => {
+                ehci::controller(controller).map_or(true, |c| !c.port_has_device(root_port) || c.port_connect_changed(root_port))
+            }
+            _ => false,
+        }
+    }
+
     /// One bulk transfer on the data (`data_in`) or command (OUT) pipe, on DMA memory.
     fn bulk(&mut self, data_in: bool, physical: u64, length: usize) -> Result<usize, Error> {
         let endpoints = self.endpoints;
@@ -138,7 +153,7 @@ impl Msc {
                 let controller = xhci::controller(*controller).ok_or(Error::Transport)?;
                 controller.bulk_transfer(device, endpoint, physical, length as u32, max_packet).map_err(|_| Error::Transport)
             }
-            Host::Ehci { controller, target, in_toggle, out_toggle } => {
+            Host::Ehci { controller, target, in_toggle, out_toggle, .. } => {
                 let controller = ehci::controller(*controller).ok_or(Error::Transport)?;
                 let toggle = if data_in { in_toggle } else { out_toggle };
                 controller.bulk_transfer(target, endpoint & 0x0f, max_packet, physical as u32, length, data_in, toggle).map_err(|_| Error::Transport)
@@ -157,7 +172,7 @@ impl Msc {
                     controller.clear_endpoint_halt(device, endpoints.out_endpoint);
                 }
             }
-            Host::Ehci { controller, target, in_toggle, out_toggle } => {
+            Host::Ehci { controller, target, in_toggle, out_toggle, .. } => {
                 if let Some(controller) = ehci::controller(*controller) {
                     let _ = controller.control_transfer(target, 0x21, 0xff, 0, u16::from(endpoints.interface), &mut []);
                     for endpoint in [endpoints.in_endpoint, endpoints.out_endpoint] {
@@ -229,6 +244,9 @@ impl Msc {
     /// Up to three attempts: a real stick occasionally times out one transfer inside an
     /// otherwise correct exchange. An ordinary SCSI failure is an answer, not a glitch.
     fn command(&mut self, cdb: &[u8], data: &mut [u8], data_in: bool) -> Result<usize, Error> {
+        if self.is_gone() {
+            return Err(Error::Transport);
+        }
         let mut last = Error::Transport;
         for attempt in 0..3 {
             match self.command_once(cdb, data, data_in) {
@@ -305,11 +323,13 @@ pub fn write(index: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
 /// The caller has already issued SET_CONFIGURATION. Returns the block-layer disk number.
 pub fn attach_xhci(controller_index: usize, controller: &mut xhci::Controller, device: xhci::Device, endpoints: Endpoints) -> Option<usize> {
     controller.configure_bulk_endpoints(&device, endpoints.in_endpoint, endpoints.in_max_packet, endpoints.in_burst, endpoints.out_endpoint, endpoints.out_max_packet, endpoints.out_burst).ok()?;
-    register(Msc { host: Host::Xhci { controller: controller_index, device }, endpoints, tag: 0 }, "USB xHCI")
+    register(Msc { host: Host::Xhci { controller: controller_index, device }, endpoints, tag: 0, identity: [0; 36], blocks: 0 }, "USB xHCI")
 }
 
-pub fn attach_ehci(controller_index: usize, target: ehci::Target, endpoints: Endpoints) -> Option<usize> {
-    register(Msc { host: Host::Ehci { controller: controller_index, target, in_toggle: false, out_toggle: false }, endpoints, tag: 0 }, "USB EHCI")
+/// `root_port` is the EHCI root port the device sits on directly (1-based), or 0 behind a hub: only a direct device's removal
+/// can be seen from the controller's port register, and that is what lets a vanished disk fail at once.
+pub fn attach_ehci(controller_index: usize, target: ehci::Target, root_port: u8, endpoints: Endpoints) -> Option<usize> {
+    register(Msc { host: Host::Ehci { controller: controller_index, target, root_port, in_toggle: false, out_toggle: false }, endpoints, tag: 0, identity: [0; 36], blocks: 0 }, "USB EHCI")
 }
 
 fn register(mut msc: Msc, origin: &str) -> Option<usize> {
@@ -326,6 +346,23 @@ fn register(mut msc: Msc, origin: &str) -> Option<usize> {
     if block_size != 512 {
         crate::println!("USB storage: {block_size}-byte blocks are not supported (512 only).");
         return None;
+    }
+    msc.identity = inquiry;
+    msc.blocks = blocks;
+    // The same stick coming back after an unplug or a bumped cable: the old handle points at a USB address that no longer
+    // exists, so its commands fail. If a registered device has this identity (INQUIRY data and size) and no longer answers,
+    // give it the new connection instead of registering a second disk: the disk keeps its number, and everything using it
+    // (the boot volume, the slot metadata, files) works again. A healthy device with the same identity is a second, identical
+    // stick, and gets a disk of its own.
+    for slot in 0..MAX_DEVICES {
+        let Some(old) = device(slot) else { continue };
+        if old.identity == msc.identity && old.blocks == msc.blocks && old.read_capacity().is_err() {
+            unsafe { DEVICES[slot] = Some(msc) };
+            if let Some(disk) = crate::block::usb_disk(slot) {
+                crate::println!("USB storage: {} is back; disk{} works again.", core::str::from_utf8(&inquiry[8..32]).unwrap_or("?").trim(), disk + 1);
+                return Some(disk);
+            }
+        }
     }
     let slot = unsafe { (*core::ptr::addr_of_mut!(DEVICES)).iter().position(Option::is_none)? };
     unsafe { DEVICES[slot] = Some(msc) };

@@ -1,4 +1,4 @@
-//! `audio-net`: streams audio between hosts, from and to the USB audio device.
+//! `audio-net [device=N]`: streams audio between hosts, from and to the audio device (USB audio or HD Audio).
 //!
 //! ```text
 //! tape run audio-net                       the settings panel (see panel.rs)
@@ -395,7 +395,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let mut info = AudioInfo::default();
     let device = (api.audio_info)(&mut info) != 0 && info.capture_channels != 0;
     if tone.is_none() && !device {
-        return println!("audio-net send: no USB audio device with inputs (use src=tone=440 to send a test tone).");
+        return println!("audio-net send: no audio device with inputs (use src=tone=440 to send a test tone).");
     }
     let (mut device_channels, mut slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
     let selection = options.channels.unwrap_or(ChannelSet(0b11));
@@ -686,7 +686,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     }
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
-        return println!("audio-net recv: no USB audio device with outputs.");
+        return println!("audio-net recv: no audio device with outputs.");
     }
     let (device_channels, slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
     let device_frame = device_channels * slot;
@@ -1071,7 +1071,10 @@ pub fn run_once(api: &'static TapeApi, mode: &str, options: &Options<'static>) {
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(real: &'static TapeApi) {
     tape_rt::init(real);
-    let arguments = core::str::from_utf8(tape_rt::args()).unwrap_or("");
+    let arguments = match tape_rt::take_audio_device_arg(real, core::str::from_utf8(tape_rt::args()).unwrap_or("")) {
+        Ok(rest) => rest,
+        Err(reason) => return println!("audio-net: {reason}."),
+    };
     if arguments.trim().is_empty() {
         return panel::run(real);
     }

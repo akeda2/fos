@@ -324,6 +324,13 @@ impl Controller {
         read32(self.port_register(port))
     }
 
+    /// The port's connect-status-change bit: set by the controller whenever a device is plugged in or removed and cleared
+    /// only by software (enumeration clears it). A port we enumerated earlier with this bit set again has seen its device
+    /// come or go since, even if a device is connected now (an unplug and replug in between leaves no other trace).
+    pub fn port_connect_changed(&self, port: u8) -> bool {
+        self.port_status(port) & (1 << 1) != 0
+    }
+
     pub fn port_has_device(&self, port: u8) -> bool {
         let status = self.port_status(port);
         status & PORT_CONNECTED != 0 && status & PORT_OWNER == 0

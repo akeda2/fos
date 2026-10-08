@@ -67,6 +67,12 @@ pub fn count() -> usize {
     unsafe { COUNT }
 }
 
+/// The disk number of the USB mass-storage device in `usb_storage`'s slot `slot` (disk numbers move around when the boot
+/// disk is put first, so the slot is the stable identity).
+pub fn usb_disk(slot: usize) -> Option<usize> {
+    (0..count()).find(|&index| matches!(get(index), Some(Disk { backend: Backend::Usb(found), .. }) if found == slot))
+}
+
 pub fn get(index: usize) -> Option<Disk> {
     unsafe { (*core::ptr::addr_of!(DISKS)).get(index).copied().flatten() }
 }
