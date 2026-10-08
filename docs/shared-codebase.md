@@ -1,7 +1,12 @@
 # Fosfor OS: one 64-bit codebase, two boot paths
 
-Status: **plan, decided in conversation 2026-10-08.** Nothing below is built yet except
-what `docs/v2-design.md` already describes (the UEFI path). This note supersedes the
+Status (2026-10-08): **P0, the driver ports and P2 are done on branch `unify-64`; the BIOS path
+(B1-B5), the shared-crate move (P3) and the rename (R) are not started.** Built so far: tag
+`legacy-v1` and branch `legacy` at `055c093`; RTL8139 and Intel HD Audio ported into the 64-bit
+kernel (`make test-rtl8139`, `make test-hda`); tape API 3 (`audio_devices`, `audio_use_device`);
+the tree promoted to the top level (`abi/`, `kernel/`, `boot/uefi/`, `fat/`, `tapes/`, `tools/`)
+with the v2-prefixed make targets renamed (`make image`, `make test-NAME`, `make test-all`).
+32 of 33 tests pass; `test-nettapes` failed before the move too. This note supersedes the
 "v1 and v2 live side by side, drivers copied and widened" decision in v2-design.md
 section 3 and the "v1 is maintained" paragraph in section 12.
 

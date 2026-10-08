@@ -1,3 +1,12 @@
+> **Which edition does this describe?** Fosfor OS (short form *fos*) is now one 64-bit tree
+> (`make image`, `make test`; see `AGENTS.md` for the current layout and `docs/v2-design.md` and
+> `docs/shared-codebase.md` for the design and plan). **Most of this README was written for the
+> 32-bit BIOS edition**, which is frozen at tag `legacy-v1` (`git checkout legacy-v1`); its
+> command table, boot walkthrough and tape reference match that tag, and many tapes and drivers
+> described below exist only there (see "Driver parity" in `docs/shared-codebase.md`). The shell
+> commands, FOSFS, the network tools and most tapes are the same in both. A rewrite of this
+> file for the 64-bit tree is still to do.
+
 # fos
 
 `fos` is a deliberately small x86 operating system for learning how a machine
