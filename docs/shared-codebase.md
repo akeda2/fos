@@ -6,7 +6,8 @@ Status (2026-10-08): **P0, the driver ports and P2 are done on branch `unify-64`
 kernel (`make test-rtl8139`, `make test-hda`); tape API 3 (`audio_devices`, `audio_use_device`);
 the tree promoted to the top level (`abi/`, `kernel/`, `boot/uefi/`, `fat/`, `tapes/`, `tools/`)
 with the v2-prefixed make targets renamed (`make image`, `make test-NAME`, `make test-all`).
-32 of 33 tests pass; `test-nettapes` failed before the move too. This note supersedes the
+32 of 33 tests pass; `test-nettapes` failed before the move too. **B1 (BIOS spike) is done**: see
+section 4.4. This note supersedes the
 "v1 and v2 live side by side, drivers copied and widened" decision in v2-design.md
 section 3 and the "v1 is maintained" paragraph in section 12.
 
@@ -143,6 +144,31 @@ The kernel is already about 550 KB and will grow, so it cannot be loaded inside 
 Decide with a short spike (milestone B1). The default expectation is **A first** (least
 new machinery, v1's asm is proven) with the state machine's byte layout and its tests
 shared with `abi::select_slot` so the two implementations cannot drift.
+
+### 4.4 B1 spike result (2026-10-08)
+
+`make test-bios-spike` boots `build/bios-spike/spike.img` under SeaBIOS on QEMU's `pc` and `q35`
+machines: stage one (`boot/bios/stage1.S`, the MBR) reads stage two from LBA 64 with EDD; stage two
+(`stage2.S`, 1.3 KB) initialises COM1, enables A20 (BIOS, then port 0x92, verified), collects the
+E820 map into a boot-information block at `0x5000`, reads the kernel in 16 KiB pieces and copies each
+above 1 MiB through unreal mode, builds identity page tables for 4 GiB (2 MiB pages), enables PAE and
+`EFER.LME` and jumps to a 64-bit test kernel (`spike_kernel.S`) that checks the boot information and a
+marker at the end of its own image. What this settles:
+
+- **Option A of 4.3 works**: stage two stays in assembly and needs no real-mode trampoline from long
+  mode. Unreal mode is re-entered before every copy because a BIOS call may reset the ES limit.
+- **Stage two lives in the GPT "BIOS boot gap"** (LBA 34-2047, 1 MiB free), so no partition is
+  needed and one disk image can later carry both the UEFI ESP and the BIOS chain (a hybrid).
+- **Not yet done, deliberately**: loading a real ELF64 PIE (the spike kernel is a flat binary linked
+  at its address). The plan is to stage the whole slot image high, then let a small 64-bit routine
+  in stage two apply the `PT_LOAD` segments and `R_X86_64_RELATIVE` relocations, so the same kernel
+  ELF the UEFI loader reads boots on both paths. Also not done: the 8042 A20 fallback, the A/B slot
+  state machine (to share `abi::select_slot`'s byte layout), GPT discovery of the payload partition,
+  VBE, the ACPI RSDP scan, and everything on real hardware (unreal mode and A20 are the usual
+  real-machine surprises; the AMD/nForce board is the first target).
+- A builder bug worth remembering: patching a `bytearray` with a slice of a different length shrinks
+  it silently, which shifted every data address by four bytes and showed up as garbled strings and a
+  BIOS disk error; `tools/build_bios_spike.py` now asserts the length is unchanged.
 
 ## 5. Migration, in order
 

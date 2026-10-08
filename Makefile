@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean
+.PHONY: all help clean bios-spike
 
 all: image tapes
 
@@ -246,3 +246,26 @@ test-all: image
 	@failed=""; for t in $(ALL_TESTS); do \
 		if $(MAKE) --no-print-directory $$t; then echo "PASS $$t"; else echo "FAIL $$t"; failed="$$failed $$t"; fi; done; \
 	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi; echo "all tests passed"
+
+# ---- BIOS boot path, spike B1 (docs/shared-codebase.md): stage one + stage two + a 64-bit test kernel ----
+# Plain GNU as/ld: the 16-, 32- and 64-bit parts are all assembled with `as --64` (which accepts .code16/.code32) and
+# linked as flat binaries at their load addresses.
+BIOS_SPIKE := $(BUILD)/bios-spike
+$(BIOS_SPIKE)/%.bin: boot/bios/%.S
+	mkdir -p $(BIOS_SPIKE)
+	as --64 -o $(BIOS_SPIKE)/$*.o $<
+	ld -m elf_x86_64 -Ttext=$(BIOS_SPIKE_ADDRESS_$*) --oformat binary -o $@ $(BIOS_SPIKE)/$*.o
+BIOS_SPIKE_ADDRESS_stage1 := 0x7c00
+BIOS_SPIKE_ADDRESS_stage2 := 0x8000
+$(BIOS_SPIKE)/spike_kernel.bin: boot/bios/spike_kernel.S
+	mkdir -p $(BIOS_SPIKE)
+	as --64 -o $(BIOS_SPIKE)/spike_kernel.o $<
+	ld -m elf_x86_64 -Ttext=0x100000 --oformat binary -o $@ $(BIOS_SPIKE)/spike_kernel.o
+$(BIOS_SPIKE)/spike.img: $(BIOS_SPIKE)/stage1.bin $(BIOS_SPIKE)/stage2.bin $(BIOS_SPIKE)/spike_kernel.bin tools/build_bios_spike.py
+	python3 tools/build_bios_spike.py --stage1 $(BIOS_SPIKE)/stage1.bin --stage2 $(BIOS_SPIKE)/stage2.bin --kernel $(BIOS_SPIKE)/spike_kernel.bin --output $@
+bios-spike: $(BIOS_SPIKE)/spike.img
+
+.PHONY: test-bios-spike
+# SeaBIOS (QEMU's default firmware) boots the spike image into long mode on two chipsets and memory sizes.
+test-bios-spike: bios-spike
+	python3 tools/test_bios_spike.py
