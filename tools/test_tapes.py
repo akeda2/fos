@@ -70,7 +70,7 @@ def main():
                 return wire.until(marker, timeout)
 
             hello = run("run hello a b  c")
-            check("hello from a v2 tape (API version 3" in hello, "a tape loads from FOSFS (ELF64 PIE, relocated) and runs", hello)
+            check("hello from a v2 tape (API version 4" in hello, "a tape loads from FOSFS (ELF64 PIE, relocated) and runs", hello)
             check("arguments: [a b  c]" in hello, "startup arguments arrive through the table", hello)
             check("primes up to 100000: 9592" in hello, "it computes correctly with memory from the kernel's alloc()", hello)
             check("fos> " in hello, "control returns to the shell after the tape", hello)

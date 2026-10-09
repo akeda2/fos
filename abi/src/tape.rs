@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`.
-pub const TAPE_API_VERSION: u32 = 3;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`.
+pub const TAPE_API_VERSION: u32 = 4;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -164,6 +164,11 @@ pub struct TapeApi {
     /// first. 0 on success, `AUDIO_NO_DEVICE` for a number that does not exist. The choice is undone when the tape ends, so a
     /// tape never changes what the operator picked with `audio device N`.
     pub audio_use_device: extern "C" fn(u32) -> i32,
+    /// `nic_active()` (version 4): the zero-based number of the interface the operator chose with `nic use N` (default 0). The
+    /// single-interface tape calls of the old API (`tape-rt`'s `compat::nic_mac/send/receive`, used by `net-chat`, `ip-chat` and
+    /// `telnet`) go to this interface, as they did in v1; a tape that picks interfaces itself uses `nic_mac(index, ...)` and friends
+    /// directly. Check `version >= 4` and `size` before calling; before version 4 the answer is always 0.
+    pub nic_active: extern "C" fn() -> u32,
 }
 
 /// `AudioDevice::kind` values.

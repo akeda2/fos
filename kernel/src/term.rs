@@ -2584,12 +2584,17 @@ fn hexdump(address: u64, length: usize) {
 }
 
 /// `nic send`: one broadcast test frame (ethertype 0x88b5, v1's TEST_ETHERTYPE) out of interface 1.
-/// `nic use N`: the interface the other nic subcommands default to.
+/// The interface chosen with `nic use N` (zero-based): what `nic sniff` defaults to and what a tape's single-interface calls use.
+pub fn active_nic() -> usize {
+    unsafe { ACTIVE_NIC }.min(nic_count().saturating_sub(1))
+}
+
+/// `nic use N`: the interface the other nic subcommands, and a tape's single-interface network calls, use.
 fn nic_use(argument: Option<&str>) {
     match argument.and_then(|word| word.parse::<usize>().ok()) {
         Some(number) if number >= 1 && number <= nic_count() => {
             unsafe { ACTIVE_NIC = number - 1 };
-            crate::println!("Using NIC {number} for nic sniff.");
+            crate::println!("Using NIC {number} for nic sniff and the single-interface tape calls.");
         }
         _ => crate::println!("Usage: nic use N   (N from 1 to {}; `nic` lists them). Now: NIC {}.", nic_count(), unsafe { ACTIVE_NIC } + 1),
     }

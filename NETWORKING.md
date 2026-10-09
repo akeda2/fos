@@ -334,7 +334,10 @@ always means the boot disk.
 callbacks. It preserves one hardware-independent contract while keeping
 device-specific register programming in separate modules. `nic list` shows
 every initialized interface and `nic use N` changes the active one (the shell
-uses one-based numbering; tape callbacks use zero-based indices):
+uses one-based numbering; tape callbacks use zero-based indices). The active interface
+is what `nic sniff` defaults to and what the single-interface calls of `net-chat`,
+`ip-chat` and `telnet` use (the tape ABI's `nic_active`, version 4); tapes that
+choose interfaces themselves (`router`, `bridge`, `nettest`) pass an index:
 
 - `kernel/src/rtl8139.rs` supports the QEMU-default RTL8139 with its
   polling receive ring and overflow recovery.

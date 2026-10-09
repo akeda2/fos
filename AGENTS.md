@@ -111,7 +111,7 @@ A tape is a position-independent ELF64 executable whose entry is
 `extern "C" fn(api: &TapeApi)`. `abi/src/tape.rs` is the source of truth; rules:
 
 - **Append-only.** Fields are only added at the end of `TapeApi`; a tape checks `version`
-  and `size` before using a late field. Version is currently 3.
+  and `size` before using a late field. Version is currently 4 (`nic_active`: `nic use N` also steers the single-interface network calls of `net-chat`, `ip-chat` and `telnet`).
 - **Never add fields to a struct the kernel fills in** (`AudioInfo`, `AudioStats`,
   `DiskInfo`, ...): a tape built earlier passes a smaller struct and the kernel writes
   past it. New information gets a new call and a new struct (`audio_buffer`,

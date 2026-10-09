@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The `telnet` tape: connect, negotiate, show what the server sends, send what is typed, notice a disconnect.
 
-The guest has two NICs: the first sits on QEMU's user-mode network (the one a tape's network calls use), the second carries the
-`term net` session that types for the tape (multicast segment). The user-mode network is 10.0.2.0/24 with the gateway and the host
+The guest has two NICs: the first carries the `term net` session that types for the tape (multicast segment); the second sits on QEMU's
+user-mode network and is chosen with `nic use 2`, which a tape's single-interface network calls follow. The user-mode network is 10.0.2.0/24 with the gateway and the host
 at 10.0.2.2; a small Telnet server on the host (127.0.0.1) plays the remote machine: it asks for TERMINAL-TYPE and NAWS and prints a greeting with UTF-8 text; the test types a line through the
 term session and the server echoes it back. Checks: the tape connects (static addressing, ARP for the gateway, a TCP handshake);
 its Telnet replies agree to terminal type and window size; the greeting and the UTF-8 text reach the screen; a typed line reaches the
@@ -127,10 +127,10 @@ def main():
         command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-drive", f"format=raw,file={image}",
-                   # Interface 0 is the one a tape's network calls use, so the user-mode NIC comes first and the term net session
-                   # (which types for the tape) rides the second.
-                   "-netdev", "user,id=net1", "-device", "e1000,netdev=net1,mac=52:54:00:12:34:7b",
-                   "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:7a"]
+                   # NIC 1 carries the term net session that types for the tape; NIC 2 is the user-mode network, chosen with
+                   # `nic use 2` (the tape's single-interface network calls follow it, ABI version 4).
+                   "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:7a",
+                   "-netdev", "user,id=net1", "-device", "e1000,netdev=net1,mac=52:54:00:12:34:7b"]
         wire = Wire()
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         raw = bytearray()
@@ -161,6 +161,7 @@ def main():
                 wire.send(guest, TAG_DATA, text.encode() + b"\r")
                 return wire.until(marker, timeout)
 
+            check("Using NIC 2" in line("nic use 2", "fos> "), "`nic use 2` selects the user-mode NIC for the tape's network calls", "")
             screen = line(f"run telnet static 10.0.2.15/24 10.0.2.2 10.0.2.2 {SERVER_PORT}", "login:", 40)
             check(server.connected.wait(5), "the tape connects to the server (ARP for the gateway, then TCP)", screen)
             check("Welcome to the test server" in screen, "the server's greeting is shown", screen)

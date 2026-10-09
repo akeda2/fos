@@ -222,15 +222,20 @@ pub mod compat {
     pub fn nic_count() -> u32 {
         (api().nic_count)() as u32
     }
-    /// The "active" interface of v1 is interface 0 here.
+    /// The "active" interface of v1: the one the operator chose with `nic use N` (interface 0 by default; the kernel's
+    /// `nic_active`, ABI version 4).
+    fn active() -> usize {
+        let table = api();
+        if table.version >= 4 && (table.size as usize) >= core::mem::size_of::<crate::TapeApi>() { (table.nic_active)() as usize } else { 0 }
+    }
     pub fn nic_mac(out: usize) -> u32 {
-        (api().nic_mac)(0, out as *mut u8)
+        (api().nic_mac)(active(), out as *mut u8)
     }
     pub fn nic_send(frame: usize, length: u32) -> u32 {
-        (api().nic_send)(0, frame as *const u8, length as usize)
+        (api().nic_send)(active(), frame as *const u8, length as usize)
     }
     pub fn nic_receive(buffer: usize, capacity: u32) -> u32 {
-        (api().nic_receive)(0, buffer as *mut u8, capacity as usize) as u32
+        (api().nic_receive)(active(), buffer as *mut u8, capacity as usize) as u32
     }
     pub fn nic_mac_at(nic: u32, out: usize) -> u32 {
         (api().nic_mac)(nic as usize, out as *mut u8)

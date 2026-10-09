@@ -464,6 +464,10 @@ extern "C" fn api_audio_devices(number: u32, out: *mut fosfor_abi::tape::AudioDe
     crate::audio::device_count() as u32
 }
 
+extern "C" fn api_nic_active() -> u32 {
+    term::active_nic() as u32
+}
+
 extern "C" fn api_audio_use_device(number: u32) -> i32 {
     crate::audio::use_device_for_tape(number)
 }
@@ -546,6 +550,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         wall_clock: api_wall_clock,
         audio_devices: api_audio_devices,
         audio_use_device: api_audio_use_device,
+        nic_active: api_nic_active,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
