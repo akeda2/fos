@@ -86,6 +86,19 @@ def main():
             check("= 42" in wire.until("= 42", 15), "an interactive tape reads keys from the term net session (read_key)", "")
             wire.send(guest, TAG_DATA, b"\x1b")
             check("fos> " in wire.until("fos> ", 15), "a lone Escape byte aborts the tape and the prompt returns", "")
+            # A short frame is padded to 60 bytes with zeros; they must not reach the tape as keys. audio-net's peer picker
+            # closes on "any other key", so pressing P over term net used to flash the picker and return to the panel.
+            wire.send(guest, TAG_DATA, b"run audio-net\n")
+            wire.until("audio-net: settings", 20)
+            wire.send(guest, TAG_DATA, b"p")
+            opened = wire.until("machines on the network", 10).split("machines on the network")[-1]
+            later = opened + "".join(payload.decode("utf-8", "replace") for _, tag, payload in wire.frames(2.5) if tag == TAG_DATA)
+            check("audio-net: settings" not in later, "the peer picker stays open after P (the zero padding of a one-byte term net frame is not delivered as keys)", later)
+            wire.send(guest, TAG_DATA, b"x")
+            closed = "".join(payload.decode("utf-8", "replace") for _, tag, payload in wire.frames(2.5) if tag == TAG_DATA)
+            check("audio-net: settings" in closed, "and any other key closes it and brings the settings panel back", closed)
+            wire.send(guest, TAG_DATA, b"q")
+            wire.until("fos> ", 15)
 
             # A tape over the network: the v1 `tape load net` protocol.
             blob = HELLO.read_bytes()

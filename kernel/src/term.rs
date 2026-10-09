@@ -263,7 +263,12 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
             prompt();
         }
         TAG_DATA if session_open() && unsafe { *core::ptr::addr_of!(PEER) } == Some(source) && unsafe { SESSION_NIC } == index => {
+            // The frame has no length field and Ethernet pads a short frame to 60 bytes with zeros, so a single typed key
+            // arrives followed by dozens of NULs. Drop the trailing zeros (as the chat and terminal code always did): a tape
+            // that read them saw "any other key" right behind every key, and audio-net's peer picker closed the moment it
+            // opened. A NUL a person really typed (Ctrl-@) is lost, which nobody misses.
             let payload = &frame[15..];
+            let payload = &payload[..payload.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1)];
             unsafe { PEER_ACTIVITY = apic::ticks() };
             if unsafe { TAPE_MODE } {
                 // A running tape owns the input. A lone Escape byte is "stop".
