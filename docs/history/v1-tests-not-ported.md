@@ -54,3 +54,17 @@ Also noticed while triaging: the host unit tests of the tape libraries (`cargo t
 `tapes/router`, `nettest`, `ed`, `ip-chat`, `telnet`) do not build, with a duplicate `panic_impl`
 because the crates depend on `tape-rt`, whose panic handler is unconditional. That was already
 true before the `crates/` move. The fix is probably a `cfg(not(test))` around the handler.
+
+## Ported since (2026-10-09)
+
+- `test_idle_cpu_e2e` -> `tools/test_idle_cpu.py` (`make test-idle-cpu`): the idle prompt, `calc`, `ed`, `net-chat` and an open
+  `term net` session use 1-2% of a host core; `memtest` is the 100% control.
+- `test_net_chat_e2e` -> `tools/test_net_chat.py` (`make test-net-chat`): the test plays the chat peer itself on the multicast segment
+  (this kernel has no shell `chat` command to run a second guest in).
+- `test_telnet_e2e` -> `tools/test_telnet.py` (`make test-telnet`): a Telnet server on the host, reached through QEMU's user-mode
+  network on the guest's first NIC (a tape's network calls use interface 0; the `term net` session rides the second NIC). The legacy
+  test implemented ARP/IPv4/TCP by hand. Found on the way: the console prints each byte above 0x7f as `?` (it does not decode UTF-8).
+- `test_router_arp_queue_e2e` -> a scenario at the end of the forwarding checks in `tapes/test_router_e2e.py` (`make test-router`).
+
+Still open from the list above: `test_net_dhcp_e2e` (DHCP is exercised by the router and ip-chat tests but not on its own),
+`test_release_loops_e2e` and the nettest retarget/router/self-test scenarios.

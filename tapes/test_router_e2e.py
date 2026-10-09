@@ -136,6 +136,11 @@ def arp_request(source_mac: bytes, source_ip: bytes, target_ip: bytes) -> bytes:
     return ethernet_frame(b"\xff" * 6, source_mac, 0x0806, payload)
 
 
+def arp_reply(sender_mac: bytes, sender_ip: bytes, target_mac: bytes, target_ip: bytes) -> bytes:
+    payload = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 2, sender_mac, sender_ip, target_mac, target_ip)
+    return ethernet_frame(target_mac, sender_mac, 0x0806, payload)
+
+
 def udp_datagram(source_port: int, destination_port: int, payload: bytes) -> bytes:
     return struct.pack("!HHHH", source_port, destination_port, 8 + len(payload), 0) + payload
 
@@ -687,6 +692,35 @@ def main() -> None:
         assert forwarded[14 + 8] == 63, forwarded.hex()
         assert checksum(forwarded[14 : 14 + 20]) == 0
         print("PASS: router forwarded B to A with TTL and checksum updated.")
+
+        # An ARP miss: the destination is a host the router has never heard from. It must ask for its address and hold the packet
+        # that caused the question, then send it when the answer arrives (it used to drop it, so the first packet of every
+        # conversation was lost). Ported from the legacy test_router_arp_queue_e2e.
+        unknown_ip = bytes((10, 0, 15, 77))
+        unknown_mac = bytes.fromhex("525400cafe77")
+        links["a"].send(ipv4_frame(ROUTER_MAC_A, LEFT_MAC, LEFT_IP, unknown_ip, b"first packet to an unknown host"))
+        asked = wait_for_frame(
+            links["b"],
+            lambda frame: frame[12:14] == b"\x08\x06"
+            and frame[6:12] == ROUTER_MAC_B
+            and frame[20:22] == b"\x00\x01"
+            and frame[38:42] == unknown_ip,
+            10,
+            "an ARP request on segment B for the unknown host",
+        )
+        assert asked[0:6] == b"\xff" * 6, "the question is a broadcast"
+        print("PASS: router asked for the address of a host it had never heard from.")
+        links["b"].send(arp_reply(unknown_mac, unknown_ip, ROUTER_MAC_B, ROUTER_IP_B))
+        held = wait_for_frame(
+            links["b"],
+            lambda frame: frame[0:6] == unknown_mac and frame[12:14] == b"\x08\x00" and frame[30:34] == unknown_ip,
+            10,
+            "the held packet, sent when the ARP reply arrived",
+        )
+        assert held[14 + 8] == 63, held.hex()
+        assert checksum(held[14 : 14 + 20]) == 0
+        assert held[34:34 + len(b"first packet to an unknown host")] == b"first packet to an unknown host", held.hex()
+        print("PASS: the packet that triggered the ARP request was held and delivered after the reply.")
 
         self_ping_identifier = 0x4242
         self_ping_request = icmp_echo(8, self_ping_identifier, 7, b"ping the router itself")

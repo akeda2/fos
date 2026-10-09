@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet
 
 all: image tapes
 
@@ -34,6 +34,18 @@ test-usb-kbd-replug: image
 # A timed-out xHCI command is aborted and the command ring carries on (usb abort-test).
 test-xhci-abort: image
 	python3 tools/test_xhci_abort.py
+
+# An idle machine sleeps in hlt instead of spinning (QEMU's host CPU use).
+test-idle-cpu: image
+	python3 tools/test_idle_cpu.py
+
+# The net-chat tape: chat text and discovery over raw Ethernet, driven from a term net session.
+test-net-chat: image
+	python3 tools/test_net_chat.py
+
+# The telnet tape against a host-side Telnet server (QEMU user-mode network).
+test-telnet: image
+	python3 tools/test_telnet.py
 
 # `make -s print-image`: the path `make image` writes (tools/build_image.py's DEFAULT_IMAGE must equal it; test-stick-guids checks).
 print-image:
