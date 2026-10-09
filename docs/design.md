@@ -819,3 +819,12 @@ waits, preserve serial output on failure, wait for the prompt before typing.
   characters map to code page 437 where it has them. Anything else, and broken sequences, show as '?'. A tape's `putc` collects the
   bytes of one sequence before printing, so `telnet` to a UTF-8 server shows Swedish letters. Input stays ASCII. Tested by
   `make test-console-utf8` (glyph cells found in a screendump).
+
+**Hostnames announced unprompted (2026-10-09):** every machine broadcasts a discovery-reply frame (its name) on each interface with a
+  link, four times in the first seconds and then every 10 s, from the main loop and from a running tape's service loop. Receivers
+  file the name in the peer table (`nic peers`) without having asked, and answer a machine they had not heard of with their own
+  name, so a segment is mutually known within seconds of boot. Without a `hostname` file the name is `fos-` and the last three MAC
+  bytes (it used to be `fos2` on every machine). The table is exposed to tapes by `peer_info` (ABI 5). `audio-net` takes the
+  kernel's name as its default session name (`name=` still overrides), `audio-net list` prints the table, and on raw Ethernet / AVTP
+  `to=NAME` resolves from it with no stream announcement; an IP `to=NAME` still waits for SAP, because the table holds MACs only.
+  Tested by `make test-hostnames`. Peers are never aged out of the table.

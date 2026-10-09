@@ -253,6 +253,7 @@ pub struct Transport {
 
 impl Transport {
     pub fn open(api: &TapeApi, options: &Options) -> Option<Transport> {
+        peers::set_default_name(api, options.nic);
         let mut mac = [0u8; 6];
         (api.nic_mac)(options.nic, mac.as_mut_ptr());
         let mut config = NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) };
@@ -1018,7 +1019,11 @@ pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'s
     if announces_listening {
         transport.announce_receiver(options);
     }
-    if wants_listener {
+    if wants_listener && layer_2 && let Some(peer) = peers::kernel_peer(api, options.to) {
+        // The kernel already knows the machine from its name announcements: no need to wait for a stream announcement.
+        println!("'{}' is {} (known from its name announcement).", options.to, MacText(peer.mac));
+        peers::set_listener_mac(options, peer.mac);
+    } else if wants_listener {
         let Some(entry) = peers::find(api, options, &mut transport, options.to, true) else { return false };
         if layer_2 {
             peers::adopt_listener_l2(options, &entry);

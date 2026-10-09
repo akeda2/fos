@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8 test-hostnames
 
 all: image tapes
 
@@ -56,6 +56,10 @@ test-nettest-lab: image
 	python3 tools/test_nettest_lab.py
 test-console-utf8: image
 	python3 tools/test_console_utf8.py
+
+# Machines announce their names unprompted; audio-net uses the kernel's name and peer table.
+test-hostnames: image
+	python3 tools/test_hostnames.py
 
 # `bootcode update` replaces the UEFI loader on the ESP (verified with fsck.vfat and 7-Zip), and the new loader boots.
 test-bootcode-uefi: image

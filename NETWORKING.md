@@ -936,3 +936,11 @@ This is the original, unedited text of AGENTS.md's `tapes/router/` bullet.
   retry -- previously the first ping of every conversation was lost or a second
   late (`make test-tape-router-arp`). The tape deliberately has no dynamic routing,
   ICMP errors, fragmentation, or IPv6.
+
+## Hostname announcements
+
+Each machine broadcasts its name (tag 0x03, the discovery reply) on every interface with a link: four times in the first
+seconds, then every 10 s, also while a tape runs. `nic peers` lists what has been heard without a `nic discover`. Names
+are the `hostname` file's plus the NIC number, or `fos-` and the last three MAC bytes. Tapes read the table with `peer_info`
+(ABI 5); `audio-net` uses the name as its session name and resolves `to=NAME` on raw Ethernet/AVTP from it. A tape that
+counts raw frames (`nic recv`, the bridge test) will see these broadcasts.

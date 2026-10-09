@@ -101,7 +101,7 @@ def main():
         outcome["data"] = seen
 
     text = run({"settings": "deny-term-net\n"}, "M3 complete", denied)
-    check("deny-term-net" in text and outcome["reply"] == b"fos2", "deny-term-net: discovery still answers", text)
+    check("deny-term-net" in text and outcome["reply"] == b"fos-123479", "deny-term-net: discovery still answers", text)
     check(not outcome["data"] and "Remote terminal connected" not in text, "deny-term-net: a HELLO gets no session", text)
 
     text = run({"debug": "reboot-on-crash\nreboot-delay 1\ncrash-on-boot\n"}, "resetting in 1 s", no_reboot=False, times=2)

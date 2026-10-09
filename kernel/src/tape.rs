@@ -398,6 +398,14 @@ extern "C" fn api_hostname(index: usize, out: *mut u8, capacity: usize) -> usize
     unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, length) };
     length
 }
+extern "C" fn api_peer_info(number: usize, out: *mut fosfor_abi::tape::PeerInfo) -> usize {
+    let mut info = fosfor_abi::tape::PeerInfo::default();
+    let count = term::peer_info(number, &mut info);
+    if number >= 1 && number <= count && !out.is_null() {
+        unsafe { out.write(info) };
+    }
+    count
+}
 extern "C" fn api_disk_info(number: usize, out: *mut fosfor_abi::tape::DiskInfo) -> u32 {
     use fosfor_abi::tape::{DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DISK_NO_VOLUME};
     let Some(disk) = number.checked_sub(1).and_then(crate::block::get) else { return 0 };
@@ -582,6 +590,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         audio_devices: api_audio_devices,
         audio_use_device: api_audio_use_device,
         nic_active: api_nic_active,
+        peer_info: api_peer_info,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

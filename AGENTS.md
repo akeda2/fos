@@ -111,7 +111,7 @@ A tape is a position-independent ELF64 executable whose entry is
 `extern "C" fn(api: &TapeApi)`. `abi/src/tape.rs` is the source of truth; rules:
 
 - **Append-only.** Fields are only added at the end of `TapeApi`; a tape checks `version`
-  and `size` before using a late field. Version is currently 4 (`nic_active`: `nic use N` also steers the single-interface network calls of `net-chat`, `ip-chat` and `telnet`).
+  and `size` before using a late field. Version is currently 5 (`peer_info`: the kernel table of announced machine names; `nic_active`: `nic use N` also steers the single-interface network calls of `net-chat`, `ip-chat` and `telnet`).
 - **Never add fields to a struct the kernel fills in** (`AudioInfo`, `AudioStats`,
   `DiskInfo`, ...): a tape built earlier passes a smaller struct and the kernel writes
   past it. New information gets a new call and a new struct (`audio_buffer`,
@@ -194,8 +194,8 @@ maintainer's memory notes, not in this repository.
 ## Things a new session should know (2026-10-09)
 
 - **Tests added for hardware-shaped behaviour**: `test-usb-kbd-replug`, `test-usb-replug` (disks, hubs, the hub itself),
-  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`, `test-console-utf8`.
-  `make test-all` runs every `test-*` target (64 of them; none is a known failure).
+  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`, `test-console-utf8`, `test-hostnames`.
+  `make test-all` runs every `test-*` target (65 of them; none is a known failure).
 - **`term net` data frames carry no length**: the kernel drops trailing zero bytes (Ethernet padding) before a tape or the shell sees
   the frame; a NUL typed on purpose is lost. A tape's single-interface network calls follow `nic use N` (ABI 4, `nic_active`).
 - **Hubs**: a hub's ports are only visible by asking the hub, so `usb rescan` is what notices a device that went away behind one;
@@ -206,6 +206,9 @@ maintainer's memory notes, not in this repository.
   loader without a stick rewrite (both verified on real machines). `debug video skip` plus `reboot` shows the VGA text console.
 - **Open work** is in `DEFERRED.md` ("Open after the 2026-10-09 session").
 
+- **Hostnames**: every machine broadcasts its name (`hostname` file + NIC number, else `fos-` + last 3 MAC bytes) at boot and every
+  10 s (`term.rs` `announce_service`, also while a tape runs); `handle_frame` files them in the peer table (`nic peers`, ABI `peer_info`).
+  `audio-net` uses that name as its session name and resolves `proto=raw|avtp to=NAME` from the table; IP `to=NAME` still needs SAP.
 - **Console text is UTF-8** (`framebuffer.rs`: Latin-9 glyphs, CP437 in BIOS text mode; `tape.rs` `api_putc` assembles sequences). Input
   and file names are still ASCII.
 

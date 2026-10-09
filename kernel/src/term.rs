@@ -51,8 +51,9 @@ const KUP_CHECKSUM_MISMATCH: u8 = 2;
 const KUP_DISK_ERROR: u8 = 3;
 const KUP_BUSY: u8 = 4;
 /// The name announced in discovery replies for interface `index`: `NAME<n>` from the
-/// `hostname` file (n is the one-based interface number, as v1 does), or "fos2" (then
-/// "fos2-2", "fos2-3"... for further interfaces).
+/// `hostname` file (n is the one-based interface number, as v1 does), or without that file
+/// `fos-` and the last three bytes of the interface's MAC address (so that machines that were
+/// never named still tell each other apart).
 pub fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
     use core::fmt::Write;
     struct Cursor<'a>(&'a mut [u8; 20], usize);
@@ -65,10 +66,10 @@ pub fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
         }
     }
     let mut cursor = Cursor(out, 0);
-    let _ = match (crate::config::hostname(), index) {
+    let _ = match (crate::config::hostname(), nic_at(index).map(|nic| nic.mac())) {
         (Some(base), _) => write!(cursor, "{base}{}", index + 1),
-        (None, 0) => write!(cursor, "fos2"),
-        (None, _) => write!(cursor, "fos2-{}", index + 1),
+        (None, Some(mac)) => write!(cursor, "fos-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5]),
+        (None, None) => write!(cursor, "fos"),
     };
     cursor.1
 }
@@ -216,8 +217,35 @@ pub fn poll() {
             }
         }
     }
+    announce_service();
     if session_open() {
         flush();
+    }
+}
+
+/// Seconds between a machine's unsolicited name announcements; the first few come faster so that a machine
+/// that has just booted is known to the others (and knows them) within seconds.
+const ANNOUNCE_SECONDS: u64 = 10;
+static mut NEXT_ANNOUNCE: u64 = 0;
+static mut ANNOUNCE_COUNT: u32 = 0;
+
+/// Broadcasts this machine's name on every interface that has a link, the same frame a discovery probe is answered
+/// with, so every fos machine on the segment learns it without asking (`handle_frame` files it in the peer table,
+/// which tapes read with `peer_info`). Called from the main loop and from a running tape's service loop.
+fn announce_service() {
+    unsafe {
+        if apic::ticks() < NEXT_ANNOUNCE {
+            return;
+        }
+        ANNOUNCE_COUNT = ANNOUNCE_COUNT.saturating_add(1);
+        NEXT_ANNOUNCE = apic::ticks() + if ANNOUNCE_COUNT <= 4 { 1 } else { ANNOUNCE_SECONDS } * apic::TICK_HZ;
+    }
+    for index in 0..nic_count() {
+        if let Some(nic) = nic_at(index).filter(|nic| nic.link_up()) {
+            let mut name = [0u8; 20];
+            let length = hostname(index, &mut name);
+            send(nic, &[0xff; 6], TAG_DISCOVER_REPLY, &name[..length]);
+        }
     }
 }
 
@@ -235,6 +263,19 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
                 let length = hostname(index, &mut name);
                 send(nic, &source, TAG_DISCOVER_REPLY, &name[..length]);
             }
+        }
+        // A name announcement (or the answer to a probe): remember who it is. A machine we had not heard of may
+        // have booted after our last broadcast, so it is told our name straight away (it does the same for us once).
+        TAG_DISCOVER_REPLY => {
+            if remember_peer(index, source, netfs_name(&frame[15..])) {
+                if let Some(nic) = nic_at(index) {
+                    let mut name = [0u8; 20];
+                    let length = hostname(index, &mut name);
+                    send(nic, &source, TAG_DISCOVER_REPLY, &name[..length]);
+                }
+            }
+            // Not consumed: a tape with its own address book (`net-chat`) still sees the frame.
+            return false;
         }
         // NETFS is served at the prompt and in `term net`, never while a tape runs (the staging buffer is the tape's) or
         // when the settings file closed the network terminal.
@@ -868,6 +909,7 @@ fn tape_service() {
             queue_frame(index, &buffer[..length]);
         }
     }
+    announce_service();
     flush();
 }
 
@@ -2769,33 +2811,51 @@ fn nic_sniff(argument: Option<&str>) {
     crate::println!("Stopped: {shown} frame(s) shown{}.", if skipped > 0 { ", some skipped to keep up" } else { "" });
 }
 
-const MAX_PEERS: usize = 16;
-/// What `nic discover` heard: (MAC, name, name length, interface).
+const MAX_PEERS: usize = 32;
+/// Who has announced itself or answered a probe: (MAC, name, name length, interface).
 static mut PEERS: [([u8; 6], [u8; 20], usize, usize); MAX_PEERS] = [([0; 6], [0; 20], 0, 0); MAX_PEERS];
 static mut PEER_COUNT: usize = 0;
 
-fn remember_peer(index: usize, mac: [u8; 6], name: &[u8]) {
-    // Some virtual networks echo our own probe's answer back; this machine is not its own peer.
+/// Files a peer's name; true if the peer is new. A known peer's name is replaced (its `hostname` file may have changed).
+fn remember_peer(index: usize, mac: [u8; 6], name: &[u8]) -> bool {
+    // Some virtual networks echo our own frames back; this machine is not its own peer.
     if (0..nic_count()).any(|own| nic_at(own).is_some_and(|nic| nic.mac() == mac)) {
-        return;
+        return false;
     }
+    let length = name.len().min(20);
     unsafe {
         let peers = &mut *core::ptr::addr_of_mut!(PEERS);
         let count = PEER_COUNT;
         if let Some(entry) = peers[..count].iter_mut().find(|entry| entry.0 == mac) {
-            if entry.2 == 0 {
-                entry.2 = name.len().min(20);
-                entry.1[..entry.2].copy_from_slice(&name[..entry.2]);
+            if length != 0 {
+                entry.1 = [0; 20];
+                entry.1[..length].copy_from_slice(&name[..length]);
+                entry.2 = length;
             }
-            return;
+            entry.3 = index;
+            return false;
         }
         if count < MAX_PEERS {
-            let length = name.len().min(20);
             peers[count] = (mac, [0; 20], length, index);
             peers[count].1[..length].copy_from_slice(&name[..length]);
             PEER_COUNT = count + 1;
+            return true;
         }
     }
+    false
+}
+
+/// A tape's `peer_info`: peer `number` (1-based; 0 only counts) into `out`.
+pub fn peer_info(number: usize, out: &mut fosfor_abi::tape::PeerInfo) -> usize {
+    let count = unsafe { PEER_COUNT };
+    if number >= 1 && number <= count {
+        let (mac, name, length, nic) = unsafe { (*core::ptr::addr_of!(PEERS))[number - 1] };
+        out.mac = mac;
+        out.nic = nic as u8;
+        out.name_length = length as u8;
+        out.name = name;
+    }
+    count
 }
 
 fn print_peers() {

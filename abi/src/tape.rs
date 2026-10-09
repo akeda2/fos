@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`.
-pub const TAPE_API_VERSION: u32 = 4;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`.
+pub const TAPE_API_VERSION: u32 = 5;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -169,6 +169,30 @@ pub struct TapeApi {
     /// `telnet`) go to this interface, as they did in v1; a tape that picks interfaces itself uses `nic_mac(index, ...)` and friends
     /// directly. Check `version >= 4` and `size` before calling; before version 4 the answer is always 0.
     pub nic_active: extern "C" fn() -> u32,
+    /// `peer_info(number, out)` (version 5): the other fos machines this one has heard announce their names (every machine
+    /// broadcasts its `hostname`, or `fos-` and the last three MAC bytes, every 10 s and when it boots; see `nic discover`).
+    /// Returns how many are known; if `number` is 1 to that count, `out` is filled with that peer, `number` 0 only counts.
+    /// A tape resolves a machine name to a MAC address with it, without asking on the wire. Check `version >= 5` and `size`.
+    pub peer_info: extern "C" fn(usize, *mut PeerInfo) -> usize,
+}
+
+/// What `peer_info` fills in. Kernel-filled, so never extend it: a new fact gets a new call.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PeerInfo {
+    pub mac: [u8; 6],
+    /// The zero-based interface the peer was heard on.
+    pub nic: u8,
+    /// Bytes of `name` in use.
+    pub name_length: u8,
+    /// The peer's announced name (ASCII, not terminated).
+    pub name: [u8; 20],
+}
+
+impl PeerInfo {
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..usize::from(self.name_length).min(20)]).unwrap_or("")
+    }
 }
 
 /// `AudioDevice::kind` values.

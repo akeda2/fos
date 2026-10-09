@@ -191,7 +191,8 @@ def main() -> None:
         """Run `nic recv` on `segment`, injecting once on `inject_segment` and tolerating stale queued frames.
 
         A terminal frame used to enter `term net` can still be waiting in a
-        polling NIC ring when a nested shell command starts. `nic recv` is a
+        polling NIC ring when a nested shell command starts, and a
+        machine's periodic name announcement (a broadcast) can come first too. `nic recv` is a
         deliberately raw shell diagnostic and therefore reports that frame
         instead of applying the terminal classifier. Retry the command until
         the frame under test is the one returned.
@@ -199,11 +200,11 @@ def main() -> None:
         start = send_command(segment, destination, source, guest_name, b"nic recv")
         time.sleep(0.2)
         multicast[inject_segment].send(frame)
-        for attempt in range(4):
+        for attempt in range(10):
             result = read_until(guest_name, b"fos> ", 10, start)
             if expected in result:
                 return result
-            if attempt == 3:
+            if attempt == 9:
                 break
             start = send_command(segment, destination, source, guest_name, b"nic recv")
         for _ in range(3):

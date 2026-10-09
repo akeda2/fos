@@ -79,7 +79,32 @@ impl Announcer {
     }
 }
 
-/// The name this machine announces under: `name=` or `fos-` and the last three MAC bytes.
+static mut DEFAULT_NAME: [u8; 20] = [0; 20];
+static mut DEFAULT_NAME_LENGTH: usize = 0;
+
+/// Takes the kernel's name for this machine (the `hostname` file's, or `fos-` and the last MAC bytes) as the default
+/// session name, so the name other machines already know from the kernel's own announcements is the one `audio-net` uses.
+pub fn set_default_name(api: &TapeApi, nic: usize) {
+    let buffer = unsafe { &mut *(&raw mut DEFAULT_NAME) };
+    unsafe { DEFAULT_NAME_LENGTH = (api.hostname)(nic, buffer.as_mut_ptr(), buffer.len()) };
+}
+
+/// The other machines the kernel has heard announce themselves (`peer_info`, ABI 5); none on an older kernel.
+pub fn kernel_peers(api: &TapeApi) -> impl Iterator<Item = tape_rt::PeerInfo> + '_ {
+    let usable = api.version >= 5 && (api.size as usize) >= core::mem::size_of::<TapeApi>();
+    let count = if usable { (api.peer_info)(0, core::ptr::null_mut()) } else { 0 };
+    (1..=count).filter_map(move |number| {
+        let mut info = tape_rt::PeerInfo::default();
+        ((api.peer_info)(number, &mut info) >= number).then_some(info)
+    })
+}
+
+/// The MAC of the machine the kernel knows as `name` (case ignored), if it has announced itself.
+pub fn kernel_peer(api: &TapeApi, name: &str) -> Option<tape_rt::PeerInfo> {
+    kernel_peers(api).find(|peer| peer.name().eq_ignore_ascii_case(name))
+}
+
+/// The name this machine announces under: `name=`, else the kernel's name, else `fos-` and the last three MAC bytes.
 pub fn session_name<'a>(configured: &str, mac: [u8; 6], buffer: &'a mut [u8; sap::MAX_NAME]) -> &'a str {
     let mut length = 0;
     let mut push = |byte: u8, length: &mut usize| {
@@ -88,7 +113,13 @@ pub fn session_name<'a>(configured: &str, mac: [u8; 6], buffer: &'a mut [u8; sap
             *length += 1;
         }
     };
-    if configured.is_empty() {
+    let default: &[u8] = unsafe { &*(&raw const DEFAULT_NAME) };
+    let default = &default[..unsafe { DEFAULT_NAME_LENGTH }];
+    if configured.is_empty() && !default.is_empty() {
+        for &byte in default {
+            push(byte, &mut length);
+        }
+    } else if configured.is_empty() {
         for &byte in b"fos-" {
             push(byte, &mut length);
         }
@@ -302,6 +333,14 @@ pub fn list(api: &'static TapeApi, options: &Options) {
             you
         );
     }
+    let mut machines = 0;
+    for peer in kernel_peers(api) {
+        if machines == 0 {
+            println!("Machines the kernel has heard announce their names (usable as `to=NAME` on raw Ethernet / AVTP):");
+        }
+        machines += 1;
+        println!("{machines:>2}  {:<24} {}  (NIC {})", peer.name(), MacText(peer.mac), usize::from(peer.nic) + 1);
+    }
     if count == 0 {
         println!("No announcements heard. A peer announces while it streams (or has its panel open) on the same kind of network ({}).", if layer_2 { "raw Ethernet or AVTP, same switch" } else { "RTP" });
     }
@@ -364,6 +403,11 @@ pub fn adopt_sender_l2(options: &mut Options<'static>, entry: &Entry) {
 /// `to=NAME` on a layer 2 network: send to the MAC that announced it listens.
 pub fn adopt_listener_l2(options: &mut Options<'static>, entry: &Entry) {
     options.to = mac_text(entry.from_mac);
+}
+
+/// `to=NAME` resolved by the kernel's peer table: send to that MAC.
+pub fn set_listener_mac(options: &mut Options<'static>, mac: [u8; 6]) {
+    options.to = mac_text(mac);
 }
 
 /// `source=NAME`: fills in the receive options from a sender's announcement. Err says why it cannot be received.

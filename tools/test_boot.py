@@ -287,7 +287,7 @@ def main():
     check(milliseconds is not None and 900 <= int(milliseconds.group(1)) <= 1100, f"100 timer ticks take about a second by the independent PM timer ({milliseconds and milliseconds.group(1)} ms)", text)
     check(re.search(r"PCI: \d+ functions found", text) is not None, "the kernel scans PCI", text)
     check(re.search(r"e1000 \(\w+\) at [0-9a-f:.]+: MAC 52:54:00:12:34:77, link up", text) is not None, "and brings up the e1000 with its link", text)
-    check(reply is not None and reply[1] == b"fos2" and guest == bytes.fromhex("525400123477"), f"a discovery probe over the wire is answered by 'fos2' ({reply})", text)
+    check(reply is not None and reply[1] == b"fos-123477" and guest == bytes.fromhex("525400123477"), f"a discovery probe over the wire is answered by 'fos-123477' ({reply})", text)
     check("Remote terminal connected" in text and "fos> " in session and "Type `help`" in session, "a term net session opens (HELLO answered with banner and prompt)", session)
     check("shutdown" in transcript["help"] and "dmesg" in transcript["help"], "`help` output arrives over the wire in DATA frames", transcript["help"])
     check(re.search(r"Managed:\s+\d+ MiB", transcript["memory"]) is not None, "`memory` reports the allocator", transcript["memory"])
