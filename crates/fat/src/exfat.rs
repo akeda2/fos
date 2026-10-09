@@ -52,6 +52,7 @@ impl<D: Device> Fs<D> {
         self.data_lba = u64::from(le32(boot, 88));
         self.clusters = le32(boot, 92);
         self.root = le32(boot, 96);
+        self.dir = self.root;
         if self.root < 2 || self.root > self.clusters + 1 || self.clusters == 0 {
             return Err(Error::NotFat);
         }

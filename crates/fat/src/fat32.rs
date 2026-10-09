@@ -59,6 +59,7 @@ impl<D: Device> Fs<D> {
         self.fat_sectors = fat_sectors;
         self.fats = fats;
         self.root = le32(boot, 44);
+        self.dir = self.root;
         self.fsinfo = u32::from(le16(boot, 48));
         if self.root < 2 || self.root > clusters + 1 {
             return Err(Error::NotFat);
@@ -140,8 +141,26 @@ impl<D: Device> Fs<D> {
     }
 
     pub(crate) fn fat32_remove(&mut self, file: &Entry) -> Result<(), Error> {
-        // Free the chain (consecutive clusters in one pass over the FAT), then mark the entries deleted.
-        let mut cluster = file.first_cluster;
+        // Free the chain, then mark the entries deleted.
+        self.fat32_free_chain(file.first_cluster)?;
+        self.fat32_drop_entry(file)
+    }
+
+    /// Marks a file's directory entries deleted (0xE5), leaving its clusters as they are.
+    pub(crate) fn fat32_drop_entry(&mut self, file: &Entry) -> Result<(), Error> {
+        let mut sector = [0u8; SECTOR];
+        self.device.read(file.set_lba, &mut sector)?;
+        let last = file.set_offset / 32;
+        let first = last.saturating_sub(file.set_entries - 1);
+        for slot in first..=last {
+            sector[slot * 32] = 0xe5;
+        }
+        self.device.write(file.set_lba, &sector)
+    }
+
+    /// Frees the clusters of the chain starting at `first` (consecutive clusters in one pass over the FAT).
+    pub(crate) fn fat32_free_chain(&mut self, first: u32) -> Result<(), Error> {
+        let mut cluster = first;
         let (mut run_start, mut run_length) = (cluster, 0u32);
         let mut guard = 0u32;
         while cluster >= 2 && cluster <= self.clusters + 1 {
@@ -163,14 +182,27 @@ impl<D: Device> Fs<D> {
                 return Err(Error::Corrupt);
             }
         }
+        Ok(())
+    }
+
+    /// See `Fs::replace`: the one-sector switch, then the clean-up.
+    pub(crate) fn fat32_replace(&mut self, old: &Entry, new: &Entry) -> Result<(), Error> {
         let mut sector = [0u8; SECTOR];
-        self.device.read(file.set_lba, &mut sector)?;
-        let last = file.set_offset / 32;
-        let first = last.saturating_sub(file.set_entries - 1);
-        for slot in first..=last {
-            sector[slot * 32] = 0xe5;
+        self.device.read(old.set_lba, &mut sector)?;
+        let at = old.set_offset; // the short entry (the last of the set)
+        let (date, time) = self.time.dos();
+        sector[at + 22..at + 24].copy_from_slice(&time.to_le_bytes());
+        sector[at + 24..at + 26].copy_from_slice(&date.to_le_bytes());
+        sector[at + 18..at + 20].copy_from_slice(&date.to_le_bytes());
+        sector[at + 20..at + 22].copy_from_slice(&((new.first_cluster >> 16) as u16).to_le_bytes());
+        sector[at + 26..at + 28].copy_from_slice(&(new.first_cluster as u16).to_le_bytes());
+        sector[at + 28..at + 32].copy_from_slice(&(new.size as u32).to_le_bytes());
+        self.device.write(old.set_lba, &sector)?; // the switch: this one sector decides which contents the name has
+        self.fat32_drop_entry(new)?;
+        if old.first_cluster >= 2 && old.first_cluster != new.first_cluster {
+            self.fat32_free_chain(old.first_cluster)?;
         }
-        self.device.write(file.set_lba, &sector)
+        self.invalidate_fsinfo()
     }
 
     /// Finds a run of free clusters: the first one with at least `want` clusters, else the longest there is.

@@ -243,8 +243,11 @@ go onto the boot volume as ordinary files and `bootcode update` / `bootcode upda
 command, like `format` and `install`) validates them (stage one exactly one sector with the 0x55aa signature and an empty
 partition-table area; stage two at most 24 sectors, starting with `cli`, carrying its banner), writes stage two first and reads it
 back, then stage one's code into the MBR and reads that back. `make test-bios-bootcode` patches one letter of the banner, updates,
-reboots and sees the new banner. The UEFI loader on the ESP has no such path yet (the `fat` crate writes the root directory only,
-and BOOTX64.EFI is in `\EFI\BOOT`).
+reboots and sees the new banner. The UEFI loader on the ESP is replaced the same way (2026-10-09): `loader.efi` on the boot volume
+(checked: PE32+ x86-64, EFI application, the loader's banner) is written to `\EFI\BOOT\BOOTX64.NEW`, read back, and switched in with
+one directory-sector write (`fat::Fs::enter` reaches the subdirectory, `fat::Fs::replace` does the switch; the `fat` crate still creates
+no directories). `make test-bootcode-uefi` patches a word of the banner, updates, checks the ESP with `fsck.vfat` and 7-Zip from the
+host, resets and sees the new banner.
 
 ## 5. Migration, in order
 

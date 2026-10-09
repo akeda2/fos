@@ -10,8 +10,9 @@
 //!   recording needs: no allocation work while the audio is flowing (exFAT sets "no FAT chain"; FAT32's chain is
 //!   written once when the run is claimed), and the directory entry's size is the only thing that moves.
 //!
-//! What it does not do: subdirectories, renames, files that grow by chaining fragments, 4 KiB sectors, TexFAT, or
-//! non-ASCII names. A name with characters outside printable ASCII is refused rather than mangled.
+//! What it does not do: creating subdirectories, renames, files that grow by chaining fragments, 4 KiB sectors, TexFAT, or
+//! non-ASCII names. On FAT32 it can *enter* an existing subdirectory (`enter`: the loader's `\EFI\BOOT` on an EFI System
+//! Partition) and swap a file's contents for another file's in one sector write (`replace`). A name with characters outside printable ASCII is refused rather than mangled.
 //!
 //! Power-cut behaviour: the directory entry's size only ever advances to what has been written (the caller passes
 //! the length with each write), so after a cut the file holds everything up to its last length update. On FAT32 the
@@ -166,6 +167,8 @@ pub struct Fs<D: Device> {
     pub(crate) fat_sectors: u32,
     pub(crate) fats: u32,
     pub(crate) root: u32,
+    /// The directory every lookup, listing and creation works on: the root until `enter` says otherwise.
+    pub(crate) dir: u32,
     /// FAT32: the FSInfo sector (0 = none). exFAT: the allocation bitmap's first cluster and length in bytes.
     pub(crate) fsinfo: u32,
     pub(crate) bitmap_cluster: u32,
@@ -184,7 +187,7 @@ impl<D: Device> Fs<D> {
             return Err(Error::NotFat);
         }
         let mut fs = Fs {
-            device, kind: Kind::Fat32, spc: 0, data_lba: 0, clusters: 0, fat_lba: 0, fat_sectors: 0, fats: 0, root: 0, fsinfo: 0, bitmap_cluster: 0, bitmap_bytes: 0, time: Time::DEFAULT,
+            device, kind: Kind::Fat32, spc: 0, data_lba: 0, clusters: 0, fat_lba: 0, fat_sectors: 0, fats: 0, root: 0, dir: 0, fsinfo: 0, bitmap_cluster: 0, bitmap_bytes: 0, time: Time::DEFAULT,
             fat_cache_lba: u64::MAX, fat_cache: [0; SECTOR],
         };
         if &boot[3..11] == b"EXFAT   " {
@@ -217,7 +220,59 @@ impl<D: Device> Fs<D> {
         self.device
     }
 
-    /// Looks `name` up in the root directory.
+    /// Makes the subdirectory `name` of the current directory the current one: lookups, listings, `create` and `remove` then
+    /// work in it. FAT32 only (an EFI System Partition is FAT32 by specification). `enter_root` goes back.
+    pub fn enter(&mut self, name: &[u8]) -> Result<(), Error> {
+        if self.kind != Kind::Fat32 {
+            return Err(Error::Unsupported);
+        }
+        match self.entry(name)? {
+            Some(entry) if entry.is_directory => {
+                // A subdirectory's ".." entry says cluster 0 for the root; a named entry never does, but be safe.
+                self.dir = if entry.first_cluster < 2 { self.root } else { entry.first_cluster };
+                Ok(())
+            }
+            Some(_) => Err(Error::NotFound),
+            None => Err(Error::NotFound),
+        }
+    }
+
+    pub fn enter_root(&mut self) {
+        self.dir = self.root;
+    }
+
+    /// Makes the file `target` hold what the file `source` holds, in one sector write: the directory entry of `target` is
+    /// pointed at `source`'s clusters (and takes its size and time), so after a power cut the volume has either the old
+    /// contents or the new, never half of each. Only then is `source`'s own entry dropped (its clusters now belong to
+    /// `target`) and `target`'s old clusters freed. A cut between the steps leaves two entries sharing one chain, or a
+    /// leaked old chain, which a file system check tidies up; `forget_alias` finishes the first case. FAT32 only.
+    pub fn replace(&mut self, target: &[u8], source: &[u8]) -> Result<(), Error> {
+        if self.kind != Kind::Fat32 {
+            return Err(Error::Unsupported);
+        }
+        let old = self.entry(target)?.ok_or(Error::NotFound)?;
+        let new = self.entry(source)?.ok_or(Error::NotFound)?;
+        if old.is_directory || new.is_directory || new.first_cluster < 2 || new.size == 0 {
+            return Err(Error::Unsupported);
+        }
+        self.fat32_replace(&old, &new)
+    }
+
+    /// Finishes an interrupted `replace`: if the file `alias` and the file `of` share their first cluster, `alias`'s entry is
+    /// dropped without freeing the clusters (they belong to `of`). False if there is nothing to do.
+    pub fn forget_alias(&mut self, alias: &[u8], of: &[u8]) -> Result<bool, Error> {
+        if self.kind != Kind::Fat32 {
+            return Err(Error::Unsupported);
+        }
+        let (Some(alias), Some(of)) = (self.entry(alias)?, self.entry(of)?) else { return Ok(false) };
+        if alias.first_cluster < 2 || alias.first_cluster != of.first_cluster {
+            return Ok(false);
+        }
+        self.fat32_drop_entry(&alias)?;
+        Ok(true)
+    }
+
+    /// Looks `name` up in the current directory (the root until `enter`).
     pub fn find(&mut self, name: &[u8]) -> Result<Option<File>, Error> {
         Ok(self.entry(name)?.map(|entry| entry.file()))
     }
@@ -460,7 +515,7 @@ impl<D: Device> Fs<D> {
 
     /// Runs `visit` over every sector of the root directory in order until it returns `Done`.
     pub(crate) fn root_sectors<T>(&mut self, mut visit: impl FnMut(u64, &mut [u8; SECTOR]) -> Visit<T>) -> Result<Option<T>, Error> {
-        let mut cluster = self.root;
+        let mut cluster = self.dir;
         let mut guard = 0u32;
         let mut sector = [0u8; SECTOR];
         loop {
@@ -490,7 +545,7 @@ impl<D: Device> Fs<D> {
         self.zero_cluster(cluster)?;
         let end = if self.kind == Kind::Fat32 { 0x0fff_ffff } else { 0xffff_ffff };
         self.fat_set_range(cluster, 1, |_| end)?;
-        let mut last = self.root;
+        let mut last = self.dir;
         while let Some(next) = self.chain_next(last)? {
             last = next;
         }

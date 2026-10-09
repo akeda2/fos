@@ -287,3 +287,95 @@ fn formatted_exfat_volumes_pass_fsck_and_work() {
         fsck(&path, &["fsck.exfat", "-n"]);
     }
 }
+
+/// Writes `data` as `name` in one go (a few hundred KiB at most: the loader).
+fn put(fs: &mut Fs<FileDevice>, name: &[u8], data: &[u8]) {
+    let stream = fs.create(name, data.len() as u64).unwrap();
+    fs.write(&stream, 0, data, data.len() as u64).unwrap();
+    fs.finish(&stream, name, data.len() as u64).unwrap();
+}
+
+/// Turns the root entry `name` (11 bytes, space padded) from a file into an empty directory: the crate cannot make
+/// directories, and `mkfs.vfat` makes none, so the test makes one by hand (with its "." and ".." entries, as `fsck` expects).
+fn make_directory(path: &Path, name: &[u8; 11]) {
+    let mut file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let mut image = vec![0u8; 8 << 20];
+    file.read_exact(&mut image).unwrap();
+    let at = (0..image.len() - 32).step_by(32).find(|&at| &image[at..at + 11] == name && image[at + 11] == 0x20).expect("the entry");
+    image[at + 11] = 0x10; // directory
+    image[at + 28..at + 32].fill(0); // a directory's size field is 0
+    let cluster = (u32::from(u16::from_le_bytes([image[at + 20], image[at + 21]])) << 16) | u32::from(u16::from_le_bytes([image[at + 26], image[at + 27]]));
+    let spc = u64::from(image[13]);
+    let data_lba = u64::from(u16::from_le_bytes([image[14], image[15]])) + u64::from(image[16]) * u64::from(u32::from_le_bytes([image[36], image[37], image[38], image[39]]));
+    let directory_lba = data_lba + u64::from(cluster - 2) * spc;
+    let mut sector = [0u8; 512];
+    for (slot, (dots, target)) in [(&b".          ", cluster), (&b"..         ", 0u32)].into_iter().enumerate() {
+        let entry = &mut sector[slot * 32..slot * 32 + 32];
+        entry[..11].copy_from_slice(*dots);
+        entry[11] = 0x10;
+        entry[20..22].copy_from_slice(&((target >> 16) as u16).to_le_bytes());
+        entry[26..28].copy_from_slice(&(target as u16).to_le_bytes());
+    }
+    file.seek(SeekFrom::Start((at - at % 512) as u64)).unwrap();
+    file.write_all(&image[at - at % 512..at - at % 512 + 512]).unwrap();
+    file.seek(SeekFrom::Start(directory_lba * 512)).unwrap();
+    file.write_all(&sector).unwrap();
+}
+
+/// A FAT32 volume with `\EFI\BOOT\BOOTX64.EFI`, the loader of an EFI System Partition: the directory is entered, a new file
+/// written beside the old one and swapped in with `replace`; the volume must stay valid (`fsck.vfat`, 7-Zip) and the old
+/// file's clusters must be free again.
+#[test]
+fn replacing_a_file_in_a_subdirectory_keeps_the_volume_valid() {
+    if !tool("mkfs.vfat") {
+        return;
+    }
+    let path = scratch("replace.img");
+    let _cleanup = Cleanup(path.clone());
+    make_image(&path, 128, &["mkfs.vfat", "-F", "32", "-s", "1"]);
+    {
+        let mut fs = open(&path);
+        let cluster = fs.cluster_bytes() as usize;
+        // A directory made from a one-cluster file with zeroed contents.
+        put(&mut fs, b"efi", &vec![0u8; cluster]);
+        drop(fs);
+        make_directory(&path, b"EFI        ");
+    }
+    let mut fs = open(&path);
+    fs.set_time(Time { year: 2026, month: 10, day: 9, hour: 9, minute: 0, second: 0 });
+    fs.enter(b"EFI").unwrap();
+    assert!(fs.entry(b"efi").unwrap().is_none(), "the directory's own name is not inside it");
+    let old = pattern(0, 100_000);
+    let new = pattern(7, 180_000); // bigger than the old one: it needs a new, longer run of clusters
+    put(&mut fs, b"bootx64.efi", &old);
+    put(&mut fs, b"bootx64.new", &new);
+    // The root and the subdirectory are separate places.
+    fs.enter_root();
+    assert!(fs.find(b"bootx64.efi").unwrap().is_none());
+    fs.enter(b"EFI").unwrap();
+
+    fs.replace(b"bootx64.efi", b"bootx64.new").unwrap();
+    assert!(fs.find(b"bootx64.new").unwrap().is_none(), "the temporary name is gone");
+    let file = fs.find(b"BOOTX64.EFI").unwrap().expect("the loader is still there");
+    assert_eq!(file.size, 180_000);
+    let mut data = vec![0u8; 180_000];
+    assert_eq!(fs.read(&file, 0, &mut data).unwrap(), 180_000);
+    assert!(data == new, "the loader holds the new contents");
+    // Nothing of the old file is left allocated: a new file of the old file's size fits where it was, and the volume checks out.
+    put(&mut fs, b"again.bin", &old);
+    drop(fs);
+    fsck(&path, &["fsck.vfat", "-n"]);
+    let listing = Command::new("7z").args(["l"]).arg(&path).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    // 7-Zip lists the names as stored (lower case, from the lower-case names the files were created with).
+    if let Some(bytes) = seven_zip(&path, "efi/bootx64.efi") {
+        assert!(bytes.len() == new.len() && bytes == new, "7-Zip reads the new loader (got {} bytes, wanted {}, first difference at {:?})\n{listing}", bytes.len(), new.len(), bytes.iter().zip(new.iter()).position(|(a, b)| a != b));
+    }
+    // A cut after the switch (two names, one chain) is finished by `forget_alias`.
+    let mut fs = open(&path);
+    fs.enter(b"EFI").unwrap();
+    put(&mut fs, b"bootx64.new", &new);
+    let first = fs.entry(b"bootx64.new").unwrap().unwrap().first_cluster;
+    assert_ne!(first, fs.entry(b"bootx64.efi").unwrap().unwrap().first_cluster);
+    assert!(!fs.forget_alias(b"bootx64.new", b"bootx64.efi").unwrap(), "different chains: nothing to forget");
+    assert!(fs.find(b"bootx64.new").unwrap().is_some());
+}

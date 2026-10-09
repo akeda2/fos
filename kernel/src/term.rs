@@ -1164,7 +1164,7 @@ fn execute(command: &str) {
             crate::println!("nic       the network interfaces (list); nic use|sniff|discover|peers|map|regs|send|recv");
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
             crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
-            crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code from stage1.bin/stage2.bin");
+            crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
             crate::println!("sector diskN LBA [COUNT]   raw read-only dump of disk sectors (a GPT header, the slot metadata)");
             crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
             crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");

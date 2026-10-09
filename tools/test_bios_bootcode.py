@@ -114,8 +114,8 @@ def main():
 
         # --- refusals: nothing may be written ---
         cases = (
-            ("no files", build(tmp, "none", None, None), "there is no stage1.bin"),
-            ("no stage two", build(tmp, "no2", stage1, None), "there is no stage2.bin"),
+            ("no files", build(tmp, "none", None, None), "put stage1.bin and stage2.bin"),
+            ("no stage two", build(tmp, "no2", stage1, None), "no stage2.bin"),
             ("stage one of the wrong size", build(tmp, "short", stage1[:100], stage2), "exactly 512 bytes"),
             ("stage one with code in the partition table", build(tmp, "table", stage1[:450] + b"\x01" + stage1[451:], stage2), "partition-table area"),
             ("a stage two that is not stage two", build(tmp, "junk", stage1, b"\xfa" + bytes(200)), "lacks stage two's banner"),
