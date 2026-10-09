@@ -957,9 +957,13 @@ fn run_session(
     receive_buffer: &mut [u8; MAX_FRAME_LEN],
     max_frame_len: usize,
 ) {
+    // A fresh local port for every run (40000-59999, from the clock). A fixed one made a second connection to a server that had
+    // closed the first fail: the server still holds the old connection in TIME_WAIT and ignores a SYN on the same port whose
+    // sequence number is lower than the old one's.
+    let local_port = TELNET_LOCAL_PORT + ((ticks() as u32).wrapping_mul(2_654_435_761) >> 16) as u16 % 20_000;
     let mut connection = TcpConnection::<TCP_RX_CAPACITY>::active(
         config.local_ip,
-        TELNET_LOCAL_PORT,
+        local_port,
         config.server_ip,
         config.server_port,
         (ticks() as u32) ^ u32::from_be_bytes(own_mac.0[..4].try_into().unwrap()),

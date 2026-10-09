@@ -296,6 +296,10 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
             crate::println!("Remote terminal disconnected.");
             if unsafe { TAPE_MODE } {
                 tape_input_push(TAPE_ABORT);
+            } else if unsafe { BLOCKING } {
+                // A command that runs until Escape (nic sniff...) has nobody left to stop it: end it as Escape would, so the
+                // machine is not stuck in it with a client that is gone for good.
+                unsafe { BREAK = true };
             } else {
                 prompt();
             }

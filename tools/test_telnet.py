@@ -7,7 +7,7 @@ at 10.0.2.2; a small Telnet server on the host (127.0.0.1) plays the remote mach
 term session and the server echoes it back. Checks: the tape connects (static addressing, ARP for the gateway, a TCP handshake);
 its Telnet replies agree to terminal type and window size; the greeting and the UTF-8 text reach the screen; a typed line reaches the
 server as a line; the echoed answer comes back; and when the server closes the connection the tape returns to a usable shell.
-Ported from the legacy tapes/test_telnet_e2e.py, which implemented ARP/IPv4/TCP by hand; slirp does that here. Run with
+A second run with `dhcp` checks the DHCP client against QEMU's DHCP server (the legacy net-dhcp test covered it on its own). Ported from the legacy tapes/test_telnet_e2e.py, which implemented ARP/IPv4/TCP by hand; slirp does that here. Run with
 `make test-telnet`."""
 import os
 import re
@@ -44,8 +44,18 @@ class Server(threading.Thread):
         self.connected = threading.Event()
 
     def run(self):
-        connection, _ = self.listener.accept()
-        self.connected.set()
+        while True:
+            connection, _ = self.listener.accept()
+            self.state = "data"
+            self.connected.set()
+            try:
+                self.serve(connection)
+            except Exception as error:  # a test-server bug must show up in the output, not as a silent disconnect
+                print(f'telnet test server error: {error!r}')
+            finally:
+                connection.close()
+
+    def serve(self, connection):
         connection.sendall(bytes([IAC, DO, TERMINAL_TYPE, IAC, DO, NAWS]))
         connection.sendall("Welcome to the test server: gröövy ✓\r\nlogin: ".encode())
         line = bytearray()
@@ -175,6 +185,16 @@ def main():
             back = wire.until("fos> ", 30)
             check("fos> " in back, "when the server closes the connection the tape returns to the shell", back)
             check("ticks at 100 Hz" in line("uptime", "ticks at 100 Hz"), "and the shell is still usable", "")
+
+            # The DHCP client: the same tape with `dhcp` takes its address from QEMU's DHCP server (10.0.2.15) and connects again.
+            server.connected.clear()
+            screen = line(f"run telnet dhcp 10.0.2.2 {SERVER_PORT}", "login:", 60)
+            check("TELNET CONFIG" in screen and "10.0.2.15" in screen, "`telnet dhcp` gets its address from a real DHCP server (10.0.2.15)", screen)
+            check(server.connected.wait(5), "and connects with it", screen)
+            for byte in b"bye\r":
+                wire.send(guest, TAG_DATA, bytes([byte]))
+                time.sleep(0.06)
+            check("fos> " in wire.until("fos> ", 30), "and returns to the shell as before", "")
         finally:
             process.terminate()
             try:

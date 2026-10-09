@@ -66,5 +66,13 @@ true before the `crates/` move. The fix is probably a `cfg(not(test))` around th
   test implemented ARP/IPv4/TCP by hand. Found on the way: the console prints each byte above 0x7f as `?` (it does not decode UTF-8).
 - `test_router_arp_queue_e2e` -> a scenario at the end of the forwarding checks in `tapes/test_router_e2e.py` (`make test-router`).
 
-Still open from the list above: `test_net_dhcp_e2e` (DHCP is exercised by the router and ip-chat tests but not on its own),
-`test_release_loops_e2e` and the nettest retarget/router/self-test scenarios.
+- `test_release_loops_e2e` -> `tools/test_release_loops.py` (`make test-release-loops`): `nic sniff` on and off the session's NIC, and
+  `tape load net`, end on the client's Escape and on its disconnect. The disconnect half failed on this kernel: `TAG_BYE` during a
+  blocking command did not end it, so a vanished client left `nic sniff` running; fixed in `kernel/src/term.rs`.
+- `test_nettest_e2e` (clean link, rate limit, loss and delay), `test_nettest_selftest_e2e` (the `selftest` keyword),
+  `test_nettest_retarget_e2e` and `test_nettest_router_e2e` -> `tools/test_nettest_lab.py` (`make test-nettest-lab`): a four-NIC guest
+  with two cables, plus a second guest running the `router` tape. Not carried over: the sweep, bidirectional and report-file
+  scenarios, and the duplication/reordering/corruption impairments of the legacy `test_nettest_e2e`.
+- `test_net_dhcp_e2e` -> a second connection in `tools/test_telnet.py` with `run telnet dhcp`, against QEMU's DHCP server. It found that
+  the tape always used local port 40000, so a second connection to a server that had closed the first (TIME_WAIT) failed; the tape now
+  picks its port from the clock.

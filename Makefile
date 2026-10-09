@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab
 
 all: image tapes
 
@@ -46,6 +46,14 @@ test-net-chat: image
 # The telnet tape against a host-side Telnet server (QEMU user-mode network).
 test-telnet: image
 	python3 tools/test_telnet.py
+
+# Blocking commands (nic sniff, tape load net) end on the term net client's Escape or disconnect, on any NIC.
+test-release-loops: image
+	python3 tools/test_release_loops.py
+
+# nettest's generator and sink through a four-NIC loop: clean, rate limit, loss and delay, selftest, retarget.
+test-nettest-lab: image
+	python3 tools/test_nettest_lab.py
 
 # `make -s print-image`: the path `make image` writes (tools/build_image.py's DEFAULT_IMAGE must equal it; test-stick-guids checks).
 print-image:
