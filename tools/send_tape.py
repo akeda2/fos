@@ -128,6 +128,7 @@ def discover(raw: socket.socket, iface: str, source: bytes, timeout: float) -> l
     raw.send(pad(frame))
 
     found: list[bytes] = []
+    names: dict[bytes, str] = {}
     deadline = time.monotonic() + timeout
     raw.settimeout(0.1)
     while time.monotonic() < deadline:
@@ -140,9 +141,17 @@ def discover(raw: socket.socket, iface: str, source: bytes, timeout: float) -> l
         if packet[12:14] != CHAT_ETHERTYPE.to_bytes(2, "big") or packet[14] != CHAT_TAG_DISCOVER_REPLY:
             continue
         reply_source = packet[6:12]
-        if reply_source == source or reply_source in found:
+        if reply_source == source:
+            continue
+        # The reply (an answer to our probe or a machine's own periodic announcement) carries its host name.
+        name = packet[15:].split(b"\0", 1)[0].decode("ascii", "replace")
+        if name:
+            names[bytes(reply_source)] = name
+        if reply_source in found:
             continue
         found.append(reply_source)
+    if names:
+        remember_peer_names(names)
     return found
 
 
@@ -153,6 +162,34 @@ def discover(raw: socket.socket, iface: str, source: bytes, timeout: float) -> l
 # Overridable with an environment variable mainly so tests don't pollute a
 # real user's cache with throwaway QEMU-session MACs.
 PEERS_CACHE_FILE = Path(os.environ.get("FOS_PEERS_FILE", str(Path.home() / ".cache" / "fos_peers.json")))
+
+
+# Host names heard in discovery replies and in the machines' own periodic announcements, kept beside the address book
+# (the address book itself stays a plain list of MACs, as the other tools read it). Best effort, like the book.
+PEER_NAMES_FILE = PEERS_CACHE_FILE.with_name(PEERS_CACHE_FILE.name + ".names")
+
+
+def load_peer_names() -> dict[bytes, str]:
+    try:
+        entries = json.loads(PEER_NAMES_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    names = {}
+    for text, name in entries.items():
+        try:
+            names[parse_mac(text)] = str(name)
+        except SystemExit:
+            continue
+    return names
+
+
+def remember_peer_names(heard: dict[bytes, str]) -> None:
+    names = load_peer_names()
+    if all(names.get(mac) == name for mac, name in heard.items()):
+        return
+    names.update(heard)
+    PEER_NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PEER_NAMES_FILE.write_text(json.dumps({format_mac(mac): name for mac, name in names.items()}))
 
 
 def load_known_peers() -> list[bytes]:
@@ -200,8 +237,15 @@ def resolve_peer(text: str, peers: list[bytes]) -> bytes:
     """Accepts either a full MAC address or a 1-based index into `peers`
     -- exactly how fos's own `chat`/`tape send` accept
     `PEER_MAC|PEER_NUMBER` (see `kernel/src/shell.rs`'s `peer_by_index`)
-    -- and returns the resolved MAC address, or exits with a clear error
-    for an out-of-range number."""
+    -- or a host name heard earlier (case ignored), and returns the
+    resolved MAC address, or exits with a clear error for an
+    out-of-range number."""
+    if not text.isdigit() and not MAC_PATTERN.match(text.strip()):
+        matches = [mac for mac, name in load_peer_names().items() if name.lower() == text.lower()]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise SystemExit(f"{len(matches)} machines are called {text}; pass a MAC address.")
     if text.isdigit():
         index = int(text)
         if index < 1 or index > len(peers):
@@ -221,8 +265,9 @@ def print_known_peers(peers: list[bytes]) -> None:
         print("No peers known yet. Run 'tools/peers.py --discover' (or send_tape.py/term_net.py once) first.")
         return
     print("Known peers (use the number with --mac instead of a full MAC address):")
+    names = load_peer_names()
     for index, mac in enumerate(peers, start=1):
-        print(f"  {index}: {format_mac(mac)}")
+        print(f"  {index}: {format_mac(mac)}  {names.get(mac, '')}".rstrip())
 
 
 def send_tape(raw: socket.socket, destination: bytes, source: bytes, data: bytes, delay: float) -> None:
@@ -319,7 +364,7 @@ def main() -> None:
             elif not live_peers:
                 raise SystemExit(
                     "no fos host replied to the discovery probe. Make sure one is running "
-                    "'tape load net' or 'nic discover'/'chat', or pass --mac AA:BB:CC:DD:EE:FF (or a peer number) explicitly."
+                    "'tape load net' or 'nic discover'/'chat', or pass --mac AA:BB:CC:DD:EE:FF (a peer number or a host name) explicitly."
                 )
             else:
                 print_known_peers(known_peers)

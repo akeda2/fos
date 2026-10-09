@@ -20,6 +20,9 @@ Examples:
   tools/peers.py --discover       # broadcast a probe, merge any replies in, then print
   tools/peers.py --forget         # empty the address book
 
+Host names come from the machines' own announcements (every fos machine broadcasts its name at boot and every 10 s) and from
+discovery replies; `--mac NAME` in the other tools accepts them. With --discover, names are heard during the whole wait.
+
 Broadcasting with --discover requires CAP_NET_RAW, same as
 send_tape.py/term_net.py (in practice: run this as root, e.g. with
 `sudo`, unless the interpreter has been granted the capability directly,
