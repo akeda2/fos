@@ -13,7 +13,7 @@
 use fosfor_abi::keymap::hid_ascii;
 
 use crate::xhci::{self, Controller, Trb};
-use crate::{ehci, usb_storage};
+use crate::{ehci, ohci, usb_storage};
 use crate::{keyboard, memory};
 
 const MAX_KEYBOARDS: usize = 4;
@@ -25,6 +25,8 @@ enum Source {
     Xhci { bus: u8, device: u8, function: u8, slot: u8, dci: u32, buffer: u64 },
     /// A permanent queue head on an EHCI controller.
     Ehci { controller: usize, index: usize },
+    /// A permanent endpoint descriptor on an OHCI controller's periodic list.
+    Ohci { controller: usize, index: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -120,7 +122,7 @@ pub fn probe_all() -> usize {
         let Some(controller) = xhci::controller(index) else { continue };
         added += crate::usb_hub::rescan(index, controller);
     }
-    added + probe_all_ehci()
+    added + probe_all_ehci() + probe_all_ohci()
 }
 
 /// `usb try PORT [hot|warm]`: a diagnostic for a port that will not enumerate: optionally resets it by hand, then goes
@@ -342,6 +344,12 @@ pub fn poll() {
                 decode(keyboard, &report);
             }
         }
+        if let Source::Ohci { controller, index } = keyboard.source {
+            if let Some(report) = ohci::controller(controller).and_then(|c| c.poll_keyboard(index)) {
+                keyboard.reports += 1;
+                decode(keyboard, &report);
+            }
+        }
     }
 }
 
@@ -397,7 +405,7 @@ fn probe_all_ehci() -> usize {
             let count = match count {
                 Ok(count) => count,
                 Err(ehci::Error::CompanionPort) => {
-                    crate::println!("USB: EHCI {:02x}:{:02x}.{} port {port}: a full/low-speed device wired to the root port belongs to the companion controller, which has no driver.", controller.pci.bus, controller.pci.device, controller.pci.function);
+                    crate::println!("USB: EHCI {:02x}:{:02x}.{} port {port}: a full/low-speed device wired to the root port belongs to the companion controller (OHCI, see `usb`; UHCI has no driver).", controller.pci.bus, controller.pci.device, controller.pci.function);
                     continue;
                 }
                 Err(error) => {
@@ -472,6 +480,100 @@ fn drop_ehci_keyboard_entries(controller_index: usize, removed: u8) {
     }
 }
 
+/// Probes every OHCI controller's root ports for boot keyboards (OHCI is the companion that gets the low- and full-speed devices
+/// when a board's EHCI controller takes the high-speed ones; there are no hubs or disks here). Returns how many were added. A
+/// port whose device was unplugged or replugged since it was claimed has its keyboard dropped and is looked at again.
+fn probe_all_ohci() -> usize {
+    let mut added = 0;
+    for index in 0..ohci::count() {
+        let Some(controller) = ohci::controller(index) else { continue };
+        for port in 1..=controller.ports {
+            if controller.claimed_ports & (1 << port) != 0 {
+                if !controller.port_connect_changed(port) {
+                    continue; // still the device we enumerated
+                }
+                controller.claimed_ports &= !(1 << port);
+                let removed = controller.remove_keyboards_on_port(port);
+                drop_ohci_keyboard_entries(index, removed);
+                crate::println!("USB: OHCI {:02x}:{:02x}.{} port {port}: its device was unplugged or replugged; looking at the port again.",
+                    controller.pci.bus, controller.pci.device, controller.pci.function);
+            }
+            if !controller.port_has_device(port) {
+                continue;
+            }
+            let mut attempt = 1;
+            let found = loop {
+                match controller.enumerate_port(port) {
+                    Err(error) if attempt < 3 => {
+                        crate::println!("USB: OHCI {:02x}:{:02x}.{} port {port}, attempt {attempt}/3 failed at \"{}\": {error:?}.",
+                            controller.pci.bus, controller.pci.device, controller.pci.function, controller.step);
+                        attempt += 1;
+                        crate::apic::wait_ticks(15);
+                    }
+                    other => break other,
+                }
+            };
+            let found = match found {
+                Ok(found) => found,
+                Err(error) => {
+                    crate::println!("USB: OHCI {:02x}:{:02x}.{} port {port}: device not usable ({error:?} at \"{}\").",
+                        controller.pci.bus, controller.pci.device, controller.pci.function, controller.step);
+                    continue;
+                }
+            };
+            if found.descriptor[4] == 9 {
+                crate::println!("USB: OHCI {:02x}:{:02x}.{} port {port}: a hub; hubs on OHCI are not supported.", controller.pci.bus, controller.pci.device, controller.pci.function);
+                continue;
+            }
+            match setup_ohci_keyboard(index, controller, &found, port) {
+                Ok(true) => {
+                    controller.claimed_ports |= 1 << port;
+                    added += 1;
+                }
+                Ok(false) => {}
+                Err(error) => crate::println!("USB: OHCI port {port}: device not usable ({error:?})."),
+            }
+        }
+    }
+    added
+}
+
+fn drop_ohci_keyboard_entries(controller_index: usize, removed: u8) {
+    let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    for entry in keyboards.iter_mut() {
+        if matches!(*entry, Some(Keyboard { source: Source::Ohci { controller: c, index }, .. }) if c == controller_index && removed & (1 << index) != 0) {
+            *entry = None;
+        }
+    }
+}
+
+fn setup_ohci_keyboard(controller_index: usize, controller: &mut ohci::Controller, found: &ohci::Found, root_port: u8) -> Result<bool, ohci::Error> {
+    let target = found.target;
+    let (vendor, product) = (u16::from_le_bytes([found.descriptor[8], found.descriptor[9]]), u16::from_le_bytes([found.descriptor[10], found.descriptor[11]]));
+    let mut configuration = [0u8; 256];
+    controller.get_descriptor(&target, 2, 0, &mut configuration[..9])?;
+    let total = usize::from(u16::from_le_bytes([configuration[2], configuration[3]])).clamp(9, configuration.len());
+    controller.get_descriptor(&target, 2, 0, &mut configuration[..total])?;
+    let Some((interface, endpoint, max_packet, _interval)) = find_boot_keyboard(&configuration[..total]) else {
+        return Ok(false);
+    };
+    controller.set_configuration(&target, configuration[5])?;
+    controller.control_transfer(&target, 0x21, 0x0b, 0, u16::from(interface), &mut [])?; // SET_PROTOCOL(boot)
+    let _ = controller.control_transfer(&target, 0x21, 0x0a, 0, u16::from(interface), &mut []); // SET_IDLE(0)
+    let index = controller.add_keyboard(target, endpoint, max_packet, root_port)?;
+    let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    let Some(slot) = keyboards.iter_mut().find(|entry| entry.is_none()) else { return Ok(false) };
+    *slot = Some(Keyboard { source: Source::Ohci { controller: controller_index, index }, previous: [0; 8], caps: false, reports: 0 });
+    crate::println!(
+        "USB keyboard {vendor:04x}:{product:04x} on OHCI {:02x}:{:02x}.{} port {root_port} ({}): ready.",
+        controller.pci.bus,
+        controller.pci.device,
+        controller.pci.function,
+        if target.low_speed { "low speed" } else { "full speed" }
+    );
+    Ok(true)
+}
+
 fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controller, found: &ehci::Found, root_port: u8, claimed_port: u8) -> Result<bool, ehci::Error> {
     let target = found.target;
     let (vendor, product) = (u16::from_le_bytes([found.descriptor[8], found.descriptor[9]]), u16::from_le_bytes([found.descriptor[10], found.descriptor[11]]));
@@ -530,6 +632,15 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
         for port in 1..=controller.ports {
             if controller.port_has_device(port) {
                 print(format_args!("  port {port}: device connected{}", if controller.claimed_ports & (1 << port) != 0 { ", in use (a keyboard or a disk)" } else { "" }));
+            }
+        }
+    }
+    for index in 0..ohci::count() {
+        let Some(controller) = ohci::controller(index) else { continue };
+        print(format_args!("OHCI {:02x}:{:02x}.{}: {} ports", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports));
+        for port in 1..=controller.ports {
+            if let Some((low_speed, claimed)) = controller.describe_port(port) {
+                print(format_args!("  port {port}: device connected ({}){}", if low_speed { "low speed" } else { "full speed" }, if claimed { ", in use (a keyboard)" } else { "" }));
             }
         }
     }

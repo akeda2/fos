@@ -225,7 +225,7 @@ Follow-ups from that first run (all in QEMU-tested code; the AMD board has not r
 being in another machine); stage two reads the metadata back after writing it; an unplugged EHCI disk fails immediately
 and a returning stick takes over its old disk (`make test-usb-replug`); audio tapes name their device and accept
 `device=N`. Not done: the RTL8168H on that board stays on polled interrupts (its MSI self-test needs a transmitted
-frame, and the link is not up yet at init); no OHCI/UHCI driver (USB keyboards there rely on BIOS legacy emulation);
+frame, and the link is not up yet at init); an OHCI driver for keyboards on the root ports now exists (`kernel/src/ohci.rs`; no hubs, no disks; QEMU-tested, see `make test-keyboard`), no UHCI driver;
 the xHCI replug path (disks directly on a root port, tested in QEMU; not yet on the Skylake) leaves a replugged keyboard's old entry behind and does not cover disks behind hubs.
 
 Replug on real hardware (the same board, 2026-10-08): a USB 3.0 stick (Kingston DataTraveler 3.0) on an nForce EHCI port drops

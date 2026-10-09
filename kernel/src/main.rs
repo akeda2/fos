@@ -28,6 +28,7 @@ mod diag;
 mod cpu;
 mod e1000;
 mod ehci;
+mod ohci;
 mod fatvol;
 mod fault;
 mod fosfs;
@@ -278,11 +279,12 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     // ---- USB keyboards (xHCI) ----
     let controllers = xhci::init_all();
     let ehci_controllers = ehci::init_all();
-    if controllers + ehci_controllers == 0 {
-        println!("USB: no xHCI or EHCI controller.");
+    let ohci_controllers = ohci::init_all();
+    if controllers + ehci_controllers + ohci_controllers == 0 {
+        println!("USB: no xHCI, EHCI or OHCI controller.");
     } else {
         let keyboards = usb_hid::probe_all();
-        println!("USB: {controllers} xHCI and {ehci_controllers} EHCI controller(s), {keyboards} usable device(s) (keyboards, disks).");
+        println!("USB: {controllers} xHCI, {ehci_controllers} EHCI and {ohci_controllers} OHCI controller(s), {keyboards} usable device(s) (keyboards, disks).");
     }
 
     // ---- storage: find the boot disk by its partition GUID, mount FOSFS ----

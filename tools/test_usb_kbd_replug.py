@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A USB keyboard that is unplugged and plugged back in keeps working, over and over (xHCI and EHCI).
+"""A USB keyboard that is unplugged and plugged back in keeps working, over and over (xHCI, EHCI and OHCI).
 
 Before: the kernel kept the old keyboard's table entry, so every replug added another one (the table of four was full after
 the fourth, and the keyboard then stayed dead), `usb` counted ghosts, and on xHCI the new device's slot number matched the
@@ -77,7 +77,7 @@ class Machine:
 
 
 def scenario(controller):
-    label = "EHCI" if "ehci" in controller else "xHCI"
+    label = "EHCI" if "ehci" in controller else "OHCI" if "ohci" in controller else "xHCI"
     with tempfile.TemporaryDirectory() as tmp:
         machine = Machine(tmp, controller)
         try:
@@ -104,7 +104,7 @@ def scenario(controller):
 
 
 def main():
-    for controller in ("qemu-xhci", "usb-ehci"):
+    for controller in ("qemu-xhci", "usb-ehci", "pci-ohci"):
         scenario(controller)
     print("usb keyboard replug: all checks passed")
 
