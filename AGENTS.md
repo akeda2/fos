@@ -191,6 +191,21 @@ encodes the traps that gave false results. Deploy path: `devloop push KERNEL`, t
 `foscopy.py --mac N FILE :disk1/NAME`. Test machines and their quirks are in the
 maintainer's memory notes, not in this repository.
 
+## Things a new session should know (2026-10-09)
+
+- **Tests added for hardware-shaped behaviour**: `test-usb-kbd-replug`, `test-usb-replug` (disks, hubs, the hub itself),
+  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`.
+  `make test-all` runs every `test-*` target (60 of them; `test-nettapes` is the one known failure).
+- **`term net` data frames carry no length**: the kernel drops trailing zero bytes (Ethernet padding) before a tape or the shell sees
+  the frame; a NUL typed on purpose is lost. A tape's single-interface network calls follow `nic use N` (ABI 4, `nic_active`).
+- **Hubs**: a hub's ports are only visible by asking the hub, so `usb rescan` is what notices a device that went away behind one;
+  the storage driver asks the hub before every transfer (`child_vanished`, `hub_child_vanished`) so a pulled disk fails at once. A
+  hub's first class request after SET_CONFIGURATION may stall once (a Realtek 0bda:0401 does): `usb_hub::enumerate` waits and retries.
+- **Real-hardware workflow**: `tools/devloop.py` as described above; a pushed kernel that comes back on the *other* slot with
+  "no FOSFS data partition" in `dmesg` means the A/B fallback reverted it. `bootcode` can replace the BIOS boot code and the UEFI
+  loader without a stick rewrite (both verified on real machines). `debug video skip` plus `reboot` shows the VGA text console.
+- **Open work** is in `DEFERRED.md` ("Open after the 2026-10-09 session").
+
 ## Conventions
 
 - Every shell command's output fits an 80-column text grid; keep each print line to at
