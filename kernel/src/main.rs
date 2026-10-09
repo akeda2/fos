@@ -201,6 +201,10 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         framebuffer::fill_rect(0, fb.height as usize - 48, 64, 32, 255, 0, 0);
         framebuffer::fill_rect(80, fb.height as usize - 48, 64, 32, 0, 255, 0);
         framebuffer::fill_rect(160, fb.height as usize - 48, 64, 32, 0, 0, 255);
+    } else if info.runtime_services == 0 && framebuffer::init_text() {
+        // BIOS boot, video mode switch skipped: the BIOS's 80x25 text screen is still there, so use it.
+        framebuffer::write_str(log::contents());
+        println!("No framebuffer: using the BIOS's 80x25 VGA text screen (and the serial port).");
     } else {
         println!("No framebuffer: serial console only.");
     }

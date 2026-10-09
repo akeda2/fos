@@ -6,8 +6,7 @@ codebase on `main` that boots through UEFI or BIOS (`make test`, `make test-bios
 lives on at tag `legacy-v1` / branch `legacy`. The README is rewritten for this tree (the old one is
 `docs/legacy-v1-readme.md`); `docs/history/v1-tests-not-ported.md` says which v1 tests were dropped and which
 are worth porting. First real-hardware results (AMD/nForce through BIOS, Skylake and a laptop through UEFI)
-are in sections 4.5-4.6 and in `DEFERRED.md`. Still open: font scaling on large modes, a VGA text backend for
-the BIOS "skip video" case, the UEFI loader update path and what `DEFERRED.md` lists. This note supersedes the
+are in sections 4.5-4.6 and in `DEFERRED.md`. Still open: font scaling on large modes, the UEFI loader update path and what `DEFERRED.md` lists. This note supersedes the
 "v1 and v2 live side by side, drivers copied and widened" decision in v2-design.md
 section 3 and the "v1 is maintained" paragraph in section 12.
 
@@ -196,7 +195,7 @@ state at every disk call and again before the mode switch, so a key held from po
 runs counts), or `debug video skip` in the shell, a flag in the slot-metadata sector (`SlotMetadata::flags`, byte 16 bit 0,
 preserved by the loader and the kernel; `debug video auto` clears it). `make test-bios-video` checks both, including that the
 flag survives a reboot. The catch: with the mode switch skipped the kernel has no framebuffer and only the serial port, because
-there is no VGA text console to fall back on (a small text backend for the 80x25 screen would close that gap).
+there was no VGA text console to fall back on. Now there is: with no framebuffer on a BIOS boot the kernel paints the same character grid into VGA text memory at 0xB8000 (`framebuffer::init_text`, uncached mapping added in `paging`; the hardware cursor follows through the CRT controller), so the machine has a screen and the serial port. `make test-bios-video` reads the screen back through the QEMU monitor.
 
 Mode choice diagnostics: stage two leaves its mode table (including modes found by probing the unlisted numbers 0x100-0x1FF) and
 the DDC/EDID results in low memory (`VBET` at 0x3600, EDID size at 0x35f8), and the kernel command `videomodes` prints them (no

@@ -1558,7 +1558,7 @@ fn execute(command: &str) {
                     None => crate::debug::read_metadata(),
                 };
                 match updated {
-                    Some(metadata) if metadata.flags & FLAG_SKIP_VIDEO != 0 => crate::println!("BIOS boot: the video mode switch is skipped (text mode stays, the kernel is serial only). `debug video auto` undoes it. UEFI boots ignore this."),
+                    Some(metadata) if metadata.flags & FLAG_SKIP_VIDEO != 0 => crate::println!("BIOS boot: the video mode switch is skipped (the BIOS text screen stays and the kernel writes to it, and to the serial port). `debug video auto` undoes it. UEFI boots ignore this."),
                     Some(_) => crate::println!("BIOS boot: the video mode (VBE framebuffer) is chosen automatically. Holding Shift during a boot skips it once; `debug video skip` skips it for good."),
                     None => crate::println!("debug video: the slot metadata could not be read or written."),
                 }

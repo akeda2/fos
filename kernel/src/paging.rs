@@ -219,6 +219,10 @@ pub fn build_and_load(info: &BootInfo, framebuffer: &Framebuffer) {
     if framebuffer.base != 0 {
         let flags = WRITABLE | NO_EXECUTE | if write_combining { WRITE_THROUGH } else { CACHE_DISABLE | WRITE_THROUGH };
         map_region(root, framebuffer.base, framebuffer.base + framebuffer.size, flags, &layout);
+    } else if info.runtime_services == 0 {
+        // A BIOS boot with no linear framebuffer (the video mode switch was skipped): the screen is still in the BIOS's 80x25
+        // text mode, whose memory is the VGA window at 0xB8000. It is not RAM in the memory map, so it is mapped here, uncached.
+        map_region(root, crate::framebuffer::VGA_TEXT_BASE, crate::framebuffer::VGA_TEXT_BASE + 0x8000, WRITABLE | NO_EXECUTE | CACHE_DISABLE | WRITE_THROUGH, &layout);
     }
 
     // NXE lets the NX bit in page entries mean something (otherwise it is a reserved

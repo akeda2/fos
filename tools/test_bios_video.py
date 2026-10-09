@@ -2,7 +2,8 @@
 """BIOS path: the two ways to keep stage two from switching the video mode (a video BIOS that hangs in a VBE call).
 
  * Hold Shift: the QEMU monitor holds a Shift key down for several seconds from the start of the boot; stage two reads the
-   BIOS keyboard state just before the VBE step, says it skipped the mode, and the kernel comes up serial-only.
+   BIOS keyboard state just before the VBE step, says it skipped the mode, and the kernel paints the BIOS's 80x25 text screen
+   (and the serial port).
  * `debug video skip`: sets a flag in the slot-metadata sector (byte 16, bit 0) from the shell; after a reboot stage two
    honours it every time, until `debug video auto` clears it and the next boot has its VBE framebuffer again.
 Boots through SeaBIOS (no OVMF), on a private copy of the image. Run with `make test-bios-video`."""
@@ -54,6 +55,20 @@ class Machine:
         self.process.wait()
 
 
+def screen_text(machine, tmp):
+    """What is on the BIOS text screen: the 80x25 character/attribute words at 0xB8000, read through the QEMU monitor."""
+    path = Path(tmp) / "vga.bin"
+    path.unlink(missing_ok=True)
+    monitor(machine.monitor_path, f'pmemsave 0xb8000 4000 "{path}"')
+    for _ in range(50):
+        if path.exists() and path.stat().st_size >= 4000:
+            break
+        time.sleep(0.1)
+    data = path.read_bytes()
+    characters = data[0::2]
+    return "\n".join(characters[row * 80:(row + 1) * 80].decode("latin-1").rstrip() for row in range(25))
+
+
 def reboot(machine):
     """Sends `reboot`, waits for the *next* boot's stage two and then its prompt; returns that boot's serial text."""
     before = len(machine.text())
@@ -75,10 +90,13 @@ def main():
             machine.wait_for("Fosfor stage 2")          # SeaBIOS is up and handling the keyboard; stage two is running
             monitor(machine.monitor_path, "sendkey shift 12000")
             text = machine.wait_for("fos> ")
+            time.sleep(0.5)
+            screen = screen_text(machine, tmp)
         finally:
             machine.close()
         check("Video: skipped (Shift is held" in text, "a held Shift makes stage two skip the video mode", text)
-        check("No framebuffer: serial console only." in text and "Framebuffer console ready" not in text, "and the kernel runs serial-only", text)
+        check("Fosfor OS kernel" in screen and "fos>" in screen, "the screen itself shows the boot log and the prompt (VGA text memory)", screen)
+        check("No framebuffer: using the BIOS's 80x25 VGA text screen" in text and "Framebuffer console ready" not in text, "and the kernel uses the BIOS text screen instead", text)
 
         # --- the persistent flag ---
         image = tmp / "copy.img"
@@ -91,7 +109,7 @@ def main():
             seen = machine.wait_for("automatically", 20, mark)[mark:]
             check("chosen automatically" in seen, "`debug video` reports the automatic default", seen)
             mark = machine.send("debug video skip")
-            seen = machine.wait_for("serial only", 20, mark)[mark:]
+            seen = machine.wait_for("video mode switch is skipped", 20, mark)[mark:]
             check("video mode switch is skipped" in seen, "`debug video skip` sets the flag", seen)
             mark = machine.send("debug slots")
             seen = machine.wait_for("BIOS video mode switch:", 20, mark)[mark:]
@@ -100,7 +118,10 @@ def main():
             check("BIOS video mode switch: skipped" in seen, "and `debug slots` shows it", seen)
             second = reboot(machine)
             check("Video: skipped (Shift is held, or `debug video skip` is set)" in second, "after a reboot stage two honours the flag", second[-1500:])
-            check("No framebuffer: serial console only." in second, "and the kernel is serial-only", second[-800:])
+            check("No framebuffer: using the BIOS's 80x25 VGA text screen" in second, "and the kernel uses the BIOS text screen", second[-800:])
+            machine.send("uptime")
+            time.sleep(1.0)
+            check("ticks at 100 Hz" in screen_text(machine, tmp), "a command typed afterwards shows its output on the screen too", "")
             mark = machine.send("debug video auto")
             machine.wait_for("chosen automatically", 20, mark)
             third = reboot(machine)

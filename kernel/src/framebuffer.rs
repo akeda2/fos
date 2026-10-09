@@ -1,6 +1,9 @@
 //! A text console on the firmware's linear framebuffer: an 8x16 bitmap font drawn
 //! pixel by pixel, with a cursor, line wrap and scrolling.
 //!
+//! On a BIOS boot whose video mode switch was skipped there is no framebuffer, but the screen is still in the BIOS's 80x25 text
+//! mode: the same character grid is then painted into VGA text memory (`init_text`), so the machine is not serial-only.
+//!
 //! The framebuffer is plain memory the display reads, mapped write-combining: stores are
 //! fast, *reads are not* (about uncached speed). Scrolling by copying pixels reads the
 //! whole screen per line, which made a 16 KiB `dmesg` take over a minute on real hardware.
@@ -13,6 +16,8 @@ use core::fmt;
 use fosfor_abi::{Framebuffer, PIXEL_RGB};
 
 pub struct Console {
+    /// VGA text mode instead of pixels: `base` is then the 80x25 array of character/attribute words at 0xB8000.
+    text: bool,
     base: *mut u32,
     stride: usize,
     width: usize,
@@ -90,6 +95,9 @@ impl Console {
 
     /// Draws every cell whose character differs from what is on screen.
     fn repaint(&mut self) {
+        if self.text {
+            return self.repaint_text();
+        }
         let columns = self.columns;
         for row in 0..self.rows {
             for column in 0..columns {
@@ -101,6 +109,29 @@ impl Console {
                 }
             }
         }
+    }
+
+    /// The text-mode paint: a cell is a 16-bit word, character in the low byte and colours in the high byte, and the hardware
+    /// cursor is moved through the CRT controller (index port 0x3D4, data port 0x3D5; registers 0x0E and 0x0F hold the cursor's
+    /// cell number, high and low byte). Unlike the pixel framebuffer this memory is cheap to write, but the same
+    /// only-what-changed rule keeps a slow bus from being flooded.
+    fn repaint_text(&mut self) {
+        let columns = self.columns;
+        for row in 0..self.rows {
+            for column in 0..columns {
+                let index = row * columns + column;
+                let wanted = unsafe { CELLS[index] };
+                if wanted != unsafe { PAINTED[index] } {
+                    unsafe { self.base.cast::<u16>().add(index).write_volatile(u16::from(TEXT_ATTRIBUTE) << 8 | u16::from(wanted)) };
+                    unsafe { PAINTED[index] = wanted };
+                }
+            }
+        }
+        let cell = (self.row.min(self.rows - 1) * columns + self.column.min(columns - 1)) as u16;
+        crate::cpu::outb(0x3d4, 0x0e);
+        crate::cpu::outb(0x3d5, (cell >> 8) as u8);
+        crate::cpu::outb(0x3d4, 0x0f);
+        crate::cpu::outb(0x3d5, cell as u8);
     }
 
     /// The few ANSI sequences a tape's screen editor sends: `ESC [ n C` / `ESC [ n D` (cursor
@@ -194,6 +225,7 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
         return false;
     }
     let mut console = Console {
+        text: false,
         base: framebuffer.base as *mut u32,
         stride: framebuffer.stride as usize,
         width: framebuffer.width as usize,
@@ -222,6 +254,49 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
         (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
         *core::ptr::addr_of_mut!(CONSOLE) = Some(console);
     }
+    true
+}
+
+/// Where VGA text memory is, and the colours of its cells: light grey on blue, as the pixel console draws.
+pub const VGA_TEXT_BASE: u64 = 0xb8000;
+const TEXT_ATTRIBUTE: u8 = 0x17;
+
+/// Starts the console in VGA text mode (80x25 at 0xB8000, which `paging` maps on a BIOS boot without a framebuffer): the
+/// screen is cleared, and the cursor made visible. Only for a BIOS boot, where the BIOS left the screen in text mode; a UEFI
+/// machine without a framebuffer has no text screen.
+pub fn init_text() -> bool {
+    let mut console = Console {
+        text: true,
+        base: VGA_TEXT_BASE as *mut u32,
+        stride: 80,
+        width: 80,
+        height: 25,
+        format: 0,
+        columns: 80,
+        rows: 25,
+        column: 0,
+        row: 0,
+        foreground: 0,
+        background: 0,
+        escape: 0,
+        parameter: 0,
+        first_parameter: 0,
+        has_first: false,
+    };
+    unsafe {
+        let cells = console.base.cast::<u16>();
+        for index in 0..80 * 25 {
+            cells.add(index).write_volatile(u16::from(TEXT_ATTRIBUTE) << 8 | u16::from(b' '));
+        }
+        (*core::ptr::addr_of_mut!(CELLS)).fill(b' ');
+        (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
+        *core::ptr::addr_of_mut!(CONSOLE) = Some(console);
+    }
+    // CRTC register 0x0A: bit 5 turns the cursor off; clear it, and give the cursor a block-ish shape (scan lines 13-15).
+    crate::cpu::outb(0x3d4, 0x0a);
+    crate::cpu::outb(0x3d5, 13);
+    crate::cpu::outb(0x3d4, 0x0b);
+    crate::cpu::outb(0x3d5, 15);
     true
 }
 
