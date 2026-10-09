@@ -828,3 +828,7 @@ waits, preserve serial output on failure, wait for the prompt before typing.
   kernel's name as its default session name (`name=` still overrides), `audio-net list` prints the table, and on raw Ethernet / AVTP
   `to=NAME` resolves from it with no stream announcement; an IP `to=NAME` still waits for SAP, because the table holds MACs only.
   Tested by `make test-hostnames`. Peers are never aged out of the table.
+
+**Config files on FAT/exFAT (2026-10-09):** `hostname`, `settings`, `debug` and `start` are looked up on the boot FOSFS volume, then the other
+  FOSFS volumes, and only then in the root directory of the first FAT32/exFAT disk that has the file (`config::read_fat`), so a name or a
+  start script can be edited on a PC. Files over 4096 bytes are ignored. Tested by `make test-config-fat`.

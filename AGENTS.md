@@ -75,7 +75,7 @@ Also read on demand: `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put asid
   the boot disk (found by the payload partition GUID); other numbers follow discovery
   order and are not stable. FOSFS volumes may carry a label (superblock offset 64);
   `diskN/NAME` and `@LABEL/NAME` name files across volumes. FAT/exFAT volumes are only
-  reachable by explicit `diskN`. Disk-destroying commands (`format`, `install`)
+  reachable by explicit `diskN`, except that boot-time config (`hostname`, `settings`, `debug`, `start`) falls back to a FAT/exFAT root when no FOSFS volume has the file. Disk-destroying commands (`format`, `install`)
   announce what they would erase and need `... confirm` as the very next command;
   never the boot disk.
   A USB disk that is unplugged fails at once (its EHCI root port says so; no multi-second timeouts) and, when the same stick
@@ -194,8 +194,8 @@ maintainer's memory notes, not in this repository.
 ## Things a new session should know (2026-10-09)
 
 - **Tests added for hardware-shaped behaviour**: `test-usb-kbd-replug`, `test-usb-replug` (disks, hubs, the hub itself),
-  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`, `test-console-utf8`, `test-hostnames`.
-  `make test-all` runs every `test-*` target (65 of them; none is a known failure).
+  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`, `test-console-utf8`, `test-hostnames`, `test-config-fat`.
+  `make test-all` runs every `test-*` target (66 of them; none is a known failure).
 - **`term net` data frames carry no length**: the kernel drops trailing zero bytes (Ethernet padding) before a tape or the shell sees
   the frame; a NUL typed on purpose is lost. A tape's single-interface network calls follow `nic use N` (ABI 4, `nic_active`).
 - **Hubs**: a hub's ports are only visible by asking the hub, so `usb rescan` is what notices a device that went away behind one;

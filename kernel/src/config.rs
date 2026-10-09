@@ -1,4 +1,5 @@
-//! The optional per-machine files on the boot FOSFS volume, the same ones v1 reads:
+//! The optional per-machine files on the boot FOSFS volume (else any other FOSFS volume, else the root of a FAT32/exFAT
+//! disk), the same ones v1 reads:
 //!
 //! * `hostname`: the base name announced in discovery replies (`NAME` + the interface
 //!   number, so `lab` becomes `lab1`);
@@ -57,8 +58,8 @@ pub fn hostname() -> Option<&'static str> {
 
 /// Reads `name` into the shared buffer (from the boot volume, else the first other disk that has it); the text, if present.
 fn read(name: &str) -> Option<&'static str> {
-    let volume = storage::volume_with_file(name.as_bytes())?;
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
+    let Some(volume) = storage::volume_with_file(name.as_bytes()) else { return read_fat(name, buffer) };
     match volume.read(name.as_bytes(), buffer) {
         Ok(Some(length)) => core::str::from_utf8(&buffer[..length]).ok(),
         Ok(None) => None,
@@ -67,6 +68,37 @@ fn read(name: &str) -> Option<&'static str> {
             None
         }
     }
+}
+
+/// The fallback when no FOSFS volume has `name`: the root directory of the first FAT32/exFAT disk that does (a stick or
+/// SSD a PC can write, so a hostname or start script can be edited there). Disks with a FOSFS volume are not looked at
+/// again, and a file longer than the buffer is ignored rather than cut.
+fn read_fat(name: &str, buffer: &'static mut [u8; FILE_CAPACITY]) -> Option<&'static str> {
+    for number in 1..=crate::block::count() {
+        if storage::volume_on(number).is_ok() {
+            continue;
+        }
+        let Some(mut fs) = crate::fatvol::mount(number - 1) else { continue };
+        let Ok(Some(entry)) = fs.entry(name.as_bytes()) else { continue };
+        if entry.is_directory {
+            continue;
+        }
+        if entry.size as usize > FILE_CAPACITY {
+            crate::println!("{name}: disk{number} has it but it is over {FILE_CAPACITY} bytes; ignored.");
+            return None;
+        }
+        return match fs.read(&entry.file(), 0, &mut buffer[..entry.size as usize]) {
+            Ok(length) => {
+                crate::println!("{name}: read from disk{number} (FAT/exFAT).");
+                core::str::from_utf8(&buffer[..length]).ok()
+            }
+            Err(error) => {
+                crate::println!("{name}: cannot be read from disk{number} ({error:?}); ignored.");
+                None
+            }
+        };
+    }
+    None
 }
 
 fn lines(text: &str) -> impl Iterator<Item = &str> {
