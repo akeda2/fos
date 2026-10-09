@@ -355,7 +355,7 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
         R_GATEWAY => dash(settings.gateway.as_str(), out),
         R_NAME => {
             if settings.name.is_empty() {
-                let _ = write!(out, "{}  (automatic: fos- and the end of the MAC; type a name to change it)", effective_name(settings).as_str());
+                let _ = write!(out, "{}  (automatic: the kernel's host name; type a name to change it)", effective_name(settings).as_str());
             } else {
                 let _ = write!(out, "{}", settings.name.as_str());
             }
@@ -836,7 +836,7 @@ fn run_stream(settings: &Settings) {
     tape_rt::set_quiet(false);
 }
 
-/// The name this machine announces under: the configured one or `fos-` and the end of the MAC.
+/// The name this machine announces under: the configured one or the kernel's host name.
 fn effective_name(settings: &Settings) -> Text<24> {
     let mut mac = [0u8; 6];
     (tape_rt::api().nic_mac)(settings.nic.saturating_sub(1), mac.as_mut_ptr());

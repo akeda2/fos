@@ -253,7 +253,6 @@ pub struct Transport {
 
 impl Transport {
     pub fn open(api: &TapeApi, options: &Options) -> Option<Transport> {
-        peers::set_default_name(api, options.nic);
         let mut mac = [0u8; 6];
         (api.nic_mac)(options.nic, mac.as_mut_ptr());
         let mut config = NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) };

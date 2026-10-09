@@ -79,16 +79,6 @@ impl Announcer {
     }
 }
 
-static mut DEFAULT_NAME: [u8; 20] = [0; 20];
-static mut DEFAULT_NAME_LENGTH: usize = 0;
-
-/// Takes the kernel's name for this machine (the `hostname` file's, or `fos-` and the last MAC bytes) as the default
-/// session name, so the name other machines already know from the kernel's own announcements is the one `audio-net` uses.
-pub fn set_default_name(api: &TapeApi, nic: usize) {
-    let buffer = unsafe { &mut *(&raw mut DEFAULT_NAME) };
-    unsafe { DEFAULT_NAME_LENGTH = (api.hostname)(nic, buffer.as_mut_ptr(), buffer.len()) };
-}
-
 /// The other machines the kernel has heard announce themselves (`peer_info`, ABI 5); none on an older kernel.
 pub fn kernel_peers(api: &TapeApi) -> impl Iterator<Item = tape_rt::PeerInfo> + '_ {
     let usable = api.version >= 5 && (api.size as usize) >= core::mem::size_of::<TapeApi>();
@@ -113,8 +103,13 @@ pub fn session_name<'a>(configured: &str, mac: [u8; 6], buffer: &'a mut [u8; sap
             *length += 1;
         }
     };
-    let default: &[u8] = unsafe { &*(&raw const DEFAULT_NAME) };
-    let default = &default[..unsafe { DEFAULT_NAME_LENGTH }];
+    // The kernel's name for the interface that has this MAC (the `hostname` file's, or `fos-` and the end of the MAC).
+    let mut kernel_name = [0u8; 20];
+    let kernel_length = match crate::nic_by_mac(mac) {
+        Some(nic) => (tape_rt::api().hostname)(nic, kernel_name.as_mut_ptr(), kernel_name.len()),
+        None => 0,
+    };
+    let default = &kernel_name[..kernel_length];
     if configured.is_empty() && !default.is_empty() {
         for &byte in default {
             push(byte, &mut length);

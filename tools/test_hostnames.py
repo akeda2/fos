@@ -40,6 +40,14 @@ def main():
             text = b.text()[mark:]
             check("alpha1" in text and "52:54:00:12:34:b1" in text, "audio-net list shows the machines the kernel knows", text[-600:])
 
+            mark_a = a.send("run audio-net send proto=raw src=tone=440 secs=14")
+            a.pump(2)
+            mark = b.send("run audio-net list proto=raw secs=6")
+            b.wait_for("fos> ", 30, mark)
+            text = b.text()[mark:]
+            check("alpha1" in text and "sends" in text, "A's stream announcement carries its hostname-file name", text[-700:])
+            a.wait_for("fos> ", 30, mark_a)
+
             mark = b.send("run audio-net send proto=raw to=alpha1 src=tone=440 secs=2")
             b.wait_for("fos> ", 40, mark)
             text = b.text()[mark:]
