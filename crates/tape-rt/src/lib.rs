@@ -13,6 +13,9 @@ pub use fosfor_abi::tape::*;
 
 use core::fmt::Write;
 
+// The entry point and the panic handler exist only in a tape build (the `os: none` tape target). A host build, `cargo test` of a
+// tape's library, has std's own panic handler and a C runtime's `_start`, and no `tape_main` to call.
+#[cfg(target_os = "none")]
 core::arch::global_asm!(
     r#"
     .section .text.entry, "ax"
@@ -473,6 +476,7 @@ pub fn micros() -> u64 {
     (api().micros)()
 }
 
+#[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // A tape has nowhere to unwind to: say what happened, then wait for the operator to

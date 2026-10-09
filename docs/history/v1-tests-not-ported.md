@@ -53,7 +53,9 @@ names; check them out with `git show legacy-v1:PATH`.
 Also noticed while triaging: the host unit tests of the tape libraries (`cargo test` in
 `tapes/router`, `nettest`, `ed`, `ip-chat`, `telnet`) do not build, with a duplicate `panic_impl`
 because the crates depend on `tape-rt`, whose panic handler is unconditional. That was already
-true before the `crates/` move. The fix is probably a `cfg(not(test))` around the handler.
+true before the `crates/` move. Fixed 2026-10-09: `tape-rt`'s `_start` and panic handler are now compiled only for the
+`os: none` tape target, and the libraries are tested with `cargo test --lib` (a tape's binary target is `#![no_main]` and has no
+host build). `make test` runs 56 of these tests (router 16, nettest 23, ed 5, ip-chat 5, telnet 7).
 
 ## Ported since (2026-10-09)
 

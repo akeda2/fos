@@ -17,7 +17,7 @@ all: image tapes
 help:
 	@echo "make image        build $(BUILD)/fosfor/fosfor.img (UEFI loader + kernel + every tape)"
 	@echo "make run          build it and boot it in QEMU + OVMF with the serial console on the terminal"
-	@echo "make test         unit tests of abi/fat/audio-rec, then the boot test (loader, kernel, framebuffer)"
+	@echo "make test         host unit tests (abi, crates, tape libraries), then the boot test (loader, kernel, framebuffer)"
 	@echo "make test-NAME    one end-to-end test (see the .PHONY list below), e.g. test-nic, test-hda, test-recorder"
 	@echo "make test-all     every test-* target in turn, with a summary"
 	@echo "make loader|kernel|tapes   build one part"
@@ -129,6 +129,9 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path abi/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/fat/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml
+	for tape in router nettest ed ip-chat telnet; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
 
 # Deliberate-fault kernels (one Cargo feature each): checks the exception reports,

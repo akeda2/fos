@@ -133,7 +133,7 @@ Python 3 (stdlib only for tools), `qemu-system-x86_64` with OVMF
 ```sh
 make image            # build/fosfor/fosfor.img: loader + kernel + every tape (default goal)
 make run              # boot it in QEMU + OVMF, serial on the terminal
-make test             # unit tests (abi, fat, audio-rec) and the boot/framebuffer test
+make test             # host unit tests (abi, crates, the tape libraries via `cargo test --lib`) and the boot/framebuffer test
 make test-NAME        # one end-to-end test; `make help`, or the .PHONY list in the Makefile
 make test-bios        # 16 of them, booted through BIOS (SeaBIOS), plus kernel placement and the skip-video override
 make test-all         # every test-* target (slow, ~30 min); prints PASS/FAIL per target
