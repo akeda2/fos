@@ -348,18 +348,15 @@ Checked on real hardware by now: BIOS boot on the AMD/nForce board (video, EDID,
 the Skylake (xHCI hubs of both speeds, replug of disks and of a whole hub), the laptop (`bootcode` replaced the UEFI loader).
 What is left, roughly by value:
 
-- **Console glyphs.** The console prints every byte above 0x7f as `?` (no UTF-8 decoding, and the font is ASCII + a few Latin-1
-  forms). `telnet` to a UTF-8 server and a UTF-8 file name both show `?`. A decoder in `framebuffer.rs`/`console` plus the glyphs
-  the font already has (Lat15) would cover Swedish letters. Font scaling for big modes is a separate item (above).
+- **Typing non-ASCII.** The console now decodes UTF-8 (Latin-9 glyphs in the pixel font, code page 437 in BIOS text mode), but input
+  is still ASCII only: the line editor drops bytes above 0x7e, `cat` and `hexdump`-style listings print them as '.', and file names
+  stay ASCII. Font scaling for big modes is a separate item (above).
 - **xHCI command abort on real hardware.** `Controller::abort_command_ring` is checked in QEMU (`make test-xhci-abort`) but nothing
   has made a real command time out since the SuperSpeed hub was fixed; watch for the "a command timed out; the command ring was
   aborted" line in `dmesg` on a machine that has one.
 - **OHCI** (`kernel/src/ohci.rs`): keyboards on root ports only, tested on the AMD board with unplug/replug. Not done: hubs, disks
   (full speed, slow), UHCI (Intel/VIA companion; no driver), interrupts instead of polling, and a keyboard behind a hub on a
   low/full-speed root port.
-- **nettest scenarios not ported** from the legacy tests (`docs/history/v1-tests-not-ported.md`): the rate sweep, bidirectional and
-  report-file runs, and the duplicate/reorder/corrupt impairments.
-- **`ls` on a vanished disk** says "no FOSFS data partition" when the cause is a read error (the disk is gone); say so.
 - **A bus-powered hub and a USB 3 stick**: the AMD board's Terminus hub (1a40:0101) does not detect a Kingston DataTraveler 3.0
   at all, only the 2.0 one. A hardware limit; nothing to fix, but it looks like a driver bug on first meeting.
 - **EHCI hub diagnostics** print extra lines when a hub port reports unusual status (`ehci.rs`, `hub_bring_up_port`); fine for

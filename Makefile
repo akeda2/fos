@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8
 
 all: image tapes
 
@@ -54,6 +54,8 @@ test-release-loops: image
 # nettest's generator and sink through a four-NIC loop: clean, rate limit, loss and delay, selftest, retarget.
 test-nettest-lab: image
 	python3 tools/test_nettest_lab.py
+test-console-utf8: image
+	python3 tools/test_console_utf8.py
 
 # `bootcode update` replaces the UEFI loader on the ESP (verified with fsck.vfat and 7-Zip), and the new loader boots.
 test-bootcode-uefi: image

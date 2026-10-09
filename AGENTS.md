@@ -144,8 +144,8 @@ from the test's QEMU command line (`FOS_FIRMWARE=bios`); a check that greps load
 use the shared text or `LOADER_BANNER`/`BIOS` from `tools/test_boot.py`. Run `make test` for any kernel or loader change and the matching `make test-NAME` for
 the area you touched (`test-debug-mode` for crash/KUP/watchdog, `test-hda` and
 `test-usb-audio` for audio, `test-nic` and `test-rtl8139` for NICs, `test-recorder*`
-for the recorder, ...). Known failing: `test-nettapes` (the bridge test through the
-`qemu-i386` shim; failed before the unification). `test-audio-net` and `test-nettest`
+for the recorder, ...). `test-nettapes` (bridge and ip-chat through the
+`qemu-i386` shim) passes again. `test-audio-net` and `test-nettest`
 have been seen to flake once. Tests use bounded waits, keep the serial output on
 failure and wait for the prompt before typing. **Every new tape needs a focused test
 through its documented load/run path**; a green build is not validation. Editing a path
@@ -194,8 +194,8 @@ maintainer's memory notes, not in this repository.
 ## Things a new session should know (2026-10-09)
 
 - **Tests added for hardware-shaped behaviour**: `test-usb-kbd-replug`, `test-usb-replug` (disks, hubs, the hub itself),
-  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`.
-  `make test-all` runs every `test-*` target (63 of them; `test-nettapes` is the one known failure).
+  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`, `test-console-utf8`.
+  `make test-all` runs every `test-*` target (64 of them; none is a known failure).
 - **`term net` data frames carry no length**: the kernel drops trailing zero bytes (Ethernet padding) before a tape or the shell sees
   the frame; a NUL typed on purpose is lost. A tape's single-interface network calls follow `nic use N` (ABI 4, `nic_active`).
 - **Hubs**: a hub's ports are only visible by asking the hub, so `usb rescan` is what notices a device that went away behind one;
@@ -205,6 +205,9 @@ maintainer's memory notes, not in this repository.
   "no FOSFS data partition" in `dmesg` means the A/B fallback reverted it. `bootcode` can replace the BIOS boot code and the UEFI
   loader without a stick rewrite (both verified on real machines). `debug video skip` plus `reboot` shows the VGA text console.
 - **Open work** is in `DEFERRED.md` ("Open after the 2026-10-09 session").
+
+- **Console text is UTF-8** (`framebuffer.rs`: Latin-9 glyphs, CP437 in BIOS text mode; `tape.rs` `api_putc` assembles sequences). Input
+  and file names are still ASCII.
 
 ## Conventions
 

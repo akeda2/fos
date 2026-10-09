@@ -13,6 +13,8 @@ tapes``) and ``make image``.
 
 import os
 import selectors
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -20,7 +22,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import send_tape  # noqa: E402
-from test_primes_e2e import McastSocket  # noqa: E402
 
 MCAST_GROUP = "230.42.42.59"
 MCAST_PORT = 4259
@@ -52,6 +53,24 @@ GUESTS = {
         "peer": b"192.0.2.10",
     },
 }
+
+
+class McastSocket:
+    def __init__(self, group: str, port: int):
+        self.group = group
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", port))
+        membership = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+
+    def send(self, frame: bytes) -> None:
+        self.sock.sendto(frame, (self.group, self.port))
+
+    def close(self) -> None:
+        self.sock.close()
 
 
 def term_frame(destination: bytes, source: bytes, tag: int, payload: bytes = b"") -> bytes:
@@ -212,7 +231,7 @@ def main() -> None:
             read_until(name, b"Tape returned; back at the fos shell.", 10, start)
 
         recovery = run_shell_command("a", b"about")
-        if (b"fos is a small educational 64-bit x86 operating system." if V2 else b"fos is a small educational 32-bit x86 operating system.") not in recovery:
+        if (b"is a small educational 64-bit x86 operating system." if V2 else b"is a small educational 32-bit x86 operating system.") not in recovery:
             raise SystemExit("shell did not recover after the IPv4 chat tape returned")
         print("PASS: IPv4 chat returned cleanly and the remote shell stayed usable.")
 

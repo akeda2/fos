@@ -35,6 +35,9 @@ pub struct Console {
     /// The parameter before a `;` (`ESC [ row ; column H`), and whether there was one.
     first_parameter: usize,
     has_first: bool,
+    /// A UTF-8 sequence in progress: the code point so far and how many continuation bytes are still due.
+    utf8_code: u32,
+    utf8_left: u8,
 }
 
 /// The largest text grid kept (256 columns x 100 rows covers up to 2048x1600 at 8x16).
@@ -195,16 +198,80 @@ impl Console {
             // The shell erases a typed character with "\x08 \x08" (back, blank, back): a serial
             // terminal interprets it, so the grid has to as well.
             0x08 => self.column = self.column.saturating_sub(1),
-            byte => {
-                if self.column >= self.columns {
-                    self.newline();
-                }
-                // Anything outside the font's printable range shows as '?'.
-                let shown = if byte == b'\t' || (0x20..0x7f).contains(&byte) { if byte == b'\t' { b' ' } else { byte } } else { b'?' };
-                unsafe { CELLS[self.row * self.columns + self.column] = shown };
-                self.column += 1;
-            }
+            byte => self.put_text_byte(byte),
         }
+    }
+
+    /// Text bytes: ASCII directly, anything above 0x7f through a UTF-8 decoder (the shell, `telnet` and file names send
+    /// UTF-8). A sequence that is broken, or whose character the font lacks, shows as '?'.
+    fn put_text_byte(&mut self, byte: u8) {
+        if self.utf8_left > 0 {
+            if byte & 0xc0 == 0x80 {
+                self.utf8_code = self.utf8_code << 6 | u32::from(byte & 0x3f);
+                self.utf8_left -= 1;
+                if self.utf8_left == 0 {
+                    let cell = self.cell_for(self.utf8_code);
+                    self.put_cell(cell);
+                }
+                return;
+            }
+            // The sequence was cut short: show it as one '?' and read this byte afresh.
+            self.utf8_left = 0;
+            self.put_cell(b'?');
+        }
+        match byte {
+            0xc2..=0xdf => (self.utf8_code, self.utf8_left) = (u32::from(byte & 0x1f), 1),
+            0xe0..=0xef => (self.utf8_code, self.utf8_left) = (u32::from(byte & 0x0f), 2),
+            0xf0..=0xf4 => (self.utf8_code, self.utf8_left) = (u32::from(byte & 0x07), 3),
+            b'\t' => self.put_cell(b' '),
+            0x20..=0x7e => self.put_cell(byte),
+            _ => self.put_cell(b'?'),
+        }
+    }
+
+    /// The cell value that draws `code point` in this console's font, or '?'. The pixel font is ISO 8859-15 (Latin-9: Latin-1
+    /// with the euro sign and the letters Š š Ž ž Œ œ Ÿ in place of eight rarely used symbols); VGA text memory uses the
+    /// code page 437 of the video BIOS, which has the Nordic and common Western letters but no Ø, Þ and the like.
+    fn cell_for(&self, code: u32) -> u8 {
+        match code {
+            0x20..=0x7e => code as u8,
+            0xa0 => b' ',
+            0x2018 | 0x2019 => b'\'',
+            0x201c | 0x201d => b'"',
+            0x2013 | 0x2014 => b'-',
+            _ if self.text => cp437_for(code),
+            0xa1..=0xff if !matches!(code, 0xa4 | 0xa6 | 0xa8 | 0xb4 | 0xb8 | 0xbc..=0xbe) => code as u8,
+            0x20ac => 0xa4,
+            0x0160 => 0xa6,
+            0x0161 => 0xa8,
+            0x017d => 0xb4,
+            0x017e => 0xb8,
+            0x0152 => 0xbc,
+            0x0153 => 0xbd,
+            0x0178 => 0xbe,
+            _ => b'?',
+        }
+    }
+
+    fn put_cell(&mut self, cell: u8) {
+        if self.column >= self.columns {
+            self.newline();
+        }
+        unsafe { CELLS[self.row * self.columns + self.column] = cell };
+        self.column += 1;
+    }
+}
+
+/// Code page 437 position of a Unicode letter or symbol, for VGA text mode.
+fn cp437_for(code: u32) -> u8 {
+    match char::from_u32(code).unwrap_or('?') {
+        'ü' => 0x81, 'é' => 0x82, 'â' => 0x83, 'ä' => 0x84, 'à' => 0x85, 'å' => 0x86, 'ç' => 0x87, 'ê' => 0x88,
+        'ë' => 0x89, 'è' => 0x8a, 'ï' => 0x8b, 'î' => 0x8c, 'ì' => 0x8d, 'Ä' => 0x8e, 'Å' => 0x8f, 'É' => 0x90,
+        'æ' => 0x91, 'Æ' => 0x92, 'ô' => 0x93, 'ö' => 0x94, 'ò' => 0x95, 'û' => 0x96, 'ù' => 0x97, 'ÿ' => 0x98,
+        'Ö' => 0x99, 'Ü' => 0x9a, '¢' => 0x9b, '£' => 0x9c, '¥' => 0x9d, 'á' => 0xa0, 'í' => 0xa1, 'ó' => 0xa2,
+        'ú' => 0xa3, 'ñ' => 0xa4, 'Ñ' => 0xa5, '¿' => 0xa8, 'ß' => 0xe1, 'µ' => 0xe6, '°' => 0xf8, '±' => 0xf1,
+        '·' => 0xfa, '²' => 0xfd,
+        _ => b'?',
     }
 }
 
@@ -241,6 +308,8 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
         parameter: 0,
         first_parameter: 0,
         has_first: false,
+        utf8_code: 0,
+        utf8_left: 0,
     };
     console.foreground = console.pixel(0xc0, 0xc0, 0xc0);
     console.background = console.pixel(0x00, 0x00, 0x20);
@@ -282,6 +351,8 @@ pub fn init_text() -> bool {
         parameter: 0,
         first_parameter: 0,
         has_first: false,
+        utf8_code: 0,
+        utf8_left: 0,
     };
     unsafe {
         let cells = console.base.cast::<u16>();

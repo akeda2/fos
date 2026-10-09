@@ -6,7 +6,7 @@ once: generator (NIC 1) -> cable -> NIC 2 [impairment link] NIC 3 -> cable -> si
 measurement of what the link did: the throughput it allowed, the frames it dropped and the delay it added (generator and sink share
 the tape's clock). The guest is driven over the serial port, which a tape reads as its keyboard (a lone Escape ends it).
 
-Scenarios: a clean link; a rate limit below the offered load; random loss plus a fixed delay; the ready-made `selftest` keyword; and
+Scenarios: a clean link (with a `gen.save` report file); a rate sweep; both directions at once (`bidir=on`); a rate limit below the offered load; random loss plus a fixed delay; the ready-made `selftest` keyword; and
 re-pointing the generator, sink and link from the prompt (`gen nic`, `sink nic`, `link`). Ported from the legacy
 test_nettest_selftest_e2e and test_nettest_retarget_e2e. Run with `make test-nettest-lab`."""
 import os
@@ -75,6 +75,14 @@ class Lab:
         self.process.wait()
 
 
+def shell(lab, line):
+    """Runs one shell command at the `fos> ` prompt and returns its output."""
+    start = len(lab.text())
+    lab.type(line)
+    lab.wait_for("fos> ", start, 20)
+    return lab.text(start)
+
+
 def run_scenario(lab, arguments, seconds, sink_nic=4):
     """Runs the tape until the generator has finished, stops it with Escape and returns the final counters."""
     start = len(lab.text())
@@ -82,6 +90,8 @@ def run_scenario(lab, arguments, seconds, sink_nic=4):
     lab.wait_for("nettest> ", start, 30)
     lab.wait_for("generator finished", start, seconds + 40)
     lab.wait_for("summary:", start, 20)
+    if "gen.save=" in arguments:
+        lab.wait_for("bytes to ", start, 20)
     lab.pump(0.5)
     lab.escape()
     lab.wait_for("fos> ", start + lab.text(start).index("nettest> "), 30)
@@ -99,6 +109,8 @@ def run_scenario(lab, arguments, seconds, sink_nic=4):
     if reverse:
         result["rev"] = dict(zip(("sent", "failed", "rx", "avg_kbit", "lost", "dup", "reord"), (int(v) for v in reverse.groups())))
     result["output"] = text
+    result["sweep"] = [tuple(float(v) for v in step) for step in re.findall(
+        r"sweep (\d+) kbit: sent (\d+) rx (\d+) loss ([\d.]+)% got (\d+) kbit lat (\d+)/(\d+) us", text)]
     return result
 
 
@@ -129,6 +141,31 @@ def main():
             share = 100.0 * result["lost"] / max(1, result["rx"] + result["lost"])
             check(4 <= share <= 16, f"loss 10%: the sink saw {share:.1f}% lost", result["output"])
             check(19_000 <= result["lat_min"] <= 26_000, f"delay 20 ms: minimum latency {result['lat_min']} us", result["output"])
+
+            # A report file written when the test ends.
+            result = run_scenario(lab, base + "gen.rate=4000 gen.time=3 gen.save=report1", 3)
+            report = shell(lab, "cat report1")
+            check("nettest report" in report and "summary: sent" in report and "latency histogram (us):" in report,
+                  "gen.save=report1 left a report file with settings, summary and histogram", report)
+
+            # A rate sweep against a 2000 kbit/s limiter: loss appears once the offered rate passes the limit and the
+            # delivered rate flattens at the limit.
+            result = run_scenario(lab, "2 3 gen=1 sink=4 gen.size=1000 gen.delay=3 gen.sweep=1000:4000:1000:2 rate=2000 queue=30", 8)
+            steps = result["sweep"]
+            check([int(step[0]) for step in steps] == [1000, 2000, 3000, 4000],
+                  f"the sweep reports one line per step ({[int(step[0]) for step in steps]})", result["output"])
+            check(steps[0][3] < 1.0 and 900 <= steps[0][4] <= 1100, f"1000 kbit/s offered passes untouched: {steps[0]}", result["output"])
+            check(steps[2][3] > 20 and steps[3][3] > steps[2][3] and 1800 <= steps[3][4] <= 2200,
+                  f"above the limit loss grows and throughput stays at 2000: {steps[2:]}", result["output"])
+
+            # Both directions at once: a 2000 kbit/s limiter each way, 3000 offered each way.
+            result = run_scenario(lab, base + "gen.rate=3000 rate=2000 queue=30 bidir=on", 4)
+            reverse = result.get("rev")
+            check(reverse is not None and 1800 <= result["avg_kbit"] <= 2200 and 1800 <= reverse["avg_kbit"] <= 2200,
+                  f"bidirectional: forward {result['avg_kbit']} and reverse {reverse and reverse['avg_kbit']} kbit/s behind 2000 limiters",
+                  result["output"])
+            check(reverse["sent"] > 600 and reverse["lost"] > 0 and reverse["dup"] == 0,
+                  f"the reverse stream sent {reverse['sent']} frames and lost the excess ({reverse['lost']})", result["output"])
 
             result = run_scenario(lab, "selftest 1 2 3 4 gen.rate=4000 gen.time=3 rate=1000 queue=30", 3)
             check(850 <= result["avg_kbit"] <= 1150 and result["lost"] > 0, f"the `selftest` keyword: {result['avg_kbit']} kbit/s behind a 1000 kbit/s limiter", result["output"])

@@ -813,3 +813,9 @@ waits, preserve serial output on failure, wait for the prompt before typing.
 3. Boot that same image on the Skylake as an early reality check: if firmware
    quirks bite, we want to know before the kernel exists.
 
+
+**Console UTF-8 (2026-10-09):** the framebuffer console decodes UTF-8 and draws code points through the font's ISO 8859-15 glyphs
+  (the euro sign and Š š Ž ž Œ œ Ÿ included; typographic quotes and dashes become ASCII); in BIOS VGA text mode the same
+  characters map to code page 437 where it has them. Anything else, and broken sequences, show as '?'. A tape's `putc` collects the
+  bytes of one sequence before printing, so `telnet` to a UTF-8 server shows Swedish letters. Input stays ASCII. Tested by
+  `make test-console-utf8` (glyph cells found in a screendump).

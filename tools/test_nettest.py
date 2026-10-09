@@ -9,7 +9,8 @@ between the NICs (multi-NIC support, promiscuous mode, raw frame callbacks, the
 and watches the other.
 
 Checks: a clean link forwards both ways; `loss ab 100` drops one direction only;
-the statistics reflect it; `quit` returns to the shell and promiscuous mode is restored."""
+the statistics reflect it; duplication, reordering and corruption do what they say;
+`quit` returns to the shell and promiscuous mode is restored."""
 
 import os
 import selectors
@@ -80,8 +81,8 @@ class Segment:
         return [struct.unpack(">I", f[14:18])[0] for f in self.frames(wait) if f[12:14] == TEST]
 
 
-def test_frame(destination, source, sequence):
-    return (destination + source + TEST + struct.pack(">I", sequence)).ljust(60, b"\0")
+def test_frame(destination, source, sequence, size=60):
+    return (destination + source + TEST + struct.pack(">I", sequence)).ljust(size, b"\0")
 
 
 def term_frame(tag, payload=b""):
@@ -169,6 +170,44 @@ def main():
             check(len(passed) == 20, f"while B -> A is untouched ({len(passed)}/20)", "")
             stats = say("stats", "nettest> ")
             check("a>b" in stats.lower() or "a>b" in stats, "`stats` reports per-direction counters", stats)
+
+            def burst(segment, count, destination, source, size=60, gap=0.003, first=0):
+                for sequence in range(first, first + count):
+                    segment.send(test_frame(destination, source, sequence, size))
+                    time.sleep(gap)
+
+            # Duplication, reordering and corruption, one direction (A -> B) each.
+            say("reset", "nettest> ")
+            say("dup ab 100", "nettest> ")
+            b.test_sequences(0.3)
+            burst(a, 10, HOST_B, HOST_A)
+            got = b.test_sequences(1.0)
+            check(sorted(got) == sorted(list(range(10)) * 2), f"`dup ab 100` delivers every frame twice ({sorted(got)})", "")
+
+            say("reset", "nettest> ")
+            say("reorder ab 100", "nettest> ")
+            b.test_sequences(0.3)
+            burst(a, 10, HOST_B, HOST_A, gap=0.01)
+            got = b.test_sequences(1.0)
+            check(got == [1, 0, 3, 2, 5, 4, 7, 6, 9, 8], f"`reorder ab 100` swaps neighbouring frames ({got})", "")
+            b.test_sequences(0.3)
+            a.send(test_frame(HOST_B, HOST_A, 77))
+            got = b.test_sequences(1.0)
+            check(got == [77], "a frame held for reordering is still released when nothing follows", "")
+
+            say("reset", "nettest> ")
+            say("corrupt ab 100", "nettest> ")
+            b.test_sequences(0.3)
+            sent = [test_frame(HOST_B, HOST_A, i, 200) for i in range(15)]
+            for frame in sent:
+                a.send(frame)
+                time.sleep(0.003)
+            received = [f for f in b.frames(1.0) if f[12:14] == TEST]
+            flips = [sum(bin(x ^ y).count("1") for x, y in zip(one, two)) for one, two in zip(sent, received)]
+            check(len(received) == 15 and all(f == 1 for f in flips) and all(one[:14] == two[:14] for one, two in zip(sent, received)),
+                  f"`corrupt ab 100` flips exactly one payload bit per frame ({flips})", "")
+            check("corrupted 15" in say("stats", "nettest> "), "`stats` counts the corrupted frames", "")
+            say("reset", "nettest> ")
 
             back = say("quit", "fos> ")
             check("fos> " in back, "`quit` returns to the shell", back)

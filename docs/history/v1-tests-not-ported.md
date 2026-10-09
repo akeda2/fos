@@ -73,8 +73,21 @@ host build). `make test` runs 56 of these tests (router 16, nettest 23, ed 5, ip
   blocking command did not end it, so a vanished client left `nic sniff` running; fixed in `kernel/src/term.rs`.
 - `test_nettest_e2e` (clean link, rate limit, loss and delay), `test_nettest_selftest_e2e` (the `selftest` keyword),
   `test_nettest_retarget_e2e` and `test_nettest_router_e2e` -> `tools/test_nettest_lab.py` (`make test-nettest-lab`): a four-NIC guest
-  with two cables, plus a second guest running the `router` tape. Not carried over: the sweep, bidirectional and report-file
-  scenarios, and the duplication/reordering/corruption impairments of the legacy `test_nettest_e2e`.
+  with two cables, plus a second guest running the `router` tape. The sweep, bidirectional and report-file
+  scenarios were added to `test_nettest_lab.py` and the duplication/reordering/corruption impairments to `tools/test_nettest.py`
+  (2026-10-09, later): nothing of the legacy nettest tests is left unported.
 - `test_net_dhcp_e2e` -> a second connection in `tools/test_telnet.py` with `run telnet dhcp`, against QEMU's DHCP server. It found that
   the tape always used local port 40000, so a second connection to a server that had closed the first (TIME_WAIT) failed; the tape now
   picks its port from the clock.
+
+## `test-nettapes` fixed (2026-10-09)
+
+Three separate causes, none in the bridge forwarding logic itself:
+- `nic recv` only saw frames with the fos ethertype (`term::poll` drops the rest of a LAN's traffic), so it could never show the
+  test's 0x88b7/0x88b8 frames; it now queues every frame while it waits, and runs in blocking mode so a typed `nic recv` that
+  arrives meanwhile is ignored instead of nesting (the old stack overflow in this test).
+- QEMU's multicast netdev loops a guest's own frames back to it. The bridge then learned MACs on the wrong port and, for
+  broadcasts, re-flooded its own copies forever (1700 frames in a few seconds). The bridge tape now remembers hashes of its last
+  16 sends per port and ignores one matching copy on receive; the test uses broadcasts from unused source MACs.
+- The test injected the A-to-B frame on segment B (never crossing the bridge), and `test_ip_chat_e2e` imported a helper from a
+  deleted 32-bit test and checked a v1 `about` string.

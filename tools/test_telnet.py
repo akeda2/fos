@@ -165,9 +165,8 @@ def main():
             screen = line(f"run telnet static 10.0.2.15/24 10.0.2.2 10.0.2.2 {SERVER_PORT}", "login:", 40)
             check(server.connected.wait(5), "the tape connects to the server (ARP for the gateway, then TCP)", screen)
             check("Welcome to the test server" in screen, "the server's greeting is shown", screen)
-            # The console prints a byte above 0x7f as '?' (it does not decode UTF-8), so the four bytes of "öö" show as four '?': what is
-            # checked is that every byte arrived, in place, not that the glyphs render.
-            check(re.search(r"gr\?{4}vy", screen) is not None, "the bytes of UTF-8 text from the server all reach the screen", screen)
+            # UTF-8 from the server arrives whole: "ö" is a character now (the term client gets it as UTF-8; the console shows '?' for the check mark, which the font lacks).
+            check("gröövy" in screen, "UTF-8 text from the server reaches the screen as characters", screen)
 
             time.sleep(0.5)
             replies = bytes(server.replies)

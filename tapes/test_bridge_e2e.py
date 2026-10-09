@@ -42,6 +42,13 @@ CHAT_ETHERTYPE = bytes((0x88, 0xB6))
 BRIDGE_MAC_A = bytes.fromhex("525400beef01")
 BRIDGE_MAC_B = bytes.fromhex("525400beef02")
 SENDER_MAC = bytes.fromhex("525400beef03")
+# QEMU's multicast netdev loops a guest's own frames back to it, so the bridge sees its forwarded copy
+# arrive on the far port and learns the source MAC there. The first frame therefore uses a source MAC
+# nobody listens on. The same loop-back mis-learns the guests' own terminal replies, so the test frames
+# are broadcasts, which are always flooded, instead of unicasts that depend on a racy learning table.
+GHOST_MAC = bytes.fromhex("525400beef05")
+GHOST_MAC_B = bytes.fromhex("525400beef06")
+BROADCAST = b"\xff" * 6
 RECEIVER_MAC = bytes.fromhex("525400beef04")
 BRIDGE_CLIENT_MAC = bytes.fromhex("02deadbeef31")
 SENDER_CLIENT_MAC = bytes.fromhex("02deadbeef32")
@@ -179,8 +186,9 @@ def main() -> None:
         guest_name: str,
         frame: bytes,
         expected: bytes,
+        inject_segment: str,
     ) -> bytes:
-        """Run `nic recv`, injecting once and tolerating stale queued frames.
+        """Run `nic recv` on `segment`, injecting once on `inject_segment` and tolerating stale queued frames.
 
         A terminal frame used to enter `term net` can still be waiting in a
         polling NIC ring when a nested shell command starts. `nic recv` is a
@@ -190,7 +198,7 @@ def main() -> None:
         """
         start = send_command(segment, destination, source, guest_name, b"nic recv")
         time.sleep(0.2)
-        multicast[segment].send(frame)
+        multicast[inject_segment].send(frame)
         for attempt in range(4):
             result = read_until(guest_name, b"fos> ", 10, start)
             if expected in result:
@@ -198,9 +206,17 @@ def main() -> None:
             if attempt == 3:
                 break
             start = send_command(segment, destination, source, guest_name, b"nic recv")
+        for _ in range(3):
+            multicast["a"].send(term_frame(BRIDGE_MAC_A, BRIDGE_CLIENT_MAC, TERM_TAG_DATA, b"\x1b"))
+            time.sleep(0.05)
+        try:
+            read_until("bridge", b"Bridge stopped;", 5, len(output["bridge"]) - 10)
+        except SystemExit:
+            pass
         raise SystemExit(
             f"{guest_name} did not receive the expected bridged frame:\n"
-            f"{output[guest_name].decode('utf-8', 'replace')}"
+            f"{output[guest_name].decode('utf-8', 'replace')}\n--- bridge:\n"
+            f"{output['bridge'][-1500:].decode('utf-8', 'replace')}"
         )
 
     try:
@@ -248,25 +264,27 @@ def main() -> None:
         read_until("bridge", b"fos bridge: ports 1", 10, run_start)
         print("PASS: bridge tape started with two selected e1000 interfaces (via the documented 'bridge' keyword form).")
 
-        expected = b"dst 52:54:00:be:ef:04 src 52:54:00:be:ef:03 ethertype 0x88b7"
+        expected = b"dst ff:ff:ff:ff:ff:ff src 52:54:00:be:ef:05 ethertype 0x88b7"
         receive_expected_frame(
             "b",
             RECEIVER_MAC,
             RECEIVER_CLIENT_MAC,
             "receiver",
-            ethernet_frame(RECEIVER_MAC, SENDER_MAC, 0x88B7, b"bridge a to b"),
+            ethernet_frame(BROADCAST, GHOST_MAC, 0x88B7, b"bridge a to b"),
             expected,
+            "a",
         )
         print("PASS: bridge forwarded a frame from segment A to segment B.")
 
-        expected = b"dst 52:54:00:be:ef:03 src 52:54:00:be:ef:04 ethertype 0x88b8"
+        expected = b"dst ff:ff:ff:ff:ff:ff src 52:54:00:be:ef:06 ethertype 0x88b8"
         receive_expected_frame(
             "a",
             SENDER_MAC,
             SENDER_CLIENT_MAC,
             "sender",
-            ethernet_frame(SENDER_MAC, RECEIVER_MAC, 0x88B8, b"bridge b to a"),
+            ethernet_frame(BROADCAST, GHOST_MAC_B, 0x88B8, b"bridge b to a"),
             expected,
+            "b",
         )
         print("PASS: bridge forwarded a frame from segment B to segment A.")
 

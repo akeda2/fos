@@ -113,11 +113,42 @@ pub fn staged_length() -> usize {
 
 // ---- the callbacks a tape sees ----
 
+/// A UTF-8 sequence a tape is printing one `putc` byte at a time, waiting for its last byte.
+static mut PUTC_PENDING: [u8; 4] = [0; 4];
+static mut PUTC_PENDING_LENGTH: usize = 0;
+
 extern "C" fn api_putc(byte: u32) {
     let byte = byte as u8;
-    let mut utf8 = [0u8; 4];
-    let text = if byte < 0x80 { (byte as char).encode_utf8(&mut utf8) } else { "?" };
-    crate::print(format_args!("{text}"));
+    let pending = unsafe { &mut *core::ptr::addr_of_mut!(PUTC_PENDING) };
+    let length = unsafe { &mut *core::ptr::addr_of_mut!(PUTC_PENDING_LENGTH) };
+    if byte < 0x80 {
+        if *length > 0 {
+            *length = 0;
+            crate::print(format_args!("?"));
+        }
+        let mut utf8 = [0u8; 4];
+        crate::print(format_args!("{}", (byte as char).encode_utf8(&mut utf8)));
+        return;
+    }
+    // Bytes above 0x7f are collected until they make one valid UTF-8 character (the console and a remote terminal both
+    // want whole characters); a broken sequence is shown as '?'.
+    if *length == 0 && byte & 0xc0 == 0x80 || *length == pending.len() {
+        *length = 0;
+        return crate::print(format_args!("?"));
+    }
+    pending[*length] = byte;
+    *length += 1;
+    match core::str::from_utf8(&pending[..*length]) {
+        Ok(text) => {
+            *length = 0;
+            crate::print(format_args!("{text}"));
+        }
+        Err(error) if error.error_len().is_some() => {
+            *length = 0;
+            crate::print(format_args!("?"));
+        }
+        Err(_) => {} // incomplete: wait for the next byte
+    }
 }
 /// A whole string in one console call (one repaint, one relay frame), where `putc` costs a repaint per byte.
 extern "C" fn api_puts(text: *const u8, length: usize) {
@@ -125,7 +156,7 @@ extern "C" fn api_puts(text: *const u8, length: usize) {
     match core::str::from_utf8(bytes) {
         Ok(text) => crate::print(format_args!("{text}")),
         Err(_) => {
-            // Not UTF-8: print what is ASCII and '?' for the rest, as `putc` does.
+            // Not valid UTF-8 as a whole: byte by byte, so `putc`'s per-sequence handling decides what is printable.
             for &byte in bytes {
                 api_putc(u32::from(byte));
             }

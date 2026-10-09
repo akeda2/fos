@@ -37,6 +37,51 @@ struct LearnedMac {
     valid: bool,
 }
 
+const ECHO_SLOTS: usize = 16;
+
+/// Hashes of frames this bridge recently sent on one port. A segment that loops a sender's own frames back
+/// to it (QEMU's multicast netdev does) would otherwise be learned from and re-flooded forever.
+#[derive(Clone, Copy)]
+struct Echoes {
+    hashes: [u32; ECHO_SLOTS],
+    valid: [bool; ECHO_SLOTS],
+    next: usize,
+}
+
+const EMPTY_ECHOES: Echoes = Echoes {
+    hashes: [0; ECHO_SLOTS],
+    valid: [false; ECHO_SLOTS],
+    next: 0,
+};
+
+fn frame_hash(frame: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for &byte in frame {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+impl Echoes {
+    fn remember(&mut self, frame: &[u8]) {
+        self.hashes[self.next] = frame_hash(frame);
+        self.valid[self.next] = true;
+        self.next = (self.next + 1) % ECHO_SLOTS;
+    }
+
+    /// True (once per remembered send) if `frame` is a copy of one this port just sent.
+    fn take(&mut self, frame: &[u8]) -> bool {
+        let hash = frame_hash(frame);
+        for slot in 0..ECHO_SLOTS {
+            if self.valid[slot] && self.hashes[slot] == hash {
+                self.valid[slot] = false;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 const EMPTY_LEARNED: LearnedMac = LearnedMac {
     mac: [0; 6],
     port: 0,
@@ -196,6 +241,7 @@ fn forward_frame(
     port_count: usize,
     ingress: usize,
     frame: &[u8],
+    echoes: &mut [Echoes; MAX_PORTS],
     learned: Option<usize>,
     forwarded: &mut u32,
     dropped: &mut u32,
@@ -205,6 +251,7 @@ fn forward_frame(
             continue;
         }
         if nic_send_at(ports[egress], frame.as_ptr() as usize, frame.len() as u32) != 0 {
+            echoes[egress].remember(frame);
             *forwarded += 1;
         } else {
             *dropped += 1;
@@ -273,6 +320,7 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
 
     print_port_list(putc, &ports, &macs, port_count);
     let mut learned = [EMPTY_LEARNED; MAX_LEARNED];
+    let mut echoes = [EMPTY_ECHOES; MAX_PORTS];
     let mut frame = [0u8; MAX_FRAME_LEN];
     let mut forwarded = 0u32;
     let mut dropped = 0u32;
@@ -292,6 +340,9 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
                 continue;
             }
             received_any = true;
+            if echoes[ingress].take(&frame[..received]) {
+                continue;
+            }
             let source: [u8; 6] = frame[6..12].try_into().unwrap();
             let destination: [u8; 6] = frame[0..6].try_into().unwrap();
             if local_port(&macs, port_count, &destination)
@@ -311,6 +362,7 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
                 port_count,
                 ingress,
                 &frame[..received],
+                &mut echoes,
                 learned_destination,
                 &mut forwarded,
                 &mut dropped,

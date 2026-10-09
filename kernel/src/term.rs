@@ -200,6 +200,9 @@ fn send(nic: &mut Nic, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
     nic.send(&frame[..15 + payload.len()])
 }
 
+/// Set while `nic recv` waits: `poll` then queues every unhandled frame, not only the fos ethertype's.
+static mut QUEUE_ALL: bool = false;
+
 /// Handles whatever the NIC has received. Call this from the main loop.
 pub fn poll() {
     let mut buffer = [0u8; 1600];
@@ -208,7 +211,7 @@ pub fn poll() {
             let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
             // Frames a tape may be about to want (its own load protocol, over the fos ethertype)
             // wait in the queue; the rest of a busy LAN's traffic is not worth keeping.
-            if !handle_frame(index, &buffer[..length]) && length >= 14 && buffer[12..14] == ETHERTYPE {
+            if !handle_frame(index, &buffer[..length]) && length >= 14 && (buffer[12..14] == ETHERTYPE || unsafe { QUEUE_ALL }) {
                 queue_frame(index, &buffer[..length]);
             }
         }
@@ -2918,8 +2921,18 @@ fn nic_send_test() {
 
 /// `nic recv`: waits up to three seconds for a frame that is not the terminal's, then dumps it.
 fn nic_recv_test() {
+    // Blocking mode keeps typed commands that arrive meanwhile from running nested inside this wait
+    // (each nesting adds big stack frames); Escape ends the wait instead.
+    blocking(true);
+    unsafe { QUEUE_ALL = true };
+    nic_recv_wait();
+    unsafe { QUEUE_ALL = false };
+    blocking(false);
+}
+
+fn nic_recv_wait() {
     let deadline = apic::ticks() + 3 * apic::TICK_HZ;
-    while apic::ticks() < deadline {
+    while apic::ticks() < deadline && !break_requested() {
         poll();
         for index in 0..nic_count() {
             let mut buffer = [0u8; 1600];

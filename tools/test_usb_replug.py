@@ -132,6 +132,7 @@ def hub_replug_scenario():
             started = time.monotonic()
             gone = machine.run("ls disk2", 30)
             check("readme.txt" not in gone and time.monotonic() - started < 10, f"after the hub is unplugged its disk fails at once ({time.monotonic() - started:.1f} s)", gone)
+            check("cannot read the disk" in gone, "and `ls` says the disk cannot be read (not that it has no partition)", gone)
             added = monitor_output(machine.monitor_path, "device_add usb-hub,bus=hc.0,port=1,id=hubdev2")
             check("Error" not in added, "QEMU plugs a hub back in", added)
             machine.pump(2)

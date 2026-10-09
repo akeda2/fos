@@ -50,6 +50,8 @@ impl core::fmt::Display for DiskNumber {
 #[derive(Debug)]
 pub enum VolumeError {
     NoSuchDisk,
+    /// The partition table could not be read at all (a failed read: the disk is gone or failing).
+    DiskUnreadable,
     NoPartition,
     NotFormatted,
     Unreadable(fosfs::Error),
@@ -59,6 +61,7 @@ impl core::fmt::Display for VolumeError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             VolumeError::NoSuchDisk => write!(formatter, "no such disk (see `disks`)"),
+            VolumeError::DiskUnreadable => write!(formatter, "cannot read the disk (it may have been unplugged)"),
             VolumeError::NoPartition => write!(formatter, "no FOSFS data partition (a GPT partition of the FOSFS type)"),
             VolumeError::NotFormatted => write!(formatter, "its data partition holds no FOSFS v3 volume"),
             VolumeError::Unreadable(error) => write!(formatter, "cannot read the data partition ({error:?})"),
@@ -72,7 +75,10 @@ pub fn volume_on(number: usize) -> Result<Volume, VolumeError> {
         return Err(VolumeError::NoSuchDisk);
     }
     let disk = number - 1;
-    let partition = gpt::find(disk, &FOSFS_TYPE_GUID, |_| true).ok_or(VolumeError::NoPartition)?;
+    let partition = gpt::find(disk, &FOSFS_TYPE_GUID, |_| true).ok_or_else(|| {
+        // `find` says None for "no such partition" and for a failed read alike; tell them apart.
+        if block::read(disk, 1, &mut [0u8; 512]).is_err() { VolumeError::DiskUnreadable } else { VolumeError::NoPartition }
+    })?;
     Volume::mount(disk, partition.start, partition.sectors).map_err(|error| match error {
         fosfs::Error::NotFormatted => VolumeError::NotFormatted,
         other => VolumeError::Unreadable(other),
