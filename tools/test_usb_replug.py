@@ -33,7 +33,7 @@ class Machine:
             ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio",
              "-monitor", f"unix:{self.monitor_path},server,nowait", *disks,
              "-device", f"{controller},id=hc", "-drive", f"if=none,id=stick,format=raw,file={stick}",
-             *(["-device", "usb-hub,bus=hc.0,port=1"] if behind_hub else []), "-device", device],
+             *(["-device", "usb-hub,bus=hc.0,port=1,id=hubdev"] if behind_hub else []), "-device", device],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.raw = bytearray()
 
@@ -111,6 +111,46 @@ def scenario(controller, behind_hub=False):
             machine.close()
 
 
+def hub_replug_scenario():
+    """The hub itself is unplugged, with a stick behind it, and plugged back in (the stick plugged into it again): everything
+    behind the hub must fail at once, then the hub is enumerated afresh and the same stick takes its old disk number back."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        boot = tmp / "boot.img"
+        shutil.copy(IMAGE, boot)
+        stick_image = bytearray(IMAGE.read_bytes())
+        build_image.randomize_guids(stick_image)
+        stick = tmp / "stick.img"
+        stick.write_bytes(stick_image)
+        machine = Machine(tmp, boot, stick, "qemu-xhci", behind_hub=True)
+        try:
+            machine.wait_for("fos> ", 90)
+            before = machine.run("ls disk2")
+            check("readme.txt" in before, "hub replug: the stick behind the hub is disk2", before)
+            monitor_output(machine.monitor_path, "device_del hubdev")
+            machine.pump(2)
+            started = time.monotonic()
+            gone = machine.run("ls disk2", 30)
+            check("readme.txt" not in gone and time.monotonic() - started < 10, f"after the hub is unplugged its disk fails at once ({time.monotonic() - started:.1f} s)", gone)
+            added = monitor_output(machine.monitor_path, "device_add usb-hub,bus=hc.0,port=1,id=hubdev2")
+            check("Error" not in added, "QEMU plugs a hub back in", added)
+            machine.pump(2)
+            monitor_output(machine.monitor_path, f"drive_add 0 if=none,id=stick2,format=raw,file={stick}")
+            added = monitor_output(machine.monitor_path, "device_add usb-storage,bus=hc.0,drive=stick2,id=stickdev2,port=1.3")
+            check("Error" not in added, "and the same stick into it", added)
+            machine.pump(2)
+            rescan = machine.run("usb rescan", 90)
+            alive = machine.process.poll() is None and "CPU EXCEPTION" not in machine.text()
+            check(alive, "the kernel survives `usb rescan` (no fault through a released slot)", machine.text()[-1500:])
+            check("is back; disk2 works again" in machine.text(), "the hub is enumerated afresh and the stick takes disk2 back", rescan)
+            after = machine.run("ls disk2")
+            check("readme.txt" in after, "`ls disk2` works again", after)
+            disks = machine.run("disks")
+            check("disk3" not in disks, "and no extra disk was registered", disks)
+        finally:
+            machine.close()
+
+
 def boot_disk_scenario():
     """The machine's own boot stick (on xHCI) is unplugged and plugged back in on the same port: it must come back as
     disk1, not as a second disk. (Found on the Skylake: the old handle named a slot number that was freed and, depending on
@@ -147,6 +187,7 @@ def main():
     for controller in ("usb-ehci", "qemu-xhci"):
         scenario(controller)
     scenario("qemu-xhci", behind_hub=True)
+    hub_replug_scenario()
     boot_disk_scenario()
     print("usb replug: all checks passed")
 

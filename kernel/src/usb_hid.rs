@@ -83,11 +83,13 @@ pub fn probe_all() -> usize {
             if controller.slot_in_use_for_port(port) {
                 // A device we enumerated here earlier. If the port says it went away (or went away and came back), drop its
                 // slot and look at the port afresh; a disk that returns is recognised in usb_storage::register and takes
-                // over its old disk number. A port with a hub on it is left alone (its devices have their own states).
-                if crate::usb_hub::has_hub_on_port(index, port) || (controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port)) {
+                // over its old disk number. A port with a hub on it is only touched when the port itself changed (the hub was
+                // unplugged or replugged): its devices have their own states, which `usb_hub::rescan` follows.
+                if controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port) {
                     continue;
                 }
-                usb_storage::mark_xhci_port_stale(index, port); // before the slots go: nothing may use them again
+                usb_storage::mark_xhci_port_stale(index, port); // before the slots go: nothing may use them again (a hub's children too)
+                crate::usb_hub::forget_hubs_on_port(index, port); // the hub, and any hub behind it, is gone with its port
                 release_port(controller, port, None);
                 crate::println!("USB: xHCI {:02x}:{:02x}.{} port {port}: its device was unplugged or replugged; looking at the port again.",
                     controller.pci.bus, controller.pci.device, controller.pci.function);

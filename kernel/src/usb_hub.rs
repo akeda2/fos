@@ -123,6 +123,9 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
 /// could be a glitch, and `scan` deals with a replug.
 pub fn child_vanished(controller_index: usize, port: u8, route: u32) -> bool {
     let Some(controller) = xhci::controller(controller_index) else { return true };
+    if controller.port_status(port) & 1 == 0 {
+        return true; // the root port itself has nothing connected: the hub, and with it the device, is gone (no need to ask)
+    }
     for hub in hubs().iter().flatten() {
         if hub.controller != controller_index || hub.device.port != port {
             continue;
@@ -137,10 +140,14 @@ pub fn child_vanished(controller_index: usize, port: u8, route: u32) -> bool {
 }
 
 /// Looks for devices on every known hub of this controller that are not yet in use.
-/// Whether a hub this driver tracks hangs off root port `port` of controller `controller_index`: the devices below it share
-/// that root port's connection state, so unplug detection for the port as a whole must leave them alone.
-pub fn has_hub_on_port(controller_index: usize, port: u8) -> bool {
-    hubs().iter().flatten().any(|hub| hub.controller == controller_index && hub.device.port == port)
+/// Forgets every hub (of any tier) below root port `port`: the port's device was unplugged or replugged, so the hub's state, and
+/// everything behind it, is gone. The ports are looked at afresh by the next enumeration.
+pub fn forget_hubs_on_port(controller_index: usize, port: u8) {
+    for entry in hubs().iter_mut() {
+        if entry.is_some_and(|hub| hub.controller == controller_index && hub.device.port == port) {
+            *entry = None;
+        }
+    }
 }
 
 pub fn rescan(controller_index: usize, controller: &mut Controller) -> usize {

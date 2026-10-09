@@ -80,7 +80,7 @@ Also read on demand: `NETWORKING.md`, `AUDIO.md`, `DEFERRED.md` (things put asid
   never the boot disk.
   A USB disk that is unplugged fails at once (its EHCI root port says so; no multi-second timeouts) and, when the same stick
   (INQUIRY identity and size) comes back, `usb rescan` gives it its old disk number again. `sector diskN LBA [COUNT]` dumps
-  raw sectors read-only; `debug slots` says why the slot metadata cannot be read. The same holds for xHCI disks directly on a root port (a disk behind a hub does not recover: its hub's state is separate). A replugged USB keyboard likewise gets a fresh entry: the old one is dropped with its xHCI slot (`usb_hid::release_port`) or EHCI queue head (`make test-usb-kbd-replug`).
+  raw sectors read-only; `debug slots` says why the slot metadata cannot be read. The same holds for xHCI disks directly on a root port, for disks behind a hub (the hub's ports are asked, `usb rescan` finds a returning stick) and for the hub itself: an unplugged hub, a USB 3 hub's two halves included, is torn down with its devices and enumerated afresh when it returns. A replugged USB keyboard likewise gets a fresh entry: the old one is dropped with its xHCI slot (`usb_hid::release_port`) or EHCI queue head (`make test-usb-kbd-replug`).
 - **FOSFS v3** (flat, 64 entries, 64-bit contiguous extents) is byte-compatible
   with the legacy edition. File names: up to 16 of lowercase letters, digits, `.`, `_`,
   `-`; enforced in `kernel/src/fosfs.rs`, the tape file-system calls and
