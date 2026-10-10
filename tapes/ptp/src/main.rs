@@ -61,13 +61,14 @@ struct Options {
     idle: bool,
     verbose: bool,
     l2: bool,
+    both: bool,
     ntp: &'static str,
     settime: bool,
     zone_minutes: i32,
 }
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
-    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, ntp: "", settime: false, zone_minutes: 0 };
+    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, both: false, ntp: "", settime: false, zone_minutes: 0 };
     for word in arguments.split_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
@@ -75,6 +76,7 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
             "master" => options.master = true,
             "idle" => options.idle = true,
             "l2" => options.l2 = true,
+            "both" => options.both = true,
             "verbose" => options.verbose = true,
             "settime" => options.settime = true,
             "ntp" => options.ntp = if value.is_empty() { "dhcp" } else { value },
@@ -90,6 +92,9 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
             "prio1" => options.priority1 = value.parse().map_err(|_| "prio1= is 0 to 255")?,
             _ => return Err("unknown option"),
         }
+    }
+    if options.both && (!options.master || options.l2) {
+        return Err("both is for a master, on UDP and Ethernet together (not with l2)");
     }
     Ok(options)
 }
@@ -192,8 +197,8 @@ fn l2() -> bool {
 }
 
 /// The PTP message in a received frame, and whether it is an event message, whichever transport is in use.
-fn incoming<'a>(api: &TapeApi, nic: usize, config: &net::NetConfig, arp: &mut ArpCache<8>, frame: &'a [u8]) -> Option<(bool, &'a [u8])> {
-    if l2() {
+fn incoming<'a>(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, arp: &mut ArpCache<8>, frame: &'a [u8]) -> Option<(bool, &'a [u8])> {
+    if l2 {
         return ptp_tape::l2_message(frame).map(|message| (ptp_tape::is_event(message), message));
     }
     match net::inbound(api, nic, config, arp, frame, EVENT_PORT..=GENERAL_PORT, 0) {
@@ -202,9 +207,9 @@ fn incoming<'a>(api: &TapeApi, nic: usize, config: &net::NetConfig, arp: &mut Ar
     }
 }
 
-fn send(api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16, payload: &[u8]) {
+fn send(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16, payload: &[u8]) {
     let mut frame = [0u8; 160];
-    if l2() {
+    if l2 {
         let length = ptp_tape::build_l2_frame(&mut frame, config.mac.0, payload);
         if length != 0 {
             net::send_frame(api, nic, &frame[..length]);
@@ -275,7 +280,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         println!("ptp {}: NIC {}, Ethernet (0x88F7 to 01:1B:19:00:00:00), domain {}. Escape stops.", if options.master { "master" } else { "slave" }, options.nic + 1, options.domain);
         (api.nic_set_multicast)(options.nic, 1);
     } else {
-        println!("ptp {}: NIC {} {}.{}.{}.{}, domain {}, group 224.0.1.129. Escape stops.", if options.master { "master" } else { "slave" }, options.nic + 1, config.ip.0[0], config.ip.0[1], config.ip.0[2], config.ip.0[3], options.domain);
+        if options.both {
+            (api.nic_set_multicast)(options.nic, 1);
+        }
+        println!("ptp {}: NIC {} {}.{}.{}.{}, domain {}, group 224.0.1.129{}. Escape stops.", if options.master { "master" } else { "slave" }, options.nic + 1, config.ip.0[0], config.ip.0[1], config.ip.0[2], config.ip.0[3], options.domain, if options.both { " and Ethernet (0x88F7)" } else { "" });
     }
     let mut igmp = igmp::Igmp::new(GROUP);
     if !options.l2 {
@@ -287,9 +295,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     } else {
         slave(api, &options, &config, mac);
     }
-    if options.l2 {
+    if options.l2 || options.both {
         (api.nic_set_multicast)(options.nic, 0);
-    } else {
+    }
+    if !options.l2 {
         igmp.leave(api, options.nic, &config);
     }
 }
@@ -332,7 +341,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
             if !l2() && igmp.handle(&frame[..length], t2 as u64 / 1000) {
                 continue;
             }
-            if let Some((_, payload)) = incoming(api, options.nic, config, &mut arp, &frame[..length]) {
+            if let Some((_, payload)) = incoming(l2(), api, options.nic, config, &mut arp, &frame[..length]) {
                 let is_sync = payload.first().is_some_and(|byte| byte & 0x0f == ptp_tape::SYNC);
                 let sample = if late && is_sync {
                     slave.discard_sync(payload);
@@ -375,7 +384,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
             let mut message = [0u8; 64];
             let length = build_delay_req(&mut message, options.domain, identity, sequence);
             slave.request_sent(sequence, now_ns());
-            send(api, options.nic, config, EVENT_PORT, &message[..length]);
+            send(l2(), api, options.nic, config, EVENT_PORT, &message[..length]);
         }
         if now >= next_report {
             next_report += 1_000_000_000;
@@ -440,6 +449,14 @@ fn set_clock_from_master(slave: &Slave, options: &Options, master_ptp_ns: i64, r
     true
 }
 
+/// A master message on the transport in use, or on both UDP and Ethernet with `both`.
+fn send_all(options: &Options, api: &TapeApi, config: &net::NetConfig, port: u16, payload: &[u8]) {
+    send(l2(), api, options.nic, config, port, payload);
+    if options.both {
+        send(true, api, options.nic, config, port, payload);
+    }
+}
+
 fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6], ntp_synced: bool) {
     let identity = port_identity(mac, 1);
     let mut clock = Clock::ordinary(mac);
@@ -481,11 +498,13 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
             if !l2() && igmp.handle(&frame[..length], t4 as u64 / 1000) {
                 continue;
             }
-            if let Some((true, payload)) = incoming(api, options.nic, config, &mut arp, &frame[..length]) {
+            // With `both` a Delay_Req can arrive over either transport; it is answered over the one it came by.
+            let over_l2 = l2() || (options.both && ptp_tape::l2_message(&frame[..length]).is_some());
+            if let Some((true, payload)) = incoming(over_l2, api, options.nic, config, &mut arp, &frame[..length]) {
                 if let Some(request) = Header::parse(payload).filter(|h| h.message_type == DELAY_REQ && h.domain == options.domain && h.source != identity) {
                     let mut message = [0u8; 64];
                     let length = build_delay_resp(&mut message, options.domain, identity, request.source, request.sequence, t4, 0x7f);
-                    send(api, options.nic, config, GENERAL_PORT, &message[..length]);
+                    send(over_l2, api, options.nic, config, GENERAL_PORT, &message[..length]);
                     answered += 1;
                 }
             }
@@ -498,7 +517,7 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
             announce_sequence = announce_sequence.wrapping_add(1);
             let mut message = [0u8; 64];
             let length = build_announce(&mut message, options.domain, identity, announce_sequence, &clock, 0);
-            send(api, options.nic, config, GENERAL_PORT, &message[..length]);
+            send_all(options, api, config, GENERAL_PORT, &message[..length]);
         }
         if now >= next_sync {
             next_sync += sync_interval;
@@ -508,10 +527,18 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
             sync_sequence = sync_sequence.wrapping_add(1);
             let mut message = [0u8; 64];
             let length = build_sync(&mut message, options.domain, identity, sync_sequence, None, sync_log);
-            let t1 = now_ns();
-            send(api, options.nic, config, EVENT_PORT, &message[..length]);
-            let length = build_follow_up(&mut message, options.domain, identity, sync_sequence, t1, sync_log);
-            send(api, options.nic, config, GENERAL_PORT, &message[..length]);
+            // Each transport's Follow_Up carries the time its own Sync left, so sending on both does not skew the second.
+            let mut sent = [(false, 0i64); 2];
+            let transports = if options.both { 2 } else { 1 };
+            for (index, entry) in sent.iter_mut().enumerate().take(transports) {
+                let over_l2 = if index == 0 { l2() } else { true };
+                *entry = (over_l2, now_ns());
+                send(over_l2, api, options.nic, config, EVENT_PORT, &message[..length]);
+            }
+            for &(over_l2, t1) in &sent[..transports] {
+                let length = build_follow_up(&mut message, options.domain, identity, sync_sequence, t1, sync_log);
+                send(over_l2, api, options.nic, config, GENERAL_PORT, &message[..length]);
+            }
             syncs += 1;
         }
         if now >= next_report {
@@ -528,7 +555,7 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
 tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP or Ethernet.
 
   tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D]
-               [domain=N] [l2] [ntp=dhcp|A.B.C.D] [settime] [tz=+H[:MM]]
+               [domain=N] [l2|both] [ntp=dhcp|A.B.C.D] [settime] [tz=+H[:MM]]
                [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US]
                [idle] [verbose]
 
@@ -536,6 +563,7 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
   master    announce a clock; ntp= takes real time from an NTP server first
   nic=N     the interface (default: the one chosen with `nic use`)
   l2        PTP over Ethernet (0x88F7), no IP; ptp4l -2 compatible
+  both      master: serve UDP and Ethernet at once (slaves pick one)
   settime   slave: set this machine's clock and RTC from the master, then end
   tz=+2     hours east of UTC for settime (the RTC holds local time)
   secs=N    stop after N seconds; Escape stops at any time
