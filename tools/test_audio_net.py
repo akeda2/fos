@@ -525,7 +525,7 @@ def priority_test():
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
             mark = a.send("run audio-net recv priority=bogus")
-            a.wait_for("priority= is safe, balanced, low or auto", 30, mark)
+            a.wait_for("priority= is wifi, safe, balanced, low, live or auto", 30, mark)
             a.wait_for("fos> ", 30, mark)
             mark_b = b.send("run audio-net send proto=rtp ptp=off name=lowlat ip=192.168.60.1/24 src=tone=440 priority=low secs=30")
             b.wait_for("frames (250 us) per packet", 60, mark_b)
@@ -541,6 +541,14 @@ def priority_test():
             mark_b = b.send("run audio-net send proto=rtp ptp=off name=lowlat ip=192.168.60.1/24 src=tone=440 priority=low ptime=500 secs=2")
             b.wait_for("frames (500 us) per packet", 60, mark_b)
             check(True, "an explicit ptime= overrides the priority", "")
+            b.wait_for("Sent ", 30, mark_b)
+            b.wait_for("fos> ", 30, len(b.text()) - 10)
+            for word, text_us in (("live", "frames (125 us) per packet"), ("wifi", "frames (2000 us) per packet")):
+                mark_b = b.send(f"run audio-net send proto=rtp ptp=off name=lowlat ip=192.168.60.1/24 src=tone=440 priority={word} secs=2")
+                b.wait_for(text_us, 60, mark_b)
+                check(True, f"priority={word} sends {text_us.split('(')[1].split(')')[0]} packets", "")
+                b.wait_for("Sent ", 30, mark_b)
+                b.wait_for("fos> ", 30, len(b.text()) - 10)
         finally:
             a.stop()
             b.stop()

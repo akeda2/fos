@@ -88,6 +88,10 @@ pub enum Priority {
     Safe,
     Balanced,
     Low,
+    /// Wired, dedicated link: 3 ms ring, 125 us packets.
+    Live,
+    /// Worst case (Wi-Fi, powerline, a busy shared link): a 40 ms ring and 2 ms packets.
+    Wifi,
     Auto,
 }
 
@@ -97,6 +101,8 @@ impl Priority {
             "safe" => Some(Priority::Safe),
             "balanced" => Some(Priority::Balanced),
             "low" => Some(Priority::Low),
+            "live" => Some(Priority::Live),
+            "wifi" => Some(Priority::Wifi),
             "auto" => Some(Priority::Auto),
             _ => None,
         }
@@ -106,7 +112,8 @@ impl Priority {
         match self {
             Priority::Safe | Priority::Auto => 12,
             Priority::Balanced => 6,
-            Priority::Low => 3,
+            Priority::Low | Priority::Live => 3,
+            Priority::Wifi => 40,
         }
     }
 
@@ -115,6 +122,8 @@ impl Priority {
             Priority::Safe => 1000,
             Priority::Balanced | Priority::Auto => 500,
             Priority::Low => 250,
+            Priority::Live => 125,
+            Priority::Wifi => 2000,
         }
     }
 }
@@ -143,7 +152,7 @@ pub struct Options<'a> {
     bits: usize,
     tone: Option<u32>,
     target_ms: u32,
-    /// `priority=safe|balanced|low|auto`: sets `target=` and `ptime=` unless they are given.
+    /// `priority=wifi|safe|balanced|low|live|auto`: sets `target=` and `ptime=` unless they are given.
     priority: Option<Priority>,
     /// Microseconds of audio per packet (the sender's choice; the receiver follows what arrives).
     ptime_us: u32,
@@ -243,9 +252,9 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
                 options.target_ms = value.parse().map_err(|_| "target= needs milliseconds")?;
                 options.target_given = true;
             }
-            "priority" => options.priority = Some(Priority::parse(value).ok_or("priority= is safe, balanced, low or auto")?),
+            "priority" => options.priority = Some(Priority::parse(value).ok_or("priority= is wifi, safe, balanced, low, live or auto")?),
             "ptime" => {
-                options.ptime_us = value.parse().ok().filter(|&us| (125..=1000).contains(&us)).ok_or("ptime= is the packet time in microseconds, 125 to 1000")?;
+                options.ptime_us = value.parse().ok().filter(|&us| (125..=4000).contains(&us)).ok_or("ptime= is the packet time in microseconds, 125 to 4000")?;
                 options.ptime_given = true;
             }
             "secs" => options.seconds = value.parse().map_err(|_| "secs= needs a number")?,
@@ -596,7 +605,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let mut payload = [0u8; 1514];
     let mut ptp_frame = [0u8; 1514];
     let mut age_frames = 0u32;
-    let mut capture = [0u8; 8192];
+    let mut capture = [0u8; 16384];
     let mut held = 0usize; // bytes of device-format audio waiting in `capture`
     let device_frame = device_channels * slot;
     // The banner above took a while to print and capture has been running: audio from before now would go out as one

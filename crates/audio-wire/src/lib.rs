@@ -142,6 +142,15 @@ pub fn frames_per_packet(rate: u32, channels: usize, bits: usize, max_payload: u
 /// time trades network and CPU load for latency.
 pub fn frames_per_packet_within(rate: u32, channels: usize, bits: usize, max_payload: usize, packet_us: u32) -> usize {
     let limit = (u64::from(rate) * u64::from(packet_us) / 1_000_000).max(1) as usize;
+    // Longer than 1 ms (Wi-Fi: fewer, bigger packets): whole milliseconds, as many as the payload holds.
+    let frame_bytes = (channels * bits / 8).max(1);
+    let per_ms = (rate / 1000).max(1) as usize;
+    for milliseconds in (2..=packet_us / 1000).rev() {
+        let frames = per_ms * milliseconds as usize;
+        if frames * frame_bytes <= max_payload {
+            return frames;
+        }
+    }
     frames_per_packet(rate, channels, bits, max_payload).min(limit)
 }
 
@@ -953,6 +962,9 @@ mod tests {
     #[test]
     fn packet_sizes_fit() {
         assert_eq!(frames_per_packet(48_000, 2, 24, MAX_RTP_PAYLOAD), 48); // 1 ms stereo: 288 bytes
+        assert_eq!(frames_per_packet_within(48_000, 2, 24, MAX_RTP_PAYLOAD, 2000), 96); // 2 ms stereo: 576 bytes
+        assert_eq!(frames_per_packet_within(48_000, 8, 24, MAX_RTP_PAYLOAD, 2000), 48); // 2 ms of 8 channels is 2304 bytes
+        assert_eq!(frames_per_packet_within(48_000, 2, 24, MAX_RTP_PAYLOAD, 1000), 48);
         assert_eq!(frames_per_packet(48_000, 22, 24, MAX_RTP_PAYLOAD), 12); // 22 channels need 250 us: 792 bytes (1 ms is 3168)
         assert_eq!(frames_per_packet(96_000, 22, 24, MAX_RTP_PAYLOAD), 12); // 96 kHz: 1 ms = 96 frames, 250 us = 24 (1584 B) too big, 125 us = 12
         assert_eq!(frames_per_packet(48_000, 64, 24, 1000), 3);

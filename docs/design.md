@@ -844,15 +844,17 @@ waits, preserve serial output on failure, wait for the prompt before typing.
 
 ### audio-net priority, packet time and auto step-down
 
-`priority=safe|balanced|low|auto` (panel row "Priority") picks the receive ring and the packet time together:
-safe 12 ms / 1 ms, balanced 6 ms / 0.5 ms, low 3 ms / 0.25 ms; `target=` and `ptime=` (125 to 1000 us, PCM)
+`priority=wifi|safe|balanced|low|live|auto` (panel row "Priority") picks the receive ring and the packet time together:
+safe 12 ms / 1 ms, balanced 6 ms / 0.5 ms, low 3 ms / 0.25 ms, live 3 ms / 0.125 ms (wired, dedicated link), wifi 40 ms / 2 ms (worst case); `target=` and `ptime=` (125 to 4000 us, PCM)
 override either. Measured on Skylake USB to laptop USB with the loopback probe (`send latency`): safe ~20 ms
 and 0 underruns, balanced ~13.5 ms and ~7, low ~10 ms and ~74 per 28 s. Use low only on a quiet, wired
 network. `auto` starts as safe, steps the receiver's ring down (12, 6, 3 ms) after 30 s without loss or
 underrun, and on the first loss steps up one level and holds 60 s. The panel redraws less often at the
 lower priorities (it stalls the stream loop), and the receive loop trims a ring that is far too full
 (`target*2+96` frames). `make test-audio-net` covers it (`priority_test`). Only real hardware can check the
-underrun counts and the loopback figures.
+underrun counts and the loopback figures. With PTP (amd1 master, wired gigabit, skylake3 to laptop1, no probe) low
+and live ran 115k and 229k packets with 0 lost and 0 underruns: capture to the receiver's ring ~3.5 ms (low) and
+~3.2 ms (live) against ~7.2 ms at the default; `target=2` gave one underrun in 30 s.
 
 ### ptp (PTPv2 measurement, first step towards AES67 clocking)
 

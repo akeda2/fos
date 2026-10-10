@@ -44,9 +44,9 @@ const R_GROUP: usize = 13;
 const R_PORT: usize = 14;
 const R_PREBUFFER: usize = 15;
 const ROWS: usize = 16;
-const PRIORITIES: [&str; 4] = ["safe", "balanced", "low", "auto"];
+const PRIORITIES: [&str; 6] = ["safe", "balanced", "low", "auto", "live", "wifi"];
 /// Packet time choices in microseconds; 0 = what the priority says.
-const PACKET_US: [u32; 5] = [0, 1000, 500, 250, 125];
+const PACKET_US: [u32; 6] = [0, 1000, 500, 250, 125, 2000];
 const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Priority", "Packet time", "Send channels", "Receive channels", "Name", "Multicast group", "HTTP port", "Pre-buffer"];
 
 #[derive(Clone, Copy)]
@@ -350,10 +350,12 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
                 "Balanced  (6 ms ring, 0.5 ms packets, less screen updating)",
                 "Low latency  (3 ms ring, 0.25 ms packets; needs a quiet network)",
                 "Auto  (starts safe, steps the ring down while the stream is clean)",
+                "Live  (3 ms ring, 0.125 ms packets; wired, dedicated link)",
+                "Wi-Fi  (40 ms ring, 2 ms packets: the worst-case network)",
             ][settings.priority]);
         }
         R_PACKET => {
-            let _ = write!(out, "{}", ["By priority", "1 ms", "0.5 ms", "0.25 ms", "0.125 ms"][settings.packet]);
+            let _ = write!(out, "{}", ["By priority", "1 ms", "0.5 ms", "0.25 ms", "0.125 ms", "2 ms"][settings.packet]);
         }
         R_ADDRESSING => {
             let _ = write!(out, "{}", if settings.dhcp { "DHCP (the address comes from the network's DHCP server)" } else { "Static (type the address below)" });
@@ -861,7 +863,7 @@ fn run_stream(settings: &Settings) {
     // Drawing the screen stalls the stream loop briefly: the more latency is asked for, the less the screen is touched.
     (run.draw_gap, run.counters_gap, run.hold_back) = match options.priority {
         Some(crate::Priority::Balanced) => (100_000, 500_000, false),
-        Some(crate::Priority::Low) => (250_000, 1_000_000, false),
+        Some(crate::Priority::Low | crate::Priority::Live) => (250_000, 1_000_000, false),
         _ => (25_000, 250_000, true),
     };
     stats::reset();
