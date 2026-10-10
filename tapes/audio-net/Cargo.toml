@@ -8,6 +8,7 @@ tape-rt = { path = "../../crates/tape-rt" }
 audio-wire = { path = "../../crates/audio-wire" }
 tape-panel = { path = "../../crates/tape-panel" }
 tape-net = { path = "../../crates/tape-net" }
+tape-ip = { path = "../../crates/tape-ip" }
 opus-codec = { path = "../../crates/opus-codec" }
 ptp-tape = { path = "../ptp" }
 

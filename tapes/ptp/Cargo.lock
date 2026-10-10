@@ -15,6 +15,16 @@ name = "ptp-tape"
 version = "0.1.0"
 dependencies = [
  "audio-wire",
+ "tape-ip",
+ "tape-net",
+ "tape-rt",
+]
+
+[[package]]
+name = "tape-ip"
+version = "0.1.0"
+dependencies = [
+ "audio-wire",
  "tape-net",
  "tape-rt",
 ]

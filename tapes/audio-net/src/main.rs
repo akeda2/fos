@@ -64,8 +64,7 @@
 
 mod clock;
 mod duplex;
-mod igmp;
-mod net;
+use tape_ip::{igmp, net};
 mod panel;
 mod stats;
 mod peers;

@@ -1,0 +1,15 @@
+[package]
+name = "tape-ip"
+version = "0.1.0"
+edition = "2024"
+description = "IPv4 plumbing for tapes: addressing, ARP, UDP/RTP framing, DHCP client and IGMP host side"
+license = "MIT"
+
+[lib]
+name = "tape_ip"
+path = "src/lib.rs"
+
+[dependencies]
+tape-rt = { path = "../tape-rt" }
+tape-net = { path = "../tape-net" }
+audio-wire = { path = "../audio-wire" }

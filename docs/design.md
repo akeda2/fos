@@ -863,8 +863,8 @@ and one-step Sync, Delay_Req/Delay_Resp (end-to-end), correction fields, best-ma
 is a slave that only *measures* (the first sample sets the base offset; a real slave would step there): per
 second it prints the mean offset, spread, one-way path delay and the clock-rate difference in ppm;
 `tape run ptp master` is a small grandmaster (clock class 248, two-step Sync every `sync=` ms, 125 by default).
-The protocol and arithmetic are in `tapes/ptp/src/lib.rs` (host tests); `main.rs` reuses audio-net's `net.rs`
-and `igmp.rs`. Timestamps are software: the receive time is read when the polling loop gets the frame (the loop
+The protocol and arithmetic are in `tapes/ptp/src/lib.rs` (host tests); `main.rs` uses the shared `tape-ip` crate (`net`
+and `igmp`, moved out of audio-net). Timestamps are software: the receive time is read when the polling loop gets the frame (the loop
 spins), the transmit time just before the frame is handed to the NIC. A Sync read more than `late=` us after the
 last empty poll waited in the ring and is skipped. The path delay is the median of the last nine exchanges, with
 faster requests while it warms up.

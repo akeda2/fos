@@ -29,10 +29,7 @@
 //!
 //! Escape stops it. The protocol and the arithmetic live in `lib.rs`, with host tests (`cargo test --lib`).
 
-#[path = "../../audio-net/src/igmp.rs"]
-mod igmp;
-#[path = "../../audio-net/src/net.rs"]
-mod net;
+use tape_ip::{igmp, net};
 
 use ptp_tape::{Clock, DELAY_REQ, EVENT_PORT, GENERAL_PORT, GROUP, Header, Rate, Slave, Window, build_announce, build_delay_req, build_delay_resp, build_follow_up, build_sync, interval_ns, port_identity};
 use tape_net::{ArpCache, Ipv4Address, MacAddress};
