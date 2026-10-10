@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D] [domain=N]
-//!              [l2] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US] [idle] [verbose]
+//!              [l2] [ntp=dhcp|A.B.C.D] [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US] [idle] [verbose]
 //! ```
 //!
 //! `slave` (the default) listens for Announce, Sync and Follow_Up on the PTP multicast group (224.0.1.129),
@@ -21,6 +21,15 @@
 //!
 //! `l2` speaks PTP over Ethernet instead (IEEE 1588 Annex F, `ptp4l -2`): ethertype 0x88F7 frames to
 //! 01:1B:19:00:00:00, no IP address, DHCP or IGMP, so it also works on a bare switch or a link with no router.
+//!
+//! `ntp=` (master): before announcing, ask an NTP server the time (`dhcp` is the server DHCP names in option 42, else the
+//! gateway; or an address) and make the master's PTP time real: TAI, so Unix time plus 37 s, with the Announce saying timeSource NTP
+//! and the UTC offset. Without it the master counts from boot and its slaves know that. The master does not follow NTP afterwards
+//! (a PTP master that stepped would unlock its slaves); restart it to resync, an oscillator drifts a few seconds a day.
+//! With `l2` the NTP exchange still needs an IP address (`ip=`), used for that one exchange.
+//!
+//! `settime` (slave): once locked (8 samples) to a master that has real time, set this machine's clock and RTC from it, once.
+//! The RTC holds local time, so say the zone with `tz=` (hours east of UTC: `+2`, `-5`, `+5:30`; default 0, which is UTC).
 //!
 //! Timestamps are taken in software: receive time when the polling loop reads the frame, transmit time just
 //! before the frame is handed to the NIC. By default the loop spins, to keep that error small; `idle` sleeps
@@ -52,10 +61,13 @@ struct Options {
     idle: bool,
     verbose: bool,
     l2: bool,
+    ntp: &'static str,
+    settime: bool,
+    zone_minutes: i32,
 }
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
-    let mut options = Options { master: false, nic: 0, ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false };
+    let mut options = Options { master: false, nic: 0, ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, ntp: "", settime: false, zone_minutes: 0 };
     for word in arguments.split_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
@@ -64,6 +76,9 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
             "idle" => options.idle = true,
             "l2" => options.l2 = true,
             "verbose" => options.verbose = true,
+            "settime" => options.settime = true,
+            "ntp" => options.ntp = if value.is_empty() { "dhcp" } else { value },
+            "tz" => options.zone_minutes = tape_net::ntp::parse_zone(value).ok_or("tz= is hours east of UTC, like +2, -5 or +5:30")?,
             "nic" => options.nic = value.parse::<usize>().ok().filter(|&n| n >= 1).ok_or("nic= is the NIC number, from 1")? - 1,
             "ip" => options.ip = value,
             "gateway" => options.gateway = value,
@@ -79,8 +94,60 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
     Ok(options)
 }
 
+/// Added to the local clock for the master's PTP time: zero (time since boot) until NTP says what the date is.
+static EPOCH_NS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
 fn now_ns() -> i64 {
-    tape_rt::micros() as i64 * 1000
+    tape_rt::micros() as i64 * 1000 + EPOCH_NS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+struct Shown(tape_net::ntp::Civil);
+
+impl core::fmt::Display for Shown {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let t = &self.0;
+        write!(f, "{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second)
+    }
+}
+
+/// Asks the NTP server and, if it answers, makes `now_ns()` the TAI time. True if the master's time is now real.
+fn adopt_ntp_time(api: &TapeApi, options: &Options, config: &net::NetConfig, from_dhcp: Option<Ipv4Address>) -> bool {
+    let server = if options.ntp == "dhcp" {
+        match from_dhcp {
+            Some(server) => server,
+            None if config.gateway.0 != [0; 4] => {
+                println!("ptp: DHCP names no NTP server (option 42); trying the gateway.");
+                config.gateway
+            }
+            None => {
+                println!("ptp: DHCP names no NTP server and there is no gateway; give ntp=A.B.C.D. The master counts from boot.");
+                return false;
+            }
+        }
+    } else {
+        match net::parse_ip(options.ntp) {
+            Some(server) => server,
+            None => {
+                println!("ptp: ntp= is dhcp or an IP address (there is no DNS client). The master counts from boot.");
+                return false;
+            }
+        }
+    };
+    println!("ptp: asking NTP server {}.{}.{}.{} for the time...", server.0[0], server.0[1], server.0[2], server.0[3]);
+    let mut arp = ArpCache::<8>::new();
+    let Some(sample) = tape_ip::ntp::query(api, options.nic, config, &mut arp, server) else {
+        println!("ptp: no answer from the NTP server. The master counts from boot, so slaves will not set their clocks from it.");
+        return false;
+    };
+    let local = tape_rt::micros() as i64 * 1000;
+    let date = tape_net::ntp::civil_from_unix((local + sample.offset) / 1_000_000_000);
+    if date.year < 2024 {
+        println!("ptp: the NTP server says {}, which cannot be right. The master counts from boot.", Shown(date));
+        return false;
+    }
+    EPOCH_NS.store(sample.offset + tape_net::ntp::TAI_MINUS_UTC * 1_000_000_000, core::sync::atomic::Ordering::Relaxed);
+    println!("ptp: NTP time {} UTC (round trip {} us). The master's PTP time is now TAI from it.", Shown(date), Us(sample.delay));
+    true
 }
 
 /// Signed nanoseconds shown as microseconds with one decimal.
@@ -182,12 +249,20 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut mac = [0u8; 6];
     (api.nic_mac)(options.nic, mac.as_mut_ptr());
     L2.store(options.l2, core::sync::atomic::Ordering::Relaxed);
-    let config = if options.l2 {
+    if !options.master && !options.ntp.is_empty() {
+        return println!("ptp: ntp= is for the master; a slave takes its time from the master (settime).");
+    }
+    let wants_ntp = !options.ntp.is_empty();
+    let mut dhcp_ntp = None;
+    let config = if options.l2 && !wants_ntp {
         net::NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) }
     } else if options.ip == "dhcp" {
         println!("ptp: asking DHCP for an address on NIC {}...", options.nic + 1);
-        match net::dhcp(api, options.nic, MacAddress(mac)) {
-            Some(config) => config,
+        match net::dhcp_with_ntp(api, options.nic, MacAddress(mac)) {
+            Some((config, ntp)) => {
+                dhcp_ntp = ntp;
+                config
+            }
             None => return println!("ptp: no DHCP answer; give ip=A.B.C.D/N instead."),
         }
     } else {
@@ -206,8 +281,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if !options.l2 {
         igmp.join(api, options.nic, &config);
     }
+    let ntp_synced = wants_ntp && adopt_ntp_time(api, &options, &config, dhcp_ntp);
     if options.master {
-        master(api, &options, &config, mac);
+        master(api, &options, &config, mac, ntp_synced);
     } else {
         slave(api, &options, &config, mac);
     }
@@ -234,6 +310,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     let mut steps_seen = 0;
     let mut silent = 0u32;
     let mut last_empty = now_ns();
+    let (mut time_set, mut refusal_shown) = (false, false);
     println!("ptp: waiting for an Announce...");
     loop {
         let now = now_ns();
@@ -268,6 +345,9 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
                     total.add(sample.residual);
                     delays.add(sample.delay);
                     rate.add(t2, sample.offset);
+                    if options.settime && !time_set && total.count >= 8 {
+                        time_set = set_clock_from_master(&slave, options, t2 - sample.offset, &mut refusal_shown);
+                    }
                     if options.verbose {
                         println!("  seq {} offset {} us (raw {} ms) delay {} us", sample.sequence, Us(sample.residual), sample.offset / 1_000_000, Us(sample.delay));
                     }
@@ -337,10 +417,37 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     }
 }
 
-fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]) {
+/// Sets the machine's clock and RTC from the master's time (`master_ptp_ns`, TAI) if the master has real time.
+fn set_clock_from_master(slave: &Slave, options: &Options, master_ptp_ns: i64, refusal_shown: &mut bool) -> bool {
+    let Some((_, clock)) = slave.master() else { return false };
+    let unix = clock.unix_ns(master_ptp_ns);
+    let local = (unix + 500_000_000).div_euclid(1_000_000_000) + i64::from(options.zone_minutes) * 60;
+    let date = tape_net::ntp::civil_from_unix(local);
+    if !clock.has_real_time() || date.year < 2024 {
+        if !*refusal_shown {
+            *refusal_shown = true;
+            println!("ptp: settime: the master has no real time (time source {}); start it with ntp=. The clock is unchanged.", clock.time_source);
+        }
+        return false;
+    }
+    let wall = tape_rt::WallClock { year: date.year, month: date.month, day: date.day, hour: date.hour, minute: date.minute, second: date.second, reserved: 0 };
+    if tape_rt::set_wall_clock(&wall) {
+        let zone = options.zone_minutes;
+        println!("ptp: clock and RTC set to {} (local time, UTC{}{}:{:02}) from the master.", Shown(date), if zone < 0 { '-' } else { '+' }, zone.abs() / 60, zone.abs() % 60);
+    } else {
+        println!("ptp: settime: the kernel refused the date (needs ABI 6, a date from 2024 to 2099).");
+    }
+    true
+}
+
+fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6], ntp_synced: bool) {
     let identity = port_identity(mac, 1);
     let mut clock = Clock::ordinary(mac);
     clock.priority1 = options.priority1;
+    if ntp_synced {
+        clock.time_source = ptp_tape::TIME_SOURCE_NTP;
+        clock.utc_offset = Some(tape_net::ntp::TAI_MINUS_UTC as i16);
+    }
     let mut igmp = igmp::Igmp::new(GROUP);
     let mut arp = ArpCache::<8>::new();
     let mut frame = [0u8; net::MAX_FRAME];

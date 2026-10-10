@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`.
-pub const TAPE_API_VERSION: u32 = 5;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`.
+pub const TAPE_API_VERSION: u32 = 6;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -174,6 +174,11 @@ pub struct TapeApi {
     /// Returns how many are known; if `number` is 1 to that count, `out` is filled with that peer, `number` 0 only counts.
     /// A tape resolves a machine name to a MAC address with it, without asking on the wire. Check `version >= 5` and `size`.
     pub peer_info: extern "C" fn(usize, *mut PeerInfo) -> usize,
+    /// `wall_clock_set(time)` (version 6): sets the clock to `time` (local time, like `wall_clock` reports and `date set` takes) and
+    /// writes it to the RTC. 1 if it was set, 0 if the date is not valid (before 2024 or after 2099). The clock steps at once, so a
+    /// tape calls it only when nothing is being recorded; `ptp settime` does it once, when it first locks to a master with real
+    /// time. Check `version >= 6` and `size` before calling.
+    pub wall_clock_set: extern "C" fn(*const WallClock) -> u32,
 }
 
 /// What `peer_info` fills in. Kernel-filled, so never extend it: a new fact gets a new call.

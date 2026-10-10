@@ -459,6 +459,11 @@ extern "C" fn api_wall_clock(out: *mut fosfor_abi::tape::WallClock) -> u32 {
         None => 0,
     }
 }
+extern "C" fn api_wall_clock_set(time: *const fosfor_abi::tape::WallClock) -> u32 {
+    let time = unsafe { *time };
+    let time = fat::Time { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
+    u32::from(crate::clock::set(&time).is_ok())
+}
 extern "C" fn api_audio_set_capture_ring(bytes: u64) {
     crate::usb_audio::set_capture_ring(bytes); // the capture ring belongs to whichever device starts next
 }
@@ -591,6 +596,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         audio_use_device: api_audio_use_device,
         nic_active: api_nic_active,
         peer_info: api_peer_info,
+        wall_clock_set: api_wall_clock_set,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

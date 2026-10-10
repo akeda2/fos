@@ -48,7 +48,7 @@ their own.
 | `hello`, `calc`, `memtest` | The smallest example; an RPN calculator; a RAM tester and soak test. |
 | `ed` | A line editor with cursor keys; saves to FOSFS, FAT32 or exFAT. |
 | `net-chat`, `ip-chat`, `telnet` | Raw-Ethernet chat, IPv4/UDP chat, a Telnet client. |
-| `ptp` | PTPv2 (IEEE 1588, the clock AES67 uses) over UDP, or over Ethernet with `l2` (ethertype 0x88F7, no IP; `ptp4l -2`): `tape run ptp [master] [l2]`. As a slave it measures this machine's clock offset, path delay and rate against a master; so far it steers nothing. |
+| `ptp` | PTPv2 (IEEE 1588, the clock AES67 uses) over UDP, or over Ethernet with `l2` (ethertype 0x88F7, no IP; `ptp4l -2`): `tape run ptp [master] [l2]`. As a slave it measures this machine's clock offset, path delay and rate against a master. `master ntp=dhcp\|A.B.C.D` first asks an NTP server the time (DHCP option 42, else the gateway) so the master's time is real; `settime tz=+2` on a slave then sets that machine's clock and RTC from it, once (`date` shows it). |
 | `router`, `bridge`, `nettest` | A layer-3 router (NAT, DHCP, health-checked uplinks), a layer-2 learning bridge, a link-impairment and traffic generator. |
 | `play`, `record`, `recorder`, `audio-net` | WAV playback and recording, a field recorder, audio streaming between hosts (raw Ethernet or RTP, Opus). RTP follows a PTP clock when one is found (`ptp=auto\|l2\|off`; raw and AVTP use Ethernet PTP, `ptp l2`) and a receiver shows the one-way delay. `priority=wifi\|safe\|balanced\|low\|live\|auto` picks ring and packet time (40 ms/2 ms ... 3 ms/0.125 ms). |
 

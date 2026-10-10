@@ -472,6 +472,15 @@ pub fn wall_clock() -> Option<WallClock> {
     ((table.wall_clock)(&mut now) != 0).then_some(now)
 }
 
+/// Sets the machine's clock and RTC to `time` (local time). False if the kernel is older than ABI 6 or the date is not valid.
+pub fn set_wall_clock(time: &WallClock) -> bool {
+    let table = api();
+    if table.version < 6 || (table.size as usize) < core::mem::size_of::<TapeApi>() {
+        return false;
+    }
+    (table.wall_clock_set)(time) != 0
+}
+
 pub fn micros() -> u64 {
     (api().micros)()
 }

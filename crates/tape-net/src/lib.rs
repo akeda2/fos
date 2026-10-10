@@ -14,6 +14,8 @@
 //! outstanding segment for retransmission.
 #![no_std]
 
+pub mod ntp;
+
 use core::convert::TryInto;
 
 /// Errors returned by fixed-buffer parsers and builders.
@@ -806,6 +808,7 @@ pub const DHCP_OPTION_SUBNET_MASK: u8 = 1;
 pub const DHCP_OPTION_ROUTER: u8 = 3;
 pub const DHCP_OPTION_HOST_NAME: u8 = 12;
 pub const DHCP_OPTION_DNS: u8 = 6;
+pub const DHCP_OPTION_NTP: u8 = 42;
 pub const DHCP_OPTION_BROADCAST_ADDRESS: u8 = 28;
 pub const DHCP_OPTION_REQUESTED_IP: u8 = 50;
 pub const DHCP_OPTION_LEASE_TIME: u8 = 51;
@@ -817,6 +820,7 @@ pub const DHCP_OPTION_REBINDING_TIME: u8 = 59;
 pub const DHCP_OPTION_MAX_MESSAGE_SIZE: u8 = 57;
 pub const DHCP_OPTION_END: u8 = 255;
 pub const DHCP_MAX_DNS_SERVERS: usize = 2;
+pub const DHCP_MAX_NTP_SERVERS: usize = 2;
 
 /// BOOTP request/reply direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1227,6 +1231,9 @@ pub struct DhcpLease {
     pub router: Ipv4Address,
     pub dns_servers: [Ipv4Address; DHCP_MAX_DNS_SERVERS],
     pub dns_server_count: usize,
+    /// Option 42: the NTP servers the DHCP server names (the first `ntp_server_count`).
+    pub ntp_servers: [Ipv4Address; DHCP_MAX_NTP_SERVERS],
+    pub ntp_server_count: usize,
     pub server: Ipv4Address,
     pub lease_seconds: u32,
     pub renewal_seconds: u32,
@@ -1533,6 +1540,7 @@ impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
                     DHCP_OPTION_SUBNET_MASK,
                     DHCP_OPTION_ROUTER,
                     DHCP_OPTION_DNS,
+                    DHCP_OPTION_NTP,
                     DHCP_OPTION_SERVER_IDENTIFIER,
                     DHCP_OPTION_LEASE_TIME,
                     DHCP_OPTION_RENEWAL_TIME,
@@ -1600,6 +1608,17 @@ impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
             Some(_) => return Err(Error::Invalid),
             None => 0,
         };
+        // A malformed option 42 only costs the NTP hint, never the lease.
+        let mut ntp_servers = [Ipv4Address::UNSPECIFIED; DHCP_MAX_NTP_SERVERS];
+        let mut ntp_server_count = 0;
+        if let Ok(Some(bytes)) = options.find(DHCP_OPTION_NTP) {
+            if !bytes.is_empty() && bytes.len() % 4 == 0 {
+                ntp_server_count = core::cmp::min(bytes.len() / 4, DHCP_MAX_NTP_SERVERS);
+                for (index, server) in ntp_servers.iter_mut().enumerate().take(ntp_server_count) {
+                    *server = Ipv4Address(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+                }
+            }
+        }
         let lease = DhcpLease {
             address,
             subnet_mask: options
@@ -1610,6 +1629,8 @@ impl<const OPTION_CAP: usize> DhcpClient<OPTION_CAP> {
                 .unwrap_or(Ipv4Address::UNSPECIFIED),
             dns_servers,
             dns_server_count,
+            ntp_servers,
+            ntp_server_count,
             server,
             lease_seconds,
             renewal_seconds,
@@ -2383,6 +2404,9 @@ mod tests {
                     .push(DHCP_OPTION_DNS, &[192, 0, 2, 53, 198, 51, 100, 53])
                     .unwrap();
                 writer
+                    .push(DHCP_OPTION_NTP, &[192, 0, 2, 123])
+                    .unwrap();
+                writer
                     .push_u32(DHCP_OPTION_LEASE_TIME, lease_seconds)
                     .unwrap();
                 writer
@@ -2450,6 +2474,8 @@ mod tests {
         let lease = client.lease().unwrap();
         assert_eq!(lease.address, address);
         assert_eq!(lease.dns_server_count, 2);
+        assert_eq!(lease.ntp_server_count, 1);
+        assert_eq!(lease.ntp_servers[0], Ipv4Address([192, 0, 2, 123]));
         assert_eq!(
             lease.dns_servers,
             [

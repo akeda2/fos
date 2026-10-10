@@ -149,6 +149,27 @@ pub struct Clock {
     pub identity: [u8; 8],
     pub steps_removed: u16,
     pub time_source: u8,
+    /// TAI minus UTC in seconds, when the Announce says it is valid (flag utcOffsetValid).
+    pub utc_offset: Option<i16>,
+}
+
+/// Announce flag bits (the low octet of the header's flag field).
+pub const FLAG_UTC_OFFSET_VALID: u16 = 0x0004;
+pub const FLAG_PTP_TIMESCALE: u16 = 0x0008;
+/// timeSource values: NTP, and the ones that are a real-time reference. 0x90 (other) and 0xa0 (internal oscillator) are not.
+pub const TIME_SOURCE_NTP: u8 = 0x50;
+
+impl Clock {
+    /// True if the master says its time came from outside (atomic clock, GPS, radio, PTP, NTP, set by hand), not from its own
+    /// oscillator counting from boot.
+    pub fn has_real_time(&self) -> bool {
+        (0x10..=0x60).contains(&self.time_source)
+    }
+
+    /// The master's time as Unix nanoseconds (UTC), given its PTP time (TAI). Assumes 37 s when no offset was announced.
+    pub fn unix_ns(&self, ptp_ns: i64) -> i64 {
+        ptp_ns - i64::from(self.utc_offset.unwrap_or(37)) * 1_000_000_000
+    }
 }
 
 impl Clock {
@@ -157,7 +178,7 @@ impl Clock {
         let id = port_identity(mac, 0);
         let mut identity = [0u8; 8];
         identity.copy_from_slice(&id[..8]);
-        Clock { priority1: 128, class: 248, accuracy: 0xfe, variance: 0xffff, priority2: 128, identity, steps_removed: 0, time_source: 0xa0 }
+        Clock { priority1: 128, class: 248, accuracy: 0xfe, variance: 0xffff, priority2: 128, identity, steps_removed: 0, time_source: 0xa0, utc_offset: None }
     }
 
     fn key(&self) -> ([u8; 5], [u8; 8]) {
@@ -187,8 +208,10 @@ fn header(message_type: u8, length: usize, domain: u8, flags: u16, source: PortI
 }
 
 pub fn build_announce(out: &mut [u8], domain: u8, source: PortIdentity, sequence: u16, clock: &Clock, log_interval: i8) -> usize {
-    header(ANNOUNCE, ANNOUNCE_LEN, domain, 0, source, sequence, 5, log_interval).write(out);
+    let flags = if clock.utc_offset.is_some() { FLAG_UTC_OFFSET_VALID | FLAG_PTP_TIMESCALE } else { 0 };
+    header(ANNOUNCE, ANNOUNCE_LEN, domain, flags, source, sequence, 5, log_interval).write(out);
     out[34..ANNOUNCE_LEN].fill(0);
+    out[44..46].copy_from_slice(&clock.utc_offset.unwrap_or(0).to_be_bytes());
     out[47] = clock.priority1;
     out[48] = clock.class;
     out[49] = clock.accuracy;
@@ -242,6 +265,7 @@ pub fn parse_announce(message: &[u8]) -> Option<Clock> {
         identity,
         steps_removed: u16::from_be_bytes([message[61], message[62]]),
         time_source: message[63],
+        utc_offset: (u16::from_be_bytes([message[6], message[7]]) & FLAG_UTC_OFFSET_VALID != 0).then(|| i16::from_be_bytes([message[44], message[45]])),
     })
 }
 
@@ -718,6 +742,24 @@ mod tests {
 
     const MASTER: PortIdentity = [1, 2, 3, 0xff, 0xfe, 4, 5, 6, 0, 1];
     const ME: PortIdentity = [9, 9, 9, 0xff, 0xfe, 9, 9, 9, 0, 1];
+
+    #[test]
+    fn announce_carries_the_time_source_and_utc_offset() {
+        let mut clock = Clock::ordinary([1, 2, 3, 4, 5, 6]);
+        let mut out = [0u8; 64];
+        build_announce(&mut out, 0, MASTER, 1, &clock, 0);
+        let parsed = parse_announce(&out).unwrap();
+        assert_eq!(parsed.utc_offset, None);
+        assert!(!parsed.has_real_time());
+        clock.time_source = TIME_SOURCE_NTP;
+        clock.utc_offset = Some(37);
+        build_announce(&mut out, 0, MASTER, 1, &clock, 0);
+        let parsed = parse_announce(&out).unwrap();
+        assert_eq!(parsed.utc_offset, Some(37));
+        assert!(parsed.has_real_time());
+        assert_eq!(parsed.unix_ns(1_791_000_037_000_000_000), 1_791_000_000_000_000_000);
+        assert_eq!(Header::parse(&out).unwrap().flags & (FLAG_UTC_OFFSET_VALID | FLAG_PTP_TIMESCALE), 0x000c);
+    }
 
     fn slave() -> Slave {
         let mut slave = Slave::new(0, ME, 1_000_000_000);
