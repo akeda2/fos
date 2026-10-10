@@ -243,7 +243,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// `PLAYBACK_WINDOW_MS` of them, because a packet is filled when it is queued and plays a whole window later:
 /// the window *is* the playback latency.
 const WINDOW: usize = 192;
-const PLAYBACK_WINDOW_MS: u32 = 6;
+const PLAYBACK_WINDOW_MS: u32 = 3;
 /// PCM ring size in bytes (about a second of 6-channel 24-bit audio at 48 kHz fits).
 pub(crate) const RING_BYTES: usize = 1 << 20;
 /// The capture ring is bigger: a recording to a USB stick can stall for seconds while the stick erases flash, and

@@ -345,7 +345,7 @@ firmware, so a pending slot is tried on the next boot.
   (`src=tone=440`, no audio hardware needed); `recv` locks onto the first sender, plays on the device
   (`ch=` places the stream's channels on output channels), bridges short sequence gaps with silence, resyncs
   after long ones, and keeps the playback ring near `target=` ms by dropping or repeating one frame at a
-  time (a resampler replaces that in a later stage). Playback's transfer window is now ~6 ms (a packet plays a
+  time (a resampler replaces that in a later stage). Playback's transfer window is now ~3 ms (was 6; measured on Skylake -> laptop over USB, the click-to-click latency fell from 17 to 15 ms at `target=6`, underruns unchanged) (a packet plays a
   whole window after it is filled, so the window is the latency). `micros()` no longer goes backwards when
   the timer interrupt is late (a pending timer interrupt counts as an elapsed tick, and the value is clamped).
   Tested between two QEMU guests (`make test-audio-net`: stereo 24-bit and mono 16-bit tones, 0 lost,
