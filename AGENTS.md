@@ -154,7 +154,7 @@ through its documented load/run path**; a green build is not validation. Editing
 
 ## Debug mode, KUP, real hardware
 
-Per-machine config files on FOSFS: `start` (boot script), `hostname`, `settings`
+Per-machine config files on FOSFS: `start` (boot script; the `start` command reruns it), `hostname`, `settings`
 (`no-msi`, `deny-term-net`), `debug` (`reboot-on-crash`, `reboot-delay N`,
 `kernel-update`, `watchdog [N]`, `crash-on-boot`; `tools/default-debug.txt` is installed
 by default). A fatal exception writes a crash record (read and printed by the next

@@ -37,6 +37,11 @@ def main():
             text = guest.text()[mark:]
             check("hi.sh> uptime" in text and "ticks at 100 Hz" in text and "Managed:" in text, "typing the name runs NAME.sh", text)
 
+            mark = guest.send("start")
+            guest.pump(1.5)
+            text = guest.text()[mark:]
+            check("start file: running 1 command(s)." in text and "start> hi" in text and "hi.sh> uptime" in text, "typing `start` runs the start file again", text)
+
             mark = guest.send("args a b c")
             guest.pump(1.0)
             text = guest.text()[mark:]

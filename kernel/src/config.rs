@@ -157,9 +157,9 @@ pub fn load() {
     }
 }
 
-/// Runs the `start` file through `run`, one command per line.
-pub fn run_start(mut run: impl FnMut(&str)) {
-    let Some(text) = read("start") else { return };
+/// Runs the `start` file through `run`, one command per line. False if there is no such file.
+pub fn run_start(mut run: impl FnMut(&str)) -> bool {
+    let Some(text) = read("start") else { return false };
     // `read` shares one buffer, so copy before running commands that may read files.
     let mut script = [0u8; FILE_CAPACITY];
     script[..text.len()].copy_from_slice(text.as_bytes());
@@ -169,4 +169,5 @@ pub fn run_start(mut run: impl FnMut(&str)) {
         crate::println!("start> {line}");
         run(line);
     }
+    true
 }

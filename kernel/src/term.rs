@@ -1025,6 +1025,19 @@ impl core::fmt::Display for Mac<'_> {
     }
 }
 
+/// `start`: runs the `start` file again, as the boot does. A start file that itself says `start` would never end, so inside a run it is refused.
+fn start_command() {
+    static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if RUNNING.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::println!("start: the start file is already running.");
+        return;
+    }
+    if !crate::config::run_start(run_line) {
+        crate::println!("start: no start file on a FOSFS volume (or the FAT/exFAT root).");
+    }
+    RUNNING.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn prompt() {
     crate::print(format_args!("fos> "));
 }
@@ -1219,6 +1232,7 @@ fn execute(command: &str) {
             crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL;");
             crate::println!("          a FAT32/exFAT disk too, by its diskN: ls cat write rm copy)");
             crate::println!("ls [diskN]        list FOSFS files (a FAT32/exFAT disk too, if named)");
+            crate::println!("start     run the start file again (as at boot)");
             crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");
             crate::println!("cat [diskN] NAME  show a file");
             crate::println!("write [diskN] NAME TEXT   create or replace a file");
@@ -1410,6 +1424,7 @@ fn execute(command: &str) {
             }
         }
         "date" => date_command(words),
+        "start" => start_command(),
         "cat" if words.clone().next().and_then(fat_disk).is_some() => {
             let first = words.next().unwrap_or("");
             let named = first.split_once('/').map(|(_, name)| name).filter(|name| !name.is_empty()).or_else(|| words.next());
