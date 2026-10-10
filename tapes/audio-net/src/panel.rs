@@ -123,6 +123,9 @@ impl Settings {
             }
         }
         let peer = if self.mode == SERVE { "" } else { self.peer.as_str() };
+        if peer.is_empty() && self.mode == 1 && self.rtp() && self.group.is_empty() {
+            let _ = writeln!(out, "source auto"); // the one stream that is announced
+        }
         if !peer.is_empty() {
             if self.mode != 1 {
                 let _ = writeln!(out, "to {peer}");
@@ -206,6 +209,7 @@ impl Settings {
                 "group" => self.group = Text::from(value),
                 "http" => self.port = Text::from(value),
                 "prebuffer" => self.prebuffer = Text::from(value),
+                "to" | "source" | "from" if value == "auto" => {}
                 "to" | "source" | "from" => self.peer = Text::from(value),
                 "codec" => opus = value == "opus",
                 "bitrate" => bitrate = value.parse().unwrap_or(96),
@@ -268,6 +272,9 @@ fn cfg_text(settings: &Settings, for_run: bool) -> &'static str {
 
 /// What the settings would run: the mode and the options, or why they are not a valid stream.
 fn build(settings: &Settings) -> Result<(&'static str, Options<'static>), &'static str> {
+    if settings.applies(R_GROUP) && !settings.group.is_empty() && !crate::net::parse_ip(settings.group.as_str()).is_some_and(|group| audio_wire::is_multicast_address(group.0)) {
+        return Err("Multicast group: an address such as 239.1.2.3 (224.0.0.0-239.255.255.255), or empty for automatic.");
+    }
     let text = cfg_text(settings, true);
     let mut words: [&'static str; crate::MAX_WORDS] = [""; crate::MAX_WORDS];
     let mut count = 0;
@@ -323,7 +330,12 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
         }
         R_PEER => {
             if settings.peer.is_empty() {
-                let _ = write!(out, "{}", if settings.mode == 1 { "-  (any sender; P picks from the announced ones)" } else { "-  (P picks from the announced ones)" });
+                let _ = write!(out, "{}", match (settings.mode, settings.rtp()) {
+                    (1, true) => "-  (the announced stream; P picks one)",
+                    (1, false) => "-  (any sender; P picks from the announced ones)",
+                    (_, true) => "-  (automatic multicast group; P picks a machine)",
+                    _ => "-  (P picks from the announced ones)",
+                });
             } else {
                 let _ = write!(out, "{}", settings.peer.as_str());
             }
@@ -360,7 +372,13 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
                 let _ = write!(out, "{}", settings.name.as_str());
             }
         }
-        _ => dash(settings.group.as_str(), out),
+        _ => {
+            if settings.group.is_empty() {
+                let _ = write!(out, "-  (automatic: a sender picks one, receivers follow its announcement)");
+            } else {
+                let _ = write!(out, "{}", settings.group.as_str());
+            }
+        }
     }
 }
 

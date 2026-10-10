@@ -461,7 +461,10 @@ firmware, so a pending slot is tried on the next boot.
   of what it accepts (`a=recvonly`), under `name=` (default `fos-` and the last three MAC bytes), and withdraws the
   announcement (SAP's deletion flag) when it stops. `audio-net list [secs=N]` joins the group with IGMP, listens and prints
   a table: name, role (sends/listens), the announcer's IP and MAC, codec, channels, rate and address:port (marked when the
-  address is this machine's). A receiver can say `source=NAME`: it waits (15 s) for the sender's announcement and takes
+  address is this machine's). No address has to be typed for multicast: a sender with no `to=` (panel: Peer empty) picks
+  239.192.x.y from a hash of its name, avoiding groups it hears in use (2 s); a receiver with `source=auto` (panel: Peer
+  empty) joins the only announced multicast stream, or says that none or several are announced; a bad Group in the
+  panel is refused with a message. A receiver can say `source=NAME`: it waits (15 s) for the sender's announcement and takes
   codec, channel count, rate, port and multicast group from the SDP, so the cfg of a receiver can be just `mode recv`,
   `ip ...` and `source studio-a`; a sender can say `to=NAME` and sends to the listener's address and port with the
   codec it announced. Names are looked up again on every retry. The SDP parser (`audio_wire::sap`, host-tested) reads

@@ -47,7 +47,10 @@
 //! **Multicast.** `send to=239.1.2.3` goes to a multicast group (MAC 01:00:5e:..., no ARP). A receiver gets it with
 //! `recv group=239.1.2.3`: the tape joins the group with an IGMP report (so a snooping switch forwards it to this
 //! port), answers the querier's queries, and sends a leave when it stops; the NIC is told to accept all multicast
-//! while it runs. `codec=opus` (see `opus.rs`) sends Opus instead of PCM.
+//! while it runs. `codec=opus` (see `opus.rs`) sends Opus instead of PCM. No address needs typing: an RTP `send` with
+//! no `to=` (or `to=auto`) picks 239.192.x.y from its name (after 2 s of listening for groups already in use; `group=`
+//! overrides), and `recv source=auto` joins the one multicast (or to-this-machine) stream that is announced. The panel
+//! does both when Peer is empty.
 #![no_std]
 #![no_main]
 
@@ -1002,17 +1005,24 @@ fn collect(api: &TapeApi, arguments: &'static str) -> Result<([&'static str; MAX
 pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'static>) -> bool {
     // With `proto=raw|avtp` given, names are looked up in layer 2 announcements; otherwise a name means RTP.
     let layer_2 = options.proto_explicit && options.proto != Proto::Rtp;
-    let wants_source = !options.source.is_empty() && mode == "recv";
-    let to_name = !options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none();
+    let auto_to = matches!(mode, "send" | "duplex") && options.proto == Proto::Rtp && matches!(options.to, "" | "auto" | "multicast");
+    let auto_source = mode == "recv" && !layer_2 && options.source == "auto";
+    let wants_source = !options.source.is_empty() && mode == "recv" && !auto_source;
+    let to_name = !auto_to && !options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none();
     let wants_listener = to_name && matches!(mode, "send" | "duplex") && (options.proto == Proto::Rtp || layer_2);
     let announces_listening = matches!(mode, "recv" | "duplex") && (!options.source.is_empty() || wants_listener);
-    if !wants_source && !wants_listener {
+    if !wants_source && !wants_listener && !auto_to && !auto_source {
         return true;
     }
     if !layer_2 {
         options.proto = Proto::Rtp;
     }
     let Some(mut transport) = Transport::open(api, options) else { return false };
+    if auto_to {
+        let mut buffer = [0u8; audio_wire::sap::MAX_NAME];
+        let name = peers::session_name(options.name, transport.mac, &mut buffer);
+        options.to = peers::choose_group(api, options, &mut transport, name);
+    }
     // Be findable while looking: a peer that sends to our name needs our listening address before it can start,
     // and it may be waiting for the same of us. (A duplex machine looks up its `source=` later, while it sends.)
     if announces_listening {
@@ -1028,6 +1038,13 @@ pub fn resolve_names(api: &'static TapeApi, mode: &str, options: &mut Options<'s
             peers::adopt_listener_l2(options, &entry);
         } else {
             peers::adopt_listener(options, &entry);
+        }
+    }
+    if auto_source {
+        let Some(entry) = peers::find_auto(api, options, &mut transport) else { return false };
+        if let Err(reason) = peers::adopt_sender(options, &entry, transport.config.ip.0) {
+            println!("audio-net: '{}': {reason}.", entry.session.name());
+            return false;
         }
     }
     if wants_source {

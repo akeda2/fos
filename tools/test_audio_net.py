@@ -7,6 +7,7 @@ arrive, be played and be recorded at the right frequency and length, the receive
 packets, and a stream with another channel count/bit depth (mono, 16-bit) must be converted and played
 too. Run with `make test-audio-net`."""
 
+import re
 import os
 import select
 import socket
@@ -381,6 +382,7 @@ def main():
     duplex_test()
     config_test()
     peers_test()
+    auto_group_test()
     panel_test()
     layer_2_names_test()
     layer_2_panel_test()
@@ -470,6 +472,35 @@ def config_test():
             n = b.text()[mark:].count("trying again in 5 s")
             b.pump(8.0)
             check(b.text()[mark:].count("trying again in 5 s") == n, "Escape stops the retrying", "")
+        finally:
+            a.stop()
+            b.stop()
+
+
+def auto_group_test():
+    """No IP to type: B sends as 'glenn' with no `to=` and picks a multicast group itself (239.192.x.y, from the
+    name); A, with nothing but `source=auto`, finds the announcement, joins that group and receives. A bad group in
+    the panel's settings is refused with a message."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = Path(tmp) / "auto.wav"
+        a = Guest(tmp, "auto-a", "52:54:00:12:34:c1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"])
+        b = Guest(tmp, "auto-b", "52:54:00:12:34:c2")
+        try:
+            for guest in (a, b):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark_b = b.send("run audio-net send proto=rtp codec=opus name=glenn ip=192.168.60.1/24 src=tone=500 secs=40")
+            b.wait_for("Announcing this stream as 'glenn'", 60, mark_b)
+            text_b = b.text()[mark_b:]
+            group = re.search(r"multicast group (239\.192\.\d+\.\d+)", text_b)
+            check(group is not None, "a sender without to= chooses a 239.192.x.y group itself", text_b[-700:])
+            mark = a.send("run audio-net recv source=auto ip=192.168.60.2/24 secs=8 target=30")
+            a.wait_for("Received ", 90, mark)
+            a.wait_for("fos> ", 30, mark)
+            text = a.text()[mark:]
+            check("Found 'glenn'." in text and group is not None and f"Joined multicast group {group.group(1)}" in text, "source=auto finds the only announced stream and joins its group", text[-900:])
+            packets = int(text.split("Received ")[-1].split(" ")[0])
+            check(packets >= 200, f"and receives it ({packets} packets) with no address typed", text[-600:])
         finally:
             a.stop()
             b.stop()
@@ -587,7 +618,7 @@ def panel_test():
             keys(a, "s")
             a.pump(3.0)
             keys(b, "s")
-            a.pump(5.0)
+            a.pump(8.0)  # an empty Peer on a receiver means source=auto: it first waits for the announcement
             b.pump(2.0)
             text_a, text_b = a.text()[mark_a:], b.text()[mark_b:]
             check("Tx " in text_b and "Lost 0" in text_a, "both live views show counters", text_a[-500:] + text_b[-500:])

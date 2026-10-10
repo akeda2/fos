@@ -17,7 +17,7 @@ use crate::{MacText, Options, Proto, Transport};
 use audio_wire::sap::{self, Codec, Session};
 use audio_wire::{Sdp, SdpOpus, multicast_mac, write_sdp, write_sdp_opus};
 use tape_net::{Ipv4Address, MacAddress};
-use tape_rt::{TapeApi, println};
+use tape_rt::{TapeApi, print, println};
 
 const ANNOUNCE_MICROS: u64 = 5_000_000;
 const MAX_ENTRIES: usize = 24;
@@ -360,12 +360,12 @@ pub fn find(api: &'static TapeApi, options: &Options, transport: &mut Transport,
     found
 }
 
-static mut TEXT_BUFFERS: [[u8; 16]; 2] = [[0; 16]; 2];
+static mut TEXT_BUFFERS: [[u8; 16]; 3] = [[0; 16]; 3];
 
 /// A static text of an address, for an `Options` field that borrows its text.
 fn address_text(slot: usize, address: [u8; 4]) -> &'static str {
     use core::fmt::Write;
-    let buffers: &'static mut [[u8; 16]; 2] = unsafe { &mut *(&raw mut TEXT_BUFFERS) };
+    let buffers: &'static mut [[u8; 16]; 3] = unsafe { &mut *(&raw mut TEXT_BUFFERS) };
     let buffer: &'static mut [u8; 16] = &mut buffers[slot];
     let mut cursor = audio_wire::Cursor { bytes: &mut buffer[..], length: 0 };
     let _ = write!(cursor, "{}.{}.{}.{}", address[0], address[1], address[2], address[3]);
@@ -443,4 +443,61 @@ pub fn adopt_listener(options: &mut Options<'static>, entry: &Entry) {
             if options.opus { "Opus" } else { "PCM" }
         );
     }
+}
+
+/// A multicast group for a stream, chosen from its name: 239.192.x.y (the organisation-local scope, which routers do
+/// not forward). The same name always gives the same group; `taken` says whether another stream already uses one,
+/// and the next address is tried then.
+pub fn auto_group(name: &str, taken: impl Fn([u8; 4]) -> bool) -> [u8; 4] {
+    let hash = name.bytes().fold(0x811c_9dc5u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193));
+    let mut n = ((hash >> 16) ^ hash) as u16;
+    loop {
+        let group = [239, 192, (n >> 8) as u8, n as u8];
+        if n != 0 && !taken(group) {
+            return group;
+        }
+        n = n.wrapping_add(1);
+    }
+}
+
+/// `to=` left empty (or `auto`): the group for the stream called `name`; `group=` is used as it is when set.
+/// Otherwise listens 2 s for streams already announced so that the choice avoids their groups.
+pub fn choose_group(api: &'static TapeApi, options: &Options<'static>, transport: &mut Transport, name: &str) -> &'static str {
+    if !options.group.is_empty() {
+        println!("Sending to the multicast group {}.", options.group);
+        return options.group;
+    }
+    println!("Choosing a multicast group for '{name}' (listening 2 s for the groups in use)...");
+    let directory = listen(api, options, transport, 2, |_| false);
+    let group = auto_group(name, |group| directory.iter().any(|entry| !entry.session.receive_only && entry.session.destination == group && entry.session.name() != name));
+    println!("Sending to the multicast group {}.{}.{}.{} (receivers find it from the announcement).", group[0], group[1], group[2], group[3]);
+    address_text(2, group)
+}
+
+/// `source=auto`: the one RTP stream announced to a multicast group or to this machine. Waits up to 15 s for it.
+/// None (after saying why) when there is none yet, or several (then the sender's name must be chosen).
+pub fn find_auto(api: &'static TapeApi, options: &Options, transport: &mut Transport) -> Option<Entry> {
+    println!("Looking for an announced stream...");
+    let my_ip = transport.config.ip.0;
+    let wanted = |entry: &&Entry| !entry.session.receive_only && entry.session.l2 == 0 && (audio_wire::is_multicast_address(entry.session.destination) || entry.session.destination == my_ip);
+    let started = tape_rt::micros();
+    let directory = listen(api, options, transport, 15, |directory| {
+        let count = directory.iter().filter(wanted).count();
+        count > 1 || (count == 1 && tape_rt::micros() >= started + 2_000_000)
+    });
+    let mut found = directory.iter().filter(wanted);
+    let first = found.next().copied();
+    if found.next().is_some() {
+        print!("audio-net: several streams are announced: ");
+        for entry in directory.iter().filter(wanted) {
+            print!("'{}' ", entry.session.name());
+        }
+        println!("- choose one (Peer, or source=NAME).");
+        return None;
+    }
+    match first {
+        Some(entry) => println!("Found '{}'.", entry.session.name()),
+        None => println!("No stream announced yet; waiting for a sender."),
+    }
+    first
 }
