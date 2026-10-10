@@ -614,17 +614,17 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let mut capture = [0u8; 16384];
     let mut held = 0usize; // bytes of device-format audio waiting in `capture`
     let device_frame = device_channels * slot;
-    // The banner above took a while to print and capture has been running: audio from before now would go out as one
-    // burst that the receiver's ring cannot hold.
-    if tone.is_none() {
-        while (api.audio_read)(capture.as_mut_ptr(), capture.len()) != 0 {}
-    }
     let (mut sequence, mut timestamp, mut sent, mut phase) = (0u16, 0u32, 0u64, 0u32);
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
     let mut probe = LatencyProbe::new(options.rate, per_packet);
     if options.latency {
         println!("Latency probe: sending silence and a click every 0.5 s; the receiver's output must be cabled to input channel {} here.", selection.channels().next().unwrap_or(0) + 1);
+    }
+    // The banner and prints above took a while to print and capture has been running: audio from before now would go out as one
+    // burst that the receiver's ring cannot hold.
+    if tone.is_none() {
+        while (api.audio_read)(capture.as_mut_ptr(), capture.len()) != 0 {}
     }
     loop {
         if (api.should_abort)() != 0 {
