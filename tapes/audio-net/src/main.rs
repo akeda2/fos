@@ -599,6 +599,11 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let mut capture = [0u8; 8192];
     let mut held = 0usize; // bytes of device-format audio waiting in `capture`
     let device_frame = device_channels * slot;
+    // The banner above took a while to print and capture has been running: audio from before now would go out as one
+    // burst that the receiver's ring cannot hold.
+    if tone.is_none() {
+        while (api.audio_read)(capture.as_mut_ptr(), capture.len()) != 0 {}
+    }
     let (mut sequence, mut timestamp, mut sent, mut phase) = (0u16, 0u32, 0u64, 0u32);
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
