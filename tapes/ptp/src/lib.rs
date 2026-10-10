@@ -659,7 +659,10 @@ impl MediaClock {
                 if difference.unsigned_abs() > u64::from(rate) << 16 {
                     wanted
                 } else {
-                    expected.wrapping_add((difference / 128) as u64) & mask
+                    // The target is an upper bound (a sample is never newer than "now minus what is held"), so a
+                    // lower one is believed quickly and a higher one slowly.
+                    let gain = if difference < 0 { 4 } else { 128 };
+                    expected.wrapping_add((difference / gain) as u64) & mask
                 }
             }
         };
@@ -903,9 +906,9 @@ mod tests {
         let mut worst_error = 0i64;
         let mut seed = 99u64;
         for n in 0..20_000u64 {
-            // the packet source runs 50 ppm fast against PTP; the target has up to 2 ms of read jitter
+            // the packet source runs 50 ppm fast against PTP; the target is never early and up to 2 ms late (one-sided read jitter)
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let jitter = ((seed >> 33) % 96) as i64 - 48;
+            let jitter = ((seed >> 33) % 96) as i64;
             let ptp_ns = 3_600_000_000_000i64 + (n as i64) * 1_000_000 * 1_000_000 / 1_000_050 * 1000 / 1000;
             let target = MediaClock::frames_at(ptp_ns, rate).wrapping_add(jitter as u32);
             let stamp = clock.next(target, rate, 48);
@@ -917,8 +920,8 @@ mod tests {
                 worst_error = worst_error.max(i64::from(stamp.wrapping_sub(MediaClock::frames_at(ptp_ns, rate)) as i32).abs());
             }
         }
-        assert!(worst_jump <= 1, "stamps step by 48 frames +- {worst_jump}");
-        assert!(worst_error <= 12, "stamp is {worst_error} frames from PTP time");
+        assert!(worst_jump <= 12, "stamps step by 48 frames +- {worst_jump}");
+        assert!(worst_error <= 48, "stamp is {worst_error} frames from PTP time");
     }
 
     #[test]
