@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D] [domain=N]
-//!              [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US] [idle] [verbose]
+//!              [l2] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US] [idle] [verbose]
 //! ```
 //!
 //! `slave` (the default) listens for Announce, Sync and Follow_Up on the PTP multicast group (224.0.1.129),
@@ -18,6 +18,9 @@
 //! `master` announces itself (clock class 248, priority 128, an internal oscillator), sends two-step Syncs
 //! every `sync=` ms (default 125, the AES67 media-profile rate) and answers Delay_Req. Its time is the time
 //! since boot. Another machine can be a master too (`ptp4l -i IF -S -m` on a Linux box).
+//!
+//! `l2` speaks PTP over Ethernet instead (IEEE 1588 Annex F, `ptp4l -2`): ethertype 0x88F7 frames to
+//! 01:1B:19:00:00:00, no IP address, DHCP or IGMP, so it also works on a bare switch or a link with no router.
 //!
 //! Timestamps are taken in software: receive time when the polling loop reads the frame, transmit time just
 //! before the frame is handed to the NIC. By default the loop spins, to keep that error small; `idle` sleeps
@@ -48,16 +51,18 @@ struct Options {
     late_us: i64,
     idle: bool,
     verbose: bool,
+    l2: bool,
 }
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
-    let mut options = Options { master: false, nic: 0, ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false };
+    let mut options = Options { master: false, nic: 0, ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false };
     for word in arguments.split_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
             "slave" => options.master = false,
             "master" => options.master = true,
             "idle" => options.idle = true,
+            "l2" => options.l2 = true,
             "verbose" => options.verbose = true,
             "nic" => options.nic = value.parse::<usize>().ok().filter(|&n| n >= 1).ok_or("nic= is the NIC number, from 1")? - 1,
             "ip" => options.ip = value,
@@ -113,8 +118,32 @@ impl core::fmt::Display for Us {
     }
 }
 
+static L2: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn l2() -> bool {
+    L2.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The PTP message in a received frame, and whether it is an event message, whichever transport is in use.
+fn incoming<'a>(api: &TapeApi, nic: usize, config: &net::NetConfig, arp: &mut ArpCache<8>, frame: &'a [u8]) -> Option<(bool, &'a [u8])> {
+    if l2() {
+        return ptp_tape::l2_message(frame).map(|message| (ptp_tape::is_event(message), message));
+    }
+    match net::inbound(api, nic, config, arp, frame, EVENT_PORT..=GENERAL_PORT, 0) {
+        net::Inbound::Udp { destination_port, payload, .. } => Some((destination_port == EVENT_PORT, payload)),
+        _ => None,
+    }
+}
+
 fn send(api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16, payload: &[u8]) {
     let mut frame = [0u8; 160];
+    if l2() {
+        let length = ptp_tape::build_l2_frame(&mut frame, config.mac.0, payload);
+        if length != 0 {
+            net::send_frame(api, nic, &frame[..length]);
+        }
+        return;
+    }
     let destination = MacAddress(audio_wire::multicast_mac(GROUP));
     if let Some(length) = net::build_udp_frame(&mut frame, config, destination, Ipv4Address(GROUP), port, port, 1, payload) {
         net::send_frame(api, nic, &frame[..length]);
@@ -152,7 +181,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let mut mac = [0u8; 6];
     (api.nic_mac)(options.nic, mac.as_mut_ptr());
-    let config = if options.ip == "dhcp" {
+    L2.store(options.l2, core::sync::atomic::Ordering::Relaxed);
+    let config = if options.l2 {
+        net::NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) }
+    } else if options.ip == "dhcp" {
         println!("ptp: asking DHCP for an address on NIC {}...", options.nic + 1);
         match net::dhcp(api, options.nic, MacAddress(mac)) {
             Some(config) => config,
@@ -164,15 +196,26 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             Err(reason) => return println!("ptp: {reason}."),
         }
     };
-    println!("ptp {}: NIC {} {}.{}.{}.{}, domain {}, group 224.0.1.129. Escape stops.", if options.master { "master" } else { "slave" }, options.nic + 1, config.ip.0[0], config.ip.0[1], config.ip.0[2], config.ip.0[3], options.domain);
+    if options.l2 {
+        println!("ptp {}: NIC {}, Ethernet (0x88F7 to 01:1B:19:00:00:00), domain {}. Escape stops.", if options.master { "master" } else { "slave" }, options.nic + 1, options.domain);
+        (api.nic_set_multicast)(options.nic, 1);
+    } else {
+        println!("ptp {}: NIC {} {}.{}.{}.{}, domain {}, group 224.0.1.129. Escape stops.", if options.master { "master" } else { "slave" }, options.nic + 1, config.ip.0[0], config.ip.0[1], config.ip.0[2], config.ip.0[3], options.domain);
+    }
     let mut igmp = igmp::Igmp::new(GROUP);
-    igmp.join(api, options.nic, &config);
+    if !options.l2 {
+        igmp.join(api, options.nic, &config);
+    }
     if options.master {
         master(api, &options, &config, mac);
     } else {
         slave(api, &options, &config, mac);
     }
-    igmp.leave(api, options.nic, &config);
+    if options.l2 {
+        (api.nic_set_multicast)(options.nic, 0);
+    } else {
+        igmp.leave(api, options.nic, &config);
+    }
 }
 
 fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]) {
@@ -209,10 +252,10 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
             let t2 = now_ns();
             let late = t2 - last_empty > options.late_us * 1000;
             busy = true;
-            if igmp.handle(&frame[..length], t2 as u64 / 1000) {
+            if !l2() && igmp.handle(&frame[..length], t2 as u64 / 1000) {
                 continue;
             }
-            if let net::Inbound::Udp { payload, .. } = net::inbound(api, options.nic, config, &mut arp, &frame[..length], EVENT_PORT..=GENERAL_PORT, 0) {
+            if let Some((_, payload)) = incoming(api, options.nic, config, &mut arp, &frame[..length]) {
                 let is_sync = payload.first().is_some_and(|byte| byte & 0x0f == ptp_tape::SYNC);
                 let sample = if late && is_sync {
                     slave.discard_sync(payload);
@@ -231,7 +274,9 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
                 }
             }
         }
-        igmp.poll(api, options.nic, config, (now / 1000) as u64);
+        if !l2() {
+            igmp.poll(api, options.nic, config, (now / 1000) as u64);
+        }
         slave.tick(now);
         if slave.counters.masters != masters_seen {
             masters_seen = slave.counters.masters;
@@ -326,10 +371,10 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
             }
             let t4 = now_ns();
             busy = true;
-            if igmp.handle(&frame[..length], t4 as u64 / 1000) {
+            if !l2() && igmp.handle(&frame[..length], t4 as u64 / 1000) {
                 continue;
             }
-            if let net::Inbound::Udp { destination_port: EVENT_PORT, payload, .. } = net::inbound(api, options.nic, config, &mut arp, &frame[..length], EVENT_PORT..=GENERAL_PORT, 0) {
+            if let Some((true, payload)) = incoming(api, options.nic, config, &mut arp, &frame[..length]) {
                 if let Some(request) = Header::parse(payload).filter(|h| h.message_type == DELAY_REQ && h.domain == options.domain && h.source != identity) {
                     let mut message = [0u8; 64];
                     let length = build_delay_resp(&mut message, options.domain, identity, request.source, request.sequence, t4, 0x7f);
@@ -338,7 +383,9 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
                 }
             }
         }
-        igmp.poll(api, options.nic, config, (now / 1000) as u64);
+        if !l2() {
+            igmp.poll(api, options.nic, config, (now / 1000) as u64);
+        }
         if now >= next_announce {
             next_announce += interval_ns(0);
             announce_sequence = announce_sequence.wrapping_add(1);

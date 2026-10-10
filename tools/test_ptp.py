@@ -4,7 +4,8 @@
 The slave must find the master from its Announce, complete Sync/Follow_Up and Delay_Req/Delay_Resp
 exchanges, lose no Sync and report a small offset and a positive path delay. The frames on the wire are
 checked too: IPv4/UDP to 224.0.1.129, event messages on port 319 and general messages on 320, PTP version 2.
-Run with `make test-ptp`."""
+With `l2` the same exchange runs over Ethernet (`ptp l2`): no IP, frames of ethertype 0x88F7 to
+01:1B:19:00:00:00, event messages told by type. Run with `make test-ptp` and `make test-ptp-l2`."""
 
 import re
 import struct
@@ -35,7 +36,18 @@ def ptp_messages(frames):
     return found
 
 
+def l2_messages(frames):
+    """(is event, message type, version, length) of every ethertype 0x88F7 frame to the PTP Ethernet group."""
+    found = []
+    for _, data in frames:
+        if len(data) >= 14 + 34 and data[12:14] == b"\x88\xf7" and data[:6] == bytes([0x01, 0x1B, 0x19, 0, 0, 0]):
+            message = data[14:]
+            found.append((message[0] & 0x0F < 8, message[0] & 0x0F, message[1] & 0x0F, struct.unpack_from(">H", message, 2)[0]))
+    return found
+
+
 def main():
+    l2 = "l2" in sys.argv[1:]
     frames, stop = [], threading.Event()
     sniffer = threading.Thread(target=sniff_until, args=(stop, frames))
     sniffer.start()
@@ -46,13 +58,13 @@ def main():
             for guest in (master, slave):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            master_mark = master.send("run ptp master ip=10.7.0.1/24 secs=24")
-            master.wait_for("ptp master: NIC 1 10.7.0.1", 30, master_mark)
-            slave_mark = slave.send("run ptp ip=10.7.0.2/24 secs=14")
+            master_mark = master.send("run ptp master l2 secs=24" if l2 else "run ptp master ip=10.7.0.1/24 secs=24")
+            master.wait_for("ptp master: NIC 1, Ethernet" if l2 else "ptp master: NIC 1 10.7.0.1", 30, master_mark)
+            slave_mark = slave.send("run ptp l2 secs=14" if l2 else "run ptp ip=10.7.0.2/24 secs=14")
             slave.wait_for("ptp: waiting for an Announce", 30, slave_mark)
             slave.wait_for("ptp: master 52:54:00:ff:fe:12:35:01", 20, slave_mark)
             check(True, "the slave finds the master from its Announce")
-            slave.wait_for("ptp: offset mean", 40, slave_mark)
+            slave.wait_for("path delay", 40, slave_mark)
             text = slave.text()[slave_mark:]
             summary = re.search(r"ptp: (\d+) samples; announce (\d+) sync (\d+) follow-up (\d+) delay-resp (\d+) sync lost (\d+) late (\d+) steps (\d+)", text)
             check(summary is not None, "the slave prints a summary", text[-1200:])
@@ -81,6 +93,14 @@ def main():
             sniffer.join()
             master.stop()
             slave.stop()
+    if l2:
+        messages = l2_messages(frames)
+        kinds = {(event, kind) for event, kind, _, _ in messages}
+        check({(True, 0), (False, 8), (False, 0xB), (True, 1), (False, 9)} <= kinds, "the wire carries every message type in 0x88F7 frames", str(sorted(kinds)))
+        check(not ptp_messages(frames), "no PTP goes over UDP in l2 mode")
+        check(all(version == 2 for _, _, version, _ in messages), "every message is PTP version 2")
+        print("PASS: ptp l2")
+        return
     messages = ptp_messages(frames)
     kinds = {(port, kind) for port, kind, _, _ in messages}
     check({(319, 0), (320, 8), (320, 0xB), (319, 1), (320, 9)} <= kinds, "the wire carries Sync and Delay_Req on 319 and Follow_Up, Announce and Delay_Resp on 320", str(sorted(kinds)))

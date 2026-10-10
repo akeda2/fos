@@ -195,7 +195,7 @@ maintainer's memory notes, not in this repository.
 
 - **Tests added for hardware-shaped behaviour**: `test-usb-kbd-replug`, `test-usb-replug` (disks, hubs, the hub itself),
   `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`, `test-console-utf8`, `test-hostnames`, `test-config-fat`.
-  `make test-all` runs every `test-*` target (68 of them; none is a known failure).
+  `make test-all` runs every `test-*` target (69 of them; none is a known failure).
 - **`term net` data frames carry no length**: the kernel drops trailing zero bytes (Ethernet padding) before a tape or the shell sees
   the frame; a NUL typed on purpose is lost. A tape's single-interface network calls follow `nic use N` (ABI 4, `nic_active`).
 - **Hubs**: a hub's ports are only visible by asking the hub, so `usb rescan` is what notices a device that went away behind one;

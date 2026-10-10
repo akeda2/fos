@@ -101,7 +101,7 @@ OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-a
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-usb-audio test-hda test-audio-net test-ptp test-audio-ptp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-rtl8139
+.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-audio-ptp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -197,6 +197,10 @@ test-audio-net: image
 # ptp: a master and a slave guest; the slave must lock on, measure a small offset and lose no Sync.
 test-ptp: image
 	python3 tools/test_ptp.py
+
+# The same over Ethernet (ethertype 0x88F7), no IP.
+test-ptp-l2: image
+	python3 tools/test_ptp.py l2
 
 # audio-net on a PTP clock: master, RTP sender and receiver; stamps, SDP and the receiver's delay.
 test-audio-ptp: image

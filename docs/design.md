@@ -864,6 +864,8 @@ is a slave that only *measures* (the first sample sets the base offset; a real s
 second it prints the mean offset, spread, one-way path delay and the clock-rate difference in ppm;
 `tape run ptp master` is a small grandmaster (clock class 248, two-step Sync every `sync=` ms, 125 by default).
 The protocol and arithmetic are in `tapes/ptp/src/lib.rs` (host tests); `main.rs` uses the shared `tape-ip` crate (`net`
+
+`ptp l2` carries the same messages over Ethernet (Annex F: ethertype 0x88F7 to 01:1B:19:00:00:00, the message right after the Ethernet header, event messages told by type below 8), with no address, DHCP or IGMP, so it works on a bare switch. Framing helpers `build_l2_frame`, `l2_message`, `is_event` are host-tested; `make test-ptp-l2` checks the frames on the wire. Not yet done: audio-net following an L2 clock for raw/AVTP streams, and interop with `ptp4l -2` (gPTP/802.1AS, transportSpecific 1 with peer delay, is a separate profile).
 and `igmp`, moved out of audio-net). Timestamps are software: the receive time is read when the polling loop gets the frame (the loop
 spins), the transmit time just before the frame is handed to the NIC. A Sync read more than `late=` us after the
 last empty poll waited in the ring and is skipped. The path delay is the median of the last nine exchanges, with

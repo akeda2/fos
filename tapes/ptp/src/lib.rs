@@ -19,6 +19,35 @@ pub const GROUP: [u8; 4] = [224, 0, 1, 129];
 pub const EVENT_PORT: u16 = 319;
 pub const GENERAL_PORT: u16 = 320;
 
+/// IEEE 1588 over Ethernet (Annex F, what `ptp4l -2` speaks): the message follows the Ethernet header directly, in
+/// ethertype 0x88F7 frames to 01:1B:19:00:00:00 (every message but the peer-delay ones). No IP, no ports: a message is
+/// an event message when its type is below 8.
+pub const L2_ETHERTYPE: u16 = 0x88F7;
+pub const L2_MAC: [u8; 6] = [0x01, 0x1B, 0x19, 0x00, 0x00, 0x00];
+
+/// Writes an Ethernet frame carrying `message` from `source`; returns its length (0 if `out` is too small).
+pub fn build_l2_frame(out: &mut [u8], source: [u8; 6], message: &[u8]) -> usize {
+    let total = 14 + message.len();
+    if out.len() < total {
+        return 0;
+    }
+    out[0..6].copy_from_slice(&L2_MAC);
+    out[6..12].copy_from_slice(&source);
+    out[12..14].copy_from_slice(&L2_ETHERTYPE.to_be_bytes());
+    out[14..total].copy_from_slice(message);
+    total
+}
+
+/// The PTP message in an Ethernet frame of ethertype 0x88F7 (padding included; the header's length says where it ends).
+pub fn l2_message(frame: &[u8]) -> Option<&[u8]> {
+    (frame.len() > 14 && frame[12..14] == L2_ETHERTYPE.to_be_bytes()).then(|| &frame[14..])
+}
+
+/// Event messages (Sync, Delay_Req, ...) are timestamped; the general ones are not.
+pub fn is_event(message: &[u8]) -> bool {
+    message.first().is_some_and(|byte| byte & 0x0f < 8)
+}
+
 pub const SYNC: u8 = 0x0;
 pub const DELAY_REQ: u8 = 0x1;
 pub const FOLLOW_UP: u8 = 0x8;
@@ -922,6 +951,25 @@ mod tests {
         }
         assert!(worst_jump <= 12, "stamps step by 48 frames +- {worst_jump}");
         assert!(worst_error <= 48, "stamp is {worst_error} frames from PTP time");
+    }
+
+    #[test]
+    fn l2_frames_carry_the_message_right_after_the_ethernet_header() {
+        let mut message = [0u8; 64];
+        let length = build_sync(&mut message, 0, port_identity([2, 0, 0, 0, 0, 1], 1), 7, None, 0);
+        let mut frame = [0u8; 100];
+        let total = build_l2_frame(&mut frame, [2, 0, 0, 0, 0, 1], &message[..length]);
+        assert_eq!(total, 14 + length);
+        assert_eq!(&frame[0..6], &[0x01, 0x1B, 0x19, 0, 0, 0]);
+        assert_eq!(&frame[12..14], &[0x88, 0xF7]);
+        let found = l2_message(&frame[..total + 8]).unwrap(); // padding after the message is fine
+        assert_eq!(Header::parse(found).unwrap().sequence, 7);
+        assert!(is_event(found));
+        assert!(l2_message(&[0u8; 20]).is_none());
+        assert_eq!(build_l2_frame(&mut [0u8; 20], [0; 6], &message[..length]), 0);
+        let mut announce = [0u8; 64];
+        build_announce(&mut announce, 0, port_identity([2, 0, 0, 0, 0, 1], 1), 1, &Clock::ordinary([2, 0, 0, 0, 0, 1]), 0);
+        assert!(!is_event(&announce));
     }
 
     #[test]
