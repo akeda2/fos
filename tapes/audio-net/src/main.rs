@@ -1068,6 +1068,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let mut level = 0usize;
     let mut trimming = false;
     let (mut work_total, mut work_max, mut slow_receive, mut slow_info, mut gaps_shown) = (0u64, 0u64, 0u64, 0u64, 0u32);
+    // Ring level seen at each packet arrival (before the write), kept for the summary: min, max, and how often it held
+    // less than one packet.
+    let (mut level_min, mut level_max, mut level_short, mut level_samples) = (usize::MAX, 0usize, 0u64, 0u64);
     loop {
         if (api.should_abort)() != 0 {
             break;
@@ -1200,6 +1203,10 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             info.playback_space as usize
         }) / device_frame;
         slow_info = slow_info.max(tape_rt::micros() - t_info);
+        (level_min, level_max, level_samples) = (level_min.min(level), level_max.max(level), level_samples + 1);
+        if level < frames {
+            level_short += 1;
+        }
         // Far too full (after a stall): discard whole packets until the ring has played down to the target, rather
         // than leaving it to the servo (limited to +-2000 ppm, so tens of seconds).
         if level > fill.target() * 2 + 96 {
@@ -1289,6 +1296,10 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     println!();
     if options.verbose && packets > 0 {
         println!("Processing took {} us per packet on average, {} us at worst; nic_receive up to {slow_receive} us, audio_info up to {slow_info} us.", work_total / packets, work_max);
+    }
+    if level_samples > 0 {
+        let rate = stats::get().rate.max(1) as usize;
+        println!("Ring at arrival: {} to {} ms (target {} ms); under one packet {} of {level_samples} times.", level_min * 1000 / rate, level_max * 1000 / rate, fill.target() * 1000 / rate, level_short);
     }
     if stats::get().ptp_samples > 0 {
         let shown = stats::get();
