@@ -1071,6 +1071,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     // Ring level seen at each packet arrival (before the write), kept for the summary: min, max, and how often it held
     // less than one packet.
     let (mut level_min, mut level_max, mut level_short, mut level_samples) = (usize::MAX, 0usize, 0u64, 0u64);
+    let (mut second_low, mut second_high) = (usize::MAX, 0usize);
     loop {
         if (api.should_abort)() != 0 {
             break;
@@ -1204,6 +1205,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         }) / device_frame;
         slow_info = slow_info.max(tape_rt::micros() - t_info);
         (level_min, level_max, level_samples) = (level_min.min(level), level_max.max(level), level_samples + 1);
+        (second_low, second_high) = (second_low.min(level), second_high.max(level));
         if level < frames {
             level_short += 1;
         }
@@ -1280,6 +1282,8 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         }
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;
+            (shown.level_low, shown.level_high) = (if second_low == usize::MAX { 0 } else { second_low as u32 }, second_high as u32);
+            (second_low, second_high) = (usize::MAX, 0);
             print!(".");
             if options.verbose && (next_report - started) / 1_000_000 % 10 == 0 {
                 println!(" [{packets} packets, {lost} lost, level {level} frames (target {}), {dropped} dropped, {repeated} repeated, clock offset {} ppm]", fill.target(), servo.offset_ppm());

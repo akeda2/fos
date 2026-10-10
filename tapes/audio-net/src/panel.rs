@@ -740,8 +740,8 @@ fn panel_hook_inner() -> u32 {
         (tape_rt::api().audio_stats)(&mut device);
         let _ = write!(
             counters,
-            "Tx {} Rx {} Lost {} Ring {}/{}ms {:+}ppm UI {}/{}ms Un {} Ov {} {}:{:02}",
-            shown.sent, shown.received, shown.lost, ms(shown.level_frames, shown.rate), ms(shown.target_frames, shown.rate), shown.offset_ppm,
+            "Tx {} Rx {} Lost {} Ring {}/{} ({}-{})ms {:+}ppm UI {}/{}ms Un {} Ov {} {}:{:02}",
+            shown.sent, shown.received, shown.lost, ms(shown.level_frames, shown.rate), ms(shown.target_frames, shown.rate), ms(shown.level_low, shown.rate), ms(shown.level_high, shown.rate), shown.offset_ppm,
             run.ui_recent / 1000, run.ui_worst / 1000, device.playback_underruns.saturating_sub(shown.underrun_base), device.capture_overruns, seconds / 60, seconds % 60
         );
         if counters != run.counters {
