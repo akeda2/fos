@@ -763,6 +763,10 @@ struct LatencyProbe {
     min: u32,
     max: u32,
     missed: u32,
+    /// Every click's latency (ms x 100) and the noise threshold, kept for the summary: a print in the send loop
+    /// stalls it, the capture backlog goes out as a burst and the receiver underruns.
+    results: [u32; 64],
+    threshold: i32,
 }
 
 impl LatencyProbe {
@@ -777,7 +781,7 @@ impl LatencyProbe {
             click_packets: ms(4) as u32, // a click 4 ms long
             min_return: ms(5), // nothing comes back sooner than this: it would be noise
             give_up: ms(400),
-            sum_x100: 0, count: 0, min: u32::MAX, max: 0, missed: 0,
+            sum_x100: 0, count: 0, min: u32::MAX, max: 0, missed: 0, results: [0; 64], threshold: 0,
         }
     }
 
@@ -805,7 +809,7 @@ impl LatencyProbe {
             self.noise = self.noise.max(peak);
             if self.noise_packets == self.noise_window {
                 self.noise = (self.noise * 4).max(100);
-                println!("Noise floor on the input: peak {} (of 32768), threshold {}.", self.noise / 4, self.noise);
+                self.threshold = self.noise;
             }
         } else if let (Some(sent_at), Some(frame)) = (self.waiting.filter(|&at| number > at + self.min_return), first_loud) {
             let frames = (number - sent_at) * u64::from(self.per_packet) + frame as u64;
@@ -815,12 +819,13 @@ impl LatencyProbe {
             self.count += 1;
             self.min = self.min.min(x100);
             self.max = self.max.max(x100);
-            println!("\nLatency {}.{:02} ms", x100 / 100, x100 % 100);
+            if let Some(slot) = self.results.get_mut(self.count as usize - 1) {
+                *slot = x100;
+            }
         } else if let Some(sent_at) = self.waiting {
             if number - sent_at > self.give_up {
                 self.waiting = None;
                 self.missed += 1;
-                println!("\nNo click came back within 400 ms (level too low, or the cable is not connected).");
             }
         }
         payload.fill(0);
@@ -849,6 +854,13 @@ impl LatencyProbe {
     }
 
     fn summary(&self) {
+        println!("Noise floor on the input: peak {} (of 32768), threshold {}.", self.threshold / 4, self.threshold);
+        for x100 in self.results.iter().take(self.count as usize) {
+            println!("Latency {}.{:02} ms", x100 / 100, x100 % 100);
+        }
+        if self.missed > 0 {
+            println!("{} click(s) did not come back within 400 ms (level too low, or the cable is not connected).", self.missed);
+        }
         if self.count == 0 {
             return println!("Latency: no click came back ({} missed).", self.missed);
         }
