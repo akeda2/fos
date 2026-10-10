@@ -841,3 +841,15 @@ waits, preserve serial output on failure, wait for the prompt before typing.
 **Config files on FAT/exFAT (2026-10-09):** `hostname`, `settings`, `debug` and `start` are looked up on the boot FOSFS volume, then the other
   FOSFS volumes, and only then in the root directory of the first FAT32/exFAT disk that has the file (`config::read_fat`), so a name or a
   start script can be edited on a PC. Files over 4096 bytes are ignored. Tested by `make test-config-fat`.
+
+### audio-net priority, packet time and auto step-down
+
+`priority=safe|balanced|low|auto` (panel row "Priority") picks the receive ring and the packet time together:
+safe 12 ms / 1 ms, balanced 6 ms / 0.5 ms, low 3 ms / 0.25 ms; `target=` and `ptime=` (125 to 1000 us, PCM)
+override either. Measured on Skylake USB to laptop USB with the loopback probe (`send latency`): safe ~20 ms
+and 0 underruns, balanced ~13.5 ms and ~7, low ~10 ms and ~74 per 28 s. Use low only on a quiet, wired
+network. `auto` starts as safe, steps the receiver's ring down (12, 6, 3 ms) after 30 s without loss or
+underrun, and on the first loss steps up one level and holds 60 s. The panel redraws less often at the
+lower priorities (it stalls the stream loop), and the receive loop trims a ring that is far too full
+(`target*2+96` frames). `make test-audio-net` covers it (`priority_test`). Only real hardware can check the
+underrun counts and the loopback figures.

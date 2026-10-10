@@ -35,14 +35,19 @@ const R_IP: usize = 4;
 const R_GATEWAY: usize = 5;
 const R_PEER: usize = 6;
 const R_CODEC: usize = 7;
-const R_SEND: usize = 8;
-const R_RECEIVE: usize = 9;
-const R_NAME: usize = 10;
-const R_GROUP: usize = 11;
-const R_PORT: usize = 12;
-const R_PREBUFFER: usize = 13;
-const ROWS: usize = 14;
-const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Send channels", "Receive channels", "Name", "Multicast group", "HTTP port", "Pre-buffer"];
+const R_PRIORITY: usize = 8;
+const R_PACKET: usize = 9;
+const R_SEND: usize = 10;
+const R_RECEIVE: usize = 11;
+const R_NAME: usize = 12;
+const R_GROUP: usize = 13;
+const R_PORT: usize = 14;
+const R_PREBUFFER: usize = 15;
+const ROWS: usize = 16;
+const PRIORITIES: [&str; 4] = ["safe", "balanced", "low", "auto"];
+/// Packet time choices in microseconds; 0 = what the priority says.
+const PACKET_US: [u32; 5] = [0, 1000, 500, 250, 125];
+const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Priority", "Packet time", "Send channels", "Receive channels", "Name", "Multicast group", "HTTP port", "Pre-buffer"];
 
 #[derive(Clone, Copy)]
 struct Settings {
@@ -50,6 +55,10 @@ struct Settings {
     network: usize,
     nic: usize,
     codec: usize,
+    /// Index into `PRIORITIES`: safe, balanced, low latency, or auto (starts safe, steps down while the stream is clean).
+    priority: usize,
+    /// Index into `PACKET_US`.
+    packet: usize,
     /// Get the address from a DHCP server (the usual case) instead of the static `ip` and `gateway`.
     dhcp: bool,
     ip: Text<24>,
@@ -67,7 +76,7 @@ struct Settings {
 
 impl Settings {
     fn new() -> Settings {
-        Settings { mode: 0, network: 0, nic: 1, codec: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new(), prebuffer: Text::new() }
+        Settings { mode: 0, network: 0, nic: 1, codec: 0, priority: 0, packet: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new(), prebuffer: Text::new() }
     }
 
     /// The network needs an IP address: RTP, or the HTTP server (which has no other network).
@@ -84,6 +93,8 @@ impl Settings {
             R_SEND => self.mode != 1,
             R_RECEIVE => self.mode == 1 || self.mode == 2,
             R_PORT | R_PREBUFFER => self.mode == SERVE,
+            R_PRIORITY => self.mode != SERVE,
+            R_PACKET => self.mode != SERVE && self.mode != 1 && self.codec < 2,
             _ => true,
         }
     }
@@ -134,6 +145,12 @@ impl Settings {
                 // A name is looked up in the announcements (`source`); on a layer 2 network a typed MAC address is `from`.
                 let is_mac = !self.rtp() && crate::parse_mac(peer).is_some();
                 let _ = writeln!(out, "{} {peer}", if is_mac { "from" } else { "source" });
+            }
+        }
+        if self.mode != SERVE {
+            let _ = writeln!(out, "priority {}", PRIORITIES[self.priority]);
+            if self.packet != 0 && self.codec < 2 {
+                let _ = writeln!(out, "ptime {}", PACKET_US[self.packet]);
             }
         }
         match self.codec {
@@ -211,6 +228,8 @@ impl Settings {
                 "prebuffer" => self.prebuffer = Text::from(value),
                 "to" | "source" | "from" if value == "auto" => {}
                 "to" | "source" | "from" => self.peer = Text::from(value),
+                "priority" => self.priority = PRIORITIES.iter().position(|name| *name == value).unwrap_or(0),
+                "ptime" => self.packet = PACKET_US.iter().position(|&us| value.parse() == Ok(us)).unwrap_or(0),
                 "codec" => opus = value == "opus",
                 "bitrate" => bitrate = value.parse().unwrap_or(96),
                 "frame" => frame = value.parse().unwrap_or(20),
@@ -324,6 +343,17 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
         }
         R_CODEC => {
             let _ = write!(out, "{}", CODECS[settings.codec]);
+        }
+        R_PRIORITY => {
+            let _ = write!(out, "{}", [
+                "Safe  (12 ms ring, 1 ms packets: rides out a busy network)",
+                "Balanced  (6 ms ring, 0.5 ms packets, less screen updating)",
+                "Low latency  (3 ms ring, 0.25 ms packets; needs a quiet network)",
+                "Auto  (starts safe, steps the ring down while the stream is clean)",
+            ][settings.priority]);
+        }
+        R_PACKET => {
+            let _ = write!(out, "{}", ["By priority", "1 ms", "0.5 ms", "0.25 ms", "0.125 ms"][settings.packet]);
         }
         R_ADDRESSING => {
             let _ = write!(out, "{}", if settings.dhcp { "DHCP (the address comes from the network's DHCP server)" } else { "Static (type the address below)" });
@@ -498,6 +528,8 @@ fn cycle(settings: &mut Settings, row: usize, step: isize) {
             }
         }
         R_ADDRESSING => settings.dhcp = !settings.dhcp,
+        R_PRIORITY => settings.priority = wrap(settings.priority, PRIORITIES.len()),
+        R_PACKET => settings.packet = wrap(settings.packet, PACKET_US.len()),
         R_NETWORK => {
             settings.network = wrap(settings.network, 3);
             if !settings.rtp() && settings.codec >= 2 {
@@ -600,11 +632,16 @@ struct Run {
     cap_peak: u64,
     /// Bytes of one captured device frame (all its input channels): what turns the buffer's bytes into milliseconds.
     cap_frame: u64,
+    /// How often the screen may be drawn and the counters refreshed (microseconds): a low-latency run draws less.
+    draw_gap: u64,
+    counters_gap: u64,
+    /// Hold drawing back while the playback buffer is low (only the safe priority: the others draw rarely instead).
+    hold_back: bool,
 }
 
 const fn blank_run() -> Run {
     Run {
-        stop: false, next_draw: 0, started: 0, meters: MeterBank::new(ROW_SCALE, ROW_FIRST, PAGE_ROWS), sends: 0, next_counters: 0, ip_shown: false, serve_port: 0, mac: [0; 6], nic: 0,
+        stop: false, next_draw: 0, started: 0, meters: MeterBank::new(ROW_SCALE, ROW_FIRST, PAGE_ROWS), sends: 0, next_counters: 0, draw_gap: 25_000, counters_gap: 250_000, hold_back: true, ip_shown: false, serve_port: 0, mac: [0; 6], nic: 0,
         counters: Text::new(), message: Text::new(), actual: Text::new(), ui_worst: 0, last_draw: 0, ui_recent: 0, ui_recent_since: 0, cap_peak: 0, cap_frame: 0,
     }
 }
@@ -671,13 +708,13 @@ fn panel_hook_inner() -> u32 {
     if now < run.next_draw {
         return 0;
     }
-    run.next_draw = now + 25_000;
+    run.next_draw = now + run.draw_gap;
     // Drawing holds the stream loop up for a few milliseconds, which is only safe while the playback buffer has some to
     // spare: hold it back while the buffer is low (at most two seconds, so the screen never freezes for long).
     {
         let shown = stats::get();
         let level_ms = ms(shown.level_frames, shown.rate);
-        if shown.target_frames != 0 && level_ms < 8 && now < run.last_draw + 2_000_000 {
+        if run.hold_back && shown.target_frames != 0 && level_ms < 8 && now < run.last_draw + 2_000_000 {
             return 0;
         }
         run.last_draw = now;
@@ -686,7 +723,7 @@ fn panel_hook_inner() -> u32 {
     if stats::get().meters_on && run.meters.take_footer_dirty() {
         run.meters.draw_footer(HINT);
     } else if now >= run.next_counters {
-        run.next_counters = now + 250_000;
+        run.next_counters = now + run.counters_gap;
         if !run.ip_shown {
             if let Some(ip) = crate::current_ip() {
                 run.ip_shown = true;
@@ -812,6 +849,12 @@ fn run_stream(settings: &Settings) {
     if mode == "recv" || mode == "duplex" {
         add(ChannelSet::parse(settings.receive.as_str()), 2, false, run);
     }
+    // Drawing the screen stalls the stream loop briefly: the more latency is asked for, the less the screen is touched.
+    (run.draw_gap, run.counters_gap, run.hold_back) = match options.priority {
+        Some(crate::Priority::Balanced) => (100_000, 500_000, false),
+        Some(crate::Priority::Low) => (250_000, 1_000_000, false),
+        _ => (25_000, 250_000, true),
+    };
     stats::reset();
     at(1, 1);
     draw!("\x1b[2J");
@@ -838,8 +881,6 @@ fn run_stream(settings: &Settings) {
     // goes away. The last message line says what it is waiting for.
     loop {
         let mut run_options = options.clone();
-        // Drawing the screen stalls the stream loop briefly, so the panel plays out with a little more margin (12 ms).
-        run_options.target_ms = run_options.target_ms.max(12);
         if crate::resolve_names(shim, mode, &mut run_options) {
             run_once(shim, mode, &run_options);
         }

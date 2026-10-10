@@ -383,6 +383,7 @@ def main():
     config_test()
     peers_test()
     auto_group_test()
+    priority_test()
     panel_test()
     layer_2_names_test()
     layer_2_panel_test()
@@ -506,6 +507,40 @@ def auto_group_test():
             # needs two real machines and a cable (see docs/design.md).
             mark = a.send("run audio-net send latency src=tone=440 proto=rtp ip=192.168.60.2/24 to=239.192.9.9 secs=2")
             a.wait_for("latency needs the capture device", 60, mark)
+        finally:
+            a.stop()
+            b.stop()
+
+
+def priority_test():
+    """`priority=low` makes a sender use 0.25 ms packets (12 frames) and an explicit `ptime=` overrides the priority;
+    a receiver with `priority=auto` follows the packet size the stream arrives in and receives it; a bad value is
+    refused."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = Path(tmp) / "priority.wav"
+        a = Guest(tmp, "prio-a", "52:54:00:12:34:d1", ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=snd,path={wav}", "-device", "usb-audio,audiodev=snd"])
+        b = Guest(tmp, "prio-b", "52:54:00:12:34:d2")
+        try:
+            for guest in (a, b):
+                guest.wait_for("M3 complete")
+                guest.wait_for("fos> ")
+            mark = a.send("run audio-net recv priority=bogus")
+            a.wait_for("priority= is safe, balanced, low or auto", 30, mark)
+            a.wait_for("fos> ", 30, mark)
+            mark_b = b.send("run audio-net send proto=rtp name=lowlat ip=192.168.60.1/24 src=tone=440 priority=low secs=30")
+            b.wait_for("frames (250 us) per packet", 60, mark_b)
+            check(True, "priority=low sends 12-frame, 250 us packets", "")
+            mark = a.send("run audio-net recv source=auto ip=192.168.60.2/24 priority=auto secs=8")
+            a.wait_for("Received ", 90, mark)
+            a.wait_for("fos> ", 30, mark)
+            text = a.text()[mark:]
+            packets = int(text.split("Received ")[-1].split(" ")[0])
+            check(packets >= 500, f"a priority=auto receiver gets the small-packet stream ({packets} packets)", text[-800:])
+            b.wait_for("Sent ", 60, mark_b)
+            b.wait_for("fos> ", 30, mark_b)
+            mark_b = b.send("run audio-net send proto=rtp name=lowlat ip=192.168.60.1/24 src=tone=440 priority=low ptime=500 secs=2")
+            b.wait_for("frames (500 us) per packet", 60, mark_b)
+            check(True, "an explicit ptime= overrides the priority", "")
         finally:
             a.stop()
             b.stop()

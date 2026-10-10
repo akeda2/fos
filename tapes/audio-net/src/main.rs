@@ -69,7 +69,7 @@ mod peers;
 mod serve;
 mod opus;
 
-use audio_wire::{ChannelSet, ETHERNET_HEADER, ETHERTYPE, Fill, HEADER_LEN, Header, MAX_RAW_PAYLOAD, MAX_RTP_PAYLOAD, Resampler, Sdp, Servo, Slip, frames_per_packet, frames_to_device, pack, unpack, wire_to_frames, write_sdp};
+use audio_wire::{ChannelSet, ETHERNET_HEADER, ETHERTYPE, Fill, HEADER_LEN, Header, MAX_RAW_PAYLOAD, MAX_RTP_PAYLOAD, Resampler, Sdp, Servo, Slip, frames_to_device, pack, unpack, wire_to_frames, write_sdp};
 use net::{Inbound, NetConfig};
 use tape_net::{ArpCache, Ipv4Address, MacAddress, RtpPacket};
 use tape_rt::{AudioInfo, AudioStats, TapeApi, print, println};
@@ -77,6 +77,44 @@ use tape_rt::{AudioInfo, AudioStats, TapeApi, print, println};
 const BROADCAST: [u8; 6] = [0xff; 6];
 /// The kernel's playback PCM ring is this many bytes; its free space says how full it is.
 const RING_BYTES: usize = 1 << 20;
+
+/// What to favour: the playback ring (jitter buffer) and packet time a priority stands for. `Auto` starts as Safe at
+/// the receiver and steps the ring down while the stream stays clean (see `Adapt`); its sender uses Balanced packets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    Safe,
+    Balanced,
+    Low,
+    Auto,
+}
+
+impl Priority {
+    pub fn parse(word: &str) -> Option<Priority> {
+        match word {
+            "safe" => Some(Priority::Safe),
+            "balanced" => Some(Priority::Balanced),
+            "low" => Some(Priority::Low),
+            "auto" => Some(Priority::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn target_ms(self) -> u32 {
+        match self {
+            Priority::Safe | Priority::Auto => 12,
+            Priority::Balanced => 6,
+            Priority::Low => 3,
+        }
+    }
+
+    pub fn packet_us(self) -> u32 {
+        match self {
+            Priority::Safe => 1000,
+            Priority::Balanced | Priority::Auto => 500,
+            Priority::Low => 250,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Proto {
@@ -102,6 +140,12 @@ pub struct Options<'a> {
     bits: usize,
     tone: Option<u32>,
     target_ms: u32,
+    /// `priority=safe|balanced|low|auto`: sets `target=` and `ptime=` unless they are given.
+    priority: Option<Priority>,
+    /// Microseconds of audio per packet (the sender's choice; the receiver follows what arrives).
+    ptime_us: u32,
+    target_given: bool,
+    ptime_given: bool,
     seconds: u64,
     verbose: bool,
     /// `send latency`: send silence and a click once per 0.5 s, and time the click's return on the capture input.
@@ -164,7 +208,7 @@ pub fn nic_by_mac(mac: [u8; 6]) -> Option<usize> {
 
 pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'static str> {
     let mut options = Options {
-        proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false, latency: false,
+        proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, priority: None, ptime_us: 1000, target_given: false, ptime_given: false, seconds: 0, verbose: false, latency: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
         opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0,
     };
@@ -190,7 +234,15 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
                 None if value == "capture" => {}
                 None => return Err("src= is capture or tone=HZ"),
             },
-            "target" => options.target_ms = value.parse().map_err(|_| "target= needs milliseconds")?,
+            "target" => {
+                options.target_ms = value.parse().map_err(|_| "target= needs milliseconds")?;
+                options.target_given = true;
+            }
+            "priority" => options.priority = Some(Priority::parse(value).ok_or("priority= is safe, balanced, low or auto")?),
+            "ptime" => {
+                options.ptime_us = value.parse().ok().filter(|&us| (125..=1000).contains(&us)).ok_or("ptime= is the packet time in microseconds, 125 to 1000")?;
+                options.ptime_given = true;
+            }
             "secs" => options.seconds = value.parse().map_err(|_| "secs= needs a number")?,
             "ip" => options.ip = value,
             "gw" => options.gateway = value,
@@ -214,6 +266,14 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "verbose" => options.verbose = true,
             "latency" => options.latency = true,
             _ => return Err("unknown option"),
+        }
+    }
+    if let Some(priority) = options.priority {
+        if !options.target_given {
+            options.target_ms = priority.target_ms();
+        }
+        if !options.ptime_given {
+            options.ptime_us = priority.packet_us();
         }
     }
     Ok(options)
@@ -425,7 +485,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         Proto::Raw => MAX_RAW_PAYLOAD,
         Proto::Avtp => 1500 - audio_wire::avtp::HEADER_LEN,
     };
-    let per_packet = frames_per_packet(options.rate, channels, bits, max_payload);
+    let per_packet = audio_wire::frames_per_packet_within(options.rate, channels, bits, max_payload, options.ptime_us);
     stats::get().rate = options.rate;
     let frame_bytes = channels * bits / 8;
     let packet_us = u64::from(per_packet as u32) * 1_000_000 / u64::from(options.rate);
@@ -612,6 +672,15 @@ struct LatencyProbe {
     noise_packets: u32,
     /// Packet number at which the click went out, while waiting for it to come back.
     waiting: Option<u64>,
+    /// Packets of the click still to send after its first.
+    click_left: u32,
+    /// Packet counts for the time limits below, whatever the packet time.
+    noise_window: u32,
+    warm_up: u64,
+    period: u64,
+    click_packets: u32,
+    min_return: u64,
+    give_up: u64,
     sum_x100: u64,
     count: u32,
     min: u32,
@@ -620,13 +689,19 @@ struct LatencyProbe {
 }
 
 impl LatencyProbe {
-    const PERIOD: u64 = 500; // packets (about) between clicks
-    const NOISE_PACKETS: u32 = 300;
-    /// No click before this packet: the receiver needs a moment to lock on and fill its ring.
-    const WARM_UP: u64 = 3000;
-
     fn new(rate: u32, per_packet: usize) -> Self {
-        Self { rate, per_packet: per_packet as u32, noise: 0, noise_packets: 0, waiting: None, sum_x100: 0, count: 0, min: u32::MAX, max: 0, missed: 0 }
+        let per_second = u64::from(rate) / per_packet.max(1) as u64;
+        let ms = |ms: u64| (per_second * ms / 1000).max(1);
+        Self {
+            rate, per_packet: per_packet as u32, noise: 0, noise_packets: 0, waiting: None, click_left: 0,
+            noise_window: ms(300) as u32, // listen to the input first
+            warm_up: ms(3000), // no click before the receiver has locked on and filled its ring
+            period: ms(500),
+            click_packets: ms(4) as u32, // a click 4 ms long
+            min_return: ms(5), // nothing comes back sooner than this: it would be noise
+            give_up: ms(400),
+            sum_x100: 0, count: 0, min: u32::MAX, max: 0, missed: 0,
+        }
     }
 
     fn sample(payload: &[u8], bits: usize, index: usize) -> i32 {
@@ -643,19 +718,19 @@ impl LatencyProbe {
             for channel in 0..channels {
                 let level = Self::sample(payload, bits, frame * channels + channel).abs();
                 peak = peak.max(level);
-                if first_loud.is_none() && self.noise_packets >= Self::NOISE_PACKETS && level > self.noise {
+                if first_loud.is_none() && self.noise_packets >= self.noise_window && level > self.noise {
                     first_loud = Some(frame);
                 }
             }
         }
-        if self.noise_packets < Self::NOISE_PACKETS {
+        if self.noise_packets < self.noise_window {
             self.noise_packets += 1;
             self.noise = self.noise.max(peak);
-            if self.noise_packets == Self::NOISE_PACKETS {
+            if self.noise_packets == self.noise_window {
                 self.noise = (self.noise * 4).max(100);
                 println!("Noise floor on the input: peak {} (of 32768), threshold {}.", self.noise / 4, self.noise);
             }
-        } else if let (Some(sent_at), Some(frame)) = (self.waiting.filter(|&at| number > at + 4), first_loud) {
+        } else if let (Some(sent_at), Some(frame)) = (self.waiting.filter(|&at| number > at + self.min_return), first_loud) {
             let frames = (number - sent_at) * u64::from(self.per_packet) + frame as u64;
             let x100 = (frames * 100_000 / u64::from(self.rate)) as u32; // ms, two decimals
             self.waiting = None;
@@ -665,15 +740,19 @@ impl LatencyProbe {
             self.max = self.max.max(x100);
             println!("\nLatency {}.{:02} ms", x100 / 100, x100 % 100);
         } else if let Some(sent_at) = self.waiting {
-            if number - sent_at > 400 {
+            if number - sent_at > self.give_up {
                 self.waiting = None;
                 self.missed += 1;
                 println!("\nNo click came back within 400 ms (level too low, or the cable is not connected).");
             }
         }
         payload.fill(0);
-        if self.noise_packets >= Self::NOISE_PACKETS && self.waiting.is_none() && number >= Self::WARM_UP && number % Self::PERIOD == 0 {
+        if self.noise_packets >= self.noise_window && self.waiting.is_none() && self.click_left == 0 && number >= self.warm_up && number % self.period == 0 {
             self.waiting = Some(number);
+            self.click_left = self.click_packets;
+        }
+        if self.click_left > 0 {
+            self.click_left -= 1;
             self.fill_click(payload, channels, bits);
         }
     }
@@ -681,7 +760,7 @@ impl LatencyProbe {
     fn fill_click(&self, payload: &mut [u8], channels: usize, bits: usize) {
         let frames = payload.len() / (channels * bits / 8);
         for frame in 0..frames {
-            // A 1 kHz square wave at about 70 % of full scale, one packet long.
+            // A 1 kHz square wave at about 70 % of full scale.
             let high = (frame * 2000 / self.rate as usize) % 2 == 0;
             let bytes = (if high { 23_000i16 } else { -23_000 }).to_be_bytes();
             for channel in 0..channels {
@@ -698,6 +777,44 @@ impl LatencyProbe {
         }
         let average = (self.sum_x100 / u64::from(self.count)) as u32;
         println!("Latency over {} clicks: min {}.{:02} ms, average {}.{:02} ms, max {}.{:02} ms ({} missed).", self.count, self.min / 100, self.min % 100, average / 100, average % 100, self.max / 100, self.max % 100, self.missed);
+    }
+}
+
+/// `priority=auto`: the receiver's ring target steps down (12, 6, 3 ms) after 30 s with no lost packet and no
+/// underrun, and back up one step at the first of either, holding at that step for a minute. Only the receiver's
+/// jitter buffer is adapted: the sender's packet time is its own choice.
+struct Adapt {
+    step: usize,
+    clean_since: u64,
+    hold_until: u64,
+    lost_mark: u64,
+    underrun_mark: u64,
+}
+
+impl Adapt {
+    const TARGETS_MS: [u32; 3] = [12, 6, 3];
+    const CLEAN_US: u64 = 30_000_000;
+    const HOLD_US: u64 = 60_000_000;
+
+    fn new(now: u64, lost: u64, underruns: u64) -> Adapt {
+        Adapt { step: 0, clean_since: now, hold_until: 0, lost_mark: lost, underrun_mark: underruns }
+    }
+
+    /// Looks at the counters; returns a new target in ms when it should change.
+    fn poll(&mut self, now: u64, lost: u64, underruns: u64) -> Option<u32> {
+        if lost > self.lost_mark || underruns > self.underrun_mark {
+            (self.lost_mark, self.underrun_mark, self.clean_since) = (lost, underruns, now);
+            if self.step > 0 {
+                self.step -= 1;
+                self.hold_until = now + Self::HOLD_US;
+                return Some(Self::TARGETS_MS[self.step]);
+            }
+        } else if self.step + 1 < Self::TARGETS_MS.len() && now >= self.clean_since + Self::CLEAN_US && now >= self.hold_until {
+            self.step += 1;
+            self.clean_since = now;
+            return Some(Self::TARGETS_MS[self.step]);
+        }
+        None
     }
 }
 
@@ -845,6 +962,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let (mut packets, mut lost, mut dropped, mut repeated, mut foreign) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut fill = Fill::new(0);
     let mut servo = Servo::new(0);
+    let mut adapt: Option<Adapt> = None;
     let mut resampler = Resampler::new(2);
     let mut work = [0i32; 4096];
     let mut resampled = [0i32; 4096];
@@ -923,6 +1041,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                     (api.audio_stats)(&mut device);
                     stats::get().underrun_base = device.playback_underruns;
                 }
+                if options.priority == Some(Priority::Auto) {
+                    adapt = Some(Adapt::new(tape_rt::micros(), lost, stats::get().underrun_last.max(stats::get().underrun_base)));
+                }
                 let id = packet.source;
                 stats::set_receive(format_args!("PCM {}-bit, {} ch{}", packet.bits, packet.channels, if options.adopted_receive { " (peer's choice)" } else { "" }));
                 if options.proto == Proto::Rtp {
@@ -973,7 +1094,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         slow_info = slow_info.max(tape_rt::micros() - t_info);
         // Far too full (after a stall): discard whole packets until the ring has played down to the target, rather
         // than leaving it to the servo (limited to +-2000 ppm, so tens of seconds).
-        if level > fill.target() * 4 + 64 {
+        if level > fill.target() * 2 + 96 {
             trimming = true;
         } else if level <= fill.target() {
             trimming = false;
@@ -1033,6 +1154,14 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             let mut device = AudioStats::default();
             (api.audio_stats)(&mut device);
             shown.underrun_last = device.playback_underruns;
+        }
+        if let Some(adapt) = adapt.as_mut() {
+            if let Some(target_ms) = adapt.poll(tape_rt::micros(), lost, shown.underrun_last) {
+                let frames = (packet.rate as usize * target_ms as usize / 1000).max(1);
+                fill.set_target(frames);
+                servo.set_target(frames);
+                println!("\nauto: ring target {target_ms} ms ({}).", if target_ms < shown.target_frames * 1000 / packet.rate.max(1) { "30 s without loss" } else { "a loss or underrun" });
+            }
         }
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;

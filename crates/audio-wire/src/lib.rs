@@ -138,6 +138,13 @@ pub fn frames_per_packet(rate: u32, channels: usize, bits: usize, max_payload: u
     1
 }
 
+/// Like `frames_per_packet`, but no longer than `packet_us` microseconds (at least one frame): a shorter packet
+/// time trades network and CPU load for latency.
+pub fn frames_per_packet_within(rate: u32, channels: usize, bits: usize, max_payload: usize, packet_us: u32) -> usize {
+    let limit = (u64::from(rate) * u64::from(packet_us) / 1_000_000).max(1) as usize;
+    frames_per_packet(rate, channels, bits, max_payload).min(limit)
+}
+
 /// Reads one sample from a device-format slot (little-endian, signed, left-justified in its bytes) as a
 /// 32-bit value with the sample in the top bits.
 pub fn device_sample(slot: &[u8]) -> i32 {
@@ -217,6 +224,11 @@ impl Fill {
 
     pub fn target(&self) -> usize {
         self.target_frames
+    }
+
+    /// A new target while running (the adaptive receiver moves it).
+    pub fn set_target(&mut self, target_frames: usize) {
+        *self = Fill::new(target_frames);
     }
 
     pub fn advise(&self, level_frames: usize) -> Slip {
@@ -347,6 +359,11 @@ impl Servo {
 
     pub fn target(&self) -> usize {
         self.target_frames as usize
+    }
+
+    /// A new target while running; the learned clock offset is kept.
+    pub fn set_target(&mut self, target_frames: usize) {
+        self.target_frames = target_frames as i32;
     }
 
     /// One update: the ring `level` in frames, after `frames` input frames at `rate` Hz. Returns the new step.
@@ -877,6 +894,29 @@ pub fn is_multicast_address(address: [u8; 4]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packet_time_caps_the_frame_count() {
+        use super::*;
+        assert_eq!(frames_per_packet_within(48_000, 2, 24, 1400, 1000), 48);
+        assert_eq!(frames_per_packet_within(48_000, 2, 24, 1400, 250), 12);
+        assert_eq!(frames_per_packet_within(48_000, 2, 24, 1400, 125), 6);
+        assert_eq!(frames_per_packet_within(48_000, 32, 24, 1400, 1000), 12); // the payload limit still applies
+    }
+
+    #[test]
+    fn servo_and_fill_take_a_new_target() {
+        use super::*;
+        let mut servo = Servo::new(576);
+        servo.update(600, 48, 48_000);
+        let learned = servo.offset_ppm();
+        servo.set_target(144);
+        assert_eq!(servo.target(), 144);
+        assert_eq!(servo.offset_ppm(), learned);
+        let mut fill = Fill::new(576);
+        fill.set_target(144);
+        assert_eq!(fill.target(), 144);
+    }
+
     use super::*;
 
     #[test]
