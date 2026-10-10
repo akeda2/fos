@@ -118,6 +118,11 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
     let (mut bytes_total, mut encode_total, mut encode_max) = (0u64, 0u64, 0u64);
+    // The prints above took a while and capture has been running: audio from before now would go out as one burst.
+    if options.tone.is_none() {
+        while (api.audio_read)(capture.as_mut_ptr(), capture.len()) != 0 {}
+        held = 0;
+    }
     loop {
         if (api.should_abort)() != 0 || (options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000) {
             break;

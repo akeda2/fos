@@ -521,6 +521,11 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
     server.history.keep = ((u64::from(options.prebuffer_ms) * 1000).div_ceil(frame_us) as usize).min(40);
     let started = tape_rt::micros();
     crate::stats::get().rate = RATE;
+    // The prints above took a while and capture has been running: audio from before now would go out as one burst.
+    if options.tone.is_none() {
+        while (api.audio_read)(capture.as_mut_ptr(), capture.len()) != 0 {}
+        held = 0;
+    }
     loop {
         if (api.should_abort)() != 0 || (options.seconds != 0 && tape_rt::micros() >= started + options.seconds * 1_000_000) {
             break;
