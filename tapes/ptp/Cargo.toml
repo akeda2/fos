@@ -1,0 +1,24 @@
+[package]
+name = "ptp-tape"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ptp_tape"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ptp"
+path = "src/main.rs"
+
+[dependencies]
+tape-rt = { path = "../../crates/tape-rt" }
+tape-net = { path = "../../crates/tape-net" }
+audio-wire = { path = "../../crates/audio-wire" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = "symbols"

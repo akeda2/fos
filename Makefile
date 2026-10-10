@@ -84,7 +84,7 @@ LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
 IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net
+TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 TAPE_FILES := $(foreach tape,$(TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape)) --file debug=tools/default-debug.txt
 
@@ -101,7 +101,7 @@ OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-a
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-usb-audio test-hda test-audio-net test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-rtl8139
+.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-usb-audio test-hda test-audio-net test-ptp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -141,7 +141,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml
-	for tape in router nettest ed ip-chat telnet; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
+	for tape in router nettest ed ip-chat telnet ptp; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
 
 # Deliberate-fault kernels (one Cargo feature each): checks the exception reports,
@@ -193,6 +193,10 @@ test-hda: image
 # audio-net: a tone sent over raw Ethernet between two guests and recorded from the receiver's usb-audio.
 test-audio-net: image
 	python3 tools/test_audio_net.py
+
+# ptp: a master and a slave guest; the slave must lock on, measure a small offset and lose no Sync.
+test-ptp: image
+	python3 tools/test_ptp.py
 
 # audio-net serve: Ogg Opus over HTTP from a guest, fetched from the host and decoded with ffmpeg.
 test-audio-serve: image

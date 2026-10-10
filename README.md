@@ -48,6 +48,7 @@ their own.
 | `hello`, `calc`, `memtest` | The smallest example; an RPN calculator; a RAM tester and soak test. |
 | `ed` | A line editor with cursor keys; saves to FOSFS, FAT32 or exFAT. |
 | `net-chat`, `ip-chat`, `telnet` | Raw-Ethernet chat, IPv4/UDP chat, a Telnet client. |
+| `ptp` | PTPv2 (IEEE 1588, the clock AES67 uses) over UDP: `tape run ptp [master]`. As a slave it measures this machine's clock offset, path delay and rate against a master; so far it steers nothing. |
 | `router`, `bridge`, `nettest` | A layer-3 router (NAT, DHCP, health-checked uplinks), a layer-2 learning bridge, a link-impairment and traffic generator. |
 | `play`, `record`, `recorder`, `audio-net` | WAV playback and recording, a field recorder, audio streaming between hosts (raw Ethernet or RTP, Opus). |
 

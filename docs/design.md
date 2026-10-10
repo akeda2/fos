@@ -853,3 +853,21 @@ underrun, and on the first loss steps up one level and holds 60 s. The panel red
 lower priorities (it stalls the stream loop), and the receive loop trims a ring that is far too full
 (`target*2+96` frames). `make test-audio-net` covers it (`priority_test`). Only real hardware can check the
 underrun counts and the loopback figures.
+
+### ptp (PTPv2 measurement, first step towards AES67 clocking)
+
+`tapes/ptp` speaks PTPv2 (IEEE 1588-2008) over UDP/IPv4 on 224.0.1.129 (event 319, general 320): Announce, two-step
+and one-step Sync, Delay_Req/Delay_Resp (end-to-end), correction fields, best-master comparison. `tape run ptp`
+is a slave that only *measures* (the first sample sets the base offset; a real slave would step there): per
+second it prints the mean offset, spread, one-way path delay and the clock-rate difference in ppm;
+`tape run ptp master` is a small grandmaster (clock class 248, two-step Sync every `sync=` ms, 125 by default).
+The protocol and arithmetic are in `tapes/ptp/src/lib.rs` (host tests); `main.rs` reuses audio-net's `net.rs`
+and `igmp.rs`. Timestamps are software: the receive time is read when the polling loop gets the frame (the loop
+spins), the transmit time just before the frame is handed to the NIC. A Sync read more than `late=` us after the
+last empty poll waited in the ring and is skipped. The path delay is the median of the last nine exchanges, with
+faster requests while it warms up.
+Measured (skylake3 master, wired gigabit): amd1 path delay ~28 us, jitter ~3 us (mean of the per-second sd), rate
+-5.5 ppm; laptop1 ~41 us, jitter ~20 us, rate -69 ppm. The QEMU guests do not share a time base, so `make test-ptp`
+checks the protocol (lock, no lost Sync, wire format), not the offset. Only real hardware, and `ptp4l` as the
+other end, can check interoperability; the I219 on the dev machine has hardware timestamping, the fos NICs do not
+use it. Next: audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline and a one-way delay readout.
