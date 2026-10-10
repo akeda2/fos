@@ -363,3 +363,39 @@ What is left, roughly by value:
   bring-up, could be trimmed.
 - **Housekeeping for the maintainer**: the old `v2/` build directory (1 GB, untracked), the merged branches on GitHub
   (`hub-replug`, `kbd-replug`, `rtl8168-retry`, `videomodes`, `legacy` stays), and the two `.claude/worktrees/` agent checkouts.
+
+## Open after the 2026-10-10 session (PTP in audio-net, latency presets)
+
+Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l too), PTP in `audio-net` (RTP stamps, SDP
+`ts-refclk`, receiver delay readout), `priority=live|wifi`, the capture-backlog burst at sender start. Open, roughly by value:
+
+- **Stress the `wifi` preset with the `nettest` tape** (delay, jitter, loss between sender and receiver). The machines are not set
+  up for it right now. `wifi` stands for any link with a bad hop in it, not for Wi-Fi support (fos has none). Check that 40 ms / 2 ms
+  rides out the jitter, whether `priority=auto` should be able to step *up* to it, and what the ring needs at 5% loss.
+- **Panel**: a `ptp` setting row (`auto|off`) and the matching `cfg` words; today only the readout is there.
+- **PTP elsewhere**: Opus, `serve`, raw and AVTP have no PTP (L2 PTP, ethertype 0x88f7, is not implemented); there is no master
+  inside `audio-net` (use the `ptp` tape, ptp4l or a studio clock); no hardware timestamping on the e1000 family.
+- **Understand laptop1**: -69 ppm against PTP and ~20 us jitter, unexplained; the HDA clock and underrun investigation.
+- **`send latency` oddities**: a few underruns, ~500 discarded frames and an ~11 ms first-packet outlier appear only in latency mode
+  (the probe's click path); two clicks missed per 12 s run; `target=12` gave a gap twice as big as `target=3` and `6`.
+- **Unmeasured**: the sender's USB capture latency (PTP stamps are "capture as fos sees it"); the split of the ~5 ms of USB
+  interface overhead after the 3 ms playback window (the window itself is confirmed: 3 ms to 1 ms took 2 ms off the loopback);
+  CPU load at `ptime=125` (8000 packets/s) on slow machines.
+- **Tests**: `test-audio-net`'s duplex pitch check (`A played the other's tone`) misses under load (767-880 Hz); a real
+  panel-floor test on hardware; a full `make test-all` after this session.
+- **From before**: the remaining items of the 2026-10-09 list above.
+
+### What this session learned that other tapes can use
+
+- **Recorder (and anything that captures)**: capture runs from `audio_start`, so anything printed or computed before the first read
+  turns into a backlog; drain it before the first packet or frame (audio-net did, and the receiver stopped discarding ~50 packets).
+  A recorder that starts "now" should do the same, or say how much it kept.
+- **Recorder**: stamp takes with PTP time (`clock.rs`, `ptp-tape`): a start time on the PTP timeline lets recordings made on several
+  machines be aligned afterwards (a BWF time reference, or a line in the take's name or sidecar). The capture-age estimate (now minus
+  frames held) is the same as the sender's.
+- **Any timestamp taken in software has one-sided noise** (it is only ever late): trust the early samples more (`Tracker`, the
+  `MediaClock` phase filter at gain 1/4 down and 1/128 up) instead of averaging. This also fits `ping`-style RTT and clock checks.
+- **Tapes that share `net.rs`/`igmp.rs`** (`ptp` includes them by path): a second multicast group needs its own `Igmp` and a
+  leave that does not close the NIC filter (`Igmp::leave_report`).
+- **Presets beat knobs**: `priority=` turns ring, packet time, screen update rate and step-down into one word; a recorder could
+  offer the same for ring size and write-behind (safe, balanced, live).
