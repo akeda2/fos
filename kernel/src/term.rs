@@ -339,7 +339,11 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
             unsafe { *core::ptr::addr_of_mut!(PEER) = None };
             crate::println!("Remote terminal disconnected.");
             if unsafe { TAPE_MODE } {
-                tape_input_push(TAPE_ABORT);
+                // Only the client that started the tape takes it down with it; a tape from the start file or the
+                // local keyboard (`ptp master`) must outlive someone looking in over `term net`.
+                if unsafe { *core::ptr::addr_of!(TAPE_OWNER) } == Some(source) {
+                    tape_input_push(TAPE_ABORT);
+                }
             } else if unsafe { BLOCKING } {
                 // A command that runs until Escape (nic sniff...) has nobody left to stop it: end it as Escape would, so the
                 // machine is not stuck in it with a client that is gone for good.
@@ -810,6 +814,8 @@ pub fn housekeeping() {
 const TAPE_ABORT: u16 = 0x100;
 const TAPE_INPUT_CAPACITY: usize = 256;
 static mut TAPE_MODE: bool = false;
+/// The `term net` client that was connected when the running tape started; None for a tape of the start file or the keyboard.
+static mut TAPE_OWNER: Option<[u8; 6]> = None;
 static mut TAPE_INPUT: [u16; TAPE_INPUT_CAPACITY] = [0; TAPE_INPUT_CAPACITY];
 static mut TAPE_INPUT_HEAD: usize = 0;
 static mut TAPE_INPUT_TAIL: usize = 0;
@@ -828,6 +834,7 @@ fn tape_input_push(value: u16) {
 pub fn set_tape_mode(on: bool) {
     unsafe {
         TAPE_MODE = on;
+        *core::ptr::addr_of_mut!(TAPE_OWNER) = if on { *core::ptr::addr_of!(PEER) } else { None };
         TAPE_INPUT_HEAD = 0;
         TAPE_INPUT_TAIL = 0;
     }

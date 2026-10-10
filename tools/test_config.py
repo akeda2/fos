@@ -33,7 +33,10 @@ def run(files, wait_for, extra_after=None, no_reboot=True, seconds=90, times=1):
         arguments = []
         for name, content in files.items():
             path = Path(tmp) / f"file-{name}"
-            path.write_text(content)
+            if isinstance(content, Path):
+                path = content  # a binary such as a tape, used as it is
+            else:
+                path.write_text(content)
             arguments += ["--file", f"{name}={path}"]
         image = Path(tmp) / "image.img"
         subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(KERNEL),
@@ -103,6 +106,21 @@ def main():
     text = run({"settings": "deny-term-net\n"}, "M3 complete", denied)
     check("deny-term-net" in text and outcome["reply"] == b"fos-123479", "deny-term-net: discovery still answers", text)
     check(not outcome["data"] and "Remote terminal connected" not in text, "deny-term-net: a HELLO gets no session", text)
+
+    ptp_tape = ROOT / "build/cargo-target/x86_64-fos-tape/release/ptp"
+    visitor = {}
+
+    def look_in(wire, text):
+        guest = discover(wire)[0]
+        wire.send(guest, TAG_HELLO)
+        time.sleep(1.0)
+        wire.send(guest, 0x22)  # TERM_TAG_BYE: the visitor leaves again
+        time.sleep(2.0)
+        visitor["guest"] = guest
+
+    text = run({"start": "run ptp master ip=10.7.0.9/24\n", "ptp": ptp_tape}, "ptp master: NIC 1", look_in)
+    check(visitor.get("guest") and "Remote terminal disconnected." in text, "a term net visitor came and went", text)
+    check("syncs sent" not in text, "a tape started by the start file survives a visitor leaving", text)
 
     text = run({"debug": "reboot-on-crash\nreboot-delay 1\ncrash-on-boot\n"}, "resetting in 1 s", no_reboot=False, times=2)
     check("CPU EXCEPTION: #UD invalid opcode" in text, "crash-on-boot raises a real exception at boot", text)

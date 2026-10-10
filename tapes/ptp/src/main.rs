@@ -28,7 +28,7 @@
 //! (a PTP master that stepped would unlock its slaves); restart it to resync, an oscillator drifts a few seconds a day.
 //! With `l2` the NTP exchange still needs an IP address (`ip=`), used for that one exchange.
 //!
-//! `settime` (slave): once locked (8 samples) to a master that has real time, set this machine's clock and RTC from it, once.
+//! `settime` (slave): once locked (8 samples) to a master that has real time, set this machine's clock and RTC from it, then the tape ends.
 //! The RTC holds local time, so say the zone with `tz=` (hours east of UTC: `+2`, `-5`, `+5:30`; default 0, which is UTC).
 //!
 //! Timestamps are taken in software: receive time when the polling loop reads the frame, transmit time just
@@ -67,7 +67,7 @@ struct Options {
 }
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
-    let mut options = Options { master: false, nic: 0, ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, ntp: "", settime: false, zone_minutes: 0 };
+    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, ntp: "", settime: false, zone_minutes: 0 };
     for word in arguments.split_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
@@ -314,7 +314,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     println!("ptp: waiting for an Announce...");
     loop {
         let now = now_ns();
-        if (api.should_abort)() != 0 || (options.seconds != 0 && now - start >= i64::from(options.seconds) * 1_000_000_000) {
+        if (api.should_abort)() != 0 || (options.settime && time_set) || (options.seconds != 0 && now - start >= i64::from(options.seconds) * 1_000_000_000) {
             break;
         }
         let mut busy = false;

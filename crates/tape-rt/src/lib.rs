@@ -472,6 +472,12 @@ pub fn wall_clock() -> Option<WallClock> {
     ((table.wall_clock)(&mut now) != 0).then_some(now)
 }
 
+/// The zero-based interface chosen with `nic use N` (0 on a kernel older than ABI 4).
+pub fn active_nic() -> usize {
+    let table = api();
+    if table.version >= 4 && (table.size as usize) >= core::mem::size_of::<TapeApi>() { (table.nic_active)() as usize } else { 0 }
+}
+
 /// Sets the machine's clock and RTC to `time` (local time). False if the kernel is older than ABI 6 or the date is not valid.
 pub fn set_wall_clock(time: &WallClock) -> bool {
     let table = api();

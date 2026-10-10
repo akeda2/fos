@@ -410,11 +410,12 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         println!("debug: crash-on-boot is set; faulting now.");
         unsafe { core::arch::asm!("ud2") };
     }
-    config::run_start(term::run_line);
-
-    // The milestone: from here the machine can be used (locally or over the network).
+    // The milestone: from here the machine can be used (locally or over the network). It comes before the start
+    // script, because a script may end in a command that never returns (`run ptp master`); a pushed kernel
+    // must not stay unconfirmed, or the next boot would fall back to the old slot.
     debug::confirm_boot(config::debug().watchdog_seconds);
     println!("Fosfor OS kernel: M3 complete. Waiting for a term net client.");
+    config::run_start(term::run_line);
     term::start_local();
     loop {
         debug::pet();
