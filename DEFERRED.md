@@ -376,8 +376,8 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - **PTP elsewhere**: Opus, `serve`, raw and AVTP have no PTP (L2 PTP, ethertype 0x88f7, is not implemented); there is no master
   inside `audio-net` (use the `ptp` tape, ptp4l or a studio clock); no hardware timestamping on the e1000 family.
 - **Understand laptop1**: -69 ppm against PTP and ~20 us jitter, unexplained; the HDA clock and underrun investigation.
-- **`send latency` oddities**: a few underruns, ~500 discarded frames and an ~11 ms first-packet outlier appear only in latency mode
-  (the probe's click path); two clicks missed per 12 s run; `target=12` gave a gap twice as big as `target=3` and `6`.
+- **`send latency` oddities** (underruns, ~500 discarded frames and the first-packet outlier were print stalls, fixed; the rest
+  stands): two clicks missed per 12 s run; `target=12` gave a gap twice as big as `target=3` and `6`.
 - **Unmeasured**: the sender's USB capture latency (PTP stamps are "capture as fos sees it"); the split of the ~5 ms of USB
   interface overhead after the 3 ms playback window (the window itself is confirmed: 3 ms to 1 ms took 2 ms off the loopback);
   CPU load at `ptime=125` (8000 packets/s) on slow machines.

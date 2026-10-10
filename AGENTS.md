@@ -219,5 +219,9 @@ maintainer's memory notes, not in this repository.
 - Lower-case names throughout (FOSFS entries, files, tape names).
 - Docs that move with code: README's tape table, `docs/design.md` (a
   paragraph per feature, milestone status), this file's pointers.
+- **Never print between `audio_start` and the send loop, or inside it.** A console line costs ~10 ms on real hardware; the capture
+  backlog then goes out as a burst (underruns, discarded frames, a bogus clock offset). Drain it (`audio_read` until 0) right
+  before the loop, after the last print, and collect results to print at the end (`LatencyProbe::summary`). Fixed in audio-net
+  raw/AVTP/RTP, Opus send and `serve`.
 - Commit messages say what was verified and what only real hardware can verify. Do not
   commit or push unless asked.
