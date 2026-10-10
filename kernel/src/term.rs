@@ -11,7 +11,7 @@
 //! session is open; it is flushed to the wire in 1 KiB DATA frames.
 
 use crate::nic::Nic;
-use crate::{apic, cpu, memory, pci, power};
+use crate::{apic, memory, pci, power};
 
 const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
@@ -2183,7 +2183,7 @@ fn copy_between(source: &str, name: &str, destination: &str, new_name: &str) {
     if source_fat.is_some() || destination_fat.is_some() {
         return copy_with_fat(source, name, destination, new_name, source_fat, destination_fat);
     }
-    let mut resolve = |word: &str| match volume_word(word) {
+    let resolve = |word: &str| match volume_word(word) {
         Some(Ok(found)) => Some(found),
         Some(Err(String8Error::NoLabel)) => {
             crate::println!("copy: no volume carries the label in {word}.");

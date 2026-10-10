@@ -17,6 +17,7 @@ use crate::{memory, paging, pci};
 pub const VENDOR_INTEL: u16 = 0x8086;
 /// The classic family: 0x100e is the 82540EM (QEMU's `e1000`); 0x100f and 0x1004 are the
 /// same programming model.
+#[allow(dead_code)] // documents the family; probing matches by device id elsewhere
 const CLASSIC_IDS: &[u16] = &[0x100e, 0x100f, 0x1004];
 /// The "e1000e" family: 0x10d3 is the 82574L (QEMU's `e1000e`), 0x1503 the 82579V (a real
 /// ITX board), 0x15b7 an I219-LM (a Skylake PCH: confirmed on real hardware by v1, which
@@ -97,27 +98,43 @@ fn regs_of(variant: Variant) -> &'static Regs {
 }
 
 const REG_CTRL: usize = 0x0000;
+#[allow(dead_code)]
 const REG_ICR: usize = 0x00c0;
+#[allow(dead_code)]
 const REG_ITR: usize = 0x00c4;
+#[allow(dead_code)]
 const REG_ICS: usize = 0x00c8;
+#[allow(dead_code)]
 const REG_IMS: usize = 0x00d0;
+#[allow(dead_code)]
 const REG_IMC: usize = 0x00d8;
 const REG_EECD: usize = 0x0010;
 const REG_EXTCNF_CTRL: usize = 0x0f00;
+#[allow(dead_code)]
 const REG_TXDCTL0: usize = 0x3828;
 const REG_IVAR: usize = 0x00e4;
 const REG_RCTL: usize = 0x0100;
 const REG_TCTL: usize = 0x0400;
 const REG_TIPG: usize = 0x0410;
+#[allow(dead_code)]
 const REG_RDBAL: usize = 0x2800;
+#[allow(dead_code)]
 const REG_RDBAH: usize = 0x2804;
+#[allow(dead_code)]
 const REG_RDLEN: usize = 0x2808;
+#[allow(dead_code)]
 const REG_RDH: usize = 0x2810;
+#[allow(dead_code)]
 const REG_RDT: usize = 0x2818;
+#[allow(dead_code)]
 const REG_TDBAL: usize = 0x3800;
+#[allow(dead_code)]
 const REG_TDBAH: usize = 0x3804;
+#[allow(dead_code)]
 const REG_TDLEN: usize = 0x3808;
+#[allow(dead_code)]
 const REG_TDH: usize = 0x3810;
+#[allow(dead_code)]
 const REG_TDT: usize = 0x3818;
 const REG_RAL0: usize = 0x5400;
 const REG_RAH0: usize = 0x5404;

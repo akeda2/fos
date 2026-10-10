@@ -82,6 +82,7 @@ const OFFSET_BOUNCE: usize = 0xc00;
 const MAX_CONTROL_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // payloads are shown through Debug
 pub enum Error {
     Timeout,
     NoDevice,
@@ -114,6 +115,7 @@ pub struct Target {
 }
 
 impl Target {
+    #[allow(dead_code)]
     const DEFAULT: Target = Target { address: 0, max_packet0: 64, speed: Speed::High, hub_address: 0, hub_port: 0 };
 }
 
@@ -191,6 +193,7 @@ struct Hub {
 const MAX_HUBS: usize = 4;
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // endpoint and packet size describe the pipe
 struct KeyboardPipe {
     target: Target,
     endpoint: u8,

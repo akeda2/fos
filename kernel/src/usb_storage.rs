@@ -132,10 +132,6 @@ fn device(index: usize) -> Option<&'static mut Msc> {
     unsafe { (*core::ptr::addr_of_mut!(DEVICES)).get_mut(index)?.as_mut() }
 }
 
-pub fn count() -> usize {
-    unsafe { (*core::ptr::addr_of!(DEVICES)).iter().flatten().count() }
-}
-
 impl Msc {
     /// The device has been unplugged (or unplugged and replugged, which gives it a new USB address, so this handle is as dead as
     /// if it were gone): its root port reports no device or a connection change since it was enumerated. Asking the port is

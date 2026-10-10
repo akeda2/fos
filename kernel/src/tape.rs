@@ -72,6 +72,7 @@ fn region() -> Option<u64> {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // payload is shown through Debug
 pub enum LoadError {
     NoMemory,
     TooBig,

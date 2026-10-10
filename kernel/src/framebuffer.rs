@@ -334,7 +334,7 @@ const TEXT_ATTRIBUTE: u8 = 0x17;
 /// screen is cleared, and the cursor made visible. Only for a BIOS boot, where the BIOS left the screen in text mode; a UEFI
 /// machine without a framebuffer has no text screen.
 pub fn init_text() -> bool {
-    let mut console = Console {
+    let console = Console {
         text: true,
         base: VGA_TEXT_BASE as *mut u32,
         stride: 80,

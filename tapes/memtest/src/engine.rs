@@ -149,10 +149,6 @@ impl Region {
         self.words
     }
 
-    pub fn base(&self) -> u64 {
-        self.base
-    }
-
     fn physical(&self, index: usize) -> u64 {
         self.base + index as u64 * 4
     }

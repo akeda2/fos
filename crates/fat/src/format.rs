@@ -83,7 +83,7 @@ pub fn format_exfat<D: Device>(device: &mut D, sectors: u64, partition_offset: u
     // The FAT: zero it all, then the two reserved entries and the three chains.
     zero(device, FAT_OFFSET, fat_length)?;
     let mut fat = [0u8; SECTOR];
-    let mut put = |entry: u32, value: u32, fat: &mut [u8; SECTOR]| fat[entry as usize * 4..entry as usize * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    let put = |entry: u32, value: u32, fat: &mut [u8; SECTOR]| fat[entry as usize * 4..entry as usize * 4 + 4].copy_from_slice(&value.to_le_bytes());
     // 100 clusters of chain fit in the first sector for any normal volume; longer ones (a huge bitmap) are written below.
     put(0, 0xffff_fff8, &mut fat);
     put(1, 0xffff_ffff, &mut fat);

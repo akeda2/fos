@@ -29,14 +29,13 @@ fn read_u64(bytes: &[u8], at: usize) -> u64 {
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 
-struct Headers<'a> {
-    image: &'a [u8],
+struct Headers {
     start: usize,
     size: usize,
     count: usize,
 }
 
-fn headers(image: &[u8]) -> Result<Headers<'_>, Error> {
+fn headers(image: &[u8]) -> Result<Headers, Error> {
     const ET_DYN: u16 = 3;
     if image.len() < 64 || image[0..4] != [0x7f, b'E', b'L', b'F'] || image[4] != 2 || image[5] != 1 || read_u16(image, 18) != 62 {
         return Err(Error::NotElf64X86);
@@ -44,14 +43,14 @@ fn headers(image: &[u8]) -> Result<Headers<'_>, Error> {
     if read_u16(image, 16) != ET_DYN {
         return Err(Error::NotAnExecutable);
     }
-    let headers = Headers { image, start: read_u64(image, 32) as usize, size: read_u16(image, 54) as usize, count: read_u16(image, 56) as usize };
+    let headers = Headers { start: read_u64(image, 32) as usize, size: read_u16(image, 54) as usize, count: read_u16(image, 56) as usize };
     if headers.size < 56 || headers.start.saturating_add(headers.size.saturating_mul(headers.count)) > image.len() {
         return Err(Error::OutOfRange);
     }
     Ok(headers)
 }
 
-impl Headers<'_> {
+impl Headers {
     fn at(&self, index: usize) -> usize {
         self.start + index * self.size
     }

@@ -224,7 +224,6 @@ struct Controller<'a> {
     next_status: u64,
     status_every: u64,
     started: u64,
-    errors_seen: u32,
     passes_done: u32,
 }
 
@@ -459,7 +458,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut control = Controller {
         api, abort: false, inject: options.inject, injected: false, soak: options.soak, clock: ClockMonitor::new(), net,
         next_sample: 0, next_status: started + options.status_seconds * 1_000_000, status_every: options.status_seconds,
-        started, errors_seen: 0, passes_done: 0,
+        started, passes_done: 0,
     };
     let mut errors = Errors::new();
     let mut rng = Rng::new(options.seed);

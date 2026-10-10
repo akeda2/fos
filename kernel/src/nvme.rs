@@ -145,6 +145,7 @@ impl Queue {
 }
 
 struct Controller {
+    #[allow(dead_code)]
     registers: usize,
     frame: usize,
     io: Queue,

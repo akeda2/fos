@@ -130,10 +130,6 @@ pub fn intx_count(vector: u8) -> u64 {
     INTX_COUNTS[usize::from(vector - INTX_BASE)].load(Ordering::Relaxed)
 }
 
-pub fn intx_gsi(vector: u8) -> Option<u32> {
-    unsafe { (*core::ptr::addr_of!(INTX))[usize::from(vector - INTX_BASE)].as_ref().map(|e| e.gsi) }
-}
-
 pub fn storms() -> u64 {
     STORMS.load(Ordering::Relaxed)
 }

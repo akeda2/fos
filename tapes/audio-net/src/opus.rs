@@ -220,8 +220,6 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     if options.rate != RATE {
         return println!("audio-net recv: codec=opus is 48000 Hz only.");
     }
-    let (device_channels, slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
-    let device_frame = device_channels * slot;
     let channels = options.chan;
     let streams = channels.div_ceil(2);
     let Some(mut transport) = Transport::open(api, options) else { return };

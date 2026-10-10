@@ -91,6 +91,7 @@ pub struct Fadt {
     pub pm_timer_port: u16,
     pub pm_timer_32_bit: bool,
     pub pm1a_control: u16,
+    #[allow(dead_code)] // FADT field, parsed for completeness
     pub sci_interrupt: u16,
     /// The ACPI reset register (if the FADT advertises one): address space (1 = system I/O,
     /// 0 = memory), address, and the value to write.

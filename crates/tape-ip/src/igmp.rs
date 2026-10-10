@@ -13,7 +13,6 @@ use crate::net::NetConfig;
 use audio_wire::multicast_mac;
 use tape_rt::TapeApi;
 
-const ALL_HOSTS: [u8; 4] = [224, 0, 0, 1];
 const ALL_ROUTERS: [u8; 4] = [224, 0, 0, 2];
 const IGMPV3_REPORTS: [u8; 4] = [224, 0, 0, 22];
 

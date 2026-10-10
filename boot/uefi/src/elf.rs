@@ -15,6 +15,8 @@ pub struct LoadedKernel {
     pub size: u64,
 }
 
+// The payloads are only shown through Debug when the loader narrates a failure.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum Error {
     Elf(fosfor_abi::elf::Error),

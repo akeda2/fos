@@ -118,18 +118,10 @@ const TAPE_EVENT_ABORT: u32 = 1;
 
 type Putc = extern "C" fn(u32);
 type ShouldAbort = fn() -> u32;
-type Alloc = fn(u32) -> usize;
 type Free = fn(usize, u32);
-type NicCount = fn() -> u32;
-type NicMacAt = fn(u32, usize) -> u32;
 type NicSendAt = fn(u32, usize, u32) -> u32;
 type NicReceiveAt = fn(u32, usize, u32) -> u32;
-type NicSetPromiscuousAt = fn(u32, u32) -> u32;
-type TerminalPosition = fn() -> u32;
-type FsFileLength = fn(usize, u32, usize) -> u32;
-type FsRead = fn(usize, u32, usize, u32, usize) -> u32;
 type FsWrite = fn(usize, u32, usize, u32) -> u32;
-type FsRemove = fn(usize, u32) -> u32;
 type Ticks = fn() -> u64;
 
 struct RouterInterface {

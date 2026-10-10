@@ -131,7 +131,3 @@ pub fn interrupt() {
         }
     }
 }
-
-pub fn ps2_bytes_seen() -> u64 {
-    unsafe { BYTES_SEEN }
-}

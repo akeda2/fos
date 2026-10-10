@@ -17,6 +17,7 @@ pub const SUCCESS: Status = 0;
 
 /// `AllocatePages` types and the memory type the loader allocates as.
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
+#[allow(dead_code)] // spec value, kept beside its siblings
 pub const ALLOCATE_ADDRESS: u32 = 2;
 pub const LOADER_DATA: u32 = 2;
 /// `LocateHandleBuffer` search type: every handle supporting a protocol.
@@ -154,6 +155,7 @@ pub struct RuntimeServices {
     pub reset_system: extern "efiapi" fn(kind: u32, status: Status, data_size: usize, data: *const c_void) -> !,
 }
 
+#[allow(dead_code)] // spec value, kept beside its siblings
 pub const RESET_SHUTDOWN: u32 = 2;
 
 /// One entry of the memory map. `GetMemoryMap` reports the stride between

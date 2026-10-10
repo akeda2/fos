@@ -67,7 +67,6 @@ const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 
 type Putc = extern "C" fn(u32);
 type ReadKey = fn() -> u32;
-type NicMac = fn(usize) -> u32;
 type NicSend = fn(usize, u32) -> u32;
 type NicReceive = fn(usize, u32) -> u32;
 type Ticks = fn() -> u64;

@@ -19,6 +19,7 @@ pub struct Device {
     pub class: u8,
     pub subclass: u8,
     pub interface: u8,
+    #[allow(dead_code)]
     pub revision: u8,
 }
 
@@ -238,10 +239,6 @@ pub fn scan() -> usize {
 
 pub fn devices() -> impl Iterator<Item = Device> {
     unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(DEVICES) as *const Option<Device>, COUNT).iter().flatten().copied() }
-}
-
-pub fn find(vendor: u16, ids: &[u16]) -> Option<Device> {
-    devices().find(|device| device.vendor == vendor && ids.contains(&device.id))
 }
 
 pub fn class_name(class: u8, subclass: u8) -> &'static str {

@@ -48,6 +48,7 @@ pub fn find(disk: usize, type_guid: &[u8; 16], mut accept: impl FnMut(&Partition
 }
 
 /// What a disk's first sectors say it holds, for `format` to decide with.
+#[allow(dead_code)] // fields are shown by the disk report
 pub enum Summary {
     /// Sectors 0 and 1 are all zero: nothing has ever been put on it.
     Blank,

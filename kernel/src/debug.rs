@@ -25,9 +25,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use fosfor_abi::{BootInfo, MAX_CONSECUTIVE_CRASHES, RUNNING_STOPPED, RUNNING_UP, SlotMetadata, slot_start};
+use fosfor_abi::{BootInfo, MAX_CONSECUTIVE_CRASHES, RUNNING_STOPPED, RUNNING_UP, SlotMetadata};
 
-use crate::{apic, block, fault::Frame, paging, storage};
+use crate::{apic, block, fault::Frame, paging};
 
 /// Physical address of the crash record page (low memory, below the kernel's own
 /// allocations; reserved from the allocator in `init`).

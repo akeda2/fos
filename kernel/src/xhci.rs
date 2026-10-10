@@ -87,6 +87,7 @@ const CC_SUCCESS: u8 = 1;
 const CC_SHORT_PACKET: u8 = 13;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // payloads are shown through Debug
 pub enum Error {
     Timeout,
     Command(u8),
@@ -287,6 +288,7 @@ impl core::fmt::Display for Path {
 
 pub struct Controller {
     pub pci: pci::Device,
+    #[allow(dead_code)]
     mmio: usize,
     operational: usize,
     runtime: usize,

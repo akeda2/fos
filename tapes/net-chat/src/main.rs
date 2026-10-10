@@ -37,9 +37,7 @@ const TAPE_EVENT_ABORT: u32 = 1;
 const TAPE_EVENT_CHAR_BASE: u32 = 0x100;
 
 type Putc = extern "C" fn(u32);
-type NicMac = fn(usize) -> u32;
 type NicSend = fn(usize, u32) -> u32;
-type NicReceive = fn(usize, u32) -> u32;
 
 fn print_hex_byte(putc: Putc, byte: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";

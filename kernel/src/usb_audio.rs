@@ -537,7 +537,7 @@ pub fn attach(controller: &mut Controller, device: Device, description: Descript
     }
     let mut rates = [0u32; 8];
     let mut rate_count = 0;
-    let mut add = |rate: u32, rates: &mut [u32; 8], count: &mut usize| {
+    let add = |rate: u32, rates: &mut [u32; 8], count: &mut usize| {
         if rate != 0 && *count < rates.len() && !rates[..*count].contains(&rate) {
             rates[*count] = rate;
             *count += 1;

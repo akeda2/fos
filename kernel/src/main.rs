@@ -174,7 +174,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     // ---- descriptor tables, then page tables ----
     let layout = paging::layout();
-    let double_fault_stack_top = unsafe {
+    let double_fault_stack_top = {
         unsafe extern "C" {
             static __ist_top: u8;
         }

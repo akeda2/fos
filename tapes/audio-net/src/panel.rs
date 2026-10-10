@@ -260,7 +260,6 @@ trait TextField {
     fn push(&mut self, byte: u8);
     fn pop(&mut self);
     fn clear(&mut self);
-    fn current(&self) -> &str;
 }
 
 impl<const N: usize> TextField for Text<N> {
@@ -272,9 +271,6 @@ impl<const N: usize> TextField for Text<N> {
     }
     fn clear(&mut self) {
         Text::clear(self);
-    }
-    fn current(&self) -> &str {
-        self.as_str()
     }
 }
 

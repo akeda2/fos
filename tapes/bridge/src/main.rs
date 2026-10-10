@@ -23,12 +23,7 @@ const ETHERNET_HEADER_LEN: usize = 14;
 const BROADCAST_MAC: [u8; 6] = [0xff; 6];
 
 type Putc = extern "C" fn(u32);
-type ShouldAbort = fn() -> u32;
-type NicCount = fn() -> u32;
-type NicMacAt = fn(u32, usize) -> u32;
 type NicSendAt = fn(u32, usize, u32) -> u32;
-type NicReceiveAt = fn(u32, usize, u32) -> u32;
-type NicSetPromiscuousAt = fn(u32, u32) -> u32;
 
 #[derive(Clone, Copy)]
 struct LearnedMac {

@@ -1028,8 +1028,6 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     if (api.audio_info)(&mut info) == 0 || info.playback_channels == 0 {
         return println!("audio-net recv: no audio device with outputs.");
     }
-    let (device_channels, slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
-    let device_frame = device_channels * slot;
     let Some(mut transport) = Transport::open(api, options) else { return };
     if !transport.join_group(api, options) {
         return;
@@ -1333,7 +1331,7 @@ pub fn normalize(text: &str, words: &mut [&'static str; MAX_WORDS], count: &mut 
         let Some(first) = first else { continue };
         let pair = !first.contains('=') && second.is_some() && third.is_none();
         let pieces: &[&str] = if pair { &[first, "=", second.unwrap_or("")] } else { &[] };
-        let mut push = |piece: &str, out: &mut [u8; 4608], used: &mut usize| -> Result<(), &'static str> {
+        let push = |piece: &str, out: &mut [u8; 4608], used: &mut usize| -> Result<(), &'static str> {
             if *used + piece.len() > out.len() {
                 return Err("the configuration file has too many words");
             }

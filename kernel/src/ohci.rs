@@ -50,6 +50,7 @@ const HCE_CONTROL: usize = 0x100;
 
 const CONTROL_PERIODIC_ENABLE: u32 = 1 << 2;
 const CONTROL_CONTROL_ENABLE: u32 = 1 << 4;
+#[allow(dead_code)]
 const CONTROL_FUNCTIONAL_STATE: u32 = 3 << 6;
 const CONTROL_OPERATIONAL: u32 = 2 << 6;
 const CONTROL_INTERRUPT_ROUTING: u32 = 1 << 8;
@@ -95,6 +96,7 @@ const TD_NOT_ACCESSED: u32 = 0xf << 28;
 const CC_NO_ERROR: u32 = 0;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // payloads are shown through Debug
 pub enum Error {
     NoDevice,
     Unsupported,
@@ -120,6 +122,7 @@ pub struct Found {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // target and endpoint describe the pipe
 struct KeyboardPipe {
     target: Target,
     endpoint: u8,
@@ -564,10 +567,6 @@ impl Controller {
         };
         self.arm_keyboard(index, pipe.armed + 1);
         report
-    }
-
-    pub fn keyboard_count(&self) -> usize {
-        self.keyboards.iter().flatten().count()
     }
 
     /// The root-hub status registers' view, for `usb`: acknowledges nothing.

@@ -36,7 +36,7 @@ unsafe extern "C" {
 }
 
 fn set_gate(vector: usize, ist: u8) {
-    let handler = unsafe { core::ptr::addr_of!(isr_0) as u64 } + 16 * vector as u64;
+    let handler = core::ptr::addr_of!(isr_0) as u64 + 16 * vector as u64;
     unsafe {
         (*core::ptr::addr_of_mut!(IDT)).0[vector] = Gate {
             offset_low: handler as u16,

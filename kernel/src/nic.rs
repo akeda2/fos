@@ -123,8 +123,4 @@ impl Nic {
         }
     }
 
-    /// The e1000 interrupt bookkeeping index; only e1000-family NICs have any.
-    pub fn is_e1000(&self) -> bool {
-        matches!(self, Nic::E1000(_))
-    }
 }
