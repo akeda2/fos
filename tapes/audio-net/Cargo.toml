@@ -9,6 +9,7 @@ audio-wire = { path = "../../crates/audio-wire" }
 tape-panel = { path = "../../crates/tape-panel" }
 tape-net = { path = "../../crates/tape-net" }
 opus-codec = { path = "../../crates/opus-codec" }
+ptp-tape = { path = "../ptp" }
 
 [profile.release]
 panic = "abort"

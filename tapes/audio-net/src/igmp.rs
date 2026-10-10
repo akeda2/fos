@@ -99,6 +99,11 @@ impl Igmp {
         self.send(api, nic, config, false, false);
     }
 
+    /// A leave that keeps the NIC's multicast filter open: another group is still joined.
+    pub fn leave_report(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
+        self.send(api, nic, config, false, true);
+    }
+
     pub fn leave(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
         self.send(api, nic, config, false, true);
         (api.nic_set_multicast)(nic, 0);

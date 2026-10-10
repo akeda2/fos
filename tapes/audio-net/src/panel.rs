@@ -758,7 +758,16 @@ fn panel_hook_inner() -> u32 {
         } else {
             let _ = write!(actual, "Sending: {}   Receiving: {}", if shown.send_codec.as_str().is_empty() { "-" } else { shown.send_codec.as_str() }, if shown.receive_codec.as_str().is_empty() { "-" } else { shown.receive_codec.as_str() });
             if shown.packet_frames != 0 && !shown.receive_codec.as_str().is_empty() {
-                let _ = write!(actual, "   Delay ~{} ms", shown.delay_ms());
+                if let Some(arrival) = shown.ptp_current(tape_rt::micros()) {
+                    // Measured against the sender's PTP stamps: capture to the playback ring, ring queue included.
+                    let total = arrival + i64::from(shown.level_frames) * 1_000_000 / i64::from(shown.rate.max(1));
+                    let _ = write!(actual, "   Delay {}.{} ms PTP", total / 1000, total % 1000 / 100);
+                } else {
+                    let _ = write!(actual, "   Delay ~{} ms", shown.delay_ms());
+                }
+            }
+            if crate::clock::active() && shown.ptp_current(tape_rt::micros()).is_none() {
+                let _ = write!(actual, "   PTP {}", if crate::clock::locked() { "locked" } else if crate::clock::found() { "syncing" } else { "searching" });
             }
             // Capture side: audio waiting for the sender to take it is audio that is late. Now and the peak, in ms.
             let mut waiting = tape_rt::AudioBuffer::default();

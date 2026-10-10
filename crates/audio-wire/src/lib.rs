@@ -406,6 +406,9 @@ pub struct Sdp<'a> {
     pub packet_us: u32,
     /// The sender's MAC: stands in for a PTP clock in `ts-refclk` (RFC 7273's `localmac`).
     pub mac: [u8; 6],
+    /// The grandmaster's clock identity when the stream's RTP timestamps are on a PTP timeline (`ts-refclk:ptp=`,
+    /// AES67); `None` when they count from an arbitrary start.
+    pub ptp: Option<[u8; 8]>,
     pub session: u32,
 }
 
@@ -432,9 +435,10 @@ fn is_multicast(address: [u8; 4]) -> bool {
 }
 
 /// Writes an AES67-style SDP (RFC 4566, RFC 3190 `L16`/`L24`, RFC 7273 clocking) into `out` and returns its
-/// length. Lines end in CRLF as SDP requires. The `ts-refclk` is the sender's MAC (`localmac`), since this
-/// stack has no PTP: a receiver that insists on a PTP reference will not accept the stream, one that only
-/// needs the packet format will (ffplay, GStreamer, VLC with the right flags).
+/// length. Lines end in CRLF as SDP requires. The `ts-refclk` is the PTP grandmaster when the sender's
+/// timestamps are on its timeline (`Sdp::ptp`), else the sender's MAC (`localmac`): a receiver that insists on a
+/// PTP reference will not accept the latter, one that only needs the packet format will (ffplay, GStreamer, VLC
+/// with the right flags).
 pub fn write_sdp(sdp: &Sdp<'_>, out: &mut [u8]) -> usize {
     use core::fmt::Write;
     let mut cursor = Cursor { bytes: out, length: 0 };
@@ -464,7 +468,12 @@ pub fn write_sdp(sdp: &Sdp<'_>, out: &mut [u8]) -> usize {
         let _ = write!(cursor, "a=ptime:{milliseconds}.{}\r\n", core::str::from_utf8(&fraction[..end]).unwrap_or("0"));
     }
     let m = sdp.mac;
-    let _ = write!(cursor, "a=ts-refclk:localmac={:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}\r\na=mediaclk:direct=0\r\na={}\r\n", m[0], m[1], m[2], m[3], m[4], m[5], if sdp.receive_only { "recvonly" } else { "sendonly" });
+    if let Some(g) = sdp.ptp {
+        let _ = write!(cursor, "a=ts-refclk:ptp=IEEE1588-2008:{:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}:0\r\n", g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+    } else {
+        let _ = write!(cursor, "a=ts-refclk:localmac={:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}\r\n", m[0], m[1], m[2], m[3], m[4], m[5]);
+    }
+    let _ = write!(cursor, "a=mediaclk:direct=0\r\na={}\r\n", if sdp.receive_only { "recvonly" } else { "sendonly" });
     if sdp.idle {
         let _ = write!(cursor, "a=x-fos-idle\r\n");
     }
@@ -1007,7 +1016,7 @@ mod tests {
 
     #[test]
     fn sdp_for_a_stereo_stream() {
-        let sdp = Sdp { name: "studio", receive_only: false, idle: false, origin: [192, 168, 1, 10], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [0x18, 0x66, 0xda, 0x25, 0x1f, 0x73], session: 7 };
+        let sdp = Sdp { name: "studio", receive_only: false, idle: false, origin: [192, 168, 1, 10], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [0x18, 0x66, 0xda, 0x25, 0x1f, 0x73], ptp: None, session: 7 };
         let mut out = [0u8; 512];
         let length = write_sdp(&sdp, &mut out);
         let text = core::str::from_utf8(&out[..length]).unwrap();
@@ -1021,8 +1030,19 @@ mod tests {
     }
 
     #[test]
+    fn sdp_names_the_ptp_grandmaster_when_the_timestamps_follow_it() {
+        let sdp = Sdp { name: "x", receive_only: false, idle: false, origin: [10, 0, 0, 1], destination: [239, 1, 1, 1], port: 5004, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [1; 6], ptp: Some([0x8c, 0xec, 0x4b, 0xff, 0xfe, 0xf3, 0x4a, 0x20]), session: 1 };
+        let mut buffer = [0u8; 600];
+        let length = write_sdp(&sdp, &mut buffer);
+        let text = core::str::from_utf8(&buffer[..length]).unwrap();
+        assert!(text.contains("a=ts-refclk:ptp=IEEE1588-2008:8C-EC-4B-FF-FE-F3-4A-20:0\r\n"));
+        assert!(!text.contains("localmac"));
+        assert!(text.contains("a=mediaclk:direct=0\r\n"));
+    }
+
+    #[test]
     fn sdp_packet_times_and_unicast() {
-        let mut sdp = Sdp { name: "x", receive_only: false, idle: false, origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 6000, payload_type: 97, channels: 22, rate: 96_000, bits: 16, packet_us: 125, mac: [0; 6], session: 1 };
+        let mut sdp = Sdp { name: "x", receive_only: false, idle: false, origin: [10, 0, 0, 1], destination: [10, 0, 0, 2], port: 6000, payload_type: 97, channels: 22, rate: 96_000, bits: 16, packet_us: 125, mac: [0; 6], ptp: None, session: 1 };
         let mut out = [0u8; 512];
         let length = write_sdp(&sdp, &mut out);
         let text = core::str::from_utf8(&out[..length]).unwrap();
@@ -1194,7 +1214,7 @@ mod tests {
 
     #[test]
     fn sap_round_trip_and_session_parse() {
-        let sdp = Sdp { name: "studio-a", receive_only: false, idle: false, origin: [192, 168, 1, 20], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 4, rate: 48_000, bits: 24, packet_us: 250, mac: [0; 6], session: 77 };
+        let sdp = Sdp { name: "studio-a", receive_only: false, idle: false, origin: [192, 168, 1, 20], destination: [239, 69, 1, 1], port: 5004, payload_type: 96, channels: 4, rate: 48_000, bits: 24, packet_us: 250, mac: [0; 6], ptp: None, session: 77 };
         let mut text = [0u8; 600];
         let length = write_sdp(&sdp, &mut text);
         let mut packet = [0u8; 700];
@@ -1286,7 +1306,7 @@ mod tests {
     #[test]
     fn layer_2_announcement_parses() {
         let mut text = [0u8; 600];
-        let length = write_sdp(&Sdp { name: "rx", receive_only: true, idle: true, origin: [0; 4], destination: [0; 4], port: 0, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [2, 0, 0, 0, 0, 1], session: 7 }, &mut text);
+        let length = write_sdp(&Sdp { name: "rx", receive_only: true, idle: true, origin: [0; 4], destination: [0; 4], port: 0, payload_type: 96, channels: 2, rate: 48_000, bits: 24, packet_us: 1000, mac: [2, 0, 0, 0, 0, 1], ptp: None, session: 7 }, &mut text);
         let mut sdp = text[..length].to_vec();
         sdp.extend_from_slice(b"a=x-fos-l2:avtp\r\n");
         let session = sap::parse_sdp(&sdp).unwrap();

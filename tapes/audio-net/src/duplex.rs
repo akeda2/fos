@@ -126,6 +126,11 @@ pub fn go() {
     unsafe { SWITCHING = true };
 }
 
+/// True while the receive task runs beside the sender: it reads the NIC, so the sender must not.
+pub fn shared() -> bool {
+    unsafe { SWITCHING && TASK_LIVE }
+}
+
 extern "C" fn task_entry() -> ! {
     unsafe {
         if let Some(body) = BODY {

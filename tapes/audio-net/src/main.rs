@@ -41,9 +41,11 @@
 //! off-subnet) or `ip=dhcp`. `to=` is the destination IP, a unicast address or a multicast group
 //! (239.x.y.z, no ARP needed); `port=` (default 5004) is both the source and destination UDP port. `send`
 //! prints an SDP description of the stream to open on the other side. `recv` cannot learn the channel count
-//! from RTP (SDP carries it), so give `chan=` (default 2) and `bits=`. There is no PTP, so clocks are not
-//! synchronised: the receiver follows the sender (an AES67 device that insists on a PTP reference will not
-//! accept the stream, but the packet format is exactly AES67's).
+//! from RTP (SDP carries it), so give `chan=` (default 2) and `bits=`. `ptp=auto|off` (default auto): a
+//! sender that hears a PTPv2 clock (ptp4l, a studio clock, the `ptp` tape's master) on 224.0.1.129 locks to it
+//! before it captures, stamps RTP on the PTP timeline (sample periods mod 2^32) and names the grandmaster in
+//! the SDP (`ts-refclk:ptp`); with no clock it says so and counts from zero. A receiver that is locked too
+//! reports the sender-capture-to-arrival delay. The sound card clocks are not steered. See `clock.rs`.
 //!
 //! **AVTP.** `proto=avtp` sends and receives IEEE 1722 AAF (the audio format of AVB, layer 2, ethertype 0x22f0):
 //! 16- or 24-bit PCM at the standard rates, `to=` a MAC (default 91:e0:f0:00:fe:01), no addresses needed. fos has no
@@ -60,6 +62,7 @@
 #![no_std]
 #![no_main]
 
+mod clock;
 mod duplex;
 mod igmp;
 mod net;
@@ -185,6 +188,8 @@ pub struct Options<'a> {
     http: u16,
     /// `serve`: milliseconds of recent audio sent to a new client at once, so that its player starts with a full buffer.
     prebuffer_ms: u32,
+    /// `ptp=auto|off`: look for a PTP clock (RTP only) and stamp and time packets with it.
+    ptp: bool,
 }
 
 pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -210,7 +215,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
     let mut options = Options {
         proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, priority: None, ptime_us: 1000, target_given: false, ptime_given: false, seconds: 0, verbose: false, latency: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0, ptp: true,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -265,6 +270,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "prebuffer" => options.prebuffer_ms = value.parse().ok().filter(|&ms| ms <= 1000).ok_or("prebuffer= is 0 to 1000 milliseconds")?,
             "verbose" => options.verbose = true,
             "latency" => options.latency = true,
+            "ptp" => options.ptp = match value { "auto" | "on" => true, "off" => false, _ => return Err("ptp= is auto or off") },
             _ => return Err("unknown option"),
         }
     }
@@ -321,6 +327,8 @@ pub struct Transport {
     /// AVTP's 8-bit sequence number and its widened value, for the receiver.
     avtp_sequence: Option<(u8, u16)>,
     announcer: peers::Announcer,
+    /// This transport started the PTP clock (and must stop it).
+    ptp: bool,
 }
 
 impl Transport {
@@ -331,7 +339,7 @@ impl Transport {
         if let (Some((nic, cached)), Proto::Rtp) = (unsafe { *(&raw const CONFIG_CACHE) }, options.proto) {
             // A retry, or the second task of a duplex run: the address is already settled (no second DHCP exchange).
             if nic == options.nic {
-                return Some(Transport { proto: options.proto, mac, config: cached, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() });
+                return Some(Transport { proto: options.proto, mac, config: cached, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle(), ptp: false });
             }
         }
         if options.proto == Proto::Rtp {
@@ -361,20 +369,20 @@ impl Transport {
         } else {
             println!("Network: NIC {} (MAC {}), layer 2 only, no IP address.", options.nic + 1, MacText(mac));
         }
-        Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() })
+        Some(Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle(), ptp: false })
     }
 
     /// A transport on an address configuration that is already settled (the panel's presence announcements);
     /// remembers it so the stream started from the panel does not repeat DHCP.
     pub fn from_config(options: &Options, mac: [u8; 6], config: NetConfig) -> Transport {
         unsafe { CONFIG_CACHE = Some((options.nic, config)) };
-        Transport { proto: Proto::Rtp, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() }
+        Transport { proto: Proto::Rtp, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle(), ptp: false }
     }
 
     /// A transport on a layer 2 network with nothing printed (the panel's presence announcements).
     pub fn from_l2(options: &Options, mac: [u8; 6]) -> Transport {
         let config = NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) };
-        Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle() }
+        Transport { proto: options.proto, mac, config, arp: ArpCache::new(), port: options.port, payload_type: options.payload_type, igmp: None, avtp_sequence: None, announcer: peers::Announcer::idle(), ptp: false }
     }
 
     /// `group=`: joins the multicast group on the receive NIC. False (after a message) if it cannot.
@@ -432,8 +440,16 @@ impl Transport {
 
     /// Per loop pass: sends a due IGMP answer and, given a frame, consumes it if it is IGMP. True if consumed.
     pub fn igmp_service(&mut self, api: &TapeApi, nic: usize, frame: Option<&[u8]>) -> bool {
-        if frame.is_none() {
-            self.announce_service(api, nic);
+        match frame {
+            None => {
+                self.announce_service(api, nic);
+                clock::poll(api);
+            }
+            Some(frame) => {
+                if clock::consume(api, frame, tape_rt::micros()) {
+                    return true;
+                }
+            }
         }
         let Some(igmp) = self.igmp.as_mut() else { return false };
         let now = tape_rt::micros();
@@ -441,8 +457,24 @@ impl Transport {
         frame.is_some_and(|frame| igmp.handle(frame, now))
     }
 
+    /// `ptp=auto`: starts listening for a PTP clock (RTP only).
+    pub fn start_clock(&mut self, api: &TapeApi, options: &Options) {
+        if options.ptp && self.proto == Proto::Rtp && !self.ptp {
+            clock::start(api, options.nic, &self.config);
+            self.ptp = true;
+        }
+    }
+
+    pub fn stop_clock(&mut self, api: &TapeApi, nic: usize) {
+        if self.ptp {
+            self.ptp = false;
+            clock::stop(api, nic, self.igmp.is_some());
+        }
+    }
+
     pub fn leave_group(&mut self, api: &TapeApi, nic: usize) {
         self.announce_stop(api, nic);
+        self.stop_clock(api, nic);
         if self.proto == Proto::Avtp {
             (api.nic_set_multicast)(nic, 0);
         }
@@ -504,9 +536,23 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             Destination::Rtp { mac, ip, ttl: if audio_wire::is_multicast_address(ip.0) { 32 } else { 64 } }
         }
     };
+    // On a network with a PTP clock the packets are stamped with its time (before capture starts: waiting for the lock
+    // takes seconds, and the capture buffer would overflow).
+    let mut stamper = None;
+    transport.start_clock(api, options);
+    if transport.ptp {
+        if clock::wait_for_lock(api) {
+            println!("PTP: locked to a clock ({} us path delay); RTP timestamps are on its timeline.", clock::path_delay_us().unwrap_or(0));
+            stamper = Some(clock::Stamper::new(options.rate));
+        } else {
+            println!("PTP: {}; RTP timestamps count from zero (ptp=off silences this).", if clock::found() { "a clock was heard but did not lock" } else { "no clock found" });
+            transport.stop_clock(api, options.nic);
+        }
+    }
     if tone.is_none() {
         let status = (api.audio_start)(options.rate, 1, 0);
         if status != 0 {
+            transport.stop_clock(api, options.nic);
             return println!("audio-net send: cannot start capture at {} Hz (code {status}); the device offers {:?}.", options.rate, &info.rates[..info.rate_count as usize]);
         }
         // The mode that runs is chosen when the stream starts (automatically: the best one that offers the rate), so ask again.
@@ -514,6 +560,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         (device_channels, slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
         if selection.channels().any(|channel| channel >= device_channels) {
             (api.audio_stop)();
+            transport.stop_clock(api, options.nic);
             return println!("audio-net send: the capture mode at {} Hz has {device_channels} channel(s); ch= asks for more (`audio modes` lists the modes, inmode= picks one).", options.rate);
         }
     }
@@ -529,7 +576,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         let mut text = [0u8; 600];
         let mut name_buffer = [0u8; audio_wire::sap::MAX_NAME];
         let name = peers::session_name(options.name, transport.mac, &mut name_buffer);
-        let length = write_sdp(&Sdp { name, receive_only: false, idle: false, origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, rate: options.rate, bits, packet_us: packet_us as u32, mac: transport.mac, session: stream }, &mut text);
+        let length = write_sdp(&Sdp { name, receive_only: false, idle: false, origin: transport.config.ip.0, destination: ip.0, port: options.port, payload_type: options.payload_type, channels, rate: options.rate, bits, packet_us: packet_us as u32, mac: transport.mac, ptp: stamper.as_ref().and_then(|_| clock::grandmaster()), session: stream }, &mut text);
         println!("SDP for the receiver (save as stream.sdp; e.g. ffplay -protocol_whitelist file,udp,rtp stream.sdp):");
         println!("{}", core::str::from_utf8(&text[..length]).unwrap_or(""));
         transport.announcer.start(&text[..length]);
@@ -547,6 +594,8 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     duplex::go();
     let mut frame = [0u8; 1514];
     let mut payload = [0u8; 1514];
+    let mut ptp_frame = [0u8; 1514];
+    let mut age_frames = 0u32;
     let mut capture = [0u8; 8192];
     let mut held = 0usize; // bytes of device-format audio waiting in `capture`
     let device_frame = device_channels * slot;
@@ -565,6 +614,9 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             break;
         }
         transport.announce_service(api, options.nic);
+        if transport.ptp {
+            if duplex::shared() { clock::poll(api) } else { clock::pump(api, &mut ptp_frame) }
+        }
         let have_packet = if let Some(frequency) = tone {
             // Paced by the clock: packet number `sent` is due at started + sent * packet time.
             if tape_rt::micros() >= started + sent * paced_us_x1000 / 1000 {
@@ -587,6 +639,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             let got = (api.audio_read)(capture[held..].as_mut_ptr(), capture.len() - held);
             held += got;
             if held >= per_packet * device_frame {
+                age_frames = (held / device_frame) as u32;
                 pack(&capture[..per_packet * device_frame], slot, device_channels, per_packet, &selection, bits, &mut payload);
                 capture.copy_within(per_packet * device_frame..held, 0);
                 held -= per_packet * device_frame;
@@ -631,7 +684,8 @@ pub fn send(api: &'static TapeApi, options: &Options) {
                 Some(ETHERNET_HEADER + HEADER_LEN + length)
             }
             Destination::Rtp { mac, ip, ttl } => {
-                let rtp = RtpPacket::new(transport.payload_type, false, sequence, timestamp, stream, &payload[..length]);
+                let stamp = stamper.as_mut().and_then(|stamper| stamper.stamp(age_frames, per_packet as u32)).unwrap_or(timestamp);
+                let rtp = RtpPacket::new(transport.payload_type, false, sequence, stamp, stream, &payload[..length]);
                 net::build_rtp_frame(&mut frame, &transport.config, mac, ip, transport.port, ttl, &rtp)
             }
         };
@@ -652,6 +706,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     }
     println!();
     transport.announce_stop(api, options.nic);
+    transport.stop_clock(api, options.nic);
     println!("Sent {sent} packets ({} frames).", sent * per_packet as u64);
     if options.latency {
         probe.summary();
@@ -829,6 +884,8 @@ struct Packet {
     frames: usize,
     /// Where the samples are in the frame buffer.
     payload: core::ops::Range<usize>,
+    /// RTP's timestamp (the sender's PTP time if it follows one); None for the other protocols.
+    rtp_timestamp: Option<u32>,
 }
 
 fn proto_name(proto: Proto) -> &'static str {
@@ -875,6 +932,7 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
                 rate: header.rate,
                 frames: usize::from(header.data_length) / frame_bytes,
                 payload: start..start + usize::from(header.data_length),
+                rtp_timestamp: None,
             })
         }
         Proto::Raw => {
@@ -889,7 +947,7 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
             let mut source = [0u8; 8];
             source[..6].copy_from_slice(&sender);
             let start = ETHERNET_HEADER + HEADER_LEN;
-            Some(Packet { stream: header.stream, source, sequence: header.sequence, channels: usize::from(header.channels), bits: usize::from(header.bits), rate: header.rate, frames: usize::from(header.frames), payload: start..start + header.payload_len() })
+            Some(Packet { stream: header.stream, source, sequence: header.sequence, channels: usize::from(header.channels), bits: usize::from(header.bits), rate: header.rate, frames: usize::from(header.frames), payload: start..start + header.payload_len(), rtp_timestamp: None })
         }
         Proto::Rtp => {
             let now = (api.ticks)() as u32;
@@ -920,7 +978,7 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
             let start = rtp.payload.as_ptr() as usize - frame.as_ptr() as usize;
             let mut id = [0u8; 8];
             id[..4].copy_from_slice(&source.0);
-            Some(Packet { stream: rtp.ssrc, source: id, sequence: rtp.sequence_number, channels: options.chan, bits: options.bits, rate: options.rate, frames, payload: start..start + frames * frame_bytes })
+            Some(Packet { stream: rtp.ssrc, source: id, sequence: rtp.sequence_number, channels: options.chan, bits: options.bits, rate: options.rate, frames, payload: start..start + frames * frame_bytes, rtp_timestamp: Some(rtp.timestamp) })
         }
     }
 }
@@ -953,6 +1011,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let device_frame = device_channels * slot;
     stats::set_receive(format_args!("waiting for PCM {}-bit{}", options.bits, if options.adopted_receive { " (peer's choice)" } else { "" }));
     transport.announce_receiver(options);
+    transport.start_clock(api, options);
     println!("Listening on NIC {} for {} audio; playing on {device_channels} output channel(s) of {}-bit. Escape stops.", options.nic + 1, proto_name(options.proto), info.playback_bits);
     let mut frame = [0u8; 1514];
     let mut staging = [0u8; 8192];
@@ -986,6 +1045,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         let length = (api.nic_receive)(options.nic, frame.as_mut_ptr(), frame.len());
         let spent_receive = tape_rt::micros() - t_receive;
         slow_receive = slow_receive.max(if length != 0 { spent_receive } else { 0 });
+        let received_at = t_receive + spent_receive;
         if length == 0 {
             if locked.is_some() && tape_rt::micros() > last_packet + 2_000_000 {
                 println!("\nThe sender went quiet; waiting for a stream again.");
@@ -1059,6 +1119,12 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             _ => {}
         }
         last_packet = tape_rt::micros();
+        if let Some(stamp) = packet.rtp_timestamp.filter(|_| clock::locked()) {
+            // A sender on the same PTP timeline: the stamp is when its first sample was captured.
+            if let Some(delay) = clock::time_ns_at(received_at).and_then(|now| ptp_tape::stamp_delay(now, stamp, packet.rate, 500_000_000)) {
+                stats::get().ptp_arrival(delay / 1000, last_packet);
+            }
+        }
         // Sequence: a short gap is lost packets, bridged with silence so the audio stays aligned; a long one
         // (the receiver was busy, a cable was pulled) is a resync with no silence.
         let gap = packet.sequence.wrapping_sub(expected);
@@ -1181,6 +1247,11 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     println!();
     if options.verbose && packets > 0 {
         println!("Processing took {} us per packet on average, {} us at worst; nic_receive up to {slow_receive} us, audio_info up to {slow_info} us.", work_total / packets, work_max);
+    }
+    if stats::get().ptp_samples > 0 {
+        let shown = stats::get();
+        let ring_us = i64::from(shown.level_frames) * 1_000_000 / i64::from(shown.rate.max(1));
+        println!("PTP: capture to arrival {} us on average ({} to {}); with the {} us in the ring, about {} us from the sender's capture to this playback ring ({} packets).", shown.ptp_delay_us, shown.ptp_min_us, shown.ptp_max_us, ring_us, shown.ptp_delay_us + ring_us, shown.ptp_samples);
     }
     if options.resample {
         println!("Delay sender capture to playback ring: about {} ms (one packet plus {} ms queued); the device adds its own buffer.", stats::get().delay_ms(), stats::get().level_frames * 1000 / stats::get().rate.max(1));

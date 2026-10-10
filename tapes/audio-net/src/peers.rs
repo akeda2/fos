@@ -139,7 +139,7 @@ pub fn receiver_sdp(options: &Options, config: &NetConfig, name: &str, idle: boo
     if options.opus {
         write_sdp_opus(&SdpOpus { name, receive_only: true, idle, origin: config.ip.0, destination, port: options.port, payload_type: options.payload_type, channels: options.chan, packet_ms_x10: options.frame_x10, session }, out)
     } else {
-        write_sdp(&Sdp { name, receive_only: true, idle, origin: config.ip.0, destination, port: options.port, payload_type: options.payload_type, channels: options.chan, rate: options.rate, bits: options.bits, packet_us: 1000, mac: config.mac.0, session }, out)
+        write_sdp(&Sdp { name, receive_only: true, idle, origin: config.ip.0, destination, port: options.port, payload_type: options.payload_type, channels: options.chan, rate: options.rate, bits: options.bits, packet_us: 1000, mac: config.mac.0, ptp: None, session }, out)
     }
 }
 
@@ -147,7 +147,7 @@ pub fn receiver_sdp(options: &Options, config: &NetConfig, name: &str, idle: boo
 /// carry nothing else), with the marker that says which kind of network it is on.
 pub fn l2_sdp(options: &Options, mac: [u8; 6], name: &str, receive_only: bool, idle: bool, channels: usize, out: &mut [u8]) -> usize {
     let session = (tape_rt::micros() >> 20) as u32;
-    let mut length = write_sdp(&Sdp { name, receive_only, idle, origin: [0; 4], destination: [0; 4], port: 0, payload_type: options.payload_type, channels, rate: options.rate, bits: options.bits, packet_us: 1000, mac, session }, out);
+    let mut length = write_sdp(&Sdp { name, receive_only, idle, origin: [0; 4], destination: [0; 4], port: 0, payload_type: options.payload_type, channels, rate: options.rate, bits: options.bits, packet_us: 1000, mac, ptp: None, session }, out);
     let marker: &[u8] = if options.proto == Proto::Avtp { b"a=x-fos-l2:avtp\r\n" } else { b"a=x-fos-l2:raw\r\n" };
     out[length..length + marker.len()].copy_from_slice(marker);
     length += marker.len();

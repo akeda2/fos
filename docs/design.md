@@ -871,3 +871,18 @@ Measured (skylake3 master, wired gigabit): amd1 path delay ~28 us, jitter ~3 us 
 checks the protocol (lock, no lost Sync, wire format), not the offset. Only real hardware, and `ptp4l` as the
 other end, can check interoperability; the I219 on the dev machine has hardware timestamping, the fos NICs do not
 use it. Next: audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline and a one-way delay readout.
+
+### audio-net on a PTP clock
+
+`audio-net` (RTP only) follows a PTPv2 clock when one is found: `ptp=auto` (default) or `ptp=off`. `clock.rs`
+holds one `ptp-tape` `Slave` plus a `Tracker` (local clock to master time, rate measured over 2 s windows,
+trusts samples below its prediction more since software timestamps only err late) and joins 224.0.1.129 itself
+(its own IGMP state, left on exit). A sender waits up to 3 s for an Announce and 13 s for a lock *before* it opens
+capture (a long wait would overflow the capture ring), then stamps each packet with the PTP time of its first
+sample, in sample periods modulo 2^32 (AES67), smoothed by a slow phase filter because the USB audio clock cannot
+be steered; the SDP gets `a=ts-refclk:ptp=IEEE1588-2008:<grandmaster>:0`. It decides once: a lock mid-stream
+would make the stamps jump. A receiver measures `PTP now - stamp` per packet (rejecting values outside -5..500 ms,
+which is what an unstamped stream gives), and shows it in the summary and the panel as capture-to-arrival plus
+the ring level. Raw and AVTP have no IP, so no PTP; Opus and `serve` are not wired. `make test-audio-ptp` runs a
+master, a sender and a receiver in QEMU (lock, SDP, plausible delay, `ptp=off`); the guests share no time base, so
+accuracy needs real hardware: compare the figure with the loopback `send latency`.

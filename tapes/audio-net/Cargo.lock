@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "audio-wire",
  "opus-codec",
+ "ptp-tape",
  "tape-net",
  "tape-panel",
  "tape-rt",
@@ -25,6 +26,15 @@ version = "0.1.0"
 name = "opus-codec"
 version = "0.1.0"
 dependencies = [
+ "tape-rt",
+]
+
+[[package]]
+name = "ptp-tape"
+version = "0.1.0"
+dependencies = [
+ "audio-wire",
+ "tape-net",
  "tape-rt",
 ]
 

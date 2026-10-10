@@ -548,6 +548,138 @@ impl Rate {
     }
 }
 
+/// Turns the slave's samples into a running estimate of the master's time from the local clock: the offset, and
+/// how fast it changes (the two crystals differ by tens of ppm, which is tens of microseconds per second, far more
+/// than the measurement noise). A sample can only be late, never early (a frame waits in the NIC ring while the
+/// caller is busy), so a sample below the prediction is believed more than one above it. The rate is the slope of
+/// the estimated offset over windows of two seconds or more.
+pub struct Tracker {
+    t0: i64,
+    off0: i64,
+    /// Nanoseconds the offset grows per second (parts per billion).
+    rate_ppb: i64,
+    rate_known: bool,
+    mark: Option<(i64, i64)>,
+    count: u32,
+    last_update: i64,
+}
+
+/// A sample this far from the prediction is a step of the master or a different master: start over.
+const TRACK_STEP: i64 = 5_000_000;
+const MAX_RATE_PPB: i64 = 500_000;
+/// Samples and seconds needed before the clock counts as locked.
+const LOCK_SAMPLES: u32 = 4;
+const LOCK_AGE: i64 = 5_000_000_000;
+
+impl Tracker {
+    pub const fn new() -> Tracker {
+        Tracker { t0: 0, off0: 0, rate_ppb: 0, rate_known: false, mark: None, count: 0, last_update: 0 }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Tracker::new();
+    }
+
+    /// Local clock minus master clock at local time `local`.
+    pub fn offset_at(&self, local: i64) -> i64 {
+        self.off0 + (local - self.t0) / 1000 * self.rate_ppb / 1_000_000
+    }
+
+    /// The master's time at local time `local`.
+    pub fn master_time(&self, local: i64) -> i64 {
+        local - self.offset_at(local)
+    }
+
+    /// The rate difference in tenths of ppm (positive: the local clock runs fast), once known.
+    pub fn tenths_ppm(&self) -> Option<i64> {
+        self.rate_known.then_some(self.rate_ppb / 100)
+    }
+
+    /// Enough good samples, recently. Time read while this is false is not the master's.
+    pub fn locked(&self, local: i64) -> bool {
+        self.count >= LOCK_SAMPLES && self.rate_known && local - self.last_update <= LOCK_AGE
+    }
+
+    pub fn update(&mut self, local: i64, offset: i64) {
+        self.last_update = local;
+        if self.count == 0 || (offset - self.offset_at(local)).abs() > TRACK_STEP {
+            *self = Tracker { t0: local, off0: offset, count: 1, last_update: local, ..Tracker::new() };
+            return;
+        }
+        let predicted = self.offset_at(local);
+        let error = offset - predicted;
+        let divisor = if error < 0 || !self.rate_known { 2 } else { 32 };
+        self.off0 = predicted + error / divisor;
+        self.t0 = local;
+        self.count = self.count.saturating_add(1);
+        match self.mark {
+            None => self.mark = Some((local, self.off0)),
+            Some((then, before)) if local - then >= 2_000_000_000 => {
+                let measured = ((self.off0 - before) as i128 * 1_000_000_000 / (local - then) as i128) as i64;
+                let measured = measured.clamp(-MAX_RATE_PPB, MAX_RATE_PPB);
+                self.rate_ppb = if self.rate_known { self.rate_ppb + (measured - self.rate_ppb) / 4 } else { measured };
+                self.rate_known = true;
+                self.mark = Some((local, self.off0));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// RTP timestamps on the PTP timeline (AES67: the timestamp is the PTP time in sample periods, modulo 2^32, of
+/// the packet's first sample). The sample clock of a USB audio device cannot follow PTP, so the stamp is the
+/// previous one plus the packet's frames, pulled towards the measured PTP time by a slow filter: it follows the
+/// timeline without the jitter of reading the clock once per packet. Positions are in 1/65536 of a frame.
+pub struct MediaClock {
+    phase: Option<u64>,
+}
+
+const PHASE_BITS: u32 = 48;
+
+impl MediaClock {
+    pub const fn new() -> MediaClock {
+        MediaClock { phase: None }
+    }
+
+    /// PTP time as a timestamp: frames at `rate` since the epoch, modulo 2^32.
+    pub fn frames_at(ptp_ns: i64, rate: u32) -> u32 {
+        (i128::from(ptp_ns) * i128::from(rate) / 1_000_000_000) as u32
+    }
+
+    /// The timestamp of the next packet: `target` is the PTP time of its first sample as `frames_at` gives it,
+    /// `step` the frames since the previous packet's first sample.
+    pub fn next(&mut self, target: u32, rate: u32, step: u32) -> u32 {
+        let mask = (1u64 << PHASE_BITS) - 1;
+        let wanted = u64::from(target) << 16;
+        let phase = match self.phase {
+            None => wanted,
+            Some(previous) => {
+                let expected = previous.wrapping_add(u64::from(step) << 16) & mask;
+                let difference = ((wanted.wrapping_sub(expected) & mask) << (64 - PHASE_BITS)) as i64 >> (64 - PHASE_BITS);
+                if difference.unsigned_abs() > u64::from(rate) << 16 {
+                    wanted
+                } else {
+                    expected.wrapping_add((difference / 128) as u64) & mask
+                }
+            }
+        };
+        self.phase = Some(phase);
+        (phase >> 16) as u32
+    }
+
+    pub fn reset(&mut self) {
+        self.phase = None;
+    }
+}
+
+/// The delay in nanoseconds from the instant `stamp` names to PTP time `now_ns`, if it is plausible (a stream
+/// whose timestamps are not on the PTP timeline gives a random number: at most `limit_ns` late, or 5 ms early).
+pub fn stamp_delay(now_ns: i64, stamp: u32, rate: u32, limit_ns: i64) -> Option<i64> {
+    let difference = MediaClock::frames_at(now_ns, rate).wrapping_sub(stamp) as i32;
+    let delay = i64::from(difference) * 1_000_000_000 / i64::from(rate.max(1));
+    (-5_000_000..=limit_ns).contains(&delay).then_some(delay)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +859,85 @@ mod tests {
             rate.add(second * 1_000_000_000, second * 12_000); // 12 us per second: +12 ppm
         }
         assert_eq!(rate.tenths_ppm(), Some(120));
+    }
+
+    #[test]
+    fn tracker_follows_a_drifting_clock_through_late_samples() {
+        let mut tracker = Tracker::new();
+        let mut worst = 0i64;
+        let mut seed = 12345u64;
+        for n in 0..400i64 {
+            let local = 1_000_000_000_000 + n * 125_000_000;
+            let truth = 7_000_000_000 - (local - 1_000_000_000_000) / 1_000_000 * 70; // local minus master falls 70 ppm
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let late = if seed >> 62 == 0 { ((seed >> 20) % 300_000) as i64 } else { 0 };
+            tracker.update(local, truth + late);
+            if n > 80 {
+                worst = worst.max((tracker.offset_at(local + 60_000_000) - (truth - 4_200)).abs());
+            }
+        }
+        assert!(worst < 50_000, "worst error {worst} ns");
+        let ppm = tracker.tenths_ppm().unwrap();
+        assert!((-720..=-680).contains(&ppm), "rate {ppm}");
+        assert!(tracker.locked(1_000_000_000_000 + 399 * 125_000_000));
+        assert!(!tracker.locked(1_000_000_000_000 + 399 * 125_000_000 + 6_000_000_000));
+    }
+
+    #[test]
+    fn tracker_restarts_on_a_step() {
+        let mut tracker = Tracker::new();
+        for n in 0..20i64 {
+            tracker.update(n * 1_000_000_000, 1_000_000);
+        }
+        tracker.update(21_000_000_000, 900_000_000);
+        assert_eq!(tracker.offset_at(21_000_000_000), 900_000_000);
+        assert!(!tracker.locked(21_000_000_000));
+    }
+
+    #[test]
+    fn media_clock_follows_ptp_with_a_steady_step() {
+        let mut clock = MediaClock::new();
+        let rate = 48_000u32;
+        let mut last = 0u32;
+        let mut worst_jump = 0i64;
+        let mut worst_error = 0i64;
+        let mut seed = 99u64;
+        for n in 0..20_000u64 {
+            // the packet source runs 50 ppm fast against PTP; the target has up to 2 ms of read jitter
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let jitter = ((seed >> 33) % 96) as i64 - 48;
+            let ptp_ns = 3_600_000_000_000i64 + (n as i64) * 1_000_000 * 1_000_000 / 1_000_050 * 1000 / 1000;
+            let target = MediaClock::frames_at(ptp_ns, rate).wrapping_add(jitter as u32);
+            let stamp = clock.next(target, rate, 48);
+            if n > 0 {
+                worst_jump = worst_jump.max((i64::from(stamp.wrapping_sub(last)) - 48).abs());
+            }
+            last = stamp;
+            if n > 2_000 {
+                worst_error = worst_error.max(i64::from(stamp.wrapping_sub(MediaClock::frames_at(ptp_ns, rate)) as i32).abs());
+            }
+        }
+        assert!(worst_jump <= 1, "stamps step by 48 frames +- {worst_jump}");
+        assert!(worst_error <= 12, "stamp is {worst_error} frames from PTP time");
+    }
+
+    #[test]
+    fn media_clock_wraps_and_resets_on_a_jump() {
+        let mut clock = MediaClock::new();
+        let near_wrap = u32::MAX - 100;
+        assert_eq!(clock.next(near_wrap, 48_000, 48), near_wrap);
+        assert_eq!(clock.next(near_wrap.wrapping_add(48), 48_000, 48), near_wrap.wrapping_add(48));
+        assert_eq!(clock.next(near_wrap.wrapping_add(96), 48_000, 48), near_wrap.wrapping_add(96));
+        assert_eq!(clock.next(1_000_000, 48_000, 48), 1_000_000, "a PTP step restarts the stamps");
+    }
+
+    #[test]
+    fn stamp_delay_is_plausible_only_near_now() {
+        let now = 10_000_000_000i64;
+        let stamp = MediaClock::frames_at(now - 1_500_000, 48_000);
+        let delay = stamp_delay(now, stamp, 48_000, 1_000_000_000).unwrap();
+        assert!((1_499_000..=1_501_000).contains(&delay));
+        assert_eq!(stamp_delay(now, stamp.wrapping_add(40_000_000), 48_000, 1_000_000_000), None, "an arbitrary timeline");
+        assert_eq!(stamp_delay(now, stamp.wrapping_add(10_000), 48_000, 1_000_000_000), None, "stamped in the future");
     }
 }

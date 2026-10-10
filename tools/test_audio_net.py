@@ -221,7 +221,7 @@ def main():
                     captured = []
                     thread = threading.Thread(target=sniff, args=(4.0, captured))
                     thread.start()
-                    mark = sender.send("run audio-net send proto=rtp ip=192.168.50.1/24 to=192.168.50.2 src=tone=660 secs=3")
+                    mark = sender.send("run audio-net send proto=rtp ptp=off ip=192.168.50.1/24 to=192.168.50.2 src=tone=660 secs=3")
                     sender.wait_for("Sent ", 60, mark)
                     thread.join()
                     sdp = sender.text()[mark:]
@@ -234,7 +234,7 @@ def main():
                     captured = []
                     thread = threading.Thread(target=sniff, args=(4.0, captured))
                     thread.start()
-                    mark = sender.send("run audio-net send proto=rtp codec=opus bitrate=96 ip=192.168.50.1/24 to=192.168.50.2 src=tone=770 secs=3")
+                    mark = sender.send("run audio-net send proto=rtp ptp=off codec=opus bitrate=96 ip=192.168.50.1/24 to=192.168.50.2 src=tone=770 secs=3")
                     sender.wait_for("Sent ", 60, mark)
                     thread.join()
                     sdp = sender.text()[mark:]
@@ -249,7 +249,7 @@ def main():
                     captured = []
                     thread = threading.Thread(target=sniff, args=(3.0, captured))
                     thread.start()
-                    mark = sender.send("run audio-net send proto=rtp codec=opus ch=1-3 frame=10 ip=192.168.50.1/24 to=239.1.2.3 src=tone=500 secs=2")
+                    mark = sender.send("run audio-net send proto=rtp ptp=off codec=opus ch=1-3 frame=10 ip=192.168.50.1/24 to=239.1.2.3 src=tone=500 secs=2")
                     sender.wait_for("Sent ", 60, mark)
                     thread.join()
                     text = sender.text()[mark:]
@@ -279,7 +279,7 @@ def main():
                     receiver.pump(2.5)
                     answers = [m for m in igmp_messages(captured, bytes.fromhex("5254001234b2")) if m[1] == 0x16 and m[0] >= query_sent]
                     check(len(answers) >= 1 and answers[0][2] == "239.1.2.3", f"the receiver answers an IGMP query with a report for 239.1.2.3 ({len(answers)} seen)", "")
-                    mark = sender.send("run audio-net send proto=rtp codec=opus ip=192.168.50.1/24 to=239.1.2.3 src=tone=550 secs=3")
+                    mark = sender.send("run audio-net send proto=rtp ptp=off codec=opus ip=192.168.50.1/24 to=239.1.2.3 src=tone=550 secs=3")
                     sender.wait_for("Sent ", 60, mark)
                     receiver.pump(1.0)
                     mark = len(receiver.text())
@@ -461,7 +461,7 @@ def config_test():
             check(packets >= 2500, f"the cfg-driven receiver got {packets} packets from the cfg-driven sender", report)
             check("trying again" not in a.text(), "and Escape ended it without a retry", "")
             a.wait_for("fos> ", 30, mark)
-            mark = b.send("run audio-net send proto=rtp ip=192.168.50.1/24 to=192.168.50.9 src=tone=440")
+            mark = b.send("run audio-net send proto=rtp ptp=off ip=192.168.50.1/24 to=192.168.50.9 src=tone=440")
             end = time.monotonic() + 60
             while b.text()[mark:].count("trying again in 5 s") < 2 and time.monotonic() < end:
                 b.pump(0.5)
@@ -490,7 +490,7 @@ def auto_group_test():
             for guest in (a, b):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            mark_b = b.send("run audio-net send proto=rtp codec=opus name=glenn ip=192.168.60.1/24 src=tone=500 secs=40")
+            mark_b = b.send("run audio-net send proto=rtp ptp=off codec=opus name=glenn ip=192.168.60.1/24 src=tone=500 secs=40")
             b.wait_for("Announcing this stream as 'glenn'", 60, mark_b)
             text_b = b.text()[mark_b:]
             group = re.search(r"multicast group (239\.192\.\d+\.\d+)", text_b)
@@ -505,7 +505,7 @@ def auto_group_test():
             check(re.search(r"Delay sender capture to playback ring: about \d+ ms", text) is not None, "the receiver's summary estimates the delay", text[-900:])
             # QEMU's USB audio has no capture side, so only the refusal can be tried here; the loopback itself
             # needs two real machines and a cable (see docs/design.md).
-            mark = a.send("run audio-net send latency src=tone=440 proto=rtp ip=192.168.60.2/24 to=239.192.9.9 secs=2")
+            mark = a.send("run audio-net send ptp=off latency src=tone=440 proto=rtp ip=192.168.60.2/24 to=239.192.9.9 secs=2")
             a.wait_for("latency needs the capture device", 60, mark)
         finally:
             a.stop()
@@ -527,7 +527,7 @@ def priority_test():
             mark = a.send("run audio-net recv priority=bogus")
             a.wait_for("priority= is safe, balanced, low or auto", 30, mark)
             a.wait_for("fos> ", 30, mark)
-            mark_b = b.send("run audio-net send proto=rtp name=lowlat ip=192.168.60.1/24 src=tone=440 priority=low secs=30")
+            mark_b = b.send("run audio-net send proto=rtp ptp=off name=lowlat ip=192.168.60.1/24 src=tone=440 priority=low secs=30")
             b.wait_for("frames (250 us) per packet", 60, mark_b)
             check(True, "priority=low sends 12-frame, 250 us packets", "")
             mark = a.send("run audio-net recv source=auto ip=192.168.60.2/24 priority=auto secs=8")
@@ -538,7 +538,7 @@ def priority_test():
             check(packets >= 500, f"a priority=auto receiver gets the small-packet stream ({packets} packets)", text[-800:])
             b.wait_for("Sent ", 60, mark_b)
             b.wait_for("fos> ", 30, mark_b)
-            mark_b = b.send("run audio-net send proto=rtp name=lowlat ip=192.168.60.1/24 src=tone=440 priority=low ptime=500 secs=2")
+            mark_b = b.send("run audio-net send proto=rtp ptp=off name=lowlat ip=192.168.60.1/24 src=tone=440 priority=low ptime=500 secs=2")
             b.wait_for("frames (500 us) per packet", 60, mark_b)
             check(True, "an explicit ptime= overrides the priority", "")
         finally:
@@ -558,7 +558,7 @@ def peers_test():
             for guest in (a, b):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            mark_b = b.send("run audio-net send proto=rtp codec=opus name=studio-a ip=192.168.50.1/24 to=239.1.2.3 src=tone=500 secs=40")
+            mark_b = b.send("run audio-net send proto=rtp ptp=off codec=opus name=studio-a ip=192.168.50.1/24 to=239.1.2.3 src=tone=500 secs=40")
             b.wait_for("Announcing this stream as 'studio-a'", 60, mark_b)
             mark = a.send("run audio-net list ip=192.168.50.2/24 secs=8")
             a.wait_for("fos> ", 60, mark)
@@ -578,7 +578,7 @@ def peers_test():
             mark_a = a.send("run audio-net recv proto=rtp ip=192.168.50.2/24 name=hall secs=30 target=30")
             a.wait_for("Listening on NIC 1 for RTP/UDP", 60, mark_a)
             a.pump(3.0)
-            mark_b = b.send("run audio-net send proto=rtp ip=192.168.50.1/24 to=hall src=tone=700 secs=3")
+            mark_b = b.send("run audio-net send proto=rtp ptp=off ip=192.168.50.1/24 to=hall src=tone=700 secs=3")
             b.wait_for("Sent ", 90, mark_b)
             text_b = b.text()[mark_b:]
             check("Found 'hall': 192.168.50.2" in text_b and "Sending to 192.168.50.2" in text_b, "to=hall finds the listener and sends to its address", text_b[-900:])
@@ -658,7 +658,7 @@ def panel_test():
             keys(a, "s")
             a.pump(3.0)
             keys(b, "s")
-            a.pump(8.0)  # an empty Peer on a receiver means source=auto: it first waits for the announcement
+            a.pump(12.0)  # an empty Peer on a receiver means source=auto: it first waits for the announcement
             b.pump(2.0)
             text_a, text_b = a.text()[mark_a:], b.text()[mark_b:]
             check("Tx " in text_b and "Lost 0" in text_a, "both live views show counters", text_a[-500:] + text_b[-500:])
@@ -841,7 +841,7 @@ def codec_follows_listener_test():
                 guest.wait_for("fos> ")
             mark_a = a.send("run audio-net recv proto=rtp codec=opus name=a source=b ip=192.168.50.2/24 secs=40")
             a.pump(3.0)
-            mark_b = b.send("run audio-net send proto=rtp name=b ip=192.168.50.1/24 to=a src=tone=500 secs=6")
+            mark_b = b.send("run audio-net send proto=rtp ptp=off name=b ip=192.168.50.1/24 to=a src=tone=500 secs=6")
             b.wait_for("Sent ", 90, mark_b)
             text_b = b.text()[mark_b:]
             check("Sending 2 channel(s), 24-bit" in text_b and "Opus" not in text_b.split("Sending 2")[1][:200], "the sender keeps the codec it was set to (PCM) although its listener was set to Opus", text_b[-700:])
@@ -914,7 +914,7 @@ def dhcp_test():
         try:
             guest.wait_for("M3 complete")
             guest.wait_for("fos> ")
-            mark = guest.send("run audio-net send proto=rtp ip=dhcp to=10.0.2.2 src=tone=440 secs=1")
+            mark = guest.send("run audio-net send proto=rtp ptp=off ip=dhcp to=10.0.2.2 src=tone=440 secs=1")
             guest.wait_for("Sent ", 60, mark)
             text = guest.text()[mark:]
             check("Network: 10.0.2.15 on NIC 1 (MAC 52:54:00:12:34:c2)." in text, "ip=dhcp obtains a lease (10.0.2.15) and streams from it", text[:800])

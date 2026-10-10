@@ -62,6 +62,13 @@ pub struct Stats {
     /// The device's playback underruns when the last packet arrived: silence after the stream has ended is not one.
     pub underrun_last: u64,
     pub rate: u32,
+    /// Capture-to-arrival delay read off the sender's PTP-stamped RTP timestamps (needs both ends locked to one clock):
+    /// a running average, the extremes, how many packets, and when (micros) the last one was read.
+    pub ptp_delay_us: i64,
+    pub ptp_min_us: i64,
+    pub ptp_max_us: i64,
+    pub ptp_samples: u64,
+    pub ptp_last: u64,
     /// One detector per channel of the stream being sent and of the stream being received.
     pub send: [Ppm; MAX_CHANNELS],
     pub receive: [Ppm; MAX_CHANNELS],
@@ -83,6 +90,24 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// One packet's capture-to-arrival delay (microseconds), read at micros `now`.
+    pub fn ptp_arrival(&mut self, delay_us: i64, now: u64) {
+        if self.ptp_samples == 0 {
+            (self.ptp_delay_us, self.ptp_min_us, self.ptp_max_us) = (delay_us, delay_us, delay_us);
+        } else {
+            self.ptp_delay_us += (delay_us - self.ptp_delay_us) / 16;
+            self.ptp_min_us = self.ptp_min_us.min(delay_us);
+            self.ptp_max_us = self.ptp_max_us.max(delay_us);
+        }
+        self.ptp_samples += 1;
+        self.ptp_last = now;
+    }
+
+    /// The measured delay, if one was read in the last two seconds.
+    pub fn ptp_current(&self, now: u64) -> Option<i64> {
+        (self.ptp_samples > 0 && now.saturating_sub(self.ptp_last) < 2_000_000).then_some(self.ptp_delay_us)
+    }
+
     /// What the tape itself can say about the delay from the sender's capture to this machine's playback ring, in
     /// ms: one packet (the sender waits for a whole one) plus the audio queued here. The network adds well under a
     /// millisecond on a LAN; the playback device's own buffer and converter come on top (`send latency` measures all).
@@ -93,7 +118,7 @@ impl Stats {
 
 const fn fresh() -> Stats {
     Stats {
-        sent: 0, received: 0, lost: 0, level_frames: 0, target_frames: 0, packet_frames: 0, offset_ppm: 0, underrun_base: 0, underrun_last: 0, rate: 48_000,
+        sent: 0, received: 0, lost: 0, level_frames: 0, target_frames: 0, packet_frames: 0, offset_ppm: 0, underrun_base: 0, underrun_last: 0, rate: 48_000, ptp_delay_us: 0, ptp_min_us: 0, ptp_max_us: 0, ptp_samples: 0, ptp_last: 0,
         send: [Ppm::new(); MAX_CHANNELS], receive: [Ppm::new(); MAX_CHANNELS], send_clip: [false; MAX_CHANNELS], receive_clip: [false; MAX_CHANNELS],
         send_channels: 0, receive_channels: 0, send_codec: Label::new(), receive_codec: Label::new(), meters_on: true, serve_status: Label::new(), coefficients: Coefficients::ZERO, coefficients_rate: 0,
     }
