@@ -211,7 +211,7 @@ def main():
                     mark = receiver.send("run audio-net recv")
                     receiver.wait_for("Listening on NIC 1", 30, mark)
                     receiver.pump(3.0)  # QEMU's emulated USB audio keeps the receiver busy for a while after it starts
-                    mark = sender.send("run audio-net send src=tone=440 secs=3")
+                    mark = sender.send("run audio-net send ptp=off src=tone=440 secs=3")
                     sender.wait_for("Sent ", 60, mark)
                 elif run == "c":
                     # RTP over UDP: stereo 24-bit 660 Hz between two static addresses (ARP resolves the peer).
@@ -303,7 +303,7 @@ def main():
                     captured = []
                     thread = threading.Thread(target=sniff, args=(4.0, captured))
                     thread.start()
-                    mark = sender.send("run audio-net send proto=avtp src=tone=600 secs=3")
+                    mark = sender.send("run audio-net send ptp=off proto=avtp src=tone=600 secs=3")
                     sender.wait_for("Sent ", 60, mark)
                     thread.join()
                     frames = [f for _, f in captured if f[12:14] == b"\x22\xf0"]
@@ -322,7 +322,7 @@ def main():
                     mark = receiver.send("run audio-net recv from=52:54:00:12:34:b1 target=8")
                     receiver.wait_for("Listening on NIC 1", 30, mark)
                     receiver.pump(3.0)
-                    mark = sender.send("run audio-net send src=tone=880 ch=1 bits=16 to=52:54:00:12:34:b2 secs=3")
+                    mark = sender.send("run audio-net send ptp=off src=tone=880 ch=1 bits=16 to=52:54:00:12:34:b2 secs=3")
                     sender.wait_for("Sent ", 60, mark)
                 if run == "e":
                     continue
@@ -405,8 +405,8 @@ def duplex_test():
             for guest in (a, b):
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            mark_a = a.send("run audio-net duplex src=tone=440 from=52:54:00:12:34:d2 secs=8 target=10")
-            mark_b = b.send("run audio-net duplex src=tone=880 from=52:54:00:12:34:d1 secs=8 target=10")
+            mark_a = a.send("run audio-net duplex ptp=off src=tone=440 from=52:54:00:12:34:d2 secs=8 target=10")
+            mark_b = b.send("run audio-net duplex ptp=off src=tone=880 from=52:54:00:12:34:d1 secs=8 target=10")
             for guest, mark in ((a, mark_a), (b, mark_b)):
                 guest.wait_for("Received ", 90, mark)
                 guest.wait_for("fos> ", 30, mark)
@@ -712,7 +712,7 @@ def layer_2_names_test():
                 mark_rx = rx.send(f"run audio-net recv proto={proto} name=rx secs=40")
                 rx.wait_for("Listening on NIC 1", 30, mark_rx)
                 rx.pump(3.0)
-                mark_tx = tx.send(f"run audio-net send proto={proto} name=tx to=rx src=tone=440 secs=4")
+                mark_tx = tx.send(f"run audio-net send ptp=off proto={proto} name=tx to=rx src=tone=440 secs=4")
                 tx.wait_for("Sent ", 60, mark_tx)
                 text = tx.text()[mark_tx:]
                 check("Found 'rx': MAC 52:54:00:12:34:f2" in text, f"{proto}: to=NAME finds the listener's MAC from its announcement", text[-600:])
@@ -729,7 +729,7 @@ def layer_2_names_test():
                 rx.process.stdin.flush()
                 rx.wait_for("fos> ", 30, mark_rx + len(rx.text()[mark_rx:]) - 10)
                 # The receiver names its sender.
-                mark_tx = tx.send(f"run audio-net send proto={proto} name=tx src=tone=660 secs=25")
+                mark_tx = tx.send(f"run audio-net send ptp=off proto={proto} name=tx src=tone=660 secs=25")
                 tx.wait_for("Announcing this stream", 60, mark_tx)
                 mark_rx = rx.send(f"run audio-net recv proto={proto} name=rx source=tx secs=6")
                 rx.wait_for("Found 'tx'", 40, mark_rx)
@@ -895,7 +895,7 @@ def panel_wait_test():
             check("fos-1234b3" in picker and "listening" in picker, "the waiting receiver is listed as listening (it announces while it waits)", picker[:500])
             keys(b, "1")
             keys(b, "s")
-            a.pump(10.0)
+            a.pump(14.0)  # the sender first looks for a PTP clock for 3 s
             received = [int(part.split(" ")[0]) for part in a.text()[mark_a:].split("Rx ")[1:] if part.split(" ")[0].isdigit()]
             check(received and max(received) >= 500, f"the receiver then gets the stream ({max(received) if received else 0} packets)", a.text()[-600:])
         finally:

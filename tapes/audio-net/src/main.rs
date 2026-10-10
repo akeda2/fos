@@ -41,9 +41,11 @@
 //! off-subnet) or `ip=dhcp`. `to=` is the destination IP, a unicast address or a multicast group
 //! (239.x.y.z, no ARP needed); `port=` (default 5004) is both the source and destination UDP port. `send`
 //! prints an SDP description of the stream to open on the other side. `recv` cannot learn the channel count
-//! from RTP (SDP carries it), so give `chan=` (default 2) and `bits=`. `ptp=auto|off` (default auto): a
-//! sender that hears a PTPv2 clock (ptp4l, a studio clock, the `ptp` tape's master) on 224.0.1.129 locks to it
-//! before it captures, stamps RTP on the PTP timeline (sample periods mod 2^32) and names the grandmaster in
+//! from RTP (SDP carries it), so give `chan=` (default 2) and `bits=`. `ptp=auto|l2|off` (default auto): a
+//! sender that hears a PTPv2 clock (ptp4l, a studio clock, the `ptp` tape's master) on 224.0.1.129 (raw and AVTP
+//! streams, which have no IP, listen for Ethernet PTP, 0x88F7, instead; `l2` forces that for RTP) locks to it
+//! before it captures, stamps RTP and raw packets on the PTP timeline (sample periods mod 2^32; AVTP: a valid
+//! presentation time, capture plus 2 ms in nanoseconds) and names the grandmaster in
 //! the SDP (`ts-refclk:ptp`); with no clock it says so and counts from zero. A receiver that is locked too
 //! reports the sender-capture-to-arrival delay. The sound card clocks are not steered. See `clock.rs`.
 //!
@@ -196,8 +198,10 @@ pub struct Options<'a> {
     http: u16,
     /// `serve`: milliseconds of recent audio sent to a new client at once, so that its player starts with a full buffer.
     prebuffer_ms: u32,
-    /// `ptp=auto|off`: look for a PTP clock (RTP only) and stamp and time packets with it.
+    /// `ptp=auto|l2|off`: look for a PTP clock and stamp and time packets with it.
     ptp: bool,
+    /// `ptp=l2`: PTP over Ethernet even for RTP.
+    ptp_l2: bool,
 }
 
 pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -223,7 +227,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
     let mut options = Options {
         proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, priority: None, ptime_us: 1000, target_given: false, ptime_given: false, seconds: 0, verbose: false, latency: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0, ptp: true,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0, ptp: true, ptp_l2: false,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -278,7 +282,10 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "prebuffer" => options.prebuffer_ms = value.parse().ok().filter(|&ms| ms <= 1000).ok_or("prebuffer= is 0 to 1000 milliseconds")?,
             "verbose" => options.verbose = true,
             "latency" => options.latency = true,
-            "ptp" => options.ptp = match value { "auto" | "on" => true, "off" => false, _ => return Err("ptp= is auto or off") },
+            "ptp" => {
+                options.ptp = match value { "auto" | "on" | "l2" => true, "off" => false, _ => return Err("ptp= is auto, l2 or off") };
+                options.ptp_l2 = value == "l2";
+            }
             _ => return Err("unknown option"),
         }
     }
@@ -465,10 +472,10 @@ impl Transport {
         frame.is_some_and(|frame| igmp.handle(frame, now))
     }
 
-    /// `ptp=auto`: starts listening for a PTP clock (RTP only).
+    /// `ptp=auto`: starts listening for a PTP clock (UDP for RTP, Ethernet for raw and AVTP).
     pub fn start_clock(&mut self, api: &TapeApi, options: &Options) {
-        if options.ptp && self.proto == Proto::Rtp && !self.ptp {
-            clock::start(api, options.nic, &self.config);
+        if options.ptp && !self.ptp {
+            clock::start(api, options.nic, &self.config, self.proto != Proto::Rtp || options.ptp_l2);
             self.ptp = true;
         }
     }
@@ -476,7 +483,7 @@ impl Transport {
     pub fn stop_clock(&mut self, api: &TapeApi, nic: usize) {
         if self.ptp {
             self.ptp = false;
-            clock::stop(api, nic, self.igmp.is_some());
+            clock::stop(api, nic, self.igmp.is_some() || self.proto == Proto::Avtp);
         }
     }
 
@@ -550,10 +557,10 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     transport.start_clock(api, options);
     if transport.ptp {
         if clock::wait_for_lock(api) {
-            println!("PTP: locked to a clock ({} us path delay); RTP timestamps are on its timeline.", clock::path_delay_us().unwrap_or(0));
+            println!("PTP: locked to a clock ({} us path delay); timestamps are on its timeline.", clock::path_delay_us().unwrap_or(0));
             stamper = Some(clock::Stamper::new(options.rate));
         } else {
-            println!("PTP: {}; RTP timestamps count from zero (ptp=off silences this).", if clock::found() { "a clock was heard but did not lock" } else { "no clock found" });
+            println!("PTP: {}; timestamps count from zero (ptp=off silences this).", if clock::found() { "a clock was heard but did not lock" } else { "no clock found" });
             transport.stop_clock(api, options.nic);
         }
     }
@@ -675,12 +682,13 @@ pub fn send(api: &'static TapeApi, options: &Options) {
                 frame[0..6].copy_from_slice(&mac);
                 frame[6..12].copy_from_slice(&transport.mac);
                 frame[12..14].copy_from_slice(&audio_wire::avtp::ETHERTYPE.to_be_bytes());
-                // Stream id: our MAC and a unique id. The presentation time needs a gPTP clock, which fos does not
-                // have, so it is marked not valid (tv = 0): a listener plays on arrival, as `recv` does.
+                // Stream id: our MAC and a unique id. With a PTP clock the presentation time is valid (capture time plus
+                // 2 ms on that clock's timeline); without one tv = 0 and a listener plays on arrival, as `recv` does.
                 let mut stream_id = [0u8; 8];
                 stream_id[..6].copy_from_slice(&transport.mac);
                 stream_id[6..].copy_from_slice(&1u16.to_be_bytes());
-                let header = audio_wire::avtp::Header { sequence: sequence as u8, timestamp_valid: false, stream_id, timestamp: 0, channels: channels as u16, bits: bits as u8, rate: options.rate, data_length: length as u16 };
+                let presentation = stamper.as_ref().and_then(|stamper| stamper.presentation(age_frames));
+                let header = audio_wire::avtp::Header { sequence: sequence as u8, timestamp_valid: presentation.is_some(), stream_id, timestamp: presentation.unwrap_or(0), channels: channels as u16, bits: bits as u8, rate: options.rate, data_length: length as u16 };
                 if !header.encode(&mut frame[ETHERNET_HEADER..]) {
                     return println!("audio-net send: AVTP has no code for {} Hz.", options.rate);
                 }
@@ -692,7 +700,8 @@ pub fn send(api: &'static TapeApi, options: &Options) {
                 frame[0..6].copy_from_slice(&mac);
                 frame[6..12].copy_from_slice(&transport.mac);
                 frame[12..14].copy_from_slice(&ETHERTYPE.to_be_bytes());
-                Header { first: sent == 0, sequence, timestamp, stream, channels: channels as u8, bits: bits as u8, frames: per_packet as u16, rate: options.rate }.encode(&mut frame[ETHERNET_HEADER..]);
+                let stamp = stamper.as_mut().and_then(|stamper| stamper.stamp(age_frames, per_packet as u32)).unwrap_or(timestamp);
+                Header { first: sent == 0, sequence, timestamp: stamp, stream, channels: channels as u8, bits: bits as u8, frames: per_packet as u16, rate: options.rate }.encode(&mut frame[ETHERNET_HEADER..]);
                 frame[ETHERNET_HEADER + HEADER_LEN..ETHERNET_HEADER + HEADER_LEN + length].copy_from_slice(&payload[..length]);
                 Some(ETHERNET_HEADER + HEADER_LEN + length)
             }
@@ -899,6 +908,8 @@ struct Packet {
     payload: core::ops::Range<usize>,
     /// RTP's timestamp (the sender's PTP time if it follows one); None for the other protocols.
     rtp_timestamp: Option<u32>,
+    /// AVTP's presentation time (nanoseconds mod 2^32), when the sender marked it valid.
+    avtp_time: Option<u32>,
 }
 
 fn proto_name(proto: Proto) -> &'static str {
@@ -946,6 +957,7 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
                 frames: usize::from(header.data_length) / frame_bytes,
                 payload: start..start + usize::from(header.data_length),
                 rtp_timestamp: None,
+                avtp_time: header.timestamp_valid.then_some(header.timestamp),
             })
         }
         Proto::Raw => {
@@ -960,7 +972,7 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
             let mut source = [0u8; 8];
             source[..6].copy_from_slice(&sender);
             let start = ETHERNET_HEADER + HEADER_LEN;
-            Some(Packet { stream: header.stream, source, sequence: header.sequence, channels: usize::from(header.channels), bits: usize::from(header.bits), rate: header.rate, frames: usize::from(header.frames), payload: start..start + header.payload_len(), rtp_timestamp: None })
+            Some(Packet { stream: header.stream, source, sequence: header.sequence, channels: usize::from(header.channels), bits: usize::from(header.bits), rate: header.rate, frames: usize::from(header.frames), payload: start..start + header.payload_len(), rtp_timestamp: Some(header.timestamp), avtp_time: None })
         }
         Proto::Rtp => {
             let now = (api.ticks)() as u32;
@@ -991,7 +1003,7 @@ fn classify(api: &TapeApi, options: &Options, transport: &mut Transport, frame: 
             let start = rtp.payload.as_ptr() as usize - frame.as_ptr() as usize;
             let mut id = [0u8; 8];
             id[..4].copy_from_slice(&source.0);
-            Some(Packet { stream: rtp.ssrc, source: id, sequence: rtp.sequence_number, channels: options.chan, bits: options.bits, rate: options.rate, frames, payload: start..start + frames * frame_bytes, rtp_timestamp: Some(rtp.timestamp) })
+            Some(Packet { stream: rtp.ssrc, source: id, sequence: rtp.sequence_number, channels: options.chan, bits: options.bits, rate: options.rate, frames, payload: start..start + frames * frame_bytes, rtp_timestamp: Some(rtp.timestamp), avtp_time: None })
         }
     }
 }
@@ -1132,6 +1144,13 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             _ => {}
         }
         last_packet = tape_rt::micros();
+        if let Some(time) = packet.avtp_time.filter(|_| clock::locked()) {
+            // Presentation time = capture + 2 ms on the sender's PTP timeline (nanoseconds mod 2^32).
+            let delay = i64::from((clock::time_ns_at(received_at).unwrap_or(0) as u32).wrapping_sub(time.wrapping_sub(clock::AVTP_OFFSET_NS)) as i32);
+            if (-5_000_000..=500_000_000).contains(&delay) {
+                stats::get().ptp_arrival(delay / 1000, last_packet);
+            }
+        }
         if let Some(stamp) = packet.rtp_timestamp.filter(|_| clock::locked()) {
             // A sender on the same PTP timeline: the stamp is when its first sample was captured.
             if let Some(delay) = clock::time_ns_at(received_at).and_then(|now| ptp_tape::stamp_delay(now, stamp, packet.rate, 500_000_000)) {

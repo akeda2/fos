@@ -1,7 +1,10 @@
-//! The PTP clock of `audio-net` (RTP over IPv4 only): listens for a PTPv2 grandmaster (`ptp` tape, `ptp4l`, a
+//! The PTP clock of `audio-net`: listens for a PTPv2 grandmaster (`ptp` tape, `ptp4l`, a
 //! studio clock) on 224.0.1.129, measures this machine's clock against it and tells the stream loops what time
 //! it is on the grandmaster's timeline. Nothing is steered: the local clock runs as it is and the estimate is
 //! extrapolated from it (`ptp_tape::Tracker`).
+//!
+//! Transport: UDP on 224.0.1.129 for RTP, Ethernet (0x88F7, as `ptp l2`) for the raw and AVTP streams, which have
+//! no IP; `ptp=l2` forces Ethernet for RTP too.
 //!
 //! What it is used for: the sender stamps its RTP packets with PTP time (AES67's way, so the stream says
 //! `ts-refclk:ptp=...` in its SDP), and a receiver that is also locked reads the one-way delay from the sender's
@@ -26,6 +29,8 @@ struct Ptp {
     arp: ArpCache<8>,
     identity: PortIdentity,
     nic: usize,
+    /// Ethernet transport (no IP, no IGMP).
+    l2: bool,
     users: u8,
     /// Whether an Announce was ever heard (a clock exists on this network).
     found: bool,
@@ -42,7 +47,7 @@ fn local_ns() -> i64 {
 }
 
 /// Starts listening on `nic` (a second caller, such as the other half of a duplex run, shares the first's state).
-pub fn start(api: &TapeApi, nic: usize, config: &NetConfig) {
+pub fn start(api: &TapeApi, nic: usize, config: &NetConfig, l2: bool) {
     if let Some(ptp) = state() {
         ptp.users += 1;
         return;
@@ -55,10 +60,15 @@ pub fn start(api: &TapeApi, nic: usize, config: &NetConfig) {
         arp: ArpCache::new(),
         identity: port_identity(config.mac.0, 1),
         nic,
+        l2,
         users: 1,
         found: false,
     };
-    ptp.igmp.join(api, nic, config);
+    if l2 {
+        (api.nic_set_multicast)(nic, 1);
+    } else {
+        ptp.igmp.join(api, nic, config);
+    }
     unsafe { PTP = Some(ptp) };
 }
 
@@ -70,7 +80,9 @@ pub fn stop(api: &TapeApi, nic: usize, others_joined: bool) {
     if ptp.users > 0 {
         return;
     }
-    ptp.igmp.leave_report(api, nic, &ptp.config);
+    if !ptp.l2 {
+        ptp.igmp.leave_report(api, nic, &ptp.config);
+    }
     if !others_joined {
         (api.nic_set_multicast)(nic, 0);
     }
@@ -91,6 +103,14 @@ fn is_ptp(frame: &[u8]) -> bool {
 pub fn consume(api: &TapeApi, frame: &[u8], t2: u64) -> bool {
     let Some(ptp) = state() else { return false };
     let t2_ns = t2 as i64 * 1000;
+    if ptp.l2 {
+        let Some(message) = ptp_tape::l2_message(frame) else { return false };
+        if let Some(sample) = ptp.slave.handle(message, t2_ns) {
+            ptp.tracker.update(t2_ns, sample.offset);
+        }
+        ptp.found |= ptp.slave.master().is_some();
+        return true;
+    }
     if is_ptp(frame) {
         if let net::Inbound::Udp { payload, .. } = net::inbound(api, ptp.nic, &ptp.config, &mut ptp.arp, frame, EVENT_PORT..=GENERAL_PORT, 0) {
             if let Some(sample) = ptp.slave.handle(payload, t2_ns) {
@@ -113,12 +133,19 @@ pub fn poll(api: &TapeApi) {
     if ptp.slave.master().is_none() && ptp.tracker.tenths_ppm().is_some() {
         ptp.tracker.reset();
     }
-    ptp.igmp.poll(api, ptp.nic, &ptp.config, (now / 1000) as u64);
+    if !ptp.l2 {
+        ptp.igmp.poll(api, ptp.nic, &ptp.config, (now / 1000) as u64);
+    }
     if let Some(sequence) = ptp.slave.request_due(now) {
         let mut message = [0u8; 64];
         let length = build_delay_req(&mut message, 0, ptp.identity, sequence);
         ptp.slave.request_sent(sequence, local_ns());
         let mut frame = [0u8; 100];
+        if ptp.l2 {
+            let total = ptp_tape::build_l2_frame(&mut frame, ptp.config.mac.0, &message[..length]);
+            net::send_frame(api, ptp.nic, &frame[..total]);
+            return;
+        }
         let destination = MacAddress(audio_wire::multicast_mac(GROUP));
         if let Some(total) = net::build_udp_frame(&mut frame, &ptp.config, destination, Ipv4Address(GROUP), EVENT_PORT, EVENT_PORT, 1, &message[..length]) {
             net::send_frame(api, ptp.nic, &frame[..total]);
@@ -204,7 +231,11 @@ pub fn pump(api: &TapeApi, frame: &mut [u8]) {
     poll(api);
 }
 
-/// RTP timestamps on the PTP timeline for the sender's packets.
+/// How far ahead of capture an AVTP presentation time is set (AVB class A's 2 ms), so a listener that honours the
+/// time does not find it already past; a receiver here subtracts it again to get the capture time.
+pub const AVTP_OFFSET_NS: u32 = 2_000_000;
+
+/// Timestamps on the PTP timeline for the sender's packets (RTP and raw: sample periods; AVTP: nanoseconds).
 pub struct Stamper {
     media: MediaClock,
     rate: u32,
@@ -213,6 +244,12 @@ pub struct Stamper {
 impl Stamper {
     pub const fn new(rate: u32) -> Stamper {
         Stamper { media: MediaClock::new(), rate }
+    }
+
+    /// AVTP's `avtp_timestamp`: the presentation time (capture plus 2 ms) in nanoseconds modulo 2^32.
+    pub fn presentation(&self, age_frames: u32) -> Option<u32> {
+        let age = i64::from(age_frames) * 1_000_000_000 / i64::from(self.rate.max(1));
+        Some(((time_ns()? - age) as u32).wrapping_add(AVTP_OFFSET_NS))
     }
 
     /// The stamp of the next packet: its first sample was captured `age_frames` before now. None without a clock.

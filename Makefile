@@ -101,7 +101,7 @@ OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-a
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-audio-ptp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-rtl8139
+.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -205,6 +205,13 @@ test-ptp-l2: image
 # audio-net on a PTP clock: master, RTP sender and receiver; stamps, SDP and the receiver's delay.
 test-audio-ptp: image
 	python3 tools/test_audio_ptp.py
+
+# The same over layer 2: PTP on Ethernet, raw and AVTP streams.
+test-audio-ptp-raw: image
+	python3 tools/test_audio_ptp.py raw
+
+test-audio-ptp-avtp: image
+	python3 tools/test_audio_ptp.py avtp
 
 # audio-net serve: Ogg Opus over HTTP from a guest, fetched from the host and decoded with ffmpeg.
 test-audio-serve: image

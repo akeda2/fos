@@ -878,7 +878,7 @@ use it. Next: audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline
 
 ### audio-net on a PTP clock
 
-`audio-net` (RTP only) follows a PTPv2 clock when one is found: `ptp=auto` (default) or `ptp=off`. `clock.rs`
+`audio-net` follows a PTPv2 clock when one is found: `ptp=auto` (default), `ptp=l2` or `ptp=off`. `clock.rs`
 holds one `ptp-tape` `Slave` plus a `Tracker` (local clock to master time, rate measured over 2 s windows,
 trusts samples below its prediction more since software timestamps only err late) and joins 224.0.1.129 itself
 (its own IGMP state, left on exit). A sender waits up to 3 s for an Announce and 13 s for a lock *before* it opens
@@ -887,6 +887,6 @@ sample, in sample periods modulo 2^32 (AES67), smoothed by a slow phase filter b
 be steered; the SDP gets `a=ts-refclk:ptp=IEEE1588-2008:<grandmaster>:0`. It decides once: a lock mid-stream
 would make the stamps jump. A receiver measures `PTP now - stamp` per packet (rejecting values outside -5..500 ms,
 which is what an unstamped stream gives), and shows it in the summary and the panel as capture-to-arrival plus
-the ring level. Raw and AVTP have no IP, so no PTP; Opus and `serve` are not wired. `make test-audio-ptp` runs a
+the ring level. Raw and AVTP streams have no IP and listen for Ethernet PTP (0x88F7, the `ptp l2` master) instead; `ptp=l2` forces that for RTP. Raw stamps its header timestamp like RTP; AVTP sets a valid presentation time (capture + 2 ms, ns mod 2^32, `AVTP_OFFSET_NS`) on the PTP timeline, which is not a gPTP/802.1AS clock. Opus and `serve` are not wired. A raw or AVTP sender now also waits up to 3 s for a clock unless `ptp=off`. Measured on hardware (amd1 `ptp master l2`, skylake3 USB capture to laptop1): capture-to-arrival 0.26-0.40 ms at low/live, 2.7-2.8 ms to the ring, the same as RTP within noise (UDP: 0.28-0.43 ms, 3.0 ms). `make test-audio-ptp` (and `-raw`, `-avtp` over layer 2) runs a
 master, a sender and a receiver in QEMU (lock, SDP, plausible delay, `ptp=off`); the guests share no time base, so
 accuracy needs real hardware: compare the figure with the loopback `send latency`.

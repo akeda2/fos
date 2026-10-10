@@ -4,7 +4,9 @@
 The sender must lock to the master before it captures, stamp its RTP packets on the PTP timeline and name the
 grandmaster in its SDP (`a=ts-refclk:ptp=`). The receiver must measure sender-capture-to-arrival from those stamps.
 A second sender with `ptp=off` keeps `localmac` in its SDP. QEMU guests share no time base, so only the
-plausibility of the figures is checked. Run with `make test-audio-ptp`."""
+plausibility of the figures is checked. With `raw` or `avtp` the same runs over layer 2: the master is `ptp master l2`, the streams have no IP, the
+raw stamp is on the PTP timeline and AVTP carries a valid presentation time. Run with `make test-audio-ptp`,
+`make test-audio-ptp-raw` and `make test-audio-ptp-avtp`."""
 
 import re
 import sys
@@ -19,6 +21,8 @@ MASTER_MAC, SENDER_MAC, RECEIVER_MAC = "52:54:00:12:36:01", "52:54:00:12:36:02",
 
 
 def main():
+    proto = next((a for a in sys.argv[1:] if a in ("raw", "avtp")), "rtp")
+    l2 = proto != "rtp"
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "out.wav"
         master = Guest(tmp, "master", MASTER_MAC)
@@ -30,18 +34,19 @@ def main():
             for guest in guests:
                 guest.wait_for("M3 complete")
                 guest.wait_for("fos> ")
-            mark = master.send("run ptp master ip=10.7.0.1/24 secs=120")
-            master.wait_for("ptp master: NIC 1 10.7.0.1", 30, mark)
-            mark_r = receiver.send("run audio-net recv proto=rtp ip=10.7.0.3/24 chan=2 bits=24")
-            receiver.wait_for("Listening on NIC 1 for RTP/UDP", 30, mark_r)
+            mark = master.send("run ptp master l2 secs=120" if l2 else "run ptp master ip=10.7.0.1/24 secs=120")
+            master.wait_for("ptp master: NIC 1, Ethernet" if l2 else "ptp master: NIC 1 10.7.0.1", 30, mark)
+            mark_r = receiver.send(f"run audio-net recv proto={proto} chan=2 bits=24" if l2 else "run audio-net recv proto=rtp ip=10.7.0.3/24 chan=2 bits=24")
+            receiver.wait_for("Listening on NIC 1 for " + {"raw": "raw Ethernet", "avtp": "AVTP", "rtp": "RTP/UDP"}[proto], 30, mark_r)
             receiver.pump(3.0)
-            mark_s = sender.send("run audio-net send proto=rtp ip=10.7.0.2/24 to=10.7.0.3 src=tone=660 secs=8")
+            mark_s = sender.send(f"run audio-net send proto={proto} src=tone=660 secs=8" if l2 else "run audio-net send proto=rtp ip=10.7.0.2/24 to=10.7.0.3 src=tone=660 secs=8")
             sender.wait_for("PTP: locked to a clock", 40, mark_s)
             check(True, "the sender locks to the master before it starts")
             sender.wait_for("Sent ", 60, mark_s)
             text = sender.text()[mark_s:]
-            check("a=ts-refclk:ptp=IEEE1588-2008:52-54-00-FF-FE-12-36-01:0" in text, "its SDP names the grandmaster", text[-900:])
-            check("a=mediaclk:direct=0" in text, "and the media clock", text[-900:])
+            if not l2:
+                check("a=ts-refclk:ptp=IEEE1588-2008:52-54-00-FF-FE-12-36-01:0" in text, "its SDP names the grandmaster", text[-900:])
+                check("a=mediaclk:direct=0" in text, "and the media clock", text[-900:])
             receiver.pump(1.0)
             mark_e = len(receiver.text())
             receiver.process.stdin.write(b"\x1b")  # Escape: stop the tape
@@ -59,10 +64,11 @@ def main():
             check(-5000 <= low <= high <= 500_000, f"the delay lies in a plausible window ({low} to {high} us)")
             check(total > 0, f"and the total is positive ({total} us)")
 
-            mark_s = sender.send("run audio-net send proto=rtp ptp=off ip=10.7.0.2/24 to=239.1.2.3 src=tone=660 secs=2")
-            sender.wait_for("Sent ", 40, mark_s)
-            text = sender.text()[mark_s:]
-            check("a=ts-refclk:localmac=" in text and "ptp=IEEE" not in text and "PTP: locked" not in text, "ptp=off keeps localmac and does not wait for a clock", text[-900:])
+            if not l2:
+                mark_s = sender.send("run audio-net send proto=rtp ptp=off ip=10.7.0.2/24 to=239.1.2.3 src=tone=660 secs=2")
+                sender.wait_for("Sent ", 40, mark_s)
+                text = sender.text()[mark_s:]
+                check("a=ts-refclk:localmac=" in text and "ptp=IEEE" not in text and "PTP: locked" not in text, "ptp=off keeps localmac and does not wait for a clock", text[-900:])
         finally:
             for guest in guests:
                 guest.stop()
