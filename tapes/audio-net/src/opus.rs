@@ -433,6 +433,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         resampler.step = servo.update(level, frames, RATE);
         let shown = crate::stats::get();
         (shown.received, shown.lost, shown.level_frames, shown.target_frames, shown.offset_ppm, shown.rate) = (packets, lost, level as u32, target_frames as u32, servo.offset_ppm(), RATE);
+        shown.packet_frames = frames as u32;
         let mut remaining = frames;
         while remaining > 0 {
             let chunk = remaining.min(work.len() / channels);
@@ -471,6 +472,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     (api.audio_stats)(&mut stats);
     (api.audio_stop)();
     println!();
+    println!("Delay sender capture to playback ring: about {} ms (one frame plus {} ms queued); the device adds its own buffer.", crate::stats::get().delay_ms(), crate::stats::get().level_frames * 1000 / RATE);
     println!("Received {packets} Opus packets: {lost} lost ({concealed} concealed), {dropped} frame(s) discarded, {bad} undecodable, clock offset learned {} ppm; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats.playback_underruns.saturating_sub(crate::stats::get().underrun_base), stats.playback_errors);
 }
 

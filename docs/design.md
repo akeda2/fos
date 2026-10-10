@@ -651,6 +651,12 @@ firmware, so a pending slot is tried on the next boot.
   their CRCs) with random ones as it writes (`--keep-guids` to opt out; plain `dd` of the image
   keeps the shared GUIDs). Tests: `make test-disks`, `make test-stick-guids`.
 
+  **Delay** (2026-10): the receiver's summary and the panel's `Delay ~N ms` give one packet plus the playback ring
+  level (counters it keeps anyway). `send latency` is a loopback test aid: a click every 0.5 s, timed on the capture
+  clock until it returns on the input the receiver's output is cabled to. Measured laptop (USB) <- Skylake (USB), 12 ms
+  target: 20.6-24 ms click to click, i.e. the ring plus about 8 ms for packet, USB buffers and capture. It grows slowly
+  as the servo settles the ring.
+
 **Files on other disks.** Every command that takes a file accepts `NAME` (the boot volume), `diskN NAME` and `diskN/NAME`
 (also `@LABEL NAME`, `@LABEL/NAME`), as v1 does: `cat disk2/audio.cfg`, `copy disk2/a.cfg disk1/b.cfg`,
 `copy disk2/a.cfg disk1 b.cfg`, `write disk2/note hi`, `rm disk2/note`, `tape load disk2/audio-net`, `tape save disk2/x`,

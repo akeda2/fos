@@ -27,6 +27,12 @@
 //! the level strays. A lost packet is replaced by silence of the same length. `secs=` ends either side after
 //! that long; Escape always does.
 //!
+//! **Delay.** The receiver's summary and the panel (`Delay ~N ms`, on the Receiving line) say how late the audio is
+//! when it reaches the playback ring: one packet plus the ring level; it reads counters the receiver keeps anyway,
+//! so it costs nothing. The playback device's own buffer is not in it. `send latency` (a test aid) measures the
+//! whole path: it sends a click every 0.5 s and times its return on the capture input, with the receiver's output
+//! cabled back to that input (mind the level: use a pad). Both ends are on the capture clock, so no sync is needed.
+//!
 //! **Protocols.** `proto=raw` (default) is a bare Ethernet frame (`audio-wire`'s format): works between two
 //! hosts on one segment with no addresses at all. `proto=rtp` is standard RTP (RFC 3550) over UDP over
 //! IPv4 with 16- or 24-bit linear samples (RFC 3190 `L16`/`L24`, big endian), packet times of 125 us to 1 ms
@@ -98,6 +104,8 @@ pub struct Options<'a> {
     target_ms: u32,
     seconds: u64,
     verbose: bool,
+    /// `send latency`: send silence and a click once per 0.5 s, and time the click's return on the capture input.
+    latency: bool,
     ip: &'a str,
     gateway: &'a str,
     port: u16,
@@ -156,7 +164,7 @@ pub fn nic_by_mac(mac: [u8; 6]) -> Option<usize> {
 
 pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'static str> {
     let mut options = Options {
-        proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false,
+        proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, seconds: 0, verbose: false, latency: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
         opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0,
     };
@@ -204,6 +212,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "http" => options.http = value.parse().ok().filter(|&p| p != 0).ok_or("http= is a TCP port, 1 to 65535")?,
             "prebuffer" => options.prebuffer_ms = value.parse().ok().filter(|&ms| ms <= 1000).ok_or("prebuffer= is 0 to 1000 milliseconds")?,
             "verbose" => options.verbose = true,
+            "latency" => options.latency = true,
             _ => return Err("unknown option"),
         }
     }
@@ -397,6 +406,9 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     }
     let mut info = AudioInfo::default();
     let device = (api.audio_info)(&mut info) != 0 && info.capture_channels != 0;
+    if options.latency && tone.is_some() {
+        return println!("audio-net send: latency needs the capture device (no src=tone).");
+    }
     if tone.is_none() && !device {
         return println!("audio-net send: no audio device with inputs (use src=tone=440 to send a test tone).");
     }
@@ -481,6 +493,10 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let (mut sequence, mut timestamp, mut sent, mut phase) = (0u16, 0u32, 0u64, 0u32);
     let started = tape_rt::micros();
     let mut next_report = started + 1_000_000;
+    let mut probe = LatencyProbe::new(options.rate, per_packet);
+    if options.latency {
+        println!("Latency probe: sending silence and a click every 0.5 s; the receiver's output must be cabled to input channel {} here.", selection.channels().next().unwrap_or(0) + 1);
+    }
     loop {
         if (api.should_abort)() != 0 {
             break;
@@ -524,6 +540,9 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             continue;
         }
         let length = per_packet * frame_bytes;
+        if options.latency {
+            probe.packet(sent, &mut payload[..length], channels, bits);
+        }
         stats::peaks_from_wire(&payload[..length], channels, bits, per_packet, true);
         let total = match destination {
             Destination::Raw(mac) if options.proto == Proto::Avtp => {
@@ -574,6 +593,110 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     println!();
     transport.announce_stop(api, options.nic);
     println!("Sent {sent} packets ({} frames).", sent * per_packet as u64);
+    if options.latency {
+        probe.summary();
+    }
+}
+
+/// `send latency`: measures the delay from the moment a sample is handed to the network to the moment it is
+/// heard again on this machine's capture input, once the receiver's output is cabled back to that input
+/// (loopback). Both ends of the measurement are positions on the capture clock (frames read from the device),
+/// so the two machines need no common clock. The click is written over the packet that would have carried
+/// captured audio, and the packet's own capture position is the start time; the return is the first sample in
+/// a later packet above the noise floor. The result is the network, the receiver's ring and playback buffers,
+/// the cable and this machine's capture buffering on the way back: capture buffering on the way out is not in it.
+struct LatencyProbe {
+    rate: u32,
+    per_packet: u32,
+    noise: i32,
+    noise_packets: u32,
+    /// Packet number at which the click went out, while waiting for it to come back.
+    waiting: Option<u64>,
+    sum_x100: u64,
+    count: u32,
+    min: u32,
+    max: u32,
+    missed: u32,
+}
+
+impl LatencyProbe {
+    const PERIOD: u64 = 500; // packets (about) between clicks
+    const NOISE_PACKETS: u32 = 300;
+
+    fn new(rate: u32, per_packet: usize) -> Self {
+        Self { rate, per_packet: per_packet as u32, noise: 0, noise_packets: 0, waiting: None, sum_x100: 0, count: 0, min: u32::MAX, max: 0, missed: 0 }
+    }
+
+    fn sample(payload: &[u8], bits: usize, index: usize) -> i32 {
+        let at = index * bits / 8;
+        i32::from(i16::from_be_bytes([payload[at], payload[at + 1]]))
+    }
+
+    /// Called with each packet of captured audio before it is sent; leaves silence or the click in `payload`.
+    fn packet(&mut self, number: u64, payload: &mut [u8], channels: usize, bits: usize) {
+        let frames = self.per_packet as usize;
+        let mut first_loud = None;
+        let mut peak = 0;
+        for frame in 0..frames {
+            for channel in 0..channels {
+                let level = Self::sample(payload, bits, frame * channels + channel).abs();
+                peak = peak.max(level);
+                if first_loud.is_none() && self.noise_packets >= Self::NOISE_PACKETS && level > self.noise {
+                    first_loud = Some(frame);
+                }
+            }
+        }
+        if self.noise_packets < Self::NOISE_PACKETS {
+            self.noise_packets += 1;
+            self.noise = self.noise.max(peak);
+            if self.noise_packets == Self::NOISE_PACKETS {
+                self.noise = (self.noise * 4).max(100);
+                println!("Noise floor on the input: peak {} (of 32768), threshold {}.", self.noise / 4, self.noise);
+            }
+        } else if let (Some(sent_at), Some(frame)) = (self.waiting.filter(|&at| number > at + 1), first_loud) {
+            let frames = (number - sent_at) * u64::from(self.per_packet) + frame as u64;
+            let x100 = (frames * 100_000 / u64::from(self.rate)) as u32; // ms, two decimals
+            self.waiting = None;
+            self.sum_x100 += u64::from(x100);
+            self.count += 1;
+            self.min = self.min.min(x100);
+            self.max = self.max.max(x100);
+            println!("\nLatency {}.{:02} ms", x100 / 100, x100 % 100);
+        } else if let Some(sent_at) = self.waiting {
+            if number - sent_at > 400 {
+                self.waiting = None;
+                self.missed += 1;
+                println!("\nNo click came back within 400 ms (level too low, or the cable is not connected).");
+            }
+        }
+        payload.fill(0);
+        if self.noise_packets >= Self::NOISE_PACKETS && self.waiting.is_none() && number % Self::PERIOD == 0 {
+            self.waiting = Some(number);
+            self.fill_click(payload, channels, bits);
+        }
+    }
+
+    fn fill_click(&self, payload: &mut [u8], channels: usize, bits: usize) {
+        let frames = payload.len() / (channels * bits / 8);
+        for frame in 0..frames {
+            // A 1 kHz square wave at about 70 % of full scale, one packet long.
+            let high = (frame * 2000 / self.rate as usize) % 2 == 0;
+            let bytes = (if high { 23_000i16 } else { -23_000 }).to_be_bytes();
+            for channel in 0..channels {
+                let at = (frame * channels + channel) * bits / 8;
+                payload[at] = bytes[0];
+                payload[at + 1] = bytes[1];
+            }
+        }
+    }
+
+    fn summary(&self) {
+        if self.count == 0 {
+            return println!("Latency: no click came back ({} missed).", self.missed);
+        }
+        let average = (self.sum_x100 / u64::from(self.count)) as u32;
+        println!("Latency over {} clicks: min {}.{:02} ms, average {}.{:02} ms, max {}.{:02} ms ({} missed).", self.count, self.min / 100, self.min % 100, average / 100, average % 100, self.max / 100, self.max % 100, self.missed);
+    }
 }
 
 /// One received packet, as the receiver's common code sees it.
@@ -903,6 +1026,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         packets += 1;
         let shown = stats::get();
         (shown.received, shown.lost, shown.level_frames, shown.target_frames, shown.offset_ppm, shown.rate) = (packets, lost, level as u32, fill.target() as u32, servo.offset_ppm(), packet.rate);
+        shown.packet_frames = packet.frames as u32;
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;
             print!(".");
@@ -923,6 +1047,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         println!("Processing took {} us per packet on average, {} us at worst; nic_receive up to {slow_receive} us, audio_info up to {slow_info} us.", work_total / packets, work_max);
     }
     if options.resample {
+        println!("Delay sender capture to playback ring: about {} ms (one packet plus {} ms queued); the device adds its own buffer.", stats::get().delay_ms(), stats::get().level_frames * 1000 / stats::get().rate.max(1));
         println!("Received {packets} packets: {lost} lost, {dropped} frame(s) discarded, clock offset learned {} ppm (resampled, no frames dropped or repeated for drift), {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats.playback_underruns.saturating_sub(stats::get().underrun_base), stats.playback_errors);
     } else {
         println!("Received {packets} packets: {lost} lost, {dropped} frame(s) dropped and {repeated} repeated for clock drift, {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", stats.playback_packets, stats.playback_underruns.saturating_sub(stats::get().underrun_base), stats.playback_errors);

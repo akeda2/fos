@@ -501,6 +501,11 @@ def auto_group_test():
             check("Found 'glenn'." in text and group is not None and f"Joined multicast group {group.group(1)}" in text, "source=auto finds the only announced stream and joins its group", text[-900:])
             packets = int(text.split("Received ")[-1].split(" ")[0])
             check(packets >= 200, f"and receives it ({packets} packets) with no address typed", text[-600:])
+            check(re.search(r"Delay sender capture to playback ring: about \d+ ms", text) is not None, "the receiver's summary estimates the delay", text[-900:])
+            # QEMU's USB audio has no capture side, so only the refusal can be tried here; the loopback itself
+            # needs two real machines and a cable (see docs/design.md).
+            mark = a.send("run audio-net send latency src=tone=440 proto=rtp ip=192.168.60.2/24 to=239.192.9.9 secs=2")
+            a.wait_for("latency needs the capture device", 60, mark)
         finally:
             a.stop()
             b.stop()

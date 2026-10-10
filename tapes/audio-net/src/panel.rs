@@ -720,6 +720,9 @@ fn panel_hook_inner() -> u32 {
             let _ = write!(actual, "Clients: {}", if shown.serve_status.as_str().is_empty() { "waiting for the first" } else { shown.serve_status.as_str() });
         } else {
             let _ = write!(actual, "Sending: {}   Receiving: {}", if shown.send_codec.as_str().is_empty() { "-" } else { shown.send_codec.as_str() }, if shown.receive_codec.as_str().is_empty() { "-" } else { shown.receive_codec.as_str() });
+            if shown.packet_frames != 0 && !shown.receive_codec.as_str().is_empty() {
+                let _ = write!(actual, "   Delay ~{} ms", shown.delay_ms());
+            }
             // Capture side: audio waiting for the sender to take it is audio that is late. Now and the peak, in ms.
             let mut waiting = tape_rt::AudioBuffer::default();
             (tape_rt::api().audio_buffer)(&mut waiting);

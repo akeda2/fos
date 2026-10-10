@@ -53,6 +53,8 @@ pub struct Stats {
     pub lost: u64,
     pub level_frames: u32,
     pub target_frames: u32,
+    /// Frames in the packet last received: the stream's own packetisation delay.
+    pub packet_frames: u32,
     pub offset_ppm: i32,
     /// The device's playback underruns when the first stream locked on: playback starts before the first packet, and
     /// the silence it plays meanwhile is waiting, not an underrun of the stream.
@@ -78,9 +80,18 @@ pub struct Stats {
     coefficients_rate: u32,
 }
 
+impl Stats {
+    /// What the tape itself can say about the delay from the sender's capture to this machine's playback ring, in
+    /// ms: one packet (the sender waits for a whole one) plus the audio queued here. The network adds well under a
+    /// millisecond on a LAN; the playback device's own buffer and converter come on top (`send latency` measures all).
+    pub fn delay_ms(&self) -> u32 {
+        (self.level_frames + self.packet_frames) * 1000 / self.rate.max(1)
+    }
+}
+
 const fn fresh() -> Stats {
     Stats {
-        sent: 0, received: 0, lost: 0, level_frames: 0, target_frames: 0, offset_ppm: 0, underrun_base: 0, rate: 48_000,
+        sent: 0, received: 0, lost: 0, level_frames: 0, target_frames: 0, packet_frames: 0, offset_ppm: 0, underrun_base: 0, rate: 48_000,
         send: [Ppm::new(); MAX_CHANNELS], receive: [Ppm::new(); MAX_CHANNELS], send_clip: [false; MAX_CHANNELS], receive_clip: [false; MAX_CHANNELS],
         send_channels: 0, receive_channels: 0, send_codec: Label::new(), receive_codec: Label::new(), meters_on: true, serve_status: Label::new(), coefficients: Coefficients::ZERO, coefficients_rate: 0,
     }
