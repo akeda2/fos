@@ -622,6 +622,8 @@ struct LatencyProbe {
 impl LatencyProbe {
     const PERIOD: u64 = 500; // packets (about) between clicks
     const NOISE_PACKETS: u32 = 300;
+    /// No click before this packet: the receiver needs a moment to lock on and fill its ring.
+    const WARM_UP: u64 = 3000;
 
     fn new(rate: u32, per_packet: usize) -> Self {
         Self { rate, per_packet: per_packet as u32, noise: 0, noise_packets: 0, waiting: None, sum_x100: 0, count: 0, min: u32::MAX, max: 0, missed: 0 }
@@ -653,7 +655,7 @@ impl LatencyProbe {
                 self.noise = (self.noise * 4).max(100);
                 println!("Noise floor on the input: peak {} (of 32768), threshold {}.", self.noise / 4, self.noise);
             }
-        } else if let (Some(sent_at), Some(frame)) = (self.waiting.filter(|&at| number > at + 1), first_loud) {
+        } else if let (Some(sent_at), Some(frame)) = (self.waiting.filter(|&at| number > at + 4), first_loud) {
             let frames = (number - sent_at) * u64::from(self.per_packet) + frame as u64;
             let x100 = (frames * 100_000 / u64::from(self.rate)) as u32; // ms, two decimals
             self.waiting = None;
@@ -670,7 +672,7 @@ impl LatencyProbe {
             }
         }
         payload.fill(0);
-        if self.noise_packets >= Self::NOISE_PACKETS && self.waiting.is_none() && number % Self::PERIOD == 0 {
+        if self.noise_packets >= Self::NOISE_PACKETS && self.waiting.is_none() && number >= Self::WARM_UP && number % Self::PERIOD == 0 {
             self.waiting = Some(number);
             self.fill_click(payload, channels, bits);
         }
@@ -1027,6 +1029,11 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         let shown = stats::get();
         (shown.received, shown.lost, shown.level_frames, shown.target_frames, shown.offset_ppm, shown.rate) = (packets, lost, level as u32, fill.target() as u32, servo.offset_ppm(), packet.rate);
         shown.packet_frames = packet.frames as u32;
+        {
+            let mut device = AudioStats::default();
+            (api.audio_stats)(&mut device);
+            shown.underrun_last = device.playback_underruns;
+        }
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;
             print!(".");
@@ -1048,9 +1055,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     }
     if options.resample {
         println!("Delay sender capture to playback ring: about {} ms (one packet plus {} ms queued); the device adds its own buffer.", stats::get().delay_ms(), stats::get().level_frames * 1000 / stats::get().rate.max(1));
-        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) discarded, clock offset learned {} ppm (resampled, no frames dropped or repeated for drift), {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats.playback_underruns.saturating_sub(stats::get().underrun_base), stats.playback_errors);
+        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) discarded, clock offset learned {} ppm (resampled, no frames dropped or repeated for drift), {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats::get().underrun_last.saturating_sub(stats::get().underrun_base), stats.playback_errors);
     } else {
-        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) dropped and {repeated} repeated for clock drift, {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", stats.playback_packets, stats.playback_underruns.saturating_sub(stats::get().underrun_base), stats.playback_errors);
+        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) dropped and {repeated} repeated for clock drift, {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", stats.playback_packets, stats::get().underrun_last.saturating_sub(stats::get().underrun_base), stats.playback_errors);
     }
 }
 
