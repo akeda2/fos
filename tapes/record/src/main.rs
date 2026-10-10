@@ -207,3 +207,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Err(error) => println!("record: writing {shown} failed (code {}); what was written up to the last checkpoint is kept.", error.0),
     }
 }
+
+tape_rt::tape_help!(br#"record: record the audio inputs into a WAV file on disk.
+
+  tape run record [device=N] NAME [SECONDS] [RATE] [tone=HZ]
+
+  tape run record take1 10        10 seconds at 48000 Hz into take1.wav
+  tape run record take1 0 96000   until Escape, at 96000 Hz
+  tape run record disk2/take1 0   onto another volume (@LABEL/take1 too)
+  tone=HZ records a test tone instead of the device.
+"#);

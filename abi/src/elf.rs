@@ -57,6 +57,35 @@ impl Headers<'_> {
     }
 }
 
+/// The bytes of the section called `name` (a tape's `.fos_help` text, say), read from the section header table of the
+/// file. None if the file has no such section or its tables are damaged; never panics on a bad file.
+pub fn section<'a>(image: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    headers(image).ok()?;
+    let table = read_u64(image, 40) as usize;
+    let (entry, count, names) = (read_u16(image, 58) as usize, read_u16(image, 60) as usize, read_u16(image, 62) as usize);
+    let at = |index: usize| -> Option<usize> {
+        let start = table.checked_add(index.checked_mul(entry)?)?;
+        (entry >= 40 && start.checked_add(entry)? <= image.len()).then_some(start)
+    };
+    let range = |header: usize| -> Option<(usize, usize)> {
+        let (offset, size) = (read_u64(image, header + 24) as usize, read_u64(image, header + 32) as usize);
+        (offset.checked_add(size)? <= image.len()).then_some((offset, size))
+    };
+    let (string_start, string_size) = range(at(names)?)?;
+    let strings = &image[string_start..string_start + string_size];
+    for index in 0..count {
+        let header = at(index)?;
+        let from = read_u32(image, header) as usize;
+        let Some(tail) = strings.get(from..) else { continue };
+        let length = tail.iter().position(|&byte| byte == 0).unwrap_or(tail.len());
+        if &tail[..length] == name.as_bytes() {
+            let (offset, size) = range(header)?;
+            return Some(&image[offset..offset + size]);
+        }
+    }
+    None
+}
+
 /// How many bytes of memory the image needs (its highest segment end, page-rounded).
 pub fn span(image: &[u8]) -> Result<usize, Error> {
     let headers = headers(image)?;

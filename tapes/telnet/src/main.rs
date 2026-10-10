@@ -1309,3 +1309,12 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
         max_frame_len,
     );
 }
+
+tape_rt::tape_help!(br#"telnet: Telnet client.
+
+  tape run static LOCAL_IP/PREFIX GATEWAY SERVER_IP SERVER_PORT
+  tape run static LOCAL_IP NETMASK GATEWAY SERVER_IP SERVER_PORT
+  tape run dhcp SERVER_IP SERVER_PORT
+
+  Uses the interface chosen with `nic use`. Escape stops.
+"#);

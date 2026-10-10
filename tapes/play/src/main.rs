@@ -184,3 +184,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     (api.free)(buffer, capacity);
     println!("{}: {} packets, {} transfer error(s), {} underrun(s).", if aborted { "Stopped" } else { "Finished" }, stats.playback_packets, stats.playback_errors, stats.playback_underruns);
 }
+
+tape_rt::tape_help!(br#"play: play a WAV file on the audio outputs.
+
+  tape run play [device=N] NAME.wav
+
+  8, 16, 24 and 32 bit PCM; the file's rate must be one the device offers.
+  Escape stops.
+"#);

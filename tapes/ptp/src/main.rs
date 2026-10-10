@@ -524,3 +524,19 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
     }
     println!("ptp: {syncs} syncs sent, {answered} delay requests answered.");
 }
+
+tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP or Ethernet.
+
+  tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D]
+               [domain=N] [l2] [ntp=dhcp|A.B.C.D] [settime] [tz=+H[:MM]]
+               [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US]
+               [idle] [verbose]
+
+  slave     measure offset, delay and rate to a master (the default)
+  master    announce a clock; ntp= takes real time from an NTP server first
+  nic=N     the interface (default: the one chosen with `nic use`)
+  l2        PTP over Ethernet (0x88F7), no IP; ptp4l -2 compatible
+  settime   slave: set this machine's clock and RTC from the master, then end
+  tz=+2     hours east of UTC for settime (the RTC holds local time)
+  secs=N    stop after N seconds; Escape stops at any time
+"#);

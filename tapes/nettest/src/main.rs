@@ -2147,3 +2147,13 @@ fn print_two_digits(putc: Putc, value: u32) {
     putc(u32::from(b'0' + (value / 10 % 10) as u8));
     putc(u32::from(b'0' + (value % 10) as u8));
 }
+
+tape_rt::tape_help!(br#"nettest: two-port link impairment (loss, delay, rate) and traffic test.
+
+  tape run nettest [A B] [loss=PCT[:BURST]] [delay=MS[:JITTER]] [rate=KBIT]
+                   [queue=N] [seed=N]      prefix with ab. or ba. per direction
+  tape run nettest @nettest.cfg            one command per line
+
+  At the nettest> prompt: loss, delay, rate, queue, seed, show, stats,
+  reset, help, quit. Escape stops. See docs/nettest.md.
+"#);

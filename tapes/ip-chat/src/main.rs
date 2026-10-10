@@ -813,3 +813,12 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
 
     print_bytes(putc, b"Left IPv4 chat; back at the fos shell.\n");
 }
+
+tape_rt::tape_help!(br#"ip-chat: line-oriented IPv4/UDP chat.
+
+  tape run static LOCAL_IP/PREFIX GATEWAY [PEER_IP]
+  tape run static LOCAL_IP NETMASK GATEWAY [PEER_IP]
+  tape run dhcp [PEER_IP]
+
+  Type a line and press Enter to send it. Escape stops.
+"#);

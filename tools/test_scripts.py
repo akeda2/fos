@@ -42,6 +42,15 @@ def main():
             text = guest.text()[mark:]
             check("start file: running 1 command(s)." in text and "start> hi" in text and "hi.sh> uptime" in text, "typing `start` runs the start file again", text)
 
+            for line in ("help ptp", "ptp --help", "run ptp help"):
+                mark = guest.send(line)
+                guest.pump(1.5)
+                text = guest.text()[mark:]
+                check("ptp: PTPv2 (IEEE 1588)" in text and "settime" in text and "Tape returned" not in text, f"`{line}` shows the tape's help screen without running it", text)
+            mark = guest.send("help hello")
+            guest.pump(1.0)
+            check("hello has no help screen" in guest.text()[mark:], "`help` on a tape without a help screen says so", guest.text()[mark:])
+
             mark = guest.send("args a b c")
             guest.pump(1.0)
             text = guest.text()[mark:]

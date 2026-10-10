@@ -1088,3 +1088,13 @@ fn show(row: usize, text: &str) {
     at(row, 2);
     draw!("{text}\x1b[K");
 }
+
+tape_rt::tape_help!(br#"recorder: field recorder with meters and a pre-roll buffer.
+
+  tape run recorder [device=N] [name=NAME] [pre=SECONDS] [auto]
+                    [rate=HZ] [thresh=DB] [sound=MS] [silence=MS]
+                    [tone=HZ] [gate=ON,OFF] [diskN/NAME|@LABEL/NAME]
+
+  R starts and stops a take, Escape quits. `auto` starts a take on sound
+  and ends it on silence. tone= is a test tone instead of the device.
+"#);

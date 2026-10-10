@@ -24,7 +24,8 @@ make help       # every target
 ```
 
 At the `fos>` prompt, `help` lists the commands. Try `disks`, `ls`, `cat readme.txt`,
-`nic`, `usb`, `tape run hello`, `calc 3 4 +`.
+`nic`, `usb`, `tape run hello`, `calc 3 4 +`. A tape with a help screen shows it for
+`help NAME`, `NAME help` or `NAME --help` (`help ptp`), without running it.
 
 To run on a real machine write the image to a stick yourself, with
 `sudo python3 tools/write_stick.py /dev/sdX`. The tools never pick or write a block device on

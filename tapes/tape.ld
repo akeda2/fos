@@ -17,6 +17,7 @@ SECTIONS
   .dynstr   : { *(.dynstr) }
   .rela.dyn : { *(.rela.dyn) }
   .rodata   : { *(.rodata .rodata.*) }
+  .fos_help : { KEEP(*(.fos_help)) }
   .data     : ALIGN(4096) { *(.data .data.*) }
   .dynamic  : { *(.dynamic) }
   .bss      : ALIGN(4096) { *(.bss .bss.*) *(COMMON) }

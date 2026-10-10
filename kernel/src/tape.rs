@@ -820,11 +820,36 @@ pub fn command(arguments: &str) {
     }
 }
 
+/// The help text in the `.fos_help` section of the tape file just staged, if it has one.
+fn help_in_staged(length: usize) -> Option<&'static str> {
+    let staged: &'static [u8] = staging()?;
+    let image = &staged[..length];
+    core::str::from_utf8(elf::section(image, ".fos_help")?).ok()
+}
+
+/// `help NAME`: shows the help screen the tape file NAME carries, without running it.
+pub fn show_help(name: &str) {
+    match load_from_file(name) {
+        Ok(length) => match help_in_staged(length) {
+            Some(text) => crate::println!("{text}"),
+            None => crate::println!("help: {name} has no help screen."),
+        },
+        Err(reason) => crate::println!("help: {name}: {reason}."),
+    }
+}
+
 /// `run NAME [ARGS]`: load a tape from FOSFS and run it.
 pub fn run_named(arguments: &str) {
     let (name, rest) = arguments.trim().split_once(char::is_whitespace).unwrap_or((arguments.trim(), ""));
     match load_from_file(name) {
         Ok(length) => {
+            // `NAME help`, `NAME --help`: a tape with a `.fos_help` section shows it instead of running.
+            if matches!(rest.trim(), "help" | "-h" | "--help" | "?") {
+                if let Some(text) = help_in_staged(length) {
+                    crate::println!("{text}");
+                    return;
+                }
+            }
             set_staged_length(length);
             match load_staged(name) {
                 Ok(()) => {

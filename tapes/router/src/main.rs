@@ -3282,3 +3282,15 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
     print_u32(putc, dropped);
     print_bytes(putc, b".\n");
 }
+
+tape_rt::tape_help!(br#"router: IPv4 router with NAT, DHCP client and server, and failover.
+
+  tape run router [dhcp [NIC]]... NIC ADDRESS/PREFIX ... [default NIC GW]
+                  [health ADDRESS] [dhcp-server] [dhcp-lease-file NAME]
+                  [nat|no-nat] [quiet] [dns SERVER [SERVER]]
+  tape run router @ROUTER.CFG     the same options from a file (4096 bytes)
+
+  e.g. tape run router 1 10.0.1.1/24 2 10.0.2.1/24
+       tape run router dhcp 2 10.0.2.1/24 dhcp-server
+  Escape stops. See NETWORKING.md.
+"#);

@@ -1218,8 +1218,12 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     match word {
+        "help" if words.clone().next().is_some() => {
+            // `help NAME` shows the help screen a tape file carries (the same text as `NAME help`).
+            crate::tape::show_help(words.next().unwrap_or(""));
+        }
         "help" => {
-            crate::println!("help      this list");
+            crate::println!("help      this list (help NAME or NAME --help: a tape's usage)");
             crate::println!("about     what this is");
             crate::println!("memory    physical memory statistics");
             crate::println!("pci       list PCI functions (pci read|write B:D.F ... reaches config space)");

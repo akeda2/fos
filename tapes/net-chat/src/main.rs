@@ -371,3 +371,11 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
 
     print_bytes(putc, b"Left tape chat; back at the fos shell.\n");
 }
+
+tape_rt::tape_help!(br#"net-chat: raw-Ethernet chat (the `chat` of v1).
+
+  tape run net-chat                 broadcast chat
+  tape run net-chat AA:BB:CC:DD:EE:FF   chat with one machine
+
+  Escape stops.
+"#);

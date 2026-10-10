@@ -607,3 +607,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
     }
 }
+
+tape_rt::tape_help!(br#"memtest: RAM tester and soak test.
+
+  tape run memtest [size=MB] [passes=N] [tests=addr,walk,moving,random]
+                   [hold=SECONDS] [seed=N] [inject=WORD] [chunk=MB]
+  tape run memtest soak [for=90|5m|2h] [status=S] [net=A,B] [net.fps=N]
+                   [churn=on|off] [disk=soakNAME [disk.kb=N] [disk.every=S]]
+
+  Escape stops.
+"#);

@@ -387,3 +387,11 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
     print_u32(putc, dropped);
     print_bytes(putc, b".\n");
 }
+
+tape_rt::tape_help!(br#"bridge: layer-2 learning bridge between network interfaces.
+
+  tape run bridge          bridge every interface
+  tape run bridge 1 2      only the one-based entries of `nic list`
+
+  Forwards Ethernet frames unchanged; no IP routing. Escape stops.
+"#);

@@ -472,6 +472,18 @@ pub fn wall_clock() -> Option<WallClock> {
     ((table.wall_clock)(&mut now) != 0).then_some(now)
 }
 
+/// Gives the tape a help screen the kernel can show without running it: `help NAME`, `NAME help` and `NAME --help`
+/// print this text (the kernel reads the `.fos_help` section of the tape's ELF file). Use once, at file level, with a
+/// byte string of lines of at most 79 columns: `tape_rt::tape_help!(br#"name: what it does ..."#);`
+#[macro_export]
+macro_rules! tape_help {
+    ($text:expr) => {
+        #[used]
+        #[unsafe(link_section = ".fos_help")]
+        static FOS_HELP: [u8; $text.len()] = *$text;
+    };
+}
+
 /// The zero-based interface chosen with `nic use N` (0 on a kernel older than ABI 4).
 pub fn active_nic() -> usize {
     let table = api();
