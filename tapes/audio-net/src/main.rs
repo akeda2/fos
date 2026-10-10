@@ -715,6 +715,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let mut frame = [0u8; 1514];
     let mut staging = [0u8; 8192];
     let mut locked: Option<(u32, [u8; 8])> = None;
+    let mut base_taken = false;
     let (mut expected, mut running) = (0u16, true);
     let (mut packets, mut lost, mut dropped, mut repeated, mut foreign) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut fill = Fill::new(0);
@@ -790,6 +791,12 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                         break;
                     }
                     needed -= written.min(needed);
+                }
+                if !base_taken {
+                    base_taken = true;
+                    let mut device = AudioStats::default();
+                    (api.audio_stats)(&mut device);
+                    stats::get().underrun_base = device.playback_underruns;
                 }
                 let id = packet.source;
                 stats::set_receive(format_args!("PCM {}-bit, {} ch{}", packet.bits, packet.channels, if options.adopted_receive { " (peer's choice)" } else { "" }));
@@ -916,9 +923,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         println!("Processing took {} us per packet on average, {} us at worst; nic_receive up to {slow_receive} us, audio_info up to {slow_info} us.", work_total / packets, work_max);
     }
     if options.resample {
-        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) discarded, clock offset learned {} ppm (resampled, no frames dropped or repeated for drift), {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats.playback_underruns, stats.playback_errors);
+        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) discarded, clock offset learned {} ppm (resampled, no frames dropped or repeated for drift), {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats.playback_underruns.saturating_sub(stats::get().underrun_base), stats.playback_errors);
     } else {
-        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) dropped and {repeated} repeated for clock drift, {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", stats.playback_packets, stats.playback_underruns, stats.playback_errors);
+        println!("Received {packets} packets: {lost} lost, {dropped} frame(s) dropped and {repeated} repeated for clock drift, {foreign} from another sender; playback {} packets, {} underruns, {} transfer errors.", stats.playback_packets, stats.playback_underruns.saturating_sub(stats::get().underrun_base), stats.playback_errors);
     }
 }
 

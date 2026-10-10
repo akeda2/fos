@@ -54,6 +54,9 @@ pub struct Stats {
     pub level_frames: u32,
     pub target_frames: u32,
     pub offset_ppm: i32,
+    /// The device's playback underruns when the first stream locked on: playback starts before the first packet, and
+    /// the silence it plays meanwhile is waiting, not an underrun of the stream.
+    pub underrun_base: u64,
     pub rate: u32,
     /// One detector per channel of the stream being sent and of the stream being received.
     pub send: [Ppm; MAX_CHANNELS],
@@ -77,7 +80,7 @@ pub struct Stats {
 
 const fn fresh() -> Stats {
     Stats {
-        sent: 0, received: 0, lost: 0, level_frames: 0, target_frames: 0, offset_ppm: 0, rate: 48_000,
+        sent: 0, received: 0, lost: 0, level_frames: 0, target_frames: 0, offset_ppm: 0, underrun_base: 0, rate: 48_000,
         send: [Ppm::new(); MAX_CHANNELS], receive: [Ppm::new(); MAX_CHANNELS], send_clip: [false; MAX_CHANNELS], receive_clip: [false; MAX_CHANNELS],
         send_channels: 0, receive_channels: 0, send_codec: Label::new(), receive_codec: Label::new(), meters_on: true, serve_status: Label::new(), coefficients: Coefficients::ZERO, coefficients_rate: 0,
     }

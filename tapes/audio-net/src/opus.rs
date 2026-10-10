@@ -325,6 +325,11 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             continue;
         };
         if locked_source.is_none() {
+            if crate::stats::get().underrun_base == 0 {
+                let mut device = AudioStats::default();
+                (api.audio_stats)(&mut device);
+                crate::stats::get().underrun_base = device.playback_underruns;
+            }
             println!("Receiving Opus from {}.{}.{}.{}.", source.0[0], source.0[1], source.0[2], source.0[3]);
         }
         locked_source = Some(source.0);
@@ -466,7 +471,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     (api.audio_stats)(&mut stats);
     (api.audio_stop)();
     println!();
-    println!("Received {packets} Opus packets: {lost} lost ({concealed} concealed), {dropped} frame(s) discarded, {bad} undecodable, clock offset learned {} ppm; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats.playback_underruns, stats.playback_errors);
+    println!("Received {packets} Opus packets: {lost} lost ({concealed} concealed), {dropped} frame(s) discarded, {bad} undecodable, clock offset learned {} ppm; playback {} packets, {} underruns, {} transfer errors.", servo.offset_ppm(), stats.playback_packets, stats.playback_underruns.saturating_sub(crate::stats::get().underrun_base), stats.playback_errors);
 }
 
 /// Writes `frames` decoded frames of `width` channels (16-bit, interleaved) into the timeline at RTP timestamp
