@@ -137,6 +137,7 @@ make test             # host unit tests (abi, crates, the tape libraries via `ca
 make test-NAME        # one end-to-end test; `make help`, or the .PHONY list in the Makefile
 make test-bios        # 16 of them, booted through BIOS (SeaBIOS), plus kernel placement and the skip-video override
 make test-all         # every test-* target (slow, ~30 min); prints PASS/FAIL per target
+make test-all TEST_JOBS=8   # the same in parallel (~9 min on a 16-core xeon): tools/run_tests.py, see docs/design.md
 ```
 
 The BIOS runs reuse the UEFI tests through `tools/qemu_bios_shim.py`, which drops the OVMF drives
@@ -146,7 +147,10 @@ the area you touched (`test-debug-mode` for crash/KUP/watchdog, `test-hda` and
 `test-usb-audio` for audio, `test-nic` and `test-rtl8139` for NICs, `test-recorder*`
 for the recorder, ...). `test-nettapes` (bridge and ip-chat through the
 `qemu-i386` shim) passes again. `test-audio-net` and `test-nettest`
-have been seen to flake once. Tests use bounded waits, keep the serial output on
+have been seen to flake once. A test with a fixed host port wraps it in `testslot.port()`, and a test that boots the image reads
+`FOSFOR_IMAGE` (parallel workers each get their own copy; QEMU refuses two writers). `test-bootcode-uefi` and `test-nettapes` have
+failed under load and pass alone. The landsbro buildbot (`gb -of fos`, config `fos.yaml`) runs the parallel suite. ARP/DHCP frame
+building is shared in `crates/tape-net/src/frames.rs`: do not copy it into a tape. Tests use bounded waits, keep the serial output on
 failure and wait for the prompt before typing. **Every new tape needs a focused test
 through its documented load/run path**; a green build is not validation. Editing a path
 (moving a directory) needs a full `make test-all`: split spellings such as
