@@ -221,7 +221,7 @@ maintainer's memory notes, not in this repository.
 - A tape with arguments carries its usage as `tape_rt::tape_help!(br#"..."#);` (lines of at most 79 columns): the text
   goes into the `.fos_help` section of its ELF, and the kernel prints it for `help NAME`, `NAME help` and `NAME --help` without
   running the tape (`tape.rs` `show_help`, `abi::elf::section`). Tapes done so far: ptp, audio-net, record, recorder, play, router,
-  bridge, nettest, ip-chat, telnet, net-chat, memtest. A new tape gets one; `ed`, `calc` and `hello` have none yet.
+  bridge, nettest, ip-chat, telnet, net-chat, memtest, fterm. A new tape gets one; `ed`, `calc` and `hello` have none yet.
 - Every shell command's output fits an 80-column text grid; keep each print line to at
   most 79 columns and split long messages rather than relying on wrapping.
 - Lower-case names throughout (FOSFS entries, files, tape names).
