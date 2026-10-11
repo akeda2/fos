@@ -405,3 +405,14 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   leave that does not close the NIC filter (`Igmp::leave_report`).
 - **Presets beat knobs**: `priority=` turns ring, packet time, screen update rate and step-down into one word; a recorder could
   offer the same for ring size and write-behind (safe, balanced, live).
+
+## Open after the USB-MIDI session (2026-10-11)
+
+- **MIDI tape ABI** (append-only `midi_*` calls over `usb_midi::take`/`send`) so a tape can read and write messages; SysEx on OUT and
+  several cables per device are not done (cable 0, 1-3 byte messages only).
+- **X-Touch Compact (Mackie Control)**: `crates/mackie` (fader/button/V-Pot messages) and a `crates/mixer` model for the recorder's
+  input/output levels; not started, hardware not yet tried.
+- **USB serial adapter**: another `kind` of serial port beside the 16550 in `uart.rs` once the chip is known; `fterm` already takes
+  any port through the `serial_*` calls.
+- **`usb_midi::release`** does not free the device's buffer page (small leak on unplug).
+- **Lesson**: a blocking shell loop must call `drain_nics`, or a `term net` client's Escape never arrives and the machine looks hung.
