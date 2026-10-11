@@ -374,8 +374,10 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   rides out the jitter, whether `priority=auto` should be able to step *up* to it, and what the ring needs at 5% loss.
 - **NTP / RTC follow-ups**: the PTP master takes NTP once at start (`ptp master ntp=`); an NTP re-poll that slews rather than steps
   (non-blocking, so Syncs keep going) is not there, nor an RTC kept in UTC with a zone setting in `settings` (today `tz=` is a `ptp`
-  argument and the RTC is local time), nor a DNS client for `pool.ntp.org` names, nor `settime` as a shell/boot option. Not run on
-  real hardware yet: DHCP option 42 from the real server (check what the network hands out) and the date on the three machines.
+  argument and the RTC is local time), nor a DNS client for `pool.ntp.org` names, nor `settime` as a shell/boot option. Checked on
+  amd1 (2026-10-11): DHCP option 42 names 192.168.0.17 (pi.hole, NTP stratum 3, refid LOCL: it is not synced upstream, but its
+  clock agrees with the laptop's), `ptp master both ip=dhcp ntp=dhcp` gets the right UTC date from it in 450 us. amd1's start has
+  no `settime`/`tz=`, so its own RTC (dead battery) stays unset.
 - **Panel**: a `ptp` setting row (`auto|off`) and the matching `cfg` words; today only the readout is there.
 - **PTP elsewhere**: Opus, `serve`, raw and AVTP have no PTP (L2 PTP, ethertype 0x88f7, is not implemented); there is no master
   inside `audio-net` (use the `ptp` tape, ptp4l or a studio clock); no hardware timestamping on the e1000 family.
