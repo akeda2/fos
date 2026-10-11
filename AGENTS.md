@@ -198,7 +198,7 @@ maintainer's memory notes, not in this repository.
 ## Things a new session should know (2026-10-09)
 
 - **Tests added for hardware-shaped behaviour**: `test-usb-kbd-replug`, `test-usb-replug` (disks, hubs, the hub itself),
-  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`, `test-console-utf8`, `test-hostnames`, `test-config-fat`.
+  `test-xhci-abort`, `test-release-loops`, `test-idle-cpu`, `test-net-chat`, `test-telnet`, `test-nettest-lab`, `test-bootcode-uefi`, `test-console-utf8`, `test-console-colors`, `test-hostnames`, `test-config-fat`.
   `make test-all` runs every `test-*` target (70 of them; none is a known failure).
 - **`term net` data frames carry no length**: the kernel drops trailing zero bytes (Ethernet padding) before a tape or the shell sees
   the frame; a NUL typed on purpose is lost. A tape's single-interface network calls follow `nic use N` (ABI 4, `nic_active`).

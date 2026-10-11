@@ -312,7 +312,7 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
         utf8_left: 0,
     };
     console.foreground = console.pixel(0xc0, 0xc0, 0xc0);
-    console.background = console.pixel(0x00, 0x00, 0x20);
+    console.background = console.pixel(0x00, 0x00, 0x00);
     let (width, height, background) = (console.width, console.height, console.background);
     console.fill(0, 0, width, height, background);
     if console.columns * console.rows > MAX_CELLS {
@@ -326,9 +326,9 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
     true
 }
 
-/// Where VGA text memory is, and the colours of its cells: light grey on blue, as the pixel console draws.
+/// Where VGA text memory is, and the colours of its cells: light grey on black, as the pixel console draws.
 pub const VGA_TEXT_BASE: u64 = 0xb8000;
-const TEXT_ATTRIBUTE: u8 = 0x17;
+const TEXT_ATTRIBUTE: u8 = 0x07;
 
 /// Starts the console in VGA text mode (80x25 at 0xB8000, which `paging` maps on a BIOS boot without a framebuffer): the
 /// screen is cleared, and the cursor made visible. Only for a BIOS boot, where the BIOS left the screen in text mode; a UEFI
@@ -372,6 +372,54 @@ pub fn init_text() -> bool {
 }
 
 /// Text grid size, once the console exists.
+/// The colours the `foreground` setting accepts, as RGB.
+fn foreground_color(name: &str) -> Option<(u8, u8, u8)> {
+    Some(match name {
+        "gray" | "grey" => (0xc0, 0xc0, 0xc0),
+        "green" => (0x33, 0xff, 0x33),
+        "amber" => (0xff, 0xb0, 0x00),
+        "black" => (0x00, 0x00, 0x00),
+        _ => return None,
+    })
+}
+
+/// The colours the `background` setting accepts, as RGB.
+fn background_color(name: &str) -> Option<(u8, u8, u8)> {
+    Some(match name {
+        "black" => (0x00, 0x00, 0x00),
+        "blue" => (0x00, 0x00, 0xaa),
+        "gray" | "grey" => (0xc0, 0xc0, 0xc0),
+        _ => return None,
+    })
+}
+
+/// Changes the pixel console's colours (`None` keeps the current one) and redraws the whole
+/// screen, since `repaint` only draws cells that changed. Returns false for an unknown name or when there is no pixel
+/// console: the VGA text screen keeps its fixed grey on black.
+pub fn set_colors(foreground: Option<&str>, background: Option<&str>) -> bool {
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return false };
+    if console.text {
+        return false;
+    }
+    let (Some(foreground), Some(background)) = (
+        foreground.map_or(Some(None), |name| foreground_color(name).map(Some)),
+        background.map_or(Some(None), |name| background_color(name).map(Some)),
+    ) else {
+        return false;
+    };
+    if let Some((red, green, blue)) = foreground {
+        console.foreground = console.pixel(red, green, blue);
+    }
+    if let Some((red, green, blue)) = background {
+        console.background = console.pixel(red, green, blue);
+    }
+    let (width, height, background) = (console.width, console.height, console.background);
+    console.fill(0, 0, width, height, background);
+    unsafe { (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ') };
+    console.repaint();
+    true
+}
+
 pub fn size() -> Option<(usize, usize)> {
     unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref().map(|console| (console.columns, console.rows)) }
 }

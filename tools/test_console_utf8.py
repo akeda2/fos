@@ -24,7 +24,7 @@ TEXT = "åäöÅÄÖ€"
 LATIN9 = bytes([0xE5, 0xE4, 0xF6, 0xC5, 0xC4, 0xD6, 0xA4])
 LOADER = ROOT / "build/cargo-target/x86_64-unknown-uefi/release/fosfor-loader.efi"
 KERNEL = ROOT / "build/cargo-target/x86_64-fos-kernel/release/fosfor-kernel"
-FOREGROUND, BACKGROUND = (0xC0, 0xC0, 0xC0), (0x00, 0x00, 0x20)
+FOREGROUND, BACKGROUND = (0xC0, 0xC0, 0xC0), (0x00, 0x00, 0x00)
 
 
 def font():

@@ -4,6 +4,8 @@
 //! * `hostname`: the base name announced in discovery replies (`NAME` + the interface
 //!   number, so `lab` becomes `lab1`);
 //! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling;
+//!   `foreground gray|green|amber|black` and `background black|blue|gray` set the pixel console's colours (not in
+//!   BIOS text mode, which stays grey on black);
 //! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` arms the
 //!   software watchdog and `kernel-update` enables KUP (both in `debug.rs`/`term.rs`);
 //! * `start`: a command script run once at boot (up to 4096 bytes; blank lines and
@@ -122,6 +124,15 @@ pub fn load() {
                 Some("deny-term-net") => {
                     unsafe { DENY_TERM_NET = true };
                     crate::println!("settings: deny-term-net -- the network terminal is closed.");
+                }
+                Some(key @ ("foreground" | "background")) => {
+                    let name = line.split_whitespace().nth(1).unwrap_or("");
+                    let (fg, bg) = if key == "foreground" { (Some(name), None) } else { (None, Some(name)) };
+                    if crate::framebuffer::set_colors(fg, bg) {
+                        crate::println!("settings: {key} {name}.");
+                    } else {
+                        crate::println!("settings: `{line}` ignored (unknown colour, or no pixel console).");
+                    }
                 }
                 Some("prefer-msix") => unsafe { PREFER_MSIX = true },
                 Some("no-msi") => {
