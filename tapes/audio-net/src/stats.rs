@@ -54,6 +54,8 @@ pub struct Stats {
     pub level_frames: u32,
     /// The lowest and highest ring level at a packet arrival during the last second (frames).
     pub level_low: u32,
+    /// The longest time between two passes of the receive loop during the last second (microseconds).
+    pub pass_gap_us: u32,
     pub level_high: u32,
     pub target_frames: u32,
     /// Frames in the packet last received: the stream's own packetisation delay.
@@ -121,7 +123,7 @@ impl Stats {
 
 const fn fresh() -> Stats {
     Stats {
-        sent: 0, received: 0, lost: 0, level_frames: 0, level_low: 0, level_high: 0, target_frames: 0, packet_frames: 0, offset_ppm: 0, underrun_base: 0, underrun_last: 0, rate: 48_000, ptp_delay_us: 0, ptp_min_us: 0, ptp_max_us: 0, ptp_samples: 0, ptp_last: 0,
+        sent: 0, received: 0, lost: 0, level_frames: 0, level_low: 0, pass_gap_us: 0, level_high: 0, target_frames: 0, packet_frames: 0, offset_ppm: 0, underrun_base: 0, underrun_last: 0, rate: 48_000, ptp_delay_us: 0, ptp_min_us: 0, ptp_max_us: 0, ptp_samples: 0, ptp_last: 0,
         send: [Ppm::new(); MAX_CHANNELS], receive: [Ppm::new(); MAX_CHANNELS], send_clip: [false; MAX_CHANNELS], receive_clip: [false; MAX_CHANNELS],
         send_channels: 0, receive_channels: 0, send_codec: Label::new(), receive_codec: Label::new(), meters_on: true, serve_status: Label::new(), coefficients: Coefficients::ZERO, coefficients_rate: 0,
     }

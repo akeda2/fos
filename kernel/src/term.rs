@@ -838,6 +838,7 @@ pub fn set_tape_mode(on: bool) {
         TAPE_INPUT_HEAD = 0;
         TAPE_INPUT_TAIL = 0;
     }
+    crate::serial::defer(on);
     if !on {
         flush();
     }
@@ -918,6 +919,7 @@ fn tape_service() {
     }
     announce_service();
     flush();
+    crate::serial::pump();
 }
 
 /// A tape's `read_key`: 0 none, 1 abort, 0x100 + byte.

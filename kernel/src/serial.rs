@@ -26,7 +26,28 @@ pub fn init() {
     outb(COM1 + 4, 0x03); // DTR + RTS
 }
 
-pub fn write_byte(byte: u8) {
+/// While a tape runs, serial output is queued here instead of waiting for the UART. At 115200 baud a byte takes about
+/// 87 us, so a panel redrawing a screen line (a few hundred bytes with its escape codes) held the tape's loop up for
+/// 20 ms or more, and the USB audio ring ran dry. `pump` moves queued bytes into the 16-byte FIFO whenever the
+/// UART has room; `flush` waits for all of it (tape end, panic, halt, reset).
+const QUEUE_SIZE: usize = 131072;
+static mut QUEUE: [u8; QUEUE_SIZE] = [0; QUEUE_SIZE];
+static mut QUEUE_HEAD: usize = 0;
+static mut QUEUE_TAIL: usize = 0;
+static mut DEFER: bool = false;
+
+/// Runs `body` with interrupts off, so an interrupt handler that prints cannot interleave with the queue update.
+fn locked<T>(body: impl FnOnce() -> T) -> T {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    let result = body();
+    if flags & 0x200 != 0 {
+        unsafe { core::arch::asm!("sti") };
+    }
+    result
+}
+
+fn write_now(byte: u8) {
     // Wait (bounded) for the transmit register to empty: a machine with no UART
     // reads 0xff and must not hang the kernel.
     for _ in 0..100_000 {
@@ -35,6 +56,61 @@ pub fn write_byte(byte: u8) {
         }
     }
     outb(COM1, byte);
+}
+
+/// Queues output while a tape runs (`on`), or drains the queue and goes back to writing directly.
+pub fn defer(on: bool) {
+    if !on {
+        flush();
+    }
+    unsafe { DEFER = on };
+}
+
+/// Moves queued bytes to the UART while its transmit register is empty (it then takes a whole FIFO at once).
+pub fn pump() {
+    locked(|| unsafe {
+        let mut room = 16;
+        while room > 0 && QUEUE_TAIL != QUEUE_HEAD && inb(COM1 + 5) & 0x20 != 0 {
+            let burst = room.min((QUEUE_HEAD + QUEUE_SIZE - QUEUE_TAIL) % QUEUE_SIZE);
+            for _ in 0..burst {
+                outb(COM1, QUEUE[QUEUE_TAIL]);
+                QUEUE_TAIL = (QUEUE_TAIL + 1) % QUEUE_SIZE;
+            }
+            room = 0;
+        }
+    });
+}
+
+/// True while queued output waits for the UART.
+pub fn pending() -> bool {
+    unsafe { QUEUE_TAIL != QUEUE_HEAD }
+}
+
+/// Writes out everything queued, waiting for the UART as the direct path does.
+pub fn flush() {
+    locked(|| unsafe {
+        while QUEUE_TAIL != QUEUE_HEAD {
+            write_now(QUEUE[QUEUE_TAIL]);
+            QUEUE_TAIL = (QUEUE_TAIL + 1) % QUEUE_SIZE;
+        }
+    });
+}
+
+pub fn write_byte(byte: u8) {
+    if !unsafe { DEFER } {
+        write_now(byte);
+        return;
+    }
+    locked(|| unsafe {
+        let next = (QUEUE_HEAD + 1) % QUEUE_SIZE;
+        if next == QUEUE_TAIL {
+            // Full: wait for the oldest byte as the direct path would.
+            write_now(QUEUE[QUEUE_TAIL]);
+            QUEUE_TAIL = (QUEUE_TAIL + 1) % QUEUE_SIZE;
+        }
+        QUEUE[QUEUE_HEAD] = byte;
+        QUEUE_HEAD = next;
+    });
 }
 
 /// A received byte, if one is waiting (LSR bit 0). A machine with no UART reads 0xff from

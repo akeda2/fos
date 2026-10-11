@@ -173,6 +173,14 @@ extern "C" fn api_read_key() -> u32 {
 extern "C" fn api_set_input_mode(_mode: u32) {}
 extern "C" fn api_wait_for_event() {
     term::flush_output();
+    // Idle time is when queued serial output goes out; a tick alone would drain only 16 bytes per 10 ms.
+    if crate::serial::pending() {
+        let until = apic::micros() + 100;
+        while crate::serial::pending() && apic::micros() < until {
+            crate::serial::pump();
+        }
+        return;
+    }
     if term::nic_count() == 0 || term::all_interrupt_driven() {
         // Nothing to wait for but interrupts: a frame (MSI), a key, the 10 ms tick.
         unsafe { core::arch::asm!("hlt") };

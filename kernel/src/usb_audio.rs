@@ -473,6 +473,9 @@ struct Feedback {
     packet: u16,
     /// The last accepted value, in Q16 samples per packet, and how many were received / rejected.
     last_q16: u32,
+    /// The lowest and highest accepted values (Q16 samples per packet), reported when the stream stops.
+    min_q16: u32,
+    max_q16: u32,
     received: AtomicU64,
     rejected: AtomicU64,
 }
@@ -796,6 +799,8 @@ fn build_feedback(controller: &mut Controller, device: &Device, alt: &StreamAlt)
             next: 0,
             packet,
             last_q16: 0,
+            min_q16: u32::MAX,
+            max_q16: 0,
             received: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
         }),
@@ -858,6 +863,8 @@ fn feedback_event(stream: &mut Stream, event: &xhci::Trb, high_speed: bool) -> b
         // Believe only values within 10% of the nominal rate: a garbage report must not wreck the stream.
         if step >= u64::from(nominal) * 9 / 10 && step <= u64::from(nominal) * 11 / 10 {
             feedback.last_q16 = step as u32;
+            feedback.min_q16 = feedback.min_q16.min(step as u32);
+            feedback.max_q16 = feedback.max_q16.max(step as u32);
             feedback.received.fetch_add(1, Ordering::Relaxed);
             new_step = Some(step as u32);
         } else {
@@ -972,6 +979,27 @@ fn clone_description(description: &Description) -> Description {
 }
 
 fn stop_stream(controller: &mut Controller, device: &Device, mut stream: Stream) {
+    if !stream.capture {
+        // What the stream did, for diagnosing underruns after a run (frames per packet, Q16 shown as milli-frames).
+        let milli = |value: u32| (u64::from(value) * 1000) >> 16;
+        crate::print(format_args!(
+            "usb audio playback: {} packets, {} underruns, nominal {} mf/packet",
+            stream.packets.load(Ordering::Relaxed),
+            stream.underruns.load(Ordering::Relaxed),
+            milli(stream.nominal_step())
+        ));
+        match stream.feedback.as_ref() {
+            Some(feedback) if feedback.received.load(Ordering::Relaxed) > 0 => crate::println!(
+                "; feedback {} reports ({} rejected), {} to {} mf/packet.",
+                feedback.received.load(Ordering::Relaxed),
+                feedback.rejected.load(Ordering::Relaxed),
+                milli(feedback.min_q16),
+                milli(feedback.max_q16)
+            ),
+            Some(_) => crate::println!("; feedback endpoint gave no usable report."),
+            None => crate::println!("; no feedback endpoint (nominal rate used)."),
+        }
+    }
     if let Some(feedback) = stream.feedback.take() {
         controller.stop_endpoint(device.slot, feedback.dci);
         controller.drop_endpoint(device, feedback.dci);

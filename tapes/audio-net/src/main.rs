@@ -1072,7 +1072,11 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     // less than one packet.
     let (mut level_min, mut level_max, mut level_short, mut level_samples) = (usize::MAX, 0usize, 0u64, 0u64);
     let (mut second_low, mut second_high) = (usize::MAX, 0usize);
+    let (mut last_pass, mut second_gap) = (tape_rt::micros(), 0u64);
     loop {
+        let pass = tape_rt::micros();
+        second_gap = second_gap.max(pass - last_pass);
+        last_pass = pass;
         if (api.should_abort)() != 0 {
             break;
         }
@@ -1284,6 +1288,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             next_report += 1_000_000;
             (shown.level_low, shown.level_high) = (if second_low == usize::MAX { 0 } else { second_low as u32 }, second_high as u32);
             (second_low, second_high) = (usize::MAX, 0);
+            (shown.pass_gap_us, second_gap) = (second_gap as u32, 0);
             print!(".");
             if options.verbose && (next_report - started) / 1_000_000 % 10 == 0 {
                 println!(" [{packets} packets, {lost} lost, level {level} frames (target {}), {dropped} dropped, {repeated} repeated, clock offset {} ppm]", fill.target(), servo.offset_ppm());

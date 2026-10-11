@@ -32,6 +32,7 @@ pub fn set_acpi_reset(register: Option<(u8, u64, u8)>) {
 /// leave. Does not return.
 pub fn reset(runtime_services: u64) -> ! {
     cpu::interrupts_disable();
+    crate::serial::flush();
     unsafe {
         // Each method gets one try; a method that did not reset the machine falls through to the next.
         if RESET_ATTEMPTED == 0 {

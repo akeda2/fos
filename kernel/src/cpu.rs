@@ -89,6 +89,7 @@ pub fn interrupts_disable() {
 }
 
 pub fn halt() -> ! {
+    crate::serial::flush();
     loop {
         unsafe { core::arch::asm!("hlt") };
     }
