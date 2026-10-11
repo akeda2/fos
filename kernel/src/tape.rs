@@ -181,6 +181,15 @@ extern "C" fn api_wait_for_event() {
         }
         return;
     }
+    if crate::uart::any_open() {
+        // A polled UART: its 16-byte FIFO overflows in 1.4 ms at 115200 baud, a tick later would be too late.
+        let until = apic::micros() + 100;
+        while apic::micros() < until {
+            crate::uart::poll();
+            core::hint::spin_loop();
+        }
+        return;
+    }
     if term::nic_count() == 0 || term::all_interrupt_driven() {
         // Nothing to wait for but interrupts: a frame (MSI), a key, the 10 ms tick.
         unsafe { core::arch::asm!("hlt") };
@@ -473,6 +482,38 @@ extern "C" fn api_wall_clock_set(time: *const fosfor_abi::tape::WallClock) -> u3
     let time = fat::Time { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
     u32::from(crate::clock::set(&time).is_ok())
 }
+extern "C" fn api_serial_count() -> usize {
+    crate::uart::count()
+}
+extern "C" fn api_serial_info(number: usize, out: *mut fosfor_abi::tape::SerialInfo) -> u32 {
+    let mut info = fosfor_abi::tape::SerialInfo::default();
+    let found = crate::uart::info(number, &mut info);
+    if found && !out.is_null() {
+        unsafe { out.write(info) };
+    }
+    u32::from(found)
+}
+extern "C" fn api_serial_open(number: usize, baud: u32, format: u32) -> i32 {
+    crate::uart::open(number, baud, format)
+}
+extern "C" fn api_serial_close(number: usize) {
+    crate::uart::close(number);
+}
+extern "C" fn api_serial_read(number: usize, buffer: *mut u8, capacity: usize) -> usize {
+    crate::uart::read(number, unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
+}
+extern "C" fn api_serial_write(number: usize, data: *const u8, length: usize) -> usize {
+    crate::uart::write(number, unsafe { core::slice::from_raw_parts(data, length) })
+}
+extern "C" fn api_serial_lines(number: usize) -> u32 {
+    crate::uart::lines(number)
+}
+extern "C" fn api_serial_set_lines(number: usize, lines: u32) {
+    crate::uart::set_lines(number, lines);
+}
+extern "C" fn api_serial_break(number: usize, on: u32) {
+    crate::uart::set_break(number, on != 0);
+}
 extern "C" fn api_audio_set_capture_ring(bytes: u64) {
     crate::usb_audio::set_capture_ring(bytes); // the capture ring belongs to whichever device starts next
 }
@@ -606,6 +647,15 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_active: api_nic_active,
         peer_info: api_peer_info,
         wall_clock_set: api_wall_clock_set,
+        serial_count: api_serial_count,
+        serial_info: api_serial_info,
+        serial_open: api_serial_open,
+        serial_close: api_serial_close,
+        serial_read: api_serial_read,
+        serial_write: api_serial_write,
+        serial_lines: api_serial_lines,
+        serial_set_lines: api_serial_set_lines,
+        serial_break: api_serial_break,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
@@ -626,6 +676,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         );
     }
     crate::debug::set_tape_running(false);
+    crate::uart::close_all();
     crate::audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an audio stream running
     term::set_tape_mode(false);
     memory::free(stack, STACK_BYTES / memory::FRAME);

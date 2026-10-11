@@ -56,6 +56,7 @@ mod power;
 mod serial;
 mod storage;
 mod tape;
+mod uart;
 mod term;
 mod usb_audio;
 mod usb_hid;
@@ -93,6 +94,7 @@ pub fn print(arguments: core::fmt::Arguments) {
             log::push(text);
             framebuffer::write_str(text);
             term::relay(text);
+            uart::shell_write(text);
             Ok(())
         }
     }
@@ -426,8 +428,17 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         }
         usb_hid::poll();
         term::poll();
-        // Sleep until the next timer tick (or a NIC-less machine's only wakeup).
-        unsafe { core::arch::asm!("hlt") };
+        if uart::shell_active() {
+            // The shell's UART has no interrupt and a 16-byte FIFO: keep polling it instead of sleeping a whole tick.
+            let until = apic::micros() + 100;
+            while apic::micros() < until {
+                uart::poll();
+                core::hint::spin_loop();
+            }
+        } else {
+            // Sleep until the next timer tick (or a NIC-less machine's only wakeup).
+            unsafe { core::arch::asm!("hlt") };
+        }
     }
 }
 

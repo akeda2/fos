@@ -915,3 +915,30 @@ sending a frame (callback, per-NIC send, tape API). Verified: host tests, `test-
 tests do not share a segment. Logs go to `build/test-logs/`; the slowest tests of the last run start first; a failure is
 re-run alone at the end (each worker also gets its own copy of the image, `FOSFOR_IMAGE`, because QEMU refuses two writers on one file; tests must honour that variable) and reported as "only when run alone" if it then passes. A new test with a fixed host port must
 wrap it in `port()`. `fos.yaml` (the landsbro buildbot) uses `TEST_JOBS=8`. Without `TEST_JOBS` the run is serial as before.
+
+### fterm and the serial tape calls
+
+ABI 7 adds `serial_count/info/open/close/read/write/lines/set_lines/break`: the 16550 UARTs at COM2-COM4 (`kernel/src/uart.rs`; COM1 is the
+console and is never offered). Polled, with a 4 KiB ring per port filled whenever a tape asks for input and while `wait_for_event` yields
+(100 us) with a port open, since the FIFO holds only 16 bytes. The `fterm` tape is a serial terminal over them: keys out as typed (Ctrl-C and
+Esc too), received bytes to the console, commands behind Ctrl-A plus a plain letter (no AltGr combination, for Nordic keyboards). `make
+test-fterm` plays the device on QEMU's second UART over TCP.
+
+The tape's transports are `Link`s (`tapes/fterm/src/link.rs`: `poll`, `read`, `write`, `status`, `close`; the loop never blocks): `serial.rs`,
+`telnet.rs` (the telnet tape's session as a non-blocking state machine: DHCP or static, ARP, TCP, option negotiation, reusing `telnet_tape` and
+`tape_net`; it does not answer cursor-position queries) and `termnet.rs` (HELLO/DATA/BYE to a MAC or an announced name from `peer_info`).
+`run fterm telnet IP [PORT] [static LOCAL/PREFIX GATEWAY]` and `run fterm net NAME|MAC` follow `nic use`. `make test-fterm-net` runs both against a
+host Telnet server and a host-side `term net` peer.
+
+A bare `run fterm` (or `run fterm ui`) shows a settings panel like audio-net's and the recorder's (`tapes/fterm/src/ui.rs`; the rules, host-tested, are
+`form.rs`): transport (serial, Telnet, `term net`), the rows that belong to it, `P` picks a machine from the peer table, `C` connects, `W` saves
+`fterm.cfg`, which is just the equivalent command line (`run fterm @fterm.cfg` repeats it; more words may follow the `@`). Keys are plain: Up/Down or
+Tab select, Space/Backspace/Enter change, Left/Right too. A session returns to the panel. Over the console UART a raw ESC reads as abort, so arrow
+keys only work from the keyboard and `term net`; that is why Space/Backspace exist. `make test-fterm-ui`.
+
+**Serial shell.** `serial-shell [PORT] [BAUD]` in `settings` (default: the first listed port, 115200 8n1) puts this machine's shell on that port:
+the kernel's output is mirrored to it (LF as CR LF) and its input is read like the keyboard's (`keyboard::pop` falls back to `uart::shell_read`).
+It is opt-in, so "deny" means not having the line; there is no password, so it is a full shell for whoever holds the cable. A shell port is not
+offered to tapes (`serial_open` gives `SERIAL_BUSY`, -3; `fterm` says so). The main loop polls the UART every 100 us instead of `hlt` while it is on,
+so an idle machine burns CPU (the FIFO is 16 bytes, a pasted line would be lost otherwise); `test-idle-cpu` runs without it. `make test-serial-shell`
+boots an image with the setting and plays the laptop on COM2. Planned: USB serial adapters as another port `kind` behind the same calls.

@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`.
-pub const TAPE_API_VERSION: u32 = 6;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls.
+pub const TAPE_API_VERSION: u32 = 7;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -179,6 +179,77 @@ pub struct TapeApi {
     /// tape calls it only when nothing is being recorded; `ptp settime` does it once, when it first locks to a master with real
     /// time. Check `version >= 6` and `size` before calling.
     pub wall_clock_set: extern "C" fn(*const WallClock) -> u32,
+    /// `serial_count()` (version 7): how many serial ports a tape may use, numbered 1 to that count. COM1 is not among them: it is
+    /// the console. Check `version >= 7` and `size` before calling this or any `serial_*` call.
+    pub serial_count: extern "C" fn() -> usize,
+    /// `serial_info(number, out)` (version 7): fills `SerialInfo` for port `number` (1-based); 1 on success, 0 for no such port.
+    pub serial_info: extern "C" fn(usize, *mut SerialInfo) -> u32,
+    /// `serial_open(number, baud, format)` (version 7): programs the port (`format` is `SERIAL_8N1` or'ed with `SERIAL_STOP2` and
+    /// one parity flag), clears its FIFOs and raises DTR and RTS. Opening an open port reprograms it. 0 or a negative `SERIAL_*`
+    /// code. Every port a tape opened is closed when it ends.
+    pub serial_open: extern "C" fn(usize, u32, u32) -> i32,
+    /// `serial_close(number)` (version 7): stops using the port (DTR and RTS drop).
+    pub serial_close: extern "C" fn(usize),
+    /// `serial_read(number, buffer, capacity)` (version 7): copies received bytes out; returns how many. Never blocks. The kernel
+    /// moves the UART's FIFO into a ring whenever the tape calls `read_key`, `should_abort`, `wait_for_event` or this, so call
+    /// one of them at least every millisecond or two at 115200 baud.
+    pub serial_read: extern "C" fn(usize, *mut u8, usize) -> usize,
+    /// `serial_write(number, data, len)` (version 7): queues bytes for sending; returns how many the transmitter took (at most
+    /// its 16-byte FIFO per call, so a short return means "come back later"). Never blocks.
+    pub serial_write: extern "C" fn(usize, *const u8, usize) -> usize,
+    /// `serial_lines(number)` (version 7): the modem control lines, `SERIAL_LINE_*` bits (CTS, DSR, RI, DCD in; DTR, RTS out).
+    pub serial_lines: extern "C" fn(usize) -> u32,
+    /// `serial_set_lines(number, lines)` (version 7): sets the output lines (`SERIAL_LINE_DTR`, `SERIAL_LINE_RTS`).
+    pub serial_set_lines: extern "C" fn(usize, u32),
+    /// `serial_break(number, on)` (version 7): holds the transmit line low (a break) while `on` is non-zero.
+    pub serial_break: extern "C" fn(usize, u32),
+}
+
+/// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.
+pub const SERIAL_8N1: u32 = 0x03;
+pub const SERIAL_7N1: u32 = 0x02;
+pub const SERIAL_STOP2: u32 = 0x04;
+pub const SERIAL_PARITY_ODD: u32 = 0x08;
+pub const SERIAL_PARITY_EVEN: u32 = 0x18;
+
+/// `serial_lines` bits.
+pub const SERIAL_LINE_CTS: u32 = 0x01;
+pub const SERIAL_LINE_DSR: u32 = 0x02;
+pub const SERIAL_LINE_RI: u32 = 0x04;
+pub const SERIAL_LINE_DCD: u32 = 0x08;
+pub const SERIAL_LINE_DTR: u32 = 0x10;
+pub const SERIAL_LINE_RTS: u32 = 0x20;
+
+/// `serial_open` errors (negative).
+pub const SERIAL_NO_PORT: i32 = -1;
+pub const SERIAL_BAD_SETTINGS: i32 = -2;
+/// The port belongs to the kernel (`serial-shell` in `settings`): the shell is on it.
+pub const SERIAL_BUSY: i32 = -3;
+
+/// `SerialInfo::kind`: what drives the port. Later kinds (USB serial adapters) will get new values.
+pub const SERIAL_KIND_UART: u32 = 1;
+
+/// What `serial_info` fills in. Kernel-filled, so never extend it: a new fact gets a new call.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SerialInfo {
+    pub kind: u32,
+    /// 1 while a tape has the port open.
+    pub open: u32,
+    /// The UART's I/O base for `SERIAL_KIND_UART`.
+    pub io_base: u32,
+    pub baud: u32,
+    pub format: u32,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// Receive faults since the port was opened: bytes lost to an overrun (the kernel's ring or the UART's FIFO), framing
+    /// errors, parity errors and breaks seen.
+    pub overruns: u32,
+    pub framing_errors: u32,
+    pub parity_errors: u32,
+    pub breaks: u32,
+    /// Port name, ASCII, zero padded (`COM2`).
+    pub name: [u8; 8],
 }
 
 /// What `peer_info` fills in. Kernel-filled, so never extend it: a new fact gets a new call.

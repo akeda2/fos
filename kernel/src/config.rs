@@ -4,6 +4,7 @@
 //! * `hostname`: the base name announced in discovery replies (`NAME` + the interface
 //!   number, so `lab` becomes `lab1`);
 //! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling;
+//!   `serial-shell [PORT] [BAUD]` puts the shell on a serial port as well (COM2-COM4, numbered as `fterm list` does; off unless asked);
 //!   `foreground gray|green|amber|black` and `background black|blue|gray` set the pixel console's colours (not in
 //!   BIOS text mode, which stays grey on black);
 //! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` arms the
@@ -132,6 +133,15 @@ pub fn load() {
                         crate::println!("settings: {key} {name}.");
                     } else {
                         crate::println!("settings: `{line}` ignored (unknown colour, or no pixel console).");
+                    }
+                }
+                Some("serial-shell") => {
+                    let mut words = line.split_whitespace().skip(1);
+                    let number = words.next().and_then(|word| word.parse().ok()).unwrap_or(1);
+                    let baud = words.next().and_then(|word| word.parse().ok()).unwrap_or(115_200);
+                    match crate::uart::open_shell(number, baud) {
+                        0 => crate::println!("settings: serial-shell -- the shell is also on serial port {number} at {baud} baud (8n1)."),
+                        _ => crate::println!("settings: `{line}` ignored (no such serial port, or bad baud rate; `run fterm list` shows them)."),
                     }
                 }
                 Some("prefer-msix") => unsafe { PREFER_MSIX = true },

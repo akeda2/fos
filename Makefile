@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8 test-console-colors test-hostnames test-config-fat
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8 test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell
 
 all: image tapes
 
@@ -42,6 +42,22 @@ test-idle-cpu: image
 # The net-chat tape: chat text and discovery over raw Ethernet, driven from a term net session.
 test-net-chat: image
 	python3 tools/test_net_chat.py
+
+# The fterm serial terminal tape against a host-side peer on the second QEMU UART (COM2).
+test-fterm: image
+	python3 tools/test_fterm.py
+
+# The fterm settings panel, driven by keystrokes.
+test-fterm-ui: image
+	python3 tools/test_fterm_ui.py
+
+# fterm over Telnet (user-mode network) and term net (a host-side peer on the multicast segment).
+test-fterm-net: image
+	python3 tools/test_fterm_net.py
+
+# The shell on a serial port (`serial-shell` in settings), driven from a host-side peer on COM2.
+test-serial-shell: image
+	python3 tools/test_serial_shell.py
 
 # The telnet tape against a host-side Telnet server (QEMU user-mode network).
 test-telnet: image
@@ -86,7 +102,7 @@ LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
 IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp
+TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp fterm
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
 TAPE_FILES := $(foreach tape,$(TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape)) --file debug=tools/default-debug.txt
 
@@ -143,7 +159,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml
-	for tape in router nettest ed ip-chat telnet ptp; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
+	for tape in router nettest ed ip-chat telnet ptp fterm; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
 
 # Deliberate-fault kernels (one Cargo feature each): checks the exception reports,

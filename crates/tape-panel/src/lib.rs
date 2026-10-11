@@ -132,6 +132,12 @@ impl<const N: usize> Text<N> {
     }
 }
 
+impl<const N: usize> core::fmt::Debug for Text<N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
 impl<const N: usize> Default for Text<N> {
     fn default() -> Self {
         Self::new()

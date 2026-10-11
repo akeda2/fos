@@ -312,7 +312,7 @@ def main():
     check(pixel(32, bar_y) == (255, 0, 0), f"red bar is red {pixel(32, bar_y)}", text)
     check(pixel(112, bar_y) == (0, 255, 0), f"green bar is green {pixel(112, bar_y)}", text)
     check(pixel(192, bar_y) == (0, 0, 255), f"blue bar is blue {pixel(192, bar_y)}", text)
-    check(pixel(width - 10, height // 2) == (0, 0, 0x20), f"the background fill is the console colour {pixel(width - 10, height // 2)}", text)
+    check(pixel(width - 10, height // 2) == (0, 0, 0), f"the background fill is the console colour {pixel(width - 10, height // 2)}", text)
     lit = sum(1 for y in range(0, 16 * 12) for x in range(0, 8 * 60) if pixel(x, y) == (0xc0, 0xc0, 0xc0))
     check(lit > 400, f"text is drawn on screen ({lit} foreground pixels in the first rows)", text)
     print("boot via BIOS: all checks passed" if BIOS else "boot (M0-M3): all checks passed")

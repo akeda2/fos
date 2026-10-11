@@ -917,6 +917,7 @@ fn tape_service() {
             queue_frame(index, &buffer[..length]);
         }
     }
+    crate::uart::poll();
     announce_service();
     flush();
     crate::serial::pump();

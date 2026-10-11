@@ -111,7 +111,7 @@ A tape is a position-independent ELF64 executable whose entry is
 `extern "C" fn(api: &TapeApi)`. `abi/src/tape.rs` is the source of truth; rules:
 
 - **Append-only.** Fields are only added at the end of `TapeApi`; a tape checks `version`
-  and `size` before using a late field. Version is currently 6 (`wall_clock_set`: `ptp settime` sets the clock and RTC; 5: `peer_info`: the kernel table of announced machine names; `nic_active`: `nic use N` also steers the single-interface network calls of `net-chat`, `ip-chat` and `telnet`).
+  and `size` before using a late field. Version is currently 7 (`serial_*`: COM2-COM4 for the `fterm` tape, `kernel/src/uart.rs`; 6: `wall_clock_set`: `ptp settime` sets the clock and RTC; 5: `peer_info`: the kernel table of announced machine names; `nic_active`: `nic use N` also steers the single-interface network calls of `net-chat`, `ip-chat` and `telnet`).
 - **Never add fields to a struct the kernel fills in** (`AudioInfo`, `AudioStats`,
   `DiskInfo`, ...): a tape built earlier passes a smaller struct and the kernel writes
   past it. New information gets a new call and a new struct (`audio_buffer`,
@@ -159,7 +159,7 @@ through its documented load/run path**; a green build is not validation. Editing
 ## Debug mode, KUP, real hardware
 
 Per-machine config files on FOSFS: `start` (boot script; the `start` command reruns it), `hostname`, `settings`
-(`no-msi`, `deny-term-net`), `debug` (`reboot-on-crash`, `reboot-delay N`,
+(`no-msi`, `deny-term-net`, `serial-shell [PORT] [BAUD]`: the shell also on a serial port, no password, see docs/design.md), `debug` (`reboot-on-crash`, `reboot-delay N`,
 `kernel-update`, `watchdog [N]`, `crash-on-boot`; `tools/default-debug.txt` is installed
 by default). A fatal exception writes a crash record (read and printed by the next
 boot) and, with `reboot-on-crash`, resets; five pre-milestone crashes in a row stop the
