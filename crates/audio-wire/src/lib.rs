@@ -382,9 +382,14 @@ impl Servo {
         // order: natural frequency w = sqrt(Ki * rate), damping z = Kp * rate / (2 w). At 48 kHz these gains give
         // w = 0.14 rad/s (a ~45 s period) and z = 0.87: it settles without ringing.
         // Integral: 4e-7 per frame-second -> 400 ppb * error * (frames / rate).
-        self.integral_ppb = (self.integral_ppb + 400 * error * frames as i64 / i64::from(rate.max(1))).clamp(-MAX_PPB, MAX_PPB);
         // Proportional: 5 ppm per frame of error.
         let proportional = 5000 * error;
+        // Anti-windup: while the output is already at its limit and the error pushes further that way, the integral
+        // stands still (otherwise it saturates as well and the loop takes long to come back once the error changes sign).
+        let saturated = (self.integral_ppb + proportional).abs() >= MAX_PPB && (self.integral_ppb + proportional).signum() == error.signum();
+        if !saturated {
+            self.integral_ppb = (self.integral_ppb + 400 * error * frames as i64 / i64::from(rate.max(1))).clamp(-MAX_PPB, MAX_PPB);
+        }
         let ppb = (self.integral_ppb + proportional).clamp(-MAX_PPB, MAX_PPB);
         self.step = (i64::from(UNITY_STEP) + ppb * i64::from(UNITY_STEP) / 1_000_000_000) as u32;
         self.step
@@ -1127,6 +1132,22 @@ mod tests {
             // Catmull-Rom on a 1 kHz tone at 48 kHz is accurate to ~ -80 dB of full scale.
             assert!(worst < 0.5 * i32::MAX as f64 * 1e-3, "{label}: worst error {worst}");
         }
+    }
+
+    #[test]
+    fn the_servo_does_not_wind_up_while_the_output_is_at_its_limit() {
+        let mut servo = Servo::new(576);
+        // A ring far above the target for a long time: the output is at the limit from the first update on.
+        for _ in 0..100_000 {
+            servo.update(2000, 48, 48_000);
+        }
+        assert!(servo.offset_ppm() < 2000, "the integral must not run on while saturated: {} ppm", servo.offset_ppm());
+        // When the level comes back below the target the step must fall below unity within a few updates.
+        let mut updates = 0;
+        while servo.update(300, 48, 48_000) >= UNITY_STEP && updates < 1000 {
+            updates += 1;
+        }
+        assert!(updates < 1000, "the servo took too long to reverse");
     }
 
     #[test]

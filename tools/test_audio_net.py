@@ -191,8 +191,11 @@ def check_rtp(frames):
 
 
 def tone_frequency(samples, rate, window):
-    crossings = sum(1 for x, y in zip(window, window[1:]) if x < 0 <= y)
-    return crossings * rate / len(window)
+    # The median distance between rising zero crossings: QEMU's emulated USB audio now and then drops or repeats a few
+    # milliseconds, which skews a plain crossing count (and failed this test about half the time) but moves only a few periods.
+    rising = [i for i, (x, y) in enumerate(zip(window, window[1:])) if x < 0 <= y]
+    distances = sorted(b - a for a, b in zip(rising, rising[1:]))
+    return rate / distances[len(distances) // 2] if distances else 0.0
 
 
 def main():
