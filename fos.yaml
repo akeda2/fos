@@ -11,8 +11,8 @@ jobs:
   active: true
   path: ~/dev/fos
   test:
-    - make all -j16
-    - make test-all TEST_JOBS=8
+    - export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH && make all -j16
+    - export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH && make test-all TEST_JOBS=8
   post-build:
     - which gb && gb -I fos.yaml -a -w
   interval: 7200
