@@ -54,6 +54,8 @@ their own.
 | `router`, `bridge`, `nettest` | A layer-3 router (NAT, DHCP, health-checked uplinks), a layer-2 learning bridge, a link-impairment and traffic generator. |
 | `play`, `record`, `recorder`, `audio-net` | WAV playback and recording, a field recorder, audio streaming between hosts (raw Ethernet or RTP, Opus). RTP follows a PTP clock when one is found (`ptp=auto\|l2\|off`; raw and AVTP use Ethernet PTP, `ptp l2`) and a receiver shows the one-way delay. `priority=wifi\|safe\|balanced\|low\|live\|auto` picks ring and packet time (40 ms/2 ms ... 3 ms/0.125 ms). |
 
+**USB MIDI** (kernel, class-compliant devices on xHCI): `midi` lists devices, `midi monitor` prints incoming messages until Escape, `midi send [#N] 90 3c 64` sends one 1-3 byte message. Verified on real hardware with a cable looped out to in; QEMU has no USB-MIDI model, so `make test-midi` only covers the no-device paths.
+
 Reference documents: [`NETWORKING.md`](NETWORKING.md), [`AUDIO.md`](AUDIO.md),
 [`docs/recorder.md`](docs/recorder.md), [`docs/nettest.md`](docs/nettest.md),
 [`docs/rust-tapes-for-dummies.md`](docs/rust-tapes-for-dummies.md) (write your own tape).

@@ -61,6 +61,7 @@ mod term;
 mod usb_audio;
 mod usb_hid;
 mod usb_hub;
+mod usb_midi;
 mod usb_storage;
 mod xhci;
 

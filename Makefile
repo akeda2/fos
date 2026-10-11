@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8 test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8 test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi
 
 all: image tapes
 
@@ -58,6 +58,14 @@ test-fterm-net: image
 # The shell on a serial port (`serial-shell` in settings), driven from a host-side peer on COM2.
 test-serial-shell: image
 	python3 tools/test_serial_shell.py
+
+# The `midi` shell command without a USB MIDI device (QEMU has none; the real-hardware loopback is manual).
+test-midi: image
+	python3 tools/test_midi.py
+
+# The `midi` shell command without a USB MIDI device (QEMU has none; real-hardware loopback is manual).
+test-midi: image
+	python3 tools/test_midi.py
 
 # The telnet tape against a host-side Telnet server (QEMU user-mode network).
 test-telnet: image

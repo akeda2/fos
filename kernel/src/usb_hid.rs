@@ -63,6 +63,7 @@ pub fn release_port(controller: &mut Controller, port: u8, route: Option<u32>) {
             *buffer = report;
         }
     }
+    crate::usb_midi::release(controller, port, route);
     // The slots go first: the controller must stop writing reports before their buffer is handed back.
     match route {
         Some(route) => controller.release_route_slots(port, route),
@@ -213,6 +214,15 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
                 }
             });
         }
+        // A MIDI cable or controller (a MIDIStreaming interface; the audio parsing below is for PCM devices).
+        if let Some(endpoints) = crate::usb_midi::find_endpoints(&configuration[..total]) {
+            controller.set_configuration(&device, configuration[5])?;
+            if crate::usb_midi::attach(controller, device, &endpoints, vendor, product) {
+                return Ok(true);
+            }
+            controller.release_slot(device.slot);
+            return Ok(false);
+        }
         // Not a keyboard, not a stick: an audio device is described (see `usb_audio`); nothing else is handled.
         if crate::usb_audio::is_audio(&configuration[..total]) {
             let description = crate::usb_audio::parse(&configuration[..total]);
@@ -291,6 +301,9 @@ fn find_boot_keyboard(descriptors: &[u8]) -> Option<(u8, u8, u16, u8)> {
 /// Handles an event nobody was waiting for: a keyboard's report completing.
 pub fn background_event(controller: &mut Controller, event: &Trb) {
     if !event.is_transfer() {
+        return;
+    }
+    if crate::usb_midi::background_event(controller, event) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
@@ -646,5 +659,6 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
             }
         }
     }
+    crate::usb_midi::describe_devices(&print);
     print(format_args!("{} USB keyboard(s), {} reports so far", keyboard_count(), reports_seen()));
 }

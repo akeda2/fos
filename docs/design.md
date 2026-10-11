@@ -942,3 +942,12 @@ It is opt-in, so "deny" means not having the line; there is no password, so it i
 offered to tapes (`serial_open` gives `SERIAL_BUSY`, -3; `fterm` says so). The main loop polls the UART every 100 us instead of `hlt` while it is on,
 so an idle machine burns CPU (the FIFO is 16 bytes, a pasted line would be lost otherwise); `test-idle-cpu` runs without it. `make test-serial-shell`
 boots an image with the setting and plays the laptop on COM2. Planned: USB serial adapters as another port `kind` behind the same calls.
+
+### USB-MIDI (kernel/src/usb_midi.rs)
+
+Class-compliant MIDIStreaming interfaces (audio class 1, subclass 3) on xHCI, directly on a root port or behind a hub: `usb_hid::probe_device` finds one
+after the keyboard and mass-storage checks (`find_endpoints`: bulk IN + bulk OUT). Messages travel as 4-byte USB-MIDI event packets (cable<<4 | CIN, three MIDI
+bytes). The IN transfer is queued one max-packet at a time (a cheap full-speed cable has 8-byte packets), `background_event` splits packets into a
+256-entry ring, `release` forgets a device with its slot. Shell: `midi` (list), `midi monitor` (print what arrives until Escape), `midi send [#N] HEX..`
+(one message, no SysEx, cable 0). Verified on skylake3 and laptop1 with a 2381:0100 cable: enumeration, OUT transfers and, looped out to in on laptop1, IN events (note on/off, control change). A blocking monitor must call `drain_nics`, or a `term net` Escape never arrives. `make test-midi` covers only the no-device paths (QEMU has no USB-MIDI model). Not yet: SysEx
+on OUT, several cables per device, a tape ABI (the X-Touch/Mackie work will add it).
