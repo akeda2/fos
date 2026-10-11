@@ -180,7 +180,7 @@ def main():
                    "-serial", "stdio", "-monitor", f"unix:{monitor_path},server,nowait", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
                    "-drive", f"if=pflash,format=raw,file={vars_copy}",
-                   "-drive", f"format=raw,file={IMAGE}",
+                   "-drive", f"format=raw,file={IMAGE},snapshot=on",
                    "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}",
                    "-device", "e1000,netdev=net0,mac=52:54:00:12:34:77"]
         wire = Wire()

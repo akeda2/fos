@@ -32,7 +32,7 @@ def boot(memory, wait_for):
         log = Path(tmp) / "serial.log"
         process = subprocess.Popen(
             ["qemu-system-x86_64", "-machine", "q35", "-m", str(memory), "-display", "none", "-no-reboot",
-             "-drive", f"format=raw,file={IMAGE}", "-serial", f"file:{log}"],
+             "-drive", f"format=raw,file={IMAGE},snapshot=on", "-serial", f"file:{log}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.time() + 40

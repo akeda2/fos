@@ -85,7 +85,7 @@ def main():
         tmp = Path(tmp)
 
         # --- a held Shift key ---
-        machine = Machine(tmp, IMAGE)
+        machine = Machine(tmp, f"{IMAGE},snapshot=on")
         try:
             machine.wait_for("Fosfor stage 2")          # SeaBIOS is up and handling the keyboard; stage two is running
             monitor(machine.monitor_path, "sendkey shift 12000")

@@ -40,7 +40,7 @@ def boot(vga):
         log = Path(tmp) / "serial.log"
         process = subprocess.Popen(
             ["qemu-system-x86_64", "-machine", "q35", "-m", "256", "-display", "none", "-no-reboot", "-vga", "none",
-             "-device", f"VGA,{vga}", "-drive", f"format=raw,file={IMAGE}", "-serial", f"file:{log}"],
+             "-device", f"VGA,{vga}", "-drive", f"format=raw,file={IMAGE},snapshot=on", "-serial", f"file:{log}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.time() + 40
