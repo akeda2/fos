@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+from testslot import port  # noqa: E402
 import send_tape  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,8 +34,8 @@ if V2:
     IMAGE = ROOT / "build" / "fosfor" / "fosfor.img"
     TAPE = ROOT / "build" / "cargo-target" / "x86_64-fos-tape" / "release" / "bridge"
 WAIT_MARKER = b"M3 complete" if V2 else b"Waiting for a remote terminal client to connect"
-SEGMENT_A = ("230.42.42.70", 4270)
-SEGMENT_B = ("230.42.42.71", 4271)
+SEGMENT_A = ("230.42.42.70", port(4270))
+SEGMENT_B = ("230.42.42.71", port(4271))
 TERM_TAG_HELLO = 0x20
 TERM_TAG_DATA = 0x21
 TERM_TAG_BYE = 0x22

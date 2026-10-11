@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from testslot import port  # noqa: E402
 from test_boot import CODE_CANDIDATES, IMAGE, VARS_CANDIDATES, check, clean, find  # noqa: E402
 
 MACS = [f"52:54:00:ac:00:0{n}" for n in range(1, 5)]
@@ -206,13 +207,13 @@ def main():
         router_tmp, lab_tmp = Path(tmp) / "router", Path(tmp) / "lab"
         router_tmp.mkdir()
         lab_tmp.mkdir()
-        router = Lab(router_tmp, socket_nics("ae", "listen", (4392, 4393)))
+        router = Lab(router_tmp, socket_nics("ae", "listen", (port(4392), port(4393))))
         lab = None
         try:
             start = len(router.text())
             router.type("run router no-nat 1 10.0.1.1/24 2 10.0.2.1/24")
             router.wait_for("Forwarding IPv4 frames", start, 40)
-            lab = Lab(lab_tmp, socket_nics("ad", "connect", (4392, 4393)))
+            lab = Lab(lab_tmp, socket_nics("ad", "connect", (port(4392), port(4393))))
             result = run_scenario(lab, "routertest 1 2 gen.rate=2000 gen.size=500 gen.time=4", 4, sink_nic=2)
             check(result["sent"] > 800, f"through the router: the generator sent {result['sent']} datagrams", result["output"])
             check(result["lost"] <= 2 and result["rx"] >= result["sent"] - 3,

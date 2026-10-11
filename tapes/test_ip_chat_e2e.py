@@ -21,10 +21,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+from testslot import port  # noqa: E402
 import send_tape  # noqa: E402
 
 MCAST_GROUP = "230.42.42.59"
-MCAST_PORT = 4259
+MCAST_PORT = port(4259)
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "build" / "fos.img"
 TAPE = ROOT / "build" / "tapes" / "ip-chat.bin"

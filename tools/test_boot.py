@@ -42,7 +42,8 @@ FINAL_MARKER = "M3 complete"
 BIOS = os.environ.get("FOS_FIRMWARE") == "bios"
 # What each boot path prints once per boot, for the tests that count boots.
 LOADER_BANNER = "Fosfor stage 2 (BIOS path)" if BIOS else "Fosfor OS loader (milestone M1)"
-MCAST_GROUP, MCAST_PORT = "230.42.42.44", 4244
+from testslot import port  # noqa: E402
+MCAST_GROUP, MCAST_PORT = "230.42.42.44", port(4244)
 HOST_MAC = bytes.fromhex("02deadbeef03")
 BROADCAST = b"\xff" * 6
 ETHERTYPE = b"\x88\xb6"

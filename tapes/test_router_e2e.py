@@ -21,6 +21,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+from testslot import port  # noqa: E402
 import send_tape  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,8 +37,8 @@ if V2:
 WAIT_MARKER = b"M3 complete" if V2 else b"Waiting for a remote terminal client to connect"
 LOAD_MARKER = b"Waiting for a tape over the network" if V2 else b"Have the sender target this card's MAC address"
 CONFIG = ROOT / "tapes" / "router" / "router.cfg"
-SEGMENT_A = ("230.42.42.80", 4280)
-SEGMENT_B = ("230.42.42.81", 4281)
+SEGMENT_A = ("230.42.42.80", port(4280))
+SEGMENT_B = ("230.42.42.81", port(4281))
 CHAT_ETHERTYPE = bytes((0x88, 0xB6))
 TERM_TAG_HELLO = 0x20
 TERM_TAG_DATA = 0x21
@@ -1079,7 +1080,7 @@ def test_uplink_boot_timeout_is_not_fatal() -> None:
                 "-no-reboot", "-no-shutdown", "-display", "none",
                 # NIC 1: an isolated multicast segment with nothing on the
                 # other end -- no DHCP server will ever answer here.
-                "-netdev", "socket,id=net0,mcast=230.55.55.90:4590",
+                "-netdev", f"socket,id=net0,mcast=230.55.55.90:{port(4590)}",
                 "-device", "e1000,netdev=net0",
                 # NIC 2: QEMU's own user-mode network -- a real DHCP server
                 # answers here, the same trick tapes/test_net_dhcp_e2e.py
@@ -1088,7 +1089,7 @@ def test_uplink_boot_timeout_is_not_fatal() -> None:
                 "-device", "e1000,netdev=net1",
                 # NIC 3: another isolated segment, used only as the
                 # required downstream (non-uplink) interface.
-                "-netdev", "socket,id=net2,mcast=230.55.55.91:4591",
+                "-netdev", f"socket,id=net2,mcast=230.55.55.91:{port(4591)}",
                 "-device", "e1000,netdev=net2",
             ],
             stdin=subprocess.PIPE,

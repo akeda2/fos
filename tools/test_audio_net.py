@@ -22,9 +22,10 @@ import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from testslot import port  # noqa: E402
 from test_boot import CODE_CANDIDATES, IMAGE, VARS_CANDIDATES, check, clean, find  # noqa: E402
 
-GROUP, PORT = "230.42.42.77", 4277
+GROUP, PORT = "230.42.42.77", port(4277)
 
 
 def fosfs_add(image, files):

@@ -12,7 +12,7 @@ jobs:
   path: ~/dev/fos
   test:
     - make all -j16
-    - make test-all TEST_JOBS=16
+    - make test-all TEST_JOBS=8
   post-build:
     - which gb && gb -I fos.yaml -a -w
   interval: 7200

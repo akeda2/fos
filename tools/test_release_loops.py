@@ -17,10 +17,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from testslot import port  # noqa: E402
 from test_boot import (BROADCAST, CODE_CANDIDATES, IMAGE, TAG_BYE, TAG_DATA, TAG_DISCOVER_REPLY, TAG_DISCOVER_REQUEST,  # noqa: E402
                        TAG_HELLO, VARS_CANDIDATES, Wire, check, clean, find, MCAST_GROUP, MCAST_PORT)
 
-OTHER_GROUP, OTHER_PORT = "230.42.42.91", 4291
+OTHER_GROUP, OTHER_PORT = "230.42.42.91", port(4291)
 
 
 def main():

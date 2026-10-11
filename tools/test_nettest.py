@@ -24,9 +24,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from testslot import port  # noqa: E402
 from test_boot import CODE_CANDIDATES, IMAGE, VARS_CANDIDATES, check, clean, find  # noqa: E402
 
-SEGMENT_A_PORT, SEGMENT_B_PORT = 4290, 4291
+SEGMENT_A_PORT, SEGMENT_B_PORT = port(4290), port(4291)
 NIC_A = bytes.fromhex("525400ce0001")
 NIC_B = bytes.fromhex("525400ce0002")
 HOST_A = bytes.fromhex("525400ce00a1")

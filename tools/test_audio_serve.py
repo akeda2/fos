@@ -18,10 +18,11 @@ import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from testslot import port  # noqa: E402
 from test_audio_net import Guest  # noqa: E402
 from test_boot import CODE_CANDIDATES, IMAGE, VARS_CANDIDATES, check, find  # noqa: E402
 
-HOST_PORT = 18000
+HOST_PORT = port(18000)
 
 
 def crc32_ogg(data):

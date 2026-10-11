@@ -907,3 +907,11 @@ accuracy needs real hardware: compare the figure with the loopback `send latency
 `DhcpClient`. `ip-chat`, `telnet`, `router` and `tape-ip` (`audio-net`) all use it; each keeps only its own way of
 sending a frame (callback, per-NIC send, tape API). Verified: host tests, `test-nettapes`, `test-telnet`,
 `test-router`, `test-audio-net`.
+
+### Parallel `make test-all`
+
+`make test-all TEST_JOBS=N` runs `tools/run_tests.py`: N workers, each with its own `FOS_TEST_SLOT`; `tools/testslot.py`
+`port()` shifts every fixed host port (QEMU multicast segments, host-forwarded and listening TCP ports) by 1000 per slot, so
+tests do not share a segment. Logs go to `build/test-logs/`; the slowest tests of the last run start first; a failure is
+re-run alone at the end and reported as "only when run alone" if it then passes. A new test with a fixed host port must
+wrap it in `port()`. `fos.yaml` (the landsbro buildbot) uses `TEST_JOBS=8`. Without `TEST_JOBS` the run is serial as before.

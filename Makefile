@@ -19,7 +19,7 @@ help:
 	@echo "make run          build it and boot it in QEMU + OVMF with the serial console on the terminal"
 	@echo "make test         host unit tests (abi, crates, tape libraries), then the boot test (loader, kernel, framebuffer)"
 	@echo "make test-NAME    one end-to-end test (see the .PHONY list below), e.g. test-nic, test-hda, test-recorder"
-	@echo "make test-all     every test-* target in turn, with a summary"
+	@echo "make test-all     every test-* target in turn, with a summary (TEST_JOBS=N: N at a time)"
 	@echo "make loader|kernel|tapes   build one part"
 	@echo "make clean        remove $(BUILD)/"
 
@@ -372,7 +372,11 @@ test-bios-placement: image
 ALL_TESTS := $(filter-out test-all test-bios test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode,$(filter test-%,$(shell sed -n '/[$$]/d;s/^\.PHONY: //p' Makefile))) $(addprefix test-bios-,$(BIOS_TESTS)) test-bios-placement test-bios-video test-bios-sector test-bios-edid test-bios-bootcode
 .PHONY: test-all
 test-all: image
+ifdef TEST_JOBS
+	@python3 tools/run_tests.py $(TEST_JOBS) $(ALL_TESTS)
+else
 	@failed=""; for t in $(ALL_TESTS); do \
 		if $(MAKE) --no-print-directory $$t; then echo "PASS $$t"; else echo "FAIL $$t"; failed="$$failed $$t"; fi; done; \
 	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi; echo "all tests passed"
+endif
 
