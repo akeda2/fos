@@ -913,5 +913,5 @@ sending a frame (callback, per-NIC send, tape API). Verified: host tests, `test-
 `make test-all TEST_JOBS=N` runs `tools/run_tests.py`: N workers, each with its own `FOS_TEST_SLOT`; `tools/testslot.py`
 `port()` shifts every fixed host port (QEMU multicast segments, host-forwarded and listening TCP ports) by 1000 per slot, so
 tests do not share a segment. Logs go to `build/test-logs/`; the slowest tests of the last run start first; a failure is
-re-run alone at the end and reported as "only when run alone" if it then passes. A new test with a fixed host port must
+re-run alone at the end (each worker also gets its own copy of the image, `FOSFOR_IMAGE`, because QEMU refuses two writers on one file; tests must honour that variable) and reported as "only when run alone" if it then passes. A new test with a fixed host port must
 wrap it in `port()`. `fos.yaml` (the landsbro buildbot) uses `TEST_JOBS=8`. Without `TEST_JOBS` the run is serial as before.

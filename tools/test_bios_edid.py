@@ -6,6 +6,7 @@ mode that is not bigger than the monitor and has the monitor's shape (within 2%)
 an EDID it keeps the old safe rule (the largest mode up to 1280x1024). Boots through SeaBIOS (no OVMF) with QEMU's standard VGA
 playing different monitors and reads stage two's narration and the kernel's `Framebuffer:` line from the serial log.
 Run with `make test-bios-edid`."""
+import os
 import re
 import subprocess
 import sys
@@ -14,7 +15,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-IMAGE = ROOT / "build" / "fosfor" / "fosfor.img"
+IMAGE = Path(os.environ.get("FOSFOR_IMAGE", ROOT / "build" / "fosfor" / "fosfor.img"))
 FAILURES = []
 
 # (QEMU VGA properties, the EDID size stage two should report or None, the mode it should end up with)

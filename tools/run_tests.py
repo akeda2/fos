@@ -8,6 +8,7 @@ Targets that took longest last time start first, so the run does not end on one 
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -19,8 +20,18 @@ LOGS = ROOT / "build" / "test-logs"
 TIMES = LOGS / "times.json"
 
 
+def slot_image(slot):
+    """A private copy of the image per slot: QEMU refuses a second writer on one image file."""
+    source = ROOT / "build" / "fosfor" / "fosfor.img"
+    copy = ROOT / "build" / "test-slots" / str(slot) / "fosfor.img"
+    if not copy.exists() or copy.stat().st_mtime < source.stat().st_mtime:
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, copy)
+    return copy
+
+
 def run(target, slot):
-    environment = dict(os.environ, FOS_TEST_SLOT=str(slot))
+    environment = dict(os.environ, FOS_TEST_SLOT=str(slot), FOSFOR_IMAGE=str(slot_image(slot)))
     started = time.time()
     with open(LOGS / f"{target}.log", "w") as log:
         # -o image: test-all has built the image once; parallel makes must not rebuild it under each other
@@ -57,6 +68,8 @@ def main():
         thread.join()
     failed = [target for target in targets if not results[target]]
     for target in failed:
+        if os.environ.get("FOS_NO_RETRY"):
+            break
         ok, seconds = run(target, 0)
         print(f"{'PASS (alone)' if ok else 'FAIL (alone)'} {target} ({seconds:.0f}s)", flush=True)
         results[target] = ok

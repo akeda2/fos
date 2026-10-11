@@ -7,6 +7,7 @@ Boots the image through SeaBIOS (no OVMF: QEMU's default firmware) with three am
  * 8 MiB: not enough contiguous RAM above 1 MiB for the image plus its read buffer, so stage two stops with a message that says so
    (instead of loading over something else).
 Run with `make test-bios-placement`."""
+import os
 import re
 import subprocess
 import sys
@@ -15,7 +16,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-IMAGE = ROOT / "build" / "fosfor" / "fosfor.img"
+IMAGE = Path(os.environ.get("FOSFOR_IMAGE", ROOT / "build" / "fosfor" / "fosfor.img"))
 FAILURES = []
 
 
