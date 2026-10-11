@@ -10,9 +10,9 @@ jobs:
 - name: fos
   active: true
   path: ~/dev/fos
+  pre-build: which gb && gb -I fos.yaml -a -w 
   test:
     - export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH && make all -j16
     - export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH && make test-all TEST_JOBS=8
   post-build:
-    - which gb && gb -I fos.yaml -a -w
   interval: 7200
