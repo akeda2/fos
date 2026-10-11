@@ -37,17 +37,20 @@ const R_PEER: usize = 6;
 const R_CODEC: usize = 7;
 const R_PRIORITY: usize = 8;
 const R_PACKET: usize = 9;
-const R_SEND: usize = 10;
-const R_RECEIVE: usize = 11;
-const R_NAME: usize = 12;
-const R_GROUP: usize = 13;
-const R_PORT: usize = 14;
-const R_PREBUFFER: usize = 15;
-const ROWS: usize = 16;
+const R_PTP: usize = 10;
+const R_SEND: usize = 11;
+const R_RECEIVE: usize = 12;
+const R_NAME: usize = 13;
+const R_GROUP: usize = 14;
+const R_PORT: usize = 15;
+const R_PREBUFFER: usize = 16;
+const ROWS: usize = 17;
 const PRIORITIES: [&str; 6] = ["safe", "balanced", "low", "auto", "live", "wifi"];
 /// Packet time choices in microseconds; 0 = what the priority says.
+/// The `ptp=` choices: follow a clock found on this network's own kind of transport, over Ethernet even for RTP, or none.
+const PTP_MODES: [&str; 3] = ["auto", "l2", "off"];
 const PACKET_US: [u32; 6] = [0, 1000, 500, 250, 125, 2000];
-const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Priority", "Packet time", "Send channels", "Receive channels", "Name", "Multicast group", "HTTP port", "Pre-buffer"];
+const LABELS: [&str; ROWS] = ["Mode", "Network", "NIC", "Addressing", "IP address", "Gateway", "Peer", "Codec (sent)", "Priority", "Packet time", "Clock (PTP)", "Send channels", "Receive channels", "Name", "Multicast group", "HTTP port", "Pre-buffer"];
 
 #[derive(Clone, Copy)]
 struct Settings {
@@ -59,6 +62,8 @@ struct Settings {
     priority: usize,
     /// Index into `PACKET_US`.
     packet: usize,
+    /// Index into `PTP_MODES`.
+    ptp: usize,
     /// Get the address from a DHCP server (the usual case) instead of the static `ip` and `gateway`.
     dhcp: bool,
     ip: Text<24>,
@@ -76,7 +81,7 @@ struct Settings {
 
 impl Settings {
     fn new() -> Settings {
-        Settings { mode: 0, network: 0, nic: 1, codec: 0, priority: 0, packet: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new(), prebuffer: Text::new() }
+        Settings { mode: 0, network: 0, nic: 1, codec: 0, priority: 0, packet: 0, ptp: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new(), prebuffer: Text::new() }
     }
 
     /// The network needs an IP address: RTP, or the HTTP server (which has no other network).
@@ -93,7 +98,7 @@ impl Settings {
             R_SEND => self.mode != 1,
             R_RECEIVE => self.mode == 1 || self.mode == 2,
             R_PORT | R_PREBUFFER => self.mode == SERVE,
-            R_PRIORITY => self.mode != SERVE,
+            R_PRIORITY | R_PTP => self.mode != SERVE,
             R_PACKET => self.mode != SERVE && self.mode != 1 && self.codec < 2,
             _ => true,
         }
@@ -149,6 +154,7 @@ impl Settings {
         }
         if self.mode != SERVE {
             let _ = writeln!(out, "priority {}", PRIORITIES[self.priority]);
+            let _ = writeln!(out, "ptp {}", PTP_MODES[self.ptp]);
             if self.packet != 0 && self.codec < 2 {
                 let _ = writeln!(out, "ptime {}", PACKET_US[self.packet]);
             }
@@ -229,6 +235,7 @@ impl Settings {
                 "to" | "source" | "from" if value == "auto" => {}
                 "to" | "source" | "from" => self.peer = Text::from(value),
                 "priority" => self.priority = PRIORITIES.iter().position(|name| *name == value).unwrap_or(0),
+                "ptp" => self.ptp = PTP_MODES.iter().position(|name| *name == value).unwrap_or(0),
                 "ptime" => self.packet = PACKET_US.iter().position(|&us| value.parse() == Ok(us)).unwrap_or(0),
                 "codec" => opus = value == "opus",
                 "bitrate" => bitrate = value.parse().unwrap_or(96),
@@ -349,6 +356,13 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
                 "Live  (3 ms ring, 0.125 ms packets; wired, dedicated link)",
                 "Wi-Fi  (40 ms ring, 2 ms packets: the worst-case network)",
             ][settings.priority]);
+        }
+        R_PTP => {
+            let _ = write!(out, "{}", [
+                "Auto  (follows a PTP clock when one is heard: RTP over UDP, raw and AVTP over Ethernet)",
+                "Ethernet  (PTP over layer 2 even for RTP: the `ptp l2` master)",
+                "Off  (no clock: timestamps count from zero, no one-way delay shown)",
+            ][settings.ptp]);
         }
         R_PACKET => {
             let _ = write!(out, "{}", ["By priority", "1 ms", "0.5 ms", "0.25 ms", "0.125 ms", "2 ms"][settings.packet]);
@@ -528,6 +542,7 @@ fn cycle(settings: &mut Settings, row: usize, step: isize) {
         R_ADDRESSING => settings.dhcp = !settings.dhcp,
         R_PRIORITY => settings.priority = wrap(settings.priority, PRIORITIES.len()),
         R_PACKET => settings.packet = wrap(settings.packet, PACKET_US.len()),
+        R_PTP => settings.ptp = wrap(settings.ptp, PTP_MODES.len()),
         R_NETWORK => {
             settings.network = wrap(settings.network, 3);
             if !settings.rtp() && settings.codec >= 2 {

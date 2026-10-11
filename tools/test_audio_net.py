@@ -685,6 +685,14 @@ def panel_test():
                 guest.pump(1.5)
                 check("Press any key for the settings" in guest.text(), f"Escape stops the stream ({guest.name})", guest.text()[-400:])
                 keys(guest, " ")
+            # The Clock (PTP) row, two rows below Priority.
+            for _ in range(8):
+                if "> Clock (PTP)" in b.text()[-300:]:
+                    break
+                keys(b, "j")
+            check("> Clock (PTP)" in b.text()[-700:] and "Auto" in b.text()[-700:], "the Clock (PTP) row follows Packet time and starts at Auto", b.text()[-700:])
+            keys(b, "l")
+            check("Ethernet" in b.text()[-700:], "Right changes the clock to Ethernet (ptp=l2)", b.text()[-700:])
             keys(b, "w")
             check("Saved audio.cfg" in b.text(), "W saves audio.cfg", b.text()[-400:])
             keys(b, "q")
@@ -692,7 +700,7 @@ def panel_test():
             mark = b.send("cat audio.cfg")
             b.pump(1.5)
             config = b.text()[mark:]
-            check("mode send" in config and "ip 192.168.50.1/24" in config and "to fos-1234b1" in config and "src tone" not in config, "the saved cfg holds the settings (and not the test tone)", config)
+            check("mode send" in config and "ip 192.168.50.1/24" in config and "to fos-1234b1" in config and "ptp l2" in config and "src tone" not in config, "the saved cfg holds the settings (and not the test tone)", config)
         finally:
             a.stop()
             b.stop()
