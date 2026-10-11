@@ -35,11 +35,12 @@
 
 use core::cmp::min;
 
+use tape_net::frames;
 use tape_net::{
-    ArpCache, ArpOperation, ArpPacket, DHCP_BOOTSTRAP_DESTINATION, DHCP_CLIENT_PORT,
-    DHCP_SERVER_PORT, DhcpClient, DhcpClientState, DhcpPacket, ETHERTYPE_ARP, ETHERTYPE_IPV4,
-    EthernetFrame, Ipv4Address, Ipv4Header, Ipv4Packet, MacAddress, TcpConnection, TcpSegment,
-    TcpState, UdpDatagram,
+    ArpCache, ArpOperation, ArpPacket, DHCP_BOOTSTRAP_DESTINATION,
+    DhcpClient, DhcpClientState, ETHERTYPE_ARP, ETHERTYPE_IPV4,
+    EthernetFrame, Ipv4Address, Ipv4Packet, MacAddress, TcpConnection, TcpSegment,
+    TcpState,
 };
 use tape_rt::print_bytes;
 use telnet_tape::{
@@ -429,26 +430,9 @@ fn send_tcp_bytes(
     send_frame(nic_send, &mut frame, length, max_frame_len)
 }
 
-fn send_arp_request(
-    nic_send: NicSend,
-    own_mac: MacAddress,
-    local_ip: Ipv4Address,
-    target_ip: Ipv4Address,
-    max_frame_len: usize,
-) -> bool {
-    let packet = ArpPacket::request(own_mac, local_ip, target_ip);
-    let mut arp_bytes = [0u8; ArpPacket::LEN];
-    let Ok(arp_len) = packet.encode(&mut arp_bytes) else {
-        return false;
-    };
-    let ethernet = EthernetFrame::new(
-        MacAddress::BROADCAST,
-        own_mac,
-        ETHERTYPE_ARP,
-        &arp_bytes[..arp_len],
-    );
+fn send_arp_request(nic_send: NicSend, own_mac: MacAddress, local_ip: Ipv4Address, target_ip: Ipv4Address, max_frame_len: usize) -> bool {
     let mut frame = [0u8; MAX_FRAME_LEN];
-    let Ok(length) = ethernet.encode(&mut frame) else {
+    let Some(length) = frames::arp_request_frame(&mut frame, own_mac, local_ip, target_ip) else {
         return false;
     };
     send_frame(nic_send, &mut frame, length, max_frame_len)
@@ -462,14 +446,8 @@ fn send_arp_reply(
     target_ip: Ipv4Address,
     max_frame_len: usize,
 ) -> bool {
-    let packet = ArpPacket::reply(own_mac, local_ip, target_mac, target_ip);
-    let mut arp_bytes = [0u8; ArpPacket::LEN];
-    let Ok(arp_len) = packet.encode(&mut arp_bytes) else {
-        return false;
-    };
-    let ethernet = EthernetFrame::new(target_mac, own_mac, ETHERTYPE_ARP, &arp_bytes[..arp_len]);
     let mut frame = [0u8; MAX_FRAME_LEN];
-    let Ok(length) = ethernet.encode(&mut frame) else {
+    let Some(length) = frames::arp_reply_frame(&mut frame, own_mac, local_ip, target_mac, target_ip) else {
         return false;
     };
     send_frame(nic_send, &mut frame, length, max_frame_len)
@@ -529,72 +507,12 @@ fn poll_arp(
 }
 
 fn receive_dhcp(frame: &[u8], client: &mut DhcpClient<128>, now: u32) {
-    let Ok(ethernet) = EthernetFrame::parse(frame) else {
-        return;
-    };
-    if ethernet.ethertype != ETHERTYPE_IPV4 {
-        return;
-    }
-    let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else {
-        return;
-    };
-    if packet.header.protocol != 17 {
-        return;
-    }
-    let Ok(datagram) = UdpDatagram::parse(
-        packet.payload,
-        false,
-        packet.header.source,
-        packet.header.destination,
-    ) else {
-        return;
-    };
-    if datagram.source_port != DHCP_SERVER_PORT || datagram.destination_port != DHCP_CLIENT_PORT {
-        return;
-    }
-    let Ok(dhcp) = DhcpPacket::parse(datagram.payload) else {
-        return;
-    };
-    let _ = client.receive(now, &dhcp);
+    frames::feed_dhcp(frame, client, now);
 }
 
-fn send_dhcp_payload(
-    nic_send: NicSend,
-    own_mac: MacAddress,
-    payload: &[u8],
-    max_frame_len: usize,
-) -> bool {
+fn send_dhcp_payload(nic_send: NicSend, own_mac: MacAddress, payload: &[u8], max_frame_len: usize) -> bool {
     let mut frame = [0u8; MAX_FRAME_LEN];
-    let mut udp_bytes = [0u8; MAX_FRAME_LEN];
-    let udp = UdpDatagram::new(DHCP_CLIENT_PORT, DHCP_SERVER_PORT, payload);
-    let Ok(udp_len) = udp.encode_with_checksum(
-        &mut udp_bytes,
-        Ipv4Address::UNSPECIFIED,
-        DHCP_BOOTSTRAP_DESTINATION,
-        false,
-    ) else {
-        return false;
-    };
-    let packet = Ipv4Packet {
-        header: Ipv4Header::new(
-            Ipv4Address::UNSPECIFIED,
-            DHCP_BOOTSTRAP_DESTINATION,
-            17,
-            udp_len,
-        ),
-        payload: &udp_bytes[..udp_len],
-    };
-    let mut ip_bytes = [0u8; MAX_FRAME_LEN];
-    let Ok(ip_len) = packet.encode(&mut ip_bytes) else {
-        return false;
-    };
-    let ethernet = EthernetFrame::new(
-        MacAddress::BROADCAST,
-        own_mac,
-        ETHERTYPE_IPV4,
-        &ip_bytes[..ip_len],
-    );
-    let Ok(length) = ethernet.encode(&mut frame) else {
+    let Some(length) = frames::dhcp_client_frame(&mut frame, own_mac, Ipv4Address::UNSPECIFIED, DHCP_BOOTSTRAP_DESTINATION, payload) else {
         return false;
     };
     send_frame(nic_send, &mut frame, length, max_frame_len)

@@ -45,6 +45,7 @@ use router_tape::{
     ConfigError, FileName, ForwardProtocol, InterfaceConfig, MAX_FORWARDS, MAX_INTERFACES,
     PortForward, RouterConfig, parse_config, route_next_hop, routing_configs_for_active_uplink,
 };
+use tape_net::frames;
 use tape_net::{
     ArpCache, ArpOperation, ArpPacket, DHCP_CLIENT_PORT, DHCP_MAX_DNS_SERVERS,
     DHCP_OPTION_BROADCAST_ADDRESS, DHCP_OPTION_DNS, DHCP_OPTION_LEASE_TIME,
@@ -963,19 +964,8 @@ fn send_arp_request(
     nic_send_at: NicSendAt,
     max_frame_len: usize,
 ) -> bool {
-    let packet = ArpPacket::request(interface.mac, interface.address, target);
-    let mut arp = [0u8; ArpPacket::LEN];
-    let Ok(arp_len) = packet.encode(&mut arp) else {
-        return false;
-    };
-    let ethernet = EthernetFrame::new(
-        MacAddress::BROADCAST,
-        interface.mac,
-        ETHERTYPE_ARP,
-        &arp[..arp_len],
-    );
     let mut frame = [0u8; MAX_FRAME_LEN];
-    let Ok(length) = ethernet.encode(&mut frame) else {
+    let Some(length) = frames::arp_request_frame(&mut frame, interface.mac, interface.address, target) else {
         return false;
     };
     length <= max_frame_len && nic_send_at(interface.nic, frame.as_ptr() as usize, length as u32) != 0
@@ -988,47 +978,15 @@ fn send_arp_reply(
     nic_send_at: NicSendAt,
     max_frame_len: usize,
 ) -> bool {
-    let packet = ArpPacket::reply(interface.mac, interface.address, target_mac, target_ip);
-    let mut arp = [0u8; ArpPacket::LEN];
-    let Ok(arp_len) = packet.encode(&mut arp) else {
-        return false;
-    };
-    let ethernet = EthernetFrame::new(target_mac, interface.mac, ETHERTYPE_ARP, &arp[..arp_len]);
     let mut frame = [0u8; MAX_FRAME_LEN];
-    let Ok(length) = ethernet.encode(&mut frame) else {
+    let Some(length) = frames::arp_reply_frame(&mut frame, interface.mac, interface.address, target_mac, target_ip) else {
         return false;
     };
     length <= max_frame_len && nic_send_at(interface.nic, frame.as_ptr() as usize, length as u32) != 0
 }
 
 fn receive_dhcp(frame: &[u8], client: &mut DhcpClient<128>, now: u32) {
-    let Ok(ethernet) = EthernetFrame::parse(frame) else {
-        return;
-    };
-    if ethernet.ethertype != ETHERTYPE_IPV4 {
-        return;
-    }
-    let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else {
-        return;
-    };
-    if packet.header.protocol != 17 {
-        return;
-    }
-    let Ok(datagram) = UdpDatagram::parse(
-        packet.payload,
-        false,
-        packet.header.source,
-        packet.header.destination,
-    ) else {
-        return;
-    };
-    if datagram.source_port != DHCP_SERVER_PORT || datagram.destination_port != DHCP_CLIENT_PORT {
-        return;
-    }
-    let Ok(dhcp) = DhcpPacket::parse(datagram.payload) else {
-        return;
-    };
-    let _ = client.receive(now, &dhcp);
+    frames::feed_dhcp(frame, client, now);
 }
 
 fn send_dhcp_payload(
@@ -1044,21 +1002,7 @@ fn send_dhcp_payload(
     max_frame_len: usize,
 ) -> bool {
     let mut frame = [0u8; MAX_FRAME_LEN];
-    let mut udp_bytes = [0u8; MAX_FRAME_LEN];
-    let udp = UdpDatagram::new(source_port, destination_port, payload);
-    let Ok(udp_len) = udp.encode_with_checksum(&mut udp_bytes, source, destination, false) else {
-        return false;
-    };
-    let packet = Ipv4Packet {
-        header: Ipv4Header::new(source, destination, 17, udp_len),
-        payload: &udp_bytes[..udp_len],
-    };
-    let mut ip_bytes = [0u8; MAX_FRAME_LEN];
-    let Ok(ip_len) = packet.encode(&mut ip_bytes) else {
-        return false;
-    };
-    let ethernet = EthernetFrame::new(target_mac, own_mac, ETHERTYPE_IPV4, &ip_bytes[..ip_len]);
-    let Ok(length) = ethernet.encode(&mut frame) else {
+    let Some(length) = frames::dhcp_frame(&mut frame, own_mac, target_mac, source, destination, source_port, destination_port, payload) else {
         return false;
     };
     length <= max_frame_len && nic_send_at(nic, frame.as_ptr() as usize, length as u32) != 0

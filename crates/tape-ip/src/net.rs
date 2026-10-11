@@ -1,8 +1,9 @@
 //! The IPv4 side of `audio-net`: addressing, ARP, UDP/RTP framing and a DHCP client. Built on the shared
 //! `tape-net` protocol library (the same one `router`, `ip-chat` and `telnet` use).
 
+use tape_net::frames;
 use tape_net::{
-    ArpCache, ArpOperation, ArpPacket, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClient, DhcpClientState, DhcpPacket, ETHERTYPE_ARP, ETHERTYPE_IPV4,
+    ArpCache, ArpOperation, ArpPacket, DhcpClient, DhcpClientState, ETHERTYPE_ARP, ETHERTYPE_IPV4,
     EthernetFrame, Ipv4Address, Ipv4Header, Ipv4Packet, MacAddress, RtpPacket, UdpDatagram,
 };
 use tape_rt::TapeApi;
@@ -95,13 +96,9 @@ pub fn inbound<'a>(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpC
             let Ok(packet) = ArpPacket::parse(ethernet.payload) else { return Inbound::Nothing };
             arp.insert(packet.sender_protocol, packet.sender_hardware, now);
             if packet.operation == ArpOperation::Request && packet.target_protocol == config.ip && packet.sender_hardware != config.mac {
-                let reply = ArpPacket::reply(config.mac, config.ip, packet.sender_hardware, packet.sender_protocol);
-                let mut arp_bytes = [0u8; ArpPacket::LEN];
-                if let Ok(length) = reply.encode(&mut arp_bytes) {
-                    let mut out = [0u8; 64];
-                    if let Ok(total) = EthernetFrame::new(packet.sender_hardware, config.mac, ETHERTYPE_ARP, &arp_bytes[..length]).encode(&mut out) {
-                        send_frame(api, nic, &out[..total]);
-                    }
+                let mut out = [0u8; 64];
+                if let Some(total) = frames::arp_reply_frame(&mut out, config.mac, config.ip, packet.sender_hardware, packet.sender_protocol) {
+                    send_frame(api, nic, &out[..total]);
                 }
             }
             Inbound::Nothing
@@ -148,13 +145,9 @@ pub fn resolve(api: &TapeApi, nic: usize, config: &NetConfig, arp: &mut ArpCache
     while tape_rt::micros() < start + 2_000_000 {
         if tape_rt::micros() >= last_request + 500_000 {
             last_request = tape_rt::micros();
-            let request = ArpPacket::request(config.mac, config.ip, next_hop);
-            let mut arp_bytes = [0u8; ArpPacket::LEN];
-            if let Ok(length) = request.encode(&mut arp_bytes) {
-                let mut out = [0u8; 64];
-                if let Ok(total) = EthernetFrame::new(MacAddress::BROADCAST, config.mac, ETHERTYPE_ARP, &arp_bytes[..length]).encode(&mut out) {
-                    send_frame(api, nic, &out[..total]);
-                }
+            let mut out = [0u8; 64];
+            if let Some(total) = frames::arp_request_frame(&mut out, config.mac, config.ip, next_hop) {
+                send_frame(api, nic, &out[..total]);
             }
         }
         let length = (api.nic_receive)(nic, frame.as_mut_ptr(), frame.len());
@@ -208,13 +201,7 @@ impl DhcpTask {
         let mut frame = [0u8; MAX_FRAME];
         if let Ok(Some(length)) = self.client.poll(now, &mut payload) {
             let transmit = self.client.transmit();
-            let mut udp = [0u8; MAX_FRAME];
-            let mut ip = [0u8; MAX_FRAME];
-            let sent = UdpDatagram::new(DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &payload[..length])
-                .encode_with_checksum(&mut udp, transmit.source, transmit.destination, false)
-                .ok()
-                .and_then(|udp_len| Ipv4Packet { header: Ipv4Header::new(transmit.source, transmit.destination, 17, udp_len), payload: &udp[..udp_len] }.encode(&mut ip).ok())
-                .and_then(|ip_len| EthernetFrame::new(MacAddress::BROADCAST, mac, ETHERTYPE_IPV4, &ip[..ip_len]).encode(&mut frame).ok());
+            let sent = frames::dhcp_client_frame(&mut frame, mac, transmit.source, transmit.destination, &payload[..length]);
             match sent {
                 Some(total) => {
                     send_frame(api, nic, &frame[..total]);
@@ -235,20 +222,7 @@ impl DhcpTask {
             if length == 0 {
                 break;
             }
-            let Ok(ethernet) = EthernetFrame::parse(&frame[..length]) else { continue };
-            if ethernet.ethertype != ETHERTYPE_IPV4 {
-                continue;
-            }
-            let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else { continue };
-            if packet.header.protocol != 17 {
-                continue;
-            }
-            let Ok(datagram) = UdpDatagram::parse(packet.payload, false, packet.header.source, packet.header.destination) else { continue };
-            if datagram.source_port == DHCP_SERVER_PORT && datagram.destination_port == DHCP_CLIENT_PORT {
-                if let Ok(dhcp) = DhcpPacket::parse(datagram.payload) {
-                    let _ = self.client.receive(now, &dhcp);
-                }
-            }
+            frames::feed_dhcp(&frame[..length], &mut self.client, now);
         }
         DhcpStep::Waiting
     }
