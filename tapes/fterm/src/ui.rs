@@ -1,7 +1,7 @@
 //! The panel shown by a bare `run fterm` (or `run fterm ui`): pick the transport and its settings, press C to connect. Like the
 //! `audio-net` and recorder panels it draws with plain ANSI (so it works on the local screen and over `term net`) and reads
 //! `read_key`. All keys are plain or arrows: Up/Down or Tab select, Left/Right, Space/Backspace or Enter change, C connects, W saves
-//! `fterm.cfg` (which `run fterm @fterm.cfg` repeats), P picks a machine that announced itself, Q or Esc quits. The form's
+//! `fterm.cfg` (which `run fterm @fterm.cfg` repeats), P lists the machines that announced themselves and Enter picks one, Q or Esc quits. The form's
 //! rules live in `form.rs`.
 
 use crate::connect;
@@ -101,7 +101,7 @@ fn draw_all(api: &TapeApi, form: &Form, selected: usize, editing: bool, message:
     at(FIRST_ROW + ROWS.len() + 3, 1);
     draw!(" Up/Down or Tab: select   Enter or Space/Backspace: change   C: connect\x1b[K");
     at(FIRST_ROW + ROWS.len() + 4, 1);
-    draw!(" P: pick a machine   W: save {CONFIG_FILE}   Q or Esc: quit\x1b[K");
+    draw!(" P: pick a machine from a list   W: save {CONFIG_FILE}   Q or Esc: quit\x1b[K");
     at(FIRST_ROW + ROWS.len() + 5, 1);
     draw!(" Once connected: Ctrl-A x leaves, Ctrl-A h lists the other commands\x1b[K");
     end_batch();
@@ -143,8 +143,34 @@ fn save(form: &Form) -> &'static str {
     }
 }
 
-/// P: the next machine in the kernel's table of announced names (the first one if the form holds none of them).
-fn pick_peer(api: &TapeApi, form: &mut Form) -> &'static str {
+const PICK_ROWS: usize = 14;
+
+fn draw_picker(api: &TapeApi, count: usize, selected: usize, top: usize) {
+    begin_batch();
+    draw!("\x1b[2J");
+    at(1, 1);
+    draw!(" Pick a machine ({count} announced on the network)\x1b[K");
+    at(2, 1);
+    draw!(" {:-<78}", "");
+    for line in 0..PICK_ROWS.min(count - top) {
+        let number = top + line + 1;
+        let mut info = PeerInfo::default();
+        (api.peer_info)(number, &mut info);
+        let marker = if number == selected + 1 { '>' } else { ' ' };
+        let mac = info.mac;
+        at(3 + line, 1);
+        draw!(
+            " {marker} {:<20} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  NIC {}\x1b[K",
+            info.name(), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], info.nic
+        );
+    }
+    at(4 + PICK_ROWS, 1);
+    draw!(" Up/Down: select   Enter: choose   Esc or Q: cancel\x1b[K");
+    end_batch();
+}
+
+/// P: a list of the machines the kernel has heard announce themselves (`peer_info`); Enter puts the chosen name in the form.
+fn pick_peer(api: &TapeApi, decoder: &mut KeyDecoder, form: &mut Form) -> &'static str {
     if api.version < 5 {
         return "This kernel has no peer table.";
     }
@@ -152,18 +178,41 @@ fn pick_peer(api: &TapeApi, form: &mut Form) -> &'static str {
     if count == 0 {
         return "No machine has announced itself yet (`nic peers` lists them).";
     }
-    let mut current = None;
+    let mut selected = 0;
     for number in 1..=count {
         let mut info = PeerInfo::default();
         (api.peer_info)(number, &mut info);
         if info.name().eq_ignore_ascii_case(form.peer.as_str()) {
-            current = Some(number);
+            selected = number - 1;
         }
     }
-    let mut info = PeerInfo::default();
-    (api.peer_info)(current.map_or(1, |number| number % count + 1), &mut info);
-    form.peer = Text::from(info.name());
-    ""
+    let mut top = 0;
+    loop {
+        if selected < top {
+            top = selected;
+        } else if selected >= top + PICK_ROWS {
+            top = selected + 1 - PICK_ROWS;
+        }
+        draw_picker(api, count, selected, top);
+        let key = loop {
+            match next_key(decoder) {
+                Some(key) => break key,
+                None => (api.wait_for_event)(),
+            }
+        };
+        match key {
+            Key::Up => selected = (selected + count - 1) % count,
+            Key::Down | Key::Tab => selected = (selected + 1) % count,
+            Key::Enter => {
+                let mut info = PeerInfo::default();
+                (api.peer_info)(selected + 1, &mut info);
+                form.peer = Text::from(info.name());
+                return "";
+            }
+            Key::Char(b'q' | b'Q') | Key::Control(0x1b) => return "",
+            _ => {}
+        }
+    }
 }
 
 /// Shows the panel until the user quits; each connection returns to it.
@@ -222,7 +271,7 @@ pub fn run(api: &'static TapeApi) {
                         form.transport = NET;
                         selected = ROWS.iter().position(|&row| row == Row::Peer).unwrap_or(selected);
                     }
-                    message = pick_peer(api, &mut form);
+                    message = pick_peer(api, &mut decoder, &mut form);
                 }
                 Key::Char(b'w' | b'W') => message = save(&form),
                 Key::Char(b'c' | b'C') => match form.problem() {

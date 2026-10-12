@@ -8,7 +8,7 @@ test_telnet.py) answers at 10.0.2.2.
 Telnet: static and DHCP addressing, the greeting and UTF-8 text on screen, a typed line reaching the server and its answer coming
 back, the terminal-type/NAWS replies, Ctrl-A s, and the tape returning to the shell when the server hangs up. `term net`: HELLO on
 start, the peer's DATA on screen, typed keys as DATA, the peer's BYE ending the session, Ctrl-A x sending BYE, and a peer named by
-its announced name. Run with `make test-fterm-net`."""
+its announced name, and the panel's machine list (P). Run with `make test-fterm-net`."""
 import os
 import selectors
 import shutil
@@ -181,6 +181,20 @@ def main():
             type_(b"run fterm net LABBOX\r")
             check(wait_frame(TAG_HELLO) is not None, "term net: a peer is found by its announced name", text()[mark:])
             type_(b"\x01x")
+            wait_for("fos> ", 20, mark)
+
+            # The panel's P key lists announced machines; Enter puts the chosen name in the form.
+            mark = len(text())
+            type_(b"run fterm\r")
+            wait_for("Connect to", 20, mark)
+            type_(b"p")
+            wait_for("Pick a machine", 10, mark)
+            check("labbox" in text()[mark:], "panel: P lists the announced machines", text()[mark:])
+            mark = len(text())
+            type_(b"\r")
+            wait_for("Machine (name or MAC)", 10, mark)
+            check("labbox" in text()[mark:], "panel: Enter puts the chosen machine in the form", text()[mark:])
+            type_(b"q")
             wait_for("fos> ", 20, mark)
 
             mark = len(text())

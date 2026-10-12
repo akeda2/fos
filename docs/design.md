@@ -931,7 +931,7 @@ The tape's transports are `Link`s (`tapes/fterm/src/link.rs`: `poll`, `read`, `w
 host Telnet server and a host-side `term net` peer.
 
 A bare `run fterm` (or `run fterm ui`) shows a settings panel like audio-net's and the recorder's (`tapes/fterm/src/ui.rs`; the rules, host-tested, are
-`form.rs`): transport (serial, Telnet, `term net`), the rows that belong to it, `P` picks a machine from the peer table, `C` connects, `W` saves
+`form.rs`): transport (serial, Telnet, `term net`), the rows that belong to it, `P` opens a list of the machines in the peer table (Up/Down, Enter chooses, Esc cancels), `C` connects, `W` saves
 `fterm.cfg`, which is just the equivalent command line (`run fterm @fterm.cfg` repeats it; more words may follow the `@`). Keys are plain: Up/Down or
 Tab select, Space/Backspace/Enter change, Left/Right too. A session returns to the panel. Over the console UART a raw ESC reads as abort, so arrow
 keys only work from the keyboard and `term net`; that is why Space/Backspace exist. `make test-fterm-ui`.
