@@ -17,8 +17,8 @@ use tape_net::{
 use tape_rt::println;
 use telnet_tape::{
     TCP_SEGMENT_CAPACITY, TELNET_BINARY, TELNET_DO, TELNET_IAC, TELNET_NAWS, TELNET_SB, TELNET_SE, TELNET_SUPPRESS_GO_AHEAD,
-    TELNET_TERMINAL_NAME, TELNET_TERMINAL_TYPE, TELNET_TTYPE_IS, TELNET_TTYPE_SEND, TELNET_WILL, TELNET_WINDOW_HEIGHT,
-    TELNET_WINDOW_WIDTH, TelnetEvent, TelnetParser, build_tcp_frame, encode_application, same_subnet,
+    TELNET_TERMINAL_NAME, TELNET_TERMINAL_TYPE, TELNET_TTYPE_IS, TELNET_TTYPE_SEND, TELNET_WILL,
+    TelnetEvent, TelnetParser, build_tcp_frame, encode_application, same_subnet,
 };
 
 const TCP_RX_CAPACITY: usize = 1024;
@@ -421,7 +421,10 @@ impl TelnetLink {
     }
 
     fn queue_naws(&mut self) {
-        let data = [(TELNET_WINDOW_WIDTH >> 8) as u8, TELNET_WINDOW_WIDTH as u8, (TELNET_WINDOW_HEIGHT >> 8) as u8, TELNET_WINDOW_HEIGHT as u8];
+        // The real console grid, so a remote full-screen program uses all of it.
+        let (columns, rows) = tape_rt::console_size();
+        let (width, height) = (columns as u16, rows as u16);
+        let data = [(width >> 8) as u8, width as u8, (height >> 8) as u8, height as u8];
         self.queue_subnegotiation(TELNET_NAWS, &data);
     }
 

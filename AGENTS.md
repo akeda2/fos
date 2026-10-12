@@ -111,7 +111,7 @@ A tape is a position-independent ELF64 executable whose entry is
 `extern "C" fn(api: &TapeApi)`. `abi/src/tape.rs` is the source of truth; rules:
 
 - **Append-only.** Fields are only added at the end of `TapeApi`; a tape checks `version`
-  and `size` before using a late field. Version is currently 7 (`serial_*`: COM2-COM4 for the `fterm` tape, `kernel/src/uart.rs`; 6: `wall_clock_set`: `ptp settime` sets the clock and RTC; 5: `peer_info`: the kernel table of announced machine names; `nic_active`: `nic use N` also steers the single-interface network calls of `net-chat`, `ip-chat` and `telnet`).
+  and `size` before using a late field. Version is currently 8 (`console_size`: the console's columns and rows; fterm reports them as its Telnet window and sizes its machine list by them; 7: `serial_*`: COM2-COM4 for the `fterm` tape, `kernel/src/uart.rs`; 6: `wall_clock_set`: `ptp settime` sets the clock and RTC; 5: `peer_info`: the kernel table of announced machine names; `nic_active`: `nic use N` also steers the single-interface network calls of `net-chat`, `ip-chat` and `telnet`).
 - **Never add fields to a struct the kernel fills in** (`AudioInfo`, `AudioStats`,
   `DiskInfo`, ...): a tape built earlier passes a smaller struct and the kernel writes
   past it. New information gets a new call and a new struct (`audio_buffer`,

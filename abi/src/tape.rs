@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls.
-pub const TAPE_API_VERSION: u32 = 7;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`.
+pub const TAPE_API_VERSION: u32 = 8;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -203,6 +203,9 @@ pub struct TapeApi {
     pub serial_set_lines: extern "C" fn(usize, u32),
     /// `serial_break(number, on)` (version 7): holds the transmit line low (a break) while `on` is non-zero.
     pub serial_break: extern "C" fn(usize, u32),
+    /// `console_size()` (version 8): the text grid of the console, `columns << 16 | rows` (0 when there is no console). A tape
+    /// that lays out a screen or tells a remote host its window size (Telnet NAWS) uses it instead of assuming 80x25.
+    pub console_size: extern "C" fn() -> u32,
 }
 
 /// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.

@@ -499,6 +499,18 @@ pub fn set_wall_clock(time: &WallClock) -> bool {
     (table.wall_clock_set)(time) != 0
 }
 
+/// The console's text grid as (columns, rows); 80x25 when the kernel is older than ABI 8 or has no console.
+pub fn console_size() -> (usize, usize) {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, console_size) + core::mem::size_of::<usize>();
+    if table.version < 8 || (table.size as usize) < end {
+        return (80, 25);
+    }
+    let packed = (table.console_size)();
+    let (columns, rows) = ((packed >> 16) as usize, (packed & 0xffff) as usize);
+    if columns == 0 || rows == 0 { (80, 25) } else { (columns, rows) }
+}
+
 pub fn micros() -> u64 {
     (api().micros)()
 }

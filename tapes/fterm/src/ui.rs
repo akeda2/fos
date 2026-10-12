@@ -152,7 +152,10 @@ fn save(form: &Form) -> &'static str {
     }
 }
 
-const PICK_ROWS: usize = 14;
+// The list uses the console's height: 3 header lines and 2 footer lines are the rest.
+fn pick_rows() -> usize {
+    tape_rt::console_size().1.saturating_sub(6).clamp(5, 60)
+}
 
 fn draw_picker(api: &TapeApi, count: usize, selected: usize, top: usize) {
     begin_batch();
@@ -161,7 +164,7 @@ fn draw_picker(api: &TapeApi, count: usize, selected: usize, top: usize) {
     draw!(" Pick a machine ({count} announced on the network)\x1b[K");
     at(2, 1);
     draw!(" {:-<78}", "");
-    for line in 0..PICK_ROWS.min(count - top) {
+    for line in 0..pick_rows().min(count - top) {
         let number = top + line + 1;
         let mut info = PeerInfo::default();
         (api.peer_info)(number, &mut info);
@@ -173,7 +176,7 @@ fn draw_picker(api: &TapeApi, count: usize, selected: usize, top: usize) {
             info.name(), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], info.nic
         );
     }
-    at(4 + PICK_ROWS, 1);
+    at(4 + pick_rows(), 1);
     draw!(" Up/Down: select   Enter: choose   Esc or Q: cancel\x1b[K");
     end_batch();
 }
@@ -199,8 +202,8 @@ fn pick_peer(api: &TapeApi, decoder: &mut KeyDecoder, form: &mut Form) -> &'stat
     loop {
         if selected < top {
             top = selected;
-        } else if selected >= top + PICK_ROWS {
-            top = selected + 1 - PICK_ROWS;
+        } else if selected >= top + pick_rows() {
+            top = selected + 1 - pick_rows();
         }
         draw_picker(api, count, selected, top);
         let key = loop {

@@ -482,6 +482,9 @@ extern "C" fn api_wall_clock_set(time: *const fosfor_abi::tape::WallClock) -> u3
     let time = fat::Time { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
     u32::from(crate::clock::set(&time).is_ok())
 }
+extern "C" fn api_console_size() -> u32 {
+    crate::framebuffer::size().map_or(0, |(columns, rows)| ((columns as u32) << 16) | rows as u32 & 0xffff)
+}
 extern "C" fn api_serial_count() -> usize {
     crate::uart::count()
 }
@@ -655,6 +658,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         serial_write: api_serial_write,
         serial_lines: api_serial_lines,
         serial_set_lines: api_serial_set_lines,
+        console_size: api_console_size,
         serial_break: api_serial_break,
     };
     term::clear_frame_queue();

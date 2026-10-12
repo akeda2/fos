@@ -69,7 +69,7 @@ fn tx_pump(link: &mut dyn Link) -> bool {
 }
 
 fn usable(api: &TapeApi) -> bool {
-    api.version >= 7 && (api.size as usize) >= core::mem::size_of::<TapeApi>()
+    api.version >= 7 && (api.size as usize) >= core::mem::offset_of!(TapeApi, serial_break) + core::mem::size_of::<usize>()
 }
 
 fn list(api: &TapeApi) {
