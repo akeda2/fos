@@ -451,6 +451,10 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - NEC MSI freeze: with the boot stick on the NEC controller, the MSI self-test froze at its first doorbell write (cause unexplained; no disk
   attached was fine). `xhci::enable_interrupts_all` keeps a vendor 0x1033 controller with a USB disk polled. The interrupt-storm guard and
   event-ring loop cap in `xhci.rs` did not fire.
+  Tried 2026-10-12 and ruled out: MSI-X first (also freezes); Linux's order (MSI and INTE armed before the controller runs, as `xhci_run`
+  does for the NEC): with the first command's ring drained at once nothing froze but no interrupt showed, and waiting for the interrupt
+  without draining froze the machine again. So the freeze follows the MSI actually being delivered (the vector's handler or the delivery
+  path on this board), not the doorbell write. Next: a serial or crash-record trace from the handler, or a different vector/CPU target.
 - EHCI keyboard: the keyboard (low speed, behind the 00:1a.0 hub) used to sit on the async list with S/C masks 0; the Sandy Bridge PCH halted
   with a host system error on that QH during the next control transfer. Keyboards now hang off a periodic frame list (S-mask 0x01, C-mask 0x1c
   behind a hub), as Linux does; the async list holds only the control QH. `usb` prints EHCI USBCMD/USBSTS and the QHs. Open: all 1024 periodic
