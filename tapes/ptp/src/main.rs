@@ -29,6 +29,7 @@
 //! With `l2` the NTP exchange still needs an IP address (`ip=`), used for that one exchange.
 //!
 //! `settime` (slave): once locked (8 samples) to a master that has real time, set this machine's clock and RTC from it, then the tape ends.
+//! Without `secs=` it gives up after 60 s so a start file is not held up by a master that is down.
 //! The RTC holds local time, so say the zone with `tz=` (hours east of UTC: `+2`, `-5`, `+5:30`; default 0, which is UTC).
 //!
 //! Timestamps are taken in software: receive time when the polling loop reads the frame, transmit time just
@@ -67,6 +68,8 @@ struct Options {
     settime: bool,
     zone_minutes: i32,
 }
+
+const SETTIME_GIVE_UP_SECONDS: u32 = 60;
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
     let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, both: false, ntp: "", dns: "", settime: false, zone_minutes: 0 };
@@ -337,9 +340,14 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     let mut last_empty = now_ns();
     let (mut time_set, mut refusal_shown) = (false, false);
     println!("ptp: waiting for an Announce...");
+    // A start-file `ptp settime` must not hold the shell for ever when the master is down.
+    let limit = if options.seconds == 0 && options.settime { SETTIME_GIVE_UP_SECONDS } else { options.seconds };
     loop {
         let now = now_ns();
-        if (api.should_abort)() != 0 || (options.settime && time_set) || (options.seconds != 0 && now - start >= i64::from(options.seconds) * 1_000_000_000) {
+        if (api.should_abort)() != 0 || (options.settime && time_set) || (limit != 0 && now - start >= i64::from(limit) * 1_000_000_000) {
+            if options.settime && !time_set && limit != 0 && now - start >= i64::from(limit) * 1_000_000_000 {
+                println!("ptp: settime: no usable master within {limit} s; the clock is unchanged.");
+            }
             break;
         }
         let mut busy = false;
@@ -582,7 +590,8 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
   nic=N     the interface (default: the one chosen with `nic use`)
   l2        PTP over Ethernet (0x88F7), no IP; ptp4l -2 compatible
   both      master: serve UDP and Ethernet at once (slaves pick one)
-  settime   slave: set this machine's clock and RTC from the master, then end
+  settime   slave: set the clock and RTC from the master, then end (gives up
+            after 60 s without secs=)
   tz=+2     hours east of UTC for settime (the RTC holds local time)
   secs=N    stop after N seconds; Escape stops at any time
 "#);
