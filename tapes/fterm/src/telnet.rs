@@ -1,17 +1,18 @@
 //! Telnet as a link: the telnet tape's session turned into a state machine that `poll` advances a step at a time, so the
 //! terminal loop (keys, Ctrl-A commands) keeps running while DHCP, ARP and the TCP handshake are in flight.
 //!
-//! Dhcp -> Arp -> Connect -> Up -> Closed. The protocol pieces are the telnet tape's (`telnet_tape`: option parser, IAC
+//! Dhcp -> Arp -> Connect -> Up -> Closed; a host name adds Arp (the DNS server) -> Dns before the Arp for the server. The protocol pieces are the telnet tape's (`telnet_tape`: option parser, IAC
 //! doubling, TCP frame builder) and `tape_net`'s fixed-buffer ARP/DHCP/TCP; nothing here allocates. What the telnet tape does
 //! on top and this link does not: it does not answer the remote's cursor-position queries (ESC [ 6 n).
 
 use crate::link::{Link, MAX_FRAME, Nic};
 use core::cmp::min;
-use fterm::TelnetTarget;
+use fterm::{Server, TelnetTarget};
+use tape_net::dns;
 use tape_net::frames;
 use tape_net::{
     ArpCache, ArpOperation, ArpPacket, DHCP_BOOTSTRAP_DESTINATION, DhcpClient, DhcpClientState, ETHERTYPE_ARP, ETHERTYPE_IPV4,
-    EthernetFrame, Ipv4Address, Ipv4Packet, MacAddress, TcpConnection, TcpSegment, TcpState,
+    EthernetFrame, Ipv4Address, Ipv4Header, Ipv4Packet, MacAddress, TcpConnection, TcpSegment, TcpState, UdpDatagram,
 };
 use tape_rt::println;
 use telnet_tape::{
@@ -28,11 +29,15 @@ const ARP_TIMEOUT_TICKS: u64 = 400;
 const CONNECT_TIMEOUT_TICKS: u64 = 1500;
 const DHCP_TIMEOUT_SECONDS: u32 = 8;
 const LOCAL_PORT_BASE: u16 = 40000;
+const DNS_LOCAL_PORT: u16 = 40125;
+const DNS_RETRY_TICKS: u64 = 150;
+const DNS_TIMEOUT_TICKS: u64 = 600;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Dhcp,
     Arp,
+    Dns,
     Connect,
     Up,
     Closed,
@@ -48,6 +53,18 @@ pub struct TelnetLink {
     gateway: Ipv4Address,
     next_hop: Ipv4Address,
     server_mac: MacAddress,
+    /// The host name still to resolve (empty once `server` is an address), and the DNS exchange that does it.
+    name: [u8; dns::MAX_NAME],
+    name_len: usize,
+    dns_server: Ipv4Address,
+    dns_port: u16,
+    dns_id: u16,
+    dns_sent: u64,
+    /// A DNS server on the command line, else the lease's, else the gateway.
+    dns_given: Option<fterm::DnsServer>,
+    lease_dns: Ipv4Address,
+    /// What the current ARP resolution is for: the DNS server (true) or the Telnet server.
+    arp_for_dns: bool,
     dhcp: DhcpClient<128>,
     dhcp_started: u32,
     arp: ArpCache<8>,
@@ -81,13 +98,25 @@ impl TelnetLink {
         let mut link = TelnetLink {
             nic,
             phase: Phase::Dhcp,
-            server: Ipv4Address::new(target.server),
+            server: match target.server {
+                Server::Ip(address) => Ipv4Address::new(address),
+                Server::Name(_) => Ipv4Address::UNSPECIFIED,
+            },
             server_port: target.port,
             local: Ipv4Address::UNSPECIFIED,
             netmask: Ipv4Address::UNSPECIFIED,
             gateway: Ipv4Address::UNSPECIFIED,
             next_hop: Ipv4Address::UNSPECIFIED,
             server_mac: MacAddress([0; 6]),
+            name: [0; dns::MAX_NAME],
+            name_len: 0,
+            dns_server: Ipv4Address::UNSPECIFIED,
+            dns_port: dns::PORT,
+            dns_id: (now as u16) ^ u16::from(own[5]),
+            dns_sent: 0,
+            dns_given: target.dns,
+            lease_dns: Ipv4Address::UNSPECIFIED,
+            arp_for_dns: false,
             dhcp: DhcpClient::<128>::new(nic.mac, transaction, 1, 5),
             dhcp_started: (now / 100) as u32,
             arp: ArpCache::<8>::new(),
@@ -105,12 +134,16 @@ impl TelnetLink {
             sent: 0,
             received: 0,
         };
+        if let Server::Name(name) = target.server {
+            link.name[..name.len()].copy_from_slice(name.as_bytes());
+            link.name_len = name.len();
+        }
         match target.fixed {
             Some(fixed) => {
                 link.local = Ipv4Address::new(fixed.local);
                 link.netmask = prefix_mask(fixed.prefix);
                 link.gateway = Ipv4Address::new(fixed.gateway);
-                link.start_arp();
+                link.start_route();
             }
             None => println!("[DHCP: asking for an address...]"),
         }
@@ -122,17 +155,119 @@ impl TelnetLink {
         self.phase = Phase::Closed;
     }
 
-    fn start_arp(&mut self) {
-        self.next_hop = if same_subnet(self.local, self.netmask, self.server) { self.server } else { self.gateway };
-        if self.next_hop == Ipv4Address::UNSPECIFIED {
-            self.fail("the server is off-subnet and there is no gateway");
+    /// Addressing is known: resolve the host name first if there is one, else go straight to the server.
+    fn start_route(&mut self) {
+        if self.name_len == 0 {
+            self.start_arp(false);
             return;
         }
-        println!("[telnet: {}.{}.{}.{} port {}, local {}.{}.{}.{}]", self.server.0[0], self.server.0[1], self.server.0[2], self.server.0[3], self.server_port,
-            self.local.0[0], self.local.0[1], self.local.0[2], self.local.0[3]);
+        let (server, port) = match self.dns_given {
+            Some(given) => (Ipv4Address::new(given.address), given.port),
+            None if self.lease_dns != Ipv4Address::UNSPECIFIED => (self.lease_dns, dns::PORT),
+            None => (self.gateway, dns::PORT),
+        };
+        if server == Ipv4Address::UNSPECIFIED {
+            self.fail("no DNS server known (DHCP named none and there is no gateway; add `dns A.B.C.D`)");
+            return;
+        }
+        self.dns_server = server;
+        self.dns_port = port;
+        self.start_arp(true);
+    }
+
+    /// Resolve the hardware address of the next hop towards the DNS server (`for_dns`) or the Telnet server.
+    fn start_arp(&mut self, for_dns: bool) {
+        let target = if for_dns { self.dns_server } else { self.server };
+        self.next_hop = if same_subnet(self.local, self.netmask, target) { target } else { self.gateway };
+        if self.next_hop == Ipv4Address::UNSPECIFIED {
+            self.fail(if for_dns { "the DNS server is off-subnet and there is no gateway" } else { "the server is off-subnet and there is no gateway" });
+            return;
+        }
+        if !for_dns {
+            println!("[telnet: {}.{}.{}.{} port {}, local {}.{}.{}.{}]", self.server.0[0], self.server.0[1], self.server.0[2], self.server.0[3], self.server_port,
+                self.local.0[0], self.local.0[1], self.local.0[2], self.local.0[3]);
+        }
+        self.arp_for_dns = for_dns;
         self.phase = Phase::Arp;
         self.phase_started = tape_rt::ticks();
         self.arp_sent = 0;
+    }
+
+    fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("")
+    }
+
+    fn start_dns(&mut self, mac: MacAddress) {
+        self.server_mac = mac; // the DNS server's hop, until the Telnet server's is found
+        self.dns_sent = 0;
+        self.phase = Phase::Dns;
+        self.phase_started = tape_rt::ticks();
+        let d = self.dns_server.0;
+        println!("[DNS: asking {}.{}.{}.{} for {}...]", d[0], d[1], d[2], d[3], self.name());
+    }
+
+    /// One UDP datagram from our DNS port to the DNS server, through the next hop's hardware address.
+    fn send_dns_query(&mut self) -> bool {
+        let mut query = [0u8; dns::MAX_QUERY];
+        let Some(length) = dns::build_query(&mut query, self.dns_id, self.name()) else { return false };
+        let mut udp = [0u8; MAX_FRAME];
+        let Ok(udp_len) = UdpDatagram::new(DNS_LOCAL_PORT, self.dns_port, &query[..length]).encode(&mut udp, self.local, self.dns_server) else { return false };
+        let mut ip = [0u8; MAX_FRAME];
+        let header = Ipv4Header::new(self.local, self.dns_server, 17, udp_len);
+        let Ok(ip_len) = (Ipv4Packet { header, payload: &udp[..udp_len] }).encode(&mut ip) else { return false };
+        let mut out = [0u8; MAX_FRAME];
+        let Ok(total) = EthernetFrame::new(self.server_mac, self.nic.mac, ETHERTYPE_IPV4, &ip[..ip_len]).encode(&mut out) else { return false };
+        self.nic.send(&out[..total])
+    }
+
+    /// Sends the query (again every 1.5 s) and reads what comes back; an answer moves on to the Telnet server.
+    fn poll_dns(&mut self) -> bool {
+        let ticks = tape_rt::ticks();
+        if ticks.wrapping_sub(self.phase_started) > DNS_TIMEOUT_TICKS {
+            self.fail("the DNS server did not answer");
+            return true;
+        }
+        if self.dns_sent == 0 || ticks.wrapping_sub(self.dns_sent) >= DNS_RETRY_TICKS {
+            if !self.send_dns_query() {
+                self.fail("could not send the DNS query");
+                return true;
+            }
+            self.dns_sent = ticks.max(1);
+        }
+        let length = self.nic.receive(&mut self.frame);
+        if length == 0 {
+            return false;
+        }
+        let Ok(ethernet) = EthernetFrame::parse(&self.frame[..length]) else { return true };
+        if ethernet.ethertype == ETHERTYPE_ARP {
+            self.handle_arp(length, ticks as u32);
+            return true;
+        }
+        if ethernet.ethertype != ETHERTYPE_IPV4 {
+            return true;
+        }
+        let Ok(packet) = Ipv4Packet::parse(ethernet.payload, true) else { return true };
+        if packet.header.protocol != 17 || packet.header.source != self.dns_server {
+            return true;
+        }
+        let Ok(datagram) = UdpDatagram::parse(packet.payload, true, packet.header.source, packet.header.destination) else { return true };
+        if datagram.destination_port != DNS_LOCAL_PORT || datagram.source_port != self.dns_port {
+            return true;
+        }
+        match dns::parse_reply(datagram.payload, self.dns_id, self.name()) {
+            Ok(address) => {
+                self.server = Ipv4Address::new(address);
+                println!("[DNS: {} is {}.{}.{}.{}]", self.name(), address[0], address[1], address[2], address[3]);
+                self.name_len = 0;
+                self.start_arp(false);
+            }
+            Err(dns::Failure::NotOurs) => {}
+            Err(failure) => {
+                let message = dns::describe(failure);
+                self.fail(message);
+            }
+        }
+        true
     }
 
     fn send_tcp(&mut self, length: usize) -> bool {
@@ -185,7 +320,10 @@ impl TelnetLink {
                     self.netmask = lease.subnet_mask;
                     self.gateway = lease.router;
                     println!("[DHCP: leased {}.{}.{}.{}]", lease.address.0[0], lease.address.0[1], lease.address.0[2], lease.address.0[3]);
-                    self.start_arp();
+                    if lease.dns_server_count > 0 {
+                        self.lease_dns = lease.dns_servers[0];
+                    }
+                    self.start_route();
                     return true;
                 }
                 _ => {
@@ -209,6 +347,10 @@ impl TelnetLink {
     fn poll_arp(&mut self) -> bool {
         let ticks = tape_rt::ticks();
         if let Some(mac) = self.arp.lookup(self.next_hop, ticks as u32) {
+            if self.arp_for_dns {
+                self.start_dns(mac);
+                return true;
+            }
             self.server_mac = mac;
             return self.start_connect();
         }
@@ -411,6 +553,7 @@ impl Link for TelnetLink {
         match self.phase {
             Phase::Dhcp => self.poll_dhcp(),
             Phase::Arp => self.poll_arp(),
+            Phase::Dns => self.poll_dns(),
             Phase::Connect | Phase::Up => self.poll_session(),
             Phase::Closed => false,
         }
@@ -448,10 +591,14 @@ impl Link for TelnetLink {
         let name = match self.phase {
             Phase::Dhcp => "asking DHCP",
             Phase::Arp => "resolving the server",
+            Phase::Dns => "looking up the name",
             Phase::Connect => "connecting",
             Phase::Up => "connected",
             Phase::Closed => "closed",
         };
+        if self.name_len != 0 {
+            return println!("\n[fterm: telnet {}:{} {}]", self.name(), self.server_port, name);
+        }
         println!(
             "\n[fterm: telnet {}.{}.{}.{}:{} {}, sent {} received {}]",
             self.server.0[0], self.server.0[1], self.server.0[2], self.server.0[3], self.server_port, name, self.sent, self.received

@@ -2,7 +2,7 @@
 //!
 //! The form always reduces to an ordinary `fterm` command line (`Form::args`), which `parse_args` then checks; the saved
 //! `fterm.cfg` is that same line, so `run fterm @fterm.cfg` repeats what the panel did. `Form::from_args` is the way back.
-use crate::{DEFAULT_BAUD, DEFAULT_FORMAT, Peer, Target, format_name, parse_args};
+use crate::{DEFAULT_BAUD, DEFAULT_FORMAT, Peer, Server, Target, format_name, parse_args};
 use core::fmt::Write;
 use tape_panel::Text;
 
@@ -25,12 +25,13 @@ pub enum Row {
     Addressing,
     Local,
     Gateway,
+    Dns,
     Peer,
     Echo,
     Crlf,
 }
 
-pub const ROWS: [Row; 12] = [
+pub const ROWS: [Row; 13] = [
     Row::Transport,
     Row::Port,
     Row::Baud,
@@ -40,6 +41,7 @@ pub const ROWS: [Row; 12] = [
     Row::Addressing,
     Row::Local,
     Row::Gateway,
+    Row::Dns,
     Row::Peer,
     Row::Echo,
     Row::Crlf,
@@ -48,7 +50,7 @@ pub const ROWS: [Row; 12] = [
 impl Row {
     /// Text rows are typed into; the others cycle.
     pub fn is_text(self) -> bool {
-        matches!(self, Row::Server | Row::TcpPort | Row::Local | Row::Gateway | Row::Peer)
+        matches!(self, Row::Server | Row::TcpPort | Row::Local | Row::Gateway | Row::Dns | Row::Peer)
     }
 
     /// Whether the row applies to the chosen transport (and, for the static addresses, to the addressing mode).
@@ -56,7 +58,7 @@ impl Row {
         match self {
             Row::Transport | Row::Echo | Row::Crlf => true,
             Row::Port | Row::Baud | Row::Format => form.transport == SERIAL,
-            Row::Server | Row::TcpPort | Row::Addressing => form.transport == TELNET,
+            Row::Server | Row::TcpPort | Row::Addressing | Row::Dns => form.transport == TELNET,
             Row::Local | Row::Gateway => form.transport == TELNET && !form.dhcp,
             Row::Peer => form.transport == NET,
         }
@@ -66,7 +68,9 @@ impl Row {
     pub fn accepts(self, byte: u8) -> bool {
         match self {
             Row::TcpPort => byte.is_ascii_digit(),
-            Row::Server | Row::Gateway => byte.is_ascii_digit() || byte == b'.',
+            Row::Gateway => byte.is_ascii_digit() || byte == b'.',
+            Row::Server => byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'),
+            Row::Dns => byte.is_ascii_digit() || byte == b'.' || byte == b':',
             Row::Local => byte.is_ascii_digit() || byte == b'.' || byte == b'/',
             Row::Peer => byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'),
             _ => false,
@@ -80,11 +84,12 @@ pub struct Form {
     pub port: usize,
     pub baud: u32,
     pub format: u32,
-    pub server: Text<15>,
+    pub server: Text<40>,
     pub tcp_port: Text<5>,
     pub dhcp: bool,
     pub local: Text<18>,
     pub gateway: Text<15>,
+    pub dns: Text<21>,
     pub peer: Text<20>,
     pub echo: bool,
     pub crlf: bool,
@@ -102,6 +107,7 @@ impl Default for Form {
             dhcp: true,
             local: Text::new(),
             gateway: Text::new(),
+            dns: Text::new(),
             peer: Text::new(),
             echo: false,
             crlf: false,
@@ -118,7 +124,19 @@ impl Form {
             Target::Serial => {}
             Target::Telnet(target) => {
                 form.transport = TELNET;
-                let _ = write!(form.server, "{}.{}.{}.{}", target.server[0], target.server[1], target.server[2], target.server[3]);
+                match target.server {
+                    Server::Ip(a) => {
+                        let _ = write!(form.server, "{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+                    }
+                    Server::Name(name) => form.server = Text::from(name),
+                }
+                if let Some(dns) = target.dns {
+                    let a = dns.address;
+                    let _ = write!(form.dns, "{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+                    if dns.port != 53 {
+                        let _ = write!(form.dns, ":{}", dns.port);
+                    }
+                }
                 form.tcp_port.clear();
                 let _ = write!(form.tcp_port, "{}", target.port);
                 if let Some(fixed) = target.fixed {
@@ -143,7 +161,7 @@ impl Form {
     }
 
     /// The command line this form stands for (it may still fail `parse_args`: an address left empty, say).
-    pub fn args(&self) -> Text<120> {
+    pub fn args(&self) -> Text<160> {
         let mut out = Text::new();
         match self.transport {
             SERIAL => {
@@ -156,6 +174,9 @@ impl Form {
                 if !self.dhcp {
                     let gateway = if self.gateway.is_empty() { "0.0.0.0" } else { self.gateway.as_str() };
                     let _ = write!(out, " static {} {}", self.local.as_str(), gateway);
+                }
+                if !self.dns.is_empty() {
+                    let _ = write!(out, " dns {}", self.dns.as_str());
                 }
             }
             _ => {
@@ -210,10 +231,11 @@ impl Form {
 
     pub fn text_mut(&mut self, row: Row) -> Option<TextRef<'_>> {
         match row {
-            Row::Server => Some(TextRef::Short(&mut self.server)),
+            Row::Server => Some(TextRef::Name(&mut self.server)),
             Row::TcpPort => Some(TextRef::Port(&mut self.tcp_port)),
             Row::Local => Some(TextRef::Local(&mut self.local)),
             Row::Gateway => Some(TextRef::Short(&mut self.gateway)),
+            Row::Dns => Some(TextRef::Dns(&mut self.dns)),
             Row::Peer => Some(TextRef::Peer(&mut self.peer)),
             _ => None,
         }
@@ -223,6 +245,8 @@ impl Form {
 /// A text row's buffer, whatever its capacity.
 pub enum TextRef<'a> {
     Short(&'a mut Text<15>),
+    Name(&'a mut Text<40>),
+    Dns(&'a mut Text<21>),
     Port(&'a mut Text<5>),
     Local(&'a mut Text<18>),
     Peer(&'a mut Text<20>),
@@ -232,6 +256,8 @@ impl TextRef<'_> {
     pub fn push(&mut self, byte: u8) {
         match self {
             TextRef::Short(text) => text.push(byte),
+            TextRef::Name(text) => text.push(byte),
+            TextRef::Dns(text) => text.push(byte),
             TextRef::Port(text) => text.push(byte),
             TextRef::Local(text) => text.push(byte),
             TextRef::Peer(text) => text.push(byte),
@@ -241,6 +267,8 @@ impl TextRef<'_> {
     pub fn clear(&mut self) {
         match self {
             TextRef::Short(text) => text.clear(),
+            TextRef::Name(text) => text.clear(),
+            TextRef::Dns(text) => text.clear(),
             TextRef::Port(text) => text.clear(),
             TextRef::Local(text) => text.clear(),
             TextRef::Peer(text) => text.clear(),
@@ -250,6 +278,8 @@ impl TextRef<'_> {
     pub fn pop(&mut self) {
         match self {
             TextRef::Short(text) => text.pop(),
+            TextRef::Name(text) => text.pop(),
+            TextRef::Dns(text) => text.pop(),
             TextRef::Port(text) => text.pop(),
             TextRef::Local(text) => text.pop(),
             TextRef::Peer(text) => text.pop(),
@@ -273,6 +303,8 @@ mod tests {
             "2 9600 7e1 echo",
             "telnet 10.0.0.5 2323 crlf",
             "telnet 10.0.0.5 23 static 10.0.0.9/24 10.0.0.1",
+            "telnet lab.example 23 dns 10.0.0.1",
+            "telnet lab.example 2323 static 10.0.0.9/24 10.0.0.1 dns 10.0.2.2:5353 echo",
             "net skylake3",
             "net aa:bb:cc:0:1:2 echo crlf",
         ] {
@@ -304,9 +336,9 @@ mod tests {
         let shown = |form: &Form| ROWS.iter().filter(|row| row.applies(form)).count();
         assert_eq!(shown(&form), 6);
         form.transport = TELNET;
-        assert_eq!(shown(&form), 6);
+        assert_eq!(shown(&form), 7);
         form.dhcp = false;
-        assert_eq!(shown(&form), 8);
+        assert_eq!(shown(&form), 9);
         form.transport = NET;
         assert_eq!(shown(&form), 4);
         // Moving skips what is hidden and wraps.
@@ -316,9 +348,9 @@ mod tests {
             *slot = at;
             at = form.move_row(at, 1);
         }
-        assert_eq!(visited, [0, 9, 10, 11]);
+        assert_eq!(visited, [0, 10, 11, 12]);
         assert_eq!(at, 0);
-        assert_eq!(form.move_row(0, -1), 11);
+        assert_eq!(form.move_row(0, -1), 12);
     }
 
     #[test]
@@ -343,7 +375,8 @@ mod tests {
 
     #[test]
     fn typing_is_filtered_per_row() {
-        assert!(Row::Server.accepts(b'7') && Row::Server.accepts(b'.') && !Row::Server.accepts(b'/'));
+        assert!(Row::Server.accepts(b'7') && Row::Server.accepts(b'.') && Row::Server.accepts(b'x') && !Row::Server.accepts(b'/'));
+        assert!(Row::Dns.accepts(b':') && !Row::Dns.accepts(b'x'));
         assert!(Row::Local.accepts(b'/') && !Row::TcpPort.accepts(b'.'));
         assert!(Row::Peer.accepts(b'x') && Row::Peer.accepts(b':') && !Row::Peer.accepts(b' '));
         let mut form = Form::default();

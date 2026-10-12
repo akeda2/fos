@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D] [domain=N]
-//!              [l2] [ntp=dhcp|A.B.C.D] [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US] [idle] [verbose]
+//!              [l2] [ntp=dhcp|A.B.C.D|NAME] [dns=A.B.C.D] [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US] [idle] [verbose]
 //! ```
 //!
 //! `slave` (the default) listens for Announce, Sync and Follow_Up on the PTP multicast group (224.0.1.129),
@@ -23,7 +23,7 @@
 //! 01:1B:19:00:00:00, no IP address, DHCP or IGMP, so it also works on a bare switch or a link with no router.
 //!
 //! `ntp=` (master): before announcing, ask an NTP server the time (`dhcp` is the server DHCP names in option 42, else the
-//! gateway; or an address) and make the master's PTP time real: TAI, so Unix time plus 37 s, with the Announce saying timeSource NTP
+//! gateway; or an address or a host name, which the DNS server from DHCP option 6, `dns=A.B.C.D` or else the gateway resolves) and make the master's PTP time real: TAI, so Unix time plus 37 s, with the Announce saying timeSource NTP
 //! and the UTC offset. Without it the master counts from boot and its slaves know that. The master does not follow NTP afterwards
 //! (a PTP master that stepped would unlock its slaves); restart it to resync, an oscillator drifts a few seconds a day.
 //! With `l2` the NTP exchange still needs an IP address (`ip=`), used for that one exchange.
@@ -63,12 +63,13 @@ struct Options {
     l2: bool,
     both: bool,
     ntp: &'static str,
+    dns: &'static str,
     settime: bool,
     zone_minutes: i32,
 }
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
-    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, both: false, ntp: "", settime: false, zone_minutes: 0 };
+    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, both: false, ntp: "", dns: "", settime: false, zone_minutes: 0 };
     for word in arguments.split_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
@@ -80,6 +81,7 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
             "verbose" => options.verbose = true,
             "settime" => options.settime = true,
             "ntp" => options.ntp = if value.is_empty() { "dhcp" } else { value },
+            "dns" => options.dns = value,
             "tz" => options.zone_minutes = tape_net::ntp::parse_zone(value).ok_or("tz= is hours east of UTC, like +2, -5 or +5:30")?,
             "nic" => options.nic = value.parse::<usize>().ok().filter(|&n| n >= 1).ok_or("nic= is the NIC number, from 1")? - 1,
             "ip" => options.ip = value,
@@ -116,7 +118,7 @@ impl core::fmt::Display for Shown {
 }
 
 /// Asks the NTP server and, if it answers, makes `now_ns()` the TAI time. True if the master's time is now real.
-fn adopt_ntp_time(api: &TapeApi, options: &Options, config: &net::NetConfig, from_dhcp: Option<Ipv4Address>) -> bool {
+fn adopt_ntp_time(api: &TapeApi, options: &Options, config: &net::NetConfig, from_dhcp: Option<Ipv4Address>, dhcp_dns: Option<Ipv4Address>) -> bool {
     let server = if options.ntp == "dhcp" {
         match from_dhcp {
             Some(server) => server,
@@ -133,8 +135,20 @@ fn adopt_ntp_time(api: &TapeApi, options: &Options, config: &net::NetConfig, fro
         match net::parse_ip(options.ntp) {
             Some(server) => server,
             None => {
-                println!("ptp: ntp= is dhcp or an IP address (there is no DNS client). The master counts from boot.");
-                return false;
+                let dns = options.dns.is_empty().then_some(dhcp_dns).flatten().or_else(|| net::parse_ip(options.dns)).or((config.gateway.0 != [0; 4]).then_some(config.gateway));
+                let Some(dns) = dns else {
+                    println!("ptp: {} is a name and no DNS server is known (dns=A.B.C.D). The master counts from boot.", options.ntp);
+                    return false;
+                };
+                println!("ptp: asking DNS server {}.{}.{}.{} for {}...", dns.0[0], dns.0[1], dns.0[2], dns.0[3], options.ntp);
+                let mut arp = ArpCache::<8>::new();
+                match tape_ip::dns::lookup(api, options.nic, config, &mut arp, dns, tape_net::dns::PORT, options.ntp) {
+                    Ok(server) => server,
+                    Err(reason) => {
+                        println!("ptp: {}: {reason}. The master counts from boot.", options.ntp);
+                        return false;
+                    }
+                }
             }
         }
     };
@@ -259,13 +273,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let wants_ntp = !options.ntp.is_empty();
     let mut dhcp_ntp = None;
+    let mut dhcp_dns = None;
     let config = if options.l2 && !wants_ntp {
         net::NetConfig { mac: MacAddress(mac), ip: Ipv4Address([0; 4]), netmask: Ipv4Address([0; 4]), gateway: Ipv4Address([0; 4]) }
     } else if options.ip == "dhcp" {
         println!("ptp: asking DHCP for an address on NIC {}...", options.nic + 1);
-        match net::dhcp_with_ntp(api, options.nic, MacAddress(mac)) {
-            Some((config, ntp)) => {
+        match net::dhcp_with_servers(api, options.nic, MacAddress(mac)) {
+            Some((config, ntp, dns)) => {
                 dhcp_ntp = ntp;
+                dhcp_dns = dns;
                 config
             }
             None => return println!("ptp: no DHCP answer; give ip=A.B.C.D/N instead."),
@@ -289,7 +305,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if !options.l2 {
         igmp.join(api, options.nic, &config);
     }
-    let ntp_synced = wants_ntp && adopt_ntp_time(api, &options, &config, dhcp_ntp);
+    let ntp_synced = wants_ntp && adopt_ntp_time(api, &options, &config, dhcp_ntp, dhcp_dns);
     if options.master {
         master(api, &options, &config, mac, ntp_synced);
     } else {
@@ -555,12 +571,14 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
 tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP or Ethernet.
 
   tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D]
-               [domain=N] [l2|both] [ntp=dhcp|A.B.C.D] [settime] [tz=+H[:MM]]
-               [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US]
+               [domain=N] [l2|both] [ntp=dhcp|A.B.C.D|NAME] [dns=A.B.C.D]
+               [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US]
                [idle] [verbose]
 
   slave     measure offset, delay and rate to a master (the default)
   master    announce a clock; ntp= takes real time from an NTP server first
+  ntp=NAME  a host name is looked up at the DNS server of DHCP, dns=, or the
+            gateway
   nic=N     the interface (default: the one chosen with `nic use`)
   l2        PTP over Ethernet (0x88F7), no IP; ptp4l -2 compatible
   both      master: serve UDP and Ethernet at once (slaves pick one)

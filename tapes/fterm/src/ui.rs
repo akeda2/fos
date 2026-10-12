@@ -19,11 +19,12 @@ fn label(row: Row) -> &'static str {
         Row::Port => "Serial port",
         Row::Baud => "Baud rate",
         Row::Format => "Data format",
-        Row::Server => "Telnet server",
+        Row::Server => "Telnet server (IP or name)",
         Row::TcpPort => "TCP port",
         Row::Addressing => "Addressing",
         Row::Local => "Our address/prefix",
         Row::Gateway => "Gateway",
+        Row::Dns => "DNS server (optional)",
         Row::Peer => "Machine (name or MAC)",
         Row::Echo => "Local echo",
         Row::Crlf => "Enter sends CR LF",
@@ -63,6 +64,7 @@ fn value(api: &TapeApi, form: &Form, row: Row) -> Text<40> {
         Row::Addressing => write(&mut text, format_args!("{}", if form.dhcp { "DHCP" } else { "static" })),
         Row::Local => write(&mut text, format_args!("{}", form.local.as_str())),
         Row::Gateway => write(&mut text, format_args!("{}", form.gateway.as_str())),
+        Row::Dns => write(&mut text, format_args!("{}", form.dns.as_str())),
         Row::Peer => write(&mut text, format_args!("{}", form.peer.as_str())),
         Row::Echo => write(&mut text, format_args!("{}", on_off(form.echo))),
         Row::Crlf => write(&mut text, format_args!("{}", on_off(form.crlf))),
@@ -79,7 +81,7 @@ fn draw_row(api: &TapeApi, form: &Form, index: usize, selected: usize, editing: 
     }
     let marker = if index == selected { '>' } else { ' ' };
     let cursor = if editing && index == selected { "_" } else { "" };
-    draw!(" {marker} {:<24}{}{cursor}\x1b[K", label(row), value(api, form, row).as_str());
+    draw!(" {marker} {:<28}{}{cursor}\x1b[K", label(row), value(api, form, row).as_str());
 }
 
 fn draw_message(message: &str) {

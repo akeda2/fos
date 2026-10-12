@@ -171,6 +171,7 @@ pub struct DhcpTask {
     mac: MacAddress,
     nic: usize,
     ntp_server: Option<Ipv4Address>,
+    dns_server: Option<Ipv4Address>,
 }
 
 pub enum DhcpStep {
@@ -187,7 +188,7 @@ impl DhcpTask {
         let mut name = [0u8; 20];
         let length = (api.hostname)(nic, name.as_mut_ptr(), name.len());
         client.set_host_name(&name[..length]);
-        DhcpTask { client, started: (api.ticks)() as u32 / 100, mac, nic, ntp_server: None }
+        DhcpTask { client, started: (api.ticks)() as u32 / 100, mac, nic, ntp_server: None, dns_server: None }
     }
 
     /// Does what is due (sends a request, reads the frames waiting) without blocking.
@@ -211,6 +212,7 @@ impl DhcpTask {
         }
         if self.client.state() == DhcpClientState::Bound {
             self.ntp_server = self.client.lease().filter(|lease| lease.ntp_server_count > 0).map(|lease| lease.ntp_servers[0]);
+            self.dns_server = self.client.lease().filter(|lease| lease.dns_server_count > 0).map(|lease| lease.dns_servers[0]);
             return match self.client.lease() {
                 Some(lease) if lease.subnet_mask != Ipv4Address([0; 4]) => DhcpStep::Bound(NetConfig { mac, ip: lease.address, netmask: lease.subnet_mask, gateway: lease.router }),
                 _ => DhcpStep::Failed,
@@ -235,12 +237,24 @@ impl DhcpTask {
     }
 }
 
+impl DhcpTask {
+    /// The first DNS server the lease named (option 6), once bound.
+    pub fn dns_server(&self) -> Option<Ipv4Address> {
+        self.dns_server
+    }
+}
+
 /// Like `dhcp`, and also returns the NTP server the DHCP server named, if any.
 pub fn dhcp_with_ntp(api: &TapeApi, nic: usize, mac: MacAddress) -> Option<(NetConfig, Option<Ipv4Address>)> {
+    dhcp_with_servers(api, nic, mac).map(|(config, ntp, _)| (config, ntp))
+}
+
+/// Like `dhcp`, and also returns the NTP and the (first) DNS server the DHCP server named, if any.
+pub fn dhcp_with_servers(api: &TapeApi, nic: usize, mac: MacAddress) -> Option<(NetConfig, Option<Ipv4Address>, Option<Ipv4Address>)> {
     let mut task = DhcpTask::new(api, nic, mac);
     loop {
         match task.step(api) {
-            DhcpStep::Bound(config) => return Some((config, task.ntp_server())),
+            DhcpStep::Bound(config) => return Some((config, task.ntp_server(), task.dns_server())),
             DhcpStep::Failed => return None,
             DhcpStep::Waiting => tape_rt::idle(),
         }

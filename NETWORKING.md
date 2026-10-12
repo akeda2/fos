@@ -944,3 +944,11 @@ seconds, then every 10 s, also while a tape runs. `nic peers` lists what has bee
 are the `hostname` file's plus the NIC number, or `fos-` and the last three MAC bytes. Tapes read the table with `peer_info`
 (ABI 5); `audio-net` uses the name as its session name and resolves `to=NAME` on raw Ethernet/AVTP from it. A tape that
 counts raw frames (`nic recv`, the bridge test) will see these broadcasts.
+
+## DNS client
+
+`crates/tape-net/src/dns.rs` builds an A query and parses the reply (first A record; a reply with another id, name or
+a request is ignored); `crates/tape-ip/src/dns.rs` `lookup` does ARP, then three tries of 1.5 s over UDP. The server is,
+in order: the `dns=A.B.C.D[:PORT]` / `dns A.B.C.D[:PORT]` option, DHCP option 6 (`dhcp_with_servers`), the gateway.
+Users: `ptp ... ntp=NAME` and `fterm telnet NAME` (a non-blocking phase of the link, with the panel's DNS field).
+No cache, no TCP fallback, no AAAA, one server.

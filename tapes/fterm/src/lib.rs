@@ -17,7 +17,7 @@ pub const PREFIX: u8 = 0x01;
 pub enum Target<'a> {
     /// A serial port; `Config::port`, `baud` and `format` apply.
     Serial,
-    Telnet(TelnetTarget),
+    Telnet(TelnetTarget<'a>),
     /// Another fos machine's shell over `term net`.
     Net(Peer<'a>),
 }
@@ -29,12 +29,45 @@ pub struct Fixed {
     pub gateway: [u8; 4],
 }
 
+/// The Telnet server: an address, or a host name the DNS client resolves first.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Server<'a> {
+    Ip([u8; 4]),
+    Name(&'a str),
+}
+
+/// A DNS server given on the command line (`dns A.B.C.D[:PORT]`; the port is for test servers, 53 otherwise).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct DnsServer {
+    pub address: [u8; 4],
+    pub port: u16,
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub struct TelnetTarget {
-    pub server: [u8; 4],
+pub struct TelnetTarget<'a> {
+    pub server: Server<'a>,
     pub port: u16,
     /// `None`: ask DHCP.
     pub fixed: Option<Fixed>,
+    /// `None`: the one DHCP names (option 6), else the gateway.
+    pub dns: Option<DnsServer>,
+}
+
+/// A host name for `telnet`: valid DNS syntax and at least one letter (so `1.2.3` is a bad address, not a name).
+fn parse_server(word: &str) -> Result<Server<'_>, &'static str> {
+    match parse_ip(word) {
+        Some(address) => Ok(Server::Ip(address)),
+        None if tape_net::dns::valid_name(word) && word.bytes().any(|byte| byte.is_ascii_alphabetic()) => Ok(Server::Name(word)),
+        None => Err("bad server address"),
+    }
+}
+
+fn parse_dns(word: &str) -> Result<DnsServer, &'static str> {
+    let (address, port) = match word.split_once(':') {
+        Some((address, port)) => (address, port.parse::<u16>().ok().filter(|&port| port != 0).ok_or("bad DNS port")?),
+        None => (word, tape_net::dns::PORT),
+    };
+    Ok(DnsServer { address: parse_ip(address).ok_or("bad DNS server address")?, port })
 }
 
 /// A `term net` peer: a MAC address, or the name it announces (resolved through the kernel's peer table).
@@ -119,7 +152,7 @@ pub fn format_name(format: u32, out: &mut [u8; 3]) {
     out[2] = if format & 0x04 != 0 { b'2' } else { b'1' };
 }
 
-/// `[PORT] [BAUD] [FORMAT] [echo] [crlf]`, `list`, `telnet IP [PORT] [static LOCAL/PREFIX GATEWAY]` or `net NAME|MAC`. In the serial
+/// `[PORT] [BAUD] [FORMAT] [echo] [crlf]`, `list`, `telnet IP|NAME [PORT] [static LOCAL/PREFIX GATEWAY] [dns IP[:PORT]]` or `net NAME|MAC`. In the serial
 /// form the first number is the port, the second the baud rate; `echo` and `crlf` may come anywhere.
 pub fn parse_args(text: &str) -> Result<Config<'_>, &'static str> {
     let mut config = Config::default();
@@ -127,8 +160,8 @@ pub fn parse_args(text: &str) -> Result<Config<'_>, &'static str> {
     match words.peek().copied() {
         Some("telnet") => {
             words.next();
-            let server = parse_ip(words.next().ok_or("telnet needs a server address")?).ok_or("bad server address")?;
-            let mut target = TelnetTarget { server, port: 23, fixed: None };
+            let server = parse_server(words.next().ok_or("telnet needs a server address")?)?;
+            let mut target = TelnetTarget { server, port: 23, fixed: None, dns: None };
             if let Some(port) = words.peek().and_then(|word| word.parse::<u16>().ok()) {
                 words.next();
                 if port == 0 {
@@ -165,6 +198,12 @@ pub fn parse_args(text: &str) -> Result<Config<'_>, &'static str> {
                 let gateway = parse_ip(words.next().ok_or("static needs a gateway (0.0.0.0 for none)")?).ok_or("bad gateway")?;
                 if let Target::Telnet(target) = &mut config.target {
                     target.fixed = Some(Fixed { local, prefix, gateway });
+                }
+            }
+            "dns" if matches!(config.target, Target::Telnet(_)) => {
+                let server = parse_dns(words.next().ok_or("dns needs a server address")?)?;
+                if let Target::Telnet(target) = &mut config.target {
+                    target.dns = Some(server);
                 }
             }
             _ if config.target != Target::Serial => return Err("unknown argument"),
@@ -290,11 +329,18 @@ mod tests {
     #[test]
     fn telnet_and_net_targets() {
         let config = parse_args("telnet 10.0.0.5").unwrap();
-        assert_eq!(config.target, Target::Telnet(TelnetTarget { server: [10, 0, 0, 5], port: 23, fixed: None }));
+        assert_eq!(config.target, Target::Telnet(TelnetTarget { server: Server::Ip([10, 0, 0, 5]), port: 23, fixed: None, dns: None }));
         let config = parse_args("telnet 10.0.0.5 2323 static 10.0.0.9/24 10.0.0.1 echo").unwrap();
         let fixed = Fixed { local: [10, 0, 0, 9], prefix: 24, gateway: [10, 0, 0, 1] };
-        assert_eq!(config.target, Target::Telnet(TelnetTarget { server: [10, 0, 0, 5], port: 2323, fixed: Some(fixed) }));
+        assert_eq!(config.target, Target::Telnet(TelnetTarget { server: Server::Ip([10, 0, 0, 5]), port: 2323, fixed: Some(fixed), dns: None }));
         assert!(config.echo);
+        let config = parse_args("telnet Lab.example 2323 dns 10.0.0.1:5353").unwrap();
+        let dns = Some(DnsServer { address: [10, 0, 0, 1], port: 5353 });
+        assert_eq!(config.target, Target::Telnet(TelnetTarget { server: Server::Name("Lab.example"), port: 2323, fixed: None, dns }));
+        assert_eq!(parse_args("telnet lab dns 10.0.0.1").unwrap().target, Target::Telnet(TelnetTarget { server: Server::Name("lab"), port: 23, fixed: None, dns: Some(DnsServer { address: [10, 0, 0, 1], port: 53 }) }));
+        for bad in ["telnet bad_name!", "telnet a..b", "telnet lab dns", "telnet lab dns x", "telnet lab dns 10.0.0.1:0", "net x dns 10.0.0.1"] {
+            assert!(parse_args(bad).is_err(), "{bad}");
+        }
         assert_eq!(parse_args("net aa:bb:cc:0:1:2").unwrap().target, Target::Net(Peer::Mac([0xaa, 0xbb, 0xcc, 0, 1, 2])));
         assert_eq!(parse_args("net skylake3 crlf").unwrap().target, Target::Net(Peer::Name("skylake3")));
         for bad in ["telnet", "telnet 1.2.3", "telnet 1.2.3.4 0", "telnet 1.2.3.4 static 1.2.3.5 1.2.3.1", "net", "net x 5"] {

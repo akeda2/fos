@@ -416,3 +416,8 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   any port through the `serial_*` calls.
 - **`usb_midi::release`** does not free the device's buffer page (small leak on unplug).
 - **Lesson**: a blocking shell loop must call `drain_nics`, or a `term net` client's Escape never arrives and the machine looks hung.
+
+## Open after the DNS session (2026-10-11)
+
+- Use `tape_ip::dns::lookup` in the `telnet` and `ip-chat` (`to=NAME`) tapes; today only `ptp` and `fterm` resolve names.
+- Caching, TCP fallback on truncation, a second server, AAAA, and a `nslookup`-style shell command or tape.

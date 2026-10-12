@@ -303,8 +303,10 @@ tape_rt::tape_help!(br#"fterm: a terminal for serial ports, Telnet and other fos
   run fterm [PORT] [BAUD] [8n1] [echo] [crlf]
                                   serial: PORT 1 = first listed, BAUD 115200,
                                   format 8n1 (7e1, 8o2, ... also work)
-  run fterm telnet IP [PORT] [static LOCAL/PREFIX GATEWAY]
-                                  Telnet (port 23); DHCP unless static is given
+  run fterm telnet IP|NAME [PORT] [static LOCAL/PREFIX GATEWAY] [dns IP]
+                                  Telnet (port 23); DHCP unless static is given.
+                                  A NAME goes to the DNS server DHCP names,
+                                  `dns`, or else the gateway
   run fterm net NAME|MAC          another fos machine's shell (term net)
 
   Keys go out as typed (Ctrl-C and Esc too); incoming text is shown.

@@ -951,3 +951,9 @@ bytes). The IN transfer is queued one max-packet at a time (a cheap full-speed c
 256-entry ring, `release` forgets a device with its slot. Shell: `midi` (list), `midi monitor` (print what arrives until Escape), `midi send [#N] HEX..`
 (one message, no SysEx, cable 0). Verified on skylake3 and laptop1 with a 2381:0100 cable: enumeration, OUT transfers and, looped out to in on laptop1, IN events (note on/off, control change). A blocking monitor must call `drain_nics`, or a `term net` Escape never arrives. `make test-midi` covers only the no-device paths (QEMU has no USB-MIDI model). Not yet: SysEx
 on OUT, several cables per device, a tape ABI (the X-Touch/Mackie work will add it).
+
+### DNS resolution
+
+A small A-record client: pure codec in `tape-net::dns` (host tests), blocking `tape_ip::dns::lookup`, and a
+non-blocking `Phase::Dns` in the fterm Telnet link. `ptp ntp=NAME` uses it too. The server comes from `dns`, DHCP option 6,
+or the gateway. Tested end to end by `make test-fterm-net` against a Python DNS responder reached as 10.0.2.2.

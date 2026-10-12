@@ -14,6 +14,7 @@
 //! outstanding segment for retransmission.
 #![no_std]
 
+pub mod dns;
 pub mod frames;
 pub mod ntp;
 
