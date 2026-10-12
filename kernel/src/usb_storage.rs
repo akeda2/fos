@@ -373,7 +373,10 @@ pub fn mark_ehci_hub_stale(controller_index: usize, hub_address: u8, hub_port: u
 /// Registers a freshly addressed xHCI device with a Mass Storage interface as a disk.
 /// The caller has already issued SET_CONFIGURATION. Returns the block-layer disk number.
 pub fn attach_xhci(controller_index: usize, controller: &mut xhci::Controller, device: xhci::Device, endpoints: Endpoints) -> Option<usize> {
-    controller.configure_bulk_endpoints(&device, endpoints.in_endpoint, endpoints.in_max_packet, endpoints.in_burst, endpoints.out_endpoint, endpoints.out_max_packet, endpoints.out_burst).ok()?;
+    if let Err(error) = controller.configure_bulk_endpoints(&device, endpoints.in_endpoint, endpoints.in_max_packet, endpoints.in_burst, endpoints.out_endpoint, endpoints.out_max_packet, endpoints.out_burst) {
+        crate::println!("USB storage: configuring the bulk endpoints failed ({error:?}).");
+        return None;
+    }
     register(Msc { host: Host::Xhci { controller: controller_index, device }, endpoints, tag: 0, identity: [0; 36], blocks: 0, stale: false }, "USB xHCI")
 }
 
@@ -393,7 +396,10 @@ fn register(mut msc: Msc, origin: &str) -> Option<usize> {
         crate::println!("USB storage: the device never became ready.");
         return None;
     }
-    let (blocks, block_size) = msc.read_capacity().ok()?;
+    let Ok((blocks, block_size)) = msc.read_capacity() else {
+        crate::println!("USB storage: READ CAPACITY failed.");
+        return None;
+    };
     if block_size != 512 {
         crate::println!("USB storage: {block_size}-byte blocks are not supported (512 only).");
         return None;

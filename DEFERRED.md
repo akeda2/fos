@@ -436,8 +436,14 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - **Not needed yet**: recordings go to exFAT, so 64 entries hold the tapes and config files. Revisit when about 50 are used, or when anything writes many files to FOSFS. Sub-directories are a separate, larger job (path syntax clashes with `diskN/NAME` and `@LABEL/NAME`; new ABI calls; a v4 format).
 - **`tapesync`** is done (2026-10-12, `docs/design.md`); it checks for free directory entries before pulling. Open: only the boot volume and stamped tapes; not tested on real hardware; the stamp is per build, so every commit makes every tape "newer" (a per-tape content stamp would avoid needless pulls).
 
-## clock1: boot disk not recognised (2026-10-12, to investigate)
+## clock1: boot disk not recognised (2026-10-12, fix written, needs a reflash to verify)
 
-- New PTP clock machine `clock1`. It boots from an xHCI port (the loader finds the kernel), but the kernel does not find its own boot disk at start: at the shell there is no `disk1`. After `usb rescan` the disk appears as `disk1` and mounts, but it is not recognised as the boot disk (the payload-partition GUID lookup that makes `disk1` the boot disk, and the slot metadata/config files such as `start`, `hostname`, `settings`, `debug`, apparently were not used at boot).
-- Start with: `dmesg` and `debug slots` on clock1 (does it say why the slot metadata cannot be read?), `usb` output before and after the rescan, and whether the stick/SSD enumerates late (xHCI port power-up or a USB 3 device that needs more time than boot waits) so the boot-disk search runs before it exists. A fix probably means retrying the boot-disk search after USB enumeration settles (or after `usb rescan`).
-- Not yet investigated: board, USB controller IDs (`pci`) and what kind of disk it is.
+- clock1 (xHCI NEC 1033:0194 at 02:00.0, a Kingston USB 3 stick as boot disk) booted from the stick, but the kernel found no disk at boot
+  ("Storage: no disks found", no `USB storage` line, no error), so `disk1` was not the boot disk and no config file was read.
+  `usb rescan` then attached the stick, but the boot-disk search only ran at boot. KUP cannot reach such a machine either (no payload located),
+  so it needs the stick reflashed once.
+- Fix: `storage::locate_boot_disk` is the boot-disk search split out of `storage::init`; `main` retries it every 0.5 s for up to 10 s (re-probing USB)
+  when USB is present and the boot disk is missing, and `usb rescan` runs it too (then `start` runs the start script). The silent failure paths in
+  `usb_storage` (endpoint configuration, READ CAPACITY) now print.
+- Still unknown: why the stick was missing at boot (a SuperSpeed link that trains after the xHCI reset is the guess). After the reflash `dmesg`
+  should show "Boot disk not found yet", the late `USB storage` line and the boot disk found by the retry.

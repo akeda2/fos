@@ -111,8 +111,14 @@ fn trimmed(model: &[u8]) -> &str {
     core::str::from_utf8(model).unwrap_or("?").trim()
 }
 
+/// What the loader said about the payload partition it booted from: GUID, first sector, size.
+static mut PAYLOAD_IDENTITY: Option<([u8; 16], u64, u64)> = None;
+
 pub fn init(info: &BootInfo) {
-    unsafe { BOOT_SLOT = info.boot_slot };
+    unsafe {
+        BOOT_SLOT = info.boot_slot;
+        PAYLOAD_IDENTITY = Some((info.payload_guid, info.payload_start, info.payload_sectors));
+    }
     let sata = ahci::init_all(|drive, controller, port| {
         let origin = format_origin("SATA", controller, Some(port));
         block::register(Backend::Ahci(drive), drive.sectors, drive.model, origin.as_str());
@@ -123,7 +129,21 @@ pub fn init(info: &BootInfo) {
     });
     if block::count() == 0 {
         crate::println!("Storage: no disks found by the drivers this kernel has ({sata} SATA, {nvme} NVMe).");
-        return;
+    }
+    locate_boot_disk(true);
+}
+
+/// Finds the boot disk among the registered disks, makes it disk1 and mounts its FOSFS volume. Returns true when the boot
+/// disk is known (also when it was found earlier). Called at boot, again from the retry in `main` and from `usb rescan`: a
+/// USB disk on some controllers is not ready when the first scan runs. `report` says what is missing; a quiet retry stays
+/// silent about a boot disk that is still not there.
+pub fn locate_boot_disk(report: bool) -> bool {
+    if boot_disk().is_some() {
+        return true;
+    }
+    let Some((guid, start, sectors)) = (unsafe { *core::ptr::addr_of!(PAYLOAD_IDENTITY) }) else { return false };
+    if block::count() == 0 {
+        return false;
     }
 
     // The boot disk is the one holding the payload partition the loader read. It becomes
@@ -131,15 +151,17 @@ pub fn init(info: &BootInfo) {
     // disk this system started from".
     let mut found = None;
     for index in 0..block::count() {
-        let hit = gpt::find(index, &PAYLOAD_TYPE_GUID, |p| p.unique_guid == info.payload_guid && p.start == info.payload_start && p.sectors == info.payload_sectors);
+        let hit = gpt::find(index, &PAYLOAD_TYPE_GUID, |p| p.unique_guid == guid && p.start == start && p.sectors == sectors);
         if hit.is_some() {
             found = Some(index);
             break;
         }
     }
+    if found.is_none() && !report {
+        return false;
+    }
     let found = found.map(|index| {
-        let moved = index != 0;
-        if moved {
+        if index != 0 {
             crate::println!("The boot disk was found as driver disk {}; renumbering it to disk1 (the others keep their order behind it).", index + 1);
         }
         block::move_to_front(index)
@@ -156,13 +178,14 @@ pub fn init(info: &BootInfo) {
     }
     let Some(disk) = found else {
         crate::println!("Boot disk: not found among the disks above (the payload partition GUID matches none); no FOSFS.");
-        return;
+        return false;
     };
     crate::println!("Boot disk: disk{} (its GPT holds the payload partition the loader booted from).", disk + 1);
     unsafe {
         BOOT_DISK = Some(disk);
-        PAYLOAD_START = Some(info.payload_start);
+        PAYLOAD_START = Some(start);
     }
+    crate::debug::set_payload(disk, start);
     match gpt::find(disk, &FOSFS_TYPE_GUID, |_| true) {
         Some(partition) => match Volume::mount(disk, partition.start, partition.sectors) {
             Ok(volume) => {
@@ -176,6 +199,7 @@ pub fn init(info: &BootInfo) {
         },
         None => crate::println!("FOSFS: no FOSFS data partition on the boot disk."),
     }
+    true
 }
 
 /// "SATA c:p" or "NVMe c" without allocating.

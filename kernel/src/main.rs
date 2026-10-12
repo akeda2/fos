@@ -293,8 +293,20 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
 
     // ---- storage: find the boot disk by its partition GUID, mount FOSFS ----
     storage::init(info);
-    if let Some(disk) = storage::boot_disk() {
-        debug::set_payload(disk, info.payload_start);
+    // A USB disk can be slow to appear (a SuperSpeed link retraining after the controller reset, a flash drive spinning up):
+    // with USB present and no boot disk yet, look again for a few seconds before carrying on without it.
+    if storage::boot_disk().is_none() && controllers + ehci_controllers + ohci_controllers > 0 {
+        println!("Boot disk not found yet; USB disks can be slow to appear. Looking again (up to 10 s).");
+        for _ in 0..20 {
+            apic::wait_ticks(50);
+            usb_hid::probe_all();
+            if storage::locate_boot_disk(false) {
+                break;
+            }
+        }
+        if storage::boot_disk().is_none() {
+            println!("Boot disk: still not found (`usb rescan` looks again).");
+        }
     }
     debug::report_previous_crash();
 

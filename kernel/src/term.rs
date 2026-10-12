@@ -1557,6 +1557,9 @@ fn execute(command: &str) {
             if sub == Some("rescan") {
                 let added = crate::usb_hid::probe_all();
                 crate::println!("{added} new device(s) (keyboards or disks).");
+                if crate::storage::boot_disk().is_none() && crate::storage::locate_boot_disk(false) {
+                    crate::println!("The boot disk turned up late: `start` runs its start script (hostname, settings and debug files load at boot only).");
+                }
             } else if sub == Some("abort-test") {
                 // A hidden test hook: see `Controller::abort_self_test`.
                 match crate::xhci::controller(0) {

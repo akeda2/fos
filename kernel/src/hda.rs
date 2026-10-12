@@ -1084,7 +1084,6 @@ impl Hda {
         }
         self.configure_path(&path, capture);
 
-        let regs = self.regs;
         let was = cpu::interrupts_save_and_disable();
         let stream = self.stream(capture);
         stream.index = index;
