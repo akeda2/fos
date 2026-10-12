@@ -421,3 +421,11 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 
 - Use `tape_ip::dns::lookup` in the `telnet` and `ip-chat` (`to=NAME`) tapes; today only `ptp` and `fterm` resolve names.
 - Caching, TCP fallback on truncation, a second server, AAAA, and a `nslookup`-style shell command or tape.
+
+## Open after the fterm/DNS session (2026-10-12)
+
+- **A blocked `start` file looks like a hung machine.** skylake3's `start` runs `ptp l2 settime`; with the master down it held the shell (no NETFS, no `term net` output, `help fterm` seemed to hang). `settime` now gives up after 60 s; use `secs=20` in start files. The earlier xHCI command timeout on `help fterm` is not explained and was not reproduced.
+- amd1's `start` begins with `ptp settime`, which waits for a master that does not exist there: drop it or add `secs=`.
+- A lone ESC over `term net` did not stop the start-file `ptp` on skylake3 (it worked on amd1 and laptop1): find out why.
+- fterm: the settings panel is a fixed 80-column layout (only the Telnet window size and the machine list follow `console_size`); the Telnet NAWS value has no test.
+- DNS: see the DNS session section above.
