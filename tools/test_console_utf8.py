@@ -45,6 +45,14 @@ def cells_with(shot, glyph):
     return found
 
 
+def columns_with(shot, glyph):
+    """The text columns of the screendump holding `glyph`."""
+    width, height, pixel = read_ppm(shot)
+    return {column for row in range(height // 16) for column in range(width // 8)
+            if all(((pixel(column * 8 + bit, row * 16 + line) == FOREGROUND) == bool(glyph[line] & (0x80 >> bit)))
+                   for line in range(16) for bit in range(8))}
+
+
 def main():
     code, variables = find("FOS_OVMF_CODE", CODE_CANDIDATES), find("FOS_OVMF_VARS", VARS_CANDIDATES)
     glyphs = font()
@@ -54,7 +62,9 @@ def main():
         shutil.copy(IMAGE, image)
         vars_copy = tmp / "vars.fd"
         shutil.copy(variables, vars_copy)
-        (tmp / "u.txt").write_text(TEXT + "\n", encoding="utf-8")
+        # Escape sequences the console does not draw (a window title, DEC private mode, a character set, a CSI colour) must be
+        # swallowed whole; 'Z' appears nowhere else on the screen and the 80 digits would show.
+        (tmp / "u.txt").write_text("\x1b]0;ZZZ\x07\x1b[?" + "8" * 40 + "h\x1b(B\x1b[>" + "8" * 40 + "c\x1b]0;ZZZ\x1b\\\t" + TEXT + "\n", encoding="utf-8")
         second = tmp / "second.img"
         subprocess.run([sys.executable, str(ROOT / "tools/build_image.py"), "--loader", str(LOADER), "--kernel", str(KERNEL),
                         "--output", str(second), "--label", "utf8", "--payload-guid", "f05b2a00-0000-4f05-8000-0000000000aa",
@@ -112,7 +122,11 @@ def main():
                 glyph = glyphs[code_point]
                 check(cells_with(before, glyph) == 0 and cells_with(after, glyph) > 0,
                       f"'{character}' is drawn with glyph 0x{code_point:02x}", "")
+            check(columns_with(after, glyphs[LATIN9[0]]) == {8}, "a tab moves to the next multiple of 8 columns", "")
             check(cells_with(after, glyphs[ord("?")]) == 0, "and none of it is drawn as '?'", "")
+            check(cells_with(after, glyphs[ord("Z")]) == 0
+                  and cells_with(after, glyphs[ord("8")]) < cells_with(before, glyphs[ord("8")]) + 20,
+                  "OSC, private CSI and charset sequences are swallowed, not printed", "")
         finally:
             qemu.kill()
             qemu.wait()

@@ -10,7 +10,8 @@
 //! its IRQ 1 is routed through the I/O APIC to `KEYBOARD_VECTOR`.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use fosfor_abi::keymap::Set1Decoder;
+use core::sync::atomic::AtomicBool;
+use fosfor_abi::keymap::{Layout, Set1Decoder};
 
 use crate::{cpu, ioapic};
 
@@ -27,6 +28,26 @@ static HEAD: AtomicUsize = AtomicUsize::new(0); // next slot to write (interrupt
 static TAIL: AtomicUsize = AtomicUsize::new(0); // next slot to read (main loop)
 static mut DECODER: Set1Decoder = Set1Decoder::new();
 static mut BYTES_SEEN: u64 = 0;
+static SWEDISH: AtomicBool = AtomicBool::new(false);
+
+/// Chooses what the keys type (`keymap sv|us`, the `settings` file). US until told otherwise: the layout is a property of the
+/// keyboard in front of the machine, which the kernel cannot see.
+pub fn set_layout(layout: Layout) {
+    SWEDISH.store(layout == Layout::Swedish, Ordering::Relaxed);
+}
+
+/// The layout a `keymap` word names.
+pub fn layout_named(name: &str) -> Option<Layout> {
+    match name {
+        "us" => Some(Layout::Us),
+        "sv" | "se" | "fi" => Some(Layout::Swedish),
+        _ => None,
+    }
+}
+
+pub fn layout() -> Layout {
+    if SWEDISH.load(Ordering::Relaxed) { Layout::Swedish } else { Layout::Us }
+}
 
 /// Adds a key to the queue (called from interrupt context and by other key sources).
 pub fn push(byte: u8) {
@@ -125,7 +146,7 @@ pub fn interrupt() {
         let byte = cpu::inb(DATA);
         unsafe {
             BYTES_SEEN += 1;
-            if let Some(key) = (*core::ptr::addr_of_mut!(DECODER)).feed(byte) {
+            if let Some(key) = (*core::ptr::addr_of_mut!(DECODER)).feed_layout(byte, layout()) {
                 push(key);
             }
         }

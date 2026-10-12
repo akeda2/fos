@@ -47,8 +47,7 @@ use telnet_tape::{
     MARKER_ABORTED, MARKER_CONNECTED, MARKER_CONNECTING, MARKER_DISCONNECTED, MAX_FRAME_LEN,
     StartupError, StartupMode, TCP_SEGMENT_CAPACITY, TELNET_BINARY, TELNET_DO, TELNET_IAC,
     TELNET_NAWS, TELNET_SB, TELNET_SE, TELNET_SUPPRESS_GO_AHEAD, TELNET_TERMINAL_NAME,
-    TELNET_TERMINAL_TYPE, TELNET_TTYPE_IS, TELNET_TTYPE_SEND, TELNET_WILL, TELNET_WINDOW_HEIGHT,
-    TELNET_WINDOW_WIDTH, TelnetConfig, TelnetEvent, TelnetParser, build_tcp_frame,
+    TELNET_TERMINAL_TYPE, TELNET_TTYPE_IS, TELNET_TTYPE_SEND, TELNET_WILL, TelnetConfig, TelnetEvent, TelnetParser, build_tcp_frame,
     encode_application, parse_startup, same_subnet,
 };
 
@@ -707,15 +706,13 @@ fn queue_subnegotiation(queue: &mut ByteQueue<MAX_INPUT_QUEUE>, option: u8, data
 }
 
 fn queue_naws(queue: &mut ByteQueue<MAX_INPUT_QUEUE>) -> bool {
+    // The real console grid (80x25 from an older kernel), so the server lays `ls` and full-screen programs out for all of it.
+    let (columns, rows) = tape_rt::console_size();
+    let (width, height) = (columns as u16, rows as u16);
     queue_subnegotiation(
         queue,
         TELNET_NAWS,
-        &[
-            (TELNET_WINDOW_WIDTH >> 8) as u8,
-            TELNET_WINDOW_WIDTH as u8,
-            (TELNET_WINDOW_HEIGHT >> 8) as u8,
-            TELNET_WINDOW_HEIGHT as u8,
-        ],
+        &[(width >> 8) as u8, width as u8, (height >> 8) as u8, height as u8],
     )
 }
 

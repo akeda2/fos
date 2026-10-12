@@ -936,6 +936,11 @@ A bare `run fterm` (or `run fterm ui`) shows a settings panel like audio-net's a
 Tab select, Space/Backspace/Enter change, Left/Right too. A session returns to the panel. Over the console UART a raw ESC reads as abort, so arrow
 keys only work from the keyboard and `term net`; that is why Space/Backspace exist. `make test-fterm-ui`.
 
+**Keyboard layout.** The local keyboard (PS/2 and USB HID) decodes as US by default. `keymap sv` (also `se`, `fi`) in the shell, or a `keymap sv` line in
+`settings`, selects Swedish/Finnish: å ä ö (and Å Ä Ö) on the keys right of P and L, the symbols moved, AltGr for `@ $ { [ ] } \ | ~` and the euro sign;
+dead keys type their plain character. `abi/src/keymap.rs` holds the tables; å ä ö travel as private codes 0x90-0x96 and `tape_service` expands them to
+UTF-8 for tapes (fterm sends them on to Telnet/serial). The shell and file names stay ASCII. `make test-keymap`.
+
 **Serial shell.** `serial-shell [PORT] [BAUD]` in `settings` (default: the first listed port, 115200 8n1) puts this machine's shell on that port:
 the kernel's output is mirrored to it (LF as CR LF) and its input is read like the keyboard's (`keyboard::pop` falls back to `uart::shell_read`).
 It is opt-in, so "deny" means not having the line; there is no password, so it is a full shell for whoever holds the cable. A shell port is not

@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8 test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi
 
 all: image tapes
 
@@ -82,6 +82,9 @@ test-console-colors: image
 	python3 tools/test_console_colors.py
 test-console-utf8: image
 	python3 tools/test_console_utf8.py
+# `keymap sv`: å ä ö Å and AltGr symbols from a PS/2 keyboard.
+test-keymap: image
+	python3 tools/test_keymap.py
 
 # Machines announce their names unprompted; audio-net uses the kernel's name and peer table.
 test-hostnames: image

@@ -10,7 +10,7 @@
 //!
 //! Nothing here can stop the boot: every failure is reported and the port skipped.
 
-use fosfor_abi::keymap::hid_ascii;
+use fosfor_abi::keymap::hid_key;
 
 use crate::xhci::{self, Controller, Trb};
 use crate::{ehci, ohci, usb_storage};
@@ -335,7 +335,7 @@ fn decode(keyboard: &mut Keyboard, report: &[u8; 8]) {
         }
         if usage == 0x39 {
             keyboard.caps = !keyboard.caps;
-        } else if let Some(byte) = hid_ascii(usage, modifiers, keyboard.caps) {
+        } else if let Some(byte) = hid_key(usage, modifiers, keyboard.caps, keyboard::layout()) {
             keyboard::push(byte);
         }
     }

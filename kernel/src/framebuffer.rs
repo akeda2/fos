@@ -29,12 +29,15 @@ pub struct Console {
     row: usize,
     foreground: u32,
     background: u32,
-    /// ANSI escape parsing: 0 = none, 1 = after ESC, 2 = inside `ESC [` collecting a number.
+    /// ANSI escape parsing: 0 = none, 1 = after ESC, 2 = inside `ESC [` collecting a number, 3 = inside an OSC/DCS string,
+    /// 4 = ESC seen inside such a string, 5 = after `ESC (` and the like (one byte left to swallow).
     escape: u8,
     parameter: usize,
     /// The parameter before a `;` (`ESC [ row ; column H`), and whether there was one.
     first_parameter: usize,
     has_first: bool,
+    /// The CSI in progress has a private marker (`?`, `>`, `<`, `=`): not ours, swallowed whole.
+    csi_private: bool,
     /// A UTF-8 sequence in progress: the code point so far and how many continuation bytes are still due.
     utf8_code: u32,
     utf8_left: u8,
@@ -184,9 +187,18 @@ impl Console {
     fn put(&mut self, character: u8) {
         match self.escape {
             1 => {
-                self.escape = if character == b'[' { 2 } else { 0 };
                 self.parameter = 0;
                 self.has_first = false;
+                self.csi_private = false;
+                self.escape = match character {
+                    b'[' => 2,
+                    // OSC (window title, shell integration), DCS, SOS, PM, APC: a string up to BEL or ESC \.
+                    b']' | b'P' | b'X' | b'^' | b'_' => 3,
+                    // `ESC ( B` and friends: one more byte names the character set.
+                    0x20..=0x2f => 5,
+                    0x1b => 1,
+                    _ => 0,
+                };
                 return;
             }
             2 => {
@@ -196,11 +208,36 @@ impl Console {
                         (self.first_parameter, self.has_first) = (self.parameter, true);
                         self.parameter = 0;
                     }
+                    b':'..=b'?' => self.csi_private = true,
+                    0x20..=0x2f | 0x00..=0x1a | 0x1c..=0x1f => {}
+                    0x1b => self.escape = 1,
                     last => {
                         self.escape = 0;
-                        self.control_sequence(last);
+                        if !self.csi_private {
+                            self.control_sequence(last);
+                        }
                     }
                 }
+                return;
+            }
+            3 => {
+                match character {
+                    0x07 => self.escape = 0,
+                    0x1b => self.escape = 4,
+                    _ => {}
+                }
+                return;
+            }
+            4 => {
+                // ESC \ ends the string; any other byte after ESC starts a new sequence.
+                self.escape = if character == b'\\' { 0 } else { 1 };
+                if self.escape == 1 {
+                    return self.put(character);
+                }
+                return;
+            }
+            5 => {
+                self.escape = 0;
                 return;
             }
             _ => {}
@@ -212,6 +249,12 @@ impl Console {
             // The shell erases a typed character with "\x08 \x08" (back, blank, back): a serial
             // terminal interprets it, so the grid has to as well.
             0x08 => self.column = self.column.saturating_sub(1),
+            // A tab moves to the next multiple of 8 (what `ls` on a Linux host over telnet relies on for its columns).
+            b'\t' if self.utf8_left == 0 => {
+                for _ in 0..if self.column < self.columns { 8 - self.column % 8 } else { 0 } {
+                    self.put_cell(b' ');
+                }
+            }
             byte => self.put_text_byte(byte),
         }
     }
@@ -238,6 +281,8 @@ impl Console {
             0xe0..=0xef => (self.utf8_code, self.utf8_left) = (u32::from(byte & 0x0f), 2),
             0xf0..=0xf4 => (self.utf8_code, self.utf8_left) = (u32::from(byte & 0x07), 3),
             b'\t' => self.put_cell(b' '),
+            // Other control characters (BEL, SO/SI, NUL after a telnet CR, DEL) draw nothing.
+            0x00..=0x1f | 0x7f => {}
             0x20..=0x7e => self.put_cell(byte),
             _ => self.put_cell(b'?'),
         }
@@ -322,6 +367,7 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
         parameter: 0,
         first_parameter: 0,
         has_first: false,
+        csi_private: false,
         utf8_code: 0,
         utf8_left: 0,
     };
@@ -365,6 +411,7 @@ pub fn init_text() -> bool {
         parameter: 0,
         first_parameter: 0,
         has_first: false,
+        csi_private: false,
         utf8_code: 0,
         utf8_left: 0,
     };

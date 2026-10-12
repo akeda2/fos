@@ -5,6 +5,7 @@
 //!   number, so `lab` becomes `lab1`);
 //! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling;
 //!   `serial-shell [PORT] [BAUD]` puts the shell on a serial port as well (COM2-COM4, numbered as `fterm list` does; off unless asked);
+//!   `keymap us|sv` picks the keyboard layout (US by default; sv is Swedish/Finnish);
 //!   `foreground gray|green|amber|black` and `background black|blue|gray` set the pixel console's colours (not in
 //!   BIOS text mode, which stays grey on black);
 //! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` arms the
@@ -142,6 +143,16 @@ pub fn load() {
                     match crate::uart::open_shell(number, baud) {
                         0 => crate::println!("settings: serial-shell -- the shell is also on serial port {number} at {baud} baud (8n1)."),
                         _ => crate::println!("settings: `{line}` ignored (no such serial port, or bad baud rate; `run fterm list` shows them)."),
+                    }
+                }
+                Some("keymap") => {
+                    let name = line.split_whitespace().nth(1).unwrap_or("");
+                    match crate::keyboard::layout_named(name) {
+                        Some(layout) => {
+                            crate::keyboard::set_layout(layout);
+                            crate::println!("settings: keymap {name}.");
+                        }
+                        None => crate::println!("settings: `{line}` ignored (keymap us or sv)."),
                     }
                 }
                 Some("prefer-msix") => unsafe { PREFER_MSIX = true },

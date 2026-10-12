@@ -17,6 +17,42 @@ pub const KEY_INSERT: u8 = 0x88;
 pub const KEY_PAGE_UP: u8 = 0x89;
 pub const KEY_PAGE_DOWN: u8 = 0x8a;
 
+/// Private codes for the letters a Nordic layout adds. Not plain UTF-8 bytes: the second byte of å ä ö Å Ä Ö (0xa5 0xa4 0xb6
+/// 0x85 0x84 0x96) would collide with the cursor codes above. A running tape gets them expanded to UTF-8 (`utf8_sequence`); the
+/// shell, whose input is ASCII, ignores them like every code >= 0x80.
+pub const KEY_ARING: u8 = 0x90;
+pub const KEY_AUML: u8 = 0x91;
+pub const KEY_OUML: u8 = 0x92;
+pub const KEY_ARING_UPPER: u8 = 0x93;
+pub const KEY_AUML_UPPER: u8 = 0x94;
+pub const KEY_OUML_UPPER: u8 = 0x95;
+pub const KEY_EURO: u8 = 0x96;
+
+/// The UTF-8 bytes a tape receives for one of the letter codes above.
+pub fn utf8_sequence(code: u8) -> Option<&'static [u8]> {
+    Some(match code {
+        KEY_ARING => "å".as_bytes(),
+        KEY_AUML => "ä".as_bytes(),
+        KEY_OUML => "ö".as_bytes(),
+        KEY_ARING_UPPER => "Å".as_bytes(),
+        KEY_AUML_UPPER => "Ä".as_bytes(),
+        KEY_OUML_UPPER => "Ö".as_bytes(),
+        KEY_EURO => "€".as_bytes(),
+        _ => return None,
+    })
+}
+
+/// Which physical-key-to-character table is used. The scancodes and usages name *keys*; the layout says what is printed on them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Layout {
+    #[default]
+    Us,
+    /// Swedish (Finnish is the same): å ä ö on the keys right of P and L, the symbols moved, AltGr for `@ $ { [ ] } \ ~ |` and the
+    /// euro sign. The dead keys (´ ¨ ^ ~ and ` as accents) type their plain character instead, or nothing; § ½ ¤ £ are not
+    /// produced (the console is ASCII plus the letters above).
+    Swedish,
+}
+
 /// The bytes after `ESC [` that a terminal sends for one of the private key codes above.
 pub fn ansi_sequence(code: u8) -> Option<&'static [u8]> {
     Some(match code {
@@ -64,6 +100,65 @@ fn finish(plain: u8, shifted: u8, shift: bool, ctrl: bool, caps: bool) -> Option
     Some(byte)
 }
 
+/// The Swedish layout's answer for a HID usage: `None` when the US table applies, `Some(None)` when the key types nothing, else the
+/// byte or private code. Only the keys that differ are here.
+fn swedish(usage: u8, shift: bool, altgr: bool, caps: bool) -> Option<Option<u8>> {
+    let letter = |lower: u8, upper: u8| Some(Some(if shift != caps { upper } else { lower }));
+    let pick = |plain: u8, shifted: u8, third: u8| {
+        Some(match (altgr, shift) {
+            (true, _) if third != 0 => Some(third),
+            (true, _) => None,
+            (false, true) => (shifted != 0).then_some(shifted),
+            (false, false) => (plain != 0).then_some(plain),
+        })
+    };
+    match usage {
+        0x1e => pick(b'1', b'!', 0),
+        0x1f => pick(b'2', b'"', b'@'),
+        0x20 => pick(b'3', b'#', 0),
+        0x21 => pick(b'4', 0, b'$'),
+        0x22 => pick(b'5', b'%', KEY_EURO),
+        0x23 => pick(b'6', b'&', 0),
+        0x24 => pick(b'7', b'/', b'{'),
+        0x25 => pick(b'8', b'(', b'['),
+        0x26 => pick(b'9', b')', b']'),
+        0x27 => pick(b'0', b'=', b'}'),
+        0x2d => pick(b'+', b'?', b'\\'),
+        0x2e => pick(0, b'`', 0),
+        0x2f => letter(KEY_ARING, KEY_ARING_UPPER),
+        0x30 => pick(0, b'^', b'~'),
+        0x31 | 0x32 => pick(b'\'', b'*', 0),
+        0x33 => letter(KEY_OUML, KEY_OUML_UPPER),
+        0x34 => letter(KEY_AUML, KEY_AUML_UPPER),
+        0x35 => Some(None),
+        0x36 => pick(b',', b';', 0),
+        0x37 => pick(b'.', b':', 0),
+        0x38 => pick(b'-', b'_', 0),
+        0x64 => pick(b'<', b'>', b'|'),
+        _ => None,
+    }
+}
+
+/// The HID usage of the key a set-1 scancode names, for the keys the Swedish layout changes.
+fn set1_usage(code: u8) -> u8 {
+    match code {
+        0x02..=0x0b => 0x1e + (code - 0x02),
+        0x0c => 0x2d,
+        0x0d => 0x2e,
+        0x1a => 0x2f,
+        0x1b => 0x30,
+        0x2b => 0x31,
+        0x27 => 0x33,
+        0x28 => 0x34,
+        0x29 => 0x35,
+        0x33 => 0x36,
+        0x34 => 0x37,
+        0x35 => 0x38,
+        0x56 => 0x64,
+        _ => 0,
+    }
+}
+
 /// A PS/2 set-1 decoder: feed it the raw bytes from port 0x60.
 #[derive(Default)]
 pub struct Set1Decoder {
@@ -71,17 +166,23 @@ pub struct Set1Decoder {
     left_shift: bool,
     right_shift: bool,
     ctrl: bool,
+    altgr: bool,
     caps: bool,
 }
 
 impl Set1Decoder {
     pub const fn new() -> Self {
-        Set1Decoder { extended: false, left_shift: false, right_shift: false, ctrl: false, caps: false }
+        Set1Decoder { extended: false, left_shift: false, right_shift: false, ctrl: false, altgr: false, caps: false }
     }
 
     /// Returns the ASCII byte a key press produces, if any. Releases, modifiers,
     /// extended keys (arrows, keypad Enter...) and controller replies produce none.
     pub fn feed(&mut self, byte: u8) -> Option<u8> {
+        self.feed_layout(byte, Layout::Us)
+    }
+
+    /// `feed` for a keyboard layout.
+    pub fn feed_layout(&mut self, byte: u8, layout: Layout) -> Option<u8> {
         if byte == 0xe0 || byte == 0xe1 {
             self.extended = true;
             return None;
@@ -92,6 +193,7 @@ impl Set1Decoder {
         match code {
             0x2a if !extended => self.left_shift = !released,
             0x36 if !extended => self.right_shift = !released,
+            0x38 if extended => self.altgr = !released, // the right Alt key
             0x1d => self.ctrl = !released, // either Ctrl key (the extended one is right Ctrl)
             0x3a if !extended && !released => self.caps = !self.caps,
             _ => {}
@@ -123,6 +225,11 @@ impl Set1Decoder {
         if released || extended || code as usize >= SET1_PLAIN.len() || byte == 0xfa || byte == 0xfe || byte == 0xaa {
             return None;
         }
+        if layout == Layout::Swedish && !self.ctrl {
+            if let Some(key) = swedish(set1_usage(code), self.left_shift || self.right_shift, self.altgr, self.caps) {
+                return key;
+            }
+        }
         finish(SET1_PLAIN[code as usize], SET1_SHIFT[code as usize], self.left_shift || self.right_shift, self.ctrl, self.caps)
     }
 }
@@ -130,6 +237,11 @@ impl Set1Decoder {
 /// ASCII for a HID keyboard usage (usage page 0x07) with the given modifiers.
 /// `modifiers` is the boot report's modifier byte (bit 0/4 Ctrl, bit 1/5 Shift).
 pub fn hid_ascii(usage: u8, modifiers: u8, caps: bool) -> Option<u8> {
+    hid_key(usage, modifiers, caps, Layout::Us)
+}
+
+/// `hid_ascii` for a keyboard layout (modifier bit 6 is the right Alt, AltGr).
+pub fn hid_key(usage: u8, modifiers: u8, caps: bool, layout: Layout) -> Option<u8> {
     // HID usages of F4, F6, F7, F8, F10, F12: the "give up" keys, acting as Escape.
     if matches!(usage, 0x3d | 0x3f | 0x40 | 0x41 | 0x43 | 0x45) {
         return Some(0x1b);
@@ -146,6 +258,11 @@ pub fn hid_ascii(usage: u8, modifiers: u8, caps: bool) -> Option<u8> {
         0x51 => return Some(KEY_DOWN),
         0x52 => return Some(KEY_UP),
         _ => {}
+    }
+    if layout == Layout::Swedish && modifiers & 0x11 == 0 {
+        if let Some(key) = swedish(usage, modifiers & 0x22 != 0, modifiers & 0x40 != 0, caps) {
+            return key;
+        }
     }
     let index = usize::from(usage.checked_sub(4)?);
     if index >= HID_PLAIN.len() {
@@ -211,5 +328,36 @@ mod tests {
         assert_eq!(hid_ascii(0x00, 0, false), None);
         assert_eq!(hid_ascii(0x50, 0, false), Some(KEY_LEFT));
         assert_eq!(hid_ascii(0x4c, 0, false), Some(KEY_DELETE));
+    }
+
+    #[test]
+    fn swedish_hid() {
+        let sv = |usage, modifiers, caps| hid_key(usage, modifiers, caps, Layout::Swedish);
+        assert_eq!(sv(0x2f, 0, false), Some(KEY_ARING));
+        assert_eq!(sv(0x2f, 0x02, false), Some(KEY_ARING_UPPER));
+        assert_eq!(sv(0x34, 0, true), Some(KEY_AUML_UPPER)); // caps lock
+        assert_eq!(sv(0x33, 0, false), Some(KEY_OUML));
+        assert_eq!(sv(0x1f, 0x02, false), Some(b'"'));
+        assert_eq!(sv(0x1f, 0x40, false), Some(b'@'));
+        assert_eq!(sv(0x24, 0x40, false), Some(b'{'));
+        assert_eq!(sv(0x24, 0x02, false), Some(b'/'));
+        assert_eq!(sv(0x2d, 0x40, false), Some(b'\\'));
+        assert_eq!(sv(0x38, 0, false), Some(b'-'));
+        assert_eq!(sv(0x64, 0x40, false), Some(b'|'));
+        assert_eq!(sv(0x2e, 0, false), None); // dead acute
+        assert_eq!(sv(0x04, 0, false), Some(b'a')); // letters as before
+        assert_eq!(hid_ascii(0x2f, 0, false), Some(b'[')); // the US layout is untouched
+        assert_eq!(utf8_sequence(KEY_AUML), Some("ä".as_bytes()));
+    }
+
+    #[test]
+    fn swedish_set1() {
+        let mut decoder = Set1Decoder::new();
+        let mut type_sv = |bytes: &[u8]| bytes.iter().filter_map(|&byte| decoder.feed_layout(byte, Layout::Swedish)).collect::<Vec<u8>>();
+        assert_eq!(type_sv(&[0x1a, 0x9a, 0x28, 0xa8, 0x27, 0xa7]), &[KEY_ARING, KEY_AUML, KEY_OUML]);
+        assert_eq!(type_sv(&[0x2a, 0x28, 0xa8, 0xaa]), &[KEY_AUML_UPPER]);
+        // AltGr (extended right Alt) + 7 is `{`; released, 7 is a digit again.
+        assert_eq!(type_sv(&[0xe0, 0x38, 0x08, 0x88, 0xe0, 0xb8, 0x08]), &[b'{', b'7']);
+        assert_eq!(type_sv(&[0x35, 0xb5]), b"-");
     }
 }

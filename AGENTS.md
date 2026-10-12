@@ -164,7 +164,7 @@ too-small or over-256-GiB devices and makes the user type the device name back; 
 yourself or suggest bare `dd` first; give the user the command.
 
 Per-machine config files on FOSFS: `start` (boot script; the `start` command reruns it), `hostname`, `settings`
-(`no-msi`, `deny-term-net`, `serial-shell [PORT] [BAUD]`: the shell also on a serial port, no password, see docs/design.md), `debug` (`reboot-on-crash`, `reboot-delay N`,
+(`no-msi`, `deny-term-net`, `keymap sv` (Swedish/Finnish local keyboard, default US; docs/design.md), `serial-shell [PORT] [BAUD]`: the shell also on a serial port, no password, see docs/design.md), `debug` (`reboot-on-crash`, `reboot-delay N`,
 `kernel-update`, `watchdog [N]`, `crash-on-boot`; `tools/default-debug.txt` is installed
 by default). A fatal exception writes a crash record (read and printed by the next
 boot) and, with `reboot-on-crash`, resets; five pre-milestone crashes in a row stop the

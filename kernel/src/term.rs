@@ -924,6 +924,11 @@ fn tape_service() {
             for &byte in sequence {
                 tape_input_push(u16::from(byte));
             }
+        } else if let Some(sequence) = fosfor_abi::keymap::utf8_sequence(key) {
+            // å ä ö (and the euro sign) from a Nordic layout: the tape reads UTF-8, like `term net` sends it.
+            for &byte in sequence {
+                tape_input_push(u16::from(byte));
+            }
         } else {
             tape_input_push(u16::from(key));
         }
@@ -1277,6 +1282,7 @@ fn execute(command: &str) {
             crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");
             crate::println!("run NAME [ARGS]   load a tape from FOSFS and run it");
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
+            crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
             crate::println!("uptime    time since the timer started; sleep N waits N seconds");
             crate::println!("dmesg     the boot log");
             crate::println!("shutdown  power off");
@@ -1580,6 +1586,16 @@ fn execute(command: &str) {
             }
             crate::println!("Slept {seconds} s.");
         }
+        "keymap" => match words.next() {
+            None => crate::println!("keymap: {} (keymap us|sv changes it).", if crate::keyboard::layout() == fosfor_abi::keymap::Layout::Us { "us" } else { "sv" }),
+            Some(name) => match crate::keyboard::layout_named(name) {
+                Some(layout) => {
+                    crate::keyboard::set_layout(layout);
+                    crate::println!("keymap: {name}.");
+                }
+                None => crate::println!("keymap: unknown layout `{name}` (us or sv)."),
+            },
+        },
         "uptime" => {
             let ticks = apic::ticks();
             crate::println!("{} ticks at {} Hz ({} s); spurious legacy-PIC interrupts: {}", ticks, apic::TICK_HZ, ticks / apic::TICK_HZ, apic::legacy_pic_interrupts());
