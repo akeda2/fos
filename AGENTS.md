@@ -158,6 +158,11 @@ through its documented load/run path**; a green build is not validation. Editing
 
 ## Debug mode, KUP, real hardware
 
+**Flashing a stick** (a machine with no working NIC yet cannot take KUP): the user runs
+`sudo python3 tools/write_stick.py /dev/sdX` (image defaults to `build/fosfor/fosfor.img`). It refuses mounted, non-removable,
+too-small or over-256-GiB devices and makes the user type the device name back; it never picks a device. Never run it
+yourself or suggest bare `dd` first; give the user the command.
+
 Per-machine config files on FOSFS: `start` (boot script; the `start` command reruns it), `hostname`, `settings`
 (`no-msi`, `deny-term-net`, `serial-shell [PORT] [BAUD]`: the shell also on a serial port, no password, see docs/design.md), `debug` (`reboot-on-crash`, `reboot-delay N`,
 `kernel-update`, `watchdog [N]`, `crash-on-boot`; `tools/default-debug.txt` is installed

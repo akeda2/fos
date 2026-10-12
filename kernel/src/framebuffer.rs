@@ -46,6 +46,9 @@ static mut CELLS: [u8; MAX_CELLS] = [b' '; MAX_CELLS];
 /// What is currently drawn on screen, cell by cell.
 static mut PAINTED: [u8; MAX_CELLS] = [b' '; MAX_CELLS];
 
+/// The cell index the pixel console's caret is drawn in (`usize::MAX`: none yet).
+static mut CARET_AT: usize = usize::MAX;
+
 static mut CONSOLE: Option<Console> = None;
 
 impl Console {
@@ -112,6 +115,17 @@ impl Console {
                 }
             }
         }
+        // The caret: an underline in the cell the next character goes to. A cell the loop above just redrew has lost
+        // it, and a cell the caret left must be restored, so the old cell is redrawn and the caret drawn afresh each time.
+        let at = self.row.min(self.rows - 1) * columns + self.column.min(columns - 1);
+        let old = unsafe { CARET_AT };
+        if old != at && old < self.rows * columns {
+            self.draw_glyph(unsafe { CELLS[old] }, old % columns, old / columns);
+        }
+        let (x, y) = ((at % columns) * FONT_WIDTH, (at / columns) * FONT_HEIGHT);
+        let value = self.foreground;
+        self.fill(x, y + FONT_HEIGHT - 2, FONT_WIDTH, 2, value);
+        unsafe { CARET_AT = at };
     }
 
     /// The text-mode paint: a cell is a 16-bit word, character in the low byte and colours in the high byte, and the hardware
