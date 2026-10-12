@@ -992,16 +992,33 @@ impl Hda {
                 return Err("the device does not offer that sample rate");
             }
         }
-        if want_capture {
-            self.build_stream(true, rate_bit)?;
-        }
-        if want_playback {
-            if let Err(reason) = self.build_stream(false, rate_bit) {
-                self.stop();
-                return Err(reason);
+        // The first start after a quiet spell can leave the DMA engine stalled on real hardware (an Intel 6 series PCH,
+        // 8086:1c20: RUN set, LPIB stays 0, no buffer ever completes, so playback is never drained); stopping the streams
+        // and starting them again works. Up to three attempts; the last one is kept whatever it does.
+        for attempt in 1..=3 {
+            if want_capture {
+                self.build_stream(true, rate_bit)?;
             }
+            if want_playback {
+                if let Err(reason) = self.build_stream(false, rate_bit) {
+                    self.stop();
+                    return Err(reason);
+                }
+            }
+            if attempt == 3 || self.streams_moving() {
+                break;
+            }
+            self.stop();
         }
         Ok(())
+    }
+
+    /// True once every running stream's link position has left 0 (within 20 ms: a period is 10 ms).
+    fn streams_moving(&self) -> bool {
+        [&self.playback, &self.capture].iter().filter(|stream| stream.active.load(Ordering::Acquire)).all(|stream| {
+            let registers = self.stream_registers(stream.index);
+            wait_until(20_000, || read32(registers, SD_LPIB) != 0)
+        })
     }
 
     fn build_stream(&mut self, capture: bool, rate_bit: usize) -> Result<(), &'static str> {
@@ -1092,7 +1109,7 @@ impl Hda {
         stream.path = path;
         stream.active.store(true, Ordering::Release);
         self.update_interrupt_control();
-        write32(regs + SD_BASE + SD_STRIDE * u64::from(index), SD_CTL, (u32::from(tag) << SD_CTL_TAG_SHIFT) | SD_CTL_IOCE | SD_CTL_RUN);
+        write32(registers, SD_CTL, (u32::from(tag) << SD_CTL_TAG_SHIFT) | SD_CTL_IOCE | SD_CTL_RUN);
         cpu::interrupts_restore(was);
         Ok(())
     }
@@ -1563,6 +1580,33 @@ pub fn status(index: usize) {
                 stream.underruns.load(Ordering::Relaxed),
                 stream.pcm.available(),
                 stream.pcm.overruns.load(Ordering::Relaxed)
+            );
+            // The hardware's view, for a stream that makes no progress: control (RUN is bit 1), status, link position
+            // (LPIB), the position buffer's entry, and the controller's interrupt control and status.
+            let registers = hda.stream_registers(stream.index);
+            let entry = if hda.position_buffer == 0 { 0 } else { unsafe { ((hda.position_buffer + 8 * u64::from(stream.index)) as *const u32).read_volatile() } };
+            crate::println!(
+                "    SD{} ctl {:#08x} sts {:#04x} lpib {} dpib {} | intctl {:#010x} intsts {:#010x}",
+                stream.index,
+                read32(registers, SD_CTL) & 0xff_ffff,
+                read8(registers, SD_STS),
+                read32(registers, SD_LPIB),
+                entry,
+                read32(hda.regs, REG_INTCTL),
+                read32(hda.regs, REG_INTSTS)
+            );
+            crate::println!(
+                "    gctl {:#x} wallclk {} pci cmd {:#x} cbl {} lvi {} fifos {} fmt {:#x} bdl {:#x}/{:#x} dpl {:#x}",
+                read32(hda.regs, REG_GCTL),
+                read32(hda.regs, 0x30),
+                hda.pci.read32(4) & 0xffff,
+                read32(registers, SD_CBL),
+                read16(registers, SD_LVI),
+                read16(registers, 0x10),
+                read16(registers, SD_FMT),
+                read32(registers, SD_BDPU),
+                read32(registers, SD_BDPL),
+                read32(hda.regs, REG_DPLBASE)
             );
         } else {
             let path = if capture { &hda.capture_path } else { &hda.playback_path };
