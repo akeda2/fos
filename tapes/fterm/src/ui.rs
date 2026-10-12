@@ -106,6 +106,13 @@ fn draw_all(api: &TapeApi, form: &Form, selected: usize, editing: bool, message:
     draw!(" P: pick a machine from a list   W: save {CONFIG_FILE}   Q or Esc: quit\x1b[K");
     at(FIRST_ROW + ROWS.len() + 5, 1);
     draw!(" Once connected: Ctrl-A x leaves, Ctrl-A h lists the other commands\x1b[K");
+    // The hardware cursor follows the edit position (the "_" drawn after the value), else rests on the selected row.
+    if editing {
+        let length = value(api, form, ROWS[selected]).as_str().chars().count();
+        at(FIRST_ROW + selected, 32 + length);
+    } else {
+        at(FIRST_ROW + selected, 2);
+    }
     end_batch();
 }
 
