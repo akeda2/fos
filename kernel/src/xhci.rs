@@ -378,7 +378,13 @@ fn drain(index: usize) {
         return;
     }
     let mut consumed = false;
+    let mut taken = 0;
     loop {
+        taken += 1;
+        if taken > 16 * EVENT_TRBS {
+            crate::println!("xHCI {index}: the event ring never ran dry ({taken} events in one pass); giving up this pass.");
+            break;
+        }
         let at = state.base + state.index as u64 * TRB_BYTES;
         let trb = read_trb(at);
         if (trb.control & TRB_CYCLE != 0) != state.cycle {
@@ -406,6 +412,29 @@ fn interrupt(index: usize) {
     if !state.ready {
         return;
     }
+    // A controller that keeps raising the interrupt (the vector outranks the timer's, so the machine would freeze with
+    // the timer starved) is switched back to polling: more than 2000 interrupts without one timer tick is not an event
+    // stream. The foreground drains the ring itself from then on.
+    static mut LAST_TICK: u64 = 0;
+    static mut BURST: u32 = 0;
+    let now = apic::ticks();
+    unsafe {
+        if now != LAST_TICK {
+            LAST_TICK = now;
+            BURST = 0;
+        }
+        BURST += 1;
+        if BURST > 2000 {
+            let usbcmd = state.usbsts - 4; // USBCMD sits just before USBSTS in the operational registers
+            write32(usbcmd, read32(usbcmd) & !(1 << 2)); // INTE off
+            write32(state.iman, 0b01); // clear IP, IE off
+            write32(state.usbsts, 1 << 3);
+            let burst = BURST;
+            crate::println!("xHCI {index}: interrupt storm ({burst} in one tick); events are polled from now on.");
+            BURST = 0;
+            return;
+        }
+    }
     write32(state.iman, 0b11); // clear IP, keep IE
     write32(state.usbsts, 1 << 3); // clear EINT
     drain(index);
@@ -421,6 +450,13 @@ pub fn enable_interrupts_all(no_msi: bool) {
         let Some(controller) = controller(index) else { continue };
         if no_msi {
             crate::println!("xHCI {:02x}:{:02x}.{}: interrupts polled (settings: no-msi).", controller.pci.bus, controller.pci.device, controller.pci.function);
+            continue;
+        }
+        // The NEC uPD720200 on clock1 (1033:0194) froze the machine at the first doorbell write after MSI was enabled while the
+        // boot stick was attached to it (an old kernel enabled MSI fine with no disk on it; not understood). A controller that
+        // carries a disk stays polled: the foreground drains its ring, as it did before MSI.
+        if crate::usb_storage::uses_xhci(index) && controller.pci.vendor == 0x1033 {
+            crate::println!("xHCI {:02x}:{:02x}.{}: a USB disk is on this NEC controller; events stay polled (MSI froze it).", controller.pci.bus, controller.pci.device, controller.pci.function);
             continue;
         }
         match controller.enable_interrupts() {

@@ -436,7 +436,7 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - **Not needed yet**: recordings go to exFAT, so 64 entries hold the tapes and config files. Revisit when about 50 are used, or when anything writes many files to FOSFS. Sub-directories are a separate, larger job (path syntax clashes with `diskN/NAME` and `@LABEL/NAME`; new ABI calls; a v4 format).
 - **`tapesync`** is done (2026-10-12, `docs/design.md`); it checks for free directory entries before pulling. Open: only the boot volume and stamped tapes; not tested on real hardware; the stamp is per build, so every commit makes every tape "newer" (a per-tape content stamp would avoid needless pulls).
 
-## clock1: boot disk not recognised (2026-10-12, fix written, needs a reflash to verify)
+## clock1: boot disk not recognised (2026-10-12, fixed and verified on the machine)
 
 - clock1 (xHCI NEC 1033:0194 at 02:00.0, a Kingston USB 3 stick as boot disk) booted from the stick, but the kernel found no disk at boot
   ("Storage: no disks found", no `USB storage` line, no error), so `disk1` was not the boot disk and no config file was read.
@@ -447,3 +447,11 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   `usb_storage` (endpoint configuration, READ CAPACITY) now print.
 - Still unknown: why the stick was missing at boot (a SuperSpeed link that trains after the xHCI reset is the guess). After the reflash `dmesg`
   should show "Boot disk not found yet", the late `USB storage` line and the boot disk found by the retry.
+- Verified on clock1: the retry finds the stick, boots to the shell, KUP works.
+- NEC MSI freeze: with the boot stick on the NEC controller, the MSI self-test froze at its first doorbell write (cause unexplained; no disk
+  attached was fine). `xhci::enable_interrupts_all` keeps a vendor 0x1033 controller with a USB disk polled. The interrupt-storm guard and
+  event-ring loop cap in `xhci.rs` did not fire.
+- EHCI keyboard: the keyboard (low speed, behind the 00:1a.0 hub) used to sit on the async list with S/C masks 0; the Sandy Bridge PCH halted
+  with a host system error on that QH during the next control transfer. Keyboards now hang off a periodic frame list (S-mask 0x01, C-mask 0x1c
+  behind a hub), as Linux does; the async list holds only the control QH. `usb` prints EHCI USBCMD/USBSTS and the QHs. Open: all 1024 periodic
+  entries poll every frame (no interval spreading), and no recovery if an EHCI controller halts.

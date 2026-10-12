@@ -644,6 +644,7 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
     for index in 0..ehci::count() {
         let Some(controller) = ehci::controller(index) else { continue };
         print(format_args!("EHCI {:02x}:{:02x}.{}: {} ports", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports));
+        controller.describe_keyboards(&print);
         for port in 1..=controller.ports {
             if controller.port_has_device(port) {
                 print(format_args!("  port {port}: device connected{}", if controller.claimed_ports & (1 << port) != 0 { ", in use (a keyboard or a disk)" } else { "" }));

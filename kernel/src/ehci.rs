@@ -45,15 +45,20 @@ const OP_USBCMD: usize = 0x00;
 const OP_USBSTS: usize = 0x04;
 const OP_USBINTR: usize = 0x08;
 const OP_CTRLDSSEGMENT: usize = 0x10;
+const OP_FRINDEX: usize = 0x0c;
+const OP_PERIODICLISTBASE: usize = 0x14;
 const OP_ASYNCLISTADDR: usize = 0x18;
 const OP_CONFIGFLAG: usize = 0x40;
 const OP_PORTSC: usize = 0x44;
 
 const CMD_RUN: u32 = 1 << 0;
 const CMD_RESET: u32 = 1 << 1;
+const CMD_PERIODIC_ENABLE: u32 = 1 << 4;
 const CMD_ASYNC_ENABLE: u32 = 1 << 5;
 const STS_HALTED: u32 = 1 << 12;
+const STS_PERIODIC_RUNNING: u32 = 1 << 14;
 const STS_ASYNC_RUNNING: u32 = 1 << 15;
+const PERIODIC_ENTRIES: usize = 1024;
 
 const PORT_CONNECTED: u32 = 1 << 0;
 const PORT_ENABLED: u32 = 1 << 2;
@@ -139,6 +144,13 @@ fn qh_capabilities(target: &Target) -> u32 {
     (1 << 30) | (u32::from(target.hub_port) << 23) | (u32::from(target.hub_address) << 16)
 }
 
+/// Capabilities word of an interrupt QH: start-split in microframe 0, complete-splits in microframes 2-4 when a hub
+/// translates (a low/full-speed device); a high-speed endpoint just polls in microframe 0.
+fn interrupt_capabilities(target: &Target) -> u32 {
+    let masks = if target.hub_address != 0 { 0x01 | (0x1c << 8) } else { 0x01 };
+    qh_capabilities(target) | masks
+}
+
 fn read32(address: usize) -> u32 {
     unsafe { (address as *const u32).read_volatile() }
 }
@@ -208,6 +220,8 @@ pub struct Controller {
     operational: usize,
     pub ports: u8,
     frame: usize,
+    /// The periodic frame list (one page, 1024 links): keyboards' interrupt queue heads hang off every entry.
+    periodic: usize,
     next_address: u8,
     /// What enumeration was doing when it last failed (for the boot log).
     pub step: &'static str,
@@ -301,6 +315,10 @@ impl Controller {
         // Low memory (below 256 MiB), like v1: the first real EHCI (a Sandy Bridge PCH) halted with a host
         // system error on a frame near 3 GiB; the cause is not understood, so stay where v1 worked.
         let frame = memory::allocate_contiguous(1, Some(256 << 20)).ok_or(Error::NoMemory)? as usize;
+        let periodic = memory::allocate_contiguous(1, Some(256 << 20)).ok_or(Error::NoMemory)? as usize;
+        for entry in 0..PERIODIC_ENTRIES {
+            unsafe { (periodic as *mut u32).add(entry).write_volatile(TERMINATE) };
+        }
         if hccparams & 1 != 0 {
             write32(operational + OP_CTRLDSSEGMENT, 0); // 64-bit capable: all our DMA memory is below 4 GiB
         }
@@ -311,7 +329,9 @@ impl Controller {
         for index in 0..=MAX_KEYBOARDS {
             let words = qh_at(index) as *mut u32;
             unsafe {
-                words.write_volatile(qh_at(0) | LINK_QH);
+                // Keyboard queue heads live on the periodic list, not the async one: a split interrupt endpoint
+                // on the async list halted the Sandy Bridge PCH with a host system error.
+                words.write_volatile(if index == 0 { qh_at(0) | LINK_QH } else { TERMINATE });
                 words.add(1).write_volatile(if index == 0 { 1 << 15 } else { 0 });
                 words.add(2).write_volatile(1 << 30);
                 words.add(4).write_volatile(TERMINATE);
@@ -319,6 +339,8 @@ impl Controller {
             }
         }
         write32(operational + OP_ASYNCLISTADDR, qh_at(0));
+        write32(operational + OP_PERIODICLISTBASE, periodic as u32);
+        write32(operational + OP_FRINDEX, 0);
 
         write32(operational + OP_USBCMD, CMD_RUN | (8 << 16));
         if !wait_until(100, || read32(operational + OP_USBSTS) & STS_HALTED == 0) {
@@ -334,7 +356,7 @@ impl Controller {
             }
         }
         apic::wait_ticks(15);
-        Ok(Controller { pci: device, operational, ports, frame, next_address: 1, step: "", last_toggle: false, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
+        Ok(Controller { pci: device, operational, ports, frame, periodic, next_address: 1, step: "", last_toggle: false, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
     }
 
     fn port_register(&self, port: u8) -> usize {
@@ -361,14 +383,16 @@ impl Controller {
         read32(self.operational + OP_USBSTS)
     }
 
-    pub fn keyboard_count(&self) -> usize {
-        self.keyboards.iter().flatten().count()
-    }
-
     fn set_async(&self, on: bool) -> bool {
         let command = read32(self.operational + OP_USBCMD);
         write32(self.operational + OP_USBCMD, if on { command | CMD_ASYNC_ENABLE } else { command & !CMD_ASYNC_ENABLE });
         wait_until(5, || (read32(self.operational + OP_USBSTS) & STS_ASYNC_RUNNING != 0) == on)
+    }
+
+    fn set_periodic(&self, on: bool) -> bool {
+        let command = read32(self.operational + OP_USBCMD);
+        write32(self.operational + OP_USBCMD, if on { command | CMD_PERIODIC_ENABLE } else { command & !CMD_PERIODIC_ENABLE });
+        wait_until(5, || (read32(self.operational + OP_USBSTS) & STS_PERIODIC_RUNNING != 0) == on)
     }
 
     fn qtd_address(&self, index: usize) -> u32 {
@@ -415,9 +439,6 @@ impl Controller {
         write32(self.operational + OP_USBSTS, 0x3f);
         let outcome = if self.set_async(true) { self.wait_chain(qtds) } else { Err(Error::Timeout) };
         self.set_async(false);
-        if self.keyboard_count() > 0 {
-            self.set_async(true); // keep the keyboards' queue heads running
-        }
         outcome
     }
 
@@ -805,16 +826,21 @@ impl Controller {
     /// Rebuilds the async list: control QH, then every keyboard QH in use, back to the control QH.
     /// The schedule is switched off while the links change.
     fn relink(&mut self) {
-        self.set_async(false);
-        let mut previous = self.frame + OFFSET_CONTROL_QH;
-        for index in 0..MAX_KEYBOARDS {
+        self.set_periodic(false);
+        let mut head = TERMINATE;
+        for index in (0..MAX_KEYBOARDS).rev() {
             if self.keyboards[index].is_some() {
                 let qh = self.keyboard_qh(index);
-                unsafe { (previous as *mut u32).write_volatile(qh as u32 | LINK_QH) };
-                previous = qh;
+                unsafe { (qh as *mut u32).write_volatile(head) };
+                head = qh as u32 | LINK_QH;
             }
         }
-        unsafe { (previous as *mut u32).write_volatile((self.frame + OFFSET_CONTROL_QH) as u32 | LINK_QH) };
+        for entry in 0..PERIODIC_ENTRIES {
+            unsafe { (self.periodic as *mut u32).add(entry).write_volatile(head) };
+        }
+        if head != TERMINATE {
+            self.set_periodic(true);
+        }
     }
 
     /// Dedicates a queue head to a keyboard's interrupt-IN endpoint and arms it.
@@ -826,7 +852,7 @@ impl Controller {
         unsafe {
             let words = self.keyboard_qh(index) as *mut u32;
             words.add(1).write_volatile(qh_characteristics(&target, endpoint, max_packet, false, false));
-            words.add(2).write_volatile(qh_capabilities(&target));
+            words.add(2).write_volatile(interrupt_capabilities(&target));
         }
         self.arm_keyboard(index);
         Ok(index)
@@ -845,7 +871,6 @@ impl Controller {
         }
         if removed != 0 {
             self.relink();
-            self.set_async(true);
         }
         removed
     }
@@ -862,7 +887,6 @@ impl Controller {
         }
         if removed != 0 {
             self.relink();
-            self.set_async(true);
         }
         removed
     }
@@ -870,7 +894,7 @@ impl Controller {
     /// Queues one IN transfer of a report on keyboard `index`'s queue head.
     fn arm_keyboard(&mut self, index: usize) {
         let Some(pipe) = self.keyboards[index] else { return };
-        self.set_async(false);
+        self.set_periodic(false);
         let qtd = Qtd { pid: PID_IN, toggle: pipe.toggle, bytes: 8, buffer: self.keyboard_buffer(index) as u32, alternate: None };
         Self::write_qtd(self.keyboard_qtd(index) as u32, &qtd, TERMINATE, TERMINATE, true);
         unsafe {
@@ -882,7 +906,24 @@ impl Controller {
             }
         }
         write32(self.operational + OP_USBSTS, 0x3f);
-        self.set_async(true);
+        self.set_periodic(true);
+    }
+
+    /// One line per keyboard queue for `usb`: the controller registers and the report qTD's token (0x80 = still active, i.e.
+    /// the controller has not completed the transfer), so a keyboard that never reports can be told from a dead controller.
+    pub fn describe_keyboards(&self, print: &impl Fn(core::fmt::Arguments)) {
+        let (cmd, sts, list) = (read32(self.operational + OP_USBCMD), read32(self.operational + OP_USBSTS), read32(self.operational + OP_ASYNCLISTADDR));
+        print(format_args!("    USBCMD {cmd:#x} USBSTS {sts:#x} ASYNCLISTADDR {list:#x} frame {:#x}", self.frame));
+        let control = unsafe { core::slice::from_raw_parts((self.frame + OFFSET_CONTROL_QH) as *const u32, 12) };
+        print(format_args!("    control QH {:#x}: {:x?}", self.frame + OFFSET_CONTROL_QH, control));
+        for index in 0..MAX_KEYBOARDS {
+            if self.keyboards[index].is_none() {
+                continue;
+            }
+            let token = unsafe { ((self.keyboard_qtd(index) + 8) as *const u32).read_volatile() };
+            let qh = unsafe { core::slice::from_raw_parts(self.keyboard_qh(index) as *const u32, 12) };
+            print(format_args!("    keyboard {index}: qTD token {token:#x}, QH {:#x}: {:x?}", self.keyboard_qh(index), qh));
+        }
     }
 
     /// Checks keyboard `index`: if its report transfer finished, returns the 8-byte

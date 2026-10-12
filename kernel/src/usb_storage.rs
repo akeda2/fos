@@ -128,6 +128,11 @@ fn dma() -> Option<(u64, u64)> {
     }
 }
 
+/// True when a USB disk is attached through xHCI controller `controller_index`.
+pub fn uses_xhci(controller_index: usize) -> bool {
+    (0..MAX_DEVICES).any(|slot| matches!(device(slot), Some(Msc { host: Host::Xhci { controller, .. }, .. }) if *controller == controller_index))
+}
+
 fn device(index: usize) -> Option<&'static mut Msc> {
     unsafe { (*core::ptr::addr_of_mut!(DEVICES)).get_mut(index)?.as_mut() }
 }
