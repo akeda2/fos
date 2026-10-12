@@ -1276,8 +1276,9 @@ impl Controller {
             (input as *mut u32).add(1).write_volatile(1 | (1 << in_dci) | (1 << out_dci)); // add the slot context and both endpoints
             core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
             let slot_context = self.context_slot(input) as *mut u32;
-            let word0 = slot_context.read_volatile() & !(0x1f << 27);
-            slot_context.write_volatile(word0 | (in_dci.max(out_dci) << 27));
+            let word0 = slot_context.read_volatile();
+            let entries = ((word0 >> 27) & 0x1f).max(in_dci.max(out_dci)); // keep what an earlier endpoint (audio) already needs
+            slot_context.write_volatile((word0 & !(0x1f << 27)) | (entries << 27));
             for (dci, ring, endpoint_type, max_packet, burst) in [(in_dci, in_ring, 6u32, in_max_packet, in_burst), (out_dci, out_ring, 2u32, out_max_packet, out_burst)] {
                 let context = self.context_endpoint(input, dci) as *mut u32;
                 context.add(1).write_volatile((3 << 1) | (endpoint_type << 3) | (u32::from(burst) << 8) | (u32::from(max_packet) << 16));

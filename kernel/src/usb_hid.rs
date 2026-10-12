@@ -214,20 +214,25 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
                 }
             });
         }
-        // A MIDI cable or controller (a MIDIStreaming interface; the audio parsing below is for PCM devices).
-        if let Some(endpoints) = crate::usb_midi::find_endpoints(&configuration[..total]) {
-            controller.set_configuration(&device, configuration[5])?;
-            if crate::usb_midi::attach(controller, device, &endpoints, vendor, product) {
-                return Ok(true);
+        // A device can be audio, MIDI or both (a class-compliant interface such as the RME UFX has PCM streaming and a MIDI port
+        // in one configuration). Audio goes first: attaching it selects the configuration, which would reset the bulk endpoints
+        // the MIDI side had configured. Each side takes what it can; the slot is only released when neither did.
+        let midi = crate::usb_midi::find_endpoints(&configuration[..total]);
+        let audio = crate::usb_audio::is_audio(&configuration[..total]);
+        if midi.is_some() || audio {
+            let mut attached = false;
+            if audio {
+                let description = crate::usb_audio::parse(&configuration[..total]);
+                crate::usb_audio::report(&description, &device.path(), vendor, product, xhci::speed_name(device.speed));
+                attached = crate::usb_audio::attach(controller, device, description, configuration[5]);
             }
-            controller.release_slot(device.slot);
-            return Ok(false);
-        }
-        // Not a keyboard, not a stick: an audio device is described (see `usb_audio`); nothing else is handled.
-        if crate::usb_audio::is_audio(&configuration[..total]) {
-            let description = crate::usb_audio::parse(&configuration[..total]);
-            crate::usb_audio::report(&description, &device.path(), vendor, product, xhci::speed_name(device.speed));
-            if crate::usb_audio::attach(controller, device, description, configuration[5]) {
+            if let Some(endpoints) = midi {
+                if !attached {
+                    controller.set_configuration(&device, configuration[5])?;
+                }
+                attached |= crate::usb_midi::attach(controller, device, &endpoints, vendor, product);
+            }
+            if attached {
                 return Ok(true);
             }
             controller.release_slot(device.slot);
