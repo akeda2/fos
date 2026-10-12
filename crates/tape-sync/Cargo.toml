@@ -1,0 +1,11 @@
+[package]
+name = "fosfor-tape-sync"
+version = "0.1.0"
+edition = "2024"
+
+# What `tapesync` needs and the host tests can check: SHA-256, HMAC-SHA-256, the build stamp a tape carries in its
+# `.fos_build` section, the signed manifest two machines exchange, and the decision about which tapes to pull.
+# `no_std`, no allocation, independent of the kernel.
+[lib]
+name = "tape_sync"
+path = "src/lib.rs"

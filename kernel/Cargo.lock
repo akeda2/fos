@@ -16,4 +16,9 @@ version = "0.1.0"
 dependencies = [
  "fosfor-abi",
  "fosfor-fat",
+ "fosfor-tape-sync",
 ]
+
+[[package]]
+name = "fosfor-tape-sync"
+version = "0.1.0"

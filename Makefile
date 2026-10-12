@@ -112,7 +112,9 @@ IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
 TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp fterm
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape))
-TAPE_FILES := $(foreach tape,$(TAPES),--file $(tape)=$(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$(tape)) --file debug=tools/default-debug.txt
+# The image and deployments use the stamped copies (tools/stamp_tape.py: the `.fos_build` section `tapesync` compares).
+TAPE_STAMPED := $(OUT)/tapes
+TAPE_FILES := $(foreach tape,$(TAPES),--file $(tape)=$(TAPE_STAMPED)/$(tape)) --file debug=tools/default-debug.txt
 
 # ---- Opus (stage C of audio-net): libopus built freestanding for the 64-bit tape target ----
 # The vendored tree (crates/opus-codec/vendor/opus, v1.5.2, fixed-point, trimmed to what the build needs) is compiled
@@ -127,7 +129,7 @@ OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-a
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-rtl8139
+.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -144,10 +146,16 @@ kernel:
 tapes: $(OPUS_LIB)
 	for tape in $(TAPES); do (cd tapes/$$tape && cargo +nightly-2026-09-13 build --release) || exit 1; done
 
+# Copies of the tapes with the build stamp added: build/fosfor/tapes/NAME is what goes into the image and onto machines.
+.PHONY: stamp-tapes
+stamp-tapes: tapes
+	mkdir -p $(TAPE_STAMPED)
+	for tape in $(TAPES); do python3 tools/stamp_tape.py $(CARGO_TARGET_DIR)/x86_64-fos-tape/release/$$tape $(TAPE_STAMPED)/$$tape || exit 1; done
+
 # A bootable disk image: GPT + a FAT32 EFI System Partition with \EFI\BOOT\BOOTX64.EFI
 # and a payload partition with the kernel in slot 0 (tools/build_image.py;
 # standard library only).
-image: loader kernel tapes $(BIOS_STAGES)
+image: loader kernel tapes stamp-tapes $(BIOS_STAGES)
 	mkdir -p $(OUT)
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) --output $(IMAGE) \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin $(TAPE_FILES)
@@ -167,6 +175,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/tape-sync/Cargo.toml
 	for tape in router nettest ed ip-chat telnet ptp fterm; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
 
@@ -254,6 +263,10 @@ test-audio-serve: image
 # NETFS: foscopy.py and copy HOST/NAME between machines.
 test-netfs: image
 	python3 tools/test_netfs.py
+
+# tapesync: pulling newer tapes between machines, authenticated by the synckey file.
+test-tapesync: image
+	python3 tools/test_tapesync.py
 
 # nic sniff / discover / peers / map / use.
 test-nic: image

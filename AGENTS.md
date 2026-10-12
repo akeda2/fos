@@ -208,6 +208,7 @@ maintainer's memory notes, not in this repository.
 - **Real-hardware workflow**: `tools/devloop.py` as described above; a pushed kernel that comes back on the *other* slot with
   "no FOSFS data partition" in `dmesg` means the A/B fallback reverted it. `bootcode` can replace the BIOS boot code and the UEFI
   loader without a stick rewrite (both verified on real machines). `debug video skip` plus `reboot` shows the VGA text console.
+- **Tape sync**: `tapesync [HOST] [apply]` pulls newer tapes (from HOST or every peer) between machines that share a `synckey` file; tapes carry a `.fos_build` stamp added by `tools/stamp_tape.py`, so deploy `build/fosfor/tapes/NAME`, not the cargo output (`docs/design.md`, `make test-tapesync`).
 - **Open work** is in `DEFERRED.md` ("Open after the 2026-10-09 session").
 
 - **Hostnames**: every machine broadcasts its name (`hostname` file + NIC number, else `fos-` + last 3 MAC bytes) at boot and every

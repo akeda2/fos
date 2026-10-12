@@ -957,3 +957,21 @@ on OUT, several cables per device, a tape ABI (the X-Touch/Mackie work will add 
 A small A-record client: pure codec in `tape-net::dns` (host tests), blocking `tape_ip::dns::lookup`, and a
 non-blocking `Phase::Dns` in the fterm Telnet link. `ptp ntp=NAME` uses it too. The server comes from `dns`, DHCP option 6,
 or the gateway. Tested end to end by `make test-fterm-net` against a Python DNS responder reached as 10.0.2.2.
+
+### tapesync (kernel/src/tapesync.rs, crates/tape-sync)
+
+Explicit, pull-only, authenticated tape sync between machines: `tapesync [HOST]` lists what differs, `tapesync [HOST] apply` installs it. Without HOST every machine in the peer table is asked in turn (one that does not answer costs a 3 s timeout); the newest offer of each tape wins and its source is shown, and equal build times with other bytes are reported, not guessed.
+Every machine that has a `synckey` file (one line of text, the same on the machines that trust each other; NETFS refuses to read
+or write it) answers `TAG_SYNC_REQUEST 0x40` (a 16-byte nonce) with a manifest as a GET stream: per stamped tape on the boot
+volume its name, size, build time, tape ABI and SHA-256, then HMAC-SHA-256 over `nonce || manifest`. The requester trusts only a
+manifest that verifies for its own nonce (so no replay), fetches files with plain NETFS and installs one only if size, SHA-256
+and stamp equal the signed entry. A *stamp* is 16 bytes in the ELF section `.fos_build`, added after linking by
+`tools/stamp_tape.py` (`make stamp-tapes`; the image and `build/fosfor/tapes/NAME` are the stamped copies, deploy those): the
+commit time of HEAD for a clean tree (machines building one commit agree), else the build time, plus the ABI version from
+`abi/src/tape.rs`. Rules (`tape_sync::decide`): missing here is new; a newer stamp replaces; the same bytes are left; our newer or
+equal-time-different bytes are kept; a tape for a newer ABI than this kernel is skipped; a file here that is not a stamped tape
+is never overwritten. The server answers one request per 2 s (hashing every tape is work) and not while its own client command
+runs. New tapes need free FOSFS directory entries (64 per volume; DEFERRED.md plans a bigger directory), checked before anything
+is fetched. FOSFS rewrites a file in place when it still fits, so a power cut mid-write can damage that one tape; run it again.
+Not done: sync of non-tape files, the other disks, automatic or periodic sync. `make test-tapesync` (four machines: same key,
+other key, no key) covers it; the crate's host tests cover SHA-256/HMAC vectors, the manifest and the rules.

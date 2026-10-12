@@ -56,6 +56,7 @@ mod power;
 mod serial;
 mod storage;
 mod tape;
+mod tapesync;
 mod uart;
 mod term;
 mod usb_audio;

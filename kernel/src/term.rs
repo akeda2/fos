@@ -25,7 +25,7 @@ const TAG_GET_REQUEST: u8 = 0x30;
 const TAG_GET_START: u8 = 0x31;
 const TAG_GET_DATA: u8 = 0x32;
 const TAG_GET_STOP: u8 = 0x33;
-const TAG_GET_ERROR: u8 = 0x34;
+pub(crate) const TAG_GET_ERROR: u8 = 0x34;
 const TAG_PUT_REQUEST: u8 = 0x35;
 const TAG_PUT_DATA: u8 = 0x36;
 const TAG_PUT_STOP: u8 = 0x37;
@@ -37,9 +37,13 @@ const NETFS_TOO_LARGE: u8 = 3;
 const NETFS_BAD_NAME: u8 = 4;
 const NETFS_DIRECTORY_FULL: u8 = 5;
 const NETFS_DATA_FULL: u8 = 6;
-const NETFS_DISK_ERROR: u8 = 7;
+pub(crate) const NETFS_DISK_ERROR: u8 = 7;
 const NETFS_CHECKSUM: u8 = 8;
-const NETFS_BUSY: u8 = 9;
+pub(crate) const NETFS_BUSY: u8 = 9;
+/// `tapesync` is not set up on the machine asked (no `synckey` file, or it asked too soon after the last request).
+pub(crate) const NETFS_NO_SYNC: u8 = 10;
+/// The tape-sync request (see `tapesync.rs` and crates/tape-sync): a nonce in, a signed manifest out as a GET stream.
+pub(crate) const TAG_SYNC_REQUEST: u8 = 0x40;
 const NETFS_CHUNK: usize = 1024;
 const TAG_KUP_REQUEST: u8 = 0x3a;
 const TAG_KUP_DATA: u8 = 0x3b;
@@ -283,6 +287,7 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
         TAG_PUT_REQUEST if netfs_enabled() => netfs_put_request(index, source, &frame[15..]),
         TAG_PUT_DATA if netfs_enabled() => netfs_put_data(source, &frame[15..]),
         TAG_PUT_STOP if netfs_enabled() => netfs_put_stop(index, source),
+        TAG_SYNC_REQUEST if netfs_enabled() => crate::tapesync::serve(index, source, &frame[15..]),
         TAG_KUP_REQUEST if crate::config::debug().kernel_update => kup_request(index, source, &frame[15..]),
         TAG_KUP_DATA if crate::config::debug().kernel_update => kup_data(source, &frame[15..]),
         TAG_KUP_STOP if crate::config::debug().kernel_update => kup_stop(index, source),
@@ -412,14 +417,14 @@ struct NetfsPut {
 
 static mut NETFS_PUT: NetfsPut = NetfsPut { active: false, source: [0; 6], disk: 0, name: [0; 16], name_length: 0, expected: 0, checksum: 0, received: 0, next_sequence: 0, last_activity: 0 };
 
-fn netfs_reply(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) {
+pub(crate) fn netfs_reply(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8]) {
     if let Some(nic) = nic_at(index) {
         send(nic, destination, tag, payload);
     }
 }
 
 /// True if the staging buffer is in use by a transfer that is still alive (a PUT in progress, or a kernel update).
-fn netfs_busy(source: &[u8; 6]) -> bool {
+pub(crate) fn netfs_busy(source: &[u8; 6]) -> bool {
     let put = unsafe { &*core::ptr::addr_of!(NETFS_PUT) };
     let kup = unsafe { &*core::ptr::addr_of!(KUP) };
     (put.active && put.source != *source && apic::ticks().wrapping_sub(put.last_activity) < 500) || (kup.active && apic::ticks().wrapping_sub(kup.last_activity) < 500)
@@ -438,6 +443,10 @@ fn netfs_get_request(index: usize, source: [u8; 6], payload: &[u8]) {
     if !crate::fosfs::valid_name(name) {
         return reply_error(NETFS_BAD_NAME);
     }
+    // The shared secret of `tapesync` never leaves the machine, whoever asks.
+    if name == crate::tapesync::KEY_FILE.as_bytes() {
+        return reply_error(NETFS_NOT_FOUND);
+    }
     let Ok(volume) = crate::storage::volume_on(usize::from(payload[0])) else { return reply_error(NETFS_NO_DISK) };
     let Some(staging) = crate::tape::staging() else { return reply_error(NETFS_TOO_LARGE) };
     let length = match volume.read(name, staging) {
@@ -447,15 +456,21 @@ fn netfs_get_request(index: usize, source: [u8; 6], payload: &[u8]) {
         Err(crate::fosfs::Error::TooBig) => return reply_error(NETFS_TOO_LARGE),
         Err(_) => return reply_error(NETFS_DISK_ERROR),
     };
-    let checksum = fosfor_abi::internet_checksum(&staging[..length]);
+    netfs_stream(index, &source, &staging[..length], core::str::from_utf8(name).unwrap_or("?"));
+}
+
+/// Sends `data` to `source` as a GET answer: START with the length and checksum, numbered DATA chunks, STOP.
+pub(crate) fn netfs_stream(index: usize, source: &[u8; 6], data: &[u8], what: &str) {
+    let length = data.len();
+    let checksum = fosfor_abi::internet_checksum(data);
     let mut start = [0u8; 6];
     start[0..4].copy_from_slice(&(length as u32).to_le_bytes());
     start[4..6].copy_from_slice(&checksum.to_le_bytes());
-    netfs_reply(index, &source, TAG_GET_START, &start);
-    crate::println!("NETFS: sending {} ({length} bytes) to {}.", core::str::from_utf8(name).unwrap_or("?"), Mac(&source));
+    netfs_reply(index, source, TAG_GET_START, &start);
+    crate::println!("NETFS: sending {what} ({length} bytes) to {}.", Mac(source));
     // The receiver reads from a finite ring: one chunk a millisecond is a pace real hardware keeps up with.
     let mut next = apic::micros();
-    for (sequence, chunk) in staging[..length].chunks(NETFS_CHUNK).enumerate() {
+    for (sequence, chunk) in data.chunks(NETFS_CHUNK).enumerate() {
         let mut frame = [0u8; 4 + NETFS_CHUNK];
         frame[0..4].copy_from_slice(&(sequence as u32).to_le_bytes());
         frame[4..4 + chunk.len()].copy_from_slice(chunk);
@@ -463,10 +478,10 @@ fn netfs_get_request(index: usize, source: [u8; 6], payload: &[u8]) {
             core::hint::spin_loop();
         }
         next = apic::micros() + 1000;
-        netfs_reply(index, &source, TAG_GET_DATA, &frame[..4 + chunk.len()]);
+        netfs_reply(index, source, TAG_GET_DATA, &frame[..4 + chunk.len()]);
         crate::debug::pet();
     }
-    netfs_reply(index, &source, TAG_GET_STOP, &[]);
+    netfs_reply(index, source, TAG_GET_STOP, &[]);
 }
 
 /// A request to store a file. Acceptance is silent; a refusal is an error frame.
@@ -481,7 +496,7 @@ fn netfs_put_request(index: usize, source: [u8; 6], payload: &[u8]) {
     let expected = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
     let checksum = u16::from_le_bytes(payload[5..7].try_into().unwrap());
     let name = netfs_name(&payload[7..]);
-    if !crate::fosfs::valid_name(name) {
+    if !crate::fosfs::valid_name(name) || name == crate::tapesync::KEY_FILE.as_bytes() {
         return reply_error(NETFS_BAD_NAME);
     }
     if crate::storage::volume_on(usize::from(payload[0])).is_err() {
@@ -555,13 +570,14 @@ fn netfs_error_text(code: u8) -> &'static str {
         NETFS_DISK_ERROR => "disk error on the machine",
         NETFS_CHECKSUM => "checksum mismatch (data was damaged in transit)",
         NETFS_BUSY => "busy: another transfer is in progress there",
+        NETFS_NO_SYNC => "tape sync is not available there (no synckey file, or asked again within 2 s)",
         _ => "unknown error",
     }
 }
 
 /// `HOST[:diskN]` to the machine's MAC, the interface to reach it on and the disk number. HOST is a name from
 /// `nic peers` (looked up with a discovery if the table has no such name yet), a MAC address, or a peer number.
-fn netfs_peer(spec: &str) -> Option<([u8; 6], usize, usize)> {
+pub(crate) fn netfs_peer(spec: &str) -> Option<([u8; 6], usize, usize)> {
     let (host, disk) = match spec.split_once(":disk") {
         Some((host, number)) => (host, number.parse::<usize>().ok()?),
         None => (spec, 1),
@@ -592,15 +608,20 @@ fn netfs_peer(spec: &str) -> Option<([u8; 6], usize, usize)> {
 }
 
 /// Fetches a file from a peer into the staging buffer; returns its length.
-fn netfs_fetch(mac: [u8; 6], nic_index: usize, disk: usize, name: &str) -> Result<usize, &'static str> {
+pub(crate) fn netfs_fetch(mac: [u8; 6], nic_index: usize, disk: usize, name: &str) -> Result<usize, &'static str> {
     let staging = crate::tape::staging().ok_or("no memory for the transfer buffer")?;
-    if netfs_busy(&mac) {
-        return Err("a transfer into this machine is in progress");
-    }
     let mut request = [0u8; 1 + 16];
     request[0] = disk as u8;
     request[1..1 + name.len()].copy_from_slice(name.as_bytes());
-    netfs_reply(nic_index, &mac, TAG_GET_REQUEST, &request[..1 + name.len()]);
+    netfs_receive(mac, nic_index, TAG_GET_REQUEST, &request[..1 + name.len()], staging)
+}
+
+/// Sends `request` (a GET-style request with tag `tag`) to a peer and collects its START/DATA/STOP answer into `staging`.
+pub(crate) fn netfs_receive(mac: [u8; 6], nic_index: usize, tag: u8, request: &[u8], staging: &mut [u8]) -> Result<usize, &'static str> {
+    if netfs_busy(&mac) {
+        return Err("a transfer into this machine is in progress");
+    }
+    netfs_reply(nic_index, &mac, tag, request);
     let (mut total, mut checksum, mut received, mut sequence) = (None::<usize>, 0u16, 0usize, 0u32);
     let mut outcome: Option<Result<(), &'static str>> = None;
     let mut deadline = apic::ticks() + 3 * apic::TICK_HZ;
@@ -1245,6 +1266,7 @@ fn execute(command: &str) {
             crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
             crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL;");
             crate::println!("          a FAT32/exFAT disk too, by its diskN: ls cat write rm copy)");
+            crate::println!("tapesync [HOST] [apply]   pull newer tapes from one or all peers (needs the synckey file)");
             crate::println!("ls [diskN]        list FOSFS files (a FAT32/exFAT disk too, if named)");
             crate::println!("start     run the start file again (as at boot)");
             crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");
@@ -1421,6 +1443,7 @@ fn execute(command: &str) {
         "bootcode" => crate::bootcode::command(words),
         "videomodes" => videomodes_command(),
         "copy" => copy_command(words),
+        "tapesync" => crate::tapesync::command(words),
         "disks" => {
             for index in 0..crate::block::count() {
                 let disk = crate::block::get(index).unwrap();
@@ -2846,6 +2869,15 @@ const MAX_PEERS: usize = 32;
 static mut PEERS: [([u8; 6], [u8; 20], usize, usize); MAX_PEERS] = [([0; 6], [0; 20], 0, 0); MAX_PEERS];
 static mut PEER_COUNT: usize = 0;
 
+pub(crate) fn peer_count() -> usize {
+    unsafe { PEER_COUNT }
+}
+
+/// Peer `number` (1-based, as `nic peers` lists them): MAC, name, name length, interface.
+pub(crate) fn peer_at(number: usize) -> Option<([u8; 6], [u8; 20], usize, usize)> {
+    (number >= 1 && number <= peer_count()).then(|| unsafe { (*core::ptr::addr_of!(PEERS))[number - 1] })
+}
+
 /// Files a peer's name; true if the peer is new. A known peer's name is replaced (its `hostname` file may have changed).
 fn remember_peer(index: usize, mac: [u8; 6], name: &[u8]) -> bool {
     // Some virtual networks echo our own frames back; this machine is not its own peer.
@@ -2901,7 +2933,7 @@ fn print_peers() {
 
 /// `nic discover`: asks every interface who else runs fos (a broadcast probe, repeated each second for three seconds)
 /// and lists the answers with their host names. Machines also answer on their own, whenever they are running.
-fn nic_discover() {
+pub(crate) fn nic_discover() {
     if nic_count() == 0 {
         return crate::println!("No network interface.");
     }

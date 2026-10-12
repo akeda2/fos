@@ -429,3 +429,9 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - A lone ESC over `term net` did not stop the start-file `ptp` on skylake3 (it worked on amd1 and laptop1): find out why.
 - fterm: the settings panel is a fixed 80-column layout (only the Telnet window size and the machine list follow `console_size`); the Telnet NAWS value has no test.
 - DNS: see the DNS session section above.
+
+## FOSFS directory size and tape sync (2026-10-12, planned)
+
+- **Directory is fixed at 64 entries** (`DIRECTORY_SECTORS = 8`, `DATA_START = 9` in `kernel/src/fosfs.rs`). The superblock already records both (offsets 16 and 20), and `mount` only checks them against the constants. Plan: read them from the superblock (8-256 sectors), `format` and `build_image.py` default to 1024 entries (128 sectors), old 8-sector volumes mount unchanged. An old kernel refuses a big-directory volume as unformatted (one-way compatibility; the legacy edition is frozen). Moving an existing volume means re-format and copy. Replace the stack arrays sized `MAX_ENTRIES` (extents) with the new cap. Test: more than 64 files, plus a mount test for an 8-sector volume.
+- **Not needed yet**: recordings go to exFAT, so 64 entries hold the tapes and config files. Revisit when about 50 are used, or when anything writes many files to FOSFS. Sub-directories are a separate, larger job (path syntax clashes with `diskN/NAME` and `@LABEL/NAME`; new ABI calls; a v4 format).
+- **`tapesync`** is done (2026-10-12, `docs/design.md`); it checks for free directory entries before pulling. Open: only the boot volume and stamped tapes; not tested on real hardware; the stamp is per build, so every commit makes every tape "newer" (a per-tape content stamp would avoid needless pulls).
