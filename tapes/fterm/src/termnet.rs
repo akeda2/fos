@@ -9,8 +9,11 @@ const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const TAG_HELLO: u8 = 0x20;
 const TAG_DATA: u8 = 0x21;
 const TAG_BYE: u8 = 0x22;
-/// Payload bytes per DATA frame, as the kernel's server sends them.
-const DATA_CAPACITY: usize = 512;
+/// Payload bytes per DATA frame the kernel's server sends (`term.rs` DATA_CAPACITY); a smaller buffer here cut the end
+/// of a long `ls`, prompt included.
+const DATA_CAPACITY: usize = 1024;
+/// Payload bytes per DATA frame we send: keys, so a small frame is plenty.
+const SEND_CAPACITY: usize = 512;
 /// How long to wait for the first byte of the remote shell before saying so, in ticks.
 const SILENCE_TICKS: u64 = 300;
 
@@ -45,7 +48,7 @@ impl TermNetLink {
     }
 
     fn send(&mut self, tag: u8, payload: &[u8]) -> bool {
-        let mut frame = [0u8; 15 + DATA_CAPACITY];
+        let mut frame = [0u8; 15 + SEND_CAPACITY];
         frame[..6].copy_from_slice(&self.peer);
         frame[6..12].copy_from_slice(&self.nic.mac.0);
         frame[12..14].copy_from_slice(&ETHERTYPE);
@@ -100,7 +103,7 @@ impl Link for TermNetLink {
     }
 
     fn write(&mut self, data: &[u8]) -> usize {
-        let count = data.len().min(DATA_CAPACITY);
+        let count = data.len().min(SEND_CAPACITY);
         if count == 0 || !self.send(TAG_DATA, &data[..count]) {
             return 0;
         }

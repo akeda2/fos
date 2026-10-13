@@ -215,6 +215,12 @@ def main():
             wait_for("file1 file2", 10, mark)
             check(True, "term net: the answer is shown", "")
 
+            # The kernel's server sends frames of up to 1024 bytes; a client that cut them at 512 lost the end of a long `ls`.
+            mark = len(text())
+            wire.send(guest, TAG_DATA, b"".join(b"line%02d-filler-filler-filler\r\n" % n for n in range(24)) + b"remote> ")
+            wait_for("line23", 10, mark)
+            check("line23" in text()[mark:] and "remote> " in text()[mark:], "term net: a 700-byte frame arrives whole, prompt included", text()[mark:][-200:])
+
             mark = len(text())
             wire.send(guest, TAG_BYE)
             wait_for("fos> ", 20, mark)
