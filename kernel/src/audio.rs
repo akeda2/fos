@@ -1,6 +1,6 @@
 //! The audio facade: one set of calls in front of the audio devices the kernel can drive.
 //!
-//! There are two kinds of device, USB audio class (`usb_audio.rs`, behind an xHCI controller) and Intel HD Audio
+//! There are two kinds of device, USB audio class (`usb_audio.rs`, behind an xHCI or EHCI controller) and Intel HD Audio
 //! (`hda.rs`, a PCI controller with a codec). Tapes know neither: they see `audio_info`, `audio_select`,
 //! `audio_start`, `audio_read`, `audio_write`, `audio_stats` and `audio_stop` of the tape ABI, which the kernel
 //! routes through this module to *the active device*.
@@ -134,10 +134,7 @@ pub fn use_device_for_tape(number: u32) -> i32 {
 /// The ordinary starter for the shell and tapes. The error strings are the ones `start_for_tape` maps to codes.
 pub fn start(rate: u32, capture: bool, playback: bool) -> Result<(), &'static str> {
     match active() {
-        Some(Backend::Usb) => {
-            let controller = usb::controller().ok_or("no USB audio device")?;
-            usb::start(controller, rate, capture, playback)
-        }
+        Some(Backend::Usb) => usb::start(rate, capture, playback),
         Some(Backend::Hda(index)) => hda::start(index, rate, capture, playback),
         None => Err("no audio device"),
     }
@@ -145,9 +142,7 @@ pub fn start(rate: u32, capture: bool, playback: bool) -> Result<(), &'static st
 
 /// Stops every running stream on every device.
 pub fn stop() {
-    if let Some(controller) = usb::controller() {
-        usb::stop(controller);
-    }
+    usb::stop();
     for index in 0..hda::count() {
         hda::stop(index);
     }
@@ -197,6 +192,7 @@ pub fn playback_format() -> Option<(u8, u8)> {
 /// What the foreground must do to keep a polled device moving (an HD Audio controller without working interrupts;
 /// the USB side is moved by `usb_hid::poll`, which the callers already do).
 pub fn poll() {
+    usb::ehci_poll();
     hda::poll();
 }
 

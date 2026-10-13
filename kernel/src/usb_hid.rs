@@ -390,7 +390,10 @@ fn probe_all_ehci() -> usize {
                 // The root port itself changed: a hub on it is gone with everything behind it.
                 if let Some(hub_address) = controller.hub_address_on_port(port) {
                     usb_storage::mark_ehci_hub_stale(index, hub_address, 0);
+                    crate::usb_audio::ehci_departed(index, hub_address, 0);
                     controller.forget_hub(port);
+                } else {
+                    crate::usb_audio::ehci_departed(index, 0, 0);
                 }
                 // It was unplugged, or unplugged and plugged back in (a bumped cable, a stick moved to another machine and
                 // returned). Forget the claim and look at the port afresh; a disk that comes back is recognised in
@@ -477,6 +480,7 @@ fn rescan_ehci_hub(controller_index: usize, controller: &mut ehci::Controller, p
         crate::println!("USB: EHCI {:02x}:{:02x}.{} hub port {port}.{hub_port}: its device was unplugged or replugged; looking at the port again.",
             controller.pci.bus, controller.pci.device, controller.pci.function);
         usb_storage::mark_ehci_hub_stale(controller_index, hub_address, hub_port);
+        crate::usb_audio::ehci_departed(controller_index, hub_address, hub_port);
         let removed = controller.remove_keyboards_behind(hub_address, hub_port);
         drop_ehci_keyboard_entries(controller_index, removed);
     }
@@ -609,6 +613,26 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
                 return Ok(true);
             }
         }
+        if crate::usb_audio::is_audio(&configuration[..total]) {
+            let description = crate::usb_audio::parse(&configuration[..total]);
+            let speed = match target.speed {
+                ehci::Speed::High => "high speed",
+                ehci::Speed::Full => "full speed",
+                ehci::Speed::Low => "low speed",
+            };
+            crate::usb_audio::report(&description, &format_args!("EHCI {:02x}:{:02x}.{} address {}", controller.pci.bus, controller.pci.device, controller.pci.function, target.address), vendor, product, speed);
+            if crate::usb_audio::attach_ehci(controller, controller_index, target, description, configuration[5]) {
+                return Ok(true);
+            }
+        }
+        crate::println!(
+            "USB: EHCI {:02x}:{:02x}.{} address {}: {vendor:04x}:{product:04x} (device class {:#04x}): nothing here uses it.",
+            controller.pci.bus,
+            controller.pci.device,
+            controller.pci.function,
+            target.address,
+            found.descriptor[4]
+        );
         return Ok(false);
     };
     controller.set_configuration(&target, configuration[5])?;

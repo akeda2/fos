@@ -55,6 +55,11 @@ const CMD_RUN: u32 = 1 << 0;
 const CMD_RESET: u32 = 1 << 1;
 const CMD_PERIODIC_ENABLE: u32 = 1 << 4;
 const CMD_ASYNC_ENABLE: u32 = 1 << 5;
+const CMD_IAAD: u32 = 1 << 6;
+const STS_USBINT: u32 = 1 << 0;
+const STS_USBERRINT: u32 = 1 << 1;
+const STS_HSE: u32 = 1 << 4;
+const STS_IAA: u32 = 1 << 5;
 const STS_HALTED: u32 = 1 << 12;
 const STS_PERIODIC_RUNNING: u32 = 1 << 14;
 const STS_ASYNC_RUNNING: u32 = 1 << 15;
@@ -127,6 +132,77 @@ impl Target {
 /// QH dword 1: device address, endpoint, endpoint speed, data toggle from the qTD,
 /// head-of-list flag, max packet size, and the "control endpoint" flag that a
 /// non-high-speed control endpoint must carry.
+/// How many iTDs each stream keeps in the periodic list: one per frame, revisited every `ISO_RING` ms (it must divide the
+/// 1024 frame-list entries). A refilled iTD plays that long after it was filled, which is the playback latency.
+pub const ISO_RING: usize = 16;
+/// An iTD is 64 bytes, plus seven extended-buffer-pointer dwords (high address halves) on a controller with 64-bit
+/// addressing: 92 bytes, so the stride is 128 (32-byte aligned). With a 64-byte stride the high words of iTD k are the
+/// status words of iTD k+1: the controller then DMAs to garbage addresses (only the last iTD of a page works).
+pub const ITD_BYTES: usize = 128;
+
+/// Builds an isochronous transfer descriptor. An iTD is one frame of a high-speed isochronous endpoint: eight
+/// transaction slots, one per microframe, whose status words the controller rewrites (bit 31 = Active until the slot
+/// ran, bits 30:28 = errors, 27:16 = bytes moved for an IN slot). The endpoint, direction, packet size and the pages of
+/// the data buffer (`region`, page aligned, `pages` pages, physically contiguous) never change, so they are written
+/// once here; `itd_arm` fills the slots for each lap. All slots start inactive.
+pub fn itd_init(itd: usize, target: &Target, endpoint: u8, max_packet: u16, input: bool, region: u64, pages: usize) {
+    for word in 0..ITD_BYTES / 4 {
+        write32(itd + 4 * word, 0);
+    }
+    write32(itd, TERMINATE);
+    let page = |n: usize| if n < pages { ((region as u32) & !0xfff).wrapping_add(n as u32 * 0x1000) } else { 0 };
+    write32(itd + 4 * 9, page(0) | (u32::from(endpoint & 0xf) << 8) | u32::from(target.address));
+    write32(itd + 4 * 10, page(1) | (u32::from(input) << 11) | u32::from(max_packet & 0x7ff));
+    write32(itd + 4 * 11, page(2) | 1); // Mult 1: one transaction per microframe
+    for n in 3..7 {
+        write32(itd + 4 * (9 + n), page(n));
+    }
+}
+
+/// Arms an iTD for its next visit: transaction `j` runs in microframe `j * step` and moves `lengths[j]` bytes at offset
+/// `j * max_packet` of the buffer region. The last transaction raises an interrupt (IOC) when it completes.
+pub fn itd_arm(itd: usize, step: usize, lengths: &[u16], max_packet: u16) {
+    for slot in 0..8 {
+        write32(itd + 4 * (1 + slot), 0);
+    }
+    for (j, &length) in lengths.iter().enumerate() {
+        let offset = j * usize::from(max_packet);
+        let ioc = u32::from(j + 1 == lengths.len());
+        let word = (1 << 31) | (u32::from(length) << 16) | (ioc << 15) | (((offset >> 12) as u32) << 12) | (offset & 0xfff) as u32;
+        write32(itd + 4 * (1 + j * step), word);
+    }
+}
+
+/// True while any of the iTD's `count` transactions (every `step` microframes) has not run yet.
+pub fn itd_active(itd: usize, step: usize, count: usize) -> bool {
+    (0..count).any(|j| read32(itd + 4 * (1 + j * step)) & (1 << 31) != 0)
+}
+
+/// The finished transaction `j`: (bytes moved, error bits). The error bits are data buffer error, babble, transaction error.
+pub fn itd_result(itd: usize, step: usize, j: usize) -> (usize, u32) {
+    let word = read32(itd + 4 * (1 + j * step));
+    (((word >> 16) & 0xfff) as usize, (word >> 28) & 0x7)
+}
+
+/// The completion interrupt: acknowledge what is ours (only bits that were enabled, since the line may be shared) and
+/// let the audio code service its iTD rings.
+fn isr(context: usize) {
+    let Some(controller) = controller(context) else { return };
+    let enabled = read32(controller.operational + OP_USBINTR);
+    let status = read32(controller.operational + OP_USBSTS) & enabled & (STS_USBINT | STS_USBERRINT | STS_IAA | STS_HSE);
+    if status == 0 {
+        return;
+    }
+    write32(controller.operational + OP_USBSTS, status);
+    if status & STS_HSE != 0 {
+        let command = read32(controller.operational + OP_USBCMD);
+        controller.fault = Some((status, command, controller.frame_now()));
+    }
+    if status & (STS_USBINT | STS_USBERRINT) != 0 {
+        crate::usb_audio::ehci_event(context, controller.frame_now());
+    }
+}
+
 fn qh_characteristics(target: &Target, endpoint: u8, max_packet: u16, head: bool, control: bool) -> u32 {
     u32::from(target.address)
         | (u32::from(endpoint & 0xf) << 8)
@@ -227,6 +303,13 @@ pub struct Controller {
     pub step: &'static str,
     /// The data toggle the controller left in the last completed qTD of the previous chain.
     last_toggle: bool,
+    /// Isochronous iTD rings linked into the periodic list: 0 = playback, 1 = capture (`ISO_RING` iTDs each).
+    iso: [Option<usize>; 2],
+    /// The I/O APIC vector the controller's INTx line was routed to (0 = none) and whether probing already failed.
+    irq_vector: u8,
+    irq_failed: bool,
+    /// Host system error seen by the interrupt (the controller halts itself on one): (USBSTS, USBCMD, frame) at that moment.
+    fault: Option<(u32, u32, usize)>,
     /// Root ports where a keyboard was found (bit n = port n); rescans skip them.
     pub claimed_ports: u16,
     hubs: [Option<Hub>; MAX_HUBS],
@@ -356,7 +439,7 @@ impl Controller {
             }
         }
         apic::wait_ticks(15);
-        Ok(Controller { pci: device, operational, ports, frame, periodic, next_address: 1, step: "", last_toggle: false, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
+        Ok(Controller { pci: device, operational, ports, frame, periodic, next_address: 1, step: "", last_toggle: false, iso: [None; 2], irq_vector: 0, irq_failed: false, fault: None, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
     }
 
     fn port_register(&self, port: u8) -> usize {
@@ -823,8 +906,9 @@ impl Controller {
         self.frame + OFFSET_KEYBOARD_BUFFER + index * 0x20
     }
 
-    /// Rebuilds the async list: control QH, then every keyboard QH in use, back to the control QH.
-    /// The schedule is switched off while the links change.
+    /// Rebuilds the periodic list. Frame `f` visits, in this order: the playback iTD `f % ISO_RING`, the capture iTD
+    /// `f % ISO_RING` (isochronous descriptors must come first in a frame's chain), then every keyboard QH in use. The
+    /// schedule is switched off while the links change.
     fn relink(&mut self) {
         self.set_periodic(false);
         let mut head = TERMINATE;
@@ -835,12 +919,110 @@ impl Controller {
                 head = qh as u32 | LINK_QH;
             }
         }
-        for entry in 0..PERIODIC_ENTRIES {
-            unsafe { (self.periodic as *mut u32).add(entry).write_volatile(head) };
+        // An iTD ring is visited every ISO_RING frames, so the chain behind iTD k depends only on k.
+        let mut chain = [head; ISO_RING];
+        for (k, link) in chain.iter_mut().enumerate() {
+            for which in [1usize, 0] {
+                if let Some(base) = self.iso[which] {
+                    let itd = base + k * ITD_BYTES;
+                    write32(itd, *link); // type 0 = iTD, so the address is the link
+                    *link = itd as u32;
+                }
+            }
         }
-        if head != TERMINATE {
+        for entry in 0..PERIODIC_ENTRIES {
+            unsafe { (self.periodic as *mut u32).add(entry).write_volatile(chain[entry % ISO_RING]) };
+        }
+        if head != TERMINATE || self.iso.iter().any(Option::is_some) {
             self.set_periodic(true);
         }
+    }
+
+    // ---- isochronous transfers ----
+
+    /// The frame (millisecond) the controller is in, as an index into the periodic list.
+    pub fn frame_now(&self) -> usize {
+        ((read32(self.operational + OP_FRINDEX) >> 3) as usize) & (PERIODIC_ENTRIES - 1)
+    }
+
+    /// Links a ring of `ISO_RING` iTDs (at `itds`, 64 bytes each, built by `itd_init`) into every frame: slot 0 is
+    /// playback, 1 is capture.
+    pub fn iso_install(&mut self, which: usize, itds: usize) {
+        self.iso[which] = Some(itds);
+        self.relink();
+    }
+
+    /// Unlinks a ring. When this returns the schedule has been stopped and restarted without it, so the controller no
+    /// longer touches the iTDs and the caller may free them.
+    pub fn iso_remove(&mut self, which: usize) {
+        self.iso[which] = None;
+        self.relink();
+    }
+
+    /// Routes the controller's INTx line to a vector and turns on the completion interrupts (USBINT, USBERRINT) that
+    /// the iTDs' IOC bits raise. Probed once (EHCI has no MSI here and the ACPI routing table is not read): each
+    /// candidate pin gets a self-test with the async-advance doorbell, which makes the controller raise an interrupt on
+    /// purpose. Returns false if no pin delivered it; the caller then services the rings by polling.
+    pub fn enable_interrupts(&mut self, index: usize) -> bool {
+        if self.irq_vector == 0 {
+            if self.irq_failed {
+                return false;
+            }
+            let (first, end) = crate::ioapic::gsi_range();
+            let mut candidates = [u32::MAX; 9];
+            candidates[0] = u32::from(self.pci.interrupt_line());
+            for (slot, gsi) in (16..24u32).enumerate() {
+                candidates[slot + 1] = gsi;
+            }
+            for (position, &gsi) in candidates.iter().enumerate() {
+                if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
+                    continue;
+                }
+                let Some(vector) = crate::msi::attach_intx(gsi, isr, index) else { continue };
+                if self.interrupt_self_test(|| crate::msi::intx_count(vector)) {
+                    self.irq_vector = vector;
+                    crate::println!("EHCI {:02x}:{:02x}.{}: interrupts on I/O APIC pin {gsi}, vector {vector:#x}.", self.pci.bus, self.pci.device, self.pci.function);
+                    break;
+                }
+                crate::msi::detach_intx(vector, index);
+            }
+            if self.irq_vector == 0 {
+                self.irq_failed = true;
+                return false;
+            }
+        }
+        write32(self.operational + OP_USBSTS, STS_USBINT | STS_USBERRINT);
+        write32(self.operational + OP_USBINTR, STS_USBINT | STS_USBERRINT | STS_HSE);
+        true
+    }
+
+    /// Stops the completion interrupts (the route stays, for the next stream).
+    pub fn disable_interrupts(&mut self) {
+        write32(self.operational + OP_USBINTR, 0);
+    }
+
+    pub fn status_word(&self) -> u32 {
+        read32(self.operational + OP_USBSTS)
+    }
+
+    pub fn interrupts_enabled(&self) -> bool {
+        self.irq_vector != 0 && read32(self.operational + OP_USBINTR) != 0
+    }
+
+    /// Makes the controller raise "interrupt on async advance" and waits for the vector's count to move.
+    fn interrupt_self_test(&mut self, count: impl Fn() -> u64) -> bool {
+        let before = count();
+        write32(self.operational + OP_USBSTS, STS_IAA);
+        write32(self.operational + OP_USBINTR, STS_IAA);
+        let running = self.set_async(true);
+        if running {
+            write32(self.operational + OP_USBCMD, read32(self.operational + OP_USBCMD) | CMD_IAAD);
+        }
+        let delivered = running && wait_until(5, || count() != before);
+        write32(self.operational + OP_USBINTR, 0);
+        self.set_async(false);
+        write32(self.operational + OP_USBSTS, STS_IAA);
+        delivered
     }
 
     /// Dedicates a queue head to a keyboard's interrupt-IN endpoint and arms it.
@@ -914,6 +1096,10 @@ impl Controller {
     pub fn describe_keyboards(&self, print: &impl Fn(core::fmt::Arguments)) {
         let (cmd, sts, list) = (read32(self.operational + OP_USBCMD), read32(self.operational + OP_USBSTS), read32(self.operational + OP_ASYNCLISTADDR));
         print(format_args!("    USBCMD {cmd:#x} USBSTS {sts:#x} ASYNCLISTADDR {list:#x} frame {:#x}", self.frame));
+        print(format_args!("    FRINDEX {:#x} PERIODICLISTBASE {:#x} USBINTR {:#x} iso {:x?}", read32(self.operational + OP_FRINDEX), read32(self.operational + OP_PERIODICLISTBASE), read32(self.operational + OP_USBINTR), self.iso));
+        if let Some((status, command, frame)) = self.fault {
+            print(format_args!("    HOST SYSTEM ERROR seen: USBSTS {status:#x} USBCMD {command:#x} in frame {frame}"));
+        }
         let control = unsafe { core::slice::from_raw_parts((self.frame + OFFSET_CONTROL_QH) as *const u32, 12) };
         print(format_args!("    control QH {:#x}: {:x?}", self.frame + OFFSET_CONTROL_QH, control));
         for index in 0..MAX_KEYBOARDS {

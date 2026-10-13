@@ -234,9 +234,10 @@ pub fn report(description: &Description, path: &dyn core::fmt::Display, vendor: 
 // later unpublishes the same way after clearing its `active` flag. Everything else about a published
 // stream (its position in the window, its transfer ring, the feedback state) belongs to `irq_event`.
 
+use crate::ehci;
 use crate::memory;
 use crate::xhci::{self, Controller, Device, Ring as TransferRing};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Most transfers kept queued per stream (the array size). Capture keeps all of them (24 ms at high speed: a
 /// capture packet is delivered when it completes, so a long window adds no latency). Playback keeps only about
@@ -484,10 +485,12 @@ struct Stream {
     alt: StreamAlt,
     dci: u32,
     capture: bool,
-    ring: TransferRing,
+    /// xHCI only: the transfer ring (EHCI streams use `ehci` instead).
+    ring: Option<TransferRing>,
     doorbell: usize,
     buffers: u64,
     frames: u64,
+    ehci: Option<EhciPipe>,
     /// Slot whose completion is expected next, and the TRB address queued for each slot.
     next: usize,
     trbs: [u64; WINDOW],
@@ -507,6 +510,27 @@ struct Stream {
     bytes: AtomicU64,
     errors: AtomicU64,
     underruns: AtomicU64,
+    /// A capture stream that only measures the device's clock for a playback stream without a feedback endpoint (EHCI):
+    /// its data is counted (frames, packets) and dropped.
+    monitor: bool,
+    mon_frames: u64,
+    mon_packets: u64,
+}
+
+/// An EHCI stream: a ring of `ehci::ISO_RING` iTDs, one per frame, each refilled after it completes (see `ehci_service`).
+#[derive(Clone, Copy)]
+struct EhciPipe {
+    controller_index: usize,
+    /// 0 = playback, 1 = capture: which of the controller's two iTD rings.
+    which: usize,
+    itds: u64,
+    /// The iTD completed (or due) next.
+    next: usize,
+    /// Microframes between transactions (2^(bInterval-1)) and transactions per iTD (8 / step).
+    step: usize,
+    per_itd: usize,
+    /// Bytes of buffer per iTD (a multiple of the page size, as the iTD's buffer pointers are page based).
+    region: usize,
 }
 
 impl Stream {
@@ -515,10 +539,30 @@ impl Stream {
     }
 }
 
+/// Where the audio device is attached.
+#[derive(Clone, Copy)]
+enum Bus {
+    Xhci { controller_index: usize, controller: (u8, u8, u8), device: Device },
+    Ehci { controller_index: usize, target: ehci::Target },
+}
+
+/// Control requests on either bus.
+enum Host<'a> {
+    Xhci(&'a mut Controller, Device),
+    Ehci(&'a mut ehci::Controller, ehci::Target),
+}
+
+impl Host<'_> {
+    fn control(&mut self, request_type: u8, request: u8, value: u16, index: u16, data: &mut [u8]) -> bool {
+        match self {
+            Host::Xhci(controller, device) => controller.control_transfer(device, request_type, request, value, index, data).is_ok(),
+            Host::Ehci(controller, target) => controller.control_transfer(target, request_type, request, value, index, data).is_ok(),
+        }
+    }
+}
+
 struct AudioDevice {
-    controller_index: usize,
-    controller: (u8, u8, u8),
-    device: Device,
+    bus: Bus,
     description: Description,
     /// Rates the device offers (class 1.0: from the descriptor; class 2.0: the clock source's ranges).
     rates: [u32; 8],
@@ -538,6 +582,33 @@ pub fn attach(controller: &mut Controller, device: Device, description: Descript
     if audio().is_some() || controller.set_configuration(&device, configuration_value).is_err() {
         return false;
     }
+    let bus = Bus::Xhci { controller_index: controller.index, controller: (controller.pci.bus, controller.pci.device, controller.pci.function), device };
+    install(bus, Host::Xhci(controller, device), description);
+    true
+}
+
+/// The same for a device behind an EHCI controller. Only high-speed devices stream (a full-speed isochronous endpoint behind a
+/// hub needs split isochronous descriptors, which this driver does not build).
+pub fn attach_ehci(controller: &mut ehci::Controller, controller_index: usize, target: ehci::Target, description: Description, configuration_value: u8) -> bool {
+    if audio().is_some() {
+        return false;
+    }
+    if target.speed != ehci::Speed::High {
+        crate::println!("USB audio: a full- or low-speed device on EHCI needs split isochronous transfers, which are not supported.");
+        return false;
+    }
+    if description.alts[..description.alt_count].iter().any(|alt| alt.extra_transactions != 0 || alt.interval == 0 || alt.interval > 4) {
+        crate::println!("USB audio: this device uses high-bandwidth or slow-interval endpoints, which the EHCI driver does not stream.");
+        return false;
+    }
+    if controller.set_configuration(&target, configuration_value).is_err() {
+        return false;
+    }
+    install(Bus::Ehci { controller_index, target }, Host::Ehci(controller, target), description);
+    true
+}
+
+fn install(bus: Bus, mut host: Host, description: Description) {
     let mut rates = [0u32; 8];
     let mut rate_count = 0;
     let add = |rate: u32, rates: &mut [u32; 8], count: &mut usize| {
@@ -551,7 +622,7 @@ pub fn attach(controller: &mut Controller, device: Device, description: Descript
         // (minimum, maximum, resolution) triplets of 32-bit values.
         let mut data = [0u8; 2 + 12 * 8];
         let index = (u16::from(description.clock_sources[0]) << 8) | u16::from(description.control_interface);
-        if controller.control_transfer(&device, 0xa1, 0x02, 0x0100, index, &mut data).is_ok() {
+        if host.control(0xa1, 0x02, 0x0100, index, &mut data) {
             let ranges = usize::from(u16::from_le_bytes([data[0], data[1]])).min(8);
             for range in 0..ranges {
                 let at = 2 + 12 * range;
@@ -580,18 +651,8 @@ pub fn attach(controller: &mut Controller, device: Device, description: Descript
         }
     }
     unsafe {
-        DEVICE = Some(AudioDevice {
-            controller_index: controller.index,
-            controller: (controller.pci.bus, controller.pci.device, controller.pci.function),
-            device,
-            description,
-            rates,
-            rate_count,
-            capture: None,
-            playback: None,
-        });
+        DEVICE = Some(AudioDevice { bus, description, rates, rate_count, capture: None, playback: None });
     }
-    true
 }
 
 pub fn present() -> bool {
@@ -695,16 +756,30 @@ pub fn print_modes() {
 
 /// Selects the sample rate: class 1.0 sets it on the streaming endpoint (SET_CUR, 3 bytes), class 2.0
 /// on the clock source (SET_CUR, 4 bytes).
-fn set_rate(controller: &mut Controller, device: &Device, description: &Description, alt: &StreamAlt, rate: u32) -> bool {
+fn set_rate(host: &mut Host, description: &Description, alt: &StreamAlt, rate: u32) -> bool {
     let bytes = rate.to_le_bytes();
     if description.class_version == 2 {
         let index = (u16::from(description.clock_sources[0]) << 8) | u16::from(description.control_interface);
         let mut data = bytes;
-        controller.control_transfer(device, 0x21, 0x01, 0x0100, index, &mut data).is_ok()
+        host.control(0x21, 0x01, 0x0100, index, &mut data)
     } else {
         let mut data = [bytes[0], bytes[1], bytes[2]];
-        controller.control_transfer(device, 0x22, 0x01, 0x0100, u16::from(alt.endpoint), &mut data).is_ok()
+        host.control(0x22, 0x01, 0x0100, u16::from(alt.endpoint), &mut data)
     }
+}
+
+/// Selects the streaming alternate setting and the sample rate.
+fn select_alt(host: &mut Host, description: &Description, alt: &StreamAlt, rate: u32) -> Result<(), &'static str> {
+    if !host.control(0x01, 0x0b, u16::from(alt.alt), u16::from(alt.interface), &mut []) {
+        return Err("SET_INTERFACE failed");
+    }
+    // A class 1.0 alternate setting that offers exactly one rate (a fixed-rate device such as a PCM2902) has nothing to
+    // select, and such devices stall the request: skip it instead of warning on every start.
+    let fixed_rate = description.class_version != 2 && alt.rate_count == 1 && alt.rates[0] == rate;
+    if !fixed_rate && !set_rate(host, description, alt, rate) {
+        crate::println!("audio: the device refused sample rate {rate} (carrying on at whatever it uses).");
+    }
+    Ok(())
 }
 
 /// Everything a stream needs, built with interrupts enabled and the stream not yet visible to `irq_event`.
@@ -728,15 +803,9 @@ fn build_stream(controller: &mut Controller, device: &Device, description: &Desc
         memory::free(ring.base(), 1);
         pcm.free();
     };
-    if controller.control_transfer(device, 0x01, 0x0b, u16::from(alt.alt), u16::from(alt.interface), &mut []).is_err() {
+    if let Err(reason) = select_alt(&mut Host::Xhci(&mut *controller, *device), description, &alt, rate) {
         cleanup(&ring, &pcm);
-        return Err("SET_INTERFACE failed");
-    }
-    // A class 1.0 alternate setting that offers exactly one rate (a fixed-rate device such as a PCM2902) has nothing to
-    // select, and such devices stall the request: skip it instead of warning on every start.
-    let fixed_rate = description.class_version != 2 && alt.rate_count == 1 && alt.rates[0] == rate;
-    if !fixed_rate && !set_rate(controller, device, description, &alt, rate) {
-        crate::println!("audio: the device refused sample rate {rate} (carrying on at whatever it uses).");
+        return Err(reason);
     }
     let dci = match controller.configure_isoc_endpoint(device, alt.endpoint, alt.max_packet, alt.interval, &ring) {
         Ok(dci) => dci,
@@ -751,10 +820,11 @@ fn build_stream(controller: &mut Controller, device: &Device, description: &Desc
         alt,
         dci,
         capture,
-        ring,
+        ring: Some(ring),
         doorbell: controller.doorbell_address(device.slot),
         buffers,
         frames,
+        ehci: None,
         next: 0,
         trbs: [0; WINDOW],
         window: WINDOW,
@@ -769,6 +839,9 @@ fn build_stream(controller: &mut Controller, device: &Device, description: &Desc
         bytes: AtomicU64::new(0),
         errors: AtomicU64::new(0),
         underruns: AtomicU64::new(0),
+        monitor: false,
+        mon_frames: 0,
+        mon_packets: 0,
     };
     stream.step_q16 = stream.nominal_step();
     if !capture {
@@ -815,26 +888,39 @@ fn build_feedback(controller: &mut Controller, device: &Device, alt: &StreamAlt)
 /// Fills (playback) or just aims (capture) packet slot `slot` and queues its transfer. Interrupt context.
 fn queue_slot(stream: &mut Stream, slot: usize) {
     let address = stream.buffers + (slot * usize::from(stream.alt.max_packet)) as u64;
-    let length = if stream.capture {
-        u32::from(stream.alt.max_packet)
-    } else {
-        // This packet's frame count: the Q16 frames-per-packet step (nominal rate / packets per second, or
-        // the device's own figure from its feedback endpoint), with the fraction carried over so 44.1 kHz
-        // comes out as 44 frames per packet with a 45 once in ten.
-        let total = u64::from(stream.accumulator_q16) + u64::from(stream.step_q16);
-        let frames = (total >> 16) as u32;
-        stream.accumulator_q16 = (total & 0xffff) as u32;
-        let frame_bytes = usize::from(stream.alt.channels) * usize::from(stream.alt.subslot_bytes);
-        let wanted = (frames as usize * frame_bytes).min(usize::from(stream.alt.max_packet));
-        let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, wanted) };
-        let got = stream.pcm.pop(buffer);
-        if got < wanted {
-            buffer[got..].fill(0);
-            stream.underruns.fetch_add(1, Ordering::Relaxed);
+    let length = if stream.capture { u32::from(stream.alt.max_packet) } else { fill_playback_packet(stream, address) as u32 };
+    if let Some(ring) = stream.ring.as_mut() {
+        stream.trbs[slot] = xhci::push_isoc(ring, address, length);
+    }
+}
+
+/// Fills a playback packet at `address` from the PCM ring (silence when it is empty, counted as an underrun) and returns
+/// its length in bytes. Interrupt context.
+/// Diagnostics: the packet counts at the first and the latest underrun of the last playback stream.
+/// Diagnostics: the frames-per-packet step (Q16) measured from the device's capture data, 0 if none.
+static MEASURED_STEP: AtomicU32 = AtomicU32::new(0);
+static UNDERRUN_FIRST: AtomicU64 = AtomicU64::new(0);
+static UNDERRUN_LAST: AtomicU64 = AtomicU64::new(0);
+
+fn fill_playback_packet(stream: &mut Stream, address: u64) -> usize {
+    // This packet's frame count: the Q16 frames-per-packet step (nominal rate / packets per second, or
+    // the device's own figure from its feedback endpoint), with the fraction carried over so 44.1 kHz
+    // comes out as 44 frames per packet with a 45 once in ten.
+    let total = u64::from(stream.accumulator_q16) + u64::from(stream.step_q16);
+    let frames = (total >> 16) as u32;
+    stream.accumulator_q16 = (total & 0xffff) as u32;
+    let frame_bytes = usize::from(stream.alt.channels) * usize::from(stream.alt.subslot_bytes);
+    let wanted = (frames as usize * frame_bytes).min(usize::from(stream.alt.max_packet));
+    let buffer = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, wanted) };
+    let got = stream.pcm.pop(buffer);
+    if got < wanted {
+        buffer[got..].fill(0);
+        if stream.underruns.fetch_add(1, Ordering::Relaxed) == 0 {
+            UNDERRUN_FIRST.store(stream.packets.load(Ordering::Relaxed), Ordering::Relaxed);
         }
-        wanted as u32
-    };
-    stream.trbs[slot] = xhci::push_isoc(&mut stream.ring, address, length);
+        UNDERRUN_LAST.store(stream.packets.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+    wanted
 }
 
 /// Handles one feedback transfer event of `stream`. Interrupt context.
@@ -886,10 +972,11 @@ pub fn irq_event(index: usize, event: &xhci::Trb) -> bool {
         return false;
     }
     let Some(device) = audio() else { return false };
-    if device.controller_index != index || event.slot_number() != device.device.slot {
+    let Bus::Xhci { controller_index, device: xhci_device, .. } = device.bus else { return false };
+    if controller_index != index || event.slot_number() != xhci_device.slot {
         return false;
     }
-    let high_speed = device.device.speed >= 3;
+    let high_speed = xhci_device.speed >= 3;
     for stream in [device.capture.as_mut(), device.playback.as_mut()].into_iter().flatten() {
         let ours = event.endpoint_index() == stream.dci || stream.feedback.as_ref().is_some_and(|feedback| feedback.dci == event.endpoint_index());
         if !ours {
@@ -944,7 +1031,7 @@ fn publish(slot: &mut Option<Stream>, stream: Stream) {
 }
 
 /// Starts capture and/or playback at `rate`. Returns a reason on failure.
-pub fn start(controller: &mut Controller, rate: u32, want_capture: bool, want_playback: bool) -> Result<(), &'static str> {
+pub fn start(rate: u32, want_capture: bool, want_playback: bool) -> Result<(), &'static str> {
     let Some(device) = audio() else { return Err("no USB audio device") };
     if device.capture.is_some() || device.playback.is_some() {
         return Err("already running");
@@ -952,19 +1039,240 @@ pub fn start(controller: &mut Controller, rate: u32, want_capture: bool, want_pl
     if device.rate_count > 0 && !device.rates[..device.rate_count].contains(&rate) {
         return Err("the device does not offer that sample rate");
     }
-    let dev = device.device;
+    let bus = device.bus;
     let description = Description { ..clone_description(&device.description) };
-    if want_capture {
-        let alt = choose_alt(device, true, rate)?;
-        let stream = build_stream(controller, &dev, &description, alt, rate, true)?;
-        publish(&mut device.capture, stream);
-    }
-    if want_playback {
-        let alt = choose_alt(device, false, rate)?;
-        let stream = build_stream(controller, &dev, &description, alt, rate, false)?;
-        publish(&mut device.playback, stream);
+    for capture in [true, false] {
+        let monitor = capture && !want_capture && want_playback && matches!(bus, Bus::Ehci { .. });
+        if capture && !want_capture && !monitor || !capture && !want_playback {
+            continue;
+        }
+        let alt = match choose_alt(device, capture, rate) {
+            Ok(alt) => alt,
+            Err(_) if monitor => continue,
+            Err(reason) => return Err(reason),
+        };
+        let result = match bus {
+            Bus::Xhci { device: xhci_device, .. } => {
+                let controller = controller().ok_or("no USB audio device")?;
+                build_stream(controller, &xhci_device, &description, alt, rate, capture).map(|stream| publish(if capture { &mut device.capture } else { &mut device.playback }, stream))
+            }
+            Bus::Ehci { controller_index, target } => {
+                let controller = ehci::controller(controller_index).ok_or("no USB audio device")?;
+                build_ehci_stream(controller, controller_index, target, &description, alt, rate, capture, monitor)
+                    .map(|stream| publish_ehci(controller, if capture { &mut device.capture } else { &mut device.playback }, stream))
+            }
+        };
+        match result {
+            Err(_) if monitor => {}
+            other => other?,
+        }
     }
     Ok(())
+}
+
+/// Everything an EHCI stream needs: the packet buffers (one page-aligned region per iTD), the iTD ring linked into the
+/// controller's periodic list, the PCM ring. Built with interrupts enabled and the stream not yet visible to
+/// `ehci_event`. Memory stays below 256 MiB, where the first real EHCI is known to work (see `ehci.rs`).
+fn build_ehci_stream(controller: &mut ehci::Controller, controller_index: usize, target: ehci::Target, description: &Description, alt: StreamAlt, rate: u32, capture: bool, monitor: bool) -> Result<Stream, &'static str> {
+    if alt.max_packet == 0 || alt.max_packet > 1024 {
+        return Err("the endpoint has no usable packet size");
+    }
+    let step = 1usize << (alt.interval.clamp(1, 4) - 1);
+    let per_itd = 8 / step;
+    let region = (per_itd * usize::from(alt.max_packet)).next_multiple_of(4096);
+    let frames = (ehci::ISO_RING * region / 4096) as u64;
+    let low = Some(256u64 << 20);
+    let buffers = memory::allocate_contiguous(frames, low).ok_or("no memory for the packet buffers")?;
+    let Some(itds) = memory::allocate_contiguous(1, low) else {
+        memory::free(buffers, frames);
+        return Err("no memory for the descriptors");
+    };
+    let Some(pcm) = (if capture && !monitor { allocate_capture_ring() } else { PcmRing::allocate(RING_BYTES) }) else {
+        memory::free(buffers, frames);
+        memory::free(itds, 1);
+        return Err("no memory for the PCM ring");
+    };
+    let cleanup = |pcm: &PcmRing| {
+        memory::free(buffers, frames);
+        memory::free(itds, 1);
+        pcm.free();
+    };
+    if let Err(reason) = select_alt(&mut Host::Ehci(&mut *controller, target), description, &alt, rate) {
+        cleanup(&pcm);
+        return Err(reason);
+    }
+    for k in 0..ehci::ISO_RING {
+        ehci::itd_init(itds as usize + k * ehci::ITD_BYTES, &target, alt.endpoint, alt.max_packet, capture, buffers + (k * region) as u64, region / 4096);
+    }
+    let which = usize::from(capture);
+    let mut stream = Stream {
+        alt,
+        dci: 0,
+        capture,
+        ring: None,
+        doorbell: 0,
+        buffers,
+        frames,
+        ehci: Some(EhciPipe { controller_index, which, itds, next: 0, step, per_itd, region }),
+        next: 0,
+        trbs: [0; WINDOW],
+        window: ehci::ISO_RING,
+        pcm,
+        step_q16: 0,
+        accumulator_q16: 0,
+        feedback: None,
+        packets_per_second: (8000 / step as u32).max(1),
+        rate,
+        active: AtomicBool::new(false),
+        packets: AtomicU64::new(0),
+        bytes: AtomicU64::new(0),
+        errors: AtomicU64::new(0),
+        underruns: AtomicU64::new(0),
+        monitor: false,
+        mon_frames: 0,
+        mon_packets: 0,
+    };
+    stream.step_q16 = stream.nominal_step();
+    stream.monitor = monitor;
+    Ok(stream)
+}
+
+/// Fills (playback) or aims (capture) the iTD at ring position `k` and arms it. Interrupt context.
+fn ehci_fill(stream: &mut Stream, k: usize) {
+    let Some(pipe) = stream.ehci else { return };
+    let region = stream.buffers + (k * pipe.region) as u64;
+    let max_packet = usize::from(stream.alt.max_packet);
+    let mut lengths = [0u16; 8];
+    for (j, length) in lengths[..pipe.per_itd].iter_mut().enumerate() {
+        *length = if stream.capture { max_packet as u16 } else { fill_playback_packet(stream, region + (j * max_packet) as u64) as u16 };
+    }
+    ehci::itd_arm(pipe.itds as usize + k * ehci::ITD_BYTES, pipe.step, &lengths[..pipe.per_itd], stream.alt.max_packet);
+}
+
+/// Links the iTD ring into the periodic list, then (interrupts off, so `ehci_event` sees the stream complete or not at all)
+/// arms every iTD in the order the controller will visit them, starting two frames from now.
+fn publish_ehci(controller: &mut ehci::Controller, slot: &mut Option<Stream>, stream: Stream) {
+    let Some(pipe) = stream.ehci else { return };
+    if !controller.enable_interrupts(pipe.controller_index) {
+        crate::println!("audio: no interrupt path for EHCI; the descriptors are serviced from the foreground (`audio::poll`).");
+    }
+    controller.iso_install(pipe.which, pipe.itds as usize);
+    let was = crate::cpu::interrupts_save_and_disable();
+    *slot = Some(stream);
+    let stream = slot.as_mut().unwrap();
+    let first = (controller.frame_now() + 2) % ehci::ISO_RING;
+    if let Some(pipe) = stream.ehci.as_mut() {
+        pipe.next = first;
+    }
+    for offset in 0..ehci::ISO_RING {
+        ehci_fill(stream, (first + offset) % ehci::ISO_RING);
+    }
+    stream.active.store(true, Ordering::Release);
+    crate::cpu::interrupts_restore(was);
+}
+
+/// Completed iTDs of one stream: collect what a capture iTD received, refill and re-arm it, move on. An iTD is visited once
+/// every `ISO_RING` frames; one that is still active although its frame has passed was missed (the schedule stopped, or
+/// this ran too late): it is counted and re-armed anyway. Interrupt context.
+/// Diagnostics of the EHCI capture path, per iTD ring position: bytes the controller reported, and how many of them were non-zero.
+static ISO_LEN: [AtomicU64; ehci::ISO_RING] = [const { AtomicU64::new(0) }; ehci::ISO_RING];
+static ISO_NONZERO: [AtomicU64; ehci::ISO_RING] = [const { AtomicU64::new(0) }; ehci::ISO_RING];
+
+fn ehci_service(stream: &mut Stream, frame: usize) {
+    for _ in 0..ehci::ISO_RING {
+        let Some(pipe) = stream.ehci else { return };
+        let itd = pipe.itds as usize + pipe.next * ehci::ITD_BYTES;
+        let since = (frame + ehci::ISO_RING - pipe.next) % ehci::ISO_RING;
+        if ehci::itd_active(itd, pipe.step, pipe.per_itd) {
+            if since == 0 || since > ehci::ISO_RING / 2 {
+                return; // running now, or not due yet
+            }
+            stream.errors.fetch_add(1, Ordering::Relaxed);
+        } else if stream.capture {
+            let region = stream.buffers + (pipe.next * pipe.region) as u64;
+            for j in 0..pipe.per_itd {
+                let (length, errors) = ehci::itd_result(itd, pipe.step, j);
+                if errors != 0 {
+                    stream.errors.fetch_add(1, Ordering::Relaxed);
+                } else if length > 0 && stream.monitor {
+                    stream.mon_frames += (length / (usize::from(stream.alt.channels) * usize::from(stream.alt.subslot_bytes)).max(1)) as u64;
+                } else if length > 0 {
+                    let data = unsafe { core::slice::from_raw_parts((region + (j * usize::from(stream.alt.max_packet)) as u64) as *const u8, length) };
+                    stream.bytes.fetch_add(length as u64, Ordering::Relaxed);
+                    ISO_LEN[pipe.next].fetch_add(length as u64, Ordering::Relaxed);
+                    ISO_NONZERO[pipe.next].fetch_add(data.iter().filter(|&&b| b != 0).count() as u64, Ordering::Relaxed);
+                    stream.pcm.push_whole(data);
+                }
+            }
+        } else {
+            for j in 0..pipe.per_itd {
+                if ehci::itd_result(itd, pipe.step, j).1 != 0 {
+                    stream.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        stream.packets.fetch_add(pipe.per_itd as u64, Ordering::Relaxed);
+        stream.mon_packets += pipe.per_itd as u64;
+        ehci_fill(stream, pipe.next);
+        if let Some(pipe) = stream.ehci.as_mut() {
+            pipe.next = (pipe.next + 1) % ehci::ISO_RING;
+        }
+    }
+}
+
+/// The EHCI completion interrupt (or `ehci_poll`): services the running streams. Must not allocate, print or wait.
+pub fn ehci_event(index: usize, frame: usize) {
+    let Some(device) = audio() else { return };
+    let Bus::Ehci { controller_index, .. } = device.bus else { return };
+    if controller_index != index {
+        return;
+    }
+    for stream in [device.capture.as_mut(), device.playback.as_mut()].into_iter().flatten() {
+        if stream.active.load(Ordering::Acquire) {
+            ehci_service(stream, frame);
+        }
+    }
+    // Implicit feedback: an asynchronous device without a feedback endpoint consumes at its own clock, which the
+    // frames it delivers per packet reveal (it sends one sample per tick of that clock). The running average over
+    // the whole stream becomes the playback stream's frames-per-packet step (Q16), within 1% of nominal.
+    if let (Some(monitor), Some(playback)) = (device.capture.as_ref(), device.playback.as_mut()) {
+        if monitor.monitor && monitor.mon_packets >= 4000 {
+            let measured = ((monitor.mon_frames << 16) / monitor.mon_packets) as u32;
+            let nominal = playback.nominal_step();
+            if measured > nominal - nominal / 100 && measured < nominal + nominal / 100 {
+                playback.step_q16 = measured;
+                MEASURED_STEP.store(measured, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Foreground servicing for an EHCI audio device whose interrupt could not be routed.
+pub fn ehci_poll() {
+    let Some(device) = audio() else { return };
+    let Bus::Ehci { controller_index, .. } = device.bus else { return };
+    if device.capture.is_none() && device.playback.is_none() {
+        return;
+    }
+    let Some(controller) = ehci::controller(controller_index) else { return };
+    if controller.interrupts_enabled() {
+        return;
+    }
+    let was = crate::cpu::interrupts_save_and_disable();
+    ehci_event(controller_index, controller.frame_now());
+    crate::cpu::interrupts_restore(was);
+}
+
+/// The device at hub port `hub_port` of hub `hub_address` (or on root port: hub_address 0) of an EHCI controller went away: forget
+/// it if it was the audio device.
+pub fn ehci_departed(controller_index: usize, hub_address: u8, hub_port: u8) {
+    let Some(device) = audio() else { return };
+    let Bus::Ehci { controller_index: index, target } = device.bus else { return };
+    if index != controller_index || target.hub_address != hub_address || (hub_port != 0 && target.hub_port != hub_port) {
+        return;
+    }
+    stop();
+    unsafe { DEVICE = None };
 }
 
 fn clone_description(description: &Description) -> Description {
@@ -978,7 +1286,7 @@ fn clone_description(description: &Description) -> Description {
     }
 }
 
-fn stop_stream(controller: &mut Controller, device: &Device, mut stream: Stream) {
+fn stop_stream(host: &mut Host, mut stream: Stream) {
     if !stream.capture {
         // What the stream did, for diagnosing underruns after a run (frames per packet, Q16 shown as milli-frames).
         let milli = |value: u32| (u64::from(value) * 1000) >> 16;
@@ -988,6 +1296,13 @@ fn stop_stream(controller: &mut Controller, device: &Device, mut stream: Stream)
             stream.underruns.load(Ordering::Relaxed),
             milli(stream.nominal_step())
         ));
+        let measured = MEASURED_STEP.swap(0, Ordering::Relaxed);
+        if measured != 0 {
+            crate::print(format_args!(" (measured {} mf/packet = {} ppm vs nominal)", milli(measured), (i64::from(measured) - i64::from(stream.nominal_step())) * 1_000_000 / i64::from(stream.nominal_step())));
+        }
+        if stream.underruns.load(Ordering::Relaxed) > 0 {
+            crate::print(format_args!(" (first at packet {}, last at {})", UNDERRUN_FIRST.load(Ordering::Relaxed), UNDERRUN_LAST.load(Ordering::Relaxed)));
+        }
         match stream.feedback.as_ref() {
             Some(feedback) if feedback.received.load(Ordering::Relaxed) > 0 => crate::println!(
                 "; feedback {} reports ({} rejected), {} to {} mf/packet.",
@@ -1000,24 +1315,58 @@ fn stop_stream(controller: &mut Controller, device: &Device, mut stream: Stream)
             None => crate::println!("; no feedback endpoint (nominal rate used)."),
         }
     }
-    if let Some(feedback) = stream.feedback.take() {
-        controller.stop_endpoint(device.slot, feedback.dci);
-        controller.drop_endpoint(device, feedback.dci);
-        memory::free(feedback.buffers, 1);
-        memory::free(feedback.ring.base(), 1);
+    match host {
+        Host::Xhci(controller, device) => {
+            if let Some(feedback) = stream.feedback.take() {
+                controller.stop_endpoint(device.slot, feedback.dci);
+                controller.drop_endpoint(device, feedback.dci);
+                memory::free(feedback.buffers, 1);
+                memory::free(feedback.ring.base(), 1);
+            }
+            controller.stop_endpoint(device.slot, stream.dci);
+            controller.drop_endpoint(device, stream.dci);
+            if let Some(ring) = stream.ring.as_ref() {
+                memory::free(ring.base(), 1);
+            }
+        }
+        Host::Ehci(controller, _) => {
+            if let Some(pipe) = stream.ehci {
+                crate::println!(
+                    "ehci iso: {} packets, {} bytes, {} errors, next {}, frame {}, itd0 {:08x} {:08x} sts {:08x}",
+                    stream.packets.load(Ordering::Relaxed),
+                    stream.bytes.load(Ordering::Relaxed),
+                    stream.errors.load(Ordering::Relaxed),
+                    pipe.next,
+                    controller.frame_now(),
+                    unsafe { core::ptr::read_volatile(pipe.itds as *const u32) },
+                    unsafe { core::ptr::read_volatile((pipe.itds + 4) as *const u32) },
+                    controller.status_word()
+                );
+                if stream.capture {
+                    for k in [0usize, 1, 14, 15] {
+                        let itd = pipe.itds + (k * ehci::ITD_BYTES) as u64;
+                        let word = |n: usize| unsafe { core::ptr::read_volatile((itd as usize + 4 * n) as *const u32) };
+                        let buffer = stream.buffers + (k * pipe.region) as u64;
+                        let head = unsafe { core::ptr::read_volatile(buffer as *const u64) };
+                        crate::println!("  itd{k} @{itd:#x}: w9 {:08x} w10 {:08x} w11 {:08x} w12 {:08x}, buffer {buffer:#x} starts {head:016x}", word(9), word(10), word(11), word(12));
+                    }
+                    for k in 0..ehci::ISO_RING {
+                        crate::println!("  iTD {k}: {} bytes, {} non-zero", ISO_LEN[k].swap(0, Ordering::Relaxed), ISO_NONZERO[k].swap(0, Ordering::Relaxed));
+                    }
+                }
+                controller.iso_remove(pipe.which); // the schedule restarts without the ring: the controller is done with the iTDs
+                memory::free(pipe.itds, 1);
+            }
+        }
     }
-    controller.stop_endpoint(device.slot, stream.dci);
-    controller.drop_endpoint(device, stream.dci);
-    let _ = controller.control_transfer(device, 0x01, 0x0b, 0, u16::from(stream.alt.interface), &mut []); // back to alternate setting 0
+    let _ = host.control(0x01, 0x0b, 0, u16::from(stream.alt.interface), &mut []); // back to alternate setting 0
     memory::free(stream.buffers, stream.frames);
-    memory::free(stream.ring.base(), 1);
     stream.pcm.free();
 }
 
-pub fn stop(controller: &mut Controller) {
+pub fn stop() {
     let Some(device) = audio() else { return };
-    let dev = device.device;
-    // 1. Tell `irq_event` to stop touching the streams (their events are swallowed from now on).
+    // 1. Tell `irq_event` and `ehci_event` to stop touching the streams (their events are swallowed from now on).
     let was = crate::cpu::interrupts_save_and_disable();
     for stream in [device.capture.as_ref(), device.playback.as_ref()].into_iter().flatten() {
         stream.active.store(false, Ordering::Release);
@@ -1028,17 +1377,26 @@ pub fn stop(controller: &mut Controller) {
     let capture = device.capture.take();
     let playback = device.playback.take();
     crate::cpu::interrupts_restore(was);
-    if let Some(stream) = capture {
-        stop_stream(controller, &dev, stream);
-    }
-    if let Some(stream) = playback {
-        stop_stream(controller, &dev, stream);
+    match device.bus {
+        Bus::Xhci { device: xhci_device, .. } => {
+            let Some(controller) = controller() else { return };
+            for stream in [capture, playback].into_iter().flatten() {
+                stop_stream(&mut Host::Xhci(&mut *controller, xhci_device), stream);
+            }
+        }
+        Bus::Ehci { controller_index, target } => {
+            let Some(controller) = ehci::controller(controller_index) else { return };
+            for stream in [capture, playback].into_iter().flatten() {
+                stop_stream(&mut Host::Ehci(&mut *controller, target), stream);
+            }
+            controller.disable_interrupts();
+        }
     }
 }
 
-/// The xHCI controller the audio device is on.
+/// The xHCI controller the audio device is on (None for a device on EHCI).
 pub fn controller() -> Option<&'static mut Controller> {
-    let identity = audio()?.controller;
+    let Bus::Xhci { controller: identity, .. } = audio()?.bus else { return None };
     (0..xhci::count()).find_map(|index| xhci::controller(index).filter(|c| (c.pci.bus, c.pci.device, c.pci.function) == identity))
 }
 
