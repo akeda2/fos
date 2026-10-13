@@ -229,8 +229,10 @@ pub const SERIAL_BAD_SETTINGS: i32 = -2;
 /// The port belongs to the kernel (`serial-shell` in `settings`): the shell is on it.
 pub const SERIAL_BUSY: i32 = -3;
 
-/// `SerialInfo::kind`: what drives the port. Later kinds (USB serial adapters) will get new values.
+/// `SerialInfo::kind`: what drives the port.
 pub const SERIAL_KIND_UART: u32 = 1;
+/// A USB serial adapter (`kernel/src/usb_serial.rs`); its ports are numbered after the UARTs.
+pub const SERIAL_KIND_USB: u32 = 2;
 
 /// What `serial_info` fills in. Kernel-filled, so never extend it: a new fact gets a new call.
 #[repr(C)]

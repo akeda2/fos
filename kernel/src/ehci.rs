@@ -303,6 +303,8 @@ pub struct Controller {
     pub step: &'static str,
     /// The data toggle the controller left in the last completed qTD of the previous chain.
     last_toggle: bool,
+    /// How long `wait_chain` waits for the current transfer, in ticks (`TIMEOUT_TICKS` unless a caller shortens it).
+    wait_limit: u64,
     /// Isochronous iTD rings linked into the periodic list: 0 = playback, 1 = capture (`ISO_RING` iTDs each).
     iso: [Option<usize>; 2],
     /// The I/O APIC vector the controller's INTx line was routed to (0 = none) and whether probing already failed.
@@ -439,7 +441,7 @@ impl Controller {
             }
         }
         apic::wait_ticks(15);
-        Ok(Controller { pci: device, operational, ports, frame, periodic, next_address: 1, step: "", last_toggle: false, iso: [None; 2], irq_vector: 0, irq_failed: false, fault: None, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
+        Ok(Controller { pci: device, operational, ports, frame, periodic, next_address: 1, step: "", last_toggle: false, wait_limit: TIMEOUT_TICKS, iso: [None; 2], irq_vector: 0, irq_failed: false, fault: None, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
     }
 
     fn port_register(&self, port: u8) -> usize {
@@ -552,7 +554,7 @@ impl Controller {
             if finished {
                 return Ok(remaining);
             }
-            if apic::ticks().wrapping_sub(start) >= TIMEOUT_TICKS {
+            if apic::ticks().wrapping_sub(start) >= self.wait_limit {
                 return Err(Error::Timeout);
             }
         }
@@ -619,6 +621,15 @@ impl Controller {
         *toggle = self.last_toggle;
         let left: u32 = remaining[..count].iter().sum();
         Ok(length - left as usize)
+    }
+
+    /// `bulk_transfer` that gives up after `ticks` (10 ms each) instead of a second: for polling an IN endpoint that is
+    /// usually idle (a USB serial adapter). A timeout means "nothing there", and the queue is left clean.
+    pub fn bulk_transfer_within(&mut self, ticks: u64, target: &Target, endpoint: u8, max_packet: u16, buffer: u32, length: usize, data_in: bool, toggle: &mut bool) -> Result<usize, Error> {
+        self.wait_limit = ticks;
+        let outcome = self.bulk_transfer(target, endpoint, max_packet, buffer, length, data_in, toggle);
+        self.wait_limit = TIMEOUT_TICKS;
+        outcome
     }
 
     pub fn get_descriptor(&mut self, target: &Target, kind: u8, index: u8, buffer: &mut [u8]) -> Result<usize, Error> {
@@ -787,6 +798,15 @@ impl Controller {
         for slot in self.hubs.iter_mut() {
             if slot.is_some_and(|hub| hub.root_port == port) {
                 *slot = None;
+            }
+        }
+    }
+
+    /// Makes `rescan_hub` treat the device on a hub port as new: its port is reset and the device addressed again.
+    pub fn unclaim_hub_child(&mut self, hub_address: u8, hub_port: u8) {
+        for hub in self.hubs.iter_mut().flatten() {
+            if hub.target.address == hub_address {
+                hub.claimed &= !(1 << hub_port);
             }
         }
     }

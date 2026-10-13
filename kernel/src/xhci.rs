@@ -1259,27 +1259,32 @@ impl Controller {
     }
 
     /// Adds a device's two bulk endpoints (Configure Endpoint). `*_endpoint` are endpoint
-    /// addresses (bit 7 = IN); `burst` is the SuperSpeed companion's max burst.
+    /// addresses (bit 7 = IN); `burst` is the SuperSpeed companion's max burst. An endpoint
+    /// number of 0 leaves that direction out (a device in a firmware-download state has only a bulk OUT).
     #[allow(clippy::too_many_arguments)]
     pub fn configure_bulk_endpoints(&mut self, device: &Device, in_endpoint: u8, in_max_packet: u16, in_burst: u8, out_endpoint: u8, out_max_packet: u16, out_burst: u8) -> Result<(), Error> {
         let slot = usize::from(device.slot);
-        let in_dci = u32::from(in_endpoint & 0x0f) * 2 + 1;
+        let in_dci = if in_endpoint & 0x0f != 0 { u32::from(in_endpoint & 0x0f) * 2 + 1 } else { 0 };
         let out_dci = u32::from(out_endpoint & 0x0f) * 2;
-        if in_dci >= DCI_COUNT as u32 || out_dci == 0 || out_dci >= DCI_COUNT as u32 {
+        if (in_dci == 0 && out_dci == 0) || in_dci >= DCI_COUNT as u32 || out_dci >= DCI_COUNT as u32 {
             return Err(Error::Unsupported);
         }
-        let in_ring = Ring::allocate().ok_or(Error::NoMemory)?;
-        let out_ring = Ring::allocate().ok_or(Error::NoMemory)?;
+        let in_ring = if in_dci != 0 { Ring::allocate().ok_or(Error::NoMemory)? } else { NO_RING };
+        let out_ring = if out_dci != 0 { Ring::allocate().ok_or(Error::NoMemory)? } else { NO_RING };
         let (input, output) = (self.slots[slot].input, self.slots[slot].output);
         unsafe {
             core::ptr::write_bytes(input as *mut u8, 0, memory::FRAME as usize);
-            (input as *mut u32).add(1).write_volatile(1 | (1 << in_dci) | (1 << out_dci)); // add the slot context and both endpoints
+            let added = (u32::from(in_dci != 0) << in_dci) | (u32::from(out_dci != 0) << out_dci);
+            (input as *mut u32).add(1).write_volatile(1 | added); // add the slot context and the endpoints
             core::ptr::copy_nonoverlapping(output as *const u8, self.context_slot(input) as *mut u8, 32);
             let slot_context = self.context_slot(input) as *mut u32;
             let word0 = slot_context.read_volatile();
             let entries = ((word0 >> 27) & 0x1f).max(in_dci.max(out_dci)); // keep what an earlier endpoint (audio) already needs
             slot_context.write_volatile((word0 & !(0x1f << 27)) | (entries << 27));
             for (dci, ring, endpoint_type, max_packet, burst) in [(in_dci, in_ring, 6u32, in_max_packet, in_burst), (out_dci, out_ring, 2u32, out_max_packet, out_burst)] {
+                if dci == 0 {
+                    continue;
+                }
                 let context = self.context_endpoint(input, dci) as *mut u32;
                 context.add(1).write_volatile((3 << 1) | (endpoint_type << 3) | (u32::from(burst) << 8) | (u32::from(max_packet) << 16));
                 context.add(2).write_volatile(ring.base as u32 | 1);
@@ -1287,8 +1292,12 @@ impl Controller {
                 context.add(4).write_volatile(1024);
             }
         }
-        self.slots[slot].rings[in_dci as usize] = in_ring;
-        self.slots[slot].rings[out_dci as usize] = out_ring;
+        if in_dci != 0 {
+            self.slots[slot].rings[in_dci as usize] = in_ring;
+        }
+        if out_dci != 0 {
+            self.slots[slot].rings[out_dci as usize] = out_ring;
+        }
         self.command(input, 0, (TRB_CONFIGURE_ENDPOINT << 10) | (u32::from(device.slot) << 24))?;
         Ok(())
     }

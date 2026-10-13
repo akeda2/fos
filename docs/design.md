@@ -948,6 +948,29 @@ offered to tapes (`serial_open` gives `SERIAL_BUSY`, -3; `fterm` says so). The m
 so an idle machine burns CPU (the FIFO is 16 bytes, a pasted line would be lost otherwise); `test-idle-cpu` runs without it. `make test-serial-shell`
 boots an image with the setting and plays the laptop on COM2. Planned: USB serial adapters as another port `kind` behind the same calls.
 
+*Verified on real hardware (skylake, 2026-10-13).* A USB-serial adapter on the host (`/dev/ttyUSB3`, 115200 8n1, user in `dialout`) reached
+the shell on skylake's serial-shell port; `help`, `uptime`, `debug status`, `usb`, `disks`, `nic` and `dmesg` all worked. `debug crash`
+raises a #UD on purpose (it does not read the crash record): the exception dump went out over serial, the machine reset after the 3 s
+`reboot-delay`, came back on the same slot and re-ran `start`. The boot log (`dmesg`) can be read over the cable even with every NIC down.
+Use raw termios or `python3 -m serial.tools.miniterm /dev/ttyUSBN 115200`; send CR as Enter. Do not probe with `debug crash` or `debug hang`
+unless a reset is wanted.
+
+**USB serial adapters** (`kernel/src/usb_serial.rs` generic layer, `usb_serial_ti.rs` the first chip driver). A chip driver implements the
+`Chip` trait (claims a vendor/product, picks the configuration, runs a one-time `attach` such as a firmware download, then `open`, `close`,
+`set_lines`, `set_break`); the generic layer finds the bulk endpoints, owns the DMA bounce page, the receive ring and the statistics, and
+works on **EHCI** (blocking bulk OUT; bulk IN polled with a 10 ms limit, a timeout meaning "no data") and **xHCI** (blocking bulk OUT; one
+IN TRB kept queued, completions arriving in `background_event`, like `usb_midi`). `uart.rs` numbers the USB ports after the 16550s
+(`SERIAL_KIND_USB`, name `USB1`...), so `serial_*`, `fterm list` and `fterm N 115200 8n1` work unchanged. No shell on a USB port yet
+(`serial-shell` ignores them). Another simple chip (FTDI, CP210x, CH341, PL2303, CDC-ACM) is one more `impl Chip` and an entry in `CHIPS`.
+
+The Moxa UPort 1110 (110a:1110, TI TUSB3410) has no firmware on board: copy Moxa's `moxa-1110.fw` (linux-firmware, LICENCE.moxa) to a FOSFS
+volume (`foscopy.py --mac N moxa-1110.fw :disk1/moxa-1110.fw`). USB probing runs before the volumes are mounted at boot, so the first pass says
+the file is missing; run `usb rescan` (or put it in `start`) and the driver downloads the firmware, resets the port and picks the adapter up as
+`USB1` once it re-enumerates. A hub child is made to look new by `ehci::unclaim_hub_child`; `usb_hid::probe_all` runs one extra pass after a
+download. The modem-status interrupt endpoint is not read: CTS/DSR/DCD/RI read as low, DTR/RTS as set. Verified on real hardware (clock1,
+EHCI behind an Intel hub, to skylake's `serial-shell`): `run fterm 1 115200 8n1` showed skylake's `help`, `uptime`, `debug status` and `ls`.
+Also verified on skylake's xHCI controller (full speed, firmware download, attach, bulk OUT, queued bulk IN; the adapter's d-sub wired to skylake's own COM1 gave a console feedback loop: 112904 bytes received, no errors). `usb` shows how many IN transfers completed. Not verified: unplug/replug, rates other than 115200, parity, the adapter against a second machine (a test against amd's COM1 got nothing; its port may be off). QEMU has no TUSB3410.
+
 ### USB-MIDI (kernel/src/usb_midi.rs)
 
 Class-compliant MIDIStreaming interfaces (audio class 1, subclass 3) on xHCI, directly on a root port or behind a hub: `usb_hid::probe_device` finds one

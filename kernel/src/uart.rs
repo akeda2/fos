@@ -108,12 +108,22 @@ fn port(number: usize) -> Option<&'static mut Port> {
 
 /// How many ports there are (numbered from 1).
 pub fn count() -> usize {
+    uart_count() + crate::usb_serial::count()
+}
+
+fn uart_count() -> usize {
     ports().iter().flatten().count()
+}
+
+/// The index among the USB serial ports if `number` is past the UARTs (they are numbered after them).
+fn usb(number: usize) -> Option<usize> {
+    number.checked_sub(uart_count() + 1)
 }
 
 /// Whether a tape has any port open: the tape's wait must then poll instead of sleeping.
 pub fn any_open() -> bool {
-    unsafe { (*core::ptr::addr_of!(PORTS)).iter().flatten().any(|port| port.open) }
+    let uart_open = unsafe { (*core::ptr::addr_of!(PORTS)).iter().flatten().any(|port| port.open) };
+    uart_open || crate::usb_serial::any_open()
 }
 
 /// Moves one port's FIFO into its ring and counts line errors.
@@ -151,6 +161,7 @@ fn drain(port: &mut Port) {
 
 /// Services every open port; cheap when none is open.
 pub fn poll() {
+    crate::usb_serial::poll();
     for port in ports().iter_mut().flatten() {
         if port.open {
             drain(port);
@@ -159,6 +170,9 @@ pub fn poll() {
 }
 
 pub fn info(number: usize, out: &mut SerialInfo) -> bool {
+    if let Some(index) = usb(number) {
+        return crate::usb_serial::info(index, out);
+    }
     let Some(port) = port(number) else { return false };
     let mut name = [0u8; 8];
     name[..4].copy_from_slice(&port.name);
@@ -181,6 +195,9 @@ pub fn info(number: usize, out: &mut SerialInfo) -> bool {
 
 /// Programs the port: divisor, line format, FIFOs on and cleared, no interrupts, DTR and RTS up.
 pub fn open(number: usize, baud: u32, format: u32) -> i32 {
+    if let Some(index) = usb(number) {
+        return crate::usb_serial::open(index, baud, format);
+    }
     let Some(port) = port(number) else { return SERIAL_NO_PORT };
     if port.shell {
         return SERIAL_BUSY;
@@ -212,6 +229,9 @@ pub fn open(number: usize, baud: u32, format: u32) -> i32 {
 }
 
 pub fn close(number: usize) {
+    if let Some(index) = usb(number) {
+        return crate::usb_serial::close(index);
+    }
     if let Some(port) = port(number) {
         if port.open && !port.shell {
             port.open = false;
@@ -224,12 +244,15 @@ pub fn close(number: usize) {
 
 /// A tape that ended leaves nothing open.
 pub fn close_all() {
-    for number in 1..=3 {
+    for number in 1..=count() {
         close(number);
     }
 }
 
 pub fn read(number: usize, out: &mut [u8]) -> usize {
+    if let Some(index) = usb(number) {
+        return crate::usb_serial::read(index, out);
+    }
     let Some(port) = port(number).filter(|port| port.open && !port.shell) else { return 0 };
     drain(port);
     let mut count = 0;
@@ -243,6 +266,9 @@ pub fn read(number: usize, out: &mut [u8]) -> usize {
 
 /// Hands the transmitter bytes while its holding register says it is empty (a whole 16-byte FIFO at once); never waits.
 pub fn write(number: usize, data: &[u8]) -> usize {
+    if let Some(index) = usb(number) {
+        return crate::usb_serial::write(index, data);
+    }
     let Some(port) = port(number).filter(|port| port.open && !port.shell) else { return 0 };
     if data.is_empty() || inb(port.base + 5) & 0x20 == 0 {
         return 0;
@@ -256,6 +282,9 @@ pub fn write(number: usize, data: &[u8]) -> usize {
 }
 
 pub fn lines(number: usize) -> u32 {
+    if let Some(index) = usb(number) {
+        return crate::usb_serial::lines(index);
+    }
     let Some(port) = port(number).filter(|port| port.open && !port.shell) else { return 0 };
     let status = inb(port.base + 6);
     let mut lines = 0;
@@ -274,12 +303,18 @@ pub fn lines(number: usize) -> u32 {
 }
 
 pub fn set_lines(number: usize, lines: u32) {
+    if let Some(index) = usb(number) {
+        return crate::usb_serial::set_lines(index, lines);
+    }
     let Some(port) = port(number).filter(|port| port.open && !port.shell) else { return };
     port.modem = u8::from(lines & SERIAL_LINE_DTR != 0) | (u8::from(lines & SERIAL_LINE_RTS != 0) << 1);
     outb(port.base + 4, port.modem);
 }
 
 pub fn set_break(number: usize, on: bool) {
+    if let Some(index) = usb(number) {
+        return crate::usb_serial::set_break(index, on);
+    }
     let Some(port) = port(number).filter(|port| port.open && !port.shell) else { return };
     outb(port.base + 3, (port.format as u8 & 0x1f) | if on { 0x40 } else { 0 });
 }
@@ -296,6 +331,9 @@ static mut SHELL: Option<usize> = None;
 
 /// Gives port `number` to the shell. 0 on success, else a `SERIAL_*` code.
 pub fn open_shell(number: usize, baud: u32) -> i32 {
+    if usb(number).is_some() {
+        return SERIAL_NO_PORT; // no shell on a USB adapter (yet): the ports appear after the boot-time settings are read
+    }
     let code = open(number, baud, 0x03);
     if code == 0 {
         if let Some(port) = port(number) {

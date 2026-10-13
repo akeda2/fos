@@ -1575,6 +1575,7 @@ fn execute(command: &str) {
                 return;
             }
             crate::usb_hid::describe_devices(|arguments| crate::println!("{}", arguments));
+            crate::usb_serial::describe();
         }
         "midi" => midi_command(&mut words),
         "sleep" => {

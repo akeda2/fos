@@ -77,6 +77,16 @@ pub fn release_port(controller: &mut Controller, port: u8, route: Option<u32>) {
 /// Looks at every connected root port that is not already in use and starts any boot
 /// keyboard found. Returns how many keyboards were added.
 pub fn probe_all() -> usize {
+    let added = probe_all_once();
+    // A device that took firmware (a USB serial adapter) is reset and enumerated once more; one extra pass, so no loop.
+    if crate::usb_serial::take_reprobe() {
+        crate::apic::wait_ticks(30);
+        return added + probe_all_once();
+    }
+    added
+}
+
+fn probe_all_once() -> usize {
     let mut added = 0;
     for index in 0..xhci::count() {
         let Some(controller) = xhci::controller(index) else { continue };
@@ -89,6 +99,7 @@ pub fn probe_all() -> usize {
                 if controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port) {
                     continue;
                 }
+                crate::usb_serial::xhci_departed(index, port);
                 usb_storage::mark_xhci_port_stale(index, port); // before the slots go: nothing may use them again (a hub's children too)
                 crate::usb_hub::forget_hubs_on_port(index, port); // the hub, and any hub behind it, is gone with its port
                 release_port(controller, port, None);
@@ -238,6 +249,17 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
             controller.release_slot(device.slot);
             return Ok(false);
         }
+        match crate::usb_serial::attach_xhci(controller_index, controller, device, vendor, product, descriptor[17]) {
+            crate::usb_serial::Outcome::Attached => {
+                crate::println!("USB serial {vendor:04x}:{product:04x} on port {port} of xHCI {:02x}:{:02x}.{} ({}): ready (see `usb`).", controller.pci.bus, controller.pci.device, controller.pci.function, xhci::speed_name(device.speed));
+                return Ok(true);
+            }
+            crate::usb_serial::Outcome::Reprobe | crate::usb_serial::Outcome::Retry => {
+                controller.release_slot(device.slot); // the port is reset and the device enumerated afresh on the next pass
+                return Ok(false);
+            }
+            crate::usb_serial::Outcome::Unclaimed => {}
+        }
         controller.release_slot(device.slot);
         crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (device class {:#04x}, {}): nothing here uses it.", descriptor[4], xhci::speed_name(device.speed));
         return Ok(false);
@@ -308,7 +330,7 @@ pub fn background_event(controller: &mut Controller, event: &Trb) {
     if !event.is_transfer() {
         return;
     }
-    if crate::usb_midi::background_event(controller, event) {
+    if crate::usb_midi::background_event(controller, event) || crate::usb_serial::background_event(controller, event) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
@@ -391,9 +413,11 @@ fn probe_all_ehci() -> usize {
                 if let Some(hub_address) = controller.hub_address_on_port(port) {
                     usb_storage::mark_ehci_hub_stale(index, hub_address, 0);
                     crate::usb_audio::ehci_departed(index, hub_address, 0);
+                    crate::usb_serial::ehci_departed(index, hub_address, 0);
                     controller.forget_hub(port);
                 } else {
                     crate::usb_audio::ehci_departed(index, 0, 0);
+                    crate::usb_serial::ehci_root_departed(index, port);
                 }
                 // It was unplugged, or unplugged and plugged back in (a bumped cable, a stick moved to another machine and
                 // returned). Forget the claim and look at the port afresh; a disk that comes back is recognised in
@@ -481,6 +505,7 @@ fn rescan_ehci_hub(controller_index: usize, controller: &mut ehci::Controller, p
             controller.pci.bus, controller.pci.device, controller.pci.function);
         usb_storage::mark_ehci_hub_stale(controller_index, hub_address, hub_port);
         crate::usb_audio::ehci_departed(controller_index, hub_address, hub_port);
+        crate::usb_serial::ehci_departed(controller_index, hub_address, hub_port);
         let removed = controller.remove_keyboards_behind(hub_address, hub_port);
         drop_ehci_keyboard_entries(controller_index, removed);
     }
@@ -624,6 +649,20 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
             if crate::usb_audio::attach_ehci(controller, controller_index, target, description, configuration[5]) {
                 return Ok(true);
             }
+        }
+        match crate::usb_serial::attach_ehci(controller_index, controller, target, root_port, vendor, product, found.descriptor[17]) {
+            crate::usb_serial::Outcome::Attached => {
+                crate::println!("USB serial {vendor:04x}:{product:04x} on EHCI {:02x}:{:02x}.{} address {}: ready (see `usb`).", controller.pci.bus, controller.pci.device, controller.pci.function, target.address);
+                return Ok(true);
+            }
+            crate::usb_serial::Outcome::Reprobe | crate::usb_serial::Outcome::Retry => {
+                // A firmware download changes what the device is: reset its port so that it is enumerated afresh.
+                if target.hub_address != 0 {
+                    controller.unclaim_hub_child(target.hub_address, target.hub_port);
+                }
+                return Ok(false);
+            }
+            crate::usb_serial::Outcome::Unclaimed => {}
         }
         crate::println!(
             "USB: EHCI {:02x}:{:02x}.{} address {}: {vendor:04x}:{product:04x} (device class {:#04x}): nothing here uses it.",
