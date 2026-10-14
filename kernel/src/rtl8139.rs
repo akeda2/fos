@@ -136,6 +136,7 @@ fn isr(index: usize) {
         return;
     }
     write16(base, REG_ISR, status);
+    crate::msi::claim();
     ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
     if status & ISR_TIMEOUT != 0 {
         write32(base, REG_TIMERINT, 0); // the self-test's cause: one shot, not wanted again
@@ -267,6 +268,16 @@ impl Rtl8139 {
         write32(self.io_base, REG_MAR0 + 4, value);
     }
 
+    /// The PHY's basic mode control register: the 8139 maps it straight into I/O space (`BMCR`, 0x62).
+    pub fn phy_control(&self) -> Option<u16> {
+        Some(read16(self.io_base, 0x62))
+    }
+
+    pub fn set_phy_control(&mut self, value: u16) -> bool {
+        write16(self.io_base, 0x62, value);
+        true
+    }
+
     /// The `MSR` link-status bit (inverted: LINKB is "bad").
     pub fn link_up(&self) -> bool {
         read8(self.io_base, REG_MSR) & MSR_LINKB == 0
@@ -318,17 +329,14 @@ impl Rtl8139 {
     pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
         let mut reason = "no I/O APIC pin delivered the self-test interrupt";
         let (first, end) = crate::ioapic::gsi_range();
-        let mut candidates = [u32::MAX; 9];
-        candidates[0] = u32::from(device.interrupt_line());
-        for (slot, gsi) in (16..24u32).enumerate() {
-            candidates[slot + 1] = gsi;
-        }
+        let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
                 continue;
             }
             let Some(vector) = crate::msi::attach_intx(gsi, isr, self.index) else { continue };
-            if self.self_test(|| crate::msi::intx_count(vector)) {
+            let index = self.index;
+            if self.self_test(|| ISR[index].interrupts.load(Ordering::Relaxed)) {
                 return Ok(self.finish_interrupts(Delivery::Intx { gsi, vector }));
             }
             write16(self.io_base, REG_IMR, 0);

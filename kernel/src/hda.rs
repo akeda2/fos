@@ -1208,6 +1208,7 @@ impl Hda {
         if status == 0 {
             return; // a shared line, and not ours
         }
+        crate::msi::claim();
         self.interrupts.fetch_add(1, Ordering::Relaxed);
         if status & INTSTS_CIS != 0 {
             let response = read8(self.regs, REG_RIRBSTS);
@@ -1266,17 +1267,13 @@ impl Hda {
         // Legacy INTx: the firmware's line (a hint on APIC systems) and the pins an Intel or QEMU chipset
         // routes to the I/O APIC (GSI 16-23), probed because the ACPI routing table is not read.
         let (first, end) = crate::ioapic::gsi_range();
-        let mut candidates = [u32::MAX; 9];
-        candidates[0] = u32::from(device.interrupt_line());
-        for (slot, gsi) in (16..24u32).enumerate() {
-            candidates[slot + 1] = gsi;
-        }
+        let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
                 continue;
             }
             let Some(vector) = msi::attach_intx(gsi, isr, index) else { continue };
-            if self.self_test(|| msi::intx_count(vector)) {
+            if self.self_test(|| controller(index).interrupts.load(Ordering::Relaxed)) {
                 return Ok(Delivery::Intx { gsi, vector });
             }
             msi::detach_intx(vector, index);

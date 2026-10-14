@@ -712,6 +712,21 @@ interrupts a second), and **proves delivery** by raising a link-status interrupt
 and waiting for the message. The handler only reads `ICR` (which acknowledges) and counts;
 frames are still drained by the foreground. When every NIC has an interrupt, `wait_for_event`
 is a real `hlt` (an idle tape used 1% of a host core under QEMU, against 100% when spinning).
+The `power [N]` shell command shows where the CPU's time went (`cpu::sleep` counts time in `hlt` and wake-ups; `cpu::spun`
+counts the 100 us polling slices per reason: polled NIC, UART, serial output; the rest is "running"). It reports since boot and
+since the previous `power`, so run it after a tape ends to see what the tape did; `power N` samples N seconds at the prompt.
+It also lists the five busiest interrupt vectors (a storm shows here: the 3C905's floating GSI 11 pin fired 125000 times a
+second on the Skylake board; INTx self-tests now count only interrupts the card claimed, and an unclaimed-interrupt guard masks
+a pin that fires 200 times a tick), and on Intel CPUs the temperature, package watts (RAPL) and average speed (APERF/MPERF).
+**Frequency scaling** is `power hwp [performance|balanced|power]` or `hwp balanced` in `settings`: it turns on Intel hardware
+P-states, so the CPU ramps itself with load (a busy tape keeps full speed, no kernel policy). Off by default; it stays on until
+reset and needs real hardware. laptop1: awake speed 31% of base at the idle prompt, 104% under a spinning tape (power
+preference).
+**Parking idle NICs** (`kernel/src/nicpark.rs`): `nic park N` / `nic unpark N` power a link-down interface's copper PHY down
+(MII register 0, bit 11; e1000 classic and I350 through MDIC, RTL8139, RTL8168; not e1000e, which shares its PHY with the
+management engine, and not the 3C905). A parked PHY cannot see a cable, so it wakes every 30 s for 8 s and stays up if the
+link comes. `park-idle` in `settings` parks every NIC whose link has been down for a minute. Verified on skylake3's i350
+(power-down bit read back, wake and unpark work); the watts saved are below what RAPL shows. The ptp tape sleeps between polls as a master by default and spins as a slave (`idle`/`spin` override).
 Delivery is tried in order: **MSI-X** (only with the `prefer-msix` setting, and only on the
 82574, where `IVAR` maps causes to a vector; a test hook, since MSI is enough for every part
 here), **MSI**, then **legacy INTx through the I/O APIC**. INTx needs the interrupt's pin, which

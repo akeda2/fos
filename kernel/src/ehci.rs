@@ -184,6 +184,10 @@ pub fn itd_result(itd: usize, step: usize, j: usize) -> (usize, u32) {
     (((word >> 16) & 0xfff) as usize, (word >> 28) & 0x7)
 }
 
+/// Interrupts this driver claimed: the INTx self-test counts these, not the vector's raw count (a floating pin delivers
+/// interrupts of its own).
+static CLAIMS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The completion interrupt: acknowledge what is ours (only bits that were enabled, since the line may be shared) and
 /// let the audio code service its iTD rings.
 fn isr(context: usize) {
@@ -194,6 +198,8 @@ fn isr(context: usize) {
         return;
     }
     write32(controller.operational + OP_USBSTS, status);
+    crate::msi::claim();
+    CLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if status & STS_HSE != 0 {
         let command = read32(controller.operational + OP_USBCMD);
         controller.fault = Some((status, command, controller.frame_now()));
@@ -989,17 +995,13 @@ impl Controller {
                 return false;
             }
             let (first, end) = crate::ioapic::gsi_range();
-            let mut candidates = [u32::MAX; 9];
-            candidates[0] = u32::from(self.pci.interrupt_line());
-            for (slot, gsi) in (16..24u32).enumerate() {
-                candidates[slot + 1] = gsi;
-            }
+            let candidates = crate::msi::intx_candidates(self.pci.interrupt_line());
             for (position, &gsi) in candidates.iter().enumerate() {
                 if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
                     continue;
                 }
                 let Some(vector) = crate::msi::attach_intx(gsi, isr, index) else { continue };
-                if self.interrupt_self_test(|| crate::msi::intx_count(vector)) {
+                if self.interrupt_self_test(|| CLAIMS.load(core::sync::atomic::Ordering::Relaxed)) {
                     self.irq_vector = vector;
                     crate::println!("EHCI {:02x}:{:02x}.{}: interrupts on I/O APIC pin {gsi}, vector {vector:#x}.", self.pci.bus, self.pci.device, self.pci.function);
                     break;

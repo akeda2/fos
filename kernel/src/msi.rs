@@ -7,7 +7,7 @@
 //! Handlers run in interrupt context and must only acknowledge the device and note that
 //! work is pending; descriptor and protocol parsing stays in the foreground.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::apic;
 
@@ -69,6 +69,33 @@ const SHARERS: usize = 4;
 /// More interrupts than this on one vector in a single tick is an interrupt storm (a
 /// cause nobody clears on a level-triggered line freezes the machine): mask the pin.
 const STORM_LIMIT: u64 = 2000;
+
+/// Set by a handler that found a cause on its device (`claim`); `dispatch_intx` clears it first and counts an
+/// interrupt nobody claimed. A line that floats or is driven by an unhandled device shows up as a flood of those.
+static CLAIMED: AtomicBool = AtomicBool::new(false);
+/// Unclaimed interrupts on one pin within a tick that mean a storm. Far below `STORM_LIMIT`: a flood nobody answers
+/// is never legitimate (skylake3's pin 11 gave 1250 per tick and slipped under the general limit).
+const UNCLAIMED_LIMIT: u64 = 200;
+static UNCLAIMED_TICK: [AtomicU64; INTX_COUNT] = [const { AtomicU64::new(0) }; INTX_COUNT];
+static UNCLAIMED_SEEN: [AtomicU64; INTX_COUNT] = [const { AtomicU64::new(0) }; INTX_COUNT];
+
+/// A handler calls this once it has found (and is serving) a cause on its own device.
+pub fn claim() {
+    CLAIMED.store(true, Ordering::Relaxed);
+}
+
+/// The pins to probe for a PCI device's legacy interrupt, best first: GSI 16-23, where Intel and QEMU chipsets route
+/// PCI INTx, then the firmware's "interrupt line" (an ISA IRQ number, which on a PCH may be a stray copy of a PIRQ).
+/// Entries that cannot be used are `u32::MAX`; the caller still checks the I/O APIC's range and that the pin is
+/// proven by a self-test that counts only interrupts the device itself claimed.
+pub fn intx_candidates(interrupt_line: u8) -> [u32; 9] {
+    let mut candidates = [u32::MAX; 9];
+    for (slot, gsi) in (16..24u32).enumerate() {
+        candidates[slot] = gsi;
+    }
+    candidates[8] = u32::from(interrupt_line);
+    candidates
+}
 
 struct Intx {
     gsi: u32,
@@ -141,12 +168,22 @@ pub fn handles_intx(vector: u64) -> bool {
 pub fn dispatch_intx(vector: u64) {
     let slot = (vector - u64::from(INTX_BASE)) as usize;
     INTX_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+    CLAIMED.store(false, Ordering::Relaxed);
     if let Some(entry) = unsafe { (*core::ptr::addr_of!(INTX))[slot].as_ref() } {
         for (handler, context) in entry.handlers.iter().flatten() {
             handler(*context);
         }
-        // Storm guard: count interrupts within the current tick.
         let now = apic::ticks();
+        if !CLAIMED.load(Ordering::Relaxed) {
+            if UNCLAIMED_TICK[slot].swap(now, Ordering::Relaxed) != now {
+                UNCLAIMED_SEEN[slot].store(0, Ordering::Relaxed);
+            }
+            if UNCLAIMED_SEEN[slot].fetch_add(1, Ordering::Relaxed) > UNCLAIMED_LIMIT {
+                crate::ioapic::mask_gsi(entry.gsi);
+                STORMS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Storm guard: count interrupts within the current tick.
         if STORM_TICK[slot].swap(now, Ordering::Relaxed) != now {
             STORM_SEEN[slot].store(0, Ordering::Relaxed);
         }

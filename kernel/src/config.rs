@@ -156,6 +156,20 @@ pub fn load() {
                     }
                 }
                 Some("prefer-msix") => unsafe { PREFER_MSIX = true },
+                Some("park-idle") => {
+                    crate::nicpark::set_automatic();
+                    crate::println!("settings: park-idle -- NICs without a link are parked after a minute.");
+                }
+                Some("hwp") => {
+                    let name = line.split_whitespace().nth(1).unwrap_or("balanced");
+                    match crate::cpupower::PREFERENCES.iter().find(|entry| entry.0 == name) {
+                        Some(&(_, value)) => match crate::cpupower::enable_hwp(value) {
+                            Ok(_) => crate::println!("settings: hwp {name} -- the CPU picks its own speed."),
+                            Err(why) => crate::println!("settings: hwp ignored: {why}."),
+                        },
+                        None => crate::println!("settings: `{line}` ignored (hwp performance, balanced or power)."),
+                    }
+                }
                 Some("no-msi") => {
                     unsafe { NO_MSI = true };
                     crate::println!("settings: no-msi -- NICs stay on polling.");

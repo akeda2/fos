@@ -227,6 +227,10 @@ fn isr(index: usize) {
         return;
     }
     let cause = read(registers, state.icr.load(Ordering::Relaxed));
+    if cause == 0 {
+        return; // a shared line, or a spurious one: not claimed
+    }
+    crate::msi::claim();
     state.interrupts.fetch_add(1, Ordering::Relaxed);
     if cause & ICR_RXO != 0 {
         state.overruns.fetch_add(1, Ordering::Relaxed);
@@ -512,6 +516,36 @@ impl E1000 {
         read(self.registers, REG_STATUS) & STATUS_LU != 0
     }
 
+    /// The PHY's basic mode control register (MII register 0) through MDIC, for parking. Only the classic and I350
+    /// parts (internal copper PHY at MDIO address 1); the e1000e family (82574, 82579, I219) shares its PHY with the
+    /// management engine and needs the software/firmware semaphore, so it is left alone.
+    pub fn phy_control(&self) -> Option<u16> {
+        if self.variant == Variant::E1000e {
+            return None;
+        }
+        self.mdic(2 << 26, 0)
+    }
+
+    pub fn set_phy_control(&mut self, value: u16) -> bool {
+        self.variant != Variant::E1000e && self.mdic(1 << 26, value).is_some()
+    }
+
+    /// One MDIC cycle: opcode (read 2, write 1) in bits 27:26, PHY address 1, register 0; ready is bit 28, error bit 30.
+    fn mdic(&self, opcode: u32, data: u16) -> Option<u16> {
+        write(self.registers, 0x20, opcode | 1 << 21 | u32::from(data));
+        for _ in 0..100_000 {
+            let value = read(self.registers, 0x20);
+            if value & (1 << 30) != 0 {
+                return None;
+            }
+            if value & (1 << 28) != 0 {
+                return Some(value as u16);
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+
     /// Copies the next received frame into `out`; returns its length, or None if the
     /// ring is empty.
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
@@ -644,21 +678,16 @@ impl E1000 {
             }
         }
 
-        // Legacy INTx: candidates are the firmware's interrupt line (a hint) and the PCI
-        // pins an Intel/QEMU chipset routes to the I/O APIC (GSI 16-23).
+        // Legacy INTx: the PCI pins an Intel/QEMU chipset routes to the I/O APIC (GSI 16-23), then the firmware's
+        // interrupt line (a hint).
         let (first, end) = crate::ioapic::gsi_range();
-        let line = u32::from(device.interrupt_line());
-        let mut candidates = [u32::MAX; 9];
-        candidates[0] = line;
-        for (slot, gsi) in (16..24u32).enumerate() {
-            candidates[slot + 1] = gsi;
-        }
+        let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
                 continue;
             }
             let Some(vector) = crate::msi::attach_intx(gsi, isr, self.index) else { continue };
-            if self.self_test(false, || crate::msi::intx_count(vector)) {
+            if self.self_test(false, || ISR[self.index].interrupts.load(core::sync::atomic::Ordering::Relaxed)) {
                 self.delivery_set(Delivery::Intx { gsi, vector });
                 return Ok(Delivery::Intx { gsi, vector });
             }

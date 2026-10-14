@@ -116,7 +116,7 @@ pub fn nic_count() -> usize {
     unsafe { NIC_COUNT }
 }
 
-fn nic_at(index: usize) -> Option<&'static mut Nic> {
+pub fn nic_at(index: usize) -> Option<&'static mut Nic> {
     unsafe { (*core::ptr::addr_of_mut!(NICS)).get_mut(index)?.as_mut() }
 }
 
@@ -237,6 +237,7 @@ static mut ANNOUNCE_COUNT: u32 = 0;
 /// with, so every fos machine on the segment learns it without asking (`handle_frame` files it in the peer table,
 /// which tapes read with `peer_info`). Called from the main loop and from a running tape's service loop.
 fn announce_service() {
+    crate::nicpark::service();
     unsafe {
         if apic::ticks() < NEXT_ANNOUNCE {
             return;
@@ -668,7 +669,7 @@ pub(crate) fn netfs_receive(mac: [u8; 6], nic_index: usize, tag: u8, request: &[
             }
         });
         crate::debug::pet();
-        unsafe { core::arch::asm!("hlt") };
+        crate::cpu::sleep();
     }
     blocking(false);
     match outcome {
@@ -698,7 +699,7 @@ fn netfs_store(mac: [u8; 6], nic_index: usize, disk: usize, name: &str, length: 
                 refusal = Some(netfs_error_text(frame[15]));
             }
         });
-        unsafe { core::arch::asm!("hlt") };
+        crate::cpu::sleep();
     }
     if let Some(reason) = refusal {
         blocking(false);
@@ -733,7 +734,7 @@ fn netfs_store(mac: [u8; 6], nic_index: usize, disk: usize, name: &str, length: 
                 }
             }
         });
-        unsafe { core::arch::asm!("hlt") };
+        crate::cpu::sleep();
     }
     blocking(false);
     result.unwrap_or(Err("no reply (a frame may have been lost: there is no retransmission)"))
@@ -1259,7 +1260,7 @@ fn execute(command: &str) {
             crate::println!("cpuinfo bootinfo memmap irqstat   what the CPU, loader and firmware report");
             crate::println!("hexdump ADDRESS [LENGTH]   dump mapped memory; io r8|w8.. PORT; mmio r32|w32.. ADDR");
             crate::println!("clear     clear the screen");
-            crate::println!("nic       the network interfaces (list); nic use|sniff|discover|peers|map|regs|send|recv");
+            crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
             crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
             crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
             crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
@@ -1284,6 +1285,8 @@ fn execute(command: &str) {
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
             crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
             crate::println!("uptime    time since the timer started; sleep N waits N seconds");
+            crate::println!("power    [N]  how much of the time the CPU slept in hlt (N: sample N s at the prompt)");
+            crate::println!("power hwp [performance|balanced|power]  CPU frequency scaling (Intel HWP)");
             crate::println!("dmesg     the boot log");
             crate::println!("shutdown  power off");
             crate::println!("reset     restart through the firmware (reboot is the same)");
@@ -1325,6 +1328,17 @@ fn execute(command: &str) {
             nic_sniff(words.next());
         }
         "nic" if matches!(words.clone().next(), Some("discover")) => nic_discover(),
+        "nic" if matches!(words.clone().next(), Some("park" | "unpark")) => {
+            let park = words.next() == Some("park");
+            let Some(index) = words.next().and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
+                crate::println!("nic park|unpark N: power the PHY of an unplugged interface down (see `nic`).");
+                return;
+            };
+            match if park { crate::nicpark::park(index - 1) } else { crate::nicpark::unpark(index - 1) } {
+                Ok(()) => crate::println!("nic {index}: {}.", if park { "parked, checked for a cable every 30 s" } else { "unparked, negotiating" }),
+                Err(why) => crate::println!("nic {index}: {why}."),
+            }
+        }
         "nic" if matches!(words.clone().next(), Some("peers")) => print_peers(),
         "nic" if matches!(words.clone().next(), Some("map")) => nic_map(),
         "nic" if matches!(words.clone().next(), Some("send")) => nic_send_test(),
@@ -1432,6 +1446,7 @@ fn execute(command: &str) {
                         }
                     }
                     nic.describe();
+                    crate::nicpark::describe(index);
                     if index == 0 {
                         crate::println!("   tape frame queue: {} queued, {} dropped", unsafe { FRAMES_QUEUED }, unsafe { FRAMES_DROPPED });
                     }
@@ -1586,7 +1601,7 @@ fn execute(command: &str) {
             let end = apic::ticks() + seconds * apic::TICK_HZ;
             while apic::ticks() < end {
                 crate::debug::pet();
-                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+                crate::cpu::sleep();
             }
             crate::println!("Slept {seconds} s.");
         }
@@ -1604,6 +1619,10 @@ fn execute(command: &str) {
             let ticks = apic::ticks();
             crate::println!("{} ticks at {} Hz ({} s); spurious legacy-PIC interrupts: {}", ticks, apic::TICK_HZ, ticks / apic::TICK_HZ, apic::legacy_pic_interrupts());
         }
+        "power" => match words.next() {
+            Some("hwp") => hwp_command(words.next()),
+            word => power_command(word.and_then(|word| word.parse::<u64>().ok())),
+        },
         "dmesg" => crate::print(format_args!("{}", crate::log::contents())),
         "shutdown" | "halt" => {
             crate::println!("Powering off.");
@@ -2875,7 +2894,7 @@ fn nic_sniff(argument: Option<&str>) {
             crate::println!("{shown:>5} {:>4}B {}", frame.len(), line.as_str());
         });
         crate::debug::pet();
-        unsafe { core::arch::asm!("hlt") };
+        crate::cpu::sleep();
     }
     blocking(false);
     if let Some(nic) = nic_at(index) {
@@ -2980,7 +2999,7 @@ pub(crate) fn nic_discover() {
             }
         });
         crate::debug::pet();
-        unsafe { core::arch::asm!("hlt") };
+        crate::cpu::sleep();
     }
     blocking(false);
     print_peers();
@@ -3089,7 +3108,7 @@ fn nic_recv_wait() {
             }
         }
         crate::debug::pet();
-        unsafe { core::arch::asm!("hlt") };
+        crate::cpu::sleep();
     }
     crate::println!("No frame received (timed out waiting).");
 }
@@ -3152,5 +3171,103 @@ fn midi_command<'a>(words: &mut impl Iterator<Item = &'a str>) {
             }
         }
         Some(_) => crate::println!("Usage: midi | midi monitor | midi send [#N] HEX HEX [HEX]"),
+    }
+}
+
+/// Previous `power` reading: (micros, halted, wakeups, spun per reason), so the next call reports the time in between
+/// (for instance while a tape ran).
+static mut POWER_MARK: (u64, u64, u64, [u64; crate::cpu::SPIN_REASONS]) = (0, 0, 0, [0; crate::cpu::SPIN_REASONS]);
+
+/// `power [N]`: the share of time the CPU slept in `hlt` (it draws and heats least there) and, for the rest, whether
+/// it was polling on purpose (and why) or simply busy. With N it first idles at the prompt for N seconds.
+fn power_command(sample_seconds: Option<u64>) {
+    use crate::cpu::{idle_stats, SPIN_REASONS};
+    if let Some(seconds) = sample_seconds {
+        let end = apic::ticks() + seconds.min(60) * apic::TICK_HZ;
+        while apic::ticks() < end {
+            crate::debug::pet();
+            crate::cpu::sleep();
+        }
+    }
+    let now = apic::micros();
+    let (halted, wakeups, spun) = idle_stats();
+    let mark = unsafe { *core::ptr::addr_of!(POWER_MARK) };
+    let report = |label: &str, span: u64, halted: u64, wakeups: u64, spun: [u64; SPIN_REASONS]| {
+        let span = span.max(1);
+        let percent = |part: u64| part * 100 / span;
+        crate::println!(
+            "{label}: {} s, halted {}%, {} wakeups/s",
+            span / 1_000_000,
+            percent(halted),
+            wakeups * 1_000_000 / span
+        );
+        let polled: u64 = spun.iter().sum();
+        let busy = span.saturating_sub(halted + polled);
+        crate::println!(
+            "   polling {}% (NIC {}%, UART {}%, serial out {}%), running {}%",
+            percent(polled),
+            percent(spun[0]),
+            percent(spun[1]),
+            percent(spun[2]),
+            percent(busy)
+        );
+    };
+    report("since boot", now, halted, wakeups, spun);
+    if mark.0 != 0 {
+        let delta = [0, 1, 2].map(|index| spun[index] - mark.3[index]);
+        report("since last power", now - mark.0, halted - mark.1, wakeups - mark.2, delta);
+    }
+    unsafe { *core::ptr::addr_of_mut!(POWER_MARK) = (now, halted, wakeups, spun) };
+    // The five busiest interrupt vectors since boot: a wake-up rate far above the 100 Hz tick plus the NICs' own
+    // interrupts means something else keeps the CPU from sleeping.
+    let mut top = [(0u64, 0usize); 5];
+    for vector in 0..256 {
+        let count = crate::cpu::vector_count(vector);
+        if count > top[4].0 {
+            top[4] = (count, vector);
+            top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
+    }
+    let seconds = (now / 1_000_000).max(1);
+    for (count, vector) in top.iter().filter(|entry| entry.0 > 0) {
+        crate::println!("   vector {vector:#04x}: {count} interrupts ({}/s since boot)", count / seconds);
+    }
+    match crate::cpupower::temperature() {
+        Some((margin, Some(tjmax))) => crate::println!("CPU temperature: {} C ({margin} C below the throttle point, {tjmax} C)", tjmax.saturating_sub(margin)),
+        Some((margin, None)) => crate::println!("CPU temperature: {margin} C below the throttle point"),
+        None => crate::println!("CPU temperature: not available (Intel digital sensor only)"),
+    }
+    if let Some((since_boot, since_last)) = crate::cpupower::speed_percent() {
+        crate::println!("CPU speed: {since_boot}% of base since boot, {since_last}% since last power (awake time)");
+    }
+    if let Some((since_boot, since_last)) = crate::cpupower::power_milliwatts() {
+        crate::println!("CPU package power: {}.{:02} W since boot, {}.{:02} W since last power", since_boot / 1000, since_boot % 1000 / 10, since_last / 1000, since_last % 1000 / 10);
+    }
+    crate::println!("INTx pins masked as storms: {}", crate::msi::storms());
+    crate::println!("Not in the sums: time a tape spends busy-waiting without calling idle(), shown as running.");
+}
+
+/// `power hwp [performance|balanced|power]`: show or enable the CPU's own frequency scaling.
+fn hwp_command(preference: Option<&str>) {
+    if let Some(name) = preference {
+        let Some(&(_, value)) = crate::cpupower::PREFERENCES.iter().find(|entry| entry.0 == name) else {
+            crate::println!("power hwp [performance|balanced|power]: how eagerly the CPU may slow down.");
+            return;
+        };
+        match crate::cpupower::enable_hwp(value) {
+            Ok((lowest, highest)) => crate::println!("HWP on, {name}: speed between {lowest} and {highest}, until reset."),
+            Err(why) => crate::println!("HWP: {why}."),
+        }
+        return;
+    }
+    match crate::cpupower::hwp_status() {
+        None => crate::println!("HWP: not available (needs an Intel CPU with it, not a VM)"),
+        Some((false, ..)) => crate::println!("HWP: off (firmware speed). `power hwp balanced` turns it on."),
+        Some((true, low, high, epp)) => {
+            crate::println!("HWP: on, performance range {low}..{high}");
+            if let Some(epp) = epp {
+                crate::println!("Energy preference {epp} (0 performance, 255 power saving)");
+            }
+        }
     }
 }

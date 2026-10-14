@@ -88,6 +88,54 @@ pub fn interrupts_disable() {
     unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
 }
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Why the CPU stayed awake while it had nothing to do: the counters behind the `power` command.
+#[derive(Clone, Copy)]
+pub enum Spin {
+    /// A polled NIC (no interrupt) is watched in 100 us slices.
+    PolledNic,
+    /// A UART (16-byte FIFO, no interrupt) is polled in 100 us slices.
+    Uart,
+    /// Queued serial output is being pumped.
+    SerialOut,
+}
+
+pub const SPIN_REASONS: usize = 3;
+static HALT_US: AtomicU64 = AtomicU64::new(0);
+static WAKEUPS: AtomicU64 = AtomicU64::new(0);
+static SPIN_US: [AtomicU64; SPIN_REASONS] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+static VECTORS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+
+/// Counts one interrupt or exception on `vector` (called first thing from `interrupt_dispatch`).
+pub fn count_vector(vector: u64) {
+    VECTORS[(vector & 0xff) as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn vector_count(vector: usize) -> u64 {
+    VECTORS[vector & 0xff].load(Ordering::Relaxed)
+}
+
+/// Idle accounting since boot: (microseconds in `hlt`, wake-ups from it, microseconds spun per `Spin` reason).
+pub fn idle_stats() -> (u64, u64, [u64; SPIN_REASONS]) {
+    (HALT_US.load(Ordering::Relaxed), WAKEUPS.load(Ordering::Relaxed), [0, 1, 2].map(|index| SPIN_US[index].load(Ordering::Relaxed)))
+}
+
+/// `hlt` until the next interrupt (a tick is at most 10 ms away), counting the time asleep. Every idle wait goes
+/// through here so `power` can tell a machine that sleeps from one that polls. Interrupts must be enabled.
+pub fn sleep() {
+    let start = crate::apic::micros();
+    unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    HALT_US.fetch_add(crate::apic::micros().saturating_sub(start), Ordering::Relaxed);
+    WAKEUPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Counts time spent awake-but-idle for `reason`; wrap a polling wait with the `start` it took.
+pub fn spun(reason: Spin, start_micros: u64) {
+    SPIN_US[reason as usize].fetch_add(crate::apic::micros().saturating_sub(start_micros), Ordering::Relaxed);
+}
+
 pub fn halt() -> ! {
     crate::serial::flush();
     loop {

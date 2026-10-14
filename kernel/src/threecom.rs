@@ -165,6 +165,7 @@ fn isr(index: usize) {
     }
     // Commands are not waited for to completion here, but the write itself must not land on a running one.
     issue_command(base, ACK_INTERRUPT | status | STATUS_INT_LATCH);
+    crate::msi::claim();
     ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
     if status & STATUS_HOST_ERROR != 0 {
         FATAL[index].store(true, Ordering::Release);
@@ -422,17 +423,16 @@ impl ThreeCom {
     pub fn enable_interrupts(&mut self, device: &pci::Device) -> Result<Delivery, &'static str> {
         let mut reason = "no I/O APIC pin delivered the self-test interrupt";
         let (first, end) = crate::ioapic::gsi_range();
-        let mut candidates = [u32::MAX; 9];
-        candidates[0] = u32::from(device.interrupt_line());
-        for (slot, gsi) in (16..24u32).enumerate() {
-            candidates[slot + 1] = gsi;
-        }
+        let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
                 continue;
             }
             let Some(vector) = crate::msi::attach_intx(gsi, isr, self.index) else { continue };
-            if self.self_test(|| crate::msi::intx_count(vector)) {
+            // Count only interrupts this card claimed (its status showed a cause): a pin that floats low "delivers"
+            // interrupts on its own, which once passed the self-test and then stormed at 125 kHz (skylake, pin 11).
+            let index = self.index;
+            if self.self_test(|| ISR[index].interrupts.load(Ordering::Relaxed)) {
                 return Ok(self.finish_interrupts(Delivery::Intx { gsi, vector }));
             }
             let _ = self.command(SET_INTERRUPT_ENABLE);

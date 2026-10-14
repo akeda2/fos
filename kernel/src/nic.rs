@@ -47,6 +47,25 @@ impl Nic {
         }
     }
 
+    /// The PHY's basic mode control register, for drivers that can reach the PHY (see `nicpark`).
+    pub fn phy_control(&self) -> Option<u16> {
+        match self {
+            Nic::E1000(nic) => nic.phy_control(),
+            Nic::Rtl8139(nic) => nic.phy_control(),
+            Nic::Rtl8168(nic) => nic.phy_control(),
+            Nic::ThreeCom(_) => None,
+        }
+    }
+
+    pub fn set_phy_control(&mut self, value: u16) -> bool {
+        match self {
+            Nic::E1000(nic) => nic.set_phy_control(value),
+            Nic::Rtl8139(nic) => nic.set_phy_control(value),
+            Nic::Rtl8168(nic) => nic.set_phy_control(value),
+            Nic::ThreeCom(_) => false,
+        }
+    }
+
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
         match self {
             Nic::E1000(nic) => nic.receive(out),

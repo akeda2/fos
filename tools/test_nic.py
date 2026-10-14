@@ -81,6 +81,12 @@ def main():
             mark = c.send("nic use 9")
             c.pump(0.5)
             check("Usage: nic use N" in c.text()[mark:], "and refuses one that does not exist", c.text()[mark:])
+            mark = c.send("nic park 1")
+            c.pump(0.5)
+            check("nic 1: it has a link." in c.text()[mark:], "nic park reads the PHY and refuses an interface with a link", c.text()[mark:])
+            mark = c.send("nic unpark 1")
+            c.pump(0.5)
+            check("nic 1: it is not parked." in c.text()[mark:], "and nic unpark an interface that is not parked", c.text()[mark:])
         finally:
             for guest in (a, b, c):
                 guest.stop()

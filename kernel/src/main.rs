@@ -26,6 +26,8 @@ mod config;
 mod debug;
 mod diag;
 mod cpu;
+mod cpupower;
+mod nicpark;
 mod e1000;
 mod ehci;
 mod ohci;
@@ -116,6 +118,7 @@ static BREAKPOINTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// Every interrupt and exception arrives here, from `isr_common` (isr_stubs.S).
 #[unsafe(no_mangle)]
 extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
+    cpu::count_vector(frame.vector);
     match frame.vector {
         3 => {
             BREAKPOINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -433,6 +436,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     // must not stay unconfirmed, or the next boot would fall back to the old slot.
     debug::confirm_boot(config::debug().watchdog_seconds);
     println!("Fosfor OS kernel: M3 complete. Waiting for a term net client.");
+    cpupower::init();
     config::run_start(term::run_line);
     term::start_local();
     loop {
@@ -446,14 +450,15 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         term::poll();
         if uart::shell_active() {
             // The shell's UART has no interrupt and a 16-byte FIFO: keep polling it instead of sleeping a whole tick.
-            let until = apic::micros() + 100;
-            while apic::micros() < until {
+            let begin = apic::micros();
+            while apic::micros() < begin + 100 {
                 uart::poll();
                 core::hint::spin_loop();
             }
+            cpu::spun(cpu::Spin::Uart, begin);
         } else {
             // Sleep until the next timer tick (or a NIC-less machine's only wakeup).
-            unsafe { core::arch::asm!("hlt") };
+            cpu::sleep();
         }
     }
 }

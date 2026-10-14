@@ -86,6 +86,7 @@ fn isr(index: usize) {
         return;
     }
     write16(base, REG_ISR, status);
+    crate::msi::claim();
     ISR[index].interrupts.fetch_add(1, Ordering::Relaxed);
     if status & ISR_TOK != 0 {
         write16(base, REG_IMR, INTERRUPT_MASK); // the self-test's extra cause is no longer wanted
@@ -338,17 +339,14 @@ impl Rtl8168 {
         // Legacy INTx: the firmware's interrupt line (a hint) and the PCI pins an Intel/QEMU
         // chipset routes to the I/O APIC (GSI 16-23).
         let (first, end) = crate::ioapic::gsi_range();
-        let mut candidates = [u32::MAX; 9];
-        candidates[0] = u32::from(device.interrupt_line());
-        for (slot, gsi) in (16..24u32).enumerate() {
-            candidates[slot + 1] = gsi;
-        }
+        let candidates = crate::msi::intx_candidates(device.interrupt_line());
         for (position, &gsi) in candidates.iter().enumerate() {
             if gsi == u32::MAX || gsi == 0 || gsi < first || gsi >= end || candidates[..position].contains(&gsi) {
                 continue;
             }
             let Some(vector) = crate::msi::attach_intx(gsi, isr, self.index) else { continue };
-            if self.self_test(|| crate::msi::intx_count(vector)) {
+            let index = self.index;
+            if self.self_test(|| ISR[index].interrupts.load(Ordering::Relaxed)) {
                 return Ok(self.finish_interrupts(Delivery::Intx { gsi, vector }));
             }
             write16(self.io_base, REG_IMR, 0);
@@ -438,6 +436,30 @@ impl Rtl8168 {
 
     pub fn link_up(&self) -> bool {
         read8(self.io_base, REG_PHYSTATUS) & PHYSTATUS_LINK != 0
+    }
+
+    /// The PHY's basic mode control register through `PHYAR` (0x60: flag bit 31, register in 20:16, data in 15:0; the
+    /// flag is set when a read is done and cleared when a write is). Register page 0 is selected first (register 31).
+    pub fn phy_control(&self) -> Option<u16> {
+        self.phy_access(31, Some(0))?;
+        self.phy_access(0, None)
+    }
+
+    pub fn set_phy_control(&mut self, value: u16) -> bool {
+        self.phy_access(31, Some(0)).is_some() && self.phy_access(0, Some(value)).is_some()
+    }
+
+    fn phy_access(&self, register: u32, write: Option<u16>) -> Option<u16> {
+        let command = register << 16 | write.map_or(0, |value| 1 << 31 | u32::from(value));
+        write32(self.io_base, 0x60, command);
+        for _ in 0..100_000 {
+            let value = read32(self.io_base, 0x60);
+            if (value & (1 << 31) != 0) == write.is_none() {
+                return Some(value as u16);
+            }
+            core::hint::spin_loop();
+        }
+        None
     }
 
     /// Link speed in Mb/s and whether it is full duplex, from the PHY status register.

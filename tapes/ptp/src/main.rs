@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D] [domain=N]
-//!              [l2] [ntp=dhcp|A.B.C.D|NAME] [dns=A.B.C.D] [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US] [idle] [verbose]
+//!              [l2] [ntp=dhcp|A.B.C.D|NAME] [dns=A.B.C.D] [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US] [spin] [verbose]
 //! ```
 //!
 //! `slave` (the default) listens for Announce, Sync and Follow_Up on the PTP multicast group (224.0.1.129),
@@ -33,8 +33,9 @@
 //! The RTC holds local time, so say the zone with `tz=` (hours east of UTC: `+2`, `-5`, `+5:30`; default 0, which is UTC).
 //!
 //! Timestamps are taken in software: receive time when the polling loop reads the frame, transmit time just
-//! before the frame is handed to the NIC. By default the loop spins, to keep that error small; `idle` sleeps
-//! between polls instead (up to about 100 us worse on a polled NIC, kinder to the CPU).
+//! before the frame is handed to the NIC. A master by default (a slave must not: wake-up latency makes its receive times `late`) sleeps between polls (`tape_rt::idle`): the CPU halts
+//! until the NIC's interrupt (about 10 us of wake-up added to the receive time on clock1's MSI e1000e; measured), or on a
+//! polled NIC waits in 100 us slices. `spin` polls flat out (the slave default): the smallest error, a core at full speed (and warm). `idle` on a slave trades accuracy for a cool CPU.
 //!
 //! A Sync that sat in the NIC's ring while the loop was busy (a print, a send) would carry a receive time that
 //! is too late; when the last empty poll is more than `late=` us (default 300) before the frame, the Sync is
@@ -72,13 +73,15 @@ struct Options {
 const SETTIME_GIVE_UP_SECONDS: u32 = 60;
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
-    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: false, verbose: false, l2: false, both: false, ntp: "", dns: "", settime: false, zone_minutes: 0 };
+    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: true, verbose: false, l2: false, both: false, ntp: "", dns: "", settime: false, zone_minutes: 0 };
+    let mut idle_set = None;
     for word in arguments.split_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         match key {
             "slave" => options.master = false,
             "master" => options.master = true,
-            "idle" => options.idle = true,
+            "idle" => idle_set = Some(true),
+            "spin" => idle_set = Some(false),
             "l2" => options.l2 = true,
             "both" => options.both = true,
             "verbose" => options.verbose = true,
@@ -101,6 +104,7 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
     if options.both && (!options.master || options.l2) {
         return Err("both is for a master, on UDP and Ethernet together (not with l2)");
     }
+    options.idle = idle_set.unwrap_or(options.master);
     Ok(options)
 }
 
@@ -239,7 +243,7 @@ fn send(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16,
     }
 }
 
-/// Waits for a polled NIC: spins by default (the receive time is the clock reading), or sleeps.
+/// Waits between polls: sleeps (master default, or `idle`), or spins (slave default, `spin`: the smallest receive-time error).
 fn wait(options: &Options) {
     if options.idle {
         tape_rt::idle();
@@ -581,7 +585,7 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
   tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D]
                [domain=N] [l2|both] [ntp=dhcp|A.B.C.D|NAME] [dns=A.B.C.D]
                [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US]
-               [idle] [verbose]
+               [spin] [verbose]
 
   slave     measure offset, delay and rate to a master (the default)
   master    announce a clock; ntp= takes real time from an NTP server first
@@ -593,5 +597,7 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
   settime   slave: set the clock and RTC from the master, then end (gives up
             after 60 s without secs=)
   tz=+2     hours east of UTC for settime (the RTC holds local time)
+  spin      poll flat out (slave default): smallest timestamp error, hot CPU
+  idle      sleep between polls (master default); a slave loses accuracy
   secs=N    stop after N seconds; Escape stops at any time
 "#);
