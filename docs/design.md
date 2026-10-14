@@ -963,6 +963,11 @@ offered to tapes (`serial_open` gives `SERIAL_BUSY`, -3; `fterm` says so). The m
 so an idle machine burns CPU (the FIFO is 16 bytes, a pasted line would be lost otherwise); `test-idle-cpu` runs without it. `make test-serial-shell`
 boots an image with the setting and plays the laptop on COM2. Planned: USB serial adapters as another port `kind` behind the same calls.
 
+**COM1 receive interrupt** (`serial.rs`): the console's input used to be polled on the 10 ms idle tick, and the UART's 16-byte FIFO overran on a pasted
+or scripted line (about 4 of 24 characters lost on rack1 at 115200). With an I/O APIC, IRQ 4 now goes to vector 0x42 (FIFO trigger 8, OUT2 set); the handler
+only moves bytes into a 1 KiB ring (`RX_DROPPED` counts overflow) that `read_byte` empties. Without an I/O APIC or a UART it polls as before. Verified on
+rack1 (a 127-character line sent in one write arrives whole; idle power unchanged) and by `test-serial-shell`, `test-idle-cpu`, `test-bios-boot`, `test`.
+
 *Verified on real hardware (skylake, 2026-10-13).* A USB-serial adapter on the host (`/dev/ttyUSB3`, 115200 8n1, user in `dialout`) reached
 the shell on skylake's serial-shell port; `help`, `uptime`, `debug status`, `usb`, `disks`, `nic` and `dmesg` all worked. `debug crash`
 raises a #UD on purpose (it does not read the crash record): the exception dump went out over serial, the machine reset after the 3 s

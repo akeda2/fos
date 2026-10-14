@@ -134,6 +134,10 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut Frame) {
             keyboard::interrupt();
             apic::end_of_interrupt();
         }
+        v if v == u64::from(serial::VECTOR) => {
+            serial::interrupt();
+            apic::end_of_interrupt();
+        }
         v if v == u64::from(apic::SPURIOUS_VECTOR) => {} // a spurious interrupt needs no EOI
         v if (u64::from(apic::LEGACY_PIC_BASE)..u64::from(apic::LEGACY_PIC_BASE) + 16).contains(&v) => apic::legacy_pic_interrupt(),
         v if v < 32 => fault::fatal(frame),
@@ -273,6 +277,9 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     match madt.as_ref().and_then(ioapic::init) {
         Some(pins) => {
             println!("I/O APIC: {pins} pins; ISA interrupts routed through it.");
+            if serial::enable_interrupt() {
+                println!("COM1: receive interrupt on IRQ 4 -> vector {:#x} (input is buffered; a pasted line is not lost).", serial::VECTOR);
+            }
             match keyboard::init_ps2() {
                 keyboard::Ps2::Ready { gsi } => println!("PS/2 keyboard: 8042 ready, scancode set 1, IRQ 1 on GSI {gsi} -> vector {:#x}.", keyboard::KEYBOARD_VECTOR),
                 keyboard::Ps2::NoInterrupt => println!("PS/2 keyboard: controller present but its interrupt could not be routed; no PS/2 input."),

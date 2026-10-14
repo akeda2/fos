@@ -2,6 +2,7 @@
 //! reads. Programmed directly with port I/O (the firmware's console is gone).
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const COM1: u16 = 0x3f8;
 
@@ -113,15 +114,76 @@ pub fn write_byte(byte: u8) {
     });
 }
 
-/// A received byte, if one is waiting (LSR bit 0). A machine with no UART reads 0xff from
-/// the line-status register, which must not be mistaken for data. There is no interrupt: the
-/// foreground polls (the 16-byte FIFO covers a 10 ms idle tick at typing speed).
+/// Received bytes waiting for the shell. With the receive interrupt on, the handler fills this from the UART's 16-byte
+/// FIFO (115200 baud is a byte every 87 us, so a pasted line overran the FIFO long before the 10 ms idle tick polled it
+/// and characters were lost); `read_byte` empties it.
+const RX_SIZE: usize = 1024;
+static mut RX: [u8; RX_SIZE] = [0; RX_SIZE];
+static RX_HEAD: AtomicUsize = AtomicUsize::new(0);
+static RX_TAIL: AtomicUsize = AtomicUsize::new(0);
+static RX_INTERRUPT: AtomicBool = AtomicBool::new(false);
+pub static RX_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+pub const VECTOR: u8 = 0x42;
+
+/// Turns on the receive interrupt once the I/O APIC is up. IRQ 4 is routed to `VECTOR`; the UART raises it when its
+/// receive FIFO holds 8 bytes, or when bytes have sat there for four character times (so a short line still arrives).
+/// MCR bit 3 (OUT2) is what connects a PC UART's interrupt pin to the IRQ line. Not enabled on a machine with no UART
+/// (the line-status register reads 0xff) or when the interrupt cannot be routed: then the foreground polls as before.
+pub fn enable_interrupt() -> bool {
+    if inb(COM1 + 5) == 0xff || crate::ioapic::route_isa(4, VECTOR).is_none() {
+        return false;
+    }
+    locked(|| {
+        outb(COM1 + 2, 0x87); // FIFO on, receive trigger level 8, cleared
+        outb(COM1 + 4, 0x0b); // DTR + RTS + OUT2
+        outb(COM1 + 1, 0x01); // interrupt on received data
+        RX_INTERRUPT.store(true, Ordering::Relaxed);
+    });
+    true
+}
+
+/// IRQ 4: move everything in the FIFO into the ring (the handler must not print).
+pub fn interrupt() {
+    drain();
+}
+
+fn drain() {
+    for _ in 0..64 {
+        let status = inb(COM1 + 5);
+        if status == 0xff || status & 1 == 0 {
+            break;
+        }
+        let byte = inb(COM1);
+        let head = RX_HEAD.load(Ordering::Relaxed);
+        let next = (head + 1) % RX_SIZE;
+        if next == RX_TAIL.load(Ordering::Acquire) {
+            RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        unsafe { (*core::ptr::addr_of_mut!(RX))[head] = byte };
+        RX_HEAD.store(next, Ordering::Release);
+    }
+}
+
+/// A received byte, if one is waiting. A machine with no UART reads 0xff from the line-status register, which must not
+/// be mistaken for data. Without the interrupt the foreground polls the UART itself (the 16-byte FIFO covers a 10 ms idle
+/// tick at typing speed, not a paste).
 pub fn read_byte() -> Option<u8> {
-    let status = inb(COM1 + 5);
-    if status == 0xff || status & 1 == 0 {
+    if !RX_INTERRUPT.load(Ordering::Relaxed) {
+        let status = inb(COM1 + 5);
+        if status == 0xff || status & 1 == 0 {
+            return None;
+        }
+        return Some(inb(COM1));
+    }
+    let tail = RX_TAIL.load(Ordering::Relaxed);
+    if tail == RX_HEAD.load(Ordering::Acquire) {
         return None;
     }
-    Some(inb(COM1))
+    let byte = unsafe { (*core::ptr::addr_of!(RX))[tail] };
+    RX_TAIL.store((tail + 1) % RX_SIZE, Ordering::Release);
+    Some(byte)
 }
 
 pub struct Serial;
