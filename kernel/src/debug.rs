@@ -151,16 +151,20 @@ pub fn confirm_boot(watchdog_seconds: Option<u32>) {
         None => crate::println!("Slot metadata could not be updated: no A/B fallback or crash tracking this boot."),
     }
     pet();
+    // The streak clears after a good run whether or not the watchdog is armed: with three or more unclean boots it stays
+    // off, so tying the clearing to the watchdog left the streak (and the disabled watchdog) stuck for ever. Power-button
+    // stops count as unclean, so a machine that is simply switched off now and then reaches three easily.
+    let unclean = unsafe { UNCLEAN_BOOTS };
+    if unclean > 0 {
+        unsafe { CLEAR_STREAK_PENDING = true };
+    }
     if let Some(seconds) = watchdog_seconds {
-        let unclean = unsafe { UNCLEAN_BOOTS };
         if unclean >= 3 {
             crate::println!("Watchdog stays off: {unclean} unclean boots in a row (a hang must not become a reboot loop).");
+            crate::println!("It comes back on the next boot once this one has run five minutes.");
         } else {
             unsafe { WATCHDOG_TICKS = u64::from(seconds.max(5)) * apic::TICK_HZ };
             crate::println!("Watchdog armed: reset after {} s without progress.", seconds.max(5));
-            if unclean > 0 {
-                unsafe { CLEAR_STREAK_PENDING = true };
-            }
         }
     }
 }
