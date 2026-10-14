@@ -461,3 +461,11 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   with a host system error on that QH during the next control transfer. Keyboards now hang off a periodic frame list (S-mask 0x01, C-mask 0x1c
   behind a hub), as Linux does; the async list holds only the control QH. `usb` prints EHCI USBCMD/USBSTS and the QHs. Open: all 1024 periodic
   entries poll every frame (no interval spreading), and no recovery if an EHCI controller halts.
+
+## Open after the power-saving session (2026-10-14)
+
+- amd1 (three 3C905) was offline: it still runs the old kernel. When it is up, check `power 5`, `irqstat` and `nic` for INTx pins and storms.
+- rack1 (headless, serial on COM1, `settings` with `park-idle` and `hwp balanced`) was moved into the rack: verify kernel, settings and serial.
+- Unverified on real hardware: HWP under busy tape-net traffic, RTL8139/RTL8168 PHY parking, link detection after a park wake, ptp master
+  on clock1 after its reset. `make test-all` has not been run for these changes (run it on landsbro with `gb -of fos`).
+- Power-button stops count as unclean boots; three in a row switch the watchdog off until one boot runs five minutes.
