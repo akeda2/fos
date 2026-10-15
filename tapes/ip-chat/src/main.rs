@@ -719,6 +719,8 @@ pub extern "C" fn tape_main(api: &'static tape_rt::TapeApi) {
                     }
                     8 | 127 if line_len != 0 => {
                         line_len -= 1;
+                        // read_key does not echo, so erase the character on screen ourselves.
+                        print_bytes(putc, b"\x08 \x08");
                         saw_carriage_return = false;
                     }
                     printable if (0x20..=0x7e).contains(&printable) => {

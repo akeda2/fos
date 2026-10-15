@@ -79,6 +79,16 @@ def main():
             sent = [payload.rstrip(b"\0") for _, tag, payload in wire.frames(3.0) if tag == CHAT_TEXT]
             check(any(b"from the tape" in payload for payload in sent), "a typed line is sent as a chat text frame (broadcast)", repr(sent))
 
+            # Backspace removes the last character from the line and erases it on screen.
+            for byte in b"abx\x08c\r":
+                wire.send(guest, TAG_DATA, bytes([byte]))
+                time.sleep(0.05)
+            seen = list(wire.frames(3.0))
+            echoed = b"".join(payload for _, tag, payload in seen if tag == TAG_DATA)
+            check(b"\x08 \x08" in echoed, "Backspace is echoed as erase (BS space BS)", repr(echoed))
+            sent = [payload.rstrip(b"\0") for _, tag, payload in seen if tag == CHAT_TEXT]
+            check(any(payload == b"abc" for payload in sent), "Backspace drops the character from the sent line", repr(sent))
+
             # /discover broadcasts a probe; the peer's reply goes into the address book.
             wire.send(guest, TAG_DATA, b"/discover\r")
             probes = [source for source, tag, _ in wire.frames(3.0) if tag == TAG_DISCOVER_REQUEST]
