@@ -183,7 +183,20 @@ impl Steer {
 fn start_hardware_stamps(options: &Options) {
     if !options.software && tape_rt::nic_ts_enable(options.nic) {
         HW_NIC.store(options.nic, core::sync::atomic::Ordering::Relaxed);
-        if options.steer && !options.master {
+        if options.steer && options.master {
+            // The master's times are the card's own stamps, with no conversion to the polling loop's clock (that
+            // conversion adds up to ~7 us of noise to a Sync's origin time). The card is first set to the tape's
+            // clock, so that its epoch is the same one a plain master announces.
+            let (before, card, after) = (now_ns(), tape_rt::nic_ts_clock(options.nic) as i64, now_ns());
+            let now = (before + after) / 2;
+            if tape_rt::nic_ts_step(options.nic, now - card) {
+                CARD_TIME.store(now, core::sync::atomic::Ordering::Relaxed);
+                STEER_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+                println!("ptp: master times are NIC {}'s own clock, set to the tape's.", options.nic + 1);
+            } else {
+                println!("ptp: steer: this NIC or kernel cannot set its clock; the master uses the tape's.");
+            }
+        } else if options.steer {
             if tape_rt::nic_ts_adjust(options.nic, 0) {
                 CARD_TIME.store(now_ns(), core::sync::atomic::Ordering::Relaxed);
                 STEER_ON.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -460,6 +473,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     let mut masters_seen = 0;
     let mut steps_seen = 0;
     let mut settled = Window::default();
+    let mut last_t = (0i64, 0i64);
     let mut steer = None;
     let mut silent = 0u32;
     let mut last_empty = now_ns();
@@ -525,7 +539,8 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
                         time_set = set_clock_from_master(&slave, options, t2 - sample.offset, &mut refusal_shown);
                     }
                     if options.verbose {
-                        println!("  seq {} offset {} us (raw {} ms) delay {} us", sample.sequence, Us(sample.residual), sample.offset / 1_000_000, Us(sample.delay));
+                        println!("  seq {} offset {} us (raw {} ms) delay {} us t1+{} t2+{}", sample.sequence, Us(sample.residual), sample.offset / 1_000_000, Us(sample.delay), sample.t1 - last_t.0, sample.t2 - last_t.1);
+                        last_t = (sample.t1, sample.t2);
                     }
                 }
             }
@@ -744,7 +759,8 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
   tz=+2     hours east of UTC for settime (the RTC holds local time)
   software  do not use the NIC's hardware timestamps (I350)
   quiet     slave: one line a minute, not a second (a console line delays the poll loop)
-  steer     slave: step and steer the NIC's own clock to the master (hardware
+  steer     master: send the NIC's own clock as the time (no timer noise). slave:
+            step and steer the NIC's own clock to the master (hardware
             timestamps and clock steering needed)
   spin      poll flat out (slave default): smallest timestamp error, hot CPU
   idle      sleep between polls (master default); a slave loses accuracy

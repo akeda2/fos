@@ -956,7 +956,11 @@ path delay 19.9 us. The same on two I350s (skylake2/rack2, NIC 2): offset +-0.3 
 40-bit count's wrap (about 18 min). A dip to -14 us every 8 Syncs came from the master asking for a hardware stamp on every
 frame it sent (Announce, Follow_Up, Delay_Resp too) and waiting for it; `send` now stamps only Sync and Delay_Req, and the
 offset sd fell from 2.2 to 0.5 us. `quiet` prints one line a minute instead of one a second: a console line costs about 10 ms. `Slave::clock_moved` shifts the times
-the slave holds when the caller steps its clock. Only real hardware checks this; QEMU has no steerable NIC.
+the slave holds when the caller steps its clock. Only real hardware checks this; QEMU has no steerable NIC. A steered slave also prints the statistics after the first 60 s, when the servo has learned the rate (the whole-run
+min/max of a 1300 s run, +-130 us, was the first seconds after the -17 ms step). `steer` on the *master* (L2 or UDP) makes
+its Sync origin times the card's own stamps, the card first being set to the tape's clock: a plain master converts each
+stamp to the polling loop's clock, and that conversion put a -6 us dip on about one Sync in 100 (a Sync sent a few ms off
+its 125 ms slot). Verified on the I350 pair: settled offset sd 0.1 us, min -0.1, max +0.3 us (was sd 0.5, min -6.7).
 
 **Timestamps on the e1000e family.** The 82579 (96 MHz clock) and the Skylake I219 (24 MHz) have the same TSYNC
 registers as the I350 (Linux's e1000e `ptp.c`), with four differences handled in `e1000.rs`: SYSTIM counts fractions of

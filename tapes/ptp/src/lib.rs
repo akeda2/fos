@@ -277,6 +277,9 @@ pub struct Sample {
     pub residual: i64,
     pub delay: i64,
     pub sequence: u16,
+    /// The Sync's origin time at the master and its arrival time here, as measured (for diagnostics).
+    pub t1: i64,
+    pub t2: i64,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -500,7 +503,7 @@ impl Slave {
             base = offset;
             self.base = Some(base);
         }
-        Some(Sample { offset, residual: offset - base, delay, sequence })
+        Some(Sample { offset, residual: offset - base, delay, sequence, t1, t2 })
     }
 }
 
