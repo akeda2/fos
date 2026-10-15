@@ -33,6 +33,9 @@ Contents: [the picture](#the-picture) · [before you start](#before-you-start-kn
   configured separately: `ab` is port A to port B, `ba` the reverse. Both ports
   listen promiscuously. It does no routing and learns nothing; it is a
   two-port, Ethernet-only pass-through (like a cable with bad manners).
+  Frames are forwarded byte for byte: source and destination MACs are never
+  rewritten and the ports' own MACs never appear, so with no faults set the
+  link is invisible to IP, ARP and DHCP, exactly like a wire.
 * The **generator** sends frames from its NIC at a constant bit rate.
 * The **sink** receives them on its NIC and keeps the books.
 
@@ -459,6 +462,49 @@ gen.save=wifi-30m
 | `make test-tape-nettest-router` | Two QEMU guests: the generator and sink in one, the `router` tape in the other; UDP/IP in both directions through it. |
 | `python3 tapes/test_nettest_selftest_e2e.py` | The four-NIC loop in QEMU: the sink's measurements against the link's settings (clean, limited, lossy, delayed, UDP, sweep, bidirectional, the `selftest` keyword, a report file). |
 | `make test-nic-map` | `nic map` against virtual cables. |
+| `make test-nettest-remote` | Two guests: `serve=1` and `remote=1` find each other, sync clocks, run a test both ways. |
+
+## Two machines: `serve=N` and `remote=N`
+
+Run nettest on two machines to measure the physical network between them.
+
+- Server: just `nettest` (put it in the `start` file). It is the far end on NIC 1; `nettest nic=2` (or
+  `serve=2`) picks another NIC for the control frames. The server needs no further set-up: the master
+  chooses everything, including which server NIC carries the test.
+- Master: `tape run nettest remote=1`, or plain `nettest` and then `remote 1` at the prompt. It sends a
+  unicast HELLO to every announced machine on that NIC
+  (nothing is broadcast, so other hosts are not disturbed), auto-selects a lone server, and otherwise lets
+  you choose with `peer N|NAME|MAC` or the `P` key at an empty prompt. `peer` alone probes again.
+- `test [up|down|both] [rate=KBIT] [size=B] [time=S]` runs the test (default both ways, 10000 kbit/s,
+  1000 B, 5 s); `test stop` aborts. The master then fetches the server's counters and prints one merged
+  report (sent, received, loss, jitter, latency per direction; tail loss shown as "not delivered").
+
+A plain `nettest` with no arguments is the far end; a role typed at its prompt (`link A B`, `gen nic N`,
+`serve N`, `remote N`) takes over. `nics` lists the NICs and their roles; `help` has one page per topic.
+
+**A separate network for the test.** The control frames stay on the NIC given at start. `via=N` runs the
+test on the server's NIC N, `here=N` on the master's NIC N (`0` = the control NIC; both persist until
+changed). Each end lists its NICs and MACs (the master prints the server's when the peer is picked), so the
+two ends can sit on one network or on two physically separate ones, each with one NIC or several. Before
+such a test the master probes the test path with the same clock exchange (the test path's delay, not the
+control network's, sets the offset) and fails with "no answer on the test path" if it is not cabled; the
+report names the path (`test path: our NIC 2 <-> peer NIC 2`). The server's counters still come back over
+the control network. Frames and tests need no routing: both test NICs must be on the same layer-2 network.
+
+`test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]` (defaults 2000 to 20000
+step 2000, 3 s per step, 1 s settle between steps so the last step's queue drains) runs the ladder by itself and prints one row per step: kbit/s delivered, loss (frames sent but
+not delivered) and queueing delay (mean minus minimum one-way delay; the clock offset cancels out of it) for
+each direction, then the highest rate with at most 1% loss. The full report also shows the minimum delay,
+reordered/duplicated frames and the share of the asked-for rate delivered in each second (`% of rate per
+second`): a steady shortfall means a rate limit, a single dip means an outage. The latency percentiles come
+from a 33-bucket histogram (50 us up to 5 s, steps of 1-2.5 ms around 1-10 ms and 5-25 ms up to 150 ms). The minimum is clamped at 0 when the offset error exceeds the true delay, so
+trust the queueing figure rather than the minimum. On a powerline link the knee moves between runs.
+
+Control frames are ethertype 0x88B5, magic `FNC1`. On selection the master exchanges its time by unicast
+using the IEEE 1588 delay request-response arithmetic (the ptp tape cannot run at the same time): eight
+samples, the minimum round trip is used, and half that round trip is the printed error bound. Loss, rate
+and jitter do not depend on the offset; one-way latency does. The peer's wall clock is not set.
+The engine and its host tests are in `tapes/nettest/src/remote.rs`.
 
 The same four-port loop was run on real I350 hardware (the Skylake machine,
 cabled NIC 2↔3 and NIC 4↔5); the numbers in the recipes above are from that run.

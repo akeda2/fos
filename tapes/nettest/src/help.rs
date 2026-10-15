@@ -1,0 +1,176 @@
+//! The nettest> prompt's help: one short overview, one page per topic, and `help all`. Pages are
+//! written for an 80x25 text grid (the BIOS console, a serial terminal) and every line is at most 79
+//! columns; a text longer than the console's rows is shown a screenful at a time.
+
+use tape_rt::api;
+
+type Putc = extern "C" fn(u32);
+
+const EVENT_ABORT: u32 = 1;
+const EVENT_BYTE_BASE: u32 = 0x100;
+
+const OVERVIEW: &[u8] = b"\
+nettest measures a network, or breaks it on purpose. Pick a mode, then type
+commands; nothing runs until you do. 'nics' lists the NICs.
+
+  link A B             impair the wire between two NICs: loss, delay, rate...
+  gen / sink           one machine: send test traffic out of one NIC, count it
+                       on another (cabled together)
+  serve N | remote N   two machines: the far end, and the master that runs the
+                       tests and prints one report (then: peer, test)
+
+Anywhere: show  stats  summary  save NAME  view on|off  reset  nics  quit
+More:     help start | link | gen | two | all         Escape stops the tape
+";
+
+const START: &[u8] = b"\
+Getting started. Nothing runs until you pick a mode ('nics' lists the NICs).
+
+ The wire in the middle: cable machine A to NIC 2 and machine B to NIC 3.
+   link 2 3            then:  loss 2   delay 40 5   rate 10000
+   'show' lists the faults, 'stats' counts, 'reset' makes the wire clean.
+
+ One machine, two NICs cabled together:
+   gen nic 2   sink nic 3   gen rate 5000   gen start        then: summary
+   (or: gen sweep 1000 9000 1000 3 steps the rate and prints a table)
+
+ Two machines, any wire or switch between them:
+   far end:  serve 1                 master:  remote 1  (finds it; P picks)
+   master:   test both rate=10000 time=5       or   test sweep both to=20000
+
+ Roles can be combined (a link on two NICs, gen/sink on two others); serve and
+ remote use one NIC and nothing else. 'link off', 'gen nic off', 'sink nic off'
+ and 'serve off' / 'remote off' give a NIC back.
+";
+
+const LINK: &[u8] = b"\
+The impaired wire (link A B). Prefix ab or ba for one direction only.
+  loss [ab|ba] PCT [burst N]   drop PCT% (0.1 steps); N lost in a row
+  delay [ab|ba] MS [JITTER]    hold frames MS ms +/- JITTER ms
+  rate [ab|ba] KBIT            link speed; 0 = unlimited
+  queue [ab|ba] N              frames allowed in flight
+  dup|reorder|corrupt [ab|ba] PCT   deliver twice / swap with next / flip a bit
+  preset [ab|ba] NAME          a named profile; \"presets\" lists them
+  seed N                       repeatable randomness
+  show | stats | reset [stats] settings; counters; clean wire / clear counters
+  view on|off                  live statistics panel above the prompt
+  link A B | link off          which two NICs carry the wire
+";
+
+const GEN: &[u8] = b"\
+One machine: the generator (gen nic N) and the sink (sink nic N).
+  gen start | stop | show      the traffic generator
+  gen nic N|off                which NIC sends; sink nic N|off which one counts
+  gen rate KBIT | size BYTES   constant bit rate of whole frames (60-1514)
+  gen sweep START END STEP S   step the rate, S seconds each; table of results
+  gen bidir on|off             also send a stream back, sink NIC -> gen NIC
+  gen to MAC|sink | count N | time S    destination; stop after N frames / S s
+  gen ip|dst|gw A.B.C.D | port N        send routable UDP/IP (ARPs the gateway)
+  sink [show|hist|reset]       loss, latency, jitter; the latency histogram
+  sink ip A.B.C.D | port N     also accept UDP/IP; answer ARP for the address
+  summary | save NAME          end-of-test summary; write a report file
+";
+
+const TWO: &[u8] = b"\
+Two machines: run nettest on both. Unicast only; other hosts are not disturbed.
+  serve N | serve off      far end on NIC N: waits for a master and answers it
+  remote N | remote off    master on NIC N: probes the announced machines
+  peer                     probe again; 'peer N|NAME|MAC' picks one, P cycles
+  test [up|down|both] [rate=KBIT] [size=B] [time=S]   one test, one report
+  test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]
+                           step the rate; the highest rate with <= 1% loss
+  test stop                abort a running test
+  via=N here=N             run the test on the peer's NIC N / our NIC N (another
+                           network than the control one; 0 = the control NIC)
+The report has, per direction: frames sent/received, loss, rate, latency
+percentiles, queueing delay (clock-offset free) and delivery per second.
+";
+
+/// The page for `topic` ("" = the overview); None for an unknown topic.
+fn page(topic: &[u8]) -> Option<&'static [&'static [u8]]> {
+    Some(match topic {
+        b"" => &[OVERVIEW],
+        b"start" | b"modes" => &[START],
+        b"link" => &[LINK],
+        b"gen" | b"sink" => &[GEN],
+        b"two" | b"remote" | b"serve" | b"test" | b"peer" => &[TWO],
+        b"all" => &[OVERVIEW, START, LINK, GEN, TWO],
+        _ => return None,
+    })
+}
+
+/// Prints help for `topic`; false (and a hint) if there is no such topic.
+pub fn print_topic(putc: Putc, topic: &[u8]) -> bool {
+    let Some(pages) = page(topic) else {
+        for &byte in b"no such topic; help start | link | gen | two | all\n" {
+            putc(u32::from(byte));
+        }
+        return false;
+    };
+    let (_, rows) = tape_rt::console_size();
+    let screen = rows.saturating_sub(1).max(10);
+    let mut shown = 0;
+    for (index, text) in pages.iter().enumerate() {
+        if index != 0 {
+            putc(u32::from(b'\n'));
+            shown += 1;
+        }
+        for line in text.split_inclusive(|&byte| byte == b'\n') {
+            if shown >= screen && !more(putc) {
+                return true;
+            }
+            if shown >= screen {
+                shown = 0;
+            }
+            for &byte in line {
+                putc(u32::from(byte));
+            }
+            shown += 1;
+        }
+    }
+    true
+}
+
+/// Waits for a key after a full screen; false if the reader wants to stop.
+fn more(putc: Putc) -> bool {
+    for &byte in b"-- more: any key for the next page, q stops --" {
+        putc(u32::from(byte));
+    }
+    let go = loop {
+        let event = (api().read_key)();
+        if event == EVENT_ABORT {
+            break false;
+        }
+        if event >= EVENT_BYTE_BASE {
+            break !matches!((event - EVENT_BYTE_BASE) as u8, b'q' | b'Q');
+        }
+        (api().wait_for_event)();
+    };
+    putc(u32::from(b'\r'));
+    for _ in 0..48 {
+        putc(u32::from(b' '));
+    }
+    putc(u32::from(b'\r'));
+    go
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_line_fits_79_columns() {
+        for text in [OVERVIEW, START, LINK, GEN, TWO] {
+            for line in text.split(|&byte| byte == b'\n') {
+                assert!(line.len() <= 79, "too long ({}): {}", line.len(), core::str::from_utf8(line).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn topic_pages_fit_a_25_row_console() {
+        for text in [OVERVIEW, START, LINK, GEN, TWO] {
+            assert!(text.iter().filter(|&&byte| byte == b'\n').count() <= 22);
+        }
+    }
+}

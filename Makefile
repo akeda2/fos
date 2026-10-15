@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-nettest-remote test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi
 
 all: image tapes
 
@@ -74,6 +74,10 @@ test-telnet: image
 # Blocking commands (nic sniff, tape load net) end on the term net client's Escape or disconnect, on any NIC.
 test-release-loops: image
 	python3 tools/test_release_loops.py
+
+# Two guests: nettest serve=1 and remote=1 find each other, sync clocks and run a test both ways.
+test-nettest-remote: image
+	python3 tools/test_nettest_remote.py
 
 # nettest's generator and sink through a four-NIC loop: clean, rate limit, loss and delay, selftest, retarget.
 test-nettest-lab: image

@@ -9,8 +9,10 @@
 //! pass `ticks * 10_000`; delays therefore take effect with 10 ms granularity.
 #![cfg_attr(not(test), no_std)]
 
+pub mod remote;
+
 /// Bytes per queue slot: a 12-byte header (due time, length) plus the largest
-/// Ethernet frame the NIC drivers hand a tape (1514 bytes).
+/// Ethernet frame the NIC drivers hand a tape (1518 bytes: a VLAN-tagged full frame).
 pub const SLOT_BYTES: usize = 1536;
 const HEADER_BYTES: usize = 12;
 
@@ -406,7 +408,7 @@ impl<'a> Direction<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Traffic generator and sink.
+// Traffic generator and sink. (`remote.rs` runs them on two machines at once.)
 //
 // The generator emits numbered, timestamped frames at a constant bit rate; the
 // sink checks them off. Because both run in the same tape on the same machine
@@ -718,7 +720,7 @@ impl Generator {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SinkStats {
     pub received: u32,
     pub bytes: u64,
@@ -739,12 +741,24 @@ pub struct SinkStats {
     /// below `HISTOGRAM_BOUNDS_US[i]` (and not below the previous bound); the
     /// last bucket takes everything slower.
     pub histogram: [u32; HISTOGRAM_BUCKETS],
+    /// Frames received in each second after the first one (later seconds all land in the last bin): where in a
+    /// test the loss happened.
+    pub timeline: [u16; TIMELINE_BINS],
+}
+
+pub const TIMELINE_BINS: usize = 30;
+
+impl Default for SinkStats {
+    fn default() -> Self {
+        Sink::new().stats
+    }
 }
 
 /// Upper bounds (exclusive, microseconds) of the latency histogram's buckets.
-pub const HISTOGRAM_BOUNDS_US: [u32; 23] = [
-    50, 100, 200, 300, 500, 750, 1_000, 1_500, 2_000, 3_000, 5_000, 7_500, 10_000, 15_000, 20_000,
-    30_000, 50_000, 75_000, 100_000, 200_000, 500_000, 1_000_000, 5_000_000,
+pub const HISTOGRAM_BOUNDS_US: [u32; 32] = [
+    50, 100, 200, 300, 500, 750, 1_000, 1_500, 2_000, 3_000, 4_000, 5_000, 6_000, 8_000, 10_000, 12_500, 15_000,
+    20_000, 25_000, 30_000, 40_000, 50_000, 60_000, 75_000, 100_000, 125_000, 150_000, 200_000, 300_000, 500_000,
+    1_000_000, 5_000_000,
 ];
 pub const HISTOGRAM_BUCKETS: usize = HISTOGRAM_BOUNDS_US.len() + 1;
 
@@ -775,6 +789,9 @@ pub struct Sink {
     /// Routable mode: also accept UDP datagrams to this address and port.
     pub udp_ip: Option<[u8; 4]>,
     pub udp_port: u16,
+    /// This machine's clock minus the sender's, for frames from another machine (`remote`); 0 when
+    /// the generator is on this machine. Subtracted from every latency.
+    pub clock_offset_us: i64,
     expected: u32,
     /// Bit `i` set: sequence `expected - 1 - i` has been received.
     window: u64,
@@ -792,7 +809,9 @@ impl Sink {
                 latency_max: 0, latency_sum: 0, jitter: 0, first_us: 0, last_us: 0,
                 interval_latency_max: 0,
                 histogram: [0; HISTOGRAM_BUCKETS],
+                timeline: [0; TIMELINE_BINS],
             },
+            clock_offset_us: 0,
             expected: 0,
             window: 0,
             previous_latency: 0,
@@ -801,10 +820,11 @@ impl Sink {
     }
 
     pub fn reset(&mut self) {
-        let (ip, port) = (self.udp_ip, self.udp_port);
+        let (ip, port, offset) = (self.udp_ip, self.udp_port, self.clock_offset_us);
         *self = Self::new();
         self.udp_ip = ip;
         self.udp_port = port;
+        self.clock_offset_us = offset;
     }
 
     /// Consumes a received frame if it is one of the generator's; false if not.
@@ -835,7 +855,7 @@ impl Sink {
         } else {
             return false;
         };
-        let latency = now_us.saturating_sub(sent_us).min(u64::from(u32::MAX)) as u32;
+        let latency = (now_us as i64 - sent_us as i64 - self.clock_offset_us).clamp(0, i64::from(u32::MAX)) as u32;
         let stats = &mut self.stats;
         if !self.seen_any {
             self.seen_any = true;
@@ -851,6 +871,8 @@ impl Sink {
         stats.interval_latency_max = stats.interval_latency_max.max(latency);
         let bucket = HISTOGRAM_BOUNDS_US.iter().position(|&bound| latency < bound).unwrap_or(HISTOGRAM_BOUNDS_US.len());
         stats.histogram[bucket] += 1;
+        let second = (now_us.saturating_sub(stats.first_us) / 1_000_000).min(TIMELINE_BINS as u64 - 1) as usize;
+        stats.timeline[second] = stats.timeline[second].saturating_add(1);
         stats.latency_sum += u64::from(latency);
         let delta = latency.abs_diff(self.previous_latency);
         stats.jitter = (stats.jitter as i64 + (i64::from(delta) - i64::from(stats.jitter)) / 16) as u32;
@@ -1453,7 +1475,7 @@ mod tests {
         // 90 frames under 100 us, 9 under 1 ms, 1 under 10 ms.
         stats.histogram[1] = 90;
         stats.histogram[6] = 9;
-        stats.histogram[12] = 1;
+        stats.histogram[14] = 1;
         assert_eq!(stats.latency_percentile(500), 100);
         assert_eq!(stats.latency_percentile(950), 1_000);
         assert_eq!(stats.latency_percentile(999), 10_000);

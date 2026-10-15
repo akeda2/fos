@@ -122,6 +122,9 @@ const REG_RDBAL: usize = 0x2800;
 #[allow(dead_code)]
 const REG_RDBAH: usize = 0x2804;
 #[allow(dead_code)]
+/// Statistics registers, clear on read: missed packets (the receive ring was full) and receive no buffers.
+const REG_MPC: usize = 0x4010;
+const REG_RNBC: usize = 0x40a0;
 const REG_RDLEN: usize = 0x2808;
 #[allow(dead_code)]
 const REG_RDH: usize = 0x2810;
@@ -147,6 +150,10 @@ const CTRL_RST: u32 = 1 << 26;
 const RCTL_EN: u32 = 1 << 1;
 const RCTL_BAM: u32 = 1 << 15;
 const RCTL_SECRC: u32 = 1 << 26;
+/// Long packet enable: without it the card drops anything over 1518 bytes on the wire (FCS included), which is a
+/// 1514-byte frame; a VLAN-tagged full frame is 1522.
+const RCTL_LPE: u32 = 1 << 5;
+const DESCRIPTOR_EOP: u8 = 1 << 1;
 const TCTL_EN: u32 = 1 << 1;
 const TCTL_PSP: u32 = 1 << 3;
 const TCTL_CT: u32 = 0x10 << 4;
@@ -178,10 +185,13 @@ const ITR_VALUE: u32 = 100;
 const DESCRIPTOR_DONE: u8 = 1;
 const TX_EOP_IFCS_RS: u8 = (1 << 0) | (1 << 1) | (1 << 3);
 
+/// 256 descriptors of 16 bytes fill the one page the ring gets. 128 let a 1 Gbit/s burst of 1400-byte
+/// frames overrun a slower CPU (rack: ~360 missed packets in 5 s); the card counts them in MPC.
 const RX_COUNT: usize = 128;
 const TX_COUNT: usize = 16;
 const BUFFER_SIZE: usize = 2048;
-pub const MAX_FRAME: usize = 1514;
+/// 1514 plus a 4-byte VLAN tag: a tagged full-size frame must cross a bridge intact.
+pub const MAX_FRAME: usize = 1518;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -203,6 +213,10 @@ pub struct IsrState {
     icr: core::sync::atomic::AtomicUsize,
     pub interrupts: core::sync::atomic::AtomicU64,
     pub overruns: core::sync::atomic::AtomicU64,
+    /// Frames the card dropped for want of a receive buffer (MPC) and the times it had none (RNBC),
+    /// summed over `nic list` calls: both registers clear when read.
+    pub missed: core::sync::atomic::AtomicU64,
+    pub no_buffers: core::sync::atomic::AtomicU64,
     pub link_changes: core::sync::atomic::AtomicU64,
 }
 
@@ -213,6 +227,8 @@ pub static ISR: [IsrState; MAX_INTERFACES] = [const {
         icr: core::sync::atomic::AtomicUsize::new(0),
         interrupts: core::sync::atomic::AtomicU64::new(0),
         overruns: core::sync::atomic::AtomicU64::new(0),
+        missed: core::sync::atomic::AtomicU64::new(0),
+        no_buffers: core::sync::atomic::AtomicU64::new(0),
         link_changes: core::sync::atomic::AtomicU64::new(0),
     }
 }; MAX_INTERFACES];
@@ -265,6 +281,8 @@ pub struct E1000 {
     rx_buffers: u64,
     tx_buffers: u64,
     rx_next: usize,
+    /// Inside an oversize frame that spans several buffers (RCTL.LPE lets it in): drop it up to its last descriptor.
+    rx_skipping: bool,
     tx_next: usize,
     pub frames_received: u64,
     pub frames_sent: u64,
@@ -475,7 +493,7 @@ impl E1000 {
             write(registers, r.txdctl, TXDCTL_QUEUE_ENABLE);
         }
         write(registers, REG_TCTL, tctl);
-        write(registers, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC); // 2 KiB buffers, broadcast + own MAC
+        write(registers, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_LPE); // 2 KiB buffers, broadcast + own MAC
         write(registers, REG_CTRL, CTRL_SLU | CTRL_FD);
         if variant == Variant::I350 {
             // 2 KiB receive buffers (SRRCTL counts KiB), then enable both queues explicitly and
@@ -494,7 +512,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0 })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0 })
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -510,6 +528,18 @@ impl E1000 {
     pub fn set_multicast(&mut self, on: bool) {
         let control = read(self.registers, REG_RCTL);
         write(self.registers, REG_RCTL, if on { control | (1 << 4) } else { control & !(1 << 4) });
+    }
+
+    /// `nic list`: what the card itself counted lost for want of receive buffers. These are the
+    /// frames a foreground that polls too slowly costs; the ring is `RX_COUNT` buffers deep.
+    pub fn describe(&self) {
+        use core::sync::atomic::Ordering;
+        let state = &ISR[self.index];
+        let missed = u64::from(read(self.registers, REG_MPC));
+        let none = u64::from(read(self.registers, REG_RNBC));
+        let missed = state.missed.fetch_add(missed, Ordering::Relaxed) + missed;
+        let none = state.no_buffers.fetch_add(none, Ordering::Relaxed) + none;
+        crate::println!("   receive ring: {RX_COUNT} buffers; card counted {missed} missed packets, {none} no-buffer events");
     }
 
     pub fn link_up(&self) -> bool {
@@ -549,21 +579,29 @@ impl E1000 {
     /// Copies the next received frame into `out`; returns its length, or None if the
     /// ring is empty.
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
-        let descriptor = unsafe { (self.rx_ring as *mut Descriptor).add(self.rx_next) };
-        let status = unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) };
-        if status & DESCRIPTOR_DONE == 0 {
-            return None;
+        loop {
+            let descriptor = unsafe { (self.rx_ring as *mut Descriptor).add(self.rx_next) };
+            let status = unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) };
+            if status & DESCRIPTOR_DONE == 0 {
+                return None;
+            }
+            let length = unsafe { read_volatile(core::ptr::addr_of!((*descriptor).length)) } as usize;
+            let length = length.min(BUFFER_SIZE).min(out.len());
+            let keep = !self.rx_skipping && status & DESCRIPTOR_EOP != 0;
+            if keep {
+                let buffer = (self.rx_buffers + (self.rx_next * BUFFER_SIZE) as u64) as *const u8;
+                unsafe { core::ptr::copy_nonoverlapping(buffer, out.as_mut_ptr(), length) };
+            }
+            self.rx_skipping = status & DESCRIPTOR_EOP == 0;
+            // Hand the buffer back: clear status, then advance the tail onto it.
+            unsafe { write_volatile(core::ptr::addr_of_mut!((*descriptor).status), 0) };
+            write(self.registers, self.r.rdt, self.rx_next as u32);
+            self.rx_next = (self.rx_next + 1) % RX_COUNT;
+            if keep {
+                self.frames_received += 1;
+                return Some(length);
+            }
         }
-        let length = unsafe { read_volatile(core::ptr::addr_of!((*descriptor).length)) } as usize;
-        let length = length.min(BUFFER_SIZE).min(out.len());
-        let buffer = (self.rx_buffers + (self.rx_next * BUFFER_SIZE) as u64) as *const u8;
-        unsafe { core::ptr::copy_nonoverlapping(buffer, out.as_mut_ptr(), length) };
-        // Hand the buffer back: clear status, then advance the tail onto it.
-        unsafe { write_volatile(core::ptr::addr_of_mut!((*descriptor).status), 0) };
-        write(self.registers, self.r.rdt, self.rx_next as u32);
-        self.rx_next = (self.rx_next + 1) % RX_COUNT;
-        self.frames_received += 1;
-        Some(length)
     }
 
     /// Queues one frame (padded to the 60-byte minimum). Returns false if the ring

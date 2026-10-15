@@ -543,7 +543,7 @@ extern "C" fn api_nic_mac(index: usize, out: *mut u8) -> u32 {
     1
 }
 extern "C" fn api_nic_send(index: usize, frame: *const u8, length: usize) -> u32 {
-    if length > 1514 {
+    if length > 1518 {
         return 0;
     }
     u32::from(term::nic_send(index, unsafe { core::slice::from_raw_parts(frame, length) }))
@@ -593,7 +593,7 @@ extern "C" fn api_audio_stats(out: *mut fosfor_abi::tape::AudioStats) {
 }
 
 extern "C" fn api_nic_max_frame_len() -> usize {
-    1514
+    1518
 }
 
 /// Runs the loaded tape with `arguments`. The tape gets a 1 MiB stack of its own, so

@@ -128,7 +128,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.describe(),
             Nic::Rtl8168(nic) => nic.describe(),
             Nic::ThreeCom(nic) => nic.describe(),
-            Nic::E1000(_) => {}
+            Nic::E1000(nic) => nic.describe(),
         }
     }
 

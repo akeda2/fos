@@ -142,7 +142,12 @@ def main():
             check("2 interface" not in "" and "interface 1" in clean(bytes(output)), "the terminal session opens on interface 1 of two", clean(bytes(output)))
 
             started = say("run nettest", "nettest> ")
-            check("NIC 1 <-> NIC 2 (promiscuous)" in started, "the tape starts between NIC 1 and NIC 2 and puts both in promiscuous mode", started)
+            check("Serving on NIC 1" in started, "plain 'nettest' is the far end on NIC 1, waiting for a master", started)
+            helped = say("help", "nettest> ")
+            check("link A B" in helped and "serve N | remote N" in helped, "help shows the modes", helped)
+            check(all(len(line) <= 79 for line in clean(helped.encode()).splitlines()), "help fits 79 columns", helped)
+            moved = say("link 1 2", "nettest> ")
+            check("impairment link moved" in moved and "two-machine mode stopped" in moved, "'link 1 2' at the prompt sets up the wire between NIC 1 and NIC 2", moved)
 
             for frame in a.frames(0.2):
                 pass

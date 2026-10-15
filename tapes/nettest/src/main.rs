@@ -23,11 +23,14 @@
 
 extern crate nettest_tape;
 
+mod help;
+
 use core::ptr::addr_of_mut;
 use nettest_tape::{
     ArpInfo, Config, Direction, GEN_HEADER_LEN, Generator, HISTOGRAM_BOUNDS_US, MAX_FRAME, PRESETS,
     Rng, SLOT_BYTES, Sink, Sweep, UdpPlan, build_arp, parse_arp, parse_ip, parse_mac, parse_permille, parse_u32, preset,
 };
+use nettest_tape::remote::{CTRL_ETHERTYPE, Event as RemoteEvent, Remote, Role as RemoteRole, TestParams};
 use tape_rt::{TapeApi, micros, print_bytes, print_u32};
 
 fn wait_for_event() {
@@ -92,6 +95,15 @@ struct Session<'a> {
     rsink: Sink,
     rev_gateway: Option<[u8; 4]>,
     last_rev_arp_us: u64,
+    /// Two-machine mode (`serve=N` / `remote=N`, see `remote.rs`): the role asked for, the engine once the NIC's
+    /// MAC is known, when to probe the announced machines for servers next (0 = not any more), and which found
+    /// server the `P` key chose last.
+    remote_role: Option<RemoteRole>,
+    remote: Option<Remote>,
+    probe_at_us: u64,
+    chosen: usize,
+    /// A running `test sweep`: the rate ladder and the best loss-free rate each way so far.
+    rate_sweep: Option<RateSweep>,
     /// FOSFS write callback (for `save`), the file `gen.save=NAME` writes when a
     /// test finishes, and when the end-of-test summary is due (0 = not pending).
     fs_write: Option<fn(usize, u32, usize, u32) -> u32>,
@@ -210,6 +222,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         last_rev_arp_us: 0,
         gen_mac: [0; 6],
         sink_mac: [0; 6],
+        remote_role: None,
+        remote: None,
+        probe_at_us: 0,
+        chosen: 0,
+        rate_sweep: None,
         fs_write: None,
         save_name: [0; 16],
         save_name_len: 0,
@@ -234,6 +251,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
               \x20      [rate=KBIT] [queue=N] [seed=N] [gen=N] [sink=N] [gen.rate=KBIT]\n\
               \x20      [gen.size=B] [gen.to=MAC|sink] [gen.count=N] [gen.time=S]\n\
               \x20      [gen.run=on]   or   tape run nettest @FILE\n\
+              Two machines: nettest serve=N (far end)  nettest remote=N (master)\n\
+              Or just \"nettest\" and choose at the prompt (help)\n\
               Ready-made: nettest selftest GEN LINK_IN LINK_OUT SINK [settings]\n\
               \x20           nettest routertest GEN SINK [settings]\n",
         );
@@ -242,8 +261,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     // Roles: the impairment link between two ports, a generator NIC, a sink NIC.
     // With only `gen=`/`sink=` and no port numbers there is no impairment link.
+    // `nettest` with nothing at all starts idle: every mode is chosen at the prompt.
+    let idle = arguments.iter().all(|byte| byte.is_ascii_whitespace());
+    if idle && nic_total >= 1 {
+        // A plain `nettest` (a `start` file line) is the far end: a master finds it and does the
+        // set-up. Any role command typed here takes the NIC back.
+        session.gen_nic = Some(0);
+        session.remote_role = Some(RemoteRole::Server);
+    }
     let roles = session.gen_nic.is_some() || session.sink_nic.is_some();
-    session.limiter = port_count != 0 || !roles;
+    session.limiter = port_count != 0 || !(roles || idle);
     if session.limiter {
         if port_count == 0 {
             ports = [0, 1];
@@ -305,6 +332,17 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     session.gen_mac = gen_mac;
     session.sink_mac = sink_mac;
+    if let Some(role) = session.remote_role {
+        if session.sink_nic.is_some() || session.limiter {
+            print_bytes(putc, b"nettest: serve=N / remote=N use one NIC and nothing else.\n");
+            release(big);
+            return;
+        }
+        let id = (micros() as u16) ^ u16::from_le_bytes([gen_mac[4], gen_mac[5]]);
+        let mut remote = Remote::new(role, gen_mac, id);
+        set_remote_nics(&mut remote, nic_total, nic_mac_at);
+        session.remote = Some(remote);
+    }
     session.ports = ports;
     session.macs = macs;
     session.fs_write = Some(fs_write);
@@ -322,9 +360,25 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         print_u32(putc, session.links[0].queue.capacity() as u32);
         print_bytes(putc, b" frames of queue per way.\n");
     } else {
-        print_bytes(putc, b"no impairment link (generator/sink only).\n");
+        if session.gen_nic.is_some() || session.sink_nic.is_some() {
+            print_bytes(putc, b"no impairment link (generator/sink only).\n");
+        } else {
+            print_nics(putc, &session);
+            print_bytes(putc, b"Pick a mode: link A B, gen/sink, serve N, remote N.\n");
+        }
     }
-    if let Some(nic) = session.gen_nic {
+    if let (Some(nic), Some(remote)) = (session.gen_nic, session.remote.as_ref()) {
+        if remote.role == RemoteRole::Server {
+            print_bytes(putc, b"Serving on NIC ");
+            print_u32(putc, nic + 1);
+            print_bytes(putc, b": waiting for a master (it types 'remote N'; help for other modes).\n");
+        } else {
+            print_bytes(putc, b"Master on NIC ");
+            print_u32(putc, nic + 1);
+            print_bytes(putc, b": looking for servers; 'peer' lists them, P picks the next, 'test' runs.\n");
+            session.probe_at_us = micros() + 1_000_000;
+        }
+    } else if let Some(nic) = session.gen_nic {
         print_bytes(putc, b"Generator on NIC ");
         print_u32(putc, nic + 1);
         print_bytes(putc, b"; start it with: gen start\n");
@@ -363,6 +417,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             view_update(putc, &mut session, now_us / 10_000);
         }
 
+        if session.remote.is_some() {
+            busy |= remote_pass(putc, &mut session, &mut frame, max_frame_len, &line[..line_length]);
+        }
+
         // The sink first, so a frame is timestamped as soon as it is seen.
         if let Some(nic) = session.sink_nic {
             for _ in 0..64 {
@@ -393,6 +451,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         // so its receive ring never fills while the foreground is busy sending.
         if let Some(nic) = session.gen_nic {
             for _ in 0..8 {
+                if session.remote.is_some() {
+                    break; // remote_pass reads this NIC
+                }
                 let received = nic_receive_at(nic, frame.as_mut_ptr() as usize, max_frame_len as u32) as usize;
                 if received < ETHERNET_HEADER_LEN {
                     break;
@@ -484,8 +545,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         // The generator: everything that has come due, up to a burst limit.
         if let Some(nic) = session.gen_nic {
             let mut sent = 0;
-            while let Some(length) = session.generator.next_frame(now_us, session.gen_mac, &mut frame, sent) {
-                let ok = nic_send_at(nic, frame.as_ptr() as usize, length as u32) != 0;
+            let (tx_nic, tx_mac) = if session.generator.running { tx_path(&session, nic) } else { (nic, session.gen_mac) };
+            while let Some(length) = session.generator.next_frame(now_us, tx_mac, &mut frame, sent) {
+                let ok = nic_send_at(tx_nic, frame.as_ptr() as usize, length as u32) != 0;
                 session.generator.record_send(length, ok);
                 sent += 1;
                 busy = true;
@@ -498,7 +560,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 print_bytes(putc, b"\ngenerator finished: ");
                 print_gen_line(putc, &session);
                 // Give the last frames a moment to arrive, then summarize.
-                session.summary_due_us = now_us + 1_000_000;
+                if session.remote.is_none() {
+                    session.summary_due_us = now_us + 1_000_000;
+                }
                 print_bytes(putc, b"nettest> ");
                 print_bytes(putc, &line[..line_length]);
             }
@@ -540,8 +604,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                         generator_was_running = session.generator.running;
                         print_bytes(putc, b"nettest> ");
                     }
-                    // The kernel's read_key already erased the character on screen.
-                    8 | 127 => line_length = line_length.saturating_sub(1),
+                    b'P' if line_length == 0 && session.remote.as_ref().is_some_and(|r| r.role == RemoteRole::Master) => {
+                        putc(u32::from(b'\n'));
+                        choose_next(putc, &mut session);
+                        print_bytes(putc, b"nettest> ");
+                    }
+                    // read_key does not echo: erase the character on screen as the shell does (back, blank, back).
+                    8 | 127 if line_length > 0 => {
+                        line_length -= 1;
+                        print_bytes(putc, b"\x08 \x08");
+                    }
                     byte @ 32..=126 if line_length < line.len() => {
                         line[line_length] = byte;
                         line_length += 1;
@@ -729,6 +801,9 @@ fn apply_startup(
                 index += 1;
             } else if let Some(equals) = word.iter().position(|&byte| byte == b'=') {
                 if !apply_setting(session, &word[..equals], &word[equals + 1..]) {
+                    if word.starts_with(b"serve=") || word.starts_with(b"remote=") {
+                        print_bytes(putc, b"nettest: use one of serve=N and remote=N\n");
+                    }
                     return false;
                 }
                 index += 1;
@@ -768,6 +843,17 @@ fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
             }
             None => false,
         };
+    }
+    if key == b"serve" || key == b"remote" || key == b"nic" {
+        let Some(number) = parse_u32(value).filter(|&number| number >= 1) else { return false };
+        // nic=N is the far end (like serve=N) on a chosen NIC; plain `nettest` uses NIC 1.
+        let role = if key != b"remote" { RemoteRole::Server } else { RemoteRole::Master };
+        if session.remote_role.is_some_and(|had| had != role) {
+            return false;
+        }
+        session.gen_nic = Some(number - 1);
+        session.remote_role = Some(role);
+        return true;
     }
     if key == b"gen" || key == b"sink" {
         let Some(number) = parse_u32(value).filter(|&number| number >= 1) else { return false };
@@ -1060,7 +1146,16 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
     }
     match words[0] {
         b"quit" | b"q" | b"exit" => return Outcome::Quit,
-        b"help" | b"h" | b"?" => print_help(putc),
+        b"help" | b"h" | b"?" => {
+            if !help::print_topic(putc, words.get(1).copied().unwrap_or(b"")) {
+                return Outcome::Error;
+            }
+        }
+        b"nics" => print_nics(putc, session),
+        b"serve" | b"remote" => {
+            let role = if words[0] == b"serve" { RemoteRole::Server } else { RemoteRole::Master };
+            return remote_mode(putc, session, role, words.get(1).copied().unwrap_or(b""));
+        }
         b"show" => show(putc, session),
         b"stats" => print_stats(putc, session),
         b"reset" => {
@@ -1119,10 +1214,15 @@ fn run_line(putc: Putc, session: &mut Session<'_>, line: &[u8]) -> Outcome {
             print_u32(putc, backwards);
             putc(u32::from(b'\n'));
         }
+        b"peer" => return peer_command(putc, session, &words[1..count]),
+        b"test" => return test_command(putc, session, &words[1..count]),
         b"gen" => return gen_command(putc, session, &words[1..count]),
         b"sink" => match words.get(1).copied() {
             Some(b"nic") => {
                 return retarget(putc, session, Role::Sink, words.get(2).copied().unwrap_or(b""));
+            }
+            Some(number) if parse_u32(number).is_some() => {
+                return retarget(putc, session, Role::Sink, number);
             }
             Some(b"reset") => {
                 session.sink.reset();
@@ -1187,6 +1287,10 @@ fn gen_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcom
         print_gen_config(putc, session);
         return Outcome::Continue;
     };
+    if verb == b"nic" || parse_u32(verb).is_some() {
+        let arg = if verb == b"nic" { words.get(1).copied().unwrap_or(b"") } else { verb };
+        return retarget(putc, session, Role::Gen, arg);
+    }
     if verb == b"nic" {
         return retarget(putc, session, Role::Gen, words.get(1).copied().unwrap_or(b""));
     }
@@ -1279,6 +1383,7 @@ fn retarget(putc: Putc, session: &mut Session<'_>, role: Role, arg: &[u8]) -> Ou
             }
         }
     };
+    drop_remote(putc, session);
     if let Some(nic) = new {
         if nic_in_use(session, nic, Some(&role)) {
             print_bytes(putc, b"that NIC already has another role\n");
@@ -1351,6 +1456,9 @@ fn relink(putc: Putc, session: &mut Session<'_>, first: &[u8], second: &[u8]) ->
         return Outcome::Error;
     }
     let (a, b) = (a - 1, b - 1);
+    if session.gen_nic.is_some_and(|nic| nic == a || nic == b) {
+        drop_remote(putc, session);
+    }
     for nic in [a, b] {
         if session.gen_nic == Some(nic) || session.sink_nic == Some(nic) {
             print_bytes(putc, b"that NIC already has another role\n");
@@ -1520,32 +1628,6 @@ fn print_sink_latency(putc: Putc, session: &Session<'_>) {
     print_u32(putc, stats.latency_max);
     print_bytes(putc, b"  jitter ");
     print_u32(putc, stats.jitter);
-}
-
-fn print_help(putc: Putc) {
-    print_bytes(
-        putc,
-        b"loss [ab|ba] PCT [burst N]   drop PCT% (0.1 steps); N lost in a row\n\
-          delay [ab|ba] MS [JITTER]    hold frames MS ms +/- JITTER ms\n\
-          rate [ab|ba] KBIT            link speed; 0 = unlimited\n\
-          queue [ab|ba] N              frames allowed in flight\n\
-          dup|reorder|corrupt [ab|ba] PCT   deliver twice / swap with next / flip a bit\n\
-          preset [ab|ba] NAME          a named profile; \"presets\" lists them\n\
-          seed N | show | stats        repeatable randomness; settings; counters\n\
-          view on|off                  live statistics panel above the prompt\n\
-          reset [stats]                clean link, or clear the counters\n\
-          gen start|stop|show          the traffic generator (needs gen=N)\n\
-          gen nic N|off | sink nic N|off | link A B|off   re-point a role\n\
-          gen rate KBIT | size BYTES   constant bit rate of whole frames\n\
-          gen sweep START END STEP S   step the rate, S seconds each; table of results\n\
-          gen bidir on|off             also send a stream back, sink NIC -> gen NIC\n\
-          gen to MAC|sink | count N | time S    destination; stop after N / S\n\
-          gen ip|dst|gw A.B.C.D | port N   send routable UDP/IP (ARP for the gateway)\n\
-          sink [show|hist|reset]       the receiver (needs sink=N): loss, latency\n\
-          summary | save NAME          end-of-test summary; write a report file\n\
-          sink ip A.B.C.D | port N     also accept UDP/IP; answer ARP for the address\n\
-          quit                         stop (Escape also stops)\n",
-    );
 }
 
 fn print_tenths(putc: Putc, permille: u16) {
@@ -2154,6 +2236,755 @@ tape_rt::tape_help!(br#"nettest: two-port link impairment (loss, delay, rate) an
                    [queue=N] [seed=N]      prefix with ab. or ba. per direction
   tape run nettest @nettest.cfg            one command per line
 
-  At the nettest> prompt: loss, delay, rate, queue, seed, show, stats,
-  reset, help, quit. Escape stops. See docs/nettest.md.
+  tape run nettest [nic=N]                 far end on NIC N (default 1): a master
+                                           sets it up; or choose at the prompt:
+                                           nics, link, gen, sink, serve, remote
+  At the nettest> prompt, 'help' lists everything. Escape stops.
+  See docs/nettest.md.
 "#);
+
+
+// ---------------------------------------------------------------------------
+// Two machines (`serve=N` / `remote=N`): see `remote.rs` for the protocol.
+
+fn print_u64(putc: Putc, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for &digit in digits[..count].iter().rev() {
+        putc(u32::from(digit));
+    }
+}
+
+/// A signed microsecond count as seconds with three decimals (`-12.345 s`): two machines booted at
+/// different times differ by far more than a u32 of microseconds.
+fn print_offset(putc: Putc, offset_us: i64) {
+    if offset_us < 0 {
+        putc(u32::from(b'-'));
+    }
+    let ms = offset_us.unsigned_abs() / 1000;
+    print_u64(putc, ms / 1000);
+    putc(u32::from(b'.'));
+    let fraction = (ms % 1000) as u32;
+    for place in [100, 10, 1] {
+        putc(u32::from(b'0') + (fraction / place % 10));
+    }
+    print_bytes(putc, b" s");
+}
+
+/// The announced machines the kernel has heard on `nic`.
+/// Every announced machine. The kernel table keeps one NIC per MAC, so with two NICs on one segment the NIC
+/// shown may not be ours; a HELLO sent on the chosen NIC decides who is really reachable.
+fn heard_on(_nic: u32, out: &mut [tape_rt::PeerInfo; 16]) -> usize {
+    let api = tape_rt::api();
+    if api.version < 5 || (api.size as usize) < core::mem::size_of::<TapeApi>() {
+        return 0;
+    }
+    let total = (api.peer_info)(0, core::ptr::null_mut());
+    let mut count = 0;
+    for number in 1..=total {
+        let mut info = tape_rt::PeerInfo::default();
+        if (api.peer_info)(number, &mut info) >= number && count < out.len() {
+            out[count] = info;
+            count += 1;
+        }
+    }
+    count
+}
+
+fn print_peer_name(putc: Putc, mac: [u8; 6], nic: u32) {
+    let mut peers = [tape_rt::PeerInfo::default(); 16];
+    let count = heard_on(nic, &mut peers);
+    match peers[..count].iter().find(|peer| peer.mac == mac) {
+        Some(peer) => print_bytes(putc, &peer.name[..usize::from(peer.name_length).min(20)]),
+        None => print_mac(putc, &mac),
+    }
+}
+
+/// Sends the unicast HELLO to every announced machine on the NIC; servers answer.
+fn probe_servers(session: &mut Session<'_>) -> usize {
+    let (Some(nic), Some(remote)) = (session.gen_nic, session.remote.as_mut()) else { return 0 };
+    let mut peers = [tape_rt::PeerInfo::default(); 16];
+    let count = heard_on(nic, &mut peers);
+    let mut macs = [[0u8; 6]; 16];
+    for (slot, peer) in macs.iter_mut().zip(&peers[..count]) {
+        *slot = peer.mac;
+    }
+    remote.discover(&macs[..count], micros());
+    count
+}
+
+fn start_sync(putc: Putc, session: &mut Session<'_>, mac: [u8; 6]) {
+    let nic = session.gen_nic.unwrap_or(0);
+    if let Some(remote) = session.remote.as_mut() {
+        remote.select(mac, micros());
+    }
+    print_bytes(putc, b"peer ");
+    print_peer_name(putc, mac, nic);
+    print_bytes(putc, b": measuring the clock offset...\n");
+}
+
+/// `P`: the next server found, wrapping round.
+fn choose_next(putc: Putc, session: &mut Session<'_>) {
+    let Some(remote) = session.remote.as_ref() else { return };
+    if remote.busy() {
+        print_bytes(putc, b"a test is running\n");
+        return;
+    }
+    if remote.found_count == 0 {
+        let count = probe_servers(session);
+        print_bytes(putc, b"no server known yet; probing ");
+        print_u32(putc, count as u32);
+        print_bytes(putc, b" machine(s)...\n");
+        return;
+    }
+    session.chosen = (session.chosen + 1) % remote.found_count;
+    let mac = remote.found[session.chosen].mac;
+    start_sync(putc, session, mac);
+}
+
+fn peer_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcome {
+    let Some(nic) = session.gen_nic else { return not_remote(putc) };
+    let Some(remote) = session.remote.as_ref().filter(|remote| remote.role == RemoteRole::Master) else {
+        return not_remote(putc);
+    };
+    if remote.busy() {
+        print_bytes(putc, b"a test is running\n");
+        return Outcome::Error;
+    }
+    let Some(&arg) = words.first() else {
+        let count = probe_servers(session);
+        print_bytes(putc, b"probing ");
+        print_u32(putc, count as u32);
+        print_bytes(putc, b" announced machine(s)...\n");
+        return Outcome::Continue;
+    };
+    let mut peers = [tape_rt::PeerInfo::default(); 16];
+    let count = heard_on(nic, &mut peers);
+    let mac = if let Some(number) = parse_u32(arg) {
+        // The Nth server found, as the list printed it.
+        match number.checked_sub(1).and_then(|index| remote.found[..remote.found_count].get(index as usize)) {
+            Some(found) => found.mac,
+            None => {
+                print_bytes(putc, b"no such number; 'peer' lists the servers\n");
+                return Outcome::Error;
+            }
+        }
+    } else if let Some(mac) = parse_mac(arg) {
+        mac
+    } else if let Some(peer) = peers[..count].iter().find(|peer| {
+        peer.name[..usize::from(peer.name_length).min(20)].eq_ignore_ascii_case(arg)
+    }) {
+        peer.mac
+    } else {
+        print_bytes(putc, b"unknown name; use: peer [N|NAME|MAC]\n");
+        return Outcome::Error;
+    };
+    start_sync(putc, session, mac);
+    Outcome::Continue
+}
+
+/// `test sweep`: steps the rate up by `step` until `to`; `best_*` is the highest rate that lost at most 1%.
+#[derive(Clone, Copy)]
+struct RateSweep {
+    to: u32,
+    step: u32,
+    best_up: u32,
+    best_down: u32,
+    /// Pause between steps, so the previous step's queued frames drain: when the next step starts (0 = none
+    /// pending) and at which rate.
+    settle_us: u64,
+    resume_at_us: u64,
+    next_rate: u32,
+}
+
+fn not_remote(putc: Putc) -> Outcome {
+    print_bytes(putc, b"this needs the master mode: type remote N (help two)\n");
+    Outcome::Error
+}
+
+fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcome {
+    if !session.remote.as_ref().is_some_and(|remote| remote.role == RemoteRole::Master) {
+        return not_remote(putc);
+    }
+    let mut params = session.remote.as_ref().map_or(TestParams::new(), |remote| remote.test);
+    let (mut sweeping, mut to, mut step, mut rate_given, mut time_given, mut settle) = (false, 20_000u32, 2_000u32, false, false, 1u32);
+    for &word in words {
+        match word {
+            b"sweep" => sweeping = true,
+            b"up" => (params.up, params.down) = (true, false),
+            b"down" => (params.up, params.down) = (false, true),
+            b"both" => (params.up, params.down) = (true, true),
+            b"stop" => {
+                session.rate_sweep = None;
+                let mut out = [0u8; 512];
+                let Session { remote, generator, .. } = session;
+                let length = remote.as_mut().and_then(|remote| remote.stop_test(generator, &mut out));
+                if let (Some(length), Some(nic)) = (length, session.gen_nic) {
+                    let _ = nic_send_at(nic, out.as_ptr() as usize, length as u32);
+                }
+                print_bytes(putc, b"test stopped\n");
+                return Outcome::Continue;
+            }
+            _ => {
+                let Some(equals) = word.iter().position(|&byte| byte == b'=') else {
+                    print_bytes(putc, b"use: test [sweep] [up|down|both] [rate=KBIT] [size=B] [time=S] [via=N] [here=N]\n");
+                    return Outcome::Error;
+                };
+                let value = parse_u32(&word[equals + 1..]).filter(|&value| value > 0);
+                if matches!(&word[..equals], b"via" | b"here") {
+                    let number = match &word[equals + 1..] {
+                        b"0" | b"control" | b"ctl" => Some(0),
+                        other => parse_u32(other).filter(|&value| (1..=16).contains(&value)),
+                    };
+                    let Some(number) = number else {
+                        print_bytes(putc, b"via=N / here=N: a NIC number, or 0 for the control NIC\n");
+                        return Outcome::Error;
+                    };
+                    if &word[..equals] == b"via" {
+                        params.via = number as u8;
+                    } else {
+                        params.here = number as u8;
+                    }
+                    continue;
+                }
+                match (&word[..equals], value) {
+                    (b"rate", Some(value)) => (params.rate_kbit, rate_given) = (value, true),
+                    (b"to", Some(value)) => to = value,
+                    (b"step", Some(value)) => step = value,
+                    (b"settle", Some(value)) if value <= 60 => settle = value,
+                    (b"size", Some(value)) if (60..=1514).contains(&value) => params.size = value as u16,
+                    (b"time", Some(value)) if value <= 3600 => (params.seconds, time_given) = (value as u16, true),
+                    _ => {
+                        print_bytes(putc, b"bad value: rate KBIT, size 60-1514, time 1-3600 s, settle 1-60 s\n");
+                        return Outcome::Error;
+                    }
+                }
+            }
+        }
+    }
+    if sweeping {
+        if !rate_given {
+            params.rate_kbit = 2_000;
+        }
+        if !time_given {
+            params.seconds = 3;
+        }
+        if to < params.rate_kbit || step == 0 {
+            print_bytes(putc, b"sweep: rate=FROM to=TO step=STEP (kbit/s), TO at least FROM\n");
+            return Outcome::Error;
+        }
+        session.rate_sweep = Some(RateSweep { to, step, best_up: 0, best_down: 0, settle_us: u64::from(settle) * 1_000_000, resume_at_us: 0, next_rate: 0 });
+        print_bytes(putc, b"sweep (queue = mean minus minimum delay), kbit/s sent, then per direction:\n");
+        print_bytes(putc, b"        sent    got    loss  queue |    got    loss  queue\n");
+    }
+    begin_test(putc, session, params)
+}
+
+fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outcome {
+    let mut here_mac = session.gen_mac;
+    if let Some(nic) = params.here.checked_sub(1).map(u32::from) {
+        if nic as usize >= session.nic_total || (session.mac_at)(nic, here_mac.as_mut_ptr() as usize) == 0 {
+            print_bytes(putc, b"here=N: no such NIC (see 'nics')\n");
+            session.rate_sweep = None;
+            return Outcome::Error;
+        }
+        if nic_in_use(session, nic, Some(&Role::Gen)) && session.gen_nic != Some(nic) {
+            print_bytes(putc, b"here=N: that NIC has another role\n");
+            session.rate_sweep = None;
+            return Outcome::Error;
+        }
+    }
+    let Session { remote, generator, sink, .. } = session;
+    let result = match remote.as_mut() {
+        Some(remote) => remote.start_test(params, micros(), generator, sink, here_mac),
+        None => Err("no remote"),
+    };
+    match result {
+        Ok(()) if session.rate_sweep.is_some() => Outcome::Continue,
+        Ok(()) => {
+            print_bytes(putc, b"starting the test (");
+            print_bytes(putc, if params.up && params.down { b"both ways" } else if params.up { b"up" } else { b"down" });
+            print_bytes(putc, b", ");
+            print_u32(putc, params.rate_kbit);
+            print_bytes(putc, b" kbit/s of ");
+            print_u32(putc, u32::from(params.size));
+            print_bytes(putc, b" B frames, ");
+            print_u32(putc, u32::from(params.seconds));
+            print_bytes(putc, b" s)...\n");
+            Outcome::Continue
+        }
+        Err(reason) => {
+            session.rate_sweep = None;
+            print_bytes(putc, reason.as_bytes());
+            putc(u32::from(b'\n'));
+            Outcome::Error
+        }
+    }
+}
+
+/// Mean latency minus the minimum, in microseconds: the queueing delay, which the clock offset cancels out of.
+fn queueing_us(stats: &nettest_tape::SinkStats) -> u32 {
+    if stats.received == 0 {
+        return 0;
+    }
+    ((stats.latency_sum / u64::from(stats.received)) as u32).saturating_sub(stats.latency_min)
+}
+
+/// Hundredths of a percent of `sent` that never arrived (tail loss included).
+fn missing_hundredths(sent: u32, received: u32) -> u32 {
+    if sent == 0 {
+        return 0;
+    }
+    ((u64::from(sent.saturating_sub(received)) * 10_000) / u64::from(sent)) as u32
+}
+
+fn print_padded(putc: Putc, value: u32, width: usize) {
+    let mut digits = 1;
+    let mut rest = value;
+    while rest >= 10 {
+        rest /= 10;
+        digits += 1;
+    }
+    for _ in digits..width {
+        putc(u32::from(b' '));
+    }
+    print_u32(putc, value);
+}
+
+/// One `test sweep` row for the step that just ended, then the next step or the verdict.
+fn sweep_step_done(putc: Putc, session: &mut Session<'_>) {
+    let (Some(mut sweep), Some(remote)) = (session.rate_sweep, session.remote.as_ref()) else { return };
+    let (Some(report), params) = (remote.report, remote.test) else { return };
+    print_padded(putc, params.rate_kbit, 12);
+    let mut rate_ok = [false; 2];
+    for (index, (enabled, sent, sink)) in [
+        (params.up, session.generator.stats.sent, &report.sink),
+        (params.down, report.gen_sent, &session.sink.stats),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        print_bytes(putc, if index == 0 { b"  " } else { b" | " });
+        if !enabled {
+            print_bytes(putc, b"      -         -     -");
+            continue;
+        }
+        let mut peer = Sink::new();
+        peer.stats = *sink;
+        print_padded(putc, peer.average_kbit() as u32, 6);
+        let lost = missing_hundredths(sent, sink.received);
+        print_padded(putc, lost / 100, 7);
+        putc(u32::from(b'.'));
+        print_u32(putc, (lost % 100) / 10);
+        print_bytes(putc, b"%");
+        print_padded(putc, queueing_us(sink) / 1000, 5);
+        print_bytes(putc, b"ms");
+        rate_ok[index] = lost <= 100;
+    }
+    putc(u32::from(b'\n'));
+    if rate_ok[0] {
+        sweep.best_up = params.rate_kbit;
+    }
+    if rate_ok[1] {
+        sweep.best_down = params.rate_kbit;
+    }
+    let next = params.rate_kbit.saturating_add(sweep.step);
+    if next <= sweep.to {
+        sweep.next_rate = next;
+        sweep.resume_at_us = micros() + sweep.settle_us;
+        session.rate_sweep = Some(sweep);
+        return;
+    }
+    session.rate_sweep = None;
+    print_bytes(putc, b"sweep done: highest rate with at most 1% loss: ");
+    for (label, best, enabled) in [(&b"up "[..], sweep.best_up, params.up), (&b"down "[..], sweep.best_down, params.down)] {
+        if enabled {
+            print_bytes(putc, label);
+            if best == 0 {
+                print_bytes(putc, b"none");
+            } else {
+                print_u32(putc, best);
+                print_bytes(putc, b" kbit/s");
+            }
+            print_bytes(putc, b"  ");
+        }
+    }
+    putc(u32::from(b'\n'));
+}
+
+/// One pass of the two-machine engine: read the NIC, run the master's timers, report events.
+fn remote_pass(putc: Putc, session: &mut Session<'_>, frame: &mut [u8], max_frame_len: usize, line: &[u8]) -> bool {
+    let Some(nic) = session.gen_nic else { return false };
+    let mut busy = false;
+    let mut out = [0u8; 512];
+    // The control NIC; a server also listens on every other NIC (a master may probe its test NIC),
+    // a master on its test NIC. Replies leave on the NIC the frame came in on.
+    let test_nic = test_nic_of(session);
+    let tx_nic = test_nic.unwrap_or(nic);
+    let is_server = session.remote.as_ref().is_some_and(|remote| remote.role == RemoteRole::Server);
+    let mut listen = [u32::MAX; 16];
+    let mut listening = 0;
+    listen[0] = nic;
+    listening += 1;
+    if is_server {
+        for other in (0..session.nic_total as u32).filter(|&other| other != nic).take(15) {
+            listen[listening] = other;
+            listening += 1;
+        }
+    } else if let Some(other) = test_nic.filter(|&other| other != nic) {
+        listen[listening] = other;
+        listening += 1;
+    }
+    for &rx in &listen[..listening] {
+        for _ in 0..64 {
+            let received = nic_receive_at(rx, frame.as_mut_ptr() as usize, max_frame_len as u32) as usize;
+            if received < ETHERNET_HEADER_LEN {
+                break;
+            }
+            busy = true;
+            if frame[12..14] == CTRL_ETHERTYPE {
+                let Session { remote, generator, sink, .. } = &mut *session;
+                let Some(remote) = remote.as_mut() else { break };
+                if let Some(length) = remote.handle(&frame[..received], micros(), generator, sink, &mut out) {
+                    let mut mac = [0u8; 6];
+                    if rx != nic && (session.mac_at)(rx, mac.as_mut_ptr() as usize) != 0 {
+                        out[6..12].copy_from_slice(&mac);
+                    }
+                    let _ = nic_send_at(rx, out.as_ptr() as usize, length as u32);
+                }
+            } else if rx == tx_nic {
+                let _ = session.sink.on_frame(&frame[..received], micros());
+            }
+        }
+    }
+    let now = micros();
+    if let Some(remote) = session.remote.as_mut() {
+        if let Some(length) = remote.poll(now, &mut out) {
+            let on_test_path = remote.out_on_test_path;
+            let (send_nic, mac) = if on_test_path { tx_path(session, nic) } else { (nic, session.gen_mac) };
+            if on_test_path {
+                out[6..12].copy_from_slice(&mac);
+            }
+            let _ = nic_send_at(send_nic, out.as_ptr() as usize, length as u32);
+            busy = true;
+        }
+    }
+    // Look for servers at start, then every 10 s until one is picked.
+    if session.probe_at_us != 0 && now >= session.probe_at_us {
+        let idle = session.remote.as_ref().is_some_and(|remote| remote.peer.is_none() && !remote.busy());
+        session.probe_at_us = if idle { now + 10_000_000 } else { 0 };
+        if idle {
+            probe_servers(session);
+        }
+    }
+    if let Some(sweep) = session.rate_sweep.filter(|sweep| sweep.resume_at_us != 0 && micros() >= sweep.resume_at_us) {
+        if let Some(sweep) = session.rate_sweep.as_mut() {
+            sweep.resume_at_us = 0;
+        }
+        if let Some(mut params) = session.remote.as_ref().map(|remote| remote.test) {
+            params.rate_kbit = sweep.next_rate;
+            putc(u32::from(b'\r'));
+            let _ = begin_test(putc, session, params);
+            print_bytes(putc, b"nettest> ");
+            print_bytes(putc, line);
+        }
+        busy = true;
+    }
+    while let Some(event) = session.remote.as_mut().and_then(|remote| remote.take_event()) {
+        putc(u32::from(b'\r'));
+        print_remote_event(putc, session, nic, event);
+        print_bytes(putc, b"nettest> ");
+        print_bytes(putc, line);
+        busy = true;
+    }
+    busy
+}
+
+fn print_remote_event(putc: Putc, session: &mut Session<'_>, nic: u32, event: RemoteEvent) {
+    match event {
+        RemoteEvent::Found(found) => {
+            print_bytes(putc, b"server: ");
+            print_peer_name(putc, found.mac, nic);
+            print_bytes(putc, b"  ");
+            print_mac(putc, &found.mac);
+            print_bytes(putc, b"  round trip ");
+            print_u32(putc, found.rtt_us);
+            print_bytes(putc, b" us\n");
+        }
+        RemoteEvent::DiscoveryDone(count) => {
+            if count == 0 {
+                print_bytes(putc, b"no server answered (start one with 'tape run nettest serve=N'); retrying\n");
+                return;
+            }
+            let selected = session.remote.as_ref().is_some_and(|remote| remote.peer.is_some());
+            if count == 1 && !selected {
+                let mac = session.remote.as_ref().map(|remote| remote.found[0].mac);
+                if let Some(mac) = mac {
+                    session.chosen = 0;
+                    start_sync(putc, session, mac);
+                }
+            } else if !selected {
+                print_u32(putc, u32::from(count));
+                print_bytes(putc, b" servers: pick with 'peer N' or press P to cycle\n");
+            }
+        }
+        RemoteEvent::Synced { rtt_us, offset_us, samples } => {
+            print_bytes(putc, b"peer ready: clock offset ");
+            print_offset(putc, offset_us);
+            print_bytes(putc, b", round trip ");
+            print_u32(putc, rtt_us);
+            print_bytes(putc, b" us (");
+            print_u32(putc, u32::from(samples));
+            print_bytes(putc, b" samples; one-way latency is good to about +/-");
+            print_u32(putc, rtt_us / 2);
+            print_bytes(putc, b" us). Type: test\n");
+            if let Some(remote) = session.remote.as_ref().filter(|remote| remote.peer_nic_count > 1) {
+                print_bytes(putc, b"peer NICs (test via=N uses one, here=N one of ours):\n");
+                for number in 0..remote.peer_nic_count {
+                    print_bytes(putc, b"  ");
+                    print_u32(putc, number as u32 + 1);
+                    print_bytes(putc, b"  ");
+                    print_mac(putc, &remote.peer_nics[number]);
+                    putc(u32::from(b'\n'));
+                }
+            }
+        }
+        RemoteEvent::Started if session.rate_sweep.is_some() => {}
+        RemoteEvent::Started => print_bytes(putc, b"test running...\n"),
+        RemoteEvent::Finished if session.rate_sweep.is_some() => sweep_step_done(putc, session),
+        RemoteEvent::Finished => print_remote_report(putc, session, nic),
+        RemoteEvent::Failed(reason) => {
+            session.rate_sweep = None;
+            print_bytes(putc, reason.as_bytes());
+            putc(u32::from(b'\n'));
+        }
+        RemoteEvent::Serving { up, down } => {
+            print_bytes(putc, b"master started a test: ");
+            print_bytes(putc, if up && down { b"both ways" } else if up { b"up" } else { b"down" });
+            putc(u32::from(b'\n'));
+        }
+    }
+}
+
+fn print_remote_report(putc: Putc, session: &Session<'_>, nic: u32) {
+    let Some(remote) = session.remote.as_ref() else { return };
+    let (Some(report), Some(peer)) = (remote.report, remote.peer) else { return };
+    print_bytes(putc, b"== remote test with ");
+    print_peer_name(putc, peer, nic);
+    print_bytes(putc, b" (clock offset ");
+    print_offset(putc, remote.offset_us);
+    print_bytes(putc, b", round trip ");
+    print_u32(putc, remote.rtt_us);
+    print_bytes(putc, b" us) ==\n");
+    if remote.test.via != 0 || remote.test.here != 0 {
+        print_bytes(putc, b"test path: our NIC ");
+        print_u32(putc, if remote.test.here != 0 { u32::from(remote.test.here) } else { nic + 1 });
+        print_bytes(putc, b" <-> peer NIC ");
+        if remote.test.via != 0 {
+            print_u32(putc, u32::from(remote.test.via));
+        } else {
+            print_bytes(putc, b"(control)");
+        }
+        putc(u32::from(b'\n'));
+    }
+    let mut peer_sink = Sink::new();
+    peer_sink.stats = report.sink;
+    if remote.test.up {
+        print_bytes(putc, b"up   (here -> peer): sent ");
+        print_u32(putc, session.generator.stats.sent);
+        summarize_sink(putc, &peer_sink, b"got ");
+        print_latency_percentiles(putc, &peer_sink.stats);
+        print_delay_detail(putc, &peer_sink.stats);
+        print_timeline(putc, &peer_sink.stats, remote.test);
+        print_missing(putc, session.generator.stats.sent, report.sink.received);
+    }
+    if remote.test.down {
+        print_bytes(putc, b"down (peer -> here): sent ");
+        print_u32(putc, report.gen_sent);
+        summarize_sink(putc, &session.sink, b"got ");
+        print_latency_percentiles(putc, &session.sink.stats);
+        print_delay_detail(putc, &session.sink.stats);
+        print_timeline(putc, &session.sink.stats, remote.test);
+        print_missing(putc, report.gen_sent, session.sink.stats.received);
+    }
+    print_bytes(putc, b"(one-way latency depends on the clock offset above; loss, rate and jitter do not)\n");
+}
+
+/// Exact minimum and queueing delay (mean minus minimum), and reordered or duplicated frames when there are any.
+fn print_delay_detail(putc: Putc, stats: &nettest_tape::SinkStats) {
+    print_bytes(putc, b"  delay us: min ");
+    print_u32(putc, stats.latency_min);
+    print_bytes(putc, b", queueing avg ");
+    print_u32(putc, queueing_us(stats));
+    if stats.reordered > 0 || stats.duplicated > 0 {
+        print_bytes(putc, b", reordered ");
+        print_u32(putc, stats.reordered);
+        print_bytes(putc, b", duplicated ");
+        print_u32(putc, stats.duplicated);
+    }
+    putc(u32::from(b'\n'));
+}
+
+/// Frames received in each second of a test as a percentage of the rate asked for: a dip shows when it went wrong.
+fn print_timeline(putc: Putc, stats: &nettest_tape::SinkStats, params: TestParams) {
+    let bins = usize::from(params.seconds).min(nettest_tape::TIMELINE_BINS);
+    let nominal = (u64::from(params.rate_kbit) * 125 / u64::from(params.size).max(1)).max(1);
+    if bins < 2 || stats.received == 0 {
+        return;
+    }
+    print_bytes(putc, b"  % of rate per second:");
+    for (index, &count) in stats.timeline[..bins].iter().enumerate() {
+        if index % 14 == 0 && index != 0 {
+            print_bytes(putc, b"\n                       ");
+        }
+        print_padded(putc, ((u64::from(count) * 100) / nominal).min(999) as u32, 4);
+    }
+    putc(u32::from(b'\n'));
+}
+
+/// Frames sent but never counted, which the sink's sequence-gap loss cannot see at the tail of a test.
+fn print_missing(putc: Putc, sent: u32, received: u32) {
+    if sent > received {
+        print_bytes(putc, b"  not delivered: ");
+        print_u32(putc, sent - received);
+        print_bytes(putc, b" of ");
+        print_u32(putc, sent);
+        putc(u32::from(b'\n'));
+    }
+}
+
+/// `nics`: every NIC with its MAC and what nettest does with it.
+fn print_nics(putc: Putc, session: &Session<'_>) {
+    for nic in 0..session.nic_total as u32 {
+        let mut mac = [0u8; 6];
+        print_bytes(putc, b"  NIC ");
+        print_u32(putc, nic + 1);
+        print_bytes(putc, b"  ");
+        if (session.mac_at)(nic, mac.as_mut_ptr() as usize) != 0 {
+            print_mac(putc, &mac);
+        } else {
+            print_bytes(putc, b"(no MAC)         ");
+        }
+        print_bytes(putc, b"  ");
+        let role: &[u8] = if session.limiter && session.ports.contains(&nic) {
+            b"impaired link"
+        } else if session.gen_nic == Some(nic) {
+            match session.remote.as_ref().map(|remote| remote.role) {
+                Some(RemoteRole::Server) => b"serve (far end)",
+                Some(RemoteRole::Master) => b"remote (master)",
+                None => b"generator",
+            }
+        } else if session.sink_nic == Some(nic) {
+            b"sink"
+        } else {
+            b"free"
+        };
+        print_bytes(putc, role);
+        putc(u32::from(b'\n'));
+    }
+}
+
+/// `serve N|off` / `remote N|off`: start or stop the two-machine mode at the prompt, as
+/// `serve=N` / `remote=N` do at launch. The NIC must be free: it carries only this.
+fn remote_mode(putc: Putc, session: &mut Session<'_>, role: RemoteRole, arg: &[u8]) -> Outcome {
+    if arg == b"off" {
+        if session.remote.as_ref().is_none_or(|remote| remote.role != role) {
+            print_bytes(putc, b"that mode is not running\n");
+            return Outcome::Error;
+        }
+        session.remote = None;
+        session.remote_role = None;
+        session.gen_nic = None;
+        session.rgen.stop();
+        session.rsink.reset();
+        print_bytes(putc, b"two-machine mode off; the NIC is free\n");
+        return Outcome::Continue;
+    }
+    let Some(number) = parse_u32(arg).filter(|&number| number >= 1 && number as usize <= session.nic_total) else {
+        print_bytes(putc, b"use: serve N | remote N (a NIC number from 'nics'), or ... off\n");
+        return Outcome::Error;
+    };
+    drop_remote(putc, session);
+    let nic = number - 1;
+    if session.sink_nic.is_some() || session.gen_nic.is_some() || nic_in_use(session, nic, None) {
+        print_bytes(putc, b"that NIC has a role; free it first ('link off', 'gen nic off', 'sink nic off')\n");
+        return Outcome::Error;
+    }
+    let mut mac = [0u8; 6];
+    if (session.mac_at)(nic, mac.as_mut_ptr() as usize) == 0 {
+        print_bytes(putc, b"failed to read that NIC's MAC\n");
+        return Outcome::Error;
+    }
+    session.generator.stop();
+    session.gen_nic = Some(nic);
+    session.gen_mac = mac;
+    session.remote_role = Some(role);
+    let id = (micros() as u16) ^ u16::from_le_bytes([mac[4], mac[5]]);
+    let mut remote = Remote::new(role, mac, id);
+    set_remote_nics(&mut remote, session.nic_total, session.mac_at);
+    session.remote = Some(remote);
+    if role == RemoteRole::Server {
+        print_bytes(putc, b"serving: waiting for a master (it types 'remote N')\n");
+    } else {
+        session.probe_at_us = micros() + 1_000_000;
+        print_bytes(putc, b"master: looking for servers; 'peer' lists them, P picks, 'test' runs\n");
+    }
+    Outcome::Continue
+}
+
+/// Stops serve/remote and frees its NIC: a role typed at the prompt wins over the default far end.
+fn drop_remote(putc: Putc, session: &mut Session<'_>) {
+    if session.remote.is_none() {
+        return;
+    }
+    session.remote = None;
+    session.remote_role = None;
+    session.gen_nic = None;
+    session.rgen.stop();
+    session.rsink.reset();
+    print_bytes(putc, b"(two-machine mode stopped)\n");
+}
+
+/// Tells the engine every NIC's MAC: the HELLO reply lists them, so a master can pick the server's test NIC.
+fn set_remote_nics(remote: &mut Remote, total: usize, mac_at: fn(u32, usize) -> u32) {
+    let mut macs = [[0u8; 6]; 6];
+    let mut count = 0;
+    for nic in 0..total.min(macs.len()) {
+        if mac_at(nic as u32, macs[nic].as_mut_ptr() as usize) != 0 {
+            count = nic + 1;
+        }
+    }
+    remote.set_nics(&macs[..count]);
+}
+
+/// The NIC the test streams use when it is not the control NIC: the master's `here=N`, or the NIC the
+/// server's master chose with `via=N`.
+fn test_nic_of(session: &Session<'_>) -> Option<u32> {
+    let remote = session.remote.as_ref()?;
+    match remote.role {
+        RemoteRole::Master => remote.test.here.checked_sub(1).map(u32::from),
+        RemoteRole::Server => remote.test_nic.map(u32::from),
+    }
+}
+
+/// Where the generator's frames go out: the NIC and the source MAC on it.
+fn tx_path(session: &Session<'_>, control: u32) -> (u32, [u8; 6]) {
+    match test_nic_of(session) {
+        Some(nic) if nic != control => {
+            let mut mac = [0u8; 6];
+            if (session.mac_at)(nic, mac.as_mut_ptr() as usize) != 0 {
+                return (nic, mac);
+            }
+            (control, session.gen_mac)
+        }
+        _ => (control, session.gen_mac),
+    }
+}
