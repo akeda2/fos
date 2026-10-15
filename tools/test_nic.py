@@ -121,6 +121,25 @@ def main():
             mark = a.send("nic mcast 1 join 02:00:00:00:00:01")
             a.wait_for("no hash filter", 10, mark)
             check(True, "a unicast address is refused")
+
+            # The VLAN filter: with id 5 registered, a tag 5 frame arrives, a tag 6 frame does not, untagged still does.
+            def vlan_burst(vid):
+                tag = b"" if vid is None else b"\x81\x00" + vid.to_bytes(2, "big")
+                frame = bytes.fromhex("ffffffffffff525400aabbcc") + tag + b"\x88\xb5" + bytes(60)
+                before = received(a)
+                for _ in range(40):
+                    inject(frame)
+                    time.sleep(0.005)
+                a.pump(1.0)
+                return received(a) - before
+
+            mark = a.send("nic vlan 1 add 5")
+            a.wait_for("VLAN 5 add done", 10, mark)
+            ok, other, plain = vlan_burst(5), vlan_burst(6), vlan_burst(None)
+            check(ok >= 40 and other < 10 and plain >= 40, f"VLAN filter: registered id {ok}, other id {other}, untagged {plain} of 40")
+            mark = a.send("nic vlan 1 clear")
+            a.wait_for("VLAN filter off", 10, mark)
+            check(vlan_burst(6) >= 40, "and every tag arrives again once it is cleared")
         finally:
             for guest in (a, b, c):
                 guest.stop()

@@ -1092,6 +1092,19 @@ pub fn nic_multicast_clear_all() {
     }
 }
 
+pub fn nic_vlan_filter(index: usize, vid: u16, on: bool) -> bool {
+    nic_at(index).is_some_and(|nic| nic.vlan_filter(vid, on))
+}
+
+/// Drops every VLAN id (filter off) on every NIC (a tape ended).
+pub fn nic_vlan_clear_all() {
+    let mut index = 0;
+    while let Some(nic) = nic_at(index) {
+        nic.vlan_clear();
+        index += 1;
+    }
+}
+
 pub fn nic_set_multicast(index: usize, on: bool) -> bool {
     match nic_at(index) {
         Some(nic) => {
@@ -1412,6 +1425,10 @@ fn execute(command: &str) {
         "nic" if matches!(words.clone().next(), Some("ts")) => {
             words.next();
             nic_timestamp_test(words.next(), words.next(), words.next());
+        }
+        "nic" if matches!(words.clone().next(), Some("vlan")) => {
+            words.next();
+            nic_vlan_test(words.next(), words.next(), words.next());
         }
         "nic" if matches!(words.clone().next(), Some("mcast")) => {
             words.next();
@@ -3159,6 +3176,31 @@ fn nic_send_test() {
 }
 
 /// `nic recv`: waits up to three seconds for a frame that is not the terminal's, then dumps it.
+/// `nic vlan N add|del VID | clear`: registers or drops VLAN ids in the card's VLAN filter by hand (the call tapes make,
+/// `nic_vlan_filter`). With one id the card drops tagged frames of other ids; untagged frames always arrive.
+fn nic_vlan_test(index: Option<&str>, action: Option<&str>, vid: Option<&str>) {
+    let usage = "nic vlan N add|del VID | clear: the card's VLAN filter (E1000 family); VID 0-4095.";
+    let Some(index) = index.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
+        return crate::println!("{usage}");
+    };
+    match (action, vid.and_then(|word| word.parse::<u16>().ok())) {
+        (Some("clear"), _) => {
+            if let Some(nic) = nic_at(index - 1) {
+                nic.vlan_clear();
+            }
+            crate::println!("nic {index}: VLAN filter off, no ids registered.");
+        }
+        (Some(action @ ("add" | "del")), Some(vid)) => {
+            if nic_vlan_filter(index - 1, vid, action == "add") {
+                crate::println!("nic {index}: VLAN {vid} {action} done (hardware filter).");
+            } else {
+                crate::println!("nic {index}: no VLAN filter for id {vid} (invalid id, or this card has none).");
+            }
+        }
+        _ => crate::println!("{usage}"),
+    }
+}
+
 /// `nic mcast N join|leave MAC | clear`: joins or leaves one multicast group in the card's hash filter by hand, the
 /// call tapes make (`nic_multicast_join`), so a test can see that only the joined groups arrive.
 fn nic_multicast_test(index: Option<&str>, action: Option<&str>, address: Option<&str>) {

@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`.
-pub const TAPE_API_VERSION: u32 = 12;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`.
+pub const TAPE_API_VERSION: u32 = 13;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -233,6 +233,11 @@ pub struct TapeApi {
     /// multicast frame". 1 if done, 0 on a card without the filter (then use `nic_set_multicast`). Groups share filter bits,
     /// so a tape still checks the address. The kernel drops every group when a tape ends.
     pub nic_multicast_join: extern "C" fn(usize, *const u8, u32) -> u32,
+    /// `nic_vlan_filter(index, vid, on)` (version 13): registers (on) or drops VLAN id `vid` (0-4095) in the card's VLAN
+    /// filter. With the first id the card starts dropping tagged frames of other ids (untagged frames always pass), so a
+    /// tape that never calls it sees every tag as before. The filter stays off while the card is promiscuous. 1 if done,
+    /// 0 on a card without it or an invalid id. The kernel clears all ids (filter off) when a tape ends.
+    pub nic_vlan_filter: extern "C" fn(usize, u32, u32) -> u32,
 }
 
 /// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.

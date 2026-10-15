@@ -212,6 +212,10 @@ const REG_TDH: usize = 0x3810;
 #[allow(dead_code)]
 const REG_TDT: usize = 0x3818;
 /// Multicast table array: 128 registers = 4096 bits, indexed by 12 bits of the destination address (RCTL.MO = 0).
+/// VLAN filter table array: 128 registers, one bit per 12-bit VLAN id (the same address on the I350, 82574 and PCH parts).
+const REG_VFTA: usize = 0x5600;
+/// RCTL.VFE: drop tagged frames whose VLAN id is not set in the VFTA. Untagged frames are not affected.
+const RCTL_VFE: u32 = 1 << 18;
 const REG_MTA: usize = 0x5200;
 const MTA_REGISTERS: usize = 128;
 const REG_RAL0: usize = 0x5400;
@@ -374,6 +378,9 @@ pub struct E1000 {
     ts_offset: u64,
     /// Groups joined per multicast-table bit (`multicast_join`): two groups can share a bit, so each is counted.
     mc_users: [u8; 4096],
+    /// Shadow of the VLAN filter table (VFTA): one bit per VLAN id the card lets through when RCTL.VFE is on.
+    vlan_ids: [u32; 128],
+    promiscuous: bool,
 }
 
 #[derive(Debug)]
@@ -602,7 +609,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096] })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false })
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -611,6 +618,43 @@ impl E1000 {
         let control = read(self.registers, REG_RCTL);
         let bits = (1 << 3) | (1 << 4);
         write(self.registers, REG_RCTL, if on { control | bits } else { control & !bits });
+        self.promiscuous = on;
+        self.vlan_apply();
+    }
+
+    /// Lets frames tagged with VLAN id `vid` through the card's VLAN filter (`on`) or stops them. The filter (RCTL.VFE)
+    /// turns on with the first id and off with the last, so a tape that never asks sees every tag as before; it also
+    /// stays off while the card is promiscuous (Linux does the same: a bridge wants every tag). Untagged frames always
+    /// pass. False for an id above 4095.
+    pub fn vlan_filter(&mut self, vid: u16, on: bool) -> bool {
+        if vid > 4095 {
+            return false;
+        }
+        let (register, bit) = (usize::from(vid >> 5), 1u32 << (vid & 31));
+        self.vlan_ids[register] = if on { self.vlan_ids[register] | bit } else { self.vlan_ids[register] & !bit };
+        write(self.registers, REG_VFTA + register * 4, self.vlan_ids[register]);
+        self.vlan_apply();
+        true
+    }
+
+    /// Forgets every VLAN id and turns the filter off (a tape ended).
+    pub fn vlan_clear(&mut self) {
+        self.vlan_ids = [0; 128];
+        for index in 0..128 {
+            write(self.registers, REG_VFTA + index * 4, 0);
+        }
+        self.vlan_apply();
+    }
+
+    /// Whether the VLAN filter is on: ids are registered and the card is not promiscuous.
+    pub fn vlan_active(&self) -> bool {
+        read(self.registers, REG_RCTL) & RCTL_VFE != 0
+    }
+
+    fn vlan_apply(&mut self) {
+        let wanted = !self.promiscuous && self.vlan_ids.iter().any(|word| *word != 0);
+        let control = read(self.registers, REG_RCTL);
+        write(self.registers, REG_RCTL, if wanted { control | RCTL_VFE } else { control & !RCTL_VFE });
     }
 
     /// Multicast promiscuous (RCTL.MPE, bit 4): receive every multicast frame. The multicast table array is left

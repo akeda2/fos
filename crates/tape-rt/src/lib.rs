@@ -540,6 +540,14 @@ fn has_steering() -> bool {
     table.version >= 10 && (table.size as usize) >= end
 }
 
+/// Registers (`on`) or drops one VLAN id in the card's VLAN filter; the filter turns on with the first id. True if the
+/// card did it; false on a card without one or a kernel older than version 13 (every tag then still arrives).
+pub fn vlan_filter(nic: usize, vid: u16, on: bool) -> bool {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, nic_vlan_filter) + core::mem::size_of::<usize>();
+    table.version >= 13 && (table.size as usize) >= end && (table.nic_vlan_filter)(nic, u32::from(vid), u32::from(on)) != 0
+}
+
 /// Joins (`on`) or leaves one multicast group in the card's hash filter. True if the card did it; false means it has no
 /// such filter (or the kernel is older than version 12) and the caller opens all multicast with `nic_set_multicast`.
 pub fn multicast_group(nic: usize, mac: [u8; 6], on: bool) -> bool {

@@ -124,6 +124,20 @@ impl Nic {
         }
     }
 
+    /// Registers or drops one VLAN id in the hardware VLAN filter (`TapeApi::nic_vlan_filter`); false on a card without one.
+    pub fn vlan_filter(&mut self, vid: u16, on: bool) -> bool {
+        match self {
+            Nic::E1000(nic) => nic.vlan_filter(vid, on),
+            _ => false,
+        }
+    }
+
+    pub fn vlan_clear(&mut self) {
+        if let Nic::E1000(nic) = self {
+            nic.vlan_clear();
+        }
+    }
+
     /// Accept all multicast frames (see `TapeApi::nic_set_multicast`).
     pub fn set_multicast(&mut self, on: bool) {
         match self {

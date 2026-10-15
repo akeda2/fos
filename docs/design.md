@@ -913,6 +913,12 @@ a bit, so tapes still compare addresses. `ptp` (L2), audio-net's PTP listener an
 kernel clears all groups when a tape ends. `nic mcast N join|leave MAC | clear` does it by hand; `make test-nic` injects
 frames to a joined and an unjoined group. Only real hardware can confirm the I350/82579/I219 tables behave like QEMU's.
 
+**VLAN filter (ABI 13).** `nic_vlan_filter(nic, vid, on)` sets one bit of the E1000 family's VFTA (0x5600, 4096 bits). The
+filter (`RCTL.VFE`) is on only while at least one id is registered and the card is not promiscuous, so existing tapes
+(bridge, nettest) still see every tag; untagged frames always pass. The kernel clears the table and the filter when a
+tape ends. No tape uses it yet; `nic vlan N add|del VID | clear` drives it by hand and `make test-nic` checks registered,
+other and untagged frames. Only real hardware can confirm the I350/82579/I219 drop other tags like QEMU's e1000.
+
 **Per-packet receive stamps (ABI 11).** `nic_ts_all(nic, on)` makes the I350 stamp every received frame: the receive ring
 then uses advanced descriptors (SRRCTL DESCTYPE 1, bit 30 asks for the stamp, TSYNCRXCTL type ALL), and a stamped frame
 carries a 16-byte header (SYSTIML at byte 8, SYSTIMH at 12) that `receive()` strips and files as `nic_ts_rx`. The card
