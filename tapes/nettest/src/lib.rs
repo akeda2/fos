@@ -481,6 +481,7 @@ fn build_udp_frame(
     source_mac: [u8; 6],
     sequence: u32,
     sent_us: u64,
+    offload: bool,
 ) -> usize {
     out[0..6].copy_from_slice(&destination_mac);
     out[6..12].copy_from_slice(&source_mac);
@@ -509,6 +510,9 @@ fn build_udp_frame(
     out[52..60].copy_from_slice(&sent_us.to_le_bytes());
     for (offset, byte) in out[UDP_TEST_END..size].iter_mut().enumerate() {
         *byte = (offset as u8).wrapping_add(sequence as u8);
+    }
+    if offload {
+        return size;
     }
     // UDP checksum over the pseudo-header (source, destination, protocol, length)
     // and the whole datagram; 0 would mean "none", so a computed 0 becomes 0xffff.
@@ -607,6 +611,8 @@ pub struct Generator {
     /// then holds the next hop's MAC once `resolved`.
     pub udp: Option<UdpPlan>,
     pub resolved: bool,
+    /// Leave the UDP checksum 0 for the card to fill in; the main loop sets it for a pass when `tape_rt::tx_offload` is on.
+    pub offload: bool,
     sequence: u32,
     /// When the next frame is due, in nanoseconds (finer than a microsecond so
     /// the rounding of a 12 us gigabit interval does not drift).
@@ -625,6 +631,7 @@ impl Generator {
             seconds_limit: 0,
             stats: GenStats { sent: 0, send_failed: 0, bytes: 0, lagged: 0 },
             udp: None,
+            offload: false,
             resolved: true,
             sequence: 0,
             next_due_ns: 0,
@@ -690,7 +697,7 @@ impl Generator {
         }
         let size = self.size.clamp(GEN_MIN_SIZE.max(GEN_HEADER_LEN), MAX_FRAME).min(out.len());
         if let Some(plan) = self.udp {
-            build_udp_frame(out, size, &plan, self.destination, source, self.sequence, now_us);
+            build_udp_frame(out, size, &plan, self.destination, source, self.sequence, now_us, self.offload);
             self.sequence = self.sequence.wrapping_add(1);
             self.next_due_ns += self.interval_ns();
             return Some(size);
@@ -1368,6 +1375,22 @@ mod tests {
             source_port: 9001,
             destination_port: 9000,
         }
+    }
+
+    #[test]
+    fn offloaded_udp_frames_leave_the_checksum_to_the_card() {
+        let mut generator = Generator::new();
+        generator.rate_kbit = 1_000_000;
+        generator.size = 300;
+        generator.offload = true;
+        generator.set_udp(udp_plan());
+        generator.start(100);
+        generator.resolve([0xaa; 6], 1_000);
+        let mut frame = [0u8; 1514];
+        let length = generator.next_frame(1_000, [2; 6], &mut frame, 0).unwrap();
+        assert_eq!(length, 300);
+        assert_eq!(frame[40..42], [0, 0]);
+        assert_eq!(internet_checksum(&frame[14..34], 0), 0, "the IP header checksum is still ours");
     }
 
     #[test]

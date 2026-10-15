@@ -1105,6 +1105,19 @@ pub fn nic_vlan_clear_all() {
     }
 }
 
+pub fn nic_tx_offload(index: usize, on: bool) -> bool {
+    nic_at(index).is_some_and(|nic| nic.set_tx_offload(on))
+}
+
+/// Turns transmit checksum offload off on every NIC (a tape ended; ordinary frames carry their own checksums).
+pub fn nic_tx_offload_off_all() {
+    let mut index = 0;
+    while let Some(nic) = nic_at(index) {
+        nic.set_tx_offload(false);
+        index += 1;
+    }
+}
+
 pub fn nic_set_multicast(index: usize, on: bool) -> bool {
     match nic_at(index) {
         Some(nic) => {
@@ -1425,6 +1438,10 @@ fn execute(command: &str) {
         "nic" if matches!(words.clone().next(), Some("ts")) => {
             words.next();
             nic_timestamp_test(words.next(), words.next(), words.next());
+        }
+        "nic" if matches!(words.clone().next(), Some("csum")) => {
+            words.next();
+            nic_checksum_test(words.next());
         }
         "nic" if matches!(words.clone().next(), Some("vlan")) => {
             words.next();
@@ -3175,7 +3192,52 @@ fn nic_send_test() {
     }
 }
 
-/// `nic recv`: waits up to three seconds for a frame that is not the terminal's, then dumps it.
+/// `nic csum N`: turns transmit checksum offload on for interface N and broadcasts three IPv4 UDP frames (payloads of 5,
+/// 26 and 27 bytes: a padded short frame, even and odd lengths) whose UDP checksum field is 0, so the card must fill it
+/// in. A host on the same segment can check the sums (`tools/test_tx_offload.py`). Offload goes off again afterwards.
+fn nic_checksum_test(number: Option<&str>) {
+    let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
+        return crate::println!("nic csum N: sends UDP frames with checksum 0 through the card's checksum offload (I350).");
+    };
+    let mut mac = [0u8; 6];
+    if !nic_mac(index - 1, &mut mac) {
+        return;
+    }
+    if !nic_tx_offload(index - 1, true) {
+        return crate::println!("nic {index}: no transmit checksum offload on this interface (I350 only).");
+    }
+    for length in [5usize, 26, 27] {
+        let mut frame = [0u8; 14 + 20 + 8 + 27];
+        let size = 14 + 20 + 8 + length;
+        frame[0..6].copy_from_slice(&[0xff; 6]);
+        frame[6..12].copy_from_slice(&mac);
+        frame[12..14].copy_from_slice(&[0x08, 0x00]);
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&((20 + 8 + length) as u16).to_be_bytes());
+        frame[22] = 64;
+        frame[23] = 17;
+        frame[26..30].copy_from_slice(&[10, 99, 0, 1]);
+        frame[30..34].copy_from_slice(&[10, 99, 0, 2]);
+        let mut sum = 0u32;
+        for pair in frame[14..34].chunks(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        frame[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        frame[34..36].copy_from_slice(&40000u16.to_be_bytes());
+        frame[36..38].copy_from_slice(&40001u16.to_be_bytes());
+        frame[38..40].copy_from_slice(&((8 + length) as u16).to_be_bytes());
+        for (at, byte) in frame[42..size].iter_mut().enumerate() {
+            *byte = b'a' + at as u8;
+        }
+        let sent = nic_send(index - 1, &frame[..size]);
+        crate::println!("nic {index}: UDP frame with {length} payload bytes, checksum 0 to the card: {}.", if sent { "sent" } else { "FAILED" });
+    }
+    nic_tx_offload(index - 1, false);
+}
+
 /// `nic vlan N add|del VID | clear`: registers or drops VLAN ids in the card's VLAN filter by hand (the call tapes make,
 /// `nic_vlan_filter`). With one id the card drops tagged frames of other ids; untagged frames always arrive.
 fn nic_vlan_test(index: Option<&str>, action: Option<&str>, vid: Option<&str>) {
@@ -3372,6 +3434,7 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
     }
 }
 
+/// `nic recv`: waits up to three seconds for a frame that is not the terminal's, then dumps it.
 fn nic_recv_test() {
     // Blocking mode keeps typed commands that arrive meanwhile from running nested inside this wait
     // (each nesting adds big stack frames); Escape ends the wait instead.

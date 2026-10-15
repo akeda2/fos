@@ -546,11 +546,17 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         if let Some(nic) = session.gen_nic {
             let mut sent = 0;
             let (tx_nic, tx_mac) = if session.generator.running { tx_path(&session, nic) } else { (nic, session.gen_mac) };
+            // Offload only around the generator's own frames: a relayed frame with checksum 0 must stay as it is.
+            let offload = session.generator.running && session.generator.udp.is_some() && tape_rt::tx_offload(tx_nic as usize, true);
+            session.generator.offload = offload;
             while let Some(length) = session.generator.next_frame(now_us, tx_mac, &mut frame, sent) {
                 let ok = nic_send_at(tx_nic, frame.as_ptr() as usize, length as u32) != 0;
                 session.generator.record_send(length, ok);
                 sent += 1;
                 busy = true;
+            }
+            if offload {
+                tape_rt::tx_offload(tx_nic as usize, false);
             }
             let Session { sweep, generator, sink, .. } = &mut session;
             if let Some(result) = sweep.poll(now_us, generator, sink) {

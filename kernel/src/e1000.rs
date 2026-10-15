@@ -184,6 +184,13 @@ const FTQF_UDP_STAMP: u32 = 17 | (1 << 15) | (1 << 27) | 0xe000_0000;
 /// Advanced transmit data descriptor: type data (DTYP 3), end of packet, insert FCS, report status,
 /// descriptor extension, and MAC_TSTAMP to have the card timestamp this frame.
 const ADV_TX_DATA_TS: u32 = 0x0030_0000 | (1 << 24) | (1 << 25) | (1 << 27) | (1 << 29) | 0x0008_0000;
+/// Advanced transmit data descriptor without a timestamp: data type, descriptor extension, end of packet, insert FCS,
+/// report status (the card then writes DD back).
+const ADV_TX_DATA: u32 = 0x0030_0000 | (1 << 24) | (1 << 25) | (1 << 27) | (1 << 29);
+/// Advanced transmit context descriptor type (DTYP 2) with the descriptor extension bit.
+const ADV_CTXT: u32 = 0x0020_0000 | (1 << 29);
+/// POPTS.TXSM (insert the TCP/UDP checksum) in the data descriptor's olinfo/status dword, bits 15:8.
+const ADV_TXSM: u32 = 0x02 << 8;
 /// Whether `frame` is a PTP event message (Sync, Delay_Req, ...: messageType below 8) over Ethernet (0x88f7)
 /// or UDP port 319, i.e. what the card stamps.
 fn is_ptp_event(frame: &[u8]) -> bool {
@@ -381,6 +388,10 @@ pub struct E1000 {
     /// Shadow of the VLAN filter table (VFTA): one bit per VLAN id the card lets through when RCTL.VFE is on.
     vlan_ids: [u32; 128],
     promiscuous: bool,
+    /// Transmit checksum offload on (I350): `send` hands IPv4 UDP/TCP frames to the card to checksum.
+    tx_offload: bool,
+    /// Ring slots that hold an advanced context descriptor (not a buffer address) until the slot is reused.
+    tx_ctx: [bool; TX_COUNT],
 }
 
 #[derive(Debug)]
@@ -609,7 +620,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -833,15 +844,10 @@ impl E1000 {
         let _ = read(self.registers, REG_TXSTMPH);
         if self.ts_clock.is_some() {
             // A data descriptor (DEXT, DTYP_D) with the timestamp bit in its upper dword, as Linux's e1000_tx_queue builds it.
-            let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
-            let mut waited = 0u32;
-            while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
-                waited += 1;
-                if waited > 2_000_000 {
-                    return (false, 0);
-                }
-                core::hint::spin_loop();
+            if !self.claim_tx_slot(self.tx_next) {
+                return (false, 0);
             }
+            let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
             let buffer = (self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
             let length = frame.len().max(60);
             unsafe {
@@ -863,15 +869,10 @@ impl E1000 {
             }
             return (true, 0);
         }
-        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
-        let mut waited = 0u32;
-        while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
-            waited += 1;
-            if waited > 2_000_000 {
-                return (false, 0);
-            }
-            core::hint::spin_loop();
+        if !self.claim_tx_slot(self.tx_next) {
+            return (false, 0);
         }
+        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
         let buffer = (self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
         let length = frame.len().max(60);
         unsafe {
@@ -1013,11 +1014,109 @@ impl E1000 {
         }
     }
 
+    /// Turns transmit checksum offload on or off. Only the I350 (advanced descriptors); false elsewhere.
+    pub fn set_tx_offload(&mut self, on: bool) -> bool {
+        if self.variant != Variant::I350 {
+            return false;
+        }
+        self.tx_offload = on;
+        true
+    }
+
+    /// Waits (bounded) until transmit slot `slot` is free and makes it an ordinary slot again. A slot that holds a
+    /// context descriptor has no status of its own that says "done" (its dwords are context fields), but the card works the
+    /// ring in order, so the data descriptor after it completing means the context was consumed too; its buffer address
+    /// was overwritten by the context and is put back here.
+    fn claim_tx_slot(&mut self, slot: usize) -> bool {
+        let watched = if self.tx_ctx[slot] { (slot + 1) % TX_COUNT } else { slot };
+        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(watched) };
+        let mut waited = 0u32;
+        while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
+            waited += 1;
+            if waited > 2_000_000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        if self.tx_ctx[slot] {
+            let own = unsafe { (self.tx_ring as *mut Descriptor).add(slot) };
+            let free = Descriptor { address: self.tx_buffers + (slot * BUFFER_SIZE) as u64, length: 0, word: 0, status: DESCRIPTOR_DONE, errors_or_css: 0, special: 0 };
+            unsafe { write_volatile(own, free) };
+            self.tx_ctx[slot] = false;
+        }
+        true
+    }
+
+    /// Queues an IPv4 UDP or TCP frame with the card computing the L4 checksum (a context descriptor, then an advanced
+    /// data descriptor with TXSM). The pseudo-header sum goes into the checksum field first, as the card wants it (not
+    /// complemented); it then sums the L4 header and payload to the end of the buffer, whose padding is zeros, and
+    /// complements. Only a UDP frame whose checksum field is 0 ("none") or a TCP frame is touched; anything else, a
+    /// fragment or an odd frame goes the ordinary way. Returns None for those.
+    fn send_offloaded(&mut self, frame: &[u8]) -> Option<bool> {
+        if frame.len() < 42 || frame[12..14] != [0x08, 0x00] || frame[14] >> 4 != 4 {
+            return None;
+        }
+        let ip_length = usize::from(frame[14] & 15) * 4;
+        let total = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+        let fragment = u16::from_be_bytes([frame[20], frame[21]]) & 0x3fff;
+        let l4 = 14 + ip_length;
+        if ip_length < 20 || fragment != 0 || total < ip_length || 14 + total > frame.len() {
+            return None;
+        }
+        let (checksum_at, tucmd) = match frame[23] {
+            17 if l4 + 8 <= 14 + total && frame[l4 + 6..l4 + 8] == [0, 0] => (l4 + 6, 0x0400u32),
+            6 if l4 + 20 <= 14 + total => (l4 + 16, 0x0400 | 0x0800),
+            _ => return None,
+        };
+        if !self.link_up() {
+            self.frames_dropped_no_link += 1;
+            return Some(true);
+        }
+        let (context, data) = (self.tx_next, (self.tx_next + 1) % TX_COUNT);
+        if !self.claim_tx_slot(context) || !self.claim_tx_slot(data) {
+            return Some(false);
+        }
+        let mut sum = 0u32;
+        for pair in frame[26..34].chunks(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        sum += u32::from(frame[23]) + (total - ip_length) as u32;
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let length = (14 + total).max(60);
+        let buffer = (self.tx_buffers + (data * BUFFER_SIZE) as u64) as *mut u8;
+        unsafe {
+            core::ptr::write_bytes(buffer, 0, length);
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), buffer, 14 + total);
+            *buffer.add(checksum_at) = (sum >> 8) as u8;
+            *buffer.add(checksum_at + 1) = sum as u8;
+            let words = (self.tx_ring as *mut Descriptor).add(data) as *mut u32;
+            write_volatile(words.add(2), ADV_TX_DATA | length as u32);
+            write_volatile(words.add(3), (length as u32) << 14 | ADV_TXSM); // PAYLEN, POPTS; DD (status) clear
+            let words = (self.tx_ring as *mut Descriptor).add(context) as *mut u32;
+            write_volatile(words, 14 << 9 | ip_length as u32); // MACLEN, IPLEN
+            write_volatile(words.add(1), 0);
+            write_volatile(words.add(2), ADV_CTXT | tucmd);
+            write_volatile(words.add(3), 0);
+        }
+        self.tx_ctx[context] = true;
+        self.tx_next = (data + 1) % TX_COUNT;
+        write(self.registers, self.r.tdt, self.tx_next as u32);
+        self.frames_sent += 1;
+        Some(true)
+    }
+
     /// Queues one frame (padded to the 60-byte minimum). Returns false if the ring
     /// stays full, which means the link is down or the card is wedged.
     pub fn send(&mut self, frame: &[u8]) -> bool {
         if frame.len() > MAX_FRAME {
             return false;
+        }
+        if self.tx_offload {
+            if let Some(result) = self.send_offloaded(frame) {
+                return result;
+            }
         }
         // No link: the card will not transmit and the descriptor would never complete, so a
         // sender would wait out its timeout and report a hardware failure. A cable that is not
@@ -1027,15 +1126,10 @@ impl E1000 {
             self.frames_dropped_no_link += 1;
             return true;
         }
-        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
-        let mut waited = 0u32;
-        while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
-            waited += 1;
-            if waited > 2_000_000 {
-                return false;
-            }
-            core::hint::spin_loop();
+        if !self.claim_tx_slot(self.tx_next) {
+            return false;
         }
+        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
         let buffer = (self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
         let length = frame.len().max(60);
         unsafe {

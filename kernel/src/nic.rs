@@ -124,6 +124,14 @@ impl Nic {
         }
     }
 
+    /// Transmit checksum offload (`TapeApi::nic_tx_offload`); false on a card without it.
+    pub fn set_tx_offload(&mut self, on: bool) -> bool {
+        match self {
+            Nic::E1000(nic) => nic.set_tx_offload(on),
+            _ => false,
+        }
+    }
+
     /// Registers or drops one VLAN id in the hardware VLAN filter (`TapeApi::nic_vlan_filter`); false on a card without one.
     pub fn vlan_filter(&mut self, vid: u16, on: bool) -> bool {
         match self {

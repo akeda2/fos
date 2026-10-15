@@ -510,6 +510,9 @@ extern "C" fn api_nic_multicast_join(index: usize, mac: *const u8, on: u32) -> u
 extern "C" fn api_nic_vlan_filter(index: usize, vid: u32, on: u32) -> u32 {
     u16::try_from(vid).is_ok_and(|vid| term::nic_vlan_filter(index, vid, on != 0)) as u32
 }
+extern "C" fn api_nic_tx_offload(index: usize, on: u32) -> u32 {
+    u32::from(term::nic_tx_offload(index, on != 0))
+}
 extern "C" fn api_nic_ts_all(index: usize, on: u32) -> u32 {
     u32::from(term::nic_ts_all(index, on != 0))
 }
@@ -713,6 +716,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_ts_all: api_nic_ts_all,
         nic_multicast_join: api_nic_multicast_join,
         nic_vlan_filter: api_nic_vlan_filter,
+        nic_tx_offload: api_nic_tx_offload,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
@@ -738,6 +742,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
     term::set_tape_mode(false);
     term::nic_multicast_clear_all();
     term::nic_vlan_clear_all();
+    term::nic_tx_offload_off_all();
     term::nic_ts_all_off(); // per-frame stamps change the receive buffer format; a tape that ends leaves PTP-only stamping
     memory::free(stack, STACK_BYTES / memory::FRAME);
     crate::println!("Tape returned; back at the fos shell.");

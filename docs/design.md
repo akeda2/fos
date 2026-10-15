@@ -913,6 +913,17 @@ a bit, so tapes still compare addresses. `ptp` (L2), audio-net's PTP listener an
 kernel clears all groups when a tape ends. `nic mcast N join|leave MAC | clear` does it by hand; `make test-nic` injects
 frames to a joined and an unjoined group. Only real hardware can confirm the I350/82579/I219 tables behave like QEMU's.
 
+**Transmit checksum offload (ABI 14).** `nic_tx_offload(nic, on)` makes the I350's `send` hand IPv4 UDP frames whose checksum
+field is 0 (and TCP frames) to the card: a context descriptor (MACLEN 14, IPLEN) plus an advanced data descriptor with
+TXSM. The driver writes the pseudo-header sum into the field (not complemented) and the card sums the rest to the end of
+the buffer (padding is zeros) and complements. A context takes a ring slot of its own that overwrites the slot's buffer
+address, so `claim_tx_slot` treats the data descriptor after it as the proof the slot is free and puts the address back;
+every send path goes through it. Frames with a checksum, fragments and non-UDP/TCP go the ordinary way. The nettest
+generator turns it on around its own frames only (a relayed zero-checksum frame must stay as it is). The saving is
+small at audio rates (a 1.5 KB sum is under a microsecond); it matters for nettest at line rate. QEMU has no I350, so
+`tools/test_tx_offload.py` checks real hardware (`nic csum N` sends three frames, the host verifies the sums); checked
+on skylake2's I350 (padded, even and odd lengths).
+
 **VLAN filter (ABI 13).** `nic_vlan_filter(nic, vid, on)` sets one bit of the E1000 family's VFTA (0x5600, 4096 bits). The
 filter (`RCTL.VFE`) is on only while at least one id is registered and the card is not promiscuous, so existing tapes
 (bridge, nettest) still see every tag; untagged frames always pass. The kernel clears the table and the filter when a

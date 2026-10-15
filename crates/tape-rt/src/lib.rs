@@ -540,6 +540,15 @@ fn has_steering() -> bool {
     table.version >= 10 && (table.size as usize) >= end
 }
 
+/// Turns transmit checksum offload on or off: with it on, `nic_send` has the card checksum IPv4 UDP frames whose checksum
+/// field is 0 (and TCP frames). True if the card does it; false (a card without it, or a kernel older than version 14)
+/// means the tape must compute checksums itself.
+pub fn tx_offload(nic: usize, on: bool) -> bool {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, nic_tx_offload) + core::mem::size_of::<usize>();
+    table.version >= 14 && (table.size as usize) >= end && (table.nic_tx_offload)(nic, u32::from(on)) != 0
+}
+
 /// Registers (`on`) or drops one VLAN id in the card's VLAN filter; the filter turns on with the first id. True if the
 /// card did it; false on a card without one or a kernel older than version 13 (every tag then still arrives).
 pub fn vlan_filter(nic: usize, vid: u16, on: bool) -> bool {
