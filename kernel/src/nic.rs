@@ -75,6 +75,14 @@ impl Nic {
         }
     }
 
+    /// The hardware receive timestamp (nanoseconds of the card's clock) of the frame `receive` returned last; 0 if none.
+    pub fn take_stamp(&mut self) -> u64 {
+        match self {
+            Nic::E1000(nic) => nic.take_stamp(),
+            _ => 0,
+        }
+    }
+
     pub fn send(&mut self, frame: &[u8]) -> bool {
         match self {
             Nic::E1000(nic) => nic.send(frame),

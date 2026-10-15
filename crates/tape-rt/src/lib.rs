@@ -511,6 +511,39 @@ pub fn console_size() -> (usize, usize) {
     if columns == 0 || rows == 0 { (80, 25) } else { (columns, rows) }
 }
 
+/// Whether the kernel's table has the version-9 hardware timestamp calls.
+fn has_timestamps() -> bool {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, nic_send_stamped) + core::mem::size_of::<usize>();
+    table.version >= 9 && (table.size as usize) >= end
+}
+
+/// Arms hardware timestamps on interface `nic`; false on an older kernel or a card without them.
+pub fn nic_ts_enable(nic: usize) -> bool {
+    has_timestamps() && (api().nic_ts_enable)(nic) != 0
+}
+
+/// The card's clock in nanoseconds (40 bits; 0 without timestamps).
+pub fn nic_ts_clock(nic: usize) -> u64 {
+    if has_timestamps() { (api().nic_ts_clock)(nic) } else { 0 }
+}
+
+/// The hardware stamp of the frame the last `nic_receive` on `nic` returned (0: none).
+pub fn nic_ts_rx(nic: usize) -> u64 {
+    if has_timestamps() { (api().nic_ts_rx)(nic) } else { 0 }
+}
+
+/// Sends `frame`; returns (sent, hardware transmit stamp or 0).
+pub fn nic_send_stamped(nic: usize, frame: &[u8]) -> (bool, u64) {
+    let mut stamp = 0u64;
+    let sent = if has_timestamps() {
+        (api().nic_send_stamped)(nic, frame.as_ptr(), frame.len(), &mut stamp) != 0
+    } else {
+        (api().nic_send)(nic, frame.as_ptr(), frame.len()) != 0
+    };
+    (sent, stamp)
+}
+
 pub fn micros() -> u64 {
     (api().micros)()
 }

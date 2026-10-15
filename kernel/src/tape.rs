@@ -487,6 +487,25 @@ extern "C" fn api_wall_clock_set(time: *const fosfor_abi::tape::WallClock) -> u3
     let time = fat::Time { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
     u32::from(crate::clock::set(&time).is_ok())
 }
+extern "C" fn api_nic_ts_enable(index: usize) -> u32 {
+    u32::from(term::nic_ts_enable(index))
+}
+extern "C" fn api_nic_ts_clock(index: usize) -> u64 {
+    term::nic_ts_clock(index)
+}
+extern "C" fn api_nic_ts_rx(index: usize) -> u64 {
+    term::last_rx_stamp(index)
+}
+extern "C" fn api_nic_send_stamped(index: usize, frame: *const u8, length: usize, stamp: *mut u64) -> u32 {
+    if length > 1518 {
+        return 0;
+    }
+    let (sent, value) = term::nic_send_stamped(index, unsafe { core::slice::from_raw_parts(frame, length) });
+    if !stamp.is_null() {
+        unsafe { stamp.write(value) };
+    }
+    u32::from(sent)
+}
 extern "C" fn api_console_size() -> u32 {
     crate::framebuffer::size().map_or(0, |(columns, rows)| ((columns as u32) << 16) | rows as u32 & 0xffff)
 }
@@ -665,6 +684,10 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         serial_set_lines: api_serial_set_lines,
         console_size: api_console_size,
         serial_break: api_serial_break,
+        nic_ts_enable: api_nic_ts_enable,
+        nic_ts_clock: api_nic_ts_clock,
+        nic_ts_rx: api_nic_ts_rx,
+        nic_send_stamped: api_nic_send_stamped,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

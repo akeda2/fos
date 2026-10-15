@@ -890,8 +890,14 @@ faster requests while it warms up.
 Measured (skylake3 master, wired gigabit): amd1 path delay ~28 us, jitter ~3 us (mean of the per-second sd), rate
 -5.5 ppm; laptop1 ~41 us, jitter ~20 us, rate -69 ppm. The QEMU guests do not share a time base, so `make test-ptp`
 checks the protocol (lock, no lost Sync, wire format), not the offset. Only real hardware, and `ptp4l` as the
-other end, can check interoperability; the I219 on the dev machine has hardware timestamping, the fos NICs do not
-use it. Next: audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline and a one-way delay readout.
+other end, can check interoperability; the I219 on the dev machine has hardware timestamping (not used).
+**Hardware timestamps (I350, ABI 9).** `e1000.rs` arms the 82580-family IEEE 1588 unit (SYSTIM 1 ns/tick; RX filter
+`EVENT_V2` plus ETQF/FTQF for L2 0x88F7 and UDP 319; TX stamps through an advanced descriptor) and `nic ts N [send|listen]`
+shows it. The kernel attaches the RX stamp when it queues the frame; tapes read it with `nic_ts_rx` after `nic_receive`
+and `nic_send_stamped`. `ptp` moves card stamps onto its own clock (`hw_to_local`) and prints which kind it uses;
+`software` opts out. skylake1<->rack, I350 NIC 2 on a direct cable: path delay 1.9 us (min 0.0, max 2.5), sample-to-sample
+noise about 1 us; the "jitter" line then mostly shows the -54 ppm clock-rate difference. Only real hardware checks it
+(QEMU NICs lack the registers). Next: audio-net with `ts-refclk:ptp` audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline and a one-way delay readout.
 
 ### audio-net on a PTP clock
 

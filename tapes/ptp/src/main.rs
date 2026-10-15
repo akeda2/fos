@@ -68,12 +68,13 @@ struct Options {
     dns: &'static str,
     settime: bool,
     zone_minutes: i32,
+    software: bool,
 }
 
 const SETTIME_GIVE_UP_SECONDS: u32 = 60;
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
-    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: true, verbose: false, l2: false, both: false, ntp: "", dns: "", settime: false, zone_minutes: 0 };
+    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: true, verbose: false, l2: false, both: false, ntp: "", dns: "", settime: false, zone_minutes: 0, software: false };
     let mut idle_set = None;
     for word in arguments.split_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -85,6 +86,7 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
             "l2" => options.l2 = true,
             "both" => options.both = true,
             "verbose" => options.verbose = true,
+            "software" => options.software = true,
             "settime" => options.settime = true,
             "ntp" => options.ntp = if value.is_empty() { "dhcp" } else { value },
             "dns" => options.dns = value,
@@ -110,6 +112,44 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
 
 /// Added to the local clock for the master's PTP time: zero (time since boot) until NTP says what the date is.
 static EPOCH_NS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// The interface whose hardware timestamps are in use, when it has them (set once at start).
+static HW_NIC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// A card's stamp is a count of its own clock (40 bits are enough to measure back from now).
+const STAMP_MASK: u64 = (1 << 40) - 1;
+
+/// Moves a hardware stamp onto the tape's clock: read the card's clock between two reads of ours (the middle is its
+/// moment on our timeline, to about a microsecond) and subtract how long ago the stamp was. The polling loop's
+/// delay between the frame's arrival and this call drops out, which is the point of the card's stamp.
+fn hw_to_local(stamp: u64) -> i64 {
+    let nic = HW_NIC.load(core::sync::atomic::Ordering::Relaxed);
+    let before = now_ns();
+    let card = tape_rt::nic_ts_clock(nic);
+    let after = now_ns();
+    (before + after) / 2 - (card.wrapping_sub(stamp) & STAMP_MASK) as i64
+}
+
+/// Arms the card's timestamps unless `software` was asked for; says which kind this run measures with.
+fn start_hardware_stamps(options: &Options) {
+    if !options.software && tape_rt::nic_ts_enable(options.nic) {
+        HW_NIC.store(options.nic, core::sync::atomic::Ordering::Relaxed);
+        println!("ptp: hardware timestamps on NIC {} (the card stamps PTP event frames).", options.nic + 1);
+    } else {
+        println!("ptp: software timestamps (the polling loop reads the clock){}.", if options.software { ", as asked" } else { ": this NIC has no hardware timestamps" });
+    }
+}
+
+/// The time a frame just returned by `nic_receive` arrived: the card's stamp when it has one, else now.
+fn receive_time(nic: usize) -> (i64, bool) {
+    if HW_NIC.load(core::sync::atomic::Ordering::Relaxed) == nic {
+        let stamp = tape_rt::nic_ts_rx(nic);
+        if stamp != 0 {
+            return (hw_to_local(stamp), true);
+        }
+    }
+    (now_ns(), false)
+}
 
 fn now_ns() -> i64 {
     tape_rt::micros() as i64 * 1000 + EPOCH_NS.load(core::sync::atomic::Ordering::Relaxed)
@@ -228,19 +268,29 @@ fn incoming<'a>(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, ar
     }
 }
 
-fn send(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16, payload: &[u8]) {
+/// Sends one PTP message; returns the time it left: the card's transmit stamp when it has one, else the clock just
+/// before the frame was handed over.
+fn send(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16, payload: &[u8]) -> i64 {
     let mut frame = [0u8; 160];
-    if l2 {
-        let length = ptp_tape::build_l2_frame(&mut frame, config.mac.0, payload);
-        if length != 0 {
-            net::send_frame(api, nic, &frame[..length]);
+    let length = if l2 {
+        ptp_tape::build_l2_frame(&mut frame, config.mac.0, payload)
+    } else {
+        let destination = MacAddress(audio_wire::multicast_mac(GROUP));
+        net::build_udp_frame(&mut frame, config, destination, Ipv4Address(GROUP), port, port, 1, payload).unwrap_or(0)
+    };
+    if length == 0 {
+        return now_ns();
+    }
+    let before = now_ns();
+    if HW_NIC.load(core::sync::atomic::Ordering::Relaxed) == nic {
+        let (_, stamp) = tape_rt::nic_send_stamped(nic, &frame[..length]);
+        if stamp != 0 {
+            return hw_to_local(stamp);
         }
-        return;
+        return before;
     }
-    let destination = MacAddress(audio_wire::multicast_mac(GROUP));
-    if let Some(length) = net::build_udp_frame(&mut frame, config, destination, Ipv4Address(GROUP), port, port, 1, payload) {
-        net::send_frame(api, nic, &frame[..length]);
-    }
+    net::send_frame(api, nic, &frame[..length]);
+    before
 }
 
 /// Waits between polls: sleeps (master default, or `idle`), or spins (slave default, `spin`: the smallest receive-time error).
@@ -343,6 +393,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     let mut silent = 0u32;
     let mut last_empty = now_ns();
     let (mut time_set, mut refusal_shown) = (false, false);
+    start_hardware_stamps(options);
     println!("ptp: waiting for an Announce...");
     // A start-file `ptp settime` must not hold the shell for ever when the master is down.
     let limit = if options.seconds == 0 && options.settime { SETTIME_GIVE_UP_SECONDS } else { options.seconds };
@@ -363,8 +414,8 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
             }
             // The receive time is read as soon as the frame is in hand. If the last poll that found nothing is
             // long ago (a print, a send), the frame may have waited and its time is too late to measure with.
-            let t2 = now_ns();
-            let late = t2 - last_empty > options.late_us * 1000;
+            let (t2, hardware) = receive_time(options.nic);
+            let late = !hardware && t2 - last_empty > options.late_us * 1000;
             busy = true;
             if !l2() && igmp.handle(&frame[..length], t2 as u64 / 1000) {
                 continue;
@@ -411,8 +462,8 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
         if let Some(sequence) = slave.request_due(now) {
             let mut message = [0u8; 64];
             let length = build_delay_req(&mut message, options.domain, identity, sequence);
-            slave.request_sent(sequence, now_ns());
-            send(l2(), api, options.nic, config, EVENT_PORT, &message[..length]);
+            let t3 = send(l2(), api, options.nic, config, EVENT_PORT, &message[..length]);
+            slave.request_sent(sequence, t3);
         }
         if now >= next_report {
             next_report += 1_000_000_000;
@@ -506,6 +557,7 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
         708..=1414 => 0,
         _ => 1,
     };
+    start_hardware_stamps(options);
     let start = now_ns();
     let (mut next_announce, mut next_sync, mut next_report) = (start, start, start + 5_000_000_000);
     let (mut announce_sequence, mut sync_sequence) = (0u16, 0u16);
@@ -521,7 +573,7 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
             if length == 0 {
                 break;
             }
-            let t4 = now_ns();
+            let (t4, _) = receive_time(options.nic);
             busy = true;
             if !l2() && igmp.handle(&frame[..length], t4 as u64 / 1000) {
                 continue;
@@ -560,8 +612,7 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
             let transports = if options.both { 2 } else { 1 };
             for (index, entry) in sent.iter_mut().enumerate().take(transports) {
                 let over_l2 = if index == 0 { l2() } else { true };
-                *entry = (over_l2, now_ns());
-                send(over_l2, api, options.nic, config, EVENT_PORT, &message[..length]);
+                *entry = (over_l2, send(over_l2, api, options.nic, config, EVENT_PORT, &message[..length]));
             }
             for &(over_l2, t1) in &sent[..transports] {
                 let length = build_follow_up(&mut message, options.domain, identity, sync_sequence, t1, sync_log);
@@ -585,7 +636,7 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
   tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D]
                [domain=N] [l2|both] [ntp=dhcp|A.B.C.D|NAME] [dns=A.B.C.D]
                [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US]
-               [spin] [verbose]
+               [spin] [verbose] [software]
 
   slave     measure offset, delay and rate to a master (the default)
   master    announce a clock; ntp= takes real time from an NTP server first
@@ -597,6 +648,7 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
   settime   slave: set the clock and RTC from the master, then end (gives up
             after 60 s without secs=)
   tz=+2     hours east of UTC for settime (the RTC holds local time)
+  software  do not use the NIC's hardware timestamps (I350)
   spin      poll flat out (slave default): smallest timestamp error, hot CPU
   idle      sleep between polls (master default); a slave loses accuracy
   secs=N    stop after N seconds; Escape stops at any time

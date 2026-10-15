@@ -148,11 +148,27 @@ const TSYNC_ENABLE: u32 = 1 << 4;
 const RXCTL_TYPE_EVENT_V2: u32 = 0x0a;
 /// ETQF: filter enable (26) and "timestamp this ethertype" (30), ethertype in 15:0 (0x88f7 = PTP over Ethernet).
 const ETQF_PTP_L2: u32 = (1 << 26) | (1 << 30) | 0x88f7;
-/// FTQF: every field masked, so the UDP (layer 4) filter never matches and cannot timestamp anything.
-const FTQF_MASK_ALL: u32 = 0xf000_0000;
+const REG_IMIR3: usize = 0x5a8c;
+const REG_IMIREXT3: usize = 0x5aac;
+const IMIREXT_SIZE_BP: u32 = 0x1000;
+const IMIREXT_CTRL_BP: u32 = 0x8_0000;
+/// FTQF: protocol UDP, port filter in IMIR, VF bypass (15), "timestamp" (27); mask bits 31:28 set except the protocol one (28).
+const FTQF_UDP_STAMP: u32 = 17 | (1 << 15) | (1 << 27) | 0xe000_0000;
 /// Advanced transmit data descriptor: type data (DTYP 3), end of packet, insert FCS, report status,
 /// descriptor extension, and MAC_TSTAMP to have the card timestamp this frame.
 const ADV_TX_DATA_TS: u32 = 0x0030_0000 | (1 << 24) | (1 << 25) | (1 << 27) | (1 << 29) | 0x0008_0000;
+/// Whether `frame` is a PTP event message (Sync, Delay_Req, ...: messageType below 8) over Ethernet (0x88f7)
+/// or UDP port 319, i.e. what the card stamps.
+fn is_ptp_event(frame: &[u8]) -> bool {
+    if frame.len() >= 15 && frame[12..14] == [0x88, 0xf7] {
+        return frame[14] & 0x08 == 0;
+    }
+    if frame.len() >= 42 && frame[12..14] == [0x08, 0x00] && frame[23] == 17 {
+        let udp = 14 + usize::from(frame[14] & 0x0f) * 4;
+        return frame.len() >= udp + 8 && frame[udp + 2..udp + 4] == [0x01, 0x3f];
+    }
+    false
+}
 const REG_RDLEN: usize = 0x2808;
 #[allow(dead_code)]
 const REG_RDH: usize = 0x2810;
@@ -316,6 +332,10 @@ pub struct E1000 {
     pub frames_sent: u64,
     /// Frames "sent" while the link was down (lost, as on an unplugged cable).
     pub frames_dropped_no_link: u64,
+    /// Timestamps armed (`ts_enable`): `receive` then attaches the card's stamp to each PTP event frame.
+    ts_on: bool,
+    /// SYSTIM stamp of the frame `receive` returned last (0: none), taken by `take_stamp`.
+    last_stamp: u64,
 }
 
 #[derive(Debug)]
@@ -540,7 +560,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0 })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, last_stamp: 0 })
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -574,11 +594,21 @@ impl E1000 {
         write(self.registers, REG_TSYNCRXCTL, TSYNC_ENABLE | RXCTL_TYPE_EVENT_V2);
         write(self.registers, REG_TSYNCRXCFG, 0);
         write(self.registers, REG_ETQF3, ETQF_PTP_L2);
-        write(self.registers, REG_FTQF3, FTQF_MASK_ALL);
+        // Layer 4: UDP destination port 319 (PTP events) is stamped too. FTQF3 matches the protocol only (UDP = 17),
+        // IMIR3 holds the port (as the card reads it, byte-swapped), IMIREXT3 bypasses size and control-bit checks.
+        write(self.registers, REG_IMIR3, 319u16.swap_bytes() as u32);
+        write(self.registers, REG_IMIREXT3, IMIREXT_SIZE_BP | IMIREXT_CTRL_BP);
+        write(self.registers, REG_FTQF3, FTQF_UDP_STAMP);
         // Reading the high words releases any stamp left latched.
         let _ = read(self.registers, REG_TXSTMPH);
         let _ = read(self.registers, REG_RXSTMPH);
+        self.ts_on = true;
         true
+    }
+
+    /// The stamp of the frame `receive` returned last, once (0: the frame had none).
+    pub fn take_stamp(&mut self) -> u64 {
+        core::mem::take(&mut self.last_stamp)
     }
 
     /// The card's clock in nanoseconds. The value latches on the lowest register, SYSTIMR here.
@@ -604,10 +634,10 @@ impl E1000 {
     }
 
     /// Sends `frame` with an advanced descriptor that asks for a transmit stamp, and returns it
-    /// (None: the frame did not go out, or no stamp came within a bounded wait). One at a time.
-    pub fn send_stamped(&mut self, frame: &[u8]) -> Option<u64> {
+    /// as (sent, stamp); the stamp is 0 when none came within a bounded wait. One at a time.
+    pub fn send_stamped(&mut self, frame: &[u8]) -> (bool, u64) {
         if !self.ts_supported() || frame.len() > MAX_FRAME || !self.link_up() {
-            return None;
+            return (false, 0);
         }
         let _ = read(self.registers, REG_TXSTMPH);
         let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
@@ -615,7 +645,7 @@ impl E1000 {
         while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
             waited += 1;
             if waited > 2_000_000 {
-                return None;
+                return (false, 0);
             }
             core::hint::spin_loop();
         }
@@ -632,11 +662,11 @@ impl E1000 {
         write(self.registers, self.r.tdt, self.tx_next as u32);
         self.frames_sent += 1;
         // Wait for the descriptor and the stamp; a few hundred microseconds at most on a live link.
-        let mut stamp = None;
+        let mut stamp = 0;
         for _ in 0..2_000_000u32 {
             if read(self.registers, REG_TSYNCTXCTL) & TSYNC_VALID != 0 {
                 let low = u64::from(read(self.registers, REG_TXSTMPL));
-                stamp = Some(low | u64::from(read(self.registers, REG_TXSTMPH)) << 32);
+                stamp = low | u64::from(read(self.registers, REG_TXSTMPH)) << 32;
                 break;
             }
             core::hint::spin_loop();
@@ -652,7 +682,7 @@ impl E1000 {
             write_volatile(words.add(2), 0);
             write_volatile(words.add(3), u32::from(DESCRIPTOR_DONE));
         }
-        stamp
+        (true, stamp)
     }
 
     /// `nic list`: what the card itself counted lost for want of receive buffers. These are the
@@ -724,6 +754,9 @@ impl E1000 {
             self.rx_next = (self.rx_next + 1) % RX_COUNT;
             if keep {
                 self.frames_received += 1;
+                // Only PTP event frames are stamped, and only one at a time: the stamp belongs to this frame
+                // when it is one (the ring is read in arrival order, and PTP events are tens of ms apart).
+                self.last_stamp = if self.ts_on && is_ptp_event(&out[..length]) { self.ts_rx_stamp().unwrap_or(0) } else { 0 };
                 return Some(length);
             }
         }

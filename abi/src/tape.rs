@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`.
-pub const TAPE_API_VERSION: u32 = 8;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`.
+pub const TAPE_API_VERSION: u32 = 9;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -206,6 +206,19 @@ pub struct TapeApi {
     /// `console_size()` (version 8): the text grid of the console, `columns << 16 | rows` (0 when there is no console). A tape
     /// that lays out a screen or tells a remote host its window size (Telnet NAWS) uses it instead of assuming 80x25.
     pub console_size: extern "C" fn() -> u32,
+    /// `nic_ts_enable(index)` (version 9): arms the interface's IEEE 1588 hardware timestamps (Intel I350 today); 1 if it has
+    /// them, 0 if not (the tape then keeps its software stamps). Received PTP event frames (Ethernet 0x88f7 or UDP port 319)
+    /// are then stamped by the card, and `nic_send_stamped` returns transmit stamps. Check `version >= 9` and `size`.
+    pub nic_ts_enable: extern "C" fn(usize) -> u32,
+    /// `nic_ts_clock(index)` (version 9): the card's own clock in nanoseconds (the timeline of every stamp; 40 bits, wraps in
+    /// about 18 minutes, so subtract with wrapping and mask). 0 on a card without timestamps.
+    pub nic_ts_clock: extern "C" fn(usize) -> u64,
+    /// `nic_ts_rx(index)` (version 9): the hardware stamp of the frame the last `nic_receive(index, ...)` returned, in the
+    /// card's clock; 0 if that frame has none (not a PTP event, or the card had no stamp free). Valid until the next receive.
+    pub nic_ts_rx: extern "C" fn(usize) -> u64,
+    /// `nic_send_stamped(index, frame, length, stamp)` (version 9): like `nic_send`, and stores the frame's transmit stamp (card
+    /// clock) in `*stamp`, 0 if none. Returns 1 if the frame was sent, 0 if not. Waits for the stamp, a few tens of microseconds.
+    pub nic_send_stamped: extern "C" fn(usize, *const u8, usize, *mut u64) -> u32,
 }
 
 /// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.

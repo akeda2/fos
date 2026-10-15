@@ -216,8 +216,9 @@ pub fn poll() {
             let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
             // Frames a tape may be about to want (its own load protocol, over the fos ethertype)
             // wait in the queue; the rest of a busy LAN's traffic is not worth keeping.
+            let stamp = nic_at(index).map_or(0, |nic| nic.take_stamp());
             if !handle_frame(index, &buffer[..length]) && length >= 14 && (buffer[12..14] == ETHERTYPE || unsafe { QUEUE_ALL }) {
-                queue_frame(index, &buffer[..length]);
+                queue_frame(index, &buffer[..length], stamp);
             }
         }
     }
@@ -872,6 +873,9 @@ pub fn set_tape_mode(on: bool) {
 const FRAME_FIFO: usize = 64;
 static mut FRAMES: [[u8; 1600]; MAX_NICS * FRAME_FIFO] = [[0; 1600]; MAX_NICS * FRAME_FIFO];
 static mut FRAME_LENGTHS: [usize; MAX_NICS * FRAME_FIFO] = [0; MAX_NICS * FRAME_FIFO];
+/// Hardware receive stamp of each queued frame (0: none), and of the frame `pop_frame` handed out last.
+static mut FRAME_STAMPS: [u64; MAX_NICS * FRAME_FIFO] = [0; MAX_NICS * FRAME_FIFO];
+static mut LAST_STAMP: [u64; MAX_NICS] = [0; MAX_NICS];
 static mut FRAME_HEAD: [usize; MAX_NICS] = [0; MAX_NICS];
 static mut FRAME_TAIL: [usize; MAX_NICS] = [0; MAX_NICS];
 static mut FRAMES_DROPPED: u32 = 0;
@@ -880,7 +884,7 @@ static mut FRAMES_QUEUED: u32 = 0;
 /// Keeps a frame that is not the terminal's for a tape (`tape load net` listens for its own
 /// protocol, `nic_receive` for everything else). Frames that arrive before a tape is
 /// listening wait here instead of being lost.
-fn queue_frame(index: usize, frame: &[u8]) {
+fn queue_frame(index: usize, frame: &[u8], stamp: u64) {
     unsafe {
         let head = FRAME_HEAD[index];
         let next = (head + 1) % FRAME_FIFO;
@@ -891,6 +895,7 @@ fn queue_frame(index: usize, frame: &[u8]) {
         let slot = index * FRAME_FIFO + head;
         core::slice::from_raw_parts_mut((core::ptr::addr_of_mut!(FRAMES) as *mut u8).add(slot * 1600), frame.len()).copy_from_slice(frame);
         FRAME_LENGTHS[slot] = frame.len();
+        FRAME_STAMPS[slot] = stamp;
         FRAME_HEAD[index] = next;
         FRAMES_QUEUED += 1;
     }
@@ -938,10 +943,11 @@ fn tape_service() {
     for index in 0..nic_count() {
         loop {
             let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
+            let stamp = nic_at(index).map_or(0, |nic| nic.take_stamp());
             if handle_frame(index, &buffer[..length]) {
                 continue;
             }
-            queue_frame(index, &buffer[..length]);
+            queue_frame(index, &buffer[..length], stamp);
         }
     }
     crate::uart::poll();
@@ -993,8 +999,33 @@ fn pop_frame(index: usize, out: &mut [u8]) -> usize {
         let slot = index * FRAME_FIFO + FRAME_TAIL[index];
         let length = FRAME_LENGTHS[slot].min(out.len());
         out[..length].copy_from_slice(core::slice::from_raw_parts((core::ptr::addr_of!(FRAMES) as *const u8).add(slot * 1600), length));
+        LAST_STAMP[index] = FRAME_STAMPS[slot];
         FRAME_TAIL[index] = (FRAME_TAIL[index] + 1) % FRAME_FIFO;
         length
+    }
+}
+
+/// The hardware receive stamp of the frame `pop_frame` (so a tape's `nic_receive`) returned last on `index`; 0 if none.
+pub fn last_rx_stamp(index: usize) -> u64 {
+    if index >= MAX_NICS { 0 } else { unsafe { LAST_STAMP[index] } }
+}
+
+/// Arms hardware timestamps on interface `index` (index 0-based); false if the card has none.
+pub fn nic_ts_enable(index: usize) -> bool {
+    nic_at(index).and_then(|nic| nic.as_e1000()).is_some_and(|card| card.ts_enable())
+}
+
+/// The card's clock in nanoseconds (0 without timestamps).
+pub fn nic_ts_clock(index: usize) -> u64 {
+    nic_at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map_or(0, |card| card.systim())
+}
+
+/// Sends `frame` and returns (sent, transmit stamp); the stamp is 0 when the card has none.
+pub fn nic_send_stamped(index: usize, frame: &[u8]) -> (bool, u64) {
+    let Some(nic) = nic_at(index) else { return (false, 0) };
+    match nic.as_e1000().filter(|card| card.ts_supported()) {
+        Some(card) => card.send_stamped(frame),
+        None => (nic.send(frame), 0),
     }
 }
 
@@ -3119,27 +3150,31 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>) {
             frame[15] = 0x02; // versionPTP 2
             frame[17] = 44; // messageLength
             let before = card.systim();
-            let stamp = card.send_stamped(&frame);
+            let (_, stamp) = card.send_stamped(&frame);
             let after = card.systim();
-            match stamp {
+            match Some(stamp).filter(|&stamp| stamp != 0) {
                 Some(stamp) => crate::println!("nic {index}: Sync sent; TX stamp {stamp}, SYSTIM before {before}, after {after} (stamp - before = {} ns).", stamp as i64 - before as i64),
                 None => crate::println!("nic {index}: no transmit stamp (link down, or the card gave none)."),
             }
         }
         Some("listen") => {
             blocking(true);
+            unsafe { QUEUE_ALL = true };
             let deadline = apic::ticks() + 10 * apic::TICK_HZ;
             crate::println!("nic {index}: listening 10 s for PTP-over-Ethernet event frames (ethertype 0x88f7).");
             while apic::ticks() < deadline && !break_requested() {
                 poll();
-                if let Some(card) = nic_at(index - 1).and_then(|nic| nic.as_e1000()) {
-                    if let Some(stamp) = card.ts_rx_stamp() {
-                        let now = card.systim();
+                let mut buffer = [0u8; 1600];
+                while pop_frame(index - 1, &mut buffer) != 0 {
+                    let stamp = last_rx_stamp(index - 1);
+                    if stamp != 0 {
+                        let now = nic_ts_clock(index - 1);
                         crate::println!("RX stamp {stamp}; SYSTIM now {now} (noticed {} ns later).", now as i64 - stamp as i64);
                     }
                 }
                 crate::cpu::sleep();
             }
+            unsafe { QUEUE_ALL = false };
             blocking(false);
             if let Some(card) = nic_at(index - 1).and_then(|nic| nic.as_e1000()) {
                 crate::println!("{} frames received so far; TSYNCRXCTL {:#x}.", card.frames_received, card.ts_rx_control());
