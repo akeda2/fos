@@ -371,7 +371,8 @@ fn send(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16,
         return now_ns();
     }
     let before = now_ns();
-    if HW_NIC.load(core::sync::atomic::Ordering::Relaxed) == nic {
+    // Only event messages (Sync, Delay_Req) are stamped: the others would make the send wait for a stamp that may not come.
+    if HW_NIC.load(core::sync::atomic::Ordering::Relaxed) == nic && payload.first().is_some_and(|byte| byte & 0x0f < 8) {
         let (_, stamp) = tape_rt::nic_send_stamped(nic, &frame[..length]);
         if stamp != 0 {
             return hw_to_local(stamp);
@@ -577,7 +578,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
                 jitter_seconds += 1;
             }
             last_rate = rate.tenths_ppm().or(last_rate);
-            if second.count > 0 && options.quiet {
+            if second.count > 0 && options.quiet && seconds % 60 != 0 {
                 silent = 0;
             } else if second.count > 0 {
                 match rate.tenths_ppm() {
@@ -755,7 +756,7 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
             after 60 s without secs=)
   tz=+2     hours east of UTC for settime (the RTC holds local time)
   software  do not use the NIC's hardware timestamps (I350)
-  quiet     slave: no per-second lines (a console line delays the poll loop)
+  quiet     slave: one line a minute, not a second (a console line delays the poll loop)
   steer     slave: step and steer the NIC's own clock to the master (hardware
             timestamps and clock steering needed)
   spin      poll flat out (slave default): smallest timestamp error, hot CPU

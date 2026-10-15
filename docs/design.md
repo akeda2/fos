@@ -922,8 +922,10 @@ the clock is stepped once (`nic_ts_step`, only above 20 us), and then every samp
 drift += ki*offset (kp and ki from the sync interval: 1.30 and 0.13 at the default 125 ms); there is no later step. A first
 design (step above 100 us, gains per second, no rate estimate) never converged: the steps repeated. Measured on the real
 machines (laptop1 I219 master, clock1 82579V slave, over a switch, L2): offset +-0.3 us, rate +0.0 ppm (+64 ppm unsteered),
-path delay 19.9 us, with a dip to about -14 us every 4 s that is not the console output (it stays with `quiet`) and is
-unexplained. `quiet` drops the per-second lines: a console line costs about 10 ms. `Slave::clock_moved` shifts the times
+path delay 19.9 us. The same on two I350s (skylake2/rack2, NIC 2): offset +-0.3 us, delay 2.7 us, held for 1300 s, past the
+40-bit count's wrap (about 18 min). A dip to -14 us every 8 Syncs came from the master asking for a hardware stamp on every
+frame it sent (Announce, Follow_Up, Delay_Resp too) and waiting for it; `send` now stamps only Sync and Delay_Req, and the
+offset sd fell from 2.2 to 0.5 us. `quiet` prints one line a minute instead of one a second: a console line costs about 10 ms. `Slave::clock_moved` shifts the times
 the slave holds when the caller steps its clock. Only real hardware checks this; QEMU has no steerable NIC.
 
 **Timestamps on the e1000e family.** The 82579 (96 MHz clock) and the Skylake I219 (24 MHz) have the same TSYNC
