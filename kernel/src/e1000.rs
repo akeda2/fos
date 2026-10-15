@@ -133,6 +133,7 @@ const REG_SYSTIML: usize = 0xb600;
 const REG_SYSTIMH: usize = 0xb604;
 const REG_SYSTIMR: usize = 0xb6f8;
 const REG_TSAUXC: usize = 0xb640;
+const REG_TIMINCA: usize = 0xb608;
 const REG_TSYNCTXCTL: usize = 0xb614;
 const REG_TXSTMPL: usize = 0xb618;
 const REG_TXSTMPH: usize = 0xb61c;
@@ -616,6 +617,24 @@ impl E1000 {
         let _ = read(self.registers, REG_SYSTIMR);
         let low = u64::from(read(self.registers, REG_SYSTIML));
         low | u64::from(read(self.registers, REG_SYSTIMH)) << 32
+    }
+
+    /// Speeds the card's clock up (positive) or slows it (negative) by `ppb` parts per billion, through TIMINCA's
+    /// fine adjustment (bit 31 = slower; the size is ppb * 2^26 / 1953125,
+    /// as Linux igb computes it for the 82580 family). 0 restores the nominal rate. Returns the value written.
+    pub fn ts_adjust(&mut self, ppb: i32) -> u32 {
+        let magnitude = (u64::from(ppb.unsigned_abs()) << 26) / 1_953_125;
+        let value = (magnitude as u32 & 0x7fff_ffff) | if ppb < 0 { 0x8000_0000 } else { 0 };
+        write(self.registers, REG_TIMINCA, value);
+        value
+    }
+
+    /// Jumps the clock by `delta` nanoseconds: read, add, write back SYSTIML then SYSTIMH. The two reads and the write
+    /// take about a microsecond, so a step is only that exact; ptp steps once and then steers with `ts_adjust`.
+    pub fn ts_step(&mut self, delta: i64) {
+        let target = self.systim().wrapping_add(delta as u64) & 0xff_ffff_ffff;
+        write(self.registers, REG_SYSTIML, target as u32);
+        write(self.registers, REG_SYSTIMH, (target >> 32) as u32);
     }
 
     /// TSYNCRXCTL, for diagnostics: bit 0 is "a stamp is latched".

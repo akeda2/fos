@@ -897,7 +897,13 @@ shows it. The kernel attaches the RX stamp when it queues the frame; tapes read 
 and `nic_send_stamped`. `ptp` moves card stamps onto its own clock (`hw_to_local`) and prints which kind it uses;
 `software` opts out. skylake1<->rack, I350 NIC 2 on a direct cable: path delay 1.9 us (min 0.0, max 2.5), sample-to-sample
 noise about 1 us; the "jitter" line then mostly shows the -54 ppm clock-rate difference. Only real hardware checks it
-(QEMU NICs lack the registers). Next: audio-net with `ts-refclk:ptp` audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline and a one-way delay readout.
+(QEMU NICs lack the registers).
+**Clock steering (ABI 10).** `nic_ts_adjust(nic, ppb)` writes TIMINCA (sign bit 31, size ppb*2^26/1953125, as Linux igb);
+`nic_ts_step(nic, ns)` reads SYSTIM, adds and writes it back (exact to the ~5 us the register reads take).
+`nic ts N adjust PPB` / `step NS` try them. skylake1 NIC 2 against the CPU timer over 4 s: +100000 ppb gave +99688,
+-100000 gave -100152, +1000000 gave +1000332 (baseline +305600). `ptp` does not steer the card yet: it maps card stamps
+onto its software clock, so a rate change does not show in its offsets. The pulse-per-second (SDP) output is not done:
+the I350's SDP pins are not on the boards at hand to check it. Next: audio-net with `ts-refclk:ptp` audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline and a one-way delay readout.
 
 ### audio-net on a PTP clock
 

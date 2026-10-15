@@ -533,6 +533,23 @@ pub fn nic_ts_rx(nic: usize) -> u64 {
     if has_timestamps() { (api().nic_ts_rx)(nic) } else { 0 }
 }
 
+/// Whether the kernel's table has the version-10 clock steering calls.
+fn has_steering() -> bool {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, nic_ts_step) + core::mem::size_of::<usize>();
+    table.version >= 10 && (table.size as usize) >= end
+}
+
+/// Runs the card's clock `ppb` parts per billion fast (negative: slow); 0 restores the nominal rate. False if it cannot.
+pub fn nic_ts_adjust(nic: usize, ppb: i32) -> bool {
+    has_steering() && (api().nic_ts_adjust)(nic, ppb) != 0
+}
+
+/// Moves the card's clock by `delta_ns`. False if it cannot.
+pub fn nic_ts_step(nic: usize, delta_ns: i64) -> bool {
+    has_steering() && (api().nic_ts_step)(nic, delta_ns) != 0
+}
+
 /// Sends `frame`; returns (sent, hardware transmit stamp or 0).
 pub fn nic_send_stamped(nic: usize, frame: &[u8]) -> (bool, u64) {
     let mut stamp = 0u64;

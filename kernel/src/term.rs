@@ -1020,6 +1020,16 @@ pub fn nic_ts_clock(index: usize) -> u64 {
     nic_at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map_or(0, |card| card.systim())
 }
 
+/// Frequency-adjusts the card's clock by `ppb` (false without timestamps).
+pub fn nic_ts_adjust(index: usize, ppb: i32) -> bool {
+    nic_at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map(|card| card.ts_adjust(ppb)).is_some()
+}
+
+/// Steps the card's clock by `delta` nanoseconds (false without timestamps).
+pub fn nic_ts_step(index: usize, delta: i64) -> bool {
+    nic_at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map(|card| card.ts_step(delta)).is_some()
+}
+
 /// Sends `frame` and returns (sent, transmit stamp); the stamp is 0 when the card has none.
 pub fn nic_send_stamped(index: usize, frame: &[u8]) -> (bool, u64) {
     let Some(nic) = nic_at(index) else { return (false, 0) };
@@ -1372,7 +1382,7 @@ fn execute(command: &str) {
         }
         "nic" if matches!(words.clone().next(), Some("ts")) => {
             words.next();
-            nic_timestamp_test(words.next(), words.next());
+            nic_timestamp_test(words.next(), words.next(), words.next());
         }
         "nic" if matches!(words.clone().next(), Some("peers")) => print_peers(),
         "nic" if matches!(words.clone().next(), Some("map")) => nic_map(),
@@ -3119,9 +3129,9 @@ fn nic_send_test() {
 /// `nic ts N [send|listen]`: checks the card's IEEE 1588 hardware timestamps (I350). Plain: is SYSTIM running at
 /// 1 ns a tick? `send`: transmit a PTP Sync frame and print its stamp against SYSTIM just before and after.
 /// `listen`: for 10 s print the stamp of each PTP frame that arrives against SYSTIM when it was noticed.
-fn nic_timestamp_test(number: Option<&str>, action: Option<&str>) {
+fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<&str>) {
     let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
-        crate::println!("nic ts N [send|listen]: IEEE 1588 hardware timestamps of interface N (I350).");
+        crate::println!("nic ts N [send|listen|adjust PPB|step NS]: IEEE 1588 hardware timestamps of interface N (I350).");
         return;
     };
     let Some(nic) = nic_at(index - 1) else { return };
@@ -3180,7 +3190,25 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>) {
                 crate::println!("{} frames received so far; TSYNCRXCTL {:#x}.", card.frames_received, card.ts_rx_control());
             }
         }
-        Some(_) => crate::println!("nic ts N [send|listen]"),
+        Some("adjust") | Some("step") => {
+            let Some(value) = value.and_then(|word| word.parse::<i64>().ok()) else {
+                return crate::println!("nic ts {index} adjust PPB | step NS: a signed number.");
+            };
+            if action == Some("adjust") {
+                let written = card.ts_adjust(value as i32);
+                let (before, start) = (card.systim(), apic::micros());
+                while apic::micros() < start + 4_000_000 {
+                    core::hint::spin_loop();
+                }
+                let (after, end) = (card.systim(), apic::micros());
+                let (ns, expect) = ((after.wrapping_sub(before) & 0xff_ffff_ffff) as i64, ((end - start) * 1000) as i64);
+                crate::println!("nic {index}: TIMINCA {written:#x}; over {} ms the card clock ran {} ppb against the CPU's timer (compare with adjust 0).", (end - start) / 1000, (ns - expect) * 1_000_000_000 / expect);
+            } else {
+                let (before, after) = (card.systim(), { card.ts_step(value); card.systim() });
+                crate::println!("nic {index}: SYSTIM {before} -> {after} (asked {value} ns, got {} ns).", after as i64 - before as i64);
+            }
+        }
+        Some(_) => crate::println!("nic ts N [send|listen|adjust PPB|step NS]"),
     }
 }
 

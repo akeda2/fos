@@ -493,6 +493,12 @@ extern "C" fn api_nic_ts_enable(index: usize) -> u32 {
 extern "C" fn api_nic_ts_clock(index: usize) -> u64 {
     term::nic_ts_clock(index)
 }
+extern "C" fn api_nic_ts_adjust(index: usize, ppb: i32) -> u32 {
+    u32::from(term::nic_ts_adjust(index, ppb))
+}
+extern "C" fn api_nic_ts_step(index: usize, delta: i64) -> u32 {
+    u32::from(term::nic_ts_step(index, delta))
+}
 extern "C" fn api_nic_ts_rx(index: usize) -> u64 {
     term::last_rx_stamp(index)
 }
@@ -688,6 +694,8 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_ts_clock: api_nic_ts_clock,
         nic_ts_rx: api_nic_ts_rx,
         nic_send_stamped: api_nic_send_stamped,
+        nic_ts_adjust: api_nic_ts_adjust,
+        nic_ts_step: api_nic_ts_step,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
