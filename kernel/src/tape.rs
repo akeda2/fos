@@ -499,6 +499,14 @@ extern "C" fn api_nic_ts_adjust(index: usize, ppb: i32) -> u32 {
 extern "C" fn api_nic_ts_step(index: usize, delta: i64) -> u32 {
     u32::from(term::nic_ts_step(index, delta))
 }
+extern "C" fn api_nic_multicast_join(index: usize, mac: *const u8, on: u32) -> u32 {
+    if mac.is_null() {
+        return 0;
+    }
+    let mut address = [0u8; 6];
+    unsafe { core::ptr::copy_nonoverlapping(mac, address.as_mut_ptr(), 6) };
+    u32::from(term::nic_multicast_join(index, address, on != 0))
+}
 extern "C" fn api_nic_ts_all(index: usize, on: u32) -> u32 {
     u32::from(term::nic_ts_all(index, on != 0))
 }
@@ -700,6 +708,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_ts_adjust: api_nic_ts_adjust,
         nic_ts_step: api_nic_ts_step,
         nic_ts_all: api_nic_ts_all,
+        nic_multicast_join: api_nic_multicast_join,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
@@ -723,6 +732,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
     crate::uart::close_all();
     crate::audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an audio stream running
     term::set_tape_mode(false);
+    term::nic_multicast_clear_all();
     term::nic_ts_all_off(); // per-frame stamps change the receive buffer format; a tape that ends leaves PTP-only stamping
     memory::free(stack, STACK_BYTES / memory::FRAME);
     crate::println!("Tape returned; back at the fos shell.");

@@ -1079,6 +1079,19 @@ pub fn nic_set_promiscuous(index: usize, on: bool) -> bool {
     }
 }
 
+pub fn nic_multicast_join(index: usize, mac: [u8; 6], on: bool) -> bool {
+    nic_at(index).is_some_and(|nic| nic.multicast_join(mac, on))
+}
+
+/// Drops every hardware multicast group on every NIC (a tape ended; the shell wants none).
+pub fn nic_multicast_clear_all() {
+    let mut index = 0;
+    while let Some(nic) = nic_at(index) {
+        nic.multicast_clear();
+        index += 1;
+    }
+}
+
 pub fn nic_set_multicast(index: usize, on: bool) -> bool {
     match nic_at(index) {
         Some(nic) => {
@@ -1399,6 +1412,10 @@ fn execute(command: &str) {
         "nic" if matches!(words.clone().next(), Some("ts")) => {
             words.next();
             nic_timestamp_test(words.next(), words.next(), words.next());
+        }
+        "nic" if matches!(words.clone().next(), Some("mcast")) => {
+            words.next();
+            nic_multicast_test(words.next(), words.next(), words.next());
         }
         "nic" if matches!(words.clone().next(), Some("peers")) => print_peers(),
         "nic" if matches!(words.clone().next(), Some("map")) => nic_map(),
@@ -3142,6 +3159,39 @@ fn nic_send_test() {
 }
 
 /// `nic recv`: waits up to three seconds for a frame that is not the terminal's, then dumps it.
+/// `nic mcast N join|leave MAC | clear`: joins or leaves one multicast group in the card's hash filter by hand, the
+/// call tapes make (`nic_multicast_join`), so a test can see that only the joined groups arrive.
+fn nic_multicast_test(index: Option<&str>, action: Option<&str>, address: Option<&str>) {
+    let usage = "nic mcast N join|leave MAC | clear: the card's multicast hash filter (E1000 family); MAC like 01:00:5e:01:02:03.";
+    let Some(index) = index.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
+        return crate::println!("{usage}");
+    };
+    match action {
+        Some("clear") => {
+            if let Some(nic) = nic_at(index - 1) {
+                nic.multicast_clear();
+            }
+            crate::println!("nic {index}: no multicast groups joined.");
+        }
+        Some(action @ ("join" | "leave")) => {
+            let mut mac = [0u8; 6];
+            let mut parts = address.unwrap_or("").split(':');
+            for byte in mac.iter_mut() {
+                match parts.next().and_then(|part| u8::from_str_radix(part, 16).ok()) {
+                    Some(value) => *byte = value,
+                    None => return crate::println!("{usage}"),
+                }
+            }
+            if nic_multicast_join(index - 1, mac, action == "join") {
+                crate::println!("nic {index}: {action} {} done (hash filter).", Mac(&mac));
+            } else {
+                crate::println!("nic {index}: no hash filter for {} (not a multicast address, or this card has none).", Mac(&mac));
+            }
+        }
+        _ => crate::println!("{usage}"),
+    }
+}
+
 /// `nic ts N [send|listen]`: checks the card's IEEE 1588 hardware timestamps (I350). Plain: is SYSTIM running at
 /// 1 ns a tick? `send`: transmit a PTP Sync frame and print its stamp against SYSTIM just before and after.
 /// `listen`: for 10 s print the stamp of each PTP frame that arrives against SYSTIM when it was noticed.

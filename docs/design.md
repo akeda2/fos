@@ -905,6 +905,14 @@ noise about 1 us; the "jitter" line then mostly shows the -54 ppm clock-rate dif
 onto its software clock, so a rate change does not show in its offsets. The pulse-per-second (SDP) output is not done:
 the I350's SDP pins are not on the boards at hand to check it. Next: audio-net with `ts-refclk:ptp` audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline and a one-way delay readout.
 
+**Multicast hash filter (ABI 12).** Tapes used to open all multicast (`RCTL.MPE`). `nic_multicast_join(nic, mac, on)`
+sets one bit of the E1000 family's 4096-bit table (MTA, 0x5200): hash = `(mac[4] >> 4 | mac[5] << 4) & 0xfff`, register
+`hash >> 5`, bit `hash & 31`, with a refcount per bit so two groups sharing a bit leave independently. Groups can share
+a bit, so tapes still compare addresses. `ptp` (L2), audio-net's PTP listener and `tape-ip` IGMP join through
+`tape_rt::multicast_group`, falling back to `nic_set_multicast` when it returns false (other NICs, old kernels). The
+kernel clears all groups when a tape ends. `nic mcast N join|leave MAC | clear` does it by hand; `make test-nic` injects
+frames to a joined and an unjoined group. Only real hardware can confirm the I350/82579/I219 tables behave like QEMU's.
+
 **Per-packet receive stamps (ABI 11).** `nic_ts_all(nic, on)` makes the I350 stamp every received frame: the receive ring
 then uses advanced descriptors (SRRCTL DESCTYPE 1, bit 30 asks for the stamp, TSYNCRXCTL type ALL), and a stamped frame
 carries a 16-byte header (SYSTIML at byte 8, SYSTIMH at 12) that `receive()` strips and files as `nic_ts_rx`. The card

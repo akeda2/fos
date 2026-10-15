@@ -540,6 +540,14 @@ fn has_steering() -> bool {
     table.version >= 10 && (table.size as usize) >= end
 }
 
+/// Joins (`on`) or leaves one multicast group in the card's hash filter. True if the card did it; false means it has no
+/// such filter (or the kernel is older than version 12) and the caller opens all multicast with `nic_set_multicast`.
+pub fn multicast_group(nic: usize, mac: [u8; 6], on: bool) -> bool {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, nic_multicast_join) + core::mem::size_of::<usize>();
+    table.version >= 12 && (table.size as usize) >= end && (table.nic_multicast_join)(nic, mac.as_ptr(), u32::from(on)) != 0
+}
+
 /// Runs the card's clock `ppb` parts per billion fast (negative: slow); 0 restores the nominal rate. False if it cannot.
 pub fn nic_ts_adjust(nic: usize, ppb: i32) -> bool {
     has_steering() && (api().nic_ts_adjust)(nic, ppb) != 0

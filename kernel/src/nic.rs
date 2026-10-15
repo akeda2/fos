@@ -109,6 +109,21 @@ impl Nic {
         }
     }
 
+    /// Joins or leaves one multicast group in the hardware filter (`TapeApi::nic_multicast_join`); false on a card
+    /// without one (the caller then opens all multicast with `set_multicast`).
+    pub fn multicast_join(&mut self, mac: [u8; 6], on: bool) -> bool {
+        match self {
+            Nic::E1000(nic) => nic.multicast_join(mac, on),
+            _ => false,
+        }
+    }
+
+    pub fn multicast_clear(&mut self) {
+        if let Nic::E1000(nic) = self {
+            nic.multicast_clear();
+        }
+    }
+
     /// Accept all multicast frames (see `TapeApi::nic_set_multicast`).
     pub fn set_multicast(&mut self, on: bool) {
         match self {

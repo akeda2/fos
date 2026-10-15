@@ -13,6 +13,7 @@ use crate::net::NetConfig;
 use audio_wire::multicast_mac;
 use tape_rt::TapeApi;
 
+const ALL_HOSTS: [u8; 4] = [224, 0, 0, 1];
 const ALL_ROUTERS: [u8; 4] = [224, 0, 0, 2];
 const IGMPV3_REPORTS: [u8; 4] = [224, 0, 0, 22];
 
@@ -86,10 +87,13 @@ impl Igmp {
         self.reports += 1;
     }
 
-    /// Starts receiving the group: all multicast through the NIC, and an unsolicited join (sent twice, as
+    /// Starts receiving the group: the group and 224.0.0.1 through the card's hash filter (all multicast on a card
+    /// without one), and an unsolicited join (sent twice, as
     /// RFC 2236 suggests, in case the first is lost).
     pub fn join(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
-        (api.nic_set_multicast)(nic, 1);
+        if !self.filter(nic, true) {
+            (api.nic_set_multicast)(nic, 1);
+        }
         self.send(api, nic, config, false, false);
         let until = tape_rt::micros() + 10_000;
         while tape_rt::micros() < until {
@@ -101,11 +105,20 @@ impl Igmp {
     /// A leave that keeps the NIC's multicast filter open: another group is still joined.
     pub fn leave_report(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
         self.send(api, nic, config, false, true);
+        self.filter(nic, false);
     }
 
     pub fn leave(&mut self, api: &TapeApi, nic: usize, config: &NetConfig) {
         self.send(api, nic, config, false, true);
-        (api.nic_set_multicast)(nic, 0);
+        if !self.filter(nic, false) {
+            (api.nic_set_multicast)(nic, 0);
+        }
+    }
+
+    /// The hardware filter for the group and for 224.0.0.1 (the queries): false if the card has none, so the caller
+    /// opens all multicast instead.
+    fn filter(&self, nic: usize, on: bool) -> bool {
+        tape_rt::multicast_group(nic, multicast_mac(ALL_HOSTS), on) && tape_rt::multicast_group(nic, multicast_mac(self.group), on)
     }
 
     /// Looks at one received frame; true if it was IGMP (so the caller need not look at it again). A query for

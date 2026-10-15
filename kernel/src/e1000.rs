@@ -211,6 +211,9 @@ const REG_TDLEN: usize = 0x3808;
 const REG_TDH: usize = 0x3810;
 #[allow(dead_code)]
 const REG_TDT: usize = 0x3818;
+/// Multicast table array: 128 registers = 4096 bits, indexed by 12 bits of the destination address (RCTL.MO = 0).
+const REG_MTA: usize = 0x5200;
+const MTA_REGISTERS: usize = 128;
 const REG_RAL0: usize = 0x5400;
 const REG_RAH0: usize = 0x5404;
 const REG_STATUS: usize = 0x0008;
@@ -369,6 +372,8 @@ pub struct E1000 {
     ts_clock: Option<(u32, u32, bool)>,
     /// Nanoseconds added to the card's clock by `ts_step` on a card whose SYSTIM cannot be written.
     ts_offset: u64,
+    /// Groups joined per multicast-table bit (`multicast_join`): two groups can share a bit, so each is counted.
+    mc_users: [u8; 4096],
 }
 
 #[derive(Debug)]
@@ -574,6 +579,9 @@ impl E1000 {
             write(registers, r.txdctl, TXDCTL_QUEUE_ENABLE);
         }
         write(registers, REG_TCTL, tctl);
+        for index in 0..MTA_REGISTERS {
+            write(registers, REG_MTA + index * 4, 0); // no multicast group until a tape joins one
+        }
         write(registers, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_LPE); // 2 KiB buffers, broadcast + own MAC
         write(registers, REG_CTRL, CTRL_SLU | CTRL_FD);
         if variant == Variant::I350 {
@@ -594,7 +602,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0 })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096] })
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -610,6 +618,32 @@ impl E1000 {
     pub fn set_multicast(&mut self, on: bool) {
         let control = read(self.registers, REG_RCTL);
         write(self.registers, REG_RCTL, if on { control | (1 << 4) } else { control & !(1 << 4) });
+    }
+
+    /// Joins (`on`) or leaves one multicast group in the card's hash filter, so that frames for it arrive without opening
+    /// every multicast frame (`set_multicast`). The card keeps 4096 bits and tests one bit per frame, chosen by bits 47:36
+    /// of the destination address (the byte order of Linux igb's `igb_hash_mc_addr`): other groups can share a bit and
+    /// get through too, so a tape still checks the address. False if the address is not a multicast one.
+    pub fn multicast_join(&mut self, mac: [u8; 6], on: bool) -> bool {
+        if mac[0] & 1 == 0 {
+            return false;
+        }
+        let hash = (usize::from(mac[4]) >> 4 | usize::from(mac[5]) << 4) & 0xfff;
+        let users = &mut self.mc_users[hash];
+        *users = if on { users.saturating_add(1) } else { users.saturating_sub(1) };
+        let register = REG_MTA + (hash >> 5) * 4;
+        let bits = read(self.registers, register);
+        let bit = 1u32 << (hash & 31);
+        write(self.registers, register, if self.mc_users[hash] > 0 { bits | bit } else { bits & !bit });
+        true
+    }
+
+    /// Forgets every joined group (a tape that ended without leaving them).
+    pub fn multicast_clear(&mut self) {
+        self.mc_users = [0; 4096];
+        for index in 0..MTA_REGISTERS {
+            write(self.registers, REG_MTA + index * 4, 0);
+        }
     }
 
     /// Whether the card has IEEE 1588 timestamp registers this driver knows (the I350, the 82579 and the Skylake I219).

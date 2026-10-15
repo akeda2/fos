@@ -46,6 +46,13 @@ fn local_ns() -> i64 {
     tape_rt::micros() as i64 * 1000
 }
 
+/// Lets the PTP-over-Ethernet group (01:1B:19:00:00:00) through the card: its hash filter, else all multicast.
+fn l2_multicast(api: &TapeApi, nic: usize, on: bool) {
+    if !tape_rt::multicast_group(nic, [0x01, 0x1b, 0x19, 0, 0, 0], on) {
+        (api.nic_set_multicast)(nic, u32::from(on));
+    }
+}
+
 /// Starts listening on `nic` (a second caller, such as the other half of a duplex run, shares the first's state).
 pub fn start(api: &TapeApi, nic: usize, config: &NetConfig, l2: bool) {
     if let Some(ptp) = state() {
@@ -65,7 +72,7 @@ pub fn start(api: &TapeApi, nic: usize, config: &NetConfig, l2: bool) {
         found: false,
     };
     if l2 {
-        (api.nic_set_multicast)(nic, 1);
+        l2_multicast(api, nic, true);
     } else {
         ptp.igmp.join(api, nic, config);
     }
@@ -83,7 +90,8 @@ pub fn stop(api: &TapeApi, nic: usize, others_joined: bool) {
     if !ptp.l2 {
         ptp.igmp.leave_report(api, nic, &ptp.config);
     }
-    if !others_joined {
+    let in_hardware = ptp.l2 && tape_rt::multicast_group(nic, [0x01, 0x1b, 0x19, 0, 0, 0], false);
+    if !in_hardware && !others_joined {
         (api.nic_set_multicast)(nic, 0);
     }
     unsafe { PTP = None };

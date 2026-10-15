@@ -359,6 +359,13 @@ fn incoming<'a>(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, ar
 
 /// Sends one PTP message; returns the time it left: the card's transmit stamp when it has one, else the clock just
 /// before the frame was handed over.
+/// Lets 01:1B:19:00:00:00 (PTP over Ethernet) through the card: its hash filter, else all multicast.
+fn l2_multicast(api: &TapeApi, nic: usize, on: bool) {
+    if !tape_rt::multicast_group(nic, ptp_tape::L2_MAC, on) {
+        (api.nic_set_multicast)(nic, u32::from(on));
+    }
+}
+
 fn send(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16, payload: &[u8]) -> i64 {
     let mut frame = [0u8; 160];
     let length = if l2 {
@@ -441,10 +448,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     };
     if options.l2 {
         println!("ptp {}: NIC {}, Ethernet (0x88F7 to 01:1B:19:00:00:00), domain {}. Escape stops.", if options.master { "master" } else { "slave" }, options.nic + 1, options.domain);
-        (api.nic_set_multicast)(options.nic, 1);
+        l2_multicast(api, options.nic, true);
     } else {
         if options.both {
-            (api.nic_set_multicast)(options.nic, 1);
+            l2_multicast(api, options.nic, true);
         }
         println!("ptp {}: NIC {} {}.{}.{}.{}, domain {}, group 224.0.1.129{}. Escape stops.", if options.master { "master" } else { "slave" }, options.nic + 1, config.ip.0[0], config.ip.0[1], config.ip.0[2], config.ip.0[3], options.domain, if options.both { " and Ethernet (0x88F7)" } else { "" });
     }
@@ -459,7 +466,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         slave(api, &options, &config, mac);
     }
     if options.l2 || options.both {
-        (api.nic_set_multicast)(options.nic, 0);
+        l2_multicast(api, options.nic, false);
     }
     if !options.l2 {
         igmp.leave(api, options.nic, &config);

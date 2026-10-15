@@ -3,6 +3,7 @@
 (another fos machine answers with its name), `nic map` (a guest with two NICs cabled through a QEMU hub hears itself)
 and `nic use`."""
 
+import re
 import socket
 import struct
 import sys
@@ -87,6 +88,39 @@ def main():
             mark = c.send("nic unpark 1")
             c.pump(0.5)
             check("nic 1: it is not parked." in c.text()[mark:], "and nic unpark an interface that is not parked", c.text()[mark:])
+
+            # The multicast hash filter: only a joined group gets through the card (RCTL.MPE stays off).
+            def received(guest):
+                mark = guest.send("nic")
+                guest.wait_for("fos> ", 10, mark)
+                found = re.search(r"frames: (\d+) received", guest.text()[mark:])
+                return int(found.group(1)) if found else -1
+
+            def burst(group):
+                frame = bytes.fromhex("0100" + "5e0102" + group) + bytes.fromhex("525400aabbcc") + b"\x88\xb5" + bytes(60)
+                for _ in range(40):
+                    inject(frame)
+                    time.sleep(0.005)
+                a.pump(1.0)
+
+            mark = a.send("nic mcast 1 join 01:00:5e:01:02:03")
+            a.wait_for("join 01:00:5e:01:02:03 done", 10, mark)
+            before = received(a)
+            burst("04")
+            idle = received(a) - before
+            before = received(a)
+            burst("03")
+            joined = received(a) - before
+            check(joined >= 40 and idle < 10, f"a joined multicast group arrives and another does not ({joined} against {idle} of 40)", a.text()[-600:])
+            mark = a.send("nic mcast 1 leave 01:00:5e:01:02:03")
+            a.wait_for("leave 01:00:5e:01:02:03 done", 10, mark)
+            before = received(a)
+            burst("03")
+            left = received(a) - before
+            check(left < 10, f"and it stops arriving after the leave ({left} of 40)", a.text()[-600:])
+            mark = a.send("nic mcast 1 join 02:00:00:00:00:01")
+            a.wait_for("no hash filter", 10, mark)
+            check(True, "a unicast address is refused")
         finally:
             for guest in (a, b, c):
                 guest.stop()

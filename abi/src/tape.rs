@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`.
-pub const TAPE_API_VERSION: u32 = 11;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`.
+pub const TAPE_API_VERSION: u32 = 12;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -228,6 +228,11 @@ pub struct TapeApi {
     /// events, so `nic_ts_rx` after each `nic_receive` gives its arrival time in the card's clock (0 = off again). 1 if done,
     /// 0 if the card cannot. Meant for latency measurement (nettest) and RTP arrival times (audio-net).
     pub nic_ts_all: extern "C" fn(usize, u32) -> u32,
+    /// `nic_multicast_join(index, mac, on)` (version 12): `mac` points at 6 bytes, a multicast address. Lets frames for that one
+    /// group through the card's hash filter (on) or stops that (off; joins are counted), without `nic_set_multicast`'s "every
+    /// multicast frame". 1 if done, 0 on a card without the filter (then use `nic_set_multicast`). Groups share filter bits,
+    /// so a tape still checks the address. The kernel drops every group when a tape ends.
+    pub nic_multicast_join: extern "C" fn(usize, *const u8, u32) -> u32,
 }
 
 /// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.
