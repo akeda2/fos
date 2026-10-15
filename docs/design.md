@@ -940,7 +940,10 @@ arithmetic and falls back to `micros()` when the card cannot stamp; a tape that 
 stamping. Changing SRRCTL by toggling RXDCTL.QUEUE_ENABLE kills receive: write it with RCTL.EN cleared. nettest uses it at
 its three sink sites (`stamps=software` turns it off for comparison): on a direct 50 Mbit/s link the polling receiver's
 jitter went from 177 us to 15 us. audio-net uses it for its PTP arrival statistics when PTP is on. Only an I350 has it;
-QEMU cannot check it.
+QEMU cannot check it. Frames already in the ring when stamping is switched on carry no stamp (the card adds it on arrival;
+the first few frames of `nic ts N all`, among them the 0x88b6 term-net frame that carried the command, show stamp 0). Every
+frame received afterwards is stamped, whatever its ethertype or destination (checked on skylake2's I350: broadcast, unicast,
+0x88b5, 0x88b6 and 0x8899, 39 of 42 stamped, the three missing ones the pre-existing frames).
 
 **`ptp` card-clock steering (`steer`).** A slave with hardware stamps and clock steering (ABI 10) can discipline the NIC's own
 clock instead of only measuring: the stamps then are the card's time, unwrapped past the I350's 40-bit count (`unwrap_card`),

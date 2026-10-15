@@ -3357,7 +3357,7 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
             unsafe { QUEUE_ALL = true };
             let deadline = apic::ticks() + 5 * apic::TICK_HZ;
             crate::println!("nic {index}: stamping every received frame for 5 s.");
-            let (mut frames, mut stamped, mut shown, mut previous) = (0u32, 0u32, 0, 0u64);
+            let (mut frames, mut stamped, mut shown, mut missing, mut previous) = (0u32, 0u32, 0, 0u32, 0u64);
             while apic::ticks() < deadline && !break_requested() {
                 poll();
                 let mut buffer = [0u8; 1600];
@@ -3371,10 +3371,11 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
                     if stamp != 0 {
                         stamped += 1;
                     }
-                    if shown < 8 {
+                    if shown < 8 || (stamp == 0 && missing < 40) {
                         shown += 1;
+                        missing += u32::from(stamp == 0);
                         let kind = u16::from_be_bytes([buffer[12], buffer[13]]);
-                        crate::println!("{length} bytes, type {kind:#06x}, stamp {stamp}, {} ns after the previous.", stamp.wrapping_sub(previous) & 0xff_ffff_ffff);
+                        crate::println!("{length} B to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type {kind:#06x} stamp {stamp}, +{} ns", buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], stamp.wrapping_sub(previous) & 0xff_ffff_ffff);
                     }
                     if stamp != 0 {
                         previous = stamp;
