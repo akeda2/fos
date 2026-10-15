@@ -125,6 +125,34 @@ const REG_RDBAH: usize = 0x2804;
 /// Statistics registers, clear on read: missed packets (the receive ring was full) and receive no buffers.
 const REG_MPC: usize = 0x4010;
 const REG_RNBC: usize = 0x40a0;
+// IEEE 1588 hardware timestamping (82580 family: the I350). SYSTIM is a free-running 40-bit nanosecond
+// counter (SYSTIMH carries 8 bits, so it wraps about every 18 minutes); the card latches the SYSTIM value
+// of one received PTP event frame in RXSTMP and of one transmitted frame in TXSTMP, until software reads
+// the high word. Register map and sequence follow Linux's igb_ptp.c; only real hardware can check it.
+const REG_SYSTIML: usize = 0xb600;
+const REG_SYSTIMH: usize = 0xb604;
+const REG_SYSTIMR: usize = 0xb6f8;
+const REG_TSAUXC: usize = 0xb640;
+const REG_TSYNCTXCTL: usize = 0xb614;
+const REG_TXSTMPL: usize = 0xb618;
+const REG_TXSTMPH: usize = 0xb61c;
+const REG_TSYNCRXCTL: usize = 0xb620;
+const REG_RXSTMPL: usize = 0xb624;
+const REG_RXSTMPH: usize = 0xb628;
+const REG_TSYNCRXCFG: usize = 0x5f50;
+const REG_ETQF3: usize = 0x5cbc;
+const REG_FTQF3: usize = 0x59ec;
+const TSYNC_VALID: u32 = 1;
+const TSYNC_ENABLE: u32 = 1 << 4;
+/// TSYNCRXCTL type 0x0a (bits 3:1 = 5): the PTP v2 event messages, over layer 2 or UDP.
+const RXCTL_TYPE_EVENT_V2: u32 = 0x0a;
+/// ETQF: filter enable (26) and "timestamp this ethertype" (30), ethertype in 15:0 (0x88f7 = PTP over Ethernet).
+const ETQF_PTP_L2: u32 = (1 << 26) | (1 << 30) | 0x88f7;
+/// FTQF: every field masked, so the UDP (layer 4) filter never matches and cannot timestamp anything.
+const FTQF_MASK_ALL: u32 = 0xf000_0000;
+/// Advanced transmit data descriptor: type data (DTYP 3), end of packet, insert FCS, report status,
+/// descriptor extension, and MAC_TSTAMP to have the card timestamp this frame.
+const ADV_TX_DATA_TS: u32 = 0x0030_0000 | (1 << 24) | (1 << 25) | (1 << 27) | (1 << 29) | 0x0008_0000;
 const REG_RDLEN: usize = 0x2808;
 #[allow(dead_code)]
 const REG_RDH: usize = 0x2810;
@@ -528,6 +556,103 @@ impl E1000 {
     pub fn set_multicast(&mut self, on: bool) {
         let control = read(self.registers, REG_RCTL);
         write(self.registers, REG_RCTL, if on { control | (1 << 4) } else { control & !(1 << 4) });
+    }
+
+    /// Whether the card has IEEE 1588 timestamp registers this driver knows (the I350 only).
+    pub fn ts_supported(&self) -> bool {
+        self.variant == Variant::I350
+    }
+
+    /// Starts the timestamp clock and arms receive stamping of PTP-over-Ethernet event frames
+    /// (Sync, Delay_Req, ...) and transmit stamping. Returns false on a card without it.
+    pub fn ts_enable(&mut self) -> bool {
+        if !self.ts_supported() {
+            return false;
+        }
+        write(self.registers, REG_TSAUXC, 0); // bit 31 clear: SYSTIM runs
+        write(self.registers, REG_TSYNCTXCTL, TSYNC_ENABLE);
+        write(self.registers, REG_TSYNCRXCTL, TSYNC_ENABLE | RXCTL_TYPE_EVENT_V2);
+        write(self.registers, REG_TSYNCRXCFG, 0);
+        write(self.registers, REG_ETQF3, ETQF_PTP_L2);
+        write(self.registers, REG_FTQF3, FTQF_MASK_ALL);
+        // Reading the high words releases any stamp left latched.
+        let _ = read(self.registers, REG_TXSTMPH);
+        let _ = read(self.registers, REG_RXSTMPH);
+        true
+    }
+
+    /// The card's clock in nanoseconds. The value latches on the lowest register, SYSTIMR here.
+    pub fn systim(&self) -> u64 {
+        let _ = read(self.registers, REG_SYSTIMR);
+        let low = u64::from(read(self.registers, REG_SYSTIML));
+        low | u64::from(read(self.registers, REG_SYSTIMH)) << 32
+    }
+
+    /// TSYNCRXCTL, for diagnostics: bit 0 is "a stamp is latched".
+    pub fn ts_rx_control(&self) -> u32 {
+        read(self.registers, REG_TSYNCRXCTL)
+    }
+
+    /// The SYSTIM stamp of the last PTP event frame received, if one is latched (and releases it).
+    /// Only one frame is stamped at a time, so poll often; the stamp belongs to the newest PTP frame.
+    pub fn ts_rx_stamp(&mut self) -> Option<u64> {
+        if read(self.registers, REG_TSYNCRXCTL) & TSYNC_VALID == 0 {
+            return None;
+        }
+        let low = u64::from(read(self.registers, REG_RXSTMPL));
+        Some(low | u64::from(read(self.registers, REG_RXSTMPH)) << 32)
+    }
+
+    /// Sends `frame` with an advanced descriptor that asks for a transmit stamp, and returns it
+    /// (None: the frame did not go out, or no stamp came within a bounded wait). One at a time.
+    pub fn send_stamped(&mut self, frame: &[u8]) -> Option<u64> {
+        if !self.ts_supported() || frame.len() > MAX_FRAME || !self.link_up() {
+            return None;
+        }
+        let _ = read(self.registers, REG_TXSTMPH);
+        let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
+        let mut waited = 0u32;
+        while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
+            waited += 1;
+            if waited > 2_000_000 {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+        let buffer = (self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
+        let length = frame.len().max(60);
+        unsafe {
+            core::ptr::write_bytes(buffer, 0, length);
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), buffer, frame.len());
+            let words = descriptor as *mut u32;
+            write_volatile(words.add(2), ADV_TX_DATA_TS | length as u32);
+            write_volatile(words.add(3), (length as u32) << 14); // PAYLEN; DD (status) clear
+        }
+        self.tx_next = (self.tx_next + 1) % TX_COUNT;
+        write(self.registers, self.r.tdt, self.tx_next as u32);
+        self.frames_sent += 1;
+        // Wait for the descriptor and the stamp; a few hundred microseconds at most on a live link.
+        let mut stamp = None;
+        for _ in 0..2_000_000u32 {
+            if read(self.registers, REG_TSYNCTXCTL) & TSYNC_VALID != 0 {
+                let low = u64::from(read(self.registers, REG_TXSTMPL));
+                stamp = Some(low | u64::from(read(self.registers, REG_TXSTMPH)) << 32);
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        // Leave the slot the way the legacy send path expects it: done, nothing else set.
+        let mut waited = 0u32;
+        while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 && waited < 2_000_000 {
+            waited += 1;
+            core::hint::spin_loop();
+        }
+        unsafe {
+            let words = descriptor as *mut u32;
+            write_volatile(words.add(2), 0);
+            write_volatile(words.add(3), u32::from(DESCRIPTOR_DONE));
+        }
+        stamp
     }
 
     /// `nic list`: what the card itself counted lost for want of receive buffers. These are the

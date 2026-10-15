@@ -84,6 +84,14 @@ impl Nic {
         }
     }
 
+    /// The e1000-family driver when this is one (for the IEEE 1588 timestamp calls, `nic ts`).
+    pub fn as_e1000(&mut self) -> Option<&mut crate::e1000::E1000> {
+        match self {
+            Nic::E1000(nic) => Some(nic),
+            _ => None,
+        }
+    }
+
     pub fn set_promiscuous(&mut self, on: bool) {
         match self {
             Nic::E1000(nic) => nic.set_promiscuous(on),

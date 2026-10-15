@@ -1339,6 +1339,10 @@ fn execute(command: &str) {
                 Err(why) => crate::println!("nic {index}: {why}."),
             }
         }
+        "nic" if matches!(words.clone().next(), Some("ts")) => {
+            words.next();
+            nic_timestamp_test(words.next(), words.next());
+        }
         "nic" if matches!(words.clone().next(), Some("peers")) => print_peers(),
         "nic" if matches!(words.clone().next(), Some("map")) => nic_map(),
         "nic" if matches!(words.clone().next(), Some("send")) => nic_send_test(),
@@ -3081,6 +3085,70 @@ fn nic_send_test() {
 }
 
 /// `nic recv`: waits up to three seconds for a frame that is not the terminal's, then dumps it.
+/// `nic ts N [send|listen]`: checks the card's IEEE 1588 hardware timestamps (I350). Plain: is SYSTIM running at
+/// 1 ns a tick? `send`: transmit a PTP Sync frame and print its stamp against SYSTIM just before and after.
+/// `listen`: for 10 s print the stamp of each PTP frame that arrives against SYSTIM when it was noticed.
+fn nic_timestamp_test(number: Option<&str>, action: Option<&str>) {
+    let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
+        crate::println!("nic ts N [send|listen]: IEEE 1588 hardware timestamps of interface N (I350).");
+        return;
+    };
+    let Some(nic) = nic_at(index - 1) else { return };
+    let mac = nic.mac();
+    let Some(card) = nic.as_e1000().filter(|card| card.ts_supported()) else {
+        crate::println!("nic {index}: no hardware timestamps known for this interface (the I350 has them).");
+        return;
+    };
+    card.ts_enable();
+    match action {
+        None => {
+            let (before, start) = (card.systim(), apic::ticks());
+            while apic::ticks() < start + apic::TICK_HZ / 10 {
+                core::hint::spin_loop();
+            }
+            let (after, end) = (card.systim(), apic::ticks());
+            let ns = after.wrapping_sub(before) & 0xff_ffff_ffff;
+            crate::println!("nic {index}: SYSTIM {after} ns; advanced {ns} ns in {} ticks of {} Hz (1 ns a tick: {} expected).", end - start, apic::TICK_HZ, (end - start) * 1_000_000_000 / apic::TICK_HZ);
+        }
+        Some("send") => {
+            let mut frame = [0u8; 60];
+            frame[..6].copy_from_slice(&[0xff; 6]); // broadcast: the card filters multicast
+            frame[6..12].copy_from_slice(&mac);
+            frame[12..14].copy_from_slice(&[0x88, 0xf7]);
+            frame[14] = 0x00; // messageType 0: Sync, an event message
+            frame[15] = 0x02; // versionPTP 2
+            frame[17] = 44; // messageLength
+            let before = card.systim();
+            let stamp = card.send_stamped(&frame);
+            let after = card.systim();
+            match stamp {
+                Some(stamp) => crate::println!("nic {index}: Sync sent; TX stamp {stamp}, SYSTIM before {before}, after {after} (stamp - before = {} ns).", stamp as i64 - before as i64),
+                None => crate::println!("nic {index}: no transmit stamp (link down, or the card gave none)."),
+            }
+        }
+        Some("listen") => {
+            blocking(true);
+            let deadline = apic::ticks() + 10 * apic::TICK_HZ;
+            crate::println!("nic {index}: listening 10 s for PTP-over-Ethernet event frames (ethertype 0x88f7).");
+            while apic::ticks() < deadline && !break_requested() {
+                poll();
+                if let Some(card) = nic_at(index - 1).and_then(|nic| nic.as_e1000()) {
+                    if let Some(stamp) = card.ts_rx_stamp() {
+                        let now = card.systim();
+                        crate::println!("RX stamp {stamp}; SYSTIM now {now} (noticed {} ns later).", now as i64 - stamp as i64);
+                    }
+                }
+                crate::cpu::sleep();
+            }
+            blocking(false);
+            if let Some(card) = nic_at(index - 1).and_then(|nic| nic.as_e1000()) {
+                crate::println!("{} frames received so far; TSYNCRXCTL {:#x}.", card.frames_received, card.ts_rx_control());
+            }
+        }
+        Some(_) => crate::println!("nic ts N [send|listen]"),
+    }
+}
+
 fn nic_recv_test() {
     // Blocking mode keeps typed commands that arrive meanwhile from running nested inside this wait
     // (each nesting adds big stack frames); Escape ends the wait instead.
