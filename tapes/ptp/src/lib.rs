@@ -360,6 +360,17 @@ impl Slave {
         self.master.as_ref().map(|master| (master.source, master.clock))
     }
 
+    /// The caller moved its clock by `delta` nanoseconds (the card's, steered): times held from before the move shift with it,
+    /// and the offsets measured from here on are the true ones, with nothing to subtract.
+    pub fn clock_moved(&mut self, delta: i64) {
+        self.last_ms = self.last_ms.map(|ms| ms + delta);
+        if let Some(pending) = &mut self.pending {
+            pending.t2 += delta;
+        }
+        self.request_sent = self.request_sent.map(|(sequence, t3)| (sequence, t3 + delta));
+        self.base = Some(0);
+    }
+
     pub fn path_delay(&self) -> Option<i64> {
         self.delay
     }
@@ -786,6 +797,28 @@ mod tests {
             slave.handle(&out[..n], t3 + up);
         }
         sample
+    }
+
+    #[test]
+    fn clock_moved_gives_true_offsets_straight_away() {
+        let mut slave = slave();
+        let mut now = 0;
+        let mut last = None;
+        for sequence in 0..6 {
+            now += 125_000_000;
+            last = exchange(&mut slave, now, 250_000, 10_000, 10_000, sequence).or(last);
+        }
+        let sample = last.unwrap();
+        assert_eq!(sample.offset, -250_000);
+        // The caller steps its clock forward by 250 us: later exchanges see no difference.
+        slave.clock_moved(250_000);
+        let mut sample = None;
+        for sequence in 6..12 {
+            now += 125_000_000;
+            sample = exchange(&mut slave, now + 250_000, 0, 10_000, 10_000, sequence).or(sample);
+        }
+        let sample = sample.unwrap();
+        assert_eq!((sample.offset, sample.residual), (0, 0));
     }
 
     #[test]

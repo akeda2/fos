@@ -69,12 +69,14 @@ struct Options {
     settime: bool,
     zone_minutes: i32,
     software: bool,
+    steer: bool,
+    quiet: bool,
 }
 
 const SETTIME_GIVE_UP_SECONDS: u32 = 60;
 
 fn parse(arguments: &'static str) -> Result<Options, &'static str> {
-    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: true, verbose: false, l2: false, both: false, ntp: "", dns: "", settime: false, zone_minutes: 0, software: false };
+    let mut options = Options { master: false, nic: tape_rt::active_nic(), ip: "dhcp", gateway: "", domain: 0, seconds: 0, delay_seconds: 1, sync_ms: 125, priority1: 128, late_us: 300, idle: true, verbose: false, l2: false, both: false, ntp: "", dns: "", settime: false, zone_minutes: 0, software: false, steer: false, quiet: false };
     let mut idle_set = None;
     for word in arguments.split_whitespace() {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -87,6 +89,8 @@ fn parse(arguments: &'static str) -> Result<Options, &'static str> {
             "both" => options.both = true,
             "verbose" => options.verbose = true,
             "software" => options.software = true,
+            "steer" => options.steer = true,
+            "quiet" => options.quiet = true,
             "settime" => options.settime = true,
             "ntp" => options.ntp = if value.is_empty() { "dhcp" } else { value },
             "dns" => options.dns = value,
@@ -116,6 +120,11 @@ static EPOCH_NS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::
 /// The interface whose hardware timestamps are in use, when it has them (set once at start).
 static HW_NIC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
 
+/// `steer`: the tape's clock is the card's own, kept in step with the master (see `Steer`).
+static STEER_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The card clock, unwrapped: the last value handed out (nanoseconds, congruent to the card's 40-bit count).
+static CARD_TIME: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
 /// A card's stamp is a count of its own clock (40 bits are enough to measure back from now).
 const STAMP_MASK: u64 = (1 << 40) - 1;
 
@@ -123,6 +132,9 @@ const STAMP_MASK: u64 = (1 << 40) - 1;
 /// moment on our timeline, to about a microsecond) and subtract how long ago the stamp was. The polling loop's
 /// delay between the frame's arrival and this call drops out, which is the point of the card's stamp.
 fn hw_to_local(stamp: u64) -> i64 {
+    if STEER_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return unwrap_card(stamp);
+    }
     let nic = HW_NIC.load(core::sync::atomic::Ordering::Relaxed);
     let before = now_ns();
     let card = tape_rt::nic_ts_clock(nic);
@@ -130,13 +142,90 @@ fn hw_to_local(stamp: u64) -> i64 {
     (before + after) / 2 - (card.wrapping_sub(stamp) & STAMP_MASK) as i64
 }
 
+/// A stamp or clock reading as time that does not wrap: the value nearest the last one that matches in the low 40 bits
+/// (the card's own width on an I350; the cards that count further agree on those bits too). Needs a reading at least every
+/// few minutes, which a running slave gives it many times a second.
+fn unwrap_card(raw: u64) -> i64 {
+    let last = CARD_TIME.load(core::sync::atomic::Ordering::Relaxed);
+    let delta = ((raw.wrapping_sub(last as u64) << 24) as i64) >> 24;
+    let value = last + delta;
+    CARD_TIME.store(value, core::sync::atomic::Ordering::Relaxed);
+    value
+}
+
+/// Disciplines the card's clock the way linuxptp's PI servo does: the first two offsets give the rate error, the clock is
+/// then stepped once (never again), and from there ppb = kp*offset + drift, drift += ki*offset on every sample. The offset
+/// is the card's clock minus the master's, so the correction is its negative.
+struct Steer {
+    nic: usize,
+    kp: f64,
+    ki: f64,
+    drift: f64,
+    first: Option<(i64, i64)>,
+    locked: bool,
+}
+
+/// kp and ki per sample for linuxptp's hardware-stamp scales (0.7 * T^-0.3 and 0.3 * T^0.4 for sync interval T seconds),
+/// for the nearest of the usual intervals.
+const STEER_GAINS: [(u32, f64, f64); 7] = [(30, 2.0, 0.074), (62, 1.61, 0.099), (125, 1.30, 0.130), (250, 1.06, 0.172), (500, 0.86, 0.227), (1000, 0.7, 0.3), (2000, 0.569, 0.396)];
+const STEER_MAX_PPB: f64 = 500_000.0;
+
+impl Steer {
+    fn new(nic: usize, sync_ms: u32) -> Steer {
+        tape_rt::nic_ts_adjust(nic, 0);
+        let (_, kp, ki) = STEER_GAINS.iter().copied().min_by_key(|&(ms, _, _)| ms.abs_diff(sync_ms)).unwrap();
+        Steer { nic, kp, ki, drift: 0.0, first: None, locked: false }
+    }
+
+    /// Feeds one measurement (`local` is when it was taken on the card's timeline). Returns the step applied, if any.
+    fn update(&mut self, local: i64, offset: i64) -> Option<i64> {
+        if !self.locked {
+            let Some((first_local, first_offset)) = self.first else {
+                self.first = Some((local, offset));
+                return None;
+            };
+            let span = (local - first_local) as f64 / 1e9;
+            if span < 0.016 / self.ki {
+                return None;
+            }
+            self.drift = (1e9 * (offset - first_offset) as f64 / (local - first_local) as f64).clamp(-STEER_MAX_PPB, STEER_MAX_PPB);
+            self.locked = true;
+            tape_rt::nic_ts_adjust(self.nic, (-self.drift) as i32);
+            if offset.abs() > 20_000 && tape_rt::nic_ts_step(self.nic, -offset) {
+                CARD_TIME.fetch_sub(offset, core::sync::atomic::Ordering::Relaxed);
+                return Some(-offset);
+            }
+            return None;
+        }
+        let integral = self.ki * offset as f64;
+        let ppb = self.kp * offset as f64 + self.drift + integral;
+        if ppb.abs() < STEER_MAX_PPB {
+            self.drift += integral;
+        }
+        tape_rt::nic_ts_adjust(self.nic, (-ppb.clamp(-STEER_MAX_PPB, STEER_MAX_PPB)) as i32);
+        None
+    }
+}
+
 /// Arms the card's timestamps unless `software` was asked for; says which kind this run measures with.
 fn start_hardware_stamps(options: &Options) {
     if !options.software && tape_rt::nic_ts_enable(options.nic) {
         HW_NIC.store(options.nic, core::sync::atomic::Ordering::Relaxed);
+        if options.steer && !options.master {
+            if tape_rt::nic_ts_adjust(options.nic, 0) {
+                CARD_TIME.store(now_ns(), core::sync::atomic::Ordering::Relaxed);
+                STEER_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+                println!("ptp: steering NIC {}'s clock: it is stepped to the master, then kept in step (timestamps are its own).", options.nic + 1);
+            } else {
+                println!("ptp: steer: this NIC or kernel cannot steer its clock; measuring only.");
+            }
+        }
         println!("ptp: hardware timestamps on NIC {} (the card stamps PTP event frames).", options.nic + 1);
     } else {
         println!("ptp: software timestamps (the polling loop reads the clock){}.", if options.software { ", as asked" } else { ": this NIC has no hardware timestamps" });
+        if options.steer {
+            println!("ptp: steer needs hardware timestamps; measuring only.");
+        }
     }
 }
 
@@ -390,10 +479,14 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     let mut next_report = start + 1_000_000_000;
     let mut masters_seen = 0;
     let mut steps_seen = 0;
+    let mut steer = None;
     let mut silent = 0u32;
     let mut last_empty = now_ns();
     let (mut time_set, mut refusal_shown) = (false, false);
     start_hardware_stamps(options);
+    if STEER_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        steer = Some(Steer::new(options.nic, options.sync_ms));
+    }
     println!("ptp: waiting for an Announce...");
     // A start-file `ptp settime` must not hold the shell for ever when the master is down.
     let limit = if options.seconds == 0 && options.settime { SETTIME_GIVE_UP_SECONDS } else { options.seconds };
@@ -422,13 +515,24 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
             }
             if let Some((_, payload)) = incoming(l2(), api, options.nic, config, &mut arp, &frame[..length]) {
                 let is_sync = payload.first().is_some_and(|byte| byte & 0x0f == ptp_tape::SYNC);
+                // With a steered card t2 is on the card's timeline, which the Announce timeout (software time) must not mix with.
                 let sample = if late && is_sync {
                     slave.discard_sync(payload);
                     None
                 } else {
-                    slave.handle(payload, t2)
+                    slave.handle(payload, if steer.is_some() && !is_sync { now } else { t2 })
                 };
                 if let Some(sample) = sample {
+                    if let Some(servo) = steer.as_mut() {
+                        if let Some(delta) = servo.update(t2, sample.offset) {
+                            slave.clock_moved(delta);
+                            rate.reset();
+                            second = Window::default();
+                            total = Window::default();
+                            println!("ptp: stepped the card clock by {} us.", Us(delta));
+                            continue;
+                        }
+                    }
                     second.add(sample.residual);
                     total.add(sample.residual);
                     delays.add(sample.delay);
@@ -473,7 +577,9 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
                 jitter_seconds += 1;
             }
             last_rate = rate.tenths_ppm().or(last_rate);
-            if second.count > 0 {
+            if second.count > 0 && options.quiet {
+                silent = 0;
+            } else if second.count > 0 {
                 match rate.tenths_ppm() {
                     Some(tenths) => println!("{:>4}s off {:>7} sd {:>6} [{:>7},{:>7}] dly {:>6} {:+}.{} ppm n{}", seconds, Us(second.mean()), Us(second.deviation()), Us(second.min), Us(second.max), Us(slave.path_delay().unwrap_or(0)), tenths / 10, (tenths % 10).abs(), second.count),
                     None => println!("{:>4}s off {:>7} sd {:>6} [{:>7},{:>7}] dly {:>6} n{}", seconds, Us(second.mean()), Us(second.deviation()), Us(second.min), Us(second.max), Us(slave.path_delay().unwrap_or(0)), second.count),
@@ -636,7 +742,7 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
   tape run ptp [slave|master] [nic=N] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D]
                [domain=N] [l2|both] [ntp=dhcp|A.B.C.D|NAME] [dns=A.B.C.D]
                [settime] [tz=+H[:MM]] [secs=N] [delay=SECONDS] [sync=MS] [prio1=N] [late=US]
-               [spin] [verbose] [software]
+               [spin] [verbose] [software] [steer] [quiet]
 
   slave     measure offset, delay and rate to a master (the default)
   master    announce a clock; ntp= takes real time from an NTP server first
@@ -649,6 +755,9 @@ tape_rt::tape_help!(br#"ptp: PTPv2 (IEEE 1588) clock sync, master or slave, UDP 
             after 60 s without secs=)
   tz=+2     hours east of UTC for settime (the RTC holds local time)
   software  do not use the NIC's hardware timestamps (I350)
+  quiet     slave: no per-second lines (a console line delays the poll loop)
+  steer     slave: step and steer the NIC's own clock to the master (hardware
+            timestamps and clock steering needed)
   spin      poll flat out (slave default): smallest timestamp error, hot CPU
   idle      sleep between polls (master default); a slave loses accuracy
   secs=N    stop after N seconds; Escape stops at any time
