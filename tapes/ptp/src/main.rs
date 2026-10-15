@@ -120,6 +120,8 @@ static EPOCH_NS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::
 /// The interface whose hardware timestamps are in use, when it has them (set once at start).
 static HW_NIC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
 
+const SETTLE_NS: i64 = 60_000_000_000;
+
 /// `steer`: the tape's clock is the card's own, kept in step with the master (see `Steer`).
 static STEER_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The card clock, unwrapped: the last value handed out (nanoseconds, congruent to the card's 40-bit count).
@@ -457,6 +459,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     let mut next_report = start + 1_000_000_000;
     let mut masters_seen = 0;
     let mut steps_seen = 0;
+    let mut settled = Window::default();
     let mut steer = None;
     let mut silent = 0u32;
     let mut last_empty = now_ns();
@@ -513,6 +516,9 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
                     }
                     second.add(sample.residual);
                     total.add(sample.residual);
+                    if now - start >= SETTLE_NS {
+                        settled.add(sample.residual);
+                    }
                     delays.add(sample.delay);
                     rate.add(t2, sample.offset);
                     if options.settime && !time_set && total.count >= 8 {
@@ -580,6 +586,10 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
     println!("ptp: {} samples; announce {} sync {} follow-up {} delay-resp {} sync lost {} late {} steps {}", total.count, c.announces, c.syncs, c.follow_ups, c.delay_resps, c.sync_lost, c.late, c.steps);
     if total.count > 0 {
         println!("ptp: offset mean {} us, sd {} us, min {} us, max {} us; path delay {} us (min {}, max {})", Us(total.mean()), Us(total.deviation()), Us(total.min), Us(total.max), Us(delays.mean()), Us(delays.min), Us(delays.max));
+        // The servo needs a while to learn the clock's rate, and the first seconds show it (up to ~130 us after a step).
+        if steer.is_some() && settled.count > 1 {
+            println!("ptp: after the first {} s of settling: mean {} us, sd {} us, min {} us, max {} us", SETTLE_NS / 1_000_000_000, Us(settled.mean()), Us(settled.deviation()), Us(settled.min), Us(settled.max));
+        }
         // The overall spread includes any rate difference between the clocks; the per-second spread is the jitter.
         let jitter = if jitter_seconds > 0 { jitter_sum / jitter_seconds } else { 0 };
         match last_rate {
