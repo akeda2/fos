@@ -1587,7 +1587,7 @@ tape_rt::tape_help!(br#"audio-net: audio over the network (raw Ethernet, RTP or 
   tape run audio-net                the settings panel
   tape run audio-net send [proto=raw|rtp|avtp] [nic=N|MAC] [to=MAC|IP|NAME]
                     [rate=48000] [ch=3-4] [bits=24] [src=capture|tone=HZ]
-                    [secs=N] [ip=A.B.C.D/N|dhcp] [ptp=off|slave|master]
+                    [secs=N] [ip=A.B.C.D/N|dhcp] [ptp=auto|l2|off]
   tape run audio-net recv [proto=..] [nic=N|MAC] [from=MAC] [port=5004]
                     [ch=1-2] [target=MS] [group=239.1.2.3] [codec=pcm|opus]
   tape run audio-net duplex ...     send and receive together

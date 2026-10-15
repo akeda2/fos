@@ -217,6 +217,9 @@ def main():
 
             back = say("quit", "fos> ")
             check("fos> " in back, "`quit` returns to the shell", back)
+            started = say("run nettest nic=2", "nettest> ")
+            check("Serving on NIC 2" in started, "'nettest nic=2' is the far end on NIC 2", started)
+            say("quit", "fos> ")
             health = say("uptime", "fos> ")
             check("ticks at 100 Hz" in health, "the shell is healthy after the tape", health)
             a.send(term_frame(DATA, b"shutdown\n"))
