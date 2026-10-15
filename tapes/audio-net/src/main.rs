@@ -1088,7 +1088,8 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         let length = (api.nic_receive)(options.nic, frame.as_mut_ptr(), frame.len());
         let spent_receive = tape_rt::micros() - t_receive;
         slow_receive = slow_receive.max(if length != 0 { spent_receive } else { 0 });
-        let received_at = t_receive + spent_receive;
+        // The card's own stamp when it has one: the polling loop's delay stays out of the PTP arrival statistics.
+        let received_at = if length != 0 && transport.ptp { tape_rt::rx_arrival_us(options.nic) } else { t_receive + spent_receive };
         if length == 0 {
             if locked.is_some() && tape_rt::micros() > last_packet + 2_000_000 {
                 println!("\nThe sender went quiet; waiting for a stream again.");

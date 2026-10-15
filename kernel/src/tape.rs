@@ -499,6 +499,9 @@ extern "C" fn api_nic_ts_adjust(index: usize, ppb: i32) -> u32 {
 extern "C" fn api_nic_ts_step(index: usize, delta: i64) -> u32 {
     u32::from(term::nic_ts_step(index, delta))
 }
+extern "C" fn api_nic_ts_all(index: usize, on: u32) -> u32 {
+    u32::from(term::nic_ts_all(index, on != 0))
+}
 extern "C" fn api_nic_ts_rx(index: usize) -> u64 {
     term::last_rx_stamp(index)
 }
@@ -696,6 +699,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_send_stamped: api_nic_send_stamped,
         nic_ts_adjust: api_nic_ts_adjust,
         nic_ts_step: api_nic_ts_step,
+        nic_ts_all: api_nic_ts_all,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
@@ -719,6 +723,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
     crate::uart::close_all();
     crate::audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an audio stream running
     term::set_tape_mode(false);
+    term::nic_ts_all_off(); // per-frame stamps change the receive buffer format; a tape that ends leaves PTP-only stamping
     memory::free(stack, STACK_BYTES / memory::FRAME);
     crate::println!("Tape returned; back at the fos shell.");
     Ok(())

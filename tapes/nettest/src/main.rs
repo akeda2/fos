@@ -444,7 +444,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     }
                     continue;
                 }
-                let _ = session.sink.on_frame(&frame[..received], micros());
+                let _ = session.sink.on_frame(&frame[..received], tape_rt::rx_arrival_us(nic as usize));
             }
         }
         // The generator's NIC hears the wire too (ARP, discovery...): drain it
@@ -460,7 +460,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 }
                 // The reverse stream (bidirectional mode) ends here.
                 if session.bidir && parse_arp(&frame[..received]).is_none() {
-                    let _ = session.rsink.on_frame(&frame[..received], micros());
+                    let _ = session.rsink.on_frame(&frame[..received], tape_rt::rx_arrival_us(nic as usize));
                     continue;
                 }
                 // Routable mode: learn the next hop's MAC from its ARP reply, and
@@ -843,6 +843,11 @@ fn apply_setting(session: &mut Session<'_>, key: &[u8], value: &[u8]) -> bool {
             }
             None => false,
         };
+    }
+    if key == b"stamps" {
+        // stamps=software compares against the polling-loop clock instead of the card stamps
+        tape_rt::rx_software(value == b"software");
+        return value == b"software" || value == b"hardware";
     }
     if key == b"serve" || key == b"remote" || key == b"nic" {
         let Some(number) = parse_u32(value).filter(|&number| number >= 1) else { return false };
@@ -2661,7 +2666,7 @@ fn remote_pass(putc: Putc, session: &mut Session<'_>, frame: &mut [u8], max_fram
                     let _ = nic_send_at(rx, out.as_ptr() as usize, length as u32);
                 }
             } else if rx == tx_nic {
-                let _ = session.sink.on_frame(&frame[..received], micros());
+                let _ = session.sink.on_frame(&frame[..received], tape_rt::rx_arrival_us(rx as usize));
             }
         }
     }

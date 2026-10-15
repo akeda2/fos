@@ -134,6 +134,17 @@ const REG_SYSTIMH: usize = 0xb604;
 const REG_SYSTIMR: usize = 0xb6f8;
 const REG_TSAUXC: usize = 0xb640;
 const REG_TIMINCA: usize = 0xb608;
+/// SRRCTL: descriptor type 1 (advanced, one buffer) and "put the receive timestamp in front of the frame".
+const SRRCTL_DESCTYPE_ADV_ONEBUF: u32 = 0x0200_0000;
+const SRRCTL_TIMESTAMP: u32 = 0x4000_0000;
+/// TSYNCRXCTL type: stamp every received frame (82580 and later).
+const RXCTL_TYPE_ALL: u32 = 0x08;
+/// Advanced receive write-back status bits (the dword at offset 8): done, end of packet, "a timestamp precedes the frame".
+const ADV_DD: u32 = 1;
+const ADV_EOP: u32 = 2;
+const ADV_TSIP: u32 = 1 << 15;
+/// The timestamp header the card puts before a frame: 16 bytes, SYSTIML and SYSTIMH in the last eight.
+const TS_HEADER: usize = 16;
 const REG_TSYNCTXCTL: usize = 0xb614;
 const REG_TXSTMPL: usize = 0xb618;
 const REG_TXSTMPH: usize = 0xb61c;
@@ -141,6 +152,21 @@ const REG_TSYNCRXCTL: usize = 0xb620;
 const REG_RXSTMPL: usize = 0xb624;
 const REG_RXSTMPH: usize = 0xb628;
 const REG_TSYNCRXCFG: usize = 0x5f50;
+// The e1000e family with IEEE 1588 (82579, I217/I218/I219; Linux's e1000e ptp.c): the same SYSTIM, TXSTMP, RXSTMP and
+// TSYNC registers, but SYSTIM is a free-running 64-bit counter in fractions of a nanosecond (`ns = SYSTIM >> shift`),
+// TIMINCA must be programmed (nominal rate), and the clock cannot be written: a step is an offset kept here.
+const REG_FEXTNVM7: usize = 0xe4;
+const REG_RXMTRL: usize = 0xb634;
+const REG_RXUDP: usize = 0xb638;
+/// Per chip: (nominal TIMINCA, shift from SYSTIM units to ns, needs FEXTNVM7 bit 0 to run the clock).
+/// 82579: 96 MHz (INCPERIOD 3, INCVALUE 125 << 17). I219 of the Skylake PCH: 24 MHz (INCPERIOD 3, INCVALUE 125 << 14).
+fn pch_clock(device_id: u16) -> Option<(u32, u32, bool)> {
+    match device_id {
+        0x1502 | 0x1503 => Some((3 << 24 | 125 << 17, 19, false)),
+        0x15b7 | 0x156f => Some((3 << 24 | 125 << 14, 14, true)),
+        _ => None,
+    }
+}
 const REG_ETQF3: usize = 0x5cbc;
 const REG_FTQF3: usize = 0x59ec;
 const TSYNC_VALID: u32 = 1;
@@ -335,8 +361,14 @@ pub struct E1000 {
     pub frames_dropped_no_link: u64,
     /// Timestamps armed (`ts_enable`): `receive` then attaches the card's stamp to each PTP event frame.
     ts_on: bool,
+    /// Every received frame is stamped (`ts_stamp_all`), in a 16-byte header the card puts before it.
+    ts_all: bool,
     /// SYSTIM stamp of the frame `receive` returned last (0: none), taken by `take_stamp`.
     last_stamp: u64,
+    /// `pch_clock` for this card (e1000e family with timestamps), else None.
+    ts_clock: Option<(u32, u32, bool)>,
+    /// Nanoseconds added to the card's clock by `ts_step` on a card whose SYSTIM cannot be written.
+    ts_offset: u64,
 }
 
 #[derive(Debug)]
@@ -547,7 +579,8 @@ impl E1000 {
         if variant == Variant::I350 {
             // 2 KiB receive buffers (SRRCTL counts KiB), then enable both queues explicitly and
             // wait for the receive enable to latch before handing the card any buffers.
-            write(registers, r.srrctl, (BUFFER_SIZE / 1024) as u32);
+            // Advanced one-buffer descriptors: the only format that lets the card prepend a timestamp to a frame.
+            write(registers, r.srrctl, (BUFFER_SIZE / 1024) as u32 | SRRCTL_DESCTYPE_ADV_ONEBUF);
             write(registers, r.txdctl, TXDCTL_QUEUE_ENABLE);
             write(registers, r.rxdctl, TXDCTL_QUEUE_ENABLE);
             let mut waited = 0;
@@ -561,7 +594,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, last_stamp: 0 })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0 })
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -579,9 +612,17 @@ impl E1000 {
         write(self.registers, REG_RCTL, if on { control | (1 << 4) } else { control & !(1 << 4) });
     }
 
-    /// Whether the card has IEEE 1588 timestamp registers this driver knows (the I350 only).
+    /// Whether the card has IEEE 1588 timestamp registers this driver knows (the I350, the 82579 and the Skylake I219).
     pub fn ts_supported(&self) -> bool {
-        self.variant == Variant::I350
+        self.variant == Variant::I350 || self.ts_clock.is_some()
+    }
+
+    /// A raw SYSTIM or stamp value in nanoseconds on the clock tapes see.
+    fn ts_ns(&self, raw: u64) -> u64 {
+        match self.ts_clock {
+            Some((_, shift, _)) => (raw >> shift).wrapping_add(self.ts_offset),
+            None => raw,
+        }
     }
 
     /// Starts the timestamp clock and arms receive stamping of PTP-over-Ethernet event frames
@@ -589,6 +630,22 @@ impl E1000 {
     pub fn ts_enable(&mut self) -> bool {
         if !self.ts_supported() {
             return false;
+        }
+        if let Some((timinca, _, fextnvm7)) = self.ts_clock {
+            if fextnvm7 {
+                let value = read(self.registers, REG_FEXTNVM7);
+                write(self.registers, REG_FEXTNVM7, value | 1);
+            }
+            write(self.registers, REG_TIMINCA, timinca);
+            write(self.registers, REG_TSYNCTXCTL, TSYNC_ENABLE);
+            write(self.registers, REG_TSYNCRXCTL, TSYNC_ENABLE | RXCTL_TYPE_EVENT_V2);
+            // Which frames are stamped: Ethernet type 0x88f7 (PTP over layer 2) and UDP destination port 319.
+            write(self.registers, REG_RXMTRL, 0x88f7);
+            write(self.registers, REG_RXUDP, u32::from(319u16.swap_bytes()));
+            let _ = read(self.registers, REG_TXSTMPH);
+            let _ = read(self.registers, REG_RXSTMPH);
+            self.ts_on = true;
+            return true;
         }
         write(self.registers, REG_TSAUXC, 0); // bit 31 clear: SYSTIM runs
         write(self.registers, REG_TSYNCTXCTL, TSYNC_ENABLE);
@@ -603,7 +660,30 @@ impl E1000 {
         // Reading the high words releases any stamp left latched.
         let _ = read(self.registers, REG_TXSTMPH);
         let _ = read(self.registers, REG_RXSTMPH);
+        if self.ts_all {
+            self.ts_stamp_all(false);
+        }
         self.ts_on = true;
+        true
+    }
+
+    pub fn ts_all(&self) -> bool {
+        self.ts_all
+    }
+
+    /// Stamps every received frame, not just PTP events (the card's clock at the moment the frame arrived), or stops
+    /// doing so. Needs `ts_enable`. Receive is stopped for the moment the buffer format changes.
+    pub fn ts_stamp_all(&mut self, on: bool) -> bool {
+        if !self.ts_on || self.variant != Variant::I350 {
+            return false;
+        }
+        let control = read(self.registers, REG_RCTL);
+        write(self.registers, REG_RCTL, control & !RCTL_EN);
+        let base = (BUFFER_SIZE / 1024) as u32 | SRRCTL_DESCTYPE_ADV_ONEBUF;
+        write(self.registers, self.r.srrctl, if on { base | SRRCTL_TIMESTAMP } else { base });
+        write(self.registers, REG_TSYNCRXCTL, TSYNC_ENABLE | if on { RXCTL_TYPE_ALL } else { RXCTL_TYPE_EVENT_V2 });
+        write(self.registers, REG_RCTL, control);
+        self.ts_all = on;
         true
     }
 
@@ -614,15 +694,25 @@ impl E1000 {
 
     /// The card's clock in nanoseconds. The value latches on the lowest register, SYSTIMR here.
     pub fn systim(&self) -> u64 {
-        let _ = read(self.registers, REG_SYSTIMR);
+        if self.ts_clock.is_none() {
+            let _ = read(self.registers, REG_SYSTIMR);
+        }
         let low = u64::from(read(self.registers, REG_SYSTIML));
-        low | u64::from(read(self.registers, REG_SYSTIMH)) << 32
+        self.ts_ns(low | u64::from(read(self.registers, REG_SYSTIMH)) << 32)
     }
 
     /// Speeds the card's clock up (positive) or slows it (negative) by `ppb` parts per billion, through TIMINCA's
     /// fine adjustment (bit 31 = slower; the size is ppb * 2^26 / 1953125,
     /// as Linux igb computes it for the 82580 family). 0 restores the nominal rate. Returns the value written.
     pub fn ts_adjust(&mut self, ppb: i32) -> u32 {
+        if let Some((timinca, _, _)) = self.ts_clock {
+            // Here the increment itself is scaled: INCVALUE (the low 24 bits) * (1e9 + ppb) / 1e9.
+            let base = i64::from(timinca & 0x00ff_ffff);
+            let value = (base + base * i64::from(ppb) / 1_000_000_000) as u32 & 0x00ff_ffff;
+            let written = (timinca & !0x00ff_ffff) | value;
+            write(self.registers, REG_TIMINCA, written);
+            return written;
+        }
         let magnitude = (u64::from(ppb.unsigned_abs()) << 26) / 1_953_125;
         let value = (magnitude as u32 & 0x7fff_ffff) | if ppb < 0 { 0x8000_0000 } else { 0 };
         write(self.registers, REG_TIMINCA, value);
@@ -632,6 +722,10 @@ impl E1000 {
     /// Jumps the clock by `delta` nanoseconds: read, add, write back SYSTIML then SYSTIMH. The two reads and the write
     /// take about a microsecond, so a step is only that exact; ptp steps once and then steers with `ts_adjust`.
     pub fn ts_step(&mut self, delta: i64) {
+        if self.ts_clock.is_some() {
+            self.ts_offset = self.ts_offset.wrapping_add(delta as u64);
+            return;
+        }
         let target = self.systim().wrapping_add(delta as u64) & 0xff_ffff_ffff;
         write(self.registers, REG_SYSTIML, target as u32);
         write(self.registers, REG_SYSTIMH, (target >> 32) as u32);
@@ -649,7 +743,7 @@ impl E1000 {
             return None;
         }
         let low = u64::from(read(self.registers, REG_RXSTMPL));
-        Some(low | u64::from(read(self.registers, REG_RXSTMPH)) << 32)
+        Some(self.ts_ns(low | u64::from(read(self.registers, REG_RXSTMPH)) << 32))
     }
 
     /// Sends `frame` with an advanced descriptor that asks for a transmit stamp, and returns it
@@ -659,6 +753,38 @@ impl E1000 {
             return (false, 0);
         }
         let _ = read(self.registers, REG_TXSTMPH);
+        if self.ts_clock.is_some() {
+            // A data descriptor (DEXT, DTYP_D) with the timestamp bit in its upper dword, as Linux's e1000_tx_queue builds it.
+            let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
+            let mut waited = 0u32;
+            while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
+                waited += 1;
+                if waited > 2_000_000 {
+                    return (false, 0);
+                }
+                core::hint::spin_loop();
+            }
+            let buffer = (self.tx_buffers + (self.tx_next * BUFFER_SIZE) as u64) as *mut u8;
+            let length = frame.len().max(60);
+            unsafe {
+                core::ptr::write_bytes(buffer, 0, length);
+                core::ptr::copy_nonoverlapping(frame.as_ptr(), buffer, frame.len());
+                write_volatile(core::ptr::addr_of_mut!((*descriptor).length), length as u16);
+                write_volatile(core::ptr::addr_of_mut!((*descriptor).word), (u16::from(TX_EOP_IFCS_RS | 0x20) << 8) | 0x10);
+                write_volatile(core::ptr::addr_of_mut!((*descriptor).status), 0x10);
+            }
+            self.tx_next = (self.tx_next + 1) % TX_COUNT;
+            write(self.registers, self.r.tdt, self.tx_next as u32);
+            self.frames_sent += 1;
+            for _ in 0..2_000_000u32 {
+                if read(self.registers, REG_TSYNCTXCTL) & TSYNC_VALID != 0 {
+                    let low = u64::from(read(self.registers, REG_TXSTMPL));
+                    return (true, self.ts_ns(low | u64::from(read(self.registers, REG_TXSTMPH)) << 32));
+                }
+                core::hint::spin_loop();
+            }
+            return (true, 0);
+        }
         let descriptor = unsafe { (self.tx_ring as *mut Descriptor).add(self.tx_next) };
         let mut waited = 0u32;
         while unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) } & DESCRIPTOR_DONE == 0 {
@@ -753,29 +879,57 @@ impl E1000 {
     /// Copies the next received frame into `out`; returns its length, or None if the
     /// ring is empty.
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
+        let advanced = self.variant == Variant::I350;
         loop {
             let descriptor = unsafe { (self.rx_ring as *mut Descriptor).add(self.rx_next) };
-            let status = unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) };
-            if status & DESCRIPTOR_DONE == 0 {
+            let buffer = (self.rx_buffers + (self.rx_next * BUFFER_SIZE) as u64) as *const u8;
+            let (done, end_of_packet, length, stamped) = if advanced {
+                // Write-back format: status dword at offset 8, length at 12.
+                let words = descriptor as *const u8;
+                let status = unsafe { read_volatile(words.add(8) as *const u32) };
+                (status & ADV_DD != 0, status & ADV_EOP != 0, unsafe { read_volatile(words.add(12) as *const u16) } as usize, status & ADV_TSIP != 0)
+            } else {
+                let status = unsafe { read_volatile(core::ptr::addr_of!((*descriptor).status)) };
+                (status & DESCRIPTOR_DONE != 0, status & DESCRIPTOR_EOP != 0, unsafe { read_volatile(core::ptr::addr_of!((*descriptor).length)) } as usize, false)
+            };
+            if !done {
                 return None;
             }
-            let length = unsafe { read_volatile(core::ptr::addr_of!((*descriptor).length)) } as usize;
-            let length = length.min(BUFFER_SIZE).min(out.len());
-            let keep = !self.rx_skipping && status & DESCRIPTOR_EOP != 0;
+            let skip = if stamped { TS_HEADER.min(length) } else { 0 };
+            let length = (length - skip).min(BUFFER_SIZE - skip).min(out.len());
+            let keep = !self.rx_skipping && end_of_packet;
+            let mut stamp = 0;
             if keep {
-                let buffer = (self.rx_buffers + (self.rx_next * BUFFER_SIZE) as u64) as *const u8;
-                unsafe { core::ptr::copy_nonoverlapping(buffer, out.as_mut_ptr(), length) };
+                unsafe { core::ptr::copy_nonoverlapping(buffer.add(skip), out.as_mut_ptr(), length) };
+                if stamped {
+                    let (low, high) = unsafe { (read_volatile(buffer.add(8) as *const u32), read_volatile(buffer.add(12) as *const u32)) };
+                    stamp = (u64::from(low) | u64::from(high) << 32) & 0xff_ffff_ffff;
+                }
             }
-            self.rx_skipping = status & DESCRIPTOR_EOP == 0;
-            // Hand the buffer back: clear status, then advance the tail onto it.
-            unsafe { write_volatile(core::ptr::addr_of_mut!((*descriptor).status), 0) };
+            self.rx_skipping = !end_of_packet;
+            // Hand the buffer back. The advanced write-back overwrote the buffer address, so it is written again.
+            if advanced {
+                unsafe {
+                    write_volatile(descriptor as *mut u64, buffer as u64);
+                    write_volatile((descriptor as *mut u64).add(1), 0);
+                }
+            } else {
+                unsafe { write_volatile(core::ptr::addr_of_mut!((*descriptor).status), 0) };
+            }
             write(self.registers, self.r.rdt, self.rx_next as u32);
             self.rx_next = (self.rx_next + 1) % RX_COUNT;
             if keep {
                 self.frames_received += 1;
-                // Only PTP event frames are stamped, and only one at a time: the stamp belongs to this frame
-                // when it is one (the ring is read in arrival order, and PTP events are tens of ms apart).
-                self.last_stamp = if self.ts_on && is_ptp_event(&out[..length]) { self.ts_rx_stamp().unwrap_or(0) } else { 0 };
+                // Every frame carries its own stamp in `ts_stamp_all` mode. Otherwise only PTP event frames are
+                // stamped, and only one at a time: the stamp belongs to this frame when it is one (the ring is read
+                // in arrival order, and PTP events are tens of ms apart).
+                self.last_stamp = if self.ts_all {
+                    stamp
+                } else if self.ts_on && is_ptp_event(&out[..length]) {
+                    self.ts_rx_stamp().unwrap_or(0)
+                } else {
+                    0
+                };
                 return Some(length);
             }
         }

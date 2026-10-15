@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock).
-pub const TAPE_API_VERSION: u32 = 10;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`.
+pub const TAPE_API_VERSION: u32 = 11;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -224,6 +224,10 @@ pub struct TapeApi {
     pub nic_ts_adjust: extern "C" fn(usize, i32) -> u32,
     /// `nic_ts_step(index, delta_ns)` (version 10): moves the card's clock by `delta_ns` (signed). 1 if done, 0 if not.
     pub nic_ts_step: extern "C" fn(usize, i64) -> u32,
+    /// `nic_ts_all(index, on)` (version 11): after `nic_ts_enable`, makes the card stamp *every* received frame, not only PTP
+    /// events, so `nic_ts_rx` after each `nic_receive` gives its arrival time in the card's clock (0 = off again). 1 if done,
+    /// 0 if the card cannot. Meant for latency measurement (nettest) and RTP arrival times (audio-net).
+    pub nic_ts_all: extern "C" fn(usize, u32) -> u32,
 }
 
 /// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.

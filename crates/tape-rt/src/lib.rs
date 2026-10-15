@@ -550,6 +550,64 @@ pub fn nic_ts_step(nic: usize, delta_ns: i64) -> bool {
     has_steering() && (api().nic_ts_step)(nic, delta_ns) != 0
 }
 
+/// Stamps every received frame on `nic` (after `nic_ts_enable`), so `nic_ts_rx` is valid for each one; false if it cannot.
+pub fn nic_ts_all(nic: usize, on: bool) -> bool {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, nic_ts_all) + core::mem::size_of::<usize>();
+    table.version >= 11 && (table.size as usize) >= end && (table.nic_ts_all)(nic, u32::from(on)) != 0
+}
+
+const RX_NICS: usize = 8;
+/// Per interface: 0 not tried, 1 stamping every frame, 2 the card cannot.
+static RX_STATE: [core::sync::atomic::AtomicU8; RX_NICS] = [const { core::sync::atomic::AtomicU8::new(0) }; RX_NICS];
+/// The card clock (ns) and the tape clock (us) read together, so a card stamp can be moved onto the tape clock.
+static RX_CARD_NS: [core::sync::atomic::AtomicU64; RX_NICS] = [const { core::sync::atomic::AtomicU64::new(0) }; RX_NICS];
+static RX_LOCAL_US: [core::sync::atomic::AtomicU64; RX_NICS] = [const { core::sync::atomic::AtomicU64::new(0) }; RX_NICS];
+
+/// `true` makes `rx_arrival_us` ignore the card's stamps (for comparing against them).
+pub fn rx_software(on: bool) {
+    for state in &RX_STATE {
+        state.store(if on { 2 } else { 0 }, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The arrival time, on the `micros()` clock, of the frame the last `nic_receive(nic, ...)` returned. With hardware
+/// timestamps (the first call arms the card to stamp every frame) this is when the card saw it, free of the polling
+/// loop's delay; without them it is `micros()` now. The card clock is tied to `micros()` again every 100 ms, so
+/// the two crystals cannot drift apart by more than nanoseconds in between.
+pub fn rx_arrival_us(nic: usize) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = micros();
+    if nic >= RX_NICS {
+        return now;
+    }
+    if RX_STATE[nic].load(Relaxed) == 0 {
+        let armed = nic_ts_enable(nic) && nic_ts_all(nic, true);
+        RX_STATE[nic].store(if armed { 1 } else { 2 }, Relaxed);
+        RX_LOCAL_US[nic].store(0, Relaxed);
+    }
+    if RX_STATE[nic].load(Relaxed) != 1 {
+        return now;
+    }
+    let stamp = nic_ts_rx(nic);
+    if stamp == 0 {
+        return now;
+    }
+    if now.wrapping_sub(RX_LOCAL_US[nic].load(Relaxed)) > 100_000 {
+        let before = micros();
+        let card = nic_ts_clock(nic);
+        let after = micros();
+        RX_CARD_NS[nic].store(card, Relaxed);
+        RX_LOCAL_US[nic].store(before + (after - before) / 2, Relaxed);
+    }
+    const MASK: u64 = (1 << 40) - 1;
+    let mut delta = (stamp.wrapping_sub(RX_CARD_NS[nic].load(Relaxed)) & MASK) as i64;
+    if delta >= 1 << 39 {
+        delta -= 1 << 40; // the frame came before the reading
+    }
+    ((RX_LOCAL_US[nic].load(Relaxed) as i64 * 1000 + delta) / 1000) as u64
+}
+
 /// Sends `frame`; returns (sent, hardware transmit stamp or 0).
 pub fn nic_send_stamped(nic: usize, frame: &[u8]) -> (bool, u64) {
     let mut stamp = 0u64;

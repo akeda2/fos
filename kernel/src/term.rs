@@ -1025,6 +1025,22 @@ pub fn nic_ts_adjust(index: usize, ppb: i32) -> bool {
     nic_at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map(|card| card.ts_adjust(ppb)).is_some()
 }
 
+/// Stamps every received frame (`on`) or only PTP events again; false without timestamps armed.
+pub fn nic_ts_all(index: usize, on: bool) -> bool {
+    nic_at(index).and_then(|nic| nic.as_e1000()).is_some_and(|card| card.ts_stamp_all(on))
+}
+
+/// Back to stamping only PTP events on every interface (after a tape that asked for every frame).
+pub fn nic_ts_all_off() {
+    for index in 0..nic_count() {
+        if let Some(card) = nic_at(index).and_then(|nic| nic.as_e1000()) {
+            if card.ts_all() {
+                card.ts_stamp_all(false);
+            }
+        }
+    }
+}
+
 /// Steps the card's clock by `delta` nanoseconds (false without timestamps).
 pub fn nic_ts_step(index: usize, delta: i64) -> bool {
     nic_at(index).and_then(|nic| nic.as_e1000()).filter(|card| card.ts_supported()).map(|card| card.ts_step(delta)).is_some()
@@ -3131,13 +3147,13 @@ fn nic_send_test() {
 /// `listen`: for 10 s print the stamp of each PTP frame that arrives against SYSTIM when it was noticed.
 fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<&str>) {
     let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
-        crate::println!("nic ts N [send|listen|adjust PPB|step NS]: IEEE 1588 hardware timestamps of interface N (I350).");
+        crate::println!("nic ts N [send|listen|all|adjust PPB|step NS]: IEEE 1588 hardware timestamps of interface N (I350).");
         return;
     };
     let Some(nic) = nic_at(index - 1) else { return };
     let mac = nic.mac();
     let Some(card) = nic.as_e1000().filter(|card| card.ts_supported()) else {
-        crate::println!("nic {index}: no hardware timestamps known for this interface (the I350 has them).");
+        crate::println!("nic {index}: no hardware timestamps known for this interface (I350, 82579, Skylake I219).");
         return;
     };
     card.ts_enable();
@@ -3155,10 +3171,22 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
             let mut frame = [0u8; 60];
             frame[..6].copy_from_slice(&[0xff; 6]); // broadcast: the card filters multicast
             frame[6..12].copy_from_slice(&mac);
-            frame[12..14].copy_from_slice(&[0x88, 0xf7]);
-            frame[14] = 0x00; // messageType 0: Sync, an event message
-            frame[15] = 0x02; // versionPTP 2
-            frame[17] = 44; // messageLength
+            frame[12..14].copy_from_slice(if value == Some("plain") { &[0x88, 0xb5] } else { &[0x88, 0xf7] });
+            if value == Some("plain") {
+                frame[14..41].copy_from_slice(b"fos raw ethernet test frame");
+            } else {
+                frame[14] = 0x00; // messageType 0: Sync, an event message
+                frame[15] = 0x02; // versionPTP 2
+                frame[17] = 44; // messageLength
+            }
+            if value == Some("burst") {
+                frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+                for number in 0..16u8 {
+                    frame[14] = number;
+                    card.send(&frame);
+                }
+                return crate::println!("nic {index}: 16 plain frames sent back to back.");
+            }
             let before = card.systim();
             let (_, stamp) = card.send_stamped(&frame);
             let after = card.systim();
@@ -3166,6 +3194,46 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
                 Some(stamp) => crate::println!("nic {index}: Sync sent; TX stamp {stamp}, SYSTIM before {before}, after {after} (stamp - before = {} ns).", stamp as i64 - before as i64),
                 None => crate::println!("nic {index}: no transmit stamp (link down, or the card gave none)."),
             }
+        }
+        Some("all") => {
+            if !card.ts_stamp_all(true) {
+                return crate::println!("nic {index}: cannot stamp every frame.");
+            }
+            blocking(true);
+            unsafe { QUEUE_ALL = true };
+            let deadline = apic::ticks() + 5 * apic::TICK_HZ;
+            crate::println!("nic {index}: stamping every received frame for 5 s.");
+            let (mut frames, mut stamped, mut shown, mut previous) = (0u32, 0u32, 0, 0u64);
+            while apic::ticks() < deadline && !break_requested() {
+                poll();
+                let mut buffer = [0u8; 1600];
+                loop {
+                    let length = pop_frame(index - 1, &mut buffer);
+                    if length == 0 {
+                        break;
+                    }
+                    frames += 1;
+                    let stamp = last_rx_stamp(index - 1);
+                    if stamp != 0 {
+                        stamped += 1;
+                    }
+                    if shown < 8 {
+                        shown += 1;
+                        let kind = u16::from_be_bytes([buffer[12], buffer[13]]);
+                        crate::println!("{length} bytes, type {kind:#06x}, stamp {stamp}, {} ns after the previous.", stamp.wrapping_sub(previous) & 0xff_ffff_ffff);
+                    }
+                    if stamp != 0 {
+                        previous = stamp;
+                    }
+                }
+                crate::cpu::sleep();
+            }
+            unsafe { QUEUE_ALL = false };
+            blocking(false);
+            if let Some(card) = nic_at(index - 1).and_then(|nic| nic.as_e1000()) {
+                card.ts_stamp_all(false);
+            }
+            crate::println!("{frames} frames received, {stamped} with a stamp.");
         }
         Some("listen") => {
             blocking(true);
@@ -3208,7 +3276,7 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
                 crate::println!("nic {index}: SYSTIM {before} -> {after} (asked {value} ns, got {} ns).", after as i64 - before as i64);
             }
         }
-        Some(_) => crate::println!("nic ts N [send|listen|adjust PPB|step NS]"),
+        Some(_) => crate::println!("nic ts N [send|listen|all|adjust PPB|step NS]"),
     }
 }
 

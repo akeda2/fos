@@ -905,6 +905,27 @@ noise about 1 us; the "jitter" line then mostly shows the -54 ppm clock-rate dif
 onto its software clock, so a rate change does not show in its offsets. The pulse-per-second (SDP) output is not done:
 the I350's SDP pins are not on the boards at hand to check it. Next: audio-net with `ts-refclk:ptp` audio-net with `ts-refclk:ptp`, RTP timestamps on the PTP timeline and a one-way delay readout.
 
+**Per-packet receive stamps (ABI 11).** `nic_ts_all(nic, on)` makes the I350 stamp every received frame: the receive ring
+then uses advanced descriptors (SRRCTL DESCTYPE 1, bit 30 asks for the stamp, TSYNCRXCTL type ALL), and a stamped frame
+carries a 16-byte header (SYSTIML at byte 8, SYSTIMH at 12) that `receive()` strips and files as `nic_ts_rx`. The card
+clock is tied to `micros()` every 100 ms by `tape_rt::rx_arrival_us(nic)`, which converts each stamp with wrap-safe 40-bit
+arithmetic and falls back to `micros()` when the card cannot stamp; a tape that ends puts the card back to PTP-only
+stamping. Changing SRRCTL by toggling RXDCTL.QUEUE_ENABLE kills receive: write it with RCTL.EN cleared. nettest uses it at
+its three sink sites (`stamps=software` turns it off for comparison): on a direct 50 Mbit/s link the polling receiver's
+jitter went from 177 us to 15 us. audio-net uses it for its PTP arrival statistics when PTP is on. Only an I350 has it;
+QEMU cannot check it.
+
+**Timestamps on the e1000e family.** The 82579 (96 MHz clock) and the Skylake I219 (24 MHz) have the same TSYNC
+registers as the I350 (Linux's e1000e `ptp.c`), with four differences handled in `e1000.rs`: SYSTIM counts fractions of
+a nanosecond (`ns = SYSTIM >> shift`, 19 and 14); TIMINCA must be programmed (`pch_clock`) and is also how `ts_adjust`
+steers (INCVALUE scaled by the ppb); SYSTIM cannot be written, so `ts_step` keeps an offset; and receive filtering is
+RXMTRL (ethertype 0x88f7) plus RXUDP (319), with no per-frame stamping (`nic_ts_all` is I350 only). A transmit stamp is
+asked for per frame through a data descriptor (DEXT, DTYP_D, EXTCMD_TSTAMP in the upper dword); the I219 also needs
+FEXTNVM7 bit 0. The 82574 is not enabled (QEMU's e1000e would claim stamps it cannot give). Verified on a Skylake I219-LM
+(laptop1), an 82579LM (piano1) and an 82579V (clock1): clocks run and steer (+100000 ppb measured +99.7 and +100.1 ppm), TX
+and RX stamps arrive, and `ptp` laptop1 -> clock1 over a switch measures a path delay of 18 us against 51 us with
+software stamps. audio-net behind a clock1 master (hardware stamps) shows capture-to-arrival of 76 us; behind piano1 (software) it was +-4 ms.
+
 ### audio-net on a PTP clock
 
 `audio-net` follows a PTPv2 clock when one is found: `ptp=auto` (default), `ptp=l2` or `ptp=off`. `clock.rs`
