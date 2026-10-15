@@ -96,8 +96,8 @@ def main():
                 found = re.search(r"frames: (\d+) received", guest.text()[mark:])
                 return int(found.group(1)) if found else -1
 
-            def burst(group):
-                frame = bytes.fromhex("0100" + "5e0102" + group) + bytes.fromhex("525400aabbcc") + b"\x88\xb5" + bytes(60)
+            def burst(group, middle="01"):
+                frame = bytes.fromhex("0100" + "5e" + middle + "02" + group) + bytes.fromhex("525400aabbcc") + b"\x88\xb5" + bytes(60)
                 for _ in range(40):
                     inject(frame)
                     time.sleep(0.005)
@@ -118,9 +118,30 @@ def main():
             burst("03")
             left = received(a) - before
             check(left < 10, f"and it stops arriving after the leave ({left} of 40)", a.text()[-600:])
+            # Two groups that differ only above the hashed bits share one filter bit: leaving one keeps the other.
+            for address in ("01:00:5e:01:02:03", "01:00:5e:05:02:03"):
+                mark = a.send(f"nic mcast 1 join {address}")
+                a.wait_for("done (hash filter)", 10, mark)
+            mark = a.send("nic mcast 1 leave 01:00:5e:01:02:03")
+            a.wait_for("leave 01:00:5e:01:02:03 done", 10, mark)
+            before = received(a)
+            burst("03", "05")
+            shared = received(a) - before
+            mark = a.send("nic regs 1")
+            a.wait_for("fos> ", 10, mark)
+            check(shared >= 40 and "MTA[" in a.text()[mark:], f"a bit two groups share stays set when one leaves ({shared} of 40; nic regs lists the table)", a.text()[-600:])
+            mark = a.send("nic mcast 1 clear")
+            a.wait_for("no multicast groups joined", 10, mark)
+            before = received(a)
+            burst("03", "05")
+            check(received(a) - before < 10, "and nic mcast clear drops every group")
             mark = a.send("nic mcast 1 join 02:00:00:00:00:01")
             a.wait_for("no hash filter", 10, mark)
             check(True, "a unicast address is refused")
+
+            mark = a.send("nic csum 1")
+            a.wait_for("fos> ", 10, mark)
+            check("no transmit checksum offload" in a.text()[mark:], "nic csum is refused on a card without the offload (the I350 has it)", a.text()[mark:])
 
             # The VLAN filter: with id 5 registered, a tag 5 frame arrives, a tag 6 frame does not, untagged still does.
             def vlan_burst(vid):

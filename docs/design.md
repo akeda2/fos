@@ -928,7 +928,9 @@ on skylake2's I350 (padded, even and odd lengths).
 filter (`RCTL.VFE`) is on only while at least one id is registered and the card is not promiscuous, so existing tapes
 (bridge, nettest) still see every tag; untagged frames always pass. The kernel clears the table and the filter when a
 tape ends. No tape uses it yet; `nic vlan N add|del VID | clear` drives it by hand and `make test-nic` checks registered,
-other and untagged frames. Only real hardware can confirm the I350/82579/I219 drop other tags like QEMU's e1000.
+other and untagged frames. Checked on real hardware: the I350 drops other tags (200 of 200 tagged 5 and untagged frames arrive, 6 of 200 tagged 6,
+the rest background traffic); the 82579 and I219 (PCH) have no VLAN filter, VFE and the VFTA do not hold a write, so
+the call returns 0 there and every tag arrives (`tools/test_nic_offload_hw.py vlan`).
 
 **Per-packet receive stamps (ABI 11).** `nic_ts_all(nic, on)` makes the I350 stamp every received frame: the receive ring
 then uses advanced descriptors (SRRCTL DESCTYPE 1, bit 30 asks for the stamp, TSYNCRXCTL type ALL), and a stamped frame

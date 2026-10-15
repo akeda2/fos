@@ -153,56 +153,26 @@ fn unwrap_card(raw: u64) -> i64 {
     value
 }
 
-/// Disciplines the card's clock the way linuxptp's PI servo does: the first two offsets give the rate error, the clock is
-/// then stepped once (never again), and from there ppb = kp*offset + drift, drift += ki*offset on every sample. The offset
-/// is the card's clock minus the master's, so the correction is its negative.
+/// Drives the card's clock from a `Servo` (the arithmetic is in the library, with its tests).
 struct Steer {
     nic: usize,
-    kp: f64,
-    ki: f64,
-    drift: f64,
-    first: Option<(i64, i64)>,
-    locked: bool,
+    servo: ptp_tape::Servo,
 }
-
-/// kp and ki per sample for linuxptp's hardware-stamp scales (0.7 * T^-0.3 and 0.3 * T^0.4 for sync interval T seconds),
-/// for the nearest of the usual intervals.
-const STEER_GAINS: [(u32, f64, f64); 7] = [(30, 2.0, 0.074), (62, 1.61, 0.099), (125, 1.30, 0.130), (250, 1.06, 0.172), (500, 0.86, 0.227), (1000, 0.7, 0.3), (2000, 0.569, 0.396)];
-const STEER_MAX_PPB: f64 = 500_000.0;
 
 impl Steer {
     fn new(nic: usize, sync_ms: u32) -> Steer {
         tape_rt::nic_ts_adjust(nic, 0);
-        let (_, kp, ki) = STEER_GAINS.iter().copied().min_by_key(|&(ms, _, _)| ms.abs_diff(sync_ms)).unwrap();
-        Steer { nic, kp, ki, drift: 0.0, first: None, locked: false }
+        Steer { nic, servo: ptp_tape::Servo::new(sync_ms) }
     }
 
     /// Feeds one measurement (`local` is when it was taken on the card's timeline). Returns the step applied, if any.
     fn update(&mut self, local: i64, offset: i64) -> Option<i64> {
-        if !self.locked {
-            let Some((first_local, first_offset)) = self.first else {
-                self.first = Some((local, offset));
-                return None;
-            };
-            let span = (local - first_local) as f64 / 1e9;
-            if span < 0.016 / self.ki {
-                return None;
-            }
-            self.drift = (1e9 * (offset - first_offset) as f64 / (local - first_local) as f64).clamp(-STEER_MAX_PPB, STEER_MAX_PPB);
-            self.locked = true;
-            tape_rt::nic_ts_adjust(self.nic, (-self.drift) as i32);
-            if offset.abs() > 20_000 && tape_rt::nic_ts_step(self.nic, -offset) {
-                CARD_TIME.fetch_sub(offset, core::sync::atomic::Ordering::Relaxed);
-                return Some(-offset);
-            }
-            return None;
+        let out = self.servo.update(local, offset)?;
+        tape_rt::nic_ts_adjust(self.nic, out.ppb);
+        if out.step != 0 && tape_rt::nic_ts_step(self.nic, out.step) {
+            CARD_TIME.fetch_add(out.step, core::sync::atomic::Ordering::Relaxed);
+            return Some(out.step);
         }
-        let integral = self.ki * offset as f64;
-        let ppb = self.kp * offset as f64 + self.drift + integral;
-        if ppb.abs() < STEER_MAX_PPB {
-            self.drift += integral;
-        }
-        tape_rt::nic_ts_adjust(self.nic, (-ppb.clamp(-STEER_MAX_PPB, STEER_MAX_PPB)) as i32);
         None
     }
 }

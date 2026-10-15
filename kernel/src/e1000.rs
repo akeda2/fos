@@ -638,7 +638,8 @@ impl E1000 {
     /// stays off while the card is promiscuous (Linux does the same: a bridge wants every tag). Untagged frames always
     /// pass. False for an id above 4095.
     pub fn vlan_filter(&mut self, vid: u16, on: bool) -> bool {
-        if vid > 4095 {
+        // The 82579 and I219 (PCH) have no VLAN filter: VFE and the VFTA do not hold a write (read back on real parts).
+        if vid > 4095 || self.ts_clock.is_some() {
             return false;
         }
         let (register, bit) = (usize::from(vid >> 5), 1u32 << (vid & 31));
@@ -650,11 +651,32 @@ impl E1000 {
 
     /// Forgets every VLAN id and turns the filter off (a tape ended).
     pub fn vlan_clear(&mut self) {
+        if self.ts_clock.is_some() {
+            return;
+        }
         self.vlan_ids = [0; 128];
         for index in 0..128 {
             write(self.registers, REG_VFTA + index * 4, 0);
         }
         self.vlan_apply();
+    }
+
+    /// `nic regs`: the receive filter state: RCTL, the VLAN filter table's set bits and what the card holds in its MTA.
+    pub fn dump_registers(&self) {
+        let control = read(self.registers, REG_RCTL);
+        crate::println!("   RCTL {control:#010x}: VFE {}, UPE {}, MPE {}, BAM {}", control >> 18 & 1, control >> 3 & 1, control >> 4 & 1, control >> 15 & 1);
+        for index in 0..128 {
+            let word = read(self.registers, REG_VFTA + index * 4);
+            if word != 0 {
+                crate::println!("   VFTA[{index}] {word:#010x} (shadow {:#010x})", self.vlan_ids[index]);
+            }
+        }
+        for index in 0..MTA_REGISTERS {
+            let word = read(self.registers, REG_MTA + index * 4);
+            if word != 0 {
+                crate::println!("   MTA[{index}] {word:#010x}");
+            }
+        }
     }
 
     /// Whether the VLAN filter is on: ids are registered and the card is not promiscuous.

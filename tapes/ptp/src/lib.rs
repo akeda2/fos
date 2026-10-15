@@ -747,6 +747,64 @@ pub fn stamp_delay(now_ns: i64, stamp: u32, rate: u32, limit_ns: i64) -> Option<
     (-5_000_000..=limit_ns).contains(&delay).then_some(delay)
 }
 
+/// kp and ki per sample for linuxptp's hardware-stamp scales (0.7 * T^-0.3 and 0.3 * T^0.4 for sync interval T seconds),
+/// for the nearest of the usual intervals (milliseconds, kp, ki).
+const SERVO_GAINS: [(u32, f64, f64); 7] = [(30, 2.0, 0.074), (62, 1.61, 0.099), (125, 1.30, 0.130), (250, 1.06, 0.172), (500, 0.86, 0.227), (1000, 0.7, 0.3), (2000, 0.569, 0.396)];
+pub const SERVO_MAX_PPB: f64 = 500_000.0;
+/// The first measurement steps the clock only if it is further off than this (ns), as linuxptp's first_step_threshold.
+const SERVO_STEP_NS: i64 = 20_000;
+
+/// What the servo wants done after a measurement: set the card's rate to `ppb` (parts per billion, signed), and, when
+/// `step` is not 0, move its clock by that many nanoseconds first.
+#[derive(Debug, PartialEq)]
+pub struct ServoOut {
+    pub ppb: i32,
+    pub step: i64,
+}
+
+/// linuxptp's PI servo for a card clock: the first two offsets give the rate error, the clock is then stepped once
+/// (never again), and from there ppb = kp*offset + drift, drift += ki*offset on every sample. The offset is the card's
+/// clock minus the master's, so the correction is its negative.
+pub struct Servo {
+    kp: f64,
+    ki: f64,
+    drift: f64,
+    first: Option<(i64, i64)>,
+    locked: bool,
+}
+
+impl Servo {
+    pub fn new(sync_ms: u32) -> Servo {
+        let (_, kp, ki) = SERVO_GAINS.iter().copied().min_by_key(|&(ms, _, _)| ms.abs_diff(sync_ms)).unwrap();
+        Servo { kp, ki, drift: 0.0, first: None, locked: false }
+    }
+
+    /// Feeds one measurement (`local` is when it was taken on the card's timeline, ns). None while it still waits for the
+    /// second sample that gives the rate.
+    pub fn update(&mut self, local: i64, offset: i64) -> Option<ServoOut> {
+        if !self.locked {
+            let Some((first_local, first_offset)) = self.first else {
+                self.first = Some((local, offset));
+                return None;
+            };
+            let span = (local - first_local) as f64 / 1e9;
+            if span < 0.016 / self.ki {
+                return None;
+            }
+            self.drift = (1e9 * (offset - first_offset) as f64 / (local - first_local) as f64).clamp(-SERVO_MAX_PPB, SERVO_MAX_PPB);
+            self.locked = true;
+            let step = if offset.abs() > SERVO_STEP_NS { -offset } else { 0 };
+            return Some(ServoOut { ppb: (-self.drift) as i32, step });
+        }
+        let integral = self.ki * offset as f64;
+        let ppb = self.kp * offset as f64 + self.drift + integral;
+        if ppb.abs() < SERVO_MAX_PPB {
+            self.drift += integral;
+        }
+        Some(ServoOut { ppb: (-ppb.clamp(-SERVO_MAX_PPB, SERVO_MAX_PPB)) as i32, step: 0 })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,5 +1123,45 @@ mod tests {
         assert!((1_499_000..=1_501_000).contains(&delay));
         assert_eq!(stamp_delay(now, stamp.wrapping_add(40_000_000), 48_000, 1_000_000_000), None, "an arbitrary timeline");
         assert_eq!(stamp_delay(now, stamp.wrapping_add(10_000), 48_000, 1_000_000_000), None, "stamped in the future");
+    }
+
+    /// A card clock 64 ppm fast and 3 ms ahead, a Sync every 125 ms: the servo steps once, then holds the offset to
+    /// well under a microsecond with the rate near the 64 ppm it is told to cancel.
+    #[test]
+    fn servo_steps_once_then_locks_to_the_rate() {
+        let mut servo = Servo::new(125);
+        let (mut card_ns, mut true_ns) = (3_000_000i64, 0i64);
+        let (mut applied_ppb, mut steps, mut worst) = (0i32, 0, 0i64);
+        for sample in 0..400 {
+            let offset = card_ns - true_ns;
+            if let Some(out) = servo.update(card_ns, offset) {
+                applied_ppb = out.ppb;
+                if out.step != 0 {
+                    steps += 1;
+                    card_ns += out.step;
+                }
+            }
+            if sample >= 200 {
+                worst = worst.max((card_ns - true_ns).abs());
+            }
+            // 125 ms of true time: the card runs 64 ppm fast, less what the servo takes off (a negative adjustment slows it).
+            true_ns += 125_000_000;
+            card_ns += (125_000_000f64 * (1.0 + (64_000.0 + f64::from(applied_ppb)) / 1e9)) as i64;
+        }
+        assert_eq!(steps, 1);
+        assert!(worst < 1_000, "offset {worst} ns after 25 s");
+        assert!((f64::from(applied_ppb) + 64_000.0).abs() < 2_000.0, "rate {applied_ppb} ppb");
+    }
+
+    #[test]
+    fn servo_does_not_step_a_small_offset_and_clamps_the_rate() {
+        let mut servo = Servo::new(125);
+        assert_eq!(servo.update(0, 5_000), None, "the first sample only remembers");
+        let out = servo.update(500_000_000, 5_000).unwrap();
+        assert_eq!(out.step, 0);
+        let mut wild = Servo::new(125);
+        wild.update(0, 0);
+        let out = wild.update(500_000_000, 10_000_000_000).unwrap();
+        assert_eq!(out.ppb.abs(), SERVO_MAX_PPB as i32, "a rate beyond the card's range is clamped");
     }
 }

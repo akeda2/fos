@@ -191,7 +191,7 @@ impl Nic {
             Nic::Rtl8139(nic) => nic.dump_registers(),
             Nic::Rtl8168(nic) => nic.dump_registers(),
             Nic::ThreeCom(nic) => nic.dump_registers(),
-            Nic::E1000(_) => crate::println!("   (no register dump for this driver)"),
+            Nic::E1000(nic) => nic.dump_registers(),
         }
     }
 

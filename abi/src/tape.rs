@@ -236,7 +236,7 @@ pub struct TapeApi {
     /// `nic_vlan_filter(index, vid, on)` (version 13): registers (on) or drops VLAN id `vid` (0-4095) in the card's VLAN
     /// filter. With the first id the card starts dropping tagged frames of other ids (untagged frames always pass), so a
     /// tape that never calls it sees every tag as before. The filter stays off while the card is promiscuous. 1 if done,
-    /// 0 on a card without it or an invalid id. The kernel clears all ids (filter off) when a tape ends.
+    /// 0 on a card without it (the 82579 and I219 have none) or an invalid id. The kernel clears all ids (filter off) when a tape ends.
     pub nic_vlan_filter: extern "C" fn(usize, u32, u32) -> u32,
     /// `nic_tx_offload(index, on)` (version 14): with it on, `nic_send` lets the card compute the TCP/UDP checksum of an
     /// unfragmented IPv4 frame: a UDP frame whose checksum field is 0 gets the real checksum (the tape need not compute it;
