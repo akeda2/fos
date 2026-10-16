@@ -3371,10 +3371,11 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
                     if stamp != 0 {
                         stamped += 1;
                     }
-                    if shown < 8 || (stamp == 0 && missing < 40) {
+                    let kind = u16::from_be_bytes([buffer[12], buffer[13]]);
+                    // The terminal's own 0x88b6 frames would fill the list; the rest is what the caller wants to see.
+                    if kind != 0x88b6 && (shown < 40 || (stamp == 0 && missing < 40)) {
                         shown += 1;
                         missing += u32::from(stamp == 0);
-                        let kind = u16::from_be_bytes([buffer[12], buffer[13]]);
                         crate::println!("{length} B to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type {kind:#06x} stamp {stamp}, +{} ns", buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], stamp.wrapping_sub(previous) & 0xff_ffff_ffff);
                     }
                     if stamp != 0 {

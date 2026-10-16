@@ -913,8 +913,9 @@ a bit, so tapes still compare addresses. `ptp` (L2), audio-net's PTP listener an
 kernel clears all groups when a tape ends. `nic mcast N join|leave MAC | clear` does it by hand; `make test-nic` injects
 frames to a joined and an unjoined group. The ICH/PCH parts (82579, I217-I219) have a 1024-bit table (32 registers) and
 hash `(mac[4] >> 6 | mac[5] << 2) & 0x3ff`; the I350/82574 use the 4096-bit formula above. Checked on an 82579V: of 256
-groups swept, only the joined one arrived. Only real hardware can confirm the tables behave like QEMU's. Open: an
-82579V slave in UDP PTP gets no Announce/Sync through the lab switch (L2 PTP and raw frames to the group work).
+groups swept, only the joined one arrived. Only real hardware can confirm the tables behave like QEMU's. A switch with IGMP snooping on kept an 82579V from
+getting UDP PTP (frames injected from a host arrived, the switch's group table never listed the card); with snooping off,
+82579V and I350 work as slave and master over UDP.
 
 **Transmit checksum offload (ABI 14).** `nic_tx_offload(nic, on)` makes the I350's `send` hand IPv4 UDP frames whose checksum
 field is 0 (and TCP frames) to the card: a context descriptor (MACLEN 14, IPLEN) plus an advanced data descriptor with
