@@ -53,7 +53,8 @@ def main() -> None:
 
     if args.forget:
         send_tape.save_known_peers([])
-        print(f"Cleared {send_tape.PEERS_CACHE_FILE}.")
+        send_tape.forget_peer_names()
+        print(f"Cleared {send_tape.PEERS_CACHE_FILE} and the host names heard.")
         return
 
     known_peers = send_tape.load_known_peers()

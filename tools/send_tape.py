@@ -192,6 +192,11 @@ def remember_peer_names(heard: dict[bytes, str]) -> None:
     PEER_NAMES_FILE.write_text(json.dumps({format_mac(mac): name for mac, name in names.items()}))
 
 
+def forget_peer_names() -> None:
+    """Empties the heard-names file; `--forget` must clear it too, or a name heard from a long-gone MAC still resolves."""
+    PEER_NAMES_FILE.unlink(missing_ok=True)
+
+
 def load_known_peers() -> list[bytes]:
     """Loads the address book in first-seen order, the same order
     `remember_known_peer` preserves and `kernel/src/shell.rs`'s own
