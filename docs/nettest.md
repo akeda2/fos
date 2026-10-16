@@ -552,6 +552,11 @@ than its input or shared (a 1G to 100M step, or two senders into one port); the 
 buffer, N times the frame size. On a clean 1G to 1G pair no loss is expected, and the verdict says the switch never queued. The
 START frame carries the count (wire version 3).
 
+`size=mix` sends the classic 7:4:1 mix of 64, 576 and 1500 byte frames (mean 354 B; `rate` still paces the bytes), which loads a
+switch's per-packet path the way real traffic does, where a fixed 1400 B test does not. `macs=N` rotates the source MAC through N
+addresses (the last byte of the NIC's own, plus 0 to N-1), so the switch has to learn and keep N entries; a switch with a small
+or slow address table shows it as loss or flooding. Both work with `sweep`, `soak` and `burst`.
+
 Control frames are ethertype 0x88B5, magic `FNC1`. On selection the master exchanges its time by unicast
 using the IEEE 1588 delay request-response arithmetic (the ptp tape cannot run at the same time): eight
 samples, the minimum round trip is used, and half that round trip is the printed error bound. Loss, rate

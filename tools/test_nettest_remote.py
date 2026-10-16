@@ -101,6 +101,11 @@ def main():
             check([s[0] for s in segments] == ["10", "20"], f"the soak prints a line per 10 s segment ({segments})", report[-1200:])
             check(all(int(s[1]) > 1500 and int(s[3]) > 1500 for s in segments), "the soak segments carry the rate in both directions", report[-1200:])
             check(re.search(r"up  : sent \d+k, lost [0-9.]+%, worst second \d+% of the rate, \d+ seconds under 95%", report) is not None, "the soak summary names the worst second", report[-1200:])
+            mark = master.send("test both size=mix macs=8 rate=2000 time=2 expect=1500 loss=1")
+            master.wait_for("RESULT:", 60, mark)
+            report = master.text()[mark:]
+            check("mixed 64/576/1500 B frames" in report, "a mixed-size test says so", report[-1200:])
+            check("RESULT: PASS" in report, "a mixed-size, many-MAC test delivers the rate without loss", report[-1200:])
             mark = master.send("test burst both count=16 to=64 size=800")
             master.wait_for("burst done:", 90, mark)
             report = master.text()[mark:].replace("nettest> ", "")

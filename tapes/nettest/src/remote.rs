@@ -77,11 +77,15 @@ pub struct TestParams {
     pub here: u8,
     /// Frames each generator sends back to back (a burst test); 0 = send for `seconds` at `rate_kbit`.
     pub count: u32,
+    /// Send the 7:4:1 mix of 64, 576 and 1500 byte frames (`size` then holds their mean, for the statistics).
+    pub mix: bool,
+    /// Rotate the source MAC through this many addresses (0 or 1 = the NIC's own).
+    pub macs: u8,
 }
 
 impl TestParams {
     pub const fn new() -> Self {
-        Self { up: true, down: true, rate_kbit: 10_000, size: 1000, seconds: 5, via: 0, here: 0, count: 0 }
+        Self { up: true, down: true, rate_kbit: 10_000, size: 1000, seconds: 5, via: 0, here: 0, count: 0, mix: false, macs: 0 }
     }
 }
 
@@ -356,6 +360,8 @@ impl Remote {
         generator.rate_kbit = params.rate_kbit;
         generator.size = usize::from(params.size);
         generator.count_limit = params.count;
+        generator.mix = params.mix;
+        generator.macs = params.macs;
         generator.seconds_limit = u32::from(params.seconds);
         generator.destination = target;
         sink.reset();
@@ -481,7 +487,7 @@ impl Remote {
                 self.next_at = now_us + RETRY_US;
                 let (test, offset, seq, here_mac) = (self.test, self.offset_us, self.seq, self.here_mac);
                 let mut writer = self.header(out, peer, T_START, seq);
-                writer.u8(u8::from(test.up) | (u8::from(test.down) << 1));
+                writer.u8(u8::from(test.up) | (u8::from(test.down) << 1) | (u8::from(test.mix) << 2));
                 writer.u32(test.rate_kbit);
                 writer.u16(test.size);
                 writer.u16(test.seconds);
@@ -489,6 +495,7 @@ impl Remote {
                 writer.u8(if test.via == 0 { VIA_CONTROL } else { test.via - 1 });
                 writer.put(&here_mac);
                 writer.u32(test.count);
+                writer.u8(test.macs);
                 Some(Self::finish(writer))
             }
             Phase::Running { until } => {
@@ -574,6 +581,7 @@ impl Remote {
                 let via = body.u8().unwrap_or(VIA_CONTROL);
                 let here_mac = body.take::<6>().filter(|mac| *mac != [0; 6]).unwrap_or(source);
                 let count = body.u32().unwrap_or(0);
+                let macs = body.u8().unwrap_or(0);
                 self.session = session;
                 self.master = source;
                 if self.last_start != Some(seq) {
@@ -586,6 +594,8 @@ impl Remote {
                         generator.rate_kbit = rate;
                         generator.size = usize::from(size);
                         generator.count_limit = count;
+                        generator.mix = flags & 4 != 0;
+                        generator.macs = macs;
                         generator.seconds_limit = u32::from(seconds);
                         generator.destination = here_mac;
                         generator.start(now_us);

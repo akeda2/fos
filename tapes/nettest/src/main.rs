@@ -2256,6 +2256,8 @@ tape_rt::tape_help!(br#"nettest: two-port link impairment (loss, delay, rate) an
   tape run nettest [nic=N]                 far end on NIC N (default 1): a master
                                            sets it up; or choose at the prompt:
                                            nics, link, gen, sink, serve, remote
+  Master: test [sweep|soak|burst] [up|down|both] [rate=KBIT] [size=B|mix]
+    [time=S] [macs=N] [expect=KBIT] [loss=PCT] [count=N] [to=N]
   At the nettest> prompt, 'help' lists everything. Escape stops.
   See docs/nettest.md.
 "#);
@@ -2543,7 +2545,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             }
             _ => {
                 let Some(equals) = word.iter().position(|&byte| byte == b'=') else {
-                    print_bytes(putc, b"use: test [sweep|soak|burst] [up|down|both] [rate=KBIT] [size=B] [time=S]\n  [expect=KBIT] [loss=PCT] [count=N] [to=N] [via=N] [here=N]\n");
+                    print_bytes(putc, b"use: test [sweep|soak|burst] [up|down|both] [rate=KBIT] [size=B|mix] [time=S]\n  [macs=N] [expect=KBIT] [loss=PCT] [count=N] [to=N] [via=N] [here=N]\n");
                     return Outcome::Error;
                 };
                 let value = parse_u32(&word[equals + 1..]).filter(|&value| value > 0);
@@ -2561,6 +2563,18 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                     } else {
                         params.here = number as u8;
                     }
+                    continue;
+                }
+                if &word[..equals] == b"size" && &word[equals + 1..] == b"mix" {
+                    (params.size, params.mix, size_given) = (nettest_tape::MIX_MEAN_SIZE as u16, true, true);
+                    continue;
+                }
+                if &word[..equals] == b"macs" {
+                    let Some(macs) = parse_u32(&word[equals + 1..]).filter(|&macs| (1..=255).contains(&macs)) else {
+                        print_bytes(putc, b"macs=N: source addresses to rotate through, 1-255\n");
+                        return Outcome::Error;
+                    };
+                    params.macs = macs as u8;
                     continue;
                 }
                 if &word[..equals] == b"loss" {
@@ -2671,7 +2685,11 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
             print_bytes(putc, b", ");
             print_u32(putc, params.rate_kbit);
             print_bytes(putc, b" kbit/s of ");
-            print_u32(putc, u32::from(params.size));
+            if params.mix {
+                print_bytes(putc, b"mixed 64/576/1500");
+            } else {
+                print_u32(putc, u32::from(params.size));
+            }
             print_bytes(putc, b" B frames, ");
             print_u32(putc, u32::from(params.seconds));
             print_bytes(putc, b" s)...\n");

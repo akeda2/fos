@@ -434,6 +434,8 @@ pub fn counter_delta(now: &[u64; NIC_COUNTERS], start: &[u64; NIC_COUNTERS]) -> 
 }
 
 /// Smallest frame the generator will build (an Ethernet minimum frame).
+/// Mean frame size of the 7:4:1 mix of 64, 576 and 1500 byte frames.
+pub const MIX_MEAN_SIZE: usize = 354;
 pub const GEN_MIN_SIZE: usize = 60;
 /// Frames sent per call at most, so a long stall cannot turn into one huge
 /// burst that overruns the far end's receive ring.
@@ -616,6 +618,10 @@ pub struct Generator {
     pub destination: [u8; 6],
     /// Stop after this many frames (0 = no limit).
     pub count_limit: u32,
+    /// Send the classic 7:4:1 mix of 64, 576 and 1500 byte frames instead of `size`; `rate_kbit` still paces the bytes.
+    pub mix: bool,
+    /// Rotate the source MAC through this many addresses (0 or 1 = the NIC's own), to fill a switch's address table.
+    pub macs: u8,
     /// Stop after this many seconds (0 = no limit).
     pub seconds_limit: u32,
     pub stats: GenStats,
@@ -640,6 +646,8 @@ impl Generator {
             size: 1000,
             destination: [0xff; 6],
             count_limit: 0,
+            mix: false,
+            macs: 0,
             seconds_limit: 0,
             stats: GenStats { sent: 0, send_failed: 0, bytes: 0, lagged: 0 },
             udp: None,
@@ -681,8 +689,33 @@ impl Generator {
 
     /// Nanoseconds between frames for the current size and rate.
     pub fn interval_ns(&self) -> u64 {
+        self.interval_for(self.size)
+    }
+
+    fn interval_for(&self, size: usize) -> u64 {
         // bits / (rate * 1000 bit/s) seconds = bits * 1_000_000 / rate ns.
-        (self.size as u64 * 8 * 1_000_000) / u64::from(self.rate_kbit.max(1))
+        (size as u64 * 8 * 1_000_000) / u64::from(self.rate_kbit.max(1))
+    }
+
+    /// Frame size of the next frame: `size`, or the 7:4:1 mix (64, 576, 1500) by sequence number.
+    fn frame_size(&self) -> usize {
+        if !self.mix {
+            return self.size;
+        }
+        match self.sequence % 12 {
+            0..=6 => 64,
+            7..=10 => 576,
+            _ => 1500,
+        }
+    }
+
+    /// The source MAC of the next frame: `base` with its last byte stepped through `macs` addresses (the first is the NIC's own).
+    fn frame_source(&self, base: [u8; 6]) -> [u8; 6] {
+        let mut mac = base;
+        if self.macs > 1 {
+            mac[5] = mac[5].wrapping_add((self.sequence % u32::from(self.macs)) as u8);
+        }
+        mac
     }
 
     /// If a frame is due, builds it into `out` and returns its length; call
@@ -707,11 +740,13 @@ impl Generator {
             self.next_due_ns = now_ns;
             self.stats.lagged = self.stats.lagged.wrapping_add(1);
         }
-        let size = self.size.clamp(GEN_MIN_SIZE.max(GEN_HEADER_LEN), MAX_FRAME).min(out.len());
+        let size = self.frame_size().clamp(GEN_MIN_SIZE.max(GEN_HEADER_LEN), MAX_FRAME).min(out.len());
+        let source = self.frame_source(source);
+        let interval = self.interval_for(size);
         if let Some(plan) = self.udp {
             build_udp_frame(out, size, &plan, self.destination, source, self.sequence, now_us, self.offload);
             self.sequence = self.sequence.wrapping_add(1);
-            self.next_due_ns += self.interval_ns();
+            self.next_due_ns += interval;
             return Some(size);
         }
         out[0..6].copy_from_slice(&self.destination);
@@ -725,7 +760,7 @@ impl Generator {
             *byte = (offset as u8).wrapping_add(self.sequence as u8);
         }
         self.sequence = self.sequence.wrapping_add(1);
-        self.next_due_ns += self.interval_ns();
+        self.next_due_ns += interval;
         Some(size)
     }
 
@@ -1309,6 +1344,27 @@ mod tests {
         assert_eq!(generator.next_frame(1_000_000, [1; 6], &mut frame, 1), None);
         assert_eq!(generator.next_frame(1_007_999, [1; 6], &mut frame, 0), None);
         assert!(generator.next_frame(1_008_000, [1; 6], &mut frame, 0).is_some());
+    }
+
+    #[test]
+    fn generator_mixes_sizes_and_rotates_source_macs() {
+        let mut generator = Generator::new();
+        generator.rate_kbit = 1_000_000;
+        generator.mix = true;
+        generator.macs = 4;
+        generator.count_limit = 12;
+        generator.start(0);
+        let mut frame = [0u8; 1600];
+        let (mut sizes, mut total, mut sent) = ([0usize; 3], 0, 0);
+        while let Some(length) = generator.next_frame(100_000, [2, 0, 0, 0, 0, 0xfe], &mut frame, sent) {
+            sizes[[64, 576, 1500].iter().position(|&size| size == length).unwrap()] += 1;
+            assert_eq!(frame[11], 0xfe_u8.wrapping_add((sent % 4) as u8));
+            generator.record_send(length, true);
+            total += length;
+            sent += 1;
+        }
+        assert_eq!(sizes, [7, 4, 1]);
+        assert_eq!(total / 12, MIX_MEAN_SIZE);
     }
 
     #[test]
