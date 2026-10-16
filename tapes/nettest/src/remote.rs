@@ -22,7 +22,7 @@ use crate::{Generator, HISTOGRAM_BUCKETS, NIC_COUNTERS, Sink, SinkStats, TIMELIN
 
 pub const CTRL_ETHERTYPE: [u8; 2] = [0x88, 0xb5];
 const MAGIC: &[u8; 4] = b"FNC1";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const HEADER: usize = 26;
 
 const T_HELLO: u8 = 1;
@@ -612,7 +612,7 @@ impl Remote {
                     writer.u32(count);
                 }
                 for count in stats.timeline {
-                    writer.u16(count);
+                    writer.u32(count);
                 }
                 writer.u32(sent);
                 writer.u32(failed);
@@ -691,7 +691,7 @@ impl Remote {
                     stats.histogram[index] = body.u32()?;
                 }
                 for index in 0..TIMELINE_BINS {
-                    stats.timeline[index] = body.u16()?;
+                    stats.timeline[index] = body.u32()?;
                 }
                 let gen_sent = body.u32()?;
                 let gen_failed = body.u32()?;

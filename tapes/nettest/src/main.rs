@@ -104,6 +104,7 @@ struct Session<'a> {
     chosen: usize,
     /// A running `test sweep`: the rate ladder and the best loss-free rate each way so far.
     rate_sweep: Option<RateSweep>,
+    soak: Option<Soak>,
     /// FOSFS write callback (for `save`), the file `gen.save=NAME` writes when a
     /// test finishes, and when the end-of-test summary is due (0 = not pending).
     fs_write: Option<fn(usize, u32, usize, u32) -> u32>,
@@ -227,6 +228,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         probe_at_us: 0,
         chosen: 0,
         rate_sweep: None,
+        soak: None,
         fs_write: None,
         save_name: [0; 16],
         save_name_len: 0,
@@ -562,7 +564,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if let Some(result) = sweep.poll(now_us, generator, sink) {
                 print_sweep_step(putc, &result);
             }
-            if generator_was_running && !session.generator.running {
+            if generator_was_running && !session.generator.running && session.soak.is_none() {
                 print_bytes(putc, b"\ngenerator finished: ");
                 print_gen_line(putc, &session);
                 // Give the last frames a moment to arrive, then summarize.
@@ -2416,6 +2418,24 @@ struct RateSweep {
     next_rate: u32,
 }
 
+/// Seconds per `test soak` segment: one report line each, and the unit counters are compared over.
+const SOAK_SEGMENT_S: u32 = 10;
+
+/// `test soak`: back-to-back segments of one test for a long time, a line per segment, and a summary with the worst second
+/// and how many seconds delivered under 95% of the rate asked for (per direction: 0 up, 1 down).
+#[derive(Clone, Copy)]
+struct Soak {
+    total_s: u32,
+    done_s: u32,
+    worst_percent: [u32; 2],
+    dips: [u32; 2],
+    sent: [u64; 2],
+    got: [u64; 2],
+    /// Changes of every error counter (missed, CRC, PAUSE ... on either end) summed over all segments.
+    counter_changes: u64,
+    by_counter: [u64; COUNTER_NAMES.len()],
+}
+
 fn not_remote(putc: Putc) -> Outcome {
     print_bytes(putc, b"this needs the master mode: type remote N (help two)\n");
     Outcome::Error
@@ -2427,14 +2447,17 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     }
     let mut params = session.remote.as_ref().map_or(TestParams::new(), |remote| remote.test);
     let (mut sweeping, mut to, mut step, mut rate_given, mut time_given, mut settle) = (false, 20_000u32, 2_000u32, false, false, 1u32);
+    let (mut soaking, mut size_given) = (false, false);
     for &word in words {
         match word {
             b"sweep" => sweeping = true,
+            b"soak" => soaking = true,
             b"up" => (params.up, params.down) = (true, false),
             b"down" => (params.up, params.down) = (false, true),
             b"both" => (params.up, params.down) = (true, true),
             b"stop" => {
                 session.rate_sweep = None;
+                session.soak = None;
                 let mut out = [0u8; 512];
                 let Session { remote, generator, .. } = session;
                 let length = remote.as_mut().and_then(|remote| remote.stop_test(generator, &mut out));
@@ -2446,7 +2469,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             }
             _ => {
                 let Some(equals) = word.iter().position(|&byte| byte == b'=') else {
-                    print_bytes(putc, b"use: test [sweep] [up|down|both] [rate=KBIT] [size=B] [time=S] [via=N] [here=N]\n");
+                    print_bytes(putc, b"use: test [sweep|soak] [up|down|both] [rate=KBIT] [size=B] [time=S] [via=N] [here=N]\n");
                     return Outcome::Error;
                 };
                 let value = parse_u32(&word[equals + 1..]).filter(|&value| value > 0);
@@ -2471,8 +2494,8 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                     (b"to", Some(value)) => to = value,
                     (b"step", Some(value)) => step = value,
                     (b"settle", Some(value)) if value <= 60 => settle = value,
-                    (b"size", Some(value)) if (60..=1514).contains(&value) => params.size = value as u16,
-                    (b"time", Some(value)) if value <= 3600 => (params.seconds, time_given) = (value as u16, true),
+                    (b"size", Some(value)) if (60..=1514).contains(&value) => (params.size, size_given) = (value as u16, true),
+                    (b"time", Some(value)) if value <= 86_400 && (soaking || value <= 3600) => (params.seconds, time_given) = (value as u16, true),
                     _ => {
                         print_bytes(putc, b"bad value: rate KBIT, size 60-1514, time 1-3600 s, settle 1-60 s\n");
                         return Outcome::Error;
@@ -2480,6 +2503,20 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                 }
             }
         }
+    }
+    if soaking && !sweeping {
+        let total_s = if time_given { u32::from(params.seconds) } else { 600 };
+        if !rate_given {
+            params.rate_kbit = 900_000;
+        }
+        if !size_given {
+            params.size = 1400;
+        }
+        params.seconds = SOAK_SEGMENT_S as u16;
+        session.soak = Some(Soak { total_s, done_s: 0, worst_percent: [u32::MAX; 2], dips: [0; 2], sent: [0; 2], got: [0; 2], counter_changes: 0, by_counter: [0; COUNTER_NAMES.len()] });
+        print_bytes(putc, b"soak ");
+        print_u32(putc, total_s);
+        print_bytes(putc, b" s in segments of 10 s; per segment: kbit/s, loss, errors\n");
     }
     if sweeping {
         if !rate_given {
@@ -2505,11 +2542,13 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
         if nic as usize >= session.nic_total || (session.mac_at)(nic, here_mac.as_mut_ptr() as usize) == 0 {
             print_bytes(putc, b"here=N: no such NIC (see 'nics')\n");
             session.rate_sweep = None;
+            session.soak = None;
             return Outcome::Error;
         }
         if nic_in_use(session, nic, Some(&Role::Gen)) && session.gen_nic != Some(nic) {
             print_bytes(putc, b"here=N: that NIC has another role\n");
             session.rate_sweep = None;
+            session.soak = None;
             return Outcome::Error;
         }
     }
@@ -2519,7 +2558,7 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
         None => Err("no remote"),
     };
     match result {
-        Ok(()) if session.rate_sweep.is_some() => Outcome::Continue,
+        Ok(()) if session.rate_sweep.is_some() || session.soak.is_some() => Outcome::Continue,
         Ok(()) => {
             print_bytes(putc, b"starting the test (");
             print_bytes(putc, if params.up && params.down { b"both ways" } else if params.up { b"up" } else { b"down" });
@@ -2534,6 +2573,7 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
         }
         Err(reason) => {
             session.rate_sweep = None;
+            session.soak = None;
             print_bytes(putc, reason.as_bytes());
             putc(u32::from(b'\n'));
             Outcome::Error
@@ -2629,6 +2669,116 @@ fn sweep_step_done(putc: Putc, session: &mut Session<'_>) {
         }
     }
     putc(u32::from(b'\n'));
+}
+
+/// Seconds of a segment whose frames arrived at under 95% of the rate asked for, and the lowest second as a percentage.
+fn timeline_dips(stats: &nettest_tape::SinkStats, params: TestParams) -> (u32, u32) {
+    let nominal = (u64::from(params.rate_kbit) * 125 / u64::from(params.size).max(1)).max(1);
+    let bins = usize::from(params.seconds).min(nettest_tape::TIMELINE_BINS);
+    let (mut dips, mut worst) = (0, u32::MAX);
+    for &count in &stats.timeline[..bins] {
+        let percent = (u64::from(count) * 100 / nominal).min(999) as u32;
+        worst = worst.min(percent);
+        if percent < 95 {
+            dips += 1;
+        }
+    }
+    (dips, worst)
+}
+
+/// One `test soak` segment line, the totals, and either the next segment or the summary.
+fn soak_step_done(putc: Putc, session: &mut Session<'_>) {
+    let (Some(mut soak), Some(remote)) = (session.soak, session.remote.as_ref()) else { return };
+    let (Some(report), params) = (remote.report, remote.test) else { return };
+    let changes: u64 = remote.own_counters[2..].iter().chain(report.counters[2..].iter()).sum();
+    soak.counter_changes += changes;
+    for (total, (own, peer)) in soak.by_counter.iter_mut().zip(remote.own_counters[2..].iter().zip(&report.counters[2..])) {
+        *total += own + peer;
+    }
+    soak.done_s += SOAK_SEGMENT_S;
+    print_padded(putc, soak.done_s, 6);
+    print_bytes(putc, b"s");
+    for (index, (enabled, sent, sink)) in [
+        (params.up, session.generator.stats.sent, &report.sink),
+        (params.down, report.gen_sent, &session.sink.stats),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if !enabled {
+            continue;
+        }
+        let mut seen = Sink::new();
+        seen.stats = *sink;
+        let lost = missing_hundredths(sent, sink.received);
+        let (dips, worst) = timeline_dips(sink, params);
+        soak.sent[index] += u64::from(sent);
+        soak.got[index] += u64::from(sink.received);
+        soak.dips[index] += dips;
+        soak.worst_percent[index] = soak.worst_percent[index].min(worst);
+        print_bytes(putc, if index == 0 { b"  up " } else { b"  down " });
+        print_u32(putc, seen.average_kbit() as u32);
+        print_bytes(putc, b" ");
+        print_u32(putc, lost / 100);
+        putc(u32::from(b'.'));
+        print_two_digits(putc, lost % 100);
+        print_bytes(putc, b"%");
+    }
+    print_bytes(putc, b"  errors ");
+    print_u32(putc, changes.min(u64::from(u32::MAX)) as u32);
+    putc(u32::from(b'\n'));
+    if soak.done_s < soak.total_s {
+        session.soak = Some(soak);
+        let _ = begin_test(putc, session, params);
+        return;
+    }
+    session.soak = None;
+    print_bytes(putc, b"soak done: ");
+    print_u32(putc, soak.done_s);
+    print_bytes(putc, b" s\n");
+    for (index, enabled, label) in [(0, params.up, &b"up  "[..]), (1, params.down, &b"down"[..])] {
+        if !enabled {
+            continue;
+        }
+        print_bytes(putc, b"  ");
+        print_bytes(putc, label);
+        print_bytes(putc, b": sent ");
+        print_u32(putc, (soak.sent[index] / 1000) as u32);
+        print_bytes(putc, b"k, lost ");
+        let lost = missing_hundredths_wide(soak.sent[index], soak.got[index]);
+        print_u32(putc, lost / 100);
+        putc(u32::from(b'.'));
+        print_two_digits(putc, lost % 100);
+        print_bytes(putc, b"%, worst second ");
+        print_u32(putc, soak.worst_percent[index].min(999));
+        print_bytes(putc, b"% of the rate, ");
+        print_u32(putc, soak.dips[index]);
+        print_bytes(putc, b" seconds under 95%\n");
+    }
+    print_bytes(putc, b"  error counter changes on both NICs: ");
+    print_u32(putc, soak.counter_changes.min(u64::from(u32::MAX)) as u32);
+    let mut any = false;
+    for (name, &value) in COUNTER_NAMES.iter().zip(&soak.by_counter) {
+        if value != 0 {
+            print_bytes(putc, if any { b", " } else { b" (" });
+            print_u32(putc, value.min(u64::from(u32::MAX)) as u32);
+            putc(u32::from(b' '));
+            print_bytes(putc, name);
+            any = true;
+        }
+    }
+    if any {
+        putc(u32::from(b')'));
+    }
+    putc(u32::from(b'\n'));
+}
+
+/// `missing_hundredths` for totals that no longer fit 32 bits.
+fn missing_hundredths_wide(sent: u64, received: u64) -> u32 {
+    if sent == 0 {
+        return 0;
+    }
+    ((sent.saturating_sub(received) * 10_000) / sent) as u32
 }
 
 /// One pass of the two-machine engine: read the NIC, run the master's timers, report events.
@@ -2778,12 +2928,14 @@ fn print_remote_event(putc: Putc, session: &mut Session<'_>, nic: u32, event: Re
                 }
             }
         }
-        RemoteEvent::Started if session.rate_sweep.is_some() => {}
+        RemoteEvent::Started if session.rate_sweep.is_some() || session.soak.is_some() => {}
         RemoteEvent::Started => print_bytes(putc, b"test running...\n"),
         RemoteEvent::Finished if session.rate_sweep.is_some() => sweep_step_done(putc, session),
+        RemoteEvent::Finished if session.soak.is_some() => soak_step_done(putc, session),
         RemoteEvent::Finished => print_remote_report(putc, session, nic),
         RemoteEvent::Failed(reason) => {
             session.rate_sweep = None;
+            session.soak = None;
             print_bytes(putc, reason.as_bytes());
             putc(u32::from(b'\n'));
         }
@@ -2843,6 +2995,8 @@ fn print_remote_report(putc: Putc, session: &Session<'_>, nic: u32) {
     print_bytes(putc, b"(one-way latency depends on the clock offset above; loss, rate and jitter do not)\n");
 }
 
+const COUNTER_NAMES: [&[u8]; 7] = [b"missed", b"no-buffer", b"CRC", b"symbol", b"XOFF in", b"XOFF out", b"queue drops"];
+
 /// The test NIC's negotiated speed and what its error counters gained during the test (all zero is the good case).
 fn print_link_counters(putc: Putc, who: &[u8], counters: &[u64; nettest_tape::NIC_COUNTERS]) {
     if counters[0] == 0 {
@@ -2853,9 +3007,8 @@ fn print_link_counters(putc: Putc, who: &[u8], counters: &[u64; nettest_tape::NI
     print_bytes(putc, b": ");
     print_u32(putc, counters[0] as u32);
     print_bytes(putc, if counters[1] != 0 { b" Mbit/s full duplex" } else { b" Mbit/s HALF duplex" });
-    let names: [&[u8]; 7] = [b"missed", b"no-buffer", b"CRC", b"symbol", b"XOFF in", b"XOFF out", b"queue drops"];
     let mut any = false;
-    for (name, &value) in names.iter().zip(&counters[2..]) {
+    for (name, &value) in COUNTER_NAMES.iter().zip(&counters[2..]) {
         if value != 0 {
             print_bytes(putc, if any { b", " } else { b"\n  during test: " });
             print_u32(putc, value.min(u64::from(u32::MAX)) as u32);

@@ -762,7 +762,7 @@ pub struct SinkStats {
     pub histogram: [u32; HISTOGRAM_BUCKETS],
     /// Frames received in each second after the first one (later seconds all land in the last bin): where in a
     /// test the loss happened.
-    pub timeline: [u16; TIMELINE_BINS],
+    pub timeline: [u32; TIMELINE_BINS],
 }
 
 pub const TIMELINE_BINS: usize = 30;

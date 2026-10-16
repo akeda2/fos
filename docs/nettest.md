@@ -532,6 +532,15 @@ second`): a steady shortfall means a rate limit, a single dip means an outage. T
 from a 33-bucket histogram (50 us up to 5 s, steps of 1-2.5 ms around 1-10 ms and 5-25 ms up to 150 ms). The minimum is clamped at 0 when the offset error exceeds the true delay, so
 trust the queueing figure rather than the minimum. On a powerline link the knee moves between runs.
 
+`test soak [both|up|down] [rate=KBIT] [size=B] [time=S]` (defaults 900000 kbit/s of 1400 B frames for 600 s; `time` up to
+86400) runs 10 s tests back to back, so a switch can be watched for ten minutes or hours. Each segment prints one line (kbit/s
+delivered and loss each way, and how many error counters moved on both NICs), and the summary gives the loss over the whole run,
+the worst second as a percentage of the rate asked for, the seconds that delivered under 95% of it, and which counters moved
+(missed packets, CRC, PAUSE ...). A segment starts a moment after the last, so the soak takes about a quarter longer on the
+wall clock than `time`. `test stop` ends it. The tape prints nothing per frame, and the soak suppresses "generator finished" so a
+console line (about 10 ms on real hardware) does not make the receiver miss frames: that print was good for 8 missed packets per
+segment on the I350 pair. A 60 s soak at 900 Mbit/s through the Deltaco switch showed 0 errors and a worst second of 99%.
+
 Control frames are ethertype 0x88B5, magic `FNC1`. On selection the master exchanges its time by unicast
 using the IEEE 1588 delay request-response arithmetic (the ptp tape cannot run at the same time): eight
 samples, the minimum round trip is used, and half that round trip is the printed error bound. Loss, rate
