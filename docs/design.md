@@ -365,6 +365,13 @@ firmware, so a pending slot is tried on the next boot.
   about -60 dB at 1 kHz otherwise) and `Servo` a PI controller on the playback ring level (second order,
   w = 0.14 rad/s, z = 0.87, limited to +-2000 ppm) that learns the steady clock ratio; `drift=slip` keeps the old
   behaviour. Host unit tests cover the filter, the servo's convergence on a 400 ppm offset and the formats.
+  **`drift=ptp` (prototype, AVTP, locked PTP clock):** fits the sender's frames against its capture stamps and the
+  sound card's played frames (written minus ring level) against PTP time (`audio_wire::RateFit`, least squares, since the
+  level moves in whole packets), and starts the servo at the ratio after 8 s (`Servo::seed_ppm`). Measured on the lab
+  (clock1 steered master, rack2 tone sender, skylake2 USB audio): the fit said -171 ppm where the servo learned -172, so
+  the two independent measurements agree; seeding did not shorten settling, because the ring level seen at arrival stays
+  near 60 frames against a 288 target in every run (with or without it), i.e. the servo's error is mostly not
+  controllable (suspected: the USB driver pulls data into transfers ahead of the visible ring). Not investigated further.
   Hardware (H6 on the Skylake to the UFX on the Sandy Bridge machine, raw Ethernet, 100 s, 100,045 packets): 0 lost,
   0 frames dropped or repeated, learned offset 8 ppm (so the two interfaces' clocks agree to ~10 ppm). With the
   sender deliberately skewed (`skew=` on a tone source) the learned offset moves by exactly the skew (+400 then

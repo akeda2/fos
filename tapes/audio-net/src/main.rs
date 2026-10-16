@@ -23,7 +23,7 @@
 //! output channels the stream's channels go to (default 1, 2, ...). The two hosts' clocks differ slightly, so
 //! the receiver keeps the playback ring near `target=` ms: by default a variable-rate resampler (4-point cubic,
 //! integer) steered by a small PI servo learns the true clock ratio, a few hundred ppm, and follows it without
-//! ever dropping or repeating a sample (`drift=resample`); `drift=slip` instead drops or repeats one frame when
+//! ever dropping or repeating a sample (`drift=resample`); `drift=ptp` seeds the servo from PTP stamps (AVTP); `drift=slip` instead drops or repeats one frame when
 //! the level strays. A lost packet is replaced by silence of the same length. `secs=` ends either side after
 //! that long; Escape always does.
 //!
@@ -72,6 +72,9 @@ mod stats;
 mod peers;
 mod serve;
 mod opus;
+
+/// How long `drift=ptp` measures before it starts the servo: enough samples for a few ppm, far less than the servo's own ~45 s.
+const SEED_SECS: f64 = 8.0;
 
 use audio_wire::{ChannelSet, ETHERNET_HEADER, ETHERTYPE, Fill, HEADER_LEN, Header, MAX_RAW_PAYLOAD, MAX_RTP_PAYLOAD, Resampler, Sdp, Servo, Slip, frames_to_device, pack, unpack, wire_to_frames, write_sdp};
 use net::{Inbound, NetConfig};
@@ -170,6 +173,8 @@ pub struct Options<'a> {
     from: Option<[u8; 6]>,
     /// Clock-drift handling: a resampler steered by a servo (default) or single-frame slips.
     resample: bool,
+    /// `drift=ptp`: resample, and start the servo at the rate PTP stamps measure (AVTP with a locked clock).
+    ptp_seed: bool,
     /// Test aid for `send src=tone`: run the sender's clock this many ppm fast (negative: slow).
     skew_ppm: i64,
     /// `codec=opus`: PCM (default) or Opus over RTP.
@@ -226,7 +231,7 @@ pub fn nic_by_mac(mac: [u8; 6]) -> Option<usize> {
 pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'static str> {
     let mut options = Options {
         proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, priority: None, ptime_us: 1000, target_given: false, ptime_given: false, seconds: 0, verbose: false, latency: false,
-        ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, skew_ppm: 0,
+        ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, ptp_seed: false, skew_ppm: 0,
         opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0, ptp: true, ptp_l2: false,
     };
     for word in words {
@@ -265,7 +270,10 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "gw" => options.gateway = value,
             "port" => options.port = value.parse().map_err(|_| "port= needs a number")?,
             "pt" => options.payload_type = value.parse().ok().filter(|&p| p < 128).ok_or("pt= is 0 to 127")?,
-            "drift" => options.resample = match value { "resample" => true, "slip" => false, _ => return Err("drift= is resample or slip") },
+            "drift" => {
+                options.resample = match value { "resample" | "ptp" => true, "slip" => false, _ => return Err("drift= is resample, slip or ptp") };
+                options.ptp_seed = value == "ptp";
+            }
             "skew" => options.skew_ppm = value.parse().map_err(|_| "skew= needs a number of ppm")?,
             "in" => options.in_channels = Some(ChannelSet::parse(value).ok_or("in= is like 1-2 or 9-10,1")?),
             "out" => options.out_channels = Some(ChannelSet::parse(value).ok_or("out= is like 1-2 or 9-10,1")?),
@@ -1058,6 +1066,10 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let mut servo = Servo::new(0);
     let mut adapt: Option<Adapt> = None;
     let mut resampler = Resampler::new(2);
+    // drift=ptp: the sender's frame rate against its AVTP capture stamps, the card's played frames against PTP time.
+    let (mut sender_fit, mut device_fit) = (audio_wire::RateFit::new(), audio_wire::RateFit::new());
+    let (mut sender_time, mut sender_frames, mut previous_stamp, mut written_out) = (0i64, 0f64, None::<u32>, 0u64);
+    let mut ptp_seeded: Option<i32> = None;
     let mut work = [0i32; 4096];
     let mut resampled = [0i32; 4096];
     let mut placement = [None; audio_wire::MAX_CHANNELS];
@@ -1170,6 +1182,19 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                 stats::get().ptp_arrival(delay / 1000, last_packet);
             }
         }
+        if let Some(time) = packet.avtp_time.filter(|_| options.ptp_seed && clock::locked()) {
+            // The stamps wrap every 4.29 s: sum the 32-bit differences of consecutive packets.
+            if let Some(previous) = previous_stamp.replace(time) {
+                if packet.sequence.wrapping_sub(expected) == 0 {
+                    sender_time += i64::from(time.wrapping_sub(previous) as i32);
+                    sender_frames += packet.frames as f64;
+                    sender_fit.push(sender_time, sender_frames);
+                } else {
+                    sender_fit.reset();
+                    (sender_time, sender_frames) = (0, 0.0);
+                }
+            }
+        }
         if let Some(stamp) = packet.rtp_timestamp.filter(|_| clock::locked()) {
             // A sender on the same PTP timeline: the stamp is when its first sample was captured.
             if let Some(delay) = clock::time_ns_at(received_at).and_then(|now| ptp_tape::stamp_delay(now, stamp, packet.rate, 500_000_000)) {
@@ -1209,6 +1234,11 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             info.playback_space as usize
         }) / device_frame;
         slow_info = slow_info.max(tape_rt::micros() - t_info);
+        if options.ptp_seed && options.resample {
+            if let Some(now) = clock::time_ns_at(t_info) {
+                device_fit.push(now, written_out as f64 - level as f64);
+            }
+        }
         (level_min, level_max, level_samples) = (level_min.min(level), level_max.max(level), level_samples + 1);
         (second_low, second_high) = (second_low.min(level), second_high.max(level));
         if level < frames {
@@ -1244,7 +1274,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             }
             frames_to_device(&resampled, wire_channels, produced, &placement[..wire_channels], slot, device_channels, &mut staging);
             let bytes = produced * device_frame;
-            if (api.audio_write)(staging.as_ptr(), bytes) < bytes {
+            let accepted = (api.audio_write)(staging.as_ptr(), bytes);
+            written_out += (accepted / device_frame) as u64;
+            if accepted < bytes {
                 dropped += 1; // the ring is full (the sender runs fast, or the device stalled)
             }
         } else {
@@ -1287,6 +1319,14 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         }
         if tape_rt::micros() >= next_report {
             next_report += 1_000_000;
+            if options.ptp_seed && ptp_seeded.is_none() && sender_fit.span_secs() >= SEED_SECS && device_fit.span_secs() >= SEED_SECS {
+                if let Some(ppm) = sender_fit.rate().zip(device_fit.rate()).and_then(|(sender, device)| audio_wire::rate_ratio_ppm(sender, device)) {
+                    let learned = servo.offset_ppm();
+                    servo.seed_ppm(ppm as i32);
+                    ptp_seeded = Some(ppm as i32);
+                    println!("\nPTP: sender runs {ppm:+.1} ppm against this sound card; servo started there (it had learned {learned} ppm by itself).");
+                }
+            }
             (shown.level_low, shown.level_high) = (if second_low == usize::MAX { 0 } else { second_low as u32 }, second_high as u32);
             (second_low, second_high) = (usize::MAX, 0);
             (shown.pass_gap_us, second_gap) = (second_gap as u32, 0);
@@ -1315,6 +1355,17 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         let shown = stats::get();
         let ring_us = i64::from(shown.level_frames) * 1_000_000 / i64::from(shown.rate.max(1));
         println!("PTP: capture to arrival {} us on average ({} to {}); with the {} us in the ring, about {} us from the sender's capture to this playback ring ({} packets).", shown.ptp_delay_us, shown.ptp_min_us, shown.ptp_max_us, ring_us, shown.ptp_delay_us + ring_us, shown.ptp_samples);
+    }
+    if options.ptp_seed {
+        match sender_fit.rate().zip(device_fit.rate()) {
+            Some((sender, device)) => {
+                println!("PTP rate fit: sender {sender:.2} Hz, sound card {device:.2} Hz over {:.0} s: {:+.1} ppm; the servo ended at {} ppm.", device_fit.span_secs(), audio_wire::rate_ratio_ppm(sender, device).unwrap_or(0.0), servo.offset_ppm());
+                if let Some(ppm) = ptp_seeded {
+                    println!("PTP: the servo was seeded with {ppm} ppm after {SEED_SECS:.0} s.");
+                }
+            }
+            None => println!("PTP rate fit: not enough stamped packets (needs AVTP and a locked clock)."),
+        }
     }
     if options.resample {
         println!("Delay sender capture to playback ring: about {} ms (one packet plus {} ms queued); the device adds its own buffer.", stats::get().delay_ms(), stats::get().level_frames * 1000 / stats::get().rate.max(1));

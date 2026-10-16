@@ -399,6 +399,64 @@ impl Servo {
     pub fn offset_ppm(&self) -> i32 {
         (self.integral_ppb / 1000) as i32
     }
+
+    /// Starts the integral at a rate measured another way (PTP stamps), so the ring level only has to trim the rest.
+    pub fn seed_ppm(&mut self, ppm: i32) {
+        self.integral_ppb = (i64::from(ppm) * 1000).clamp(-MAX_PPB, MAX_PPB);
+    }
+}
+
+/// Least-squares slope of a counter against time, for rates measured against one clock (PTP time): the sender's
+/// frames against its capture stamps, the sound card's played frames against the receiver's PTP time. A fit over
+/// many samples, not the two end points, because each sample is quantised (a ring level moves in whole packets).
+#[derive(Clone, Copy, Default)]
+pub struct RateFit {
+    origin: Option<(i64, f64)>,
+    n: f64,
+    sx: f64,
+    sy: f64,
+    sxy: f64,
+    sxx: f64,
+    span_ns: i64,
+}
+
+impl RateFit {
+    pub const fn new() -> RateFit {
+        RateFit { origin: None, n: 0.0, sx: 0.0, sy: 0.0, sxy: 0.0, sxx: 0.0, span_ns: 0 }
+    }
+
+    pub fn reset(&mut self) {
+        *self = RateFit::new();
+    }
+
+    /// One sample: `count` (frames) at `time_ns`.
+    pub fn push(&mut self, time_ns: i64, count: f64) {
+        let (t0, c0) = *self.origin.get_or_insert((time_ns, count));
+        let x = (time_ns - t0) as f64 / 1e9;
+        let y = count - c0;
+        self.n += 1.0;
+        self.sx += x;
+        self.sy += y;
+        self.sxy += x * y;
+        self.sxx += x * x;
+        self.span_ns = time_ns - t0;
+    }
+
+    /// Seconds between the first and last sample.
+    pub fn span_secs(&self) -> f64 {
+        self.span_ns as f64 / 1e9
+    }
+
+    /// Counts per second, once there are at least 20 samples over a measurable span.
+    pub fn rate(&self) -> Option<f64> {
+        let denominator = self.n * self.sxx - self.sx * self.sx;
+        (self.n >= 20.0 && denominator > 1e-6).then(|| (self.n * self.sxy - self.sx * self.sy) / denominator)
+    }
+}
+
+/// How much faster the sender's sample clock runs than the sound card's, in ppm, from two measured rates.
+pub fn rate_ratio_ppm(sender_hz: f64, device_hz: f64) -> Option<f64> {
+    (sender_hz > 1.0 && device_hz > 1.0).then(|| (sender_hz / device_hz - 1.0) * 1e6)
 }
 
 /// Everything an SDP description of one RTP audio stream needs.
@@ -1350,5 +1408,33 @@ mod tests {
         let mut packet = [0u8; 700];
         let size = sap::encode([0; 4], false, 5, &sdp, &mut packet);
         assert_eq!(sap::parse(&packet[..size]).unwrap().sdp, &sdp[..]);
+    }
+
+    #[test]
+    fn rate_fit_finds_the_slope_through_quantised_samples() {
+        // A card playing 48000.0 * (1 - 170 ppm) frames a second, its level read in whole 48-frame packets.
+        let mut fit = RateFit::new();
+        for tick in 0..300 {
+            let seconds = tick as f64 * 0.1;
+            let played = (seconds * 48_000.0 * (1.0 - 170e-6) / 48.0).floor() * 48.0;
+            fit.push((seconds * 1e9) as i64, played);
+        }
+        let device = fit.rate().unwrap();
+        assert!((device - 47_991.84).abs() < 1.0, "device {device}");
+        let ppm = rate_ratio_ppm(48_000.0, device).unwrap();
+        assert!((ppm - 170.0).abs() < 25.0, "ratio {ppm} ppm");
+    }
+
+    #[test]
+    fn rate_fit_needs_samples_and_seed_is_clamped() {
+        let mut fit = RateFit::new();
+        fit.push(0, 0.0);
+        assert!(fit.rate().is_none());
+        assert!(rate_ratio_ppm(0.0, 48_000.0).is_none());
+        let mut servo = Servo::new(576);
+        servo.seed_ppm(-168);
+        assert_eq!(servo.offset_ppm(), -168);
+        servo.seed_ppm(50_000);
+        assert_eq!(servo.offset_ppm(), 2000);
     }
 }
