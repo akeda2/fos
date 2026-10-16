@@ -475,8 +475,8 @@ Run nettest on two machines to measure the physical network between them.
   unicast HELLO to every announced machine on that NIC
   (nothing is broadcast, so other hosts are not disturbed), auto-selects a lone server, and otherwise lets
   you choose with `peer N|NAME|MAC` or the `P` key at an empty prompt. `peer` alone probes again.
-- `test [up|down|both] [rate=KBIT] [size=B] [time=S]` runs the test (default both ways, 10000 kbit/s,
-  1000 B, 5 s); `test stop` aborts. The master then fetches the server's counters and prints one merged
+- `test [up|down|both] [rate=KBIT] [size=B] [time=S]` runs the test (default both ways, 900000 kbit/s,
+  1400 B, 5 s: a plain `test` loads a gigabit link nearly fully); `test stop` aborts. The master then fetches the server's counters and prints one merged
   report (sent, received, loss, jitter, latency per direction; tail loss shown as "not delivered").
 
 A plain `nettest` with no arguments is the far end; a role typed at its prompt (`link A B`, `gen nic N`,

@@ -2738,7 +2738,8 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     }
     // Every test starts from the defaults (both ways), so one command does not depend on the last; only the test path
     // (via=N, here=N) is kept, as documented.
-    let mut params = TestParams::new();
+    // A plain `test` is the first thing a user types: it offers (nearly) a gigabit link's full rate, not a token trickle.
+    let mut params = TestParams { rate_kbit: 900_000, size: 1400, ..TestParams::new() };
     if let Some(remote) = session.remote.as_ref() {
         (params.via, params.here) = (remote.test.via, remote.test.here);
     }

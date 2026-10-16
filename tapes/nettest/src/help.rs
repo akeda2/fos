@@ -84,7 +84,7 @@ Two machines: run nettest on both. Unicast only; other hosts are not disturbed.
   test stop                abort a running test
   via=N here=N             run the test on the peer's NIC N / our NIC N (kept
                            until changed; 0 = the control NIC)
-Each test starts from the defaults (both ways, 10000 kbit/s, 1000 B, 5 s).
+Each test starts from the defaults (both ways, 900000 kbit/s, 1400 B, 5 s).
 The report begins with a Summary line; below it, per direction: frames, loss,
 rate, latency, queueing delay, delivery per second. 'help check' says more.
 ";
