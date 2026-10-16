@@ -963,7 +963,7 @@ impl E1000 {
         let missed = state.missed.fetch_add(missed, Ordering::Relaxed) + missed;
         let none = state.no_buffers.fetch_add(none, Ordering::Relaxed) + none;
         crate::println!("   receive ring: {RX_COUNT} buffers; card counted {missed} missed packets, {none} no-buffer events");
-        let mut take = |register: usize, total: &core::sync::atomic::AtomicU64| {
+        let take = |register: usize, total: &core::sync::atomic::AtomicU64| {
             let now = u64::from(read(self.registers, register));
             total.fetch_add(now, Ordering::Relaxed) + now
         };

@@ -2816,6 +2816,7 @@ fn print_remote_report(putc: Putc, session: &Session<'_>, nic: u32) {
         print_delay_detail(putc, &peer_sink.stats);
         print_timeline(putc, &peer_sink.stats, remote.test);
         print_missing(putc, session.generator.stats.sent, report.sink.received);
+        print_offered(putc, session.generator.stats.sent, remote.test);
     }
     if remote.test.down {
         print_bytes(putc, b"down (peer -> here): sent ");
@@ -2825,6 +2826,7 @@ fn print_remote_report(putc: Putc, session: &Session<'_>, nic: u32) {
         print_delay_detail(putc, &session.sink.stats);
         print_timeline(putc, &session.sink.stats, remote.test);
         print_missing(putc, report.gen_sent, session.sink.stats.received);
+        print_offered(putc, report.gen_sent, remote.test);
     }
     print_bytes(putc, b"(one-way latency depends on the clock offset above; loss, rate and jitter do not)\n");
 }
@@ -2859,6 +2861,24 @@ fn print_timeline(putc: Putc, stats: &nettest_tape::SinkStats, params: TestParam
         print_padded(putc, ((u64::from(count) * 100) / nominal).min(999) as u32, 4);
     }
     putc(u32::from(b'\n'));
+}
+
+/// Frames the generator managed to send against what the rate asked for: below about 95% the tape (CPU per frame), not
+/// the link, was the limit, and the delivered rate says nothing about the switch.
+fn print_offered(putc: Putc, sent: u32, params: TestParams) {
+    let size = u64::from(params.size).max(1);
+    // The generator paces by frame bytes alone, but a gigabit wire also carries 20 bytes of preamble and gap per frame:
+    // asking for more than that is not the tape's fault.
+    let per_second = (u64::from(params.rate_kbit) * 125 / size).min(1_000_000 * 125 / (size + 20));
+    let wanted = per_second * u64::from(params.seconds);
+    if wanted == 0 || u64::from(sent) * 100 >= wanted * 95 {
+        return;
+    }
+    print_bytes(putc, b"  tape limit: generator sent ");
+    print_u32(putc, (u64::from(sent) * 100 / wanted) as u32);
+    print_bytes(putc, b"% of the offered rate (");
+    print_u32(putc, (u64::from(sent) / u64::from(params.seconds).max(1)) as u32);
+    print_bytes(putc, b" frames/s)\n    the tape, not the link, is the limit: use a lower rate or larger size\n");
 }
 
 /// Frames sent but never counted, which the sink's sequence-gap loss cannot see at the tail of a test.

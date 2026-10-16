@@ -513,7 +513,11 @@ flat-lines at one number from the first step is a link-speed or port fault; a nu
 (a damaged pair), a partner that never offers it at the far port. In that example moving the cable to another port did not help
 (still 100), and after the next reboot of the host the link came up at 1000 with both receivers OK; the same sweep then
 delivered 900 Mbit/s both ways at 1400 B with 0.00% loss. Small frames test the tape more than the switch: at 64 B the
-generator and sink loops top out near 60 kframes/s here, far below the switch's rate, so do not read that as a switch limit.
+generator and sink loops top out at roughly 80 kframes/s each way while both run (about 40 Mbit/s), far below the switch's
+rate, so do not read that as a switch limit. A remote report says so itself: when a generator sent under 95% of the frames
+the rate asked for (counting the 20 bytes of preamble and gap per frame on a gigabit wire), the direction gets a "tape
+limit" line. Since the kernel frame queue holds 256 frames per NIC and `nic list` shows how many were dropped, a loss
+with "tape frame queue ... dropped" growing is the tape's own, not the link's.
 
 direction (try `size=64`, `size=1500` and `up`/`down` separately) points at the switch's forwarding or buffers.
 
