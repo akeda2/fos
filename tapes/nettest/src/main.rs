@@ -603,6 +603,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             let event = read_key();
             if event == TAPE_EVENT_ABORT {
                 putc(u32::from(b'\n'));
+                if test_active(&session) {
+                    // The first Escape ends the test, not nettest.
+                    stop_test_now(&mut session);
+                    print_bytes(putc, b"test aborted (Escape again leaves nettest)\nnettest> ");
+                    continue;
+                }
                 break 'run;
             }
             if event >= TAPE_EVENT_BYTE_BASE {
@@ -2727,9 +2733,48 @@ struct Soak {
     by_counter: [u64; COUNTER_NAMES.len()],
 }
 
+/// Is a two-machine test (or a sweep, soak, burst or check between its steps) in progress on this master?
+fn test_active(session: &Session<'_>) -> bool {
+    session.remote.as_ref().is_some_and(|remote| remote.role == RemoteRole::Master && remote.busy())
+        || session.rate_sweep.is_some()
+        || session.soak.is_some()
+        || session.burst.is_some()
+        || session.check.is_some()
+}
+
+/// Ends whatever test is running and tells the server to stop its generator.
+fn stop_test_now(session: &mut Session<'_>) {
+    session.rate_sweep = None;
+    session.soak = None;
+    session.burst = None;
+    session.check = None;
+    let mut out = [0u8; 512];
+    let Session { remote, generator, .. } = session;
+    let length = remote.as_mut().and_then(|remote| remote.stop_test(generator, &mut out));
+    if let (Some(length), Some(nic)) = (length, session.gen_nic) {
+        let _ = nic_send_at(nic, out.as_ptr() as usize, length as u32);
+    }
+}
+
 fn not_remote(putc: Putc) -> Outcome {
     print_bytes(putc, b"this needs the master mode: type remote N (help two)\n");
     Outcome::Error
+}
+
+/// The option names as typed -> the names `test_command` works with. The clear names come first in the help; the short
+/// older spellings keep working. `from=` is the start rate of a sweep and the first burst size of a burst.
+fn canonical_option(name: &[u8], burst: bool) -> &[u8] {
+    match name {
+        b"from" if burst => b"count",
+        b"from" => b"rate",
+        b"pause" => b"settle",
+        b"min-rate" => b"expect",
+        b"max-loss" => b"loss",
+        b"peer-nic" => b"via",
+        b"our-nic" => b"here",
+        b"source-macs" => b"macs",
+        other => other,
+    }
 }
 
 fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outcome {
@@ -2746,6 +2791,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     let (mut sweeping, mut to, mut step, mut rate_given, mut time_given, mut settle) = (false, 1_000_000u32, 100_000u32, false, false, 1u32);
     let (mut soaking, mut size_given, mut bursting, mut count) = (false, false, false, 32u32);
     let (mut checking, mut to_given) = (false, false);
+    let burst_mode = words.contains(&&b"burst"[..]);
     let (mut expect_kbit, mut loss_permille) = (0u32, None);
     if words.iter().any(|&word| matches!(word, b"help" | b"?")) {
         let topic: &[u8] = [&b"sweep"[..], b"soak", b"burst", b"check"].into_iter().find(|&mode| words.contains(&mode)).unwrap_or(b"test");
@@ -2762,62 +2808,58 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             b"down" => (params.up, params.down) = (false, true),
             b"both" => (params.up, params.down) = (true, true),
             b"stop" => {
-                session.rate_sweep = None;
-                session.soak = None;
-                session.burst = None;
-                session.check = None;
-                let mut out = [0u8; 512];
-                let Session { remote, generator, .. } = session;
-                let length = remote.as_mut().and_then(|remote| remote.stop_test(generator, &mut out));
-                if let (Some(length), Some(nic)) = (length, session.gen_nic) {
-                    let _ = nic_send_at(nic, out.as_ptr() as usize, length as u32);
-                }
+                stop_test_now(session);
                 print_bytes(putc, b"test stopped\n");
                 return Outcome::Continue;
             }
             _ => {
                 let Some(equals) = word.iter().position(|&byte| byte == b'=') else {
-                    print_bytes(putc, b"use: test [check|sweep|soak|burst] [up|down|both] [rate=KBIT] [size=B|mix] [time=S]\n  [macs=N] [expect=KBIT] [loss=PCT] [count=N] [to=N] [via=N] [here=N]\n");
+                    print_bytes(putc, b"unknown word; 'test help' lists the commands and options\n");
                     return Outcome::Error;
                 };
+                let name = canonical_option(&word[..equals], burst_mode);
+                if !matches!(name, b"via" | b"here" | b"size" | b"macs" | b"loss" | b"expect" | b"rate" | b"to" | b"count" | b"step" | b"settle" | b"time") {
+                    print_bytes(putc, b"unknown option; 'test help' lists them\n");
+                    return Outcome::Error;
+                }
                 let value = parse_u32(&word[equals + 1..]).filter(|&value| value > 0);
-                if matches!(&word[..equals], b"via" | b"here") {
+                if matches!(name, b"via" | b"here") {
                     let number = match &word[equals + 1..] {
                         b"0" | b"control" | b"ctl" => Some(0),
                         other => parse_u32(other).filter(|&value| (1..=16).contains(&value)),
                     };
                     let Some(number) = number else {
-                        print_bytes(putc, b"via=N / here=N: a NIC number, or 0 for the control NIC\n");
+                        print_bytes(putc, b"peer-nic=N / our-nic=N: a NIC number, or 0 for the control NIC\n");
                         return Outcome::Error;
                     };
-                    if &word[..equals] == b"via" {
+                    if name == b"via" {
                         params.via = number as u8;
                     } else {
                         params.here = number as u8;
                     }
                     continue;
                 }
-                if &word[..equals] == b"size" && &word[equals + 1..] == b"mix" {
+                if name == b"size" && &word[equals + 1..] == b"mix" {
                     (params.size, params.mix, size_given) = (nettest_tape::MIX_MEAN_SIZE as u16, true, true);
                     continue;
                 }
-                if &word[..equals] == b"macs" {
+                if name == b"macs" {
                     let Some(macs) = parse_u32(&word[equals + 1..]).filter(|&macs| (1..=255).contains(&macs)) else {
-                        print_bytes(putc, b"macs=N: source addresses to rotate through, 1-255\n");
+                        print_bytes(putc, b"source-macs=N: how many source addresses to rotate through, 1-255\n");
                         return Outcome::Error;
                     };
                     params.macs = macs as u8;
                     continue;
                 }
-                if &word[..equals] == b"loss" {
+                if name == b"loss" {
                     let Some(limit) = nettest_tape::parse_permille(&word[equals + 1..]) else {
-                        print_bytes(putc, b"loss=PCT: the loss allowed, such as 0 or 0.1 (one decimal)\n");
+                        print_bytes(putc, b"max-loss=PERCENT: the loss allowed, such as 0 or 0.1 (one decimal)\n");
                         return Outcome::Error;
                     };
                     loss_permille = Some(limit);
                     continue;
                 }
-                match (&word[..equals], value) {
+                match (name, value) {
                     (b"expect", Some(value)) => expect_kbit = value,
                     (b"rate", Some(value)) => (params.rate_kbit, rate_given) = (value, true),
                     (b"to", Some(value)) => (to, to_given) = (value, true),
@@ -2827,7 +2869,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                     (b"size", Some(value)) if (60..=1514).contains(&value) => (params.size, size_given) = (value as u16, true),
                     (b"time", Some(value)) if value <= 86_400 && (soaking || value <= 3600) => (params.seconds, time_given) = (value as u16, true),
                     _ => {
-                        print_bytes(putc, b"bad value: rate KBIT, size 60-1514, time 1-3600 s, settle 1-60 s\n");
+                        print_bytes(putc, b"bad value: rate/from/to/step in kbit/s, size 60-1514 bytes, time 1-3600 seconds, pause 1-60 seconds\n");
                         return Outcome::Error;
                     }
                 }
@@ -2847,7 +2889,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             params.size = 1400;
         }
         if count == 0 || to < count {
-            print_bytes(putc, b"burst: count=FRAMES to=FRAMES (to at least count)\n");
+            print_bytes(putc, b"burst: from=FRAMES to=FRAMES (to at least from)\n");
             return Outcome::Error;
         }
         params.rate_kbit = 4_000_000;
@@ -2880,7 +2922,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             params.seconds = 3;
         }
         if to < params.rate_kbit || step == 0 {
-            print_bytes(putc, b"sweep: rate=FROM to=TO step=STEP (kbit/s), TO at least FROM\n");
+            print_bytes(putc, b"sweep: from=KBIT to=KBIT step=KBIT (to at least from, step above 0)\n");
             return Outcome::Error;
         }
         session.rate_sweep = Some(RateSweep { to, step, best_up: 0, best_down: 0, settle_us: u64::from(settle) * 1_000_000, resume_at_us: 0, next_rate: 0 });

@@ -78,14 +78,16 @@ Two machines: run nettest on both. Unicast only; other hosts are not disturbed.
   serve N | serve off      far end on NIC N: waits for a master and answers it
   remote N | remote off    master on NIC N: probes the announced machines
   peer                     probe again; 'peer N|NAME|MAC' picks one, P cycles
-  test check [rate=KBIT]   the health check: ~40 s, one answer GOOD or PROBLEM
-  test [up|down|both] [rate=KBIT] [size=B|mix] [time=S] [macs=N]   one test
-  test sweep|soak|burst    step the rate | a long run | back-to-back frames
+  test check               the health check: ~40 s, one answer GOOD or PROBLEM
+  test [up|down|both] [rate=KBIT] [size=BYTES|mix] [time=SECONDS]   one test
+  test sweep | soak | burst   step the rate | a long run | back-to-back frames
                            ('test sweep help', 'help soak', 'help burst')
-  expect=KBIT loss=PCT     make a test print RESULT: PASS or FAIL
-  test stop                abort a running test
-  via=N here=N             run the test on the peer's NIC N / our NIC N (kept
-                           until changed; 0 = the control NIC)
+  min-rate=KBIT max-loss=PERCENT   make a test print RESULT: PASS or FAIL
+  source-macs=N            rotate the source address through N addresses
+  peer-nic=N our-nic=N     test the peer's NIC N / our NIC N (kept until
+                           changed; 0 = the control NIC)
+  test stop                abort a running test (Escape does too; a second
+                           Escape leaves nettest)
 Each test starts from the defaults (both ways, 900000 kbit/s, 1400 B, 5 s).
 The report begins with a Summary line; below it, per direction: frames, loss,
 rate, latency, queueing delay, delivery per second. 'help check' says more.
@@ -93,32 +95,38 @@ rate, latency, queueing delay, delivery per second. 'help check' says more.
 
 const SWEEP: &[u8] = b"\
 test sweep: step the offered rate and find where the link stops keeping up.
-  test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]
-                           [size=B|mix] [macs=N] [expect=KBIT] [loss=PCT]
-  defaults   rate=100000 to=1000000 step=100000 (kbit/s: a tenth of a gigabit
-             link up to the whole link), time=3 (s per step), settle=1 (s
-             between steps, so the last step's queue drains), size=1400
+  test sweep [both|up|down] [from=KBIT] [to=KBIT] [step=KBIT] [time=SECONDS]
+             [pause=SECONDS] [size=BYTES|mix] [source-macs=N]
+             [min-rate=KBIT] [max-loss=PERCENT]
+  from      first rate, default 100000 (a tenth of a gigabit link)
+  to        last rate, default 1000000 (the whole link)
+  step      increase per step, default 100000
+  time      seconds per step, default 3
+  pause     seconds of rest between steps so the queue drains, default 1
 One row per step: kbit/s delivered, loss and queueing delay for each direction,
 then the highest rate with at most 1% loss. The first step that loses frames
-is the link's knee. On a 100 Mbit link use to=100000 step=10000 rate=10000.
- example:  test sweep up to=500000 step=50000 rate=50000
+is the link's knee. On a 100 Mbit link: from=10000 to=100000 step=10000.
+ example:  test sweep up from=50000 to=500000 step=50000
 ";
 
 const SOAK: &[u8] = b"\
 test soak: a long run in 10 s segments, to qualify a cable or a switch.
-  test soak [both|up|down] [rate=KBIT] [size=B|mix] [time=S] [macs=N]
-                           [expect=KBIT] [loss=PCT]
-  defaults   rate=900000 size=1400 time=600 (s; up to 86400)
+  test soak [both|up|down] [rate=KBIT] [size=BYTES|mix] [time=SECONDS]
+            [source-macs=N] [min-rate=KBIT] [max-loss=PERCENT]
+  rate      default 900000      size   default 1400
+  time      total seconds, default 600 (up to 86400)
 A line per segment (kbit/s, loss, error counters), then a summary with the
-worst second and the seconds under 95% of the rate. Add expect= and loss= for
-RESULT: PASS or FAIL. 'test stop' ends it. It takes about a quarter longer
-than time=. Use 'both' explicitly: up/down are not remembered.
+worst second and the seconds under 95% of the rate. Add min-rate and max-loss
+for RESULT: PASS or FAIL. 'test stop' or Escape ends it. It takes about a
+quarter longer than time. Name the direction (both): up/down are not remembered.
 ";
 
 const BURST: &[u8] = b"\
 test burst: how many back-to-back frames survive, to size a switch's buffer.
-  test burst [both|up|down] [count=N] [to=N] [size=B]
-  defaults   count=32, doubling up to to=8192 frames, size=1400
+  test burst [both|up|down] [from=FRAMES] [to=FRAMES] [size=BYTES]
+  from      first burst, default 32 frames; each step doubles it
+  to        last burst, default 8192 frames
+  size      bytes per frame, default 1400
 Frames go out unpaced; each step prints delivered and lost per direction. A
 switch only drops a burst when its output is slower than its input or shared
 (1G into 100M, two senders into one port); the largest burst delivered whole
@@ -128,6 +136,7 @@ switch never queued.
 
 const CHECK: &[u8] = b"\
 test check: one command to find out whether a link or switch is healthy.
+  test check [rate=KBIT]      rate defaults to 900000 (or what the link carries)
   1  full-size frames (1400 B) at 900 Mbit/s for 10 s, both ways
   2  mixed sizes (64/576/1500 B) from 64 source addresses, 10 s
   3  bursts of back-to-back frames, 32 doubling to 512
@@ -135,8 +144,7 @@ It reads the link speed, duplex and error counters of both NICs. The answer:
   GOOD          no loss, full rate, no errors
   PROBLEM       with the reasons, and what to try
   INCONCLUSIVE  the tape could not send that fast; lower the rate
-A link slower than gigabit is offered what it can carry. 'test check rate=KBIT'
-sets the rate. For a long run use 'test soak', for a rate ladder 'test sweep'.
+For a long run use 'test soak', for a rate ladder 'test sweep'.
 ";
 
 /// The page for `topic` ("" = the overview); None for an unknown topic.

@@ -482,8 +482,8 @@ Run nettest on two machines to measure the physical network between them.
 A plain `nettest` with no arguments is the far end; a role typed at its prompt (`link A B`, `gen nic N`,
 `serve N`, `remote N`) takes over. `nics` lists the NICs and their roles; `help` has one page per topic.
 
-**A separate network for the test.** The control frames stay on the NIC given at start. `via=N` runs the
-test on the server's NIC N, `here=N` on the master's NIC N (`0` = the control NIC; both persist until
+**A separate network for the test.** The control frames stay on the NIC given at start. `peer-nic=N` runs the
+test on the server's NIC N, `our-nic=N` on the master's NIC N (`0` = the control NIC; both persist until
 changed; every other option, and the direction, starts from the default in each `test`). Each end lists its NICs and MACs (the master prints the server's when the peer is picked), so the
 two ends can sit on one network or on two physically separate ones, each with one NIC or several. Before
 such a test the master probes the test path with the same clock exchange (the test path's delay, not the
@@ -523,7 +523,7 @@ with "tape frame queue ... dropped" growing is the tape's own, not the link's.
 
 direction (try `size=64`, `size=1500` and `up`/`down` separately) points at the switch's forwarding or buffers.
 
-`test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]` (defaults 100000 to 1000000
+`test sweep [both|up|down] [from=KBIT] [to=KBIT] [step=KBIT] [time=SECONDS] [pause=SECONDS]` (defaults 100000 to 1000000
 step 100000 kbit/s: a tenth of a gigabit link up to the whole link; 3 s per step, 1 s settle between steps so the last step's queue drains) runs the ladder by itself and prints one row per step: kbit/s delivered, loss (frames sent but
 not delivered) and queueing delay (mean minus minimum one-way delay; the clock offset cancels out of it) for
 each direction, then the highest rate with at most 1% loss. The full report also shows the minimum delay,
@@ -532,17 +532,17 @@ second`): a steady shortfall means a rate limit, a single dip means an outage. T
 from a 33-bucket histogram (50 us up to 5 s, steps of 1-2.5 ms around 1-10 ms and 5-25 ms up to 150 ms). The minimum is clamped at 0 when the offset error exceeds the true delay, so
 trust the queueing figure rather than the minimum. On a powerline link the knee moves between runs.
 
-`test [soak] ... expect=KBIT loss=PCT` turns a test into a check: after the report (or the soak summary) a line says `RESULT: PASS`, or
-`RESULT: FAIL` with each direction that delivered less than `expect` kbit/s or lost more than `loss` percent (one decimal: `loss=0.1`).
+`test [soak] ... min-rate=KBIT max-loss=PERCENT` turns a test into a check: after the report (or the soak summary) a line says `RESULT: PASS`, or
+`RESULT: FAIL` with each direction that delivered less than `min-rate` kbit/s or lost more than `max-loss` percent (one decimal: `max-loss=0.1`).
 A soak judges the lowest segment's rate and the loss over the whole run. Use it to qualify a cable or switch, for example
-`test both rate=900000 size=1400 time=10 expect=850000 loss=0.1`.
+`test both rate=900000 size=1400 time=10 min-rate=850000 max-loss=0.1`.
 
 `test soak [both|up|down] [rate=KBIT] [size=B] [time=S]` (defaults 900000 kbit/s of 1400 B frames for 600 s; `time` up to
 86400) runs 10 s tests back to back, so a switch can be watched for ten minutes or hours. Each segment prints one line (kbit/s
 delivered and loss each way, and how many error counters moved on both NICs), and the summary gives the loss over the whole run,
 the worst second as a percentage of the rate asked for, the seconds that delivered under 95% of it, and which counters moved
 (missed packets, CRC, PAUSE ...). A segment starts a moment after the last, so the soak takes about a quarter longer on the
-wall clock than `time`. `test stop` ends it. The tape prints nothing per frame, and the soak suppresses "generator finished" so a
+wall clock than `time`. `test stop` or Escape ends it. The tape prints nothing per frame, and the soak suppresses "generator finished" so a
 console line (about 10 ms on real hardware) does not make the receiver miss frames: that print was good for 8 missed packets per
 segment on the I350 pair. A 60 s soak at 900 Mbit/s through the Deltaco switch showed 0 errors and a worst second of 99%.
 
@@ -554,14 +554,16 @@ itself could not send that fast. `test check rate=KBIT` sets the rate. Every ord
 one-line `Summary:` (GOOD, PROBLEM or INCONCLUSIVE) before the details. Loss over 0.1% or a delivered rate under 90% of what the
 link carries is a problem; more offered than the link carries is judged by the delivered rate only.
 
-`test burst [up|down|both] [count=N] [to=N] [size=B]` (defaults 32 frames doubling to 8192, 1400 B) sends N frames back to back,
+`test burst [up|down|both] [from=FRAMES] [to=FRAMES] [size=BYTES]` (defaults 32 frames doubling to 8192, 1400 B) sends N frames back to back,
 unpaced, then doubles N and prints frames delivered and lost per direction. A switch drops a burst only when its output is slower
 than its input or shared (a 1G to 100M step, or two senders into one port); the largest burst delivered whole then estimates its
 buffer, N times the frame size. On a clean 1G to 1G pair no loss is expected, and the verdict says the switch never queued. The
 START frame carries the count (wire version 3).
 
+The older short names (`rate=` for a sweep's start, `settle`, `expect`, `loss`, `count`, `via`, `here`, `macs`) still work.
+
 `size=mix` sends the classic 7:4:1 mix of 64, 576 and 1500 byte frames (mean 354 B; `rate` still paces the bytes), which loads a
-switch's per-packet path the way real traffic does, where a fixed 1400 B test does not. `macs=N` rotates the source MAC through N
+switch's per-packet path the way real traffic does, where a fixed 1400 B test does not. `source-macs=N` rotates the source MAC through N
 addresses (the last byte of the NIC's own, plus 0 to N-1), so the switch has to learn and keep N entries; a switch with a small
 or slow address table shows it as loss or flooding. Both work with `sweep`, `soak` and `burst`.
 
