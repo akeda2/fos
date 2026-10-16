@@ -523,8 +523,8 @@ with "tape frame queue ... dropped" growing is the tape's own, not the link's.
 
 direction (try `size=64`, `size=1500` and `up`/`down` separately) points at the switch's forwarding or buffers.
 
-`test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]` (defaults 2000 to 20000
-step 2000, 3 s per step, 1 s settle between steps so the last step's queue drains) runs the ladder by itself and prints one row per step: kbit/s delivered, loss (frames sent but
+`test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]` (defaults 100000 to 1000000
+step 100000 kbit/s: a tenth of a gigabit link up to the whole link; 3 s per step, 1 s settle between steps so the last step's queue drains) runs the ladder by itself and prints one row per step: kbit/s delivered, loss (frames sent but
 not delivered) and queueing delay (mean minus minimum one-way delay; the clock offset cancels out of it) for
 each direction, then the highest rate with at most 1% loss. The full report also shows the minimum delay,
 reordered/duplicated frames and the share of the asked-for rate delivered in each second (`% of rate per

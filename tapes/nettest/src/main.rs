@@ -2743,10 +2743,15 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     if let Some(remote) = session.remote.as_ref() {
         (params.via, params.here) = (remote.test.via, remote.test.here);
     }
-    let (mut sweeping, mut to, mut step, mut rate_given, mut time_given, mut settle) = (false, 20_000u32, 2_000u32, false, false, 1u32);
+    let (mut sweeping, mut to, mut step, mut rate_given, mut time_given, mut settle) = (false, 1_000_000u32, 100_000u32, false, false, 1u32);
     let (mut soaking, mut size_given, mut bursting, mut count) = (false, false, false, 32u32);
-    let mut checking = false;
+    let (mut checking, mut to_given) = (false, false);
     let (mut expect_kbit, mut loss_permille) = (0u32, None);
+    if words.iter().any(|&word| matches!(word, b"help" | b"?")) {
+        let topic: &[u8] = [&b"sweep"[..], b"soak", b"burst", b"check"].into_iter().find(|&mode| words.contains(&mode)).unwrap_or(b"test");
+        help::print_topic(putc, topic);
+        return Outcome::Continue;
+    }
     for &word in words {
         match word {
             b"sweep" => sweeping = true,
@@ -2815,7 +2820,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                 match (&word[..equals], value) {
                     (b"expect", Some(value)) => expect_kbit = value,
                     (b"rate", Some(value)) => (params.rate_kbit, rate_given) = (value, true),
-                    (b"to", Some(value)) => to = value,
+                    (b"to", Some(value)) => (to, to_given) = (value, true),
                     (b"count", Some(value)) => count = value,
                     (b"step", Some(value)) => step = value,
                     (b"settle", Some(value)) if value <= 60 => settle = value,
@@ -2835,7 +2840,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     }
     session.criteria = (expect_kbit > 0 || loss_permille.is_some()).then_some(Criteria { expect_kbit, loss_permille });
     if bursting {
-        if to == 20_000 {
+        if !to_given {
             to = 8192; // `to` defaults to the sweep's kbit/s ceiling; for a burst it is a frame count
         }
         if !size_given {
@@ -2869,7 +2874,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     }
     if sweeping {
         if !rate_given {
-            params.rate_kbit = 2_000;
+            params.rate_kbit = 100_000; // a tenth of a gigabit link, up to the whole link in ten steps
         }
         if !time_given {
             params.seconds = 3;
@@ -2879,8 +2884,17 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             return Outcome::Error;
         }
         session.rate_sweep = Some(RateSweep { to, step, best_up: 0, best_down: 0, settle_us: u64::from(settle) * 1_000_000, resume_at_us: 0, next_rate: 0 });
-        print_bytes(putc, b"sweep (queue = mean minus minimum delay), kbit/s sent, then per direction:\n");
-        print_bytes(putc, b"        sent    got    loss  queue |    got    loss  queue\n");
+        print_bytes(putc, b"sweep ");
+        print_u32(putc, params.rate_kbit);
+        print_bytes(putc, b" to ");
+        print_u32(putc, to);
+        print_bytes(putc, b" kbit/s in steps of ");
+        print_u32(putc, step);
+        print_bytes(putc, b", ");
+        print_u32(putc, u32::from(params.seconds));
+        print_bytes(putc, b" s each ('test sweep help' lists the options)\n");
+        print_bytes(putc, b"(queue = mean minus minimum delay); kbit/s sent, then per direction:\n");
+        print_bytes(putc, b"        sent      got   loss queue    |     got   loss queue\n");
     }
     begin_test(putc, session, params)
 }
@@ -2991,12 +3005,12 @@ fn sweep_step_done(putc: Putc, session: &mut Session<'_>) {
     {
         print_bytes(putc, if index == 0 { b"  " } else { b" | " });
         if !enabled {
-            print_bytes(putc, b"      -         -     -");
+            print_bytes(putc, b"       -         -     -");
             continue;
         }
         let mut peer = Sink::new();
         peer.stats = *sink;
-        print_padded(putc, peer.average_kbit() as u32, 6);
+        print_padded(putc, peer.average_kbit() as u32, 7);
         let lost = missing_hundredths(sent, sink.received);
         print_padded(putc, lost / 100, 7);
         putc(u32::from(b'.'));

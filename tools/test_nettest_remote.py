@@ -78,6 +78,9 @@ def main():
             report = master.text()[mark:]
             check("down (peer" not in report, "an up-only test reports only the up stream", report[-800:])
             check("delay us: min" in report, "the report shows min and queueing delay", report[-800:])
+            mark = master.send("test sweep help")
+            master.wait_for("defaults   rate=100000 to=1000000 step=100000", 10, mark)
+            check("test sweep: step the offered rate" in master.text()[mark:], "'test sweep help' lists the sweep options without running it", master.text()[mark:][-800:])
             mark = master.send("test sweep both rate=1000 to=3000 step=1000 time=1")
             master.wait_for("sweep done:", 60, mark)
             report = master.text()[mark:]

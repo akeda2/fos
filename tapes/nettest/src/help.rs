@@ -20,7 +20,8 @@ commands; nothing runs until you do. 'nics' lists the NICs.
                        tests and prints one report (then: peer, test)
 
 Anywhere: show  stats  summary  save NAME  view on|off  reset  nics  quit
-More:     help start | link | gen | two | check | all         Escape stops the tape
+More:     help start | link | gen | two | check | sweep | all
+Escape stops the tape.
 ";
 
 const START: &[u8] = b"\
@@ -80,6 +81,7 @@ Two machines: run nettest on both. Unicast only; other hosts are not disturbed.
   test check [rate=KBIT]   the health check: ~40 s, one answer GOOD or PROBLEM
   test [up|down|both] [rate=KBIT] [size=B|mix] [time=S] [macs=N]   one test
   test sweep|soak|burst    step the rate | a long run | back-to-back frames
+                           ('test sweep help', 'help soak', 'help burst')
   expect=KBIT loss=PCT     make a test print RESULT: PASS or FAIL
   test stop                abort a running test
   via=N here=N             run the test on the peer's NIC N / our NIC N (kept
@@ -87,6 +89,41 @@ Two machines: run nettest on both. Unicast only; other hosts are not disturbed.
 Each test starts from the defaults (both ways, 900000 kbit/s, 1400 B, 5 s).
 The report begins with a Summary line; below it, per direction: frames, loss,
 rate, latency, queueing delay, delivery per second. 'help check' says more.
+";
+
+const SWEEP: &[u8] = b"\
+test sweep: step the offered rate and find where the link stops keeping up.
+  test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]
+                           [size=B|mix] [macs=N] [expect=KBIT] [loss=PCT]
+  defaults   rate=100000 to=1000000 step=100000 (kbit/s: a tenth of a gigabit
+             link up to the whole link), time=3 (s per step), settle=1 (s
+             between steps, so the last step's queue drains), size=1400
+One row per step: kbit/s delivered, loss and queueing delay for each direction,
+then the highest rate with at most 1% loss. The first step that loses frames
+is the link's knee. On a 100 Mbit link use to=100000 step=10000 rate=10000.
+ example:  test sweep up to=500000 step=50000 rate=50000
+";
+
+const SOAK: &[u8] = b"\
+test soak: a long run in 10 s segments, to qualify a cable or a switch.
+  test soak [both|up|down] [rate=KBIT] [size=B|mix] [time=S] [macs=N]
+                           [expect=KBIT] [loss=PCT]
+  defaults   rate=900000 size=1400 time=600 (s; up to 86400)
+A line per segment (kbit/s, loss, error counters), then a summary with the
+worst second and the seconds under 95% of the rate. Add expect= and loss= for
+RESULT: PASS or FAIL. 'test stop' ends it. It takes about a quarter longer
+than time=. Use 'both' explicitly: up/down are not remembered.
+";
+
+const BURST: &[u8] = b"\
+test burst: how many back-to-back frames survive, to size a switch's buffer.
+  test burst [both|up|down] [count=N] [to=N] [size=B]
+  defaults   count=32, doubling up to to=8192 frames, size=1400
+Frames go out unpaced; each step prints delivered and lost per direction. A
+switch only drops a burst when its output is slower than its input or shared
+(1G into 100M, two senders into one port); the largest burst delivered whole
+is about its buffer. On a clean 1G to 1G path nothing is lost, which means the
+switch never queued.
 ";
 
 const CHECK: &[u8] = b"\
@@ -111,7 +148,10 @@ fn page(topic: &[u8]) -> Option<&'static [&'static [u8]]> {
         b"gen" | b"sink" => &[GEN],
         b"two" | b"remote" | b"serve" | b"test" | b"peer" => &[TWO],
         b"check" => &[CHECK],
-        b"all" => &[OVERVIEW, START, LINK, GEN, TWO, CHECK],
+        b"sweep" => &[SWEEP],
+        b"soak" => &[SOAK],
+        b"burst" => &[BURST],
+        b"all" => &[OVERVIEW, START, LINK, GEN, TWO, CHECK, SWEEP, SOAK, BURST],
         _ => return None,
     })
 }
@@ -119,7 +159,7 @@ fn page(topic: &[u8]) -> Option<&'static [&'static [u8]]> {
 /// Prints help for `topic`; false (and a hint) if there is no such topic.
 pub fn print_topic(putc: Putc, topic: &[u8]) -> bool {
     let Some(pages) = page(topic) else {
-        for &byte in b"no such topic; help start | link | gen | two | check | all\n" {
+        for &byte in b"no such topic; help start | link | gen | two | check | sweep | all\n" {
             putc(u32::from(byte));
         }
         return false;
@@ -177,7 +217,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_79_columns() {
-        for text in [OVERVIEW, START, LINK, GEN, TWO, CHECK] {
+        for text in [OVERVIEW, START, LINK, GEN, TWO, CHECK, SWEEP, SOAK, BURST] {
             for line in text.split(|&byte| byte == b'\n') {
                 assert!(line.len() <= 79, "too long ({}): {}", line.len(), core::str::from_utf8(line).unwrap());
             }
@@ -186,7 +226,7 @@ mod tests {
 
     #[test]
     fn topic_pages_fit_a_25_row_console() {
-        for text in [OVERVIEW, START, LINK, GEN, TWO, CHECK] {
+        for text in [OVERVIEW, START, LINK, GEN, TWO, CHECK, SWEEP, SOAK, BURST] {
             assert!(text.iter().filter(|&&byte| byte == b'\n').count() <= 22);
         }
     }
