@@ -509,6 +509,12 @@ gigabit pair deliver about 98 Mbit/s each way. That is exactly what a first run 
 1000, and both directions of the test delivering 98 Mbit/s at every offered rate (the `up` rows showed no loss, because the
 sender is held back by its own slow port; the `down` rows lost the surplus at the switch). A full-rate ladder that
 flat-lines at one number from the first step is a link-speed or port fault; a number that varies with frame size or
+`nic phy N` then tells a bad cable from a bad port: a partner that offers `1000FD` while the link came up at 100 points at the cable
+(a damaged pair), a partner that never offers it at the far port. In that example moving the cable to another port did not help
+(still 100), and after the next reboot of the host the link came up at 1000 with both receivers OK; the same sweep then
+delivered 900 Mbit/s both ways at 1400 B with 0.00% loss. Small frames test the tape more than the switch: at 64 B the
+generator and sink loops top out near 60 kframes/s here, far below the switch's rate, so do not read that as a switch limit.
+
 direction (try `size=64`, `size=1500` and `up`/`down` separately) points at the switch's forwarding or buffers.
 
 `test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]` (defaults 2000 to 20000

@@ -980,6 +980,14 @@ impl E1000 {
     }
 
     /// One MDIC cycle: opcode (read 2, write 1) in bits 27:26, PHY address 1, register 0; ready is bit 28, error bit 30.
+    /// A standard MII register (clause 22) of the internal copper PHY; classic and I350 parts only (see `phy_control`).
+    pub fn phy_read(&self, register: u32) -> Option<u16> {
+        if self.variant == Variant::E1000e {
+            return None;
+        }
+        self.mdic(2 << 26 | (register & 31) << 16, 0)
+    }
+
     fn mdic(&self, opcode: u32, data: u16) -> Option<u16> {
         write(self.registers, 0x20, opcode | 1 << 21 | u32::from(data));
         for _ in 0..100_000 {

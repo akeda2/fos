@@ -56,6 +56,14 @@ impl Nic {
         }
     }
 
+    /// An MII register of the copper PHY, for `nic phy` (e1000 classic and I350 only).
+    pub fn phy_read(&self, register: u32) -> Option<u16> {
+        match self {
+            Nic::E1000(nic) => nic.phy_read(register),
+            _ => None,
+        }
+    }
+
     /// The PHY's basic mode control register, for drivers that can reach the PHY (see `nicpark`).
     pub fn phy_control(&self) -> Option<u16> {
         match self {

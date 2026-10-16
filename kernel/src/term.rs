@@ -1435,6 +1435,10 @@ fn execute(command: &str) {
                 Err(why) => crate::println!("nic {index}: {why}."),
             }
         }
+        "nic" if matches!(words.clone().next(), Some("phy")) => {
+            words.next();
+            nic_phy(words.next());
+        }
         "nic" if matches!(words.clone().next(), Some("ts")) => {
             words.next();
             nic_timestamp_test(words.next(), words.next(), words.next());
@@ -2842,6 +2846,36 @@ pub fn active_nic() -> usize {
 }
 
 /// `nic use N`: the interface the other nic subcommands, and a tape's single-interface network calls, use.
+/// `nic phy N`: what the copper PHY and its link partner advertise. A gigabit pair that links at 100 with a partner
+/// offering 1000 has a cable fault (a bad pair); a partner that never offers 1000 is the far port or its settings.
+fn nic_phy(arg: Option<&str>) {
+    let Some(index) = arg.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
+        crate::println!("nic phy N: show the copper PHY's advertised and partner abilities.");
+        return;
+    };
+    let Some(nic) = nic_at(index - 1) else { return };
+    let (Some(advertised), Some(partner), Some(control_1000), Some(status_1000)) = (nic.phy_read(4), nic.phy_read(5), nic.phy_read(9), nic.phy_read(10)) else {
+        crate::println!("nic {index}: this interface's PHY cannot be read.");
+        return;
+    };
+    let speeds = |word: u16| {
+        let mut text = [0u8; 24];
+        let mut length = 0;
+        for (bit, name) in [(5, "10HD "), (6, "10FD "), (7, "100HD "), (8, "100FD ")] {
+            if word >> bit & 1 != 0 {
+                text[length..length + name.len()].copy_from_slice(name.as_bytes());
+                length += name.len();
+            }
+        }
+        (text, length)
+    };
+    let (ours, ours_length) = speeds(advertised);
+    let (theirs, theirs_length) = speeds(partner);
+    crate::println!("nic {index}: we offer  {}{}", core::str::from_utf8(&ours[..ours_length]).unwrap_or("?"), if control_1000 & 0x0200 != 0 { "1000FD" } else { "" });
+    crate::println!("nic {index}: partner   {}{}", core::str::from_utf8(&theirs[..theirs_length]).unwrap_or("?"), if status_1000 & 0x0800 != 0 { "1000FD" } else { "" });
+    crate::println!("nic {index}: 1000BASE-T local receiver {}, remote receiver {}", if status_1000 & 0x2000 != 0 { "OK" } else { "not OK" }, if status_1000 & 0x1000 != 0 { "OK" } else { "not OK" });
+}
+
 fn nic_use(argument: Option<&str>) {
     match argument.and_then(|word| word.parse::<usize>().ok()) {
         Some(number) if number >= 1 && number <= nic_count() => {
