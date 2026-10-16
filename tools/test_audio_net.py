@@ -73,7 +73,7 @@ class Guest:
         command = ["qemu-system-x86_64", "-machine", "q35", "-m", "512", "-display", "none", "-serial", "stdio", "-no-reboot",
                    "-drive", f"if=pflash,format=raw,readonly=on,file={code}", "-drive", f"if=pflash,format=raw,file={vars_copy}",
                    "-drive", f"format=raw,file={disk}",
-                   "-netdev", f"socket,id=net0,mcast={GROUP}:{PORT}", "-device", f"e1000,netdev=net0,mac={mac}", *extra]
+                   "-netdev", f"socket,id=net0,mcast={GROUP}:{PORT}", "-device", f"{os.environ.get('FOS_NIC_MODEL', 'e1000')},netdev=net0,mac={mac}", *extra]
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.raw = bytearray()
         self.name = name
