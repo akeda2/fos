@@ -47,6 +47,15 @@ impl Nic {
         }
     }
 
+    /// Negotiated (Mbit/s, full duplex), where the driver can tell.
+    pub fn link_speed(&self) -> Option<(u16, bool)> {
+        match self {
+            Nic::E1000(nic) => nic.link_speed(),
+            Nic::Rtl8168(nic) => nic.link_speed(),
+            _ => None,
+        }
+    }
+
     /// The PHY's basic mode control register, for drivers that can reach the PHY (see `nicpark`).
     pub fn phy_control(&self) -> Option<u16> {
         match self {

@@ -1530,6 +1530,9 @@ fn execute(command: &str) {
             for index in 0..nic_count() {
                 if let Some(nic) = nic_at(index) {
                     crate::println!("{}: {} {}  {}{}", index + 1, nic.family(), Mac(&nic.mac()), if nic.link_up() { "link up" } else { "link DOWN" }, if unsafe { SESSION_NIC } == index && session_open() { "  (terminal)" } else { "" });
+                    if let Some((speed, full)) = nic.link_speed() {
+                        crate::println!("   negotiated {speed} Mbit/s {}", if full { "full duplex" } else { "half duplex" });
+                    }
                     let (received, sent, dropped) = nic.counters();
                     crate::println!("   frames: {} received, {} sent{}", received, sent, if dropped != 0 { " (some dropped: no link)" } else { "" });
                     // v1's `nic` reported "NIC IRQn: N notifications"; keep that line (tools grep for it).

@@ -491,6 +491,26 @@ control network's, sets the offset) and fails with "no answer on the test path" 
 report names the path (`test path: our NIC 2 <-> peer NIC 2`). The server's counters still come back over
 the control network. Frames and tests need no routing: both test NICs must be on the same layer-2 network.
 
+**Worked example: a switch that was taken out of service as "too slow".** Host names carry the NIC number
+(`NETWORKING.md`): `skylake2` and `skylake3` are NICs 2 and 3 of one machine, `rack2` and `rack3` of another. NIC 2
+of each sits on the ordinary network (the terminal and `term_net.py` use it); NIC 3 of each is cabled to the switch
+under test. Everything can then be driven from the desk without touching the switch's network:
+
+```text
+rack      (term net to rack2):     tape run nettest nic=3
+skylake   (term net to skylake2):  tape run nettest remote=3
+nettest> test both rate=900000 size=1400 time=5
+nettest> test sweep both rate=100000 to=1000000 step=100000 time=3
+```
+
+First look at what each end negotiated: `nic list` shows `negotiated 1000 Mbit/s full duplex` under each I350/e1000e
+NIC. Each cable negotiates on its own, and the switch bridges the two, so one cable or port stuck at 100 Mbit makes a
+gigabit pair deliver about 98 Mbit/s each way. That is exactly what a first run showed: `skylake3` at 100, `rack3` at
+1000, and both directions of the test delivering 98 Mbit/s at every offered rate (the `up` rows showed no loss, because the
+sender is held back by its own slow port; the `down` rows lost the surplus at the switch). A full-rate ladder that
+flat-lines at one number from the first step is a link-speed or port fault; a number that varies with frame size or
+direction (try `size=64`, `size=1500` and `up`/`down` separately) points at the switch's forwarding or buffers.
+
 `test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]` (defaults 2000 to 20000
 step 2000, 3 s per step, 1 s settle between steps so the last step's queue drains) runs the ladder by itself and prints one row per step: kbit/s delivered, loss (frames sent but
 not delivered) and queueing delay (mean minus minimum one-way delay; the clock offset cancels out of it) for

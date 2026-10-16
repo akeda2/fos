@@ -244,6 +244,7 @@ const TCTL_PSP: u32 = 1 << 3;
 const TCTL_CT: u32 = 0x10 << 4;
 const TCTL_COLD: u32 = 0x40 << 12;
 const STATUS_LU: u32 = 1 << 1;
+const STATUS_FD: u32 = 1;
 const STATUS_GIO_MASTER_ENABLE: u32 = 1 << 19;
 const CTRL_GIO_MASTER_DISABLE: u32 = 1 << 2;
 const EECD_AUTO_RD: u32 = 1 << 9;
@@ -952,6 +953,16 @@ impl E1000 {
 
     pub fn link_up(&self) -> bool {
         read(self.registers, REG_STATUS) & STATUS_LU != 0
+    }
+
+    /// The negotiated speed in Mbit/s and whether it is full duplex, from STATUS bits 7:6 (0 = 10, 1 = 100, 2 and 3 =
+    /// 1000) and bit 0; `None` without link. A gigabit port that comes up at 100 is a cable or port fault.
+    pub fn link_speed(&self) -> Option<(u16, bool)> {
+        let status = read(self.registers, REG_STATUS);
+        if status & STATUS_LU == 0 {
+            return None;
+        }
+        Some((match (status >> 6) & 3 { 0 => 10, 1 => 100, _ => 1000 }, status & STATUS_FD != 0))
     }
 
     /// The PHY's basic mode control register (MII register 0) through MDIC, for parking. Only the classic and I350

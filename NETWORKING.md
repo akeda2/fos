@@ -333,7 +333,8 @@ always means the boot disk.
 `kernel/src/nic.rs` is the common facade used by the shell and all tape
 callbacks. It preserves one hardware-independent contract while keeping
 device-specific register programming in separate modules. `nic list` shows
-every initialized interface and `nic use N` changes the active one (the shell
+every initialized interface (with the negotiated speed and duplex on the e1000 family and RTL8168: a gigabit port that
+comes up at 100 Mbit/s is a cable or port fault) and `nic use N` changes the active one (the shell
 uses one-based numbering; tape callbacks use zero-based indices). The active interface
 is what `nic sniff` defaults to and what the single-interface calls of `net-chat`,
 `ip-chat` and `telnet` use (the tape ABI's `nic_active`, version 4); tapes that
