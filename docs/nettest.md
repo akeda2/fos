@@ -546,6 +546,12 @@ wall clock than `time`. `test stop` ends it. The tape prints nothing per frame, 
 console line (about 10 ms on real hardware) does not make the receiver miss frames: that print was good for 8 missed packets per
 segment on the I350 pair. A 60 s soak at 900 Mbit/s through the Deltaco switch showed 0 errors and a worst second of 99%.
 
+`test burst [up|down|both] [count=N] [to=N] [size=B]` (defaults 32 frames doubling to 8192, 1400 B) sends N frames back to back,
+unpaced, then doubles N and prints frames delivered and lost per direction. A switch drops a burst only when its output is slower
+than its input or shared (a 1G to 100M step, or two senders into one port); the largest burst delivered whole then estimates its
+buffer, N times the frame size. On a clean 1G to 1G pair no loss is expected, and the verdict says the switch never queued. The
+START frame carries the count (wire version 3).
+
 Control frames are ethertype 0x88B5, magic `FNC1`. On selection the master exchanges its time by unicast
 using the IEEE 1588 delay request-response arithmetic (the ptp tape cannot run at the same time): eight
 samples, the minimum round trip is used, and half that round trip is the printed error bound. Loss, rate

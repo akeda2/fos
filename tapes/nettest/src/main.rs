@@ -105,6 +105,7 @@ struct Session<'a> {
     /// A running `test sweep`: the rate ladder and the best loss-free rate each way so far.
     rate_sweep: Option<RateSweep>,
     soak: Option<Soak>,
+    burst: Option<Burst>,
     criteria: Option<Criteria>,
     /// FOSFS write callback (for `save`), the file `gen.save=NAME` writes when a
     /// test finishes, and when the end-of-test summary is due (0 = not pending).
@@ -230,6 +231,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         chosen: 0,
         rate_sweep: None,
         soak: None,
+        burst: None,
         criteria: None,
         fs_write: None,
         save_name: [0; 16],
@@ -566,7 +568,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if let Some(result) = sweep.poll(now_us, generator, sink) {
                 print_sweep_step(putc, &result);
             }
-            if generator_was_running && !session.generator.running && session.soak.is_none() {
+            if generator_was_running && !session.generator.running && session.soak.is_none() && session.burst.is_none() {
                 print_bytes(putc, b"\ngenerator finished: ");
                 print_gen_line(putc, &session);
                 // Give the last frames a moment to arrive, then summarize.
@@ -2472,6 +2474,20 @@ fn print_verdict(putc: Putc, criteria: Criteria, results: &[DirectionResult]) {
     }
 }
 
+/// `test burst`: frames sent back to back at the most the tape and the wire manage, doubling the burst each step. A switch
+/// whose egress is slower than its ingress (or shared by several senders) queues the burst and drops what its buffer cannot
+/// hold, so the largest burst delivered whole estimates the buffer. `best_*` is that burst, 0 = none.
+#[derive(Clone, Copy)]
+struct Burst {
+    to: u32,
+    best_up: u32,
+    best_down: u32,
+    lost_up: bool,
+    lost_down: bool,
+    resume_at_us: u64,
+    next_count: u32,
+}
+
 /// Seconds per `test soak` segment: one report line each, and the unit counters are compared over.
 const SOAK_SEGMENT_S: u32 = 10;
 
@@ -2502,18 +2518,20 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     }
     let mut params = session.remote.as_ref().map_or(TestParams::new(), |remote| remote.test);
     let (mut sweeping, mut to, mut step, mut rate_given, mut time_given, mut settle) = (false, 20_000u32, 2_000u32, false, false, 1u32);
-    let (mut soaking, mut size_given) = (false, false);
+    let (mut soaking, mut size_given, mut bursting, mut count) = (false, false, false, 32u32);
     let (mut expect_kbit, mut loss_permille) = (0u32, None);
     for &word in words {
         match word {
             b"sweep" => sweeping = true,
             b"soak" => soaking = true,
+            b"burst" => bursting = true,
             b"up" => (params.up, params.down) = (true, false),
             b"down" => (params.up, params.down) = (false, true),
             b"both" => (params.up, params.down) = (true, true),
             b"stop" => {
                 session.rate_sweep = None;
                 session.soak = None;
+                session.burst = None;
                 let mut out = [0u8; 512];
                 let Session { remote, generator, .. } = session;
                 let length = remote.as_mut().and_then(|remote| remote.stop_test(generator, &mut out));
@@ -2525,7 +2543,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             }
             _ => {
                 let Some(equals) = word.iter().position(|&byte| byte == b'=') else {
-                    print_bytes(putc, b"use: test [sweep|soak] [up|down|both] [rate=KBIT] [size=B] [time=S]\n  [expect=KBIT] [loss=PCT] [via=N] [here=N]\n");
+                    print_bytes(putc, b"use: test [sweep|soak|burst] [up|down|both] [rate=KBIT] [size=B] [time=S]\n  [expect=KBIT] [loss=PCT] [count=N] [to=N] [via=N] [here=N]\n");
                     return Outcome::Error;
                 };
                 let value = parse_u32(&word[equals + 1..]).filter(|&value| value > 0);
@@ -2557,6 +2575,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                     (b"expect", Some(value)) => expect_kbit = value,
                     (b"rate", Some(value)) => (params.rate_kbit, rate_given) = (value, true),
                     (b"to", Some(value)) => to = value,
+                    (b"count", Some(value)) => count = value,
                     (b"step", Some(value)) => step = value,
                     (b"settle", Some(value)) if value <= 60 => settle = value,
                     (b"size", Some(value)) if (60..=1514).contains(&value) => (params.size, size_given) = (value as u16, true),
@@ -2570,6 +2589,25 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
         }
     }
     session.criteria = (expect_kbit > 0 || loss_permille.is_some()).then_some(Criteria { expect_kbit, loss_permille });
+    if bursting {
+        if to == 20_000 {
+            to = 8192; // `to` defaults to the sweep's kbit/s ceiling; for a burst it is a frame count
+        }
+        if !size_given {
+            params.size = 1400;
+        }
+        if count == 0 || to < count {
+            print_bytes(putc, b"burst: count=FRAMES to=FRAMES (to at least count)\n");
+            return Outcome::Error;
+        }
+        params.rate_kbit = 4_000_000;
+        params.seconds = 2;
+        params.count = count;
+        session.burst = Some(Burst { to, best_up: 0, best_down: 0, lost_up: false, lost_down: false, resume_at_us: 0, next_count: 0 });
+        print_bytes(putc, b"burst: frames sent back to back, doubling; delivered and lost per direction\n");
+    } else {
+        params.count = 0;
+    }
     if soaking && !sweeping {
         let total_s = if time_given { u32::from(params.seconds) } else { 600 };
         if !rate_given {
@@ -2609,12 +2647,14 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
             print_bytes(putc, b"here=N: no such NIC (see 'nics')\n");
             session.rate_sweep = None;
             session.soak = None;
+            session.burst = None;
             return Outcome::Error;
         }
         if nic_in_use(session, nic, Some(&Role::Gen)) && session.gen_nic != Some(nic) {
             print_bytes(putc, b"here=N: that NIC has another role\n");
             session.rate_sweep = None;
             session.soak = None;
+            session.burst = None;
             return Outcome::Error;
         }
     }
@@ -2624,7 +2664,7 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
         None => Err("no remote"),
     };
     match result {
-        Ok(()) if session.rate_sweep.is_some() || session.soak.is_some() => Outcome::Continue,
+        Ok(()) if session.rate_sweep.is_some() || session.soak.is_some() || session.burst.is_some() => Outcome::Continue,
         Ok(()) => {
             print_bytes(putc, b"starting the test (");
             print_bytes(putc, if params.up && params.down { b"both ways" } else if params.up { b"up" } else { b"down" });
@@ -2640,6 +2680,7 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
         Err(reason) => {
             session.rate_sweep = None;
             session.soak = None;
+            session.burst = None;
             print_bytes(putc, reason.as_bytes());
             putc(u32::from(b'\n'));
             Outcome::Error
@@ -2859,6 +2900,66 @@ fn missing_hundredths_wide(sent: u64, received: u64) -> u32 {
     ((sent.saturating_sub(received) * 10_000) / sent) as u32
 }
 
+/// One `test burst` row, then the next doubling or the verdict.
+fn burst_step_done(putc: Putc, session: &mut Session<'_>) {
+    let (Some(mut burst), Some(remote)) = (session.burst, session.remote.as_ref()) else { return };
+    let (Some(report), params) = (remote.report, remote.test) else { return };
+    print_padded(putc, params.count, 7);
+    print_bytes(putc, b" frames");
+    for (index, (enabled, sent, got)) in [
+        (params.up, session.generator.stats.sent, report.sink.received),
+        (params.down, report.gen_sent, session.sink.stats.received),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if !enabled {
+            continue;
+        }
+        let lost = sent.saturating_sub(got);
+        print_bytes(putc, if index == 0 { b"  up: got " } else { b"  down: got " });
+        print_u32(putc, got);
+        print_bytes(putc, b", lost ");
+        print_u32(putc, lost);
+        if lost == 0 && sent >= params.count {
+            if index == 0 && !burst.lost_up {
+                burst.best_up = params.count;
+            } else if index == 1 && !burst.lost_down {
+                burst.best_down = params.count;
+            }
+        } else if index == 0 {
+            burst.lost_up = true;
+        } else {
+            burst.lost_down = true;
+        }
+    }
+    putc(u32::from(b'\n'));
+    let next = params.count.saturating_mul(2);
+    if next <= burst.to {
+        burst.next_count = next;
+        burst.resume_at_us = micros() + 1_000_000;
+        session.burst = Some(burst);
+        return;
+    }
+    session.burst = None;
+    print_bytes(putc, b"burst done: largest burst delivered whole: ");
+    for (label, best, lost, enabled) in [(&b"up "[..], burst.best_up, burst.lost_up, params.up), (&b"down "[..], burst.best_down, burst.lost_down, params.down)] {
+        if enabled {
+            print_bytes(putc, label);
+            if best == 0 {
+                print_bytes(putc, b"none");
+            } else {
+                print_u32(putc, best);
+                if !lost {
+                    print_bytes(putc, b"+ (no loss at all)");
+                }
+            }
+            print_bytes(putc, b"  ");
+        }
+    }
+    print_bytes(putc, b"\n  a switch only drops a burst when its output is slower than its input or shared; no loss means it never queued\n");
+}
+
 /// One pass of the two-machine engine: read the NIC, run the master's timers, report events.
 fn remote_pass(putc: Putc, session: &mut Session<'_>, frame: &mut [u8], max_frame_len: usize, line: &[u8]) -> bool {
     let Some(nic) = session.gen_nic else { return false };
@@ -2940,6 +3041,19 @@ fn remote_pass(putc: Putc, session: &mut Session<'_>, frame: &mut [u8], max_fram
         }
         busy = true;
     }
+    if let Some(burst) = session.burst.filter(|burst| burst.resume_at_us != 0 && micros() >= burst.resume_at_us) {
+        if let Some(burst) = session.burst.as_mut() {
+            burst.resume_at_us = 0;
+        }
+        if let Some(mut params) = session.remote.as_ref().map(|remote| remote.test) {
+            params.count = burst.next_count;
+            putc(u32::from(b'\r'));
+            let _ = begin_test(putc, session, params);
+            print_bytes(putc, b"nettest> ");
+            print_bytes(putc, line);
+        }
+        busy = true;
+    }
     while let Some(event) = session.remote.as_mut().and_then(|remote| remote.take_event()) {
         putc(u32::from(b'\r'));
         print_remote_event(putc, session, nic, event);
@@ -3006,14 +3120,17 @@ fn print_remote_event(putc: Putc, session: &mut Session<'_>, nic: u32, event: Re
                 }
             }
         }
-        RemoteEvent::Started if session.rate_sweep.is_some() || session.soak.is_some() => {}
+        RemoteEvent::Started if session.rate_sweep.is_some() || session.soak.is_some() || session.burst.is_some() => {}
         RemoteEvent::Started => print_bytes(putc, b"test running...\n"),
         RemoteEvent::Finished if session.rate_sweep.is_some() => sweep_step_done(putc, session),
         RemoteEvent::Finished if session.soak.is_some() => soak_step_done(putc, session),
+        RemoteEvent::Finished if session.burst.is_some() => burst_step_done(putc, session),
         RemoteEvent::Finished => print_remote_report(putc, session, nic),
         RemoteEvent::Failed(reason) => {
             session.rate_sweep = None;
             session.soak = None;
+            session.burst = None;
+            session.burst = None;
             print_bytes(putc, reason.as_bytes());
             putc(u32::from(b'\n'));
         }

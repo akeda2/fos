@@ -22,7 +22,7 @@ use crate::{Generator, HISTOGRAM_BUCKETS, NIC_COUNTERS, Sink, SinkStats, TIMELIN
 
 pub const CTRL_ETHERTYPE: [u8; 2] = [0x88, 0xb5];
 const MAGIC: &[u8; 4] = b"FNC1";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const HEADER: usize = 26;
 
 const T_HELLO: u8 = 1;
@@ -75,11 +75,13 @@ pub struct TestParams {
     pub via: u8,
     /// The master's own test NIC, one-based; 0 = its control NIC. The master's main loop reads it.
     pub here: u8,
+    /// Frames each generator sends back to back (a burst test); 0 = send for `seconds` at `rate_kbit`.
+    pub count: u32,
 }
 
 impl TestParams {
     pub const fn new() -> Self {
-        Self { up: true, down: true, rate_kbit: 10_000, size: 1000, seconds: 5, via: 0, here: 0 }
+        Self { up: true, down: true, rate_kbit: 10_000, size: 1000, seconds: 5, via: 0, here: 0, count: 0 }
     }
 }
 
@@ -353,7 +355,7 @@ impl Remote {
         generator.stop();
         generator.rate_kbit = params.rate_kbit;
         generator.size = usize::from(params.size);
-        generator.count_limit = 0;
+        generator.count_limit = params.count;
         generator.seconds_limit = u32::from(params.seconds);
         generator.destination = target;
         sink.reset();
@@ -486,6 +488,7 @@ impl Remote {
                 writer.u64(offset as u64);
                 writer.u8(if test.via == 0 { VIA_CONTROL } else { test.via - 1 });
                 writer.put(&here_mac);
+                writer.u32(test.count);
                 Some(Self::finish(writer))
             }
             Phase::Running { until } => {
@@ -570,6 +573,7 @@ impl Remote {
                 let offset = body.u64()? as i64;
                 let via = body.u8().unwrap_or(VIA_CONTROL);
                 let here_mac = body.take::<6>().filter(|mac| *mac != [0; 6]).unwrap_or(source);
+                let count = body.u32().unwrap_or(0);
                 self.session = session;
                 self.master = source;
                 if self.last_start != Some(seq) {
@@ -581,7 +585,7 @@ impl Remote {
                     if flags & 2 != 0 {
                         generator.rate_kbit = rate;
                         generator.size = usize::from(size);
-                        generator.count_limit = 0;
+                        generator.count_limit = count;
                         generator.seconds_limit = u32::from(seconds);
                         generator.destination = here_mac;
                         generator.start(now_us);
