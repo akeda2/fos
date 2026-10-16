@@ -484,7 +484,7 @@ A plain `nettest` with no arguments is the far end; a role typed at its prompt (
 
 **A separate network for the test.** The control frames stay on the NIC given at start. `via=N` runs the
 test on the server's NIC N, `here=N` on the master's NIC N (`0` = the control NIC; both persist until
-changed). Each end lists its NICs and MACs (the master prints the server's when the peer is picked), so the
+changed; every other option, and the direction, starts from the default in each `test`). Each end lists its NICs and MACs (the master prints the server's when the peer is picked), so the
 two ends can sit on one network or on two physically separate ones, each with one NIC or several. Before
 such a test the master probes the test path with the same clock exchange (the test path's delay, not the
 control network's, sets the offset) and fails with "no answer on the test path" if it is not cabled; the
@@ -545,6 +545,14 @@ the worst second as a percentage of the rate asked for, the seconds that deliver
 wall clock than `time`. `test stop` ends it. The tape prints nothing per frame, and the soak suppresses "generator finished" so a
 console line (about 10 ms on real hardware) does not make the receiver miss frames: that print was good for 8 missed packets per
 segment on the I350 pair. A 60 s soak at 900 Mbit/s through the Deltaco switch showed 0 errors and a worst second of 99%.
+
+**The quick way: `test check`.** One command, about 40 seconds, for "is this link or switch healthy?". It runs full-size frames
+(1400 B at 900 Mbit/s, or what a slower link carries) both ways, then a mix of sizes from 64 source addresses, then bursts, and
+reads the link speed, duplex and error counters of both NICs. The answer is `GOOD` (no loss, full rate, no errors), `PROBLEM`
+with each finding on a line and what to try (a cable swap, another port, a duplex setting), or `INCONCLUSIVE` when the tape
+itself could not send that fast. `test check rate=KBIT` sets the rate. Every ordinary `test` report also starts with the same
+one-line `Summary:` (GOOD, PROBLEM or INCONCLUSIVE) before the details. Loss over 0.1% or a delivered rate under 90% of what the
+link carries is a problem; more offered than the link carries is judged by the delivered rate only.
 
 `test burst [up|down|both] [count=N] [to=N] [size=B]` (defaults 32 frames doubling to 8192, 1400 B) sends N frames back to back,
 unpaced, then doubles N and prints frames delivered and lost per direction. A switch drops a burst only when its output is slower

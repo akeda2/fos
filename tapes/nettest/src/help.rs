@@ -20,7 +20,7 @@ commands; nothing runs until you do. 'nics' lists the NICs.
                        tests and prints one report (then: peer, test)
 
 Anywhere: show  stats  summary  save NAME  view on|off  reset  nics  quit
-More:     help start | link | gen | two | all         Escape stops the tape
+More:     help start | link | gen | two | check | all         Escape stops the tape
 ";
 
 const START: &[u8] = b"\
@@ -36,7 +36,8 @@ Getting started. Nothing runs until you pick a mode ('nics' lists the NICs).
 
  Two machines, any wire or switch between them:
    far end:  serve 1                 master:  remote 1  (finds it; P picks)
-   master:   test both rate=10000 time=5       or   test sweep both to=20000
+   master:   test check            (the health check: GOOD or PROBLEM)
+             test both rate=10000 time=5       or   test sweep both to=20000
 
  Roles can be combined (a link on two NICs, gen/sink on two others); serve and
  remote use one NIC and nothing else. 'link off', 'gen nic off', 'sink nic off'
@@ -76,14 +77,29 @@ Two machines: run nettest on both. Unicast only; other hosts are not disturbed.
   serve N | serve off      far end on NIC N: waits for a master and answers it
   remote N | remote off    master on NIC N: probes the announced machines
   peer                     probe again; 'peer N|NAME|MAC' picks one, P cycles
-  test [up|down|both] [rate=KBIT] [size=B] [time=S]   one test, one report
-  test sweep [both|up|down] [rate=FROM] [to=TO] [step=STEP] [time=S] [settle=S]
-                           step the rate; the highest rate with <= 1% loss
+  test check [rate=KBIT]   the health check: ~40 s, one answer GOOD or PROBLEM
+  test [up|down|both] [rate=KBIT] [size=B|mix] [time=S] [macs=N]   one test
+  test sweep|soak|burst    step the rate | a long run | back-to-back frames
+  expect=KBIT loss=PCT     make a test print RESULT: PASS or FAIL
   test stop                abort a running test
-  via=N here=N             run the test on the peer's NIC N / our NIC N (another
-                           network than the control one; 0 = the control NIC)
-The report has, per direction: frames sent/received, loss, rate, latency
-percentiles, queueing delay (clock-offset free) and delivery per second.
+  via=N here=N             run the test on the peer's NIC N / our NIC N (kept
+                           until changed; 0 = the control NIC)
+Each test starts from the defaults (both ways, 10000 kbit/s, 1000 B, 5 s).
+The report begins with a Summary line; below it, per direction: frames, loss,
+rate, latency, queueing delay, delivery per second. 'help check' says more.
+";
+
+const CHECK: &[u8] = b"\
+test check: one command to find out whether a link or switch is healthy.
+  1  full-size frames (1400 B) at 900 Mbit/s for 10 s, both ways
+  2  mixed sizes (64/576/1500 B) from 64 source addresses, 10 s
+  3  bursts of back-to-back frames, 32 doubling to 512
+It reads the link speed, duplex and error counters of both NICs. The answer:
+  GOOD          no loss, full rate, no errors
+  PROBLEM       with the reasons, and what to try
+  INCONCLUSIVE  the tape could not send that fast; lower the rate
+A link slower than gigabit is offered what it can carry. 'test check rate=KBIT'
+sets the rate. For a long run use 'test soak', for a rate ladder 'test sweep'.
 ";
 
 /// The page for `topic` ("" = the overview); None for an unknown topic.
@@ -94,7 +110,8 @@ fn page(topic: &[u8]) -> Option<&'static [&'static [u8]]> {
         b"link" => &[LINK],
         b"gen" | b"sink" => &[GEN],
         b"two" | b"remote" | b"serve" | b"test" | b"peer" => &[TWO],
-        b"all" => &[OVERVIEW, START, LINK, GEN, TWO],
+        b"check" => &[CHECK],
+        b"all" => &[OVERVIEW, START, LINK, GEN, TWO, CHECK],
         _ => return None,
     })
 }
@@ -102,7 +119,7 @@ fn page(topic: &[u8]) -> Option<&'static [&'static [u8]]> {
 /// Prints help for `topic`; false (and a hint) if there is no such topic.
 pub fn print_topic(putc: Putc, topic: &[u8]) -> bool {
     let Some(pages) = page(topic) else {
-        for &byte in b"no such topic; help start | link | gen | two | all\n" {
+        for &byte in b"no such topic; help start | link | gen | two | check | all\n" {
             putc(u32::from(byte));
         }
         return false;
@@ -160,7 +177,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_79_columns() {
-        for text in [OVERVIEW, START, LINK, GEN, TWO] {
+        for text in [OVERVIEW, START, LINK, GEN, TWO, CHECK] {
             for line in text.split(|&byte| byte == b'\n') {
                 assert!(line.len() <= 79, "too long ({}): {}", line.len(), core::str::from_utf8(line).unwrap());
             }
@@ -169,7 +186,7 @@ mod tests {
 
     #[test]
     fn topic_pages_fit_a_25_row_console() {
-        for text in [OVERVIEW, START, LINK, GEN, TWO] {
+        for text in [OVERVIEW, START, LINK, GEN, TWO, CHECK] {
             assert!(text.iter().filter(|&&byte| byte == b'\n').count() <= 22);
         }
     }

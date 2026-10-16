@@ -106,6 +106,7 @@ struct Session<'a> {
     rate_sweep: Option<RateSweep>,
     soak: Option<Soak>,
     burst: Option<Burst>,
+    check: Option<Check>,
     criteria: Option<Criteria>,
     /// FOSFS write callback (for `save`), the file `gen.save=NAME` writes when a
     /// test finishes, and when the end-of-test summary is due (0 = not pending).
@@ -232,6 +233,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         rate_sweep: None,
         soak: None,
         burst: None,
+        check: None,
         criteria: None,
         fs_write: None,
         save_name: [0; 16],
@@ -568,7 +570,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             if let Some(result) = sweep.poll(now_us, generator, sink) {
                 print_sweep_step(putc, &result);
             }
-            if generator_was_running && !session.generator.running && session.soak.is_none() && session.burst.is_none() {
+            if generator_was_running && !session.generator.running && session.soak.is_none() && session.burst.is_none() && session.check.is_none() {
                 print_bytes(putc, b"\ngenerator finished: ");
                 print_gen_line(putc, &session);
                 // Give the last frames a moment to arrive, then summarize.
@@ -2476,6 +2478,215 @@ fn print_verdict(putc: Putc, criteria: Criteria, results: &[DirectionResult]) {
     }
 }
 
+const F_LOSS_UP: u8 = 1;
+const F_LOSS_DOWN: u8 = 2;
+const F_SLOW_UP: u8 = 4;
+const F_SLOW_DOWN: u8 = 8;
+const F_HALF: u8 = 16;
+const F_ERRORS: u8 = 32;
+/// The tape could not send what was asked, so the link was never tested at that rate: not a link problem.
+const F_TAPE: u8 = 64;
+
+/// What a finished two-machine test says about the link, in plain terms (`F_*` flags), for the summary line and `check`.
+#[derive(Clone, Copy)]
+struct Assessment {
+    flags: u8,
+    /// Delivered kbit/s and loss (hundredths of a percent), per direction (0 up, 1 down).
+    kbit: [u64; 2],
+    loss: [u32; 2],
+    /// The lower of the two ends' negotiated speeds in Mbit/s; 0 = unknown.
+    speed_mbit: u32,
+}
+
+/// Loss is judged against this many hundredths of a percent (0.1%); delivery against 90% of what the link can carry.
+const ASSESS_LOSS_HUNDREDTHS: u32 = 10;
+
+fn assess(session: &Session<'_>) -> Option<Assessment> {
+    let remote = session.remote.as_ref()?;
+    let report = remote.report?;
+    let test = remote.test;
+    let mut peer_sink = Sink::new();
+    peer_sink.stats = report.sink;
+    let mut found = Assessment { flags: 0, kbit: [0; 2], loss: [0; 2], speed_mbit: 0 };
+    for counters in [&remote.own_counters, &report.counters] {
+        if counters[0] == 0 {
+            continue;
+        }
+        let speed = counters[0] as u32;
+        found.speed_mbit = if found.speed_mbit == 0 { speed } else { found.speed_mbit.min(speed) };
+        if counters[1] == 0 {
+            found.flags |= F_HALF;
+        }
+        // CRC, symbol and PAUSE counts: the cable, connector or switch port, not the tape.
+        if counters[4..=7].iter().any(|&value| value != 0) {
+            found.flags |= F_ERRORS;
+        }
+    }
+    let size = u64::from(test.size).max(1);
+    let wire_kbit = if found.speed_mbit == 0 { u64::MAX } else { u64::from(found.speed_mbit) * 1000 * size / (size + 20) };
+    let target = u64::from(test.rate_kbit).min(wire_kbit);
+    // More offered than the link carries: loss is then expected, and only the delivered rate says anything.
+    let overloaded = u64::from(test.rate_kbit) > wire_kbit;
+    let wanted = offered_frames(test);
+    let directions = [
+        (test.up, session.generator.stats.sent, report.sink.received, peer_sink.average_kbit(), F_LOSS_UP, F_SLOW_UP),
+        (test.down, report.gen_sent, session.sink.stats.received, session.sink.average_kbit(), F_LOSS_DOWN, F_SLOW_DOWN),
+    ];
+    for (index, (enabled, sent, got, kbit, loss_flag, slow_flag)) in directions.into_iter().enumerate() {
+        if !enabled {
+            continue;
+        }
+        found.kbit[index] = kbit;
+        found.loss[index] = missing_hundredths(sent, got);
+        let tape_limited = wanted != 0 && u64::from(sent) * 100 < wanted * 95;
+        if tape_limited {
+            found.flags |= F_TAPE;
+        } else if !overloaded && found.loss[index] > ASSESS_LOSS_HUNDREDTHS {
+            found.flags |= loss_flag;
+        } else if kbit * 100 < target * 90 {
+            found.flags |= slow_flag;
+        }
+    }
+    Some(found)
+}
+
+/// The one-line answer: `label` GOOD with the numbers, or PROBLEM / INCONCLUSIVE with each finding on its own line.
+fn print_headline(putc: Putc, label: &[u8], found: &Assessment, test: TestParams) {
+    let problems = found.flags & !F_TAPE;
+    print_bytes(putc, label);
+    if problems == 0 && found.flags & F_TAPE == 0 {
+        print_bytes(putc, b" GOOD - ");
+        for (name, enabled, kbit) in [(&b"up "[..], test.up, found.kbit[0]), (&b"down "[..], test.down, found.kbit[1])] {
+            if enabled {
+                print_bytes(putc, name);
+                print_u32(putc, (kbit / 1000) as u32);
+                print_bytes(putc, b" Mbit/s, ");
+            }
+        }
+        print_bytes(putc, b"no loss");
+        if found.speed_mbit != 0 {
+            print_bytes(putc, b", link ");
+            print_u32(putc, found.speed_mbit);
+            print_bytes(putc, b" Mbit/s");
+        }
+        putc(u32::from(b'\n'));
+        return;
+    }
+    print_bytes(putc, if problems != 0 { b" PROBLEM\n" } else { b" INCONCLUSIVE\n" });
+    for (flag, name, index) in [(F_LOSS_UP, &b"up"[..], 0), (F_LOSS_DOWN, &b"down"[..], 1)] {
+        if found.flags & flag != 0 {
+            print_bytes(putc, b"  - ");
+            print_bytes(putc, name);
+            print_bytes(putc, b" lost ");
+            print_hundredths(putc, found.loss[index]);
+            print_bytes(putc, b"% of its frames\n");
+        }
+    }
+    for (flag, name, index) in [(F_SLOW_UP, &b"up"[..], 0), (F_SLOW_DOWN, &b"down"[..], 1)] {
+        if found.flags & flag != 0 {
+            print_bytes(putc, b"  - ");
+            print_bytes(putc, name);
+            print_bytes(putc, b" delivered only ");
+            print_u32(putc, (found.kbit[index] / 1000) as u32);
+            print_bytes(putc, b" Mbit/s, well below what the link carries\n");
+        }
+    }
+    if found.flags & F_HALF != 0 {
+        print_bytes(putc, b"  - a NIC runs half duplex: a duplex mismatch (set both ends to auto)\n");
+    }
+    if found.flags & F_ERRORS != 0 {
+        print_bytes(putc, b"  - the NICs counted CRC, symbol or PAUSE events: cable, connector or port\n");
+    }
+    if found.flags & F_TAPE != 0 {
+        print_bytes(putc, b"  - the tape could not send that fast: use a lower rate or a larger size\n");
+    }
+}
+
+/// `test check`: the whole link health check in one command. Stages run back to back (`check_step_done` chains them).
+#[derive(Clone, Copy)]
+struct Check {
+    stage: u8,
+    rate: u32,
+    flags: u8,
+}
+
+const CHECK_STAGES: u8 = 3;
+
+fn check_params(stage: u8, rate: u32, via: u8, here: u8) -> TestParams {
+    let mut params = TestParams::new();
+    (params.rate_kbit, params.seconds, params.size, params.via, params.here) = (rate, 10, 1400, via, here);
+    if stage == 1 {
+        (params.size, params.mix, params.macs) = (nettest_tape::MIX_MEAN_SIZE as u16, true, 64);
+    }
+    params
+}
+
+fn check_start(putc: Putc, session: &mut Session<'_>, rate: u32, base: TestParams) -> Outcome {
+    session.criteria = None;
+    session.check = Some(Check { stage: 0, rate, flags: 0 });
+    print_bytes(putc, b"check: three tests, about 40 s: full-size frames, a mix of sizes and source addresses, bursts\n");
+    check_begin_stage(putc, session, base.via, base.here)
+}
+
+fn check_begin_stage(putc: Putc, session: &mut Session<'_>, via: u8, here: u8) -> Outcome {
+    let Some(check) = session.check else { return Outcome::Error };
+    print_bytes(putc, b"check ");
+    print_u32(putc, u32::from(check.stage) + 1);
+    print_bytes(putc, b"/3: ");
+    if check.stage == 2 {
+        print_bytes(putc, b"bursts of back-to-back 1400 B frames, doubling\n");
+        let mut params = check_params(0, 4_000_000, via, here);
+        (params.seconds, params.count) = (2, 32);
+        session.burst = Some(Burst { to: 512, best_up: 0, best_down: 0, lost_up: false, lost_down: false, resume_at_us: 0, next_count: 0 });
+        return begin_test(putc, session, params);
+    }
+    print_bytes(putc, if check.stage == 0 { b"full-size frames (1400 B) at " } else { b"mixed sizes (64/576/1500 B), 64 source addresses, at " });
+    print_u32(putc, check.rate / 1000);
+    print_bytes(putc, b" Mbit/s for 10 s\n");
+    begin_test(putc, session, check_params(check.stage, check.rate, via, here))
+}
+
+fn check_step_done(putc: Putc, session: &mut Session<'_>) {
+    let (Some(mut check), Some(found)) = (session.check, assess(session)) else { return };
+    let Some(test) = session.remote.as_ref().map(|remote| remote.test) else { return };
+    print_headline(putc, b"  ", &found, test);
+    check.flags |= found.flags;
+    if found.speed_mbit != 0 {
+        // A slower link than gigabit: the later stages offer what it can carry.
+        check.rate = check.rate.min(found.speed_mbit * 900);
+    }
+    check.stage += 1;
+    session.check = Some(check);
+    let _ = check_begin_stage(putc, session, test.via, test.here);
+}
+
+fn check_finish(putc: Putc, session: &mut Session<'_>, burst: Burst) {
+    let Some(check) = session.check.take() else { return };
+    print_bytes(putc, b"  bursts: largest delivered whole: up ");
+    print_u32(putc, burst.best_up);
+    print_bytes(putc, b" frames, down ");
+    print_u32(putc, burst.best_down);
+    print_bytes(putc, if burst.lost_up || burst.lost_down { b" frames (the path queues and drops)\n" } else { b" frames (never queued)\n" });
+    let problems = check.flags & !F_TAPE;
+    if problems == 0 {
+        print_bytes(putc, if check.flags & F_TAPE != 0 { b"CHECK: INCONCLUSIVE - the tape could not keep up at that rate; try 'test check rate=500000'\n" } else { b"CHECK: PASS - no loss, no errors, full rate in both directions, with full-size and mixed traffic\n" });
+        return;
+    }
+    print_bytes(putc, b"CHECK: FAIL. What to do:\n");
+    if problems & (F_LOSS_UP | F_LOSS_DOWN) != 0 {
+        print_bytes(putc, b"  - loss: swap the cable and try another switch port; 'test sweep both to=1000000'\n    finds the rate where loss starts, 'test soak' shows whether it comes and goes\n");
+    }
+    if problems & (F_SLOW_UP | F_SLOW_DOWN) != 0 {
+        print_bytes(putc, b"  - low rate with no loss: a slow switch, or a shared uplink; compare with 'test up'\n    and 'test down' alone, and with the two machines on one switch\n");
+    }
+    if problems & F_HALF != 0 {
+        print_bytes(putc, b"  - duplex mismatch: enable auto-negotiation on both ends\n");
+    }
+    if problems & F_ERRORS != 0 {
+        print_bytes(putc, b"  - CRC/symbol errors: replace the cable or connector\n");
+    }
+}
+
 /// `test burst`: frames sent back to back at the most the tape and the wire manage, doubling the burst each step. A switch
 /// whose egress is slower than its ingress (or shared by several senders) queues the burst and drops what its buffer cannot
 /// hold, so the largest burst delivered whole estimates the buffer. `best_*` is that burst, 0 = none.
@@ -2518,15 +2729,22 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     if !session.remote.as_ref().is_some_and(|remote| remote.role == RemoteRole::Master) {
         return not_remote(putc);
     }
-    let mut params = session.remote.as_ref().map_or(TestParams::new(), |remote| remote.test);
+    // Every test starts from the defaults (both ways), so one command does not depend on the last; only the test path
+    // (via=N, here=N) is kept, as documented.
+    let mut params = TestParams::new();
+    if let Some(remote) = session.remote.as_ref() {
+        (params.via, params.here) = (remote.test.via, remote.test.here);
+    }
     let (mut sweeping, mut to, mut step, mut rate_given, mut time_given, mut settle) = (false, 20_000u32, 2_000u32, false, false, 1u32);
     let (mut soaking, mut size_given, mut bursting, mut count) = (false, false, false, 32u32);
+    let mut checking = false;
     let (mut expect_kbit, mut loss_permille) = (0u32, None);
     for &word in words {
         match word {
             b"sweep" => sweeping = true,
             b"soak" => soaking = true,
             b"burst" => bursting = true,
+            b"check" => checking = true,
             b"up" => (params.up, params.down) = (true, false),
             b"down" => (params.up, params.down) = (false, true),
             b"both" => (params.up, params.down) = (true, true),
@@ -2534,6 +2752,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                 session.rate_sweep = None;
                 session.soak = None;
                 session.burst = None;
+                session.check = None;
                 let mut out = [0u8; 512];
                 let Session { remote, generator, .. } = session;
                 let length = remote.as_mut().and_then(|remote| remote.stop_test(generator, &mut out));
@@ -2545,7 +2764,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             }
             _ => {
                 let Some(equals) = word.iter().position(|&byte| byte == b'=') else {
-                    print_bytes(putc, b"use: test [sweep|soak|burst] [up|down|both] [rate=KBIT] [size=B|mix] [time=S]\n  [macs=N] [expect=KBIT] [loss=PCT] [count=N] [to=N] [via=N] [here=N]\n");
+                    print_bytes(putc, b"use: test [check|sweep|soak|burst] [up|down|both] [rate=KBIT] [size=B|mix] [time=S]\n  [macs=N] [expect=KBIT] [loss=PCT] [count=N] [to=N] [via=N] [here=N]\n");
                     return Outcome::Error;
                 };
                 let value = parse_u32(&word[equals + 1..]).filter(|&value| value > 0);
@@ -2601,6 +2820,10 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                 }
             }
         }
+    }
+    if checking {
+        let rate = if rate_given { params.rate_kbit } else { 900_000 };
+        return check_start(putc, session, rate, params);
     }
     session.criteria = (expect_kbit > 0 || loss_permille.is_some()).then_some(Criteria { expect_kbit, loss_permille });
     if bursting {
@@ -2662,6 +2885,7 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
             session.rate_sweep = None;
             session.soak = None;
             session.burst = None;
+            session.check = None;
             return Outcome::Error;
         }
         if nic_in_use(session, nic, Some(&Role::Gen)) && session.gen_nic != Some(nic) {
@@ -2669,6 +2893,7 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
             session.rate_sweep = None;
             session.soak = None;
             session.burst = None;
+            session.check = None;
             return Outcome::Error;
         }
     }
@@ -2678,7 +2903,7 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
         None => Err("no remote"),
     };
     match result {
-        Ok(()) if session.rate_sweep.is_some() || session.soak.is_some() || session.burst.is_some() => Outcome::Continue,
+        Ok(()) if session.rate_sweep.is_some() || session.soak.is_some() || session.burst.is_some() || session.check.is_some() => Outcome::Continue,
         Ok(()) => {
             print_bytes(putc, b"starting the test (");
             print_bytes(putc, if params.up && params.down { b"both ways" } else if params.up { b"up" } else { b"down" });
@@ -2692,13 +2917,21 @@ fn begin_test(putc: Putc, session: &mut Session<'_>, params: TestParams) -> Outc
             }
             print_bytes(putc, b" B frames, ");
             print_u32(putc, u32::from(params.seconds));
-            print_bytes(putc, b" s)...\n");
+            print_bytes(putc, b" s)");
+            if params.via != 0 || params.here != 0 {
+                print_bytes(putc, b" on our NIC ");
+                print_u32(putc, u32::from(params.here));
+                print_bytes(putc, b" <-> peer NIC ");
+                print_u32(putc, u32::from(params.via));
+            }
+            print_bytes(putc, b"...\n");
             Outcome::Continue
         }
         Err(reason) => {
             session.rate_sweep = None;
             session.soak = None;
             session.burst = None;
+            session.check = None;
             print_bytes(putc, reason.as_bytes());
             putc(u32::from(b'\n'));
             Outcome::Error
@@ -2960,6 +3193,10 @@ fn burst_step_done(putc: Putc, session: &mut Session<'_>) {
         return;
     }
     session.burst = None;
+    if session.check.is_some() {
+        check_finish(putc, session, burst);
+        return;
+    }
     print_bytes(putc, b"burst done: largest burst delivered whole: ");
     for (label, best, lost, enabled) in [(&b"up "[..], burst.best_up, burst.lost_up, params.up), (&b"down "[..], burst.best_down, burst.lost_down, params.down)] {
         if enabled {
@@ -3138,17 +3375,18 @@ fn print_remote_event(putc: Putc, session: &mut Session<'_>, nic: u32, event: Re
                 }
             }
         }
-        RemoteEvent::Started if session.rate_sweep.is_some() || session.soak.is_some() || session.burst.is_some() => {}
+        RemoteEvent::Started if session.rate_sweep.is_some() || session.soak.is_some() || session.burst.is_some() || session.check.is_some() => {}
         RemoteEvent::Started => print_bytes(putc, b"test running...\n"),
         RemoteEvent::Finished if session.rate_sweep.is_some() => sweep_step_done(putc, session),
         RemoteEvent::Finished if session.soak.is_some() => soak_step_done(putc, session),
         RemoteEvent::Finished if session.burst.is_some() => burst_step_done(putc, session),
+        RemoteEvent::Finished if session.check.is_some() => check_step_done(putc, session),
         RemoteEvent::Finished => print_remote_report(putc, session, nic),
         RemoteEvent::Failed(reason) => {
             session.rate_sweep = None;
             session.soak = None;
             session.burst = None;
-            session.burst = None;
+            session.check = None;
             print_bytes(putc, reason.as_bytes());
             putc(u32::from(b'\n'));
         }
@@ -3180,6 +3418,9 @@ fn print_remote_report(putc: Putc, session: &Session<'_>, nic: u32) {
             print_bytes(putc, b"(control)");
         }
         putc(u32::from(b'\n'));
+    }
+    if let Some(assessment) = assess(session) {
+        print_headline(putc, b"Summary:", &assessment, remote.test);
     }
     print_link_counters(putc, b"here", &remote.own_counters);
     print_link_counters(putc, b"peer", &report.counters);
@@ -3281,14 +3522,17 @@ fn print_timeline(putc: Putc, stats: &nettest_tape::SinkStats, params: TestParam
     putc(u32::from(b'\n'));
 }
 
+/// Frames the generator should send in a whole test. It paces by frame bytes alone, but a gigabit wire also carries 20 bytes
+/// of preamble and gap per frame: asking for more than that is not the tape's fault.
+fn offered_frames(params: TestParams) -> u64 {
+    let size = u64::from(params.size).max(1);
+    (u64::from(params.rate_kbit) * 125 / size).min(1_000_000 * 125 / (size + 20)) * u64::from(params.seconds)
+}
+
 /// Frames the generator managed to send against what the rate asked for: below about 95% the tape (CPU per frame), not
 /// the link, was the limit, and the delivered rate says nothing about the switch.
 fn print_offered(putc: Putc, sent: u32, params: TestParams) {
-    let size = u64::from(params.size).max(1);
-    // The generator paces by frame bytes alone, but a gigabit wire also carries 20 bytes of preamble and gap per frame:
-    // asking for more than that is not the tape's fault.
-    let per_second = (u64::from(params.rate_kbit) * 125 / size).min(1_000_000 * 125 / (size + 20));
-    let wanted = per_second * u64::from(params.seconds);
+    let wanted = offered_frames(params);
     if wanted == 0 || u64::from(sent) * 100 >= wanted * 95 {
         return;
     }
