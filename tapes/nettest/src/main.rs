@@ -2664,6 +2664,9 @@ fn remote_pass(putc: Putc, session: &mut Session<'_>, frame: &mut [u8], max_fram
             if frame[12..14] == CTRL_ETHERTYPE {
                 let Session { remote, generator, sink, .. } = &mut *session;
                 let Some(remote) = remote.as_mut() else { break };
+                if let Some(values) = tape_rt::nic_counters(tx_nic as usize) {
+                    remote.local_counters = values;
+                }
                 if let Some(length) = remote.handle(&frame[..received], micros(), generator, sink, &mut out) {
                     let mut mac = [0u8; 6];
                     if rx != nic && (session.mac_at)(rx, mac.as_mut_ptr() as usize) != 0 {
@@ -2720,6 +2723,13 @@ fn remote_pass(putc: Putc, session: &mut Session<'_>, frame: &mut [u8], max_fram
 }
 
 fn print_remote_event(putc: Putc, session: &mut Session<'_>, nic: u32, event: RemoteEvent) {
+    if matches!(event, RemoteEvent::Started | RemoteEvent::Serving { .. }) {
+        // What the test costs the NIC is the change in its counters from here to the report.
+        let test_nic = test_nic_of(session).unwrap_or(nic);
+        if let (Some(values), Some(remote)) = (tape_rt::nic_counters(test_nic as usize), session.remote.as_mut()) {
+            remote.start_counters = values;
+        }
+    }
     match event {
         RemoteEvent::Found(found) => {
             print_bytes(putc, b"server: ");
@@ -2806,6 +2816,8 @@ fn print_remote_report(putc: Putc, session: &Session<'_>, nic: u32) {
         }
         putc(u32::from(b'\n'));
     }
+    print_link_counters(putc, b"here", &remote.own_counters);
+    print_link_counters(putc, b"peer", &report.counters);
     let mut peer_sink = Sink::new();
     peer_sink.stats = report.sink;
     if remote.test.up {
@@ -2829,6 +2841,33 @@ fn print_remote_report(putc: Putc, session: &Session<'_>, nic: u32) {
         print_offered(putc, report.gen_sent, remote.test);
     }
     print_bytes(putc, b"(one-way latency depends on the clock offset above; loss, rate and jitter do not)\n");
+}
+
+/// The test NIC's negotiated speed and what its error counters gained during the test (all zero is the good case).
+fn print_link_counters(putc: Putc, who: &[u8], counters: &[u64; nettest_tape::NIC_COUNTERS]) {
+    if counters[0] == 0 {
+        return; // no link information: an old kernel or server, or a card that cannot tell
+    }
+    print_bytes(putc, b"link ");
+    print_bytes(putc, who);
+    print_bytes(putc, b": ");
+    print_u32(putc, counters[0] as u32);
+    print_bytes(putc, if counters[1] != 0 { b" Mbit/s full duplex" } else { b" Mbit/s HALF duplex" });
+    let names: [&[u8]; 7] = [b"missed", b"no-buffer", b"CRC", b"symbol", b"XOFF in", b"XOFF out", b"queue drops"];
+    let mut any = false;
+    for (name, &value) in names.iter().zip(&counters[2..]) {
+        if value != 0 {
+            print_bytes(putc, if any { b", " } else { b"\n  during test: " });
+            print_u32(putc, value.min(u64::from(u32::MAX)) as u32);
+            putc(u32::from(b' '));
+            print_bytes(putc, name);
+            any = true;
+        }
+    }
+    if !any {
+        print_bytes(putc, b", no errors or PAUSE during the test");
+    }
+    putc(u32::from(b'\n'));
 }
 
 /// Exact minimum and queueing delay (mean minus minimum), and reordered or duplicated frames when there are any.

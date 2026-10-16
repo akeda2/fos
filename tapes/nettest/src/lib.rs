@@ -421,6 +421,18 @@ const GEN_MAGIC: &[u8; 4] = b"FNT1";
 /// Bytes of Ethernet header plus the generator's own header (magic, stream,
 /// sequence number, timestamp): the smallest frame that can carry them.
 pub const GEN_HEADER_LEN: usize = 14 + 4 + 2 + 4 + 8;
+/// Values `tape_rt::nic_counters` returns: speed, duplex, then error totals.
+pub const NIC_COUNTERS: usize = 9;
+
+/// What a test cost the NIC: link speed and duplex as they are now, every error counter as the change since `start`.
+pub fn counter_delta(now: &[u64; NIC_COUNTERS], start: &[u64; NIC_COUNTERS]) -> [u64; NIC_COUNTERS] {
+    let mut delta = *now;
+    for index in 2..NIC_COUNTERS {
+        delta[index] = now[index].saturating_sub(start[index]);
+    }
+    delta
+}
+
 /// Smallest frame the generator will build (an Ethernet minimum frame).
 pub const GEN_MIN_SIZE: usize = 60;
 /// Frames sent per call at most, so a long stall cannot turn into one huge

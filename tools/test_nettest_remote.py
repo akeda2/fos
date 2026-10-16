@@ -52,6 +52,8 @@ def main():
             server.wait_for("master started a test: both ways", 5, server_mark)
             check("peer -> here" in report, "both directions are reported")
             check("% of rate per second:" in report, "the report shows delivery per second", report[-1200:])
+            check(re.search(r"link here: \d+ Mbit/s (full|HALF) duplex", report) is not None, "the report names the master's link speed", report[-1200:])
+            check(re.search(r"link peer: \d+ Mbit/s (full|HALF) duplex", report) is not None, "the report names the server's link speed", report[-1200:])
             raw_mark = len(master.raw)
             master.process.stdin.write(b"tesx\x7ft up rate=1000 time=1\n")
             master.process.stdin.flush()

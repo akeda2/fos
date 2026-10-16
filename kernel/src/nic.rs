@@ -56,6 +56,15 @@ impl Nic {
         }
     }
 
+    /// Missed packets, no-buffer events, CRC errors, symbol errors, PAUSE frames received and sent (running totals), for
+    /// `TapeApi::nic_counters`; e1000 family only.
+    pub fn error_counters(&self) -> Option<[u64; 6]> {
+        match self {
+            Nic::E1000(nic) => Some(nic.error_counters()),
+            _ => None,
+        }
+    }
+
     /// An MII register of the copper PHY, for `nic phy` (e1000 classic and I350 only).
     pub fn phy_read(&self, register: u32) -> Option<u16> {
         match self {

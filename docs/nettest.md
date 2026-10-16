@@ -512,7 +512,9 @@ flat-lines at one number from the first step is a link-speed or port fault; a nu
 `nic phy N` then tells a bad cable from a bad port: a partner that offers `1000FD` while the link came up at 100 points at the cable
 (a damaged pair), a partner that never offers it at the far port. In that example moving the cable to another port did not help
 (still 100), and after the next reboot of the host the link came up at 1000 with both receivers OK; the same sweep then
-delivered 900 Mbit/s both ways at 1400 B with 0.00% loss. Small frames test the tape more than the switch: at 64 B the
+delivered 900 Mbit/s both ways at 1400 B with 0.00% loss. The remote report also starts with the test NIC's negotiated speed and duplex on both machines and says whether CRC or symbol errors,
+missed packets or PAUSE frames appeared during the test ("link here: 1000 Mbit/s full duplex, no errors or PAUSE during the test"),
+which tells a bad cable or a flow-controlling switch apart from a slow one. Small frames test the tape more than the switch: at 64 B the
 generator and sink loops top out at roughly 80 kframes/s each way while both run (about 40 Mbit/s), far below the switch's
 rate, so do not read that as a switch limit. A remote report says so itself: when a generator sent under 95% of the frames
 the rate asked for (counting the 20 bytes of preamble and gap per frame on a gigabit wire), the direction gets a "tape

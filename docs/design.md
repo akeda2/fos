@@ -924,6 +924,13 @@ groups swept, only the joined one arrived. Only real hardware can confirm the ta
 getting UDP PTP (frames injected from a host arrived, the switch's group table never listed the card); with snooping off,
 82579V and I350 work as slave and master over UDP.
 
+**NIC counters in the nettest report (ABI 15).** `nic_counters(nic, out, count)` fills a u64 array: negotiated Mbit/s, duplex,
+then running totals of missed packets, no-buffer events, CRC and symbol errors, PAUSE (XOFF) frames received and sent, and frames the
+kernel's tape queue dropped (the statistics registers clear on read, so `e1000.rs` `error_counters` adds each read to a total). The
+`nettest` master snapshots its test NIC when a test starts and the server does likewise; the T_REPORT frame appends the server's
+changes (an older server sends none and its line is simply left out), and the report prints `link here:` and `link peer:` with
+the speed, duplex and any counter that moved. Verified in QEMU (`make test-nettest-remote`) and on the I350 pair.
+
 **Transmit checksum offload (ABI 14).** `nic_tx_offload(nic, on)` makes the I350's `send` hand IPv4 UDP frames whose checksum
 field is 0 (and TCP frames) to the card: a context descriptor (MACLEN 14, IPLEN) plus an advanced data descriptor with
 TXSM. The driver writes the pseudo-header sum into the field (not complemented) and the card sums the rest to the end of

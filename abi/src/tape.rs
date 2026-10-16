@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`.
-pub const TAPE_API_VERSION: u32 = 14;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`.
+pub const TAPE_API_VERSION: u32 = 15;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -244,6 +244,12 @@ pub struct TapeApi {
     /// overwritten. Bytes after the IP total length are dropped. 1 if done, 0 on a card without it (the I350 has it; the
     /// tape then checksums itself). The kernel turns it off when a tape ends.
     pub nic_tx_offload: extern "C" fn(usize, u32) -> u32,
+    /// `nic_counters(index, out, count)` (version 15): writes up to `count` u64 values to `out` and returns how many it wrote
+    /// (0: no such interface). The order is fixed, new values only at the end: 0 negotiated Mbit/s (0 unknown), 1 full duplex
+    /// (0 or 1), 2 packets the card missed for want of receive buffers, 3 no-buffer events, 4 CRC errors, 5 symbol errors,
+    /// 6 PAUSE (XOFF) frames received, 7 PAUSE frames sent, 8 frames the kernel's tape queue dropped. Values 2-7 are 0 on a
+    /// card without these counters; all but 0 and 1 are running totals since boot, so take two snapshots and subtract.
+    pub nic_counters: extern "C" fn(usize, *mut u64, usize) -> usize,
 }
 
 /// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.

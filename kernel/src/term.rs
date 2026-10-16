@@ -1128,6 +1128,23 @@ pub fn nic_vlan_clear_all() {
     }
 }
 
+/// `TapeApi::nic_counters`: fills `out` with negotiated Mbit/s (0 unknown), full duplex (0/1), the six card error
+/// totals (`Nic::error_counters`) and frames the kernel's tape queue dropped; returns how many it wrote.
+pub fn nic_counters(index: usize, out: &mut [u64]) -> usize {
+    let Some(nic) = nic_at(index) else { return 0 };
+    let (speed, duplex) = nic.link_speed().map_or((0, 0), |(speed, full)| (u64::from(speed), u64::from(full)));
+    let mut all = [0u64; 9];
+    all[0] = speed;
+    all[1] = duplex;
+    if let Some(errors) = nic.error_counters() {
+        all[2..8].copy_from_slice(&errors);
+    }
+    all[8] = u64::from(unsafe { FRAMES_DROPPED[index] });
+    let count = out.len().min(all.len());
+    out[..count].copy_from_slice(&all[..count]);
+    count
+}
+
 pub fn nic_tx_offload(index: usize, on: bool) -> bool {
     nic_at(index).is_some_and(|nic| nic.set_tx_offload(on))
 }

@@ -18,7 +18,7 @@
 //!
 //! Frame: `dst src 88B5 "FNC1" type version session(u16) seq(u32) payload`, little-endian, zero padded.
 
-use crate::{Generator, HISTOGRAM_BUCKETS, Sink, SinkStats, TIMELINE_BINS};
+use crate::{Generator, HISTOGRAM_BUCKETS, NIC_COUNTERS, Sink, SinkStats, TIMELINE_BINS, counter_delta};
 
 pub const CTRL_ETHERTYPE: [u8; 2] = [0x88, 0xb5];
 const MAGIC: &[u8; 4] = b"FNC1";
@@ -89,6 +89,9 @@ pub struct PeerReport {
     pub sink: SinkStats,
     pub gen_sent: u32,
     pub gen_failed: u32,
+    /// The server's test NIC over the test: link speed and duplex, then the change in each error counter
+    /// (`tape_rt::nic_counters` order). All zero from a server that does not report them.
+    pub counters: [u64; NIC_COUNTERS],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -154,6 +157,11 @@ pub struct Remote {
     sync_path: bool,
     /// `poll` just built a frame for the test path (the master's `here` NIC), not the control path.
     pub out_on_test_path: bool,
+    /// The tape's reading of its test NIC's counters, refreshed before a control frame is handled, and the reading taken
+    /// when the test started. A server reports their difference; a master keeps its own in `own_counters`.
+    pub local_counters: [u64; NIC_COUNTERS],
+    pub start_counters: [u64; NIC_COUNTERS],
+    pub own_counters: [u64; NIC_COUNTERS],
 }
 
 struct Writer<'a> {
@@ -241,6 +249,9 @@ impl Remote {
             sync_target: [0; 6],
             sync_path: false,
             out_on_test_path: false,
+            local_counters: [0; NIC_COUNTERS],
+            start_counters: [0; NIC_COUNTERS],
+            own_counters: [0; NIC_COUNTERS],
         }
     }
 
@@ -605,6 +616,9 @@ impl Remote {
                 }
                 writer.u32(sent);
                 writer.u32(failed);
+                for value in counter_delta(&self.local_counters, &self.start_counters) {
+                    writer.u64(value);
+                }
                 Some(Self::finish(writer))
             }
             (Role::Server, T_STOP) => {
@@ -681,7 +695,13 @@ impl Remote {
                 }
                 let gen_sent = body.u32()?;
                 let gen_failed = body.u32()?;
-                self.report = Some(PeerReport { sink: stats, gen_sent, gen_failed });
+                let mut counters = [0u64; NIC_COUNTERS];
+                for value in counters.iter_mut() {
+                    // An older server stops after `gen_failed`: its counters stay 0 (unknown).
+                    *value = body.u64().unwrap_or(0);
+                }
+                self.own_counters = counter_delta(&self.local_counters, &self.start_counters);
+                self.report = Some(PeerReport { sink: stats, gen_sent, gen_failed, counters });
                 self.phase = Phase::Ready;
                 self.push_event(Event::Finished);
                 None
@@ -813,6 +833,24 @@ mod tests {
         let report = rig.master.report.unwrap();
         assert_eq!(report.sink.received, 1);
         assert_eq!(report.gen_failed, 0);
+    }
+
+    #[test]
+    fn the_report_carries_the_servers_counter_changes() {
+        let mut rig = Rig::new();
+        rig.master.select(SERVER, rig.now);
+        rig.run_until(|rig| rig.master.ready());
+        let params = TestParams { rate_kbit: 8_000, seconds: 1, ..TestParams::new() };
+        rig.master.start_test(params, rig.now, &mut rig.mgen, &mut rig.msink, MASTER).unwrap();
+        rig.server.start_counters = [1000, 1, 10, 0, 5, 0, 0, 0, 0];
+        rig.server.local_counters = [1000, 1, 12, 3, 5, 0, 7, 0, 0];
+        rig.master.start_counters = [1000, 1, 0, 0, 0, 0, 0, 0, 0];
+        rig.master.local_counters = [100, 0, 0, 0, 9, 0, 0, 0, 0];
+        rig.run_until(|rig| rig.events.contains(&Event::Finished));
+        let report = rig.master.report.unwrap();
+        // Speed and duplex as the server saw them at the end, every error counter as a change over the test.
+        assert_eq!(report.counters, [1000, 1, 2, 3, 0, 0, 7, 0, 0]);
+        assert_eq!(rig.master.own_counters, [100, 0, 0, 0, 9, 0, 0, 0, 0]);
     }
 
     #[test]

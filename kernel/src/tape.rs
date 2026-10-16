@@ -510,6 +510,12 @@ extern "C" fn api_nic_multicast_join(index: usize, mac: *const u8, on: u32) -> u
 extern "C" fn api_nic_vlan_filter(index: usize, vid: u32, on: u32) -> u32 {
     u16::try_from(vid).is_ok_and(|vid| term::nic_vlan_filter(index, vid, on != 0)) as u32
 }
+extern "C" fn api_nic_counters(index: usize, out: *mut u64, count: usize) -> usize {
+    if out.is_null() {
+        return 0;
+    }
+    term::nic_counters(index, unsafe { core::slice::from_raw_parts_mut(out, count) })
+}
 extern "C" fn api_nic_tx_offload(index: usize, on: u32) -> u32 {
     u32::from(term::nic_tx_offload(index, on != 0))
 }
@@ -717,6 +723,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_multicast_join: api_nic_multicast_join,
         nic_vlan_filter: api_nic_vlan_filter,
         nic_tx_offload: api_nic_tx_offload,
+        nic_counters: api_nic_counters,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

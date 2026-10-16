@@ -549,6 +549,22 @@ pub fn tx_offload(nic: usize, on: bool) -> bool {
     table.version >= 14 && (table.size as usize) >= end && (table.nic_tx_offload)(nic, u32::from(on)) != 0
 }
 
+/// Number of values `nic_counters` can return, in the order the ABI documents (speed, duplex, missed, no-buffer, CRC,
+/// symbol, XOFF received, XOFF sent, tape queue drops).
+pub const NIC_COUNTERS: usize = 9;
+
+/// Link speed and error counters of interface `nic` (see `TapeApi::nic_counters`); `None` on a kernel older than version
+/// 15 or an unknown interface.
+pub fn nic_counters(nic: usize) -> Option<[u64; NIC_COUNTERS]> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, nic_counters) + core::mem::size_of::<usize>();
+    if table.version < 15 || (table.size as usize) < end {
+        return None;
+    }
+    let mut values = [0u64; NIC_COUNTERS];
+    ((table.nic_counters)(nic, values.as_mut_ptr(), NIC_COUNTERS) != 0).then_some(values)
+}
+
 /// Registers (`on`) or drops one VLAN id in the card's VLAN filter; the filter turns on with the first id. True if the
 /// card did it; false on a card without one or a kernel older than version 13 (every tag then still arrives).
 pub fn vlan_filter(nic: usize, vid: u16, on: bool) -> bool {

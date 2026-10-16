@@ -956,22 +956,29 @@ impl E1000 {
     /// `nic list`: what the card itself counted lost for want of receive buffers. These are the
     /// frames a foreground that polls too slowly costs; the ring is `RX_COUNT` buffers deep.
     pub fn describe(&self) {
+        let [missed, none, crc, symbol, xoff_rx, xoff_tx] = self.error_counters();
+        crate::println!("   receive ring: {RX_COUNT} buffers; card counted {missed} missed packets, {none} no-buffer events");
+        crate::println!("   errors: {crc} CRC, {symbol} symbol; PAUSE (XOFF): {xoff_rx} received, {xoff_tx} sent");
+    }
+
+    /// Running totals since boot of missed packets, no-buffer events, CRC errors, symbol errors and PAUSE (XOFF) frames
+    /// received and sent. The statistics registers clear when read, so each read is added to a total here; a caller
+    /// takes two snapshots and subtracts.
+    pub fn error_counters(&self) -> [u64; 6] {
         use core::sync::atomic::Ordering;
         let state = &ISR[self.index];
-        let missed = u64::from(read(self.registers, REG_MPC));
-        let none = u64::from(read(self.registers, REG_RNBC));
-        let missed = state.missed.fetch_add(missed, Ordering::Relaxed) + missed;
-        let none = state.no_buffers.fetch_add(none, Ordering::Relaxed) + none;
-        crate::println!("   receive ring: {RX_COUNT} buffers; card counted {missed} missed packets, {none} no-buffer events");
         let take = |register: usize, total: &core::sync::atomic::AtomicU64| {
             let now = u64::from(read(self.registers, register));
             total.fetch_add(now, Ordering::Relaxed) + now
         };
-        let crc = take(0x4000, &state.crc_errors);
-        let symbol = take(0x4008, &state.symbol_errors);
-        let xoff_rx = take(0x4050, &state.xoff_received);
-        let xoff_tx = take(0x4054, &state.xoff_sent);
-        crate::println!("   errors: {crc} CRC, {symbol} symbol; PAUSE (XOFF): {xoff_rx} received, {xoff_tx} sent");
+        [
+            take(REG_MPC, &state.missed),
+            take(REG_RNBC, &state.no_buffers),
+            take(0x4000, &state.crc_errors),
+            take(0x4008, &state.symbol_errors),
+            take(0x4050, &state.xoff_received),
+            take(0x4054, &state.xoff_sent),
+        ]
     }
 
     pub fn link_up(&self) -> bool {
