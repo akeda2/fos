@@ -376,8 +376,10 @@ fn send(l2: bool, api: &TapeApi, nic: usize, config: &net::NetConfig, port: u16,
 }
 
 /// Waits between polls: sleeps (master default, or `idle`), or spins (slave default, `spin`: the smallest receive-time error).
-fn wait(options: &Options) {
-    if options.idle {
+/// `due_ns` is the next time the caller has work: a sleep ends at the next interrupt, and the kernel tick is 10 ms,
+/// so within one tick of the deadline it spins instead (otherwise a 125 ms Sync goes out at 120 or 130 ms).
+fn wait(options: &Options, due_ns: i64) {
+    if options.idle && due_ns - now_ns() > 11_000_000 {
         tape_rt::idle();
     } else {
         core::hint::spin_loop();
@@ -594,7 +596,7 @@ fn slave(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6]
             second = Window::default();
         }
         if !busy {
-            wait(options);
+            wait(options, i64::MAX);
         }
     }
     let c = slave.counters;
@@ -734,7 +736,7 @@ fn master(api: &TapeApi, options: &Options, config: &net::NetConfig, mac: [u8; 6
             println!("{:>4}s master: {} syncs sent, {} delay requests answered", (now - start) / 1_000_000_000, syncs, answered);
         }
         if !busy {
-            wait(options);
+            wait(options, next_announce.min(next_sync));
         }
     }
     println!("ptp: {syncs} syncs sent, {answered} delay requests answered.");
