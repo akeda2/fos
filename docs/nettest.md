@@ -532,6 +532,11 @@ second`): a steady shortfall means a rate limit, a single dip means an outage. T
 from a 33-bucket histogram (50 us up to 5 s, steps of 1-2.5 ms around 1-10 ms and 5-25 ms up to 150 ms). The minimum is clamped at 0 when the offset error exceeds the true delay, so
 trust the queueing figure rather than the minimum. On a powerline link the knee moves between runs.
 
+`test [soak] ... expect=KBIT loss=PCT` turns a test into a check: after the report (or the soak summary) a line says `RESULT: PASS`, or
+`RESULT: FAIL` with each direction that delivered less than `expect` kbit/s or lost more than `loss` percent (one decimal: `loss=0.1`).
+A soak judges the lowest segment's rate and the loss over the whole run. Use it to qualify a cable or switch, for example
+`test both rate=900000 size=1400 time=10 expect=850000 loss=0.1`.
+
 `test soak [both|up|down] [rate=KBIT] [size=B] [time=S]` (defaults 900000 kbit/s of 1400 B frames for 600 s; `time` up to
 86400) runs 10 s tests back to back, so a switch can be watched for ten minutes or hours. Each segment prints one line (kbit/s
 delivered and loss each way, and how many error counters moved on both NICs), and the summary gives the loss over the whole run,

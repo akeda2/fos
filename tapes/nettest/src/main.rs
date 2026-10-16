@@ -105,6 +105,7 @@ struct Session<'a> {
     /// A running `test sweep`: the rate ladder and the best loss-free rate each way so far.
     rate_sweep: Option<RateSweep>,
     soak: Option<Soak>,
+    criteria: Option<Criteria>,
     /// FOSFS write callback (for `save`), the file `gen.save=NAME` writes when a
     /// test finishes, and when the end-of-test summary is due (0 = not pending).
     fs_write: Option<fn(usize, u32, usize, u32) -> u32>,
@@ -229,6 +230,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         chosen: 0,
         rate_sweep: None,
         soak: None,
+        criteria: None,
         fs_write: None,
         save_name: [0; 16],
         save_name_len: 0,
@@ -2418,6 +2420,58 @@ struct RateSweep {
     next_rate: u32,
 }
 
+/// `expect=KBIT` and `loss=PCT` of a test: what it must deliver (each direction that runs) and may lose.
+#[derive(Clone, Copy)]
+struct Criteria {
+    expect_kbit: u32,
+    /// Tenths of a percent (`nettest_tape::parse_permille`).
+    loss_permille: Option<u16>,
+}
+
+/// One direction's result for `print_verdict`: kbit/s delivered (the lowest segment of a soak) and loss in hundredths of a percent.
+struct DirectionResult {
+    name: &'static [u8],
+    kbit: u64,
+    loss_hundredths: u32,
+}
+
+/// `RESULT: PASS`, or `RESULT: FAIL` with every criterion a direction missed.
+fn print_verdict(putc: Putc, criteria: Criteria, results: &[DirectionResult]) {
+    let mut failed = false;
+    for result in results {
+        failed |= u64::from(criteria.expect_kbit) > result.kbit
+            || criteria.loss_permille.is_some_and(|limit| result.loss_hundredths > u32::from(limit) * 10);
+    }
+    print_bytes(putc, if failed { b"RESULT: FAIL\n" } else { b"RESULT: PASS\n" });
+    if !failed {
+        return;
+    }
+    for result in results {
+        if u64::from(criteria.expect_kbit) > result.kbit {
+            print_bytes(putc, b"  ");
+            print_bytes(putc, result.name);
+            print_bytes(putc, b": delivered ");
+            print_u32(putc, result.kbit as u32);
+            print_bytes(putc, b" kbit/s, expected at least ");
+            print_u32(putc, criteria.expect_kbit);
+            putc(u32::from(b'\n'));
+        }
+        if let Some(limit) = criteria.loss_permille.filter(|&limit| result.loss_hundredths > u32::from(limit) * 10) {
+            print_bytes(putc, b"  ");
+            print_bytes(putc, result.name);
+            print_bytes(putc, b": lost ");
+            print_u32(putc, result.loss_hundredths / 100);
+            putc(u32::from(b'.'));
+            print_two_digits(putc, result.loss_hundredths % 100);
+            print_bytes(putc, b"%, allowed ");
+            print_u32(putc, u32::from(limit) / 10);
+            putc(u32::from(b'.'));
+            print_u32(putc, u32::from(limit) % 10);
+            print_bytes(putc, b"%\n");
+        }
+    }
+}
+
 /// Seconds per `test soak` segment: one report line each, and the unit counters are compared over.
 const SOAK_SEGMENT_S: u32 = 10;
 
@@ -2433,6 +2487,7 @@ struct Soak {
     got: [u64; 2],
     /// Changes of every error counter (missed, CRC, PAUSE ... on either end) summed over all segments.
     counter_changes: u64,
+    min_kbit: [u64; 2],
     by_counter: [u64; COUNTER_NAMES.len()],
 }
 
@@ -2448,6 +2503,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
     let mut params = session.remote.as_ref().map_or(TestParams::new(), |remote| remote.test);
     let (mut sweeping, mut to, mut step, mut rate_given, mut time_given, mut settle) = (false, 20_000u32, 2_000u32, false, false, 1u32);
     let (mut soaking, mut size_given) = (false, false);
+    let (mut expect_kbit, mut loss_permille) = (0u32, None);
     for &word in words {
         match word {
             b"sweep" => sweeping = true,
@@ -2469,7 +2525,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             }
             _ => {
                 let Some(equals) = word.iter().position(|&byte| byte == b'=') else {
-                    print_bytes(putc, b"use: test [sweep|soak] [up|down|both] [rate=KBIT] [size=B] [time=S] [via=N] [here=N]\n");
+                    print_bytes(putc, b"use: test [sweep|soak] [up|down|both] [rate=KBIT] [size=B] [time=S]\n  [expect=KBIT] [loss=PCT] [via=N] [here=N]\n");
                     return Outcome::Error;
                 };
                 let value = parse_u32(&word[equals + 1..]).filter(|&value| value > 0);
@@ -2489,7 +2545,16 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
                     }
                     continue;
                 }
+                if &word[..equals] == b"loss" {
+                    let Some(limit) = nettest_tape::parse_permille(&word[equals + 1..]) else {
+                        print_bytes(putc, b"loss=PCT: the loss allowed, such as 0 or 0.1 (one decimal)\n");
+                        return Outcome::Error;
+                    };
+                    loss_permille = Some(limit);
+                    continue;
+                }
                 match (&word[..equals], value) {
+                    (b"expect", Some(value)) => expect_kbit = value,
                     (b"rate", Some(value)) => (params.rate_kbit, rate_given) = (value, true),
                     (b"to", Some(value)) => to = value,
                     (b"step", Some(value)) => step = value,
@@ -2504,6 +2569,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             }
         }
     }
+    session.criteria = (expect_kbit > 0 || loss_permille.is_some()).then_some(Criteria { expect_kbit, loss_permille });
     if soaking && !sweeping {
         let total_s = if time_given { u32::from(params.seconds) } else { 600 };
         if !rate_given {
@@ -2513,7 +2579,7 @@ fn test_command(putc: Putc, session: &mut Session<'_>, words: &[&[u8]]) -> Outco
             params.size = 1400;
         }
         params.seconds = SOAK_SEGMENT_S as u16;
-        session.soak = Some(Soak { total_s, done_s: 0, worst_percent: [u32::MAX; 2], dips: [0; 2], sent: [0; 2], got: [0; 2], counter_changes: 0, by_counter: [0; COUNTER_NAMES.len()] });
+        session.soak = Some(Soak { total_s, done_s: 0, worst_percent: [u32::MAX; 2], dips: [0; 2], sent: [0; 2], got: [0; 2], counter_changes: 0, min_kbit: [u64::MAX; 2], by_counter: [0; COUNTER_NAMES.len()] });
         print_bytes(putc, b"soak ");
         print_u32(putc, total_s);
         print_bytes(putc, b" s in segments of 10 s; per segment: kbit/s, loss, errors\n");
@@ -2712,6 +2778,7 @@ fn soak_step_done(putc: Putc, session: &mut Session<'_>) {
         seen.stats = *sink;
         let lost = missing_hundredths(sent, sink.received);
         let (dips, worst) = timeline_dips(sink, params);
+        soak.min_kbit[index] = soak.min_kbit[index].min(seen.average_kbit());
         soak.sent[index] += u64::from(sent);
         soak.got[index] += u64::from(sink.received);
         soak.dips[index] += dips;
@@ -2754,6 +2821,17 @@ fn soak_step_done(putc: Putc, session: &mut Session<'_>) {
         print_bytes(putc, b"% of the rate, ");
         print_u32(putc, soak.dips[index]);
         print_bytes(putc, b" seconds under 95%\n");
+    }
+    if let Some(criteria) = session.criteria {
+        let mut results = [DirectionResult { name: b"", kbit: 0, loss_hundredths: 0 }, DirectionResult { name: b"", kbit: 0, loss_hundredths: 0 }];
+        let mut count = 0;
+        for (index, enabled, name) in [(0, params.up, &b"up"[..]), (1, params.down, &b"down"[..])] {
+            if enabled {
+                results[count] = DirectionResult { name, kbit: soak.min_kbit[index], loss_hundredths: missing_hundredths_wide(soak.sent[index], soak.got[index]) };
+                count += 1;
+            }
+        }
+        print_verdict(putc, criteria, &results[..count]);
     }
     print_bytes(putc, b"  error counter changes on both NICs: ");
     print_u32(putc, soak.counter_changes.min(u64::from(u32::MAX)) as u32);
@@ -2993,6 +3071,19 @@ fn print_remote_report(putc: Putc, session: &Session<'_>, nic: u32) {
         print_offered(putc, report.gen_sent, remote.test);
     }
     print_bytes(putc, b"(one-way latency depends on the clock offset above; loss, rate and jitter do not)\n");
+    if let Some(criteria) = session.criteria {
+        let mut results = [DirectionResult { name: b"", kbit: 0, loss_hundredths: 0 }, DirectionResult { name: b"", kbit: 0, loss_hundredths: 0 }];
+        let mut count = 0;
+        if remote.test.up {
+            results[count] = DirectionResult { name: b"up", kbit: peer_sink.average_kbit(), loss_hundredths: missing_hundredths(session.generator.stats.sent, report.sink.received) };
+            count += 1;
+        }
+        if remote.test.down {
+            results[count] = DirectionResult { name: b"down", kbit: session.sink.average_kbit(), loss_hundredths: missing_hundredths(report.gen_sent, session.sink.stats.received) };
+            count += 1;
+        }
+        print_verdict(putc, criteria, &results[..count]);
+    }
 }
 
 const COUNTER_NAMES: [&[u8]; 7] = [b"missed", b"no-buffer", b"CRC", b"symbol", b"XOFF in", b"XOFF out", b"queue drops"];
