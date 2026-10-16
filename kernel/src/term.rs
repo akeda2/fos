@@ -868,9 +868,9 @@ pub fn set_tape_mode(on: bool) {
 }
 
 /// Frames that were not the terminal's, kept per interface for the tape's `nic_receive`
-/// (a short FIFO: a tape that does not poll loses the oldest traffic, like a NIC ring
-/// overrun).
-const FRAME_FIFO: usize = 64;
+/// (a FIFO twice the hardware ring: a tape that does not poll loses the oldest traffic, like a NIC ring
+/// overrun; 64 slots made `nettest` lose small frames long before the NIC did).
+const FRAME_FIFO: usize = 256;
 static mut FRAMES: [[u8; 1600]; MAX_NICS * FRAME_FIFO] = [[0; 1600]; MAX_NICS * FRAME_FIFO];
 static mut FRAME_LENGTHS: [usize; MAX_NICS * FRAME_FIFO] = [0; MAX_NICS * FRAME_FIFO];
 /// Hardware receive stamp of each queued frame (0: none), and of the frame `pop_frame` handed out last.
@@ -878,7 +878,7 @@ static mut FRAME_STAMPS: [u64; MAX_NICS * FRAME_FIFO] = [0; MAX_NICS * FRAME_FIF
 static mut LAST_STAMP: [u64; MAX_NICS] = [0; MAX_NICS];
 static mut FRAME_HEAD: [usize; MAX_NICS] = [0; MAX_NICS];
 static mut FRAME_TAIL: [usize; MAX_NICS] = [0; MAX_NICS];
-static mut FRAMES_DROPPED: u32 = 0;
+static mut FRAMES_DROPPED: [u32; MAX_NICS] = [0; MAX_NICS];
 static mut FRAMES_QUEUED: u32 = 0;
 
 /// Keeps a frame that is not the terminal's for a tape (`tape load net` listens for its own
@@ -890,7 +890,7 @@ fn queue_frame(index: usize, frame: &[u8], stamp: u64) {
         let next = (head + 1) % FRAME_FIFO;
         if next == FRAME_TAIL[index] {
             FRAME_TAIL[index] = (FRAME_TAIL[index] + 1) % FRAME_FIFO; // full: drop the oldest
-            FRAMES_DROPPED += 1;
+            FRAMES_DROPPED[index] += 1;
         }
         let slot = index * FRAME_FIFO + head;
         core::slice::from_raw_parts_mut((core::ptr::addr_of_mut!(FRAMES) as *mut u8).add(slot * 1600), frame.len()).copy_from_slice(frame);
@@ -916,6 +916,24 @@ pub fn tape_poll() {
     tape_service();
 }
 
+/// Moves every frame waiting in a NIC's hardware ring into the per-interface FIFO (the terminal's own frames are
+/// handled on the way). The part of `tape_service` a receive-heavy tape needs on every call; the rest runs on a timer.
+fn drain_nics_to_fifo() {
+    let mut buffer = [0u8; 1600];
+    for index in 0..nic_count() {
+        // At most one ring's worth per call: under a line-rate flood the ring never stays empty, and an
+        // unbounded loop here would starve the tape that is supposed to consume (and send) the traffic.
+        for _ in 0..256 {
+            let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
+            let stamp = nic_at(index).map_or(0, |nic| nic.take_stamp());
+            if handle_frame(index, &buffer[..length]) {
+                continue;
+            }
+            queue_frame(index, &buffer[..length], stamp);
+        }
+    }
+}
+
 fn tape_service() {
     crate::debug::pet();
     crate::usb_hid::poll();
@@ -939,17 +957,7 @@ fn tape_service() {
             tape_input_push(u16::from(key));
         }
     }
-    let mut buffer = [0u8; 1600];
-    for index in 0..nic_count() {
-        loop {
-            let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
-            let stamp = nic_at(index).map_or(0, |nic| nic.take_stamp());
-            if handle_frame(index, &buffer[..length]) {
-                continue;
-            }
-            queue_frame(index, &buffer[..length], stamp);
-        }
-    }
+    drain_nics_to_fifo();
     crate::uart::poll();
     announce_service();
     flush();
@@ -982,7 +990,22 @@ pub fn tape_should_abort() -> bool {
 
 /// A tape's `nic_receive`: the next queued frame of interface `index` that is not the
 /// terminal's.
+///
+/// A queued frame is handed out at once. The full service (USB, keys, serial, console) used to run on every call, which
+/// at tens of thousands of frames a second cost more than the frames: it now runs only when the queue is empty, and a
+/// light drain of the hardware rings every 16 frames keeps them from overrunning meanwhile.
 pub fn tape_receive(index: usize, out: &mut [u8]) -> usize {
+    static mut SINCE_DRAIN: u32 = 0;
+    if index < MAX_NICS && unsafe { FRAME_TAIL[index] != FRAME_HEAD[index] } {
+        unsafe {
+            SINCE_DRAIN += 1;
+            if SINCE_DRAIN >= 16 {
+                SINCE_DRAIN = 0;
+                drain_nics_to_fifo();
+            }
+        }
+        return pop_frame(index, out);
+    }
     tape_service();
     pop_frame(index, out)
 }
@@ -1567,7 +1590,7 @@ fn execute(command: &str) {
                     nic.describe();
                     crate::nicpark::describe(index);
                     if index == 0 {
-                        crate::println!("   tape frame queue: {} queued, {} dropped", unsafe { FRAMES_QUEUED }, unsafe { FRAMES_DROPPED });
+                        crate::println!("   tape frame queue: {} queued, {} dropped (all interfaces)", unsafe { FRAMES_QUEUED }, unsafe { FRAMES_DROPPED }.iter().sum::<u32>());
                     }
                 }
             }

@@ -425,7 +425,7 @@ pub const GEN_HEADER_LEN: usize = 14 + 4 + 2 + 4 + 8;
 pub const GEN_MIN_SIZE: usize = 60;
 /// Frames sent per call at most, so a long stall cannot turn into one huge
 /// burst that overruns the far end's receive ring.
-const GEN_MAX_BURST: u32 = 16;
+const GEN_MAX_BURST: u32 = 64;
 /// If the schedule falls this far behind (microseconds) it is restarted from
 /// now instead of catching up, and the event is counted.
 const GEN_MAX_LAG_US: u64 = 200_000;

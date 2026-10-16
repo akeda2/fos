@@ -274,7 +274,9 @@ const TX_EOP_IFCS_RS: u8 = (1 << 0) | (1 << 1) | (1 << 3);
 /// 256 descriptors of 16 bytes fill the one page the ring gets. 128 let a 1 Gbit/s burst of 1400-byte
 /// frames overrun a slower CPU (rack: ~360 missed packets in 5 s); the card counts them in MPC.
 const RX_COUNT: usize = 128;
-const TX_COUNT: usize = 16;
+/// 16 descriptors were 10 us of runway at 64-byte line rate: a tape that came back late for a few microseconds left
+/// the wire idle. 128 (the ring still fits its page) keeps a burst queued while the tape is away.
+const TX_COUNT: usize = 128;
 const BUFFER_SIZE: usize = 2048;
 /// 1514 plus a 4-byte VLAN tag: a tagged full-size frame must cross a bridge intact.
 pub const MAX_FRAME: usize = 1518;
@@ -304,6 +306,11 @@ pub struct IsrState {
     pub missed: core::sync::atomic::AtomicU64,
     pub no_buffers: core::sync::atomic::AtomicU64,
     pub link_changes: core::sync::atomic::AtomicU64,
+    /// CRC errors, symbol errors, PAUSE frames received (XOFF) and sent (XOFF), summed over `nic list` calls (clear on read).
+    pub crc_errors: core::sync::atomic::AtomicU64,
+    pub symbol_errors: core::sync::atomic::AtomicU64,
+    pub xoff_received: core::sync::atomic::AtomicU64,
+    pub xoff_sent: core::sync::atomic::AtomicU64,
 }
 
 pub const MAX_INTERFACES: usize = 8;
@@ -316,6 +323,10 @@ pub static ISR: [IsrState; MAX_INTERFACES] = [const {
         missed: core::sync::atomic::AtomicU64::new(0),
         no_buffers: core::sync::atomic::AtomicU64::new(0),
         link_changes: core::sync::atomic::AtomicU64::new(0),
+        crc_errors: core::sync::atomic::AtomicU64::new(0),
+        symbol_errors: core::sync::atomic::AtomicU64::new(0),
+        xoff_received: core::sync::atomic::AtomicU64::new(0),
+        xoff_sent: core::sync::atomic::AtomicU64::new(0),
     }
 }; MAX_INTERFACES];
 
@@ -374,6 +385,9 @@ pub struct E1000 {
     pub frames_sent: u64,
     /// Frames "sent" while the link was down (lost, as on an unplugged cable).
     pub frames_dropped_no_link: u64,
+    /// Sends since the link was last read; the STATUS read is an uncached MMIO load, so it is paid every 16th send.
+    link_checks: u8,
+    link_ok: bool,
     /// Timestamps armed (`ts_enable`): `receive` then attaches the card's stamp to each PTP event frame.
     ts_on: bool,
     /// Every received frame is stamped (`ts_stamp_all`), in a 16-byte header the card puts before it.
@@ -621,7 +635,7 @@ impl E1000 {
             write(registers, r.rdt, (RX_COUNT - 1) as u32);
         }
 
-        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
+        Ok(E1000 { registers, variant, r, index, delivery: Delivery::Polled, mac, rx_ring, tx_ring, rx_buffers, tx_buffers, rx_next: 0, rx_skipping: false, tx_next: 0, frames_received: 0, frames_sent: 0, frames_dropped_no_link: 0, link_checks: 0, link_ok: true, ts_on: false, ts_all: false, last_stamp: 0, ts_clock: pch_clock(device.id), ts_offset: 0, mc_users: [0; 4096], vlan_ids: [0; 128], promiscuous: false, tx_offload: false, tx_ctx: [false; TX_COUNT] })
     }
 
     /// Promiscuous mode: receive every frame on the wire, not only ours and broadcasts
@@ -949,6 +963,15 @@ impl E1000 {
         let missed = state.missed.fetch_add(missed, Ordering::Relaxed) + missed;
         let none = state.no_buffers.fetch_add(none, Ordering::Relaxed) + none;
         crate::println!("   receive ring: {RX_COUNT} buffers; card counted {missed} missed packets, {none} no-buffer events");
+        let mut take = |register: usize, total: &core::sync::atomic::AtomicU64| {
+            let now = u64::from(read(self.registers, register));
+            total.fetch_add(now, Ordering::Relaxed) + now
+        };
+        let crc = take(0x4000, &state.crc_errors);
+        let symbol = take(0x4008, &state.symbol_errors);
+        let xoff_rx = take(0x4050, &state.xoff_received);
+        let xoff_tx = take(0x4054, &state.xoff_sent);
+        crate::println!("   errors: {crc} CRC, {symbol} symbol; PAUSE (XOFF): {xoff_rx} received, {xoff_tx} sent");
     }
 
     pub fn link_up(&self) -> bool {
@@ -1170,7 +1193,11 @@ impl E1000 {
         // sender would wait out its timeout and report a hardware failure. A cable that is not
         // plugged in just loses the frame; do the same, so protocol code (a router starting
         // with a dead uplink, say) keeps working and retries as it would on a real wire.
-        if !self.link_up() {
+        self.link_checks = self.link_checks.wrapping_add(1);
+        if self.link_checks % 16 == 1 || !self.link_ok {
+            self.link_ok = self.link_up();
+        }
+        if !self.link_ok {
             self.frames_dropped_no_link += 1;
             return true;
         }
