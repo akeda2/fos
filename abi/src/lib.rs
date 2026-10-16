@@ -13,6 +13,17 @@ pub mod tape;
 pub const BOOT_INFO_MAGIC: u64 = u64::from_le_bytes(*b"FOSV2BI\0");
 pub const BOOT_INFO_VERSION: u32 = 5;
 
+/// The bit of an E1000-family multicast table (MTA) a group address selects. The I350 and 82574 have 4096 bits and use
+/// address bits 47:36; the ICH/PCH parts (82579, I217-I219) have 1024 bits (32 registers) and use bits 47:38. Both agree
+/// only where the last two bytes are 0, as for PTP's 01:1b:19:00:00:00.
+pub fn multicast_hash(mac: [u8; 6], pch: bool) -> usize {
+    if pch {
+        (usize::from(mac[4]) >> 6 | usize::from(mac[5]) << 2) & 0x3ff
+    } else {
+        (usize::from(mac[4]) >> 4 | usize::from(mac[5]) << 4) & 0xfff
+    }
+}
+
 /// The memory map, in the firmware's own format. Entries are `descriptor_size`
 /// bytes apart (never `size_of::<MemoryDescriptor>()`: the firmware may use a
 /// larger descriptor), and `kind` follows the UEFI memory type numbering.
@@ -276,6 +287,18 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multicast_hash_matches_each_table_size() {
+        let ptp = [0x01, 0x1b, 0x19, 0, 0, 0];
+        assert_eq!((multicast_hash(ptp, true), multicast_hash(ptp, false)), (0, 0));
+        // 224.0.1.129 -> 01:00:5e:00:01:81: the table the lab 82579V was checked against.
+        let group = [0x01, 0x00, 0x5e, 0x00, 0x01, 0x81];
+        assert_eq!(multicast_hash(group, false), 0x810);
+        assert_eq!(multicast_hash(group, true), 0x204);
+        assert!(multicast_hash([1, 0, 0x5e, 0, 0xff, 0xff], true) < 1024);
+        assert_eq!(multicast_hash([1, 0, 0x5e, 0, 0xff, 0xff], false), 0xfff);
+    }
 
     /// The BIOS boot path (boot/bios/stage2.S) writes `BootInfo` by hand, byte for byte. If this test fails, a field was
     /// added or moved: update the `BI_*` offsets in boot/bios/stage2.S in the same change.

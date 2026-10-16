@@ -86,6 +86,10 @@ def main():
             check(jitter < 2000, f"the per-second jitter is small ({jitter} us)")
             check(abs(ppm) < 5000, f"the clock rate difference is measured and plausible ({ppm} ppm)")
             check(bool(re.search(r"\d+s off +-?[\d.]+ sd", text)), "a line per second shows offset and spread")
+            slave.wait_for("Tape returned", 30, slave_mark)
+            steer_mark = slave.send("run ptp l2 steer secs=2" if l2 else "run ptp ip=10.7.0.2/24 steer secs=2")
+            slave.wait_for("ptp: steer needs hardware timestamps; measuring only.", 30, steer_mark)
+            check(True, "steer on a card without hardware stamps says it only measures")
             master.wait_for("delay requests answered.", 30, master_mark)
             check(re.search(r"([1-9]\d*) delay requests answered", master.text()[master_mark:]) is not None, "the master answered the Delay_Req messages")
         finally:

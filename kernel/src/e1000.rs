@@ -701,11 +701,7 @@ impl E1000 {
     /// parts (82579, I217-I219; Linux's `e1000_hash_mc_addr` with mta_reg_count 32), which take bits 47:38. The two
     /// agree only for addresses whose last two bytes are 0, such as PTP's 01:1b:19:00:00:00.
     fn multicast_hash(&self, mac: [u8; 6]) -> usize {
-        if self.ts_clock.is_some() {
-            (usize::from(mac[4]) >> 6 | usize::from(mac[5]) << 2) & 0x3ff
-        } else {
-            (usize::from(mac[4]) >> 4 | usize::from(mac[5]) << 4) & 0xfff
-        }
+        fosfor_abi::multicast_hash(mac, self.ts_clock.is_some())
     }
 
     /// Joins (`on`) or leaves one multicast group in the card's hash filter, so that frames for it arrive without opening
