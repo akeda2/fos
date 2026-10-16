@@ -41,6 +41,7 @@ const TAPE_EVENT_ABORT: u32 = 1;
 const TAPE_EVENT_BYTE_BASE: u32 = 0x100;
 const ETHERNET_HEADER_LEN: usize = 14;
 const LINE_CAPACITY: usize = 120;
+const HISTORY: usize = 8;
 const MAX_WORDS: usize = 24;
 
 /// Queue storage used when the kernel's big pool cannot supply more (a QEMU
@@ -403,6 +404,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut frame = [0u8; MAX_FRAME];
     let mut line = [0u8; LINE_CAPACITY];
     let mut line_length = 0usize;
+    // Line editing: the cursor, the last few lines (Up/Down) and the state of an ESC [ x cursor-key sequence.
+    let mut cursor = 0usize;
+    let mut history = [[0u8; LINE_CAPACITY]; HISTORY];
+    let mut history_lengths = [0usize; HISTORY];
+    let (mut history_count, mut history_pos) = (0usize, 0usize);
+    let mut escape_state = 0u8;
     session.started = true;
     session.view.start_tick = micros() / 10_000;
     if session.gen_autostart && session.gen_nic.is_some() {
@@ -579,6 +586,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 }
                 print_bytes(putc, b"nettest> ");
                 print_bytes(putc, &line[..line_length]);
+                cursor = line_length;
             }
             generator_was_running = session.generator.running;
         }
@@ -594,6 +602,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             }
             print_bytes(putc, b"nettest> ");
             print_bytes(putc, &line[..line_length]);
+            cursor = line_length;
         }
 
         // Keys: once per pass when idle, but at most once a millisecond while
@@ -613,33 +622,88 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             }
             if event >= TAPE_EVENT_BYTE_BASE {
                 busy = true;
-                match (event - TAPE_EVENT_BYTE_BASE) as u8 {
-                    b'\r' | b'\n' => {
-                        putc(u32::from(b'\n'));
-                        let outcome = run_line(putc, &mut session, &line[..line_length]);
-                        line_length = 0;
-                        if matches!(outcome, Outcome::Quit) {
-                            break 'run;
+                let byte = (event - TAPE_EVENT_BYTE_BASE) as u8;
+                // A cursor key arrives as ESC [ A/B/C/D (also from a term net client).
+                if escape_state == 1 {
+                    escape_state = if byte == b'[' { 2 } else { 0 };
+                } else if escape_state == 2 {
+                    escape_state = 0;
+                    let old_length = line_length;
+                    match byte {
+                        b'A' if history_pos < history_count => {
+                            history_pos += 1;
+                            let slot = (history_count - history_pos) % HISTORY;
+                            line_length = history_lengths[slot];
+                            line[..line_length].copy_from_slice(&history[slot][..line_length]);
+                            cursor = line_length;
+                            redraw(putc, &line, line_length, cursor, old_length);
                         }
-                        generator_was_running = session.generator.running;
-                        print_bytes(putc, b"nettest> ");
+                        b'B' if history_pos > 0 => {
+                            history_pos -= 1;
+                            if history_pos == 0 {
+                                line_length = 0;
+                            } else {
+                                let slot = (history_count - history_pos) % HISTORY;
+                                line_length = history_lengths[slot];
+                                line[..line_length].copy_from_slice(&history[slot][..line_length]);
+                            }
+                            cursor = line_length;
+                            redraw(putc, &line, line_length, cursor, old_length);
+                        }
+                        b'C' if cursor < line_length => {
+                            putc(u32::from(line[cursor]));
+                            cursor += 1;
+                        }
+                        b'D' if cursor > 0 => {
+                            cursor -= 1;
+                            putc(8);
+                        }
+                        _ => {}
                     }
-                    b'P' if line_length == 0 && session.remote.as_ref().is_some_and(|r| r.role == RemoteRole::Master) => {
-                        putc(u32::from(b'\n'));
-                        choose_next(putc, &mut session);
-                        print_bytes(putc, b"nettest> ");
+                } else {
+                    match byte {
+                        27 => escape_state = 1,
+                        b'\r' | b'\n' => {
+                            putc(u32::from(b'\n'));
+                            if line_length > 0 {
+                                let slot = history_count % HISTORY;
+                                history[slot][..line_length].copy_from_slice(&line[..line_length]);
+                                history_lengths[slot] = line_length;
+                                history_count += 1;
+                            }
+                            history_pos = 0;
+                            let outcome = run_line(putc, &mut session, &line[..line_length]);
+                            line_length = 0;
+                            cursor = 0;
+                            if matches!(outcome, Outcome::Quit) {
+                                break 'run;
+                            }
+                            generator_was_running = session.generator.running;
+                            print_bytes(putc, b"nettest> ");
+                        }
+                        b'P' if line_length == 0 && session.remote.as_ref().is_some_and(|r| r.role == RemoteRole::Master) => {
+                            putc(u32::from(b'\n'));
+                            choose_next(putc, &mut session);
+                            print_bytes(putc, b"nettest> ");
+                        }
+                        // read_key does not echo: erase the character on screen as the shell does.
+                        8 | 127 if cursor > 0 => {
+                            line.copy_within(cursor..line_length, cursor - 1);
+                            line_length -= 1;
+                            cursor -= 1;
+                            putc(8);
+                            redraw_tail(putc, &line, cursor, line_length + 1, line_length);
+                        }
+                        byte @ 32..=126 if line_length < line.len() => {
+                            line.copy_within(cursor..line_length, cursor + 1);
+                            line[cursor] = byte;
+                            line_length += 1;
+                            cursor += 1;
+                            putc(u32::from(byte));
+                            redraw_tail(putc, &line, cursor, line_length - 1, line_length);
+                        }
+                        _ => {}
                     }
-                    // read_key does not echo: erase the character on screen as the shell does (back, blank, back).
-                    8 | 127 if line_length > 0 => {
-                        line_length -= 1;
-                        print_bytes(putc, b"\x08 \x08");
-                    }
-                    byte @ 32..=126 if line_length < line.len() => {
-                        line[line_length] = byte;
-                        line_length += 1;
-                        putc(u32::from(byte));
-                    }
-                    _ => {}
                 }
             }
         }
@@ -662,6 +726,32 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     print_bytes(putc, b"nettest stopped.\n");
     print_stats(putc, &session);
     release(big);
+}
+
+/// Redraws the whole prompt line and leaves the cursor at `cursor`; `old_length` blanks what a longer line left.
+fn redraw(putc: Putc, line: &[u8], length: usize, cursor: usize, old_length: usize) {
+    print_bytes(putc, b"\rnettest> ");
+    print_bytes(putc, &line[..length]);
+    for _ in length..old_length {
+        putc(u32::from(b' '));
+    }
+    for _ in cursor..length.max(old_length) {
+        putc(8);
+    }
+}
+
+/// After an insert or delete in the middle of the line: reprints what follows the cursor and puts the cursor back.
+fn redraw_tail(putc: Putc, line: &[u8], cursor: usize, old_length: usize, length: usize) {
+    if cursor == length && old_length <= length {
+        return;
+    }
+    print_bytes(putc, &line[cursor..length]);
+    for _ in length..old_length {
+        putc(u32::from(b' '));
+    }
+    for _ in cursor..length.max(old_length) {
+        putc(8);
+    }
 }
 
 fn release(big: usize) {
@@ -3707,7 +3797,7 @@ fn drop_remote(putc: Putc, session: &mut Session<'_>) {
     session.gen_nic = None;
     session.rgen.stop();
     session.rsink.reset();
-    print_bytes(putc, b"(two-machine mode stopped)\n");
+    print_bytes(putc, b"(the earlier two-machine role is replaced)\n");
 }
 
 /// Tells the engine every NIC's MAC: the HELLO reply lists them, so a master can pick the server's test NIC.

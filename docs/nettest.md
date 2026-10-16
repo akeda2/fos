@@ -168,6 +168,8 @@ unattended: add `gen.save=NAME` and the report is on disk when you come back.
 While it runs the tape shows `nettest> ` and reads the keyboard (or the `term net`
 session). Commands change the running test. **Escape stops the tape** (over `term
 net`, a lone Escape key press). `quit` does too. Counters print when it stops.
+The prompt has line editing: Left/Right move the cursor, Backspace deletes before it, Up/Down recall
+the last eight lines (over `term net` and from a USB/PS/2 keyboard; a serial line sends Escape as a stop).
 
 Typing is polled about once a millisecond while traffic is flowing, so it never
 starves the forwarding, but the console output of a command can be slow on a slow
