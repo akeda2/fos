@@ -2570,6 +2570,13 @@ fn print_headline(putc: Putc, label: &[u8], found: &Assessment, test: TestParams
             print_bytes(putc, b" Mbit/s");
         }
         putc(u32::from(b'\n'));
+        // A light test proves little about a fast link: say how much of it was actually offered.
+        let link_kbit = u64::from(found.speed_mbit) * 1000;
+        if link_kbit != 0 && u64::from(test.rate_kbit) * 100 < link_kbit * 50 {
+            print_bytes(putc, b"  only ");
+            print_u32(putc, (u64::from(test.rate_kbit) * 100 / link_kbit).max(1) as u32);
+            print_bytes(putc, b"% of the link was offered: this does not show its capacity; try 'test check'\n");
+        }
         return;
     }
     print_bytes(putc, if problems != 0 { b" PROBLEM\n" } else { b" INCONCLUSIVE\n" });

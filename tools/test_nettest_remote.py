@@ -115,6 +115,7 @@ def main():
             mark = master.send("test up rate=2000 size=800 time=2")
             master.wait_for("Summary:", 60, mark)
             check("Summary: GOOD - up " in master.text()[mark:], "a report starts with a Summary line", master.text()[mark:][-800:])
+            check("of the link was offered" in master.text()[mark:], "a light test says it did not show the link's capacity", master.text()[mark:][-800:])
             mark = master.send("test time=2 rate=2000")
             master.wait_for("Summary:", 60, mark)
             check("both ways" in master.text()[mark:], "each test starts from the defaults (both ways again)", master.text()[mark:][-800:])
