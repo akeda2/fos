@@ -3351,7 +3351,7 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
         }
         Some("all") => {
             if !card.ts_stamp_all(true) {
-                return crate::println!("nic {index}: cannot stamp every frame.");
+                crate::println!("nic {index}: cannot stamp every frame; listing them without stamps.");
             }
             blocking(true);
             unsafe { QUEUE_ALL = true };

@@ -911,7 +911,10 @@ sets one bit of the E1000 family's 4096-bit table (MTA, 0x5200): hash = `(mac[4]
 a bit, so tapes still compare addresses. `ptp` (L2), audio-net's PTP listener and `tape-ip` IGMP join through
 `tape_rt::multicast_group`, falling back to `nic_set_multicast` when it returns false (other NICs, old kernels). The
 kernel clears all groups when a tape ends. `nic mcast N join|leave MAC | clear` does it by hand; `make test-nic` injects
-frames to a joined and an unjoined group. Only real hardware can confirm the I350/82579/I219 tables behave like QEMU's.
+frames to a joined and an unjoined group. The ICH/PCH parts (82579, I217-I219) have a 1024-bit table (32 registers) and
+hash `(mac[4] >> 6 | mac[5] << 2) & 0x3ff`; the I350/82574 use the 4096-bit formula above. Checked on an 82579V: of 256
+groups swept, only the joined one arrived. Only real hardware can confirm the tables behave like QEMU's. Open: an
+82579V slave in UDP PTP gets no Announce/Sync through the lab switch (L2 PTP and raw frames to the group work).
 
 **Transmit checksum offload (ABI 14).** `nic_tx_offload(nic, on)` makes the I350's `send` hand IPv4 UDP frames whose checksum
 field is 0 (and TCP frames) to the card: a context descriptor (MACLEN 14, IPLEN) plus an advanced data descriptor with

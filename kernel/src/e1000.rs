@@ -697,15 +697,26 @@ impl E1000 {
         write(self.registers, REG_RCTL, if on { control | (1 << 4) } else { control & !(1 << 4) });
     }
 
+    /// The multicast table has 4096 bits on the I350 and the 82574 (hash = address bits 47:36) but 1024 on the ICH/PCH
+    /// parts (82579, I217-I219; Linux's `e1000_hash_mc_addr` with mta_reg_count 32), which take bits 47:38. The two
+    /// agree only for addresses whose last two bytes are 0, such as PTP's 01:1b:19:00:00:00.
+    fn multicast_hash(&self, mac: [u8; 6]) -> usize {
+        if self.ts_clock.is_some() {
+            (usize::from(mac[4]) >> 6 | usize::from(mac[5]) << 2) & 0x3ff
+        } else {
+            (usize::from(mac[4]) >> 4 | usize::from(mac[5]) << 4) & 0xfff
+        }
+    }
+
     /// Joins (`on`) or leaves one multicast group in the card's hash filter, so that frames for it arrive without opening
-    /// every multicast frame (`set_multicast`). The card keeps 4096 bits and tests one bit per frame, chosen by bits 47:36
-    /// of the destination address (the byte order of Linux igb's `igb_hash_mc_addr`): other groups can share a bit and
+    /// every multicast frame (`set_multicast`). The card tests one bit per frame, chosen by the destination address
+    /// (`multicast_hash`; the byte order of Linux igb's `igb_hash_mc_addr`): other groups can share a bit and
     /// get through too, so a tape still checks the address. False if the address is not a multicast one.
     pub fn multicast_join(&mut self, mac: [u8; 6], on: bool) -> bool {
         if mac[0] & 1 == 0 {
             return false;
         }
-        let hash = (usize::from(mac[4]) >> 4 | usize::from(mac[5]) << 4) & 0xfff;
+        let hash = self.multicast_hash(mac);
         let users = &mut self.mc_users[hash];
         *users = if on { users.saturating_add(1) } else { users.saturating_sub(1) };
         let register = REG_MTA + (hash >> 5) * 4;
