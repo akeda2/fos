@@ -469,3 +469,14 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - Unverified on real hardware: HWP under busy tape-net traffic, RTL8139/RTL8168 PHY parking, link detection after a park wake, ptp master
   on clock1 after its reset. `make test-all` has not been run for these changes (run it on landsbro with `gb -of fos`).
 - Power-button stops count as unclean boots; three in a row switch the watchdog off until one boot runs five minutes.
+
+## Open after the nettest switch-measurement session (2026-10-16)
+
+- **Serial Escape**: `kernel/src/term.rs` `tape_service` turns every Escape from the keyboard queue (serial included) into a tape
+  abort, so arrow keys sent over a serial line stop a tape. Needs an ESC-sequence timeout in the serial path. It is also why the
+  nettest prompt's line editing has no QEMU test (`term net` works; the QEMU harness talks serial).
+- **Not yet seen on real hardware**: Escape aborting a running `test` on the rack/skylake pair, a link slower than gigabit (the plain
+  `test` offers 900 Mbit/s), and a real fault (CRC errors, half duplex) producing a `PROBLEM` summary. The Deltaco "300 Mb" symptom
+  was never reproduced; the pair measured 900 Mbit/s each way, lossless.
+- **Optional**: `start=`/`end=` aliases for sweeps (`from=`/`to=` kept: `start` collides with `gen start`); rename the `gen`/`sink`/
+  `link` prompt options; suppress "generator finished" between sweep steps.
