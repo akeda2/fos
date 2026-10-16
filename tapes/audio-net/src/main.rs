@@ -1083,6 +1083,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     // Ring level seen at each packet arrival (before the write), kept for the summary: min, max, and how often it held
     // less than one packet.
     let (mut level_min, mut level_max, mut level_short, mut level_samples) = (usize::MAX, 0usize, 0u64, 0u64);
+    let (mut level_sum, mut level_buckets) = (0u64, [0u32; 16]);
     let (mut second_low, mut second_high) = (usize::MAX, 0usize);
     let (mut last_pass, mut second_gap) = (tape_rt::micros(), 0u64);
     loop {
@@ -1240,6 +1241,8 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             }
         }
         (level_min, level_max, level_samples) = (level_min.min(level), level_max.max(level), level_samples + 1);
+        level_sum += level as u64;
+        level_buckets[(level * 1000 / packet.rate.max(1) as usize).min(15)] += 1;
         (second_low, second_high) = (second_low.min(level), second_high.max(level));
         if level < frames {
             level_short += 1;
@@ -1349,7 +1352,10 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     }
     if level_samples > 0 {
         let rate = stats::get().rate.max(1) as usize;
-        println!("Ring at arrival: {} to {} ms (target {} ms); under one packet {} of {level_samples} times.", level_min * 1000 / rate, level_max * 1000 / rate, fill.target() * 1000 / rate, level_short);
+        println!("Ring at arrival: {} to {} ms, mean {} us (target {} ms); under one packet {} of {level_samples} times.", level_min * 1000 / rate, level_max * 1000 / rate, level_sum * 1_000_000 / level_samples / rate as u64, fill.target() * 1000 / rate, level_short);
+        if options.verbose {
+            println!("Ring at arrival by whole ms (0 to 15+): {:?}", level_buckets);
+        }
     }
     if stats::get().ptp_samples > 0 {
         let shown = stats::get();
