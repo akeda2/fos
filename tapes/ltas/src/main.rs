@@ -31,6 +31,7 @@ Keys (Escape quits):
   n FFT size     t time constant   c/x calibration +/-0.5 dB
   1 2 3 4 show live/exp/ltas/peak     Up/Down move, Left/Right scale
   g generator off/white/pink/sine   + - level   f tone   b bursts
+  , . input channel -/+ (chan=N starts on N)
   s save CSV+PNG on the first exFAT/FAT32 disk (save=N picks one)
 "#
 );
@@ -80,6 +81,8 @@ impl<const N: usize> Write for Line<N> {
 struct Settings {
     rate: u32,
     channel: usize,
+    /// Input channels the device captures (the status line shows `ch N/M`).
+    channels: usize,
     resolution: Resolution,
     window: dsp::window::Kind,
     weighting: Weighting,
@@ -168,6 +171,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let (width, height) = (width.min(MAX_WIDTH), height.min(MAX_HEIGHT));
     let mut settings = Settings {
         rate: value(arguments, "rate").and_then(|v| v.parse().ok()).unwrap_or(48_000),
+        channels: 0,
         channel: value(arguments, "chan").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1) - 1,
         resolution: value(arguments, "res").and_then(Resolution::from_name).unwrap_or(Resolution::Third),
         window: value(arguments, "win").and_then(dsp::window::Kind::from_name).unwrap_or(dsp::window::Kind::Hann),
@@ -187,6 +191,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if settings.channel >= info.capture_channels as usize {
         return println!("ltas: the device has {} input channel(s); chan={} is out of range.", info.capture_channels, settings.channel + 1);
     }
+    settings.channels = info.capture_channels as usize;
     let (capture_channels, capture_slot, capture_bits) = (info.capture_channels as usize, info.capture_slot_bytes as usize, info.capture_bits as usize);
     let playback_ok = info.playback_channels > 0 && info.playback_slot_bytes > 0;
 
@@ -265,6 +270,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             let mut reconfigure = false;
             let mut regrid = false;
             match key {
+                Key::Char(b'.') | Key::Char(b',') if capture_channels > 1 => {
+                    let last = capture_channels - 1;
+                    settings.channel = if key == Key::Char(b'.') { if settings.channel >= last { 0 } else { settings.channel + 1 } } else if settings.channel == 0 { last } else { settings.channel - 1 };
+                    analyzer.reset();
+                    let _ = write!(message, "input channel {}", settings.channel + 1);
+                }
                 Key::Char(b's') => save_requested = true,
                 Key::Char(b' ') => frozen = !frozen,
                 Key::Char(b'r') => {
@@ -456,8 +467,10 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
     let mut line = Line::<200>::new();
     let _ = write!(
         line,
-        "LTAS  {} Hz  {}  FFT {} {}  weight {}  cal {:+.1} dB  avg {} s  frames {}{}",
+        "LTAS  {} Hz  ch {}/{}  {}  FFT {} {}  weight {}  cal {:+.1} dB  avg {} s  frames {}{}",
         settings.rate,
+        settings.channel + 1,
+        settings.channels,
         settings.resolution.name(),
         settings.n,
         settings.window.name(),

@@ -129,7 +129,7 @@ def main():
             check(pixel(56, 60) == GRID_MAJOR, "the plot frame is drawn", str(pixel(56, 60)))
             lit = sum(1 for y in range(4, 36) for x in range(56, 600) if pixel(x, y) != BACKGROUND)
             check(lit > 300, f"the status line is drawn ({lit} lit pixels)", "")
-            for key in (b"v", b"w", b"a", b"n", b"t", b"g", b"+", b"f", b"b", b"3", b"3", b"r", b" ", b" "):
+            for key in (b"v", b"w", b"a", b"n", b"t", b"g", b"+", b"f", b"b", b"3", b"3", b".", b",", b"r", b" ", b" "):
                 machine.wire.send(machine.guest, TAG_DATA, key)
                 time.sleep(0.4)
             _, _, after = screenshot(machine.monitor, "ltas2.ppm")
