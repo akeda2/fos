@@ -193,6 +193,9 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-bench/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-sync/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/gfx/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/dsp/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/ltas/Cargo.toml
 	for tape in router nettest ed ip-chat telnet ptp fterm; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py
 

@@ -924,6 +924,17 @@ groups swept, only the joined one arrived. Only real hardware can confirm the ta
 getting UDP PTP (frames injected from a host arrived, the switch's group table never listed the card); with snooping off,
 82579V and I350 work as slave and master over UDP.
 
+**Audio-analysis crates (for the `ltas` tape and later ones).** All `no_std`, no allocation, host-tested (`make test`):
+`crates/gfx` (a RAM `Canvas` of 0x00RRGGBB pixels: rectangles, lines, 8x16 text in the kernel's console font, and a PNG
+writer: 8-bit RGB, filter "Up" plus fixed-Huffman deflate with distance-1 runs, so a flat chart is tens of KB, streamed through
+a callback in 4 KiB IDAT chunks); `crates/dsp` (`math`: sin, cos, ln, log10, exp, sqrt without libm; `fft`: radix-2, split
+re/im, per-stage twiddle tables, the same code built generic and with `avx2,fma`, chosen by the caller from `fp_level`;
+`window`: Rect/Hann/Hamming/Blackman-Harris/Flat-top with coherent gain and power sum); `crates/ltas` (`Analyzer`: windowed FFT
+every `hop` samples, one-sided mean square per bin, A/C/Z weighting per bin, 1/3, 1/6, 1/12-octave bands (ISO base-ten
+centres, 20 Hz-20 kHz) by overlap-weighted bin summing or raw FFT bins, `Accumulator` with live, exponential, linear (the
+LTAS) and peak views at once). Levels are dB re a full-scale sine plus a calibration offset; FFT-bin output is normalised for
+noise, so a tone reads 2-3 dB low there.
+
 **Graphics for tapes (ABI 17).** `gfx_info` (width<<32|height, 0 in BIOS VGA text mode), `gfx_open`, `gfx_close`, `gfx_fill` and
 `gfx_blit` (a `u32` 0x00RRGGBB buffer with a stride in pixels, clipped at the right and bottom) let a tape draw on the
 framebuffer. `gfx_open` clears the screen and stops the console painting it (the text grid keeps updating, so serial and
