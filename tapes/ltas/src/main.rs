@@ -5,6 +5,7 @@
 #![no_std]
 #![no_main]
 
+mod save;
 mod view;
 
 use core::fmt::Write;
@@ -17,7 +18,7 @@ use view::{Layout, Scale};
 
 tape_rt::tape_help!(
     br#"ltas [device=N] [outdev=M] [rate=48000] [chan=1] [n=8192]
-     [res=1/3|1/6|1/12|fft] [weight=z|a|c]
+     [res=1/3|1/6|1/12|fft] [weight=z|a|c] [save=N]
      [win=hann|rect|hamming|blackman-harris|flat-top]
      [cal=DB] [tau=SECONDS] [noise=off|white|pink|sine] [level=-20]
      [tone=HZ] [out=MASK]
@@ -30,6 +31,7 @@ Keys (Escape quits):
   n FFT size     t time constant   c/x calibration +/-0.5 dB
   1 2 3 4 show live/exp/ltas/peak     Up/Down move, Left/Right scale
   g generator off/white/pink/sine   + - level   f tone   b bursts
+  s save CSV+PNG on the first exFAT/FAT32 disk (save=N picks one)
 "#
 );
 
@@ -41,6 +43,8 @@ const SIZES: [usize; 5] = [1024, 2048, 4096, 8192, 16384];
 const TAUS: [f32; 6] = [0.125, 0.25, 0.5, 1.0, 2.0, 5.0];
 const TONES: [f32; 7] = [125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0];
 
+/// Four views of the most outputs there can be (the CSV writer) or one view (the drawing).
+static mut LEVELS: [f32; 4 * (MAXN / 2 + 1)] = [0.0; 4 * (MAXN / 2 + 1)];
 static mut BLOCK_BYTES: [u8; BLOCK] = [0; BLOCK];
 static mut SAMPLES: [f32; BLOCK / 2] = [0.0; BLOCK / 2];
 static mut NOISE_MONO: [f32; 4096] = [0.0; 4096];
@@ -224,12 +228,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut shown = [false, true, true, true];
     let mut frozen = false;
     let mut decoder = KeyDecoder::new();
-    let mut levels = [0.0f32; MAXN];
+    let levels = unsafe { &mut *(&raw mut LEVELS) };
     let mut dirty = true;
     let mut next_draw = 0u64;
     let mut burst = false;
     let mut tone_index = 3;
     let mut message = Line::<64>::new();
+    let wanted_disk = value(arguments, "save").and_then(|v| v.parse::<usize>().ok());
+    let mut save_requested = false;
+    let mut saves = 0u32;
 
     let block = unsafe { &mut *(&raw mut BLOCK_BYTES) };
     let samples = unsafe { &mut *(&raw mut SAMPLES) };
@@ -258,6 +265,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             let mut reconfigure = false;
             let mut regrid = false;
             match key {
+                Key::Char(b's') => save_requested = true,
                 Key::Char(b' ') => frozen = !frozen,
                 Key::Char(b'r') => {
                     analyzer.reset();
@@ -334,6 +342,23 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             dirty = true;
         }
 
+        if save_requested {
+            save_requested = false;
+            saves += 1;
+            canvas_render(frame, grid, width, height, &layout, &scale, analyzer, shown, levels, &settings, &generator, playback_ok, frozen);
+            let outcome = save_measurement(api, wanted_disk, saves, analyzer, frame, width, height, levels);
+            message.length = 0;
+            match outcome {
+                Ok((disk, base)) => {
+                    let _ = write!(message, "saved disk{disk}/{}.csv+png", base.as_str());
+                }
+                Err(reason) => {
+                    let _ = write!(message, "save: {reason}");
+                }
+            }
+            dirty = true;
+        }
+
         // capture -> analysis
         let mut worked = false;
         let got = (api.audio_read)(block.as_mut_ptr(), BLOCK / capture_frame * capture_frame);
@@ -366,7 +391,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             dirty = false;
             let mut canvas = Canvas::new(frame, width, height).unwrap();
             canvas.pixels[..(width * height) as usize].copy_from_slice(&grid[..(width * height) as usize]);
-            view::draw_curves(&mut canvas, &layout, &scale, analyzer, shown, &mut levels);
+            view::draw_curves(&mut canvas, &layout, &scale, analyzer, shown, levels);
             draw_status(&mut canvas, &layout, &settings, analyzer, &generator, playback_ok, frozen, shown, message.as_str());
             tape_rt::gfx_blit(0, 0, width, height, &canvas.pixels[..(width * height) as usize], width);
         }
@@ -379,6 +404,52 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut stats = tape_rt::AudioStats::default();
     (api.audio_stats)(&mut stats);
     println!("ltas: {} frame(s) analysed; capture overruns {}, playback underruns {}.", analyzer.frames(), stats.capture_overruns, stats.playback_underruns);
+}
+
+/// Draws the whole picture into `frame` (no message line, so a saved screenshot is clean).
+fn canvas_render<const N: usize>(frame: &mut [u32], grid: &[u32], width: u32, height: u32, layout: &Layout, scale: &Scale, analyzer: &mut Analyzer<N>, shown: [bool; 4], levels: &mut [f32], settings: &Settings, generator: &Generator, playback_ok: bool, frozen: bool) {
+    let mut canvas = Canvas::new(frame, width, height).unwrap();
+    canvas.pixels[..(width * height) as usize].copy_from_slice(&grid[..(width * height) as usize]);
+    view::draw_curves(&mut canvas, layout, scale, analyzer, shown, levels);
+    draw_status(&mut canvas, layout, settings, analyzer, generator, playback_ok, frozen, shown, "");
+}
+
+/// Saves the CSV and the picture in `frame` as `ltas-DATE-TIME.csv` and `.png` on an exFAT/FAT32 disk.
+fn save_measurement<const N: usize>(api: &TapeApi, wanted: Option<usize>, counter: u32, analyzer: &mut Analyzer<N>, frame: &[u32], width: u32, height: u32, levels: &mut [f32]) -> Result<(usize, Line<40>), &'static str> {
+    let Some(disk) = save::find_disk(api, wanted) else { return Err("no exFAT or FAT32 disk (save=N picks one)") };
+    let address = (api.alloc)(2 * save::BUFFER_BYTES);
+    if address == 0 {
+        return Err("out of memory");
+    }
+    let (csv_bytes, png_bytes) = unsafe { (core::slice::from_raw_parts_mut(address as *mut u8, save::BUFFER_BYTES), core::slice::from_raw_parts_mut((address + save::BUFFER_BYTES) as *mut u8, save::BUFFER_BYTES)) };
+    let mut base = Line::<40>::new();
+    let mut stamp = Line::<40>::new();
+    save::names(counter, &mut base, &mut stamp);
+    let mut csv = save::Sink { bytes: csv_bytes, length: 0 };
+    let mut png = save::Sink { bytes: png_bytes, length: 0 };
+    let outcome = (|| {
+        let count = analyzer.outputs();
+        ltas::csv::write(analyzer, stamp.as_str(), &mut levels[..4 * count], &mut csv).map_err(|_| "CSV too big")?;
+        let mut full = true;
+        let drawn = gfx::png::write_rgb(&frame[..(width * height) as usize], width, height, width, |chunk| {
+            let end = png.length + chunk.len();
+            if end <= png.bytes.len() {
+                png.bytes[png.length..end].copy_from_slice(chunk);
+                png.length = end;
+            } else {
+                full = false;
+            }
+        });
+        if !drawn || !full {
+            return Err("PNG too big");
+        }
+        if save::write_file(api, disk, base.as_str(), "csv", &csv.bytes[..csv.length]) != 0 || save::write_file(api, disk, base.as_str(), "png", &png.bytes[..png.length]) != 0 {
+            return Err("cannot write (disk full or read-only?)");
+        }
+        Ok((disk, base))
+    })();
+    (api.free)(address, 2 * save::BUFFER_BYTES);
+    outcome
 }
 
 fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &Settings, analyzer: &Analyzer<N>, generator: &Generator, playback_ok: bool, frozen: bool, shown: [bool; 4], message: &str) {

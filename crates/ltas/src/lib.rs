@@ -12,6 +12,7 @@
 
 pub mod average;
 pub mod bands;
+pub mod csv;
 pub mod weighting;
 
 use dsp::fft::Plan;

@@ -940,7 +940,10 @@ noise, so a tone reads 2-3 dB low there.
 generator (`crates/noise`: white, pink, sine, on/off bursts, a 10 ms fade, RMS level in dB re a full-scale sine) is written
 to the output with `audio_write` in the same loop (full duplex through `audio_start(rate, capture, playback)`). The
 analyser is about 1.2 MB, allocated with `api.alloc`. `make test-ltas` checks screen, loop, keys and exit against QEMU's HD
-Audio codec; levels are checked by the crate tests and on real hardware. `device=N outdev=M` puts capture and playback on different devices (ABI 18, below). Not done yet: saving CSV/PNG (`s`).
+Audio codec; levels are checked by the crate tests and on real hardware. `device=N outdev=M` puts capture and playback on different devices (ABI 18, below). `s` saves `ltas-YYYYMMDD-HHMMSS.csv` (settings header, then centre/low/high Hz, resolved flag and the four views in
+dB; `crates/ltas/src/csv.rs`) and `.png` (the screen without the message line) on the first exFAT disk, else FAT32, or `save=N`;
+without a clock the name is `ltas-NNN`. Written through `fs_write` to `diskN/NAME`, so a PC reads them; `make test-ltas` runs
+it on a `mkfs.exfat` image and `fsck.exfat` checks the volume.
 
 **Separate audio input and output (ABI 18).** `audio_use_output(N)` / shell `audio output N|same` sends playback to a
 different device than capture. `audio.rs` keeps `OUTPUT` beside `CHOSEN`: `audio_read`, the capture format and buffer follow the

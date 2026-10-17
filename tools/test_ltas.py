@@ -6,7 +6,9 @@ returns the console on Escape and reports no capture overruns. Levels, the gener
 by the host tests of `crates/ltas` and `crates/noise` and on real hardware. Run with `make test-ltas`."""
 
 import struct
+import subprocess
 import sys
+import zlib
 import tempfile
 import wave
 import time
@@ -16,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_boot import ROOT, TAG_DATA, check  # noqa: E402
 from test_debug_mode import Machine  # noqa: E402
 from test_gfx import screenshot  # noqa: E402
+from test_recorder_fat import exfat_files  # noqa: E402
 
 LTAS = ROOT / "build/cargo-target/x86_64-fos-tape-fp/release/ltas"
 BACKGROUND, GRID_MAJOR = (0x10, 0x14, 0x18), (0x3a, 0x44, 0x4d)
@@ -53,6 +56,61 @@ def split_devices():
         check(900 < crossings * rate / max(len(loud), 1) < 1100, "at about 1000 Hz", f"{crossings * rate / max(len(loud), 1):.0f}")
 
 
+def png_pixels(blob):
+    """(width, height, rows) of an 8-bit RGB PNG written by crates/gfx (filters None and Up only)."""
+    check(blob[:8] == b"\x89PNG\r\n\x1a\n", "the PNG has its signature", blob[:8].hex())
+    width, height = struct.unpack(">II", blob[16:24])
+    data, at = b"", 8
+    while at < len(blob):
+        length, kind = struct.unpack(">I4s", blob[at:at + 8])
+        if kind == b"IDAT":
+            data += blob[at + 8:at + 8 + length]
+        at += 12 + length
+    raw = zlib.decompress(data)
+    rows, previous = [], bytes(width * 3)
+    for y in range(height):
+        line = raw[y * (width * 3 + 1):(y + 1) * (width * 3 + 1)]
+        row = line[1:] if line[0] == 0 else bytes((a + b) & 255 for a, b in zip(line[1:], previous))
+        rows.append(row)
+        previous = row
+    return width, height, rows
+
+
+def save_files():
+    """`s` writes ltas-DATE-TIME.csv and .png to the exFAT disk; the CSV has the header and rows, the PNG decodes and shows
+    the plot; fsck.exfat finds the volume clean."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        exfat = tmp / "save.img"
+        exfat.write_bytes(bytes(64 << 20))
+        subprocess.run(["mkfs.exfat", str(exfat)], check=True, capture_output=True)
+        machine = Machine(tmp, {}, {"ltas": LTAS})
+        machine.extra = ["-audiodev", "none,id=snd", "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd", "-device", "ich9-ahci,id=ahci",
+                         "-drive", f"if=none,id=f2,format=raw,file={exfat}", "-device", "ide-hd,drive=f2,bus=ahci.0"]
+        machine.start()
+        try:
+            machine.wait_for("M3 complete")
+            machine.connect()
+            start = len(machine.text())
+            machine.wire.send(machine.guest, TAG_DATA, b"run ltas noise=pink level=-30\n")
+            time.sleep(5)
+            machine.wire.send(machine.guest, TAG_DATA, b"s")
+            time.sleep(3)
+            machine.wire.send(machine.guest, TAG_DATA, b"\x1b")
+            machine.wait_for("frame(s) analysed", since=start, timeout=20)
+        finally:
+            machine.stop()
+        files = exfat_files(exfat)
+        names = sorted(name for name in files if name.startswith("ltas-"))
+        check(len(names) == 2 and names[0][:-4] == names[1][:-4] and names[0].endswith(".csv") and names[1].endswith(".png"), f"a CSV and a PNG with the same stamped name ({names})", str(list(files)))
+        csv = files[names[0]].decode().splitlines()
+        check(csv[0].startswith("# ltas ") and csv[3].startswith("centre_hz,") and len(csv) == 4 + 31, f"the CSV has the header and 31 band rows ({len(csv)} lines)", "\n".join(csv[:6]))
+        width, height, rows = png_pixels(files[names[1]])
+        check((width, height) == (1280, 800) and tuple(rows[height - 5][15:18]) == BACKGROUND, f"the PNG decodes to the {width}x{height} screen", "")
+        result = subprocess.run(["fsck.exfat", "-n", str(exfat)], capture_output=True, text=True)
+        check(result.returncode == 0, "fsck.exfat finds the volume clean", result.stdout[-500:] + result.stderr[-500:])
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         machine = Machine(tmp, {}, {"ltas": LTAS})
@@ -87,6 +145,7 @@ def main():
         finally:
             machine.stop()
     split_devices()
+    save_files()
     print("ltas: all checks passed")
 
 
