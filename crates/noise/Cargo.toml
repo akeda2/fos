@@ -1,0 +1,14 @@
+[package]
+name = "noise"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "noise"
+path = "src/lib.rs"
+
+[dependencies]
+dsp = { path = "../dsp" }
+
+[dev-dependencies]
+ltas = { path = "../ltas" }
