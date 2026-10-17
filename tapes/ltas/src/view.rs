@@ -94,7 +94,7 @@ pub fn draw_grid(canvas: &mut Canvas, layout: &Layout, scale: &Scale) {
         }
     }
     canvas.rect(layout.left, layout.top, layout.plot_w, layout.plot_h, GRID_MAJOR);
-    canvas.text_centered(layout.left + layout.plot_w as i32 / 2, layout.bottom() + 24, "Hz", DIM);
+    canvas.text(6, layout.bottom() + 8, "Hz", DIM);
     canvas.text(6, layout.top - 8, "dB", DIM);
 }
 
@@ -119,8 +119,43 @@ fn curve(canvas: &mut Canvas, colour: u32, points: impl Iterator<Item = (i32, i3
     }
 }
 
-/// Draws the shown curves (indexed as `Mode::ALL`) of `analyzer` over the grid already in `canvas`.
-pub fn draw_curves<const N: usize>(canvas: &mut Canvas, layout: &Layout, scale: &Scale, analyzer: &mut Analyzer<N>, shown: [bool; 4], levels: &mut [f32]) {
+/// Calls `each(x, db)` for every pixel column from the first band centre to the last, along a Catmull-Rom spline through the
+/// band levels (equally spaced on the log axis). The outer neighbours are kept within 12 dB of the segment so that a band at
+/// the -200 dB floor does not throw the curve around.
+fn smooth<const N: usize>(analyzer: &Analyzer<N>, layout: &Layout, levels: &[f32], mut each: impl FnMut(i32, f32)) {
+    let count = analyzer.outputs();
+    if count == 0 {
+        return;
+    }
+    let (first, last) = (layout.left, layout.left + layout.plot_w as i32);
+    let at = |i: usize| layout.x(analyzer.centre_hz(i));
+    for i in 0..count.saturating_sub(1) {
+        let (x0, x1) = (at(i), at(i + 1));
+        if x1 <= x0 {
+            continue;
+        }
+        let (p1, p2) = (levels[i], levels[i + 1]);
+        let (low, high) = ((if p1 < p2 { p1 } else { p2 }) - 12.0, (if p1 > p2 { p1 } else { p2 }) + 12.0);
+        let keep = |v: f32| if v < low { low } else if v > high { high } else { v };
+        let p0 = keep(if i > 0 { levels[i - 1] } else { p1 });
+        let p3 = keep(if i + 2 < count { levels[i + 2] } else { p2 });
+        for x in x0..x1 {
+            let u = (x - x0) as f32 / (x1 - x0) as f32;
+            let value = 0.5 * (2.0 * p1 + (p2 - p0) * u + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u * u + (3.0 * p1 - p0 - 3.0 * p2 + p3) * u * u * u);
+            if x >= first && x <= last {
+                each(x, value);
+            }
+        }
+    }
+    let x = at(count - 1);
+    if x >= first && x <= last {
+        each(x, levels[count - 1]);
+    }
+}
+
+/// Draws the shown curves (indexed as `Mode::ALL`) of `analyzer` over the grid already in `canvas`. In a band mode `smooth`
+/// draws a spline through the band levels instead of the bars (FFT mode is always a polyline).
+pub fn draw_curves<const N: usize>(canvas: &mut Canvas, layout: &Layout, scale: &Scale, analyzer: &mut Analyzer<N>, shown: [bool; 4], levels: &mut [f32], smooth_curves: bool) {
     let outputs = analyzer.outputs();
     let stairs = analyzer.config().resolution != Resolution::Fft;
     let edge = |analyzer: &Analyzer<N>, i: usize| {
@@ -136,7 +171,13 @@ pub fn draw_curves<const N: usize>(canvas: &mut Canvas, layout: &Layout, scale: 
             }
         }
     }
-    if shown[2] && stairs {
+    if shown[2] && stairs && smooth_curves {
+        analyzer.levels_db(Mode::Linear, levels);
+        smooth(analyzer, layout, levels, |x, db| {
+            let y = layout.y(scale, db);
+            canvas.fill_rect(x, y, 1, (layout.bottom() - y).max(0) as u32, LTAS_BAR);
+        });
+    } else if shown[2] && stairs {
         analyzer.levels_db(Mode::Linear, levels);
         for i in 0..outputs {
             let (x0, x1) = edge(analyzer, i);
@@ -150,6 +191,18 @@ pub fn draw_curves<const N: usize>(canvas: &mut Canvas, layout: &Layout, scale: 
         }
         analyzer.levels_db(mode, levels);
         let analyzer_ref: &Analyzer<N> = analyzer;
+        if stairs && smooth_curves {
+            let mut previous: Option<(i32, i32)> = None;
+            smooth(analyzer_ref, layout, levels, |x, db| {
+                let y = layout.y(scale, db);
+                if let Some((px, py)) = previous {
+                    canvas.line(px, py, x, y, COLOURS[index]);
+                    canvas.line(px, py + 1, x, y + 1, COLOURS[index]);
+                }
+                previous = Some((x, y));
+            });
+            continue;
+        }
         let points = (0..outputs).map(|i| {
             let (x0, x1) = edge(analyzer_ref, i);
             (x0, x1, layout.y(scale, levels[i]))

@@ -19,6 +19,7 @@ use view::{Layout, Scale};
 tape_rt::tape_help!(
     br#"ltas [device=N] [outdev=M] [rate=48000] [chan=1] [n=8192]
      [res=1/3|1/6|1/12|fft] [weight=z|a|c] [save=N]
+     [style=smooth|bars]
      [win=hann|rect|hamming|blackman-harris|flat-top]
      [cal=DB] [tau=SECONDS] [noise=off|white|pink|sine] [level=-20]
      [tone=HZ] [out=MASK]
@@ -31,7 +32,7 @@ Keys (Escape quits):
   n FFT size     t time constant   c/x calibration +/-0.5 dB
   1 2 3 4 show live/exp/ltas/peak     Up/Down move, Left/Right scale
   g generator off/white/pink/sine   + - level   f tone   b bursts
-  , . input channel -/+ (chan=N starts on N)
+  , . input channel -/+ (chan=N starts on N)   m smooth/bars
   s save CSV+PNG on the first exFAT/FAT32 disk (save=N picks one)
 "#
 );
@@ -83,6 +84,8 @@ struct Settings {
     channel: usize,
     /// Input channels the device captures (the status line shows `ch N/M`).
     channels: usize,
+    /// Band modes draw a spline through the band levels (`m` toggles bars).
+    smooth: bool,
     resolution: Resolution,
     window: dsp::window::Kind,
     weighting: Weighting,
@@ -172,6 +175,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut settings = Settings {
         rate: value(arguments, "rate").and_then(|v| v.parse().ok()).unwrap_or(48_000),
         channels: 0,
+        smooth: value(arguments, "style") != Some("bars"),
         channel: value(arguments, "chan").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1) - 1,
         resolution: value(arguments, "res").and_then(Resolution::from_name).unwrap_or(Resolution::Third),
         window: value(arguments, "win").and_then(dsp::window::Kind::from_name).unwrap_or(dsp::window::Kind::Hann),
@@ -276,6 +280,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     analyzer.reset();
                     let _ = write!(message, "input channel {}", settings.channel + 1);
                 }
+                Key::Char(b'm') => settings.smooth = !settings.smooth,
                 Key::Char(b's') => save_requested = true,
                 Key::Char(b' ') => frozen = !frozen,
                 Key::Char(b'r') => {
@@ -402,7 +407,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             dirty = false;
             let mut canvas = Canvas::new(frame, width, height).unwrap();
             canvas.pixels[..(width * height) as usize].copy_from_slice(&grid[..(width * height) as usize]);
-            view::draw_curves(&mut canvas, &layout, &scale, analyzer, shown, levels);
+            view::draw_curves(&mut canvas, &layout, &scale, analyzer, shown, levels, settings.smooth);
             draw_status(&mut canvas, &layout, &settings, analyzer, &generator, playback_ok, frozen, shown, message.as_str());
             tape_rt::gfx_blit(0, 0, width, height, &canvas.pixels[..(width * height) as usize], width);
         }
@@ -421,7 +426,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 fn canvas_render<const N: usize>(frame: &mut [u32], grid: &[u32], width: u32, height: u32, layout: &Layout, scale: &Scale, analyzer: &mut Analyzer<N>, shown: [bool; 4], levels: &mut [f32], settings: &Settings, generator: &Generator, playback_ok: bool, frozen: bool) {
     let mut canvas = Canvas::new(frame, width, height).unwrap();
     canvas.pixels[..(width * height) as usize].copy_from_slice(&grid[..(width * height) as usize]);
-    view::draw_curves(&mut canvas, layout, scale, analyzer, shown, levels);
+    view::draw_curves(&mut canvas, layout, scale, analyzer, shown, levels, settings.smooth);
     draw_status(&mut canvas, layout, settings, analyzer, generator, playback_ok, frozen, shown, "");
 }
 
@@ -467,11 +472,12 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
     let mut line = Line::<200>::new();
     let _ = write!(
         line,
-        "LTAS  {} Hz  ch {}/{}  {}  FFT {} {}  weight {}  cal {:+.1} dB  avg {} s  frames {}{}",
+        "LTAS  {} Hz  ch {}/{}  {}{}  FFT {} {}  weight {}  cal {:+.1} dB  avg {} s  frames {}{}",
         settings.rate,
         settings.channel + 1,
         settings.channels,
         settings.resolution.name(),
+        if settings.resolution == Resolution::Fft { "" } else if settings.smooth { " smooth" } else { " bars" },
         settings.n,
         settings.window.name(),
         settings.weighting.name(),
