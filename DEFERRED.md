@@ -493,3 +493,10 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   devices, a stress load during the sweep. RTP (`peer=A.B.C.D`, UDP port 9876), the panel answering a master while idle (`serve_panel`)
   and T applying ptime/target to the panel rows (`Settings.target`) are done but QEMU-tested only for RTP; the panel paths have no
   automated test. `make test` and `make test-all` not run.
+
+## Open after the ltas session (2026-10-17)
+
+- `ltas` is tested in QEMU (silence in) and by hand on laptop1 (UFX channels, smoothed curves, avg off). Not checked on hardware:
+  blit speed on a write-combining framebuffer, AVX2 FFT speed, USB capture with HD Audio playback, saving to a real stick, RTC stamps.
+  Not done: two USB interfaces at once (`usb_audio.rs` is a single instance), a standalone `noise` tape, a test of the `t` avg-off
+  setting. skylake3 and rack3 still run the older `ltas`. landsbro's scheduled `gb -of fos` runs at 12:13/14:13/16:14 failed (exit 2), not investigated.
