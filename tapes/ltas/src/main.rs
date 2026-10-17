@@ -21,7 +21,7 @@ tape_rt::tape_help!(
      [res=1/3|1/6|1/12|fft] [weight=z|a|c] [save=N]
      [style=smooth|bars]
      [win=hann|rect|hamming|blackman-harris|flat-top]
-     [cal=DB] [tau=SECONDS] [noise=off|white|pink|sine] [level=-20]
+     [cal=DB] [tau=SECONDS|0] [noise=off|white|pink|sine] [level=-20]
      [tone=HZ] [out=MASK]
 Long-term average spectrum of the audio input, on the screen, with a test
 signal generator for the output. device= is the input, outdev= a different
@@ -42,7 +42,15 @@ const BLOCK: usize = 32 << 10;
 const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
 const SIZES: [usize; 5] = [1024, 2048, 4096, 8192, 16384];
-const TAUS: [f32; 6] = [0.125, 0.25, 0.5, 1.0, 2.0, 5.0];
+struct AvgLabel(f32);
+
+impl core::fmt::Display for AvgLabel {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if self.0 <= 0.0 { write!(f, "off") } else { write!(f, "{} s", self.0) }
+    }
+}
+
+const TAUS: [f32; 7] = [0.0, 0.125, 0.25, 0.5, 1.0, 2.0, 5.0];
 const TONES: [f32; 7] = [125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0];
 
 /// Four views of the most outputs there can be (the CSV writer) or one view (the drawing).
@@ -182,11 +190,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         weighting: value(arguments, "weight").and_then(Weighting::from_name).unwrap_or(Weighting::Z),
         n: value(arguments, "n").and_then(|v| v.parse().ok()).filter(|n| SIZES.contains(n)).unwrap_or(8192),
         calibration_db: value(arguments, "cal").and_then(parse_f32).unwrap_or(0.0),
-        tau_index: 3,
+        tau_index: 4,
         avx2: tape_rt::fp_level() >= FP_AVX2,
     };
     if let Some(tau) = value(arguments, "tau").and_then(parse_f32) {
-        settings.tau_index = (0..TAUS.len()).min_by(|&a, &b| (TAUS[a] - tau).abs().total_cmp(&(TAUS[b] - tau).abs())).unwrap_or(3);
+        settings.tau_index = (0..TAUS.len()).min_by(|&a, &b| (TAUS[a] - tau).abs().total_cmp(&(TAUS[b] - tau).abs())).unwrap_or(4);
     }
     let mut info = AudioInfo::default();
     if (api.audio_info)(&mut info) == 0 || info.capture_channels == 0 {
@@ -472,7 +480,7 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
     let mut line = Line::<200>::new();
     let _ = write!(
         line,
-        "LTAS  {} Hz  ch {}/{}  {}{}  FFT {} {}  weight {}  cal {:+.1} dB  avg {} s  frames {}{}",
+        "LTAS  {} Hz  ch {}/{}  {}{}  FFT {} {}  weight {}  cal {:+.1} dB  avg {}  frames {}{}",
         settings.rate,
         settings.channel + 1,
         settings.channels,
@@ -482,7 +490,7 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
         settings.window.name(),
         settings.weighting.name(),
         settings.calibration_db,
-        TAUS[settings.tau_index],
+        AvgLabel(TAUS[settings.tau_index]),
         analyzer.frames(),
         if frozen { "  FROZEN" } else { "" }
     );
