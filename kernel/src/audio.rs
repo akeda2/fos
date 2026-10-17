@@ -9,6 +9,11 @@
 //! there is one (so a machine that had one before HD Audio was supported behaves as it did), else the HD Audio
 //! controller with the best playback and capture paths. A tape cannot choose; the operator does, before running it.
 //!
+//! Playback can go to a different device than capture (`audio output N|same`, the tape call `audio_use_output`): capture,
+//! `audio_read` and the capture format follow the input device above, `audio_write` and the playback format follow the output.
+//! `audio_start` then starts one direction on each device. Two devices of the same kind work for HD Audio; USB audio is a
+//! single instance, so USB in plus HD Audio out (or the reverse) is the useful pair.
+//!
 //! Both backends move PCM through the same `PcmRing`: a single-producer single-consumer byte FIFO that the
 //! interrupt handler and the foreground share, so `audio_write` returns how much fitted and `audio_read` what has
 //! arrived, whichever device is behind them.
@@ -28,6 +33,11 @@ static mut CHOSEN: Option<Backend> = None;
 /// While a tape has chosen a device (`audio_use_device`), what the operator had chosen before, to put back when the tape ends.
 /// `None` = no tape has chosen anything.
 static mut OPERATOR_CHOICE: Option<Option<Backend>> = None;
+
+/// A separate playback device (`audio output`); `None` = playback follows the active device.
+static mut OUTPUT: Option<Backend> = None;
+/// What the operator had chosen as the output before a tape did (`audio_use_output`).
+static mut OPERATOR_OUTPUT: Option<Option<Backend>> = None;
 
 fn available(backend: Backend) -> bool {
     match backend {
@@ -69,18 +79,57 @@ fn active() -> Option<Backend> {
     }
 }
 
-/// `audio device N|auto`: picks the device (1-based, as `audio` lists them). Anything running is stopped first.
-pub fn choose(number: Option<usize>) -> Result<(), &'static str> {
-    let backend = match number {
-        None => None,
+/// The device playback goes to: the separate output when one is chosen and present, else the active device.
+fn output() -> Option<Backend> {
+    match unsafe { *core::ptr::addr_of!(OUTPUT) } {
+        Some(backend) if available(backend) => Some(backend),
+        _ => active(),
+    }
+}
+
+fn split() -> bool {
+    output() != active()
+}
+
+fn backend_number(number: Option<usize>) -> Result<Option<Backend>, &'static str> {
+    match number {
+        None => Ok(None),
         Some(number) => {
             let (list, count) = devices();
             if number == 0 || number > count {
                 return Err("no such device (`audio` lists them)");
             }
-            Some(list[number - 1])
+            Ok(Some(list[number - 1]))
         }
-    };
+    }
+}
+
+/// `audio output N|same`: playback goes to device N (1-based, as `audio` lists them); `same` follows the input device.
+pub fn choose_output(number: Option<usize>) -> Result<(), &'static str> {
+    let backend = backend_number(number)?;
+    stop();
+    unsafe { *core::ptr::addr_of_mut!(OUTPUT) = backend };
+    Ok(())
+}
+
+/// The tape call `audio_use_output`: like `audio output N|same` (0 = same), undone when the tape ends.
+pub fn use_output_for_tape(number: u32) -> i32 {
+    let before = unsafe { *core::ptr::addr_of!(OUTPUT) };
+    match choose_output(if number == 0 { None } else { Some(number as usize) }) {
+        Ok(()) => {
+            let saved = unsafe { &mut *core::ptr::addr_of_mut!(OPERATOR_OUTPUT) };
+            if saved.is_none() {
+                *saved = Some(before);
+            }
+            0
+        }
+        Err(_) => AUDIO_NO_DEVICE,
+    }
+}
+
+/// `audio device N|auto`: picks the device (1-based, as `audio` lists them). Anything running is stopped first.
+pub fn choose(number: Option<usize>) -> Result<(), &'static str> {
+    let backend = backend_number(number)?;
     stop();
     unsafe { *core::ptr::addr_of_mut!(CHOSEN) = backend };
     Ok(())
@@ -133,7 +182,23 @@ pub fn use_device_for_tape(number: u32) -> i32 {
 
 /// The ordinary starter for the shell and tapes. The error strings are the ones `start_for_tape` maps to codes.
 pub fn start(rate: u32, capture: bool, playback: bool) -> Result<(), &'static str> {
-    match active() {
+    if !split() {
+        return start_on(active(), rate, capture, playback);
+    }
+    if capture {
+        start_on(active(), rate, true, false)?;
+    }
+    if playback {
+        if let Err(reason) = start_on(output(), rate, false, true) {
+            stop();
+            return Err(reason);
+        }
+    }
+    Ok(())
+}
+
+fn start_on(backend: Option<Backend>, rate: u32, capture: bool, playback: bool) -> Result<(), &'static str> {
+    match backend {
         Some(Backend::Usb) => usb::start(rate, capture, playback),
         Some(Backend::Hda(index)) => hda::start(index, rate, capture, playback),
         None => Err("no audio device"),
@@ -157,7 +222,7 @@ pub fn read(out: &mut [u8]) -> usize {
 }
 
 pub fn write(data: &[u8]) -> usize {
-    match active() {
+    match output() {
         Some(Backend::Usb) => usb::write(data),
         Some(Backend::Hda(index)) => hda::write(index, data),
         None => 0,
@@ -165,7 +230,7 @@ pub fn write(data: &[u8]) -> usize {
 }
 
 pub fn playback_space() -> usize {
-    match active() {
+    match output() {
         Some(Backend::Usb) => usb::playback_space(),
         Some(Backend::Hda(index)) => hda::playback_space(index),
         None => 0,
@@ -182,7 +247,7 @@ pub fn capture_format() -> Option<(u8, u8)> {
 }
 
 pub fn playback_format() -> Option<(u8, u8)> {
-    match active() {
+    match output() {
         Some(Backend::Usb) => usb::playback_format(),
         Some(Backend::Hda(index)) => hda::format(index, false),
         None => None,
@@ -197,7 +262,7 @@ pub fn poll() {
 }
 
 pub fn select(capture: bool, mode: u32) -> Result<(), &'static str> {
-    match active() {
+    match if capture { active() } else { output() } {
         Some(Backend::Usb) => usb::select(capture, mode),
         Some(Backend::Hda(index)) => hda::select(index, capture, mode),
         None => Err("no audio device"),
@@ -229,18 +294,61 @@ pub fn status() {
             }
         }
     }
+    if split() {
+        if let Some(out) = output() {
+            let position = list[..count].iter().position(|backend| *backend == out).map_or(0, |at| at + 1);
+            crate::println!("Playback goes to device {position} (`audio output same` follows the input).");
+        }
+    }
     match current {
         Backend::Usb => usb::status(),
         Backend::Hda(index) => hda::status(index),
     }
 }
 
-pub fn fill_info(info: &mut AudioInfo) -> bool {
-    match active() {
+fn info_of(backend: Option<Backend>, info: &mut AudioInfo) -> bool {
+    match backend {
         Some(Backend::Usb) => usb::fill_info(info),
         Some(Backend::Hda(index)) => hda::fill_info(index, info),
         None => false,
     }
+}
+
+/// With a separate output the capture side comes from the input device, the playback side from the output device, and
+/// the rates are the ones both offer (one rate serves both streams).
+pub fn fill_info(info: &mut AudioInfo) -> bool {
+    let found = info_of(active(), info);
+    if !split() {
+        return found;
+    }
+    let mut out = AudioInfo::default();
+    if !info_of(output(), &mut out) {
+        return found;
+    }
+    info.playback_channels = out.playback_channels;
+    info.playback_slot_bytes = out.playback_slot_bytes;
+    info.playback_bits = out.playback_bits;
+    info.playback_rate = out.playback_rate;
+    info.playback_space = out.playback_space;
+    if !found {
+        info.capture_channels = 0;
+        info.capture_slot_bytes = 0;
+        info.capture_bits = 0;
+        info.rate_count = out.rate_count;
+        info.rates = out.rates;
+        return true;
+    }
+    let mut common = [0u32; 8];
+    let mut count = 0;
+    for &rate in &info.rates[..(info.rate_count as usize).min(8)] {
+        if out.rates[..(out.rate_count as usize).min(8)].contains(&rate) {
+            common[count] = rate;
+            count += 1;
+        }
+    }
+    info.rates = common;
+    info.rate_count = count as u32;
+    true
 }
 
 pub fn fill_stats(stats: &mut AudioStats) {
@@ -248,6 +356,17 @@ pub fn fill_stats(stats: &mut AudioStats) {
         Some(Backend::Usb) => usb::fill_stats(stats),
         Some(Backend::Hda(index)) => hda::fill_stats(index, stats),
         None => *stats = AudioStats::default(),
+    }
+    if split() {
+        let mut out = AudioStats::default();
+        match output() {
+            Some(Backend::Usb) => usb::fill_stats(&mut out),
+            Some(Backend::Hda(index)) => hda::fill_stats(index, &mut out),
+            None => {}
+        }
+        stats.playback_packets = out.playback_packets;
+        stats.playback_errors = out.playback_errors;
+        stats.playback_underruns = out.playback_underruns;
     }
 }
 
@@ -287,5 +406,8 @@ pub fn stop_for_tape() {
     // A device the tape picked is not the operator's choice: put the operator's back.
     if let Some(before) = unsafe { (*core::ptr::addr_of_mut!(OPERATOR_CHOICE)).take() } {
         unsafe { *core::ptr::addr_of_mut!(CHOSEN) = before };
+    }
+    if let Some(before) = unsafe { (*core::ptr::addr_of_mut!(OPERATOR_OUTPUT)).take() } {
+        unsafe { *core::ptr::addr_of_mut!(OUTPUT) = before };
     }
 }

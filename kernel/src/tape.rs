@@ -641,6 +641,10 @@ extern "C" fn api_audio_use_device(number: u32) -> i32 {
     crate::audio::use_device_for_tape(number)
 }
 
+extern "C" fn api_audio_use_output(number: u32) -> i32 {
+    crate::audio::use_output_for_tape(number)
+}
+
 extern "C" fn api_audio_select(direction: u32, mode: u32) -> i32 {
     crate::audio::select_for_tape(direction == 0, mode)
 }
@@ -749,6 +753,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         gfx_close: api_gfx_close,
         gfx_fill: api_gfx_fill,
         gfx_blit: api_gfx_blit,
+        audio_use_output: api_audio_use_output,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

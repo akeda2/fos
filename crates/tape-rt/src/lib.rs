@@ -101,6 +101,19 @@ pub fn take_audio_device_arg<'a>(api: &TapeApi, arguments: &'a str) -> Result<&'
     Ok(after.trim_start())
 }
 
+/// Sends playback to audio device `number` (1-based; 0 = same as the input device) while capture stays where it is: the
+/// split input/output of tape API 18. Undone when the tape ends.
+pub fn use_audio_output(api: &TapeApi, number: u32) -> Result<(), &'static str> {
+    let end = core::mem::offset_of!(TapeApi, audio_use_output) + core::mem::size_of::<usize>();
+    if api.version < 18 || (api.size as usize) < end {
+        return Err("this kernel cannot split audio input and output (tape API 18 needed)");
+    }
+    if (api.audio_use_output)(number) != 0 {
+        return Err("there is no such audio device (`audio` lists them)");
+    }
+    Ok(())
+}
+
 pub struct Console;
 
 static mut QUIET: bool = false;

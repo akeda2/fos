@@ -16,12 +16,14 @@ use tape_rt::{AudioInfo, FP_AVX2, Key, KeyDecoder, TapeApi, println};
 use view::{Layout, Scale};
 
 tape_rt::tape_help!(
-    br#"ltas [device=N] [rate=48000] [chan=1] [res=1/3|1/6|1/12|fft] [n=8192]
-     [win=hann|rect|hamming|blackman-harris|flat-top] [weight=z|a|c]
+    br#"ltas [device=N] [outdev=M] [rate=48000] [chan=1] [n=8192]
+     [res=1/3|1/6|1/12|fft] [weight=z|a|c]
+     [win=hann|rect|hamming|blackman-harris|flat-top]
      [cal=DB] [tau=SECONDS] [noise=off|white|pink|sine] [level=-20]
      [tone=HZ] [out=MASK]
 Long-term average spectrum of the audio input, on the screen, with a test
-signal generator for the output. Curves: live, exp(onential), ltas (equal
+signal generator for the output. device= is the input, outdev= a different
+output device (`audio` numbers them). Curves: live, exp(onential), ltas (equal
 average since reset), peak. Levels are dB re a full-scale sine.
 Keys (Escape quits):
   space freeze   r reset   v resolution   w window   a weighting
@@ -147,6 +149,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Ok(rest) => rest,
         Err(reason) => return println!("ltas: {reason}."),
     };
+    if let Some(number) = value(arguments, "outdev") {
+        let Ok(number) = number.parse::<u32>() else { return println!("ltas: outdev=N needs a number (`audio` lists the devices).") };
+        if let Err(reason) = tape_rt::use_audio_output(api, number) {
+            return println!("ltas: {reason}.");
+        }
+    }
     if tape_rt::fp_level() == 0 {
         return println!("ltas: needs a hard-float tape build (kernel without FP support?).");
     }

@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls.
-pub const TAPE_API_VERSION: u32 = 17;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`.
+pub const TAPE_API_VERSION: u32 = 18;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -275,6 +275,12 @@ pub struct TapeApi {
     /// The framebuffer is write-combining memory that is slow to read, so a tape keeps its picture in ordinary memory and
     /// blits the part that changed.
     pub gfx_blit: extern "C" fn(u32, u32, u32, u32, *const u32, u32) -> u32,
+    /// `audio_use_output(number)` (version 18): sends playback to device `number` (1-based, as `audio_devices` numbers them)
+    /// while capture stays on the device `audio_use_device` (or the operator) chose; 0 = playback follows the input device.
+    /// `audio_start` then starts each direction on its own device, `audio_read`/`audio_write`/`audio_info`/`audio_stats` combine
+    /// the two. USB audio is a single instance, so the useful pairs are USB in + HD Audio out and the reverse. Stops anything
+    /// running first. 0 on success, `AUDIO_NO_DEVICE` for a number that does not exist. Undone when the tape ends.
+    pub audio_use_output: extern "C" fn(u32) -> i32,
 }
 
 /// `fp_level` returns: no SSE state enabled, SSE2 (every x86-64 CPU; `f32`/`f64` in XMM registers), or AVX2 with FMA (the

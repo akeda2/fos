@@ -1951,6 +1951,19 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
                 Err(reason) => crate::println!("audio: {reason}."),
             }
         }
+        Some("output") => {
+            let number = match words.next() {
+                Some("same") | Some("auto") | None => None,
+                Some(word) => match word.parse::<usize>() {
+                    Ok(number) => Some(number),
+                    Err(_) => return crate::println!("Usage: audio output N|same   (`audio` lists the devices)"),
+                },
+            };
+            match ua::choose_output(number) {
+                Ok(()) => ua::status(),
+                Err(reason) => crate::println!("audio: {reason}."),
+            }
+        }
         Some("stop") => {
             ua::stop();
             ua::status();

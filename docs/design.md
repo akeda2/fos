@@ -935,6 +935,14 @@ centres, 20 Hz-20 kHz) by overlap-weighted bin summing or raw FFT bins, `Accumul
 LTAS) and peak views at once). Levels are dB re a full-scale sine plus a calibration offset; FFT-bin output is normalised for
 noise, so a tone reads 2-3 dB low there.
 
+**The `ltas` tape.** `tapes/ltas` ties the crates together: it captures with `audio_read`, unpacks one channel
+(`dsp::pcm`), feeds `ltas::Analyzer`, and draws into a RAM `gfx::Canvas` blitted at most 20 times a second. The built-in
+generator (`crates/noise`: white, pink, sine, on/off bursts, a 10 ms fade, RMS level in dB re a full-scale sine) is written
+to the output with `audio_write` in the same loop (full duplex through `audio_start(rate, capture, playback)`). The
+analyser is about 1.2 MB, allocated with `api.alloc`. `make test-ltas` checks screen, loop, keys and exit against QEMU's HD
+Audio codec; levels are checked by the crate tests and on real hardware. Not done yet: saving CSV/PNG (`s`), separate input
+and output devices.
+
 **Graphics for tapes (ABI 17).** `gfx_info` (width<<32|height, 0 in BIOS VGA text mode), `gfx_open`, `gfx_close`, `gfx_fill` and
 `gfx_blit` (a `u32` 0x00RRGGBB buffer with a stride in pixels, clipped at the right and bottom) let a tape draw on the
 framebuffer. `gfx_open` clears the screen and stops the console painting it (the text grid keeps updating, so serial and
