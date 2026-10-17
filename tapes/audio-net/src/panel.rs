@@ -62,6 +62,8 @@ struct Settings {
     priority: usize,
     /// Index into `PACKET_US`.
     packet: usize,
+    /// Ring target in ms from a benchmark (0: what the priority says).
+    target: u32,
     /// Index into `PTP_MODES`.
     ptp: usize,
     /// Get the address from a DHCP server (the usual case) instead of the static `ip` and `gateway`.
@@ -81,7 +83,7 @@ struct Settings {
 
 impl Settings {
     fn new() -> Settings {
-        Settings { mode: 0, network: 0, nic: 1, codec: 0, priority: 0, packet: 0, ptp: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new(), prebuffer: Text::new() }
+        Settings { mode: 0, network: 0, nic: 1, codec: 0, priority: 0, packet: 0, target: 0, ptp: 0, dhcp: true, ip: Text::from("192.168.1.20/24"), gateway: Text::new(), peer: Text::new(), name: Text::new(), group: Text::new(), send: Text::from("1-2"), receive: Text::from("1-2"), port: Text::new(), prebuffer: Text::new() }
     }
 
     /// The network needs an IP address: RTP, or the HTTP server (which has no other network).
@@ -155,6 +157,9 @@ impl Settings {
         if self.mode != SERVE {
             let _ = writeln!(out, "priority {}", PRIORITIES[self.priority]);
             let _ = writeln!(out, "ptp {}", PTP_MODES[self.ptp]);
+            if self.target != 0 {
+                let _ = writeln!(out, "target {}", self.target);
+            }
             if self.packet != 0 && self.codec < 2 {
                 let _ = writeln!(out, "ptime {}", PACKET_US[self.packet]);
             }
@@ -235,6 +240,7 @@ impl Settings {
                 "to" | "source" | "from" if value == "auto" => {}
                 "to" | "source" | "from" => self.peer = Text::from(value),
                 "priority" => self.priority = PRIORITIES.iter().position(|name| *name == value).unwrap_or(0),
+                "target" => self.target = value.parse().unwrap_or(0),
                 "ptp" => self.ptp = PTP_MODES.iter().position(|name| *name == value).unwrap_or(0),
                 "ptime" => self.packet = PACKET_US.iter().position(|&us| value.parse() == Ok(us)).unwrap_or(0),
                 "codec" => opus = value == "opus",
@@ -346,6 +352,9 @@ fn value_text(settings: &Settings, row: usize, info: &AudioInfo, out: &mut Text<
         }
         R_CODEC => {
             let _ = write!(out, "{}", CODECS[settings.codec]);
+        }
+        R_PRIORITY if settings.target != 0 => {
+            let _ = write!(out, "Benchmark: {} ms ring (change to reset)", settings.target);
         }
         R_PRIORITY => {
             let _ = write!(out, "{}", [
@@ -540,7 +549,10 @@ fn cycle(settings: &mut Settings, row: usize, step: isize) {
             }
         }
         R_ADDRESSING => settings.dhcp = !settings.dhcp,
-        R_PRIORITY => settings.priority = wrap(settings.priority, PRIORITIES.len()),
+        R_PRIORITY => {
+            settings.priority = wrap(settings.priority, PRIORITIES.len());
+            settings.target = 0;
+        }
         R_PACKET => settings.packet = wrap(settings.packet, PACKET_US.len()),
         R_PTP => settings.ptp = wrap(settings.ptp, PTP_MODES.len()),
         R_NETWORK => {
@@ -592,29 +604,36 @@ const BENCH_FILE: &str = "bench.cfg";
 
 /// T: runs the link benchmark against the selected peer (which must be running `audio-net benchserve`), shows the
 /// recommendation and offers to save it as options for `audio-net @bench.cfg`.
-fn run_bench(settings: &Settings, decoder: &mut KeyDecoder) -> &'static str {
+fn run_bench(settings: &mut Settings, decoder: &mut KeyDecoder) -> &'static str {
     let real = tape_rt::api();
-    let (_, mut options) = match build(settings) {
+    let (_, mut options) = match build(&*settings) {
         Ok(found) => found,
         Err(reason) => return reason,
     };
-    if options.proto == crate::Proto::Rtp {
-        return "Benchmark: set the Network row to raw Ethernet or AVTP.";
-    }
     options.peer = if options.to.is_empty() { options.source } else { options.to };
     options.to = "";
     draw!("\x1b[2J");
     at(1, 1);
     draw!(" fos audio-net: benchmark with {} (it must run `audio-net benchserve`)\n", if options.peer.is_empty() { "-" } else { options.peer });
-    let outcome = crate::bench::master(tape_rt::abort::wrap(real), &options);
+    let outcome = crate::bench::master(tape_rt::abort::wrap(real), &options, true);
     let mut saved = "";
     match outcome {
-        Some(found) => tape_rt::println!("\nW: save ptime={} target={} to {BENCH_FILE}   any other key: back", found.ptime_us, found.target_ms),
+        Some(found) => tape_rt::println!("\nA: use ptime={} target={} in the settings   W: save to {BENCH_FILE}   other key: back", found.ptime_us, found.target_ms),
         None => tape_rt::println!("\nAny key: back to the settings."),
     }
     loop {
         match next_key(decoder) {
             None => tape_rt::idle(),
+            Some(Key::Char(b'a' | b'A')) if outcome.is_some() => {
+                let Some(found) = outcome else { break };
+                settings.packet = PACKET_US.iter().position(|&us| us == found.ptime_us).unwrap_or(0);
+                settings.target = found.target_ms;
+                if PRIORITIES[settings.priority] == "auto" {
+                    settings.priority = 0;
+                }
+                saved = "Settings now use the benchmark's packet time and ring (S saves audio.cfg).";
+                break;
+            }
             Some(Key::Char(b'w' | b'W')) if outcome.is_some() => {
                 let Some(found) = outcome else { break };
                 let mut text = Text::<100>::new();
@@ -626,6 +645,17 @@ fn run_bench(settings: &Settings, decoder: &mut KeyDecoder) -> &'static str {
         }
     }
     saved
+}
+
+/// The panel is idle and a master wants a benchmark: serve it with the form's network settings, then come back.
+fn serve_bench(settings: &Settings, presence: &mut Presence) -> &'static str {
+    let Ok((_, options)) = build(settings) else { return "" };
+    presence.stop(false);
+    draw!("\x1b[2J");
+    at(1, 1);
+    draw!(" fos audio-net: benchmark server\n\n");
+    crate::bench::serve_panel(tape_rt::abort::wrap(tape_rt::api()), &options);
+    "Served a benchmark."
 }
 
 /// B: make the machine start streaming at boot, with a `start` file running the saved configuration.
@@ -992,11 +1022,13 @@ struct Presence {
     start_at: u64,
     status: Text<100>,
     shown: Text<100>,
+    /// A benchmark master's HELLO was seen: the main loop serves it.
+    bench_wanted: bool,
 }
 
 impl Presence {
     fn new() -> Presence {
-        Presence { link: Link::Off, transport: None, igmp: Igmp::new(sap::GROUP), directory: peers::Directory::new(), start_at: tape_rt::micros() + PRESENCE_DELAY, status: Text::new(), shown: Text::new() }
+        Presence { link: Link::Off, transport: None, igmp: Igmp::new(sap::GROUP), directory: peers::Directory::new(), start_at: tape_rt::micros() + PRESENCE_DELAY, status: Text::new(), shown: Text::new(), bench_wanted: false }
     }
 
     /// Withdraws the announcement and goes back to Off (the settings changed, or a stream is about to start).
@@ -1146,6 +1178,9 @@ impl Presence {
             if length == 0 {
                 break;
             }
+            if length > 18 && frame[12..14] == [0x88, 0xb5] && &frame[14..18] == b"ABN1" {
+                self.bench_wanted = true;
+            }
             peers::l2_announcement(&frame[..length], transport.mac, &mut self.directory);
         }
         let mac = transport.mac;
@@ -1176,8 +1211,10 @@ impl Presence {
                 continue;
             }
             let ticks = (api.ticks)() as u32;
-            if let crate::net::Inbound::Udp { source, payload, .. } = net::inbound(api, nic, &transport.config, &mut transport.arp, &frame[..length], sap::PORT..=sap::PORT, ticks) {
-                if source != transport.config.ip {
+            if let crate::net::Inbound::Udp { source, payload, .. } = net::inbound(api, nic, &transport.config, &mut transport.arp, &frame[..length], sap::PORT..=crate::bench::BENCH_PORT, ticks) {
+                if payload.starts_with(b"ABN1") {
+                    self.bench_wanted = true;
+                } else if source != transport.config.ip {
                     if let Some(packet) = sap::parse(payload) {
                         self.directory.update(&packet, frame[6..12].try_into().unwrap_or([0; 6]));
                     }
@@ -1430,7 +1467,7 @@ pub fn run(real: &'static TapeApi) {
                 }
                 Key::Char(b't') | Key::Char(b'T') => {
                     presence.stop(false);
-                    message = run_bench(&settings, &mut decoder);
+                    message = run_bench(&mut settings, &mut decoder);
                     info = read_audio_info();
                     dirty.full = true;
                 }
@@ -1460,6 +1497,13 @@ pub fn run(real: &'static TapeApi) {
         }
         if changed && !editing {
             presence.stop(network_changed);
+        }
+        if !any && presence.bench_wanted {
+            presence.bench_wanted = false;
+            message = serve_bench(&settings, &mut presence);
+            draw_form(&settings, selected, editing, &info, message);
+            presence.shown = Text::new();
+            continue;
         }
         if !any {
             presence.tick(&settings);

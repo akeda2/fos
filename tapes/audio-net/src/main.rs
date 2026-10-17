@@ -1552,7 +1552,7 @@ pub fn run_once(api: &'static TapeApi, mode: &str, options: &Options<'static>) {
         "serve" => serve::serve(api, options),
         "benchserve" => bench::serve(api, options),
         "bench" => {
-            bench::master(api, options);
+            bench::master(api, options, false);
         }
         "send" if options.opus => opus::send(api, options),
         "recv" if options.opus => opus::receive(api, options),
@@ -1665,8 +1665,8 @@ tape_rt::tape_help!(br#"audio-net: audio over the network (raw Ethernet, RTP or 
                     [ch=1-2] [target=MS] [group=239.1.2.3] [codec=pcm|opus]
   tape run audio-net duplex ...     send and receive together
   tape run audio-net serve [http=8000] [bitrate=KBIT]    Ogg Opus over HTTP
-  tape run audio-net benchserve [proto=raw|avtp] [nic=N]   on the far machine
-  tape run audio-net bench peer=NAME|MAC [proto=avtp] [rate=48000] [bits=24]
+  tape run audio-net benchserve [proto=raw|avtp|rtp] [nic=N]   far machine
+  tape run audio-net bench peer=NAME|MAC|IP [proto=avtp|rtp] [rate=48000] [bits=24]
                     [ch=1-2] [tol=0.01] [stepsecs=10]   find the lowest
                     ptime/target both directions carry; only this one runs
   tape run audio-net @audio.cfg     options from a file

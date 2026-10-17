@@ -249,6 +249,11 @@ pub fn parse_step(frame: &[u8]) -> Option<Params> {
     })
 }
 
+/// The master is done (or stopping): the server may return to what it was doing.
+pub fn abort(out: &mut [u8], dst: [u8; 6], src: [u8; 6], session: u16, seq: u32) -> usize {
+    control_header(out, dst, src, K_ABORT, session, seq).finish()
+}
+
 pub fn step_ack(out: &mut [u8], dst: [u8; 6], src: [u8; 6], session: u16, seq: u32, step: u16) -> usize {
     let mut writer = control_header(out, dst, src, K_STEP_ACK, session, seq);
     writer.u16(step);
@@ -527,6 +532,8 @@ mod tests {
         assert_eq!(parse_hello_reply(&frame[..length]).unwrap(), (11, 22, 33, Some([1, 2, 3, 4, 5, 6, 7, 8])));
         let length = hello_reply(&mut frame, MAC_A, MAC_B, 7, 1, 11, 22, 33, None);
         assert_eq!(parse_hello_reply(&frame[..length]).unwrap().3, None);
+        let length = abort(&mut frame, MAC_B, MAC_A, 7, 12);
+        assert_eq!(parse_control(&frame[..length]).unwrap().kind, K_ABORT);
     }
 
     #[test]

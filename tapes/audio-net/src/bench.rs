@@ -11,10 +11,19 @@
 //!
 //! Nothing is printed while a step streams or receives: a console line costs ~10 ms on real hardware.
 
+use crate::net::{self, Inbound};
 use crate::{AVTP_DEFAULT_MAC, MacText, Options, Proto, Transport, clock, parse_mac, peers};
 use audio_bench::{Analyzer, Params, PTIMES_US, StepResult, NEED_NONE};
 use audio_wire::ChannelSet;
+use tape_net::{Ipv4Address, MacAddress};
 use tape_rt::{TapeApi, println};
+
+/// RTP mode: control and data are UDP datagrams to this port (the next one after SAP's 9875, so the panel's presence
+/// loop, which already reads that range, notices a master calling). Their payload is an `audio_bench` frame without
+/// its 14-byte Ethernet header.
+pub const BENCH_PORT: u16 = 9876;
+/// IPv4 + UDP header bytes a datagram adds to the 14-byte Ethernet-shaped frame the bench builds.
+const UDP_OVERHEAD: usize = 20 + 8;
 
 /// Packets one step can tell apart (about 12 s at 125 us).
 const SLOTS: usize = 100_000;
@@ -50,6 +59,7 @@ enum Event {
     HelloReply { seq: u32, t1: u64, t2: u64, t3: u64, grandmaster: Option<[u8; 8]>, t4: u64 },
     Step { source: [u8; 6], seq: u32, params: Params },
     Ack(u16),
+    Abort,
     Query { step: u16, sent: u32 },
     Report { step: u16, sent: u32, result: StepResult },
 }
@@ -59,30 +69,39 @@ struct Ctx {
     nic: usize,
     mac: [u8; 6],
     transport: Transport,
+    /// RTP: where datagrams go (the peer; on a server the master that last called) and the frames' own buffer.
+    rtp: bool,
+    dest_ip: Ipv4Address,
+    dest_mac: MacAddress,
+    from: Option<(Ipv4Address, MacAddress)>,
+    /// The master's view of the server's MAC (None outside a master run).
+    peer: Option<[u8; 6]>,
     session: u16,
     seq: u32,
     ethertype: u16,
     rx: [u8; FRAME],
     tx: [u8; FRAME],
+    wire: [u8; FRAME],
 }
 
 impl Ctx {
     fn open(api: &'static TapeApi, options: &Options<'static>) -> Option<Ctx> {
-        if options.proto == Proto::Rtp {
-            println!("audio-net bench: proto=raw or proto=avtp (layer 2); RTP is not supported here.");
-            return None;
-        }
+        let rtp = options.proto == Proto::Rtp;
         let mut mac = [0u8; 6];
         (api.nic_mac)(options.nic, mac.as_mut_ptr());
-        let mut transport = Transport::from_l2(options, mac);
+        let mut transport = if rtp { Transport::open(api, options)? } else { Transport::from_l2(options, mac) };
         transport.start_clock(api, options);
-        (api.nic_set_multicast)(options.nic, 1);
+        if !rtp {
+            (api.nic_set_multicast)(options.nic, 1);
+        }
         let ethertype = if options.proto == Proto::Avtp { audio_wire::avtp::ETHERTYPE } else { audio_wire::ETHERTYPE };
-        Some(Ctx { api, nic: options.nic, mac, transport, session: 0, seq: 0, ethertype, rx: [0; FRAME], tx: [0; FRAME] })
+        Some(Ctx { api, nic: options.nic, mac, transport, rtp, dest_ip: Ipv4Address([0; 4]), dest_mac: MacAddress([0; 6]), from: None, peer: None, session: 0, seq: 0, ethertype, rx: [0; FRAME], tx: [0; FRAME], wire: [0; FRAME] })
     }
 
     fn close(&mut self) {
-        (self.api.nic_set_multicast)(self.nic, 0);
+        if !self.rtp {
+            (self.api.nic_set_multicast)(self.nic, 0);
+        }
         self.transport.stop_clock(self.api, self.nic);
     }
 
@@ -90,8 +109,21 @@ impl Ctx {
         (self.api.should_abort)() != 0
     }
 
+    /// Sends the frame built in `tx`; over RTP its payload goes in a UDP datagram to `dest_ip`.
     fn send(&mut self, length: usize) {
+        if self.rtp {
+            if let Some(total) = net::build_udp_frame(&mut self.wire, &self.transport.config, self.dest_mac, self.dest_ip, BENCH_PORT, BENCH_PORT, 64, &self.tx[14..length]) {
+                (self.api.nic_send)(self.nic, self.wire.as_ptr(), total);
+            }
+            return;
+        }
         (self.api.nic_send)(self.nic, self.tx.as_ptr(), length);
+    }
+
+    /// Sends to a given peer (L2: the MAC in the frame; RTP: the server's own address and MAC).
+    fn target(&mut self, ip: Ipv4Address, mac: MacAddress) {
+        self.dest_ip = ip;
+        self.dest_mac = mac;
     }
 
     /// The stamp of "now" on the clock a step uses.
@@ -101,11 +133,39 @@ impl Ctx {
 
     /// Reads one frame and says what it was. Data frames of the running step go to `analyzer`.
     fn poll(&mut self, step: Option<&Params>, analyzer: &mut Option<Analyzer<'static>>) -> Event {
-        let length = (self.api.nic_receive)(self.nic, self.rx.as_mut_ptr(), self.rx.len());
+        let mut length = (self.api.nic_receive)(self.nic, self.rx.as_mut_ptr(), self.rx.len());
         let arrival = tape_rt::micros();
         if length == 0 {
             self.transport.igmp_service(self.api, self.nic, None);
             return Event::None;
+        }
+        if self.rtp {
+            // Back to the frame shape the parsers know: a datagram's payload behind a made-up Ethernet header.
+            let ticks = (self.api.ticks)() as u32;
+            let mut shaped = [0u8; FRAME];
+            let shaped_length = match net::inbound(self.api, self.nic, &self.transport.config, &mut self.transport.arp, &self.rx[..length], BENCH_PORT..=BENCH_PORT, ticks) {
+                Inbound::Udp { source, payload, .. } if payload.len() >= 4 && 14 + payload.len() <= FRAME => {
+                    let ethertype = match &payload[..4] {
+                        b"ABN1" => audio_bench::CTRL_ETHERTYPE,
+                        b"ABD1" => self.ethertype,
+                        _ => return Event::None,
+                    };
+                    shaped[6..12].copy_from_slice(&self.rx[6..12]);
+                    shaped[12..14].copy_from_slice(&ethertype.to_be_bytes());
+                    shaped[14..14 + payload.len()].copy_from_slice(payload);
+                    if ethertype == audio_bench::CTRL_ETHERTYPE {
+                        self.from = Some((source, MacAddress(self.rx[6..12].try_into().unwrap_or([0; 6]))));
+                    }
+                    14 + payload.len()
+                }
+                Inbound::Nothing => {
+                    self.transport.igmp_service(self.api, self.nic, Some(&self.rx[..length]));
+                    return Event::None;
+                }
+                _ => return Event::None,
+            };
+            self.rx[..shaped_length].copy_from_slice(&shaped[..shaped_length]);
+            length = shaped_length;
         }
         let frame = &self.rx[..length];
         if length < 14 {
@@ -117,6 +177,7 @@ impl Ctx {
                 audio_bench::K_HELLO => audio_bench::parse_hello(frame).map_or(Event::None, |t1| Event::Hello { source: control.source, session: control.session, seq: control.seq, t1, t2: arrival }),
                 audio_bench::K_HELLO_REPLY if control.session == self.session => audio_bench::parse_hello_reply(frame).map_or(Event::None, |(t1, t2, t3, grandmaster)| Event::HelloReply { seq: control.seq, t1, t2, t3, grandmaster, t4: arrival }),
                 audio_bench::K_STEP if control.session == self.session => audio_bench::parse_step(frame).map_or(Event::None, |params| Event::Step { source: control.source, seq: control.seq, params }),
+                audio_bench::K_ABORT if control.session == self.session => Event::Abort,
                 audio_bench::K_STEP_ACK if control.session == self.session => audio_bench::parse_step_ack(frame).map_or(Event::None, Event::Ack),
                 audio_bench::K_QUERY if control.session == self.session => audio_bench::parse_query(frame).map_or(Event::None, |(step, sent)| Event::Query { step, sent }),
                 audio_bench::K_REPORT if control.session == self.session => audio_bench::parse_report(frame).map_or(Event::None, |(step, done, sent, result)| if done { Event::Report { step, sent, result } } else { Event::None }),
@@ -151,7 +212,9 @@ impl Ctx {
             if sent % 64 == 0 && self.aborted() {
                 break;
             }
-            let length = audio_bench::data_frame(&mut self.tx, params.destination, self.mac, self.ethertype, self.session, params.step, sent, Ctx::stamp(params.ptp), usize::from(params.frame_len));
+            // Over RTP the frame's size counts the IP, UDP and RTP headers the datagram will carry.
+            let wanted = usize::from(params.frame_len).saturating_sub(if self.rtp { UDP_OVERHEAD } else { 0 });
+            let length = audio_bench::data_frame(&mut self.tx, params.destination, self.mac, self.ethertype, self.session, params.step, sent, Ctx::stamp(params.ptp), wanted);
             self.send(length);
             sent += 1;
         }
@@ -197,31 +260,54 @@ pub struct Outcome {
 }
 
 /// Runs the benchmark against `options.peer`. Returns the recommendation, if any step passed in both directions.
-pub fn master(api: &'static TapeApi, options: &Options<'static>) -> Option<Outcome> {
+/// `quiet`: no line per step (the panel's screen is only 24 rows); the summary is printed either way.
+pub fn master(api: &'static TapeApi, options: &Options<'static>, quiet: bool) -> Option<Outcome> {
     let mut ctx = Ctx::open(api, options)?;
-    let outcome = run_master(&mut ctx, options);
+    let outcome = run_master(&mut ctx, options, quiet);
+    // Tell the server it may go back to what it was doing (a few times: nothing acknowledges it).
+    if let Some(peer) = ctx.peer {
+        for _ in 0..3 {
+            ctx.seq += 1;
+            let length = audio_bench::abort(&mut ctx.tx, peer, ctx.mac, ctx.session, ctx.seq);
+            ctx.send(length);
+        }
+    }
     ctx.close();
     outcome
 }
 
-fn resolve_peer(api: &TapeApi, text: &str) -> Option<[u8; 6]> {
+/// Where the master sends: a MAC on layer 2, the IP address (and its MAC) over RTP. Prints why not.
+fn resolve_peer(ctx: &mut Ctx, text: &str) -> Option<[u8; 6]> {
     if text.is_empty() {
-        println!("audio-net bench: peer=NAME|MAC names the machine running `audio-net benchserve`.");
+        println!("audio-net bench: peer=NAME|MAC (RTP: peer=A.B.C.D) names the machine running `audio-net benchserve`.");
         return None;
     }
-    parse_mac(text).or_else(|| peers::kernel_peer(api, text).map(|peer| peer.mac)).or_else(|| {
+    if ctx.rtp {
+        let Some(ip) = net::parse_ip(text) else {
+            println!("audio-net bench: with proto=rtp the peer is its IP address (peer=A.B.C.D).");
+            return None;
+        };
+        let Some(mac) = net::resolve(ctx.api, ctx.nic, &ctx.transport.config, &mut ctx.transport.arp, ip) else {
+            println!("audio-net bench: {text} does not answer ARP.");
+            return None;
+        };
+        ctx.target(ip, mac);
+        return Some(mac.0);
+    }
+    parse_mac(text).or_else(|| peers::kernel_peer(ctx.api, text).map(|peer| peer.mac)).or_else(|| {
         println!("audio-net bench: '{text}' has not announced itself (`nic peers`); use its MAC address.");
         None
     })
 }
 
-fn run_master(ctx: &mut Ctx, options: &Options<'static>) -> Option<Outcome> {
+fn run_master(ctx: &mut Ctx, options: &Options<'static>, quiet: bool) -> Option<Outcome> {
     let api = ctx.api;
-    let peer = resolve_peer(api, options.peer)?;
+    let peer = resolve_peer(ctx, options.peer)?;
+    ctx.peer = Some(peer);
     let channels = options.channels.unwrap_or(ChannelSet(0b11)).count();
     let bits = options.bits;
-    let (header, max_payload) = if options.proto == Proto::Avtp { (audio_wire::avtp::HEADER_LEN, 1500 - audio_wire::avtp::HEADER_LEN) } else { (audio_wire::HEADER_LEN, audio_wire::MAX_RAW_PAYLOAD) };
-    let destination = parse_mac(options.to).unwrap_or(if options.proto == Proto::Avtp { AVTP_DEFAULT_MAC } else { [0xff; 6] });
+    let (header, max_payload) = if ctx.rtp { (28 + 12, audio_wire::MAX_RTP_PAYLOAD) } else if options.proto == Proto::Avtp { (audio_wire::avtp::HEADER_LEN, 1500 - audio_wire::avtp::HEADER_LEN) } else { (audio_wire::HEADER_LEN, audio_wire::MAX_RAW_PAYLOAD) };
+    let destination = if ctx.rtp { [0; 6] } else { parse_mac(options.to).unwrap_or(if options.proto == Proto::Avtp { AVTP_DEFAULT_MAC } else { [0xff; 6] }) };
     let (whole, hundredths) = percent(options.tol_ppm);
     println!("audio-net bench: {} {} Hz {}-bit x{} to {} via NIC {} (MAC {}).", if options.proto == Proto::Avtp { "AVTP" } else { "raw" }, options.rate, bits, channels, MacText(peer), options.nic + 1, MacText(ctx.mac));
     println!("Tolerance {whole}.{hundredths:02} % late or lost ({} ppm); {} s per step; Escape stops.", options.tol_ppm, options.step_secs);
@@ -235,32 +321,39 @@ fn run_master(ctx: &mut Ctx, options: &Options<'static>) -> Option<Outcome> {
     }
     ctx.session = (tape_rt::micros() as u16) | 1;
 
-    // Clock offset: the sample with the shortest round trip (the others queued somewhere).
-    let mut best: Option<(i64, i64, Option<[u8; 8]>)> = None;
-    for attempt in 0..16 {
+    // Clock offset: the sample with the shortest round trip (the others queued somewhere). With PTP here, keep asking
+    // (up to 12 s) until the server answers locked too: it starts its clock on the first HELLO.
+    let want_ptp = options.ptp && clock::locked();
+    let mut best: Option<(i64, i64)> = None;
+    let mut grandmaster: Option<[u8; 8]> = None;
+    let mut answers = 0;
+    for _ in 0..40 {
         ctx.seq += 1;
         let t1 = tape_rt::micros();
         let length = audio_bench::hello(&mut ctx.tx, peer, ctx.mac, ctx.session, ctx.seq, t1);
         ctx.send(length);
         let until = tape_rt::micros() + 300_000;
         while tape_rt::micros() < until && !ctx.aborted() {
-            if let Event::HelloReply { seq, t1, t2, t3, grandmaster, t4 } = ctx.poll(None, &mut None) {
+            if let Event::HelloReply { seq, t1, t2, t3, grandmaster: reported, t4 } = ctx.poll(None, &mut None) {
                 if seq == ctx.seq {
                     let round_trip = (t4 as i64 - t1 as i64) - (t3 as i64 - t2 as i64);
                     let offset = ((t2 as i64 - t1 as i64) + (t3 as i64 - t4 as i64)) / 2;
-                    if best.is_none_or(|(rtt, _, _)| round_trip < rtt) {
-                        best = Some((round_trip, offset, grandmaster));
+                    if best.is_none_or(|(rtt, _)| round_trip < rtt) {
+                        best = Some((round_trip, offset));
                     }
+                    grandmaster = reported;
+                    answers += 1;
                     break;
                 }
             } else {
                 tape_rt::idle();
             }
         }
-        if best.is_some() && attempt >= 7 {
+        if ctx.aborted() || (answers >= 8 && (!want_ptp || grandmaster.is_some())) {
             break;
         }
     }
+    let best = best.map(|(round_trip, offset)| (round_trip, offset, grandmaster));
     let Some((round_trip, offset, grandmaster)) = best else {
         println!("audio-net bench: {} does not answer; start `audio-net benchserve` there (same network, same proto).", MacText(peer));
         return None;
@@ -284,16 +377,21 @@ fn run_master(ctx: &mut Ctx, options: &Options<'static>) -> Option<Outcome> {
             step += 1;
             let destination = if master_sends || destination[0] & 1 != 0 { destination } else { ctx.mac };
             let params = Params { step, master_sends, ethertype: ctx.ethertype, destination, frame_len, period_ns, secs, tolerance_ppm: options.tol_ppm, offset_us: if master_sends { offset_us } else { -offset_us }, ptp };
+            let label = if master_sends { "up  " } else { "down" };
+            if quiet {
+                tape_rt::print!("\rMeasuring {ptime} us packets, {}...   ", if master_sends { "master to peer" } else { "peer to master" });
+            }
             let result = run_step(ctx, peer, &params);
             if ctx.aborted() {
                 break 'sweep;
             }
-            let label = if master_sends { "up  " } else { "down" };
             match result {
                 Some(result) => {
-                    println!("{label} {:4} us {:3} fr: rx {}/{} lost {} late {} need {} ms", ptime, per_packet, result.received, result.expected, result.lost, Ms(result.max_late_us), Ms(result.need_us));
-                    if result.duplicates + result.reordered != 0 {
-                        println!("     {} duplicated, {} out of order", result.duplicates, result.reordered);
+                    if !quiet {
+                        println!("{label} {:4} us {:3} fr: rx {}/{} lost {} late {} need {} ms", ptime, per_packet, result.received, result.expected, result.lost, Ms(result.max_late_us), Ms(result.need_us));
+                        if result.duplicates + result.reordered != 0 {
+                            println!("     {} duplicated, {} out of order", result.duplicates, result.reordered);
+                        }
                     }
                     if master_sends { rows[index].up = Some(result) } else { rows[index].down = Some(result) }
                 }
@@ -304,6 +402,9 @@ fn run_master(ctx: &mut Ctx, options: &Options<'static>) -> Option<Outcome> {
     if ctx.aborted() {
         println!("audio-net bench: stopped.");
         return None;
+    }
+    if quiet {
+        println!();
     }
     summary(options, &rows)
 }
@@ -398,16 +499,57 @@ struct Serving {
     printed: u16,
 }
 
-/// `benchserve`: answers a master until Escape.
+/// `benchserve`: answers masters until Escape.
 pub fn serve(api: &'static TapeApi, options: &Options<'static>) {
     let Some(mut ctx) = Ctx::open(api, options) else { return };
-    println!("audio-net benchserve: NIC {} (MAC {}), {}. Waiting for a master; Escape stops.", options.nic + 1, MacText(ctx.mac), if options.proto == Proto::Avtp { "AVTP" } else { "raw" });
+    println!("audio-net benchserve: NIC {} (MAC {}), {}. Waiting for a master; Escape stops.", options.nic + 1, MacText(ctx.mac), proto_label(options.proto));
+    serve_loop(&mut ctx, false);
+    ctx.close();
+}
+
+/// The panel's server: a master called while the panel was idle. Serves that one master and returns when it says it is
+/// done, goes quiet for 90 s, or Escape is pressed.
+pub fn serve_panel(api: &'static TapeApi, options: &Options<'static>) {
+    let Some(mut ctx) = Ctx::open(api, options) else { return };
+    println!("A master is benchmarking this link ({}, NIC {}). Escape stops.", proto_label(options.proto), options.nic + 1);
+    serve_loop(&mut ctx, true);
+    ctx.close();
+}
+
+fn proto_label(proto: Proto) -> &'static str {
+    match proto {
+        Proto::Avtp => "AVTP",
+        Proto::Rtp => "RTP",
+        Proto::Raw => "raw",
+    }
+}
+
+fn serve_loop(ctx: &mut Ctx, one_master: bool) {
     let mut state = Serving { params: None, analyzer: None, sent: 0, peer: [0; 6], printed: 0 };
+    let mut last_heard = tape_rt::micros();
     while !ctx.aborted() {
         let params = state.params;
         let event = ctx.poll(params.as_ref(), &mut state.analyzer);
+        if !matches!(event, Event::None) {
+            last_heard = tape_rt::micros();
+        } else if one_master && tape_rt::micros() - last_heard > 90_000_000 {
+            break;
+        }
+        if matches!(event, Event::Hello { .. } | Event::Step { .. }) && ctx.rtp {
+            if let Some((ip, mac)) = ctx.from {
+                ctx.target(ip, mac);
+            }
+        }
         match event {
             Event::None => tape_rt::idle(),
+            Event::Abort => {
+                if one_master {
+                    break;
+                }
+                println!("Master finished.");
+                state = Serving { params: None, analyzer: None, sent: 0, peer: [0; 6], printed: 0 };
+                ctx.session = 0;
+            }
             Event::Hello { source, session, seq, t1, t2 } => {
                 if ctx.session != session {
                     println!("Master {} (session {session}).", MacText(source));
@@ -450,5 +592,4 @@ pub fn serve(api: &'static TapeApi, options: &Options<'static>) {
             _ => {}
         }
     }
-    ctx.close();
 }

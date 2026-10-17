@@ -59,6 +59,20 @@ def main():
             mark = master.send("\x1b")
             master.wait_for("stopped", 20, mark)
             check(True, "Escape stops a running bench")
+            server_mark = server.send("\x1b")
+            server.wait_for("fos> ", 20, server_mark)
+            server_mark = server.send("run audio-net benchserve proto=rtp ip=10.9.0.1/24")
+            server.wait_for("Waiting for a master", 30, server_mark)
+            master_mark = master.send("run audio-net bench proto=rtp ip=10.9.0.2/24 peer=10.9.0.1 stepsecs=2 tol=5")
+            master.wait_for("Lowest within", 180, master_mark)
+            report = master.text()[master_mark:]
+            rows = re.findall(r"^(up  |down) +(\d+) us +(\d+) fr: rx (\d+)/(\d+)", report, re.M)
+            check(len(rows) == 10, f"RTP: ten steps ran ({len(rows)})", report[-1500:])
+            for direction, ptime, frames, received, expected in rows:
+                if ptime == "2000":
+                    check(int(received) > 0.8 * int(expected), f"RTP {direction.strip()} 2 ms packets are carried ({received} of {expected})", report[-1500:])
+            server.wait_for("Master finished", 20, server_mark)
+            check(True, "the master's ABORT returns the server to waiting")
         finally:
             server.stop()
             master.stop()

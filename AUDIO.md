@@ -183,6 +183,8 @@ and the real-hardware duplex bug narrative) is in
 ## Finding the lowest safe latency: `audio-net bench`
 
 Run `audio-net benchserve proto=avtp` on one machine and `audio-net bench proto=avtp peer=NAME` on the other (or T in the panel).
+With RTP use `peer=A.B.C.D` (control and data are UDP port 9876). A machine sitting in the panel answers a master by itself
+(it leaves the form, serves, comes back); in the panel T shows the table and A copies ptime and target into the rows.
 It streams numbered packets of the stream's real size both ways at packet times 125 us ... 2 ms, and prints, per packet time, the
 ring a receiver needs (`need`) within `tol=` late-or-lost packets and the ring that leaves none (`clean`), then the lowest `ptime`
 and `target` that pass in both directions. See docs/design.md for the method and its limits.

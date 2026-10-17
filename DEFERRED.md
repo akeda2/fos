@@ -490,5 +490,6 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 ## Open after the audio-net bench session (2026-10-17)
 
 - `audio-net bench` is network-only and has had no real-hardware run yet (QEMU only). Not done: end-to-end loopback with real audio
-  devices, a stress load during the sweep, RTP, a panel idle loop that answers a master (the far machine runs `benchserve`), applying
-  the result to the panel's rows (T offers `bench.cfg` for `audio-net @audio.cfg @bench.cfg`). `make test` and `make test-all` not run.
+  devices, a stress load during the sweep. RTP (`peer=A.B.C.D`, UDP port 9876), the panel answering a master while idle (`serve_panel`)
+  and T applying ptime/target to the panel rows (`Settings.target`) are done but QEMU-tested only for RTP; the panel paths have no
+  automated test. `make test` and `make test-all` not run.
