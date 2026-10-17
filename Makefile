@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-nettest-remote test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-nettest-remote test-audio-bench test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi
 
 all: image tapes
 
@@ -74,6 +74,10 @@ test-telnet: image
 # Blocking commands (nic sniff, tape load net) end on the term net client's Escape or disconnect, on any NIC.
 test-release-loops: image
 	python3 tools/test_release_loops.py
+
+# audio-net bench: master and benchserve guests sweep packet times both ways and recommend ptime/target.
+test-audio-bench: image
+	python3 tools/test_audio_bench.py
 
 # Two guests: nettest serve=1 and remote=1 find each other, sync clocks and run a test both ways.
 test-nettest-remote: image
@@ -182,6 +186,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/audio-bench/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-sync/Cargo.toml
 	for tape in router nettest ed ip-chat telnet ptp fterm; do cargo +nightly-2026-09-13 test --lib --manifest-path tapes/$$tape/Cargo.toml || exit 1; done
 	python3 tools/test_boot.py

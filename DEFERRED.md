@@ -486,3 +486,9 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - RTL8168G/H transmit checksum offload is done and checked for UDP on skylake4/rack4. Open: TCP offload not tried on hardware; RX
   checksum (`CPlusCmd` bit 5, `opts1` protocol/fail bits) has no consumer until a tape ABI call reports it; large send/VLAN insert not done;
   older RTL8168 chips (pre-G) use another descriptor layout and answer false. `make test` was not run for this change.
+
+## Open after the audio-net bench session (2026-10-17)
+
+- `audio-net bench` is network-only and has had no real-hardware run yet (QEMU only). Not done: end-to-end loopback with real audio
+  devices, a stress load during the sweep, RTP, a panel idle loop that answers a master (the far machine runs `benchserve`), applying
+  the result to the panel's rows (T offers `bench.cfg` for `audio-net @audio.cfg @bench.cfg`). `make test` and `make test-all` not run.

@@ -64,6 +64,7 @@
 #![no_std]
 #![no_main]
 
+mod bench;
 mod clock;
 mod duplex;
 use tape_ip::{igmp, net};
@@ -207,6 +208,11 @@ pub struct Options<'a> {
     ptp: bool,
     /// `ptp=l2`: PTP over Ethernet even for RTP.
     ptp_l2: bool,
+    /// `bench`: the machine running `benchserve` (a MAC or an announced name), the tolerated late-or-lost share in ppm,
+    /// and the seconds each step streams.
+    peer: &'a str,
+    tol_ppm: u32,
+    step_secs: u16,
 }
 
 pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -232,7 +238,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
     let mut options = Options {
         proto: Proto::Raw, proto_explicit: false, nic: 0, to: "", rate: 48_000, channels: None, chan: 2, bits: 24, tone: None, target_ms: 6, priority: None, ptime_us: 1000, target_given: false, ptime_given: false, seconds: 0, verbose: false, latency: false,
         ip: "", gateway: "", port: 5004, payload_type: 96, from: None, resample: true, ptp_seed: false, skew_ppm: 0,
-        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0, ptp: true, ptp_l2: false,
+        opus: false, bitrate: 128_000, frame_x10: 200, complexity: 5, group: "", name: "", source: "", adopted_send: false, adopted_receive: false, in_mode: 0, out_mode: 0, in_channels: None, out_channels: None, http: 8000, prebuffer_ms: 0, ptp: true, ptp_l2: false, peer: "", tol_ppm: 100, step_secs: 10,
     };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
@@ -288,6 +294,9 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "complexity" => options.complexity = value.parse().ok().filter(|&c| c <= 10).ok_or("complexity= is 0 to 10")?,
             "http" => options.http = value.parse().ok().filter(|&p| p != 0).ok_or("http= is a TCP port, 1 to 65535")?,
             "prebuffer" => options.prebuffer_ms = value.parse().ok().filter(|&ms| ms <= 1000).ok_or("prebuffer= is 0 to 1000 milliseconds")?,
+            "peer" => options.peer = value,
+            "tol" => options.tol_ppm = bench::parse_percent_ppm(value).ok_or("tol= is a percentage from 0 to 5, like 0.01")?,
+            "stepsecs" => options.step_secs = value.parse().ok().filter(|&s| (2..=60).contains(&s)).ok_or("stepsecs= is 2 to 60 seconds")?,
             "verbose" => options.verbose = true,
             "latency" => options.latency = true,
             "ptp" => {
@@ -1541,6 +1550,10 @@ pub fn run_once(api: &'static TapeApi, mode: &str, options: &Options<'static>) {
     match mode {
         "duplex" => duplex::run(api, options),
         "serve" => serve::serve(api, options),
+        "benchserve" => bench::serve(api, options),
+        "bench" => {
+            bench::master(api, options);
+        }
         "send" if options.opus => opus::send(api, options),
         "recv" if options.opus => opus::receive(api, options),
         "send" => send(api, options),
@@ -1568,7 +1581,7 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
     let mut kept = 0;
     for &word in &words[..count] {
         match word.strip_prefix("mode=").unwrap_or(word) {
-            "send" | "recv" | "duplex" | "list" | "serve" => mode = word.strip_prefix("mode=").unwrap_or(word),
+            "send" | "recv" | "duplex" | "list" | "serve" | "bench" | "benchserve" => mode = word.strip_prefix("mode=").unwrap_or(word),
             _ => {
                 options_words[kept] = word;
                 kept += 1;
@@ -1596,6 +1609,9 @@ pub extern "C" fn tape_main(real: &'static TapeApi) {
             options.proto = Proto::Rtp;
         }
         return peers::list(tape_rt::abort::wrap(real), &options);
+    }
+    if mode == "bench" || mode == "benchserve" {
+        return run_once(tape_rt::abort::wrap(real), mode, &options);
     }
     let by_name = !options.source.is_empty() || (!options.to.is_empty() && net::parse_ip(options.to.split(':').next().unwrap_or("")).is_none() && parse_mac(options.to).is_none());
     println!(
@@ -1649,6 +1665,10 @@ tape_rt::tape_help!(br#"audio-net: audio over the network (raw Ethernet, RTP or 
                     [ch=1-2] [target=MS] [group=239.1.2.3] [codec=pcm|opus]
   tape run audio-net duplex ...     send and receive together
   tape run audio-net serve [http=8000] [bitrate=KBIT]    Ogg Opus over HTTP
+  tape run audio-net benchserve [proto=raw|avtp] [nic=N]   on the far machine
+  tape run audio-net bench peer=NAME|MAC [proto=avtp] [rate=48000] [bits=24]
+                    [ch=1-2] [tol=0.01] [stepsecs=10]   find the lowest
+                    ptime/target both directions carry; only this one runs
   tape run audio-net @audio.cfg     options from a file
   device=N picks the audio device. Escape stops. See AUDIO.md.
 "#);

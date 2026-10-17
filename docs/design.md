@@ -1126,3 +1126,19 @@ runs. New tapes need free FOSFS directory entries (64 per volume; DEFERRED.md pl
 is fetched. FOSFS rewrites a file in place when it still fits, so a power cut mid-write can damage that one tape; run it again.
 Not done: sync of non-tape files, the other disks, automatic or periodic sync. `make test-tapesync` (four machines: same key,
 other key, no key) covers it; the crate's host tests cover SHA-256/HMAC vectors, the manifest and the rules.
+
+### audio-net bench (tapes/audio-net/src/bench.rs, crates/audio-bench)
+
+`audio-net benchserve` on one machine and `audio-net bench peer=NAME|MAC [proto=raw|avtp] [rate= bits= ch=] [tol=PERCENT]
+[stepsecs=N]` on the other (the master, also the panel's T key) find the lowest `ptime=` and `target=` the link carries. The master
+sweeps 125 us ... 2 ms packet times; each step streams numbered packets of the real frame size on an absolute schedule, first
+master to server, then server to master (the larger need of the two counts). The receiver keeps one `i32` per packet (its arrival
+relative to the ideal schedule) and judges them afterwards: the schedule is a line through the minima of half-second windows (absorbs
+the clocks' ppm difference), a packet's lateness is its height above that line, and the smallest ring `target` that leaves at most
+`tol=` (default 0.01 %, 100 ppm) of the packets late or lost is the step's *need*; the *clean* column is the target that leaves none.
+A recommendation is need plus a quarter (at least 250 us), rounded up to whole ms (`target=` takes ms). Control frames are unicast
+ethertype 0x88b5 (`ABN1`: HELLO/STEP/QUERY/REPORT), so no IP is needed; clocks are the PTP clock when both ends lock to the same
+grandmaster, else a four-stamp offset (min round trip of up to 16). Nothing prints while a step runs. Network only: no audio device
+(an end-to-end loopback and stress load are not done). 100 ppm is a glitch about every 10 s at 1 ms packets, so `tol=0` for a
+margin. `make test-audio-bench` (QEMU, e1000: shows drops at 125/250 us, so only the 2 ms steps must be clean); only real hardware
+tells what a given switch and NIC do. The pure part has host tests (`cargo test` in crates/audio-bench).

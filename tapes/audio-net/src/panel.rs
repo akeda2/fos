@@ -470,7 +470,7 @@ fn draw_form(settings: &Settings, selected: usize, editing: bool, info: &AudioIn
     }
     draw_info(settings, message);
     at(5 + ROWS + 4, 1);
-    draw!(" Up/Down or Tab: select   Left/Right or Enter: change   S: start   P: pick a peer\x1b[K");
+    draw!(" Up/Down or Tab: select   Left/Right or Enter: change   S: start   P: pick a peer   T: benchmark\x1b[K");
     at(5 + ROWS + 5, 1);
     draw!(" W: save {CONFIG_FILE}   B: start at boot   Q or Esc: quit\x1b[K");
 }
@@ -586,6 +586,46 @@ fn save_settings(settings: &Settings) -> &'static str {
     } else {
         "Could not write audio.cfg (is the volume full?)."
     }
+}
+
+const BENCH_FILE: &str = "bench.cfg";
+
+/// T: runs the link benchmark against the selected peer (which must be running `audio-net benchserve`), shows the
+/// recommendation and offers to save it as options for `audio-net @bench.cfg`.
+fn run_bench(settings: &Settings, decoder: &mut KeyDecoder) -> &'static str {
+    let real = tape_rt::api();
+    let (_, mut options) = match build(settings) {
+        Ok(found) => found,
+        Err(reason) => return reason,
+    };
+    if options.proto == crate::Proto::Rtp {
+        return "Benchmark: set the Network row to raw Ethernet or AVTP.";
+    }
+    options.peer = if options.to.is_empty() { options.source } else { options.to };
+    options.to = "";
+    draw!("\x1b[2J");
+    at(1, 1);
+    draw!(" fos audio-net: benchmark with {} (it must run `audio-net benchserve`)\n", if options.peer.is_empty() { "-" } else { options.peer });
+    let outcome = crate::bench::master(tape_rt::abort::wrap(real), &options);
+    let mut saved = "";
+    match outcome {
+        Some(found) => tape_rt::println!("\nW: save ptime={} target={} to {BENCH_FILE}   any other key: back", found.ptime_us, found.target_ms),
+        None => tape_rt::println!("\nAny key: back to the settings."),
+    }
+    loop {
+        match next_key(decoder) {
+            None => tape_rt::idle(),
+            Some(Key::Char(b'w' | b'W')) if outcome.is_some() => {
+                let Some(found) = outcome else { break };
+                let mut text = Text::<100>::new();
+                let _ = write!(text, "ptime={} target={}\n", found.ptime_us, found.target_ms);
+                saved = if (real.fs_write)(BENCH_FILE.as_ptr(), BENCH_FILE.len(), text.as_str().as_ptr(), text.as_str().len()) == 0 { "Saved bench.cfg: `audio-net @audio.cfg @bench.cfg` uses it." } else { "Could not write bench.cfg." };
+                break;
+            }
+            Some(_) => break,
+        }
+    }
+    saved
 }
 
 /// B: make the machine start streaming at boot, with a `start` file running the saved configuration.
@@ -1387,6 +1427,12 @@ pub fn run(real: &'static TapeApi) {
                 Key::Char(b'b') | Key::Char(b'B') => {
                     message = toggle_boot(&settings);
                     dirty.info = true;
+                }
+                Key::Char(b't') | Key::Char(b'T') => {
+                    presence.stop(false);
+                    message = run_bench(&settings, &mut decoder);
+                    info = read_audio_info();
+                    dirty.full = true;
                 }
                 Key::Char(b'q') | Key::Char(b'Q') => quit = true,
                 ref other if is_escape(other) => quit = true,

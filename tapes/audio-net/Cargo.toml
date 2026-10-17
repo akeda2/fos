@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 tape-rt = { path = "../../crates/tape-rt" }
 audio-wire = { path = "../../crates/audio-wire" }
+audio-bench = { path = "../../crates/audio-bench" }
 tape-panel = { path = "../../crates/tape-panel" }
 tape-net = { path = "../../crates/tape-net" }
 tape-ip = { path = "../../crates/tape-ip" }

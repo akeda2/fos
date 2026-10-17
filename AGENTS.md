@@ -214,6 +214,7 @@ maintainer's memory notes, not in this repository.
   "no FOSFS data partition" in `dmesg` means the A/B fallback reverted it. `bootcode` can replace the BIOS boot code and the UEFI
   loader without a stick rewrite (both verified on real machines). `debug video skip` plus `reboot` shows the VGA text console.
 - **Tape sync**: `tapesync [HOST] [apply]` pulls newer tapes (from HOST or every peer) between machines that share a `synckey` file; tapes carry a `.fos_build` stamp added by `tools/stamp_tape.py`, so deploy `build/fosfor/tapes/NAME`, not the cargo output (`docs/design.md`, `make test-tapesync`).
+- **`audio-net bench`** (`benchserve` on the far machine; panel key T) finds the lowest ptime/target a link carries: `crates/audio-bench`, `tapes/audio-net/src/bench.rs`, `make test-audio-bench`; method in `docs/design.md`.
 - **Open work** is in `DEFERRED.md` ("Open after the 2026-10-09 session").
 
 - **Hostnames**: every machine broadcasts its name (`hostname` file + NIC number, else `fos-` + last 3 MAC bytes) at boot and every
