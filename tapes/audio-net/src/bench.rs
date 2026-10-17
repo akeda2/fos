@@ -484,7 +484,7 @@ fn summary(options: &Options<'static>, rows: &[Row]) -> Option<Outcome> {
         println!("Without a single late packet: ptime={ptime} target={target}  (about {} us)", audio_bench::delay_us(ptime, target));
     }
     if options.tol_ppm >= 100 {
-        println!("Note: {} ppm is a late or lost packet about every {} s at 1 ms packets; run tol=0 for a margin.", options.tol_ppm, 1_000_000 / options.tol_ppm.max(1));
+        println!("Note: {} ppm is a late or lost packet about every {} s at 1 ms packets; run tol=0 for a margin.", options.tol_ppm, 1_000_000 / options.tol_ppm.max(1) / 1000);
     }
     let (ptime_us, target_ms) = tolerant?;
     Some(Outcome { ptime_us, target_ms })
