@@ -516,6 +516,10 @@ extern "C" fn api_nic_counters(index: usize, out: *mut u64, count: usize) -> usi
     }
     term::nic_counters(index, unsafe { core::slice::from_raw_parts_mut(out, count) })
 }
+static mut FP_LEVEL: u32 = 0;
+extern "C" fn api_fp_level() -> u32 {
+    unsafe { FP_LEVEL }
+}
 extern "C" fn api_nic_tx_offload(index: usize, on: u32) -> u32 {
     u32::from(term::nic_tx_offload(index, on != 0))
 }
@@ -724,10 +728,12 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_vlan_filter: api_nic_vlan_filter,
         nic_tx_offload: api_nic_tx_offload,
         nic_counters: api_nic_counters,
+        fp_level: api_fp_level,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
     crate::debug::set_tape_running(true);
+    unsafe { FP_LEVEL = crate::cpu::fp_enable() };
     unsafe {
         // Switch to the tape's stack for the call, then back. r12/r13 are callee-saved,
         // so the tape preserves them: r13 keeps our stack pointer across the call.
@@ -743,6 +749,8 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
             clobber_abi("C"),
         );
     }
+    crate::cpu::fp_disable();
+    unsafe { FP_LEVEL = 0 };
     crate::debug::set_tape_running(false);
     crate::uart::close_all();
     crate::audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an audio stream running

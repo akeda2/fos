@@ -75,6 +75,94 @@ pub fn write_cr3(value: u64) {
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags)) };
 }
 
+pub fn read_cr4() -> u64 {
+    let value: u64;
+    unsafe { core::arch::asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+fn write_cr4(value: u64) {
+    unsafe { core::arch::asm!("mov cr4, {}", in(reg) value, options(nostack, preserves_flags)) };
+}
+
+fn xgetbv0() -> u64 {
+    let (low, high): (u32, u32);
+    unsafe { core::arch::asm!("xgetbv", in("ecx") 0, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)) };
+    u64::from(high) << 32 | u64::from(low)
+}
+
+fn xsetbv0(value: u64) {
+    unsafe { core::arch::asm!("xsetbv", in("ecx") 0, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nomem, nostack, preserves_flags)) };
+}
+
+const CR0_MP: u64 = 1 << 1;
+const CR0_EM: u64 = 1 << 2;
+const CR0_TS: u64 = 1 << 3;
+const CR4_OSFXSR: u64 = 1 << 9;
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
+const CR4_OSXSAVE: u64 = 1 << 18;
+const XCR0_X87_SSE_AVX: u64 = 0b111;
+
+/// What `fp_enable` changed, so `fp_disable` can put it back (CR0, CR4, XCR0), and the level it reached.
+static mut FP_SAVED: Option<(u64, u64, u64)> = None;
+
+/// Switches on the floating point a hard-float tape (target `x86_64-fos-tape-fp`) needs and returns the level
+/// (`fosfor_abi::tape::FP_*`). The kernel itself is built without SSE and never touches XMM/YMM state, so nothing here
+/// has to be saved or restored around an interrupt: the state belongs to the tape that runs, one at a time.
+///
+/// Why each bit: CR4.OSFXSR lets SSE instructions run and CR4.OSXMMEXCPT routes an SIMD fault to #XM (they are masked
+/// anyway); without them every SSE instruction is #UD. CR0.EM must be clear (it would make them #NM), CR0.MP set and
+/// CR0.TS clear (no lazy-switch trap). AVX needs more: CR4.OSXSAVE, then XCR0 = x87|SSE|AVX through `xsetbv`; the CPU
+/// only runs VEX instructions when both say so. AVX2 and FMA come from CPUID, and the level is only `FP_AVX2` when
+/// `xgetbv` reads the YMM bit back. `fninit` and MXCSR 0x1f80 (all exceptions masked, round to nearest) give the tape the
+/// state the ABI promises. Called before every tape starts, so the tape's first instruction may already use an XMM register.
+pub fn fp_enable() -> u32 {
+    use fosfor_abi::tape::{FP_AVX2, FP_NONE, FP_SSE2};
+    let (_, _, ecx, edx) = cpuid(1, 0);
+    // FXSR (bit 24) and SSE2 (bit 26) are in every x86-64 CPU; a hypervisor that hides them gets no floating point.
+    if edx & (1 << 24) == 0 || edx & (1 << 26) == 0 {
+        return FP_NONE;
+    }
+    fp_disable(); // a second call must not record the already-enabled state as the original
+    let (cr0, cr4) = (read_cr0(), read_cr4());
+    let mut saved_xcr0 = 0;
+    let mut level = FP_SSE2;
+    let mut new_cr4 = cr4 | CR4_OSFXSR | CR4_OSXMMEXCPT;
+    let xsave_and_avx = ecx & (1 << 26) != 0 && ecx & (1 << 28) != 0;
+    if xsave_and_avx {
+        new_cr4 |= CR4_OSXSAVE;
+    }
+    write_cr0((cr0 & !(CR0_EM | CR0_TS)) | CR0_MP);
+    write_cr4(new_cr4);
+    if xsave_and_avx {
+        saved_xcr0 = xgetbv0();
+        xsetbv0(saved_xcr0 | XCR0_X87_SSE_AVX);
+        let (max_leaf, ..) = cpuid(0, 0);
+        let avx2 = max_leaf >= 7 && cpuid(7, 0).1 & (1 << 5) != 0;
+        let fma = ecx & (1 << 12) != 0;
+        if avx2 && fma && xgetbv0() & XCR0_X87_SSE_AVX == XCR0_X87_SSE_AVX {
+            level = FP_AVX2;
+        }
+    }
+    unsafe {
+        FP_SAVED = Some((cr0, cr4, saved_xcr0));
+        core::arch::asm!("fninit", options(nomem, nostack));
+        let mxcsr: u32 = 0x1f80;
+        core::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(readonly, nostack, preserves_flags));
+    }
+    level
+}
+
+/// Undoes `fp_enable` (a tape that ended): XCR0 first (it needs CR4.OSXSAVE), then CR4 and CR0 as they were.
+pub fn fp_disable() {
+    let Some((cr0, cr4, xcr0)) = (unsafe { (*(&raw mut FP_SAVED)).take() }) else { return };
+    if read_cr4() & CR4_OSXSAVE != 0 {
+        xsetbv0(xcr0);
+    }
+    write_cr4(cr4);
+    write_cr0(cr0);
+}
+
 pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
     (result.eax, result.ebx, result.ecx, result.edx)

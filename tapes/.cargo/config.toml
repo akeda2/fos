@@ -11,3 +11,8 @@ json-target-spec = true
 
 [target.x86_64-fos-tape]
 rustflags = ["-C", "link-arg=-T../tape.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]
+
+# The hard-float target for tapes that do DSP (`tapes/NAME/.cargo/config.toml` points `build.target` at it). The kernel
+# turns SSE on before such a tape starts (`TapeApi::fp_level`); only these tapes may use XMM registers.
+[target.x86_64-fos-tape-fp]
+rustflags = ["-C", "link-arg=-T../tape.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]

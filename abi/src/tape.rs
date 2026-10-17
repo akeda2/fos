@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`.
-pub const TAPE_API_VERSION: u32 = 15;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`.
+pub const TAPE_API_VERSION: u32 = 16;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -250,7 +250,20 @@ pub struct TapeApi {
     /// 6 PAUSE (XOFF) frames received, 7 PAUSE frames sent, 8 frames the kernel's tape queue dropped. Values 2-7 are 0 on a
     /// card without these counters; all but 0 and 1 are running totals since boot, so take two snapshots and subtract.
     pub nic_counters: extern "C" fn(usize, *mut u64, usize) -> usize,
+    /// `fp_level()` (version 16): what floating point the kernel switched on for this tape, `FP_*`. The kernel does it before
+    /// the tape's entry runs (a hard-float build may use an XMM register in its very first instruction, so a call made from
+    /// the tape would come too late) and undoes it when the tape ends. Only a tape built for `x86_64-fos-tape-fp` may use
+    /// SSE; a soft-float tape never notices. The kernel itself stays soft-float and never touches XMM/YMM, so the state is
+    /// the tape's alone. A tape that wants AVX2 or FMA checks for `FP_AVX2` first (an `#[target_feature]` function, never
+    /// the baseline build), and falls back to the SSE2 code otherwise.
+    pub fp_level: extern "C" fn() -> u32,
 }
+
+/// `fp_level` returns: no SSE state enabled, SSE2 (every x86-64 CPU; `f32`/`f64` in XMM registers), or AVX2 with FMA (the
+/// OS has enabled YMM state through XCR0 as well).
+pub const FP_NONE: u32 = 0;
+pub const FP_SSE2: u32 = 1;
+pub const FP_AVX2: u32 = 2;
 
 /// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.
 pub const SERIAL_8N1: u32 = 0x03;

@@ -924,6 +924,17 @@ groups swept, only the joined one arrived. Only real hardware can confirm the ta
 getting UDP PTP (frames injected from a host arrived, the switch's group table never listed the card); with snooping off,
 82579V and I350 work as slave and master over UDP.
 
+**Hard-float tapes (ABI 16).** The kernel and ordinary tapes are soft-float (no SSE). A tape that does DSP is built for
+`targets/x86_64-fos-tape-fp.json` (SSE2 baseline; the crate's `.cargo/config.toml` sets `build.target`, the output lands in
+`build/cargo-target/x86_64-fos-tape-fp/`, and the Makefile's `FP_TAPES` lists them). `cpu::fp_enable` runs *before* the tape's entry,
+not on request: a hard-float build may use an XMM register in its first instruction, so a call from `tape_main` would come too late.
+It sets CR4.OSFXSR/OSXMMEXCPT, clears CR0.EM/TS, sets MP, and where CPUID has XSAVE, AVX, AVX2 and FMA sets CR4.OSXSAVE and XCR0 =
+x87|SSE|AVX (read back with `xgetbv` before it claims AVX2); `fninit` and MXCSR 0x1f80 give a clean state. `fp_level()` tells the tape
+`FP_SSE2` or `FP_AVX2` (`tape_rt::fp_level`); AVX2/FMA code lives in `#[target_feature(enable = "avx2,fma")]` functions chosen at run
+time. `fp_disable` restores CR0, CR4 and XCR0 when the tape ends. No XMM/YMM state is saved anywhere: the kernel never uses it and runs one
+tape at a time. A soft-float tape is unaffected. `tapes/fpcheck` and `make test-fp` (QEMU default CPU: level 1; `-cpu max`: level 2).
+Verified on real hardware: skylake and rack (AVX2 + FMA, level 2).
+
 **NIC counters in the nettest report (ABI 15).** `nic_counters(nic, out, count)` fills a u64 array: negotiated Mbit/s, duplex,
 then running totals of missed packets, no-buffer events, CRC and symbol errors, PAUSE (XOFF) frames received and sent, and frames the
 kernel's tape queue dropped (the statistics registers clear on read, so `e1000.rs` `error_counters` adds each read to a total). The
