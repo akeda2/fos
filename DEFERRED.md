@@ -499,4 +499,7 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - `ltas` is tested in QEMU (silence in) and by hand on laptop1 (UFX channels, smoothed curves, avg off). Not checked on hardware:
   blit speed on a write-combining framebuffer, AVX2 FFT speed, USB capture with HD Audio playback, saving to a real stick, RTC stamps.
   Two USB interfaces at once are done (QEMU: two usb-audio playing in turn; real hardware untested). Not done: a standalone `noise` tape, a test of the `t` avg-off
-  setting. skylake3 and rack3 still run the older `ltas`. landsbro's scheduled `gb -of fos` runs at 12:13/14:13/16:14 failed (exit 2), not investigated.
+  setting. All hosts run the refactored `ltas` (0d7ac6b). landsbro's scheduled `gb -of fos` runs at 12:13/14:13/16:14 failed (exit 2), not investigated.
+- Next: a goniometer tape with Nordic scale meters on `crates/audio-screen`, `gfx::plot`, `audio_wire::meter` (`Input::read_pair`
+  is there for the channel pair). Mid/side, phosphor persistence and correlation are not written. `make test-all` (landsbro) has not
+  run since the USB-units, simd and shared-crate changes; clock1's PTP after the last reset was not looked at.
