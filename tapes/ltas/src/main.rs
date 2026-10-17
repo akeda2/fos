@@ -503,7 +503,7 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
         }
         canvas.text(x + 16, 24, text.as_str(), view::TEXT);
     }
-    canvas.text(layout.left, layout.height as i32 - 18, "space freeze  r reset  v res  w window  a weight  n size  t avg  g gen  Esc quit", view::DIM);
+    canvas.text(layout.left, layout.height as i32 - 18, "space freeze  r reset  v res  m smooth  w win  a weight  n size  t avg  , . chan  s save  g gen  +- lvl  f tone  b burst  Esc", view::DIM);
     if !message.is_empty() {
         canvas.text_right(layout.left + layout.plot_w as i32, 6, message, view::EXP);
     }
