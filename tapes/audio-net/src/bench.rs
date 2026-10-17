@@ -322,12 +322,16 @@ fn run_master(ctx: &mut Ctx, options: &Options<'static>, quiet: bool) -> Option<
     ctx.session = (tape_rt::micros() as u16) | 1;
 
     // Clock offset: the sample with the shortest round trip (the others queued somewhere). With PTP here, keep asking
-    // (up to 12 s) until the server answers locked too: it starts its clock on the first HELLO.
+    // (up to 30 s) until the server answers locked too: it starts its clock on the first HELLO and needs a while to lock.
     let want_ptp = options.ptp && clock::locked();
     let mut best: Option<(i64, i64)> = None;
     let mut grandmaster: Option<[u8; 8]> = None;
     let mut answers = 0;
-    for _ in 0..40 {
+    for attempt in 0..100 {
+        // 12 s to hear the server at all; the rest only while waiting for its grandmaster.
+        if attempt >= 40 && !(want_ptp && answers > 0) {
+            break;
+        }
         ctx.seq += 1;
         let t1 = tape_rt::micros();
         let length = audio_bench::hello(&mut ctx.tx, peer, ctx.mac, ctx.session, ctx.seq, t1);
@@ -361,6 +365,10 @@ fn run_master(ctx: &mut Ctx, options: &Options<'static>, quiet: bool) -> Option<
     let ptp = options.ptp && clock::locked() && grandmaster.is_some() && grandmaster == clock::grandmaster();
     let offset_us = if ptp { 0 } else { offset };
     println!("Peer answers: round trip {round_trip} us; clocks: {}.", if ptp { "PTP, same grandmaster" } else { "measured offset (no shared PTP clock; absolute delays are rough)" });
+    if options.ptp && !ptp {
+        println!("WARNING: no shared PTP clock, so the needs below are too high; do not trust them.");
+        println!("  Let both ends lock to one grandmaster (about 30 s), then rerun.");
+    }
 
     let mut rows = [Row { per_packet: 0, up: None, down: None }; PTIMES_US.len()];
     let mut step = 0u16;
@@ -375,6 +383,8 @@ fn run_master(ctx: &mut Ctx, options: &Options<'static>, quiet: bool) -> Option<
         let frame_len = (14 + header + per_packet * channels * bits / 8).max(60) as u16;
         for master_sends in [true, false] {
             step += 1;
+            // Two free-running clocks drift apart (up to ~150 ppm, ~1.5 ms per 10 s), so a stale offset inflates the needs.
+            let offset_us = if ptp { 0 } else { remeasure_offset(ctx, peer).unwrap_or(offset_us) };
             let destination = if master_sends || destination[0] & 1 != 0 { destination } else { ctx.mac };
             let params = Params { step, master_sends, ethertype: ctx.ethertype, destination, frame_len, period_ns, secs, tolerance_ppm: options.tol_ppm, offset_us: if master_sends { offset_us } else { -offset_us }, ptp };
             let label = if master_sends { "up  " } else { "down" };
@@ -407,6 +417,33 @@ fn run_master(ctx: &mut Ctx, options: &Options<'static>, quiet: bool) -> Option<
         println!();
     }
     summary(options, &rows)
+}
+
+/// The clock offset again, from the shortest round trip of a few HELLOs (the master and the peer read `micros()`).
+fn remeasure_offset(ctx: &mut Ctx, peer: [u8; 6]) -> Option<i64> {
+    let mut best: Option<(i64, i64)> = None;
+    for _ in 0..8 {
+        ctx.seq += 1;
+        let t1 = tape_rt::micros();
+        let length = audio_bench::hello(&mut ctx.tx, peer, ctx.mac, ctx.session, ctx.seq, t1);
+        ctx.send(length);
+        let until = tape_rt::micros() + 100_000;
+        while tape_rt::micros() < until && !ctx.aborted() {
+            if let Event::HelloReply { seq, t1, t2, t3, t4, .. } = ctx.poll(None, &mut None) {
+                if seq == ctx.seq {
+                    let round_trip = (t4 as i64 - t1 as i64) - (t3 as i64 - t2 as i64);
+                    let offset = ((t2 as i64 - t1 as i64) + (t3 as i64 - t4 as i64)) / 2;
+                    if best.is_none_or(|(rtt, _)| round_trip < rtt) {
+                        best = Some((round_trip, offset));
+                    }
+                    break;
+                }
+            } else {
+                tape_rt::idle();
+            }
+        }
+    }
+    best.map(|(_, offset)| offset)
 }
 
 fn run_step(ctx: &mut Ctx, peer: [u8; 6], params: &Params) -> Option<StepResult> {
