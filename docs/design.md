@@ -1094,6 +1094,12 @@ download. The modem-status interrupt endpoint is not read: CTS/DSR/DCD/RI read a
 EHCI behind an Intel hub, to skylake's `serial-shell`): `run fterm 1 115200 8n1` showed skylake's `help`, `uptime`, `debug status` and `ls`.
 Also verified on skylake's xHCI controller (full speed, firmware download, attach, bulk OUT, queued bulk IN; the adapter's d-sub wired to skylake's own COM1 gave a console feedback loop: 112904 bytes received, no errors). `usb` shows how many IN transfers completed. Not verified: unplug/replug, rates other than 115200, parity, the adapter against a second machine (a test against amd's COM1 got nothing; its port may be off). QEMU has no TUSB3410.
 
+The Prolific PL2303 (067b:2303, `usb_serial_pl2303.rs`) needs no firmware: `attach` runs the vendor handshake (reads 0x8484/0x8383, writes 0x0404,
+(0,1), (1,0), (2,0x44)), `open` sets the line coding (class request 0x20) and DTR/RTS (0x22), break is SEND_BREAK (0x23). The HX/TA init is assumed;
+bcdDevice is not read, so the older PL2303 (non-HX) variants are untried. Verified on real hardware (rack's xHCI, full speed; the d-sub on skylake's COM1
+console): `run fterm 1 115200` on rack showed skylake's whole boot log (5805 bytes), and typing `ver` from fterm reached skylake's shell, which answered.
+Not verified: unplug/replug, other baud rates and formats, modem-status lines.
+
 ### USB-MIDI (kernel/src/usb_midi.rs)
 
 Class-compliant MIDIStreaming interfaces (audio class 1, subclass 3) on xHCI, directly on a root port or behind a hub: `usb_hid::probe_device` finds one

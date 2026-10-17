@@ -48,7 +48,7 @@ pub trait Chip: Sync {
     fn set_break(&self, pipe: &mut Pipe, on: bool);
 }
 
-static CHIPS: [&dyn Chip; 1] = [&crate::usb_serial_ti::Ti];
+static CHIPS: [&dyn Chip; 2] = [&crate::usb_serial_ti::Ti, &crate::usb_serial_pl2303::Pl2303];
 
 #[derive(Clone, Copy)]
 enum Link {
@@ -79,6 +79,20 @@ impl Pipe {
             Link::Ehci { controller, target, .. } => ehci::controller(controller).is_some_and(|c| c.control_transfer(&target, 0x40, request, value, index, &mut copy[..length]).is_ok()),
             Link::Xhci { controller, device } => xhci::controller(controller).is_some_and(|c| c.control_transfer(&device, 0x40, request, value, index, &mut copy[..length]).is_ok()),
         }
+    }
+
+    /// Any control request to the device (`kind` is bmRequestType: 0x40 vendor out, 0xc0 vendor in, 0x21 class out). `data`
+    /// is sent, or filled, for at most 64 bytes.
+    pub fn control(&mut self, kind: u8, request: u8, value: u16, index: u16, data: &mut [u8]) -> bool {
+        let length = data.len().min(64);
+        let mut copy = [0u8; 64];
+        copy[..length].copy_from_slice(&data[..length]);
+        let ok = match self.link {
+            Link::Ehci { controller, target, .. } => ehci::controller(controller).is_some_and(|c| c.control_transfer(&target, kind, request, value, index, &mut copy[..length]).is_ok()),
+            Link::Xhci { controller, device } => xhci::controller(controller).is_some_and(|c| c.control_transfer(&device, kind, request, value, index, &mut copy[..length]).is_ok()),
+        };
+        data[..length].copy_from_slice(&copy[..length]);
+        ok
     }
 
     /// Sends `data` (at most 2048 bytes) on the bulk OUT endpoint. Returns how many bytes went.

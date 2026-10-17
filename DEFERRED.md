@@ -412,10 +412,10 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
   several cables per device are not done (cable 0, 1-3 byte messages only).
 - **X-Touch Compact (Mackie Control)**: `crates/mackie` (fader/button/V-Pot messages) and a `crates/mixer` model for the recorder's
   input/output levels; not started, hardware not yet tried.
-- **USB serial adapters**: the generic layer and the Moxa UPort 1110 (TI TUSB3410) driver are done (`docs/design.md`, "USB serial adapters").
+- **USB serial adapters**: the generic layer and the Moxa UPort 1110 (TI TUSB3410) and Prolific PL2303 drivers are done (`docs/design.md`, "USB serial adapters").
   Open: unplug/replug is untested on hardware (EHCI and xHCI receive/transmit are verified); the TI modem-status interrupt endpoint is unread; `serial-shell` on a USB
-  port; the firmware is only looked for when the adapter is probed (boot probing precedes the volumes, so `usb rescan` is needed once); more
-  chips (FTDI, CP210x, CH341, PL2303, CDC-ACM) would each be one `impl Chip`; a QEMU test needs a chip QEMU emulates (`usb-serial` is FTDI).
+  port; the firmware is only looked for when the adapter is probed (boot probing precedes the volumes, so `usb rescan` is needed once); PL2303 type detection (only the HX/TA init is used); more
+  chips (FTDI, CP210x, CH341, CDC-ACM) would each be one `impl Chip`; a QEMU test needs a chip QEMU emulates (`usb-serial` is FTDI).
 - **`usb_midi::release`** does not free the device's buffer page (small leak on unplug).
 - **Lesson**: a blocking shell loop must call `drain_nics`, or a `term net` client's Escape never arrives and the machine looks hung.
 
