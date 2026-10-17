@@ -64,6 +64,7 @@ def main():
         else:
             check(False, "QEMU's WAV backend recorded the stream", "no wav file")
     play_tapes_test()
+    two_devices_test()
     print("usb audio: all checks passed")
 
 
@@ -95,6 +96,31 @@ def segments(samples, rate):
     if start is not None:
         result.append((start, last))
     return result
+
+
+def tone_hz(path):
+    with wave.open(str(path)) as recording:
+        rate, channels, count = recording.getframerate(), recording.getnchannels(), recording.getnframes()
+        samples = struct.unpack(f"<{count * channels}h", recording.readframes(count))[::channels]
+    loud = [value for value in samples if abs(value) > 500]
+    crossings = sum(1 for a, b in zip(loud, loud[1:]) if a < 0 <= b)
+    return len(loud) / rate, crossings * rate / max(len(loud), 1)
+
+
+def two_devices_test():
+    """Two USB audio devices at once: each is listed, picked and played on its own (QEMU's usb-audio is output-only)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        first, second = Path(tmp) / "one.wav", Path(tmp) / "two.wav"
+        extra = ["-device", "qemu-xhci,id=xhci", "-audiodev", f"wav,id=a,path={first}", "-device", "usb-audio,audiodev=a",
+                 "-audiodev", f"wav,id=b,path={second}", "-device", "usb-audio,audiodev=b"]
+        text = boot_with_commands(extra, ["usb rescan", "audio", "audio device 2", "audio tone 880 2", "audio device 1", "audio tone 440 2",
+                                          "audio device 2", "audio"])
+        listing = text.split("usb rescan")[-1].split("audio device 2")[0]
+        check(len(re.findall(r"USB audio on xHCI port", listing)) == 2, "both USB audio devices are listed, each with its port", listing[-800:])
+        check(text.count("0 errors") >= 2, "each plays without transfer errors", text[-1500:])
+        for path, wanted, name in ((first, 440, "device 1"), (second, 880, "device 2")):
+            seconds, hz = tone_hz(path) if path.exists() and path.stat().st_size > 44 else (0, 0)
+            check(seconds > 1 and abs(hz - wanted) < wanted * 0.06, f"{name} recorded its own tone ({seconds:.1f} s at {hz:.0f} Hz, wanted {wanted})", "")
 
 
 def play_tapes_test():

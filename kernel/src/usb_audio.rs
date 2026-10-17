@@ -571,28 +571,54 @@ struct AudioDevice {
     playback: Option<Stream>,
 }
 
-static mut DEVICE: Option<AudioDevice> = None;
+/// How many USB audio devices can be kept at once ("units", numbered from 0 in the order they were attached). Each has its own
+/// streams and picked modes, so one can capture while another plays.
+pub const UNITS: usize = 2;
 
-fn audio() -> Option<&'static mut AudioDevice> {
-    unsafe { (*core::ptr::addr_of_mut!(DEVICE)).as_mut() }
+static mut DEVICES: [Option<AudioDevice>; UNITS] = [const { None }; UNITS];
+
+fn audio(unit: usize) -> Option<&'static mut AudioDevice> {
+    unsafe { (*core::ptr::addr_of_mut!(DEVICES)).get_mut(unit)?.as_mut() }
+}
+
+/// The units that hold a device.
+fn units() -> impl Iterator<Item = usize> {
+    (0..UNITS).filter(|&unit| audio(unit).is_some())
+}
+
+/// The unit for a device attaching on an xHCI controller: the one that holds the same port (the device was unplugged and came
+/// back; its old entry is dead), else a free one.
+fn xhci_unit(controller_index: usize, new: &Device) -> Option<usize> {
+    let same = units().find(|&unit| match audio(unit).map(|device| device.bus) {
+        Some(Bus::Xhci { controller_index: index, device, .. }) => index == controller_index && (device.port, device.route, device.tier) == (new.port, new.route, new.tier),
+        _ => false,
+    });
+    same.or_else(|| (0..UNITS).find(|&unit| audio(unit).is_none()))
 }
 
 /// Keeps an audio device after enumeration (its slot stays open) and reads its sample rates.
 pub fn attach(controller: &mut Controller, device: Device, description: Description, configuration_value: u8) -> bool {
-    if audio().is_some() || controller.set_configuration(&device, configuration_value).is_err() {
+    let Some(unit) = xhci_unit(controller.index, &device) else {
+        crate::println!("USB audio: {UNITS} audio devices are already attached; this one is ignored.");
+        return false;
+    };
+    if controller.set_configuration(&device, configuration_value).is_err() {
         return false;
     }
     let bus = Bus::Xhci { controller_index: controller.index, controller: (controller.pci.bus, controller.pci.device, controller.pci.function), device };
-    install(bus, Host::Xhci(controller, device), description);
+    install(unit, bus, Host::Xhci(controller, device), description);
     true
 }
 
 /// The same for a device behind an EHCI controller. Only high-speed devices stream (a full-speed isochronous endpoint behind a
-/// hub needs split isochronous descriptors, which this driver does not build).
+/// hub needs split isochronous descriptors, which this driver does not build). The controller has one iTD ring per direction,
+/// so a second device on the same EHCI controller is refused (put it on another controller, or on xHCI).
 pub fn attach_ehci(controller: &mut ehci::Controller, controller_index: usize, target: ehci::Target, description: Description, configuration_value: u8) -> bool {
-    if audio().is_some() {
+    let busy = units().any(|unit| matches!(audio(unit).map(|device| device.bus), Some(Bus::Ehci { controller_index: index, .. }) if index == controller_index));
+    let Some(unit) = (0..UNITS).find(|&unit| audio(unit).is_none()).filter(|_| !busy) else {
+        crate::println!("USB audio: no free slot for another device here (one per EHCI controller, {UNITS} in all); this one is ignored.");
         return false;
-    }
+    };
     if target.speed != ehci::Speed::High {
         crate::println!("USB audio: a full- or low-speed device on EHCI needs split isochronous transfers, which are not supported.");
         return false;
@@ -604,11 +630,11 @@ pub fn attach_ehci(controller: &mut ehci::Controller, controller_index: usize, t
     if controller.set_configuration(&target, configuration_value).is_err() {
         return false;
     }
-    install(Bus::Ehci { controller_index, target }, Host::Ehci(controller, target), description);
+    install(unit, Bus::Ehci { controller_index, target }, Host::Ehci(controller, target), description);
     true
 }
 
-fn install(bus: Bus, mut host: Host, description: Description) {
+fn install(unit: usize, bus: Bus, mut host: Host, description: Description) {
     let mut rates = [0u32; 8];
     let mut rate_count = 0;
     let add = |rate: u32, rates: &mut [u32; 8], count: &mut usize| {
@@ -651,18 +677,33 @@ fn install(bus: Bus, mut host: Host, description: Description) {
         }
     }
     unsafe {
-        DEVICE = Some(AudioDevice { bus, description, rates, rate_count, capture: None, playback: None });
+        (*core::ptr::addr_of_mut!(DEVICES))[unit] = Some(AudioDevice { bus, description, rates, rate_count, capture: None, playback: None });
+        (*core::ptr::addr_of_mut!(SELECTED))[unit] = [None, None];
     }
 }
 
-pub fn present() -> bool {
-    audio().is_some()
+pub fn present(unit: usize) -> bool {
+    audio(unit).is_some()
 }
 
-/// The device's alternate setting for a direction, if it has one.
-/// The mode (alternate setting, by index into the description) the user picked for capture and for playback; None picks
-/// automatically. Set by `select`.
-static mut SELECTED: [Option<usize>; 2] = [None, None];
+/// Where a unit is attached, for `audio` listings: "USB audio on xHCI port 3" or "USB audio on EHCI 00:1a.0".
+pub fn label(unit: usize) -> impl core::fmt::Display {
+    struct Label(Option<Bus>);
+    impl core::fmt::Display for Label {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            match self.0 {
+                Some(Bus::Xhci { device, .. }) => write!(f, "USB audio on xHCI port {}", device.path()),
+                Some(Bus::Ehci { controller_index, target }) => write!(f, "USB audio on EHCI {controller_index}, address {}", target.address),
+                None => write!(f, "USB audio"),
+            }
+        }
+    }
+    Label(audio(unit).map(|device| device.bus))
+}
+
+/// The mode (alternate setting, by index into the description) the user picked for capture and for playback, per unit; None
+/// picks automatically. Set by `select`.
+static mut SELECTED: [[Option<usize>; 2]; UNITS] = [[None, None]; UNITS];
 
 fn direction(capture: bool) -> usize {
     usize::from(!capture)
@@ -684,10 +725,10 @@ fn offers(device_rates: &[u32], class_version: u8, alt: &StreamAlt, rate: u32) -
 
 /// The mode to start at `rate`: the one the user picked (it must offer the rate), else the best that does: most channels,
 /// then most bits.
-fn choose_alt(device: &AudioDevice, capture: bool, rate: u32) -> Result<StreamAlt, &'static str> {
+fn choose_alt(unit: usize, device: &AudioDevice, capture: bool, rate: u32) -> Result<StreamAlt, &'static str> {
     let rates = &device.rates[..device.rate_count];
     let class = device.description.class_version;
-    if let Some(index) = unsafe { (*core::ptr::addr_of!(SELECTED))[direction(capture)] } {
+    if let Some(index) = unsafe { (*core::ptr::addr_of!(SELECTED))[unit][direction(capture)] } {
         let alt = device.description.alts[index];
         return if offers(rates, class, &alt, rate) { Ok(alt) } else { Err("the chosen mode does not offer that sample rate (`audio modes` lists what each offers)") };
     }
@@ -702,10 +743,10 @@ fn choose_alt(device: &AudioDevice, capture: bool, rate: u32) -> Result<StreamAl
 }
 
 /// The mode a tape sees before it has started anything: the picked one, else the best at 48 kHz (or at any rate).
-fn default_alt(device: &AudioDevice, capture: bool) -> Option<StreamAlt> {
+fn default_alt(unit: usize, device: &AudioDevice, capture: bool) -> Option<StreamAlt> {
     let rates = &device.rates[..device.rate_count];
     let class = device.description.class_version;
-    if let Some(index) = unsafe { (*core::ptr::addr_of!(SELECTED))[direction(capture)] } {
+    if let Some(index) = unsafe { (*core::ptr::addr_of!(SELECTED))[unit][direction(capture)] } {
         return Some(device.description.alts[index]);
     }
     modes(&device.description, capture).max_by_key(|(_, alt)| (offers(rates, class, alt, 48_000), alt.channels, alt.bits)).map(|(_, alt)| *alt)
@@ -713,22 +754,22 @@ fn default_alt(device: &AudioDevice, capture: bool) -> Option<StreamAlt> {
 
 /// `mode` is the 1-based number `audio modes` shows for that direction; 0 means automatic. It applies to the next start (a
 /// running stream keeps its mode).
-pub fn select(capture: bool, mode: u32) -> Result<(), &'static str> {
-    let device = audio().ok_or("no USB audio device")?;
+pub fn select(unit: usize, capture: bool, mode: u32) -> Result<(), &'static str> {
+    let device = audio(unit).ok_or("no USB audio device")?;
     let index = if mode == 0 {
         None
     } else {
         Some(modes(&device.description, capture).nth(mode as usize - 1).map(|(index, _)| index).ok_or("no such mode (`audio modes` lists them)")?)
     };
-    unsafe { (*core::ptr::addr_of_mut!(SELECTED))[direction(capture)] = index };
+    unsafe { (*core::ptr::addr_of_mut!(SELECTED))[unit][direction(capture)] = index };
     Ok(())
 }
 
 /// `audio modes`: what the device offers in each direction, numbered, with the picked one marked.
-pub fn print_modes() {
-    let Some(device) = audio() else { return crate::println!("No USB audio device.") };
+pub fn print_modes(unit: usize) {
+    let Some(device) = audio(unit) else { return crate::println!("No USB audio device.") };
     for (capture, name) in [(false, "Playback"), (true, "Capture")] {
-        let picked = unsafe { (*core::ptr::addr_of!(SELECTED))[direction(capture)] };
+        let picked = unsafe { (*core::ptr::addr_of!(SELECTED))[unit][direction(capture)] };
         crate::println!("{name} modes (`audio use {} N`, or `auto`):", if capture { "capture" } else { "playback" });
         let mut any = false;
         for (number, (index, alt)) in modes(&device.description, capture).enumerate() {
@@ -968,10 +1009,11 @@ fn feedback_event(stream: &mut Stream, event: &xhci::Trb, high_speed: bool) -> b
 /// Called by the xHCI event drain (interrupt context, or the foreground with interrupts off) for every
 /// event; returns true if it belonged to an audio stream and was handled. Must not allocate, print or wait.
 pub fn irq_event(index: usize, event: &xhci::Trb) -> bool {
-    if !event.is_transfer() {
-        return false;
-    }
-    let Some(device) = audio() else { return false };
+    event.is_transfer() && (0..UNITS).any(|unit| unit_irq_event(unit, index, event))
+}
+
+fn unit_irq_event(unit: usize, index: usize, event: &xhci::Trb) -> bool {
+    let Some(device) = audio(unit) else { return false };
     let Bus::Xhci { controller_index, device: xhci_device, .. } = device.bus else { return false };
     if controller_index != index || event.slot_number() != xhci_device.slot {
         return false;
@@ -1031,8 +1073,8 @@ fn publish(slot: &mut Option<Stream>, stream: Stream) {
 }
 
 /// Starts capture and/or playback at `rate`. Returns a reason on failure.
-pub fn start(rate: u32, want_capture: bool, want_playback: bool) -> Result<(), &'static str> {
-    let Some(device) = audio() else { return Err("no USB audio device") };
+pub fn start(unit: usize, rate: u32, want_capture: bool, want_playback: bool) -> Result<(), &'static str> {
+    let Some(device) = audio(unit) else { return Err("no USB audio device") };
     if device.capture.is_some() || device.playback.is_some() {
         return Err("already running");
     }
@@ -1046,14 +1088,14 @@ pub fn start(rate: u32, want_capture: bool, want_playback: bool) -> Result<(), &
         if capture && !want_capture && !monitor || !capture && !want_playback {
             continue;
         }
-        let alt = match choose_alt(device, capture, rate) {
+        let alt = match choose_alt(unit, device, capture, rate) {
             Ok(alt) => alt,
             Err(_) if monitor => continue,
             Err(reason) => return Err(reason),
         };
         let result = match bus {
             Bus::Xhci { device: xhci_device, .. } => {
-                let controller = controller().ok_or("no USB audio device")?;
+                let controller = controller(unit).ok_or("no USB audio device")?;
                 build_stream(controller, &xhci_device, &description, alt, rate, capture).map(|stream| publish(if capture { &mut device.capture } else { &mut device.playback }, stream))
             }
             Bus::Ehci { controller_index, target } => {
@@ -1222,7 +1264,13 @@ fn ehci_service(stream: &mut Stream, frame: usize) {
 
 /// The EHCI completion interrupt (or `ehci_poll`): services the running streams. Must not allocate, print or wait.
 pub fn ehci_event(index: usize, frame: usize) {
-    let Some(device) = audio() else { return };
+    for unit in 0..UNITS {
+        unit_ehci_event(unit, index, frame);
+    }
+}
+
+fn unit_ehci_event(unit: usize, index: usize, frame: usize) {
+    let Some(device) = audio(unit) else { return };
     let Bus::Ehci { controller_index, .. } = device.bus else { return };
     if controller_index != index {
         return;
@@ -1249,7 +1297,13 @@ pub fn ehci_event(index: usize, frame: usize) {
 
 /// Foreground servicing for an EHCI audio device whose interrupt could not be routed.
 pub fn ehci_poll() {
-    let Some(device) = audio() else { return };
+    for unit in 0..UNITS {
+        poll_unit(unit);
+    }
+}
+
+fn poll_unit(unit: usize) {
+    let Some(device) = audio(unit) else { return };
     let Bus::Ehci { controller_index, .. } = device.bus else { return };
     if device.capture.is_none() && device.playback.is_none() {
         return;
@@ -1259,20 +1313,22 @@ pub fn ehci_poll() {
         return;
     }
     let was = crate::cpu::interrupts_save_and_disable();
-    ehci_event(controller_index, controller.frame_now());
+    unit_ehci_event(unit, controller_index, controller.frame_now());
     crate::cpu::interrupts_restore(was);
 }
 
 /// The device at hub port `hub_port` of hub `hub_address` (or on root port: hub_address 0) of an EHCI controller went away: forget
 /// it if it was the audio device.
 pub fn ehci_departed(controller_index: usize, hub_address: u8, hub_port: u8) {
-    let Some(device) = audio() else { return };
-    let Bus::Ehci { controller_index: index, target } = device.bus else { return };
-    if index != controller_index || target.hub_address != hub_address || (hub_port != 0 && target.hub_port != hub_port) {
-        return;
+    for unit in 0..UNITS {
+        let Some(device) = audio(unit) else { continue };
+        let Bus::Ehci { controller_index: index, target } = device.bus else { continue };
+        if index != controller_index || target.hub_address != hub_address || (hub_port != 0 && target.hub_port != hub_port) {
+            continue;
+        }
+        stop(unit);
+        unsafe { (*core::ptr::addr_of_mut!(DEVICES))[unit] = None };
     }
-    stop();
-    unsafe { DEVICE = None };
 }
 
 fn clone_description(description: &Description) -> Description {
@@ -1364,8 +1420,15 @@ fn stop_stream(host: &mut Host, mut stream: Stream) {
     stream.pcm.free();
 }
 
-pub fn stop() {
-    let Some(device) = audio() else { return };
+/// Stops the streams of every unit.
+pub fn stop_all() {
+    for unit in 0..UNITS {
+        stop(unit);
+    }
+}
+
+pub fn stop(unit: usize) {
+    let Some(device) = audio(unit) else { return };
     // 1. Tell `irq_event` and `ehci_event` to stop touching the streams (their events are swallowed from now on).
     let was = crate::cpu::interrupts_save_and_disable();
     for stream in [device.capture.as_ref(), device.playback.as_ref()].into_iter().flatten() {
@@ -1379,7 +1442,7 @@ pub fn stop() {
     crate::cpu::interrupts_restore(was);
     match device.bus {
         Bus::Xhci { device: xhci_device, .. } => {
-            let Some(controller) = controller() else { return };
+            let Some(controller) = controller(unit) else { return };
             for stream in [capture, playback].into_iter().flatten() {
                 stop_stream(&mut Host::Xhci(&mut *controller, xhci_device), stream);
             }
@@ -1395,39 +1458,39 @@ pub fn stop() {
 }
 
 /// The xHCI controller the audio device is on (None for a device on EHCI).
-pub fn controller() -> Option<&'static mut Controller> {
-    let Bus::Xhci { controller: identity, .. } = audio()?.bus else { return None };
+pub fn controller(unit: usize) -> Option<&'static mut Controller> {
+    let Bus::Xhci { controller: identity, .. } = audio(unit)?.bus else { return None };
     (0..xhci::count()).find_map(|index| xhci::controller(index).filter(|c| (c.pci.bus, c.pci.device, c.pci.function) == identity))
 }
 
 /// Copies captured bytes (interleaved frames) out of the PCM ring.
-pub fn read(out: &mut [u8]) -> usize {
-    audio().and_then(|device| device.capture.as_ref()).map_or(0, |stream| stream.pcm.pop(out))
+pub fn read(unit: usize, out: &mut [u8]) -> usize {
+    audio(unit).and_then(|device| device.capture.as_ref()).map_or(0, |stream| stream.pcm.pop(out))
 }
 
 /// Queues playback bytes (interleaved frames); returns how many fitted.
-pub fn write(data: &[u8]) -> usize {
-    audio().and_then(|device| device.playback.as_ref()).map_or(0, |stream| stream.pcm.push(data))
+pub fn write(unit: usize, data: &[u8]) -> usize {
+    audio(unit).and_then(|device| device.playback.as_ref()).map_or(0, |stream| stream.pcm.push(data))
 }
 
 /// Bytes of room in the playback PCM ring.
-pub fn playback_space() -> usize {
-    audio().and_then(|device| device.playback.as_ref()).map_or(0, |stream| stream.pcm.space())
+pub fn playback_space(unit: usize) -> usize {
+    audio(unit).and_then(|device| device.playback.as_ref()).map_or(0, |stream| stream.pcm.space())
 }
 
 /// Channel layout of the capture stream: (channels, bytes per sample slot).
-pub fn capture_format() -> Option<(u8, u8)> {
-    audio().and_then(|device| device.capture.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
+pub fn capture_format(unit: usize) -> Option<(u8, u8)> {
+    audio(unit).and_then(|device| device.capture.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
 }
 
 /// Channel layout of the playback stream: (channels, bytes per sample slot).
-pub fn playback_format() -> Option<(u8, u8)> {
-    audio().and_then(|device| device.playback.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
+pub fn playback_format(unit: usize) -> Option<(u8, u8)> {
+    audio(unit).and_then(|device| device.playback.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
 }
 
 /// `audio` with no arguments: what the device offers and how a running stream is doing.
-pub fn status() {
-    let Some(device) = audio() else { return crate::println!("No USB audio device.") };
+pub fn status(unit: usize) {
+    let Some(device) = audio(unit) else { return crate::println!("No USB audio device.") };
     let class = if device.description.class_version == 2 { "2.0" } else { "1.0" };
     crate::print(format_args!("USB audio (class {class}) sample rates:"));
     for rate in &device.rates[..device.rate_count] {
@@ -1466,13 +1529,13 @@ pub fn status() {
 }
 
 /// Fills the tape ABI's `AudioInfo`; false if there is no audio device.
-pub fn fill_info(info: &mut fosfor_abi::tape::AudioInfo) -> bool {
-    let Some(device) = audio() else { return false };
+pub fn fill_info(unit: usize, info: &mut fosfor_abi::tape::AudioInfo) -> bool {
+    let Some(device) = audio(unit) else { return false };
     let mut out = fosfor_abi::tape::AudioInfo::default();
     out.class_version = u32::from(device.description.class_version.max(1));
     // A running stream's mode, else the picked one or the best at 48 kHz.
-    let playback_alt = device.playback.as_ref().map(|stream| stream.alt).or_else(|| default_alt(device, false));
-    let capture_alt = device.capture.as_ref().map(|stream| stream.alt).or_else(|| default_alt(device, true));
+    let playback_alt = device.playback.as_ref().map(|stream| stream.alt).or_else(|| default_alt(unit, device, false));
+    let capture_alt = device.capture.as_ref().map(|stream| stream.alt).or_else(|| default_alt(unit, device, true));
     if let Some(alt) = playback_alt {
         out.playback_channels = u32::from(alt.channels);
         out.playback_slot_bytes = u32::from(alt.subslot_bytes);
@@ -1497,9 +1560,9 @@ pub fn fill_info(info: &mut fosfor_abi::tape::AudioInfo) -> bool {
     true
 }
 
-pub fn fill_stats(stats: &mut fosfor_abi::tape::AudioStats) {
+pub fn fill_stats(unit: usize, stats: &mut fosfor_abi::tape::AudioStats) {
     let mut out = fosfor_abi::tape::AudioStats::default();
-    if let Some(device) = audio() {
+    if let Some(device) = audio(unit) {
         if let Some(stream) = &device.capture {
             out.capture_packets = stream.packets.load(Ordering::Relaxed);
             out.capture_bytes = stream.bytes.load(Ordering::Relaxed);
@@ -1516,6 +1579,6 @@ pub fn fill_stats(stats: &mut fosfor_abi::tape::AudioStats) {
 }
 
 /// The capture ring's size and backlog, for `audio_buffer`.
-pub fn buffer_info() -> (u64, u64) {
-    audio().and_then(|device| device.capture.as_ref()).map_or((0, 0), |stream| (stream.pcm.size as u64, stream.pcm.available() as u64))
+pub fn buffer_info(unit: usize) -> (u64, u64) {
+    audio(unit).and_then(|device| device.capture.as_ref()).map_or((0, 0), |stream| (stream.pcm.size as u64, stream.pcm.available() as u64))
 }

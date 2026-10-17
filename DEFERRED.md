@@ -498,5 +498,5 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 
 - `ltas` is tested in QEMU (silence in) and by hand on laptop1 (UFX channels, smoothed curves, avg off). Not checked on hardware:
   blit speed on a write-combining framebuffer, AVX2 FFT speed, USB capture with HD Audio playback, saving to a real stick, RTC stamps.
-  Not done: two USB interfaces at once (`usb_audio.rs` is a single instance), a standalone `noise` tape, a test of the `t` avg-off
+  Two USB interfaces at once are done (QEMU: two usb-audio playing in turn; real hardware untested). Not done: a standalone `noise` tape, a test of the `t` avg-off
   setting. skylake3 and rack3 still run the older `ltas`. landsbro's scheduled `gb -of fos` runs at 12:13/14:13/16:14 failed (exit 2), not investigated.

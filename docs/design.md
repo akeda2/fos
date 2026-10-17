@@ -951,9 +951,11 @@ it on a `mkfs.exfat` image and `fsck.exfat` checks the volume.
 **Separate audio input and output (ABI 18).** `audio_use_output(N)` / shell `audio output N|same` sends playback to a
 different device than capture. `audio.rs` keeps `OUTPUT` beside `CHOSEN`: `audio_read`, the capture format and buffer follow the
 input, `audio_write`, the playback format and space follow the output, `audio_start` starts each direction on its own device,
-and `audio_info`/`audio_stats` combine the two (rates are the ones both offer). USB audio is one instance, so USB in + HD
-Audio out or the reverse works; two USB interfaces need a multi-instance `usb_audio.rs` (not done). `make test-ltas` runs
-HD Audio in, USB out and checks the 1 kHz tone in QEMU's USB recording; hardware untested.
+and `audio_info`/`audio_stats` combine the two (rates are the ones both offer). `usb_audio.rs` keeps `UNITS` (2) devices, each with its own streams and picked modes (`Backend::Usb(unit)`; `audio` lists each
+with its port), so two USB interfaces (one in, one out) work; xHCI devices are independent, but a second device on the same EHCI
+controller is refused (one iTD ring per direction per controller). A replugged xHCI device takes over its old unit (same port).
+`make test-ltas` runs HD Audio in, USB out and checks the 1 kHz tone in QEMU's USB recording; `make test-usb-audio` plays on two
+USB devices in turn and checks each recording. Two USB devices on real hardware untested.
 
 **Graphics for tapes (ABI 17).** `gfx_info` (width<<32|height, 0 in BIOS VGA text mode), `gfx_open`, `gfx_close`, `gfx_fill` and
 `gfx_blit` (a `u32` 0x00RRGGBB buffer with a stride in pixels, clipped at the right and bottom) let a tape draw on the

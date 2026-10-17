@@ -12,7 +12,8 @@
 //! Playback can go to a different device than capture (`audio output N|same`, the tape call `audio_use_output`): capture,
 //! `audio_read` and the capture format follow the input device above, `audio_write` and the playback format follow the output.
 //! `audio_start` then starts one direction on each device. Two devices of the same kind work for HD Audio; USB audio is a
-//! single instance, so USB in plus HD Audio out (or the reverse) is the useful pair.
+//! up to `usb::UNITS` instances, so USB in plus USB out, or USB with HD Audio, work too (two USB devices on one EHCI controller
+//! do not: it has one isochronous schedule).
 //!
 //! Both backends move PCM through the same `PcmRing`: a single-producer single-consumer byte FIFO that the
 //! interrupt handler and the foreground share, so `audio_write` returns how much fitted and `audio_read` what has
@@ -24,7 +25,7 @@ use fosfor_abi::tape::{AudioDevice, AudioInfo, AudioStats, AUDIO_KIND_HDA, AUDIO
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    Usb,
+    Usb(usize),
     Hda(usize),
 }
 
@@ -41,19 +42,21 @@ static mut OPERATOR_OUTPUT: Option<Option<Backend>> = None;
 
 fn available(backend: Backend) -> bool {
     match backend {
-        Backend::Usb => usb::present(),
+        Backend::Usb(unit) => usb::present(unit),
         Backend::Hda(index) => hda::present(index),
     }
 }
 
-/// Every device that can be used, in the order `audio device` numbers them: USB audio first, then each HD Audio
+/// Every device that can be used, in the order `audio device` numbers them: USB audio first (by unit), then each HD Audio
 /// controller that has a playback or capture path.
-fn devices() -> ([Backend; 1 + hda::MAX_CONTROLLERS], usize) {
-    let mut list = [Backend::Usb; 1 + hda::MAX_CONTROLLERS];
+fn devices() -> ([Backend; usb::UNITS + hda::MAX_CONTROLLERS], usize) {
+    let mut list = [Backend::Usb(0); usb::UNITS + hda::MAX_CONTROLLERS];
     let mut count = 0;
-    if usb::present() {
-        list[count] = Backend::Usb;
-        count += 1;
+    for unit in 0..usb::UNITS {
+        if usb::present(unit) {
+            list[count] = Backend::Usb(unit);
+            count += 1;
+        }
     }
     for index in 0..hda::count() {
         if hda::present(index) {
@@ -65,8 +68,8 @@ fn devices() -> ([Backend; 1 + hda::MAX_CONTROLLERS], usize) {
 }
 
 fn automatic() -> Option<Backend> {
-    if usb::present() {
-        return Some(Backend::Usb);
+    if let Some(unit) = (0..usb::UNITS).find(|&unit| usb::present(unit)) {
+        return Some(Backend::Usb(unit));
     }
     (0..hda::count()).filter(|&index| hda::present(index)).max_by_key(|&index| (hda::rank(index), usize::MAX - index)).map(Backend::Hda)
 }
@@ -149,7 +152,7 @@ pub fn device_info(number: usize) -> Option<AudioDevice> {
     let backend = list[number - 1];
     let active = active() == Some(backend);
     Some(match backend {
-        Backend::Usb => AudioDevice { kind: AUDIO_KIND_USB, active: active as u32, ..AudioDevice::default() },
+        Backend::Usb(_) => AudioDevice { kind: AUDIO_KIND_USB, active: active as u32, ..AudioDevice::default() },
         Backend::Hda(index) => {
             let (bus, device, function, vendor, id) = hda::label(index);
             AudioDevice {
@@ -199,7 +202,7 @@ pub fn start(rate: u32, capture: bool, playback: bool) -> Result<(), &'static st
 
 fn start_on(backend: Option<Backend>, rate: u32, capture: bool, playback: bool) -> Result<(), &'static str> {
     match backend {
-        Some(Backend::Usb) => usb::start(rate, capture, playback),
+        Some(Backend::Usb(unit)) => usb::start(unit, rate, capture, playback),
         Some(Backend::Hda(index)) => hda::start(index, rate, capture, playback),
         None => Err("no audio device"),
     }
@@ -207,7 +210,7 @@ fn start_on(backend: Option<Backend>, rate: u32, capture: bool, playback: bool) 
 
 /// Stops every running stream on every device.
 pub fn stop() {
-    usb::stop();
+    usb::stop_all();
     for index in 0..hda::count() {
         hda::stop(index);
     }
@@ -215,7 +218,7 @@ pub fn stop() {
 
 pub fn read(out: &mut [u8]) -> usize {
     match active() {
-        Some(Backend::Usb) => usb::read(out),
+        Some(Backend::Usb(unit)) => usb::read(unit, out),
         Some(Backend::Hda(index)) => hda::read(index, out),
         None => 0,
     }
@@ -223,7 +226,7 @@ pub fn read(out: &mut [u8]) -> usize {
 
 pub fn write(data: &[u8]) -> usize {
     match output() {
-        Some(Backend::Usb) => usb::write(data),
+        Some(Backend::Usb(unit)) => usb::write(unit, data),
         Some(Backend::Hda(index)) => hda::write(index, data),
         None => 0,
     }
@@ -231,7 +234,7 @@ pub fn write(data: &[u8]) -> usize {
 
 pub fn playback_space() -> usize {
     match output() {
-        Some(Backend::Usb) => usb::playback_space(),
+        Some(Backend::Usb(unit)) => usb::playback_space(unit),
         Some(Backend::Hda(index)) => hda::playback_space(index),
         None => 0,
     }
@@ -240,7 +243,7 @@ pub fn playback_space() -> usize {
 /// (channels, bytes per sample slot) of the running capture / playback stream.
 pub fn capture_format() -> Option<(u8, u8)> {
     match active() {
-        Some(Backend::Usb) => usb::capture_format(),
+        Some(Backend::Usb(unit)) => usb::capture_format(unit),
         Some(Backend::Hda(index)) => hda::format(index, true),
         None => None,
     }
@@ -248,7 +251,7 @@ pub fn capture_format() -> Option<(u8, u8)> {
 
 pub fn playback_format() -> Option<(u8, u8)> {
     match output() {
-        Some(Backend::Usb) => usb::playback_format(),
+        Some(Backend::Usb(unit)) => usb::playback_format(unit),
         Some(Backend::Hda(index)) => hda::format(index, false),
         None => None,
     }
@@ -263,7 +266,7 @@ pub fn poll() {
 
 pub fn select(capture: bool, mode: u32) -> Result<(), &'static str> {
     match if capture { active() } else { output() } {
-        Some(Backend::Usb) => usb::select(capture, mode),
+        Some(Backend::Usb(unit)) => usb::select(unit, capture, mode),
         Some(Backend::Hda(index)) => hda::select(index, capture, mode),
         None => Err("no audio device"),
     }
@@ -271,7 +274,7 @@ pub fn select(capture: bool, mode: u32) -> Result<(), &'static str> {
 
 pub fn print_modes() {
     match active() {
-        Some(Backend::Usb) => usb::print_modes(),
+        Some(Backend::Usb(unit)) => usb::print_modes(unit),
         Some(Backend::Hda(index)) => hda::print_modes(index),
         None => crate::println!("No audio device."),
     }
@@ -286,7 +289,7 @@ pub fn status() {
         for (position, backend) in list[..count].iter().enumerate() {
             crate::print(format_args!("  {}{}: ", if *backend == current { '*' } else { ' ' }, position + 1));
             match backend {
-                Backend::Usb => crate::println!("USB audio"),
+                Backend::Usb(unit) => crate::println!("{}", usb::label(*unit)),
                 Backend::Hda(index) => {
                     let (bus, device, function, vendor, id) = hda::label(*index);
                     crate::println!("HD Audio {bus:02x}:{device:02x}.{function} ({vendor:04x}:{id:04x})");
@@ -301,14 +304,14 @@ pub fn status() {
         }
     }
     match current {
-        Backend::Usb => usb::status(),
+        Backend::Usb(unit) => usb::status(unit),
         Backend::Hda(index) => hda::status(index),
     }
 }
 
 fn info_of(backend: Option<Backend>, info: &mut AudioInfo) -> bool {
     match backend {
-        Some(Backend::Usb) => usb::fill_info(info),
+        Some(Backend::Usb(unit)) => usb::fill_info(unit, info),
         Some(Backend::Hda(index)) => hda::fill_info(index, info),
         None => false,
     }
@@ -353,14 +356,14 @@ pub fn fill_info(info: &mut AudioInfo) -> bool {
 
 pub fn fill_stats(stats: &mut AudioStats) {
     match active() {
-        Some(Backend::Usb) => usb::fill_stats(stats),
+        Some(Backend::Usb(unit)) => usb::fill_stats(unit, stats),
         Some(Backend::Hda(index)) => hda::fill_stats(index, stats),
         None => *stats = AudioStats::default(),
     }
     if split() {
         let mut out = AudioStats::default();
         match output() {
-            Some(Backend::Usb) => usb::fill_stats(&mut out),
+            Some(Backend::Usb(unit)) => usb::fill_stats(unit, &mut out),
             Some(Backend::Hda(index)) => hda::fill_stats(index, &mut out),
             None => {}
         }
@@ -372,7 +375,7 @@ pub fn fill_stats(stats: &mut AudioStats) {
 
 pub fn buffer_info() -> (u64, u64) {
     match active() {
-        Some(Backend::Usb) => usb::buffer_info(),
+        Some(Backend::Usb(unit)) => usb::buffer_info(unit),
         Some(Backend::Hda(index)) => hda::buffer_info(index),
         None => (0, 0),
     }
