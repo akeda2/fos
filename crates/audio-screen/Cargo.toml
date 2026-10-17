@@ -1,0 +1,14 @@
+[package]
+name = "audio-screen"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "audio_screen"
+path = "src/lib.rs"
+
+[dependencies]
+tape-rt = { path = "../tape-rt" }
+dsp = { path = "../dsp" }
+gfx = { path = "../gfx" }
+noise = { path = "../noise" }

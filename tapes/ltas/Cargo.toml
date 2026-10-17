@@ -8,6 +8,7 @@ name = "ltas"
 path = "src/main.rs"
 
 [dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
 tape-rt = { path = "../../crates/tape-rt" }
 dsp = { path = "../../crates/dsp" }
 gfx = { path = "../../crates/gfx" }

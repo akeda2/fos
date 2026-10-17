@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "audio-screen"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+ "gfx",
+ "noise",
+ "tape-rt",
+]
+
+[[package]]
 name = "dsp"
 version = "0.1.0"
 
@@ -25,6 +35,7 @@ dependencies = [
 name = "ltas-tape"
 version = "0.1.0"
 dependencies = [
+ "audio-screen",
  "dsp",
  "gfx",
  "ltas",

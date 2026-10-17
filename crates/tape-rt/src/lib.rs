@@ -8,8 +8,11 @@
 #![no_std]
 
 pub mod abort;
+pub mod save;
+pub mod text;
 
 pub use fosfor_abi::tape::*;
+pub use text::{Line, alloc_pixels, alloc_zeroed, arg_value, parse_f32};
 
 use core::fmt::Write;
 

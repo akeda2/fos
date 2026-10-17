@@ -935,6 +935,15 @@ centres, 20 Hz-20 kHz) by overlap-weighted bin summing or raw FFT bins, `Accumul
 LTAS) and peak views at once). Levels are dB re a full-scale sine plus a calibration offset; FFT-bin output is normalised for
 noise, so a tone reads 2-3 dB low there.
 
+**Shared pieces for audio-with-screen tapes.** What `ltas` needed that the next tape (a goniometer, level meters) needs too lives
+in libraries, not in the tape: `crates/audio-screen` (`startup`: `device=`/`outdev=`, hard-float and screen checks; `Input`:
+capture format, channel choice with `,` `.`, `read` of one channel or `read_pair` of two; `Playback`: pumps a generator to
+the output mask; `Screen`: grid and frame buffers, the 20 fps rhythm, `present`; `poll_keys`), `gfx::plot` (palette, `Frame`
+and dB `Scale`, the dB grid, staircase/polyline `curve`, Catmull-Rom `spline`), and `tape_rt::{text, save}` (`arg_value`,
+`parse_f32`, `Line<N>`, `alloc_zeroed`, `alloc_pixels`; `save::Sink`, `find_disk`, `names(PREFIX, ..)`, `write_file`,
+`with_buffers` for a CSV/PNG save to an exFAT or FAT32 stick). The Nordic PPM detector is `audio_wire::meter`. Behaviour of
+`ltas` is unchanged (`make test-ltas`).
+
 **The `ltas` tape.** `tapes/ltas` ties the crates together: it captures with `audio_read`, unpacks one channel
 (`dsp::pcm`), feeds `ltas::Analyzer`, and draws into a RAM `gfx::Canvas` blitted at most 20 times a second. The built-in
 generator (`crates/noise`: white, pink, sine, on/off bursts, a 10 ms fade, RMS level in dB re a full-scale sine) is written

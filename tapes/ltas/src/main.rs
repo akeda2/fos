@@ -5,15 +5,14 @@
 #![no_std]
 #![no_main]
 
-mod save;
 mod view;
 
 use core::fmt::Write;
-use dsp::pcm::unpack_channel;
+use audio_screen::{Input, Playback, Screen, poll_keys};
 use gfx::Canvas;
 use ltas::{Analyzer, Config, Mode, Resolution, Weighting};
 use noise::{Generator, Kind as NoiseKind};
-use tape_rt::{AudioInfo, FP_AVX2, Key, KeyDecoder, TapeApi, println};
+use tape_rt::{FP_AVX2, Key, KeyDecoder, Line, TapeApi, alloc_zeroed, arg_value as value, parse_f32, println, save};
 use view::{Layout, Scale};
 
 tape_rt::tape_help!(
@@ -59,41 +58,9 @@ const TONES: [f32; 7] = [125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0];
 static mut LEVELS: [f32; 4 * (MAXN / 2 + 1)] = [0.0; 4 * (MAXN / 2 + 1)];
 static mut BLOCK_BYTES: [u8; BLOCK] = [0; BLOCK];
 static mut SAMPLES: [f32; BLOCK / 2] = [0.0; BLOCK / 2];
-static mut NOISE_MONO: [f32; 4096] = [0.0; 4096];
-static mut NOISE_BYTES: [u8; 4096 * 4 * 24] = [0; 4096 * 4 * 24];
-
-/// A line of text for the canvas, built with `write!`.
-struct Line<const N: usize> {
-    bytes: [u8; N],
-    length: usize,
-}
-
-impl<const N: usize> Line<N> {
-    fn new() -> Self {
-        Self { bytes: [0; N], length: 0 }
-    }
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
-    }
-}
-
-impl<const N: usize> Write for Line<N> {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        for byte in text.bytes() {
-            if self.length < N {
-                self.bytes[self.length] = byte;
-                self.length += 1;
-            }
-        }
-        Ok(())
-    }
-}
 
 struct Settings {
     rate: u32,
-    channel: usize,
-    /// Input channels the device captures (the status line shows `ch N/M`).
-    channels: usize,
     /// Band modes draw a spline through the band levels (`m` toggles bars).
     smooth: bool,
     resolution: Resolution,
@@ -120,73 +87,17 @@ impl Settings {
     }
 }
 
-fn alloc_zeroed<T>(api: &TapeApi) -> Option<&'static mut T> {
-    let bytes = core::mem::size_of::<T>();
-    let address = (api.alloc)(bytes);
-    if address == 0 {
-        return None;
-    }
-    unsafe {
-        core::ptr::write_bytes(address as *mut u8, 0, bytes);
-        Some(&mut *(address as *mut T))
-    }
-}
-
-fn alloc_pixels(api: &TapeApi, count: usize) -> Option<&'static mut [u32]> {
-    let address = (api.alloc)(count * 4);
-    if address == 0 {
-        return None;
-    }
-    Some(unsafe { core::slice::from_raw_parts_mut(address as *mut u32, count) })
-}
-
-fn value<'a>(arguments: &'a str, key: &str) -> Option<&'a str> {
-    arguments.split_ascii_whitespace().find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
-}
-
-fn parse_f32(text: &str) -> Option<f32> {
-    let (negative, digits) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text.strip_prefix('+').unwrap_or(text)),
-    };
-    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
-    let mut result = whole.parse::<u32>().ok()? as f32;
-    let mut scale = 0.1;
-    for digit in fraction.bytes() {
-        if !digit.is_ascii_digit() {
-            return None;
-        }
-        result += (digit - b'0') as f32 * scale;
-        scale /= 10.0;
-    }
-    Some(if negative { -result } else { result })
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn tape_main(api: &'static TapeApi) {
     tape_rt::init(api);
-    let arguments = match tape_rt::take_audio_device_arg(api, core::str::from_utf8(tape_rt::args()).unwrap_or("")) {
-        Ok(rest) => rest,
+    let started = match audio_screen::startup(api, MAX_WIDTH, MAX_HEIGHT) {
+        Ok(started) => started,
         Err(reason) => return println!("ltas: {reason}."),
     };
-    if let Some(number) = value(arguments, "outdev") {
-        let Ok(number) = number.parse::<u32>() else { return println!("ltas: outdev=N needs a number (`audio` lists the devices).") };
-        if let Err(reason) = tape_rt::use_audio_output(api, number) {
-            return println!("ltas: {reason}.");
-        }
-    }
-    if tape_rt::fp_level() == 0 {
-        return println!("ltas: needs a hard-float tape build (kernel without FP support?).");
-    }
-    let Some((width, height)) = tape_rt::gfx_info() else {
-        return println!("ltas: no pixel screen (BIOS text mode). Use a UEFI boot or a VBE mode.");
-    };
-    let (width, height) = (width.min(MAX_WIDTH), height.min(MAX_HEIGHT));
+    let (arguments, width, height) = (started.arguments, started.width, started.height);
     let mut settings = Settings {
         rate: value(arguments, "rate").and_then(|v| v.parse().ok()).unwrap_or(48_000),
-        channels: 0,
         smooth: value(arguments, "style") != Some("bars"),
-        channel: value(arguments, "chan").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1) - 1,
         resolution: value(arguments, "res").and_then(Resolution::from_name).unwrap_or(Resolution::Third),
         window: value(arguments, "win").and_then(dsp::window::Kind::from_name).unwrap_or(dsp::window::Kind::Hann),
         weighting: value(arguments, "weight").and_then(Weighting::from_name).unwrap_or(Weighting::Z),
@@ -205,22 +116,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if let Some(tau) = value(arguments, "tau").and_then(parse_f32) {
         settings.tau_index = (0..TAUS.len()).min_by(|&a, &b| (TAUS[a] - tau).abs().total_cmp(&(TAUS[b] - tau).abs())).unwrap_or(4);
     }
-    let mut info = AudioInfo::default();
-    if (api.audio_info)(&mut info) == 0 || info.capture_channels == 0 {
-        return println!("ltas: no audio input (USB audio or HD Audio with a capture side).");
-    }
-    if settings.channel >= info.capture_channels as usize {
-        return println!("ltas: the device has {} input channel(s); chan={} is out of range.", info.capture_channels, settings.channel + 1);
-    }
-    settings.channels = info.capture_channels as usize;
-    let (capture_channels, capture_slot, capture_bits) = (info.capture_channels as usize, info.capture_slot_bytes as usize, info.capture_bits as usize);
-    let playback_ok = info.playback_channels > 0 && info.playback_slot_bytes > 0;
+    let chan = value(arguments, "chan").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+    let mut input = match Input::query(api, chan) {
+        Ok(input) => input,
+        Err(reason) => return println!("ltas: {reason}."),
+    };
+    let playback_ok = input.playback_ok();
 
-    let (Some(analyzer), Some(grid), Some(frame)) = (
-        alloc_zeroed::<Analyzer<MAXN>>(api),
-        alloc_pixels(api, (width * height) as usize),
-        alloc_pixels(api, (width * height) as usize),
-    ) else {
+    let (Some(analyzer), Some(mut screen)) = (alloc_zeroed::<Analyzer<MAXN>>(api), Screen::new(api, width, height)) else {
         return println!("ltas: out of memory.");
     };
     if !analyzer.configure(settings.config()) {
@@ -230,10 +133,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     generator.set_rate(settings.rate);
     generator.set_level_db(value(arguments, "level").and_then(parse_f32).unwrap_or(-20.0));
     generator.set_frequency(value(arguments, "tone").and_then(parse_f32).unwrap_or(1000.0));
-    let mut output_mask: u32 = value(arguments, "out").and_then(|v| v.parse().ok()).unwrap_or(0b11);
-    if output_mask == 0 {
-        output_mask = 0b11;
-    }
+    let output_mask: u32 = value(arguments, "out").and_then(|v| v.parse().ok()).unwrap_or(0b11);
+    let mut playback = Playback::new(api, &input, output_mask);
     let want_noise = value(arguments, "noise").and_then(NoiseKind::from_name).unwrap_or(NoiseKind::Silence);
     if want_noise != NoiseKind::Silence && !playback_ok {
         println!("ltas: the device has no outputs; the generator stays off.");
@@ -241,11 +142,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         generator.set_kind(want_noise);
     }
 
-    let status = (api.audio_start)(settings.rate, 1, playback_ok as u32);
-    if status != 0 {
-        return println!("ltas: cannot start audio at {} Hz (code {status}); the device offers {:?}.", settings.rate, &info.rates[..info.rate_count as usize]);
+    if let Err(status) = input.start(api, settings.rate) {
+        return println!("ltas: cannot start audio at {} Hz (code {status}); the device offers {:?}.", settings.rate, &input.rates[..input.rate_count]);
     }
-    if !tape_rt::gfx_open() {
+    if !screen.open() {
         (api.audio_stop)();
         return println!("ltas: cannot take the screen.");
     }
@@ -256,8 +156,6 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let (mut analysis_us, mut analysis_frames, mut analysis_worst) = (0u64, 0u64, 0u64);
     let mut decoder = KeyDecoder::new();
     let levels = unsafe { &mut *(&raw mut LEVELS) };
-    let mut dirty = true;
-    let mut next_draw = 0u64;
     let mut burst = false;
     let mut tone_index = 3;
     let mut message = Line::<64>::new();
@@ -267,36 +165,18 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 
     let block = unsafe { &mut *(&raw mut BLOCK_BYTES) };
     let samples = unsafe { &mut *(&raw mut SAMPLES) };
-    let mono = unsafe { &mut *(&raw mut NOISE_MONO) };
-    let packed = unsafe { &mut *(&raw mut NOISE_BYTES) };
-    let capture_frame = capture_channels * capture_slot;
-    let playback_frame = info.playback_channels as usize * info.playback_slot_bytes as usize;
     let _ = write!(message, "ready");
 
-    {
-        let mut canvas = Canvas::new(grid, width, height).unwrap();
-        view::draw_grid(&mut canvas, &layout, &scale);
-    }
-    'main: loop {
-        // keys
-        loop {
-            let event = (api.read_key)();
-            if event == 0 {
-                break;
-            }
-            if event == 1 {
-                break 'main;
-            }
-            let Some(key) = decoder.feed((event & 0xff) as u8) else { continue };
+    view::draw_grid(&mut screen.grid(), &layout, &scale);
+    loop {
+        let keep_going = poll_keys(api, &mut decoder, |key| {
             message.length = 0;
             let mut reconfigure = false;
             let mut regrid = false;
             match key {
-                Key::Char(b'.') | Key::Char(b',') if capture_channels > 1 => {
-                    let last = capture_channels - 1;
-                    settings.channel = if key == Key::Char(b'.') { if settings.channel >= last { 0 } else { settings.channel + 1 } } else if settings.channel == 0 { last } else { settings.channel - 1 };
+                Key::Char(b'.') | Key::Char(b',') if input.step_channel(key) => {
                     analyzer.reset();
-                    let _ = write!(message, "input channel {}", settings.channel + 1);
+                    let _ = write!(message, "input channel {}", input.channel + 1);
                 }
                 Key::Char(b'm') => settings.smooth = !settings.smooth,
                 Key::Char(b's') => save_requested = true,
@@ -370,17 +250,19 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 let _ = write!(message, "setting not possible");
             }
             if regrid {
-                let mut canvas = Canvas::new(grid, width, height).unwrap();
-                view::draw_grid(&mut canvas, &layout, &scale);
+                view::draw_grid(&mut screen.grid(), &layout, &scale);
             }
-            dirty = true;
+            screen.mark_dirty();
+        });
+        if !keep_going {
+            break;
         }
 
         if save_requested {
             save_requested = false;
             saves += 1;
-            canvas_render(frame, grid, width, height, &layout, &scale, analyzer, shown, levels, &settings, &generator, playback_ok, frozen);
-            let outcome = save_measurement(api, wanted_disk, saves, analyzer, frame, width, height, levels);
+            canvas_render(&mut screen, &layout, &scale, analyzer, shown, levels, &settings, &input, &generator, playback_ok, frozen);
+            let outcome = save_measurement(api, wanted_disk, saves, analyzer, screen.pixels(), width, height, levels);
             message.length = 0;
             match outcome {
                 Ok((disk, base)) => {
@@ -390,14 +272,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     let _ = write!(message, "save: {reason}");
                 }
             }
-            dirty = true;
+            screen.mark_dirty();
         }
 
         // capture -> analysis
         let mut worked = false;
-        let got = (api.audio_read)(block.as_mut_ptr(), BLOCK / capture_frame * capture_frame);
-        if got >= capture_frame {
-            let count = unpack_channel(&block[..got], &mut samples[..], capture_channels, capture_slot, capture_bits, settings.channel);
+        let count = input.read(api, &mut block[..], &mut samples[..], input.channel);
+        if count > 0 {
             if !frozen {
                 let began = tape_rt::micros();
                 let frames = analyzer.push(&samples[..count]);
@@ -406,43 +287,30 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     analysis_us += took;
                     analysis_frames += frames as u64;
                     analysis_worst = analysis_worst.max(took / frames as u64);
-                    dirty = true;
+                    screen.mark_dirty();
                 }
             }
             worked = true;
         }
 
         // generator -> playback
-        if playback_ok {
-            let mut now = AudioInfo::default();
-            (api.audio_info)(&mut now);
-            let room = now.playback_space as usize / playback_frame.max(1);
-            let frames = room.min(mono.len()).min(packed.len() / playback_frame.max(1));
-            if frames > 0 {
-                generator.fill(&mut mono[..frames]);
-                let bytes = noise::pack(&mono[..frames], &mut packed[..], info.playback_channels as usize, info.playback_slot_bytes as usize, info.playback_bits as usize, output_mask);
-                (api.audio_write)(packed.as_ptr(), bytes);
-                worked = true;
-            }
+        if let Some(playback) = playback.as_mut() {
+            worked |= playback.pump(api, &input, |mono| generator.fill(mono));
         }
 
         // drawing, at most 20 times a second
-        let now_us = tape_rt::micros();
-        if dirty && now_us >= next_draw {
-            next_draw = now_us + 50_000;
-            dirty = false;
-            let mut canvas = Canvas::new(frame, width, height).unwrap();
-            canvas.pixels[..(width * height) as usize].copy_from_slice(&grid[..(width * height) as usize]);
+        if screen.due() {
+            let mut canvas = screen.frame();
             view::draw_curves(&mut canvas, &layout, &scale, analyzer, shown, levels, settings.smooth);
-            draw_status(&mut canvas, &layout, &settings, analyzer, &generator, playback_ok, frozen, shown, message.as_str());
-            tape_rt::gfx_blit(0, 0, width, height, &canvas.pixels[..(width * height) as usize], width);
+            draw_status(&mut canvas, &layout, &settings, &input, analyzer, &generator, playback_ok, frozen, shown, message.as_str());
+            screen.present();
         }
         if !worked {
             tape_rt::idle();
         }
     }
     (api.audio_stop)();
-    tape_rt::gfx_close();
+    screen.close();
     if analysis_frames > 0 {
         println!(
             "ltas: {} FFT {}: {} us per analysis on average, {} us at worst ({} frames timed).",
@@ -459,59 +327,44 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 }
 
 /// Draws the whole picture into `frame` (no message line, so a saved screenshot is clean).
-fn canvas_render<const N: usize>(frame: &mut [u32], grid: &[u32], width: u32, height: u32, layout: &Layout, scale: &Scale, analyzer: &mut Analyzer<N>, shown: [bool; 4], levels: &mut [f32], settings: &Settings, generator: &Generator, playback_ok: bool, frozen: bool) {
-    let mut canvas = Canvas::new(frame, width, height).unwrap();
-    canvas.pixels[..(width * height) as usize].copy_from_slice(&grid[..(width * height) as usize]);
+fn canvas_render<const N: usize>(screen: &mut Screen, layout: &Layout, scale: &Scale, analyzer: &mut Analyzer<N>, shown: [bool; 4], levels: &mut [f32], settings: &Settings, input: &Input, generator: &Generator, playback_ok: bool, frozen: bool) {
+    let mut canvas = screen.frame();
     view::draw_curves(&mut canvas, layout, scale, analyzer, shown, levels, settings.smooth);
-    draw_status(&mut canvas, layout, settings, analyzer, generator, playback_ok, frozen, shown, "");
+    draw_status(&mut canvas, layout, settings, input, analyzer, generator, playback_ok, frozen, shown, "");
 }
 
 /// Saves the CSV and the picture in `frame` as `ltas-DATE-TIME.csv` and `.png` on an exFAT/FAT32 disk.
 fn save_measurement<const N: usize>(api: &TapeApi, wanted: Option<usize>, counter: u32, analyzer: &mut Analyzer<N>, frame: &[u32], width: u32, height: u32, levels: &mut [f32]) -> Result<(usize, Line<40>), &'static str> {
     let Some(disk) = save::find_disk(api, wanted) else { return Err("no exFAT or FAT32 disk (save=N picks one)") };
-    let address = (api.alloc)(2 * save::BUFFER_BYTES);
-    if address == 0 {
-        return Err("out of memory");
-    }
-    let (csv_bytes, png_bytes) = unsafe { (core::slice::from_raw_parts_mut(address as *mut u8, save::BUFFER_BYTES), core::slice::from_raw_parts_mut((address + save::BUFFER_BYTES) as *mut u8, save::BUFFER_BYTES)) };
     let mut base = Line::<40>::new();
     let mut stamp = Line::<40>::new();
-    save::names(counter, &mut base, &mut stamp);
-    let mut csv = save::Sink { bytes: csv_bytes, length: 0 };
-    let mut png = save::Sink { bytes: png_bytes, length: 0 };
-    let outcome = (|| {
+    save::names("ltas", counter, &mut base, &mut stamp);
+    save::with_buffers(api, |csv_bytes, png_bytes| {
+        let mut csv = save::Sink::new(csv_bytes);
+        let mut png = save::Sink::new(png_bytes);
         let count = analyzer.outputs();
         ltas::csv::write(analyzer, stamp.as_str(), &mut levels[..4 * count], &mut csv).map_err(|_| "CSV too big")?;
         let mut full = true;
-        let drawn = gfx::png::write_rgb(&frame[..(width * height) as usize], width, height, width, |chunk| {
-            let end = png.length + chunk.len();
-            if end <= png.bytes.len() {
-                png.bytes[png.length..end].copy_from_slice(chunk);
-                png.length = end;
-            } else {
-                full = false;
-            }
-        });
+        let drawn = gfx::png::write_rgb(&frame[..(width * height) as usize], width, height, width, |chunk| full &= png.push(chunk));
         if !drawn || !full {
             return Err("PNG too big");
         }
-        if save::write_file(api, disk, base.as_str(), "csv", &csv.bytes[..csv.length]) != 0 || save::write_file(api, disk, base.as_str(), "png", &png.bytes[..png.length]) != 0 {
+        if save::write_file(api, disk, base.as_str(), "csv", csv.written()) != 0 || save::write_file(api, disk, base.as_str(), "png", png.written()) != 0 {
             return Err("cannot write (disk full or read-only?)");
         }
         Ok((disk, base))
-    })();
-    (api.free)(address, 2 * save::BUFFER_BYTES);
-    outcome
+    })
+    .unwrap_or(Err("out of memory"))
 }
 
-fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &Settings, analyzer: &Analyzer<N>, generator: &Generator, playback_ok: bool, frozen: bool, shown: [bool; 4], message: &str) {
+fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &Settings, input: &Input, analyzer: &Analyzer<N>, generator: &Generator, playback_ok: bool, frozen: bool, shown: [bool; 4], message: &str) {
     let mut line = Line::<200>::new();
     let _ = write!(
         line,
         "LTAS  {} Hz  ch {}/{}  {}{}  FFT {} {} {}  weight {}  cal {:+.1} dB  avg {}  frames {}{}",
         settings.rate,
-        settings.channel + 1,
-        settings.channels,
+        input.channel + 1,
+        input.channels,
         settings.resolution.name(),
         if settings.resolution == Resolution::Fft { "" } else if settings.smooth { " smooth" } else { " bars" },
         settings.n,

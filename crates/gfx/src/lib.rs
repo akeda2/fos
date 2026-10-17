@@ -3,6 +3,7 @@
 //! writer for screenshots (`png`). `no_std`, no allocation: the caller owns the pixel slice.
 #![cfg_attr(not(test), no_std)]
 
+pub mod plot;
 pub mod png;
 
 mod font {
