@@ -5,6 +5,7 @@ plot (background, grid, text, the curves at the floor), keeps analysing (frames 
 returns the console on Escape and reports no capture overruns. Levels, the generator's signal and real input are checked
 by the host tests of `crates/ltas` and `crates/noise` and on real hardware. Run with `make test-ltas`."""
 
+import re
 import struct
 import subprocess
 import sys
@@ -54,6 +55,28 @@ def split_devices():
         crossings = sum(1 for a, b in zip(loud, loud[1:]) if a < 0 <= b)
         check(len(loud) > rate, f"it holds sound ({len(loud)} loud samples)", "")
         check(900 < crossings * rate / max(len(loud), 1) < 1100, "at about 1000 Hz", f"{crossings * rate / max(len(loud), 1):.0f}")
+
+
+def forced_sse2():
+    """`simd=sse2` runs the baseline FFT whatever the CPU has; an unknown value is refused."""
+    with tempfile.TemporaryDirectory() as tmp:
+        machine = Machine(tmp, {}, {"ltas": LTAS})
+        machine.extra = ["-audiodev", "none,id=snd", "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd"]
+        machine.start()
+        try:
+            machine.wait_for("M3 complete")
+            machine.connect()
+            start = len(machine.text())
+            machine.wire.send(machine.guest, TAG_DATA, b"run ltas simd=sse3\n")
+            text = machine.wait_for("simd= takes auto, sse2 or avx2", since=start, timeout=20)
+            start = len(machine.text())
+            machine.wire.send(machine.guest, TAG_DATA, b"run ltas simd=sse2\n")
+            time.sleep(5)
+            machine.wire.send(machine.guest, TAG_DATA, b"\x1b")
+            text = machine.wait_for("frame(s) analysed", since=start, timeout=20)
+            check("ltas: SSE2 FFT" in text, "simd=sse2 forces the baseline FFT", text[-600:])
+        finally:
+            machine.stop()
 
 
 def png_pixels(blob):
@@ -139,11 +162,13 @@ def main():
             frames = int(text.split("ltas: ")[-1].split(" frame")[0])
             check(frames >= 3, f"the analyser ran ({frames} frames)", text[-1500:])
             check("capture overruns 0" in text, "no capture overruns", text[-500:])
+            check(re.search(r"ltas: (AVX2\+FMA|SSE2) FFT \d+: \d+ us per analysis", text) is not None, "the exit line names the FFT code path and its timing", text[-600:])
             time.sleep(0.5)
             _, _, last = screenshot(machine.monitor, "ltas3.ppm")
             check(last(56, 60) != GRID_MAJOR, "the plot is gone when the tape ends", "")
         finally:
             machine.stop()
+    forced_sse2()
     split_devices()
     save_files()
     print("ltas: all checks passed")

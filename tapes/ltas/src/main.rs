@@ -21,12 +21,14 @@ tape_rt::tape_help!(
      [res=1/3|1/6|1/12|fft] [weight=z|a|c] [save=N]
      [style=smooth|bars]
      [win=hann|rect|hamming|blackman-harris|flat-top]
-     [cal=DB] [tau=SECONDS|0] [noise=off|white|pink|sine] [level=-20]
-     [tone=HZ] [out=MASK]
+     [cal=DB] [tau=SECONDS|0] [simd=auto|sse2|avx2]
+     [noise=off|white|pink|sine] [level=-20] [tone=HZ] [out=MASK]
 Long-term average spectrum of the audio input, on the screen, with a test
 signal generator for the output. device= is the input, outdev= a different
 output device (`audio` numbers them). Curves: live, exp(onential), ltas (equal
 average since reset), peak. Levels are dB re a full-scale sine.
+The FFT uses AVX2+FMA when the CPU has it, else SSE2; simd= forces SSE2 (to
+compare). The status line shows which; on exit the mean/worst time per frame.
 Keys (Escape quits):
   space freeze   r reset   v resolution   w window   a weighting
   n FFT size     t time constant   c/x calibration +/-0.5 dB
@@ -193,6 +195,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         tau_index: 4,
         avx2: tape_rt::fp_level() >= FP_AVX2,
     };
+    match value(arguments, "simd") {
+        None | Some("auto") => {}
+        Some("sse2") => settings.avx2 = false,
+        Some("avx2") if settings.avx2 => {}
+        Some("avx2") => return println!("ltas: simd=avx2: this CPU (or the kernel) has no AVX2/FMA."),
+        Some(_) => return println!("ltas: simd= takes auto, sse2 or avx2."),
+    }
     if let Some(tau) = value(arguments, "tau").and_then(parse_f32) {
         settings.tau_index = (0..TAUS.len()).min_by(|&a, &b| (TAUS[a] - tau).abs().total_cmp(&(TAUS[b] - tau).abs())).unwrap_or(4);
     }
@@ -244,6 +253,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut scale = Scale { db_top: 10.0, db_range: 90.0 };
     let mut shown = [false, true, true, true];
     let mut frozen = false;
+    let (mut analysis_us, mut analysis_frames, mut analysis_worst) = (0u64, 0u64, 0u64);
     let mut decoder = KeyDecoder::new();
     let levels = unsafe { &mut *(&raw mut LEVELS) };
     let mut dirty = true;
@@ -388,8 +398,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         let got = (api.audio_read)(block.as_mut_ptr(), BLOCK / capture_frame * capture_frame);
         if got >= capture_frame {
             let count = unpack_channel(&block[..got], &mut samples[..], capture_channels, capture_slot, capture_bits, settings.channel);
-            if !frozen && analyzer.push(&samples[..count]) > 0 {
-                dirty = true;
+            if !frozen {
+                let began = tape_rt::micros();
+                let frames = analyzer.push(&samples[..count]);
+                if frames > 0 {
+                    let took = tape_rt::micros().wrapping_sub(began);
+                    analysis_us += took;
+                    analysis_frames += frames as u64;
+                    analysis_worst = analysis_worst.max(took / frames as u64);
+                    dirty = true;
+                }
             }
             worked = true;
         }
@@ -425,6 +443,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     (api.audio_stop)();
     tape_rt::gfx_close();
+    if analysis_frames > 0 {
+        println!(
+            "ltas: {} FFT {}: {} us per analysis on average, {} us at worst ({} frames timed).",
+            if settings.avx2 { "AVX2+FMA" } else { "SSE2" },
+            settings.n,
+            analysis_us / analysis_frames,
+            analysis_worst,
+            analysis_frames
+        );
+    }
     let mut stats = tape_rt::AudioStats::default();
     (api.audio_stats)(&mut stats);
     println!("ltas: {} frame(s) analysed; capture overruns {}, playback underruns {}.", analyzer.frames(), stats.capture_overruns, stats.playback_underruns);
@@ -480,13 +508,14 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
     let mut line = Line::<200>::new();
     let _ = write!(
         line,
-        "LTAS  {} Hz  ch {}/{}  {}{}  FFT {} {}  weight {}  cal {:+.1} dB  avg {}  frames {}{}",
+        "LTAS  {} Hz  ch {}/{}  {}{}  FFT {} {} {}  weight {}  cal {:+.1} dB  avg {}  frames {}{}",
         settings.rate,
         settings.channel + 1,
         settings.channels,
         settings.resolution.name(),
         if settings.resolution == Resolution::Fft { "" } else if settings.smooth { " smooth" } else { " bars" },
         settings.n,
+        if settings.avx2 { "avx2" } else { "sse2" },
         settings.window.name(),
         settings.weighting.name(),
         settings.calibration_db,

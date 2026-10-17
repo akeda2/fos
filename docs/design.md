@@ -941,6 +941,7 @@ generator (`crates/noise`: white, pink, sine, on/off bursts, a 10 ms fade, RMS l
 to the output with `audio_write` in the same loop (full duplex through `audio_start(rate, capture, playback)`). The
 analyser is about 1.2 MB, allocated with `api.alloc`. `make test-ltas` checks screen, loop, keys and exit against QEMU's HD
 Audio codec; levels are checked by the crate tests and on real hardware. `device=N outdev=M` puts capture and playback on different devices (ABI 18, below). In a band mode the curves are a Catmull-Rom spline through the band levels (`style=bars` or `m` gives the bars/staircase).
+The FFT has two code paths, baseline SSE2 and AVX2+FMA (`dsp::fft`); the tape uses AVX2 when `fp_level` says the CPU has it. The status line shows `avx2` or `sse2`, `simd=sse2` forces the baseline (`simd=avx2` is refused without AVX2) so the two can be compared, and on exit the tape prints the mean and worst microseconds per analysis frame (window, FFT and bands) for the FFT size in use.
 `,` and `.` step through the device's input channels (the status line shows `ch N/M`; `chan=N` starts on N; the averages restart).
 `t` cycles the exponential average's time constant: off, 0.125 ... 5 s (default 1 s); off (`tau=0`) makes each frame replace the average.
 `s` saves `ltas-YYYYMMDD-HHMMSS.csv` (settings header, then centre/low/high Hz, resolved flag and the four views in
