@@ -121,7 +121,7 @@ LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
 IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp fterm fpcheck
+TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp fterm fpcheck gfxcheck
 # Hard-float tapes (target x86_64-fos-tape-fp, SSE2/AVX2; the kernel enables SSE before they start) build into their own directory.
 FP_TAPES := fpcheck
 tape_dir = x86_64-fos-tape$(if $(filter $(1),$(FP_TAPES)),-fp)
@@ -143,7 +143,7 @@ OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-a
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
+.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -236,6 +236,10 @@ test-diag: image
 # Hard-float tapes: SSE and AVX2/FMA switched on before a tape starts (fp_level), QEMU default CPU and -cpu max.
 test-fp: image
 	python3 tools/test_fp.py
+
+# Tape graphics (gfx_*): colours, stride, clipping and the console coming back, read from a QEMU screendump.
+test-gfx: image
+	python3 tools/test_gfx.py
 
 
 # USB audio class 1.0 against QEMU's usb-audio: discovery, a played tone recorded to WAV, capture.

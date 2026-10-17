@@ -516,6 +516,21 @@ extern "C" fn api_nic_counters(index: usize, out: *mut u64, count: usize) -> usi
     }
     term::nic_counters(index, unsafe { core::slice::from_raw_parts_mut(out, count) })
 }
+extern "C" fn api_gfx_info() -> u64 {
+    crate::framebuffer::gfx_info().map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height))
+}
+extern "C" fn api_gfx_open() -> u32 {
+    u32::from(crate::framebuffer::gfx_open())
+}
+extern "C" fn api_gfx_close() {
+    crate::framebuffer::gfx_close();
+}
+extern "C" fn api_gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u32 {
+    u32::from(crate::framebuffer::gfx_fill(x, y, width, height, rgb))
+}
+extern "C" fn api_gfx_blit(x: u32, y: u32, width: u32, height: u32, pixels: *const u32, stride: u32) -> u32 {
+    u32::from(unsafe { crate::framebuffer::gfx_blit(x, y, width, height, pixels, stride) })
+}
 static mut FP_LEVEL: u32 = 0;
 extern "C" fn api_fp_level() -> u32 {
     unsafe { FP_LEVEL }
@@ -729,6 +744,11 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         nic_tx_offload: api_nic_tx_offload,
         nic_counters: api_nic_counters,
         fp_level: api_fp_level,
+        gfx_info: api_gfx_info,
+        gfx_open: api_gfx_open,
+        gfx_close: api_gfx_close,
+        gfx_fill: api_gfx_fill,
+        gfx_blit: api_gfx_blit,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);
@@ -749,6 +769,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
             clobber_abi("C"),
         );
     }
+    crate::framebuffer::gfx_close(); // a tape that ended (or was aborted) without closing gives the screen back
     crate::cpu::fp_disable();
     unsafe { FP_LEVEL = 0 };
     crate::debug::set_tape_running(false);

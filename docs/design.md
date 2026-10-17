@@ -924,6 +924,13 @@ groups swept, only the joined one arrived. Only real hardware can confirm the ta
 getting UDP PTP (frames injected from a host arrived, the switch's group table never listed the card); with snooping off,
 82579V and I350 work as slave and master over UDP.
 
+**Graphics for tapes (ABI 17).** `gfx_info` (width<<32|height, 0 in BIOS VGA text mode), `gfx_open`, `gfx_close`, `gfx_fill` and
+`gfx_blit` (a `u32` 0x00RRGGBB buffer with a stride in pixels, clipped at the right and bottom) let a tape draw on the
+framebuffer. `gfx_open` clears the screen and stops the console painting it (the text grid keeps updating, so serial and
+`term net` are unaffected); the kernel calls `gfx_close` when the tape ends and repaints the console. The kernel converts to
+the framebuffer's pixel order (RGB swaps red and blue; anything else is BGR). Framebuffer reads are very slow (write-combining),
+so a tape draws into a RAM back buffer and blits it. `tapes/gfxcheck`, `make test-gfx` (QEMU screendump).
+
 **Hard-float tapes (ABI 16).** The kernel and ordinary tapes are soft-float (no SSE). A tape that does DSP is built for
 `targets/x86_64-fos-tape-fp.json` (SSE2 baseline; the crate's `.cargo/config.toml` sets `build.target`, the output lands in
 `build/cargo-target/x86_64-fos-tape-fp/`, and the Makefile's `FP_TAPES` lists them). `cpu::fp_enable` runs *before* the tape's entry,

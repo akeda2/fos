@@ -558,6 +558,48 @@ pub fn fp_level() -> u32 {
     if table.version < 16 || (table.size as usize) < end { fosfor_abi::tape::FP_NONE } else { (table.fp_level)() }
 }
 
+/// The pixel screen's size (width, height), or `None` without a pixel framebuffer or on a kernel older than version 17.
+pub fn gfx_info() -> Option<(u32, u32)> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, gfx_blit) + core::mem::size_of::<usize>();
+    if table.version < 17 || (table.size as usize) < end {
+        return None;
+    }
+    let packed = (table.gfx_info)();
+    (packed != 0).then_some(((packed >> 32) as u32, packed as u32))
+}
+
+fn gfx_table() -> Option<&'static TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, gfx_blit) + core::mem::size_of::<usize>();
+    (table.version >= 17 && (table.size as usize) >= end).then_some(table)
+}
+
+/// Takes the screen for graphics (the console stops painting; the kernel gives it back when the tape ends). False when there
+/// is no pixel framebuffer. See `TapeApi::gfx_open`.
+pub fn gfx_open() -> bool {
+    gfx_table().is_some_and(|table| (table.gfx_open)() != 0)
+}
+
+/// Gives the screen back to the console, which draws its text again.
+pub fn gfx_close() {
+    if let Some(table) = gfx_table() {
+        (table.gfx_close)();
+    }
+}
+
+/// A filled rectangle, `rgb` = 0x00RRGGBB, clipped to the screen. False if the screen is not open.
+pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
+    gfx_table().is_some_and(|table| (table.gfx_fill)(x, y, width, height, rgb) != 0)
+}
+
+/// Copies a block of 0x00RRGGBB pixels (`stride` pixels per row, at least `width`; `pixels.len()` must cover the block) to the
+/// screen at (x, y), clipped on the right and bottom. False if it was not drawn.
+pub fn gfx_blit(x: u32, y: u32, width: u32, height: u32, pixels: &[u32], stride: u32) -> bool {
+    let needed = if height == 0 { 0 } else { (height as usize - 1) * stride as usize + width as usize };
+    pixels.len() >= needed && gfx_table().is_some_and(|table| (table.gfx_blit)(x, y, width, height, pixels.as_ptr(), stride) != 0)
+}
+
 /// Number of values `nic_counters` can return, in the order the ABI documents (speed, duplex, missed, no-buffer, CRC,
 /// symbol, XOFF received, XOFF sent, tape queue drops).
 pub const NIC_COUNTERS: usize = 9;

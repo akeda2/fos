@@ -54,6 +54,9 @@ static mut CARET_AT: usize = usize::MAX;
 
 static mut CONSOLE: Option<Console> = None;
 
+/// A tape has the screen for graphics (`gfx_open`): the console keeps its text grid but draws nothing.
+static mut GFX_OPEN: bool = false;
+
 impl Console {
     /// A pixel value for the given colour in this framebuffer's byte order.
     fn pixel(&self, red: u8, green: u8, blue: u8) -> u32 {
@@ -106,6 +109,9 @@ impl Console {
     fn repaint(&mut self) {
         if self.text {
             return self.repaint_text();
+        }
+        if unsafe { GFX_OPEN } {
+            return; // a tape owns the pixels; the grid keeps changing and is drawn again by `gfx_close`
         }
         let columns = self.columns;
         for row in 0..self.rows {
@@ -493,6 +499,85 @@ pub fn fill_rect(x: usize, y: usize, width: usize, height: usize, red: u8, green
         let value = console.pixel(red, green, blue);
         console.fill(x, y, width, height, value);
     }
+}
+
+/// What a tape sees of the screen: width, height in pixels and whether there is one (a pixel framebuffer; the BIOS text screen
+/// has none). Tape pixels are always 0x00RRGGBB; the kernel converts to the screen's byte order.
+pub fn gfx_info() -> Option<(u32, u32)> {
+    let console = unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }?;
+    (!console.text).then_some((console.width as u32, console.height as u32))
+}
+
+/// Gives the screen to a tape: the console stops painting (its text grid, serial and `term net` output carry on) and the
+/// screen is cleared to the console's background. False without a pixel framebuffer.
+pub fn gfx_open() -> bool {
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return false };
+    if console.text {
+        return false;
+    }
+    let (width, height, background) = (console.width, console.height, console.background);
+    console.fill(0, 0, width, height, background);
+    unsafe { GFX_OPEN = true };
+    true
+}
+
+/// Takes the screen back (also done when a tape ends): clears it and draws the whole text grid again.
+pub fn gfx_close() {
+    if !unsafe { GFX_OPEN } {
+        return;
+    }
+    unsafe { GFX_OPEN = false };
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return };
+    let (width, height, background) = (console.width, console.height, console.background);
+    console.fill(0, 0, width, height, background);
+    unsafe {
+        (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
+        CARET_AT = usize::MAX;
+    }
+    console.repaint();
+}
+
+/// A tape's 0x00RRGGBB in this framebuffer's byte order (`Console::pixel` for a packed colour).
+fn gfx_pixel(console: &Console, rgb: u32) -> u32 {
+    console.pixel((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+}
+
+/// Fills a rectangle (clipped to the screen) with 0x00RRGGBB. False if no tape has the screen open.
+pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| unsafe { GFX_OPEN }) else { return false };
+    let value = gfx_pixel(console, rgb);
+    console.fill(x as usize, y as usize, width as usize, height as usize, value);
+    true
+}
+
+/// Copies a w x h block of 0x00RRGGBB pixels (`stride` pixels per source row) to the screen at (x, y), clipped on the right
+/// and bottom. A BGR framebuffer has the same pixel layout, so each row is one copy; an RGB one swaps red and blue.
+///
+/// # Safety
+/// `source` must be readable for `(height - 1) * stride + width` pixels.
+pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u32, stride: u32) -> bool {
+    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| unsafe { GFX_OPEN }) else { return false };
+    let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+    if source.is_null() || stride < width || x >= console.width || y >= console.height {
+        return false;
+    }
+    let columns = width.min(console.width - x);
+    let rows = height.min(console.height - y);
+    let swap = console.format == PIXEL_RGB;
+    for row in 0..rows {
+        let from = unsafe { source.add(row * stride) };
+        let to = unsafe { console.base.add((y + row) * console.stride + x) };
+        if swap {
+            for column in 0..columns {
+                let value = unsafe { from.add(column).read() };
+                let swapped = value & 0xff00_ff00 | (value & 0xff) << 16 | (value >> 16) & 0xff;
+                unsafe { to.add(column).write_volatile(swapped) };
+            }
+        } else {
+            unsafe { core::ptr::copy_nonoverlapping(from, to, columns) };
+        }
+    }
+    true
 }
 
 pub fn write_str(text: &str) {

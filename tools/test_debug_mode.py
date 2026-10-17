@@ -69,6 +69,7 @@ class Machine:
         self.raw = bytearray()
         self.guest = None
         self.cpu = None  # a QEMU -cpu model, when a test needs one
+        self.monitor = None  # a path for QEMU's human monitor socket (screendump), when a test needs one
 
     def start(self):
         vars_copy = self.tmp / "vars.fd"
@@ -79,6 +80,8 @@ class Machine:
                    "-netdev", f"socket,id=net0,mcast={MCAST_GROUP}:{MCAST_PORT}", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:7b"]
         if self.cpu:
             command += ["-cpu", self.cpu]
+        if self.monitor:
+            command += ["-monitor", f"unix:{self.monitor},server,nowait"]
         self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.raw = bytearray()
         self.guest = None

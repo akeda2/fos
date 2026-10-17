@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`.
-pub const TAPE_API_VERSION: u32 = 16;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls.
+pub const TAPE_API_VERSION: u32 = 17;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -257,6 +257,24 @@ pub struct TapeApi {
     /// the tape's alone. A tape that wants AVX2 or FMA checks for `FP_AVX2` first (an `#[target_feature]` function, never
     /// the baseline build), and falls back to the SSE2 code otherwise.
     pub fp_level: extern "C" fn() -> u32,
+    /// `gfx_info()` (version 17): the pixel framebuffer's size as `width << 32 | height`, 0 when the machine has none (a BIOS
+    /// boot on the VGA text screen, or no video at all). Tape pixels are `0x00RRGGBB` whatever the screen's byte order is.
+    pub gfx_info: extern "C" fn() -> u64,
+    /// `gfx_open()` (version 17): the tape takes the screen. The console stops painting (its text grid, the serial port and
+    /// `term net` carry on, so `println!` still reaches those) and the screen is cleared to the console's background.
+    /// 1 on success, 0 without a pixel framebuffer. The kernel gives the screen back (`gfx_close`) when the tape ends.
+    pub gfx_open: extern "C" fn() -> u32,
+    /// `gfx_close()` (version 17): clears the screen and draws the console's text again.
+    pub gfx_close: extern "C" fn(),
+    /// `gfx_fill(x, y, width, height, rgb)` (version 17): a filled rectangle of one colour, clipped to the screen. 1 if drawn,
+    /// 0 if the tape has not opened the screen.
+    pub gfx_fill: extern "C" fn(u32, u32, u32, u32, u32) -> u32,
+    /// `gfx_blit(x, y, width, height, pixels, stride)` (version 17): copies `height` rows of `width` 0x00RRGGBB pixels
+    /// (`stride` pixels from one row to the next, at least `width`) to the screen at (x, y), clipped on the right and
+    /// bottom. 1 if drawn, 0 if not (the screen is not open, `pixels` is null, `stride < width`, or (x, y) is off screen).
+    /// The framebuffer is write-combining memory that is slow to read, so a tape keeps its picture in ordinary memory and
+    /// blits the part that changed.
+    pub gfx_blit: extern "C" fn(u32, u32, u32, u32, *const u32, u32) -> u32,
 }
 
 /// `fp_level` returns: no SSE state enabled, SSE2 (every x86-64 CPU; `f32`/`f64` in XMM registers), or AVX2 with FMA (the
