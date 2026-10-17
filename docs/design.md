@@ -940,8 +940,14 @@ noise, so a tone reads 2-3 dB low there.
 generator (`crates/noise`: white, pink, sine, on/off bursts, a 10 ms fade, RMS level in dB re a full-scale sine) is written
 to the output with `audio_write` in the same loop (full duplex through `audio_start(rate, capture, playback)`). The
 analyser is about 1.2 MB, allocated with `api.alloc`. `make test-ltas` checks screen, loop, keys and exit against QEMU's HD
-Audio codec; levels are checked by the crate tests and on real hardware. Not done yet: saving CSV/PNG (`s`), separate input
-and output devices.
+Audio codec; levels are checked by the crate tests and on real hardware. `device=N outdev=M` puts capture and playback on different devices (ABI 18, below). Not done yet: saving CSV/PNG (`s`).
+
+**Separate audio input and output (ABI 18).** `audio_use_output(N)` / shell `audio output N|same` sends playback to a
+different device than capture. `audio.rs` keeps `OUTPUT` beside `CHOSEN`: `audio_read`, the capture format and buffer follow the
+input, `audio_write`, the playback format and space follow the output, `audio_start` starts each direction on its own device,
+and `audio_info`/`audio_stats` combine the two (rates are the ones both offer). USB audio is one instance, so USB in + HD
+Audio out or the reverse works; two USB interfaces need a multi-instance `usb_audio.rs` (not done). `make test-ltas` runs
+HD Audio in, USB out and checks the 1 kHz tone in QEMU's USB recording; hardware untested.
 
 **Graphics for tapes (ABI 17).** `gfx_info` (width<<32|height, 0 in BIOS VGA text mode), `gfx_open`, `gfx_close`, `gfx_fill` and
 `gfx_blit` (a `u32` 0x00RRGGBB buffer with a stride in pixels, clipped at the right and bottom) let a tape draw on the
