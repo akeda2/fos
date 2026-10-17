@@ -154,6 +154,7 @@ impl Nic {
     pub fn set_tx_offload(&mut self, on: bool) -> bool {
         match self {
             Nic::E1000(nic) => nic.set_tx_offload(on),
+            Nic::Rtl8168(nic) => nic.set_tx_offload(on),
             _ => false,
         }
     }

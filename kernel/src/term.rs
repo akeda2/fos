@@ -3274,14 +3274,14 @@ fn nic_send_test() {
 /// in. A host on the same segment can check the sums (`tools/test_tx_offload.py`). Offload goes off again afterwards.
 fn nic_checksum_test(number: Option<&str>) {
     let Some(index) = number.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
-        return crate::println!("nic csum N: sends UDP frames with checksum 0 through the card's checksum offload (I350).");
+        return crate::println!("nic csum N: sends UDP frames with checksum 0 through the card's checksum offload (I350, RTL8168G/H).");
     };
     let mut mac = [0u8; 6];
     if !nic_mac(index - 1, &mut mac) {
         return;
     }
     if !nic_tx_offload(index - 1, true) {
-        return crate::println!("nic {index}: no transmit checksum offload on this interface (I350 only).");
+        return crate::println!("nic {index}: no transmit checksum offload on this interface (I350, RTL8168G/H).");
     }
     for length in [5usize, 26, 27] {
         let mut frame = [0u8; 14 + 20 + 8 + 27];

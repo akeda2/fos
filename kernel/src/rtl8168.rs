@@ -126,6 +126,12 @@ const DESC_FS: u32 = 1 << 29;
 const DESC_LS: u32 = 1 << 28;
 const DESC_RX_RES: u32 = 1 << 21; // receive error summary
 const DESC_LENGTH_MASK: u32 = 0x3fff;
+// Transmit `opts2` of the 8168C and later (Linux r8169 `TD1_*`; no datasheet lists them): which checksum to compute and,
+// from bit 18, the offset of the TCP/UDP header from the start of the frame.
+const TD1_IPV4_CS: u32 = 1 << 29;
+const TD1_TCP_CS: u32 = 1 << 30;
+const TD1_UDP_CS: u32 = 1 << 31;
+const TD1_TRANSPORT_SHIFT: u32 = 18;
 
 const DESCRIPTOR_BYTES: usize = 16;
 /// v1's lesson: with only 8-16 descriptors a tape forwarding a gigabit stream overran constantly.
@@ -172,9 +178,9 @@ fn read_opts1(ring: u64, index: usize) -> u32 {
 }
 
 /// Fills a descriptor and hands it over: address first, OWN (in `opts1`) last behind a fence.
-fn write_descriptor(ring: u64, index: usize, opts1: u32, address: u64) {
+fn write_descriptor(ring: u64, index: usize, opts1: u32, address: u64, opts2: u32) {
     unsafe {
-        write_volatile(field(ring, index, 1), 0); // VLAN
+        write_volatile(field(ring, index, 1), opts2); // VLAN, transmit checksum flags
         write_volatile(field(ring, index, 2), address as u32);
         write_volatile(field(ring, index, 3), (address >> 32) as u32);
     }
@@ -197,6 +203,8 @@ pub struct Rtl8168 {
     rx_next: usize,
     tx_next: usize,
     enable_after_config: bool,
+    /// Transmit checksum offload (`set_tx_offload`): `send` lets the chip sum IPv4 UDP/TCP frames.
+    tx_offload: bool,
     promiscuous: bool,
     pub mac: [u8; 6],
     pub frames_received: u64,
@@ -263,6 +271,7 @@ impl Rtl8168 {
             rx_next: 0,
             tx_next: 0,
             enable_after_config,
+            tx_offload: false,
             promiscuous: false,
             mac,
             frames_received: 0,
@@ -499,6 +508,51 @@ impl Rtl8168 {
         true
     }
 
+    /// Turns transmit checksum offload on or off. Only the 8168G/H generation, whose descriptor layout is the one used
+    /// here; false on older chips.
+    pub fn set_tx_offload(&mut self, on: bool) -> bool {
+        if !self.enable_after_config {
+            return false;
+        }
+        self.tx_offload = on;
+        true
+    }
+
+    /// For an IPv4 UDP frame whose checksum field is 0 ("none") or a TCP frame: writes the pseudo-header sum into the
+    /// checksum field of the descriptor's buffer copy (not complemented, as the chip wants it) and returns the `opts2`
+    /// flags that make the chip sum the TCP/UDP header and payload and complement. None for anything else (a fragment,
+    /// another protocol, a UDP frame that already has its checksum), which goes the ordinary way.
+    fn offload_flags(frame: &[u8], buffer: *mut u8) -> Option<u32> {
+        if frame.len() < 42 || frame[12..14] != [0x08, 0x00] || frame[14] >> 4 != 4 {
+            return None;
+        }
+        let ip_length = usize::from(frame[14] & 15) * 4;
+        let total = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+        let fragment = u16::from_be_bytes([frame[20], frame[21]]) & 0x3fff;
+        let l4 = 14 + ip_length;
+        if ip_length < 20 || fragment != 0 || total < ip_length || 14 + total > frame.len() {
+            return None;
+        }
+        let (checksum_at, protocol_flag) = match frame[23] {
+            17 if l4 + 8 <= 14 + total && frame[l4 + 6..l4 + 8] == [0, 0] => (l4 + 6, TD1_UDP_CS),
+            6 if l4 + 20 <= 14 + total => (l4 + 16, TD1_TCP_CS),
+            _ => return None,
+        };
+        let mut sum = 0u32;
+        for pair in frame[26..34].chunks(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        sum += u32::from(frame[23]) + (total - ip_length) as u32;
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        unsafe {
+            *buffer.add(checksum_at) = (sum >> 8) as u8;
+            *buffer.add(checksum_at + 1) = sum as u8;
+        }
+        Some(TD1_IPV4_CS | protocol_flag | (l4 as u32) << TD1_TRANSPORT_SHIFT)
+    }
+
     /// Queues one frame (padded to the 60-byte minimum). A frame sent with no link is dropped, as
     /// on the e1000 driver, instead of waiting for a descriptor that would never complete.
     pub fn send(&mut self, frame: &[u8]) -> bool {
@@ -527,8 +581,9 @@ impl Rtl8168 {
         destination[..frame.len()].copy_from_slice(frame);
         let length = frame.len().max(MIN_FRAME);
         destination[frame.len()..length].fill(0);
+        let flags = if self.tx_offload { Self::offload_flags(frame, buffer as *mut u8) } else { None };
         let eor = if index == TX_COUNT - 1 { DESC_EOR } else { 0 };
-        write_descriptor(ring, index, DESC_OWN | eor | DESC_FS | DESC_LS | length as u32, buffer);
+        write_descriptor(ring, index, DESC_OWN | eor | DESC_FS | DESC_LS | length as u32, buffer, flags.unwrap_or(0));
         write8(self.io_base, REG_TPPOLL, TPPOLL_NPQ); // doorbell: look at the normal-priority queue
         self.frames_sent += 1;
         true
@@ -567,7 +622,7 @@ impl Rtl8168 {
             count
         });
         // Hand the descriptor back whether or not the frame was good.
-        write_descriptor(self.rings, index, rx_opts1(index), buffer);
+        write_descriptor(self.rings, index, rx_opts1(index), buffer, 0);
         self.rx_next = (index + 1) % RX_COUNT;
         if copied.is_some() {
             self.frames_received += 1;
@@ -579,11 +634,11 @@ impl Rtl8168 {
 
 fn init_rings(rings: u64, rx_buffers: u64, tx_buffers: u64) {
     for index in 0..RX_COUNT {
-        write_descriptor(rings, index, rx_opts1(index), rx_buffers + (index * BUFFER_BYTES) as u64);
+        write_descriptor(rings, index, rx_opts1(index), rx_buffers + (index * BUFFER_BYTES) as u64, 0);
     }
     for index in 0..TX_COUNT {
         let eor = if index == TX_COUNT - 1 { DESC_EOR } else { 0 };
-        write_descriptor(rings + TX_RING_OFFSET, index, eor, tx_buffers + (index * BUFFER_BYTES) as u64);
+        write_descriptor(rings + TX_RING_OFFSET, index, eor, tx_buffers + (index * BUFFER_BYTES) as u64, 0);
     }
 }
 

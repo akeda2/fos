@@ -942,6 +942,11 @@ small at audio rates (a 1.5 KB sum is under a microsecond); it matters for nette
 `tools/test_tx_offload.py` checks real hardware (`nic csum N` sends three frames, the host verifies the sums); checked
 on skylake2's I350 (padded, even and odd lengths).
 
+The RTL8168G/H (chip version 0x4c0 and up) has the same call: `send` writes the pseudo-header sum into the checksum field
+and sets `opts2` bits 29 (IPv4), 30 (TCP) or 31 (UDP) plus the TCP/UDP header offset from bit 18 (Linux r8169's `TD1_*`; the
+public datasheet lists none of them). Older RTL8168s use another layout and answer false. RX checksum is not used (no
+consumer in the tape ABI). Checked on skylake4 and rack4 (chip 0x541) with `tools/test_tx_offload.py --nic 4`.
+
 **VLAN filter (ABI 13).** `nic_vlan_filter(nic, vid, on)` sets one bit of the E1000 family's VFTA (0x5600, 4096 bits). The
 filter (`RCTL.VFE`) is on only while at least one id is registered and the card is not promiscuous, so existing tapes
 (bridge, nettest) still see every tag; untagged frames always pass. The kernel clears the table and the filter when a
