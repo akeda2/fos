@@ -1,4 +1,4 @@
-//! The loudness (LUFS) panel left of the scope: a bar for momentary or short-term loudness on the EBU "+9" or "+18" LU scale
+//! The loudness (LUFS) panel left of the scope: a bar each for momentary and short-term loudness on the EBU "+9" or "+18" LU scale
 //! (0 = the target), the numbers (M, S, I, LRA) and a history of the short-term loudness. The measurement is `dsp::loudness`.
 
 use crate::layout::Rect;
@@ -15,12 +15,12 @@ pub const TARGETS: [f32; 3] = [-23.0, -24.0, -14.0];
 pub const HISTORY: usize = 512;
 const HISTORY_H: u32 = 110;
 const BAR_W: u32 = 26;
+const BARS_W: u32 = 2 * BAR_W + 10;
 const LABELS: i32 = 34;
 
 pub struct Panel {
     pub target: usize,
     pub wide: bool,
-    pub short: bool,
     history: [f32; HISTORY],
     filled: usize,
     next: usize,
@@ -29,7 +29,7 @@ pub struct Panel {
 
 impl Panel {
     pub fn new() -> Self {
-        Self { target: 0, wide: false, short: false, history: [FLOOR_LUFS; HISTORY], filled: 0, next: 0, steps: 0 }
+        Self { target: 0, wide: false, history: [FLOOR_LUFS; HISTORY], filled: 0, next: 0, steps: 0 }
     }
 
     pub fn target_lufs(&self) -> f32 {
@@ -77,13 +77,15 @@ impl Panel {
         if !Self::fits(area) {
             return;
         }
-        meter::draw_scale(canvas, self.scale(), Self::bar_x(area), BAR_W, area.y, Self::bar_height(area));
+        meter::draw_scale(canvas, self.scale(), Self::bar_x(area), BARS_W, area.y, Self::bar_height(area));
+        canvas.text(Self::bar_x(area), area.y - 26, "M", DIM);
+        canvas.text(Self::bar_x(area) + BAR_W as i32 + 10, area.y - 26, "S", DIM);
         canvas.text(Self::numbers_x(area), area.y - 26, "loudness", DIM);
         canvas.text(area.x, area.y + area.h as i32 - HISTORY_H as i32 - 20, "short-term history", DIM);
     }
 
     fn numbers_x(area: Rect) -> i32 {
-        Self::bar_x(area) + BAR_W as i32 + 6 + LABELS + 6
+        Self::bar_x(area) + BARS_W as i32 + 6 + LABELS + 6
     }
 
     pub fn draw(&self, canvas: &mut Canvas, area: Rect, loudness: &Loudness) {
@@ -92,12 +94,13 @@ impl Panel {
         }
         let target = self.target_lufs();
         let scale = self.scale();
-        let shown = if self.short { loudness.short_term() } else { loudness.momentary() };
         let to_lu = |lufs: f32| if lufs <= FLOOR_LUFS + 1.0 { -200.0 } else { (lufs - target).max(scale.min + 0.01) };
-        let level = to_lu(shown);
         let height = Self::bar_height(area);
         let (x, y) = (Self::bar_x(area), area.y);
-        meter::draw_bar(canvas, scale, x, BAR_W, y, height, level, level, false);
+        for (index, lufs) in [loudness.momentary(), loudness.short_term()].into_iter().enumerate() {
+            let level = to_lu(lufs);
+            meter::draw_bar(canvas, scale, x + index as i32 * (BAR_W as i32 + 10), BAR_W, y, height, level, level, false);
+        }
 
         let tx = Self::numbers_x(area);
         let mut row = y;
@@ -114,8 +117,8 @@ impl Panel {
             row += 24;
         };
         let (m, s) = (loudness.momentary(), loudness.short_term());
-        line(canvas, if self.short { "M " } else { "M>" }, Some(m), "LUFS", TEXT);
-        line(canvas, if self.short { "S>" } else { "S " }, Some(s), "LUFS", TEXT);
+        line(canvas, "M ", Some(m), "LUFS", TEXT);
+        line(canvas, "S ", Some(s), "LUFS", TEXT);
         line(canvas, "I ", loudness.integrated(), "LUFS", TEXT);
         line(canvas, "LRA", loudness.range(), "LU", TEXT);
         let mut out = Line::<24>::new();

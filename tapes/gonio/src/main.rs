@@ -26,7 +26,7 @@ use tape_rt::{Key, KeyDecoder, Line, TapeApi, alloc_bytes, arg_value as value, p
 tape_rt::tape_help!(
     br#"gonio [@NAME] [device=N] [chan=A,B] [rate=48000] [scale=nordic|dbfs]
       [style=dots|lines] [law=log|linear] [range=DB] [gain=DB] [tau=SECONDS]
-      [target=-23|-24|-14] [ebu=9|18] [lufs=m|s]
+      [target=-23|-24|-14] [ebu=9|18]
       [src=input|test] [phase=DEG] [tone=HZ] [level=-18] [right=DB]
 Goniometer for two input channels (default 1,2; `device=` picks the audio
 device, `audio` numbers them): phase scope with persistence (mono is a
@@ -38,16 +38,15 @@ stereo tone (phase=DEG between L and R, right=DB level difference) instead.
 The left side is a loudness (EBU R128, ITU BS.1770 LUFS) panel: M (400 ms),
 S (3 s), I (integrated, gated), LRA and a one-per-second history of S.
 Its bar reads in LU against the target (-23 EBU, -24 ATSC, -14 streaming) on
-the EBU +9 or +18 scale; lufs=m|s picks M or S for the bar.
+the EBU +9 or +18 scale, one bar for M and one for S.
 Keys (Escape quits):
   space freeze   r reset (holds, clip lamps, scope)   m Nordic/dBFS scale
   v dots/lines   l log/linear scope law   x log range 30/40/50/60 dB
                (log: the centre is -range dBFS, quiet signals stay visible)
   + - scope gain 3 dB   , . input pair -/+ (1-2, 3-4, ...)
-  t loudness target -23/-24/-14   e EBU scale +9/+18   b bar M/S
+  t loudness target -23/-24/-14   e EBU scale +9/+18
   i reset I and LRA
-  w save the settings (scale, style, law, range, gain, tau, rate, target, ebu,
-    lufs) in gonio.cfg
+  w save the settings (scale, style, law, range, gain, tau, rate, target, ebu) in gonio.cfg
   p test tone phase 0/45/90/135/180   (src=test)
 Settings: gonio.cfg is read at start (key=value words, # comments); `@NAME` on
 the command line reads that file instead (any diskN/NAME) and w saves to it.
@@ -143,7 +142,6 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         None => 0,
     };
     panel.wide = value(arguments, "ebu") == Some("18");
-    panel.short = value(arguments, "lufs") == Some("s");
     let mut tone = PairSine::new();
     tone.set_rate(state.rate);
     tone.set_frequency(value(arguments, "tone").and_then(parse_f32).unwrap_or(997.0));
@@ -186,7 +184,6 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     panel.wide = !panel.wide;
                     draw_grid(&mut screen, &layout, state.kind, &panel);
                 }
-                Key::Char(b'b') => panel.short = !panel.short,
                 Key::Char(b'i') => {
                     loudness.reset();
                     panel.clear_history();
@@ -204,7 +201,6 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     body.put("rate", format_args!("{}", state.rate));
                     body.put("target", format_args!("{:.0}", panel.target_lufs()));
                     body.put("ebu", format_args!("{}", if panel.wide { 18 } else { 9 }));
-                    body.put("lufs", format_args!("{}", if panel.short { "s" } else { "m" }));
                     match config.save(api, body.as_str()) {
                         Ok(name) => {
                             let _ = write!(message, "saved {name}");
@@ -349,5 +345,5 @@ fn draw_status(canvas: &mut gfx::Canvas, law: &str, layout: &Layout, state: &Sta
     if !message.is_empty() {
         canvas.text_right(layout.width as i32 - 16, 6, message, gfx::meter::AMBER);
     }
-    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  w save  t target  e EBU  b M/S  i reset  +- gain  , . channels  p test phase  Esc", DIM);
+    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  w save  t target  e EBU  i reset  +- gain  , . channels  p test phase  Esc", DIM);
 }
