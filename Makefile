@@ -121,9 +121,9 @@ LOADER_EFI := $(CARGO_TARGET_DIR)/x86_64-unknown-uefi/release/fosfor-loader.efi
 KERNEL_ELF := $(CARGO_TARGET_DIR)/x86_64-fos-kernel/release/fosfor-kernel
 IMAGE := $(OUT)/fosfor.img
 # tapes: one crate each under tapes/ (shared libraries live in crates/), each built to build/cargo-target/x86_64-fos-tape/release/NAME.
-TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp fterm fpcheck gfxcheck ltas
+TAPES := hello calc memtest nettest bridge router ip-chat telnet net-chat ed record recorder play audio-net ptp fterm fpcheck gfxcheck ltas gonio
 # Hard-float tapes (target x86_64-fos-tape-fp, SSE2/AVX2; the kernel enables SSE before they start) build into their own directory.
-FP_TAPES := fpcheck ltas
+FP_TAPES := fpcheck ltas gonio
 tape_dir = x86_64-fos-tape$(if $(filter $(1),$(FP_TAPES)),-fp)
 TAPE_BINS := $(foreach tape,$(TAPES),$(CARGO_TARGET_DIR)/$(call tape_dir,$(tape))/release/$(tape))
 # The image and deployments use the stamped copies (tools/stamp_tape.py: the `.fos_build` section `tapesync` compares).
@@ -143,7 +143,7 @@ OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-a
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
+.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -250,6 +250,10 @@ test-gfx: image
 # The ltas tape (graphic spectrum analyser) against QEMU's HD Audio codec: screen, analysis loop, keys, exit.
 test-ltas: image
 	python3 tools/test_ltas.py
+
+# The gonio tape (goniometer, correlation and level meters) with its built-in stereo test tone: mono and opposite polarity.
+test-gonio: image
+	python3 tools/test_gonio.py
 
 
 # USB audio class 1.0 against QEMU's usb-audio: discovery, a played tone recorded to WAV, capture.

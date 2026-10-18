@@ -203,6 +203,63 @@ impl Generator {
     }
 }
 
+/// A stereo test tone: the same sine on both channels with a phase offset and level difference on the right, so a
+/// goniometer or correlation meter has something known to show without an input (offset 0 = mono, correlation +1; 90 degrees
+/// = 0; 180 = opposite polarity, -1). `level_db` is the left channel's RMS dB (as `Generator`); `right_db` the right's
+/// level relative to the left.
+pub struct PairSine {
+    sample_rate: f32,
+    frequency: f32,
+    left: f32,
+    right: f32,
+    phase_offset: f64,
+    phase: f64,
+}
+
+impl PairSine {
+    pub const fn new() -> Self {
+        Self { sample_rate: 48000.0, frequency: 1000.0, left: 0.1, right: 0.1, phase_offset: 0.0, phase: 0.0 }
+    }
+
+    pub fn set_rate(&mut self, sample_rate: u32) {
+        self.sample_rate = sample_rate as f32;
+    }
+
+    pub fn set_frequency(&mut self, hz: f32) {
+        self.frequency = hz;
+    }
+
+    /// Left RMS dB re a full-scale sine's RMS, and the right channel relative to it.
+    pub fn set_level_db(&mut self, level_db: f32, right_db: f32) {
+        self.left = pow10(level_db / 20.0);
+        self.right = pow10((level_db + right_db) / 20.0);
+    }
+
+    pub fn set_phase_degrees(&mut self, degrees: f32) {
+        self.phase_offset = degrees as f64 * core::f64::consts::PI / 180.0;
+    }
+
+    /// Fills both slices (equal length; the shorter counts) with samples in -1..1.
+    pub fn fill(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let step = 2.0 * core::f64::consts::PI * self.frequency as f64 / self.sample_rate as f64;
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            self.phase += step;
+            if self.phase > core::f64::consts::TAU {
+                self.phase -= core::f64::consts::TAU;
+            }
+            let (a, b) = (sin_cos64(self.phase).0 as f32, sin_cos64(self.phase + self.phase_offset).0 as f32);
+            *l = (a * self.left * core::f32::consts::SQRT_2).clamp(-1.0, 1.0);
+            *r = (b * self.right * core::f32::consts::SQRT_2).clamp(-1.0, 1.0);
+        }
+    }
+}
+
+impl Default for PairSine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Writes `mono` into `out` as interleaved frames: `channels` channels, each sample in a `slot`-byte little-endian signed slot
 /// holding `bits` significant bits (left-justified, as USB audio does), the signal on every channel selected in `mask` (bit 0
 /// = channel 1) and zero elsewhere. Returns the bytes written (as many whole frames as fit).
@@ -229,6 +286,19 @@ pub fn pack(mono: &[f32], out: &mut [u8], channels: usize, slot: usize, bits: us
 mod tests {
     use super::*;
     use ltas::{Analyzer, Config, Mode, Resolution};
+
+    #[test]
+    fn pair_sine_levels_and_phase() {
+        let mut pair = PairSine::new();
+        pair.set_level_db(-6.0, -6.0);
+        pair.set_phase_degrees(180.0);
+        let (mut l, mut r) = (vec![0.0; 4800], vec![0.0; 4800]);
+        pair.fill(&mut l, &mut r);
+        let peak = |v: &[f32]| v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert!((peak(&l) - 0.5012 * core::f32::consts::SQRT_2).abs() < 0.01);
+        assert!((peak(&r) / peak(&l) - 0.5012).abs() < 0.01);
+        assert!(l.iter().zip(&r).all(|(a, b)| a * b <= 1e-6));
+    }
 
     fn generate(kind: Kind, db: f32, samples: usize) -> Vec<f32> {
         let mut generator = Generator::new();

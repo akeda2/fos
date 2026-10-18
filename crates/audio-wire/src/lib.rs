@@ -617,6 +617,13 @@ pub mod meter {
     /// A sample this close to full scale (about -0.04 dB) counts as clipping.
     pub const CLIP: u32 = 0x7ff0_0000;
 
+    /// The detector input for a sample in -1..1 (its magnitude, 1.0 = `FULL_SCALE`).
+    #[inline]
+    pub fn magnitude(sample: f32) -> u32 {
+        let a = if sample < 0.0 { -sample } else { sample };
+        if a >= 1.0 { FULL_SCALE } else { (a * FULL_SCALE as f32) as u32 }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Coefficients {
         /// Fraction (of 2^16) of the gap to a higher input closed per sample.

@@ -12,3 +12,4 @@ tape-rt = { path = "../tape-rt" }
 dsp = { path = "../dsp" }
 gfx = { path = "../gfx" }
 noise = { path = "../noise" }
+audio-wire = { path = "../audio-wire" }

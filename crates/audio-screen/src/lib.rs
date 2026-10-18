@@ -4,6 +4,8 @@
 //! frames-a-second rhythm, and `poll_keys` reads the keyboard. What is measured and drawn stays in the tape.
 #![cfg_attr(not(test), no_std)]
 
+pub mod meters;
+
 use dsp::pcm::unpack_channel;
 use gfx::Canvas;
 use tape_rt::{AudioInfo, Key, KeyDecoder, TapeApi, alloc_pixels, alloc_zeroed};
@@ -41,6 +43,8 @@ pub struct Input {
     pub bits: usize,
     /// 0-based.
     pub channel: usize,
+    /// The second channel of a stereo pair (0-based), for the tools that take two; `query` sets it to `channel`.
+    pub second: usize,
     pub playback_channels: usize,
     pub playback_slot: usize,
     pub playback_bits: usize,
@@ -67,6 +71,7 @@ impl Input {
             slot: info.capture_slot_bytes as usize,
             bits: info.capture_bits as usize,
             channel,
+            second: channel,
             playback_channels: info.playback_channels as usize,
             playback_slot: info.playback_slot_bytes as usize,
             playback_bits: info.playback_bits as usize,
@@ -102,6 +107,41 @@ impl Input {
             Key::Char(b',') => self.channel = if self.channel == 0 { last } else { self.channel - 1 },
             _ => return false,
         }
+        true
+    }
+
+    /// A stereo pair: `first` and `second` are the 1-based `chan=A,B` values (0 is taken as 1); a one-channel device pairs
+    /// channel 1 with itself.
+    pub fn set_pair(&mut self, first: usize, second: usize) -> Result<(), &'static str> {
+        let (a, b) = (first.max(1) - 1, second.max(1) - 1);
+        if a >= self.channels || b >= self.channels {
+            return Err("chan= is out of range for this device's input channels");
+        }
+        self.channel = a;
+        self.second = b;
+        Ok(())
+    }
+
+    /// The default pair: channels 1 and 2 (or 1 and 1 on a one-channel device).
+    pub fn default_pair(&mut self) {
+        self.channel = 0;
+        self.second = if self.channels > 1 { 1 } else { 0 };
+    }
+
+    /// `,` (previous) and `.` (next): steps the pair by two channels (1-2, 3-4, ...), wrapping. True when it changed.
+    pub fn step_pair(&mut self, key: Key) -> bool {
+        if self.channels < 3 {
+            return false;
+        }
+        let pairs = self.channels / 2;
+        let now = self.channel / 2;
+        let next = match key {
+            Key::Char(b'.') => (now + 1) % pairs,
+            Key::Char(b',') => (now + pairs - 1) % pairs,
+            _ => return false,
+        };
+        self.channel = next * 2;
+        self.second = next * 2 + 1;
         true
     }
 
@@ -259,7 +299,7 @@ mod tests {
     use super::*;
 
     fn input(channels: usize) -> Input {
-        Input { channels, slot: 4, bits: 24, channel: 0, playback_channels: 0, playback_slot: 0, playback_bits: 0, rates: [0; 16], rate_count: 0 }
+        Input { channels, slot: 4, bits: 24, channel: 0, playback_channels: 0, playback_slot: 0, playback_bits: 0, rates: [0; 16], rate_count: 0, second: 0 }
     }
 
     #[test]
@@ -272,5 +312,18 @@ mod tests {
         assert!(many.step_channel(Key::Char(b'.')));
         assert_eq!(many.channel, 0);
         assert!(!many.step_channel(Key::Char(b'x')));
+    }
+
+    #[test]
+    fn pairs_step_by_two_and_wrap() {
+        let mut ten = input(10);
+        ten.default_pair();
+        assert_eq!((ten.channel, ten.second), (0, 1));
+        assert!(ten.step_pair(Key::Char(b'.')));
+        assert_eq!((ten.channel, ten.second), (2, 3));
+        assert!(ten.step_pair(Key::Char(b',')) && ten.step_pair(Key::Char(b',')));
+        assert_eq!((ten.channel, ten.second), (8, 9));
+        assert!(ten.set_pair(9, 3).is_ok() && ten.set_pair(1, 11).is_err());
+        assert!(!input(2).step_pair(Key::Char(b'.')));
     }
 }

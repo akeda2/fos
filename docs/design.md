@@ -944,6 +944,17 @@ and dB `Scale`, the dB grid, staircase/polyline `curve`, Catmull-Rom `spline`), 
 `with_buffers` for a CSV/PNG save to an exFAT or FAT32 stick). The Nordic PPM detector is `audio_wire::meter`. Behaviour of
 `ltas` is unchanged (`make test-ltas`).
 
+**The `gonio` tape** (`tapes/gonio`, `make test-gonio`) is a broadcast-style goniometer: a phosphor-persistence scope in the
+middle (x = (R-L)/2, y = (L+R)/2, so mono is vertical, L only leans up-left, opposite polarity is horizontal), a Nordic PPM or
+dBFS bar per channel on the right (`m` switches; peak hold and clip lamp), a correlation bar and a balance bar under the scope,
+and a reserved rect on the left for a later LUFS meter. It takes the first two channels of the device (`chan=A,B`, `,` `.` step
+the pair by two) and adapts its layout to the screen (`layout.rs`, designed for 16:9). QEMU has no audio input, so `src=test`
+plays a built-in stereo tone through the same path (`phase=`, `right=`, `p` cycles the phase). The reusable parts:
+`gfx::scope` (`Phosphor`, `draw_graticule`), `gfx::meter` (`Scale` DBFS/NORDIC, `draw_scale`, `draw_bar`, `draw_bipolar`),
+`dsp::stereo` (`Correlator`: correlation and balance), `dsp::level` (`SamplePeak` with clip detection, `PeakHold`),
+`audio_screen::meters` (one channel's PPM + sample peak + holds), `Input::set_pair`/`step_pair`, `noise::PairSine`. The test
+tone is not commensurate with the sample rate (997 Hz) so the dot scope does not draw 48 fixed points.
+
 **The `ltas` tape.** `tapes/ltas` ties the crates together: it captures with `audio_read`, unpacks one channel
 (`dsp::pcm`), feeds `ltas::Analyzer`, and draws into a RAM `gfx::Canvas` blitted at most 20 times a second. The built-in
 generator (`crates/noise`: white, pink, sine, on/off bursts, a 10 ms fade, RMS level in dB re a full-scale sine) is written

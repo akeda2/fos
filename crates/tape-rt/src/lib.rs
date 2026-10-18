@@ -12,7 +12,7 @@ pub mod save;
 pub mod text;
 
 pub use fosfor_abi::tape::*;
-pub use text::{Line, alloc_pixels, alloc_zeroed, arg_value, parse_f32};
+pub use text::{Line, alloc_bytes, alloc_pixels, alloc_zeroed, arg_value, parse_f32};
 
 use core::fmt::Write;
 

@@ -1,0 +1,22 @@
+[package]
+name = "gonio-tape"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "gonio"
+path = "src/main.rs"
+
+[dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
+tape-rt = { path = "../../crates/tape-rt" }
+dsp = { path = "../../crates/dsp" }
+gfx = { path = "../../crates/gfx" }
+noise = { path = "../../crates/noise" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"

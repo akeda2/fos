@@ -96,6 +96,18 @@ pub fn alloc_pixels(api: &TapeApi, count: usize) -> Option<&'static mut [u32]> {
     }
 }
 
+/// `count` zeroed bytes from the kernel.
+pub fn alloc_bytes(api: &TapeApi, count: usize) -> Option<&'static mut [u8]> {
+    let address = (api.alloc)(count);
+    if address == 0 {
+        return None;
+    }
+    unsafe {
+        core::ptr::write_bytes(address as *mut u8, 0, count);
+        Some(core::slice::from_raw_parts_mut(address as *mut u8, count))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
