@@ -21,7 +21,7 @@ use noise::PairSine;
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, alloc_bytes, arg_value as value, parse_f32, println};
 
 tape_rt::tape_help!(
-    br#"gonio [device=N] [chan=A,B] [rate=48000] [scale=nordic|dbfs]
+    br#"gonio [@NAME] [device=N] [chan=A,B] [rate=48000] [scale=nordic|dbfs]
       [style=dots|lines] [law=log|linear] [range=DB] [gain=DB] [tau=SECONDS]
       [src=input|test] [phase=DEG] [tone=HZ] [level=-18] [right=DB]
 Goniometer for two input channels (default 1,2; `device=` picks the audio
@@ -36,7 +36,11 @@ Keys (Escape quits):
   v dots/lines   l log/linear scope law   x log range 30/40/50/60 dB
                (log: the centre is -range dBFS, quiet signals stay visible)
   + - scope gain 3 dB   , . input pair -/+ (1-2, 3-4, ...)
+  w save the settings (scale, style, law, range, gain, tau, rate) in gonio.cfg
   p test tone phase 0/45/90/135/180   (src=test)
+Settings: gonio.cfg is read at start (key=value words, # comments); `@NAME` on
+the command line reads that file instead (any diskN/NAME) and w saves to it.
+Words on the command line win over the file. An unset key keeps its default.
 "#
 );
 
@@ -66,7 +70,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Ok(started) => started,
         Err(reason) => return println!("gonio: {reason}."),
     };
-    let (arguments, width, height) = (started.arguments, started.width, started.height);
+    let config = match tape_rt::config::Config::load(api, "gonio", started.arguments) {
+        Ok(config) => config,
+        Err(reason) => return println!("gonio: {reason}."),
+    };
+    let (arguments, width, height) = (config.text(), started.width, started.height);
     let mut state = State {
         rate: value(arguments, "rate").and_then(|v| v.parse().ok()).unwrap_or(48_000),
         kind: if value(arguments, "scale") == Some("dbfs") { MeterKind::Dbfs } else { MeterKind::Nordic },
@@ -152,6 +160,24 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     draw_grid(&mut screen, &layout, state.kind);
                 }
                 Key::Char(b'v') => state.lines = !state.lines,
+                Key::Char(b'w') => {
+                    let mut body = tape_rt::config::Settings::<256>::new();
+                    body.put("scale", format_args!("{}", if state.kind == MeterKind::Dbfs { "dbfs" } else { "nordic" }));
+                    body.put("style", format_args!("{}", if state.lines { "lines" } else { "dots" }));
+                    body.put("law", format_args!("{}", if phosphor.law == Law::Log { "log" } else { "linear" }));
+                    body.put("range", format_args!("{:.0}", phosphor.range_db));
+                    body.put("gain", format_args!("{:.0}", state.gain_db));
+                    body.put("tau", format_args!("{:.2}", state.tau_s));
+                    body.put("rate", format_args!("{}", state.rate));
+                    match config.save(api, body.as_str()) {
+                        Ok(name) => {
+                            let _ = write!(message, "saved {name}");
+                        }
+                        Err(reason) => {
+                            let _ = write!(message, "save: {reason}");
+                        }
+                    }
+                }
                 Key::Char(b'x') => {
                     phosphor.range_db = if phosphor.range_db >= 60.0 { 30.0 } else { phosphor.range_db + 10.0 };
                     phosphor.clear();
@@ -283,5 +309,5 @@ fn draw_status(canvas: &mut gfx::Canvas, law: &str, layout: &Layout, state: &Sta
     if !message.is_empty() {
         canvas.text_right(layout.width as i32 - 16, 6, message, gfx::meter::AMBER);
     }
-    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  +- gain  , . channels  p test phase  Esc", DIM);
+    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  w save  +- gain  , . channels  p test phase  Esc", DIM);
 }

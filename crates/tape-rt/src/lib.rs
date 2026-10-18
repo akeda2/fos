@@ -8,6 +8,7 @@
 #![no_std]
 
 pub mod abort;
+pub mod config;
 pub mod save;
 pub mod text;
 

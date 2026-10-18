@@ -958,6 +958,13 @@ of the bars with a dimmer dBFS column outside. Capture only is started (an unfed
 screen is redrawn every loop (`Screen::due` needs `mark_dirty`). The test
 tone is not commensurate with the sample rate (997 Hz) so the dot scope does not draw 48 fixed points.
 
+**Remembered options (`tape_rt::config`).** A tape keeps its settings in a FOSFS text file of the same `key=value` words the
+command line takes: `Config::load(api, "gonio", args)` reads `gonio.cfg` (missing is fine), or, with `@NAME` on the command
+line, that file instead (`diskN/NAME` and `@LABEL/NAME` work; a missing one is an error). Words on the command line come first
+and so win; `#` comments and newlines are allowed in the file. `Settings` builds the body for `Config::save`, which rewrites
+the file that was loaded. `gonio` saves with `w` (scale, style, law, range, gain, tau, rate; never `device=`, `chan=` or the
+test tone, whose numbers are not stable). Tested in `crates/tape-rt` (host) and `make test-gonio`. Not yet used by `ltas`.
+
 **The `ltas` tape.** `tapes/ltas` ties the crates together: it captures with `audio_read`, unpacks one channel
 (`dsp::pcm`), feeds `ltas::Analyzer`, and draws into a RAM `gfx::Canvas` blitted at most 20 times a second. The built-in
 generator (`crates/noise`: white, pink, sine, on/off bursts, a 10 ms fade, RMS level in dB re a full-scale sine) is written
