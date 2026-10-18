@@ -66,6 +66,15 @@ pub fn pop() -> Option<u8> {
     pop_keyboard().or_else(crate::serial::read_byte).or_else(crate::uart::shell_read)
 }
 
+/// Like `pop`, and says whether the byte came from a serial port (a terminal's bytes, where Escape also starts a cursor-key
+/// sequence) rather than a local keyboard.
+pub fn pop_with_source() -> Option<(u8, bool)> {
+    if let Some(byte) = pop_keyboard() {
+        return Some((byte, false));
+    }
+    crate::serial::read_byte().or_else(crate::uart::shell_read).map(|byte| (byte, true))
+}
+
 fn pop_keyboard() -> Option<u8> {
     let tail = TAIL.load(Ordering::Relaxed);
     if tail == HEAD.load(Ordering::Acquire) {

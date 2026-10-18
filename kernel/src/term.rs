@@ -934,11 +934,34 @@ fn drain_nics_to_fifo() {
     }
 }
 
+/// When a lone ESC byte arrived from a serial port and may still turn out to start a cursor-key sequence (0 = none pending).
+static mut SERIAL_ESCAPE_AT: u64 = 0;
+/// How long a serial Escape waits for the `[` of a sequence: a terminal sends the bytes back to back (a few ms at 9600 baud).
+const SERIAL_ESCAPE_US: u64 = 50_000;
+
 fn tape_service() {
     crate::debug::pet();
     crate::usb_hid::poll();
-    while let Some(key) = crate::keyboard::pop() {
-        if key == 0x1b {
+    while let Some((key, serial)) = crate::keyboard::pop_with_source() {
+        if serial {
+            // A terminal sends an arrow key as ESC [ A: only an Escape not followed (within SERIAL_ESCAPE_US) by `[` or `O`
+            // is "stop", else every cursor key would end the tape.
+            let now = apic::micros();
+            if unsafe { SERIAL_ESCAPE_AT } != 0 {
+                unsafe { SERIAL_ESCAPE_AT = 0 };
+                if key == b'[' || key == b'O' {
+                    tape_input_push(0x1b);
+                    tape_input_push(u16::from(key));
+                    continue;
+                }
+                tape_input_push(TAPE_ABORT);
+            }
+            if key == 0x1b {
+                unsafe { SERIAL_ESCAPE_AT = now.max(1) };
+                continue;
+            }
+            tape_input_push(u16::from(key));
+        } else if key == 0x1b {
             tape_input_push(TAPE_ABORT);
         } else if let Some(sequence) = fosfor_abi::keymap::ansi_sequence(key) {
             // A cursor key (a private code from the keyboard decoders): the tape sees the bytes a
@@ -956,6 +979,10 @@ fn tape_service() {
         } else {
             tape_input_push(u16::from(key));
         }
+    }
+    if unsafe { SERIAL_ESCAPE_AT } != 0 && apic::micros().wrapping_sub(unsafe { SERIAL_ESCAPE_AT }) > SERIAL_ESCAPE_US {
+        unsafe { SERIAL_ESCAPE_AT = 0 };
+        tape_input_push(TAPE_ABORT);
     }
     drain_nics_to_fifo();
     crate::uart::poll();

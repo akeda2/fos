@@ -123,6 +123,16 @@ def main():
             check(wait_peer("fos> ", 20, mark) and "carries this machine's shell" in seen()[mark:], "fterm refuses the port that carries the shell", seen()[mark:])
 
             mark = len(seen())
+            send(b"run fterm\r")
+            pump(1.5)
+            send(b"\x1b[B")
+            send(b"\x1b[A")
+            pump(0.5)
+            check("fos> " not in seen()[mark:], "cursor keys (ESC [ A) on the port do not stop a running tape", seen()[mark:])
+            send(b"\x1b")
+            check(wait_peer("fos> ", 10, mark), "a lone Escape on the port still stops it", seen()[mark:])
+
+            mark = len(seen())
             send(b"uptime\r")
             check(wait_peer("ticks at 100 Hz", 20, mark), "and the shell is still usable", seen()[mark:])
         finally:
