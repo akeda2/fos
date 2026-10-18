@@ -947,7 +947,7 @@ and dB `Scale`, the dB grid, staircase/polyline `curve`, Catmull-Rom `spline`), 
 **The `gonio` tape** (`tapes/gonio`, `make test-gonio`) is a broadcast-style goniometer: a phosphor-persistence scope in the
 middle (x = (R-L)/2, y = (L+R)/2, so mono is vertical, L only leans up-left, opposite polarity is horizontal), a Nordic PPM or
 dBFS bar per channel on the right (`m` switches; peak hold and clip lamp), a correlation bar and a balance bar under the scope,
-and a reserved rect on the left for a later LUFS meter. It takes the first two channels of the device (`chan=A,B`, `,` `.` step
+and a loudness panel on the left (`tapes/gonio/src/lufs.rs`, measurement in `dsp::loudness`: BS.1770 K-weighting, M 400 ms, S 3 s, gated integrated and LRA from 0.1 LU histograms; a bar in LU against the target -23/-24/-14 on the EBU +9 or +18 scale, numbers, and a one-per-second history of S; keys `t` `e` `b` `i`, args `target=` `ebu=` `lufs=`, saved by `w`; no true-peak yet). It takes the first two channels of the device (`chan=A,B`, `,` `.` step
 the pair by two) and adapts its layout to the screen (`layout.rs`, designed for 16:9). QEMU has no audio input, so `src=test`
 plays a built-in stereo tone through the same path (`phase=`, `right=`, `p` cycles the phase). The reusable parts:
 `gfx::scope` (`Phosphor`, `draw_graticule`), `gfx::meter` (`Scale` DBFS/NORDIC, `draw_scale`, `draw_bar`, `draw_bipolar`),

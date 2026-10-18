@@ -27,8 +27,7 @@ pub struct Layout {
     /// Where the bars are (the scale's labels sit on both sides of it); same top and height as the scope.
     pub bars: Rect,
     pub bar_w: u32,
-    /// Reserved for a loudness meter.
-    #[allow(dead_code)]
+    /// The loudness panel.
     pub left_panel: Rect,
 }
 

@@ -78,6 +78,19 @@ def main():
             meter_x = sx + size + 28 + 56 + 5
             lit_bar = sum(1 for y in range(sy, sy + size) if pixel(meter_x, y) not in (BACKGROUND, AXIS))
             check(lit_bar > 20, f"the left level meter is lit ({lit_bar} rows)", "")
+            def loudness_rows(pixel):
+                """Lit rows of the loudness bar (tapes/gonio/src/lufs.rs: x = 16 + 34 + 13, height = scope - 154)."""
+                return sum(1 for y in range(sy, sy + size - 154) if sum(pixel(16 + 34 + 13, y)) > 300)
+
+            full = loudness_rows(pixel)
+            check(full > 40, f"the loudness bar is lit ({full} rows)", "")
+            for _ in range(2):  # -23 -> -24 -> -14: the same -12 LUFS tone is then +2 LU, well below the +9 end
+                machine.wire.send(machine.guest, TAG_DATA, b"t")
+                time.sleep(0.3)
+            time.sleep(3)
+            _, _, pixel = screenshot(machine.monitor, "gonio_lufs.ppm")
+            lower = loudness_rows(pixel)
+            check(lower < full - 15, f"the target toggle moves the bar ({full} -> {lower} rows)", "")
             for key in (b"p", b"p", b"p", b"p"):
                 machine.wire.send(machine.guest, TAG_DATA, key)
                 time.sleep(0.3)
@@ -87,7 +100,7 @@ def main():
             lit = trace_pixels(pixel, sx, sy, size)
             check(len(lit) > 50 and all(abs(y - cy) <= 2 for _, y in lit), "opposite polarity is a horizontal line", f"{len(lit)} {sorted({y for _, y in lit})[:10]}")
             check(pixel(sx + size // 4, bar_y) == RED, "the correlation bar is filled to the left in red", str(pixel(sx + size // 4, bar_y)))
-            for key in (b"m", b"v", b"+", b"-", b"r", b" ", b" ", b",", b"w"):
+            for key in (b"m", b"v", b"+", b"-", b"r", b" ", b" ", b",", b"w", b"i", b"e", b"b"):
                 machine.wire.send(machine.guest, TAG_DATA, key)
                 time.sleep(0.3)
             _, _, pixel = screenshot(machine.monitor, "gonio3.ppm")

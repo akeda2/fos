@@ -82,6 +82,11 @@ pub fn exp64(x: f64) -> f64 {
     sum * f64::from_bits(((k as i64 + 1023) as u64) << 52)
 }
 
+/// 10^x in f64.
+pub fn pow10_64(x: f64) -> f64 {
+    exp64(x * LN_10)
+}
+
 /// 10^x.
 pub fn pow10(x: f32) -> f32 {
     exp64(x as f64 * LN_10) as f32

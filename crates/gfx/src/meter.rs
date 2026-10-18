@@ -46,6 +46,28 @@ impl Scale {
         ticks: &[(12.0, "+12"), (9.0, "+9"), (6.0, "+6"), (3.0, "+3"), (0.0, "TEST"), (-3.0, "-3"), (-6.0, "-6"), (-9.0, "-9"), (-12.0, "-12"), (-18.0, "-18"), (-24.0, "-24"), (-30.0, "-30"), (-36.0, "-36"), (-42.0, "-42")],
     };
 
+    /// Loudness relative to the target (LU, 0 = the target) on the EBU "+9" scale, -18..+9 (EBU Tech 3341 / R128 s1).
+    pub const LU9: Scale = Scale {
+        name: "LU",
+        min: -18.0,
+        max: 9.0,
+        dbfs_at_zero: 0.0,
+        warn: 1.0,
+        over: 9.0,
+        ticks: &[(9.0, "+9"), (6.0, "+6"), (3.0, "+3"), (0.0, "0"), (-3.0, "-3"), (-6.0, "-6"), (-9.0, "-9"), (-12.0, "-12"), (-15.0, "-15"), (-18.0, "-18")],
+    };
+
+    /// The EBU "+18" scale, -36..+18 LU.
+    pub const LU18: Scale = Scale {
+        name: "LU",
+        min: -36.0,
+        max: 18.0,
+        dbfs_at_zero: 0.0,
+        warn: 1.0,
+        over: 9.0,
+        ticks: &[(18.0, "+18"), (12.0, "+12"), (6.0, "+6"), (0.0, "0"), (-6.0, "-6"), (-12.0, "-12"), (-18.0, "-18"), (-24.0, "-24"), (-30.0, "-30"), (-36.0, "-36")],
+    };
+
     /// dBFS of a value on this scale.
     pub fn dbfs(&self, value: f32) -> f32 {
         value + self.dbfs_at_zero
@@ -106,6 +128,32 @@ pub fn draw_bar(canvas: &mut Canvas, scale: &Scale, x: i32, w: u32, y: i32, h: u
     canvas.fill_rect(x, y - 12, w, 8, if clipped { RED } else { OFF });
 }
 
+/// A history chart: `values` (the scale's units, oldest first, one per pixel column; older ones than `w` are dropped) as a line
+/// in the box at (x, y, w, h), with the scale's ticks as faint lines and 0 stronger. A value at or below `scale.min` is a gap.
+pub fn draw_history(canvas: &mut Canvas, scale: &Scale, x: i32, y: i32, w: u32, h: u32, values: &[f32]) {
+    canvas.fill_rect(x, y, w, h, OFF);
+    for &(value, _) in scale.ticks {
+        canvas.fill_rect(x, scale.row(value, y, h), w, 1, if value == 0.0 { GRID_MAJOR } else { GRID });
+    }
+    canvas.rect(x, y, w, h, GRID_MAJOR);
+    let shown = &values[values.len().saturating_sub(w as usize)..];
+    let first = x + (w as usize - shown.len()) as i32;
+    let mut previous: Option<(i32, i32)> = None;
+    for (index, &value) in shown.iter().enumerate() {
+        if value <= scale.min {
+            previous = None;
+            continue;
+        }
+        let point = (first + index as i32, scale.row(value, y, h).min(y + h as i32 - 1));
+        if let Some((px, py)) = previous {
+            canvas.line(px, py, point.0, point.1, GREEN);
+        } else {
+            canvas.set(point.0, point.1, GREEN);
+        }
+        previous = Some(point);
+    }
+}
+
 /// A horizontal bar from the middle: `value` in -1..=1 fills left (negative) or right (positive); ticks at -1, 0, +1.
 /// `zones`: `negative_red` colours the negative side red (correlation), otherwise both sides are green (balance).
 pub fn draw_bipolar(canvas: &mut Canvas, x: i32, y: i32, w: u32, h: u32, value: f32, negative_red: bool, left_label: &str, right_label: &str) {
@@ -139,6 +187,15 @@ mod tests {
         assert_eq!(Scale::DBFS.row(-200.0, 100, 600), 700);
         assert_eq!(Scale::NORDIC.dbfs(0.0), -18.0);
         assert_eq!(Scale::NORDIC.dbfs(9.0), -9.0);
+    }
+
+    #[test]
+    fn history_draws_and_drops_gaps() {
+        let mut pixels = vec![0u32; 120 * 80];
+        let mut canvas = Canvas::new(&mut pixels, 120, 80).unwrap();
+        draw_history(&mut canvas, &Scale::LU18, 10, 10, 100, 60, &[-200.0, -3.0, 0.0, 5.0, -200.0, 2.0]);
+        let green = pixels.iter().filter(|&&p| p == GREEN).count();
+        assert!(green >= 4, "{green}");
     }
 
     #[test]

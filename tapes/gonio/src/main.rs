@@ -1,28 +1,32 @@
 //! `gonio`: a broadcast-style goniometer for a pair of audio input channels: a phosphor-persistence phase scope in the middle,
-//! vertical Nordic PPM / dBFS level meters on the right, a correlation meter and a balance bar under the scope, and room left
-//! of the scope for a loudness panel later. The pieces are libraries: the scaffold `crates/audio-screen`, the scope, meters
+//! vertical Nordic PPM / dBFS level meters on the right, a correlation meter and a balance bar under the scope, and a loudness
+//! (LUFS) panel left of the scope. The pieces are libraries: the scaffold `crates/audio-screen`, the scope, meters
 //! and plot helpers in `crates/gfx`, the measurements in `crates/dsp` (`stereo`, `level`) and the Nordic PPM in
 //! `audio_wire::meter`. A hard-float tape.
 #![no_std]
 #![no_main]
 
 mod layout;
+mod lufs;
 
 use audio_screen::meters::{Channel, Kind as MeterKind};
 use audio_screen::{Input, Screen, poll_keys};
 use core::fmt::Write;
 use dsp::level::db_amplitude;
+use dsp::loudness::Loudness;
 use dsp::stereo::Correlator;
 use gfx::meter;
 use gfx::plot::{BACKGROUND, DIM, TEXT};
 use gfx::scope::{LOG_RANGE_DB, Law, Phosphor, draw_graticule};
 use layout::Layout;
+use lufs::Panel;
 use noise::PairSine;
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, alloc_bytes, arg_value as value, parse_f32, println};
 
 tape_rt::tape_help!(
     br#"gonio [@NAME] [device=N] [chan=A,B] [rate=48000] [scale=nordic|dbfs]
       [style=dots|lines] [law=log|linear] [range=DB] [gain=DB] [tau=SECONDS]
+      [target=-23|-24|-14] [ebu=9|18] [lufs=m|s]
       [src=input|test] [phase=DEG] [tone=HZ] [level=-18] [right=DB]
 Goniometer for two input channels (default 1,2; `device=` picks the audio
 device, `audio` numbers them): phase scope with persistence (mono is a
@@ -31,12 +35,19 @@ meters for each channel (Nordic PPM, TEST = -18 dBFS, or sample peak in
 dBFS, with peak hold and a clip lamp), the correlation (-1..+1) over about
 tau seconds (default 0.3) and the L/R balance. src=test shows a built-in
 stereo tone (phase=DEG between L and R, right=DB level difference) instead.
+The left side is a loudness (EBU R128, ITU BS.1770 LUFS) panel: M (400 ms),
+S (3 s), I (integrated, gated), LRA and a one-per-second history of S.
+Its bar reads in LU against the target (-23 EBU, -24 ATSC, -14 streaming) on
+the EBU +9 or +18 scale; lufs=m|s picks M or S for the bar.
 Keys (Escape quits):
   space freeze   r reset (holds, clip lamps, scope)   m Nordic/dBFS scale
   v dots/lines   l log/linear scope law   x log range 30/40/50/60 dB
                (log: the centre is -range dBFS, quiet signals stay visible)
   + - scope gain 3 dB   , . input pair -/+ (1-2, 3-4, ...)
-  w save the settings (scale, style, law, range, gain, tau, rate) in gonio.cfg
+  t loudness target -23/-24/-14   e EBU scale +9/+18   b bar M/S
+  i reset I and LRA
+  w save the settings (scale, style, law, range, gain, tau, rate, target, ebu,
+    lufs) in gonio.cfg
   p test tone phase 0/45/90/135/180   (src=test)
 Settings: gonio.cfg is read at start (key=value words, # comments); `@NAME` on
 the command line reads that file instead (any diskN/NAME) and w saves to it.
@@ -125,6 +136,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     phosphor.range_db = value(arguments, "range").and_then(parse_f32).unwrap_or(LOG_RANGE_DB).clamp(10.0, 90.0);
     let mut correlator = Correlator::new(state.rate, state.tau_s);
     let mut meters = [Channel::new(state.rate), Channel::new(state.rate)];
+    let mut loudness = Loudness::new(state.rate);
+    let mut panel = Panel::new();
+    panel.target = match value(arguments, "target").and_then(parse_f32) {
+        Some(t) => lufs::TARGETS.iter().position(|&x| x == t).unwrap_or(0),
+        None => 0,
+    };
+    panel.wide = value(arguments, "ebu") == Some("18");
+    panel.short = value(arguments, "lufs") == Some("s");
     let mut tone = PairSine::new();
     tone.set_rate(state.rate);
     tone.set_frequency(value(arguments, "tone").and_then(parse_f32).unwrap_or(997.0));
@@ -142,7 +161,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut message = Line::<48>::new();
     let mut last_draw = tape_rt::micros();
     let mut frames_drawn = 0u32;
-    draw_grid(&mut screen, &layout, state.kind);
+    draw_grid(&mut screen, &layout, state.kind, &panel);
 
     loop {
         let keep_going = poll_keys(api, &mut decoder, |key| {
@@ -157,11 +176,25 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 }
                 Key::Char(b'm') => {
                     state.kind = state.kind.next();
-                    draw_grid(&mut screen, &layout, state.kind);
+                    draw_grid(&mut screen, &layout, state.kind, &panel);
+                }
+                Key::Char(b't') => {
+                    panel.target = (panel.target + 1) % lufs::TARGETS.len();
+                    let _ = write!(message, "target {:.0} LUFS", panel.target_lufs());
+                }
+                Key::Char(b'e') => {
+                    panel.wide = !panel.wide;
+                    draw_grid(&mut screen, &layout, state.kind, &panel);
+                }
+                Key::Char(b'b') => panel.short = !panel.short,
+                Key::Char(b'i') => {
+                    loudness.reset();
+                    panel.clear_history();
+                    let _ = write!(message, "loudness reset");
                 }
                 Key::Char(b'v') => state.lines = !state.lines,
                 Key::Char(b'w') => {
-                    let mut body = tape_rt::config::Settings::<256>::new();
+                    let mut body = tape_rt::config::Settings::<320>::new();
                     body.put("scale", format_args!("{}", if state.kind == MeterKind::Dbfs { "dbfs" } else { "nordic" }));
                     body.put("style", format_args!("{}", if state.lines { "lines" } else { "dots" }));
                     body.put("law", format_args!("{}", if phosphor.law == Law::Log { "log" } else { "linear" }));
@@ -169,6 +202,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     body.put("gain", format_args!("{:.0}", state.gain_db));
                     body.put("tau", format_args!("{:.2}", state.tau_s));
                     body.put("rate", format_args!("{}", state.rate));
+                    body.put("target", format_args!("{:.0}", panel.target_lufs()));
+                    body.put("ebu", format_args!("{}", if panel.wide { 18 } else { 9 }));
+                    body.put("lufs", format_args!("{}", if panel.short { "s" } else { "m" }));
                     match config.save(api, body.as_str()) {
                         Ok(name) => {
                             let _ = write!(message, "saved {name}");
@@ -219,6 +255,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             }
         }
         if count > 0 {
+            loudness.feed(&left[..count], &right[..count]);
+            panel.sample(&mut loudness);
             if !state.frozen {
                 let (l, r) = (&left[..count], &right[..count]);
                 correlator.feed(l, r);
@@ -249,6 +287,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 canvas.text_centered(x + layout.bar_w as i32 / 2, layout.bars.y + layout.bars.h as i32 + 8, if reading.hold > scale.min { shown } else { "-" }, TEXT);
                 canvas.text_centered(x + layout.bar_w as i32 / 2, layout.bars.y - 26, if channel == 0 { "L" } else { "R" }, DIM);
             }
+            panel.draw(&mut canvas, layout.left_panel, &loudness);
             let (c, b) = (layout.correlation, layout.balance);
             let correlation = correlator.correlation();
             meter::draw_bipolar(&mut canvas, c.x, c.y, c.w, c.h, correlation, true, "-1", "+1");
@@ -277,11 +316,12 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 }
 
 /// The static layer: background, scope graticule, meter scale, bar titles.
-fn draw_grid(screen: &mut Screen, layout: &Layout, kind: MeterKind) {
+fn draw_grid(screen: &mut Screen, layout: &Layout, kind: MeterKind, panel: &Panel) {
     let mut canvas = screen.grid();
     canvas.clear(BACKGROUND);
     draw_graticule(&mut canvas, layout.scope.x, layout.scope.y, layout.scope.w);
     meter::draw_scale(&mut canvas, kind.scale(), layout.bars.x, layout.bars.w, layout.bars.y, layout.bars.h);
+    panel.draw_grid(&mut canvas, layout.left_panel);
     canvas.text_centered(layout.balance.x + layout.balance.w as i32 / 2, layout.balance.y - 18, "balance", DIM);
 }
 
@@ -309,5 +349,5 @@ fn draw_status(canvas: &mut gfx::Canvas, law: &str, layout: &Layout, state: &Sta
     if !message.is_empty() {
         canvas.text_right(layout.width as i32 - 16, 6, message, gfx::meter::AMBER);
     }
-    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  w save  +- gain  , . channels  p test phase  Esc", DIM);
+    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  w save  t target  e EBU  b M/S  i reset  +- gain  , . channels  p test phase  Esc", DIM);
 }
