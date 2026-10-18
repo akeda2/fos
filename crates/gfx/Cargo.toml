@@ -6,3 +6,6 @@ edition = "2024"
 [lib]
 name = "gfx"
 path = "src/lib.rs"
+
+[dependencies]
+dsp = { path = "../dsp" }

@@ -96,6 +96,14 @@ impl Input {
         }
     }
 
+    /// Like `start` but capture only: a tool that never writes samples must not leave the output side running unfed.
+    pub fn start_capture(&self, api: &TapeApi, rate: u32) -> Result<(), u32> {
+        match (api.audio_start)(rate, 1, 0) {
+            0 => Ok(()),
+            status => Err(status as u32),
+        }
+    }
+
     /// The `,` (previous) and `.` (next) keys: steps the channel with wrap-around. True when it changed.
     pub fn step_channel(&mut self, key: Key) -> bool {
         if self.channels < 2 {

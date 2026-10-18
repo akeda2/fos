@@ -46,7 +46,7 @@ impl Layout {
         let balance = Rect { x: sx, y: under + 16 + 26, w: size as u32, h: 10 };
         let right = sx + size + 28;
         let label = 56;
-        let free = w - right - label - 52 - 16;
+        let free = w - right - label - 6 - 60 - 34 - 16;
         let bar_w = ((free - 10) / 2).clamp(14, 40);
         let bars = Rect { x: right + label, y: sy, w: (2 * bar_w + 10) as u32, h: size as u32 };
         let left_panel = Rect { x: 16, y: sy, w: (sx - 28 - 16).max(0) as u32, h: size as u32 };

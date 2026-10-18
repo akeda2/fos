@@ -952,7 +952,10 @@ the pair by two) and adapts its layout to the screen (`layout.rs`, designed for 
 plays a built-in stereo tone through the same path (`phase=`, `right=`, `p` cycles the phase). The reusable parts:
 `gfx::scope` (`Phosphor`, `draw_graticule`), `gfx::meter` (`Scale` DBFS/NORDIC, `draw_scale`, `draw_bar`, `draw_bipolar`),
 `dsp::stereo` (`Correlator`: correlation and balance), `dsp::level` (`SamplePeak` with clip detection, `PeakHold`),
-`audio_screen::meters` (one channel's PPM + sample peak + holds), `Input::set_pair`/`step_pair`, `noise::PairSine`. The test
+`audio_screen::meters` (one channel's PPM + sample peak + holds), `Input::set_pair`/`step_pair`, `noise::PairSine`. The scope has a linear and a log law (`gfx::scope::Law`, default log: distance is dB over `range=` 40 dB, so a -18 dBFS
+signal reaches 55% of the radius; `l` toggles, `x` cycles 30-60 dB). The Nordic scale runs to +12 and is labelled on both sides
+of the bars with a dimmer dBFS column outside. Capture only is started (an unfed output side silenced a USB device), and the
+screen is redrawn every loop (`Screen::due` needs `mark_dirty`). The test
 tone is not commensurate with the sample rate (997 Hz) so the dot scope does not draw 48 fixed points.
 
 **The `ltas` tape.** `tapes/ltas` ties the crates together: it captures with `audio_read`, unpacks one channel

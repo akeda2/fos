@@ -15,15 +15,15 @@ use dsp::level::db_amplitude;
 use dsp::stereo::Correlator;
 use gfx::meter;
 use gfx::plot::{BACKGROUND, DIM, TEXT};
-use gfx::scope::{Phosphor, draw_graticule};
+use gfx::scope::{LOG_RANGE_DB, Law, Phosphor, draw_graticule};
 use layout::Layout;
 use noise::PairSine;
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, alloc_bytes, arg_value as value, parse_f32, println};
 
 tape_rt::tape_help!(
     br#"gonio [device=N] [chan=A,B] [rate=48000] [scale=nordic|dbfs]
-      [style=dots|lines] [gain=DB] [tau=SECONDS]
-      [src=input|test] [phase=DEG] [tone=HZ] [level=-12] [right=DB]
+      [style=dots|lines] [law=log|linear] [range=DB] [gain=DB] [tau=SECONDS]
+      [src=input|test] [phase=DEG] [tone=HZ] [level=-18] [right=DB]
 Goniometer for two input channels (default 1,2; `device=` picks the audio
 device, `audio` numbers them): phase scope with persistence (mono is a
 vertical line, L only leans left, opposite polarity is horizontal), peak
@@ -33,7 +33,9 @@ tau seconds (default 0.3) and the L/R balance. src=test shows a built-in
 stereo tone (phase=DEG between L and R, right=DB level difference) instead.
 Keys (Escape quits):
   space freeze   r reset (holds, clip lamps, scope)   m Nordic/dBFS scale
-  v dots/lines   + - scope gain 3 dB   , . input pair -/+ (1-2, 3-4, ...)
+  v dots/lines   l log/linear scope law   x log range 30/40/50/60 dB
+               (log: the centre is -range dBFS, quiet signals stay visible)
+  + - scope gain 3 dB   , . input pair -/+ (1-2, 3-4, ...)
   p test tone phase 0/45/90/135/180   (src=test)
 "#
 );
@@ -103,7 +105,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return println!("gonio: out of memory.");
     };
     let Some(mut phosphor) = Phosphor::new(cells, size) else { return println!("gonio: the screen is too small.") };
-    if let Err(status) = input.start(api, state.rate) {
+    if let Err(status) = input.start_capture(api, state.rate) {
         return println!("gonio: cannot start audio at {} Hz (code {status}); the device offers {:?}.", state.rate, &input.rates[..input.rate_count]);
     }
     if !screen.open() {
@@ -111,12 +113,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return println!("gonio: cannot take the screen.");
     }
 
+    phosphor.law = if value(arguments, "law") == Some("linear") { Law::Linear } else { Law::Log };
+    phosphor.range_db = value(arguments, "range").and_then(parse_f32).unwrap_or(LOG_RANGE_DB).clamp(10.0, 90.0);
     let mut correlator = Correlator::new(state.rate, state.tau_s);
     let mut meters = [Channel::new(state.rate), Channel::new(state.rate)];
     let mut tone = PairSine::new();
     tone.set_rate(state.rate);
     tone.set_frequency(value(arguments, "tone").and_then(parse_f32).unwrap_or(997.0));
-    tone.set_level_db(value(arguments, "level").and_then(parse_f32).unwrap_or(-12.0), value(arguments, "right").and_then(parse_f32).unwrap_or(0.0));
+    tone.set_level_db(value(arguments, "level").and_then(parse_f32).unwrap_or(-18.0), value(arguments, "right").and_then(parse_f32).unwrap_or(0.0));
     let phase = value(arguments, "phase").and_then(parse_f32).unwrap_or(0.0);
     tone.set_phase_degrees(phase);
     let mut tone_phase = phase;
@@ -148,6 +152,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     draw_grid(&mut screen, &layout, state.kind);
                 }
                 Key::Char(b'v') => state.lines = !state.lines,
+                Key::Char(b'x') => {
+                    phosphor.range_db = if phosphor.range_db >= 60.0 { 30.0 } else { phosphor.range_db + 10.0 };
+                    phosphor.clear();
+                }
+                Key::Char(b'l') => {
+                    phosphor.law = phosphor.law.next();
+                    phosphor.clear();
+                }
                 Key::Char(b'+') => state.gain_db = (state.gain_db + 3.0).min(36.0),
                 Key::Char(b'-') => state.gain_db = (state.gain_db - 3.0).max(-12.0),
                 Key::Char(b'p') if state.test => {
@@ -191,6 +203,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             worked = true;
         }
 
+        // meters decay and the phosphor fades even with no new samples, so the picture is always redrawn
+        screen.mark_dirty();
         if screen.due() {
             let now = tape_rt::micros();
             let dt = (now.wrapping_sub(last_draw) as f32 / 1e6).clamp(0.001, 1.0);
@@ -216,7 +230,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             let mut text = Line::<24>::new();
             let _ = write!(text, "correlation {correlation:+.2}");
             canvas.text_centered(c.x + c.w as i32 / 2, c.y - 20, text.as_str(), TEXT);
-            draw_status(&mut canvas, &layout, &state, &input, tone_phase, message.as_str());
+            let mut law = Line::<16>::new();
+            if phosphor.law == Law::Log {
+                let _ = write!(law, "log {:.0} dB", phosphor.range_db);
+            } else {
+                let _ = write!(law, "linear");
+            }
+            draw_status(&mut canvas, law.as_str(), &layout, &state, &input, tone_phase, message.as_str());
             screen.present();
         }
         if !worked {
@@ -239,17 +259,18 @@ fn draw_grid(screen: &mut Screen, layout: &Layout, kind: MeterKind) {
     canvas.text_centered(layout.balance.x + layout.balance.w as i32 / 2, layout.balance.y - 18, "balance", DIM);
 }
 
-fn draw_status(canvas: &mut gfx::Canvas, layout: &Layout, state: &State, input: &Input, phase: f32, message: &str) {
+fn draw_status(canvas: &mut gfx::Canvas, law: &str, layout: &Layout, state: &State, input: &Input, phase: f32, message: &str) {
     let mut line = Line::<160>::new();
     let _ = write!(
         line,
-        "GONIO  {} Hz  ch {}+{}/{}  {}  {}  gain {:+.0} dB  corr {:.1} s{}{}",
+        "GONIO  {} Hz  ch {}+{}/{}  {}  {}  {}  gain {:+.0} dB  corr {:.1} s{}{}",
         state.rate,
         input.channel + 1,
         input.second + 1,
         input.channels,
         state.kind.scale().name,
         if state.lines { "lines" } else { "dots" },
+        law,
         state.gain_db,
         state.tau_s,
         if state.test { "  TEST" } else { "" },
@@ -262,5 +283,5 @@ fn draw_status(canvas: &mut gfx::Canvas, layout: &Layout, state: &State, input: 
     if !message.is_empty() {
         canvas.text_right(layout.width as i32 - 16, 6, message, gfx::meter::AMBER);
     }
-    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  +- gain  , . channels  p test phase  Esc", DIM);
+    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  +- gain  , . channels  p test phase  Esc", DIM);
 }

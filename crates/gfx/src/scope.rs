@@ -5,16 +5,41 @@
 //! display frame, `draw` paints them over the canvas.
 
 use crate::Canvas;
+use dsp::math::{log10, sqrt};
+
+/// How the distance from the centre maps to the picture. The angle of a point is never changed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Law {
+    /// Distance proportional to amplitude: a -18 dBFS signal reaches 1/8 of the way to the edge.
+    Linear,
+    /// Distance proportional to dB over `LOG_RANGE_DB` (the edge is full scale): quiet signals stay visible.
+    Log,
+}
+
+impl Law {
+    pub fn next(self) -> Law {
+        match self {
+            Law::Linear => Law::Log,
+            Law::Log => Law::Linear,
+        }
+    }
+}
+
+/// The default dB span from the edge to the centre in `Law::Log` (`Phosphor::range_db`).
+pub const LOG_RANGE_DB: f32 = 40.0;
 
 pub struct Phosphor<'a> {
     cells: &'a mut [u8],
     size: usize,
+    pub law: Law,
+    /// dB from the edge to the centre in `Law::Log`.
+    pub range_db: f32,
 }
 
 impl<'a> Phosphor<'a> {
     /// `cells` must hold `size * size` bytes.
     pub fn new(cells: &'a mut [u8], size: usize) -> Option<Self> {
-        (cells.len() >= size * size && size >= 2).then_some(Self { cells, size })
+        (cells.len() >= size * size && size >= 2).then_some(Self { cells, size, law: Law::Linear, range_db: LOG_RANGE_DB })
     }
 
     pub fn size(&self) -> usize {
@@ -27,8 +52,18 @@ impl<'a> Phosphor<'a> {
 
     fn position(&self, l: f32, r: f32, gain: f32) -> Option<(usize, usize)> {
         let half = (self.size - 1) as f32 / 2.0;
-        let x = half + (r - l) * 0.5 * gain * half;
-        let y = half - (l + r) * 0.5 * gain * half;
+        let (mut u, mut v) = ((r - l) * 0.5 * gain, (l + r) * 0.5 * gain);
+        if self.law == Law::Log {
+            // distance d (1.0 = edge) becomes 1 + dB(d) / range, clamped at the centre; the direction stays
+            let d2 = u * u + v * v;
+            if d2 > 1e-12 {
+                let shown = (1.0 + 10.0 * log10(d2) / self.range_db).max(0.0);
+                let scale = shown / sqrt(d2);
+                (u, v) = (u * scale, v * scale);
+            }
+        }
+        let x = half + u * half;
+        let y = half - v * half;
         (x >= 0.0 && y >= 0.0 && x < self.size as f32 && y < self.size as f32).then_some((x as usize, y as usize))
     }
 
@@ -136,6 +171,31 @@ mod tests {
 
     fn lit(p: &Phosphor) -> Vec<(usize, usize)> {
         (0..p.size * p.size).filter(|&i| p.cells[i] > 0).map(|i| (i % p.size, i / p.size)).collect()
+    }
+
+    #[test]
+    fn log_law_lifts_quiet_signals_and_keeps_full_scale_and_direction() {
+        let mut cells = vec![0u8; 201 * 201];
+        let mut p = Phosphor::new(&mut cells, 201).unwrap();
+        p.law = Law::Log;
+        p.trace(&[0.1259], &[0.1259], 1.0, false, 100); // -18 dBFS mono
+        let (x, y) = lit(&p)[0];
+        assert_eq!(x, 100);
+        // linear: 12.6 % of the radius; log: 1 - 18/40 = 55 % of it
+        assert!((100 - y as i32 - 55).abs() <= 2, "{y}");
+        p.clear();
+        p.trace(&[0.999], &[0.999], 1.0, false, 100);
+        assert!(lit(&p)[0].1 <= 1);
+    }
+
+    #[test]
+    fn log_range_is_adjustable() {
+        let mut cells = vec![0u8; 201 * 201];
+        let mut p = Phosphor::new(&mut cells, 201).unwrap();
+        p.law = Law::Log;
+        p.range_db = 60.0;
+        p.trace(&[0.1259], &[0.1259], 1.0, false, 100); // -18 dBFS: 1 - 18/60 = 70 %
+        assert!((100 - lit(&p)[0].1 as i32 - 70).abs() <= 2);
     }
 
     #[test]

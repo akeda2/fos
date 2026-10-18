@@ -35,15 +35,15 @@ impl Scale {
         ticks: &[(0.0, "0"), (-3.0, "-3"), (-6.0, "-6"), (-9.0, "-9"), (-12.0, "-12"), (-18.0, "-18"), (-24.0, "-24"), (-30.0, "-30"), (-40.0, "-40"), (-50.0, "-50"), (-60.0, "-60")],
     };
 
-    /// The Nordic PPM scale (IEC 60268-10 type I as used by the Nordic broadcasters): TEST at -18 dBFS, permitted maximum +9.
+    /// The Nordic PPM scale (IEC 60268-10 type I as used by the Nordic broadcasters): TEST at -18 dBFS, permitted maximum +9, the scale runs to +12 like the other Nordic meters.
     pub const NORDIC: Scale = Scale {
         name: "Nordic",
         min: -42.0,
-        max: 9.0,
+        max: 12.0,
         dbfs_at_zero: -18.0,
         warn: 0.0,
         over: 9.0,
-        ticks: &[(9.0, "+9"), (6.0, "+6"), (3.0, "+3"), (0.0, "TEST"), (-3.0, "-3"), (-6.0, "-6"), (-9.0, "-9"), (-12.0, "-12"), (-18.0, "-18"), (-24.0, "-24"), (-30.0, "-30"), (-36.0, "-36"), (-42.0, "-42")],
+        ticks: &[(12.0, "+12"), (9.0, "+9"), (6.0, "+6"), (3.0, "+3"), (0.0, "TEST"), (-3.0, "-3"), (-6.0, "-6"), (-9.0, "-9"), (-12.0, "-12"), (-18.0, "-18"), (-24.0, "-24"), (-30.0, "-30"), (-36.0, "-36"), (-42.0, "-42")],
     };
 
     /// dBFS of a value on this scale.
@@ -62,23 +62,29 @@ impl Scale {
     }
 }
 
-/// The static part, for the grid layer: faint tick lines across `bars_x..bars_x + bars_w`, the scale's labels right-aligned at
-/// `bars_x - 6`, and (when the scale is not dBFS) the dBFS equivalents left-aligned after the bars.
+/// Pixels from the right-hand scale labels to the dBFS column (a "TEST" label and a gap).
+pub const DBFS_COLUMN: i32 = 60;
+
+/// The static part, for the grid layer: faint tick lines across `bars_x..bars_x + bars_w`, the scale's labels on both sides of
+/// the bars (right-aligned at `bars_x - 6`, left-aligned after them) and, when the scale is not dBFS, the dBFS equivalents in
+/// a dimmer column to the right of those (`DBFS_COLUMN` pixels further out).
 pub fn draw_scale(canvas: &mut Canvas, scale: &Scale, bars_x: i32, bars_w: u32, y: i32, h: u32) {
     for &(value, label) in scale.ticks {
         let row = scale.row(value, y, h);
         canvas.fill_rect(bars_x, row, bars_w, 1, if value == 0.0 { GRID_MAJOR } else { GRID });
         let colour = if value == 0.0 { TEXT } else { DIM };
         canvas.text_right(bars_x - 6, row - 8, label, colour);
+        canvas.text(bars_x + bars_w as i32 + 6, row - 8, label, colour);
         if scale.dbfs_at_zero != 0.0 {
             let mut text = [0u8; 12];
             let shown = format_fixed(&mut text, scale.dbfs(value), 0);
-            canvas.text(bars_x + bars_w as i32 + 6, row - 8, shown, DIM);
+            canvas.text(bars_x + bars_w as i32 + 6 + DBFS_COLUMN, row - 8, shown, DIM);
         }
     }
     canvas.text_right(bars_x - 6, y - 26, scale.name, TEXT);
+    canvas.text(bars_x + bars_w as i32 + 6, y - 26, scale.name, TEXT);
     if scale.dbfs_at_zero != 0.0 {
-        canvas.text(bars_x + bars_w as i32 + 6, y - 26, "dBFS", DIM);
+        canvas.text(bars_x + bars_w as i32 + 6 + DBFS_COLUMN, y - 26, "dBFS", DIM);
     }
 }
 
