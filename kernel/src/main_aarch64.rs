@@ -18,12 +18,38 @@ mod usb_kbd;
 mod virtio_blk;
 mod xhci;
 
+/// Everything printed before the framebuffer console exists, replayed onto the screen once it does (a Pi shows nothing on a
+/// silent serial port otherwise). Bytes beyond the buffer are dropped.
+static mut EARLY_LOG: [u8; 8192] = [0; 8192];
+static mut EARLY_LEN: usize = 0;
+static mut EARLY_LOGGING: bool = true;
+
+fn replay_early_log() {
+    unsafe {
+        *core::ptr::addr_of_mut!(EARLY_LOGGING) = false;
+        let len = *core::ptr::addr_of!(EARLY_LEN);
+        let log = &*core::ptr::addr_of!(EARLY_LOG);
+        if let Ok(text) = core::str::from_utf8(&log[..len]) {
+            framebuffer::write_str(text);
+        }
+    }
+}
+
 /// `println!` goes to the PL011 and, once it exists, the framebuffer; the boot log joins as its module is ported.
 pub fn print(arguments: core::fmt::Arguments) {
     struct Both;
     impl Write for Both {
         fn write_str(&mut self, text: &str) -> core::fmt::Result {
             let _ = arch::aarch64::pl011::Serial.write_str(text);
+            unsafe {
+                if *core::ptr::addr_of!(EARLY_LOGGING) {
+                    let len = *core::ptr::addr_of!(EARLY_LEN);
+                    let room = 8192 - len;
+                    let take = text.len().min(room);
+                    core::ptr::copy_nonoverlapping(text.as_ptr(), (core::ptr::addr_of_mut!(EARLY_LOG) as *mut u8).add(len), take);
+                    *core::ptr::addr_of_mut!(EARLY_LEN) = len + take;
+                }
+            }
             framebuffer::write_str(text);
             Ok(())
         }
@@ -93,6 +119,9 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         println!("Console: PL011 at {:#x} ({}).", arch::aarch64::pl011::base(), if uart_from_acpi { "ACPI SPCR" } else { "default" });
         arch::aarch64::early::mark(7);
         let screen = framebuffer::init(&info.framebuffer);
+        if screen {
+            replay_early_log();
+        }
         println!("Framebuffer console: {}.", if screen { "on" } else { "none (serial only)" });
         println!("Page tables loaded: RAM NX in 2 MiB blocks, kernel W^X, page 0 and stack guard unmapped.");
     }
