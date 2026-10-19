@@ -155,6 +155,7 @@ fn current_el() -> u64 {
 pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
     let root = memory::allocate().expect("no frame for the page-table root");
     unsafe { ROOT = root };
+    super::early::mark(10);
 
     for descriptor in info.memory_descriptors() {
         // 0 reserved, 11/12 memory-mapped I/O: not RAM, and devices are mapped on demand.
@@ -196,7 +197,13 @@ pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
     // Page 0 stays unmapped so a null dereference faults (if RAM starts there at all).
     unmap_page(root, 0);
 
+    // Hardware bring-up: row 4 = framebuffer base, row 5 = kernel entry stack/level (current EL), row 6 = root.
+    super::early::bits(4, framebuffer.base);
+    super::early::bits(5, current_el());
+    super::early::bits(6, root);
+    super::early::mark(11);
     load(root);
+    super::early::mark(12);
 }
 
 /// True when a block or page mapping already exists for `address`.
