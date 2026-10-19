@@ -32,4 +32,4 @@ include!("main_aarch64.rs");
 #[cfg(target_arch = "aarch64")]
 pub use arch::aarch64::timer;
 #[cfg(target_arch = "aarch64")]
-pub use arch::aarch64::{cpu, gic, paging};
+pub use arch::aarch64::{cpu, gic, paging, pci_config};

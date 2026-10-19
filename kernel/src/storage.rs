@@ -9,7 +9,9 @@ use fosfor_abi::{BootInfo, FOSFS_TYPE_GUID, PAYLOAD_TYPE_GUID};
 
 use crate::block::{self, Backend};
 use crate::fosfs::{self, Volume};
-use crate::{ahci, gpt, nvme};
+use crate::gpt;
+#[cfg(target_arch = "x86_64")]
+use crate::{ahci, nvme};
 
 static mut BOOT_VOLUME: Option<Volume> = None;
 static mut BOOT_DISK: Option<usize> = None;
@@ -119,14 +121,26 @@ pub fn init(info: &BootInfo) {
         BOOT_SLOT = info.boot_slot;
         PAYLOAD_IDENTITY = Some((info.payload_guid, info.payload_start, info.payload_sectors));
     }
-    let sata = ahci::init_all(|drive, controller, port| {
-        let origin = format_origin("SATA", controller, Some(port));
-        block::register(Backend::Ahci(drive), drive.sectors, drive.model, origin.as_str());
-    });
-    let nvme = nvme::init_all(|drive, controller| {
-        let origin = format_origin("NVMe", controller, None);
-        block::register(Backend::Nvme(drive), drive.sectors, drive.model, origin.as_str());
-    });
+    #[cfg(target_arch = "x86_64")]
+    let (sata, nvme) = {
+        let sata = ahci::init_all(|drive, controller, port| {
+            let origin = format_origin("SATA", controller, Some(port));
+            block::register(Backend::Ahci(drive), drive.sectors, drive.model, origin.as_str());
+        });
+        let nvme = nvme::init_all(|drive, controller| {
+            let origin = format_origin("NVMe", controller, None);
+            block::register(Backend::Nvme(drive), drive.sectors, drive.model, origin.as_str());
+        });
+        (sata, nvme)
+    };
+    #[cfg(target_arch = "aarch64")]
+    let (sata, nvme) = {
+        crate::virtio_blk::init_all(|drive, index| {
+            let origin = format_origin("virtio", index, None);
+            block::register(Backend::Virtio(drive), drive.sectors, drive.model(), origin.as_str());
+        });
+        (0, 0)
+    };
     if block::count() == 0 {
         crate::println!("Storage: no disks found by the drivers this kernel has ({sata} SATA, {nvme} NVMe).");
     }
@@ -185,6 +199,7 @@ pub fn locate_boot_disk(report: bool) -> bool {
         BOOT_DISK = Some(disk);
         PAYLOAD_START = Some(start);
     }
+    #[cfg(target_arch = "x86_64")]
     crate::debug::set_payload(disk, start);
     match gpt::find(disk, &FOSFS_TYPE_GUID, |_| true) {
         Some(partition) => match Volume::mount(disk, partition.start, partition.sectors) {

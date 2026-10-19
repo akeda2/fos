@@ -2,16 +2,22 @@
 //! interface by 512-byte sector. Drivers register disks here; the rest of the kernel
 //! (GPT, FOSFS) only knows `read`/`write` by disk number.
 
+#[cfg(target_arch = "x86_64")]
 use crate::{ahci, nvme, usb_storage};
 
 pub const MAX_DISKS: usize = 8;
 
 #[derive(Clone, Copy)]
 pub enum Backend {
+    #[cfg(target_arch = "x86_64")]
     Ahci(ahci::Drive),
+    #[cfg(target_arch = "x86_64")]
     Nvme(nvme::Drive),
     /// An index into `usb_storage`'s device table.
+    #[cfg(target_arch = "x86_64")]
     Usb(usize),
+    #[cfg(target_arch = "aarch64")]
+    Virtio(crate::virtio_blk::Drive),
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +75,7 @@ pub fn count() -> usize {
 
 /// The disk number of the USB mass-storage device in `usb_storage`'s slot `slot` (disk numbers move around when the boot
 /// disk is put first, so the slot is the stable identity).
+#[cfg(target_arch = "x86_64")]
 pub fn usb_disk(slot: usize) -> Option<usize> {
     (0..count()).find(|&index| matches!(get(index), Some(Disk { backend: Backend::Usb(found), .. }) if found == slot))
 }
@@ -84,19 +91,24 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
         return Err(Error::OutOfRange);
     }
     match info.backend {
+        #[cfg(target_arch = "x86_64")]
         Backend::Ahci(drive) => {
             for (index, chunk) in buffer.chunks_mut(ahci::MAX_SECTORS * 512).enumerate() {
                 drive.read(lba + (index * ahci::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
             Ok(())
         }
+        #[cfg(target_arch = "x86_64")]
         Backend::Nvme(drive) => {
             for (index, chunk) in buffer.chunks_mut(nvme::MAX_SECTORS * 512).enumerate() {
                 drive.read(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
             Ok(())
         }
+        #[cfg(target_arch = "x86_64")]
         Backend::Usb(device) => usb_storage::read(device, lba, buffer).map_err(|_| Error::Device),
+        #[cfg(target_arch = "aarch64")]
+        Backend::Virtio(drive) => drive.read(lba, buffer).map_err(|_| Error::Device),
     }
 }
 
@@ -107,18 +119,23 @@ pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         return Err(Error::OutOfRange);
     }
     match info.backend {
+        #[cfg(target_arch = "x86_64")]
         Backend::Ahci(drive) => {
             for (index, chunk) in buffer.chunks(ahci::MAX_SECTORS * 512).enumerate() {
                 drive.write(lba + (index * ahci::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
             Ok(())
         }
+        #[cfg(target_arch = "x86_64")]
         Backend::Nvme(drive) => {
             for (index, chunk) in buffer.chunks(nvme::MAX_SECTORS * 512).enumerate() {
                 drive.write(lba + (index * nvme::MAX_SECTORS) as u64, chunk).map_err(|_| Error::Device)?;
             }
             Ok(())
         }
+        #[cfg(target_arch = "x86_64")]
         Backend::Usb(device) => usb_storage::write(device, lba, buffer).map_err(|_| Error::Device),
+        #[cfg(target_arch = "aarch64")]
+        Backend::Virtio(drive) => drive.write(lba, buffer).map_err(|_| Error::Device),
     }
 }

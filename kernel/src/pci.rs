@@ -84,6 +84,7 @@ impl Device {
     /// +4 address low, +8 address high (64-bit capable devices only), then the 16-bit
     /// message data (the vector). Control bit 0 enables, bits 4-6 choose how many vectors
     /// (0 = one), bit 7 says the device takes a 64-bit address.
+    #[cfg(target_arch = "x86_64")]
     pub fn enable_msi(&self, vector: u8, apic_id: u32) -> bool {
         let Some(capability) = self.find_capability(0x05) else { return false };
         let header = self.read32(capability);
@@ -109,6 +110,7 @@ impl Device {
     /// while the entry is written). MSI-X keeps its message table in a device BAR instead of
     /// config space: the capability gives the table's BAR and offset. Returns false if the
     /// device has no MSI-X capability or its table BAR cannot be mapped.
+    #[cfg(target_arch = "x86_64")]
     pub fn enable_msix(&self, vector: u8, apic_id: u32) -> bool {
         let Some(capability) = self.find_capability(0x11) else { return false };
         let header = self.read32(capability);
@@ -131,6 +133,7 @@ impl Device {
         true
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub fn disable_msix(&self) {
         if let Some(capability) = self.find_capability(0x11) {
             let header = self.read32(capability);
@@ -146,6 +149,7 @@ impl Device {
     }
 
     /// Turns MSI off again (and re-enables the INTx pin).
+    #[cfg(target_arch = "x86_64")]
     pub fn disable_msi(&self) {
         if let Some(capability) = self.find_capability(0x05) {
             let header = self.read32(capability);

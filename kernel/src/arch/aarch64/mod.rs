@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod exceptions;
 pub mod gic;
 pub mod paging;
+pub mod pci_config;
 pub mod pl011;
 pub mod timer;
 

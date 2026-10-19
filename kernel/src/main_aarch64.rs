@@ -3,9 +3,15 @@ use core::panic::PanicInfo;
 use fosfor_abi::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 
 mod arch;
+mod block;
 mod font_data;
+mod fosfs;
 mod framebuffer;
+mod gpt;
 mod memory;
+mod pci;
+mod storage;
+mod virtio_blk;
 
 /// `println!` goes to the PL011 and, once it exists, the framebuffer; the boot log joins as its module is ported.
 pub fn print(arguments: core::fmt::Arguments) {
@@ -68,6 +74,21 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         }
         cpu::interrupts_disable();
         println!("GICv2 up: {} timer interrupts (INTID 30) in 100 ms, expected about 10.", gic::irq_ticks());
+    }
+    if info.magic == BOOT_INFO_MAGIC {
+        match arch::aarch64::pci_config::init(info.acpi_rsdp) {
+            Some(base) => println!("PCI: ECAM window at {base:#x} (ACPI MCFG)."),
+            None => println!("PCI: the firmware describes no ECAM window."),
+        }
+        println!("PCI: {} function(s) on bus 0.", pci::scan());
+        for device in pci::devices() {
+            println!(
+                "  {:02x}:{:02x}.{} {:04x}:{:04x} {}",
+                device.bus, device.device, device.function, device.vendor, device.id,
+                pci::class_name(device.class, device.subclass)
+            );
+        }
+        storage::init(info);
     }
     let before = timer::micros();
     timer::busy_wait_ms(100);

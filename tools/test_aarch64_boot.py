@@ -38,7 +38,7 @@ def boot(image: Path, screendump: Path | None = None) -> str:
                 ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-device", "ramfb",
                  "-serial", "stdio", "-no-reboot", "-monitor", f"unix:{monitor},server,nowait",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
-                 "-drive", f"file={image},format=raw,if=virtio,snapshot=on"],
+                 "-drive", f"file={image},format=raw,if=none,id=boot,snapshot=on", "-device", "virtio-blk-pci,drive=boot"],
                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
             try:
                 deadline = time.time() + 60
@@ -81,6 +81,8 @@ def main():
     check("Page tables loaded" in text and re.search(r"Physical memory: \d+ MiB managed", text) is not None, "the kernel builds and loads its own page tables (MMU, W^X, device map)", text)
     irq = re.search(r"(\d+) timer interrupts", text)
     check(irq is not None and 8 <= int(irq.group(1)) <= 12, "the GIC delivers the 100 Hz timer interrupt and the CPU returns from it", text)
+    check("Boot disk: disk1" in text and "virtio-blk" in text, "PCI (ECAM) finds virtio-blk; the boot disk is located by the payload partition GUID", text)
+    check(re.search(r"FOSFS: mounted on disk1 \(\d+ MiB, \d+ file", text) is not None, "FOSFS mounts on the boot disk (GPT, block layer, virtio-blk driver)", text)
     check("Framebuffer console: on" in text, "the loader hands over a GOP framebuffer and the kernel starts its console on it", text)
     total, lit = lit_pixels(shot) if shot.exists() else (0, 0)
     check(total > 0 and lit > 2000, f"the screen shows the kernel's text ({lit} lit pixels of {total})", text)
