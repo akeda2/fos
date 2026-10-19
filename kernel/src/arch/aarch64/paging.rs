@@ -145,6 +145,14 @@ fn map_range(root: u64, start: u64, end: u64, attributes: u64) {
     }
 }
 
+macro_rules! sysreg {
+    ($name:literal) => {{
+        let v: u64;
+        unsafe { core::arch::asm!(concat!("mrs {}, ", $name), out(reg) v, options(nomem, nostack)) };
+        v
+    }};
+}
+
 fn current_el() -> u64 {
     let el: u64;
     unsafe { core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack)) };
@@ -198,7 +206,7 @@ pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
     unmap_page(root, 0);
 
     // Hardware bring-up: row 4 = framebuffer base, row 5 = kernel entry stack/level (current EL), row 6 = root.
-    super::early::bits(4, framebuffer.base);
+    super::early::bits(4, sysreg!("id_aa64mmfr0_el1"));
     super::early::bits(5, current_el());
     super::early::bits(6, root);
     diagnostics(root, framebuffer.base);
@@ -222,14 +230,6 @@ fn walk(root: u64, address: u64) -> u64 {
         return l2;
     }
     unsafe { entry(l2 & ADDRESS_MASK, (address >> 12) & 0x1ff).read() }
-}
-
-macro_rules! sysreg {
-    ($name:literal) => {{
-        let v: u64;
-        unsafe { core::arch::asm!(concat!("mrs {}, ", $name), out(reg) v, options(nomem, nostack)) };
-        v
-    }};
 }
 
 /// Hardware bring-up: draws what the firmware left in the MMU registers and what our new tables say about the
@@ -282,7 +282,10 @@ fn load(root: u64) {
     unsafe {
         core::arch::asm!("dsb ish", options(nostack));
         if current_el() == 2 {
-            let tcr = low | (pa_range << 16) | (1 << 23) | (1 << 31);
+            // Keep the firmware's TCR (T0SZ, PS, granule, walk attributes): its geometry is known to work on this
+            // chip, and a PS or T0SZ of ours that the CPU rejects hung the MMU enable on a Pi 4.
+            let _ = (low, pa_range);
+            let tcr = sysreg!("tcr_el2");
             // MMU off while MAIR/TCR/TTBR0 change: the firmware's TCR may use another T0SZ than ours, and
             // the window between the writes would walk its tables with the wrong geometry. No memory access
             // inside the block (everything is in registers), so the cache state does not matter.
