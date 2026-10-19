@@ -201,9 +201,62 @@ pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
     super::early::bits(4, framebuffer.base);
     super::early::bits(5, current_el());
     super::early::bits(6, root);
+    diagnostics(root, framebuffer.base);
     super::early::mark(11);
     load(root);
     super::early::mark(12);
+}
+
+/// The descriptor our tables hold for `address` (0 when unmapped), found by a software walk.
+fn walk(root: u64, address: u64) -> u64 {
+    let l0 = unsafe { entry(root, (address >> 39) & 0x1ff).read() };
+    if l0 & VALID == 0 {
+        return 0;
+    }
+    let l1 = unsafe { entry(l0 & ADDRESS_MASK, (address >> 30) & 0x1ff).read() };
+    if l1 & VALID == 0 {
+        return 0;
+    }
+    let l2 = unsafe { entry(l1 & ADDRESS_MASK, (address >> 21) & 0x1ff).read() };
+    if l2 & 3 != 3 {
+        return l2;
+    }
+    unsafe { entry(l2 & ADDRESS_MASK, (address >> 12) & 0x1ff).read() }
+}
+
+macro_rules! sysreg {
+    ($name:literal) => {{
+        let v: u64;
+        unsafe { core::arch::asm!(concat!("mrs {}, ", $name), out(reg) v, options(nomem, nostack)) };
+        v
+    }};
+}
+
+/// Hardware bring-up: draws what the firmware left in the MMU registers and what our new tables say about the
+/// addresses the kernel needs next (rows 7-15 of `early::bits`, MSB first: tcr, sctlr, ttbr0, mair, hcr, then
+/// descriptors for pc, sp, framebuffer and the vector table).
+fn diagnostics(root: u64, framebuffer: u64) {
+    let (tcr, sctlr, ttbr, mair, hcr, vbar) = if current_el() == 2 {
+        (sysreg!("tcr_el2"), sysreg!("sctlr_el2"), sysreg!("ttbr0_el2"), sysreg!("mair_el2"), sysreg!("hcr_el2"), sysreg!("vbar_el2"))
+    } else {
+        (sysreg!("tcr_el1"), sysreg!("sctlr_el1"), sysreg!("ttbr0_el1"), sysreg!("mair_el1"), 0, sysreg!("vbar_el1"))
+    };
+    let pc: u64;
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("adr {}, .", out(reg) pc, options(nomem, nostack));
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack));
+    }
+    let early = super::early::bits;
+    early(7, tcr);
+    early(8, sctlr);
+    early(9, ttbr);
+    early(10, mair);
+    early(11, hcr);
+    early(12, walk(root, pc));
+    early(13, walk(root, sp));
+    early(14, walk(root, framebuffer));
+    early(15, walk(root, vbar));
 }
 
 /// True when a block or page mapping already exists for `address`.
