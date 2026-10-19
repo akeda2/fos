@@ -3,6 +3,7 @@
 
 pub mod cpu;
 pub mod exceptions;
+pub mod gic;
 pub mod paging;
 pub mod pl011;
 pub mod timer;

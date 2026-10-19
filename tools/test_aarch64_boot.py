@@ -51,6 +51,8 @@ def main():
     timer = re.search(r"Generic timer: (\d+) Hz, ticks \d+; a 100 ms wait took (\d+) us", text)
     check(timer is not None and 90_000 <= int(timer.group(2)) <= 300_000, "the generic timer counts: a 100 ms busy wait measures about 100 ms", text)
     check("Page tables loaded" in text and re.search(r"Physical memory: \d+ MiB managed", text) is not None, "the kernel builds and loads its own page tables (MMU, W^X, device map)", text)
+    irq = re.search(r"(\d+) timer interrupts", text)
+    check(irq is not None and 8 <= int(irq.group(1)) <= 12, "the GIC delivers the 100 Hz timer interrupt and the CPU returns from it", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
     print("aarch64 boot: all checks passed")
 

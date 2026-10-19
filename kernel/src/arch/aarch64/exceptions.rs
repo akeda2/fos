@@ -25,7 +25,8 @@ global_asm!(
     vector 2
     vector 3
     vector 4
-    vector 5
+    .balign 0x80
+    b irq_entry                        // 5: IRQ from the current EL on SP_ELx, the only IRQ we expect
     vector 6
     vector 7
     vector 8
@@ -36,6 +37,31 @@ global_asm!(
     vector 13
     vector 14
     vector 15
+    irq_entry:
+        sub sp, sp, #176
+        stp x0, x1, [sp, #0]
+        stp x2, x3, [sp, #16]
+        stp x4, x5, [sp, #32]
+        stp x6, x7, [sp, #48]
+        stp x8, x9, [sp, #64]
+        stp x10, x11, [sp, #80]
+        stp x12, x13, [sp, #96]
+        stp x14, x15, [sp, #112]
+        stp x16, x17, [sp, #128]
+        stp x18, x30, [sp, #144]
+        bl irq_dispatch
+        ldp x18, x30, [sp, #144]
+        ldp x16, x17, [sp, #128]
+        ldp x14, x15, [sp, #112]
+        ldp x12, x13, [sp, #96]
+        ldp x10, x11, [sp, #80]
+        ldp x8, x9, [sp, #64]
+        ldp x6, x7, [sp, #48]
+        ldp x4, x5, [sp, #32]
+        ldp x2, x3, [sp, #16]
+        ldp x0, x1, [sp, #0]
+        add sp, sp, #176
+        eret
     exception_common:
         bl exception_report
     1:  wfe
@@ -61,6 +87,12 @@ pub fn init() {
         }
         asm!("isb", options(nomem, nostack));
     }
+}
+
+/// Called from `irq_entry` with the caller-saved registers on the stack: acknowledge, run the handler, end the interrupt.
+#[unsafe(no_mangle)]
+extern "C" fn irq_dispatch() {
+    crate::gic::dispatch();
 }
 
 fn class_name(class: u64) -> &'static str {

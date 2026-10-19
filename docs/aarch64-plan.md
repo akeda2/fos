@@ -42,7 +42,7 @@ mailbox, SD) about 3-4k more. The large x86 drivers are simply not needed.
   instruction cache and allocates the kernel as LoaderCode); `abi::elf` accepts the host CPU's ELF machine and RELATIVE relocation;
   `kernel/src/main.rs` dispatches to `main_x86_64.rs` or `main_aarch64.rs`; a minimal aarch64 kernel (`arch/aarch64/`: `_start`, PL011) prints its BootInfo;
   `make test-aarch64-boot` (image: `make image-aarch64`). Also done: exception vectors, generic timer (`make test-aarch64-faults`), the physical allocator and our own page tables
-  (`arch/aarch64/paging.rs`: identity map, RAM NX in 2 MiB blocks, kernel W^X, guard pages, `map_device`; EL1 or EL2). Left: GICv3/GIC-400,
+  (`arch/aarch64/paging.rs`: identity map, RAM NX in 2 MiB blocks, kernel W^X, guard pages, `map_device`; EL1 or EL2). Also done: GICv2 (`arch/aarch64/gic.rs`, QEMU virt default and the Pi's GIC-400) with a 100 Hz physical-timer IRQ through a register-saving IRQ vector. Left:
   framebuffer from GOP, then growing the module list (log, fosfs, shell) until `cargo check` shows no `cfg` gaps. The UART base is the QEMU one
   (`pl011::QEMU_VIRT_BASE`); the Pi's comes from the SPCR/DT tables.
 - **M2 - tape ABI on aarch64.** `targets/aarch64-fos-tape.json` (hard-float), shared `tapes/tape.ld`, tape ELF loader checks `e_machine`,

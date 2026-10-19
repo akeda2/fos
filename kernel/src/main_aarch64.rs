@@ -47,6 +47,16 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         paging::map_device(arch::aarch64::pl011::QEMU_VIRT_BASE, 4096);
         println!("Page tables loaded: RAM NX in 2 MiB blocks, kernel W^X, page 0 and stack guard unmapped.");
     }
+    if info.magic == BOOT_INFO_MAGIC {
+        gic::init();
+        cpu::interrupts_enable();
+        let start = timer::micros();
+        while timer::micros() - start < 100_000 {
+            cpu::sleep();
+        }
+        cpu::interrupts_disable();
+        println!("GICv2 up: {} timer interrupts (INTID 30) in 100 ms, expected about 10.", gic::irq_ticks());
+    }
     let before = timer::micros();
     timer::busy_wait_ms(100);
     let waited = timer::micros() - before;
