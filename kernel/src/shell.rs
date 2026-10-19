@@ -9,7 +9,8 @@ pub fn run() -> ! {
     lineedit::reset();
     crate::print(format_args!("\nType `help` for the commands.\nfos> "));
     loop {
-        match crate::arch::aarch64::pl011::read_byte() {
+        crate::usb_kbd::poll();
+        match crate::arch::aarch64::pl011::read_byte().or_else(crate::usb_kbd::pop) {
             Some(byte) => {
                 let mut line = [0u8; lineedit::LINE_MAX];
                 if let Some(length) = lineedit::feed(byte, &mut line) {

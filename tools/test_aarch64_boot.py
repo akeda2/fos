@@ -24,7 +24,7 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = ()) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = ()) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
     when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
@@ -55,6 +55,16 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                     qemu.stdin.write(command.encode() + b"\r")
                     qemu.stdin.flush()
                     wait_for(number)
+                if usb_keys and monitor.exists():
+                    # QEMU's usb-kbd: keys typed through the monitor reach the shell as USB HID reports.
+                    with socket.socket(socket.AF_UNIX) as sock:
+                        sock.settimeout(10)
+                        sock.connect(str(monitor))
+                        sock.recv(4096)
+                        for key in usb_keys:
+                            sock.sendall(f"sendkey {key}\n".encode())
+                            time.sleep(0.4)
+                    wait_for(len(commands) + 2)
                 time.sleep(1)  # let the console repaint reach the screen
                 if screendump is not None and monitor.exists():
                     with socket.socket(socket.AF_UNIX) as sock:
@@ -81,7 +91,7 @@ def lit_pixels(path: Path) -> tuple[int, int]:
 
 def main():
     shot = Path(tempfile.mkdtemp()) / "screen.ppm"
-    text = boot(IMAGE, shot, ("version", "disks", "ls", "cat hostname", "mem"))
+    text = boot(IMAGE, shot, ("version", "disks", "ls", "cat hostname", "mem"), ("v", "e", "r", "s", "i", "o", "n", "ret"))
     check("Fosfor OS loader" in text, "the aarch64 loader runs under AAVMF", text)
     check("Kernel image read" in text and "Loading its ELF64 segments" in text, "the loader reads the kernel from the payload slot", text)
     check("Fosfor OS kernel (aarch64): running from the UEFI loader." in text, "the kernel runs after ExitBootServices (instruction cache synced)", text)
@@ -100,6 +110,7 @@ def main():
     check(total > 0 and lit > 2000, f"the screen shows the kernel's text ({lit} lit pixels of {total})", text)
     check("Fosfor OS (aarch64 port)" in text and "virtio-blk" in text.split("version", 1)[-1], "the shell reads the serial console and runs `version` and `disks`", text)
     check(re.search(r"\d+ file\(s\)\.", text) is not None and re.search(r"Physical memory: \d+ MiB managed, \d+ MiB free\.\s+fos> ", text) is not None, "the shell lists FOSFS files and answers `mem`", text)
+    check(text.count("Fosfor OS (aarch64 port)") >= 2, "keys typed on the USB keyboard reach the shell (`version` run from it)", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
     check("USB: 1 xHCI controller(s)." in text and re.search(r"USB keyboard 0627:0001 on port \d+ .*: ready\.", text) is not None, "the xHCI controller comes up and enumerates the USB keyboard", text)
     print("aarch64 boot: all checks passed")
