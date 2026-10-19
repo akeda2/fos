@@ -16,3 +16,8 @@ rustflags = ["-C", "link-arg=-T../tape.ld", "-C", "relocation-model=pic", "-C", 
 # turns SSE on before such a tape starts (`TapeApi::fp_level`); only these tapes may use XMM registers.
 [target.x86_64-fos-tape-fp]
 rustflags = ["-C", "link-arg=-T../tape.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]
+
+# The aarch64 port (docs/aarch64-plan.md): the built-in hard-float bare-metal target, same linker script and PIE layout.
+# Build with `make tape-aarch64`, which passes `--target aarch64-unknown-none`.
+[target.aarch64-unknown-none]
+rustflags = ["-C", "link-arg=-T../tape.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]

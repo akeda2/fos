@@ -30,8 +30,8 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT"),
-        "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, no tapes yet."),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT run NAME [ARGS]"),
+        "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
             crate::println!("up {}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
@@ -55,6 +55,7 @@ fn execute(line: &str) {
         }
         "ls" => list(rest),
         "cat" => cat(rest),
+        "run" => run_tape(rest),
         "echo" => crate::println!("{rest}"),
         other => crate::println!("{other}: unknown command (try `help`)."),
     }
@@ -103,5 +104,18 @@ fn cat(name: &str) {
         }
         Ok(None) => crate::println!("cat: {name}: no such file."),
         Err(error) => crate::println!("cat: {name}: {error:?} (files over 16 KiB are not shown)."),
+    }
+}
+
+/// `run NAME [ARGS]`: loads a tape from the boot volume and runs it until it returns or Escape stops it.
+fn run_tape(rest: &str) {
+    let (name, arguments) = rest.split_once(' ').map_or((rest, ""), |(name, arguments)| (name, arguments.trim()));
+    if name.is_empty() {
+        crate::println!("run: which tape? (run NAME [ARGS])");
+        return;
+    }
+    match crate::tape_aarch64::load(name).and_then(|entry| crate::tape_aarch64::run(entry, arguments)) {
+        Ok(()) => crate::println!("Tape returned; back at the fos shell."),
+        Err(reason) => crate::println!("run: {name}: {reason}."),
     }
 }

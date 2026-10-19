@@ -19,7 +19,7 @@ use core::fmt::Write;
 
 // The entry point and the panic handler exist only in a tape build (the `os: none` tape target). A host build, `cargo test` of a
 // tape's library, has std's own panic handler and a C runtime's `_start`, and no `tape_main` to call.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
     .section .text.entry, "ax"
@@ -30,6 +30,21 @@ core::arch::global_asm!(
         mov rbp, rsp
         call tape_main
         pop rbp
+        ret
+    "#
+);
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .global _start
+    _start:
+        // x0 = &TapeApi, passed straight on; the stack is the tape's own and 16-byte aligned.
+        stp x29, x30, [sp, #-16]!
+        mov x29, sp
+        bl tape_main
+        ldp x29, x30, [sp], #16
         ret
     "#
 );

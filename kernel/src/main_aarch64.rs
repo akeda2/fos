@@ -13,6 +13,7 @@ mod memory;
 mod pci;
 mod shell;
 mod storage;
+mod tape_aarch64;
 mod usb_kbd;
 mod virtio_blk;
 mod xhci;
@@ -124,6 +125,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     unsafe {
         core::ptr::read_volatile(0x10 as *const u64);
     }
+    tape_aarch64::set_boot_info(info);
     println!("USB: {} keyboard(s) found.", usb_kbd::init());
     cpu::interrupts_enable();
     shell::run()

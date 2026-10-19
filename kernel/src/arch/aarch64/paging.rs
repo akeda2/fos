@@ -279,3 +279,28 @@ pub fn is_mapped(address: u64) -> bool {
     }
     false
 }
+
+/// Makes `[start, start + length)` (2 MiB aligned, RAM) executable or not again: tapes run from one such region. The
+/// region stays writable (the loader fills it); the kernel trusts tapes as it trusts itself. Callers sync the caches
+/// afterwards (`cpu::sync_code`).
+pub fn set_executable(start: u64, length: u64, executable: bool) {
+    let root = unsafe { ROOT };
+    let mut address = start;
+    while address < start + length {
+        let l1 = next_table(root, (address >> 39) & 0x1ff);
+        let l2 = next_table(l1, (address >> 30) & 0x1ff);
+        let slot = entry(l2, (address >> 21) & 0x1ff);
+        let value = unsafe { slot.read() };
+        assert!(value & 3 == 1, "set_executable: not a 2 MiB RAM block");
+        let value = if executable { value & !(PXN | UXN) } else { value | PXN | UXN };
+        unsafe { slot.write(value) };
+        address += BLOCK;
+    }
+    unsafe {
+        if current_el() == 2 {
+            core::arch::asm!("dsb ishst", "tlbi alle2", "dsb ish", "isb", options(nostack));
+        } else {
+            core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
+        }
+    }
+}

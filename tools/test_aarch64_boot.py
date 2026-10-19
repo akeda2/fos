@@ -91,7 +91,7 @@ def lit_pixels(path: Path) -> tuple[int, int]:
 
 def main():
     shot = Path(tempfile.mkdtemp()) / "screen.ppm"
-    text = boot(IMAGE, shot, ("version", "disks", "ls", "cat hostname", "mem"), ("v", "e", "r", "s", "i", "o", "n", "ret"))
+    text = boot(IMAGE, shot, ("version", "disks", "ls", "cat hostname", "mem", "run hello one two", "run nothere"), ("v", "e", "r", "s", "i", "o", "n", "ret"))
     check("Fosfor OS loader" in text, "the aarch64 loader runs under AAVMF", text)
     check("Kernel image read" in text and "Loading its ELF64 segments" in text, "the loader reads the kernel from the payload slot", text)
     check("Fosfor OS kernel (aarch64): running from the UEFI loader." in text, "the kernel runs after ExitBootServices (instruction cache synced)", text)
@@ -110,6 +110,8 @@ def main():
     check(total > 0 and lit > 2000, f"the screen shows the kernel's text ({lit} lit pixels of {total})", text)
     check("Fosfor OS (aarch64 port)" in text and "virtio-blk" in text.split("version", 1)[-1], "the shell reads the serial console and runs `version` and `disks`", text)
     check(re.search(r"\d+ file\(s\)\.", text) is not None and re.search(r"Physical memory: \d+ MiB managed, \d+ MiB free\.\s+fos> ", text) is not None, "the shell lists FOSFS files and answers `mem`", text)
+    check("hello from a v2 tape" in text and "arguments: [one two]" in text and re.search(r"primes up to 100000: 9592 \(in \d+ us\)", text) is not None and "Tape returned; back at the fos shell." in text, "a hard-float aarch64 tape loads from FOSFS, runs with arguments, allocates, uses the clock and returns", text)
+    check("run: nothere: no such file." in text, "a missing tape is refused politely", text)
     check(text.count("Fosfor OS (aarch64 port)") >= 2, "keys typed on the USB keyboard reach the shell (`version` run from it)", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
     check("USB: 1 xHCI controller(s)." in text and re.search(r"USB keyboard 0627:0001 on port \d+ .*: ready\.", text) is not None, "the xHCI controller comes up and enumerates the USB keyboard", text)
