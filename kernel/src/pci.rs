@@ -192,6 +192,9 @@ impl Device {
         if base == 0 || mask == 0 {
             return None;
         }
+        // Behind a bridge with address translation (Pi 4) the BAR holds a PCI address, not the CPU's.
+        #[cfg(target_arch = "aarch64")]
+        let base = crate::pci_config::cpu_address(base);
         Some((base, (!mask).wrapping_add(1)))
     }
 }

@@ -146,8 +146,8 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     }
     if info.magic == BOOT_INFO_MAGIC {
         match arch::aarch64::pci_config::init(info.acpi_rsdp) {
-            Some(base) => println!("PCI: ECAM window at {base:#x} (ACPI MCFG)."),
-            None => println!("PCI: the firmware describes no ECAM window."),
+            Some((base, kind)) => println!("PCI: config space at {base:#x}: {kind}."),
+            None => println!("PCI: no config-space window (no MCFG, not a Pi 4)."),
         }
         println!("PCI: {} function(s) on bus 0.", pci::scan());
         for device in pci::devices() {

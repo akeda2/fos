@@ -28,6 +28,11 @@ struct Allocator {
     hint: u64,
 }
 
+/// `[first, last)` frames of the DMA pool (empty when there is none): memory the kernel maps non-cacheable, which a device
+/// that is not cache-coherent with the CPU (the Pi 4's PCIe) can use. Requests with a `below` limit, the DMA ones, are
+/// served from it only, and every other request leaves it alone.
+static mut POOL: (u64, u64) = (0, 0);
+
 static mut ALLOCATOR: Allocator = Allocator { bitmap: core::ptr::null_mut(), frames: 0, free: 0, hint: 0 };
 
 fn allocator() -> &'static mut Allocator {
@@ -173,16 +178,20 @@ pub fn allocate_contiguous(count: u64, below: Option<u64>) -> Option<u64> {
 /// head and tail say which bytes are valid), where clearing gigabytes would just be a delay.
 pub fn allocate_contiguous_uncleared(count: u64, below: Option<u64>) -> Option<u64> {
     let a = allocator();
-    let limit = below.map_or(a.frames, |address| (address / FRAME).min(a.frames));
-    if count == 0 || count > limit {
+    let pool = unsafe { *core::ptr::addr_of!(POOL) };
+    let from_pool = pool.1 != 0 && below.is_some();
+    let limit = if from_pool { pool.1 } else { below.map_or(a.frames, |address| (address / FRAME).min(a.frames)) };
+    let low = if from_pool { pool.0 } else { 0 };
+    if count == 0 || count > limit.saturating_sub(low) {
         return None;
     }
     // Two passes over the rolling hint: from the hint to the end, then from the start.
-    for (from, to) in [(a.hint.min(limit), limit), (0, a.hint.min(limit))] {
+    let hint = a.hint.clamp(low, limit);
+    for (from, to) in [(hint, limit), (low, hint)] {
         let mut run = 0u64;
         let mut frame = from;
         while frame < to {
-            if a.is_used(frame) {
+            if a.is_used(frame) || (!from_pool && frame >= pool.0 && frame < pool.1) {
                 run = 0;
             } else {
                 run += 1;
@@ -199,6 +208,16 @@ pub fn allocate_contiguous_uncleared(count: u64, below: Option<u64>) -> Option<u
         }
     }
     None
+}
+
+/// Sets aside `frames` below 4 GiB as the DMA pool and maps it non-cacheable (see `POOL`). Call once, after paging is up.
+#[cfg(target_arch = "aarch64")]
+pub fn dma_pool(frames: u64) {
+    let Some(start) = allocate_contiguous_uncleared(frames, Some(1 << 32)) else { return };
+    crate::paging::map_uncached(start, frames * FRAME);
+    free(start, frames);
+    unsafe { *core::ptr::addr_of_mut!(POOL) = (start / FRAME, start / FRAME + frames) };
+    crate::println!("DMA pool: {} KiB at {:#x}, mapped non-cacheable.", frames * FRAME / 1024, start);
 }
 
 /// One zeroed frame anywhere.

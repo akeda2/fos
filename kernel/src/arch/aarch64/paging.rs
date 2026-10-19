@@ -421,3 +421,29 @@ pub fn set_executable(start: u64, length: u64, executable: bool) {
         }
     }
 }
+
+/// Remaps `[start, start + length)` of RAM as normal non-cacheable, for memory a device writes behind the CPU's back (the
+/// Pi 4's VL805 is not cache-coherent). The range's cache lines are cleaned and invalidated first, so no dirty line can later
+/// overwrite what the device wrote, and no cacheable alias of it remains.
+pub fn map_uncached(start: u64, length: u64) {
+    let root = unsafe { ROOT };
+    let (first, end) = (start & !(PAGE - 1), (start + length + PAGE - 1) & !(PAGE - 1));
+    unsafe {
+        for line in (first..end).step_by(64) {
+            core::arch::asm!("dc civac, {}", in(reg) line, options(nostack));
+        }
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+    let mut page = first;
+    while page < end {
+        map_page(root, page, FRAMEBUFFER);
+        page += PAGE;
+    }
+    unsafe {
+        if current_el() == 2 {
+            core::arch::asm!("dsb ishst", "tlbi alle2", "dsb ish", "isb", options(nostack));
+        } else {
+            core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
+        }
+    }
+}
