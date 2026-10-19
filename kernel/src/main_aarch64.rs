@@ -3,11 +3,21 @@ use core::panic::PanicInfo;
 use fosfor_abi::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 
 mod arch;
+mod font_data;
+mod framebuffer;
 mod memory;
 
-/// `println!` goes to the PL011 for now; the framebuffer and the boot log join it as their modules are ported.
+/// `println!` goes to the PL011 and, once it exists, the framebuffer; the boot log joins as its module is ported.
 pub fn print(arguments: core::fmt::Arguments) {
-    let _ = arch::aarch64::pl011::Serial.write_fmt(arguments);
+    struct Both;
+    impl Write for Both {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let _ = arch::aarch64::pl011::Serial.write_str(text);
+            framebuffer::write_str(text);
+            Ok(())
+        }
+    }
+    let _ = Both.write_fmt(arguments);
 }
 
 /// The loader jumps here (through `_start`, arch/aarch64/mod.rs) with the BootInfo pointer.
@@ -43,8 +53,10 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         );
         let stats = memory::stats();
         println!("Physical memory: {} MiB managed, {} MiB free.", stats.frames * memory::FRAME / (1024 * 1024), stats.free * memory::FRAME / (1024 * 1024));
-        paging::build_and_load(info);
+        paging::build_and_load(info, &info.framebuffer);
         paging::map_device(arch::aarch64::pl011::QEMU_VIRT_BASE, 4096);
+        let screen = framebuffer::init(&info.framebuffer);
+        println!("Framebuffer console: {}.", if screen { "on" } else { "none (serial only)" });
         println!("Page tables loaded: RAM NX in 2 MiB blocks, kernel W^X, page 0 and stack guard unmapped.");
     }
     if info.magic == BOOT_INFO_MAGIC {

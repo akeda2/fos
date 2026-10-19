@@ -29,10 +29,12 @@ const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 const RAM_DATA: u64 = ATTR_NORMAL | INNER_SHAREABLE | ACCESS | PXN | UXN;
 const RAM_CODE: u64 = ATTR_NORMAL | INNER_SHAREABLE | ACCESS | UXN | READ_ONLY;
 const RAM_RODATA: u64 = RAM_DATA | READ_ONLY;
+const ATTR_UNCACHED: u64 = 2 << 2; // MAIR index 2: normal non-cacheable (the display reads RAM behind the CPU cache)
+const FRAMEBUFFER: u64 = ATTR_UNCACHED | INNER_SHAREABLE | ACCESS | PXN | UXN;
 const DEVICE: u64 = ATTR_DEVICE | ACCESS | PXN | UXN;
 
-/// MAIR: index 0 = normal write-back (0xff), index 1 = device-nGnRnE (0x00).
-const MAIR: u64 = 0xff;
+/// MAIR: index 0 = normal write-back (0xff), 1 = device-nGnRnE (0x00), 2 = normal non-cacheable (0x44).
+const MAIR: u64 = 0xff | (0x44 << 16);
 
 static mut ROOT: u64 = 0;
 
@@ -150,7 +152,7 @@ fn current_el() -> u64 {
 }
 
 /// Builds the tables from the firmware memory map and the kernel's own layout, then switches to them.
-pub fn build_and_load(info: &BootInfo) {
+pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
     let root = memory::allocate().expect("no frame for the page-table root");
     unsafe { ROOT = root };
 
@@ -179,6 +181,16 @@ pub fn build_and_load(info: &BootInfo) {
     map_range(root, l.text_start, l.text_end, RAM_CODE);
     map_range(root, l.rodata_start, l.rodata_end, RAM_RODATA);
     map_range(root, l.rodata_end, l.kernel_end, RAM_DATA);
+    // The framebuffer is non-cacheable so the display sees every store without cache maintenance.
+    if framebuffer.base != 0 && framebuffer.format < fosfor_abi::PIXEL_NONE {
+        let start = framebuffer.base & !(PAGE - 1);
+        let end = (framebuffer.base + framebuffer.size + PAGE - 1) & !(PAGE - 1);
+        let mut address = start;
+        while address < end {
+            map_page(root, address, FRAMEBUFFER);
+            address += PAGE;
+        }
+    }
     // The stack guard: one page that faults instead of silently corrupting what lies below the stack.
     unmap_page(root, l.stack_guard);
     // Page 0 stays unmapped so a null dereference faults (if RAM starts there at all).
@@ -214,14 +226,14 @@ fn load(root: u64) {
             core::arch::asm!(
                 "msr mair_el2, {mair}", "msr tcr_el2, {tcr}", "msr ttbr0_el2, {root}", "isb",
                 "tlbi alle2", "dsb ish", "isb",
-                mair = in(reg) MAIR | (0x00 << 8), tcr = in(reg) tcr, root = in(reg) root, options(nostack)
+                mair = in(reg) MAIR, tcr = in(reg) tcr, root = in(reg) root, options(nostack)
             );
         } else {
             let tcr = low | (1 << 23) | (pa_range << 32);
             core::arch::asm!(
                 "msr mair_el1, {mair}", "msr tcr_el1, {tcr}", "msr ttbr0_el1, {root}", "isb",
                 "tlbi vmalle1", "dsb ish", "isb",
-                mair = in(reg) MAIR | (0x00 << 8), tcr = in(reg) tcr, root = in(reg) root, options(nostack)
+                mair = in(reg) MAIR, tcr = in(reg) tcr, root = in(reg) root, options(nostack)
             );
         }
     }

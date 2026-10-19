@@ -5,9 +5,11 @@ and the AAVMF firmware (apt: qemu-system-arm qemu-efi-aarch64). Run `make test-a
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,27 +24,53 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path) -> str:
-    """Boots `image` under QEMU virt + AAVMF and returns the serial text (the kernel parks, so the timeout is the normal end)."""
+def boot(image: Path, screendump: Path | None = None) -> str:
+    """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
+    when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
         raise SystemExit("qemu-system-aarch64 or the AAVMF firmware is missing (apt install qemu-system-arm qemu-efi-aarch64)")
     with tempfile.TemporaryDirectory() as scratch:
         variables = Path(scratch) / "vars.fd"
         shutil.copyfile(VARS, variables)
-        try:
-            run = subprocess.run(
-                ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-serial", "stdio", "-no-reboot",
+        log, monitor = Path(scratch) / "serial.txt", Path(scratch) / "mon.sock"
+        with open(log, "wb") as out:
+            qemu = subprocess.Popen(
+                ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-device", "ramfb",
+                 "-serial", "stdio", "-no-reboot", "-monitor", f"unix:{monitor},server,nowait",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
                  "-drive", f"file={image},format=raw,if=virtio,snapshot=on"],
-                capture_output=True, timeout=45)
-            output = run.stdout
-        except subprocess.TimeoutExpired as expired:
-            output = expired.stdout or b""  # the kernel parks; the timeout is the normal end
+                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.time() + 60
+                while time.time() < deadline and b"parking the cpu" not in log.read_bytes().lower():
+                    time.sleep(0.5)
+                time.sleep(1)  # let the console repaint reach the screen
+                if screendump is not None and monitor.exists():
+                    with socket.socket(socket.AF_UNIX) as sock:
+                        sock.settimeout(10)
+                        sock.connect(str(monitor))
+                        sock.recv(4096)
+                        sock.sendall(f"screendump {screendump}\n".encode())
+                        time.sleep(1.5)
+            finally:
+                qemu.kill()
+                qemu.wait()
+        output = log.read_bytes()
     return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", output.decode("utf-8", "replace")).replace("\r", "")
 
 
+def lit_pixels(path: Path) -> tuple[int, int]:
+    """(width, height) and how many pixels of a binary PPM are not black."""
+    data = path.read_bytes()
+    parts = data.split(b"\n", 3)
+    width, height = map(int, parts[1].split())
+    pixels = parts[3]
+    return width * height, sum(1 for k in range(0, len(pixels), 3) if pixels[k:k + 3] != b"\0\0\0")
+
+
 def main():
-    text = boot(IMAGE)
+    shot = Path(tempfile.mkdtemp()) / "screen.ppm"
+    text = boot(IMAGE, shot)
     check("Fosfor OS loader" in text, "the aarch64 loader runs under AAVMF", text)
     check("Kernel image read" in text and "Loading its ELF64 segments" in text, "the loader reads the kernel from the payload slot", text)
     check("Fosfor OS kernel (aarch64): running from the UEFI loader." in text, "the kernel runs after ExitBootServices (instruction cache synced)", text)
@@ -53,6 +81,9 @@ def main():
     check("Page tables loaded" in text and re.search(r"Physical memory: \d+ MiB managed", text) is not None, "the kernel builds and loads its own page tables (MMU, W^X, device map)", text)
     irq = re.search(r"(\d+) timer interrupts", text)
     check(irq is not None and 8 <= int(irq.group(1)) <= 12, "the GIC delivers the 100 Hz timer interrupt and the CPU returns from it", text)
+    check("Framebuffer console: on" in text, "the loader hands over a GOP framebuffer and the kernel starts its console on it", text)
+    total, lit = lit_pixels(shot) if shot.exists() else (0, 0)
+    check(total > 0 and lit > 2000, f"the screen shows the kernel's text ({lit} lit pixels of {total})", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
     print("aarch64 boot: all checks passed")
 

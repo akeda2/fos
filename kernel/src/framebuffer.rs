@@ -154,10 +154,15 @@ impl Console {
             }
         }
         let cell = (self.row.min(self.rows - 1) * columns + self.column.min(columns - 1)) as u16;
-        crate::cpu::outb(0x3d4, 0x0e);
-        crate::cpu::outb(0x3d5, (cell >> 8) as u8);
-        crate::cpu::outb(0x3d4, 0x0f);
-        crate::cpu::outb(0x3d5, cell as u8);
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::cpu::outb(0x3d4, 0x0e);
+            crate::cpu::outb(0x3d5, (cell >> 8) as u8);
+            crate::cpu::outb(0x3d4, 0x0f);
+            crate::cpu::outb(0x3d5, cell as u8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = cell;
     }
 
     /// The few ANSI sequences a tape's screen editor sends: `ESC [ n C` / `ESC [ n D` (cursor
@@ -431,10 +436,13 @@ pub fn init_text() -> bool {
         *core::ptr::addr_of_mut!(CONSOLE) = Some(console);
     }
     // CRTC register 0x0A: bit 5 turns the cursor off; clear it, and give the cursor a block-ish shape (scan lines 13-15).
-    crate::cpu::outb(0x3d4, 0x0a);
-    crate::cpu::outb(0x3d5, 13);
-    crate::cpu::outb(0x3d4, 0x0b);
-    crate::cpu::outb(0x3d5, 15);
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::cpu::outb(0x3d4, 0x0a);
+        crate::cpu::outb(0x3d5, 13);
+        crate::cpu::outb(0x3d4, 0x0b);
+        crate::cpu::outb(0x3d5, 15);
+    }
     true
 }
 
