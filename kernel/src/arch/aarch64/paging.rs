@@ -230,16 +230,25 @@ fn load(root: u64) {
         core::arch::asm!("dsb ish", options(nostack));
         if current_el() == 2 {
             let tcr = low | (pa_range << 16) | (1 << 23) | (1 << 31);
+            // MMU off while MAIR/TCR/TTBR0 change: the firmware's TCR may use another T0SZ than ours, and
+            // the window between the writes would walk its tables with the wrong geometry. No memory access
+            // inside the block (everything is in registers), so the cache state does not matter.
             core::arch::asm!(
+                "mrs {s}, sctlr_el2", "bic {t}, {s}, #1", "msr sctlr_el2, {t}", "isb",
                 "msr mair_el2, {mair}", "msr tcr_el2, {tcr}", "msr ttbr0_el2, {root}", "isb",
-                "tlbi alle2", "dsb ish", "isb",
+                "tlbi alle2", "dsb nsh", "isb",
+                "msr sctlr_el2, {s}", "isb",
+                s = out(reg) _, t = out(reg) _,
                 mair = in(reg) MAIR, tcr = in(reg) tcr, root = in(reg) root, options(nostack)
             );
         } else {
             let tcr = low | (1 << 23) | (pa_range << 32);
             core::arch::asm!(
+                "mrs {s}, sctlr_el1", "bic {t}, {s}, #1", "msr sctlr_el1, {t}", "isb",
                 "msr mair_el1, {mair}", "msr tcr_el1, {tcr}", "msr ttbr0_el1, {root}", "isb",
-                "tlbi vmalle1", "dsb ish", "isb",
+                "tlbi vmalle1", "dsb nsh", "isb",
+                "msr sctlr_el1, {s}", "isb",
+                s = out(reg) _, t = out(reg) _,
                 mair = in(reg) MAIR, tcr = in(reg) tcr, root = in(reg) root, options(nostack)
             );
         }
