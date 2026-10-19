@@ -14,6 +14,7 @@ mod pci;
 mod shell;
 mod storage;
 mod tape_aarch64;
+mod genet;
 mod sdhci;
 mod usb_hub;
 mod usb_kbd;
@@ -172,6 +173,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
             );
         }
         storage::init(info);
+        genet::init();
     }
     let before = timer::micros();
     timer::busy_wait_ms(100);

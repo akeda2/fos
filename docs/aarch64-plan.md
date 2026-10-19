@@ -123,3 +123,11 @@ The Pi 4 boots pftf edk2 -> our loader -> kernel, shows the boot log, runs the s
   and the keyboard is found. xHCI is polled (no PCIe MSI yet).
 - **SD card (`sdhci.rs`, written 2026-10-19, tested on QEMU `sdhci-pci` only):** standard SDHCI by polling and PIO, 32-bit register accesses only (the Arasan EMMC2 at 0xFE340000, like Linux's `sdhci-iproc`, dislikes 8/16-bit ones), card reinitialised from scratch (CMD0/8/ACMD41/2/3/9/7, 4-bit, 25 MHz), SDSC and SDHC. Shell `cp SRC DST` and `cat diskN/NAME` exercise it (`make test-aarch64-boot` boots virtio and reads/writes a second SD copy). **Unverified on the Pi:** the 100 MHz base clock, 3.3 V power and the reset of a card the firmware left running.
 - **Still missing on the Pi:** Genet NIC, interrupts for xHCI, Pi 5.
+
+### Pi 4 Ethernet (Genet), written 2026-10-19, unverified on hardware
+
+`kernel/src/genet.rs`: GENETv5 at 0xFD580000, polled, one TX buffer and 128 RX buffers from the non-cacheable DMA pool.
+MAC from the firmware's UMAC registers (fallback `02:f0:5b:00:00:01`); BCM54213PE PHY at MDIO 1 gets the RGMII-RXID skew
+and is auto-negotiated only when it has no link. Tape ABI NIC 0 is the Genet; multicast is promiscuous mode. QEMU has no
+Genet, so only `make tapes-aarch64` and the boot test cover it; the `netcheck` tape (DHCP, ARP, four pings) and the shell
+`nic` command are the first things to run on the Pi. Unknown until then: bring-up order, speed/duplex bits, PHY state left by edk2.

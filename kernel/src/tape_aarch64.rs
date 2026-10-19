@@ -33,13 +33,7 @@ macro_rules! stubs {
 }
 
 stubs! {
-    api_nic_count() -> usize = 0;
-    api_nic_mac(usize, *mut u8) -> u32 = 0;
-    api_nic_send(usize, *const u8, usize) -> u32 = 0;
-    api_nic_receive(usize, *mut u8, usize) -> usize = 0;
     api_nic_max_frame_len() -> usize = 1514;
-    api_nic_set_promiscuous(usize, u32) -> u32 = 0;
-    api_nic_set_multicast(usize, u32) -> u32 = 0;
     api_nic_active() -> u32 = 0;
     api_nic_ts_enable(usize) -> u32 = 0;
     api_nic_ts_clock(usize) -> u64 = 0;
@@ -343,6 +337,40 @@ extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, 
         Err(crate::fosfs::Error::TooBig) => FS_TOO_BIG,
         Err(_) => FS_ERROR,
     }
+}
+
+// Network calls: the Pi 4's Genet is NIC 0; elsewhere there is no NIC. Multicast reception is promiscuous mode (see genet.rs).
+extern "C" fn api_nic_count() -> usize {
+    usize::from(crate::genet::present())
+}
+
+extern "C" fn api_nic_mac(index: usize, out: *mut u8) -> u32 {
+    match crate::genet::mac().filter(|_| index == 0) {
+        Some(mac) => {
+            unsafe { core::ptr::copy_nonoverlapping(mac.as_ptr(), out, 6) };
+            1
+        }
+        None => 0,
+    }
+}
+
+extern "C" fn api_nic_send(index: usize, frame: *const u8, length: usize) -> u32 {
+    u32::from(index == 0 && length <= 1518 && crate::genet::send(unsafe { core::slice::from_raw_parts(frame, length) }))
+}
+
+extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) -> usize {
+    if index != 0 {
+        return 0;
+    }
+    crate::genet::receive(unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
+}
+
+extern "C" fn api_nic_set_promiscuous(index: usize, on: u32) -> u32 {
+    u32::from(index == 0 && crate::genet::set_promiscuous(on != 0))
+}
+
+extern "C" fn api_nic_set_multicast(index: usize, on: u32) -> u32 {
+    api_nic_set_promiscuous(index, on)
 }
 
 extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8, length: usize) -> isize {
