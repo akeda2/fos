@@ -1,7 +1,9 @@
-//! aarch64 (Raspberry Pi 4 and later, QEMU `virt`): boot entry and the PL011 console. Grows with the port
-//! (docs/aarch64-plan.md): exception vectors, MMU, GIC, generic timer come next.
+//! aarch64 (Raspberry Pi 4 and later, QEMU `virt`): boot entry, exception vectors, the generic timer and the PL011
+//! console. Grows with the port (docs/aarch64-plan.md): MMU and GIC come next.
 
+pub mod exceptions;
 pub mod pl011;
+pub mod timer;
 
 // Entered from the UEFI loader like a C function: x0 = the BootInfo pointer, MMU and caches on with the firmware's
 // identity map, interrupts as the firmware left them (masked here: the kernel has no vectors yet). The loader zeroed

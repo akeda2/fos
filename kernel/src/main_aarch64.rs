@@ -28,6 +28,26 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
             info.acpi_rsdp
         );
     }
+    arch::aarch64::exceptions::init();
+    let before = timer::micros();
+    timer::busy_wait_ms(100);
+    let waited = timer::micros() - before;
+    println!(
+        "Exception vectors installed (running at EL{}). Generic timer: {} Hz, ticks {}; a 100 ms wait took {} us.",
+        arch::aarch64::exceptions::current_el(),
+        timer::frequency(),
+        timer::ticks(),
+        waited
+    );
+    // Deliberate faults for the exception test (make test-aarch64-faults): one per Cargo feature.
+    #[cfg(feature = "fault-ud")]
+    unsafe {
+        core::arch::asm!("udf #0")
+    };
+    #[cfg(feature = "fault-null")]
+    unsafe {
+        core::ptr::read_volatile(0x10 as *const u64);
+    }
     println!("Nothing more to do yet: parking the CPU.");
     loop {
         unsafe { core::arch::asm!("wfe") };

@@ -22,7 +22,8 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def main():
+def boot(image: Path) -> str:
+    """Boots `image` under QEMU virt + AAVMF and returns the serial text (the kernel parks, so the timeout is the normal end)."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
         raise SystemExit("qemu-system-aarch64 or the AAVMF firmware is missing (apt install qemu-system-arm qemu-efi-aarch64)")
     with tempfile.TemporaryDirectory() as scratch:
@@ -32,18 +33,24 @@ def main():
             run = subprocess.run(
                 ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-serial", "stdio", "-no-reboot",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
-                 "-drive", f"file={IMAGE},format=raw,if=virtio,snapshot=on"],
+                 "-drive", f"file={image},format=raw,if=virtio,snapshot=on"],
                 capture_output=True, timeout=45)
             output = run.stdout
         except subprocess.TimeoutExpired as expired:
             output = expired.stdout or b""  # the kernel parks; the timeout is the normal end
-    text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", output.decode("utf-8", "replace")).replace("\r", "")
+    return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", output.decode("utf-8", "replace")).replace("\r", "")
+
+
+def main():
+    text = boot(IMAGE)
     check("Fosfor OS loader" in text, "the aarch64 loader runs under AAVMF", text)
     check("Kernel image read" in text and "Loading its ELF64 segments" in text, "the loader reads the kernel from the payload slot", text)
     check("Fosfor OS kernel (aarch64): running from the UEFI loader." in text, "the kernel runs after ExitBootServices (instruction cache synced)", text)
     match = re.search(r"BootInfo v5: (\d+) memory-map entries, kernel at (0x[0-9a-f]+) \((\d+) KiB\), slot 0, ACPI RSDP (0x[0-9a-f]+)", text)
     check(match is not None and int(match.group(1)) > 10 and match.group(4) != "0x0", "the kernel reads a valid BootInfo (memory map and ACPI RSDP)", text)
-    check("PANIC" not in text and "FATAL" not in text, "no panic and no loader fatal", text)
+    timer = re.search(r"Generic timer: (\d+) Hz, ticks \d+; a 100 ms wait took (\d+) us", text)
+    check(timer is not None and 90_000 <= int(timer.group(2)) <= 300_000, "the generic timer counts: a 100 ms busy wait measures about 100 ms", text)
+    check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
     print("aarch64 boot: all checks passed")
 
 
