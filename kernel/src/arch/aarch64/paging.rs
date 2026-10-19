@@ -27,7 +27,9 @@ const UXN: u64 = 1 << 54;
 const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 const RAM_DATA: u64 = ATTR_NORMAL | INNER_SHAREABLE | ACCESS | PXN | UXN;
-const RAM_CODE: u64 = ATTR_NORMAL | INNER_SHAREABLE | ACCESS | UXN | READ_ONLY;
+// Executable means both PXN and UXN clear: at EL1 UXN only stops EL0 (there is none), but at EL2 there is one privilege
+// level and bit 54 is its execute-never bit, so a code page with UXN set faults on the first fetch (Pi 4 with edk2).
+const RAM_CODE: u64 = ATTR_NORMAL | INNER_SHAREABLE | ACCESS | READ_ONLY;
 const RAM_RODATA: u64 = RAM_DATA | READ_ONLY;
 const ATTR_UNCACHED: u64 = 2 << 2; // MAIR index 2: normal non-cacheable (the display reads RAM behind the CPU cache)
 const FRAMEBUFFER: u64 = ATTR_UNCACHED | INNER_SHAREABLE | ACCESS | PXN | UXN;
@@ -203,7 +205,7 @@ pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
         let start = descriptor.physical_start & !(BLOCK - 1);
         let end = (descriptor.physical_start + descriptor.pages * PAGE + BLOCK - 1) & !(BLOCK - 1);
         // UEFI runtime code (5) stays executable for the runtime services.
-        let attributes = if descriptor.kind == 5 { RAM_DATA & !PXN } else { RAM_DATA };
+        let attributes = if descriptor.kind == 5 { RAM_DATA & !(PXN | UXN) } else { RAM_DATA };
         let mut address = start;
         while address < end {
             // Neighbouring descriptors can share a block; the first mapping wins unless this one needs exec.
