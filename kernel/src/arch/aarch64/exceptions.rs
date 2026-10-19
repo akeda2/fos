@@ -123,6 +123,11 @@ extern "C" fn exception_report(index: u64) -> ! {
     let origin = ["current EL, SP0", "current EL", "lower EL (AArch64)", "lower EL (AArch32)"][(index / 4) as usize];
     let kind = ["synchronous", "IRQ", "FIQ", "SError"][(index % 4) as usize];
     let class = esr >> 26;
+    // Pixels first (no serial needed): a red-less, fixed pattern of ESR, ELR, FAR as bits under the progress squares.
+    super::early::bits(0, esr);
+    super::early::bits(1, elr);
+    super::early::bits(2, far);
+    super::early::bits(3, index);
     crate::println!();
     crate::println!("EXCEPTION: {kind} from {origin}, running at EL{}.", current_el());
     crate::println!("  ESR {esr:#010x}: class {class:#04x} ({}), ISS {:#x}", class_name(class), esr & 0x1ff_ffff);

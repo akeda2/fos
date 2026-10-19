@@ -3,6 +3,7 @@
 
 pub mod acpi;
 pub mod cpu;
+pub mod early;
 pub mod exceptions;
 pub mod gic;
 pub mod paging;

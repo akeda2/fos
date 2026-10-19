@@ -35,6 +35,11 @@ pub fn print(arguments: core::fmt::Arguments) {
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     let info = unsafe { &*info };
+    let screen = &info.framebuffer;
+    arch::aarch64::early::init(screen.base, screen.stride, screen.width, screen.height);
+    arch::aarch64::early::mark(0);
+    arch::aarch64::exceptions::init();
+    arch::aarch64::early::mark(1);
     // Before the first line is printed: the PL011 is at the address the firmware's SPCR table gives (QEMU `virt` 0x09000000,
     // a Pi 4 0xFE201000). Printing first, to QEMU's address, would write to nothing on a Pi and show no sign of life.
     let mut uart_from_acpi = false;
@@ -44,7 +49,9 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
             uart_from_acpi = true;
         }
     }
+    arch::aarch64::early::mark(2);
     println!();
+    arch::aarch64::early::mark(3);
     println!("Fosfor OS kernel (aarch64): running from the UEFI loader.");
     if info.magic != BOOT_INFO_MAGIC || info.version != BOOT_INFO_VERSION || info.size as usize != core::mem::size_of::<BootInfo>() {
         println!("BootInfo is not what this kernel expects (magic {:#x}, version {}, size {}).", info.magic, info.version, info.size);
@@ -59,7 +66,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
             info.acpi_rsdp
         );
     }
-    arch::aarch64::exceptions::init();
+    arch::aarch64::early::mark(4);
     // The console and interrupt controller are where the firmware's ACPI tables say (QEMU `virt` and the Pi 4 differ).
     if info.magic == BOOT_INFO_MAGIC {
         if let Some((distributor, cpu_interface)) = arch::aarch64::acpi::madt_gic(info.acpi_rsdp) {
@@ -77,15 +84,19 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
                 (info.acpi_rsdp & !0xfff, 8192),
             ],
         );
+        arch::aarch64::early::mark(5);
         let stats = memory::stats();
         println!("Physical memory: {} MiB managed, {} MiB free.", stats.frames * memory::FRAME / (1024 * 1024), stats.free * memory::FRAME / (1024 * 1024));
         paging::build_and_load(info, &info.framebuffer);
+        arch::aarch64::early::mark(6);
         paging::map_device(arch::aarch64::pl011::base(), 4096);
         println!("Console: PL011 at {:#x} ({}).", arch::aarch64::pl011::base(), if uart_from_acpi { "ACPI SPCR" } else { "default" });
+        arch::aarch64::early::mark(7);
         let screen = framebuffer::init(&info.framebuffer);
         println!("Framebuffer console: {}.", if screen { "on" } else { "none (serial only)" });
         println!("Page tables loaded: RAM NX in 2 MiB blocks, kernel W^X, page 0 and stack guard unmapped.");
     }
+    arch::aarch64::early::mark(8);
     if info.magic == BOOT_INFO_MAGIC {
         gic::init();
         cpu::interrupts_enable();
