@@ -57,6 +57,9 @@ pub fn print(arguments: core::fmt::Arguments) {
     let _ = Both.write_fmt(arguments);
 }
 
+const PI4_GIC_DISTRIBUTOR: u64 = 0xff84_1000;
+const PI4_PL011: u64 = 0xfe20_1000;
+
 /// The loader jumps here (through `_start`, arch/aarch64/mod.rs) with the BootInfo pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(info: *const BootInfo) -> ! {
@@ -69,10 +72,15 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     // Before the first line is printed: the PL011 is at the address the firmware's SPCR table gives (QEMU `virt` 0x09000000,
     // a Pi 4 0xFE201000). Printing first, to QEMU's address, would write to nothing on a Pi and show no sign of life.
     let mut uart_from_acpi = false;
+    let mut uart_from_pi4 = false;
     if info.magic == BOOT_INFO_MAGIC && info.version == BOOT_INFO_VERSION {
         if let Some(base) = arch::aarch64::acpi::spcr_uart(info.acpi_rsdp) {
             arch::aarch64::pl011::set_base(base);
             uart_from_acpi = true;
+        } else if arch::aarch64::acpi::madt_gic(info.acpi_rsdp).is_some_and(|(distributor, _)| distributor == PI4_GIC_DISTRIBUTOR) {
+            // edk2 on a Pi 4 gives no usable SPCR; the PL011 on GPIO14/15 is where the firmware's own console runs.
+            arch::aarch64::pl011::set_base(PI4_PL011);
+            uart_from_pi4 = true;
         }
     }
     arch::aarch64::early::mark(2);
@@ -116,7 +124,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         paging::build_and_load(info, &info.framebuffer);
         arch::aarch64::early::mark(6);
         paging::map_device(arch::aarch64::pl011::base(), 4096);
-        println!("Console: PL011 at {:#x} ({}).", arch::aarch64::pl011::base(), if uart_from_acpi { "ACPI SPCR" } else { "default" });
+        println!("Console: PL011 at {:#x} ({}).", arch::aarch64::pl011::base(), if uart_from_acpi { "ACPI SPCR" } else if uart_from_pi4 { "Pi 4 default, no usable SPCR" } else { "default" });
         arch::aarch64::early::mark(7);
         let screen = framebuffer::init(&info.framebuffer);
         if screen {
