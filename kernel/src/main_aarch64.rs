@@ -18,15 +18,27 @@ mod usb_kbd;
 mod virtio_blk;
 mod xhci;
 
-/// Everything printed before the framebuffer console exists, replayed onto the screen once it does (a Pi shows nothing on a
-/// silent serial port otherwise). Bytes beyond the buffer are dropped.
-static mut EARLY_LOG: [u8; 8192] = [0; 8192];
+/// Everything printed since boot (`dmesg`), also replayed onto the screen once the framebuffer console exists (a Pi shows
+/// nothing on a silent serial port otherwise). Bytes beyond the buffer are dropped.
+static mut EARLY_LOG: [u8; 16384] = [0; 16384];
 static mut EARLY_LEN: usize = 0;
-static mut EARLY_LOGGING: bool = true;
 
-fn replay_early_log() {
+/// The log so far, to the serial console only (it would otherwise be appended to itself).
+pub fn dmesg() {
     unsafe {
-        *core::ptr::addr_of_mut!(EARLY_LOGGING) = false;
+        let len = *core::ptr::addr_of!(EARLY_LEN);
+        let log = &*core::ptr::addr_of!(EARLY_LOG);
+        if let Ok(text) = core::str::from_utf8(&log[..len]) {
+            for line in text.split_inclusive('\n') {
+                let _ = arch::aarch64::pl011::Serial.write_str(line.trim_end_matches('\n'));
+                let _ = arch::aarch64::pl011::Serial.write_str("\r\n");
+            }
+        }
+    }
+}
+
+pub fn replay_early_log() {
+    unsafe {
         let len = *core::ptr::addr_of!(EARLY_LEN);
         let log = &*core::ptr::addr_of!(EARLY_LOG);
         if let Ok(text) = core::str::from_utf8(&log[..len]) {
@@ -42,9 +54,9 @@ pub fn print(arguments: core::fmt::Arguments) {
         fn write_str(&mut self, text: &str) -> core::fmt::Result {
             let _ = arch::aarch64::pl011::Serial.write_str(text);
             unsafe {
-                if *core::ptr::addr_of!(EARLY_LOGGING) {
+                {
                     let len = *core::ptr::addr_of!(EARLY_LEN);
-                    let room = 8192 - len;
+                    let room = 16384 - len;
                     let take = text.len().min(room);
                     core::ptr::copy_nonoverlapping(text.as_ptr(), (core::ptr::addr_of_mut!(EARLY_LOG) as *mut u8).add(len), take);
                     *core::ptr::addr_of_mut!(EARLY_LEN) = len + take;
@@ -116,7 +128,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
                 (info.kernel_base, info.kernel_size),
                 (info as *const BootInfo as u64, 4096),
                 (info.memory_map, map_bytes),
-                (info.acpi_rsdp & !0xfff, 8192),
+                (info.acpi_rsdp & !0xfff, 16384),
             ],
         );
         arch::aarch64::early::mark(5);
