@@ -37,6 +37,36 @@ const DEVICE: u64 = ATTR_DEVICE | ACCESS | PXN | UXN;
 const MAIR: u64 = 0xff | (0x44 << 16);
 
 static mut ROOT: u64 = 0;
+const MAX_TABLES: usize = 512;
+static mut TABLES: [u64; MAX_TABLES] = [0; MAX_TABLES];
+static mut TABLE_COUNT: usize = 0;
+
+/// A zeroed frame for a page table, remembered so `clean_tables` can push it out of the data cache before the switch.
+fn table_frame() -> u64 {
+    let frame = memory::allocate().expect("no frame for a page table");
+    unsafe {
+        let count = *core::ptr::addr_of!(TABLE_COUNT);
+        assert!(count < MAX_TABLES, "too many page-table frames");
+        (*core::ptr::addr_of_mut!(TABLES))[count] = frame;
+        *core::ptr::addr_of_mut!(TABLE_COUNT) = count + 1;
+    }
+    frame
+}
+
+/// Cleans every table frame to the point of coherency: the walker may read memory, not our dirty cache lines (QEMU is
+/// always coherent, a Cortex-A72 need not be).
+fn clean_tables() {
+    unsafe {
+        let count = *core::ptr::addr_of!(TABLE_COUNT);
+        for index in 0..count {
+            let frame = (*core::ptr::addr_of!(TABLES))[index];
+            for line in (0..PAGE).step_by(64) {
+                core::arch::asm!("dc civac, {}", in(reg) frame + line, options(nostack));
+            }
+        }
+        core::arch::asm!("dsb sy", "isb", options(nostack));
+    }
+}
 
 unsafe extern "C" {
     static __kernel_start: u8;
@@ -88,7 +118,7 @@ fn next_table(table: u64, index: u64) -> u64 {
     let slot = entry(table, index);
     let value = unsafe { slot.read() };
     if value & VALID == 0 {
-        let new = memory::allocate().expect("no frame for a page table");
+        let new = table_frame();
         unsafe { slot.write(new | TABLE) };
         new
     } else {
@@ -103,7 +133,7 @@ fn level3(root: u64, address: u64) -> u64 {
     let slot = entry(l2, (address >> 21) & 0x1ff);
     let value = unsafe { slot.read() };
     if value & 3 == 1 {
-        let table = memory::allocate().expect("no frame for a page table");
+        let table = table_frame();
         let attributes = value & !ADDRESS_MASK & !3;
         for page in 0..512u64 {
             unsafe { (table as *mut u64).add(page as usize).write((value & ADDRESS_MASK) + page * PAGE | attributes | PAGE_DESC) };
@@ -161,7 +191,7 @@ fn current_el() -> u64 {
 
 /// Builds the tables from the firmware memory map and the kernel's own layout, then switches to them.
 pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
-    let root = memory::allocate().expect("no frame for the page-table root");
+    let root = table_frame();
     unsafe { ROOT = root };
     super::early::mark(10);
 
@@ -209,6 +239,7 @@ pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
     super::early::bits(4, sysreg!("id_aa64mmfr0_el1"));
     super::early::bits(5, current_el());
     super::early::bits(6, root);
+    clean_tables();
     diagnostics(root, framebuffer.base);
     super::early::mark(11);
     load(root);
