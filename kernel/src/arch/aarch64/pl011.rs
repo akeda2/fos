@@ -1,4 +1,4 @@
-//! The ARM PrimeCell PL011 UART: the Pi 4's UART0 and QEMU `virt`'s console. Transmit only for now.
+//! The ARM PrimeCell PL011 UART: the Pi 4's UART0 and QEMU `virt`'s console. Transmit and polled receive.
 //! Registers (offsets): DR 0x00 (write a byte), FR 0x18 (bit 5 TXFF: transmit FIFO full, bit 3 BUSY).
 //! The firmware has already set the baud rate and enabled the UART, so the kernel just writes; a bounded wait on TXFF
 //! keeps a UART that never drains from hanging the kernel.
@@ -38,4 +38,13 @@ impl core::fmt::Write for Serial {
         }
         Ok(())
     }
+}
+
+/// The next received byte, if one is waiting (FR bit 4 RXFE: receive FIFO empty; DR holds the byte in its low 8 bits).
+pub fn read_byte() -> Option<u8> {
+    let base = BASE.load(Ordering::Relaxed);
+    if unsafe { core::ptr::read_volatile((base + 0x18) as *const u32) } & 1 << 4 != 0 {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_volatile(base as *const u32) } as u8)
 }

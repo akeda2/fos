@@ -24,7 +24,7 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = ()) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
     when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
@@ -39,11 +39,22 @@ def boot(image: Path, screendump: Path | None = None) -> str:
                  "-serial", "stdio", "-no-reboot", "-monitor", f"unix:{monitor},server,nowait",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
                  "-drive", f"file={image},format=raw,if=none,id=boot,snapshot=on", "-device", "virtio-blk-pci,drive=boot"],
-                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+                stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT)
             try:
-                deadline = time.time() + 60
-                while time.time() < deadline and b"parking the cpu" not in log.read_bytes().lower():
-                    time.sleep(0.5)
+                def wait_for(count: int) -> None:
+                    """Waits until the serial text holds `count` shell prompts (or the kernel parked after a fault)."""
+                    deadline = time.time() + 60
+                    while time.time() < deadline:
+                        seen = log.read_bytes().lower()
+                        if seen.count(b"fos> ") >= count or b"parking the cpu" in seen:
+                            return
+                        time.sleep(0.3)
+
+                wait_for(1)
+                for number, command in enumerate(commands, start=2):
+                    qemu.stdin.write(command.encode() + b"\r")
+                    qemu.stdin.flush()
+                    wait_for(number)
                 time.sleep(1)  # let the console repaint reach the screen
                 if screendump is not None and monitor.exists():
                     with socket.socket(socket.AF_UNIX) as sock:
@@ -70,7 +81,7 @@ def lit_pixels(path: Path) -> tuple[int, int]:
 
 def main():
     shot = Path(tempfile.mkdtemp()) / "screen.ppm"
-    text = boot(IMAGE, shot)
+    text = boot(IMAGE, shot, ("version", "disks", "ls", "cat hostname", "mem"))
     check("Fosfor OS loader" in text, "the aarch64 loader runs under AAVMF", text)
     check("Kernel image read" in text and "Loading its ELF64 segments" in text, "the loader reads the kernel from the payload slot", text)
     check("Fosfor OS kernel (aarch64): running from the UEFI loader." in text, "the kernel runs after ExitBootServices (instruction cache synced)", text)
@@ -86,6 +97,8 @@ def main():
     check("Framebuffer console: on" in text, "the loader hands over a GOP framebuffer and the kernel starts its console on it", text)
     total, lit = lit_pixels(shot) if shot.exists() else (0, 0)
     check(total > 0 and lit > 2000, f"the screen shows the kernel's text ({lit} lit pixels of {total})", text)
+    check("Fosfor OS (aarch64 port)" in text and "virtio-blk" in text.split("version", 1)[-1], "the shell reads the serial console and runs `version` and `disks`", text)
+    check(re.search(r"\d+ file\(s\)\.", text) is not None and re.search(r"Physical memory: \d+ MiB managed, \d+ MiB free\.\s+fos> ", text) is not None, "the shell lists FOSFS files and answers `mem`", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
     print("aarch64 boot: all checks passed")
 

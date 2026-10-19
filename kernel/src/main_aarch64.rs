@@ -8,8 +8,10 @@ mod font_data;
 mod fosfs;
 mod framebuffer;
 mod gpt;
+mod lineedit;
 mod memory;
 mod pci;
+mod shell;
 mod storage;
 mod virtio_blk;
 
@@ -72,7 +74,6 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         while timer::micros() - start < 100_000 {
             cpu::sleep();
         }
-        cpu::interrupts_disable();
         println!("GICv2 up: {} timer interrupts (INTID 30) in 100 ms, expected about 10.", gic::irq_ticks());
     }
     if info.magic == BOOT_INFO_MAGIC {
@@ -109,10 +110,8 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     unsafe {
         core::ptr::read_volatile(0x10 as *const u64);
     }
-    println!("Nothing more to do yet: parking the CPU.");
-    loop {
-        unsafe { core::arch::asm!("wfe") };
-    }
+    cpu::interrupts_enable();
+    shell::run()
 }
 
 #[panic_handler]
