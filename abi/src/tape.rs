@@ -288,6 +288,11 @@ pub struct TapeApi {
 pub const FP_NONE: u32 = 0;
 pub const FP_SSE2: u32 = 1;
 pub const FP_AVX2: u32 = 2;
+/// Level 1 is "the architecture's baseline floating point is on", whatever the CPU: on aarch64 that is NEON/FP (always
+/// present there), and the kernel reports it as `FP_NEON`. Level 2 (`FP_AVX2`) exists on x86-64 only, so a tape's
+/// `>= FP_AVX2` test is false on ARM, and the values are never reused for another meaning.
+pub const FP_BASE: u32 = 1;
+pub const FP_NEON: u32 = FP_BASE;
 
 /// `serial_open` line formats: the low bits of the UART's line control register, so they combine with `|`.
 pub const SERIAL_8N1: u32 = 0x03;

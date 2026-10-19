@@ -581,7 +581,7 @@ pub fn tx_offload(nic: usize, on: bool) -> bool {
     table.version >= 14 && (table.size as usize) >= end && (table.nic_tx_offload)(nic, u32::from(on)) != 0
 }
 
-/// The floating point the kernel enabled for this tape (`fosfor_abi::tape::FP_NONE`, `FP_SSE2` or `FP_AVX2`). Only a tape built
+/// The floating point the kernel enabled for this tape (`fosfor_abi::tape::FP_NONE`, `FP_SSE2`, or `FP_NEON` on aarch64, or `FP_AVX2`). Only a tape built
 /// for `x86_64-fos-tape-fp` may use SSE at all; this says whether AVX2+FMA code (an `#[target_feature]` function) may run too.
 /// A kernel older than version 16 reports `FP_NONE`.
 pub fn fp_level() -> u32 {

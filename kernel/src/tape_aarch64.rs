@@ -3,7 +3,7 @@
 //!
 //! The table handed over is the full `TapeApi` (tapes call late fields without checking `size`, so a shorter table
 //! would send them to address 0). What this port has no driver for yet -- audio, NIC, serial ports, timestamps,
-//! graphics -- is a stub that reports "nothing there": zero NICs, no audio device, `AUDIO_NO_DEVICE`, `gfx_info` 0.
+//! -- is a stub that reports "nothing there": zero NICs, no audio device, `AUDIO_NO_DEVICE`.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -82,11 +82,6 @@ stubs! {
     api_serial_lines(usize) -> u32 = 0;
     api_serial_set_lines(usize, u32) = ();
     api_serial_break(usize, u32) = ();
-    api_gfx_info() -> u64 = 0;
-    api_gfx_open() -> u32 = 0;
-    api_gfx_close() = ();
-    api_gfx_fill(u32, u32, u32, u32, u32) -> u32 = 0;
-    api_gfx_blit(u32, u32, u32, u32, *const u32, u32) -> u32 = 0;
 }
 
 fn region() -> Option<u64> {
@@ -230,18 +225,63 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
             clobber_abi("C"),
         );
     }
+    crate::framebuffer::gfx_close();
+    unsafe { PENDING_LENGTH = 0 };
     memory::free(stack, STACK_BYTES / memory::FRAME);
     Ok(())
 }
 
+static mut PENDING: [u8; 4] = [0; 4];
+static mut PENDING_LENGTH: usize = 0;
+
+/// Bytes above 0x7f are collected until they make one valid UTF-8 character; a broken sequence prints '?'.
 extern "C" fn api_putc(byte: u32) {
     let byte = byte as u8;
+    let pending = unsafe { &mut *core::ptr::addr_of_mut!(PENDING) };
+    let length = unsafe { &mut *core::ptr::addr_of_mut!(PENDING_LENGTH) };
     if byte < 0x80 {
+        if *length > 0 {
+            *length = 0;
+            crate::print(format_args!("?"));
+        }
         crate::print(format_args!("{}", byte as char));
-    } else {
-        // Multi-byte UTF-8 is not reassembled yet.
-        crate::print(format_args!("?"));
+        return;
     }
+    if *length == 0 && byte & 0xc0 == 0x80 || *length == pending.len() {
+        *length = 0;
+        return crate::print(format_args!("?"));
+    }
+    pending[*length] = byte;
+    *length += 1;
+    match core::str::from_utf8(&pending[..*length]) {
+        Ok(text) => {
+            *length = 0;
+            crate::print(format_args!("{text}"));
+        }
+        Err(error) if error.error_len().is_some() => {
+            *length = 0;
+            crate::print(format_args!("?"));
+        }
+        Err(_) => {}
+    }
+}
+
+// Screen 0 is the boot framebuffer. The calls take no screen index yet: a second screen will arrive as an append-only
+// ABI version (docs/aarch64-plan.md), and these stay the calls for screen 0.
+extern "C" fn api_gfx_info() -> u64 {
+    crate::framebuffer::gfx_info().map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height))
+}
+extern "C" fn api_gfx_open() -> u32 {
+    u32::from(crate::framebuffer::gfx_open())
+}
+extern "C" fn api_gfx_close() {
+    crate::framebuffer::gfx_close();
+}
+extern "C" fn api_gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u32 {
+    u32::from(crate::framebuffer::gfx_fill(x, y, width, height, rgb))
+}
+extern "C" fn api_gfx_blit(x: u32, y: u32, width: u32, height: u32, pixels: *const u32, stride: u32) -> u32 {
+    u32::from(unsafe { crate::framebuffer::gfx_blit(x, y, width, height, pixels, stride) })
 }
 
 /// The next typed byte from the serial console or the USB keyboard.
@@ -337,7 +377,7 @@ extern "C" fn api_console_size() -> u32 {
 }
 
 /// Hard-float tapes run on the CPU's baseline FP/SIMD (NEON), which `cpu::fp_enable` switches on before the call;
-/// `FP_SSE2` is the ABI's name for "baseline floating point is on". There is no AVX2 equivalent to offer.
+/// Baseline FP is NEON/FP, which every aarch64 CPU has; there is no AVX2 equivalent to offer, so level 2 is never returned.
 extern "C" fn api_fp_level() -> u32 {
-    FP_SSE2
+    FP_NEON
 }
