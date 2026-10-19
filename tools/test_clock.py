@@ -136,7 +136,7 @@ def main():
                 _, _, pixel = screenshot(monitor, "clock_lead.ppm")
                 second = (lambda d: d[0] * 10 + d[1] if None not in d else None)([read_digit(pixel, box) for box in face.seconds_boxes()])
                 time.sleep(0.9)
-                if second is None or second >= 55:
+                if second is None:
                     continue
                 target = second // 5 * 5 + 5
                 should = second % 5 <= 3
@@ -144,6 +144,14 @@ def main():
                 seen.add(second % 5)
                 check(lit == should, f"lead=3: at second {second} the mark at {target} is {'lit' if lit else 'dark'}, wanted {'lit' if should else 'dark'}")
             check(len(seen) >= 3, f"lead=3: saw {len(seen)} different positions in the 5-second cycle")
+            _, _, pixel = screenshot(monitor, "clock_dim.ppm")
+            bar = lambda: sum(1 for x in range(16, 400) for y in range(6, 20) if pixel(x, y) == YELLOW)
+            check(bar() == 0, "the status line is dim once the bars have timed out")
+            guest.process.stdin.write(b"n")
+            guest.process.stdin.flush()
+            time.sleep(1.5)
+            _, _, pixel = screenshot(monitor, "clock_lit.ppm")
+            check(bar() > 50, "a key lights the status line")
             guest.process.stdin.write(b"\x1b")
             guest.process.stdin.flush()
             guest.wait_for("clock: stopped.", 10, mark)

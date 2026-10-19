@@ -19,7 +19,7 @@ use tape_rt::{Key, KeyDecoder, Line, TapeApi, arg_value as value, println};
 tape_rt::tape_help!(
     br#"clock [@NAME] [ntp=dhcp|A.B.C.D|NAME|off] [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D]
       [dns=A.B.C.D] [nic=N] [tz=+H[:MM]] [resync=SECONDS] [hours=24|12] [utc]
-      [theme=dark|classic|light] [source=ntp|ptp] [domain=N] [l2] [spin] [lead=N]
+      [theme=dark|classic|light] [source=ntp|ptp] [domain=N] [l2] [spin] [lead=N] [bars=on]
 A studio clock: 60 red dots for the seconds, the time in big yellow digits
 (24 h by default) with the seconds below it, and the date. The time comes from
 an NTP server: ntp=dhcp (the default) uses the server DHCP names (option 42),
@@ -44,6 +44,8 @@ lead=N (0 to 3, default 0) lights the next 5-second mark ahead of the count: it
 is lit from the previous mark until N seconds later, dark for the rest and
 lit for good when the count reaches it (the old studio clocks' cue). Key l
 switches it off and on.
+The status line and the key line sit back in dim grey and light up for 6 s after
+any key (and at start); bars=on keeps them lit.
 Keys (Escape quits):
   h 12/24 hours   u UTC/local   n ask the server now   k theme   l lead
   w save the settings (hours, utc, theme, lead) in clock.cfg
@@ -53,6 +55,8 @@ Words on the command line win over the file.
 "#
 );
 
+/// How long the status and key bars stay bright after a key (and at start).
+const BARS_SECONDS: u64 = 6;
 const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -351,12 +355,14 @@ fn draw_face(canvas: &mut gfx::Canvas, g: &Geometry, seconds: i64, view: &View) 
     let date = ntp::civil_from_unix(seconds);
     let colour = theme().text;
     let ghost = dial::ghost(theme().background, colour);
-    for index in 0..=u32::from(date.second) {
+    // With a cue the 12 o'clock dot is dim like the rest at 55-59, so the cue for the minute mark shows and goes dark too.
+    let first = if view.lead > 0 && date.second >= 55 { 1 } else { 0 };
+    for index in first..=u32::from(date.second) {
         let (x, y) = dial::ring_position(index, g.cx, g.cy, g.ring);
         dial::fill_disc(canvas, x, y, if index % 5 == 0 { g.big } else { g.small }, dot_red());
     }
     // The next 5-second mark is lit ahead of the count for `lead` seconds after the previous one, dark again for the
-    // rest, and lit for good when the count arrives. (Before the top of the minute the 12 o'clock dot is lit already.)
+    // rest, and lit for good when the count arrives. 
     let into = u32::from(date.second) % 5;
     if view.lead > 0 && into <= view.lead {
         let (x, y) = dial::ring_position((u32::from(date.second) / 5 * 5 + 5) % 60, g.cx, g.cy, g.ring);
@@ -403,7 +409,7 @@ fn draw_face(canvas: &mut gfx::Canvas, g: &Geometry, seconds: i64, view: &View) 
     }
 }
 
-fn draw_status(canvas: &mut gfx::Canvas, g: &Geometry, view: &View, time: &Time, network: Option<&Net>, resync_s: u64, message: &str) {
+fn draw_status(canvas: &mut gfx::Canvas, g: &Geometry, view: &View, time: &Time, network: Option<&Net>, resync_s: u64, message: &str, bright: bool) {
     let mut line = Line::<200>::new();
     let zone = time.zone.unwrap_or(0);
     let _ = write!(line, "CLOCK  {}  {}", if view.twelve { "12 h" } else { "24 h" }, if view.utc { "UTC" } else { "local" });
@@ -443,11 +449,13 @@ fn draw_status(canvas: &mut gfx::Canvas, g: &Geometry, view: &View, time: &Time,
             let _ = write!(line, "  machine clock");
         }
     }
-    canvas.text(16, 6, line.as_str(), if stale { theme().amber } else { theme().text });
+    // The bars sit back (a third of the text colour) until a key lights them; a stale clock stays amber and visible.
+    let (status, keys) = if bright { (theme().text, theme().dim) } else { (mix(theme().background, theme().text, 1, 3), mix(theme().background, theme().text, 1, 4)) };
+    canvas.text(16, 6, line.as_str(), if stale { theme().amber } else { status });
     if !message.is_empty() {
         canvas.text_right(g.width - 16, 6, message, theme().amber);
     }
-    canvas.text(16, g.height - 18, "h 12/24 h  u UTC/local  n sync now  k theme  l lead  w save  Esc", theme().dim);
+    canvas.text(16, g.height - 18, "h 12/24 h  u UTC/local  n sync now  k theme  l lead  w save  Esc", keys);
 }
 
 #[unsafe(no_mangle)]
@@ -506,12 +514,16 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     let mut message_until = 0u64;
     let mut next_sync = tape_rt::micros() + resync_s * 1_000_000;
     let mut last_seconds = i64::MIN;
+    let mut bars_were_bright = true;
+    let bars_always = value(arguments, "bars") == Some("on");
+    let mut bars_until = tape_rt::micros() + BARS_SECONDS * 1_000_000;
     let spin = ptp && arguments.split_whitespace().any(|w| w == "spin");
     loop {
         let mut sync_now = false;
         let keep_going = poll_keys(api, &mut decoder, |key| {
             message.clear();
             message_until = tape_rt::micros() + 4_000_000;
+            bars_until = tape_rt::micros() + BARS_SECONDS * 1_000_000;
             match key {
                 Key::Char(b'h') => view.twelve = !view.twelve,
                 Key::Char(b'u') => view.utc = !view.utc,
@@ -580,10 +592,15 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             message.clear();
             screen.mark_dirty();
         }
+        let bright = bars_always || tape_rt::micros() < bars_until;
+        if bright != bars_were_bright {
+            bars_were_bright = bright;
+            screen.mark_dirty();
+        }
         if screen.due() {
             let mut canvas = screen.frame();
             draw_face(&mut canvas, &g, seconds, &view);
-            draw_status(&mut canvas, &g, &view, &time, network.as_ref(), resync_s, message.as_str());
+            draw_status(&mut canvas, &g, &view, &time, network.as_ref(), resync_s, message.as_str(), bright);
             screen.present();
         }
         // A query in flight is polled flat out: its reply's arrival time is what the offset is made from.
