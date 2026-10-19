@@ -6,7 +6,7 @@
 The image defaults to what `make image` builds (build_image.DEFAULT_IMAGE, build/fosfor/fosfor.img in this repository), wherever
 the script is run from. `dd if=IMAGE of=/dev/sdX bs=4M conv=fsync status=progress` does exactly the same
 copy; this script only refuses the mistakes that cost people their disks: it will not touch
-anything that is mounted, not a whole disk, not removable, smaller than the image, or
+anything that is mounted, not a whole disk, not removable (a built-in SD card slot's card counts),  smaller than the image, or
 larger than 256 GiB (a stick, not a system drive), and it shows what it found and asks you
 to type the device name back. It never picks a device itself. Destructive by design: the
 stick's old contents are gone.
@@ -58,7 +58,9 @@ def main() -> int:
         return fail(f"{device} is not a whole-disk block device (give /dev/sdX, not a partition like /dev/sdX1)")
     size = int(sysfs(name, "size") or 0) * 512
     image_size = arguments.image.stat().st_size
-    if sysfs(name, "removable") != "1":
+    # A built-in SD card slot is not flagged removable, but its card says "SD" (soldered eMMC says "MMC", which stays refused).
+    sd_card = name.startswith("mmcblk") and sysfs(name, "device/type") == "SD"
+    if sysfs(name, "removable") != "1" and not sd_card:
         return fail(f"{device} is not flagged removable by the kernel; refusing (a USB stick should be). Use dd yourself if you are sure.")
     if size < image_size:
         return fail(f"{device} holds {size >> 20} MiB, the image is {image_size >> 20} MiB")
@@ -71,7 +73,7 @@ def main() -> int:
         return fail("run as root (sudo): writing a block device needs it")
 
     vendor, model = sysfs(name, "device/vendor"), sysfs(name, "device/model")
-    print(f"Device : {device}  {vendor} {model}  {size / 1e9:.1f} GB, removable")
+    print(f"Device : {device}  {vendor} {model}  {size / 1e9:.1f} GB, {'SD card' if sd_card else 'removable'}")
     print(f"Image  : {arguments.image}  {image_size >> 20} MiB")
     print(f"This ERASES everything on {device}. Type the device name ({name}) to go on: ", end="", flush=True)
     if sys.stdin.readline().strip() != name:
