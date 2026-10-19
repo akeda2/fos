@@ -24,7 +24,7 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple[str, str, Path] | None = None) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple[str, str, Path] | None = None, steps: tuple[tuple[str, str], ...] = ()) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
     when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
@@ -55,6 +55,16 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                     qemu.stdin.write(command.encode() + b"\r")
                     qemu.stdin.flush()
                     wait_for(number)
+                for text, marker in steps:
+                    # Interactive input for a running tape: typed a byte at a time (the PL011 FIFO is 16 deep), then wait for `marker`.
+                    start = len(log.read_bytes())
+                    for byte in text.encode():
+                        qemu.stdin.write(bytes([byte]))
+                        qemu.stdin.flush()
+                        time.sleep(0.03)
+                    deadline = time.time() + 20
+                    while time.time() < deadline and marker.encode() not in log.read_bytes()[start:]:
+                        time.sleep(0.2)
                 if during is not None:
                     # A command whose screen is only there while it runs: type it, wait for its marker, grab the screen.
                     command, marker, shot = during
@@ -116,7 +126,7 @@ def lit_pixels(path: Path) -> tuple[int, int]:
 
 def main():
     shot = Path(tempfile.mkdtemp()) / "screen.ppm"
-    text = boot(IMAGE, shot, ("version", "disks", "ls", "cat hostname", "mem", "run hello one two", "run nothere"), ("v", "e", "r", "s", "i", "o", "n", "ret"))
+    text = boot(IMAGE, shot, ("version", "disks", "ls", "cat hostname", "mem", "run hello one two", "run nothere", "keymap sv"), ("e", "c", "h", "o", "spc", "minus", "ret"))
     check("Fosfor OS loader" in text, "the aarch64 loader runs under AAVMF", text)
     check("Kernel image read" in text and "Loading its ELF64 segments" in text, "the loader reads the kernel from the payload slot", text)
     check("Fosfor OS kernel (aarch64): running from the UEFI loader." in text, "the kernel runs after ExitBootServices (instruction cache synced)", text)
@@ -133,6 +143,11 @@ def main():
     check("Framebuffer console: on" in text, "the loader hands over a GOP framebuffer and the kernel starts its console on it", text)
     total, lit = lit_pixels(shot) if shot.exists() else (0, 0)
     check(total > 0 and lit > 2000, f"the screen shows the kernel's text ({lit} lit pixels of {total})", text)
+    ed_text = boot(IMAGE, None, (), (), None, (("run ed note\r", "ed> "), ("a\r", ". "), ("one\r", ". "), ("two\r", ". "), (".\r", "ed> "), ("x\r", "written note"), ("cat note\r", "two\n")))
+    calc_text = boot(IMAGE, None, ("run calc 3 4 + 6 *",))
+    check(re.search(r"^= 42$", calc_text, re.M) is not None, "calc evaluates its arguments (3 4 + 6 * = 42)", calc_text)
+    check("written note" in ed_text, "ed appends lines from the serial keyboard and writes the file through fs_write", ed_text)
+    check(re.search(r"^one$", ed_text, re.M) is not None and re.search(r"^two$", ed_text, re.M) is not None, "the file ed wrote reads back with `cat`", ed_text)
     gfx_shot = shot.with_name("gfx.ppm")
     gfx_text = boot(IMAGE, None, (), (), ("run gfxcheck secs=3", "gfxcheck: drawn", gfx_shot))
     pixel, size = ppm_reader(gfx_shot)
@@ -148,7 +163,7 @@ def main():
     check(re.search(r"\d+ file\(s\)\.", text) is not None and re.search(r"Physical memory: \d+ MiB managed, \d+ MiB free\.\s+fos> ", text) is not None, "the shell lists FOSFS files and answers `mem`", text)
     check("hello from a v2 tape" in text and "arguments: [one two]" in text and re.search(r"primes up to 100000: 9592 \(in \d+ us\)", text) is not None and "Tape returned; back at the fos shell." in text, "a hard-float aarch64 tape loads from FOSFS, runs with arguments, allocates, uses the clock and returns", text)
     check("run: nothere: no such file." in text, "a missing tape is refused politely", text)
-    check(text.count("Fosfor OS (aarch64 port)") >= 2, "keys typed on the USB keyboard reach the shell (`version` run from it)", text)
+    check(re.search(r"^\+$", text, re.M) is not None, "keys typed on the USB keyboard reach the shell, and `keymap sv` makes the US minus key type '+'", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
     check("USB: 1 xHCI controller(s)." in text and re.search(r"USB keyboard 0627:0001 on port \d+ .*: ready\.", text) is not None, "the xHCI controller comes up and enumerates the USB keyboard", text)
     print("aarch64 boot: all checks passed")

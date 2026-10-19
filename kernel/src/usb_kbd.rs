@@ -6,7 +6,7 @@
 
 use crate::memory;
 use crate::xhci::{self, Controller, Trb};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fosfor_abi::keymap::{hid_key, Layout};
 
 const MAX_KEYBOARDS: usize = 4;
@@ -26,6 +26,7 @@ struct Keyboard {
 
 static mut KEYBOARDS: [Option<Keyboard>; MAX_KEYBOARDS] = [None; MAX_KEYBOARDS];
 static mut KEYS: [u8; QUEUE] = [0; QUEUE];
+static SWEDISH: AtomicBool = AtomicBool::new(false);
 static HEAD: AtomicUsize = AtomicUsize::new(0);
 static TAIL: AtomicUsize = AtomicUsize::new(0);
 
@@ -36,6 +37,20 @@ fn push(byte: u8) {
         unsafe { (*core::ptr::addr_of_mut!(KEYS))[head] = byte };
         HEAD.store(next, Ordering::Release);
     }
+}
+
+/// The layout a `keymap` word names (the x86 `keyboard::layout_named`).
+pub fn layout_named(name: &str) -> Option<Layout> {
+    match name {
+        "us" => Some(Layout::Us),
+        "sv" | "se" | "fi" => Some(Layout::Swedish),
+        _ => None,
+    }
+}
+
+/// Chooses what the keys type; US until told otherwise (`keymap` command, `settings` file).
+pub fn set_layout(layout: Layout) {
+    SWEDISH.store(layout == Layout::Swedish, Ordering::Relaxed);
 }
 
 /// The next typed byte, if one is waiting.
@@ -167,7 +182,7 @@ fn decode(keyboard: &mut Keyboard, report: &[u8; 8]) {
         }
         if usage == 0x39 {
             keyboard.caps = !keyboard.caps;
-        } else if let Some(byte) = hid_key(usage, report[0], keyboard.caps, Layout::Us) {
+        } else if let Some(byte) = hid_key(usage, report[0], keyboard.caps, if SWEDISH.load(Ordering::Relaxed) { Layout::Swedish } else { Layout::Us }) {
             push(byte);
         }
     }

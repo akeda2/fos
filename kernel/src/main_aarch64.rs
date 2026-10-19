@@ -127,6 +127,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     }
     tape_aarch64::set_boot_info(info);
     println!("USB: {} keyboard(s) found.", usb_kbd::init());
+    shell::apply_settings();
     cpu::interrupts_enable();
     shell::run()
 }

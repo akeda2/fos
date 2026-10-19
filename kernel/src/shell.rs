@@ -30,7 +30,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT run NAME [ARGS]"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT keymap us|sv run NAME [ARGS]"),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -56,6 +56,10 @@ fn execute(line: &str) {
         "ls" => list(rest),
         "cat" => cat(rest),
         "run" => run_tape(rest),
+        "keymap" => match crate::usb_kbd::layout_named(rest) {
+            Some(layout) => crate::usb_kbd::set_layout(layout),
+            None => crate::println!("keymap: us or sv."),
+        },
         "echo" => crate::println!("{rest}"),
         other => crate::println!("{other}: unknown command (try `help`)."),
     }
@@ -117,5 +121,24 @@ fn run_tape(rest: &str) {
     match crate::tape_aarch64::load(name).and_then(|entry| crate::tape_aarch64::run(entry, arguments)) {
         Ok(()) => crate::println!("Tape returned; back at the fos shell."),
         Err(reason) => crate::println!("run: {name}: {reason}."),
+    }
+}
+
+/// Applies the `settings` file's `keymap us|sv` line from the boot volume (the only setting this port reads so far).
+pub fn apply_settings() {
+    let Some(volume) = storage::boot_volume() else { return };
+    let mut buffer = [0u8; 1024];
+    let Ok(Some(length)) = volume.read(b"settings", &mut buffer) else { return };
+    for line in core::str::from_utf8(&buffer[..length]).unwrap_or("").lines() {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("keymap") {
+            match words.next().and_then(crate::usb_kbd::layout_named) {
+                Some(layout) => {
+                    crate::usb_kbd::set_layout(layout);
+                    crate::println!("settings: {}.", line.trim());
+                }
+                None => crate::println!("settings: `{}` ignored (keymap us or sv).", line.trim()),
+            }
+        }
     }
 }
