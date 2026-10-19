@@ -36,10 +36,42 @@ pub fn mark(stage: u32) {
     square(stage * 28, 0, 24, 0x00ff_ffff);
 }
 
-/// `value` as 64 squares (16 px pitch) on row `row` (each row 20 px high, below the progress row).
+const FONT: [[u8; 7]; 16] = [
+    [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+    [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+    [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
+    [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+    [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+    [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+    [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+    [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+    [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+    [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+    [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+    [0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100],
+    [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+    [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+];
+
+fn digit(x: u32, y: u32, value: u32, color: u32) {
+    for (line, pattern) in FONT[(value & 15) as usize].iter().enumerate() {
+        for column in 0..5u32 {
+            if pattern >> (4 - column) & 1 != 0 {
+                square(x + column * 3, y + line as u32 * 3, 3, color);
+            }
+        }
+    }
+}
+
+/// `value` as 16 hex digits (3x scaled 5x7 font) on line `row`: a gray row number, then white digits. Rows 0-7 form the
+/// left column, 8-15 the right one, each line 26 px high below the progress row.
 pub fn bits(row: u32, value: u64) {
-    for bit in 0..64u32 {
-        let set = value >> (63 - bit) & 1 != 0;
-        square(bit * 12, 40 + row * 20, 10, if set { 0x00ff_ffff } else { 0x0040_4040 });
+    let x0 = (row / 8) * 380;
+    let y = 40 + (row % 8) * 26;
+    digit(x0, y, row, 0x0080_8080);
+    for index in 0..16u32 {
+        digit(x0 + 24 + index * 20, y, (value >> (60 - 4 * index)) as u32, 0x00ff_ffff);
     }
 }
