@@ -9,6 +9,7 @@ pub mod idt;
 pub mod ioapic;
 pub mod msi;
 pub mod paging;
+pub mod pci_config;
 pub mod serial;
 
 /// The system timer as the rest of the kernel sees it (`crate::timer`): a tick counter at `TICK_HZ` and a microsecond clock.

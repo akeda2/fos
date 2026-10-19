@@ -71,7 +71,7 @@ use fosfor_abi::{BootInfo, PIXEL_RGB};
 // The architecture layer (boot entry, CPU, interrupts, paging) lives in `arch/`; its modules are re-exported here so
 // the rest of the kernel keeps saying `crate::cpu`, `crate::paging`, ... whichever architecture is built.
 #[cfg(target_arch = "x86_64")]
-pub use arch::x86_64::{acpi, apic, cpu, cpupower, gdt, idt, ioapic, msi, paging, serial, timer};
+pub use arch::x86_64::{acpi, apic, cpu, cpupower, gdt, idt, ioapic, msi, paging, pci_config, serial, timer};
 
 
 /// `println!` goes to the serial port, the boot log and, once it exists, the framebuffer.

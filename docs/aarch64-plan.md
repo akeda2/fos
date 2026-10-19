@@ -36,7 +36,7 @@ mailbox, SD) about 3-4k more. The large x86 drivers are simply not needed.
 
 ## Milestones
 
-- **M0 - arch split (first step done 2026-10-19: the x86-only modules moved to `kernel/src/arch/x86_64/` and re-exported; boot tests pass; PCI port I/O, `uart.rs` and the interface traits are still to do).** Move x86 code under `kernel/src/arch/x86_64/` behind a thin interface (`irq`, `timer`, `mmu`,
+- **M0 - arch split (largely done 2026-10-19).** Done: x86-only modules moved to `kernel/src/arch/x86_64/` and re-exported at the crate root; `crate::timer` is the neutral system timer; PCI config access is `crate::pci_config` (x86: ports 0xCF8/0xCFC). Left, best done with `cargo check --target aarch64-unknown-none-softfloat` as the guide (221 errors at the start of M1): neutral names for interrupt enable/sleep/halt, `paging::map_device`/`is_mapped`, `msi::*` and the CPU id; `cfg`-gating the PC-only drivers (PS/2, VGA text, RTL8139/8168, 3C905, e1000, HDA, AHCI, EHCI/OHCI, RTC/PIT in `clock.rs`, `power`, `diag`, COM2-4 in `uart.rs`), which sit inside enum dispatch in `nic.rs`, `block.rs`, `storage.rs` and `term.rs`.
   `serial`, `barrier`, `pci config`). No behaviour change; `make test` must stay green. This is the risky refactor, do it first.
 - **M1 - core on QEMU virt.** `aarch64-fos-kernel` target, entry from the UEFI loader, EL1, MMU with identity map (kernel text RO/X, rest
   NX, device memory attribute for MMIO), exception vectors, GICv3, generic timer (`micros()` from `CNTVCT`), PL011 console, framebuffer

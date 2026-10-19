@@ -1,12 +1,10 @@
-//! PCI configuration space, through the legacy port mechanism (0xCF8 address, 0xCFC
-//! data). It works on every x86 machine and needs no ACPI table; the memory-mapped
-//! ECAM window (MCFG) is only needed for the extended space above offset 0xFF, which
-//! nothing here reads yet.
+//! PCI devices: the bus scan and the per-device helpers (BARs, capabilities, MSI). The configuration-space access itself
+//! is `crate::pci_config`, supplied by the architecture: on x86 the legacy port mechanism (0xCF8 address, 0xCFC data), which
+//! works on every PC and needs no ACPI table; the memory-mapped ECAM window (MCFG) is only needed for the extended space
+//! above offset 0xFF, which nothing here reads yet.
 
-use crate::cpu;
+use crate::pci_config;
 
-const ADDRESS_PORT: u16 = 0xcf8;
-const DATA_PORT: u16 = 0xcfc;
 pub const MAX_DEVICES: usize = 128;
 
 #[derive(Clone, Copy)]
@@ -26,18 +24,12 @@ pub struct Device {
 static mut DEVICES: [Option<Device>; MAX_DEVICES] = [None; MAX_DEVICES];
 static mut COUNT: usize = 0;
 
-fn address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    0x8000_0000 | (u32::from(bus) << 16) | (u32::from(device) << 11) | (u32::from(function) << 8) | u32::from(offset & 0xfc)
-}
-
 pub fn read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    cpu::outl(ADDRESS_PORT, address(bus, device, function, offset));
-    cpu::inl(DATA_PORT)
+    pci_config::read32(bus, device, function, offset)
 }
 
 pub fn write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
-    cpu::outl(ADDRESS_PORT, address(bus, device, function, offset));
-    cpu::outl(DATA_PORT, value);
+    pci_config::write32(bus, device, function, offset, value)
 }
 
 impl Device {
