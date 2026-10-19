@@ -10,6 +10,7 @@ mod view;
 use core::fmt::Write;
 use audio_screen::{Input, Playback, Screen, poll_keys};
 use gfx::Canvas;
+use gfx::theme::theme;
 use ltas::{Analyzer, Config, Mode, Resolution, Weighting};
 use noise::{Generator, Kind as NoiseKind};
 use tape_rt::{FP_AVX2, Key, KeyDecoder, Line, TapeApi, alloc_zeroed, arg_value as value, parse_f32, println, save};
@@ -22,6 +23,7 @@ tape_rt::tape_help!(
      [win=hann|rect|hamming|blackman-harris|flat-top]
      [cal=DB] [tau=SECONDS|0] [simd=auto|sse2|avx2]
      [noise=off|white|pink|sine] [level=-20] [tone=HZ] [out=MASK]
+     [theme=dark|classic|light]
 Long-term average spectrum of the audio input, on the screen, with a test
 signal generator for the output. device= is the input, outdev= a different
 output device (`audio` numbers them). Curves: live, exp(onential), ltas (equal
@@ -34,6 +36,7 @@ Keys (Escape quits):
   1 2 3 4 show live/exp/ltas/peak     Up/Down move, Left/Right scale
   g generator off/white/pink/sine   + - level   f tone   b bursts
   , . input channel -/+ (chan=N starts on N)   m smooth/bars
+  k colour theme dark/classic/light (light: white, for bright rooms and paper)
   s save CSV+PNG on the first exFAT/FAT32 disk (save=N picks one)
 "#
 );
@@ -95,6 +98,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Err(reason) => return println!("ltas: {reason}."),
     };
     let (arguments, width, height) = (started.arguments, started.width, started.height);
+    if let Some(name) = value(arguments, "theme") {
+        if !gfx::theme::set_by_name(name) {
+            return println!("ltas: theme= takes dark, classic or light.");
+        }
+    }
     let mut settings = Settings {
         rate: value(arguments, "rate").and_then(|v| v.parse().ok()).unwrap_or(48_000),
         smooth: value(arguments, "style") != Some("bars"),
@@ -179,6 +187,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     let _ = write!(message, "input channel {}", input.channel + 1);
                 }
                 Key::Char(b'm') => settings.smooth = !settings.smooth,
+                Key::Char(b'k') => {
+                    let _ = write!(message, "theme {}", gfx::theme::next().name);
+                    regrid = true;
+                }
                 Key::Char(b's') => save_requested = true,
                 Key::Char(b' ') => frozen = !frozen,
                 Key::Char(b'r') => {
@@ -376,10 +388,10 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
         analyzer.frames(),
         if frozen { "  FROZEN" } else { "" }
     );
-    canvas.text(layout.left, 6, line.as_str(), view::TEXT);
+    canvas.text(layout.left, 6, line.as_str(), theme().text);
     let mut x = layout.left;
     for (index, mode) in Mode::ALL.into_iter().enumerate() {
-        let colour = if shown[index] { view::COLOURS[index] } else { view::DIM };
+        let colour = if shown[index] { theme().curves[index] } else { theme().dim };
         x = canvas.text(x, 24, mode.name(), colour) + 16;
     }
     if playback_ok {
@@ -391,10 +403,10 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
                 let _ = write!(text, " {:.0} Hz", generator.frequency());
             }
         }
-        canvas.text(x + 16, 24, text.as_str(), view::TEXT);
+        canvas.text(x + 16, 24, text.as_str(), theme().text);
     }
-    canvas.text(layout.left, layout.height as i32 - 18, "space freeze  r reset  v res  m smooth  w win  a weight  n size  t avg  , . chan  s save  g gen  +- lvl  f tone  b burst  Esc", view::DIM);
+    canvas.text(layout.left, layout.height as i32 - 18, "space freeze  r reset  v res  m smooth  w win  a weight  n size  t avg  , . chan  s save  g gen  +- lvl  f tone  b burst  Esc", theme().dim);
     if !message.is_empty() {
-        canvas.text_right(layout.left + layout.plot_w as i32, 6, message, view::EXP);
+        canvas.text_right(layout.left + layout.plot_w as i32, 6, message, theme().curves[1]);
     }
 }

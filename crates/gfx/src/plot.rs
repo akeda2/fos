@@ -3,13 +3,8 @@
 //! levels at given x positions. The horizontal axis (log Hz, time, ...) is the tape's own; the frame only says where the
 //! plot lies.
 
+use crate::theme::theme;
 use crate::{Canvas, format_fixed};
-
-pub const BACKGROUND: u32 = 0x101418;
-pub const GRID: u32 = 0x232a31;
-pub const GRID_MAJOR: u32 = 0x3a444d;
-pub const TEXT: u32 = 0xc8d0d8;
-pub const DIM: u32 = 0x7d8791;
 
 /// Where the plot lies on a `width` x `height` screen: a margin for the axis labels around `plot_w` x `plot_h`.
 #[derive(Clone, Copy)]
@@ -50,15 +45,15 @@ impl Frame {
 
 /// Clears `canvas` and draws the horizontal dB lines every 10 dB with their labels, the 0 dB line stronger.
 pub fn draw_db_grid(canvas: &mut Canvas, frame: &Frame, scale: &Scale) {
-    canvas.clear(BACKGROUND);
+    canvas.clear(theme().background);
     let step = 10.0;
     let mut db = (scale.db_top / step) as i32 as f32 * step;
     while db >= scale.db_top - scale.db_range - 0.01 {
         let y = frame.y(scale, db);
-        canvas.fill_rect(frame.left, y, frame.plot_w, 1, if db == 0.0 { GRID_MAJOR } else { GRID });
+        canvas.fill_rect(frame.left, y, frame.plot_w, 1, if db == 0.0 { theme().grid_major } else { theme().grid });
         let mut text = [0u8; 12];
         let shown = format_fixed(&mut text, db, 0);
-        canvas.text_right(frame.left - 6, y - 8, shown, DIM);
+        canvas.text_right(frame.left - 6, y - 8, shown, theme().dim);
         db -= step;
     }
 }

@@ -157,6 +157,11 @@ def main():
                 time.sleep(0.4)
             _, _, after = screenshot(machine.monitor, "ltas2.ppm")
             check(after(5, height - 5) == BACKGROUND and after(56, 60) == GRID_MAJOR, "the keys left the display intact", "")
+            for key, wanted, name in ((b"k", (0, 0, 0), "classic"), (b"k", (255, 255, 255), "light")):
+                machine.wire.send(machine.guest, TAG_DATA, key)
+                time.sleep(1.5)
+                _, _, themed = screenshot(machine.monitor, "ltas_theme.ppm")
+                check(themed(5, height - 5) == wanted, f"k switches to the {name} theme", str(themed(5, height - 5)))
             machine.wire.send(machine.guest, TAG_DATA, b"\x1b")
             text = machine.wait_for("frame(s) analysed", since=start, timeout=20)
             frames = int(text.split("ltas: ")[-1].split(" frame")[0])

@@ -21,7 +21,7 @@ GREEN, RED = (0x3c, 0xcf, 0x6a), (0xff, 0x4d, 0x4d)
 
 def layout(width, height):
     """tapes/gonio/src/layout.rs: the scope square and the correlation bar."""
-    size = max(min(height - 34 - 22 - 100 - 24, width - 400), 64) & ~1
+    size = max(min(height - 34 - 22 - 100 - 24, width - 520), 64) & ~1
     sx, sy = (width - size) // 2, 34 + 22
     return sx, sy, size, sy + size + 22
 
@@ -79,8 +79,9 @@ def main():
             lit_bar = sum(1 for y in range(sy, sy + size) if pixel(meter_x, y) not in (BACKGROUND, AXIS))
             check(lit_bar > 20, f"the left level meter is lit ({lit_bar} rows)", "")
             def loudness_rows(pixel):
-                """Lit rows of the loudness bar (tapes/gonio/src/lufs.rs: x = 16 + 34 + 13, height = scope - 154)."""
-                return sum(1 for y in range(sy, sy + size - 154) if sum(pixel(16 + 34 + 13, y)) > 300)
+                """Lit rows of the loudness bar (tapes/gonio/src/lufs.rs: against the scope, height = scope - 2)."""
+                bar_x = 16 + (sx - 28 - 16) - 34 - 62 + 13
+                return sum(1 for y in range(sy, sy + size - 2) if sum(pixel(bar_x, y)) > 300)
 
             full = loudness_rows(pixel)
             check(full > 40, f"the loudness bar is lit ({full} rows)", "")
@@ -105,6 +106,11 @@ def main():
                 time.sleep(0.3)
             _, _, pixel = screenshot(machine.monitor, "gonio3.ppm")
             check(pixel(5, height - 5) == BACKGROUND and pixel(sx + size // 4, sy) == FRAME, "the keys left the display intact", "")
+            for key, wanted, name in ((b"k", (0, 0, 0), "classic"), (b"k", (255, 255, 255), "light"), (b"k", BACKGROUND, "dark")):
+                machine.wire.send(machine.guest, TAG_DATA, key)
+                time.sleep(1.5)
+                _, _, pixel = screenshot(machine.monitor, "gonio_theme.ppm")
+                check(pixel(5, height - 5) == wanted, f"k switches to the {name} theme", str(pixel(5, height - 5)))
             machine.wire.send(machine.guest, TAG_DATA, b"\x1b")
             text = machine.wait_for("frame(s) drawn", since=start, timeout=20)
             check("capture overruns 0" in text, "no capture overruns", text[-500:])

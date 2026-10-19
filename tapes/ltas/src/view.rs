@@ -5,19 +5,11 @@ use dsp::math::log10;
 use gfx::Canvas;
 use ltas::{Analyzer, Mode, Resolution};
 
-pub use gfx::plot::{DIM, Scale, TEXT};
-use gfx::plot::{GRID, GRID_MAJOR, Frame, axis_label, curve, spline};
-pub const LIVE: u32 = 0x4aa3ff;
-pub const EXP: u32 = 0xffd34a;
-pub const LTAS: u32 = 0x4ade80;
-pub const PEAK: u32 = 0xff5c5c;
-const LTAS_BAR: u32 = 0x1c4a32;
-const UNRESOLVED: u32 = 0xd08000;
+pub use gfx::plot::Scale;
+use gfx::plot::{Frame, axis_label, curve, spline};
+use gfx::theme::theme;
 const LOW_HZ: f32 = 20.0;
 const HIGH_HZ: f32 = 20000.0;
-
-/// Curve colours in `Mode::ALL` order: live, exp, ltas, peak.
-pub const COLOURS: [u32; 4] = [LIVE, EXP, LTAS, PEAK];
 
 /// The plot frame on the screen plus the log-frequency mapping; the frame's fields and `y` are reached through `Deref`.
 #[derive(Clone, Copy)]
@@ -53,15 +45,15 @@ pub fn draw_grid(canvas: &mut Canvas, layout: &Layout, scale: &Scale) {
                 continue;
             }
             let x = layout.x(hz as f32);
-            canvas.fill_rect(x, layout.top, 1, layout.plot_h, if multiple == 1 { GRID_MAJOR } else { GRID });
+            canvas.fill_rect(x, layout.top, 1, layout.plot_h, if multiple == 1 { theme().grid_major } else { theme().grid });
             if matches!(multiple, 1 | 2 | 5) {
-                axis_label(canvas, x, layout.bottom() + 8, hz, DIM);
+                axis_label(canvas, x, layout.bottom() + 8, hz, theme().dim);
             }
         }
     }
-    canvas.rect(layout.left, layout.top, layout.plot_w, layout.plot_h, GRID_MAJOR);
-    canvas.text(6, layout.bottom() + 8, "Hz", DIM);
-    canvas.text(6, layout.top - 8, "dB", DIM);
+    canvas.rect(layout.left, layout.top, layout.plot_w, layout.plot_h, theme().grid_major);
+    canvas.text(6, layout.bottom() + 8, "Hz", theme().dim);
+    canvas.text(6, layout.top - 8, "dB", theme().dim);
 }
 
 /// The spline through the band levels, bands equally spaced on the log axis; `each(x, db)` for every pixel column.
@@ -84,7 +76,7 @@ pub fn draw_curves<const N: usize>(canvas: &mut Canvas, layout: &Layout, scale: 
         for i in 0..outputs {
             if !analyzer.band_is_resolved(i) {
                 let (x0, x1) = edge(analyzer, i);
-                canvas.fill_rect(x0, layout.bottom() + 1, (x1 - x0).max(1) as u32, 2, UNRESOLVED);
+                canvas.fill_rect(x0, layout.bottom() + 1, (x1 - x0).max(1) as u32, 2, theme().unresolved);
             }
         }
     }
@@ -92,14 +84,14 @@ pub fn draw_curves<const N: usize>(canvas: &mut Canvas, layout: &Layout, scale: 
         analyzer.levels_db(Mode::Linear, levels);
         smooth_bands(analyzer, layout, levels, |x, db| {
             let y = layout.y(scale, db);
-            canvas.fill_rect(x, y, 1, (layout.bottom() - y).max(0) as u32, LTAS_BAR);
+            canvas.fill_rect(x, y, 1, (layout.bottom() - y).max(0) as u32, theme().bar_fill);
         });
     } else if shown[2] && stairs {
         analyzer.levels_db(Mode::Linear, levels);
         for i in 0..outputs {
             let (x0, x1) = edge(analyzer, i);
             let y = layout.y(scale, levels[i]);
-            canvas.fill_rect(x0 + 1, y, (x1 - x0 - 1).max(1) as u32, (layout.bottom() - y).max(0) as u32, LTAS_BAR);
+            canvas.fill_rect(x0 + 1, y, (x1 - x0 - 1).max(1) as u32, (layout.bottom() - y).max(0) as u32, theme().bar_fill);
         }
     }
     for (index, mode) in Mode::ALL.into_iter().enumerate() {
@@ -113,8 +105,8 @@ pub fn draw_curves<const N: usize>(canvas: &mut Canvas, layout: &Layout, scale: 
             smooth_bands(analyzer_ref, layout, levels, |x, db| {
                 let y = layout.y(scale, db);
                 if let Some((px, py)) = previous {
-                    canvas.line(px, py, x, y, COLOURS[index]);
-                    canvas.line(px, py + 1, x, y + 1, COLOURS[index]);
+                    canvas.line(px, py, x, y, theme().curves[index]);
+                    canvas.line(px, py + 1, x, y + 1, theme().curves[index]);
                 }
                 previous = Some((x, y));
             });
@@ -124,6 +116,6 @@ pub fn draw_curves<const N: usize>(canvas: &mut Canvas, layout: &Layout, scale: 
             let (x0, x1) = edge(analyzer_ref, i);
             (x0, x1, layout.y(scale, levels[i]))
         });
-        curve(canvas, COLOURS[index], points, stairs);
+        curve(canvas, theme().curves[index], points, stairs);
     }
 }

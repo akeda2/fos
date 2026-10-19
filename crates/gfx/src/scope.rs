@@ -5,6 +5,7 @@
 //! display frame, `draw` paints them over the canvas.
 
 use crate::Canvas;
+use crate::theme::{mix, theme};
 use dsp::math::{log10, sqrt};
 
 /// How the distance from the centre maps to the picture. The angle of a point is never changed.
@@ -120,7 +121,7 @@ impl<'a> Phosphor<'a> {
         }
     }
 
-    /// Paints the lit cells over `canvas` with the top-left at (x, y): green that brightens towards white with intensity.
+    /// Paints the lit cells over `canvas` with the top-left at (x, y): green that follows the theme's phosphor ramp (green brightening to white in `dark`).
     pub fn draw(&self, canvas: &mut Canvas, x: i32, y: i32) {
         for row in 0..self.size {
             for column in 0..self.size {
@@ -133,36 +134,31 @@ impl<'a> Phosphor<'a> {
     }
 }
 
-/// Dark green -> green -> white-green for intensity 1..=255.
+/// The theme's phosphor colours for intensity 1..=255: stop 0 at 0, stop 1 at 140, stop 2 at 255.
 fn ramp(v: u32) -> u32 {
-    let green = 70 + v * 185 / 255;
-    let other = if v > 140 { (v - 140) * 255 / 115 } else { 0 };
-    (other << 16) | (green << 8) | (other + v / 8).min(255)
+    let [low, middle, high] = theme().phosphor;
+    if v > 140 { mix(middle, high, v - 140, 115) } else { mix(low, middle, v, 140) }
 }
-
-pub const AXIS: u32 = 0x2c363f;
-pub const FRAME: u32 = 0x4b5964;
-pub const LABEL: u32 = 0x9aa5af;
 
 /// The graticule of a scope of `size` pixels with its top-left at (x, y), matching `Phosphor::draw`: the box, the 45-degree
 /// L and R axes and the M (vertical) and S (horizontal) axes, labelled. `canvas` should be the grid layer.
 pub fn draw_graticule(canvas: &mut Canvas, x: i32, y: i32, size: u32) {
     let (s, c) = (size as i32 - 1, (size as i32 - 1) / 2);
-    canvas.line(x, y + c, x + s, y + c, AXIS);
-    canvas.line(x + c, y, x + c, y + s, AXIS);
-    canvas.line(x, y, x + s, y + s, AXIS);
-    canvas.line(x + s, y, x, y + s, AXIS);
+    canvas.line(x, y + c, x + s, y + c, theme().axis);
+    canvas.line(x + c, y, x + c, y + s, theme().axis);
+    canvas.line(x, y, x + s, y + s, theme().axis);
+    canvas.line(x + s, y, x, y + s, theme().axis);
     // a diamond through the edge midpoints: the full-scale mono and opposite-polarity extremes
     for (a, b) in [((c, 0), (s, c)), ((s, c), (c, s)), ((c, s), (0, c)), ((0, c), (c, 0))] {
-        canvas.line(x + a.0, y + a.1, x + b.0, y + b.1, AXIS);
+        canvas.line(x + a.0, y + a.1, x + b.0, y + b.1, theme().axis);
     }
-    canvas.rect(x, y, size, size, FRAME);
-    canvas.text_centered(x + c, y - 18, "+M", LABEL);
-    canvas.text_centered(x + c, y + s + 4, "-M", LABEL);
-    canvas.text(x - 18, y + c - 8, "-S", LABEL);
-    canvas.text(x + s + 4, y + c - 8, "+S", LABEL);
-    canvas.text(x + 4, y + 4, "L", LABEL);
-    canvas.text(x + s - 12, y + 4, "R", LABEL);
+    canvas.rect(x, y, size, size, theme().frame);
+    canvas.text_centered(x + c, y - 18, "+M", theme().label);
+    canvas.text_centered(x + c, y + s + 4, "-M", theme().label);
+    canvas.text(x - 18, y + c - 8, "-S", theme().label);
+    canvas.text(x + s + 4, y + c - 8, "+S", theme().label);
+    canvas.text(x + 4, y + 4, "L", theme().label);
+    canvas.text(x + s - 12, y + 4, "R", theme().label);
 }
 
 #[cfg(test)]

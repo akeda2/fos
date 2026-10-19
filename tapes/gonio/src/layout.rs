@@ -1,13 +1,13 @@
 //! Where everything goes, derived from the screen size so any aspect ratio works (16:9 is what it is drawn for): the scope is
 //! a square in the middle, the correlation and balance bars under it, the level meters to its right, and the area to its left
-//! is kept free for a loudness (LUFS) panel.
+//! is kept free for a loudness (LUFS) panel that also reaches down beside the correlation and balance bars.
 
 const TOP: i32 = 34;
 const BOTTOM: i32 = 24;
 /// Under the scope: its -M label, then the correlation bar and the balance bar with their labels.
 const UNDER: i32 = 22 + 16 + 26 + 10 + 26;
 /// The least room each side column keeps.
-const SIDE_MIN: i32 = 200;
+const SIDE_MIN: i32 = 260;
 
 #[derive(Clone, Copy)]
 pub struct Rect {
@@ -48,7 +48,7 @@ impl Layout {
         let free = w - right - label - 6 - 60 - 34 - 16;
         let bar_w = ((free - 10) / 2).clamp(14, 40);
         let bars = Rect { x: right + label, y: sy, w: (2 * bar_w + 10) as u32, h: size as u32 };
-        let left_panel = Rect { x: 16, y: sy, w: (sx - 28 - 16).max(0) as u32, h: size as u32 };
+        let left_panel = Rect { x: 16, y: sy, w: (sx - 28 - 16).max(0) as u32, h: (size + UNDER) as u32 };
         Self { width, height, scope, correlation, balance, bars, bar_w: bar_w as u32, left_panel }
     }
 

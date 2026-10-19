@@ -16,7 +16,7 @@ use dsp::level::db_amplitude;
 use dsp::loudness::Loudness;
 use dsp::stereo::Correlator;
 use gfx::meter;
-use gfx::plot::{BACKGROUND, DIM, TEXT};
+use gfx::theme::theme;
 use gfx::scope::{LOG_RANGE_DB, Law, Phosphor, draw_graticule};
 use layout::Layout;
 use lufs::Panel;
@@ -26,7 +26,7 @@ use tape_rt::{Key, KeyDecoder, Line, TapeApi, alloc_bytes, arg_value as value, p
 tape_rt::tape_help!(
     br#"gonio [@NAME] [device=N] [chan=A,B] [rate=48000] [scale=nordic|dbfs]
       [style=dots|lines] [law=log|linear] [range=DB] [gain=DB] [tau=SECONDS]
-      [target=-23|-24|-14] [ebu=9|18]
+      [target=-23|-24|-14] [ebu=9|18] [theme=dark|classic|light]
       [src=input|test] [phase=DEG] [tone=HZ] [level=-18] [right=DB]
 Goniometer for two input channels (default 1,2; `device=` picks the audio
 device, `audio` numbers them): phase scope with persistence (mono is a
@@ -45,7 +45,7 @@ Keys (Escape quits):
                (log: the centre is -range dBFS, quiet signals stay visible)
   + - scope gain 3 dB   , . input pair -/+ (1-2, 3-4, ...)
   t loudness target -23/-24/-14   e EBU scale +9/+18
-  i reset I and LRA
+  i reset I and LRA   k colour theme dark/classic/light
   w save the settings (scale, style, law, range, gain, tau, rate, target, ebu) in gonio.cfg
   p test tone phase 0/45/90/135/180   (src=test)
 Settings: gonio.cfg is read at start (key=value words, # comments); `@NAME` on
@@ -85,6 +85,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Err(reason) => return println!("gonio: {reason}."),
     };
     let (arguments, width, height) = (config.text(), started.width, started.height);
+    if let Some(name) = value(arguments, "theme") {
+        if !gfx::theme::set_by_name(name) {
+            return println!("gonio: theme= takes dark, classic or light.");
+        }
+    }
     let mut state = State {
         rate: value(arguments, "rate").and_then(|v| v.parse().ok()).unwrap_or(48_000),
         kind: if value(arguments, "scale") == Some("dbfs") { MeterKind::Dbfs } else { MeterKind::Nordic },
@@ -176,6 +181,10 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     state.kind = state.kind.next();
                     draw_grid(&mut screen, &layout, state.kind, &panel);
                 }
+                Key::Char(b'k') => {
+                    let _ = write!(message, "theme {}", gfx::theme::next().name);
+                    draw_grid(&mut screen, &layout, state.kind, &panel);
+                }
                 Key::Char(b't') => {
                     panel.target = (panel.target + 1) % lufs::TARGETS.len();
                     let _ = write!(message, "target {:.0} LUFS", panel.target_lufs());
@@ -200,6 +209,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                     body.put("tau", format_args!("{:.2}", state.tau_s));
                     body.put("rate", format_args!("{}", state.rate));
                     body.put("target", format_args!("{:.0}", panel.target_lufs()));
+                    body.put("theme", format_args!("{}", gfx::theme::theme().name));
                     body.put("ebu", format_args!("{}", if panel.wide { 18 } else { 9 }));
                     match config.save(api, body.as_str()) {
                         Ok(name) => {
@@ -280,8 +290,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
                 meter::draw_bar(&mut canvas, scale, x, layout.bar_w, layout.bars.y, layout.bars.h, reading.level, reading.hold, reading.clipped);
                 let mut text = [0u8; 12];
                 let shown = gfx::format_fixed(&mut text, reading.hold, 1);
-                canvas.text_centered(x + layout.bar_w as i32 / 2, layout.bars.y + layout.bars.h as i32 + 8, if reading.hold > scale.min { shown } else { "-" }, TEXT);
-                canvas.text_centered(x + layout.bar_w as i32 / 2, layout.bars.y - 26, if channel == 0 { "L" } else { "R" }, DIM);
+                canvas.text_centered(x + layout.bar_w as i32 / 2, layout.bars.y + layout.bars.h as i32 + 8, if reading.hold > scale.min { shown } else { "-" }, theme().text);
+                canvas.text_centered(x + layout.bar_w as i32 / 2, layout.bars.y - 26, if channel == 0 { "L" } else { "R" }, theme().dim);
             }
             panel.draw(&mut canvas, layout.left_panel, &loudness);
             let (c, b) = (layout.correlation, layout.balance);
@@ -290,7 +300,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             meter::draw_bipolar(&mut canvas, b.x, b.y, b.w, b.h, correlator.balance(), false, "L", "R");
             let mut text = Line::<24>::new();
             let _ = write!(text, "correlation {correlation:+.2}");
-            canvas.text_centered(c.x + c.w as i32 / 2, c.y - 20, text.as_str(), TEXT);
+            canvas.text_centered(c.x + c.w as i32 / 2, c.y - 20, text.as_str(), theme().text);
             let mut law = Line::<16>::new();
             if phosphor.law == Law::Log {
                 let _ = write!(law, "log {:.0} dB", phosphor.range_db);
@@ -314,11 +324,11 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
 /// The static layer: background, scope graticule, meter scale, bar titles.
 fn draw_grid(screen: &mut Screen, layout: &Layout, kind: MeterKind, panel: &Panel) {
     let mut canvas = screen.grid();
-    canvas.clear(BACKGROUND);
+    canvas.clear(theme().background);
     draw_graticule(&mut canvas, layout.scope.x, layout.scope.y, layout.scope.w);
     meter::draw_scale(&mut canvas, kind.scale(), layout.bars.x, layout.bars.w, layout.bars.y, layout.bars.h);
     panel.draw_grid(&mut canvas, layout.left_panel);
-    canvas.text_centered(layout.balance.x + layout.balance.w as i32 / 2, layout.balance.y - 18, "balance", DIM);
+    canvas.text_centered(layout.balance.x + layout.balance.w as i32 / 2, layout.balance.y - 18, "balance", theme().dim);
 }
 
 fn draw_status(canvas: &mut gfx::Canvas, law: &str, layout: &Layout, state: &State, input: &Input, phase: f32, message: &str) {
@@ -341,9 +351,9 @@ fn draw_status(canvas: &mut gfx::Canvas, law: &str, layout: &Layout, state: &Sta
     if state.test {
         let _ = write!(line, " {phase:.0} deg");
     }
-    canvas.text(16, 6, line.as_str(), TEXT);
+    canvas.text(16, 6, line.as_str(), theme().text);
     if !message.is_empty() {
-        canvas.text_right(layout.width as i32 - 16, 6, message, gfx::meter::AMBER);
+        canvas.text_right(layout.width as i32 - 16, 6, message, theme().amber);
     }
-    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  w save  t target  e EBU  i reset  +- gain  , . channels  p test phase  Esc", DIM);
+    canvas.text(16, layout.height as i32 - 18, "space freeze  r reset  m scale  v dots/lines  l law  x range  w save  k theme  t target  e EBU  i reset  +- gain  , . channels  p test phase  Esc", theme().dim);
 }

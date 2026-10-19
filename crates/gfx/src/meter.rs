@@ -2,14 +2,8 @@
 //! mean: dBFS, or the Nordic PPM scale whose 0 is TEST = -18 dBFS), a peak-hold marker and a clip lamp, and a horizontal
 //! bipolar bar (-1..+1) for correlation and balance. The readings come from elsewhere (`dsp::level`, `audio_wire::meter`).
 
-use crate::plot::{DIM, GRID, GRID_MAJOR, TEXT};
+use crate::theme::theme;
 use crate::{Canvas, format_fixed};
-
-pub const GREEN: u32 = 0x3ccf6a;
-pub const AMBER: u32 = 0xffc83d;
-pub const RED: u32 = 0xff4d4d;
-const OFF: u32 = 0x1a2026;
-const HOLD: u32 = 0xffffff;
 
 /// A vertical scale from `min` to `max` (the scale's own units, dB). `dbfs_at_zero` is the dBFS of the scale's 0 (0 for dBFS,
 /// -18 for Nordic); `warn` and `over` are where the bar turns amber and red; `ticks` are the labelled values.
@@ -80,7 +74,7 @@ impl Scale {
     }
 
     fn colour(&self, value: f32) -> u32 {
-        if value > self.over - 0.01 { RED } else if value > self.warn - 0.01 { AMBER } else { GREEN }
+        if value > self.over - 0.01 { theme().red } else if value > self.warn - 0.01 { theme().amber } else { theme().green }
     }
 }
 
@@ -93,27 +87,27 @@ pub const DBFS_COLUMN: i32 = 60;
 pub fn draw_scale(canvas: &mut Canvas, scale: &Scale, bars_x: i32, bars_w: u32, y: i32, h: u32) {
     for &(value, label) in scale.ticks {
         let row = scale.row(value, y, h);
-        canvas.fill_rect(bars_x, row, bars_w, 1, if value == 0.0 { GRID_MAJOR } else { GRID });
-        let colour = if value == 0.0 { TEXT } else { DIM };
+        canvas.fill_rect(bars_x, row, bars_w, 1, if value == 0.0 { theme().grid_major } else { theme().grid });
+        let colour = if value == 0.0 { theme().text } else { theme().dim };
         canvas.text_right(bars_x - 6, row - 8, label, colour);
         canvas.text(bars_x + bars_w as i32 + 6, row - 8, label, colour);
         if scale.dbfs_at_zero != 0.0 {
             let mut text = [0u8; 12];
             let shown = format_fixed(&mut text, scale.dbfs(value), 0);
-            canvas.text(bars_x + bars_w as i32 + 6 + DBFS_COLUMN, row - 8, shown, DIM);
+            canvas.text(bars_x + bars_w as i32 + 6 + DBFS_COLUMN, row - 8, shown, theme().dim);
         }
     }
-    canvas.text_right(bars_x - 6, y - 26, scale.name, TEXT);
-    canvas.text(bars_x + bars_w as i32 + 6, y - 26, scale.name, TEXT);
+    canvas.text_right(bars_x - 6, y - 26, scale.name, theme().text);
+    canvas.text(bars_x + bars_w as i32 + 6, y - 26, scale.name, theme().text);
     if scale.dbfs_at_zero != 0.0 {
-        canvas.text(bars_x + bars_w as i32 + 6 + DBFS_COLUMN, y - 26, "dBFS", DIM);
+        canvas.text(bars_x + bars_w as i32 + 6 + DBFS_COLUMN, y - 26, "dBFS", theme().dim);
     }
 }
 
 /// One bar: lit in 3-pixel segments up to `value` (the scale's units), a hold marker at `hold` and a red lamp above the bar
 /// when `clipped`.
 pub fn draw_bar(canvas: &mut Canvas, scale: &Scale, x: i32, w: u32, y: i32, h: u32, value: f32, hold: f32, clipped: bool) {
-    canvas.fill_rect(x, y, w, h, OFF);
+    canvas.fill_rect(x, y, w, h, theme().off);
     let top = scale.row(value, y, h);
     let mut row = y + h as i32 - 3;
     while row >= top {
@@ -123,19 +117,19 @@ pub fn draw_bar(canvas: &mut Canvas, scale: &Scale, x: i32, w: u32, y: i32, h: u
     }
     if hold > scale.min {
         let marker = scale.row(hold, y, h);
-        canvas.fill_rect(x, marker.min(y + h as i32 - 2), w, 2, HOLD);
+        canvas.fill_rect(x, marker.min(y + h as i32 - 2), w, 2, theme().hold);
     }
-    canvas.fill_rect(x, y - 12, w, 8, if clipped { RED } else { OFF });
+    canvas.fill_rect(x, y - 12, w, 8, if clipped { theme().red } else { theme().off });
 }
 
 /// A history chart: `values` (the scale's units, oldest first, one per pixel column; older ones than `w` are dropped) as a line
 /// in the box at (x, y, w, h), with the scale's ticks as faint lines and 0 stronger. A value at or below `scale.min` is a gap.
 pub fn draw_history(canvas: &mut Canvas, scale: &Scale, x: i32, y: i32, w: u32, h: u32, values: &[f32]) {
-    canvas.fill_rect(x, y, w, h, OFF);
+    canvas.fill_rect(x, y, w, h, theme().off);
     for &(value, _) in scale.ticks {
-        canvas.fill_rect(x, scale.row(value, y, h), w, 1, if value == 0.0 { GRID_MAJOR } else { GRID });
+        canvas.fill_rect(x, scale.row(value, y, h), w, 1, if value == 0.0 { theme().grid_major } else { theme().grid });
     }
-    canvas.rect(x, y, w, h, GRID_MAJOR);
+    canvas.rect(x, y, w, h, theme().grid_major);
     let shown = &values[values.len().saturating_sub(w as usize)..];
     let first = x + (w as usize - shown.len()) as i32;
     let mut previous: Option<(i32, i32)> = None;
@@ -146,9 +140,9 @@ pub fn draw_history(canvas: &mut Canvas, scale: &Scale, x: i32, y: i32, w: u32, 
         }
         let point = (first + index as i32, scale.row(value, y, h).min(y + h as i32 - 1));
         if let Some((px, py)) = previous {
-            canvas.line(px, py, point.0, point.1, GREEN);
+            canvas.line(px, py, point.0, point.1, theme().green);
         } else {
-            canvas.set(point.0, point.1, GREEN);
+            canvas.set(point.0, point.1, theme().green);
         }
         previous = Some(point);
     }
@@ -157,23 +151,23 @@ pub fn draw_history(canvas: &mut Canvas, scale: &Scale, x: i32, y: i32, w: u32, 
 /// A horizontal bar from the middle: `value` in -1..=1 fills left (negative) or right (positive); ticks at -1, 0, +1.
 /// `zones`: `negative_red` colours the negative side red (correlation), otherwise both sides are green (balance).
 pub fn draw_bipolar(canvas: &mut Canvas, x: i32, y: i32, w: u32, h: u32, value: f32, negative_red: bool, left_label: &str, right_label: &str) {
-    canvas.fill_rect(x, y, w, h, OFF);
+    canvas.fill_rect(x, y, w, h, theme().off);
     let middle = x + w as i32 / 2;
     let v = if value < -1.0 { -1.0 } else if value > 1.0 { 1.0 } else { value };
     let reach = (v * (w as f32 / 2.0)) as i32;
     if reach >= 0 {
-        canvas.fill_rect(middle, y + 2, reach as u32, h - 4, GREEN);
+        canvas.fill_rect(middle, y + 2, reach as u32, h - 4, theme().green);
     } else {
-        canvas.fill_rect(middle + reach, y + 2, (-reach) as u32, h - 4, if negative_red { RED } else { GREEN });
+        canvas.fill_rect(middle + reach, y + 2, (-reach) as u32, h - 4, if negative_red { theme().red } else { theme().green });
     }
     for step in 0..=4 {
         let tick = x + (w as i32 - 1) * step / 4;
-        canvas.fill_rect(tick, y + h as i32, 1, 6, if step == 2 { TEXT } else { DIM });
+        canvas.fill_rect(tick, y + h as i32, 1, 6, if step == 2 { theme().text } else { theme().dim });
     }
-    canvas.fill_rect(middle, y - 4, 1, h + 4, TEXT);
-    canvas.text_centered(x, y + h as i32 + 8, left_label, DIM);
-    canvas.text_centered(middle, y + h as i32 + 8, "0", DIM);
-    canvas.text_centered(x + w as i32 - 1, y + h as i32 + 8, right_label, DIM);
+    canvas.fill_rect(middle, y - 4, 1, h + 4, theme().text);
+    canvas.text_centered(x, y + h as i32 + 8, left_label, theme().dim);
+    canvas.text_centered(middle, y + h as i32 + 8, "0", theme().dim);
+    canvas.text_centered(x + w as i32 - 1, y + h as i32 + 8, right_label, theme().dim);
 }
 
 #[cfg(test)]
@@ -194,7 +188,7 @@ mod tests {
         let mut pixels = vec![0u32; 120 * 80];
         let mut canvas = Canvas::new(&mut pixels, 120, 80).unwrap();
         draw_history(&mut canvas, &Scale::LU18, 10, 10, 100, 60, &[-200.0, -3.0, 0.0, 5.0, -200.0, 2.0]);
-        let green = pixels.iter().filter(|&&p| p == GREEN).count();
+        let green = pixels.iter().filter(|&&p| crate::theme::THEMES.iter().any(|t| t.green == p)).count();
         assert!(green >= 4, "{green}");
     }
 
