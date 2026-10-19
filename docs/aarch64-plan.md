@@ -104,3 +104,21 @@ start (the Pi 4 has two micro-HDMI outputs).
 - Target: Pi 4; UEFI-first (edk2 + our loader), raw `kernel8.img` only as a fallback.
 - Order: QEMU `virt` first, then the Pi.
 - A 3.3 V USB serial adapter is available for early bring-up; the SD card is still to be found.
+
+## Pi 4 bring-up findings (2026-10-19, verified on hardware)
+
+The Pi 4 boots pftf edk2 -> our loader -> kernel, shows the boot log, runs the serial shell and a USB keyboard.
+
+- **EL2 has one execute-never bit.** The kernel runs at EL2, where descriptor bit 54 (UXN) is the only XN bit; PXN is ignored. Code pages
+  must clear both. QEMU boots at EL1 (UXN only blocks EL0) and never shows it; the symptom was a hang the moment the MMU came back on.
+- **Serial:** the firmware gives no usable SPCR, so when the GIC distributor is 0xff841000 the kernel uses the PL011 at 0xfe201000
+  (GPIO 14/15, 115200). An in-memory early log (`dmesg`, serial only) is replayed onto the screen once the console exists.
+- **Bring-up tools:** pixel breadcrumbs (`early.rs`: `mark`, `bits`) before the console works; shell `acpi`, `peek`, `poke`, `dmesg`, `usb`.
+- **PCIe:** no MCFG. The BCM2711 root complex at 0xFD500000 (config via EXT_CFG_INDEX/DATA, `pci_config.rs`) is already linked up by
+  the firmware; the VL805 xHCI is 01:00.0. Outbound window CPU 0x6_0000_0000 -> PCI 0xf8000000 (`cpu_address()` translates BARs);
+  inbound window 4 GB at 0.
+- **DMA:** a 4 MiB non-cacheable pool (`memory::dma_pool`, serves allocations with a `below` limit) since the VL805 is assumed non-coherent.
+  Works for xHCI on hardware. Never use exclusive atomics on that memory.
+- **USB:** the Pi's ports sit behind a VIA hub (2109:3431) on the VL805; `usb_hub.rs` now builds for aarch64 against `usb_kbd.rs`
+  and the keyboard is found. xHCI is polled (no PCIe MSI yet).
+- **Still missing on the Pi:** SD card (so no FOSFS, no tapes), Genet NIC, interrupts for xHCI, Pi 5.
