@@ -15,27 +15,12 @@ use core::sync::atomic::AtomicU64;
 static ECAM: AtomicU64 = AtomicU64::new(0);
 static MAPPED: AtomicBool = AtomicBool::new(false);
 
-fn table_at<T: Copy>(address: u64, offset: u64) -> T {
-    unsafe { core::ptr::read_unaligned((address + offset) as *const T) }
-}
-
-/// Finds the MCFG table from the ACPI RSDP (through the XSDT) and remembers the ECAM base of its first segment.
-/// Returns that base, or None when the firmware describes no ECAM.
+/// Reads the ECAM base from the ACPI MCFG table and remembers it. Returns that base, or None when the firmware
+/// describes no ECAM.
 pub fn init(rsdp: u64) -> Option<u64> {
-    if rsdp == 0 || table_at::<[u8; 8]>(rsdp, 0) != *b"RSD PTR " || table_at::<u8>(rsdp, 15) < 2 {
-        return None;
-    }
-    let xsdt: u64 = table_at(rsdp, 24);
-    let length: u32 = table_at(xsdt, 4);
-    for entry in 0..(u64::from(length).saturating_sub(36) / 8) {
-        let table: u64 = table_at(xsdt, 36 + entry * 8);
-        if table_at::<[u8; 4]>(table, 0) == *b"MCFG" && table_at::<u32>(table, 4) >= 60 {
-            let base: u64 = table_at(table, 44);
-            ECAM.store(base, Ordering::Relaxed);
-            return Some(base);
-        }
-    }
-    None
+    let base = super::acpi::mcfg_base(rsdp)?;
+    ECAM.store(base, Ordering::Relaxed);
+    Some(base)
 }
 
 fn register(bus: u8, device: u8, function: u8, offset: u8) -> Option<*mut u32> {

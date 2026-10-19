@@ -1,6 +1,7 @@
 //! aarch64 (Raspberry Pi 4 and later, QEMU `virt`): boot entry, exception vectors, the generic timer and the PL011
 //! console. Grows with the port (docs/aarch64-plan.md): MMU and GIC come next.
 
+pub mod acpi;
 pub mod cpu;
 pub mod exceptions;
 pub mod gic;

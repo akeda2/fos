@@ -6,12 +6,15 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// QEMU `virt`'s PL011. A real board's address is found from the firmware's SPCR/DT tables (the Pi 4's UART0 is
-/// 0xFE201000 behind the firmware's own mapping); until that is parsed, `set_base` can override it.
+/// 0xFE201000 behind the firmware's own mapping); `acpi::spcr_uart` supplies it at boot (`set_base`).
 pub const QEMU_VIRT_BASE: u64 = 0x0900_0000;
 
 static BASE: AtomicU64 = AtomicU64::new(QEMU_VIRT_BASE);
 
-#[allow(dead_code)]
+pub fn base() -> u64 {
+    BASE.load(Ordering::Relaxed)
+}
+
 pub fn set_base(base: u64) {
     BASE.store(base, Ordering::Relaxed);
 }

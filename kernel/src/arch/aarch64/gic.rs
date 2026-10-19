@@ -1,8 +1,7 @@
 //! GICv2 interrupt controller: the Raspberry Pi 4's GIC-400, and QEMU `virt`'s default GIC.
 //!
 //! One distributor (routes interrupts, here all to CPU 0) and one CPU interface (acknowledge/end of interrupt). Registers
-//! are memory-mapped through `paging::map_device`. The bases are QEMU's; the Pi 4's (GICD 0xFF841000, GICC 0xFF842000)
-//! come from the device tree or MADT once those are parsed (`set_base`). Only the private peripheral interrupt of the
+//! are memory-mapped through `paging::map_device`. The defaults are QEMU's; MADT supplies the real ones (the Pi 4's are GICD 0xFF841000, GICC 0xFF842000) through `set_base`. Only the private peripheral interrupt of the
 //! generic physical timer (INTID 30) is wired up so far; it drives a 100 Hz counter, proving the whole IRQ path.
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +18,11 @@ static RELOAD: AtomicU64 = AtomicU64::new(0);
 pub fn set_base(distributor: u64, cpu_interface: u64) {
     GICD.store(distributor, Ordering::Relaxed);
     GICC.store(cpu_interface, Ordering::Relaxed);
+}
+
+/// (distributor, CPU interface) as configured.
+pub fn bases() -> (u64, u64) {
+    (GICD.load(Ordering::Relaxed), GICC.load(Ordering::Relaxed))
 }
 
 fn write(base: &AtomicU64, offset: u64, value: u32) {

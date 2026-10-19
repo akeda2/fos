@@ -94,6 +94,7 @@ def main():
     check(irq is not None and 8 <= int(irq.group(1)) <= 12, "the GIC delivers the 100 Hz timer interrupt and the CPU returns from it", text)
     check("Boot disk: disk1" in text and "virtio-blk" in text, "PCI (ECAM) finds virtio-blk; the boot disk is located by the payload partition GUID", text)
     check(re.search(r"FOSFS: mounted on disk1 \(\d+ MiB, \d+ file", text) is not None, "FOSFS mounts on the boot disk (GPT, block layer, virtio-blk driver)", text)
+    check("Console: PL011 at 0x9000000 (ACPI SPCR)" in text and "GICv2 at 0x8000000/0x8010000" in text, "the UART (SPCR) and the GIC (MADT) bases come from the ACPI tables", text)
     check("Framebuffer console: on" in text, "the loader hands over a GOP framebuffer and the kernel starts its console on it", text)
     total, lit = lit_pixels(shot) if shot.exists() else (0, 0)
     check(total > 0 and lit > 2000, f"the screen shows the kernel's text ({lit} lit pixels of {total})", text)

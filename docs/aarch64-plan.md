@@ -42,7 +42,7 @@ mailbox, SD) about 3-4k more. The large x86 drivers are simply not needed.
   instruction cache and allocates the kernel as LoaderCode); `abi::elf` accepts the host CPU's ELF machine and RELATIVE relocation;
   `kernel/src/main.rs` dispatches to `main_x86_64.rs` or `main_aarch64.rs`; a minimal aarch64 kernel (`arch/aarch64/`: `_start`, PL011) prints its BootInfo;
   `make test-aarch64-boot` (image: `make image-aarch64`). Also done: exception vectors, generic timer (`make test-aarch64-faults`), the physical allocator and our own page tables
-  (`arch/aarch64/paging.rs`: identity map, RAM NX in 2 MiB blocks, kernel W^X, guard pages, `map_device`; EL1 or EL2). Also done: GICv2 (`arch/aarch64/gic.rs`, QEMU virt default and the Pi's GIC-400) with a 100 Hz physical-timer IRQ through a register-saving IRQ vector. Also done: the GOP framebuffer (mapped non-cacheable) with the shared 8x16 text console; the test takes a QEMU `screendump` (ramfb) and checks pixels. Also done: PCI config through ECAM (base from the ACPI MCFG; `arch/aarch64/pci_config.rs`), a polling virtio-blk driver (`virtio_blk.rs`, test scaffolding), and the portable block/GPT/FOSFS/storage stack mounting the boot volume. Also done: a serial shell (`shell.rs`, shared `lineedit`; help, ls, cat, disks, mem, uptime; tested by typing into QEMU's serial). Left: tapes (M2), the Pi's mailbox framebuffer (no GOP without edk2 display setup), then growing the module list (log, fosfs, shell) until `cargo check` shows no `cfg` gaps. The UART base is the QEMU one
+  (`arch/aarch64/paging.rs`: identity map, RAM NX in 2 MiB blocks, kernel W^X, guard pages, `map_device`; EL1 or EL2). Also done: GICv2 (`arch/aarch64/gic.rs`, QEMU virt default and the Pi's GIC-400) with a 100 Hz physical-timer IRQ through a register-saving IRQ vector. Also done: the GOP framebuffer (mapped non-cacheable) with the shared 8x16 text console; the test takes a QEMU `screendump` (ramfb) and checks pixels. Also done: PCI config through ECAM (base from the ACPI MCFG; `arch/aarch64/pci_config.rs`), a polling virtio-blk driver (`virtio_blk.rs`, test scaffolding), and the portable block/GPT/FOSFS/storage stack mounting the boot volume. Also done: a serial shell (`shell.rs`, shared `lineedit`; help, ls, cat, disks, mem, uptime; tested by typing into QEMU's serial). Also done: UART and GIC bases from ACPI SPCR/MADT. Left: tapes (M2) (no GOP without edk2 display setup), then growing the module list (log, fosfs, shell) until `cargo check` shows no `cfg` gaps. The UART base is the QEMU one
   (`pl011::QEMU_VIRT_BASE`); the Pi's comes from the SPCR/DT tables.
 - **M2 - tape ABI on aarch64.** `targets/aarch64-fos-tape.json` (hard-float), shared `tapes/tape.ld`, tape ELF loader checks `e_machine`,
   `tools/stamp_tape.py` and `build_image.py` learn the architecture. `make test-aarch64-*` mirrors the key tests.
@@ -58,6 +58,10 @@ mailbox, SD) about 3-4k more. The large x86 drivers are simply not needed.
 
 ## Known hardware traps (to check, none verified yet)
 
+- **Update the Pi 4's bootloader EEPROM first** (an old one may not boot the current edk2 build or USB/SD the way its README expects): write
+  "Misc utility images > Bootloader" from Raspberry Pi Imager to the SD card, boot it once, wait for the green screen. Needs the SD card.
+- Expected: edk2 on the Pi 4 gives a GOP framebuffer (so no mailbox code is needed), ACPI with SPCR (UART), MADT (GIC-400) and an MCFG
+  for the PCIe/VL805 (with a config-window quirk). The kernel reads the UART and GIC from those tables (`arch/aarch64/acpi.rs`), tested on QEMU only.
 - Pi 4 PCIe/xHCI needs the firmware (or us) to reset the VL805 through the mailbox; edk2 does it already.
 - Genet has no PTP hardware stamping, so PTP on a Pi is software-stamped (accuracy like our `software` mode).
 - DMA coherency: treat all DMA memory as non-cacheable at first, optimise later.

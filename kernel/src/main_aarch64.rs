@@ -48,6 +48,17 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         );
     }
     arch::aarch64::exceptions::init();
+    // The console and interrupt controller are where the firmware's ACPI tables say (QEMU `virt` and the Pi 4 differ).
+    let mut uart_from_acpi = false;
+    if info.magic == BOOT_INFO_MAGIC {
+        if let Some(base) = arch::aarch64::acpi::spcr_uart(info.acpi_rsdp) {
+            arch::aarch64::pl011::set_base(base);
+            uart_from_acpi = true;
+        }
+        if let Some((distributor, cpu_interface)) = arch::aarch64::acpi::madt_gic(info.acpi_rsdp) {
+            gic::set_base(distributor, cpu_interface);
+        }
+    }
     if info.magic == BOOT_INFO_MAGIC {
         let map_bytes = info.memory_map_count * info.memory_map_descriptor_size;
         memory::init(
@@ -62,7 +73,8 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         let stats = memory::stats();
         println!("Physical memory: {} MiB managed, {} MiB free.", stats.frames * memory::FRAME / (1024 * 1024), stats.free * memory::FRAME / (1024 * 1024));
         paging::build_and_load(info, &info.framebuffer);
-        paging::map_device(arch::aarch64::pl011::QEMU_VIRT_BASE, 4096);
+        paging::map_device(arch::aarch64::pl011::base(), 4096);
+        println!("Console: PL011 at {:#x} ({}).", arch::aarch64::pl011::base(), if uart_from_acpi { "ACPI SPCR" } else { "default" });
         let screen = framebuffer::init(&info.framebuffer);
         println!("Framebuffer console: {}.", if screen { "on" } else { "none (serial only)" });
         println!("Page tables loaded: RAM NX in 2 MiB blocks, kernel W^X, page 0 and stack guard unmapped.");
@@ -74,7 +86,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         while timer::micros() - start < 100_000 {
             cpu::sleep();
         }
-        println!("GICv2 up: {} timer interrupts (INTID 30) in 100 ms, expected about 10.", gic::irq_ticks());
+        println!("GICv2 at {:#x}/{:#x}: {} timer interrupts (INTID 30) in 100 ms, expected about 10.", gic::bases().0, gic::bases().1, gic::irq_ticks());
     }
     if info.magic == BOOT_INFO_MAGIC {
         match arch::aarch64::pci_config::init(info.acpi_rsdp) {
