@@ -64,38 +64,88 @@ pub fn pop() -> Option<u8> {
     Some(byte)
 }
 
-/// Brings up every xHCI controller and starts any boot keyboard on its connected root ports. Returns how many keyboards.
+static mut STEP: &str = "";
+
+/// Names the enumeration step in progress, for the "attempt failed at ..." messages (`usb_hub` uses it too).
+pub fn set_step(step: &'static str) {
+    unsafe { STEP = step };
+}
+
+pub fn step() -> &'static str {
+    unsafe { STEP }
+}
+
+/// Brings up every xHCI controller and starts any boot keyboard on its connected root ports and on the hubs behind them.
+/// Returns how many keyboards.
 pub fn init() -> usize {
     let controllers = xhci::init_all();
     crate::println!("USB: {controllers} xHCI controller(s).");
+    probe_all()
+}
+
+/// Looks at every connected root port that is not in use yet, and at every known hub's ports. Returns how many keyboards
+/// were added (the `usb` shell command runs this again after something was plugged in).
+pub fn probe_all() -> usize {
     let mut found = 0;
     for index in 0..xhci::count() {
         let Some(controller) = xhci::controller(index) else { continue };
         for port in 1..=controller.ports {
-            if controller.port_status(port) & 1 == 0 {
+            if controller.slot_in_use_for_port(port) || controller.port_status(port) & 1 == 0 {
                 continue;
             }
             for attempt in 1..=3 {
-                match probe_port(controller, port) {
+                set_step("open the port (reset, enable slot, address device)");
+                match probe_port(index, controller, port) {
                     Ok(true) => {
                         found += 1;
                         break;
                     }
                     Ok(false) => break,
                     Err(error) => {
-                        crate::println!("USB: xHCI {index} port {port}, attempt {attempt}/3 failed: {error:?}.");
+                        crate::println!("USB: xHCI {index} port {port}, attempt {attempt}/3 failed at \"{}\": {error:?}.", step());
                         controller.release_port_slots(port);
                         crate::timer::wait_ticks(15);
                     }
                 }
             }
         }
+        found += crate::usb_hub::rescan(index, controller);
     }
     found
 }
 
-fn probe_port(controller: &mut Controller, port: u8) -> Result<bool, xhci::Error> {
-    let mut device = controller.open_port(port)?;
+/// Drops the slots in a port (or, with a route, one device behind a hub) and the keyboard entries that used them. The
+/// controller stops writing reports (the slots go first) before the report buffer is handed back.
+pub fn release_port(controller: &mut Controller, port: u8, route: Option<u32>) {
+    let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };
+    let identity = (controller.pci.bus, controller.pci.device, controller.pci.function);
+    let mut buffers = [0u64; MAX_KEYBOARDS];
+    for (entry, freed) in keyboards.iter_mut().zip(buffers.iter_mut()) {
+        let Some(keyboard) = *entry else { continue };
+        let there = controller.slot_location(keyboard.slot).is_some_and(|(p, r)| p == port && route.is_none_or(|wanted| wanted == r));
+        if (keyboard.bus, keyboard.device, keyboard.function) == identity && there {
+            *entry = None;
+            *freed = keyboard.buffer;
+        }
+    }
+    match route {
+        Some(route) => controller.release_route_slots(port, route),
+        None => controller.release_port_slots(port),
+    }
+    for buffer in buffers.into_iter().filter(|&buffer| buffer != 0) {
+        memory::free(buffer, 1);
+    }
+}
+
+fn probe_port(controller_index: usize, controller: &mut Controller, port: u8) -> Result<bool, xhci::Error> {
+    let device = controller.open_port(port)?;
+    probe_device(controller_index, controller, device)
+}
+
+/// Reads an addressed device's descriptors: a hub is enumerated (its children come back here), a boot keyboard is started,
+/// anything else is ignored for now.
+pub fn probe_device(controller_index: usize, controller: &mut Controller, mut device: xhci::Device) -> Result<bool, xhci::Error> {
+    set_step("read the device descriptor");
     let mut descriptor = [0u8; 18];
     controller.get_descriptor(&device, 1, 0, &mut descriptor[..8])?;
     // SuperSpeed gives bMaxPacketSize0 as an exponent (always 9 = 512); the other speeds as the size itself.
@@ -103,8 +153,14 @@ fn probe_port(controller: &mut Controller, port: u8) -> Result<bool, xhci::Error
     controller.set_control_max_packet(&mut device, max_packet)?;
     controller.get_descriptor(&device, 1, 0, &mut descriptor)?;
     let (vendor, product) = (u16::from_le_bytes([descriptor[8], descriptor[9]]), u16::from_le_bytes([descriptor[10], descriptor[11]]));
+    let port = device.path();
+    set_step("read the configuration descriptor");
     let mut configuration = [0u8; 512];
     controller.get_descriptor(&device, 2, 0, &mut configuration[..9])?;
+    if descriptor[4] == 9 {
+        crate::println!("USB: port {port}: a hub ({vendor:04x}:{product:04x}, {}).", xhci::speed_name(device.speed));
+        return crate::usb_hub::enumerate(controller_index, controller, device, configuration[5]);
+    }
     let total = usize::from(u16::from_le_bytes([configuration[2], configuration[3]])).clamp(9, configuration.len());
     controller.get_descriptor(&device, 2, 0, &mut configuration[..total])?;
     let Some((interface, endpoint, max_packet_in, interval)) = find_boot_keyboard(&configuration[..total]) else {
@@ -112,6 +168,7 @@ fn probe_port(controller: &mut Controller, port: u8) -> Result<bool, xhci::Error
         controller.release_slot(device.slot);
         return Ok(false);
     };
+    set_step("start the keyboard");
     controller.set_configuration(&device, configuration[5])?;
     controller.control_transfer(&device, 0x21, 0x0b, 0, u16::from(interface), &mut [])?; // SET_PROTOCOL(boot)
     let _ = controller.control_transfer(&device, 0x21, 0x0a, 0, u16::from(interface), &mut []); // SET_IDLE(0); may stall
@@ -120,6 +177,7 @@ fn probe_port(controller: &mut Controller, port: u8) -> Result<bool, xhci::Error
     let slot = unsafe { (*core::ptr::addr_of_mut!(KEYBOARDS)).iter_mut().find(|entry| entry.is_none()) };
     let Some(slot) = slot else {
         controller.release_slot(device.slot);
+        memory::free(buffer, 1);
         return Ok(false);
     };
     *slot = Some(Keyboard { bus: controller.pci.bus, device: controller.pci.device, function: controller.pci.function, slot: device.slot, dci, buffer, previous: [0; 8], caps: false });

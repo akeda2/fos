@@ -14,6 +14,7 @@ mod pci;
 mod shell;
 mod storage;
 mod tape_aarch64;
+mod usb_hub;
 mod usb_kbd;
 mod virtio_blk;
 mod xhci;

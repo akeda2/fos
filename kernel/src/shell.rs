@@ -30,7 +30,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT keymap us|sv run NAME [ARGS]\ndmesg acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT keymap us|sv run NAME [ARGS]\ndmesg usb acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -65,6 +65,7 @@ fn execute(line: &str) {
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
         }),
         "dmesg" => crate::dmesg(),
+        "usb" => crate::println!("usb: {} new keyboard(s).", crate::usb_kbd::probe_all()),
         "peek" => peek(rest),
         "poke" => poke(rest),
         other => crate::println!("{other}: unknown command (try `help`)."),

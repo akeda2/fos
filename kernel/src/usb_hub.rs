@@ -21,6 +21,13 @@
 
 use crate::xhci::{self, Controller, Device};
 
+// The module that probes a device handed to it and releases a port's slots: the full USB host code on x86, the keyboard-only
+// one on aarch64 (both offer `set_step`, `step`, `release_port` and `probe_device`).
+#[cfg(target_arch = "x86_64")]
+use crate::usb_hid as host;
+#[cfg(target_arch = "aarch64")]
+use crate::usb_kbd as host;
+
 pub const MAX_HUBS: usize = 8;
 
 const REQUEST_GET_STATUS: u8 = 0;
@@ -68,7 +75,7 @@ fn port_feature(controller: &mut Controller, hub: &Device, request: u8, feature:
 /// powers them and scans for devices. `configuration` is its only configuration's value.
 pub fn enumerate(controller_index: usize, controller: &mut Controller, device: Device, configuration: u8) -> Result<bool, xhci::Error> {
     let super_speed = device.speed >= 4;
-    crate::usb_hid::set_step("set the hub's configuration");
+    host::set_step("set the hub's configuration");
     controller.set_configuration(&device, configuration)?;
     // `usb try` experiments on a Realtek 0bda:0401 (the SuperSpeed half of a USB 3 hub on the Skylake) showed that the first
     // hub-class request after SET_CONFIGURATION is stalled, whichever it is (depth, hub descriptor), and the next one works.
@@ -76,13 +83,13 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
     // give it that time and, if it stalls anyway, ask again once (`control_transfer` has already cleared the stall).
     crate::timer::wait_ticks(5);
     if super_speed {
-        crate::usb_hid::set_step("set the SuperSpeed hub depth");
+        host::set_step("set the SuperSpeed hub depth");
         // A SuperSpeed hub must be told how many hubs lie between it and the root.
         if controller.control_transfer(&device, 0x20, REQUEST_SET_HUB_DEPTH, u16::from(device.tier), 0, &mut []).is_err() {
             controller.control_transfer(&device, 0x20, REQUEST_SET_HUB_DEPTH, u16::from(device.tier), 0, &mut [])?;
         }
     }
-    crate::usb_hid::set_step("read the hub descriptor");
+    host::set_step("read the hub descriptor");
     let mut descriptor = [0u8; 12];
     let kind: u16 = if super_speed { 0x2a } else { 0x29 }; // hub descriptor types for USB 3 / USB 2
     if controller.control_transfer(&device, 0xa0, REQUEST_GET_DESCRIPTOR, kind << 8, 0, &mut descriptor).is_err() {
@@ -96,7 +103,7 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
         controller.release_slot(device.slot);
         return Ok(false);
     }
-    crate::usb_hid::set_step("tell the controller this slot is a hub");
+    host::set_step("tell the controller this slot is a hub");
     controller.configure_hub(&device, ports, ((characteristics >> 5) & 3) as u8)?;
     let slot = hubs().iter_mut().find(|entry| entry.is_none());
     let Some(slot) = slot else {
@@ -182,8 +189,9 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
                 continue;
             }
             crate::println!("USB: xHCI hub port {}.{port}: its device was unplugged or replugged; looking at the port again.", hub.device.path());
+            #[cfg(target_arch = "x86_64")]
             crate::usb_storage::mark_xhci_route_stale(controller_index, hub.device.port, route);
-            crate::usb_hid::release_port(controller, hub.device.port, Some(route));
+            host::release_port(controller, hub.device.port, Some(route));
             let _ = port_feature(controller, &hub.device, REQUEST_CLEAR_FEATURE, FEATURE_C_PORT_CONNECTION, port);
         }
         // Real hubs and devices sometimes fail the first attempt: start over (reset
@@ -196,8 +204,8 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
                 }
                 Ok(false) => break,
                 Err(error) => {
-                    crate::println!("USB: hub port {}.{port}, attempt {attempt}/3 failed at \"{}\": {error:?}.", hub.device.path(), crate::usb_hid::step());
-                    crate::usb_hid::release_port(controller, hub.device.port, Some(route));
+                    crate::println!("USB: hub port {}.{port}, attempt {attempt}/3 failed at \"{}\": {error:?}.", hub.device.path(), host::step());
+                    host::release_port(controller, hub.device.port, Some(route));
                     crate::timer::wait_ticks(15);
                 }
             }
@@ -208,7 +216,7 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
 
 fn probe_port(controller_index: usize, controller: &mut Controller, hub: &Hub, port: u8) -> Result<bool, xhci::Error> {
     // Reset the port and wait for the hub to say the reset finished.
-    crate::usb_hid::set_step("reset the hub port");
+    host::set_step("reset the hub port");
     port_feature(controller, &hub.device, REQUEST_SET_FEATURE, FEATURE_PORT_RESET, port)?;
     let start = crate::timer::ticks();
     let mut status = 0;
@@ -236,9 +244,9 @@ fn probe_port(controller_index: usize, controller: &mut Controller, hub: &Hub, p
         1
     };
     crate::timer::wait_ticks(3); // reset recovery
-    crate::usb_hid::set_step("address the device behind the hub (enable slot, address device)");
+    host::set_step("address the device behind the hub (enable slot, address device)");
     let device = controller.open_hub_port(&hub.device, port, speed)?;
-    crate::usb_hid::probe_device(controller_index, controller, device)
+    host::probe_device(controller_index, controller, device)
 }
 
 /// Lists hubs of this controller and what is connected to each of their ports.
