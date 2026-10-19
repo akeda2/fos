@@ -3,6 +3,7 @@
 //! writer for screenshots (`png`). `no_std`, no allocation: the caller owns the pixel slice.
 #![cfg_attr(not(test), no_std)]
 
+pub mod dial;
 pub mod meter;
 pub mod plot;
 pub mod png;
@@ -116,6 +117,24 @@ impl<'a> Canvas<'a> {
         for byte in text.bytes() {
             self.glyph(at, y, byte, rgb);
             at += GLYPH_WIDTH as i32;
+        }
+        at
+    }
+
+    /// Text in the console font enlarged `scale` times (each font pixel becomes a square), left edge at `x`; returns the
+    /// x after the last glyph.
+    pub fn text_scaled(&mut self, x: i32, y: i32, text: &str, scale: u32, rgb: u32) -> i32 {
+        let scale = scale.max(1) as i32;
+        let mut at = x;
+        for byte in text.bytes() {
+            for (row, bits) in font::FONT[byte as usize].iter().enumerate() {
+                for column in 0..GLYPH_WIDTH as i32 {
+                    if bits & (0x80 >> column) != 0 {
+                        self.fill_rect(at + column * scale, y + row as i32 * scale, scale as u32, scale as u32, rgb);
+                    }
+                }
+            }
+            at += GLYPH_WIDTH as i32 * scale;
         }
         at
     }

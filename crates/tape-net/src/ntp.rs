@@ -100,6 +100,32 @@ pub fn civil_from_unix(seconds: i64) -> Civil {
     Civil { year: year as u16, month: month as u8, day: day as u8, hour: (rest / 3600) as u8, minute: (rest % 3600 / 60) as u8, second: (rest % 60) as u8 }
 }
 
+/// The inverse of `civil_from_unix`: a calendar date and time as seconds since 1970 (Howard Hinnant's days-from-civil).
+pub fn unix_from_civil(date: &Civil) -> i64 {
+    let year = i64::from(date.year) - i64::from(date.month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month = i64::from(date.month);
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(date.day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    (era * 146_097 + day_of_era - 719_468) * 86_400 + i64::from(date.hour) * 3600 + i64::from(date.minute) * 60 + i64::from(date.second)
+}
+
+/// Day of the week of a Unix time, 0 = Monday (1970-01-01 was a Thursday).
+pub fn weekday(seconds: i64) -> u8 {
+    (seconds.div_euclid(86_400) + 3).rem_euclid(7) as u8
+}
+
+/// The zone, in minutes east of UTC, that explains a machine clock set to local time: `local` is its reading as seconds
+/// since 1970, `utc` the real time. A whole number of quarter hours within +-14 h and a clock no more than two minutes
+/// off in that zone; None when the machine clock is simply wrong.
+pub fn guess_zone(local: i64, utc: i64) -> Option<i32> {
+    let difference = local - utc;
+    let quarters = (difference + 450).div_euclid(900);
+    let minutes = (quarters * 15) as i32;
+    ((difference - quarters * 900).abs() <= 120 && minutes.abs() <= 14 * 60).then_some(minutes)
+}
+
 /// `+2`, `-5`, `+5:30` or `0` as minutes east of UTC.
 pub fn parse_zone(text: &str) -> Option<i32> {
     let (sign, digits) = match text.as_bytes().first()? {
@@ -131,6 +157,30 @@ mod tests {
         bytes[32..40].copy_from_slice(&received);
         bytes[40..48].copy_from_slice(&transmitted);
         bytes
+    }
+
+    #[test]
+    fn civil_and_unix_convert_both_ways() {
+        for seconds in [0, 951_782_400, 1_709_251_199, 1_709_251_200, 1_792_400_123, 4_102_444_799] {
+            assert_eq!(unix_from_civil(&civil_from_unix(seconds)), seconds);
+        }
+    }
+
+    #[test]
+    fn weekday_counts_from_monday() {
+        assert_eq!(weekday(0), 3, "1970-01-01 was a Thursday");
+        assert_eq!(weekday(1_792_400_000 / 86_400 * 86_400), 0, "2026-10-19 is a Monday");
+        assert_eq!(weekday(-1), 2, "1969-12-31 was a Wednesday");
+    }
+
+    #[test]
+    fn zone_is_guessed_only_from_a_clock_that_is_roughly_right() {
+        let utc = 1_792_400_000;
+        assert_eq!(guess_zone(utc + 2 * 3600 + 5, utc), Some(120));
+        assert_eq!(guess_zone(utc - 5 * 3600 - 30 * 60, utc), Some(-330));
+        assert_eq!(guess_zone(utc + 20, utc), Some(0));
+        assert_eq!(guess_zone(utc + 86_400, utc), None, "a day off is not a zone");
+        assert_eq!(guess_zone(utc + 7 * 60, utc), None, "seven minutes off is not a zone");
     }
 
     #[test]

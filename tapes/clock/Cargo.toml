@@ -1,0 +1,23 @@
+[package]
+name = "clock-tape"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "clock"
+path = "src/main.rs"
+
+[dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
+tape-rt = { path = "../../crates/tape-rt" }
+tape-net = { path = "../../crates/tape-net" }
+tape-ip = { path = "../../crates/tape-ip" }
+ptp-tape = { path = "../ptp" }
+gfx = { path = "../../crates/gfx" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"
