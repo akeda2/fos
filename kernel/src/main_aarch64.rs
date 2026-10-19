@@ -34,9 +34,18 @@ pub fn print(arguments: core::fmt::Arguments) {
 /// The loader jumps here (through `_start`, arch/aarch64/mod.rs) with the BootInfo pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(info: *const BootInfo) -> ! {
+    let info = unsafe { &*info };
+    // Before the first line is printed: the PL011 is at the address the firmware's SPCR table gives (QEMU `virt` 0x09000000,
+    // a Pi 4 0xFE201000). Printing first, to QEMU's address, would write to nothing on a Pi and show no sign of life.
+    let mut uart_from_acpi = false;
+    if info.magic == BOOT_INFO_MAGIC && info.version == BOOT_INFO_VERSION {
+        if let Some(base) = arch::aarch64::acpi::spcr_uart(info.acpi_rsdp) {
+            arch::aarch64::pl011::set_base(base);
+            uart_from_acpi = true;
+        }
+    }
     println!();
     println!("Fosfor OS kernel (aarch64): running from the UEFI loader.");
-    let info = unsafe { &*info };
     if info.magic != BOOT_INFO_MAGIC || info.version != BOOT_INFO_VERSION || info.size as usize != core::mem::size_of::<BootInfo>() {
         println!("BootInfo is not what this kernel expects (magic {:#x}, version {}, size {}).", info.magic, info.version, info.size);
     } else {
@@ -52,12 +61,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     }
     arch::aarch64::exceptions::init();
     // The console and interrupt controller are where the firmware's ACPI tables say (QEMU `virt` and the Pi 4 differ).
-    let mut uart_from_acpi = false;
     if info.magic == BOOT_INFO_MAGIC {
-        if let Some(base) = arch::aarch64::acpi::spcr_uart(info.acpi_rsdp) {
-            arch::aarch64::pl011::set_base(base);
-            uart_from_acpi = true;
-        }
         if let Some((distributor, cpu_interface)) = arch::aarch64::acpi::madt_gic(info.acpi_rsdp) {
             gic::set_base(distributor, cpu_interface);
         }
