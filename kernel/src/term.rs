@@ -1533,6 +1533,7 @@ fn execute(command: &str) {
         "io" => crate::diag::io(words),
         "mmio" => crate::diag::mmio(words),
         "clear" => crate::print(format_args!("\x1b[2J")),
+        "gpu" => crate::gpu::command(),
         "hexdump" => {
             let address = words.next().and_then(parse_number);
             let length = words.next().and_then(parse_number).unwrap_or(64);

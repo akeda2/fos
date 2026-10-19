@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates kernel/src/isr_stubs.S: 256 interrupt entry stubs of 16 bytes each
+"""Generates kernel/src/arch/x86_64/isr_stubs.S: 256 interrupt entry stubs of 16 bytes each
 (so the kernel can compute stub N's address as `isr_0 + 16 * N` and needs no
 relocated pointer table) and the common code they jump to.
 
@@ -8,7 +8,7 @@ code only for some exceptions (8, 10-14, 17, 21, 29, 30), so the others push a
 dummy 0; then the vector number is pushed. `isr_common` saves every general
 register and calls the Rust `interrupt_dispatch(frame)`.
 
-    python3 tools/gen_isr_stubs.py > kernel/src/isr_stubs.S
+    python3 tools/gen_isr_stubs.py > kernel/src/arch/x86_64/isr_stubs.S
 """
 
 ERROR_CODE_VECTORS = {8, 10, 11, 12, 13, 14, 17, 21, 29, 30}

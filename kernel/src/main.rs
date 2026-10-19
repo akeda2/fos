@@ -15,20 +15,18 @@
 #![no_std]
 #![no_main]
 
-mod acpi;
+mod arch;
 mod audio;
 mod ahci;
 mod block;
 mod bootcode;
-mod apic;
 mod clock;
 mod config;
 mod debug;
 mod diag;
-mod cpu;
-mod cpupower;
 mod nicpark;
 mod e1000;
+mod gpu;
 mod ehci;
 mod ohci;
 mod fatvol;
@@ -38,24 +36,18 @@ mod font_data;
 mod gpt;
 mod hda;
 mod framebuffer;
-mod gdt;
-mod idt;
 mod install;
-mod ioapic;
 mod keyboard;
 mod lineedit;
 mod log;
 mod memory;
-mod msi;
 mod nic;
 mod nvme;
-mod paging;
 mod pci;
 mod rtl8139;
 mod rtl8168;
 mod threecom;
 mod power;
-mod serial;
 mod storage;
 mod tape;
 mod tapesync;
@@ -76,21 +68,11 @@ use core::panic::PanicInfo;
 use fault::Frame;
 use fosfor_abi::{BootInfo, PIXEL_RGB};
 
-core::arch::global_asm!(
-    r#"
-    .section .text.entry, "ax"
-    .global _start
-    _start:
-        cli                              # the firmware's interrupt state is not ours
-        cld
-        lea rsp, [rip + __stack_top]     # our own stack, at the end of .bss
-        xor ebp, ebp
-        call kmain                       # rdi still holds the BootInfo pointer
-    2:  hlt
-        jmp 2b
-    "#
-);
-core::arch::global_asm!(include_str!("isr_stubs.S"));
+// The architecture layer (boot entry, CPU, interrupts, paging) lives in `arch/`; its modules are re-exported here so
+// the rest of the kernel keeps saying `crate::cpu`, `crate::paging`, ... whichever architecture is built.
+#[cfg(target_arch = "x86_64")]
+pub use arch::x86_64::{acpi, apic, cpu, cpupower, gdt, idt, ioapic, msi, paging, serial};
+
 
 /// `println!` goes to the serial port, the boot log and, once it exists, the framebuffer.
 pub fn print(arguments: core::fmt::Arguments) {
