@@ -19,6 +19,7 @@ pub const SUCCESS: Status = 0;
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
 #[allow(dead_code)] // spec value, kept beside its siblings
 pub const ALLOCATE_ADDRESS: u32 = 2;
+pub const LOADER_CODE: u32 = 1;
 pub const LOADER_DATA: u32 = 2;
 /// `LocateHandleBuffer` search type: every handle supporting a protocol.
 pub const BY_PROTOCOL: u32 = 2;

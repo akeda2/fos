@@ -143,7 +143,7 @@ OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-a
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-clock test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
+.PHONY: loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-clock test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -175,6 +175,24 @@ image: loader kernel tapes stamp-tapes $(BIOS_STAGES)
 	mkdir -p $(OUT)
 	python3 tools/build_image.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) --output $(IMAGE) \
 		--bios-stage1 $(BIOS_OUT)/stage1.bin --bios-stage2 $(BIOS_OUT)/stage2.bin $(TAPE_FILES)
+
+# aarch64 (Raspberry Pi 4, QEMU virt; docs/aarch64-plan.md): the loader and kernel for the other CPU, in their own image.
+A64_LOADER := $(CARGO_TARGET_DIR)/aarch64-unknown-uefi/release/fosfor-loader.efi
+A64_KERNEL := $(CARGO_TARGET_DIR)/aarch64-unknown-none-softfloat/release/fosfor-kernel
+A64_IMAGE := $(BUILD)/fosfor-aarch64/fosfor.img
+
+loader-aarch64:
+	cd boot/uefi && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-uefi -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
+
+kernel-aarch64:
+	cd kernel && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
+
+image-aarch64: loader-aarch64 kernel-aarch64
+	mkdir -p $(dir $(A64_IMAGE))
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL) --output $(A64_IMAGE)
+
+test-aarch64-boot: image-aarch64
+	python3 tools/test_aarch64_boot.py
 
 # Boot the image under QEMU + OVMF with the serial console on the terminal.
 run: image

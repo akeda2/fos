@@ -1,18 +1,25 @@
 //! Loading a position-independent ELF64 executable (`ET_DYN`, as `-pie` links one) into
 //! memory the caller has chosen: copy the `PT_LOAD` segments, clear the BSS, apply the
-//! `R_X86_64_RELATIVE` relocations. Shared by the UEFI loader (which loads the kernel)
+//! `R_X86_64_RELATIVE` (or `R_AARCH64_RELATIVE`) relocations. Shared by the UEFI loader (which loads the kernel)
 //! and the kernel (which loads tapes), so both agree on what an acceptable image is.
 //!
 //! Position independence is what makes loading robust: the image is linked at address
 //! 0 and lands wherever memory is free, so no fixed address has to be available on
 //! every firmware and every machine.
 
+/// The ELF `e_machine` and the RELATIVE relocation type of the CPU this crate is built for: an image for another CPU is refused.
+#[cfg(target_arch = "x86_64")]
+const HOST: (u16, u32) = (62, 8);
+#[cfg(target_arch = "aarch64")]
+const HOST: (u16, u32) = (183, 1027);
+
 #[derive(Debug)]
 pub enum Error {
+    /// Not a little-endian ELF64 for this CPU (the name is historical: it was x86-64 only).
     NotElf64X86,
     NotAnExecutable,
     OutOfRange,
-    /// A relocation type other than R_X86_64_RELATIVE: nothing here resolves symbols.
+    /// A relocation type other than RELATIVE: nothing here resolves symbols.
     UnsupportedRelocation(u32),
 }
 
@@ -37,7 +44,7 @@ struct Headers {
 
 fn headers(image: &[u8]) -> Result<Headers, Error> {
     const ET_DYN: u16 = 3;
-    if image.len() < 64 || image[0..4] != [0x7f, b'E', b'L', b'F'] || image[4] != 2 || image[5] != 1 || read_u16(image, 18) != 62 {
+    if image.len() < 64 || image[0..4] != [0x7f, b'E', b'L', b'F'] || image[4] != 2 || image[5] != 1 || read_u16(image, 18) != HOST.0 {
         return Err(Error::NotElf64X86);
     }
     if read_u16(image, 16) != ET_DYN {
@@ -137,14 +144,13 @@ pub unsafe fn load(image: &[u8], base: u64) -> Result<u64, Error> {
 }
 
 /// Walks the loaded `.dynamic` section for the relocation table (`DT_RELA`, `DT_RELASZ`)
-/// and applies every `R_X86_64_RELATIVE` entry: the word at `base + offset` becomes
+/// and applies every RELATIVE entry: the word at `base + offset` becomes
 /// `base + addend`. Those are the only relocations a statically linked
 /// position-independent executable needs.
 unsafe fn apply_relocations(base: u64, dynamic: u64) -> Result<(), Error> {
     const DT_NULL: u64 = 0;
     const DT_RELA: u64 = 7;
     const DT_RELASZ: u64 = 8;
-    const R_X86_64_RELATIVE: u32 = 8;
     let (mut table, mut size) = (0u64, 0u64);
     let mut entry = (base + dynamic) as *const u64;
     loop {
@@ -160,7 +166,7 @@ unsafe fn apply_relocations(base: u64, dynamic: u64) -> Result<(), Error> {
     for index in 0..(size / 24) {
         let record = (base + table + index * 24) as *const u64;
         let (offset, info, addend) = unsafe { (record.read(), record.add(1).read(), record.add(2).read()) };
-        if info as u32 != R_X86_64_RELATIVE {
+        if info as u32 != HOST.1 {
             return Err(Error::UnsupportedRelocation(info as u32));
         }
         unsafe { ((base + offset) as *mut u64).write(base + addend) };

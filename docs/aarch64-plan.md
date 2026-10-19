@@ -38,9 +38,12 @@ mailbox, SD) about 3-4k more. The large x86 drivers are simply not needed.
 
 - **M0 - arch split (largely done 2026-10-19).** Done: x86-only modules moved to `kernel/src/arch/x86_64/` and re-exported at the crate root; `crate::timer` is the neutral system timer; PCI config access is `crate::pci_config` (x86: ports 0xCF8/0xCFC). Left, best done with `cargo check --target aarch64-unknown-none-softfloat` as the guide (221 errors at the start of M1): neutral names for interrupt enable/sleep/halt, `paging::map_device`/`is_mapped`, `msi::*` and the CPU id; `cfg`-gating the PC-only drivers (PS/2, VGA text, RTL8139/8168, 3C905, e1000, HDA, AHCI, EHCI/OHCI, RTC/PIT in `clock.rs`, `power`, `diag`, COM2-4 in `uart.rs`), which sit inside enum dispatch in `nic.rs`, `block.rs`, `storage.rs` and `term.rs`.
   `serial`, `barrier`, `pci config`). No behaviour change; `make test` must stay green. This is the risky refactor, do it first.
-- **M1 - core on QEMU virt.** `aarch64-fos-kernel` target, entry from the UEFI loader, EL1, MMU with identity map (kernel text RO/X, rest
-  NX, device memory attribute for MMIO), exception vectors, GICv3, generic timer (`micros()` from `CNTVCT`), PL011 console, framebuffer
-  from GOP. Shell runs; `hello` tape runs.
+- **M1 - core on QEMU virt (first step done 2026-10-19).** Done: the loader builds for `aarch64-unknown-uefi` and boots under AAVMF (it syncs the
+  instruction cache and allocates the kernel as LoaderCode); `abi::elf` accepts the host CPU's ELF machine and RELATIVE relocation;
+  `kernel/src/main.rs` dispatches to `main_x86_64.rs` or `main_aarch64.rs`; a minimal aarch64 kernel (`arch/aarch64/`: `_start`, PL011) prints its BootInfo;
+  `make test-aarch64-boot` (image: `make image-aarch64`). Left: exception vectors, MMU (take over from the firmware's map), GICv3, generic timer,
+  framebuffer from GOP, then growing the module list (log, fosfs, shell) until `cargo check` shows no `cfg` gaps. The UART base is the QEMU one
+  (`pl011::QEMU_VIRT_BASE`); the Pi's comes from the SPCR/DT tables.
 - **M2 - tape ABI on aarch64.** `targets/aarch64-fos-tape.json` (hard-float), shared `tapes/tape.ld`, tape ELF loader checks `e_machine`,
   `tools/stamp_tape.py` and `build_image.py` learn the architecture. `make test-aarch64-*` mirrors the key tests.
 - **M3 - PCIe + xHCI + USB keyboard/storage on QEMU.** PCI through ECAM, MSI via GIC ITS or legacy SPI, reuse `xhci.rs` with barriers and

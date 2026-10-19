@@ -28,10 +28,32 @@ pub enum Error {
 pub fn load(boot: &BootServices, image: &[u8]) -> Result<LoadedKernel, Error> {
     let span = fosfor_abi::elf::span(image).map_err(Error::Elf)? as u64;
     let mut base = 0u64;
-    let status = (boot.allocate_pages)(uefi::ALLOCATE_ANY_PAGES, uefi::LOADER_DATA, (span / 4096) as usize, &mut base);
+    // aarch64 firmware may map LoaderData no-execute; the kernel image is code the firmware must allow to run.
+    #[cfg(target_arch = "aarch64")]
+    let memory_type = uefi::LOADER_CODE;
+    #[cfg(not(target_arch = "aarch64"))]
+    let memory_type = uefi::LOADER_DATA;
+    let status = (boot.allocate_pages)(uefi::ALLOCATE_ANY_PAGES, memory_type, (span / 4096) as usize, &mut base);
     if status != uefi::SUCCESS {
         return Err(Error::PagesUnavailable { status });
     }
     let entry = unsafe { fosfor_abi::elf::load(image, base) }.map_err(Error::Elf)?;
+    sync_instruction_cache(base, span);
     Ok(LoadedKernel { entry, base, size: span })
 }
+
+/// The loader wrote the kernel's code through the data cache; the CPU fetches instructions through its own. Clean the data
+/// cache to the point of unification, invalidate the instruction cache and flush the pipeline, or the jump may run stale bytes.
+#[cfg(target_arch = "aarch64")]
+fn sync_instruction_cache(start: u64, length: u64) {
+    const LINE: u64 = 64;
+    let mut address = start & !(LINE - 1);
+    while address < start + length {
+        unsafe { core::arch::asm!("dc cvau, {}", in(reg) address, options(nostack)) };
+        address += LINE;
+    }
+    unsafe { core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack)) };
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn sync_instruction_cache(_start: u64, _length: u64) {}

@@ -25,14 +25,25 @@ pub struct Console {
 
 static mut CONSOLE: Console = Console { text_out: core::ptr::null_mut() };
 
+// COM1 is an x86 I/O port; elsewhere the firmware console is the only output (MIRROR_TO_COM1 is off anyway).
+#[cfg(target_arch = "x86_64")]
 fn outb(port: u16, value: u8) {
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
 }
 
+#[cfg(target_arch = "x86_64")]
 fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)) };
     value
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn outb(_port: u16, _value: u8) {}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn inb(_port: u16) -> u8 {
+    0x20
 }
 
 /// 115200 baud, 8 data bits, no parity, one stop bit, FIFOs on: the settings the

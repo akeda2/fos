@@ -10,3 +10,7 @@ json-target-spec = true
 # A position-independent executable: the loader picks the physical address the
 # kernel lands at and applies its R_X86_64_RELATIVE relocations (v2/loader/src/elf.rs).
 rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]
+
+[target.aarch64-unknown-none-softfloat]
+# The same position-independent image as on x86; the loader applies R_AARCH64_RELATIVE relocations.
+rustflags = ["-C", "link-arg=-Tlinker-aarch64.ld", "-C", "relocation-model=pic", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro"]

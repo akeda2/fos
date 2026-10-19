@@ -70,8 +70,8 @@ def short_entry(name83: bytes, attribute: int, cluster: int, size: int) -> bytes
     )
 
 
-def build_esp(loader: bytes) -> bytes:
-    """A FAT32 volume of ESP_SECTORS sectors holding /EFI/BOOT/BOOTX64.EFI."""
+def build_esp(loader: bytes, loader_name: bytes = b"BOOTX64 EFI") -> bytes:
+    """A FAT32 volume of ESP_SECTORS sectors holding /EFI/BOOT/BOOTX64.EFI (BOOTAA64.EFI for aarch64)."""
     sectors = ESP_SECTORS
     reserved = 32
     fats = 2
@@ -127,7 +127,7 @@ def build_esp(loader: bytes) -> bytes:
     boot_dir = directory([
         short_entry(b".          ", 0x10, 4, 0),
         short_entry(b"..         ", 0x10, 3, 0),
-        short_entry(b"BOOTX64 EFI", 0x20, 5, len(loader)),
+        short_entry(loader_name, 0x20, 5, len(loader)),
     ])
 
     volume = bytearray(sectors * SECTOR)
@@ -255,7 +255,9 @@ BIOS_STAGE2_SECTORS = 24
 
 
 def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload_guid: uuid.UUID = PAYLOAD_GUID,
-                bios_stage1=None, bios_stage2=None) -> bytes:
+                bios_stage1=None, bios_stage2=None, arch: str = "x86_64") -> bytes:
+    if arch == "aarch64":
+        bios_stage1 = bios_stage2 = b""  # no BIOS boot code for a Pi
     if bios_stage1 is None and bios_stage2 is None:
         # Not told: use the BIOS boot code `make` built, if it is there, so every image the tests build is bootable by BIOS too.
         root = Path(__file__).resolve().parent.parent
@@ -278,7 +280,7 @@ def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload
 
     write_gpt(image, DISK_GUID, payload_guid, FOSFS_GUID)
 
-    esp = build_esp(loader)
+    esp = build_esp(loader, b"BOOTAA64EFI" if arch == "aarch64" else b"BOOTX64 EFI")
     image[ESP_START * SECTOR:ESP_START * SECTOR + len(esp)] = esp
     payload = build_payload(kernel)
     image[PAYLOAD_START * SECTOR:PAYLOAD_START * SECTOR + len(payload)] = payload
@@ -301,9 +303,12 @@ def main():
                         "(default: build/bios/stage1.bin if `make` has built it)")
     parser.add_argument("--bios-stage2", type=Path, help="boot/bios stage two, written into the GPT boot gap at LBA 64 "
                         "(default: build/bios/stage2.bin)")
+    parser.add_argument("--arch", choices=("x86_64", "aarch64"), default="x86_64", help="the CPU the loader and kernel are built for (names the loader BOOTAA64.EFI for aarch64; aarch64 images have no BIOS boot code)")
     parser.add_argument("--no-bios", action="store_true", help="build a UEFI-only image")
     arguments = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
+    if arguments.arch == "aarch64":
+        arguments.no_bios = True
     if not arguments.no_bios and not arguments.bios_stage1 and not arguments.bios_stage2:
         stage1, stage2 = root / "build/bios/stage1.bin", root / "build/bios/stage2.bin"
         if stage1.exists() and stage2.exists():
@@ -317,7 +322,7 @@ def main():
         files = [item for item in files if item[0] != name] + [(name, Path(path).read_bytes())]
     arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files, arguments.label, arguments.payload_guid,
                                                 arguments.bios_stage1.read_bytes() if arguments.bios_stage1 else b"",
-                                                arguments.bios_stage2.read_bytes() if arguments.bios_stage2 else b""))
+                                                arguments.bios_stage2.read_bytes() if arguments.bios_stage2 else b"", arguments.arch))
     print(f"wrote {arguments.output}")
 
 

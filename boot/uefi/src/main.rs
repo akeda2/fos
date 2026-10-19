@@ -180,7 +180,11 @@ fn exit_and_jump(image: Handle, boot: &uefi::BootServices, map_buffer: *mut u8, 
             // The firmware is gone. The kernel is entered like a C function with the
             // BootInfo pointer in rdi (System V ABI), in the long mode and identity
             // mapping the firmware left; it replaces both immediately.
+            #[cfg(target_arch = "x86_64")]
             let kernel: extern "sysv64" fn(*const BootInfo) -> ! = unsafe { core::mem::transmute(entry as usize) };
+            // aarch64: AAPCS64, the BootInfo pointer in x0, MMU on with the firmware's identity map, interrupts masked below.
+            #[cfg(target_arch = "aarch64")]
+            let kernel: extern "C" fn(*const BootInfo) -> ! = unsafe { core::mem::transmute(entry as usize) };
             kernel(info)
         }
     }
@@ -295,13 +299,24 @@ fn describe_acpi(table: &SystemTable) -> u64 {
     root as u64
 }
 
+fn halt() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("hlt")
+    };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("wfi")
+    };
+}
+
 /// Reports a problem the loader cannot recover from and stops (boot services are
 /// still alive when this is called, so the message reaches the console).
 fn fatal(message: &str) -> ! {
     println!();
     println!("Fosfor OS loader FATAL: {message}");
     loop {
-        unsafe { core::arch::asm!("hlt") };
+        halt();
     }
 }
 
@@ -309,6 +324,6 @@ fn fatal(message: &str) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     println!("\nFosfor OS loader PANIC: {info}");
     loop {
-        unsafe { core::arch::asm!("hlt") };
+        halt();
     }
 }
