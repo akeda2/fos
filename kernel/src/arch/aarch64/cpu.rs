@@ -24,3 +24,16 @@ pub fn interrupts_enable() {
 pub fn interrupts_disable() {
     unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)) };
 }
+
+/// Masks interrupts and returns whether they were enabled, for `interrupts_restore` (a critical section).
+pub fn interrupts_save_and_disable() -> bool {
+    let was = interrupts_enabled();
+    interrupts_disable();
+    was
+}
+
+pub fn interrupts_restore(was: bool) {
+    if was {
+        interrupts_enable();
+    }
+}

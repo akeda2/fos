@@ -38,7 +38,7 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                 ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-device", "ramfb",
                  "-serial", "stdio", "-no-reboot", "-monitor", f"unix:{monitor},server,nowait",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
-                 "-drive", f"file={image},format=raw,if=none,id=boot,snapshot=on", "-device", "virtio-blk-pci,drive=boot"],
+                 "-drive", f"file={image},format=raw,if=none,id=boot,snapshot=on", "-device", "virtio-blk-pci,drive=boot", "-device", "qemu-xhci", "-device", "usb-kbd"],
                 stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT)
             try:
                 def wait_for(count: int) -> None:
@@ -101,6 +101,7 @@ def main():
     check("Fosfor OS (aarch64 port)" in text and "virtio-blk" in text.split("version", 1)[-1], "the shell reads the serial console and runs `version` and `disks`", text)
     check(re.search(r"\d+ file\(s\)\.", text) is not None and re.search(r"Physical memory: \d+ MiB managed, \d+ MiB free\.\s+fos> ", text) is not None, "the shell lists FOSFS files and answers `mem`", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
+    check("USB: 1 xHCI controller(s)." in text and re.search(r"USB keyboard 0627:0001 on port \d+ .*: ready\.", text) is not None, "the xHCI controller comes up and enumerates the USB keyboard", text)
     print("aarch64 boot: all checks passed")
 
 

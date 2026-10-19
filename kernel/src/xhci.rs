@@ -17,7 +17,9 @@
 //! 4 KiB host pages. All memory comes from the physical allocator below 4 GiB, so a
 //! 32-bit-DMA controller and a 64-bit one behave the same.
 
-use crate::{apic, memory, paging, pci, timer};
+#[cfg(target_arch = "x86_64")]
+use crate::apic;
+use crate::{memory, paging, pci, timer};
 
 pub const MAX_CONTROLLERS: usize = 4;
 pub const MAX_SLOTS: usize = 16;
@@ -219,6 +221,7 @@ fn write64(address: usize, value: u64) {
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
     let start = timer::ticks();
     loop {
+        #[cfg(target_arch = "x86_64")]
         crate::debug::pet();
         if condition() {
             return true;
@@ -396,9 +399,11 @@ fn drain(index: usize) {
             state.cycle = !state.cycle;
         }
         consumed = true;
-        if !crate::usb_audio::irq_event(index, &trb) {
-            soft_push(index, trb);
+        #[cfg(target_arch = "x86_64")]
+        if crate::usb_audio::irq_event(index, &trb) {
+            continue;
         }
+        soft_push(index, trb);
     }
     if consumed {
         let dequeue = state.base + state.index as u64 * TRB_BYTES;
@@ -407,6 +412,7 @@ fn drain(index: usize) {
 }
 
 /// The MSI handler: acknowledge the interrupt (IMAN.IP and USBSTS.EINT are write-1-to-clear), then drain.
+#[cfg(target_arch = "x86_64")]
 fn interrupt(index: usize) {
     let state = unsafe { (*core::ptr::addr_of!(EVENTS))[index] };
     if !state.ready {
@@ -445,6 +451,7 @@ fn interrupt(index: usize) {
 /// completion must raise the interrupt); interrupt moderation is set to 1 ms so a high-speed isochronous
 /// stream's 8,000 completions per second cost about 1,000 interrupts. A controller that fails stays in
 /// the polled mode, where the foreground drains the ring itself as before.
+#[cfg(target_arch = "x86_64")]
 pub fn enable_interrupts_all(no_msi: bool) {
     for index in 0..count() {
         let Some(controller) = controller(index) else { continue };
@@ -686,6 +693,7 @@ impl Controller {
     /// the plain-MSI self-test fails or the capability is missing (QEMU's xHCI has only MSI-X; the NEC
     /// uPD720200 on the Sandy Bridge machine has both but only MSI-X works, as Linux's xhci also tries
     /// it first). Returns the vector, or why the controller stays polled.
+    #[cfg(target_arch = "x86_64")]
     pub fn enable_interrupts(&mut self) -> Result<u8, &'static str> {
         let msi = self.pci.find_capability(0x05).is_some();
         let msix = self.pci.find_capability(0x11).is_some();
@@ -751,7 +759,8 @@ impl Controller {
     fn wait_event(&mut self, ticks: u64, wanted: impl Fn(&Trb) -> bool) -> Result<Trb, Error> {
         let start = timer::ticks();
         loop {
-            crate::debug::pet();
+            #[cfg(target_arch = "x86_64")]
+        crate::debug::pet();
             while let Some(event) = self.next_event() {
                 if wanted(&event) {
                     return Ok(event);

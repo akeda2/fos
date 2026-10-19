@@ -13,7 +13,9 @@ mod memory;
 mod pci;
 mod shell;
 mod storage;
+mod usb_kbd;
 mod virtio_blk;
+mod xhci;
 
 /// `println!` goes to the PL011 and, once it exists, the framebuffer; the boot log joins as its module is ported.
 pub fn print(arguments: core::fmt::Arguments) {
@@ -122,6 +124,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     unsafe {
         core::ptr::read_volatile(0x10 as *const u64);
     }
+    println!("USB: {} keyboard(s) found.", usb_kbd::init());
     cpu::interrupts_enable();
     shell::run()
 }
