@@ -286,12 +286,24 @@ fn load(root: u64) {
             // MMU off while MAIR/TCR/TTBR0 change: the firmware's TCR may use another T0SZ than ours, and
             // the window between the writes would walk its tables with the wrong geometry. No memory access
             // inside the block (everything is in registers), so the cache state does not matter.
+            // Probes: 4x8 white pixels at y=28, x=380/400/420/440, stored straight to the framebuffer (the stores
+            // work with the MMU off too): before the switch, MMU off, registers written, MMU back on.
+            let (p0, pitch) = super::early::pixel_address(380, 28);
+            let (p1, _) = super::early::pixel_address(400, 28);
+            let (p2, _) = super::early::pixel_address(420, 28);
+            let (p3, _) = super::early::pixel_address(440, 28);
             core::arch::asm!(
+                "mov {w:w}, #0xffff", "movk {w:w}, #0xff, lsl #16",
+                "mov {c}, #8", "2: stp {w:w}, {w:w}, [{p0}]", "stp {w:w}, {w:w}, [{p0}, #8]", "add {p0}, {p0}, {pitch}", "subs {c}, {c}, #1", "b.ne 2b",
                 "mrs {s}, sctlr_el2", "bic {t}, {s}, #1", "msr sctlr_el2, {t}", "isb",
+                "mov {c}, #8", "2: stp {w:w}, {w:w}, [{p1}]", "stp {w:w}, {w:w}, [{p1}, #8]", "add {p1}, {p1}, {pitch}", "subs {c}, {c}, #1", "b.ne 2b",
                 "msr mair_el2, {mair}", "msr tcr_el2, {tcr}", "msr ttbr0_el2, {root}", "isb",
                 "tlbi alle2", "dsb nsh", "isb",
+                "mov {c}, #8", "2: stp {w:w}, {w:w}, [{p2}]", "stp {w:w}, {w:w}, [{p2}, #8]", "add {p2}, {p2}, {pitch}", "subs {c}, {c}, #1", "b.ne 2b",
                 "msr sctlr_el2, {s}", "isb",
-                s = out(reg) _, t = out(reg) _,
+                "mov {c}, #8", "2: stp {w:w}, {w:w}, [{p3}]", "stp {w:w}, {w:w}, [{p3}, #8]", "add {p3}, {p3}, {pitch}", "subs {c}, {c}, #1", "b.ne 2b",
+                s = out(reg) _, t = out(reg) _, w = out(reg) _, c = out(reg) _,
+                p0 = inout(reg) p0 => _, p1 = inout(reg) p1 => _, p2 = inout(reg) p2 => _, p3 = inout(reg) p3 => _, pitch = in(reg) pitch,
                 mair = in(reg) MAIR, tcr = in(reg) tcr, root = in(reg) root, options(nostack)
             );
         } else {
