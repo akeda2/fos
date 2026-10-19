@@ -121,4 +121,5 @@ The Pi 4 boots pftf edk2 -> our loader -> kernel, shows the boot log, runs the s
   Works for xHCI on hardware. Never use exclusive atomics on that memory.
 - **USB:** the Pi's ports sit behind a VIA hub (2109:3431) on the VL805; `usb_hub.rs` now builds for aarch64 against `usb_kbd.rs`
   and the keyboard is found. xHCI is polled (no PCIe MSI yet).
-- **Still missing on the Pi:** SD card (so no FOSFS, no tapes), Genet NIC, interrupts for xHCI, Pi 5.
+- **SD card (`sdhci.rs`, written 2026-10-19, tested on QEMU `sdhci-pci` only):** standard SDHCI by polling and PIO, 32-bit register accesses only (the Arasan EMMC2 at 0xFE340000, like Linux's `sdhci-iproc`, dislikes 8/16-bit ones), card reinitialised from scratch (CMD0/8/ACMD41/2/3/9/7, 4-bit, 25 MHz), SDSC and SDHC. Shell `cp SRC DST` and `cat diskN/NAME` exercise it (`make test-aarch64-boot` boots virtio and reads/writes a second SD copy). **Unverified on the Pi:** the 100 MHz base clock, 3.3 V power and the reset of a card the firmware left running.
+- **Still missing on the Pi:** Genet NIC, interrupts for xHCI, Pi 5.

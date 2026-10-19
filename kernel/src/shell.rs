@@ -30,7 +30,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT keymap us|sv run NAME [ARGS]\ndmesg usb acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST echo TEXT keymap us|sv run NAME [ARGS]\ndmesg usb acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -55,6 +55,7 @@ fn execute(line: &str) {
         }
         "ls" => list(rest),
         "cat" => cat(rest),
+        "cp" => copy(rest),
         "run" => run_tape(rest),
         "keymap" => match crate::usb_kbd::layout_named(rest) {
             Some(layout) => crate::usb_kbd::set_layout(layout),
@@ -81,6 +82,36 @@ fn volume(argument: &str) -> Option<fosfs::Volume> {
     storage::volume_on(number).ok()
 }
 
+/// Splits `diskN/NAME` into its volume and the file name; a plain name is on the boot volume.
+fn locate(name: &str) -> Option<(fosfs::Volume, &str)> {
+    match name.split_once('/') {
+        Some((disk, file)) => Some((volume(disk)?, file)),
+        None => Some((storage::boot_volume()?, name)),
+    }
+}
+
+/// `cp SRC DST`: copies a file (up to 64 KiB) between volumes, `diskN/NAME` or a boot-volume name.
+fn copy(rest: &str) {
+    static mut BUFFER: [u8; 65536] = [0; 65536];
+    let Some((from, to)) = rest.split_once(' ') else {
+        crate::println!("cp: cp SRC DST (names are NAME or diskN/NAME).");
+        return;
+    };
+    let (Some((source, source_name)), Some((target, target_name))) = (locate(from.trim()), locate(to.trim())) else {
+        crate::println!("cp: no FOSFS volume there.");
+        return;
+    };
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
+    match source.read(source_name.as_bytes(), buffer) {
+        Ok(Some(length)) => match target.write(target_name.as_bytes(), &buffer[..length]) {
+            Ok(()) => crate::println!("cp: {length} bytes to {to}."),
+            Err(error) => crate::println!("cp: cannot write {to} ({error:?})."),
+        },
+        Ok(None) => crate::println!("cp: {from}: no such file."),
+        Err(error) => crate::println!("cp: {from}: {error:?} (files over 64 KiB are not copied)."),
+    }
+}
+
 fn list(argument: &str) {
     let Some(volume) = volume(argument) else {
         crate::println!("ls: no FOSFS volume there (use `ls` or `ls diskN`).");
@@ -100,8 +131,8 @@ fn list(argument: &str) {
 /// Shows up to 16 KiB of a file as text (non-printable bytes as dots).
 fn cat(name: &str) {
     static mut BUFFER: [u8; 16384] = [0; 16384];
-    let Some(volume) = volume("") else {
-        crate::println!("cat: no boot volume.");
+    let Some((volume, name)) = locate(name) else {
+        crate::println!("cat: no such volume.");
         return;
     };
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };

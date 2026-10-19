@@ -18,6 +18,8 @@ pub enum Backend {
     Usb(usize),
     #[cfg(target_arch = "aarch64")]
     Virtio(crate::virtio_blk::Drive),
+    #[cfg(target_arch = "aarch64")]
+    Sd(crate::sdhci::Drive),
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +111,8 @@ pub fn read(disk: usize, lba: u64, buffer: &mut [u8]) -> Result<(), Error> {
         Backend::Usb(device) => usb_storage::read(device, lba, buffer).map_err(|_| Error::Device),
         #[cfg(target_arch = "aarch64")]
         Backend::Virtio(drive) => drive.read(lba, buffer).map_err(|_| Error::Device),
+        #[cfg(target_arch = "aarch64")]
+        Backend::Sd(drive) => drive.read(lba, buffer).map_err(|_| Error::Device),
     }
 }
 
@@ -137,5 +141,7 @@ pub fn write(disk: usize, lba: u64, buffer: &[u8]) -> Result<(), Error> {
         Backend::Usb(device) => usb_storage::write(device, lba, buffer).map_err(|_| Error::Device),
         #[cfg(target_arch = "aarch64")]
         Backend::Virtio(drive) => drive.write(lba, buffer).map_err(|_| Error::Device),
+        #[cfg(target_arch = "aarch64")]
+        Backend::Sd(drive) => drive.write(lba, buffer).map_err(|_| Error::Device),
     }
 }

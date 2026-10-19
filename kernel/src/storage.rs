@@ -139,6 +139,10 @@ pub fn init(info: &BootInfo) {
             let origin = format_origin("virtio", index, None);
             block::register(Backend::Virtio(drive), drive.sectors, drive.model(), origin.as_str());
         });
+        crate::sdhci::init_all(|drive, index| {
+            let origin = format_origin("SD", index, None);
+            block::register(Backend::Sd(drive), drive.sectors, drive.model(), origin.as_str());
+        });
         (0, 0)
     };
     if block::count() == 0 {
