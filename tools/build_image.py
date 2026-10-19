@@ -61,17 +61,60 @@ def fat_date_time():
     return date, time
 
 
-def short_entry(name83: bytes, attribute: int, cluster: int, size: int) -> bytes:
+def short_entry(name83: bytes, attribute: int, cluster: int, size: int, case_bits: int = 0) -> bytes:
     assert len(name83) == 11
     date, time = fat_date_time()
     return struct.pack(
         "<11sBBBHHHHHHHI",
-        name83, attribute, 0, 0, time, date, date, cluster >> 16, time, date, cluster & 0xFFFF, size,
+        name83, attribute, case_bits, 0, time, date, date, cluster >> 16, time, date, cluster & 0xFFFF, size,
     )
 
 
-def build_esp(loader: bytes, loader_name: bytes = b"BOOTX64 EFI") -> bytes:
-    """A FAT32 volume of ESP_SECTORS sectors holding /EFI/BOOT/BOOTX64.EFI (BOOTAA64.EFI for aarch64)."""
+def short_name(name: str, taken: set):
+    """(11-byte short name, NT case bits, long name needed) for `name`. A name that fits 8.3 with an all-upper or all-lower base
+    and extension is stored as itself (the NT case bits carry the lower case); any other gets a `BASE~N` short name and long-name
+    entries."""
+    base, dot, extension = name.rpartition(".") if "." in name else (name, "", "")
+    ok = lambda text: all(c.isalnum() and c.isascii() or c in "_-$~!#%&'()@^`{}" for c in text)
+    fits = 0 < len(base) <= 8 and len(extension) <= 3 and ok(base) and ok(extension)
+    same_case = lambda text: text == text.upper() or text == text.lower()
+    if fits and same_case(base) and same_case(extension):
+        bits = (0x08 if base != base.upper() else 0) | (0x10 if extension != extension.upper() else 0)
+        return (base.upper().ljust(8) + extension.upper().ljust(3)).encode(), bits, False
+    stem = "".join(c if ok(c) else "_" for c in base.upper().replace(".", ""))[:6] or "FILE"
+    for number in range(1, 1000):
+        candidate = (stem + f"~{number}").ljust(8) + "".join(c if ok(c) else "_" for c in extension.upper())[:3].ljust(3)
+        if candidate not in taken:
+            return candidate.encode(), 0, True
+    raise SystemExit(f"cannot make a short name for {name}")
+
+
+def long_entries(name: str, short: bytes) -> list:
+    """VFAT long-name directory entries for `name` (in on-disk order: last part first)."""
+    checksum = 0
+    for byte in short:
+        checksum = ((checksum >> 1) | ((checksum & 1) << 7)) + byte & 0xFF
+    units = list(name.encode("utf-16-le"))
+    chars = [units[i] | units[i + 1] << 8 for i in range(0, len(units), 2)]
+    chars = chars + ([0] if len(chars) % 13 else []) + [0xFFFF] * (-(len(chars) + (1 if len(chars) % 13 else 0)) % 13)
+    parts = [chars[i:i + 13] for i in range(0, len(chars), 13)]
+    entries = []
+    for index, part in enumerate(parts, start=1):
+        order = index | (0x40 if index == len(parts) else 0)
+        entry = bytearray(32)
+        entry[0] = order
+        entry[11] = 0x0F
+        entry[13] = checksum
+        for slot, offset in enumerate((1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)):
+            struct.pack_into("<H", entry, offset, part[slot])
+        entries.append(bytes(entry))
+    return entries[::-1]
+
+
+def build_esp(loader: bytes, loader_name: bytes = b"BOOTX64 EFI", extras=None) -> bytes:
+    """A FAT32 volume of ESP_SECTORS sectors holding /EFI/BOOT/BOOTX64.EFI (BOOTAA64.EFI for aarch64), plus `extras`: a dict of
+    path -> bytes (`overlays/x.dtbo`; long names are written as VFAT entries) for a board whose own firmware reads the first
+    FAT volume, like the Raspberry Pi 4's edk2 files. Directories and files are laid out one 512-byte cluster per sector."""
     sectors = ESP_SECTORS
     reserved = 32
     fats = 2
@@ -87,6 +130,65 @@ def build_esp(loader: bytes, loader_name: bytes = b"BOOTX64 EFI") -> bytes:
     assert clusters >= 65525, "too few clusters for FAT32"
     data_start = reserved + fats * fat_sectors
 
+    # The tree: nested dicts for directories, bytes for files; EFI first so the loader keeps its historical clusters.
+    tree = {}
+    loader_file = (loader_name[:8].decode().strip() + "." + loader_name[8:].decode().strip())
+    tree["EFI"] = {"BOOT": {loader_file: loader}}
+    for path, data in sorted((extras or {}).items()):
+        parts = path.split("/")
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = data
+
+    # Directory entries per directory: (long entries, short entry template without cluster) built after clusters are known.
+    class Dir:
+        def __init__(self, children, parent):
+            self.children, self.parent = children, parent
+            self.shorts, taken = {}, set()
+            self.count = 0 if parent is None else 2
+            for child in children:
+                short, bits, long = short_name(child, taken)
+                taken.add(short.decode())
+                self.shorts[child] = (short, bits, long)
+                self.count += 1 + (len(long_entries(child, short)) if long else 0)
+            self.sectors = max(1, -(-self.count * 32 // SECTOR))
+            self.cluster = 0
+
+    dirs = []
+
+    def walk(node, parent):
+        directory = Dir(node, parent)
+        dirs.append(directory)
+        directory.nodes = {}
+        for name, child in node.items():
+            if isinstance(child, dict):
+                directory.nodes[name] = walk(child, directory)
+        return directory
+
+    root_dir = walk(tree, None)
+    next_cluster = 2
+    for directory in dirs:
+        directory.cluster = next_cluster
+        next_cluster += directory.sectors
+    files = []
+
+    def collect(directory):
+        for name, child in directory.children.items():
+            if isinstance(child, dict):
+                collect(directory.nodes[name])
+            else:
+                files.append((directory, name, child))
+
+    collect(root_dir)
+    placement = {}
+    for directory, name, data in files:
+        count = max(1, -(-len(data) // SECTOR))
+        placement[(id(directory), name)] = (next_cluster, count)
+        next_cluster += count
+    assert next_cluster - 2 <= clusters, "the ESP is too small for the extra files"
+    used = next_cluster - 2
+
     # --- boot sector, FSInfo, backups ---
     boot = bytearray(SECTOR)
     boot[0:3] = b"\xEB\x58\x90"
@@ -100,53 +202,51 @@ def build_esp(loader: bytes, loader_name: bytes = b"BOOTX64 EFI") -> bytes:
     struct.pack_into("<I", fsinfo, 0, 0x41615252)
     struct.pack_into("<I", fsinfo, 484, 0x61417272)
     # Free cluster count and the next one to try, as a mounting OS would compute them.
-    file_clusters_used = max(1, (len(loader) + SECTOR - 1) // SECTOR)
-    struct.pack_into("<II", fsinfo, 488, clusters - 3 - file_clusters_used, 5 + file_clusters_used)
+    struct.pack_into("<II", fsinfo, 488, clusters - used, next_cluster)
     struct.pack_into("<I", fsinfo, 508, 0xAA550000)
 
-    # --- allocation: root = cluster 2, EFI = 3, BOOT = 4, file from 5 ---
-    file_clusters = max(1, (len(loader) + SECTOR - 1) // SECTOR)
     fat = bytearray(fat_sectors * SECTOR)
     struct.pack_into("<II", fat, 0, 0x0FFFFFF8, 0x0FFFFFFF)
     end_of_chain = 0x0FFFFFFF
-    for cluster in (2, 3, 4):
-        struct.pack_into("<I", fat, cluster * 4, end_of_chain)
-    for index in range(file_clusters):
-        cluster = 5 + index
-        struct.pack_into("<I", fat, cluster * 4, cluster + 1 if index + 1 < file_clusters else end_of_chain)
 
-    def directory(entries) -> bytes:
-        return b"".join(entries).ljust(SECTOR, b"\0")
-
-    root = directory([short_entry(b"EFI        ", 0x10, 3, 0)])
-    efi = directory([
-        short_entry(b".          ", 0x10, 3, 0),
-        short_entry(b"..         ", 0x10, 0, 0),
-        short_entry(b"BOOT       ", 0x10, 4, 0),
-    ])
-    boot_dir = directory([
-        short_entry(b".          ", 0x10, 4, 0),
-        short_entry(b"..         ", 0x10, 3, 0),
-        short_entry(loader_name, 0x20, 5, len(loader)),
-    ])
+    def chain(first, count):
+        for index in range(count):
+            cluster = first + index
+            struct.pack_into("<I", fat, cluster * 4, cluster + 1 if index + 1 < count else end_of_chain)
 
     volume = bytearray(sectors * SECTOR)
     volume[0:SECTOR] = boot
     volume[SECTOR:2 * SECTOR] = fsinfo
     volume[6 * SECTOR:7 * SECTOR] = boot
     volume[7 * SECTOR:8 * SECTOR] = fsinfo
-    for copy in range(fats):
-        start = (reserved + copy * fat_sectors) * SECTOR
-        volume[start:start + len(fat)] = fat
 
     def put_cluster(cluster: int, data: bytes):
         offset = (data_start + cluster - 2) * SECTOR
         volume[offset:offset + len(data)] = data
 
-    put_cluster(2, root)
-    put_cluster(3, efi)
-    put_cluster(4, boot_dir)
-    put_cluster(5, loader.ljust(file_clusters * SECTOR, b"\0"))
+    for directory in dirs:
+        chain(directory.cluster, directory.sectors)
+        entries = []
+        if directory.parent is not None:
+            parent = 0 if directory.parent is root_dir else directory.parent.cluster
+            entries += [short_entry(b".          ", 0x10, directory.cluster, 0), short_entry(b"..         ", 0x10, parent, 0)]
+        for name, child in directory.children.items():
+            short, bits, long = directory.shorts[name]
+            if long:
+                entries += long_entries(name, short)
+            if isinstance(child, dict):
+                entries.append(short_entry(short, 0x10, directory.nodes[name].cluster, 0, bits))
+            else:
+                first, count = placement[(id(directory), name)]
+                entries.append(short_entry(short, 0x20, first, len(child), bits))
+        put_cluster(directory.cluster, b"".join(entries).ljust(directory.sectors * SECTOR, b"\0"))
+    for directory, name, data in files:
+        first, count = placement[(id(directory), name)]
+        chain(first, count)
+        put_cluster(first, data.ljust(count * SECTOR, b"\0"))
+    for copy in range(fats):
+        start = (reserved + copy * fat_sectors) * SECTOR
+        volume[start:start + len(fat)] = fat
     return bytes(volume)
 
 
@@ -255,7 +355,7 @@ BIOS_STAGE2_SECTORS = 24
 
 
 def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload_guid: uuid.UUID = PAYLOAD_GUID,
-                bios_stage1=None, bios_stage2=None, arch: str = "x86_64") -> bytes:
+                bios_stage1=None, bios_stage2=None, arch: str = "x86_64", esp_files=None) -> bytes:
     if arch == "aarch64":
         bios_stage1 = bios_stage2 = b""  # no BIOS boot code for a Pi
     if bios_stage1 is None and bios_stage2 is None:
@@ -280,7 +380,7 @@ def build_image(loader: bytes, kernel: bytes, files=(), label: str = "", payload
 
     write_gpt(image, DISK_GUID, payload_guid, FOSFS_GUID)
 
-    esp = build_esp(loader, b"BOOTAA64EFI" if arch == "aarch64" else b"BOOTX64 EFI")
+    esp = build_esp(loader, b"BOOTAA64EFI" if arch == "aarch64" else b"BOOTX64 EFI", esp_files)
     image[ESP_START * SECTOR:ESP_START * SECTOR + len(esp)] = esp
     payload = build_payload(kernel)
     image[PAYLOAD_START * SECTOR:PAYLOAD_START * SECTOR + len(payload)] = payload
@@ -304,6 +404,8 @@ def main():
     parser.add_argument("--bios-stage2", type=Path, help="boot/bios stage two, written into the GPT boot gap at LBA 64 "
                         "(default: build/bios/stage2.bin)")
     parser.add_argument("--arch", choices=("x86_64", "aarch64"), default="x86_64", help="the CPU the loader and kernel are built for (names the loader BOOTAA64.EFI for aarch64; aarch64 images have no BIOS boot code)")
+    parser.add_argument("--esp-dir", type=Path, help="copy this directory tree into the ESP's root (the Raspberry Pi 4's edk2 firmware files: "
+                        "RPI_EFI.fd, start4.elf, config.txt, ...; its own firmware reads them from the first FAT volume)")
     parser.add_argument("--no-bios", action="store_true", help="build a UEFI-only image")
     arguments = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
@@ -320,9 +422,10 @@ def main():
     for spec in arguments.file:
         name, _, path = spec.partition("=")
         files = [item for item in files if item[0] != name] + [(name, Path(path).read_bytes())]
+    esp_files = {str(path.relative_to(arguments.esp_dir)): path.read_bytes() for path in sorted(arguments.esp_dir.rglob("*")) if path.is_file()} if arguments.esp_dir else None
     arguments.output.write_bytes(build_image(arguments.loader.read_bytes(), arguments.kernel.read_bytes(), files, arguments.label, arguments.payload_guid,
                                                 arguments.bios_stage1.read_bytes() if arguments.bios_stage1 else b"",
-                                                arguments.bios_stage2.read_bytes() if arguments.bios_stage2 else b"", arguments.arch))
+                                                arguments.bios_stage2.read_bytes() if arguments.bios_stage2 else b"", arguments.arch, esp_files))
     print(f"wrote {arguments.output}")
 
 

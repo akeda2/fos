@@ -78,6 +78,16 @@ display-selection property tag on real hardware). The tape side is the same for 
 (`gfx_screens`, `gfx_select` or a screen index in `gfx_*`), and `audio_screen::Screen` taking an index. This is a good reason to do
 the Pi port before dual-screen on PC.
 
+## Pi 4 SD card (M6, first cut)
+
+`make image-pi4` builds `build/fosfor-aarch64/fosfor-pi4.img`: the aarch64 image with the pftf/RPi4 edk2 release (pinned by version and
+SHA-256, `tools/fetch_rpi4_firmware.py`, kept in `build/rpi4-firmware`) copied into the ESP root (`build_image.py --esp-dir`; the ESP
+writer now handles subdirectories and VFAT long names, `fsck.vfat` is clean, and the x86 ESP is byte-identical to before). The Pi's own
+firmware reads `config.txt`, `start4.elf` and `RPI_EFI.fd` from the first FAT volume; edk2 then runs our `\EFI\BOOT\BOOTAA64.EFI`.
+A person flashes it: `sudo python3 tools/write_stick.py /dev/sdX --image build/fosfor-aarch64/fosfor-pi4.img`. **Unverified on the
+Pi:** that the Pi 4 EEPROM boots from a GPT disk's ESP (if not, a hybrid MBR entry for the ESP is the fix) and that edk2 offers
+the loader without a boot-menu step. `config.txt` has `enable_uart=1` and the PL011 on GPIO 14/15, so the serial cable shows everything.
+
 ## Pi 5 (later)
 
 Ethernet, USB and GPIO sit on the RP1 chip behind a PCIe link: a different NIC (Cadence GEM), a different xHCI, a different
