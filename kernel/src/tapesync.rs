@@ -295,7 +295,7 @@ fn ask(target: &Target, key: &[u8], state: &mut State, (local_count, file_count)
         let tape = remote.name_bytes();
         let local = state.local[..local_count].iter().find(|entry| entry.name_bytes() == tape).copied();
         let exists = state.names[..file_count].iter().zip(&state.name_lengths).any(|(known, &length)| &known[..usize::from(length)] == tape);
-        let action = tape_sync::decide(&remote, local.as_ref(), exists, abi);
+        let action = tape_sync::decide(&remote, local.as_ref(), exists, abi, tape_sync::HOST_ARCH);
         let label = core::str::from_utf8(tape).unwrap_or("?");
         if verbose {
             match (action, local) {
@@ -308,6 +308,7 @@ fn ask(target: &Target, key: &[u8], state: &mut State, (local_count, file_count)
                 (Action::Keep, _) => println!("{label:<16} ours is newer; kept"),
                 (Action::Differs, _) => println!("{label:<16} same build time, other bytes; kept"),
                 (Action::TooNew, _) => println!("{label:<16} needs tape ABI {} (this kernel has {abi}); skipped", remote.stamp.abi),
+                (Action::OtherCpu, _) => println!("{label:<16} built for another CPU; skipped"),
                 (Action::NotATape, _) => println!("{label:<16} a file of that name here is not a tape; skipped"),
                 (Action::BadName, _) | (Action::Newer, None) => println!("{label:<16} not usable; skipped"),
             }

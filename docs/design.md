@@ -1205,7 +1205,7 @@ or write it) answers `TAG_SYNC_REQUEST 0x40` (a 16-byte nonce) with a manifest a
 volume its name, size, build time, tape ABI and SHA-256, then HMAC-SHA-256 over `nonce || manifest`. The requester trusts only a
 manifest that verifies for its own nonce (so no replay), fetches files with plain NETFS and installs one only if size, SHA-256
 and stamp equal the signed entry. A *stamp* is 16 bytes in the ELF section `.fos_build`, added after linking by
-`tools/stamp_tape.py` (`make stamp-tapes`; the image and `build/fosfor/tapes/NAME` are the stamped copies, deploy those): the
+`tools/stamp_tape.py` (it also records the CPU, x86-64 or aarch64, and `tapesync` skips tapes built for another one) (`make stamp-tapes`; the image and `build/fosfor/tapes/NAME` are the stamped copies, deploy those): the
 commit time of HEAD for a clean tree (machines building one commit agree), else the build time, plus the ABI version from
 `abi/src/tape.rs`. Rules (`tape_sync::decide`): missing here is new; a newer stamp replaces; the same bytes are left; our newer or
 equal-time-different bytes are kept; a tape for a newer ABI than this kernel is skipped; a file here that is not a stamped tape

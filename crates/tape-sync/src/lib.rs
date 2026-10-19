@@ -9,7 +9,7 @@
 //!
 //! A *stamp* is 16 bytes in the ELF section `.fos_build`, added after linking by `tools/stamp_tape.py`: the build
 //! time (seconds since 1970; the commit time for a clean tree, so two machines building one commit agree), the tape
-//! ABI version it was built for, and four reserved bytes. Only files with a stamp are tapes as far as sync is concerned.
+//! ABI version and CPU it was built for, and three reserved bytes. Only files with a stamp are tapes as far as sync is concerned.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -169,13 +169,25 @@ pub fn equal(a: &[u8], b: &[u8]) -> bool {
 pub struct Stamp {
     pub build: u64,
     pub abi: u32,
+    /// The CPU the tape is built for (`ARCH_*`). Stamps made before this field existed have 0, which is x86-64.
+    pub arch: u8,
 }
+
+pub const ARCH_X86_64: u8 = 0;
+pub const ARCH_AARCH64: u8 = 1;
+
+/// The CPU this build runs on: `decide` only offers tapes for it.
+#[cfg(target_arch = "aarch64")]
+pub const HOST_ARCH: u8 = ARCH_AARCH64;
+#[cfg(not(target_arch = "aarch64"))]
+pub const HOST_ARCH: u8 = ARCH_X86_64;
 
 impl Stamp {
     pub fn encode(&self) -> [u8; STAMP_LEN] {
         let mut out = [0u8; STAMP_LEN];
         out[0..8].copy_from_slice(&self.build.to_le_bytes());
         out[8..12].copy_from_slice(&self.abi.to_le_bytes());
+        out[12] = self.arch;
         out
     }
 
@@ -183,7 +195,7 @@ impl Stamp {
         if bytes.len() != STAMP_LEN {
             return None;
         }
-        Some(Stamp { build: u64::from_le_bytes(bytes[0..8].try_into().ok()?), abi: u32::from_le_bytes(bytes[8..12].try_into().ok()?) })
+        Some(Stamp { build: u64::from_le_bytes(bytes[0..8].try_into().ok()?), abi: u32::from_le_bytes(bytes[8..12].try_into().ok()?), arch: bytes[12] })
     }
 }
 
@@ -198,7 +210,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub const EMPTY: Entry = Entry { name: [0; NAME_LEN], length: 0, stamp: Stamp { build: 0, abi: 0 }, sha256: [0; 32] };
+    pub const EMPTY: Entry = Entry { name: [0; NAME_LEN], length: 0, stamp: Stamp { build: 0, abi: 0, arch: 0 }, sha256: [0; 32] };
 
     pub fn name_bytes(&self) -> &[u8] {
         let end = self.name.iter().position(|&byte| byte == 0).unwrap_or(NAME_LEN);
@@ -217,7 +229,10 @@ pub fn encode(entries: &[Entry], key: &[u8], nonce: &[u8; NONCE_LEN], out: &mut 
         out[at..at + NAME_LEN].copy_from_slice(&entry.name);
         out[at + 16..at + 20].copy_from_slice(&entry.length.to_le_bytes());
         out[at + 20..at + 28].copy_from_slice(&entry.stamp.build.to_le_bytes());
-        out[at + 28..at + 32].copy_from_slice(&entry.stamp.abi.to_le_bytes());
+        // The manifest entry has no spare bytes: the CPU rides in bits 16-23 of the ABI word. A machine that predates
+        // it reads such a tape as built for an impossibly new ABI and skips it, which is the safe outcome.
+        let word = entry.stamp.abi | u32::from(entry.stamp.arch) << 16;
+        out[at + 28..at + 32].copy_from_slice(&word.to_le_bytes());
         out[at + 32..at + 64].copy_from_slice(&entry.sha256);
     }
     let body = HEADER_LEN + count * ENTRY_LEN;
@@ -249,10 +264,8 @@ pub fn decode(bytes: &[u8], key: &[u8], nonce: &[u8; NONCE_LEN], entries: &mut [
         let at = HEADER_LEN + index * ENTRY_LEN;
         entry.name.copy_from_slice(&bytes[at..at + NAME_LEN]);
         entry.length = u32::from_le_bytes(bytes[at + 16..at + 20].try_into().unwrap());
-        entry.stamp = Stamp {
-            build: u64::from_le_bytes(bytes[at + 20..at + 28].try_into().unwrap()),
-            abi: u32::from_le_bytes(bytes[at + 28..at + 32].try_into().unwrap()),
-        };
+        let word = u32::from_le_bytes(bytes[at + 28..at + 32].try_into().unwrap());
+        entry.stamp = Stamp { build: u64::from_le_bytes(bytes[at + 20..at + 28].try_into().unwrap()), abi: word & 0xffff, arch: (word >> 16) as u8 };
         entry.sha256.copy_from_slice(&bytes[at + 32..at + 64]);
     }
     Ok(count)
@@ -279,13 +292,18 @@ pub enum Action {
     NotATape,
     /// The name is not a valid FOSFS name.
     BadName,
+    /// Built for another CPU (an x86-64 tape offered to an ARM machine, or the reverse): it could not run here.
+    OtherCpu,
 }
 
 /// `local` is this machine's stamped entry of the same name, `local_exists` whether *any* file has that name.
-pub fn decide(remote: &Entry, local: Option<&Entry>, local_exists: bool, kernel_abi: u32) -> Action {
+pub fn decide(remote: &Entry, local: Option<&Entry>, local_exists: bool, kernel_abi: u32, kernel_arch: u8) -> Action {
     let name = remote.name_bytes();
     if name.is_empty() || name.len() > NAME_LEN || !name.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-')) {
         return Action::BadName;
+    }
+    if remote.stamp.arch != kernel_arch {
+        return Action::OtherCpu;
     }
     if remote.stamp.abi > kernel_abi {
         return Action::TooNew;
@@ -351,14 +369,14 @@ mod tests {
         let mut e = Entry::EMPTY;
         e.name[..name.len()].copy_from_slice(name.as_bytes());
         e.length = 1234;
-        e.stamp = Stamp { build, abi };
+        e.stamp = Stamp { build, abi, arch: ARCH_X86_64 };
         e.sha256 = [fill; 32];
         e
     }
 
     #[test]
     fn stamp_round_trip() {
-        let stamp = Stamp { build: 1_760_000_000, abi: 8 };
+        let stamp = Stamp { build: 1_760_000_000, abi: 8, arch: ARCH_AARCH64 };
         assert_eq!(Stamp::decode(&stamp.encode()), Some(stamp));
         assert_eq!(Stamp::decode(&[0; 15]), None);
     }
@@ -396,14 +414,24 @@ mod tests {
     #[test]
     fn decisions() {
         let theirs = entry("play", 200, 8, 1);
-        assert_eq!(decide(&theirs, None, false, 8), Action::New);
-        assert_eq!(decide(&theirs, None, true, 8), Action::NotATape);
-        assert_eq!(decide(&theirs, Some(&entry("play", 100, 8, 2)), true, 8), Action::Newer);
-        assert_eq!(decide(&theirs, Some(&entry("play", 300, 8, 2)), true, 8), Action::Keep);
-        assert_eq!(decide(&theirs, Some(&entry("play", 200, 8, 2)), true, 8), Action::Differs);
-        assert_eq!(decide(&theirs, Some(&entry("play", 100, 8, 1)), true, 8), Action::Same);
-        assert_eq!(decide(&entry("play", 200, 9, 1), None, false, 8), Action::TooNew);
-        assert_eq!(decide(&entry("Bad Name", 200, 8, 1), None, false, 8), Action::BadName);
-        assert_eq!(decide(&Entry::EMPTY, None, false, 8), Action::BadName);
+        assert_eq!(decide(&theirs, None, false, 8, ARCH_X86_64), Action::New);
+        assert_eq!(decide(&theirs, None, true, 8, ARCH_X86_64), Action::NotATape);
+        assert_eq!(decide(&theirs, Some(&entry("play", 100, 8, 2)), true, 8, ARCH_X86_64), Action::Newer);
+        assert_eq!(decide(&theirs, Some(&entry("play", 300, 8, 2)), true, 8, ARCH_X86_64), Action::Keep);
+        assert_eq!(decide(&theirs, Some(&entry("play", 200, 8, 2)), true, 8, ARCH_X86_64), Action::Differs);
+        assert_eq!(decide(&theirs, Some(&entry("play", 100, 8, 1)), true, 8, ARCH_X86_64), Action::Same);
+        assert_eq!(decide(&entry("play", 200, 9, 1), None, false, 8, ARCH_X86_64), Action::TooNew);
+        assert_eq!(decide(&entry("Bad Name", 200, 8, 1), None, false, 8, ARCH_X86_64), Action::BadName);
+        assert_eq!(decide(&Entry::EMPTY, None, false, 8, ARCH_X86_64), Action::BadName);
+        // An ARM tape is never offered to an x86 machine, nor the reverse, and the CPU survives the manifest.
+        let mut arm = entry("play", 200, 8, 1);
+        arm.stamp.arch = ARCH_AARCH64;
+        assert_eq!(decide(&arm, None, false, 8, ARCH_X86_64), Action::OtherCpu);
+        assert_eq!(decide(&arm, None, false, 8, ARCH_AARCH64), Action::New);
+        let mut out = [0u8; MANIFEST_MAX];
+        let length = encode(&[arm], b"key", &[0; NONCE_LEN], &mut out);
+        let mut back = [Entry::EMPTY; MAX_TAPES];
+        assert_eq!(decode(&out[..length], b"key", &[0; NONCE_LEN], &mut back), Ok(1));
+        assert_eq!(back[0].stamp, arm.stamp);
     }
 }

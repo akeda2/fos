@@ -190,13 +190,16 @@ kernel-aarch64:
 # Tapes for aarch64 (M2 of the plan): the portable ones, built for the built-in hard-float aarch64-unknown-none target.
 A64_TAPES := hello
 A64_TAPE_DIR := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release
+A64_TAPE_STAMPED := build/fosfor-aarch64/tapes
 
 tapes-aarch64:
 	for tape in $(A64_TAPES); do (cd tapes/$$tape && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem) || exit 1; done
+	mkdir -p $(A64_TAPE_STAMPED)
+	for tape in $(A64_TAPES); do python3 tools/stamp_tape.py $(A64_TAPE_DIR)/$$tape $(A64_TAPE_STAMPED)/$$tape || exit 1; done
 
 image-aarch64: loader-aarch64 kernel-aarch64 tapes-aarch64
 	mkdir -p $(dir $(A64_IMAGE))
-	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL) $(foreach tape,$(A64_TAPES),--file $(tape)=$(A64_TAPE_DIR)/$(tape)) --output $(A64_IMAGE)
+	python3 tools/build_image.py --arch aarch64 --loader $(A64_LOADER) --kernel $(A64_KERNEL) $(foreach tape,$(A64_TAPES),--file $(tape)=$(A64_TAPE_STAMPED)/$(tape)) --output $(A64_IMAGE)
 
 test-aarch64-boot: image-aarch64
 	python3 tools/test_aarch64_boot.py
