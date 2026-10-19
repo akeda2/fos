@@ -60,3 +60,24 @@ pub fn madt_gic(rsdp: u64) -> Option<(u64, u64)> {
     }
     Some((distributor?, cpu_interface?))
 }
+
+static mut RSDP: u64 = 0;
+
+/// Remembers the RSDP for the shell's `acpi` command.
+pub fn remember(rsdp: u64) {
+    unsafe { RSDP = rsdp };
+}
+
+/// Calls `each(signature, address, length)` for every table in the XSDT.
+pub fn list(mut each: impl FnMut([u8; 4], u64, u64)) {
+    let rsdp = unsafe { RSDP };
+    if rsdp == 0 || read::<[u8; 8]>(rsdp, 0) != *b"RSD PTR " || read::<u8>(rsdp, 15) < 2 {
+        return;
+    }
+    let xsdt: u64 = read(rsdp, 24);
+    let length: u32 = read(xsdt, 4);
+    for entry in 0..u64::from(length).saturating_sub(36) / 8 {
+        let table: u64 = read(xsdt, 36 + entry * 8);
+        each(read(table, 0), table, table_length(table));
+    }
+}

@@ -30,7 +30,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT keymap us|sv run NAME [ARGS]"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat NAME echo TEXT keymap us|sv run NAME [ARGS]\nacpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -61,6 +61,11 @@ fn execute(line: &str) {
             None => crate::println!("keymap: us or sv."),
         },
         "echo" => crate::println!("{rest}"),
+        "acpi" => crate::arch::aarch64::acpi::list(|signature, address, length| {
+            crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
+        }),
+        "peek" => peek(rest),
+        "poke" => poke(rest),
         other => crate::println!("{other}: unknown command (try `help`)."),
     }
 }
@@ -141,4 +146,39 @@ pub fn apply_settings() {
             }
         }
     }
+}
+
+fn hex(word: Option<&str>) -> Option<u64> {
+    u64::from_str_radix(word?.trim_start_matches("0x"), 16).ok()
+}
+
+/// `peek ADDR [N]`: N 32-bit words (default 4, at most 64) from a physical address, mapped as device memory on demand.
+/// A bring-up tool: an address with nothing behind it faults and the exception report says so.
+fn peek(rest: &str) {
+    let mut words = rest.split_whitespace();
+    let Some(address) = hex(words.next()).map(|address| address & !3) else {
+        crate::println!("peek ADDR [N]  (hex)");
+        return;
+    };
+    let count = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(4).clamp(1, 64);
+    crate::arch::aarch64::paging::map_device(address, count * 4);
+    for index in 0..count {
+        if index % 4 == 0 {
+            crate::print(format_args!("{}{:#012x}:", if index == 0 { "" } else { "\n" }, address + index * 4));
+        }
+        let value = unsafe { core::ptr::read_volatile((address + index * 4) as *const u32) };
+        crate::print(format_args!(" {value:08x}"));
+    }
+    crate::println!();
+}
+
+/// `poke ADDR VALUE`: one 32-bit device write.
+fn poke(rest: &str) {
+    let mut words = rest.split_whitespace();
+    let (Some(address), Some(value)) = (hex(words.next()).map(|address| address & !3), hex(words.next())) else {
+        crate::println!("poke ADDR VALUE  (hex)");
+        return;
+    };
+    crate::arch::aarch64::paging::map_device(address, 4);
+    unsafe { core::ptr::write_volatile(address as *mut u32, value as u32) };
 }

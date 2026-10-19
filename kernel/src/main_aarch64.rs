@@ -71,6 +71,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     arch::aarch64::early::mark(1);
     // Before the first line is printed: the PL011 is at the address the firmware's SPCR table gives (QEMU `virt` 0x09000000,
     // a Pi 4 0xFE201000). Printing first, to QEMU's address, would write to nothing on a Pi and show no sign of life.
+    arch::aarch64::acpi::remember(info.acpi_rsdp);
     let mut uart_from_acpi = false;
     let mut uart_from_pi4 = false;
     if info.magic == BOOT_INFO_MAGIC && info.version == BOOT_INFO_VERSION {
