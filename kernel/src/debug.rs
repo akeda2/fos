@@ -27,7 +27,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use fosfor_abi::{BootInfo, MAX_CONSECUTIVE_CRASHES, RUNNING_STOPPED, RUNNING_UP, SlotMetadata};
 
-use crate::{apic, block, fault::Frame, paging};
+use crate::{block, fault::Frame, paging, timer};
 
 /// Physical address of the crash record page (low memory, below the kernel's own
 /// allocations; reserved from the allocator in `init`).
@@ -35,8 +35,8 @@ pub const CRASH_RECORD_ADDRESS: u64 = 0x5000;
 const CRASH_MAGIC: u64 = u64::from_le_bytes(*b"FOSCRASH");
 pub const WATCHDOG_VECTOR: u64 = 240;
 /// A tape may run this long between callbacks before the watchdog suspects a hang.
-const TAPE_LIMIT_TICKS: u64 = 10 * 60 * apic::TICK_HZ;
-const GOOD_UPTIME_TICKS: u64 = 5 * 60 * apic::TICK_HZ;
+const TAPE_LIMIT_TICKS: u64 = 10 * 60 * timer::TICK_HZ;
+const GOOD_UPTIME_TICKS: u64 = 5 * 60 * timer::TICK_HZ;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -163,7 +163,7 @@ pub fn confirm_boot(watchdog_seconds: Option<u32>) {
             crate::println!("Watchdog stays off: {unclean} unclean boots in a row (a hang must not become a reboot loop).");
             crate::println!("It comes back on the next boot once this one has run five minutes.");
         } else {
-            unsafe { WATCHDOG_TICKS = u64::from(seconds.max(5)) * apic::TICK_HZ };
+            unsafe { WATCHDOG_TICKS = u64::from(seconds.max(5)) * timer::TICK_HZ };
             crate::println!("Watchdog armed: reset after {} s without progress.", seconds.max(5));
         }
     }
@@ -178,7 +178,7 @@ pub fn mark_clean_stop() {
 /// enough to be called good.
 pub fn housekeeping() {
     unsafe {
-        if CLEAR_STREAK_PENDING && !STREAK_CLEARED && apic::ticks() > GOOD_UPTIME_TICKS {
+        if CLEAR_STREAK_PENDING && !STREAK_CLEARED && timer::ticks() > GOOD_UPTIME_TICKS {
             STREAK_CLEARED = true;
             let _ = update_metadata(|metadata| metadata.unclean_boots = 0);
         }
@@ -210,7 +210,7 @@ pub fn slot_summary(print: impl Fn(core::fmt::Arguments)) {
     if ticks == 0 {
         print(format_args!("watchdog: off"));
     } else {
-        print(format_args!("watchdog: {} s", ticks / apic::TICK_HZ));
+        print(format_args!("watchdog: {} s", ticks / timer::TICK_HZ));
     }
 }
 
@@ -231,7 +231,7 @@ pub fn record_crash(frame: &Frame) {
         rflags: frame.rflags,
         rsp: frame.rsp,
         ss: frame.ss,
-        ticks: apic::ticks(),
+        ticks: timer::ticks(),
         boot_slot: u64::from(unsafe { BOOT_SLOT }),
         registers: [frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp, frame.r8],
         cr2: crate::cpu::read_cr2(),
@@ -279,7 +279,7 @@ pub fn boot_crash_count() -> u32 {
 
 /// The foreground made progress. Cheap: call it from every wait loop.
 pub fn pet() {
-    LAST_PET.store(apic::ticks(), Ordering::Relaxed);
+    LAST_PET.store(timer::ticks(), Ordering::Relaxed);
 }
 
 /// A tape starts or stops running (it gets a longer limit while running).
@@ -295,8 +295,8 @@ pub fn watchdog_tick(frame: &mut Frame) {
     if limit == 0 || unsafe { WATCHDOG_TICKS } == 0 {
         return;
     }
-    if apic::ticks().wrapping_sub(LAST_PET.load(Ordering::Relaxed)) > limit {
-        crate::println!("\nWatchdog: no progress for {} s; the CPU was at RIP {:#x}.", limit / apic::TICK_HZ, frame.rip);
+    if timer::ticks().wrapping_sub(LAST_PET.load(Ordering::Relaxed)) > limit {
+        crate::println!("\nWatchdog: no progress for {} s; the CPU was at RIP {:#x}.", limit / timer::TICK_HZ, frame.rip);
         frame.vector = WATCHDOG_VECTOR;
         frame.error = 0;
         crate::fault::fatal_reset(frame);

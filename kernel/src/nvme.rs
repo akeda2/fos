@@ -19,7 +19,7 @@
 //! drop, program the admin queue addresses and sizes, set `CC.EN` with the queue entry
 //! sizes, wait for `RDY`, then Identify and create the I/O queues with admin commands.
 
-use crate::{apic, memory, paging, pci};
+use crate::{memory, paging, pci, timer};
 
 pub const MAX_CONTROLLERS: usize = 4;
 /// Most sectors one `read`/`write` call moves (the bounce buffer's size, two pages).
@@ -73,13 +73,13 @@ fn read64(address: usize) -> u64 {
 }
 
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
-    let start = apic::ticks();
+    let start = timer::ticks();
     loop {
         crate::debug::pet();
         if condition() {
             return true;
         }
-        if apic::ticks().wrapping_sub(start) >= ticks {
+        if timer::ticks().wrapping_sub(start) >= ticks {
             return condition();
         }
         core::hint::spin_loop();

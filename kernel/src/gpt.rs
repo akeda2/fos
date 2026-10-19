@@ -107,7 +107,7 @@ fn crc32(data: &[u8]) -> u32 {
 /// so this mixes the time-stamp counter, the tick count and the caller's salt through a
 /// splitmix64 generator: not secret, only meant to make two disks formatted here differ.
 fn random_guid(salt: u64) -> [u8; 16] {
-    let mut state = unsafe { core::arch::x86_64::_rdtsc() } ^ salt.rotate_left(32) ^ crate::apic::ticks().wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut state = unsafe { core::arch::x86_64::_rdtsc() } ^ salt.rotate_left(32) ^ crate::timer::ticks().wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let mut bytes = [0u8; 16];
     for half in bytes.chunks_mut(8) {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);

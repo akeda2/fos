@@ -141,6 +141,6 @@ fn download(pipe: &mut Pipe) -> Result<(), &'static str> {
             _ => return Err("the firmware download failed"),
         }
     }
-    crate::apic::wait_ticks(10); // let the firmware start
+    crate::timer::wait_ticks(10); // let the firmware start
     Ok(())
 }

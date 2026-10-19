@@ -27,7 +27,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering, fence};
 
 use crate::e1000::{Delivery, ISR, MAX_INTERFACES};
-use crate::{apic, cpu, memory, pci};
+use crate::{apic, cpu, memory, pci, timer};
 
 pub const VENDOR_REALTEK: u16 = 0x10ec;
 pub const DEVICE_IDS: &[u16] = &[0x8168, 0x8161];
@@ -225,7 +225,7 @@ fn wait_reset(base: u16) -> bool {
     write8(base, REG_CR, CR_RST);
     for _ in 0..1_000_000u32 {
         if read8(base, REG_CR) & CR_RST == 0 {
-            apic::wait_ticks(1);
+            timer::wait_ticks(1);
             return true;
         }
         core::hint::spin_loop();
@@ -300,8 +300,8 @@ impl Rtl8168 {
         frame[6..12].copy_from_slice(&self.mac);
         frame[12..14].copy_from_slice(&[0x88, 0xb5]);
         self.send(&frame);
-        let start = apic::ticks();
-        while arrived() == before && apic::ticks().wrapping_sub(start) < 3 {
+        let start = timer::ticks();
+        while arrived() == before && timer::ticks().wrapping_sub(start) < 3 {
             core::hint::spin_loop();
         }
         arrived() != before
@@ -324,7 +324,7 @@ impl Rtl8168 {
         // `receive` when the link comes up, instead of giving up for the whole session.
         if !self.link_up() {
             self.retry = Some(*device);
-            self.retry_after = apic::ticks() + RETRY_TICKS;
+            self.retry_after = timer::ticks() + RETRY_TICKS;
             return Err("no link yet, so the self-test cannot send a frame; it is retried when the link comes up");
         }
         let mut reason = "no interrupt path passed its self-test";
@@ -369,7 +369,7 @@ impl Rtl8168 {
     /// (at most `RETRY_LIMIT` times, `RETRY_TICKS` apart, so a path that really does not work costs three short stalls).
     fn retry_interrupts(&mut self) {
         let Some(device) = self.retry else { return };
-        if self.interrupts_enabled || apic::ticks() < self.retry_after || !self.link_up() {
+        if self.interrupts_enabled || timer::ticks() < self.retry_after || !self.link_up() {
             return;
         }
         // The self-test waits for timer ticks: never run it with interrupts off.
@@ -386,7 +386,7 @@ impl Rtl8168 {
                 crate::println!("rtl8168 {}: link is up, interrupts stay polled ({reason}).", self.index + 1);
                 if self.retry_attempts < RETRY_LIMIT && !self.interrupts_enabled {
                     self.retry = Some(device);
-                    self.retry_after = apic::ticks() + RETRY_TICKS;
+                    self.retry_after = timer::ticks() + RETRY_TICKS;
                 }
             }
         }

@@ -14,7 +14,7 @@
 //! All transfers go through DMA frames below 4 GiB owned by this module, so the caller's
 //! buffer can be anywhere and a 32-bit EHCI is as happy as an xHCI.
 
-use crate::{apic, ehci, memory, xhci};
+use crate::{ehci, memory, timer, xhci};
 
 const CBW_LEN: usize = 31;
 const CSW_LEN: usize = 13;
@@ -272,7 +272,7 @@ impl Msc {
                 Err(error) => {
                     last = error;
                     if attempt < 2 {
-                        apic::wait_ticks(1);
+                        timer::wait_ticks(1);
                     }
                 }
             }
@@ -286,7 +286,7 @@ impl Msc {
             if self.command(&[0u8; 6], &mut [], true).is_ok() {
                 return true;
             }
-            apic::wait_ticks(10);
+            timer::wait_ticks(10);
         }
         false
     }

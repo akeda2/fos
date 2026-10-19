@@ -80,7 +80,7 @@ impl Device {
             let control = self.read32(capability + 4);
             if control & 3 != 0 {
                 self.write32(capability + 4, control & !3);
-                crate::apic::wait_ticks(1); // D3hot -> D0 needs 10 ms
+                crate::timer::wait_ticks(1); // D3hot -> D0 needs 10 ms
             }
         }
     }

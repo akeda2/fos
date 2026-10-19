@@ -27,7 +27,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::e1000::{Delivery, ISR, MAX_INTERFACES};
-use crate::{apic, cpu, memory, pci};
+use crate::{cpu, memory, pci, timer};
 
 pub const VENDOR_3COM: u16 = 0x10b7;
 /// 3C905 (Boomerang) 9050/9051, 3C905B 9055 and its variants, 3C905C 9200.
@@ -403,8 +403,8 @@ impl ThreeCom {
         let _ = self.command(SET_INTERRUPT_ENABLE | mask);
         let before = arrived();
         issue_command(self.io_base, REQUEST_INTERRUPT);
-        let start = apic::ticks();
-        while arrived() == before && apic::ticks().wrapping_sub(start) < 3 {
+        let start = timer::ticks();
+        while arrived() == before && timer::ticks().wrapping_sub(start) < 3 {
             core::hint::spin_loop();
         }
         arrived() != before
@@ -564,9 +564,9 @@ impl ThreeCom {
         }
         // The card keeps the list pointer until it has the whole frame out: on a 10 Mb/s link that is nearly a millisecond for a
         // 1 KiB frame, so a sender pacing frames a millisecond apart finds it busy. Wait (bounded) instead of dropping.
-        let deadline = apic::micros() + 50_000;
+        let deadline = timer::micros() + 50_000;
         while read32(self.io_base, DOWN_LIST_PTR) != 0 {
-            if apic::micros() > deadline {
+            if timer::micros() > deadline {
                 self.tx_busy_drops += 1;
                 return false;
             }

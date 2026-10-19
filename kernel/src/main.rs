@@ -71,7 +71,7 @@ use fosfor_abi::{BootInfo, PIXEL_RGB};
 // The architecture layer (boot entry, CPU, interrupts, paging) lives in `arch/`; its modules are re-exported here so
 // the rest of the kernel keeps saying `crate::cpu`, `crate::paging`, ... whichever architecture is built.
 #[cfg(target_arch = "x86_64")]
-pub use arch::x86_64::{acpi, apic, cpu, cpupower, gdt, idt, ioapic, msi, paging, serial};
+pub use arch::x86_64::{acpi, apic, cpu, cpupower, gdt, idt, ioapic, msi, paging, serial, timer};
 
 
 /// `println!` goes to the serial port, the boot log and, once it exists, the framebuffer.
@@ -243,7 +243,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
                     if report.x2apic { "x2APIC" } else { "xAPIC" },
                     report.base,
                     report.timer_hz / 1_000_000,
-                    apic::TICK_HZ,
+                    timer::TICK_HZ,
                     apic::TIMER_VECTOR
                 );
                 cpu::interrupts_enable();
@@ -293,7 +293,7 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
     if storage::boot_disk().is_none() && controllers + ehci_controllers + ohci_controllers > 0 {
         println!("Boot disk not found yet; USB disks can be slow to appear. Looking again (up to 10 s).");
         for _ in 0..20 {
-            apic::wait_ticks(50);
+            timer::wait_ticks(50);
             usb_hid::probe_all();
             if storage::locate_boot_disk(false) {
                 break;
@@ -440,8 +440,8 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         term::poll();
         if uart::shell_active() {
             // The shell's UART has no interrupt and a 16-byte FIFO: keep polling it instead of sleeping a whole tick.
-            let begin = apic::micros();
-            while apic::micros() < begin + 100 {
+            let begin = timer::micros();
+            while timer::micros() < begin + 100 {
                 uart::poll();
                 core::hint::spin_loop();
             }
@@ -489,10 +489,10 @@ fn self_test_interrupts(fadt: &acpi::Fadt) {
         apic::legacy_pic_interrupts() - before
     );
 
-    let start_ticks = apic::ticks();
+    let start_ticks = timer::ticks();
     let mask: u64 = if fadt.pm_timer_32_bit { 0xffff_ffff } else { 0x00ff_ffff };
     let pm_start = u64::from(cpu::inl(fadt.pm_timer_port)) & mask;
-    while apic::ticks() - start_ticks < 100 {
+    while timer::ticks() - start_ticks < 100 {
         unsafe { core::arch::asm!("hlt") };
     }
     let pm_elapsed = (u64::from(cpu::inl(fadt.pm_timer_port)) & mask).wrapping_sub(pm_start) & mask;

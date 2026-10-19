@@ -35,7 +35,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::e1000::{Delivery, ISR, MAX_INTERFACES};
-use crate::{apic, cpu, memory, pci};
+use crate::{cpu, memory, pci, timer};
 
 pub const VENDOR_REALTEK: u16 = 0x10ec;
 pub const DEVICE_IDS: &[u16] = &[0x8139];
@@ -308,8 +308,8 @@ impl Rtl8139 {
         let before = arrived();
         write32(self.io_base, REG_TIMERINT, 0x2000); // ~250 microseconds at the counter's 33 MHz
         write32(self.io_base, REG_TCTR, 0); // restart the counter
-        let start = apic::ticks();
-        while arrived() == before && apic::ticks().wrapping_sub(start) < 3 {
+        let start = timer::ticks();
+        while arrived() == before && timer::ticks().wrapping_sub(start) < 3 {
             core::hint::spin_loop();
         }
         arrived() != before

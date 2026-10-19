@@ -426,7 +426,7 @@ fn write(registers: usize, offset: usize, value: u32) {
 }
 
 fn short_wait(ticks: u64) {
-    crate::apic::wait_ticks(ticks);
+    crate::timer::wait_ticks(ticks);
 }
 
 /// The classic reset: set CTRL.RST and wait for it to clear.
@@ -1242,8 +1242,8 @@ impl E1000 {
         write(self.registers, self.r.ims, mask);
         let before = arrived();
         write(self.registers, self.r.ics, if msix { ICR_OTHER } else { ICR_LSC });
-        let start = crate::apic::ticks();
-        while arrived() == before && crate::apic::ticks().wrapping_sub(start) < 3 {
+        let start = crate::timer::ticks();
+        while arrived() == before && crate::timer::ticks().wrapping_sub(start) < 3 {
             core::hint::spin_loop();
         }
         arrived() != before

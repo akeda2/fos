@@ -80,7 +80,7 @@ pub fn probe_all() -> usize {
     let added = probe_all_once();
     // A device that took firmware (a USB serial adapter) is reset and enumerated once more; one extra pass, so no loop.
     if crate::usb_serial::take_reprobe() {
-        crate::apic::wait_ticks(30);
+        crate::timer::wait_ticks(30);
         return added + probe_all_once();
     }
     added
@@ -126,7 +126,7 @@ fn probe_all_once() -> usize {
                             unsafe { STEP }, controller.port_status(port), controller.usbsts()
                         );
                         release_port(controller, port, None);
-                        crate::apic::wait_ticks(15);
+                        crate::timer::wait_ticks(15);
                     }
                 }
             }
@@ -441,7 +441,7 @@ fn probe_all_ehci() -> usize {
                             controller.pci.bus, controller.pci.device, controller.pci.function, controller.step, controller.port_status(port), controller.usbsts()
                         );
                         attempt += 1;
-                        crate::apic::wait_ticks(15);
+                        crate::timer::wait_ticks(15);
                         if !controller.wait_port_stable(port, 100, 1500) {
                             break Err(ehci::Error::NoDevice); // it really is gone
                         }
@@ -557,7 +557,7 @@ fn probe_all_ohci() -> usize {
                         crate::println!("USB: OHCI {:02x}:{:02x}.{} port {port}, attempt {attempt}/3 failed at \"{}\": {error:?}.",
                             controller.pci.bus, controller.pci.device, controller.pci.function, controller.step);
                         attempt += 1;
-                        crate::apic::wait_ticks(15);
+                        crate::timer::wait_ticks(15);
                     }
                     other => break other,
                 }

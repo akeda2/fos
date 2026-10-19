@@ -51,7 +51,7 @@
 //! and teardown. **Everything beyond what QEMU's synthetic codecs exercise is unverified on real hardware.**
 
 use crate::audio::PcmRing;
-use crate::{apic, cpu, memory, msi, paging, pci};
+use crate::{apic, cpu, memory, msi, paging, pci, timer};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const MAX_CONTROLLERS: usize = 4;
@@ -463,12 +463,12 @@ fn write32(base: u64, offset: u64, value: u32) {
 /// Polls `condition` for up to `microseconds`. Bounded by the clock and, in case the clock is not running, by an
 /// iteration count: a stuck register must never hang the boot.
 fn wait_until(microseconds: u64, mut condition: impl FnMut() -> bool) -> bool {
-    let start = apic::micros();
+    let start = timer::micros();
     for _ in 0..20_000_000u32 {
         if condition() {
             return true;
         }
-        if apic::micros().wrapping_sub(start) > microseconds {
+        if timer::micros().wrapping_sub(start) > microseconds {
             return condition();
         }
         core::hint::spin_loop();
@@ -589,7 +589,7 @@ impl Hda {
         if !wait_until(50_000, || read32(regs, REG_GCTL) & GCTL_CRST == 0) {
             return None;
         }
-        apic::busy_wait_ms(1);
+        timer::busy_wait_ms(1);
         write32(regs, REG_GCTL, (control | GCTL_CRST) & !(1 << 8));
         if !wait_until(50_000, || read32(regs, REG_GCTL) & GCTL_CRST != 0) {
             return None;
@@ -597,7 +597,7 @@ impl Hda {
         // Codecs need at least 521 us after the link comes up to signal presence; they usually take a few ms.
         // Wait for the first, then a little for the rest.
         wait_until(150_000, || read16(regs, REG_STATESTS) & 0x7fff != 0);
-        apic::busy_wait_ms(2);
+        timer::busy_wait_ms(2);
         let present = read16(regs, REG_STATESTS) & 0x7fff;
         write16(regs, REG_STATESTS, present); // write 1 to clear
         Some(present)
@@ -628,7 +628,7 @@ impl Hda {
             // Wake the function group before reading anything from it: a codec left in D3 answers parameter reads
             // but its converters do not run.
             self.command(verb(address, codec.afg, VERB_SET_POWER_STATE, 0));
-            apic::busy_wait_ms(10);
+            timer::busy_wait_ms(10);
             codec.afg_pcm = self.parameter(address, codec.afg, PAR_PCM).unwrap_or(0);
             codec.afg_amp_in = self.parameter(address, codec.afg, PAR_AMP_IN_CAP).unwrap_or(0);
             codec.afg_amp_out = self.parameter(address, codec.afg, PAR_AMP_OUT_CAP).unwrap_or(0);
@@ -1230,8 +1230,8 @@ impl Hda {
         let before = arrived();
         let address = self.codecs.iter().find(|codec| codec.present).map_or(0, |codec| codec.address);
         self.command(verb(address, 0, VERB_GET_PARAMETER, PAR_VENDOR_ID));
-        let start = apic::ticks();
-        while arrived() == before && apic::ticks().wrapping_sub(start) < 3 {
+        let start = timer::ticks();
+        while arrived() == before && timer::ticks().wrapping_sub(start) < 3 {
             core::hint::spin_loop();
         }
         let ok = arrived() != before;

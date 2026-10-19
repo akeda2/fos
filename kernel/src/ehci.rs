@@ -31,7 +31,7 @@
 //! controller (UHCI/OHCI), which this kernel has no driver for: such a port is
 //! released to it. Polling only; no interrupts.
 
-use crate::{apic, memory, paging, pci};
+use crate::{memory, paging, pci, timer};
 
 pub const MAX_CONTROLLERS: usize = 2;
 pub const MAX_KEYBOARDS: usize = 2;
@@ -241,13 +241,13 @@ fn write32(address: usize, value: u32) {
 }
 
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
-    let start = apic::ticks();
+    let start = timer::ticks();
     loop {
         crate::debug::pet();
         if condition() {
             return true;
         }
-        if apic::ticks().wrapping_sub(start) >= ticks {
+        if timer::ticks().wrapping_sub(start) >= ticks {
             return condition();
         }
         core::hint::spin_loop();
@@ -446,7 +446,7 @@ impl Controller {
                 write32(register, (read32(register) & PORT_KEEP) | PORT_POWER);
             }
         }
-        apic::wait_ticks(15);
+        timer::wait_ticks(15);
         Ok(Controller { pci: device, operational, ports, frame, periodic, next_address: 1, step: "", last_toggle: false, wait_limit: TIMEOUT_TICKS, iso: [None; 2], irq_vector: 0, irq_failed: false, fault: None, claimed_ports: 0, hubs: [None; MAX_HUBS], keyboards: [None; MAX_KEYBOARDS] })
     }
 
@@ -534,7 +534,7 @@ impl Controller {
     }
 
     fn wait_chain(&mut self, qtds: &[Qtd]) -> Result<[u32; MAX_QTDS], Error> {
-        let start = apic::ticks();
+        let start = timer::ticks();
         loop {
             let mut remaining = [0u32; MAX_QTDS];
             let mut finished = true;
@@ -560,7 +560,7 @@ impl Controller {
             if finished {
                 return Ok(remaining);
             }
-            if apic::ticks().wrapping_sub(start) >= self.wait_limit {
+            if timer::ticks().wrapping_sub(start) >= self.wait_limit {
                 return Err(Error::Timeout);
             }
         }
@@ -661,7 +661,7 @@ impl Controller {
             } else {
                 stable = 0;
             }
-            apic::wait_ticks(1);
+            timer::wait_ticks(1);
             waited += 10;
         }
         false
@@ -685,12 +685,12 @@ impl Controller {
             return Err(Error::CompanionPort);
         }
         write32(register, (status & PORT_KEEP & !PORT_ENABLED) | PORT_RESET | PORT_CHANGE_BITS);
-        apic::wait_ticks(6); // hold reset at least 50 ms
+        timer::wait_ticks(6); // hold reset at least 50 ms
         write32(register, read32(register) & PORT_KEEP & !PORT_RESET);
         if !wait_until(5, || read32(register) & PORT_RESET == 0) {
             return Err(Error::NoDevice);
         }
-        apic::wait_ticks(6); // reset recovery (the standard asks for 10 ms; flash sticks coming out of a USB 3 fallback want more)
+        timer::wait_ticks(6); // reset recovery (the standard asks for 10 ms; flash sticks coming out of a USB 3 fallback want more)
         let after = read32(register);
         write32(register, (after & PORT_KEEP) | PORT_CHANGE_BITS);
         if after & PORT_CONNECTED == 0 {
@@ -728,7 +728,7 @@ impl Controller {
                 Err(error) if tries >= 3 => return Err(error),
                 Err(_) => {
                     tries += 1;
-                    apic::wait_ticks(5);
+                    timer::wait_ticks(5);
                 }
             }
         }
@@ -736,7 +736,7 @@ impl Controller {
         let address = self.allocate_address().ok_or(Error::Unsupported)?;
         self.step = "SET_ADDRESS";
         self.control_transfer(&target, 0x00, 0x05, u16::from(address), 0, &mut [])?;
-        apic::wait_ticks(1); // SET_ADDRESS recovery time
+        timer::wait_ticks(1); // SET_ADDRESS recovery time
         target.address = address;
         let mut descriptor = [0u8; 18];
         self.step = "read the full device descriptor at the new address";
@@ -749,7 +749,7 @@ impl Controller {
     pub fn enumerate_port(&mut self, port: u8, found: &mut [Option<Found>; 8]) -> Result<usize, Error> {
         self.step = "reset the root port";
         self.reset_root_port(port)?;
-        apic::wait_ticks(10); // let the device (or the hub's own reset) settle before the first transfer
+        timer::wait_ticks(10); // let the device (or the hub's own reset) settle before the first transfer
         let device = self.address_default_device(Speed::High, 0, 0)?;
         if device.descriptor[4] != 9 {
             found[0] = Some(device);
@@ -887,7 +887,7 @@ impl Controller {
         };
         self.step = "power a hub port";
         self.control_transfer(hub, 0x23, 0x03, PORT_POWER_FEATURE, port_index, &mut [])?;
-        apic::wait_ticks(power_good_ticks.max(10));
+        timer::wait_ticks(power_good_ticks.max(10));
         self.step = "look for a device on a hub port";
         let (state, change) = status(self)?;
         if state & 1 == 0 {
@@ -900,14 +900,14 @@ impl Controller {
         let _ = self.control_transfer(hub, 0x23, 0x01, C_PORT_CONNECTION, port_index, &mut []);
         self.control_transfer(hub, 0x23, 0x03, PORT_RESET_FEATURE, port_index, &mut [])?;
         for _ in 0..20 {
-            apic::wait_ticks(1);
+            timer::wait_ticks(1);
             let (state, change) = status(self)?;
             if change & (1 << 4) != 0 && state & (1 << 4) == 0 {
                 let _ = self.control_transfer(hub, 0x23, 0x01, C_PORT_RESET, port_index, &mut []);
                 if state & 2 == 0 {
                     return Err(Error::NoDevice);
                 }
-                apic::wait_ticks(3);
+                timer::wait_ticks(3);
                 return Ok(if state & (1 << 10) != 0 {
                     Speed::High
                 } else if state & (1 << 9) != 0 {

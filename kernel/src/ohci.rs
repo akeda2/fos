@@ -23,7 +23,7 @@
 //! `OwnershipChangeRequest` and the SMM code lets go (clears it). Controllers that implement the legacy keyboard emulation
 //! have extra registers at 0x100 (`HceControl`); clearing them stops the PS/2 impersonation.
 
-use crate::{apic, memory, paging, pci};
+use crate::{memory, paging, pci, timer};
 use core::sync::atomic::{Ordering, fence};
 
 pub const MAX_CONTROLLERS: usize = 2;
@@ -168,13 +168,13 @@ fn write32(address: usize, value: u32) {
 }
 
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
-    let start = apic::ticks();
+    let start = timer::ticks();
     loop {
         crate::debug::pet();
         if condition() {
             return true;
         }
-        if apic::ticks().wrapping_sub(start) >= ticks {
+        if timer::ticks().wrapping_sub(start) >= ticks {
             return condition();
         }
         core::hint::spin_loop();
@@ -271,7 +271,7 @@ impl Controller {
         for port in 1..=ports {
             write32(mmio + HC_RH_PORT_STATUS + 4 * (usize::from(port) - 1), PORT_SET_POWER);
         }
-        apic::wait_ticks(u64::from(descriptor_a >> 24) / 5 + 10);
+        timer::wait_ticks(u64::from(descriptor_a >> 24) / 5 + 10);
         Ok(Controller { pci: device, mmio, ports, frame, buffers, next_address: 1, control_tail: 0, claimed_ports: 0, keyboards: [None; MAX_KEYBOARDS], step: "" })
     }
 
@@ -410,10 +410,10 @@ impl Controller {
             return false;
         }
         write32(register, PORT_RESET_CHANGE | PORT_CONNECT_CHANGE);
-        apic::wait_ticks(3); // recovery time before the first request
+        timer::wait_ticks(3); // recovery time before the first request
         if read32(register) & PORT_ENABLED == 0 {
             write32(register, PORT_SET_ENABLE);
-            apic::wait_ticks(1);
+            timer::wait_ticks(1);
         }
         read32(register) & PORT_ENABLED != 0
     }
@@ -440,7 +440,7 @@ impl Controller {
                 Err(error) if tries >= 3 => return Err(error),
                 Err(_) => {
                     tries += 1;
-                    apic::wait_ticks(5);
+                    timer::wait_ticks(5);
                 }
             }
         }
@@ -449,7 +449,7 @@ impl Controller {
         self.next_address = if self.next_address >= 126 { 1 } else { self.next_address + 1 };
         self.step = "set the device address";
         self.control_transfer(&target, 0x00, 0x05, u16::from(address), 0, &mut [])?;
-        apic::wait_ticks(2); // the device may take 2 ms to start answering at its new address
+        timer::wait_ticks(2); // the device may take 2 ms to start answering at its new address
         target.address = address;
         self.step = "read the device descriptor";
         let mut descriptor = [0u8; 18];
@@ -476,7 +476,7 @@ impl Controller {
     fn relink(&mut self) {
         let control = read32(self.mmio + HC_CONTROL);
         write32(self.mmio + HC_CONTROL, control & !CONTROL_PERIODIC_ENABLE);
-        apic::wait_ticks(2);
+        timer::wait_ticks(2);
         let mut previous: Option<*mut u32> = None;
         let mut first = 0u32;
         for index in 0..MAX_KEYBOARDS {

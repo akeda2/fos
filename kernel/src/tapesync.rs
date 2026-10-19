@@ -16,7 +16,7 @@
 
 use crate::fosfs::Volume;
 use crate::term::{Mac, NETFS_BUSY, NETFS_DISK_ERROR, NETFS_NO_SYNC, TAG_GET_ERROR, TAG_SYNC_REQUEST};
-use crate::{apic, println};
+use crate::{println, timer};
 use tape_sync::{Action, Entry, MANIFEST_MAX, MAX_TAPES, NAME_LEN, NONCE_LEN, Stamp};
 
 pub const KEY_FILE: &str = "synckey";
@@ -112,7 +112,7 @@ fn scan(volume: &Volume, state: &mut State) -> Result<(usize, usize), &'static s
 fn nonce() -> [u8; NONCE_LEN] {
     let mut seed = [0u8; 16];
     seed[0..8].copy_from_slice(&unsafe { core::arch::x86_64::_rdtsc() }.to_le_bytes());
-    seed[8..16].copy_from_slice(&apic::micros().to_le_bytes());
+    seed[8..16].copy_from_slice(&timer::micros().to_le_bytes());
     let digest = tape_sync::sha256(&seed);
     digest[..NONCE_LEN].try_into().unwrap()
 }
@@ -127,19 +127,19 @@ pub fn serve(index: usize, source: [u8; 6], payload: &[u8]) {
     let Some(volume) = crate::storage::boot_volume() else { return refuse(NETFS_NO_SYNC) };
     let mut key = [0u8; KEY_MAX];
     let Some(key_length) = read_key(&volume, &mut key) else { return refuse(NETFS_NO_SYNC) };
-    let recently = unsafe { LAST_SERVED } != 0 && apic::ticks().wrapping_sub(unsafe { LAST_SERVED }) < 2 * apic::TICK_HZ;
+    let recently = unsafe { LAST_SERVED } != 0 && timer::ticks().wrapping_sub(unsafe { LAST_SERVED }) < 2 * timer::TICK_HZ;
     if unsafe { CLIENT_ACTIVE } || recently {
         return refuse(NETFS_NO_SYNC);
     }
     if crate::term::netfs_busy(&source) {
         return refuse(NETFS_BUSY);
     }
-    unsafe { LAST_SERVED = apic::ticks() };
+    unsafe { LAST_SERVED = timer::ticks() };
     let state = state();
     let Ok((tapes, _)) = scan(&volume, state) else { return refuse(NETFS_DISK_ERROR) };
     let length = tape_sync::encode(&state.local[..tapes], &key[..key_length], &nonce, &mut state.wire);
     crate::term::netfs_stream(index, &source, &state.wire[..length], "the tape manifest");
-    unsafe { LAST_SERVED = apic::ticks() };
+    unsafe { LAST_SERVED = timer::ticks() };
 }
 
 fn age(seconds: u64) -> (u64, &'static str) {

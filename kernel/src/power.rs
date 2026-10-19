@@ -43,20 +43,20 @@ pub fn reset(runtime_services: u64) -> ! {
                     0 if crate::paging::is_mapped(address) => (address as *mut u8).write_volatile(value),
                     _ => {}
                 }
-                crate::apic::busy_wait_ms(50);
+                crate::timer::busy_wait_ms(50);
             }
         }
         if RESET_ATTEMPTED == 1 {
             RESET_ATTEMPTED = 2;
             cpu::outb(0xcf9, 0x02);
-            crate::apic::busy_wait_ms(5);
+            crate::timer::busy_wait_ms(5);
             cpu::outb(0xcf9, 0x06);
-            crate::apic::busy_wait_ms(50);
+            crate::timer::busy_wait_ms(50);
         }
         if RESET_ATTEMPTED == 2 {
             RESET_ATTEMPTED = 3;
             cpu::outb(0x64, 0xfe);
-            crate::apic::busy_wait_ms(50);
+            crate::timer::busy_wait_ms(50);
         }
         if RESET_ATTEMPTED == 3 && runtime_services != 0 {
             RESET_ATTEMPTED = 4;
@@ -89,7 +89,7 @@ pub fn shutdown(runtime_services: u64) {
         if pm1b != 0 {
             cpu::outw(pm1b, (u16::from(type_b) << 10) | SLP_EN);
         }
-        crate::apic::busy_wait_ms(500);
+        crate::timer::busy_wait_ms(500);
     }
     if runtime_services == 0 {
         return;

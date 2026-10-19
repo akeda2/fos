@@ -17,7 +17,7 @@
 //! 4 KiB host pages. All memory comes from the physical allocator below 4 GiB, so a
 //! 32-bit-DMA controller and a 64-bit one behave the same.
 
-use crate::{apic, memory, paging, pci};
+use crate::{apic, memory, paging, pci, timer};
 
 pub const MAX_CONTROLLERS: usize = 4;
 pub const MAX_SLOTS: usize = 16;
@@ -217,13 +217,13 @@ fn write64(address: usize, value: u64) {
 }
 
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
-    let start = apic::ticks();
+    let start = timer::ticks();
     loop {
         crate::debug::pet();
         if condition() {
             return true;
         }
-        if apic::ticks().wrapping_sub(start) >= ticks {
+        if timer::ticks().wrapping_sub(start) >= ticks {
             return condition();
         }
         core::hint::spin_loop();
@@ -417,7 +417,7 @@ fn interrupt(index: usize) {
     // stream. The foreground drains the ring itself from then on.
     static mut LAST_TICK: u64 = 0;
     static mut BURST: u32 = 0;
-    let now = apic::ticks();
+    let now = timer::ticks();
     unsafe {
         if now != LAST_TICK {
             LAST_TICK = now;
@@ -636,7 +636,7 @@ impl Controller {
             }
         }
         // The reset dropped every link; give SuperSpeed devices time to train.
-        apic::wait_ticks(15);
+        timer::wait_ticks(15);
         Ok(controller)
     }
 
@@ -715,8 +715,8 @@ impl Controller {
             // `wait_event` below consumes the completion.
             let command = self.command_ring.push(0, 0, TRB_NOOP_COMMAND << 10);
             self.ring_doorbell(0, 0);
-            let start = apic::ticks();
-            while crate::msi::count(vector) == before && apic::ticks().wrapping_sub(start) < 5 {
+            let start = timer::ticks();
+            while crate::msi::count(vector) == before && timer::ticks().wrapping_sub(start) < 5 {
                 core::hint::spin_loop();
             }
             if self.wait_event(TIMEOUT_TICKS, |event| event.kind() == TRB_COMMAND_COMPLETION && event.parameter == command).is_err() {
@@ -749,7 +749,7 @@ impl Controller {
     /// Waits for an event accepted by `wanted`. Anything else (port changes, reports
     /// from keyboards already running) goes to the background handler.
     fn wait_event(&mut self, ticks: u64, wanted: impl Fn(&Trb) -> bool) -> Result<Trb, Error> {
-        let start = apic::ticks();
+        let start = timer::ticks();
         loop {
             crate::debug::pet();
             while let Some(event) = self.next_event() {
@@ -758,7 +758,7 @@ impl Controller {
                 }
                 crate::usb_hid::background_event(self, &event);
             }
-            if apic::ticks().wrapping_sub(start) >= ticks {
+            if timer::ticks().wrapping_sub(start) >= ticks {
                 return Err(Error::Timeout);
             }
             core::hint::spin_loop();
@@ -811,8 +811,8 @@ impl Controller {
         self.ring_doorbell(0, 0);
         // The Command Ring Stopped, Command Aborted and No-Op completion events: take them off the event ring (anything
         // else goes to the background handler).
-        let start = apic::ticks();
-        while apic::ticks().wrapping_sub(start) < 3 {
+        let start = timer::ticks();
+        while timer::ticks().wrapping_sub(start) < 3 {
             while let Some(event) = self.next_event() {
                 crate::usb_hid::background_event(self, &event);
             }
@@ -850,7 +850,7 @@ impl Controller {
         write32(register, (read32(register) & PORTSC_PRESERVE) | request);
         let done = wait_until(100, || read32(register) & done_bit != 0);
         write32(register, (read32(register) & PORTSC_PRESERVE) | PORTSC_CHANGE_BITS);
-        apic::wait_ticks(3);
+        timer::wait_ticks(3);
         done
     }
 
@@ -874,7 +874,7 @@ impl Controller {
                 return Err(Error::NoDevice);
             }
             write32(register, (read32(register) & PORTSC_PRESERVE) | PORTSC_CHANGE_BITS);
-            apic::wait_ticks(3); // 10 ms reset recovery
+            timer::wait_ticks(3); // 10 ms reset recovery
         }
         let status = read32(register);
         if status & PORTSC_ENABLED == 0 || status & PORTSC_CONNECTED == 0 {
@@ -910,14 +910,14 @@ impl Controller {
             if result.is_err() {
                 self.release_slot(slot);
             } else {
-                apic::wait_ticks(1);
+                timer::wait_ticks(1);
             }
             return result;
         }
         if result.is_err() {
             self.release_slot(slot);
         } else {
-            apic::wait_ticks(1); // SET_ADDRESS recovery time, with some margin, before the first transfer
+            timer::wait_ticks(1); // SET_ADDRESS recovery time, with some margin, before the first transfer
         }
         result
     }
@@ -951,7 +951,7 @@ impl Controller {
         if result.is_err() {
             self.release_slot(slot);
         } else {
-            apic::wait_ticks(1);
+            timer::wait_ticks(1);
         }
         result
     }

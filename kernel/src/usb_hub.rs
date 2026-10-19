@@ -74,7 +74,7 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
     // hub-class request after SET_CONFIGURATION is stalled, whichever it is (depth, hub descriptor), and the next one works.
     // The hub is still starting up after being configured (USB allows a device 50 ms to recover from SET_CONFIGURATION), so
     // give it that time and, if it stalls anyway, ask again once (`control_transfer` has already cleared the stall).
-    crate::apic::wait_ticks(5);
+    crate::timer::wait_ticks(5);
     if super_speed {
         crate::usb_hid::set_step("set the SuperSpeed hub depth");
         // A SuperSpeed hub must be told how many hubs lie between it and the root.
@@ -111,7 +111,7 @@ pub fn enumerate(controller_index: usize, controller: &mut Controller, device: D
         let _ = port_feature(controller, &device, REQUEST_SET_FEATURE, FEATURE_PORT_POWER, port);
     }
     // Power-good time, then time for a device to announce itself and debounce.
-    crate::apic::wait_ticks(power_good_ms / 10 + 25);
+    crate::timer::wait_ticks(power_good_ms / 10 + 25);
     scan(controller_index, controller, &hub);
     Ok(true)
 }
@@ -198,7 +198,7 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
                 Err(error) => {
                     crate::println!("USB: hub port {}.{port}, attempt {attempt}/3 failed at \"{}\": {error:?}.", hub.device.path(), crate::usb_hid::step());
                     crate::usb_hid::release_port(controller, hub.device.port, Some(route));
-                    crate::apic::wait_ticks(15);
+                    crate::timer::wait_ticks(15);
                 }
             }
         }
@@ -210,14 +210,14 @@ fn probe_port(controller_index: usize, controller: &mut Controller, hub: &Hub, p
     // Reset the port and wait for the hub to say the reset finished.
     crate::usb_hid::set_step("reset the hub port");
     port_feature(controller, &hub.device, REQUEST_SET_FEATURE, FEATURE_PORT_RESET, port)?;
-    let start = crate::apic::ticks();
+    let start = crate::timer::ticks();
     let mut status = 0;
-    while crate::apic::ticks().wrapping_sub(start) < 50 {
+    while crate::timer::ticks().wrapping_sub(start) < 50 {
         status = port_status(controller, &hub.device, port)?;
         if status & CHANGE_RESET != 0 {
             break;
         }
-        crate::apic::wait_ticks(1);
+        crate::timer::wait_ticks(1);
     }
     let _ = port_feature(controller, &hub.device, REQUEST_CLEAR_FEATURE, FEATURE_C_PORT_RESET, port);
     let _ = port_feature(controller, &hub.device, REQUEST_CLEAR_FEATURE, FEATURE_C_PORT_CONNECTION, port);
@@ -235,7 +235,7 @@ fn probe_port(controller_index: usize, controller: &mut Controller, hub: &Hub, p
     } else {
         1
     };
-    crate::apic::wait_ticks(3); // reset recovery
+    crate::timer::wait_ticks(3); // reset recovery
     crate::usb_hid::set_step("address the device behind the hub (enable slot, address device)");
     let device = controller.open_hub_port(&hub.device, port, speed)?;
     crate::usb_hid::probe_device(controller_index, controller, device)

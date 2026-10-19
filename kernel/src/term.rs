@@ -11,7 +11,7 @@
 //! session is open; it is flushed to the wire in 1 KiB DATA frames.
 
 use crate::nic::Nic;
-use crate::{apic, memory, pci, power};
+use crate::{apic, memory, pci, power, timer};
 
 const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
@@ -240,11 +240,11 @@ static mut ANNOUNCE_COUNT: u32 = 0;
 fn announce_service() {
     crate::nicpark::service();
     unsafe {
-        if apic::ticks() < NEXT_ANNOUNCE {
+        if timer::ticks() < NEXT_ANNOUNCE {
             return;
         }
         ANNOUNCE_COUNT = ANNOUNCE_COUNT.saturating_add(1);
-        NEXT_ANNOUNCE = apic::ticks() + if ANNOUNCE_COUNT <= 4 { 1 } else { ANNOUNCE_SECONDS } * apic::TICK_HZ;
+        NEXT_ANNOUNCE = timer::ticks() + if ANNOUNCE_COUNT <= 4 { 1 } else { ANNOUNCE_SECONDS } * timer::TICK_HZ;
     }
     for index in 0..nic_count() {
         if let Some(nic) = nic_at(index).filter(|nic| nic.link_up()) {
@@ -298,14 +298,14 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
         // waiting state accepts a new peer), unless the owner has been silent for five minutes.
         TAG_HELLO if session_open()
             && unsafe { *core::ptr::addr_of!(PEER) } != Some(source)
-            && apic::ticks().wrapping_sub(unsafe { PEER_ACTIVITY }) < 5 * 60 * apic::TICK_HZ => {}
+            && timer::ticks().wrapping_sub(unsafe { PEER_ACTIVITY }) < 5 * 60 * timer::TICK_HZ => {}
         TAG_HELLO => {
             // A new HELLO replaces any earlier session (the old client is gone or
             // restarting); the screen and serial port show who connected.
             unsafe {
                 *core::ptr::addr_of_mut!(PEER) = Some(source);
                 SESSION_NIC = index;
-                PEER_ACTIVITY = apic::ticks();
+                PEER_ACTIVITY = timer::ticks();
                 RELAY_LENGTH = 0;
             }
             crate::lineedit::reset();
@@ -320,7 +320,7 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
             // opened. A NUL a person really typed (Ctrl-@) is lost, which nobody misses.
             let payload = &frame[15..];
             let payload = &payload[..payload.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1)];
-            unsafe { PEER_ACTIVITY = apic::ticks() };
+            unsafe { PEER_ACTIVITY = timer::ticks() };
             if unsafe { TAPE_MODE } {
                 // A running tape owns the input. A lone Escape byte is "stop".
                 if payload.first() == Some(&0x1b) && payload.iter().rposition(|&b| b != 0) == Some(0) {
@@ -429,7 +429,7 @@ pub(crate) fn netfs_reply(index: usize, destination: &[u8; 6], tag: u8, payload:
 pub(crate) fn netfs_busy(source: &[u8; 6]) -> bool {
     let put = unsafe { &*core::ptr::addr_of!(NETFS_PUT) };
     let kup = unsafe { &*core::ptr::addr_of!(KUP) };
-    (put.active && put.source != *source && apic::ticks().wrapping_sub(put.last_activity) < 500) || (kup.active && apic::ticks().wrapping_sub(kup.last_activity) < 500)
+    (put.active && put.source != *source && timer::ticks().wrapping_sub(put.last_activity) < 500) || (kup.active && timer::ticks().wrapping_sub(kup.last_activity) < 500)
 }
 
 /// A request to read a file: answers with START, numbered DATA chunks and STOP, or an error code.
@@ -471,15 +471,15 @@ pub(crate) fn netfs_stream(index: usize, source: &[u8; 6], data: &[u8], what: &s
     netfs_reply(index, source, TAG_GET_START, &start);
     crate::println!("NETFS: sending {what} ({length} bytes) to {}.", Mac(source));
     // The receiver reads from a finite ring: one chunk a millisecond is a pace real hardware keeps up with.
-    let mut next = apic::micros();
+    let mut next = timer::micros();
     for (sequence, chunk) in data.chunks(NETFS_CHUNK).enumerate() {
         let mut frame = [0u8; 4 + NETFS_CHUNK];
         frame[0..4].copy_from_slice(&(sequence as u32).to_le_bytes());
         frame[4..4 + chunk.len()].copy_from_slice(chunk);
-        while apic::micros() < next {
+        while timer::micros() < next {
             core::hint::spin_loop();
         }
-        next = apic::micros() + 1000;
+        next = timer::micros() + 1000;
         netfs_reply(index, source, TAG_GET_DATA, &frame[..4 + chunk.len()]);
         crate::debug::pet();
     }
@@ -508,7 +508,7 @@ fn netfs_put_request(index: usize, source: [u8; 6], payload: &[u8]) {
         return reply_error(NETFS_TOO_LARGE);
     }
     let put = unsafe { &mut *core::ptr::addr_of_mut!(NETFS_PUT) };
-    *put = NetfsPut { active: true, source, disk: usize::from(payload[0]), name: [0; 16], name_length: name.len(), expected, checksum, received: 0, next_sequence: 0, last_activity: apic::ticks() };
+    *put = NetfsPut { active: true, source, disk: usize::from(payload[0]), name: [0; 16], name_length: name.len(), expected, checksum, received: 0, next_sequence: 0, last_activity: timer::ticks() };
     put.name[..name.len()].copy_from_slice(name);
     crate::println!("NETFS: receiving {} ({expected} bytes) from {}.", core::str::from_utf8(name).unwrap_or("?"), Mac(&source));
 }
@@ -529,7 +529,7 @@ fn netfs_put_data(source: [u8; 6], payload: &[u8]) {
     staging[put.received..put.received + take].copy_from_slice(&payload[4..4 + take]);
     put.received += take;
     put.next_sequence += 1;
-    put.last_activity = apic::ticks();
+    put.last_activity = timer::ticks();
 }
 
 fn netfs_put_stop(index: usize, source: [u8; 6]) {
@@ -626,9 +626,9 @@ pub(crate) fn netfs_receive(mac: [u8; 6], nic_index: usize, tag: u8, request: &[
     netfs_reply(nic_index, &mac, tag, request);
     let (mut total, mut checksum, mut received, mut sequence) = (None::<usize>, 0u16, 0usize, 0u32);
     let mut outcome: Option<Result<(), &'static str>> = None;
-    let mut deadline = apic::ticks() + 3 * apic::TICK_HZ;
+    let mut deadline = timer::ticks() + 3 * timer::TICK_HZ;
     blocking(true);
-    while outcome.is_none() && apic::ticks() < deadline && !break_requested() {
+    while outcome.is_none() && timer::ticks() < deadline && !break_requested() {
         drain_nics(|_, frame| {
             if frame.len() < 15 || frame[12..14] != ETHERTYPE || frame[6..12] != mac {
                 return;
@@ -644,7 +644,7 @@ pub(crate) fn netfs_receive(mac: [u8; 6], nic_index: usize, tag: u8, request: &[
                         total = Some(length);
                         checksum = u16::from_le_bytes(payload[4..6].try_into().unwrap());
                     }
-                    deadline = apic::ticks() + 3 * apic::TICK_HZ;
+                    deadline = timer::ticks() + 3 * timer::TICK_HZ;
                 }
                 TAG_GET_DATA if payload.len() >= 4 => {
                     if let Some(length) = total {
@@ -655,7 +655,7 @@ pub(crate) fn netfs_receive(mac: [u8; 6], nic_index: usize, tag: u8, request: &[
                             staging[received..received + take].copy_from_slice(&payload[4..4 + take]);
                             received += take;
                             sequence += 1;
-                            deadline = apic::ticks() + 3 * apic::TICK_HZ;
+                            deadline = timer::ticks() + 3 * timer::TICK_HZ;
                         }
                     }
                 }
@@ -693,8 +693,8 @@ fn netfs_store(mac: [u8; 6], nic_index: usize, disk: usize, name: &str, length: 
     blocking(true);
     let mut refusal: Option<&'static str> = None;
     // A refusal arrives at once; acceptance is silent.
-    let until = apic::ticks() + apic::TICK_HZ / 2;
-    while apic::ticks() < until && refusal.is_none() {
+    let until = timer::ticks() + timer::TICK_HZ / 2;
+    while timer::ticks() < until && refusal.is_none() {
         drain_nics(|_, frame| {
             if frame.len() >= 16 && frame[12..14] == ETHERTYPE && frame[6..12] == mac && frame[14] == TAG_PUT_ERROR {
                 refusal = Some(netfs_error_text(frame[15]));
@@ -706,15 +706,15 @@ fn netfs_store(mac: [u8; 6], nic_index: usize, disk: usize, name: &str, length: 
         blocking(false);
         return Err(reason);
     }
-    let mut next = apic::micros();
+    let mut next = timer::micros();
     for (sequence, chunk) in staging[..length].chunks(NETFS_CHUNK).enumerate() {
         let mut frame = [0u8; 4 + NETFS_CHUNK];
         frame[0..4].copy_from_slice(&(sequence as u32).to_le_bytes());
         frame[4..4 + chunk.len()].copy_from_slice(chunk);
-        while apic::micros() < next {
+        while timer::micros() < next {
             core::hint::spin_loop();
         }
-        next = apic::micros() + 1000;
+        next = timer::micros() + 1000;
         netfs_reply(nic_index, &mac, TAG_PUT_DATA, &frame[..4 + chunk.len()]);
         crate::debug::pet();
         if break_requested() {
@@ -724,8 +724,8 @@ fn netfs_store(mac: [u8; 6], nic_index: usize, disk: usize, name: &str, length: 
     }
     netfs_reply(nic_index, &mac, TAG_PUT_STOP, &[]);
     let mut result: Option<Result<(), &'static str>> = None;
-    let deadline = apic::ticks() + 10 * apic::TICK_HZ;
-    while result.is_none() && apic::ticks() < deadline && !break_requested() {
+    let deadline = timer::ticks() + 10 * timer::TICK_HZ;
+    while result.is_none() && timer::ticks() < deadline && !break_requested() {
         drain_nics(|_, frame| {
             if frame.len() >= 15 && frame[12..14] == ETHERTYPE && frame[6..12] == mac {
                 match frame[14] {
@@ -744,7 +744,7 @@ fn netfs_store(mac: [u8; 6], nic_index: usize, disk: usize, name: &str, length: 
 fn kup_request(index: usize, source: [u8; 6], payload: &[u8]) {
     let kup = unsafe { &mut *core::ptr::addr_of_mut!(KUP) };
     // A transfer from someone else that is still alive keeps the staging buffer.
-    if kup.active && kup.source != source && apic::ticks().wrapping_sub(kup.last_activity) < 500 {
+    if kup.active && kup.source != source && timer::ticks().wrapping_sub(kup.last_activity) < 500 {
         return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_BUSY]);
     }
     if payload.len() < 6 {
@@ -756,7 +756,7 @@ fn kup_request(index: usize, source: [u8; 6], payload: &[u8]) {
         kup.active = false;
         return kup_reply(index, &source, TAG_KUP_ERROR, &[KUP_TOO_LARGE]);
     }
-    *kup = Kup { active: true, source, expected, checksum, received: 0, next_sequence: 0, last_activity: apic::ticks() };
+    *kup = Kup { active: true, source, expected, checksum, received: 0, next_sequence: 0, last_activity: timer::ticks() };
     crate::println!("KUP: receiving a kernel image of {expected} bytes from {}.", Mac(&source));
 }
 
@@ -777,7 +777,7 @@ fn kup_data(source: [u8; 6], payload: &[u8]) {
     staging[kup.received..kup.received + take].copy_from_slice(&payload[4..4 + take]);
     kup.received += take;
     kup.next_sequence += 1;
-    kup.last_activity = apic::ticks();
+    kup.last_activity = timer::ticks();
 }
 
 fn kup_stop(index: usize, source: [u8; 6]) {
@@ -818,13 +818,13 @@ fn kup_stop(index: usize, source: [u8; 6]) {
     crate::println!("KUP: image verified and written to slot {slot} (pending); restarting in about a second to try it.");
     kup_reply(index, &source, TAG_KUP_ACK, &[]);
     flush();
-    unsafe { RESET_AT = apic::ticks() + apic::TICK_HZ };
+    unsafe { RESET_AT = timer::ticks() + timer::TICK_HZ };
 }
 
 /// Main-loop work: restart after an accepted kernel update.
 pub fn housekeeping() {
     unsafe {
-        if RESET_AT != 0 && apic::ticks() >= RESET_AT {
+        if RESET_AT != 0 && timer::ticks() >= RESET_AT {
             RESET_AT = 0;
             crate::debug::mark_clean_stop();
             power::reset(RUNTIME_SERVICES);
@@ -946,7 +946,7 @@ fn tape_service() {
         if serial {
             // A terminal sends an arrow key as ESC [ A: only an Escape not followed (within SERIAL_ESCAPE_US) by `[` or `O`
             // is "stop", else every cursor key would end the tape.
-            let now = apic::micros();
+            let now = timer::micros();
             if unsafe { SERIAL_ESCAPE_AT } != 0 {
                 unsafe { SERIAL_ESCAPE_AT = 0 };
                 if key == b'[' || key == b'O' {
@@ -980,7 +980,7 @@ fn tape_service() {
             tape_input_push(u16::from(key));
         }
     }
-    if unsafe { SERIAL_ESCAPE_AT } != 0 && apic::micros().wrapping_sub(unsafe { SERIAL_ESCAPE_AT }) > SERIAL_ESCAPE_US {
+    if unsafe { SERIAL_ESCAPE_AT } != 0 && timer::micros().wrapping_sub(unsafe { SERIAL_ESCAPE_AT }) > SERIAL_ESCAPE_US {
         unsafe { SERIAL_ESCAPE_AT = 0 };
         tape_input_push(TAPE_ABORT);
     }
@@ -1785,8 +1785,8 @@ fn execute(command: &str) {
             // write or any other slow command looks like to the rest of the kernel. USB audio must keep
             // flowing meanwhile (test: `audio start`, `sleep`, `audio`).
             let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(1).min(60);
-            let end = apic::ticks() + seconds * apic::TICK_HZ;
-            while apic::ticks() < end {
+            let end = timer::ticks() + seconds * timer::TICK_HZ;
+            while timer::ticks() < end {
                 crate::debug::pet();
                 crate::cpu::sleep();
             }
@@ -1803,8 +1803,8 @@ fn execute(command: &str) {
             },
         },
         "uptime" => {
-            let ticks = apic::ticks();
-            crate::println!("{} ticks at {} Hz ({} s); spurious legacy-PIC interrupts: {}", ticks, apic::TICK_HZ, ticks / apic::TICK_HZ, apic::legacy_pic_interrupts());
+            let ticks = timer::ticks();
+            crate::println!("{} ticks at {} Hz ({} s); spurious legacy-PIC interrupts: {}", ticks, timer::TICK_HZ, ticks / timer::TICK_HZ, apic::legacy_pic_interrupts());
         }
         "power" => match words.next() {
             Some("hwp") => hwp_command(words.next()),
@@ -2020,9 +2020,9 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             for second in 1..=seconds {
                 let mut peaks = [0u32; 32];
                 let mut carry = 0usize; // bytes of an incomplete frame left from the previous read
-                let end = apic::ticks() + apic::TICK_HZ;
+                let end = timer::ticks() + timer::TICK_HZ;
                 let mut frames = 0u64;
-                while apic::ticks() < end {
+                while timer::ticks() < end {
                     crate::debug::pet();
                     crate::usb_hid::poll();
                     ua::poll();
@@ -2073,10 +2073,10 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             if let Err(reason) = ua::start(rate, true, true) {
                 return crate::println!("audio: {reason}.");
             }
-            let end = apic::ticks() + seconds * apic::TICK_HZ;
+            let end = timer::ticks() + seconds * timer::TICK_HZ;
             let mut scratch = [0u8; 4096];
             let silence = [0u8; 2048];
-            while apic::ticks() < end {
+            while timer::ticks() < end {
                 crate::debug::pet();
                 crate::usb_hid::poll();
                     ua::poll();
@@ -2101,10 +2101,10 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
             // (integer-only, and plenty to hear or to measure the fundamental).
             let step = (u64::from(frequency) << 16) / u64::from(rate);
             let mut phase = 0u64;
-            let end = apic::ticks() + seconds * apic::TICK_HZ;
+            let end = timer::ticks() + seconds * timer::TICK_HZ;
             let frame_bytes = channels * slot;
             let mut chunk = [0u8; 2048];
-            while apic::ticks() < end {
+            while timer::ticks() < end {
                 crate::debug::pet();
                 crate::usb_hid::poll();
                     ua::poll();
@@ -2574,17 +2574,17 @@ pub fn tape_send(peer: &str, length: usize) -> Result<(), &'static str> {
     let staging = crate::tape::staging().ok_or("no memory for the transfer buffer")?;
     crate::println!("Sending {length} bytes to {} as a tape (it must be in `tape load net`)...", Mac(&mac));
     netfs_reply(nic, &mac, 0x10, &(length as u32).to_le_bytes());
-    let mut next = apic::micros() + 10_000;
+    let mut next = timer::micros() + 10_000;
     blocking(true);
     for (sequence, chunk) in staging[..length].chunks(NETFS_CHUNK).enumerate() {
         let mut frame = [0u8; 4 + NETFS_CHUNK];
         frame[0..4].copy_from_slice(&(sequence as u32).to_le_bytes());
         frame[4..4 + chunk.len()].copy_from_slice(chunk);
         // One frame per 3 ms (as tools/send_tape.py): the receiver polls a finite ring (the sender is not told about a lost frame).
-        while apic::micros() < next {
+        while timer::micros() < next {
             core::hint::spin_loop();
         }
-        next = apic::micros() + 3000;
+        next = timer::micros() + 3000;
         netfs_reply(nic, &mac, 0x11, &frame[..4 + chunk.len()]);
         crate::debug::pet();
         if break_requested() {
@@ -3209,11 +3209,11 @@ pub(crate) fn nic_discover() {
     crate::println!("Looking for other fos machines (3 s)...");
     unsafe { PEER_COUNT = 0 };
     blocking(true);
-    let started = apic::ticks();
+    let started = timer::ticks();
     let mut next_probe = started;
-    while apic::ticks() < started + 3 * apic::TICK_HZ && !break_requested() {
-        if apic::ticks() >= next_probe {
-            next_probe += apic::TICK_HZ;
+    while timer::ticks() < started + 3 * timer::TICK_HZ && !break_requested() {
+        if timer::ticks() >= next_probe {
+            next_probe += timer::TICK_HZ;
             for index in 0..nic_count() {
                 if let Some(nic) = nic_at(index) {
                     let mut name = [0u8; 20];
@@ -3258,8 +3258,8 @@ fn nic_map() {
             frame[14..20].copy_from_slice(b"FOSMAP");
             frame[20] = from as u8;
             nic.send(&frame);
-            let until = apic::ticks() + apic::TICK_HZ / 5;
-            while apic::ticks() < until {
+            let until = timer::ticks() + timer::TICK_HZ / 5;
+            while timer::ticks() < until {
                 drain_nics(|to, received| {
                     if received.len() >= 21 && received[12..14] == [0x88, 0xb9] && &received[14..20] == b"FOSMAP" {
                         let sender = usize::from(received[20]);
@@ -3431,13 +3431,13 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
     card.ts_enable();
     match action {
         None => {
-            let (before, start) = (card.systim(), apic::ticks());
-            while apic::ticks() < start + apic::TICK_HZ / 10 {
+            let (before, start) = (card.systim(), timer::ticks());
+            while timer::ticks() < start + timer::TICK_HZ / 10 {
                 core::hint::spin_loop();
             }
-            let (after, end) = (card.systim(), apic::ticks());
+            let (after, end) = (card.systim(), timer::ticks());
             let ns = after.wrapping_sub(before) & 0xff_ffff_ffff;
-            crate::println!("nic {index}: SYSTIM {after} ns; advanced {ns} ns in {} ticks of {} Hz (1 ns a tick: {} expected).", end - start, apic::TICK_HZ, (end - start) * 1_000_000_000 / apic::TICK_HZ);
+            crate::println!("nic {index}: SYSTIM {after} ns; advanced {ns} ns in {} ticks of {} Hz (1 ns a tick: {} expected).", end - start, timer::TICK_HZ, (end - start) * 1_000_000_000 / timer::TICK_HZ);
         }
         Some("send") => {
             let mut frame = [0u8; 60];
@@ -3473,10 +3473,10 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
             }
             blocking(true);
             unsafe { QUEUE_ALL = true };
-            let deadline = apic::ticks() + 5 * apic::TICK_HZ;
+            let deadline = timer::ticks() + 5 * timer::TICK_HZ;
             crate::println!("nic {index}: stamping every received frame for 5 s.");
             let (mut frames, mut stamped, mut shown, mut missing, mut previous) = (0u32, 0u32, 0, 0u32, 0u64);
-            while apic::ticks() < deadline && !break_requested() {
+            while timer::ticks() < deadline && !break_requested() {
                 poll();
                 let mut buffer = [0u8; 1600];
                 loop {
@@ -3512,9 +3512,9 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
         Some("listen") => {
             blocking(true);
             unsafe { QUEUE_ALL = true };
-            let deadline = apic::ticks() + 10 * apic::TICK_HZ;
+            let deadline = timer::ticks() + 10 * timer::TICK_HZ;
             crate::println!("nic {index}: listening 10 s for PTP-over-Ethernet event frames (ethertype 0x88f7).");
-            while apic::ticks() < deadline && !break_requested() {
+            while timer::ticks() < deadline && !break_requested() {
                 poll();
                 let mut buffer = [0u8; 1600];
                 while pop_frame(index - 1, &mut buffer) != 0 {
@@ -3538,11 +3538,11 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
             };
             if action == Some("adjust") {
                 let written = card.ts_adjust(value as i32);
-                let (before, start) = (card.systim(), apic::micros());
-                while apic::micros() < start + 4_000_000 {
+                let (before, start) = (card.systim(), timer::micros());
+                while timer::micros() < start + 4_000_000 {
                     core::hint::spin_loop();
                 }
-                let (after, end) = (card.systim(), apic::micros());
+                let (after, end) = (card.systim(), timer::micros());
                 let (ns, expect) = ((after.wrapping_sub(before) & 0xff_ffff_ffff) as i64, ((end - start) * 1000) as i64);
                 crate::println!("nic {index}: TIMINCA {written:#x}; over {} ms the card clock ran {} ppb against the CPU's timer (compare with adjust 0).", (end - start) / 1000, (ns - expect) * 1_000_000_000 / expect);
             } else {
@@ -3566,8 +3566,8 @@ fn nic_recv_test() {
 }
 
 fn nic_recv_wait() {
-    let deadline = apic::ticks() + 3 * apic::TICK_HZ;
-    while apic::ticks() < deadline && !break_requested() {
+    let deadline = timer::ticks() + 3 * timer::TICK_HZ;
+    while timer::ticks() < deadline && !break_requested() {
         poll();
         for index in 0..nic_count() {
             let mut buffer = [0u8; 1600];
@@ -3657,13 +3657,13 @@ static mut POWER_MARK: (u64, u64, u64, [u64; crate::cpu::SPIN_REASONS]) = (0, 0,
 fn power_command(sample_seconds: Option<u64>) {
     use crate::cpu::{idle_stats, SPIN_REASONS};
     if let Some(seconds) = sample_seconds {
-        let end = apic::ticks() + seconds.min(60) * apic::TICK_HZ;
-        while apic::ticks() < end {
+        let end = timer::ticks() + seconds.min(60) * timer::TICK_HZ;
+        while timer::ticks() < end {
             crate::debug::pet();
             crate::cpu::sleep();
         }
     }
-    let now = apic::micros();
+    let now = timer::micros();
     let (halted, wakeups, spun) = idle_stats();
     let mark = unsafe { *core::ptr::addr_of!(POWER_MARK) };
     let report = |label: &str, span: u64, halted: u64, wakeups: u64, spun: [u64; SPIN_REASONS]| {

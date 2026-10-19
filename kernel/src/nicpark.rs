@@ -9,7 +9,7 @@
 //! `IDLE_SECONDS`. Only drivers that can reach the PHY take part (e1000 classic and I350, RTL8139, RTL8168); a NIC with a
 //! link is never parked. QEMU models none of the power savings, so only real hardware shows the effect.
 
-use crate::{apic, nic::Nic, term};
+use crate::{nic::Nic, term, timer};
 
 const POWER_DOWN: u16 = 1 << 11;
 const AUTONEG_ENABLE: u16 = 1 << 12;
@@ -68,7 +68,7 @@ pub fn park(index: usize) -> Result<(), &'static str> {
     slot.parked = true;
     slot.parks += 1;
     slot.wake_until = 0;
-    slot.next_wake = apic::ticks() + WAKE_EVERY_SECONDS * apic::TICK_HZ;
+    slot.next_wake = timer::ticks() + WAKE_EVERY_SECONDS * timer::TICK_HZ;
     Ok(())
 }
 
@@ -86,7 +86,7 @@ pub fn unpark(index: usize) -> Result<(), &'static str> {
 
 /// Called from the periodic service loops: parks idle NICs (automatic mode) and runs the wake-up checks of parked ones.
 pub fn service() {
-    let now = apic::ticks();
+    let now = timer::ticks();
     for index in 0..term::nic_count() {
         let Some(nic) = term::nic_at(index) else { continue };
         let state = slot(index);
@@ -98,18 +98,18 @@ pub fn service() {
                     state.down_since = 0;
                 } else if now >= state.wake_until {
                     state.wake_until = 0;
-                    state.next_wake = now + WAKE_EVERY_SECONDS * apic::TICK_HZ;
+                    state.next_wake = now + WAKE_EVERY_SECONDS * timer::TICK_HZ;
                     power_down(nic, true);
                 }
             } else if now >= state.next_wake && power_down(nic, false) {
-                state.wake_until = now + WAKE_FOR_SECONDS * apic::TICK_HZ;
+                state.wake_until = now + WAKE_FOR_SECONDS * timer::TICK_HZ;
             }
         } else if unsafe { AUTO } {
             if nic.link_up() {
                 state.down_since = 0;
             } else if state.down_since == 0 {
                 state.down_since = now.max(1);
-            } else if now - state.down_since >= IDLE_SECONDS * apic::TICK_HZ {
+            } else if now - state.down_since >= IDLE_SECONDS * timer::TICK_HZ {
                 let _ = park(index);
                 state.down_since = now;
             }

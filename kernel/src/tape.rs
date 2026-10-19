@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use fosfor_abi::tape::*;
 use fosfor_abi::{BootInfo, elf};
 
-use crate::{apic, memory, paging, storage, term};
+use crate::{memory, paging, storage, term, timer};
 
 const HUGE: u64 = 2 * 1024 * 1024;
 const REGION_BYTES: u64 = 4 * 1024 * 1024;
@@ -174,11 +174,11 @@ extern "C" fn api_set_input_mode(_mode: u32) {}
 extern "C" fn api_wait_for_event() {
     use crate::cpu::{spun, Spin};
     term::flush_output();
-    let begin = apic::micros();
+    let begin = timer::micros();
     // Idle time is when queued serial output goes out; a tick alone would drain only 16 bytes per 10 ms.
     if crate::serial::pending() {
         let until = begin + 100;
-        while crate::serial::pending() && apic::micros() < until {
+        while crate::serial::pending() && timer::micros() < until {
             crate::serial::pump();
         }
         spun(Spin::SerialOut, begin);
@@ -187,7 +187,7 @@ extern "C" fn api_wait_for_event() {
     if crate::uart::any_open() {
         // A polled UART: its 16-byte FIFO overflows in 1.4 ms at 115200 baud, a tick later would be too late.
         let until = begin + 100;
-        while apic::micros() < until {
+        while timer::micros() < until {
             crate::uart::poll();
             core::hint::spin_loop();
         }
@@ -201,17 +201,17 @@ extern "C" fn api_wait_for_event() {
         // A polled NIC would only be noticed at the next 10 ms tick, adding that to every
         // frame. Yield briefly instead (about 100 us).
         let until = begin + 100;
-        while apic::micros() < until {
+        while timer::micros() < until {
             core::hint::spin_loop();
         }
         spun(Spin::PolledNic, begin);
     }
 }
 extern "C" fn api_ticks() -> u64 {
-    apic::ticks()
+    timer::ticks()
 }
 extern "C" fn api_micros() -> u64 {
-    apic::micros()
+    timer::micros()
 }
 extern "C" fn api_alloc(bytes: usize) -> usize {
     if bytes == 0 {
@@ -808,7 +808,7 @@ fn receive_from_network() -> Result<usize, &'static str> {
     let mut sender: Option<[u8; 6]> = None;
     let (mut expected, mut received, mut next_sequence) = (0usize, 0usize, 0u32);
     let mut transferring = false;
-    let mut last_report = apic::ticks();
+    let mut last_report = timer::ticks();
     let result = loop {
         if term::tape_should_abort() {
             break Err("gave up");
@@ -848,9 +848,9 @@ fn receive_from_network() -> Result<usize, &'static str> {
                 staging[received..received + take].copy_from_slice(&payload[4..4 + take]);
                 received += take;
                 next_sequence += 1;
-                if apic::ticks() - last_report >= 200 {
+                if timer::ticks() - last_report >= 200 {
                     crate::println!("  {received} / {expected} bytes");
-                    last_report = apic::ticks();
+                    last_report = timer::ticks();
                 }
             }
             TAG_TAPE_STOP if transferring => {

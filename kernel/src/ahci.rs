@@ -14,7 +14,7 @@
 //! each port is stopped before it is pointed at fresh structures. The HBA is not reset:
 //! other ports may be in use.
 
-use crate::{apic, memory, paging, pci};
+use crate::{memory, paging, pci, timer};
 
 pub const MAX_CONTROLLERS: usize = 2;
 pub const MAX_DRIVES: usize = 8;
@@ -82,13 +82,13 @@ fn write32(address: usize, value: u32) {
 }
 
 fn wait_until(ticks: u64, mut condition: impl FnMut() -> bool) -> bool {
-    let start = apic::ticks();
+    let start = timer::ticks();
     loop {
         crate::debug::pet();
         if condition() {
             return true;
         }
-        if apic::ticks().wrapping_sub(start) >= ticks {
+        if timer::ticks().wrapping_sub(start) >= ticks {
             return condition();
         }
         core::hint::spin_loop();

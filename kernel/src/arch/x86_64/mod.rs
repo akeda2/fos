@@ -11,6 +11,12 @@ pub mod msi;
 pub mod paging;
 pub mod serial;
 
+/// The system timer as the rest of the kernel sees it (`crate::timer`): a tick counter at `TICK_HZ` and a microsecond clock.
+/// On x86 it is the local APIC timer; another architecture provides the same five names from its own timer.
+pub mod timer {
+    pub use super::apic::{busy_wait_ms, micros, ticks, wait_ticks, TICK_HZ};
+}
+
 core::arch::global_asm!(
     r#"
     .section .text.entry, "ax"

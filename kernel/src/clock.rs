@@ -10,7 +10,7 @@
 //! A clock whose battery is dead reads garbage or a date long ago; `now()` then says `None` rather than inventing a
 //! time, and callers fall back to a fixed stamp. `date set` fixes that for the session and writes the RTC.
 
-use crate::{apic, cpu};
+use crate::{cpu, timer};
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use fat::Time;
 
@@ -136,7 +136,7 @@ pub fn init(century: u8) {
 }
 
 fn set_base(time: &Time) {
-    BASE_MICROS.store(apic::micros(), Ordering::Relaxed);
+    BASE_MICROS.store(timer::micros(), Ordering::Relaxed);
     BASE_SECONDS.store(to_seconds(time), Ordering::Relaxed);
 }
 
@@ -146,7 +146,7 @@ pub fn now() -> Option<Time> {
     if base == 0 {
         return None;
     }
-    let elapsed = apic::micros().saturating_sub(BASE_MICROS.load(Ordering::Relaxed)) / 1_000_000;
+    let elapsed = timer::micros().saturating_sub(BASE_MICROS.load(Ordering::Relaxed)) / 1_000_000;
     Some(from_seconds(base + elapsed))
 }
 

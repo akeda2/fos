@@ -122,7 +122,7 @@ fn report_and_stop(frame: &Frame, always_reset: bool) -> ! {
             );
         } else {
             println!("*** resetting in {} s", debug.reboot_delay_seconds);
-            crate::apic::busy_wait_ms(u64::from(debug.reboot_delay_seconds) * 1000);
+            crate::timer::busy_wait_ms(u64::from(debug.reboot_delay_seconds) * 1000);
             crate::power::reset(crate::power::runtime_services());
         }
     }
