@@ -37,6 +37,50 @@ fn write(offset: u64, value: u32) {
     unsafe { ((BASE + offset) as *mut u32).write_volatile(value) }
 }
 
+/// Posts the message in `page` and waits for the answer to the same buffer. Bounded.
+fn transact(page: u64) -> bool {
+    let message = ((page | BUS_ALIAS) as u32 & !0xf) | CHANNEL;
+    let start = timer::micros();
+    while read(WRITE_STATUS) & FULL != 0 {
+        if timer::micros() - start > TIMEOUT_US {
+            return false;
+        }
+    }
+    write(WRITE, message);
+    while timer::micros() - start <= TIMEOUT_US {
+        if read(READ_STATUS) & EMPTY == 0 && read(READ) == message {
+            return unsafe { (page as *const u32).add(1).read_volatile() } == 0x8000_0000;
+        }
+    }
+    false
+}
+
+/// Asks the firmware for a 32-bit framebuffer of `width` x `height` on `display` (selected first), and returns its address
+/// (ARM side, the bus alias removed), size in bytes and pitch in bytes. The firmware may answer with other dimensions.
+pub fn framebuffer(display: u32, width: u32, height: u32) -> Option<(u64, u64, u32)> {
+    tag(SET_DISPLAY_NUM, &[display], &mut [0u32])?;
+    let page = memory::allocate_contiguous(1, Some(1 << 32))?;
+    let buffer = page as *mut u32;
+    let message: [u32; 30] = [
+        30 * 4, 0,
+        SET_DISPLAY_NUM, 4, 0, display,
+        0x0004_8003, 8, 0, width, height,
+        0x0004_8004, 8, 0, width, height,
+        0x0004_8005, 4, 0, 32,
+        0x0004_0001, 8, 0, 4096, 0,
+        GET_PITCH, 4, 0, 0,
+        0,
+    ];
+    for (index, value) in message.iter().enumerate() {
+        unsafe { buffer.add(index).write_volatile(*value) };
+    }
+    let ok = transact(page);
+    let get = |index: usize| unsafe { buffer.add(index).read_volatile() };
+    let result = (ok && get(22) & 0x8000_0000 != 0 && get(23) != 0).then(|| (u64::from(get(23) & 0x3fff_ffff), u64::from(get(24)), get(28)));
+    memory::free(page, 1);
+    result
+}
+
 /// Sends one property message holding a single tag with `request` as its value (the answer may be longer, up to `WORDS`),
 /// and returns the first `reply.len()` answer words. `None` if the mailbox does not answer, or the firmware does not know
 /// the tag (it then leaves the response bit clear).
@@ -56,23 +100,8 @@ pub fn tag(id: u32, request: &[u32], reply: &mut [u32]) -> Option<()> {
         put(5 + index, *value);
     }
     put(5 + words, 0);
-    let message = ((page | BUS_ALIAS) as u32 & !0xf) | CHANNEL;
-    let start = timer::micros();
-    let mut ok = false;
-    while read(WRITE_STATUS) & FULL != 0 {
-        if timer::micros() - start > TIMEOUT_US {
-            memory::free(page, 1);
-            return None;
-        }
-    }
-    write(WRITE, message);
-    while timer::micros() - start <= TIMEOUT_US {
-        if read(READ_STATUS) & EMPTY == 0 && read(READ) == message {
-            ok = true;
-            break;
-        }
-    }
-    let answered = ok && get(1) == 0x8000_0000 && get(4) & 0x8000_0000 != 0;
+    let ok = transact(page);
+    let answered = ok && get(4) & 0x8000_0000 != 0;
     if answered {
         for (index, slot) in reply.iter_mut().enumerate() {
             *slot = get(5 + index);

@@ -64,7 +64,7 @@ fn execute(line: &str) {
         "sector" => sector(rest),
         "audio" => audio(rest),
         "date" => date(rest),
-        "display" => display(),
+        "display" => display(rest),
         "run" => run_tape(rest),
         "keymap" => match crate::usb_kbd::layout_named(rest) {
             Some(layout) => crate::usb_kbd::set_layout(layout),
@@ -515,10 +515,29 @@ fn audio(rest: &str) {
 
 /// `display` asks the Pi's VideoCore firmware how many HDMI outputs it drives and what each is set to (read-only: it selects
 /// a display for the questions, then selects display 0 again). Meaningful on a Pi only; elsewhere the mailbox does not answer.
-fn display() {
+fn display(rest: &str) {
     use crate::mailbox::*;
     if crate::arch::aarch64::gic::bases().0 != 0xff84_1000 {
         println!("display: the VideoCore mailbox exists on a Raspberry Pi 4 only.");
+        return;
+    }
+    if rest.starts_with("test") {
+        let display: u32 = rest[4..].trim().parse().unwrap_or(1);
+        match framebuffer(display, 1920, 1080) {
+            Some((base, size, pitch)) => {
+                println!("display {display}: framebuffer {base:#x}, {size} bytes, pitch {pitch}; drawing colour bars.");
+                crate::paging::map_framebuffer(base, size);
+                let (width, rows) = (pitch as u64 / 4, size / u64::from(pitch));
+                let colours = [0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x808080];
+                for y in 0..rows {
+                    for x in 0..width {
+                        let colour = colours[(x * 8 / width) as usize];
+                        unsafe { ((base + (y * width + x) * 4) as *mut u32).write_volatile(colour) };
+                    }
+                }
+            }
+            None => println!("display {display}: the firmware gave no framebuffer."),
+        }
         return;
     }
     let mut count = [0u32];
