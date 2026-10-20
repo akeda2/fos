@@ -22,20 +22,43 @@ fn error(code: isize) -> FsError {
     }
 }
 
+/// A bare name means the boot volume. `tape_fs` would also look on other disks for a tape's configuration file; the
+/// shell does not, so `cat NAME` says "no such file" for a file that lives on another disk.
+fn pin<'a>(reference: &'a str, storage: &'a mut [u8; 96]) -> &'a [u8] {
+    let Some(boot) = crate::storage::boot_disk().filter(|_| !reference.contains('/')) else { return reference.as_bytes() };
+    let mut cursor = Cursor(storage, 0);
+    if fmt::write(&mut cursor, format_args!("disk{}/{reference}", boot + 1)).is_err() {
+        return reference.as_bytes();
+    }
+    let end = cursor.1;
+    &storage[..end]
+}
+
+struct Cursor<'a>(&'a mut [u8], usize);
+
+impl fmt::Write for Cursor<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.1 + text.len();
+        self.0.get_mut(self.1..end).ok_or(fmt::Error)?.copy_from_slice(text.as_bytes());
+        self.1 = end;
+        Ok(())
+    }
+}
+
 impl Host for KernelHost {
     fn print(&mut self, arguments: fmt::Arguments) {
         crate::print(arguments);
     }
 
     fn read(&mut self, reference: &str, buffer: &mut [u8]) -> Result<usize, FsError> {
-        match tape_fs::read(reference.as_bytes(), buffer) {
+        match tape_fs::read(pin(reference, &mut [0; 96]), buffer) {
             length if length >= 0 => Ok(length as usize),
             code => Err(error(code)),
         }
     }
 
     fn length(&mut self, reference: &str) -> Result<u64, FsError> {
-        match tape_fs::length(reference.as_bytes()) {
+        match tape_fs::length(pin(reference, &mut [0; 96])) {
             length if length >= 0 => Ok(length as u64),
             code => Err(error(code)),
         }

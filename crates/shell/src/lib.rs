@@ -61,7 +61,7 @@ impl fmt::Display for FsError {
             FsError::NotFound => "no such file",
             FsError::TooBig => "the file is too big for this command",
             FsError::BadName => "that name cannot be used on that volume",
-            FsError::NoVolume => "no such volume (see `disks`)",
+            FsError::NoVolume => "no such disk, or no FOSFS data partition or FAT volume on it (see `disks`)",
             FsError::Empty => "an empty file cannot be made on a FAT volume",
             FsError::Failed => "the volume could not be read or written (no room, or damaged)",
         })

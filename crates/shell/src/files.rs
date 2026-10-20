@@ -52,7 +52,7 @@ fn ls(host: &mut dyn Host, rest: &str) {
         sayln!(host);
     });
     match outcome {
-        Ok(kind) if !any && volume.is_empty() => sayln!(host, "{kind} is empty."),
+        Ok(kind) if !any && (volume.is_empty() || kind == "FOSFS") => sayln!(host, "{kind} is empty."),
         Ok(kind) if !any => sayln!(host, "{volume} ({kind}) is empty."),
         Ok(_) => {}
         Err(error) if volume.is_empty() => sayln!(host, "ls: {error}."),
@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(run(&mut host, "ls esp"), "esp (FAT32) is empty.\n");
         run(&mut host, "write a.txt 12345");
         assert_eq!(run(&mut host, "ls"), "a.txt                     5 bytes\n");
-        assert_eq!(run(&mut host, "ls disk9"), "ls: disk9: no such volume (see `disks`).\n");
+        assert_eq!(run(&mut host, "ls disk9"), "ls: disk9: no such disk, or no FOSFS data partition or FAT volume on it (see `disks`).\n");
     }
 
     #[test]
