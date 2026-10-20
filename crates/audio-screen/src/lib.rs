@@ -16,6 +16,8 @@ pub struct Startup<'a> {
     pub arguments: &'a str,
     pub width: u32,
     pub height: u32,
+    /// The tape screen (`screen=N`, default 0); `width` and `height` are that screen's.
+    pub screen: u32,
 }
 
 /// The shared beginning of `tape_main`: `device=N` and `outdev=M`, the hard-float check and the pixel screen size (at most
@@ -30,10 +32,11 @@ pub fn startup(api: &'static TapeApi, max_width: u32, max_height: u32) -> Result
     if tape_rt::fp_level() == 0 {
         return Err("needs a hard-float tape build (kernel without FP support?)");
     }
-    let Some((width, height)) = tape_rt::gfx_info() else {
-        return Err("no pixel screen (BIOS text mode). Use a UEFI boot or a VBE mode");
+    let screen = tape_rt::screen_arg(arguments);
+    let Some((width, height)) = tape_rt::gfx_info_on(screen) else {
+        return Err(if screen == 0 { "no pixel screen (BIOS text mode). Use a UEFI boot or a VBE mode" } else { "no such screen (screen=N)" });
     };
-    Ok(Startup { arguments, width: width.min(max_width), height: height.min(max_height) })
+    Ok(Startup { arguments, width: width.min(max_width), height: height.min(max_height), screen })
 }
 
 /// The capture side of the active audio device, and which channel (or, for a stereo tool, which first channel) is chosen.

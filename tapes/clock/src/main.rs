@@ -464,7 +464,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if tape_rt::fp_level() == 0 {
         return println!("clock: needs a hard-float tape build (kernel without FP support?).");
     }
-    let Some((width, height)) = tape_rt::gfx_info() else {
+    let screen_number = tape_rt::screen_arg(core::str::from_utf8(tape_rt::args()).unwrap_or(""));
+    let Some((width, height)) = tape_rt::gfx_info_on(screen_number) else {
         return println!("clock: no pixel screen (BIOS text mode). Use a UEFI boot or a VBE mode.");
     };
     let config = match tape_rt::config::Config::load(api, "clock", core::str::from_utf8(tape_rt::args()).unwrap_or("")) {
@@ -504,7 +505,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
 
     let g = Geometry::new(width.min(MAX_WIDTH), height.min(MAX_HEIGHT));
-    let Some(mut screen) = Screen::new(api, g.width as u32, g.height as u32) else { return println!("clock: out of memory.") };
+    let Some(mut screen) = Screen::new(api, g.width as u32, g.height as u32).map(|screen| screen.on(screen_number)) else { return println!("clock: out of memory.") };
     if !screen.open() {
         return println!("clock: cannot take the screen.");
     }

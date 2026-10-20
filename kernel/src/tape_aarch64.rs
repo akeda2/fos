@@ -17,7 +17,8 @@ const REGION_BYTES: u64 = 4 * 1024 * 1024;
 const STAGE_BYTES: usize = 4 * 1024 * 1024;
 const STACK_BYTES: u64 = 1024 * 1024;
 
-static mut REGION: u64 = 0;
+/// Two tape regions: `run A + B` keeps both tapes loaded at once.
+static mut REGIONS: [u64; 2] = [0; 2];
 static mut INFO: *const BootInfo = core::ptr::null();
 static SPAN: AtomicU64 = AtomicU64::new(0);
 
@@ -60,9 +61,10 @@ stubs! {
     api_serial_break(usize, u32) = ();
 }
 
-fn region() -> Option<u64> {
+fn region(slot: usize) -> Option<u64> {
     unsafe {
-        if REGION == 0 {
+        let regions = &mut *core::ptr::addr_of_mut!(REGIONS);
+        if regions[slot] == 0 {
             let total = REGION_BYTES + HUGE;
             let raw = memory::allocate_contiguous(total / memory::FRAME, None)?;
             let start = (raw + HUGE - 1) & !(HUGE - 1);
@@ -70,14 +72,19 @@ fn region() -> Option<u64> {
             let end = start + REGION_BYTES;
             memory::free(end, (raw + total - end) / memory::FRAME);
             paging::set_executable(start, REGION_BYTES, true);
-            REGION = start;
+            regions[slot] = start;
         }
-        Some(REGION)
+        Some(regions[slot])
     }
 }
 
 /// Reads `name` from the boot volume, relocates it into the tape region and returns its entry point.
 pub fn load(name: &str) -> Result<u64, &'static str> {
+    load_slot(name, 0)
+}
+
+/// `load` into region `slot` (0 or 1), so two tapes can be resident together.
+pub fn load_slot(name: &str, slot: usize) -> Result<u64, &'static str> {
     let volume = storage::boot_volume().ok_or("no boot volume")?;
     let staging = memory::allocate_contiguous(STAGE_BYTES as u64 / memory::FRAME, None).ok_or("no memory for staging")?;
     let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, STAGE_BYTES) };
@@ -92,7 +99,7 @@ pub fn load(name: &str) -> Result<u64, &'static str> {
         if span > REGION_BYTES {
             return Err("the tape does not fit the 4 MiB region");
         }
-        let base = region().ok_or("no memory for the tape region")?;
+        let base = region(slot).ok_or("no memory for the tape region")?;
         unsafe { core::ptr::write_bytes(base as *mut u8, 0, REGION_BYTES as usize) };
         let entry = unsafe { elf::load(image, base) }.map_err(|_| "the tape's ELF segments are malformed")?;
         cpu::sync_code(base, REGION_BYTES);
@@ -103,11 +110,8 @@ pub fn load(name: &str) -> Result<u64, &'static str> {
     outcome
 }
 
-/// Calls the tape's entry on a stack of its own with the API table; returns when the tape returns.
-pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
-    let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
-    let stack = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None).ok_or("no memory for the tape's stack")?;
-    let api = TapeApi {
+fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
+    TapeApi {
         version: TAPE_API_VERSION,
         size: core::mem::size_of::<TapeApi>() as u32,
         putc: api_putc,
@@ -192,7 +196,14 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
         gfx_close_on: crate::framebuffer::api_gfx_close_on,
         gfx_fill_on: crate::framebuffer::api_gfx_fill_on,
         gfx_blit_on: crate::framebuffer::api_gfx_blit_on,
-    };
+    }
+}
+
+/// Calls the tape's entry on a stack of its own with the API table; returns when the tape returns.
+pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
+    let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
+    let stack = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None).ok_or("no memory for the tape's stack")?;
+    let api = make_api(info, arguments);
     cpu::fp_enable();
     unsafe {
         // x21 is callee-saved, so the tape preserves it: it keeps our stack pointer across the call.
@@ -268,10 +279,22 @@ extern "C" fn api_gfx_blit(x: u32, y: u32, width: u32, height: u32, pixels: *con
     u32::from(unsafe { crate::framebuffer::gfx_blit(x, y, width, height, pixels, stride) })
 }
 
-/// The next typed byte from the serial console or the USB keyboard.
+/// The next typed byte from the serial console or the USB keyboard. With two tapes running only the focused one gets keys;
+/// Tab passes the focus to the other.
 fn next_byte() -> Option<u8> {
     crate::usb_kbd::poll();
-    crate::arch::aarch64::pl011::read_byte().or_else(crate::usb_kbd::pop)
+    let tasks = tasks();
+    if tasks.active && tasks.current != tasks.focus {
+        return None;
+    }
+    let byte = crate::arch::aarch64::pl011::read_byte().or_else(crate::usb_kbd::pop)?;
+    if tasks.active && byte == 0x09 {
+        if let Some(other) = tasks.next_live(tasks.focus) {
+            tasks.focus = other;
+        }
+        return None;
+    }
+    Some(byte)
 }
 
 extern "C" fn api_read_key() -> u32 {
@@ -289,8 +312,20 @@ extern "C" fn api_should_abort() -> u32 {
 
 extern "C" fn api_set_input_mode(_mode: u32) {}
 
+/// A tape found nothing to do. Alone, the CPU sleeps until the next interrupt. With two tapes each gets a pass before the CPU
+/// sleeps, and the other tape runs now.
 extern "C" fn api_wait_for_event() {
-    cpu::sleep();
+    let tasks = tasks();
+    if !tasks.active {
+        cpu::sleep();
+        return;
+    }
+    tasks.streak += 1;
+    if tasks.streak >= tasks.live() {
+        tasks.streak = 0;
+        cpu::sleep();
+    }
+    yield_to_next();
 }
 
 extern "C" fn api_ticks() -> u64 {
@@ -464,4 +499,168 @@ extern "C" fn api_console_size() -> u32 {
 /// Baseline FP is NEON/FP, which every aarch64 CPU has; there is no AVX2 equivalent to offer, so level 2 is never returned.
 extern "C" fn api_fp_level() -> u32 {
     FP_NEON
+}
+
+// Two tapes on one core (`run A + B`): cooperative tasks. Each tape has a stack of its own and runs until it calls
+// `wait_for_event` (what `tape_rt::idle` does between polling passes), which switches to the other. The kernel is never
+// interrupted halfway, so its unlocked state needs no protection; that is why this is not a second core (the kernel runs
+// on core 0 only and is not safe to enter from two cores).
+core::arch::global_asm!(
+    r#"
+    .arch_extension fp
+    .global fos_task_switch
+fos_task_switch:
+    sub sp, sp, #176
+    stp x19, x20, [sp, #0]
+    stp x21, x22, [sp, #16]
+    stp x23, x24, [sp, #32]
+    stp x25, x26, [sp, #48]
+    stp x27, x28, [sp, #64]
+    stp x29, x30, [sp, #80]
+    stp d8, d9, [sp, #96]
+    stp d10, d11, [sp, #112]
+    stp d12, d13, [sp, #128]
+    stp d14, d15, [sp, #144]
+    mov x2, sp
+    str x2, [x0]
+    mov sp, x1
+    ldp x19, x20, [sp, #0]
+    ldp x21, x22, [sp, #16]
+    ldp x23, x24, [sp, #32]
+    ldp x25, x26, [sp, #48]
+    ldp x27, x28, [sp, #64]
+    ldp x29, x30, [sp, #80]
+    ldp d8, d9, [sp, #96]
+    ldp d10, d11, [sp, #112]
+    ldp d12, d13, [sp, #128]
+    ldp d14, d15, [sp, #144]
+    add sp, sp, #176
+    ret
+    .global fos_task_start
+fos_task_start:
+    mov x0, x20
+    blr x19
+    bl fos_task_finished
+    brk #0
+"#
+);
+
+unsafe extern "C" {
+    /// Saves the callee-saved registers on this stack, stores the stack pointer at `save`, resumes the context at `to`.
+    fn fos_task_switch(save: *mut u64, to: u64);
+    fn fos_task_start();
+}
+
+const TASKS: usize = 2;
+/// Bytes `fos_task_switch` pushes: x19-x30 and d8-d15.
+const SWITCH_FRAME: u64 = 176;
+
+struct Tasks {
+    active: bool,
+    sp: [u64; TASKS],
+    done: [bool; TASKS],
+    /// Where `run_two` waits for the tasks to end.
+    main_sp: u64,
+    current: usize,
+    /// The task that gets the keyboard.
+    focus: usize,
+    /// Tasks that have idled since the CPU last slept.
+    streak: usize,
+}
+
+static mut TASKS_STATE: Tasks = Tasks { active: false, sp: [0; TASKS], done: [false; TASKS], main_sp: 0, current: 0, focus: 0, streak: 0 };
+
+fn tasks() -> &'static mut Tasks {
+    unsafe { &mut *core::ptr::addr_of_mut!(TASKS_STATE) }
+}
+
+impl Tasks {
+    fn live(&self) -> usize {
+        self.done.iter().filter(|done| !**done).count()
+    }
+
+    /// The next task after `from` that has not finished.
+    fn next_live(&self, from: usize) -> Option<usize> {
+        (1..TASKS).map(|step| (from + step) % TASKS).find(|&task| !self.done[task])
+    }
+}
+
+fn yield_to_next() {
+    let tasks = tasks();
+    let me = tasks.current;
+    if let Some(next) = tasks.next_live(me) {
+        tasks.current = next;
+        unsafe { fos_task_switch(&mut tasks.sp[me], tasks.sp[next]) };
+    }
+}
+
+/// Where a task lands when its tape returns (`fos_task_start`): runs the other task, or hands back to `run_two`.
+#[unsafe(no_mangle)]
+extern "C" fn fos_task_finished() -> ! {
+    let tasks = tasks();
+    let me = tasks.current;
+    tasks.done[me] = true;
+    let next = tasks.next_live(me);
+    if tasks.focus == me {
+        tasks.focus = next.unwrap_or(me);
+    }
+    let to = match next {
+        Some(next) => {
+            tasks.current = next;
+            tasks.sp[next]
+        }
+        None => tasks.main_sp,
+    };
+    unsafe { fos_task_switch(&mut tasks.sp[me], to) };
+    loop {
+        cpu::sleep();
+    }
+}
+
+/// Runs two loaded tapes side by side on this core until both have returned. Tab moves the keyboard between them.
+pub fn run_two(tapes: [(u64, &str); TASKS]) -> Result<(), &'static str> {
+    let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
+    let mut stacks = [0u64; TASKS];
+    for index in 0..TASKS {
+        match memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None) {
+            Some(stack) => stacks[index] = stack,
+            None => {
+                for stack in stacks[..index].iter() {
+                    memory::free(*stack, STACK_BYTES / memory::FRAME);
+                }
+                return Err("no memory for the tapes' stacks");
+            }
+        }
+    }
+    cpu::fp_enable();
+    let state = tasks();
+    for (index, (entry, arguments)) in tapes.iter().enumerate() {
+        // The tape's API table sits at the top of its stack; below it a first switch frame that "returns" into
+        // fos_task_start with x19 = entry and x20 = the table.
+        let api_at = (stacks[index] + STACK_BYTES as u64 - core::mem::size_of::<TapeApi>() as u64) & !15;
+        let frame = api_at - SWITCH_FRAME;
+        unsafe {
+            (api_at as *mut TapeApi).write(make_api(info, arguments));
+            core::ptr::write_bytes(frame as *mut u8, 0, SWITCH_FRAME as usize);
+            let words = frame as *mut u64;
+            words.write(*entry);
+            words.add(1).write(api_at);
+            words.add(11).write(fos_task_start as usize as u64);
+        }
+        state.sp[index] = frame;
+        state.done[index] = false;
+    }
+    state.focus = 0;
+    state.streak = 0;
+    state.current = 0;
+    state.active = true;
+    unsafe { fos_task_switch(&mut state.main_sp, state.sp[0]) };
+    state.active = false;
+    crate::framebuffer::gfx_close();
+    crate::framebuffer::gfx_close_extra();
+    unsafe { PENDING_LENGTH = 0 };
+    for stack in stacks {
+        memory::free(stack, STACK_BYTES / memory::FRAME);
+    }
+    Ok(())
 }

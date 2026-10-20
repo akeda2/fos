@@ -197,6 +197,8 @@ def main():
     check(pixel(4, 71) == (0, 255, 0) and pixel(8, 71) == black, "gfx_blit: a wider stride draws only the block's width", str((pixel(4, 71), pixel(8, 71))))
     check(pixel(width - 1, height - 1) == (255, 0, 255) and pixel(300, 300) == black, "a block past the corner is clipped and the rest of the screen is cleared", "")
     check("gfxcheck: done" in gfx_text, "the tape ends and the shell returns (gfx_close)", gfx_text)
+    two_text = boot(IMAGE, None, ("date set 2026-10-20 11:52:30",), (), None, (("run clock ntp=off + clock ntp=off\r", "ntp=off\r\n"), ("\t", ""), ("\x1b", "clock: stopped."), ("\x1b", "Both tapes returned")))
+    check(two_text.count("clock: stopped.") == 2 and "Both tapes returned; back at the fos shell." in two_text, "`run A + B` runs two tapes at once; Tab moves the keyboard, Esc ends the focused one and the shell returns when both have", two_text)
     clock_shot = shot.with_name("clock.ppm")
     clock_text = boot(IMAGE, None, ("date set 2026-10-20 11:52:30",), (), ("run clock ntp=off", "run clock", clock_shot, "\x1b"))
     total, lit = lit_pixels(clock_shot)[0], lit_pixels(clock_shot)[1]

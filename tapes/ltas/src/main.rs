@@ -131,7 +131,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     };
     let playback_ok = input.playback_ok();
 
-    let (Some(analyzer), Some(mut screen)) = (alloc_zeroed::<Analyzer<MAXN>>(api), Screen::new(api, width, height)) else {
+    let (Some(analyzer), Some(mut screen)) = (alloc_zeroed::<Analyzer<MAXN>>(api), Screen::new(api, width, height).map(|screen| screen.on(started.screen))) else {
         return println!("ltas: out of memory.");
     };
     if !analyzer.configure(settings.config()) {

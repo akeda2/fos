@@ -124,7 +124,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let layout = Layout::new(width, height);
     let size = layout.scope.w as usize;
-    let (Some(mut screen), Some(cells)) = (Screen::new(api, width, height), alloc_bytes(api, size * size)) else {
+    let (Some(mut screen), Some(cells)) = (Screen::new(api, width, height).map(|screen| screen.on(started.screen)), alloc_bytes(api, size * size)) else {
         return println!("gonio: out of memory.");
     };
     let Some(mut phosphor) = Phosphor::new(cells, size) else { return println!("gonio: the screen is too small.") };

@@ -643,6 +643,11 @@ pub fn gfx_screens() -> u32 {
     }
 }
 
+/// The tape screen a tape draws on: `screen=N` among its arguments (0, the console's, when absent or not a number).
+pub fn screen_arg(arguments: &str) -> u32 {
+    arg_value(arguments, "screen").and_then(|value| value.parse().ok()).unwrap_or(0)
+}
+
 fn screens_table() -> Option<&'static TapeApi> {
     let table = api();
     let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, gfx_blit_on) + core::mem::size_of::<usize>();

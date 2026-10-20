@@ -258,6 +258,22 @@ fn run_tape(rest: &str) {
         crate::println!("run: which tape? (run NAME [ARGS])");
         return;
     }
+    if let Some((first, second)) = rest.split_once(" + ") {
+        fn split(part: &str) -> (&str, &str) {
+            let part = part.trim();
+            part.split_once(' ').map_or((part, ""), |(name, arguments)| (name, arguments.trim()))
+        }
+        let (first, second) = (split(first), split(second));
+        let loaded = crate::tape_aarch64::load_slot(first.0, 0).and_then(|one| Ok((one, crate::tape_aarch64::load_slot(second.0, 1)?)));
+        // `calc 3 4 + 6 *` has a `+` too: it is a second tape only when the word after it names a tape that loads.
+        if let Ok((one, two)) = loaded {
+            match crate::tape_aarch64::run_two([(one, first.1), (two, second.1)]) {
+                Ok(()) => crate::println!("Both tapes returned; back at the fos shell."),
+                Err(reason) => crate::println!("run: {reason}."),
+            }
+            return;
+        }
+    }
     match crate::tape_aarch64::load(name).and_then(|entry| crate::tape_aarch64::run(entry, arguments)) {
         Ok(()) => crate::println!("Tape returned; back at the fos shell."),
         Err(reason) => crate::println!("run: {name}: {reason}."),
