@@ -199,6 +199,8 @@ def main():
     check("gfxcheck: done" in gfx_text, "the tape ends and the shell returns (gfx_close)", gfx_text)
     two_text = boot(IMAGE, None, ("date set 2026-10-20 11:52:30",), (), None, (("run clock ntp=off + clock ntp=off\r", "ntp=off\r\n"), ("\t", ""), ("\x1b", "clock: stopped."), ("\x1b", "Both tapes returned")))
     check(two_text.count("clock: stopped.") == 2 and "Both tapes returned; back at the fos shell." in two_text, "`run A + B` runs two tapes at once; Tab moves the keyboard, Esc ends the focused one and the shell returns when both have", two_text)
+    start_text = boot(IMAGE, None, (), (), None, (("run ed start\r", "ed> "), ("a\r", ". "), ("# comment\r", ". "), ("echo from-start-file\r", ". "), (".\r", "ed> "), ("x\r", "written start"), ("start\r", "fos> ")))
+    check("start file: running 1 command(s)." in start_text and "start> echo from-start-file" in start_text and re.search(r"^from-start-file$", start_text, re.M) is not None, "`start` runs the boot volume's start file (comments skipped)", start_text)
     clock_shot = shot.with_name("clock.ppm")
     clock_text = boot(IMAGE, None, ("date set 2026-10-20 11:52:30",), (), ("run clock ntp=off", "run clock", clock_shot, "\x1b"))
     total, lit = lit_pixels(clock_shot)[0], lit_pixels(clock_shot)[1]

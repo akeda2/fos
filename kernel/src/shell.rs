@@ -5,8 +5,30 @@
 use crate::{block, fosfs, lineedit, memory, storage, timer};
 
 /// Prompts, then serves the serial console forever: poll a byte, edit, run a finished line.
+static mut START_SCRIPT: [u8; 4096] = [0; 4096];
+
+/// Runs the boot volume's `start` file, one command per line (blank lines and `#` lines skipped), as on x86. A tape in it
+/// holds the shell until it ends (Esc), so a long-running one belongs on the last line.
+fn start_script(announce_missing: bool) {
+    let Some(volume) = storage::boot_volume() else { return };
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(START_SCRIPT) };
+    let length = match volume.read(b"start", buffer) {
+        Ok(Some(length)) => length,
+        Ok(None) => return if announce_missing { crate::println!("start: no start file on the boot volume.") },
+        Err(error) => return crate::println!("start: cannot be read ({error:?})."),
+    };
+    let script = core::str::from_utf8(&buffer[..length]).unwrap_or("");
+    let lines = || script.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#') && *line != "start");
+    crate::println!("start file: running {} command(s).", lines().count());
+    for line in lines() {
+        crate::println!("start> {line}");
+        execute(line);
+    }
+}
+
 pub fn run() -> ! {
     lineedit::reset();
+    start_script(false);
     crate::print(format_args!("\nType `help` for the commands.\nfos> "));
     loop {
         crate::usb_kbd::poll();
@@ -31,6 +53,7 @@ fn execute(line: &str) {
     match word {
         "" => {}
         "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST cmp A B fsck [diskN] echo TEXT keymap us|sv run NAME [ARGS]\ndmesg irqs usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "start" => start_script(true),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -75,7 +98,9 @@ fn execute(line: &str) {
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
         }),
         "dmesg" => crate::dmesg(),
-        "nic" if rest == "rx" => crate::genet::show_rx(),
+        "nic" if rest == "rx" => crate::genet::show_rx(false),
+        "nic" if rest == "rx multicast" => crate::genet::show_rx(true),
+        "nic" if rest == "promisc on" || rest == "promisc off" => crate::println!("Genet promiscuous {}: {}.", &rest[8..], if crate::genet::set_promiscuous(rest == "promisc on") { "ok" } else { "no NIC" }),
         "nic" => crate::genet::status(),
         "usb" => crate::println!("usb: {} new keyboard(s) or disk(s).", crate::usb_kbd::probe_all()),
         "recv" => recv_serial(rest),

@@ -260,3 +260,19 @@ isochronous buffers are still to confirm by ear/loopback.
 inputs 1-2): scope, level meters, correlation and the loudness panel look as on x86. **No QEMU test**: QEMU's `usb-audio` is
 output-only and the port has no HDA, so there is no capture device to run it against; it is verified on the Pi only. Deploy:
 `python3 tools/send_file_serial.py /dev/ttyUSB3 build/fosfor-aarch64/tapes/gonio gonio --fast 921600`.
+
+## Time at boot: `start` script and `ptp` (2026-10-20)
+
+The shell runs the boot volume's `start` file before the prompt (one command per line, `#` comments and blank
+lines skipped; `start` reruns it; long-running commands go last). The Pi's `start` is `run ptp l2 settime tz=+2`:
+the `ptp` tape (in `A64_TAPES`) uses software timestamps, since Genet has none, and `wall_clock_set` sets the clock.
+Verified on the Pi against clock1 (`ptp master both`): `reset` and the clock is right at the prompt (offset ~90 us).
+
+Genet finding: `UMAC_CMD` promiscuous alone does not pass multicast on the Pi 4. The firmware leaves
+`UMAC_MDF_CTRL = 0x18000` (two address filters), and they still apply; Linux (`bcmgenet_set_rx_mode`) writes 0 there
+with promiscuous. `genet::set_promiscuous` now does the same and restores the value on `off`. Shell: `nic promisc
+on|off`, `nic rx multicast`. Later: `nic_multicast_join` could use the 17 MDF entries instead of promiscuous.
+
+Open: IP-mode ptp (UDP 224.0.1.129) gets Announce/Sync but clock1 never answers the Delay_Req (the Pi does send it,
+86 bytes, `nic_send` true); L2 mode works. Not yet found whether the switch (IGMP snooping), clock1 or our frame is
+at fault.

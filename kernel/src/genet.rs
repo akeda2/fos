@@ -67,6 +67,8 @@ const CMD_TX_EN: u32 = 1 << 0;
 const CMD_RX_EN: u32 = 1 << 1;
 const CMD_SPEED_SHIFT: u32 = 2;
 const CMD_PROMISC: u32 = 1 << 4;
+/// The MAC destination filter's enable mask: Linux writes 0 with promiscuous mode (`bcmgenet_set_rx_mode`).
+const UMAC_MDF_CTRL: u64 = UMAC + 0x650;
 const CMD_SW_RESET: u32 = 1 << 13;
 const CMD_LCL_LOOP_EN: u32 = 1 << 15;
 
@@ -471,6 +473,18 @@ pub fn set_promiscuous(on: bool) -> bool {
     let Some(genet) = state() else { return false };
     genet.promiscuous = on;
     update(UMAC_CMD, CMD_PROMISC, if on { CMD_PROMISC } else { 0 });
+    // The firmware leaves two MAC destination filter entries enabled (MDF_CTRL 0x18000), which drop multicast even in
+    // promiscuous mode; Linux writes 0 here too. Restore them when promiscuous mode goes off.
+    static SAVED_MDF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if on {
+        let current = read(UMAC_MDF_CTRL);
+        if current != 0 {
+            SAVED_MDF.store(current, core::sync::atomic::Ordering::Relaxed);
+        }
+        write(UMAC_MDF_CTRL, 0);
+    } else {
+        write(UMAC_MDF_CTRL, SAVED_MDF.load(core::sync::atomic::Ordering::Relaxed));
+    }
     true
 }
 
@@ -561,6 +575,7 @@ pub fn status() {
     if STORM.load(core::sync::atomic::Ordering::Relaxed) {
         crate::println!("  interrupt storm: receive interrupts are masked, the ring is polled.");
     }
+    crate::println!("  UMAC_CMD {:08x}, MDF_CTRL {:08x}.", read(UMAC_CMD), read(UMAC_MDF_CTRL));
     crate::println!("  frames sent {}, received {}, dropped {} (last status {:08x}).", genet.sent, genet.received, genet.dropped, genet.last_drop);
     crate::println!(
         "  PHY {}: BMCR {:04x?} BMSR {:04x?} ADV {:04x?} LPA {:04x?} CTRL1000 {:04x?} STAT1000 {:04x?}",
@@ -575,13 +590,13 @@ pub fn status() {
 }
 
 /// `nic rx`: for three seconds prints a line per received frame (length, destination, source, EtherType, IPv4 protocol).
-pub fn show_rx() {
+pub fn show_rx(multicast_only: bool) {
     let mut frame = [0u8; 1600];
     let start = timer::micros();
     let mut shown = 0;
     while timer::micros() - start < 3_000_000 && shown < 40 {
         let length = receive(&mut frame);
-        if length < 14 {
+        if length < 14 || (multicast_only && (frame[0] & 1 == 0 || frame[0..6] == [0xff; 6])) {
             continue;
         }
         shown += 1;
