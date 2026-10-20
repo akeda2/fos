@@ -191,3 +191,12 @@ Not on aarch64 yet: FAT32/exFAT volumes (no `fatvol`/USB storage there), so a PC
   already wrote data before the length. `fsck [diskN]` lists extents and reports damaged, overlapping or duplicate entries without changing anything.
   Not covered: a torn 512-byte directory-sector write (the SD card's own atomicity is assumed) and FAT volumes, whose writer already commits the entry last.
 - **ABI 19: `fs_list`** (and `tape_rt::list_file`): the nth file of `""`, `diskN` or `@LABEL`; `disk_info` now works on aarch64 (free space, label).
+
+## FAT32/exFAT on aarch64
+
+`fatvol.rs` (the glue to the `fat` crate) now builds on both ports; the FAT branches of the tape file calls moved from
+`tape.rs` into `tape_fs.rs`, so `fs_read/write/remove/list/stream_*` and `disk_info` behave the same everywhere. A disk with
+no FOSFS volume but a FAT32/exFAT one (GPT basic data, MBR, or a superfloppy) is reached by `diskN/NAME`; the shell's `ls
+diskN` and `cat diskN/NAME` use the same calls. aarch64 has no wall clock yet, so FAT files get the fixed default date.
+Tested in QEMU on a `mkfs.vfat` virtio disk (`make test-aarch64-boot`); the Pi's SD card and USB sticks are not tried
+(USB mass storage is not ported).

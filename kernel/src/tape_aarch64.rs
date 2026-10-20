@@ -386,24 +386,7 @@ extern "C" fn api_fs_list(volume: *const u8, volume_length: usize, index: usize,
 }
 
 extern "C" fn api_disk_info(number: usize, out: *mut DiskInfo) -> u32 {
-    let Some(disk) = number.checked_sub(1).and_then(crate::block::get) else { return 0 };
-    let mut info = DiskInfo { sectors: disk.sectors, boot: u32::from(storage::boot_disk() == Some(number - 1)), ..Default::default() };
-    info.model.copy_from_slice(&disk.model);
-    info.kind = match storage::volume_on(number) {
-        Ok(volume) => {
-            if let Ok(label) = volume.label() {
-                let bytes = label.as_bytes();
-                info.label[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
-            }
-            if let Ok((free, largest)) = volume.free_space() {
-                (info.free_bytes, info.largest_bytes) = (free, largest);
-            }
-            DISK_FOSFS
-        }
-        Err(_) => DISK_NO_VOLUME,
-    };
-    unsafe { *out = info };
-    1
+    crate::tape_fs::disk_info(number, unsafe { &mut *out })
 }
 
 extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {

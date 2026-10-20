@@ -163,7 +163,20 @@ fn compare(rest: &str) {
 
 fn list(argument: &str) {
     let Some(volume) = volume(argument) else {
-        crate::println!("ls: no FOSFS volume there (use `ls` or `ls diskN`).");
+        // A FAT32/exFAT card a PC formatted: its root directory, through the same call a tape uses.
+        let mut info: fosfor_abi::tape::FileInfo = unsafe { core::mem::zeroed() };
+        let mut index = 0;
+        while crate::tape_fs::list(argument.as_bytes(), index, &mut info) == 1 {
+            let name = core::str::from_utf8(&info.name[..info.name_length as usize]).unwrap_or("?");
+            let slash = if info.flags & fosfor_abi::tape::FILE_DIRECTORY != 0 { "/" } else { "" };
+            crate::println!("{:>10}  {name}{slash}", info.length);
+            index += 1;
+        }
+        if index == 0 {
+            crate::println!("ls: no files, or no FOSFS/FAT volume there (use `ls` or `ls diskN`).");
+        } else {
+            crate::println!("{index} file(s).");
+        }
         return;
     };
     let mut files = 0;
@@ -180,11 +193,21 @@ fn list(argument: &str) {
 /// Shows up to 16 KiB of a file as text (non-printable bytes as dots).
 fn cat(name: &str) {
     static mut BUFFER: [u8; 16384] = [0; 16384];
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
     let Some((volume, name)) = locate(name) else {
-        crate::println!("cat: no such volume.");
+        // `diskN/NAME` on a FAT32/exFAT card.
+        let length = crate::tape_fs::read(name.as_bytes(), buffer);
+        if length < 0 {
+            crate::println!("cat: {name}: not found or not readable (code {length}).");
+            return;
+        }
+        for &byte in &buffer[..length as usize] {
+            let shown = if byte == b'\n' || (0x20..0x7f).contains(&byte) { byte } else { b'.' };
+            crate::print(format_args!("{}", shown as char));
+        }
+        crate::println!();
         return;
     };
-    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
     match volume.read(name.as_bytes(), buffer) {
         Ok(Some(length)) => {
             for &byte in &buffer[..length] {

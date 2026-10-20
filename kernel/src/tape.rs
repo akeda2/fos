@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use fosfor_abi::tape::*;
 use fosfor_abi::{BootInfo, elf};
 
-use crate::{memory, paging, storage, term, timer};
+use crate::{memory, paging, term, timer};
 
 const HUGE: u64 = 2 * 1024 * 1024;
 const REGION_BYTES: u64 = 4 * 1024 * 1024;
@@ -225,151 +225,32 @@ extern "C" fn api_free(address: usize, bytes: usize) {
     }
 }
 /// FOSFS references (`NAME`, `diskN/NAME`, `@LABEL/NAME`) are resolved in `tape_fs`, shared with the aarch64 port.
-/// A FAT32/exFAT volume named by a reference: `diskN/NAME` where disk N holds no FOSFS volume of ours but a FAT one
-/// (a stick or card a PC formatted). A disk with a FOSFS partition always means FOSFS.
-fn resolve_fat(reference: &[u8]) -> Option<(crate::fatvol::Fs, &[u8])> {
-    let slash = reference.iter().position(|&byte| byte == b'/')?;
-    let (selector, name) = (&reference[..slash], &reference[slash + 1..]);
-    let number = selector.strip_prefix(b"disk").and_then(|digits| core::str::from_utf8(digits).ok()).and_then(|digits| digits.parse::<usize>().ok())?;
-    if storage::volume_on(number).is_ok() {
-        return None;
-    }
-    crate::fatvol::mount(number - 1).map(|fs| (fs, name))
-}
-
-fn fat_error(error: fat::Error) -> isize {
-    match error {
-        fat::Error::NotFound => FS_NOT_FOUND,
-        fat::Error::BadName => FS_BAD_NAME,
-        _ => FS_ERROR,
-    }
-}
-
+/// The tape file calls are shared with the aarch64 port: see `tape_fs`.
 extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, capacity: usize) -> isize {
-    let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
-    if let Some((mut fs, name)) = resolve_fat(reference) {
-        return match fs.find(name) {
-            Ok(Some(file)) if file.size as usize > capacity => FS_TOO_BIG,
-            Ok(Some(file)) => {
-                let buffer = unsafe { core::slice::from_raw_parts_mut(buffer, capacity) };
-                match fs.read(&file, 0, &mut buffer[..file.size as usize]) {
-                    Ok(length) => length as isize,
-                    Err(error) => fat_error(error),
-                }
-            }
-            Ok(None) => FS_NOT_FOUND,
-            Err(error) => fat_error(error),
-        };
-    }
-    let buffer = unsafe { core::slice::from_raw_parts_mut(buffer, capacity) };
-    crate::tape_fs::read(reference, buffer)
+    let (name, buffer) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts_mut(buffer, capacity)) };
+    crate::tape_fs::read(name, buffer)
 }
 extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8, length: usize) -> isize {
-    let (reference, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
-    // A FAT32/exFAT disk named explicitly (`diskN/NAME`), as `fs_read` already allows: replace the file the way the shell's
-    // `write` does -- reserve its whole length, write it, then finish (the directory entry appears with the final size).
-    // (`ed` could read such a file but not save it back: this call resolved FOSFS volumes only.)
-    if let Some((mut fs, file)) = resolve_fat(reference) {
-        if data.is_empty() {
-            return FS_ERROR; // an empty file cannot be created on a FAT volume here (the shell's `write` says the same)
-        }
-        crate::fatvol::stamp(&mut fs);
-        let outcome = fs.create(file, data.len() as u64).and_then(|stream| {
-            fs.write(&stream, 0, data, data.len() as u64)?;
-            fs.finish(&stream, file, data.len() as u64)
-        });
-        return match outcome {
-            Ok(()) => 0,
-            Err(error) => fat_error(error),
-        };
-    }
-    crate::tape_fs::write(reference, data)
+    let (name, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
+    crate::tape_fs::write(name, data)
 }
-/// Or, on a FAT32/exFAT volume: the mounted volume, the stream and the file's name (for `finish`).
-static mut FAT_STREAM: Option<(crate::fatvol::Fs, fat::Stream, [u8; 64], usize)> = None;
-
 extern "C" fn api_fs_stream_open(name: *const u8, name_length: usize, max_bytes: u64) -> isize {
-    let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
-    crate::tape_fs::stream_reset();
-    unsafe { FAT_STREAM = None };
-    if let Some((mut fs, file)) = resolve_fat(reference) {
-        if file.len() > 64 {
-            return FS_BAD_NAME;
-        }
-        return match fs.create(file, max_bytes) {
-            Ok(stream) => {
-                let mut stored = [0u8; 64];
-                stored[..file.len()].copy_from_slice(file);
-                let capacity = stream.capacity();
-                unsafe { FAT_STREAM = Some((fs, stream, stored, file.len())) };
-                capacity as isize
-            }
-            Err(error) => fat_error(error),
-        };
-    }
-    crate::tape_fs::stream_open(reference, max_bytes)
+    crate::tape_fs::stream_open(unsafe { core::slice::from_raw_parts(name, name_length) }, max_bytes)
 }
 extern "C" fn api_fs_stream_write(offset: u64, data: *const u8, length: usize, file_length: u64) -> isize {
-    let data = unsafe { core::slice::from_raw_parts(data, length) };
-    if let Some((fs, stream, _, _)) = unsafe { (*(&raw mut FAT_STREAM)).as_mut() } {
-        crate::fatvol::stamp(fs);
-        return match fs.write(stream, offset, data, file_length) {
-            Ok(()) => 0,
-            Err(fat::Error::OutOfRange) => FS_TOO_BIG,
-            Err(error) => fat_error(error),
-        };
-    }
-    crate::tape_fs::stream_write(offset, data, file_length)
+    crate::tape_fs::stream_write(offset, unsafe { core::slice::from_raw_parts(data, length) }, file_length)
 }
 extern "C" fn api_fs_stream_close(file_length: u64) -> isize {
-    if let Some((mut fs, stream, name, length)) = unsafe { (*(&raw mut FAT_STREAM)).take() } {
-        crate::fatvol::stamp(&mut fs);
-        return match fs.finish(&stream, &name[..length], file_length) {
-            Ok(()) => 0,
-            Err(error) => fat_error(error),
-        };
-    }
     crate::tape_fs::stream_close(file_length)
 }
 extern "C" fn api_fs_list(volume: *const u8, volume_length: usize, index: usize, out: *mut fosfor_abi::tape::FileInfo) -> isize {
-    use fosfor_abi::tape::{FileInfo, FILE_DIRECTORY};
-    let reference = unsafe { core::slice::from_raw_parts(volume, volume_length) };
-    // `diskN` holding no FOSFS but a FAT volume: its root directory, as `fs_read` resolves `diskN/NAME`.
-    let number = reference.strip_prefix(b"disk").and_then(|digits| core::str::from_utf8(digits).ok()).and_then(|digits| digits.parse::<usize>().ok());
-    if let Some(number) = number.filter(|&number| storage::volume_on(number).is_err()) {
-        let Some(mut fs) = crate::fatvol::mount(number.wrapping_sub(1)) else { return FS_NO_VOLUME };
-        let (mut position, mut found) = (0, false);
-        let outcome = fs.list(|entry| {
-            if position == index && !found {
-                found = true;
-                let name = entry.name();
-                let length = name.len().min(64);
-                let mut info = FileInfo { length: u64::from(entry.size), flags: if entry.is_directory { FILE_DIRECTORY } else { 0 }, name_length: length as u32, name: [0; 64] };
-                info.name[..length].copy_from_slice(&name[..length]);
-                unsafe { *out = info };
-            }
-            position += 1;
-        });
-        return match outcome {
-            Ok(()) => isize::from(found),
-            Err(error) => fat_error(error),
-        };
-    }
-    crate::tape_fs::list(reference, index, unsafe { &mut *out })
+    crate::tape_fs::list(unsafe { core::slice::from_raw_parts(volume, volume_length) }, index, unsafe { &mut *out })
+}
+extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {
+    crate::tape_fs::remove(unsafe { core::slice::from_raw_parts(name, name_length) })
 }
 extern "C" fn api_free_pages() -> usize {
     memory::stats().free as usize
-}
-extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {
-    let reference = unsafe { core::slice::from_raw_parts(name, name_length) };
-    if let Some((mut fs, file)) = resolve_fat(reference) {
-        return match fs.remove(file) {
-            Ok(true) => 0,
-            Ok(false) => FS_NOT_FOUND,
-            Err(error) => fat_error(error),
-        };
-    }
-    crate::tape_fs::remove(reference)
 }
 extern "C" fn api_hostname(index: usize, out: *mut u8, capacity: usize) -> usize {
     let mut name = [0u8; 20];
@@ -389,33 +270,7 @@ extern "C" fn api_peer_info(number: usize, out: *mut fosfor_abi::tape::PeerInfo)
     count
 }
 extern "C" fn api_disk_info(number: usize, out: *mut fosfor_abi::tape::DiskInfo) -> u32 {
-    use fosfor_abi::tape::{DISK_EXFAT, DISK_FAT32, DISK_FOSFS, DISK_NO_VOLUME};
-    let Some(disk) = number.checked_sub(1).and_then(crate::block::get) else { return 0 };
-    let mut info = fosfor_abi::tape::DiskInfo { sectors: disk.sectors, boot: u32::from(storage::boot_disk() == Some(number - 1)), ..Default::default() };
-    info.model.copy_from_slice(&disk.model);
-    info.kind = match storage::volume_on(number) {
-        Ok(volume) => {
-            if let Ok(label) = volume.label() {
-                let bytes = label.as_bytes();
-                info.label[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
-            }
-            if let Ok((free, largest)) = volume.free_space() {
-                (info.free_bytes, info.largest_bytes) = (free, largest);
-            }
-            DISK_FOSFS
-        }
-        Err(_) => match crate::fatvol::mount(number - 1) {
-            Some(mut fs) => {
-                if let Ok((free, largest)) = fs.free_space() {
-                    (info.free_bytes, info.largest_bytes) = (free, largest);
-                }
-                if fs.kind() == fat::Kind::ExFat { DISK_EXFAT } else { DISK_FAT32 }
-            }
-            None => DISK_NO_VOLUME,
-        },
-    };
-    unsafe { *out = info };
-    1
+    crate::tape_fs::disk_info(number, unsafe { &mut *out })
 }
 extern "C" fn api_disk_format_exfat(number: usize, label: *const u8, length: usize) -> i32 {
     use crate::fatvol::FormatError;

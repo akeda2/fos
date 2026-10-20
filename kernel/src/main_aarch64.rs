@@ -5,6 +5,7 @@ use fosfor_abi::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 mod arch;
 mod block;
 mod font_data;
+mod fatvol;
 mod fosfs;
 mod framebuffer;
 mod gpt;

@@ -84,9 +84,19 @@ pub fn mount(disk: usize) -> Option<Fs> {
 /// A mounted FAT volume on a disk.
 pub type Fs = fat::Fs<Partition>;
 
+/// The local time; the aarch64 port has no wall clock yet, so its files get the fixed date.
+#[cfg(target_arch = "x86_64")]
+fn now() -> Option<fat::Time> {
+    crate::clock::now()
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn now() -> Option<fat::Time> {
+    None
+}
+
 /// Gives `fs` the current local time for the files it creates or writes (a fixed date if the clock was never set).
 pub fn stamp(fs: &mut Fs) {
-    fs.set_time(crate::clock::now().unwrap_or(fat::Time::DEFAULT));
+    fs.set_time(now().unwrap_or(fat::Time::DEFAULT));
 }
 
 /// Why `format_exfat` did not.
@@ -125,8 +135,8 @@ pub fn format_exfat(disk: usize, label: &[u8]) -> Result<u64, FormatError> {
     let _ = info;
     let partition = gpt::write_single_partition(disk, &BASIC_DATA_GUID, "exFAT data").map_err(|_| FormatError::Failed)?;
     let mut device = Partition { disk, base: partition.start, sectors: partition.sectors };
-    // A serial number that differs between volumes: the tick and time-stamp counters, mixed.
-    let serial = (unsafe { core::arch::x86_64::_rdtsc() } as u32) ^ (crate::timer::ticks() as u32).rotate_left(16);
-    fat::format_exfat(&mut device, partition.sectors, partition.start, label, serial, crate::clock::now().unwrap_or(fat::Time::DEFAULT)).map_err(|_| FormatError::Failed)?;
+    // A serial number that differs between volumes: the tick and microsecond counters, mixed.
+    let serial = (crate::timer::micros() as u32) ^ (crate::timer::ticks() as u32).rotate_left(16);
+    fat::format_exfat(&mut device, partition.sectors, partition.start, label, serial, now().unwrap_or(fat::Time::DEFAULT)).map_err(|_| FormatError::Failed)?;
     Ok(partition.sectors / 2048)
 }
