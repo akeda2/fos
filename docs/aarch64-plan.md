@@ -170,3 +170,7 @@ clock is derived from the firmware's 115200 divisors. On the Pi: **921600 works*
 - `irqs` shell command: counts for timer, UART, SD, Genet and MSI vectors.
 - Verified on the Pi (serial KUP at 921600 into slot 0): `irqs` shows UART, SD, Genet and xHCI MSI counts rising; `ls` works;
   QEMU aarch64 boot, faults and serial-KUP tests pass.
+
+- SD under load (Pi 4): `cp` now stages up to 256 KiB and `cmp A B` compares two files; 92 KB tapes copied chain-wise
+  (ed -> e1 -> e2 -> e1 -> e3, netcheck -> n1) all compared identical while the SD interrupt count rose (327).
+- The paging bring-up probes (on-screen register rows, MMU-switch pixel markers) are gone; the Pi still boots.

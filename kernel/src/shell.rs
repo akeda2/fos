@@ -30,7 +30,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST echo TEXT keymap us|sv run NAME [ARGS]\ndmesg irqs usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST cmp A B echo TEXT keymap us|sv run NAME [ARGS]\ndmesg irqs usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -56,6 +56,7 @@ fn execute(line: &str) {
         "ls" => list(rest),
         "cat" => cat(rest),
         "cp" => copy(rest),
+        "cmp" => compare(rest),
         "run" => run_tape(rest),
         "keymap" => match crate::usb_kbd::layout_named(rest) {
             Some(layout) => crate::usb_kbd::set_layout(layout),
@@ -109,7 +110,7 @@ fn locate(name: &str) -> Option<(fosfs::Volume, &str)> {
 
 /// `cp SRC DST`: copies a file (up to 64 KiB) between volumes, `diskN/NAME` or a boot-volume name.
 fn copy(rest: &str) {
-    static mut BUFFER: [u8; 65536] = [0; 65536];
+    const SIZE: usize = 256 * 1024;
     let Some((from, to)) = rest.split_once(' ') else {
         crate::println!("cp: cp SRC DST (names are NAME or diskN/NAME).");
         return;
@@ -118,15 +119,42 @@ fn copy(rest: &str) {
         crate::println!("cp: no FOSFS volume there.");
         return;
     };
-    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
+    let Some(staging) = memory::allocate_contiguous(SIZE as u64 / memory::FRAME, None) else {
+        return crate::println!("cp: no memory.");
+    };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, SIZE) };
     match source.read(source_name.as_bytes(), buffer) {
         Ok(Some(length)) => match target.write(target_name.as_bytes(), &buffer[..length]) {
             Ok(()) => crate::println!("cp: {length} bytes to {to}."),
             Err(error) => crate::println!("cp: cannot write {to} ({error:?})."),
         },
         Ok(None) => crate::println!("cp: {from}: no such file."),
-        Err(error) => crate::println!("cp: {from}: {error:?} (files over 64 KiB are not copied)."),
+        Err(error) => crate::println!("cp: {from}: {error:?} (files over 256 KiB are not copied)."),
     }
+    memory::free(staging, SIZE as u64 / memory::FRAME);
+}
+
+/// `cmp A B`: reads both files (up to 256 KiB) and says whether they are byte-identical; a read-back check of `cp`.
+fn compare(rest: &str) {
+    const HALF: usize = 256 * 1024;
+    let Some((a, b)) = rest.split_once(' ') else {
+        return crate::println!("cmp: cmp A B (names are NAME or diskN/NAME).");
+    };
+    let (Some((va, na)), Some((vb, nb))) = (locate(a.trim()), locate(b.trim())) else {
+        return crate::println!("cmp: no FOSFS volume there.");
+    };
+    let Some(staging) = memory::allocate_contiguous(2 * HALF as u64 / memory::FRAME, None) else {
+        return crate::println!("cmp: no memory.");
+    };
+    let all = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, 2 * HALF) };
+    let (first, second) = all.split_at_mut(HALF);
+    let result = (va.read(na.as_bytes(), first), vb.read(nb.as_bytes(), second));
+    match result {
+        (Ok(Some(x)), Ok(Some(y))) if x == y && first[..x] == second[..y] => crate::println!("cmp: identical, {x} bytes."),
+        (Ok(Some(x)), Ok(Some(y))) => crate::println!("cmp: DIFFER ({x} and {y} bytes)."),
+        _ => crate::println!("cmp: cannot read both files."),
+    }
+    memory::free(staging, 2 * HALF as u64 / memory::FRAME);
 }
 
 fn list(argument: &str) {
