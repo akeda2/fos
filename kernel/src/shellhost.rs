@@ -1,0 +1,88 @@
+//! The console and file system the shared shell (`crates/shell`) runs on, for both ports: output goes where `print` goes
+//! (the screen, the serial port, a `term net` session) and files are reached through `tape_fs`, the same references and
+//! volumes a tape sees.
+
+use core::fmt;
+
+use fosfor_shell::{Entry, FsError, Host, Stamp};
+
+use crate::{memory, tape_fs};
+
+pub struct KernelHost;
+
+/// An `FS_*` code from `tape_fs` as the shell's error.
+fn error(code: isize) -> FsError {
+    use fosfor_abi::tape::*;
+    match code {
+        FS_NOT_FOUND => FsError::NotFound,
+        FS_TOO_BIG => FsError::TooBig,
+        FS_BAD_NAME => FsError::BadName,
+        FS_NO_VOLUME => FsError::NoVolume,
+        _ => FsError::Failed,
+    }
+}
+
+impl Host for KernelHost {
+    fn print(&mut self, arguments: fmt::Arguments) {
+        crate::print(arguments);
+    }
+
+    fn read(&mut self, reference: &str, buffer: &mut [u8]) -> Result<usize, FsError> {
+        match tape_fs::read(reference.as_bytes(), buffer) {
+            length if length >= 0 => Ok(length as usize),
+            code => Err(error(code)),
+        }
+    }
+
+    fn length(&mut self, reference: &str) -> Result<u64, FsError> {
+        match tape_fs::length(reference.as_bytes()) {
+            length if length >= 0 => Ok(length as u64),
+            code => Err(error(code)),
+        }
+    }
+
+    fn write(&mut self, reference: &str, data: &[u8]) -> Result<(), FsError> {
+        let is_fat = tape_fs::is_fat(reference.as_bytes());
+        match tape_fs::write(reference.as_bytes(), data) {
+            0 => Ok(()),
+            _ if is_fat && data.is_empty() => Err(FsError::Empty),
+            code => Err(error(code)),
+        }
+    }
+
+    fn remove(&mut self, reference: &str) -> Result<(), FsError> {
+        match tape_fs::remove(reference.as_bytes()) {
+            0 => Ok(()),
+            code => Err(error(code)),
+        }
+    }
+
+    fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError> {
+        tape_fs::each_entry(volume.as_bytes(), &mut |name, length, directory, modified| {
+            let modified = modified.map(|time| Stamp { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second });
+            each(&mut KernelHost, Entry { name, length, directory, modified });
+        })
+        .map_err(error)
+    }
+
+    fn with_buffer(&mut self, size: usize, run: &mut dyn FnMut(&mut dyn Host, &mut [u8])) -> bool {
+        let frames = (size as u64).div_ceil(memory::FRAME);
+        let Some(address) = memory::allocate_contiguous(frames, None) else { return false };
+        run(self, unsafe { core::slice::from_raw_parts_mut(address as *mut u8, size) });
+        memory::free(address, frames);
+        true
+    }
+
+    fn tape_help(&mut self, reference: &str) -> bool {
+        const SIZE: usize = 512 * 1024;
+        let mut shown = false;
+        self.with_buffer(SIZE, &mut |host, image| {
+            let Ok(length) = host.read(reference, image) else { return };
+            if let Some(text) = fosfor_abi::elf::section(&image[..length], ".fos_help").and_then(|text| core::str::from_utf8(text).ok()) {
+                crate::println!("{text}");
+                shown = true;
+            }
+        });
+        shown
+    }
+}

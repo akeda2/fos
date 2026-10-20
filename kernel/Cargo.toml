@@ -16,6 +16,7 @@ opt-level = "z"
 fosfor-abi = { path = "../abi" }
 fosfor-fat = { path = "../crates/fat" }
 fosfor-tape-sync = { path = "../crates/tape-sync" }
+fosfor-shell = { path = "../crates/shell" }
 
 # Deliberate-fault builds for the exception tests (make test-faults): each one
 # provokes one kind of fault right after boot so the report can be checked.

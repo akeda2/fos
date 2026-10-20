@@ -1,0 +1,12 @@
+[package]
+name = "fosfor-shell"
+version = "0.1.0"
+edition = "2024"
+
+# The shell both ports share: the command table and its dispatch, `help` made from the table, and the file commands
+# (`ls cat write rm cp cmp`) on volume references (`NAME`, `diskN/NAME`, `@LABEL/NAME`, `esp/NAME`). `no_std`, no allocation,
+# independent of the kernel: a `Host` trait stands in for the console and the file system, so the host unit tests run the
+# commands against an in-memory volume. A port adds its own commands as a second table (see `docs/shell.md`).
+[lib]
+name = "fosfor_shell"
+path = "src/lib.rs"

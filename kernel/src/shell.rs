@@ -2,6 +2,9 @@
 //! only what the port has so far: files on FOSFS volumes, disks, memory, time. The x86 shell (`term.rs`) is tied to the
 //! network terminal and the PC drivers; this one grows towards the same command set (tapes next) as modules are ported.
 
+use fosfor_shell::Command;
+
+use crate::shellhost::KernelHost;
 use crate::{block, fosfs, lineedit, memory, storage, timer};
 
 /// Prompts, then serves the serial console forever: poll a byte, edit, run a finished line.
@@ -57,109 +60,113 @@ pub fn run() -> ! {
     }
 }
 
-fn execute(line: &str) {
-    let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
-    match word {
-        "" => {}
-        "help" if !rest.is_empty() => {
-            if !show_tape_help(rest) {
-                crate::println!("help: {rest} has no help screen.");
-            }
+/// The Pi's own commands; the file commands and `help` come from the shared shell (`crates/shell`).
+static COMMANDS: &[Command] = &[
+    Command::new("start", "start", "runs the boot volume's `start` file again.", |_, _| start_script(true)),
+    Command::new("version", "version", "the kernel's name.", |_, _| crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`).")),
+    Command::new("uptime", "uptime", "time since boot.", |_, _| {
+        let seconds = timer::micros() / 1_000_000;
+        crate::println!("up {}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
+    }),
+    Command::new("mem", "mem", "physical memory, managed and free.", |_, _| {
+        let stats = memory::stats();
+        let mib = |frames: u64| frames * memory::FRAME / (1024 * 1024);
+        crate::println!("Physical memory: {} MiB managed, {} MiB free.", mib(stats.frames), mib(stats.free));
+    })
+    .alias(&["memory"]),
+    Command::new("disks", "disks", "lists the disks: size, model and where each came from.", |_, _| {
+        for index in 0..block::count() {
+            let disk = block::get(index).unwrap();
+            crate::println!(
+                "disk{}: {} MiB, {} ({})",
+                index + 1,
+                disk.sectors / 2048,
+                core::str::from_utf8(&disk.model).unwrap_or("?").trim(),
+                core::str::from_utf8(&disk.origin[..disk.origin_length]).unwrap_or("?")
+            );
         }
-        "help" => crate::println!(
-            "help [NAME] version uptime mem disks ls [diskN] cat [diskN/|esp/]NAME write NAME TEXT\nrm NAME cp SRC DST cmp A B fsck [diskN] echo TEXT grow diskN sleep N clear keymap us|sv\nrun NAME [ARGS] [&N] ps kill N|NAME|all dmesg irqs usb nic [rx] slots debug\nkup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up)"
-        ),
-        "start" => start_script(true),
-        "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
-        "uptime" => {
-            let seconds = timer::micros() / 1_000_000;
-            crate::println!("up {}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
-        }
-        "mem" | "memory" => {
-            let stats = memory::stats();
-            let mib = |frames: u64| frames * memory::FRAME / (1024 * 1024);
-            crate::println!("Physical memory: {} MiB managed, {} MiB free.", mib(stats.frames), mib(stats.free));
-        }
-        "disks" => {
-            for index in 0..block::count() {
-                let disk = block::get(index).unwrap();
-                crate::println!(
-                    "disk{}: {} MiB, {} ({})",
-                    index + 1,
-                    disk.sectors / 2048,
-                    core::str::from_utf8(&disk.model).unwrap_or("?").trim(),
-                    core::str::from_utf8(&disk.origin[..disk.origin_length]).unwrap_or("?")
-                );
-            }
-        }
-        "ls" => list(rest),
-        "cat" => cat(rest),
-        "cp" | "copy" => copy(rest),
-        "cmp" => compare(rest),
-        "fsck" => match volume(rest) {
-            Some(volume) => fosfs::report(&volume),
-            None => crate::println!("fsck: no FOSFS volume there (use `fsck` or `fsck diskN`)."),
-        },
-        "sector" => sector(rest),
-        "audio" => audio(rest),
-        "date" => date(rest),
-        "display" => display(rest),
-        "run" => run_tape(rest),
-        "ps" | "tasks" => crate::tasks::list(),
-        "kill" => crate::tasks::kill(rest.split_whitespace().next()),
-        "keymap" => match crate::usb_kbd::layout_named(rest) {
-            Some(layout) => crate::usb_kbd::set_layout(layout),
-            None => crate::println!("keymap: us or sv."),
-        },
-        "echo" => crate::println!("{rest}"),
-        "acpi" => crate::arch::aarch64::acpi::list(|signature, address, length| {
+    }),
+    Command::new("fsck", "fsck [diskN]", "checks a FOSFS volume's directory.", |_, rest| match volume(rest) {
+        Some(volume) => fosfs::report(&volume),
+        None => crate::println!("fsck: no FOSFS volume there (use `fsck` or `fsck diskN`)."),
+    }),
+    Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
+    Command::new("sector", "sector diskN LBA [COUNT]", "hex dump of raw sectors (read-only, at most 4).", |_, rest| sector(rest)),
+    Command::new("audio", "audio ...", "the audio device and a quick capture check.", |_, rest| audio(rest)),
+    Command::new("date", "date [set ...]", "the date and time.", |_, rest| date(rest)),
+    Command::new("display", "display ...", "the screens.", |_, rest| display(rest)),
+    Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |_, rest| run_tape(rest)),
+    Command::new("ps", "ps", "lists the running tapes.", |_, _| crate::tasks::list()).alias(&["tasks"]),
+    Command::new("kill", "kill N|NAME|all", "stops a background tape.", |_, rest| crate::tasks::kill(rest.split_whitespace().next())),
+    Command::new("keymap", "keymap us|sv", "the USB keyboard layout.", |_, rest| match crate::usb_kbd::layout_named(rest) {
+        Some(layout) => crate::usb_kbd::set_layout(layout),
+        None => crate::println!("keymap: us or sv."),
+    }),
+    Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
+    Command::new("acpi", "acpi", "lists the ACPI tables.", |_, _| {
+        crate::arch::aarch64::acpi::list(|signature, address, length| {
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
-        }),
-        "dmesg" => crate::dmesg(),
-        "nic" if rest == "rx" => crate::genet::show_rx(false),
-        "nic" if rest == "rx multicast" => crate::genet::show_rx(true),
-        "nic" if rest == "promisc on" || rest == "promisc off" => crate::println!("Genet promiscuous {}: {}.", &rest[8..], if crate::genet::set_promiscuous(rest == "promisc on") { "ok" } else { "no NIC" }),
-        "nic" => crate::genet::status(),
-        "usb" => crate::println!("usb: {} new keyboard(s) or disk(s).", crate::usb_kbd::probe_all()),
-        "recv" => recv_serial(rest),
-        "kup" if rest == "serial" || rest.starts_with("serial ") => kup_serial(rest["serial".len()..].trim()),
-        "slots" => crate::slots::show(),
-        "debug" if matches!(rest, "" | "status" | "slots") => {
+        })
+    }),
+    Command::new("dmesg", "dmesg", "the kernel log.", |_, _| crate::dmesg()),
+    Command::new("nic", "nic [rx [multicast]|promisc on|off]", "the Genet NIC: status, receive filter, promiscuous mode.", |_, rest| match rest {
+        "rx" => crate::genet::show_rx(false),
+        "rx multicast" => crate::genet::show_rx(true),
+        "promisc on" | "promisc off" => crate::println!("Genet promiscuous {}: {}.", &rest[8..], if crate::genet::set_promiscuous(rest == "promisc on") { "ok" } else { "no NIC" }),
+        _ => crate::genet::status(),
+    }),
+    Command::new("usb", "usb", "rescans for USB keyboards and disks.", |_, _| crate::println!("usb: {} new keyboard(s) or disk(s).", crate::usb_kbd::probe_all())),
+    Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
+    Command::new("kup", "kup serial [BAUD]", "takes a kernel update over the serial port.", |_, rest| match rest.strip_prefix("serial") {
+        Some(baud) if baud.is_empty() || baud.starts_with(' ') => kup_serial(baud.trim()),
+        _ => crate::println!("Usage: kup serial [BAUD]"),
+    }),
+    Command::new("slots", "slots", "the A/B kernel slots.", |_, _| crate::slots::show()),
+    Command::new("debug", "debug [status|slots]", "kernel-update setting and the A/B slots.", |_, rest| match rest {
+        "" | "status" | "slots" => {
             crate::println!("kernel-update {}", crate::netservice::kernel_update_enabled());
             crate::slots::show();
         }
-        "irqs" | "irqstat" => {
-            let (uart, dropped) = crate::arch::aarch64::pl011::interrupt_counts();
-            crate::println!("timer {}, uart {uart} (bytes dropped {dropped}), sd {}, genet {}", crate::gic::irq_ticks(), crate::sdhci::interrupt_count(), crate::genet::interrupt_count());
-            for vector in 0..crate::msi::COUNT as u8 {
-                if crate::msi::count(vector) != 0 {
-                    crate::println!("msi {vector}: {}", crate::msi::count(vector));
-                }
+        _ => crate::println!("debug: status | slots"),
+    }),
+    Command::new("irqs", "irqs", "interrupt counts.", |_, _| {
+        let (uart, dropped) = crate::arch::aarch64::pl011::interrupt_counts();
+        crate::println!("timer {}, uart {uart} (bytes dropped {dropped}), sd {}, genet {}", crate::gic::irq_ticks(), crate::sdhci::interrupt_count(), crate::genet::interrupt_count());
+        for vector in 0..crate::msi::COUNT as u8 {
+            if crate::msi::count(vector) != 0 {
+                crate::println!("msi {vector}: {}", crate::msi::count(vector));
             }
         }
-        "reset" | "reboot" => {
-            crate::println!("Restarting.");
-            crate::arch::aarch64::power::reset()
+    })
+    .alias(&["irqstat"]),
+    Command::new("reset", "reset", "restarts the machine.", |_, _| {
+        crate::println!("Restarting.");
+        crate::arch::aarch64::power::reset()
+    })
+    .alias(&["reboot"]),
+    Command::new("sleep", "sleep SECONDS", "waits (at most 60 s).", |_, rest| {
+        let seconds = rest.parse::<u64>().unwrap_or(1).min(60);
+        let end = timer::ticks() + seconds * timer::TICK_HZ;
+        while timer::ticks() < end {
+            crate::cpu::sleep();
         }
-        "grow" => grow(rest),
-        "write" => write_file(rest),
-        "rm" => remove_file(rest),
-        "sleep" => {
-            let seconds = rest.parse::<u64>().unwrap_or(1).min(60);
-            let end = timer::ticks() + seconds * timer::TICK_HZ;
-            while timer::ticks() < end {
-                crate::cpu::sleep();
-            }
-            crate::println!("Slept {seconds} s.");
-        }
-        "clear" => crate::print(format_args!("\x1b[2J")),
-        "peek" => peek(rest),
-        "poke" => poke(rest),
-        // `diskN/NAME ARGS`, `@LABEL/NAME` and `esp/NAME` run that tape without `run`, as on x86.
-        other if other.contains('/') => run_tape(line),
-        // A dotless file name is taken for a tape (`ed NAME`), as on x86.
-        other if !other.contains('.') && storage::volume_with_file(other.as_bytes()).is_some() => run_tape(line),
-        other => crate::println!("{other}: unknown command (try `help`)."),
+        crate::println!("Slept {seconds} s.");
+    }),
+    Command::new("clear", "clear", "clears the screen.", |_, _| crate::print(format_args!("\x1b[2J"))),
+    Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),
+    Command::new("poke", "poke ADDR VALUE", "writes memory (hex; bring-up).", |_, rest| poke(rest)),
+];
+
+fn execute(line: &str) {
+    if line.is_empty() || fosfor_shell::execute(&mut KernelHost, &[COMMANDS, fosfor_shell::files::COMMANDS], line) {
+        return;
+    }
+    let word = line.split_whitespace().next().unwrap_or("");
+    // `diskN/NAME ARGS`, `@LABEL/NAME` and `esp/NAME` run that tape without `run`; so does a dotless file name (`ed NAME`), as on x86.
+    if word.contains('/') || (!word.contains('.') && storage::volume_with_file(word.as_bytes()).is_some()) {
+        run_tape(line);
+    } else {
+        crate::println!("{word}: unknown command (try `help`).");
     }
 }
 
@@ -170,14 +177,6 @@ fn volume(argument: &str) -> Option<fosfs::Volume> {
     }
     let number = argument.strip_prefix("disk").and_then(|digits| digits.parse().ok())?;
     storage::volume_on(number).ok()
-}
-
-/// Splits `diskN/NAME` into its volume and the file name; a plain name is on the boot volume.
-fn locate(name: &str) -> Option<(fosfs::Volume, &str)> {
-    match name.split_once('/') {
-        Some((disk, file)) => Some((volume(disk)?, file)),
-        None => Some((storage::boot_volume()?, name)),
-    }
 }
 
 /// `grow diskN`: makes the disk's FOSFS volume fill the disk (the last partition grows; the files are kept), as on x86.
@@ -218,198 +217,6 @@ fn grow(argument: &str) {
     crate::println!("disk{number}: FOSFS volume grown from {} MiB to {} MiB; the files are unchanged.", before / 2048, volume.sectors / 2048);
 }
 
-/// Prints the `.fos_help` section of the tape file NAME (NAME or diskN/NAME) without running it. False if there is none.
-fn show_tape_help(name: &str) -> bool {
-    const SIZE: usize = 512 * 1024;
-    let Some((volume, file)) = locate(name) else { return false };
-    let Some(staging) = memory::allocate_contiguous(SIZE as u64 / memory::FRAME, None) else { return false };
-    let image = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, SIZE) };
-    let shown = match volume.read(file.as_bytes(), image) {
-        Ok(Some(length)) => match fosfor_abi::elf::section(&image[..length], ".fos_help").and_then(|text| core::str::from_utf8(text).ok()) {
-            Some(text) => {
-                crate::println!("{text}");
-                true
-            }
-            None => false,
-        },
-        _ => false,
-    };
-    memory::free(staging, SIZE as u64 / memory::FRAME);
-    shown
-}
-
-/// `write NAME TEXT`: a small text file (NAME or diskN/NAME), as on x86.
-fn write_file(rest: &str) {
-    let (name, text) = rest.split_once(' ').map_or((rest, ""), |(name, text)| (name, text.trim_start()));
-    let Some((volume, file)) = locate(name).filter(|_| !name.is_empty()) else {
-        // A FAT32/exFAT volume (`esp/NAME`, `diskN/NAME`): the same call a tape's `fs_write` makes.
-        if name.contains('/') {
-            return match crate::tape_fs::write(name.as_bytes(), text.as_bytes()) {
-                0 => crate::println!("Wrote {} bytes to {name}.", text.len()),
-                code => crate::println!("write: {name}: failed (code {code}; an empty file cannot be made on FAT)."),
-            };
-        }
-        return crate::println!("Usage: write NAME TEXT   (NAME, diskN/NAME or esp/NAME)");
-    };
-    match volume.write(file.as_bytes(), text.as_bytes()) {
-        Ok(()) => crate::println!("Wrote {} bytes to {file}.", text.len()),
-        Err(error) => crate::println!("write: {error:?}"),
-    }
-}
-
-/// `rm NAME`: removes a file from a FOSFS volume (NAME or diskN/NAME).
-fn remove_file(name: &str) {
-    let Some((volume, file)) = locate(name).filter(|_| !name.is_empty()) else {
-        if name.contains('/') {
-            return match crate::tape_fs::remove(name.as_bytes()) {
-                0 => crate::println!("Removed {name}."),
-                _ => crate::println!("rm: {name}: no such file or no such volume."),
-            };
-        }
-        return crate::println!("Usage: rm NAME   (NAME, diskN/NAME or esp/NAME)");
-    };
-    match volume.remove(file.as_bytes()) {
-        Ok(true) => crate::println!("Removed {file}."),
-        Ok(false) => crate::println!("rm: no such file."),
-        Err(error) => crate::println!("rm: {error:?}"),
-    }
-}
-
-/// `cp SRC DST`: copies a file (up to 256 KiB) between volumes: `NAME`, `diskN/NAME` or `esp/NAME` (FAT32/exFAT through the tape calls).
-fn copy(rest: &str) {
-    const SIZE: usize = 256 * 1024;
-    let Some((from, to)) = rest.split_once(' ') else {
-        crate::println!("cp: cp SRC DST (names are NAME, diskN/NAME or esp/NAME).");
-        return;
-    };
-    let (from, to) = (from.trim(), to.trim());
-    let Some(staging) = memory::allocate_contiguous(SIZE as u64 / memory::FRAME, None) else {
-        return crate::println!("cp: no memory.");
-    };
-    let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, SIZE) };
-    // FOSFS volumes are read and written directly; anything else (FAT) goes through the tape file calls.
-    let read = match locate(from) {
-        Some((source, name)) => match source.read(name.as_bytes(), buffer) {
-            Ok(Some(length)) => Some(length),
-            Ok(None) => {
-                crate::println!("cp: {from}: no such file.");
-                None
-            }
-            Err(error) => {
-                crate::println!("cp: {from}: {error:?} (files over 256 KiB are not copied).");
-                None
-            }
-        },
-        None => match crate::tape_fs::read(from.as_bytes(), buffer) {
-            length if length >= 0 => Some(length as usize),
-            code => {
-                crate::println!("cp: {from}: not readable (code {code}).");
-                None
-            }
-        },
-    };
-    match read {
-        Some(length) => {
-            let written = match locate(to) {
-                Some((target, name)) => target.write(name.as_bytes(), &buffer[..length]).map_err(|_| ()),
-                None => match crate::tape_fs::write(to.as_bytes(), &buffer[..length]) {
-                    0 => Ok(()),
-                    _ => Err(()),
-                },
-            };
-            match written {
-                Ok(()) => crate::println!("cp: {length} bytes to {to}."),
-                Err(()) => crate::println!("cp: cannot write {to}."),
-            }
-        }
-        None => {}
-    }
-    memory::free(staging, SIZE as u64 / memory::FRAME);
-}
-
-/// `cmp A B`: reads both files (up to 256 KiB) and says whether they are byte-identical; a read-back check of `cp`.
-fn compare(rest: &str) {
-    const HALF: usize = 256 * 1024;
-    let Some((a, b)) = rest.split_once(' ') else {
-        return crate::println!("cmp: cmp A B (names are NAME or diskN/NAME).");
-    };
-    let (Some((va, na)), Some((vb, nb))) = (locate(a.trim()), locate(b.trim())) else {
-        return crate::println!("cmp: no FOSFS volume there.");
-    };
-    let Some(staging) = memory::allocate_contiguous(2 * HALF as u64 / memory::FRAME, None) else {
-        return crate::println!("cmp: no memory.");
-    };
-    let all = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, 2 * HALF) };
-    let (first, second) = all.split_at_mut(HALF);
-    let result = (va.read(na.as_bytes(), first), vb.read(nb.as_bytes(), second));
-    match result {
-        (Ok(Some(x)), Ok(Some(y))) if x == y && first[..x] == second[..y] => crate::println!("cmp: identical, {x} bytes."),
-        (Ok(Some(x)), Ok(Some(y))) => crate::println!("cmp: DIFFER ({x} and {y} bytes)."),
-        _ => crate::println!("cmp: cannot read both files."),
-    }
-    memory::free(staging, 2 * HALF as u64 / memory::FRAME);
-}
-
-fn list(argument: &str) {
-    let Some(volume) = volume(argument) else {
-        // A FAT32/exFAT card a PC formatted: its root directory, through the same call a tape uses.
-        let mut info: fosfor_abi::tape::FileInfo = unsafe { core::mem::zeroed() };
-        let mut index = 0;
-        while crate::tape_fs::list(argument.as_bytes(), index, &mut info) == 1 {
-            let name = core::str::from_utf8(&info.name[..info.name_length as usize]).unwrap_or("?");
-            let slash = if info.flags & fosfor_abi::tape::FILE_DIRECTORY != 0 { "/" } else { "" };
-            crate::println!("{:>10}  {name}{slash}", info.length);
-            index += 1;
-        }
-        if index == 0 {
-            crate::println!("ls: no files, or no FOSFS/FAT volume there (use `ls` or `ls diskN`).");
-        } else {
-            crate::println!("{index} file(s).");
-        }
-        return;
-    };
-    let mut files = 0;
-    let result = volume.for_each(|entry| {
-        files += 1;
-        crate::println!("{:>10}  {}", entry.length, core::str::from_utf8(entry.name()).unwrap_or("?"));
-    });
-    match result {
-        Ok(()) => crate::println!("{files} file(s)."),
-        Err(error) => crate::println!("ls: cannot read the directory ({error:?})."),
-    }
-}
-
-/// Shows up to 16 KiB of a file as text (non-printable bytes as dots).
-fn cat(name: &str) {
-    static mut BUFFER: [u8; 16384] = [0; 16384];
-    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BUFFER) };
-    let Some((volume, name)) = locate(name) else {
-        // `diskN/NAME` on a FAT32/exFAT card.
-        let length = crate::tape_fs::read(name.as_bytes(), buffer);
-        if length < 0 {
-            crate::println!("cat: {name}: not found or not readable (code {length}).");
-            return;
-        }
-        for &byte in &buffer[..length as usize] {
-            let shown = if byte == b'\n' || (0x20..0x7f).contains(&byte) { byte } else { b'.' };
-            crate::print(format_args!("{}", shown as char));
-        }
-        crate::println!();
-        return;
-    };
-    match volume.read(name.as_bytes(), buffer) {
-        Ok(Some(length)) => {
-            for &byte in &buffer[..length] {
-                let shown = if byte == b'\n' || (0x20..0x7f).contains(&byte) { byte } else { b'.' };
-                crate::print(format_args!("{}", shown as char));
-            }
-            crate::println!();
-        }
-        Ok(None) => crate::println!("cat: {name}: no such file."),
-        Err(error) => crate::println!("cat: {name}: {error:?} (files over 16 KiB are not shown)."),
-    }
-}
-
 /// `sector diskN LBA [COUNT]`: a read-only hex dump of raw sectors (at most 4).
 fn sector(rest: &str) {
     let mut words = rest.split_whitespace();
@@ -448,7 +255,7 @@ fn run_tape(rest: &str) {
         return;
     }
     // `run NAME help`: a tape with a `.fos_help` section shows it instead of running.
-    if matches!(arguments, "help" | "-h" | "--help" | "?") && show_tape_help(name) {
+    if matches!(arguments, "help" | "-h" | "--help" | "?") && fosfor_shell::Host::tape_help(&mut KernelHost, name) {
         return;
     }
     if let Some(Ok(nic)) = service {

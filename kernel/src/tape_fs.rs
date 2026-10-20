@@ -54,6 +54,11 @@ fn resolve_fat(reference: &[u8]) -> Option<(crate::fatvol::Fs, &[u8])> {
     fat_disk(number).map(|fs| (fs, &reference[slash + 1..]))
 }
 
+/// Whether a reference names a FAT32/exFAT volume (`esp/`, or `diskN/` of a disk with no FOSFS volume).
+pub fn is_fat(reference: &[u8]) -> bool {
+    resolve_fat(reference).is_some()
+}
+
 fn fat_error(error: fat::Error) -> isize {
     match error {
         fat::Error::NotFound => FS_NOT_FOUND,
@@ -144,40 +149,54 @@ pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
     storage::volume_on(disk_number(reference)?).ok()
 }
 
-/// `fs_list`: the `index`th file of a volume (`""`, `diskN`, `@LABEL`); a FAT disk lists its root directory.
-pub fn list(reference: &[u8], index: usize, out: &mut FileInfo) -> isize {
+/// Every entry of a volume (`""`, `diskN`, `@LABEL`, `esp`): its name, length, whether it is a directory and (FAT) when it
+/// was written; the result is the kind of volume (`FOSFS`, `FAT32`, `exFAT`) or an `FS_*` code. A disk with only a
+/// FAT32/exFAT volume lists its root directory.
+pub fn each_entry(reference: &[u8], each: &mut dyn FnMut(&[u8], u64, bool, Option<fat::Time>)) -> Result<&'static str, isize> {
     let fat = if reference == b"esp" { crate::fatvol::mount_esp() } else { disk_number(reference).and_then(fat_disk) };
     if let Some(mut fs) = fat {
-        let (mut position, mut found) = (0, false);
-        let outcome = fs.list(|entry| {
-            if position == index && !found {
-                found = true;
-                let name = entry.name();
-                let length = name.len().min(64);
-                *out = FileInfo { length: u64::from(entry.size), flags: if entry.is_directory { FILE_DIRECTORY } else { 0 }, name_length: length as u32, name: [0; 64] };
-                out.name[..length].copy_from_slice(&name[..length]);
-            }
-            position += 1;
-        });
-        return match outcome {
-            Ok(()) => isize::from(found),
-            Err(error) => fat_error(error),
-        };
+        let kind = if fs.kind() == fat::Kind::ExFat { "exFAT" } else { "FAT32" };
+        return fs.list(|entry| each(entry.name(), u64::from(entry.size), entry.is_directory, entry.modified)).map(|()| kind).map_err(fat_error);
     }
-    let Some(volume) = resolve_volume(reference) else { return FS_NO_VOLUME };
-    let mut position = 0;
-    let mut found = false;
-    let outcome = volume.for_each(|entry| {
+    let volume = resolve_volume(reference).ok_or(FS_NO_VOLUME)?;
+    volume.for_each(|entry| each(entry.name(), entry.length, false, None)).map(|()| "FOSFS").map_err(|_| FS_ERROR)
+}
+
+/// `fs_list`: the `index`th file of a volume (`""`, `diskN`, `@LABEL`); a FAT disk lists its root directory.
+pub fn list(reference: &[u8], index: usize, out: &mut FileInfo) -> isize {
+    let (mut position, mut found) = (0, false);
+    let outcome = each_entry(reference, &mut |name, length, directory, _| {
         if position == index && !found {
             found = true;
-            let name = entry.name();
-            *out = FileInfo { length: entry.length, flags: 0, name_length: name.len() as u32, name: [0; 64] };
-            out.name[..name.len()].copy_from_slice(name);
+            let shown = name.len().min(64);
+            *out = FileInfo { length, flags: if directory { FILE_DIRECTORY } else { 0 }, name_length: shown as u32, name: [0; 64] };
+            out.name[..shown].copy_from_slice(&name[..shown]);
         }
         position += 1;
     });
     match outcome {
-        Ok(()) => isize::from(found),
+        Ok(_) => isize::from(found),
+        Err(code) => code,
+    }
+}
+
+/// The length of a file, or an `FS_*` code.
+pub fn length(reference: &[u8]) -> isize {
+    if let Some((mut fs, name)) = resolve_fat(reference) {
+        return match fs.entry(name) {
+            Ok(Some(entry)) if !entry.is_directory => entry.size as isize,
+            Ok(_) => FS_NOT_FOUND,
+            Err(error) => fat_error(error),
+        };
+    }
+    let (volume, name) = match resolve_file(reference, true) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    match volume.file_length(name) {
+        Ok(Some(length)) => length as isize,
+        Ok(None) => FS_NOT_FOUND,
+        Err(Error::InvalidName) => FS_BAD_NAME,
         Err(_) => FS_ERROR,
     }
 }
