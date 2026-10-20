@@ -351,7 +351,6 @@ pub fn init() -> bool {
     write(RDMA_CONS_INDEX, 0);
     let consumed = read(RDMA_PROD_INDEX) & 0xffff;
     write(RDMA_CONS_INDEX, consumed);
-    crate::println!("Genet: receive indices after reset: producer {consumed}.");
     write(RDMA_RING + DMA_RING_BUF_SIZE, (DESCRIPTORS as u32) << 16 | BUFFER_LENGTH as u32);
     write(RDMA_XON_XOFF_THRESH, DMA_FC_THRESH);
     write(RDMA_REGS + DMA_RING_CFG, 1 << DEFAULT_RING);
@@ -482,9 +481,6 @@ pub fn receive(buffer: &mut [u8]) -> usize {
         } else {
             genet.dropped += 1;
             genet.last_drop = status;
-            if genet.dropped <= 8 {
-                crate::println!("Genet: dropped descriptor {:08x} (index {}, prod {:x}, cons {:x}), data {:02x?}", status, genet.rx_index, read(RDMA_PROD_INDEX), genet.consumed, unsafe { core::slice::from_raw_parts(address as *const u8, 24) });
-            }
         }
         // Give the descriptor back to the MAC.
         genet.consumed = (genet.consumed + 1) & 0xffff;
