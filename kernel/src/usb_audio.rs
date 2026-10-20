@@ -1061,6 +1061,8 @@ fn publish(slot: &mut Option<Stream>, stream: Stream) {
     for position in 0..stream.window {
         queue_slot(stream, position);
     }
+    // The first window goes out before the caller can have written anything: silence by construction, not an underrun.
+    stream.underruns.store(0, Ordering::Relaxed);
     if let Some(feedback) = stream.feedback.as_mut() {
         for position in 0..FEEDBACK_WINDOW {
             feedback.trbs[position] = xhci::push_isoc(&mut feedback.ring, feedback.buffers + (position * 16) as u64, u32::from(feedback.packet));
