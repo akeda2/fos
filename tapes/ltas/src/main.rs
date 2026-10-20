@@ -326,7 +326,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if analysis_frames > 0 {
         println!(
             "ltas: {} FFT {}: {} us per analysis on average, {} us at worst ({} frames timed).",
-            if settings.avx2 { "AVX2+FMA" } else { "SSE2" },
+            if cfg!(target_arch = "aarch64") { "baseline" } else if settings.avx2 { "AVX2+FMA" } else { "SSE2" },
             settings.n,
             analysis_us / analysis_frames,
             analysis_worst,

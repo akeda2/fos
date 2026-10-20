@@ -295,3 +295,13 @@ It needs a `kernel-update` line in the boot volume's `debug` file (deliver it on
 only at the prompt (not while a tape runs) and not while a service owns the NIC. Verified on the Pi: discovered as
 `fos-b12e7b`, 542824-byte image pushed with `--delay 0.002`, ACK received, board restarted. The first kernel with this
 still has to arrive by serial KUP.
+
+## Audio tapes on the Pi (2026-10-20)
+
+`play`, `record`, `recorder` and `ltas` build unchanged for aarch64 (`A64_TAPES`) and run on the Pi with the USB audio interface
+(2 out, 6 in, 24-bit, 48 kHz). Verified on the Pi 4: `record` took 10 s of 6 channels into a FOSFS file on the SD card (8.4 MiB/s
+while writing, slowest block 69 ms, 0 transfer errors, 0 overruns); `play` played it back (the 2400 underruns it prints are the
+300 ms of silence it waits out after the ring is empty, the same on x86); `ltas` runs its analysis at 814 us per 8192-point FFT
+with 0 overruns; `recorder` shows its panel. Not checked by ear or eye (the user was away from the Pi), and no QEMU test (QEMU's
+`usb-audio` is output-only and there is no HDA). The Pi shell has no `help NAME` / `NAME help` yet (x86 prints the tape's
+`.fos_help` section); `run record help` there starts a recording called help.wav.
