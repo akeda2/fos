@@ -47,18 +47,6 @@ stubs! {
     api_nic_tx_offload(usize, u32) -> u32 = 0;
     api_nic_counters(usize, *mut u64, usize) -> usize = 0;
     api_peer_info(usize, *mut PeerInfo) -> usize = 0;
-    api_audio_info(*mut AudioInfo) -> u32 = 0;
-    api_audio_start(u32, u32, u32) -> i32 = AUDIO_NO_DEVICE;
-    api_audio_stop() = ();
-    api_audio_read(*mut u8, usize) -> usize = 0;
-    api_audio_write(*const u8, usize) -> usize = 0;
-    api_audio_stats(*mut AudioStats) = ();
-    api_audio_select(u32, u32) -> i32 = AUDIO_NO_DEVICE;
-    api_audio_buffer(*mut AudioBuffer) = ();
-    api_audio_set_capture_ring(u64) = ();
-    api_audio_devices(u32, *mut AudioDevice) -> u32 = 0;
-    api_audio_use_device(u32) -> i32 = AUDIO_NO_DEVICE;
-    api_audio_use_output(u32) -> i32 = AUDIO_NO_DEVICE;
     api_hostname(usize, *mut u8, usize) -> usize = 0;
     api_disk_format_exfat(usize, *const u8, usize) -> i32 = -1;
     api_wall_clock(*mut WallClock) -> u32 = 0;
@@ -383,6 +371,53 @@ extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8,
 
 extern "C" fn api_fs_list(volume: *const u8, volume_length: usize, index: usize, out: *mut FileInfo) -> isize {
     crate::tape_fs::list(unsafe { core::slice::from_raw_parts(volume, volume_length) }, index, unsafe { &mut *out })
+}
+
+extern "C" fn api_audio_info(out: *mut AudioInfo) -> u32 {
+    u32::from(crate::audio::fill_info(unsafe { &mut *out }))
+}
+extern "C" fn api_audio_start(rate: u32, capture: u32, playback: u32) -> i32 {
+    crate::audio::start_for_tape(rate, capture != 0, playback != 0)
+}
+extern "C" fn api_audio_stop() {
+    crate::audio::stop_for_tape();
+}
+/// USB audio moves through the xHCI event ring, which `next_byte` (and so every tape's key poll) drains; the audio calls
+/// drain it themselves too, since a tape that only streams may not read keys often.
+extern "C" fn api_audio_read(buffer: *mut u8, length: usize) -> usize {
+    crate::usb_kbd::poll();
+    crate::audio::read(unsafe { core::slice::from_raw_parts_mut(buffer, length) })
+}
+extern "C" fn api_audio_write(data: *const u8, length: usize) -> usize {
+    crate::usb_kbd::poll();
+    crate::audio::write(unsafe { core::slice::from_raw_parts(data, length) })
+}
+extern "C" fn api_audio_stats(out: *mut AudioStats) {
+    crate::audio::fill_stats(unsafe { &mut *out });
+}
+extern "C" fn api_audio_select(direction: u32, mode: u32) -> i32 {
+    crate::audio::select_for_tape(direction == 0, mode)
+}
+extern "C" fn api_audio_buffer(out: *mut AudioBuffer) {
+    let (ring_bytes, available_bytes) = crate::audio::buffer_info();
+    unsafe { *out = AudioBuffer { ring_bytes, available_bytes } };
+}
+extern "C" fn api_audio_set_capture_ring(bytes: u64) {
+    crate::usb_audio::set_capture_ring(bytes);
+}
+extern "C" fn api_audio_devices(number: u32, out: *mut AudioDevice) -> u32 {
+    if !out.is_null() {
+        if let Some(device) = crate::audio::device_info(number as usize) {
+            unsafe { out.write(device) };
+        }
+    }
+    crate::audio::device_count() as u32
+}
+extern "C" fn api_audio_use_device(number: u32) -> i32 {
+    crate::audio::use_device_for_tape(number)
+}
+extern "C" fn api_audio_use_output(number: u32) -> i32 {
+    crate::audio::use_output_for_tape(number)
 }
 
 extern "C" fn api_disk_info(number: usize, out: *mut DiskInfo) -> u32 {

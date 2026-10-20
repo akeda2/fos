@@ -62,6 +62,7 @@ fn execute(line: &str) {
             None => crate::println!("fsck: no FOSFS volume there (use `fsck` or `fsck diskN`)."),
         },
         "sector" => sector(rest),
+        "audio" => audio(rest),
         "run" => run_tape(rest),
         "keymap" => match crate::usb_kbd::layout_named(rest) {
             Some(layout) => crate::usb_kbd::set_layout(layout),
@@ -369,5 +370,54 @@ fn kup_serial(speed: &str) {
             crate::arch::aarch64::power::reset()
         }
         Err(message) => crate::println!("KUP serial: {message}; nothing was written."),
+    }
+}
+
+/// `audio` (status), `audio modes`, `audio tone [HZ] [SECONDS]`: a first look at USB audio on this port.
+fn audio(rest: &str) {
+    use crate::audio as ua;
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        None => ua::status(),
+        Some("modes") => ua::print_modes(),
+        Some("tone") => {
+            let frequency = words.next().and_then(|w| w.parse::<u32>().ok()).unwrap_or(440).clamp(20, 20_000);
+            let seconds = words.next().and_then(|w| w.parse::<u64>().ok()).unwrap_or(3).clamp(1, 60);
+            let rate = 48_000;
+            if let Err(reason) = ua::start(rate, false, true) {
+                return crate::println!("audio: {reason}.");
+            }
+            let Some((channels, slot)) = ua::playback_format() else { return };
+            let (channels, slot) = (usize::from(channels), usize::from(slot));
+            let frame_bytes = channels * slot;
+            let step = (u64::from(frequency) << 16) / u64::from(rate);
+            let mut phase = 0u64;
+            let end = timer::ticks() + seconds * timer::TICK_HZ;
+            let mut chunk = [0u8; 2048];
+            while timer::ticks() < end {
+                crate::usb_kbd::poll();
+                ua::poll();
+                let frames = (chunk.len() / frame_bytes).min(ua::playback_space() / frame_bytes);
+                if frames == 0 {
+                    continue;
+                }
+                for frame in chunk[..frames * frame_bytes].chunks_mut(frame_bytes) {
+                    let half = (phase & 0x7fff) as i64;
+                    let magnitude = (half * (0x8000 - half)) >> 13;
+                    let sample = (if phase & 0x8000 != 0 { -magnitude } else { magnitude }) / 4;
+                    phase = (phase + step) & 0xffff;
+                    let value = sample << (8 * slot as u32 - 16);
+                    for sample_slot in frame.chunks_mut(slot) {
+                        for (index, byte) in sample_slot.iter_mut().enumerate() {
+                            *byte = (value >> (8 * index)) as u8;
+                        }
+                    }
+                }
+                ua::write(&chunk[..frames * frame_bytes]);
+            }
+            ua::status();
+            ua::stop();
+        }
+        Some(_) => crate::println!("Usage: audio | audio modes | audio tone [HZ] [SECONDS]"),
     }
 }

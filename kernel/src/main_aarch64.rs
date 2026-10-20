@@ -3,6 +3,11 @@ use core::panic::PanicInfo;
 use fosfor_abi::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 
 mod arch;
+mod audio;
+#[path = "ehci_none.rs"]
+mod ehci;
+#[path = "hda_none.rs"]
+mod hda;
 mod block;
 mod font_data;
 mod fatvol;
@@ -21,6 +26,7 @@ mod kup_serial;
 mod slots;
 mod sdhci;
 mod usb_hub;
+mod usb_audio;
 mod usb_kbd;
 mod usb_storage;
 mod virtio_blk;

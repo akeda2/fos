@@ -210,3 +210,13 @@ number (`usb` rescans). Sticks are therefore ordinary `diskN` entries: FOSFS or 
 tape file calls all work on them. QEMU `usb-storage` on the xHCI controller is tested in `make test-aarch64-boot`; the Pi's
 VL805 controller with a real stick, and unplug/replug on aarch64, have not been tried. Booting from a USB stick is not
 supported (the Pi boots from its SD card).
+
+## USB audio on aarch64
+
+`usb_audio.rs` and `audio.rs` build on both ports. The EHCI and HDA parts are satisfied by stub modules
+(`ehci_none.rs`, `hda_none.rs`, included with `#[path]`), so only xHCI audio exists here. `usb_kbd::probe_device`
+attaches audio-class devices, `xhci::drain` hands isochronous events to `usb_audio::irq_event`, and the tape table's
+`audio_*` calls are the same as on x86. Shell: `audio`, `audio modes`, `audio tone [HZ] [SECONDS]`.
+Verified on a Pi 4 with a 2-out/6-in class 2.0 interface: attach, modes, 4 s playback with feedback locked
+(6.001 vs 6.000 frames/packet), no errors. Whether the tone is audible and clean, capture, and DMA coherency of the
+isochronous buffers are still to confirm by ear/loopback.

@@ -189,6 +189,16 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
                 }
             });
         }
+        // A USB audio class device (an interface or a headset): PCM streams through isochronous endpoints.
+        if crate::usb_audio::is_audio(&configuration[..total]) {
+            let description = crate::usb_audio::parse(&configuration[..total]);
+            crate::usb_audio::report(&description, &device.path(), vendor, product, xhci::speed_name(device.speed));
+            if crate::usb_audio::attach(controller, device, description, configuration[5]) {
+                return Ok(true);
+            }
+            controller.release_slot(device.slot);
+            return Ok(false);
+        }
         crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (class {:#04x}, {}): not a keyboard or disk, ignored for now.", descriptor[4], xhci::speed_name(device.speed));
         controller.release_slot(device.slot);
         return Ok(false);

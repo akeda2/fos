@@ -397,7 +397,6 @@ fn drain(index: usize) {
             state.cycle = !state.cycle;
         }
         consumed = true;
-        #[cfg(target_arch = "x86_64")]
         if crate::usb_audio::irq_event(index, &trb) {
             continue;
         }
