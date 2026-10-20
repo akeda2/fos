@@ -233,3 +233,10 @@ isochronous buffers are still to confirm by ear/loopback.
   `python3 tools/send_file_serial.py /dev/ttyUSB3 build/fosfor-aarch64/tapes/clock clock --fast 921600` (154 KB in 2.3 s).
   The shell must be idle at its prompt. `NAME` may be `diskN/NAME`. Tested in `make test-aarch64-kup` (QEMU).
 - Verified on the Pi: DHCP on the Genet, NTP from the LAN server, the machine's clock set (round trip 432 us).
+
+## Gonio on aarch64 (2026-10-20)
+
+`gonio` builds unchanged for `aarch64-unknown-none` (`A64_TAPES`) and runs on the Pi 4 with a USB class 2.0 interface (microphones on
+inputs 1-2): scope, level meters, correlation and the loudness panel look as on x86. **No QEMU test**: QEMU's `usb-audio` is
+output-only and the port has no HDA, so there is no capture device to run it against; it is verified on the Pi only. Deploy:
+`python3 tools/send_file_serial.py /dev/ttyUSB3 build/fosfor-aarch64/tapes/gonio gonio --fast 921600`.
