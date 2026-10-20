@@ -17,6 +17,7 @@ mod framebuffer;
 mod gpt;
 mod lineedit;
 mod mailbox;
+mod netservice;
 mod memory;
 mod pci;
 mod service_host;

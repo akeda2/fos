@@ -153,7 +153,7 @@ fn receive(link: &mut impl Link, staging: &mut [u8]) -> Result<usize, &'static s
 
 /// Writes the verified image into the inactive slot and makes it the pending one: the loader gives it exactly one try and
 /// falls back to the running kernel unless it reaches its milestone. Returns the slot.
-fn install(staging: &mut [u8], length: usize) -> Result<u8, &'static str> {
+pub fn install(staging: &mut [u8], length: usize) -> Result<u8, &'static str> {
     let (Some(current), Some(disk), Some(payload)) = (metadata::read_metadata(), crate::storage::boot_disk(), crate::storage::payload_start()) else {
         return Err("the slot metadata or the boot disk is not available");
     };

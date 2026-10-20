@@ -284,3 +284,14 @@ at fault.
 2 and 3 (0 and 1 are for `run A + B`). A foreground tape's end no longer blanks screen 1 while a service runs. Verified on the Pi:
 `run clock ntp=off screen=1 &0` ticks on the second screen next to the shell and `run calc`; it stalls while a shell command or a
 tape load blocks (SD reads), because switching is cooperative. Ethernet KUP is x86 only; the Pi uses serial KUP.
+
+## Ethernet KUP and discovery on the Pi (2026-10-20)
+
+`kernel/src/netservice.rs` speaks the x86 wire format (ethertype 0x88b6) from the shell's idle loop: it answers
+`tools/peers.py --discover` (name = `hostname` file + `1`, else `fos-` + last MAC bytes) and takes a kernel update
+(`tools/send_kernel_update.py`, `devloop.py push`) with the same checks as x86: length, RFC 1071 checksum, one sender at a time,
+no retransmission. The image is staged in RAM and written to the inactive slot by `kup_serial::install`, then the board resets.
+It needs a `kernel-update` line in the boot volume's `debug` file (deliver it once with `send_file_serial.py`), is served
+only at the prompt (not while a tape runs) and not while a service owns the NIC. Verified on the Pi: discovered as
+`fos-b12e7b`, 542824-byte image pushed with `--delay 0.002`, ACK received, board restarted. The first kernel with this
+still has to arrive by serial KUP.

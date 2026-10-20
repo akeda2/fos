@@ -45,6 +45,10 @@ pub fn run() -> ! {
             // Background tapes (`run NAME &N`) get a pass; the CPU sleeps only when they are all idle.
             // The 100 Hz timer interrupt wakes this at least every 10 ms.
             None => {
+                // Frames for the network service (discovery, kernel update) first; more may be waiting.
+                if crate::netservice::poll() {
+                    continue;
+                }
                 if !crate::tasks::pass() {
                     crate::cpu::sleep();
                 }
