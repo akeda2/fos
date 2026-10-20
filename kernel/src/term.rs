@@ -1825,6 +1825,10 @@ fn execute(command: &str) {
             crate::debug::mark_clean_stop();
             power::reset(unsafe { RUNTIME_SERVICES });
         }
+        "kup" => match words.next() {
+            Some("serial") => kup_serial(),
+            _ => crate::println!("kup serial: take a kernel over the COM1 console (tools/send_kernel_serial.py)."),
+        },
         "debug" => match words.next() {
             Some("status") | Some("slots") | None => {
                 let debug = crate::config::debug();
@@ -3743,5 +3747,40 @@ fn hwp_command(preference: Option<&str>) {
                 crate::println!("Energy preference {epp} (0 performance, 255 power saving)");
             }
         }
+    }
+}
+
+/// COM1 as a `kup_serial` link.
+struct Com1;
+
+impl crate::kup_serial::Link for Com1 {
+    fn read_byte(&mut self) -> Option<u8> {
+        crate::serial::read_byte()
+    }
+    fn write_byte(&mut self, byte: u8) {
+        crate::serial::write_byte(byte);
+    }
+    fn micros(&self) -> u64 {
+        crate::timer::micros()
+    }
+}
+
+/// `kup serial`: a kernel image from `tools/send_kernel_serial.py` over COM1 into the inactive slot, then a restart to try
+/// it (the same slot logic as the network KUP; the command is for the serial console, the protocol owns COM1 meanwhile).
+fn kup_serial() {
+    let Some(staging) = crate::tape::staging() else {
+        return crate::println!("kup: no memory for the image.");
+    };
+    crate::println!("KUP serial: ready (the sender starts within 30 s).");
+    flush();
+    match crate::kup_serial::serve(&mut Com1, staging) {
+        Ok(slot) => {
+            crate::println!("KUP serial: image verified and written to slot {slot} (pending); restarting to try it.");
+            flush();
+            timer::busy_wait_ms(200);
+            crate::debug::mark_clean_stop();
+            power::reset(unsafe { RUNTIME_SERVICES });
+        }
+        Err(message) => crate::println!("KUP serial: {message}; nothing was written (COM1 bytes dropped: {}).", crate::serial::RX_DROPPED.load(core::sync::atomic::Ordering::Relaxed)),
     }
 }

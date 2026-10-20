@@ -143,7 +143,7 @@ OPUS_CFLAGS := -O2 -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-a
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: image-pi4 tapes-aarch64 loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot test-aarch64-faults opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-clock test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
+.PHONY: image-pi4 tapes-aarch64 loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot test-aarch64-faults test-aarch64-kup test-kup-serial opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-clock test-usb-audio test-hda test-audio-net test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -209,6 +209,13 @@ image-pi4: image-aarch64
 
 test-aarch64-boot: image-aarch64
 	python3 tools/test_aarch64_boot.py
+
+# Serial KUP: a kernel pushed over the console UART is tried from the other slot and confirmed.
+test-aarch64-kup: image-aarch64
+	python3 tools/test_kup_serial.py aarch64
+
+test-kup-serial: image
+	python3 tools/test_kup_serial.py x86
 
 # Deliberate-fault kernels (one Cargo feature each) must be reported by the aarch64 exception vectors.
 test-aarch64-faults: loader-aarch64

@@ -29,6 +29,11 @@ fn put(byte: u8) {
     unsafe { core::ptr::write_volatile(base as *mut u32, u32::from(byte)) };
 }
 
+/// One byte as is (the console writer turns `\n` into CRLF; a binary protocol must not).
+pub fn write_raw(byte: u8) {
+    put(byte);
+}
+
 pub struct Serial;
 
 impl core::fmt::Write for Serial {

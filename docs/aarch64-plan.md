@@ -131,3 +131,12 @@ MAC from the firmware's UMAC registers (fallback `02:f0:5b:00:00:01`); BCM54213P
 and is auto-negotiated only when it has no link. Tape ABI NIC 0 is the Genet; multicast is promiscuous mode. QEMU has no
 Genet, so only `make tapes-aarch64` and the boot test cover it; the `netcheck` tape (DHCP, ARP, four pings) and the shell
 `nic` command are the first things to run on the Pi. Unknown until then: bring-up order, speed/duplex bits, PHY state left by edk2.
+
+## Genet RX ring and serial KUP
+
+- Genet RX: the MAC's write pointer starts at descriptor 0 after reset, while the producer index counts from where the
+  firmware left it. The driver indexes from 0 and resets PROD/CONS to 0; an unwritten descriptor reads `0x08008000`.
+- Serial KUP (`kup serial` in the shell, `tools/send_kernel_serial.py PORT KERNEL`, both architectures): framed
+  stop-and-wait over the console UART, whole-image CRC-32, written to the inactive slot only after it matches, then
+  reset; the loader gives it one try. x86 needs the 4 KiB COM1 ring for 2 KiB frames. Tests: `make test-aarch64-kup`,
+  `make test-kup-serial`. Only the Pi can verify: the BCM2711 watchdog reset, SD slot writes through EMMC2, Genet RX/DHCP.

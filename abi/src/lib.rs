@@ -284,9 +284,35 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// CRC-32 (IEEE 802.3, reflected, as zlib's `crc32`): the serial kernel update protocol's frame and image check.
+pub fn crc32(data: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut index = 0;
+        while index < 256 {
+            let mut value = index as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                value = if value & 1 != 0 { 0xedb8_8320 ^ (value >> 1) } else { value >> 1 };
+                bit += 1;
+            }
+            table[index] = value;
+            index += 1;
+        }
+        table
+    };
+    !data.iter().fold(!0u32, |crc, &byte| TABLE[((crc ^ u32::from(byte)) & 0xff) as usize] ^ (crc >> 8))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn crc32_matches_zlib() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
 
     #[test]
     fn multicast_hash_matches_each_table_size() {

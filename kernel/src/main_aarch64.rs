@@ -15,6 +15,8 @@ mod shell;
 mod storage;
 mod tape_aarch64;
 mod genet;
+mod kup_serial;
+mod slots;
 mod sdhci;
 mod usb_hub;
 mod usb_kbd;
@@ -198,6 +200,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     println!("USB: {} keyboard(s) found.", usb_kbd::init());
     shell::apply_settings();
     cpu::interrupts_enable();
+    slots::confirm_boot();
     shell::run()
 }
 

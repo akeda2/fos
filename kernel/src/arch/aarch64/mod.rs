@@ -9,6 +9,7 @@ pub mod gic;
 pub mod paging;
 pub mod pci_config;
 pub mod pl011;
+pub mod power;
 pub mod timer;
 
 // Entered from the UEFI loader like a C function: x0 = the BootInfo pointer, MMU and caches on with the firmware's

@@ -117,7 +117,7 @@ pub fn write_byte(byte: u8) {
 /// Received bytes waiting for the shell. With the receive interrupt on, the handler fills this from the UART's 16-byte
 /// FIFO (115200 baud is a byte every 87 us, so a pasted line overran the FIFO long before the 10 ms idle tick polled it
 /// and characters were lost); `read_byte` empties it.
-const RX_SIZE: usize = 1024;
+const RX_SIZE: usize = 4096;
 static mut RX: [u8; RX_SIZE] = [0; RX_SIZE];
 static RX_HEAD: AtomicUsize = AtomicUsize::new(0);
 static RX_TAIL: AtomicUsize = AtomicUsize::new(0);

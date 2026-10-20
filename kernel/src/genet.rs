@@ -133,6 +133,7 @@ struct Genet {
     sent: u32,
     received: u32,
     dropped: u32,
+    last_drop: u32,
 }
 
 static mut GENET: Option<Genet> = None;
@@ -346,8 +347,11 @@ pub fn init() -> bool {
     write(RDMA_WRITE_PTR, 0);
     write(RDMA_RING + DMA_END_ADDR, (DESCRIPTORS as u64 * DESC_SIZE / 4 - 1) as u32);
     // The producer index cannot be set, so the consumer index is set to match it.
+    write(RDMA_PROD_INDEX, 0);
+    write(RDMA_CONS_INDEX, 0);
     let consumed = read(RDMA_PROD_INDEX) & 0xffff;
     write(RDMA_CONS_INDEX, consumed);
+    crate::println!("Genet: receive indices after reset: producer {consumed}.");
     write(RDMA_RING + DMA_RING_BUF_SIZE, (DESCRIPTORS as u32) << 16 | BUFFER_LENGTH as u32);
     write(RDMA_XON_XOFF_THRESH, DMA_FC_THRESH);
     write(RDMA_REGS + DMA_RING_CFG, 1 << DEFAULT_RING);
@@ -381,7 +385,7 @@ pub fn init() -> bool {
         mac,
         rx_buffers,
         tx_buffer,
-        rx_index: (consumed & 0xff) as usize,
+        rx_index: 0,
         consumed,
         tx_index: (transmitted & 0xff) as usize,
         phy,
@@ -391,6 +395,7 @@ pub fn init() -> bool {
         sent: 0,
         received: 0,
         dropped: 0,
+        last_drop: 0,
     };
     write(UMAC_CMD, CMD_TX_EN | CMD_RX_EN);
     let linked = wait_for_link(&mut genet, 4000);
@@ -463,6 +468,10 @@ pub fn receive(buffer: &mut [u8]) -> usize {
         barrier();
         let descriptor = RX_DESCRIPTORS + genet.rx_index as u64 * DESC_SIZE;
         let status = read(descriptor);
+        if status == (BUFFER_LENGTH as u32) << 16 | DMA_OWN {
+            // The index moved before the MAC wrote this descriptor: look again later.
+            return 0;
+        }
         let length = ((status >> 16) & 0xfff) as usize;
         let address = genet.rx_buffers + genet.rx_index as u64 * BUFFER_LENGTH as u64;
         let whole = status & (DMA_SOP | DMA_EOP) == (DMA_SOP | DMA_EOP) && status & DMA_RX_ERRORS == 0 && length > RX_PAD;
@@ -472,6 +481,10 @@ pub fn receive(buffer: &mut [u8]) -> usize {
             genet.received += 1;
         } else {
             genet.dropped += 1;
+            genet.last_drop = status;
+            if genet.dropped <= 8 {
+                crate::println!("Genet: dropped descriptor {:08x} (index {}, prod {:x}, cons {:x}), data {:02x?}", status, genet.rx_index, read(RDMA_PROD_INDEX), genet.consumed, unsafe { core::slice::from_raw_parts(address as *const u8, 24) });
+            }
         }
         // Give the descriptor back to the MAC.
         genet.consumed = (genet.consumed + 1) & 0xffff;
@@ -495,7 +508,7 @@ pub fn status() {
     if linked {
         crate::println!("  {} Mbit/s, {} duplex.", genet.speed, if genet.full_duplex { "full" } else { "half" });
     }
-    crate::println!("  frames sent {}, received {}, dropped {}.", genet.sent, genet.received, genet.dropped);
+    crate::println!("  frames sent {}, received {}, dropped {} (last status {:08x}).", genet.sent, genet.received, genet.dropped, genet.last_drop);
     crate::println!(
         "  PHY {}: BMCR {:04x?} BMSR {:04x?} ADV {:04x?} LPA {:04x?} CTRL1000 {:04x?} STAT1000 {:04x?}",
         genet.phy,
@@ -506,4 +519,26 @@ pub fn status() {
         mdio_read(genet.phy, CTRL1000).unwrap_or(0xffff),
         mdio_read(genet.phy, STAT1000).unwrap_or(0xffff)
     );
+}
+
+/// `nic rx`: for three seconds prints a line per received frame (length, destination, source, EtherType, IPv4 protocol).
+pub fn show_rx() {
+    let mut frame = [0u8; 1600];
+    let start = timer::micros();
+    let mut shown = 0;
+    while timer::micros() - start < 3_000_000 && shown < 40 {
+        let length = receive(&mut frame);
+        if length < 14 {
+            continue;
+        }
+        shown += 1;
+        crate::println!(
+            "  {length:4} B to {:02x?} from {:02x?} type {:02x}{:02x} proto {:02x}",
+            &frame[0..6],
+            &frame[6..12],
+            frame[12],
+            frame[13],
+            frame.get(23).copied().unwrap_or(0)
+        );
+    }
 }

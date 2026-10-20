@@ -6,6 +6,7 @@ mod bootcode;
 mod clock;
 mod config;
 mod debug;
+mod kup_serial;
 mod diag;
 mod nicpark;
 mod e1000;

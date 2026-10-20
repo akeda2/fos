@@ -30,7 +30,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST echo TEXT keymap us|sv run NAME [ARGS]\ndmesg usb nic acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST echo TEXT keymap us|sv run NAME [ARGS]\ndmesg usb nic [rx] slots kup serial reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -66,8 +66,15 @@ fn execute(line: &str) {
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
         }),
         "dmesg" => crate::dmesg(),
+        "nic" if rest == "rx" => crate::genet::show_rx(),
         "nic" => crate::genet::status(),
         "usb" => crate::println!("usb: {} new keyboard(s).", crate::usb_kbd::probe_all()),
+        "kup" if rest == "serial" => kup_serial(),
+        "slots" => crate::slots::show(),
+        "reset" => {
+            crate::println!("Restarting.");
+            crate::arch::aarch64::power::reset()
+        }
         "peek" => peek(rest),
         "poke" => poke(rest),
         other => crate::println!("{other}: unknown command (try `help`)."),
@@ -215,4 +222,40 @@ fn poke(rest: &str) {
     };
     crate::arch::aarch64::paging::map_device(address, 4);
     unsafe { core::ptr::write_volatile(address as *mut u32, value as u32) };
+}
+
+/// The console UART as a `kup_serial` link.
+struct Console;
+
+impl crate::kup_serial::Link for Console {
+    fn read_byte(&mut self) -> Option<u8> {
+        crate::arch::aarch64::pl011::read_byte()
+    }
+    fn write_byte(&mut self, byte: u8) {
+        crate::arch::aarch64::pl011::write_raw(byte);
+    }
+    fn micros(&self) -> u64 {
+        timer::micros()
+    }
+}
+
+/// `kup serial`: takes a kernel image from `tools/send_kernel_serial.py` over the console UART into the inactive slot, then
+/// restarts to try it (the loader falls back to this kernel unless the new one reaches its milestone).
+fn kup_serial() {
+    const STAGE_BYTES: usize = 4 * 1024 * 1024;
+    let Some(staging) = memory::allocate_contiguous(STAGE_BYTES as u64 / memory::FRAME, None) else {
+        return crate::println!("kup: no memory for the image.");
+    };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, STAGE_BYTES) };
+    crate::println!("KUP serial: ready (the sender starts within 30 s).");
+    let result = crate::kup_serial::serve(&mut Console, buffer);
+    memory::free(staging, STAGE_BYTES as u64 / memory::FRAME);
+    match result {
+        Ok(slot) => {
+            crate::println!("KUP serial: image verified and written to slot {slot} (pending); restarting to try it.");
+            timer::busy_wait_ms(200);
+            crate::arch::aarch64::power::reset()
+        }
+        Err(message) => crate::println!("KUP serial: {message}; nothing was written."),
+    }
 }
