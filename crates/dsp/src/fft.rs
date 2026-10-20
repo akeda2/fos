@@ -45,15 +45,18 @@ impl<const MAX: usize> Plan<MAX> {
     /// In-place forward transform of `re`/`im` (each exactly `len()` long); X[k] = sum x[n] e^{-2 pi i n k / N}, unscaled.
     pub fn forward(&self, re: &mut [f32], im: &mut [f32], avx2: bool) {
         assert!(re.len() == self.n && im.len() == self.n && self.n >= 2);
+        // The AVX2 build exists on x86-64 only; elsewhere the flag is ignored (aarch64 NEON vectorises the generic code).
+        #[cfg(target_arch = "x86_64")]
         if avx2 {
             // SAFETY: the caller promises AVX2 and FMA are present (fp_level).
-            unsafe { forward_avx2(self, re, im) }
-        } else {
-            forward_generic(self, re, im);
+            return unsafe { forward_avx2(self, re, im) };
         }
+        let _ = avx2;
+        forward_generic(self, re, im);
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn forward_avx2<const MAX: usize>(plan: &Plan<MAX>, re: &mut [f32], im: &mut [f32]) {
     forward_generic(plan, re, im);

@@ -10,6 +10,7 @@ mod ehci;
 mod hda;
 mod block;
 mod font_data;
+mod clock;
 mod fatvol;
 mod fosfs;
 mod framebuffer;

@@ -9,39 +9,54 @@
 //!
 //! A clock whose battery is dead reads garbage or a date long ago; `now()` then says `None` rather than inventing a
 //! time, and callers fall back to a fixed stamp. `date set` fixes that for the session and writes the RTC.
+//!
+//! The aarch64 port has no RTC (a Pi 4 has none): the software clock starts unset and is set by `date set` or by a tape
+//! (`clock` asks an NTP server), then advances by the timer's microsecond count the same way.
 
-use crate::{cpu, timer};
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+#[cfg(target_arch = "x86_64")]
+use crate::cpu;
+use crate::timer;
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::AtomicU8;
+use core::sync::atomic::{AtomicU64, Ordering};
 use fat::Time;
 
+#[cfg(target_arch = "x86_64")]
 const INDEX: u16 = 0x70;
+#[cfg(target_arch = "x86_64")]
 const DATA: u16 = 0x71;
 /// Seconds since 2000-01-01 00:00:00 (local time) at `BASE_MICROS`, or 0 when no valid time is known.
 static BASE_SECONDS: AtomicU64 = AtomicU64::new(0);
 static BASE_MICROS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
 static CENTURY_REGISTER: AtomicU8 = AtomicU8::new(0);
 /// Dates before this year are taken as "the clock was never set".
 const FIRST_VALID_YEAR: u16 = 2024;
 
+#[cfg(target_arch = "x86_64")]
 fn read_register(register: u8) -> u8 {
     cpu::outb(INDEX, register);
     cpu::inb(DATA)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn write_register(register: u8, value: u8) {
     cpu::outb(INDEX, register);
     cpu::outb(DATA, value);
 }
 
+#[cfg(target_arch = "x86_64")]
 fn from_bcd(value: u8) -> u8 {
     (value >> 4) * 10 + (value & 15)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn to_bcd(value: u8) -> u8 {
     (value / 10) << 4 | (value % 10)
 }
 
 /// One consistent reading of the RTC, or None if it never settles or is not valid.
+#[cfg(target_arch = "x86_64")]
 fn read_rtc() -> Option<Time> {
     let century_register = CENTURY_REGISTER.load(Ordering::Relaxed);
     if read_register(0x0d) & 0x80 == 0 {
@@ -124,6 +139,7 @@ fn from_seconds(seconds: u64) -> Time {
 
 /// Reads the RTC and starts the software clock from it. `century` is the FADT's century register (0 if none). Needs the
 /// APIC timer to be running (it advances the clock).
+#[cfg(target_arch = "x86_64")]
 pub fn init(century: u8) {
     CENTURY_REGISTER.store(century, Ordering::Relaxed);
     match read_rtc() {
@@ -160,12 +176,19 @@ impl core::fmt::Display for Display {
     }
 }
 
-/// Sets the clock to `time` (local) and writes it to the RTC. Err is a reason for the user.
+/// Sets the clock to `time` (local) and, on x86, writes it to the RTC. Err is a reason for the user.
 pub fn set(time: &Time) -> Result<(), &'static str> {
     if !valid(time) {
         return Err("that is not a date (2024-01-01 or later, e.g. `date set 2026-10-06 14:30`)");
     }
     set_base(time);
+    #[cfg(target_arch = "x86_64")]
+    write_rtc(time);
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_rtc(time: &Time) {
     // Stop the RTC's own updates (register B bit 7) while its fields are written, and keep it in 24-hour mode.
     let status_b = read_register(0x0b);
     let binary = status_b & 4 != 0;
@@ -182,5 +205,4 @@ pub fn set(time: &Time) -> Result<(), &'static str> {
         write_register(century, convert((time.year / 100) as u8));
     }
     write_register(0x0b, (status_b | 2) & !0x80);
-    Ok(())
 }

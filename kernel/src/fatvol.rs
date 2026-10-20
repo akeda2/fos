@@ -84,14 +84,9 @@ pub fn mount(disk: usize) -> Option<Fs> {
 /// A mounted FAT volume on a disk.
 pub type Fs = fat::Fs<Partition>;
 
-/// The local time; the aarch64 port has no wall clock yet, so its files get the fixed date.
-#[cfg(target_arch = "x86_64")]
+/// The local time, or None while the clock is unset (files then get the fixed date).
 fn now() -> Option<fat::Time> {
     crate::clock::now()
-}
-#[cfg(not(target_arch = "x86_64"))]
-fn now() -> Option<fat::Time> {
-    None
 }
 
 /// Gives `fs` the current local time for the files it creates or writes (a fixed date if the clock was never set).

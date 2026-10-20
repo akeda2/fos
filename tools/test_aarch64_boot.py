@@ -24,7 +24,7 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple[str, str, Path] | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
     when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
@@ -90,7 +90,7 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                         time.sleep(0.2)
                 if during is not None:
                     # A command whose screen is only there while it runs: type it, wait for its marker, grab the screen.
-                    command, marker, shot = during
+                    command, marker, shot, *after = during  # `after`: text typed once the screen is grabbed (Esc ends a tape)
                     qemu.stdin.write(command.encode() + b"\r")
                     qemu.stdin.flush()
                     deadline = time.time() + 30
@@ -103,6 +103,9 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                         sock.recv(4096)
                         sock.sendall(f"screendump {shot}\n".encode())
                         time.sleep(1.5)
+                    if after:
+                        qemu.stdin.write(after[0].encode())
+                        qemu.stdin.flush()
                     wait_for(len(commands) + 2)
                 if usb_keys and monitor.exists():
                     # QEMU's usb-kbd: keys typed through the monitor reach the shell as USB HID reports.
@@ -194,6 +197,11 @@ def main():
     check(pixel(4, 71) == (0, 255, 0) and pixel(8, 71) == black, "gfx_blit: a wider stride draws only the block's width", str((pixel(4, 71), pixel(8, 71))))
     check(pixel(width - 1, height - 1) == (255, 0, 255) and pixel(300, 300) == black, "a block past the corner is clipped and the rest of the screen is cleared", "")
     check("gfxcheck: done" in gfx_text, "the tape ends and the shell returns (gfx_close)", gfx_text)
+    clock_shot = shot.with_name("clock.ppm")
+    clock_text = boot(IMAGE, None, ("date set 2026-10-20 11:52:30",), (), ("run clock ntp=off", "run clock", clock_shot, "\x1b"))
+    total, lit = lit_pixels(clock_shot)[0], lit_pixels(clock_shot)[1]
+    check("The clock is 2026-10-20 11:52:30" in clock_text and "clock: stopped." in clock_text and "clock: the machine" not in clock_text, "the software clock is set with `date set`; the clock tape starts from it and Esc ends it", clock_text)
+    check(lit > total // 50, "the clock tape draws its face on the screen", f"{lit} of {total} pixels lit")
     check("Fosfor OS (aarch64 port)" in text and "virtio-blk" in text.split("version", 1)[-1], "the shell reads the serial console and runs `version` and `disks`", text)
     check(re.search(r"\d+ file\(s\)\.", text) is not None and re.search(r"Physical memory: \d+ MiB managed, \d+ MiB free\.\s+fos> ", text) is not None, "the shell lists FOSFS files and answers `mem`", text)
     check("hello from a v2 tape" in text and "arguments: [one two]" in text and re.search(r"files on the boot volume: [1-9]\d*", text) is not None and re.search(r"primes up to 100000: 9592 \(in \d+ us\)", text) is not None and "Tape returned; back at the fos shell." in text, "a hard-float aarch64 tape loads from FOSFS, runs with arguments, lists files (fs_list), allocates, uses the clock and returns", text)

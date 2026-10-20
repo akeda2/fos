@@ -3,9 +3,17 @@
 
 use core::f64::consts::{LN_10, LN_2, PI};
 
+#[cfg(target_arch = "x86_64")]
 pub fn sqrt64(x: f64) -> f64 {
     use core::arch::x86_64::{_mm_cvtsd_f64, _mm_set_sd, _mm_sqrt_sd};
     unsafe { _mm_cvtsd_f64(_mm_sqrt_sd(_mm_set_sd(0.0), _mm_set_sd(x))) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn sqrt64(x: f64) -> f64 {
+    let result: f64;
+    unsafe { core::arch::asm!("fsqrt {0:d}, {1:d}", out(vreg) result, in(vreg) x, options(pure, nomem, nostack)) };
+    result
 }
 
 pub fn sqrt(x: f32) -> f32 {

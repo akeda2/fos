@@ -49,8 +49,6 @@ stubs! {
     api_peer_info(usize, *mut PeerInfo) -> usize = 0;
     api_hostname(usize, *mut u8, usize) -> usize = 0;
     api_disk_format_exfat(usize, *const u8, usize) -> i32 = -1;
-    api_wall_clock(*mut WallClock) -> u32 = 0;
-    api_wall_clock_set(*const WallClock) -> u32 = 0;
     api_serial_count() -> usize = 0;
     api_serial_info(usize, *mut SerialInfo) -> u32 = 0;
     api_serial_open(usize, u32, u32) -> i32 = -1;
@@ -418,6 +416,21 @@ extern "C" fn api_audio_use_device(number: u32) -> i32 {
 }
 extern "C" fn api_audio_use_output(number: u32) -> i32 {
     crate::audio::use_output_for_tape(number)
+}
+
+extern "C" fn api_wall_clock(out: *mut WallClock) -> u32 {
+    match crate::clock::now() {
+        Some(time) => {
+            unsafe { *out = WallClock { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second, reserved: 0 } };
+            1
+        }
+        None => 0,
+    }
+}
+extern "C" fn api_wall_clock_set(time: *const WallClock) -> u32 {
+    let time = unsafe { *time };
+    let time = fat::Time { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
+    u32::from(crate::clock::set(&time).is_ok())
 }
 
 extern "C" fn api_disk_info(number: usize, out: *mut DiskInfo) -> u32 {

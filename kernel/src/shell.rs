@@ -63,6 +63,7 @@ fn execute(line: &str) {
         },
         "sector" => sector(rest),
         "audio" => audio(rest),
+        "date" => date(rest),
         "run" => run_tape(rest),
         "keymap" => match crate::usb_kbd::layout_named(rest) {
             Some(layout) => crate::usb_kbd::set_layout(layout),
@@ -467,5 +468,35 @@ fn audio(rest: &str) {
             ua::stop();
         }
         Some(_) => crate::println!("Usage: audio | audio modes | audio tone [HZ] [SECONDS] | audio capture [SECONDS]"),
+    }
+}
+
+/// `date` shows the clock; `date set YYYY-MM-DD HH:MM[:SS]` sets it (local time). The Pi has no RTC, so it starts unset.
+fn date(rest: &str) {
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        None => match crate::clock::now() {
+            Some(time) => crate::println!("{} (local time, software clock)", crate::clock::Display(time)),
+            None => crate::println!("The clock is not set (no RTC here). `date set YYYY-MM-DD HH:MM`, or run the clock tape."),
+        },
+        Some("set") => {
+            let parsed = (|| {
+                let (date, time) = (words.next()?, words.next()?);
+                let mut parts = date.split('-');
+                let (year, month, day) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+                let mut parts = time.split(':');
+                let (hour, minute) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+                let second = parts.next().map_or(Some(0), |word| word.parse().ok())?;
+                Some(fat::Time { year, month, day, hour, minute, second })
+            })();
+            match parsed {
+                None => crate::println!("Usage: date set YYYY-MM-DD HH:MM[:SS]   (local time)"),
+                Some(time) => match crate::clock::set(&time) {
+                    Ok(()) => crate::println!("The clock is {}.", crate::clock::Display(time)),
+                    Err(reason) => crate::println!("date: {reason}"),
+                },
+            }
+        }
+        Some(_) => crate::println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
     }
 }
