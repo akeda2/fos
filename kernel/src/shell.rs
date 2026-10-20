@@ -418,6 +418,54 @@ fn audio(rest: &str) {
             ua::status();
             ua::stop();
         }
-        Some(_) => crate::println!("Usage: audio | audio modes | audio tone [HZ] [SECONDS]"),
+        Some("capture") => {
+            let seconds = words.next().and_then(|w| w.parse::<u64>().ok()).unwrap_or(3).clamp(1, 30);
+            if let Err(reason) = ua::start(48_000, true, false) {
+                return crate::println!("audio: {reason}.");
+            }
+            let Some((channels, slot)) = ua::capture_format() else { return };
+            let (channels, slot) = (usize::from(channels), usize::from(slot));
+            let frame_bytes = channels * slot;
+            let mut data = [0u8; 4096];
+            for second in 1..=seconds {
+                let mut peaks = [0u32; 32];
+                let mut carry = 0usize;
+                let mut frames = 0u64;
+                let end = timer::ticks() + timer::TICK_HZ;
+                while timer::ticks() < end {
+                    crate::usb_kbd::poll();
+                    ua::poll();
+                    let room = (data.len() - carry) / frame_bytes * frame_bytes;
+                    let total = carry + ua::read(&mut data[carry..carry + room]);
+                    let whole = total / frame_bytes * frame_bytes;
+                    for frame in data[..whole].chunks(frame_bytes) {
+                        for (channel, sample) in frame.chunks(slot).enumerate().take(32) {
+                            let mut value = 0i64;
+                            for (index, &byte) in sample.iter().enumerate() {
+                                value |= i64::from(byte) << (8 * index);
+                            }
+                            let bits = 8 * slot as u32;
+                            if value >> (bits - 1) != 0 {
+                                value -= 1 << bits;
+                            }
+                            // report in 16-bit units whatever the slot width
+                            let magnitude = (value.unsigned_abs() >> (bits - 16)) as u32;
+                            peaks[channel] = peaks[channel].max(magnitude);
+                        }
+                        frames += 1;
+                    }
+                    data.copy_within(whole..total, 0);
+                    carry = total - whole;
+                }
+                crate::print(format_args!("[{second:>2} s] {frames} frames; peaks (of 32768):"));
+                for peak in &peaks[..channels.min(32)] {
+                    crate::print(format_args!(" {peak}"));
+                }
+                crate::println!();
+            }
+            ua::status();
+            ua::stop();
+        }
+        Some(_) => crate::println!("Usage: audio | audio modes | audio tone [HZ] [SECONDS] | audio capture [SECONDS]"),
     }
 }
