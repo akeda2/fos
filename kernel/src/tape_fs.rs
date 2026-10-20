@@ -68,6 +68,38 @@ pub fn remove(reference: &[u8]) -> isize {
     }
 }
 
+/// The volume a `fs_list` reference names: empty (boot volume), `diskN` or `@LABEL`.
+pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
+    if reference.is_empty() {
+        return storage::boot_volume();
+    }
+    if let Some(label) = reference.strip_prefix(b"@") {
+        return storage::volume_labelled(label).map(|(_, volume)| volume);
+    }
+    let number = reference.strip_prefix(b"disk").and_then(|digits| core::str::from_utf8(digits).ok()).and_then(|digits| digits.parse::<usize>().ok())?;
+    storage::volume_on(number).ok()
+}
+
+/// `fs_list` on a FOSFS volume.
+pub fn list(reference: &[u8], index: usize, out: &mut FileInfo) -> isize {
+    let Some(volume) = resolve_volume(reference) else { return FS_NO_VOLUME };
+    let mut position = 0;
+    let mut found = false;
+    let outcome = volume.for_each(|entry| {
+        if position == index && !found {
+            found = true;
+            let name = entry.name();
+            *out = FileInfo { length: entry.length, flags: 0, name_length: name.len() as u32, name: [0; 64] };
+            out.name[..name.len()].copy_from_slice(name);
+        }
+        position += 1;
+    });
+    match outcome {
+        Ok(()) => isize::from(found),
+        Err(_) => FS_ERROR,
+    }
+}
+
 /// Forgets the stream in progress (a new `fs_stream_open` replaces it).
 pub fn stream_reset() {
     unsafe { STREAM = None };

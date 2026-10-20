@@ -60,7 +60,6 @@ stubs! {
     api_audio_use_device(u32) -> i32 = AUDIO_NO_DEVICE;
     api_audio_use_output(u32) -> i32 = AUDIO_NO_DEVICE;
     api_hostname(usize, *mut u8, usize) -> usize = 0;
-    api_disk_info(usize, *mut DiskInfo) -> u32 = 0;
     api_disk_format_exfat(usize, *const u8, usize) -> i32 = -1;
     api_wall_clock(*mut WallClock) -> u32 = 0;
     api_wall_clock_set(*const WallClock) -> u32 = 0;
@@ -200,6 +199,7 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
         gfx_fill: api_gfx_fill,
         gfx_blit: api_gfx_blit,
         audio_use_output: api_audio_use_output,
+        fs_list: api_fs_list,
     };
     cpu::fp_enable();
     unsafe {
@@ -379,6 +379,31 @@ extern "C" fn api_nic_set_multicast(index: usize, on: u32) -> u32 {
 extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8, length: usize) -> isize {
     let (name, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
     crate::tape_fs::write(name, data)
+}
+
+extern "C" fn api_fs_list(volume: *const u8, volume_length: usize, index: usize, out: *mut FileInfo) -> isize {
+    crate::tape_fs::list(unsafe { core::slice::from_raw_parts(volume, volume_length) }, index, unsafe { &mut *out })
+}
+
+extern "C" fn api_disk_info(number: usize, out: *mut DiskInfo) -> u32 {
+    let Some(disk) = number.checked_sub(1).and_then(crate::block::get) else { return 0 };
+    let mut info = DiskInfo { sectors: disk.sectors, boot: u32::from(storage::boot_disk() == Some(number - 1)), ..Default::default() };
+    info.model.copy_from_slice(&disk.model);
+    info.kind = match storage::volume_on(number) {
+        Ok(volume) => {
+            if let Ok(label) = volume.label() {
+                let bytes = label.as_bytes();
+                info.label[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
+            }
+            if let Ok((free, largest)) = volume.free_space() {
+                (info.free_bytes, info.largest_bytes) = (free, largest);
+            }
+            DISK_FOSFS
+        }
+        Err(_) => DISK_NO_VOLUME,
+    };
+    unsafe { *out = info };
+    1
 }
 
 extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {

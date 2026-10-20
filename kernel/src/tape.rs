@@ -331,6 +331,32 @@ extern "C" fn api_fs_stream_close(file_length: u64) -> isize {
     }
     crate::tape_fs::stream_close(file_length)
 }
+extern "C" fn api_fs_list(volume: *const u8, volume_length: usize, index: usize, out: *mut fosfor_abi::tape::FileInfo) -> isize {
+    use fosfor_abi::tape::{FileInfo, FILE_DIRECTORY};
+    let reference = unsafe { core::slice::from_raw_parts(volume, volume_length) };
+    // `diskN` holding no FOSFS but a FAT volume: its root directory, as `fs_read` resolves `diskN/NAME`.
+    let number = reference.strip_prefix(b"disk").and_then(|digits| core::str::from_utf8(digits).ok()).and_then(|digits| digits.parse::<usize>().ok());
+    if let Some(number) = number.filter(|&number| storage::volume_on(number).is_err()) {
+        let Some(mut fs) = crate::fatvol::mount(number.wrapping_sub(1)) else { return FS_NO_VOLUME };
+        let (mut position, mut found) = (0, false);
+        let outcome = fs.list(|entry| {
+            if position == index && !found {
+                found = true;
+                let name = entry.name();
+                let length = name.len().min(64);
+                let mut info = FileInfo { length: u64::from(entry.size), flags: if entry.is_directory { FILE_DIRECTORY } else { 0 }, name_length: length as u32, name: [0; 64] };
+                info.name[..length].copy_from_slice(&name[..length]);
+                unsafe { *out = info };
+            }
+            position += 1;
+        });
+        return match outcome {
+            Ok(()) => isize::from(found),
+            Err(error) => fat_error(error),
+        };
+    }
+    crate::tape_fs::list(reference, index, unsafe { &mut *out })
+}
 extern "C" fn api_free_pages() -> usize {
     memory::stats().free as usize
 }
@@ -687,6 +713,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         gfx_fill: api_gfx_fill,
         gfx_blit: api_gfx_blit,
         audio_use_output: api_audio_use_output,
+        fs_list: api_fs_list,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

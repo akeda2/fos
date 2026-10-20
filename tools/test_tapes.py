@@ -8,6 +8,7 @@ with the term session as the input source, a lone Escape byte as the abort), and
 sent over Ethernet with the v1 `tape load net` protocol, then `tape run`, `tape save`
 and `run` of the saved copy."""
 
+import re
 import os
 import select
 import shutil
@@ -72,6 +73,7 @@ def main():
             hello = run("run hello a b  c")
             check("hello from a v2 tape (API version " in hello, "a tape loads from FOSFS (ELF64 PIE, relocated) and runs", hello)
             check("arguments: [a b  c]" in hello, "startup arguments arrive through the table", hello)
+            check(re.search(r"files on the boot volume: [1-9]\d*", hello) is not None, "fs_list walks the boot volume's directory (API 19)", hello)
             check("primes up to 100000: 9592" in hello, "it computes correctly with memory from the kernel's alloc()", hello)
             check("fos> " in hello, "control returns to the shell after the tape", hello)
 

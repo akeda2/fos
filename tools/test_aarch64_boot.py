@@ -179,7 +179,7 @@ def main():
     check("gfxcheck: done" in gfx_text, "the tape ends and the shell returns (gfx_close)", gfx_text)
     check("Fosfor OS (aarch64 port)" in text and "virtio-blk" in text.split("version", 1)[-1], "the shell reads the serial console and runs `version` and `disks`", text)
     check(re.search(r"\d+ file\(s\)\.", text) is not None and re.search(r"Physical memory: \d+ MiB managed, \d+ MiB free\.\s+fos> ", text) is not None, "the shell lists FOSFS files and answers `mem`", text)
-    check("hello from a v2 tape" in text and "arguments: [one two]" in text and re.search(r"primes up to 100000: 9592 \(in \d+ us\)", text) is not None and "Tape returned; back at the fos shell." in text, "a hard-float aarch64 tape loads from FOSFS, runs with arguments, allocates, uses the clock and returns", text)
+    check("hello from a v2 tape" in text and "arguments: [one two]" in text and re.search(r"files on the boot volume: [1-9]\d*", text) is not None and re.search(r"primes up to 100000: 9592 \(in \d+ us\)", text) is not None and "Tape returned; back at the fos shell." in text, "a hard-float aarch64 tape loads from FOSFS, runs with arguments, lists files (fs_list), allocates, uses the clock and returns", text)
     check("run: nothere: no such file." in text, "a missing tape is refused politely", text)
     check(re.search(r"^\+$", text, re.M) is not None, "keys typed on the USB keyboard reach the shell, and `keymap sv` makes the US minus key type '+'", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)

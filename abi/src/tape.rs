@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`.
-pub const TAPE_API_VERSION: u32 = 18;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`.
+pub const TAPE_API_VERSION: u32 = 19;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -281,6 +281,38 @@ pub struct TapeApi {
     /// the two. USB audio is a single instance, so the useful pairs are USB in + HD Audio out and the reverse. Stops anything
     /// running first. 0 on success, `AUDIO_NO_DEVICE` for a number that does not exist. Undone when the tape ends.
     pub audio_use_output: extern "C" fn(u32) -> i32,
+    /// `fs_list(volume, volume_len, index, out)` (version 19): the `index`th (from 0) file on a volume, as a `FileInfo`:
+    /// 1 if `out` was filled, 0 when `index` is past the last file, a negative `FS_*` code (`FS_NO_VOLUME`) otherwise.
+    /// `volume` names it like the prefix of a file reference: empty for the boot volume, `diskN` or `@LABEL`. The order is
+    /// the directory's and stays the same while no file is added or removed. FAT32/exFAT volumes list their root
+    /// directory (x86-64 only for now), subdirectories flagged `FILE_DIRECTORY`. Free space is in `disk_info`.
+    pub fs_list: extern "C" fn(*const u8, usize, usize, *mut FileInfo) -> isize,
+}
+
+/// What `fs_list` reports about one file.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileInfo {
+    pub length: u64,
+    /// `FILE_*` bits.
+    pub flags: u32,
+    pub name_length: u32,
+    /// The name, `name_length` bytes of it (FOSFS names are at most 16, FAT ones up to 64).
+    pub name: [u8; 64],
+}
+
+pub const FILE_DIRECTORY: u32 = 1;
+
+impl Default for FileInfo {
+    fn default() -> Self {
+        FileInfo { length: 0, flags: 0, name_length: 0, name: [0; 64] }
+    }
+}
+
+impl FileInfo {
+    pub fn name(&self) -> &[u8] {
+        &self.name[..(self.name_length as usize).min(64)]
+    }
 }
 
 /// `fp_level` returns: no SSE state enabled, SSE2 (every x86-64 CPU; `f32`/`f64` in XMM registers), or AVX2 with FMA (the

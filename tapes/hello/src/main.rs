@@ -13,6 +13,14 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     println!("hello from a v2 tape (API version {}, table of {} bytes).", api.version, api.size);
     let arguments = core::str::from_utf8(tape_rt::args()).unwrap_or("?");
     println!("arguments: [{arguments}]");
+    let mut names = 0;
+    while let Ok(Some(file)) = tape_rt::list_file(api, "", names) {
+        names += 1;
+        if names == 1 {
+            println!("first file: {} ({} bytes)", core::str::from_utf8(file.name()).unwrap_or("?"), file.length);
+        }
+    }
+    println!("files on the boot volume: {names}");
 
     // A sieve in memory from the kernel's allocator: no pools, no size classes.
     let bytes = LIMIT + 1;

@@ -182,3 +182,12 @@ branch in front): `NAME`, `diskN/NAME` and `@LABEL/NAME`, `FS_BAD_NAME` for inva
 knew only the boot volume and stubbed the streams. Tested: `run ed disk2/tapenote` on the QEMU SD card, read back by the shell, absent
 from the boot volume (`make test-aarch64-boot`); x86 `test-ed`, `test-record`, `test-recorder`, `test-recorder-fat`, `test-config-fat`.
 Not on aarch64 yet: FAT32/exFAT volumes (no `fatvol`/USB storage there), so a PC-formatted card is not readable.
+
+## Crash safety and file listing
+
+- **No journal, copy-on-write instead.** FOSFS keeps no allocation map: the directory (8 sectors, one 64-byte entry per file) is the only record of what is used,
+  so a power cut cannot leave leaked or double-booked space. `Volume::write` now puts the new contents in a free extent of its own and commits with the single
+  directory-sector write; the old file or the new one survives, never a mix. Only on a disk with no free run does it overwrite in place. Streams (`reserve`)
+  already wrote data before the length. `fsck [diskN]` lists extents and reports damaged, overlapping or duplicate entries without changing anything.
+  Not covered: a torn 512-byte directory-sector write (the SD card's own atomicity is assumed) and FAT volumes, whose writer already commits the entry last.
+- **ABI 19: `fs_list`** (and `tape_rt::list_file`): the nth file of `""`, `diskN` or `@LABEL`; `disk_info` now works on aarch64 (free space, label).

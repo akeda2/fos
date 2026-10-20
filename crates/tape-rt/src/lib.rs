@@ -15,6 +15,21 @@ pub mod text;
 pub use fosfor_abi::tape::*;
 pub use text::{Line, alloc_bytes, alloc_pixels, alloc_zeroed, arg_value, parse_f32};
 
+/// The `index`th file on `volume` (empty = the boot volume, `diskN`, `@LABEL`): `Ok(None)` past the last one. Needs tape
+/// API 19; an older kernel gets `Err(FS_ERROR)` instead of a jump to an address that is not there.
+pub fn list_file(api: &TapeApi, volume: &str, index: usize) -> Result<Option<FileInfo>, isize> {
+    let end = core::mem::offset_of!(TapeApi, fs_list) + core::mem::size_of::<usize>();
+    if api.version < 19 || (api.size as usize) < end {
+        return Err(FS_ERROR);
+    }
+    let mut info = FileInfo::default();
+    match (api.fs_list)(volume.as_ptr(), volume.len(), index, &mut info) {
+        1 => Ok(Some(info)),
+        0 => Ok(None),
+        code => Err(code),
+    }
+}
+
 use core::fmt::Write;
 
 // The entry point and the panic handler exist only in a tape build (the `os: none` tape target). A host build, `cargo test` of a
