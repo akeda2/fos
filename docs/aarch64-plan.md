@@ -220,3 +220,16 @@ attaches audio-class devices, `xhci::drain` hands isochronous events to `usb_aud
 Verified on a Pi 4 with a 2-out/6-in class 2.0 interface: attach, modes, 4 s playback with feedback locked
 (6.001 vs 6.000 frames/packet), no errors. Whether the tone is audible and clean, capture, and DMA coherency of the
 isochronous buffers are still to confirm by ear/loopback.
+
+## Clock tape, software wall clock, `recv` (2026-10-20)
+
+- `clock` builds for `aarch64-unknown-none` (in `A64_TAPES`). The `dsp` crate became portable: `sqrt64` is `fsqrt` on
+  aarch64 and the AVX2 FFT build is x86-64 only (NEON vectorises the generic loop).
+- `clock.rs` is shared. The Pi 4 has no RTC, so the software clock starts **unset** and advances on `timer::micros()`;
+  `date set YYYY-MM-DD HH:MM[:SS]` (aarch64 shell) or the clock tape's NTP sets it, and FAT files then get its date.
+  The `wall_clock` and `wall_clock_set` tape calls are real. Ideas not done: NTP at boot, a battery-backed RTC on a HAT.
+- `recv NAME [BAUD]` (aarch64 shell) and `tools/send_file_serial.py PORT FILE NAME [--fast BAUD]` copy one file over the
+  console UART with the serial-KUP framing (`kup_serial::serve_file`). Deploy a tape without taking out the SD:
+  `python3 tools/send_file_serial.py /dev/ttyUSB3 build/fosfor-aarch64/tapes/clock clock --fast 921600` (154 KB in 2.3 s).
+  The shell must be idle at its prompt. `NAME` may be `diskN/NAME`. Tested in `make test-aarch64-kup` (QEMU).
+- Verified on the Pi: DHCP on the Genet, NTP from the LAN server, the machine's clock set (round trip 432 us).

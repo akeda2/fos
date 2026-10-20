@@ -100,6 +100,28 @@ def main():
                 check("too large" in str(refusal), "an image larger than a slot can take is refused before anything is written", str(refusal) + text())
             check(wait_for("nothing was written"), "the shell reports the refusal and returns", text())
 
+            if ARCH == "aarch64":
+                # `recv NAME` (tools/send_file_serial.py): a file of several frames lands in FOSFS; a bad name is refused.
+                body = b"".join(b"serial file line %04d\n" % number for number in range(300))
+                mark = len(text())
+                write(b"\r")
+                try:
+                    sender.push(read, write, body, log=lambda message: None, shell_command=b"recv rtest.txt")
+                except SystemExit as failure:
+                    check(False, str(failure), text()[mark:])
+                check(wait_for("recv: %d bytes written to rtest.txt" % len(body), 20, mark), "`recv` writes a multi-frame file", text()[mark:])
+                mark = len(text())
+                write(b"cat rtest.txt\r")
+                check(wait_for("serial file line 0299", 20, mark), "the file read back holds what was sent", text()[mark:])
+                mark = len(text())
+                write(b"\r")
+                try:
+                    sender.push(read, write, b"x", log=lambda message: None, shell_command=b"recv BAD")
+                    check(False, "an invalid file name is refused")
+                except SystemExit as refusal:
+                    check("could not be written" in str(refusal), "an invalid file name is refused by the machine", str(refusal))
+                check(wait_for("nothing was written", 20, mark), "the shell reports it and returns", text()[mark:])
+
             kernel = KERNEL.read_bytes()
             mark = len(text())
             write(b"\r")

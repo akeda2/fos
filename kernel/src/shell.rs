@@ -77,6 +77,7 @@ fn execute(line: &str) {
         "nic" if rest == "rx" => crate::genet::show_rx(),
         "nic" => crate::genet::status(),
         "usb" => crate::println!("usb: {} new keyboard(s) or disk(s).", crate::usb_kbd::probe_all()),
+        "recv" => recv_serial(rest),
         "kup" if rest == "serial" || rest.starts_with("serial ") => kup_serial(rest["serial".len()..].trim()),
         "slots" => crate::slots::show(),
         "irqs" => {
@@ -371,6 +372,46 @@ fn kup_serial(speed: &str) {
             crate::arch::aarch64::power::reset()
         }
         Err(message) => crate::println!("KUP serial: {message}; nothing was written."),
+    }
+}
+
+/// `recv NAME [BAUD]`: takes one file from `tools/send_file_serial.py` over the console UART (same framing and CRC as
+/// `kup serial`) and writes it as NAME (or diskN/NAME). Puts a tape on a Pi with no network file service and no SD swap.
+fn recv_serial(rest: &str) {
+    let mut words = rest.split_whitespace();
+    let Some(name) = words.next() else { return crate::println!("Usage: recv NAME [BAUD]   (then run tools/send_file_serial.py PORT FILE NAME)") };
+    let baud = words.next().map_or(0, |word| word.parse::<u32>().unwrap_or(1));
+    if baud != 0 && !(9_600..=3_000_000).contains(&baud) {
+        return crate::println!("recv: BAUD is 9600 to 3000000 (the sender must be told the same).");
+    }
+    const STAGE_BYTES: usize = 2 * 1024 * 1024;
+    let Some(staging) = memory::allocate_contiguous(STAGE_BYTES as u64 / memory::FRAME, None) else {
+        return crate::println!("recv: no memory.");
+    };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, STAGE_BYTES) };
+    if baud == 0 {
+        crate::println!("KUP serial: ready for file {name} (the sender starts within 30 s).");
+    } else {
+        crate::println!("KUP serial: ready for file {name} at {baud} baud (the sender switches too and starts within 30 s).");
+        crate::arch::aarch64::pl011::drain();
+        timer::busy_wait_ms(50);
+        if !crate::arch::aarch64::pl011::set_baud(baud) {
+            memory::free(staging, STAGE_BYTES as u64 / memory::FRAME);
+            return crate::println!("recv: that speed is not possible with this UART clock.");
+        }
+    }
+    let result = crate::kup_serial::serve_file(&mut Console, buffer, |data| match crate::tape_fs::write(name.as_bytes(), data) {
+        0 => Ok(()),
+        _ => Err("the file could not be written (bad name, no space, or no such volume)"),
+    });
+    if baud != 0 {
+        crate::arch::aarch64::pl011::drain();
+        crate::arch::aarch64::pl011::set_baud(0);
+    }
+    memory::free(staging, STAGE_BYTES as u64 / memory::FRAME);
+    match result {
+        Ok(length) => crate::println!("recv: {length} bytes written to {name}."),
+        Err(message) => crate::println!("recv: {message}; nothing was written."),
     }
 }
 

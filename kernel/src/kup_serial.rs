@@ -186,3 +186,20 @@ pub fn serve(link: &mut impl Link, staging: &mut [u8]) -> Result<u8, &'static st
         }
     }
 }
+
+/// The same transfer for a file (`recv NAME` in the aarch64 shell, `tools/send_file_serial.py`): receive and verify, hand the
+/// bytes to `store`, then answer `K` (sequence 0) or `F` with the reason. Returns the length received.
+#[cfg(target_arch = "aarch64")]
+pub fn serve_file(link: &mut impl Link, staging: &mut [u8], store: impl FnOnce(&[u8]) -> Result<(), &'static str>) -> Result<usize, &'static str> {
+    let length = receive(link, staging)?;
+    match store(&staging[..length]) {
+        Ok(()) => {
+            send(link, b'K', 0, &[]);
+            Ok(length)
+        }
+        Err(message) => {
+            send(link, b'F', 0, message.as_bytes());
+            Err(message)
+        }
+    }
+}

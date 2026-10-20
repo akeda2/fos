@@ -59,7 +59,7 @@ class Reader:
             self.pump(min(remaining, 0.2))
 
 
-def push(read, write, image: bytes, log=print, command: bool = True, baud: int = 0, set_speed=None) -> int:
+def push(read, write, image: bytes, log=print, command: bool = True, baud: int = 0, set_speed=None, shell_command: bytes = b"kup serial") -> int:
     """Runs the whole update over `read(timeout) -> bytes` / `write(bytes)`; returns the slot the kernel was written to.
     With `baud` the machine is asked to raise its UART speed (aarch64 shell) and `set_speed(baud)` switches this end."""
     reader = Reader(read)
@@ -68,7 +68,7 @@ def push(read, write, image: bytes, log=print, command: bool = True, baud: int =
         time.sleep(0.2)
         reader.pump(0.3)
         reader.buffer = b""
-        write(b"kup serial %d\r" % baud if baud else b"kup serial\r")
+        write(shell_command + (b" %d" % baud if baud else b"") + b"\r")  # `recv NAME` for a file (send_file_serial.py)
     deadline = time.time() + 15
     while b"KUP serial: ready" not in reader.buffer + reader.text:
         if time.time() > deadline:
