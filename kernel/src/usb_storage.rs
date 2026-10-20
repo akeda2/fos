@@ -290,12 +290,18 @@ impl Msc {
 
     /// TEST UNIT READY until it succeeds (fresh media can report not-ready for a moment).
     fn wait_until_ready(&mut self) -> bool {
+        let mut last = Error::Transport;
+        let mut sense = [0u8; 18];
         for _ in 0..30 {
-            if self.command(&[0u8; 6], &mut [], true).is_ok() {
-                return true;
+            match self.command(&[0u8; 6], &mut [], true) {
+                Ok(_) => return true,
+                Err(error) => last = error,
             }
+            // A failed command leaves a unit-attention condition that must be read out before the next one passes.
+            let _ = self.command(&[0x03, 0, 0, 0, 18, 0], &mut sense, true);
             timer::wait_ticks(10);
         }
+        crate::println!("USB storage: not ready ({last:?}, sense key {:#x} asc {:#04x}).", sense[2] & 0x0f, sense[12]);
         false
     }
 

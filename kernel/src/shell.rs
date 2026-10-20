@@ -61,6 +61,7 @@ fn execute(line: &str) {
             Some(volume) => fosfs::report(&volume),
             None => crate::println!("fsck: no FOSFS volume there (use `fsck` or `fsck diskN`)."),
         },
+        "sector" => sector(rest),
         "run" => run_tape(rest),
         "keymap" => match crate::usb_kbd::layout_named(rest) {
             Some(layout) => crate::usb_kbd::set_layout(layout),
@@ -218,6 +219,31 @@ fn cat(name: &str) {
         }
         Ok(None) => crate::println!("cat: {name}: no such file."),
         Err(error) => crate::println!("cat: {name}: {error:?} (files over 16 KiB are not shown)."),
+    }
+}
+
+/// `sector diskN LBA [COUNT]`: a read-only hex dump of raw sectors (at most 4).
+fn sector(rest: &str) {
+    let mut words = rest.split_whitespace();
+    let number = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
+    let lba = words.next().and_then(|word| word.parse::<u64>().ok());
+    let count = words.next().map_or(Some(1), |word| word.parse::<usize>().ok()).filter(|count| (1..=4).contains(count));
+    let (Some(number), Some(lba), Some(count)) = (number, lba, count) else {
+        crate::println!("sector: sector diskN LBA [COUNT 1-4]");
+        return;
+    };
+    let mut buffer = [0u8; 2048];
+    let buffer = &mut buffer[..count * 512];
+    if block::read(number.wrapping_sub(1), lba, buffer).is_err() {
+        crate::println!("sector: cannot read disk{number} at {lba}.");
+        return;
+    }
+    for (row, bytes) in buffer.chunks(16).enumerate() {
+        crate::print(format_args!("{:04x}:", row * 16));
+        for byte in bytes {
+            crate::print(format_args!(" {byte:02x}"));
+        }
+        crate::println!();
     }
 }
 
