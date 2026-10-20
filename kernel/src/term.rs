@@ -2217,7 +2217,7 @@ fn audio_command(mut words: core::str::SplitWhitespace) {
 /// `HOST/NAME`, which names another machine).
 fn split_volume(word: &str) -> Option<(&str, &str)> {
     let (volume, name) = word.split_once('/')?;
-    let is_volume = volume.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) || volume.strip_prefix('@').is_some_and(|label| !label.is_empty());
+    let is_volume = volume == "esp" || volume.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) || volume.strip_prefix('@').is_some_and(|label| !label.is_empty());
     (is_volume && !name.is_empty()).then_some((volume, name))
 }
 
@@ -2243,6 +2243,9 @@ fn fat_disk(word: &str) -> Option<(usize, crate::fatvol::Fs, Option<&str>)> {
         Some((disk, name)) => (disk, Some(name)),
         None => (word, None),
     };
+    if disk == "esp" {
+        return crate::fatvol::mount_esp().map(|fs| (0, fs, name));
+    }
     let number = disk.strip_prefix("disk")?.parse::<usize>().ok()?;
     if number == 0 || crate::storage::volume_on(number).is_ok() {
         return None;
@@ -2281,8 +2284,10 @@ fn fat_list(number: usize, mut fs: crate::fatvol::Fs) {
         }
     });
     match outcome {
+        Ok(()) if !any && number == 0 => crate::println!("esp ({kind}) is empty."),
         Ok(()) if !any => crate::println!("disk{number} ({kind}) is empty."),
         Ok(()) => {}
+        Err(error) if number == 0 => crate::println!("ls: esp: {}.", fat_error_text(error)),
         Err(error) => crate::println!("ls: disk{number}: {}.", fat_error_text(error)),
     }
 }
@@ -2492,7 +2497,7 @@ fn copy_with_fat(source: &str, name: &str, destination: &str, new_name: &str, so
 /// it can be larger than the shell's own 64 KiB file buffer. The source is only read.
 fn copy_command(mut words: core::str::SplitWhitespace) {
     let Some(source) = words.next() else {
-        return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (diskN or @LABEL); copy HOST[:diskN]/NAME DST [NEWNAME]; copy SRC NAME HOST[:diskN] [NEWNAME]");
+        return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (diskN, @LABEL or esp); copy HOST[:diskN]/NAME DST [NEWNAME]; copy SRC NAME HOST[:diskN] [NEWNAME]");
     };
     // `copy diskN/NAME DST[/NEWNAME]` is `copy diskN NAME DST NEWNAME`.
     if let Some((volume, name)) = split_volume(source) {
@@ -2509,14 +2514,14 @@ fn copy_command(mut words: core::str::SplitWhitespace) {
         return copy_from_peer(source, destination, words.next());
     }
     let (Some(name), Some(destination)) = (words.next(), words.next()) else {
-        return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (diskN or @LABEL); copy HOST[:diskN]/NAME DST [NEWNAME]; copy SRC NAME HOST[:diskN] [NEWNAME]");
+        return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (diskN, @LABEL or esp); copy HOST[:diskN]/NAME DST [NEWNAME]; copy SRC NAME HOST[:diskN] [NEWNAME]");
     };
     let (destination, new_name) = match split_volume(destination) {
         Some((volume, new_name)) => (volume, new_name),
         None => (destination, words.next().unwrap_or(name)),
     };
     // `copy SRC NAME HOST[:diskN] [NEWNAME]`: store a local file on another machine.
-    if volume_word(destination).is_none() {
+    if volume_word(destination).is_none() && destination != "esp" {
         return copy_to_peer(source, name, destination, new_name);
     }
     copy_between(source, name, destination, new_name)

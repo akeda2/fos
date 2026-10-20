@@ -305,3 +305,14 @@ while writing, slowest block 69 ms, 0 transfer errors, 0 overruns); `play` playe
 with 0 overruns; `recorder` shows its panel. Not checked by ear or eye (the user was away from the Pi), and no QEMU test (QEMU's
 `usb-audio` is output-only and there is no HDA). The Pi shell has no `help NAME` / `NAME help` yet (x86 prints the tape's
 `.fos_help` section); `run record help` there starts a recording called help.wav.
+
+## Shell parity, `help NAME`, `grow`, and the ESP as `esp/` (2026-10-20)
+
+The Pi shell gained `write`, `rm`, `sleep`, `clear`, `grow diskN`, `debug`, `help NAME` (and `run NAME help`: the tape's `.fos_help`
+section, read without running it) and the x86 spellings `memory`, `irqstat`, `copy`, `reboot`. **`esp`** names the boot disk's
+FAT32 EFI System Partition on both kernels (`fatvol::mount_esp`, the same lookup `bootcode` uses): `ls esp`, `cat esp/config.txt`,
+`write esp/NAME TEXT`, `rm esp/NAME`, `cp`/`copy` to and from FOSFS, and a tape's `fs_read/fs_write/fs_list` with `esp/NAME` (so
+`run ed esp/config.txt` edits the Pi's `config.txt`). Root directory only (the FAT driver does not enter `EFI/` or `overlays/`).
+Verified: `make test-aarch64-boot`, `make test-fat-shell`; on the Pi `ls esp` lists the firmware files and `cat esp/config.txt`
+shows `config.txt` (CRLF line ends print as dots). A bad edit of `config.txt` or the firmware files can stop the Pi booting; keep
+the SD card's image to hand.

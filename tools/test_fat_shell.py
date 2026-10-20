@@ -71,6 +71,13 @@ def main():
                 check("no such file" in run(f"rm {disk} Note.txt"), "removing it twice says so", "")
             # A bare name is FOSFS only: a file that exists only on a FAT disk is not found by `cat NAME`.
             check("no such file" in run("cat Copy.txt"), "a bare name never reaches a FAT disk", "")
+            # The boot disk's EFI System Partition is `esp`: its root directory, like a FAT disk (the loader stays under EFI/BOOT).
+            text = run("write esp/hello.txt typed on the esp")
+            check("Wrote 16 bytes to hello.txt" in text and "typed on the esp" in run("cat esp/hello.txt"), "`write esp/NAME TEXT` and `cat esp/NAME` on the EFI System Partition", text)
+            text = run("copy disk1 note.txt esp Note.txt")
+            check("Copied note.txt" in text and "Note.txt" in run("ls esp") and "EFI" in run("ls esp"), "`copy` to `esp`; `ls esp` lists it next to EFI", text)
+            check("Removed hello.txt" in run("rm esp/hello.txt") and "hello.txt" not in run("ls esp"), "`rm esp/NAME`", "")
+            run("rm esp Note.txt")
         finally:
             guest.process.kill()
             guest.process.wait()

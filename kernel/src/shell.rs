@@ -67,7 +67,7 @@ fn execute(line: &str) {
             }
         }
         "help" => crate::println!(
-            "help [NAME] version uptime mem disks ls [diskN] cat [diskN/]NAME write NAME TEXT\nrm NAME cp SRC DST cmp A B fsck [diskN] echo TEXT grow diskN sleep N clear keymap us|sv\nrun NAME [ARGS] [&N] ps kill N|NAME|all dmesg irqs usb nic [rx] slots debug\nkup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up)"
+            "help [NAME] version uptime mem disks ls [diskN] cat [diskN/|esp/]NAME write NAME TEXT\nrm NAME cp SRC DST cmp A B fsck [diskN] echo TEXT grow diskN sleep N clear keymap us|sv\nrun NAME [ARGS] [&N] ps kill N|NAME|all dmesg irqs usb nic [rx] slots debug\nkup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up)"
         ),
         "start" => start_script(true),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
@@ -238,7 +238,14 @@ fn show_tape_help(name: &str) -> bool {
 fn write_file(rest: &str) {
     let (name, text) = rest.split_once(' ').map_or((rest, ""), |(name, text)| (name, text.trim_start()));
     let Some((volume, file)) = locate(name).filter(|_| !name.is_empty()) else {
-        return crate::println!("Usage: write NAME TEXT   (NAME or diskN/NAME; a FOSFS volume)");
+        // A FAT32/exFAT volume (`esp/NAME`, `diskN/NAME`): the same call a tape's `fs_write` makes.
+        if name.contains('/') {
+            return match crate::tape_fs::write(name.as_bytes(), text.as_bytes()) {
+                0 => crate::println!("Wrote {} bytes to {name}.", text.len()),
+                code => crate::println!("write: {name}: failed (code {code}; an empty file cannot be made on FAT)."),
+            };
+        }
+        return crate::println!("Usage: write NAME TEXT   (NAME, diskN/NAME or esp/NAME)");
     };
     match volume.write(file.as_bytes(), text.as_bytes()) {
         Ok(()) => crate::println!("Wrote {} bytes to {file}.", text.len()),
@@ -249,7 +256,13 @@ fn write_file(rest: &str) {
 /// `rm NAME`: removes a file from a FOSFS volume (NAME or diskN/NAME).
 fn remove_file(name: &str) {
     let Some((volume, file)) = locate(name).filter(|_| !name.is_empty()) else {
-        return crate::println!("Usage: rm NAME   (NAME or diskN/NAME; a FOSFS volume)");
+        if name.contains('/') {
+            return match crate::tape_fs::remove(name.as_bytes()) {
+                0 => crate::println!("Removed {name}."),
+                _ => crate::println!("rm: {name}: no such file or no such volume."),
+            };
+        }
+        return crate::println!("Usage: rm NAME   (NAME, diskN/NAME or esp/NAME)");
     };
     match volume.remove(file.as_bytes()) {
         Ok(true) => crate::println!("Removed {file}."),
@@ -258,28 +271,54 @@ fn remove_file(name: &str) {
     }
 }
 
-/// `cp SRC DST`: copies a file (up to 64 KiB) between volumes, `diskN/NAME` or a boot-volume name.
+/// `cp SRC DST`: copies a file (up to 256 KiB) between volumes: `NAME`, `diskN/NAME` or `esp/NAME` (FAT32/exFAT through the tape calls).
 fn copy(rest: &str) {
     const SIZE: usize = 256 * 1024;
     let Some((from, to)) = rest.split_once(' ') else {
-        crate::println!("cp: cp SRC DST (names are NAME or diskN/NAME).");
+        crate::println!("cp: cp SRC DST (names are NAME, diskN/NAME or esp/NAME).");
         return;
     };
-    let (Some((source, source_name)), Some((target, target_name))) = (locate(from.trim()), locate(to.trim())) else {
-        crate::println!("cp: no FOSFS volume there.");
-        return;
-    };
+    let (from, to) = (from.trim(), to.trim());
     let Some(staging) = memory::allocate_contiguous(SIZE as u64 / memory::FRAME, None) else {
         return crate::println!("cp: no memory.");
     };
     let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, SIZE) };
-    match source.read(source_name.as_bytes(), buffer) {
-        Ok(Some(length)) => match target.write(target_name.as_bytes(), &buffer[..length]) {
-            Ok(()) => crate::println!("cp: {length} bytes to {to}."),
-            Err(error) => crate::println!("cp: cannot write {to} ({error:?})."),
+    // FOSFS volumes are read and written directly; anything else (FAT) goes through the tape file calls.
+    let read = match locate(from) {
+        Some((source, name)) => match source.read(name.as_bytes(), buffer) {
+            Ok(Some(length)) => Some(length),
+            Ok(None) => {
+                crate::println!("cp: {from}: no such file.");
+                None
+            }
+            Err(error) => {
+                crate::println!("cp: {from}: {error:?} (files over 256 KiB are not copied).");
+                None
+            }
         },
-        Ok(None) => crate::println!("cp: {from}: no such file."),
-        Err(error) => crate::println!("cp: {from}: {error:?} (files over 256 KiB are not copied)."),
+        None => match crate::tape_fs::read(from.as_bytes(), buffer) {
+            length if length >= 0 => Some(length as usize),
+            code => {
+                crate::println!("cp: {from}: not readable (code {code}).");
+                None
+            }
+        },
+    };
+    match read {
+        Some(length) => {
+            let written = match locate(to) {
+                Some((target, name)) => target.write(name.as_bytes(), &buffer[..length]).map_err(|_| ()),
+                None => match crate::tape_fs::write(to.as_bytes(), &buffer[..length]) {
+                    0 => Ok(()),
+                    _ => Err(()),
+                },
+            };
+            match written {
+                Ok(()) => crate::println!("cp: {length} bytes to {to}."),
+                Err(()) => crate::println!("cp: cannot write {to}."),
+            }
+        }
+        None => {}
     }
     memory::free(staging, SIZE as u64 / memory::FRAME);
 }

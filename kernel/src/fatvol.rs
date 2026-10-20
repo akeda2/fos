@@ -12,6 +12,9 @@ use fat::{Device, Error};
 /// on-disk mixed-endian byte order.
 const BASIC_DATA_GUID: [u8; 16] = [0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7];
 
+/// The GPT type GUID of the EFI System Partition, in the on-disk mixed-endian byte order.
+pub const ESP_GUID: [u8; 16] = [0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b];
+
 /// A partition (or whole disk) as the `fat` crate's device: sector 0 is the volume's first sector.
 #[derive(Clone, Copy)]
 pub struct Partition {
@@ -77,6 +80,16 @@ pub fn mount(disk: usize) -> Option<Fs> {
     candidates[count] = Partition { disk, base: 0, sectors: info.sectors };
     count += 1;
     let mut fs = candidates[..count].iter().find_map(|&partition| fat::Fs::mount(partition).ok())?;
+    stamp(&mut fs);
+    Some(fs)
+}
+
+/// The boot disk's EFI System Partition (`esp/NAME`): on a Pi that is where `config.txt` and the firmware live, and the
+/// loader is under `EFI/BOOT`. Only the root directory is reachable, like every FAT volume here.
+pub fn mount_esp() -> Option<Fs> {
+    let disk = crate::storage::boot_disk()?;
+    let partition = gpt::find(disk, &ESP_GUID, |_| true)?;
+    let mut fs = fat::Fs::mount(Partition { disk, base: partition.start, sectors: partition.sectors }).ok()?;
     stamp(&mut fs);
     Some(fs)
 }

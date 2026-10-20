@@ -32,7 +32,7 @@ const STAGE2_BYTES: usize = BIOS_STAGE2_SECTORS as usize * SECTOR;
 const CODE_BYTES: usize = 446;
 
 /// The GPT type GUID of an EFI System Partition, in on-disk byte order.
-const ESP_GUID: [u8; 16] = [0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b];
+const ESP_GUID: [u8; 16] = fatvol::ESP_GUID;
 const LOADER_PATH: &str = "\\EFI\\BOOT\\BOOTX64.EFI";
 /// The largest loader accepted (the real one is a few hundred KiB).
 const LOADER_MAX_BYTES: usize = 2 << 20;

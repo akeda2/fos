@@ -1,7 +1,7 @@
 //! The tape file calls (`fs_read`, `fs_write`, `fs_remove`, `fs_list`, `fs_stream_*`, `disk_info`), shared by both ports so a
 //! tape sees the same names, volumes and error codes on x86-64 and aarch64.
 //!
-//! A reference is `NAME` (the boot volume), `diskN/NAME` or `@LABEL/NAME`. A disk that holds a FOSFS volume always means
+//! A reference is `NAME` (the boot volume), `diskN/NAME`, `@LABEL/NAME` or `esp/NAME` (the boot disk's FAT32 EFI System Partition). A disk that holds a FOSFS volume always means
 //! FOSFS; a disk with only a FAT32/exFAT volume (a stick or card a PC formatted) is reachable by an explicit `diskN/`.
 
 use fosfor_abi::tape::*;
@@ -47,6 +47,9 @@ fn fat_disk(number: usize) -> Option<crate::fatvol::Fs> {
 /// A FAT32/exFAT volume named by a reference `diskN/NAME`.
 fn resolve_fat(reference: &[u8]) -> Option<(crate::fatvol::Fs, &[u8])> {
     let slash = reference.iter().position(|&byte| byte == b'/')?;
+    if &reference[..slash] == b"esp" {
+        return crate::fatvol::mount_esp().map(|fs| (fs, &reference[slash + 1..]));
+    }
     let number = disk_number(&reference[..slash])?;
     fat_disk(number).map(|fs| (fs, &reference[slash + 1..]))
 }
@@ -143,7 +146,8 @@ pub fn resolve_volume(reference: &[u8]) -> Option<Volume> {
 
 /// `fs_list`: the `index`th file of a volume (`""`, `diskN`, `@LABEL`); a FAT disk lists its root directory.
 pub fn list(reference: &[u8], index: usize, out: &mut FileInfo) -> isize {
-    if let Some(mut fs) = disk_number(reference).and_then(fat_disk) {
+    let fat = if reference == b"esp" { crate::fatvol::mount_esp() } else { disk_number(reference).and_then(fat_disk) };
+    if let Some(mut fs) = fat {
         let (mut position, mut found) = (0, false);
         let outcome = fs.list(|entry| {
             if position == index && !found {
