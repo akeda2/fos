@@ -78,6 +78,18 @@ display-selection property tag on real hardware). The tape side is the same for 
 (`gfx_screens`, `gfx_select` or a screen index in `gfx_*`), and `audio_screen::Screen` taking an index. This is a good reason to do
 the Pi port before dual-screen on PC.
 
+**Done on the Pi 4 (2026-10-20).** `kernel/src/mailbox.rs` talks to the VideoCore mailbox (property channel 8). The firmware needs
+`max_framebuffers=2` in `config.txt` (`tools/fetch_rpi4_firmware.py` adds it to the pftf config, so `make image-pi4` has it); without
+it the display select is ignored and a new framebuffer replaces display 0's. With it, `get number of displays` says 2 (ids 2 = HDMI0,
+7 = HDMI1) and one message (select display, physical/virtual size, depth 32, pixel order BGR, allocate, pitch) gives display 1 its own
+buffer (outside kernel RAM, mapped non-cacheable by `paging::map_framebuffer`). Boot registers it as tape screen 1
+(`framebuffer::add_screen`; screen 0 stays the console). The shell has `display` (what the firmware reports) and `display test N`
+(colour bars). **Tape ABI 20** (append-only): `gfx_screens` and `gfx_info_on`/`open_on`/`close_on`/`fill_on`/`blit_on` with a screen
+number; the old `gfx_*` calls are screen 0. Tape side: `tape_rt::gfx_screens`, `gfx_*_on`, and `audio_screen::Screen::on(index)`;
+`gfxcheck screen=N` exercises it. The kernel blanks screen 1 when a tape ends. Verified on the Pi: `gfxcheck screen=1` draws correctly
+(colours right) on the second screen, console on screen 0 untouched. x86 reports 1 screen. Not done: a tape that uses both screens
+(the dual clock + gonio), and screen sizes that differ (a tape sizes its buffers from `gfx_info_on`).
+
 ## Pi 4 SD card (M6, first cut)
 
 `make image-pi4` builds `build/fosfor-aarch64/fosfor-pi4.img`: the aarch64 image with the pftf/RPi4 edk2 release (pinned by version and

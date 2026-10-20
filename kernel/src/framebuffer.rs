@@ -588,6 +588,113 @@ pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u
     true
 }
 
+/// A screen beyond the console's: only tapes draw on it (Pi 4 second HDMI output, `mailbox::second_screen`). 0x00RRGGBB
+/// pixels as on the console, BGR in memory.
+struct Extra {
+    base: *mut u32,
+    stride: usize,
+    width: usize,
+    height: usize,
+    open: bool,
+}
+
+static mut EXTRA: Option<Extra> = None;
+
+/// Registers the second screen: `stride` is in pixels, memory already mapped, 32 bits per pixel, blue first in memory.
+pub fn add_screen(base: u64, width: u32, height: u32, stride: u32) {
+    let extra = Extra { base: base as *mut u32, stride: stride as usize, width: width as usize, height: height as usize, open: false };
+    unsafe { *core::ptr::addr_of_mut!(EXTRA) = Some(extra) };
+}
+
+fn extra() -> Option<&'static mut Extra> {
+    unsafe { (*core::ptr::addr_of_mut!(EXTRA)).as_mut() }
+}
+
+fn extra_clear(screen: &Extra) {
+    for y in 0..screen.height {
+        unsafe { core::ptr::write_bytes(screen.base.add(y * screen.stride), 0, screen.width) };
+    }
+}
+
+/// Ends a tape's use of the extra screen: black again (there is no text to redraw).
+pub fn gfx_close_extra() {
+    if let Some(screen) = extra().filter(|screen| screen.open) {
+        screen.open = false;
+        extra_clear(screen);
+    }
+}
+
+pub extern "C" fn api_gfx_screens() -> u32 {
+    u32::from(gfx_info().is_some()) + u32::from(extra().is_some())
+}
+
+pub extern "C" fn api_gfx_info_on(screen: u32) -> u64 {
+    match screen {
+        0 => gfx_info().map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height)),
+        1 => extra().map_or(0, |screen| (screen.width as u64) << 32 | screen.height as u64),
+        _ => 0,
+    }
+}
+
+pub extern "C" fn api_gfx_open_on(screen: u32) -> u32 {
+    match screen {
+        0 => u32::from(gfx_open()),
+        1 => extra().map_or(0, |screen| {
+            extra_clear(screen);
+            screen.open = true;
+            1
+        }),
+        _ => 0,
+    }
+}
+
+pub extern "C" fn api_gfx_close_on(screen: u32) {
+    match screen {
+        0 => gfx_close(),
+        1 => gfx_close_extra(),
+        _ => {}
+    }
+}
+
+pub extern "C" fn api_gfx_fill_on(screen: u32, x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u32 {
+    match screen {
+        0 => u32::from(gfx_fill(x, y, width, height, rgb)),
+        1 => {
+            let Some(screen) = extra().filter(|screen| screen.open) else { return 0 };
+            let (x, y) = (x as usize, y as usize);
+            let columns = (width as usize).min(screen.width.saturating_sub(x));
+            let rows = (height as usize).min(screen.height.saturating_sub(y));
+            for row in 0..rows {
+                for column in 0..columns {
+                    unsafe { screen.base.add((y + row) * screen.stride + x + column).write_volatile(rgb) };
+                }
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+pub extern "C" fn api_gfx_blit_on(screen: u32, x: u32, y: u32, width: u32, height: u32, pixels: *const u32, stride: u32) -> u32 {
+    match screen {
+        0 => u32::from(unsafe { gfx_blit(x, y, width, height, pixels, stride) }),
+        1 => {
+            let Some(screen) = extra().filter(|screen| screen.open) else { return 0 };
+            let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+            if pixels.is_null() || stride < width || x >= screen.width || y >= screen.height {
+                return 0;
+            }
+            for row in 0..height.min(screen.height - y) {
+                let from = unsafe { pixels.add(row * stride) };
+                let to = unsafe { screen.base.add((y + row) * screen.stride + x) };
+                unsafe { core::ptr::copy_nonoverlapping(from, to, width.min(screen.width - x)) };
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
 pub fn write_str(text: &str) {
     use core::fmt::Write;
     if let Some(console) = unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() } {

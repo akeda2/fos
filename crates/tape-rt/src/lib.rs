@@ -635,6 +635,64 @@ pub fn gfx_close() {
     }
 }
 
+/// How many pixel screens a tape can draw on (version 20; 1 with a pixel framebuffer on an older kernel, 0 without).
+pub fn gfx_screens() -> u32 {
+    match screens_table() {
+        Some(table) => (table.gfx_screens)(),
+        None => u32::from(gfx_info().is_some()),
+    }
+}
+
+fn screens_table() -> Option<&'static TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, gfx_blit_on) + core::mem::size_of::<usize>();
+    (table.version >= 20 && (table.size as usize) >= end).then_some(table)
+}
+
+/// `gfx_info` for screen number `screen` (0-based). Screen 0 works on kernels from version 17, others need 20.
+pub fn gfx_info_on(screen: u32) -> Option<(u32, u32)> {
+    if screen == 0 {
+        return gfx_info();
+    }
+    let packed = (screens_table()?.gfx_info_on)(screen);
+    (packed != 0).then_some(((packed >> 32) as u32, packed as u32))
+}
+
+/// `gfx_open` for a screen.
+pub fn gfx_open_on(screen: u32) -> bool {
+    if screen == 0 {
+        return gfx_open();
+    }
+    screens_table().is_some_and(|table| (table.gfx_open_on)(screen) != 0)
+}
+
+/// `gfx_close` for a screen.
+pub fn gfx_close_on(screen: u32) {
+    if screen == 0 {
+        gfx_close();
+    } else if let Some(table) = screens_table() {
+        (table.gfx_close_on)(screen);
+    }
+}
+
+/// `gfx_fill` for a screen.
+pub fn gfx_fill_on(screen: u32, x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
+    if screen == 0 {
+        return gfx_fill(x, y, width, height, rgb);
+    }
+    screens_table().is_some_and(|table| (table.gfx_fill_on)(screen, x, y, width, height, rgb) != 0)
+}
+
+/// `gfx_blit` for a screen.
+pub fn gfx_blit_on(screen: u32, x: u32, y: u32, width: u32, height: u32, pixels: &[u32], stride: u32) -> bool {
+    if screen == 0 {
+        return gfx_blit(x, y, width, height, pixels, stride);
+    }
+    let needed = if height == 0 { 0 } else { (height as usize - 1) * stride as usize + width as usize };
+    pixels.len() >= needed
+        && screens_table().is_some_and(|table| (table.gfx_blit_on)(screen, x, y, width, height, pixels.as_ptr(), stride) != 0)
+}
+
 /// A filled rectangle, `rgb` = 0x00RRGGBB, clipped to the screen. False if the screen is not open.
 pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
     gfx_table().is_some_and(|table| (table.gfx_fill)(x, y, width, height, rgb) != 0)

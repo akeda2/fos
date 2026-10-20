@@ -222,6 +222,8 @@ impl Playback {
 pub struct Screen {
     pub width: u32,
     pub height: u32,
+    /// The tape screen drawn on (`tape_rt::gfx_screens`); 0 is the console's.
+    pub index: u32,
     grid: &'static mut [u32],
     frame: &'static mut [u32],
     dirty: bool,
@@ -231,17 +233,23 @@ pub struct Screen {
 impl Screen {
     pub fn new(api: &TapeApi, width: u32, height: u32) -> Option<Self> {
         let pixels = (width * height) as usize;
-        Some(Self { width, height, grid: alloc_pixels(api, pixels)?, frame: alloc_pixels(api, pixels)?, dirty: true, next_draw: 0 })
+        Some(Self { width, height, index: 0, grid: alloc_pixels(api, pixels)?, frame: alloc_pixels(api, pixels)?, dirty: true, next_draw: 0 })
+    }
+
+    /// Draws on tape screen `index` instead of 0 (`width` and `height` given to `new` must fit it).
+    pub fn on(mut self, index: u32) -> Self {
+        self.index = index;
+        self
     }
 
     /// Takes the screen from the console. False when the kernel will not give it.
     pub fn open(&self) -> bool {
-        tape_rt::gfx_open()
+        tape_rt::gfx_open_on(self.index)
     }
 
     /// Gives it back (the console is repainted).
     pub fn close(&self) {
-        tape_rt::gfx_close();
+        tape_rt::gfx_close_on(self.index);
     }
 
     /// The canvas of the static part, to be redrawn after the layout or scale changes.
@@ -276,7 +284,7 @@ impl Screen {
     /// Sends the frame to the screen.
     pub fn present(&self) {
         let pixels = (self.width * self.height) as usize;
-        tape_rt::gfx_blit(0, 0, self.width, self.height, &self.frame[..pixels], self.width);
+        tape_rt::gfx_blit_on(self.index, 0, 0, self.width, self.height, &self.frame[..pixels], self.width);
     }
 
     /// The last drawn frame (for a PNG).

@@ -569,6 +569,12 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         gfx_blit: api_gfx_blit,
         audio_use_output: api_audio_use_output,
         fs_list: api_fs_list,
+        gfx_screens: crate::framebuffer::api_gfx_screens,
+        gfx_info_on: crate::framebuffer::api_gfx_info_on,
+        gfx_open_on: crate::framebuffer::api_gfx_open_on,
+        gfx_close_on: crate::framebuffer::api_gfx_close_on,
+        gfx_fill_on: crate::framebuffer::api_gfx_fill_on,
+        gfx_blit_on: crate::framebuffer::api_gfx_blit_on,
     };
     term::clear_frame_queue();
     term::set_tape_mode(true);

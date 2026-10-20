@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`.
-pub const TAPE_API_VERSION: u32 = 19;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number).
+pub const TAPE_API_VERSION: u32 = 20;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -287,6 +287,21 @@ pub struct TapeApi {
     /// the directory's and stays the same while no file is added or removed. FAT32/exFAT volumes list their root
     /// directory (x86-64 only for now), subdirectories flagged `FILE_DIRECTORY`. Free space is in `disk_info`.
     pub fs_list: extern "C" fn(*const u8, usize, usize, *mut FileInfo) -> isize,
+    /// `gfx_screens()` (version 20): how many pixel screens a tape can draw on. 0 without one, 1 on most machines; a
+    /// Raspberry Pi 4 with `max_framebuffers=2` and two monitors has 2. Screen 0 is the console's.
+    pub gfx_screens: extern "C" fn() -> u32,
+    /// `gfx_info_on(screen)` (version 20): as `gfx_info` for screen number `screen` (0-based); 0 for a number that does not
+    /// exist. The calls `gfx_info`..`gfx_blit` of versions 17-19 are these with screen 0.
+    pub gfx_info_on: extern "C" fn(u32) -> u64,
+    /// `gfx_open_on(screen)` (version 20): as `gfx_open`. Only screen 0 has the console; another screen is cleared to black
+    /// and has no text to give back. The kernel closes every screen a tape opened when it ends.
+    pub gfx_open_on: extern "C" fn(u32) -> u32,
+    /// `gfx_close_on(screen)` (version 20): as `gfx_close`.
+    pub gfx_close_on: extern "C" fn(u32),
+    /// `gfx_fill_on(screen, x, y, width, height, rgb)` (version 20): as `gfx_fill`.
+    pub gfx_fill_on: extern "C" fn(u32, u32, u32, u32, u32, u32) -> u32,
+    /// `gfx_blit_on(screen, x, y, width, height, pixels, stride)` (version 20): as `gfx_blit`.
+    pub gfx_blit_on: extern "C" fn(u32, u32, u32, u32, u32, *const u32, u32) -> u32,
 }
 
 /// What `fs_list` reports about one file.

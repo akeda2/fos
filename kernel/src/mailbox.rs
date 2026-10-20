@@ -55,18 +55,19 @@ fn transact(page: u64) -> bool {
     false
 }
 
-/// Asks the firmware for a 32-bit framebuffer of `width` x `height` on `display` (selected first), and returns its address
-/// (ARM side, the bus alias removed), size in bytes and pitch in bytes. The firmware may answer with other dimensions.
-pub fn framebuffer(display: u32, width: u32, height: u32) -> Option<(u64, u64, u32)> {
+/// Asks the firmware for a 32-bit BGR framebuffer of `width` x `height` on `display` (selected first), and returns its address
+/// (ARM side, the bus alias removed), size in bytes, pitch in bytes, and the width and height it really gave.
+pub fn framebuffer(display: u32, width: u32, height: u32) -> Option<(u64, u64, u32, u32, u32)> {
     tag(SET_DISPLAY_NUM, &[display], &mut [0u32])?;
     let page = memory::allocate_contiguous(1, Some(1 << 32))?;
     let buffer = page as *mut u32;
-    let message: [u32; 30] = [
-        30 * 4, 0,
+    let message: [u32; 34] = [
+        34 * 4, 0,
         SET_DISPLAY_NUM, 4, 0, display,
         0x0004_8003, 8, 0, width, height,
         0x0004_8004, 8, 0, width, height,
         0x0004_8005, 4, 0, 32,
+        0x0004_8006, 4, 0, 0, // pixel order 0 = BGR: 0x00RRGGBB as a 32-bit word
         0x0004_0001, 8, 0, 4096, 0,
         GET_PITCH, 4, 0, 0,
         0,
@@ -76,9 +77,29 @@ pub fn framebuffer(display: u32, width: u32, height: u32) -> Option<(u64, u64, u
     }
     let ok = transact(page);
     let get = |index: usize| unsafe { buffer.add(index).read_volatile() };
-    let result = (ok && get(22) & 0x8000_0000 != 0 && get(23) != 0).then(|| (u64::from(get(23) & 0x3fff_ffff), u64::from(get(24)), get(28)));
+    let result = (ok && get(26) & 0x8000_0000 != 0 && get(27) != 0)
+        .then(|| (u64::from(get(27) & 0x3fff_ffff), u64::from(get(28)), get(32), get(9), get(10)));
     memory::free(page, 1);
     result
+}
+
+/// If the firmware drives a second display (Pi 4 with `max_framebuffers=2`), gives it a framebuffer the size of the console's
+/// and registers it as tape screen 1. Display 0 is selected again afterwards. Silent when there is no second display.
+pub fn second_screen() {
+    let Some((width, height)) = crate::framebuffer::gfx_info() else { return };
+    let mut count = [0u32];
+    if tag(GET_NUM_DISPLAYS, &[], &mut count).is_none() || count[0] < 2 {
+        return;
+    }
+    let screen = framebuffer(1, width, height);
+    let _ = tag(SET_DISPLAY_NUM, &[0], &mut [0u32]);
+    let Some((base, size, pitch, got_width, got_height)) = screen else {
+        crate::println!("Second screen: the firmware gave no framebuffer for display 1.");
+        return;
+    };
+    crate::paging::map_framebuffer(base, size);
+    crate::framebuffer::add_screen(base, got_width, got_height, pitch / 4);
+    crate::println!("Second screen: display 1, {got_width}x{got_height} at {base:#x} (tape screen 1).");
 }
 
 /// Sends one property message holding a single tag with `request` as its value (the answer may be longer, up to `WORDS`),

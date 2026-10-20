@@ -189,6 +189,9 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         }
         storage::init(info);
         genet::init();
+        if gic::bases().0 == PI4_GIC_DISTRIBUTOR {
+            mailbox::second_screen();
+        }
     }
     let before = timer::micros();
     timer::busy_wait_ms(100);

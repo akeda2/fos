@@ -524,7 +524,7 @@ fn display(rest: &str) {
     if rest.starts_with("test") {
         let display: u32 = rest[4..].trim().parse().unwrap_or(1);
         match framebuffer(display, 1920, 1080) {
-            Some((base, size, pitch)) => {
+            Some((base, size, pitch, _, _)) => {
                 println!("display {display}: framebuffer {base:#x}, {size} bytes, pitch {pitch}; drawing colour bars.");
                 crate::paging::map_framebuffer(base, size);
                 let (width, rows) = (pitch as u64 / 4, size / u64::from(pitch));
