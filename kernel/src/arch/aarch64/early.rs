@@ -75,9 +75,3 @@ pub fn bits(row: u32, value: u64) {
         digit(x0 + 24 + index * 20, y, (value >> (60 - 4 * index)) as u32, 0x00ff_ffff);
     }
 }
-
-/// Physical address of pixel (x, y) and the row pitch in bytes, for stores made from assembly with the MMU off.
-pub fn pixel_address(x: u32, y: u32) -> (u64, u64) {
-    let stride = u64::from(STRIDE.load(Ordering::Relaxed));
-    (BASE.load(Ordering::Relaxed) + 4 * (u64::from(y) * stride + u64::from(x)), stride * 4)
-}

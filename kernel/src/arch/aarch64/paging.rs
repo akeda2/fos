@@ -180,7 +180,7 @@ fn map_range(root: u64, start: u64, end: u64, attributes: u64) {
 macro_rules! sysreg {
     ($name:literal) => {{
         let v: u64;
-        unsafe { core::arch::asm!(concat!("mrs {}, ", $name), out(reg) v, options(nomem, nostack)) };
+        core::arch::asm!(concat!("mrs {}, ", $name), out(reg) v, options(nomem, nostack));
         v
     }};
 }
@@ -195,7 +195,6 @@ fn current_el() -> u64 {
 pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
     let root = table_frame();
     unsafe { ROOT = root };
-    super::early::mark(10);
 
     for descriptor in info.memory_descriptors() {
         // 0 reserved, 11/12 memory-mapped I/O: not RAM, and devices are mapped on demand.
@@ -237,59 +236,8 @@ pub fn build_and_load(info: &BootInfo, framebuffer: &fosfor_abi::Framebuffer) {
     // Page 0 stays unmapped so a null dereference faults (if RAM starts there at all).
     unmap_page(root, 0);
 
-    // Hardware bring-up: row 4 = framebuffer base, row 5 = kernel entry stack/level (current EL), row 6 = root.
-    super::early::bits(4, sysreg!("id_aa64mmfr0_el1"));
-    super::early::bits(5, current_el());
-    super::early::bits(6, root);
     clean_tables();
-    diagnostics(root, framebuffer.base);
-    super::early::mark(11);
     load(root);
-    super::early::mark(12);
-}
-
-/// The descriptor our tables hold for `address` (0 when unmapped), found by a software walk.
-fn walk(root: u64, address: u64) -> u64 {
-    let l0 = unsafe { entry(root, (address >> 39) & 0x1ff).read() };
-    if l0 & VALID == 0 {
-        return 0;
-    }
-    let l1 = unsafe { entry(l0 & ADDRESS_MASK, (address >> 30) & 0x1ff).read() };
-    if l1 & VALID == 0 {
-        return 0;
-    }
-    let l2 = unsafe { entry(l1 & ADDRESS_MASK, (address >> 21) & 0x1ff).read() };
-    if l2 & 3 != 3 {
-        return l2;
-    }
-    unsafe { entry(l2 & ADDRESS_MASK, (address >> 12) & 0x1ff).read() }
-}
-
-/// Hardware bring-up: draws what the firmware left in the MMU registers and what our new tables say about the
-/// addresses the kernel needs next (rows 7-15 of `early::bits`, MSB first: tcr, sctlr, ttbr0, mair, hcr, then
-/// descriptors for pc, sp, framebuffer and the vector table).
-fn diagnostics(root: u64, framebuffer: u64) {
-    let (tcr, sctlr, ttbr, mair, hcr, vbar) = if current_el() == 2 {
-        (sysreg!("tcr_el2"), sysreg!("sctlr_el2"), sysreg!("ttbr0_el2"), sysreg!("mair_el2"), sysreg!("hcr_el2"), sysreg!("vbar_el2"))
-    } else {
-        (sysreg!("tcr_el1"), sysreg!("sctlr_el1"), sysreg!("ttbr0_el1"), sysreg!("mair_el1"), 0, sysreg!("vbar_el1"))
-    };
-    let pc: u64;
-    let sp: u64;
-    unsafe {
-        core::arch::asm!("adr {}, .", out(reg) pc, options(nomem, nostack));
-        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack));
-    }
-    let early = super::early::bits;
-    early(7, tcr);
-    early(8, sctlr);
-    early(9, ttbr);
-    early(10, mair);
-    early(11, hcr);
-    early(12, walk(root, pc));
-    early(13, walk(root, sp));
-    early(14, walk(root, framebuffer));
-    early(15, walk(root, vbar));
 }
 
 /// True when a block or page mapping already exists for `address`.
@@ -322,24 +270,12 @@ fn load(root: u64) {
             // MMU off while MAIR/TCR/TTBR0 change: the firmware's TCR may use another T0SZ than ours, and
             // the window between the writes would walk its tables with the wrong geometry. No memory access
             // inside the block (everything is in registers), so the cache state does not matter.
-            // Probes: 4x8 white pixels at y=28, x=380/400/420/440, stored straight to the framebuffer (the stores
-            // work with the MMU off too): before the switch, MMU off, registers written, MMU back on.
-            let (p0, pitch) = super::early::pixel_address(380, 28);
-            let (p1, _) = super::early::pixel_address(400, 28);
-            let (p2, _) = super::early::pixel_address(420, 28);
-            let (p3, _) = super::early::pixel_address(440, 28);
             core::arch::asm!(
-                "mov {w:w}, #0xffff", "movk {w:w}, #0xff, lsl #16",
-                "mov {c}, #8", "2: stp {w:w}, {w:w}, [{p0}]", "stp {w:w}, {w:w}, [{p0}, #8]", "add {p0}, {p0}, {pitch}", "subs {c}, {c}, #1", "b.ne 2b",
                 "mrs {s}, sctlr_el2", "bic {t}, {s}, #1", "msr sctlr_el2, {t}", "isb",
-                "mov {c}, #8", "2: stp {w:w}, {w:w}, [{p1}]", "stp {w:w}, {w:w}, [{p1}, #8]", "add {p1}, {p1}, {pitch}", "subs {c}, {c}, #1", "b.ne 2b",
                 "msr mair_el2, {mair}", "msr tcr_el2, {tcr}", "msr ttbr0_el2, {root}", "isb",
                 "tlbi alle2", "dsb nsh", "isb",
-                "mov {c}, #8", "2: stp {w:w}, {w:w}, [{p2}]", "stp {w:w}, {w:w}, [{p2}, #8]", "add {p2}, {p2}, {pitch}", "subs {c}, {c}, #1", "b.ne 2b",
                 "msr sctlr_el2, {s}", "isb",
-                "mov {c}, #8", "2: stp {w:w}, {w:w}, [{p3}]", "stp {w:w}, {w:w}, [{p3}, #8]", "add {p3}, {p3}, {pitch}", "subs {c}, {c}, #1", "b.ne 2b",
-                s = out(reg) _, t = out(reg) _, w = out(reg) _, c = out(reg) _,
-                p0 = inout(reg) p0 => _, p1 = inout(reg) p1 => _, p2 = inout(reg) p2 => _, p3 = inout(reg) p3 => _, pitch = in(reg) pitch,
+                s = out(reg) _, t = out(reg) _,
                 mair = in(reg) MAIR, tcr = in(reg) tcr, root = in(reg) root, options(nostack)
             );
         } else {
