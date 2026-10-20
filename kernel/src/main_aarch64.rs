@@ -14,6 +14,7 @@ mod pci;
 mod shell;
 mod storage;
 mod tape_aarch64;
+mod tape_fs;
 mod genet;
 mod kup_serial;
 mod slots;

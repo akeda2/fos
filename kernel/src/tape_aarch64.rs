@@ -59,9 +59,6 @@ stubs! {
     api_audio_devices(u32, *mut AudioDevice) -> u32 = 0;
     api_audio_use_device(u32) -> i32 = AUDIO_NO_DEVICE;
     api_audio_use_output(u32) -> i32 = AUDIO_NO_DEVICE;
-    api_fs_stream_open(*const u8, usize, u64) -> isize = FS_ERROR;
-    api_fs_stream_write(u64, *const u8, usize, u64) -> isize = FS_ERROR;
-    api_fs_stream_close(u64) -> isize = FS_ERROR;
     api_hostname(usize, *mut u8, usize) -> usize = 0;
     api_disk_info(usize, *mut DiskInfo) -> u32 = 0;
     api_disk_format_exfat(usize, *const u8, usize) -> i32 = -1;
@@ -330,13 +327,19 @@ extern "C" fn api_free_pages() -> usize {
 
 extern "C" fn api_fs_read(name: *const u8, name_length: usize, buffer: *mut u8, capacity: usize) -> isize {
     let (name, buffer) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts_mut(buffer, capacity)) };
-    let Some(volume) = storage::boot_volume() else { return FS_NO_VOLUME };
-    match volume.read(name, buffer) {
-        Ok(Some(length)) => length as isize,
-        Ok(None) => FS_NOT_FOUND,
-        Err(crate::fosfs::Error::TooBig) => FS_TOO_BIG,
-        Err(_) => FS_ERROR,
-    }
+    crate::tape_fs::read(name, buffer)
+}
+
+extern "C" fn api_fs_stream_open(name: *const u8, name_length: usize, max_bytes: u64) -> isize {
+    crate::tape_fs::stream_open(unsafe { core::slice::from_raw_parts(name, name_length) }, max_bytes)
+}
+
+extern "C" fn api_fs_stream_write(offset: u64, data: *const u8, length: usize, file_length: u64) -> isize {
+    crate::tape_fs::stream_write(offset, unsafe { core::slice::from_raw_parts(data, length) }, file_length)
+}
+
+extern "C" fn api_fs_stream_close(file_length: u64) -> isize {
+    crate::tape_fs::stream_close(file_length)
 }
 
 // Network calls: the Pi 4's Genet is NIC 0; elsewhere there is no NIC. Multicast reception is promiscuous mode (see genet.rs).
@@ -375,21 +378,11 @@ extern "C" fn api_nic_set_multicast(index: usize, on: u32) -> u32 {
 
 extern "C" fn api_fs_write(name: *const u8, name_length: usize, data: *const u8, length: usize) -> isize {
     let (name, data) = unsafe { (core::slice::from_raw_parts(name, name_length), core::slice::from_raw_parts(data, length)) };
-    let Some(volume) = storage::boot_volume() else { return FS_NO_VOLUME };
-    match volume.write(name, data) {
-        Ok(()) => 0,
-        Err(_) => FS_ERROR,
-    }
+    crate::tape_fs::write(name, data)
 }
 
 extern "C" fn api_fs_remove(name: *const u8, name_length: usize) -> isize {
-    let name = unsafe { core::slice::from_raw_parts(name, name_length) };
-    let Some(volume) = storage::boot_volume() else { return FS_NO_VOLUME };
-    match volume.remove(name) {
-        Ok(true) => 0,
-        Ok(false) => FS_NOT_FOUND,
-        Err(_) => FS_ERROR,
-    }
+    crate::tape_fs::remove(unsafe { core::slice::from_raw_parts(name, name_length) })
 }
 
 extern "C" fn api_puts(text: *const u8, length: usize) {

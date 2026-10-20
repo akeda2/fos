@@ -174,3 +174,11 @@ clock is derived from the firmware's 115200 divisors. On the Pi: **921600 works*
 - SD under load (Pi 4): `cp` now stages up to 256 KiB and `cmp A B` compares two files; 92 KB tapes copied chain-wise
   (ed -> e1 -> e2 -> e1 -> e3, netcheck -> n1) all compared identical while the SD interrupt count rose (327).
 - The paging bring-up probes (on-screen register rows, MMU-switch pixel markers) are gone; the Pi still boots.
+
+## Tape file calls
+
+`fs_read/write/remove` and `fs_stream_*` now live in `kernel/src/tape_fs.rs` for both ports (the x86 `tape.rs` puts its FAT32/exFAT
+branch in front): `NAME`, `diskN/NAME` and `@LABEL/NAME`, `FS_BAD_NAME` for invalid names, streaming for recorders. Before, aarch64
+knew only the boot volume and stubbed the streams. Tested: `run ed disk2/tapenote` on the QEMU SD card, read back by the shell, absent
+from the boot volume (`make test-aarch64-boot`); x86 `test-ed`, `test-record`, `test-recorder`, `test-recorder-fat`, `test-config-fat`.
+Not on aarch64 yet: FAT32/exFAT volumes (no `fatvol`/USB storage there), so a PC-formatted card is not readable.

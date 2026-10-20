@@ -34,6 +34,7 @@ mod threecom;
 mod power;
 mod storage;
 mod tape;
+mod tape_fs;
 mod tapesync;
 mod uart;
 mod term;
