@@ -61,8 +61,13 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
+        "help" if !rest.is_empty() => {
+            if !show_tape_help(rest) {
+                crate::println!("help: {rest} has no help screen.");
+            }
+        }
         "help" => crate::println!(
-            "help version uptime mem disks ls [diskN] cat [diskN/]NAME write NAME TEXT\nrm NAME cp SRC DST cmp A B fsck [diskN] echo TEXT sleep N clear keymap us|sv\nrun NAME [ARGS] [&N] ps kill N|NAME|all dmesg irqs usb nic [rx] slots debug\nkup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up)"
+            "help [NAME] version uptime mem disks ls [diskN] cat [diskN/]NAME write NAME TEXT\nrm NAME cp SRC DST cmp A B fsck [diskN] echo TEXT grow diskN sleep N clear keymap us|sv\nrun NAME [ARGS] [&N] ps kill N|NAME|all dmesg irqs usb nic [rx] slots debug\nkup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up)"
         ),
         "start" => start_script(true),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
@@ -136,6 +141,7 @@ fn execute(line: &str) {
             crate::println!("Restarting.");
             crate::arch::aarch64::power::reset()
         }
+        "grow" => grow(rest),
         "write" => write_file(rest),
         "rm" => remove_file(rest),
         "sleep" => {
@@ -168,6 +174,64 @@ fn locate(name: &str) -> Option<(fosfs::Volume, &str)> {
         Some((disk, file)) => Some((volume(disk)?, file)),
         None => Some((storage::boot_volume()?, name)),
     }
+}
+
+/// `grow diskN`: makes the disk's FOSFS volume fill the disk (the last partition grows; the files are kept), as on x86.
+fn grow(argument: &str) {
+    let Some(number) = argument.strip_prefix("disk").and_then(|digits| digits.parse::<usize>().ok()) else {
+        return crate::println!("Usage: grow diskN   (make the disk's FOSFS volume fill the disk; files are kept)");
+    };
+    if number == 0 || block::get(number - 1).is_none() {
+        return crate::println!("disk{number}: no such disk (see `disks`).");
+    }
+    let disk = number - 1;
+    let before = match storage::volume_on(number) {
+        Ok(volume) => volume.sectors,
+        Err(error) => return crate::println!("grow: disk{number}: {error}."),
+    };
+    use crate::gpt::GrowError;
+    let partition = match crate::gpt::grow_last_partition(disk, &fosfor_abi::FOSFS_TYPE_GUID) {
+        Ok(partition) => partition,
+        Err(GrowError::NothingToGrow) => {
+            // The partition may already fill the disk while the volume does not (an interrupted grow): finish that.
+            match crate::gpt::find(disk, &fosfor_abi::FOSFS_TYPE_GUID, |_| true) {
+                Some(partition) if partition.sectors > before + 2048 => partition,
+                _ => return crate::println!("disk{number}: the FOSFS volume ({} MiB) already fills the disk.", before / 2048),
+            }
+        }
+        Err(GrowError::NoGpt) => return crate::println!("grow: disk{number} has no GPT this kernel understands."),
+        Err(GrowError::NoPartition) => return crate::println!("grow: disk{number} has no FOSFS partition."),
+        Err(GrowError::NotLast) => return crate::println!("grow: another partition lies after the FOSFS one; only the last partition can grow."),
+        Err(GrowError::Disk) => return crate::println!("grow: disk{number}: reading or writing the partition table failed."),
+    };
+    let volume = match fosfs::Volume::mount(disk, partition.start, partition.sectors).and_then(|volume| volume.grow(partition.sectors)) {
+        Ok(volume) => volume,
+        Err(error) => return crate::println!("grow: the partition grew but the volume could not ({error:?}); run `grow disk{number}` again."),
+    };
+    if storage::boot_disk() == Some(disk) {
+        storage::remount_boot();
+    }
+    crate::println!("disk{number}: FOSFS volume grown from {} MiB to {} MiB; the files are unchanged.", before / 2048, volume.sectors / 2048);
+}
+
+/// Prints the `.fos_help` section of the tape file NAME (NAME or diskN/NAME) without running it. False if there is none.
+fn show_tape_help(name: &str) -> bool {
+    const SIZE: usize = 512 * 1024;
+    let Some((volume, file)) = locate(name) else { return false };
+    let Some(staging) = memory::allocate_contiguous(SIZE as u64 / memory::FRAME, None) else { return false };
+    let image = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, SIZE) };
+    let shown = match volume.read(file.as_bytes(), image) {
+        Ok(Some(length)) => match fosfor_abi::elf::section(&image[..length], ".fos_help").and_then(|text| core::str::from_utf8(text).ok()) {
+            Some(text) => {
+                crate::println!("{text}");
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    };
+    memory::free(staging, SIZE as u64 / memory::FRAME);
+    shown
 }
 
 /// `write NAME TEXT`: a small text file (NAME or diskN/NAME), as on x86.
@@ -338,6 +402,10 @@ fn run_tape(rest: &str) {
     let (name, arguments) = rest.split_once(' ').map_or((rest, ""), |(name, arguments)| (name, arguments.trim()));
     if name.is_empty() {
         crate::println!("run: which tape? (run NAME [ARGS])");
+        return;
+    }
+    // `run NAME help`: a tape with a `.fos_help` section shows it instead of running.
+    if matches!(arguments, "help" | "-h" | "--help" | "?") && show_tape_help(name) {
         return;
     }
     if let Some(Ok(nic)) = service {

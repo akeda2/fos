@@ -161,6 +161,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             tape_rt::idle();
         }
     }
+    // Underruns are counted up to the moment the ring runs empty: the silence the device is fed while the last packets finish
+    // is not one, and would show as about 300 ms worth of them.
+    let mut underruns = None;
     // Let the ring drain (it is empty when the whole ring is free), then a little more for the packets in flight.
     if !aborted {
         let mut waited = 0;
@@ -172,6 +175,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             tape_rt::idle();
             waited += 1;
         }
+        let mut drained = AudioStats::default();
+        (api.audio_stats)(&mut drained);
+        underruns = Some(drained.playback_underruns);
         let until = tape_rt::micros() + 300_000;
         while tape_rt::micros() < until {
             let _ = (api.audio_read)(core::ptr::null_mut(), 0);
@@ -182,7 +188,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     (api.audio_stats)(&mut stats);
     (api.audio_stop)();
     (api.free)(buffer, capacity);
-    println!("{}: {} packets, {} transfer error(s), {} underrun(s).", if aborted { "Stopped" } else { "Finished" }, stats.playback_packets, stats.playback_errors, stats.playback_underruns);
+    println!("{}: {} packets, {} transfer error(s), {} underrun(s).", if aborted { "Stopped" } else { "Finished" }, stats.playback_packets, stats.playback_errors, underruns.unwrap_or(stats.playback_underruns));
 }
 
 tape_rt::tape_help!(br#"play: play a WAV file on the audio outputs.

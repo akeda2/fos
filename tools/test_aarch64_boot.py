@@ -24,7 +24,7 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False, big: bool = False) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
     when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
@@ -40,6 +40,11 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
             size = padded.stat().st_size
             os.truncate(padded, 1 << (size - 1).bit_length())
         # The firmware cannot boot from an SD card, so it boots the virtio disk; the SD card is a second copy (disk2).
+        if big:
+            # A "stick" much bigger than the image, so `grow` has room (the copy is thrown away with the scratch directory).
+            image = Path(scratch) / "big.img"
+            shutil.copyfile(IMAGE, image)
+            os.truncate(image, 256 << 20)
         disk = ["-drive", f"file={image},format=raw,if=none,id=boot,snapshot=on", "-device", "virtio-blk-pci,drive=boot"]
         if sd:
             disk += ["-drive", f"file={padded},format=raw,if=none,id=card,snapshot=on", "-device", "sdhci-pci", "-device", "sd-card,drive=card"]
@@ -202,6 +207,9 @@ def main():
     cmd_text = boot(IMAGE, None, ("write scratch.txt hello shell", "cat scratch.txt", "rm scratch.txt", "rm scratch.txt", "sleep 1", "debug", "memory", "irqstat"))
     check("Wrote 11 bytes to scratch.txt." in cmd_text and re.search(r"^hello shell$", cmd_text, re.M) is not None and "Removed scratch.txt." in cmd_text and "rm: no such file." in cmd_text, "`write` and `rm` create, read back and remove a file, as on x86", cmd_text)
     check("Slept 1 s." in cmd_text and "kernel-update" in cmd_text and "slot sizes (sectors)" in cmd_text and "Physical memory:" in cmd_text, "`sleep`, `debug` (kernel-update and slots) and the x86 names `memory`/`irqstat` work", cmd_text)
+    grow_text = boot(IMAGE, None, ("write keep.txt hello grown", "grow disk1", "grow disk1", "cat keep.txt", "help calc", "help hello"), big=True)
+    check("grown from" in grow_text and "files are unchanged" in grow_text and "already fills the disk" in grow_text and "hello grown" in grow_text, "`grow disk1` grows the FOSFS volume into the free space, a second one says so, and the files are kept", grow_text)
+    check("help: hello has no help screen." in grow_text or "usage" in grow_text.lower() or "calc" in grow_text.split("help calc", 1)[-1], "`help NAME` shows a tape's help or says it has none without running it", grow_text)
     service_text = boot(IMAGE, None, ("date set 2026-10-20 11:52:30",), (), None, (("run clock ntp=off &0\r", "Service clock started"), ("ps\r", "no NIC"), ("echo shell-still-works\r", "shell-still-works"), ("run clock ntp=off &3\r", "no NIC 3"), ("kill clock\r", "Service clock ended."), ("ps\r", "No services running")))
     check("Service clock started" in service_text and "Service clock ended." in service_text and "shell-still-works" in service_text, "`run NAME &0` runs a tape as a service while the shell stays usable; `ps` lists it and `kill NAME` ends it", service_text)
     start_text = boot(IMAGE, None, (), (), None, (("run ed start\r", "ed> "), ("a\r", ". "), ("# comment\r", ". "), ("echo from-start-file\r", ". "), (".\r", "ed> "), ("x\r", "written start"), ("start\r", "fos> ")))
