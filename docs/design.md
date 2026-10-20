@@ -1236,7 +1236,7 @@ tells what a given switch and NIC do. The pure part has host tests (`cargo test`
 ### Services: quiet tapes in the background (kernel/src/tasks.rs)
 
 `run NAME ARGS &N` starts a tape as a *service* that owns NIC N (1-based) and
-runs next to the shell or a foreground tape. `tasks` lists services, `kill N`
+runs next to the shell or a foreground tape. `ps` (or `tasks`) lists services, `kill N`, `kill NAME` (every service running that tape) or `kill all`
 ends one. Scheduling is cooperative: a context switch (`fos_ctx_switch`, callee-
 saved registers only) happens at tape-call boundaries (`should_abort`, `read_key`,
 `micros`, `wait_for_event`, 200 us slices) and in the shell loop, never inside a

@@ -293,18 +293,41 @@ pub fn list() {
     }
 }
 
-/// `kill N`
-pub fn kill(argument: Option<&str>) {
-    let Some(number) = argument.and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=MAX_SERVICES).contains(n)) else {
-        return crate::println!("Usage: kill N   (N from `tasks`)");
-    };
-    let service = &mut services()[number - 1];
-    if service.state != State::Live {
-        return crate::println!("kill: no service {number}.");
-    }
+/// Flags service `index` (0-based) to stop at its next Escape check.
+fn stop(index: usize) {
+    let service = &mut services()[index];
     service.abort = true;
-    crate::println!("Stopping service {} ({}); it ends the next time it checks for Escape.", number, service.name());
+    crate::println!("Stopping service {} ({}); it ends the next time it checks for Escape.", index + 1, service.name());
+}
+
+fn settle() {
     for _ in 0..4 {
         yield_now();
     }
+}
+
+/// `kill N`, `kill NAME` (every service running that tape) or `kill all`
+pub fn kill(argument: Option<&str>) {
+    let Some(word) = argument else {
+        return crate::println!("Usage: kill N | NAME | all   (see `ps`)");
+    };
+    if let Some(number) = word.parse::<usize>().ok().filter(|n| (1..=MAX_SERVICES).contains(n)) {
+        if services()[number - 1].state != State::Live {
+            return crate::println!("kill: no service {number}.");
+        }
+        stop(number - 1);
+        return settle();
+    }
+    let mut found = false;
+    for index in 0..MAX_SERVICES {
+        let service = &services()[index];
+        if service.state == State::Live && !service.abort && (word == "all" || service.name() == word) {
+            found = true;
+            stop(index);
+        }
+    }
+    if !found {
+        return crate::println!("kill: no service \"{word}\".");
+    }
+    settle();
 }
