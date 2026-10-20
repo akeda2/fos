@@ -1717,6 +1717,7 @@ fn execute(command: &str) {
                 Err(error) => crate::println!("ls: {error:?}"),
             }
         }),
+        "fsck" => files(&mut words, |volume, _, _| crate::fosfs::report(&volume)),
         "cat" => {
             files(&mut words, |volume, name, mut words| {
                 let name = name.or_else(|| words.next()).unwrap_or("");

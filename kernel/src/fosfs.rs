@@ -215,6 +215,66 @@ impl Volume {
         Ok(())
     }
 
+    /// Reads the directory the way a repair tool would: reports every file's extent through `line`, and every problem
+    /// (a damaged entry, extents that overlap, a name used twice). Returns (files, problems); nothing is changed. There is
+    /// nothing to replay or roll back after a power cut, so this only makes visible what mount and `for_each` already
+    /// skip over.
+    pub fn check(&self, mut line: impl FnMut(core::fmt::Arguments)) -> Result<(usize, usize), Error> {
+        let mut files = [(0u64, 0u64, [0u8; MAX_NAME], 0usize); MAX_ENTRIES];
+        let (mut count, mut problems, mut slots) = (0, 0, 0);
+        for sector_offset in 0..DIRECTORY_SECTORS {
+            let contents = self.read_sector(1 + sector_offset)?;
+            for index in 0..ENTRIES_PER_SECTOR {
+                let at = index * ENTRY_SIZE;
+                if contents[at] == 0 {
+                    continue;
+                }
+                slots += 1;
+                let name_length = usize::from(contents[at + 1]);
+                let (start, length, sectors) = (get_u64(&contents, at + 4), get_u64(&contents, at + 12), get_u64(&contents, at + 20));
+                let good = contents[at] == 1
+                    && (1..=MAX_NAME).contains(&name_length)
+                    && start >= DATA_START
+                    && start.saturating_add(sectors) <= self.sectors
+                    && length <= sectors.saturating_mul(512);
+                if !good {
+                    problems += 1;
+                    line(format_args!("directory entry {} is damaged (ignored)", slots - 1));
+                    continue;
+                }
+                let mut name = [0u8; MAX_NAME];
+                name.copy_from_slice(&contents[at + 28..at + 44]);
+                files[count] = (start, sectors, name, name_length);
+                count += 1;
+                line(format_args!(
+                    "{:<16} {:>9} bytes at sector {}, {} sectors",
+                    core::str::from_utf8(&name[..name_length]).unwrap_or("?"),
+                    length,
+                    start,
+                    sectors
+                ));
+            }
+        }
+        for a in 0..count {
+            for b in a + 1..count {
+                let (x, y) = (&files[a], &files[b]);
+                if x.3 == y.3 && x.2[..x.3] == y.2[..y.3] {
+                    problems += 1;
+                    line(format_args!("{} appears twice", core::str::from_utf8(&x.2[..x.3]).unwrap_or("?")));
+                }
+                if x.1 != 0 && y.1 != 0 && x.0 < y.0 + y.1 && y.0 < x.0 + x.1 {
+                    problems += 1;
+                    line(format_args!(
+                        "{} and {} share sectors",
+                        core::str::from_utf8(&x.2[..x.3]).unwrap_or("?"),
+                        core::str::from_utf8(&y.2[..y.3]).unwrap_or("?")
+                    ));
+                }
+            }
+        }
+        Ok((count, problems))
+    }
+
     pub fn find(&self, name: &[u8]) -> Result<Option<Entry>, Error> {
         let mut result = None;
         self.for_each(|entry| {
@@ -245,8 +305,11 @@ impl Volume {
         Ok(Some(length))
     }
 
-    /// Creates or replaces a file. An existing file is rewritten in place when it fits
-    /// its old extent, otherwise moved to a free extent.
+    /// Creates or replaces a file. The new contents go to a free extent of their own and the single directory-sector
+    /// write that points the entry at it is the commit, so a power cut leaves the old file or the new one, never a mix
+    /// (there is no allocation map to repair: the directory is the only record of what is used). Only when the disk has
+    /// no free run for the new copy is an existing file rewritten in place (or moved over its own old extent), and that
+    /// case is not crash-safe.
     pub fn write(&self, name: &[u8], data: &[u8]) -> Result<(), Error> {
         if !valid_name(name) {
             return Err(Error::InvalidName);
@@ -254,8 +317,14 @@ impl Volume {
         let existing = self.find(name)?;
         let needed = data.len().div_ceil(512) as u64;
         let (slot, start) = match existing {
-            Some(entry) if needed <= entry.sector_count => ((entry.directory_lba, entry.index), entry.start),
-            Some(entry) => ((entry.directory_lba, entry.index), self.free_extent(needed, Some(&entry))?.ok_or(Error::DataFull)?),
+            Some(entry) => {
+                let start = match self.free_extent(needed, None)? {
+                    Some(fresh) => fresh,
+                    None if needed <= entry.sector_count => entry.start,
+                    None => self.free_extent(needed, Some(&entry))?.ok_or(Error::DataFull)?,
+                };
+                ((entry.directory_lba, entry.index), start)
+            }
             None => (self.free_slot()?.ok_or(Error::DirectoryFull)?, self.free_extent(needed, None)?.ok_or(Error::DataFull)?),
         };
         // Data first, directory entry last: a failure in between leaves the old file intact.
@@ -430,5 +499,14 @@ impl Volume {
             candidate = candidate.max(end);
         }
         Ok((candidate + count <= self.sectors).then_some(candidate))
+    }
+}
+
+/// `fsck`: prints where every file lives and what, if anything, is wrong with the directory.
+pub fn report(volume: &Volume) {
+    match volume.check(|text| crate::println!("{text}")) {
+        Ok((files, 0)) => crate::println!("fsck: {files} file(s), directory consistent."),
+        Ok((files, problems)) => crate::println!("fsck: {files} file(s), {problems} problem(s) (damaged entries are ignored, nothing is changed)."),
+        Err(error) => crate::println!("fsck: {error:?}"),
     }
 }
