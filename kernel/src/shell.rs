@@ -64,6 +64,7 @@ fn execute(line: &str) {
         "sector" => sector(rest),
         "audio" => audio(rest),
         "date" => date(rest),
+        "display" => display(),
         "run" => run_tape(rest),
         "keymap" => match crate::usb_kbd::layout_named(rest) {
             Some(layout) => crate::usb_kbd::set_layout(layout),
@@ -510,6 +511,43 @@ fn audio(rest: &str) {
         }
         Some(_) => crate::println!("Usage: audio | audio modes | audio tone [HZ] [SECONDS] | audio capture [SECONDS]"),
     }
+}
+
+/// `display` asks the Pi's VideoCore firmware how many HDMI outputs it drives and what each is set to (read-only: it selects
+/// a display for the questions, then selects display 0 again). Meaningful on a Pi only; elsewhere the mailbox does not answer.
+fn display() {
+    use crate::mailbox::*;
+    if crate::arch::aarch64::gic::bases().0 != 0xff84_1000 {
+        println!("display: the VideoCore mailbox exists on a Raspberry Pi 4 only.");
+        return;
+    }
+    let mut count = [0u32];
+    if tag(GET_NUM_DISPLAYS, &[], &mut count).is_none() {
+        println!("display: no VideoCore mailbox answer (not a Pi, or the tag is unknown).");
+        return;
+    }
+    println!("display: firmware reports {} display(s).", count[0]);
+    for index in 0..count[0].clamp(2, 4) {
+        let mut selected = [0u32];
+        if tag(SET_DISPLAY_NUM, &[index], &mut selected).is_none() {
+            println!("  {index}: select refused");
+            continue;
+        }
+        let mut id = [0u32];
+        let id_known = tag(GET_DISPLAY_ID, &[index], &mut id).is_some();
+        println!("  {index}: select answered {}, display id {}", selected[0], if id_known { id[0] as i64 } else { -1 });
+        let (mut physical, mut virtual_size, mut depth, mut pitch) = ([0u32; 2], [0u32; 2], [0u32], [0u32]);
+        let ok = tag(GET_PHYSICAL_SIZE, &[], &mut physical).is_some()
+            && tag(GET_VIRTUAL_SIZE, &[], &mut virtual_size).is_some()
+            && tag(GET_DEPTH, &[], &mut depth).is_some()
+            && tag(GET_PITCH, &[], &mut pitch).is_some();
+        if ok {
+            println!("  {index}: {}x{} (buffer {}x{}), {} bpp, pitch {}", physical[0], physical[1], virtual_size[0], virtual_size[1], depth[0], pitch[0]);
+        } else {
+            println!("  {index}: selected, but the size tags got no answer");
+        }
+    }
+    let _ = tag(SET_DISPLAY_NUM, &[0], &mut [0u32]);
 }
 
 /// `date` shows the clock; `date set YYYY-MM-DD HH:MM[:SS]` sets it (local time). The Pi has no RTC, so it starts unset.
