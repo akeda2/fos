@@ -21,7 +21,8 @@ const REGION_BYTES: u64 = 4 * 1024 * 1024;
 pub const STAGE_BYTES: usize = 4 * 1024 * 1024;
 const STACK_BYTES: u64 = 1024 * 1024;
 
-static mut REGION: u64 = 0;
+/// Slot 0 is the foreground tape's region; slots 1.. belong to services (`tasks.rs`).
+static mut REGIONS: [u64; 1 + crate::tasks::MAX_SERVICES] = [0; 1 + crate::tasks::MAX_SERVICES];
 static mut STAGING: u64 = 0;
 static mut STAGED_LENGTH: usize = 0;
 static mut ENTRY: u64 = 0;
@@ -55,9 +56,10 @@ pub fn set_staged_length(length: usize) {
 
 /// The tape region: 4 MiB at a 2 MiB boundary, executable. Allocated on first use by
 /// over-allocating and handing the unaligned head and tail back.
-fn region() -> Option<u64> {
+fn region(slot: usize) -> Option<u64> {
     unsafe {
-        if REGION == 0 {
+        let region = &mut (*core::ptr::addr_of_mut!(REGIONS))[slot];
+        if *region == 0 {
             let total = REGION_BYTES + HUGE;
             let raw = memory::allocate_contiguous(total / memory::FRAME, None)?;
             let start = (raw + HUGE - 1) & !(HUGE - 1);
@@ -65,9 +67,9 @@ fn region() -> Option<u64> {
             let end = start + REGION_BYTES;
             memory::free(end, (raw + total - end) / memory::FRAME);
             paging::set_executable(start, REGION_BYTES, true);
-            REGION = start;
+            *region = start;
         }
-        Some(REGION)
+        Some(*region)
     }
 }
 
@@ -79,8 +81,8 @@ pub enum LoadError {
     Elf(elf::Error),
 }
 
-/// Relocates the staged file into the tape region and records its entry point.
-pub fn load_staged(name: &str) -> Result<(), LoadError> {
+/// Relocates the staged file into the region of `slot`; returns its entry point and size.
+fn load_into(slot: usize) -> Result<(u64, u64), LoadError> {
     let image_length = unsafe { STAGED_LENGTH };
     let staging = staging().ok_or(LoadError::NoMemory)?;
     let image = &staging[..image_length];
@@ -88,10 +90,21 @@ pub fn load_staged(name: &str) -> Result<(), LoadError> {
     if span > REGION_BYTES {
         return Err(LoadError::TooBig);
     }
-    let base = region().ok_or(LoadError::NoMemory)?;
+    let base = region(slot).ok_or(LoadError::NoMemory)?;
     // Clear the region first so a shorter tape never runs on a longer one's leftovers.
     unsafe { core::ptr::write_bytes(base as *mut u8, 0, REGION_BYTES as usize) };
     let entry = unsafe { elf::load(image, base) }.map_err(LoadError::Elf)?;
+    Ok((entry, span))
+}
+
+/// A service's tape: staged file into its slot's region (see `tasks::start`).
+pub fn load_staged_service(slot: usize, _name: &str) -> Result<u64, LoadError> {
+    load_into(slot).map(|(entry, _)| entry)
+}
+
+/// Relocates the staged file into the foreground tape region and records its entry point.
+pub fn load_staged(name: &str) -> Result<(), LoadError> {
+    let (entry, span) = load_into(0)?;
     unsafe {
         ENTRY = entry;
         let take = name.len().min(16);
@@ -165,15 +178,29 @@ extern "C" fn api_puts(text: *const u8, length: usize) {
     }
 }
 extern "C" fn api_should_abort() -> u32 {
+    if crate::tasks::in_service() {
+        return u32::from(crate::tasks::service_should_abort());
+    }
+    crate::tasks::maybe_yield();
     u32::from(term::tape_should_abort())
 }
 extern "C" fn api_read_key() -> u32 {
+    if crate::tasks::in_service() {
+        return crate::tasks::service_read_key();
+    }
+    crate::tasks::maybe_yield();
     term::tape_key()
 }
 extern "C" fn api_set_input_mode(_mode: u32) {}
 extern "C" fn api_wait_for_event() {
     use crate::cpu::{spun, Spin};
+    if crate::tasks::in_service() {
+        return crate::tasks::service_wait();
+    }
     term::flush_output();
+    if crate::tasks::pass() {
+        return; // a service has work: do not sleep
+    }
     let begin = timer::micros();
     // Idle time is when queued serial output goes out; a tick alone would drain only 16 bytes per 10 ms.
     if crate::serial::pending() {
@@ -211,6 +238,7 @@ extern "C" fn api_ticks() -> u64 {
     timer::ticks()
 }
 extern "C" fn api_micros() -> u64 {
+    crate::tasks::maybe_yield();
     timer::micros()
 }
 extern "C" fn api_alloc(bytes: usize) -> usize {
@@ -346,6 +374,15 @@ extern "C" fn api_gfx_blit(x: u32, y: u32, width: u32, height: u32, pixels: *con
     u32::from(unsafe { crate::framebuffer::gfx_blit(x, y, width, height, pixels, stride) })
 }
 static mut FP_LEVEL: u32 = 0;
+/// Turns SSE/AVX2 off again (nothing running needs them).
+pub fn clear_fp_level() {
+    crate::cpu::fp_disable();
+    unsafe { FP_LEVEL = 0 };
+}
+/// A service may be a hard-float tape: the units stay on while any service runs.
+pub fn enable_fp_level() {
+    unsafe { FP_LEVEL = crate::cpu::fp_enable() };
+}
 extern "C" fn api_fp_level() -> u32 {
     unsafe { FP_LEVEL }
 }
@@ -430,7 +467,11 @@ extern "C" fn api_nic_send(index: usize, frame: *const u8, length: usize) -> u32
     u32::from(term::nic_send(index, unsafe { core::slice::from_raw_parts(frame, length) }))
 }
 extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) -> usize {
-    term::tape_receive(index, unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
+    let buffer = unsafe { core::slice::from_raw_parts_mut(buffer, capacity) };
+    if crate::tasks::in_service() {
+        return term::service_receive(index, buffer);
+    }
+    term::tape_receive(index, buffer)
 }
 extern "C" fn api_audio_info(out: *mut fosfor_abi::tape::AudioInfo) -> u32 {
     u32::from(crate::audio::fill_info(unsafe { &mut *out }))
@@ -448,7 +489,7 @@ extern "C" fn api_audio_devices(number: u32, out: *mut fosfor_abi::tape::AudioDe
 }
 
 extern "C" fn api_nic_active() -> u32 {
-    term::active_nic() as u32
+    crate::tasks::current_nic().unwrap_or_else(term::active_nic) as u32
 }
 
 extern "C" fn api_audio_use_device(number: u32) -> i32 {
@@ -481,16 +522,8 @@ extern "C" fn api_nic_max_frame_len() -> usize {
     1518
 }
 
-/// Runs the loaded tape with `arguments`. The tape gets a 1 MiB stack of its own, so
-/// its recursion cannot eat the kernel's.
-pub fn run(arguments: &str) -> Result<(), &'static str> {
-    let entry = unsafe { ENTRY };
-    if entry == 0 {
-        return Err("no tape is loaded (tape load NAME)");
-    }
-    let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
-    let stack = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None).ok_or("no memory for the tape's stack")?;
-    let api = TapeApi {
+pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
+    TapeApi {
         version: TAPE_API_VERSION,
         size: core::mem::size_of::<TapeApi>() as u32,
         putc: api_putc,
@@ -575,7 +608,19 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         gfx_close_on: crate::framebuffer::api_gfx_close_on,
         gfx_fill_on: crate::framebuffer::api_gfx_fill_on,
         gfx_blit_on: crate::framebuffer::api_gfx_blit_on,
-    };
+    }
+}
+
+/// Runs the loaded tape with `arguments`. The tape gets a 1 MiB stack of its own, so
+/// its recursion cannot eat the kernel's.
+pub fn run(arguments: &str) -> Result<(), &'static str> {
+    let entry = unsafe { ENTRY };
+    if entry == 0 {
+        return Err("no tape is loaded (tape load NAME)");
+    }
+    let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
+    let stack = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None).ok_or("no memory for the tape's stack")?;
+    let api = build_api(info, arguments);
     term::clear_frame_queue();
     term::set_tape_mode(true);
     crate::debug::set_tape_running(true);
@@ -596,8 +641,9 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
         );
     }
     crate::framebuffer::gfx_close(); // a tape that ended (or was aborted) without closing gives the screen back
-    crate::cpu::fp_disable();
-    unsafe { FP_LEVEL = 0 };
+    if crate::tasks::count() == 0 {
+        clear_fp_level();
+    }
     crate::debug::set_tape_running(false);
     crate::uart::close_all();
     crate::audio::stop_for_tape(); // a tape that returns (or was aborted) must not leave an audio stream running
@@ -827,7 +873,16 @@ pub fn show_help(name: &str) {
 
 /// `run NAME [ARGS]`: load a tape from FOSFS and run it.
 pub fn run_named(arguments: &str) {
-    let (name, rest) = arguments.trim().split_once(char::is_whitespace).unwrap_or((arguments.trim(), ""));
+    // `run NAME ARGS &N`: a service on NIC N.
+    let arguments = arguments.trim();
+    let (arguments, service) = match arguments.rsplit_once(char::is_whitespace) {
+        Some((before, last)) if last.starts_with('&') => (before.trim(), Some(last[1..].parse::<usize>().ok().filter(|&n| n >= 1))),
+        _ => (arguments, None),
+    };
+    if service == Some(None) {
+        return crate::println!("run: `&N` names the NIC the background tape owns (N from 1 to {}).", term::nic_count());
+    }
+    let (name, rest) = arguments.split_once(char::is_whitespace).unwrap_or((arguments, ""));
     match load_from_file(name) {
         Ok(length) => {
             // `NAME help`, `NAME --help`: a tape with a `.fos_help` section shows it instead of running.
@@ -838,6 +893,9 @@ pub fn run_named(arguments: &str) {
                 }
             }
             set_staged_length(length);
+            if let Some(Some(nic)) = service {
+                return crate::tasks::start(name, rest.trim(), nic - 1);
+            }
             match load_staged(name) {
                 Ok(()) => {
                     if let Err(reason) = run(rest.trim()) {

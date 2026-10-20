@@ -217,7 +217,7 @@ pub fn poll() {
             // Frames a tape may be about to want (its own load protocol, over the fos ethertype)
             // wait in the queue; the rest of a busy LAN's traffic is not worth keeping.
             let stamp = nic_at(index).map_or(0, |nic| nic.take_stamp());
-            if !handle_frame(index, &buffer[..length]) && length >= 14 && (buffer[12..14] == ETHERTYPE || unsafe { QUEUE_ALL }) {
+            if !handle_frame(index, &buffer[..length]) && length >= 14 && (buffer[12..14] == ETHERTYPE || unsafe { QUEUE_ALL } || crate::tasks::service_owns(index)) {
                 queue_frame(index, &buffer[..length], stamp);
             }
         }
@@ -903,9 +903,19 @@ fn queue_frame(index: usize, frame: &[u8], stamp: u64) {
 
 /// Forgets frames queued for tapes (a tape about to run should not see stale traffic).
 pub fn clear_frame_queue() {
-    unsafe {
-        FRAME_HEAD = [0; MAX_NICS];
-        FRAME_TAIL = [0; MAX_NICS];
+    for index in 0..MAX_NICS {
+        if !crate::tasks::service_owns(index) {
+            clear_frame_queue_nic(index);
+        }
+    }
+}
+
+pub fn clear_frame_queue_nic(index: usize) {
+    if index < MAX_NICS {
+        unsafe {
+            FRAME_HEAD[index] = 0;
+            FRAME_TAIL[index] = 0;
+        }
     }
 }
 
@@ -919,17 +929,65 @@ pub fn tape_poll() {
 /// Moves every frame waiting in a NIC's hardware ring into the per-interface FIFO (the terminal's own frames are
 /// handled on the way). The part of `tape_service` a receive-heavy tape needs on every call; the rest runs on a timer.
 fn drain_nics_to_fifo() {
-    let mut buffer = [0u8; 1600];
     for index in 0..nic_count() {
-        // At most one ring's worth per call: under a line-rate flood the ring never stays empty, and an
-        // unbounded loop here would starve the tape that is supposed to consume (and send) the traffic.
-        for _ in 0..256 {
-            let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
-            let stamp = nic_at(index).map_or(0, |nic| nic.take_stamp());
-            if handle_frame(index, &buffer[..length]) {
-                continue;
+        drain_nic_to_fifo(index);
+    }
+}
+
+fn drain_nic_to_fifo(index: usize) {
+    let mut buffer = [0u8; 1600];
+    // At most one ring's worth per call: under a line-rate flood the ring never stays empty, and an
+    // unbounded loop here would starve the tape that is supposed to consume (and send) the traffic.
+    for _ in 0..256 {
+        let Some(length) = nic_at(index).and_then(|nic| nic.receive(&mut buffer)) else { break };
+        let stamp = nic_at(index).map_or(0, |nic| nic.take_stamp());
+        if handle_frame(index, &buffer[..length]) {
+            continue;
+        }
+        queue_frame(index, &buffer[..length], stamp);
+    }
+}
+
+/// Moves the frames waiting on the NICs that services own into their queues (a service's own `nic_receive` does this
+/// too; the shell's `poll` and a foreground tape's service loop keep the rings from overrunning meanwhile).
+pub fn service_poll() {
+    if crate::tasks::count() == 0 {
+        return;
+    }
+    for index in 0..nic_count() {
+        if crate::tasks::service_owns(index) {
+            drain_nic_to_fifo(index);
+        }
+    }
+}
+
+/// A service's `nic_receive`: only on its own NIC.
+pub fn service_receive(index: usize, out: &mut [u8]) -> usize {
+    if crate::tasks::current_nic() != Some(index) {
+        return 0;
+    }
+    if index < MAX_NICS && unsafe { FRAME_TAIL[index] != FRAME_HEAD[index] } {
+        return pop_frame(index, out);
+    }
+    drain_nic_to_fifo(index);
+    pop_frame(index, out)
+}
+
+/// True while a foreground tape owns the keys and the screen.
+pub fn tape_mode() -> bool {
+    unsafe { TAPE_MODE }
+}
+
+/// A service ended: its NIC goes back to the state a tape leaves it in.
+pub fn nic_release(index: usize) {
+    if let Some(nic) = nic_at(index) {
+        nic.multicast_clear();
+        nic.vlan_clear();
+        nic.set_tx_offload(false);
+        if let Some(card) = nic.as_e1000() {
+            if card.ts_all() {
+                card.ts_stamp_all(false);
             }
-            queue_frame(index, &buffer[..length], stamp);
         }
     }
 }
@@ -1023,6 +1081,10 @@ pub fn tape_should_abort() -> bool {
 /// light drain of the hardware rings every 16 frames keeps them from overrunning meanwhile.
 pub fn tape_receive(index: usize, out: &mut [u8]) -> usize {
     static mut SINCE_DRAIN: u32 = 0;
+    if crate::tasks::service_owns(index) {
+        tape_service();
+        return 0;
+    }
     if index < MAX_NICS && unsafe { FRAME_TAIL[index] != FRAME_HEAD[index] } {
         unsafe {
             SINCE_DRAIN += 1;
@@ -1083,6 +1145,9 @@ pub fn nic_ts_all(index: usize, on: bool) -> bool {
 /// Back to stamping only PTP events on every interface (after a tape that asked for every frame).
 pub fn nic_ts_all_off() {
     for index in 0..nic_count() {
+        if crate::tasks::service_owns(index) {
+            continue;
+        }
         if let Some(card) = nic_at(index).and_then(|nic| nic.as_e1000()) {
             if card.ts_all() {
                 card.ts_stamp_all(false);
@@ -1137,7 +1202,9 @@ pub fn nic_multicast_join(index: usize, mac: [u8; 6], on: bool) -> bool {
 pub fn nic_multicast_clear_all() {
     let mut index = 0;
     while let Some(nic) = nic_at(index) {
-        nic.multicast_clear();
+        if !crate::tasks::service_owns(index) {
+            nic.multicast_clear();
+        }
         index += 1;
     }
 }
@@ -1150,7 +1217,9 @@ pub fn nic_vlan_filter(index: usize, vid: u16, on: bool) -> bool {
 pub fn nic_vlan_clear_all() {
     let mut index = 0;
     while let Some(nic) = nic_at(index) {
-        nic.vlan_clear();
+        if !crate::tasks::service_owns(index) {
+            nic.vlan_clear();
+        }
         index += 1;
     }
 }
@@ -1180,7 +1249,9 @@ pub fn nic_tx_offload(index: usize, on: bool) -> bool {
 pub fn nic_tx_offload_off_all() {
     let mut index = 0;
     while let Some(nic) = nic_at(index) {
-        nic.set_tx_offload(false);
+        if !crate::tasks::service_owns(index) {
+            nic.set_tx_offload(false);
+        }
         index += 1;
     }
 }
@@ -1445,6 +1516,7 @@ fn execute(command: &str) {
             crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
             crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");
             crate::println!("run NAME [ARGS]   load a tape from FOSFS and run it");
+            crate::println!("run NAME ARGS &N  run it in the background on NIC N; `tasks`, `kill N`");
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
             crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
             crate::println!("uptime    time since the timer started; sleep N waits N seconds");
@@ -1642,6 +1714,8 @@ fn execute(command: &str) {
         }
         "tape" => crate::tape::command(command.strip_prefix("tape").unwrap_or("")),
         "run" => crate::tape::run_named(command.strip_prefix("run").unwrap_or("")),
+        "tasks" => crate::tasks::list(),
+        "kill" => crate::tasks::kill(words.next()),
         "label" => label_command(words),
         "audio" => audio_command(words),
         "hda" => crate::hda::describe(),

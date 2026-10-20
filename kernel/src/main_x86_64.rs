@@ -34,6 +34,7 @@ mod threecom;
 mod power;
 mod storage;
 mod tape;
+mod tasks;
 mod tape_fs;
 mod tapesync;
 mod uart;
@@ -417,6 +418,9 @@ pub extern "sysv64" fn kmain(info: *const BootInfo) -> ! {
         }
         usb_hid::poll();
         term::poll();
+        if tasks::pass() {
+            continue; // a service is busy: no sleeping until it idles
+        }
         if uart::shell_active() {
             // The shell's UART has no interrupt and a 16-byte FIFO: keep polling it instead of sleeping a whole tick.
             let begin = timer::micros();

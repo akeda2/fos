@@ -1232,3 +1232,24 @@ margin. `make test-audio-bench` (QEMU, e1000: shows drops at 125/250 us, so only
 tells what a given switch and NIC do. The pure part has host tests (`cargo test` in crates/audio-bench).
 
 **The `clock` tape** (`tapes/clock`, `make test-clock`) is a Wharton-style studio clock: a ring of 60 red dots (a saturated red; the themes' alarm red looked pink on black) that light up one second at a time, the time as big yellow seven-segment digits (`gfx::dial`, 24 h by default) with the seconds below and the date; a pixel screen and a hard-float build like `gonio`. It keeps its own time: the model is `unix_ns = micros()*1000 + offset`, redrawn when the shown second changes. `ntp=` (default `dhcp`: option 42, else the gateway; an address or a name) asks at start and every `resync=` s (a non-blocking `tape_ip::ntp::Client`: the picture keeps running, the loop polls flat out for the 0.4 s a query takes); `source=ptp` instead listens as a PTP slave (`ptp_tape::Slave`, UDP group 224.0.1.129, or Ethernet 0x88F7 with `l2`, which needs no IP or DHCP; `domain=N`), needs a master whose Announce says its time is real, and follows every Sync, smoothing the offset by 1/8 and jumping when it moves over 50 ms. A PTP clock sleeps between polls (a Sync is timed up to 10 ms late, so the clock is about 0-5 ms off); `spin` polls flat out and discards late Syncs (sub-ms, CPU busy). The status line turns amber when nothing was heard for 10 s. Either way the machine's clock and RTC are set when they differ by 1 s. The zone is `tz=+H[:MM]`, else `ntp::guess_zone` from the machine's clock (which holds local time), else UTC. No hardware stamps for PTP yet; the accuracy is that of a software slave (hundreds of microseconds), plenty for a seconds dot. `lead=N` (0-3, key `l`, default off) is the old studio clocks' cue: the next 5-second mark is lit from the previous mark until N seconds later, dark for the rest and lit for good when the count reaches it (with the cue on, the 12 o'clock dot is dim at 55-59 like the rest, so the minute mark gets the cue too). The status and key lines are dim until a key lights them for 6 s (`bars=on` keeps them lit; a stale clock stays amber). The test runs a fake NTP server and a PTP master guest and decodes the screenshot.
+
+### Services: quiet tapes in the background (kernel/src/tasks.rs)
+
+`run NAME ARGS &N` starts a tape as a *service* that owns NIC N (1-based) and
+runs next to the shell or a foreground tape. `tasks` lists services, `kill N`
+ends one. Scheduling is cooperative: a context switch (`fos_ctx_switch`, callee-
+saved registers only) happens at tape-call boundaries (`should_abort`, `read_key`,
+`micros`, `wait_for_event`, 200 us slices) and in the shell loop, never inside a
+kernel routine, so no locks are needed. Each service has its own 4 MiB tape
+region and 1 MiB stack; at most 2.
+
+NIC ownership replaces frame filtering: frames of a service's NIC go only to the
+service, and the foreground tape gets none from it. A second service on an owned
+NIC is refused. Tape-end cleanup (multicast, VLAN, offload, timestamps) skips
+service NICs; `nic_release` clears them when the service ends.
+
+Limits: services must be quiet (console output is shared), must not be audio
+tapes (audio, UART and gfx teardown are not owner-aware), and keys/Escape go to
+the foreground only. KUP and NETFS work while a service runs. Test:
+`make test-services` (ptp master service, slave locks on, foreground tapes,
+`kill`). Only real hardware shows Sync jitter next to a busy foreground tape.

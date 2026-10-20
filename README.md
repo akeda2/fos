@@ -77,6 +77,8 @@ tools/foscopy.py --iface IF --mac MAC FILE :disk1/NAME # copy a file onto its di
 tools/term_net.py --iface IF --mac MAC                 # an interactive terminal
 ```
 
+A quiet tape can run in the background as a service that owns one NIC: `run ptp master ip=dhcp &1`; `tasks` lists services and `kill N` ends one (see `docs/design.md`, "Services").
+
 Between machines, `tapesync [HOST] [apply]` pulls newer tapes from one peer, or from all discovered ones, that share the `synckey` file (see `docs/design.md`).
 
 `debug` files on the machine's disk (see `AGENTS.md`) turn on reboot-on-crash, the watchdog and
