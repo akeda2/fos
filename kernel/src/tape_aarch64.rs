@@ -199,6 +199,13 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
     }
 }
 
+/// The second screen is blanked when a tape ends, unless a service may be drawing on it.
+fn close_extra_screens() {
+    if crate::tasks::count() == 0 {
+        crate::framebuffer::gfx_close_extra();
+    }
+}
+
 /// Writes a `TapeApi` for a tape started by the service scheduler.
 pub unsafe fn write_api(at: u64, arguments: &'static str) {
     if let Some(info) = unsafe { INFO.as_ref() } {
@@ -227,7 +234,7 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
         );
     }
     crate::framebuffer::gfx_close();
-    crate::framebuffer::gfx_close_extra();
+    close_extra_screens();
     unsafe { PENDING_LENGTH = 0 };
     memory::free(stack, STACK_BYTES / memory::FRAME);
     Ok(())
@@ -683,7 +690,7 @@ pub fn run_two(tapes: [(u64, &str); TASKS]) -> Result<(), &'static str> {
     unsafe { fos_task_switch(&mut state.main_sp, state.sp[0]) };
     state.active = false;
     crate::framebuffer::gfx_close();
-    crate::framebuffer::gfx_close_extra();
+    close_extra_screens();
     unsafe { PENDING_LENGTH = 0 };
     for stack in stacks {
         memory::free(stack, STACK_BYTES / memory::FRAME);

@@ -276,3 +276,11 @@ on|off`, `nic rx multicast`. Later: `nic_multicast_join` could use the 17 MDF en
 Open: IP-mode ptp (UDP 224.0.1.129) gets Announce/Sync but clock1 never answers the Delay_Req (the Pi does send it,
 86 bytes, `nic_send` true); L2 mode works. Not yet found whether the switch (IGMP snooping), clock1 or our frame is
 at fault.
+
+## Services on the Pi (2026-10-20)
+
+`run NAME ARGS &N`, `ps` and `kill N|NAME|all` work as on x86 (`docs/design.md` "Services"; `kernel/src/tasks.rs` is the same file,
+`service_host.rs` and the `ctx` block in it are the per-kernel parts). `&1` is the Genet; `&0` owns no NIC. Services use tape regions
+2 and 3 (0 and 1 are for `run A + B`). A foreground tape's end no longer blanks screen 1 while a service runs. Verified on the Pi:
+`run clock ntp=off screen=1 &0` ticks on the second screen next to the shell and `run calc`; it stalls while a shell command or a
+tape load blocks (SD reads), because switching is cooperative. Ethernet KUP is x86 only; the Pi uses serial KUP.
