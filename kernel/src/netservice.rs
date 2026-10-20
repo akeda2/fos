@@ -60,7 +60,7 @@ fn send(destination: &[u8; 6], tag: u8, payload: &[u8]) {
 }
 
 /// True when the boot volume's `debug` file has a `kernel-update` line.
-fn kernel_update_enabled() -> bool {
+pub fn kernel_update_enabled() -> bool {
     let Some(volume) = crate::storage::boot_volume() else { return false };
     let mut buffer = [0u8; 1024];
     let Ok(Some(length)) = volume.read(b"debug", &mut buffer) else { return false };

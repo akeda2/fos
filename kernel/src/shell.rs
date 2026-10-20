@@ -61,7 +61,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST cmp A B fsck [diskN] echo TEXT keymap us|sv run NAME [ARGS] [&N] ps kill N|NAME|all\ndmesg irqs usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST cmp A B fsck [diskN] echo TEXT keymap us|sv run NAME [ARGS] [&N] ps kill N|NAME|all\ndmesg irqs usb nic [rx] slots debug kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "start" => start_script(true),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
@@ -117,6 +117,10 @@ fn execute(line: &str) {
         "recv" => recv_serial(rest),
         "kup" if rest == "serial" || rest.starts_with("serial ") => kup_serial(rest["serial".len()..].trim()),
         "slots" => crate::slots::show(),
+        "debug" if matches!(rest, "" | "status" | "slots") => {
+            crate::println!("kernel-update {}", crate::netservice::kernel_update_enabled());
+            crate::slots::show();
+        }
         "irqs" => {
             let (uart, dropped) = crate::arch::aarch64::pl011::interrupt_counts();
             crate::println!("timer {}, uart {uart} (bytes dropped {dropped}), sd {}, genet {}", crate::gic::irq_ticks(), crate::sdhci::interrupt_count(), crate::genet::interrupt_count());
