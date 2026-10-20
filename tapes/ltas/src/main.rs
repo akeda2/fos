@@ -380,7 +380,7 @@ fn draw_status<const N: usize>(canvas: &mut Canvas, layout: &Layout, settings: &
         settings.resolution.name(),
         if settings.resolution == Resolution::Fft { "" } else if settings.smooth { " smooth" } else { " bars" },
         settings.n,
-        if settings.avx2 { "avx2" } else { "sse2" },
+        if settings.avx2 { "avx2" } else if cfg!(target_arch = "x86_64") { "sse2" } else { "base" },
         settings.window.name(),
         settings.weighting.name(),
         settings.calibration_db,

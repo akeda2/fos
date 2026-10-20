@@ -293,22 +293,94 @@ extern "C" fn api_gfx_blit(x: u32, y: u32, width: u32, height: u32, pixels: *con
     u32::from(unsafe { crate::framebuffer::gfx_blit(x, y, width, height, pixels, stride) })
 }
 
-/// The next typed byte from the serial console or the USB keyboard. With two tapes running only the focused one gets keys;
-/// Tab passes the focus to the other.
-fn next_byte() -> Option<u8> {
+const TAPE_ABORT: u16 = 0x100;
+const INPUT_CAPACITY: usize = 32;
+static mut INPUT: [u16; INPUT_CAPACITY] = [0; INPUT_CAPACITY];
+static mut INPUT_HEAD: usize = 0;
+static mut INPUT_TAIL: usize = 0;
+/// When a lone ESC byte arrived on the serial console and may still start a cursor-key sequence (0 = none pending).
+static mut SERIAL_ESCAPE_AT: u64 = 0;
+/// How long a serial Escape waits for the `[` of a sequence; a terminal sends the bytes back to back.
+const SERIAL_ESCAPE_US: u64 = 50_000;
+
+fn input_push(value: u16) {
+    unsafe {
+        let next = (INPUT_HEAD + 1) % INPUT_CAPACITY;
+        if next != INPUT_TAIL {
+            (*core::ptr::addr_of_mut!(INPUT))[INPUT_HEAD] = value;
+            INPUT_HEAD = next;
+        }
+    }
+}
+
+/// Moves what the keyboards typed into the tape's input queue, as on x86 (`term.rs` `tape_service`): a USB cursor key becomes
+/// the bytes a terminal sends (ESC [ A), å ä ö become UTF-8, a lone Escape is "stop" (`TAPE_ABORT`). On the serial console an
+/// ESC followed within 50 ms by `[` or `O` starts a sequence; any other ESC is "stop".
+fn input_pump() {
     crate::usb_kbd::poll();
+    while let Some(key) = crate::usb_kbd::pop() {
+        if key == 0x1b {
+            input_push(TAPE_ABORT);
+        } else if let Some(sequence) = fosfor_abi::keymap::ansi_sequence(key) {
+            input_push(0x1b);
+            input_push(u16::from(b'['));
+            sequence.iter().for_each(|&byte| input_push(u16::from(byte)));
+        } else if let Some(sequence) = fosfor_abi::keymap::utf8_sequence(key) {
+            sequence.iter().for_each(|&byte| input_push(u16::from(byte)));
+        } else {
+            input_push(u16::from(key));
+        }
+    }
+    while let Some(key) = crate::arch::aarch64::pl011::read_byte() {
+        unsafe {
+            if SERIAL_ESCAPE_AT != 0 {
+                SERIAL_ESCAPE_AT = 0;
+                if key == b'[' || key == b'O' {
+                    input_push(0x1b);
+                    input_push(u16::from(key));
+                    continue;
+                }
+                input_push(TAPE_ABORT);
+            }
+            if key == 0x1b {
+                SERIAL_ESCAPE_AT = timer::micros().max(1);
+                continue;
+            }
+        }
+        input_push(u16::from(key));
+    }
+    unsafe {
+        if SERIAL_ESCAPE_AT != 0 && timer::micros().wrapping_sub(SERIAL_ESCAPE_AT) > SERIAL_ESCAPE_US {
+            SERIAL_ESCAPE_AT = 0;
+            input_push(TAPE_ABORT);
+        }
+    }
+}
+
+/// The next typed key (a byte, or `TAPE_ABORT`) from the serial console or the USB keyboard. With two tapes running only the
+/// focused one gets keys; Tab passes the focus to the other.
+fn next_key() -> Option<u16> {
     let tasks = tasks();
     if tasks.active && tasks.current != tasks.focus {
         return None;
     }
-    let byte = crate::arch::aarch64::pl011::read_byte().or_else(crate::usb_kbd::pop)?;
-    if tasks.active && byte == 0x09 {
-        if let Some(other) = tasks.next_live(tasks.focus) {
-            tasks.focus = other;
+    input_pump();
+    unsafe {
+        if INPUT_TAIL == INPUT_HEAD {
+            return None;
         }
-        return None;
+        let value = (*core::ptr::addr_of!(INPUT))[INPUT_TAIL];
+        INPUT_TAIL = (INPUT_TAIL + 1) % INPUT_CAPACITY;
+        if tasks.active && value == 0x09 {
+            if let Some(other) = tasks.next_live(tasks.focus) {
+                tasks.focus = other;
+            }
+            INPUT_HEAD = 0;
+            INPUT_TAIL = 0;
+            return None;
+        }
+        Some(value)
     }
-    Some(byte)
 }
 
 extern "C" fn api_read_key() -> u32 {
@@ -316,9 +388,9 @@ extern "C" fn api_read_key() -> u32 {
         return crate::tasks::service_read_key();
     }
     crate::tasks::maybe_yield();
-    match next_byte() {
+    match next_key() {
         None => KEY_NONE,
-        Some(0x1b) => KEY_ABORT,
+        Some(TAPE_ABORT) => KEY_ABORT,
         Some(byte) => KEY_BASE + u32::from(byte),
     }
 }
@@ -329,7 +401,12 @@ extern "C" fn api_should_abort() -> u32 {
         return u32::from(crate::tasks::service_should_abort());
     }
     crate::tasks::maybe_yield();
-    u32::from(next_byte() == Some(0x1b))
+    while let Some(key) = next_key() {
+        if key == TAPE_ABORT {
+            return 1;
+        }
+    }
+    0
 }
 
 extern "C" fn api_set_input_mode(_mode: u32) {}
@@ -455,7 +532,7 @@ extern "C" fn api_audio_start(rate: u32, capture: u32, playback: u32) -> i32 {
 extern "C" fn api_audio_stop() {
     crate::audio::stop_for_tape();
 }
-/// USB audio moves through the xHCI event ring, which `next_byte` (and so every tape's key poll) drains; the audio calls
+/// USB audio moves through the xHCI event ring, which `input_pump` (and so every tape's key poll) drains; the audio calls
 /// drain it themselves too, since a tape that only streams may not read keys often.
 extern "C" fn api_audio_read(buffer: *mut u8, length: usize) -> usize {
     crate::usb_kbd::poll();
