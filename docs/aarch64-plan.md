@@ -200,3 +200,13 @@ no FOSFS volume but a FAT32/exFAT one (GPT basic data, MBR, or a superfloppy) is
 diskN` and `cat diskN/NAME` use the same calls. aarch64 has no wall clock yet, so FAT files get the fixed default date.
 Tested in QEMU on a `mkfs.vfat` virtio disk (`make test-aarch64-boot`); the Pi's SD card and USB sticks are not tried
 (USB mass storage is not ported).
+
+## USB mass storage on aarch64
+
+`usb_storage.rs` (Bulk-Only Transport, one SCSI command per exchange, 64 KiB per command) now builds on both ports; the EHCI
+host is x86-only. `usb_kbd::probe_device` hands a non-keyboard device with a Mass Storage interface to `attach_xhci`, a hub's
+children go the same way, and an unplugged or replugged root port marks its disk stale so a returning stick keeps its disk
+number (`usb` rescans). Sticks are therefore ordinary `diskN` entries: FOSFS or FAT32/exFAT, `ls`, `cat`, `cp`, `fsck`, and the
+tape file calls all work on them. QEMU `usb-storage` on the xHCI controller is tested in `make test-aarch64-boot`; the Pi's
+VL805 controller with a real stick, and unplug/replug on aarch64, have not been tried. Booting from a USB stick is not
+supported (the Pi boots from its SD card).

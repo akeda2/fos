@@ -22,6 +22,7 @@ mod slots;
 mod sdhci;
 mod usb_hub;
 mod usb_kbd;
+mod usb_storage;
 mod virtio_blk;
 mod xhci;
 

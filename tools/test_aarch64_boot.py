@@ -24,7 +24,7 @@ def check(condition, message, text=""):
     print(f"PASS: {message}")
 
 
-def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple[str, str, Path] | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False) -> str:
+def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] = (), usb_keys: tuple[str, ...] = (), during: tuple[str, str, Path] | None = None, steps: tuple[tuple[str, str], ...] = (), sd: bool = False, fat: bool = False, usb: bool = False) -> str:
     """Boots `image` under QEMU virt + AAVMF + ramfb and returns the serial text. The kernel parks, so the run ends
     when the parking message shows (or after 60 s); a PPM screenshot goes to `screendump` when given."""
     if not shutil.which("qemu-system-aarch64") or not Path(CODE).exists():
@@ -43,19 +43,25 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
         disk = ["-drive", f"file={image},format=raw,if=none,id=boot,snapshot=on", "-device", "virtio-blk-pci,drive=boot"]
         if sd:
             disk += ["-drive", f"file={padded},format=raw,if=none,id=card,snapshot=on", "-device", "sdhci-pci", "-device", "sd-card,drive=card"]
-        if fat:
+        stick = []
+        if fat or usb:
             # A PC-formatted FAT32 volume with no partition table (a "superfloppy"), as a third disk.
             fat_image = Path(scratch) / "fat.img"
             with open(fat_image, "wb") as handle:
                 handle.truncate(64 << 20)
             subprocess.run(["mkfs.vfat", "-F", "32", "-s", "1", str(fat_image)], check=True, capture_output=True)
-            disk += ["-drive", f"file={fat_image},format=raw,if=none,id=fat", "-device", "virtio-blk-pci,drive=fat"]
+            # `usb` puts the same volume on a USB stick (xHCI, Bulk-Only Transport) instead of a second virtio disk.
+            disk += ["-drive", f"file={fat_image},format=raw,if=none,id=fat"]
+            if usb:
+                stick = ["-device", "usb-storage,drive=fat,bus=xhci.0"]
+            else:
+                disk += ["-device", "virtio-blk-pci,drive=fat"]
         with open(log, "wb") as out:
             qemu = subprocess.Popen(
                 ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-display", "none", "-device", "ramfb",
                  "-serial", "stdio", "-no-reboot", "-monitor", f"unix:{monitor},server,nowait",
                  "-drive", f"if=pflash,format=raw,readonly=on,file={CODE}", "-drive", f"if=pflash,format=raw,file={variables}",
-                 *disk, "-device", "qemu-xhci", "-device", "usb-kbd"],
+                 *disk, "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd", *stick],
                 stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT)
             try:
                 def wait_for(count: int) -> None:
@@ -173,6 +179,8 @@ def main():
     check("tapenote" not in sd_text.rsplit("fos> ls", 1)[-1].split("fsck disk2", 1)[0], "that file did not land on the boot volume", sd_text)
     fat_text = boot(IMAGE, None, (), (), None, (("ls disk2\r", "fos> "), ("run ed disk2/fatnote.txt\r", "ed> "), ("a\r", ". "), ("fatline\r", ". "), (".\r", "ed> "), ("x\r", "written"), ("ls disk2\r", "file(s)."), ("cat disk2/fatnote.txt\r", "fatline\n")), fat=True)
     check("fatnote.txt" in fat_text.rsplit("fos> ls disk2", 1)[-1] and "written disk2/fatnote.txt" in fat_text and re.search(r"^fatline$", fat_text, re.M) is not None, "a FAT32 disk (no FOSFS) is written by a tape (`fs_write`), listed and read by the shell", fat_text)
+    usb_text = boot(IMAGE, None, (), (), None, (("usb\r", "fos> "), ("disks\r", "fos> "), ("run ed disk2/stick.txt\r", "ed> "), ("a\r", ". "), ("stickline\r", ". "), (".\r", "ed> "), ("x\r", "written"), ("ls disk2\r", "file(s)."), ("cat disk2/stick.txt\r", "stickline\n")), usb=True)
+    check("USB storage" in usb_text and "disk2" in usb_text and "written disk2/stick.txt" in usb_text and re.search(r"^stickline$", usb_text, re.M) is not None, "a USB stick (xHCI, Bulk-Only) becomes a disk; a tape writes a file to it and the shell reads it back", usb_text)
     places = re.findall(r"^copied\s+\d+ bytes at sector (\d+)", sd_text, re.M)
     check(len(places) == 2 and places[0] != places[1] and "directory consistent" in sd_text, "replacing a file writes the new copy to a different extent (copy-on-write) and fsck finds the directory consistent", sd_text)
     gfx_shot = shot.with_name("gfx.ppm")

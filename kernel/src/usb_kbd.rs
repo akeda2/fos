@@ -90,7 +90,18 @@ pub fn probe_all() -> usize {
     for index in 0..xhci::count() {
         let Some(controller) = xhci::controller(index) else { continue };
         for port in 1..=controller.ports {
-            if controller.slot_in_use_for_port(port) || controller.port_status(port) & 1 == 0 {
+            if controller.slot_in_use_for_port(port) {
+                // A device enumerated here earlier: if the port says it went away (or was replugged), drop its slot, mark its
+                // disk stale (a returning stick takes its old number back) and look at the port afresh.
+                if controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port) {
+                    continue;
+                }
+                crate::usb_storage::mark_xhci_port_stale(index, port);
+                crate::usb_hub::forget_hubs_on_port(index, port);
+                release_port(controller, port, None);
+                crate::println!("USB: xHCI {index} port {port}: its device was unplugged or replugged; looking at the port again.");
+            }
+            if controller.port_status(port) & 1 == 0 {
                 continue;
             }
             for attempt in 1..=3 {
@@ -164,7 +175,21 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
     let total = usize::from(u16::from_le_bytes([configuration[2], configuration[3]])).clamp(9, configuration.len());
     controller.get_descriptor(&device, 2, 0, &mut configuration[..total])?;
     let Some((interface, endpoint, max_packet_in, interval)) = find_boot_keyboard(&configuration[..total]) else {
-        crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (class {:#04x}, {}): not a keyboard, ignored for now.", descriptor[4], xhci::speed_name(device.speed));
+        // A USB stick (Mass Storage, Bulk-Only) becomes a disk.
+        if let Some(endpoints) = crate::usb_storage::find_endpoints(&configuration[..total]) {
+            controller.set_configuration(&device, configuration[5])?;
+            return Ok(match crate::usb_storage::attach_xhci(controller_index, controller, device, endpoints) {
+                Some(disk) => {
+                    crate::println!("USB storage {vendor:04x}:{product:04x} on port {port} ({}): {}.", xhci::speed_name(device.speed), crate::storage::DiskNumber(disk));
+                    true
+                }
+                None => {
+                    controller.release_slot(device.slot);
+                    false
+                }
+            });
+        }
+        crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (class {:#04x}, {}): not a keyboard or disk, ignored for now.", descriptor[4], xhci::speed_name(device.speed));
         controller.release_slot(device.slot);
         return Ok(false);
     };

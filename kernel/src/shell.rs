@@ -73,7 +73,7 @@ fn execute(line: &str) {
         "dmesg" => crate::dmesg(),
         "nic" if rest == "rx" => crate::genet::show_rx(),
         "nic" => crate::genet::status(),
-        "usb" => crate::println!("usb: {} new keyboard(s).", crate::usb_kbd::probe_all()),
+        "usb" => crate::println!("usb: {} new keyboard(s) or disk(s).", crate::usb_kbd::probe_all()),
         "kup" if rest == "serial" || rest.starts_with("serial ") => kup_serial(rest["serial".len()..].trim()),
         "slots" => crate::slots::show(),
         "irqs" => {

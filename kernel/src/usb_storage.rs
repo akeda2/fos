@@ -14,7 +14,9 @@
 //! All transfers go through DMA frames below 4 GiB owned by this module, so the caller's
 //! buffer can be anywhere and a 32-bit EHCI is as happy as an xHCI.
 
-use crate::{ehci, memory, timer, xhci};
+use crate::{memory, timer, xhci};
+#[cfg(target_arch = "x86_64")]
+use crate::ehci;
 
 const CBW_LEN: usize = 31;
 const CSW_LEN: usize = 13;
@@ -95,6 +97,7 @@ pub fn find_endpoints(config: &[u8]) -> Option<Endpoints> {
 #[derive(Clone, Copy)]
 enum Host {
     Xhci { controller: usize, device: xhci::Device },
+    #[cfg(target_arch = "x86_64")]
     Ehci { controller: usize, target: ehci::Target, root_port: u8, in_toggle: bool, out_toggle: bool },
 }
 
@@ -146,6 +149,7 @@ impl Msc {
             return true;
         }
         match self.host {
+            #[cfg(target_arch = "x86_64")]
             Host::Ehci { controller, root_port, .. } if root_port != 0 => {
                 ehci::controller(controller).map_or(true, |c| !c.port_has_device(root_port) || c.port_connect_changed(root_port))
             }
@@ -153,10 +157,12 @@ impl Msc {
             // SuperSpeed link, and failing a working boot disk at once would be worse than a slow failure. (A replug is still
             // handled: `usb rescan` sees the change bit and checks the old handle by really using it.)
             Host::Xhci { controller, device } if device.route == 0 => xhci::controller(controller).map_or(true, |c| c.port_status(device.port) & 1 == 0),
+            #[cfg(target_arch = "x86_64")]
             Host::Ehci { controller, target, .. } if target.hub_address != 0 => {
                 ehci::controller(controller).map_or(true, |c| c.hub_child_vanished(target.hub_address, target.hub_port))
             }
             Host::Xhci { controller, device } => crate::usb_hub::child_vanished(controller, device.port, device.route),
+            #[allow(unreachable_patterns)]
             _ => false,
         }
     }
@@ -170,6 +176,7 @@ impl Msc {
                 let controller = xhci::controller(*controller).ok_or(Error::Transport)?;
                 controller.bulk_transfer(device, endpoint, physical, length as u32, max_packet).map_err(|_| Error::Transport)
             }
+            #[cfg(target_arch = "x86_64")]
             Host::Ehci { controller, target, in_toggle, out_toggle, .. } => {
                 let controller = ehci::controller(*controller).ok_or(Error::Transport)?;
                 let toggle = if data_in { in_toggle } else { out_toggle };
@@ -189,6 +196,7 @@ impl Msc {
                     controller.clear_endpoint_halt(device, endpoints.out_endpoint);
                 }
             }
+            #[cfg(target_arch = "x86_64")]
             Host::Ehci { controller, target, in_toggle, out_toggle, .. } => {
                 if let Some(controller) = ehci::controller(*controller) {
                     let _ = controller.control_transfer(target, 0x21, 0xff, 0, u16::from(endpoints.interface), &mut []);
@@ -365,6 +373,7 @@ pub fn mark_xhci_route_stale(controller_index: usize, port: u8, route: u32) {
 
 /// The EHCI counterpart: the disks behind hub `hub_address` (only the one on `hub_port`, or all of them when it is 0) went
 /// away or were replaced, so their handles are dead.
+#[cfg(target_arch = "x86_64")]
 pub fn mark_ehci_hub_stale(controller_index: usize, hub_address: u8, hub_port: u8) {
     for slot in 0..MAX_DEVICES {
         if let Some(Msc { host: Host::Ehci { controller, target, .. }, stale, .. }) = device(slot) {
@@ -387,6 +396,7 @@ pub fn attach_xhci(controller_index: usize, controller: &mut xhci::Controller, d
 
 /// `root_port` is the EHCI root port the device sits on directly (1-based), or 0 behind a hub: only a direct device's removal
 /// can be seen from the controller's port register, and that is what lets a vanished disk fail at once.
+#[cfg(target_arch = "x86_64")]
 pub fn attach_ehci(controller_index: usize, target: ehci::Target, root_port: u8, endpoints: Endpoints) -> Option<usize> {
     register(Msc { host: Host::Ehci { controller: controller_index, target, root_port, in_toggle: false, out_toggle: false }, endpoints, tag: 0, identity: [0; 36], blocks: 0, stale: false }, "USB EHCI")
 }

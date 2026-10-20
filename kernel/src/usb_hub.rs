@@ -189,7 +189,6 @@ fn scan(controller_index: usize, controller: &mut Controller, hub: &Hub) -> usiz
                 continue;
             }
             crate::println!("USB: xHCI hub port {}.{port}: its device was unplugged or replugged; looking at the port again.", hub.device.path());
-            #[cfg(target_arch = "x86_64")]
             crate::usb_storage::mark_xhci_route_stale(controller_index, hub.device.port, route);
             host::release_port(controller, hub.device.port, Some(route));
             let _ = port_feature(controller, &hub.device, REQUEST_CLEAR_FEATURE, FEATURE_C_PORT_CONNECTION, port);
