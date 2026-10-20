@@ -171,13 +171,17 @@ fn run_tape(rest: &str) {
 }
 
 /// Applies the `settings` file's `keymap us|sv` line from the boot volume (the only setting this port reads so far).
-pub fn apply_settings() {
-    let Some(volume) = storage::boot_volume() else { return };
+/// Reads the `settings` file; returns whether it says `no-msi` (leave PCIe devices on polling).
+pub fn apply_settings() -> bool {
+    let Some(volume) = storage::boot_volume() else { return false };
     let mut buffer = [0u8; 1024];
-    let Ok(Some(length)) = volume.read(b"settings", &mut buffer) else { return };
+    let Ok(Some(length)) = volume.read(b"settings", &mut buffer) else { return false };
+    let mut no_msi = false;
     for line in core::str::from_utf8(&buffer[..length]).unwrap_or("").lines() {
         let mut words = line.split_whitespace();
-        if words.next() == Some("keymap") {
+        let first = words.next();
+        no_msi |= first == Some("no-msi");
+        if first == Some("keymap") {
             match words.next().and_then(crate::usb_kbd::layout_named) {
                 Some(layout) => {
                     crate::usb_kbd::set_layout(layout);
@@ -187,6 +191,7 @@ pub fn apply_settings() {
             }
         }
     }
+    no_msi
 }
 
 fn hex(word: Option<&str>) -> Option<u64> {

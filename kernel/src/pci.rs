@@ -84,21 +84,26 @@ impl Device {
     /// +4 address low, +8 address high (64-bit capable devices only), then the 16-bit
     /// message data (the vector). Control bit 0 enables, bits 4-6 choose how many vectors
     /// (0 = one), bit 7 says the device takes a 64-bit address.
-    #[cfg(target_arch = "x86_64")]
     pub fn enable_msi(&self, vector: u8, apic_id: u32) -> bool {
+        // Physical destination mode, fixed delivery, to one local APIC.
+        self.enable_msi_message(0xfee0_0000 | u64::from(apic_id) << 12, u32::from(vector))
+    }
+
+    /// The same with an explicit message: the device writes `data` to `address` (the x86 local APIC window, the Pi 4's
+    /// PCIe MSI doorbell, a GICv2m frame).
+    pub fn enable_msi_message(&self, address: u64, data: u32) -> bool {
         let Some(capability) = self.find_capability(0x05) else { return false };
         let header = self.read32(capability);
         let control = (header >> 16) as u16;
         let data_offset = if control & (1 << 7) != 0 {
-            self.write32(capability + 8, 0); // upper address bits
+            self.write32(capability + 8, (address >> 32) as u32); // upper address bits
             capability + 12
         } else {
             capability + 8
         };
-        // Physical destination mode, fixed delivery, to one local APIC.
-        self.write32(capability + 4, 0xfee0_0000 | (apic_id << 12));
-        let data = self.read32(data_offset);
-        self.write32(data_offset, (data & 0xffff_0000) | u32::from(vector));
+        self.write32(capability + 4, address as u32);
+        let old = self.read32(data_offset);
+        self.write32(data_offset, (old & 0xffff_0000) | (data & 0xffff));
         // Enable with a single vector (clear the multiple-message-enable bits).
         let enabled = (control & !(0x7 << 4)) | 1;
         self.write32(capability, (header & 0xffff) | (u32::from(enabled) << 16));
@@ -110,8 +115,11 @@ impl Device {
     /// while the entry is written). MSI-X keeps its message table in a device BAR instead of
     /// config space: the capability gives the table's BAR and offset. Returns false if the
     /// device has no MSI-X capability or its table BAR cannot be mapped.
-    #[cfg(target_arch = "x86_64")]
     pub fn enable_msix(&self, vector: u8, apic_id: u32) -> bool {
+        self.enable_msix_message(0xfee0_0000 | u64::from(apic_id) << 12, u32::from(vector))
+    }
+
+    pub fn enable_msix_message(&self, address: u64, data: u32) -> bool {
         let Some(capability) = self.find_capability(0x11) else { return false };
         let header = self.read32(capability);
         let control = (header >> 16) as u16;
@@ -123,9 +131,9 @@ impl Device {
         self.write32(capability, (header & 0xffff) | (u32::from(control | (1 << 15) | (1 << 14)) << 16));
         let entry = (base + offset) as *mut u32;
         unsafe {
-            entry.write_volatile(0xfee0_0000 | (apic_id << 12)); // message address low
-            entry.add(1).write_volatile(0); // address high
-            entry.add(2).write_volatile(u32::from(vector)); // message data
+            entry.write_volatile(address as u32); // message address low
+            entry.add(1).write_volatile((address >> 32) as u32); // address high
+            entry.add(2).write_volatile(data); // message data
             entry.add(3).write_volatile(0); // vector control: bit 0 = masked, clear it
         }
         self.write32(capability, (header & 0xffff) | (u32::from((control | (1 << 15)) & !(1 << 14)) << 16));
@@ -133,7 +141,6 @@ impl Device {
         true
     }
 
-    #[cfg(target_arch = "x86_64")]
     pub fn disable_msix(&self) {
         if let Some(capability) = self.find_capability(0x11) {
             let header = self.read32(capability);
@@ -149,7 +156,6 @@ impl Device {
     }
 
     /// Turns MSI off again (and re-enables the INTx pin).
-    #[cfg(target_arch = "x86_64")]
     pub fn disable_msi(&self) {
         if let Some(capability) = self.find_capability(0x05) {
             let header = self.read32(capability);

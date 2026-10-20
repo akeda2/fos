@@ -36,6 +36,20 @@ const RBUF_CTRL: u64 = 0x300;
 const RBUF_ALIGN_2B: u32 = 1 << 1;
 const RBUF_TBUF_SIZE_CTRL: u64 = 0x300 + 0xb4;
 
+// INTRL2_0, the interrupt block for the default queue (Linux bcmgenet.h): status, set, clear, mask status/set/clear.
+const INTRL2_0: u64 = 0x200;
+const INTRL2_CLEAR: u64 = INTRL2_0 + 0x08;
+const INTRL2_MASK_SET: u64 = INTRL2_0 + 0x10;
+const INTRL2_MASK_CLEAR: u64 = INTRL2_0 + 0x14;
+/// RXDMA multi-buffer, packet and buffer done (bits 13..=15): which of them the hardware raises per frame is not
+/// documented, so all three are unmasked and any one wakes the foreground.
+const IRQ_RXDMA: u32 = 0b111 << 13;
+/// GIC INTID of Genet interrupt 0 (SPI 157).
+const IRQ_INTID: u32 = 32 + 157;
+
+static IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static IRQ_BITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 const UMAC: u64 = 0x800;
 const UMAC_CMD: u64 = UMAC + 0x008;
 const UMAC_MAC0: u64 = UMAC + 0x00c;
@@ -353,6 +367,7 @@ pub fn init() -> bool {
     write(RDMA_CONS_INDEX, consumed);
     write(RDMA_RING + DMA_RING_BUF_SIZE, (DESCRIPTORS as u32) << 16 | BUFFER_LENGTH as u32);
     write(RDMA_XON_XOFF_THRESH, DMA_FC_THRESH);
+    write(RDMA_RING + DMA_MBUF_DONE_THRESH, 1);
     write(RDMA_REGS + DMA_RING_CFG, 1 << DEFAULT_RING);
     for index in 0..DESCRIPTORS as u64 {
         let address = rx_buffers + index * BUFFER_LENGTH as u64;
@@ -407,8 +422,37 @@ pub fn init() -> bool {
         crate::println!("Genet: {} Mbit/s, {} duplex.", genet.speed, if genet.full_duplex { "full" } else { "half" });
     }
     unsafe { *core::ptr::addr_of_mut!(GENET) = Some(genet) };
+    // Frames wake the CPU: a level interrupt per receive event, cleared by the handler, the ring still drained by
+    // `receive` in the foreground.
+    write(INTRL2_MASK_SET, 0xffff_ffff);
+    write(INTRL2_CLEAR, 0xffff_ffff);
+    crate::gic::register(IRQ_INTID, true, interrupt);
+    write(INTRL2_MASK_CLEAR, IRQ_RXDMA);
     true
 }
+
+/// IRQ context: note which cause fired and clear it (the status bits are latched, the line is level).
+fn interrupt(_intid: u32) {
+    let status = read(INTRL2_0) & IRQ_RXDMA;
+    write(INTRL2_CLEAR, 0xffff_ffff);
+    IRQ_BITS.fetch_or(status, core::sync::atomic::Ordering::Relaxed);
+    IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // A cause that cannot be cleared would starve everything else: more than 2000 interrupts in one timer tick
+    // masks them all, and the foreground keeps draining the ring.
+    use core::sync::atomic::Ordering::Relaxed;
+    static TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static BURST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let now = crate::gic::irq_ticks();
+    if TICK.swap(now, Relaxed) != now {
+        BURST.store(0, Relaxed);
+    }
+    if BURST.fetch_add(1, Relaxed) > 2000 {
+        write(INTRL2_MASK_SET, 0xffff_ffff);
+        STORM.store(true, Relaxed);
+    }
+}
+
+static STORM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn present() -> bool {
     state().is_some()
@@ -503,6 +547,14 @@ pub fn status() {
     crate::println!("Genet {:02x?}: {}", genet.mac, if linked { "link up" } else { "no link" });
     if linked {
         crate::println!("  {} Mbit/s, {} duplex.", genet.speed, if genet.full_duplex { "full" } else { "half" });
+    }
+    crate::println!(
+        "  receive interrupts {} (causes seen {:#x}).",
+        IRQS.load(core::sync::atomic::Ordering::Relaxed),
+        IRQ_BITS.load(core::sync::atomic::Ordering::Relaxed) >> 13
+    );
+    if STORM.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::println!("  interrupt storm: receive interrupts are masked, the ring is polled.");
     }
     crate::println!("  frames sent {}, received {}, dropped {} (last status {:08x}).", genet.sent, genet.received, genet.dropped, genet.last_drop);
     crate::println!(

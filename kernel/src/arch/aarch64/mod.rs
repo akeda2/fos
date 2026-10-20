@@ -6,6 +6,7 @@ pub mod cpu;
 pub mod early;
 pub mod exceptions;
 pub mod gic;
+pub mod msi;
 pub mod paging;
 pub mod pci_config;
 pub mod pl011;

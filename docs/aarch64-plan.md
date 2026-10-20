@@ -120,9 +120,9 @@ The Pi 4 boots pftf edk2 -> our loader -> kernel, shows the boot log, runs the s
 - **DMA:** a 4 MiB non-cacheable pool (`memory::dma_pool`, serves allocations with a `below` limit) since the VL805 is assumed non-coherent.
   Works for xHCI on hardware. Never use exclusive atomics on that memory.
 - **USB:** the Pi's ports sit behind a VIA hub (2109:3431) on the VL805; `usb_hub.rs` now builds for aarch64 against `usb_kbd.rs`
-  and the keyboard is found. xHCI is polled (no PCIe MSI yet).
+  and the keyboard is found. xHCI events arrive by MSI (see "Interrupts" below).
 - **SD card (`sdhci.rs`, written 2026-10-19, tested on QEMU `sdhci-pci` only):** standard SDHCI by polling and PIO, 32-bit register accesses only (the Arasan EMMC2 at 0xFE340000, like Linux's `sdhci-iproc`, dislikes 8/16-bit ones), card reinitialised from scratch (CMD0/8/ACMD41/2/3/9/7, 4-bit, 25 MHz), SDSC and SDHC. Shell `cp SRC DST` and `cat diskN/NAME` exercise it (`make test-aarch64-boot` boots virtio and reads/writes a second SD copy). **Unverified on the Pi:** the 100 MHz base clock, 3.3 V power and the reset of a card the firmware left running.
-- **Still missing on the Pi:** Genet NIC, interrupts for xHCI, Pi 5.
+- **Still missing on the Pi:** Pi 5; interrupts for the SD card and the UART.
 
 ### Pi 4 Ethernet (Genet), written 2026-10-19, unverified on hardware
 
@@ -140,3 +140,15 @@ Genet, so only `make tapes-aarch64` and the boot test cover it; the `netcheck` t
   stop-and-wait over the console UART, whole-image CRC-32, written to the inactive slot only after it matches, then
   reset; the loader gives it one try. x86 needs the 4 KiB COM1 ring for 2 KiB frames. Tests: `make test-aarch64-kup`,
   `make test-kup-serial`. Only the Pi can verify: the BCM2711 watchdog reset, SD slot writes through EMMC2, Genet RX/DHCP.
+
+## Interrupts (2026-10-20, verified on the Pi and in QEMU)
+
+- `gic::register(intid, level, handler)` routes an SPI to CPU 0 and runs `handler(intid)` in IRQ context.
+- `arch/aarch64/msi.rs` has the x86 `msi` interface. Pi 4: the PCIe controller's MSI block, SPI 148, 32 messages latched
+  in MSI_INTR2. **The target address must be 0xF_FFFF_FFFC** (above 4 GiB): the firmware's inbound window covers the first
+  4 GiB, and with 0xFFFF_FFFC the VL805's message was taken for a memory write and never arrived. QEMU: GICv2m frame.
+- `xhci.rs` `enable_interrupts_all` (shared with x86, self-test and storm guard included) runs before IRQs are enabled in
+  `kmain`; `no-msi` in `settings` keeps polling.
+- Genet: INTRL2_0 receive-done bits 13-15 (all three fire), SPI 157, a storm guard. The foreground still drains the ring;
+  the interrupt wakes the shell's and tapes' `wfi`, so a ping now takes 0.3 ms instead of 10 ms.
+- Tests: `make test-aarch64-boot` checks MSI delivery through the GICv2m frame; the Pi checks are the `nic` and boot log lines.

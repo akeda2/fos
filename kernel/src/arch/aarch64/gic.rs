@@ -4,7 +4,7 @@
 //! are memory-mapped through `paging::map_device`. The defaults are QEMU's; MADT supplies the real ones (the Pi 4's are GICD 0xFF841000, GICC 0xFF842000) through `set_base`. Only the private peripheral interrupt of the
 //! generic physical timer (INTID 30) is wired up so far; it drives a 100 Hz counter, proving the whole IRQ path.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const QEMU_GICD: u64 = 0x0800_0000;
 pub const QEMU_GICC: u64 = 0x0801_0000;
@@ -14,6 +14,10 @@ static GICD: AtomicU64 = AtomicU64::new(QEMU_GICD);
 static GICC: AtomicU64 = AtomicU64::new(QEMU_GICC);
 static IRQ_TICKS: AtomicU64 = AtomicU64::new(0);
 static RELOAD: AtomicU64 = AtomicU64::new(0);
+/// Highest interrupt ID handled (the Pi 4's GIC-400 has 216 SPIs, INTID 32..=255 used; QEMU `virt` up to 160).
+const MAX_INTID: usize = 288;
+/// Handlers by INTID (0 = none), `fn(intid)`; they run in IRQ context before the end-of-interrupt.
+static HANDLERS: [AtomicUsize; MAX_INTID] = [const { AtomicUsize::new(0) }; MAX_INTID];
 
 pub fn set_base(distributor: u64, cpu_interface: u64) {
     GICD.store(distributor, Ordering::Relaxed);
@@ -45,6 +49,27 @@ pub fn init() {
     start_timer();
 }
 
+/// Routes shared peripheral interrupt `intid` (32 and up) to CPU 0 and calls `handler(intid)` when it fires. `level` is
+/// the trigger type the device uses (PCIe, Genet: level; GICv2m MSIs: edge). The line is enabled at once: the handler
+/// must find and clear its cause, or a level interrupt fires again forever.
+pub fn register(intid: u32, level: bool, handler: fn(u32)) {
+    if (intid as usize) >= MAX_INTID || intid < 32 {
+        return;
+    }
+    HANDLERS[intid as usize].store(handler as usize, Ordering::Release);
+    let config = 0xc00 + 4 * (intid as u64 / 16);
+    let shift = 2 * (intid % 16) + 1; // bit 1 of each 2-bit field: 1 = edge-triggered
+    let value = read(&GICD, config) & !(1 << shift);
+    write(&GICD, config, value | u32::from(!level) << shift);
+    write_byte(0x400 + intid as u64, 0xa0); // priority
+    write_byte(0x800 + intid as u64, 0x01); // target: CPU 0
+    enable(intid);
+}
+
+fn write_byte(offset: u64, value: u8) {
+    unsafe { ((GICD.load(Ordering::Relaxed) + offset) as *mut u8).write_volatile(value) };
+}
+
 fn enable(intid: u32) {
     write(&GICD, 0x100 + 4 * (intid as u64 / 32), 1 << (intid % 32));
 }
@@ -73,6 +98,11 @@ pub fn dispatch() {
         IRQ_TICKS.fetch_add(1, Ordering::Relaxed);
         let reload = RELOAD.load(Ordering::Relaxed);
         unsafe { core::arch::asm!("msr cntp_tval_el0, {}", in(reg) reload, options(nomem, nostack)) };
+    }
+    let handler = HANDLERS.get(intid as usize).map_or(0, |h| h.load(Ordering::Acquire));
+    if handler != 0 {
+        let handler: fn(u32) = unsafe { core::mem::transmute(handler) };
+        handler(intid);
     }
     write(&GICC, 0x010, iar);
 }

@@ -18,6 +18,14 @@ static mut HANDLERS: [Option<fn(usize)>; COUNT] = [None; COUNT];
 static mut CONTEXTS: [usize; COUNT] = [0; COUNT];
 static COUNTS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
+pub fn enable_msi(device: &crate::pci::Device, vector: u8) -> bool {
+    device.enable_msi(vector, apic::id())
+}
+
+pub fn enable_msix(device: &crate::pci::Device, vector: u8) -> bool {
+    device.enable_msix(vector, apic::id())
+}
+
 /// Claims a free vector for `handler(context)`.
 pub fn allocate(handler: fn(usize), context: usize) -> Option<u8> {
     unsafe {

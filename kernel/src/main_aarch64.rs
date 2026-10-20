@@ -167,6 +167,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
             None => println!("PCI: no config-space window (no MCFG, not a Pi 4)."),
         }
         println!("PCI: {} function(s) on bus 0.", pci::scan());
+        println!("MSI: {}.", msi::init());
         for device in pci::devices() {
             println!(
                 "  {:02x}:{:02x}.{} {:04x}:{:04x} {}",
@@ -198,7 +199,8 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
     }
     tape_aarch64::set_boot_info(info);
     println!("USB: {} keyboard(s) found.", usb_kbd::init());
-    shell::apply_settings();
+    let no_msi = shell::apply_settings();
+    xhci::enable_interrupts_all(no_msi);
     cpu::interrupts_enable();
     slots::confirm_boot();
     shell::run()

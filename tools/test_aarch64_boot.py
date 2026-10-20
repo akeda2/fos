@@ -179,6 +179,7 @@ def main():
     check("run: nothere: no such file." in text, "a missing tape is refused politely", text)
     check(re.search(r"^\+$", text, re.M) is not None, "keys typed on the USB keyboard reach the shell, and `keymap sv` makes the US minus key type '+'", text)
     check("PANIC" not in text and "FATAL" not in text and "EXCEPTION" not in text, "no panic, no loader fatal, no exception", text)
+    check("MSI: GICv2m frame." in text and re.search(r"xHCI \S+: MSI(-X)? on vector \S+ \(the self-test interrupt arrived\)", text) is not None, "the xHCI controller delivers its events by MSI through the GICv2m frame and the GIC", text)
     check("USB: 1 xHCI controller(s)." in text and re.search(r"USB keyboard 0627:0001 on port \d+ .*: ready\.", text) is not None, "the xHCI controller comes up and enumerates the USB keyboard", text)
     print("aarch64 boot: all checks passed")
 

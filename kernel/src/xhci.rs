@@ -17,8 +17,6 @@
 //! 4 KiB host pages. All memory comes from the physical allocator below 4 GiB, so a
 //! 32-bit-DMA controller and a 64-bit one behave the same.
 
-#[cfg(target_arch = "x86_64")]
-use crate::apic;
 use crate::{memory, paging, pci, timer};
 
 pub const MAX_CONTROLLERS: usize = 4;
@@ -412,7 +410,6 @@ fn drain(index: usize) {
 }
 
 /// The MSI handler: acknowledge the interrupt (IMAN.IP and USBSTS.EINT are write-1-to-clear), then drain.
-#[cfg(target_arch = "x86_64")]
 fn interrupt(index: usize) {
     let state = unsafe { (*core::ptr::addr_of!(EVENTS))[index] };
     if !state.ready {
@@ -451,7 +448,6 @@ fn interrupt(index: usize) {
 /// completion must raise the interrupt); interrupt moderation is set to 1 ms so a high-speed isochronous
 /// stream's 8,000 completions per second cost about 1,000 interrupts. A controller that fails stays in
 /// the polled mode, where the foreground drains the ring itself as before.
-#[cfg(target_arch = "x86_64")]
 pub fn enable_interrupts_all(no_msi: bool) {
     for index in 0..count() {
         let Some(controller) = controller(index) else { continue };
@@ -462,6 +458,7 @@ pub fn enable_interrupts_all(no_msi: bool) {
         // The NEC uPD720200 on clock1 (1033:0194) froze the machine at the first doorbell write after MSI was enabled while the
         // boot stick was attached to it (an old kernel enabled MSI fine with no disk on it; not understood). A controller that
         // carries a disk stays polled: the foreground drains its ring, as it did before MSI.
+        #[cfg(target_arch = "x86_64")]
         if crate::usb_storage::uses_xhci(index) && controller.pci.vendor == 0x1033 {
             crate::println!("xHCI {:02x}:{:02x}.{}: a USB disk is on this NEC controller; events stay polled (MSI froze it).", controller.pci.bus, controller.pci.device, controller.pci.function);
             continue;
@@ -693,7 +690,6 @@ impl Controller {
     /// the plain-MSI self-test fails or the capability is missing (QEMU's xHCI has only MSI-X; the NEC
     /// uPD720200 on the Sandy Bridge machine has both but only MSI-X works, as Linux's xhci also tries
     /// it first). Returns the vector, or why the controller stays polled.
-    #[cfg(target_arch = "x86_64")]
     pub fn enable_interrupts(&mut self) -> Result<u8, &'static str> {
         let msi = self.pci.find_capability(0x05).is_some();
         let msix = self.pci.find_capability(0x11).is_some();
@@ -706,7 +702,7 @@ impl Controller {
                 continue;
             }
             let Some(vector) = crate::msi::allocate(interrupt, self.index) else { return Err("no free MSI vector") };
-            let enabled = if use_msix { self.pci.enable_msix(vector, apic::id()) } else { self.pci.enable_msi(vector, apic::id()) };
+            let enabled = if use_msix { crate::msi::enable_msix(&self.pci, vector) } else { crate::msi::enable_msi(&self.pci, vector) };
             if !enabled {
                 crate::msi::release(vector);
                 reason = "could not enable MSI";
