@@ -61,14 +61,16 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST cmp A B fsck [diskN] echo TEXT keymap us|sv run NAME [ARGS] [&N] ps kill N|NAME|all\ndmesg irqs usb nic [rx] slots debug kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!(
+            "help version uptime mem disks ls [diskN] cat [diskN/]NAME write NAME TEXT\nrm NAME cp SRC DST cmp A B fsck [diskN] echo TEXT sleep N clear keymap us|sv\nrun NAME [ARGS] [&N] ps kill N|NAME|all dmesg irqs usb nic [rx] slots debug\nkup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up)"
+        ),
         "start" => start_script(true),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
             crate::println!("up {}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
         }
-        "mem" => {
+        "mem" | "memory" => {
             let stats = memory::stats();
             let mib = |frames: u64| frames * memory::FRAME / (1024 * 1024);
             crate::println!("Physical memory: {} MiB managed, {} MiB free.", mib(stats.frames), mib(stats.free));
@@ -87,7 +89,7 @@ fn execute(line: &str) {
         }
         "ls" => list(rest),
         "cat" => cat(rest),
-        "cp" => copy(rest),
+        "cp" | "copy" => copy(rest),
         "cmp" => compare(rest),
         "fsck" => match volume(rest) {
             Some(volume) => fosfs::report(&volume),
@@ -121,7 +123,7 @@ fn execute(line: &str) {
             crate::println!("kernel-update {}", crate::netservice::kernel_update_enabled());
             crate::slots::show();
         }
-        "irqs" => {
+        "irqs" | "irqstat" => {
             let (uart, dropped) = crate::arch::aarch64::pl011::interrupt_counts();
             crate::println!("timer {}, uart {uart} (bytes dropped {dropped}), sd {}, genet {}", crate::gic::irq_ticks(), crate::sdhci::interrupt_count(), crate::genet::interrupt_count());
             for vector in 0..crate::msi::COUNT as u8 {
@@ -130,10 +132,21 @@ fn execute(line: &str) {
                 }
             }
         }
-        "reset" => {
+        "reset" | "reboot" => {
             crate::println!("Restarting.");
             crate::arch::aarch64::power::reset()
         }
+        "write" => write_file(rest),
+        "rm" => remove_file(rest),
+        "sleep" => {
+            let seconds = rest.parse::<u64>().unwrap_or(1).min(60);
+            let end = timer::ticks() + seconds * timer::TICK_HZ;
+            while timer::ticks() < end {
+                crate::cpu::sleep();
+            }
+            crate::println!("Slept {seconds} s.");
+        }
+        "clear" => crate::print(format_args!("\x1b[2J")),
         "peek" => peek(rest),
         "poke" => poke(rest),
         other => crate::println!("{other}: unknown command (try `help`)."),
@@ -154,6 +167,30 @@ fn locate(name: &str) -> Option<(fosfs::Volume, &str)> {
     match name.split_once('/') {
         Some((disk, file)) => Some((volume(disk)?, file)),
         None => Some((storage::boot_volume()?, name)),
+    }
+}
+
+/// `write NAME TEXT`: a small text file (NAME or diskN/NAME), as on x86.
+fn write_file(rest: &str) {
+    let (name, text) = rest.split_once(' ').map_or((rest, ""), |(name, text)| (name, text.trim_start()));
+    let Some((volume, file)) = locate(name).filter(|_| !name.is_empty()) else {
+        return crate::println!("Usage: write NAME TEXT   (NAME or diskN/NAME; a FOSFS volume)");
+    };
+    match volume.write(file.as_bytes(), text.as_bytes()) {
+        Ok(()) => crate::println!("Wrote {} bytes to {file}.", text.len()),
+        Err(error) => crate::println!("write: {error:?}"),
+    }
+}
+
+/// `rm NAME`: removes a file from a FOSFS volume (NAME or diskN/NAME).
+fn remove_file(name: &str) {
+    let Some((volume, file)) = locate(name).filter(|_| !name.is_empty()) else {
+        return crate::println!("Usage: rm NAME   (NAME or diskN/NAME; a FOSFS volume)");
+    };
+    match volume.remove(file.as_bytes()) {
+        Ok(true) => crate::println!("Removed {file}."),
+        Ok(false) => crate::println!("rm: no such file."),
+        Err(error) => crate::println!("rm: {error:?}"),
     }
 }
 
