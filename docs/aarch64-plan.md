@@ -141,7 +141,7 @@ Genet, so only `make tapes-aarch64` and the boot test cover it; the `netcheck` t
   reset; the loader gives it one try. x86 needs the 4 KiB COM1 ring for 2 KiB frames. Tests: `make test-aarch64-kup`,
   `make test-kup-serial`. Only the Pi can verify: the BCM2711 watchdog reset, SD slot writes through EMMC2, Genet RX/DHCP.
 
-## Interrupts (2026-10-20, verified on the Pi and in QEMU)
+## Interrupts (2026-10-20, verified on the Pi, USB keyboard included, and in QEMU)
 
 - `gic::register(intid, level, handler)` routes an SPI to CPU 0 and runs `handler(intid)` in IRQ context.
 - `arch/aarch64/msi.rs` has the x86 `msi` interface. Pi 4: the PCIe controller's MSI block, SPI 148, 32 messages latched
