@@ -1482,57 +1482,11 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "ls" | "cat" | "write" | "rm" | "cp" | "cmp") {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp") {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[fosfor_shell::files::COMMANDS], command);
         return;
     }
     match word {
-        "help" if words.clone().next().is_some() => {
-            // `help NAME` shows the help screen a tape file carries (the same text as `NAME help`).
-            crate::tape::show_help(words.next().unwrap_or(""));
-        }
-        "help" => {
-            crate::println!("help      this list (help NAME or NAME --help: a tape's usage)");
-            crate::println!("about     what this is");
-            crate::println!("memory    physical memory statistics");
-            crate::println!("pci       list PCI functions (pci read|write B:D.F ... reaches config space)");
-            crate::println!("cpuinfo bootinfo memmap irqstat   what the CPU, loader and firmware report");
-            crate::println!("hexdump ADDRESS [LENGTH]   dump mapped memory; io r8|w8.. PORT; mmio r32|w32.. ADDR");
-            crate::println!("clear     clear the screen");
-            crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
-            crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
-            crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
-            crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
-            crate::println!("sector diskN LBA [COUNT]   raw read-only dump of disk sectors (a GPT header, the slot metadata)");
-            crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
-            crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
-            crate::println!("format diskN exfat [LABEL]    erase a disk and make it one exFAT volume for PCs");
-            crate::println!("grow diskN        make a disk's FOSFS volume fill the disk (files are kept)");
-            crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
-            crate::println!("copy SRC NAME DST [NEWNAME]   copy a file between volumes (diskN or @LABEL;");
-            crate::println!("          a FAT32/exFAT disk too, by its diskN: ls cat write rm copy)");
-            crate::println!("tapesync [HOST] [apply]   pull newer tapes from one or all peers (needs the synckey file)");
-            crate::println!("ls [diskN]        list FOSFS files (a FAT32/exFAT disk too, if named)");
-            crate::println!("start     run the start file again (as at boot)");
-            crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");
-            crate::println!("cat [diskN] NAME  show a file");
-            crate::println!("write [diskN] NAME TEXT   create or replace a file");
-            crate::println!("rm [diskN] NAME   delete a file");
-            crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
-            crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");
-            crate::println!("run NAME [ARGS]   load a tape from FOSFS and run it");
-            crate::println!("run NAME ARGS &N  run it in the background on NIC N; `&0` no NIC; `ps`, `kill N|NAME|all`");
-            crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
-            crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
-            crate::println!("uptime    time since the timer started; sleep N waits N seconds");
-            crate::println!("power    [N]  how much of the time the CPU slept in hlt (N: sample N s at the prompt)");
-            crate::println!("power hwp [performance|balanced|power]  CPU frequency scaling (Intel HWP)");
-            crate::println!("dmesg     the boot log");
-            crate::println!("shutdown  power off");
-            crate::println!("reset     restart through the firmware (reboot is the same)");
-            crate::println!("debug ... status | slots | crash | hang");
-            crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
-        }
         "about" => {
             crate::println!("Fosfor OS (fos) is a small educational 64-bit x86 operating system.");
             crate::println!("One kernel, booted by a UEFI loader or by the BIOS boot code.");
@@ -2788,6 +2742,42 @@ fn label_command(mut words: core::str::SplitWhitespace) {
         Ok(()) => crate::println!("disk{number} is now @{wanted}."),
         Err(error) => crate::println!("label: {error:?}"),
     }
+}
+
+/// The x86 commands that are not in the shared tables yet (docs/shell.md), listed by `help` after the shared ones.
+pub(crate) fn help_extra() {
+    crate::println!("copy SRC NAME DST [NEWNAME]   copy a file, also between machines (diskN, @LABEL, esp; FAT too)");
+    crate::println!("about     what this is");
+    crate::println!("memory    physical memory statistics");
+    crate::println!("pci       list PCI functions (pci read|write B:D.F ... reaches config space)");
+    crate::println!("cpuinfo bootinfo memmap irqstat   what the CPU, loader and firmware report");
+    crate::println!("hexdump ADDRESS [LENGTH]   dump mapped memory; io r8|w8.. PORT; mmio r32|w32.. ADDR");
+    crate::println!("clear     clear the screen");
+    crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
+    crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
+    crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
+    crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
+    crate::println!("sector diskN LBA [COUNT]   raw read-only dump of disk sectors (a GPT header, the slot metadata)");
+    crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
+    crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
+    crate::println!("format diskN exfat [LABEL]    erase a disk and make it one exFAT volume for PCs");
+    crate::println!("grow diskN        make a disk's FOSFS volume fill the disk (files are kept)");
+    crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
+    crate::println!("tapesync [HOST] [apply]   pull newer tapes from one or all peers (needs the synckey file)");
+    crate::println!("start     run the start file again (as at boot)");
+    crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");
+    crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
+    crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");
+    crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
+    crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
+    crate::println!("uptime    time since the timer started; sleep N waits N seconds");
+    crate::println!("power    [N]  how much of the time the CPU slept in hlt (N: sample N s at the prompt)");
+    crate::println!("power hwp [performance|balanced|power]  CPU frequency scaling (Intel HWP)");
+    crate::println!("dmesg     the boot log");
+    crate::println!("shutdown  power off");
+    crate::println!("reset     restart through the firmware (reboot is the same)");
+    crate::println!("debug ... status | slots | crash | hang");
+    crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
 }
 
 fn parse_number(word: &str) -> Option<u64> {

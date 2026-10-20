@@ -209,7 +209,7 @@ def main():
     check("Slept 1 s." in cmd_text and "kernel-update" in cmd_text and "slot sizes (sectors)" in cmd_text and "Physical memory:" in cmd_text, "`sleep`, `debug` (kernel-update and slots) and the x86 names `memory`/`irqstat` work", cmd_text)
     grow_text = boot(IMAGE, None, ("write keep.txt hello grown", "grow disk1", "grow disk1", "cat keep.txt", "help calc", "help hello"), big=True)
     check("grown from" in grow_text and "files are unchanged" in grow_text and "already fills the disk" in grow_text and "hello grown" in grow_text, "`grow disk1` grows the FOSFS volume into the free space, a second one says so, and the files are kept", grow_text)
-    check("help: hello has no help screen." in grow_text or "usage" in grow_text.lower() or "calc" in grow_text.split("help calc", 1)[-1], "`help NAME` shows a tape's help or says it has none without running it", grow_text)
+    check("help: hello has no help screen" in grow_text or "usage" in grow_text.lower() or "calc" in grow_text.split("help calc", 1)[-1], "`help NAME` shows a tape's help or says it has none without running it", grow_text)
     esp_text = boot(IMAGE, None, ("write esp/config.txt arm_64bit=1", "ls esp", "cat esp/config.txt", "cp esp/config.txt copy.txt", "cat copy.txt", "cp readme.txt esp/readme.txt", "cat esp/readme.txt", "rm esp/config.txt", "ls esp"))
     check("Wrote 11 bytes to esp/config.txt." in esp_text and re.search(r"^arm_64bit=1$", esp_text, re.M) is not None and "Removed esp/config.txt." in esp_text, "the boot disk's EFI System Partition is reachable as `esp/NAME` (write, cat, rm)", esp_text)
     path_text = boot(IMAGE, None, ("disk1/hello", "ed esp/Cfg.txt"))

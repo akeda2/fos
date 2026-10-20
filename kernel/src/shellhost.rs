@@ -96,6 +96,11 @@ impl Host for KernelHost {
         true
     }
 
+    fn help_extra(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        crate::term::help_extra();
+    }
+
     fn tape_help(&mut self, reference: &str) -> bool {
         const SIZE: usize = 512 * 1024;
         let mut shown = false;

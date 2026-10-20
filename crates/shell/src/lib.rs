@@ -81,6 +81,8 @@ pub trait Host {
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError>;
     /// Runs `run` with a scratch buffer of `size` bytes; false if there is no memory for it.
     fn with_buffer(&mut self, size: usize, run: &mut dyn FnMut(&mut dyn Host, &mut [u8])) -> bool;
+    /// Extra `help` lines for commands a port implements outside the tables (printed after the table's names).
+    fn help_extra(&mut self) {}
     /// Prints the help screen of the tape file `reference` (without running it); false if it has none.
     fn tape_help(&mut self, _reference: &str) -> bool {
         false
@@ -155,11 +157,12 @@ fn help(host: &mut dyn Host, tables: &[&[Command]], topic: &str) {
             column += command.name.len() + 1;
         }
         sayln!(host);
+        host.help_extra();
         sayln!(host, "A tape runs as `NAME [ARGS]` or `run NAME [ARGS]`; `run NAME ARGS &N` runs it in the background on NIC N.");
     } else if let Some(command) = find(tables, topic) {
         sayln!(host, "{}", command.usage);
         sayln!(host, "  {}", command.summary);
     } else if !host.tape_help(topic) {
-        sayln!(host, "help: {topic} is no command and has no help screen.");
+        sayln!(host, "help: {topic} has no help screen (and is no command).");
     }
 }

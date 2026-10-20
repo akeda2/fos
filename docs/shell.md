@@ -14,5 +14,5 @@ One shell core for every port: `crates/shell` (`fosfor_shell`, `no_std`, host-te
   a line that is no command (tape names, `PATH/NAME`).
 
 Status: both shells use the core for the file commands (`ls cat write rm cp cmp`). x86 keeps its own `copy` (peers,
-NETFS) and `fsck`; its bare names are pinned to the boot disk (`shellhost.rs` `pin`). Next: `help`, `run`/tape names and
+NETFS) and `fsck`; its bare names are pinned to the boot disk (`shellhost.rs` `pin`). `help` is shared too (x86 lists its not-yet-shared commands through `Host::help_extra`). Next: `run`/tape names and
 scripts, then the common hardware-free commands (`sleep`, `uptime`, `keymap`, `date`, `ps`, `kill`). The extra Pi commands move to the shared table when x86 has them.
