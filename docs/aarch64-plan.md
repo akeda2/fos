@@ -87,8 +87,16 @@ buffer (outside kernel RAM, mapped non-cacheable by `paging::map_framebuffer`). 
 (colour bars). **Tape ABI 20** (append-only): `gfx_screens` and `gfx_info_on`/`open_on`/`close_on`/`fill_on`/`blit_on` with a screen
 number; the old `gfx_*` calls are screen 0. Tape side: `tape_rt::gfx_screens`, `gfx_*_on`, and `audio_screen::Screen::on(index)`;
 `gfxcheck screen=N` exercises it. The kernel blanks screen 1 when a tape ends. Verified on the Pi: `gfxcheck screen=1` draws correctly
-(colours right) on the second screen, console on screen 0 untouched. x86 reports 1 screen. Not done: a tape that uses both screens
-(the dual clock + gonio), and screen sizes that differ (a tape sizes its buffers from `gfx_info_on`).
+(colours right) on the second screen, console on screen 0 untouched. x86 reports 1 screen. Not done: screen sizes that differ (a tape
+sizes its buffers from `gfx_info_on`).
+
+**Two tapes at once (2026-10-20).** `run A args + B args` runs two tapes side by side on core 0 (`tape_aarch64.rs`, `run_two`).
+Not a second core: the kernel is single-core and its state is unlocked. Each tape gets a region (`load_slot`), its own stack and a
+`TapeApi`; `fos_task_switch` (asm, x19-x30 + d8-d15) switches tasks when a tape calls `wait_for_event` (`tape_rt::idle`), and the CPU
+sleeps only once every live tape has idled. Only the focused tape gets keys; Tab moves the focus, Esc ends the focused tape. A tape
+that never idles starves the other. `+` is a second tape only if the next word loads as a tape (`calc 3 4 + 6 *` still works).
+`clock`, `gonio` and `ltas` take `screen=N`. Verified in QEMU (`test-aarch64-boot`: two clocks, Tab, Esc) and on the Pi 4:
+`run clock screen=0 + gonio screen=1` with USB audio capture, no stutter or lag. The Tab focus switch itself is only checked by hand.
 
 ## Pi 4 SD card (M6, first cut)
 
