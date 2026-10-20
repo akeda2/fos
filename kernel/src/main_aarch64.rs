@@ -160,6 +160,7 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
             cpu::sleep();
         }
         println!("GICv2 at {:#x}/{:#x}: {} timer interrupts (INTID 30) in 100 ms, expected about 10.", gic::bases().0, gic::bases().1, gic::irq_ticks());
+        arch::aarch64::pl011::enable_interrupt(gic::bases().0 == PI4_GIC_DISTRIBUTOR);
     }
     if info.magic == BOOT_INFO_MAGIC {
         match arch::aarch64::pci_config::init(info.acpi_rsdp) {

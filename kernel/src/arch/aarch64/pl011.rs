@@ -3,7 +3,7 @@
 //! The firmware has already set the baud rate and enabled the UART, so the kernel just writes; a bounded wait on TXFF
 //! keeps a UART that never drains from hanging the kernel.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// QEMU `virt`'s PL011. A real board's address is found from the firmware's SPCR/DT tables (the Pi 4's UART0 is
 /// 0xFE201000 behind the firmware's own mapping); `acpi::spcr_uart` supplies it at boot (`set_base`).
@@ -73,7 +73,8 @@ pub fn set_baud(baud: u32) -> bool {
         register(0x28).write_volatile(new_fbrd);
         register(0x2c).write_volatile(register(0x2c).read_volatile());
         register(0x30).write_volatile(control);
-        while read_byte().is_some() {}
+        while fifo_read().is_some() {}
+        TAIL.store(HEAD.load(Ordering::Relaxed), Ordering::Relaxed);
     }
     true
 }
@@ -101,11 +102,80 @@ impl core::fmt::Write for Serial {
     }
 }
 
-/// The next received byte, if one is waiting (FR bit 4 RXFE: receive FIFO empty; DR holds the byte in its low 8 bits).
-pub fn read_byte() -> Option<u8> {
-    let base = BASE.load(Ordering::Relaxed);
-    if unsafe { core::ptr::read_volatile((base + 0x18) as *const u32) } & 1 << 4 != 0 {
-        return None;
+/// Received bytes the interrupt handler has taken out of the 16-byte FIFO (single producer, single consumer).
+const RING_SIZE: usize = 4096;
+static mut RING: [u8; RING_SIZE] = [0; RING_SIZE];
+static HEAD: AtomicUsize = AtomicUsize::new(0);
+static TAIL: AtomicUsize = AtomicUsize::new(0);
+static INTERRUPT: AtomicBool = AtomicBool::new(false);
+static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The Pi 4's UART0 is SPI 121, QEMU `virt`'s PL011 SPI 1.
+const PI4_INTID: u32 = 32 + 121;
+const QEMU_INTID: u32 = 32 + 1;
+const IMSC: u64 = 0x38;
+const ICR: u64 = 0x44;
+const IFLS: u64 = 0x34;
+/// Interrupt mask bits: receive (4) and receive timeout (6, the FIFO holds bytes that stopped coming).
+const RX_INTERRUPTS: u32 = 1 << 4 | 1 << 6;
+
+/// Receives through the interrupt: the FIFO is emptied into a 4 KiB ring as bytes arrive, so a busy foreground (a flash
+/// write, a screen redraw) no longer overruns the 16-byte FIFO, and `wfi` wakes on a typed key. Needs the GIC.
+pub fn enable_interrupt(pi4: bool) {
+    unsafe {
+        register(IFLS).write_volatile(0); // receive trigger at 1/8 full (2 bytes)
+        register(ICR).write_volatile(0x7ff);
     }
-    Some(unsafe { core::ptr::read_volatile(base as *const u32) } as u8)
+    crate::gic::register(if pi4 { PI4_INTID } else { QEMU_INTID }, true, interrupt);
+    INTERRUPT.store(true, Ordering::Release);
+    unsafe { register(IMSC).write_volatile(register(IMSC).read_volatile() | RX_INTERRUPTS) };
+}
+
+fn interrupt(_intid: u32) {
+    INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+    while let Some(byte) = fifo_read() {
+        let head = HEAD.load(Ordering::Relaxed);
+        let next = (head + 1) % RING_SIZE;
+        if next == TAIL.load(Ordering::Acquire) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        unsafe { (*core::ptr::addr_of_mut!(RING))[head] = byte };
+        HEAD.store(next, Ordering::Release);
+    }
+    unsafe { register(ICR).write_volatile(0x7ff) };
+}
+
+/// (interrupts taken, bytes dropped because the ring was full).
+pub fn interrupt_counts() -> (u64, u64) {
+    (INTERRUPTS.load(Ordering::Relaxed), DROPPED.load(Ordering::Relaxed))
+}
+
+fn fifo_read() -> Option<u8> {
+    if unsafe { register(0x18).read_volatile() } & 1 << 4 != 0 {
+        return None; // FR bit 4 RXFE: receive FIFO empty
+    }
+    Some(unsafe { register(0).read_volatile() } as u8)
+}
+
+/// The next received byte, if one is waiting (the ring once the interrupt is on, else the FIFO itself).
+pub fn read_byte() -> Option<u8> {
+    if !INTERRUPT.load(Ordering::Acquire) {
+        return fifo_read();
+    }
+    let tail = TAIL.load(Ordering::Relaxed);
+    if tail == HEAD.load(Ordering::Acquire) {
+        // A byte below the FIFO trigger level raises no interrupt (QEMU has no receive timeout); with interrupts off the
+        // handler cannot slip newer bytes in ahead of it.
+        let was = crate::cpu::interrupts_save_and_disable();
+        let byte = if tail == HEAD.load(Ordering::Acquire) { fifo_read() } else { None };
+        crate::cpu::interrupts_restore(was);
+        if byte.is_some() || tail == HEAD.load(Ordering::Acquire) {
+            return byte;
+        }
+    }
+    let byte = unsafe { (*core::ptr::addr_of!(RING))[tail] };
+    TAIL.store((tail + 1) % RING_SIZE, Ordering::Release);
+    Some(byte)
 }

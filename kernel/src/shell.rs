@@ -30,7 +30,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST echo TEXT keymap us|sv run NAME [ARGS]\ndmesg usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST echo TEXT keymap us|sv run NAME [ARGS]\ndmesg irqs usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -71,6 +71,15 @@ fn execute(line: &str) {
         "usb" => crate::println!("usb: {} new keyboard(s).", crate::usb_kbd::probe_all()),
         "kup" if rest == "serial" || rest.starts_with("serial ") => kup_serial(rest["serial".len()..].trim()),
         "slots" => crate::slots::show(),
+        "irqs" => {
+            let (uart, dropped) = crate::arch::aarch64::pl011::interrupt_counts();
+            crate::println!("timer {}, uart {uart} (bytes dropped {dropped}), sd {}, genet {}", crate::gic::irq_ticks(), crate::sdhci::interrupt_count(), crate::genet::interrupt_count());
+            for vector in 0..crate::msi::COUNT as u8 {
+                if crate::msi::count(vector) != 0 {
+                    crate::println!("msi {vector}: {}", crate::msi::count(vector));
+                }
+            }
+        }
         "reset" => {
             crate::println!("Restarting.");
             crate::arch::aarch64::power::reset()

@@ -159,3 +159,14 @@ Genet, so only `make tapes-aarch64` and the boot test cover it; the `netcheck` t
 port) for the transfer; the kernel restores the firmware's speed afterwards, also when no sender starts within 30 s. The UART
 clock is derived from the firmware's 115200 divisors. On the Pi: **921600 works** (375 KB in 5.5 s instead of 33 s); 1.5 and
 3 Mbaud got no answer (host adapter or line, not investigated). x86 COM1 still runs at 115200 only.
+
+## UART and SD interrupts
+
+- **UART (`pl011.rs`)**: the receive and receive-timeout interrupts (Pi 4 SPI 121, QEMU SPI 1) empty the 16-byte FIFO into a
+  4 KiB ring, so a busy foreground (flash write, redraw) no longer overruns it. A byte below the trigger level raises no
+  interrupt on QEMU, so `read_byte` also polls the FIFO (interrupts off, to keep order) when the ring is empty.
+- **SD (`sdhci.rs`)**: Pi 4 only (EMMC2 SPI 126). Status bits are still polled; a wait longer than 50 us sleeps in `wfi` until the
+  controller raises its line (the handler masks the signal enable again). QEMU keeps spinning.
+- `irqs` shell command: counts for timer, UART, SD, Genet and MSI vectors.
+- Verified on the Pi (serial KUP at 921600 into slot 0): `irqs` shows UART, SD, Genet and xHCI MSI counts rising; `ls` works;
+  QEMU aarch64 boot, faults and serial-KUP tests pass.

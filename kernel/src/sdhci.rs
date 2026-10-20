@@ -7,7 +7,8 @@
 //! registers share one word (0x0C) and are written together, command in the upper half, which also starts the command.
 //!
 //! No DMA: data moves through the buffer data port (0x20), so there are no cache or bus-address questions, and the
-//! controller's interrupts stay masked (status bits are polled). The card is reinitialised from scratch (reset, 400 kHz
+//! controller's interrupts only wake the CPU (the Pi's EMMC2 SPI 126: a wait that outlasts a short spin sleeps in `wfi`
+//! until the controller raises its line; status bits are still read by polling, and the timer tick is the backstop). The card is reinitialised from scratch (reset, 400 kHz
 //! clock, CMD0/8/55/41/2/3/9/7/ACMD6) rather than adopting what the firmware left: the sequence is short and does not
 //! depend on state the firmware may have changed. SDSC cards (byte addressing) are handled; a card the firmware
 //! switched to 1.8 V signalling would need a power cycle, which this driver does not do (it reports the failure).
@@ -23,6 +24,13 @@ const PI4_EMMC2: u64 = 0xfe34_0000;
 const PI4_GIC_DISTRIBUTOR: u64 = 0xff84_1000;
 /// The EMMC2 clock the firmware leaves, in MHz; its capabilities register does not give one.
 const PI4_BASE_MHZ: u32 = 100;
+/// EMMC2's GIC interrupt (SPI 126).
+const PI4_INTID: u32 = 32 + 126;
+/// A wait shorter than this spins; a longer one sleeps until the interrupt.
+const SPIN_MICROS: u64 = 50;
+
+static INTERRUPTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WAKE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 const SDMA: usize = 0x00;
 const BLOCK: usize = 0x04;
@@ -177,6 +185,7 @@ impl Controller {
 
     fn wait_status(&self, bit: u32) -> Result<(), Error> {
         let start = timer::micros();
+        let wakes = WAKE_BASE.load(core::sync::atomic::Ordering::Relaxed) == self.base;
         loop {
             let status = self.read(INT_STATUS);
             if status & INT_ERROR != 0 {
@@ -187,6 +196,16 @@ impl Controller {
             }
             if timer::micros() - start > 500_000 {
                 return Err(Error::Timeout);
+            }
+            if wakes && timer::micros() - start > SPIN_MICROS {
+                // Raise the line for this bit (or an error); with interrupts masked the check and the sleep cannot miss it,
+                // as `wfi` wakes on a pending interrupt whether or not it is taken.
+                let was = crate::cpu::interrupts_save_and_disable();
+                self.write(INT_SIGNAL, bit | INT_ERROR);
+                if self.read(INT_STATUS) & (bit | INT_ERROR) == 0 {
+                    crate::cpu::sleep();
+                }
+                crate::cpu::interrupts_restore(was);
             }
         }
     }
@@ -295,6 +314,20 @@ impl Controller {
     }
 }
 
+/// IRQ context: drop the signal enable so the level line falls (the status bits stay for the poller).
+fn interrupt(_intid: u32) {
+    INTERRUPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let base = WAKE_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    if base != 0 {
+        unsafe { ((base + INT_SIGNAL as u64) as *mut u32).write_volatile(0) };
+    }
+}
+
+/// How many SD interrupts have been taken.
+pub fn interrupt_count() -> u64 {
+    INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn bring_up(base: u64, slot: usize, pi4: bool) -> Option<Drive> {
     crate::paging::map_device(base, 0x1000);
     let mut controller = Controller { base, rca: 0, block_addressed: true };
@@ -317,6 +350,10 @@ fn bring_up(base: u64, slot: usize, pi4: bool) -> Option<Drive> {
                 return None;
             }
             unsafe { (*core::ptr::addr_of_mut!(CONTROLLERS))[slot] = Some(controller) };
+            if pi4 {
+                WAKE_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
+                crate::gic::register(PI4_INTID, true, interrupt);
+            }
             Some(Drive { index: slot, sectors })
         }
         Err(error) => {

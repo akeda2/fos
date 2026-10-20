@@ -454,6 +454,11 @@ fn interrupt(_intid: u32) {
 
 static STORM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Receive interrupts taken so far.
+pub fn interrupt_count() -> u64 {
+    IRQS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn present() -> bool {
     state().is_some()
 }
