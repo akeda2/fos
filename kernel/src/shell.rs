@@ -155,6 +155,10 @@ fn execute(line: &str) {
         "clear" => crate::print(format_args!("\x1b[2J")),
         "peek" => peek(rest),
         "poke" => poke(rest),
+        // `diskN/NAME ARGS`, `@LABEL/NAME` and `esp/NAME` run that tape without `run`, as on x86.
+        other if other.contains('/') => run_tape(line),
+        // A dotless file name is taken for a tape (`ed NAME`), as on x86.
+        other if !other.contains('.') && storage::volume_with_file(other.as_bytes()).is_some() => run_tape(line),
         other => crate::println!("{other}: unknown command (try `help`)."),
     }
 }

@@ -173,7 +173,14 @@ fn parse_filename<'a>(args_ptr: usize, args_len: u32) -> Option<&'a [u8]> {
 /// the actual disk selection.
 fn valid_reference(reference: &[u8]) -> bool {
     match reference.iter().position(|&byte| byte == b'/') {
-        Some(slash) => is_disk_selector(&reference[..slash]) && valid_name(&reference[slash + 1..]),
+        Some(slash) => {
+            let name = &reference[slash + 1..];
+            // `esp/NAME` is a FAT volume: its names may be upper case (config.txt, RPI_EFI.fd).
+            (is_disk_selector(&reference[..slash]) && valid_name(name))
+                || (!name.is_empty()
+                    && name.len() <= 16
+                    && name.iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-')))
+        }
         None => valid_name(reference),
     }
 }
@@ -184,6 +191,9 @@ fn valid_reference(reference: &[u8]) -> bool {
 fn is_disk_selector(word: &[u8]) -> bool {
     if let Some(label) = word.strip_prefix(b"@") {
         return valid_name(label); // a volume label has the same shape as a file name
+    }
+    if word == b"esp" {
+        return true;
     }
     match word.strip_prefix(b"disk") {
         Some(suffix) => !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit),

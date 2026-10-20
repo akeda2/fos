@@ -85,14 +85,14 @@ pub fn load(name: &str) -> Result<u64, &'static str> {
 
 /// `load` into region `slot` (0 and 1 for `run A + B`, then one per service), so several tapes can be resident together.
 pub fn load_slot(name: &str, slot: usize) -> Result<u64, &'static str> {
-    let volume = storage::boot_volume().ok_or("no boot volume")?;
     let staging = memory::allocate_contiguous(STAGE_BYTES as u64 / memory::FRAME, None).ok_or("no memory for staging")?;
     let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, STAGE_BYTES) };
     let outcome = (|| {
-        let length = match volume.read(name.as_bytes(), buffer) {
-            Ok(Some(length)) => length,
-            Ok(None) => return Err("no such file"),
-            Err(_) => return Err("cannot read the file (over 4 MiB?)"),
+        // A bare name is on the boot volume; diskN/NAME, @LABEL/NAME and esp/NAME go through the tape file calls.
+        let length = match crate::tape_fs::read(name.as_bytes(), buffer) {
+            length if length >= 0 => length as usize,
+            FS_NOT_FOUND => return Err("no such file"),
+            _ => return Err("cannot read the file (over 4 MiB?)"),
         };
         let image = &buffer[..length];
         let span = elf::span(image).map_err(|_| "not a tape for this CPU (ELF check failed)")? as u64;
