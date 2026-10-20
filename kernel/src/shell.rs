@@ -42,8 +42,13 @@ pub fn run() -> ! {
                     crate::print(format_args!("fos> "));
                 }
             }
+            // Background tapes (`run NAME &N`) get a pass; the CPU sleeps only when they are all idle.
             // The 100 Hz timer interrupt wakes this at least every 10 ms.
-            None => crate::cpu::sleep(),
+            None => {
+                if !crate::tasks::pass() {
+                    crate::cpu::sleep();
+                }
+            }
         }
     }
 }
@@ -52,7 +57,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST cmp A B fsck [diskN] echo TEXT keymap us|sv run NAME [ARGS]\ndmesg irqs usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST cmp A B fsck [diskN] echo TEXT keymap us|sv run NAME [ARGS] [&N] ps kill N|NAME|all\ndmesg irqs usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "start" => start_script(true),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
@@ -89,6 +94,8 @@ fn execute(line: &str) {
         "date" => date(rest),
         "display" => display(rest),
         "run" => run_tape(rest),
+        "ps" | "tasks" => crate::tasks::list(),
+        "kill" => crate::tasks::kill(rest.split_whitespace().next()),
         "keymap" => match crate::usb_kbd::layout_named(rest) {
             Some(layout) => crate::usb_kbd::set_layout(layout),
             None => crate::println!("keymap: us or sv."),
@@ -278,10 +285,18 @@ fn sector(rest: &str) {
 
 /// `run NAME [ARGS]`: loads a tape from the boot volume and runs it until it returns or Escape stops it.
 fn run_tape(rest: &str) {
+    // `run NAME ARGS &N`: a background tape (service) that owns NIC N.
+    let (rest, service) = crate::tasks::split_suffix(rest);
+    if service == Some(Err(())) {
+        return crate::tasks::usage();
+    }
     let (name, arguments) = rest.split_once(' ').map_or((rest, ""), |(name, arguments)| (name, arguments.trim()));
     if name.is_empty() {
         crate::println!("run: which tape? (run NAME [ARGS])");
         return;
+    }
+    if let Some(Ok(nic)) = service {
+        return crate::tasks::start(name, arguments, nic);
     }
     if let Some((first, second)) = rest.split_once(" + ") {
         fn split(part: &str) -> (&str, &str) {

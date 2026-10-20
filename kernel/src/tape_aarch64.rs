@@ -18,7 +18,7 @@ const STAGE_BYTES: usize = 4 * 1024 * 1024;
 const STACK_BYTES: u64 = 1024 * 1024;
 
 /// Two tape regions: `run A + B` keeps both tapes loaded at once.
-static mut REGIONS: [u64; 2] = [0; 2];
+static mut REGIONS: [u64; 2 + crate::tasks::MAX_SERVICES] = [0; 2 + crate::tasks::MAX_SERVICES];
 static mut INFO: *const BootInfo = core::ptr::null();
 static SPAN: AtomicU64 = AtomicU64::new(0);
 
@@ -83,7 +83,7 @@ pub fn load(name: &str) -> Result<u64, &'static str> {
     load_slot(name, 0)
 }
 
-/// `load` into region `slot` (0 or 1), so two tapes can be resident together.
+/// `load` into region `slot` (0 and 1 for `run A + B`, then one per service), so several tapes can be resident together.
 pub fn load_slot(name: &str, slot: usize) -> Result<u64, &'static str> {
     let volume = storage::boot_volume().ok_or("no boot volume")?;
     let staging = memory::allocate_contiguous(STAGE_BYTES as u64 / memory::FRAME, None).ok_or("no memory for staging")?;
@@ -199,6 +199,13 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
     }
 }
 
+/// Writes a `TapeApi` for a tape started by the service scheduler.
+pub unsafe fn write_api(at: u64, arguments: &'static str) {
+    if let Some(info) = unsafe { INFO.as_ref() } {
+        unsafe { (at as *mut TapeApi).write(make_api(info, arguments)) };
+    }
+}
+
 /// Calls the tape's entry on a stack of its own with the API table; returns when the tape returns.
 pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
     let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
@@ -298,6 +305,10 @@ fn next_byte() -> Option<u8> {
 }
 
 extern "C" fn api_read_key() -> u32 {
+    if crate::tasks::in_service() {
+        return crate::tasks::service_read_key();
+    }
+    crate::tasks::maybe_yield();
     match next_byte() {
         None => KEY_NONE,
         Some(0x1b) => KEY_ABORT,
@@ -307,6 +318,10 @@ extern "C" fn api_read_key() -> u32 {
 
 /// Escape stops a tape; any other key typed meanwhile is dropped (`should_abort` and `read_key` share one input).
 extern "C" fn api_should_abort() -> u32 {
+    if crate::tasks::in_service() {
+        return u32::from(crate::tasks::service_should_abort());
+    }
+    crate::tasks::maybe_yield();
     u32::from(next_byte() == Some(0x1b))
 }
 
@@ -315,15 +330,24 @@ extern "C" fn api_set_input_mode(_mode: u32) {}
 /// A tape found nothing to do. Alone, the CPU sleeps until the next interrupt. With two tapes each gets a pass before the CPU
 /// sleeps, and the other tape runs now.
 extern "C" fn api_wait_for_event() {
+    if crate::tasks::in_service() {
+        return crate::tasks::service_wait();
+    }
+    // Services get a pass; the CPU sleeps only when they are all idle too.
+    let busy = crate::tasks::pass();
     let tasks = tasks();
     if !tasks.active {
-        cpu::sleep();
+        if !busy {
+            cpu::sleep();
+        }
         return;
     }
     tasks.streak += 1;
     if tasks.streak >= tasks.live() {
         tasks.streak = 0;
-        cpu::sleep();
+        if !busy {
+            cpu::sleep();
+        }
     }
     yield_to_next();
 }
@@ -333,6 +357,7 @@ extern "C" fn api_ticks() -> u64 {
 }
 
 extern "C" fn api_micros() -> u64 {
+    crate::tasks::maybe_yield();
     timer::micros()
 }
 
@@ -390,7 +415,8 @@ extern "C" fn api_nic_send(index: usize, frame: *const u8, length: usize) -> u32
 }
 
 extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) -> usize {
-    if index != 0 {
+    // A NIC a service owns delivers to the service alone.
+    if index != 0 || (crate::tasks::service_owns(index) && !crate::tasks::in_service()) {
         return 0;
     }
     crate::genet::receive(unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })

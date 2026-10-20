@@ -1516,7 +1516,7 @@ fn execute(command: &str) {
             crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
             crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");
             crate::println!("run NAME [ARGS]   load a tape from FOSFS and run it");
-            crate::println!("run NAME ARGS &N  run it in the background on NIC N; `ps`, `kill N|NAME|all`");
+            crate::println!("run NAME ARGS &N  run it in the background on NIC N; `&0` no NIC; `ps`, `kill N|NAME|all`");
             crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
             crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
             crate::println!("uptime    time since the timer started; sleep N waits N seconds");

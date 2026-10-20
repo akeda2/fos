@@ -874,13 +874,9 @@ pub fn show_help(name: &str) {
 /// `run NAME [ARGS]`: load a tape from FOSFS and run it.
 pub fn run_named(arguments: &str) {
     // `run NAME ARGS &N`: a service on NIC N.
-    let arguments = arguments.trim();
-    let (arguments, service) = match arguments.rsplit_once(char::is_whitespace) {
-        Some((before, last)) if last.starts_with('&') => (before.trim(), Some(last[1..].parse::<usize>().ok().filter(|&n| n >= 1))),
-        _ => (arguments, None),
-    };
-    if service == Some(None) {
-        return crate::println!("run: `&N` names the NIC the background tape owns (N from 1 to {}).", term::nic_count());
+    let (arguments, service) = crate::tasks::split_suffix(arguments);
+    if service == Some(Err(())) {
+        return crate::tasks::usage();
     }
     let (name, rest) = arguments.split_once(char::is_whitespace).unwrap_or((arguments, ""));
     match load_from_file(name) {
@@ -893,8 +889,8 @@ pub fn run_named(arguments: &str) {
                 }
             }
             set_staged_length(length);
-            if let Some(Some(nic)) = service {
-                return crate::tasks::start(name, rest.trim(), nic - 1);
+            if let Some(Ok(nic)) = service {
+                return crate::tasks::start(name, rest.trim(), nic);
             }
             match load_staged(name) {
                 Ok(()) => {

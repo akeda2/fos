@@ -34,6 +34,7 @@ mod threecom;
 mod power;
 mod storage;
 mod tape;
+mod service_host;
 mod tasks;
 mod tape_fs;
 mod tapesync;

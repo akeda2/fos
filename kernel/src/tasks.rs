@@ -1,3 +1,6 @@
+//! Shared by the x86-64 and aarch64 kernels; only `ctx` (the register switch) and `service_host.rs` (what a service needs
+//! from the NIC and tape code of its kernel) differ.
+//!
 //! Background tapes ("services"): `run NAME ARGS &N` starts a tape that keeps running while the shell, or another tape,
 //! is in use. See docs/design.md "Services".
 //!
@@ -6,18 +9,19 @@
 //! the shell's idle loop, never inside a kernel routine, so the kernel needs no locks. Because a tape treats every
 //! call as clobbering the SSE/AVX registers, switching there needs to save only the callee-saved integer registers.
 //!
-//! A service owns one NIC (`&N`, 1-based): the frames of that NIC are queued for it alone (the foreground tape's
+//! A service owns one NIC (`&N`, 1-based; `&0` owns none): the frames of that NIC are queued for it alone (the foreground tape's
 //! `nic_receive` on that NIC returns nothing) and the card's multicast, VLAN, offload and stamp state is its own to
 //! set and to clear when it ends. Console output is not redirected: a service should be quiet. Keys and `Escape` go
 //! to the foreground tape only; `kill N` stops a service.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use fosfor_abi::tape::TapeApi;
-
-use crate::{memory, term, timer};
+use crate::service_host as host;
+use crate::{memory, timer};
 
 pub const MAX_SERVICES: usize = 2;
+/// `Service::nic` of a service that owns no NIC (`&0`).
+const NO_NIC: usize = usize::MAX;
 const STACK_BYTES: u64 = 1024 * 1024;
 /// How long a context may run before a tape call hands the CPU on (a tape that idles hands it on at once).
 const SLICE_US: u64 = 200;
@@ -74,48 +78,113 @@ pub fn in_service() -> bool {
 
 /// True when a running service owns NIC `index` (0-based).
 pub fn service_owns(index: usize) -> bool {
-    count() != 0 && services().iter().any(|service| service.state == State::Live && service.nic == index)
+    count() != 0 && index != NO_NIC && services().iter().any(|service| service.state == State::Live && service.nic == index)
 }
 
 /// The NIC of the service that is running now.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub fn current_nic() -> Option<usize> {
     let current = unsafe { CURRENT };
-    (current != 0).then(|| services()[current - 1].nic)
+    (current != 0).then(|| services()[current - 1].nic).filter(|&nic| nic != NO_NIC)
 }
 
-core::arch::global_asm!(
-    ".global fos_ctx_switch",
-    "fos_ctx_switch:",
-    // rdi: where to save the old stack pointer, rsi: the new one.
-    "push rbp",
-    "push rbx",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "mov [rdi], rsp",
-    "mov rsp, rsi",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop rbx",
-    "pop rbp",
-    "ret",
-    ".global fos_task_entry",
-    "fos_task_entry:",
-    // First run of a service: r12 is the tape's entry, r13 its TapeApi.
-    "mov rdi, r13",
-    "and rsp, -16",
-    "call r12",
-    "call {exit}",
-    "ud2",
-    exit = sym task_exit,
-);
+#[cfg(target_arch = "x86_64")]
+mod ctx {
+    core::arch::global_asm!(
+        ".global fos_ctx_switch",
+        "fos_ctx_switch:",
+        // rdi: where to save the old stack pointer, rsi: the new one.
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rdi], rsp",
+        "mov rsp, rsi",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        ".global fos_task_entry",
+        "fos_task_entry:",
+        // First run of a service: r12 is the tape's entry, r13 its TapeApi.
+        "mov rdi, r13",
+        "and rsp, -16",
+        "call r12",
+        "call {exit}",
+        "ud2",
+        exit = sym super::task_exit,
+    );
 
-unsafe extern "C" {
-    fn fos_ctx_switch(save: *mut u64, load: u64);
-    fn fos_task_entry();
+    unsafe extern "C" {
+        fn fos_ctx_switch(save: *mut u64, load: u64);
+        fn fos_task_entry();
+    }
+
+    pub unsafe fn switch(save: *mut u64, load: u64) {
+        unsafe { fos_ctx_switch(save, load) }
+    }
+
+    /// The stack pointer a new service starts from: what `fos_ctx_switch` pops (r15 r14 r13 r12 rbx rbp), then the
+    /// address it returns to. `below` is the lowest address the tape's API table and arguments occupy.
+    pub unsafe fn first_frame(below: u64, entry: u64, api: u64) -> u64 {
+        let sp = below - 64;
+        let frame = sp as *mut u64;
+        unsafe {
+            for word in 0..8 {
+                frame.add(word).write(0);
+            }
+            frame.add(2).write(api);
+            frame.add(3).write(entry);
+            frame.add(6).write(fos_task_entry as *const () as u64);
+        }
+        sp
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod ctx {
+    // `fos_task_switch` (tape_aarch64.rs) saves x19-x30 and d8-d15; a first frame "returns" into `fos_service_entry`
+    // with x19 = the tape's entry and x20 = its TapeApi.
+    core::arch::global_asm!(
+        r#"
+        .global fos_service_entry
+    fos_service_entry:
+        mov x0, x20
+        blr x19
+        bl {exit}
+        brk #0
+    "#,
+        exit = sym super::task_exit,
+    );
+
+    unsafe extern "C" {
+        fn fos_task_switch(save: *mut u64, to: u64);
+        fn fos_service_entry();
+    }
+
+    /// Bytes `fos_task_switch` pushes.
+    const SWITCH_FRAME: u64 = 176;
+
+    pub unsafe fn switch(save: *mut u64, load: u64) {
+        unsafe { fos_task_switch(save, load) }
+    }
+
+    pub unsafe fn first_frame(below: u64, entry: u64, api: u64) -> u64 {
+        let sp = (below - SWITCH_FRAME) & !15;
+        let words = sp as *mut u64;
+        unsafe {
+            core::ptr::write_bytes(sp as *mut u8, 0, SWITCH_FRAME as usize);
+            words.write(entry);
+            words.add(1).write(api);
+            words.add(11).write(fos_service_entry as *const () as u64);
+        }
+        sp
+    }
 }
 
 fn saved_rsp(context: usize) -> u64 {
@@ -143,7 +212,7 @@ fn switch_to(next: usize) {
         let load = saved_rsp(next);
         CURRENT = next;
         SLICE_START = timer::micros();
-        fos_ctx_switch(save, load);
+        ctx::switch(save, load);
     }
     reap();
 }
@@ -193,41 +262,61 @@ pub fn service_read_key() -> u32 {
 
 /// A service's `wait_for_event`: nothing to do until an interrupt, so the others may run.
 pub fn service_wait() {
-    term::service_poll();
+    host::service_poll();
     let me = unsafe { CURRENT } - 1;
     services()[me].idle = true;
     yield_now();
     services()[me].idle = false;
 }
 
-extern "C" fn task_exit() -> ! {
+pub extern "C" fn task_exit() -> ! {
     let id = unsafe { CURRENT };
     let service = &mut services()[id - 1];
-    term::nic_release(service.nic);
+    if service.nic != NO_NIC {
+        host::nic_release(service.nic);
+    }
     crate::println!("Service {} ended.", service.name());
     service.state = State::Dead;
     LIVE.fetch_sub(1, Ordering::Relaxed);
-    if count() == 0 && !term::tape_mode() {
-        crate::tape::clear_fp_level();
+    if count() == 0 {
+        host::services_over();
     }
     let next = next_runnable(id);
     let mut unused = 0u64;
     unsafe {
         CURRENT = next;
         SLICE_START = timer::micros();
-        fos_ctx_switch(&mut unused, saved_rsp(next));
+        ctx::switch(&mut unused, saved_rsp(next));
     }
     unreachable!("a finished service was resumed");
 }
 
-/// `run NAME ARGS &N`: the staged file `name` (already read into the staging buffer) becomes a service on NIC `nic`
-/// (0-based).
-pub fn start(name: &str, arguments: &str, nic: usize) {
+/// Splits a trailing `&N` off the arguments of `run`: `None` when there is none, `Err` when N is not a number,
+/// `Ok(None)` for `&0` (no NIC), `Ok(Some(index))` with the 0-based NIC otherwise.
+pub fn split_suffix(arguments: &str) -> (&str, Option<Result<Option<usize>, ()>>) {
+    let arguments = arguments.trim();
+    match arguments.rsplit_once(char::is_whitespace) {
+        Some((before, last)) if last.starts_with('&') => {
+            let nic = last[1..].parse::<usize>().map(|n| n.checked_sub(1)).map_err(|_| ());
+            (before.trim(), Some(nic))
+        }
+        _ => (arguments, None),
+    }
+}
+
+pub fn usage() {
+    crate::println!("run: `&N` names the NIC the background tape owns (N from 1 to {}; `&0` for none).", host::nic_count());
+}
+
+/// `run NAME ARGS &N`: tape `name` becomes a service owning NIC `nic` (0-based; `None` for no NIC). The kernel's
+/// `host::load` has the file ready (x86: the staging buffer; aarch64: it reads it).
+pub fn start(name: &str, arguments: &str, nic: Option<usize>) {
     if in_service() {
         return crate::println!("run: a service cannot start another.");
     }
-    if nic >= term::nic_count() {
-        return crate::println!("run: no NIC {} (this machine has {}).", nic + 1, term::nic_count());
+    let nic = nic.unwrap_or(NO_NIC);
+    if nic != NO_NIC && nic >= host::nic_count() {
+        return crate::println!("run: no NIC {} (this machine has {}).", nic + 1, host::nic_count());
     }
     if service_owns(nic) {
         return crate::println!("run: a service already owns NIC {}.", nic + 1);
@@ -236,36 +325,22 @@ pub fn start(name: &str, arguments: &str, nic: usize) {
         return crate::println!("run: the arguments of a service take at most {ARGS_BYTES} bytes.");
     }
     let Some(slot) = services().iter().position(|service| service.state == State::Free) else {
-        return crate::println!("run: {MAX_SERVICES} services are running already (`tasks`, `kill N`).");
+        return crate::println!("run: {MAX_SERVICES} services are running already (`ps`, `kill N`).");
     };
-    let entry = match crate::tape::load_staged_service(slot + 1, name) {
-        Ok(entry) => entry,
-        Err(error) => return crate::println!("run: {name} is not a usable tape ({error:?})."),
-    };
+    let Some(entry) = host::load(slot + 1, name) else { return };
     let Some(stack) = memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None) else {
         return crate::println!("run: no memory for the service's stack.");
     };
-    let Some(info) = crate::tape::boot_info() else { return crate::println!("run: no boot info.") };
     // The top of the stack holds what the tape reads for as long as it runs: its API table and argument text.
     let args_at = (stack + STACK_BYTES - ARGS_BYTES as u64) & !15;
-    let api_at = (args_at - core::mem::size_of::<TapeApi>() as u64) & !15;
+    let api_at = (args_at - host::API_BYTES as u64) & !15;
     let bytes = arguments.as_bytes();
-    unsafe {
+    let sp = unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), args_at as *mut u8, bytes.len());
         let text = core::str::from_utf8_unchecked(core::slice::from_raw_parts(args_at as *const u8, bytes.len()));
-        (api_at as *mut TapeApi).write(crate::tape::build_api(info, text));
-    }
-    // What `fos_ctx_switch` pops (r15 r14 r13 r12 rbx rbp), then the address it returns to.
-    let sp = api_at - 64;
-    unsafe {
-        let frame = sp as *mut u64;
-        for word in 0..8 {
-            frame.add(word).write(0);
-        }
-        frame.add(2).write(api_at);
-        frame.add(3).write(entry);
-        frame.add(6).write(fos_task_entry as *const () as u64);
-    }
+        host::write_api(api_at, text);
+        ctx::first_frame(api_at, entry, api_at)
+    };
     let service = &mut services()[slot];
     *service = Service::EMPTY;
     let take = name.len().min(16);
@@ -276,20 +351,30 @@ pub fn start(name: &str, arguments: &str, nic: usize) {
     service.nic = nic;
     service.state = State::Live;
     LIVE.fetch_add(1, Ordering::Relaxed);
-    term::clear_frame_queue_nic(nic);
-    crate::tape::enable_fp_level();
-    crate::println!("Service {name} started on NIC {}: `tasks` lists services, `kill {}` stops this one.", nic + 1, slot + 1);
+    if nic != NO_NIC {
+        host::nic_claim(nic);
+    }
+    host::services_begin();
+    if nic == NO_NIC {
+        crate::println!("Service {name} started: `ps` lists services, `kill {}` stops this one.", slot + 1);
+    } else {
+        crate::println!("Service {name} started on NIC {}: `ps` lists services, `kill {}` stops this one.", nic + 1, slot + 1);
+    }
     yield_now(); // let it start and print its first lines
 }
 
 /// `tasks`
 pub fn list() {
     if count() == 0 {
-        return crate::println!("No services running (`run NAME ARGS &N` starts one on NIC N).");
+        return crate::println!("No services running (`run NAME ARGS &N` starts one on NIC N, `&0` on none).");
     }
     for (index, service) in services().iter().enumerate().filter(|(_, service)| service.state == State::Live) {
         let state = if service.abort { "stopping" } else if service.idle { "idle" } else { "running" };
-        crate::println!("{}  {:<16} NIC {}  {state}", index + 1, service.name(), service.nic + 1);
+        if service.nic == NO_NIC {
+            crate::println!("{}  {:<16} no NIC  {state}", index + 1, service.name());
+        } else {
+            crate::println!("{}  {:<16} NIC {}  {state}", index + 1, service.name(), service.nic + 1);
+        }
     }
 }
 
