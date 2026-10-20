@@ -30,7 +30,7 @@ fn execute(line: &str) {
     let (word, rest) = line.split_once(' ').map_or((line, ""), |(word, rest)| (word, rest.trim()));
     match word {
         "" => {}
-        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST echo TEXT keymap us|sv run NAME [ARGS]\ndmesg usb nic [rx] slots kup serial reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
+        "help" => crate::println!("help version uptime mem disks ls [diskN] cat [diskN/]NAME cp SRC DST echo TEXT keymap us|sv run NAME [ARGS]\ndmesg usb nic [rx] slots kup serial [BAUD] reset acpi peek ADDR [N] poke ADDR VALUE (hex; bring-up tools)"),
         "version" => crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`)."),
         "uptime" => {
             let seconds = timer::micros() / 1_000_000;
@@ -69,7 +69,7 @@ fn execute(line: &str) {
         "nic" if rest == "rx" => crate::genet::show_rx(),
         "nic" => crate::genet::status(),
         "usb" => crate::println!("usb: {} new keyboard(s).", crate::usb_kbd::probe_all()),
-        "kup" if rest == "serial" => kup_serial(),
+        "kup" if rest == "serial" || rest.starts_with("serial ") => kup_serial(rest["serial".len()..].trim()),
         "slots" => crate::slots::show(),
         "reset" => {
             crate::println!("Restarting.");
@@ -246,14 +246,31 @@ impl crate::kup_serial::Link for Console {
 
 /// `kup serial`: takes a kernel image from `tools/send_kernel_serial.py` over the console UART into the inactive slot, then
 /// restarts to try it (the loader falls back to this kernel unless the new one reaches its milestone).
-fn kup_serial() {
+fn kup_serial(speed: &str) {
+    let baud = if speed.is_empty() { 0 } else { speed.parse::<u32>().unwrap_or(0) };
+    if !speed.is_empty() && !(9_600..=3_000_000).contains(&baud) {
+        return crate::println!("kup serial [BAUD]: BAUD is 9600 to 3000000 (the sender must be told the same).");
+    }
     const STAGE_BYTES: usize = 4 * 1024 * 1024;
     let Some(staging) = memory::allocate_contiguous(STAGE_BYTES as u64 / memory::FRAME, None) else {
         return crate::println!("kup: no memory for the image.");
     };
     let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, STAGE_BYTES) };
-    crate::println!("KUP serial: ready (the sender starts within 30 s).");
+    if baud == 0 {
+        crate::println!("KUP serial: ready (the sender starts within 30 s).");
+    } else {
+        crate::println!("KUP serial: ready at {baud} baud (the sender switches too and starts within 30 s).");
+        crate::arch::aarch64::pl011::drain();
+        timer::busy_wait_ms(50);
+        if !crate::arch::aarch64::pl011::set_baud(baud) {
+            return crate::println!("kup serial: that speed is not possible with this UART clock.");
+        }
+    }
     let result = crate::kup_serial::serve(&mut Console, buffer);
+    if baud != 0 {
+        crate::arch::aarch64::pl011::drain();
+        crate::arch::aarch64::pl011::set_baud(0);
+    }
     memory::free(staging, STAGE_BYTES as u64 / memory::FRAME);
     match result {
         Ok(slot) => {

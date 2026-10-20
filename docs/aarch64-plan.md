@@ -152,3 +152,10 @@ Genet, so only `make tapes-aarch64` and the boot test cover it; the `netcheck` t
 - Genet: INTRL2_0 receive-done bits 13-15 (all three fire), SPI 157, a storm guard. The foreground still drains the ring;
   the interrupt wakes the shell's and tapes' `wfi`, so a ping now takes 0.3 ms instead of 10 ms.
 - Tests: `make test-aarch64-boot` checks MSI delivery through the GICv2m frame; the Pi checks are the `nic` and boot log lines.
+
+## Faster serial KUP (2026-10-20)
+
+`kup serial BAUD` (aarch64 shell) and `tools/send_kernel_serial.py PORT KERNEL --fast BAUD` raise the PL011 (and the host
+port) for the transfer; the kernel restores the firmware's speed afterwards, also when no sender starts within 30 s. The UART
+clock is derived from the firmware's 115200 divisors. On the Pi: **921600 works** (375 KB in 5.5 s instead of 33 s); 1.5 and
+3 Mbaud got no answer (host adapter or line, not investigated). x86 COM1 still runs at 115200 only.

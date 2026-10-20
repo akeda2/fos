@@ -104,7 +104,7 @@ def main():
             mark = len(text())
             write(b"\r")
             try:
-                slot = sender.push(read, write, kernel, log=lambda message: print("  " + message))
+                slot = sender.push(read, write, kernel, log=lambda message: print("  " + message), baud=921600 if ARCH == "aarch64" else 0, set_speed=lambda baud: None)
             except SystemExit as failure:
                 time.sleep(6)
                 check(False, str(failure), text()[mark:])

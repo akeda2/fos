@@ -59,15 +59,16 @@ class Reader:
             self.pump(min(remaining, 0.2))
 
 
-def push(read, write, image: bytes, log=print, command: bool = True) -> int:
-    """Runs the whole update over `read(timeout) -> bytes` / `write(bytes)`; returns the slot the kernel was written to."""
+def push(read, write, image: bytes, log=print, command: bool = True, baud: int = 0, set_speed=None) -> int:
+    """Runs the whole update over `read(timeout) -> bytes` / `write(bytes)`; returns the slot the kernel was written to.
+    With `baud` the machine is asked to raise its UART speed (aarch64 shell) and `set_speed(baud)` switches this end."""
     reader = Reader(read)
     if command:
         write(b"\r")
         time.sleep(0.2)
         reader.pump(0.3)
         reader.buffer = b""
-        write(b"kup serial\r")
+        write(b"kup serial %d\r" % baud if baud else b"kup serial\r")
     deadline = time.time() + 15
     while b"KUP serial: ready" not in reader.buffer + reader.text:
         if time.time() > deadline:
@@ -75,6 +76,10 @@ def push(read, write, image: bytes, log=print, command: bool = True) -> int:
         reader.pump(0.2)
     reader.text = b""
     reader.buffer = reader.buffer.split(b"KUP serial: ready", 1)[-1]
+    if baud and set_speed:
+        time.sleep(0.02)
+        set_speed(baud)
+        reader.buffer = b""
 
     def exchange(kind: bytes, sequence: int, payload: bytes = b"", timeout: float = 1.0, attempts: int = 8):
         for _ in range(attempts):
@@ -119,15 +124,20 @@ def main() -> None:
     parser.add_argument("port")
     parser.add_argument("kernel")
     parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--fast", type=int, default=0, help="raise both ends to this speed for the transfer (aarch64 shell)")
     arguments = parser.parse_args()
     image = open(arguments.kernel, "rb").read()
     fd = os.open(arguments.port, os.O_RDWR | os.O_NOCTTY)
     attributes = termios.tcgetattr(fd)
     attributes[0] = attributes[1] = attributes[3] = 0
     attributes[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
-    speed = getattr(termios, f"B{arguments.baud}")
-    attributes[4] = attributes[5] = speed
-    termios.tcsetattr(fd, termios.TCSANOW, attributes)
+
+    def set_speed(baud: int) -> None:
+        speed = getattr(termios, f"B{baud}")
+        attributes[4] = attributes[5] = speed
+        termios.tcsetattr(fd, termios.TCSADRAIN, attributes)
+
+    set_speed(arguments.baud)
 
     def read(timeout: float) -> bytes:
         ready, _, _ = select.select([fd], [], [], timeout)
@@ -137,7 +147,10 @@ def main() -> None:
         while data:
             data = data[os.write(fd, data) :]
 
-    slot = push(read, write, image)
+    try:
+        slot = push(read, write, image, baud=arguments.fast, set_speed=set_speed)
+    finally:
+        set_speed(arguments.baud)
     print(f"the machine verified the kernel and wrote it to slot {slot}; it restarts and tries it once.")
 
 
