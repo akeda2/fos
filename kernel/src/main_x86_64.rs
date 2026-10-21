@@ -1,5 +1,6 @@
 mod arch;
 mod audio;
+mod audioshell;
 mod ahci;
 mod block;
 mod bootcode;

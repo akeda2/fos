@@ -62,7 +62,6 @@ pub fn run() -> ! {
 
 /// The Pi's own commands; the file commands and `help` come from the shared shell (`crates/shell`).
 static COMMANDS: &[Command] = &[
-    Command::new("audio", "audio ...", "the audio device and a quick capture check.", |_, rest| audio(rest)),
     Command::new("display", "display ...", "the screens.", |_, rest| display(rest)),
     Command::new("acpi", "acpi", "lists the ACPI tables.", |_, _| {
         crate::arch::aarch64::acpi::list(|signature, address, length| {
@@ -253,103 +252,6 @@ fn recv_serial(rest: &str) {
     match result {
         Ok(length) => crate::println!("recv: {length} bytes written to {name}."),
         Err(message) => crate::println!("recv: {message}; nothing was written."),
-    }
-}
-
-/// `audio` (status), `audio modes`, `audio tone [HZ] [SECONDS]`: a first look at USB audio on this port.
-fn audio(rest: &str) {
-    use crate::audio as ua;
-    let mut words = rest.split_whitespace();
-    match words.next() {
-        None => ua::status(),
-        Some("modes") => ua::print_modes(),
-        Some("tone") => {
-            let frequency = words.next().and_then(|w| w.parse::<u32>().ok()).unwrap_or(440).clamp(20, 20_000);
-            let seconds = words.next().and_then(|w| w.parse::<u64>().ok()).unwrap_or(3).clamp(1, 60);
-            let rate = 48_000;
-            if let Err(reason) = ua::start(rate, false, true) {
-                return crate::println!("audio: {reason}.");
-            }
-            let Some((channels, slot)) = ua::playback_format() else { return };
-            let (channels, slot) = (usize::from(channels), usize::from(slot));
-            let frame_bytes = channels * slot;
-            let step = (u64::from(frequency) << 16) / u64::from(rate);
-            let mut phase = 0u64;
-            let end = timer::ticks() + seconds * timer::TICK_HZ;
-            let mut chunk = [0u8; 2048];
-            while timer::ticks() < end {
-                crate::usb_kbd::poll();
-                ua::poll();
-                let frames = (chunk.len() / frame_bytes).min(ua::playback_space() / frame_bytes);
-                if frames == 0 {
-                    continue;
-                }
-                for frame in chunk[..frames * frame_bytes].chunks_mut(frame_bytes) {
-                    let half = (phase & 0x7fff) as i64;
-                    let magnitude = (half * (0x8000 - half)) >> 13;
-                    let sample = (if phase & 0x8000 != 0 { -magnitude } else { magnitude }) / 4;
-                    phase = (phase + step) & 0xffff;
-                    let value = sample << (8 * slot as u32 - 16);
-                    for sample_slot in frame.chunks_mut(slot) {
-                        for (index, byte) in sample_slot.iter_mut().enumerate() {
-                            *byte = (value >> (8 * index)) as u8;
-                        }
-                    }
-                }
-                ua::write(&chunk[..frames * frame_bytes]);
-            }
-            ua::status();
-            ua::stop();
-        }
-        Some("capture") => {
-            let seconds = words.next().and_then(|w| w.parse::<u64>().ok()).unwrap_or(3).clamp(1, 30);
-            if let Err(reason) = ua::start(48_000, true, false) {
-                return crate::println!("audio: {reason}.");
-            }
-            let Some((channels, slot)) = ua::capture_format() else { return };
-            let (channels, slot) = (usize::from(channels), usize::from(slot));
-            let frame_bytes = channels * slot;
-            let mut data = [0u8; 4096];
-            for second in 1..=seconds {
-                let mut peaks = [0u32; 32];
-                let mut carry = 0usize;
-                let mut frames = 0u64;
-                let end = timer::ticks() + timer::TICK_HZ;
-                while timer::ticks() < end {
-                    crate::usb_kbd::poll();
-                    ua::poll();
-                    let room = (data.len() - carry) / frame_bytes * frame_bytes;
-                    let total = carry + ua::read(&mut data[carry..carry + room]);
-                    let whole = total / frame_bytes * frame_bytes;
-                    for frame in data[..whole].chunks(frame_bytes) {
-                        for (channel, sample) in frame.chunks(slot).enumerate().take(32) {
-                            let mut value = 0i64;
-                            for (index, &byte) in sample.iter().enumerate() {
-                                value |= i64::from(byte) << (8 * index);
-                            }
-                            let bits = 8 * slot as u32;
-                            if value >> (bits - 1) != 0 {
-                                value -= 1 << bits;
-                            }
-                            // report in 16-bit units whatever the slot width
-                            let magnitude = (value.unsigned_abs() >> (bits - 16)) as u32;
-                            peaks[channel] = peaks[channel].max(magnitude);
-                        }
-                        frames += 1;
-                    }
-                    data.copy_within(whole..total, 0);
-                    carry = total - whole;
-                }
-                crate::print(format_args!("[{second:>2} s] {frames} frames; peaks (of 32768):"));
-                for peak in &peaks[..channels.min(32)] {
-                    crate::print(format_args!(" {peak}"));
-                }
-                crate::println!();
-            }
-            ua::status();
-            ua::stop();
-        }
-        Some(_) => crate::println!("Usage: audio | audio modes | audio tone [HZ] [SECONDS] | audio capture [SECONDS]"),
     }
 }
 

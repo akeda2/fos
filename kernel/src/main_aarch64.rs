@@ -4,6 +4,7 @@ use fosfor_abi::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 
 mod arch;
 mod audio;
+mod audioshell;
 #[path = "ehci_none.rs"]
 mod ehci;
 #[path = "hda_none.rs"]

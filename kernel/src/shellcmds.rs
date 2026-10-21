@@ -37,6 +37,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("nic", "nic [list|sniff [N]|promisc N on|off]", "the network interfaces: list, watch the frames, promiscuous mode.", |_, rest| crate::nicshell::command(rest)),
     Command::new("usb", "usb [rescan]", "the USB controllers and what is plugged in; `rescan` looks again.", |_, rest| crate::usbshell::command(rest)),
     Command::new("kup", "kup serial [BAUD]", "takes a kernel update over the console serial port.", |_, rest| crate::kupshell::command(rest)),
+    Command::new("audio", "audio [device|output|use|start|stop|capture|duplex|tone|modes] ...", "the audio devices, streams and quick checks (`audio help` lists them).", |_, rest| crate::audioshell::command(rest)),
     Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |host, rest| {
         if rest.is_empty() {
             crate::println!("run: which tape? (run NAME [ARGS])");
