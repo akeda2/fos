@@ -98,6 +98,7 @@ def main():
             listing = run("label")
             check("disk2: @backup" in listing and "disk1: (no label)" in listing, "`label` lists each volume's label", listing)
             check("only2" in run("ls @backup"), "`ls @backup` selects the labelled volume", "")
+            check("consistent" in run("fsck @backup") and "no volume carries" in run("fsck @nothere"), "`fsck @LABEL` selects the labelled volume", "")
             check("lives on the second disk only" in run("cat @backup only2"), "`cat @backup NAME` reads from it", "")
             check("is now @boot" in run("label disk1 boot") and "disk1: @boot" in run("label disk1"), "`label disk1 NAME` sets a label", "")
             check("already carries" in run("label disk1 backup"), "a label already in use is refused", "")

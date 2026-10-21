@@ -1424,7 +1424,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump") {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck") {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1564,7 +1564,6 @@ fn execute(command: &str) {
         "videomodes" => videomodes_command(),
         "copy" => copy_command(words),
         "tapesync" => crate::tapesync::command(words),
-        "fsck" => files(&mut words, |volume, _, _| crate::fosfs::report(&volume)),
         "usb" => {
             let sub = words.next();
             if sub == Some("rescan") {

@@ -5,7 +5,7 @@
 use fosfor_shell::Command;
 
 use crate::shellhost::KernelHost;
-use crate::{fosfs, lineedit, memory, storage, timer};
+use crate::{lineedit, memory, storage, timer};
 
 /// Prompts, then serves the serial console forever: poll a byte, edit, run a finished line.
 static mut START_SCRIPT: [u8; 4096] = [0; 4096];
@@ -62,10 +62,6 @@ pub fn run() -> ! {
 
 /// The Pi's own commands; the file commands and `help` come from the shared shell (`crates/shell`).
 static COMMANDS: &[Command] = &[
-    Command::new("fsck", "fsck [diskN]", "checks a FOSFS volume's directory.", |_, rest| match volume(rest) {
-        Some(volume) => fosfs::report(&volume),
-        None => crate::println!("fsck: no FOSFS volume there (use `fsck` or `fsck diskN`)."),
-    }),
     Command::new("audio", "audio ...", "the audio device and a quick capture check.", |_, rest| audio(rest)),
     Command::new("display", "display ...", "the screens.", |_, rest| display(rest)),
     Command::new("acpi", "acpi", "lists the ACPI tables.", |_, _| {
@@ -85,8 +81,7 @@ static COMMANDS: &[Command] = &[
         Some(baud) if baud.is_empty() || baud.starts_with(' ') => kup_serial(baud.trim()),
         _ => crate::println!("Usage: kup serial [BAUD]"),
     }),
-    Command::new("slots", "slots", "the A/B kernel slots.", |_, _| crate::slots::show()),
-    Command::new("debug", "debug [status|slots]", "kernel-update setting and the A/B slots.", |_, rest| match rest {
+    Command::new("debug", "debug [status|slots]", "kernel-update setting and the A/B slots (same wording as the x86 kernel).", |_, rest| match rest {
         "" | "status" | "slots" => {
             crate::println!("kernel-update {}", crate::netservice::kernel_update_enabled());
             crate::slots::show();
@@ -116,14 +111,6 @@ fn execute(line: &str) {
     }
 }
 
-/// The volume `diskN` names, or the boot volume for an empty argument.
-fn volume(argument: &str) -> Option<fosfs::Volume> {
-    if argument.is_empty() {
-        return storage::boot_volume();
-    }
-    let number = argument.strip_prefix("disk").and_then(|digits| digits.parse().ok())?;
-    storage::volume_on(number).ok()
-}
 
 /// `run NAME [ARGS]`: loads a tape from the boot volume and runs it until it returns or Escape stops it.
 pub(crate) fn run_tape(rest: &str) {

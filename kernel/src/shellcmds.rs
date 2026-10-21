@@ -33,6 +33,7 @@ pub static COMMANDS: &[Command] = &[
             _ => crate::println!("Usage: hexdump ADDRESS [LENGTH <= 4096]  (decimal or 0x hex)"),
         }
     }),
+    Command::new("fsck", "fsck [diskN|@LABEL]", "checks a FOSFS volume's directory (default: the boot volume).", |_, rest| fsck(rest)),
     Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |host, rest| {
         if rest.is_empty() {
             crate::println!("run: which tape? (run NAME [ARGS])");
@@ -319,5 +320,27 @@ fn hexdump(address: u64, length: usize) {
         let chunk = unsafe { core::slice::from_raw_parts(at as *const u8, (page_end - at) as usize) };
         dump_bytes(at, chunk);
         at = page_end;
+    }
+}
+
+/// `fsck [diskN|@LABEL]`: the same volume names as the file commands.
+fn fsck(rest: &str) {
+    if rest.is_empty() {
+        match crate::storage::boot_volume() {
+            Some(volume) => crate::fosfs::report(&volume),
+            None => crate::println!("fsck: no FOSFS volume is mounted (see `disks`)."),
+        }
+    } else if let Some(label) = rest.strip_prefix('@') {
+        match crate::storage::volume_labelled(label.as_bytes()) {
+            Some((_, volume)) => crate::fosfs::report(&volume),
+            None => crate::println!("fsck: no volume carries the label @{label} (see `label`)."),
+        }
+    } else if let Some(number) = rest.strip_prefix("disk").and_then(|digits| digits.parse().ok()) {
+        match crate::storage::volume_on(number) {
+            Ok(volume) => crate::fosfs::report(&volume),
+            Err(error) => crate::println!("fsck: {rest}: {error}."),
+        }
+    } else {
+        crate::println!("Usage: fsck [diskN|@LABEL]");
     }
 }

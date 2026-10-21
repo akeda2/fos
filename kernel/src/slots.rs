@@ -57,7 +57,8 @@ pub fn show() {
     match read_metadata() {
         Some(m) => {
             crate::println!("active slot: {}, pending: {:?}, attempted: {}, confirmed: {}", m.active_slot, m.pending_slot, m.attempted, m.confirmed);
-            crate::println!("slot sizes (sectors): {} / {}; crash count {}, unclean boots {}", m.slot_sectors[0], m.slot_sectors[1], m.crash_count, m.unclean_boots);
+            crate::println!("slot sizes (sectors): {} / {}", m.slot_sectors[0], m.slot_sectors[1]);
+            crate::println!("crash count: {}, running: {}, unclean boots: {}", m.crash_count, m.running, m.unclean_boots);
         }
         None => crate::println!("the slot metadata cannot be read."),
     }
