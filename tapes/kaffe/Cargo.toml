@@ -1,0 +1,20 @@
+[package]
+name = "kaffe-tape"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "kaffe"
+path = "src/main.rs"
+
+[dependencies]
+audio-screen = { path = "../../crates/audio-screen" }
+tape-rt = { path = "../../crates/tape-rt" }
+gfx = { path = "../../crates/gfx" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "symbols"
