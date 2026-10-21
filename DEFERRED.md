@@ -506,12 +506,14 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 
 ## Planned: Pi GPIO and touchscreen (2026-10-21)
 
-- **Pi GPIO, local and remote.** Decided: a kernel driver (`gpio.rs`, Pi only), not direct register access from tapes, because the
-  pins share a block with the UART, I2C and SPI muxing and the kernel can refuse pins it owns (console UART, Ethernet PHY, SD, HDMI
-  I2C) and restore every pin when a tape ends. Plan: append-only tape calls `gpio_get/set/mode/pull` (all 58 pins as a bitmask),
-  later edge events; shell `gpio` (list with function and level, `read N`, `set N 0|1`, `mode N in|out`), never driving a pin by
-  default; 3.3 V only. Remote: a new NETFS-style request/reply tag on the existing frames, authenticated with `synckey`; reads
-  always allowed, writes only with a `settings` line (`gpio-remote`) and a deny list of pins. Not started; fix the wire format first.
+- **Pi GPIO, local and remote: written** (`kernel/src/gpio.rs`, `gpio_remote.rs`, `gpio_shell.rs`; tape ABI 22 `gpio_*`,
+  `tape_rt::gpio_*`). Register rules follow Linux `pinctrl-bcm2835.c` (GPFSEL, write-one GPSET/GPCLR, BCM2711 pull registers at
+  0xe4; an output's level is latched before the pin turns into one). Only GPIO2..27 except 14/15 can change, minus `gpio-deny N..`;
+  all 58 read; nothing is configured at boot; tape end returns altered alt-function pins to input. Shell `gpio [@HOST] [list|read N|
+  set N 0|1|mode N in|out L|altK|pull N none|up|down]`. Remote: NETFS tags 0x41/0x42, challenge-response signed with `synckey`;
+  reads with the key, writes also need `gpio-remote` in `settings`; served at the prompt/`term net`, not while a tape runs.
+  `gpio-sim` is a RAM bank for `make test-gpio`. Only real pins verify: register offsets, pull read-back, pin safety. Open: edge
+  events/IRQs (Linux groups 0-27, 28-45, 46-57), `tools/gpio.py` host client, a tape using the calls.
 - **Touchscreen** (Pi). The panel is USB, so it goes through `usb_hid` as a pointer device. To test 2026-10-22: which HID report
   descriptor it sends (single or multi-touch, absolute coordinates, range). Then a pointer/touch event call for tapes (append-only
   ABI) and hit-testing in the console and `gfx_*` tapes. Nordic-only keyboards still hold for any on-screen keys.

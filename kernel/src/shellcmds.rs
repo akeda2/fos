@@ -49,6 +49,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("label", "label [diskN|@LABEL [NAME|-]]", "shows or sets a FOSFS volume's label (@LABEL names a volume).", |_, rest| label(rest)),
     Command::new("format", "format diskN [NAME] [force] | format diskN exfat [LABEL]", "erases a disk's FOSFS volume, or makes it one exFAT volume for PCs; asks first (then `format diskN confirm`).", |_, rest| crate::formatshell::command(rest)),
     Command::new("debug", "debug [status|slots|crash|hang|video ...]", "kernel-update setting and the A/B slots; `crash` and `hang` test the crash record and the watchdog; `video` (x86 BIOS boots) the video mode.", |_, rest| debug(rest)),
+    Command::new("gpio", "gpio [@HOST] [list|read N|set N 0|1|mode N in|out 0|1|altK|pull N none|up|down]", "the Raspberry Pi's GPIO pins, here or on another machine (needs the synckey file for @HOST).", |_, rest| crate::gpio_shell::command(rest)),
     Command::new("tapesync", "tapesync [HOST] [apply]", "pulls newer tapes from one or all peers (needs the synckey file).", |_, rest| crate::tapesync::command(rest.split_whitespace())),
     Command::new("pci", "pci [read B:D.F [OFFSET [LENGTH]] | write B:D.F OFFSET VALUE]", "lists PCI functions; read/write reach configuration space.", |_, rest| crate::diag::pci_command(rest.split_whitespace())),
     Command::new("cpuinfo", "cpuinfo", "what the CPU reports.", |_, _| crate::diag::cpuinfo()),

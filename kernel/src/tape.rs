@@ -609,6 +609,12 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         gfx_fill_on: crate::framebuffer::api_gfx_fill_on,
         gfx_blit_on: crate::framebuffer::api_gfx_blit_on,
         audio_float: crate::audio::api_audio_float,
+        gpio_pins: crate::gpio::api_gpio_pins,
+        gpio_read: crate::gpio::api_gpio_read,
+        gpio_write: crate::gpio::api_gpio_write,
+        gpio_mode: crate::gpio::api_gpio_mode,
+        gpio_pull: crate::gpio::api_gpio_pull,
+        gpio_function: crate::gpio::api_gpio_function,
     }
 }
 
@@ -641,6 +647,7 @@ pub fn run(arguments: &str) -> Result<(), &'static str> {
             clobber_abi("C"),
         );
     }
+    crate::gpio::tape_ended();
     crate::framebuffer::gfx_close(); // a tape that ended (or was aborted) without closing gives the screen back
     if crate::tasks::count() == 0 {
         clear_fp_level();

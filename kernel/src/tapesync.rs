@@ -21,7 +21,7 @@ use crate::{println, timer};
 use tape_sync::{Action, Entry, MANIFEST_MAX, MAX_TAPES, NAME_LEN, NONCE_LEN, Stamp};
 
 use crate::netfs::KEY_FILE;
-const KEY_MAX: usize = 128;
+pub(crate) const KEY_MAX: usize = 128;
 
 struct State {
     wire: [u8; MANIFEST_MAX],
@@ -65,7 +65,7 @@ fn state() -> &'static mut State {
 
 /// The shared secret: the first line of `synckey` on the boot volume, trimmed. `None` without the file (or if it is empty
 /// or over 128 bytes).
-fn read_key(volume: &Volume, out: &mut [u8; KEY_MAX]) -> Option<usize> {
+pub(crate) fn read_key(volume: &Volume, out: &mut [u8; KEY_MAX]) -> Option<usize> {
     let length = volume.read(KEY_FILE.as_bytes(), out).ok()??;
     let text = core::str::from_utf8(&out[..length]).ok()?;
     let line = text.lines().next()?.trim();
@@ -122,7 +122,7 @@ fn cycles() -> u64 {
     count
 }
 
-fn nonce() -> [u8; NONCE_LEN] {
+pub(crate) fn nonce() -> [u8; NONCE_LEN] {
     let mut seed = [0u8; 16];
     seed[0..8].copy_from_slice(&cycles().to_le_bytes());
     seed[8..16].copy_from_slice(&timer::micros().to_le_bytes());

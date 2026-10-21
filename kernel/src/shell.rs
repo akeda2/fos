@@ -242,6 +242,9 @@ pub fn apply_settings() -> bool {
         let mut words = line.split_whitespace();
         let first = words.next();
         no_msi |= first == Some("no-msi");
+        if matches!(first, Some("gpio-remote" | "gpio-sim" | "gpio-deny")) {
+            crate::gpio::apply_setting(line);
+        }
         if let Some(key @ ("rotate" | "rotate1")) = first {
             let word = words.next().unwrap_or("");
             let mode = crate::framebuffer::Rotate::parse(word);

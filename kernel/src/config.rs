@@ -3,7 +3,8 @@
 //!
 //! * `hostname`: the base name announced in discovery replies (`NAME` + the interface
 //!   number, so `lab` becomes `lab1`);
-//! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling;
+//! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling; `gpio-remote` lets other machines write
+//!   pins, `gpio-deny N..` forbids pins, `gpio-sim` gives a RAM-backed bank (tests);
 //!   `serial-shell [PORT] [BAUD]` puts the shell on a serial port as well (COM2-COM4, numbered as `fterm list` does; off unless asked);
 //!   `keymap us|sv` picks the keyboard layout (US by default; sv is Swedish/Finnish);
 //!   `foreground gray|green|amber|black|#rrggbb` and `background black|blue|gray|#rrggbb` set the pixel console's colours (not in
@@ -125,6 +126,9 @@ pub fn load() {
     if let Some(text) = read("settings") {
         for line in lines(text) {
             match line.split_whitespace().next() {
+                Some("gpio-remote" | "gpio-sim" | "gpio-deny") => {
+                    crate::gpio::apply_setting(line);
+                }
                 Some("deny-term-net") => {
                     unsafe { DENY_TERM_NET = true };
                     crate::println!("settings: deny-term-net -- the network terminal is closed.");

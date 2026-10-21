@@ -670,6 +670,49 @@ pub fn audio_float_of(table: &TapeApi) -> (bool, bool) {
     (bits & fosfor_abi::tape::AUDIO_FLOAT_CAPTURE != 0, bits & fosfor_abi::tape::AUDIO_FLOAT_PLAYBACK != 0)
 }
 
+fn gpio_table() -> Option<&'static TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, gpio_function) + core::mem::size_of::<usize>();
+    (table.version >= 22 && table.size as usize >= end).then_some(table)
+}
+
+/// GPIO pins this tape may change (bit N = GPIO N); 0 without GPIO or on a kernel older than version 22.
+pub fn gpio_pins() -> u64 {
+    gpio_table().map_or(0, |t| (t.gpio_pins)())
+}
+
+/// Levels of all pins, GPIO0 in bit 0.
+pub fn gpio_read() -> u64 {
+    gpio_table().map_or(0, |t| (t.gpio_read)())
+}
+
+/// Sets the output pins in `mask` to `values`; returns the pins refused.
+pub fn gpio_write(mask: u64, values: u64) -> u64 {
+    gpio_table().map_or(mask, |t| (t.gpio_write)(mask, values))
+}
+
+/// Function of a pin: 0 input, 1 output (starting at `level`), 2..=7 alt0..alt5. `Err` is the kernel's negative code.
+pub fn gpio_mode(pin: u32, function: u32, level: bool) -> Result<(), i32> {
+    match gpio_table() {
+        Some(t) => match (t.gpio_mode)(pin, function, u32::from(level)) {
+            0 => Ok(()),
+            code => Err(code),
+        },
+        None => Err(-3),
+    }
+}
+
+/// Pull of a pin: 0 none, 1 up, 2 down.
+pub fn gpio_pull(pin: u32, pull: u32) -> Result<(), i32> {
+    match gpio_table() {
+        Some(t) => match (t.gpio_pull)(pin, pull) {
+            0 => Ok(()),
+            code => Err(code),
+        },
+        None => Err(-3),
+    }
+}
+
 /// `gfx_info` for screen number `screen` (0-based). Screen 0 works on kernels from version 17, others need 20. From 20 on,
 /// even screen 0 goes through the numbered calls: `run A | B` splits the console into two screens, 0 and 1.
 pub fn gfx_info_on(screen: u32) -> Option<(u32, u32)> {

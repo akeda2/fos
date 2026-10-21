@@ -32,6 +32,9 @@ pub(crate) const NETFS_BUSY: u8 = 9;
 pub(crate) const NETFS_NO_SYNC: u8 = 10;
 /// The tape-sync request (see `tapesync.rs` and crates/tape-sync): a nonce in, a signed manifest out as a GET stream.
 pub(crate) const TAG_SYNC_REQUEST: u8 = 0x40;
+/// GPIO over the network (`gpio_remote.rs`): a signed request and its answer, one frame each.
+pub(crate) const TAG_GPIO_REQUEST: u8 = 0x41;
+pub(crate) const TAG_GPIO_REPLY: u8 = 0x42;
 /// The shared secret of `tapesync`; NETFS never reads or writes it.
 pub(crate) const KEY_FILE: &str = "synckey";
 pub(crate) const NETFS_CHUNK: usize = 1024;
@@ -282,6 +285,28 @@ pub(crate) fn netfs_fetch(mac: [u8; 6], nic_index: usize, disk: usize, name: &st
 }
 
 /// Sends `request` (a GET-style request with tag `tag`) to a peer and collects its START/DATA/STOP answer into `staging`.
+/// Sends one frame and waits up to 2 s for one frame with tag `reply_tag` from the same machine; its payload goes to `out`.
+pub(crate) fn exchange(mac: [u8; 6], nic_index: usize, tag: u8, request: &[u8], reply_tag: u8, out: &mut [u8]) -> Result<usize, &'static str> {
+    send(nic_index, &mac, tag, request);
+    let mut answer = None;
+    let deadline = timer::ticks() + 2 * timer::TICK_HZ;
+    imp::blocking(true);
+    while answer.is_none() && timer::ticks() < deadline && !imp::break_requested() {
+        imp::drain(|_, frame| {
+            if answer.is_none() && frame.len() > 15 && frame[12..14] == ETHERTYPE && frame[6..12] == mac && frame[14] == reply_tag {
+                let payload = &frame[15..];
+                let take = payload.len().min(out.len());
+                out[..take].copy_from_slice(&payload[..take]);
+                answer = Some(take);
+            }
+        });
+        imp::pet();
+        crate::cpu::sleep();
+    }
+    imp::blocking(false);
+    answer.ok_or("no answer")
+}
+
 pub(crate) fn netfs_receive(mac: [u8; 6], nic_index: usize, tag: u8, request: &[u8], staging: &mut [u8]) -> Result<usize, &'static str> {
     if netfs_busy(&mac) {
         return Err("a transfer into this machine is in progress");
@@ -558,6 +583,7 @@ pub(crate) fn handle(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> 
         TAG_PUT_DATA if netfs_enabled() => netfs_put_data(source, payload),
         TAG_PUT_STOP if netfs_enabled() => netfs_put_stop(index, source),
         TAG_SYNC_REQUEST if netfs_enabled() => crate::tapesync::serve(index, source, payload),
+        TAG_GPIO_REQUEST if netfs_enabled() => crate::gpio_remote::serve(index, source, payload),
         _ => return None,
     }
     Some(true)
