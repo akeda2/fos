@@ -1264,7 +1264,7 @@ always uses the numbered gfx calls for that. A runs in front on screen 0 with th
 two-display form: screen 0 and screen 1.
 `rotate=r|l` (clockwise / anti-clockwise) turns the whole tape screen for a monitor mounted in portrait: tapes see an upright
 screen of swapped width and height (`gfx_info`, fill and blit rotate onto the framebuffer, `framebuffer::Rotate`) and the split
-is cut on that logical screen, so `rotate=r split=v` gives two squarish areas. The `rotate r|l|off` setting makes it permanent;
+is cut on that logical screen, so `rotate=r split=v` gives two squarish areas. The `rotate r|l|off` setting makes it permanent (the Pi's second screen has `rotate1`, and a `rotate=` on a `+`/`|` group turns the physical screen that group draws on);
 the text console is not rotated. `make test-split` checks all four layouts.
 
 ### Native float audio (ABI 21, crates/audio-sample, crates/audio-wire)

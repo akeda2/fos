@@ -142,7 +142,7 @@ pub fn load() {
                     let word = line.split_whitespace().nth(1).unwrap_or("");
                     let mode = crate::framebuffer::Rotate::parse(word);
                     if mode.is_some() || matches!(word, "off" | "none") {
-                        crate::framebuffer::rotate_default(mode);
+                        crate::framebuffer::rotate_default(0, mode);
                         crate::println!("settings: rotate {word} (tapes' pixel screens; the text console stays upright).");
                     } else {
                         crate::println!("settings: `{line}` ignored (rotate r|l|off).");

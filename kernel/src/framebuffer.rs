@@ -527,7 +527,7 @@ pub fn gfx_info() -> Option<(u32, u32)> {
         return None;
     }
     // A rotated screen is seen by tapes as it is on the monitor: width and height swap.
-    Some(match rotation() {
+    Some(match rotation(0) {
         Some(_) => (console.height as u32, console.width as u32),
         None => (console.width as u32, console.height as u32),
     })
@@ -554,28 +554,50 @@ impl Rotate {
     }
 }
 
-static mut ROTATE_DEFAULT: Option<Rotate> = None;
-static mut ROTATE_NOW: Option<Rotate> = None;
+/// Rotation per physical screen (0: the console, 1: the Pi's second HDMI output).
+static mut ROTATE_DEFAULT: [Option<Rotate>; 2] = [None; 2];
+static mut ROTATE_NOW: [Option<Rotate>; 2] = [None; 2];
 
-/// The `rotate` setting: the rotation every tape gets unless a `run` line says otherwise.
-pub fn rotate_default(mode: Option<Rotate>) {
+/// The `rotate` (screen 0) and `rotate1` (screen 1) settings: the rotation every tape gets unless a `run` line says otherwise.
+pub fn rotate_default(phys: usize, mode: Option<Rotate>) {
+    if phys > 1 {
+        return;
+    }
     unsafe {
-        *core::ptr::addr_of_mut!(ROTATE_DEFAULT) = mode;
-        *core::ptr::addr_of_mut!(ROTATE_NOW) = mode;
+        (*core::ptr::addr_of_mut!(ROTATE_DEFAULT))[phys] = mode;
+        (*core::ptr::addr_of_mut!(ROTATE_NOW))[phys] = mode;
     }
 }
 
-/// A `run` line's own `rotate=` (`None`: the setting's); `rotate_reset` goes back to the setting afterwards.
-pub fn rotate_run(mode: Option<Rotate>) {
-    unsafe { *core::ptr::addr_of_mut!(ROTATE_NOW) = mode.or(*core::ptr::addr_of!(ROTATE_DEFAULT)) };
+/// A `run` line's own `rotate=` for physical screen `phys` (`None`: the setting's); `rotate_reset` goes back to the settings
+/// afterwards.
+pub fn rotate_run(phys: usize, mode: Option<Rotate>) {
+    if phys > 1 {
+        return;
+    }
+    unsafe { (*core::ptr::addr_of_mut!(ROTATE_NOW))[phys] = mode.or((*core::ptr::addr_of!(ROTATE_DEFAULT))[phys]) };
 }
 
 pub fn rotate_reset() {
     unsafe { *core::ptr::addr_of_mut!(ROTATE_NOW) = *core::ptr::addr_of!(ROTATE_DEFAULT) };
 }
 
-fn rotation() -> Option<Rotate> {
-    unsafe { *core::ptr::addr_of!(ROTATE_NOW) }
+fn rotation(phys: usize) -> Option<Rotate> {
+    unsafe { (*core::ptr::addr_of!(ROTATE_NOW))[phys] }
+}
+
+/// A rectangle of the logical (rotated) screen as a rectangle of the physical screen (`screen_width` x `screen_height`),
+/// clipped to the logical screen (height x width). Returns (x, y, width, height); `None` when it is outside.
+fn rotate_rect(turn: Rotate, screen_width: u32, screen_height: u32, x: u32, y: u32, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    if x >= screen_height || y >= screen_width {
+        return None;
+    }
+    let (width, height) = (width.min(screen_height - x), height.min(screen_width - y));
+    let (px, py) = match turn {
+        Rotate::Right => (screen_width - y - height, x),
+        Rotate::Left => (y, screen_height - x - width),
+    };
+    Some((px, py, height, width))
 }
 
 /// Gives the screen to a tape: the console stops painting (its text grid, serial and `term net` output carry on) and the
@@ -622,21 +644,13 @@ pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
 
 /// Fills a rectangle of the logical (rotated) screen with a framebuffer pixel value.
 fn fill_logical(console: &mut Console, x: u32, y: u32, width: u32, height: u32, value: u32) {
-    let Some(turn) = rotation() else {
+    let Some(turn) = rotation(0) else {
         console.fill(x as usize, y as usize, width as usize, height as usize, value);
         return;
     };
-    // The rectangle turns into another rectangle: clip it to the logical screen (height x width), then map it.
-    let (screen_width, screen_height) = (console.width as u32, console.height as u32);
-    if x >= screen_height || y >= screen_width {
-        return;
+    if let Some((px, py, pw, ph)) = rotate_rect(turn, console.width as u32, console.height as u32, x, y, width, height) {
+        console.fill(px as usize, py as usize, pw as usize, ph as usize, value);
     }
-    let (width, height) = (width.min(screen_height - x), height.min(screen_width - y));
-    let (px, py) = match turn {
-        Rotate::Right => (screen_width - y - height, x),
-        Rotate::Left => (y, screen_height - x - width),
-    };
-    console.fill(px as usize, py as usize, height as usize, width as usize, value);
 }
 
 /// Copies a w x h block of 0x00RRGGBB pixels (`stride` pixels per source row) to the screen at (x, y), clipped on the right
@@ -648,7 +662,7 @@ pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| unsafe { GFX_OPEN }) else { return false };
     let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
     let swap = console.format == PIXEL_RGB;
-    if let Some(turn) = rotation() {
+    if let Some(turn) = rotation(0) {
         // Logical (x, y) lands on framebuffer (W-1-y, x) turning right, (y, H-1-x) turning left.
         let (screen_width, screen_height) = (console.width, console.height);
         if source.is_null() || stride < width || x >= screen_height || y >= screen_width {
@@ -782,7 +796,10 @@ pub fn split_services_over() {
 fn phys_info(phys: usize) -> Option<(u32, u32)> {
     match phys {
         0 => gfx_info(),
-        _ => extra().map(|screen| (screen.width as u32, screen.height as u32)),
+        _ => extra().map(|screen| match rotation(1) {
+            Some(_) => (screen.height as u32, screen.width as u32),
+            None => (screen.width as u32, screen.height as u32),
+        }),
     }
 }
 
@@ -809,6 +826,13 @@ fn phys_fill(phys: usize, x: u32, y: u32, width: u32, height: u32, rgb: u32) -> 
         0 => gfx_fill(x, y, width, height, rgb),
         _ => {
             let Some(screen) = extra().filter(|screen| screen.open) else { return false };
+            let (mut x, mut y, mut width, mut height) = (x, y, width, height);
+            if let Some(turn) = rotation(1) {
+                match rotate_rect(turn, screen.width as u32, screen.height as u32, x, y, width, height) {
+                    Some(rect) => (x, y, width, height) = rect,
+                    None => return true,
+                }
+            }
             let (x, y) = (x as usize, y as usize);
             let columns = (width as usize).min(screen.width.saturating_sub(x));
             let rows = (height as usize).min(screen.height.saturating_sub(y));
@@ -828,6 +852,23 @@ unsafe fn phys_blit(phys: usize, x: u32, y: u32, width: u32, height: u32, pixels
         _ => {
             let Some(screen) = extra().filter(|screen| screen.open) else { return false };
             let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+            if let Some(turn) = rotation(1) {
+                // Logical (x, y) lands on (W-1-y, x) turning right, (y, H-1-x) turning left, as on the console.
+                if pixels.is_null() || stride < width || x >= screen.height || y >= screen.width {
+                    return false;
+                }
+                for row in 0..height.min(screen.width - y) {
+                    for column in 0..width.min(screen.height - x) {
+                        let value = unsafe { pixels.add(row * stride + column).read() };
+                        let (px, py) = match turn {
+                            Rotate::Right => (screen.width - 1 - (y + row), x + column),
+                            Rotate::Left => (y + row, screen.height - 1 - (x + column)),
+                        };
+                        unsafe { screen.base.add(py * screen.stride + px).write_volatile(value) };
+                    }
+                }
+                return true;
+            }
             if pixels.is_null() || stride < width || x >= screen.width || y >= screen.height {
                 return false;
             }

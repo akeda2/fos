@@ -152,11 +152,15 @@ fn run_groups(rest: &str) -> bool {
     let mut texts = [[0u8; 256]; 4];
     let mut args = [""; 4];
     let mut splits = [None; 2];
+    let mut turns = [(0usize, None); 2];
     let mut used = [false; 2];
     let mut index = 0;
     let mut slots = texts.iter_mut();
     for group in 0..groups {
         let size = sizes[group];
+        let own = tapes[index].1;
+        let other = if size == 2 { tapes[index + 1].1 } else { "" };
+        turns[group] = (crate::tasks::group_screen(own, other).unwrap_or(group), crate::tasks::rotate_option(own, other));
         if size == 2 {
             let phys = crate::tasks::group_screen(tapes[index].1, tapes[index + 1].1).unwrap_or(group);
             if phys > 1 || used[phys] {
@@ -183,7 +187,9 @@ fn run_groups(rest: &str) -> bool {
     for (phys, mode) in splits.into_iter().flatten() {
         crate::framebuffer::split_set(phys, Some(mode));
     }
-    crate::framebuffer::rotate_run(crate::tasks::rotate_option(rest, ""));
+    for (phys, mode) in turns.into_iter().take(groups) {
+        crate::framebuffer::rotate_run(phys, mode);
+    }
     let outcome = crate::tape_aarch64::run_many(&jobs[..count]);
     crate::framebuffer::split_clear_all();
     crate::framebuffer::rotate_reset();
@@ -236,14 +242,14 @@ pub fn apply_settings() -> bool {
         let mut words = line.split_whitespace();
         let first = words.next();
         no_msi |= first == Some("no-msi");
-        if first == Some("rotate") {
+        if let Some(key @ ("rotate" | "rotate1")) = first {
             let word = words.next().unwrap_or("");
             let mode = crate::framebuffer::Rotate::parse(word);
             if mode.is_some() || matches!(word, "off" | "none") {
-                crate::framebuffer::rotate_default(mode);
-                crate::println!("settings: rotate {word} (tapes' pixel screens; the text console stays upright).");
+                crate::framebuffer::rotate_default(usize::from(key == "rotate1"), mode);
+                crate::println!("settings: {key} {word} (tapes' pixel screens; the text console stays upright).");
             } else {
-                crate::println!("settings: `{}` ignored (rotate r|l|off).", line.trim());
+                crate::println!("settings: `{}` ignored ({key} r|l|off).", line.trim());
             }
         }
         if let Some(key @ ("foreground" | "background")) = first {

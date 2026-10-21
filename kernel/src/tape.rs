@@ -886,7 +886,7 @@ fn run_shared(first: &str, second: &str) -> bool {
     };
     let Ok(length) = load_from_file(two) else { return false };
     crate::framebuffer::split_set(0, Some(crate::tasks::split_mode(first, second)));
-    crate::framebuffer::rotate_run(crate::tasks::rotate_option(first, second));
+    crate::framebuffer::rotate_run(0, crate::tasks::rotate_option(first, second));
     set_staged_length(length);
     crate::tasks::start(two, two_args, None);
     match load_from_file(one) {
