@@ -81,6 +81,7 @@ pub fn command(rest: &str) {
             }
             let Some((channels, slot)) = ua::capture_format() else { return };
             let (channels, slot) = (usize::from(channels), usize::from(slot));
+            let float = ua::capture_float() && slot == 4;
             let mut data = [0u8; 4096];
             for second in 1..=seconds {
                 let mut peaks = [0u32; 32];
@@ -96,6 +97,12 @@ pub fn command(rest: &str) {
                     let whole = total / frame_bytes * frame_bytes;
                     for frame in data[..whole].chunks(frame_bytes) {
                         for (channel, sample) in frame.chunks(slot).enumerate().take(32) {
+                            if float {
+                                // IEEE single: report the magnitude in 1/32768 of full scale (1.0), like 16-bit PCM
+                                let bits = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                                peaks[channel] = peaks[channel].max(float_peak(bits));
+                                continue;
+                            }
                             // little-endian signed PCM in `slot` bytes: sign-extend, take the magnitude
                             let mut value = 0i64;
                             for (index, &byte) in sample.iter().enumerate() {
@@ -164,6 +171,7 @@ pub fn command(rest: &str) {
             let mut phase = 0u64;
             let end = crate::timer::ticks() + seconds * crate::timer::TICK_HZ;
             let frame_bytes = channels * slot;
+            let float = ua::playback_float() && slot == 4;
             let mut chunk = [0u8; 2048];
             while crate::timer::ticks() < end {
                 pump();
@@ -177,7 +185,11 @@ pub fn command(rest: &str) {
                     let magnitude = (half * (0x8000 - half)) >> 13; // 0..32768
                     let sample = (if phase & 0x8000 != 0 { -magnitude } else { magnitude }) / 4; // a quarter of full scale
                     phase = (phase + step) & 0xffff;
-                    let value = sample << (8 * slot as u32 - 16); // scale 16-bit to the slot's width
+                    let value = if float {
+                        i64::from(float_bits(sample as i32))
+                    } else {
+                        sample << (8 * slot as u32 - 16) // scale 16-bit to the slot's width
+                    };
                     for sample_slot in frame.chunks_mut(slot) {
                         for (index, byte) in sample_slot.iter_mut().enumerate() {
                             *byte = (value >> (8 * index)) as u8;
@@ -191,6 +203,29 @@ pub fn command(rest: &str) {
         }
         Some(_) => crate::println!("Usage: audio | audio device N|auto | audio modes | audio use capture|playback N|auto | audio start RATE [capture|playback|both] | audio stop | audio capture SECONDS [RATE] | audio tone [HZ] [SECONDS] [RATE] | audio duplex [SECONDS] [RATE]"),
     }
+}
+
+/// The bit pattern of `sample / 32768` as an IEEE single, by integer arithmetic (the kernel is soft-float and has no SSE).
+fn float_bits(sample: i32) -> u32 {
+    if sample == 0 {
+        return 0;
+    }
+    let magnitude = sample.unsigned_abs();
+    let top = 31 - magnitude.leading_zeros(); // position of the leading one
+    let mantissa = if top <= 23 { magnitude << (23 - top) } else { magnitude >> (top - 23) } & 0x7f_ffff;
+    let exponent = 127 + top - 15; // divided by 2^15
+    (u32::from(sample < 0) << 31) | (exponent << 23) | mantissa
+}
+
+/// |float| in 1/32768 of full scale, from the bit pattern: exponent and mantissa shifted, no float arithmetic.
+fn float_peak(bits: u32) -> u32 {
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    if exponent < 127 - 15 - 1 {
+        return 0; // below 1/32768 (or a denormal)
+    }
+    let mantissa = (bits & 0x7f_ffff) | 0x80_0000; // 1.m * 2^23
+    let shift = exponent - 127 + 15 - 23; // value * 32768 = mantissa * 2^shift
+    if shift >= 0 { mantissa.checked_shl(shift as u32).unwrap_or(u32::MAX) } else { mantissa >> (-shift).min(31) as u32 }
 }
 
 /// One pass of the housekeeping every wait loop needs: pet the watchdog, serve USB events, move the audio rings.

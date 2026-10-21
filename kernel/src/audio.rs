@@ -257,6 +257,15 @@ pub fn playback_format() -> Option<(u8, u8)> {
     }
 }
 
+/// Whether the running capture / playback stream carries 32-bit IEEE floats instead of integers (USB only; HD Audio is PCM).
+pub fn capture_float() -> bool {
+    matches!(active(), Some(Backend::Usb(unit)) if usb::capture_float(unit))
+}
+
+pub fn playback_float() -> bool {
+    matches!(output(), Some(Backend::Usb(unit)) if usb::playback_float(unit))
+}
+
 /// What the foreground must do to keep a polled device moving (an HD Audio controller without working interrupts;
 /// the USB side is moved by `usb_hid::poll`, which the callers already do).
 pub fn poll() {

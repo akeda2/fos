@@ -20,6 +20,8 @@ pub struct StreamAlt {
     /// Bytes per sample slot in the isochronous packets, and how many of its bits carry audio.
     pub subslot_bytes: u8,
     pub bits: u8,
+    /// The samples are IEEE 754 single-precision floats (a 4-byte slot), not integers: UAC1 wFormatTag 3, UAC2 bmFormats bit 2.
+    pub float: bool,
     pub endpoint: u8,
     /// Bits 3:2 of the endpoint's attributes: 0 none, 1 asynchronous, 2 adaptive, 3 synchronous.
     pub sync: u8,
@@ -107,7 +109,12 @@ pub fn parse(configuration: &[u8]) -> Description {
                     description.clock_sources[description.clock_count] = d[3];
                     description.clock_count += 1;
                 }
-                (2, 1) if uac2_stream && length >= 11 => current.channels = d[10], // AS_GENERAL (class 2.0)
+                (2, 1) if uac2_stream && length >= 11 => {
+                    // AS_GENERAL (class 2.0): bmFormats at 6..10, bit 2 is TYPE_I IEEE_FLOAT
+                    current.channels = d[10];
+                    current.float = d[6] & 4 != 0;
+                }
+                (2, 1) if !uac2_stream && length >= 7 => current.float = u16::from_le_bytes([d[5], d[6]]) == 3, // wFormatTag IEEE_FLOAT
                 (2, 2) if uac2_stream && length >= 6 => {
                     current.subslot_bytes = d[4];
                     current.bits = d[5];
@@ -182,11 +189,12 @@ pub fn report(description: &Description, path: &dyn core::fmt::Display, vendor: 
     );
     for alt in &description.alts[..description.alt_count] {
         crate::println!(
-            "  interface {} alt {}: {} {} ch, {}-bit in {}-byte slots, endpoint {:#04x} isochronous ({}), max packet {}{}, interval {}",
+            "  interface {} alt {}: {} {} ch, {}{}-bit in {}-byte slots, endpoint {:#04x} isochronous ({}), max packet {}{}, interval {}",
             alt.interface,
             alt.alt,
             if alt.endpoint & 0x80 != 0 { "capture" } else { "playback" },
             alt.channels,
+            if alt.float { "float " } else { "" },
             alt.bits,
             alt.subslot_bytes,
             alt.endpoint,
@@ -737,7 +745,7 @@ fn choose_alt(unit: usize, device: &AudioDevice, capture: bool, rate: u32) -> Re
     }
     modes(&device.description, capture)
         .filter(|(_, alt)| offers(rates, class, alt, rate))
-        .max_by_key(|(_, alt)| (alt.channels, alt.bits))
+        .max_by_key(|(_, alt)| (alt.channels, alt.bits, !alt.float))
         .map(|(_, alt)| *alt)
         .ok_or(if capture { "no capture mode of the device offers that sample rate" } else { "no playback mode of the device offers that sample rate" })
 }
@@ -749,7 +757,7 @@ fn default_alt(unit: usize, device: &AudioDevice, capture: bool) -> Option<Strea
     if let Some(index) = unsafe { (*core::ptr::addr_of!(SELECTED))[unit][direction(capture)] } {
         return Some(device.description.alts[index]);
     }
-    modes(&device.description, capture).max_by_key(|(_, alt)| (offers(rates, class, alt, 48_000), alt.channels, alt.bits)).map(|(_, alt)| *alt)
+    modes(&device.description, capture).max_by_key(|(_, alt)| (offers(rates, class, alt, 48_000), alt.channels, alt.bits, !alt.float)).map(|(_, alt)| *alt)
 }
 
 /// `mode` is the 1-based number `audio modes` shows for that direction; 0 means automatic. It applies to the next start (a
@@ -774,7 +782,7 @@ pub fn print_modes(unit: usize) {
         let mut any = false;
         for (number, (index, alt)) in modes(&device.description, capture).enumerate() {
             any = true;
-            crate::print(format_args!("  {}{:>2}: {} ch, {}-bit,", if picked == Some(index) { '*' } else { ' ' }, number + 1, alt.channels, alt.bits));
+            crate::print(format_args!("  {}{:>2}: {} ch, {}{}-bit,", if picked == Some(index) { '*' } else { ' ' }, number + 1, alt.channels, if alt.float { "float " } else { "" }, alt.bits));
             if device.description.class_version == 2 || alt.rate_count == 0 && alt.continuous_range == (0, 0) {
                 crate::print(format_args!(" the device's rates"));
             } else if alt.rate_count > 0 {
@@ -790,7 +798,7 @@ pub fn print_modes(unit: usize) {
             crate::println!("  none");
         }
         if picked.is_none() && any {
-            crate::println!("  (automatic: the mode with the most channels and bits that offers the rate asked for)");
+            crate::println!("  (automatic: the mode with the most channels and bits that offers the rate asked for; integer before float)");
         }
     }
 }
@@ -1488,6 +1496,15 @@ pub fn capture_format(unit: usize) -> Option<(u8, u8)> {
 /// Channel layout of the playback stream: (channels, bytes per sample slot).
 pub fn playback_format(unit: usize) -> Option<(u8, u8)> {
     audio(unit).and_then(|device| device.playback.as_ref()).map(|stream| (stream.alt.channels, stream.alt.subslot_bytes))
+}
+
+/// Whether the capture / playback stream carries IEEE float samples.
+pub fn capture_float(unit: usize) -> bool {
+    audio(unit).and_then(|device| device.capture.as_ref()).is_some_and(|stream| stream.alt.float)
+}
+
+pub fn playback_float(unit: usize) -> bool {
+    audio(unit).and_then(|device| device.playback.as_ref()).is_some_and(|stream| stream.alt.float)
 }
 
 /// `audio` with no arguments: what the device offers and how a running stream is doing.
