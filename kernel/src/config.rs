@@ -6,8 +6,8 @@
 //! * `settings`: `deny-term-net` closes the network terminal, `no-msi` keeps NICs polling;
 //!   `serial-shell [PORT] [BAUD]` puts the shell on a serial port as well (COM2-COM4, numbered as `fterm list` does; off unless asked);
 //!   `keymap us|sv` picks the keyboard layout (US by default; sv is Swedish/Finnish);
-//!   `foreground gray|green|amber|black` and `background black|blue|gray` set the pixel console's colours (not in
-//!   BIOS text mode, which stays grey on black);
+//!   `foreground gray|green|amber|black|#rrggbb` and `background black|blue|gray|#rrggbb` set the pixel console's colours (not in
+//!   BIOS text mode, which stays grey on black; the Pi kernel reads them too);
 //! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` arms the
 //!   software watchdog and `kernel-update` enables KUP (both in `debug.rs`/`term.rs`);
 //! * `start`: a command script run once at boot (up to 4096 bytes; blank lines and

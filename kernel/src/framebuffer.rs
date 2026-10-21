@@ -447,24 +447,34 @@ pub fn init_text() -> bool {
 }
 
 /// Text grid size, once the console exists.
-/// The colours the `foreground` setting accepts, as RGB.
+/// `#rrggbb` (or `rrggbb`) as RGB.
+fn hex_color(name: &str) -> Option<(u8, u8, u8)> {
+    let digits = name.strip_prefix('#').unwrap_or(name);
+    if digits.len() != 6 {
+        return None;
+    }
+    let value = u32::from_str_radix(digits, 16).ok()?;
+    Some(((value >> 16) as u8, (value >> 8) as u8, value as u8))
+}
+
+/// The colours the `foreground` setting accepts (a name, or #rrggbb), as RGB.
 fn foreground_color(name: &str) -> Option<(u8, u8, u8)> {
     Some(match name {
         "gray" | "grey" => (0xc0, 0xc0, 0xc0),
         "green" => (0x33, 0xff, 0x33),
         "amber" => (0xff, 0xb0, 0x00),
         "black" => (0x00, 0x00, 0x00),
-        _ => return None,
+        _ => return hex_color(name),
     })
 }
 
-/// The colours the `background` setting accepts, as RGB.
+/// The colours the `background` setting accepts (a name, or #rrggbb), as RGB.
 fn background_color(name: &str) -> Option<(u8, u8, u8)> {
     Some(match name {
         "black" => (0x00, 0x00, 0x00),
         "blue" => (0x00, 0x00, 0xaa),
         "gray" | "grey" => (0xc0, 0xc0, 0xc0),
-        _ => return None,
+        _ => return hex_color(name),
     })
 }
 

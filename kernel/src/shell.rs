@@ -138,6 +138,15 @@ pub fn apply_settings() -> bool {
         let mut words = line.split_whitespace();
         let first = words.next();
         no_msi |= first == Some("no-msi");
+        if let Some(key @ ("foreground" | "background")) = first {
+            let name = words.next().unwrap_or("");
+            let (fg, bg) = if key == "foreground" { (Some(name), None) } else { (None, Some(name)) };
+            if crate::framebuffer::set_colors(fg, bg) {
+                crate::println!("settings: {key} {name}.");
+            } else {
+                crate::println!("settings: `{}` ignored (unknown colour, or no pixel console).", line.trim());
+            }
+        }
         if first == Some("keymap") {
             match words.next().and_then(crate::usb_kbd::layout_named) {
                 Some(layout) => {
