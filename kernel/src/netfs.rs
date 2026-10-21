@@ -579,6 +579,112 @@ pub(crate) fn send(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8])
     imp::send_frame(index, &frame[..15 + payload.len()])
 }
 
+// ---- `copy` between machines ---------------------------------------------------------------------------------------
+
+pub(crate) fn split_volume(word: &str) -> Option<(&str, &str)> {
+    let (volume, name) = word.split_once('/')?;
+    let is_volume = volume == "esp" || volume.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) || volume.strip_prefix('@').is_some_and(|label| !label.is_empty());
+    (is_volume && !name.is_empty()).then_some((volume, name))
+}
+
+/// A volume named by a command word: `diskN` or `@LABEL`. `None` if the word is neither.
+pub(crate) fn volume_word(word: &str) -> Option<Result<(usize, crate::fosfs::Volume), String8Error>> {
+    if let Some(label) = word.strip_prefix('@') {
+        return Some(crate::storage::volume_labelled(label.as_bytes()).ok_or(String8Error::NoLabel));
+    }
+    let number = word.strip_prefix("disk")?.parse::<usize>().ok()?;
+    Some(crate::storage::volume_on(number).map(|volume| (number, volume)).map_err(String8Error::Volume))
+}
+
+pub(crate) enum String8Error {
+    NoLabel,
+    Volume(crate::storage::VolumeError),
+}
+
+
+fn write_error(error: crate::fosfs::Error) -> &'static str {
+    use crate::fosfs::Error;
+    match error {
+        Error::DirectoryFull => "the destination directory is full",
+        Error::DataFull => "the destination volume is full",
+        Error::InvalidName => "the destination name is invalid",
+        _ => "writing the destination failed",
+    }
+}
+
+/// The `copy` forms that name another machine: `copy HOST[:diskN]/NAME DST [NEWNAME]` fetches, `copy SRC NAME HOST[:diskN]
+/// [NEWNAME]` stores. True if `rest` was one of them (and is done); false leaves it to the local copy.
+pub(crate) fn copy_peer(rest: &str) -> bool {
+    let mut words = rest.split_whitespace();
+    let Some(source) = words.next() else { return false };
+    if split_volume(source).is_some() {
+        return false;
+    }
+    if volume_word(source).is_none() && source.contains('/') {
+        let Some(destination) = words.next() else {
+            crate::println!("copy: where to? (copy HOST[:diskN]/NAME DST [NEWNAME])");
+            return true;
+        };
+        copy_from_peer(source, destination, words.next());
+        return true;
+    }
+    let (Some(name), Some(destination)) = (words.next(), words.next()) else { return false };
+    if split_volume(destination).is_some() || volume_word(destination).is_some() || destination == "esp" {
+        return false;
+    }
+    copy_to_peer(source, name, destination, words.next().unwrap_or(name));
+    true
+}
+
+/// `copy HOST[:diskN]/NAME DST [NEWNAME]`: the first word is the remote file, the second the local volume (and the third,
+/// the new name, arrives as `destination` here because the parser shifted the words).
+fn copy_from_peer(remote: &str, local_volume: &str, new_name: Option<&str>) {
+    let Some((spec, name)) = remote.rsplit_once('/') else { return };
+    let new_name = new_name.unwrap_or(name);
+    let Some(Ok((_, volume))) = volume_word(local_volume) else {
+        return crate::println!("copy: {local_volume} is not diskN or @LABEL.");
+    };
+    if !crate::fosfs::valid_name(name.as_bytes()) || !crate::fosfs::valid_name(new_name.as_bytes()) {
+        return crate::println!("copy: invalid file name.");
+    }
+    let Some((mac, nic, disk)) = netfs_peer(spec) else { return crate::println!("copy: no machine called {spec} answered (see `nic peers`).") };
+    crate::println!("Fetching {name} from {} disk{disk}...", crate::netdump::Mac(&mac));
+    match netfs_fetch(mac, nic, disk, name) {
+        Ok(length) => {
+            let staging = staging().unwrap();
+            match volume.write(new_name.as_bytes(), &staging[..length]) {
+                Ok(()) => crate::println!("Copied {name} ({length} bytes) from {spec} to {local_volume} as {new_name}."),
+                Err(error) => crate::println!("copy: {}.", write_error(error)),
+            }
+        }
+        Err(reason) => crate::println!("copy: {reason}."),
+    }
+}
+
+/// `copy SRC NAME HOST[:diskN] [NEWNAME]`: a local file to another machine.
+fn copy_to_peer(source: &str, name: &str, host: &str, new_name: &str) {
+    let Some(Ok((_, volume))) = volume_word(source) else {
+        return crate::println!("copy: {source} is not diskN or @LABEL.");
+    };
+    if !crate::fosfs::valid_name(name.as_bytes()) || !crate::fosfs::valid_name(new_name.as_bytes()) {
+        return crate::println!("copy: invalid file name.");
+    }
+    let Some(staging) = staging() else { return crate::println!("copy: no memory for the transfer buffer.") };
+    let length = match volume.read(name.as_bytes(), staging) {
+        Ok(Some(0)) => return crate::println!("copy: {name} is empty."),
+        Ok(Some(length)) => length,
+        Ok(None) => return crate::println!("copy: {name}: no such file on {source}."),
+        Err(_) => return crate::println!("copy: {name} cannot be read (over 4 MiB?)."),
+    };
+    let Some((mac, nic, disk)) = netfs_peer(host) else { return crate::println!("copy: no machine called {host} answered (see `nic peers`).") };
+    crate::println!("Sending {name} ({length} bytes) to {} disk{disk}...", crate::netdump::Mac(&mac));
+    match netfs_store(mac, nic, disk, new_name, length) {
+        Ok(()) => crate::println!("Copied {name} to {host} as {new_name}."),
+        Err(reason) => crate::println!("copy: {reason}."),
+    }
+}
+
+
 pub(crate) fn staging() -> Option<&'static mut [u8]> {
     imp::staging()
 }

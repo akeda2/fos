@@ -985,7 +985,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug" | "tapesync" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug" | "tapesync" | "copy" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1047,7 +1047,6 @@ fn execute(command: &str) {
         "install" => crate::install::command(words),
         "bootcode" => crate::bootcode::command(words),
         "videomodes" => videomodes_command(),
-        "copy" => copy_command(words),
         "usb" => match words.next() {
             Some("abort-test") => {
                 // A hidden test hook: see `Controller::abort_self_test`.
@@ -1117,26 +1116,6 @@ fn files<'a>(words: &mut core::str::SplitWhitespace<'a>, action: impl FnOnce(cra
 
 /// `diskN/NAME` or `@LABEL/NAME` split into the volume word and the file name. `None` for anything else (a plain name, or
 /// `HOST/NAME`, which names another machine).
-fn split_volume(word: &str) -> Option<(&str, &str)> {
-    let (volume, name) = word.split_once('/')?;
-    let is_volume = volume == "esp" || volume.strip_prefix("disk").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) || volume.strip_prefix('@').is_some_and(|label| !label.is_empty());
-    (is_volume && !name.is_empty()).then_some((volume, name))
-}
-
-/// A volume named by a command word: `diskN` or `@LABEL`. `None` if the word is neither.
-fn volume_word(word: &str) -> Option<Result<(usize, crate::fosfs::Volume), String8Error>> {
-    if let Some(label) = word.strip_prefix('@') {
-        return Some(crate::storage::volume_labelled(label.as_bytes()).ok_or(String8Error::NoLabel));
-    }
-    let number = word.strip_prefix("disk")?.parse::<usize>().ok()?;
-    Some(crate::storage::volume_on(number).map(|volume| (number, volume)).map_err(String8Error::Volume))
-}
-
-enum String8Error {
-    NoLabel,
-    Volume(crate::storage::VolumeError),
-}
-
 /// `diskN` (or `diskN/NAME`) naming a disk that has a FAT32/exFAT volume and no FOSFS one: the volume and the file
 /// name after the slash, if any. FAT is only ever reached by naming its disk; a bare name, `@LABEL` and every search
 /// the shell does for its own files (`start`, scripts, tapes) look at FOSFS volumes alone.
@@ -1293,7 +1272,7 @@ fn copy_with_fat(source: &str, name: &str, destination: &str, new_name: &str, so
 /// `copy SRC NAME DST [NEWNAME]`: one file from one volume to another, where SRC and DST are
 /// `diskN` or `@LABEL`. The whole file goes through a buffer taken from the page allocator, so
 /// it can be larger than the shell's own 64 KiB file buffer. The source is only read.
-fn copy_command(mut words: core::str::SplitWhitespace) {
+pub(crate) fn copy_command(mut words: core::str::SplitWhitespace) {
     let Some(source) = words.next() else {
         return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (diskN, @LABEL or esp); copy HOST[:diskN]/NAME DST [NEWNAME]; copy SRC NAME HOST[:diskN] [NEWNAME]");
     };
@@ -1306,11 +1285,6 @@ fn copy_command(mut words: core::str::SplitWhitespace) {
         };
         return copy_between(volume, name, destination, new_name);
     }
-    // `copy HOST[:diskN]/NAME DST [NEWNAME]`: fetch a file from another machine.
-    if volume_word(source).is_none() && source.contains('/') {
-        let Some(destination) = words.next() else { return crate::println!("copy: where to? (copy HOST[:diskN]/NAME DST [NEWNAME])") };
-        return copy_from_peer(source, destination, words.next());
-    }
     let (Some(name), Some(destination)) = (words.next(), words.next()) else {
         return crate::println!("Usage: copy SRC NAME DST [NEWNAME]   (diskN, @LABEL or esp); copy HOST[:diskN]/NAME DST [NEWNAME]; copy SRC NAME HOST[:diskN] [NEWNAME]");
     };
@@ -1318,10 +1292,6 @@ fn copy_command(mut words: core::str::SplitWhitespace) {
         Some((volume, new_name)) => (volume, new_name),
         None => (destination, words.next().unwrap_or(name)),
     };
-    // `copy SRC NAME HOST[:diskN] [NEWNAME]`: store a local file on another machine.
-    if volume_word(destination).is_none() && destination != "esp" {
-        return copy_to_peer(source, name, destination, new_name);
-    }
     copy_between(source, name, destination, new_name)
 }
 
@@ -1377,54 +1347,6 @@ fn copy_between(source: &str, name: &str, destination: &str, new_name: &str) {
     match outcome {
         Ok(()) => crate::println!("Copied {name} ({length} bytes) from {source} to {destination} as {new_name}."),
         Err(CopyError(reason)) => crate::println!("copy: {reason}."),
-    }
-}
-
-/// `copy HOST[:diskN]/NAME DST [NEWNAME]`: the first word is the remote file, the second the local volume (and the third,
-/// the new name, arrives as `destination` here because the parser shifted the words).
-fn copy_from_peer(remote: &str, local_volume: &str, new_name: Option<&str>) {
-    let Some((spec, name)) = remote.rsplit_once('/') else { return };
-    let new_name = new_name.unwrap_or(name);
-    let Some(Ok((_, volume))) = volume_word(local_volume) else {
-        return crate::println!("copy: {local_volume} is not diskN or @LABEL.");
-    };
-    if !crate::fosfs::valid_name(name.as_bytes()) || !crate::fosfs::valid_name(new_name.as_bytes()) {
-        return crate::println!("copy: invalid file name.");
-    }
-    let Some((mac, nic, disk)) = netfs_peer(spec) else { return crate::println!("copy: no machine called {spec} answered (see `nic peers`).") };
-    crate::println!("Fetching {name} from {} disk{disk}...", Mac(&mac));
-    match netfs_fetch(mac, nic, disk, name) {
-        Ok(length) => {
-            let staging = crate::tape::staging().unwrap();
-            match volume.write(new_name.as_bytes(), &staging[..length]) {
-                Ok(()) => crate::println!("Copied {name} ({length} bytes) from {spec} to {local_volume} as {new_name}."),
-                Err(error) => crate::println!("copy: {}.", copy_error("write", error).0),
-            }
-        }
-        Err(reason) => crate::println!("copy: {reason}."),
-    }
-}
-
-/// `copy SRC NAME HOST[:diskN] [NEWNAME]`: a local file to another machine.
-fn copy_to_peer(source: &str, name: &str, host: &str, new_name: &str) {
-    let Some(Ok((_, volume))) = volume_word(source) else {
-        return crate::println!("copy: {source} is not diskN or @LABEL.");
-    };
-    if !crate::fosfs::valid_name(name.as_bytes()) || !crate::fosfs::valid_name(new_name.as_bytes()) {
-        return crate::println!("copy: invalid file name.");
-    }
-    let Some(staging) = crate::tape::staging() else { return crate::println!("copy: no memory for the transfer buffer.") };
-    let length = match volume.read(name.as_bytes(), staging) {
-        Ok(Some(0)) => return crate::println!("copy: {name} is empty."),
-        Ok(Some(length)) => length,
-        Ok(None) => return crate::println!("copy: {name}: no such file on {source}."),
-        Err(_) => return crate::println!("copy: {name} cannot be read (over 4 MiB?)."),
-    };
-    let Some((mac, nic, disk)) = netfs_peer(host) else { return crate::println!("copy: no machine called {host} answered (see `nic peers`).") };
-    crate::println!("Sending {name} ({length} bytes) to {} disk{disk}...", Mac(&mac));
-    match netfs_store(mac, nic, disk, new_name, length) {
-        Ok(()) => crate::println!("Copied {name} to {host} as {new_name}."),
-        Err(reason) => crate::println!("copy: {reason}."),
     }
 }
 
@@ -1542,7 +1464,6 @@ pub(crate) fn debug_video(mut words: core::str::SplitWhitespace) {
 
 /// The x86 commands that are not in the shared tables yet (docs/shell.md), listed by `help` after the shared ones.
 pub(crate) fn help_extra() {
-    crate::println!("copy SRC NAME DST [NEWNAME]   copy a file, also between machines (diskN, @LABEL, esp; FAT too)");
     crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
     crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
     crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");

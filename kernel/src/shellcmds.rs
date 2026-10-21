@@ -58,6 +58,11 @@ pub static COMMANDS: &[Command] = &[
     Command::new("mmio", "mmio r8|r16|r32|r64 ADDR | mmio w8|w16|w32|w64 ADDR VALUE", "reads or writes mapped memory and device registers.", |_, rest| crate::diag::mmio(rest.split_whitespace())),
     #[cfg(target_arch = "x86_64")]
     Command::new("io", "io r8|r16|r32 PORT | io w8|w16|w32 PORT VALUE", "raw I/O port access.", |_, rest| crate::diag::io(rest.split_whitespace())),
+    Command::new("copy", "copy SRC NAME DST [NEWNAME] | HOST[:diskN]/NAME DST [NEWNAME] | SRC NAME HOST[:diskN]", "copies a file between volumes or to and from another machine (see `nic peers`).", |host, rest| {
+        if !crate::netfs::copy_peer(rest) {
+            local_copy(host, rest);
+        }
+    }),
     Command::new("sector", "sector diskN LBA [COUNT <= 4]", "raw read-only dump of disk sectors (a GPT header, the slot metadata).", |_, rest| sector(rest)),
     Command::new("start", "start", "runs the start file again (as at boot).", |_, _| start()),
     Command::new("dmesg", "dmesg", "the boot log.", |_, _| dmesg()),
@@ -455,5 +460,18 @@ fn fsck(rest: &str) {
         }
     } else {
         crate::println!("Usage: fsck [diskN|@LABEL]");
+    }
+}
+
+/// A copy between local volumes: x86 keeps its FAT-aware `copy`, the Pi uses the shared `cp`.
+#[cfg(target_arch = "x86_64")]
+fn local_copy(_: &mut dyn fosfor_shell::Host, rest: &str) {
+    crate::term::copy_command(rest.split_whitespace());
+}
+
+#[cfg(target_arch = "aarch64")]
+fn local_copy(host: &mut dyn fosfor_shell::Host, rest: &str) {
+    if let Some(cp) = fosfor_shell::files::COMMANDS.iter().find(|command| command.name == "cp") {
+        (cp.run)(host, rest);
     }
 }
