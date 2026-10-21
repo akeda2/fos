@@ -27,9 +27,9 @@ pub fn ring_position(index: u32, cx: i32, cy: i32, radius: i32) -> (i32, i32) {
 /// Segment bits: 1 top, 2 upper right, 4 lower right, 8 bottom, 16 lower left, 32 upper left, 64 middle.
 pub const SEGMENTS: [u8; 10] = [0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f];
 
-/// Colour of an unlit segment next to lit ones of colour `on`.
+/// Colour of an unlit segment next to lit ones of colour `on`. Faint on purpose: an LCD seen from the side lifts its blacks.
 pub fn ghost(background: u32, on: u32) -> u32 {
-    mix(background, on, 1, 14)
+    mix(background, on, 1, 32)
 }
 
 /// One digit in a box `w` x `h` at (`x`, `y`) with segments `t` thick; `None` is blank (unlit segments only).

@@ -335,7 +335,7 @@ fn dot_red() -> u32 {
 fn draw_grid(screen: &mut Screen, g: &Geometry) {
     let mut canvas = screen.grid();
     canvas.clear(theme().background);
-    let unlit = mix(theme().background, dot_red(), 2, 9);
+    let unlit = mix(theme().background, dot_red(), 1, 20);
     for index in 0..60 {
         let (x, y) = dial::ring_position(index, g.cx, g.cy, g.ring);
         dial::fill_disc(&mut canvas, x, y, if index % 5 == 0 { g.big } else { g.small }, unlit);
