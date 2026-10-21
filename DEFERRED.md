@@ -506,8 +506,12 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 
 ## Planned: Pi GPIO and touchscreen (2026-10-21)
 
-- **Pi GPIO, local and remote.** Local: a shell command (and a tape call, ABI append-only) to read, write and set the function and pull of
-  the BCM2711 pins, bounded waits, no pin changed without being asked. Remote: the same over the network (NETFS-style or `term net`
-  frames), so another fos machine can read and drive a Pi's pins. Not started; design the wire format before the code.
-- **Touchscreen support** (Pi). Not started: which panel (USB HID touch, DSI/I2C) is not decided. Nordic-only keyboards still hold for
-  any on-screen keys; the console grid and `gfx_*` tapes need a pointer/touch event call (append-only ABI).
+- **Pi GPIO, local and remote.** Decided: a kernel driver (`gpio.rs`, Pi only), not direct register access from tapes, because the
+  pins share a block with the UART, I2C and SPI muxing and the kernel can refuse pins it owns (console UART, Ethernet PHY, SD, HDMI
+  I2C) and restore every pin when a tape ends. Plan: append-only tape calls `gpio_get/set/mode/pull` (all 58 pins as a bitmask),
+  later edge events; shell `gpio` (list with function and level, `read N`, `set N 0|1`, `mode N in|out`), never driving a pin by
+  default; 3.3 V only. Remote: a new NETFS-style request/reply tag on the existing frames, authenticated with `synckey`; reads
+  always allowed, writes only with a `settings` line (`gpio-remote`) and a deny list of pins. Not started; fix the wire format first.
+- **Touchscreen** (Pi). The panel is USB, so it goes through `usb_hid` as a pointer device. To test 2026-10-22: which HID report
+  descriptor it sends (single or multi-touch, absolute coordinates, range). Then a pointer/touch event call for tapes (append-only
+  ABI) and hit-testing in the console and `gfx_*` tapes. Nordic-only keyboards still hold for any on-screen keys.
