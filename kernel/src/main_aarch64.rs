@@ -32,6 +32,7 @@ mod tasks;
 mod tape_fs;
 mod genet;
 mod kup_serial;
+mod kupshell;
 mod slots;
 mod sdhci;
 mod usb_hub;

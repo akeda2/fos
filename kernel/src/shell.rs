@@ -70,10 +70,6 @@ static COMMANDS: &[Command] = &[
         })
     }),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
-    Command::new("kup", "kup serial [BAUD]", "takes a kernel update over the serial port.", |_, rest| match rest.strip_prefix("serial") {
-        Some(baud) if baud.is_empty() || baud.starts_with(' ') => kup_serial(baud.trim()),
-        _ => crate::println!("Usage: kup serial [BAUD]"),
-    }),
     Command::new("debug", "debug [status|slots]", "kernel-update setting and the A/B slots (same wording as the x86 kernel).", |_, rest| match rest {
         "" | "status" | "slots" => {
             crate::println!("kernel-update {}", crate::netservice::kernel_update_enabled());
@@ -206,7 +202,7 @@ fn poke(rest: &str) {
 }
 
 /// The console UART as a `kup_serial` link.
-struct Console;
+pub(crate) struct Console;
 
 impl crate::kup_serial::Link for Console {
     fn read_byte(&mut self) -> Option<u8> {
@@ -217,44 +213,6 @@ impl crate::kup_serial::Link for Console {
     }
     fn micros(&self) -> u64 {
         timer::micros()
-    }
-}
-
-/// `kup serial`: takes a kernel image from `tools/send_kernel_serial.py` over the console UART into the inactive slot, then
-/// restarts to try it (the loader falls back to this kernel unless the new one reaches its milestone).
-fn kup_serial(speed: &str) {
-    let baud = if speed.is_empty() { 0 } else { speed.parse::<u32>().unwrap_or(0) };
-    if !speed.is_empty() && !(9_600..=3_000_000).contains(&baud) {
-        return crate::println!("kup serial [BAUD]: BAUD is 9600 to 3000000 (the sender must be told the same).");
-    }
-    const STAGE_BYTES: usize = 4 * 1024 * 1024;
-    let Some(staging) = memory::allocate_contiguous(STAGE_BYTES as u64 / memory::FRAME, None) else {
-        return crate::println!("kup: no memory for the image.");
-    };
-    let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, STAGE_BYTES) };
-    if baud == 0 {
-        crate::println!("KUP serial: ready (the sender starts within 30 s).");
-    } else {
-        crate::println!("KUP serial: ready at {baud} baud (the sender switches too and starts within 30 s).");
-        crate::arch::aarch64::pl011::drain();
-        timer::busy_wait_ms(50);
-        if !crate::arch::aarch64::pl011::set_baud(baud) {
-            return crate::println!("kup serial: that speed is not possible with this UART clock.");
-        }
-    }
-    let result = crate::kup_serial::serve(&mut Console, buffer);
-    if baud != 0 {
-        crate::arch::aarch64::pl011::drain();
-        crate::arch::aarch64::pl011::set_baud(0);
-    }
-    memory::free(staging, STAGE_BYTES as u64 / memory::FRAME);
-    match result {
-        Ok(slot) => {
-            crate::println!("KUP serial: image verified and written to slot {slot} (pending); restarting to try it.");
-            timer::busy_wait_ms(200);
-            crate::arch::aarch64::power::reset()
-        }
-        Err(message) => crate::println!("KUP serial: {message}; nothing was written."),
     }
 }
 

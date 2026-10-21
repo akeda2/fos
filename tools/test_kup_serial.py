@@ -19,7 +19,7 @@ from test_aarch64_boot import CODE, IMAGE, ROOT, VARS, check  # noqa: E402
 ARCH = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
 if ARCH == "aarch64":
     KERNEL = Path(os.environ.get("FOSFOR_AARCH64_KERNEL", ROOT / "build/cargo-target/aarch64-unknown-none-softfloat/release/fosfor-kernel"))
-    SLOTS = "slots"
+    SLOTS = "debug slots"
     MACHINE = ["qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72", "-m", "1G", "-device", "ramfb"]
     DISK = ["-device", "virtio-blk-pci,drive=boot"]
 else:

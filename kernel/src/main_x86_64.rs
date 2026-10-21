@@ -7,6 +7,7 @@ mod clock;
 mod config;
 mod debug;
 mod kup_serial;
+mod kupshell;
 mod diag;
 mod netdump;
 mod nicshell;
