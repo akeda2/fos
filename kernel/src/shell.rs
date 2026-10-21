@@ -69,13 +69,6 @@ static COMMANDS: &[Command] = &[
         })
     }),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
-    Command::new("debug", "debug [status|slots]", "kernel-update setting and the A/B slots (same wording as the x86 kernel).", |_, rest| match rest {
-        "" | "status" | "slots" => {
-            crate::println!("kernel-update {}", crate::netservice::kernel_update_enabled());
-            crate::slots::show();
-        }
-        _ => crate::println!("debug: status | slots"),
-    }),
     Command::new("irqs", "irqs", "interrupt counts.", |_, _| {
         let (uart, dropped) = crate::arch::aarch64::pl011::interrupt_counts();
         crate::println!("timer {}, uart {uart} (bytes dropped {dropped}), sd {}, genet {}", crate::gic::irq_ticks(), crate::sdhci::interrupt_count(), crate::genet::interrupt_count());

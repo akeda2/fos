@@ -187,7 +187,7 @@ pub fn relay(text: &str) {
 
 /// Sends everything queued as DATA frames. A frame that cannot be sent is dropped
 /// (a terminal can tolerate a torn screen; a stuck NIC must not stall the shell).
-fn flush() {
+pub(crate) fn flush() {
     let (Some(nic), Some(peer)) = (nic(), unsafe { *core::ptr::addr_of!(PEER) }) else { return };
     unsafe {
         let ring = &*core::ptr::addr_of!(RELAY);
@@ -1428,7 +1428,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1534,70 +1534,6 @@ fn execute(command: &str) {
         "power" => match words.next() {
             Some("hwp") => hwp_command(words.next()),
             word => power_command(word.and_then(|word| word.parse::<u64>().ok())),
-        },
-        "debug" => match words.next() {
-            Some("status") | Some("slots") | None => {
-                let debug = crate::config::debug();
-                crate::println!("reboot-on-crash {}, reboot-delay {} s, kernel-update {}, crash-on-boot {}", debug.reboot_on_crash, debug.reboot_delay_seconds, debug.kernel_update, debug.crash_on_boot);
-                crate::debug::slot_summary(|arguments| crate::println!("{}", arguments));
-            }
-            Some("crash") => {
-                crate::println!("Raising an invalid-opcode exception on purpose.");
-                flush();
-                unsafe { core::arch::asm!("ud2") };
-            }
-            Some("hang") => {
-                crate::println!("Spinning with interrupts on and no progress; the watchdog (if armed) should reset the machine.");
-                flush();
-                loop {
-                    core::hint::spin_loop();
-                }
-            }
-            Some("video") => {
-                use fosfor_abi::FLAG_SKIP_VIDEO;
-                let mut hint: Option<(u16, u16)> = None;
-                let change = match words.next() {
-                    Some("skip") => Some(true),
-                    Some("auto") => Some(false),
-                    // `size WxH` tells the BIOS stage two the monitor's size when the video BIOS cannot (no DDC/EDID, as on the
-                    // AMD/nForce board's NVIDIA card); `size auto` forgets it.
-                    Some("size") => {
-                        match words.next() {
-                            Some("auto") => hint = Some((0, 0)),
-                            Some(text) => match text.split_once('x').and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))) {
-                                Some((width, height)) if (640..=8192).contains(&width) && (480..=8192).contains(&height) => hint = Some((width, height)),
-                                _ => return crate::println!("debug video size WIDTHxHEIGHT (640x480 to 8192x8192) | size auto"),
-                            },
-                            None => return crate::println!("debug video size WIDTHxHEIGHT | size auto"),
-                        }
-                        None
-                    }
-                    None | Some("status") => None,
-                    Some(_) => return crate::println!("debug video [skip|auto|size WxH|size auto]"),
-                };
-                if let Some(size) = hint {
-                    if crate::debug::update_metadata(|metadata| metadata.monitor_hint = size).is_none() {
-                        return crate::println!("debug video: the slot metadata could not be read or written.");
-                    }
-                    if size == (0, 0) {
-                        crate::println!("Monitor size hint cleared: a BIOS boot trusts the monitor's EDID, else the old 1280x1024 rule.");
-                    } else {
-                        crate::println!("Monitor size hint {}x{}: a BIOS boot without an EDID picks the VBE mode whose shape fits it best.", size.0, size.1);
-                    }
-                }
-                let updated = match change {
-                    Some(skip) => crate::debug::update_metadata(|metadata| {
-                        if skip { metadata.flags |= FLAG_SKIP_VIDEO } else { metadata.flags &= !FLAG_SKIP_VIDEO }
-                    }),
-                    None => crate::debug::read_metadata(),
-                };
-                match updated {
-                    Some(metadata) if metadata.flags & FLAG_SKIP_VIDEO != 0 => crate::println!("BIOS boot: the video mode switch is skipped (the BIOS text screen stays and the kernel writes to it, and to the serial port). `debug video auto` undoes it. UEFI boots ignore this."),
-                    Some(_) => crate::println!("BIOS boot: the video mode (VBE framebuffer) is chosen automatically. Holding Shift during a boot skips it once; `debug video skip` skips it for good."),
-                    None => crate::println!("debug video: the slot metadata could not be read or written."),
-                }
-            }
-            Some(_) => crate::println!("debug: status | slots | crash | hang | video [skip|auto|size WxH]"),
         },
         other => {
             if !fosfor_shell::external(&mut crate::shellhost::KernelHost, command) {
@@ -2026,6 +1962,52 @@ fn copy_error(stage: &'static str, error: crate::fosfs::Error) -> CopyError {
 }
 
 /// A `format` that was announced and awaits `format diskN confirm`.
+/// `debug video [skip|auto|size WxH|size auto]`: BIOS boots only (a flag and a monitor hint in the slot metadata).
+pub(crate) fn debug_video(mut words: core::str::SplitWhitespace) {
+        use fosfor_abi::FLAG_SKIP_VIDEO;
+        let mut hint: Option<(u16, u16)> = None;
+        let change = match words.next() {
+            Some("skip") => Some(true),
+            Some("auto") => Some(false),
+            // `size WxH` tells the BIOS stage two the monitor's size when the video BIOS cannot (no DDC/EDID, as on the
+            // AMD/nForce board's NVIDIA card); `size auto` forgets it.
+            Some("size") => {
+                match words.next() {
+                    Some("auto") => hint = Some((0, 0)),
+                    Some(text) => match text.split_once('x').and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))) {
+                        Some((width, height)) if (640..=8192).contains(&width) && (480..=8192).contains(&height) => hint = Some((width, height)),
+                        _ => return crate::println!("debug video size WIDTHxHEIGHT (640x480 to 8192x8192) | size auto"),
+                    },
+                    None => return crate::println!("debug video size WIDTHxHEIGHT | size auto"),
+                }
+                None
+            }
+            None | Some("status") => None,
+            Some(_) => return crate::println!("debug video [skip|auto|size WxH|size auto]"),
+        };
+        if let Some(size) = hint {
+            if crate::debug::update_metadata(|metadata| metadata.monitor_hint = size).is_none() {
+                return crate::println!("debug video: the slot metadata could not be read or written.");
+            }
+            if size == (0, 0) {
+                crate::println!("Monitor size hint cleared: a BIOS boot trusts the monitor's EDID, else the old 1280x1024 rule.");
+            } else {
+                crate::println!("Monitor size hint {}x{}: a BIOS boot without an EDID picks the VBE mode whose shape fits it best.", size.0, size.1);
+            }
+        }
+        let updated = match change {
+            Some(skip) => crate::debug::update_metadata(|metadata| {
+                if skip { metadata.flags |= FLAG_SKIP_VIDEO } else { metadata.flags &= !FLAG_SKIP_VIDEO }
+            }),
+            None => crate::debug::read_metadata(),
+        };
+        match updated {
+            Some(metadata) if metadata.flags & FLAG_SKIP_VIDEO != 0 => crate::println!("BIOS boot: the video mode switch is skipped (the BIOS text screen stays and the kernel writes to it, and to the serial port). `debug video auto` undoes it. UEFI boots ignore this."),
+            Some(_) => crate::println!("BIOS boot: the video mode (VBE framebuffer) is chosen automatically. Holding Shift during a boot skips it once; `debug video skip` skips it for good."),
+            None => crate::println!("debug video: the slot metadata could not be read or written."),
+        }
+}
+
 /// The x86 commands that are not in the shared tables yet (docs/shell.md), listed by `help` after the shared ones.
 pub(crate) fn help_extra() {
     crate::println!("copy SRC NAME DST [NEWNAME]   copy a file, also between machines (diskN, @LABEL, esp; FAT too)");
@@ -2045,7 +2027,6 @@ pub(crate) fn help_extra() {
     crate::println!("uptime    time since the timer started; sleep N waits N seconds");
     crate::println!("power    [N]  how much of the time the CPU slept in hlt (N: sample N s at the prompt)");
     crate::println!("power hwp [performance|balanced|power]  CPU frequency scaling (Intel HWP)");
-    crate::println!("debug ... status | slots | crash | hang");
     crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
 }
 

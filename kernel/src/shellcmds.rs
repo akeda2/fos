@@ -48,6 +48,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
     Command::new("label", "label [diskN|@LABEL [NAME|-]]", "shows or sets a FOSFS volume's label (@LABEL names a volume).", |_, rest| label(rest)),
     Command::new("format", "format diskN [NAME] [force] | format diskN exfat [LABEL]", "erases a disk's FOSFS volume, or makes it one exFAT volume for PCs; asks first (then `format diskN confirm`).", |_, rest| crate::formatshell::command(rest)),
+    Command::new("debug", "debug [status|slots|crash|hang|video ...]", "kernel-update setting and the A/B slots; `crash` and `hang` test the crash record and the watchdog; `video` (x86 BIOS boots) the video mode.", |_, rest| debug(rest)),
     Command::new("sector", "sector diskN LBA [COUNT <= 4]", "raw read-only dump of disk sectors (a GPT header, the slot metadata).", |_, rest| sector(rest)),
     Command::new("start", "start", "runs the start file again (as at boot).", |_, _| start()),
     Command::new("dmesg", "dmesg", "the boot log.", |_, _| dmesg()),
@@ -106,6 +107,48 @@ fn label(rest: &str) {
         Ok(()) if wanted.is_empty() => crate::println!("disk{number}: label cleared."),
         Ok(()) => crate::println!("disk{number} is now @{wanted}."),
         Err(error) => crate::println!("label: {error:?}"),
+    }
+}
+
+fn debug(rest: &str) {
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        None | Some("status") | Some("slots") => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let debug = crate::config::debug();
+                crate::println!("reboot-on-crash {}, reboot-delay {} s, kernel-update {}, crash-on-boot {}", debug.reboot_on_crash, debug.reboot_delay_seconds, debug.kernel_update, debug.crash_on_boot);
+                crate::debug::slot_summary(|arguments| crate::println!("{}", arguments));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                crate::println!("kernel-update {}", crate::netservice::kernel_update_enabled());
+                crate::slots::show();
+            }
+        }
+        Some("crash") => {
+            crate::println!("Raising an undefined-instruction exception on purpose.");
+            #[cfg(target_arch = "x86_64")]
+            {
+                crate::term::flush();
+                unsafe { core::arch::asm!("ud2") };
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!("udf #0")
+            };
+        }
+        Some("hang") => {
+            crate::println!("Spinning with interrupts on and no progress; the watchdog (if armed) should reset the machine.");
+            #[cfg(target_arch = "x86_64")]
+            crate::term::flush();
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        Some("video") => crate::term::debug_video(words),
+        Some(_) => crate::println!("debug: status | slots | crash | hang | video [skip|auto|size WxH]"),
     }
 }
 
