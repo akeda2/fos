@@ -503,3 +503,11 @@ Done and checked on skylake3, laptop1 and amd1: the `ptp` tape (against ptp4l to
 - `gonio` (goniometer) is written and tested in QEMU with its test tone only. Open: true-peak in the LUFS panel, a PNG save key (`tape_rt::save`), real-hardware checks (UFX pairs, Nordic reading against a known tone, scope on real
   programme material, draw speed on the real framebuffer), playing the test pair to the outputs. `make test-all` (landsbro) has not
   run since the USB-units, simd and shared-crate changes; clock1's PTP after the last reset was not looked at.
+
+## Planned: Pi GPIO and touchscreen (2026-10-21)
+
+- **Pi GPIO, local and remote.** Local: a shell command (and a tape call, ABI append-only) to read, write and set the function and pull of
+  the BCM2711 pins, bounded waits, no pin changed without being asked. Remote: the same over the network (NETFS-style or `term net`
+  frames), so another fos machine can read and drive a Pi's pins. Not started; design the wire format before the code.
+- **Touchscreen support** (Pi). Not started: which panel (USB HID touch, DSI/I2C) is not decided. Nordic-only keyboards still hold for
+  any on-screen keys; the console grid and `gfx_*` tapes need a pointer/touch event call (append-only ABI).
