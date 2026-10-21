@@ -64,24 +64,6 @@ pub fn run() -> ! {
 static COMMANDS: &[Command] = &[
     Command::new("start", "start", "runs the boot volume's `start` file again.", |_, _| start_script(true)),
     Command::new("version", "version", "the kernel's name.", |_, _| crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`).")),
-    Command::new("mem", "mem", "physical memory, managed and free.", |_, _| {
-        let stats = memory::stats();
-        let mib = |frames: u64| frames * memory::FRAME / (1024 * 1024);
-        crate::println!("Physical memory: {} MiB managed, {} MiB free.", mib(stats.frames), mib(stats.free));
-    })
-    .alias(&["memory"]),
-    Command::new("disks", "disks", "lists the disks: size, model and where each came from.", |_, _| {
-        for index in 0..block::count() {
-            let disk = block::get(index).unwrap();
-            crate::println!(
-                "disk{}: {} MiB, {} ({})",
-                index + 1,
-                disk.sectors / 2048,
-                core::str::from_utf8(&disk.model).unwrap_or("?").trim(),
-                core::str::from_utf8(&disk.origin[..disk.origin_length]).unwrap_or("?")
-            );
-        }
-    }),
     Command::new("fsck", "fsck [diskN]", "checks a FOSFS volume's directory.", |_, rest| match volume(rest) {
         Some(volume) => fosfs::report(&volume),
         None => crate::println!("fsck: no FOSFS volume there (use `fsck` or `fsck diskN`)."),
@@ -91,7 +73,6 @@ static COMMANDS: &[Command] = &[
     Command::new("audio", "audio ...", "the audio device and a quick capture check.", |_, rest| audio(rest)),
     Command::new("display", "display ...", "the screens.", |_, rest| display(rest)),
     Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |_, rest| run_tape(rest)),
-    Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
     Command::new("acpi", "acpi", "lists the ACPI tables.", |_, _| {
         crate::arch::aarch64::acpi::list(|signature, address, length| {
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
@@ -133,7 +114,6 @@ static COMMANDS: &[Command] = &[
         crate::arch::aarch64::power::reset()
     })
     .alias(&["reboot"]),
-    Command::new("clear", "clear", "clears the screen.", |_, _| crate::print(format_args!("\x1b[2J"))),
     Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),
     Command::new("poke", "poke ADDR VALUE", "writes memory (hex; bring-up).", |_, rest| poke(rest)),
 ];

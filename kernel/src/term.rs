@@ -11,7 +11,7 @@
 //! session is open; it is flushed to the wire in 1 KiB DATA frames.
 
 use crate::nic::Nic;
-use crate::{memory, pci, power, timer};
+use crate::{pci, power, timer};
 
 const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
@@ -1436,7 +1436,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1445,11 +1445,6 @@ fn execute(command: &str) {
             crate::println!("Fosfor OS (fos) is a small educational 64-bit x86 operating system.");
             crate::println!("One kernel, booted by a UEFI loader or by the BIOS boot code.");
             crate::println!("Design: docs/design.md.");
-        }
-        "memory" => {
-            let stats = memory::stats();
-            crate::println!("Managed:   {} MiB ({} frames of 4 KiB)", stats.frames * memory::FRAME / (1024 * 1024), stats.frames);
-            crate::println!("Free:      {} MiB ({} frames)", stats.free * memory::FRAME / (1024 * 1024), stats.free);
         }
         "pci" if crate::diag::pci_access(words.clone()) => {}
         "pci" => {
@@ -1517,7 +1512,6 @@ fn execute(command: &str) {
         "irqstat" => crate::diag::irqstat(),
         "io" => crate::diag::io(words),
         "mmio" => crate::diag::mmio(words),
-        "clear" => crate::print(format_args!("\x1b[2J")),
         "gpu" => crate::gpu::command(),
         "hexdump" => {
             let address = words.next().and_then(parse_number);
@@ -1637,22 +1631,6 @@ fn execute(command: &str) {
         "videomodes" => videomodes_command(),
         "copy" => copy_command(words),
         "tapesync" => crate::tapesync::command(words),
-        "disks" => {
-            for index in 0..crate::block::count() {
-                let disk = crate::block::get(index).unwrap();
-                crate::println!(
-                    "disk{}: {} MiB {} {}",
-                    index + 1,
-                    disk.sectors / 2048,
-                    core::str::from_utf8(&disk.origin[..disk.origin_length]).unwrap_or("?"),
-                    core::str::from_utf8(&disk.model).unwrap_or("?").trim()
-                );
-            }
-            match crate::storage::boot_disk() {
-                Some(disk) => crate::println!("boot disk: disk{}", disk + 1),
-                None => crate::println!("boot disk: not identified"),
-            }
-        }
         "start" => start_command(),
         "fsck" => files(&mut words, |volume, _, _| crate::fosfs::report(&volume)),
         "usb" => {
@@ -2643,13 +2621,10 @@ fn label_command(mut words: core::str::SplitWhitespace) {
 pub(crate) fn help_extra() {
     crate::println!("copy SRC NAME DST [NEWNAME]   copy a file, also between machines (diskN, @LABEL, esp; FAT too)");
     crate::println!("about     what this is");
-    crate::println!("memory    physical memory statistics");
     crate::println!("pci       list PCI functions (pci read|write B:D.F ... reaches config space)");
     crate::println!("cpuinfo bootinfo memmap irqstat   what the CPU, loader and firmware report");
     crate::println!("hexdump ADDRESS [LENGTH]   dump mapped memory; io r8|w8.. PORT; mmio r32|w32.. ADDR");
-    crate::println!("clear     clear the screen");
     crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
-    crate::println!("disks     disks found by the drivers (the boot disk is disk1)");
     crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
     crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
     crate::println!("sector diskN LBA [COUNT]   raw read-only dump of disk sectors (a GPT header, the slot metadata)");

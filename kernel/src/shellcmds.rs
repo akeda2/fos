@@ -18,7 +18,35 @@ pub static COMMANDS: &[Command] = &[
     Command::new("keymap", "keymap [us|sv]", "the local keyboard layout (sv: Swedish/Finnish).", |_, rest| keymap(rest)),
     Command::new("ps", "ps", "lists the running tapes.", |_, _| crate::tasks::list()).alias(&["tasks"]),
     Command::new("kill", "kill N|NAME|all", "stops a background tape.", |_, rest| crate::tasks::kill(rest.split_whitespace().next())),
+    Command::new("memory", "memory", "physical memory, managed and free.", |_, _| memory()).alias(&["mem"]),
+    Command::new("disks", "disks", "the disks the drivers found (the boot disk is disk1).", |_, _| disks()),
+    Command::new("clear", "clear", "clears the screen.", |_, _| crate::print(format_args!("\x1b[2J"))),
+    Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
 ];
+
+fn memory() {
+    let stats = crate::memory::stats();
+    let mib = |frames: u64| frames * crate::memory::FRAME / (1024 * 1024);
+    crate::println!("Managed:   {} MiB ({} frames of 4 KiB)", mib(stats.frames), stats.frames);
+    crate::println!("Free:      {} MiB ({} frames)", mib(stats.free), stats.free);
+}
+
+fn disks() {
+    for index in 0..crate::block::count() {
+        let disk = crate::block::get(index).unwrap();
+        crate::println!(
+            "disk{}: {} MiB {} {}",
+            index + 1,
+            disk.sectors / 2048,
+            core::str::from_utf8(&disk.origin[..disk.origin_length]).unwrap_or("?"),
+            core::str::from_utf8(&disk.model).unwrap_or("?").trim()
+        );
+    }
+    match crate::storage::boot_disk() {
+        Some(disk) => crate::println!("boot disk: disk{}", disk + 1),
+        None => crate::println!("boot disk: not identified"),
+    }
+}
 
 fn sleep(rest: &str) {
     let seconds = rest.split_whitespace().next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(1).min(60);
