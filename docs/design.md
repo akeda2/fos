@@ -1268,6 +1268,6 @@ float WAV (format tag 3) for a float device, `play` reads it, `ltas`/`gonio` met
 integer device is dithered (TPDF, `audio_wire::Dither`); a float device gets the samples as decoded. A private
 wire mode `bits=32` (or `bits=f32`) sends big-endian IEEE singles: raw header bits 32, RTP payload `F32` in the
 SDP (no RFC name exists), AVTP AAF format 0x01. L16/L24 remain the standards-based modes. `send latency` needs
-16 or 24 bits; the panel has no float entry yet (a saved `bits 32` reads back as 24). Tests: `make test`
+16 or 24 bits. The panel's codec row has a "PCM 32-bit float" choice (saved as `bits 32`, last in the list so the Opus numbers stay put). Tests: `make test`
 (`audio-sample`, `audio-wire` round trips) and `make test-audio-net` (run h: float RTP, F32 SDP, 350 Hz tone).
 Only real hardware shows a float interface's behaviour and Opus's CPU cost on old machines.

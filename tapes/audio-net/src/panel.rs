@@ -25,7 +25,16 @@ const MODES: [&str; 4] = ["Send", "Receive", "Duplex (send and receive)", "Serve
 /// `Settings::mode` of the HTTP server.
 const SERVE: usize = 3;
 const NETWORKS: [&str; 3] = ["RTP over IP (routable, AES67-style)", "Raw Ethernet (same switch, no IP)", "AVTP (AVB, same switch, no IP)"];
-const CODECS: [&str; 5] = ["PCM 24-bit (best quality)", "PCM 16-bit", "Opus, balanced (96 kbit/s per stereo pair)", "Opus, low bandwidth (48 kbit/s per pair)", "Opus, low delay (128 kbit/s per pair, 5 ms)"];
+const CODECS: [&str; 6] = ["PCM 24-bit (best quality)", "PCM 16-bit", "Opus, balanced (96 kbit/s per stereo pair)", "Opus, low bandwidth (48 kbit/s per pair)", "Opus, low delay (128 kbit/s per pair, 5 ms)", "PCM 32-bit float (private mode, F32)"];
+/// Index of the float PCM choice; it comes after the Opus ones so their numbers stay put.
+const FLOAT: usize = 5;
+/// PCM choices are 24-bit, 16-bit and float; 2 to 4 are Opus.
+fn is_pcm(codec: usize) -> bool {
+    codec < 2 || codec == FLOAT
+}
+fn is_opus(codec: usize) -> bool {
+    (2..FLOAT).contains(&codec)
+}
 
 const R_MODE: usize = 0;
 const R_NETWORK: usize = 1;
@@ -101,7 +110,7 @@ impl Settings {
             R_RECEIVE => self.mode == 1 || self.mode == 2,
             R_PORT | R_PREBUFFER => self.mode == SERVE,
             R_PRIORITY | R_PTP => self.mode != SERVE,
-            R_PACKET => self.mode != SERVE && self.mode != 1 && self.codec < 2,
+            R_PACKET => self.mode != SERVE && self.mode != 1 && is_pcm(self.codec),
             _ => true,
         }
     }
@@ -160,7 +169,7 @@ impl Settings {
             if self.target != 0 {
                 let _ = writeln!(out, "target {}", self.target);
             }
-            if self.packet != 0 && self.codec < 2 {
+            if self.packet != 0 && is_pcm(self.codec) {
                 let _ = writeln!(out, "ptime {}", PACKET_US[self.packet]);
             }
         }
@@ -176,6 +185,9 @@ impl Settings {
             }
             3 => {
                 let _ = writeln!(out, "codec opus\nbitrate 48\nframe 20");
+            }
+            FLOAT => {
+                let _ = writeln!(out, "bits 32");
             }
             _ => {
                 let _ = writeln!(out, "codec opus\nbitrate 128\nframe 5");
@@ -246,7 +258,7 @@ impl Settings {
                 "codec" => opus = value == "opus",
                 "bitrate" => bitrate = value.parse().unwrap_or(96),
                 "frame" => frame = value.parse().unwrap_or(20),
-                "bits" => bits = value.parse().unwrap_or(24),
+                "bits" => bits = if value == "f32" { 32 } else { value.parse().unwrap_or(24) },
                 "ch" if self.mode == 1 => self.receive = Text::from(value),
                 "ch" | "in" => self.send = Text::from(value),
                 "out" => self.receive = Text::from(value),
@@ -257,13 +269,15 @@ impl Settings {
             if frame < 20 { 4 } else if bitrate <= 64 { 3 } else { 2 }
         } else if bits == 16 {
             1
+        } else if bits == 32 {
+            FLOAT
         } else {
             0
         };
-        if !self.rtp() && self.codec >= 2 {
+        if !self.rtp() && is_opus(self.codec) {
             self.codec = 0;
         }
-        if self.mode == SERVE && self.codec < 2 {
+        if self.mode == SERVE && is_pcm(self.codec) {
             self.codec = 2; // Ogg Opus: there is no PCM here
         }
     }
@@ -442,6 +456,7 @@ fn bandwidth(settings: &Settings) -> u32 {
         1 => count * 16 * 48 * 112 / 100,
         2 => count.div_ceil(2) * 96,
         3 => count.div_ceil(2) * 48,
+        FLOAT => count * 32 * 48 * 112 / 100,
         _ => count.div_ceil(2) * 128,
     };
     match settings.mode {
@@ -544,7 +559,7 @@ fn cycle(settings: &mut Settings, row: usize, step: isize) {
     match row {
         R_MODE => {
             settings.mode = wrap(settings.mode, MODES.len());
-            if settings.mode == SERVE && settings.codec < 2 {
+            if settings.mode == SERVE && is_pcm(settings.codec) {
                 settings.codec = 2; // Ogg Opus: there is no PCM here
             }
         }
@@ -557,7 +572,7 @@ fn cycle(settings: &mut Settings, row: usize, step: isize) {
         R_PTP => settings.ptp = wrap(settings.ptp, PTP_MODES.len()),
         R_NETWORK => {
             settings.network = wrap(settings.network, 3);
-            if !settings.rtp() && settings.codec >= 2 {
+            if !settings.rtp() && is_opus(settings.codec) {
                 settings.codec = 0; // Opus needs RTP
             }
         }
@@ -567,8 +582,10 @@ fn cycle(settings: &mut Settings, row: usize, step: isize) {
                 // The Opus choices only (2 to 4), wrapping.
                 settings.codec = 2 + (settings.codec.max(2) - 2 + if step < 0 { 2 } else { 1 }) % 3;
             } else {
-                let count = if settings.rtp() { CODECS.len() } else { 2 };
-                settings.codec = wrap(settings.codec, count);
+                // Without RTP: 24-bit, 16-bit and float (Opus needs RTP).
+                let choices: &[usize] = if settings.rtp() { &[0, 1, 2, 3, 4, FLOAT] } else { &[0, 1, FLOAT] };
+                let at = choices.iter().position(|&c| c == settings.codec).unwrap_or(0);
+                settings.codec = choices[wrap(at, choices.len())];
             }
         }
         _ => {}
