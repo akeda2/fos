@@ -13,6 +13,7 @@ mod block;
 mod font_data;
 mod clock;
 mod fatvol;
+mod formatshell;
 mod fosfs;
 mod framebuffer;
 mod gpt;

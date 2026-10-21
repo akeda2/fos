@@ -91,6 +91,9 @@ static COMMANDS: &[Command] = &[
 ];
 
 fn execute(line: &str) {
+    if line.split_whitespace().next() != Some("format") {
+        crate::formatshell::cancel();
+    }
     if line.is_empty() || fosfor_shell::execute(&mut KernelHost, &[COMMANDS, crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], line) {
         return;
     }

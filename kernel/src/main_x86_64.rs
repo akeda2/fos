@@ -18,6 +18,7 @@ mod gpu;
 mod ehci;
 mod ohci;
 mod fatvol;
+mod formatshell;
 mod fault;
 mod fosfs;
 mod font_data;

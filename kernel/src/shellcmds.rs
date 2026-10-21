@@ -47,6 +47,7 @@ pub static COMMANDS: &[Command] = &[
     }),
     Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
     Command::new("label", "label [diskN|@LABEL [NAME|-]]", "shows or sets a FOSFS volume's label (@LABEL names a volume).", |_, rest| label(rest)),
+    Command::new("format", "format diskN [NAME] [force] | format diskN exfat [LABEL]", "erases a disk's FOSFS volume, or makes it one exFAT volume for PCs; asks first (then `format diskN confirm`).", |_, rest| crate::formatshell::command(rest)),
     Command::new("sector", "sector diskN LBA [COUNT <= 4]", "raw read-only dump of disk sectors (a GPT header, the slot metadata).", |_, rest| sector(rest)),
     Command::new("start", "start", "runs the start file again (as at boot).", |_, _| start()),
     Command::new("dmesg", "dmesg", "the boot log.", |_, _| dmesg()),
