@@ -1,5 +1,5 @@
-//! A thin Rust wrapper around a vendored libopus (BSD-3-Clause, `tapes/opus-codec/vendor/opus`, v1.5.2), built
-//! freestanding for the 64-bit tape target by `make opus-lib`: no libc, no malloc. libopus's own allocations
+//! A thin Rust wrapper around a vendored libopus (BSD-3-Clause, `crates/opus-codec/vendor/opus`, v1.6.1, the
+//! floating-point build), built freestanding for the 64-bit hard-float tape target by `make opus-lib`: no libc, no malloc. libopus's own allocations
 //! (a scratch "pseudo stack" and the codec state) go through the tape API's `alloc`/`free`, remembered with a
 //! small size header in front of each block, so a tape needs nothing from the system but the table it already
 //! has. Only one encoder and one decoder at a time are expected per stream, but any number of instances work.
@@ -12,6 +12,8 @@ unsafe extern "C" {
     fn opus_decoder_get_size(channels: i32) -> i32;
     fn opus_decoder_init(state: *mut c_void, sample_rate: i32, channels: i32) -> i32;
     fn opus_decode(state: *mut c_void, data: *const u8, len: i32, pcm: *mut i16, frame_size: i32, decode_fec: i32) -> i32;
+    fn opus_decode_float(state: *mut c_void, data: *const u8, len: i32, pcm: *mut f32, frame_size: i32, decode_fec: i32) -> i32;
+    fn opus_encode_float(state: *mut c_void, pcm: *const f32, frame_size: i32, data: *mut u8, max_data_bytes: i32) -> i32;
     fn opus_encoder_get_size(channels: i32) -> i32;
     fn opus_encoder_init(state: *mut c_void, sample_rate: i32, channels: i32, application: i32) -> i32;
     fn opus_encode(state: *mut c_void, pcm: *const i16, frame_size: i32, data: *mut u8, max_data_bytes: i32) -> i32;
@@ -120,6 +122,25 @@ impl Decoder {
 }
 
 impl Decoder {
+    /// Like `decode`, into interleaved 32-bit float (full scale 1.0): no integer step, so a float device gets the
+    /// decoder's own output.
+    pub fn decode_float(&mut self, packet: &[u8], pcm: &mut [f32], frame_size: usize) -> Result<usize> {
+        if pcm.len() < frame_size * self.channels as usize {
+            return Err(OpusError::OutputTooSmall);
+        }
+        let n = unsafe { opus_decode_float(self.state, packet.as_ptr(), packet.len() as i32, pcm.as_mut_ptr(), frame_size as i32, 0) };
+        if n < 0 { Err(OpusError::from_code(n)) } else { Ok(n as usize) }
+    }
+
+    /// `conceal` into float.
+    pub fn conceal_float(&mut self, pcm: &mut [f32], frame_size: usize) -> Result<usize> {
+        if pcm.len() < frame_size * self.channels as usize {
+            return Err(OpusError::OutputTooSmall);
+        }
+        let n = unsafe { opus_decode_float(self.state, core::ptr::null(), 0, pcm.as_mut_ptr(), frame_size as i32, 0) };
+        if n < 0 { Err(OpusError::from_code(n)) } else { Ok(n as usize) }
+    }
+
     /// Packet-loss concealment: asks libopus to synthesise `frame_size` frames per channel for a packet that never
     /// arrived (it extrapolates from the last good audio).
     pub fn conceal(&mut self, pcm: &mut [i16], frame_size: usize) -> Result<usize> {
@@ -197,6 +218,17 @@ impl Encoder {
             return Err(OpusError::OutputTooSmall);
         }
         let n = unsafe { opus_encode(self.state, pcm.as_ptr(), frame_size as i32, packet.as_mut_ptr(), packet.len() as i32) };
+        if n < 0 { Err(OpusError::from_code(n)) } else { Ok(n as usize) }
+    }
+}
+
+impl Encoder {
+    /// Encodes `frame_size` frames per channel of interleaved 32-bit float (full scale 1.0); returns the packet's length.
+    pub fn encode_float(&mut self, pcm: &[f32], frame_size: usize, packet: &mut [u8]) -> Result<usize> {
+        if pcm.len() < frame_size * self.channels as usize {
+            return Err(OpusError::OutputTooSmall);
+        }
+        let n = unsafe { opus_encode_float(self.state, pcm.as_ptr(), frame_size as i32, packet.as_mut_ptr(), packet.len() as i32) };
         if n < 0 { Err(OpusError::from_code(n)) } else { Ok(n as usize) }
     }
 }

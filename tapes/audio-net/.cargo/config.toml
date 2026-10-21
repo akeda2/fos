@@ -1,0 +1,4 @@
+# A hard-float tape: libopus is the floating-point build and audio samples stay f32 end to end (SSE2 baseline,
+# the kernel turns SSE on before the tape starts; see tapes/.cargo/config.toml).
+[build]
+target = "../../targets/x86_64-fos-tape-fp.json"

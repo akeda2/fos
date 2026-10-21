@@ -3,15 +3,17 @@
  * This is NOT part of upstream libopus (which normally generates config.h
  * via autoconf) -- it is this project's own, hand-written substitute,
  * matching AGENTS.md's "Real-time audio streaming over RTP/UDP" Opus
- * design: a vendored fixed-point-only decoder, no libm, no libc malloc.
+ * design: a vendored float codec (SSE2, FLOAT_APPROX), no libm, no libc malloc.
  *
- * Vendored from: https://github.com/xiph/opus release v1.5.2
+ * Vendored from: https://github.com/xiph/opus release v1.6.1
  * (tapes/opus-codec/vendor/opus/, trimmed to the decode-only subset --
  * see the Makefile's opus-codec-lib recipe for the exact file list and
  * AGENTS.md for the rationale). License: BSD-3-Clause, see
  * tapes/opus-codec/vendor/opus/COPYING (kept verbatim from upstream).
  *
- * FIXED_POINT + DISABLE_FLOAT_API: build the fixed-point decoder only --
+ * Floating-point build (no FIXED_POINT): the float API takes f32 straight from a
+ * float audio device. FLOAT_APPROX replaces exp/log with polynomials, so only a few
+ * libm symbols remain; opus-codec's lib.rs provides them (checked with nm -u). Earlier fixed-point notes:
  * no libm dependency anywhere (verified by inspecting every compiled
  * object's undefined symbols: no sqrt/sin/cos/exp/log/pow appears).
  *
@@ -71,8 +73,7 @@
 #define CONFIG_H
 
 #define OPUS_BUILD 1
-#define FIXED_POINT 1
-#define DISABLE_FLOAT_API 1
+#define FLOAT_APPROX 1
 #define NONTHREADSAFE_PSEUDOSTACK 1
 #define CUSTOM_SUPPORT 1
 

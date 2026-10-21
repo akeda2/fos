@@ -379,7 +379,7 @@ firmware, so a pending slot is tried on the next boot.
   is slow (about 10 ms a line over serial), so any per-packet or per-loss message makes a receiver lose the next
   packets; `verbose` therefore prints only a few gap lines and one status line per 10 s.
   **Stage C, Opus:** `codec=opus` (with `proto=rtp`, 48 kHz) sends and receives Opus (RFC 7587, `opus/48000/2`) from the
-  vendored fixed-point libopus (`build.rs` links `build/fosfor/opus-fixed/libopus_fixed.a`). One RTP stream per stereo
+  vendored floating-point libopus 1.6.1 (`build.rs` links `build/fosfor/opus-float/libopus_float.a`; audio-net is a hard-float tape). One RTP stream per stereo
   pair (an odd last channel is a mono stream) on UDP ports `port`, `port+2`, ..., each with its own SSRC and the
   same RTP timestamps; `send` prints an SDP with one media line per stream. Options: `bitrate=` (kbit/s per pair,
   default 128), `frame=` (2.5, 5, 10, 20, 40, 60 ms; default 20), `complexity=` (0-10, default 5). The receiver
