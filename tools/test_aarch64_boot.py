@@ -74,7 +74,7 @@ def boot(image: Path, screendump: Path | None = None, commands: tuple[str, ...] 
                     deadline = time.time() + 60
                     while time.time() < deadline:
                         seen = log.read_bytes().lower()
-                        if seen.count(b"fos> ") >= count or b"parking the cpu" in seen:
+                        if seen.count(b"fos> ") >= count or b"parking the cpu" in seen or qemu.poll() is not None:
                             return
                         time.sleep(0.3)
 
@@ -204,6 +204,9 @@ def main():
     check("gfxcheck: done" in gfx_text, "the tape ends and the shell returns (gfx_close)", gfx_text)
     two_text = boot(IMAGE, None, ("date set 2026-10-20 11:52:30",), (), None, (("run clock ntp=off + clock ntp=off\r", "ntp=off\r\n"), ("\t", ""), ("\x1b", "clock: stopped."), ("\x1b", "Both tapes returned")))
     check(two_text.count("clock: stopped.") == 2 and "Both tapes returned; back at the fos shell." in two_text, "`run A + B` runs two tapes at once; Tab moves the keyboard, Esc ends the focused one and the shell returns when both have", two_text)
+    start = time.time()
+    off_text = boot(IMAGE, None, ("shutdown",))
+    check("Powering off." in off_text and time.time() - start < 40, "`shutdown` powers the machine off (PSCI SYSTEM_OFF ends QEMU)", off_text)
     cmd_text = boot(IMAGE, None, ("write scratch.txt hello shell", "cat scratch.txt", "rm scratch.txt", "rm scratch.txt", "sleep 1", "debug", "memory", "irqstat"))
     check("Wrote 11 bytes to scratch.txt." in cmd_text and re.search(r"^hello shell$", cmd_text, re.M) is not None and "Removed scratch.txt." in cmd_text and "rm: scratch.txt: no such file" in cmd_text, "`write` and `rm` create, read back and remove a file, as on x86", cmd_text)
     check("Slept 1 s." in cmd_text and "kernel-update" in cmd_text and "slot sizes (sectors)" in cmd_text and "Managed:" in cmd_text, "`sleep`, `debug` (kernel-update and slots) and the x86 names `memory`/`irqstat` work", cmd_text)

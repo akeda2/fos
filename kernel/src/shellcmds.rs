@@ -21,8 +21,35 @@ pub static COMMANDS: &[Command] = &[
     Command::new("memory", "memory", "physical memory, managed and free.", |_, _| memory()).alias(&["mem"]),
     Command::new("disks", "disks", "the disks the drivers found (the boot disk is disk1).", |_, _| disks()),
     Command::new("clear", "clear", "clears the screen.", |_, _| crate::print(format_args!("\x1b[2J"))),
+    Command::new("reset", "reset", "restarts the machine (through the firmware, so a pending kernel slot is tried).", |_, _| restart()).alias(&["reboot"]),
+    Command::new("shutdown", "shutdown", "powers off (a Pi 4 halts in its bootloader).", |_, _| power_off()).alias(&["halt"]),
     Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
 ];
+
+fn restart() {
+    crate::println!("Resetting.");
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::term::flush_output();
+        crate::debug::mark_clean_stop();
+        crate::power::reset(crate::power::runtime_services());
+    }
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::power::reset();
+}
+
+fn power_off() {
+    crate::println!("Powering off.");
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::term::flush_output();
+        crate::debug::mark_clean_stop();
+        crate::power::shutdown(crate::power::runtime_services());
+        crate::println!("Shutdown returned.");
+    }
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::power::off();
+}
 
 fn memory() {
     let stats = crate::memory::stats();

@@ -109,11 +109,6 @@ static COMMANDS: &[Command] = &[
         }
     })
     .alias(&["irqstat"]),
-    Command::new("reset", "reset", "restarts the machine.", |_, _| {
-        crate::println!("Restarting.");
-        crate::arch::aarch64::power::reset()
-    })
-    .alias(&["reboot"]),
     Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),
     Command::new("poke", "poke ADDR VALUE", "writes memory (hex; bring-up).", |_, rest| poke(rest)),
 ];

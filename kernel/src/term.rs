@@ -1436,7 +1436,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1664,20 +1664,6 @@ fn execute(command: &str) {
             word => power_command(word.and_then(|word| word.parse::<u64>().ok())),
         },
         "dmesg" => crate::print(format_args!("{}", crate::log::contents())),
-        "shutdown" | "halt" => {
-            crate::println!("Powering off.");
-            flush();
-            crate::debug::mark_clean_stop();
-            power::shutdown(unsafe { RUNTIME_SERVICES });
-            crate::println!("Shutdown returned.");
-        }
-        "reset" | "reboot" => {
-            // Through the firmware, so the loader runs again (and a pending kernel slot is tried).
-            crate::println!("Resetting.");
-            flush();
-            crate::debug::mark_clean_stop();
-            power::reset(unsafe { RUNTIME_SERVICES });
-        }
         "kup" => match words.next() {
             Some("serial") => kup_serial(),
             _ => crate::println!("kup serial: take a kernel over the COM1 console (tools/send_kernel_serial.py)."),
@@ -2644,8 +2630,6 @@ pub(crate) fn help_extra() {
     crate::println!("power    [N]  how much of the time the CPU slept in hlt (N: sample N s at the prompt)");
     crate::println!("power hwp [performance|balanced|power]  CPU frequency scaling (Intel HWP)");
     crate::println!("dmesg     the boot log");
-    crate::println!("shutdown  power off");
-    crate::println!("reset     restart through the firmware (reboot is the same)");
     crate::println!("debug ... status | slots | crash | hang");
     crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
 }
