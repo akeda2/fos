@@ -283,7 +283,7 @@ at fault.
 `service_host.rs` and the `ctx` block in it are the per-kernel parts). `&1` is the Genet; `&0` owns no NIC. Services use tape regions
 2 and 3 (0 and 1 are for `run A + B`). A foreground tape's end no longer blanks screen 1 while a service runs. Verified on the Pi:
 `run clock ntp=off screen=1 &0` ticks on the second screen next to the shell and `run calc`; it stalls while a shell command or a
-tape load blocks (SD reads), because switching is cooperative. Ethernet KUP is x86 only; the Pi uses serial KUP.
+tape load blocks (SD reads), because switching is cooperative. `run A ARGS + B ARGS` (two tapes, Tab moves the keys) gives A `screen=0` and B `screen=1` unless their arguments name a `screen=`. Ethernet KUP is x86 only; the Pi uses serial KUP.
 
 ## Ethernet KUP and discovery on the Pi (2026-10-20)
 

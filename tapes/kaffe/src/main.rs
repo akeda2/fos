@@ -24,7 +24,8 @@ server (the one DHCP names, else the gateway; ntp=off keeps the clock as it is,
 set by date set or ptp settime). tz= is the local zone in hours east of UTC; the
 zone is otherwise guessed from the machine's clock, or UTC when that is not set.
 Next to a clock service (run clock screen=2 &1) give kaffe ntp=off: the service
-keeps the machine's clock and owns the NIC.
+keeps the machine's clock and owns the NIC. On the Pi, "run kaffe ntp=off + clock"
+runs both, kaffe on screen 0 (keys) and clock on screen 1; Tab switches keys.
 Keys: Enter or Space = Kaffet klart!   c, Delete or Backspace = Rensa
       Escape quits.
 "#
