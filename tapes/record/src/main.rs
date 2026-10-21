@@ -78,7 +78,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     if frame_bytes == 0 || frame_bytes > BLOCK {
         return println!("record: unusable capture format.");
     }
-    let format = Format { channels: channels as u16, rate, slot: slot as u16, bits: bits as u16 };
+    // A float device is recorded unconverted, as a float WAV.
+    let float = tone.is_none() && tape_rt::audio_float().0;
+    let format = Format { channels: channels as u16, rate, slot: slot as u16, bits: bits as u16, float };
     let mut file_name = [0u8; 40];
     let mut length = 0;
     for &byte in name.as_bytes().iter().take(30) {
@@ -114,7 +116,8 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         return println!("record: cannot start capture at {rate} Hz (code {status}); the device offers {:?}.", &info.rates[..info.rate_count as usize]);
     }
     println!(
-        "Recording {channels} channel(s), {bits}-bit, {rate} Hz into {shown} ({} MiB reserved){}. Escape stops.",
+        "Recording {channels} channel(s), {}{bits}-bit, {rate} Hz into {shown} ({} MiB reserved){}. Escape stops.",
+        if float { "float " } else { "" },
         recorder.capacity() >> 20,
         if seconds == 0 { ", until Escape" } else { "" }
     );

@@ -8,6 +8,7 @@ name = "noise"
 path = "src/lib.rs"
 
 [dependencies]
+audio-sample = { path = "../audio-sample" }
 dsp = { path = "../dsp" }
 
 [dev-dependencies]

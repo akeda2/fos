@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "audio-sample"
+version = "0.1.0"
+
+[[package]]
 name = "audio-screen"
 version = "0.1.0"
 dependencies = [
+ "audio-sample",
  "audio-wire",
  "dsp",
  "gfx",
@@ -16,10 +21,16 @@ dependencies = [
 [[package]]
 name = "audio-wire"
 version = "0.1.0"
+dependencies = [
+ "audio-sample",
+]
 
 [[package]]
 name = "dsp"
 version = "0.1.0"
+dependencies = [
+ "audio-sample",
+]
 
 [[package]]
 name = "fosfor-abi"
@@ -55,6 +66,7 @@ dependencies = [
 name = "noise"
 version = "0.1.0"
 dependencies = [
+ "audio-sample",
  "dsp",
 ]
 

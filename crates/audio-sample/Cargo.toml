@@ -1,0 +1,12 @@
+[package]
+name = "audio-sample"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "audio_sample"
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

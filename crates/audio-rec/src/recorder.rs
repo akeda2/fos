@@ -193,7 +193,7 @@ mod tests {
         u32::from_le_bytes(file[at + 4..at + 8].try_into().unwrap())
     }
 
-    const FORMAT: Format = Format { channels: 2, rate: 48_000, slot: 2, bits: 16 };
+    const FORMAT: Format = Format { channels: 2, rate: 48_000, slot: 2, bits: 16, float: false };
 
     #[test]
     fn a_take_has_a_matching_header() {

@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number).
-pub const TAPE_API_VERSION: u32 = 20;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`.
+pub const TAPE_API_VERSION: u32 = 21;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -302,7 +302,15 @@ pub struct TapeApi {
     pub gfx_fill_on: extern "C" fn(u32, u32, u32, u32, u32, u32) -> u32,
     /// `gfx_blit_on(screen, x, y, width, height, pixels, stride)` (version 20): as `gfx_blit`.
     pub gfx_blit_on: extern "C" fn(u32, u32, u32, u32, u32, *const u32, u32) -> u32,
+    /// `audio_float()` (version 21): which running-or-default audio streams carry 32-bit IEEE float samples instead of
+    /// signed integers, `AUDIO_FLOAT_*` bits. `audio_info` reports such a stream as 4-byte slots of 32 bits, so without
+    /// this a tape would read the bit patterns as integers. A float sample is -1.0..1.0 for full scale (it may exceed it).
+    pub audio_float: extern "C" fn() -> u32,
 }
+
+/// `audio_float` bits: the capture stream / the playback stream carries IEEE 754 single-precision samples.
+pub const AUDIO_FLOAT_CAPTURE: u32 = 1;
+pub const AUDIO_FLOAT_PLAYBACK: u32 = 2;
 
 /// What `fs_list` reports about one file.
 #[repr(C)]

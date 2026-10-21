@@ -21,8 +21,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-sample"
+version = "0.1.0"
+
+[[package]]
 name = "audio-wire"
 version = "0.1.0"
+dependencies = [
+ "audio-sample",
+]
 
 [[package]]
 name = "fosfor-abi"

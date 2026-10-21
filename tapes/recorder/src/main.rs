@@ -656,7 +656,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     }
     let mut rec_channels = selection.count_ones() as usize;
     let mut rec_frame = rec_channels * slot; // a recorded frame: the selected channels
-    let format = Format { channels: rec_channels as u16, rate, slot: slot as u16, bits: bits as u16 };
+    let float = options.tone.is_none() && tape_rt::audio_float().0;
+    let sample_format = audio_wire::Format::new(slot, bits, float);
+    let format = Format { channels: rec_channels as u16, rate, slot: slot as u16, bits: bits as u16, float };
     // `NAME` may start with a volume (`disk2/gig`, `@label/gig`): a diskN picks that disk in the menu, anything else is
     // used as typed and the menu leaves it alone.
     let (volume_word, file_part) = match options.name.rsplit_once('/') {
@@ -765,7 +767,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             let mut chosen = Text::<40>::new();
             select::describe(selection, channels, &mut chosen);
             at(1, 2);
-            draw!("fos recorder: {channels} ch {bits}-bit {rate} Hz  recording {} ({rec_channels})  pre-roll {} s{}\x1b[K", chosen.as_str(), options.pre_seconds, if options.tone.is_some() { "  (test tone)" } else { "" });
+            draw!("fos recorder: {channels} ch {}{bits}-bit {rate} Hz  recording {} ({rec_channels})  pre-roll {} s{}\x1b[K", if float { "float " } else { "" }, chosen.as_str(), options.pre_seconds, if options.tone.is_some() { "  (test tone)" } else { "" });
         }};
     }
     draw_title!();
@@ -1002,7 +1004,7 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         let now = tape_rt::micros();
         if got > 0 {
             let device_block = &block_buffer[..got];
-            let loudest = peaks::feed(device_block, channels, slot, &coefficients, detectors, clips, selection);
+            let loudest = peaks::feed(device_block, channels, sample_format, &coefficients, detectors, clips, selection);
             // What is recorded: the selected channels (the block itself when that is all of them).
             let block: &[u8] = if selection == full_mask {
                 device_block

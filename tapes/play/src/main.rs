@@ -23,6 +23,8 @@ struct Wav {
     channels: usize,
     rate: u32,
     bits: usize,
+    /// IEEE float samples (32 bits), format tag 3 or the extensible IEEE_FLOAT subtype.
+    float: bool,
     data: usize,
     length: usize,
 }
@@ -32,6 +34,7 @@ fn parse(bytes: &[u8]) -> Option<Wav> {
         return None;
     }
     let (mut channels, mut rate, mut bits, mut format) = (0usize, 0u32, 0usize, 0u16);
+    let mut subtype = 0u16;
     let mut at = 12;
     while at + 8 <= bytes.len() {
         let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
@@ -42,20 +45,33 @@ fn parse(bytes: &[u8]) -> Option<Wav> {
                 channels = usize::from(u16::from_le_bytes(bytes[body + 2..body + 4].try_into().ok()?));
                 rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().ok()?);
                 bits = usize::from(u16::from_le_bytes(bytes[body + 14..body + 16].try_into().ok()?));
+                if size >= 40 && body + 26 <= bytes.len() {
+                    subtype = u16::from_le_bytes(bytes[body + 24..body + 26].try_into().ok()?); // the sub-format GUID's first word
+                }
             }
             b"data" => {
-                // 1 = PCM, 0xfffe = extensible (accepted: only the sample layout matters here)
-                if (format != 1 && format != 0xfffe) || channels == 0 || !matches!(bits, 8 | 16 | 24 | 32) {
+                // 1 = PCM, 3 = IEEE float, 0xfffe = extensible (its sub-format says which)
+                let float = format == 3 || (format == 0xfffe && subtype == 3);
+                if (format != 1 && format != 3 && format != 0xfffe) || channels == 0 || !matches!(bits, 8 | 16 | 24 | 32) || (float && bits != 32) {
                     return None;
                 }
                 let length = size.min(bytes.len() - body);
-                return Some(Wav { channels, rate, bits, data: body, length });
+                return Some(Wav { channels, rate, bits, float, data: body, length });
             }
             _ => {}
         }
         at = body + size + (size & 1);
     }
     None
+}
+
+/// One file sample as -1..1 (a float file's samples as they are).
+fn file_sample(bytes: &[u8], wav: &Wav) -> f32 {
+    if wav.float {
+        audio_sample::Format::new(4, 32, true).read(bytes)
+    } else {
+        sample(bytes, wav.bits) as f32 * (1.0 / 2147483648.0)
+    }
 }
 
 /// One file sample as a signed value left-justified in 32 bits.
@@ -111,11 +127,13 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
     };
     let (out_channels, out_slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
     let in_slot = wav.bits / 8;
+    let out_float = tape_rt::audio_float().1;
+    let out_format = audio_sample::Format::new(out_slot, info.playback_bits as usize, out_float);
     let in_frame = wav.channels * in_slot;
     let frames = wav.length / in_frame;
     println!(
-        "Playing {name}: {} Hz, {} channel(s), {}-bit, {} frames ({} s) on {out_channels} output channel(s) of {}-bit.",
-        wav.rate, wav.channels, wav.bits, frames, frames / wav.rate as usize, info.playback_bits
+        "Playing {name}: {} Hz, {} channel(s), {}{}-bit, {} frames ({} s) on {out_channels} output channel(s) of {}{}-bit.",
+        wav.rate, wav.channels, if wav.float { "float " } else { "" }, wav.bits, frames, frames / wav.rate as usize, if out_float { "float " } else { "" }, info.playback_bits
     );
     let status = (api.audio_start)(wav.rate, 0, 1);
     if status != 0 {
@@ -135,6 +153,19 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
             while frame < frames && staged + out_frame <= staging.len() {
                 let source = &data[frame * in_frame..(frame + 1) * in_frame];
                 for channel in 0..out_channels {
+                    if wav.float || out_float {
+                        // Through f32 so a float file or device is never rounded to an integer on the way.
+                        let value = if wav.channels == 1 {
+                            file_sample(&source[..in_slot], &wav)
+                        } else if channel < wav.channels {
+                            file_sample(&source[channel * in_slot..(channel + 1) * in_slot], &wav)
+                        } else {
+                            0.0
+                        };
+                        out_format.write(value, &mut staging[staged..staged + out_slot]);
+                        staged += out_slot;
+                        continue;
+                    }
                     // mono: every output channel gets the one input channel; otherwise channel for channel, silence for the rest
                     let value = if wav.channels == 1 {
                         sample(&source[..in_slot], wav.bits)
@@ -195,6 +226,6 @@ tape_rt::tape_help!(br#"play: play a WAV file on the audio outputs.
 
   tape run play [device=N] NAME.wav
 
-  8, 16, 24 and 32 bit PCM; the file's rate must be one the device offers.
+  8, 16, 24 and 32 bit PCM and 32 bit float; the file's rate must be one the device offers.
   Escape stops.
 "#);

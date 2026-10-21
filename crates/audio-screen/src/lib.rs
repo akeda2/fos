@@ -44,6 +44,9 @@ pub struct Input {
     pub channels: usize,
     pub slot: usize,
     pub bits: usize,
+    /// The capture / playback slots hold 32-bit IEEE floats, not integers (`tape_rt::audio_float`).
+    pub float: bool,
+    pub playback_float: bool,
     /// 0-based.
     pub channel: usize,
     /// The second channel of a stereo pair (0-based), for the tools that take two; `query` sets it to `channel`.
@@ -73,6 +76,8 @@ impl Input {
             channels: info.capture_channels as usize,
             slot: info.capture_slot_bytes as usize,
             bits: info.capture_bits as usize,
+            float: tape_rt::audio_float_of(api).0,
+            playback_float: tape_rt::audio_float_of(api).1,
             channel,
             second: channel,
             playback_channels: info.playback_channels as usize,
@@ -167,7 +172,7 @@ impl Input {
         if got < frame {
             return 0;
         }
-        unpack_channel(&scratch[..got], out, self.channels, self.slot, self.bits, channel)
+        unpack_channel(&scratch[..got], out, self.channels, self.slot, self.bits, self.float, channel)
     }
 
     /// Like `read` for two channels at once (a stereo pair), each into its own buffer; the shorter count of the two.
@@ -180,8 +185,8 @@ impl Input {
         if got < frame {
             return 0;
         }
-        let a = unpack_channel(&scratch[..got], left, self.channels, self.slot, self.bits, channels.0);
-        let b = unpack_channel(&scratch[..got], right, self.channels, self.slot, self.bits, channels.1);
+        let a = unpack_channel(&scratch[..got], left, self.channels, self.slot, self.bits, self.float, channels.0);
+        let b = unpack_channel(&scratch[..got], right, self.channels, self.slot, self.bits, self.float, channels.1);
         a.min(b)
     }
 }
@@ -214,7 +219,7 @@ impl Playback {
             return false;
         }
         fill(&mut self.mono[..frames]);
-        let bytes = noise::pack(&self.mono[..frames], &mut self.packed[..], input.playback_channels, input.playback_slot, input.playback_bits, self.mask);
+        let bytes = noise::pack(&self.mono[..frames], &mut self.packed[..], input.playback_channels, input.playback_slot, input.playback_bits, input.playback_float, self.mask);
         (api.audio_write)(self.packed.as_ptr(), bytes);
         true
     }
@@ -318,7 +323,7 @@ mod tests {
     use super::*;
 
     fn input(channels: usize) -> Input {
-        Input { channels, slot: 4, bits: 24, channel: 0, playback_channels: 0, playback_slot: 0, playback_bits: 0, rates: [0; 16], rate_count: 0, second: 0 }
+        Input { channels, slot: 4, bits: 24, float: false, playback_float: false, channel: 0, playback_channels: 0, playback_slot: 0, playback_bits: 0, rates: [0; 16], rate_count: 0, second: 0 }
     }
 
     #[test]

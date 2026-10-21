@@ -7,7 +7,8 @@
 //!
 //! `fmt ` is plain PCM (16 bytes) when the file is one or two channels of whole 16-bit samples, which every reader
 //! knows; otherwise WAVE_FORMAT_EXTENSIBLE (40 bytes), which is what multichannel and 24-bit files need to be read
-//! correctly. Samples are stored as the device delivers them: little-endian, in `slot` bytes, left-justified, `bits`
+//! correctly. A float device (`float`) gives one or two channels of IEEE_FLOAT (format tag 3, 32 bits) and more channels
+//! extensible with the IEEE_FLOAT subtype, the samples unconverted. Samples are stored as the device delivers them: little-endian, in `slot` bytes, left-justified, `bits`
 //! of them valid (a 24-bit sample in a 4-byte slot is a valid case).
 
 const JUNK_LEN: usize = 28; // the size of a ds64 chunk body with no table entries
@@ -22,6 +23,8 @@ pub struct Format {
     pub slot: u16,
     /// Significant bits per sample.
     pub bits: u16,
+    /// The samples are 32-bit IEEE floats.
+    pub float: bool,
 }
 
 impl Format {
@@ -30,7 +33,7 @@ impl Format {
     }
 
     fn plain(&self) -> bool {
-        self.channels <= 2 && self.bits == self.slot * 8 && self.slot == 2
+        self.channels <= 2 && if self.float { self.slot == 4 } else { self.bits == self.slot * 8 && self.slot == 2 }
     }
 }
 
@@ -73,7 +76,7 @@ pub fn write_header(out: &mut [u8], format: &Format, data_bytes: u64) -> usize {
     put(b"fmt ");
     let plain = format.plain();
     put(&(if plain { PCM_FMT } else { EXT_FMT } as u32).to_le_bytes());
-    put(&(if plain { 1u16 } else { 0xfffe }).to_le_bytes());
+    put(&(if !plain { 0xfffe } else if format.float { 3u16 } else { 1u16 }).to_le_bytes());
     put(&format.channels.to_le_bytes());
     put(&format.rate.to_le_bytes());
     put(&((u64::from(format.rate) * format.frame_bytes()) as u32).to_le_bytes());
@@ -83,8 +86,8 @@ pub fn write_header(out: &mut [u8], format: &Format, data_bytes: u64) -> usize {
         put(&22u16.to_le_bytes()); // cbSize
         put(&format.bits.to_le_bytes()); // valid bits per sample
         put(&channel_mask(format.channels).to_le_bytes());
-        // KSDATAFORMAT_SUBTYPE_PCM
-        put(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
+        // KSDATAFORMAT_SUBTYPE_PCM, or _IEEE_FLOAT (3)
+        put(&[if format.float { 0x03 } else { 0x01 }, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
     }
     put(b"data");
     put(&(if big { 0xffff_ffff } else { data_bytes as u32 }).to_le_bytes());
@@ -102,7 +105,7 @@ mod tests {
 
     #[test]
     fn plain_stereo_16() {
-        let format = Format { channels: 2, rate: 48_000, slot: 2, bits: 16 };
+        let format = Format { channels: 2, rate: 48_000, slot: 2, bits: 16, float: false };
         let mut out = [0u8; 128];
         let length = write_header(&mut out, &format, 1000);
         assert_eq!(length, 80);
@@ -118,7 +121,7 @@ mod tests {
 
     #[test]
     fn multichannel_24_is_extensible() {
-        let format = Format { channels: 6, rate: 96_000, slot: 3, bits: 24 };
+        let format = Format { channels: 6, rate: 96_000, slot: 3, bits: 24, float: false };
         let mut out = [0u8; 128];
         let length = write_header(&mut out, &format, 0);
         assert_eq!(length, 104);
@@ -133,7 +136,7 @@ mod tests {
 
     #[test]
     fn over_4_gib_is_rf64() {
-        let format = Format { channels: 2, rate: 48_000, slot: 4, bits: 24 };
+        let format = Format { channels: 2, rate: 48_000, slot: 4, bits: 24, float: false };
         let mut out = [0u8; 128];
         let data = 5u64 << 30;
         let length = write_header(&mut out, &format, data);

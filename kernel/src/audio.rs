@@ -266,6 +266,19 @@ pub fn playback_float() -> bool {
     matches!(output(), Some(Backend::Usb(unit)) if usb::playback_float(unit))
 }
 
+/// Tape ABI `audio_float`: the float flags of the streams a tape sees (the running or default mode of each direction).
+pub extern "C" fn api_audio_float() -> u32 {
+    let capture = match active() {
+        Some(Backend::Usb(unit)) => usb::capture_float_default(unit),
+        _ => false,
+    };
+    let playback = match output() {
+        Some(Backend::Usb(unit)) => usb::playback_float_default(unit),
+        _ => false,
+    };
+    u32::from(capture) | u32::from(playback) << 1
+}
+
 /// What the foreground must do to keep a polled device moving (an HD Audio controller without working interrupts;
 /// the USB side is moved by `usb_hid::poll`, which the callers already do).
 pub fn poll() {

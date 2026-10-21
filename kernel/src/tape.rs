@@ -608,6 +608,7 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         gfx_close_on: crate::framebuffer::api_gfx_close_on,
         gfx_fill_on: crate::framebuffer::api_gfx_fill_on,
         gfx_blit_on: crate::framebuffer::api_gfx_blit_on,
+        audio_float: crate::audio::api_audio_float,
     }
 }
 

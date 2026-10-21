@@ -465,6 +465,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
         return println!("audio-net serve: no audio device with inputs (use src=tone=440 to serve a test tone).");
     }
     let (mut device_channels, mut slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+    let mut float = tape_rt::audio_float().0;
     let selection = options.channels.unwrap_or(ChannelSet(0b11));
     let channels = selection.count();
     if channels > 2 {
@@ -488,6 +489,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
         }
         (api.audio_info)(&mut info);
         (device_channels, slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+        float = tape_rt::audio_float().0;
         if selection.channels().any(|channel| channel >= device_channels) {
             (api.audio_stop)();
             return println!("audio-net serve: the capture mode at 48000 Hz has {device_channels} channel(s); ch= asks for more.");
@@ -561,7 +563,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
                     (tone_sample(phase.wrapping_add((frequency * 65_536 / RATE) * index as u32) & 0xffff)) as i16
                 } else {
                     let at = index * device_frame + channel_list[lane] * slot;
-                    device_sample_16(&capture[at..at + slot])
+                    device_sample_16(&capture[at..at + slot], audio_wire::Format::new(slot, slot * 8, float))
                 };
             }
         }

@@ -537,6 +537,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         return println!("audio-net send: no audio device with inputs (use src=tone=440 to send a test tone).");
     }
     let (mut device_channels, mut slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+    let mut float = tape_rt::audio_float().0;
     let selection = options.channels.unwrap_or(ChannelSet(0b11));
     let channels = selection.count();
     if tone.is_none() && selection.channels().any(|channel| channel >= device_channels) {
@@ -590,6 +591,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         // The mode that runs is chosen when the stream starts (automatically: the best one that offers the rate), so ask again.
         (api.audio_info)(&mut info);
         (device_channels, slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+        float = tape_rt::audio_float().0;
         if selection.channels().any(|channel| channel >= device_channels) {
             (api.audio_stop)();
             transport.stop_clock(api, options.nic);
@@ -677,7 +679,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             held += got;
             if held >= per_packet * device_frame {
                 age_frames = (held / device_frame) as u32;
-                pack(&capture[..per_packet * device_frame], slot, device_channels, per_packet, &selection, bits, &mut payload);
+                pack(&capture[..per_packet * device_frame], audio_wire::Format::new(slot, slot * 8, float), device_channels, per_packet, &selection, bits, &mut payload);
                 capture.copy_within(per_packet * device_frame..held, 0);
                 held -= per_packet * device_frame;
                 true
@@ -1060,6 +1062,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     // The mode that runs is chosen when the stream starts, so ask again what it is.
     (api.audio_info)(&mut info);
     let (device_channels, slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
+    let float = tape_rt::audio_float().1;
     let device_frame = device_channels * slot;
     stats::set_receive(format_args!("waiting for PCM {}-bit{}", options.bits, if options.adopted_receive { " (peer's choice)" } else { "" }));
     transport.announce_receiver(options);
@@ -1284,7 +1287,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                     produced += 1;
                 }
             }
-            frames_to_device(&resampled, wire_channels, produced, &placement[..wire_channels], slot, device_channels, &mut staging);
+            frames_to_device(&resampled, wire_channels, produced, &placement[..wire_channels], audio_wire::Format::new(slot, slot * 8, float), device_channels, &mut staging);
             let bytes = produced * device_frame;
             let accepted = (api.audio_write)(staging.as_ptr(), bytes);
             written_out += (accepted / device_frame) as u64;
@@ -1298,7 +1301,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             dropped += skip as u64;
             let wire_skip = skip * wire_channels * packet.bits / 8;
             out_frames -= skip.min(out_frames);
-            unpack(&payload[wire_skip..], wire_channels, packet.bits, out_frames, &placement[..wire_channels], slot, device_channels, &mut staging);
+            unpack(&payload[wire_skip..], wire_channels, packet.bits, out_frames, &placement[..wire_channels], audio_wire::Format::new(slot, slot * 8, float), device_channels, &mut staging);
             if advice == Slip::Repeat && out_frames > 0 {
                 repeated += 1;
                 staging.copy_within((out_frames - 1) * device_frame..out_frames * device_frame, out_frames * device_frame);

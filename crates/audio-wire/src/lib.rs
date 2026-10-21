@@ -154,25 +154,24 @@ pub fn frames_per_packet_within(rate: u32, channels: usize, bits: usize, max_pay
     frames_per_packet(rate, channels, bits, max_payload).min(limit)
 }
 
-/// Reads one sample from a device-format slot (little-endian, signed, left-justified in its bytes) as a
-/// 32-bit value with the sample in the top bits.
-pub fn device_sample(slot: &[u8]) -> i32 {
-    let mut value = 0u32;
-    for (index, &byte) in slot.iter().enumerate() {
-        value |= u32::from(byte) << (8 * (4 - slot.len() + index));
-    }
-    value as i32
+pub use audio_sample::Format;
+
+/// Reads one sample from a device-format slot (little-endian, signed, left-justified in its bytes; or a 4-byte float, clipped
+/// at full scale) as a 32-bit value with the sample in the top bits.
+pub fn device_sample(slot: &[u8], format: Format) -> i32 {
+    format.top32(slot)
 }
 
 /// Packs `frames` frames from device-format `device` (`device_channels` channels in `slot`-byte slots)
 /// into network order, keeping the channels in `selection` (in ascending order), `bits` per sample.
 /// Returns the bytes written to `out`.
-pub fn pack(device: &[u8], slot: usize, device_channels: usize, frames: usize, selection: &ChannelSet, bits: usize, out: &mut [u8]) -> usize {
+pub fn pack(device: &[u8], format: Format, device_channels: usize, frames: usize, selection: &ChannelSet, bits: usize, out: &mut [u8]) -> usize {
     let sample_bytes = bits / 8;
+    let slot = format.slot;
     let mut at = 0;
     for frame in device.chunks(slot * device_channels).take(frames) {
         for channel in selection.channels() {
-            let value = if channel < device_channels { device_sample(&frame[channel * slot..(channel + 1) * slot]) } else { 0 };
+            let value = if channel < device_channels { device_sample(&frame[channel * slot..(channel + 1) * slot], format) } else { 0 };
             let bytes = value.to_be_bytes(); // the top `sample_bytes` bytes carry the sample
             out[at..at + sample_bytes].copy_from_slice(&bytes[..sample_bytes]);
             at += sample_bytes;
@@ -184,8 +183,9 @@ pub fn pack(device: &[u8], slot: usize, device_channels: usize, frames: usize, s
 /// The reverse: network-order frames of `wire_channels` channels become device-format frames of
 /// `device_channels` channels in `slot`-byte slots. `placement[i]` is the device channel (0-based) that
 /// network channel `i` goes to, or `None` to drop it; device channels nothing is placed on stay silent.
-pub fn unpack(wire: &[u8], wire_channels: usize, bits: usize, frames: usize, placement: &[Option<usize>], slot: usize, device_channels: usize, out: &mut [u8]) -> usize {
+pub fn unpack(wire: &[u8], wire_channels: usize, bits: usize, frames: usize, placement: &[Option<usize>], format: Format, device_channels: usize, out: &mut [u8]) -> usize {
     let sample_bytes = bits / 8;
+    let slot = format.slot;
     let device_frame = slot * device_channels;
     for frame in 0..frames {
         let target = &mut out[frame * device_frame..(frame + 1) * device_frame];
@@ -200,9 +200,8 @@ pub fn unpack(wire: &[u8], wire_channels: usize, bits: usize, frames: usize, pla
             for (index, &byte) in wire[at..at + sample_bytes].iter().enumerate() {
                 value |= u32::from(byte) << (8 * (3 - index));
             }
-            // Keep the top `slot` bytes of the 32-bit value (little-endian in the slot).
-            let bytes = value.to_le_bytes();
-            target[destination * slot..(destination + 1) * slot].copy_from_slice(&bytes[4 - slot..]);
+            // Keep the top `slot` bytes of the 32-bit value (little-endian in the slot), or make the float.
+            format.put_top32(value as i32, &mut target[destination * slot..(destination + 1) * slot]);
         }
     }
     frames * device_frame
@@ -267,7 +266,8 @@ pub fn wire_to_frames(wire: &[u8], channels: usize, bits: usize, frames: usize, 
 
 /// 32-bit working frames to device-format frames (`slot`-byte little-endian slots, `device_channels` channels),
 /// placing channel `i` of the frames on device channel `placement[i]` (`None` drops it); the rest stay silent.
-pub fn frames_to_device(frames: &[i32], channels: usize, count: usize, placement: &[Option<usize>], slot: usize, device_channels: usize, out: &mut [u8]) -> usize {
+pub fn frames_to_device(frames: &[i32], channels: usize, count: usize, placement: &[Option<usize>], format: Format, device_channels: usize, out: &mut [u8]) -> usize {
+    let slot = format.slot;
     let device_frame = slot * device_channels;
     for frame in 0..count {
         let target = &mut out[frame * device_frame..(frame + 1) * device_frame];
@@ -277,8 +277,7 @@ pub fn frames_to_device(frames: &[i32], channels: usize, count: usize, placement
             if destination >= device_channels {
                 continue;
             }
-            let bytes = (frames[frame * channels + channel] as u32).to_le_bytes();
-            target[destination * slot..(destination + 1) * slot].copy_from_slice(&bytes[4 - slot..]);
+            format.put_top32(frames[frame * channels + channel], &mut target[destination * slot..(destination + 1) * slot]);
         }
     }
     count * device_frame
@@ -597,9 +596,10 @@ pub fn write_sdp_opus(sdp: &SdpOpus<'_>, out: &mut [u8]) -> usize {
     cursor.length
 }
 
-/// The 16-bit value of a device-format slot (`slot` little-endian bytes, left-justified): its top 16 bits.
-pub fn device_sample_16(slot_bytes: &[u8]) -> i16 {
-    (device_sample(slot_bytes) >> 16) as i16
+/// The 16-bit value of a device-format slot (`slot` little-endian bytes, left-justified, or a float clipped at full scale):
+/// its top 16 bits. For Opus built with the fixed-point API; see `opus_codec` for the float path.
+pub fn device_sample_16(slot_bytes: &[u8], format: Format) -> i16 {
+    (device_sample(slot_bytes, format) >> 16) as i16
 }
 
 /// A programme peak meter (PPM) in the Nordic style (IEC 60268-10 type I): a quasi-peak detector that charges fast
@@ -1048,7 +1048,7 @@ mod tests {
             0xfe, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // frame 1: -2, 0, -8388608
         ];
         let mut out = [0u8; 12];
-        let written = pack(&device, 3, 3, 2, &ChannelSet(0b101), 24, &mut out);
+        let written = pack(&device, Format::new(3, 3*8, false), 3, 2, &ChannelSet(0b101), 24, &mut out);
         assert_eq!(written, 12);
         // little-endian 0x030201 becomes big-endian 03 02 01
         assert_eq!(out, [0x03, 0x02, 0x01, 0x30, 0x20, 0x10, 0xff, 0xff, 0xfe, 0x80, 0x00, 0x00]);
@@ -1059,17 +1059,17 @@ mod tests {
         // 24-bit device -> 16-bit wire keeps the top 16 bits
         let device = [0x34, 0x12, 0x7f]; // 0x7f1234
         let mut out = [0u8; 2];
-        pack(&device, 3, 1, 1, &ChannelSet(1), 16, &mut out);
+        pack(&device, Format::new(3, 3*8, false), 1, 1, &ChannelSet(1), 16, &mut out);
         assert_eq!(out, [0x7f, 0x12]);
         // 16-bit wire -> 24-bit device: shifted up, low byte zero
         let wire = [0x7f, 0x12];
         let mut back = [0u8; 3];
-        unpack(&wire, 1, 16, 1, &[Some(0)], 3, 1, &mut back);
+        unpack(&wire, 1, 16, 1, &[Some(0)], Format::new(3, 3 * 8, false), 1, &mut back);
         assert_eq!(back, [0x00, 0x12, 0x7f]);
         // 24-bit wire -> 16-bit device: truncated
         let wire = [0x7f, 0x12, 0x34];
         let mut back = [0u8; 2];
-        unpack(&wire, 1, 24, 1, &[Some(0)], 2, 1, &mut back);
+        unpack(&wire, 1, 24, 1, &[Some(0)], Format::new(2, 2 * 8, false), 1, &mut back);
         assert_eq!(back, [0x12, 0x7f]);
     }
 
@@ -1078,7 +1078,7 @@ mod tests {
         // a 2-channel network stream placed on channels 3 and 1 of a 4-channel device with 2-byte slots
         let wire = [0x11, 0x22, 0x33, 0x44]; // L=0x1122, R=0x3344 (16-bit BE)
         let mut out = [0xffu8; 8];
-        unpack(&wire, 2, 16, 1, &[Some(2), Some(0)], 2, 4, &mut out);
+        unpack(&wire, 2, 16, 1, &[Some(2), Some(0)], Format::new(2, 16, false), 4, &mut out);
         assert_eq!(out, [0x44, 0x33, 0, 0, 0x22, 0x11, 0, 0]);
     }
 
@@ -1089,10 +1089,10 @@ mod tests {
             *byte = (index * 37 + 11) as u8;
         }
         let mut wire = [0u8; 4 * 6 * 3];
-        pack(&device, 3, 6, 4, &ChannelSet(0b111111), 24, &mut wire);
+        pack(&device, Format::new(3, 3*8, false), 6, 4, &ChannelSet(0b111111), 24, &mut wire);
         let mut back = [0u8; 6 * 3 * 4];
         let placement: Vec<Option<usize>> = (0..6).map(Some).collect();
-        unpack(&wire, 6, 24, 4, &placement, 3, 6, &mut back);
+        unpack(&wire, 6, 24, 4, &placement, Format::new(3, 3 * 8, false), 6, &mut back);
         assert_eq!(back, device);
     }
 
@@ -1253,7 +1253,7 @@ mod tests {
         wire_to_frames(&wire, 2, 24, 1, &mut frames);
         assert_eq!(frames, [0x1234_5600, (0xfffffe00u32) as i32]);
         let mut device = [0u8; 6];
-        frames_to_device(&frames, 2, 1, &[Some(0), Some(1)], 3, 2, &mut device);
+        frames_to_device(&frames, 2, 1, &[Some(0), Some(1)], Format::new(3, 24, false), 2, &mut device);
         assert_eq!(device, [0x56, 0x34, 0x12, 0xfe, 0xff, 0xff]);
     }
 
@@ -1272,9 +1272,15 @@ mod tests {
 
     #[test]
     fn device_sample_to_16_bits() {
-        assert_eq!(device_sample_16(&[0x00, 0x34, 0x12]), 0x1234); // 24-bit: the top two bytes
-        assert_eq!(device_sample_16(&[0xff, 0x7f]), 0x7fff); // 16-bit slot unchanged
-        assert_eq!(device_sample_16(&[0x00, 0x00, 0x80]), -0x8000);
+        assert_eq!(device_sample_16(&[0x00, 0x34, 0x12], Format::new(3, 24, false)), 0x1234); // 24-bit: the top two bytes
+        assert_eq!(device_sample_16(&[0xff, 0x7f], Format::new(2, 16, false)), 0x7fff); // 16-bit slot unchanged
+        assert_eq!(device_sample_16(&[0x00, 0x00, 0x80], Format::new(3, 24, false)), -0x8000);
+        let float = Format::new(4, 32, true);
+        assert_eq!(device_sample_16(&0.5f32.to_le_bytes(), float), 0x4000);
+        assert_eq!(device_sample_16(&2.0f32.to_le_bytes(), float), 0x7fff, "a float above full scale clips");
+        let mut slot = [0u8; 4];
+        float.put_top32(0x2000_0000, &mut slot);
+        assert_eq!(f32::from_le_bytes(slot), 0.25);
     }
 
     #[test]

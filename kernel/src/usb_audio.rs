@@ -1547,6 +1547,15 @@ pub fn status(unit: usize) {
     }
 }
 
+/// The float flag of what `fill_info` reports for each direction: the running stream's mode, else the picked or best one.
+pub fn capture_float_default(unit: usize) -> bool {
+    audio(unit).is_some_and(|device| device.capture.as_ref().map(|stream| stream.alt).or_else(|| default_alt(unit, device, true)).is_some_and(|alt| alt.float))
+}
+
+pub fn playback_float_default(unit: usize) -> bool {
+    audio(unit).is_some_and(|device| device.playback.as_ref().map(|stream| stream.alt).or_else(|| default_alt(unit, device, false)).is_some_and(|alt| alt.float))
+}
+
 /// Fills the tape ABI's `AudioInfo`; false if there is no audio device.
 pub fn fill_info(unit: usize, info: &mut fosfor_abi::tape::AudioInfo) -> bool {
     let Some(device) = audio(unit) else { return false };

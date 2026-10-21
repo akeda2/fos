@@ -236,6 +236,7 @@ test: image
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/audio-sample/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-bench/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-sync/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/shell/Cargo.toml

@@ -6,3 +6,6 @@ edition = "2024"
 [lib]
 name = "dsp"
 path = "src/lib.rs"
+
+[dependencies]
+audio-sample = { path = "../audio-sample" }

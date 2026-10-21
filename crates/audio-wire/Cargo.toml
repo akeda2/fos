@@ -7,6 +7,9 @@ edition = "2024"
 name = "audio_wire"
 path = "src/lib.rs"
 
+[dependencies]
+audio-sample = { path = "../audio-sample" }
+
 [profile.release]
 panic = "abort"
 opt-level = "z"

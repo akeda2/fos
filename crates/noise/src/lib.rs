@@ -261,22 +261,19 @@ impl Default for PairSine {
 }
 
 /// Writes `mono` into `out` as interleaved frames: `channels` channels, each sample in a `slot`-byte little-endian signed slot
-/// holding `bits` significant bits (left-justified, as USB audio does), the signal on every channel selected in `mask` (bit 0
+/// holding `bits` significant bits (left-justified, as USB audio does) or, with `float`, a 4-byte IEEE single, the signal on every channel selected in `mask` (bit 0
 /// = channel 1) and zero elsewhere. Returns the bytes written (as many whole frames as fit).
-pub fn pack(mono: &[f32], out: &mut [u8], channels: usize, slot: usize, bits: usize, mask: u32) -> usize {
+pub fn pack(mono: &[f32], out: &mut [u8], channels: usize, slot: usize, bits: usize, float: bool, mask: u32) -> usize {
+    let format = audio_sample::Format::new(slot, bits, float);
     let frame = channels * slot;
-    if frame == 0 || slot > 4 || slot * 8 < bits {
+    if frame == 0 || !format.valid() {
         return 0;
     }
     let frames = mono.len().min(out.len() / frame);
-    let peak = ((1u64 << (bits - 1)) - 1) as f32;
     for (n, &sample) in mono.iter().take(frames).enumerate() {
-        let value = (sample * peak) as i32;
-        let shifted = (value as i64) << (slot * 8 - bits);
         for channel in 0..channels {
             let at = n * frame + channel * slot;
-            let word = if mask >> channel & 1 != 0 { shifted } else { 0 };
-            out[at..at + slot].copy_from_slice(&word.to_le_bytes()[..slot]);
+            format.write(if mask >> channel & 1 != 0 { sample } else { 0.0 }, &mut out[at..at + slot]);
         }
     }
     frames * frame
@@ -383,12 +380,15 @@ mod tests {
     fn pack_formats() {
         let mono = [0.5f32, -0.5];
         let mut out = [0xffu8; 16];
-        assert_eq!(pack(&mono, &mut out, 2, 2, 16, 0b01), 8);
+        assert_eq!(pack(&mono, &mut out, 2, 2, 16, false, 0b01), 8);
         assert_eq!(&out[..8], &[0xff, 0x3f, 0, 0, 0x01, 0xc0, 0, 0]);
         let mut out = [0u8; 12];
-        assert_eq!(pack(&mono, &mut out, 1, 3, 24, 1), 6);
+        assert_eq!(pack(&mono, &mut out, 1, 3, 24, false, 1), 6);
         assert_eq!(&out[..3], &[0xff, 0xff, 0x3f]);
-        assert_eq!(pack(&mono, &mut out, 1, 3, 32, 1), 0, "bits do not fit the slot");
-        assert_eq!(pack(&mono, &mut out[..2], 1, 3, 24, 1), 0);
+        assert_eq!(pack(&mono, &mut out, 1, 3, 32, false, 1), 0, "bits do not fit the slot");
+        assert_eq!(pack(&mono, &mut out[..2], 1, 3, 24, false, 1), 0);
+        let mut out = [0u8; 8];
+        assert_eq!(pack(&[0.5, 2.0], &mut out, 1, 4, 32, true, 1), 8);
+        assert_eq!(out, [0.5f32.to_le_bytes(), 2.0f32.to_le_bytes()].concat()[..], "float is written as it is");
     }
 }

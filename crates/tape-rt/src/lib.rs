@@ -654,6 +654,22 @@ fn screens_table() -> Option<&'static TapeApi> {
     (table.version >= 20 && (table.size as usize) >= end).then_some(table)
 }
 
+/// Whether the (default or running) audio streams carry 32-bit floats: `(capture, playback)`. False on a kernel older than
+/// version 21, which has no float streams to report.
+pub fn audio_float() -> (bool, bool) {
+    audio_float_of(api())
+}
+
+/// `audio_float` for a tape that holds its `TapeApi` table.
+pub fn audio_float_of(table: &TapeApi) -> (bool, bool) {
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, audio_float) + core::mem::size_of::<usize>();
+    if table.version < 21 || (table.size as usize) < end {
+        return (false, false);
+    }
+    let bits = (table.audio_float)();
+    (bits & fosfor_abi::tape::AUDIO_FLOAT_CAPTURE != 0, bits & fosfor_abi::tape::AUDIO_FLOAT_PLAYBACK != 0)
+}
+
 /// `gfx_info` for screen number `screen` (0-based). Screen 0 works on kernels from version 17, others need 20.
 pub fn gfx_info_on(screen: u32) -> Option<(u32, u32)> {
     if screen == 0 {

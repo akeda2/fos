@@ -8,6 +8,7 @@ name = "audio_screen"
 path = "src/lib.rs"
 
 [dependencies]
+audio-sample = { path = "../audio-sample" }
 tape-rt = { path = "../tape-rt" }
 dsp = { path = "../dsp" }
 gfx = { path = "../gfx" }

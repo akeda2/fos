@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tape-rt = { path = "../../crates/tape-rt" }
+audio-sample = { path = "../../crates/audio-sample" }
 
 [profile.release]
 panic = "abort"

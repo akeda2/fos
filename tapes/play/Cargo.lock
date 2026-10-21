@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "audio-sample"
+version = "0.1.0"
+
+[[package]]
 name = "fosfor-abi"
 version = "0.1.0"
 
@@ -10,6 +14,7 @@ version = "0.1.0"
 name = "play"
 version = "0.1.0"
 dependencies = [
+ "audio-sample",
  "tape-rt",
 ]
 

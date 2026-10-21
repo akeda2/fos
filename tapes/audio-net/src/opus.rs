@@ -43,6 +43,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         return println!("audio-net send: codec=opus is 48000 Hz only.");
     }
     let (mut device_channels, mut slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+    let mut float = tape_rt::audio_float().0;
     let selection = options.channels.unwrap_or(ChannelSet(0b11));
     let channels = selection.count();
     if options.tone.is_none() && selection.channels().any(|channel| channel >= device_channels) {
@@ -75,6 +76,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         }
         (api.audio_info)(&mut info);
         (device_channels, slot) = (info.capture_channels as usize, info.capture_slot_bytes as usize);
+        float = tape_rt::audio_float().0;
         if selection.channels().any(|channel| channel >= device_channels) {
             (api.audio_stop)();
             return println!("audio-net send: the capture mode at 48000 Hz has {device_channels} channel(s); ch= asks for more (`audio modes` lists the modes, inmode= picks one).");
@@ -157,7 +159,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
                         tone_block[index]
                     } else {
                         let at = index * device_frame + channel_list[stream * 2 + lane] * slot;
-                        device_sample_16(&capture[at..at + slot])
+                        device_sample_16(&capture[at..at + slot], audio_wire::Format::new(slot, slot * 8, float))
                     };
                 }
             }
@@ -240,6 +242,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     }
     (api.audio_info)(&mut info);
     let (device_channels, slot) = (info.playback_channels as usize, info.playback_slot_bytes as usize);
+    let float = tape_rt::audio_float().1;
     let device_frame = device_channels * slot;
     let targets = options.channels.unwrap_or(ChannelSet((1u64 << channels.min(device_channels)).wrapping_sub(1) as u32));
     let mut placement = [None; MAX_CHANNELS];
@@ -461,7 +464,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                     produced += 1;
                 }
             }
-            frames_to_device(&resampled, channels, produced, &placement[..channels], slot, device_channels, &mut staging);
+            frames_to_device(&resampled, channels, produced, &placement[..channels], audio_wire::Format::new(slot, slot * 8, float), device_channels, &mut staging);
             let bytes = produced * device_frame;
             if (api.audio_write)(staging.as_ptr(), bytes) < bytes {
                 dropped += 1;
