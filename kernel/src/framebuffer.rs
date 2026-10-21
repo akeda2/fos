@@ -689,14 +689,6 @@ pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u
     true
 }
 
-/// Clears one half of the open console to its background.
-fn split_clear_half(x: u32, y: u32, width: u32, height: u32) -> bool {
-    let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return false };
-    let background = console.background;
-    fill_logical(console, x, y, width, height, background);
-    true
-}
-
 /// A screen beyond the console's: only tapes draw on it (Pi 4 second HDMI output, `mailbox::second_screen`). 0x00RRGGBB
 /// pixels as on the console, BGR in memory.
 struct Extra {
@@ -733,114 +725,90 @@ pub fn gfx_close_extra() {
     }
 }
 
-/// How the console screen is shared by `run A | B`: tape screens 0 and 1 are then its two halves, so two graphic tapes
-/// work on one display (each sees its half as a whole screen and lays itself out to it).
+/// How one physical screen is shared by two tapes (`run A | B`): each tape sees its half as a whole screen and lays itself
+/// out to that size.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Split {
-    /// Screen 0 left, screen 1 right.
+    /// First tape left, second right.
     Sides,
-    /// Screen 0 above, screen 1 below.
+    /// First tape above, second below.
     Stacked,
 }
 
-static mut SPLIT: Option<Split> = None;
-static mut SPLIT_OPEN: [bool; 2] = [false; 2];
+/// Tape screen numbers: 0 and 1 are whole physical screens (the console, the Pi's second HDMI output). While physical screen
+/// `p` is split its halves are numbers `2 + 2p` and `3 + 2p`, and the number `p` is not available.
+static mut SPLIT: [Option<Split>; 2] = [None; 2];
+/// Splits made for background tapes: they end when the services do (`split_services_over`).
+static mut SPLIT_SERVICE: [bool; 2] = [false; 2];
+static mut REGION_OPEN: [bool; 4] = [false; 4];
 
-/// Starts (`Some`) or ends (`None`) the split. Ending it does not repaint: the tapes' own close, or `gfx_close`, does.
-pub fn split_set(mode: Option<Split>) {
-    unsafe {
-        *core::ptr::addr_of_mut!(SPLIT) = mode;
-        *core::ptr::addr_of_mut!(SPLIT_OPEN) = [false; 2];
-    }
-}
-
-/// The half that tape screen `screen` is while the console is split: x, y, width, height in console pixels.
-/// `Some(None)` is a screen number the split does not have; `None` means no split.
-fn split_rect(screen: u32) -> Option<Option<(u32, u32, u32, u32)>> {
-    let mode = unsafe { *core::ptr::addr_of!(SPLIT) }?;
-    let (width, height) = gfx_info()?;
-    if screen > 1 {
-        return Some(None);
-    }
-    Some(Some(match mode {
-        Split::Sides => (screen * (width / 2), 0, width / 2, height),
-        Split::Stacked => (0, screen * (height / 2), width, height / 2),
-    }))
-}
-
-pub extern "C" fn api_gfx_screens() -> u32 {
-    if unsafe { (*core::ptr::addr_of!(SPLIT)).is_some() } {
-        return 2;
-    }
-    u32::from(gfx_info().is_some()) + u32::from(extra().is_some())
-}
-
-pub extern "C" fn api_gfx_info_on(screen: u32) -> u64 {
-    if let Some(half) = split_rect(screen) {
-        return half.map_or(0, |(_, _, width, height)| u64::from(width) << 32 | u64::from(height));
-    }
-    match screen {
-        0 => gfx_info().map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height)),
-        1 => extra().map_or(0, |screen| (screen.width as u64) << 32 | screen.height as u64),
-        _ => 0,
-    }
-}
-
-pub extern "C" fn api_gfx_open_on(screen: u32) -> u32 {
-    if let Some(half) = split_rect(screen) {
-        let Some((x, y, width, height)) = half else { return 0 };
-        let open = unsafe { &mut *core::ptr::addr_of_mut!(SPLIT_OPEN) };
-        // The first tape takes the console (cleared whole); the second one only clears its own half.
-        let ok = if open.iter().any(|open| *open) { split_clear_half(x, y, width, height) } else { gfx_open() };
-        open[screen as usize] = ok;
-        return u32::from(ok);
-    }
-    match screen {
-        0 => u32::from(gfx_open()),
-        1 => extra().map_or(0, |screen| {
-            extra_clear(screen);
-            screen.open = true;
-            1
-        }),
-        _ => 0,
-    }
-}
-
-pub extern "C" fn api_gfx_close_on(screen: u32) {
-    if let Some(half) = split_rect(screen) {
-        let Some((x, y, width, height)) = half else { return };
-        let open = unsafe { &mut *core::ptr::addr_of_mut!(SPLIT_OPEN) };
-        if !open[screen as usize] {
-            return;
-        }
-        open[screen as usize] = false;
-        // The console comes back when the last half is given up; until then the freed half just goes dark.
-        if open.iter().any(|open| *open) {
-            split_clear_half(x, y, width, height);
-        } else {
-            gfx_close();
-        }
+/// Splits physical screen `phys` (`None` ends it). Ending does not repaint: the tapes' own close, or `gfx_close`, does.
+pub fn split_set(phys: usize, mode: Option<Split>) {
+    if phys > 1 {
         return;
     }
-    match screen {
-        0 => gfx_close(),
-        1 => gfx_close_extra(),
-        _ => {}
+    unsafe {
+        (*core::ptr::addr_of_mut!(SPLIT))[phys] = mode;
+        (*core::ptr::addr_of_mut!(SPLIT_SERVICE))[phys] = false;
+        let open = &mut *core::ptr::addr_of_mut!(REGION_OPEN);
+        open[2 * phys] = false;
+        open[2 * phys + 1] = false;
     }
 }
 
-pub extern "C" fn api_gfx_fill_on(screen: u32, x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u32 {
-    if let Some(half) = split_rect(screen) {
-        let Some((left, top, half_width, half_height)) = half.filter(|_| unsafe { (*core::ptr::addr_of!(SPLIT_OPEN))[screen as usize] }) else { return 0 };
-        if x >= half_width || y >= half_height {
-            return 1;
-        }
-        return u32::from(gfx_fill(left + x, top + y, width.min(half_width - x), height.min(half_height - y), rgb));
+/// `split_set` for tapes started as services: the split goes away when the last service has ended.
+pub fn split_set_service(phys: usize, mode: Split) {
+    split_set(phys, Some(mode));
+    if phys < 2 {
+        unsafe { (*core::ptr::addr_of_mut!(SPLIT_SERVICE))[phys] = true };
     }
-    match screen {
-        0 => u32::from(gfx_fill(x, y, width, height, rgb)),
-        1 => {
-            let Some(screen) = extra().filter(|screen| screen.open) else { return 0 };
+}
+
+pub fn split_clear_all() {
+    for phys in 0..2 {
+        split_set(phys, None);
+    }
+}
+
+pub fn split_services_over() {
+    for phys in 0..2 {
+        if unsafe { (*core::ptr::addr_of!(SPLIT_SERVICE))[phys] } {
+            split_set(phys, None);
+        }
+    }
+}
+
+/// Logical size of physical screen `phys`.
+fn phys_info(phys: usize) -> Option<(u32, u32)> {
+    match phys {
+        0 => gfx_info(),
+        _ => extra().map(|screen| (screen.width as u32, screen.height as u32)),
+    }
+}
+
+fn phys_open(phys: usize) -> bool {
+    match phys {
+        0 => gfx_open(),
+        _ => extra().is_some_and(|screen| {
+            extra_clear(screen);
+            screen.open = true;
+            true
+        }),
+    }
+}
+
+fn phys_close(phys: usize) {
+    match phys {
+        0 => gfx_close(),
+        _ => gfx_close_extra(),
+    }
+}
+
+fn phys_fill(phys: usize, x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
+    match phys {
+        0 => gfx_fill(x, y, width, height, rgb),
+        _ => {
+            let Some(screen) = extra().filter(|screen| screen.open) else { return false };
             let (x, y) = (x as usize, y as usize);
             let columns = (width as usize).min(screen.width.saturating_sub(x));
             let rows = (height as usize).min(screen.height.saturating_sub(y));
@@ -849,37 +817,151 @@ pub extern "C" fn api_gfx_fill_on(screen: u32, x: u32, y: u32, width: u32, heigh
                     unsafe { screen.base.add((y + row) * screen.stride + x + column).write_volatile(rgb) };
                 }
             }
-            1
+            true
         }
-        _ => 0,
     }
 }
 
-pub extern "C" fn api_gfx_blit_on(screen: u32, x: u32, y: u32, width: u32, height: u32, pixels: *const u32, stride: u32) -> u32 {
-    if let Some(half) = split_rect(screen) {
-        let Some((left, top, half_width, half_height)) = half.filter(|_| unsafe { (*core::ptr::addr_of!(SPLIT_OPEN))[screen as usize] }) else { return 0 };
-        if x >= half_width || y >= half_height {
-            return 0;
-        }
-        // Clipping to the half keeps the stride check (`stride >= width`) true.
-        return u32::from(unsafe { gfx_blit(left + x, top + y, width.min(half_width - x), height.min(half_height - y), pixels, stride) });
-    }
-    match screen {
-        0 => u32::from(unsafe { gfx_blit(x, y, width, height, pixels, stride) }),
-        1 => {
-            let Some(screen) = extra().filter(|screen| screen.open) else { return 0 };
+unsafe fn phys_blit(phys: usize, x: u32, y: u32, width: u32, height: u32, pixels: *const u32, stride: u32) -> bool {
+    match phys {
+        0 => unsafe { gfx_blit(x, y, width, height, pixels, stride) },
+        _ => {
+            let Some(screen) = extra().filter(|screen| screen.open) else { return false };
             let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
             if pixels.is_null() || stride < width || x >= screen.width || y >= screen.height {
-                return 0;
+                return false;
             }
             for row in 0..height.min(screen.height - y) {
                 let from = unsafe { pixels.add(row * stride) };
                 let to = unsafe { screen.base.add((y + row) * screen.stride + x) };
                 unsafe { core::ptr::copy_nonoverlapping(from, to, width.min(screen.width - x)) };
             }
-            1
+            true
         }
-        _ => 0,
+    }
+}
+
+/// Clears a rectangle of an open physical screen: the console's background, black on the second screen.
+fn phys_clear_rect(phys: usize, x: u32, y: u32, width: u32, height: u32) {
+    match phys {
+        0 => {
+            if let Some(console) = unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() } {
+                let background = console.background;
+                fill_logical(console, x, y, width, height, background);
+            }
+        }
+        _ => {
+            phys_fill(phys, x, y, width, height, 0);
+        }
+    }
+}
+
+/// What a tape screen number means right now: the physical screen, and for a half of a split screen which half and its
+/// rectangle (x, y, width, height) on the logical screen. `None` for a number that is not available.
+fn resolve(screen: u32) -> Option<(usize, Option<(usize, (u32, u32, u32, u32))>)> {
+    match screen {
+        0 | 1 => unsafe { (*core::ptr::addr_of!(SPLIT))[screen as usize] }.is_none().then_some((screen as usize, None)),
+        2..=5 => {
+            let (phys, half) = (((screen - 2) / 2) as usize, ((screen - 2) % 2) as usize);
+            let mode = unsafe { (*core::ptr::addr_of!(SPLIT))[phys] }?;
+            let (width, height) = phys_info(phys)?;
+            let rect = match mode {
+                Split::Sides => (half as u32 * (width / 2), 0, width / 2, height),
+                Split::Stacked => (0, half as u32 * (height / 2), width, height / 2),
+            };
+            Some((phys, Some((half, rect))))
+        }
+        _ => None,
+    }
+}
+
+fn region_open(phys: usize, half: usize) -> bool {
+    unsafe { (*core::ptr::addr_of!(REGION_OPEN))[2 * phys + half] }
+}
+
+fn set_region_open(phys: usize, half: usize, open: bool) {
+    unsafe { (*core::ptr::addr_of_mut!(REGION_OPEN))[2 * phys + half] = open };
+}
+
+pub extern "C" fn api_gfx_screens() -> u32 {
+    u32::from(gfx_info().is_some()) + u32::from(extra().is_some())
+}
+
+pub extern "C" fn api_gfx_info_on(screen: u32) -> u64 {
+    let size = match resolve(screen) {
+        Some((_, Some((_, (_, _, width, height))))) => Some((width, height)),
+        Some((phys, None)) => phys_info(phys),
+        None => None,
+    };
+    size.map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height))
+}
+
+pub extern "C" fn api_gfx_open_on(screen: u32) -> u32 {
+    match resolve(screen) {
+        Some((phys, None)) => u32::from(phys_open(phys)),
+        Some((phys, Some((half, (x, y, width, height))))) => {
+            // The first tape takes the whole screen (cleared); the second one only clears its own half.
+            let other_open = region_open(phys, 1 - half);
+            let ok = if other_open {
+                phys_clear_rect(phys, x, y, width, height);
+                true
+            } else {
+                phys_open(phys)
+            };
+            set_region_open(phys, half, ok);
+            u32::from(ok)
+        }
+        None => 0,
+    }
+}
+
+pub extern "C" fn api_gfx_close_on(screen: u32) {
+    match resolve(screen) {
+        Some((phys, None)) => phys_close(phys),
+        Some((phys, Some((half, (x, y, width, height))))) => {
+            if !region_open(phys, half) {
+                return;
+            }
+            set_region_open(phys, half, false);
+            // The screen goes back when the last half is given up; until then the freed half just goes dark.
+            if region_open(phys, 1 - half) {
+                phys_clear_rect(phys, x, y, width, height);
+            } else {
+                phys_close(phys);
+            }
+        }
+        None => {}
+    }
+}
+
+pub extern "C" fn api_gfx_fill_on(screen: u32, x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u32 {
+    match resolve(screen) {
+        Some((phys, None)) => u32::from(phys_fill(phys, x, y, width, height, rgb)),
+        Some((phys, Some((half, (left, top, half_width, half_height))))) => {
+            if !region_open(phys, half) {
+                return 0;
+            }
+            if x >= half_width || y >= half_height {
+                return 1;
+            }
+            u32::from(phys_fill(phys, left + x, top + y, width.min(half_width - x), height.min(half_height - y), rgb))
+        }
+        None => 0,
+    }
+}
+
+pub extern "C" fn api_gfx_blit_on(screen: u32, x: u32, y: u32, width: u32, height: u32, pixels: *const u32, stride: u32) -> u32 {
+    match resolve(screen) {
+        Some((phys, None)) => u32::from(unsafe { phys_blit(phys, x, y, width, height, pixels, stride) }),
+        Some((phys, Some((half, (left, top, half_width, half_height))))) => {
+            if !region_open(phys, half) || x >= half_width || y >= half_height {
+                return 0;
+            }
+            // Clipping to the half keeps the stride check (`stride >= width`) true.
+            let (width, height) = (width.min(half_width - x), height.min(half_height - y));
+            u32::from(unsafe { phys_blit(phys, left + x, top + y, width, height, pixels, stride) })
+        }
+        None => 0,
     }
 }
 

@@ -280,6 +280,7 @@ pub extern "C" fn task_exit() -> ! {
     LIVE.fetch_sub(1, Ordering::Relaxed);
     if count() == 0 {
         host::services_over();
+        crate::framebuffer::split_services_over();
     }
     let next = next_runnable(id);
     let mut unused = 0u64;
@@ -316,9 +317,15 @@ pub fn rotate_option(first: &str, second: &str) -> Option<crate::framebuffer::Ro
     first.split_ascii_whitespace().chain(second.split_ascii_whitespace()).find_map(|word| word.strip_prefix("rotate=")).and_then(crate::framebuffer::Rotate::parse)
 }
 
-/// `arguments` without any `split=` or `rotate=` word, plus `screen=N` unless they name a screen already, written into `buffer`;
-/// `None` when they do not fit.
-pub fn with_screen<'a>(buffer: &'a mut [u8; 256], arguments: &str, screen: usize) -> Option<&'a str> {
+/// The `screen=N` of a `run A | B` pair: the physical screen the pair shares (either tape may name it).
+pub fn group_screen(first: &str, second: &str) -> Option<usize> {
+    first.split_ascii_whitespace().chain(second.split_ascii_whitespace()).find_map(|word| word.strip_prefix("screen=")?.parse().ok())
+}
+
+/// `arguments` without any `split=` or `rotate=` word, plus `screen=N` written into `buffer`. A `screen=` of the tape's own
+/// stays unless `force` (the halves of a split screen are numbered by the kernel, `framebuffer::api_gfx_info_on`).
+/// `None` when it does not fit.
+pub fn with_screen<'a>(buffer: &'a mut [u8; 256], arguments: &str, screen: usize, force: bool) -> Option<&'a str> {
     use core::fmt::Write;
     struct Out<'b>(&'b mut [u8], usize);
     impl Write for Out<'_> {
@@ -331,7 +338,10 @@ pub fn with_screen<'a>(buffer: &'a mut [u8; 256], arguments: &str, screen: usize
     }
     let mut out = Out(&mut buffer[..], 0);
     let mut named = false;
-    for word in arguments.split_ascii_whitespace().filter(|word| !word.starts_with("split=") && !word.starts_with("rotate=")) {
+    for word in arguments.split_ascii_whitespace() {
+        if word.starts_with("split=") || word.starts_with("rotate=") || (force && word.starts_with("screen=")) {
+            continue;
+        }
         named |= word.starts_with("screen=");
         write!(out, "{word} ").ok()?;
     }

@@ -78,8 +78,8 @@ mod imp {
     pub fn nic_release(_nic: usize) {}
 
     pub fn load(slot: usize, name: &str) -> Option<u64> {
-        // Regions 0 and 1 belong to `run A + B`; services follow.
-        match tape::load_slot(name, slot + 1) {
+        // The first regions belong to `run A | B + C | D`; services follow (`slot` counts from 1).
+        match tape::load_slot(name, slot - 1 + tape::TASK_SLOTS) {
             Ok(entry) => Some(entry),
             Err(reason) => {
                 crate::println!("run: {name}: {reason}.");

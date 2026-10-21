@@ -86,6 +86,114 @@ fn execute(line: &str) {
 }
 
 
+/// A tape name and its arguments from one part of a `run` line.
+fn tape_part(part: &str) -> (&str, &str) {
+    let part = part.trim();
+    part.split_once(' ').map_or((part, ""), |(name, arguments)| (name, arguments.trim()))
+}
+
+/// `run A | B screen=P &N`: two background tapes share physical screen P (default 0); A owns NIC N, B none.
+fn start_pair(rest: &str, nic: Option<usize>) -> bool {
+    let Some((first, second)) = rest.split_once(" | ") else { return false };
+    let ((one, one_args), (two, two_args)) = (tape_part(first), tape_part(second));
+    let phys = crate::tasks::group_screen(one_args, two_args).unwrap_or(0);
+    if phys > 1 {
+        crate::println!("run: there is no screen {phys}.");
+        return true;
+    }
+    let mode = crate::tasks::split_mode(one_args, two_args);
+    let (mut one_text, mut two_text) = ([0u8; 256], [0u8; 256]);
+    let (Some(one_args), Some(two_args)) = (
+        crate::tasks::with_screen(&mut one_text, one_args, 2 + 2 * phys, true),
+        crate::tasks::with_screen(&mut two_text, two_args, 3 + 2 * phys, true),
+    ) else {
+        crate::println!("run: the arguments of a tape take at most 240 bytes.");
+        return true;
+    };
+    crate::framebuffer::split_set_service(phys, mode);
+    crate::tasks::start(one, one_args, nic);
+    crate::tasks::start(two, two_args, None);
+    true
+}
+
+/// `run A + B` (two screens), `run A | B` (one screen shared) and up to four tapes as `run A | B + C | D`. Every tape is
+/// loaded first: `calc 3 4 + 6 *` has a `+` too, and is no such line unless each word after a separator names a tape. A
+/// pair shares the screen named by a `screen=P` among its arguments (default: the pair's place in the line). False: this
+/// is not such a line.
+fn run_groups(rest: &str) -> bool {
+    let mut tapes = [("", ""); 4];
+    let mut sizes = [0usize; 2];
+    let (mut count, mut groups) = (0, 0);
+    for (group, text) in rest.split(" + ").enumerate() {
+        if group > 1 {
+            return false;
+        }
+        groups += 1;
+        for (position, part) in text.split(" | ").enumerate() {
+            if position > 1 {
+                return false;
+            }
+            tapes[count] = tape_part(part);
+            sizes[group] += 1;
+            count += 1;
+        }
+    }
+    if count < 2 {
+        return false;
+    }
+    let mut entries = [0u64; 4];
+    for index in 0..count {
+        match crate::tape_aarch64::load_slot(tapes[index].0, index) {
+            Ok(entry) => entries[index] = entry,
+            Err(_) => return false,
+        }
+    }
+    // A tape alone has its group's physical screen; the halves of a pair are numbered by the kernel.
+    let mut texts = [[0u8; 256]; 4];
+    let mut args = [""; 4];
+    let mut splits = [None; 2];
+    let mut used = [false; 2];
+    let mut index = 0;
+    let mut slots = texts.iter_mut();
+    for group in 0..groups {
+        let size = sizes[group];
+        if size == 2 {
+            let phys = crate::tasks::group_screen(tapes[index].1, tapes[index + 1].1).unwrap_or(group);
+            if phys > 1 || used[phys] {
+                crate::println!("run: screen {phys} is not available for this pair.");
+                return true;
+            }
+            used[phys] = true;
+            splits[group] = Some((phys, crate::tasks::split_mode(tapes[index].1, tapes[index + 1].1)));
+        }
+        for part in 0..size {
+            let screen = if size == 2 { 2 + 2 * splits[group].map_or(0, |(phys, _)| phys) + part } else { group };
+            let Some(text) = crate::tasks::with_screen(slots.next().unwrap(), tapes[index + part].1, screen, size == 2) else {
+                crate::println!("run: the arguments of a tape take at most 240 bytes.");
+                return true;
+            };
+            args[index + part] = text;
+        }
+        index += size;
+    }
+    let mut jobs = [(0u64, ""); 4];
+    for index in 0..count {
+        jobs[index] = (entries[index], args[index]);
+    }
+    for (phys, mode) in splits.into_iter().flatten() {
+        crate::framebuffer::split_set(phys, Some(mode));
+    }
+    crate::framebuffer::rotate_run(crate::tasks::rotate_option(rest, ""));
+    let outcome = crate::tape_aarch64::run_many(&jobs[..count]);
+    crate::framebuffer::split_clear_all();
+    crate::framebuffer::rotate_reset();
+    match outcome {
+        Ok(()) => crate::println!("All {count} tapes returned; back at the fos shell."),
+        Err(reason) => crate::println!("run: {reason}."),
+    }
+    true
+}
+
 /// `run NAME [ARGS]`: loads a tape from the boot volume and runs it until it returns or Escape stops it.
 pub(crate) fn run_tape(rest: &str) {
     // `run NAME ARGS &N`: a background tape (service) that owns NIC N.
@@ -103,37 +211,13 @@ pub(crate) fn run_tape(rest: &str) {
         return;
     }
     if let Some(Ok(nic)) = service {
-        return crate::tasks::start(name, arguments, nic);
-    }
-    // `run A + B`: two screens. `run A | B [split=h|v]`: one screen shared, A left (h, default) or above (v).
-    let pair = rest.split_once(" + ").map(|(a, b)| (a, b, false)).or_else(|| rest.split_once(" | ").map(|(a, b)| (a, b, true)));
-    if let Some((first, second, shared)) = pair {
-        fn split(part: &str) -> (&str, &str) {
-            let part = part.trim();
-            part.split_once(' ').map_or((part, ""), |(name, arguments)| (name, arguments.trim()))
-        }
-        let (first, second) = (split(first), split(second));
-        let loaded = crate::tape_aarch64::load_slot(first.0, 0).and_then(|one| Ok((one, crate::tape_aarch64::load_slot(second.0, 1)?)));
-        // `calc 3 4 + 6 *` has a `+` too: it is a second tape only when the word after it names a tape that loads.
-        if let Ok((one, two)) = loaded {
-            // Each tape draws on its own screen (0, then 1) unless its arguments say `screen=N`.
-            let (mut one_text, mut two_text) = ([0u8; 256], [0u8; 256]);
-            let (Some(one_args), Some(two_args)) = (crate::tasks::with_screen(&mut one_text, first.1, 0), crate::tasks::with_screen(&mut two_text, second.1, 1)) else {
-                return crate::println!("run: the arguments of a tape take at most 240 bytes.");
-            };
-            if shared {
-                crate::framebuffer::split_set(Some(crate::tasks::split_mode(first.1, second.1)));
-            }
-            crate::framebuffer::rotate_run(crate::tasks::rotate_option(first.1, second.1));
-            let outcome = crate::tape_aarch64::run_two([(one, one_args), (two, two_args)]);
-            crate::framebuffer::split_set(None);
-            crate::framebuffer::rotate_reset();
-            match outcome {
-                Ok(()) => crate::println!("Both tapes returned; back at the fos shell."),
-                Err(reason) => crate::println!("run: {reason}."),
-            }
+        if rest.contains(" | ") && start_pair(rest, nic) {
             return;
         }
+        return crate::tasks::start(name, arguments, nic);
+    }
+    if run_groups(rest) {
+        return;
     }
     match crate::tape_aarch64::load(name).and_then(|entry| crate::tape_aarch64::run(entry, arguments)) {
         Ok(()) => crate::println!("Tape returned; back at the fos shell."),

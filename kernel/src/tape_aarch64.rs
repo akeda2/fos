@@ -17,8 +17,9 @@ const REGION_BYTES: u64 = 4 * 1024 * 1024;
 const STAGE_BYTES: usize = 4 * 1024 * 1024;
 const STACK_BYTES: u64 = 1024 * 1024;
 
-/// Two tape regions: `run A + B` keeps both tapes loaded at once.
-static mut REGIONS: [u64; 2 + crate::tasks::MAX_SERVICES] = [0; 2 + crate::tasks::MAX_SERVICES];
+/// Tape regions 0-3 hold the tapes of one `run A | B + C | D`; the services follow.
+pub const TASK_SLOTS: usize = 4;
+static mut REGIONS: [u64; TASK_SLOTS + crate::tasks::MAX_SERVICES] = [0; TASK_SLOTS + crate::tasks::MAX_SERVICES];
 static mut INFO: *const BootInfo = core::ptr::null();
 static SPAN: AtomicU64 = AtomicU64::new(0);
 
@@ -88,7 +89,7 @@ pub fn load(name: &str) -> Result<u64, &'static str> {
     load_slot(name, 0)
 }
 
-/// `load` into region `slot` (0 and 1 for `run A + B`, then one per service), so several tapes can be resident together.
+/// `load` into region `slot` (0-3 for `run A | B + C | D`, then one per service), so several tapes can be resident together.
 pub fn load_slot(name: &str, slot: usize) -> Result<u64, &'static str> {
     let staging = memory::allocate_contiguous(STAGE_BYTES as u64 / memory::FRAME, None).ok_or("no memory for staging")?;
     let buffer = unsafe { core::slice::from_raw_parts_mut(staging as *mut u8, STAGE_BYTES) };
@@ -667,7 +668,7 @@ unsafe extern "C" {
     fn fos_task_start();
 }
 
-const TASKS: usize = 2;
+const TASKS: usize = TASK_SLOTS;
 /// Bytes `fos_task_switch` pushes: x19-x30 and d8-d15.
 const SWITCH_FRAME: u64 = 176;
 
@@ -733,11 +734,14 @@ extern "C" fn fos_task_finished() -> ! {
     }
 }
 
-/// Runs two loaded tapes side by side on this core until both have returned. Tab moves the keyboard between them.
-pub fn run_two(tapes: [(u64, &str); TASKS]) -> Result<(), &'static str> {
+/// Runs up to four loaded tapes side by side on this core until all have returned. Tab moves the keyboard between them.
+pub fn run_many(tapes: &[(u64, &str)]) -> Result<(), &'static str> {
     let info = unsafe { INFO.as_ref() }.ok_or("no boot info")?;
+    if tapes.is_empty() || tapes.len() > TASKS {
+        return Err("one to four tapes at a time");
+    }
     let mut stacks = [0u64; TASKS];
-    for index in 0..TASKS {
+    for index in 0..tapes.len() {
         match memory::allocate_contiguous(STACK_BYTES / memory::FRAME, None) {
             Some(stack) => stacks[index] = stack,
             None => {
@@ -766,6 +770,9 @@ pub fn run_two(tapes: [(u64, &str); TASKS]) -> Result<(), &'static str> {
         state.sp[index] = frame;
         state.done[index] = false;
     }
+    for index in tapes.len()..TASKS {
+        state.done[index] = true;
+    }
     state.focus = 0;
     state.streak = 0;
     state.current = 0;
@@ -775,8 +782,8 @@ pub fn run_two(tapes: [(u64, &str); TASKS]) -> Result<(), &'static str> {
     crate::framebuffer::gfx_close();
     close_extra_screens();
     unsafe { PENDING_LENGTH = 0 };
-    for stack in stacks {
-        memory::free(stack, STACK_BYTES / memory::FRAME);
+    for stack in &stacks[..tapes.len()] {
+        memory::free(*stack, STACK_BYTES / memory::FRAME);
     }
     Ok(())
 }

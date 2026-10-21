@@ -881,11 +881,11 @@ fn run_shared(first: &str, second: &str) -> bool {
     }
     let ((one, one_args), (two, two_args)) = (split(first), split(second));
     let (mut one_text, mut two_text) = ([0u8; 256], [0u8; 256]);
-    let (Some(one_args), Some(two_args)) = (crate::tasks::with_screen(&mut one_text, one_args, 0), crate::tasks::with_screen(&mut two_text, two_args, 1)) else {
+    let (Some(one_args), Some(two_args)) = (crate::tasks::with_screen(&mut one_text, one_args, 2, true), crate::tasks::with_screen(&mut two_text, two_args, 3, true)) else {
         return false;
     };
     let Ok(length) = load_from_file(two) else { return false };
-    crate::framebuffer::split_set(Some(crate::tasks::split_mode(first, second)));
+    crate::framebuffer::split_set(0, Some(crate::tasks::split_mode(first, second)));
     crate::framebuffer::rotate_run(crate::tasks::rotate_option(first, second));
     set_staged_length(length);
     crate::tasks::start(two, two_args, None);
@@ -904,7 +904,7 @@ fn run_shared(first: &str, second: &str) -> bool {
         Err(reason) => crate::println!("run: {one}: {reason}."),
     }
     crate::tasks::kill(Some(two));
-    crate::framebuffer::split_set(None);
+    crate::framebuffer::split_clear_all();
     crate::framebuffer::rotate_reset();
     true
 }

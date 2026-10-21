@@ -1254,6 +1254,8 @@ the foreground only. KUP and NETFS work while a service runs. Test:
 `make test-services` (ptp master service, slave locks on, foreground tapes,
 `kill`). Only real hardware shows Sync jitter next to a busy foreground tape.
 
+**Several screens** (Pi): splits are per physical screen; tape screen numbers 0 and 1 are whole screens, 2+2P and 3+2P the halves of split screen P. `run A | B + C | D` (up to four tapes, Tab moves the keys) and `run A | B screen=P &N` (background pair) use them; see `docs/aarch64-plan.md`.
+
 **Two graphic tapes on one screen** (`run A ARGS | B ARGS [split=h|v]`, `make test-split`): the console is cut in two, side by side
 (`split=h`, default) or stacked (`split=v`). Tape screens 0 and 1 become the halves (`framebuffer::split_set`; `gfx_info_on` reports a
 half, fill and blit are clipped and offset into it), so a tape that lays itself out to its screen size needs no change. `tape-rt`
