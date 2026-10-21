@@ -685,6 +685,36 @@ fn copy_to_peer(source: &str, name: &str, host: &str, new_name: &str) {
 }
 
 
+pub(crate) fn count() -> usize {
+    imp::count()
+}
+
+pub(crate) fn mac(index: usize) -> Option<[u8; 6]> {
+    imp::mac(index)
+}
+
+pub(crate) fn link_up(index: usize) -> bool {
+    imp::link_up(index)
+}
+
+pub(crate) fn send_frame(index: usize, frame: &[u8]) -> bool {
+    imp::send_frame(index, frame)
+}
+
+/// Receives what is waiting on every interface; our own protocols are served, the rest goes to `visit(interface, frame)`.
+pub(crate) fn drain(visit: impl FnMut(usize, &[u8])) {
+    imp::drain(visit);
+}
+
+/// A shell loop that runs until Escape: `blocking(true)` first (a `term net` client's keys must not nest commands).
+pub(crate) fn blocking(on: bool) {
+    imp::blocking(on);
+}
+
+pub(crate) fn break_requested() -> bool {
+    imp::break_requested()
+}
+
 pub(crate) fn staging() -> Option<&'static mut [u8]> {
     imp::staging()
 }

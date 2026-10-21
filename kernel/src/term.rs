@@ -164,7 +164,7 @@ fn send(nic: &mut Nic, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
     nic.send(&frame[..15 + payload.len()])
 }
 
-/// Set while `nic recv` waits: `poll` then queues every unhandled frame, not only the fos ethertype's.
+/// Set while a `nic` self-test waits: `poll` then queues every unhandled frame, not only the fos ethertype's.
 static mut QUEUE_ALL: bool = false;
 
 /// Handles whatever the NIC has received. Call this from the main loop.
@@ -985,15 +985,11 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug" | "tapesync" | "copy" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug" | "tapesync" | "copy" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover" | "use" | "map" | "send" | "recv"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
     match word {
-        "nic" if matches!(words.clone().next(), Some("use")) => {
-            words.next();
-            nic_use(words.next());
-        }
         "nic" if matches!(words.clone().next(), Some("park" | "unpark")) => {
             let park = words.next() == Some("park");
             let Some(index) = words.next().and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
@@ -1025,9 +1021,6 @@ fn execute(command: &str) {
             words.next();
             nic_multicast_test(words.next(), words.next(), words.next());
         }
-        "nic" if matches!(words.clone().next(), Some("map")) => nic_map(),
-        "nic" if matches!(words.clone().next(), Some("send")) => nic_send_test(),
-        "nic" if matches!(words.clone().next(), Some("recv")) => nic_recv_test(),
         "gpu" => crate::gpu::command(),
         "nic" if matches!(words.clone().next(), Some("regs")) => {
             words.next();
@@ -1488,6 +1481,11 @@ fn parse_number(word: &str) -> Option<u64> {
 
 /// `nic send`: one broadcast test frame (ethertype 0x88b5, v1's TEST_ETHERTYPE) out of interface 1.
 /// The interface chosen with `nic use N` (zero-based): what `nic sniff` defaults to and what a tape's single-interface calls use.
+/// `nic use N`: the interface the nic subcommands and the single-interface tape calls default to (zero-based).
+pub(crate) fn set_active_nic(index: usize) {
+    unsafe { ACTIVE_NIC = index };
+}
+
 pub fn active_nic() -> usize {
     unsafe { ACTIVE_NIC }.min(nic_count().saturating_sub(1))
 }
@@ -1523,16 +1521,6 @@ fn nic_phy(arg: Option<&str>) {
     crate::println!("nic {index}: 1000BASE-T local receiver {}, remote receiver {}", if status_1000 & 0x2000 != 0 { "OK" } else { "not OK" }, if status_1000 & 0x1000 != 0 { "OK" } else { "not OK" });
 }
 
-fn nic_use(argument: Option<&str>) {
-    match argument.and_then(|word| word.parse::<usize>().ok()) {
-        Some(number) if number >= 1 && number <= nic_count() => {
-            unsafe { ACTIVE_NIC = number - 1 };
-            crate::println!("Using NIC {number} for nic sniff and the single-interface tape calls.");
-        }
-        _ => crate::println!("Usage: nic use N   (N from 1 to {}; `nic` lists them). Now: NIC {}.", nic_count(), unsafe { ACTIVE_NIC } + 1),
-    }
-}
-
 /// Receives every waiting frame on every interface. The terminal's and discovery's own frames are handled as usual
 /// (so the session stays alive while a command runs); everything else goes to `visit(interface, frame)`.
 pub(crate) fn drain_nics(mut visit: impl FnMut(usize, &[u8])) {
@@ -1547,81 +1535,6 @@ pub(crate) fn drain_nics(mut visit: impl FnMut(usize, &[u8])) {
     }
     if session_open() {
         flush();
-    }
-}
-
-/// `nic map`: which interfaces hear which. Every interface with a link sends a probe and the others listen; with
-/// two ports cabled together this shows the cable. It retries up to three rounds while nothing is heard (links
-/// coming up take a moment).
-fn nic_map() {
-    let count = nic_count();
-    if count == 0 {
-        return crate::println!("No network interface.");
-    }
-    let mut heard = [[false; MAX_NICS]; MAX_NICS];
-    blocking(true);
-    for round in 0..3 {
-        for from in 0..count {
-            let Some(nic) = nic_at(from) else { continue };
-            if !nic.link_up() {
-                continue;
-            }
-            let mut frame = [0u8; 14 + 8];
-            frame[0..6].copy_from_slice(&[0xff; 6]);
-            frame[6..12].copy_from_slice(&nic.mac());
-            frame[12..14].copy_from_slice(&[0x88, 0xb9]);
-            frame[14..20].copy_from_slice(b"FOSMAP");
-            frame[20] = from as u8;
-            nic.send(&frame);
-            let until = timer::ticks() + timer::TICK_HZ / 5;
-            while timer::ticks() < until {
-                drain_nics(|to, received| {
-                    if received.len() >= 21 && received[12..14] == [0x88, 0xb9] && &received[14..20] == b"FOSMAP" {
-                        let sender = usize::from(received[20]);
-                        // Only our own interfaces' probes count (another machine on the same network sends some too).
-                        if sender < MAX_NICS && sender != to && nic_at(sender).is_some_and(|nic| nic.mac() == received[6..12]) {
-                            heard[sender][to] = true;
-                        }
-                    }
-                });
-                crate::debug::pet();
-            }
-        }
-        if heard.iter().any(|row| row.iter().any(|&seen| seen)) || break_requested() {
-            break;
-        }
-        crate::println!("Nothing heard yet (round {})...", round + 1);
-    }
-    blocking(false);
-    for from in 0..count {
-        let Some(nic) = nic_at(from) else { continue };
-        crate::print(format_args!("NIC {} {} ({}): ", from + 1, Mac(&nic.mac()), if nic.link_up() { "link up" } else { "link DOWN" }));
-        let mut any = false;
-        for to in 0..count {
-            if heard[from][to] {
-                crate::print(format_args!("{}NIC {}", if any { ", " } else { "heard by " }, to + 1));
-                any = true;
-            }
-        }
-        crate::println!("{}", if any { "" } else { "heard by nobody" });
-    }
-}
-
-fn nic_send_test() {
-    let mut mac = [0u8; 6];
-    if !nic_mac(0, &mut mac) {
-        return crate::println!("No network interface.");
-    }
-    let payload = b"fos raw ethernet test frame";
-    let mut frame = [0u8; 14 + 27];
-    frame[0..6].copy_from_slice(&[0xff; 6]);
-    frame[6..12].copy_from_slice(&mac);
-    frame[12..14].copy_from_slice(&[0x88, 0xb5]);
-    frame[14..].copy_from_slice(payload);
-    if nic_send(0, &frame) {
-        crate::println!("Sent {} bytes: broadcast test frame (ethertype 0x88b5).", frame.len());
-    } else {
-        crate::println!("Send failed.");
     }
 }
 
@@ -1870,38 +1783,6 @@ fn nic_timestamp_test(number: Option<&str>, action: Option<&str>, value: Option<
 }
 
 /// `nic recv`: waits up to three seconds for a frame that is not the terminal's, then dumps it.
-fn nic_recv_test() {
-    // Blocking mode keeps typed commands that arrive meanwhile from running nested inside this wait
-    // (each nesting adds big stack frames); Escape ends the wait instead.
-    blocking(true);
-    unsafe { QUEUE_ALL = true };
-    nic_recv_wait();
-    unsafe { QUEUE_ALL = false };
-    blocking(false);
-}
-
-fn nic_recv_wait() {
-    let deadline = timer::ticks() + 3 * timer::TICK_HZ;
-    while timer::ticks() < deadline && !break_requested() {
-        poll();
-        for index in 0..nic_count() {
-            let mut buffer = [0u8; 1600];
-            let length = pop_frame(index, &mut buffer);
-            if length >= 14 {
-                let f = &buffer[..length];
-                crate::println!(
-                    "Received {length} bytes: dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype 0x{:02x}{:02x}",
-                    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13]
-                );
-                return crate::shellcmds::dump_bytes(0, f);
-            }
-        }
-        crate::debug::pet();
-        crate::cpu::sleep();
-    }
-    crate::println!("No frame received (timed out waiting).");
-}
-
 /// `midi` lists the USB-MIDI devices; `midi monitor` prints what they send until Escape; `midi send HEX...` sends one
 /// message (`midi send 90 3c 64` is note C4 on) to the first device, `midi send N HEX...` to device N.
 fn midi_command<'a>(words: &mut impl Iterator<Item = &'a str>) {
