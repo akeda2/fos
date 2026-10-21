@@ -64,10 +64,6 @@ pub fn run() -> ! {
 static COMMANDS: &[Command] = &[
     Command::new("start", "start", "runs the boot volume's `start` file again.", |_, _| start_script(true)),
     Command::new("version", "version", "the kernel's name.", |_, _| crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`).")),
-    Command::new("uptime", "uptime", "time since boot.", |_, _| {
-        let seconds = timer::micros() / 1_000_000;
-        crate::println!("up {}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
-    }),
     Command::new("mem", "mem", "physical memory, managed and free.", |_, _| {
         let stats = memory::stats();
         let mib = |frames: u64| frames * memory::FRAME / (1024 * 1024);
@@ -93,15 +89,8 @@ static COMMANDS: &[Command] = &[
     Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
     Command::new("sector", "sector diskN LBA [COUNT]", "hex dump of raw sectors (read-only, at most 4).", |_, rest| sector(rest)),
     Command::new("audio", "audio ...", "the audio device and a quick capture check.", |_, rest| audio(rest)),
-    Command::new("date", "date [set ...]", "the date and time.", |_, rest| date(rest)),
     Command::new("display", "display ...", "the screens.", |_, rest| display(rest)),
     Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |_, rest| run_tape(rest)),
-    Command::new("ps", "ps", "lists the running tapes.", |_, _| crate::tasks::list()).alias(&["tasks"]),
-    Command::new("kill", "kill N|NAME|all", "stops a background tape.", |_, rest| crate::tasks::kill(rest.split_whitespace().next())),
-    Command::new("keymap", "keymap us|sv", "the USB keyboard layout.", |_, rest| match crate::usb_kbd::layout_named(rest) {
-        Some(layout) => crate::usb_kbd::set_layout(layout),
-        None => crate::println!("keymap: us or sv."),
-    }),
     Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
     Command::new("acpi", "acpi", "lists the ACPI tables.", |_, _| {
         crate::arch::aarch64::acpi::list(|signature, address, length| {
@@ -144,21 +133,13 @@ static COMMANDS: &[Command] = &[
         crate::arch::aarch64::power::reset()
     })
     .alias(&["reboot"]),
-    Command::new("sleep", "sleep SECONDS", "waits (at most 60 s).", |_, rest| {
-        let seconds = rest.parse::<u64>().unwrap_or(1).min(60);
-        let end = timer::ticks() + seconds * timer::TICK_HZ;
-        while timer::ticks() < end {
-            crate::cpu::sleep();
-        }
-        crate::println!("Slept {seconds} s.");
-    }),
     Command::new("clear", "clear", "clears the screen.", |_, _| crate::print(format_args!("\x1b[2J"))),
     Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),
     Command::new("poke", "poke ADDR VALUE", "writes memory (hex; bring-up).", |_, rest| poke(rest)),
 ];
 
 fn execute(line: &str) {
-    if line.is_empty() || fosfor_shell::execute(&mut KernelHost, &[COMMANDS, fosfor_shell::files::COMMANDS], line) {
+    if line.is_empty() || fosfor_shell::execute(&mut KernelHost, &[COMMANDS, crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], line) {
         return;
     }
     if !fosfor_shell::external(&mut KernelHost, line) {
@@ -584,32 +565,3 @@ fn display(rest: &str) {
     let _ = tag(SET_DISPLAY_NUM, &[0], &mut [0u32]);
 }
 
-/// `date` shows the clock; `date set YYYY-MM-DD HH:MM[:SS]` sets it (local time). The Pi has no RTC, so it starts unset.
-fn date(rest: &str) {
-    let mut words = rest.split_whitespace();
-    match words.next() {
-        None => match crate::clock::now() {
-            Some(time) => crate::println!("{} (local time, software clock)", crate::clock::Display(time)),
-            None => crate::println!("The clock is not set (no RTC here). `date set YYYY-MM-DD HH:MM`, or run the clock tape."),
-        },
-        Some("set") => {
-            let parsed = (|| {
-                let (date, time) = (words.next()?, words.next()?);
-                let mut parts = date.split('-');
-                let (year, month, day) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
-                let mut parts = time.split(':');
-                let (hour, minute) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
-                let second = parts.next().map_or(Some(0), |word| word.parse().ok())?;
-                Some(fat::Time { year, month, day, hour, minute, second })
-            })();
-            match parsed {
-                None => crate::println!("Usage: date set YYYY-MM-DD HH:MM[:SS]   (local time)"),
-                Some(time) => match crate::clock::set(&time) {
-                    Ok(()) => crate::println!("The clock is {}.", crate::clock::Display(time)),
-                    Err(reason) => crate::println!("date: {reason}"),
-                },
-            }
-        }
-        Some(_) => crate::println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
-    }
-}

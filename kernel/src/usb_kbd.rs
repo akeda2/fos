@@ -53,6 +53,10 @@ pub fn set_layout(layout: Layout) {
     SWEDISH.store(layout == Layout::Swedish, Ordering::Relaxed);
 }
 
+pub fn layout() -> Layout {
+    if SWEDISH.load(Ordering::Relaxed) { Layout::Swedish } else { Layout::Us }
+}
+
 /// The next typed byte, if one is waiting.
 pub fn pop() -> Option<u8> {
     let tail = TAIL.load(Ordering::Relaxed);

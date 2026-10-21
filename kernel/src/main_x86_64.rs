@@ -36,6 +36,7 @@ mod storage;
 mod tape;
 mod service_host;
 mod tasks;
+mod shellcmds;
 mod shellhost;
 mod tape_fs;
 mod tapesync;

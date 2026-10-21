@@ -11,7 +11,7 @@
 //! session is open; it is flushed to the wire in 1 KiB DATA frames.
 
 use crate::nic::Nic;
-use crate::{apic, memory, pci, power, timer};
+use crate::{memory, pci, power, timer};
 
 const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
 const TAG_DISCOVER_REQUEST: u8 = 0x02;
@@ -1435,9 +1435,9 @@ fn execute(command: &str) {
     if word != "bootcode" {
         crate::bootcode::cancel(); // and a boot-code update
     }
-    // The file commands are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp") {
-        fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[fosfor_shell::files::COMMANDS], command);
+    // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
+        fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
     match word {
@@ -1627,8 +1627,6 @@ fn execute(command: &str) {
         }
         "tape" => crate::tape::command(command.strip_prefix("tape").unwrap_or("")),
         "run" => crate::tape::run_named(command.strip_prefix("run").unwrap_or("")),
-        "ps" | "tasks" => crate::tasks::list(),
-        "kill" => crate::tasks::kill(words.next()),
         "label" => label_command(words),
         "audio" => audio_command(words),
         "hda" => crate::hda::describe(),
@@ -1655,7 +1653,6 @@ fn execute(command: &str) {
                 None => crate::println!("boot disk: not identified"),
             }
         }
-        "date" => date_command(words),
         "start" => start_command(),
         "fsck" => files(&mut words, |volume, _, _| crate::fosfs::report(&volume)),
         "usb" => {
@@ -1684,32 +1681,6 @@ fn execute(command: &str) {
             crate::usb_serial::describe();
         }
         "midi" => midi_command(&mut words),
-        "sleep" => {
-            // Blocks the shell for N seconds without polling anything (the watchdog is fed): what a long disk
-            // write or any other slow command looks like to the rest of the kernel. USB audio must keep
-            // flowing meanwhile (test: `audio start`, `sleep`, `audio`).
-            let seconds = words.next().and_then(|word| word.parse::<u64>().ok()).unwrap_or(1).min(60);
-            let end = timer::ticks() + seconds * timer::TICK_HZ;
-            while timer::ticks() < end {
-                crate::debug::pet();
-                crate::cpu::sleep();
-            }
-            crate::println!("Slept {seconds} s.");
-        }
-        "keymap" => match words.next() {
-            None => crate::println!("keymap: {} (keymap us|sv changes it).", if crate::keyboard::layout() == fosfor_abi::keymap::Layout::Us { "us" } else { "sv" }),
-            Some(name) => match crate::keyboard::layout_named(name) {
-                Some(layout) => {
-                    crate::keyboard::set_layout(layout);
-                    crate::println!("keymap: {name}.");
-                }
-                None => crate::println!("keymap: unknown layout `{name}` (us or sv)."),
-            },
-        },
-        "uptime" => {
-            let ticks = timer::ticks();
-            crate::println!("{} ticks at {} Hz ({} s); spurious legacy-PIC interrupts: {}", ticks, timer::TICK_HZ, ticks / timer::TICK_HZ, apic::legacy_pic_interrupts());
-        }
         "power" => match words.next() {
             Some("hwp") => hwp_command(words.next()),
             word => power_command(word.and_then(|word| word.parse::<u64>().ok())),
@@ -2117,35 +2088,6 @@ fn videomodes_command() {
 }
 
 /// `date` shows the clock; `date set YYYY-MM-DD HH:MM[:SS]` sets it (local time) and writes the RTC.
-fn date_command(mut words: core::str::SplitWhitespace) {
-    match words.next() {
-        None => match crate::clock::now() {
-            Some(time) => crate::println!("{} (local time, from the RTC)", crate::clock::Display(time)),
-            None => crate::println!("The clock is not set (the RTC held no valid time). `date set YYYY-MM-DD HH:MM`."),
-        },
-        Some("set") => {
-            let parsed = (|| {
-                let date = words.next()?;
-                let time = words.next()?;
-                let mut parts = date.split('-');
-                let (year, month, day) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
-                let mut parts = time.split(':');
-                let (hour, minute) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
-                let second = parts.next().map_or(Some(0), |word| word.parse().ok())?;
-                Some(fat::Time { year, month, day, hour, minute, second })
-            })();
-            match parsed {
-                None => crate::println!("Usage: date set YYYY-MM-DD HH:MM[:SS]   (local time)"),
-                Some(time) => match crate::clock::set(&time) {
-                    Ok(()) => crate::println!("The clock is {}.", crate::clock::Display(time)),
-                    Err(reason) => crate::println!("date: {reason}"),
-                },
-            }
-        }
-        Some(_) => crate::println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
-    }
-}
-
 /// A file copied to or from a FAT volume (one of the two ends is FAT). Through memory, like the FOSFS copy.
 fn copy_with_fat(source: &str, name: &str, destination: &str, new_name: &str, source_fat: Option<(usize, crate::fatvol::Fs, Option<&str>)>, destination_fat: Option<(usize, crate::fatvol::Fs, Option<&str>)>) {
     const LIMIT: usize = 64 << 20;

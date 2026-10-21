@@ -22,6 +22,7 @@ mod memory;
 mod pci;
 mod service_host;
 mod shell;
+mod shellcmds;
 mod shellhost;
 mod storage;
 mod tape_aarch64;
