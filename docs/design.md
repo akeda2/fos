@@ -1254,6 +1254,13 @@ the foreground only. KUP and NETFS work while a service runs. Test:
 `make test-services` (ptp master service, slave locks on, foreground tapes,
 `kill`). Only real hardware shows Sync jitter next to a busy foreground tape.
 
+**Two graphic tapes on one screen** (`run A ARGS | B ARGS [split=h|v]`, `make test-split`): the console is cut in two, side by side
+(`split=h`, default) or stacked (`split=v`). Tape screens 0 and 1 become the halves (`framebuffer::split_set`; `gfx_info_on` reports a
+half, fill and blit are clipped and offset into it), so a tape that lays itself out to its screen size needs no change. `tape-rt`
+always uses the numbered gfx calls for that. A runs in front on screen 0 with the keys; B has screen 1. On the Pi both are tasks
+(Tab moves the keys, as with `+`); on x86 B is a service without a NIC or keys and ends with A. `run A + B` (Pi) is the
+two-display form: screen 0 and screen 1.
+
 ### Native float audio (ABI 21, crates/audio-sample, crates/audio-wire)
 
 One USB audio driver (`usb_audio.rs`) serves both kernels and now detects 32-bit IEEE float streams (alt settings with

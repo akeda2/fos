@@ -872,6 +872,41 @@ pub fn show_help(name: &str) {
     }
 }
 
+/// `run A | B`: the console is split into two screens, B starts as a service on screen 1 and A runs in front on screen 0.
+/// False (nothing started) when B is not a tape, since `calc 3 | 4` has a `|` too. B ends with A.
+fn run_shared(first: &str, second: &str) -> bool {
+    fn split(part: &str) -> (&str, &str) {
+        let part = part.trim();
+        part.split_once(char::is_whitespace).map_or((part, ""), |(name, arguments)| (name, arguments.trim()))
+    }
+    let ((one, one_args), (two, two_args)) = (split(first), split(second));
+    let (mut one_text, mut two_text) = ([0u8; 256], [0u8; 256]);
+    let (Some(one_args), Some(two_args)) = (crate::tasks::with_screen(&mut one_text, one_args, 0), crate::tasks::with_screen(&mut two_text, two_args, 1)) else {
+        return false;
+    };
+    let Ok(length) = load_from_file(two) else { return false };
+    crate::framebuffer::split_set(Some(crate::tasks::split_mode(first, second)));
+    set_staged_length(length);
+    crate::tasks::start(two, two_args, None);
+    match load_from_file(one) {
+        Ok(length) => {
+            set_staged_length(length);
+            match load_staged(one) {
+                Ok(()) => {
+                    if let Err(reason) = run(one_args) {
+                        crate::println!("run: {reason}.");
+                    }
+                }
+                Err(error) => crate::println!("run: {one} is not a usable tape ({error:?})."),
+            }
+        }
+        Err(reason) => crate::println!("run: {one}: {reason}."),
+    }
+    crate::tasks::kill(Some(two));
+    crate::framebuffer::split_set(None);
+    true
+}
+
 /// `run NAME [ARGS]`: load a tape from FOSFS and run it.
 pub fn run_named(arguments: &str) {
     // `run NAME ARGS &N`: a service on NIC N.
@@ -880,6 +915,14 @@ pub fn run_named(arguments: &str) {
         return crate::tasks::usage();
     }
     let (name, rest) = arguments.split_once(char::is_whitespace).unwrap_or((arguments, ""));
+    // `run A ARGS | B ARGS [split=h|v]`: two graphic tapes share the screen (B runs as a service without NIC or keys).
+    if service.is_none() {
+        if let Some((first, second)) = arguments.split_once(" | ") {
+            if run_shared(first, second) {
+                return;
+            }
+        }
+    }
     match load_from_file(name) {
         Ok(length) => {
             // `NAME help`, `NAME --help`: a tape with a `.fos_help` section shows it instead of running.

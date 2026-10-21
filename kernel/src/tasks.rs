@@ -304,6 +304,38 @@ pub fn split_suffix(arguments: &str) -> (&str, Option<Result<Option<usize>, ()>>
     }
 }
 
+/// `split=v` (stacked) in either tape's arguments of `run A | B`; side by side otherwise or for `split=h`.
+pub fn split_mode(first: &str, second: &str) -> crate::framebuffer::Split {
+    let stacked = first.split_ascii_whitespace().chain(second.split_ascii_whitespace()).any(|word| word == "split=v");
+    if stacked { crate::framebuffer::Split::Stacked } else { crate::framebuffer::Split::Sides }
+}
+
+/// `arguments` without any `split=` word, plus `screen=N` unless they name a screen already, written into `buffer`;
+/// `None` when they do not fit.
+pub fn with_screen<'a>(buffer: &'a mut [u8; 256], arguments: &str, screen: usize) -> Option<&'a str> {
+    use core::fmt::Write;
+    struct Out<'b>(&'b mut [u8], usize);
+    impl Write for Out<'_> {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.1 + text.len();
+            self.0.get_mut(self.1..end).ok_or(core::fmt::Error)?.copy_from_slice(text.as_bytes());
+            self.1 = end;
+            Ok(())
+        }
+    }
+    let mut out = Out(&mut buffer[..], 0);
+    let mut named = false;
+    for word in arguments.split_ascii_whitespace().filter(|word| !word.starts_with("split=")) {
+        named |= word.starts_with("screen=");
+        write!(out, "{word} ").ok()?;
+    }
+    if !named {
+        write!(out, "screen={screen}").ok()?;
+    }
+    let length = out.1;
+    core::str::from_utf8(&buffer[..length]).ok().map(str::trim)
+}
+
 pub fn usage() {
     crate::println!("run: `&N` names the NIC the background tape owns (N from 1 to {}; `&0` for none).", host::nic_count());
 }

@@ -86,32 +86,6 @@ fn execute(line: &str) {
 }
 
 
-/// `arguments`, plus `screen=N` unless they name a screen already; `None` when they do not fit `buffer`.
-fn with_screen<'a>(buffer: &'a mut [u8; 256], arguments: &str, screen: usize) -> Option<&'a str> {
-    use core::fmt::Write;
-    struct Out<'b>(&'b mut [u8], usize);
-    impl Write for Out<'_> {
-        fn write_str(&mut self, text: &str) -> core::fmt::Result {
-            let end = self.1 + text.len();
-            self.0.get_mut(self.1..end).ok_or(core::fmt::Error)?.copy_from_slice(text.as_bytes());
-            self.1 = end;
-            Ok(())
-        }
-    }
-    let named = arguments.split_ascii_whitespace().any(|word| word.starts_with("screen="));
-    let mut out = Out(&mut buffer[..], 0);
-    if arguments.len() > 240 {
-        return None;
-    }
-    if named {
-        write!(out, "{arguments}").ok()?;
-    } else {
-        write!(out, "{arguments} screen={screen}").ok()?;
-    }
-    let length = out.1;
-    core::str::from_utf8(&buffer[..length]).ok().map(str::trim)
-}
-
 /// `run NAME [ARGS]`: loads a tape from the boot volume and runs it until it returns or Escape stops it.
 pub(crate) fn run_tape(rest: &str) {
     // `run NAME ARGS &N`: a background tape (service) that owns NIC N.
@@ -131,7 +105,9 @@ pub(crate) fn run_tape(rest: &str) {
     if let Some(Ok(nic)) = service {
         return crate::tasks::start(name, arguments, nic);
     }
-    if let Some((first, second)) = rest.split_once(" + ") {
+    // `run A + B`: two screens. `run A | B [split=h|v]`: one screen shared, A left (h, default) or above (v).
+    let pair = rest.split_once(" + ").map(|(a, b)| (a, b, false)).or_else(|| rest.split_once(" | ").map(|(a, b)| (a, b, true)));
+    if let Some((first, second, shared)) = pair {
         fn split(part: &str) -> (&str, &str) {
             let part = part.trim();
             part.split_once(' ').map_or((part, ""), |(name, arguments)| (name, arguments.trim()))
@@ -142,10 +118,15 @@ pub(crate) fn run_tape(rest: &str) {
         if let Ok((one, two)) = loaded {
             // Each tape draws on its own screen (0, then 1) unless its arguments say `screen=N`.
             let (mut one_text, mut two_text) = ([0u8; 256], [0u8; 256]);
-            let (Some(one_args), Some(two_args)) = (with_screen(&mut one_text, first.1, 0), with_screen(&mut two_text, second.1, 1)) else {
+            let (Some(one_args), Some(two_args)) = (crate::tasks::with_screen(&mut one_text, first.1, 0), crate::tasks::with_screen(&mut two_text, second.1, 1)) else {
                 return crate::println!("run: the arguments of a tape take at most 240 bytes.");
             };
-            match crate::tape_aarch64::run_two([(one, one_args), (two, two_args)]) {
+            if shared {
+                crate::framebuffer::split_set(Some(crate::tasks::split_mode(first.1, second.1)));
+            }
+            let outcome = crate::tape_aarch64::run_two([(one, one_args), (two, two_args)]);
+            crate::framebuffer::split_set(None);
+            match outcome {
                 Ok(()) => crate::println!("Both tapes returned; back at the fos shell."),
                 Err(reason) => crate::println!("run: {reason}."),
             }

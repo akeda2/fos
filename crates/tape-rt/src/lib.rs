@@ -670,45 +670,42 @@ pub fn audio_float_of(table: &TapeApi) -> (bool, bool) {
     (bits & fosfor_abi::tape::AUDIO_FLOAT_CAPTURE != 0, bits & fosfor_abi::tape::AUDIO_FLOAT_PLAYBACK != 0)
 }
 
-/// `gfx_info` for screen number `screen` (0-based). Screen 0 works on kernels from version 17, others need 20.
+/// `gfx_info` for screen number `screen` (0-based). Screen 0 works on kernels from version 17, others need 20. From 20 on,
+/// even screen 0 goes through the numbered calls: `run A | B` splits the console into two screens, 0 and 1.
 pub fn gfx_info_on(screen: u32) -> Option<(u32, u32)> {
-    if screen == 0 {
-        return gfx_info();
-    }
-    let packed = (screens_table()?.gfx_info_on)(screen);
+    let Some(table) = screens_table() else { return if screen == 0 { gfx_info() } else { None } };
+    let packed = (table.gfx_info_on)(screen);
     (packed != 0).then_some(((packed >> 32) as u32, packed as u32))
 }
 
 /// `gfx_open` for a screen.
 pub fn gfx_open_on(screen: u32) -> bool {
-    if screen == 0 {
-        return gfx_open();
+    match screens_table() {
+        Some(table) => (table.gfx_open_on)(screen) != 0,
+        None => screen == 0 && gfx_open(),
     }
-    screens_table().is_some_and(|table| (table.gfx_open_on)(screen) != 0)
 }
 
 /// `gfx_close` for a screen.
 pub fn gfx_close_on(screen: u32) {
-    if screen == 0 {
-        gfx_close();
-    } else if let Some(table) = screens_table() {
-        (table.gfx_close_on)(screen);
+    match screens_table() {
+        Some(table) => (table.gfx_close_on)(screen),
+        None if screen == 0 => gfx_close(),
+        None => {}
     }
 }
 
 /// `gfx_fill` for a screen.
 pub fn gfx_fill_on(screen: u32, x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
-    if screen == 0 {
-        return gfx_fill(x, y, width, height, rgb);
+    match screens_table() {
+        Some(table) => (table.gfx_fill_on)(screen, x, y, width, height, rgb) != 0,
+        None => screen == 0 && gfx_fill(x, y, width, height, rgb),
     }
-    screens_table().is_some_and(|table| (table.gfx_fill_on)(screen, x, y, width, height, rgb) != 0)
 }
 
 /// `gfx_blit` for a screen.
 pub fn gfx_blit_on(screen: u32, x: u32, y: u32, width: u32, height: u32, pixels: &[u32], stride: u32) -> bool {
-    if screen == 0 {
-        return gfx_blit(x, y, width, height, pixels, stride);
-    }
+    let Some(_) = screens_table() else { return screen == 0 && gfx_blit(x, y, width, height, pixels, stride) };
     let needed = if height == 0 { 0 } else { (height as usize - 1) * stride as usize + width as usize };
     pixels.len() >= needed
         && screens_table().is_some_and(|table| (table.gfx_blit_on)(screen, x, y, width, height, pixels.as_ptr(), stride) != 0)
