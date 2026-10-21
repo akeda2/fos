@@ -1260,6 +1260,10 @@ half, fill and blit are clipped and offset into it), so a tape that lays itself 
 always uses the numbered gfx calls for that. A runs in front on screen 0 with the keys; B has screen 1. On the Pi both are tasks
 (Tab moves the keys, as with `+`); on x86 B is a service without a NIC or keys and ends with A. `run A + B` (Pi) is the
 two-display form: screen 0 and screen 1.
+`rotate=r|l` (clockwise / anti-clockwise) turns the whole tape screen for a monitor mounted in portrait: tapes see an upright
+screen of swapped width and height (`gfx_info`, fill and blit rotate onto the framebuffer, `framebuffer::Rotate`) and the split
+is cut on that logical screen, so `rotate=r split=v` gives two squarish areas. The `rotate r|l|off` setting makes it permanent;
+the text console is not rotated. `make test-split` checks all four layouts.
 
 ### Native float audio (ABI 21, crates/audio-sample, crates/audio-wire)
 

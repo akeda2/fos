@@ -124,8 +124,10 @@ pub(crate) fn run_tape(rest: &str) {
             if shared {
                 crate::framebuffer::split_set(Some(crate::tasks::split_mode(first.1, second.1)));
             }
+            crate::framebuffer::rotate_run(crate::tasks::rotate_option(first.1, second.1));
             let outcome = crate::tape_aarch64::run_two([(one, one_args), (two, two_args)]);
             crate::framebuffer::split_set(None);
+            crate::framebuffer::rotate_reset();
             match outcome {
                 Ok(()) => crate::println!("Both tapes returned; back at the fos shell."),
                 Err(reason) => crate::println!("run: {reason}."),
@@ -150,6 +152,16 @@ pub fn apply_settings() -> bool {
         let mut words = line.split_whitespace();
         let first = words.next();
         no_msi |= first == Some("no-msi");
+        if first == Some("rotate") {
+            let word = words.next().unwrap_or("");
+            let mode = crate::framebuffer::Rotate::parse(word);
+            if mode.is_some() || matches!(word, "off" | "none") {
+                crate::framebuffer::rotate_default(mode);
+                crate::println!("settings: rotate {word} (tapes' pixel screens; the text console stays upright).");
+            } else {
+                crate::println!("settings: `{}` ignored (rotate r|l|off).", line.trim());
+            }
+        }
         if let Some(key @ ("foreground" | "background")) = first {
             let name = words.next().unwrap_or("");
             let (fg, bg) = if key == "foreground" { (Some(name), None) } else { (None, Some(name)) };

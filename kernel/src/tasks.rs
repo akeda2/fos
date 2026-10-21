@@ -310,7 +310,13 @@ pub fn split_mode(first: &str, second: &str) -> crate::framebuffer::Split {
     if stacked { crate::framebuffer::Split::Stacked } else { crate::framebuffer::Split::Sides }
 }
 
-/// `arguments` without any `split=` word, plus `screen=N` unless they name a screen already, written into `buffer`;
+/// `rotate=r|l` in either tape's arguments of `run A + B` / `run A | B`: the monitor is mounted turned clockwise or
+/// anti-clockwise (see `framebuffer::Rotate`).
+pub fn rotate_option(first: &str, second: &str) -> Option<crate::framebuffer::Rotate> {
+    first.split_ascii_whitespace().chain(second.split_ascii_whitespace()).find_map(|word| word.strip_prefix("rotate=")).and_then(crate::framebuffer::Rotate::parse)
+}
+
+/// `arguments` without any `split=` or `rotate=` word, plus `screen=N` unless they name a screen already, written into `buffer`;
 /// `None` when they do not fit.
 pub fn with_screen<'a>(buffer: &'a mut [u8; 256], arguments: &str, screen: usize) -> Option<&'a str> {
     use core::fmt::Write;
@@ -325,7 +331,7 @@ pub fn with_screen<'a>(buffer: &'a mut [u8; 256], arguments: &str, screen: usize
     }
     let mut out = Out(&mut buffer[..], 0);
     let mut named = false;
-    for word in arguments.split_ascii_whitespace().filter(|word| !word.starts_with("split=")) {
+    for word in arguments.split_ascii_whitespace().filter(|word| !word.starts_with("split=") && !word.starts_with("rotate=")) {
         named |= word.starts_with("screen=");
         write!(out, "{word} ").ok()?;
     }

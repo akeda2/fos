@@ -523,7 +523,59 @@ pub fn fill_rect(x: usize, y: usize, width: usize, height: usize, red: u8, green
 /// has none). Tape pixels are always 0x00RRGGBB; the kernel converts to the screen's byte order.
 pub fn gfx_info() -> Option<(u32, u32)> {
     let console = unsafe { (*core::ptr::addr_of!(CONSOLE)).as_ref() }?;
-    (!console.text).then_some((console.width as u32, console.height as u32))
+    if console.text {
+        return None;
+    }
+    // A rotated screen is seen by tapes as it is on the monitor: width and height swap.
+    Some(match rotation() {
+        Some(_) => (console.height as u32, console.width as u32),
+        None => (console.width as u32, console.height as u32),
+    })
+}
+
+/// Which way the monitor is turned (a portrait mount): tapes draw on an upright logical screen and the kernel rotates it
+/// onto the framebuffer. The text console is not rotated.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Rotate {
+    /// Clockwise: the logical top-left corner lands at the top right of the framebuffer.
+    Right,
+    /// Anti-clockwise: the logical top-left corner lands at the bottom left.
+    Left,
+}
+
+impl Rotate {
+    /// `r`/`right` or `l`/`left`.
+    pub fn parse(word: &str) -> Option<Rotate> {
+        match word {
+            "r" | "right" => Some(Rotate::Right),
+            "l" | "left" => Some(Rotate::Left),
+            _ => None,
+        }
+    }
+}
+
+static mut ROTATE_DEFAULT: Option<Rotate> = None;
+static mut ROTATE_NOW: Option<Rotate> = None;
+
+/// The `rotate` setting: the rotation every tape gets unless a `run` line says otherwise.
+pub fn rotate_default(mode: Option<Rotate>) {
+    unsafe {
+        *core::ptr::addr_of_mut!(ROTATE_DEFAULT) = mode;
+        *core::ptr::addr_of_mut!(ROTATE_NOW) = mode;
+    }
+}
+
+/// A `run` line's own `rotate=` (`None`: the setting's); `rotate_reset` goes back to the setting afterwards.
+pub fn rotate_run(mode: Option<Rotate>) {
+    unsafe { *core::ptr::addr_of_mut!(ROTATE_NOW) = mode.or(*core::ptr::addr_of!(ROTATE_DEFAULT)) };
+}
+
+pub fn rotate_reset() {
+    unsafe { *core::ptr::addr_of_mut!(ROTATE_NOW) = *core::ptr::addr_of!(ROTATE_DEFAULT) };
+}
+
+fn rotation() -> Option<Rotate> {
+    unsafe { *core::ptr::addr_of!(ROTATE_NOW) }
 }
 
 /// Gives the screen to a tape: the console stops painting (its text grid, serial and `term net` output carry on) and the
@@ -564,8 +616,27 @@ fn gfx_pixel(console: &Console, rgb: u32) -> u32 {
 pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| unsafe { GFX_OPEN }) else { return false };
     let value = gfx_pixel(console, rgb);
-    console.fill(x as usize, y as usize, width as usize, height as usize, value);
+    fill_logical(console, x, y, width, height, value);
     true
+}
+
+/// Fills a rectangle of the logical (rotated) screen with a framebuffer pixel value.
+fn fill_logical(console: &mut Console, x: u32, y: u32, width: u32, height: u32, value: u32) {
+    let Some(turn) = rotation() else {
+        console.fill(x as usize, y as usize, width as usize, height as usize, value);
+        return;
+    };
+    // The rectangle turns into another rectangle: clip it to the logical screen (height x width), then map it.
+    let (screen_width, screen_height) = (console.width as u32, console.height as u32);
+    if x >= screen_height || y >= screen_width {
+        return;
+    }
+    let (width, height) = (width.min(screen_height - x), height.min(screen_width - y));
+    let (px, py) = match turn {
+        Rotate::Right => (screen_width - y - height, x),
+        Rotate::Left => (y, screen_height - x - width),
+    };
+    console.fill(px as usize, py as usize, height as usize, width as usize, value);
 }
 
 /// Copies a w x h block of 0x00RRGGBB pixels (`stride` pixels per source row) to the screen at (x, y), clipped on the right
@@ -576,12 +647,32 @@ pub fn gfx_fill(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> bool {
 pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u32, stride: u32) -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }).filter(|_| unsafe { GFX_OPEN }) else { return false };
     let (x, y, width, height, stride) = (x as usize, y as usize, width as usize, height as usize, stride as usize);
+    let swap = console.format == PIXEL_RGB;
+    if let Some(turn) = rotation() {
+        // Logical (x, y) lands on framebuffer (W-1-y, x) turning right, (y, H-1-x) turning left.
+        let (screen_width, screen_height) = (console.width, console.height);
+        if source.is_null() || stride < width || x >= screen_height || y >= screen_width {
+            return false;
+        }
+        let (columns, rows) = (width.min(screen_height - x), height.min(screen_width - y));
+        for row in 0..rows {
+            for column in 0..columns {
+                let value = unsafe { source.add(row * stride + column).read() };
+                let value = if swap { value & 0xff00_ff00 | (value & 0xff) << 16 | (value >> 16) & 0xff } else { value };
+                let (px, py) = match turn {
+                    Rotate::Right => (screen_width - 1 - (y + row), x + column),
+                    Rotate::Left => (y + row, screen_height - 1 - (x + column)),
+                };
+                unsafe { console.base.add(py * console.stride + px).write_volatile(value) };
+            }
+        }
+        return true;
+    }
     if source.is_null() || stride < width || x >= console.width || y >= console.height {
         return false;
     }
     let columns = width.min(console.width - x);
     let rows = height.min(console.height - y);
-    let swap = console.format == PIXEL_RGB;
     for row in 0..rows {
         let from = unsafe { source.add(row * stride) };
         let to = unsafe { console.base.add((y + row) * console.stride + x) };
@@ -602,7 +693,7 @@ pub unsafe fn gfx_blit(x: u32, y: u32, width: u32, height: u32, source: *const u
 fn split_clear_half(x: u32, y: u32, width: u32, height: u32) -> bool {
     let Some(console) = (unsafe { (*core::ptr::addr_of_mut!(CONSOLE)).as_mut() }) else { return false };
     let background = console.background;
-    console.fill(x as usize, y as usize, width as usize, height as usize, background);
+    fill_logical(console, x, y, width, height, background);
     true
 }
 

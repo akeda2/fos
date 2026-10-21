@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """`run A | B`: two graphic tapes share one screen. `run kaffe ntp=off | clock ntp=off` puts kaffe (light-grey buttons) in the
-left half and the clock (red dots) in the right one; with `split=v` they are stacked, kaffe on top. Escape ends kaffe, which
+left half and the clock (red dots) in the right one; with `split=v` they are stacked, kaffe on top; `rotate=r|l` turns the whole screen first. Escape ends kaffe, which
 takes the clock with it, and the shell prompt returns.
 Run with `make test-split`."""
 
@@ -52,6 +52,12 @@ def main():
                       lambda w, h: ((0, 0, w // 2, h), (w // 2, 0, w, h)))
             run_split(guest, monitor, "run kaffe ntp=off | clock ntp=off split=v", "split-v.ppm",
                       lambda w, h: ((0, 0, w, h // 2), (0, h // 2, w, h)))
+            # A turned monitor: the logical screen is portrait, so `split=v` gives two squarish halves. Turned right, the
+            # logical top (kaffe) is the framebuffer's right side; turned left it is the left side.
+            run_split(guest, monitor, "run kaffe ntp=off | clock ntp=off split=v rotate=r", "split-r.ppm",
+                      lambda w, h: ((w // 2, 0, w, h), (0, 0, w // 2, h)))
+            run_split(guest, monitor, "run kaffe ntp=off | clock ntp=off split=v rotate=l", "split-l.ppm",
+                      lambda w, h: ((0, 0, w // 2, h), (w // 2, 0, w, h)))
             print("split screen: all checks passed")
         finally:
             guest.stop()

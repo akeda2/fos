@@ -8,6 +8,8 @@
 //!   `keymap us|sv` picks the keyboard layout (US by default; sv is Swedish/Finnish);
 //!   `foreground gray|green|amber|black|#rrggbb` and `background black|blue|gray|#rrggbb` set the pixel console's colours (not in
 //!   BIOS text mode, which stays grey on black; the Pi kernel reads them too);
+//!   `rotate r|l|off` turns what tapes draw clockwise or anti-clockwise for a monitor mounted in portrait (the text console
+//!   stays upright; `run A | B rotate=r` does it for one run);
 //! * `debug`: `reboot-on-crash`, `reboot-delay N`, `crash-on-boot`; `watchdog [N]` arms the
 //!   software watchdog and `kernel-update` enables KUP (both in `debug.rs`/`term.rs`);
 //! * `start`: a command script run once at boot (up to 4096 bytes; blank lines and
@@ -134,6 +136,16 @@ pub fn load() {
                         crate::println!("settings: {key} {name}.");
                     } else {
                         crate::println!("settings: `{line}` ignored (unknown colour, or no pixel console).");
+                    }
+                }
+                Some("rotate") => {
+                    let word = line.split_whitespace().nth(1).unwrap_or("");
+                    let mode = crate::framebuffer::Rotate::parse(word);
+                    if mode.is_some() || matches!(word, "off" | "none") {
+                        crate::framebuffer::rotate_default(mode);
+                        crate::println!("settings: rotate {word} (tapes' pixel screens; the text console stays upright).");
+                    } else {
+                        crate::println!("settings: `{line}` ignored (rotate r|l|off).");
                     }
                 }
                 Some("serial-shell") => {
