@@ -22,6 +22,11 @@ static mut REGIONS: [u64; 2 + crate::tasks::MAX_SERVICES] = [0; 2 + crate::tasks
 static mut INFO: *const BootInfo = core::ptr::null();
 static SPAN: AtomicU64 = AtomicU64::new(0);
 
+/// The loader's BootInfo, for diagnostics (`bootinfo`, `memmap`).
+pub fn boot_info() -> Option<&'static BootInfo> {
+    unsafe { INFO.as_ref() }
+}
+
 pub fn set_boot_info(info: &BootInfo) {
     unsafe { INFO = info };
 }

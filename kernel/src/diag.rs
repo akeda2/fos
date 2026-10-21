@@ -7,7 +7,37 @@
 //! `mmio w..` do exactly what they are told. Only the reads and writes that would fault are
 //! refused (`mmio` needs a mapped address) and the kernel's own image is off limits.
 
-use crate::{cpu, ioapic, paging, pci, tape};
+#[cfg(target_arch = "x86_64")]
+use crate::{cpu, ioapic};
+use crate::{paging, pci};
+use fosfor_abi::BootInfo;
+
+fn boot_info() -> Option<&'static BootInfo> {
+    #[cfg(target_arch = "x86_64")]
+    return crate::tape::boot_info();
+    #[cfg(target_arch = "aarch64")]
+    return crate::tape_aarch64::boot_info();
+}
+
+/// `pci`: one line per function found (class, MSI capabilities); `pci read|write ...` reaches configuration space.
+pub fn pci_command(words: core::str::SplitWhitespace) {
+    if pci_access(words) {
+        return;
+    }
+    for device in pci::devices() {
+        crate::println!(
+            "{:02x}:{:02x}.{} {:04x}:{:04x} {}{}{}",
+            device.bus,
+            device.device,
+            device.function,
+            device.vendor,
+            device.id,
+            pci::class_name(device.class, device.subclass),
+            if device.find_capability(0x05).is_some() { " msi" } else { "" },
+            if device.find_capability(0x11).is_some() { " msi-x" } else { "" }
+        );
+    }
+}
 
 fn number(word: &str) -> Option<u64> {
     match word.strip_prefix("0x") {
@@ -18,6 +48,7 @@ fn number(word: &str) -> Option<u64> {
 
 /// `cpuinfo`: vendor, brand, family/model/stepping, a few feature bits that matter to this
 /// kernel, and the invariant-TSC bit that decides how `micros()` is read.
+#[cfg(target_arch = "x86_64")]
 pub fn cpuinfo() {
     let (max_leaf, b, c, d) = cpu::cpuid(0, 0);
     let mut vendor = [0u8; 12];
@@ -78,7 +109,7 @@ pub fn cpuinfo() {
 
 /// `bootinfo`: what the loader handed over.
 pub fn bootinfo() {
-    let Some(info) = tape::boot_info() else { return crate::println!("No BootInfo recorded.") };
+    let Some(info) = boot_info() else { return crate::println!("No BootInfo recorded.") };
     crate::println!("magic {:#x}, version {}, size {} bytes", info.magic, info.version, info.size);
     crate::println!("kernel   {:#x}, {} KiB, booted from slot {}, crash count {}", info.kernel_base, info.kernel_size / 1024, info.boot_slot, info.crash_count);
     crate::println!("memory   map at {:#x}: {} descriptors of {} bytes", info.memory_map, info.memory_map_count, info.memory_map_descriptor_size);
@@ -112,7 +143,7 @@ fn memory_type(kind: u32) -> &'static str {
 
 /// `memmap`: the firmware's memory map as the loader passed it (before the kernel merged anything).
 pub fn memmap() {
-    let Some(info) = tape::boot_info() else { return crate::println!("No BootInfo recorded.") };
+    let Some(info) = boot_info() else { return crate::println!("No BootInfo recorded.") };
     crate::println!("{:>18} {:>10}  type", "physical start", "size");
     let mut usable = 0u64;
     for descriptor in info.memory_descriptors() {
@@ -171,6 +202,7 @@ pub fn pci_access(mut words: core::str::SplitWhitespace) -> bool {
     true
 }
 
+#[cfg(target_arch = "x86_64")]
 /// `io r8|r16|r32 PORT` and `io w8|w16|w32 PORT VALUE`: raw port access.
 pub fn io(mut words: core::str::SplitWhitespace) {
     let (Some(verb), Some(port)) = (words.next(), words.next().and_then(number)) else {
@@ -214,11 +246,14 @@ pub fn mmio(mut words: core::str::SplitWhitespace) {
     if address % width != 0 {
         return crate::println!("The address must be aligned to {width} bytes.");
     }
-    if let Some(info) = tape::boot_info() {
+    if let Some(info) = boot_info() {
         if address < info.kernel_base + info.kernel_size && address + width > info.kernel_base {
             return crate::println!("{address:#x} is inside the kernel's own image; refused.");
         }
     }
+    // The Pi maps device registers on demand (as `peek` always did); x86 only touches what a driver mapped.
+    #[cfg(target_arch = "aarch64")]
+    paging::map_device(address, width);
     if !paging::is_mapped(address) || !paging::is_mapped(address + width - 1) {
         return crate::println!("{address:#x}: not mapped (only addresses the kernel has mapped can be read).");
     }
@@ -242,6 +277,7 @@ pub fn mmio(mut words: core::str::SplitWhitespace) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// `irqstat`: the I/O APIC's pins (vector, trigger, polarity, mask) for every pin that is
 /// routed, the closest v2 has to v1's PIC state dump.
 pub fn irqstat() {
@@ -267,4 +303,57 @@ pub fn irqstat() {
         crate::println!("No I/O APIC pin is routed.");
     }
     crate::println!("Per-NIC interrupt counts are in `nic`; MSI vectors are listed there too.");
+}
+
+/// `cpuinfo` on aarch64: who made the core, which one it is, and the feature bits this kernel cares about.
+#[cfg(target_arch = "aarch64")]
+pub fn cpuinfo() {
+    let (midr, mpidr, isar0, pfr0, frequency): (u64, u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, midr_el1", out(reg) midr, options(nomem, nostack));
+        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
+        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
+        core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack));
+    }
+    let (implementer, variant, part, revision) = ((midr >> 24) & 0xff, (midr >> 20) & 0xf, (midr >> 4) & 0xfff, midr & 0xf);
+    let core = match (implementer, part) {
+        (0x41, 0xd03) => "Cortex-A53",
+        (0x41, 0xd07) => "Cortex-A57",
+        (0x41, 0xd08) => "Cortex-A72",
+        (0x41, 0xd0b) => "Cortex-A76",
+        (0x41, 0xd0c) => "Neoverse N1",
+        _ => "unknown core",
+    };
+    crate::println!("core       {core} (implementer {implementer:#x}, part {part:#x}, r{variant}p{revision}; MIDR {midr:#010x})");
+    crate::println!("mpidr      {mpidr:#x} (this is core {})", mpidr & 0xff);
+    crate::println!("counter    {} Hz", frequency);
+    let field = |register: u64, shift: u32| (register >> shift) & 0xf;
+    crate::print(format_args!("features  "));
+    for (name, present) in [
+        ("fp", field(pfr0, 16) != 0xf),
+        ("asimd", field(pfr0, 20) != 0xf),
+        ("aes", field(isar0, 4) != 0),
+        ("sha1", field(isar0, 8) != 0),
+        ("sha2", field(isar0, 12) != 0),
+        ("crc32", field(isar0, 16) != 0),
+        ("atomics", field(isar0, 20) != 0),
+    ] {
+        if present {
+            crate::print(format_args!(" {name}"));
+        }
+    }
+    crate::println!();
+}
+
+/// `irqstat` on aarch64: the interrupt counts the drivers keep.
+#[cfg(target_arch = "aarch64")]
+pub fn irqstat() {
+    let (uart, dropped) = crate::arch::aarch64::pl011::interrupt_counts();
+    crate::println!("timer {}, uart {uart} (bytes dropped {dropped}), sd {}, genet {}", crate::gic::irq_ticks(), crate::sdhci::interrupt_count(), crate::genet::interrupt_count());
+    for vector in 0..crate::msi::COUNT as u8 {
+        if crate::msi::count(vector) != 0 {
+            crate::println!("msi {vector}: {}", crate::msi::count(vector));
+        }
+    }
 }

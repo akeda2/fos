@@ -19,6 +19,7 @@ mod framebuffer;
 mod gpt;
 mod lineedit;
 mod mailbox;
+mod diag;
 mod netdump;
 mod netfs;
 mod nicshell;

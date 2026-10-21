@@ -985,27 +985,11 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug" | "tapesync") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug" | "tapesync" | "pci" | "cpuinfo" | "bootinfo" | "memmap" | "irqstat" | "mmio" | "io") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
     match word {
-        "pci" if crate::diag::pci_access(words.clone()) => {}
-        "pci" => {
-            for device in pci::devices() {
-                crate::println!(
-                    "{:02x}:{:02x}.{} {:04x}:{:04x} {}{}{}",
-                    device.bus,
-                    device.device,
-                    device.function,
-                    device.vendor,
-                    device.id,
-                    pci::class_name(device.class, device.subclass),
-                    if device.find_capability(0x05).is_some() { " msi" } else { "" },
-                    if device.find_capability(0x11).is_some() { " msi-x" } else { "" }
-                );
-            }
-        }
         "nic" if matches!(words.clone().next(), Some("use")) => {
             words.next();
             nic_use(words.next());
@@ -1044,12 +1028,6 @@ fn execute(command: &str) {
         "nic" if matches!(words.clone().next(), Some("map")) => nic_map(),
         "nic" if matches!(words.clone().next(), Some("send")) => nic_send_test(),
         "nic" if matches!(words.clone().next(), Some("recv")) => nic_recv_test(),
-        "cpuinfo" => crate::diag::cpuinfo(),
-        "bootinfo" => crate::diag::bootinfo(),
-        "memmap" => crate::diag::memmap(),
-        "irqstat" => crate::diag::irqstat(),
-        "io" => crate::diag::io(words),
-        "mmio" => crate::diag::mmio(words),
         "gpu" => crate::gpu::command(),
         "nic" if matches!(words.clone().next(), Some("regs")) => {
             words.next();
@@ -1565,9 +1543,6 @@ pub(crate) fn debug_video(mut words: core::str::SplitWhitespace) {
 /// The x86 commands that are not in the shared tables yet (docs/shell.md), listed by `help` after the shared ones.
 pub(crate) fn help_extra() {
     crate::println!("copy SRC NAME DST [NEWNAME]   copy a file, also between machines (diskN, @LABEL, esp; FAT too)");
-    crate::println!("pci       list PCI functions (pci read|write B:D.F ... reaches config space)");
-    crate::println!("cpuinfo bootinfo memmap irqstat   what the CPU, loader and firmware report");
-    crate::println!("io r8|w8.. PORT; mmio r32|w32.. ADDR   port and memory-mapped I/O");
     crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
     crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
     crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");

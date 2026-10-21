@@ -69,16 +69,6 @@ static COMMANDS: &[Command] = &[
         })
     }),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
-    Command::new("irqs", "irqs", "interrupt counts.", |_, _| {
-        let (uart, dropped) = crate::arch::aarch64::pl011::interrupt_counts();
-        crate::println!("timer {}, uart {uart} (bytes dropped {dropped}), sd {}, genet {}", crate::gic::irq_ticks(), crate::sdhci::interrupt_count(), crate::genet::interrupt_count());
-        for vector in 0..crate::msi::COUNT as u8 {
-            if crate::msi::count(vector) != 0 {
-                crate::println!("msi {vector}: {}", crate::msi::count(vector));
-            }
-        }
-    })
-    .alias(&["irqstat"]),
     Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),
     Command::new("poke", "poke ADDR VALUE", "writes memory (hex; bring-up).", |_, rest| poke(rest)),
 ];
