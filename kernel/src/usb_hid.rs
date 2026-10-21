@@ -697,18 +697,13 @@ fn setup_ehci_keyboard(controller_index: usize, controller: &mut ehci::Controlle
 }
 
 pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
-    for index in 0..xhci::count() {
-        let Some(controller) = xhci::controller(index) else { continue };
-        print(format_args!("xHCI {:02x}:{:02x}.{}: {} ports, events by {}", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports, if !controller.interrupt_driven { "polling" } else if controller.uses_msix { "MSI-X" } else { "MSI" }));
-        for port in 1..=controller.ports {
-            let status = controller.port_status(port);
-            if status & 1 != 0 {
-                let speed = ((status >> 10) & 0xf) as u8;
-                print(format_args!("  port {port}: device connected ({}){}", xhci::speed_name(speed), if controller.slot_in_use_for_port(port) { ", in use" } else { "" }));
-            }
-        }
-        crate::usb_hub::describe(index, controller, &print);
-    }
+    crate::usbshell::describe_xhci(&print);
+    describe_other_controllers(&print);
+    print(format_args!("{} USB keyboard(s), {} reports so far", keyboard_count(), reports_seen()));
+}
+
+/// EHCI and OHCI controllers and the MIDI devices (the xHCI part is shared with the Pi: `usbshell.rs`).
+pub fn describe_other_controllers(print: impl Fn(core::fmt::Arguments)) {
     for index in 0..ehci::count() {
         let Some(controller) = ehci::controller(index) else { continue };
         print(format_args!("EHCI {:02x}:{:02x}.{}: {} ports", controller.pci.bus, controller.pci.device, controller.pci.function, controller.ports));
@@ -729,5 +724,4 @@ pub fn describe_devices(print: impl Fn(core::fmt::Arguments)) {
         }
     }
     crate::usb_midi::describe_devices(&print);
-    print(format_args!("{} USB keyboard(s), {} reports so far", keyboard_count(), reports_seen()));
 }

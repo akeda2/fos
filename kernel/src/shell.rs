@@ -69,7 +69,6 @@ static COMMANDS: &[Command] = &[
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
         })
     }),
-    Command::new("usb", "usb", "rescans for USB keyboards and disks.", |_, _| crate::println!("usb: {} new keyboard(s) or disk(s).", crate::usb_kbd::probe_all())),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
     Command::new("kup", "kup serial [BAUD]", "takes a kernel update over the serial port.", |_, rest| match rest.strip_prefix("serial") {
         Some(baud) if baud.is_empty() || baud.starts_with(' ') => kup_serial(baud.trim()),

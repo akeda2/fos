@@ -58,6 +58,15 @@ pub fn layout() -> Layout {
 }
 
 /// The next typed byte, if one is waiting.
+pub fn keyboard_count() -> usize {
+    unsafe { (*core::ptr::addr_of!(KEYBOARDS)).iter().flatten().count() }
+}
+
+/// The Pi's keyboards keep no report counter.
+pub fn reports_seen() -> u64 {
+    0
+}
+
 pub fn pop() -> Option<u8> {
     let tail = TAIL.load(Ordering::Relaxed);
     if tail == HEAD.load(Ordering::Acquire) {

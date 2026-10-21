@@ -85,7 +85,10 @@ impl Host for KernelHost {
             let modified = modified.map(|time| Stamp { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second });
             each(&mut KernelHost, Entry { name, length, directory, modified });
         })
-        .map_err(error)
+        .map_err(|code| match (error(code), volume.strip_prefix("disk").and_then(|digits| digits.parse().ok())) {
+            (FsError::NoVolume, Some(number)) if matches!(crate::storage::volume_on(number), Err(crate::storage::VolumeError::DiskUnreadable)) => FsError::Unreadable,
+            (other, _) => other,
+        })
     }
 
     fn with_buffer(&mut self, size: usize, run: &mut dyn FnMut(&mut dyn Host, &mut [u8])) -> bool {

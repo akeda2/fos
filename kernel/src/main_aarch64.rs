@@ -37,6 +37,7 @@ mod sdhci;
 mod usb_hub;
 mod usb_audio;
 mod usb_kbd;
+mod usbshell;
 mod usb_storage;
 mod virtio_blk;
 mod xhci;

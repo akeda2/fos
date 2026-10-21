@@ -1428,7 +1428,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck") || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1519,31 +1519,20 @@ fn execute(command: &str) {
         "videomodes" => videomodes_command(),
         "copy" => copy_command(words),
         "tapesync" => crate::tapesync::command(words),
-        "usb" => {
-            let sub = words.next();
-            if sub == Some("rescan") {
-                let added = crate::usb_hid::probe_all();
-                crate::println!("{added} new device(s) (keyboards or disks).");
-                if crate::storage::boot_disk().is_none() && crate::storage::locate_boot_disk(false) {
-                    crate::println!("The boot disk turned up late: `start` runs its start script (hostname, settings and debug files load at boot only).");
-                }
-            } else if sub == Some("abort-test") {
+        "usb" => match words.next() {
+            Some("abort-test") => {
                 // A hidden test hook: see `Controller::abort_self_test`.
                 match crate::xhci::controller(0) {
                     Some(controller) => crate::println!("xHCI command abort self-test: {}.", if controller.abort_self_test() { "passed (the ring carries on)" } else { "FAILED" }),
                     None => crate::println!("xHCI command abort self-test: no xHCI controller."),
                 }
-                return;
-            } else if sub == Some("try") {
-                match words.next().and_then(|word| word.parse::<u8>().ok()) {
-                    Some(port) => crate::usb_hid::try_port(port, words.next()),
-                    None => crate::println!("Usage: usb try PORT [hot|warm]   (a diagnostic: reset the port by hand, then enumerate it once)"),
-                }
-                return;
             }
-            crate::usb_hid::describe_devices(|arguments| crate::println!("{}", arguments));
-            crate::usb_serial::describe();
-        }
+            Some("try") => match words.next().and_then(|word| word.parse::<u8>().ok()) {
+                Some(port) => crate::usb_hid::try_port(port, words.next()),
+                None => crate::println!("Usage: usb try PORT [hot|warm]   (a diagnostic: reset the port by hand, then enumerate it once)"),
+            },
+            _ => {}
+        },
         "midi" => midi_command(&mut words),
         "power" => match words.next() {
             Some("hwp") => hwp_command(words.next()),

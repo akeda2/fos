@@ -50,6 +50,8 @@ pub enum FsError {
     BadName,
     /// No such disk, label or volume.
     NoVolume,
+    /// The disk exists but cannot be read (a USB stick that was unplugged).
+    Unreadable,
     /// A file cannot be made empty here (FAT).
     Empty,
     Failed,
@@ -61,6 +63,7 @@ impl fmt::Display for FsError {
             FsError::NotFound => "no such file",
             FsError::TooBig => "the file is too big for this command",
             FsError::BadName => "that name cannot be used on that volume",
+            FsError::Unreadable => "cannot read the disk (it may have been unplugged)",
             FsError::NoVolume => "no such disk, or no FOSFS data partition or FAT volume on it (see `disks`)",
             FsError::Empty => "an empty file cannot be made on a FAT volume",
             FsError::Failed => "the volume could not be read or written (no room, or damaged)",
