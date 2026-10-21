@@ -381,10 +381,10 @@ mod tests {
         let mono = [0.5f32, -0.5];
         let mut out = [0xffu8; 16];
         assert_eq!(pack(&mono, &mut out, 2, 2, 16, false, 0b01), 8);
-        assert_eq!(&out[..8], &[0xff, 0x3f, 0, 0, 0x01, 0xc0, 0, 0]);
+        assert_eq!(&out[..8], &[0, 0x40, 0, 0, 0, 0xc0, 0, 0]);
         let mut out = [0u8; 12];
         assert_eq!(pack(&mono, &mut out, 1, 3, 24, false, 1), 6);
-        assert_eq!(&out[..3], &[0xff, 0xff, 0x3f]);
+        assert_eq!(&out[..3], &[0, 0, 0x40]);
         assert_eq!(pack(&mono, &mut out, 1, 3, 32, false, 1), 0, "bits do not fit the slot");
         assert_eq!(pack(&mono, &mut out[..2], 1, 3, 24, false, 1), 0);
         let mut out = [0u8; 8];

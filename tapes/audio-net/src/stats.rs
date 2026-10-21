@@ -174,8 +174,8 @@ pub fn peaks_from_wire(payload: &[u8], channels: usize, bits: usize, frames: usi
     }
 }
 
-/// The same for 16-bit interleaved samples (what the Opus codec works in); `first` is the first channel's number.
-pub fn peaks_from_i16(pcm: &[i16], width: usize, frames: usize, first: usize, send: bool) {
+/// The same for interleaved `f32` samples (what the Opus codec works in; 1.0 is full scale); `first` is the first channel's number.
+pub fn peaks_from_f32(pcm: &[f32], width: usize, frames: usize, first: usize, send: bool) {
     let stats = get();
     if !stats.meters_on {
         return;
@@ -191,7 +191,7 @@ pub fn peaks_from_i16(pcm: &[i16], width: usize, frames: usize, first: usize, se
                 continue;
             }
             if let Some(&sample) = pcm.get(frame * width + lane) {
-                let magnitude = u32::from(sample.unsigned_abs()) << 16;
+                let magnitude = audio_wire::meter::magnitude(sample);
                 detectors[channel].feed(magnitude, &c);
                 if magnitude >= CLIP {
                     clips[channel] = true;

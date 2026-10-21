@@ -1082,8 +1082,9 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     let (mut sender_fit, mut device_fit) = (audio_wire::RateFit::new(), audio_wire::RateFit::new());
     let (mut sender_time, mut sender_frames, mut previous_stamp, mut written_out) = (0i64, 0f64, None::<u32>, 0u64);
     let mut ptp_seeded: Option<i32> = None;
-    let mut work = [0i32; 4096];
-    let mut resampled = [0i32; 4096];
+    let mut dither = audio_wire::Dither::new(false);
+    let mut work = [0f32; 4096];
+    let mut resampled = [0f32; 4096];
     let mut placement = [None; audio_wire::MAX_CHANNELS];
     let mut wire_channels = 0usize;
     let mut last_packet = tape_rt::micros();
@@ -1279,7 +1280,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             resampler.step = servo.update(level, frames, packet.rate);
             wire_to_frames(payload, wire_channels, packet.bits, frames, &mut work);
             let mut produced = 0;
-            let mut out_frame = [0i32; audio_wire::MAX_CHANNELS];
+            let mut out_frame = [0f32; audio_wire::MAX_CHANNELS];
             for frame_index in 0..frames {
                 resampler.push(&work[frame_index * wire_channels..(frame_index + 1) * wire_channels]);
                 while resampler.next_output(&mut out_frame) && (produced + 1) * wire_channels <= resampled.len() && (produced + 1) * device_frame <= staging.len() {
@@ -1287,7 +1288,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                     produced += 1;
                 }
             }
-            frames_to_device(&resampled, wire_channels, produced, &placement[..wire_channels], audio_wire::Format::new(slot, slot * 8, float), device_channels, &mut staging);
+            frames_to_device(&resampled, wire_channels, produced, &placement[..wire_channels], audio_wire::Format::new(slot, slot * 8, float), device_channels, &mut dither, &mut staging);
             let bytes = produced * device_frame;
             let accepted = (api.audio_write)(staging.as_ptr(), bytes);
             written_out += (accepted / device_frame) as u64;

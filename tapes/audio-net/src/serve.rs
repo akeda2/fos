@@ -18,7 +18,7 @@
 
 use crate::net::{self, MAX_FRAME, NetConfig};
 use crate::{Options, Transport, stats, tone_sample};
-use audio_wire::{MAX_CHANNELS, ChannelSet, device_sample_16, ogg};
+use audio_wire::{MAX_CHANNELS, ChannelSet, ogg};
 use opus_codec::Encoder;
 use tape_net::{ArpCache, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthernetFrame, IcmpEcho, Ipv4Address, Ipv4Packet, MacAddress, TCP_SYN, TCP_ACK, TcpConnection, TcpSegment, TcpState};
 use tape_rt::{AudioInfo, TapeApi, println};
@@ -515,7 +515,7 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
     let mut server = Server { api, nic: options.nic, config: transport.config, port: options.http, clients: [const { None }; MAX_CLIENTS], connections: 0, dropped: 0, channels: channels as u8, history: History::new(), frame_samples: frame_samples as u32, last: stats::Label::new(), changed: true };
     let mut arp = ArpCache::<8>::new();
     let mut held = 0usize;
-    let mut pcm = [0i16; MAX_FRAME_SAMPLES * 2];
+    let mut pcm = [0f32; MAX_FRAME_SAMPLES * 2];
     let mut packet = [0u8; 1275];
     let mut frame = [0u8; MAX_FRAME];
     let (mut sent, mut phase) = (0u64, 0u32);
@@ -560,16 +560,16 @@ pub fn serve(api: &'static TapeApi, options: &Options) {
         for index in 0..frame_samples {
             for lane in 0..channels {
                 pcm[index * channels + lane] = if let Some(frequency) = options.tone {
-                    (tone_sample(phase.wrapping_add((frequency * 65_536 / RATE) * index as u32) & 0xffff)) as i16
+                    tone_sample(phase.wrapping_add((frequency * 65_536 / RATE) * index as u32) & 0xffff) as f32 * (1.0 / 32768.0)
                 } else {
                     let at = index * device_frame + channel_list[lane] * slot;
-                    device_sample_16(&capture[at..at + slot], audio_wire::Format::new(slot, slot * 8, float))
+                    audio_wire::Format::new(slot, slot * 8, float).read(&capture[at..at + slot])
                 };
             }
         }
-        crate::stats::peaks_from_i16(&pcm[..frame_samples * channels], channels, frame_samples, 0, true);
+        crate::stats::peaks_from_f32(&pcm[..frame_samples * channels], channels, frame_samples, 0, true);
         if server.streaming() || server.history.keep > 0 {
-            if let Ok(length) = encoder.encode(&pcm[..frame_samples * channels], frame_samples, &mut packet) {
+            if let Ok(length) = encoder.encode_float(&pcm[..frame_samples * channels], frame_samples, &mut packet) {
                 let live = server.streaming();
                 server.push_packet(&packet[..length], frame_samples as u32);
                 if live {

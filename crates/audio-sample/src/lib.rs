@@ -39,18 +39,28 @@ impl Format {
         (((raw << shift) as i32) >> shift) as f32 * (1.0 / (1u64 << (self.slot * 8 - 1)) as f32)
     }
 
-    /// Writes `value` (-1..1) into `out[..slot]`. Integers are clipped to full scale and cut to `bits` (the lower bits of a
-    /// wider slot stay zero); a float is stored as it is.
+    /// Writes `value` (-1..1) into `out[..slot]`. Integers are rounded to the nearest step, clipped to full scale and cut to
+    /// `bits` (the lower bits of a wider slot stay zero); a float is stored as it is. Reading and writing share one scale
+    /// (2^(bits-1)), so an integer sample survives the trip through `f32` unchanged.
     #[inline]
     pub fn write(self, value: f32, out: &mut [u8]) {
         if self.float {
             out[..4].copy_from_slice(&value.to_bits().to_le_bytes());
             return;
         }
-        let peak = ((1u64 << (self.bits - 1)) - 1) as f32;
+        let scale = (1u64 << (self.bits - 1)) as f32;
         let clipped = if value > 1.0 { 1.0 } else if value < -1.0 { -1.0 } else { value };
-        let integer = ((clipped * peak) as i32 as i64) << (self.slot * 8 - self.bits);
+        let scaled = clipped * scale;
+        // Round to the nearest step (full scale is -1.0 = -2^(bits-1); +1.0 clips to the largest value).
+        let rounded = (scaled + if scaled < 0.0 { -0.5 } else { 0.5 }) as i64;
+        let integer = rounded.clamp(-(1i64 << (self.bits - 1)), (1i64 << (self.bits - 1)) - 1) << (self.slot * 8 - self.bits);
         out[..self.slot].copy_from_slice(&integer.to_le_bytes()[..self.slot]);
+    }
+
+    /// One step of an integer device in the -1..1 scale (0 for a float device): the size of the dither noise.
+    #[inline]
+    pub fn lsb(self) -> f32 {
+        if self.float { 0.0 } else { 1.0 / (1u64 << (self.bits - 1)) as f32 }
     }
 
     /// The sample as a 32-bit integer with the signal in the top bits (what the wire formats and the level meters take); a
@@ -96,6 +106,22 @@ mod tests {
             assert!(format.read(&bytes) > 0.999);
             format.write(-3.0, &mut bytes);
             assert!(format.read(&bytes) <= -0.999);
+        }
+    }
+
+    #[test]
+    fn integer_samples_survive_f32_exactly() {
+        for (slot, bits) in [(2, 16), (3, 24), (4, 24)] {
+            let format = Format::new(slot, bits, false);
+            for value in [0i64, 1, -1, 12345, -12345, (1 << (bits - 1)) - 1, -(1 << (bits - 1))] {
+                let mut bytes = [0u8; 4];
+                let shifted = value << (slot * 8 - bits);
+                bytes[..slot].copy_from_slice(&shifted.to_le_bytes()[..slot]);
+                let before = bytes;
+                let mut again = [0u8; 4];
+                format.write(format.read(&bytes), &mut again);
+                assert_eq!(&again[..slot], &before[..slot], "{slot}/{bits} {value}");
+            }
         }
     }
 

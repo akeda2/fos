@@ -250,9 +250,9 @@ impl Fill {
     }
 }
 
-/// Network samples (big endian, 16 or 24 bits) to 32-bit signed values with the sample in the top bits, the
-/// working format of the resampler. `frames` frames of `channels` channels go to `out[..frames * channels]`.
-pub fn wire_to_frames(wire: &[u8], channels: usize, bits: usize, frames: usize, out: &mut [i32]) {
+/// Network samples (big endian, 16 or 24 bits) to `f32` (full scale 1.0), the working format of the resampler. `frames`
+/// frames of `channels` channels go to `out[..frames * channels]`. 16 and 24 bits are exact in an `f32`.
+pub fn wire_to_frames(wire: &[u8], channels: usize, bits: usize, frames: usize, out: &mut [f32]) {
     let sample_bytes = bits / 8;
     for index in 0..frames * channels {
         let at = index * sample_bytes;
@@ -260,15 +260,45 @@ pub fn wire_to_frames(wire: &[u8], channels: usize, bits: usize, frames: usize, 
         for (byte_index, &byte) in wire[at..at + sample_bytes].iter().enumerate() {
             value |= u32::from(byte) << (8 * (3 - byte_index));
         }
-        out[index] = value as i32;
+        out[index] = (value as i32) as f32 * (1.0 / 2147483648.0);
     }
 }
 
-/// 32-bit working frames to device-format frames (`slot`-byte little-endian slots, `device_channels` channels),
-/// placing channel `i` of the frames on device channel `placement[i]` (`None` drops it); the rest stay silent.
-pub fn frames_to_device(frames: &[i32], channels: usize, count: usize, placement: &[Option<usize>], format: Format, device_channels: usize, out: &mut [u8]) -> usize {
+/// Triangular (TPDF) dither: two uniform numbers summed, so the noise is +-1 step wide and independent of the signal. A
+/// rounding to an integer device adds it first when audio that was never an integer (a decoded Opus stream) goes to a
+/// device with fewer bits: the rounding error then becomes a steady, signal-free hiss at about -98 dBFS (16 bits) instead of
+/// distortion that follows the music. Audio that already is the device's integer (`enabled` false) goes through untouched.
+pub struct Dither {
+    state: u32,
+    pub enabled: bool,
+}
+
+impl Dither {
+    pub fn new(enabled: bool) -> Dither {
+        Dither { state: 0x2545_f491, enabled }
+    }
+
+    fn uniform(&mut self) -> f32 {
+        // xorshift32: plenty for noise this quiet.
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 17;
+        self.state ^= self.state << 5;
+        (self.state >> 8) as f32 * (1.0 / 16_777_216.0) - 0.5
+    }
+
+    /// Noise in -1..1 (in steps).
+    pub fn tpdf(&mut self) -> f32 {
+        self.uniform() + self.uniform()
+    }
+}
+
+/// Working frames (`f32`, full scale 1.0) to device-format frames (`slot`-byte little-endian slots, `device_channels`
+/// channels), placing channel `i` of the frames on device channel `placement[i]` (`None` drops it); the rest stay silent. An
+/// integer device gets `dither` added before rounding when it is enabled.
+pub fn frames_to_device(frames: &[f32], channels: usize, count: usize, placement: &[Option<usize>], format: Format, device_channels: usize, dither: &mut Dither, out: &mut [u8]) -> usize {
     let slot = format.slot;
     let device_frame = slot * device_channels;
+    let step = format.lsb();
     for frame in 0..count {
         let target = &mut out[frame * device_frame..(frame + 1) * device_frame];
         target.fill(0);
@@ -277,7 +307,11 @@ pub fn frames_to_device(frames: &[i32], channels: usize, count: usize, placement
             if destination >= device_channels {
                 continue;
             }
-            format.put_top32(frames[frame * channels + channel], &mut target[destination * slot..(destination + 1) * slot]);
+            let mut value = frames[frame * channels + channel];
+            if dither.enabled && step != 0.0 {
+                value += dither.tpdf() * step;
+            }
+            format.write(value, &mut target[destination * slot..(destination + 1) * slot]);
         }
     }
     count * device_frame
@@ -291,11 +325,11 @@ pub fn frames_to_device(frames: &[i32], channels: usize, count: usize, placement
 /// forward by one; every output frame moves it back by `step` (input frames per output frame, in Q16, 1.0 =
 /// 65536). With `step` exactly 1.0 the position stays 0 and the output is the input delayed by one frame,
 /// bit for bit; otherwise the interpolation brings a small high-frequency loss (about 0.1 dB at 5 kHz, 1 dB
-/// at 15 kHz in the worst case) that is the price of continuous, click-free rate adaptation. Integer
-/// arithmetic only.
+/// at 15 kHz in the worst case) that is the price of continuous, click-free rate adaptation. Works in `f32`, so a float
+/// device's samples pass without an integer step in between.
 pub struct Resampler {
     channels: usize,
-    history: [[i32; MAX_CHANNELS]; 4],
+    history: [[f32; MAX_CHANNELS]; 4],
     /// Position of the next output sample between `history[1]` and `history[2]`, Q16.
     position: u32,
     pub step: u32,
@@ -306,7 +340,7 @@ pub const UNITY_STEP: u32 = 1 << 16;
 
 impl Resampler {
     pub fn new(channels: usize) -> Resampler {
-        Resampler { channels: channels.min(MAX_CHANNELS), history: [[0; MAX_CHANNELS]; 4], position: UNITY_STEP, step: UNITY_STEP, primed: 0 }
+        Resampler { channels: channels.min(MAX_CHANNELS), history: [[0.0; MAX_CHANNELS]; 4], position: UNITY_STEP, step: UNITY_STEP, primed: 0 }
     }
 
     pub fn reset(&mut self) {
@@ -315,7 +349,7 @@ impl Resampler {
 
     /// Feeds one input frame (`channels` values); returns whether an output frame is due, and if so writes it
     /// to `out`. Call again with the same frame's successors via `next_output` until it says no.
-    pub fn push(&mut self, frame: &[i32]) {
+    pub fn push(&mut self, frame: &[f32]) {
         self.history[0] = self.history[1];
         self.history[1] = self.history[2];
         self.history[2] = self.history[3];
@@ -325,20 +359,17 @@ impl Resampler {
     }
 
     /// The next output frame for the frames pushed so far, if the position allows one.
-    pub fn next_output(&mut self, out: &mut [i32]) -> bool {
+    pub fn next_output(&mut self, out: &mut [f32]) -> bool {
         if self.position >= UNITY_STEP || self.primed < 4 {
             return false;
         }
-        let t = i64::from(self.position);
+        let t = self.position as f32 * (1.0 / 65536.0);
         for channel in 0..self.channels {
-            let (h0, h1, h2, h3) = (i64::from(self.history[0][channel]), i64::from(self.history[1][channel]), i64::from(self.history[2][channel]), i64::from(self.history[3][channel]));
-            let a = -h0 + 3 * h1 - 3 * h2 + h3;
-            let b = 2 * h0 - 5 * h1 + 4 * h2 - h3;
+            let (h0, h1, h2, h3) = (self.history[0][channel], self.history[1][channel], self.history[2][channel], self.history[3][channel]);
+            let a = -h0 + 3.0 * h1 - 3.0 * h2 + h3;
+            let b = 2.0 * h0 - 5.0 * h1 + 4.0 * h2 - h3;
             let c = h2 - h0;
-            let inner = ((a * t) >> 16) + b;
-            let middle = ((inner * t) >> 16) + c;
-            let value = h1 + (((middle * t) >> 16) >> 1);
-            out[channel] = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            out[channel] = h1 + 0.5 * (((a * t + b) * t + c) * t);
         }
         self.position += self.step;
         true
@@ -594,12 +625,6 @@ pub fn write_sdp_opus(sdp: &SdpOpus<'_>, out: &mut [u8]) -> usize {
         }
     }
     cursor.length
-}
-
-/// The 16-bit value of a device-format slot (`slot` little-endian bytes, left-justified, or a float clipped at full scale):
-/// its top 16 bits. For Opus built with the fixed-point API; see `opus_codec` for the float path.
-pub fn device_sample_16(slot_bytes: &[u8], format: Format) -> i16 {
-    (device_sample(slot_bytes, format) >> 16) as i16
 }
 
 /// A programme peak meter (PPM) in the Nordic style (IEC 60268-10 type I): a quasi-peak detector that charges fast
@@ -1144,16 +1169,16 @@ mod tests {
         assert!(is_multicast_address([239, 1, 1, 1]) && !is_multicast_address([192, 168, 1, 1]));
     }
 
-    fn sine_frames(count: usize, frequency: f64, rate: f64) -> Vec<i32> {
-        (0..count).map(|n| ((n as f64 * frequency * 2.0 * core::f64::consts::PI / rate).sin() * 0.5 * i32::MAX as f64) as i32).collect()
+    fn sine_frames(count: usize, frequency: f64, rate: f64) -> Vec<f32> {
+        (0..count).map(|n| ((n as f64 * frequency * 2.0 * core::f64::consts::PI / rate).sin() * 0.5) as f32).collect()
     }
 
     #[test]
     fn unity_step_is_a_one_frame_delay_and_exact() {
         let mut resampler = Resampler::new(2);
-        let input: Vec<i32> = (0..400).flat_map(|n| [n * 1000, -n * 777]).collect();
+        let input: Vec<f32> = (0..400).flat_map(|n| [n as f32 * 0.001, -n as f32 * 0.000_777]).collect();
         let mut output = Vec::new();
-        let mut frame = [0i32; 2];
+        let mut frame = [0f32; 2];
         for pair in input.chunks(2) {
             resampler.push(pair);
             while resampler.next_output(&mut frame) {
@@ -1177,7 +1202,7 @@ mod tests {
             let mut resampler = Resampler::new(1);
             resampler.step = (65_536 + ppm * 65_536 / 1_000_000) as u32;
             let mut output = Vec::new();
-            let mut frame = [0i32; 1];
+            let mut frame = [0f32; 1];
             for &sample in &input {
                 resampler.push(&[sample]);
                 while resampler.next_output(&mut frame) {
@@ -1191,11 +1216,11 @@ mod tests {
             let mut worst = 0.0f64;
             for (index, &value) in output.iter().enumerate().skip(8).take(40_000) {
                 let position = index as f64 * (f64::from(resampler.step) / 65_536.0) + 1.0; // input time of output sample `index` (the step as actually quantised)
-                let ideal = (position * 1000.0 * 2.0 * core::f64::consts::PI / rate).sin() * 0.5 * i32::MAX as f64;
+                let ideal = (position * 1000.0 * 2.0 * core::f64::consts::PI / rate).sin() * 0.5;
                 worst = worst.max((f64::from(value) - ideal).abs());
             }
             // Catmull-Rom on a 1 kHz tone at 48 kHz is accurate to ~ -80 dB of full scale.
-            assert!(worst < 0.5 * i32::MAX as f64 * 1e-3, "{label}: worst error {worst}");
+            assert!(worst < 0.5 * 1e-3, "{label}: worst error {worst}");
         }
     }
 
@@ -1222,13 +1247,13 @@ mod tests {
         let mut servo = Servo::new(288);
         let mut resampler = Resampler::new(1);
         let (mut level, mut producer_credit) = (288i64, 0f64);
-        let mut frame = [0i32; 1];
+        let mut frame = [0f32; 1];
         let mut worst_late = 0i64;
         for millisecond in 0..60_000 {
             // 48 frames arrive per ms of *sender* time; the device's ms is 1/(1+400ppm) of that: it drains 47.9808 frames.
             for _ in 0..48 {
                 resampler.step = servo.step;
-                resampler.push(&[0]);
+                resampler.push(&[0.0]);
                 while resampler.next_output(&mut frame) {
                     level += 1;
                 }
@@ -1249,12 +1274,32 @@ mod tests {
     #[test]
     fn working_format_round_trip() {
         let wire = [0x12, 0x34, 0x56, 0xff, 0xff, 0xfe];
-        let mut frames = [0i32; 2];
+        let mut frames = [0f32; 2];
         wire_to_frames(&wire, 2, 24, 1, &mut frames);
-        assert_eq!(frames, [0x1234_5600, (0xfffffe00u32) as i32]);
         let mut device = [0u8; 6];
-        frames_to_device(&frames, 2, 1, &[Some(0), Some(1)], Format::new(3, 24, false), 2, &mut device);
+        frames_to_device(&frames, 2, 1, &[Some(0), Some(1)], Format::new(3, 24, false), 2, &mut Dither::new(false), &mut device);
         assert_eq!(device, [0x56, 0x34, 0x12, 0xfe, 0xff, 0xff]);
+        let mut float_device = [0u8; 8];
+        frames_to_device(&frames, 2, 1, &[Some(0), Some(1)], Format::new(4, 32, true), 2, &mut Dither::new(true), &mut float_device);
+        assert_eq!(f32::from_le_bytes(float_device[..4].try_into().unwrap()), frames[0], "a float device gets the sample as it is, dither or not");
+    }
+
+    #[test]
+    fn dither_is_quiet_unbiased_and_only_for_integer_devices() {
+        let mut dither = Dither::new(true);
+        let (mut sum, mut peak) = (0.0f64, 0.0f32);
+        for _ in 0..100_000 {
+            let noise = dither.tpdf();
+            sum += f64::from(noise);
+            peak = peak.max(noise.abs());
+        }
+        assert!(sum.abs() / 100_000.0 < 0.01 && peak <= 1.0, "mean {} peak {peak}", sum / 100_000.0);
+        // Silence through a dithered 16-bit device is a few steps of noise, not exactly zero and not loud.
+        let silence = [0f32; 2000];
+        let mut out = [0u8; 4000];
+        frames_to_device(&silence, 1, 2000, &[Some(0)], Format::new(2, 16, false), 1, &mut dither, &mut out);
+        let samples: Vec<i16> = out.chunks(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
+        assert!(samples.iter().any(|&sample| sample != 0) && samples.iter().all(|&sample| sample.abs() <= 1));
     }
 
     #[test]
@@ -1268,19 +1313,6 @@ mod tests {
         assert!(text.contains("a=rtpmap:96 opus/48000/2"));
         assert!(text.contains("stereo=0;sprop-stereo=0"), "the last, odd channel is a mono stream");
         assert!(text.contains("a=ptime:10\r\n"));
-    }
-
-    #[test]
-    fn device_sample_to_16_bits() {
-        assert_eq!(device_sample_16(&[0x00, 0x34, 0x12], Format::new(3, 24, false)), 0x1234); // 24-bit: the top two bytes
-        assert_eq!(device_sample_16(&[0xff, 0x7f], Format::new(2, 16, false)), 0x7fff); // 16-bit slot unchanged
-        assert_eq!(device_sample_16(&[0x00, 0x00, 0x80], Format::new(3, 24, false)), -0x8000);
-        let float = Format::new(4, 32, true);
-        assert_eq!(device_sample_16(&0.5f32.to_le_bytes(), float), 0x4000);
-        assert_eq!(device_sample_16(&2.0f32.to_le_bytes(), float), 0x7fff, "a float above full scale clips");
-        let mut slot = [0u8; 4];
-        float.put_top32(0x2000_0000, &mut slot);
-        assert_eq!(f32::from_le_bytes(slot), 0.25);
     }
 
     #[test]

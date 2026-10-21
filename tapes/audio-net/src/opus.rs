@@ -8,7 +8,7 @@
 
 use crate::net::{self, Inbound};
 use crate::{Options, Transport, tone_sample};
-use audio_wire::{ChannelSet, MAX_CHANNELS, Resampler, Servo, SdpOpus, device_sample_16, frames_to_device, write_sdp_opus};
+use audio_wire::{ChannelSet, Dither, MAX_CHANNELS, Resampler, Servo, SdpOpus, frames_to_device, write_sdp_opus};
 use opus_codec::{Decoder, Encoder, packet_samples};
 use tape_net::RtpPacket;
 use tape_rt::{AudioInfo, AudioStats, TapeApi, print, println};
@@ -23,7 +23,7 @@ const TIMELINE: usize = 8192;
 const RING_BYTES: usize = 1 << 20;
 
 /// Decoded audio of every stream on one timeline, indexed by RTP timestamp modulo `TIMELINE`.
-static mut TIMELINE_DATA: [i32; TIMELINE * MAX_CHANNELS] = [0; TIMELINE * MAX_CHANNELS];
+static mut TIMELINE_DATA: [f32; TIMELINE * MAX_CHANNELS] = [0.0; TIMELINE * MAX_CHANNELS];
 
 /// Channels carried by stream `index` of `channels` channels: 2, or 1 for an odd last channel.
 fn stream_channels(index: usize, channels: usize) -> usize {
@@ -104,7 +104,7 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     let capture = unsafe { core::slice::from_raw_parts_mut(if capture_bytes == 0 { core::ptr::NonNull::dangling().as_ptr() } else { capture_address as *mut u8 }, capture_bytes * 2) };
     let mut held = 0usize;
     crate::duplex::go();
-    let mut pcm = [0i16; MAX_FRAME * 2];
+    let mut pcm = [0f32; MAX_FRAME * 2];
     let mut packet = [0u8; 1275];
     let mut frame = [0u8; 1514];
     let channel_list: [usize; MAX_CHANNELS] = {
@@ -144,10 +144,10 @@ pub fn send(api: &'static TapeApi, options: &Options) {
         let began = tape_rt::micros();
         // Tone: one sample stream for every channel; capture: the selected device channels of this frame.
         let tone_step = options.tone.map(|frequency| (u64::from(frequency) * 65_536 / u64::from(RATE)) as u32);
-        let mut tone_block = [0i16; MAX_FRAME];
+        let mut tone_block = [0f32; MAX_FRAME];
         if let Some(step) = tone_step {
             for sample in tone_block.iter_mut().take(frame_samples) {
-                *sample = (tone_sample(phase)) as i16;
+                *sample = tone_sample(phase) as f32 * (1.0 / 32768.0);
                 phase = (phase + step) & 0xffff;
             }
         }
@@ -159,13 +159,13 @@ pub fn send(api: &'static TapeApi, options: &Options) {
                         tone_block[index]
                     } else {
                         let at = index * device_frame + channel_list[stream * 2 + lane] * slot;
-                        device_sample_16(&capture[at..at + slot], audio_wire::Format::new(slot, slot * 8, float))
+                        audio_wire::Format::new(slot, slot * 8, float).read(&capture[at..at + slot])
                     };
                 }
             }
-            crate::stats::peaks_from_i16(&pcm[..frame_samples * width], width, frame_samples, stream * 2, true);
+            crate::stats::peaks_from_f32(&pcm[..frame_samples * width], width, frame_samples, stream * 2, true);
             let Some(encoder) = encoders[stream].as_mut() else { continue };
-            let Ok(length) = encoder.encode(&pcm[..frame_samples * width], frame_samples, &mut packet) else { continue };
+            let Ok(length) = encoder.encode_float(&pcm[..frame_samples * width], frame_samples, &mut packet) else { continue };
             let port = options.port + 2 * stream as u16;
             let rtp = RtpPacket::new(options.payload_type, sent == 0, sequence, timestamp, session ^ stream as u32, &packet[..length]);
             if let Some(total) = net::build_rtp_frame(&mut frame, &transport.config, mac, ip, port, ttl, &rtp) {
@@ -253,7 +253,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
     transport.announce_receiver(options);
     println!("Listening on NIC {} for Opus/RTP: {streams} stream(s) on ports {}..{}, {channels} channel(s). Escape stops.", options.nic + 1, options.port, options.port as usize + 2 * (streams - 1));
     let timeline = unsafe { &mut *core::ptr::addr_of_mut!(TIMELINE_DATA) };
-    timeline.fill(0);
+    timeline.fill(0.0);
     let target_frames = (RATE as usize * options.target_ms as usize / 1000).max(1);
     let mut servo = Servo::new(target_frames);
     let mut resampler = Resampler::new(channels);
@@ -267,9 +267,11 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
         needed -= written.min(needed);
     }
     let mut frame = [0u8; 1514];
-    let mut pcm = [0i16; MAX_FRAME * 2];
-    let mut work = [0i32; 2048 * 2];
-    let mut resampled = [0i32; 4096];
+    let mut pcm = [0f32; MAX_FRAME * 2];
+    let mut work = [0f32; 2048 * 2];
+    let mut resampled = [0f32; 4096];
+    // Decoded Opus was never an integer: an integer device gets TPDF dither at the rounding, a float device the samples as decoded.
+    let mut dither = Dither::new(!float);
     let mut staging = [0u8; 8192];
     // `play` is the timeline position (RTP timestamp) of the next frame to play; set by the first packet.
     let mut play: Option<u32> = None;
@@ -366,7 +368,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                 let mut remaining = behind as usize;
                 while remaining > 0 {
                     let piece = remaining.min(lane.last_frame).min(MAX_FRAME);
-                    if lane.decoder.conceal(&mut pcm, piece).is_ok() {
+                    if lane.decoder.conceal_float(&mut pcm, piece).is_ok() {
                         place(timeline, lane.next, first_channel, lane_channels, &pcm[..piece * lane_channels], piece);
                         concealed += 1;
                     }
@@ -377,10 +379,10 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                 lane.next = rtp.timestamp;
             }
         }
-        match lane.decoder.decode(rtp.payload, &mut pcm, samples) {
+        match lane.decoder.decode_float(rtp.payload, &mut pcm, samples) {
             Ok(decoded) => {
                 place(timeline, rtp.timestamp, first_channel, lane_channels, &pcm[..decoded * lane_channels], decoded);
-                crate::stats::peaks_from_i16(&pcm[..decoded * lane_channels], lane_channels, decoded, first_channel, false);
+                crate::stats::peaks_from_f32(&pcm[..decoded * lane_channels], lane_channels, decoded, first_channel, false);
                 lane.next = rtp.timestamp.wrapping_add(decoded as u32);
                 lane.last_frame = decoded;
             }
@@ -431,7 +433,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             dropped += frames as u64;
             for step in 0..frames {
                 let at = (position.wrapping_add(step as u32) as usize % TIMELINE) * MAX_CHANNELS;
-                timeline[at..at + MAX_CHANNELS].fill(0);
+                timeline[at..at + MAX_CHANNELS].fill(0.0);
             }
             *position = position.wrapping_add(frames as u32);
             continue;
@@ -451,12 +453,12 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
             for step in 0..chunk {
                 let at = (position.wrapping_add(step as u32) as usize % TIMELINE) * MAX_CHANNELS;
                 work[step * channels..(step + 1) * channels].copy_from_slice(&timeline[at..at + channels]);
-                timeline[at..at + MAX_CHANNELS].fill(0);
+                timeline[at..at + MAX_CHANNELS].fill(0.0);
             }
             *position = position.wrapping_add(chunk as u32);
             remaining -= chunk;
             let mut produced = 0;
-            let mut out_frame = [0i32; MAX_CHANNELS];
+            let mut out_frame = [0f32; MAX_CHANNELS];
             for step in 0..chunk {
                 resampler.push(&work[step * channels..(step + 1) * channels]);
                 while resampler.next_output(&mut out_frame) && (produced + 1) * channels <= resampled.len() && (produced + 1) * device_frame <= staging.len() {
@@ -464,7 +466,7 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
                     produced += 1;
                 }
             }
-            frames_to_device(&resampled, channels, produced, &placement[..channels], audio_wire::Format::new(slot, slot * 8, float), device_channels, &mut staging);
+            frames_to_device(&resampled, channels, produced, &placement[..channels], audio_wire::Format::new(slot, slot * 8, float), device_channels, &mut dither, &mut staging);
             let bytes = produced * device_frame;
             if (api.audio_write)(staging.as_ptr(), bytes) < bytes {
                 dropped += 1;
@@ -488,12 +490,12 @@ pub fn receive(api: &'static TapeApi, options: &Options) {
 }
 
 /// Writes `frames` decoded frames of `width` channels (16-bit, interleaved) into the timeline at RTP timestamp
-/// `at`, on channels `first..first + width`, as the 32-bit values the resampler works in.
-fn place(timeline: &mut [i32], at: u32, first: usize, width: usize, pcm: &[i16], frames: usize) {
+/// `at`, on channels `first..first + width`, as the `f32` values the resampler works in.
+fn place(timeline: &mut [f32], at: u32, first: usize, width: usize, pcm: &[f32], frames: usize) {
     for index in 0..frames {
         let base = (at.wrapping_add(index as u32) as usize % TIMELINE) * MAX_CHANNELS + first;
         for lane in 0..width {
-            timeline[base + lane] = i32::from(pcm[index * width + lane]) << 16;
+            timeline[base + lane] = pcm[index * width + lane];
         }
     }
 }
