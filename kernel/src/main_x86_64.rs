@@ -50,6 +50,7 @@ mod uart;
 mod term;
 mod usb_audio;
 mod usb_hid;
+mod usb_pointer;
 mod usbshell;
 mod usb_hub;
 mod usb_midi;

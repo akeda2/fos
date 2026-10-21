@@ -212,6 +212,7 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
             controller.release_slot(device.slot);
             return Ok(false);
         }
+        crate::usb_pointer::describe(controller, &device, &configuration[..total], vendor, product);
         crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (class {:#04x}, {}): not a keyboard or disk, ignored for now.", descriptor[4], xhci::speed_name(device.speed));
         controller.release_slot(device.slot);
         return Ok(false);

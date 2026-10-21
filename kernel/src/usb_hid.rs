@@ -260,6 +260,7 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
             }
             crate::usb_serial::Outcome::Unclaimed => {}
         }
+        crate::usb_pointer::describe(controller, &device, &configuration[..total], vendor, product);
         controller.release_slot(device.slot);
         crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (device class {:#04x}, {}): nothing here uses it.", descriptor[4], xhci::speed_name(device.speed));
         return Ok(false);

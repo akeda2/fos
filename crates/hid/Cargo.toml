@@ -1,0 +1,11 @@
+[package]
+name = "fosfor-hid"
+version = "0.1.0"
+edition = "2024"
+
+# HID report descriptor parsing for pointer devices (touch panels, mice, tablets): finds where X, Y, the tip
+# switch and the contact id sit in an input report and what range X and Y cover. `no_std`, no allocation,
+# independent of the kernel, so host unit tests can feed it real descriptors.
+[lib]
+name = "hid"
+path = "src/lib.rs"

@@ -10,7 +10,7 @@ BUILD := build
 export CARGO_TARGET_DIR := $(CURDIR)/$(BUILD)/cargo-target
 
 .DEFAULT_GOAL := image
-.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-nettest-remote test-audio-bench test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi test-services
+.PHONY: all help clean bios print-image test-usb-replug test-usb-kbd-replug test-usb-pointer test-xhci-abort test-idle-cpu test-net-chat test-telnet test-release-loops test-nettest-lab test-nettest-remote test-audio-bench test-bootcode-uefi test-console-utf8 test-keymap test-console-colors test-hostnames test-config-fat test-fterm test-fterm-net test-fterm-ui test-serial-shell test-midi test-services
 
 all: image tapes
 
@@ -26,6 +26,10 @@ help:
 # A stick that is unplugged and plugged back in (QEMU monitor device_del / device_add) gets its disk number back.
 test-usb-replug: image
 	python3 tools/test_usb_replug.py
+
+# A USB pointer device (tablet, mouse) nothing claims has its HID report descriptor dumped and parsed.
+test-usb-pointer: image
+	python3 tools/test_usb_pointer.py
 
 # A keyboard that is unplugged and plugged back in keeps working, five times over (xHCI and EHCI).
 test-usb-kbd-replug: image
@@ -233,6 +237,7 @@ run: image
 test: image
 	cargo +nightly-2026-09-13 test --manifest-path abi/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/fat/Cargo.toml
+	cargo +nightly-2026-09-13 test --manifest-path crates/hid/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-rec/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/tape-net/Cargo.toml
 	cargo +nightly-2026-09-13 test --manifest-path crates/audio-wire/Cargo.toml
