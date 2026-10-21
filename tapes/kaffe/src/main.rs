@@ -164,7 +164,7 @@ fn draw_button(canvas: &mut gfx::Canvas, rect: Rect, label: &str, scale: i32, pr
     canvas.text_scaled(rect.x + (rect.w - width) / 2, rect.y + (rect.h - GLYPH_H * scale) / 2, label, scale as u32, 0x000000);
 }
 
-/// What the clock is set from, in a dim line at the bottom; amber (`stale`) when the last sync is long ago or never happened.
+/// What the clock is set from, in a dim line in the top right corner; amber (`stale`) when the last sync is long ago or never happened.
 fn status_line(sync: Option<&tape_ip::wallclock::WallSync>, resync_us: u64, line: &mut Line<120>) -> bool {
     let Some(sync) = sync else {
         let _ = write!(line, "machine clock");
@@ -225,8 +225,8 @@ fn draw(canvas: &mut gfx::Canvas, layout: &Layout, clock: &WallClock, stamp: Opt
         at = canvas.text_scaled(at, layout.stamp_y, front.as_str(), scale as u32, 0xffffff);
         canvas.text_scaled(at, layout.stamp_y, time.as_str(), scale as u32, YELLOW);
     }
-    // Sits back at a third of white, like the clock tape's status bar; a stale clock stays amber.
-    canvas.text(16, layout.height - GLYPH_H - 6, status, if stale { theme().amber } else { 0x555555 });
+    // Sits back at a third of white (upper right, beside the title), like the clock tape's status bar; a stale clock stays amber.
+    canvas.text_right(layout.width - margin, margin, status, if stale { theme().amber } else { 0x555555 });
 }
 
 #[unsafe(no_mangle)]
