@@ -49,6 +49,7 @@ version = "0.1.0"
 dependencies = [
  "audio-screen",
  "gfx",
+ "tape-ip",
  "tape-rt",
 ]
 
@@ -59,6 +60,19 @@ dependencies = [
  "audio-sample",
  "dsp",
 ]
+
+[[package]]
+name = "tape-ip"
+version = "0.1.0"
+dependencies = [
+ "audio-wire",
+ "tape-net",
+ "tape-rt",
+]
+
+[[package]]
+name = "tape-net"
+version = "0.1.0"
 
 [[package]]
 name = "tape-rt"

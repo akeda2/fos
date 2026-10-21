@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 audio-screen = { path = "../../crates/audio-screen" }
 tape-rt = { path = "../../crates/tape-rt" }
+tape-ip = { path = "../../crates/tape-ip" }
 gfx = { path = "../../crates/gfx" }
 
 [profile.release]

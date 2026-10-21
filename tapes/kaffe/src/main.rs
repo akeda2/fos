@@ -13,12 +13,18 @@ use gfx::theme::theme;
 use tape_rt::{Key, KeyDecoder, Line, TapeApi, WallClock, println};
 
 tape_rt::tape_help!(
-    br#"kaffe [@NAME] [screen=N]
+    br#"kaffe [@NAME] [screen=N] [ntp=dhcp|A.B.C.D|NAME|off] [tz=+H[:MM]]
+      [ip=dhcp|A.B.C.D/N] [gateway=A.B.C.D] [dns=A.B.C.D] [nic=N] [resync=SECONDS]
 A coffee board for a kitchen screen: the time in big red digits and two big
 buttons. "Kaffet klart!" stamps the time the coffee was made ("Kaffet nybryggt
 kl. HH:MM", in yellow); "Rensa" clears it. The stamp is saved in kaffe.cfg and
 is still there after a restart (a stamp from an earlier day shows its date).
-The time is the machine's clock (date set, ptp settime, or run clock first).
+At start, and every 30 minutes (resync=), the machine's clock is set from an NTP
+server (the one DHCP names, else the gateway; ntp=off keeps the clock as it is,
+set by date set or ptp settime). tz= is the local zone in hours east of UTC; the
+zone is otherwise guessed from the machine's clock, or UTC when that is not set.
+Next to a clock service (run clock screen=2 &1) give kaffe ntp=off: the service
+keeps the machine's clock and owns the NIC.
 Keys: Enter or Space = Kaffet klart!   c, Delete or Backspace = Rensa
       Escape quits.
 "#
@@ -212,9 +218,19 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         Ok(config) => config,
         Err(reason) => return println!("kaffe: {reason}."),
     };
-    if tape_rt::wall_clock().is_none() {
-        return println!("kaffe: the machine's clock is not set (date set, or run ptp settime).");
+    let mut sync = tape_ip::wallclock::WallSync::connect(api, "kaffe", arguments);
+    if let Some(sync) = sync.as_mut() {
+        match sync.query(api) {
+            Ok(()) => println!("kaffe: the clock is set from the NTP server."),
+            Err(reason) => println!("kaffe: {reason}; using the machine's clock."),
+        }
     }
+    if tape_rt::wall_clock().is_none() {
+        return println!("kaffe: the machine's clock is not set (date set, ntp=A.B.C.D, or run ptp settime).");
+    }
+    let resync_us = tape_rt::arg_value(arguments, "resync").and_then(|v| v.parse::<u64>().ok()).unwrap_or(1800).clamp(10, 86_400) * 1_000_000;
+    let mut next_sync = tape_rt::micros() + resync_us;
+    let mut syncing = false;
     let mut stamp = read_stamp(config.text());
     let layout = Layout::new(width.min(MAX_WIDTH) as i32, height.min(MAX_HEIGHT) as i32);
     let Some(mut screen) = Screen::new(api, layout.width as u32, layout.height as u32).map(|screen| screen.on(screen_number)) else {
@@ -236,6 +252,19 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         });
         if !keep_going {
             break;
+        }
+        if let Some(sync) = sync.as_mut() {
+            if syncing {
+                if let Some(outcome) = sync.poll(api) {
+                    syncing = false;
+                    next_sync = tape_rt::micros() + resync_us;
+                    screen.mark_dirty();
+                    let _ = outcome; // a failed resync keeps the clock as it is; the next one tries again
+                }
+            } else if tape_rt::micros() >= next_sync {
+                sync.begin();
+                syncing = true;
+            }
         }
         let Some(clock) = tape_rt::wall_clock() else { continue };
         if let Some(button) = action {
