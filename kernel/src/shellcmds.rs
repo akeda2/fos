@@ -23,8 +23,34 @@ pub static COMMANDS: &[Command] = &[
     Command::new("clear", "clear", "clears the screen.", |_, _| crate::print(format_args!("\x1b[2J"))),
     Command::new("reset", "reset", "restarts the machine (through the firmware, so a pending kernel slot is tried).", |_, _| restart()).alias(&["reboot"]),
     Command::new("shutdown", "shutdown", "powers off (a Pi 4 halts in its bootloader).", |_, _| power_off()).alias(&["halt"]),
+    Command::new("start", "start", "runs the start file again (as at boot).", |_, _| start()),
+    Command::new("dmesg", "dmesg", "the boot log.", |_, _| dmesg()),
     Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
 ];
+
+fn start() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if RUNNING.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            return crate::println!("start: the start file is already running.");
+        }
+        if !crate::config::run_start(crate::term::run_line) {
+            crate::println!("start: no start file on a FOSFS volume (or the FAT/exFAT root).");
+        }
+        RUNNING.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(target_arch = "aarch64")]
+    crate::shell::start_script(true);
+}
+
+fn dmesg() {
+    // The Pi's early log also holds what the log replays onto the screen, so it goes to the serial console only.
+    #[cfg(target_arch = "x86_64")]
+    crate::print(format_args!("{}", crate::log::contents()));
+    #[cfg(target_arch = "aarch64")]
+    crate::dmesg();
+}
 
 fn restart() {
     crate::println!("Resetting.");

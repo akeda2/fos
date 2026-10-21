@@ -1297,18 +1297,6 @@ impl core::fmt::Display for Mac<'_> {
 }
 
 /// `start`: runs the `start` file again, as the boot does. A start file that itself says `start` would never end, so inside a run it is refused.
-fn start_command() {
-    static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if RUNNING.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        crate::println!("start: the start file is already running.");
-        return;
-    }
-    if !crate::config::run_start(run_line) {
-        crate::println!("start: no start file on a FOSFS volume (or the FAT/exFAT root).");
-    }
-    RUNNING.store(false, core::sync::atomic::Ordering::Relaxed);
-}
-
 fn prompt() {
     crate::print(format_args!("fos> "));
 }
@@ -1436,7 +1424,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1631,7 +1619,6 @@ fn execute(command: &str) {
         "videomodes" => videomodes_command(),
         "copy" => copy_command(words),
         "tapesync" => crate::tapesync::command(words),
-        "start" => start_command(),
         "fsck" => files(&mut words, |volume, _, _| crate::fosfs::report(&volume)),
         "usb" => {
             let sub = words.next();
@@ -1663,7 +1650,6 @@ fn execute(command: &str) {
             Some("hwp") => hwp_command(words.next()),
             word => power_command(word.and_then(|word| word.parse::<u64>().ok())),
         },
-        "dmesg" => crate::print(format_args!("{}", crate::log::contents())),
         "kup" => match words.next() {
             Some("serial") => kup_serial(),
             _ => crate::println!("kup serial: take a kernel over the COM1 console (tools/send_kernel_serial.py)."),
@@ -2620,7 +2606,6 @@ pub(crate) fn help_extra() {
     crate::println!("grow diskN        make a disk's FOSFS volume fill the disk (files are kept)");
     crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
     crate::println!("tapesync [HOST] [apply]   pull newer tapes from one or all peers (needs the synckey file)");
-    crate::println!("start     run the start file again (as at boot)");
     crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");
     crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
     crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");
@@ -2629,7 +2614,6 @@ pub(crate) fn help_extra() {
     crate::println!("uptime    time since the timer started; sleep N waits N seconds");
     crate::println!("power    [N]  how much of the time the CPU slept in hlt (N: sample N s at the prompt)");
     crate::println!("power hwp [performance|balanced|power]  CPU frequency scaling (Intel HWP)");
-    crate::println!("dmesg     the boot log");
     crate::println!("debug ... status | slots | crash | hang");
     crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");
 }

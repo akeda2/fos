@@ -12,7 +12,7 @@ static mut START_SCRIPT: [u8; 4096] = [0; 4096];
 
 /// Runs the boot volume's `start` file, one command per line (blank lines and `#` lines skipped), as on x86. A tape in it
 /// holds the shell until it ends (Esc), so a long-running one belongs on the last line.
-fn start_script(announce_missing: bool) {
+pub(crate) fn start_script(announce_missing: bool) {
     let Some(volume) = storage::boot_volume() else { return };
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(START_SCRIPT) };
     let length = match volume.read(b"start", buffer) {
@@ -62,7 +62,6 @@ pub fn run() -> ! {
 
 /// The Pi's own commands; the file commands and `help` come from the shared shell (`crates/shell`).
 static COMMANDS: &[Command] = &[
-    Command::new("start", "start", "runs the boot volume's `start` file again.", |_, _| start_script(true)),
     Command::new("version", "version", "the kernel's name.", |_, _| crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`).")),
     Command::new("fsck", "fsck [diskN]", "checks a FOSFS volume's directory.", |_, rest| match volume(rest) {
         Some(volume) => fosfs::report(&volume),
@@ -78,7 +77,6 @@ static COMMANDS: &[Command] = &[
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
         })
     }),
-    Command::new("dmesg", "dmesg", "the kernel log.", |_, _| crate::dmesg()),
     Command::new("nic", "nic [rx [multicast]|promisc on|off]", "the Genet NIC: status, receive filter, promiscuous mode.", |_, rest| match rest {
         "rx" => crate::genet::show_rx(false),
         "rx multicast" => crate::genet::show_rx(true),
