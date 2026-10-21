@@ -130,7 +130,7 @@ static mut BLOCKING: bool = false;
 static mut BREAK: bool = false;
 
 /// True once Escape was typed at the machine, on the serial line or by the remote client.
-fn break_requested() -> bool {
+pub(crate) fn break_requested() -> bool {
     while let Some(key) = crate::keyboard::pop() {
         if key == 0x1b {
             unsafe { BREAK = true };
@@ -139,7 +139,7 @@ fn break_requested() -> bool {
     unsafe { BREAK }
 }
 
-fn blocking(on: bool) {
+pub(crate) fn blocking(on: bool) {
     unsafe {
         BLOCKING = on;
         BREAK = false;
@@ -148,6 +148,16 @@ fn blocking(on: bool) {
 
 /// The NIC the nic subcommands default to (zero-based): `nic use N`.
 static mut ACTIVE_NIC: usize = 0;
+
+/// The interface the remote terminal session runs over, while one is open.
+pub(crate) fn session_nic() -> Option<usize> {
+    if session_open() { Some(unsafe { SESSION_NIC }) } else { None }
+}
+
+/// Frames queued for tapes and frames dropped (all interfaces).
+pub(crate) fn frame_queue_counts() -> (u32, u32) {
+    unsafe { (FRAMES_QUEUED, (*core::ptr::addr_of!(FRAMES_DROPPED)).iter().sum::<u32>()) }
+}
 
 fn session_open() -> bool {
     unsafe { (*core::ptr::addr_of!(PEER)).is_some() }
@@ -1288,13 +1298,7 @@ pub fn local_input(byte: u8) {
     feed(byte);
 }
 
-pub struct Mac<'a>(pub &'a [u8; 6]);
-impl core::fmt::Display for Mac<'_> {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
-        let b = self.0;
-        write!(formatter, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2], b[3], b[4], b[5])
-    }
-}
+pub use crate::netdump::{describe_frame, Line, Mac};
 
 /// `start`: runs the `start` file again, as the boot does. A start file that itself says `start` would never end, so inside a run it is refused.
 fn prompt() {
@@ -1424,7 +1428,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck") {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck") || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1448,10 +1452,6 @@ fn execute(command: &str) {
         "nic" if matches!(words.clone().next(), Some("use")) => {
             words.next();
             nic_use(words.next());
-        }
-        "nic" if matches!(words.clone().next(), Some("sniff")) => {
-            words.next();
-            nic_sniff(words.next());
         }
         "nic" if matches!(words.clone().next(), Some("discover")) => nic_discover(),
         "nic" if matches!(words.clone().next(), Some("park" | "unpark")) => {
@@ -1506,51 +1506,6 @@ fn execute(command: &str) {
                 if let Some(nic) = nic_at(index) {
                     crate::println!("{}: {} {}", index + 1, nic.family(), Mac(&nic.mac()));
                     nic.dump_registers();
-                }
-            }
-        }
-        "nic" => {
-            if nic_count() == 0 {
-                crate::println!("No network interface.");
-            }
-            for index in 0..nic_count() {
-                if let Some(nic) = nic_at(index) {
-                    crate::println!("{}: {} {}  {}{}", index + 1, nic.family(), Mac(&nic.mac()), if nic.link_up() { "link up" } else { "link DOWN" }, if unsafe { SESSION_NIC } == index && session_open() { "  (terminal)" } else { "" });
-                    if let Some((speed, full)) = nic.link_speed() {
-                        crate::println!("   negotiated {speed} Mbit/s {}", if full { "full duplex" } else { "half duplex" });
-                    }
-                    let (received, sent, dropped) = nic.counters();
-                    crate::println!("   frames: {} received, {} sent{}", received, sent, if dropped != 0 { " (some dropped: no link)" } else { "" });
-                    // v1's `nic` reported "NIC IRQn: N notifications"; keep that line (tools grep for it).
-                    if let crate::e1000::Delivery::Msi(v) | crate::e1000::Delivery::Msix(v) | crate::e1000::Delivery::Intx { vector: v, .. } = nic.delivery() {
-                        crate::println!("   NIC IRQ{v}: {} notifications", crate::e1000::ISR[index].interrupts.load(core::sync::atomic::Ordering::Relaxed));
-                    }
-                    match nic.delivery() {
-                        crate::e1000::Delivery::Polled => crate::println!("   interrupts: polled"),
-                        crate::e1000::Delivery::Intx { gsi, vector } => {
-                            let state = &crate::e1000::ISR[index];
-                            crate::println!(
-                                "   interrupts: INTx pin {gsi}, vector {vector:#x}: {} taken ({} storms masked)",
-                                state.interrupts.load(core::sync::atomic::Ordering::Relaxed),
-                                crate::msi::storms()
-                            );
-                        }
-                        crate::e1000::Delivery::Msi(vector) | crate::e1000::Delivery::Msix(vector) => {
-                            let state = &crate::e1000::ISR[index];
-                            crate::println!(
-                                "   interrupts: {} vector {vector:#x}: {} taken, {} receive overruns, {} link changes",
-                                if matches!(nic.delivery(), crate::e1000::Delivery::Msix(_)) { "MSI-X" } else { "MSI" },
-                                state.interrupts.load(core::sync::atomic::Ordering::Relaxed),
-                                state.overruns.load(core::sync::atomic::Ordering::Relaxed),
-                                state.link_changes.load(core::sync::atomic::Ordering::Relaxed)
-                            );
-                        }
-                    }
-                    nic.describe();
-                    crate::nicpark::describe(index);
-                    if index == 0 {
-                        crate::println!("   tape frame queue: {} queued, {} dropped (all interfaces)", unsafe { FRAMES_QUEUED }, unsafe { FRAMES_DROPPED }.iter().sum::<u32>());
-                    }
                 }
             }
         }
@@ -2573,7 +2528,7 @@ fn nic_use(argument: Option<&str>) {
 
 /// Receives every waiting frame on every interface. The terminal's and discovery's own frames are handled as usual
 /// (so the session stays alive while a command runs); everything else goes to `visit(interface, frame)`.
-fn drain_nics(mut visit: impl FnMut(usize, &[u8])) {
+pub(crate) fn drain_nics(mut visit: impl FnMut(usize, &[u8])) {
     let mut buffer = [0u8; 1600];
     for index in 0..nic_count() {
         loop {
@@ -2586,155 +2541,6 @@ fn drain_nics(mut visit: impl FnMut(usize, &[u8])) {
     if session_open() {
         flush();
     }
-}
-
-/// A short line of text on the stack.
-struct Line {
-    bytes: [u8; 110],
-    length: usize,
-}
-
-impl Line {
-    fn new() -> Line {
-        Line { bytes: [0; 110], length: 0 }
-    }
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
-    }
-}
-
-impl core::fmt::Write for Line {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let take = text.len().min(self.bytes.len() - self.length);
-        self.bytes[self.length..self.length + take].copy_from_slice(&text.as_bytes()[..take]);
-        self.length += take;
-        Ok(())
-    }
-}
-
-/// One line about a frame: the addresses, the type and what is inside, as far as the common protocols go.
-fn describe_frame(frame: &[u8], line: &mut Line) {
-    use core::fmt::Write;
-    if frame.len() < 14 {
-        let _ = write!(line, "runt frame");
-        return;
-    }
-    let ip = |at: usize| -> (u8, u8, u8, u8) { (frame[at], frame[at + 1], frame[at + 2], frame[at + 3]) };
-    let kind = u16::from_be_bytes([frame[12], frame[13]]);
-    let _ = write!(line, "{} > {} ", Mac(&frame[6..12].try_into().unwrap()), Mac(&frame[0..6].try_into().unwrap()));
-    match kind {
-        0x0806 if frame.len() >= 42 => {
-            let (sender, target) = (ip(28), ip(38));
-            if frame[21] == 1 {
-                let _ = write!(line, "ARP who has {}.{}.{}.{}? tell {}.{}.{}.{}", target.0, target.1, target.2, target.3, sender.0, sender.1, sender.2, sender.3);
-            } else {
-                let _ = write!(line, "ARP {}.{}.{}.{} is at {}", sender.0, sender.1, sender.2, sender.3, Mac(&frame[22..28].try_into().unwrap()));
-            }
-        }
-        0x0800 if frame.len() >= 34 => {
-            let (source, destination) = (ip(26), ip(30));
-            let header = usize::from(frame[14] & 15) * 4;
-            let _ = write!(line, "IPv4 {}.{}.{}.{} > {}.{}.{}.{} ", source.0, source.1, source.2, source.3, destination.0, destination.1, destination.2, destination.3);
-            let ports = |frame: &[u8]| {
-                let at = 14 + header;
-                (frame.get(at..at + 4).map_or(0, |bytes| u16::from_be_bytes([bytes[0], bytes[1]])), frame.get(at..at + 4).map_or(0, |bytes| u16::from_be_bytes([bytes[2], bytes[3]])))
-            };
-            match frame[23] {
-                1 => {
-                    let _ = write!(line, "ICMP type {}", frame.get(14 + header).copied().unwrap_or(0));
-                }
-                6 => {
-                    let (a, b) = ports(frame);
-                    let _ = write!(line, "TCP {a} > {b}");
-                }
-                17 => {
-                    let (a, b) = ports(frame);
-                    let _ = write!(line, "UDP {a} > {b}");
-                    match (a, b) {
-                        (67 | 68, _) | (_, 67 | 68) => {
-                            let _ = write!(line, " (DHCP)");
-                        }
-                        (53, _) | (_, 53) => {
-                            let _ = write!(line, " (DNS)");
-                        }
-                        (9875, _) | (_, 9875) => {
-                            let _ = write!(line, " (SAP)");
-                        }
-                        (5004..=5100, _) | (_, 5004..=5100) => {
-                            let _ = write!(line, " (RTP?)");
-                        }
-                        _ => {}
-                    }
-                }
-                other => {
-                    let _ = write!(line, "protocol {other}");
-                }
-            }
-        }
-        0x86dd => {
-            let _ = write!(line, "IPv6");
-        }
-        0x8100 => {
-            let _ = write!(line, "VLAN tag");
-        }
-        0x22f0 => {
-            let _ = write!(line, "AVTP (IEEE 1722)");
-        }
-        0x88b5 => {
-            let _ = write!(line, "fos test frame");
-        }
-        0x88b6 => {
-            let _ = write!(line, "fos terminal/chat tag {:#04x}", frame.get(14).copied().unwrap_or(0));
-        }
-        0x88ba => {
-            let _ = write!(line, "audio-net raw audio");
-        }
-        0x88cc => {
-            let _ = write!(line, "LLDP");
-        }
-        other => {
-            let _ = write!(line, "type {other:#06x}");
-        }
-    }
-}
-
-/// `nic sniff [N]`: shows every frame the interface hears (it listens to everything, not just its own traffic) until
-/// Escape. The terminal's own frames are not shown, or the display would feed on itself.
-fn nic_sniff(argument: Option<&str>) {
-    let index = match argument.and_then(|word| word.parse::<usize>().ok()) {
-        Some(number) if number >= 1 && number <= nic_count() => number - 1,
-        Some(_) => return crate::println!("nic sniff: no such interface (`nic` lists them)."),
-        None => unsafe { ACTIVE_NIC }.min(nic_count().saturating_sub(1)),
-    };
-    let Some(nic) = nic_at(index) else { return crate::println!("No network interface.") };
-    nic.set_promiscuous(true);
-    crate::println!("Sniffing NIC {} (promiscuous). Escape stops.", index + 1);
-    blocking(true);
-    let (mut shown, mut skipped) = (0u32, 0u32);
-    while !break_requested() {
-        let mut budget = 40u32; // lines per pass: a busy network must not make the screen the bottleneck
-        drain_nics(|from, frame| {
-            if from != index {
-                return;
-            }
-            if budget == 0 {
-                skipped += 1;
-                return;
-            }
-            budget -= 1;
-            shown += 1;
-            let mut line = Line::new();
-            describe_frame(frame, &mut line);
-            crate::println!("{shown:>5} {:>4}B {}", frame.len(), line.as_str());
-        });
-        crate::debug::pet();
-        crate::cpu::sleep();
-    }
-    blocking(false);
-    if let Some(nic) = nic_at(index) {
-        nic.set_promiscuous(false);
-    }
-    crate::println!("Stopped: {shown} frame(s) shown{}.", if skipped > 0 { ", some skipped to keep up" } else { "" });
 }
 
 const MAX_PEERS: usize = 32;

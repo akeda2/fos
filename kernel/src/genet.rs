@@ -556,29 +556,37 @@ pub fn receive(buffer: &mut [u8]) -> usize {
     }
 }
 
-/// The `nic` shell command: state, a link re-check and the PHY's registers.
-pub fn status() {
-    let Some(genet) = state() else {
-        crate::println!("nic: no Ethernet controller (the Genet is only started on a Raspberry Pi 4).");
-        return;
-    };
-    let linked = update_link(genet);
-    crate::println!("Genet {:02x?}: {}", genet.mac, if linked { "link up" } else { "no link" });
-    if linked {
-        crate::println!("  {} Mbit/s, {} duplex.", genet.speed, if genet.full_duplex { "full" } else { "half" });
-    }
+/// What the shared `nic` command shows for every interface.
+pub struct Info {
+    pub mac: [u8; 6],
+    pub link_up: bool,
+    pub speed: u32,
+    pub full_duplex: bool,
+    pub sent: u32,
+    pub received: u32,
+    pub dropped: u32,
+}
+
+pub fn info() -> Option<Info> {
+    let genet = state()?;
+    let link_up = update_link(genet);
+    Some(Info { mac: genet.mac, link_up, speed: genet.speed, full_duplex: genet.full_duplex, sent: genet.sent, received: genet.received, dropped: genet.dropped })
+}
+
+/// The Genet's own lines under `nic`: receive interrupts, UMAC and PHY registers.
+pub fn details() {
+    let Some(genet) = state() else { return };
     crate::println!(
-        "  receive interrupts {} (causes seen {:#x}).",
+        "   receive interrupts {} (causes seen {:#x}).",
         IRQS.load(core::sync::atomic::Ordering::Relaxed),
         IRQ_BITS.load(core::sync::atomic::Ordering::Relaxed) >> 13
     );
     if STORM.load(core::sync::atomic::Ordering::Relaxed) {
-        crate::println!("  interrupt storm: receive interrupts are masked, the ring is polled.");
+        crate::println!("   interrupt storm: receive interrupts are masked, the ring is polled.");
     }
-    crate::println!("  UMAC_CMD {:08x}, MDF_CTRL {:08x}.", read(UMAC_CMD), read(UMAC_MDF_CTRL));
-    crate::println!("  frames sent {}, received {}, dropped {} (last status {:08x}).", genet.sent, genet.received, genet.dropped, genet.last_drop);
+    crate::println!("   UMAC_CMD {:08x}, MDF_CTRL {:08x}, last drop status {:08x}.", read(UMAC_CMD), read(UMAC_MDF_CTRL), genet.last_drop);
     crate::println!(
-        "  PHY {}: BMCR {:04x?} BMSR {:04x?} ADV {:04x?} LPA {:04x?} CTRL1000 {:04x?} STAT1000 {:04x?}",
+        "   PHY {}: BMCR {:04x?} BMSR {:04x?} ADV {:04x?} LPA {:04x?} CTRL1000 {:04x?} STAT1000 {:04x?}",
         genet.phy,
         mdio_read(genet.phy, BMCR).unwrap_or(0xffff),
         mdio_read(genet.phy, BMSR).unwrap_or(0xffff),
@@ -587,26 +595,4 @@ pub fn status() {
         mdio_read(genet.phy, CTRL1000).unwrap_or(0xffff),
         mdio_read(genet.phy, STAT1000).unwrap_or(0xffff)
     );
-}
-
-/// `nic rx`: for three seconds prints a line per received frame (length, destination, source, EtherType, IPv4 protocol).
-pub fn show_rx(multicast_only: bool) {
-    let mut frame = [0u8; 1600];
-    let start = timer::micros();
-    let mut shown = 0;
-    while timer::micros() - start < 3_000_000 && shown < 40 {
-        let length = receive(&mut frame);
-        if length < 14 || (multicast_only && (frame[0] & 1 == 0 || frame[0..6] == [0xff; 6])) {
-            continue;
-        }
-        shown += 1;
-        crate::println!(
-            "  {length:4} B to {:02x?} from {:02x?} type {:02x}{:02x} proto {:02x}",
-            &frame[0..6],
-            &frame[6..12],
-            frame[12],
-            frame[13],
-            frame.get(23).copied().unwrap_or(0)
-        );
-    }
 }

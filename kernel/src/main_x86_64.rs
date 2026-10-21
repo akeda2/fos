@@ -8,6 +8,8 @@ mod config;
 mod debug;
 mod kup_serial;
 mod diag;
+mod netdump;
+mod nicshell;
 mod nicpark;
 mod e1000;
 mod gpu;

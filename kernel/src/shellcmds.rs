@@ -34,6 +34,7 @@ pub static COMMANDS: &[Command] = &[
         }
     }),
     Command::new("fsck", "fsck [diskN|@LABEL]", "checks a FOSFS volume's directory (default: the boot volume).", |_, rest| fsck(rest)),
+    Command::new("nic", "nic [list|sniff [N]|promisc N on|off]", "the network interfaces: list, watch the frames, promiscuous mode.", |_, rest| crate::nicshell::command(rest)),
     Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |host, rest| {
         if rest.is_empty() {
             crate::println!("run: which tape? (run NAME [ARGS])");

@@ -69,12 +69,6 @@ static COMMANDS: &[Command] = &[
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
         })
     }),
-    Command::new("nic", "nic [rx [multicast]|promisc on|off]", "the Genet NIC: status, receive filter, promiscuous mode.", |_, rest| match rest {
-        "rx" => crate::genet::show_rx(false),
-        "rx multicast" => crate::genet::show_rx(true),
-        "promisc on" | "promisc off" => crate::println!("Genet promiscuous {}: {}.", &rest[8..], if crate::genet::set_promiscuous(rest == "promisc on") { "ok" } else { "no NIC" }),
-        _ => crate::genet::status(),
-    }),
     Command::new("usb", "usb", "rescans for USB keyboards and disks.", |_, _| crate::println!("usb: {} new keyboard(s) or disk(s).", crate::usb_kbd::probe_all())),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
     Command::new("kup", "kup serial [BAUD]", "takes a kernel update over the serial port.", |_, rest| match rest.strip_prefix("serial") {

@@ -157,7 +157,7 @@ def lit_pixels(path: Path) -> tuple[int, int]:
 
 def main():
     shot = Path(tempfile.mkdtemp()) / "screen.ppm"
-    text = boot(IMAGE, shot, ("version", "hexdump 0x40100000 16", "disks", "ls", "cat hostname", "mem", "run hello one two", "run nothere", "keymap sv"), ("e", "c", "h", "o", "spc", "minus", "ret"))
+    text = boot(IMAGE, shot, ("version", "hexdump 0x40100000 16", "nic", "nic promisc 1 on", "disks", "ls", "cat hostname", "mem", "run hello one two", "run nothere", "keymap sv"), ("e", "c", "h", "o", "spc", "minus", "ret"))
     check("Fosfor OS loader" in text, "the aarch64 loader runs under AAVMF", text)
     check("Kernel image read" in text and "Loading its ELF64 segments" in text, "the loader reads the kernel from the payload slot", text)
     check("Fosfor OS kernel (aarch64): running from the UEFI loader." in text, "the kernel runs after ExitBootServices (instruction cache synced)", text)
@@ -228,6 +228,7 @@ def main():
     total, lit = lit_pixels(clock_shot)[0], lit_pixels(clock_shot)[1]
     check("The clock is 2026-10-20 11:52:30" in clock_text and "clock: stopped." in clock_text and "clock: the machine" not in clock_text, "the software clock is set with `date set`; the clock tape starts from it and Esc ends it", clock_text)
     check(lit > total // 50, "the clock tape draws its face on the screen", f"{lit} of {total} pixels lit")
+    check("No network interface." in text.split("fos> nic", 1)[-1] and "nic promisc: no such interface" in text, "`nic` and `nic promisc` answer without a Genet (QEMU)", text)
     check("0x0040100000: " in text and "|" in text.split("hexdump", 1)[-1], "`hexdump` dumps mapped memory", text)
     check("Fosfor OS (aarch64 port)" in text and "virtio-blk" in text.split("version", 1)[-1], "the shell reads the serial console and runs `version` and `disks`", text)
     check(re.search(r"^readme\.txt +73 bytes", text, re.M) is not None and re.search(r"Free:\s+\d+ MiB \(\d+ frames\)\s+fos> ", text) is not None, "the shell lists FOSFS files and answers `mem`", text)

@@ -17,6 +17,8 @@ mod framebuffer;
 mod gpt;
 mod lineedit;
 mod mailbox;
+mod netdump;
+mod nicshell;
 mod netservice;
 mod memory;
 mod pci;
