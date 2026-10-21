@@ -20,6 +20,7 @@ mod gpt;
 mod lineedit;
 mod mailbox;
 mod netdump;
+mod netfs;
 mod nicshell;
 mod netservice;
 mod memory;

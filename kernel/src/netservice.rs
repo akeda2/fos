@@ -11,9 +11,9 @@
 
 use crate::{genet, memory, timer};
 
-const ETHERTYPE: [u8; 2] = [0x88, 0xb6];
-const TAG_DISCOVER_REQUEST: u8 = 0x02;
-const TAG_DISCOVER_REPLY: u8 = 0x03;
+
+use crate::netfs::ETHERTYPE;
+use crate::netdump::Mac;
 const TAG_KUP_REQUEST: u8 = 0x3a;
 const TAG_KUP_DATA: u8 = 0x3b;
 const TAG_KUP_STOP: u8 = 0x3c;
@@ -48,15 +48,7 @@ fn kup() -> &'static mut Kup {
 }
 
 fn send(destination: &[u8; 6], tag: u8, payload: &[u8]) {
-    let Some(mac) = genet::mac() else { return };
-    let mut frame = [0u8; 80];
-    let length = (15 + payload.len()).max(60);
-    frame[0..6].copy_from_slice(destination);
-    frame[6..12].copy_from_slice(&mac);
-    frame[12..14].copy_from_slice(&ETHERTYPE);
-    frame[14] = tag;
-    frame[15..15 + payload.len()].copy_from_slice(payload);
-    genet::send(&frame[..length]);
+    crate::netfs::send(0, destination, tag, payload);
 }
 
 /// True when the boot volume's `debug` file has a `kernel-update` line.
@@ -65,32 +57,6 @@ pub fn kernel_update_enabled() -> bool {
     let mut buffer = [0u8; 1024];
     let Ok(Some(length)) = volume.read(b"debug", &mut buffer) else { return false };
     core::str::from_utf8(&buffer[..length]).unwrap_or("").lines().any(|line| line.split_whitespace().next() == Some("kernel-update"))
-}
-
-/// The name announced to `peers.py`: the `hostname` file plus the NIC number, else `fos-` and the last MAC bytes.
-fn name(out: &mut [u8; 20]) -> usize {
-    let mut length = 0;
-    if let Some(volume) = crate::storage::boot_volume() {
-        let mut buffer = [0u8; 18];
-        if let Ok(Some(read)) = volume.read(b"hostname", &mut buffer) {
-            let base = core::str::from_utf8(&buffer[..read]).unwrap_or("").trim();
-            for byte in base.bytes().chain(core::iter::once(b'1')).take(20) {
-                out[length] = byte;
-                length += 1;
-            }
-            return length;
-        }
-    }
-    let mac = genet::mac().unwrap_or([0; 6]);
-    for (index, byte) in [b'f', b'o', b's', b'-'].into_iter().chain(mac[3..].iter().flat_map(|byte| [hex(byte >> 4), hex(byte & 15)])).enumerate() {
-        out[index] = byte;
-        length = index + 1;
-    }
-    length
-}
-
-fn hex(nibble: u8) -> u8 {
-    b"0123456789abcdef"[usize::from(nibble)]
 }
 
 fn release() {
@@ -172,14 +138,6 @@ fn stop(source: [u8; 6]) {
     release();
 }
 
-struct Mac<'a>(&'a [u8; 6]);
-
-impl core::fmt::Display for Mac<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5])
-    }
-}
-
 /// From the shell's idle loop: serves the frames the Genet has received. Returns true if there was one (call again).
 pub fn poll() -> bool {
     unsafe {
@@ -196,23 +154,36 @@ pub fn poll() -> bool {
         crate::println!("KUP: the sender went quiet; transfer abandoned.");
         release();
     }
+    crate::netfs::announce();
     let mut buffer = [0u8; 1600];
     let length = genet::receive(&mut buffer);
-    if length < 15 || buffer[12..14] != ETHERTYPE {
-        return length != 0;
+    if length != 0 {
+        serve_frame(&buffer[..length]);
     }
-    let source: [u8; 6] = buffer[6..12].try_into().unwrap();
-    let payload = &buffer[15..length];
-    match buffer[14] {
-        TAG_DISCOVER_REQUEST => {
-            let mut text = [0u8; 20];
-            let length = name(&mut text);
-            send(&source, TAG_DISCOVER_REPLY, &text[..length]);
-        }
+    length != 0
+}
+
+/// A KUP transfer is arriving (NETFS must not take the shared RAM meanwhile).
+pub fn kup_transfer_alive() -> bool {
+    let kup = kup();
+    kup.active && timer::ticks().wrapping_sub(kup.last_activity) < STALE_TICKS
+}
+
+/// Serves one received frame: discovery, NETFS and KUP. False if it is not ours (a tape or `nic sniff` may want it).
+pub fn serve_frame(frame: &[u8]) -> bool {
+    if frame.len() < 15 || frame[12..14] != ETHERTYPE {
+        return false;
+    }
+    let source: [u8; 6] = frame[6..12].try_into().unwrap();
+    let payload = &frame[15..];
+    if let Some(consumed) = crate::netfs::handle(0, source, frame[14], payload) {
+        return consumed;
+    }
+    match frame[14] {
         TAG_KUP_REQUEST if kernel_update_enabled() => request(source, payload),
         TAG_KUP_DATA => data(source, payload),
         TAG_KUP_STOP => stop(source),
-        _ => {}
+        _ => return false,
     }
     true
 }

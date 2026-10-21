@@ -11,6 +11,7 @@ mod kup_serial;
 mod kupshell;
 mod diag;
 mod netdump;
+mod netfs;
 mod nicshell;
 mod nicpark;
 mod e1000;

@@ -19,7 +19,7 @@ use crate::term::{Mac, NETFS_BUSY, NETFS_DISK_ERROR, NETFS_NO_SYNC, TAG_GET_ERRO
 use crate::{println, timer};
 use tape_sync::{Action, Entry, MANIFEST_MAX, MAX_TAPES, NAME_LEN, NONCE_LEN, Stamp};
 
-pub const KEY_FILE: &str = "synckey";
+use crate::netfs::KEY_FILE;
 const KEY_MAX: usize = 128;
 
 struct State {
