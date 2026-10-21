@@ -46,11 +46,67 @@ pub static COMMANDS: &[Command] = &[
         }
     }),
     Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
+    Command::new("label", "label [diskN|@LABEL [NAME|-]]", "shows or sets a FOSFS volume's label (@LABEL names a volume).", |_, rest| label(rest)),
     Command::new("sector", "sector diskN LBA [COUNT <= 4]", "raw read-only dump of disk sectors (a GPT header, the slot metadata).", |_, rest| sector(rest)),
     Command::new("start", "start", "runs the start file again (as at boot).", |_, _| start()),
     Command::new("dmesg", "dmesg", "the boot log.", |_, _| dmesg()),
     Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
 ];
+
+/// `label` lists every volume's label; `label diskN|@LABEL` shows one; `label diskN|@LABEL
+/// NAME` sets it and `label diskN|@LABEL -` clears it. A label may be on one volume only.
+fn label(rest: &str) {
+    let mut words = rest.split_whitespace();
+    let Some(target) = words.next() else {
+        for number in 1..=crate::block::count() {
+            match crate::storage::volume_on(number) {
+                Ok(volume) => match volume.label() {
+                    Ok(label) if !label.is_empty() => crate::println!("disk{number}: @{}", core::str::from_utf8(label.as_bytes()).unwrap_or("?")),
+                    Ok(_) => crate::println!("disk{number}: (no label)"),
+                    Err(error) => crate::println!("disk{number}: {error:?}"),
+                },
+                Err(crate::storage::VolumeError::NoPartition) | Err(crate::storage::VolumeError::NotFormatted) => crate::println!("disk{number}: (no FOSFS volume)"),
+                Err(error) => crate::println!("disk{number}: {error}"),
+            }
+        }
+        return;
+    };
+    let (number, volume) = if let Some(label) = target.strip_prefix('@') {
+        match crate::storage::volume_labelled(label.as_bytes()) {
+            Some(found) => found,
+            None => return crate::println!("@{label}: no volume carries that label."),
+        }
+    } else if let Some(number) = target.strip_prefix("disk").and_then(|number| number.parse::<usize>().ok()) {
+        match crate::storage::volume_on(number) {
+            Ok(volume) => (number, volume),
+            Err(error) => return crate::println!("disk{number}: {error}."),
+        }
+    } else {
+        return crate::println!("Usage: label [diskN|@LABEL [NAME|-]]");
+    };
+    let Some(name) = words.next() else {
+        match volume.label() {
+            Ok(label) if !label.is_empty() => crate::println!("disk{number}: @{}", core::str::from_utf8(label.as_bytes()).unwrap_or("?")),
+            Ok(_) => crate::println!("disk{number}: (no label)"),
+            Err(error) => crate::println!("disk{number}: {error:?}"),
+        }
+        return;
+    };
+    let wanted = if name == "-" { "" } else { name };
+    if !wanted.is_empty() {
+        if !crate::fosfs::valid_name(wanted.as_bytes()) {
+            return crate::println!("label: up to 16 lowercase letters, digits, `.`, `_` or `-`.");
+        }
+        if let Some((other, _)) = crate::storage::volume_labelled(wanted.as_bytes()).filter(|(other, _)| *other != number) {
+            return crate::println!("label: disk{other} already carries @{wanted}.");
+        }
+    }
+    match volume.set_label(wanted.as_bytes()) {
+        Ok(()) if wanted.is_empty() => crate::println!("disk{number}: label cleared."),
+        Ok(()) => crate::println!("disk{number} is now @{wanted}."),
+        Err(error) => crate::println!("label: {error:?}"),
+    }
+}
 
 fn start() {
     #[cfg(target_arch = "x86_64")]

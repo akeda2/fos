@@ -1428,7 +1428,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1510,7 +1510,6 @@ fn execute(command: &str) {
             }
         }
         "tape" => crate::tape::command(command.strip_prefix("tape").unwrap_or("")),
-        "label" => label_command(words),
         "hda" => crate::hda::describe(),
         "format" => format_command(words),
         "install" => crate::install::command(words),
@@ -2180,60 +2179,6 @@ fn do_format(disk: usize, number: usize, label: &[u8], force: bool) {
     }
 }
 
-/// `label` lists every volume's label; `label diskN|@LABEL` shows one; `label diskN|@LABEL
-/// NAME` sets it and `label diskN|@LABEL -` clears it. A label may be on one volume only.
-fn label_command(mut words: core::str::SplitWhitespace) {
-    let Some(target) = words.next() else {
-        for number in 1..=crate::block::count() {
-            match crate::storage::volume_on(number) {
-                Ok(volume) => match volume.label() {
-                    Ok(label) if !label.is_empty() => crate::println!("disk{number}: @{}", core::str::from_utf8(label.as_bytes()).unwrap_or("?")),
-                    Ok(_) => crate::println!("disk{number}: (no label)"),
-                    Err(error) => crate::println!("disk{number}: {error:?}"),
-                },
-                Err(crate::storage::VolumeError::NoPartition) | Err(crate::storage::VolumeError::NotFormatted) => crate::println!("disk{number}: (no FOSFS volume)"),
-                Err(error) => crate::println!("disk{number}: {error}"),
-            }
-        }
-        return;
-    };
-    let (number, volume) = if let Some(label) = target.strip_prefix('@') {
-        match crate::storage::volume_labelled(label.as_bytes()) {
-            Some(found) => found,
-            None => return crate::println!("@{label}: no volume carries that label."),
-        }
-    } else if let Some(number) = target.strip_prefix("disk").and_then(|number| number.parse::<usize>().ok()) {
-        match crate::storage::volume_on(number) {
-            Ok(volume) => (number, volume),
-            Err(error) => return crate::println!("disk{number}: {error}."),
-        }
-    } else {
-        return crate::println!("Usage: label [diskN|@LABEL [NAME|-]]");
-    };
-    let Some(name) = words.next() else {
-        match volume.label() {
-            Ok(label) if !label.is_empty() => crate::println!("disk{number}: @{}", core::str::from_utf8(label.as_bytes()).unwrap_or("?")),
-            Ok(_) => crate::println!("disk{number}: (no label)"),
-            Err(error) => crate::println!("disk{number}: {error:?}"),
-        }
-        return;
-    };
-    let wanted = if name == "-" { "" } else { name };
-    if !wanted.is_empty() {
-        if !crate::fosfs::valid_name(wanted.as_bytes()) {
-            return crate::println!("label: up to 16 lowercase letters, digits, `.`, `_` or `-`.");
-        }
-        if let Some((other, _)) = crate::storage::volume_labelled(wanted.as_bytes()).filter(|(other, _)| *other != number) {
-            return crate::println!("label: disk{other} already carries @{wanted}.");
-        }
-    }
-    match volume.set_label(wanted.as_bytes()) {
-        Ok(()) if wanted.is_empty() => crate::println!("disk{number}: label cleared."),
-        Ok(()) => crate::println!("disk{number} is now @{wanted}."),
-        Err(error) => crate::println!("label: {error:?}"),
-    }
-}
-
 /// The x86 commands that are not in the shared tables yet (docs/shell.md), listed by `help` after the shared ones.
 pub(crate) fn help_extra() {
     crate::println!("copy SRC NAME DST [NEWNAME]   copy a file, also between machines (diskN, @LABEL, esp; FAT too)");
@@ -2243,7 +2188,6 @@ pub(crate) fn help_extra() {
     crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
     crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
     crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
-    crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
     crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
     crate::println!("format diskN exfat [LABEL]    erase a disk and make it one exFAT volume for PCs");
     crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
