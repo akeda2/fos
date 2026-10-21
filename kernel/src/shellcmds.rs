@@ -23,6 +23,15 @@ pub static COMMANDS: &[Command] = &[
     Command::new("clear", "clear", "clears the screen.", |_, _| crate::print(format_args!("\x1b[2J"))),
     Command::new("reset", "reset", "restarts the machine (through the firmware, so a pending kernel slot is tried).", |_, _| restart()).alias(&["reboot"]),
     Command::new("shutdown", "shutdown", "powers off (a Pi 4 halts in its bootloader).", |_, _| power_off()).alias(&["halt"]),
+    Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |host, rest| {
+        if rest.is_empty() {
+            crate::println!("run: which tape? (run NAME [ARGS])");
+        } else {
+            host.run_tape(rest);
+        }
+    }),
+    Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
+    Command::new("sector", "sector diskN LBA [COUNT <= 4]", "raw read-only dump of disk sectors (a GPT header, the slot metadata).", |_, rest| sector(rest)),
     Command::new("start", "start", "runs the start file again (as at boot).", |_, _| start()),
     Command::new("dmesg", "dmesg", "the boot log.", |_, _| dmesg()),
     Command::new("echo", "echo TEXT", "prints its arguments.", |_, rest| crate::println!("{rest}")),
@@ -164,4 +173,96 @@ fn date(rest: &str) {
         }
         Some(_) => crate::println!("Usage: date | date set YYYY-MM-DD HH:MM[:SS]"),
     }
+}
+
+/// A raw-disk dump to look at what is really on a disk (a GPT header, the slot metadata, a boot sector) when a driver or
+/// loader misbehaves on hardware we cannot attach a debugger to.
+fn sector(rest: &str) {
+    // `sector diskN LBA [COUNT]`: a raw read-only dump, to look at what is really on a disk (a GPT header, the slot
+    // metadata, a boot sector) when a driver or loader misbehaves on hardware we cannot attach a debugger to.
+    const USAGE: &str = "Usage: sector diskN LBA [COUNT <= 4]   (decimal or 0x hex; read-only)";
+    let mut words = rest.split_whitespace();
+    let disk = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
+    let lba = words.next().and_then(number);
+    let count = words.next().and_then(number).unwrap_or(1);
+    let (Some(number), Some(lba)) = (disk, lba) else { return crate::println!("{USAGE}") };
+    if number == 0 || count == 0 || count > 4 {
+        return crate::println!("{USAGE}");
+    }
+    for offset in 0..count {
+        let mut sector = [0u8; 512];
+        if let Err(error) = crate::block::read(number - 1, lba + offset, &mut sector) {
+            return crate::println!("disk{number} sector {}: read failed ({error:?}).", lba + offset);
+        }
+        crate::println!("disk{number} sector {}:", lba + offset);
+        let mut skipped = false;
+        for (row, bytes) in sector.chunks(16).enumerate() {
+            // runs of identical rows (zeros, mostly) are folded into one "*" line, as hexdump does
+            if row > 0 && row < 31 && bytes == &sector[(row - 1) * 16..row * 16] && bytes == &sector[(row + 1) * 16..(row + 2) * 16] {
+                if !skipped {
+                    crate::println!("*");
+                    skipped = true;
+                }
+                continue;
+            }
+            skipped = false;
+            crate::print(format_args!("{:03x}  ", row * 16));
+            for byte in bytes {
+                crate::print(format_args!("{byte:02x} "));
+            }
+            crate::print(format_args!(" "));
+            for &byte in bytes {
+                crate::print(format_args!("{}", if (0x20..0x7f).contains(&byte) { byte as char } else { '.' }));
+            }
+            crate::println!();
+        }
+    }
+}
+
+fn number(word: &str) -> Option<u64> {
+    match word.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => word.parse().ok(),
+    }
+}
+
+/// `grow diskN`: makes the disk's FOSFS volume fill the disk. A stick flashed from the 96 MiB image keeps a 32 MiB data
+/// partition and leaves the rest of the stick unused; this moves the backup partition table to the real end of the disk,
+/// extends the FOSFS partition to it and the volume to the partition. Files are kept (a FOSFS volume is extents addressed from
+/// its start, so new space is just free space). Only a FOSFS partition that is the last on the disk can grow.
+fn grow(rest: &str) {
+    let Some(number) = rest.split_whitespace().next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok()) else {
+        return crate::println!("Usage: grow diskN   (make the disk's FOSFS volume fill the disk; files are kept)");
+    };
+    if number.checked_sub(1).and_then(crate::block::get).is_none() {
+        return crate::println!("disk{number}: no such disk (see `disks`).");
+    }
+    let disk = number - 1;
+    let before = match crate::storage::volume_on(number) {
+        Ok(volume) => volume.sectors,
+        Err(error) => return crate::println!("grow: disk{number}: {error}."),
+    };
+    use crate::gpt::GrowError;
+    let partition = match crate::gpt::grow_last_partition(disk, &fosfor_abi::FOSFS_TYPE_GUID) {
+        Ok(partition) => partition,
+        Err(GrowError::NothingToGrow) => {
+            // The partition may already fill the disk while the volume does not (an interrupted grow): finish that.
+            match crate::gpt::find(disk, &fosfor_abi::FOSFS_TYPE_GUID, |_| true) {
+                Some(partition) if partition.sectors > before + 2048 => partition,
+                _ => return crate::println!("disk{number}: the FOSFS volume ({} MiB) already fills the disk.", before / 2048),
+            }
+        }
+        Err(GrowError::NoGpt) => return crate::println!("grow: disk{number} has no GPT this kernel understands."),
+        Err(GrowError::NoPartition) => return crate::println!("grow: disk{number} has no FOSFS partition."),
+        Err(GrowError::NotLast) => return crate::println!("grow: another partition lies after the FOSFS one; only the last partition can grow."),
+        Err(GrowError::Disk) => return crate::println!("grow: disk{number}: reading or writing the partition table failed."),
+    };
+    let volume = match crate::fosfs::Volume::mount(disk, partition.start, partition.sectors).and_then(|volume| volume.grow(partition.sectors)) {
+        Ok(volume) => volume,
+        Err(error) => return crate::println!("grow: the partition grew but the volume could not ({error:?}); run `grow disk{number}` again."),
+    };
+    if crate::storage::boot_disk() == Some(disk) {
+        crate::storage::remount_boot();
+    }
+    crate::println!("disk{number}: FOSFS volume grown from {} MiB to {} MiB; the files are unchanged.", before / 2048, volume.sectors / 2048);
 }

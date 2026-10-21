@@ -1424,7 +1424,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1509,46 +1509,6 @@ fn execute(command: &str) {
                 _ => crate::println!("Usage: hexdump ADDRESS [LENGTH <= 4096]  (decimal or 0x hex)"),
             }
         }
-        "sector" => {
-            // `sector diskN LBA [COUNT]`: a raw read-only dump, to look at what is really on a disk (a GPT header, the slot
-            // metadata, a boot sector) when a driver or loader misbehaves on hardware we cannot attach a debugger to.
-            const USAGE: &str = "Usage: sector diskN LBA [COUNT <= 4]   (decimal or 0x hex; read-only)";
-            let disk = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
-            let lba = words.next().and_then(parse_number);
-            let count = words.next().and_then(parse_number).unwrap_or(1);
-            let (Some(number), Some(lba)) = (disk, lba) else { return crate::println!("{USAGE}") };
-            if number == 0 || count == 0 || count > 4 {
-                return crate::println!("{USAGE}");
-            }
-            for offset in 0..count {
-                let mut sector = [0u8; 512];
-                if let Err(error) = crate::block::read(number - 1, lba + offset, &mut sector) {
-                    return crate::println!("disk{number} sector {}: read failed ({error:?}).", lba + offset);
-                }
-                crate::println!("disk{number} sector {}:", lba + offset);
-                let mut skipped = false;
-                for (row, bytes) in sector.chunks(16).enumerate() {
-                    // runs of identical rows (zeros, mostly) are folded into one "*" line, as hexdump does
-                    if row > 0 && row < 31 && bytes == &sector[(row - 1) * 16..row * 16] && bytes == &sector[(row + 1) * 16..(row + 2) * 16] {
-                        if !skipped {
-                            crate::println!("*");
-                            skipped = true;
-                        }
-                        continue;
-                    }
-                    skipped = false;
-                    crate::print(format_args!("{:03x}  ", row * 16));
-                    for byte in bytes {
-                        crate::print(format_args!("{byte:02x} "));
-                    }
-                    crate::print(format_args!(" "));
-                    for &byte in bytes {
-                        crate::print(format_args!("{}", if (0x20..0x7f).contains(&byte) { byte as char } else { '.' }));
-                    }
-                    crate::println!();
-                }
-            }
-        }
         "nic" if matches!(words.clone().next(), Some("regs")) => {
             words.next();
             let wanted = words.next().and_then(|word| word.parse::<usize>().ok());
@@ -1608,12 +1568,10 @@ fn execute(command: &str) {
             }
         }
         "tape" => crate::tape::command(command.strip_prefix("tape").unwrap_or("")),
-        "run" => crate::tape::run_named(command.strip_prefix("run").unwrap_or("")),
         "label" => label_command(words),
         "audio" => audio_command(words),
         "hda" => crate::hda::describe(),
         "format" => format_command(words),
-        "grow" => grow_command(words),
         "install" => crate::install::command(words),
         "bootcode" => crate::bootcode::command(words),
         "videomodes" => videomodes_command(),
@@ -2372,48 +2330,6 @@ fn plan_format(disk: usize, force: bool) -> Result<FormatPlan, &'static str> {
     }
 }
 
-/// `grow diskN`: makes the disk's FOSFS volume fill the disk. A stick flashed from the 96 MiB image keeps a 32 MiB data
-/// partition and leaves the rest of the stick unused; this moves the backup partition table to the real end of the disk,
-/// extends the FOSFS partition to it and the volume to the partition. Files are kept (a FOSFS volume is extents addressed from
-/// its start, so new space is just free space). Only a FOSFS partition that is the last on the disk can grow.
-fn grow_command(mut words: core::str::SplitWhitespace) {
-    let Some(number) = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok()) else {
-        return crate::println!("Usage: grow diskN   (make the disk's FOSFS volume fill the disk; files are kept)");
-    };
-    let Some(info) = number.checked_sub(1).and_then(crate::block::get) else {
-        return crate::println!("disk{number}: no such disk (see `disks`).");
-    };
-    let disk = number - 1;
-    let before = match crate::storage::volume_on(number) {
-        Ok(volume) => volume.sectors,
-        Err(error) => return crate::println!("grow: disk{number}: {error}."),
-    };
-    use crate::gpt::GrowError;
-    let partition = match crate::gpt::grow_last_partition(disk, &fosfor_abi::FOSFS_TYPE_GUID) {
-        Ok(partition) => partition,
-        Err(GrowError::NothingToGrow) => {
-            // The partition may already fill the disk while the volume does not (an interrupted grow): finish that.
-            match crate::gpt::find(disk, &fosfor_abi::FOSFS_TYPE_GUID, |_| true) {
-                Some(partition) if partition.sectors > before + 2048 => partition,
-                _ => return crate::println!("disk{number}: the FOSFS volume ({} MiB) already fills the disk.", before / 2048),
-            }
-        }
-        Err(GrowError::NoGpt) => return crate::println!("grow: disk{number} has no GPT this kernel understands."),
-        Err(GrowError::NoPartition) => return crate::println!("grow: disk{number} has no FOSFS partition."),
-        Err(GrowError::NotLast) => return crate::println!("grow: another partition lies after the FOSFS one; only the last partition can grow."),
-        Err(GrowError::Disk) => return crate::println!("grow: disk{number}: reading or writing the partition table failed."),
-    };
-    let volume = match crate::fosfs::Volume::mount(disk, partition.start, partition.sectors).and_then(|volume| volume.grow(partition.sectors)) {
-        Ok(volume) => volume,
-        Err(error) => return crate::println!("grow: the partition grew but the volume could not ({error:?}); run `grow disk{number}` again."),
-    };
-    if crate::storage::boot_disk() == Some(disk) {
-        crate::storage::remount_boot();
-    }
-    let _ = info;
-    crate::println!("disk{number}: FOSFS volume grown from {} MiB to {} MiB; the files are unchanged.", before / 2048, volume.sectors / 2048);
-}
-
 /// `format diskN [NAME] [force]` says what it would erase and waits; `format diskN confirm`
 /// (the very next command) does it. Never the boot disk. A disk with a FOSFS partition has
 /// only that partition's volume cleared; a blank disk gets a fresh GPT with one FOSFS
@@ -2599,11 +2515,9 @@ pub(crate) fn help_extra() {
     crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
     crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
     crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
-    crate::println!("sector diskN LBA [COUNT]   raw read-only dump of disk sectors (a GPT header, the slot metadata)");
     crate::println!("label [diskN|@LABEL [NAME|-]]   show or set a volume label");
     crate::println!("format diskN [NAME] [force]   erase a disk's FOSFS volume (asks to confirm)");
     crate::println!("format diskN exfat [LABEL]    erase a disk and make it one exFAT volume for PCs");
-    crate::println!("grow diskN        make a disk's FOSFS volume fill the disk (files are kept)");
     crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
     crate::println!("tapesync [HOST] [apply]   pull newer tapes from one or all peers (needs the synckey file)");
     crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");

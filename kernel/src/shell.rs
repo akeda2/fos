@@ -5,7 +5,7 @@
 use fosfor_shell::Command;
 
 use crate::shellhost::KernelHost;
-use crate::{block, fosfs, lineedit, memory, storage, timer};
+use crate::{fosfs, lineedit, memory, storage, timer};
 
 /// Prompts, then serves the serial console forever: poll a byte, edit, run a finished line.
 static mut START_SCRIPT: [u8; 4096] = [0; 4096];
@@ -67,11 +67,8 @@ static COMMANDS: &[Command] = &[
         Some(volume) => fosfs::report(&volume),
         None => crate::println!("fsck: no FOSFS volume there (use `fsck` or `fsck diskN`)."),
     }),
-    Command::new("grow", "grow diskN", "makes the disk's FOSFS volume fill the disk (files are kept).", |_, rest| grow(rest)),
-    Command::new("sector", "sector diskN LBA [COUNT]", "hex dump of raw sectors (read-only, at most 4).", |_, rest| sector(rest)),
     Command::new("audio", "audio ...", "the audio device and a quick capture check.", |_, rest| audio(rest)),
     Command::new("display", "display ...", "the screens.", |_, rest| display(rest)),
-    Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |_, rest| run_tape(rest)),
     Command::new("acpi", "acpi", "lists the ACPI tables.", |_, _| {
         crate::arch::aarch64::acpi::list(|signature, address, length| {
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
@@ -127,69 +124,6 @@ fn volume(argument: &str) -> Option<fosfs::Volume> {
     }
     let number = argument.strip_prefix("disk").and_then(|digits| digits.parse().ok())?;
     storage::volume_on(number).ok()
-}
-
-/// `grow diskN`: makes the disk's FOSFS volume fill the disk (the last partition grows; the files are kept), as on x86.
-fn grow(argument: &str) {
-    let Some(number) = argument.strip_prefix("disk").and_then(|digits| digits.parse::<usize>().ok()) else {
-        return crate::println!("Usage: grow diskN   (make the disk's FOSFS volume fill the disk; files are kept)");
-    };
-    if number == 0 || block::get(number - 1).is_none() {
-        return crate::println!("disk{number}: no such disk (see `disks`).");
-    }
-    let disk = number - 1;
-    let before = match storage::volume_on(number) {
-        Ok(volume) => volume.sectors,
-        Err(error) => return crate::println!("grow: disk{number}: {error}."),
-    };
-    use crate::gpt::GrowError;
-    let partition = match crate::gpt::grow_last_partition(disk, &fosfor_abi::FOSFS_TYPE_GUID) {
-        Ok(partition) => partition,
-        Err(GrowError::NothingToGrow) => {
-            // The partition may already fill the disk while the volume does not (an interrupted grow): finish that.
-            match crate::gpt::find(disk, &fosfor_abi::FOSFS_TYPE_GUID, |_| true) {
-                Some(partition) if partition.sectors > before + 2048 => partition,
-                _ => return crate::println!("disk{number}: the FOSFS volume ({} MiB) already fills the disk.", before / 2048),
-            }
-        }
-        Err(GrowError::NoGpt) => return crate::println!("grow: disk{number} has no GPT this kernel understands."),
-        Err(GrowError::NoPartition) => return crate::println!("grow: disk{number} has no FOSFS partition."),
-        Err(GrowError::NotLast) => return crate::println!("grow: another partition lies after the FOSFS one; only the last partition can grow."),
-        Err(GrowError::Disk) => return crate::println!("grow: disk{number}: reading or writing the partition table failed."),
-    };
-    let volume = match fosfs::Volume::mount(disk, partition.start, partition.sectors).and_then(|volume| volume.grow(partition.sectors)) {
-        Ok(volume) => volume,
-        Err(error) => return crate::println!("grow: the partition grew but the volume could not ({error:?}); run `grow disk{number}` again."),
-    };
-    if storage::boot_disk() == Some(disk) {
-        storage::remount_boot();
-    }
-    crate::println!("disk{number}: FOSFS volume grown from {} MiB to {} MiB; the files are unchanged.", before / 2048, volume.sectors / 2048);
-}
-
-/// `sector diskN LBA [COUNT]`: a read-only hex dump of raw sectors (at most 4).
-fn sector(rest: &str) {
-    let mut words = rest.split_whitespace();
-    let number = words.next().and_then(|word| word.strip_prefix("disk")).and_then(|digits| digits.parse::<usize>().ok());
-    let lba = words.next().and_then(|word| word.parse::<u64>().ok());
-    let count = words.next().map_or(Some(1), |word| word.parse::<usize>().ok()).filter(|count| (1..=4).contains(count));
-    let (Some(number), Some(lba), Some(count)) = (number, lba, count) else {
-        crate::println!("sector: sector diskN LBA [COUNT 1-4]");
-        return;
-    };
-    let mut buffer = [0u8; 2048];
-    let buffer = &mut buffer[..count * 512];
-    if block::read(number.wrapping_sub(1), lba, buffer).is_err() {
-        crate::println!("sector: cannot read disk{number} at {lba}.");
-        return;
-    }
-    for (row, bytes) in buffer.chunks(16).enumerate() {
-        crate::print(format_args!("{:04x}:", row * 16));
-        for byte in bytes {
-            crate::print(format_args!(" {byte:02x}"));
-        }
-        crate::println!();
-    }
 }
 
 /// `run NAME [ARGS]`: loads a tape from the boot volume and runs it until it returns or Escape stops it.
