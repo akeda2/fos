@@ -1424,16 +1424,11 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill") {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump") {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
     match word {
-        "about" => {
-            crate::println!("Fosfor OS (fos) is a small educational 64-bit x86 operating system.");
-            crate::println!("One kernel, booted by a UEFI loader or by the BIOS boot code.");
-            crate::println!("Design: docs/design.md.");
-        }
         "pci" if crate::diag::pci_access(words.clone()) => {}
         "pci" => {
             for device in pci::devices() {
@@ -1501,14 +1496,6 @@ fn execute(command: &str) {
         "io" => crate::diag::io(words),
         "mmio" => crate::diag::mmio(words),
         "gpu" => crate::gpu::command(),
-        "hexdump" => {
-            let address = words.next().and_then(parse_number);
-            let length = words.next().and_then(parse_number).unwrap_or(64);
-            match address {
-                Some(address) if length <= 4096 => hexdump(address, length as usize),
-                _ => crate::println!("Usage: hexdump ADDRESS [LENGTH <= 4096]  (decimal or 0x hex)"),
-            }
-        }
         "nic" if matches!(words.clone().next(), Some("regs")) => {
             words.next();
             let wanted = words.next().and_then(|word| word.parse::<usize>().ok());
@@ -2508,10 +2495,9 @@ fn label_command(mut words: core::str::SplitWhitespace) {
 /// The x86 commands that are not in the shared tables yet (docs/shell.md), listed by `help` after the shared ones.
 pub(crate) fn help_extra() {
     crate::println!("copy SRC NAME DST [NEWNAME]   copy a file, also between machines (diskN, @LABEL, esp; FAT too)");
-    crate::println!("about     what this is");
     crate::println!("pci       list PCI functions (pci read|write B:D.F ... reaches config space)");
     crate::println!("cpuinfo bootinfo memmap irqstat   what the CPU, loader and firmware report");
-    crate::println!("hexdump ADDRESS [LENGTH]   dump mapped memory; io r8|w8.. PORT; mmio r32|w32.. ADDR");
+    crate::println!("io r8|w8.. PORT; mmio r32|w32.. ADDR   port and memory-mapped I/O");
     crate::println!("nic       the network interfaces (list); nic use|park|unpark|sniff|discover|peers|map|regs|send|recv");
     crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
     crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
@@ -2536,39 +2522,6 @@ fn parse_number(word: &str) -> Option<u64> {
     match word.strip_prefix("0x") {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => word.parse().ok(),
-    }
-}
-
-/// `xxd`-style dump: offset, hex bytes, printable characters.
-fn dump_bytes(base: u64, bytes: &[u8]) {
-    for (row, chunk) in bytes.chunks(16).enumerate() {
-        crate::print(format_args!("{:#012x}: ", base + (row * 16) as u64));
-        for byte in chunk {
-            crate::print(format_args!("{byte:02x} "));
-        }
-        for _ in chunk.len()..16 {
-            crate::print(format_args!("   "));
-        }
-        crate::print(format_args!("|"));
-        for byte in chunk {
-            crate::print(format_args!("{}", if (0x20..=0x7e).contains(byte) { *byte as char } else { '.' }));
-        }
-        crate::println!("|");
-    }
-}
-
-/// Dumps physical memory (identity mapped), refusing pages that are not mapped instead of faulting.
-fn hexdump(address: u64, length: usize) {
-    let mut at = address;
-    let end = address + length as u64;
-    while at < end {
-        let page_end = ((at & !0xfff) + 0x1000).min(end);
-        if !crate::paging::is_mapped(at) {
-            return crate::println!("{at:#x}: not mapped.");
-        }
-        let chunk = unsafe { core::slice::from_raw_parts(at as *const u8, (page_end - at) as usize) };
-        dump_bytes(at, chunk);
-        at = page_end;
     }
 }
 
@@ -3230,7 +3183,7 @@ fn nic_recv_wait() {
                     "Received {length} bytes: dst {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype 0x{:02x}{:02x}",
                     f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13]
                 );
-                return dump_bytes(0, f);
+                return crate::shellcmds::dump_bytes(0, f);
             }
         }
         crate::debug::pet();

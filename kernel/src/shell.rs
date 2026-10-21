@@ -62,7 +62,6 @@ pub fn run() -> ! {
 
 /// The Pi's own commands; the file commands and `help` come from the shared shell (`crates/shell`).
 static COMMANDS: &[Command] = &[
-    Command::new("version", "version", "the kernel's name.", |_, _| crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`).")),
     Command::new("fsck", "fsck [diskN]", "checks a FOSFS volume's directory.", |_, rest| match volume(rest) {
         Some(volume) => fosfs::report(&volume),
         None => crate::println!("fsck: no FOSFS volume there (use `fsck` or `fsck diskN`)."),

@@ -23,6 +23,16 @@ pub static COMMANDS: &[Command] = &[
     Command::new("clear", "clear", "clears the screen.", |_, _| crate::print(format_args!("\x1b[2J"))),
     Command::new("reset", "reset", "restarts the machine (through the firmware, so a pending kernel slot is tried).", |_, _| restart()).alias(&["reboot"]),
     Command::new("shutdown", "shutdown", "powers off (a Pi 4 halts in its bootloader).", |_, _| power_off()).alias(&["halt"]),
+    Command::new("about", "about", "what this system is.", |_, _| about()).alias(&["version"]),
+    Command::new("hexdump", "hexdump ADDRESS [LENGTH <= 4096]", "dumps mapped memory (decimal or 0x hex).", |_, rest| {
+        let mut words = rest.split_whitespace();
+        let address = words.next().and_then(number);
+        let length = words.next().and_then(number).unwrap_or(64);
+        match address {
+            Some(address) if length <= 4096 => hexdump(address, length as usize),
+            _ => crate::println!("Usage: hexdump ADDRESS [LENGTH <= 4096]  (decimal or 0x hex)"),
+        }
+    }),
     Command::new("run", "run NAME [ARGS] [&N]", "runs a tape (`NAME [ARGS]` does too); `&N` keeps it in the background on NIC N.", |host, rest| {
         if rest.is_empty() {
             crate::println!("run: which tape? (run NAME [ARGS])");
@@ -265,4 +275,49 @@ fn grow(rest: &str) {
         crate::storage::remount_boot();
     }
     crate::println!("disk{number}: FOSFS volume grown from {} MiB to {} MiB; the files are unchanged.", before / 2048, volume.sectors / 2048);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn about() {
+    crate::println!("Fosfor OS (fos) is a small educational 64-bit x86 operating system.");
+    crate::println!("One kernel, booted by a UEFI loader or by the BIOS boot code.");
+    crate::println!("Design: docs/design.md.");
+}
+
+#[cfg(target_arch = "aarch64")]
+fn about() {
+    crate::println!("Fosfor OS (aarch64 port): shell, FOSFS, tapes (`run NAME`).");
+}
+
+/// `xxd`-style dump: offset, hex bytes, printable characters.
+pub(crate) fn dump_bytes(base: u64, bytes: &[u8]) {
+    for (row, chunk) in bytes.chunks(16).enumerate() {
+        crate::print(format_args!("{:#012x}: ", base + (row * 16) as u64));
+        for byte in chunk {
+            crate::print(format_args!("{byte:02x} "));
+        }
+        for _ in chunk.len()..16 {
+            crate::print(format_args!("   "));
+        }
+        crate::print(format_args!("|"));
+        for byte in chunk {
+            crate::print(format_args!("{}", if (0x20..=0x7e).contains(byte) { *byte as char } else { '.' }));
+        }
+        crate::println!("|");
+    }
+}
+
+/// Dumps memory (identity mapped), refusing pages that are not mapped instead of faulting.
+fn hexdump(address: u64, length: usize) {
+    let mut at = address;
+    let end = address + length as u64;
+    while at < end {
+        let page_end = ((at & !0xfff) + 0x1000).min(end);
+        if !crate::paging::is_mapped(at) {
+            return crate::println!("{at:#x}: not mapped.");
+        }
+        let chunk = unsafe { core::slice::from_raw_parts(at as *const u8, (page_end - at) as usize) };
+        dump_bytes(at, chunk);
+        at = page_end;
+    }
 }
