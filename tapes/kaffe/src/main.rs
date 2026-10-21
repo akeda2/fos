@@ -164,7 +164,31 @@ fn draw_button(canvas: &mut gfx::Canvas, rect: Rect, label: &str, scale: i32, pr
     canvas.text_scaled(rect.x + (rect.w - width) / 2, rect.y + (rect.h - GLYPH_H * scale) / 2, label, scale as u32, 0x000000);
 }
 
-fn draw(canvas: &mut gfx::Canvas, layout: &Layout, clock: &WallClock, stamp: Option<Stamp>, pressed: Option<Button>) {
+/// What the clock is set from, in a dim line at the bottom; amber (`stale`) when the last sync is long ago or never happened.
+fn status_line(sync: Option<&tape_ip::wallclock::WallSync>, resync_us: u64, line: &mut Line<120>) -> bool {
+    let Some(sync) = sync else {
+        let _ = write!(line, "machine clock");
+        return false;
+    };
+    let s = sync.server.0;
+    let _ = write!(line, "NTP {}.{}.{}.{}", s[0], s[1], s[2], s[3]);
+    if let Some(zone) = sync.zone {
+        let _ = write!(line, "  UTC{}{}:{:02}", if zone < 0 { '-' } else { '+' }, zone.abs() / 60, zone.abs() % 60);
+    }
+    match sync.last_ok_us {
+        Some(ok) => {
+            let age = tape_rt::micros().wrapping_sub(ok);
+            let _ = write!(line, "  synced {} s ago  rtt {} us", age / 1_000_000, sync.delay_ns / 1000);
+            age > 3 * resync_us
+        }
+        None => {
+            let _ = write!(line, "  no answer yet, machine clock");
+            true
+        }
+    }
+}
+
+fn draw(canvas: &mut gfx::Canvas, layout: &Layout, clock: &WallClock, stamp: Option<Stamp>, pressed: Option<Button>, status: &str, stale: bool) {
     canvas.clear(0x000000);
     let margin = (layout.height / 30).max(4);
     canvas.text_scaled(margin, margin, "Bryggt nytt kaffe? Tryck: Kaffet klart!", layout.title_scale as u32, 0xffffff);
@@ -201,6 +225,8 @@ fn draw(canvas: &mut gfx::Canvas, layout: &Layout, clock: &WallClock, stamp: Opt
         at = canvas.text_scaled(at, layout.stamp_y, front.as_str(), scale as u32, 0xffffff);
         canvas.text_scaled(at, layout.stamp_y, time.as_str(), scale as u32, YELLOW);
     }
+    // Sits back at a third of white, like the clock tape's status bar; a stale clock stays amber.
+    canvas.text(16, layout.height - GLYPH_H - 6, status, if stale { theme().amber } else { 0x555555 });
 }
 
 #[unsafe(no_mangle)]
@@ -289,7 +315,9 @@ pub extern "C" fn tape_main(api: &'static TapeApi) {
         }
         if screen.due() {
             let mut canvas = screen.frame();
-            draw(&mut canvas, &layout, &clock, stamp, pressed.map(|(button, _)| button));
+            let mut status = Line::<120>::new();
+            let stale = status_line(sync.as_ref(), resync_us, &mut status);
+            draw(&mut canvas, &layout, &clock, stamp, pressed.map(|(button, _)| button), status.as_str(), stale);
             screen.present();
         }
         tape_rt::idle();

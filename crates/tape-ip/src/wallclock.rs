@@ -16,8 +16,13 @@ pub struct WallSync {
     config: net::NetConfig,
     arp: ArpCache<8>,
     client: ntp::Client,
-    server: Ipv4Address,
-    zone: Option<i32>,
+    pub server: Ipv4Address,
+    /// Minutes east of UTC, once known.
+    pub zone: Option<i32>,
+    /// `micros()` of the last answer that was adopted.
+    pub last_ok_us: Option<u64>,
+    /// Round-trip delay of that answer, in nanoseconds.
+    pub delay_ns: i64,
 }
 
 /// `tz=` as minutes east of UTC: `Ok(None)` when absent, `Err` when it cannot be read.
@@ -105,7 +110,7 @@ impl WallSync {
         };
         let s = server.0;
         println!("{who}: NTP server {}.{}.{}.{}.", s[0], s[1], s[2], s[3]);
-        Some(WallSync { nic, config, arp, client: ntp::Client::new(server), server, zone })
+        Some(WallSync { nic, config, arp, client: ntp::Client::new(server), server, zone, last_ok_us: None, delay_ns: 0 })
     }
 
     /// Asks the server and waits (up to about 6 seconds), then sets the clock. The reason for a failure is ready to show.
@@ -134,6 +139,8 @@ impl WallSync {
         if codec::civil_from_unix(unix).year < 2024 {
             return Err("the server's date cannot be right");
         }
+        self.last_ok_us = Some(tape_rt::micros());
+        self.delay_ns = sample.delay;
         let zone = *self.zone.get_or_insert_with(|| wall_seconds().and_then(|wall| codec::guess_zone(wall, unix)).unwrap_or(0));
         let local = (local_ns + sample.offset + 500_000_000).div_euclid(1_000_000_000) + i64::from(zone) * 60;
         if wall_seconds().is_none_or(|wall| (wall - local).abs() >= 1) {
