@@ -985,7 +985,7 @@ fn execute(command: &str) {
         crate::bootcode::cancel(); // and a boot-code update
     }
     // The file commands and the common ones (shellcmds.rs) are the shared shell's (`crates/shell`, docs/shell.md); `copy` (other machines too) stays here.
-    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc"))) {
+    if matches!(word, "help" | "ls" | "cat" | "write" | "rm" | "cp" | "cmp" | "sleep" | "memory" | "grow" | "sector" | "run" | "start" | "dmesg" | "reset" | "reboot" | "shutdown" | "halt" | "disks" | "clear" | "echo" | "uptime" | "date" | "keymap" | "ps" | "tasks" | "kill" | "about" | "version" | "hexdump" | "fsck" | "kup" | "audio" | "label" | "format" | "debug" | "tapesync") || (word == "usb" && !matches!(words.clone().next(), Some("try" | "abort-test"))) || (word == "nic" && matches!(words.clone().next(), None | Some("list" | "sniff" | "promisc" | "peers" | "discover"))) {
         fosfor_shell::execute(&mut crate::shellhost::KernelHost, &[crate::shellcmds::COMMANDS, fosfor_shell::files::COMMANDS], command);
         return;
     }
@@ -1010,7 +1010,6 @@ fn execute(command: &str) {
             words.next();
             nic_use(words.next());
         }
-        "nic" if matches!(words.clone().next(), Some("discover")) => nic_discover(),
         "nic" if matches!(words.clone().next(), Some("park" | "unpark")) => {
             let park = words.next() == Some("park");
             let Some(index) = words.next().and_then(|word| word.parse::<usize>().ok()).filter(|n| (1..=nic_count()).contains(n)) else {
@@ -1042,7 +1041,6 @@ fn execute(command: &str) {
             words.next();
             nic_multicast_test(words.next(), words.next(), words.next());
         }
-        "nic" if matches!(words.clone().next(), Some("peers")) => print_peers(),
         "nic" if matches!(words.clone().next(), Some("map")) => nic_map(),
         "nic" if matches!(words.clone().next(), Some("send")) => nic_send_test(),
         "nic" if matches!(words.clone().next(), Some("recv")) => nic_recv_test(),
@@ -1072,7 +1070,6 @@ fn execute(command: &str) {
         "bootcode" => crate::bootcode::command(words),
         "videomodes" => videomodes_command(),
         "copy" => copy_command(words),
-        "tapesync" => crate::tapesync::command(words),
         "usb" => match words.next() {
             Some("abort-test") => {
                 // A hidden test hook: see `Controller::abort_self_test`.
@@ -1575,7 +1572,6 @@ pub(crate) fn help_extra() {
     crate::println!("videomodes   the screen modes the BIOS boot path's video BIOS offered (and what the monitor told)");
     crate::println!("bootcode [update] [diskN]   show or replace the BIOS boot code and the UEFI loader (files on disk1)");
     crate::println!("install diskN     copy the boot disk (ESP, kernel, files) onto another disk");
-    crate::println!("tapesync [HOST] [apply]   pull newer tapes from one or all peers (needs the synckey file)");
     crate::println!("date [set YYYY-MM-DD HH:MM]   the clock (local time; the RTC)");
     crate::println!("tape ...  load NAME|net, run [ARGS], save NAME, status");
     crate::println!("NAME [ARGS]   a command that is not built in runs the script NAME.sh ($1..$9, $*, # comments) or the tape NAME");

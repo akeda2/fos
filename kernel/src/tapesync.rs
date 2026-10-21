@@ -15,7 +15,8 @@
 //! replaced; otherwise copy it over with `copy`/`foscopy`.
 
 use crate::fosfs::Volume;
-use crate::term::{Mac, NETFS_BUSY, NETFS_DISK_ERROR, NETFS_NO_SYNC, TAG_GET_ERROR, TAG_SYNC_REQUEST};
+use crate::netdump::Mac;
+use crate::netfs::{self, NETFS_BUSY, NETFS_DISK_ERROR, NETFS_NO_SYNC, TAG_GET_ERROR, TAG_SYNC_REQUEST};
 use crate::{println, timer};
 use tape_sync::{Action, Entry, MANIFEST_MAX, MAX_TAPES, NAME_LEN, NONCE_LEN, Stamp};
 
@@ -91,11 +92,11 @@ fn scan(volume: &Volume, state: &mut State) -> Result<(usize, usize), &'static s
             }
         })
         .map_err(|_| "cannot read the FOSFS directory")?;
-    let staging = crate::tape::staging().ok_or("no memory for the transfer buffer")?;
+    let staging = crate::netfs::staging().ok_or("no memory for the transfer buffer")?;
     let mut tapes = 0;
     for index in 0..files {
         let name = &state.names[index][..usize::from(state.name_lengths[index])];
-        crate::debug::pet();
+        crate::netfs::pet();
         let Ok(Some(length)) = volume.read(name, staging) else { continue };
         let image = &staging[..length];
         let Some(stamp) = fosfor_abi::elf::section(image, tape_sync::SECTION).and_then(Stamp::decode) else { continue };
@@ -109,9 +110,21 @@ fn scan(volume: &Volume, state: &mut State) -> Result<(usize, usize), &'static s
     Ok((tapes, files))
 }
 
+#[cfg(target_arch = "x86_64")]
+fn cycles() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn cycles() -> u64 {
+    let count: u64;
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) count) };
+    count
+}
+
 fn nonce() -> [u8; NONCE_LEN] {
     let mut seed = [0u8; 16];
-    seed[0..8].copy_from_slice(&unsafe { core::arch::x86_64::_rdtsc() }.to_le_bytes());
+    seed[0..8].copy_from_slice(&cycles().to_le_bytes());
     seed[8..16].copy_from_slice(&timer::micros().to_le_bytes());
     let digest = tape_sync::sha256(&seed);
     digest[..NONCE_LEN].try_into().unwrap()
@@ -119,7 +132,7 @@ fn nonce() -> [u8; NONCE_LEN] {
 
 /// A request for our manifest.
 pub fn serve(index: usize, source: [u8; 6], payload: &[u8]) {
-    let refuse = |code: u8| crate::term::netfs_reply(index, &source, TAG_GET_ERROR, &[code]);
+    let refuse = |code: u8| crate::netfs::netfs_reply(index, &source, TAG_GET_ERROR, &[code]);
     if payload.len() < NONCE_LEN {
         return;
     }
@@ -131,14 +144,14 @@ pub fn serve(index: usize, source: [u8; 6], payload: &[u8]) {
     if unsafe { CLIENT_ACTIVE } || recently {
         return refuse(NETFS_NO_SYNC);
     }
-    if crate::term::netfs_busy(&source) {
+    if crate::netfs::netfs_busy(&source) {
         return refuse(NETFS_BUSY);
     }
     unsafe { LAST_SERVED = timer::ticks() };
     let state = state();
     let Ok((tapes, _)) = scan(&volume, state) else { return refuse(NETFS_DISK_ERROR) };
     let length = tape_sync::encode(&state.local[..tapes], &key[..key_length], &nonce, &mut state.wire);
-    crate::term::netfs_stream(index, &source, &state.wire[..length], "the tape manifest");
+    crate::netfs::netfs_stream(index, &source, &state.wire[..length], "the tape manifest");
     unsafe { LAST_SERVED = timer::ticks() };
 }
 
@@ -196,19 +209,19 @@ fn run(host: Option<&str>, apply: bool) {
     let mut candidates = 0;
     state.candidates.fill(NO_CANDIDATE);
     if let Some(host) = host {
-        let Some((mac, nic, _)) = crate::term::netfs_peer(host) else { return println!("tapesync: no machine called {host} answered (see `nic peers`).") };
+        let Some((mac, nic, _)) = crate::netfs::netfs_peer(host) else { return println!("tapesync: no machine called {host} answered (see `nic peers`).") };
         let mut target = Target { mac, nic, name: [0; 20], name_length: host.len().min(20) };
         target.name[..target.name_length].copy_from_slice(&host.as_bytes()[..target.name_length]);
         ask(&target, key, state, (local_count, file_count), &mut candidates, true);
     } else {
-        if crate::term::peer_count() == 0 {
-            crate::term::nic_discover();
+        if crate::netfs::peer_count() == 0 {
+            crate::netfs::nic_discover();
         }
-        if crate::term::peer_count() == 0 {
+        if crate::netfs::peer_count() == 0 {
             return println!("tapesync: no other machine is known (see `nic peers`).");
         }
-        for number in 1..=crate::term::peer_count() {
-            let Some((mac, name, name_length, nic)) = crate::term::peer_at(number) else { continue };
+        for number in 1..=crate::netfs::peer_count() {
+            let Some((mac, name, name_length, nic)) = crate::netfs::peer_at(number) else { continue };
             let target = Target { mac, nic, name, name_length };
             ask(&target, key, state, (local_count, file_count), &mut candidates, false);
         }
@@ -243,7 +256,7 @@ fn run(host: Option<&str>, apply: bool) {
         let candidate = state.candidates[index];
         let remote = candidate.entry;
         let name = core::str::from_utf8(remote.name_bytes()).unwrap_or("?");
-        let length = match crate::term::netfs_fetch(candidate.mac, candidate.nic, 1, name) {
+        let length = match crate::netfs::netfs_fetch(candidate.mac, candidate.nic, 1, name) {
             Ok(length) => length,
             Err(reason) => {
                 println!("{name}: {reason}.");
@@ -251,7 +264,7 @@ fn run(host: Option<&str>, apply: bool) {
                 continue;
             }
         };
-        let image = &crate::tape::staging().unwrap()[..length];
+        let image = &crate::netfs::staging().unwrap()[..length];
         let genuine = length == remote.length as usize
             && tape_sync::equal(&tape_sync::sha256(image), &remote.sha256)
             && fosfor_abi::elf::section(image, tape_sync::SECTION).and_then(Stamp::decode) == Some(remote.stamp);
@@ -279,7 +292,7 @@ fn ask(target: &Target, key: &[u8], state: &mut State, (local_count, file_count)
     let name = target.name();
     let nonce = nonce();
     println!("Asking {name} ({}) for its tape manifest...", Mac(&target.mac));
-    let received = match crate::term::netfs_receive(target.mac, target.nic, TAG_SYNC_REQUEST, &nonce, &mut state.wire) {
+    let received = match crate::netfs::netfs_receive(target.mac, target.nic, TAG_SYNC_REQUEST, &nonce, &mut state.wire) {
         Ok(length) => length,
         Err(reason) => return println!("  {name}: {reason}."),
     };

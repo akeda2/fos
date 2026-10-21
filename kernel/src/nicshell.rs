@@ -1,8 +1,8 @@
-//! The `nic` command both shells share: the interface list, `nic sniff [N]` and `nic promisc N on|off`.
+//! The `nic` command both shells share: the interface list, `nic sniff [N]`, `nic promisc N on|off`, `nic peers`, `nic discover`.
 //!
 //! The wording and the loops live here once; what differs is behind `imp`, one small block per kernel (as in
 //! `service_host.rs`): the x86 kernel reads its NIC drivers (`nic.rs`), the Pi its one Genet. x86-only subcommands
-//! (`use`, `park`, `phy`, `ts`, `csum`, `vlan`, `mcast`, `peers`, `discover`, `map`, `send`, `recv`, `regs`) stay in `term.rs`.
+//! (`use`, `park`, `phy`, `ts`, `csum`, `vlan`, `mcast`, `map`, `send`, `recv`, `regs`) stay in `term.rs`.
 
 use crate::netdump::{describe_frame, Line, Mac};
 
@@ -26,7 +26,9 @@ pub fn command(rest: &str) {
         None | Some("list") => list(),
         Some("sniff") => sniff(words.next()),
         Some("promisc") => promisc(words.next(), words.next()),
-        Some(_) => crate::println!("Usage: nic [list | sniff [N] | promisc N on|off]"),
+        Some("peers") => crate::netfs::print_peers(),
+        Some("discover") => crate::netfs::nic_discover(),
+        Some(_) => crate::println!("Usage: nic [list | sniff [N] | promisc N on|off | peers | discover]"),
     }
 }
 

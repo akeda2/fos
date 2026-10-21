@@ -34,7 +34,7 @@ pub static COMMANDS: &[Command] = &[
         }
     }),
     Command::new("fsck", "fsck [diskN|@LABEL]", "checks a FOSFS volume's directory (default: the boot volume).", |_, rest| fsck(rest)),
-    Command::new("nic", "nic [list|sniff [N]|promisc N on|off]", "the network interfaces: list, watch the frames, promiscuous mode.", |_, rest| crate::nicshell::command(rest)),
+    Command::new("nic", "nic [list|sniff [N]|promisc N on|off|peers|discover]", "the network interfaces: list, watch the frames, promiscuous mode, the other fos machines.", |_, rest| crate::nicshell::command(rest)),
     Command::new("usb", "usb [rescan]", "the USB controllers and what is plugged in; `rescan` looks again.", |_, rest| crate::usbshell::command(rest)),
     Command::new("kup", "kup serial [BAUD]", "takes a kernel update over the console serial port.", |_, rest| crate::kupshell::command(rest)),
     Command::new("audio", "audio [device|output|use|start|stop|capture|duplex|tone|modes] ...", "the audio devices, streams and quick checks (`audio help` lists them).", |_, rest| crate::audioshell::command(rest)),
@@ -49,6 +49,7 @@ pub static COMMANDS: &[Command] = &[
     Command::new("label", "label [diskN|@LABEL [NAME|-]]", "shows or sets a FOSFS volume's label (@LABEL names a volume).", |_, rest| label(rest)),
     Command::new("format", "format diskN [NAME] [force] | format diskN exfat [LABEL]", "erases a disk's FOSFS volume, or makes it one exFAT volume for PCs; asks first (then `format diskN confirm`).", |_, rest| crate::formatshell::command(rest)),
     Command::new("debug", "debug [status|slots|crash|hang|video ...]", "kernel-update setting and the A/B slots; `crash` and `hang` test the crash record and the watchdog; `video` (x86 BIOS boots) the video mode.", |_, rest| debug(rest)),
+    Command::new("tapesync", "tapesync [HOST] [apply]", "pulls newer tapes from one or all peers (needs the synckey file).", |_, rest| crate::tapesync::command(rest.split_whitespace())),
     Command::new("sector", "sector diskN LBA [COUNT <= 4]", "raw read-only dump of disk sectors (a GPT header, the slot metadata).", |_, rest| sector(rest)),
     Command::new("start", "start", "runs the start file again (as at boot).", |_, _| start()),
     Command::new("dmesg", "dmesg", "the boot log.", |_, _| dmesg()),

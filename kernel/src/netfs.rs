@@ -557,7 +557,6 @@ pub(crate) fn handle(index: usize, source: [u8; 6], tag: u8, payload: &[u8]) -> 
         TAG_PUT_REQUEST if netfs_enabled() => netfs_put_request(index, source, payload),
         TAG_PUT_DATA if netfs_enabled() => netfs_put_data(source, payload),
         TAG_PUT_STOP if netfs_enabled() => netfs_put_stop(index, source),
-        #[cfg(target_arch = "x86_64")]
         TAG_SYNC_REQUEST if netfs_enabled() => crate::tapesync::serve(index, source, payload),
         _ => return None,
     }
@@ -578,6 +577,14 @@ pub(crate) fn send(index: usize, destination: &[u8; 6], tag: u8, payload: &[u8])
     frame[14] = tag;
     frame[15..15 + payload.len()].copy_from_slice(payload);
     imp::send_frame(index, &frame[..15 + payload.len()])
+}
+
+pub(crate) fn staging() -> Option<&'static mut [u8]> {
+    imp::staging()
+}
+
+pub(crate) fn pet() {
+    imp::pet();
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -28,6 +28,7 @@ mod pci;
 mod service_host;
 mod shell;
 mod shellcmds;
+mod tapesync;
 mod shellhost;
 mod storage;
 mod tape_aarch64;
