@@ -158,6 +158,7 @@ pub fn peaks_from_wire(payload: &[u8], channels: usize, bits: usize, frames: usi
     if !stats.meters_on || channels == 0 || bytes < 2 {
         return;
     }
+    let float = bits == 32;
     let c = coefficients(stats);
     let (detectors, clips) = if send { (&mut stats.send, &mut stats.send_clip) } else { (&mut stats.receive, &mut stats.receive_clip) };
     if send { stats.send_channels = channels } else { stats.receive_channels = channels }
@@ -165,7 +166,7 @@ pub fn peaks_from_wire(payload: &[u8], channels: usize, bits: usize, frames: usi
         for channel in 0..channels.min(MAX_CHANNELS) {
             let at = (frame * channels + channel) * bytes;
             let Some(sample) = payload.get(at..at + bytes) else { return };
-            let magnitude = i32::from(i16::from_be_bytes([sample[0], sample[1]])).unsigned_abs() << 16;
+            let magnitude = if float { audio_wire::meter::magnitude(f32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]])) } else { i32::from(i16::from_be_bytes([sample[0], sample[1]])).unsigned_abs() << 16 };
             detectors[channel].feed(magnitude, &c);
             if magnitude >= CLIP {
                 clips[channel] = true;

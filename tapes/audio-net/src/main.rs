@@ -256,7 +256,7 @@ pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Options<'a>, &'
             "rate" => options.rate = value.parse().map_err(|_| "rate= needs a number")?,
             "ch" => options.channels = Some(ChannelSet::parse(value).ok_or("ch= is like 1-2 or 9-10,1 (channels 1 to 32)")?),
             "chan" => options.chan = value.parse().ok().filter(|&n| (1..=audio_wire::MAX_CHANNELS).contains(&n)).ok_or("chan= is 1 to 32")?,
-            "bits" => options.bits = value.parse().ok().filter(|&b| b == 16 || b == 24).ok_or("bits= is 16 or 24")?,
+            "bits" => options.bits = if value == "f32" { 32 } else { value.parse().ok().filter(|&b| b == 16 || b == 24 || b == 32).ok_or("bits= is 16, 24 or 32 (f32: float)")? },
             "src" => match value.strip_prefix("tone=") {
                 Some(frequency) => options.tone = Some(frequency.parse().map_err(|_| "src=tone=HZ needs a number")?),
                 None if value == "capture" => {}
@@ -533,6 +533,9 @@ pub fn send(api: &'static TapeApi, options: &Options) {
     if options.latency && tone.is_some() {
         return println!("audio-net send: latency needs the capture device (no src=tone).");
     }
+    if options.latency && options.bits == 32 {
+        return println!("audio-net send: latency needs bits=16 or 24 (the click is an integer sample).");
+    }
     if tone.is_none() && !device {
         return println!("audio-net send: no audio device with inputs (use src=tone=440 to send a test tone).");
     }
@@ -660,10 +663,15 @@ pub fn send(api: &'static TapeApi, options: &Options) {
             // Paced by the clock: packet number `sent` is due at started + sent * packet time.
             if tape_rt::micros() >= started + sent * paced_us_x1000 / 1000 {
                 for index in 0..per_packet {
+                    let phase_before = phase;
                     let sample = tone_sample(phase) << 8; // 16-bit tone as a 24-bit value
                     phase = (phase + (u64::from(frequency) * 65_536 / u64::from(options.rate)) as u32) & 0xffff;
                     for channel in 0..channels {
                         let at = (index * channels + channel) * bits / 8;
+                        if bits == 32 {
+                            payload[at..at + 4].copy_from_slice(&((tone_sample(phase_before) as f32) * (1.0 / 32768.0)).to_be_bytes());
+                            continue;
+                        }
                         let bytes = sample.to_be_bytes();
                         let wire = &bytes[1..];
                         payload[at..at + bits / 8].copy_from_slice(if bits == 24 { wire } else { &wire[..2] });

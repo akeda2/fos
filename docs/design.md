@@ -1253,3 +1253,21 @@ tapes (audio, UART and gfx teardown are not owner-aware), and keys/Escape go to
 the foreground only. KUP and NETFS work while a service runs. Test:
 `make test-services` (ptp master service, slave locks on, foreground tapes,
 `kill`). Only real hardware shows Sync jitter next to a busy foreground tape.
+
+### Native float audio (ABI 21, crates/audio-sample, crates/audio-wire)
+
+One USB audio driver (`usb_audio.rs`) serves both kernels and now detects 32-bit IEEE float streams (alt settings with
+the float format tag); `audio_info` reports one as slot 4, bits 32 and the new call `audio_float` says whether the
+active stream is float (`AudioInfo` never gains fields). `audio-sample::Format` is the single place that knows a
+slot's layout: float is full scale 1.0, integers use one scale of 2^(bits-1) with round-to-nearest, so integer
+samples survive an f32 round trip exactly. Tapes carry f32 from the device to the DSP: `record`/`recorder` write
+float WAV (format tag 3) for a float device, `play` reads it, `ltas`/`gonio` meter floats without conversion.
+
+`audio-net` is a hard-float tape on libopus 1.6.1's float build (`FLOAT_APPROX`, SSE2, `make opus-float`):
+`encode_float`/`decode_float`, so Opus never sees an integer. The PCM path stays bit-exact. Opus decoded to an
+integer device is dithered (TPDF, `audio_wire::Dither`); a float device gets the samples as decoded. A private
+wire mode `bits=32` (or `bits=f32`) sends big-endian IEEE singles: raw header bits 32, RTP payload `F32` in the
+SDP (no RFC name exists), AVTP AAF format 0x01. L16/L24 remain the standards-based modes. `send latency` needs
+16 or 24 bits; the panel has no float entry yet (a saved `bits 32` reads back as 24). Tests: `make test`
+(`audio-sample`, `audio-wire` round trips) and `make test-audio-net` (run h: float RTP, F32 SDP, 350 Hz tone).
+Only real hardware shows a float interface's behaviour and Opus's CPU cost on old machines.

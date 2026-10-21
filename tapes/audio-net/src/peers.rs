@@ -293,6 +293,7 @@ fn codec_text(session: &Session) -> &'static str {
     match session.codec {
         Codec::L16 => "L16",
         Codec::L24 => "L24",
+        Codec::F32 => "F32",
         Codec::Opus => "Opus",
     }
 }
@@ -390,7 +391,7 @@ pub fn adopt_sender_l2(options: &mut Options<'static>, entry: &Entry) {
     let s = &entry.session;
     options.from = Some(entry.from_mac);
     options.chan = s.channels;
-    options.bits = if s.codec == Codec::L16 { 16 } else { 24 };
+    options.bits = match s.codec { Codec::L16 => 16, Codec::F32 => 32, _ => 24 };
     options.rate = s.rate;
     options.adopted_receive = true;
 }
@@ -411,7 +412,7 @@ pub fn adopt_sender(options: &mut Options<'static>, entry: &Entry, my_ip: [u8; 4
     options.proto = Proto::Rtp;
     options.opus = s.codec == Codec::Opus;
     options.chan = s.channels;
-    options.bits = if s.codec == Codec::L16 { 16 } else { 24 };
+    options.bits = match s.codec { Codec::L16 => 16, Codec::F32 => 32, _ => 24 };
     options.rate = s.rate;
     options.port = s.port;
     options.payload_type = s.payload_type;

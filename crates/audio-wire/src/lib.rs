@@ -72,7 +72,7 @@ impl ChannelSet {
 ///  4-7   timestamp: the stream's frame counter at the first frame of this packet
 ///  8-11  stream id
 ///  12    channels in this packet
-///  13    bits per sample (16 or 24)
+///  13    bits per sample (16 or 24 integer; 32 is IEEE float, full scale 1.0, a private mode between fos machines)
 ///  14-15 frames in this packet
 ///  16-17 sample rate / 25 (so 48000 is 1920 and 192000 is 7680)
 /// ```
@@ -115,7 +115,7 @@ impl Header {
             frames: u16::from_be_bytes([bytes[14], bytes[15]]),
             rate: u32::from(u16::from_be_bytes([bytes[16], bytes[17]])) * 25,
         };
-        let valid = header.channels >= 1 && usize::from(header.channels) <= MAX_CHANNELS && matches!(header.bits, 16 | 24) && header.frames >= 1;
+        let valid = header.channels >= 1 && usize::from(header.channels) <= MAX_CHANNELS && matches!(header.bits, 16 | 24 | 32) && header.frames >= 1;
         let length = usize::from(header.frames) * usize::from(header.channels) * usize::from(header.bits / 8);
         (valid && bytes.len() >= HEADER_LEN + length).then_some(header)
     }
@@ -171,6 +171,13 @@ pub fn pack(device: &[u8], format: Format, device_channels: usize, frames: usize
     let mut at = 0;
     for frame in device.chunks(slot * device_channels).take(frames) {
         for channel in selection.channels() {
+            if bits == 32 {
+                // Float wire mode: the sample as a big-endian IEEE single, no integer step and no clip.
+                let value = if channel < device_channels { format.read(&frame[channel * slot..(channel + 1) * slot]) } else { 0.0 };
+                out[at..at + 4].copy_from_slice(&value.to_be_bytes());
+                at += 4;
+                continue;
+            }
             let value = if channel < device_channels { device_sample(&frame[channel * slot..(channel + 1) * slot], format) } else { 0 };
             let bytes = value.to_be_bytes(); // the top `sample_bytes` bytes carry the sample
             out[at..at + sample_bytes].copy_from_slice(&bytes[..sample_bytes]);
@@ -196,6 +203,11 @@ pub fn unpack(wire: &[u8], wire_channels: usize, bits: usize, frames: usize, pla
                 continue;
             }
             let at = (frame * wire_channels + channel) * sample_bytes;
+            if bits == 32 {
+                let value = f32::from_be_bytes([wire[at], wire[at + 1], wire[at + 2], wire[at + 3]]);
+                format.write(if value == value { value } else { 0.0 }, &mut target[destination * slot..(destination + 1) * slot]);
+                continue;
+            }
             let mut value = 0u32;
             for (index, &byte) in wire[at..at + sample_bytes].iter().enumerate() {
                 value |= u32::from(byte) << (8 * (3 - index));
@@ -250,12 +262,17 @@ impl Fill {
     }
 }
 
-/// Network samples (big endian, 16 or 24 bits) to `f32` (full scale 1.0), the working format of the resampler. `frames`
+/// Network samples (big endian, 16 or 24 bits, or 32 for a float) to `f32` (full scale 1.0), the working format of the resampler. `frames`
 /// frames of `channels` channels go to `out[..frames * channels]`. 16 and 24 bits are exact in an `f32`.
 pub fn wire_to_frames(wire: &[u8], channels: usize, bits: usize, frames: usize, out: &mut [f32]) {
     let sample_bytes = bits / 8;
     for index in 0..frames * channels {
         let at = index * sample_bytes;
+        if bits == 32 {
+            let value = f32::from_be_bytes([wire[at], wire[at + 1], wire[at + 2], wire[at + 3]]);
+            out[index] = if value == value { value } else { 0.0 };
+            continue;
+        }
         let mut value = 0u32;
         for (byte_index, &byte) in wire[at..at + sample_bytes].iter().enumerate() {
             value |= u32::from(byte) << (8 * (3 - byte_index));
@@ -554,7 +571,11 @@ pub fn write_sdp(sdp: &Sdp<'_>, out: &mut [u8]) -> usize {
         let _ = write!(cursor, "/32");
     }
     let _ = write!(cursor, "\r\nt=0 0\r\nm=audio {} RTP/AVP {}\r\n", sdp.port, sdp.payload_type);
-    let _ = write!(cursor, "a=rtpmap:{} L{}/{}/{}\r\n", sdp.payload_type, sdp.bits, sdp.rate, sdp.channels);
+    if sdp.bits == 32 {
+        let _ = write!(cursor, "a=rtpmap:{} F32/{}/{}\r\n", sdp.payload_type, sdp.rate, sdp.channels);
+    } else {
+        let _ = write!(cursor, "a=rtpmap:{} L{}/{}/{}\r\n", sdp.payload_type, sdp.bits, sdp.rate, sdp.channels);
+    }
     if thousandths == 0 {
         let _ = write!(cursor, "a=ptime:{milliseconds}\r\n");
     } else {
@@ -743,6 +764,8 @@ pub mod avtp {
     /// The AAF `format` values for integer PCM.
     pub const FORMAT_INT24: u8 = 3;
     pub const FORMAT_INT16: u8 = 4;
+    /// The AAF `format` value for 32-bit IEEE float.
+    pub const FORMAT_FLOAT32: u8 = 1;
     /// The AAF `nsr` (nominal sample rate) codes: 8, 16, 32, 44.1, 48, 88.2, 96, 176.4, 192 kHz.
     const RATES: [u32; 9] = [8_000, 16_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 
@@ -772,7 +795,7 @@ pub mod avtp {
     impl Header {
         /// Writes the 24 bytes; false if the rate or bit depth has no AAF code.
         pub fn encode(&self, out: &mut [u8]) -> bool {
-            let (Some(code), format) = (rate_code(self.rate), if self.bits == 24 { FORMAT_INT24 } else { FORMAT_INT16 }) else { return false };
+            let (Some(code), format) = (rate_code(self.rate), match self.bits { 24 => FORMAT_INT24, 32 => FORMAT_FLOAT32, _ => FORMAT_INT16 }) else { return false };
             out[0] = SUBTYPE_AAF;
             out[1] = 0x80 | if self.timestamp_valid { 0x01 } else { 0 }; // sv = 1, version 0, mr/gv 0, tv
             out[2] = self.sequence;
@@ -795,7 +818,7 @@ pub mod avtp {
             }
             let format = bytes[16];
             let bits = bytes[19];
-            if !(format == FORMAT_INT24 && bits == 24 || format == FORMAT_INT16 && bits == 16) {
+            if !(format == FORMAT_INT24 && bits == 24 || format == FORMAT_INT16 && bits == 16 || format == FORMAT_FLOAT32 && bits == 32) {
                 return None;
             }
             let channels = (u16::from(bytes[17] & 3) << 8) | u16::from(bytes[18]);
@@ -866,6 +889,8 @@ pub mod sap {
     pub enum Codec {
         L16,
         L24,
+        /// 32-bit float, a private `F32` payload name (RTP has no standard one).
+        F32,
         Opus,
     }
 
@@ -957,6 +982,8 @@ pub mod sap {
                             Codec::L16
                         } else if encoding_name.eq_ignore_ascii_case("l24") {
                             Codec::L24
+                        } else if encoding_name.eq_ignore_ascii_case("f32") {
+                            Codec::F32
                         } else if encoding_name.eq_ignore_ascii_case("opus") {
                             Codec::Opus
                         } else {
@@ -1007,6 +1034,27 @@ pub fn is_multicast_address(address: [u8; 4]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn float_wire_is_lossless_between_float_devices() {
+        use super::*;
+        let format = Format::new(4, 32, true);
+        let samples = [0.5f32, -1.25, 0.000_123, 2.0]; // beyond full scale survives too
+        let mut device = [0u8; 16];
+        for (i, s) in samples.iter().enumerate() {
+            format.write(*s, &mut device[i * 4..i * 4 + 4]);
+        }
+        let mut wire = [0u8; 16];
+        let selection = ChannelSet::parse("1-2").unwrap();
+        assert_eq!(pack(&device, format, 2, 2, &selection, 32, &mut wire), 16);
+        assert_eq!(&wire[..4], &0.5f32.to_be_bytes());
+        let mut frames = [0f32; 4];
+        wire_to_frames(&wire, 2, 32, 2, &mut frames);
+        assert_eq!(frames, samples);
+        let mut back = [0u8; 16];
+        unpack(&wire, 2, 32, 2, &[Some(0), Some(1)], format, 2, &mut back);
+        assert_eq!(back, device);
+    }
+
     #[test]
     fn packet_time_caps_the_frame_count() {
         use super::*;
