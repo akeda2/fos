@@ -226,6 +226,7 @@ mod tests {
     struct Mock {
         out: String,
         files: Vec<(String, Vec<u8>)>,
+        ran: Vec<String>,
     }
 
     fn canonical(reference: &str) -> String {
@@ -274,6 +275,13 @@ mod tests {
             run(self, &mut buffer);
             true
         }
+        fn run_script(&mut self, reference: &str, name: &str, arguments: &str) -> bool {
+            self.ran.push(std::format!("script {reference} {name} [{arguments}]"));
+            true
+        }
+        fn run_tape(&mut self, line: &str) {
+            self.ran.push(std::format!("tape {line}"));
+        }
     }
 
     fn run(host: &mut Mock, line: &str) -> String {
@@ -293,6 +301,21 @@ mod tests {
         assert_eq!(run(&mut host, "rm esp/config.txt"), "Removed esp/config.txt.\n");
         assert!(run(&mut host, "rm esp/config.txt").starts_with("rm: esp/config.txt: no such file"));
         assert!(run(&mut host, "write esp/x.txt").contains("nothing to write"));
+    }
+
+    #[test]
+    fn external_runs_scripts_before_tapes_and_ignores_data_files() {
+        let mut host = Mock::default();
+        for name in ["go.sh", "go", "readme.txt", "disk2/up.sh", "esp/tool"] {
+            run(&mut host, &std::format!("write {name} x"));
+        }
+        assert!(crate::external(&mut host, "go.sh a b"));
+        assert!(crate::external(&mut host, "go"));
+        assert!(crate::external(&mut host, "disk2/up x"));
+        assert!(crate::external(&mut host, "esp/tool  1 2"));
+        assert!(!crate::external(&mut host, "readme.txt"));
+        assert!(!crate::external(&mut host, "nothing"));
+        assert_eq!(host.ran, ["script go.sh go [a b]", "script go.sh go []", "script disk2/up.sh up [x]", "tape esp/tool  1 2"]);
     }
 
     #[test]

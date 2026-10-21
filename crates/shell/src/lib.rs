@@ -81,6 +81,17 @@ pub trait Host {
     fn list(&mut self, volume: &str, each: &mut dyn FnMut(&mut dyn Host, Entry)) -> Result<&'static str, FsError>;
     /// Runs `run` with a scratch buffer of `size` bytes; false if there is no memory for it.
     fn with_buffer(&mut self, size: usize, run: &mut dyn FnMut(&mut dyn Host, &mut [u8])) -> bool;
+    /// Whether a file (or a tape) of that name can be run from: the boot volume first, then other volumes.
+    fn exists(&mut self, reference: &str) -> bool {
+        self.length(reference).is_ok()
+    }
+    /// Runs the script file `reference` (`NAME.sh`; `name` is its base, `arguments` the rest of the line); false if this
+    /// port has no scripts.
+    fn run_script(&mut self, _reference: &str, _name: &str, _arguments: &str) -> bool {
+        false
+    }
+    /// Loads and runs the tape named in `line` (`NAME ARGS [&N]`, `PATH/NAME ARGS`), as `run` does.
+    fn run_tape(&mut self, line: &str);
     /// Extra `help` lines for commands a port implements outside the tables (printed after the table's names).
     fn help_extra(&mut self) {}
     /// Prints the help screen of the tape file `reference` (without running it); false if it has none.
@@ -139,6 +150,50 @@ pub fn execute(host: &mut dyn Host, tables: &[&[Command]], line: &str) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// A line that is no command: `NAME` or `NAME.sh` runs the script NAME.sh if there is one, else a file with no dot in its
+/// name runs as a tape (data files carry a suffix); `diskN/NAME`, `@LABEL/NAME` and `esp/NAME` name the volume. False if
+/// there is neither.
+pub fn external(host: &mut dyn Host, line: &str) -> bool {
+    let (word, rest) = split_word(line);
+    let (volume, file) = match word.rsplit_once('/') {
+        Some((volume, file)) => (Some(volume), file),
+        None => (None, word),
+    };
+    let base = file.strip_suffix(".sh").unwrap_or(file);
+    if base.is_empty() {
+        return false;
+    }
+    let mut storage = [0u8; 96];
+    let mut cursor = Cursor(&mut storage, 0);
+    let written = match volume {
+        Some(volume) => fmt::write(&mut cursor, format_args!("{volume}/{base}.sh")),
+        None => fmt::write(&mut cursor, format_args!("{base}.sh")),
+    };
+    let end = cursor.1;
+    if written.is_ok() {
+        let script = core::str::from_utf8(&storage[..end]).unwrap_or("");
+        if host.exists(script) && host.run_script(script, base, rest) {
+            return true;
+        }
+    }
+    if !file.contains('.') && host.exists(word) {
+        host.run_tape(line.trim());
+        return true;
+    }
+    false
+}
+
+struct Cursor<'a>(&'a mut [u8], usize);
+
+impl fmt::Write for Cursor<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.1 + text.len();
+        self.0.get_mut(self.1..end).ok_or(fmt::Error)?.copy_from_slice(text.as_bytes());
+        self.1 = end;
+        Ok(())
     }
 }
 

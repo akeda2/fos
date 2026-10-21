@@ -96,6 +96,22 @@ impl Host for KernelHost {
         true
     }
 
+    fn exists(&mut self, reference: &str) -> bool {
+        tape_fs::length(reference.as_bytes()) >= 0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn run_script(&mut self, reference: &str, name: &str, arguments: &str) -> bool {
+        crate::term::run_script_file(reference, name, arguments)
+    }
+
+    fn run_tape(&mut self, line: &str) {
+        #[cfg(target_arch = "x86_64")]
+        crate::tape::run_named(line);
+        #[cfg(target_arch = "aarch64")]
+        crate::shell::run_tape(line);
+    }
+
     fn help_extra(&mut self) {
         #[cfg(target_arch = "x86_64")]
         crate::term::help_extra();

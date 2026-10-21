@@ -1335,69 +1335,23 @@ fn find_file(name: &[u8]) -> Option<crate::fosfs::Volume> {
     crate::storage::volume_with_file(name)
 }
 
-/// A command word that is not built in: `NAME.sh` runs as a script (lines of commands, `#` starts a comment, `$1`..`$9`
-/// are the arguments and `$*` all of them), else the tape `NAME` runs. False if there is neither.
-fn external_command(word: &str, rest: &str) -> bool {
-    // `diskN/NAME` and `@LABEL/NAME` name the volume to run from.
-    if let Some((volume_text, file)) = split_volume(word) {
-        let Some(Ok((_, volume))) = volume_word(volume_text) else { return false };
-        let base = file.strip_suffix(".sh").unwrap_or(file);
-        let mut script = [0u8; 24];
-        if base.len() + 3 <= script.len() {
-            script[..base.len()].copy_from_slice(base.as_bytes());
-            script[base.len()..base.len() + 3].copy_from_slice(b".sh");
-            let script = &script[..base.len() + 3];
-            if crate::fosfs::valid_name(script) && matches!(volume.file_length(script), Ok(Some(_))) {
-                run_script(volume, script, base, rest);
-                return true;
-            }
-        }
-        if !file.contains('.') && matches!(volume.file_length(file.as_bytes()), Ok(Some(_))) {
-            let mut line = [0u8; 160];
-            let text = if rest.is_empty() { word.len() } else { word.len() + 1 + rest.len() };
-            if text <= line.len() {
-                line[..word.len()].copy_from_slice(word.as_bytes());
-                if !rest.is_empty() {
-                    line[word.len()] = b' ';
-                    line[word.len() + 1..text].copy_from_slice(rest.as_bytes());
-                }
-                crate::tape::run_named(core::str::from_utf8(&line[..text]).unwrap_or(word));
-            }
-            return true;
-        }
+/// Runs the script file `reference` (`NAME.sh`, `diskN/NAME.sh`, `@LABEL/NAME.sh`) if it is a FOSFS file; false if not.
+pub(crate) fn run_script_file(reference: &str, name: &str, arguments: &str) -> bool {
+    let (volume, file) = match split_volume(reference) {
+        Some((volume_text, file)) => match volume_word(volume_text) {
+            Some(Ok((_, volume))) => (volume, file),
+            _ => return false,
+        },
+        None => match find_file(reference.as_bytes()) {
+            Some(volume) => (volume, reference),
+            None => return false,
+        },
+    };
+    if !crate::fosfs::valid_name(file.as_bytes()) || !matches!(volume.file_length(file.as_bytes()), Ok(Some(_))) {
         return false;
     }
-    // `NAME` and `NAME.sh` both mean the script file NAME.sh.
-    let base = word.strip_suffix(".sh").unwrap_or(word);
-    let mut file_name = [0u8; 24];
-    if base.len() + 3 > file_name.len() {
-        return false;
-    }
-    file_name[..base.len()].copy_from_slice(base.as_bytes());
-    file_name[base.len()..base.len() + 3].copy_from_slice(b".sh");
-    let script_name = &file_name[..base.len() + 3];
-    if crate::fosfs::valid_name(script_name) {
-        if let Some(volume) = find_file(script_name) {
-            run_script(volume, script_name, base, rest);
-            return true;
-        }
-    }
-    // A file with no dot in its name is taken for a tape (data files such as `readme.txt` carry a suffix); if it is not a
-    // usable tape `run` says so.
-    if !word.contains('.') && crate::fosfs::valid_name(word.as_bytes()) && find_file(word.as_bytes()).is_some() {
-        let mut line = [0u8; 160];
-        let text = if rest.is_empty() { word.len() } else { word.len() + 1 + rest.len() };
-        if text <= line.len() {
-            line[..word.len()].copy_from_slice(word.as_bytes());
-            if !rest.is_empty() {
-                line[word.len()] = b' ';
-                line[word.len() + 1..text].copy_from_slice(rest.as_bytes());
-            }
-            crate::tape::run_named(core::str::from_utf8(&line[..text]).unwrap_or(word));
-        }
-        return true;
-    }
-    false
+    run_script(volume, file.as_bytes(), name, arguments);
+    true
 }
 
 /// Runs a script file line by line, echoing each command as `NAME.sh> command`.
@@ -1844,8 +1798,7 @@ fn execute(command: &str) {
             Some(_) => crate::println!("debug: status | slots | crash | hang | video [skip|auto|size WxH]"),
         },
         other => {
-            let rest = command[other.len()..].trim();
-            if !external_command(other, rest) {
+            if !fosfor_shell::external(&mut crate::shellhost::KernelHost, command) {
                 crate::println!("Unknown command: {other} (try `help`).");
             }
         }

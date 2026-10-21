@@ -161,12 +161,8 @@ fn execute(line: &str) {
     if line.is_empty() || fosfor_shell::execute(&mut KernelHost, &[COMMANDS, fosfor_shell::files::COMMANDS], line) {
         return;
     }
-    let word = line.split_whitespace().next().unwrap_or("");
-    // `diskN/NAME ARGS`, `@LABEL/NAME` and `esp/NAME` run that tape without `run`; so does a dotless file name (`ed NAME`), as on x86.
-    if word.contains('/') || (!word.contains('.') && storage::volume_with_file(word.as_bytes()).is_some()) {
-        run_tape(line);
-    } else {
-        crate::println!("{word}: unknown command (try `help`).");
+    if !fosfor_shell::external(&mut KernelHost, line) {
+        crate::println!("{}: unknown command (try `help`).", line.split_whitespace().next().unwrap_or(""));
     }
 }
 
@@ -243,7 +239,7 @@ fn sector(rest: &str) {
 }
 
 /// `run NAME [ARGS]`: loads a tape from the boot volume and runs it until it returns or Escape stops it.
-fn run_tape(rest: &str) {
+pub(crate) fn run_tape(rest: &str) {
     // `run NAME ARGS &N`: a background tape (service) that owns NIC N.
     let (rest, service) = crate::tasks::split_suffix(rest);
     if service == Some(Err(())) {
