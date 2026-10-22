@@ -20,6 +20,7 @@ mod gpt;
 mod lineedit;
 mod mailbox;
 mod pipower;
+mod i2s_pi;
 mod diag;
 mod netdump;
 mod netfs;
