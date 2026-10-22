@@ -1055,6 +1055,7 @@ fn execute(command: &str) {
             _ => {}
         },
         "midi" => midi_command(&mut words),
+        "cpufreq" | "temp" => power_command(None),
         "power" => match words.next() {
             Some("hwp") => hwp_command(words.next()),
             word => power_command(word.and_then(|word| word.parse::<u64>().ok())),
@@ -1467,6 +1468,7 @@ pub(crate) fn help_extra() {
     crate::println!("usb       USB controllers, devices, keyboards (usb rescan)");
     crate::println!("keymap    [us|sv]  the local keyboard layout (sv: Swedish/Finnish; `keymap sv` in settings keeps it)");
     crate::println!("uptime    time since the timer started; sleep N waits N seconds");
+    crate::println!("cpufreq  (alias temp) temperature, speed and power now; same as plain `power`");
     crate::println!("power    [N]  how much of the time the CPU slept in hlt (N: sample N s at the prompt)");
     crate::println!("power hwp [performance|balanced|power]  CPU frequency scaling (Intel HWP)");
     crate::println!("Remote: term net, and tools/term_net.py, devloop.py, foscopy.py from a PC.");

@@ -68,6 +68,7 @@ static COMMANDS: &[Command] = &[
             crate::println!("{} at {:#x}, {} bytes", core::str::from_utf8(&signature).unwrap_or("????"), address, length)
         })
     }),
+    Command::new("cpufreq", "cpufreq [MHZ|min|max]", "the ARM clock, SoC temperature and throttle flags; sets the clock.", |_, rest| crate::pipower::command(rest)).alias(&["temp"]),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
     Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),
     Command::new("poke", "poke ADDR VALUE", "writes memory (hex; bring-up).", |_, rest| poke(rest)),
@@ -242,6 +243,9 @@ pub fn apply_settings() -> bool {
         let mut words = line.split_whitespace();
         let first = words.next();
         no_msi |= first == Some("no-msi");
+        if first == Some("pi-clock") {
+            crate::pipower::apply_setting(line);
+        }
         if matches!(first, Some("gpio-remote" | "gpio-sim" | "gpio-deny")) {
             crate::gpio::apply_setting(line);
         }
