@@ -17,6 +17,11 @@ pub struct Target {
     pub hub_port: u8,
 }
 
+#[derive(Debug)]
+pub enum Error {
+    Timeout,
+}
+
 pub struct Controller;
 
 pub fn controller(_index: usize) -> Option<&'static mut Controller> {
@@ -26,6 +31,16 @@ pub fn controller(_index: usize) -> Option<&'static mut Controller> {
 impl Controller {
     pub fn control_transfer(&mut self, _target: &Target, _request_type: u8, _request: u8, _value: u16, _index: u16, _data: &mut [u8]) -> Result<usize, ()> {
         Err(())
+    }
+    pub fn get_descriptor(&mut self, _target: &Target, _kind: u8, _index: u8, _buffer: &mut [u8]) -> Result<usize, Error> {
+        Err(Error::Timeout)
+    }
+    pub fn bulk_transfer(&mut self, _target: &Target, _endpoint: u8, _max_packet: u16, _buffer: u32, _length: usize, _data_in: bool, _toggle: &mut bool) -> Result<usize, Error> {
+        Err(Error::Timeout)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_transfer_within(&mut self, _ticks: u64, _target: &Target, _endpoint: u8, _max_packet: u16, _buffer: u32, _length: usize, _data_in: bool, _toggle: &mut bool) -> Result<usize, Error> {
+        Err(Error::Timeout)
     }
     pub fn frame_now(&self) -> usize {
         0

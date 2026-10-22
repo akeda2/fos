@@ -56,15 +56,6 @@ stubs! {
     api_peer_info(usize, *mut PeerInfo) -> usize = 0;
     api_hostname(usize, *mut u8, usize) -> usize = 0;
     api_disk_format_exfat(usize, *const u8, usize) -> i32 = -1;
-    api_serial_count() -> usize = 0;
-    api_serial_info(usize, *mut SerialInfo) -> u32 = 0;
-    api_serial_open(usize, u32, u32) -> i32 = -1;
-    api_serial_close(usize) = ();
-    api_serial_read(usize, *mut u8, usize) -> usize = 0;
-    api_serial_write(usize, *const u8, usize) -> usize = 0;
-    api_serial_lines(usize) -> u32 = 0;
-    api_serial_set_lines(usize, u32) = ();
-    api_serial_break(usize, u32) = ();
 }
 
 fn region(slot: usize) -> Option<u64> {
@@ -537,6 +528,45 @@ extern "C" fn api_fs_list(volume: *const u8, volume_length: usize, index: usize,
     crate::tape_fs::list(unsafe { core::slice::from_raw_parts(volume, volume_length) }, index, unsafe { &mut *out })
 }
 
+/// Serial ports a tape may use: the USB serial adapters, numbered from 1 (this port has no 16550 UARTs; the PL011 is the console).
+extern "C" fn api_serial_count() -> usize {
+    crate::usb_serial::count()
+}
+extern "C" fn api_serial_info(number: usize, out: *mut SerialInfo) -> u32 {
+    let mut info = SerialInfo::default();
+    let found = number.checked_sub(1).is_some_and(|index| crate::usb_serial::info(index, &mut info));
+    if found && !out.is_null() {
+        unsafe { out.write(info) };
+    }
+    u32::from(found)
+}
+extern "C" fn api_serial_open(number: usize, baud: u32, format: u32) -> i32 {
+    number.checked_sub(1).map_or(SERIAL_NO_PORT, |index| crate::usb_serial::open(index, baud, format))
+}
+extern "C" fn api_serial_close(number: usize) {
+    if let Some(index) = number.checked_sub(1) {
+        crate::usb_serial::close(index);
+    }
+}
+extern "C" fn api_serial_read(number: usize, buffer: *mut u8, capacity: usize) -> usize {
+    number.checked_sub(1).map_or(0, |index| crate::usb_serial::read(index, unsafe { core::slice::from_raw_parts_mut(buffer, capacity) }))
+}
+extern "C" fn api_serial_write(number: usize, data: *const u8, length: usize) -> usize {
+    number.checked_sub(1).map_or(0, |index| crate::usb_serial::write(index, unsafe { core::slice::from_raw_parts(data, length) }))
+}
+extern "C" fn api_serial_lines(number: usize) -> u32 {
+    number.checked_sub(1).map_or(0, crate::usb_serial::lines)
+}
+extern "C" fn api_serial_set_lines(number: usize, lines: u32) {
+    if let Some(index) = number.checked_sub(1) {
+        crate::usb_serial::set_lines(index, lines);
+    }
+}
+extern "C" fn api_serial_break(number: usize, on: u32) {
+    if let Some(index) = number.checked_sub(1) {
+        crate::usb_serial::set_break(index, on != 0);
+    }
+}
 extern "C" fn api_audio_info(out: *mut AudioInfo) -> u32 {
     u32::from(crate::audio::fill_info(unsafe { &mut *out }))
 }

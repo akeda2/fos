@@ -109,6 +109,7 @@ pub fn probe_all() -> usize {
                 if controller.port_status(port) & 1 != 0 && !controller.port_connect_changed(port) {
                     continue;
                 }
+                crate::usb_serial::xhci_departed(index, port);
                 crate::usb_storage::mark_xhci_port_stale(index, port);
                 crate::usb_hub::forget_hubs_on_port(index, port);
                 release_port(controller, port, None);
@@ -212,6 +213,18 @@ pub fn probe_device(controller_index: usize, controller: &mut Controller, mut de
             controller.release_slot(device.slot);
             return Ok(false);
         }
+        // A USB serial adapter (PL2303, TI): bulk endpoints carry raw bytes, the `serial_*` tape calls reach them.
+        match crate::usb_serial::attach_xhci(controller_index, controller, device, vendor, product, descriptor[17]) {
+            crate::usb_serial::Outcome::Attached => {
+                crate::println!("USB serial {vendor:04x}:{product:04x} on port {port} ({}): ready (see `usb`).", xhci::speed_name(device.speed));
+                return Ok(true);
+            }
+            crate::usb_serial::Outcome::Reprobe | crate::usb_serial::Outcome::Retry => {
+                controller.release_slot(device.slot); // enumerated afresh on the next pass
+                return Ok(false);
+            }
+            crate::usb_serial::Outcome::Unclaimed => {}
+        }
         crate::usb_pointer::describe(controller, &device, &configuration[..total], vendor, product);
         crate::println!("USB: port {port}: {vendor:04x}:{product:04x} (class {:#04x}, {}): not a keyboard or disk, ignored for now.", descriptor[4], xhci::speed_name(device.speed));
         controller.release_slot(device.slot);
@@ -263,7 +276,7 @@ fn find_boot_keyboard(descriptors: &[u8]) -> Option<(u8, u8, u16, u8)> {
 
 /// Handles an event nobody was waiting for: a keyboard's report completing (called by xhci.rs's wait loops and `poll`).
 pub fn background_event(controller: &mut Controller, event: &Trb) {
-    if !event.is_transfer() {
+    if !event.is_transfer() || crate::usb_serial::background_event(controller, event) {
         return;
     }
     let keyboards = unsafe { &mut *core::ptr::addr_of_mut!(KEYBOARDS) };

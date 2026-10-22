@@ -87,7 +87,9 @@ mod imp {
 
     pub fn after_rescan() {}
 
-    pub fn describe_more() {}
+    pub fn describe_more() {
+        crate::usb_serial::describe();
+    }
 
     pub fn keyboards() -> Keyboards {
         Keyboards { count: crate::usb_kbd::keyboard_count(), reports: crate::usb_kbd::reports_seen() }
