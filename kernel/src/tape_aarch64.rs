@@ -41,7 +41,6 @@ macro_rules! stubs {
 
 stubs! {
     api_nic_max_frame_len() -> usize = 1514;
-    api_nic_active() -> u32 = 0;
     api_nic_ts_enable(usize) -> u32 = 0;
     api_nic_ts_clock(usize) -> u64 = 0;
     api_nic_ts_rx(usize) -> u64 = 0;
@@ -53,7 +52,6 @@ stubs! {
     api_nic_vlan_filter(usize, u32, u32) -> u32 = 0;
     api_nic_tx_offload(usize, u32) -> u32 = 0;
     api_nic_counters(usize, *mut u64, usize) -> usize = 0;
-    api_hostname(usize, *mut u8, usize) -> usize = 0;
     api_disk_format_exfat(usize, *const u8, usize) -> i32 = -1;
 }
 
@@ -288,6 +286,19 @@ extern "C" fn api_peer_info(number: usize, out: *mut PeerInfo) -> usize {
         unsafe { out.write(info) };
     }
     count
+}
+extern "C" fn api_hostname(index: usize, out: *mut u8, capacity: usize) -> usize {
+    let mut name = [0u8; 20];
+    let length = crate::netfs::hostname(index, &mut name);
+    if length > capacity {
+        return 0;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, length) };
+    length
+}
+/// The Pi has one interface (genet), so `nic use` has nothing to steer; a service pinned to a NIC still reports it.
+extern "C" fn api_nic_active() -> u32 {
+    crate::tasks::current_nic().unwrap_or(0) as u32
 }
 extern "C" fn api_gfx_info() -> u64 {
     crate::framebuffer::gfx_info().map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height))
