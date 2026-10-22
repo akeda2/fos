@@ -53,7 +53,6 @@ stubs! {
     api_nic_vlan_filter(usize, u32, u32) -> u32 = 0;
     api_nic_tx_offload(usize, u32) -> u32 = 0;
     api_nic_counters(usize, *mut u64, usize) -> usize = 0;
-    api_peer_info(usize, *mut PeerInfo) -> usize = 0;
     api_hostname(usize, *mut u8, usize) -> usize = 0;
     api_disk_format_exfat(usize, *const u8, usize) -> i32 = -1;
 }
@@ -282,6 +281,14 @@ extern "C" fn api_putc(byte: u32) {
 
 // Screen 0 is the boot framebuffer. The calls take no screen index yet: a second screen will arrive as an append-only
 // ABI version (docs/aarch64-plan.md), and these stay the calls for screen 0.
+extern "C" fn api_peer_info(number: usize, out: *mut PeerInfo) -> usize {
+    let mut info = PeerInfo::default();
+    let count = crate::netfs::peer_info(number, &mut info);
+    if number >= 1 && number <= count && !out.is_null() {
+        unsafe { out.write(info) };
+    }
+    count
+}
 extern "C" fn api_gfx_info() -> u64 {
     crate::framebuffer::gfx_info().map_or(0, |(width, height)| u64::from(width) << 32 | u64::from(height))
 }
