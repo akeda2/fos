@@ -25,6 +25,7 @@ mod fosfs;
 mod font_data;
 mod gpt;
 mod hda;
+mod i2s_none;
 mod framebuffer;
 mod install;
 mod keyboard;

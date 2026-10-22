@@ -316,3 +316,17 @@ FAT32 EFI System Partition on both kernels (`fatvol::mount_esp`, the same lookup
 Verified: `make test-aarch64-boot`, `make test-fat-shell`; on the Pi `ls esp` lists the firmware files and `cat esp/config.txt`
 shows `config.txt` (CRLF line ends print as dots). A bad edit of `config.txt` or the firmware files can stop the Pi booting; keep
 the SD card's image to hand.
+
+## I2S audio on the Pi: the Maltex HAT (2026-10-22, verified on the Pi)
+
+`kernel/src/i2s_pi.rs` drives the BCM2711 PCM block as I2S *slave* (the HAT is master: 48 kHz, 2 ch, 24-bit left-justified in
+32-bit slots) with legacy DMA channel 5 (RX) and 4 (TX) over 64 KiB rings in the non-cacheable pool; header comment has the
+register and polarity facts (this card needs the frame clock inverted). It is the audio facade's third backend
+(`Backend::I2s`, `AUDIO_KIND_I2S`), so `audio`, `audio capture|tone|duplex`, `play`, `record`, `gonio` and `audio-net` see it
+like USB audio. Nothing probes the HAT: switch it on with `i2s audio on` or `i2s-audio` in `settings`; USB audio still wins the
+automatic choice. `audio use capture 1|2` drives GPIO16 (AES3 / analog; the card's jumper 4-5). `i2s probe` and `i2s capture`
+are diagnostics. Verified on the Pi: capture 48000 frames/s with no drops, analog noise floor about -84 dBFS, playback and
+duplex run at 48000 frames/s with no underruns. Only hardware with a signal shows: channel order and level of real audio, AES3
+(GPIO13 is the lock indicator, not read yet), and that playback is *heard* (jumper 8-9 hardwires the card's output to its
+input; remove it or use 7-8 so GPIO26 chooses). The position is polled (no interrupts), so a reader or writer must call in at
+least every 170 ms. Open: IRQ-driven position, GPIO13 lock status in `audio`, `audio-net` on the Pi with the HAT.

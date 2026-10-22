@@ -109,7 +109,9 @@ pub struct AudioDeviceName(pub AudioDevice);
 impl core::fmt::Display for AudioDeviceName {
     fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let device = &self.0;
-        if device.kind == AUDIO_KIND_HDA {
+        if device.kind == AUDIO_KIND_I2S {
+            write!(out, "I2S audio HAT")
+        } else if device.kind == AUDIO_KIND_HDA {
             let location = device.pci_location;
             write!(out, "HD Audio {:02x}:{:02x}.{} ({:04x}:{:04x})", (location >> 16) & 0xff, (location >> 8) & 0xff, location & 7, device.vendor, device.id)
         } else {

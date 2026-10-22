@@ -69,7 +69,7 @@ static COMMANDS: &[Command] = &[
         })
     }),
     Command::new("cpufreq", "cpufreq [MHZ|min|max]", "the ARM clock, SoC temperature and throttle flags; sets the clock.", |_, rest| crate::pipower::command(rest)).alias(&["temp"]),
-    Command::new("i2s", "i2s probe|capture [SECONDS] [clki=0|1] [fsi=0|1]", "the Maltex I2S audio HAT: edge counts on its clock pins; receive and show levels.", |_, rest| crate::i2s_pi::command(rest)),
+    Command::new("i2s", "i2s probe|capture [SECONDS]|audio on|off", "the Maltex I2S audio HAT: clock edge counts, a level meter, or offer it as an audio device.", |_, rest| crate::i2s_pi::command(rest)),
     Command::new("recv", "recv ...", "receives a file over the serial port.", |_, rest| recv_serial(rest)),
     Command::new("peek", "peek ADDR [N]", "reads memory (hex; bring-up).", |_, rest| peek(rest)),
     Command::new("poke", "poke ADDR VALUE", "writes memory (hex; bring-up).", |_, rest| poke(rest)),
@@ -244,6 +244,9 @@ pub fn apply_settings() -> bool {
         let mut words = line.split_whitespace();
         let first = words.next();
         no_msi |= first == Some("no-msi");
+        if first == Some("i2s-audio") {
+            crate::i2s_pi::apply_setting(line);
+        }
         if first == Some("pi-clock") {
             crate::pipower::apply_setting(line);
         }
