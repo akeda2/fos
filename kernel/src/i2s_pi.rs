@@ -53,6 +53,8 @@ const PRIME: u64 = 4096;
 const INPUT_SELECT: usize = 16;
 const PINS: [usize; 3] = [18, 19, 20];
 const PIN_OUT: usize = 21;
+/// The card's AES3 sync indicator (high = locked), an input to the Pi.
+const SYNC_PIN: usize = 13;
 
 static mut RING: u64 = 0;
 static mut RUN: Run = Run {
@@ -455,11 +457,16 @@ pub fn status() {
         state.tx_consumed,
         state.tx_underruns
     );
-    crate::println!("  frame clock (GPIO19) is {}, input {}", if gpio::levels() >> 19 & 1 != 0 { "high" } else { "low" }, match state.input {
-        1 => "AES3",
-        2 => "analog",
-        _ => "as the card is set",
-    });
+    let levels = gpio::levels();
+    crate::println!(
+        "  input {}; AES3 lock (GPIO13, card jumper 1-2): {}",
+        match state.input {
+            1 => "AES3",
+            2 => "analog",
+            _ => "as the card is set",
+        },
+        if levels >> SYNC_PIN & 1 != 0 { "locked" } else { "no lock" }
+    );
 }
 
 pub fn fill_info(info: &mut AudioInfo) -> bool {
