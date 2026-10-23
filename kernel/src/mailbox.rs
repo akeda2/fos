@@ -168,15 +168,14 @@ pub fn dsi_framebuffer(current: &fosfor_abi::Framebuffer) -> Option<fosfor_abi::
     tag(GET_NUM_DISPLAYS, &[], &mut count)?;
     let mut id = [0u32];
     tag(GET_DISPLAY_ID, &[0], &mut id)?;
-    crate::println!("DSI fit: {} display(s), display 0 id {}, UEFI {}x{}.", count[0], id[0], current.width, current.height);
     if count[0] < 2 || id[0] != 0 || (current.width, current.height) != (800, 600) {
         return None;
     }
     let Some((base, size, pitch, width, height)) = framebuffer(0, 800, 480) else {
-        crate::println!("DSI fit: the firmware gave no 800x480 framebuffer.");
+        crate::println!("DSI panel: the firmware gave no 800x480 framebuffer; keeping the UEFI one.");
         return None;
     };
-    crate::println!("DSI fit: {width}x{height} at {base:#x}.");
+    crate::println!("DSI panel: {width}x{height} framebuffer at {base:#x} (the UEFI one was {}x{}).", current.width, current.height);
     crate::paging::map_framebuffer(base, size);
     Some(fosfor_abi::Framebuffer { base, size, width, height, stride: pitch / 4, format: fosfor_abi::PIXEL_BGR })
 }

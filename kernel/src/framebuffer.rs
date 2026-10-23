@@ -392,6 +392,7 @@ pub fn init(framebuffer: &Framebuffer) -> bool {
     unsafe {
         (*core::ptr::addr_of_mut!(CELLS)).fill(b' ');
         (*core::ptr::addr_of_mut!(PAINTED)).fill(b' ');
+        CARET_AT = usize::MAX; // a console started again (the Pi's DSI one) must not erase the old caret on the new screen
         *core::ptr::addr_of_mut!(CONSOLE) = Some(console);
     }
     true
