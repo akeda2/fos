@@ -222,6 +222,12 @@ pub extern "C" fn kmain(info: *const BootInfo) -> ! {
         crash::init();
         genet::init();
         if gic::bases().0 == PI4_GIC_DISTRIBUTOR {
+            // The mailbox needs the timer, so the DSI's own framebuffer replaces the UEFI one only now.
+            if let Some(dsi) = mailbox::dsi_framebuffer(&info.framebuffer) {
+                if framebuffer::init(&dsi) {
+                    replay_early_log();
+                }
+            }
             mailbox::second_screen();
         }
     }

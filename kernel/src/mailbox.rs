@@ -28,6 +28,8 @@ pub const GET_PHYSICAL_SIZE: u32 = 0x0004_0003;
 pub const GET_VIRTUAL_SIZE: u32 = 0x0004_0004;
 pub const GET_DEPTH: u32 = 0x0004_0005;
 pub const GET_PITCH: u32 = 0x0004_0008;
+/// Property tag 0x00030020 (Linux `RPI_FIRMWARE_GET_EDID_BLOCK`): request the block number; the answer is block, status, 128 bytes.
+pub const GET_EDID_BLOCK: u32 = 0x0003_0020;
 
 fn read(offset: u64) -> u32 {
     unsafe { ((BASE + offset) as *const u32).read_volatile() }
@@ -84,13 +86,19 @@ pub fn framebuffer(display: u32, width: u32, height: u32) -> Option<(u64, u64, u
 }
 
 /// If the firmware drives a second display (Pi 4 with `max_framebuffers=2`), gives it a framebuffer the size of the console's
-/// and registers it as tape screen 1. Display 0 is selected again afterwards. Silent when there is no second display.
+/// and registers it as tape screen 1 (at the monitor's EDID size when known). Display 0 is selected again afterwards. Silent when there is no second display.
 pub fn second_screen() {
     let Some((width, height)) = crate::framebuffer::gfx_info() else { return };
     let mut count = [0u32];
     if tag(GET_NUM_DISPLAYS, &[], &mut count).is_none() || count[0] < 2 {
         return;
     }
+    // The monitor's own size when its EDID is readable (capped at 1080p), else the console's.
+    let _ = tag(SET_DISPLAY_NUM, &[1], &mut [0u32]);
+    let (width, height) = match edid_native_size() {
+        Some((w, h)) if (320..=1920).contains(&w) && (200..=1080).contains(&h) => (w, h),
+        _ => (width, height),
+    };
     let screen = framebuffer(1, width, height);
     let _ = tag(SET_DISPLAY_NUM, &[0], &mut [0u32]);
     let Some((base, size, pitch, got_width, got_height)) = screen else {
@@ -130,4 +138,45 @@ pub fn tag(id: u32, request: &[u32], reply: &mut [u32]) -> Option<()> {
     }
     memory::free(page, 1);
     answered.then_some(())
+}
+
+/// The native (first detailed timing) size from the selected display's EDID block 0, or `None` when the firmware has no EDID
+/// (no monitor, the DSI panel) or the block is not valid. Pixel-clock 0 in the descriptor means it is not a timing.
+pub fn edid_native_size() -> Option<(u32, u32)> {
+    let mut reply = [0u32; 34];
+    tag(GET_EDID_BLOCK, &[0], &mut reply)?;
+    if reply[1] != 0 {
+        return None;
+    }
+    let mut block = [0u8; 128];
+    for (index, byte) in block.iter_mut().enumerate() {
+        *byte = (reply[2 + index / 4] >> (8 * (index % 4))) as u8;
+    }
+    if block[..8] != [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0] || block[54] | block[55] == 0 {
+        return None;
+    }
+    let width = u32::from(block[56]) | (u32::from(block[58]) & 0xf0) << 4;
+    let height = u32::from(block[59]) | (u32::from(block[61]) & 0xf0) << 4;
+    Some((width, height))
+}
+
+/// The DSI panel is 800x480 (16:9) but the UEFI framebuffer on it is 800x600, so the picture does not fill it. When the
+/// firmware drives two displays and display 0 is the main LCD (id 0, the DSI connector), asks it for its own 800x480
+/// framebuffer; the console and tape screen 0 then use that. `None` (keep the UEFI one) in every other case.
+pub fn dsi_framebuffer(current: &fosfor_abi::Framebuffer) -> Option<fosfor_abi::Framebuffer> {
+    let mut count = [0u32];
+    tag(GET_NUM_DISPLAYS, &[], &mut count)?;
+    let mut id = [0u32];
+    tag(GET_DISPLAY_ID, &[0], &mut id)?;
+    crate::println!("DSI fit: {} display(s), display 0 id {}, UEFI {}x{}.", count[0], id[0], current.width, current.height);
+    if count[0] < 2 || id[0] != 0 || (current.width, current.height) != (800, 600) {
+        return None;
+    }
+    let Some((base, size, pitch, width, height)) = framebuffer(0, 800, 480) else {
+        crate::println!("DSI fit: the firmware gave no 800x480 framebuffer.");
+        return None;
+    };
+    crate::println!("DSI fit: {width}x{height} at {base:#x}.");
+    crate::paging::map_framebuffer(base, size);
+    Some(fosfor_abi::Framebuffer { base, size, width, height, stride: pitch / 4, format: fosfor_abi::PIXEL_BGR })
 }

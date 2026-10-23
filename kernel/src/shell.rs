@@ -450,6 +450,10 @@ fn display(rest: &str) {
             && tag(GET_PITCH, &[], &mut pitch).is_some();
         if ok {
             println!("  {index}: {}x{} (buffer {}x{}), {} bpp, pitch {}", physical[0], physical[1], virtual_size[0], virtual_size[1], depth[0], pitch[0]);
+            match edid_native_size() {
+                Some((width, height)) => println!("  {index}: monitor's native size (EDID) {width}x{height}"),
+                None => println!("  {index}: no EDID from the firmware"),
+            }
         } else {
             println!("  {index}: selected, but the size tags got no answer");
         }

@@ -428,3 +428,9 @@ the DSI screen, an x86 USB touch screen.
 Rotation (2026-10-23): a single tape takes `rotate=r|l|flip` (`run kaffe screen=0 rotate=l`; `f` and `180` also mean flip),
 and touch follows the rotation of the screen it belongs to (`usb_pointer::upright`; the shell `touch monitor` stays raw).
 Checked on the Pi's DSI screen with `kaffe`; an x86 run and a USB panel on a rotated HDMI screen are untested.
+
+Screen sizes (2026-10-23): the firmware lists two displays only (DSI = display 0, HDMI0 = display 1; HDMI1 is not offered, and
+display numbers above 1 alias display 0). `display` also prints the EDID native size (the firmware answers with the HDMI
+monitor's EDID for either display, so it means nothing for the DSI). Screen 1 is requested at the monitor's EDID size (capped
+at 1920x1080), and the DSI console is re-created on an 800x480 firmware framebuffer (`mailbox::dsi_framebuffer`, after the timer
+starts) because the UEFI one is 800x600 on a 16:9 panel. Checked on the Pi with a 1366x768 HDMI monitor and the DSI panel.
