@@ -64,6 +64,11 @@ pub fn hostname(index: usize, out: &mut [u8; 20]) -> usize {
 }
 
 
+/// True when `settings` closed the network terminal (`deny-term-net`).
+pub(crate) fn term_denied() -> bool {
+    imp::term_denied()
+}
+
 pub(crate) fn netfs_enabled() -> bool {
     imp::served()
 }
@@ -797,6 +802,10 @@ mod imp {
         !term::tape_mode() && !crate::config::deny_term_net()
     }
 
+    pub fn term_denied() -> bool {
+        crate::config::deny_term_net()
+    }
+
     pub fn kup_busy() -> bool {
         term::kup_transfer_alive()
     }
@@ -852,14 +861,18 @@ mod imp {
                 visit(0, &buffer[..length]);
             }
         }
+        crate::termsession::flush();
     }
 
-    pub fn blocking(_on: bool) {}
+    /// A monitor that runs until Escape: the network terminal's keys then only count as Escape.
+    pub fn blocking(on: bool) {
+        crate::netservice::set_busy(on);
+    }
 
-    /// Escape on the serial line or the USB keyboard.
+    /// Escape on the serial line or the USB keyboard, or from the network terminal's client.
     pub fn break_requested() -> bool {
         crate::usb_kbd::poll();
-        let mut escape = false;
+        let mut escape = crate::netservice::take_break();
         while let Some(key) = crate::arch::aarch64::pl011::read_byte().or_else(crate::usb_kbd::pop) {
             escape |= key == 0x1b;
         }
@@ -882,7 +895,11 @@ mod imp {
     }
 
     pub fn served() -> bool {
-        true
+        !crate::netservice::denied()
+    }
+
+    pub fn term_denied() -> bool {
+        crate::netservice::denied()
     }
 
     pub fn kup_busy() -> bool {

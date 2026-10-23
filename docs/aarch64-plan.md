@@ -434,3 +434,18 @@ display numbers above 1 alias display 0). `display` also prints the EDID native 
 monitor's EDID for either display, so it means nothing for the DSI). Screen 1 is requested at the monitor's EDID size (capped
 at 1920x1080), and the DSI console is re-created on an 800x480 firmware framebuffer (`mailbox::dsi_framebuffer`, after the timer
 starts) because the UEFI one is 800x600 on a 16:9 panel. Checked on the Pi with a 1366x768 HDMI monitor and the DSI panel.
+
+## Network terminal and `deny-term-net` on the Pi (2026-10-23, verified on the Pi)
+
+`term net` now works on the Pi (`tools/term_net.py`, `devloop.py --mac N run ...`). The session protocol (HELLO/DATA/BYE, peer and
+five-minute stale takeover, relay ring, DATA framing) is one module for both kernels, `kernel/src/termsession.rs`; each kernel
+decides what a frame *does*. On the Pi (`netservice::session_frame`): at the prompt the client's keys feed the shell's line editor
+(`shell::feed_byte`), while a command runs an Escape ends it (`netfs::break_requested`), and while a tape runs the keys are the
+tape's input and a lone Escape stops it (`tape_aarch64::remote_keys`; `nic_receive` filters session frames so tapes never see
+them). Console output (`print`) is relayed and flushed from the shell loop, the tape input pump and `netfs::drain`.
+
+`deny-term-net` in `settings` makes the Pi answer nothing at all: no announcements or discovery replies, no terminal, no NETFS
+(`foscopy`) and no KUP. This is wider than on x86 (terminal and NETFS only), on purpose: a Pi deployed where it must stay silent.
+Serial console and USB keyboard still work; recover by editing `settings` there. Checked: a Pi with the line is not found by
+`peers.py --discover` and still answers on serial. The x86 kernel was refactored onto the same module (`make test-hostnames`,
+`make test-telnet` pass; the other term-net tests are for `make test-all` on landsbro).

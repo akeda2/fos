@@ -11,13 +11,10 @@
 //! session is open; it is flushed to the wire in 1 KiB DATA frames.
 
 use crate::nic::Nic;
+use crate::termsession::Frame;
 use crate::{pci, power, timer};
 
 pub(crate) use crate::netfs::*;
-const TAG_HELLO: u8 = 0x20;
-const TAG_DATA: u8 = 0x21;
-const TAG_BYE: u8 = 0x22;
-const DATA_CAPACITY: usize = 1024;
 const TAG_KUP_REQUEST: u8 = 0x3a;
 const TAG_KUP_DATA: u8 = 0x3b;
 const TAG_KUP_STOP: u8 = 0x3c;
@@ -30,13 +27,6 @@ const KUP_BUSY: u8 = 4;
 pub const MAX_NICS: usize = 8;
 static mut NICS: [Option<Nic>; MAX_NICS] = [const { None }; MAX_NICS];
 static mut NIC_COUNT: usize = 0;
-/// The interface the open session's HELLO arrived on: console output goes out of it.
-static mut SESSION_NIC: usize = 0;
-/// Tick of the last frame from the session's peer (for the stale-session takeover rule).
-static mut PEER_ACTIVITY: u64 = 0;
-static mut PEER: Option<[u8; 6]> = None;
-static mut RELAY: [u8; 16384] = [0; 16384];
-static mut RELAY_LENGTH: usize = 0;
 static mut RUNTIME_SERVICES: u64 = 0;
 
 
@@ -69,11 +59,6 @@ pub fn nic_at(index: usize) -> Option<&'static mut Nic> {
     unsafe { (*core::ptr::addr_of_mut!(NICS)).get_mut(index)?.as_mut() }
 }
 
-/// The session's interface.
-fn nic() -> Option<&'static mut Nic> {
-    nic_at(unsafe { SESSION_NIC })
-}
-
 /// Set while a shell command that runs until Escape is in charge of the input.
 static mut BLOCKING: bool = false;
 static mut BREAK: bool = false;
@@ -100,7 +85,7 @@ static mut ACTIVE_NIC: usize = 0;
 
 /// The interface the remote terminal session runs over, while one is open.
 pub(crate) fn session_nic() -> Option<usize> {
-    if session_open() { Some(unsafe { SESSION_NIC }) } else { None }
+    crate::termsession::session_nic()
 }
 
 /// Frames queued for tapes and frames dropped (all interfaces).
@@ -109,45 +94,17 @@ pub(crate) fn frame_queue_counts() -> (u32, u32) {
 }
 
 fn session_open() -> bool {
-    unsafe { (*core::ptr::addr_of!(PEER)).is_some() }
+    crate::termsession::session_open()
 }
 
 /// Called by `print` for every piece of console text; queues it for the client.
 pub fn relay(text: &str) {
-    if !session_open() {
-        return;
-    }
-    for &byte in text.as_bytes() {
-        unsafe {
-            let ring = &mut *core::ptr::addr_of_mut!(RELAY);
-            if RELAY_LENGTH == ring.len() {
-                flush();
-            }
-            if RELAY_LENGTH < ring.len() {
-                ring[RELAY_LENGTH] = byte;
-                RELAY_LENGTH += 1;
-            }
-        }
-    }
-    if unsafe { RELAY_LENGTH } >= DATA_CAPACITY {
-        flush();
-    }
+    crate::termsession::relay(text);
 }
 
-/// Sends everything queued as DATA frames. A frame that cannot be sent is dropped
-/// (a terminal can tolerate a torn screen; a stuck NIC must not stall the shell).
+/// Sends everything queued as DATA frames.
 pub(crate) fn flush() {
-    let (Some(nic), Some(peer)) = (nic(), unsafe { *core::ptr::addr_of!(PEER) }) else { return };
-    unsafe {
-        let ring = &*core::ptr::addr_of!(RELAY);
-        let mut offset = 0;
-        while offset < RELAY_LENGTH {
-            let chunk = (RELAY_LENGTH - offset).min(DATA_CAPACITY);
-            send(nic, &peer, TAG_DATA, &ring[offset..offset + chunk]);
-            offset += chunk;
-        }
-        RELAY_LENGTH = 0;
-    }
+    crate::termsession::flush();
 }
 
 fn send(nic: &mut Nic, destination: &[u8; 6], tag: u8, payload: &[u8]) -> bool {
@@ -198,40 +155,25 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
         return consumed;
     }
     match frame[14] {
-        TAG_KUP_REQUEST if crate::config::debug().kernel_update => kup_request(index, source, &frame[15..]),
-        TAG_KUP_DATA if crate::config::debug().kernel_update => kup_data(source, &frame[15..]),
-        TAG_KUP_STOP if crate::config::debug().kernel_update => kup_stop(index, source),
-        TAG_HELLO if crate::config::deny_term_net() => {} // closed by the settings file: stay silent
-        // A session is open: another client's HELLO does not steal it (as in v1, where only the
-        // waiting state accepts a new peer), unless the owner has been silent for five minutes.
-        TAG_HELLO if session_open()
-            && unsafe { *core::ptr::addr_of!(PEER) } != Some(source)
-            && timer::ticks().wrapping_sub(unsafe { PEER_ACTIVITY }) < 5 * 60 * timer::TICK_HZ => {}
-        TAG_HELLO => {
-            // A new HELLO replaces any earlier session (the old client is gone or
-            // restarting); the screen and serial port show who connected.
-            unsafe {
-                *core::ptr::addr_of_mut!(PEER) = Some(source);
-                SESSION_NIC = index;
-                PEER_ACTIVITY = timer::ticks();
-                RELAY_LENGTH = 0;
-            }
+        TAG_KUP_REQUEST if crate::config::debug().kernel_update => return { kup_request(index, source, &frame[15..]); true },
+        TAG_KUP_DATA if crate::config::debug().kernel_update => return { kup_data(source, &frame[15..]); true },
+        TAG_KUP_STOP if crate::config::debug().kernel_update => return { kup_stop(index, source); true },
+        _ => {}
+    }
+    match crate::termsession::handle(index, source, frame[14], &frame[15..]) {
+        Some(Frame::Ignored) => {}
+        Some(Frame::Hello) => {
+            // A new HELLO replaces any earlier session (the old client is gone or restarting); the screen and serial
+            // port show who connected.
             crate::lineedit::reset();
             crate::println!("Remote terminal connected from {} on interface {}.", Mac(&source), index + 1);
             crate::println!("Type `help` for the commands.");
             prompt();
         }
-        TAG_DATA if session_open() && unsafe { *core::ptr::addr_of!(PEER) } == Some(source) && unsafe { SESSION_NIC } == index => {
-            // The frame has no length field and Ethernet pads a short frame to 60 bytes with zeros, so a single typed key
-            // arrives followed by dozens of NULs. Drop the trailing zeros (as the chat and terminal code always did): a tape
-            // that read them saw "any other key" right behind every key, and audio-net's peer picker closed the moment it
-            // opened. A NUL a person really typed (Ctrl-@) is lost, which nobody misses.
-            let payload = &frame[15..];
-            let payload = &payload[..payload.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1)];
-            unsafe { PEER_ACTIVITY = timer::ticks() };
+        Some(Frame::Data(payload)) => {
             if unsafe { TAPE_MODE } {
                 // A running tape owns the input. A lone Escape byte is "stop".
-                if payload.first() == Some(&0x1b) && payload.iter().rposition(|&b| b != 0) == Some(0) {
+                if payload.first() == Some(&0x1b) && payload.len() == 1 {
                     tape_input_push(TAPE_ABORT);
                 } else {
                     for &byte in payload {
@@ -249,9 +191,7 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
                 }
             }
         }
-        TAG_BYE if unsafe { *core::ptr::addr_of!(PEER) } == Some(source) => {
-            flush();
-            unsafe { *core::ptr::addr_of_mut!(PEER) = None };
+        Some(Frame::Bye) => {
             crate::println!("Remote terminal disconnected.");
             if unsafe { TAPE_MODE } {
                 // Only the client that started the tape takes it down with it; a tape from the start file or the
@@ -267,7 +207,7 @@ fn handle_frame(index: usize, frame: &[u8]) -> bool {
                 prompt();
             }
         }
-        _ => return false,
+        None => return false,
     }
     true
 }
@@ -424,7 +364,7 @@ fn tape_input_push(value: u16) {
 pub fn set_tape_mode(on: bool) {
     unsafe {
         TAPE_MODE = on;
-        *core::ptr::addr_of_mut!(TAPE_OWNER) = if on { *core::ptr::addr_of!(PEER) } else { None };
+        *core::ptr::addr_of_mut!(TAPE_OWNER) = if on { crate::termsession::peer() } else { None };
         TAPE_INPUT_HEAD = 0;
         TAPE_INPUT_TAIL = 0;
     }

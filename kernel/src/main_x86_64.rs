@@ -52,6 +52,7 @@ mod gpio_remote;
 mod gpio_shell;
 mod uart;
 mod term;
+mod termsession;
 mod usb_audio;
 mod usb_hid;
 mod usb_pointer;

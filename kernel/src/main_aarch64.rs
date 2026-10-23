@@ -28,6 +28,7 @@ mod netdump;
 mod netfs;
 mod nicshell;
 mod netservice;
+mod termsession;
 mod memory;
 mod pci;
 mod service_host;
@@ -109,6 +110,7 @@ pub fn print(arguments: core::fmt::Arguments) {
                 }
             }
             framebuffer::write_str(text);
+            termsession::relay(text);
             Ok(())
         }
     }

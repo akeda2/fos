@@ -37,16 +37,9 @@ pub fn run() -> ! {
         crate::crash::pet();
         crate::crash::housekeeping();
         crate::usb_kbd::poll();
+        crate::termsession::flush();
         match crate::arch::aarch64::pl011::read_byte().or_else(crate::usb_kbd::pop) {
-            Some(byte) => {
-                let mut line = [0u8; lineedit::LINE_MAX];
-                if let Some(length) = lineedit::feed(byte, &mut line) {
-                    if let Ok(text) = core::str::from_utf8(&line[..length]) {
-                        execute(text.trim());
-                    }
-                    crate::print(format_args!("fos> "));
-                }
-            }
+            Some(byte) => feed_byte(byte),
             // Background tapes (`run NAME &N`) get a pass; the CPU sleeps only when they are all idle.
             // The 100 Hz timer interrupt wakes this at least every 10 ms.
             None => {
@@ -59,6 +52,19 @@ pub fn run() -> ! {
                 }
             }
         }
+    }
+}
+
+/// One typed byte (console or network terminal) into the line editor; a finished line runs.
+pub(crate) fn feed_byte(byte: u8) {
+    let mut line = [0u8; lineedit::LINE_MAX];
+    if let Some(length) = lineedit::feed(byte, &mut line) {
+        crate::netservice::set_busy(true);
+        if let Ok(text) = core::str::from_utf8(&line[..length]) {
+            execute(text.trim());
+        }
+        crate::netservice::set_busy(false);
+        crate::print(format_args!("fos> "));
     }
 }
 
@@ -306,6 +312,9 @@ pub fn apply_settings() -> bool {
             } else {
                 crate::println!("settings: `{}` ignored (unknown colour, or no pixel console).", line.trim());
             }
+        }
+        if first == Some("deny-term-net") {
+            crate::netservice::set_denied(true);
         }
         if first == Some("keymap") {
             match words.next().and_then(crate::usb_kbd::layout_named) {

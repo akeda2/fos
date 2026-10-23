@@ -224,6 +224,7 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
     let api = make_api(info, arguments);
     cpu::fp_enable();
     crate::crash::set_tape_running(true);
+    unsafe { RUNNING = true };
     unsafe {
         // x21 is callee-saved, so the tape preserves it: it keeps our stack pointer across the call.
         core::arch::asm!(
@@ -239,6 +240,7 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
         );
     }
     crate::crash::set_tape_running(false);
+    unsafe { RUNNING = false };
     crate::framebuffer::gfx_close();
     close_extra_screens();
     crate::gpio::tape_ended();
@@ -343,6 +345,22 @@ static mut SERIAL_ESCAPE_AT: u64 = 0;
 /// How long a serial Escape waits for the `[` of a sequence; a terminal sends the bytes back to back.
 const SERIAL_ESCAPE_US: u64 = 50_000;
 
+/// A foreground tape is running (the network terminal's keys then belong to it).
+static mut RUNNING: bool = false;
+
+pub fn running() -> bool {
+    unsafe { RUNNING }
+}
+
+/// Keys from the network terminal's client: a lone Escape byte stops the tape, as at the keyboard.
+pub fn remote_keys(keys: &[u8]) {
+    if keys == [0x1b] {
+        input_push(TAPE_ABORT);
+    } else {
+        keys.iter().for_each(|&key| input_push(u16::from(key)));
+    }
+}
+
 fn input_push(value: u16) {
     unsafe {
         let next = (INPUT_HEAD + 1) % INPUT_CAPACITY;
@@ -357,6 +375,7 @@ fn input_push(value: u16) {
 /// the bytes a terminal sends (ESC [ A), å ä ö become UTF-8, a lone Escape is "stop" (`TAPE_ABORT`). On the serial console an
 /// ESC followed within 50 ms by `[` or `O` starts a sequence; any other ESC is "stop".
 fn input_pump() {
+    crate::termsession::flush();
     crate::usb_kbd::poll();
     while let Some(key) = crate::usb_kbd::pop() {
         if key == 0x1b {
@@ -547,7 +566,14 @@ extern "C" fn api_nic_receive(index: usize, buffer: *mut u8, capacity: usize) ->
     if index != 0 || (crate::tasks::service_owns(index) && !crate::tasks::in_service()) {
         return 0;
     }
-    crate::genet::receive(unsafe { core::slice::from_raw_parts_mut(buffer, capacity) })
+    let buffer = unsafe { core::slice::from_raw_parts_mut(buffer, capacity) };
+    loop {
+        let length = crate::genet::receive(buffer);
+        // The network terminal's frames are the shell's (the client's keys, Escape), not the tape's.
+        if length == 0 || !crate::netservice::session_frame(&buffer[..length]) {
+            return length;
+        }
+    }
 }
 
 extern "C" fn api_nic_set_promiscuous(index: usize, on: u32) -> u32 {
@@ -853,7 +879,9 @@ pub fn run_many(tapes: &[(u64, &str)]) -> Result<(), &'static str> {
     state.streak = 0;
     state.current = 0;
     state.active = true;
+    unsafe { RUNNING = true };
     unsafe { fos_task_switch(&mut state.main_sp, state.sp[0]) };
+    unsafe { RUNNING = false };
     state.active = false;
     crate::framebuffer::gfx_close();
     close_extra_screens();
