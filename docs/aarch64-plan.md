@@ -381,10 +381,11 @@ switching with one directory-sector write. Verified: show, update + confirm, rea
 
 `kernel/src/i2c.rs`: BSC1 (GPIO2 SDA / GPIO3 SCL, alt0) as a master, shell `i2c [status|speed KHZ|scan|read|write|get]`. The
 divider comes from the firmware's core clock (mailbox id 4, 500 MHz). Waits spin 30 us, then `wfi` with the BSC interrupt (GIC SPI 117)
-armed, as the SD driver does. No repeated START yet (`get` is write, STOP, read). Verified with an empty bus: a scan takes 26/13/3/1 ms
+armed, as the SD driver does. Tape ABI 23 (`i2c_speed`, `i2c_transfer`, `tape_rt::i2c_*`; x86 answers -4) and the tape `i2cscan`
+(verified on the Pi: scan at 100 and 400 kHz, the speed returns to 100 kHz when the tape ends). No repeated START yet (`get` is write, STOP, read). Verified with an empty bus: a scan takes 26/13/3/1 ms
 at 50/100/400/1000 kHz (nine clocks per probe, so the clock and divider are right) and one interrupt per probe. A NACK can raise
 DONE before ERR, and the next transfer needs TA to fall first; both bit at 400 kHz. Not verified: a real device, clock stretching,
-transfers over 16 bytes (FIFO refill), the tape ABI (not added yet).
+transfers over 16 bytes (FIFO refill), a tape against a real device.
 
 Target: the DFRobot ~4.5" DSI panel (chips seen: ICN6211 DSI-to-RGB bridge, GD32V MCU, AEP7510, AJ2004). The ICN6211 is set up over
 I2C (usually 0x2c; Linux `chipone-icn6211.c`), but the Pi's DSI1 controller also needs a driver.

@@ -15,8 +15,8 @@
 //! past its end. New information gets a new call and a new struct (`audio_buffer`/`AudioBuffer` was added for exactly this reason).
 
 /// Version 2 added `puts` (a whole string in one console call). A tape built for 2 checks the table's version before
-/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls.
-pub const TAPE_API_VERSION: u32 = 22;
+/// using it, so it still runs on a kernel that only has version 1. Version 3 added `audio_devices` and `audio_use_device`. Version 4 added `nic_active`. Version 5 added `peer_info`. Version 6 added `wall_clock_set`. Version 7 added the `serial_*` calls. Version 8 added `console_size`. Version 9 added the `nic_ts_*` hardware timestamp calls and `nic_send_stamped`. Version 10 added `nic_ts_adjust` and `nic_ts_step` (steering the card's clock). Version 11 added `nic_ts_all`. Version 12 added `nic_multicast_join`. Version 13 added `nic_vlan_filter`. Version 14 added `nic_tx_offload`. Version 15 added `nic_counters`. Version 16 added `fp_level`. Version 17 added the `gfx_*` calls. Version 18 added `audio_use_output`. Version 19 added `fs_list`. Version 20 added `gfx_screens` and the `gfx_*_on` calls (a screen number). Version 21 added `audio_float`. Version 22 added the `gpio_*` calls. Version 23 added `i2c_speed` and `i2c_transfer`.
+pub const TAPE_API_VERSION: u32 = 23;
 
 /// `read_key` return values: nothing, abort (the operator asked the tape to stop), or
 /// `KEY_BASE + byte` for a typed byte.
@@ -322,6 +322,15 @@ pub struct TapeApi {
     pub gpio_pull: extern "C" fn(u32, u32) -> i32,
     /// `gpio_function(pin)` (version 22): 0 input, 1 output, 2..=7 alt0..alt5; negative without GPIO or for a bad pin.
     pub gpio_function: extern "C" fn(u32) -> i32,
+    /// `i2c_speed(hz)` (version 23): the Raspberry Pi 4 header's I2C bus (BSC1, GPIO2 SDA / GPIO3 SCL, which the kernel switches
+    /// to their I2C function on the first transfer). 0 asks for the current SCL speed in Hz (100000 by default); 10000..=1000000
+    /// sets it and returns 0. Negative: -3 bad argument, -4 no I2C bus (not a Pi). Back to 100 kHz when the tape ends.
+    pub i2c_speed: extern "C" fn(u32) -> i32,
+    /// `i2c_transfer(address, out, out_len, input, in_len)` (version 23): writes `out_len` bytes to the 7-bit device `address`
+    /// (0x08..=0x77) if non-zero, then (after a STOP, no repeated START) reads `in_len` bytes into `input` if non-zero; each
+    /// length at most 65535. 0 on success; -1 no acknowledge, -2 timeout or clock stretched too long or a short transfer,
+    /// -3 bad argument (or no bytes at all), -4 no I2C bus, -5 GPIO2/3 not allowed (`gpio-deny`).
+    pub i2c_transfer: extern "C" fn(u32, *const u8, u32, *mut u8, u32) -> i32,
 }
 
 /// `audio_float` bits: the capture stream / the playback stream carries IEEE 754 single-precision samples.

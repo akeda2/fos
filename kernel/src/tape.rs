@@ -131,6 +131,15 @@ pub fn staged_length() -> usize {
 static mut PUTC_PENDING: [u8; 4] = [0; 4];
 static mut PUTC_PENDING_LENGTH: usize = 0;
 
+/// `i2c_speed` / `i2c_transfer` (ABI 23): this kernel has no I2C bus (the Raspberry Pi 4 has one).
+extern "C" fn api_i2c_speed(_hz: u32) -> i32 {
+    -4
+}
+
+extern "C" fn api_i2c_transfer(_address: u32, _out: *const u8, _out_len: u32, _input: *mut u8, _in_len: u32) -> i32 {
+    -4
+}
+
 extern "C" fn api_putc(byte: u32) {
     let byte = byte as u8;
     let pending = unsafe { &mut *core::ptr::addr_of_mut!(PUTC_PENDING) };
@@ -615,6 +624,8 @@ pub fn build_api(info: &BootInfo, arguments: &str) -> TapeApi {
         gpio_mode: crate::gpio::api_gpio_mode,
         gpio_pull: crate::gpio::api_gpio_pull,
         gpio_function: crate::gpio::api_gpio_function,
+        i2c_speed: api_i2c_speed,
+        i2c_transfer: api_i2c_transfer,
     }
 }
 

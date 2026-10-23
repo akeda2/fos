@@ -715,6 +715,42 @@ pub fn gpio_pull(pin: u32, pull: u32) -> Result<(), i32> {
     }
 }
 
+/// The I2C bus's SCL speed in Hz (Raspberry Pi 4 header); `Err(-4)` where there is none or the kernel is older than version 23.
+pub fn i2c_speed() -> Result<u32, i32> {
+    let t = i2c_table().ok_or(-4)?;
+    let hz = (t.i2c_speed)(0);
+    u32::try_from(hz).map_err(|_| hz)
+}
+
+fn i2c_table() -> Option<&'static TapeApi> {
+    let table = api();
+    let end = core::mem::offset_of!(fosfor_abi::tape::TapeApi, i2c_transfer) + core::mem::size_of::<usize>();
+    (table.version >= 23 && table.size as usize >= end).then_some(table)
+}
+
+/// Sets the SCL speed, 10 kHz to 1 MHz; reset to 100 kHz when the tape ends. `Err` is the kernel's negative code.
+pub fn i2c_set_speed(hz: u32) -> Result<(), i32> {
+    match i2c_table() {
+        Some(t) => match (t.i2c_speed)(hz) {
+            0 => Ok(()),
+            code => Err(code),
+        },
+        None => Err(-4),
+    }
+}
+
+/// Writes `out` to the 7-bit device `address` (if not empty), then reads into `input` (if not empty), with a STOP between.
+/// `Err` is the kernel's negative code: -1 no acknowledge, -2 timeout, -3 bad argument, -4 no bus, -5 pins not allowed.
+pub fn i2c_transfer(address: u8, out: &[u8], input: &mut [u8]) -> Result<(), i32> {
+    match i2c_table() {
+        Some(t) => match (t.i2c_transfer)(u32::from(address), out.as_ptr(), out.len() as u32, input.as_mut_ptr(), input.len() as u32) {
+            0 => Ok(()),
+            code => Err(code),
+        },
+        None => Err(-4),
+    }
+}
+
 /// `gfx_info` for screen number `screen` (0-based). Screen 0 works on kernels from version 17, others need 20. From 20 on,
 /// even screen 0 goes through the numbered calls: `run A | B` splits the console into two screens, 0 and 1.
 pub fn gfx_info_on(screen: u32) -> Option<(u32, u32)> {

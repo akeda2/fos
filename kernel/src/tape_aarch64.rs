@@ -196,6 +196,8 @@ fn make_api(info: &BootInfo, arguments: &str) -> TapeApi {
         gpio_mode: crate::gpio::api_gpio_mode,
         gpio_pull: crate::gpio::api_gpio_pull,
         gpio_function: crate::gpio::api_gpio_function,
+        i2c_speed: crate::i2c::api_i2c_speed,
+        i2c_transfer: crate::i2c::api_i2c_transfer,
     }
 }
 
@@ -238,6 +240,7 @@ pub fn run(entry: u64, arguments: &str) -> Result<(), &'static str> {
     crate::framebuffer::gfx_close();
     close_extra_screens();
     crate::gpio::tape_ended();
+    crate::i2c::tape_ended();
     unsafe { PENDING_LENGTH = 0 };
     memory::free(stack, STACK_BYTES / memory::FRAME);
     Ok(())
@@ -850,6 +853,7 @@ pub fn run_many(tapes: &[(u64, &str)]) -> Result<(), &'static str> {
     crate::framebuffer::gfx_close();
     close_extra_screens();
     crate::gpio::tape_ended();
+    crate::i2c::tape_ended();
     unsafe { PENDING_LENGTH = 0 };
     for stack in &stacks[..tapes.len()] {
         memory::free(*stack, STACK_BYTES / memory::FRAME);

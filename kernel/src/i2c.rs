@@ -278,6 +278,54 @@ pub fn write_read(address: u8, request: &[u8], data: &mut [u8]) -> Result<(), Er
     read_bytes(address, data)
 }
 
+// ---- tape ABI 23 ------------------------------------------------------------------------------------------------------
+
+fn status_code(error: Error) -> i32 {
+    match error {
+        Error::Nack => -1,
+        Error::Timeout | Error::Stretch | Error::Short => -2,
+        Error::BadArgument => -3,
+        Error::NoBus => -4,
+        Error::Pins => -5,
+    }
+}
+
+/// `i2c_speed(hz)`: 0 returns the speed in Hz, anything else sets it (0 done, negative error).
+pub extern "C" fn api_i2c_speed(hz: u32) -> i32 {
+    if !available() {
+        return -4;
+    }
+    if hz == 0 {
+        return speed() as i32;
+    }
+    set_speed(hz).map_or_else(status_code, |()| 0)
+}
+
+/// `i2c_transfer(address, out, out_len, input, in_len)`: an optional write, then an optional read.
+pub extern "C" fn api_i2c_transfer(address: u32, out: *const u8, out_len: u32, input: *mut u8, in_len: u32) -> i32 {
+    if !available() {
+        return -4;
+    }
+    if address > 0x7f || (out_len == 0 && in_len == 0) || out_len > 0xffff || in_len > 0xffff || (out_len > 0 && out.is_null()) || (in_len > 0 && input.is_null()) {
+        return -3;
+    }
+    let result = (|| {
+        if out_len > 0 {
+            write_bytes(address as u8, unsafe { core::slice::from_raw_parts(out, out_len as usize) })?;
+        }
+        if in_len > 0 {
+            read_bytes(address as u8, unsafe { core::slice::from_raw_parts_mut(input, in_len as usize) })?;
+        }
+        Ok(())
+    })();
+    result.map_or_else(status_code, |()| 0)
+}
+
+/// A tape ends: the bus goes back to 100 kHz.
+pub fn tape_ended() {
+    SPEED_HZ.store(100_000, Ordering::Relaxed);
+}
+
 // ---- the shell command ------------------------------------------------------------------------------------------------
 
 const USAGE: &str = "i2c [status|speed KHZ|scan|read ADDR [N]|write ADDR BYTE...|get ADDR REG [N]]  (hex ADDR, REG, BYTE)";
