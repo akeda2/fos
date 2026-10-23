@@ -18,6 +18,14 @@ static mut BOOT_DISK: Option<usize> = None;
 static mut PAYLOAD_START: Option<u64> = None;
 static mut BOOT_SLOT: u32 = 0;
 
+/// Tells the watchdog a long disk operation is still making progress (`debug` on x86, `crash` on the Pi).
+pub fn pet() {
+    #[cfg(target_arch = "x86_64")]
+    crate::debug::pet();
+    #[cfg(target_arch = "aarch64")]
+    crate::crash::pet();
+}
+
 /// The A/B slot the running kernel was loaded from (`install` copies exactly that one).
 pub fn boot_slot() -> u32 {
     unsafe { BOOT_SLOT }

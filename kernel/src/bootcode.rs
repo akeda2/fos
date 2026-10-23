@@ -62,14 +62,6 @@ const MACHINE: u16 = 0x8664;
 #[cfg(target_arch = "aarch64")]
 const MACHINE: u16 = 0xaa64;
 /// The largest loader accepted (the real one is a few hundred KiB).
-#[cfg(target_arch = "x86_64")]
-fn pet() {
-    crate::debug::pet();
-}
-#[cfg(target_arch = "aarch64")]
-fn pet() {
-    crate::crash::pet();
-}
 const LOADER_MAX_BYTES: usize = 2 << 20;
 const LOADER_BANNER: &[u8] = b"Fosfor OS loader";
 
@@ -231,7 +223,7 @@ fn installed_loader(fs: &mut fatvol::Fs, name: &[u8]) -> Result<Option<(u64, u32
         }
         hash = fingerprint_step(hash, &buffer[..count]);
         offset += count as u64;
-        pet();
+        storage::pet();
     }
     Ok(Some((file.size, hash)))
 }
@@ -374,7 +366,7 @@ fn write_bios(disk: usize) {
     if let Err(error) = block::write(disk, BIOS_STAGE2_LBA, stage2) {
         return crate::println!("bootcode: writing stage two failed ({error:?}); the MBR is untouched.");
     }
-    pet();
+    storage::pet();
     let check = unsafe { &mut *core::ptr::addr_of_mut!(STAGE2_NOW) };
     if block::read(disk, BIOS_STAGE2_LBA, check).is_err() || check[..] != stage2[..] {
         return crate::println!("bootcode: stage two read back different; the MBR is untouched. Write the stick again if the disk no longer boots.");
@@ -419,7 +411,7 @@ fn write_loader(disk: usize, address: u64, length: usize) {
         if let Err(error) = fs.write(&stream, offset as u64, chunk, (offset + chunk.len()) as u64) {
             return crate::println!("bootcode: writing the new loader failed ({error:?}); the old one is untouched.");
         }
-        pet();
+        storage::pet();
     }
     if let Err(error) = fs.finish(&stream, name, length as u64) {
         return crate::println!("bootcode: finishing the new loader failed ({error:?}); the old one is untouched.");

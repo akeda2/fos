@@ -107,8 +107,8 @@ pub fn command(mut words: core::str::SplitWhitespace) {
         Some(gpt::Summary::Unknown) => return crate::println!("install: disk{number}'s first sectors hold data that is not a GPT; add `force` to replace it."),
         None => return crate::println!("install: cannot read disk{number}."),
     }
-    crate::println!("It will get the boot disk's ESP ({} MiB) and BIOS boot code, the running kernel (slot {}) and a FOSFS volume of about {} MiB{}.",
-        layout.esp.sectors / 2048, storage::boot_slot(), (info.sectors - needed + MIN_FOSFS_SECTORS) / 2048, if bare { ", empty" } else { " with every file of the boot volume" });
+    crate::println!("It will get the boot disk's ESP ({} MiB){}, the running kernel (slot {}) and a FOSFS volume of about {} MiB{}.",
+        layout.esp.sectors / 2048, if cfg!(target_arch = "aarch64") { " with the Pi firmware" } else { " and BIOS boot code" }, storage::boot_slot(), (info.sectors - needed + MIN_FOSFS_SECTORS) / 2048, if bare { ", empty" } else { " with every file of the boot volume" });
     crate::println!("ALL of disk{number} is replaced.");
     let mut stored = Pending { number, label: [0; fosfs::MAX_NAME], label_length: label.len(), bare };
     stored.label[..label.len()].copy_from_slice(label.as_bytes());
@@ -144,7 +144,7 @@ fn copy_sectors(from: usize, from_lba: u64, to: usize, to_lba: u64, sectors: u64
         let count = (sectors - done).min(CHUNK_SECTORS as u64) as usize;
         block::read(from, from_lba + done, &mut chunk[..count * 512])?;
         block::write(to, to_lba + done, &chunk[..count * 512])?;
-        crate::debug::pet();
+        storage::pet();
         done += count as u64;
     }
     Ok(())
@@ -181,8 +181,10 @@ fn run(boot: usize, disk: usize, number: usize, pending: &Pending) {
     let [esp, payload, data] = made;
     crate::println!("disk{number}: new partition table: ESP {} MiB, payload {} MiB, FOSFS {} MiB (new GUIDs).", esp.sectors / 2048, payload.sectors / 2048, data.sectors / 2048);
 
-    match copy_bios_boot_code(boot, disk) {
+    // A Pi has no BIOS boot code; its firmware files live on the ESP, which is copied below.
+    match if cfg!(target_arch = "aarch64") { Ok(false) } else { copy_bios_boot_code(boot, disk) } {
         Ok(true) => crate::println!("Copied the BIOS boot code (stage one in the MBR, stage two at LBA {BIOS_STAGE2_LBA}): the disk boots on BIOS machines too."),
+        Ok(false) if cfg!(target_arch = "aarch64") => {}
         Ok(false) => crate::println!("The boot disk has no BIOS boot code (a UEFI-only image): disk{number} will boot on UEFI machines only."),
         Err(error) => crate::println!("install: copying the BIOS boot code failed ({error:?}); disk{number} will boot on UEFI machines only."),
     }

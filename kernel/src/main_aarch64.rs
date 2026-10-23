@@ -38,6 +38,7 @@ mod gpio;
 mod gpio_remote;
 mod gpio_shell;
 mod i2c;
+mod install;
 mod shellhost;
 mod storage;
 mod tape_aarch64;

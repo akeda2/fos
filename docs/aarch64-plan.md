@@ -389,3 +389,11 @@ transfers over 16 bytes (FIFO refill), a tape against a real device.
 
 Target: the DFRobot ~4.5" DSI panel (chips seen: ICN6211 DSI-to-RGB bridge, GD32V MCU, AEP7510, AJ2004). The ICN6211 is set up over
 I2C (usually 0x2c; Linux `chipone-icn6211.c`), but the Pi's DSI1 controller also needs a driver.
+
+## install on the Pi (2026-10-23, built, not yet run on a second disk)
+
+`install diskN [LABEL] [bare] [force]` + `install diskN confirm` (`kernel/src/install.rs`, shared with x86) clones the boot disk onto
+another disk: new GPT, the ESP sector for sector (on the Pi it holds the firmware files, `config.txt`, `start4.elf`, `RPI_EFI.fd` and
+`BOOTAA64.EFI`), the running kernel as slot 0 with fresh metadata, and a FOSFS volume with every file. No BIOS code on aarch64.
+Verified: the command is registered, and it refuses the boot disk. Not verified: an actual copy (needs a USB disk or second SD in the
+Pi; USB boot is not enabled in the Pi's EEPROM yet, so a copy on USB can only be checked by reading it back or booting it from SD later).
