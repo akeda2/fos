@@ -339,3 +339,11 @@ has the stubs it needs, and the tape ABI `serial_*` calls number the adapters fr
 (serial list, term net to rack1), `net-chat` (both ways, discovery), `ip-chat` (DHCP, UDP both ways) and `telnet` (DHCP, TCP to a host
 listener) are in `A64_TAPES` and ran on the Pi. Not verified: data through the PL2303 cable. Still stubs: the NIC extras genet lacks
 (PTP stamps, multicast filter, VLAN filter, TX offload, counters). `nettest`, `bridge` and `router` build and start (in `A64_TAPES`): bridge and router refuse to run with one NIC (the Pi has only genet; no USB Ethernet driver), so their forwarding is untested on the Pi. `nettest serve=1` on the Pi answered a master on rack1 (round trip 133 us) and a soak showed 0.9-2.7% loss on frames the Pi sent: a bit-error rate on the wire (loss grew with frame size; a broadcast generator seen by a host sniffer lost single frames), because the MAC's RGMII TX clock delay (`ID_MODE_DIS`) was off while the PHY's is off too. With the MAC delay on, 20000 frames at 100 Mbit/s all arrived. Still to port: `audio-net`.
+
+### `audio-net` (2026-10-23)
+
+`audio-net` runs on the Pi. libopus is cross-built by `make opus-lib-aarch64` (clang, `--target=aarch64-unknown-none-elf`) against
+the tiny freestanding headers in `crates/opus-codec/libc-a64/` (math maps to `__builtin_*`; `acos` and friends are declared only for
+code the linker drops). `duplex` has an aarch64 `duplex_switch` (x19-x30, d8-d15). Verified: `send proto=rtp codec=opus src=tone=440`
+encodes at about 335 us per 20 ms frame (686 us worst) and announces via SAP. Not verified: receiving it elsewhere, I2S input and
+playback with a real signal, `duplex`, hardware timestamps (genet has none).

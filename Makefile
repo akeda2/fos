@@ -144,10 +144,14 @@ OPUS_SOURCES := $(filter-out %/mini_kfft.c,$(wildcard $(OPUS_VENDOR)/celt/*.c)) 
 OPUS_OBJS := $(patsubst $(OPUS_VENDOR)/%.c,$(OUT)/opus-float/%.o,$(OPUS_SOURCES))
 OPUS_LIB := $(OUT)/opus-float/libopus_float.a
 OPUS_CFLAGS := -O2 -ffreestanding -fno-stack-protector -fPIE -fno-asynchronous-unwind-tables -msse2 -mfpmath=sse -fno-math-errno -mno-red-zone -ffunction-sections -fdata-sections -U_FORTIFY_SOURCE -DHAVE_CONFIG_H -Icrates/opus-codec -I$(OPUS_VENDOR)/include -I$(OPUS_VENDOR)/celt -I$(OPUS_VENDOR)/silk -I$(OPUS_VENDOR)/silk/float
+# The same tree for aarch64 (hard float, clang since no aarch64 gcc is needed): build/fosfor-aarch64/opus-float.
+OPUS_A64_OBJS := $(patsubst $(OPUS_VENDOR)/%.c,build/fosfor-aarch64/opus-float/%.o,$(OPUS_SOURCES))
+OPUS_A64_LIB := build/fosfor-aarch64/opus-float/libopus_float.a
+OPUS_A64_CFLAGS := --target=aarch64-unknown-none-elf -isystem crates/opus-codec/libc-a64 -O2 -ffreestanding -fno-stack-protector -fPIE -fno-asynchronous-unwind-tables -fno-math-errno -ffunction-sections -fdata-sections -U_FORTIFY_SOURCE -DHAVE_CONFIG_H -Icrates/opus-codec -I$(OPUS_VENDOR)/include -I$(OPUS_VENDOR)/celt -I$(OPUS_VENDOR)/silk -I$(OPUS_VENDOR)/silk/float
 TAPE_LINK := -C link-arg=-T../tape.ld -C relocation-model=pic -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-znorelro
 
 
-.PHONY: image-pi4 tapes-aarch64 loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot test-aarch64-faults test-aarch64-kup test-kup-serial opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-clock test-kaffe test-split test-usb-audio test-hda test-audio-net test-services test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-gpio test-rtl8139
+.PHONY: opus-lib-aarch64 image-pi4 tapes-aarch64 loader-aarch64 kernel-aarch64 image-aarch64 test-aarch64-boot test-aarch64-faults test-aarch64-kup test-kup-serial opus-lib tape-opus-bench loader kernel image run test test-faults test-keyboard test-usb-boot test-config test-tapes test-nettest test-debug-mode test-msi test-router test-nettapes test-hub test-disks test-stick-guids test-format test-ed test-diag test-fp test-gfx test-ltas test-gonio test-clock test-kaffe test-split test-usb-audio test-hda test-audio-net test-services test-ptp test-ptp-l2 test-ptp-e1000e test-peers test-ptp-both test-ptp-ntp test-audio-ptp test-audio-ptp-raw test-audio-ptp-avtp test-audio-serve test-record test-recorder test-recorder-fat test-fat-shell test-format-exfat test-recorder-format test-grow test-install test-lineedit test-scripts test-nic test-netfs test-tapesync test-gpio test-rtl8139
 
 # The loader: a PE/COFF UEFI application (x86_64-unknown-uefi), built with the same
 # pinned nightly and -Z build-std as everything else here.
@@ -192,11 +196,11 @@ kernel-aarch64:
 	cd kernel && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem
 
 # Tapes for aarch64 (M2 of the plan): the portable ones, built for the built-in hard-float aarch64-unknown-none target.
-A64_TAPES := hello gfxcheck calc ed netcheck clock gonio ptp play record recorder ltas kaffe fterm telnet net-chat ip-chat bridge nettest router
+A64_TAPES := hello gfxcheck calc ed netcheck clock gonio ptp play record recorder ltas kaffe fterm telnet net-chat ip-chat bridge nettest router audio-net
 A64_TAPE_DIR := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release
 A64_TAPE_STAMPED := build/fosfor-aarch64/tapes
 
-tapes-aarch64:
+tapes-aarch64: $(OPUS_A64_LIB)
 	for tape in $(A64_TAPES); do (cd tapes/$$tape && cargo +nightly-2026-09-13 build --release --target aarch64-unknown-none -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem) || exit 1; done
 	mkdir -p $(A64_TAPE_STAMPED)
 	for tape in $(A64_TAPES); do python3 tools/stamp_tape.py $(A64_TAPE_DIR)/$$tape $(A64_TAPE_STAMPED)/$$tape || exit 1; done
@@ -479,6 +483,15 @@ $(OPUS_LIB): $(OPUS_OBJS)
 	ar rcs $@ $(OPUS_OBJS)
 
 opus-lib: $(OPUS_LIB)
+
+build/fosfor-aarch64/opus-float/%.o: $(OPUS_VENDOR)/%.c crates/opus-codec/config.h crates/opus-codec/custom_support.h
+	mkdir -p $(dir $@)
+	clang $(OPUS_A64_CFLAGS) -c $< -o $@
+
+$(OPUS_A64_LIB): $(OPUS_A64_OBJS)
+	ar rcs $@ $(OPUS_A64_OBJS)
+
+opus-lib-aarch64: $(OPUS_A64_LIB)
 
 # The benchmark tape (not part of TAPES: it links the C archive).
 tape-opus-bench: $(OPUS_LIB)

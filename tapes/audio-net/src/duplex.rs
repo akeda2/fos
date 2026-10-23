@@ -16,6 +16,7 @@ use core::arch::global_asm;
 use core::mem::MaybeUninit;
 use tape_rt::{TapeApi, println};
 
+#[cfg(target_arch = "x86_64")]
 global_asm!(
     ".text",
     ".global duplex_switch",
@@ -35,6 +36,41 @@ global_asm!(
     "pop r12",
     "pop rbx",
     "pop rbp",
+    "ret",
+);
+
+// aarch64: x19-x30 and d8-d15 are the callee-saved registers; x30 (the return address) sits at word 11.
+#[cfg(target_arch = "aarch64")]
+global_asm!(
+    ".text",
+    ".global duplex_switch",
+    "duplex_switch:",
+    // x0: where to save the current stack pointer; x1: the stack pointer to continue on.
+    "sub sp, sp, #160",
+    "stp x19, x20, [sp, #0]",
+    "stp x21, x22, [sp, #16]",
+    "stp x23, x24, [sp, #32]",
+    "stp x25, x26, [sp, #48]",
+    "stp x27, x28, [sp, #64]",
+    "stp x29, x30, [sp, #80]",
+    "stp d8, d9, [sp, #96]",
+    "stp d10, d11, [sp, #112]",
+    "stp d12, d13, [sp, #128]",
+    "stp d14, d15, [sp, #144]",
+    "mov x9, sp",
+    "str x9, [x0]",
+    "mov sp, x1",
+    "ldp x19, x20, [sp, #0]",
+    "ldp x21, x22, [sp, #16]",
+    "ldp x23, x24, [sp, #32]",
+    "ldp x25, x26, [sp, #48]",
+    "ldp x27, x28, [sp, #64]",
+    "ldp x29, x30, [sp, #80]",
+    "ldp d8, d9, [sp, #96]",
+    "ldp d10, d11, [sp, #112]",
+    "ldp d12, d13, [sp, #128]",
+    "ldp d14, d15, [sp, #144]",
+    "add sp, sp, #160",
     "ret",
 );
 
@@ -186,14 +222,18 @@ pub fn run(api: &'static TapeApi, options: &Options<'static>) {
     };
     let body: &mut dyn FnMut() = &mut receive_body;
     unsafe {
-        // Initial stack of the receive task: six saved registers and a return address into `task_entry`.
+        // Initial stack of the receive task: the saved registers and a return address into `task_entry`.
         let top = (stack_address + STACK_BYTES) & !15;
-        let initial = top - 64;
+        #[cfg(target_arch = "x86_64")]
+        let (frame, entry_word) = (64, 6);
+        #[cfg(target_arch = "aarch64")]
+        let (frame, entry_word) = (160, 11);
+        let initial = top - frame;
         let words = initial as *mut usize;
-        for index in 0..6 {
+        for index in 0..frame / 8 {
             words.add(index).write(0);
         }
-        words.add(6).write(task_entry as *const () as usize);
+        words.add(entry_word).write(task_entry as *const () as usize);
         TASK_SP = initial;
         BODY = Some(core::mem::transmute::<*mut dyn FnMut(), *mut (dyn FnMut() + 'static)>(body as *mut dyn FnMut()));
         TASK_LIVE = true;
